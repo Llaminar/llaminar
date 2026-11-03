@@ -2478,14 +2478,14 @@ namespace llaminar2
             .long_name = "--expert-tier",
             .category = "MoE Configuration",
             .value_label = "<declaration>",
-            .description = "Expert tier: name=devices;priority=N[;memory-mb=N|auto]. Enables overlay; smallest priority is the default continuation. Scope, ranks, collective and capacity resolve automatically; domain policy overrides remain available.",
+            .description = "Expert tier: name=devices;priority=N[;memory-mb=N|auto][;expert_compute=policy]. Enables overlay; smallest priority is the default continuation. Scope, ranks, collective and capacity resolve automatically. expert_compute=apportioned distributes whole experts; tensor-sharded splits each expert's matrices across participants.",
             .setter = setters::custom<OrchestrationConfig>(appendExpertTier),
         });
         spec.add({
             .long_name = "--moe-routed-expert-domain",
             .category = "MoE Configuration",
             .value_label = "<spec>",
-            .description = "Define routed hardware: name=devices[;scope=auto|single|rank-local|node-local][;backend=type][;routed_compute=auto|apportioned|replicated|tensor-sharded|gate-up-owned-down-columns][;owner=N][;ranks=0,0,1]. Defaults: inventory-bound scope/collective, inherited automatic compute and static row assignment. Prefer --expert-tier to also declare priority.",
+            .description = "Define an expert compute domain: name=devices[;scope=auto|single|rank-local|node-local][;backend=type][;expert_compute=auto|apportioned|replicated|tensor-sharded|gate-up-owned-down-columns][;expert_phase=uniform|prefill-apportioned-decode-replicated][;expert_decode_assignment=policy][;expert_prefill_assignment=policy][;owner=N][;ranks=0,0,1]. apportioned distributes whole experts; tensor-sharded splits each expert's matrices across participants. Defaults: inventory-bound scope/collective, inherited automatic compute and static row assignment. Prefer --expert-tier to also declare priority.",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {

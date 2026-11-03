@@ -169,9 +169,9 @@ namespace llaminar2::test
         const std::string explanation = renderMoERoutedExpertPlacementPlanExplanation(plan);
 
         EXPECT_NE(explanation.find("topology: graph-native tiered-overlay"), std::string::npos);
-        EXPECT_NE(explanation.find("routed_compute=apportioned"), std::string::npos);
-        EXPECT_NE(explanation.find("routed_decode_assignment=static-owner"), std::string::npos);
-        EXPECT_NE(explanation.find("routed_prefill_assignment=static-owner"), std::string::npos);
+        EXPECT_NE(explanation.find("expert_compute=apportioned"), std::string::npos);
+        EXPECT_NE(explanation.find("expert_decode_assignment=static-owner"), std::string::npos);
+        EXPECT_NE(explanation.find("expert_prefill_assignment=static-owner"), std::string::npos);
         EXPECT_NE(explanation.find("continuation_domain: cuda_hot"), std::string::npos);
         EXPECT_NE(explanation.find("routed_domains:"), std::string::npos);
         EXPECT_NE(explanation.find("routed_tiers:"), std::string::npos);
@@ -264,7 +264,7 @@ namespace llaminar2::test
                                                           "--moe-routed-expert-placement", "tiered-overlay",
                                                           "--moe-routed-expert-continuation-domain", "cuda_hot",
                                                           "--moe-routed-expert-shared-domain", "cuda_hot",
-                                                          "--moe-routed-expert-domain", "cuda_hot=0:cuda:0;backend=nccl;routed_compute=apportioned",
+                                                          "--moe-routed-expert-domain", "cuda_hot=0:cuda:0;backend=nccl;expert_compute=apportioned",
                                                           "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=4"});
 
         ASSERT_NE(missing_scope.moe_routed_expert_plan, nullptr);
@@ -294,8 +294,8 @@ namespace llaminar2::test
                   RoutedExpertComputePolicy::Apportioned);
 
         for (const char *domain : {
-                 "x=cuda:0;scope=misspelled;routed_compute=apportioned",
-                 "x=cuda:0;scope=single;routed_compute=misspelled"})
+                 "x=cuda:0;scope=misspelled;expert_compute=apportioned",
+                 "x=cuda:0;scope=single;expert_compute=misspelled"})
         {
             EXPECT_THROW((void)parseArgs({"llaminar2", "--moe-routed-expert-domain", domain}),
                          std::invalid_argument);

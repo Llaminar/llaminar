@@ -315,7 +315,7 @@ namespace llaminar2
             throw std::runtime_error(
                 "MoE expert overlay continuation domain '" + name +
                 "' has multiple participants but no graph-native collective runtime: scope=" +
-                executionDomainScopeToString(scope) + ", routed_compute=" +
+                executionDomainScopeToString(scope) + ", expert_compute=" +
                 routedExpertComputePolicyToString(routed_compute_policy));
         }
     }
@@ -439,14 +439,14 @@ namespace llaminar2
             out << "\n  domain " << domain.name
                 << ": scope=" << executionDomainScopeToString(domain.scope)
                 << " backend=" << collectiveBackendTypeToString(domain.backend)
-                << " routed_compute="
+                << " expert_compute="
                 << routedExpertComputePolicyToString(domain.routed_compute_policy)
-                << " routed_phase="
+                << " expert_phase="
                 << routedExpertPhasePolicyToString(domain.routed_phase_policy)
-                << " routed_decode_assignment="
+                << " expert_decode_assignment="
                 << routedExpertAssignmentPolicyToString(
                        domain.routed_decode_assignment_policy)
-                << " routed_prefill_assignment="
+                << " expert_prefill_assignment="
                 << routedExpertAssignmentPolicyToString(
                        domain.routed_prefill_assignment_policy)
                 << " participants=" << domain.participants.size()

@@ -124,12 +124,12 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
                 args.extend(["--dense-policy", dense_policy])
             if decode_assignment_policy is not None:
                 args.extend([
-                    "--routed-decode-assignment-policy",
+                    "--expert-decode-assignment-policy",
                     decode_assignment_policy,
                 ])
             if prefill_assignment_policy is not None:
                 args.extend([
-                    "--routed-prefill-assignment-policy",
+                    "--expert-prefill-assignment-policy",
                     prefill_assignment_policy,
                 ])
             if allreduce_precision is not None:
@@ -163,10 +163,10 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
         self.assertNotIn("tp_allreduce_bom", result.stdout)
         self.assertIn("--moe-routed-expert-placement", result.stdout)
         self.assertIn("LLAMINAR_PREFILL_GRAPH_REQUIRED=1", result.stdout)
-        self.assertIn("routed_compute=apportioned", result.stdout)
-        self.assertIn("routed_phase=uniform", result.stdout)
-        self.assertIn("routed_decode_assignment=static-owner", result.stdout)
-        self.assertIn("routed_prefill_assignment=static-owner", result.stdout)
+        self.assertIn("expert_compute=apportioned", result.stdout)
+        self.assertIn("expert_phase=uniform", result.stdout)
+        self.assertIn("expert_decode_assignment=static-owner", result.stdout)
+        self.assertIn("expert_prefill_assignment=static-owner", result.stdout)
         self.assertIn("priority=0", result.stdout)
         self.assertNotIn("fallback=", result.stdout)
 
@@ -176,11 +176,11 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("routed_compute=apportioned", result.stdout)
-        self.assertIn("routed_phase=uniform", result.stdout)
-        self.assertIn("routed_decode_assignment=static-owner", result.stdout)
+        self.assertIn("expert_compute=apportioned", result.stdout)
+        self.assertIn("expert_phase=uniform", result.stdout)
+        self.assertIn("expert_decode_assignment=static-owner", result.stdout)
         self.assertIn(
-            "routed_prefill_assignment=least-loaded-resident",
+            "expert_prefill_assignment=least-loaded-resident",
             result.stdout,
         )
         self.assertIn("owner=0", result.stdout)
@@ -190,14 +190,14 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--moe-residency-maintenance off", result.stdout)
-        self.assertIn("routed_compute=apportioned", result.stdout)
-        self.assertIn("routed_phase=uniform", result.stdout)
-        self.assertIn("routed_decode_assignment=static-owner", result.stdout)
+        self.assertIn("expert_compute=apportioned", result.stdout)
+        self.assertIn("expert_phase=uniform", result.stdout)
+        self.assertIn("expert_decode_assignment=static-owner", result.stdout)
         self.assertIn(
-            "routed_prefill_assignment=least-loaded-resident",
+            "expert_prefill_assignment=least-loaded-resident",
             result.stdout,
         )
-        self.assertNotIn("routed_compute=replicated", result.stdout)
+        self.assertNotIn("expert_compute=replicated", result.stdout)
         self.assertIn("--moe-continuation-dense-policy tensor-parallel", result.stdout)
         self.assertIn("--mtp-terminal-head-policy mirrored-full-vocabulary", result.stdout)
         self.assertNotIn("--moe-device-rebalance-maintenance-slack-tokens", result.stdout)
@@ -207,13 +207,13 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--moe-residency-maintenance off", result.stdout)
-        self.assertIn("routed_compute=replicated", result.stdout)
+        self.assertIn("expert_compute=replicated", result.stdout)
         self.assertIn(
-            "routed_phase=prefill-apportioned-decode-replicated",
+            "expert_phase=prefill-apportioned-decode-replicated",
             result.stdout,
         )
-        self.assertIn("routed_decode_assignment=static-owner", result.stdout)
-        self.assertIn("routed_prefill_assignment=least-loaded-resident", result.stdout)
+        self.assertIn("expert_decode_assignment=static-owner", result.stdout)
+        self.assertIn("expert_prefill_assignment=least-loaded-resident", result.stdout)
 
     def test_obsolete_ambiguous_replicated_decode_case_is_rejected(self) -> None:
         result = self.run_script(cases="llep_replicated_decode")

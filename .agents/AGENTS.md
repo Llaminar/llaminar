@@ -924,7 +924,7 @@ rows are decode work, not ordinary prefill. There is no `llep` value for
 for supported combinations rather than treating these policies as synonyms.
 
 Projection ownership is a separate physical mode and the automatic default for a native
-homogeneous multi-GPU domain, `routed_compute=gate-up-owned-down-columns`
+homogeneous multi-GPU domain, `expert_compute=gate-up-owned-down-columns`
 keeps movable gate/up pairs with their expert owner and fixes disjoint full-K
 down-output columns on every participant. Both exchanges are graph-visible:
 proven no-P2P domains use device-counted TransferEngine channels for compact

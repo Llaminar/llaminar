@@ -12956,7 +12956,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEDeviceRoutedDecodeTableGuardsO
     EXPECT_NE(compact.find("if(use_expert_overlay)returnfalse"),
               std::string::npos)
         << "Graph-native tiered overlays use per-participant expert masks even "
-           "when the tier domain says routed_compute=apportioned; they must not "
+           "when the tier domain says expert_compute=apportioned; they must not "
            "receive the full-owner decode runtime table.";
     EXPECT_NE(compact.find("constboolruntime_table_eligible="),
               std::string::npos)

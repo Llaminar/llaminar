@@ -125,13 +125,13 @@ namespace llaminar2::test::parity
                 out << (i ? "," : "") << std::setprecision(9) << domain.weights[i];
         }
         if (domain.routed_compute_policy != RoutedExpertComputePolicy::Unspecified)
-            out << ";routed_compute=" << routedExpertComputePolicyToString(domain.routed_compute_policy);
+            out << ";expert_compute=" << routedExpertComputePolicyToString(domain.routed_compute_policy);
         if (domain.routed_phase_policy != RoutedExpertPhasePolicy::Unspecified)
-            out << ";routed_phase=" << routedExpertPhasePolicyToString(domain.routed_phase_policy);
+            out << ";expert_phase=" << routedExpertPhasePolicyToString(domain.routed_phase_policy);
         if (domain.routed_decode_assignment_policy != RoutedExpertAssignmentPolicy::Unspecified)
-            out << ";routed_decode_assignment=" << routedExpertAssignmentPolicyToString(domain.routed_decode_assignment_policy);
+            out << ";expert_decode_assignment=" << routedExpertAssignmentPolicyToString(domain.routed_decode_assignment_policy);
         if (domain.routed_prefill_assignment_policy != RoutedExpertAssignmentPolicy::Unspecified)
-            out << ";routed_prefill_assignment=" << routedExpertAssignmentPolicyToString(domain.routed_prefill_assignment_policy);
+            out << ";expert_prefill_assignment=" << routedExpertAssignmentPolicyToString(domain.routed_prefill_assignment_policy);
         return out.str();
     }
 

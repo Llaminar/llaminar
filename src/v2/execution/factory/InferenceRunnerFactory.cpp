@@ -670,7 +670,7 @@ namespace llaminar2
                         *error =
                             "domain '" + domain->name +
                             "' must explicitly declare "
-                            "routed_prefill_assignment=least-loaded-resident "
+                            "expert_prefill_assignment=least-loaded-resident "
                             "for current-batch LLEP";
                     }
                     return false;
@@ -684,7 +684,7 @@ namespace llaminar2
                         *error =
                             "domain '" + domain->name +
                             "' must explicitly declare "
-                            "routed_decode_assignment=static-owner for the "
+                            "expert_decode_assignment=static-owner for the "
                             "economical LLEP target; verifier-sized work must "
                             "not run current-batch least-loaded planning";
                     }

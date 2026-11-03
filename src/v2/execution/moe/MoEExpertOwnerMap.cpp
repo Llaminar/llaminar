@@ -83,7 +83,7 @@ namespace llaminar2
             {
                 std::ostringstream message;
                 message << "Graph-native routed tier '" << tier.name << "' in domain '" << domain.name
-                        << "' uses routed_compute=tensor-sharded; a whole-expert owner map cannot represent within-expert tensor shards";
+                        << "' uses expert_compute=tensor-sharded; a whole-expert owner map cannot represent within-expert tensor shards";
                 throw std::invalid_argument(message.str());
             }
 

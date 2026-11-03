@@ -130,7 +130,7 @@ namespace llaminar2
                 request.routed_compute_policy != RoutedExpertComputePolicy::Apportioned &&
                 request.routed_compute_policy != RoutedExpertComputePolicy::GateUpOwnedDownColumns)
                 throw std::invalid_argument(
-                    "Implicit ExpertOverlay authority requires routed_compute=auto, apportioned or gate-up-owned-down-columns; "
+                    "Implicit ExpertOverlay authority requires expert_compute=auto, apportioned or gate-up-owned-down-columns; "
                     "replicated and tensor-sharded residency need a typed multi-owner epoch representation");
             if (!request.local_tp_weights.empty() &&
                 request.local_tp_weights.size() != request.local_tp_participants.size())

@@ -1769,14 +1769,14 @@ namespace llaminar2
     {
         std::ostringstream out;
         out << "dense=" << denseParallelPolicyToString(policy.dense)
-            << ",routed_compute="
+            << ",expert_compute="
             << routedExpertComputePolicyToString(policy.routed_compute)
-            << ",routed_phase="
+            << ",expert_phase="
             << routedExpertPhasePolicyToString(policy.routed_phase)
-            << ",routed_decode_assignment="
+            << ",expert_decode_assignment="
             << routedExpertAssignmentPolicyToString(
                    policy.routed_decode_assignment)
-            << ",routed_prefill_assignment="
+            << ",expert_prefill_assignment="
             << routedExpertAssignmentPolicyToString(
                    policy.routed_prefill_assignment);
         return out.str();

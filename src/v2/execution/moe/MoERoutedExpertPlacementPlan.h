@@ -773,14 +773,14 @@ namespace llaminar2
                 out << "      - " << domain.name << " devices=";
                 appendDevices(out, domain.participants);
                 out << " scope=" << executionDomainScopeToString(domain.scope)
-                    << " routed_compute="
+                    << " expert_compute="
                     << routedExpertComputePolicyToString(domain.routed_compute_policy)
-                    << " routed_phase="
+                    << " expert_phase="
                     << routedExpertPhasePolicyToString(domain.routed_phase_policy)
-                    << " routed_decode_assignment="
+                    << " expert_decode_assignment="
                     << routedExpertAssignmentPolicyToString(
                            domain.routed_decode_assignment_policy)
-                    << " routed_prefill_assignment="
+                    << " expert_prefill_assignment="
                     << routedExpertAssignmentPolicyToString(
                            domain.routed_prefill_assignment_policy)
                     << " backend=" << collectiveBackendTypeToString(domain.backend);
@@ -1117,7 +1117,7 @@ namespace llaminar2
             if (domain.routed_compute_policy == RoutedExpertComputePolicy::Apportioned && !domain.supportsWholeExpertApportionment())
             {
                 addError("routed expert domain '" + domain.name +
-                         "' uses routed_compute=apportioned but declares no participants");
+                         "' uses expert_compute=apportioned but declares no participants");
             }
 
             const bool apportioned_prefill_over_replicated_weights =
@@ -1135,8 +1135,8 @@ namespace llaminar2
             {
                 addError(
                     "routed expert domain '" + domain.name +
-                    "' uses routed_phase=prefill-apportioned-decode-replicated "
-                    "but routed_compute is not replicated");
+                    "' uses expert_phase=prefill-apportioned-decode-replicated "
+                    "but expert_compute is not replicated");
             }
 
             if (domain.routed_phase_policy ==
@@ -1146,7 +1146,7 @@ namespace llaminar2
             {
                 addError(
                     "routed expert domain '" + domain.name +
-                    "' uses routed_phase=prefill-apportioned-decode-replicated "
+                    "' uses expert_phase=prefill-apportioned-decode-replicated "
                     "but is not a multi-participant collective domain");
             }
 
@@ -1190,17 +1190,17 @@ namespace llaminar2
             };
             validate_assignment(
                 domain.routed_decode_assignment_policy,
-                "routed_decode_assignment",
+                "expert_decode_assignment",
                 false);
             validate_assignment(
                 domain.routed_prefill_assignment_policy,
-                "routed_prefill_assignment",
+                "expert_prefill_assignment",
                 true);
 
             if (domain.routed_compute_policy == RoutedExpertComputePolicy::TensorSharded && !domain.supportsRoutedExpertTensorSharding())
             {
                 addError("routed expert domain '" + domain.name +
-                         "' uses routed_compute=tensor-sharded but is not a multi-participant collective domain");
+                         "' uses expert_compute=tensor-sharded but is not a multi-participant collective domain");
             }
         }
 

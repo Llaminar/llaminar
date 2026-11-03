@@ -378,7 +378,7 @@ TEST(ResolvedRankOrchestration, AutomaticMixedAndMultiTierComputeRemainsWholeExp
         // A row-assignment contract that needs complete residents is resolved
         // deliberately, rather than entering projection mode and retrying it.
         const auto least_loaded = parse({"--expert-tier", std::string("owners=") +
-            spelling + ":0," + spelling + ":1;scope=rank-local;priority=0;routed_prefill_assignment=least-loaded-resident"});
+            spelling + ":0," + spelling + ":1;scope=rank-local;priority=0;expert_prefill_assignment=least-loaded-resident"});
         const auto assigned = resolve(least_loaded, cluster, 0, true);
         EXPECT_EQ(assigned.config().moe_routed_expert_plan->domains.front().routed_compute_policy,
             RoutedExpertComputePolicy::Apportioned);

@@ -13562,6 +13562,15 @@ add_v2_test(V2_Unit_OrchestrationConfigParser
     MPI_PROCS 1
 )
 
+# Explicit expert policy spelling and physical-mode distinction remain device-free.
+add_v2_test(V2_Integration_ExpertDomainPolicyCLI
+    COMMAND $<TARGET_FILE:v2_test_orchestration_config_parser>
+        --gtest_filter=Test__OrchestrationConfigParser.ExpertDomainKeys*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Config;CLI;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ExpertDomainPolicyCLI)
+
 # Structured CLI composition stays device-free, including command extensions.
 add_executable(v2_test_cli_spec unit/config/Test__CliSpec.cpp)
 target_link_libraries(v2_test_cli_spec PRIVATE GTest::gtest GTest::gtest_main)

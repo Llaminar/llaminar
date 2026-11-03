@@ -1003,11 +1003,11 @@ namespace
             << "current-batch LLEP must validate its declared graph policy before lowering";
         EXPECT_NE(
             source.find(
-                "routed_prefill_assignment=least-loaded-resident"),
+                "expert_prefill_assignment=least-loaded-resident"),
             std::string::npos)
             << "a missing explicit LLEP prefill assignment must fail with actionable diagnostics";
         EXPECT_NE(
-            source.find("routed_decode_assignment=static-owner"),
+            source.find("expert_decode_assignment=static-owner"),
             std::string::npos)
             << "the economical grouped-verifier assignment must be validated independently";
     }

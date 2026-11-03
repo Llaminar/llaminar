@@ -129,7 +129,7 @@ never use whole-expert decode movement as a proxy for LLEP.
 
 Declare the tuple through `DenseParallelPolicy`,
 `RoutedExpertComputePolicy`, `RoutedExpertPhasePolicy`, separate
-`routed_decode_assignment` and `routed_prefill_assignment` domain fields,
+`expert_decode_assignment` and `expert_prefill_assignment` domain fields,
 `MTPTerminalHeadPolicy`, `--moe-residency-maintenance`, and
 `--moe-hot-expert-cache`. Graph builders own the resulting stage, collective,
 and event wiring. PerfStats must prove static-owner grouped verification,

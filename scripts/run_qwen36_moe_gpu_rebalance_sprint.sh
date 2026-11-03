@@ -36,7 +36,7 @@ require_prefill_graph="${LLAMINAR_GPU_MOE_REBALANCE_REQUIRE_PREFILL_GRAPH:-1}"
 
 usage() {
   cat <<USAGE
-Usage: $0 [--backend cuda|rocm|both] [--placement single|twocard|both] [--cases LIST] [--bin PATH] [--model PATH] [--out DIR] [--reps N] [--context-length N] [--n-predict N] [--n-predict-list LIST] [--seeds LIST] [--prompt TEXT|--prompt-file PATH] [--rebalance-window N] [--maintenance-slack-tokens N] [--minimum-maintenance-period-tokens N] [--initial-maintenance-period-tokens N] [--perfstats] [--stage-gpu-stats] [--rebalance-trace] [--capture-collectives] [--defer-captured-collective-sync] [--dense-tp] [--dense-decode-replicated] [--dense-policy POLICY] [--routed-decode-assignment-policy POLICY] [--routed-prefill-assignment-policy POLICY] [--allreduce-precision fp16|fp32|bf16] [--allreduce-fp16-min-elements N] [--require-prefill-graph|--no-require-prefill-graph] [--dry-run]
+Usage: $0 [--backend cuda|rocm|both] [--placement single|twocard|both] [--cases LIST] [--bin PATH] [--model PATH] [--out DIR] [--reps N] [--context-length N] [--n-predict N] [--n-predict-list LIST] [--seeds LIST] [--prompt TEXT|--prompt-file PATH] [--rebalance-window N] [--maintenance-slack-tokens N] [--minimum-maintenance-period-tokens N] [--initial-maintenance-period-tokens N] [--perfstats] [--stage-gpu-stats] [--rebalance-trace] [--capture-collectives] [--defer-captured-collective-sync] [--dense-tp] [--dense-decode-replicated] [--dense-policy POLICY] [--expert-decode-assignment-policy POLICY] [--expert-prefill-assignment-policy POLICY] [--allreduce-precision fp16|fp32|bf16] [--allreduce-fp16-min-elements N] [--require-prefill-graph|--no-require-prefill-graph] [--dry-run]
 
 Runs the Qwen3.6 35B MoE GPU expert-rebalance proof matrix:
   static placement
@@ -273,16 +273,16 @@ while [[ $# -gt 0 ]]; do
       dense_policy=""
       shift
       ;;
-    --routed-decode-assignment-policy)
-      routed_decode_assignment_policy="${2:?missing --routed-decode-assignment-policy value}"
+    --expert-decode-assignment-policy)
+      routed_decode_assignment_policy="${2:?missing --expert-decode-assignment-policy value}"
       shift 2
       ;;
     --no-routed-decode-assignment-policy)
       routed_decode_assignment_policy=""
       shift
       ;;
-    --routed-prefill-assignment-policy)
-      routed_prefill_assignment_policy="${2:?missing --routed-prefill-assignment-policy value}"
+    --expert-prefill-assignment-policy)
+      routed_prefill_assignment_policy="${2:?missing --expert-prefill-assignment-policy value}"
       shift 2
       ;;
     --no-routed-prefill-assignment-policy)
@@ -348,7 +348,7 @@ esac
 case "${routed_decode_assignment_policy}" in
   ""|static-owner|least-loaded-resident) ;;
   *)
-    echo "error: --routed-decode-assignment-policy must be static-owner or least-loaded-resident" >&2
+    echo "error: --expert-decode-assignment-policy must be static-owner or least-loaded-resident" >&2
     exit 2
     ;;
 esac
@@ -356,7 +356,7 @@ esac
 case "${routed_prefill_assignment_policy}" in
   ""|static-owner|least-loaded-resident) ;;
   *)
-    echo "error: --routed-prefill-assignment-policy must be static-owner or least-loaded-resident" >&2
+    echo "error: --expert-prefill-assignment-policy must be static-owner or least-loaded-resident" >&2
     exit 2
     ;;
 esac
@@ -559,10 +559,10 @@ twocard_overlay_args() {
   local be="$1"
   local case_name="$2"
   local domain devices collective
-  local routed_compute="apportioned"
-  local routed_phase="uniform"
-  local routed_decode_assignment="${routed_decode_assignment_policy:-static-owner}"
-  local routed_prefill_assignment="${routed_prefill_assignment_policy:-static-owner}"
+  local expert_compute="apportioned"
+  local expert_phase="uniform"
+  local expert_decode_assignment="${routed_decode_assignment_policy:-static-owner}"
+  local expert_prefill_assignment="${routed_prefill_assignment_policy:-static-owner}"
   case "${be}" in
     cuda)
       domain="qwen36_moe_cuda_hot"
@@ -577,13 +577,13 @@ twocard_overlay_args() {
   esac
 
   if [[ "${case_name}" == llep || "${case_name}" == llep_hot10 ]]; then
-    routed_decode_assignment="static-owner"
-    routed_prefill_assignment="least-loaded-resident"
+    expert_decode_assignment="static-owner"
+    expert_prefill_assignment="least-loaded-resident"
   elif [[ "${case_name}" == llep_replicated_experts_decode ]]; then
-    routed_compute="replicated"
-    routed_phase="prefill-apportioned-decode-replicated"
-    routed_decode_assignment="static-owner"
-    routed_prefill_assignment="least-loaded-resident"
+    expert_compute="replicated"
+    expert_phase="prefill-apportioned-decode-replicated"
+    expert_decode_assignment="static-owner"
+    expert_prefill_assignment="least-loaded-resident"
   fi
 
   printf '%s\n' \
@@ -592,7 +592,7 @@ twocard_overlay_args() {
     --moe-routed-expert-base-model-domain "${domain}" \
     --moe-routed-expert-shared-domain "${domain}" \
     --moe-routed-expert-residency static-by-id \
-    --moe-routed-expert-domain "${domain}=${devices};scope=rank_local;backend=${collective};routed_compute=${routed_compute};routed_phase=${routed_phase};routed_decode_assignment=${routed_decode_assignment};routed_prefill_assignment=${routed_prefill_assignment};owner=0" \
+    --moe-routed-expert-domain "${domain}=${devices};scope=rank_local;backend=${collective};expert_compute=${expert_compute};expert_phase=${expert_phase};expert_decode_assignment=${expert_decode_assignment};expert_prefill_assignment=${expert_prefill_assignment};owner=0" \
     --moe-routed-expert-tier "hot@${domain};priority=0;max-experts-per-layer=256;memory-mb=8192"
 }
 

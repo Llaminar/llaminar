@@ -1040,7 +1040,7 @@ def values(flag):
     return result
 
 current_batch_llep = any(
-    "routed_prefill_assignment=least-loaded-resident" in domain
+    "expert_prefill_assignment=least-loaded-resident" in domain
     for domain in values("--moe-routed-expert-domain")
 )
 window_flag = (

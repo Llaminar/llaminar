@@ -1,3 +1,10 @@
+/**
+ * @file Test__MoEContinuationDomainSpec.cpp
+ * @brief Device-free continuation placement and explicit expert-policy validation.
+ *
+ * Dense continuation membership remains independent of expert weight layout.
+ * These declarations validate policy and identity, not runtime admission.
+ */
 #include <gtest/gtest.h>
 
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
@@ -141,7 +148,7 @@ namespace llaminar2::test
         const auto result = validateMoERoutedExpertPlacementPlan(plan);
 
         EXPECT_FALSE(result.ok());
-        EXPECT_TRUE(hasErrorContaining(result, "routed_compute=tensor-sharded"));
+        EXPECT_TRUE(hasErrorContaining(result, "expert_compute=tensor-sharded"));
     }
 
 } // namespace llaminar2::test

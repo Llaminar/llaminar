@@ -28,6 +28,54 @@
 
 using namespace llaminar2;
 
+/** @test Public domain keys name experts and retain each distinct physical compute mode. */
+TEST(Test__OrchestrationConfigParser, ExpertDomainKeysPreserveDistinctCPUComputeModes)
+{
+    for (const auto mode : {RoutedExpertComputePolicy::Apportioned,
+                           RoutedExpertComputePolicy::Replicated,
+                           RoutedExpertComputePolicy::TensorSharded})
+    {
+        const std::string specification =
+            std::string("cpu_capacity=localhost:0:cpu:0,localhost:1:cpu:0;scope=node_local;backend=upi;") +
+            "expert_compute=" + routedExpertComputePolicyToString(mode) +
+            ";expert_phase=uniform;expert_decode_assignment=static-owner;expert_prefill_assignment=static-owner";
+        const auto domain = ExecutionDomainDefinition::parse(specification);
+        EXPECT_EQ(domain.routed_compute_policy, mode);
+        EXPECT_EQ(domain.routed_phase_policy, RoutedExpertPhasePolicy::Uniform);
+        EXPECT_EQ(domain.routed_decode_assignment_policy, RoutedExpertAssignmentPolicy::StaticOwner);
+        EXPECT_EQ(domain.routed_prefill_assignment_policy, RoutedExpertAssignmentPolicy::StaticOwner);
+        EXPECT_EQ(domain.scope, ExecutionDomainScope::NODE_LOCAL);
+        EXPECT_EQ(domain.backend, CollectiveBackendType::UPI);
+        EXPECT_EQ(domain.participants.size(), 2u);
+        EXPECT_TRUE(domain.validate().empty());
+        const auto description=domain.toString();
+        EXPECT_NE(description.find("expert_compute="),std::string::npos);
+        EXPECT_EQ(description.find("routed_compute="),std::string::npos);
+    }
+}
+
+/** @test Obsolete ambiguous domain keys are rejected instead of becoming hidden aliases. */
+TEST(Test__OrchestrationConfigParser, ExpertDomainKeysRejectObsoleteSpellings)
+{
+    for (const auto* obsolete : {"routed_compute=apportioned", "routed_phase=uniform",
+                                "routed_decode_assignment=static-owner", "routed_prefill_assignment=static-owner"})
+    {
+        EXPECT_THROW(ExecutionDomainDefinition::parse(
+            std::string("cpu_capacity=cpu:0;scope=single;") + obsolete), std::invalid_argument);
+    }
+}
+
+/** @test Domain help explains both expert layouts and exposes every expert-specific key. */
+TEST(Test__OrchestrationConfigParser, ExpertDomainKeysHelpExplainsPhysicalLayouts)
+{
+    const auto help=OrchestrationConfigParser::getHelpText();
+    for(const auto* key:{"expert_compute=", "expert_phase=", "expert_decode_assignment=", "expert_prefill_assignment="})
+        EXPECT_NE(help.find(key),std::string::npos);
+    EXPECT_NE(help.find("apportioned distributes whole experts"),std::string::npos);
+    EXPECT_NE(help.find("tensor-sharded splits each expert's matrices"),std::string::npos);
+    EXPECT_EQ(help.find("routed_compute="),std::string::npos);
+}
+
 // ============================================================================
 // Helper to convert string array to argc/argv
 // ============================================================================
@@ -54,6 +102,32 @@ private:
     std::vector<std::string> strings_;
     std::vector<char *> argv_;
 };
+
+/** @test Compact tier CLI and saved config preserve expert policies without selecting a topology implementation. */
+TEST(Test__OrchestrationConfigParser, ExpertDomainKeysRoundTripPublicTierDeclaration)
+{
+    for(const auto* mode:{"apportioned","tensor-sharded"})
+    {
+        const std::string specification=std::string(
+            "cpu_capacity=localhost:0:cpu:0,localhost:1:cpu:0;scope=node_local;backend=upi;priority=10;")+
+            "expert_compute="+mode+";expert_phase=uniform;expert_decode_assignment=static-owner;expert_prefill_assignment=static-owner";
+        ArgvHelper args{"llaminar2","--expert-tier",specification.c_str()};
+        const auto config=OrchestrationConfigParser{}.parseArgs(args.argc(),args.argv());
+        ASSERT_TRUE(config.moe_routed_expert_plan);
+        ASSERT_EQ(config.moe_routed_expert_plan->domains.size(),1u);
+        const auto& original=config.moe_routed_expert_plan->domains.front();
+        EXPECT_EQ(routedExpertComputePolicyToString(original.routed_compute_policy),std::string(mode));
+        const auto restored=deserializeOrchestrationConfig(serializeOrchestrationConfig(config));
+        ASSERT_TRUE(restored.moe_routed_expert_plan);
+        ASSERT_EQ(restored.moe_routed_expert_plan->domains.size(),1u);
+        const auto& roundTrip=restored.moe_routed_expert_plan->domains.front();
+        EXPECT_EQ(roundTrip.routed_compute_policy,original.routed_compute_policy);
+        EXPECT_EQ(roundTrip.routed_phase_policy,original.routed_phase_policy);
+        EXPECT_EQ(roundTrip.routed_decode_assignment_policy,original.routed_decode_assignment_policy);
+        EXPECT_EQ(roundTrip.routed_prefill_assignment_policy,original.routed_prefill_assignment_policy);
+        EXPECT_EQ(roundTrip.participants,original.participants);
+    }
+}
 
 // ============================================================================
 // Factory Function Tests
@@ -648,7 +722,7 @@ TEST(Test__OrchestrationConfigParser,
         "--moe-routed-expert-continuation-domain", "portable_gpu_pool",
         "--moe-routed-expert-shared-domain", "portable_gpu_pool",
         "--moe-routed-expert-domain",
-        "portable_gpu_pool=cuda:0,cuda:1;scope=auto;backend=nccl;routed_compute=apportioned",
+        "portable_gpu_pool=cuda:0,cuda:1;scope=auto;backend=nccl;expert_compute=apportioned",
         "--moe-routed-expert-tier",
         "priority_0@portable_gpu_pool;priority=0",
     };
@@ -673,8 +747,8 @@ TEST(Test__OrchestrationConfigParser, Phase9B_NamedAndOverlayDomainsShareCanonic
                             "--moe-routed-expert-placement", "tiered-overlay",
                             "--moe-routed-expert-continuation-domain", "rocm_hot",
                             "--moe-routed-expert-shared-domain", "rocm_hot",
-                            "--moe-routed-expert-domain", "rocm_hot=0:rocm:0,0:rocm:1;weights=0.60,0.40;scope=rank_local;backend=rccl;routed_compute=apportioned;owner=0",
-                            "--moe-routed-expert-domain", "cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;routed_compute=apportioned;ranks=0,1",
+                            "--moe-routed-expert-domain", "rocm_hot=0:rocm:0,0:rocm:1;weights=0.60,0.40;scope=rank_local;backend=rccl;expert_compute=apportioned;owner=0",
+                            "--moe-routed-expert-domain", "cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;expert_compute=apportioned;ranks=0,1",
                             "--moe-routed-expert-tier", "hot@rocm_hot;priority=0",
                             "--moe-routed-expert-tier", "cold@cpu_cold;priority=1"};
 
@@ -716,7 +790,7 @@ TEST(Test__OrchestrationConfigParser, Phase9B_OverlayDenseTPOptIn)
                     "--moe-routed-expert-shared-domain", "cuda_hot",
                     "--moe-continuation-dense-tp", "true",
                     "--moe-continuation-dense-decode-replicated", "true",
-                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;routed_compute=apportioned;owner=0",
+                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;expert_compute=apportioned;owner=0",
                     "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
     const auto config = parser.parseArgs(args.argc(), args.argv());
@@ -744,7 +818,7 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDensePolicyNamesPhaseSplitHybrid
                     "--moe-routed-expert-base-model-domain", "cuda_hot",
                     "--moe-routed-expert-shared-domain", "cuda_hot",
                     "--moe-continuation-dense-policy", "prefill-tensor-parallel-decode-replicated",
-                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;routed_compute=apportioned;owner=0",
+                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;expert_compute=apportioned;owner=0",
                     "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
     const auto config = parser.parseArgs(args.argc(), args.argv());
@@ -770,7 +844,7 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDensePolicyNamesDecodeMirroredEm
                     "--moe-routed-expert-base-model-domain", "cuda_hot",
                     "--moe-routed-expert-shared-domain", "cuda_hot",
                     "--moe-continuation-dense-policy", "tensor-parallel-decode-mirrored-embedding",
-                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;routed_compute=apportioned;owner=0",
+                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;expert_compute=apportioned;owner=0",
                     "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
     const auto config = parser.parseArgs(args.argc(), args.argv());
@@ -816,9 +890,9 @@ TEST(Test__OrchestrationConfigParser, MoEExecutionPolicyDescriptionNamesEveryAxi
     EXPECT_EQ(
         describeMoEExecutionPolicy(policy),
         "dense=tensor-parallel-decode-mirrored-embedding,"
-        "routed_compute=tensor-sharded,routed_phase=uniform,"
-        "routed_decode_assignment=static-owner,"
-        "routed_prefill_assignment=static-owner");
+        "expert_compute=tensor-sharded,expert_phase=uniform,"
+        "expert_decode_assignment=static-owner,"
+        "expert_prefill_assignment=static-owner");
 }
 
 TEST(Test__OrchestrationConfigParser, AmbiguousCompositePolicyAliasesAreRejected)
@@ -843,10 +917,10 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDomainParsesPhaseSplitIndependen
         "--moe-routed-expert-shared-domain", "cuda_hot",
         "--moe-routed-expert-domain",
         "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;"
-        "routed_compute=replicated;"
-        "routed_phase=prefill-apportioned-decode-replicated;"
-        "routed_decode_assignment=static-owner;"
-        "routed_prefill_assignment=static-owner;owner=0",
+        "expert_compute=replicated;"
+        "expert_phase=prefill-apportioned-decode-replicated;"
+        "expert_decode_assignment=static-owner;"
+        "expert_prefill_assignment=static-owner;owner=0",
         "--moe-routed-expert-tier",
         "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
@@ -885,8 +959,8 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDomainRejectsPhaseSplitWithoutRe
         "--moe-routed-expert-shared-domain", "cuda_hot",
         "--moe-routed-expert-domain",
         "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;"
-        "routed_compute=apportioned;"
-        "routed_phase=prefill-apportioned-decode-replicated;owner=0",
+        "expert_compute=apportioned;"
+        "expert_phase=prefill-apportioned-decode-replicated;owner=0",
         "--moe-routed-expert-tier",
         "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
@@ -900,7 +974,7 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDomainParsesDecodeAndPrefillAssi
                     "--moe-routed-expert-placement", "tiered-overlay",
                     "--moe-routed-expert-continuation-domain", "cuda_hot",
                     "--moe-routed-expert-shared-domain", "cuda_hot",
-                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;routed_compute=apportioned;routed_decode_assignment=static-owner;routed_prefill_assignment=least-loaded-resident;owner=0",
+                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;expert_compute=apportioned;expert_decode_assignment=static-owner;expert_prefill_assignment=least-loaded-resident;owner=0",
                     "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
     const auto config = parser.parseArgs(args.argc(), args.argv());
@@ -933,7 +1007,7 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDomainRejectsAmbiguousAllWorkAss
         "--moe-routed-expert-shared-domain", "cuda_hot",
         "--moe-routed-expert-domain",
         "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;"
-        "routed_compute=apportioned;"
+        "expert_compute=apportioned;"
         "routed_assignment=least-loaded-resident;owner=0",
         "--moe-routed-expert-tier",
         "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
@@ -950,7 +1024,7 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDomainRejectsLeastLoadedAsComput
                     "--moe-routed-expert-placement", "tiered-overlay",
                     "--moe-routed-expert-continuation-domain", "cuda_hot",
                     "--moe-routed-expert-shared-domain", "cuda_hot",
-                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;routed_compute=least-loaded-resident;owner=0",
+                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;expert_compute=least-loaded-resident;owner=0",
                     "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
     EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
@@ -963,7 +1037,7 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDomainRejectsLegacyExpertParalle
                     "--moe-routed-expert-placement", "tiered-overlay",
                     "--moe-routed-expert-continuation-domain", "cuda_hot",
                     "--moe-routed-expert-shared-domain", "cuda_hot",
-                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;routed_compute=expert_parallel;owner=0",
+                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;expert_compute=expert_parallel;owner=0",
                     "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
     EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
@@ -972,9 +1046,9 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDomainRejectsLegacyExpertParalle
 TEST(Test__OrchestrationConfigParser, Phase9B_DomainIdentityIsNameScopedForSharedParticipants)
 {
     const auto first = ExecutionDomainDefinition::parse(
-        "continuation=0:cuda:0;scope=single;backend=auto;routed_compute=apportioned");
+        "continuation=0:cuda:0;scope=single;backend=auto;expert_compute=apportioned");
     const auto second = ExecutionDomainDefinition::parse(
-        "shared_experts=0:cuda:0;scope=single;backend=auto;routed_compute=apportioned");
+        "shared_experts=0:cuda:0;scope=single;backend=auto;expert_compute=apportioned");
 
     EXPECT_TRUE(first.samePhysicalParticipants(second));
     EXPECT_NE(first.logicalIdentity(), second.logicalIdentity());
@@ -1532,7 +1606,7 @@ moe_routed_expert_placement:
     base_model_domain: gpu_hot
     shared_expert_domain: gpu_hot
     domains:
-        - "gpu_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;routed_compute=apportioned;routed_decode_assignment=static-owner;routed_prefill_assignment=static-owner;owner=0"
+        - "gpu_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;expert_compute=apportioned;expert_decode_assignment=static-owner;expert_prefill_assignment=static-owner;owner=0"
     routed_tiers:
         - "hot@gpu_hot;priority=0"
     )";

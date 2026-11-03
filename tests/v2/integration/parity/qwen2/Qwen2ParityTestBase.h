@@ -913,7 +913,7 @@ namespace llaminar2::test::parity::qwen2
                 << "|collective=" << static_cast<int>(cfg().collective)
                 << "|tp_collective=" << static_cast<int>(cfg().tp_collective)
                 << "|activation=" << static_cast<int>(cfg().activation_precision)
-                << "|routed_compute="
+                << "|expert_compute="
                 << static_cast<int>(cfg().routed_expert_compute_policy)
                 << "|routed_owner_order="
                 << static_cast<int>(cfg().routed_expert_owner_order)

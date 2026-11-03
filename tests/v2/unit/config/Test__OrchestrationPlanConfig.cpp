@@ -79,7 +79,7 @@ TEST(OrchestrationPlanConfig, GateUpProjectionOwnershipIsAnExplicitPhysicalMode)
     for (const auto *backend : {"cuda", "rocm"})
     {
         const auto config = parse({"--expert-tier", std::string("native=") + backend + ":0," + backend +
-            ":1;priority=0;routed_compute=gate-up-owned-down-columns"});
+            ":1;priority=0;expert_compute=gate-up-owned-down-columns"});
         ASSERT_TRUE(config.moe_routed_expert_plan);
         const auto &domain = config.moe_routed_expert_plan->domains.front();
         EXPECT_EQ(domain.routed_compute_policy, request.routed_expert_compute_policy);
@@ -191,7 +191,7 @@ TEST(OrchestrationPlanConfig, ExplicitRoleAndCapacityOverridesSurviveCompactDefa
 {
     const auto config = parse({
         "--expert-tier", "primary=cuda:0;priority=0;memory-mb=4096;max-experts-per-layer=9",
-        "--expert-tier", "secondary=cuda:1;priority=8;routed_compute=replicated",
+        "--expert-tier", "secondary=cuda:1;priority=8;expert_compute=replicated",
         "--moe-routed-expert-continuation-domain", "secondary",
         "--moe-routed-expert-shared-domain", "primary"});
     const auto &plan = *config.moe_routed_expert_plan;
@@ -242,15 +242,15 @@ TEST(OrchestrationPlanConfig, AutomaticComputeUsesBoundTopologyAndPreservesExpli
                         EXPECT_EQ(domain.resolveRoutedComputePolicy(tiers), explicit_mode);
                     }
                 }
-    auto domain = ExecutionDomainDefinition::parse("mixed=cuda:0,rocm:0;scope=rank-local;routed_compute=auto");
+    auto domain = ExecutionDomainDefinition::parse("mixed=cuda:0,rocm:0;scope=rank-local;expert_compute=auto");
     EXPECT_EQ(domain.resolveRoutedComputePolicy(1), RoutedExpertComputePolicy::Apportioned);
     for (const auto *gpu : {"cuda:0", "rocm:0"})
     {
         const auto mixed_cpu = ExecutionDomainDefinition::parse(
-            std::string("mixed=cpu:0,") + gpu + ";scope=rank-local;routed_compute=auto");
+            std::string("mixed=cpu:0,") + gpu + ";scope=rank-local;expert_compute=auto");
         EXPECT_EQ(mixed_cpu.resolveRoutedComputePolicy(1), RoutedExpertComputePolicy::Apportioned);
     }
-    domain = ExecutionDomainDefinition::parse("native=cuda:0,cuda:1;routed_compute=auto");
+    domain = ExecutionDomainDefinition::parse("native=cuda:0,cuda:1;expert_compute=auto");
     EXPECT_THROW(domain.resolveRoutedComputePolicy(1), std::invalid_argument);
     domain.scope = ExecutionDomainScope::RANK_LOCAL;
     domain.routed_prefill_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedResident;
@@ -272,7 +272,7 @@ TEST(OrchestrationPlanConfig, OmittedComputeInheritsGlobalRequestWithoutOverwrit
                   RoutedExpertComputePolicy::Apportioned);
     }
     const auto config = parse({"--moe-routed-expert-compute", "apportioned", "--expert-tier",
-        "native=rocm:0,rocm:1;priority=0;routed_compute=auto"});
+        "native=rocm:0,rocm:1;priority=0;expert_compute=auto"});
     EXPECT_EQ(config.moe_routed_expert_plan->domains.front().routed_compute_policy,
               RoutedExpertComputePolicy::Automatic);
     const auto restored = deserializeOrchestrationConfig(serializeOrchestrationConfig(config));

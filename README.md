@@ -999,10 +999,18 @@ keeps gate/up weights movable while splitting each expert's down-output
 columns across the GPUs. It is a separate compute layout, not a movement
 setting. CPU, heterogeneous and multi-tier layouts keep whole-expert ownership.
 To compare against whole experts on the same GPU tier, use
-`--moe-routed-expert-compute apportioned` (or add `;routed_compute=apportioned`
+`--moe-routed-expert-compute apportioned` (or add `;expert_compute=apportioned`
 to that tier). Explicit layout choices always take precedence. Projection
 ownership currently requires rank-local GPUs from one backend; cross-rank and
 cross-tier projection execution are not yet supported.
+
+Domain policy keys identify the expert work explicitly: `expert_compute` chooses
+the weight layout, `expert_phase` chooses phase behavior, and
+`expert_decode_assignment` / `expert_prefill_assignment` choose row assignment.
+`apportioned` distributes complete experts; `tensor-sharded` splits every
+expert's matrices across the domain and combines its partial outputs. The tier
+limit counts logical experts in either mode. A declared policy still requires
+a supported execution path for its topology.
 
 For more tuning options, see `serve --help` and the
 [configuration guide](AGENTS.md#run-and-inspect-configuration). To inspect
