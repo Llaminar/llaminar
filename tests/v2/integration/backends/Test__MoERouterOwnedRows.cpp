@@ -40,6 +40,9 @@ extern "C"
     bool cudaMoE_route_logits_fp16(const float *, const void *, float *, int, int, int, int, void *, const int *);
     bool cudaMoE_route_logits_bf16(const float *, const void *, float *, int, int, int, int, void *);
     bool cudaMoE_softmax_topk(float *, float *, float *, int, int, int, bool, int, void *, const int *, void *);
+    bool cudaMoE_scored_router_logit_transform(float *, int, int, int, const float *, const int32_t *, int,
+        const int32_t *, const int *, int, void *);
+    bool cudaMoE_scale_route_weights(float *, int, int, float, const int *, int, void *);
 }
 
 namespace
@@ -93,8 +96,17 @@ namespace
                         p.capacity, p.width, p.experts, device.ordinal, stream, p.live_rows)
                 : cudaMoE_route_logits_bf16(p.hidden, p.gate, p.logits,
                     p.capacity, p.width, p.experts, device.ordinal, stream);
-            return logits && cudaMoE_softmax_topk(p.logits, indices, weights, p.capacity,
-                p.experts, p.top_k, p.normalize, device.ordinal, stream, p.live_rows, nullptr);
+            // Complete-row sqrt(softplus) routing exactly as CUDAMoEKernel::routeCore.
+            const auto &scored = p.scored;
+            return logits &&
+                (!scored.enabled || cudaMoE_scored_router_logit_transform(p.logits, p.capacity, p.experts, p.top_k,
+                    scored.bias, scored.hash_table, scored.hash_vocab, scored.token_ids, p.live_rows,
+                    device.ordinal, stream)) &&
+                cudaMoE_softmax_topk(p.logits, indices, weights, p.capacity,
+                    p.experts, p.top_k, p.normalize || scored.enabled, device.ordinal, stream, p.live_rows, nullptr) &&
+                (!scored.enabled || scored.route_scale == 1.0f ||
+                 cudaMoE_scale_route_weights(weights, p.capacity, p.top_k, scored.route_scale, p.live_rows,
+                    device.ordinal, stream));
         }
 #endif
 #ifdef HAVE_ROCM
@@ -133,8 +145,12 @@ namespace
      * @param width Hidden columns, including ragged and Q8 serial-partition boundaries.
      * @param experts Router columns.
      * @param degrees Logical domain sizes, including more participants than live rows. */
+    /** @brief Router selection policy under test. */
+    enum class Scoring { Softmax, SqrtSoftplusBias, SqrtSoftplusHash };
+
     void prove(DeviceId device, MoERouterPreparedFormat format, int capacity, int width,
-               int experts, const std::vector<int> &degrees, RouterQ8Basis basis = RouterQ8Basis::Original)
+               int experts, const std::vector<int> &degrees, RouterQ8Basis basis = RouterQ8Basis::Original,
+               Scoring scoring = Scoring::Softmax)
     {
         auto &context = GPUDeviceContextPool::instance().getContext(device);
         context.submitAndWait([&]
@@ -179,6 +195,17 @@ namespace
             auto selected_bytes = TestTensorFactory::createINT32({2});
             auto reference_indices = TestTensorFactory::createFP32({route_elements});
             auto reference_weights = TestTensorFactory::createFP32({route_elements});
+            // DeepSeek-V4 scored routing inputs: distinct selection biases, and
+            // a hash table whose rows hold distinct experts per token.
+            constexpr int hash_vocab = 37;
+            auto bias = TestTensorFactory::createFP32({size_t(experts)});
+            for (int e = 0; e < experts; ++e) bias->mutable_data()[e] = .01f * float((e * 7) % 5) - .02f;
+            auto hash_table = TestTensorFactory::createINT32({size_t(hash_vocab) * top_k});
+            for (int t = 0; t < hash_vocab; ++t)
+                for (int k = 0; k < top_k; ++k)
+                    hash_table->mutable_int32_data()[t * top_k + k] = (t * 5 + k * 3) % experts;
+            auto token_ids = TestTensorFactory::createINT32({size_t(capacity)});
+            for (int r = 0; r < capacity; ++r) token_ids->mutable_int32_data()[r] = (r * 11 + 3) % hash_vocab;
             auto q8 = TestTensorFactory::createINT32({input_elements / 4 + 1});
             auto reference_q8 = TestTensorFactory::createINT32({input_elements / 4 + 1});
             auto scales = TestTensorFactory::createFP32({input_elements / 32 + 1});
@@ -187,7 +214,8 @@ namespace
             length->mutable_int32_data()[0] = capacity;
             for (TensorBase *tensor : std::initializer_list<TensorBase *>{hidden.get(), length.get(), gate.get(), gate_scales.get(),
                 logits.get(), reference_logits.get(), selected.get(), selected_bytes.get(), reference_indices.get(),
-                reference_weights.get(), q8.get(), reference_q8.get(), scales.get(), reference_scales.get()})
+                reference_weights.get(), q8.get(), reference_q8.get(), scales.get(), reference_scales.get(),
+                bias.get(), hash_table.get(), token_ids.get()})
                 require(tensor->ensureOnDevice(device, stream), "Owned router storage");
             MoERouterOwnedRowsLaunch launch{
                 .partition = DeviceRowPartition::balanced(0, 2),
@@ -201,6 +229,16 @@ namespace
                 .logits = static_cast<float *>(logits->gpu_data_ptr()),
                 .selected = static_cast<MoERouterSelectedRoute *>(selected->gpu_data_ptr()),
                 .selected_bytes = static_cast<uint64_t *>(selected_bytes->gpu_data_ptr())};
+            if (scoring != Scoring::Softmax)
+            {
+                const bool hash = scoring == Scoring::SqrtSoftplusHash;
+                launch.scored = {.enabled = true,
+                    .bias = hash ? nullptr : static_cast<const float *>(bias->gpu_data_ptr()),
+                    .hash_table = hash ? static_cast<const int32_t *>(hash_table->gpu_data_ptr()) : nullptr,
+                    .hash_vocab = hash ? hash_vocab : 0,
+                    .token_ids = hash ? static_cast<const int32_t *>(token_ids->gpu_data_ptr()) : nullptr,
+                    .route_scale = 1.5f};
+            }
             auto oracle = launch;
             oracle.logits = static_cast<float *>(reference_logits->gpu_data_ptr());
             auto *oracle_indices = static_cast<float *>(reference_indices->gpu_data_ptr());
@@ -260,8 +298,9 @@ namespace
                     std::vector<GPUGraphKernelNodeInfo> nodes;
                     ASSERT_TRUE(graph->inspectKernelNodes(nodes));
                     const bool owns_capacity = launch.partition.capacityFor(capacity) > 0;
+                    const bool scored_nodes = owns_capacity && scoring != Scoring::Softmax;
                     ASSERT_EQ(nodes.size(), 1u + owns_capacity + (format == MoERouterPreparedFormat::BlockQ8) +
-                        (owns_capacity && basis == RouterQ8Basis::SignedHadamard32));
+                        (owns_capacity && basis == RouterQ8Basis::SignedHadamard32) + 2u * scored_nodes);
                     for (const auto &node : nodes) EXPECT_EQ(node.local_memory_bytes_per_thread, 0u) << node.name;
                     require(graph->instantiate(), "Owned router instantiate");
                     int generation = 0;
@@ -342,6 +381,22 @@ namespace
     /** @test CUDA's native prefill FP32/BF16 and actual-half rows retain exact selection bytes. */
     TEST(MoERouterOwnedRows, CUDA) { proveBackend(DeviceId::cuda(0)); }
     /** @test CUDA rotated Q8 prefill preserves compact ownership and every expert input row. */
+    /**
+     * @test DeepSeek-V4 sqrt(softplus) score and hash routing on owned rows is
+     * bit-identical to the complete-row router, including the route scale.
+     * Regression: the owned-row router rejected scored routing, so a
+     * GateUpOwnedDownColumns DeepSeek-V4 domain failed at its first prefill.
+     */
+    TEST(MoERouterOwnedRows, CUDAScored)
+    {
+        for (const auto scoring : {Scoring::SqrtSoftplusBias, Scoring::SqrtSoftplusHash})
+            for (const auto format : {MoERouterPreparedFormat::FP32, MoERouterPreparedFormat::BF16,
+                                      MoERouterPreparedFormat::FP16})
+            {
+                prove(DeviceId::cuda(0), format, 65, 96, 17, {2, 3, 4, 8}, RouterQ8Basis::Original, scoring);
+                prove(DeviceId::cuda(0), format, 512, 2048, 256, {2}, RouterQ8Basis::Original, scoring);
+            }
+    }
     TEST(MoERouterOwnedRows, CUDAHadamard)
     {
         prove(DeviceId::cuda(0), MoERouterPreparedFormat::BlockQ8, 2, 96, 17, {2, 8}, RouterQ8Basis::SignedHadamard32);

@@ -21117,17 +21117,32 @@ namespace
      * The unchanged softmax/top-k kernels then select exactly that set with
      * normalized weights s / sum(s); the route scale is applied afterwards.
      */
+    template <bool Partitioned = false>
     __global__ void scored_router_logit_transform_kernel(
         float *__restrict__ logits, int seq_len, int num_experts, int top_k,
         const float *__restrict__ bias, const int32_t *__restrict__ hash_table, int hash_vocab,
-        const int32_t *__restrict__ token_ids, const int *__restrict__ effective_seq_len)
+        const int32_t *__restrict__ token_ids, const int *__restrict__ effective_seq_len,
+        llaminar2::DeviceRowPartition partition = {})
     {
+        // Partitioned (owned-row) routing keeps compact local logit rows while
+        // hash routing reads the token at the row's original coordinate.
         const int row = blockIdx.x;
-        int live = seq_len;
-        if (effective_seq_len)
-            live = min(max(*effective_seq_len, 0), seq_len);
-        if (row >= live)
-            return;
+        int token_row = row;
+        if constexpr (Partitioned)
+        {
+            const auto span = partition.resolve(seq_len, effective_seq_len);
+            if (row >= span.count)
+                return;
+            token_row = span.first + row;
+        }
+        else
+        {
+            int live = seq_len;
+            if (effective_seq_len)
+                live = min(max(*effective_seq_len, 0), seq_len);
+            if (row >= live)
+                return;
+        }
         __shared__ float scores[kMaxExperts];
         __shared__ float keys[kMaxExperts];
         __shared__ int chosen[kMaxTopK];
@@ -21146,7 +21161,7 @@ namespace
         {
             if (threadIdx.x == 0)
             {
-                const int token = token_ids[row];
+                const int token = token_ids[token_row];
                 if (token < 0 || token >= hash_vocab)
                     __trap();
                 for (int k = 0; k < top_k; ++k)
@@ -21211,6 +21226,17 @@ namespace
         const int index = blockIdx.x * blockDim.x + threadIdx.x;
         if (index < live * top_k)
             weights[index] *= scale;
+    }
+
+    /** @brief Multiply this participant's compact owned-row route weights by the route scale. */
+    __global__ void scale_owned_route_weights_kernel(
+        llaminar2::MoERouterSelectedRoute *__restrict__ selected, int capacity, int top_k, float scale,
+        const int *__restrict__ live_rows, llaminar2::DeviceRowPartition partition)
+    {
+        const int count = partition.resolve(capacity, live_rows).count;
+        const int index = blockIdx.x * blockDim.x + threadIdx.x;
+        if (index < count * top_k)
+            selected[index].weight *= scale;
     }
 
     /** @brief Multiply the published decode runtime route weights (and legacy copy) by the route scale. */
@@ -25746,11 +25772,30 @@ namespace llaminar2::cuda
                 launch.capacity, launch.width, launch.experts, launch.live_rows, launch.partition);
             if (!finishLaunch("cudaMoE_owned_bf16_logits")) return false;
         }
+        // sqrt(softplus) score/hash routing (DeepSeek-V4) rewrites the compact
+        // logits exactly as the complete-row router does: the chosen experts
+        // keep log(s), so the normalized softmax below yields s / sum(s).
+        const auto &scored = launch.scored;
+        if (scored.enabled && rows > 0)
+        {
+            scored_router_logit_transform_kernel<true><<<rows, kThreads, 0, native_stream>>>(
+                launch.logits, launch.capacity, launch.experts, launch.top_k, scored.bias,
+                scored.hash_table, scored.hash_vocab, scored.token_ids, launch.live_rows, launch.partition);
+            if (!finishLaunch("cudaMoE_owned_scored_transform")) return false;
+        }
         softmax_topk_kernel<true><<<std::max(1, rows), kThreads, 0, native_stream>>>(
             launch.logits, nullptr, nullptr, launch.capacity, launch.experts,
-            launch.top_k, launch.normalize, launch.live_rows, nullptr, launch.partition,
+            launch.top_k, launch.normalize || scored.enabled, launch.live_rows, nullptr, launch.partition,
             launch.selected, launch.selected_bytes);
-        return finishLaunch("cudaMoE_owned_topk");
+        if (!finishLaunch("cudaMoE_owned_topk")) return false;
+        if (scored.enabled && scored.route_scale != 1.0f && rows > 0)
+        {
+            const int slots = rows * launch.top_k;
+            scale_owned_route_weights_kernel<<<(slots + kThreads - 1) / kThreads, kThreads, 0, native_stream>>>(
+                launch.selected, launch.capacity, launch.top_k, scored.route_scale, launch.live_rows, launch.partition);
+            if (!finishLaunch("cudaMoE_owned_route_scale")) return false;
+        }
+        return true;
     }
 
     bool publishRouterOwnedRows(const MoERouterRowPublication &publication, void *stream)

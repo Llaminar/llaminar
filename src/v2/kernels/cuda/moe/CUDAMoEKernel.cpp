@@ -4746,9 +4746,11 @@ namespace llaminar2
         // cache and hidden bank; capture only consumes their retained addresses.
         const bool q8_prefill = gate_is_fp32 &&
             debugEnv().gemm.cuda_moe_router_prefill == CUDARouterPrefillArithmetic::Q8;
-        if (!router_scoring_.isSoftmax() && (owned || q8_prefill))
+        // The opt-in Q8 prefill router has no scored selection stage; the
+        // ordinary and owned-row FP routers both apply it.
+        if (!router_scoring_.isSoftmax() && q8_prefill)
         {
-            LOG_ERROR("[CUDAMoEKernel] scored (sqrt-softplus) routing supports only the ordinary complete-row router");
+            LOG_ERROR("[CUDAMoEKernel] scored (sqrt-softplus) routing does not implement the Q8 prefill router");
             return false;
         }
         invalidateRouterQ8HiddenPublication();
@@ -4816,7 +4818,10 @@ namespace llaminar2
                 .format = gate_is_fp32 ? MoERouterPreparedFormat::FP32 :
                     (gate_type == TensorType::FP16 ? MoERouterPreparedFormat::FP16 : MoERouterPreparedFormat::BF16),
                 .gate = gate_weights, .logits = d_route_logits_,
-                .selected = owned->selected, .selected_bytes = owned->selected_bytes};
+                .selected = owned->selected, .selected_bytes = owned->selected_bytes,
+                .scored = {.enabled = !router_scoring_.isSoftmax(), .bias = router_scoring_.selection_bias,
+                           .hash_table = router_scoring_.hash_table, .hash_vocab = router_scoring_.hash_vocab,
+                           .token_ids = router_scoring_.token_ids, .route_scale = router_scoring_.route_scale}};
             const bool submitted = cuda::routeOwnedRows(launch, stream, router_q8_prefill_hardware_);
             if (submitted && gate_type == TensorType::FP16)
                 PerfStatsCollector::addCounter("cuda_moe", "router_fp16_owned_operands", 1.0, {}, {},

@@ -23695,6 +23695,13 @@ namespace llaminar2::rocm
     /** @brief Share installed router arithmetic while assigning each live row once. */
     bool routeOwnedRows(const MoERouterOwnedRowsLaunch &launch, void *stream)
     {
+        // sqrt(softplus) routing serves only DeepSeek-V4, which has no ROCm
+        // implementation; reject it rather than route with softmax.
+        if (launch.scored.enabled)
+        {
+            fprintf(stderr, "[ROCmMoE] DeepSeek V4: ROCm unimplemented (scored owned-row routing)\n");
+            return false;
+        }
         if (!stream || !launch.valid() || launch.experts > kDeviceMoEMaxExperts ||
             launch.top_k > kDeviceMoEMaxTopK)
             return false;

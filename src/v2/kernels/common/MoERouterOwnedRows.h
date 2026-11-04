@@ -23,6 +23,28 @@ namespace llaminar2
         std::uint64_t *selected_bytes = nullptr;
     };
 
+    /**
+     * @brief sqrt(softplus) score/hash routing applied to the compact local logits (DeepSeek-V4).
+     * @details Selection is the top-k of s + bias (or the hash table row of
+     * the token); weights are the unbiased s of the chosen experts normalized
+     * to one and multiplied by @c route_scale. Disabled means ordinary softmax.
+     */
+    struct MoERouterScoredRouting
+    {
+        bool enabled = false;
+        const float *bias = nullptr;            ///< [experts] selection bias (score routing).
+        const std::int32_t *hash_table = nullptr; ///< [vocab, top_k] (hash routing).
+        int hash_vocab = 0;
+        const std::int32_t *token_ids = nullptr;  ///< [capacity] original-coordinate token ids.
+        float route_scale = 1.0f;
+
+        /** @return Exactly one selection authority, with its inputs. */
+        [[nodiscard]] bool valid() const noexcept
+        {
+            return !enabled || (hash_table ? (token_ids && hash_vocab > 0 && !bias) : bias != nullptr);
+        }
+    };
+
     /** @brief Already prepared router representation, independent of expert codebook. */
     enum class MoERouterPreparedFormat { FP32, FP16, BF16, BlockQ8 };
 
@@ -46,6 +68,7 @@ namespace llaminar2
         float *logits = nullptr; ///< Compact local rows, same expert order and FP32 bits.
         MoERouterSelectedRoute *selected = nullptr; ///< Compact pairs in original top-k order.
         std::uint64_t *selected_bytes = nullptr; ///< Canonical local collective extent, written even when empty.
+        MoERouterScoredRouting scored; ///< Disabled: softmax routing.
 
         /** @return Whether shared geometry and mandatory addresses are complete.
          * Backend-native format limits are checked by each launch bridge. */
@@ -54,7 +77,8 @@ namespace llaminar2
             // CUDA scalar decode has a different established K tree. This
             // prefill primitive must not silently substitute that contract.
             // A retained prefill may still replay with zero or one LIVE row.
-            return capacity >= 2 && width > 0 && experts > 0 && top_k > 0 && top_k <= experts &&
+            return scored.valid() &&
+                capacity >= 2 && width > 0 && experts > 0 && top_k > 0 && top_k <= experts &&
                 live_rows && hidden && gate && logits && selected && selected_bytes &&
                 partition.participants() > 1 &&
                 (q8_basis == RouterQ8Basis::Original ||

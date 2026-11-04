@@ -24734,6 +24734,16 @@ if(HAVE_CUDA OR HAVE_ROCM)
                 MPI_PROCS 1
                 NO_MODELS
                 TIMEOUT 120)
+            if(_live_rows_backend STREQUAL "CUDA")
+                # DeepSeek-V4 sqrt(softplus) owned-row routing == complete-row routing.
+                add_v2_test(V2_Integration_MoERouterOwnedRowsScored_CUDA
+                    COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
+                        --gtest_filter=MoERouterOwnedRows.CUDAScored
+                    LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;DeepSeekV4;GraphCapture;ByteExact;Regression"
+                    MPI_PROCS 1
+                    NO_MODELS
+                    TIMEOUT 120)
+            endif()
             add_v2_test(V2_Integration_FP32SubnormalContract_${_live_rows_backend}
                 COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
                     --gtest_filter=DeviceFP32SubnormalContract.${_live_rows_backend}
