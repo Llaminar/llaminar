@@ -140,6 +140,15 @@ namespace llaminar2
             officialRepositoryIdentity(loader.getString("general.repo_url"))};
         const auto architecture = loader.architecture();
         ModelGenerationPolicy result;
+        // DeepSeek-V4's prompt format is defined by its Python reference
+        // encoder; converter-embedded Jinja ports differ between exporters and
+        // in JSON spelling. Thinking defaults on and generation_config.json
+        // (temperature 1.0, top_p 1.0) equals the standard SamplingParams.
+        if (architecture == "deepseek4")
+        {
+            result.template_source_ = TemplateSource::DeepSeekV4Native;
+            return result;
+        }
         for (const auto &candidate : candidates)
         {
             const auto identity = normalizeIdentity(candidate);
@@ -194,6 +203,8 @@ namespace llaminar2
         if (template_source_ == TemplateSource::Qwen35Maintained)
             tokenizer.setChatTemplate(ChatTemplate::create(
                 std::string(qwen35::kCommunityChatTemplate), "", ""));
+        else if (template_source_ == TemplateSource::DeepSeekV4Native)
+            tokenizer.setChatTemplate(ChatTemplate::create(ChatTemplateType::DEEPSEEK_V4));
     }
 
 }

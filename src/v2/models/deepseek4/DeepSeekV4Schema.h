@@ -24,6 +24,20 @@ public:
         return {"output_hc_fn.weight", "output_hc_base.weight", "output_hc_scale.weight", "output_norm.weight"};
     }
 
+    /** @brief DeepSeek-V4 emits DSML tool-call blocks, not Qwen XML. */
+    ToolCallFormat getToolCallFormat() const override { return ToolCallFormat::DEEPSEEK_V4_DSML; }
+
+    /**
+     * @brief Budget close for the Llaminar thinking-budget extension.
+     * @details DeepSeek-V4 answers immediately after "</think>" (no blank line,
+     * unlike Qwen), so the forced close ends with the bare delimiter.
+     */
+    std::string getStopThinkingPrompt() const override
+    {
+        return "\n\nConsidering the limited time by the user, I have to give the solution based on the "
+               "thinking directly now.</think>";
+    }
+
     GraphSchema createSchema() const override
     {
         auto schema = Qwen35MoESchemaFactory::createSchema();

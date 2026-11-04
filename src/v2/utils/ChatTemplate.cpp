@@ -14,12 +14,14 @@
  */
 
 #include "ChatTemplate.h"
+#include "DeepSeekV4ChatEncoding.h"
 #include "Logger.h"
 #include "vendor/jinja/lexer.h"
 #include "vendor/jinja/parser.h"
 #include "vendor/jinja/runtime.h"
 #include "vendor/jinja/value.h"
 #include <sstream>
+#include <stdexcept>
 #include <algorithm>
 #include <nlohmann/json.hpp>
 
@@ -74,6 +76,8 @@ namespace llaminar2
             return "Vicuna";
         case ChatTemplateType::COMMAND_R:
             return "Command-R";
+        case ChatTemplateType::DEEPSEEK_V4:
+            return "DeepSeek V4 (native)";
         case ChatTemplateType::UNKNOWN:
         default:
             return "Unknown";
@@ -104,6 +108,17 @@ namespace llaminar2
         : type_(type), raw_template_(raw_template),
           bos_token_(bos_token), eos_token_(eos_token)
     {
+        // DeepSeek-V4 is encoded natively: the format is defined by a Python
+        // reference encoder, not a template, and its thinking delimiters are
+        // fixed tokens rather than something to discover by rendering.
+        if (type_ == ChatTemplateType::DEEPSEEK_V4)
+        {
+            is_thinking_model_ = true;
+            thinking_start_tag_ = deepseek4::kThinkStart;
+            thinking_end_tag_ = deepseek4::kThinkEnd;
+            return;
+        }
+
         // Try to compile the Jinja2 template
         if (!raw_template_.empty())
         {
@@ -174,7 +189,8 @@ namespace llaminar2
     std::string ChatTemplate::renderJinja(const std::vector<ChatMessage> &messages,
                                           bool add_generation_prompt,
                                           bool enable_thinking,
-                                          const std::string &tools_json) const
+                                          const std::string &tools_json,
+                                          const std::optional<std::string> &reasoning_effort) const
     {
         if (!jinja_state_)
             return {};
@@ -270,6 +286,10 @@ namespace llaminar2
                 inp["add_generation_prompt"] = true;
             }
             inp["enable_thinking"] = enable_thinking;
+            // Only a client-supplied value is defined; templates keep their
+            // own default when the request does not choose an effort.
+            if (reasoning_effort)
+                inp["reasoning_effort"] = *reasoning_effort;
 
             // Pass tools array to Jinja context if provided
             if (!tools_json.empty())
@@ -631,10 +651,72 @@ namespace llaminar2
                                     bool enable_thinking,
                                     const std::string &tools_json) const
     {
+        return apply(messages, ChatEncodingOptions{add_generation_prompt, enable_thinking, std::nullopt, tools_json});
+    }
+
+    std::string ChatTemplate::renderDeepSeekV4(const std::vector<ChatMessage> &messages,
+                                               const ChatEncodingOptions &options) const
+    {
+        using ojson = nlohmann::ordered_json;
+        // Present each message in the OpenAI shape the reference encoder
+        // consumes. Tool-call objects and the tools array are re-parsed as
+        // order-preserving JSON: schema text must keep the client's key order.
+        ojson conversation = ojson::array();
+        for (const auto &msg : messages)
+        {
+            ojson m = {{"role", msg.role}};
+            if (!msg.content_parts.empty())
+            {
+                ojson parts = ojson::array();
+                for (const auto &part : msg.content_parts)
+                    parts.push_back({{"type", "text"}, {"text", part}});
+                m["content"] = std::move(parts);
+            }
+            else if (msg.hasToolCalls() && msg.content.empty())
+                m["content"] = nullptr;
+            else
+                m["content"] = msg.content;
+            if (msg.reasoning_content)
+                m["reasoning"] = *msg.reasoning_content;
+            if (!msg.tool_calls.empty())
+            {
+                ojson calls = ojson::array();
+                for (const auto &call : msg.tool_calls)
+                {
+                    auto parsed = ojson::parse(call, nullptr, false);
+                    if (parsed.is_discarded() || !parsed.is_object())
+                        throw std::invalid_argument("DeepSeek-V4 encoder: assistant tool_calls entry is not a JSON object");
+                    calls.push_back(std::move(parsed));
+                }
+                m["tool_calls"] = std::move(calls);
+            }
+            if (!msg.tool_call_id.empty())
+                m["tool_call_id"] = msg.tool_call_id;
+            conversation.push_back(std::move(m));
+        }
+        if (!options.tools_json.empty())
+        {
+            const auto tools = ojson::parse(options.tools_json, nullptr, false);
+            if (tools.is_discarded() || !tools.is_array())
+                throw std::invalid_argument("DeepSeek-V4 encoder: tools must be a JSON array");
+            deepseek4::attachRequestTools(conversation, tools);
+        }
+        return deepseek4::encodeChatMessages(
+            conversation, deepseek4::resolveChatPromptPolicy(options.enable_thinking, options.reasoning_effort),
+            options.add_generation_prompt);
+    }
+
+    std::string ChatTemplate::apply(const std::vector<ChatMessage> &messages, const ChatEncodingOptions &options) const
+    {
+        if (type_ == ChatTemplateType::DEEPSEEK_V4)
+            return renderDeepSeekV4(messages, options);
+
+        const bool add_generation_prompt = options.add_generation_prompt;
         // Primary path: Jinja2 rendering
         if (jinja_available_)
         {
-            std::string result = renderJinja(messages, add_generation_prompt, enable_thinking, tools_json);
+            std::string result = renderJinja(messages, add_generation_prompt, options.enable_thinking,
+                                             options.tools_json, options.reasoning_effort);
             if (!result.empty())
             {
                 return result;
@@ -681,6 +763,8 @@ namespace llaminar2
             return applyVicuna(messages, add_generation_prompt);
         case ChatTemplateType::COMMAND_R:
             return applyCommandR(messages, add_generation_prompt);
+        case ChatTemplateType::DEEPSEEK_V4:
+            throw std::logic_error("DeepSeek-V4 has no fallback renderer; apply() owns its native encoder");
         case ChatTemplateType::UNKNOWN:
         default:
             return applyUnknown(messages, add_generation_prompt);

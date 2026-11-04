@@ -36,6 +36,7 @@
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
@@ -431,6 +432,28 @@ namespace llaminar2
         }
 
         /**
+         * @brief The admitted tools as order-preserving JSON text for prompt rendering.
+         * @return Empty when no tool may be called; otherwise the client-ordered array
+         *         (or the single named function for a specific tool_choice).
+         */
+        std::string admittedToolDefinitionsOrdered(const ChatCompletionRequest &request)
+        {
+            if (!request.tool_choice.permitsCalls() || !request.tools.is_array() || request.tools.empty())
+                return {};
+            // Requests built without the HTTP parser carry only the unordered
+            // view; that view is then the only available order.
+            const nlohmann::ordered_json tools =
+                request.tools_ordered.is_array() && request.tools_ordered.size() == request.tools.size()
+                    ? request.tools_ordered : nlohmann::ordered_json::parse(request.tools.dump());
+            if (request.tool_choice.mode != ToolChoiceMode::SpecificFunction)
+                return tools.dump();
+            for (const auto &tool : tools)
+                if (tool["function"]["name"].get<std::string>() == request.tool_choice.function_name)
+                    return nlohmann::ordered_json::array({tool}).dump();
+            return {};
+        }
+
+        /**
          * @brief Materialize the model-visible tool requirement once.
          *
          * The OpenAI policy is request state, not a sampling hint.  Templates
@@ -463,12 +486,27 @@ namespace llaminar2
                  messages.front().role == "developer"))
             {
                 messages.front().content += "\n\n" + directive;
+                // Part-list content renders from its parts; the directive is a
+                // trailing paragraph either way.
+                if (!messages.front().content_parts.empty())
+                    messages.front().content_parts.push_back(directive);
             }
             else
             {
                 messages.insert(messages.begin(), ChatMessage{"system", directive});
             }
             return messages;
+        }
+
+        /**
+         * @brief Prompt tokens served from the prefix cache (OpenAI usage.prompt_tokens_details.cached_tokens).
+         * @param summary Terminal request counters published after the result.
+         * @return Matched prefix tokens, zero when the cache is disabled or bypassed.
+         */
+        std::uint64_t cachedPromptTokens(const RequestRuntimeSummary &summary)
+        {
+            const auto &prefix = summary.prefix_request;
+            return prefix.enabled && !prefix.bypassed ? prefix.matched_tokens : 0;
         }
 
         /** @brief Whether this request may turn native markers into executable calls. */
@@ -633,9 +671,13 @@ namespace llaminar2
         ChatCompletionResponse &error_out)
     {
         json body;
+        // Key order is visible prompt text (tool schemas, tool-call
+        // arguments); keep an order-preserving view for everything rendered.
+        nlohmann::ordered_json ordered_body;
         try
         {
             body = json::parse(json_body);
+            ordered_body = nlohmann::ordered_json::parse(json_body);
         }
         catch (const json::parse_error &e)
         {
@@ -670,14 +712,45 @@ namespace llaminar2
 
             std::string role = msg["role"].get<std::string>();
 
-            if (msg.contains("reasoning_content") && !msg["reasoning_content"].is_null() &&
-                !msg["reasoning_content"].is_string())
+            for (const char *field : {"reasoning_content", "reasoning"})
+                if (msg.contains(field) && !msg[field].is_null() && !msg[field].is_string())
+                {
+                    error_out.http_status = 400;
+                    error_out.json_body = dumpJsonForHttp({{"error", {
+                        {"message", std::string("message ") + field + " must be a string or null"},
+                        {"type", "invalid_request_error"}}}});
+                    return std::nullopt;
+                }
+            // Content is a string, null, or an array of OpenAI text parts.
+            // No Llaminar model has a vision tower yet: an image is rejected
+            // here rather than silently dropped from the prompt.
+            if (msg.contains("content") && !msg["content"].is_null() && !msg["content"].is_string())
             {
-                error_out.http_status = 400;
-                error_out.json_body = dumpJsonForHttp({{"error", {
-                    {"message", "message reasoning_content must be a string or null"},
-                    {"type", "invalid_request_error"}}}});
-                return std::nullopt;
+                bool valid = msg["content"].is_array();
+                std::string problem = "message content must be a string, null or an array of text parts";
+                if (valid)
+                    for (const auto &part : msg["content"])
+                    {
+                        const std::string type = part.is_object() ? part.value("type", "") : "";
+                        if (type == "image_url" || type == "image" || type == "input_image")
+                        {
+                            valid = false;
+                            problem = "image content parts are not supported by this server";
+                            break;
+                        }
+                        if (type != "text" || !part.contains("text") || !part["text"].is_string())
+                        {
+                            valid = false;
+                            break;
+                        }
+                    }
+                if (!valid)
+                {
+                    error_out.http_status = 400;
+                    error_out.json_body = dumpJsonForHttp({{"error", {
+                        {"message", problem}, {"type", "invalid_request_error"}, {"param", "messages"}}}});
+                    return std::nullopt;
+                }
             }
 
             // Assistant messages with tool_calls may have null/missing content
@@ -746,7 +819,10 @@ namespace llaminar2
         // Official Qwen examples place this option inside chat_template_kwargs.
         // Both accepted spellings feed one request mode, so sampling, rendering
         // and reasoning extraction cannot disagree about the selected policy.
+        // DeepSeek-V4 clients spell the same switch chat_template_kwargs.thinking.
         const json *nested_thinking = nullptr;
+        const json *nested_alias = nullptr;
+        const json *nested_effort = nullptr;
         if (body.contains("chat_template_kwargs"))
         {
             const auto &kwargs = body["chat_template_kwargs"];
@@ -759,20 +835,49 @@ namespace llaminar2
                 return std::nullopt;
             }
             if (kwargs.contains("enable_thinking")) nested_thinking = &kwargs["enable_thinking"];
+            if (kwargs.contains("thinking")) nested_alias = &kwargs["thinking"];
+            if (kwargs.contains("reasoning_effort")) nested_effort = &kwargs["reasoning_effort"];
         }
         const json *top_thinking = body.contains("enable_thinking") ? &body["enable_thinking"] : nullptr;
-        if ((top_thinking && !top_thinking->is_boolean()) ||
-            (nested_thinking && !nested_thinking->is_boolean()) ||
-            (top_thinking && nested_thinking && *top_thinking != *nested_thinking))
+        std::optional<bool> thinking_choice;
+        for (const json *choice : {top_thinking, nested_thinking, nested_alias})
         {
-            error_out.http_status = 400;
-            error_out.json_body = dumpJsonForHttp({{"error", {
-                {"message", "enable_thinking must be boolean and agree with chat_template_kwargs.enable_thinking"},
-                {"type", "invalid_request_error"}}}});
-            return std::nullopt;
+            if (!choice) continue;
+            if (!choice->is_boolean() || (thinking_choice && *thinking_choice != choice->get<bool>()))
+            {
+                error_out.http_status = 400;
+                error_out.json_body = dumpJsonForHttp({{"error", {
+                    {"message", "enable_thinking, chat_template_kwargs.enable_thinking and "
+                                "chat_template_kwargs.thinking must be boolean and agree"},
+                    {"type", "invalid_request_error"}}}});
+                return std::nullopt;
+            }
+            thinking_choice = choice->get<bool>();
         }
-        if (top_thinking) request.enable_thinking = top_thinking->get<bool>();
-        else if (nested_thinking) request.enable_thinking = nested_thinking->get<bool>();
+        request.enable_thinking = thinking_choice;
+
+        const json *top_effort = body.contains("reasoning_effort") && !body["reasoning_effort"].is_null()
+                                     ? &body["reasoning_effort"] : nullptr;
+        if (nested_effort && nested_effort->is_null()) nested_effort = nullptr;
+        for (const json *effort : {top_effort, nested_effort})
+        {
+            if (!effort) continue;
+            static const std::array<const char *, 7> kEfforts = {"none", "minimal", "low", "medium", "high",
+                                                                  "xhigh", "max"};
+            const bool known = effort->is_string() &&
+                std::any_of(kEfforts.begin(), kEfforts.end(),
+                            [&](const char *value) { return effort->get<std::string>() == value; });
+            if (!known || (request.reasoning_effort && *request.reasoning_effort != effort->get<std::string>()))
+            {
+                error_out.http_status = 400;
+                error_out.json_body = dumpJsonForHttp({{"error", {
+                    {"message", "reasoning_effort must be one of none, minimal, low, medium, high, xhigh, max "
+                                "and agree with chat_template_kwargs.reasoning_effort"},
+                    {"type", "invalid_request_error"}, {"param", "reasoning_effort"}}}});
+                return std::nullopt;
+            }
+            request.reasoning_effort = effort->get<std::string>();
+        }
 
         if (body.contains("return_token_ids"))
         {
@@ -920,6 +1025,7 @@ namespace llaminar2
                 return std::nullopt;
             }
             request.tools = body["tools"];
+            request.tools_ordered = ordered_body["tools"];
             for (const auto &tool : request.tools)
             {
                 if (!tool.is_object() || tool.value("type", "") != "function" ||
@@ -1020,22 +1126,39 @@ namespace llaminar2
         }
 
         // Build conversation with full tool-calling support
-        for (const auto &msg : body["messages"])
+        for (const auto &msg : ordered_body["messages"])
         {
             ChatMessage cm;
             cm.role = msg["role"].get<std::string>();
 
-            // Content may be null or missing for assistant messages with tool_calls
-            if (msg.contains("content") && !msg["content"].is_null())
+            // Content may be null or missing for assistant messages with tool_calls.
+            // Text-part arrays keep their parts for native encoders; templates see
+            // them joined by "\n" (vLLM's string content format). Tool results
+            // are always flattened that way, exactly as vLLM normalizes them.
+            if (msg.contains("content") && msg["content"].is_string())
                 cm.content = msg["content"].get<std::string>();
+            else if (msg.contains("content") && msg["content"].is_array())
+            {
+                for (const auto &part : msg["content"])
+                    cm.content_parts.push_back(part["text"].get<std::string>());
+                for (std::size_t i = 0; i < cm.content_parts.size(); ++i)
+                    cm.content += (i ? "\n" : "") + cm.content_parts[i];
+                if (cm.role == "tool")
+                    cm.content_parts.clear();
+            }
 
             // Coding clients send the separate reasoning channel back with
             // assistant/tool-call history. Preserve it for the model template;
             // merging it into content would change role and tool boundaries.
-            if (msg.contains("reasoning_content") && !msg["reasoning_content"].is_null())
+            // "reasoning" is the current OpenAI spelling; it wins over the
+            // deprecated "reasoning_content" exactly as in vLLM's normalization.
+            if (msg.contains("reasoning") && msg["reasoning"].is_string())
+                cm.reasoning_content = msg["reasoning"].get<std::string>();
+            else if (msg.contains("reasoning_content") && msg["reasoning_content"].is_string())
                 cm.reasoning_content = msg["reasoning_content"].get<std::string>();
 
-            // Parse tool_calls from assistant messages (store as serialized JSON strings)
+            // Parse tool_calls from assistant messages (store as serialized JSON
+            // strings, preserving the client's member order).
             if (msg.contains("tool_calls") && msg["tool_calls"].is_array())
             {
                 for (const auto &tc : msg["tool_calls"])
@@ -1062,6 +1185,10 @@ namespace llaminar2
 
     bool ChatCompletionHandler::thinkingEnabled(const ChatCompletionRequest &request) const
     {
+        // reasoning_effort "none" is the OpenAI spelling of "no thinking"; it
+        // governs sampling defaults and output framing as well as the prompt.
+        if (request.reasoning_effort && *request.reasoning_effort == "none")
+            return false;
         return request.enable_thinking.value_or(
             runner_.getDefaultThinkingMode() == ThinkingMode::Enabled);
     }
@@ -1144,13 +1271,27 @@ namespace llaminar2
         runner_.setStopTokens(tokenizer_.stop_tokens());
 
         // Encode with chat template (pass tools for tool-aware templates)
-        const json admitted_tools = admittedToolDefinitions(request);
-        const std::string tools_json = admitted_tools.empty()
-                                           ? std::string{}
-                                           : admitted_tools.dump();
         const auto prompt_messages = toolPolicyMessages(request);
-        auto token_ids = tokenizer_.encodeChat(prompt_messages, /*add_generation_prompt=*/true,
-                                               tools_json, thinkingEnabled(request));
+        ChatEncodingOptions encoding;
+        encoding.add_generation_prompt = true;
+        encoding.enable_thinking = thinkingEnabled(request);
+        encoding.reasoning_effort = request.reasoning_effort;
+        encoding.tools_json = admittedToolDefinitionsOrdered(request);
+        std::vector<int> token_ids;
+        try
+        {
+            token_ids = tokenizer_.encodeChat(prompt_messages, encoding);
+        }
+        catch (const std::invalid_argument &error)
+        {
+            // The native encoder rejects inputs its reference rejects
+            // (malformed tool-call arguments, an empty developer message, ...).
+            error_out.http_status = 400;
+            error_out.json_body = dumpJsonForHttp({{"error", {
+                {"message", std::string("Cannot render conversation: ") + error.what()},
+                {"type", "invalid_request_error"}, {"param", "messages"}}}});
+            return -1;
+        }
 
         if (token_ids.empty())
         {
@@ -1535,7 +1676,8 @@ namespace llaminar2
             {"choices", json::array({json{{"index", 0},
                                           {"message", message},
                                           {"finish_reason", finish_reason}}})},
-            {"usage", {{"prompt_tokens", prompt_tokens}, {"completion_tokens", completion_tokens}, {"total_tokens", prompt_tokens + completion_tokens}, {"context_window", max_context}, {"context_used", prompt_tokens + completion_tokens}}}};
+            {"usage", {{"prompt_tokens", prompt_tokens}, {"completion_tokens", completion_tokens}, {"total_tokens", prompt_tokens + completion_tokens}, {"context_window", max_context}, {"context_used", prompt_tokens + completion_tokens},
+                       {"prompt_tokens_details", {{"cached_tokens", cachedPromptTokens(runtime_summary)}}}}}};
 
         if (request.token_output == CompletionTokenOutput::TextAndIds)
         {
@@ -2044,7 +2186,8 @@ namespace llaminar2
             (request.streaming_usage == StreamingUsageOutput::Omit ||
              emit_payload(json::array(), {{"prompt_tokens", prompt_tokens},
                  {"completion_tokens", completion_tokens},
-                 {"total_tokens", prompt_tokens + completion_tokens}})))
+                 {"total_tokens", prompt_tokens + completion_tokens},
+                 {"prompt_tokens_details", {{"cached_tokens", cachedPromptTokens(runtime_summary)}}}})))
             client_connected = chunk_cb("data: [DONE]\n\n");
 
         observation.complete(prompt_tokens, committed_tokens, runtime_summary,
