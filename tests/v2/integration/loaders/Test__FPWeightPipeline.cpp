@@ -109,7 +109,7 @@ TEST(Test__FPWeightPipeline, PlanRawWeight_MixedWithQuantized)
     WeightVRAMPool pool;
     // Plan a quantized weight
     pool.planWeight("q4_weight", 512, 1024, 16, /*is_asymmetric=*/false,
-                    /*has_emins=*/false, /*raw_gguf_bytes=*/262144);
+                    /*has_emins=*/false, NativeVnniScalePlaneWidth::FP16Word, /*raw_gguf_bytes=*/262144);
     // Plan a raw FP weight
     pool.planRawWeight("fp16_weight", 512, 1024, 512 * 1024 * 2);
 
@@ -158,7 +158,7 @@ TEST(Test__FPWeightPipeline, Orchestrator_MixedPlanQuantizedAndRaw)
     LoadOrchestrator orch(nullptr, kTestOnlyUnadmittedGPUAllocation);
     orch.addDevice(0);
 
-    orch.planWeight(0, "q4_w", 512, 1024, 16, false, false, 262144);
+    orch.planWeight(0, "q4_w", 512, 1024, 16, false, false, NativeVnniScalePlaneWidth::FP16Word, 262144);
     orch.planRawWeight(0, "fp16_w", 512, 1024, 512 * 1024 * 2);
 
     auto *pool = orch.getPool(0);
@@ -346,7 +346,7 @@ TEST_F(Test__FPDeviceLoadPipeline, RAW_FP_MixedWithQuantized)
 
     // Setup pool with mixed plan
     WeightVRAMPool pool;
-    pool.planWeight("q4_weight", N, K, 16, false, false, q4_raw_bytes);
+    pool.planWeight("q4_weight", N, K, 16, false, false, NativeVnniScalePlaneWidth::FP16Word, q4_raw_bytes);
     pool.planRawWeight("fp_weight", N, K, fp_raw_bytes);
     ASSERT_TRUE(pool.allocate(backend_, 0, num_streams));
 

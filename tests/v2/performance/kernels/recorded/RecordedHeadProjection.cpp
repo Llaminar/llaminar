@@ -83,7 +83,7 @@ void planWeight(LoadOrchestrator &pool,const Request &r,DeviceId device)
     pool.addDevice(device.ordinal);
     const auto &f=native_vnni_formats::Q8_0;
     pool.planWeightForOwner(device.ordinal,r.source_tensor,r.n,r.k,f.payload_bytes,
-        canonicalDeviceVnniFormat(f).is_asymmetric,f.has_emins,std::size_t(r.n)*(r.k/32)*34,
+        canonicalDeviceVnniFormat(f).is_asymmetric,f.has_emins, NativeVnniScalePlaneWidth::FP16Word,std::size_t(r.n)*(r.k/32)*34,
         PhysicalMemoryOwner::PrimaryModelWeights);
 }
 /**

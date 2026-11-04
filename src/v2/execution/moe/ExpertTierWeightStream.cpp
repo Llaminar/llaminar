@@ -1007,7 +1007,7 @@ namespace llaminar2
         const size_t blocks =
             static_cast<size_t>(N) * static_cast<size_t>(blocks_per_row);
         if (payload.size() != blocks * payload_bytes_per_block ||
-            scales.size() != blocks ||
+            scales.size() != nativeVnniScalePlaneStorageWords(codebook_id, blocks) ||
             mins.size() != (is_asymmetric ? blocks : 0) ||
             emins.size() != (has_emins ? blocks : 0))
         {
@@ -1301,7 +1301,7 @@ namespace llaminar2
         const size_t block_count =
             static_cast<size_t>(output.N) * output.blocks_per_row;
         output.payload.resize(block_count * payload_bytes);
-        output.scales.resize(block_count);
+        output.scales.assign(nativeVnniScalePlaneStorageWords(output.codebook_id, block_count), uint16_t{0});
         if (gpu_asym)
             output.mins.resize(block_count);
         if (gpu_emins)
@@ -1395,12 +1395,15 @@ namespace llaminar2
                             cpu.native_interleaved[
                                 interleavedValueOffset(cpu, n, kb, value)];
                     }
+                    uint16_t cpu_scale_word = 0;
                     std::memcpy(
-                        &output.scales[linear],
+                        &cpu_scale_word,
                         cpu.native_interleaved.data() +
                             unit + cpu.data_stride + 128u +
                             static_cast<size_t>(n % 64) * sizeof(uint16_t),
                         sizeof(uint16_t));
+                    if (!output.setScaleWord(linear, cpu_scale_word))
+                        return reject(error, "CPU unit scale word is not an admitted native E8M0 power of two");
                     if (cpu.is_asymmetric)
                     {
                         std::memcpy(
@@ -1557,11 +1560,12 @@ namespace llaminar2
                             static_cast<size_t>(local_column) * sizeof(int16_t),
                         &compensation,
                         sizeof(compensation));
+                    const uint16_t cpu_scale_word = gpu.scaleWord(linear);
                     std::memcpy(
                         output.native_interleaved.data() +
                             unit + output.data_stride + 128u +
                             static_cast<size_t>(local_column) * sizeof(uint16_t),
-                        &gpu.scales[linear],
+                        &cpu_scale_word,
                         sizeof(uint16_t));
                     if (output.is_asymmetric || output.usesNibbleLUTSourceScale())
                     {

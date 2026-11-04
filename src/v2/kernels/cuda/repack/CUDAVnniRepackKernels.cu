@@ -16,6 +16,7 @@
  */
 
 #include "tensors/MXFP4Format.h"
+#include "tensors/NativeVnniScalePlane.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdio>
@@ -223,12 +224,14 @@ __global__ void cuda_repack_q4_0_to_vnni(
 // ============================================================================
 
 /**
- * @brief Keep MXFP4 code bytes verbatim and publish the exact FP16 block scale.
+ * @brief Keep MXFP4 code bytes verbatim and publish the native E8M0 scale byte.
  *
  * Source blocks are 17 bytes, so they are read bytewise (no 4-byte alignment).
- * The host reader has already rejected any nonzero block without an exact FP16
- * scale (mxfp4::blockFitsFP16), so preparedScaleFP16Bits() is exact here; an
- * all-zero block with an unrepresentable exponent publishes scale +0.
+ * The primary plane is one byte per block (nativeVnniScalePlaneBytes(25) == 1),
+ * addressed through the byte view of @p d_scales. The host reader has already
+ * rejected any nonzero block outside the native range [2, 252]
+ * (mxfp4::blockFitsNativeE8M0); an all-zero block with an unadmitted exponent
+ * publishes the zero marker 0.
  */
 __global__ void cuda_repack_mxfp4_to_vnni(
     const uint8_t* __restrict__ d_raw,
@@ -247,7 +250,8 @@ __global__ void cuda_repack_mxfp4_to_vnni(
 #pragma unroll
     for (int i = 0; i < 16; ++i)
         out[i] = blk[1 + i];
-    d_scales[linear] = llaminar2::mxfp4::preparedScaleFP16Bits(blk[0]);
+    static_assert(llaminar2::nativeVnniScalePlaneBytes(llaminar2::kNativeVnniMXFP4Codebook) == 1);
+    reinterpret_cast<uint8_t*>(d_scales)[linear] = llaminar2::mxfp4::preparedNativeE8M0Byte(blk[0]);
 }
 
 // ============================================================================

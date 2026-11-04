@@ -148,7 +148,8 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeV
                     .blocks_per_row=(source_k+31)/32,.payload_bytes=format.payload_bytes,
                     .payload_array=payload,.scales_array=primary,.mins_array=secondary,
                     .emins_array=out.usesCompactMultiScale()?emins:nullptr,
-                    .destination_block_origin=input_first,.destination_block_count=count};
+                    .destination_block_origin=input_first,.destination_block_count=count,
+                    .primary_layout=out.primaryScaleLayout()};
                 for(int b=0;b<count;++b) {
                     source.packVnniBlock(context,actual_row,0,input_first+b);
                     if(expanded)decode_native_block(format.codebook_id,payload+size_t(b)*format.payload_bytes,decoded+b*32);
@@ -197,9 +198,9 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeV
                     if(out.usesNibbleLUTSourceScale() || out.usesIQ3SExpandedSourceScale()) {
                         scale=primary[b];minimum=secondary[b];
                     } else if(nibble && format.codebook_id==kNativeVnniMXFP4Codebook) {
-                        // packVnniBlock already validated the block and published its exact
-                        // prepared FP16 scale (+0 for ggml all-zero blocks). Re-rounding the
-                        // FP32 source scale would turn e > 143 zero blocks into +inf.
+                        // packVnniBlock already validated the block and published the unit's
+                        // exact scale word (BF16 power of two, out.primaryScaleLayout(); 0 for
+                        // ggml all-zero blocks). Re-rounding the FP32 source scale would be lossy.
                         scale=primary[b];
                     } else if(nibble) {
                         scale=fp32_to_fp16(source.get_block_scale(actual_row,input_first+b));

@@ -208,7 +208,8 @@ namespace llaminar2
 
             // Allocate output buffers
             out.native_vnni_payload.resize(static_cast<size_t>(blocks_per_row) * N * payload_bytes);
-            out.native_vnni_scales.resize(static_cast<size_t>(blocks_per_row) * N);
+            out.native_vnni_scales.resize(nativeVnniScalePlaneStorageWords(
+                physical.codebook_id, static_cast<size_t>(blocks_per_row) * N));
             if (has_secondary)
                 out.native_vnni_mins.resize(static_cast<size_t>(blocks_per_row) * N);
             if (info->has_emins)
@@ -257,6 +258,7 @@ namespace llaminar2
             ctx.scales_array = out.native_vnni_scales.data();
             ctx.mins_array = has_secondary ? out.native_vnni_mins.data() : nullptr;
             ctx.emins_array = info->has_emins ? out.native_vnni_emins.data() : nullptr;
+            ctx.primary_layout = gpuPrimaryScaleLayout(physical.codebook_id);
 
             // Main packing loop — dispatches to per-format virtual method
 #pragma omp parallel for schedule(static)
@@ -597,9 +599,12 @@ namespace llaminar2
         batch->codebook_id = physical.codebook_id;
 
         batch->vnni_bytes_per_expert = static_cast<size_t>(blocks_per_row) * rows_per_expert * info->payload_bytes;
-        batch->scales_per_expert = static_cast<size_t>(blocks_per_row) * rows_per_expert;
-        batch->mins_per_expert = physical.is_asymmetric ? batch->scales_per_expert : 0;
-        batch->emins_per_expert = info->has_emins ? batch->scales_per_expert : 0;
+        // Strides are in elements of each plane's storage type; the primary
+        // plane may be narrower than the per-block secondary/emin planes.
+        const size_t blocks_per_expert = static_cast<size_t>(blocks_per_row) * rows_per_expert;
+        batch->scales_per_expert = nativeVnniScalePlaneStorageWords(physical.codebook_id, blocks_per_expert);
+        batch->mins_per_expert = physical.is_asymmetric ? blocks_per_expert : 0;
+        batch->emins_per_expert = info->has_emins ? blocks_per_expert : 0;
 
         batch->all_native_vnni.assign(static_cast<size_t>(num_experts) * batch->vnni_bytes_per_expert, uint8_t{0});
         batch->all_native_scales.assign(static_cast<size_t>(num_experts) * batch->scales_per_expert, uint16_t{0});
@@ -631,6 +636,7 @@ namespace llaminar2
             ctx.emins_array = info->has_emins
                                   ? batch->all_native_emins.data() + e * batch->emins_per_expert
                                   : nullptr;
+            ctx.primary_layout = gpuPrimaryScaleLayout(physical.codebook_id);
 
 #pragma omp parallel for schedule(static)
             for (int n = 0; n < rows_per_expert; ++n)

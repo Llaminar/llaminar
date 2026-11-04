@@ -228,7 +228,7 @@ namespace llaminar2
         orch.addDevice(0);
 
         orch.planWeight(0, "attn_q", 1024, 1024, kQ4PayloadBytes,
-                        false, false, 524288);
+                        false, false, NativeVnniScalePlaneWidth::FP16Word, 524288);
 
         auto *pool = orch.getPool(0);
         ASSERT_NE(pool, nullptr);
@@ -265,9 +265,9 @@ namespace llaminar2
         orch.addDevice(1);
 
         orch.planWeight(0, "w_dev0", 512, 1024, kQ4PayloadBytes,
-                        false, false, 262144);
+                        false, false, NativeVnniScalePlaneWidth::FP16Word, 262144);
         orch.planWeight(1, "w_dev1", 256, 512, kQ4PayloadBytes,
-                        true, false, 131072);
+                        true, false, NativeVnniScalePlaneWidth::FP16Word, 131072);
 
         auto *pool0 = orch.getPool(0);
         auto *pool1 = orch.getPool(1);
@@ -285,7 +285,7 @@ namespace llaminar2
     {
         LoadOrchestrator orch;
         orch.addDevice(0);
-        orch.planWeight(0, "w1", 64, 64, kQ4PayloadBytes, false, false, 1024);
+        orch.planWeight(0, "w1", 64, 64, kQ4PayloadBytes, false, false, NativeVnniScalePlaneWidth::FP16Word, 1024);
 
         ASSERT_NO_THROW(orch.allocate(1024, 3));
 
@@ -1144,7 +1144,7 @@ namespace llaminar2
         orch.addDevice(0);
 
         EXPECT_THROW(
-            orch.planWeight(99, "w", 64, 64, kQ4PayloadBytes, false, false, 1024),
+            orch.planWeight(99, "w", 64, 64, kQ4PayloadBytes, false, false, NativeVnniScalePlaneWidth::FP16Word, 1024),
             std::runtime_error);
     }
 

@@ -92,7 +92,8 @@ namespace llaminar2
                 if (format)
                     pool.planWeightForOwner(device.gpu_ordinal(), inputs[i]->tensor_name,
                         matrix.n, matrix.k, format->payload_bytes, canonicalDeviceVnniFormat(*format).is_asymmetric,
-                        format->has_emins, matrix.source_bytes, kWeightOwner);
+                        format->has_emins, nativeVnniScalePlaneWidth(canonicalDeviceVnniCodebookId(*format)),
+                        matrix.source_bytes, kWeightOwner);
                 else if (description.formats[i] == "F32" || description.formats[i] == "F16" ||
                          description.formats[i] == "BF16")
                     pool.planRawWeightForOwner(device.gpu_ordinal(), inputs[i]->tensor_name,

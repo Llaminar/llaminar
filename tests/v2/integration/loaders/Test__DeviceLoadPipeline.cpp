@@ -534,7 +534,7 @@ TEST_F(Test__DeviceLoadPipeline, Q4_0_SingleWeight)
 
     // Setup pool
     WeightVRAMPool pool;
-    pool.planWeight("test_q4_0", N, K, 16, false, false, raw_bytes);
+    pool.planWeight("test_q4_0", N, K, 16, false, false, NativeVnniScalePlaneWidth::FP16Word, raw_bytes);
     ASSERT_TRUE(pool.allocate(backend_, 0, num_streams));
 
     // Setup pinned ring
@@ -583,7 +583,7 @@ TEST_F(Test__DeviceLoadPipeline, Q4_0_RowChunkedWeightMatchesUnchunkedLayout)
 
     LoadOrchestrator orch(backend_, kTestOnlyUnadmittedGPUAllocation);
     orch.addDevice(0);
-    orch.planWeight(0, "chunked_q4_0", N, K, 16, false, false, raw_bytes);
+    orch.planWeight(0, "chunked_q4_0", N, K, 16, false, false, NativeVnniScalePlaneWidth::FP16Word, raw_bytes);
     orch.allocate(/*pinned_slot_size=*/16 * raw_bytes_per_row,
                   /*num_h2d_streams=*/2);
 
@@ -624,7 +624,7 @@ TEST_F(Test__DeviceLoadPipeline, Q4_K_RowChunkedWeightMatchesUnchunkedLayout)
 
     LoadOrchestrator orch(backend_, kTestOnlyUnadmittedGPUAllocation);
     orch.addDevice(0);
-    orch.planWeight(0, "chunked_q4_k", N, K, 16, true, false, raw_bytes);
+    orch.planWeight(0, "chunked_q4_k", N, K, 16, true, false, NativeVnniScalePlaneWidth::FP16Word, raw_bytes);
     orch.allocate(/*pinned_slot_size=*/raw_bytes_per_superblock_column,
                   /*num_h2d_streams=*/2);
 
@@ -671,7 +671,7 @@ TEST(Test__DeviceLoadPipelineCUDA, Q4_0_RowChunkedWeightMatchesUnchunkedLayout)
 
     LoadOrchestrator orch(backend, kTestOnlyUnadmittedGPUAllocation);
     orch.addDevice(0);
-    orch.planWeight(0, "cuda_chunked_q4_0", N, K, 16, false, false, raw_bytes);
+    orch.planWeight(0, "cuda_chunked_q4_0", N, K, 16, false, false, NativeVnniScalePlaneWidth::FP16Word, raw_bytes);
     orch.allocate(raw_bytes_per_block_column, 2);
 
     WeightJob job;
@@ -747,7 +747,7 @@ namespace
 
         LoadOrchestrator orch(backend, kTestOnlyUnadmittedGPUAllocation);
         orch.addDevice(0);
-        orch.planWeight(0, "mxfp4_rows", N, K, 16, false, false, host.size());
+        orch.planWeight(0, "mxfp4_rows", N, K, 16, false, false, NativeVnniScalePlaneWidth::E8M0Byte, host.size());
         // 16-row staging slots: five chunks, the last one a 3-row tail.
         orch.allocate(16 * row_bytes, 2);
 
@@ -798,7 +798,7 @@ namespace
         ASSERT_FALSE(mxfp4::blockFitsFP16(host[5 * mxfp4::kSourceBlockBytes],
                                           host.data() + 5 * mxfp4::kSourceBlockBytes + 1));
         WeightVRAMPool pool;
-        pool.planWeight("mxfp4_inexact", N, K, 16, false, false, host.size());
+        pool.planWeight("mxfp4_inexact", N, K, 16, false, false, NativeVnniScalePlaneWidth::E8M0Byte, host.size());
         ASSERT_TRUE(pool.allocate(backend, 0, 1));
         PinnedRingBuffer pinned(host.size(), 1);
         ASSERT_TRUE(pinned.allocate(backend, 0));
@@ -866,7 +866,7 @@ TEST_F(Test__DeviceLoadPipeline, Q4_K_SingleWeight)
     fill_q4k_blocks(host_blocks.data(), total_superblocks);
 
     WeightVRAMPool pool;
-    pool.planWeight("test_q4k", N, K, 16, true, false, raw_bytes);
+    pool.planWeight("test_q4k", N, K, 16, true, false, NativeVnniScalePlaneWidth::FP16Word, raw_bytes);
     ASSERT_TRUE(pool.allocate(backend_, 0, num_streams));
 
     PinnedRingBuffer pinned(raw_bytes, num_streams);
@@ -952,7 +952,7 @@ TEST_F(Test__DeviceLoadPipeline, MultipleWeights)
         }
 
         max_raw = std::max(max_raw, raw_bytes);
-        pool.planWeight(s.name, s.N, s.K, 16, s.is_asymmetric, false, raw_bytes);
+        pool.planWeight(s.name, s.N, s.K, 16, s.is_asymmetric, false, NativeVnniScalePlaneWidth::FP16Word, raw_bytes);
     }
 
     ASSERT_TRUE(pool.allocate(backend_, 0, num_streams));
@@ -1048,7 +1048,7 @@ TEST_F(Test__DeviceLoadPipeline, MultipleWeightsExercisesAllStreams)
         }
 
         std::string name = "w_" + std::to_string(w);
-        pool.planWeight(name, N, K, 16, false, false, raw_bytes);
+        pool.planWeight(name, N, K, 16, false, false, NativeVnniScalePlaneWidth::FP16Word, raw_bytes);
     }
 
     ASSERT_TRUE(pool.allocate(backend_, 0, num_streams));
@@ -1122,8 +1122,8 @@ TEST_F(Test__DeviceLoadPipeline, LoadOrchestratorEndToEnd)
     LoadOrchestrator orch(backend_, kTestOnlyUnadmittedGPUAllocation);
     orch.addDevice(0);
 
-    orch.planWeight(0, "w_q4_0", N, K, 16, false, false, raw_bytes);
-    orch.planWeight(0, "w_q4k", N2, K2, 16, true, false, raw_bytes2);
+    orch.planWeight(0, "w_q4_0", N, K, 16, false, false, NativeVnniScalePlaneWidth::FP16Word, raw_bytes);
+    orch.planWeight(0, "w_q4k", N2, K2, 16, true, false, NativeVnniScalePlaneWidth::FP16Word, raw_bytes2);
 
     ASSERT_NO_THROW(orch.allocate(max_raw, 3));
 
@@ -1176,7 +1176,7 @@ TEST_F(Test__DeviceLoadPipeline, EmptyJobsSucceeds)
 {
 #ifdef HAVE_ROCM
     WeightVRAMPool pool;
-    pool.planWeight("dummy", 64, 128, 16, false, false, 1024);
+    pool.planWeight("dummy", 64, 128, 16, false, false, NativeVnniScalePlaneWidth::FP16Word, 1024);
     ASSERT_TRUE(pool.allocate(backend_, 0, 3));
 
     PinnedRingBuffer pinned(1024, 3);

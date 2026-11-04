@@ -89,7 +89,9 @@ namespace llaminar2
     struct MoEOverlayRemoteProjectionManifest
     {
         static constexpr std::uint32_t kMagic = 0x50524F4Du; // "MORP"
-        static constexpr std::uint16_t kABIVersion = 4u;
+        // ABI 5: codebook-25 (MXFP4) CPU units carry BF16 power-of-two scale
+        // words and GPU planes native E8M0 bytes (#26).
+        static constexpr std::uint16_t kABIVersion = 5u;
         static constexpr std::size_t kWireBytes = 244u;
 
         std::uint32_t magic = kMagic;

@@ -23,6 +23,14 @@
  */
 #pragma once
 
+// Device qualifiers (__host__, __device__, __forceinline__) come from the
+// backend runtime header; include it so this header is self-contained.
+#if defined(__HIPCC__)
+#include <hip/hip_runtime.h>
+#elif defined(__CUDACC__)
+#include <cuda_runtime.h>
+#endif
+
 #include <cstdint>
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
@@ -136,6 +144,29 @@ namespace llaminar2::mxfp4
     LLAMINAR_MXFP4_HD constexpr uint32_t normalScaleFP32Bits(uint8_t e) noexcept
     {
         return static_cast<uint32_t>(e - 1u) << 23;
+    }
+
+    /**
+     * @brief Whether a block is admitted by the native E8M0 plane.
+     * @param e E8M0 exponent byte.
+     * @param qs Sixteen code bytes of the same block.
+     * @return True for e in [2, 252], or for an all-zero block (ggml writes
+     *         e = 0 for those) whose scale is irrelevant.
+     */
+    LLAMINAR_MXFP4_HD constexpr bool blockFitsNativeE8M0(uint8_t e, const uint8_t *qs) noexcept
+    {
+        return exponentFitsNativeE8M0(e) || codesAllZero(qs);
+    }
+
+    /**
+     * @brief Byte stored in the native E8M0 plane for a block accepted by blockFitsNativeE8M0().
+     * @param e E8M0 exponent byte.
+     * @return @p e when admitted, otherwise 0, the zero marker (only reachable
+     *         for all-zero blocks).
+     */
+    LLAMINAR_MXFP4_HD constexpr uint8_t preparedNativeE8M0Byte(uint8_t e) noexcept
+    {
+        return exponentFitsNativeE8M0(e) ? e : uint8_t{0};
     }
 
     /**

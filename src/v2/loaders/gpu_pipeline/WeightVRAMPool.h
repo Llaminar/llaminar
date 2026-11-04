@@ -13,6 +13,8 @@
  * shared pointers while prepared device weights remain registered.
  */
 
+#include "tensors/NativeVnniScalePlane.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -64,6 +66,8 @@ namespace llaminar2
 
         /**
          * @brief Plan a packed weight and optional mutually exclusive raw view.
+         * @param scale_plane Primary scale-plane capacity (nativeVnniScalePlaneWidth of the
+         *        physical codebook, or the widest plane a shared slot must hold).
          * @param alias Contiguous capacity beginning at the payload address.
          * Native planes retain their offsets. The allocator alone extends the
          * region when the raw view is larger; callers never reproduce alignment
@@ -71,6 +75,7 @@ namespace llaminar2
          */
         void planWeight(const std::string &name, int N, int K,
                         int payload_bytes_per_block, bool is_asymmetric, bool has_emins,
+                        NativeVnniScalePlaneWidth scale_plane,
                         size_t raw_gguf_bytes, ContiguousAlias alias = {0});
 
         /// Phase 1 (raw): Plan a floating-point weight that needs no repack.

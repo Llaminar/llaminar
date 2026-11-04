@@ -26,6 +26,14 @@
  */
 #pragma once
 
+// Device qualifiers (__host__, __device__, __forceinline__) come from the
+// backend runtime header; include it so this header is self-contained.
+#if defined(__HIPCC__)
+#include <hip/hip_runtime.h>
+#elif defined(__CUDACC__)
+#include <cuda_runtime.h>
+#endif
+
 #include "tensors/MXFP4Format.h"
 #include "tensors/NativeVnniScalePlane.h"
 
@@ -131,6 +139,31 @@ namespace llaminar2::native_vnni_scale
     LLAMINAR_NVNNI_SCALE_HD float stagedNativeScale(std::uint16_t staged)
     {
         return floatFromBits(std::uint32_t{staged} << 16);
+    }
+
+    /**
+     * @brief Store a CPU-unit scale word into the GPU plane (tier CPU -> GPU inverse).
+     * @param codebook Physical execution codebook of the destination plane.
+     * @param plane Destination primary plane base address.
+     * @param linear Block-major linear block index.
+     * @param cpu_word CPU unit word: FP16 for 2-byte planes, otherwise
+     *        mxfp4::powerOfTwoBF16Word (the staged word of a 1-byte plane).
+     * @return False when a 1-byte plane receives a word that is not +0 or an
+     *         admitted power of two; nothing is stored then.
+     */
+    LLAMINAR_NVNNI_SCALE_HD bool storePrimaryFromCpuWord(
+        std::uint8_t codebook, std::uint16_t *plane, std::size_t linear, std::uint16_t cpu_word)
+    {
+        if (nativeVnniScalePlaneBytes(codebook) == 1)
+        {
+            std::uint8_t e = 0;
+            if (!mxfp4::e8m0FromPowerOfTwoBF16Word(cpu_word, e))
+                return false;
+            reinterpret_cast<std::uint8_t *>(plane)[linear] = e;
+            return true;
+        }
+        plane[linear] = cpu_word;
+        return true;
     }
 
     /** @brief Load and decode block @p linear directly from the global plane. */
