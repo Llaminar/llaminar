@@ -681,7 +681,7 @@ TEST(CPUNativeQuantisedFusedCompletion, OrderedNibbleSplitDotBoundaryLifecycle)
             }
         }
     }
-    EXPECT_EQ(nibble_sources, 5); // Original canonical Q4_0/Q4_1/Q4_K/IQ4_NL/IQ4_XS factories.
+    EXPECT_EQ(nibble_sources, 6); // Q4_0/Q4_1/Q4_K/IQ4_NL/IQ4_XS + MXFP4 (codebook 25, PR #38).
 }
 #endif // !defined(__aarch64__)
 

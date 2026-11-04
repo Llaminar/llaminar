@@ -975,7 +975,8 @@ namespace llaminar2::cpu::native_quantised
                 build_isa,
                 runtime_isa,
                 nativeQuantisedInvocationWorkerCount(),
-                packed.codebook_id,
+                // MXFP4 shares IQ4_NL's nibble-LUT encoding and therefore its schedule evidence.
+                nativeQuantisedPolicyCodebook(packed.codebook_id),
                 N,
                 K,
                 serial_kpart,
@@ -1170,7 +1171,7 @@ namespace llaminar2::cpu::native_quantised
                 build_isa,
                 runtime_isa,
                 threads,
-                packed.codebook_id,
+                nativeQuantisedPolicyCodebook(packed.codebook_id),
                 M,
                 N,
                 K,
@@ -1182,7 +1183,7 @@ namespace llaminar2::cpu::native_quantised
                 build_isa,
                 runtime_isa,
                 threads,
-                packed.codebook_id,
+                nativeQuantisedPolicyCodebook(packed.codebook_id),
                 M,
                 N,
                 K,
@@ -1275,6 +1276,9 @@ namespace llaminar2::cpu::native_quantised
     // Q4_1: nibble → nibble (unsigned identity [0..15])
     alignas(16) static constexpr int8_t Q4_1_DECODE_LUT[16] = {
         0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+    // MXFP4: nibble → doubled E2M1 value (mxfp4::kValues)
+    alignas(16) static constexpr int8_t MXFP4_DECODE_LUT[16] = {
+        0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
 
 #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
 
@@ -1293,12 +1297,17 @@ namespace llaminar2::cpu::native_quantised
         case 4: // IQ4_NL / IQ4_XS (both use kvalues_iq4nl LUT)
             lut_data = IQ4_NL_DECODE_LUT;
             break;
+        case kNativeQuantisedMXFP4Codebook:
+            lut_data = MXFP4_DECODE_LUT;
+            break;
         case 5: // Q4_1
             lut_data = Q4_1_DECODE_LUT;
             break;
-        default: // Q4_0 (codebook 0)
+        case 0: // Q4_0
             lut_data = Q4_0_DECODE_LUT;
             break;
+        default:
+            throw std::invalid_argument("NativeQuantised nibble LUT requested for a non-nibble codebook");
         }
         __m128i lut_128 = _mm_load_si128(reinterpret_cast<const __m128i *>(lut_data));
         return _mm512_broadcast_i32x4(lut_128);

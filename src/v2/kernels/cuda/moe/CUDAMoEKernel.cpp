@@ -947,6 +947,7 @@ namespace
         case 0:
         case 4:
         case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook:
+        case llaminar2::kNativeQuantisedMXFP4Codebook:
         case 5:
         case 6:
         case 7:

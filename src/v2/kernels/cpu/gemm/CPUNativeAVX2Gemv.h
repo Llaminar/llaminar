@@ -54,6 +54,9 @@ namespace llaminar2::cpu::native_quantised
         // Q4_1: nibble → [0..15] unsigned identity
         alignas(16) static constexpr int8_t Q4_1_DECODE_LUT[16] = {
             0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+        // MXFP4: nibble → doubled E2M1 value (mxfp4::kValues)
+        alignas(16) static constexpr int8_t MXFP4_DECODE_LUT[16] = {
+            0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
     } // namespace avx2_luts
 
     // =========================================================================
@@ -68,12 +71,17 @@ namespace llaminar2::cpu::native_quantised
         case 4: // IQ4_NL / IQ4_XS
             lut_data = avx2_luts::IQ4_NL_DECODE_LUT;
             break;
+        case kNativeQuantisedMXFP4Codebook:
+            lut_data = avx2_luts::MXFP4_DECODE_LUT;
+            break;
         case 5: // Q4_1
             lut_data = avx2_luts::Q4_1_DECODE_LUT;
             break;
-        default: // Q4_0 (codebook 0)
+        case 0: // Q4_0
             lut_data = avx2_luts::Q4_0_DECODE_LUT;
             break;
+        default:
+            throw std::invalid_argument("NativeQuantised AVX2 nibble LUT requested for a non-nibble codebook");
         }
         return isa::build_decode_lut_avx2(lut_data);
     }

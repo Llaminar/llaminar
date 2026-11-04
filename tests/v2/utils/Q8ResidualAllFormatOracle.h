@@ -12,6 +12,7 @@
 #include "QuantizedVerifierFormats.h"
 #include "kernels/common/DeviceNativeQuantisedMatrixDesc.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedDecode.h"
+#include "tensors/MXFP4Format.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #include <algorithm>
 #include <array>
@@ -229,6 +230,7 @@ cpuWeights(const cpu::native_quantised::CPUNativeQuantisedPackedWeights &p) {
             const int q = (byte >> (i < 16 ? 0 : 4)) & 15;
             value = p.codebook_id == 0   ? q - 8
                     : p.codebook_id == 5 ? q
+                    : p.codebook_id == kNativeQuantisedMXFP4Codebook ? mxfp4::kValues[q]
                                          : kvalues_iq4nl[q];
           } else
             value =
