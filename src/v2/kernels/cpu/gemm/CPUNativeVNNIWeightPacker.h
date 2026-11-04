@@ -35,6 +35,7 @@
 #pragma once
 
 #include "memory/CPUWeightStoragePlacement.h"
+#include "kernels/common/NativeVnniScaleLoad.h"
 #include "loaders/NativeWeightLoadStaging.h"
 
 #include <cstdint>
@@ -249,6 +250,9 @@ namespace llaminar2::cpu::native_vnni
         /// Physical prepared encoding consumed by serial and grouped kernels.
         CPUNativeVNNIEncoding encoding = CPUNativeVNNIEncoding::ExpandedInt8;
 
+        /// Interpretation of the primary scale words (see CPUNativeVNNIScaleEncoding).
+        CPUNativeVNNIScaleEncoding scale_encoding = CPUNativeVNNIScaleEncoding::FP16;
+
         /**
          * Arithmetic identity selected by the owner of this prepared matrix.
          * ExpertOverlay matrices use the cross-backend reduction and activation
@@ -373,8 +377,11 @@ namespace llaminar2::cpu::native_vnni
          */
         [[nodiscard]] inline __m512 loadScales512(const uint16_t *primary) const
         {
-            const __m512 base = _mm512_cvtph_ps(_mm256_load_si256(
-                reinterpret_cast<const __m256i *>(primary)));
+            const __m256i words = _mm256_load_si256(reinterpret_cast<const __m256i *>(primary));
+            // BF16 power-of-two words widen by placement alone (word << 16); never F16C.
+            const __m512 base = scale_encoding == CPUNativeVNNIScaleEncoding::PowerOfTwoBF16
+                ? _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(words), 16))
+                : _mm512_cvtph_ps(words);
             if (!usesNibbleLUTSourceScale() && !usesIQ3SExpandedSourceScale()) return base;
             const __m512i raw = _mm512_cvtepu16_epi32(_mm256_load_si256(
                 reinterpret_cast<const __m256i *>(primary + 64)));
@@ -396,8 +403,10 @@ namespace llaminar2::cpu::native_vnni
          */
         [[nodiscard]] inline __m256 loadScales256(const uint16_t *primary) const
         {
-            const __m256 base = _mm256_cvtph_ps(_mm_load_si128(
-                reinterpret_cast<const __m128i *>(primary)));
+            const __m128i words = _mm_load_si128(reinterpret_cast<const __m128i *>(primary));
+            const __m256 base = scale_encoding == CPUNativeVNNIScaleEncoding::PowerOfTwoBF16
+                ? _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(words), 16))
+                : _mm256_cvtph_ps(words);
             if (!usesNibbleLUTSourceScale() && !usesIQ3SExpandedSourceScale()) return base;
             const __m256i raw = _mm256_cvtepu16_epi32(_mm_load_si128(
                 reinterpret_cast<const __m128i *>(primary + 64)));
@@ -422,7 +431,10 @@ namespace llaminar2::cpu::native_vnni
          */
         inline float blockScale(int c, int kb, int n_local) const
         {
-            const float base = fp16_to_fp32(chunkScales(c, kb)[n_local]);
+            const uint16_t primary_word = chunkScales(c, kb)[n_local];
+            const float base = scale_encoding == CPUNativeVNNIScaleEncoding::PowerOfTwoBF16
+                ? native_vnni_scale::floatFromBits(uint32_t{primary_word} << 16)
+                : fp16_to_fp32(primary_word);
             if (usesIQ3SExpandedSourceScale())
             {
                 const auto word = chunkMins(c, kb)[n_local];
