@@ -135,6 +135,42 @@ namespace llaminar2::mxfp4
         return static_cast<uint32_t>(e - 1u) << 23;
     }
 
+    /**
+     * @brief CPU-unit word for a native E8M0 scale: a BF16 power of two.
+     * @param e Stored plane byte: 0 marks an all-zero block, otherwise
+     *        exponentFitsNativeE8M0(e).
+     * @return 0 for the zero marker, otherwise (e - 1) << 7.
+     *
+     * CPU units keep a 16-bit scale slot. Zero-extending this word and shifting
+     * it left by 16 gives exactly normalScaleFP32Bits(e), so SIMD widening needs
+     * no BF16 arithmetic and the word never goes through F16C.
+     */
+    LLAMINAR_MXFP4_HD constexpr uint16_t powerOfTwoBF16Word(uint8_t e) noexcept
+    {
+        return e == 0 ? uint16_t{0} : static_cast<uint16_t>((e - 1u) << 7);
+    }
+
+    /**
+     * @brief Recover the E8M0 plane byte from a CPU-unit BF16 power-of-two word.
+     * @param word Candidate word produced by powerOfTwoBF16Word().
+     * @param[out] e Plane byte (0 for the zero marker).
+     * @return False for any word that is not +0 or a positive normal power of two
+     *         with biased exponent 1..253 (e in [2, 254]).
+     */
+    LLAMINAR_MXFP4_HD constexpr bool e8m0FromPowerOfTwoBF16Word(uint16_t word, uint8_t &e) noexcept
+    {
+        if (word == 0)
+        {
+            e = 0;
+            return true;
+        }
+        const unsigned biased = word >> 7;
+        if ((word & 0x807fu) != 0 || biased < 1u || biased > 253u)
+            return false;
+        e = static_cast<uint8_t>(biased + 1u);
+        return true;
+    }
+
     /** @brief Exact FP32 block scale 2^(e - 128) for any exponent byte. */
     inline float scaleFP32(uint8_t e) noexcept
     {
@@ -159,6 +195,9 @@ namespace llaminar2::mxfp4
     static_assert(normalScaleFP32Bits(kMinNormalFP32Exponent) == 0x00800000u, "2^-126 is the smallest FP32 normal");
     static_assert(normalScaleFP32Bits(kMaxNativeE8M0Exponent) == 0x7e800000u, "2^126");
     static_assert(!exponentFitsNativeE8M0(1) && !exponentFitsNativeE8M0(255) && exponentFitsNativeE8M0(104));
+    static_assert((uint32_t{powerOfTwoBF16Word(128)} << 16) == normalScaleFP32Bits(128));
+    static_assert((uint32_t{powerOfTwoBF16Word(2)} << 16) == normalScaleFP32Bits(2));
+    static_assert((uint32_t{powerOfTwoBF16Word(254)} << 16) == normalScaleFP32Bits(254));
 } // namespace llaminar2::mxfp4
 
 #undef LLAMINAR_MXFP4_HD
