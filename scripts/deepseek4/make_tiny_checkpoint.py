@@ -52,6 +52,8 @@ def main():
     ap.add_argument("--ref", required=True, help="dir with real config.json + tokenizer files")
     ap.add_argument("--out", required=True)
     ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--moe-inter", type=int, default=128,
+                    help="expert width; use 256 so K-quant/IQ2 recipes (256-element super-blocks) apply to ffn_down")
     a = ap.parse_args()
     torch.manual_seed(a.seed)
 
@@ -61,7 +63,7 @@ def main():
         "hidden_size": D, "num_hidden_layers": L, "num_hash_layers": 3,
         "num_attention_heads": 4, "head_dim": 256, "qk_rope_head_dim": 64,
         "q_lora_rank": 128, "o_groups": 2, "o_lora_rank": 64,
-        "moe_intermediate_size": 128, "n_routed_experts": 16, "num_experts_per_tok": 6,
+        "moe_intermediate_size": a.moe_inter, "n_routed_experts": 16, "num_experts_per_tok": 6,
         "n_shared_experts": 1, "index_n_heads": 32, "index_head_dim": 128, "index_topk": 8,
         "sliding_window": 16, "num_nextn_predict_layers": 0,
         "compress_ratios": [0, 0, 4, 128, 4, 128],
