@@ -876,9 +876,12 @@ add_v2_test(V2_Integration_DeepSeekV4CompactKVContracts
 )
 if(HAVE_CUDA)
     # CUDA replay of the compact-KV kernels against the CPU bundle (byte-exact
-    # QAT/packing, bit-identical indexer scores, bounded-scratch selection).
+    # QAT/packing incl. subnormals under fast-math FTZ, bit-identical indexer
+    # scores, bounded-scratch selection) and the captured production stages
+    # (padded/zero live rows, frontier exactly once, reset/replay).
     add_executable(v2_test_deepseek4_cuda_kernels
-        integration/kernels/deepseek4/Test__DeepSeekV4CUDAKernels.cpp)
+        integration/kernels/deepseek4/Test__DeepSeekV4CUDAKernels.cpp
+        integration/kernels/deepseek4/Test__DeepSeekV4CapturedStages.cpp)
     target_link_libraries(v2_test_deepseek4_cuda_kernels PRIVATE llaminar2_core GTest::gtest_main CUDA::cudart)
     add_v2_test(V2_Integration_CUDA_DeepSeekV4CompactKV
         COMMAND $<TARGET_FILE:v2_test_deepseek4_cuda_kernels>

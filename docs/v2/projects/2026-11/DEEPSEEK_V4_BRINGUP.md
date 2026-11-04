@@ -100,7 +100,9 @@ zero-payload hybrid cache: every layer is a typed `model_state`
 sequence frontier (device head/count rows, request reset). On GPU the terminal
 layer's `AdvanceSequenceFrontier` stage publishes the forward's real rows once
 (`advanceRecurrentSequenceState`, the all-GDN slice contract). CPU positions
-remain orchestrator-owned. `addKVCacheAppend`, the duplicate `kv_v` GEMM and
+remain orchestrator-owned. The frontier stage consumes the same row
+extent (device live-row count when bound) as every bank kernel, so a padded or
+zero-live chunk cannot advance it past the banks. `addKVCacheAppend`, the duplicate `kv_v` GEMM and
 `kv_norm_rope_v` are gone. The planner classifies the layers as
 `LayerStateKind::ModelOwned`, which gives 0 KV bytes.
 
@@ -138,7 +140,11 @@ scales with the prefill chunk. The carried banks are zeroed and published once
 at setup (`DeepSeekV4Graph::initializeCacheAuxiliaryState`). Readers decode
 records on the fly. The lightning-indexer per-32-block FP4 dot products are
 exact in FP32, and heads accumulate with fused multiply-add in a fixed order,
-so CPU and CUDA scores are bit-identical. GPU indexer scoring runs in passes of
+so CPU and CUDA scores are bit-identical. The QAT, Hadamard, record and score
+arithmetic uses explicit non-FTZ `.rn` operations on CUDA (the TU is compiled
+with `--use_fast_math --ftz=true`), so IEEE subnormal results such as FP4 0.5
+at the E8M0 floor (2^-127) match the CPU; norm/RoPE/softmax arithmetic is not
+part of this byte contract. GPU indexer scoring runs in passes of
 `deepSeekV4IndexerScoreRows` rows (`kDeepSeekV4IndexerScoreBudgetBytes` =
 64 MiB), with an exact top-k and an unchanged tie rule (score descending, block
 id ascending).
@@ -215,9 +221,20 @@ Regressions:
   - the canonical cache charges no KV payload;
   - no K/V conversion scratch exists without attention layers, with a dense
     control.
-- The CUDA suite also proves that the frontier-only CUDA cache publishes no
-  conversion scratch and advances its device frontier once per forward,
-  including across reset/replay.
+- The CUDA suite also proves:
+  - the frontier-only CUDA cache publishes no conversion scratch and advances
+    its device frontier once per forward, including across reset/replay;
+  - every indexer score is the same binary32 word on CPU and CUDA;
+  - normal inputs with subnormal QAT/decode/score results survive CUDA FTZ
+    (negative control: a plain multiply in the Hadamard scale fails it);
+  - captured production stages (pool, store, attention, raw store, frontier)
+    replayed over padded chunks with full, partial and zero live rows leave
+    rows beyond the live count untouched, make zero-live replays a no-op,
+    advance the frontier by exactly the live rows, equal one eager
+    whole-prompt execution byte for byte, and reproduce after request reset.
+- `DeepSeekV4Admission.AdmittedRootsEqualTheActualGraphInventory` compares the
+  admitted roots with the actual `DeepSeekV4Graph` schema/resolver inventory,
+  root by root, for CPU and GPU allocators and several row envelopes.
 
 Open:
 
