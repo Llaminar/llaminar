@@ -1023,6 +1023,15 @@ namespace llaminar2
         return events;
     }
 
+    std::vector<std::string> toolSectionReasoningExits(ToolCallFormat format)
+    {
+        if (format != ToolCallFormat::DEEPSEEK_V4_DSML) return {};
+        // vLLM's TOOL_START terminals: the canonical opener and the two
+        // misspellings observed in production. A bare invoke is not a reasoning
+        // exit there (it is only accepted from CONTENT).
+        return {"<" + kDsml + "tool_calls>", "<" + kDsml + "toolcalls>", "<" + kDsml + "tool>"};
+    }
+
     std::string generateToolCallId()
     {
         static thread_local std::mt19937 gen{std::random_device{}()};
