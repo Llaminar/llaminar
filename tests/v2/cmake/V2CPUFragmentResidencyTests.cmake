@@ -255,4 +255,13 @@ add_v2_test(V2_Integration_MoEOverlayDistributedMeasurementContext
     ENVIRONMENT "${V2_CPU_FRAGMENT_TEST_ENV}")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOverlayDistributedMeasurementContext)
 
+add_v2_test(V2_Integration_MoEOverlayCalibrationCoordinateIdentity
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_economy_calibration_controller>
+        --gtest_filter=MoEOverlayEconomyCalibrationController.RejectsSameSizedForeignCoordinatesBeforeTransfer
+        --gtest_repeat=20 --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;ExpertOverlay;Measurement;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "${V2_CPU_FRAGMENT_TEST_ENV}")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOverlayCalibrationCoordinateIdentity)
+
 unset(V2_CPU_FRAGMENT_TEST_ENV)

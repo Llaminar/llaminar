@@ -61,7 +61,7 @@ namespace llaminar2
 
         const auto &coordinates = config_.planner->requiredCoordinates();
         if (coordinates.empty() ||
-            coordinates.size() != config_.ledger->coordinateCount())
+            coordinates != config_.ledger->requiredCoordinates())
         {
             throw std::invalid_argument(
                 "ExpertOverlay transfer profiler and ledger coordinates disagree");

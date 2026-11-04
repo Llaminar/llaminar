@@ -166,6 +166,16 @@ namespace llaminar2
             return coordinates_.size();
         }
 
+        /**
+         * @return Immutable canonical coordinate identities admitted at setup.
+         * @note A matching count alone cannot bind a planner to this corpus.
+         */
+        [[nodiscard]] const std::vector<MoEOverlayMigrationMeasurementCoordinate> &
+        requiredCoordinates() const noexcept
+        {
+            return coordinates_;
+        }
+
         /** @return Warmup plus retained observations required per coordinate/phase. */
         [[nodiscard]] std::uint64_t requiredObservationsPerCoordinate()
             const noexcept

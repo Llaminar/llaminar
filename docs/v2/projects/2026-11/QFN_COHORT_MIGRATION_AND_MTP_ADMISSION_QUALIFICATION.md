@@ -511,6 +511,16 @@ Complete-target calibration, service/rooted-combine pricing and changed-epoch
 publication remain open. This checkpoint changes no model arithmetic, KL limit
 or public Dynamic cohort guard, and does not certify Release performance.
 
+The next focused check found that controller construction compared planner and
+ledger coordinate counts without checking their identities. The controller now
+compares the ledger's original canonical endpoint/layer sequence before any
+transfer starts. `negative221` reproduces acceptance of same-sized foreign
+endpoint and layer matrices with the original body, twenty times. After build222,
+`focused223` passes both owning suites and the new twenty-repeat explicit
+`MoEOverlayCalibrationCoordinateIdentity` preflight registration: 3/3, 1.84 seconds,
+no skips and a clean driver window. Reordered equivalent input remains valid
+through the existing ledger normalization; no timing or numerical limit changes.
+
 ## Shared histogram candidate construction
 
 The existing histogram proposal now uses one candidate-construction boundary

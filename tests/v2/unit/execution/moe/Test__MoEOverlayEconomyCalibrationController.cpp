@@ -1549,3 +1549,5 @@ namespace llaminar2::test
         EXPECT_THROW((void)MoEOverlayEconomyEvidenceMerger::mergeService(wrong_rank, owners, topology), std::invalid_argument);
     }
 } // namespace llaminar2::test
+
+#include "CalibrationCoordinateIdentityContract.inc"
