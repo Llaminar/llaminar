@@ -130,7 +130,10 @@ namespace llaminar2
             // Parse JSON
             try
             {
-                json tc_json = json::parse(json_str);
+                // Lossless parse; an inexact number makes the block literal content.
+                json tc_json = parseJsonExact<json>(json_str);
+                if (tc_json.is_discarded())
+                    throw std::invalid_argument("not exactly representable JSON");
 
                 ToolCall tc;
                 tc.id = generateToolCallId();
@@ -156,7 +159,7 @@ namespace llaminar2
                     LOG_WARN("[ToolCallParser] Tool call JSON missing 'name' field");
                 }
             }
-            catch (const json::parse_error &e)
+            catch (const std::exception &e)
             {
                 LOG_WARN("[ToolCallParser] Failed to parse tool call JSON: " << e.what());
                 // Treat the whole block as content
@@ -230,7 +233,7 @@ namespace llaminar2
         if (schema.value("type", json{}) == "string")
             return std::string(body);
 
-        json parsed = json::parse(body, nullptr, false);
+        json parsed = parseJsonExact<json>(body);
         if (parsed.is_discarded())
             return std::nullopt;
         return parsed;
@@ -596,8 +599,12 @@ namespace llaminar2
             return std::string::npos;
         }
 
-        /** @brief _dsml_arg_converter (complete parameters only). */
-        nlohmann::ordered_json convertDsmlArguments(const std::string &raw)
+        /**
+         * @brief _dsml_arg_converter (complete parameters only).
+         * @return Arguments, or nullopt when a typed value is not exactly representable
+         *         (the invoke then stays literal content rather than an altered call).
+         */
+        std::optional<nlohmann::ordered_json> convertDsmlArguments(const std::string &raw)
         {
             nlohmann::ordered_json params = nlohmann::ordered_json::object();
             size_t pos = 0;
@@ -616,10 +623,10 @@ namespace llaminar2
                     params[name] = value;
                 else
                 {
-                    // Python keeps integers beyond 64 bits exact; a rounded
-                    // double would be a different argument, so keep the text.
-                    auto parsed = hasOutOfRangeInteger(value) ? nlohmann::ordered_json(nlohmann::ordered_json::value_t::discarded)
-                                                              : nlohmann::ordered_json::parse(value, nullptr, false);
+                    // vLLM keeps non-JSON text as a string; JSON whose numbers
+                    // cannot be represented exactly is not executable at all.
+                    if (hasOutOfRangeInteger(value)) return std::nullopt;
+                    auto parsed = nlohmann::ordered_json::parse(value, nullptr, false);
                     params[name] = parsed.is_discarded() ? nlohmann::ordered_json(value) : std::move(parsed);
                 }
                 pos = end == close ? close + kDsmlParamClose.size() : next;
@@ -649,7 +656,7 @@ namespace llaminar2
                 nlohmann::ordered_json inner = args[wrapper];
                 if (inner.is_string())
                 {
-                    inner = nlohmann::ordered_json::parse(inner.get<std::string>(), nullptr, false);
+                    inner = parseJsonExact<nlohmann::ordered_json>(inner.get<std::string>());
                     if (inner.is_discarded()) return original;
                 }
                 if (!inner.is_object()) continue;
@@ -713,11 +720,19 @@ namespace llaminar2
                 }
                 return events;
             }
+            const auto arguments = convertDsmlArguments(buffer_.substr(name_end + 2, args_end - name_end - 2));
+            if (!arguments)
+            {
+                // Fail closed: an invoke whose typed value cannot be kept
+                // exactly is returned verbatim instead of executed altered.
+                events.push_back(Event::contentEvent(buffer_.substr(invoke, args_end + end_size - invoke)));
+                dsml_scan_ = args_end + end_size;
+                continue;
+            }
             ToolCall call;
             call.id = generateToolCallId();
             call.name = buffer_.substr(invoke + kDsmlInvokePrefix.size(), name_end - invoke - kDsmlInvokePrefix.size());
-            call.arguments = unwrapDsmlWrapperArguments(
-                convertDsmlArguments(buffer_.substr(name_end + 2, args_end - name_end - 2)), tools_, call.name);
+            call.arguments = unwrapDsmlWrapperArguments(*arguments, tools_, call.name);
             events.push_back(Event::toolCallEvent(std::move(call)));
             dsml_emitted_ = true;
             dsml_scan_ = args_end + end_size;
@@ -776,7 +791,9 @@ namespace llaminar2
 
                 try
                 {
-                    json parsed = json::parse(json_str);
+                    json parsed = parseJsonExact<json>(json_str);
+                    if (parsed.is_discarded())
+                        throw std::invalid_argument("not exactly representable JSON");
 
                     // Could be a single object or array of objects
                     auto extract_tc = [&](const json &obj)
@@ -819,7 +836,7 @@ namespace llaminar2
 
                     return result;
                 }
-                catch (const json::parse_error &)
+                catch (const std::exception &)
                 {
                     // Fall through to return as plain content
                 }

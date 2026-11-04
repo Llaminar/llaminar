@@ -15,6 +15,7 @@
 
 #include "ChatTemplate.h"
 #include "DeepSeekV4ChatEncoding.h"
+#include "PythonJson.h"
 #include "Logger.h"
 #include "vendor/jinja/lexer.h"
 #include "vendor/jinja/parser.h"
@@ -247,9 +248,9 @@ namespace llaminar2
                             {
                                 const auto arguments_text =
                                     tool_call["function"]["arguments"].get<std::string>();
+                                // Lossless parse: inexact numbers keep the original string.
                                 auto structured_arguments =
-                                    nlohmann::ordered_json::parse(
-                                        arguments_text, nullptr, false);
+                                    parseJsonExact<nlohmann::ordered_json>(arguments_text);
                                 if (structured_arguments.is_object())
                                 {
                                     tool_call["function"]["arguments"] =
