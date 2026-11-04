@@ -1,0 +1,346 @@
+{
+ "official": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/resolve/6821d6ad3681a4b137b066b76094fa82ebd0a380/",
+ "gguf_shards": [
+  "https://huggingface.co/unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF/resolve/87ce15810931a270f165e5e50439cd446f6b4ba5/UD-Q8_K_XL/DeepSeek-V4-Flash-Vision-Exp-UD-Q8_K_XL-00001-of-00005.gguf",
+  "https://huggingface.co/unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF/resolve/87ce15810931a270f165e5e50439cd446f6b4ba5/UD-Q8_K_XL/DeepSeek-V4-Flash-Vision-Exp-UD-Q8_K_XL-00002-of-00005.gguf",
+  "https://huggingface.co/unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF/resolve/87ce15810931a270f165e5e50439cd446f6b4ba5/UD-Q8_K_XL/DeepSeek-V4-Flash-Vision-Exp-UD-Q8_K_XL-00003-of-00005.gguf",
+  "https://huggingface.co/unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF/resolve/87ce15810931a270f165e5e50439cd446f6b4ba5/UD-Q8_K_XL/DeepSeek-V4-Flash-Vision-Exp-UD-Q8_K_XL-00004-of-00005.gguf",
+  "https://huggingface.co/unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF/resolve/87ce15810931a270f165e5e50439cd446f6b4ba5/UD-Q8_K_XL/DeepSeek-V4-Flash-Vision-Exp-UD-Q8_K_XL-00005-of-00005.gguf"
+ ],
+ "scope": "sampled rows only; not exhaustive",
+ "samples": [
+  {
+   "official_tensor": "layers.0.ffn.experts.0.w1",
+   "official_row": 0,
+   "gguf_tensor": "blk.0.ffn_gate_exps.weight",
+   "gguf_row": 0,
+   "values": 4096,
+   "gguf_type": "MXFP4",
+   "bit_identical": true,
+   "relative_l2": 0.0,
+   "official_ranges": [
+    {
+     "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/resolve/6821d6ad3681a4b137b066b76094fa82ebd0a380/model-00002-of-00048.safetensors",
+     "offset": 345097952,
+     "length": 2048
+    },
+    {
+     "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/resolve/6821d6ad3681a4b137b066b76094fa82ebd0a380/model-00002-of-00048.safetensors",
+     "offset": 11649248,
+     "length": 128
+    }
+   ],
+   "gguf_ranges": [
+    {
+     "url": "https://huggingface.co/unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF/resolve/87ce15810931a270f165e5e50439cd446f6b4ba5/UD-Q8_K_XL/DeepSeek-V4-Flash-Vision-Exp-UD-Q8_K_XL-00002-of-00005.gguf",
+     "offset": 3489986912,
+     "length": 2176
+    }
+   ]
+  },
+  {
+   "official_tensor": "layers.21.ffn.experts.200.w3",
+   "official_row": 1999,
+   "gguf_tensor": "blk.21.ffn_up_exps.weight",
+   "gguf_row": 411599,
+   "values": 4096,
+   "gguf_type": "MXFP4",
+   "bit_identical": true,
+   "relative_l2": 0.0,
+   "official_ranges": [
+    {
+     "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/resolve/6821d6ad3681a4b137b066b76094fa82ebd0a380/model-00023-of-00048.safetensors",
+     "offset": 1794480720,
+     "length": 2048
+    },
+    {
+     "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/resolve/6821d6ad3681a4b137b066b76094fa82ebd0a380/model-00023-of-00048.safetensors",
+     "offset": 104530896,
+     "length": 128
+    }
+   ],
+   "gguf_ranges": [
+    {
+     "url": "https://huggingface.co/unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF/resolve/87ce15810931a270f165e5e50439cd446f6b4ba5/UD-Q8_K_XL/DeepSeek-V4-Flash-Vision-Exp-UD-Q8_K_XL-00003-of-00005.gguf",
+     "offset": 34342304832,
+     "length": 2176
+    }
+   ]
+  },
+  {
+   "official_tensor": "layers.42.ffn.experts.255.w2",
+   "official_row": 4095,
+   "gguf_tensor": "blk.42.ffn_down_exps.weight",
+   "gguf_row": 1048575,
+   "values": 2048,
+   "gguf_type": "MXFP4",
+   "bit_identical": true,
+   "relative_l2": 0.0,
+   "official_ranges": [
+    {
+     "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/resolve/6821d6ad3681a4b137b066b76094fa82ebd0a380/model-00044-of-00048.safetensors",
+     "offset": 2566616264,
+     "length": 1024
+    },
+    {
+     "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/resolve/6821d6ad3681a4b137b066b76094fa82ebd0a380/model-00044-of-00048.safetensors",
+     "offset": 164328072,
+     "length": 64
+    }
+   ],
+   "gguf_ranges": [
+    {
+     "url": "https://huggingface.co/unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF/resolve/87ce15810931a270f165e5e50439cd446f6b4ba5/UD-Q8_K_XL/DeepSeek-V4-Flash-Vision-Exp-UD-Q8_K_XL-00005-of-00005.gguf",
+     "offset": 11123202976,
+     "length": 1088
+    }
+   ]
+  },
+  {
+   "official_tensor": "layers.0.attn.wq_b",
+   "official_row": 123,
+   "gguf_tensor": "blk.0.attn_q_b.weight",
+   "gguf_row": 123,
+   "values": 1024,
+   "gguf_type": "BF16",
+   "bit_identical": true,
+   "relative_l2": 0.0,
+   "official_ranges": [
+    {
+     "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/resolve/6821d6ad3681a4b137b066b76094fa82ebd0a380/model-00002-of-00048.safetensors",
+     "offset": 286503648,
+     "length": 1024
+    },
+    {
+     "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/resolve/6821d6ad3681a4b137b066b76094fa82ebd0a380/model-00002-of-00048.safetensors",
+     "offset": 11647200,
+     "length": 8
+    }
+   ],
+   "gguf_ranges": [
+    {
+     "url": "https://huggingface.co/unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF/resolve/87ce15810931a270f165e5e50439cd446f6b4ba5/UD-Q8_K_XL/DeepSeek-V4-Flash-Vision-Exp-UD-Q8_K_XL-00002-of-00005.gguf",
+     "offset": 2265501792,
+     "length": 2048
+    }
+   ]
+  },
+  {
+   "official_tensor": "layers.10.attn.wkv",
+   "official_row": 77,
+   "gguf_tensor": "blk.10.attn_kv.weight",
+   "gguf_row": 77,
+   "values": 4096,
+   "gguf_type": "BF16",
+   "bit_identical": true,
+   "relative_l2": 0.0,
+   "official_ranges": [
+    {
+     "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/resolve/6821d6ad3681a4b137b066b76094fa82ebd0a380/model-00012-of-00048.safetensors",
+     "offset": 236996808,
+     "length": 4096
+    },
+    {
+     "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/resolve/6821d6ad3681a4b137b066b76094fa82ebd0a380/model-00012-of-00048.safetensors",
+     "offset": 26958152,
+     "length": 32
+    }
+   ],
+   "gguf_ranges": [
+    {
+     "url": "https://huggingface.co/unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF/resolve/87ce15810931a270f165e5e50439cd446f6b4ba5/UD-Q8_K_XL/DeepSeek-V4-Flash-Vision-Exp-UD-Q8_K_XL-00002-of-00005.gguf",
+     "offset": 39253719136,
+     "length": 8192
+    }
+   ]
+  },
+  {
+   "official_tensor": "layers.5.attn.wo_b",
+   "official_row": 4000,
+   "gguf_tensor": "blk.5.attn_output_b.weight",
+   "gguf_row": 4000,
+   "values": 8192,
+   "gguf_type": "BF16",
+   "bit_identical": true,
+   "relative_l2": 0.0,
+   "official_ranges": [
+    {
+     "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/resolve/6821d6ad3681a4b137b066b76094fa82ebd0a380/model-00007-of-00048.safetensors",
+     "offset": 283843624,
+     "length": 8192
+    },
+    {
+     "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/resolve/6821d6ad3681a4b137b066b76094fa82ebd0a380/model-00007-of-00048.safetensors",
+     "offset": 14093544,
+     "length": 64
+    }
+   ],
+   "gguf_ranges": [
+    {
+     "url": "https://huggingface.co/unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF/resolve/87ce15810931a270f165e5e50439cd446f6b4ba5/UD-Q8_K_XL/DeepSeek-V4-Flash-Vision-Exp-UD-Q8_K_XL-00002-of-00005.gguf",
+     "offset": 20818869856,
+     "length": 16384
+    }
+   ]
+  },
+  {
+   "official_tensor": "layers.2.attn.wq_a",
+   "official_row": 500,
+   "gguf_tensor": "blk.2.attn_q_a.weight",
+   "gguf_row": 500,
+   "values": 4096,
+   "gguf_type": "BF16",
+   "bit_identical": true,
+   "relative_l2": 0.0,
+   "official_ranges": [
+    {
+     "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/resolve/6821d6ad3681a4b137b066b76094fa82ebd0a380/model-00004-of-00048.safetensors",
+     "offset": 314139472,
+     "length": 4096
+    },
+    {
+     "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/resolve/6821d6ad3681a4b137b066b76094fa82ebd0a380/model-00004-of-00048.safetensors",
+     "offset": 33166512,
+     "length": 32
+    }
+   ],
+   "gguf_ranges": [
+    {
+     "url": "https://huggingface.co/unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF/resolve/87ce15810931a270f165e5e50439cd446f6b4ba5/UD-Q8_K_XL/DeepSeek-V4-Flash-Vision-Exp-UD-Q8_K_XL-00002-of-00005.gguf",
+     "offset": 9668105312,
+     "length": 8192
+    }
+   ]
+  },
+  {
+   "official_tensor": "layers.2.ffn.shared_experts.w2",
+   "official_row": 9,
+   "gguf_tensor": "blk.2.ffn_down_shexp.weight",
+   "gguf_row": 9,
+   "values": 2048,
+   "gguf_type": "BF16",
+   "bit_identical": true,
+   "relative_l2": 0.0,
+   "official_ranges": [
+    {
+     "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/resolve/6821d6ad3681a4b137b066b76094fa82ebd0a380/model-00004-of-00048.safetensors",
+     "offset": 358247248,
+     "length": 2048
+    },
+    {
+     "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/resolve/6821d6ad3681a4b137b066b76094fa82ebd0a380/model-00004-of-00048.safetensors",
+     "offset": 234495824,
+     "length": 16
+    }
+   ],
+   "gguf_ranges": [
+    {
+     "url": "https://huggingface.co/unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF/resolve/87ce15810931a270f165e5e50439cd446f6b4ba5/UD-Q8_K_XL/DeepSeek-V4-Flash-Vision-Exp-UD-Q8_K_XL-00002-of-00005.gguf",
+     "offset": 10880398688,
+     "length": 4096
+    }
+   ]
+  },
+  {
+   "official_tensor": "layers.20.attn.indexer.wq_b",
+   "official_row": 3,
+   "gguf_tensor": "blk.20.indexer.attn_q_b.weight",
+   "gguf_row": 3,
+   "values": 1024,
+   "gguf_type": "BF16",
+   "bit_identical": true,
+   "relative_l2": 0.0,
+   "official_ranges": [
+    {
+     "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/resolve/6821d6ad3681a4b137b066b76094fa82ebd0a380/model-00022-of-00048.safetensors",
+     "offset": 228295880,
+     "length": 1024
+    },
+    {
+     "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/resolve/6821d6ad3681a4b137b066b76094fa82ebd0a380/model-00022-of-00048.safetensors",
+     "offset": 26957640,
+     "length": 8
+    }
+   ],
+   "gguf_ranges": [
+    {
+     "url": "https://huggingface.co/unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF/resolve/87ce15810931a270f165e5e50439cd446f6b4ba5/UD-Q8_K_XL/DeepSeek-V4-Flash-Vision-Exp-UD-Q8_K_XL-00003-of-00005.gguf",
+     "offset": 30885215680,
+     "length": 2048
+    }
+   ]
+  },
+  {
+   "official_tensor": "layers.0.ffn.gate",
+   "official_row": 3,
+   "gguf_tensor": "blk.0.ffn_gate_inp.weight",
+   "gguf_row": 3,
+   "values": 4096,
+   "gguf_type": "BF16",
+   "bit_identical": true,
+   "relative_l2": 0.0,
+   "official_ranges": [
+    {
+     "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/resolve/6821d6ad3681a4b137b066b76094fa82ebd0a380/model-00002-of-00048.safetensors",
+     "offset": 9561952,
+     "length": 8192
+    }
+   ],
+   "gguf_ranges": [
+    {
+     "url": "https://huggingface.co/unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF/resolve/87ce15810931a270f165e5e50439cd446f6b4ba5/UD-Q8_K_XL/DeepSeek-V4-Flash-Vision-Exp-UD-Q8_K_XL-00002-of-00005.gguf",
+     "offset": 4630862176,
+     "length": 8192
+    }
+   ]
+  },
+  {
+   "official_tensor": "embed",
+   "official_row": 1000,
+   "gguf_tensor": "token_embd.weight",
+   "gguf_row": 1000,
+   "values": 4096,
+   "gguf_type": "BF16",
+   "bit_identical": true,
+   "relative_l2": 0.0,
+   "official_ranges": [
+    {
+     "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/resolve/6821d6ad3681a4b137b066b76094fa82ebd0a380/model-00001-of-00048.safetensors",
+     "offset": 117288624,
+     "length": 8192
+    }
+   ],
+   "gguf_ranges": [
+    {
+     "url": "https://huggingface.co/unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF/resolve/87ce15810931a270f165e5e50439cd446f6b4ba5/UD-Q8_K_XL/DeepSeek-V4-Flash-Vision-Exp-UD-Q8_K_XL-00002-of-00005.gguf",
+     "offset": 1067556960,
+     "length": 8192
+    }
+   ]
+  },
+  {
+   "official_tensor": "head",
+   "official_row": 50000,
+   "gguf_tensor": "output.weight",
+   "gguf_row": 50000,
+   "values": 4096,
+   "gguf_type": "BF16",
+   "bit_identical": true,
+   "relative_l2": 0.0,
+   "official_ranges": [
+    {
+     "url": "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp/resolve/6821d6ad3681a4b137b066b76094fa82ebd0a380/model-00045-of-00048.safetensors",
+     "offset": 409862564,
+     "length": 8192
+    }
+   ],
+   "gguf_ranges": [
+    {
+     "url": "https://huggingface.co/unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF/resolve/87ce15810931a270f165e5e50439cd446f6b4ba5/UD-Q8_K_XL/DeepSeek-V4-Flash-Vision-Exp-UD-Q8_K_XL-00002-of-00005.gguf",
+     "offset": 409624608,
+     "length": 8192
+    }
+   ]
+  }
+ ]
+}

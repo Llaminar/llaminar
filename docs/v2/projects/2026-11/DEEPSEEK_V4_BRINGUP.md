@@ -87,3 +87,50 @@ structural feature and are converted with stock llama.cpp.
   weights (MXFP4 experts 137.1 -> 145.1 GiB), 163.9 GiB at 32K context.
   A 17-byte layout would need a codebook-specific scale plane in every
   NativeVNNI kernel; not done.
+
+## Official-weight exactness evidence
+
+`scripts/deepseek4/verify_gguf_exactness.py --json` compares one row of each of
+twelve tensors (three routed-expert rows across layers 0/21/42, attention
+q_a/q_b/kv/wo_b, shared expert, indexer, router, embedding, head) against
+`deepseek-ai/DeepSeek-V4-Flash-Vision-Exp@6821d6ad`. The exact tensors, rows
+and every compared byte range (URL, offset, length) on both sides are recorded
+in:
+
+- `dsv4-gguf-exactness-ud-q8kxl.json`: unsloth `UD-Q8_K_XL@87ce1581`, all 12 samples bit-identical.
+- `dsv4-gguf-exactness-ggml-mxfp4.json`: ggml-org `MXFP4@45ddc483`, experts and router
+  bit-identical; the FP8 projections, embedding and head are Q8_0 (relative L2 about 5e-3).
+
+This is sampled evidence: it is not exhaustive checkpoint equality. It shows that
+the converters keep the official FP4/E8M0 expert bytes and map FP8 (128x128
+E8M0 block scales) and BF16 exactly to BF16 for the sampled tensors.
+
+## Cluster run requirements (pending owner decision; no GPU window authorized)
+
+Target: compare Llaminar on UD-Q8_K_XL (official-quality weights) with the
+production deployment. The earlier image `ghcr.io/fank/llaminar:dsv4-fe3d60304bbb`
+(sha256:013075b4...) predates MXFP4 and is superseded for this plan; it only
+loads the lossy UD-IQ* files.
+
+- Image: rebuild the sm_90 Release image from a commit that includes MXFP4
+  (398ad5150 or later), CUDA archs `86;90`, ROCm off; push to GHCR (private,
+  needs a pull secret) and record the digest.
+- GGUF: `unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF@87ce15810931a270f165e5e50439cd446f6b4ba5`,
+  `UD-Q8_K_XL/*-0000{1..5}-of-00005.gguf` (150.75 GiB) in one read-only directory;
+  point `-m` at shard 1. Text only: content arrays are not supported yet.
+- Command: `llaminar2 serve -m <shard1> --expert-tier 'gpu=cuda:0,cuda:1;priority=0'
+  -c 32768 --no-prefix-cache --no-mpi-bootstrap --host 0.0.0.0 --port 8080`,
+  env `HOME=/tmp OMP_NUM_THREADS=16 OMP_PLACES=cores OMP_PROC_BIND=close`.
+  Health: `GET /health`. No `--mtp`, TP/PP flags or CPU expert tier (the pod's
+  default seccomp/no SYS_NICE blocks the CPU expert pool's NUMA calls).
+- Memory: the planner's single-device BOM is 163.9 GiB at 32K (weights 158.8,
+  of which MXFP4 experts 145.1; KV 2.7; workspace 1.4; graphs/activations 0.1).
+  The 2-GPU split is NOT certified: dense/shared weights (~13.7 GiB), KV and the
+  continuation workspace live on cuda:0, so an even expert split would put about
+  90 GiB on cuda:0 against 93.09 GiB usable. A topology-aware per-device BOM
+  (planner `--dry-run --explain-placement` on the 2-GPU topology, or a
+  synthetic 2xH100 inventory) must show both devices fitting before declaring
+  the plan feasible. Llaminar fails closed at startup if they do not fit.
+- Oracle: llama.cpp b12079 (`71efc559a`) CUDA build with
+  `-DCMAKE_CUDA_ARCHITECTURES=90`, `llama-server -m <shard1> -ngl 999 -c 32768
+  -np 1 --jinja` on the same GPUs (llama.cpp keeps the GGUF at file size).
