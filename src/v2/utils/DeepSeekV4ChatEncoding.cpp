@@ -440,6 +440,7 @@ namespace llaminar2::deepseek4
 
     std::string encodeChatMessages(const nlohmann::ordered_json &input, ChatPromptPolicy policy,
                                    bool add_generation_prompt)
+    try
     {
         if (!input.is_array())
             throw std::invalid_argument("DeepSeek-V4 encoder: messages must be an array");
@@ -459,5 +460,11 @@ namespace llaminar2::deepseek4
         for (std::size_t i = 0; i < messages.size(); ++i)
             prompt += renderMessage(i, messages, policy, drop_thinking, last_user, add_generation_prompt);
         return prompt;
+    }
+    catch (const nlohmann::json::exception &error)
+    {
+        // A wrongly typed client field (a numeric function name, an object
+        // where text is required) is malformed input, not a server fault.
+        throw std::invalid_argument(std::string("DeepSeek-V4 encoder: malformed message field: ") + error.what());
     }
 } // namespace llaminar2::deepseek4

@@ -32,6 +32,7 @@
 #include "utils/Tokenizer.h"
 #include "utils/DebugEnv.h"
 #include "utils/Logger.h"
+#include "utils/PythonJson.h"
 #include "utils/ToolCallParser.h"
 #include "nlohmann/json.hpp"
 
@@ -708,6 +709,18 @@ namespace llaminar2
             error_out.json_body = dumpJsonForHttp(err);
             return std::nullopt;
         }
+        // Integers beyond 64 bits would be rendered as rounded floats in
+        // prompts and tool arguments; Python (the reference encoder) keeps
+        // them exact. Reject instead of silently changing the request.
+        if (hasOutOfRangeInteger(json_body))
+        {
+            error_out.ok = false;
+            error_out.http_status = 400;
+            error_out.json_body = dumpJsonForHttp({{"error", {
+                {"message", "integer values outside the 64-bit range are not supported"},
+                {"type", "invalid_request_error"}}}});
+            return std::nullopt;
+        }
 
         // Validate required fields
         if (!body.contains("messages") || !body["messages"].is_array() || body["messages"].empty())
@@ -752,7 +765,8 @@ namespace llaminar2
                 if (valid)
                     for (const auto &part : msg["content"])
                     {
-                        const std::string type = part.is_object() ? part.value("type", "") : "";
+                        const std::string type = part.is_object() && part.contains("type") &&
+                                part["type"].is_string() ? part["type"].get<std::string>() : "";
                         if (type == "image_url" || type == "image" || type == "input_image")
                         {
                             valid = false;
@@ -1303,8 +1317,11 @@ namespace llaminar2
         {
             token_ids = tokenizer_.encodeChat(prompt_messages, encoding);
         }
-        catch (const std::invalid_argument &error)
+        catch (const std::exception &error)
         {
+            if (!dynamic_cast<const std::invalid_argument *>(&error) &&
+                !dynamic_cast<const nlohmann::json::exception *>(&error))
+                throw;
             // The native encoder rejects inputs its reference rejects
             // (malformed tool-call arguments, an empty developer message, ...).
             error_out.http_status = 400;

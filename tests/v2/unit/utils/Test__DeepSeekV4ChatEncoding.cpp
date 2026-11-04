@@ -271,3 +271,33 @@ TEST(Test__DeepSeekV4ChatEncoding, DsmlStreamingEqualsBatchForEverySplit)
         }
     }
 }
+
+/** @test Wrongly typed fields and integers beyond 64 bits are 400s, never a 500 or a rounded value. */
+TEST(Test__DeepSeekV4ChatEncoding, MalformedTypesAndHugeIntegersAreRejected)
+{
+    const auto reject = [](const std::string &body) {
+        ChatCompletionResponse error;
+        EXPECT_FALSE(ChatCompletionHandler::parseRequest(body, error)) << body;
+        EXPECT_EQ(error.http_status, 400) << body;
+    };
+    reject(R"({"messages": [{"role": "user", "content": [{"type": 7, "text": "x"}]}]})");
+    reject(R"({"messages": [{"role": "user", "content": "x"}], "tools": [{"type": "function",
+        "function": {"name": "f", "parameters": {"type": "object", "properties": {"id": {"maximum": 18446744073709551617}}}}}]})");
+    EXPECT_TRUE(hasOutOfRangeInteger("[18446744073709551616]"));
+    EXPECT_TRUE(hasOutOfRangeInteger("{\"a\": -9223372036854775809}"));
+    EXPECT_FALSE(hasOutOfRangeInteger("[18446744073709551615, -9223372036854775808, 1e30, 2.5]"));
+
+    // A numeric tool-call name parses as a request but cannot be rendered: invalid_argument, i.e. a 400.
+    ChatCompletionResponse error;
+    const auto request = ChatCompletionHandler::parseRequest(
+        R"({"messages": [{"role": "user", "content": "x"}, {"role": "assistant", "content": null,
+            "tool_calls": [{"id": "c", "type": "function", "function": {"name": 7, "arguments": "{}"}}]}]})", error);
+    ASSERT_TRUE(request) << error.json_body;
+    EXPECT_THROW(ChatTemplate::create(ChatTemplateType::DEEPSEEK_V4)->apply(request->messages, ChatEncodingOptions{}),
+                 std::invalid_argument);
+
+    // Model output: a huge integer argument keeps its exact text.
+    const auto result = parseDsml(section(invoke("f", param("id", "18446744073709551617", "false"))));
+    ASSERT_EQ(result.tool_calls.size(), 1u);
+    EXPECT_EQ(result.tool_calls[0].arguments, "{\"id\": \"18446744073709551617\"}");
+}

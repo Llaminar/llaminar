@@ -18,6 +18,7 @@
 
 #include <nlohmann/json.hpp>
 #include <string>
+#include <string_view>
 
 namespace llaminar2
 {
@@ -29,6 +30,15 @@ namespace llaminar2
      *         as the non-JSON tokens NaN/Infinity and no client request can carry.
      */
     std::string pythonJsonDumps(const nlohmann::ordered_json &value);
+
+    /**
+     * @brief Whether @p json_text contains an integer literal outside the 64-bit range.
+     * @details nlohmann parses such literals as doubles, which would change the
+     * value Python preserves exactly. Callers reject or keep the raw text
+     * instead of serializing a rounded float. Malformed text returns false
+     * (the caller's parser reports that error).
+     */
+    bool hasOutOfRangeInteger(std::string_view json_text);
 
     /**
      * @brief Python repr() of a finite double (shortest round-trip spelling).
