@@ -293,13 +293,30 @@ namespace llaminar2
         const auto *all = typed_data();
         if (!all) throw std::runtime_error("Native tensor raw source was retired");
         const auto &blk = all[static_cast<size_t>(source_n) * ctx.blocks_per_row + b];
-        if (!mxfp4::blockFitsFP16(blk.e, blk.qs))
-            throw std::runtime_error("MXFP4Tensor::packVnniBlock: block exponent " + std::to_string(blk.e) +
-                                     " (scale 2^" + std::to_string(static_cast<int>(blk.e) - 128) +
-                                     ") has no exact FP16 scale; refusing a lossy NativeVNNI preparation");
         // Code bytes keep the IQ4_NL nibble order; codebook 25 selects the MXFP4 lookup.
+        switch (ctx.primary_layout)
+        {
+        case VnniPrimaryScaleLayout::FP16Words:
+            if (!mxfp4::blockFitsFP16(blk.e, blk.qs))
+                throw std::runtime_error("MXFP4Tensor::packVnniBlock: block exponent " + std::to_string(blk.e) +
+                                         " (scale 2^" + std::to_string(static_cast<int>(blk.e) - 128) +
+                                         ") has no exact FP16 scale; refusing a lossy NativeVNNI preparation");
+            ctx.scales_array[linear] = mxfp4::preparedScaleFP16Bits(blk.e);
+            break;
+        case VnniPrimaryScaleLayout::NativeE8M0Bytes:
+        case VnniPrimaryScaleLayout::PowerOfTwoBF16Words:
+            if (!mxfp4::blockFitsNativeE8M0(blk.e, blk.qs))
+                throw std::runtime_error("MXFP4Tensor::packVnniBlock: block exponent " + std::to_string(blk.e) +
+                                         " is outside the native E8M0 range [2, 252]");
+            if (ctx.primary_layout == VnniPrimaryScaleLayout::NativeE8M0Bytes)
+                reinterpret_cast<uint8_t *>(ctx.scales_array)[linear] = mxfp4::preparedNativeE8M0Byte(blk.e);
+            else
+                ctx.scales_array[linear] = mxfp4::powerOfTwoBF16Word(mxfp4::preparedNativeE8M0Byte(blk.e));
+            break;
+        default:
+            throw std::invalid_argument("MXFP4Tensor::packVnniBlock: unknown primary scale layout");
+        }
         std::memcpy(vnniPayloadDst(ctx, linear), blk.qs, 16);
-        ctx.scales_array[linear] = mxfp4::preparedScaleFP16Bits(blk.e);
     }
 
 } // namespace llaminar2

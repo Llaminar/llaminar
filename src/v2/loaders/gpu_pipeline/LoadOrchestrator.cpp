@@ -83,6 +83,7 @@ namespace llaminar2
     void LoadOrchestrator::planWeight(int device_id, const std::string &name,
                                       int N, int K, int payload_bytes_per_block,
                                       bool is_asymmetric, bool has_emins,
+                                      NativeVnniScalePlaneWidth scale_plane,
                                       size_t raw_gguf_bytes,
                                       WeightVRAMPool::ContiguousAlias alias)
     {
@@ -94,6 +95,7 @@ namespace llaminar2
             payload_bytes_per_block,
             is_asymmetric,
             has_emins,
+            scale_plane,
             raw_gguf_bytes,
             persistent_owner_, alias);
     }
@@ -106,6 +108,7 @@ namespace llaminar2
         int payload_bytes_per_block,
         bool is_asymmetric,
         bool has_emins,
+        NativeVnniScalePlaneWidth scale_plane,
         size_t raw_gguf_bytes,
         PhysicalMemoryOwner owner,
         WeightVRAMPool::ContiguousAlias alias)
@@ -120,7 +123,7 @@ namespace llaminar2
 
         const size_t bytes_before = ctx->pool->totalPlannedBytes();
         ctx->pool->planWeight(name, N, K, payload_bytes_per_block, is_asymmetric,
-                              has_emins, raw_gguf_bytes, alias);
+                              has_emins, scale_plane, raw_gguf_bytes, alias);
         recordPersistentOwnerGrowth(
             *ctx,
             owner,

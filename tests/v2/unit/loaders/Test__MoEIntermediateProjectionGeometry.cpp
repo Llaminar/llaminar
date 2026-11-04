@@ -386,7 +386,7 @@ TEST(MoEIntermediateProjectionGeometry, PreparedPoolLayoutsMatchActualPoolPlans)
                       source.has_emins};
             WeightVRAMPool pool;
             pool.planWeight("original", n, k, physical.payload_bytes_per_block,
-                physical.has_mins, physical.has_emins, 0);
+                physical.has_mins, physical.has_emins, NativeVnniScalePlaneWidth::FP16Word, 0);
             const auto geometry = resolveExpertPreparedProjectionMemoryGeometry(
                 n, k, format, layout);
             EXPECT_EQ(geometry.gpu_live_bytes,

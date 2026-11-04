@@ -250,8 +250,19 @@ namespace llaminar2::cpu::native_vnni
         /// Physical prepared encoding consumed by serial and grouped kernels.
         CPUNativeVNNIEncoding encoding = CPUNativeVNNIEncoding::ExpandedInt8;
 
-        /// Interpretation of the primary scale words (see CPUNativeVNNIScaleEncoding).
-        CPUNativeVNNIScaleEncoding scale_encoding = CPUNativeVNNIScaleEncoding::FP16;
+        /// Interpretation of the primary scale words, derived from codebook and encoding.
+        [[nodiscard]] CPUNativeVNNIScaleEncoding scaleEncoding() const noexcept
+        {
+            return preparedScaleEncoding(codebook_id, encoding);
+        }
+
+        /// Pack-context layout that writes this unit's primary scale words.
+        [[nodiscard]] VnniPrimaryScaleLayout primaryScaleLayout() const noexcept
+        {
+            return scaleEncoding() == CPUNativeVNNIScaleEncoding::PowerOfTwoBF16
+                       ? VnniPrimaryScaleLayout::PowerOfTwoBF16Words
+                       : VnniPrimaryScaleLayout::FP16Words;
+        }
 
         /**
          * Arithmetic identity selected by the owner of this prepared matrix.
@@ -379,7 +390,7 @@ namespace llaminar2::cpu::native_vnni
         {
             const __m256i words = _mm256_load_si256(reinterpret_cast<const __m256i *>(primary));
             // BF16 power-of-two words widen by placement alone (word << 16); never F16C.
-            const __m512 base = scale_encoding == CPUNativeVNNIScaleEncoding::PowerOfTwoBF16
+            const __m512 base = scaleEncoding() == CPUNativeVNNIScaleEncoding::PowerOfTwoBF16
                 ? _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(words), 16))
                 : _mm512_cvtph_ps(words);
             if (!usesNibbleLUTSourceScale() && !usesIQ3SExpandedSourceScale()) return base;
@@ -404,7 +415,7 @@ namespace llaminar2::cpu::native_vnni
         [[nodiscard]] inline __m256 loadScales256(const uint16_t *primary) const
         {
             const __m128i words = _mm_load_si128(reinterpret_cast<const __m128i *>(primary));
-            const __m256 base = scale_encoding == CPUNativeVNNIScaleEncoding::PowerOfTwoBF16
+            const __m256 base = scaleEncoding() == CPUNativeVNNIScaleEncoding::PowerOfTwoBF16
                 ? _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(words), 16))
                 : _mm256_cvtph_ps(words);
             if (!usesNibbleLUTSourceScale() && !usesIQ3SExpandedSourceScale()) return base;
@@ -432,7 +443,7 @@ namespace llaminar2::cpu::native_vnni
         inline float blockScale(int c, int kb, int n_local) const
         {
             const uint16_t primary_word = chunkScales(c, kb)[n_local];
-            const float base = scale_encoding == CPUNativeVNNIScaleEncoding::PowerOfTwoBF16
+            const float base = scaleEncoding() == CPUNativeVNNIScaleEncoding::PowerOfTwoBF16
                 ? native_vnni_scale::floatFromBits(uint32_t{primary_word} << 16)
                 : fp16_to_fp32(primary_word);
             if (usesIQ3SExpandedSourceScale())
@@ -707,10 +718,14 @@ namespace llaminar2::cpu::native_vnni
 
                         if (mxfp4_source)
                         {
-                            if (!mxfp4::blockFitsFP16(blk[0], blk + 1))
+                            // Native nibble MXFP4 units always carry the exact BF16
+                            // power-of-two word of their E8M0 scale.
+                            if (meta.scaleEncoding() != CPUNativeVNNIScaleEncoding::PowerOfTwoBF16)
+                                throw std::logic_error("MXFP4 nibble units require the BF16 power-of-two scale encoding");
+                            if (!mxfp4::blockFitsNativeE8M0(blk[0], blk + 1))
                                 throw std::invalid_argument(
-                                    "MXFP4 block exponent has no exact FP16 scale; refusing lossy repack");
-                            scales_buf[col] = mxfp4::preparedScaleFP16Bits(blk[0]);
+                                    "MXFP4 block exponent is outside the native E8M0 range [2, 252]");
+                            scales_buf[col] = mxfp4::powerOfTwoBF16Word(mxfp4::preparedNativeE8M0Byte(blk[0]));
                         }
                         else
                             std::memcpy(&scales_buf[col], blk, 2);
@@ -1023,6 +1038,7 @@ namespace llaminar2::cpu::native_vnni
                                 .emins_array = nullptr,
                                 .destination_block_origin = first_kb,
                                 .destination_block_count = block_count,
+                                .primary_layout = out.primaryScaleLayout(),
                             };
                             for (int local_kb = 0; local_kb < block_count; ++local_kb)
                             {

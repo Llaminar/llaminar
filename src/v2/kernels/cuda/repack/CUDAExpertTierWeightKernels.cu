@@ -15,6 +15,7 @@
  */
 
 #include "kernels/cuda/repack/CUDAExpertTierWeightKernels.h"
+#include "kernels/common/NativeVnniScaleLoad.h"
 #include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
 #include "backends/cuda/MappedTransferServiceCUDA.h"
 #include "backends/cuda/MappedTransferServiceDevice.cuh"
@@ -241,8 +242,6 @@ namespace llaminar2
             std::uint8_t *__restrict__ cpu_chunk,
             std::uint32_t local_unit, bool active = true)
         {
-            static_assert(::llaminar2::nativeVnniScalePlaneBytes(Codebook) == 2,
-                          "tier units copy the 16-bit primary word verbatim (issue #26 switch)");
             const std::uint32_t global_unit = first_unit + local_unit;
             const int N=layout.N,blocks_per_row=layout.blocks_per_row;
             const unsigned columns=expertTierWireColumns(layout,global_unit);
@@ -276,8 +275,9 @@ namespace llaminar2
             }
             reinterpret_cast<std::int16_t *>(unit + (1024u/64)*columns)[local_column] =
                 static_cast<std::int16_t>(compensation);
+            // CPU unit word: FP16 for 2-byte planes, BF16 power of two for E8M0 planes.
             reinterpret_cast<std::uint16_t *>(unit + (1152u/64)*columns)[local_column] =
-                scales[linear];
+                ::llaminar2::native_vnni_scale::loadStagedPrimary<Codebook>(scales, linear);
             if constexpr (Asymmetric || Codebook == kNativeVnniIQ4XSSourceScaleCodebook)
             {
                 reinterpret_cast<std::uint16_t *>(unit + (1280u/64)*columns)[local_column] =
@@ -508,8 +508,14 @@ namespace llaminar2
                 static_cast<size_t>(kb+layout.gpu_first_column/32)*layout.gpu_N+n+layout.gpu_first_row;
             std::uint8_t *destination = payload + linear * 16u;
             gatherCpuPayloadVectors<16>(unit, local_column, destination, columns);
-            scales[linear] =
-                reinterpret_cast<const std::uint16_t *>(unit + (1152u/64)*columns)[local_column];
+            // Exact inverse of the GPU->CPU scale word; a malformed unit is fatal.
+            if (!::llaminar2::native_vnni_scale::storePrimaryFromCpuWord(
+                    layout.gpu_codebook_id, scales, linear,
+                    reinterpret_cast<const std::uint16_t *>(unit + (1152u/64)*columns)[local_column]))
+            {
+                __trap();
+                return;
+            }
             if constexpr (Asymmetric)
             {
                 mins[linear] = reinterpret_cast<const std::uint16_t *>(
@@ -965,9 +971,6 @@ namespace llaminar2
             const void *stream) noexcept
         {
             return layout.valid() && stream != nullptr && unit_count != 0 &&
-                   // Tier units copy the 16-bit primary word verbatim; a 1-byte plane
-                   // needs the E8M0 <-> BF16 conversion of the #26 switch first.
-                   ::llaminar2::nativeVnniScalePlaneBytes(layout.gpu_codebook_id) == 2 &&
                    first_unit < layout.unit_count &&
                    unit_count <= layout.unit_count - first_unit &&
                    unit_count <= layout.maximum_units_per_chunk &&

@@ -248,6 +248,7 @@ namespace llaminar2::cpu::native_vnni::test
                 .scales_array = scales.data(),
                 .mins_array = minima.data(),
                 .emins_array = nullptr,
+                .primary_layout = packed.primaryScaleLayout(),
             };
             source.packVnniBlock(context, source_row, 0, kb);
             const uint8_t *const block = payload.data() + kb * packed.payload_bytes;

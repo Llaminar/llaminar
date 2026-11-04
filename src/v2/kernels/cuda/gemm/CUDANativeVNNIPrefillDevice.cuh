@@ -490,13 +490,6 @@ namespace llaminar2::cuda::prefill
         {
             if constexpr (ASYNC_RAW_MODE >= 2)
             {
-                // cp.async copies plane elements verbatim and cannot normalize a
-                // 1-byte E8M0 plane into staged words. A byte plane must copy its
-                // live byte extent into raw staging and normalize it before the
-                // CTA barrier (issue #26 switch); until then this producer only
-                // admits 2-byte planes.
-                static_assert(::llaminar2::nativeVnniScalePlaneBytes(CODEBOOK_ID) == 2,
-                              "async BK64 scale staging requires a 2-byte primary plane");
                 const int chunk = threadIdx.x;
                 if (chunk >= 2 * BN / 8) return;
                 const int half = chunk / (BN / 8);
@@ -517,7 +510,22 @@ namespace llaminar2::cuda::prefill
                                 ? source[source_index + i] : uint16_t{0};
                     }
                 };
-                stage_metadata(scales_B, &smem_scales_B[stage][metadata_index(col, half)]);
+                if constexpr (::llaminar2::nativeVnniScalePlaneBytes(CODEBOOK_ID) == 1)
+                {
+                    // cp.async copies elements verbatim and cannot normalize a
+                    // 1-byte E8M0 plane. The eight live scale bytes are loaded and
+                    // normalized to staged words here; compute reads them only
+                    // after the CTA barrier that also joins the async payloads.
+                    uint16_t *destination = &smem_scales_B[stage][metadata_index(col, half)];
+#pragma unroll
+                    for (int i = 0; i < 8; ++i)
+                        destination[i] = kb < num_q40_blocks && gcol + i < N
+                            ? ::llaminar2::native_vnni_scale::loadStagedPrimary<CODEBOOK_ID>(
+                                  scales_B, source_index + i)
+                            : uint16_t{0};
+                }
+                else
+                    stage_metadata(scales_B, &smem_scales_B[stage][metadata_index(col, half)]);
                 if constexpr (NEEDS_MINS)
                     stage_metadata(mins_B, &smem_mins_B[stage][metadata_index(col, half)]);
             }

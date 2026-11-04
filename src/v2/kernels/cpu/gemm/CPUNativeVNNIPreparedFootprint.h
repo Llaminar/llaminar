@@ -50,6 +50,24 @@ namespace llaminar2::cpu::native_vnni
     };
 
     /**
+     * @brief Scale-word encoding of a prepared CPU unit, derived from its physical identity.
+     * @param codebook_id Source codebook retained by the prepared matrix.
+     * @param encoding Physical prepared encoding.
+     * @return PowerOfTwoBF16 only for MXFP4 in its native nibble encoding;
+     *         rotated (expanded INT8) MXFP4 and every other format carry FP16.
+     *
+     * Derived rather than stored, so no construction or import path can leave
+     * it stale; archives and wire records seal it through their version.
+     */
+    [[nodiscard]] constexpr CPUNativeVNNIScaleEncoding preparedScaleEncoding(
+        std::uint8_t codebook_id, CPUNativeVNNIEncoding encoding) noexcept
+    {
+        return codebook_id == 25 && encoding == CPUNativeVNNIEncoding::NibbleLUT
+                   ? CPUNativeVNNIScaleEncoding::PowerOfTwoBF16
+                   : CPUNativeVNNIScaleEncoding::FP16;
+    }
+
+    /**
      * @brief Return whether an encoding value names a supported execution path.
      *
      * Keeping this validation beside the enum lets footprint construction fail

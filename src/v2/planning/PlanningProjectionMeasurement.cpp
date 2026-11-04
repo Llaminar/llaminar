@@ -147,7 +147,8 @@ namespace llaminar2
             pool.addDevice(device.gpu_ordinal());
             if (const auto *format = native_vnni_formats::forQuantType(plan.format))
                 pool.planWeightForOwner(device.gpu_ordinal(), plan.name, plan.n, plan.k,
-                    format->payload_bytes, canonicalDeviceVnniFormat(*format).is_asymmetric, format->has_emins, plan.payload_bytes, kWeightOwner);
+                    format->payload_bytes, canonicalDeviceVnniFormat(*format).is_asymmetric, format->has_emins,
+                    nativeVnniScalePlaneWidth(canonicalDeviceVnniCodebookId(*format)), plan.payload_bytes, kWeightOwner);
             else if (floating(plan))
                 pool.planRawWeightForOwner(device.gpu_ordinal(), plan.name,
                     plan.n, plan.k, plan.payload_bytes, kWeightOwner);
