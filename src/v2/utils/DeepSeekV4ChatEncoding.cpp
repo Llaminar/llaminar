@@ -124,9 +124,10 @@ namespace llaminar2::deepseek4
             ojson arguments = function.contains("arguments") ? function["arguments"] : ojson::object();
             if (arguments.is_string())
             {
-                arguments = ojson::parse(arguments.get<std::string>(), nullptr, false);
+                arguments = parseJsonExact<ojson>(arguments.get<std::string>());
                 if (arguments.is_discarded())
-                    throw std::invalid_argument("DeepSeek-V4 encoder: tool-call arguments are not valid JSON");
+                    throw std::invalid_argument("DeepSeek-V4 encoder: tool-call arguments are not valid JSON "
+                                                "with exactly representable numbers");
             }
             if (!arguments.is_object())
                 throw std::invalid_argument("DeepSeek-V4 encoder: tool-call arguments must be a JSON object");

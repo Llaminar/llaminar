@@ -41,6 +41,23 @@ namespace llaminar2
     bool hasOutOfRangeInteger(std::string_view json_text);
 
     /**
+     * @brief The single lossless JSON parse for text embedded in requests and model output.
+     * @details Python's json module keeps every integer exact; nlohmann would
+     * round integers beyond 64 bits to doubles. Such text is reported as
+     * unparseable (a discarded value) so each caller applies its own
+     * malformed-input policy instead of acting on a different number.
+     * @tparam Json nlohmann::json or nlohmann::ordered_json.
+     * @param text JSON text.
+     * @return Parsed value, or a discarded value when malformed or not exactly representable.
+     */
+    template <class Json>
+    Json parseJsonExact(std::string_view text)
+    {
+        if (hasOutOfRangeInteger(text)) return Json(Json::value_t::discarded);
+        return Json::parse(text, nullptr, false);
+    }
+
+    /**
      * @brief Python repr() of a finite double (shortest round-trip spelling).
      * @param value Finite double.
      * @return For example "0.5", "100.0", "1e-07", "1.5e+16".

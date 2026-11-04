@@ -296,8 +296,27 @@ TEST(Test__DeepSeekV4ChatEncoding, MalformedTypesAndHugeIntegersAreRejected)
     EXPECT_THROW(ChatTemplate::create(ChatTemplateType::DEEPSEEK_V4)->apply(request->messages, ChatEncodingOptions{}),
                  std::invalid_argument);
 
-    // Model output: a huge integer argument keeps its exact text.
-    const auto result = parseDsml(section(invoke("f", param("id", "18446744073709551617", "false"))));
+    // OpenAI arguments are a JSON string: its inner numbers get the same exactness rule.
+    const auto string_args = ChatCompletionHandler::parseRequest(
+        R"({"messages": [{"role": "user", "content": "x"}, {"role": "assistant", "content": null,
+            "tool_calls": [{"id": "c", "type": "function", "function": {"name": "f",
+            "arguments": "{\"id\": 18446744073709551617}"}}]}]})", error);
+    ASSERT_TRUE(string_args) << error.json_body;
+    EXPECT_THROW(ChatTemplate::create(ChatTemplateType::DEEPSEEK_V4)->apply(string_args->messages, ChatEncodingOptions{}),
+                 std::invalid_argument);
+
+    // Model output: an invoke with an inexact typed value, directly or inside a
+    // wrapper string, is never executed with a changed number.
+    const std::string huge = section(invoke("f", param("id", "18446744073709551617", "false")));
+    auto result = parseDsml(huge);
+    EXPECT_TRUE(result.tool_calls.empty());
+    EXPECT_NE(result.content.find("18446744073709551617"), std::string::npos);
+    const auto tools = nlohmann::json::parse(R"([{"type": "function", "function": {"name": "f",
+        "parameters": {"type": "object", "properties": {"id": {"type": "integer"}}}}}])");
+    result = parseDsml(section(invoke("f", param("arguments", "{\"id\": 18446744073709551617}", "true"))), tools);
     ASSERT_EQ(result.tool_calls.size(), 1u);
-    EXPECT_EQ(result.tool_calls[0].arguments, "{\"id\": \"18446744073709551617\"}");
+    EXPECT_EQ(result.tool_calls[0].arguments, "{\"arguments\": \"{\\\"id\\\": 18446744073709551617}\"}");
+    // Other formats share the same lossless authority.
+    EXPECT_TRUE(parseToolCalls("<tool_call>\n{\"name\": \"f\", \"arguments\": {\"id\": 18446744073709551617}}\n</tool_call>",
+                               ToolCallFormat::HERMES_2_PRO).tool_calls.empty());
 }
