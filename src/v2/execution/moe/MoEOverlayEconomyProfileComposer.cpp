@@ -533,6 +533,11 @@ namespace llaminar2
 
     bool MoEOverlayTargetLayerMigrationMeasurement::valid() const noexcept
     {
+        if (measured_coordinate &&
+            (!measured_coordinate->valid() || measured_coordinate->layer == coordinate.layer ||
+             measured_coordinate->source_target.word() != coordinate.source_target.word() ||
+             measured_coordinate->destination_target.word() != coordinate.destination_target.word()))
+            return false;
         if(!coordinate.valid() || !wave_wall_nanoseconds ||
             wave_sample_count<MoEOverlayEconomyProfileComposer::kMinimumMigrationSamples ||
             inference_interference_nanoseconds || interference_sample_count || pieces.empty())return false;

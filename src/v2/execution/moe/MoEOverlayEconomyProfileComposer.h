@@ -22,6 +22,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -116,6 +117,9 @@ namespace llaminar2
         std::uint64_t wave_sample_count = 0;
         std::uint64_t inference_interference_nanoseconds = 0;
         std::uint64_t interference_sample_count = 0;
+        /** Original physically measured coordinate when this row projects an exact equivalent layer.
+         * Empty identifies direct measurements; projection never relabels retained piece geometry. */
+        std::optional<MoEOverlayMigrationTargetCoordinate> measured_coordinate;
         /** @brief Check typed target identity against original passive geometry.
          * @param coordinate Explicit original targets and model layer. @param geometry Checked original geometry.
          * @return Whether both target alternatives and physical member identities agree. */

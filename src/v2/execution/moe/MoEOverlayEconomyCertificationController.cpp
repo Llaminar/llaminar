@@ -367,8 +367,10 @@ namespace llaminar2
                     throw std::logic_error(
                         "Completed ExpertOverlay calibration omitted its sealed evidence");
                 }
-                expanded_migration_measurements_ =
-                    config_.layer_catalog->expand(*representatives);
+                expanded_migration_measurements_ = config_.prepared_target_service_plan
+                    ? config_.layer_catalog->expand(*representatives,
+                        config_.prepared_target_service_plan->snapshot())
+                    : config_.layer_catalog->expand(*representatives);
                 next_service_readiness_attempt_ = {};
                 state_.store(
                     MoEOverlayEconomyCertificationState::

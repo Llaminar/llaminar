@@ -1097,3 +1097,29 @@ Local evidence root: `/tmp/qfn-cpu-joint-qualified-r224/`.
 The original red reports remain intact. Focused repairs do not convert the
 previous complete-preflight receipt into a green one. No complete preflight
 was run for this slice, and no model/corpus reference or arithmetic was changed.
+
+
+## Original-source cohort calibration expansion (r401)
+
+The existing calibration catalog now expands physically measured complete-target
+rows only across layers with matching original source geometry. It validates
+original formats, all cohort members and source cuts through the existing
+calibration planner and physical geometry builder. Projected rows retain their
+actual measured coordinate; they cannot be submitted as fresh physical samples
+or expanded again. Whole-target expansion keeps its existing arithmetic. This
+does not enable Dynamic cohort serving by itself.
+
+`build273-result.json` records the scoped Integration build, with the existing
+CUDA SM80/86/89/90 and ROCm gfx906/gfx1100 spill guards unchanged. In
+`focused274/`, all seven relevant registrations passed: owning residency,
+composer, calibration-controller and measurement-ledger suites; the complete
+CPU target contract; the repeated actual two-socket physical calibration test;
+and the separate unsupported-native-cohort admission contract. No tests skipped
+and the driver window was clean. The complete invocation remained red because
+four ngram planning registrations exposed unrelated stale reader assertions
+and a new fixture missing one compute consumer's resource observation. Those
+failures remain preserved, not reclassified as passes.
+
+This is focused calibration evidence only. The broader Unit/preflight gate,
+Dynamic full-model movement, and Release performance remain unqualified here.
+Local evidence is retained under `/tmp/qfn-cpu-joint-qualified-r224/`.
