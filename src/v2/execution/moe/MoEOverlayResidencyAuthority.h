@@ -17,6 +17,7 @@
 #include "DecodeExpertHistogram.h"
 #include "DeviceMoERebalancePolicyShared.h"
 #include "MoEExpertOwnerMap.h"
+#include "MoEOverlayRouteTarget.h"
 #include "MoELayeredExpertOwnership.h"
 #include "MoEOptimizationStatus.h"
 #include "MoEOverlayNoPeerResidency.h"
@@ -447,7 +448,9 @@ namespace llaminar2
      * @brief One dense root-authored candidate coordinate for distributed use.
      *
      * Every model `(layer, expert)` coordinate names its candidate tier and
-     * physical participant.  Changed coordinates additionally retain the
+     * typed whole participant or complete original fixed CPU cohort. The target
+     * word grants no membership/readiness authority; reconstruction resolves it
+     * against the retained original source on every coordinate. Changed entries retain the
      * exact execution metadata used by migration staging.  Unchanged entries
      * keep that metadata zero so the wire representation has one canonical
      * form and cannot hide a second sparse change set.
@@ -455,7 +458,7 @@ namespace llaminar2
     struct MoEOverlayAuthoritativeResidencyEntry
     {
         int candidate_tier_idx = -1;
-        int candidate_owner_participant = -1;
+        MoEOverlayRouteTarget candidate_target;
         bool changed = false;
         MoEOptimizationMovementAxis axis =
             MoEOptimizationMovementAxis::TierResidency;
@@ -465,8 +468,16 @@ namespace llaminar2
         /** @return Whether this is one canonical dense proposal entry. */
         [[nodiscard]] bool valid() const noexcept;
 
-        bool operator==(
-            const MoEOverlayAuthoritativeResidencyEntry &) const = default;
+        /** @param other Dense original proposal coordinate.
+         * @return Exact target word and movement evidence equality. */
+        bool operator==(const MoEOverlayAuthoritativeResidencyEntry &other) const
+        {
+            return candidate_tier_idx == other.candidate_tier_idx &&
+                   candidate_target.word() == other.candidate_target.word() &&
+                   changed == other.changed && axis == other.axis &&
+                   activation_count == other.activation_count &&
+                   estimated_weight_bytes == other.estimated_weight_bytes;
+        }
     };
 
     /**
@@ -1538,6 +1549,16 @@ namespace llaminar2
             const char *operation) const;
 
         /**
+         * @brief Reconstruct a source-bound proposal without granting maintenance/publication.
+         * @param plan Complete original-stage dense target proposal.
+         * @return Checked unpublished transaction, never readiness or a live epoch.
+         * @throws std::invalid_argument For foreign or missing complete fixed targets.
+         * @note The public entrypoint retains its existing runtime policy guards.
+         */
+        MoEOverlayResidencyTransaction reconstructAuthoritativeResidencyPlan(
+            const MoEOverlayAuthoritativeResidencyPlan &plan);
+
+        /**
          * @brief Derive an unpublished fixed-cohort candidate from this authority's real current
          * epoch.
          * @param expected_live Exact current snapshot retained by the real transition caller.
@@ -1577,6 +1598,21 @@ namespace llaminar2
          * @throws std::runtime_error If no complete cycle fits the admitted wave.
          */
         MoEOverlayResidencyTransaction buildInitialPreparedPlacementRestoration() const;
+
+        /** @brief Keep the original derivation lock alive through production cadence. */
+        struct FrozenHistogramDerivation
+        {
+            MoEOverlayResidencyTransaction transaction;
+            std::unique_lock<std::mutex> economy_lock;
+        };
+        /**
+         * @brief Shared source-bound histogram candidate derivation, without runtime admission.
+         * @param window Original validated recorded logical routing observations.
+         * @return Existing heuristic's transaction with its original economy lock retained.
+         * @throws std::logic_error For unsupported fixed-target axes or missing economy prices.
+         */
+        FrozenHistogramDerivation buildFromFrozenHistogramWindow(
+            std::shared_ptr<const DecodeExpertHistogramWindow> window);
 
         /**
          * @brief Validate and materialize one immutable residency epoch.

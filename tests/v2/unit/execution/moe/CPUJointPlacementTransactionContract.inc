@@ -213,3 +213,43 @@ TEST(CPUJointPlacementTransactionContract, RestorationNoOpRetainsOriginalSourceA
     EXPECT_EQ(authority.snapshot(), before); // Construction never installs a candidate.
     EXPECT_THROW(authority.proposeInitialPreparedPlacementRestoration(), std::logic_error);
 }
+
+/** @test Recorded logical demand uses the actual shared source-bound candidate body, not publication. */
+TEST(CPUJointPlacementTransactionContract, HistogramBodyBuildsFixedTargetCandidatesAndBoundedCycles)
+{
+    using namespace llaminar2;
+    using namespace llaminar2::test;
+    for (bool permuted : {false, true})
+    {
+        JointPlacementOriginal original(2, 1, 6, 1, 0, permuted);
+        auto config = original.config();
+        config.max_concurrent_cycles = 1;
+        config.shadow_slots_per_endpoint_layer = 1;
+        auto enabled_axis = config;
+        enabled_axis.participant_rebalance_policy.enabled = true;
+        EXPECT_THROW(MoEOverlayResidencyAuthority{enabled_axis}, std::invalid_argument);
+        MoEOverlayResidencyAuthority authority(config);
+        const auto before = authority.snapshot();
+        const auto observed = frozenWindow(17, {11, 9, 7, 5, 3, 1});
+        const auto result = MoEOverlayJointPlacementCandidateTestAccess::histogram(authority, observed);
+        ASSERT_TRUE(result.valid());
+        EXPECT_EQ(result.previous, before);
+        EXPECT_EQ(result.histogram_window, observed);
+        EXPECT_EQ(result.candidate->originalProjectionPreparation(), original.preparation);
+        EXPECT_EQ(authority.snapshot(), before);
+        EXPECT_EQ(result.empty(), !permuted);
+        if (permuted)
+        {
+            ASSERT_EQ(result.migration_cycles.size(), 1u);
+            ASSERT_EQ(result.migrations.size(), 2u);
+            for (const auto &edge : result.migrations)
+                EXPECT_EQ(edge.activation_count, observed->activationCount(edge.layer_idx, edge.expert_id));
+            EXPECT_EQ(result.shadow_requirements.size(), 3u); // Whole destination + both CPU members.
+        }
+        auto invalid = std::make_shared<DecodeExpertHistogramWindow>(*observed);
+        invalid->num_experts = 5;
+        EXPECT_THROW(MoEOverlayJointPlacementCandidateTestAccess::histogram(authority, invalid), std::invalid_argument);
+        EXPECT_EQ(authority.snapshot(), before);
+        EXPECT_THROW(authority.proposeFromFrozenHistogramWindow(observed), std::logic_error);
+    }
+}

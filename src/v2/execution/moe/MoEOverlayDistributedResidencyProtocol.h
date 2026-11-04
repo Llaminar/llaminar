@@ -215,7 +215,7 @@ namespace llaminar2
     struct MoEOverlayDistributedResidencyProposalHeader
     {
         static constexpr std::uint32_t kMagic = 0x504F4F4Du; // "MOOP"
-        static constexpr std::uint32_t kABIVersion = 2u;
+        static constexpr std::uint32_t kABIVersion = 3u;
         static constexpr std::size_t kWireBytes = 96u;
 
         std::uint32_t magic = kMagic;

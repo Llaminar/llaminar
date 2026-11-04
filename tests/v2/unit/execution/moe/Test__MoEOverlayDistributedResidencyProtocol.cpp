@@ -945,7 +945,7 @@ namespace llaminar2::test
             .plan = {.expected_epoch = 1, .num_layers = 1, .num_experts = 4,
                 .histogram_window = window,
                 .entries = std::vector<MoEOverlayAuthoritativeResidencyEntry>(4,
-                    {.candidate_tier_idx = 0, .candidate_owner_participant = 0})},
+                    {.candidate_tier_idx = 0, .candidate_target = MoEOverlayRouteTarget::whole(0)})},
             .execution_fingerprint = {.low = 1, .high = 2},
             .policy_fingerprint = {.low = 3, .high = 4},
         };
@@ -958,7 +958,7 @@ namespace llaminar2::test
         ASSERT_NE(decoded.plan.histogram_window->transaction_demand, nullptr);
         EXPECT_EQ(fingerprintDecodeExpertHistogramWindow(*decoded.plan.histogram_window),
                   fingerprintDecodeExpertHistogramWindow(*window));
-        EXPECT_EQ(decoded.plan.entries.back().candidate_owner_participant, 0);
+        EXPECT_EQ(decoded.plan.entries.back().candidate_target.word(), 0);
         auto alternative = proposal;
         alternative.plan.histogram_window = std::make_shared<const DecodeExpertHistogramWindow>(
             demandWindow(admission, {0, 3, 1, 2}));

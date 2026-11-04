@@ -12,6 +12,18 @@ The prepared-bank prerequisite now binds the existing residency registry to its 
 
 The first concrete target is one MI50 continuation GPU and two physical CPU sockets, with rank zero owning the GPU continuation and CPU root, and rank one owning the other CPU fragment. Each CPU expert is tensor-sharded across those sockets. Dynamic movement must promote/demote complete logical experts between the GPU tier and that CPU cohort without assembling a whole CPU expert.
 
+The existing histogram proposal now shares sealed candidate construction for
+whole and fixed-cohort tier choices, unchanged prerequisites and bounded cycle
+subsets. All 74 owning authority tests and five focused registrations pass;
+production cadence retains the original economy lock. The cohort case proves
+source-bound derivation from recorded demand, not enabled dynamic execution.
+The first genuine ROCm/CPU2 prepared compute/rooted-return/reset case also
+passes with exact communication and retirement. Dense whole/cohort proposals now
+round-trip through the existing-size wire and source-bound reconstruction;
+75 authority cases, 30 protocol cases and actual two-rank consensus controls pass.
+Complete cohort service/transfer prices, repeated native reuse and changed-epoch
+publication remain required; public Dynamic/adoption guards are unchanged.
+
 ## Scope: fixed admitted layouts
 
 A placement target may be one whole-expert owner or a complete already-admitted shard cohort. Keep each target's membership, physical endpoints, root/reduction policy, cuts, native contexts, captured graph topology and capacity fixed. Migration between two pre-admitted targets may change the expert's physical partition because the targets have different cuts. That is redistribution between existing layouts, not live cohort or graph repartitioning.

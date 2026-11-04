@@ -2912,7 +2912,7 @@ namespace llaminar2::test
                     6,
                     MoEOverlayAuthoritativeResidencyEntry{
                         .candidate_tier_idx = 0,
-                        .candidate_owner_participant = 0,
+                        .candidate_target = MoEOverlayRouteTarget::whole(0),
                     }),
             },
             .execution_fingerprint = {
@@ -3125,7 +3125,7 @@ namespace llaminar2::test
                         6,
                         MoEOverlayAuthoritativeResidencyEntry{
                             .candidate_tier_idx = 0,
-                            .candidate_owner_participant = 0,
+                            .candidate_target = MoEOverlayRouteTarget::whole(0),
                         }),
                 },
                 .execution_fingerprint = {

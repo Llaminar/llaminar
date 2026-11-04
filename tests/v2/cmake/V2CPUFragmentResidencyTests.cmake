@@ -124,4 +124,23 @@ add_v2_test(V2_Integration_CPUJointRestorationSourceContract
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "${V2_CPU_FRAGMENT_TEST_ENV}")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUJointRestorationSourceContract)
+add_v2_test(V2_Integration_CPUJointHistogramCandidateSourceContract
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_residency_authority>
+        --gtest_filter=CPUJointPlacementTransactionContract.HistogramBodyBuildsFixedTargetCandidatesAndBoundedCycles
+        --gtest_repeat=20 --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;ExpertOverlay;Contract;SourceBinding;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "${V2_CPU_FRAGMENT_TEST_ENV}")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUJointHistogramCandidateSourceContract)
+
+# Append to late V2CPUFragmentResidencyTests.cmake, after its shared environment.
+# Reconstructs unpublished source-bound proposals; does not admit dynamic execution.
+add_v2_test(V2_Integration_CPUJointAuthoritativeTargetContract
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_residency_authority>
+        --gtest_filter=CPUJointAuthoritativeTargetContract.*
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;ExpertOverlay;Protocol;Contract;SourceBinding;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "${V2_CPU_FRAGMENT_TEST_ENV}")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUJointAuthoritativeTargetContract)
+
 unset(V2_CPU_FRAGMENT_TEST_ENV)

@@ -5,7 +5,10 @@
  * The fixture owns the original MPIProcessSession and existing CPU backends.
  * Every native participant occupies a distinct discovered physical socket.
  * Absent socket populations are not launched or qualified.
- * No model or fabricated prepared source/readiness is constructed here.
+ * Domain-only cases construct no model. The ROCm round-trip case additionally
+ * prepares a tiny genuine source and joins its actual GPU dispatch, CPU shards
+ * and rooted return. It supplies no fabricated completion/readiness and makes
+ * no full-model accuracy or deployment qualification claim.
  */
 #include "app/MPIProcessSession.h"
 #include "collective/GlobalTPContext.h"
@@ -22,6 +25,7 @@
 #include <optional>
 #include <variant>
 #include <algorithm>
+#include "CPUJointCapturedPacketLifecycle.inc"
 using namespace llaminar2;
 namespace {
 class CPUExpertDomainNative : public ::testing::Test {
@@ -154,4 +158,9 @@ TEST_F(CPUExpertDomainNative, UPIFourPhysicalSockets){originalDomain(CollectiveB
 TEST_F(CPUExpertDomainNative, MPIFourPhysicalSockets){originalDomain(CollectiveBackendType::MPI,4);}
 TEST_F(CPUExpertDomainNative, UPIEightPhysicalSockets){originalDomain(CollectiveBackendType::UPI,8);}
 TEST_F(CPUExpertDomainNative, MPIEightPhysicalSockets){originalDomain(CollectiveBackendType::MPI,8);}
+#ifdef HAVE_ROCM
+/** @test One actual original-epoch nonempty ROCm/CPU2 round trip and successful reset. */
+TEST_F(CPUExpertDomainNative, ROCmPreparedRootedPacketRoundTrip) { rooted_packet_lifecycle::run(DeviceId::rocm(0)); }
+#endif
+
 }

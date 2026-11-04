@@ -11,6 +11,22 @@ namespace llaminar2::test
 {
     struct MoEOverlayJointPlacementCandidateTestAccess
     {
+        /** @return Actual candidate-body result only; never runtime publication or readiness. */
+        static MoEOverlayResidencyTransaction histogram(MoEOverlayResidencyAuthority &authority,
+            std::shared_ptr<const DecodeExpertHistogramWindow> window)
+        {
+            auto derived = authority.buildFromFrozenHistogramWindow(std::move(window));
+            return std::move(derived.transaction);
+        }
+
+        /** @return Actual source-bound reconstruction only; no runtime permission or publication. */
+        static MoEOverlayResidencyTransaction reconstruct(
+            MoEOverlayResidencyAuthority &authority,
+            const MoEOverlayAuthoritativeResidencyPlan &plan)
+        {
+            return authority.reconstructAuthoritativeResidencyPlan(plan);
+        }
+
         /** @return Source-bound restoration structure only, never publication/readiness. */
         static MoEOverlayResidencyTransaction restoration(const MoEOverlayResidencyAuthority &authority)
         {

@@ -34,8 +34,9 @@ namespace llaminar2::test
              * @param experts Original tiny source E; three experts remain in the CPU tier.
              * @param layer_count Original contiguous layer count.
              * @param first Nonzero model-global layer origin when testing selected scopes.
+             * @param permuted Swap two complete whole/cohort pairs before original preparation.
              */
-            explicit JointPlacementOriginal(int members = 2, int whole_members = 1, int experts = 4, int layer_count = 1, int first = 0)
+            explicit JointPlacementOriginal(int members = 2, int whole_members = 1, int experts = 4, int layer_count = 1, int first = 0, bool permuted = false)
                 : expert_count(experts), layers(layer_count), first_layer(first),
                   file(true, false, GGUFTensorType::F32, 64, std::nullopt, 8,
                        PlanningGGUFFixture::Geometry::FullAttentionGraph, uint32_t(first + layer_count), uint32_t(experts))
@@ -62,6 +63,12 @@ namespace llaminar2::test
                     cohort.participants.push_back(GlobalDeviceAddress::cpu(member));
                     cohort.world_ranks.push_back(member);
                 }
+                if (permuted)
+                    for (auto &placement : plan.placements)
+                    {
+                        std::swap(placement.routed_expert_tier.at(0), placement.routed_expert_tier.at(experts - 3));
+                        std::swap(placement.routed_expert_tier.at(1), placement.routed_expert_tier.at(experts - 2));
+                    }
                 plan.residency_policy = RoutedExpertResidencyPolicy::StaticById;
                 plan.authority_execution = resolveMoEOverlayAuthorityExecutionKind(plan);
                 const auto original = std::make_shared<const MoERoutedExpertPlacementPlan>(plan);

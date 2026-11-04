@@ -243,10 +243,95 @@ fixtures. These receipts are under `/tmp/qfn-cpu-joint-qualified-r224/`.
 These GPU packet traces use fresh channels and terminal cancellation after
 inspection; they do not invent CPU completion or reset a cancelled channel.
 They prove capture-before-bank-change dispatch, not repeated successful
-GPU-to-CPU compute/return transactions or global cohort movement. The genuine
-two-socket rooted lifecycle test is the next independent obligation. Dynamic
-cohort inference, controller cost qualification, fresh model KL, Release
-performance and complete preflight remain unqualified.
+GPU-to-CPU compute/return transactions or global cohort movement. The first genuine
+two-socket rooted round trip is qualified below; repeated successful reuse and
+CUDA remain separate obligations. Dynamic cohort inference, controller cost
+qualification, fresh model KL, Release performance and complete preflight
+remain unqualified.
+
+## First prepared ROCm/CPU rooted round trip
+
+`common-cpu-native188` passes the genuine two-socket case in 3.38 seconds with
+no skips and clean driver evidence. One actual MPI rank occupies each physical
+socket; rank zero owns the ROCm continuation and CPU root, and rank one computes
+the other fragment. Both use original nonzero FP32 GGUF preparation and admitted
+CPU storage. This is a reduced common-MoE integration case, not a QFN model KL
+or throughput result.
+
+One retained graph publishes the actual source-local ticket and remote packet,
+then consumes the contributor completion and the root's canonical result. Both
+CPU shards execute their actual prepared engines and original rooted collective.
+The test checks a live nine-row prefix inside capacity 64, exact native gather
+and dispatch bytes, zero contributor return bytes, original slot placement,
+untouched output tails, final epoch-reader release and native-domain retirement.
+It observes successful endpoint completion and resets the original protocol;
+terminal cancellation does not stand in for success. Both temporary GGUFs retire
+normally. The output oracle checks forwarding against the actual root result;
+independent fragment arithmetic remains in its existing owning suite.
+
+Fixture repairs retain the production contracts: only the original root owns
+canonical storage, grouped roots and named scratch have separate exact BOM
+terms, the local return uses the production certificate-only layout, and the CPU
+follower activates before waiting for publication and consuming once. Unexpected
+exceptions now report before the admitted native owner unwinds and abort the
+actual MPI job promptly. No production guard was relaxed for these repairs.
+
+This case covers one nonempty prefill invocation followed by successful reset.
+Repeated nonempty/empty/small reuse, CUDA, other successful phases and changed
+placement epochs remain pending. Builds181/183/185/187 and the reduced failure
+receipts retain the path to this first green native result; they are not model
+accuracy or Release performance measurements.
+
+## Shared histogram candidate construction
+
+The existing histogram proposal now uses one candidate-construction boundary
+for complete tier targets, unchanged prerequisites and bounded cycle subsets.
+Fixed CPU cohorts use the sealed current-source producer and exact member
+capacity checks; ordinary whole ownership retains its existing path. This
+avoids assigning the cohort sentinel to a scalar owner or duplicating migration,
+cycle and shadow derivation. The original economy lock remains held through
+production histogram cadence, including when the shared derivation returns.
+
+`common-cpu-host180` passes six scoped registrations in 4.14 seconds, including
+all 74 cases in the owning residency-authority suite, pipeline-stage contracts,
+existing dependent-cycle and nonblocking-demand cases, and 20 repetitions of the
+new source-bound candidate contract. The new case exercises unchanged placement
+and a bounded whole/cohort exchange from genuine preparation and recorded
+logical demand. It checks original activation counts, all member shadows and
+absence of publication. There are no skips; build179 is coherent and passes.
+
+This proves candidate construction, not an enabled cohort controller. The
+public Static/Dynamic guards remain. Enabled scalar participant rearrangement
+and joint economy without complete member/intersection prices are rejected;
+no enabled policy axis is silently removed. The existing promotion/demotion
+criteria remain the target for both whole and sharded experts. Actual cohort
+service/movement measurements, distributed adoption, ownership publication and
+complete native inference remain separate obligations.
+
+## Dense distributed cohort targets
+
+Dense authoritative entries now carry the same checked whole-owner/cohort target
+used by the live GPU placement bank. The proposal header remains 96 bytes and
+each live entry remains 28 bytes; semantic ABI 3 rejects the former scalar-only
+ABI 2. Every changed and unchanged coordinate is reconstructed against the
+receiver's original fixed source layout. Export requires the authority's actual
+current source snapshot. Existing semantic execution identity includes original
+cohort members, cuts and native format metadata once per declaration; no model
+weights or source files are hashed.
+
+`common-cpu-focused190` passes all five selected registrations in 6.14 seconds:
+75 authority cases, 30 protocol cases, 20 real MPI consensus/publication cases
+per rank, the new complete-target source contract, and the ROCm rooted round
+trip. It has no skips and clean driver evidence; build189 coherently rebuilds
+all affected owners. The metadata contract covers declared cohorts of two
+through eight members, old-ABI rejection, absent/foreign/scalar aliases, partial
+plans, foreign export authority and mismatched original cuts/members. This does
+not claim additional physical sockets.
+
+Reconstruction remains behind the public Dynamic/admission guards. These
+results qualify unpublished proposals and existing whole-owner MPI behavior;
+actual changed-epoch cohort staging, publication, service/transfer economy and
+model inference still require their own complete proof.
 
 ## CUDA native-program stack
 

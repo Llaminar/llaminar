@@ -1522,7 +1522,9 @@ namespace llaminar2
             axis == MoEOptimizationMovementAxis::ParticipantPlacement ||
             axis == MoEOptimizationMovementAxis::Combined;
         return candidate_tier_idx >= 0 &&
-               candidate_owner_participant >= 0 && valid_axis &&
+               !candidate_target.isAbsent() &&
+               (!candidate_target.isCPUCohort() ||
+                candidate_target.word() == -std::int64_t(candidate_tier_idx) - 2) && valid_axis &&
                (changed ||
                 (activation_count == 0 && estimated_weight_bytes == 0));
     }
@@ -3680,6 +3682,25 @@ namespace llaminar2
             throw std::logic_error(
                 "ExpertOverlay cannot propose from a sealed economy profile before request-boundary demand activation");
         }
+        auto result = buildFromFrozenHistogramWindow(std::move(window));
+        // The derivation retains the original economy lock through cadence.
+        advanceHistogramWindowAfterProposal(result.transaction);
+        return std::move(result.transaction);
+    }
+
+    MoEOverlayResidencyAuthority::FrozenHistogramDerivation
+    MoEOverlayResidencyAuthority::buildFromFrozenHistogramWindow(
+        std::shared_ptr<const DecodeExpertHistogramWindow> window)
+    {
+        const auto current = snapshot();
+        const bool joint = current && current->ownershipKind() ==
+            MoEOverlayResidencyOwnershipKind::CPUJointFragments;
+        // Structural candidate support is not member-cost certification. Never
+        // silently suppress an enabled placement axis or price cohort sentinel -1.
+        if (joint && config_.participant_rebalance_policy.enabled)
+            throw std::logic_error("Fixed CPU cohort candidates do not support scalar participant rearrangement");
+        if (joint && config_.migration_economy_policy)
+            throw std::logic_error("Fixed CPU cohort candidates require certified member/intersection economy prices");
         if (!window || !window->valid() ||
             window->num_layers != config_.model_metadata.num_layers ||
             window->first_model_layer != config_.model_metadata.first_model_layer ||
@@ -3756,11 +3777,23 @@ namespace llaminar2
             config_.model_metadata,
             options);
 
-        auto tier_target_candidate = buildSnapshot(
-            previous->epoch + 1,
-            std::move(planned.planned_plan),
-            config_.model_metadata,
-            &previous->owner_map);
+        // Every tier/subset candidate shares one source-bound constructor.
+        // Ordinary explicit ownership remains scalar; fixed cohorts retain the
+        // original preparation and complete member target through the sealed producer.
+        const auto build_candidate = [&](MoERoutedExpertPlacementPlan plan,
+                                         const MoELayeredExpertOwnership *ownership = nullptr)
+        {
+            if (joint)
+            {
+                auto candidate = prepareCPUJointPlacementCandidate(previous, previous->epoch,
+                    std::move(plan.placements));
+                requireCapacityPreserving(*previous, *candidate);
+                return candidate;
+            }
+            return buildSnapshot(previous->epoch + 1, std::move(plan),
+                config_.model_metadata, &previous->owner_map, ownership);
+        };
+        auto tier_target_candidate = build_candidate(std::move(planned.planned_plan));
 
         std::vector<MoELayeredExpertOwnershipChange> participant_changes;
         const auto build_transaction =
@@ -3841,19 +3874,14 @@ namespace llaminar2
                     placement->routed_expert_tier[
                         static_cast<std::size_t>(migration.expert_id)] =
                         migration.destination.tier_idx;
-                    subset_ownership.assignOwner(
+                    if (!joint) subset_ownership.assignOwner(
                         migration.layer_idx,
                         migration.expert_id,
                         migration.destination.owner_participant);
                 }
             }
 
-            auto subset_snapshot = buildSnapshot(
-                previous->epoch + 1,
-                std::move(subset_plan),
-                config_.model_metadata,
-                &previous->owner_map,
-                &subset_ownership);
+            auto subset_snapshot = build_candidate(std::move(subset_plan), &subset_ownership);
             requireCapacityPreserving(*previous, *subset_snapshot);
             return build_transaction(
                 std::move(subset_snapshot), movement_objectives);
@@ -3882,11 +3910,7 @@ namespace llaminar2
              * participant skew against the optimizer's complete future tier
              * target would compare against a state this wave cannot reach.
              */
-            participant_base_candidate = buildSnapshot(
-                previous->epoch + 1,
-                *previous->placement_plan,
-                config_.model_metadata,
-                &previous->owner_map,
+            participant_base_candidate = build_candidate(*previous->placement_plan,
                 &previous->layered_ownership);
             participant_base_tier_cycles = 0u;
         }
@@ -4148,18 +4172,13 @@ namespace llaminar2
                             static_cast<std::size_t>(
                                 migration.expert_id)] =
                             migration.destination.tier_idx;
-                        subset_ownership.assignOwner(
+                        if (!joint) subset_ownership.assignOwner(
                             migration.layer_idx,
                             migration.expert_id,
                             migration.destination.owner_participant);
                     }
                 }
-                return buildSnapshot(
-                    previous->epoch + 1,
-                    std::move(subset_plan),
-                    config_.model_metadata,
-                    &previous->owner_map,
-                    &subset_ownership);
+                return build_candidate(std::move(subset_plan), &subset_ownership);
             };
 
             participant_base_candidate =
@@ -4222,7 +4241,7 @@ namespace llaminar2
                       ObservedTransactionServiceObjective>>{
                       std::ref(*observed_service)}
                 : std::nullopt;
-        const auto participant_plan = planOverlayParticipantRebalance(
+        const auto participant_plan = joint ? ParticipantRebalancePlan{} : planOverlayParticipantRebalance(
             *participant_base_candidate->placement_plan,
             participant_base_candidate->owner_map,
             planning_evidence,
@@ -5212,8 +5231,7 @@ namespace llaminar2
         {
             if (!config_.migration_economy_policy)
             {
-                advanceHistogramWindowAfterProposal(candidate);
-                return candidate;
+                return FrozenHistogramDerivation{std::move(candidate), std::move(economy_lock)};
             }
 
             auto evidence = economy_evidence;
@@ -5330,8 +5348,7 @@ namespace llaminar2
                     static_cast<long double>(
                         closest_rejected_payoff->shortfall_ns));
             }
-            advanceHistogramWindowAfterProposal(candidate);
-            return candidate;
+            return FrozenHistogramDerivation{std::move(candidate), std::move(economy_lock)};
         };
 
         if (full_transaction.empty())
@@ -6417,8 +6434,6 @@ namespace llaminar2
     MoEOverlayResidencyAuthority::exportAuthoritativeResidencyPlan(
         const MoEOverlayResidencyTransaction &transaction) const
     {
-        if(config_.projection_preparation && config_.projection_preparation->cpuJointOwnerMap())
-            throw std::logic_error("CPU joint fragments cannot export a scalar migration plan");
         if (!transaction.valid() ||
             transaction.purpose !=
                 MoEOverlayResidencyTransactionPurpose::PlacementChange ||
@@ -6430,6 +6445,10 @@ namespace llaminar2
             throw std::invalid_argument(
                 "Only a valid live ExpertOverlay placement transaction can be published as an authoritative plan");
         }
+        const auto current = snapshot();
+        if (!current || current.get() != transaction.previous.get() ||
+            current.owner_before(transaction.previous) || transaction.previous.owner_before(current))
+            throw std::logic_error("Authoritative export requires this authority's exact current source");
         if (transaction.previous->epoch != transaction.expected_epoch ||
             transaction.candidate->epoch != transaction.expected_epoch + 1u)
         {
@@ -6483,10 +6502,10 @@ namespace llaminar2
             for (int expert_id = 0; expert_id < plan.num_experts; ++expert_id)
             {
                 const auto *previous_owner =
-                    transaction.previous->owner_map.ownerFor(
+                    transaction.previous->placementOwnerMap().placementFor(
                         layer_idx, expert_id);
                 const auto *candidate_owner =
-                    transaction.candidate->owner_map.ownerFor(
+                    transaction.candidate->placementOwnerMap().placementFor(
                         layer_idx, expert_id);
                 if (!previous_owner || !candidate_owner)
                 {
@@ -6498,17 +6517,17 @@ namespace llaminar2
                 entry.candidate_tier_idx =
                     placement->routed_expert_tier[
                         static_cast<size_t>(expert_id)];
-                entry.candidate_owner_participant =
-                    candidate_owner->owner_participant;
+                const auto checked_target = MoEExpertPlacementTarget::fromPlacement(*candidate_owner);
+                if (!checked_target)
+                    throw std::logic_error("Authoritative candidate has an incomplete fixed target");
+                entry.candidate_target = checked_target->isCohort()
+                    ? MoEOverlayRouteTarget::cpuCohort(candidate_owner->tier_idx)
+                    : MoEOverlayRouteTarget::whole(candidate_owner->owner_participant);
 
                 const auto migration = migration_by_coordinate.find(
                     {layer_idx, expert_id});
                 const bool snapshot_changed =
-                    previous_owner->tier_idx != candidate_owner->tier_idx ||
-                    previous_owner->owner_participant !=
-                        candidate_owner->owner_participant ||
-                    previous_owner->domain_name !=
-                        candidate_owner->domain_name;
+                    !(*previous_owner == *candidate_owner);
                 if (migration == migration_by_coordinate.end())
                 {
                     if (snapshot_changed)
@@ -6521,8 +6540,7 @@ namespace llaminar2
                 if (!snapshot_changed ||
                     migration->second->destination.tier_idx !=
                         entry.candidate_tier_idx ||
-                    migration->second->destination.owner_participant !=
-                        entry.candidate_owner_participant)
+                    !(migration->second->destination == *candidate_owner))
                 {
                     throw std::logic_error(
                         "ExpertOverlay authoritative migration disagrees with its candidate snapshot");
@@ -6555,6 +6573,13 @@ namespace llaminar2
             throw std::logic_error(
                 "Only Dynamic ExpertOverlay maintenance may adopt an authoritative plan");
         }
+        return reconstructAuthoritativeResidencyPlan(plan);
+    }
+
+    MoEOverlayResidencyTransaction
+    MoEOverlayResidencyAuthority::reconstructAuthoritativeResidencyPlan(
+        const MoEOverlayAuthoritativeResidencyPlan &plan)
+    {
         if (!plan.valid() ||
             plan.num_layers != config_.model_metadata.num_layers ||
             plan.firstModelLayer() != config_.model_metadata.first_model_layer ||
@@ -6600,19 +6625,37 @@ namespace llaminar2
                 placement->routed_expert_tier[
                     static_cast<size_t>(expert_id)] =
                     entry.candidate_tier_idx;
-                candidate_ownership.assignOwner(
-                    layer_idx,
-                    expert_id,
-                    entry.candidate_owner_participant);
+                if (!previous->originalProjectionPreparation())
+                {
+                    if (!entry.candidate_target.isWhole())
+                        throw std::invalid_argument("Whole source cannot adopt a CPU cohort tag");
+                    candidate_ownership.assignOwner(layer_idx, expert_id, entry.candidate_target.word());
+                }
             }
         }
 
-        auto candidate = buildSnapshot(
-            previous->epoch + 1u,
-            std::move(candidate_plan),
-            config_.model_metadata,
-            &previous->owner_map,
-            &candidate_ownership);
+        auto candidate = previous->originalProjectionPreparation()
+            ? prepareCPUJointPlacementCandidate(previous, previous->epoch, candidate_plan.placements)
+            : buildSnapshot(previous->epoch + 1u, std::move(candidate_plan),
+                            config_.model_metadata, &previous->owner_map, &candidate_ownership);
+        // Authenticate every dense coordinate, including unchanged targets, against
+        // the actual source-derived complete placement. A cohort tag is not membership.
+        for (int row = 0; row < plan.num_layers; ++row)
+            for (int expert = 0; expert < plan.num_experts; ++expert)
+            {
+                const int layer = plan.firstModelLayer() + row;
+                const auto *owner = candidate->placementOwnerMap().placementFor(layer, expert);
+                const auto target = owner ? MoEExpertPlacementTarget::fromPlacement(*owner) : std::nullopt;
+                if (!target)
+                    throw std::invalid_argument("Authoritative target lacks a complete original placement");
+                const auto expected = target->isCohort()
+                    ? MoEOverlayRouteTarget::cpuCohort(owner->tier_idx)
+                    : MoEOverlayRouteTarget::whole(owner->owner_participant);
+                const auto &entry = plan.entries[plan.offset(layer, expert)];
+                if (entry.candidate_tier_idx != owner->tier_idx ||
+                    entry.candidate_target.word() != expected.word())
+                    throw std::invalid_argument("Authoritative target differs from the complete original source placement");
+            }
         requireCapacityPreserving(*previous, *candidate);
 
         MoEOverlayResidencyTransaction transaction;
@@ -6630,10 +6673,10 @@ namespace llaminar2
             {
                 const auto &entry =
                     plan.entries[plan.offset(layer_idx, expert_id)];
-                const auto *source = previous->owner_map.ownerFor(
+                const auto *source = previous->placementOwnerMap().placementFor(
                     layer_idx, expert_id);
                 const auto *destination =
-                    transaction.candidate->owner_map.ownerFor(
+                    transaction.candidate->placementOwnerMap().placementFor(
                         layer_idx, expert_id);
                 if (!source || !destination)
                 {
@@ -6641,10 +6684,7 @@ namespace llaminar2
                         "Distributed ExpertOverlay authoritative plan resolved an incomplete owner map");
                 }
                 const bool changed =
-                    source->tier_idx != destination->tier_idx ||
-                    source->owner_participant !=
-                        destination->owner_participant ||
-                    source->domain_name != destination->domain_name;
+                    !(*source == *destination);
                 if (changed != entry.changed)
                 {
                     throw std::logic_error(
