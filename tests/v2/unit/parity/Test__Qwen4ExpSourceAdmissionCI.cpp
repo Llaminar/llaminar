@@ -325,3 +325,29 @@ TEST(Qwen4ExpSourceAdmissionCI, CPUJointSourceObservationCountUsesOriginalLocalM
     EXPECT_EQ(qwen4ExpCPUJointSourceExpectedLayerObservations(whole,members,1),0u);
     plan.placements.clear();EXPECT_EQ(qwen4ExpCPUJointSourceExpectedLayerObservations(plan,members,0),0u);
 }
+
+/** @test Native exact resource evidence retains original ranks without a frozen-history descriptor. */
+TEST(Qwen4ExpSourceAdmissionCI, CPUJointExactResourcesUseOriginalInventoryWithoutFrozenHistory)
+{
+    for (int population : {2, 4, 8})
+    {
+        const auto cell=recordedSocketCell(population);
+        auto inventory=originalSocketRecords(population);
+        for(auto& rank:inventory.ranks)rank.cpu_worker_threads=3+rank.rank;
+        for(int rank=0;rank<population;++rank)
+        {
+            const auto facts=qwen4ExpCPUJointExactRankResources(cell,inventory,rank);
+            EXPECT_EQ(facts.rank,rank);EXPECT_EQ(facts.world_size,population);
+            EXPECT_EQ(facts.node,7);EXPECT_EQ(facts.numa,rank);
+            EXPECT_EQ(facts.socket,11+rank*3);EXPECT_EQ(facts.workers,3+rank);
+        }
+        EXPECT_THROW(qwen4ExpCPUJointExactRankResources(cell,inventory,-1),std::invalid_argument);
+        EXPECT_THROW(qwen4ExpCPUJointExactRankResources(cell,inventory,population),std::invalid_argument);
+        auto missing=inventory;missing.ranks.pop_back();
+        EXPECT_THROW(qwen4ExpCPUJointExactRankResources(cell,missing,0),std::invalid_argument);
+        auto aliased=inventory;aliased.ranks[1].cpu.numa_node=0;
+        EXPECT_THROW(qwen4ExpCPUJointExactRankResources(cell,aliased,0),std::invalid_argument);
+        inventory.ranks[0].cpu_worker_threads=0;
+        EXPECT_THROW(qwen4ExpCPUJointExactRankResources(cell,inventory,0),std::invalid_argument);
+    }
+}

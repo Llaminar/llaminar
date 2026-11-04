@@ -226,6 +226,13 @@ namespace llaminar2
         /** @brief Borrow exact already-published source worker; never discover, register or create a context. */
         PreparedGPUContextUsePermit retainExistingPreparedContext(DeviceId,const std::shared_ptr<PhysicalMemoryAuthority>&);
 
+        /** @brief Identify an existing source-prepared CUDA generation without creating it.
+         * @param device Original CUDA endpoint.
+         * @param memory Exact original PMA control block; aliases are rejected.
+         * @return Whether graph requirements must fit the fixed source-birth stack policy.
+         */
+        bool hasPreparedNativeProgramStack(DeviceId device,const std::shared_ptr<PhysicalMemoryAuthority>& memory) const;
+
         /** @brief Reject unsupported late context-stack growth for original source-prepared generations. */
         void requireOrdinaryContextStackGrowth(DeviceId,const std::shared_ptr<PhysicalMemoryAuthority>&) const;
 

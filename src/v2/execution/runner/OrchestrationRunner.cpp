@@ -19642,7 +19642,9 @@ namespace llaminar2
                     for (const auto &binding : moe_pipeline_stage_bindings_)
                     {
                         std::string error;
-                        if (!binding->owners().residency->finalizeInitialBanksFromPreparedRegistry(weights->expertGemmRegistry(), &error))
+                        if (!binding->owners().residency->bindOriginalPreparedContext(model_ctx_,
+                                binding->owners().residency->projectionPreparation(),&error) ||
+                            !binding->owners().residency->finalizeInitialBanksFromPreparedRegistry(weights->expertGemmRegistry(), &error))
                             return setError("MoE pipeline prepared banks are incomplete: " + error);
                         recordInitialMoEOverlayBankSelections(*binding->owners().residency,
                             binding->plan()->owner_order, binding->metadata().main_inference_layer_count);
@@ -19703,7 +19705,9 @@ namespace llaminar2
                     }
 
                     std::string error;
-                    if (!moe_expert_overlay_participant_residency_
+                    if (!moe_expert_overlay_participant_residency_->bindOriginalPreparedContext(model_ctx_,
+                            moe_expert_overlay_participant_residency_->projectionPreparation(),&error) ||
+                        !moe_expert_overlay_participant_residency_
                              ->finalizeInitialBanksFromPreparedRegistry(
                                  weight_manager->expertGemmRegistry(),
                                  &error))

@@ -24,6 +24,10 @@
 #include <mutex>
 #include "CapturedTransferChannelReplayProbe.h"
 #include "backends/BackendManager.h"
+#include "backends/NativeContextOpaqueContract.h"
+#ifdef HAVE_CUDA
+#include "backends/cuda/CUDABackend.h"
+#endif
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IGPUGraphCapture.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
@@ -481,6 +485,28 @@ namespace
         if (original) original->admit(builder.build());
         auto authority = original ? original->memory() : std::make_shared<PhysicalMemoryAuthority>(
             std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(builder.build()), rank.rank);
+#ifdef HAVE_CUDA
+        if(original && first.is_cuda()) {
+            // Verify birth capacity after final admission and BEFORE any NCCL
+            // communicator exists. This
+            // must fail under the original unprovisioned constructor, rather
+            // than depending on a library warmup or a late graph byte claim.
+            for(const auto device:{first,second}) {
+                auto& worker=GPUDeviceContextPool::instance().getContext(device);
+                auto* backend=dynamic_cast<CUDABackend*>(getBackendFor(device));
+                ASSERT_NE(backend,nullptr);
+                worker.submitAndWait([&] {
+                    backend->prepareNativeExecutionContextStorage(CUDANativeProgramStack::capacityBytes,
+                        device.ordinal,worker.defaultStream(),original->permit(device).memory());
+                    EXPECT_THROW(backend->prepareNativeExecutionContextStorage(CUDANativeProgramStack::capacityBytes+1u,
+                        device.ordinal,worker.defaultStream(),original->permit(device).memory()),std::runtime_error);
+                    // Original late-growth prohibition remains unchanged.
+                    EXPECT_THROW(GPUDeviceContextPool::instance().requireOrdinaryContextStackGrowth(
+                        device,original->permit(device).memory()),std::runtime_error);
+                });
+            }
+        }
+#endif
         auto &transfer = TransferEngine::instance();
         if (original)
         {
@@ -1016,6 +1042,13 @@ TEST(CapturedTransferPeerAdmission,ROCmOriginalInventory)
 #endif
 
 #include "PooledReplicatedReaderNativeReplay.inc"
+
+/** @test Original source birth plus two native patterns replay without late stack admission or warmup. */
+TEST(CapturedTransferNativeProgramStack, CUDAOriginalSourceReplay) {
+    roundTrip(DeviceId::cuda(0),DeviceId::cuda(1),
+        {.capacity=1440,.bytes={1440},.offsets={16},.replays=3,.patterns=2,
+         .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.fixed_native_collective=true,.warmups=0});
+}
 
 /** @test Fixed native library floor, not variable-count ngram qualification. */
 TEST(CapturedTransferChannelFloor, CUDA_NativeForward_Header64) {

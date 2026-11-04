@@ -695,7 +695,9 @@ inline std::vector<PerfStatRecord> beginQwen4ExpSourceMTPEvidence(const ModelPar
 }
 /** @brief Observe shared source/MTP materialization, including special table cases.
  * @param cell Existing typed source identity.
+ * @param rank Original MPI rank used to authenticate continuation versus expert-only source role.
  * @param authored Original projected policy before planning.
+ * @param rank Original MPI rank used to authenticate continuation or expert-only ownership.
  * @param runner_value Initialized real source runner.
  * @param reuse_value Original retained model/PMA certificate.
  * @param output Owned source evidence directory.
@@ -706,7 +708,7 @@ inline std::vector<PerfStatRecord> beginQwen4ExpSourceMTPEvidence(const ModelPar
  * Only enabled execution requires speculative serving setup-family evidence;
  * no inference or generation-controller execution occurs here.
  */
-inline void expectQwen4ExpSourceMTPMaterialization(const ModelParityCase &cell,
+inline void expectQwen4ExpSourceMTPMaterialization(const ModelParityCase &cell, int rank,
                                                    const OrchestrationConfig &authored,
                                                    IOrchestrationRunner &runner_value,
                                                    const ModelContextReuseContract &reuse_value,
@@ -850,10 +852,12 @@ inline void expectQwen4ExpSourceMTPMaterialization(const ModelParityCase &cell,
         const auto host_setup = reuse->pipeline_prepared_plan ||
             (resolved_overlay && resolved_overlay->usesExpertOverlayAuthority())
             ? Qwen4ExpMTPHostSetup::OverlayMaterialized : Qwen4ExpMTPHostSetup::OrdinaryDeferred;
-        const auto expected = qwen4ExpMTPSourceServingParticipants(runner->executionPlan(), programs, host_setup);
-        planned_serving_participants = expected.size();
+        const auto expected = qwen4ExpMTPSourceServingParticipants(cell, rank, authored, runner->executionPlan(),
+            *DeviceManager::instance().hardware(), programs, host_setup);
+        planned_serving_participants = std::count_if(expected.begin(), expected.end(), [](const auto &leaf)
+            { return leaf.role == Qwen4ExpMTPSourceParticipantRole::Continuation; });
         deferred_host_participants = std::count_if(expected.begin(), expected.end(), [](const auto &leaf)
-                                                   { return !leaf.completion_required; });
+                                                   { return leaf.role == Qwen4ExpMTPSourceParticipantRole::Continuation && !leaf.completion_required; });
         ASSERT_NO_THROW(setup_participants = requireQwen4ExpMTPSourceSetupFamilies(
                             setup_before, PerfStatsCollector::snapshot(), expected));
     }
@@ -1079,7 +1083,7 @@ inline void admitQwen4ExpSource(const ModelParityCase &cell)
     EXPECT_GT(store->size(), 0u);
     EXPECT_EQ(store->physicalMemoryAuthority(), reuse->physical_memory_authority);
     ASSERT_NO_FATAL_FAILURE(expectQwen4ExpSourceMTPMaterialization(
-        cell,authored,*runner,*reuse,output,setup_before));
+        cell,rank,authored,*runner,*reuse,output,setup_before));
     if (config.moe_routed_expert_plan)
     {
         ASSERT_NE(reuse->prepared_routed_weight_plan, nullptr);

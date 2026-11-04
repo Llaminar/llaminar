@@ -14,6 +14,22 @@
 #include <string>
 namespace llaminar2 {
 namespace test { struct NativeContextPreparationReplayAccess; }
+/**
+ * @brief Fixed CUDA native-program stack policy within the existing worker opaque commitment.
+ *
+ * The 2 KiB candidate covers the selected native library program before source
+ * sealing. It is not a physical-byte estimate or a per-graph allowance. Worker
+ * birth provisions it; graph inspection may only verify, never grow, this cap.
+ * Native qualification must exercise the actual configured library kernels.
+ */
+struct CUDANativeProgramStack final {
+    static constexpr std::size_t capacityBytes = 2048u;
+    /** @brief Reject an unmet source capacity or an oversized captured program.
+     * @param required Actual captured-kernel local bytes per thread.
+     * @param actual Actual driver stack capacity after original source birth.
+     */
+    static void requirePrepared(std::size_t required, std::size_t actual);
+};
 /** @brief The actual constructor population, not a selectable transport or inference mode. */
 enum class NativeContextBirthPopulation { InitialBackendContext, AdditionalContext };
 /** @brief Complete immutable physical/source/geometry closure of the measured constructor. */

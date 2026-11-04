@@ -23,7 +23,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
+#include <variant>
+#include <utility>
 #include <vector>
 
 namespace llaminar2
@@ -54,6 +57,58 @@ namespace llaminar2
          * @return Structural metadata equality, independent of a shared cohort wrapper address.
          * @note Original source liveness and native prepared authority remain separate guards. */
         bool operator==(const MoEExpertOwner &other) const;
+    };
+
+    /**
+     * @brief One physical placement vertex: a whole owner or a complete shard cohort.
+     *
+     * This immutable value is derived from the canonical owner row. It owns no
+     * capacity or live placement ledger. A cohort consumes one fragment slot at
+     * every original member, but remains one logical expert at the tier. Keeping
+     * the alternatives typed prevents the cohort's absent scalar owner (-1)
+     * from accidentally becoming a physical endpoint or joining unrelated cycles.
+     */
+    class MoEExpertPlacementTarget final
+    {
+    public:
+        /**
+         * @param placement Original whole-owner or source-bound cohort row.
+         * @return A checked target, or no value for malformed/ambiguous ownership.
+         * @note No allocation, source loading or execution admission occurs here.
+         */
+        [[nodiscard]] static std::optional<MoEExpertPlacementTarget> fromPlacement(
+            const MoEExpertOwner &placement) noexcept;
+
+        /** @return Original logical tier coordinate, independent of cohort width. */
+        [[nodiscard]] int tierIndex() const noexcept { return tier_idx_; }
+        /** @return Whether every original fragment member jointly owns the expert. */
+        [[nodiscard]] bool isCohort() const noexcept;
+        /** @return One for a whole owner, otherwise the complete original cohort width. */
+        [[nodiscard]] std::size_t participantCount() const noexcept;
+        /**
+         * @param index Original fixed cohort order, or zero for a whole owner.
+         * @return Exact canonical physical participant ID.
+         * @throws std::out_of_range For an index outside this complete target.
+         */
+        [[nodiscard]] int participantId(std::size_t index) const;
+        /**
+         * @param other Another placement vertex in the same canonical topology.
+         * @return Equality of tier, members and original source/cuts; expert ID is
+         * deliberately absent because different experts occupy the same slots.
+         */
+        [[nodiscard]] bool operator==(const MoEExpertPlacementTarget &other) const noexcept;
+
+    private:
+        using Owners = std::variant<int, std::shared_ptr<const MoEExpertShardCohort>>;
+        /**
+         * @brief Retain only a validated original tier and ownership alternative.
+         * @param tier_idx Canonical logical tier coordinate.
+         * @param owners Whole participant or complete immutable original cohort.
+         */
+        MoEExpertPlacementTarget(int tier_idx, Owners owners) noexcept
+            : tier_idx_(tier_idx), owners_(std::move(owners)) {}
+        int tier_idx_;
+        Owners owners_;
     };
 
     /** @brief Stable participant descriptor referenced by expert owners. */

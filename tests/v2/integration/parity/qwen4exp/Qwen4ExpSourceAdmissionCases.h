@@ -86,6 +86,12 @@ inline std::vector<ModelParityCase> qwen4ExpExpandSourceAdmissionMTP(
                     .policy = policy, .retained_depth = retained_depth};
                 (void)paired.requestedDepth();
                 cell.model.shared_predictor = paired.predictor;
+                // An Off-only seed deliberately has no predictor capacity.
+                // Give its selected predictor a positive public depth envelope.
+                // Keep an already-declared model maximum intact: that capability
+                // remains distinct from a smaller retained graph capacity.
+                if (cell.model.maximum_mtp_draft_depth == 0)
+                    cell.model.maximum_mtp_draft_depth = paired.retained_depth;
                 cell.mtp = paired.policy;
                 cell.retained_mtp_draft_capacity = paired.retained_depth;
             }
@@ -664,6 +670,17 @@ inline const std::vector<ModelParityCase>& qwen4ExpCPUJointWorld2SourceAdmission
             throw std::logic_error("CPU joint world2 source request changed its one Static RAM Off identity");
         return result;
     }();return cases;
+}
+/**
+ * @return Original physical world2 source topology crossed with Off/1/3/Dynamic.
+ * @note Active cases retain the canonical predictor and explicit depth-three
+ * envelope. Declaration alone proves neither preparation nor native MTP parity.
+ */
+inline const std::vector<ModelParityCase>& qwen4ExpCPUJointWorld2MTPSourceAdmissionCases()
+{
+    static const auto cases=qwen4ExpExpandSourceAdmissionMTP(
+        qwen4ExpCPUJointWorld2SourceAdmissionCases(),Qwen4ExpSourceMTPEnvelope::Retained3);
+    return cases;
 }
 /**
  * @brief Project exact continuation rank membership for a joint source observation.

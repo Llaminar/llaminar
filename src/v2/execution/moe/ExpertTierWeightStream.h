@@ -42,15 +42,16 @@ namespace llaminar2
      * @brief Immutable description of one cross-backend projection stream.
      *
      * `unit_count` units are transmitted in monotonically increasing order.
-     * Every unit is exactly one CPU interleaved block and can therefore be
-     * copied directly to its final CPU address or converted independently by a
-     * destination GPU. `manifest_hash` authenticates every field preceding it.
+     * Each unit indexes one64-column tile/32-K block, but its payload contains
+     * only live encoded columns and required metadata. Aligned full units keep
+     * direct copies; origins/tails scatter into independent final local strides.
+     * `manifest_hash` authenticates all semantic fields, including original ownership.
      */
     struct ExpertTierWeightStreamManifest
     {
         // Wire discriminator: receivers reject unknown layouts before parsing.
         static constexpr uint32_t kMagic = 0x45545753u; // "ETWS"
-        static constexpr uint16_t kVersion = 2;
+        static constexpr uint16_t kVersion = 3;
 
         // Direction is explicit so CPU bytes cannot be replayed as GPU bytes.
         uint32_t magic = kMagic;
@@ -95,6 +96,18 @@ namespace llaminar2
         uint32_t maximum_units_per_chunk = 0;
         uint64_t total_stream_bytes = 0;
         uint64_t manifest_hash = 0;
+        /** Original source and destination ownership; physical shapes alone are insufficient. */
+        MoEExpertProjectionOwnership::Projection source_projection{};
+        MoEExpertProjectionOwnership::Projection destination_projection{};
+
+        /**
+         * @brief Bind this format/provenance stream to an actual ownership intersection.
+         * @param intersection Checked original source/destination geometry.
+         * @return Resealed stream with local strides and compact live-column bytes.
+         * @throws std::invalid_argument If source allocation geometry differs or overlap is empty.
+         */
+        [[nodiscard]] ExpertTierWeightStreamManifest forIntersection(
+            const ExpertTierWeightProjectionIntersection& intersection) const;
 
         /**
          * @brief Recompute the canonical hash over all semantic fields.

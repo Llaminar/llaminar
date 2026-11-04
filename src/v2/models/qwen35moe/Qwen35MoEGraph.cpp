@@ -21,6 +21,7 @@
 #include "Qwen35MoEGraph.h"
 #include "execution/moe/MoEOverlayPreparedGraphBank.h"
 #include "execution/moe/MoEGraphOwnerProjection.h"
+#include "execution/moe/MoECPUExpertWorkspaceSource.h"
 #include "planning/ModelMemoryProfile.h"
 #include "execution/moe/MoEExpertOverlayPreparationPlan.h"
 #include "execution/moe/MoEExpertOverlayGraphScope.h"
@@ -11539,23 +11540,11 @@ namespace llaminar2
                                         .compact_route_slots = target_dispatch_inbound->compact_route_slots_host,
                                         .route_slot_capacity = canonical_route_ticket_storage->routeCapacity(),
                                         .deferred_canonical_ticket = canonical_route_ticket_storage};
-                                    // Workspace formats come from the original model directory, never
-                                    // from compact fragments or the continuation's device weight views.
-                                    const auto &model = model_ctx_->model();
-                                    std::array<TensorType, 3> formats;
-                                    const std::array<const char *, 3> names{"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"};
-                                    for (size_t role = 0; role < names.size(); ++role)
-                                    {
-                                        const auto *tensor = model.findTensor("blk." + std::to_string(layer_idx) + "." + names[role]);
-                                        const bool down = role == 2;
-                                        const std::vector<uint64_t> shape{
-                                            static_cast<uint64_t>(down ? expert_intermediate : config_.d_model),
-                                            static_cast<uint64_t>(down ? config_.d_model : expert_intermediate),
-                                            static_cast<uint64_t>(config_.moe.num_experts)};
-                                        if (!tensor || tensor->dimensions != shape)
-                                            throw std::logic_error("Qwen35 CPU joint workspace lost original native source geometry");
-                                        formats[role] = ggufToTensorType(tensor->type);
-                                    }
+                                    // The original loader routes main and shared-predictor
+                                    // coordinates without a duplicated main-directory entry.
+                                    const auto formats = originalCPUExpertWorkspaceSourceFormats(
+                                        model_ctx_->concreteLoader(),layer_idx,config_.d_model,
+                                        expert_intermediate,config_.moe.num_experts);
                                     local_params.cpu_workspace_source = MoELocalExpertStage::CPUExpertWorkspaceSource{
                                         .gate = formats[0], .up = formats[1], .down = formats[2],
                                         .workers = omp_in_parallel() ? omp_get_num_threads() : omp_get_max_threads(),

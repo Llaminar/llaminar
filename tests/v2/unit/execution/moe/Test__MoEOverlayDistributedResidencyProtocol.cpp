@@ -415,7 +415,7 @@ namespace llaminar2::test
         const auto manifest = makeMoEOverlayRemoteCpuProjectionManifest(
             identity, cpu_bytes, /*maximum_chunk_bytes=*/73);
         ASSERT_TRUE(manifest.valid());
-        EXPECT_EQ(manifest.region_bytes[0], cpu_bytes.native_interleaved.size());
+        EXPECT_EQ(manifest.region_bytes[0],1280u); // N32/K64 live columns, not2560-byte resident storage.
         EXPECT_EQ(manifest.region_bytes[1], 0u);
 
         std::array<
@@ -454,7 +454,8 @@ namespace llaminar2::test
         MoEOverlayRemoteProjectionChunkCursor cursor(manifest, regions);
         MoEOverlayRemoteProjectionChunkValidator validator(manifest);
         std::uint64_t chunks = 0;
-        while (auto chunk = cursor.takeNext())
+        std::vector<uint8_t> staging(manifest.maximum_chunk_bytes);
+        while (auto chunk = cursor.takeNext(staging))
         {
             EXPECT_EQ(chunk->header.sequence, chunks);
             EXPECT_LE(chunk->payload.size(), 73u);
@@ -688,16 +689,20 @@ namespace llaminar2::test
         MoEOverlayHostRemoteProjectionSource source(
             manifest, regions, std::make_shared<int>(1));
 
+        EXPECT_EQ(cpu_bytes.native_interleaved.size(),2560u);
+        EXPECT_EQ(manifest.total_bytes,1280u);
+        EXPECT_EQ(manifest.cpu_wire_columns_per_unit,3u);
+        std::vector<uint8_t> staging(manifest.maximum_chunk_bytes,0xa5);
         MoEOverlayRemoteProjectionChunkView first;
         std::string error;
         ASSERT_EQ(
-            source.pollNextChunk(&first, &error),
+            source.pollNextChunk(&first, &error,staging),
             MoEOverlayResidencyWaveProgress::Ready)
             << error;
         ASSERT_FALSE(first.payload.empty());
         MoEOverlayRemoteProjectionChunkView forbidden_reuse;
         EXPECT_EQ(
-            source.pollNextChunk(&forbidden_reuse, &error),
+            source.pollNextChunk(&forbidden_reuse, &error,staging),
             MoEOverlayResidencyWaveProgress::Failed);
         EXPECT_NE(error.find("still owned by MPI"), std::string::npos);
 
@@ -708,21 +713,22 @@ namespace llaminar2::test
             MoEOverlayRemoteProjectionChunkHeader{}, &error));
         ASSERT_TRUE(source.acknowledgeChunkSent(first.header, &error)) << error;
 
-        std::uint64_t acknowledged_chunks = 1;
-        while (acknowledged_chunks * manifest.maximum_chunk_bytes <
-               manifest.total_bytes)
+        std::uint64_t acknowledged_chunks = 1,acknowledged_bytes=first.payload.size();
+        while (acknowledged_bytes < manifest.total_bytes)
         {
             MoEOverlayRemoteProjectionChunkView chunk;
             ASSERT_EQ(
-                source.pollNextChunk(&chunk, &error),
+                source.pollNextChunk(&chunk, &error,staging),
                 MoEOverlayResidencyWaveProgress::Ready)
                 << error;
             ASSERT_EQ(chunk.header.sequence, acknowledged_chunks);
             ASSERT_TRUE(source.acknowledgeChunkSent(chunk.header, &error))
                 << error;
+            acknowledged_bytes+=chunk.payload.size();
             ++acknowledged_chunks;
         }
         EXPECT_GT(acknowledged_chunks, 1u);
+        EXPECT_EQ(acknowledged_bytes,1280u);
     }
 
     TEST(
@@ -1712,3 +1718,5 @@ namespace llaminar2::test
             std::invalid_argument);
     }
 } // namespace llaminar2::test
+
+#include "ExpertTierRectangularRemoteContract.inc"

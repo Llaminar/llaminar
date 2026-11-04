@@ -6,6 +6,9 @@
  * complete experts and gate/up owners. Projection-distributed down weights
  * instead use a model-lifetime bank: they never enter a movement epoch or
  * disappear when this participant no longer owns an expert's gate/up pair.
+ * Cold producer binding authenticates the original context/manager once;
+ * weak retained ownership avoids cycles, while scoped source uses protect only
+ * active preparation. Existing bank leases retain their own physical engines.
  */
 
 #include "MoEOverlayParticipantResidency.h"
@@ -14,6 +17,8 @@
 #include "DeviceMoEExpertDescriptorBuilder.h"
 
 #include "../../loaders/ExpertGemmRegistry.h"
+#include "loaders/ModelContext.h"
+#include "loaders/WeightManager.h"
 #include "../../tensors/NativeVnniFormatInfo.h"
 
 #include <algorithm>
@@ -1328,7 +1333,182 @@ namespace llaminar2
         std::shared_lock lock(mutex_);const auto found=endpoints_.find(id);
         return found!=endpoints_.end() && bool(found->second.joint_layers);
     }
+    std::optional<MoEOverlayParticipantResidencyRegistry::PreparedSourceUse>
+    MoEOverlayParticipantResidencyRegistry::acquireOriginalPreparedSourceLocked(
+        std::string *error) const
+    {
+        const auto reject = [&](const char *message) -> std::optional<PreparedSourceUse>
+        {
+            if (error)
+                *error = message;
+            return std::nullopt;
+        };
+        if (!prepared_source_bound_)
+            return reject("Prepared source has no original ModelContext binding");
+        auto context = prepared_source_context_.lock();
+        auto manager = prepared_source_manager_.lock();
+        if (!context || !manager)
+            return reject(
+                "Prepared source original context/manager has expired; rebinding is forbidden");
+        const auto actual = context->concreteWeightManager();
+        if (actual.get() != manager.get() || actual.owner_before(manager) ||
+            manager.owner_before(actual) ||
+            &manager->expertGemmRegistry() != prepared_source_registry_)
+            return reject("Prepared source original manager/registry was replaced");
+        if (error)
+            error->clear();
+        return PreparedSourceUse(std::move(context), std::move(manager), prepared_source_registry_,
+                                 config_.projection_preparation);
+    }
+    std::optional<MoEOverlayParticipantResidencyRegistry::PreparedSourceUse>
+    MoEOverlayParticipantResidencyRegistry::acquireOriginalPreparedSource(std::string *error) const
+    {
+        std::lock_guard lock(prepared_source_mutex_);
+        return acquireOriginalPreparedSourceLocked(error);
+    }
+    bool MoEOverlayParticipantResidencyRegistry::acceptsPreparedRegistryLocked(
+        const ExpertGemmRegistry &registry, std::string *error) const
+    {
+        if (prepared_source_registry_ && prepared_source_registry_ != &registry)
+        {
+            if (error)
+                *error = "Prepared source engine registry differs from its original producer";
+            return false;
+        }
+        return true;
+    }
+    bool MoEOverlayParticipantResidencyRegistry::authenticatePublishedPreparedSourceLocked(
+        const ExpertGemmRegistry &registry, std::string *error) const
+    {
+        std::shared_lock lock(mutex_);
+        for (const auto &[id, assembly] : endpoints_)
+        {
+            if (assembly.joint_layers)
+                continue; // Exact committed-source check is already in joint registration.
+            const auto *participant = initialOwnerMap().participantForId(id);
+            if (!participant)
+            {
+                if (error)
+                    *error = "Prepared source lost original participant";
+                return false;
+            }
+            for (size_t row = 0; row < assembly.registered_layers.size(); ++row)
+            {
+                if (!assembly.registered_layers[row])
+                    continue;
+                const int layer = config_.first_model_layer + int(row);
+                const auto &actual = assembly.initial_bank.layers[row];
+                const auto ownership =
+                    config_.projection_preparation &&
+                            !config_.projection_preparation->cpuJointOwnerMap()
+                        ? std::optional(
+                              config_.projection_preparation
+                                  ->requireProjectionOwnershipForParticipant(*participant, layer))
+                        : std::nullopt;
+                std::vector<MoEOverlayPreparedExpertPayload> expected;
+                if (!resolveMoEOverlayPreparedExpertPayloads(
+                        registry, *participant, layer, config_.num_experts, actual.resident_mask,
+                        expected, error, ownership))
+                    return false;
+                for (size_t expert = 0; expert < expected.size(); ++expert)
+                {
+                    if (!actual.experts[expert].sameIdentity(expected[expert]))
+                    {
+                        if (error)
+                            *error = "Published component bank differs from original model source";
+                        return false;
+                    }
+                    const auto sameOwner = [](const auto &a, const auto &b)
+                    { return !a.owner_before(b) && !b.owner_before(a); };
+                    if (!sameOwner(actual.experts[expert].gate(), expected[expert].gate()) ||
+                        !sameOwner(actual.experts[expert].up(), expected[expert].up()) ||
+                        !sameOwner(actual.experts[expert].down(), expected[expert].down()))
+                    {
+                        if (error)
+                            *error = "Published component bank has an independent engine owner";
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+    bool MoEOverlayParticipantResidencyRegistry::bindOriginalPreparedContext(
+        const std::shared_ptr<ModelContext> &context,
+        const std::shared_ptr<const MoEExpertOverlayPreparationPlan> &preparation,
+        std::string *error)
+    {
+        std::lock_guard lock(prepared_source_mutex_);
+        const auto reject = [&](const char *message)
+        {
+            if (error)
+                *error = message;
+            return false;
+        };
+        if (!context || !config_.original_model.value ||
+            config_.original_model.value != reinterpret_cast<uint64_t>(context.get()))
+            return reject("Prepared source requires its actual original ModelContext identity");
+        const auto &expected = config_.projection_preparation;
+        if (preparation.get() != expected.get() || preparation.owner_before(expected) ||
+            expected.owner_before(preparation))
+            return reject(
+                "Prepared source preparation differs from its original admission control block");
+        auto manager = context->concreteWeightManager();
+        if (!manager)
+            return reject("Prepared source original ModelContext has no concrete WeightManager");
+        if (prepared_source_bound_)
+        {
+            auto original = acquireOriginalPreparedSourceLocked(error);
+            if (!original)
+                return false;
+            if (original->context_.get() != context.get() ||
+                original->context_.owner_before(context) ||
+                context.owner_before(original->context_) ||
+                original->manager_.get() != manager.get() ||
+                original->manager_.owner_before(manager) ||
+                manager.owner_before(original->manager_))
+                return reject(
+                    "Prepared source cannot replace its original shared context/manager owner");
+            if (error)
+                error->clear();
+            return true;
+        }
+        if (!acceptsPreparedRegistryLocked(manager->expertGemmRegistry(), error))
+            return false;
+        try
+        {
+            if (!authenticatePublishedPreparedSourceLocked(manager->expertGemmRegistry(), error))
+                return false;
+        }
+        catch (const std::exception &exception)
+        {
+            if (error)
+                *error = exception.what();
+            return false;
+        }
+        prepared_source_context_ = context;
+        prepared_source_manager_ = manager;
+        prepared_source_registry_ = &manager->expertGemmRegistry();
+        prepared_source_bound_ = true;
+        if (error)
+            error->clear();
+        return true;
+    }
     bool MoEOverlayParticipantResidencyRegistry::registerInitialCPUJointLayer(
+        const ExpertGemmRegistry &registry, ModelContextId model, int id, int layer,
+        std::string *error)
+    {
+        std::lock_guard lock(prepared_source_mutex_);
+        auto source =
+            prepared_source_bound_ ? acquireOriginalPreparedSourceLocked(error) : std::nullopt;
+        if ((prepared_source_bound_ && !source) || !acceptsPreparedRegistryLocked(registry, error))
+            return false;
+        if (!registerInitialCPUJointLayerImpl(registry, model, id, layer, error))
+            return false;
+        prepared_source_registry_ = &registry;
+        return true;
+    }
+    bool MoEOverlayParticipantResidencyRegistry::registerInitialCPUJointLayerImpl(
         const ExpertGemmRegistry& registry,ModelContextId model,int id,int layer,std::string* error)
     {
         if(error)error->clear();
@@ -1382,6 +1562,66 @@ namespace llaminar2
     }
 
     bool MoEOverlayParticipantResidencyRegistry::registerInitialLayer(
+        int participant_id, int layer_idx, const std::vector<bool> &resident_mask,
+        const std::vector<MoEOverlayPreparedExpertPayload> &experts, std::string *error)
+    {
+        std::lock_guard lock(prepared_source_mutex_);
+        std::optional<PreparedSourceUse> source;
+        if (isCPUJointParticipant(participant_id))
+            return registerInitialLayerImpl(participant_id, layer_idx, resident_mask, experts, error);
+        if (prepared_source_bound_)
+        {
+            source = acquireOriginalPreparedSourceLocked(error);
+            if (!source)
+                return false;
+            const auto *participant = initialOwnerMap().participantForId(participant_id);
+            if (!participant)
+            {
+                if (error)
+                    *error = "Prepared source lost original participant";
+                return false;
+            }
+            try
+            {
+                const auto ownership =
+                    config_.projection_preparation &&
+                            !config_.projection_preparation->cpuJointOwnerMap()
+                        ? std::optional(config_.projection_preparation
+                                            ->requireProjectionOwnershipForParticipant(*participant,
+                                                                                       layer_idx))
+                        : std::nullopt;
+                std::vector<MoEOverlayPreparedExpertPayload> expected;
+                if (!resolveMoEOverlayPreparedExpertPayloads(
+                        source->registry(), *participant, layer_idx, config_.num_experts,
+                        resident_mask, expected, error, ownership) ||
+                    expected.size() != experts.size())
+                    return false;
+                for (size_t i = 0; i < expected.size(); ++i)
+                {
+                    const auto same = [](const auto &a, const auto &b)
+                    { return a.get() == b.get() && !a.owner_before(b) && !b.owner_before(a); };
+                    if (!expected[i].sameIdentity(experts[i]) ||
+                        !same(expected[i].gate(), experts[i].gate()) ||
+                        !same(expected[i].up(), experts[i].up()) ||
+                        !same(expected[i].down(), experts[i].down()))
+                    {
+                        if (error)
+                            *error =
+                                "Initial payload differs from bound original model engines/owners";
+                        return false;
+                    }
+                }
+            }
+            catch (const std::exception &exception)
+            {
+                if (error)
+                    *error = exception.what();
+                return false;
+            }
+        }
+        return registerInitialLayerImpl(participant_id, layer_idx, resident_mask, experts, error);
+    }
+    bool MoEOverlayParticipantResidencyRegistry::registerInitialLayerImpl(
         int participant_id,
         int layer_idx,
         const std::vector<bool> &resident_mask,
@@ -1503,13 +1743,16 @@ namespace llaminar2
             if (error) *error = "Prepared layer is outside the frozen residency interval: " + std::to_string(layer_idx);
             return false;
         }
+        std::lock_guard source_lock(prepared_source_mutex_);
+        auto source=prepared_source_bound_?acquireOriginalPreparedSourceLocked(error):std::nullopt;
+        if((prepared_source_bound_ && !source) || !acceptsPreparedRegistryLocked(registry,error))return false;
         // Configuration is immutable; registerInitialLayer owns the publication
         // lock. Never hold it while retaining model registry engine lifetimes.
         const auto participant_ids = localParticipantIds();
         for (const int participant_id : participant_ids)
         {
             if(isCPUJointParticipant(participant_id)) {
-                if(!registerInitialCPUJointLayer(registry,config_.original_model,participant_id,layer_idx,error))return false;
+                if(!registerInitialCPUJointLayerImpl(registry,config_.original_model,participant_id,layer_idx,error))return false;
                 continue;
             }
             const auto *participant =
@@ -1556,7 +1799,7 @@ namespace llaminar2
                 }
                 return false;
             }
-            if (!registerInitialLayer(
+            if (!registerInitialLayerImpl(
                     participant_id,
                     layer_idx,
                     resident_mask,
@@ -1574,6 +1817,7 @@ namespace llaminar2
                 return false;
             }
         }
+        prepared_source_registry_=&registry;
         return true;
     }
 

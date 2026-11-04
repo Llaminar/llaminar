@@ -64,6 +64,7 @@
 #include "ProductionParityPrefixRestorePlan.h"
 #include "execution/runner/IOrchestrationRunnerFactory.h"
 #include "utils/NativeVerifierRowEvidence.h"
+#include "utils/ScopedMoEParityCoordinatedSession.h"
 
 #include <gtest/gtest.h>
 #include <memory>
@@ -4323,6 +4324,7 @@ namespace llaminar2::test::parity
         ParityConfig config_;
         /** Explicit diagnostic metadata; no model/topology policy is stored here. */
         std::optional<FrozenParityHistoryReplay> frozen_history_replay_;
+        CoordinatedPassiveEvidenceObligation coordinated_passive_evidence_; ///< Session-owned deferred audit phase.
         std::shared_ptr<ModelContext> model_ctx_;
         std::unique_ptr<IInferenceRunner> runner_;
         IInferenceRunner *borrowed_runner_ = nullptr;
@@ -5096,6 +5098,7 @@ namespace llaminar2::test::parity
 
         void TearDown() override
         {
+            EXPECT_NO_THROW(coordinated_passive_evidence_.requireCompletedIfBound());
             /*
              * GoogleTest invokes TearDown after a derived SetUp skips or fails
              * before calling this base.  That is the only valid no-lifecycle
@@ -8226,6 +8229,43 @@ namespace llaminar2::test::parity
                 << summary;
         }
 
+        /** @brief Immutable original layer inventory required by both symmetric and coordinated audits. */
+        struct MoEOwnerOrderEvidencePreparation
+        {
+            std::string expected_order; ///< Original authored participant order.
+            int main_layer_count; ///< Original main transformer population.
+            std::vector<int> expected_layers; ///< Main and actually retained MoE predictor source layers.
+        };
+        /**
+         * @brief Validate local prerequisites before any owner-order evidence collective.
+         * @return Exact original main/predictor layer inventory without ownership reconstruction.
+         * @throws std::logic_error For unavailable counters/model/source manifests.
+         */
+        MoEOwnerOrderEvidencePreparation prepareProductionParityMoEOwnerOrderEvidence() const
+        {
+            if(!PerfStatsCollector::isEnabled() || !PerfStatsCollector::isDomainEnabled("moe_placement"))
+                throw std::logic_error("ExpertOverlay parity requires physical owner-order evidence");
+            MoEOwnerOrderEvidencePreparation result{
+                routedExpertOwnerOrderToString(cfg().routed_expert_owner_order),parityLayerCount(),{}};
+            if(result.main_layer_count<=0)
+                throw std::logic_error("Owner-order evidence has no original main source layers");
+            for(int layer=0;layer<result.main_layer_count;++layer)result.expected_layers.push_back(layer);
+            if(config_.mtp_expected_graph_capacity>0)
+            {
+                const auto* model=activeModelContextForDiagnostics();
+                if(!model)throw std::logic_error("Owner-order evidence lost original live model diagnostics");
+                const auto manifest=discoverMTPWeightManifest(model->concreteLoader(),model->architecture(),
+                    std::max(model->totalBlockCount(),model->blockCount()),true);
+                if(!manifest.available)throw std::logic_error(manifest.diagnostic);
+                for(const auto& depth:manifest.depths)
+                    if(depth.moe_ffn_layout)result.expected_layers.push_back(depth.source_layer_index);
+            }
+            std::sort(result.expected_layers.begin(),result.expected_layers.end());
+            result.expected_layers.erase(std::unique(result.expected_layers.begin(),result.expected_layers.end()),
+                result.expected_layers.end());
+            return result;
+        }
+
         /**
          * @brief Prove that physical expert banks used the generated owner order.
          *
@@ -8254,45 +8294,13 @@ namespace llaminar2::test::parity
                 return;
             }
 
-            ASSERT_TRUE(PerfStatsCollector::isEnabled());
-            ASSERT_TRUE(PerfStatsCollector::isDomainEnabled("moe_placement"))
-                << "ExpertOverlay parity requires physical owner-order evidence";
-
-            const std::string expected_order =
-                routedExpertOwnerOrderToString(
-                    cfg().routed_expert_owner_order);
-            const int main_layer_count = parityLayerCount();
-            ASSERT_GT(main_layer_count, 0);
-
-            std::vector<int> expected_layers;
-            expected_layers.reserve(static_cast<std::size_t>(main_layer_count) + 1u);
-            for (int layer = 0; layer < main_layer_count; ++layer)
-                expected_layers.push_back(layer);
-
-            if (config_.mtp_expected_graph_capacity > 0)
-            {
-                const ModelContext *active_model =
-                    activeModelContextForDiagnostics();
-                ASSERT_NE(active_model, nullptr);
-                const int raw_layer_count = std::max(
-                    active_model->totalBlockCount(),
-                    active_model->blockCount());
-                const MTPWeightManifest manifest = discoverMTPWeightManifest(
-                    active_model->concreteLoader(),
-                    active_model->architecture(),
-                    raw_layer_count,
-                    /*explicit_mtp=*/true);
-                ASSERT_TRUE(manifest.available) << manifest.diagnostic;
-                for (const auto &depth : manifest.depths)
-                {
-                    if (depth.moe_ffn_layout)
-                        expected_layers.push_back(depth.source_layer_index);
-                }
-            }
-            std::sort(expected_layers.begin(), expected_layers.end());
-            expected_layers.erase(
-                std::unique(expected_layers.begin(), expected_layers.end()),
-                expected_layers.end());
+            std::optional<MoEOwnerOrderEvidencePreparation> preparation;
+            try { preparation=prepareProductionParityMoEOwnerOrderEvidence(); }
+            catch(const std::exception& error) { FAIL()<<error.what(); }
+            const auto& prepared=*preparation;
+            const auto& expected_order=prepared.expected_order;
+            const int main_layer_count=prepared.main_layer_count;
+            const auto& expected_layers=prepared.expected_layers;
 
             std::vector<float> local_layer_coverage(
                 expected_layers.size(), 0.0f);
@@ -11079,8 +11087,17 @@ namespace llaminar2::test::parity
             }
 
             assertProductionParityMTPEvidence();
-            assertProductionParityMoEOwnerOrderEvidence(records);
-            assertProductionParityMoEMovementEvidence(records);
+            // Server-shaped peers are still receiving inference commands here.
+            // Their original session owns the all-rank passive audit after
+            // SHUTDOWN, while the original model/source diagnostics remain live.
+            if (parityReferenceGenerationCoordination() ==
+                ParityReferenceGenerationCoordination::SymmetricRanks)
+            {
+                assertProductionParityMoEOwnerOrderEvidence(records);
+                assertProductionParityMoEMovementEvidence(records);
+            }
+            else
+                coordinated_passive_evidence_.requireServing();
 
             if (isRank0())
             {
@@ -11112,6 +11129,55 @@ namespace llaminar2::test::parity
             // including fixture and RAM staging. A cell may finish after that
             // point and must still publish complete numerical diagnostics; the
             // aggregate driver reports the performance miss after all cells run.
+        }
+
+        /**
+         * @brief Bind the deferred evidence obligation to the original session callback.
+         * @return Single-use all-rank audit; missing/repeated bindings fail explicitly.
+         */
+        std::function<void()> bindCoordinatedProductionParityMoEEvidence()
+        {
+            if(parityReferenceGenerationCoordination()!=
+                ParityReferenceGenerationCoordination::ArtifactAuthorityOnly)
+                throw std::logic_error("Symmetric parity cannot defer collective evidence");
+            return coordinated_passive_evidence_.bind(
+                [this]{assertCoordinatedProductionParityMoEEvidence();});
+        }
+
+        /**
+         * @brief Complete deferred collective audits at the original session's closed-worker boundary.
+         * @note Every original rank invokes this only after its worker loop is
+         * released. Model/source owners are still live; records remain local
+         * until the unchanged owner-order and movement audits reduce them.
+         * Ordinary symmetric fixtures audit inline and cannot enter this phase.
+         */
+        void assertCoordinatedProductionParityMoEEvidence()
+        {
+            ASSERT_EQ(parityReferenceGenerationCoordination(),
+                      ParityReferenceGenerationCoordination::ArtifactAuthorityOnly);
+            // A missing local manifest/counter domain must be agreed before
+            // any peer enters the original coverage49/totals2/movement4 sums.
+            std::string prerequisite_error;
+            std::vector<int> original_layers;
+            try
+            {
+                if(config_.moe_movement_expectation!=ParityMoEMovementExpectation::NotApplicable)
+                {
+                    original_layers=prepareProductionParityMoEOwnerOrderEvidence().expected_layers;
+                    if(!PerfStatsCollector::isDomainEnabled("moe_rebalance") &&
+                       !PerfStatsCollector::isDomainEnabled("moe_overlay_residency"))
+                        throw std::logic_error("ExpertOverlay parity requires PerfStats movement evidence");
+                }
+            }
+            catch(const std::exception& error) { prerequisite_error=error.what(); }
+            float local_failed=prerequisite_error.empty()?0.0f:1.0f, any_failed=0.0f;
+            parityCoordinationMPIContext()->allreduce_sum(&local_failed,&any_failed,1);
+            ASSERT_EQ(any_failed,0.0f)<<"Original rank passive-evidence prerequisite failure: "<<prerequisite_error;
+            requireCoordinatedPassiveEvidenceLayers(*parityCoordinationMPIContext(),original_layers);
+            const auto records=PerfStatsCollector::snapshot(
+                {"moe_rebalance","moe_overlay_controller","moe_overlay_residency","moe_placement"});
+            assertProductionParityMoEOwnerOrderEvidence(records);
+            assertProductionParityMoEMovementEvidence(records);
         }
 
         /** @return Explicit test obligation; numerical fixtures always retain reference scoring. */

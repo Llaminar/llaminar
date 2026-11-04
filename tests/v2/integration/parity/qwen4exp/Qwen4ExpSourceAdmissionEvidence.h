@@ -71,7 +71,10 @@ inline const ::llaminar2::qwen4exp::PreparedImmutableSourceWorkers& requireQwen4
     return *consumed;
 }
 
-/** @brief One planned serving leaf; expert-only allocation resources are absent. */
+/** @brief Source setup role; expert fragments never imply continuation programs. */
+enum class Qwen4ExpMTPSourceParticipantRole { Continuation, ExpertFragment };
+
+/** @brief One authenticated source setup participant and its continuation obligations. */
 struct Qwen4ExpMTPSourceServingParticipant
 {
     std::string identity;            ///< Ordered PP/TP identity from the actual execution plan.
@@ -79,6 +82,7 @@ struct Qwen4ExpMTPSourceServingParticipant
     std::vector<int> verifier_rows;  ///< Exact production retained GPU family, empty on CPU.
     bool completion_required = true; ///< Ordinary non-PP host readiness deliberately defers forward setup.
     std::size_t sparse_program_count = 1; ///< Exact immutable model program inventory; nonsparse models retain one.
+    Qwen4ExpMTPSourceParticipantRole role = Qwen4ExpMTPSourceParticipantRole::Continuation; ///< Original serving role.
 };
 /** @brief Explicit validated model inventory; absence is never interpreted as nonsparse. */
 enum class Qwen4ExpMTPSourceProgramFamily { RankingOnly, CompleteSparse };
@@ -179,6 +183,14 @@ requireQwen4ExpMTPSourceSetupFamilies(std::span<const PerfStatRecord> before,
     {
         if (leaf.identity.empty() || !identities.insert(leaf.identity).second || !leaf.device.is_valid())
             throw std::invalid_argument("MTP source serving manifest has an invalid/duplicate identity");
+        if (leaf.role == Qwen4ExpMTPSourceParticipantRole::ExpertFragment)
+        {
+            if (!leaf.device.is_cpu() || leaf.completion_required || !leaf.verifier_rows.empty() ||
+                leaf.sparse_program_count != 1)
+                throw std::invalid_argument("Expert fragment source cannot advertise a continuation family");
+        }
+        else if (leaf.role != Qwen4ExpMTPSourceParticipantRole::Continuation)
+            throw std::invalid_argument("Unknown MTP source participant role");
         const auto device = leaf.device.toString();
         if (leaf.completion_required)
             ++required_completed[device];
@@ -875,5 +887,36 @@ inline void requireQwen4ExpSourceTableIdentity(const GGUFModel &directory,
         source.rows != native->dimensions[0] || source.row_elements != native->dimensions[1] ||
         source.tensorBytes() != native->size_bytes)
         throw std::invalid_argument("QFN retained native table differs from original GGUF source coordinates");
+}
+/**
+ * @brief Project MTP continuation evidence only after authenticating the original rank plan.
+ * @param cell Original source-admission cell, including explicit CPU cohort ranks.
+ * @param rank Original MPI rank, not a primary-device ordinal.
+ * @param authored Original configuration used to construct this runner.
+ * @param plan Actual initialized execution plan.
+ * @param hardware Original inventory used to resolve physical endpoints.
+ * @param programs Validated main-model sparse program inventory.
+ * @param host_setup Actual continuation startup lifecycle.
+ * @return Continuation leaves or one explicit expert-only source obligation without serving completion.
+ * @note CPU control endpoints do not own full-model MTP programs. Predictor
+ * fragments remain subject to the separate original source/Store/PMA checks.
+ */
+inline std::vector<Qwen4ExpMTPSourceServingParticipant>
+qwen4ExpMTPSourceServingParticipants(const ModelParityCase &cell, int rank,
+    const OrchestrationConfig &authored, const RankExecutionPlan &plan,
+    const HardwareInventory &hardware, Qwen4ExpMTPSourceProgramFamily programs,
+    Qwen4ExpMTPHostSetup host_setup)
+{
+    requireQwen4ExpSourceExecutionPlan(cell, rank, authored, plan, hardware);
+    if ((programs != Qwen4ExpMTPSourceProgramFamily::RankingOnly &&
+         programs != Qwen4ExpMTPSourceProgramFamily::CompleteSparse) ||
+        (host_setup != Qwen4ExpMTPHostSetup::OrdinaryDeferred &&
+         host_setup != Qwen4ExpMTPHostSetup::OverlayMaterialized))
+        throw std::invalid_argument("Unknown authenticated source setup policy");
+    if (!qwen4ExpCPUJointSocketMembers(cell).empty() &&
+        !qwen4ExpCPUJointSourceHasContinuation(cell, rank))
+        return {{"expert-source/rank" + std::to_string(rank), plan.primary_device.toLocalDeviceId(),
+                 {}, false, 1, Qwen4ExpMTPSourceParticipantRole::ExpertFragment}};
+    return qwen4ExpMTPSourceServingParticipants(plan, programs, host_setup);
 }
 } // namespace llaminar2::test::parity::qwen4exp

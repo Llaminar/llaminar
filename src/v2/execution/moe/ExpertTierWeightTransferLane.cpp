@@ -212,7 +212,7 @@ namespace llaminar2
             assignError(error, "GPU-to-CPU tier transfer has invalid layout or source arrays");
             return false;
         }
-        const std::size_t total_bytes = layout.chunkBytes(layout.unit_count);
+        const std::size_t total_bytes = layout.cpuStorageBytes();
         if (final_cpu_bytes.size() != total_bytes ||
             layout.chunkBytes(layout.maximum_units_per_chunk) >
                 config_.staging.sizeBytes())
@@ -252,7 +252,7 @@ namespace llaminar2
         in_flight_timing_valid_ = false;
         transfer_device_nanoseconds_ = 0;
         transfer_host_nanoseconds_ = 0;
-        transfer_bytes_ = static_cast<std::uint64_t>(total_bytes);
+        transfer_bytes_=layout.chunkBytes(layout.unit_count);
         failure_.clear();
         progress_ = ExpertTierWeightTransferProgress::Pending;
         transfer_started_at_ = std::chrono::steady_clock::now();
@@ -284,7 +284,7 @@ namespace llaminar2
             assignError(error, "CPU-to-GPU tier transfer has invalid layout or destination arrays");
             return false;
         }
-        const std::size_t total_bytes = layout.chunkBytes(layout.unit_count);
+        const std::size_t total_bytes = layout.cpuStorageBytes();
         if (cpu_bytes.size() != total_bytes ||
             layout.chunkBytes(layout.maximum_units_per_chunk) >
                 config_.staging.sizeBytes())
@@ -311,7 +311,7 @@ namespace llaminar2
         in_flight_timing_valid_ = false;
         transfer_device_nanoseconds_ = 0;
         transfer_host_nanoseconds_ = 0;
-        transfer_bytes_ = static_cast<std::uint64_t>(total_bytes);
+        transfer_bytes_=layout.chunkBytes(layout.unit_count);
         failure_.clear();
         progress_ = ExpertTierWeightTransferProgress::Pending;
         transfer_started_at_ = std::chrono::steady_clock::now();
@@ -320,9 +320,28 @@ namespace llaminar2
     }
 
     bool ExpertTierWeightTransferLane::startGpuToCpuContiguous(
+        const ContiguousFloatingPointWeightDescriptor& source,std::span<uint8_t> cpu,
+        const ExpertTierSourceReadiness& readiness,std::string* error) noexcept
+    {
+        if(!source.valid()){assignError(error,"Floating source descriptor is invalid");return false;}
+        const MoEExpertProjectionOwnership::Projection whole{MoEProjectionResidence::ExpertOwner,source.n,source.k,0,source.n,0,source.k};
+        return startGpuToCpuContiguous(source,cpu,readiness,
+            ExpertTierWeightProjectionIntersection::between(whole,whole),error);
+    }
+    bool ExpertTierWeightTransferLane::startCpuToGpuContiguous(
+        std::span<const uint8_t> cpu,const ContiguousFloatingPointWeightDescriptor& destination,std::string* error) noexcept
+    {
+        if(!destination.valid()){assignError(error,"Floating destination descriptor is invalid");return false;}
+        const MoEExpertProjectionOwnership::Projection whole{MoEProjectionResidence::ExpertOwner,destination.n,destination.k,0,destination.n,0,destination.k};
+        return startCpuToGpuContiguous(cpu,destination,
+            ExpertTierWeightProjectionIntersection::between(whole,whole),error);
+    }
+
+    bool ExpertTierWeightTransferLane::startGpuToCpuContiguous(
         const ContiguousFloatingPointWeightDescriptor &source,
         std::span<std::uint8_t> final_cpu_bytes,
         const ExpertTierSourceReadiness &source_readiness,
+        const ExpertTierWeightProjectionIntersection& intersection,
         std::string *error) noexcept
     {
         if (!materialized())
@@ -340,7 +359,11 @@ namespace llaminar2
                 "GPU-to-CPU contiguous tier transfer lane is already occupied");
             return false;
         }
-        if (!source.valid() || final_cpu_bytes.size() != source.bytes)
+        const auto& gpu=intersection.source();const auto& cpu=intersection.destination();
+        const size_t element_bytes=source.type==TensorType::FP32?4:2;
+        const uint64_t cpu_size=uint64_t(cpu.rows)*cpu.columns*element_bytes;
+        if (!source.valid() || intersection.empty() || gpu.rows!=source.n || gpu.columns!=source.k ||
+            cpu_size!=final_cpu_bytes.size())
         {
             assignError(
                 error,
@@ -369,7 +392,13 @@ namespace llaminar2
         gpu_contiguous_source_ =
             static_cast<const std::uint8_t *>(source.data);
         gpu_contiguous_destination_ = nullptr;
-        contiguous_total_bytes_ = source.bytes;
+        contiguous_gpu_storage_bytes_=source.bytes;
+        contiguous_wire_row_bytes_=size_t(intersection.columns())*element_bytes;
+        contiguous_cpu_row_bytes_=size_t(cpu.columns)*element_bytes;
+        contiguous_gpu_row_bytes_=size_t(gpu.columns)*element_bytes;
+        contiguous_cpu_origin_=(size_t(intersection.destinationRowOrigin())*cpu.columns+intersection.destinationColumnOrigin())*element_bytes;
+        contiguous_gpu_origin_=(size_t(intersection.sourceRowOrigin())*gpu.columns+intersection.sourceColumnOrigin())*element_bytes;
+        contiguous_total_bytes_=size_t(intersection.rows())*contiguous_wire_row_bytes_;
         contiguous_completed_bytes_ = 0;
         completed_units_ = 0;
         in_flight_units_ = 0;
@@ -379,7 +408,7 @@ namespace llaminar2
         in_flight_timing_valid_ = false;
         transfer_device_nanoseconds_ = 0;
         transfer_host_nanoseconds_ = 0;
-        transfer_bytes_ = static_cast<std::uint64_t>(source.bytes);
+        transfer_bytes_=contiguous_total_bytes_;
         failure_.clear();
         progress_ = ExpertTierWeightTransferProgress::Pending;
         transfer_started_at_ = std::chrono::steady_clock::now();
@@ -390,6 +419,7 @@ namespace llaminar2
     bool ExpertTierWeightTransferLane::startCpuToGpuContiguous(
         std::span<const std::uint8_t> cpu_bytes,
         const ContiguousFloatingPointWeightDescriptor &destination,
+        const ExpertTierWeightProjectionIntersection& intersection,
         std::string *error) noexcept
     {
         if (!materialized())
@@ -407,7 +437,11 @@ namespace llaminar2
                 "CPU-to-GPU contiguous tier transfer lane is already occupied");
             return false;
         }
-        if (!destination.valid() || cpu_bytes.size() != destination.bytes)
+        const auto& gpu=intersection.destination();const auto& cpu=intersection.source();
+        const size_t element_bytes=destination.type==TensorType::FP32?4:2;
+        const uint64_t cpu_size=uint64_t(cpu.rows)*cpu.columns*element_bytes;
+        if (!destination.valid() || intersection.empty() || gpu.rows!=destination.n || gpu.columns!=destination.k ||
+            cpu_size!=cpu_bytes.size())
         {
             assignError(
                 error,
@@ -424,7 +458,13 @@ namespace llaminar2
         gpu_contiguous_source_ = nullptr;
         gpu_contiguous_destination_ = static_cast<std::uint8_t *>(
             const_cast<void *>(destination.data));
-        contiguous_total_bytes_ = destination.bytes;
+        contiguous_gpu_storage_bytes_=destination.bytes;
+        contiguous_wire_row_bytes_=size_t(intersection.columns())*element_bytes;
+        contiguous_cpu_row_bytes_=size_t(cpu.columns)*element_bytes;
+        contiguous_gpu_row_bytes_=size_t(gpu.columns)*element_bytes;
+        contiguous_cpu_origin_=(size_t(intersection.sourceRowOrigin())*cpu.columns+intersection.sourceColumnOrigin())*element_bytes;
+        contiguous_gpu_origin_=(size_t(intersection.destinationRowOrigin())*gpu.columns+intersection.destinationColumnOrigin())*element_bytes;
+        contiguous_total_bytes_=size_t(intersection.rows())*contiguous_wire_row_bytes_;
         contiguous_completed_bytes_ = 0;
         completed_units_ = 0;
         in_flight_units_ = 0;
@@ -434,7 +474,7 @@ namespace llaminar2
         in_flight_timing_valid_ = false;
         transfer_device_nanoseconds_ = 0;
         transfer_host_nanoseconds_ = 0;
-        transfer_bytes_ = static_cast<std::uint64_t>(destination.bytes);
+        transfer_bytes_=contiguous_total_bytes_;
         failure_.clear();
         progress_ = ExpertTierWeightTransferProgress::Pending;
         transfer_started_at_ = std::chrono::steady_clock::now();
@@ -559,6 +599,8 @@ namespace llaminar2
             bytes = std::min(
                 config_.staging.sizeBytes(),
                 contiguous_total_bytes_ - contiguous_completed_bytes_);
+            if(contiguous_wire_row_bytes_!=contiguous_cpu_row_bytes_ || contiguous_wire_row_bytes_!=contiguous_gpu_row_bytes_)
+                bytes=std::min(bytes,contiguous_wire_row_bytes_-contiguous_completed_bytes_%contiguous_wire_row_bytes_);
         }
         else
         {
@@ -566,7 +608,7 @@ namespace llaminar2
                 layout_.unit_count - completed_units_;
             unit_count =
                 std::min(layout_.maximum_units_per_chunk, remaining);
-            bytes = layout_.chunkBytes(unit_count);
+            bytes = layout_.chunkBytes(unit_count,completed_units_);
             byte_offset = layout_.chunkBytes(completed_units_);
         }
         if (bytes == 0 || bytes > config_.staging.sizeBytes() ||
@@ -607,10 +649,10 @@ namespace llaminar2
              * ownership edge is required.
              */
             const auto host_copy_started = std::chrono::steady_clock::now();
-            std::memcpy(
-                pinned_chunk_,
-                cpu_source_.data() + byte_offset,
-                bytes);
+            if(!gatherExpertTierCPUWeightChunk(layout_,cpu_source_,completed_units_,unit_count,
+                    {static_cast<uint8_t*>(pinned_chunk_),bytes})) {
+                fail("CPU expert native intersection gather failed",error);return false;
+            }
             recordHostCopyDuration(
                 std::chrono::steady_clock::now() - host_copy_started);
             const bool copied = submitted && TransferEngine::instance().enqueueBackgroundStagingCopy(
@@ -626,18 +668,18 @@ namespace llaminar2
             submitted = submitted && TransferEngine::instance().enqueueBackgroundStagingCopy(
                 config_.execution, MappedTransferDirection::DeviceToHost,
                 const_cast<std::uint8_t *>(gpu_contiguous_source_),
-                contiguous_total_bytes_, byte_offset, config_.staging, 0u, bytes, &failure_);
+                contiguous_gpu_storage_bytes_, floatingOffset(true), config_.staging, 0u, bytes, &failure_);
         }
         else if (direction_ == Direction::CpuToGpuContiguous)
         {
             const auto host_copy_started = std::chrono::steady_clock::now();
             std::memcpy(
-                pinned_chunk_, cpu_source_.data() + byte_offset, bytes);
+                pinned_chunk_, cpu_source_.data() + floatingOffset(false), bytes);
             recordHostCopyDuration(
                 std::chrono::steady_clock::now() - host_copy_started);
             submitted = submitted && TransferEngine::instance().enqueueBackgroundStagingCopy(
                 config_.execution, MappedTransferDirection::HostToDevice,
-                gpu_contiguous_destination_, contiguous_total_bytes_, byte_offset,
+                gpu_contiguous_destination_, contiguous_gpu_storage_bytes_, floatingOffset(true),
                 config_.staging, 0u, bytes, &failure_);
         }
         else
@@ -709,7 +751,7 @@ namespace llaminar2
             {
                 if (isContiguousDirection())
                     service_read_.publishDeviceToMappedHost(gpu_contiguous_source_,
-                        contiguous_total_bytes_, byte_offset, bytes, source_dependency_);
+                        contiguous_gpu_storage_bytes_, floatingOffset(true), bytes, source_dependency_);
                 else
                     service_read_.publishPackedDeviceToMappedHost(gpu_source_, layout_,
                         completed_units_, unit_count, device_chunk_, config_.staging.sizeBytes(),
@@ -718,11 +760,14 @@ namespace llaminar2
             else
             {
                 const auto started = std::chrono::steady_clock::now();
-                std::memcpy(pinned_chunk_, cpu_source_.data() + byte_offset, bytes);
+                if(isContiguousDirection())std::memcpy(pinned_chunk_,cpu_source_.data()+floatingOffset(false),bytes);
+                else if(!gatherExpertTierCPUWeightChunk(layout_,cpu_source_,completed_units_,unit_count,
+                        {static_cast<uint8_t*>(pinned_chunk_),bytes}))
+                {fail("CPU expert service intersection gather failed",error);return false;}
                 recordHostCopyDuration(std::chrono::steady_clock::now() - started);
                 if (isContiguousDirection())
                     service_write_.publishMappedHostToDevice(gpu_contiguous_destination_,
-                        contiguous_total_bytes_, byte_offset, bytes);
+                        contiguous_gpu_storage_bytes_, floatingOffset(true), bytes);
                 else
                     service_write_.publishPackedMappedHostToDevice(gpu_destination_, layout_,
                         completed_units_, unit_count, device_chunk_, config_.staging.sizeBytes());
@@ -813,13 +858,10 @@ namespace llaminar2
         {
             /* D2H completion makes the pinned bytes safe for final CPU copy. */
             const auto host_copy_started = std::chrono::steady_clock::now();
-            std::memcpy(
-                cpu_destination_.data() +
-                    (isContiguousDirection()
-                         ? contiguous_completed_bytes_
-                         : layout_.chunkBytes(completed_units_)),
-                pinned_chunk_,
-                in_flight_bytes_);
+            if(isContiguousDirection())std::memcpy(cpu_destination_.data()+floatingOffset(false),pinned_chunk_,in_flight_bytes_);
+            else if(!scatterExpertTierCPUWeightChunk(layout_,
+                    {static_cast<const uint8_t*>(pinned_chunk_),in_flight_bytes_},completed_units_,in_flight_units_,cpu_destination_))
+                return fail("CPU expert native intersection scatter failed",error);
             recordHostCopyDuration(
                 std::chrono::steady_clock::now() - host_copy_started);
         }

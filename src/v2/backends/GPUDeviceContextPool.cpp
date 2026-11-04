@@ -109,6 +109,21 @@ namespace llaminar2
             throw std::logic_error("Existing source worker borrow has a foreign PMA control block");
         return {birth->second,GPUContextProvenance(device,generation->second,worker->second)};
     }
+    bool GPUDeviceContextPool::hasPreparedNativeProgramStack(DeviceId device,
+        const std::shared_ptr<PhysicalMemoryAuthority>& memory) const
+    {
+        std::lock_guard lock(mutex_);
+        const auto found=prepared_births_.find(device.toString());
+        if(found==prepared_births_.end())return false;
+        const auto& original=found->second->memory();
+        if(!memory || original.get()!=memory.get() || original.owner_before(memory) || memory.owner_before(original))
+            throw std::logic_error("Native program stack has a foreign original source PMA control block");
+        if(!device.is_cuda())return false;
+        if(retiring_nvidia_contexts_.contains(device.gpu_ordinal()) ||
+           !nvidia_contexts_.contains(device.gpu_ordinal()) || !nvidia_contexts_.at(device.gpu_ordinal()))
+            throw std::logic_error("Native program stack has no live original source CUDA worker");
+        return true;
+    }
     void GPUDeviceContextPool::requireOrdinaryContextStackGrowth(DeviceId device,
         const std::shared_ptr<PhysicalMemoryAuthority>& memory) const
     {

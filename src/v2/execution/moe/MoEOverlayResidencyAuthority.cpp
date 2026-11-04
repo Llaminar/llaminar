@@ -42,6 +42,7 @@
 #include <map>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -1524,37 +1525,63 @@ namespace llaminar2
                static_cast<size_t>(expert_id);
     }
 
+    namespace
+    {
+        /**
+         * @brief Resolve complete immutable targets without inventing a scalar cohort owner.
+         * @param migration Original logical expert edge and both physical placements.
+         * @return Source/destination targets, or no value for foreign/ambiguous coordinates.
+         */
+        std::optional<std::pair<MoEExpertPlacementTarget, MoEExpertPlacementTarget>>
+        migrationPlacementTargets(const MoEOverlayTierMigration &migration) noexcept
+        {
+            if (migration.layer_idx < 0 || migration.expert_id < 0 ||
+                migration.source.layer_idx != migration.layer_idx ||
+                migration.destination.layer_idx != migration.layer_idx ||
+                migration.source.expert_id != migration.expert_id ||
+                migration.destination.expert_id != migration.expert_id)
+                return std::nullopt;
+            auto source = MoEExpertPlacementTarget::fromPlacement(migration.source);
+            auto destination = MoEExpertPlacementTarget::fromPlacement(migration.destination);
+            if (!source || !destination)
+                return std::nullopt;
+            if (migration.source.shard_cohort && migration.destination.shard_cohort)
+            {
+                const auto &from = *migration.source.shard_cohort;
+                const auto &to = *migration.destination.shard_cohort;
+                // Different admitted cuts may redistribute the same original
+                // matrix. A different full matrix/format is not redistribution.
+                if (from.source() != to.source() ||
+                    from.ownership(0).geometry() != to.ownership(0).geometry())
+                    return std::nullopt;
+            }
+            return std::pair{std::move(*source), std::move(*destination)};
+        }
+    }
+
     bool MoEOverlayTierMigrationCycle::valid(
         const std::vector<MoEOverlayTierMigration> &migrations) const noexcept
     {
         if (layer_idx < 0 || migration_indices.empty())
             return false;
-
         std::vector<bool> seen(migrations.size(), false);
-        for (size_t cycle_offset = 0;
-             cycle_offset < migration_indices.size();
-             ++cycle_offset)
+        std::set<std::pair<int, int>> logical_edges;
+        for (size_t offset = 0; offset < migration_indices.size(); ++offset)
         {
-            const size_t migration_index = migration_indices[cycle_offset];
-            const size_t next_index = migration_indices[
-                (cycle_offset + 1) % migration_indices.size()];
-            if (migration_index >= migrations.size() ||
-                next_index >= migrations.size() ||
-                seen[migration_index])
-            {
+            const size_t index = migration_indices[offset];
+            const size_t next_index = migration_indices[(offset + 1) % migration_indices.size()];
+            if (index >= migrations.size() || next_index >= migrations.size() || seen[index])
                 return false;
-            }
-            seen[migration_index] = true;
-
-            const auto &migration = migrations[migration_index];
+            seen[index] = true;
+            const auto &edge = migrations[index];
             const auto &next = migrations[next_index];
-            if (migration.layer_idx != layer_idx ||
-                next.layer_idx != layer_idx ||
-                migration.destination.owner_participant !=
-                    next.source.owner_participant)
-            {
+            if (!logical_edges.emplace(edge.layer_idx, edge.expert_id).second)
                 return false;
-            }
+            const auto targets = migrationPlacementTargets(edge);
+            const auto next_targets = migrationPlacementTargets(next);
+            if (edge.layer_idx != layer_idx || next.layer_idx != layer_idx ||
+                !targets || !next_targets || targets->second != next_targets->first)
+                return false;
         }
         return true;
     }
@@ -1565,53 +1592,35 @@ namespace llaminar2
         using FlowKey = std::tuple<int, int>;
         std::map<FlowKey, std::int64_t> participant_flow;
         std::map<FlowKey, std::int64_t> tier_flow;
-
+        std::set<FlowKey> logical_edges;
         MoEOverlayMigrationCapacityEvidence evidence;
         evidence.edges_checked = migrations.size();
         for (const auto &migration : migrations)
         {
-            if (migration.layer_idx < 0 ||
-                migration.source.layer_idx != migration.layer_idx ||
-                migration.destination.layer_idx != migration.layer_idx ||
-                migration.source.owner_participant < 0 ||
-                migration.destination.owner_participant < 0 ||
-                migration.source.tier_idx < 0 ||
-                migration.destination.tier_idx < 0)
+            const auto targets = migrationPlacementTargets(migration);
+            if (!targets || !logical_edges.emplace(migration.layer_idx, migration.expert_id).second)
             {
                 ++evidence.malformed_edges;
                 continue;
             }
-
-            --participant_flow[{
-                migration.layer_idx,
-                migration.source.owner_participant,
-            }];
-            ++participant_flow[{
-                migration.layer_idx,
-                migration.destination.owner_participant,
-            }];
-            --tier_flow[{
-                migration.layer_idx,
-                migration.source.tier_idx,
-            }];
-            ++tier_flow[{
-                migration.layer_idx,
-                migration.destination.tier_idx,
-            }];
+            const auto &[source, destination] = *targets;
+            // One logical edge moves every source/destination fragment. Physical
+            // slots are per member; tier slots and demand are counted only once.
+            for (size_t member = 0; member < source.participantCount(); ++member)
+                --participant_flow[{migration.layer_idx, source.participantId(member)}];
+            for (size_t member = 0; member < destination.participantCount(); ++member)
+                ++participant_flow[{migration.layer_idx, destination.participantId(member)}];
+            --tier_flow[{migration.layer_idx, source.tierIndex()}];
+            ++tier_flow[{migration.layer_idx, destination.tierIndex()}];
         }
-
         evidence.participant_coordinates_checked = participant_flow.size();
         evidence.tier_coordinates_checked = tier_flow.size();
-        evidence.participant_flow_violations =
-            static_cast<size_t>(std::count_if(
-                participant_flow.begin(),
-                participant_flow.end(),
-                [](const auto &entry) { return entry.second != 0; }));
-        evidence.tier_flow_violations =
-            static_cast<size_t>(std::count_if(
-                tier_flow.begin(),
-                tier_flow.end(),
-                [](const auto &entry) { return entry.second != 0; }));
+        evidence.participant_flow_violations = static_cast<size_t>(std::count_if(
+            participant_flow.begin(), participant_flow.end(),
+            [](const auto &entry) { return entry.second != 0; }));
+        evidence.tier_flow_violations = static_cast<size_t>(std::count_if(
+            tier_flow.begin(), tier_flow.end(),
+            [](const auto &entry) { return entry.second != 0; }));
         return evidence;
     }
 
@@ -3371,9 +3380,9 @@ namespace llaminar2
                 *result.candidate,
                 nullptr,
                 /*estimated_weight_bytes=*/0u);
-            result.migration_cycles = buildMigrationCycles(
+            result.migration_cycles = buildMoEOverlayMigrationCycles(
                 result.migrations);
-            result.shadow_requirements = buildShadowRequirements(
+            result.shadow_requirements = buildMoEOverlayShadowRequirements(
                 result.migrations);
             if (!result.valid())
             {
@@ -3655,9 +3664,9 @@ namespace llaminar2
                 &observed_evidence,
                 planned.memory.routed_expert_bytes_per_expert,
                 movement_objectives);
-            result.migration_cycles = buildMigrationCycles(
+            result.migration_cycles = buildMoEOverlayMigrationCycles(
                 result.migrations);
-            result.shadow_requirements = buildShadowRequirements(
+            result.shadow_requirements = buildMoEOverlayShadowRequirements(
                 result.migrations);
             if (!result.valid())
             {
@@ -6568,9 +6577,9 @@ namespace llaminar2
                 });
             }
         }
-        transaction.migration_cycles = buildMigrationCycles(
+        transaction.migration_cycles = buildMoEOverlayMigrationCycles(
             transaction.migrations);
-        transaction.shadow_requirements = buildShadowRequirements(
+        transaction.shadow_requirements = buildMoEOverlayShadowRequirements(
             transaction.migrations);
         if (!transaction.valid())
         {
@@ -7420,153 +7429,102 @@ namespace llaminar2
         return migrations;
     }
 
-    std::vector<MoEOverlayTierMigrationCycle>
-    MoEOverlayResidencyAuthority::buildMigrationCycles(
+    std::vector<MoEOverlayTierMigrationCycle> buildMoEOverlayMigrationCycles(
         std::vector<MoEOverlayTierMigration> &migrations)
     {
+        if (!analyzeMoEOverlayMigrationCapacity(migrations).capacityPreserved())
+            throw std::logic_error("MoE migration requires complete capacity-preserving placement targets");
+        std::vector<std::pair<MoEExpertPlacementTarget, MoEExpertPlacementTarget>> targets;
+        targets.reserve(migrations.size());
+        for (const auto &edge : migrations)
+            targets.push_back(*migrationPlacementTargets(edge));
         std::vector<MoEOverlayTierMigrationCycle> cycles;
         std::vector<bool> consumed(migrations.size(), false);
-
         for (size_t seed_index = 0; seed_index < migrations.size(); ++seed_index)
         {
             if (consumed[seed_index])
                 continue;
-
             const auto &seed = migrations[seed_index];
             consumed[seed_index] = true;
-            MoEOverlayTierMigrationCycle cycle;
-            cycle.layer_idx = seed.layer_idx;
-            cycle.migration_indices.push_back(seed_index);
-
-            if (seed.source.owner_participant !=
-                seed.destination.owner_participant)
+            MoEOverlayTierMigrationCycle cycle{.layer_idx = seed.layer_idx,
+                .migration_indices = {seed_index}};
+            if (targets[seed_index].first != targets[seed_index].second)
             {
                 std::vector<size_t> return_path;
-                std::vector<int> visited_participants;
-                const int target_participant =
-                    seed.source.owner_participant;
-
-                /*
-                 * Every edge in a capacity-preserving participant delta belongs
-                 * to a directed cycle. Physical endpoints, rather than tiers,
-                 * are the vertices: an apportioned NodeTP tier can change
-                 * which socket owns an otherwise-stationary expert when hotter
-                 * experts enter or leave that tier. Avoiding repeated endpoint
-                 * vertices makes one inactive slot per participant sufficient.
-                 */
-                const auto find_return_path =
-                    [&](auto &&self, int current_participant) -> bool
+                std::vector<MoEExpertPlacementTarget> visited;
+                // A cohort is one vertex, never one vertex per fragment or the
+                // absent scalar owner -1. Closing that vertex preserves every
+                // admitted member's capacity without splitting a logical move.
+                const auto find_return_path = [&](auto &&self,
+                    const MoEExpertPlacementTarget &current) -> bool
                 {
-                    if (current_participant == target_participant)
+                    if (current == targets[seed_index].first)
                         return true;
-                    if (std::find(
-                            visited_participants.begin(),
-                            visited_participants.end(),
-                            current_participant) !=
-                        visited_participants.end())
-                    {
+                    if (std::find(visited.begin(), visited.end(), current) != visited.end())
                         return false;
-                    }
-                    visited_participants.push_back(current_participant);
-
-                    for (size_t edge_index = 0;
-                         edge_index < migrations.size();
-                         ++edge_index)
+                    visited.push_back(current);
+                    for (size_t index = 0; index < migrations.size(); ++index)
                     {
-                        const auto &edge = migrations[edge_index];
-                        if (consumed[edge_index] ||
-                            edge.layer_idx != seed.layer_idx ||
-                            edge.source.owner_participant !=
-                                current_participant)
-                        {
+                        if (consumed[index] || migrations[index].layer_idx != seed.layer_idx ||
+                            targets[index].first != current)
                             continue;
-                        }
-
-                        consumed[edge_index] = true;
-                        return_path.push_back(edge_index);
-                        if (self(
-                                self,
-                                edge.destination.owner_participant))
+                        consumed[index] = true;
+                        return_path.push_back(index);
+                        if (self(self, targets[index].second))
                             return true;
                         return_path.pop_back();
-                        consumed[edge_index] = false;
+                        consumed[index] = false;
                     }
-
-                    visited_participants.pop_back();
+                    visited.pop_back();
                     return false;
                 };
-
-                if (!find_return_path(
-                        find_return_path,
-                        seed.destination.owner_participant))
-                {
-                    throw std::logic_error(
-                        "Capacity-preserving MoE participant delta could not be decomposed into closed cycles");
-                }
-                cycle.migration_indices.insert(
-                    cycle.migration_indices.end(),
-                    return_path.begin(),
-                    return_path.end());
+                if (!find_return_path(find_return_path, targets[seed_index].second))
+                    throw std::logic_error("MoE placement delta cannot form complete whole/cohort cycles");
+                cycle.migration_indices.insert(cycle.migration_indices.end(),
+                    return_path.begin(), return_path.end());
             }
-
             if (!cycle.valid(migrations))
-            {
-                throw std::logic_error(
-                    "MoE overlay produced an invalid migration cycle");
-            }
+                throw std::logic_error("MoE overlay produced an invalid placement migration cycle");
             bool advances_tier = false;
             bool advances_participant = false;
-            for (const std::size_t migration_index :
-                 cycle.migration_indices)
+            for (const size_t index : cycle.migration_indices)
             {
-                advances_tier |= advancesTierResidency(
-                    migrations[migration_index].axis);
-                advances_participant |= advancesParticipantPlacement(
-                    migrations[migration_index].axis);
+                advances_tier |= advancesTierResidency(migrations[index].axis);
+                advances_participant |= advancesParticipantPlacement(migrations[index].axis);
             }
-            const auto cycle_axis =
-                advances_tier && advances_participant
-                    ? MoEOptimizationMovementAxis::Combined
-                    : (advances_tier
-                           ? MoEOptimizationMovementAxis::TierResidency
-                           : MoEOptimizationMovementAxis::ParticipantPlacement);
-            for (const std::size_t migration_index :
-                 cycle.migration_indices)
-            {
-                migrations[migration_index].axis = cycle_axis;
-            }
+            const auto axis = advances_tier && advances_participant
+                ? MoEOptimizationMovementAxis::Combined
+                : (advances_tier ? MoEOptimizationMovementAxis::TierResidency
+                                 : MoEOptimizationMovementAxis::ParticipantPlacement);
+            for (const size_t index : cycle.migration_indices)
+                migrations[index].axis = axis;
             cycles.push_back(std::move(cycle));
         }
-
         return cycles;
     }
 
-    std::vector<MoEOverlayTierShadowRequirement>
-    MoEOverlayResidencyAuthority::buildShadowRequirements(
+    std::vector<MoEOverlayTierShadowRequirement> buildMoEOverlayShadowRequirements(
         const std::vector<MoEOverlayTierMigration> &migrations)
     {
         using RequirementKey = std::tuple<int, int, int>;
         std::map<RequirementKey, size_t> counts;
+        std::set<std::pair<int, int>> logical_edges;
         for (const auto &migration : migrations)
         {
-            ++counts[{
-                migration.layer_idx,
-                migration.destination.tier_idx,
-                migration.destination.owner_participant,
-            }];
+            const auto targets = migrationPlacementTargets(migration);
+            if (!targets || !logical_edges.emplace(migration.layer_idx, migration.expert_id).second)
+                throw std::logic_error("MoE shadow slots require complete original placement targets");
+            const auto &destination = targets->second;
+            for (size_t member = 0; member < destination.participantCount(); ++member)
+                ++counts[{migration.layer_idx, destination.tierIndex(), destination.participantId(member)}];
         }
-
         std::vector<MoEOverlayTierShadowRequirement> requirements;
         requirements.reserve(counts.size());
         for (const auto &[key, count] : counts)
         {
-            const auto &[layer_idx, tier_idx, participant] = key;
-            requirements.push_back({
-                .layer_idx = layer_idx,
-                .tier_idx = tier_idx,
-                .destination_participant = participant,
-                .slot_count = count,
-            });
+            const auto &[layer, tier, participant] = key;
+            requirements.push_back({.layer_idx = layer, .tier_idx = tier,
+                .destination_participant = participant, .slot_count = count});
         }
         return requirements;
     }

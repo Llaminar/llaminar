@@ -20,6 +20,12 @@ bool digest(const std::string& value){return value.size()==64 &&
     std::all_of(value.begin(),value.end(),[](unsigned char c){return (c>='0'&&c<='9') || (c>='a'&&c<='f');}) &&
     value.find_first_not_of('0')!=std::string::npos;}
 }
+void CUDANativeProgramStack::requirePrepared(std::size_t required,std::size_t actual) {
+    if(required>capacityBytes || actual<capacityBytes)
+        throw std::runtime_error("CUDA original native-program stack capacity mismatch: required="+
+            std::to_string(required)+" prepared="+std::to_string(capacityBytes)+
+            " actual="+std::to_string(actual));
+}
 void NativeContextBirthKey::requireComplete() const {
     if(!device.is_gpu() || source_program_version!=1 || physical_uuid.empty() || architecture.empty() ||
        runtime_version.empty() || driver_version.empty() || visibility_identity.empty() || pthread_defaults_identity.empty() ||

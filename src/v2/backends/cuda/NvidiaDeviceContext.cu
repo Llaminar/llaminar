@@ -18,6 +18,7 @@
 #include "CUDAHardwareMetadata.h"
 #include "backends/GPUDeviceProcessLifetime.h"
 #include "backends/GPUWorkerInitialization.h"
+#include "backends/NativeContextOpaqueContract.h"
 #include "utils/ScopedOpenMPPartitionAffinity.h"
 #include "CUDAGraphCapture.h"
 #include "CUDADriverApi.h"
@@ -77,6 +78,7 @@ namespace llaminar2
 
     NvidiaDeviceContext::NvidiaDeviceContext(int device_ordinal,std::shared_ptr<PreparedGPUWorkerStack> prepared_stack)
         : process_lifetime_lease_(GPUDeviceProcessLifetime::acquireNativeContext()),
+          source_native_program_stack_bytes_(prepared_stack ? CUDANativeProgramStack::capacityBytes : 0u),
           device_ordinal_(device_ordinal)
     {
         LOG_DEBUG("[NvidiaDeviceContext] Creating context for CUDA device " << device_ordinal);
@@ -251,6 +253,19 @@ namespace llaminar2
 
         // Step 1: Set CUDA device via runtime API
         CUDA_CHECK(cudaSetDevice(device_ordinal_));
+
+        // Source beginNative already retains the SAME conservative opaque
+        // commitment. Materialize program stack now, before creator publication
+        // and final admission, so library first use cannot introduce late growth.
+        // This sets driver context storage only; it launches no warmup work.
+        if(source_native_program_stack_bytes_) {
+            std::size_t actual=0;
+            CUDA_CHECK(cudaDeviceGetLimit(&actual,cudaLimitStackSize));
+            if(actual<source_native_program_stack_bytes_)
+                CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize,source_native_program_stack_bytes_));
+            CUDA_CHECK(cudaDeviceGetLimit(&actual,cudaLimitStackSize));
+            CUDANativeProgramStack::requirePrepared(0u,actual);
+        }
 
         // Step 2: Create default stream (non-blocking for better concurrency)
         CUDA_CHECK(cudaStreamCreateWithFlags(&default_stream_, cudaStreamNonBlocking));

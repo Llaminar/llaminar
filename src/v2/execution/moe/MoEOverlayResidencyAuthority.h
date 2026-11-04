@@ -101,7 +101,9 @@ namespace llaminar2
      * Thermal direction counts are diagnostic only: a closed three-tier cycle
      * may contain one direct promotion and two stepwise demotions. Capacity is
      * preserved when every `(layer, participant)` and `(layer, tier)` vertex
-     * has equal incoming and outgoing expert slots. This typed summary keeps
+     * has equal incoming and outgoing expert slots. A cohort contributes one
+     * fragment slot at each physical member, but one expert slot at its tier.
+     * This typed summary keeps
      * that graph invariant distinct from priority-direction accounting.
      */
     struct MoEOverlayMigrationCapacityEvidence
@@ -135,8 +137,8 @@ namespace llaminar2
      * @brief One closed, capacity-preserving migration cycle within a layer.
      *
      * Indices refer to the enclosing transaction's immutable migration vector.
-     * The destination participant of each indexed edge equals the source
-     * participant of the next edge, including the last-to-first wrap. A
+     * The complete destination placement target of each indexed edge equals
+     * the source target of the next edge, including the last-to-first wrap. A
      * one-edge cycle represents a logical relocation whose physical endpoint
      * is unchanged. Cycles are the smallest units that may be selected for a
      * bounded-shadow publication wave without changing any physical
@@ -150,7 +152,7 @@ namespace llaminar2
         /**
          * @brief Validate closure, layer identity, bounds, and unique edges.
          * @param migrations Enclosing transaction's complete movement vector.
-         * @return Whether this is one well-formed directed participant cycle.
+         * @return Whether this is one well-formed directed placement cycle.
          */
         [[nodiscard]] bool valid(
             const std::vector<MoEOverlayTierMigration> &migrations) const noexcept;
@@ -173,6 +175,25 @@ namespace llaminar2
         /** @brief Compare the complete physical endpoint and capacity. */
         bool operator==(const MoEOverlayTierShadowRequirement &) const = default;
     };
+
+    /**
+     * @brief Decompose the canonical whole/cohort edges into closed placement cycles.
+     * @param migrations Complete capacity-preserving edges; each cycle receives
+     * its aggregate movement axis. Cohort members are never separate movements.
+     * @return Deterministic cycle cover with every edge represented exactly once.
+     * @throws std::logic_error For malformed targets or an open capacity flow.
+     */
+    [[nodiscard]] std::vector<MoEOverlayTierMigrationCycle> buildMoEOverlayMigrationCycles(
+        std::vector<MoEOverlayTierMigration> &migrations);
+
+    /**
+     * @brief Derive inactive physical fragment slots from the original destinations.
+     * @param migrations Complete canonical movement wave.
+     * @return Exact per-layer/tier/member shadow obligations, including every cohort member.
+     * @throws std::logic_error For malformed physical placement targets.
+     */
+    [[nodiscard]] std::vector<MoEOverlayTierShadowRequirement> buildMoEOverlayShadowRequirements(
+        const std::vector<MoEOverlayTierMigration> &migrations);
 
     /**
      * @brief Measured cost of moving one complete expert between endpoints.
@@ -1536,17 +1557,6 @@ namespace llaminar2
             size_t estimated_weight_bytes,
             std::span<const MoELayeredExpertOwnershipChange>
                 participant_changes = {});
-        /**
-         * @brief Decompose edges and normalize each cycle's objective axis.
-         * @param migrations Mutable canonical edges; every edge in a closed
-         *        cycle receives that cycle's aggregate typed objective.
-         * @return Complete deterministic capacity-preserving cycle cover.
-         */
-        static std::vector<MoEOverlayTierMigrationCycle> buildMigrationCycles(
-            std::vector<MoEOverlayTierMigration> &migrations);
-        static std::vector<MoEOverlayTierShadowRequirement>
-        buildShadowRequirements(
-            const std::vector<MoEOverlayTierMigration> &migrations);
         static void requireCapacityPreserving(
             const MoEOverlayResidencySnapshot &previous,
             const MoEOverlayResidencySnapshot &candidate);

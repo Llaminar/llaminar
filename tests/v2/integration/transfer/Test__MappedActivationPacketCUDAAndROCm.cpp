@@ -418,11 +418,13 @@ namespace
         return std::make_shared<const MoEExpertOwnerMap>(MoEExpertOwnerMap::buildShardPlacement(p,sources));
     }
 
-    template <std::int32_t Rows, std::int32_t Width = kDModel>
+    template <std::int32_t Rows, std::int32_t Width = kDModel,
+              std::int32_t BackingRows = Rows>
     class PacketRoundTrip final
     {
     public:
         static_assert(Rows > 0);
+        static_assert(BackingRows >= Rows);
         static_assert(Width > 0);
         // Class-local geometry deliberately shadows the small fixture default.
         static constexpr std::int32_t kDModel = Width;
@@ -631,23 +633,23 @@ namespace
                     static_cast<std::size_t>(kDModel)});
             target_hidden_tensor_ = std::make_shared<FP32Tensor>(
                 std::vector<std::size_t>{
-                    static_cast<std::size_t>(kRows),
+                    static_cast<std::size_t>(BackingRows),
                     static_cast<std::size_t>(kDModel)});
             target_routing_indices_tensor_ = std::make_shared<FP32Tensor>(
                 std::vector<std::size_t>{
-                    static_cast<std::size_t>(kRows),
+                    static_cast<std::size_t>(BackingRows),
                     static_cast<std::size_t>(kTopK)});
             target_routing_weights_tensor_ = std::make_shared<FP32Tensor>(
                 std::vector<std::size_t>{
-                    static_cast<std::size_t>(kRows),
+                    static_cast<std::size_t>(BackingRows),
                     static_cast<std::size_t>(kTopK)});
             target_route_input_tensor_ = std::make_shared<FP32Tensor>(
                 std::vector<std::size_t>{
-                    kEntries,
+                    static_cast<std::size_t>(BackingRows * kTopK),
                     static_cast<std::size_t>(kDModel)});
             target_canonical_route_tensor_ = std::make_shared<FP32Tensor>(
                 std::vector<std::size_t>{
-                    kEntries,
+                    static_cast<std::size_t>(BackingRows * kTopK),
                     static_cast<std::size_t>(kDModel)});
             return initializeSourcePayload() && initializeProtocol() &&
                    captureDeviceOwnedGraphs();
@@ -1617,6 +1619,26 @@ namespace
             return true;
         }
 
+        /**
+         * @brief Dirty capacity beyond this retained graph's exact physical rows.
+         *
+         * Called only between retired transactions. These bytes belong to the
+         * backing family, not dispatch/compute/return or the compact wire.
+         * @return Whether both ordered suffix writes were enqueued successfully.
+         */
+        bool poisonCapacitySuffix()
+        {
+            if constexpr (BackingRows == Rows) return true;
+            constexpr size_t hidden_offset = size_t(Rows) * kDModel * sizeof(float);
+            constexpr size_t hidden_bytes = size_t(BackingRows - Rows) * kDModel * sizeof(float);
+            constexpr size_t route_offset = hidden_offset * kTopK;
+            constexpr size_t route_bytes = hidden_bytes * kTopK;
+            return target_backend_->memset(static_cast<std::byte *>(target_hidden_) + hidden_offset,
+                       0x5a, hidden_bytes, target_device_.ordinal, target_stream_) &&
+                   target_backend_->memset(static_cast<std::byte *>(target_canonical_routes_) + route_offset,
+                       0x5a, route_bytes, target_device_.ordinal, target_stream_);
+        }
+
         /** @brief Arm and submit one retained replay with no per-layer host work. */
         bool submit(std::uint64_t generation)
         {
@@ -1877,6 +1899,26 @@ namespace
                     std::to_string(
                         control.buffers[0].dispatch_descriptor.live_rows);
                 return false;
+            }
+
+            if constexpr (BackingRows > Rows)
+            {
+                constexpr size_t elements = size_t(BackingRows - Rows) * kDModel;
+                std::array<std::uint8_t, elements * sizeof(float)> hidden_suffix{};
+                std::array<std::uint8_t, elements * kTopK * sizeof(float)> route_suffix{};
+                if (!target_backend_->deviceToHost(hidden_suffix.data(),
+                        static_cast<const std::byte *>(target_hidden_) + size_t(Rows) * kDModel * sizeof(float),
+                        hidden_suffix.size(), target_device_.ordinal, target_stream_) ||
+                    !target_backend_->deviceToHost(route_suffix.data(),
+                        static_cast<const std::byte *>(target_canonical_routes_) + size_t(Rows) * kTopK * kDModel * sizeof(float),
+                        route_suffix.size(), target_device_.ordinal, target_stream_) ||
+                    !target_backend_->synchronizeStream(target_stream_, target_device_.ordinal) ||
+                    !std::all_of(hidden_suffix.begin(), hidden_suffix.end(), [](auto byte) { return byte == 0x5a; }) ||
+                    !std::all_of(route_suffix.begin(), route_suffix.end(), [](auto byte) { return byte == 0x5a; }))
+                {
+                    error_ = "exact-row packet graph touched its backing-capacity suffix";
+                    return false;
+                }
             }
 
             std::array<float, kEntries * kDModel> canonical_routes{};
@@ -2872,13 +2914,15 @@ namespace
      * @param generations Number of independently authenticated descriptor generations.
      * @tparam Rows Captured physical row capacity.
      * @tparam Width Captured hidden width, including unaligned row tails.
+     * @tparam BackingRows Retained storage capacity, independent of exact captured work.
      */
-    template <std::int32_t Rows, std::int32_t Width = kDModel>
+    template <std::int32_t Rows, std::int32_t Width = kDModel,
+              std::int32_t BackingRows = Rows>
     void runRoleAssignment(DeviceId source, DeviceId target,
                            std::uint64_t generations = 2u)
     {
         ScopedActivationEpochPerfStats perf_stats;
-        PacketRoundTrip<Rows, Width> transaction(source, target);
+        PacketRoundTrip<Rows, Width, BackingRows> transaction(source, target);
         ASSERT_TRUE(transaction.initialize()) << transaction.error();
 
         double waits_enqueued = 0.0;
@@ -3032,6 +3076,7 @@ namespace
 
         for (std::uint64_t generation = 1u; generation <= generations; ++generation)
         {
+            ASSERT_TRUE(transaction.poisonCapacitySuffix()) << transaction.error();
             const auto submit_begin = std::chrono::steady_clock::now();
             ASSERT_TRUE(transaction.submit(generation)) << transaction.error();
             EXPECT_LT(
@@ -4778,4 +4823,26 @@ TEST(Test__MappedActivationPacketCUDAAndROCm, StaticJointSourceFixtureHasComplet
         ASSERT_NE(outside,owners->participants().end());
         for(const int layer:kLayers)EXPECT_TRUE(owners->expertsForParticipant(layer,outside->participant_id).empty());
     }
+}
+
+/** @test Actual CUDA packet consume/return keeps exact M=3 extents in a four-row tensor family. */
+TEST(Test__MappedActivationPacketCUDAAndROCm, CUDAExactRowsWithinFourRowBacking)
+{
+    auto *backend = getCUDABackend();
+    ASSERT_NE(backend, nullptr);
+    ASSERT_GT(backend->deviceCount(), 0);
+    runRoleAssignment<4, kDModel, 4>(DeviceId::cuda(0), DeviceId::cuda(0), 2);
+    runRoleAssignment<3, kDModel, 4>(DeviceId::cuda(0), DeviceId::cuda(0), 20);
+    runRoleAssignment<1, kDModel, 4>(DeviceId::cuda(0), DeviceId::cuda(0), 20);
+}
+
+/** @test Actual ROCm packet consume/return keeps exact M=3 extents in a four-row tensor family. */
+TEST(Test__MappedActivationPacketCUDAAndROCm, ROCmExactRowsWithinFourRowBacking)
+{
+    auto *backend = getROCmBackend();
+    ASSERT_NE(backend, nullptr);
+    ASSERT_GT(backend->deviceCount(), 0);
+    runRoleAssignment<4, kDModel, 4>(DeviceId::rocm(0), DeviceId::rocm(0), 2);
+    runRoleAssignment<3, kDModel, 4>(DeviceId::rocm(0), DeviceId::rocm(0), 20);
+    runRoleAssignment<1, kDModel, 4>(DeviceId::rocm(0), DeviceId::rocm(0), 20);
 }

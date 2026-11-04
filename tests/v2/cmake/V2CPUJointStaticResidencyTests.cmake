@@ -5,6 +5,14 @@
 # physical admission and immutable source-bound fragment lifetimes. These host
 # lifecycle checks do not certify CPU2 serving, throughput or unfinished cohort migration.
 if(TARGET v2_unit_expert_gemm_registry)
+    add_v2_test(V2_Integration_OriginalPreparedSourceBindingLifecycle
+        COMMAND $<TARGET_FILE:v2_unit_expert_gemm_registry>
+            --gtest_filter=CPUPreparedSourceBindingContract.* --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;PreparedWeights;SourceBinding;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false;OPENBLAS_NUM_THREADS=1;MKL_NUM_THREADS=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OriginalPreparedSourceBindingLifecycle)
+
     add_v2_test(V2_Integration_CPUJointStaticResidencyLifecycle
         COMMAND $<TARGET_FILE:v2_unit_expert_gemm_registry>
             --gtest_filter=CPUJointStaticResidency.* --gtest_brief=1
@@ -23,6 +31,18 @@ if(TARGET v2_unit_expert_gemm_registry)
     if(TEST V2_Integration_CPUJointSourceAuthorityLifecycle)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUJointSourceAuthorityLifecycle)
     endif()
+endif()
+
+if(TARGET v2_unit_moe_overlay_participant_residency)
+    # The real-source contract shares the canonical CPU admission/workspace fixtures.
+    target_include_directories(v2_unit_moe_overlay_participant_residency PRIVATE "${CMAKE_CURRENT_LIST_DIR}/..")
+    add_v2_test(V2_Integration_NonemptyPreparedSourceBankContract
+        COMMAND $<TARGET_FILE:v2_unit_moe_overlay_participant_residency>
+            --gtest_filter=PreparedSourceBindingContract.* --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;PreparedWeights;SourceBinding;Contract;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false;OPENBLAS_NUM_THREADS=1;MKL_NUM_THREADS=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NonemptyPreparedSourceBankContract)
 endif()
 
 if(TARGET v2_integration_cross_tier_expert_arithmetic)
@@ -67,4 +87,16 @@ if(TARGET v2_integration_cross_tier_expert_arithmetic)
             list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${name})
         endif()
     endforeach()
+endif()
+
+if(TARGET v2_unit_expert_gemm_registry)
+# Actual source-plan MTP completeness, before materialization/native readiness.
+add_v2_test(V2_Integration_CPUJointMTPSourceContract
+    COMMAND $<TARGET_FILE:v2_unit_expert_gemm_registry>
+        --gtest_filter=CPUJointMTPSourceContract.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;MTP;Ownership;Contract"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUJointMTPSourceContract)
+
 endif()

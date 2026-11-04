@@ -1177,8 +1177,11 @@ TEST(StaticProjectionPreparedSource, NativeDescriptorOwnsGeometryAndOriginalCode
 #include "CPUJointPreparedSourceContract.inc"
 
 #include "CPUJointStaticResidencyLifecycle.inc"
+#include "CPUJointMTPSourceContract.inc"
 #include "CPUJointDispatchContract.inc"
 
 #include "CPUJointGraphOwnershipContract.inc"
 
 #include "CPUTensorTP1PreparedStaticReplay.inc"
+
+#include "CPUPreparedSourceBindingContract.inc"

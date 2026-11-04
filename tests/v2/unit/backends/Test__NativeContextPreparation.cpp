@@ -42,6 +42,21 @@ void creator(DeviceId device){NativeContextPreparationReplayAccess::seed(device,
 std::size_t opaque(const NativeContextPreparation& source){std::size_t total=0;
     for(const auto& value:source.memory()->rankAttestation())total+=value.opaque_runtime_committed_bytes;return total;}
 }
+/** @test Fixed program capacity accepts exact bounds and diagnoses both incomplete and oversized storage. */
+TEST(NativeContextPreparation, CUDANativeProgramStackCapacityContract){
+    constexpr auto cap=CUDANativeProgramStack::capacityBytes;
+    static_assert(cap==2048u);
+    for(const auto required:{0u,1456u,2048u})
+        EXPECT_NO_THROW(CUDANativeProgramStack::requirePrepared(required,cap));
+    for(const auto required:{0u,2049u}) {
+        try { CUDANativeProgramStack::requirePrepared(required,required?cap:cap-1u);FAIL(); }
+        catch(const std::runtime_error& error) {
+            const std::string message=error.what();
+            EXPECT_NE(message.find("required="+std::to_string(required)),std::string::npos);
+            EXPECT_NE(message.find("prepared=2048"),std::string::npos);
+        }
+    }
+}
 TEST(NativeContextPreparation, ActualOwnerSamePMAAdmissionAndRepeatedBorrow){
     const auto device=DeviceId::cuda(97);creator(device);auto source=NativeContextPreparationReplayAccess::source<StackWorker>(device);
     EXPECT_EQ(opaque(*source),12288u);
@@ -54,10 +69,13 @@ TEST(NativeContextPreparation, ActualOwnerSamePMAAdmissionAndRepeatedBorrow){
         EXPECT_THROW(NativeContextPreparationReplayAccess::repeatRegistration(DeviceType::CUDA),std::logic_error);
         auto existing=GPUDeviceContextPool::instance().retainExistingPreparedContext(device,source->memory());
         EXPECT_EQ(existing.worker(),first.worker());EXPECT_EQ(existing.generation(),first.generation());
+        EXPECT_TRUE(GPUDeviceContextPool::instance().hasPreparedNativeProgramStack(device,source->memory()));
+        EXPECT_EQ(opaque(*source),12288u); // The program policy adds no separate byte commitment.
         EXPECT_NO_THROW(existing.requireWorker(first.worker()));
         EXPECT_THROW(GPUDeviceContextPool::instance().retainExistingPreparedContext(DeviceId::rocm(97),source->memory()),std::logic_error);
         auto aliasPMA=std::shared_ptr<PhysicalMemoryAuthority>(source->memory().get(),[](auto*){});
         EXPECT_THROW(GPUDeviceContextPool::instance().retainExistingPreparedContext(device,aliasPMA),std::logic_error);
+        EXPECT_THROW(GPUDeviceContextPool::instance().hasPreparedNativeProgramStack(device,aliasPMA),std::logic_error);
         auto aliasWorker=std::shared_ptr<IWorkerGPUContext>(first.worker().get(),[](auto*){});
         EXPECT_THROW(existing.requireWorker(aliasWorker),std::logic_error);
         EXPECT_THROW(existing.requireWorker(std::make_shared<testing::MockWorkerGPUContext>(97)),std::logic_error);

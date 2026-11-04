@@ -192,6 +192,8 @@ namespace llaminar2
 
         /** Declared first so native admission retires last, after worker cleanup and all resource members. */
         GPUDeviceProcessLifetime::NativeContextLease process_lifetime_lease_;
+        /** Source-birth program policy, immutable before worker publication; ordinary workers retain zero. */
+        const std::size_t source_native_program_stack_bytes_;
         // =========================================================================
         // Worker Thread Management
         // =========================================================================

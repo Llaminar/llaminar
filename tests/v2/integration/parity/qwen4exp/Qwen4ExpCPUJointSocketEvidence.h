@@ -1,6 +1,6 @@
 /**
  * @file Qwen4ExpCPUJointSocketEvidence.h
- * @brief Original-plan physical socket qualification for source-only CPU expert fragments.
+ * @brief Original-plan physical socket qualification for CPU expert source and exact-MTP proofs.
  *
  * Expected roles come only from the canonical placement plan. Native validation
  * consumes the SAME original MPI inventory later retained by the Runner, never
@@ -138,5 +138,37 @@ inline std::vector<test::CPUExpertSocketEndpoint> requireOriginalCPUJointSocketR
     if(!test::validCPUExpertSocketMembership(endpoints,cell.topology.mpi_ranks))
         throw std::invalid_argument("CPU joint source requires one original MPI rank per distinct physical socket");
     return endpoints;
+}
+/** @brief Original physical rank facts for exact MTP, independent of frozen-history identity. */
+struct Qwen4ExpCPUJointExactRankResources
+{
+    int rank; ///< Actual original MPI rank.
+    int world_size; ///< Complete original rank population.
+    int node; ///< Original physical node namespace.
+    int numa; ///< Original bound NUMA endpoint.
+    int socket; ///< Observed physical socket in that node.
+    int workers; ///< Published original CPU worker request.
+};
+/**
+ * @brief Validate exact-proof rank resources without manufacturing a history descriptor.
+ * @param cell Original exact proof topology.
+ * @param inventory Same already-published MPI inventory retained by the runner.
+ * @param rank Actual original MPI rank.
+ * @return Original physical membership and declared worker budget.
+ * @throws std::invalid_argument For missing/foreign rank, socket or worker evidence.
+ * @note This is passive evidence, never permission to execute or proof of completed inference.
+ */
+inline Qwen4ExpCPUJointExactRankResources qwen4ExpCPUJointExactRankResources(
+    const ModelParityCase& cell,const ClusterInventory& inventory,int rank)
+{
+    const auto endpoints=requireOriginalCPUJointSocketRanks(cell,inventory);
+    const auto endpoint=std::find_if(endpoints.begin(),endpoints.end(),
+        [&](const auto& value){return value.rank==rank;});
+    const auto original=std::find_if(inventory.ranks.begin(),inventory.ranks.end(),
+        [&](const auto& value){return value.rank==rank;});
+    if(endpoint==endpoints.end() || original==inventory.ranks.end() || original->cpu_worker_threads<=0)
+        throw std::invalid_argument("CPU joint exact proof lost original rank/socket/worker inventory");
+    return {rank,cell.topology.mpi_ranks,original->node_id,endpoint->numa_node,
+            endpoint->socket,original->cpu_worker_threads};
 }
 } // namespace llaminar2::test::parity::qwen4exp

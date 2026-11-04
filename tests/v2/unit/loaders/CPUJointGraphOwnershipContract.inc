@@ -123,3 +123,16 @@ TEST(CPUJointGraphOwnership, ActualQwenFamilyBorrowsOriginalPreparedMap)
     missing.setWeights(fixture.weights());
     EXPECT_THROW(missing.prepareForwardGraphTemplate(DeviceId::cpu()), std::invalid_argument);
 }
+
+#include "execution/moe/MoECPUExpertWorkspaceSource.h"
+/** @test Main-layer CPU cohort workspace formats use the same original loader geometry. */
+TEST(CPUJointGraphOwnership, WorkspaceFormatsRetainOriginalSourceGeometry)
+{
+    using namespace llaminar2;
+    const auto original=staticJointOriginal();
+    EXPECT_EQ(originalCPUExpertWorkspaceSourceFormats(*original.loader,7,8,20,512),
+        (std::array<TensorType,3>{TensorType::FP32,TensorType::FP32,TensorType::FP32}));
+    EXPECT_THROW(originalCPUExpertWorkspaceSourceFormats(*original.loader,7,8,10,512),std::logic_error);
+    EXPECT_THROW(originalCPUExpertWorkspaceSourceFormats(*original.loader,7,8,20,448),std::logic_error);
+    EXPECT_THROW(originalCPUExpertWorkspaceSourceFormats(*original.loader,8,8,20,512),std::logic_error);
+}

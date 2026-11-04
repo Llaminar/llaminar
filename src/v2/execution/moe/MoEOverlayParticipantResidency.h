@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -35,6 +36,8 @@
 namespace llaminar2
 {
     class MoEExpertOverlayPreparationPlan;
+    class ModelContext;
+    class WeightManager;
     class ExpertGemmRegistry;
     class ITensorGemm;
 
@@ -616,6 +619,76 @@ namespace llaminar2
     class MoEOverlayParticipantResidencyRegistry final
     {
     public:
+        /**
+         * @brief Scoped cold source use retaining the actual original context/manager.
+         * No bank or byte ledger is duplicated. This permit cannot be constructed
+         * from an engine pointer or a passive ModelContextId.
+         */
+        class PreparedSourceUse final
+        {
+        public:
+            /** @return Actual engine registry owned by this original manager. */
+            const ExpertGemmRegistry &registry() const noexcept
+            {
+                return *registry_;
+            }
+            /** @return Same immutable preparation control block supplied at admission. */
+            const std::shared_ptr<const MoEExpertOverlayPreparationPlan> &
+            preparation() const noexcept
+            {
+                return preparation_;
+            }
+
+        private:
+            friend class MoEOverlayParticipantResidencyRegistry;
+            /**
+             * @brief Retain authenticated original owners for one cold preparation use.
+             * @param context Original context authenticated by the residency registry.
+             * @param manager Exact manager owned by that context.
+             * @param registry Exact engine registry belonging to that manager.
+             * @param preparation Same admitted immutable preparation control block.
+             */
+            PreparedSourceUse(std::shared_ptr<ModelContext> context,
+                              std::shared_ptr<WeightManager> manager,
+                              const ExpertGemmRegistry *registry,
+                              std::shared_ptr<const MoEExpertOverlayPreparationPlan> preparation)
+                : context_(std::move(context)), manager_(std::move(manager)), registry_(registry),
+                  preparation_(std::move(preparation))
+            {
+            }
+            std::shared_ptr<ModelContext> context_;
+            std::shared_ptr<WeightManager> manager_;
+            const ExpertGemmRegistry *registry_;
+            std::shared_ptr<const MoEExpertOverlayPreparationPlan> preparation_;
+        };
+        /**
+         * @brief Bind once to the actual original model/manager/engine-registry source.
+         * @param context Genuine original ModelContext owning the WeightManager.
+         * @param preparation Exact admission preparation, including shared ownership; null matches
+         * only null.
+         * @param error Precise identity/lifetime failure, without changing the original binding.
+         * @return True for first installation or an identical live idempotent bind.
+         * @note Weak retained owners avoid context/registry cycles. A failed or
+         * expired source cannot rebind to a new owner at the same address.
+         */
+        bool bindOriginalPreparedContext(
+            const std::shared_ptr<ModelContext> &context,
+            const std::shared_ptr<const MoEExpertOverlayPreparationPlan> &preparation,
+            std::string *error = nullptr);
+        /**
+         * @brief Retain only the successfully bound live original source for cold preparation.
+         * @param error Exact missing/expired/replaced-owner diagnostic.
+         * @return A real source use or no value; unbound component APIs grant no permit.
+         */
+        std::optional<PreparedSourceUse>
+        acquireOriginalPreparedSource(std::string *error = nullptr) const;
+        /** @return Original model identity; zero denotes an explicitly unbound component fixture.
+         */
+        ModelContextId originalModel() const noexcept
+        {
+            return config_.original_model;
+        }
+
         /** @brief Distinguish real joint fragments from whole-expert prepared banks. */
         enum class InitialOwnershipKind { WholeExperts, CPUJointFragments };
         /** @brief Immutable source-bound fragment publication; only the original registry can construct it. */
@@ -712,7 +785,7 @@ namespace llaminar2
             std::shared_ptr<const MoEExpertOverlayPreparationPlan> projection_preparation;
             /** First global model layer owned by all endpoints in this registry. */
             int first_model_layer = 0;
-            ModelContextId original_model; ///< Original context strategy/store identity; required only for joint fragments.
+            ModelContextId original_model; ///< Actual production context identity; zero component-only banks grant no prepared-source use.
         };
 
         /**
@@ -931,7 +1004,59 @@ namespace llaminar2
                 InitialPublicationState::Assembling;
         };
 
+        /**
+         * @brief Retain actual owners under the cold source mutex.
+         * @param error Receives missing, expired or replaced-owner diagnostics.
+         * @return Scoped actual owners, or no value; never creates a context.
+         */
+        std::optional<PreparedSourceUse> acquireOriginalPreparedSourceLocked(std::string *error) const;
+        /**
+         * @brief Reject substitution of the first successful registry producer.
+         * @param registry Actual candidate registry object, never a key-equivalent substitute.
+         * @param error Receives an exact original-producer mismatch diagnostic.
+         * @return Whether the object matches; caller owns the cold source mutex.
+         */
+        bool acceptsPreparedRegistryLocked(const ExpertGemmRegistry &registry, std::string *error) const;
+        /**
+         * @brief Authenticate existing nonempty component banks before a model bind.
+         * @param registry Actual model-owned registry used to resolve original scoped engines.
+         * @param error Receives missing or foreign engine/control-block diagnostics.
+         * @return True only when every published row matches; performs no publication.
+         */
+        bool authenticatePublishedPreparedSourceLocked(const ExpertGemmRegistry &,
+                                                       std::string *) const;
+        /**
+         * @brief Validate/install one layer while the cold producer lock is held.
+         * @param participant_id Exact local participant.
+         * @param layer_idx Global model layer.
+         * @param resident_mask Original owner-map selection.
+         * @param experts Complete payload table for that selection.
+         * @param error Receives publication/identity failures.
+         * @return Whether the original initial bank is ready or identically reused.
+         */
+        bool registerInitialLayerImpl(int participant_id, int layer_idx,
+                                      const std::vector<bool> &resident_mask,
+                                      const std::vector<MoEOverlayPreparedExpertPayload> &experts,
+                                      std::string *error);
+        /**
+         * @brief Validate actual committed joint sources under the cold producer lock.
+         * @param registry Original model-owned source/engine registry.
+         * @param original_model Exact configured original model identity.
+         * @param participant_id Original local cohort member.
+         * @param layer_idx Global source layer.
+         * @param error Receives source/cohort/engine identity failures.
+         * @return Whether the genuine initial fragment layer is ready or identically reused.
+         */
+        bool registerInitialCPUJointLayerImpl(const ExpertGemmRegistry &registry,
+                                              ModelContextId original_model, int participant_id,
+                                              int layer_idx, std::string *error);
         Config config_;
+        // Cold identity synchronization only, never a physical-byte/source ledger.
+        mutable std::mutex prepared_source_mutex_;
+        bool prepared_source_bound_ = false;
+        std::weak_ptr<ModelContext> prepared_source_context_;
+        std::weak_ptr<WeightManager> prepared_source_manager_;
+        const ExpertGemmRegistry *prepared_source_registry_ = nullptr;
         mutable std::shared_mutex mutex_;
         std::unordered_map<int, EndpointAssembly> endpoints_;
     };

@@ -37,7 +37,9 @@ namespace llaminar2
     /**
      * @brief Source-side producer of authenticated host-visible network chunks.
      *
-     * A CPU implementation returns spans into immutable final execution bytes.
+     * A CPU implementation retains original immutable final execution bytes;
+     * native rectangles gather only live encoded columns into existing MPI send
+     * staging, while floating rectangles expose exact original row segments.
      * A GPU implementation first enqueues conversion or D2H on its exact
      * auxiliary stream, returns Pending while its event is incomplete, and then
      * returns a span into model-lifetime pinned staging storage.
@@ -55,12 +57,13 @@ namespace llaminar2
          * @brief Produce the next event-ready chunk without waiting.
          * @param chunk Receives a header and stable payload span on Ready.
          * @param error Receives an exact conversion/event failure.
+         * @param staging Original exclusive admitted MPI send lane; reused only after exact ACK.
          * @return Pending while device preparation runs, Ready for one chunk,
          *         or Failed. Ready never means end-of-stream without a chunk.
          */
         virtual MoEOverlayResidencyWaveProgress pollNextChunk(
             MoEOverlayRemoteProjectionChunkView *chunk,
-            std::string *error = nullptr) noexcept = 0;
+            std::string *error = nullptr, std::span<std::uint8_t> staging = {}) noexcept = 0;
 
         /**
          * @brief Acknowledge that MPI no longer reads the last returned payload.
@@ -192,7 +195,7 @@ namespace llaminar2
         /** @brief Return the next allocation-free cursor chunk immediately. */
         MoEOverlayResidencyWaveProgress pollNextChunk(
             MoEOverlayRemoteProjectionChunkView *chunk,
-            std::string *error = nullptr) noexcept override;
+            std::string *error = nullptr, std::span<std::uint8_t> staging = {}) noexcept override;
 
         /** @brief Release the cursor span after MPI completes its payload send. */
         bool acknowledgeChunkSent(
@@ -299,6 +302,10 @@ namespace llaminar2
         std::optional<MoEOverlayRemoteProjectionManifest> expected_manifest_;
         MoEOverlayRemoteProjectionManifestMatchPolicy match_policy_ =
             MoEOverlayRemoteProjectionManifestMatchPolicy::Exact;
+        /** Original native CPU destination geometry, retained after manifest authentication. */
+        std::optional<ExpertTierWeightCPUStorageLayout> cpu_layout_;
+        /** Original floating root geometry; protocol bytes remain a compact virtual rectangle. */
+        std::optional<MoEOverlayRemoteProjectionManifest> floating_layout_;
         std::optional<MoEOverlayRemoteProjectionChunkValidator> validator_;
         bool aborted_ = false;
     };

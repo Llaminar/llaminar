@@ -12,6 +12,8 @@
  * runtime policy is projected directly from the typed case and is never
  * recovered by parsing a GoogleTest name. Explicit numerical-only candidates
  * retain their diagnostic campaigns without becoming runtime/control authorities.
+ * Dynamic-depth expectations use the declared model ceiling; the standard
+ * full-matrix depth and retained graph storage do not override that request.
  */
 
 #pragma once
@@ -893,8 +895,9 @@ namespace llaminar2::test::parity
             case ModelParityMTP::Depth6:
                 return 6;
             case ModelParityMTP::Depth15:
-            case ModelParityMTP::DynamicDepth:
                 return kModelParityRequiredMaximumMTPDepth;
+            case ModelParityMTP::DynamicDepth:
+                return model.maximum_mtp_draft_depth;
             }
             return 0;
         }

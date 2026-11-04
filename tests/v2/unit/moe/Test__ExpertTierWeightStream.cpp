@@ -375,25 +375,20 @@ namespace llaminar2
                 2);
             ASSERT_TRUE(manifest.valid(&error)) << error;
             ASSERT_EQ(manifest.unit_count, 6u);
-            ASSERT_EQ(
-                manifest.total_stream_bytes,
-                cpu.native_interleaved.size());
+            ASSERT_EQ(manifest.deviceLayout().cpuStorageBytes(),cpu.native_interleaved.size());
+            ASSERT_LT(manifest.total_stream_bytes,cpu.native_interleaved.size());
 
             std::vector<uint8_t> final_bytes(
-                static_cast<size_t>(manifest.total_stream_bytes), 0xcc);
+                manifest.deviceLayout().cpuStorageBytes(), 0);
             ExpertTierWeightStreamReceiver receiver(manifest, final_bytes);
 
             for (uint32_t sequence = 0; sequence < 3; ++sequence)
             {
                 const uint32_t first_unit = sequence * 2;
-                const size_t offset =
-                    static_cast<size_t>(first_unit) *
-                    manifest.cpu_block_stride;
-                const size_t byte_count =
-                    2u * static_cast<size_t>(manifest.cpu_block_stride);
-                const std::span<const uint8_t> payload(
-                    cpu.native_interleaved.data() + offset,
-                    byte_count);
+                const size_t byte_count=manifest.deviceLayout().chunkBytes(2,first_unit);
+                std::vector<uint8_t> encoded(byte_count);
+                ASSERT_TRUE(gatherExpertTierCPUWeightChunk(manifest.deviceLayout(),cpu.native_interleaved,first_unit,2,encoded));
+                const std::span<const uint8_t> payload(encoded);
                 ExpertTierWeightStreamChunkHeader header;
                 header.manifest_hash = manifest.manifest_hash;
                 header.payload_hash = expertTierWeightBytesHash(payload);
@@ -427,7 +422,7 @@ namespace llaminar2
                 ExpertTierWeightProjection::Down,
                 1);
             std::vector<uint8_t> final_bytes(
-                static_cast<size_t>(manifest.total_stream_bytes), 0x5a);
+                manifest.deviceLayout().cpuStorageBytes(), 0x5a);
             ExpertTierWeightStreamReceiver receiver(manifest, final_bytes);
 
             const std::span<const uint8_t> first(
@@ -1144,3 +1139,5 @@ namespace llaminar2
         }
     } // namespace
 } // namespace llaminar2
+
+#include "ExpertTierRectangularWeightContract.inc"

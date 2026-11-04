@@ -30,4 +30,25 @@ inline const std::vector<ModelParityCase>& qwen4ExpCPUJointWorld2NumericalCases(
     }();
     return cases;
 }
+/**
+ * @return Explicit fixed1/fixed3/dynamic native serial/grouped proof requests.
+ * @note These retain the original world2 socket/source topology and canonical
+ * exact proof. They add no reference-sidecar numerical acceptance or pass badge.
+ */
+inline const std::vector<ModelParityCase>& qwen4ExpCPUJointWorld2MTPExactCases()
+{
+    static const auto cases=[] {
+        std::vector<ModelParityCase> result;
+        for(auto cell:qwen4ExpCPUJointWorld2MTPSourceAdmissionCases()) {
+            if(cell.mtp==ModelParityMTP::Off)continue;
+            cell.inventory_role=ModelParityInventoryRole::NumericalDiagnostic;
+            cell.collective_evidence_source=ParityCollectiveEvidenceSource::PostCollectiveSnapshot;
+            cell.thresholds.allreduce_stages.clear();
+            result.push_back(std::move(cell));
+        }
+        return result;
+    }();
+    return cases;
+}
+
 }

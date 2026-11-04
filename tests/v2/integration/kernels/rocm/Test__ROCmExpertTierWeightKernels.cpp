@@ -12,6 +12,8 @@
  * source identity remains4 and symmetric arithmetic is unchanged.
  */
 
+#include "utils/ExpertTierWeightWireTestOracle.h"
+
 #include "../../../utils/NativeVNNITestPartialStorage.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "planning/PhysicalMemoryAuthority.h"
@@ -41,6 +43,8 @@
 #include "tensors/VnniPackContext.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
+#include "transfer/MappedTransferProgressEpoch.h"
+#include <atomic>
 
 #include "../../../utils/QuantizedVerifierFormats.h"
 #include "../../../utils/ExpertTierFusedQKVStreamPoolHarness.h"
@@ -550,6 +554,18 @@ namespace llaminar2
                     << "all ROCm IQ decoder translation units must initialize";
             }
         };
+
+#include "utils/ExpertTierCapturedPackedTransferContract.inc"
+        /** Existing capture progression coverage; original backend completion policy is explicit. */
+        TEST_F(ROCmExpertTierWeightKernelsTest,CapturedLocalPackedTransfersProgressAllFormats)
+        { proveCapturedPackedTransfer<TestHIPBuffer,hipSuccess>(DeviceId::rocm(0),CapturedPackedClient::LocalTier); }
+        TEST_F(ROCmExpertTierWeightKernelsTest,CapturedRemotePackedTransfersProgressAllFormats)
+        { proveCapturedPackedTransfer<TestHIPBuffer,hipSuccess>(DeviceId::rocm(0),CapturedPackedClient::RemoteProjection); }
+        /** Compact rectangle repetition uses the actual retained lane and exact completion extents. */
+        TEST_F(ROCmExpertTierWeightKernelsTest,CapturedLocalRectangularTransfersAllFormats)
+        { proveCapturedPackedTransfer<TestHIPBuffer,hipSuccess>(DeviceId::rocm(0),CapturedPackedClient::LocalTier,true); }
+        TEST_F(ROCmExpertTierWeightKernelsTest,CapturedRemoteRectangularTransfersAllFormats)
+        { proveCapturedPackedTransfer<TestHIPBuffer,hipSuccess>(DeviceId::rocm(0),CapturedPackedClient::RemoteProjection,true); }
 
         /**
          * @test Captured grouped ordinary reductions preserve every original source format.
@@ -1204,7 +1220,7 @@ namespace llaminar2
                 ASSERT_TRUE(demotion_layout.valid());
                 ASSERT_EQ(
                     expected_cpu.native_interleaved.size(),
-                    demotion_manifest.total_stream_bytes);
+                    demotion_manifest.deviceLayout().cpuStorageBytes());
 
                 TestHIPBuffer<std::uint8_t> source_payload(
                     source.payload.size());
@@ -1263,7 +1279,7 @@ namespace llaminar2
                             kUnitsPerChunk,
                             demotion_layout.unit_count - first_unit);
                     const std::size_t bytes =
-                        demotion_layout.chunkBytes(unit_count);
+                        demotion_layout.chunkBytes(unit_count,first_unit);
                     ASSERT_TRUE(launchGpuToCpuExpertTierChunkROCm(
                         source_view,
                         demotion_layout,
@@ -1284,8 +1300,7 @@ namespace llaminar2
                     expectChunkBytesEqual(
                         observed_chunk,
                         bytes,
-                        expected_cpu.native_interleaved.data() +
-                            demotion_layout.chunkBytes(first_unit),
+                        test::expertTierWireOracle(demotion_layout,expected_cpu.native_interleaved,first_unit,unit_count).data(),
                         first_unit);
                     ASSERT_FALSE(::testing::Test::HasFailure());
                 }
@@ -1352,12 +1367,12 @@ namespace llaminar2
                             kUnitsPerChunk,
                             promotion_layout.unit_count - first_unit);
                     const std::size_t bytes =
-                        promotion_layout.chunkBytes(unit_count);
+                        promotion_layout.chunkBytes(unit_count,first_unit);
+                    const auto upload_wire=test::expertTierWireOracle(promotion_layout,expected_cpu.native_interleaved,first_unit,unit_count);
                     ASSERT_EQ(
                         hipMemcpyAsync(
                             device_chunk.data(),
-                            expected_cpu.native_interleaved.data() +
-                                promotion_layout.chunkBytes(first_unit),
+                            upload_wire.data(),
                             bytes,
                             hipMemcpyHostToDevice,
                             stream.native()),
@@ -1992,11 +2007,44 @@ namespace llaminar2
                 ASSERT_EQ(
                     gpu_destination.download(observed_gpu), hipSuccess);
                 EXPECT_EQ(observed_gpu, source);
+                // Same lane, original coordinate intersections and arbitrary
+                // floating K17. No quantized-block alignment is imposed here.
+                using P=MoEExpertProjectionOwnership::Projection;using R=MoEProjectionResidence;
+                const P originalSource{R::ParticipantOutputSlice,32,32,2,n,1,k};
+                const P originalTarget{R::ParticipantInputSlice,32,32,8,17,7,17};
+                const auto rectangle=ExpertTierWeightProjectionIntersection::between(originalSource,originalTarget);
+                const auto reverse=ExpertTierWeightProjectionIntersection::between(originalTarget,originalSource);
+                std::vector<uint8_t> rectangleCPU(size_t(17*17)*element_bytes,0xa5);
+                const auto beforeRectangleBytes=lane.stats().bytes_submitted;
+                void* rectangleReady=backend->createEvent(0);ASSERT_NE(rectangleReady,nullptr);
+                ASSERT_TRUE(backend->recordEvent(rectangleReady,0,producer_stream.opaque()));
+                ASSERT_TRUE(lane.startGpuToCpuContiguous(source_descriptor,rectangleCPU,
+                    ExpertTierSourceReadiness::producerEvent(rectangleReady),rectangle,&error)) << error;
+                ASSERT_EQ(pollLaneToCompletion(lane),ExpertTierWeightTransferProgress::Ready);
+                backend->destroyEvent(rectangleReady,0);
+                for(size_t row=0;row<17;++row)for(size_t column=0;column<17;++column)
+                    for(size_t byte=0;byte<element_bytes;++byte)
+                        EXPECT_EQ(rectangleCPU[(row*17+column)*element_bytes+byte],
+                            row<13?source[((row+6)*k+column+6)*element_bytes+byte]:uint8_t(0xa5));
+                ASSERT_EQ(gpu_destination.upload(std::vector<uint8_t>(bytes,0xa5)),hipSuccess);
+                ASSERT_TRUE(lane.startCpuToGpuContiguous(rectangleCPU,destination_descriptor,reverse,&error)) << error;
+                ASSERT_EQ(pollLaneToCompletion(lane),ExpertTierWeightTransferProgress::Ready);
+                ASSERT_EQ(gpu_destination.download(observed_gpu),hipSuccess);
+                for(size_t row=0;row<size_t(n);++row)for(size_t column=0;column<size_t(k);++column)
+                    for(size_t byte=0;byte<element_bytes;++byte) {
+                        const size_t index=(row*k+column)*element_bytes+byte;
+                        EXPECT_EQ(observed_gpu[index],row>=6 && column>=6?source[index]:uint8_t(0xa5));
+                    }
+                EXPECT_EQ(lane.stats().bytes_submitted-beforeRectangleBytes,size_t(2*13*17)*element_bytes);
+
             }
 
             const auto stats = lane.stats();
-            EXPECT_EQ(stats.transfers_started, 6u);
-            EXPECT_EQ(stats.transfers_completed, 6u);
+            // Each precision completes a whole projection and an original-coordinate
+            // rectangle in both directions on this same persistent lane.
+            const auto completed_per_direction = 2u * formats.size();
+            EXPECT_EQ(stats.transfers_started, 2u * completed_per_direction);
+            EXPECT_EQ(stats.transfers_completed, 2u * completed_per_direction);
             EXPECT_GT(stats.chunks_submitted, stats.transfers_completed);
             EXPECT_EQ(stats.inference_stream_waits, 0u);
             EXPECT_EQ(stats.blocking_synchronizations, 0u);
@@ -2011,7 +2059,7 @@ namespace llaminar2
                     [&](const PerfStatRecord &record)
                     {
                         return perfTag(record, "direction") == direction &&
-                               record.value == 3.0;
+                               record.value == static_cast<double>(completed_per_direction);
                     });
             };
             EXPECT_TRUE(observed_direction("gpu_to_cpu"));
@@ -3199,7 +3247,7 @@ namespace llaminar2
             TestHIPBuffer<std::uint8_t> input_payload(source.payload.size()),destination_payload(source.payload.size());
             TestHIPBuffer<std::uint16_t> input_scales(source.scales.size()),input_coeff(source.mins.size());
             TestHIPBuffer<std::uint16_t> destination_scales(source.scales.size()),destination_coeff(source.mins.size());
-            TestHIPBuffer<std::uint8_t> chunk(demotion.chunkBytes(units));
+            TestHIPBuffer<std::uint8_t> chunk(demotion.chunkBytes(units,first_unit));
             ASSERT_EQ(input_payload.upload(source.payload),hipSuccess);
             ASSERT_EQ(input_scales.upload(source.scales),hipSuccess);ASSERT_EQ(input_coeff.upload(source.mins),hipSuccess);
             ExpertTierGpuConstProjectionView in{.payload=input_payload.data(),.scales=input_scales.data(),.mins=input_coeff.data(),
@@ -3236,7 +3284,7 @@ namespace llaminar2
                 ASSERT_EQ(hipMemcpyAsync(observed_scales.data(),destination_scales.data(),destination_scales.bytes(),hipMemcpyDeviceToHost,stream.native()),hipSuccess);
                 ASSERT_EQ(hipMemcpyAsync(observed_coeff.data(),destination_coeff.data(),destination_coeff.bytes(),hipMemcpyDeviceToHost,stream.native()),hipSuccess);
                 ASSERT_EQ(stream.synchronize(),hipSuccess);
-                expectChunkBytesEqual(observed_cpu,chunk.bytes(),cpu.native_interleaved.data() + demotion.chunkBytes(first_unit),first_unit);
+                expectChunkBytesEqual(observed_cpu,chunk.bytes(),test::expertTierWireOracle(demotion,cpu.native_interleaved,first_unit,units).data(),first_unit);
                 for (int kb = 0; kb < K / 32; ++kb) for (int row = 0; row < N; ++row)
                 {
                     const auto linear = static_cast<std::size_t>(kb) * N + row;
@@ -3330,3 +3378,5 @@ namespace llaminar2
         }
     } // namespace
 } // namespace llaminar2
+
+#include "ROCmExpertTierRectangularWeightContract.inc"

@@ -25,7 +25,8 @@ if(TARGET v2_unit_expert_gemm_registry)
     foreach(_cpu_joint_projection_case IN ITEMS
         ExternalJointProjectionPreservesOriginalMembership
         OrdinaryWholeOwnerProjectionIsUnchanged
-        ActualQwenFamilyBorrowsOriginalPreparedMap)
+        ActualQwenFamilyBorrowsOriginalPreparedMap
+        WorkspaceFormatsRetainOriginalSourceGeometry)
         set(_cpu_joint_projection_test "V2_Integration_CPUJointGraph_${_cpu_joint_projection_case}")
         add_v2_test(${_cpu_joint_projection_test}
             COMMAND $<TARGET_FILE:v2_unit_expert_gemm_registry>

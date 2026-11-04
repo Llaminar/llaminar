@@ -7,6 +7,8 @@
  * participant deficits in canonical order. That rule avoids gratuitous
  * same-tier copies while keeping independently planning MPI ranks bit-for-bit
  * deterministic.
+ * Migration vertices preserve complete shard cohorts, rather than aliasing a
+ * jointly owned expert to one member or its absent scalar-owner sentinel.
  */
 
 #include <atomic>
@@ -386,6 +388,60 @@ namespace llaminar2
             return false;
         if(shard_cohort==other.shard_cohort)return true;
         return shard_cohort && other.shard_cohort && *shard_cohort==*other.shard_cohort;
+    }
+
+    std::optional<MoEExpertPlacementTarget> MoEExpertPlacementTarget::fromPlacement(
+        const MoEExpertOwner &placement) noexcept
+    {
+        if (placement.layer_idx < 0 || placement.expert_id < 0 || placement.tier_idx < 0)
+            return std::nullopt;
+        if (!placement.shard_cohort)
+        {
+            if (placement.owner_participant < 0)
+                return std::nullopt;
+            return MoEExpertPlacementTarget(placement.tier_idx, placement.owner_participant);
+        }
+        const auto &cohort = *placement.shard_cohort;
+        if (cohort.participants().size() < 2 || cohort.participants().size() > 8 ||
+            placement.owner_participant != -1 || placement.device.is_valid() ||
+            placement.owner_world_rank_known || placement.owner_world_rank != -1 ||
+            placement.domain_participant_index != -1 ||
+            cohort.source().layer_idx != placement.layer_idx ||
+            placement.expert_id >= cohort.ownership(0).geometry().experts)
+            return std::nullopt;
+        return MoEExpertPlacementTarget(placement.tier_idx, placement.shard_cohort);
+    }
+
+    bool MoEExpertPlacementTarget::isCohort() const noexcept
+    {
+        return std::holds_alternative<std::shared_ptr<const MoEExpertShardCohort>>(owners_);
+    }
+
+    std::size_t MoEExpertPlacementTarget::participantCount() const noexcept
+    {
+        return isCohort()
+            ? std::get<std::shared_ptr<const MoEExpertShardCohort>>(owners_)->participants().size()
+            : 1u;
+    }
+
+    int MoEExpertPlacementTarget::participantId(std::size_t index) const
+    {
+        if (index >= participantCount())
+            throw std::out_of_range("Expert placement target has no such original physical member");
+        return isCohort()
+            ? std::get<std::shared_ptr<const MoEExpertShardCohort>>(owners_)->participants()[index].participant_id
+            : std::get<int>(owners_);
+    }
+
+    bool MoEExpertPlacementTarget::operator==(const MoEExpertPlacementTarget &other) const noexcept
+    {
+        if (tier_idx_ != other.tier_idx_ || owners_.index() != other.owners_.index())
+            return false;
+        if (!isCohort())
+            return std::get<int>(owners_) == std::get<int>(other.owners_);
+        const auto &ours = std::get<std::shared_ptr<const MoEExpertShardCohort>>(owners_);
+        const auto &theirs = std::get<std::shared_ptr<const MoEExpertShardCohort>>(other.owners_);
+        return ours == theirs || *ours == *theirs;
     }
 
     std::uint64_t MoEExpertOwnerMap::initialBuildAttempts() noexcept

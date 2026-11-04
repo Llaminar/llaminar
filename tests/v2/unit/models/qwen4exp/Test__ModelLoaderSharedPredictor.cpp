@@ -10,6 +10,7 @@
 #include "models/qwen4exp/Qwen4ExpSidecarManifest.h"
 #include "loaders/ModelLoader.h"
 #include "execution/moe/MoEOverlayPhysicalResidencyFabric.h"
+#include "execution/moe/MoECPUExpertWorkspaceSource.h"
 #include "execution/moe/MoEOverlayInferenceTransaction.h"
 #include "execution/mtp/MTPWeightManifest.h"
 #include "loaders/ModelContext.h"
@@ -319,3 +320,34 @@ TEST(ModelLoaderSharedPredictor, RoutedManifestRejectsIncompleteOrUnsupportedSid
 }
 
 } // namespace llaminar2::test
+
+namespace llaminar2::test {
+/** @test Actual CPU expert workspace metadata resolves the original shared predictor, not the main directory. */
+TEST(ModelLoaderSharedPredictor, CPUJointWorkspaceUsesOriginalSharedPredictorSource)
+{
+    SidecarFiles files(true);ModelLoader loader;loader.setUseMmap(false);
+    ASSERT_TRUE(loader.loadModel(files.main_path));
+    const auto main_count=loader.getModel().tensors.size();
+    const auto main=originalCPUExpertWorkspaceSourceFormats(loader,0,2560,640,512);
+    EXPECT_EQ(main,(std::array<TensorType,3>{TensorType::Q4_0,TensorType::Q4_0,TensorType::Q4_0}));
+    EXPECT_THROW(originalCPUExpertWorkspaceSourceFormats(loader,48,2560,640,512),std::logic_error);
+    loader.bindSharedPredictor(SharedPredictorGGUFSource(files.predictor_path),SharedPredictorMaterialization::Active);
+    const auto predictor=originalCPUExpertWorkspaceSourceFormats(loader,48,2560,640,512);
+    EXPECT_EQ(predictor,(std::array<TensorType,3>{TensorType::Q8_0,TensorType::Q8_0,TensorType::Q8_0}));
+    EXPECT_NE(predictor,main);EXPECT_EQ(loader.getModel().tensors.size(),main_count);
+    EXPECT_EQ(loader.getModel().findTensor("blk.48.ffn_gate_exps.weight"),nullptr);
+    for(const char *role:{"gate","up","down"}) {
+        const auto name="blk.48.ffn_"+std::string(role)+"_exps.weight";
+        auto *info=const_cast<GGUFTensorInfo*>(loader.tensorInfo(name));ASSERT_NE(info,nullptr);
+        const auto original=info->dimensions;++info->dimensions[0];
+        EXPECT_THROW(originalCPUExpertWorkspaceSourceFormats(loader,48,2560,640,512),std::logic_error);
+        info->dimensions=original;
+        const auto original_type=info->type;info->type=static_cast<GGUFTensorType>(0x7fffffff);
+        EXPECT_THROW(originalCPUExpertWorkspaceSourceFormats(loader,48,2560,640,512),std::invalid_argument);
+        info->type=original_type;
+    }
+    EXPECT_THROW(originalCPUExpertWorkspaceSourceFormats(loader,48,2560,640,448),std::logic_error);
+    EXPECT_THROW(originalCPUExpertWorkspaceSourceFormats(loader,49,2560,640,512),std::logic_error);
+    EXPECT_EQ(originalCPUExpertWorkspaceSourceFormats(loader,48,2560,640,512),predictor);
+}
+}

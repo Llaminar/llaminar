@@ -14,6 +14,7 @@
  */
 #pragma once
 #include "utils/ScopedMoEParityCoordinatedSession.h"
+#include "app/RuntimeInitPhase.h"
 #include "utils/MPIContext.h"
 #include "execution/runner/IOrchestrationRunnerFactory.h"
 #include "Qwen4ExpCPUJointSocketEvidence.h"
@@ -73,6 +74,23 @@ protected:
     void SetUp() override
     {
         if(isCPUJointNumericalSurface()) {
+            // Inventory gathering may initialize a CPU-socket-filtered device
+            // view. Publish the ordinary frontend's explicit-overlay startup
+            // first: GPU visibility is host-wide, CPU allocation/affinity stays
+            // on this rank's original socket even when its GPU is on another.
+            int rank=-1, world_size=0;
+            ASSERT_EQ(MPI_Comm_rank(MPI_COMM_WORLD,&rank),MPI_SUCCESS);
+            ASSERT_EQ(MPI_Comm_size(MPI_COMM_WORLD,&world_size),MPI_SUCCESS);
+            const auto& cell=static_cast<const Derived*>(this)->modelParityCase();
+            ASSERT_EQ(world_size,cell.topology.mpi_ranks);
+            const auto startup=cell.makeOrchestrationConfig(cell.model.model_path,rank);
+            publishOrchestrationStartupPolicy(startup);
+            auto& devices=DeviceManager::instance();
+            if(!devices.hardware())
+                ASSERT_NO_THROW(RuntimeInitPhase::initializeDiscoveryRuntime(startup,rank,world_size));
+            ASSERT_FALSE(RuntimeInitPhase::requiresHostWideAcceleratorVisibility(startup,rank) &&
+                         devices.local_numa_node()>=0)
+                << "CPU joint parity requires its original host-wide accelerator startup view before MPI inventory";
             Base::mpi_ctx_=MPIContextFactory::global();
             ASSERT_TRUE(Base::mpi_ctx_);
             const auto inventory=Base::mpi_ctx_->clusterInventory();ASSERT_TRUE(inventory);
@@ -574,7 +592,8 @@ protected:
         Base::beginProductionParityEvidence();
         ASSERT_TRUE(Base::setupProductionParityPipeline());
         ASSERT_TRUE(Base::hasOrchestrationRunner());
-        ScopedMoEParityCoordinatedSession session(*Base::orch_runner_);
+        ScopedMoEParityCoordinatedSession session(*Base::orch_runner_,
+            Base::bindCoordinatedProductionParityMoEEvidence());
         if(!session.isAuthority()) {
             session.serveFollowerAndFinish();
             publishCPUJointHistoryResources();
@@ -619,6 +638,35 @@ protected:
         accuracy::requireQFN(bool(output),"Cannot publish original CPU joint history rank resources");
     }
 
+    /**
+     * @brief Publish exact-proof rank retirement facts after the original session closes.
+     * @note No frozen-history descriptor exists in this native functional proof.
+     * Original socket membership and passive process observations are retained;
+     * executed worker/GPU/capture evidence remains owned by the exact proof CSVs.
+     */
+    void publishCPUJointExactResources()
+    {
+        const auto& cell=static_cast<const Derived*>(this)->modelParityCase();
+        const auto inventory=Base::mpi_ctx_->clusterInventory();
+        accuracy::requireQFN(bool(inventory),"CPU joint exact proof lost original MPI inventory");
+        const auto original=qwen4ExpCPUJointExactRankResources(cell,*inventory,Base::mpi_ctx_->rank());
+        std::string affinity_details;
+        accuracy::requireQFN(MPIBootstrapPhase::verifyStartupThreadAffinity(original.numa,false,affinity_details),
+            "CPU joint exact proof affinity differs from original bound NUMA endpoint");
+        const auto observed=FrozenParityHistoryReplay::observeCPUExecution();
+        nlohmann::json record={{"schema","llaminar.qfn-mtp-exact-cpu-rank.v1"},
+            {"scope","native_serial_grouped_exact_functional"},{"cell",cell.testName()},
+            {"world_rank",original.rank},{"world_size",original.world_size},
+            {"original_node_id",original.node},{"numa_node",original.numa},{"socket_id",original.socket},
+            {"requested_workers",original.workers},{"observed_max_workers",observed.max_workers},
+            {"allowed_cpus",observed.allowed_cpus},{"physical_cores",observed.physical_cores},
+            {"dynamic",observed.dynamic},{"unbound",observed.unbound},{"places",observed.places},
+            {"runner_retired",true}};
+        std::ofstream output(Base::ensureResultsDir()/("mtp_exact_cpu_rank_"+std::to_string(original.rank)+".json"),std::ios::trunc);
+        output<<record.dump(2)<<'\n';output.close();
+        accuracy::requireQFN(bool(output),"Cannot publish original CPU joint exact rank resources");
+    }
+
     /** @return Whether the exact authored expert domain has real multi-member CPU fragments. */
     bool isCPUJointNumericalSurface() const
     {
@@ -646,11 +694,32 @@ protected:
         ASSERT_NE(Base::config_.mtp_expectation, ParityMTPExpectation::Disabled);
         ASSERT_NO_FATAL_FAILURE(Base::beginProductionParitySnapshotAdmission());
         ASSERT_TRUE(Base::setupProductionParityPipeline());
+        // Reuse the original coordinated request lifecycle: expert-only ranks
+        // serve the same authority's commands and never run an independent oracle.
+        std::unique_ptr<ScopedMoEParityCoordinatedSession> session;
+        if(isCPUJointNumericalSurface()) {
+            ASSERT_TRUE(Base::hasOrchestrationRunner());
+            session=std::make_unique<ScopedMoEParityCoordinatedSession>(*Base::orch_runner_,
+                Base::bindCoordinatedProductionParityMoEEvidence());
+            if(!session->isAuthority()) {
+                session->serveFollowerAndFinish();
+                publishCPUJointExactResources();
+                return;
+            }
+        }
         ASSERT_NO_FATAL_FAILURE(Base::prepareProductionParityNativeExactCheckpoint());
         DecodeParitySummary unused_numerical_summary;
         ASSERT_NO_FATAL_FAILURE(Base::runProductionParityMTPProof(
             unused_numerical_summary, MTPParityProofPurpose::NativeExactReplay));
         ASSERT_NO_FATAL_FAILURE(Base::finishProductionParityEvidence());
+        // Lookup/source evidence consumes the emitted forward-path record and
+        // the same live runner. Adaptive lookup may execute a terminal witness
+        // and refresh that record before coordinated retirement destroys owners.
+        ASSERT_NO_FATAL_FAILURE(assertLookupReuseAfterProductionProof());
+        if(session) {
+            session->finishAuthority();
+            publishCPUJointExactResources();
+        }
         std::ofstream scope(Base::ensureResultsDir() / "mtp_exact_replay_scope.txt");
         ASSERT_TRUE(scope.is_open());
         scope << "scope=native_serial_grouped_exact_functional\n"
@@ -659,7 +728,6 @@ protected:
               << "frozen_history_numerical_acceptance=false\n";
         scope.flush();
         ASSERT_TRUE(scope.good());
-        assertLookupReuseAfterProductionProof();
     }
 
     /** @brief Keep original immutable owners and real repeated-request traffic after either proof.

@@ -22,6 +22,9 @@
  */
 
 #include "MoEOverlayParticipantGraphRunner.h"
+#include "MoEOverlayMTPSourceContract.h"
+#include "MoEOverlayFollowerRowGeometry.h"
+#include "MoECPUExpertWorkspaceSource.h"
 #include "execution/compute_stages/stages/MoECPUExpertShardRouteStage.h"
 #include "execution/moe/CPUExpertShardSourceSelection.h"
 #include "MoEOverlayHostServiceContract.h"
@@ -108,35 +111,23 @@ namespace llaminar2
         }
 
         /**
-         * @brief Declare CPU arrival scratch from this layer's GGUF directory.
-         * @param model Metadata already loaded by the executing rank.
+         * @brief Declare CPU arrival scratch from the original main/predictor loader.
+         * @param loader Source-aware loader already admitted by the executing rank.
          * @param layer Layer whose complete experts this participant executes.
          * @param d_model Unsharded expert input/output width.
          * @param intermediate Unsharded gate/up output width.
          * @param experts Logical count used to validate all three parent shapes.
          * @return Source identities and this executing rank's CPU policy facts.
-         * @throws std::invalid_argument For missing or inconsistent parent metadata.
+         * @throws std::logic_error For missing or inconsistent parent metadata.
          *
          * No weight is loaded or prepared here. Empty tiers declare the same
          * eventual scratch as populated tiers, before any captured peer starts.
          */
         MoELocalExpertStage::CPUExpertWorkspaceSource cpuExpertWorkspaceSource(
-            const GGUFModel &model, int layer, int d_model, int intermediate, int experts)
+            const ModelLoader &loader, int layer, int d_model, int intermediate, int experts)
         {
-            std::array<TensorType, 3> formats;
-            for (size_t projection = 0; projection < kExpertParents.size(); ++projection)
-            {
-                const auto name = parentName(layer, kExpertParents[projection].suffix);
-                const auto *tensor = model.findTensor(name);
-                const bool down = kExpertParents[projection].role == WeightRole::MoEExpertDown;
-                const std::vector<uint64_t> expected{
-                    static_cast<uint64_t>(down ? intermediate : d_model),
-                    static_cast<uint64_t>(down ? d_model : intermediate),
-                    static_cast<uint64_t>(experts)};
-                if (!tensor || tensor->dimensions != expected)
-                    throw std::invalid_argument("CPU expert workspace requires exact source geometry for " + name);
-                formats[projection] = ggufToTensorType(tensor->type);
-            }
+            const auto formats = originalCPUExpertWorkspaceSourceFormats(
+                loader, layer, d_model, intermediate, experts);
             return {.gate = formats[0], .up = formats[1], .down = formats[2],
                     .workers = omp_in_parallel() ? omp_get_num_threads() : omp_get_max_threads(),
                     .execution = CPUExecutionGeometry::local()};
@@ -1473,21 +1464,12 @@ namespace llaminar2
             throw std::runtime_error(
                 "MoE participant graph has no routed-expert geometry");
         }
-        for (const int source_layer : mtp_source_layers_)
-        {
-            for (int expert = 0; expert < num_experts; ++expert)
-            {
-                if (owner_map_->ownerCountForExpert(
-                        source_layer, expert) != 1u)
-                {
-                    throw std::runtime_error(
-                        "MTP participant source layer " +
-                        std::to_string(source_layer) +
-                        " lacks an exact placement owner for expert " +
-                        std::to_string(expert));
-                }
-            }
-        }
+        // Source recipes precede preparation. A jointly owned expert has one
+        // logical placement and every original member's source rectangle;
+        // requiring a scalar whole owner would erase that distinction.
+        requireMoEOverlayMTPSourceCoverage(*owner_map_,
+            config_.participant_residency?config_.participant_residency->projectionPreparation().get():nullptr,
+            mtp_source_layers_,num_experts,config_.mpi_context->rank());
 
         if (config_.ownership == MoEOverlayParticipantGraphOwnership::RankLocalAuxiliary)
         {
@@ -2650,30 +2632,15 @@ namespace llaminar2
             const auto first_arena =
                 serialCompactBufferArenaForParticipant(
                     *bindings.front().participant);
-            std::vector<int> row_shapes;
-            for (const auto &family : first_arena->families())
-            {
-                if (family.row_capacity == 0u ||
-                    family.row_capacity >
-                        static_cast<size_t>(row_capacity))
-                {
-                    continue;
-                }
-                if (family.row_capacity >
-                    static_cast<size_t>(
-                        std::numeric_limits<int>::max()))
-                {
-                    throw std::overflow_error(
-                        "Mapped ExpertOverlay follower row geometry exceeds int");
-                }
-                row_shapes.push_back(
-                    static_cast<int>(family.row_capacity));
-            }
-            if (row_shapes.empty() || row_shapes.back() != row_capacity)
-            {
-                throw std::logic_error(
-                    "Mapped ExpertOverlay follower arena does not contain the admitted exact row geometry");
-            }
+            // Storage capacities remain the original admitted families. Exact
+            // live execution identities are independently retained through the
+            // declared decode bound, including dynamic widths such as M3.
+            std::vector<std::size_t> storage_rows;
+            for(const auto& family:first_arena->families())storage_rows.push_back(family.row_capacity);
+            const auto row_geometry=MoEOverlayFollowerRowGeometry::declare(
+                row_capacity,config_.max_decode_activation_rows,
+                config_.prefill_graph_row_shapes,storage_rows);
+            const auto& row_shapes=row_geometry.shapes();
 
             /*
              * CPU endpoints consume the same shared-page lanes as GPU parents,
@@ -2801,7 +2768,7 @@ namespace llaminar2
                         .projection(WeightRole::MoEExpertUp).rows:expert_intermediate;
                     local_params.layer_idx = layer;
                     local_params.cpu_workspace_source = cpuExpertWorkspaceSource(
-                        config_.model_context->model(), layer, d_model, expert_intermediate, num_experts);
+                        config_.model_context->concreteLoader(), layer, d_model, expert_intermediate, num_experts);
                     local_params.expert_mask = expert_mask;
                     local_params.overlay_participant_residency =
                         participant_residency;
@@ -2922,7 +2889,7 @@ namespace llaminar2
                  shape_it != row_shapes.rend();
                  ++shape_it)
             {
-                const int physical_rows = *shape_it;
+                const int physical_rows = shape_it->physical_rows;
                 CachedParticipantGraph::MappedGPUFollowerShape shape;
                 shape.physical_rows = physical_rows;
                 shape.endpoints.reserve(bindings.size());
@@ -2956,15 +2923,15 @@ namespace llaminar2
                         compact_arena->smallestFamilySupporting(
                             static_cast<size_t>(physical_rows));
                     if (!tensor_family ||
-                        tensor_family->row_capacity !=
-                            static_cast<size_t>(physical_rows) ||
+                        tensor_family->row_capacity != shape_it->backing_rows ||
+                        tensor_family->row_capacity < static_cast<size_t>(physical_rows) ||
                         !tensor_family->hidden ||
                         !tensor_family->routing_indices ||
                         !tensor_family->routing_weights ||
                         !tensor_family->output)
                     {
                         throw std::logic_error(
-                            "Mapped ExpertOverlay follower could not bind an exact compact tensor family");
+                            "Mapped ExpertOverlay follower exact rows do not fit their original admitted compact backing");
                     }
                     auto canonical_it =
                         participant_canonical_route_buffers_.find(
@@ -4629,6 +4596,9 @@ namespace llaminar2
         {
             primary_error = "Non-standard original expert transaction failure";
         }
+        if (!success)
+            LOG_ERROR("[MoEOverlayParticipantGraphRunner] Original mapped follower transaction failed before cancellation: "
+                << primary_error << "; ticket=" << ticket.toString());
         if (!success && !submission.native_terminals_joined)
         {
             std::string retirement_error;
@@ -4731,13 +4701,16 @@ namespace llaminar2
         }
         shape = cached.mappedShapeForRows(
             static_cast<int>(physical_rows_u64));
-        if (!shape ||
-            shape->endpoints.size() + cached.mapped_cpu_endpoints.size() !=
-                cached.mapped_lane_authorities.size())
+        if (!shape)
         {
-            return reject(
-                "Mapped ExpertOverlay follower has no setup-owned executable for the ticket row geometry");
+            std::vector<int> retained_rows;
+            for(const auto& retained:cached.mapped_gpu_shapes)retained_rows.push_back(retained.physical_rows);
+            return reject(MoEOverlayFollowerRowGeometry::missingShapeDiagnostic(
+                static_cast<int>(physical_rows_u64),retained_rows));
         }
+        if(shape->endpoints.size()+cached.mapped_cpu_endpoints.size()!=cached.mapped_lane_authorities.size())
+            return reject("Mapped ExpertOverlay follower exact executable lost its original endpoint/lane roster for physical_rows="+
+                std::to_string(physical_rows_u64));
         if (collect_timeline)
         {
             std::size_t layer_capacity = 0u;

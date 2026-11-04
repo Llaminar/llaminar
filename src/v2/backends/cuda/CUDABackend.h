@@ -4,7 +4,8 @@
  *
  * **Purpose**: Public interface for CUDA backend. Implementation lives in .cu file
  * to avoid exposing cuda_runtime.h to other compilation units.
- * Exact native-context storage is prepared through a reversible cold footprint
+ * Original source workers provision a fixed native-program stack inside their opaque
+ * commitment at birth. Ordinary native-context storage uses a reversible cold footprint
  * probe and admitted by PhysicalMemoryAuthority. Its leases have primary-context
  * lifetime, separately from model allocations and graph executables; only a
  * successful exclusive native reset publishes their retirement.
@@ -107,7 +108,10 @@ namespace llaminar2
          * @param stream Exact non-capturing graph stream.
          * @param memory Source family authority whose outstanding demand is protected.
          *
-         * A reversible cold footprint probe supplies the physical byte count.
+         * Source-prepared workers only verify the actual captured requirement
+         * against their fixed birth capacity and original PMA. Exceeding it is a
+         * precise program-capacity error, never a new allocation or OOM estimate.
+         * For ordinary workers a reversible cold footprint probe supplies the physical byte count.
          * Its PMA lease survives graph destruction and retires only after the
          * matching native context is reset. No inferred driver allocation
          * granule, guessed safety margin, or graph allowance is used.

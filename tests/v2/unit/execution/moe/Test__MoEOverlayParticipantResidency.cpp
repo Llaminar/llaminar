@@ -9,6 +9,7 @@
 
 #include "execution/moe/MoEOverlayParticipantResidency.h"
 #include "execution/moe/MoEOverlayParticipantMigration.h"
+#include "../../../fixtures/moe/MoEOverlayParticipantMigrationTestAccess.h"
 #include "execution/moe/MoEOverlayFixedDownProjectionBank.h"
 #include "execution/moe/MoEOverlayPhysicalResidencyFabric.h"
 #include "execution/moe/MoERuntimeTable.h"
@@ -1796,7 +1797,7 @@ TEST(Test__MoEOverlayParticipantMigration,
     ASSERT_EQ((*old_ticket)->epoch, 1u);
 
     auto provider = std::make_shared<IdentityTransferProvider>();
-    MoEOverlayParticipantPreparedWaveFactory factory({
+    auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({
         .registry = fixture.registry,
         .transfer_provider = provider,
         .perf_device = "cpu-hot/cpu-cold",
@@ -1877,7 +1878,7 @@ TEST(Test__MoEOverlayParticipantMigration,
 {
     auto fixture = participantMigrationFixture(/*cuda_continuation=*/true);
     auto provider = std::make_shared<IdentityTransferProvider>();
-    MoEOverlayParticipantPreparedWaveFactory factory({
+    auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({
         .registry = fixture.registry,
         .transfer_provider = provider,
         .perf_device = "cuda/cpu",
@@ -1914,7 +1915,7 @@ TEST(Test__MoEOverlayParticipantMigration,
     auto provider = std::make_shared<IdentityTransferProvider>();
     auto script = std::make_shared<ScriptedDeviceBankPublication>();
     auto publisher = std::make_shared<ScriptedDeviceBankPublisher>(script);
-    MoEOverlayParticipantPreparedWaveFactory factory({
+    auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({
         .registry = fixture.registry,
         .transfer_provider = provider,
         .device_bank_publisher = publisher,
@@ -2009,7 +2010,7 @@ TEST(Test__MoEOverlayParticipantMigration,
     auto provider = std::make_shared<IdentityTransferProvider>();
     auto script = std::make_shared<ScriptedDeviceBankPublication>();
     auto publisher = std::make_shared<ScriptedDeviceBankPublisher>(script);
-    MoEOverlayParticipantPreparedWaveFactory factory({
+    auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({
         .registry = fixture.registry,
         .transfer_provider = provider,
         .device_bank_publisher = publisher,
@@ -2068,7 +2069,7 @@ TEST(Test__MoEOverlayParticipantMigration,
     auto fixture = participantMigrationFixture();
     auto provider = std::make_shared<IdentityTransferProvider>(
         /*omit_down=*/true);
-    MoEOverlayParticipantPreparedWaveFactory factory({
+    auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({
         .registry = fixture.registry,
         .transfer_provider = provider,
         .perf_device = "cpu-hot/cpu-cold",
@@ -2111,7 +2112,7 @@ TEST(Test__MoEOverlayParticipantMigration,
         << error;
 
     auto provider = std::make_shared<IdentityTransferProvider>();
-    MoEOverlayParticipantPreparedWaveFactory factory({
+    auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({
         .registry = fixture.registry,
         .transfer_provider = provider,
         .perf_device = "cpu-hot/cpu-cold",
@@ -2130,7 +2131,7 @@ TEST(Test__MoEOverlayParticipantMigration,
 {
     auto fixture = participantMigrationFixture();
     auto provider = std::make_shared<IdentityTransferProvider>();
-    MoEOverlayParticipantPreparedWaveFactory factory({
+    auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({
         .registry = fixture.registry,
         .transfer_provider = provider,
         .perf_device = "cpu-hot/cpu-cold",
@@ -2190,7 +2191,7 @@ TEST(Test__MoEOverlayParticipantMigration,
                 .initial_epoch = 1,
             });
     auto provider = std::make_shared<IdentityTransferProvider>();
-    MoEOverlayParticipantPreparedWaveFactory factory({
+    auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({
         .registry = relay_registry,
         .transfer_provider = provider,
         .perf_device = "relay",
@@ -2778,7 +2779,7 @@ TEST(Test__MoEOverlayParticipantMigration, PipelineStageWavePublishesExactGlobal
         auto fixture = stageMigrationFixture(first);
         const auto old = fixture.registry->endpoint(0)->acquire(1);
         auto provider = std::make_shared<IdentityTransferProvider>();
-        MoEOverlayParticipantPreparedWaveFactory factory({
+        auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({
             .registry = fixture.registry, .transfer_provider = provider,
         });
         auto wave = factory.prepare(fixture.transaction);
@@ -2815,7 +2816,7 @@ TEST(Test__MoEOverlayParticipantMigration, PipelineStageForeignSnapshotFailsBefo
     auto local = stageMigrationFixture(32);
     auto foreign = stageMigrationFixture(40);
     auto provider = std::make_shared<IdentityTransferProvider>();
-    MoEOverlayParticipantPreparedWaveFactory factory({
+    auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({
         .registry = local.registry, .transfer_provider = provider,
     });
     auto wave = factory.prepare(foreign.transaction);
@@ -2873,3 +2874,5 @@ TEST(Test__MoEOverlayParticipantResidency, PipelineStageRuntimeRetainsFixedDownB
             EXPECT_THROW((MoERuntimeTable(config)), std::invalid_argument);
         }
 }
+
+#include "PreparedSourceNonemptyBankContract.inc"

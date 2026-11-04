@@ -36,7 +36,7 @@ namespace llaminar2
     /** Physical representation transmitted between two MPI ranks. */
     enum class MoEOverlayRemoteProjectionPacking : std::uint8_t
     {
-        CpuNativeVnniInterleaved = 1, ///< Final CPU execution units.
+        CpuNativeVnniInterleaved = 1, ///< Live native CPU column planes; resident padding is excluded.
         GpuSeparatedNativeVnni = 2,   ///< Payload/scales/mins/emins blobs.
         ContiguousFloating = 3,       ///< One raw FP16/BF16/FP32 matrix blob.
     };
@@ -89,8 +89,8 @@ namespace llaminar2
     struct MoEOverlayRemoteProjectionManifest
     {
         static constexpr std::uint32_t kMagic = 0x50524F4Du; // "MORP"
-        static constexpr std::uint16_t kABIVersion = 2u;
-        static constexpr std::size_t kWireBytes = 184u;
+        static constexpr std::uint16_t kABIVersion = 4u;
+        static constexpr std::size_t kWireBytes = 244u;
 
         std::uint32_t magic = kMagic;
         std::uint16_t abi_version = kABIVersion;
@@ -123,12 +123,35 @@ namespace llaminar2
 
         std::uint32_t cpu_data_stride = 0;
         std::uint32_t cpu_block_stride = 0;
+        /** Native columns per encoded wire unit; resident CPU tiles remain 64 columns. */
+        std::uint32_t cpu_wire_columns_per_unit = 0;
         std::array<std::uint64_t, kMoEOverlayRemoteProjectionRegionCount>
             region_bytes{};
         std::uint64_t total_bytes = 0;
         std::uint32_t maximum_chunk_bytes = 0;
         std::uint32_t reserved_size = 0;
         std::uint64_t manifest_hash = 0;
+        /** Original coordinate ownership retained across remote transfer envelopes. */
+        MoEExpertProjectionOwnership::Projection source_projection{};
+        MoEExpertProjectionOwnership::Projection destination_projection{};
+
+        /**
+         * @brief Bind native CPU endpoints to their checked original-coordinate overlap.
+         * @param intersection Original source/destination allocations and nonempty overlap.
+         * @return Resealed compact native wire contract using the existing send capacity.
+         * @throws std::invalid_argument For a foreign source or unsupported native alignment.
+         */
+        [[nodiscard]] MoEOverlayRemoteProjectionManifest forCPUIntersection(
+            const ExpertTierWeightProjectionIntersection& intersection) const;
+
+        /**
+         * @brief Bind floating source bytes to an original-coordinate overlap without conversion.
+         * @param intersection Original admitted source/destination rectangles.
+         * @return Resealed existing floating manifest, preserving source identity and byte precision.
+         * @throws std::invalid_argument For a nonfloating source, empty overlap or source extent mismatch.
+         */
+        [[nodiscard]] MoEOverlayRemoteProjectionManifest forFloatingIntersection(
+            const ExpertTierWeightProjectionIntersection& intersection) const;
 
         /** @return Canonical non-zero digest over every field except the digest. */
         [[nodiscard]] std::uint64_t computedHash() const noexcept;
@@ -224,13 +247,26 @@ namespace llaminar2
         const ContiguousFloatingPointWeightDescriptor &source,
         std::uint32_t maximum_chunk_bytes);
 
+    /** Select an actual CPU endpoint; no GPU geometry or execution authority is synthesized. */
+    enum class MoEOverlayRemoteCPUStorageEndpoint { Source, Destination };
+    /**
+     * @brief Resolve native CPU root strides and compact wire groups from an authenticated manifest.
+     * @param manifest Original projection and native format contract.
+     * @param endpoint Actual CPU source or destination whose root is addressed.
+     * @return Checked CPU-native root geometry, independent of any GPU representation.
+     * @throws std::invalid_argument If the manifest/endpoint cannot describe a native CPU root.
+     */
+    [[nodiscard]] ExpertTierWeightCPUStorageLayout remoteCpuProjectionStorageLayout(
+        const MoEOverlayRemoteProjectionManifest& manifest,MoEOverlayRemoteCPUStorageEndpoint endpoint);
+
     /**
      * @brief Recover the allocation-free repack layout from a CPU wire manifest.
      *
-     * Cross-rank CPU/GPU transfers carry final CPU NativeVNNI units on the
-     * network.  This conversion preserves every authenticated scalar while
+     * Cross-rank CPU/GPU transfers carry compact live native column planes.
+     * Retained CPU allocation padding never enters the network. This preserves
+     * every authenticated scalar while
      * selecting direction from the topology identity.  It rejects partial-unit
-     * network capacities so a destination GPU can repack each received chunk
+     * tile capacities so a destination GPU can repack each received live chunk
      * directly without buffering a complete projection.
      *
      * @param manifest Valid CPU-format remote projection with exactly one GPU
@@ -240,8 +276,7 @@ namespace llaminar2
      * @throws std::invalid_argument When topology, format, or chunk alignment
      *         cannot drive the production streaming repack kernel.
      */
-    [[nodiscard]] ExpertTierWeightDeviceLayout
-    remoteCpuProjectionDeviceLayout(
+    [[nodiscard]] ExpertTierWeightDeviceLayout remoteCpuProjectionDeviceLayout(
         const MoEOverlayRemoteProjectionManifest &manifest);
 
     /**
@@ -325,8 +360,9 @@ namespace llaminar2
     /**
      * @brief Allocation-free sender cursor over final host-visible regions.
      *
-     * GPU source lanes bind their persistent pinned chunk as each D2H event
-     * becomes ready; CPU lanes may bind all final source regions directly.
+     * GPU source lanes bind persistent pinned chunks after their exact D2H event.
+     * CPU native roots gather into the caller's existing exclusive send staging;
+     * floating roots expose only the next contiguous original row segment.
      * This convenience cursor is primarily for CPU paths and protocol tests.
      */
     class MoEOverlayRemoteProjectionChunkCursor final
@@ -346,11 +382,16 @@ namespace llaminar2
 
         /**
          * @brief Take the next region-bounded authenticated chunk.
-         * @return Next view, or no value after every byte was emitted.
+         * @param staging Existing exclusive admitted send-lane bytes for CPU native gathering.
+         * @return Next view, or no value after every byte was emitted or invalid staging.
          */
         [[nodiscard]] std::optional<
-            MoEOverlayRemoteProjectionChunkView> takeNext() noexcept;
+            MoEOverlayRemoteProjectionChunkView> takeNext(std::span<std::uint8_t> staging = {}) noexcept;
 
+        /** @return Whether the original CPU root needs an exclusive encoded send chunk. */
+        [[nodiscard]] bool requiresCPUStaging() const noexcept {
+            return manifest_.carriesCpuBytes() && manifest_.identity.source_device.is_cpu();
+        }
         /** @return Whether every declared region byte has been emitted. */
         [[nodiscard]] bool complete() const noexcept;
 

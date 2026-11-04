@@ -27,6 +27,8 @@
 
 namespace llaminar2
 {
+    namespace test { struct MoEOverlayParticipantMigrationTestAccess; }
+
     /** Number of independently transferred projections in one routed expert. */
     inline constexpr std::size_t kMoEOverlayExpertProjectionCount = 3;
 
@@ -252,6 +254,16 @@ namespace llaminar2
             const MoEOverlayResidencyTransaction &transaction) override;
 
     private:
+        friend struct test::MoEOverlayParticipantMigrationTestAccess;
+        /** Explicit recorded component boundary, inaccessible to production callers. */
+        struct RecordedComponentSource {};
+        /**
+         * @brief Preserve component protocol tests without pretending to own a model source.
+         * @param config Existing test registry and recorded transfer provider.
+         * @param source Private test-access tag, never a public runtime policy.
+         */
+        MoEOverlayParticipantPreparedWaveFactory(Config config,RecordedComponentSource source);
         Config config_;
+        bool requires_original_source_=true; ///< Constructor-only; public runtime construction always authenticates.
     };
 } // namespace llaminar2

@@ -11,6 +11,8 @@
 #include "execution/moe/CpuExpertSlotPool.h"
 #include "backends/BackendManager.h"
 #include "execution/moe/MoEOverlayCPUHostMaintenance.h"
+#include "loaders/ModelContext.h"
+#include "loaders/WeightManager.h"
 #include "execution/moe/MoEOverlayCPUServiceMeasurement.h"
 #include "execution/moe/MoEOverlayHostDemandMemoryPlan.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
@@ -18,6 +20,7 @@
 #include "execution/moe/ExpertPreparedMemoryGeometry.h"
 #include "execution/moe/MoEOverlayDevicePhysicalSlotLedger.h"
 #include "execution/moe/MoEOverlayParticipantMigration.h"
+#include "../../../fixtures/moe/MoEOverlayParticipantMigrationTestAccess.h"
 #include "execution/moe/MoEOverlayPhysicalResidencyFabric.h"
 #include "execution/moe/MoEOverlayPreparedWeightSource.h"
 #include "execution/moe/MoEOverlayTierMigrationTransport.h"
@@ -323,7 +326,8 @@ namespace
     std::shared_ptr<MoEOverlayParticipantResidencyRegistry> makeRegistry(
         const std::shared_ptr<const MoEOverlayResidencySnapshot> &snapshot,
         const std::array<MoEOverlayPreparedExpertPayload, ExpertCount> &experts,
-        bool service_measurements = false)
+        bool service_measurements = false,
+        ModelContextId original_model = {})
     {
         static_assert(ExpertCount > 0);
         const int first = snapshot->layered_ownership.firstModelLayer();
@@ -338,6 +342,7 @@ namespace
                     .retained_epoch_capacity = 2,
                     .collect_economy_service_measurements = service_measurements,
                     .first_model_layer = first,
+                    .original_model = original_model,
                 });
 
         std::string error;
@@ -590,6 +595,10 @@ namespace
     /** @brief Exact production CPU host lifecycle with an offset and two logical local owners. */
     struct CPUHostMaintenanceFixture
     {
+        // This explicit component context owns the SAME prepared engine cache;
+        // it does not claim GGUF/native model readiness. Genuine tiny-source
+        // binding coverage lives in PreparedSourceNonemptyBankContract.inc.
+        std::shared_ptr<ModelContext> original_context;
         MoERoutedExpertModelMetadata metadata{.num_layers = 1, .num_experts = 2,
             .d_model = 64, .routed_intermediate_size = 32, .main_inference_layer_count = 33, .first_model_layer = 32};
         std::shared_ptr<PhysicalMemoryAuthority> memory;
@@ -638,7 +647,25 @@ namespace
                 .initial_plan = plan, .model_metadata = metadata, .maintenance_mode = MoERebalanceRuntimeMode::Dynamic,
                 .histogram = histogram.get(), .histogram_max_window_tokens = 4, .economy_layer_catalog = catalog,
                 .shadow_slots_per_endpoint_layer = 1, .max_concurrent_cycles = 1});
-            residency = makeRegistry(authority->snapshot(), experts, true);
+            original_context = ModelContext::createForTesting(
+                "cpu-host-stage32-component", MPIContextFactory::self(), 33, true);
+            auto &source_registry = original_context->concreteWeightManager()->expertGemmRegistry();
+            for (const auto &owner : authority->snapshot()->owner_map.owners())
+            {
+                const auto *participant = authority->snapshot()->owner_map.participantForId(owner.owner_participant);
+                const auto &payload = experts.at(static_cast<size_t>(owner.expert_id));
+                const std::array engines{payload.gate(), payload.up(), payload.down()};
+                for (int role = 0; role < 3; ++role)
+                    source_registry.registerEngineForParticipant(participant->domain_name, participant->device,
+                        participant->world_rank, participant->domain_participant_index, owner.layer_idx,
+                        owner.expert_id, static_cast<ExpertGemmRegistry::WeightRole>(role),
+                        engines[role].get(), engines[role]);
+            }
+            residency = makeRegistry(authority->snapshot(), experts, true,
+                ModelContextId{reinterpret_cast<uint64_t>(original_context.get())});
+            std::string source_error;
+            if (!residency->bindOriginalPreparedContext(original_context, {}, &source_error))
+                throw std::runtime_error(source_error);
             config.metadata = metadata; config.storage.migration_storage = MoEOverlayMigrationStorageKind::PhysicalResidencyFabric;
             config.storage.overlay_world_size = 1; config.storage.shadow_slots_per_endpoint_layer = 1;
             config.storage.staging_capacity_bytes = 64; config.storage.maximum_concurrent_cycles = 1;
@@ -1074,7 +1101,7 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
         .perf_device = "cpu-shared-geometry-arena",
     });
 
-    MoEOverlayParticipantPreparedWaveFactory factory({
+    auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({
         .registry = registry,
         .transfer_provider = fabric,
         .perf_device = "cpu-shared-geometry-arena",
@@ -1405,7 +1432,7 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
             .perf_device = "cpu-hot/cpu-cold",
         });
 
-        MoEOverlayParticipantPreparedWaveFactory factory({
+        auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({
             .registry = registry,
             .transfer_provider = fabric,
             .perf_device = "cpu-hot/cpu-cold",
@@ -1639,7 +1666,7 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric, PipelineStageTransfersAndSealsEver
         EXPECT_EQ(memory.authority->claimedBytes(DeviceId::cpu(),
             PhysicalMemoryOwner::ExpertShadowSlots, PhysicalMemoryMaterializationKind::NewAllocation), memory.bytes);
         {
-            MoEOverlayParticipantPreparedWaveFactory factory({.registry = registry, .transfer_provider = fabric});
+            auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({.registry = registry, .transfer_provider = fabric});
             MoEOverlayTierMigrationTransport transport({.factory = &factory, .projections_per_expert = 3});
             std::shared_ptr<const MoEOverlayResidencySnapshot> previous = initial;
             for (const std::uint64_t epoch : {2u, 3u})

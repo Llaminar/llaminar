@@ -61453,7 +61453,9 @@ namespace llaminar2
                 const int source_layer = depth.source_layer_index >= 0
                     ? depth.source_layer_index : cfg.n_layers + depth.depth_index;
                 std::string error;
-                if (!residency->registerInitialLayerFromPreparedRegistry(
+                if ((residency->originalModel().value && !residency->bindOriginalPreparedContext(
+                        std::dynamic_pointer_cast<ModelContext>(injected_model_ctx_),residency->projectionPreparation(),&error)) ||
+                    !residency->registerInitialLayerFromPreparedRegistry(
                         manager->expertGemmRegistry(), source_layer, &error))
                 {
                     LOG_ERROR("[DGO] MTP expert residency reuse rejected source layer "

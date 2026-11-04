@@ -1809,6 +1809,7 @@ endforeach()
 # Test: fixed-slot serial/MTP ExpertOverlay transaction scheduling protocol
 add_executable(v2_unit_moe_overlay_inference_transaction
     unit/execution/moe/Test__MoEOverlayInferenceTransaction.cpp
+    unit/execution/moe/Test__MoEOverlayFollowerRowGeometry.cpp
 )
 target_link_libraries(v2_unit_moe_overlay_inference_transaction
     llaminar2_core
@@ -1827,6 +1828,16 @@ add_v2_test(V2_Integration_MoEPipelineStageGraphFamily
     LABELS "V2;Integration;ProductionTestPreflight;MoE;Pipeline;MTP;Regression;DeviceFree"
     MPI_PROCS 1 NO_MPI NO_MODELS
 )
+
+# Every dynamic verifier width is an exact retained execution identity; physical
+# packet roots keep their original admitted capacity buckets.
+add_v2_test(V2_Integration_MoEOverlayFollowerExactLiveRows
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_inference_transaction>
+        --gtest_filter=MoEOverlayFollowerRowGeometry.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;MTP;Contract;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOverlayFollowerExactLiveRows)
 
 # Long-lived cross-rank serving must retain exact sparse-return evidence without
 # allocating one statistics map row per command or generation sequence.
@@ -4199,6 +4210,21 @@ add_v2_test(V2_Integration_QFNSourceCPUJointExecutionPlan
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "OMP_NUM_THREADS=1;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QFNSourceCPUJointExecutionPlan)
+add_v2_test(V2_Integration_QFNCPUJointMTPSourcePolicies
+    COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+        --gtest_filter=Qwen4ExpSourceAdmissionCases.CPUJointWorld2MTPPoliciesKeepOriginalSourceAndSocketRoles
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Qwen4Exp;MTP;Ownership;Contract"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QFNCPUJointMTPSourcePolicies)
+add_v2_test(V2_Integration_ParityDynamicMTPDeclaredCeiling
+    COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+        --gtest_filter=Qwen4ExpSourceAdmissionCases.DeclaredDynamicCeilingMatchesFixtureRuntimeAndPublicArguments
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Qwen4Exp;MTP;Regression;Contract"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ParityDynamicMTPDeclaredCeiling)
+
 foreach(_source_admission_kind Unit Integration)
     set(_source_admission_labels "V2;${_source_admission_kind};BuildSystem;Admission;Regression;DeviceFree")
     if(_source_admission_kind STREQUAL "Integration")
@@ -12656,7 +12682,7 @@ if(ZLIB_FOUND)
         TEST_PREFIX V2_Integration_Parity_Qwen4Exp_Production
         # Each new original ProcessRuntime source owns a fresh numerical process;
         # existing aggregate families and their IDs remain unchanged.
-        PRODUCTION_ISOLATED_TESTS "Qwen4ExpCPUJointWorld2FullStage/Qwen4ExpCPUJointFullStageTest.ProductionParity/"
+        PRODUCTION_ISOLATED_TESTS "Qwen4ExpCPUJointWorld2FullStage/Qwen4ExpCPUJointFullStageTest.ProductionParity/;Qwen4ExpCPUJointWorld2MTPExact/Qwen4ExpMTPExactReplayTest.MTPExactReplay/"
             "Qwen4ExpConsumerLocalTP4MovementOrdinalRetained15/Qwen4ExpMainParityTest.ProductionParity/"
             "Qwen4ExpConsumerLocalTP4MovementRandomRetained15/Qwen4ExpMainParityTest.ProductionParity/"
             "Qwen4ExpConsumerLocalTP4StaticRetained15/Qwen4ExpMainParityTest.ProductionParity/"
@@ -19219,17 +19245,27 @@ add_v2_test(V2_Integration_UPIBackendMPI
 # Requires mpirun -np 2 for execution
 add_executable(v2_integration_global_tp_mpi
     integration/collective/Test__GlobalTPContext_MPI.cpp
+    integration/execution/runner/Test__MoEParityPassiveEvidenceMPI.cpp
     integration/mpi_gtest_main.cpp
 )
+target_include_directories(v2_integration_global_tp_mpi PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(v2_integration_global_tp_mpi
     llaminar2_core
     GTest::gtest
+    GTest::gmock
 )
 add_v2_test(V2_Integration_GlobalTPContext_MPI
     COMMAND $<TARGET_FILE:v2_integration_global_tp_mpi>
     MPI_PROCS 2
     LABELS "V2;Integration;GlobalTP;MPI;TensorParallel;Collective;Phase2"
 )
+add_v2_test(V2_Integration_MoEParityPassiveEvidence_MPI
+    COMMAND $<TARGET_FILE:v2_integration_global_tp_mpi>
+        --gtest_filter=MoEParityPassiveEvidenceMPI.*
+    LABELS "V2;Integration;ProductionTestPreflight;MPI;CPU;ModelFree;Parity;Lifecycle;Regression"
+    MPI_PROCS 2 NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEParityPassiveEvidence_MPI)
 
 # Test: TPAllreduceStage MPI Integration Tests (Phase 4 Global TP Unified Interface)
 # Tests TPAllreduceStage with GlobalTPContext across MPI ranks:
@@ -22605,6 +22641,12 @@ if(HAVE_CUDA AND HAVE_ROCM)
     )
     # Original static CPU cohort routing must fan out without manufacturing whole ownership.
     foreach(vendor IN ITEMS CUDA ROCm)
+        add_v2_test(V2_Integration_MoEPacketExactRowsCapacity_${vendor}
+            COMMAND $<TARGET_FILE:v2_integration_mapped_activation_packet_cuda_rocm>
+                    --gtest_filter=Test__MappedActivationPacketCUDAAndROCm.${vendor}ExactRowsWithinFourRowBacking
+                    --gtest_brief=1
+            LABELS "V2;Integration;ProductionTestPreflight;${vendor};MoE;MappedHost;GraphCapture;LivePayload;Lifecycle;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 30)
         add_v2_test(V2_Integration_StaticJointDispatchFanout_${vendor}
             COMMAND $<TARGET_FILE:v2_integration_mapped_activation_packet_cuda_rocm>
                     --gtest_filter=Test__MappedActivationPacketCUDAAndROCm.${vendor}StaticJointDispatchReachesEveryOriginalCPU2CPU4CPU8Member
@@ -24625,6 +24667,12 @@ if(HAVE_CUDA OR HAVE_ROCM)
                 MPI_PROCS 1
                 NO_MODELS
                 TIMEOUT 60)
+            add_v2_test(V2_Integration_MoEExactRowsCapacity_${_live_rows_backend}
+                COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
+                    --gtest_filter=Backends/MoELiveRows.ExactThreeRowsInFourRowCapacityAllFormats/${_live_rows_backend}
+                    --gtest_brief=1
+                LABELS "V2;Integration;ProductionTestPreflight;${_live_rows_backend};MoE;MTP;AllFormats;GraphCapture;ByteExact;Lifecycle;Regression"
+                MPI_PROCS 1 NO_MODELS TIMEOUT 30)
             add_v2_test(V2_Integration_MoELiveRows_${_live_rows_backend}
                 COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
                     --gtest_filter=Backends/MoELiveRows.CapturedSharedAndRoutedAllFormats/${_live_rows_backend}:Backends/MoELiveRows.FloatingMultiPartitionGeometry/${_live_rows_backend}
@@ -28687,6 +28735,12 @@ add_v2_test(V2_Integration_GEMMArenaReshapeCaptureIdentity
     COMMAND $<TARGET_FILE:v2_test_projection_row_contracts> --gtest_filter=GEMMArenaReshapeCaptureIdentity.*
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Regression;GEMM;GraphCapture"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_QFNCPUJointPredictorWorkspaceSource
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_metadata>
+        --gtest_filter=ModelLoaderSharedPredictor.CPUJointWorkspaceUsesOriginalSharedPredictorSource
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Qwen4Exp;MTP;Ownership;Contract"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QFNCPUJointPredictorWorkspaceSource)
 add_v2_test(V2_Integration_Qwen4ExpModelLoaderSharedPredictor
     COMMAND $<TARGET_FILE:v2_test_qwen4exp_metadata> --gtest_filter=ModelLoaderSharedPredictor.*
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Regression;Qwen4Exp;Loaders;MTP"
@@ -35826,6 +35880,17 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_SparseQueryProgramBOM
     V2_Integration_OrdinaryDeclaredNativeOwnerBOM)
 
+# Exact live-row graphs retain a larger admitted family without communicating
+# or computing its suffix. Keep each backend proof explicitly in preflight.
+foreach(_exact_rows_backend IN ITEMS CUDA ROCm)
+    foreach(_exact_rows_suite IN ITEMS MoEExactRowsCapacity MoEPacketExactRowsCapacity)
+        if(TEST V2_Integration_${_exact_rows_suite}_${_exact_rows_backend})
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+                V2_Integration_${_exact_rows_suite}_${_exact_rows_backend})
+        endif()
+    endforeach()
+endforeach()
+
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)
     if(NOT TEST ${V2_PREFLIGHT_TEST})
         message(FATAL_ERROR
@@ -37842,6 +37907,33 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2CPUExpertShardExecutionTests.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2CPUJointPreparedSourceTests.cmake)
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2CPUJointStaticResidencyTests.cmake)
+add_v2_test(V2_Integration_QFNCPUJointMTPSourceServingRole
+    COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+        --gtest_filter=Qwen4ExpSourceAdmissionCases.ActualCPUJointPlanRequiresOriginalRankDomainsAndFollowerRole:Qwen4ExpSourceAdmissionMTPEvidence.CPUOverlayTPMaterializationIsNotOrdinaryDeferredSetup:Qwen4ExpSourceAdmissionMTPEvidence.SharedCPUCounterIdentityRetainsPlanMultiplicityAndDeferredHostIsExplicit
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;MTP;Admission;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QFNCPUJointMTPSourceServingRole)
+
+add_v2_test(V2_Integration_QFNCPUJointMTPExactRankResources
+    COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+        --gtest_filter=Qwen4ExpSourceAdmissionCI.CPUJointExactResourcesUseOriginalInventoryWithoutFrozenHistory
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;MTP;Contract;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QFNCPUJointMTPExactRankResources)
+
+add_v2_test(V2_Integration_QFNCPUJointExactStartupVisibility
+    COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+        --gtest_filter=Qwen4ExpSourceAdmissionCases.CPUJointExactStartupPreservesHostWideGPUAndExactCPUSockets
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;MTP;Startup;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QFNCPUJointExactStartupVisibility)
+
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2MoEOverlayPlacementTargetTests.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2CUDANativeProgramStackTests.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2ExpertTierRectangularWeightTests.cmake)
 
 include(cmake/V2CPUShardRouteCollectiveTests.cmake)
 

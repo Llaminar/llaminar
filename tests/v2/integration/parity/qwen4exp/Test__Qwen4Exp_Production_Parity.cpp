@@ -85,6 +85,12 @@ protected:
 /** @test Original native condition/verifier inputs, snapshots and reset/reuse, without HF acceptance. */
 TEST_P(Qwen4ExpMTPExactReplayTest, MTPExactReplay) { runQwen4ExpMTPExactReplay(); }
 
+// Real physical world2; source admission and native exact arithmetic are disjoint proofs.
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpCPUJointWorld2MTPExact, Qwen4ExpMTPExactReplayTest,
+    ::testing::ValuesIn(qwen4ExpCPUJointWorld2MTPExactCases()),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
+
+
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpOppositeVendorMTPRetained15Exact, Qwen4ExpMTPExactReplayTest,
     ::testing::ValuesIn(qwen4ExpOppositeVendorMTPRetained15Cases()),
     [](const ::testing::TestParamInfo<ModelParityCase> &info) { return info.param.testName(); });
@@ -351,9 +357,9 @@ TEST_P(Qwen4ExpSourceAdmissionTest, FullSourceAdmission)
     ASSERT_NO_FATAL_FAILURE(admitQwen4ExpSource(modelParityCase()));
 }
 
-// Source-only physical world2; no active MTP/movement or numerical family is added.
+// Source admission keeps real world2 socket roles; active MTP proof is separate.
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpCPUJointWorld2SourceAdmission, Qwen4ExpSourceAdmissionTest,
-    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpCPUJointWorld2SourceAdmissionCases())),
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpCPUJointWorld2MTPSourceAdmissionCases())),
     [](const ::testing::TestParamInfo<Qwen4ExpSourceAdmissionCase>& info){return info.param.testName();});
 
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpMainSourceAdmission, Qwen4ExpSourceAdmissionTest,
@@ -570,7 +576,7 @@ TEST_P(Qwen4ExpNgramAdmissionTest, FullSourceAdmission)
         ASSERT_EQ(context->model().split_paths.size(), 4u);
         const auto source_artifacts = context->artifactPaths();
         ASSERT_NO_FATAL_FAILURE(expectQwen4ExpSourceMTPMaterialization(
-            modelParityCase(), authored, *runner, *prepared, output, mtp_setup_before));
+            modelParityCase(), rank, authored, *runner, *prepared, output, mtp_setup_before));
         EXPECT_EQ(runner->executionPlan().layerCount(), 48);
         EXPECT_EQ(runner->config().max_seq_len, 4096);
         EXPECT_EQ(runner->config().ngram_table_policy, *modelParityCase().ngram_table_policy);

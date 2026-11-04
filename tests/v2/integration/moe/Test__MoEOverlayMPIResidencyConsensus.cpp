@@ -21,6 +21,7 @@
 #include "execution/moe/MoEOverlayEconomyCalibrationController.h"
 #include "execution/moe/MoEOverlayEconomyCertificationController.h"
 #include "execution/moe/MoEOverlayParticipantMigration.h"
+#include "../../fixtures/moe/MoEOverlayParticipantMigrationTestAccess.h"
 #include "execution/moe/MoEOverlayPhysicalResidencyFabric.h"
 #include "execution/moe/MoEOverlayCapacityResolver.h"
 #include "execution/moe/MoEOverlayResidencyMaintenanceService.h"
@@ -1030,6 +1031,73 @@ namespace llaminar2::test
             return packed;
         }
 
+        /**
+         * @brief Resolve canonical live CPU planes without inventing GPU metadata.
+         * @param packed Actual original native root whose format/strides are retained.
+         * @return Whole logical projection layout; resident N padding is excluded from wire bytes.
+         */
+        ExpertTierWeightCPUStorageLayout cpuLiveWireLayout(const cpu::native_vnni::CPUNativeVNNIPackedWeights& packed)
+        {
+            ExpertTierWeightCPUStorageLayout layout{
+                .N=packed.N,.K=packed.K,.blocks_per_row=packed.blocks_per_row,
+                .cpu_N=packed.N,.cpu_K=packed.K,
+                .cpu_codebook_id=packed.codebook_id,.cpu_is_asymmetric=uint8_t(packed.is_asymmetric),
+                .cpu_is_superblock=uint8_t(packed.is_superblock),.cpu_encoding=packed.encoding,
+                .cpu_data_stride=uint32_t(packed.data_stride),.cpu_block_stride=uint32_t(packed.interleaved_block_stride),
+                .unit_count=uint32_t((packed.N+63)/64*packed.blocks_per_row),
+                .maximum_units_per_chunk=uint32_t((packed.N+63)/64*packed.blocks_per_row)};
+            if(!layout.valid())throw std::logic_error("MPI CPU fixture has invalid original native geometry");
+            return layout;
+        }
+
+        /**
+         * @brief Inspect all live source bytes through the existing canonical wire encoder.
+         * @param packed Actual original native root.
+         * @return Exact encoded payload/metadata planes, independent of storage padding.
+         */
+        std::vector<uint8_t> cpuLiveWireOracle(const cpu::native_vnni::CPUNativeVNNIPackedWeights& packed)
+        {
+            const auto layout=cpuLiveWireLayout(packed);
+            std::vector<uint8_t> result(layout.chunkBytes(layout.unit_count));
+            if(!gatherExpertTierCPUWeightChunk(layout,
+                std::span<const uint8_t>(packed.native_interleaved.data(),packed.native_interleaved.size()),0,layout.unit_count,result))
+                throw std::logic_error("MPI CPU fixture cannot encode original live planes");
+            return result;
+        }
+
+        /**
+         * @brief Independently copy this fixture's Q4_0 live columns into a dirty recipient image.
+         * @param packed Original source including deliberately populated inactive storage.
+         * @param initial Recipient's actual pre-transfer sentinel image.
+         * @return Every final recipient byte, preserving all inactive payload/metadata columns.
+         *
+         * This scalar oracle does not call the production scatter. Every four-byte
+         * payload group and16-bit scale/coefficient plane has its own64-column
+         * resident stride; comparing a compact prefix of the raw root is incorrect.
+         */
+        std::vector<uint8_t> expectedCpuRecipientImage(
+            const cpu::native_vnni::CPUNativeVNNIPackedWeights& packed,std::span<const uint8_t> initial)
+        {
+            if(packed.codebook_id!=native_vnni_formats::Q4_0.codebook_id || packed.is_superblock ||
+               packed.encoding!=cpu::native_vnni::CPUNativeVNNIEncoding::NibbleLUT || initial.size()!=packed.native_interleaved.size())
+                throw std::logic_error("Independent MPI recipient oracle requires its declared Q4_0 fixture");
+            std::vector<uint8_t> expected(initial.begin(),initial.end());
+            for(int n=0;n<packed.N;++n)for(int kb=0;kb<packed.blocks_per_row;++kb) {
+                const size_t unit=(size_t(n/64)*packed.blocks_per_row+kb)*packed.interleaved_block_stride,column=n%64;
+                for(size_t group=0;group<size_t(packed.data_stride)/256;++group)
+                    for(size_t byte=0;byte<4;++byte) {
+                        const auto offset=unit+group*256+column*4+byte;
+                        expected[offset]=packed.native_interleaved[offset];
+                    }
+                for(size_t plane=0;plane<size_t(packed.interleaved_block_stride-packed.data_stride)/128;++plane)
+                    for(size_t byte=0;byte<2;++byte) {
+                        const auto offset=unit+packed.data_stride+plane*128+column*2+byte;
+                        expected[offset]=packed.native_interleaved[offset];
+                    }
+            }
+            return expected;
+        }
+
         /** @brief Name one direction of a bidirectional two-rank data wave. */
         MoEOverlayRemoteProjectionIdentity remoteProjectionIdentity(
             int source_rank,
@@ -1358,33 +1426,32 @@ namespace llaminar2::test
                 std::move(admission), world_rank);
         }
 
-        /** @brief Verify every final byte against the source's fill function. */
-        bool distributedCpuBytesMatchSeed(
-            const MoEOverlayPreparedExpertPayload &payload,
-            std::uint8_t seed)
+        /**
+         * @brief Verify every live payload and metadata byte against the original fill function.
+         * @param payload Actual published CPU engines, not a reconstructed owner.
+         * @param seed Original source's deterministic byte seed.
+         * @return Whether all semantic native planes match the independent source pattern.
+         *
+         * Fabric slot storage is explicitly Uninitialized; inactive N columns
+         * have no zero/sentinel contract. Direct endpoint tests independently
+         * prove every dirty recipient padding byte remains untouched.
+         */
+        bool distributedCpuBytesMatchSeed(const MoEOverlayPreparedExpertPayload& payload,uint8_t seed)
         {
-            const std::array<std::shared_ptr<ITensorGemm>, 3> engines{
-                payload.gate(),
-                payload.up(),
-                payload.down(),
-            };
-            for (const auto &engine : engines)
-            {
-                const auto *packed = engine
-                                         ? engine
-                                               ->exportCPUNativeVNNIPackedWeights()
-                                         : nullptr;
-                if (!packed)
-                    return false;
-                for (std::size_t byte = 0;
-                     byte < packed->native_interleaved.size();
-                     ++byte)
-                {
-                    const auto expected = static_cast<std::uint8_t>(
-                        seed + static_cast<std::uint8_t>(byte * 13u));
-                    if (packed->native_interleaved[byte] != expected)
-                        return false;
-                }
+            const std::array<std::shared_ptr<ITensorGemm>,3> engines{payload.gate(),payload.up(),payload.down()};
+            const auto original_specs=distributedCpuProjectionSpecs();
+            for(size_t role=0;role<engines.size();++role) {
+                const auto& engine=engines[role];
+                const auto* packed=engine?engine->exportCPUNativeVNNIPackedWeights():nullptr;
+                if(!packed || packed->N!=original_specs[role].N || packed->K!=original_specs[role].K ||
+                   packed->codebook_id!=native_vnni_formats::Q4_0.codebook_id || packed->is_superblock ||
+                   packed->encoding!=cpu::native_vnni::CPUNativeVNNIEncoding::NibbleLUT)return false;
+                std::vector<uint8_t> original(packed->native_interleaved.size());
+                for(size_t byte=0;byte<original.size();++byte)original[byte]=uint8_t(seed+uint8_t(byte*13u));
+                const auto layout=cpuLiveWireLayout(*packed);
+                std::vector<uint8_t> expected(layout.chunkBytes(layout.unit_count));
+                if(!gatherExpertTierCPUWeightChunk(layout,original,0,layout.unit_count,expected) ||
+                   cpuLiveWireOracle(*packed)!=expected)return false;
             }
             return true;
         }
@@ -1697,6 +1764,11 @@ namespace llaminar2::test
                 ? rank_one_source.native_interleaved.size()
                 : rank_zero_source.native_interleaved.size(),
             0xa5u);
+        const auto initial_recipient=received_from_peer;
+        const auto zero_wire=cpuLiveWireOracle(rank_zero_source),one_wire=cpuLiveWireOracle(rank_one_source);
+        ASSERT_EQ(zero_wire.size(),1280u);ASSERT_EQ(one_wire.size(),1280u);
+        ASSERT_EQ(rank_zero_source.native_interleaved.size(),2560u);
+        EXPECT_EQ(zero_manifest.total_bytes,zero_wire.size());EXPECT_EQ(one_manifest.total_bytes,one_wire.size());
         const auto source_lifetime = std::make_shared<int>(41);
         const auto destination_lifetime = std::make_shared<int>(73);
 
@@ -1882,10 +1954,10 @@ namespace llaminar2::test
         EXPECT_TRUE(second_measurement->valid());
         EXPECT_EQ(
             first_measurement->bytes,
-            rank_zero_source.native_interleaved.size());
+            zero_wire.size());
         EXPECT_EQ(
             second_measurement->bytes,
-            rank_one_source.native_interleaved.size());
+            one_wire.size());
         EXPECT_GT(first_measurement->transport_nanoseconds, 0u);
         EXPECT_GT(second_measurement->transport_nanoseconds, 0u);
         EXPECT_EQ(first_measurement->device_nanoseconds, 0u);
@@ -1911,14 +1983,12 @@ namespace llaminar2::test
             second_measurement->transport_nanoseconds,
             second_measurement->wall_nanoseconds);
 
-        const auto &expected = context->rank() == 0
-                                   ? rank_one_source.native_interleaved
-                                   : rank_zero_source.native_interleaved;
-        EXPECT_TRUE(std::equal(
-            received_from_peer.begin(),
-            received_from_peer.end(),
-            expected.begin(),
-            expected.end()));
+        const auto& expected_source=context->rank()==0?rank_one_source:rank_zero_source;
+        EXPECT_EQ(received_from_peer,expectedCpuRecipientImage(expected_source,initial_recipient));
+        EXPECT_EQ(cpuLiveWireOracle(rank_zero_source),zero_wire);
+        EXPECT_EQ(cpuLiveWireOracle(rank_one_source),one_wire);
+        const auto& sent_wire=context->rank()==0?zero_wire:one_wire;
+        const auto& received_wire=context->rank()==0?one_wire:zero_wire;
 
         const auto stats = transport.stats();
         EXPECT_EQ(stats.lanes_materialized, 6u);
@@ -1935,10 +2005,12 @@ namespace llaminar2::test
             context->rank() == 0 ? 1u : 2u);
         EXPECT_EQ(stats.operations_completed, 2u);
         EXPECT_EQ(stats.operations_aborted, 1u);
-        EXPECT_GT(stats.chunks_sent, 1u);
-        EXPECT_GT(stats.chunks_received, 1u);
-        EXPECT_EQ(stats.bytes_sent, expected.size());
-        EXPECT_EQ(stats.bytes_received, received_from_peer.size());
+        //97-byte lane fits one4-column Q4_0 unit (80 bytes);16 units
+        // must each finish the existing send/ACK before the staging slice is reused.
+        EXPECT_EQ(stats.chunks_sent,16u);
+        EXPECT_EQ(stats.chunks_received,16u);
+        EXPECT_EQ(stats.bytes_sent,sent_wire.size());
+        EXPECT_EQ(stats.bytes_received,received_wire.size());
         EXPECT_EQ(stats.mpi_failures, 0u);
         EXPECT_EQ(stats.protocol_failures, 0u);
         EXPECT_EQ(stats.inference_stream_waits, 0u);
@@ -2004,6 +2076,10 @@ namespace llaminar2::test
             static_cast<std::uint32_t>(staging_bytes));
         std::vector<std::uint8_t> destination_bytes(
             source_projection.native_interleaved.size(), 0xa5u);
+        const auto initial_recipient=destination_bytes;
+        const auto source_wire=cpuLiveWireOracle(source_projection);
+        ASSERT_EQ(source_wire.size(),1280u);
+        EXPECT_EQ(manifest.total_bytes,source_wire.size());
         const auto source_lifetime = std::make_shared<int>(19);
         const auto destination_lifetime = std::make_shared<int>(23);
 
@@ -2043,13 +2119,14 @@ namespace llaminar2::test
             ASSERT_EQ(
                 destination_bytes.size(),
                 source_projection.native_interleaved.size());
-            EXPECT_TRUE(std::equal(
-                destination_bytes.begin(),
-                destination_bytes.end(),
-                source_projection.native_interleaved.begin(),
-                source_projection.native_interleaved.end()));
+            EXPECT_EQ(destination_bytes,expectedCpuRecipientImage(source_projection,initial_recipient));
         }
+        else EXPECT_EQ(destination_bytes,initial_recipient);
         const auto stats = transport.stats();
+        EXPECT_EQ(stats.bytes_sent,context->rank()==0?source_wire.size():0u);
+        EXPECT_EQ(stats.bytes_received,context->rank()==1?source_wire.size():0u);
+        EXPECT_EQ(stats.chunks_sent,context->rank()==0?16u:0u);
+        EXPECT_EQ(stats.chunks_received,context->rank()==1?16u:0u);
         EXPECT_EQ(stats.wave_reservations_started, 1u);
         EXPECT_EQ(stats.wave_reservations_failed, 0u);
         EXPECT_EQ(stats.operations_completed, 1u);
@@ -2219,7 +2296,7 @@ namespace llaminar2::test
             .staging_capacity_bytes = staging_bytes,
             .perf_device = "mpi-distributed-physical-cpu",
         });
-        MoEOverlayParticipantPreparedWaveFactory factory({
+        auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({
             .registry = registry,
             .transfer_provider = fabric,
             .perf_device = "mpi-distributed-physical-cpu",
@@ -2411,7 +2488,13 @@ namespace llaminar2::test
         EXPECT_EQ(projection_stats.source_operations, 3u);
         EXPECT_EQ(projection_stats.destination_operations, 3u);
         EXPECT_EQ(projection_stats.operations_completed, 6u);
-        EXPECT_GT(projection_stats.bytes_sent, 0u);
+        size_t live_expert_bytes=0;
+        for(const auto& engine:{arrived.gate(),arrived.up(),arrived.down()}) {
+            const auto* packed=engine->exportCPUNativeVNNIPackedWeights();ASSERT_NE(packed,nullptr);
+            live_expert_bytes+=cpuLiveWireOracle(*packed).size();
+        }
+        EXPECT_EQ(live_expert_bytes,3840u); //1280 live bytes per Gate/Up/Down projection.
+        EXPECT_EQ(projection_stats.bytes_sent,live_expert_bytes);
         EXPECT_EQ(
             projection_stats.bytes_sent,
             projection_stats.bytes_received);
@@ -2572,7 +2655,7 @@ namespace llaminar2::test
             .collect_economy_measurements = true,
             .perf_device = "mpi-distributed-economy-cpu",
         });
-        MoEOverlayParticipantPreparedWaveFactory factory({
+        auto factory = test::MoEOverlayParticipantMigrationTestAccess::recordedComponentFactory({
             .registry = registry,
             .transfer_provider = fabric,
             .perf_device = "mpi-distributed-economy-cpu",

@@ -464,7 +464,7 @@ namespace llaminar2
         /** @brief Acquire/submit/query one D2H network chunk without waiting. */
         MoEOverlayResidencyWaveProgress pollNextChunk(
             MoEOverlayRemoteProjectionChunkView *chunk,
-            std::string *error = nullptr) noexcept override;
+            std::string *error = nullptr, std::span<std::uint8_t> staging = {}) noexcept override;
 
         /** @brief Release pinned bytes only after MPI completes the exact send. */
         bool acknowledgeChunkSent(

@@ -1,6 +1,6 @@
 # QFN tuning dashboard
 
-Updated 2026-11-03. **Keep this file at or below 15,000 UTF-8 bytes.** Replace
+Updated 2026-11-04. **Keep this file at or below 15,000 UTF-8 bytes.** Replace
 status entries in place; put experiment histories, commands, samples and failure
 analysis in the linked tuning notes, not in this dashboard.
 
@@ -31,7 +31,7 @@ logits; component savings do not establish model gain.
 |---|---|
 | Admission | [Six-row target][target-matrix]: TP4 and genuine six-GPU follower RAM/SSD source controls each pass 2/2. Matched SSD TP2 passes 8/12; shared-pool continuation owners need native transport completion. Fresh RAM-backed ConsumerLocal controls pass 4/4. Complete regression collection is retained in the follow-up. The focused repair run now passes all 57 registrations, with no skips and clean native retirement/driver checks. Six TP4 cache source controls pass with clean driver/retirement checks. Four rebalancing source controls pass their cases, but two AMD user-pointer workqueue warnings keep that run unqualified. |
 | Native lifetime | [Review](QFN_NATIVE_RESOURCE_ALLOWANCE_REVIEW_2026-11-01.md): r65 passes all four source controls, final retirement and driver checks. |
-| Continuation / ngrams | Checkpoints `31449ce1a` and CLI `726049c38` pushed. [Follow-up](QFN_CONTINUATION_FOLLOWUP_2026-11-02.md): historical r199 prerequisites 4,042 passes, zero failures, 29 absent-hardware skips; full prerequisites need refreshing. Six CPU1-backed TP4 cache diagnostics pass the existing absolute pilot with identical metrics over 178 rows. Local RSS now follows original engine descendants (focused checks pass); old runs lack that evidence. Release timing/full approval remain pending. Shared native ownership, hot replicas and CPU2 per-expert TP remain private candidates; no policy winner is promoted. |
+| Continuation / ngrams | Checkpoint `3312168c7`: [physical CPU1/CPU2 Static/RAM/MTP-Off panels](../2026-11/QFN_CPU_EXPERT_TENSOR_SHARDING_QUALIFICATION.md) pass. TP2 has one approved KL exception (1.38264 ≤ 1.5; ordinary 1.2 and aggregate limits unchanged). TP1 peak RSS 115.44 GiB; TP2 individual peaks 73.27/44.39 GiB are not summed physical usage. CPU2 fixed1/fixed3/dynamic source admission passes with clean retirement/driver evidence. Native fixed1/fixed3/dynamic pass byte-exact checkpoints, serial-token witnesses and clean retirement. Dynamic proves three controller windows after separating exact execution rows from storage buckets. CUDA/ROCm captured M3-over-M4 all-format compute and packet regressions pass. Source-binding lifetime, compact all-format CPU/GPU transfers, native MPI live-byte and passive-audit regressions pass. CUDA source-stack replay and original-body negative pass. Shared native ngram owners/hot replicas remain private TP2-only; dynamic whole/shard fanout/publication, Release economy and all six broad rows remain unqualified. [Scoped evidence](../2026-11/QFN_COHORT_MIGRATION_AND_MTP_ADMISSION_QUALIFICATION.md). Complete67 remains red; focused passes are not a full receipt. |
 
 QSA temporal/page certificates did not repay their costs through **64K/128K**;
 no pruning policy is installed. [Study][certificates]. CUDA hardware profiling
@@ -61,11 +61,12 @@ remain controls and do not qualify the new tier/ownership combinations.
 Functional coverage retains MTP off/1/3/dynamic and dynamic expert balancing.
 Small C0/C64 row-cache fixtures force movement; performance uses useful admitted
 capacities and reports exact tier bytes, hit rates and working set. Current
-native transfer floor: retained Release 22/28 green; six CUDA memory-observation
-failures traced to collective first-use lifetime. Original-owner Integration
-rerun passes all six RCCL cases; ordinary NCCL fixed P2P still needs an admitted
-device-stack contract. No default transport is promoted. RCCL small-message event round trips
-are about 48 µs versus mapped 65–66 µs; full lookup/inference remains unmeasured.
+native transfer floor: retained Release 22/28 green. Fresh original-owner
+Integration runs pass all six RCCL cases and all six CUDA cases after native
+stack provisioning; the original CUDA failure is reproduced by an isolated
+control. Release timing and complete lookup/inference remain unqualified; no
+transport default is promoted. Retained RCCL small-message event round trips
+are about 48 µs versus mapped 65–66 µs.
 [Timings, scope and failures](QFN_NGRAM_NATIVE_TRANSFER_FLOORS_2026-11-02.md).
 
 ### Earlier measured controls

@@ -159,7 +159,7 @@ namespace llaminar2
     MoEOverlayResidencyWaveProgress
     MoEOverlayHostRemoteProjectionSource::pollNextChunk(
         MoEOverlayRemoteProjectionChunkView *chunk,
-        std::string *error) noexcept
+        std::string *error, std::span<std::uint8_t> staging) noexcept
     {
         if (!chunk || aborted_ || outstanding_header_)
         {
@@ -172,7 +172,11 @@ namespace llaminar2
                     : "Host remote projection source requires a chunk destination");
             return MoEOverlayResidencyWaveProgress::Failed;
         }
-        const auto next = cursor_.takeNext();
+        if(cursor_.requiresCPUStaging() && staging.size()<manifest_.maximum_chunk_bytes) {
+            setError(error,"Original CPU projection requires its exclusive admitted MPI send-lane staging");
+            return MoEOverlayResidencyWaveProgress::Failed;
+        }
+        const auto next = cursor_.takeNext(staging);
         if (!next)
         {
             setError(
@@ -312,24 +316,23 @@ namespace llaminar2
                 "Host remote projection physical format differs from destination contract");
             return false;
         }
-        for (std::size_t region = 0; region < regions_.size(); ++region)
-        {
-            if (regions_[region].size() != manifest.region_bytes[region])
-            {
-                setError(
-                    error,
-                    "Host remote projection final regions disagree with sender manifest");
-                return false;
+        try {
+            std::optional<ExpertTierWeightCPUStorageLayout> native;
+            if(manifest.carriesCpuBytes() && manifest.identity.destination_device.is_cpu())
+                native=remoteCpuProjectionStorageLayout(manifest,MoEOverlayRemoteCPUStorageEndpoint::Destination);
+            for(size_t region=0;region<regions_.size();++region) {
+                const ExpertWeightFormat format{.kind=manifest.format_kind};
+                const size_t expected=manifest.carriesFloatingBytes() && region==0
+                    ? size_t(manifest.destination_projection.rows)*manifest.destination_projection.columns*format.floatingElementBytes()
+                    : native && region==0?native->cpuStorageBytes():manifest.region_bytes[region];
+                if(regions_[region].size()!=expected) {
+                    setError(error,"Host remote projection original final regions disagree with sender manifest");return false;
+                }
             }
-        }
-        try
-        {
-            validator_.emplace(manifest);
-        }
-        catch (const std::exception &exception)
-        {
-            setError(error, exception.what());
-            return false;
+            validator_.emplace(manifest);cpu_layout_=native;
+            if(manifest.carriesFloatingBytes())floating_layout_=manifest;
+        } catch(const std::exception& exception) {
+            setError(error,exception.what());return false;
         }
         if (error)
             error->clear();
@@ -342,6 +345,21 @@ namespace llaminar2
         std::span<const std::uint8_t> payload,
         std::string *error) noexcept
     {
+        uint32_t first=0,units=0;
+        if(cpu_layout_) {
+            const auto total=expertTierWirePrefix(*cpu_layout_,cpu_layout_->unit_count);
+            if(header.region!=0 || header.region_offset>total || payload.size()>total-header.region_offset) {
+                setError(error,"Remote native chunk exceeds original intersection wire extent");return MoEOverlayResidencyWaveProgress::Failed;
+            }
+            first=expertTierWireUnitAt(*cpu_layout_,header.region_offset);
+            const auto end=expertTierWireUnitAt(*cpu_layout_,header.region_offset+payload.size());
+            if(end<=first || end>cpu_layout_->unit_count || end-first>cpu_layout_->maximum_units_per_chunk ||
+               expertTierWirePrefix(*cpu_layout_,first)!=header.region_offset ||
+               expertTierWirePrefix(*cpu_layout_,end)!=header.region_offset+payload.size()) {
+                setError(error,"Remote native chunk splits a live native column unit");return MoEOverlayResidencyWaveProgress::Failed;
+            }
+            units=end-first;
+        }
         if (aborted_ || !validator_ ||
             !validator_->accept(header, payload, error))
         {
@@ -352,6 +370,29 @@ namespace llaminar2
             return MoEOverlayResidencyWaveProgress::Failed;
         }
 
+        if(cpu_layout_) {
+            if(!scatterExpertTierCPUWeightChunk(*cpu_layout_,payload,first,units,regions_[0])) {
+                validator_->abort();setError(error,"Remote native intersection scatter rejected original final storage");
+                return MoEOverlayResidencyWaveProgress::Failed;
+            }
+            if(error)error->clear();return MoEOverlayResidencyWaveProgress::Ready;
+        }
+        if(floating_layout_) {
+            const auto& manifest=*floating_layout_;const ExpertWeightFormat format{.kind=manifest.format_kind};
+            const auto& owned=manifest.destination_projection;const auto& source=manifest.source_projection;
+            const size_t element=format.floatingElementBytes(),row_bytes=size_t(manifest.K)*element;
+            if((owned.columns!=manifest.K || source.columns!=manifest.K) && payload.size()>row_bytes-header.region_offset%row_bytes) {
+                validator_->abort();setError(error,"Floating remote chunk crosses an original local row gap");return MoEOverlayResidencyWaveProgress::Failed;
+            }
+            const size_t row=std::max(owned.first_row,source.first_row)-owned.first_row+header.region_offset/row_bytes;
+            const size_t column=std::max(owned.first_column,source.first_column)-owned.first_column;
+            const size_t offset=(row*owned.columns+column)*element+header.region_offset%row_bytes;
+            if(offset>regions_[0].size() || payload.size()>regions_[0].size()-offset) {
+                validator_->abort();setError(error,"Floating remote chunk exceeds original final root");return MoEOverlayResidencyWaveProgress::Failed;
+            }
+            std::memcpy(regions_[0].data()+offset,payload.data(),payload.size());
+            if(error)error->clear();return MoEOverlayResidencyWaveProgress::Ready;
+        }
         auto destination = mutableRegion(regions_, header.region);
         if (header.region_offset > destination.size() ||
             payload.size() > destination.size() -
@@ -891,7 +932,7 @@ namespace llaminar2
                 MoEOverlayRemoteProjectionChunkView chunk;
                 const auto endpoint_started_at =
                     std::chrono::steady_clock::now();
-                const auto progress = source_->pollNextChunk(&chunk, error);
+                const auto progress = source_->pollNextChunk(&chunk,error,lane().payload);
                 recordHostWorkSince(endpoint_started_at);
                 if (progress == MoEOverlayResidencyWaveProgress::Pending)
                 {

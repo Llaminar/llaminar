@@ -939,8 +939,14 @@ namespace llaminar2
             config_.perf_device = "expert_overlay";
     }
 
-    MoEOverlayTierPreparedWave
-    MoEOverlayParticipantPreparedWaveFactory::prepare(
+    MoEOverlayParticipantPreparedWaveFactory::MoEOverlayParticipantPreparedWaveFactory(
+        Config config, RecordedComponentSource)
+        : MoEOverlayParticipantPreparedWaveFactory(std::move(config))
+    {
+        requires_original_source_ = false;
+    }
+
+    MoEOverlayTierPreparedWave MoEOverlayParticipantPreparedWaveFactory::prepare(
         const MoEOverlayResidencyTransaction &transaction)
     {
         MoEOverlayTierPreparedWave result;
@@ -951,6 +957,16 @@ namespace llaminar2
             return result;
         }
 
+        // Public runtime construction always requires the real source owner,
+        // including zero-ID misuse. Recorded component tests have a private
+        // constructor boundary and cannot mint a model-source capability.
+        std::optional<MoEOverlayParticipantResidencyRegistry::PreparedSourceUse> original_source;
+        if (requires_original_source_)
+        {
+            original_source = config_.registry->acquireOriginalPreparedSource(&result.error);
+            if (!original_source)
+                return result;
+        }
         std::vector<LocalCandidateBank> local_candidates;
         std::string candidate_error;
         const auto candidate_status = buildLocalCandidates(

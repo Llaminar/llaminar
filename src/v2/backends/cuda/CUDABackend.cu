@@ -14,6 +14,7 @@
  */
 
 #include "CUDABackend.h"
+#include "backends/NativeContextOpaqueContract.h"
 #include "../GPUDeviceContextPool.h"
 #include "CUDADriverApi.h"
 #include "CUDAHardwareMetadata.h"
@@ -1327,6 +1328,12 @@ namespace llaminar2
         if (capture_status != cudaStreamCaptureStatusNone)
             throw std::logic_error("CUDA context storage must be prepared after sealing capture, never inside recording");
         CUDAStackFootprintProbe profile;
+        if (GPUDeviceContextPool::instance().hasPreparedNativeProgramStack(DeviceId::cuda(device_id),memory)) {
+            // Source birth already owns this capacity inside its original opaque
+            // commitment. Inspection cannot grow it or mint a second PMA claim.
+            CUDANativeProgramStack::requirePrepared(required_local_bytes,profile.original());
+            return;
+        }
         if (required_local_bytes <= profile.original()) return;
         // Existing original stack capacity needs no new obligation. Growth in a
         // prepared source must never enter the legacy late-observation ledger.

@@ -14,7 +14,7 @@
  * - chunks arrive once, in increasing unit order, with no partial units;
  * - every layout field participates in the manifest hash;
  * - receiver state advances only after the complete chunk validates;
- * - padded CPU columns are deterministic zero bytes; and
+ * - retained CPU padding is distinct from compact live wire bytes; and
  * - Q6_K high bits are transposed without changing quantized values.
  */
 
@@ -451,6 +451,11 @@ namespace llaminar2
             ExpertTierWeightStreamManifest manifest,
             uint32_t maximum_units_per_chunk)
         {
+            if(manifest.source_projection.source_rows==0) {
+                using Residence=MoEProjectionResidence;
+                manifest.source_projection={Residence::ExpertOwner,manifest.N,manifest.K,0,manifest.N,0,manifest.K};
+                manifest.destination_projection=manifest.source_projection;
+            }
             const uint64_t units =
                 static_cast<uint64_t>(manifest.N_padded / 64) *
                 static_cast<uint64_t>(manifest.blocks_per_row);
@@ -465,8 +470,8 @@ namespace llaminar2
             manifest.unit_count = static_cast<uint32_t>(units);
             manifest.maximum_units_per_chunk = maximum_units_per_chunk;
             if (!checkedMultiply(
-                    units,
-                    static_cast<uint64_t>(manifest.cpu_block_stride),
+                    static_cast<uint64_t>(manifest.N)*manifest.blocks_per_row,
+                    static_cast<uint64_t>(manifest.cpu_block_stride/64),
                     manifest.total_stream_bytes))
             {
                 throw std::invalid_argument("Tier stream byte count overflows uint64");
@@ -495,7 +500,7 @@ namespace llaminar2
      * @brief Recompute the manifest identity from every semantic field.
      * @return Stable 64-bit FNV-1a hash, excluding `manifest_hash` itself.
      *
-     * Field order is part of ABI version 2. New fields must be appended with a
+     * Field order is part of ABI version 3. New fields must be appended with a
      * version bump; silently reordering fields would invalidate peers' hashes.
      */
     uint64_t ExpertTierWeightStreamManifest::computedHash() const noexcept
@@ -532,6 +537,11 @@ namespace llaminar2
         hash = hashScalar(hash, unit_count);
         hash = hashScalar(hash, maximum_units_per_chunk);
         hash = hashScalar(hash, total_stream_bytes);
+        for(const auto& owned:{source_projection,destination_projection}) {
+            hash=hashScalar(hash,static_cast<uint8_t>(owned.residence));
+            for(const auto field:{owned.source_rows,owned.source_columns,owned.first_row,owned.rows,owned.first_column,owned.columns})
+                hash=hashScalar(hash,field);
+        }
         return hash;
     }
 
@@ -563,7 +573,17 @@ namespace llaminar2
         {
             return reject(error, "Tier stream identity is invalid");
         }
-        // A unit is indivisible: exactly 64 N columns by one 32-value K block.
+        try {
+            const auto intersection=ExpertTierWeightProjectionIntersection::between(source_projection,destination_projection);
+            if(intersection.empty() || intersection.rows()!=N || intersection.columns()!=K ||
+               source_projection.first_column%32 || destination_projection.first_column%32 ||
+               source_projection.columns%32 || destination_projection.columns%32 ||
+               source_projection.source_columns%32)
+                return reject(error,"Tier stream original projection/native block geometry is inconsistent");
+        } catch(const std::invalid_argument&) {
+            return reject(error,"Tier stream original projection rectangles are invalid");
+        }
+        // A native block contains exactly32 K values; N padding is never traffic.
         if (N <= 0 || K <= 0 || N_padded < N || (N_padded % 64) != 0 ||
             (K % 32) != 0 || blocks_per_row != K / 32)
         {
@@ -587,7 +607,7 @@ namespace llaminar2
             static_cast<uint64_t>(N_padded / 64) *
             static_cast<uint64_t>(blocks_per_row);
         const uint64_t expected_bytes =
-            expected_units * static_cast<uint64_t>(cpu_block_stride);
+            static_cast<uint64_t>(N)*blocks_per_row*(cpu_block_stride/64);
         if (expected_units == 0 ||
             expected_units > std::numeric_limits<uint32_t>::max() ||
             unit_count != expected_units || total_stream_bytes != expected_bytes ||
@@ -627,6 +647,14 @@ namespace llaminar2
             .K = K,
             .N_padded = N_padded,
             .blocks_per_row = blocks_per_row,
+            .cpu_N = (source_packing==ExpertTierWeightPacking::CpuNativeVnniInterleaved?source_projection:destination_projection).rows,
+            .cpu_K = (source_packing==ExpertTierWeightPacking::CpuNativeVnniInterleaved?source_projection:destination_projection).columns,
+            .cpu_first_row = std::max(source_projection.first_row,destination_projection.first_row)-(source_packing==ExpertTierWeightPacking::CpuNativeVnniInterleaved?source_projection:destination_projection).first_row,
+            .cpu_first_column = std::max(source_projection.first_column,destination_projection.first_column)-(source_packing==ExpertTierWeightPacking::CpuNativeVnniInterleaved?source_projection:destination_projection).first_column,
+            .gpu_N = (source_packing==ExpertTierWeightPacking::GpuSeparatedNativeVnni?source_projection:destination_projection).rows,
+            .gpu_K = (source_packing==ExpertTierWeightPacking::GpuSeparatedNativeVnni?source_projection:destination_projection).columns,
+            .gpu_first_row = std::max(source_projection.first_row,destination_projection.first_row)-(source_packing==ExpertTierWeightPacking::GpuSeparatedNativeVnni?source_projection:destination_projection).first_row,
+            .gpu_first_column = std::max(source_projection.first_column,destination_projection.first_column)-(source_packing==ExpertTierWeightPacking::GpuSeparatedNativeVnni?source_projection:destination_projection).first_column,
             .cpu_codebook_id = cpu_codebook_id,
             .gpu_source_codebook_id = gpu_source_codebook_id,
             .gpu_source_is_superblock = gpu_source_is_superblock,
@@ -642,6 +670,129 @@ namespace llaminar2
             .unit_count = unit_count,
             .maximum_units_per_chunk = maximum_units_per_chunk,
         };
+    }
+
+    namespace {
+        /** @brief Shared encoded plane copier; full and partial units use the same original coordinates. */
+        template<bool Gather>
+        bool copyCPUIntersection(const ExpertTierWeightCPUStorageLayout& layout,
+            std::span<const uint8_t> source,uint32_t first,uint32_t units,std::span<uint8_t> destination) noexcept
+        {
+            if(!layout.valid() || units==0 || first>=layout.unit_count || units>layout.unit_count-first ||
+               units>layout.maximum_units_per_chunk) return false;
+            const auto wire_bytes=layout.chunkBytes(units,first),root_bytes=layout.cpuStorageBytes();
+            if(source.size()!=(Gather?root_bytes:wire_bytes) || destination.size()!=(Gather?wire_bytes:root_bytes))return false;
+            const auto x=reinterpret_cast<uintptr_t>(source.data()),y=reinterpret_cast<uintptr_t>(destination.data());
+            if(!x || !y || source.size()>std::numeric_limits<uintptr_t>::max()-x ||
+               destination.size()>std::numeric_limits<uintptr_t>::max()-y ||
+               (x<y+destination.size() && y<x+source.size()))return false;
+            const size_t payload_per_column=layout.cpu_data_stride/64;
+            const size_t metadata_planes=(layout.cpu_block_stride-layout.cpu_data_stride)/128;
+            size_t wire_offset=0;
+            for(uint32_t u=first;u<first+units;++u) {
+                const size_t first_n=size_t(u/layout.blocks_per_row)*layout.wire_columns_per_unit;
+                const size_t columns=std::min(size_t(layout.wire_columns_per_unit),size_t(layout.N)-first_n);
+                const size_t kb=u%layout.blocks_per_row;
+                if(columns==64 && (size_t(layout.cpu_first_row)+first_n)%64==0) {
+                    // Identity/aligned rectangles retain the original whole-unit
+                    // memcpy economy; partial origins use the same plane mapper.
+                    const size_t root_unit=((size_t(layout.cpu_first_row)+first_n)/64)*(layout.cpu_K/32)+layout.cpu_first_column/32+kb;
+                    const size_t regular_end=size_t(layout.N/64)*layout.blocks_per_row;
+                    const size_t contiguous_units=layout.cpu_K==layout.K && layout.cpu_first_column==0
+                        ? regular_end-u:size_t(layout.blocks_per_row)-kb;
+                    const auto run=std::min(contiguous_units,size_t(first+units-u));
+                    const size_t bytes=run*layout.cpu_block_stride;
+                    if constexpr(Gather)std::memcpy(destination.data()+wire_offset,source.data()+root_unit*layout.cpu_block_stride,bytes);
+                    else std::memcpy(destination.data()+root_unit*layout.cpu_block_stride,source.data()+wire_offset,bytes);
+                    wire_offset+=bytes;u+=static_cast<uint32_t>(run-1);continue;
+                }
+                if constexpr(Gather)if(layout.cpu_encoding==cpu::native_vnni::CPUNativeVNNIEncoding::Q6KNativeDualScale && columns==64)
+                    std::memset(destination.data()+wire_offset+1024,0,512);
+                for(size_t column=0;column<columns;++column) {
+                    const size_t cpu_n=layout.cpu_first_row+first_n+column;
+                    const size_t root_unit=(cpu_n/64)*(layout.cpu_K/32)+layout.cpu_first_column/32+kb;
+                    const size_t root_offset=root_unit*layout.cpu_block_stride;
+                    const size_t root_column=cpu_n%64;
+                    const auto copy=[&](size_t cpu,size_t wire,size_t bytes) {
+                        if constexpr(Gather)std::memcpy(destination.data()+wire,source.data()+cpu,bytes);
+                        else std::memcpy(destination.data()+cpu,source.data()+wire,bytes);
+                    };
+                    const bool q6=layout.cpu_encoding==cpu::native_vnni::CPUNativeVNNIEncoding::Q6KNativeDualScale;
+                    for(size_t group=0;group<(q6?4:payload_per_column/4);++group)
+                        copy(root_offset+group*256+root_column*4,wire_offset+group*columns*4+column*4,4);
+                    if(q6)for(size_t group=0;group<8;++group) {
+                        const size_t plane=root_offset+1024+group*64+(root_column/16)*16;
+                        const size_t bit=(root_column%16)*4;
+                        const size_t wire=wire_offset+16*columns+group*columns+column;
+                        uint64_t low,high;
+                        if constexpr(Gather) {
+                            std::memcpy(&low,source.data()+plane,8);std::memcpy(&high,source.data()+plane+8,8);
+                            if(columns==64) {
+                                const size_t wire_plane=wire_offset+1024+group*64+(column/16)*16;
+                                uint64_t wire_low,wire_high;const auto wire_bit=(column%16)*4;
+                                std::memcpy(&wire_low,destination.data()+wire_plane,8);std::memcpy(&wire_high,destination.data()+wire_plane+8,8);
+                                wire_low|=((low>>bit)&15)<<wire_bit;wire_high|=((high>>bit)&15)<<wire_bit;
+                                std::memcpy(destination.data()+wire_plane,&wire_low,8);std::memcpy(destination.data()+wire_plane+8,&wire_high,8);
+                            } else destination[wire]=static_cast<uint8_t>(((low>>bit)&15)|(((high>>bit)&15)<<4));
+                        } else {
+                            std::memcpy(&low,destination.data()+plane,8);std::memcpy(&high,destination.data()+plane+8,8);
+                            uint8_t value=source[wire];
+                            if(columns==64) {
+                                const size_t wire_plane=wire_offset+1024+group*64+(column/16)*16;
+                                uint64_t wire_low,wire_high;const auto wire_bit=(column%16)*4;
+                                std::memcpy(&wire_low,source.data()+wire_plane,8);std::memcpy(&wire_high,source.data()+wire_plane+8,8);
+                                value=static_cast<uint8_t>(((wire_low>>wire_bit)&15)|(((wire_high>>wire_bit)&15)<<4));
+                            }
+                            low=(low&~(uint64_t(15)<<bit))|(uint64_t(value&15)<<bit);
+                            high=(high&~(uint64_t(15)<<bit))|(uint64_t(value>>4)<<bit);
+                            std::memcpy(destination.data()+plane,&low,8);std::memcpy(destination.data()+plane+8,&high,8);
+                        }
+                    }
+                    const bool compact=layout.cpu_encoding==cpu::native_vnni::CPUNativeVNNIEncoding::CompactMultiScale;
+                    for(size_t plane=0;plane<(compact?2:metadata_planes);++plane)
+                        copy(root_offset+layout.cpu_data_stride+plane*128+root_column*2,
+                            wire_offset+payload_per_column*columns+plane*columns*2+column*2,2);
+                    // Compact multi-scale minima are one32-bit field per
+                    // column, not two independent16-bit column planes.
+                    if(compact)copy(root_offset+layout.cpu_data_stride+256+root_column*4,
+                        wire_offset+payload_per_column*columns+4*columns+column*4,4);
+                }
+                wire_offset+=columns*(layout.cpu_block_stride/64);
+            }
+            return true;
+        }
+    }
+    bool gatherExpertTierCPUWeightChunk(const ExpertTierWeightDeviceLayout& layout,
+        std::span<const uint8_t> cpu,uint32_t first,uint32_t units,std::span<uint8_t> wire) noexcept
+    {return layout.valid() && copyCPUIntersection<true>(layout.cpuStorage(),cpu,first,units,wire);}
+    bool scatterExpertTierCPUWeightChunk(const ExpertTierWeightDeviceLayout& layout,
+        std::span<const uint8_t> wire,uint32_t first,uint32_t units,std::span<uint8_t> cpu) noexcept
+    {return layout.valid() && copyCPUIntersection<false>(layout.cpuStorage(),wire,first,units,cpu);}
+
+    bool gatherExpertTierCPUWeightChunk(const ExpertTierWeightCPUStorageLayout& layout,
+        std::span<const uint8_t> cpu,uint32_t first,uint32_t units,std::span<uint8_t> wire) noexcept
+    {return copyCPUIntersection<true>(layout,cpu,first,units,wire);}
+    bool scatterExpertTierCPUWeightChunk(const ExpertTierWeightCPUStorageLayout& layout,
+        std::span<const uint8_t> wire,uint32_t first,uint32_t units,std::span<uint8_t> cpu) noexcept
+    {return copyCPUIntersection<false>(layout,wire,first,units,cpu);}
+
+    ExpertTierWeightStreamManifest ExpertTierWeightStreamManifest::forIntersection(
+        const ExpertTierWeightProjectionIntersection& intersection) const
+    {
+        std::string error;
+        if(!valid(&error) || intersection.empty() || intersection.source().rows!=source_projection.rows ||
+           intersection.source().columns!=source_projection.columns)
+            throw std::invalid_argument("Expert transfer intersection differs from its original source allocation");
+        auto result=*this;
+        result.source_projection=intersection.source();result.destination_projection=intersection.destination();
+        result.N=intersection.rows();result.K=intersection.columns();
+        if(result.N>std::numeric_limits<int32_t>::max()-63)
+            throw std::invalid_argument("Expert transfer native row padding overflows its layout ABI");
+        result.N_padded=(result.N+63)/64*64;result.blocks_per_row=result.K/32;
+        const uint64_t units=uint64_t(result.N_padded/64)*result.blocks_per_row;
+        if(units>std::numeric_limits<uint32_t>::max())
+            throw std::invalid_argument("Expert transfer native unit count exceeds its layout ABI");
+        return sealManifest(result,std::min(maximum_units_per_chunk,static_cast<uint32_t>(units)));
     }
 
     /**
@@ -660,7 +811,7 @@ namespace llaminar2
         // An oversized span is rejected: offsets are defined by this manifest alone.
         construction_valid_ =
             manifest_.valid(nullptr) &&
-            final_bytes_.size() == manifest_.total_stream_bytes;
+            final_bytes_.size() == manifest_.deviceLayout().cpuStorageBytes();
     }
 
     /**
@@ -701,10 +852,9 @@ namespace llaminar2
         {
             return reject(error, "Tier stream chunk unit range exceeds the manifest");
         }
-        // Chunks cannot contain a partial CPU unit.
+        // Chunks contain complete live native column planes for each indexed tile.
         const uint64_t expected_payload_bytes =
-            static_cast<uint64_t>(header.unit_count) *
-            static_cast<uint64_t>(manifest_.cpu_block_stride);
+            manifest_.deviceLayout().chunkBytes(header.unit_count,header.first_unit);
         if (expected_payload_bytes > std::numeric_limits<uint32_t>::max() ||
             header.payload_bytes != expected_payload_bytes ||
             payload.size() != expected_payload_bytes)
@@ -723,13 +873,8 @@ namespace llaminar2
         }
 
         // All checks passed. Copy directly into final ownership, then publish state.
-        const size_t destination_offset =
-            static_cast<size_t>(header.first_unit) *
-            static_cast<size_t>(manifest_.cpu_block_stride);
-        std::memcpy(
-            final_bytes_.data() + destination_offset,
-            payload.data(),
-            payload.size());
+        if(!scatterExpertTierCPUWeightChunk(manifest_.deviceLayout(),payload,header.first_unit,header.unit_count,final_bytes_))
+            return reject(error,"Tier stream encoded rectangle scatter failed");
         received_units_ += header.unit_count;
         ++next_sequence_;
         complete_ = reaches_end;
@@ -797,7 +942,7 @@ namespace llaminar2
      * @param expert_id Logical routed-expert identity.
      * @param projection Gate, up, or down projection identity.
      * @param maximum_units_per_chunk Persistent staging capacity in units.
-     * @return Fully validated version-2 manifest covering compact, dual-scale,
+     * @return Fully validated version-3 manifest covering compact, dual-scale,
      *         embedded-minimum, and normalized source formats.
      */
     ExpertTierWeightStreamManifest
@@ -813,7 +958,7 @@ namespace llaminar2
     {
         validateStreamIdentity(
             residency_epoch, layer_idx, expert_id, projection);
-        if (N <= 0 || K <= 0 || (K % 32) != 0)
+        if (N <= 0 || N>std::numeric_limits<int32_t>::max()-63 || K <= 0 || (K % 32) != 0)
             throw std::invalid_argument("Tier stream GPU source geometry is invalid");
 
         const NativeVnniFormatInfo *catalog_format =
@@ -936,7 +1081,7 @@ namespace llaminar2
      * @param expert_id Logical routed-expert identity.
      * @param projection Gate, up, or down projection identity.
      * @param maximum_units_per_chunk Persistent staging capacity in units.
-     * @return Fully validated version-2 manifest with an explicit normalized
+     * @return Fully validated version-3 manifest with an explicit normalized
      *         GPU destination when compact source bits are no longer present.
      */
     ExpertTierWeightStreamManifest
