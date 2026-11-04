@@ -150,6 +150,7 @@ namespace llaminar2
             // =====================================================================
 
             validateCPULayers(config, model, result);
+            validateDeepSeekV4Capabilities(config, model, result);
 
             // Skip remaining validation if no parallelism configured
             if (config.tp_degree == 1 && config.pp_degree == 1)
@@ -206,6 +207,33 @@ namespace llaminar2
         }
 
     private:
+        /**
+         * @brief Reject runtime features the DeepSeek-V4 graph does not implement yet.
+         *
+         * The compressor rings, compressed/indexer pools and raw window live in
+         * graph-arena state that the prefix cache neither archives nor restores,
+         * so a prefix hit would resume over another request's state. MTP/DSpark
+         * and dense TP/PP have no DeepSeek-V4 graph either. Multi-device
+         * placement uses ExpertOverlay (`--expert-tier`), which is supported.
+         */
+        static void validateDeepSeekV4Capabilities(
+            const OrchestrationConfig &config,
+            const IModelContext &model,
+            TPPPValidationResult &result)
+        {
+            if (model.architecture() != "deepseek4")
+                return;
+            if (config.prefix_cache.enabled &&
+                config.prefix_cache.storage_mode != PrefixCacheStorageMode::Disabled)
+                result.addError("DeepSeek V4: prefix cache unimplemented (compressor and "
+                                "indexer state is not archived); pass --no-prefix-cache");
+            if (config.mtp.enabled)
+                result.addError("DeepSeek V4: MTP/DSpark speculative decoding unimplemented; omit --mtp");
+            if (config.tp_degree > 1 || config.pp_degree > 1)
+                result.addError("DeepSeek V4: dense tensor/pipeline parallelism unimplemented; "
+                                "place experts across devices with --expert-tier");
+        }
+
         /**
          * @brief Validate the exact assignment production LocalTP will consume.
          *
