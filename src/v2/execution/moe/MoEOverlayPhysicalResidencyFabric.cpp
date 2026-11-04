@@ -3769,6 +3769,7 @@ namespace llaminar2
                                 allocation.has_mins,
                             .has_emins = allocation.has_emins,
                             .codebook_id = source.gpu_packed.codebook_id,
+                            .scale_plane = nativeQuantisedScalePlaneWidth(source.gpu_packed.codebook_id),
                             .format = source.format,
                         };
                         projection_slot.slot = {
@@ -4416,6 +4417,8 @@ namespace llaminar2
                                 spec.has_emins = true;
                                 spec.codebook_id =
                                     canonicalDeviceVnniCodebookId(signature.format.native_quantised);
+                                // Shadow slots hold any catalogued format: widest plane.
+                                spec.scale_plane = NativeQuantisedScalePlaneWidth::FP16Word;
                             }
                             specs.push_back(std::move(spec));
                         }

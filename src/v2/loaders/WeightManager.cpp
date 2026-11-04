@@ -6870,7 +6870,9 @@ namespace llaminar2
 
             orchestrator->planWeight(target_device.ordinal, name, N, K,
                                      vnni->payload_bytes, canonicalDeviceVnniFormat(*vnni).is_asymmetric,
-                                     vnni->has_emins, raw_bytes);
+                                     vnni->has_emins,
+                                     nativeQuantisedScalePlaneWidth(canonicalDeviceVnniCodebookId(*vnni)),
+                                     raw_bytes);
             max_raw_bytes = std::max(max_raw_bytes, raw_bytes);
             ++planned_storage_count;
             weight_formats.emplace_back(name, vnni);
@@ -7054,6 +7056,7 @@ namespace llaminar2
                         allocation.payload_bytes_per_block,
                         allocation.has_mins,
                         allocation.has_emins,
+                        nativeQuantisedScalePlaneWidth(canonicalDeviceVnniCodebookId(*vnni)),
                         run.job.raw_bytes);
                 }
                 else
