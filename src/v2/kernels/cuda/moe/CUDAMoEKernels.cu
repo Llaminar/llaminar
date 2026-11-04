@@ -18803,8 +18803,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
                 dot = __dp4a(a_vals[group], packed_groups[group], dot);
             const float scale = physical_codebook == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook
                 ? llaminar2::cuda_native_quantised::native_quantised_single_scale_rn<llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook>(
-                      scale_base[linear], min_base[linear])
-                : llaminar2::cuda_native_quantised::fp16_bits_to_float(scale_base[linear]);
+                      ::llaminar2::native_quantised_scale::loadStagedPrimary<CodebookId>(scale_base, linear), min_base[linear])
+                : llaminar2::cuda_native_quantised::fp16_bits_to_float(::llaminar2::native_quantised_scale::loadStagedPrimary<CodebookId>(scale_base, linear));
             return llaminar2::device_native_quantised_contract::singleScaleBlock(dot, scale, scale_a);
         }
         if constexpr (llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::is_dual_scale)
@@ -18851,7 +18851,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
                     dot_lo,
                     dot_hi,
                     scale_a,
-                    scale_base[linear],
+                    ::llaminar2::native_quantised_scale::loadStagedPrimary<CodebookId>(scale_base, linear),
                     min_base ? min_base[linear] : 0u,
                     emin_base ? emin_base[linear] : 0u,
                     sum_lo + sum_hi,
@@ -18880,7 +18880,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
                     dot,
                     0,
                     scale_a,
-                    scale_base[linear],
+                    ::llaminar2::native_quantised_scale::loadStagedPrimary<CodebookId>(scale_base, linear),
                     min_base ? min_base[linear] : 0u,
                     0u,
                     sum_a,
