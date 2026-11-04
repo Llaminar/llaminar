@@ -72,14 +72,18 @@ void proveCPUJointShadowCalibration()
             for(;;) {
                 const auto progress=owned.wave->pollStage(&error);
                 if(progress==Progress::Failed)throw std::runtime_error(error);
-                int local_ready=progress==Progress::Ready,all_ready=0;
-                if(MPI_Allreduce(&local_ready,&all_ready,1,MPI_INT,MPI_MIN,MPI_COMM_WORLD)!=MPI_SUCCESS)
-                    throw std::runtime_error("CPU joint shadow calibration progress vote failed");
-                if(all_ready)break;
+                // The production operation owns cross-rank progress. A test-side
+                // vote on every poll would serialize the two sockets and hide
+                // missing progress edges or rank-dependent completion races.
+                if(progress==Progress::Ready)break;
                 if(std::chrono::steady_clock::now()>=deadline)
                     throw std::runtime_error("CPU joint shadow calibration exceeded original deadline");
                 std::this_thread::yield();
             }
+            // Keep both original owners alive through their independent terminal
+            // transitions; this join does not drive an unfinished operation.
+            if(MPI_Barrier(MPI_COMM_WORLD)!=MPI_SUCCESS)
+                throw std::runtime_error("CPU joint shadow calibration terminal barrier failed");
         } catch(const std::exception& failure) {
             ADD_FAILURE()<<failure.what();MPI_Abort(MPI_COMM_WORLD,2);throw;
         }

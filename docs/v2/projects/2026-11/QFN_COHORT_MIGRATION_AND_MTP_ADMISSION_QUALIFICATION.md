@@ -587,6 +587,14 @@ for eighty actual controller calibration waves; existing shadow-copy and MPI
 evidence controls also repeat twenty times. All 80 observed temporary model
 paths are retired. This test-only successor changes no production implementation.
 
+The shadow-wave witness now also progresses each rank independently instead of
+voting with a test-side MPI allreduce on every poll. A single terminal join keeps
+the original owners alive after both operations complete. Build230 and
+`focused231` pass both shadow and controller registrations, twenty repetitions
+each, in 4.66 seconds with no skips and a clean driver window. This removes test
+lockstep that could otherwise conceal production progress races; it changes no
+transport or calibration implementation.
+
 Complete cohort service/rooted-return pricing and changed-epoch
 publication/inference remain open. No model arithmetic, KL limit, serving-time
 Dynamic cohort guard or Release performance claim changes in these slices.
