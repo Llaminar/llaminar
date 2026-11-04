@@ -329,6 +329,8 @@ namespace llaminar2
             {
             case TensorType::IQ4_NL:
                 return bytes_for(IQ4_NLBlock::BLOCK_SIZE, sizeof(IQ4_NLBlock));
+            case TensorType::MXFP4:
+                return bytes_for(MXFP4Block::BLOCK_SIZE, sizeof(MXFP4Block));
             case TensorType::IQ4_XS:
                 return bytes_for(IQ4_XSBlock::BLOCK_SIZE, sizeof(IQ4_XSBlock));
             case TensorType::Q8_0:

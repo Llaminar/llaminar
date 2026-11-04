@@ -49,7 +49,7 @@ namespace llaminar2
             case TensorType::IQ1_S: case TensorType::IQ1_M:
             case TensorType::IQ2_XXS: case TensorType::IQ2_XS:
             case TensorType::IQ2_S: case TensorType::IQ3_XXS:
-            case TensorType::IQ3_S:
+            case TensorType::IQ3_S: case TensorType::MXFP4:
                 return true;
             default:
                 return false;
@@ -100,6 +100,7 @@ namespace llaminar2
                 LLAMINAR_NATIVE_EMBEDDING_BLOCK(IQ2_S);
                 LLAMINAR_NATIVE_EMBEDDING_BLOCK(IQ3_XXS);
                 LLAMINAR_NATIVE_EMBEDDING_BLOCK(IQ3_S);
+                LLAMINAR_NATIVE_EMBEDDING_BLOCK(MXFP4);
             default:
                 throw std::invalid_argument("Native embedding requires a supported quantized source");
             }
@@ -136,7 +137,7 @@ namespace llaminar2
                      TensorType::IQ4_XS, TensorType::Q2_K, TensorType::Q3_K, TensorType::Q4_K,
                      TensorType::Q5_K, TensorType::Q6_K, TensorType::Q8_K, TensorType::IQ1_S,
                      TensorType::IQ1_M, TensorType::IQ2_XXS, TensorType::IQ2_XS, TensorType::IQ2_S,
-                     TensorType::IQ3_XXS, TensorType::IQ3_S})
+                     TensorType::IQ3_XXS, TensorType::IQ3_S, TensorType::MXFP4})
             {
                 if (source == tensorTypeName(type))
                     return forSource(type, vocab_size, d_model);

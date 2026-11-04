@@ -7417,6 +7417,7 @@ namespace
         {
         case 0:
         case 4:
+        case llaminar2::kNativeQuantisedMXFP4Codebook:
             payload_bytes = 16u;
             return true;
         case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook:
@@ -13139,6 +13140,7 @@ namespace
         case 0:
         case 4:
         case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook:
+        case llaminar2::kNativeQuantisedMXFP4Codebook:
         case 5:
         case 6:
         case 7:
@@ -19732,6 +19734,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             return native_quantised_dot_desc_range<4>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook:
             return native_quantised_dot_desc_range<llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        case llaminar2::kNativeQuantisedMXFP4Codebook:
+            return native_quantised_dot_desc_range<llaminar2::kNativeQuantisedMXFP4Codebook>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 5:
             return native_quantised_dot_desc_range<5>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 6:
@@ -21548,6 +21552,7 @@ extern "C"
                 QUERY_GROUPED_PREFILL_CODEBOOK(0);
                 QUERY_GROUPED_PREFILL_CODEBOOK(4);
                 QUERY_GROUPED_PREFILL_CODEBOOK(llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook);
+                QUERY_GROUPED_PREFILL_CODEBOOK(llaminar2::kNativeQuantisedMXFP4Codebook);
                 QUERY_GROUPED_PREFILL_CODEBOOK(5);
                 QUERY_GROUPED_PREFILL_CODEBOOK(6);
                 QUERY_GROUPED_PREFILL_CODEBOOK(7);
@@ -24617,6 +24622,7 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
         case 0:  LAUNCH_GROUPED_GATE_UP_KPART(0); break;
         case 4:  LAUNCH_GROUPED_GATE_UP_KPART(4); break;
         case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook: LAUNCH_GROUPED_GATE_UP_KPART(llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook); break;
+        case llaminar2::kNativeQuantisedMXFP4Codebook: LAUNCH_GROUPED_GATE_UP_KPART(llaminar2::kNativeQuantisedMXFP4Codebook); break;
         case 5:  LAUNCH_GROUPED_GATE_UP_KPART(5); break;
         case 6:  LAUNCH_GROUPED_GATE_UP_KPART(6); break;
         case 7:  LAUNCH_GROUPED_GATE_UP_KPART(7); break;
@@ -24712,6 +24718,7 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
         case 0:  LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(0); break;
         case 4:  LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(4); break;
         case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook); break;
+        case llaminar2::kNativeQuantisedMXFP4Codebook: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(llaminar2::kNativeQuantisedMXFP4Codebook); break;
         case 5:  LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(5); break;
         case 6:  LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(6); break;
         case 7:  LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(7); break;
@@ -24817,6 +24824,7 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
         case 0:  LAUNCH_GROUPED_DOWN_KPART(0); break;
         case 4:  LAUNCH_GROUPED_DOWN_KPART(4); break;
         case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook: LAUNCH_GROUPED_DOWN_KPART(llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook); break;
+        case llaminar2::kNativeQuantisedMXFP4Codebook: LAUNCH_GROUPED_DOWN_KPART(llaminar2::kNativeQuantisedMXFP4Codebook); break;
         case 5:  LAUNCH_GROUPED_DOWN_KPART(5); break;
         case 6:  LAUNCH_GROUPED_DOWN_KPART(6); break;
         case 7:  LAUNCH_GROUPED_DOWN_KPART(7); break;
@@ -24926,6 +24934,7 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
         case 0:  LAUNCH_GROUPED_DOWN_RUNTIME_KPART(0); break;
         case 4:  LAUNCH_GROUPED_DOWN_RUNTIME_KPART(4); break;
         case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook); break;
+        case llaminar2::kNativeQuantisedMXFP4Codebook: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(llaminar2::kNativeQuantisedMXFP4Codebook); break;
         case 5:  LAUNCH_GROUPED_DOWN_RUNTIME_KPART(5); break;
         case 6:  LAUNCH_GROUPED_DOWN_RUNTIME_KPART(6); break;
         case 7:  LAUNCH_GROUPED_DOWN_RUNTIME_KPART(7); break;
@@ -25304,6 +25313,7 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                     LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(0);
                     LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(4);
                     LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook);
+                    LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(llaminar2::kNativeQuantisedMXFP4Codebook);
                     LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(5);
                     LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(6);
                     LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(7);
@@ -25406,6 +25416,7 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                 LAUNCH_GROUPED_GATEUP_IF_PRESENT(0);
                 LAUNCH_GROUPED_GATEUP_IF_PRESENT(4);
                 LAUNCH_GROUPED_GATEUP_IF_PRESENT(llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook);
+                LAUNCH_GROUPED_GATEUP_IF_PRESENT(llaminar2::kNativeQuantisedMXFP4Codebook);
                 LAUNCH_GROUPED_GATEUP_IF_PRESENT(5);
                 LAUNCH_GROUPED_GATEUP_IF_PRESENT(6);
                 LAUNCH_GROUPED_GATEUP_IF_PRESENT(7);
@@ -25574,6 +25585,7 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                     LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(0);
                     LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(4);
                     LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook);
+                    LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(llaminar2::kNativeQuantisedMXFP4Codebook);
                     LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(5);
                     LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(6);
                     LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(7);
@@ -25676,6 +25688,7 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
             LAUNCH_GROUPED_DOWN_IF_PRESENT(0);
             LAUNCH_GROUPED_DOWN_IF_PRESENT(4);
             LAUNCH_GROUPED_DOWN_IF_PRESENT(llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook);
+            LAUNCH_GROUPED_DOWN_IF_PRESENT(llaminar2::kNativeQuantisedMXFP4Codebook);
             LAUNCH_GROUPED_DOWN_IF_PRESENT(5);
             LAUNCH_GROUPED_DOWN_IF_PRESENT(6);
             LAUNCH_GROUPED_DOWN_IF_PRESENT(7);

@@ -1017,7 +1017,8 @@ namespace
             return tile == 2 ? ordinary_hint : 1;
         }
         if constexpr (CanonicalKpart &&
-                      (CB == 0 || CB == 4 || CB == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook || CB == 6 || CB == 11 ||
+                      (CB == 0 || CB == 4 || CB == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook ||
+                       CB == llaminar2::kNativeQuantisedMXFP4Codebook || CB == 6 || CB == 11 ||
                        CB == 12 || CB == 15 || CB == 19))
         {
             return tile <= 3 ? ordinary_hint : 1;
@@ -1968,6 +1969,13 @@ extern "C"
                 serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
                 cuda_stream, prefill_ctx);
             break;
+        case llaminar2::kNativeQuantisedMXFP4Codebook:
+            ok = ownedLaunchGenericPrefillBK64<llaminar2::kNativeQuantisedMXFP4Codebook>(
+                d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
+                nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+                serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+                cuda_stream, prefill_ctx);
+            break;
         case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook:
             if (!d_mins) return false;
             ok = ownedLaunchGenericPrefillBK64<llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook>(
@@ -2159,6 +2167,7 @@ extern "C"
             QUERY_LAST_DENSE_PREFILL_CODEBOOK(0);
             QUERY_LAST_DENSE_PREFILL_CODEBOOK(4);
             QUERY_LAST_DENSE_PREFILL_CODEBOOK(llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook);
+            QUERY_LAST_DENSE_PREFILL_CODEBOOK(llaminar2::kNativeQuantisedMXFP4Codebook);
             QUERY_LAST_DENSE_PREFILL_CODEBOOK(5);
             QUERY_LAST_DENSE_PREFILL_CODEBOOK(6);
             QUERY_LAST_DENSE_PREFILL_CODEBOOK(7);
@@ -2233,6 +2242,7 @@ extern "C"
             QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(0);
             QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(4);
             QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook);
+            QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(llaminar2::kNativeQuantisedMXFP4Codebook);
             QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(5);
             QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(6);
             QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(7);
