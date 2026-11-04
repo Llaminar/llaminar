@@ -1633,6 +1633,7 @@ namespace llaminar2
              * @param source_readiness Installed old-epoch ordering proof.
              * @param source_engine Pins the immutable source slot.
              * @param destination_engine Pins the inactive destination slot.
+             * @param intersection Original-coordinate overlap between independently strided roots.
              *
              * Floating representations are byte-identical on CPU and GPU, so
              * this operation streams bounded chunks without a repack kernel.
@@ -1736,9 +1737,16 @@ namespace llaminar2
                             &start_error);
                         break;
                     case Direction::GpuToCpuContiguous:
-                        started = lane_->lane()->startGpuToCpuContiguous(
-                            gpu_floating_, cpu_destination_,
-                            source_readiness_, &start_error);
+                        // The whole GPU root and CPU shard retain different
+                        // strides. Forward the same checked overlap used to
+                        // admit this operation instead of copying whole storage.
+                        started = floating_intersection_
+                            ? lane_->lane()->startGpuToCpuContiguous(
+                                  gpu_floating_, cpu_destination_, source_readiness_,
+                                  *floating_intersection_, &start_error)
+                            : lane_->lane()->startGpuToCpuContiguous(
+                                  gpu_floating_, cpu_destination_, source_readiness_,
+                                  &start_error);
                         break;
                     case Direction::CpuToGpuContiguous:
                         started = floating_intersection_

@@ -14,6 +14,12 @@ if(TEST V2_Integration_MoEOverlayCPUCohortPhysicalStagingAbort)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
         V2_Integration_MoEOverlayCPUCohortPhysicalStagingAbort)
 endif()
+foreach(_floating_cohort_backend IN ITEMS CUDA ROCm)
+    set(_floating_cohort_test V2_Integration_${_floating_cohort_backend}_CPUJointFloatingFabricRectangles)
+    if(TEST ${_floating_cohort_test})
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_floating_cohort_test})
+    endif()
+endforeach()
 
 add_v2_test(V2_Integration_PreparedProjectionIntersectionContract
     COMMAND $<TARGET_FILE:v2_unit_moe_overlay_participant_residency>

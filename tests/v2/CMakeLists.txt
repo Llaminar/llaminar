@@ -19338,7 +19338,7 @@ target_link_libraries(v2_integration_moe_overlay_residency_consensus_mpi
 )
 add_v2_test(V2_Integration_MoEOverlayResidencyConsensus_MPI
     COMMAND $<TARGET_FILE:v2_integration_moe_overlay_residency_consensus_mpi>
-        --gtest_filter=-MoEOverlayCPUCohortFabric.*
+        --gtest_filter=-MoEOverlayCPUCohortFabric.*:MoEOverlayGPUCPUCohortFabric.*
     LABELS "V2;Integration;CPU;MoE;Overlay;Residency;Async;TypedLifecycle;MPI;PerfStats;ByteExact;NoBlocking"
     MPI_PROCS 2
     TIMEOUT 60
@@ -19355,6 +19355,27 @@ if(V2_TEST_SOCKETS AND V2_TEST_SOCKETS GREATER_EQUAL 2)
             "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1")
 else()
     message(STATUS "CPU cohort physical fabric: unqualified (requires two discovered physical sockets); no MPI launch")
+endif()
+
+# Actual whole-GPU / original two-socket CPU-cohort physical rectangles.
+# These cannot join the host-only wildcard or invent a third GPU-only rank.
+if(V2_TEST_SOCKETS AND V2_TEST_SOCKETS GREATER_EQUAL 2)
+    foreach(V2_FLOATING_FABRIC_BACKEND CUDA ROCm)
+        if((V2_FLOATING_FABRIC_BACKEND STREQUAL "CUDA" AND HAVE_CUDA) OR
+           (V2_FLOATING_FABRIC_BACKEND STREQUAL "ROCm" AND HAVE_ROCM))
+            if(V2_FLOATING_FABRIC_BACKEND STREQUAL "CUDA")
+                set(V2_FLOATING_FABRIC_OTHER_STARTUP "LLAMINAR_SKIP_ROCM_STARTUP=1")
+            else()
+                set(V2_FLOATING_FABRIC_OTHER_STARTUP "LLAMINAR_SKIP_CUDA_STARTUP=1")
+            endif()
+            add_v2_test(V2_Integration_${V2_FLOATING_FABRIC_BACKEND}_CPUJointFloatingFabricRectangles
+                COMMAND $<TARGET_FILE:v2_integration_moe_overlay_residency_consensus_mpi>
+                    --gtest_filter=MoEOverlayGPUCPUCohortFabric.${V2_FLOATING_FABRIC_BACKEND}FloatingOriginalRectangles
+                LABELS "V2;Integration;ProductionTestPreflight;${V2_FLOATING_FABRIC_BACKEND};CPU;MoE;MPI;Residency;Transfer;Lifecycle;ByteExact;Contract"
+                MPI_PROCS 2 NO_MODELS TIMEOUT 60
+                ENVIRONMENT "${V2_FLOATING_FABRIC_OTHER_STARTUP}" "OMP_NUM_THREADS=1")
+        endif()
+    endforeach()
 endif()
 
 add_v2_test(V2_Integration_ExpertOverlayRetirementProgress_MPI

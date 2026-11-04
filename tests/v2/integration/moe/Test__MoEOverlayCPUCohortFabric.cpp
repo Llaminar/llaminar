@@ -4,7 +4,8 @@
  *
  * One original GGUF/context/preparation supplies all real prepared banks and
  * PMA roots. Polling gates delay/fail an actual piece, retaining its copy, ACK
- * and abort/drain. No global candidate publication or GPU actor is invented.
+ * and abort/drain. Explicit native cases replace only the whole tier with a
+ * genuine rank-zero GPU owner; no global candidate publication is invented.
  */
 #include "execution/moe/MoEOverlayPhysicalResidencyFabric.h"
 #include "execution/moe/MoEOverlayPhysicalLaneDemand.h"
@@ -15,6 +16,8 @@
 #include "loaders/ModelContext.h"
 #include "loaders/WeightManager.h"
 #include "loaders/PreparedWeightStore.h"
+#include "loaders/GPUVramPreflight.h"
+#include "../../utils/ScopedGPUStream.h"
 #include "tensors/NativeWeightSourceRange.h"
 #include "backends/HostMemoryCapacity.h"
 #include "backends/BackendManager.h"
@@ -70,15 +73,24 @@ std::vector<CPUExpertSocketEndpoint> originalFabricSockets(const MPIContext& mpi
         throw std::runtime_error("CPU cohort fabric requires one actual MPI rank per distinct physical socket");
     return result;
 }
-/** @return Fixed admitted tiers and cuts, never fabricated rank/socket execution. */
-MoERoutedExpertPlacementPlan fabricOriginalPlan(const std::vector<CPUExpertSocketEndpoint>& sockets) {
+/**
+ * @brief Declare fixed tiers/cuts against observed original socket endpoints.
+ * @param sockets Genuine world-rank ordered physical CPU endpoints.
+ * @param whole_device Explicit whole-owner backend; CPU preserves the original host-only fixture.
+ * @return Fixed admitted tiers with no fabricated rank/socket execution.
+ */
+MoERoutedExpertPlacementPlan fabricOriginalPlan(const std::vector<CPUExpertSocketEndpoint>& sockets,
+    DeviceId whole_device=DeviceId::cpu()) {
     MoERoutedExpertPlacementPlan plan;
     plan.enabled=true;plan.first_model_layer=0;plan.topology=RoutedExpertPlacementTopology::TieredOverlay;
     plan.continuation_domain=plan.base_model_domain=plan.shared_expert_domain="whole";
     RoutedExpertDomain whole;
     whole.name="whole";whole.scope=ExecutionDomainScope::RANK_LOCAL;
-    whole.backend=CollectiveBackendType::UPI;whole.owner_rank=0;
-    whole.participants={GlobalDeviceAddress::cpu(sockets.at(0).numa_node)};
+    whole.backend=whole_device.is_cuda()?CollectiveBackendType::NCCL:
+        whole_device.is_rocm()?CollectiveBackendType::RCCL:CollectiveBackendType::UPI;whole.owner_rank=0;
+    whole.participants={whole_device.is_cuda()?GlobalDeviceAddress::cuda(whole_device.ordinal):
+        whole_device.is_rocm()?GlobalDeviceAddress::rocm(whole_device.ordinal):
+        GlobalDeviceAddress::cpu(sockets.at(0).numa_node)};
     whole.routed_compute_policy=RoutedExpertComputePolicy::Apportioned;
     RoutedExpertDomain cohort;
     cohort.name="cohort";cohort.scope=ExecutionDomainScope::NODE_LOCAL;
@@ -112,8 +124,14 @@ struct FabricOriginal {
     std::vector<MoEOverlayLayerWeightManifest> manifests;
     int whole=-1,last_shard=-1;
     ModelContextId model;
-    /** @brief Parse once, admit exact source/shadow/lane roots and publish genuine initial banks. */
-    FabricOriginal() {
+    DeviceId whole_device=DeviceId::cpu();
+    /**
+     * @brief Parse once, admit exact source/shadow/lane roots and publish genuine initial banks.
+     * @param device Explicit whole-owner backend; only rank zero prepares native GPU storage.
+     */
+    explicit FabricOriginal(DeviceId device=DeviceId::cpu()):whole_device(device) {
+        if(!device.is_cpu() && !device.is_gpu())
+            throw std::invalid_argument("Fabric whole endpoint must be CPU or explicit native GPU");
         int rank=-1,size=0;MPI_Comm_rank(MPI_COMM_WORLD,&rank);MPI_Comm_size(MPI_COMM_WORLD,&size);
         mpi=std::make_shared<MPIContext>(rank,size,MPI_COMM_WORLD);
         const auto sockets=originalFabricSockets(*mpi);
@@ -124,7 +142,7 @@ struct FabricOriginal {
         context=ModelContext::create(file.path(),source);
         if(!context)throw std::runtime_error("CPU cohort fabric original context did not load");
         model=ModelContextId{reinterpret_cast<uint64_t>(context.get())};
-        plan=std::make_shared<const MoERoutedExpertPlacementPlan>(fabricOriginalPlan(sockets));
+        plan=std::make_shared<const MoERoutedExpertPlacementPlan>(fabricOriginalPlan(sockets,whole_device));
         const auto runtime=resolveMoEExpertOverlayRuntimePlan(plan,{.current_world_rank=rank,.validate_mvp_root_reachability=false});
         if(!runtime)throw std::runtime_error("CPU cohort fabric original runtime is absent");
         auto& loader=context->concreteLoader();
@@ -151,12 +169,14 @@ struct FabricOriginal {
                 resident_bytes+=CPUStorageRoot<float>(projection.finalRows()*projection.finalColumns(),
                     PhysicalMemoryOwner::RoutedExpertWeights,DeviceId::cpu(),placement).physicalBytes();
         manifests=buildMoEOverlayLayerWeightManifestFromLoader(loader,1,kExperts);
-        size_t shadow_bytes=0;
+        size_t shadow_bytes=0,gpu_shadow_bytes=0;
         for(int id:local) {
             const auto* member=topology.participantForId(id);
             const auto selected=member->domain_name=="cohort"?preparation->cpuShardSourceFor(0,*member):nullptr;
             const auto local_manifest=selected?selected->cohort()->localManifest(selected->participantIndex()):manifests.front();
-            shadow_bytes+=MoEOverlayCapacityResolver::preparedFootprints({local_manifest}).front().cpu_shadow_bytes;
+            const auto footprint=MoEOverlayCapacityResolver::preparedFootprints({local_manifest}).front();
+            if(member->device.is_gpu())gpu_shadow_bytes+=footprint.gpu_shadow_bytes;
+            else shadow_bytes+=footprint.cpu_shadow_bytes;
         }
         const MoEOverlayCapacityAdmissionPolicy storage{
             .migration_storage=MoEOverlayMigrationStorageKind::PhysicalResidencyFabric,
@@ -164,10 +184,11 @@ struct FabricOriginal {
             .maximum_concurrent_cycles=1,.maximum_execution_streams=1,.maximum_cycles_per_layer=1,
             .distributed_transport=true,.overlay_world_size=2};
         const auto staging=MoEOverlayCapacityAdmission::transferStagingBOM(*plan,2,storage,manifests,kExperts);
-        size_t migration_bytes=0;
+        size_t migration_bytes=0,gpu_migration_bytes=0;
         for(const auto& charge:staging)if(charge.world_rank==rank) {
-            if(!charge.device.is_cpu())throw std::runtime_error("CPU-only fabric unexpectedly priced a GPU allocator");
-            migration_bytes+=charge.bytes;
+            if(charge.device.is_cpu())migration_bytes+=charge.bytes;
+            else if(charge.device==whole_device)gpu_migration_bytes+=charge.bytes;
+            else throw std::runtime_error("Fabric staging introduced a foreign allocator");
         }
         const auto capacity=observeSystemMemoryCapacity();
         const PhysicalMemoryResource cpu{rank,DeviceId::cpu(),capacity.total_bytes,capacity.admission_available_bytes};
@@ -175,12 +196,43 @@ struct FabricOriginal {
         budget.add(cpu,PhysicalMemoryOwner::RoutedExpertWeights,resident_bytes);
         budget.add(cpu,PhysicalMemoryOwner::ExpertShadowSlots,shadow_bytes);
         budget.add(cpu,PhysicalMemoryOwner::ExpertMigrationStaging,migration_bytes);
+        if(whole_device.is_gpu() && rank==0) {
+            // The same preparation declares the genuine GPU source owners. GPU
+            // upload rings coexist with CPU source/fabric staging and are additive.
+            const auto footprint=MoEOverlayCapacityResolver::preparedFootprints(manifests).front();
+            auto gpu_loading=preparation->filteredForDevice(whole_device).sourceWeightPlan(loader,model);
+            size_t maximum_source_bytes=0;
+            for(const auto& request:gpu_loading.requirements()) {
+                const auto geometry=loader.nativeWeightSourceGeometry(request.source_name.empty()?request.canonical_name:request.source_name);
+                size_t request_bytes=0;
+                for(const auto& projection:projectNativeWeightSource(request,geometry))
+                    request_bytes+=projection.range.nativeBytes()*projection.matrix_count;
+                maximum_source_bytes=std::max(maximum_source_bytes,request_bytes);
+            }
+            const auto upload=resolveGPUWeightLoadMemoryGeometry(maximum_source_bytes,configuredGPUWeightLoadMemoryPolicy());
+            auto* backend=getBackendFor(whole_device);
+            if(!backend)throw std::runtime_error("Explicit floating Fabric backend is unavailable");
+            const PhysicalMemoryResource gpu{rank,whole_device,backend->deviceMemoryTotal(whole_device.ordinal),
+                backend->deviceMemoryFree(whole_device.ordinal)};
+            budget.add(gpu,PhysicalMemoryOwner::RoutedExpertWeights,2*footprint.gpu_live_bytes)
+                .add(gpu,PhysicalMemoryOwner::ExpertShadowSlots,gpu_shadow_bytes)
+                .add(gpu,PhysicalMemoryOwner::ExpertMigrationStaging,gpu_migration_bytes)
+                .add(gpu,PhysicalMemoryOwner::WeightLoadStaging,upload.staging_bytes)
+                .add(cpu,PhysicalMemoryOwner::WeightLoadStaging,upload.host_staging_bytes);
+        }
         memory=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(budget.build()),rank);
         auto manager=context->concreteWeightManager();manager->installPhysicalMemoryAuthority(memory);
         const auto frozen=manager->materialize(loading);
         if(!manager->prepareMoEExpertOverlayWeights(*runtime,DeviceId::cpu(),&frozen,nullptr,
             PreparedWeightAdmission::AllocateCompleteSet,preparation))
             throw std::runtime_error("CPU cohort fabric original preparation did not complete");
+        if(whole_device.is_gpu() && rank==0) {
+            auto gpu_loading=preparation->filteredForDevice(whole_device).sourceWeightPlan(loader,model);
+            const auto gpu_frozen=manager->materialize(gpu_loading);
+            if(!manager->prepareMoEExpertOverlayWeights(*runtime,whole_device,&gpu_frozen,nullptr,
+                PreparedWeightAdmission::AllocateCompleteSet,preparation))
+                throw std::runtime_error("Fabric genuine GPU source preparation did not complete");
+        }
         registry=std::make_shared<MoEOverlayParticipantResidencyRegistry>(MoEOverlayParticipantResidencyRegistry::Config{
             .local_participant_ids=local,.num_layers=1,.num_experts=kExperts,.initial_epoch=1,
             .retained_epoch_capacity=3,.projection_preparation=preparation,.original_model=model});
@@ -352,17 +404,32 @@ void expectDestination(const FabricOriginal& original,const MoEOverlayResidencyT
             projections[role]={MoEProjectionResidence::ExpertOwner,matrix.N,matrix.K,0,matrix.N,0,matrix.K};
         }
     }
+    const auto* participant=transaction.candidate->placementOwnerMap().participantForId(destination.participant_id);
+    ASSERT_TRUE(participant);
+    const auto destination_device=participant->device;
     for(size_t role=0;role<3;++role) {
         const auto& engine=engines[role];ASSERT_TRUE(engine);
         ContiguousFloatingPointWeightDescriptor bytes;
         ASSERT_TRUE(engine->exportContiguousFloatingPointWeights(bytes));ASSERT_TRUE(bytes.valid());
         ASSERT_EQ(bytes.type,TensorType::FP32);const auto& owned=projections[role];
         EXPECT_EQ(bytes.n,owned.rows);EXPECT_EQ(bytes.k,owned.columns);
-        const auto* values=static_cast<const float*>(bytes.data);
+        std::vector<float> downloaded;
+        if(destination_device.is_gpu()) {
+            // Diagnostic final-byte observation only, after every actual Fabric
+            // operation is Ready. This is not a production copy/substitute lane.
+            const auto device=destination_device;
+            ScopedGPUStream stream(device);
+            downloaded.resize(size_t(bytes.n)*bytes.k);
+            auto* backend=getBackendFor(device);
+            ASSERT_TRUE(backend->deviceToHost(downloaded.data(),bytes.data,bytes.bytes,device.ordinal,stream.get()));
+            ASSERT_TRUE(backend->synchronizeStream(stream.get(),device.ordinal));
+        }
+        const auto* values=downloaded.empty()?static_cast<const float*>(bytes.data):downloaded.data();
         for(int row=0;row<owned.rows;++row)for(int column=0;column<owned.columns;++column)
             ASSERT_EQ(std::bit_cast<uint32_t>(values[size_t(row)*owned.columns+column]),
                 std::bit_cast<uint32_t>(sourceValue(edge.expert_id,owned.first_row+row,owned.first_column+column,
                     owned.source_columns,owned.source_rows)));
+        if(destination_device.is_gpu())continue; // Actual CPU one-hot GEMM remains the independent execution oracle.
         auto input=TestTensorFactory::createFP32Zeros({1,size_t(bytes.k)});
         auto output=TestTensorFactory::createFP32Zeros({1,size_t(bytes.n)});
         const auto requirements=cpuProjectionTestRequirements(1,{engine.get()});
@@ -476,5 +543,205 @@ TEST(MoEOverlayCPUCohortFabric, RealTwoSocketSetupFailureDrainsWithoutStartingPh
     }
     EXPECT_EQ(original.authority->snapshot()->epoch,1u);
 }
+
+} // namespace llaminar2::test
+
+namespace llaminar2::test {
+namespace {
+/** @brief Weak observation of an actual original bank engine, never a lifetime substitute. */
+struct FloatingSourceObservation {
+    std::weak_ptr<ITensorGemm> engine;
+    DeviceId device;
+    int expert;
+    MoEExpertProjectionOwnership::Projection projection;
+};
+/**
+ * @brief Observe original sources without retaining a bank or engine across staging.
+ * @param original Same genuine source-bound registry and immutable preparation.
+ * @param transaction Same authored wave selecting actual source experts.
+ * @return Weak engine identities and original coordinates for unchanged-source checks.
+ */
+std::vector<FloatingSourceObservation> observeFloatingSources(const FabricOriginal& original,
+    const MoEOverlayResidencyTransaction& transaction)
+{
+    std::vector<FloatingSourceObservation> result;
+    const std::array<WeightRole,3> roles{WeightRole::MoEExpertGate,WeightRole::MoEExpertUp,WeightRole::MoEExpertDown};
+    for(int id:original.registry->localParticipantIds()) {
+        auto bank=original.registry->endpoint(id)->acquire(1);
+        if(!bank)throw std::runtime_error("Floating Fabric original source bank is absent");
+        const auto* participant=original.authority->snapshot()->placementOwnerMap().participantForId(id);
+        if(!participant)throw std::runtime_error("Floating Fabric original source participant is absent");
+        const auto& layer=bank->layers.front();
+        for(int expert=0;expert<kExperts;++expert)if(layer.resident_mask.at(expert) &&
+            std::any_of(transaction.migrations.begin(),transaction.migrations.end(),
+                [expert](const auto& migration){return migration.expert_id==expert;})) {
+            std::array<std::shared_ptr<ITensorGemm>,3> engines;
+            if(layer.cpu_fragment_family) {
+                const auto& payload=layer.cpu_fragments.at(expert);
+                engines={payload.gate(),payload.up(),payload.down()};
+            } else {
+                const auto& payload=layer.experts.at(expert);
+                engines={payload.gate(),payload.up(),payload.down()};
+            }
+            for(size_t role=0;role<3;++role) {
+                const auto& matrix=original.manifests.front().projections[role];
+                const auto owned=layer.cpu_fragment_family?
+                    layer.cpu_fragment_family->cohort()->ownership(layer.cpu_fragment_family->participantIndex()).projection(roles[role]):
+                    MoEExpertProjectionOwnership::Projection{MoEProjectionResidence::ExpertOwner,matrix.N,matrix.K,0,matrix.N,0,matrix.K};
+                ContiguousFloatingPointWeightDescriptor actual;
+                if(!engines[role] || !engines[role]->exportContiguousFloatingPointWeights(actual) ||
+                    !actual.valid() || actual.type!=TensorType::FP32 ||
+                    actual.n!=owned.rows || actual.k!=owned.columns)
+                    throw std::runtime_error("Floating Fabric requires actual prepared FP32 source geometry/precision");
+                result.push_back({engines[role],participant->device,expert,owned});
+            }
+        }
+    }
+    return result;
+}
+/**
+ * @brief Check every original logical source byte after destination writes complete.
+ * @param sources Weak observations: the actual Fabric bank leases must still own them.
+ */
+void expectFloatingSourcesUnchanged(const std::vector<FloatingSourceObservation>& sources)
+{
+    for(const auto& source:sources) {
+        auto engine=source.engine.lock();ASSERT_TRUE(engine);
+        ContiguousFloatingPointWeightDescriptor bytes;
+        ASSERT_TRUE(engine->exportContiguousFloatingPointWeights(bytes));ASSERT_TRUE(bytes.valid());
+        ASSERT_EQ(bytes.type,TensorType::FP32);
+        const auto& owned=source.projection;
+        ASSERT_EQ(bytes.n,owned.rows);ASSERT_EQ(bytes.k,owned.columns);
+        std::vector<float> downloaded;
+        if(source.device.is_gpu()) {
+            ScopedGPUStream stream(source.device);downloaded.resize(size_t(bytes.n)*bytes.k);
+            auto* backend=getBackendFor(source.device);
+            ASSERT_TRUE(backend->deviceToHost(downloaded.data(),bytes.data,bytes.bytes,source.device.ordinal,stream.get()));
+            ASSERT_TRUE(backend->synchronizeStream(stream.get(),source.device.ordinal));
+        }
+        const auto* values=downloaded.empty()?static_cast<const float*>(bytes.data):downloaded.data();
+        for(int row=0;row<bytes.n;++row)for(int column=0;column<bytes.k;++column)
+            ASSERT_EQ(std::bit_cast<uint32_t>(values[size_t(row)*bytes.k+column]),
+                std::bit_cast<uint32_t>(sourceValue(source.expert,owned.first_row+row,owned.first_column+column,
+                    owned.source_columns,owned.source_rows)));
+    }
+}
+/**
+ * @brief Stage actual floating whole/cohort rectangles in both directions.
+ * @param device Exact CUDA/ROCm whole-owner on rank zero; both ranks retain
+ * their original physical CPU socket/member. No extra GPU-only rank exists.
+ *
+ * Gate/up split F rows and down splits K columns. Full destination-byte checks
+ * detect writes outside each piece when its sibling carries different original
+ * columns. Source banks remain borrowed by real operations until abort/drain.
+ */
+void proveFloatingGPUCohort(DeviceId device)
+{
+    FabricOriginal original(device);
+    ::testing::Test::RecordProperty("physical_sockets",2);::testing::Test::RecordProperty("mpi_ranks",2);
+    ::testing::Test::RecordProperty("source_format","FP32");
+    const auto transaction=original.transaction();ASSERT_TRUE(transaction.valid());
+    ASSERT_EQ(transaction.migrations.size(),2u);
+    const auto sources=observeFloatingSources(original,transaction);
+    ComponentWave wave(original,transaction);
+    auto* gate=delayLastPiece(wave,original,transaction);ASSERT_TRUE(gate);
+    pollComponent(wave,gate);
+    // A finalized prefix cannot satisfy the complete destination triplet.
+    if(original.mpi->rank()==0)
+        for(size_t index=0;index<wave.prepared.migrations.size();++index)
+            if(transaction.migrations[index].expert_id==2)
+                for(const auto& destination:wave.prepared.migrations[index].destination_arrivals) {
+                    MoEOverlayPreparedExpertPayload premature;std::string error;
+                    EXPECT_FALSE(destination.arrival->completePayload(premature,&error));
+                }
+    // Withdraw original lookup owners while the last real piece is still held.
+    // The Fabric's original bank leases, not preparation/cache pointers, must
+    // keep all native source roots alive through this successful completion.
+    auto manager=original.context->concreteWeightManager();
+    manager->clearCache();manager->preparedWeightStore()->clear();manager->expertGemmRegistry().clear();
+    for(int id:original.registry->localParticipantIds()) {
+        auto endpoint=original.registry->endpoint(id);(void)endpoint->retire(1);
+        EXPECT_FALSE(endpoint->acquire(1));
+        const auto readers=endpoint->retiredEpochReaders(1);
+        if(id==original.last_shard) {
+            ASSERT_TRUE(readers);EXPECT_GT(*readers,0u); // The withheld genuine source piece still owns this reader.
+        } else EXPECT_FALSE(readers); // Already-Ready members release their readers immediately.
+    }
+    gate->released=true;pollComponent(wave);
+    expectStableTerminalQueries(wave,*original.remote,ComponentTerminalQuery::TransferReady);
+    for(size_t index=0;index<wave.prepared.migrations.size();++index)
+        for(const auto& destination:wave.prepared.migrations[index].destination_arrivals)
+            expectDestination(original,transaction,index,destination);
+    expectFloatingSourcesUnchanged(sources);
+    for(const auto& migration:wave.prepared.migrations)
+        for(const auto& piece:migration.operations) {
+            SCOPED_TRACE("rank="+std::to_string(original.mpi->rank())+
+                " source="+std::to_string(piece.source_participant)+
+                " destination="+std::to_string(piece.destination_participant)+
+                " projection="+std::to_string(static_cast<int>(piece.projection)));
+            const auto measurement=piece.operation->completedMeasurement();
+            const auto& owners=transaction.previous->placementOwnerMap();
+            const auto* source=owners.participantForId(piece.source_participant);
+            const auto* destination=owners.participantForId(piece.destination_participant);
+            ASSERT_TRUE(source && destination && source->world_rank_known && destination->world_rank_known);
+            if(source->world_rank!=original.mpi->rank() && destination->world_rank!=original.mpi->rank()) {
+                // A rank with no endpoint retains protocol readiness only. It
+                // neither transfers this piece nor invents a timing sample.
+                EXPECT_FALSE(measurement);
+                continue;
+            }
+            ASSERT_TRUE(measurement);
+            EXPECT_TRUE(measurement->valid());
+            EXPECT_EQ(measurement->bytes,uint64_t(kH)*kF*sizeof(float)/2);
+        }
+    const auto stats=original.remote->stats();
+    const uint64_t remote_bytes=uint64_t(3)*kH*kF*sizeof(float)/2;
+    EXPECT_EQ(stats.bytes_sent,remote_bytes);EXPECT_EQ(stats.bytes_received,remote_bytes);
+    EXPECT_EQ(stats.active_mpi_requests,0u);EXPECT_EQ(stats.protocol_failures,0u);
+    EXPECT_EQ(stats.inference_stream_waits,0u);EXPECT_EQ(stats.blocking_synchronizations,0u);
+    wave.abortAndDrain();
+    expectStableTerminalQueries(wave,*original.remote,ComponentTerminalQuery::AbortDrained);
+    EXPECT_EQ(original.authority->snapshot()->epoch,1u);
+    for(int id:original.registry->localParticipantIds()) {
+        auto endpoint=original.registry->endpoint(id);
+        EXPECT_FALSE(endpoint->acquire(2));
+        const auto readers=endpoint->retiredEpochReaders(1);
+        if(readers)EXPECT_EQ(*readers,0u);
+        (void)endpoint->retire(1);
+        EXPECT_FALSE(endpoint->retiredEpochReaders(1));
+    }
+    wave.prepared={};
+    original.fabric.reset();original.registry.reset();original.remote.reset();
+    original.context.reset();manager.reset();
+    for(const auto& source:sources)EXPECT_TRUE(source.engine.expired());
+    for(const auto allocator:{DeviceId::cpu(),device}) {
+        if(allocator.is_gpu() && original.mpi->rank()!=0)continue; // Remote GPU is not a local PMA resource.
+        EXPECT_EQ(original.memory->claimedBytes(allocator,PhysicalMemoryOwner::RoutedExpertWeights,
+            PhysicalMemoryMaterializationKind::NewAllocation),0u);
+        EXPECT_EQ(original.memory->claimedBytes(allocator,PhysicalMemoryOwner::ExpertShadowSlots,
+            PhysicalMemoryMaterializationKind::NewAllocation),0u);
+    }
+}
+/** @brief Unexpected native setup failure must wake its peer before owned resources unwind. */
+void runFloatingGPUCohort(DeviceId device)
+{
+    try { proveFloatingGPUCohort(device); }
+    catch(const std::exception& error) {
+        ADD_FAILURE()<<error.what();MPI_Abort(MPI_COMM_WORLD,2);throw;
+    }
+}
+} // namespace
+#if defined(HAVE_CUDA)
+TEST(MoEOverlayGPUCPUCohortFabric, CUDAFloatingOriginalRectangles)
+{
+    runFloatingGPUCohort(DeviceId::cuda(0));
+}
+#endif
+#if defined(HAVE_ROCM)
+TEST(MoEOverlayGPUCPUCohortFabric, ROCmFloatingOriginalRectangles)
+{
+    runFloatingGPUCohort(DeviceId::rocm(0));
+}
+#endif
 
 } // namespace llaminar2::test

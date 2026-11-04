@@ -313,6 +313,45 @@ fixed placement epoch. Decode/grouped phases, changed-epoch publication, full
 model KL and Release performance still require their own gates. Dynamic cohort
 guards remain unchanged.
 
+## Floating GPU/CPU-cohort physical rectangles
+
+The production floating GPU-to-CPU operation now forwards its admitted
+original-coordinate intersection to the existing transfer lane, matching the
+CPU-to-GPU direction. Previously it invoked the whole-matrix overload, which
+rejected a smaller CPU shard destination. No representation, transport, lane,
+allocation policy or numerical operation changes.
+
+`common-cpu-native199` reproduces the original mismatch on both CUDA and ROCm,
+against the exact unchanged `fc29bff7b` production body. Genuine GPU preparation
+succeeds before that failure. After the fix, `common-cpu-focused203` passes seven
+registrations in 13.91 seconds, with no skips and clean driver evidence: the two
+new native Fabric cases, both existing native rectangular/lane sweeps, the owning
+physical-fabric Unit suite, real MPI consensus controls and 20 repetitions of
+CPU-cohort staging/abort. Builds198/200/202 retain the coherent negative/fixed
+binary progression. Native201's intermediate failure was a fixture expecting a
+timing sample on a rank with neither transfer endpoint; such ranks now explicitly
+require no sample rather than inventing a zero-cost observation.
+
+The new tests use actual prepared FP32 weights, one GPU whole-owner on rank zero,
+and two physical CPU-socket members. Gate/Up F-row slices and Down K-column slices
+move in both directions through the production Fabric. Independent source-coordinate
+checks verify every final logical byte and unchanged source data; CPU one-hot GEMM
+checks remain. Each physical piece carries 49,152 bytes, and each rank sends and
+receives 147,456 MPI payload bytes. A withheld final piece prevents premature
+arrival readiness. With original cache/registry lookups withdrawn, actual source
+owners survive until completion and drain; retired readers, weak engine owners,
+active MPI requests and final/shadow PMA claims all retire cleanly.
+
+The explicit preflight registrations are
+`V2_Integration_CUDA_CPUJointFloatingFabricRectangles` and
+`V2_Integration_ROCm_CPUJointFloatingFabricRectangles`. The broader CPU/MPI
+registration excludes these GPU cases. Actual Fabric preparation here is FP32;
+existing direct-lane sweeps additionally cover FP16/BF16/FP32. This does not claim
+FP16/BF16 whole/cohort model preparation, allocation-padding canaries, changed
+placement publication, graph capture, full-model accuracy or Release economy.
+Only focused checks ran; Dynamic cohort guards and the full-preflight status are
+unchanged.
+
 ## Shared histogram candidate construction
 
 The existing histogram proposal now uses one candidate-construction boundary
