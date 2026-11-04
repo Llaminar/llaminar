@@ -176,6 +176,44 @@ TEST(NativeWindowWriterContract, DirectFinalWritesNeedNoTransientArenaAndFailure
     EXPECT_THROW(failed->finish(),std::logic_error);
 }
 
+/**
+ * @test Integer tables (DeepSeek-V4 token-id hash routing, GGUF "I32") load
+ * verbatim into a resident INT32 root with no staging, and every other use is
+ * rejected. Regression: the bounded CPU loader planned and populated only
+ * floating and NativeVNNI sources and failed deepseek4 startup on its table.
+ */
+TEST(NativeWindowWriterContract, IntegerTablesAreVerbatimResidentOnly)
+{
+    ASSERT_EQ(tensorTypeFromName("I32"), std::optional<TensorType>(TensorType::INT32));
+    EXPECT_FALSE(quoteCPUWeightPreparation(TensorType::INT32,3,6,WeightPrecision::NATIVE,
+        CPUWeightConsumer::ResidentTensor,FloatingActivationOperandPrecision::FP32));
+    EXPECT_THROW(quoteCPUWeightPreparation(TensorType::INT32,3,6,WeightPrecision::NATIVE,
+        CPUWeightConsumer::PreparedGemm,FloatingActivationOperandPrecision::FP32),std::invalid_argument);
+    EXPECT_THROW(quoteCPUWeightPreparation(TensorType::INT32,3,6,WeightPrecision::CONVERT_TO_FP32,
+        CPUWeightConsumer::ResidentTensor,FloatingActivationOperandPrecision::FP32),std::invalid_argument);
+
+    std::array<int32_t,18> table{};
+    for(size_t i=0;i<table.size();++i)table[i]=int32_t(i*37%256)-3;
+    CPUPreparedWeightSource spec{
+        .original={.original_shape={6,3},.original_type=TensorType::INT32,.native_group_elements=1,.native_group_bytes=sizeof(int32_t)},
+        .range={.original_expert=0,.selected_expert_ordinal=0,.first_row=0,.rows=3,.first_column=0,.columns=6,.native_row_bytes=6*sizeof(int32_t)},
+        .consumer=CPUWeightConsumer::ResidentTensor};
+    auto writer=CPUPreparedWeightWriter::begin(spec,CPUWeightStoragePlacement::local());
+    ASSERT_FALSE(writer->stagingRequest());
+    writer->readDirect(spec.range,[&](std::span<std::byte> target){
+        ASSERT_EQ(target.size(),sizeof(table));std::memcpy(target.data(),table.data(),target.size());});
+    auto result=writer->finish();
+    ASSERT_NE(result.final_tensor,nullptr);
+    EXPECT_EQ(result.final_tensor->native_type(),TensorType::INT32);
+    EXPECT_EQ(result.final_tensor->shape(),(std::vector<size_t>{3,6}));
+    EXPECT_EQ(0,std::memcmp(result.final_tensor->raw_data(),table.data(),sizeof(table)));
+
+    auto gemm=spec;gemm.consumer=CPUWeightConsumer::PreparedGemm;
+    EXPECT_THROW(CPUPreparedWeightWriter::begin(gemm,CPUWeightStoragePlacement::local()),std::invalid_argument);
+    auto converted=spec;converted.destination_precision=WeightPrecision::CONVERT_TO_FP32;
+    EXPECT_THROW(CPUPreparedWeightWriter::begin(converted,CPUWeightStoragePlacement::local()),std::invalid_argument);
+}
+
 TEST(NativeWindowWriterContract, ResidentParentsPreserveOriginalRankIncludingSingletonOuterAxes)
 {
     for(const auto type:{TensorType::FP32,TensorType::FP16,TensorType::BF16}) {

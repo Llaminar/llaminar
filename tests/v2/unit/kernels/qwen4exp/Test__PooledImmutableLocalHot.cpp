@@ -278,8 +278,12 @@ TEST(PooledImmutableLocalHot, GeometryKeepsOriginalNativeFormatsAndSeparateCapac
             EXPECT_NE(std::find(unsupported.begin(),unsupported.end(),code),unsupported.end());
         }
     }
-    ASSERT_EQ(formats.size(),23u);
+    // GGUF I32 (26) is a verbatim resident root (DeepSeek-V4 hash routing) in
+    // the loader, but not a pooled local-hot source: the registry keeps the
+    // original 23 formats, whose decoders are all enumerated above.
+    ASSERT_EQ(formats.size(),24u);
     for(const auto format:formats){
+        if (format == GGUFTensorType::I32) continue;
         ImmutableRowTableSource source;source.format=format;source.rows=4096;source.row_elements=256;
         const auto zero=PooledImmutableLocalHotGeometry::declare(source,{0,DeviceId::cuda(0)},32,0,{65536,3,4});
         const auto hot=PooledImmutableLocalHotGeometry::declare(source,{0,DeviceId::cuda(0)},32,4,{65536,3,4});
