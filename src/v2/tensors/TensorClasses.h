@@ -9029,16 +9029,18 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override;
         std::unique_ptr<ITensorGemm> createGemm() override;
 
+        /// Retire this tensor's host bytes; a view retires only itself, a root also revokes its views.
         void release_raw_data() override
         {
             if (!is_view_ && !raw_data_released_)
             {
                 raw_data_.clear();
                 raw_data_.shrink_to_fit();
-                raw_data_released_ = true;
             }
+            raw_data_released_ = true;
         }
-        bool is_raw_data_released() const override { return raw_data_released_; }
+        /** @return True after this tensor or any ancestor retired its host bytes. */
+        bool is_raw_data_released() const override { return raw_data_released_ || (parent_ && parent_->is_raw_data_released()); }
         bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
@@ -9095,12 +9097,16 @@ namespace llaminar2
         static void decodeBlock(const MXFP4Block &block, float *output);
 
     protected:
+        /** @return Host native bytes, or null once this tensor or an ancestor retired them. */
         void *raw_host_data_ptr() override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
+        /** @return Host native bytes, or null once this tensor or an ancestor retired them. */
         const void *raw_host_data_ptr() const override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
@@ -9121,9 +9127,11 @@ namespace llaminar2
         /// Reduction width K.
         size_t cols2d() const { return shape_.size() == 3 ? shape_[0] : shape_[1]; }
         size_t blocksPerRow() const { return (cols2d() + MXFP4Block::BLOCK_SIZE - 1) / MXFP4Block::BLOCK_SIZE; }
+        /// Every block read goes through the retirement-aware accessor and fails fast after release.
         const MXFP4Block &blockAt(size_t row_idx, size_t k_block_offset) const
         {
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             return reinterpret_cast<const MXFP4Block *>(data_ptr)[row_idx * blocksPerRow() + k_block_offset];
         }
 

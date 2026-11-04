@@ -827,7 +827,7 @@ TEST(Test__WorkspaceMemoryEstimator,
 
     size_t expected = 0u;
     size_t exercised_codebooks = 0u;
-    for (int raw = 0; raw <= static_cast<int>(TensorType::AQ8); ++raw)
+    for (int raw = 0; raw <= static_cast<int>(TensorType::MXFP4); ++raw)
     {
         const auto type = static_cast<TensorType>(raw);
         if (!isNativeQuantisedFormat(type) && !isInt8VnniFormat(type))
@@ -840,7 +840,7 @@ TEST(Test__WorkspaceMemoryEstimator,
         EXPECT_EQ(actual, expected) << "codebook=" << tensorTypeName(type);
         ++exercised_codebooks;
     }
-    EXPECT_EQ(exercised_codebooks, 21u)
+    EXPECT_EQ(exercised_codebooks, 22u)
         << "The canonical NativeQuantised predicates must enumerate every supported quantized codebook.";
 }
 
@@ -964,7 +964,7 @@ TEST(Test__WorkspaceMemoryEstimator,
 
     std::size_t expected = 0u;
     std::size_t exercised_codebooks = 0u;
-    for (int raw = 0; raw <= static_cast<int>(TensorType::AQ8); ++raw)
+    for (int raw = 0; raw <= static_cast<int>(TensorType::MXFP4); ++raw)
     {
         const TensorType type = static_cast<TensorType>(raw);
         if (!isNativeQuantisedFormat(type) && !isInt8VnniFormat(type))
@@ -980,7 +980,7 @@ TEST(Test__WorkspaceMemoryEstimator,
         EXPECT_EQ(actual, expected) << "codebook=" << tensorTypeName(type);
         ++exercised_codebooks;
     }
-    EXPECT_EQ(exercised_codebooks, 21u);
+    EXPECT_EQ(exercised_codebooks, 22u);
     // The old observation included 128 half-gate slots in graph workspace.
     // Model-owned prepared gates retire that complete bank, independently of
     // the original quantized expert codebook or the selected router precision.
@@ -1156,7 +1156,7 @@ TEST(Test__WorkspaceMemoryEstimator, ContinuationIncludesCompactQuantizedProject
         {"blk.0.ffn_up_exps.weight", 0, "", size_t(512 * 2048) * 256, 2048, 0},
         {"blk.0.ffn_down_exps.weight", 0, "", size_t(2048 * 512) * 256, 512, 0},
     };
-    for (int raw = 0; raw <= static_cast<int>(TensorType::AQ8); ++raw)
+    for (int raw = 0; raw <= static_cast<int>(TensorType::MXFP4); ++raw)
     {
         const auto type = static_cast<TensorType>(raw);
         if (!isNativeQuantisedFormat(type) && !isInt8VnniFormat(type))
