@@ -15136,7 +15136,8 @@ namespace
         }
     }
 
-    __global__ void swiglu_kernel(float *__restrict__ gate, const float *__restrict__ up, int count)
+    __global__ void swiglu_kernel(float *__restrict__ gate, const float *__restrict__ up, int count,
+                                  float swiglu_limit)
     {
         // Process four contiguous elements per thread via float4 to cut the load/store
         // instruction count 4×. count (= m*intermediate) is not guaranteed to be a
@@ -15146,7 +15147,11 @@ namespace
         if (idx < n4)
         {
             float4 g = reinterpret_cast<float4 *>(gate)[idx];
-            const float4 u = reinterpret_cast<const float4 *>(up)[idx];
+            float4 u = reinterpret_cast<const float4 *>(up)[idx];
+            llaminar2::device_swiglu_contract::clampOperands(g.x, u.x, swiglu_limit);
+            llaminar2::device_swiglu_contract::clampOperands(g.y, u.y, swiglu_limit);
+            llaminar2::device_swiglu_contract::clampOperands(g.z, u.z, swiglu_limit);
+            llaminar2::device_swiglu_contract::clampOperands(g.w, u.w, swiglu_limit);
             g.x = silu(g.x) * u.x;
             g.y = silu(g.y) * u.y;
             g.z = silu(g.z) * u.z;
@@ -15157,7 +15162,26 @@ namespace
         const int tail_base = n4 << 2;
         const int tail_idx = tail_base + idx;
         if (idx < (count & 3) && tail_idx < count)
-            gate[tail_idx] = silu(gate[tail_idx]) * up[tail_idx];
+        {
+            float g = gate[tail_idx];
+            float u = up[tail_idx];
+            llaminar2::device_swiglu_contract::clampOperands(g, u, swiglu_limit);
+            gate[tail_idx] = silu(g) * u;
+        }
+    }
+
+    /** @brief Clamp materialized DeepSeek-V4 SwiGLU operands in place (exact min/max). */
+    __global__ void swiglu_clamp_operands_kernel(
+        float *__restrict__ gate, float *__restrict__ up, int count, float swiglu_limit)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= count)
+            return;
+        float g = gate[idx];
+        float u = up[idx];
+        llaminar2::device_swiglu_contract::clampOperands(g, u, swiglu_limit);
+        gate[idx] = g;
+        up[idx] = u;
     }
 
     __global__ void weighted_add_kernel(float *__restrict__ output, const float *__restrict__ input, float weight, int count)
@@ -18312,7 +18336,8 @@ namespace
         int8_t *__restrict__ A_int8,
         float *__restrict__ scales_A_blockwise,
         int num_active,
-        int K)
+        int K,
+        float swiglu_limit)
     {
         const int slot = blockIdx.x;
         if (slot >= num_active)
@@ -18335,7 +18360,7 @@ namespace
             const int col = block_idx * kBlockSize + lane;
             const float g = gate[col];
             const float value =
-                llaminar2::device_swiglu_contract::swigluValue(g, up[col]);
+                llaminar2::device_swiglu_contract::swigluValue(g, up[col], swiglu_limit);
 
             float abs_value =
 
@@ -18766,7 +18791,8 @@ namespace
         int8_t *__restrict__ swiglu_int8,
         float *__restrict__ swiglu_scales,
         int N,
-        int K)
+        int K,
+        float swiglu_limit)
     {
         const int n = blockIdx.x * kTileN + threadIdx.x;
         const int token_group = blockIdx.y;
@@ -18874,7 +18900,10 @@ namespace
 
             const int slot = first_slot + m;
             // Inactive lanes (n >= N) contribute 0 to the warp absmax and skip the write.
-            const float value = active ? (silu(gate_acc[m]) * up_acc[m]) : 0.0f;
+            float gate_value = gate_acc[m];
+            float up_value = up_acc[m];
+            llaminar2::device_swiglu_contract::clampOperands(gate_value, up_value, swiglu_limit);
+            const float value = active ? (silu(gate_value) * up_value) : 0.0f;
 
             float abs_value =
 
@@ -18907,7 +18936,8 @@ namespace
         int8_t *__restrict__ A_int8,
         float *__restrict__ scales_A_blockwise,
         int total_slots,
-        int K)
+        int K,
+        float swiglu_limit)
     {
         const int block_idx = blockIdx.x;
         const int slot = logical_row_from_grid_yz();
@@ -18917,8 +18947,10 @@ namespace
             return;
 
         const size_t idx = static_cast<size_t>(slot) * K + col;
-        const float g = gate[idx];
-        const float value = silu(g) * up[idx];
+        float g = gate[idx];
+        float u = up[idx];
+        llaminar2::device_swiglu_contract::clampOperands(g, u, swiglu_limit);
+        const float value = silu(g) * u;
 
         float abs_value =
 
@@ -19698,7 +19730,8 @@ namespace
         int original_slot_base,
         int tile_route_slots,
         int N,
-        int k_partitions)
+        int k_partitions,
+        float swiglu_limit)
     {
         constexpr int kTileN = 32;
         const int lane = threadIdx.x;
@@ -19731,6 +19764,7 @@ namespace
             }
         }
 
+        llaminar2::device_swiglu_contract::clampOperands(gate_sum, up_sum, swiglu_limit);
         const float value = active ? (silu(gate_sum) * up_sum) : 0.0f;
         float abs_value =
             llaminar2::device_q8_activation_contract::maximumAbsoluteValue(
@@ -20277,7 +20311,8 @@ namespace
         int d_model,
         int intermediate,
         int num_experts,
-        llaminar2::DeviceMoEWeightFormat format)
+        llaminar2::DeviceMoEWeightFormat format,
+        float swiglu_limit)
     {
         __shared__ float sums[kThreads];
         const int n = static_cast<int>(blockIdx.x);
@@ -20312,7 +20347,7 @@ namespace
                     const float up = up_rows[route][k];
                     const float swiglu =
                         llaminar2::device_swiglu_contract::swigluValue(
-                            gate, up);
+                            gate, up, swiglu_limit);
                     sum = fmaf(
                         swiglu,
                         load_floating_moe_weight(
@@ -20378,7 +20413,8 @@ namespace
         int intermediate,
         int d_model,
         int num_experts,
-        llaminar2::DeviceMoEWeightFormat format)
+        llaminar2::DeviceMoEWeightFormat format,
+        float swiglu_limit)
     {
         namespace warp = llaminar2::device_moe_floating_warp;
         const int lane = threadIdx.x % warp::width;
@@ -20426,7 +20462,7 @@ namespace
         if (lane == 0)
         {
             const size_t index = static_cast<size_t>(grouped_slot) * intermediate + n;
-            grouped_swiglu[index] = ready ? llaminar2::device_swiglu_contract::swigluValue(gate_sum, up_sum) : 0.0f;
+            grouped_swiglu[index] = ready ? llaminar2::device_swiglu_contract::swigluValue(gate_sum, up_sum, swiglu_limit) : 0.0f;
         }
     }
 
@@ -23060,13 +23096,26 @@ extern "C"
         return finishLaunch("cudaMoE_shared_expert_column_gate_add");
     }
 
-    bool cudaMoE_swiglu(float *gate, const float *up, int count, int device_idx, void *stream)
+    bool cudaMoE_swiglu(float *gate, const float *up, int count, int device_idx, void *stream,
+        float swiglu_limit)
     {
         cudaSetDevice(device_idx);
         // One thread per float4 lane; ceil(count/4) threads cover both the vectorized
         // bulk and the (<4) scalar tail.
-        swiglu_kernel<<<blocksFor((count + 3) >> 2), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(gate, up, count);
+        swiglu_kernel<<<blocksFor((count + 3) >> 2), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(gate, up, count, swiglu_limit);
         return finishLaunch("cudaMoE_swiglu");
+    }
+
+    bool cudaMoE_swiglu_clamp_operands(float *gate, float *up, int count, float swiglu_limit,
+                                       int device_idx, void *stream)
+    {
+        if (!gate || !up || count <= 0 || !(swiglu_limit > 0.0f) || !stream)
+            return false;
+        if (cudaSetDevice(device_idx) != cudaSuccess)
+            return false;
+        swiglu_clamp_operands_kernel<<<blocksFor(count), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            gate, up, count, swiglu_limit);
+        return finishLaunch("cudaMoE_swiglu_clamp_operands");
     }
 
     bool cudaMoE_weighted_add(float *output, const float *input, float weight, int count, int device_idx, void *stream)
@@ -24115,7 +24164,8 @@ extern "C"
         int num_experts,
         llaminar2::DeviceMoEWeightFormat format,
         int device_idx,
-        void *stream)
+        void *stream,
+        float swiglu_limit)
     {
         if (!d_gate_rows || !d_up_rows || !d_down_descs || !d_expert_ids ||
             !d_route_weights || (!d_output && !d_canonical_routes) ||
@@ -24145,7 +24195,8 @@ extern "C"
                 d_model,
                 intermediate,
                 num_experts,
-                format);
+                format,
+                swiglu_limit);
         return finishLaunch(
             "cudaMoE_grouped_swiglu_down_floating_decode_table");
     }
@@ -24178,7 +24229,8 @@ extern "C"
         llaminar2::DeviceMoEWeightFormat format,
         int device_idx,
         void *stream,
-        const llaminar2::MoEPrefillProjectionExecution &execution)
+        const llaminar2::MoEPrefillProjectionExecution &execution,
+        float swiglu_limit)
     {
         if ((execution.executesGateUp() && (!d_hidden || !d_gate_descs || !d_up_descs)) ||
             (execution.executesDown() && (!d_down_descs || !d_grouped_weights ||
@@ -24216,7 +24268,8 @@ extern "C"
                     intermediate,
                     d_model,
                     num_experts,
-                    format);
+                    format,
+                    swiglu_limit);
             if (!finishLaunch("cudaMoE_grouped_floating_prefill_gate_up"))
                 return false;
         }
@@ -24459,7 +24512,8 @@ extern "C"
         uint8_t codebook_id,
         int k_partitions,
         int device_idx,
-        void *stream)
+        void *stream,
+        float swiglu_limit)
     {
         const bool valid_k_partitions =
             k_partitions ==
@@ -24479,7 +24533,8 @@ extern "C"
 
         // Step 1: quantize the per-slot SwiGLU activations (shared with serial path).
         grouped_swiglu_quantize_blockwise_kernel<<<num_active, kThreads, 0, cuda_stream>>>(
-            d_gate_ptrs, d_up_ptrs, d_expert_ids, d_swiglu_int8, d_swiglu_scales, num_active, intermediate);
+            d_gate_ptrs, d_up_ptrs, d_expert_ids, d_swiglu_int8, d_swiglu_scales, num_active, intermediate,
+            swiglu_limit);
         if (!finishLaunch("cudaMoE_grouped_swiglu_quantize"))
             return false;
 
@@ -24578,7 +24633,8 @@ extern "C"
         uint8_t codebook_id,
         int k_partitions,
         int device_idx,
-        void *stream)
+        void *stream,
+        float swiglu_limit)
     {
         const bool valid_k_partitions =
             k_partitions ==
@@ -24595,7 +24651,8 @@ extern "C"
         cudaSetDevice(device_idx);
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
         grouped_swiglu_quantize_blockwise_kernel<<<num_active, kThreads, 0, cuda_stream>>>(
-            d_gate_ptrs, d_up_ptrs, d_expert_ids, d_swiglu_int8, d_swiglu_scales, num_active, intermediate);
+            d_gate_ptrs, d_up_ptrs, d_expert_ids, d_swiglu_int8, d_swiglu_scales, num_active, intermediate,
+            swiglu_limit);
         if (!finishLaunch("cudaMoE_grouped_swiglu_runtime_quantize"))
             return false;
 
@@ -24767,7 +24824,8 @@ extern "C"
             imma_gateup_schedule,
         int device_idx,
         void *stream,
-        const llaminar2::MoEPrefillProjectionExecution &execution)
+        const llaminar2::MoEPrefillProjectionExecution &execution,
+        float swiglu_limit)
     {
         // One LUT family producer handles both factor programs; each actual
         // descriptor remains untouched and selects its own source scale.
@@ -24953,7 +25011,8 @@ extern "C"
                         imma_gateup_columns,
                         imma_gateup_schedule,
                         device_idx,
-                        stream))
+                        stream,
+                        swiglu_limit))
                 {
                     return false;
                 }
@@ -25032,7 +25091,7 @@ extern "C"
                         d_gate_partials, d_up_partials, d_original_to_grouped,
                         d_scratch_swiglu_int8, d_scratch_swiglu_scales,
                         original_slot_base, tile_route_slots, intermediate,
-                        gateup_k_partitions);
+                        gateup_k_partitions, swiglu_limit);
                     if (!finishGroupedPrefillLaunch(
                             "cudaMoE_grouped_gate_up_ordered_kpart_reduce_swiglu",
                             cuda_stream))
@@ -25070,7 +25129,7 @@ extern "C"
             <<<grid, block, 0, cuda_stream>>>(                                                         \
                 gateup_input, gateup_scales, source_rows, d_gate_desc_table, d_up_desc_table,          \
                 d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,             \
-                d_scratch_swiglu_int8, d_scratch_swiglu_scales, intermediate, d_model)
+                d_scratch_swiglu_int8, d_scratch_swiglu_scales, intermediate, d_model, swiglu_limit)
     #define LAUNCH_GROUPED_GATEUP_PREFILL(CB)                                                         \
         do {                                                                                          \
             if (fuse_swiglu) {                                                                        \
@@ -25147,7 +25206,7 @@ extern "C"
                 grouped_prefill_swiglu_quantize_blockwise_kernel<<<grid, block, 0, cuda_stream>>>(
                     d_scratch_gate, d_scratch_up,
                     d_scratch_swiglu_int8, d_scratch_swiglu_scales,
-                    total_slots, intermediate);
+                    total_slots, intermediate, swiglu_limit);
                 if (!finishGroupedPrefillLaunch("cudaMoE_grouped_swiglu_quantize_prefill", cuda_stream))
                     return false;
             }

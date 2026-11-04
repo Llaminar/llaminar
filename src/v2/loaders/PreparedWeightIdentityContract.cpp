@@ -34,7 +34,7 @@ namespace llaminar2
         bool rejectedRole(WeightRole role)
         {
             return isImmutableFP32WeightRole(role) || role == WeightRole::ImmutableRowTable ||
-                role == WeightRole::DeepSeekV4HashTable ||
+                isDeepSeekV4NativeOperandRole(role) ||
                 role == WeightRole::Embedding || role == WeightRole::OutputNorm ||
                 role == WeightRole::GDNSsmParam || role == WeightRole::MoERouter ||
                 role == WeightRole::SharedExpertInputGate || role == WeightRole::Norm || role == WeightRole::Bias;

@@ -324,6 +324,8 @@ namespace llaminar2
             TensorBase *up_exps = nullptr;   ///< [num_experts, intermediate, d_model]
             TensorBase *down_exps = nullptr; ///< [num_experts, d_model, intermediate]
             int expert_intermediate = 0;
+            /// DeepSeek-V4 SwiGLU operand clamp (`swiglu_clamp_exp`); 0 = plain SwiGLU.
+            float swiglu_limit = 0.0f;
 
             /**
              * @brief Authority used to resolve executable expert matrices.
@@ -2041,6 +2043,8 @@ namespace llaminar2
             int seq_len = 0;
             int d_model = 0;
             int intermediate = 0;
+            /// DeepSeek-V4 SwiGLU operand clamp (`swiglu_clamp_shexp`); 0 = plain SwiGLU.
+            float swiglu_limit = 0.0f;
 
             BufferId input_buffer_id = BufferId::NORMALIZED;
             BufferId output_buffer_id = BufferId::MOE_SHARED_EXPERT_OUTPUT;

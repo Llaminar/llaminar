@@ -46,6 +46,7 @@
 #include "../../../kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 #include "../../../kernels/cpu/primitives/VectorPrimitives.h"
 #include "../../../kernels/cpu/primitives/SwiGLUPrimitives.h"
+#include "../../../kernels/common/DeviceSwiGLUNumericalContract.h"
 #include "../../../loaders/PreparedWeightStore.h"
 #include "../../../backends/BackendManager.h"
 #include "../../../utils/Assertions.h"
@@ -963,8 +964,18 @@ namespace llaminar2
             FP32Tensor *gate_tensor, FP32Tensor *up_tensor, TensorBase *output,
             ITensorGemm *down_gemm,
             int m, int n, int intermediate,
-            DeviceWorkspaceManager *workspace)
+            DeviceWorkspaceManager *workspace,
+            IMoEKernel *clamp_kernel, float swiglu_limit)
         {
+            // DeepSeek-V4: clamp the materialized operands, then run the unchanged GEMM.
+            if (swiglu_limit > 0.0f &&
+                (!clamp_kernel || !clamp_kernel->clampSwiGLUOperands(
+                                      gate_tensor, up_tensor, m * intermediate, swiglu_limit)))
+            {
+                LOG_ERROR("[MoEExpertComputeStage] SwiGLU operand clamp failed on "
+                          << producer_stage.device().to_string());
+                return false;
+            }
             const bool ok = down_gemm->multiply_tensor_with_fused_swiglu(
                     gate_tensor, up_tensor, output,
                     m, n, intermediate,
@@ -2124,6 +2135,13 @@ namespace llaminar2
     {
         if (!acquireMoEKernelObject())
             return nullptr;
+        /*
+         * The kernel object may be shared (layer router/expert pipeline owner, or
+         * the CPU serial workspace across layers). Every expert stage installs its
+         * own clamp immediately before use, so each launch and each graph capture
+         * records this layer's value.
+         */
+        moe_kernel_->setSwiGLULimit(params_.swiglu_limit);
 
         if (params_.device_id.is_gpu() &&
             params_.routed_pipeline_kernel_owner)
@@ -3918,7 +3936,7 @@ namespace llaminar2
                             scratch_up_batch_[info.batch_idx].get(),
                             scratch_out_.get(),
                             down_gemm, /*m=*/1, d_model, intermediate,
-                            getWorkspace()))
+                            getWorkspace(), ensureMoEKernel(), params_.swiglu_limit))
                     {
                         LOG_ERROR("[MoEExpertComputeStage] CUDA decode SwiGLU/down projection failed for expert "
                                   << info.expert_id << " layer " << params_.layer_idx);
@@ -4074,11 +4092,22 @@ namespace llaminar2
                      * see one route while another sees several, yet both must
                      * materialize the same logical expert activation bytes.
                      */
-                    primitives::compute_swiglu_gpu_aligned_expert_serial(
-                        gate_fp32,
-                        up_fp32,
-                        swiglu_scratch_batch_[i].data(),
-                        intermediate);
+                    if (params_.swiglu_limit > 0.0f)
+                    {
+                        // DeepSeek-V4: same contract program on clamped operands.
+                        for (int c = 0; c < intermediate; ++c)
+                            swiglu_scratch_batch_[i][static_cast<size_t>(c)] =
+                                device_swiglu_contract::swigluValue(
+                                    gate_fp32[c], up_fp32[c], params_.swiglu_limit);
+                    }
+                    else
+                    {
+                        primitives::compute_swiglu_gpu_aligned_expert_serial(
+                            gate_fp32,
+                            up_fp32,
+                            swiglu_scratch_batch_[i].data(),
+                            intermediate);
+                    }
                 }
 
                 // Phase 2b: Use the canonical expert down-projection launcher
@@ -4142,7 +4171,7 @@ namespace llaminar2
                                 /*m=*/1,
                                 d_model,
                                 intermediate,
-                                getWorkspace()))
+                                getWorkspace(), ensureMoEKernel(), params_.swiglu_limit))
                         {
                             LOG_ERROR("[MoEExpertComputeStage] Decode SwiGLU/down projection failed for expert "
                                       << info.expert_id << " layer " << params_.layer_idx);
@@ -5148,7 +5177,8 @@ namespace llaminar2
                         swiglu_q8_blocks_per_row,
                         down_projection_descriptors.data(),
                         down_projection_count, CPUInvocationWorkspace::available<float>(
-                            bound_workspace_, kCPUProjectionPartials)))
+                            bound_workspace_, kCPUProjectionPartials),
+                        params_.swiglu_limit))
             {
                 LOG_ERROR("[MoEExpertComputeStage] CPU NativeVNNI layer-batched "
                           "grouped FFN transaction failed in layer "
@@ -5256,6 +5286,16 @@ namespace llaminar2
                     return false;
                 }
 
+                // Both down variants consume these materialized rows: clamp once.
+                if (params_.swiglu_limit > 0.0f &&
+                    !ensureMoEKernel()->clampSwiGLUOperands(
+                        grouped_scratch_gate.get(), grouped_scratch_up.get(),
+                        expert_rows * intermediate, params_.swiglu_limit))
+                {
+                    LOG_ERROR("[MoEExpertComputeStage] CPU grouped-row SwiGLU operand clamp failed"
+                              << " layer=" << params_.layer_idx);
+                    return false;
+                }
                 const bool down_ok = verifier_rows && expert_rows > 1
                     ? down_gemm->
                           multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
@@ -5277,7 +5317,7 @@ namespace llaminar2
                           expert_rows,
                           d_model,
                           intermediate,
-                          getWorkspace());
+                          getWorkspace(), nullptr, 0.0f);
                 if (!down_ok)
                 {
                     LOG_ERROR("[MoEExpertComputeStage] CPU grouped-row SwiGLU/down projection failed"
@@ -10138,6 +10178,13 @@ namespace llaminar2
                 execution.publish(projection.output);
         }
 
+        if (params_.swiglu_limit > 0.0f &&
+            !ensureMoEKernel()->clampSwiGLUOperands(
+                scratch_gate_, scratch_up_, params_.seq_len * intermediate, params_.swiglu_limit))
+        {
+            LOG_ERROR("[SharedExpertFFNStage] Shared SwiGLU operand clamp failed");
+            return false;
+        }
         if (!cached_down_gemm_->multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
                 scratch_gate_,
                 scratch_up_,
@@ -10381,7 +10428,7 @@ namespace llaminar2
                 *this,
                 scratch_gate_, scratch_up_, params_.output,
                 cached_down_gemm_, seq_len, d_model, intermediate,
-                getWorkspace()))
+                getWorkspace(), ensureMoEKernel(), params_.swiglu_limit))
         {
             LOG_ERROR("[SharedExpertFFNStage] Shared SwiGLU/down projection failed");
             return false;
@@ -10397,6 +10444,9 @@ namespace llaminar2
             owned_moe_kernel_ = KernelFactory::createMoEKernel(params_.device_id);
             moe_kernel_ = owned_moe_kernel_.get();
         }
+        // Grouped shared-expert routes evaluate SwiGLU inside this kernel.
+        if (moe_kernel_)
+            moe_kernel_->setSwiGLULimit(params_.swiglu_limit);
         if (params_.device_id.is_gpu() &&
             shouldUseGroupedVerifierPrefillRoute() &&
             params_.required_router_q8_publication)
@@ -10508,7 +10558,22 @@ namespace llaminar2
         }
 
         if (!shouldUseGroupedDecodeRoute())
+        {
+            /*
+             * The ordinary route issues gate/up through one fused two-projection
+             * submission. Its auxiliary streams/events are context-owned and must
+             * exist before capture; this stage provisions them itself rather than
+             * relying on an earlier FusedQKV/GDN stage of the same graph.
+             */
+            if (!cached_gate_gemm_->prepareFusedProjectionGraphCapture(2))
+            {
+                LOG_ERROR("[SharedExpertFFNStage] Failed to provision fused gate/up "
+                          "projection resources before graph capture"
+                          << " device=" << params_.device_id.to_string());
+                return false;
+            }
             return true;
+        }
 
         if (!ensureSharedGroupedGateUpDescriptorTable(
                 kernel, params_.d_model, params_.intermediate) ||

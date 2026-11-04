@@ -7738,6 +7738,9 @@ namespace llaminar2
                 expert_params.down_exps = layer.moe_down_exps;
                 expert_params.expert_intermediate = expert_intermediate;
                 expert_params.layer_idx = layer_idx;
+                // DeepSeek-V4 clamps routed-expert SwiGLU operands per layer.
+                expert_params.swiglu_limit = config_.deepseek_v4
+                    ? config_.deepseek_v4->layer(layer_idx).swigluLimit : 0.0f;
                 expert_params.routing_indices = routing_indices;
                 expert_params.routing_weights = routing_weights;
                 expert_params.routing_indices_buffer_id = buffers.idFor(BufferId::MOE_EXPERT_INDICES);
@@ -10371,6 +10374,8 @@ namespace llaminar2
                     local_params.d_model = config_.d_model;
                     local_params.expert_intermediate = expert_intermediate;
                     local_params.layer_idx = layer_idx;
+                    local_params.swiglu_limit = config_.deepseek_v4
+                        ? config_.deepseek_v4->layer(layer_idx).swigluLimit : 0.0f;
                     local_params.expert_mask = std::move(participant_mask);
                     local_params.prepared_store = prepared_weight_store_;
                     local_params.physical_memory_authority = prepared_weight_store_
@@ -11412,6 +11417,8 @@ namespace llaminar2
                             local_params.d_model = config_.d_model;
                             local_params.expert_intermediate = expert_intermediate;
                             local_params.layer_idx = layer_idx;
+                            local_params.swiglu_limit = config_.deepseek_v4
+                                ? config_.deepseek_v4->layer(layer_idx).swigluLimit : 0.0f;
                             local_params.expert_mask = std::move(participant_mask);
                             local_params.prepared_store = prepared_weight_store_;
                             local_params.physical_memory_authority = prepared_weight_store_
@@ -13734,6 +13741,8 @@ namespace llaminar2
 
             SharedExpertFFNStage::Params shared_params;
             shared_params.device_id = shared_device;
+            shared_params.swiglu_limit = config_.deepseek_v4
+                ? config_.deepseek_v4->layer(layer_idx).sharedSwigluLimit : 0.0f;
             shared_params.input = buffers.normalized;
             shared_params.gate_w = layer.shared_expert_gate;
             shared_params.up_w = layer.shared_expert_up;

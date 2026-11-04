@@ -606,7 +606,8 @@ bool workspaceOwnsTensorImpl(
     const WorkspaceMemoryGeometry& geometry)
 {
     const auto role = inferWeightRole(tensor.name);
-    if (role == WeightRole::ImmutableRowTable || isImmutableFP32WeightRole(role)) return false;
+    if (role == WeightRole::ImmutableRowTable || isImmutableFP32WeightRole(role) ||
+        isDeepSeekV4NativeOperandRole(role)) return false;
     if (tensor.layer_index < 0)
     {
         if (isEmbeddingWeight(tensor.name))
@@ -1781,6 +1782,11 @@ WorkspaceRequirements exactAttentionMemberRequirements(
     const ModelMemoryProfile& profile,
     const WorkspaceMemoryGeometry& geometry)
 {
+    // DeepSeek-V4 builds no AttentionComputeStage: its sparse MQA kernel owns
+    // arena-declared scratch (DeepSeekV4BufferLayout), so no FA2/split-decode
+    // workspace exists to admit.
+    if (profile.deepseek_v4)
+        return {};
     const bool has_exact_local_query_heads =
         geometry.local_query_heads > 0;
     if (geometry.device_compute_units <= 0 || geometry.batch_size <= 0 ||

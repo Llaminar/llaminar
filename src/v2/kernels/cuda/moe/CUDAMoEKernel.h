@@ -54,6 +54,8 @@ namespace llaminar2
         void setRouterScoringPolicy(const MoERouterScoringPolicy &policy) override { router_scoring_ = policy; }
         /** @copydoc IMoEKernel::setSwiGLULimit */
         void setSwiGLULimit(float limit) override { swiglu_limit_ = limit; }
+        /** @copydoc IMoEKernel::clampSwiGLUOperands */
+        bool clampSwiGLUOperands(ITensor *gate, ITensor *up, int count, float limit) override;
 
         /// @brief Construct a CUDA MoE kernel bound to one CUDA ordinal.
         explicit CUDAMoEKernel(int device_ordinal);

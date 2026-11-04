@@ -948,7 +948,7 @@ namespace llaminar2
     bool WeightManager::isGemmWeight(const std::string &name) const
     {
         const auto role = inferWeightRole(name);
-        if (role == WeightRole::ImmutableRowTable || role == WeightRole::DeepSeekV4HashTable ||
+        if (role == WeightRole::ImmutableRowTable || isDeepSeekV4NativeOperandRole(role) ||
             isImmutableFP32WeightRole(role)) return false;
         if (isFlashNextProjectionRole(role)) return true;
         if (!has_sharding_config_)
@@ -1252,6 +1252,14 @@ namespace llaminar2
                 std::vector<uint16_t> fp16_data(raw_data.size() / 2);
                 std::memcpy(fp16_data.data(), raw_data.data(), raw_data.size());
                 return std::make_unique<FP16Tensor>(shape, fp16_data);
+            }
+            case TensorType::INT32:
+            {
+                // Exact integer tables (DeepSeek-V4 token-id hash routing).
+                AlignedVector<int32_t> values;
+                values.resize_uninitialized(raw_data.size() / sizeof(int32_t));
+                std::memcpy(values.data(), raw_data.data(), values.size() * sizeof(int32_t));
+                return std::make_unique<INT32Tensor>(shape, std::move(values));
             }
             default:
                 throw std::runtime_error("[WeightManager] Unsupported tensor type for createTensorFromRawData: " +

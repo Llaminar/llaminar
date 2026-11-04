@@ -304,6 +304,29 @@ namespace llaminar2
                 throw std::invalid_argument("MoE SwiGLU clamp is not implemented by this backend");
         }
 
+        /**
+         * @brief Clamp materialized FP32 gate/up projections in place (DeepSeek-V4).
+         *
+         * Used where a backend-independent fused SwiGLU/down GEMM consumes
+         * already materialized gate/up rows: clamping the operands first
+         * (`gate = min(gate, limit)`, `up = clamp(up, -limit, limit)`) yields
+         * exactly the clamped SwiGLU without changing the GEMM's arithmetic.
+         * The launch is ordered on this kernel's bound stream.
+         *
+         * @param gate Contiguous FP32 gate rows on this kernel's device.
+         * @param up Contiguous FP32 up rows on this kernel's device.
+         * @param count Elements to clamp from the start of both tensors.
+         * @param limit Positive clamp; <= 0 is a no-op that launches nothing.
+         * @return false on invalid bindings or launch failure.
+         */
+        virtual bool clampSwiGLUOperands(ITensor *gate, ITensor *up, int count, float limit)
+        {
+            (void)gate; (void)up; (void)count;
+            if (limit > 0.0f)
+                throw std::invalid_argument("MoE SwiGLU operand clamp is not implemented by this backend");
+            return true;
+        }
+
         ~IMoEKernel() override = default;
 
         // =================================================================

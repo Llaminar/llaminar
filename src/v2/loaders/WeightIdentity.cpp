@@ -52,6 +52,7 @@ namespace llaminar2
         case WeightRole::PerLayerEmbeddingConvolution: return "PerLayerEmbeddingConvolution";
         case WeightRole::PredictorProjection: return "PredictorProjection";
         case WeightRole::DeepSeekV4Operator: return "DeepSeekV4Operator";
+        case WeightRole::DeepSeekV4NativeProjection: return "DeepSeekV4NativeProjection";
         case WeightRole::DeepSeekV4HashTable: return "DeepSeekV4HashTable";
 
         }
@@ -162,6 +163,7 @@ namespace llaminar2
             stem == "output_hc_scale.weight" || stem == "exp_probs_b.bias" || stem == "exp_probs_b_vl.bias")
             return WeightRole::DeepSeekV4Operator;
         if (stem == "ffn_gate_tid2eid.weight") return WeightRole::DeepSeekV4HashTable;
+        if (stem == "attn_output_a.weight") return WeightRole::DeepSeekV4NativeProjection;
         if (name == "token_embd.weight") return WeightRole::Embedding;
         if (name == "output.weight") return WeightRole::LMHead;
         if (name == "output_norm.weight") return WeightRole::OutputNorm;
