@@ -599,6 +599,37 @@ Complete cohort service/rooted-return pricing and changed-epoch
 publication/inference remain open. No model arithmetic, KL limit, serving-time
 Dynamic cohort guard or Release performance claim changes in these slices.
 
+## Prepared complete-target CPU service measurement
+
+The existing prepared-service producer now measures a real CPU tensor-sharded
+target using its original source, fragment banks, PMA and native domain. The
+root interval includes start release, fragment FFNs, rooted gather/combine and
+the canonical output fold. Input-ready rendezvous, serving dispatch and device
+ingress/return are excluded. Contributors emit no duplicate price or logical
+row count. Existing whole-expert prepared computation remains the control.
+This is passive setup evidence, not an installed economy price or permission
+to enable dynamic cohort movement.
+
+Build241 compiles the production producer and owning fixtures. The first
+`focused242` invocation passed the native computation and retirement once,
+then exposed two fixture errors: a missing owner map in the host rejection
+case, and GTest repetition attempting to reinitialize finalized MPI. Build243
+repairs the fixtures and repeats twenty complete source/domain lifetimes inside
+one original MPI session, one rank per physical socket. In `focused244`,
+`CPUJointPreparedComputeOriginalDomainContract` passes in 0.33 seconds and
+`CPUJointPreparedComputeService` in 11.76 seconds, with no skips and a clean
+driver window. Prefill, decode and grouped-verifier outputs match the independent
+tiny-source FP32 oracle; dirty tails, source expiry and per-probe/final PMA
+retirement pass. Both regressions are explicitly registered in production
+preflight. The same batch's unrelated CUDA reader-ACK fixture remained red;
+this is a scoped CPU result, not a claim that the complete batch was green.
+
+Receipts remain under `/tmp/qfn-cpu-joint-qualified-r224/`, including
+`prepared-service244-evidence.json`. Full preflight, new model KL and Release
+performance were not run. Next, the existing composer and transaction objective
+must consume complete-target prepared costs without mixing them with live
+dispatch-inclusive measurements or counting a sharded target once per member.
+
 ## Shared histogram candidate construction
 
 The existing histogram proposal now uses one candidate-construction boundary
