@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 
 #include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+#include "kernels/common/NativeVnniScaleLoad.h"
 #include "tensors/MXFP4Format.h"
 #include "tensors/NativeVnniFormatInfo.h"
 #include "tensors/Tensors.h"
@@ -23,7 +24,9 @@
 #include "loaders/gpu_pipeline/RepackFormat.h"
 #include "utils/CPUProjectionTestWorkspace.h"
 
+#include <array>
 #include <cmath>
+#include <immintrin.h>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -160,6 +163,126 @@ TEST(MXFP4Format, PowerOfTwoBF16WordIsExactAndValidated)
     // Every admitted exponent keeps the largest decodable weight finite.
     EXPECT_TRUE(std::isfinite(12.0f * mxfp4::scaleFP32(mxfp4::kMaxNativeE8M0Exponent)));
     EXPECT_FALSE(std::isfinite(12.0f * mxfp4::scaleFP32(mxfp4::kMaxNativeE8M0Exponent + 1)));
+}
+
+namespace
+{
+    /** @brief One 64-column CPU NibbleLUT unit whose primary words are @p words. */
+    cpu::native_vnni::CPUNativeVNNIPackedWeights cpuUnitWithScales(
+        const std::array<uint16_t, 64> &words, cpu::native_vnni::CPUNativeVNNIScaleEncoding encoding)
+    {
+        using namespace cpu::native_vnni;
+        CPUNativeVNNIPackedWeights packed;
+        packed.N = packed.N_padded = 64;
+        packed.K = 32;
+        packed.blocks_per_row = 1;
+        packed.payload_bytes = 16;
+        packed.codebook_id = kNativeVnniMXFP4Codebook;
+        packed.encoding = CPUNativeVNNIEncoding::NibbleLUT;
+        packed.scale_encoding = encoding;
+        packed.data_stride = static_cast<int>(preparedDataStride(packed.encoding));
+        packed.interleaved_block_stride =
+            static_cast<int>(preparedInterleavedBlockStride(packed.encoding, false));
+        packed.native_interleaved.resize(static_cast<size_t>(packed.interleaved_block_stride), uint8_t{0});
+        std::memcpy(const_cast<uint16_t *>(packed.chunkScales(0, 0)), words.data(), sizeof(words));
+        return packed;
+    }
+
+    /** @brief Expected FP32 bits of every column through the loader under test. */
+    template <class Load>
+    void expectColumns(const cpu::native_vnni::CPUNativeVNNIPackedWeights &packed,
+                       const std::array<uint32_t, 64> &expected, Load load)
+    {
+        for (int column = 0; column < 64; ++column)
+            EXPECT_EQ(bits(packed.blockScale(0, 0, column)), expected[column]) << "blockScale col " << column;
+        load(packed.chunkScales(0, 0), expected);
+    }
+} // namespace
+
+TEST(MXFP4CPUScaleLoaders, PowerOfTwoBF16AndFP16WordsWidenExactlyOnEveryISA)
+{
+    using namespace cpu::native_vnni;
+    // Every admitted native exponent plus the zero marker, 64 per unit.
+    std::vector<uint8_t> exponents{0};
+    for (int e = mxfp4::kMinNormalFP32Exponent; e <= mxfp4::kMaxNativeE8M0Exponent; ++e)
+        exponents.push_back(static_cast<uint8_t>(e));
+    auto vector_check = [](const uint16_t *primary, const std::array<uint32_t, 64> &expected,
+                           const CPUNativeVNNIPackedWeights &packed)
+    {
+#if defined(__AVX512F__)
+        for (int group = 0; group < 4; ++group)
+        {
+            alignas(64) float out[16];
+            _mm512_store_ps(out, packed.loadScales512(primary + group * 16));
+            for (int lane = 0; lane < 16; ++lane)
+                EXPECT_EQ(bits(out[lane]), expected[group * 16 + lane]) << "512 col " << group * 16 + lane;
+        }
+#endif
+#if defined(__AVX2__)
+        for (int group = 0; group < 8; ++group)
+        {
+            alignas(32) float out[8];
+            _mm256_store_ps(out, packed.loadScales256(primary + group * 8));
+            for (int lane = 0; lane < 8; ++lane)
+                EXPECT_EQ(bits(out[lane]), expected[group * 8 + lane]) << "256 col " << group * 8 + lane;
+        }
+#endif
+        (void)primary; (void)expected; (void)packed;
+    };
+    for (size_t first = 0; first < exponents.size(); first += 64)
+    {
+        std::array<uint16_t, 64> words{};
+        std::array<uint32_t, 64> expected{};
+        for (int column = 0; column < 64; ++column)
+        {
+            const uint8_t e = exponents[(first + column) % exponents.size()];
+            words[column] = mxfp4::powerOfTwoBF16Word(e);
+            expected[column] = e == 0 ? 0u : mxfp4::normalScaleFP32Bits(e);
+        }
+        const auto packed = cpuUnitWithScales(words, CPUNativeVNNIScaleEncoding::PowerOfTwoBF16);
+        expectColumns(packed, expected, [&](const uint16_t *p, const auto &x) { vector_check(p, x, packed); });
+    }
+    // FP16 (every existing matrix, including rotated source-25 weights) is unchanged.
+    std::array<uint16_t, 64> half_words{};
+    std::array<uint32_t, 64> half_expected{};
+    for (int column = 0; column < 64; ++column)
+    {
+        half_words[column] = static_cast<uint16_t>(0x0001u + column * 0x01f3u); // subnormals through 2^15 range
+        half_expected[column] = bits(fp16_to_fp32(half_words[column]));
+    }
+    const auto fp16 = cpuUnitWithScales(half_words, CPUNativeVNNIScaleEncoding::FP16);
+    expectColumns(fp16, half_expected, [&](const uint16_t *p, const auto &x) { vector_check(p, x, fp16); });
+    // The same words read as FP16 would not be the native scale: the tag, not the codebook, decides.
+    const auto mistagged = cpuUnitWithScales({mxfp4::powerOfTwoBF16Word(128)}, CPUNativeVNNIScaleEncoding::FP16);
+    EXPECT_NE(bits(mistagged.blockScale(0, 0, 0)), mxfp4::normalScaleFP32Bits(128));
+}
+
+TEST(MXFP4ScaleCarrier, StagedWordsDecodeExactlyAndFP16CallbacksAreUntouched)
+{
+    // Direct and staged decode agree for every admitted byte and the zero marker.
+    for (int e : {0, 2, 103, 104, 128, 129, 143, 144, 252})
+    {
+        const auto byte = static_cast<uint8_t>(e);
+        const uint16_t staged = mxfp4::powerOfTwoBF16Word(byte);
+        const float decoded = native_vnni_scale::floatFromBits(uint32_t{staged} << 16);
+        EXPECT_EQ(bits(decoded), e == 0 ? 0u : mxfp4::normalScaleFP32Bits(byte)) << e;
+        EXPECT_EQ(bits(native_vnni_scale::e8m0Scale(byte)), bits(decoded)) << e;
+    }
+    // e = 129 (scale 2) stages as 0x4000: a staged word is never re-read as a raw byte.
+    EXPECT_EQ(mxfp4::powerOfTwoBF16Word(129), 0x4000u);
+    // 2-byte planes pass the original FP16 word to the caller's widening, unchanged.
+    const uint16_t plane[3] = {0x3c00u, 0x0001u, 0x7bffu};
+    int calls = 0;
+    const auto widen = [&](uint16_t word) { ++calls; return fp16_to_fp32(word); };
+    for (size_t linear = 0; linear < 3; ++linear)
+    {
+        EXPECT_EQ(native_vnni_scale::loadStagedPrimary<4>(plane, linear), plane[linear]);
+        EXPECT_EQ(bits(native_vnni_scale::primaryScale<4>(plane, linear, widen)),
+                  bits(fp16_to_fp32(plane[linear])));
+        EXPECT_EQ(bits(native_vnni_scale::primaryScale(uint8_t{4}, plane, linear, widen)),
+                  bits(fp16_to_fp32(plane[linear])));
+    }
+    EXPECT_EQ(calls, 6);
 }
 
 TEST(MXFP4Format, CatalogAndRepackIdentity)
