@@ -97,8 +97,8 @@ void rootedPaddedPrefillContract(DeviceId device) {
  auto residency=std::make_shared<MoEOverlayParticipantResidencyRegistry>(MoEOverlayParticipantResidencyRegistry::Config{
   .local_participant_ids={selected->participant().participant_id},.num_layers=1,.num_experts=experts,.initial_epoch=1,
   .projection_preparation=original,.first_model_layer=0,.original_model=model});
- std::string error;ASSERT_TRUE(residency->registerInitialCPUJointLayer(manager.expertGemmRegistry(),model,
-  selected->participant().participant_id,0,&error))<<error;
+ std::string error;ASSERT_TRUE(residency->registerInitialCPUJointBank(manager.expertGemmRegistry(),model,
+  selected->participant().participant_id,&error))<<error;
  const auto layer=residency->initialCPUJointLayer(selected->participant().participant_id,0);ASSERT_TRUE(layer);
  auto arena=std::make_shared<MoELocalExpertSerialBufferArena>(MoELocalExpertSerialBufferArena::Config{
   .device_id=DeviceId::cpu(),.row_capacity=rows,.row_capacity_buckets={rows},.d_model=hidden,.routing_top_k=top_k,

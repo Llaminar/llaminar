@@ -468,7 +468,7 @@ namespace llaminar2
                 }
                 if (snapshot.ownershipKind() == MoEOverlayResidencyOwnershipKind::CPUJointFragments)
                 {
-                    const auto& owners = snapshot.originalOwnerMap();
+                    const auto& owners = snapshot.placementOwnerMap();
                     bool whole = false;
                     for (const auto& entry : tier->entries)
                     {

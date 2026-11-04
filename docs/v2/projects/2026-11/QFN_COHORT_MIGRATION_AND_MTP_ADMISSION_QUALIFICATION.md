@@ -31,11 +31,70 @@ passes; incompatible original matrices do not. The existing whole-owner and
 residency-authority unit suites also pass. These tests create no extra MPI
 ranks or artificial physical sockets.
 
-Dynamic joint snapshots, prepared-bank replacement, complete physical-fragment
-endpoint wiring, publication and reader retirement remain unresolved. Their
-runtime guards are unchanged. Metadata correctness alone does not admit a
-dynamic execution mode. The broader design remains in
+Source-authenticated joint placement snapshots and CPU fragment epoch banks
+now pass their component contracts. Complete physical-fragment endpoint wiring,
+live captured membership, global publication and retirement remain unresolved.
+Their runtime guards are unchanged. Component correctness alone does not admit
+a dynamic execution mode. The broader design remains in
 [the dynamic residency plan](QFN_SHARDED_EXPERT_DYNAMIC_RESIDENCY_PLAN.md).
+
+## CPU fragment epoch-bank foundation
+
+The existing participant residency registry now owns typed whole or CPU-fragment
+payloads. A fragment retains its original model/preparation, cohort member and
+three actual prepared engines. Live placement is separate from immutable source
+ownership; an incoming candidate cannot substitute a matching-looking foreign
+source or change the admitted cuts and quotas. Existing dispatch readers borrow
+the actual epoch bank. Cold graph metadata no longer permanently pins retired
+engine roots.
+
+Projection completion now checks disjoint, exact destination coverage and waits
+for every original operation before publication. An installed-bank arrival
+authenticates the actual installed fragment and starts unready; installation
+alone does not prove completed copies or globally current placement. The whole
+path uses the same completion mechanism for its singleton operation.
+
+Integration exposed a genuine multi-layer startup defect: the graph builder
+borrowed a CPU bank after registering only one layer, before the complete bank
+could be installed. Both production callers now use one complete initial-bank
+prepass, with atomic installation before any graph layer borrows it. The old
+per-layer registration API is removed. Repeated graph-family construction
+authenticates the same installed bank without rebuilding it or resurrecting
+retired initial state. Tests cover multiple layers, foreign source owners,
+post-retirement inspection, incoming expert execution and delayed old readers.
+Two fixture defects were also repaired: independent temporary model files now
+have independent lifetimes, and NUMA allocations declare their exact physical
+root sizes instead of using a heap-only test budget.
+
+Five focused contracts are explicitly registered in `ProductionTestPreflight`:
+`PreparedProjectionIntersectionContract`, `CPUFragmentPayloadContract`,
+`CPUJointPlacementCandidateContract`, `CPUFragmentEpochBankContract` and
+`CPUJointInitialBankPrepassContract` (all with the `V2_Integration_` prefix).
+`common-cpu-host147` passes all 13 selected registrations in 9.43 seconds,
+including the owning Unit suites and 20 repeats of these contracts.
+`common-cpu-native148` passes four native registrations in 11.05 seconds:
+MPI residency consensus, the six-GPU CUDA/ROCm controller-fabric control, and
+both backend CPU-joint padded-prefill contracts. No cases skip; driver windows
+are clean. Build144 builds the coherent production and test targets; build146
+refreshes the corrected registry fixture.
+
+The final real-model control, `common-cpu-exact149`, passes in 287.94 seconds
+on one MI50 plus two physical CPU sockets, with one MPI rank and 28 physical
+workers per socket, 64 GPU/448 CPU experts, RAM ngrams and dynamic MTP capacity
+three. All 3,624 verifier comparisons, 900 row-zero comparisons and six integer
+records are byte-exact across six checkpoints. Acceptance and three dynamic
+controller windows produce exact serial tokens; four exact-M3 follower
+transactions complete. Both runners retire, the GPU allocation ledger falls
+from 18,720,329,732 bytes to zero, and driver diagnostics are clean. After
+retirement, 716,017,664 allocated bytes of owned prefix artifacts are removed.
+CSV, rank and cleanup evidence remain under
+`/tmp/qfn-cpu-joint-mtp-exact-r371/dynamic/`; focused driver/build receipts are
+under `/tmp/qfn-cpu-joint-qualified-r224/`.
+
+This is native serial/grouped correctness with **Static expert placement** and
+dynamic MTP. It is not a fresh PyTorch KL panel, dynamic expert-movement proof,
+Release performance result or full-preflight certificate. Complete preflight67
+remains unqualified; the user requested scoped validation for this slice.
 
 The original prepared-source binding is now installed at the existing model
 producer boundaries. It authenticates the actual `ModelContext`, concrete

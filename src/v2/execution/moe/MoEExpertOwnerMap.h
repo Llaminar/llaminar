@@ -195,6 +195,20 @@ namespace llaminar2
             const std::vector<MoEOverlayLayerWeightManifest>& manifest);
 
         /**
+         * @brief Derive a capacity-preserving live placement with fixed original CPU cohorts.
+         * @param plan Candidate tier assignments with the unchanged declared topology.
+         * @param previous Real previous live placement, retaining stable whole owners.
+         * @param original Immutable source placement owning the original cohort/cut identities.
+         * @return One canonical live map; no source selection or physical readiness is minted.
+         * @throws std::invalid_argument For foreign topology, geometry, quotas or cohort
+         * identities.
+         * @note Original cohorts are shared, never rebuilt from candidate expert IDs.
+         */
+        static MoEExpertOwnerMap buildShardTransition(const MoERoutedExpertPlacementPlan &plan,
+                                                      const MoEExpertOwnerMap &previous,
+                                                      const MoEExpertOwnerMap &original);
+
+        /**
          * @param layer_idx Original model-global layer.
          * @param expert_id Original expert ID.
          * @return The canonical logical placement, explicitly including any shard cohort, or null.

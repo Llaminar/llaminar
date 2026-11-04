@@ -3589,8 +3589,9 @@ namespace llaminar2
     {
         for (auto &migration : prepared.migrations)
         {
-            for (auto &projection : migration.projections)
+            for (auto &piece : migration.operations)
             {
+                auto &projection = piece.operation;
                 if (projection)
                     projection->abort();
             }
@@ -3620,8 +3621,9 @@ namespace llaminar2
             bool complete = true;
             for (auto &migration : prepared.migrations)
             {
-                for (auto &projection : migration.projections)
+                for (auto &piece : migration.operations)
                 {
+                    auto &projection = piece.operation;
                     if (!projection)
                         continue;
                     std::string ignored;
@@ -4197,17 +4199,18 @@ namespace llaminar2
             return true;
         };
 
-        const std::size_t operation_count =
-            prepared.migrations.size() * kMoEOverlayExpertProjectionCount;
+        // Index only actual submitted physical operations, including source-only
+        // protocol work; logical migration count is not a transfer extent.
+        std::vector<std::unique_ptr<IMoEOverlayTierTransferOperation> *> operations;
+        for (auto &migration : prepared.migrations)
+            for (auto &piece : migration.operations)
+                operations.push_back(&piece.operation);
+        const std::size_t operation_count = operations.size();
         std::vector<std::uint8_t> projection_ready(operation_count, 0u);
         const auto operationAt = [&](std::size_t operation)
             -> std::unique_ptr<IMoEOverlayTierTransferOperation> &
         {
-            const std::size_t migration =
-                operation / kMoEOverlayExpertProjectionCount;
-            const std::size_t projection =
-                operation % kMoEOverlayExpertProjectionCount;
-            return prepared.migrations[migration].projections[projection];
+            return *operations.at(operation);
         };
         const auto pollOperation = [&](std::size_t operation,
                                        std::string *poll_error)

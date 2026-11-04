@@ -131,19 +131,19 @@ TEST(CPUJointStaticResidency, FragmentPublicationEpochIdentityAndFinalSourceRete
  EXPECT_EQ(banks.localParticipantIds(),std::vector<int>{id});EXPECT_FALSE(banks.allInitialBanksReady());
  ExpertGemmRegistry engines;std::string error;
  EXPECT_TRUE(banks.isCPUJointParticipant(id));EXPECT_FALSE(banks.isCPUJointParticipant(all[size_t(1-rank)]));
- EXPECT_THROW(banks.endpoint(id),std::logic_error);
+ EXPECT_TRUE(banks.endpoint(id));
  EXPECT_THROW(banks.initialCPUJointLayer(id,7),std::logic_error);
- EXPECT_FALSE(banks.registerInitialCPUJointLayer(engines,ModelContextId{156},id,7,&error));
+ EXPECT_FALSE(banks.registerInitialCPUJointBank(engines,ModelContextId{156},id,&error));
  const auto* participant=original.preparation->cpuJointOwnerMap()->participantForId(id);ASSERT_NE(participant,nullptr);
  const auto selected=original.preparation->cpuShardSourceFor(7,*participant);auto sources=jointSources(selected);
  sources.registerInto(engines,0,1);
- EXPECT_FALSE(banks.registerInitialCPUJointLayer(engines,ModelContextId{155},id,7,&error));
+ EXPECT_FALSE(banks.registerInitialCPUJointBank(engines,ModelContextId{155},id,&error));
  EXPECT_THROW(banks.initialCPUJointLayer(id,7),std::logic_error);
  sources.registerInto(engines,1);
- ASSERT_TRUE(banks.registerInitialCPUJointLayer(engines,ModelContextId{155},id,7,&error))<<error;
- const auto first=banks.initialCPUJointLayer(id,7);ASSERT_TRUE(first);ASSERT_TRUE(first->source());
- EXPECT_EQ(first->epoch(),29u);EXPECT_EQ(first->participantId(),id);EXPECT_EQ(first->source()->cpu_joint_source,selected);
- ASSERT_TRUE(banks.registerInitialCPUJointLayer(engines,ModelContextId{155},id,7,&error));
+ ASSERT_TRUE(banks.registerInitialCPUJointBank(engines,ModelContextId{155},id,&error))<<error;
+ const auto first=banks.initialCPUJointLayer(id,7);ASSERT_TRUE(first);ASSERT_TRUE(first->sourceSelection());
+ EXPECT_EQ(first->epoch(),29u);EXPECT_EQ(first->participantId(),id);EXPECT_EQ(first->sourceSelection(),selected);
+ ASSERT_TRUE(banks.registerInitialCPUJointBank(engines,ModelContextId{155},id,&error));
  EXPECT_EQ(banks.initialCPUJointLayer(id,7),first);EXPECT_EQ(banks.cpuJointLayer(id,7,29),first);
  EXPECT_THROW(banks.cpuJointLayer(id,7,1),std::invalid_argument);
  EXPECT_THROW(banks.cpuJointLayer(id,8,29),std::invalid_argument);
@@ -154,7 +154,7 @@ TEST(CPUJointStaticResidency, FragmentPublicationEpochIdentityAndFinalSourceRete
  EXPECT_EQ(selections[0].ownership_kind,MoEOverlayParticipantResidencyRegistry::InitialOwnershipKind::CPUJointFragments);
  EXPECT_EQ(selections[0].expert_ids.size(),448u);EXPECT_TRUE(selections[0].matches_frozen_owner_map);
  engines.clear();EXPECT_THROW((void)banks.verifyImmutablePreparedSources(engines),std::logic_error);
- EXPECT_TRUE(first->source()->experts[511].complete());
+ EXPECT_TRUE(first->acquireInitialConstruction()->layerForModelLayer(7).cpu_fragments[511].valid());
  }
  EXPECT_EQ(physical_fragments,896u); //448 original experts per independently tested local actor; no physical two-socket claim.
 }
@@ -213,7 +213,7 @@ TEST(CPUJointStaticResidency, RetainedExecutorStartsWithOriginalSourceEngines) {
  auto sources=jointSources(selected,layout->physicalBytes(),layout->workspaceBytes());
  const auto memory=sources.actor->memory;auto& store=*sources.actor->manager->preparedWeightStore();
  sources.registerInto(engines);
- std::string error;ASSERT_TRUE(banks.registerInitialCPUJointLayer(engines,ModelContextId{155},id,7,&error))<<error;
+ std::string error;ASSERT_TRUE(banks.registerInitialCPUJointBank(engines,ModelContextId{155},id,&error))<<error;
  const auto published=banks.initialCPUJointLayer(id,7);
  const auto arena=std::make_shared<MoELocalExpertSerialBufferArena>(MoELocalExpertSerialBufferArena::Config{
   .device_id=DeviceId::cpu(),.row_capacity=2,.row_capacity_buckets={1,2},.d_model=8,.routing_top_k=1,
@@ -242,8 +242,8 @@ TEST(CPUJointStaticResidency, RetainedExecutorStartsWithOriginalSourceEngines) {
  params.expert_mask.assign(512,false);params.prepared_gate_gemm.assign(512,nullptr);
  params.prepared_up_gemm.assign(512,nullptr);params.prepared_down_gemm.assign(512,nullptr);
  for(int expert:selected->expertIds()) {
-  params.expert_mask[expert]=true;const auto& e=published->source()->experts[expert];
-  params.prepared_gate_gemm[expert]=e.gate.get();params.prepared_up_gemm[expert]=e.up.get();params.prepared_down_gemm[expert]=e.down.get();
+  params.expert_mask[expert]=true;const auto& e=published->acquireInitialConstruction()->layerForModelLayer(7).cpu_fragments[expert];
+  params.prepared_gate_gemm[expert]=e.gate().get();params.prepared_up_gemm[expert]=e.up().get();params.prepared_down_gemm[expert]=e.down().get();
  }
  MoELocalExpertStage stage(params);test::CPUStageTestWorkspace workspace(stage);
  // Source publication, not mutable registry/store entries, retains the engines.
@@ -254,7 +254,7 @@ TEST(CPUJointStaticResidency, RetainedExecutorStartsWithOriginalSourceEngines) {
   ASSERT_TRUE(stage.execute(&context));
   EXPECT_EQ(canonical_moe_route_record::readRecordCount(arena->cpuJointPackedRecords()->data(),
    arena->cpuJointPackedRecords()->numel()),live);
-  EXPECT_EQ(published->source()->cpu_joint_source,selected);
+  EXPECT_EQ(published->sourceSelection(),selected);
  }
  auto replaced=params;replaced.prepared_gate_gemm[64]=params.prepared_up_gemm[64];
  EXPECT_THROW((void)MoELocalExpertStage(replaced),std::invalid_argument);
@@ -324,8 +324,8 @@ TEST(CPUJointStaticResidency, ColdLoadGraphPreservesOriginalSourceAuthority) {
   EXPECT_EQ(*competing_lease->cpu_joint_source,*selected);
   EXPECT_NE(competing_lease->cpu_joint_source->cohort(),selected->cohort());
   for(const auto& source_binding:competing_lease->sources)EXPECT_EQ(source_binding.identity.model_id,model);
-  EXPECT_FALSE(cold.residency()->registerInitialCPUJointLayer(competing.expertGemmRegistry(),model,
-   participant->participant_id,7,&error));
+  EXPECT_FALSE(cold.residency()->registerInitialCPUJointBank(competing.expertGemmRegistry(),model,
+   participant->participant_id,&error));
   EXPECT_NE(error.find("exact original source/cohort lease"),std::string::npos)<<error;
   EXPECT_THROW(cold.residency()->initialCPUJointLayer(participant->participant_id,7),std::logic_error);
  }
@@ -345,10 +345,10 @@ TEST(CPUJointStaticResidency, ColdLoadGraphPreservesOriginalSourceAuthority) {
  ASSERT_TRUE(manager.prepareMoEExpertOverlayWeights(*runtime,DeviceId::cpu(),&loaded,nullptr,
   PreparedWeightAdmission::AllocateCompleteSet,retained));
  EXPECT_EQ(MoEExpertOwnerMap::initialBuildAttempts(),before);
- ASSERT_TRUE(cold.residency()->registerInitialCPUJointLayer(manager.expertGemmRegistry(),model,
-  participant->participant_id,7,&error))<<error;
+ ASSERT_TRUE(cold.residency()->registerInitialCPUJointBank(manager.expertGemmRegistry(),model,
+  participant->participant_id,&error))<<error;
  const auto published=cold.residency()->initialCPUJointLayer(participant->participant_id,7);ASSERT_TRUE(published);
- EXPECT_EQ(published->source()->cpu_joint_source->cohort(),selected->cohort());
+ EXPECT_EQ(published->sourceSelection()->cohort(),selected->cohort());
  std::vector<bool> mask(512,false);for(const int expert:selected->expertIds())mask[expert]=true;
  MoEOverlayPreparedGraphBankRequest request{.device=DeviceId::cpu(),.tp_context=nullptr,.tp_participant=0,
   .domain=participant->domain_name,.participant=participant,.layer=7,.experts=512,.d_model=8,.expert_intermediate=20,
@@ -359,8 +359,8 @@ TEST(CPUJointStaticResidency, ColdLoadGraphPreservesOriginalSourceAuthority) {
  for(int expert=0;expert<512;++expert)EXPECT_EQ(graph.gate[expert]!=nullptr,selected->contains(expert));
  request.original_model=ModelContextId{360};
  EXPECT_THROW(adoptMoEOverlayPreparedGraphBank(*runtime,manager.expertGemmRegistry(),request),std::invalid_argument);
- EXPECT_FALSE(cold.residency()->registerInitialCPUJointLayer(manager.expertGemmRegistry(),ModelContextId{360},
-  participant->participant_id,7,&error));
+ EXPECT_FALSE(cold.residency()->registerInitialCPUJointBank(manager.expertGemmRegistry(),ModelContextId{360},
+  participant->participant_id,&error));
  EXPECT_EQ(cold.residency()->initialCPUJointLayer(participant->participant_id,7),published);
  EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::WeightLoadStaging,
   PhysicalMemoryMaterializationKind::NewAllocation),0u);

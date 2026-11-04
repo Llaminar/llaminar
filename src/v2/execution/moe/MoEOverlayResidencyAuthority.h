@@ -40,6 +40,7 @@ namespace llaminar2
     namespace test
     {
         struct MoEOverlayResidencyAuthorityConcurrencyPeer;
+        struct MoEOverlayJointPlacementCandidateTestAccess;
     }
 
     /** @brief Thermal direction of one complete expert residency move. */
@@ -351,14 +352,26 @@ namespace llaminar2
         MoEOverlayResidencyOwnershipKind ownershipKind() const noexcept;
         /** @return Same original source map for joint fragments; ordinary owner map otherwise. */
         const MoEExpertOwnerMap& originalOwnerMap() const;
-        /** @return Shared original joint map or null for ordinary whole experts. */
+        /** @return Current canonical live joint map, or null for ordinary whole experts. */
         std::shared_ptr<const MoEExpertOwnerMap> jointOwnerMap() const noexcept;
+        /** @return Actual live placement for this epoch, distinct from original source selection.
+         */
+        const MoEExpertOwnerMap &placementOwnerMap() const;
+        /** @return SAME original joint source/preparation control block, or null for ordinary
+         * ownership. */
+        std::shared_ptr<const MoEExpertOverlayPreparationPlan>
+        originalProjectionPreparation() const noexcept;
+
     private:
         friend class MoEOverlayResidencyAuthority;
-        /** @brief Original immutable definition; only cold authority construction may install this arm. */
+        /** @brief Sealed source and current placement; only the authority can construct this arm.
+         */
         struct CPUJointDefinition {
-            std::shared_ptr<const MoERoutedExpertPlacementPlan> plan;
+            std::shared_ptr<const MoERoutedExpertPlacementPlan> source_plan;
             std::shared_ptr<const MoEExpertOverlayPreparationPlan> preparation;
+            uint64_t epoch;
+            std::shared_ptr<const MoERoutedExpertPlacementPlan> live_plan;
+            std::shared_ptr<const MoEExpertOwnerMap> live_owners;
         };
         std::optional<CPUJointDefinition> joint_; ///< No public scalar field can manufacture fragment ownership.
     };
@@ -1455,6 +1468,7 @@ namespace llaminar2
     private:
         /** Device-free regression access for holding a real proposal lock. */
         friend struct test::MoEOverlayResidencyAuthorityConcurrencyPeer;
+        friend struct test::MoEOverlayJointPlacementCandidateTestAccess;
 
         /** Sole typed owner of the shared runtime-histogram drain lane. */
         enum class HistogramDrainState : std::uint8_t
@@ -1515,6 +1529,24 @@ namespace llaminar2
          */
         void requireHostDynamicPublicationAuthority(
             const char *operation) const;
+
+        /**
+         * @brief Derive an unpublished fixed-cohort candidate from this authority's real current
+         * epoch.
+         * @param expected_live Exact current snapshot retained by the real transition caller.
+         * @param expected_epoch Exact live epoch carried by that caller.
+         * @param placements Complete candidate tier assignments; all other policies stay original.
+         * @return Closed source-authenticated live placement, without physical
+         * readiness/publication.
+         * @throws std::logic_error For ordinary ownership or an unavailable original source
+         * definition.
+         * @throws std::invalid_argument For changed capacity, source geometry or fixed
+         * membership/cuts.
+         * @note This private producer does not enable Static maintenance or bypass physical fanout.
+         */
+        std::shared_ptr<const MoEOverlayResidencySnapshot> prepareCPUJointPlacementCandidate(
+            const std::shared_ptr<const MoEOverlayResidencySnapshot> &expected_live,
+            uint64_t expected_epoch, std::vector<RoutedExpertLayerPlacement> placements) const;
 
         /**
          * @brief Validate and materialize one immutable residency epoch.

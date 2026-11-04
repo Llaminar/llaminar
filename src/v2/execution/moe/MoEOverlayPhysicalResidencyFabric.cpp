@@ -1187,59 +1187,53 @@ namespace llaminar2
         };
 
         /**
-         * @brief Destination endpoint that publishes one exact prepared engine.
+         * @brief Destination endpoint that finalizes storage before original operation completion.
          *
          * Final bytes remain owned and validated by the wrapped device-specific
-         * endpoint. Publication occurs only after that endpoint reports complete
+         * endpoint. Storage finalization occurs only after that endpoint reports complete
          * and accepts its own finalization edge, so the candidate RCU bank can
          * never observe a partially received projection.
          */
-        class PublishingRemoteProjectionDestination final
+        class FinalizingRemoteProjectionDestination final
             : public IMoEOverlayRemoteProjectionDestinationEndpoint
         {
         public:
-            /** @brief Retain storage, arrival authority, role, and engine alias. */
-            PublishingRemoteProjectionDestination(
-                std::shared_ptr<
-                    IMoEOverlayRemoteProjectionDestinationEndpoint> storage,
-                std::shared_ptr<MoEOverlayPreparedExpertArrival> arrival,
-                ExpertTierWeightProjection projection,
+            /**
+             * @brief Retain original final storage and its reserved engine alias.
+             * @param storage Original destination endpoint owning physical finalization.
+             * @param engine Genuine engine alias over the reserved destination bytes.
+             */
+            FinalizingRemoteProjectionDestination(
+                std::shared_ptr<IMoEOverlayRemoteProjectionDestinationEndpoint> storage,
                 std::shared_ptr<ITensorGemm> engine)
-                : storage_(std::move(storage)),
-                  arrival_(std::move(arrival)),
-                  projection_(projection),
-                  engine_(std::move(engine))
+                : storage_(std::move(storage)), engine_(std::move(engine))
             {
-                if (!storage_ || !arrival_ || !engine_)
+                if (!storage_ || !engine_)
                 {
                     throw std::invalid_argument(
-                        "ExpertOverlay remote publication endpoint requires complete ownership");
+                        "ExpertOverlay remote finalization endpoint requires complete ownership");
                 }
             }
 
             /**
              * @brief Retain a deferred engine provider for manifest-shaped GPU arrivals.
+             * @param storage Original endpoint owning manifest validation and final storage.
+             * @param engine_provider Returns that endpoint's actual finalized engine.
              *
              * A remote GPU sender's live physical format is known only after
              * manifest authentication. The wrapped GPU endpoint creates the
-             * exact engine alias then; this provider retrieves it at the final
-             * publication edge without guessing a canonical representation.
+             * exact engine alias then; this provider retrieves it at the original
+             * finalization edge without guessing a canonical representation.
              */
-            PublishingRemoteProjectionDestination(
-                std::shared_ptr<
-                    IMoEOverlayRemoteProjectionDestinationEndpoint> storage,
-                std::shared_ptr<MoEOverlayPreparedExpertArrival> arrival,
-                ExpertTierWeightProjection projection,
+            FinalizingRemoteProjectionDestination(
+                std::shared_ptr<IMoEOverlayRemoteProjectionDestinationEndpoint> storage,
                 std::function<std::shared_ptr<ITensorGemm>()> engine_provider)
-                : storage_(std::move(storage)),
-                  arrival_(std::move(arrival)),
-                  projection_(projection),
-                  engine_provider_(std::move(engine_provider))
+                : storage_(std::move(storage)), engine_provider_(std::move(engine_provider))
             {
-                if (!storage_ || !arrival_ || !engine_provider_)
+                if (!storage_ || !engine_provider_)
                 {
-                    throw std::invalid_argument(
-                        "ExpertOverlay deferred remote publication endpoint requires complete ownership");
+                    throw std::invalid_argument("ExpertOverlay deferred remote finalization "
+                                                "endpoint requires complete ownership");
                 }
             }
 
@@ -1273,10 +1267,11 @@ namespace llaminar2
                 return storage_->complete();
             }
 
-            /** @brief Finalize storage, then publish the engine exactly once. */
+            /** @brief Finalize original storage so the original transport operation may finish; do not publish
+             * arrival. */
             bool publishFinal(std::string *error) noexcept override
             {
-                if (published_)
+                if (finalized_)
                 {
                     if (error)
                         error->clear();
@@ -1311,20 +1306,13 @@ namespace llaminar2
                             "ExpertOverlay remote destination completed without an executable engine";
                     return false;
                 }
-                if (!arrival_->publish(projection_, engine_, error))
-                    return false;
-                published_ = true;
+                finalized_ = true;
                 return true;
             }
 
-            /** @brief Poison an unpublished arrival and abort exact storage work. */
+            /** @brief Abort exact storage work; the outer operation poisons candidate arrival. */
             void abort() noexcept override
             {
-                if (!published_)
-                {
-                    (void)arrival_->fail(
-                        "ExpertOverlay remote projection was aborted before publication");
-                }
                 storage_->abort();
             }
 
@@ -1335,15 +1323,18 @@ namespace llaminar2
                 return storage_->pollAbort(error);
             }
 
+            /** @return Actual finalized engine, retained without granting candidate visibility. */
+            std::shared_ptr<ITensorGemm> preparedEngine() const noexcept
+            {
+                return finalized_ ? engine_ : nullptr;
+            }
+
         private:
             std::shared_ptr<
                 IMoEOverlayRemoteProjectionDestinationEndpoint> storage_;
-            std::shared_ptr<MoEOverlayPreparedExpertArrival> arrival_;
-            ExpertTierWeightProjection projection_ =
-                ExpertTierWeightProjection::Gate;
             std::shared_ptr<ITensorGemm> engine_;
             std::function<std::shared_ptr<ITensorGemm>()> engine_provider_;
-            bool published_ = false;
+            bool finalized_ = false;
         };
 
         /**
@@ -2784,6 +2775,19 @@ namespace llaminar2
             /** Maximum simultaneous arrivals for this one logical layer. */
             std::size_t layer_arrival_capacity = 0;
         };
+
+        /**
+         * @brief Represent existing whole-owner work through checked intersection coverage.
+         * @param rows Actual original projection N, without storage padding.
+         * @param columns Actual original projection K.
+         * @return One full original overlap, not capacity-sized wire work.
+         */
+        ExpertTierWeightProjectionIntersection wholeProjectionIntersection(int rows, int columns)
+        {
+            const MoEExpertProjectionOwnership::Projection whole{
+                MoEProjectionResidence::ExpertOwner, rows, columns, 0, rows, 0, columns};
+            return ExpertTierWeightProjectionIntersection::between(whole, whole);
+        }
 
         /** @brief Complete local destination reservation for one migration. */
         struct ReservedDestination
@@ -5266,6 +5270,7 @@ namespace llaminar2
         {
             std::size_t migration_index = 0;
             std::size_t projection_index = 0;
+            std::shared_ptr<MoEOverlayPreparedProjectionCompletion> completion;
         };
         std::vector<MoEOverlayMPIRemoteProjectionBinding> remote_bindings;
         std::vector<RemoteOperationTarget> remote_targets;
@@ -5302,6 +5307,14 @@ namespace llaminar2
                 const auto &migration =
                     migrations[migration_index];
                 auto &prepared = result.migrations[migration_index];
+                prepared.operations.resize(kProjections.size());
+                for (const auto role : kProjections)
+                    prepared.operations[projectionIndex(role)] = {
+                        .projection = role,
+                        .destination_participant = migration.destination.owner_participant,
+                        .source_participant = migration.source.owner_participant,
+                    };
+                std::shared_ptr<MoEOverlayPreparedExpertArrival> destination_arrival;
                 const bool source_local = is_local_participant(
                     migration.source.owner_participant);
                 const bool destination_local = is_local_participant(
@@ -5368,8 +5381,10 @@ namespace llaminar2
 
                 if (destination_local)
                 {
-                    prepared.destination_arrival =
+                    destination_arrival =
                         std::make_shared<MoEOverlayPreparedExpertArrival>();
+                    prepared.destination_arrivals.push_back({
+                        migration.destination.owner_participant, destination_arrival});
                 }
 
                 /* A same-rank edge owned elsewhere still occupies global shape. */
@@ -5377,7 +5392,7 @@ namespace llaminar2
                 {
                     for (const auto projection : kProjections)
                     {
-                        prepared.projections[projectionIndex(projection)] =
+                        prepared.operations[projectionIndex(projection)].operation =
                             std::make_unique<
                                 ReadyPhysicalProjectionOperation>();
                     }
@@ -5409,6 +5424,7 @@ namespace llaminar2
                             .purpose = purpose,
                         };
 
+                        std::shared_ptr<MoEOverlayPreparedProjectionCompletion> remote_completion;
                         if (source_local)
                         {
                             auto source_engine = projectionEngine(
@@ -5747,12 +5763,20 @@ namespace llaminar2
                                     destination_engine,
                                     expected_manifest,
                                     match_policy);
-                                binding.destination = std::make_shared<
-                                    PublishingRemoteProjectionDestination>(
-                                    std::move(storage),
-                                    prepared.destination_arrival,
-                                    projection,
-                                    std::move(destination_engine));
+                                auto finalized =
+                                    std::make_shared<FinalizingRemoteProjectionDestination>(
+                                        std::move(storage), std::move(destination_engine));
+                                binding.destination = finalized;
+                                const auto rows = destination_is_floating ? destination_floating.n
+                                                                          : destination_packed->N;
+                                const auto columns = destination_is_floating
+                                                         ? destination_floating.k
+                                                         : destination_packed->K;
+                                remote_completion =
+                                    std::make_shared<MoEOverlayPreparedProjectionCompletion>(
+                                        std::vector{wholeProjectionIntersection(rows, columns)},
+                                        destination_arrival, projection,
+                                        [finalized]() { return finalized->preparedEngine(); });
                             }
                             else
                             {
@@ -5877,15 +5901,17 @@ namespace llaminar2
                                     lane->second[lane_index],
                                     std::move(factory),
                                     slot_lifetime);
-                                binding.destination = std::make_shared<
-                                    PublishingRemoteProjectionDestination>(
-                                    gpu_storage,
-                                    prepared.destination_arrival,
-                                    projection,
-                                    [gpu_storage]()
-                                    {
-                                        return gpu_storage->preparedEngine();
-                                    });
+                                auto finalized =
+                                    std::make_shared<FinalizingRemoteProjectionDestination>(
+                                        gpu_storage,
+                                        [gpu_storage]() { return gpu_storage->preparedEngine(); });
+                                binding.destination = finalized;
+                                remote_completion =
+                                    std::make_shared<MoEOverlayPreparedProjectionCompletion>(
+                                        std::vector{wholeProjectionIntersection(
+                                            destination_slot.spec.N, destination_slot.spec.K)},
+                                        destination_arrival, projection,
+                                        [finalized]() { return finalized->preparedEngine(); });
                                 if (migration.source.device.is_cpu())
                                     ++local_remote_gpu_cpu_operations;
                                 else
@@ -5896,6 +5922,7 @@ namespace llaminar2
                         remote_targets.push_back({
                             .migration_index = migration_index,
                             .projection_index = projection_index,
+                            .completion = std::move(remote_completion),
                         });
                         remote_bindings.push_back(std::move(binding));
                         continue;
@@ -6290,13 +6317,14 @@ namespace llaminar2
                         }
                     }
 
-                    prepared.projections[projection_index] =
-                        std::make_unique<
-                            MoEOverlayPreparedProjectionOperation>(
-                            std::move(physical_operation),
-                            prepared.destination_arrival,
-                            projection,
-                            std::move(destination_engine));
+                    const auto signature = signatureFor(source);
+                    auto completion = std::make_shared<MoEOverlayPreparedProjectionCompletion>(
+                        std::vector{wholeProjectionIntersection(signature.N, signature.K)},
+                        destination_arrival, projection,
+                        [engine = std::move(destination_engine)]() { return engine; });
+                    prepared.operations[projection_index].operation =
+                        std::make_unique<MoEOverlayPreparedProjectionOperation>(
+                            std::move(physical_operation), std::move(completion), 0);
                 }
             }
 
@@ -6328,10 +6356,13 @@ namespace llaminar2
                      remote_index < remote_targets.size();
                      ++remote_index)
                 {
-                    const auto target = remote_targets[remote_index];
-                    result.migrations[target.migration_index]
-                        .projections[target.projection_index] =
-                        std::move(remote_wave.operations[remote_index]);
+                    const auto &target = remote_targets[remote_index];
+                    auto operation = std::move(remote_wave.operations[remote_index]);
+                    if (target.completion)
+                        operation = std::make_unique<MoEOverlayPreparedProjectionOperation>(
+                            std::move(operation), target.completion, 0);
+                    result.migrations[target.migration_index].operations[target.projection_index].operation =
+                        std::move(operation);
                 }
             }
         }
@@ -6412,8 +6443,16 @@ namespace llaminar2
                     local_ids.begin(),
                     local_ids.end(),
                     migration.destination.owner_participant);
-                const auto &arrival =
-                    prepared.migrations[index].destination_arrival;
+                const auto &keyed = prepared.migrations[index].destination_arrivals;
+                if (keyed.size() != (local_destination ? 1u : 0u) ||
+                    (local_destination &&
+                     (keyed.front().participant_id != migration.destination.owner_participant ||
+                      !keyed.front().arrival || keyed.front().arrival->isCPUJointFragment())))
+                {
+                    if (error) *error = "ExpertOverlay whole-device staging requires its exact singleton arrival";
+                    return false;
+                }
+                const auto arrival = local_destination ? keyed.front().arrival : nullptr;
                 if (!local_destination)
                 {
                     if (arrival)

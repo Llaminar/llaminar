@@ -1300,32 +1300,33 @@ namespace llaminar2
          */
         if (params_.cpu_joint_layer) {
             const auto &publication=*params_.cpu_joint_layer;
-            if (!publication.source() || publication.layer()!=params_.layer_idx)
+            const auto construction=publication.acquireInitialConstruction();
+            if (!publication.sourceSelection() || !construction || publication.layer()!=params_.layer_idx)
                 throw std::invalid_argument("CPU joint invocation has no original published layer");
-            const auto &lease=*publication.source();
-            if (!params_.device_id.is_cpu() || !lease.cpu_joint_source ||
+            const auto &lease=construction->layerForModelLayer(params_.layer_idx);
+            if (!params_.device_id.is_cpu() ||
                 params_.expert_weight_resolution_policy!=MoEExpertWeightResolutionPolicy::PreparedRegistryOnly ||
                 params_.canonical_route_arithmetic!=MoECanonicalRouteArithmeticPolicy::UnweightedExpertRowThenOrderedFMA ||
                 !params_.canonical_route_contributions)
                 throw std::invalid_argument("CPU joint expert invocation requires its source-bound unweighted canonical producer");
-            const auto &source=*lease.cpu_joint_source;
+            const auto &source=*publication.sourceSelection();
             const auto &geometry=source.ownership().geometry();
             if (source.layer()!=params_.layer_idx || geometry.experts!=params_.num_experts ||
                 geometry.model_columns!=params_.d_model ||
                 source.ownership().projection(WeightRole::MoEExpertUp).rows!=params_.expert_intermediate ||
                 params_.expert_mask.size()!=static_cast<size_t>(params_.num_experts) ||
-                lease.experts.size()!=static_cast<size_t>(params_.num_experts) ||
-                params_.prepared_gate_gemm.size()!=lease.experts.size() ||
-                params_.prepared_up_gemm.size()!=lease.experts.size() || params_.prepared_down_gemm.size()!=lease.experts.size())
+                lease.cpu_fragments.size()!=static_cast<size_t>(params_.num_experts) ||
+                params_.prepared_gate_gemm.size()!=lease.cpu_fragments.size() ||
+                params_.prepared_up_gemm.size()!=lease.cpu_fragments.size() || params_.prepared_down_gemm.size()!=lease.cpu_fragments.size())
                 throw std::invalid_argument("CPU joint expert invocation changed original source/member geometry");
             for (int expert=0;expert<params_.num_experts;++expert) {
                 const auto index=static_cast<size_t>(expert);
-                const auto &engines=lease.experts[index];
+                const auto &engines=lease.cpu_fragments[index];
                 if ((params_.expert_mask[index] && !source.contains(expert)) ||
-                    params_.prepared_gate_gemm[index]!=engines.gate.get() ||
-                    params_.prepared_up_gemm[index]!=engines.up.get() ||
-                    params_.prepared_down_gemm[index]!=engines.down.get() ||
-                    (source.contains(expert) && !engines.complete()))
+                    params_.prepared_gate_gemm[index]!=engines.gate().get() ||
+                    params_.prepared_up_gemm[index]!=engines.up().get() ||
+                    params_.prepared_down_gemm[index]!=engines.down().get() ||
+                    (source.contains(expert) && !engines.valid()))
                     throw std::invalid_argument("CPU joint expert invocation replaced an original selected native engine");
             }
         }
@@ -2683,6 +2684,13 @@ namespace llaminar2
 
     bool MoEExpertComputeStage::execute(IDeviceContext *ctx)
     {
+        if(params_.cpu_joint_layer && !cpu_joint_invocation_bank_) {
+            LOG_ERROR("CPU fragment execution requires its exact bound packet-epoch RCU lease");return false;
+        }
+        struct InvocationBankScope {
+            MoEOverlayParticipantBankLease& bank;
+            ~InvocationBankScope(){bank.reset();}
+        } release_after_gemm{cpu_joint_invocation_bank_};
         if (!overlay_service_telemetry_layer_)
             return executeWithoutServiceTelemetry(ctx);
         if (!ctx || !overlay_service_sample_ ||
@@ -9480,6 +9488,35 @@ namespace llaminar2
     bool MoEExpertComputeStage::bindSparseOverlayInvocation(
         const SparseOverlayInvocation &invocation)
     {
+        // A rejected new packet cannot leave a previous lease executable.
+        cpu_joint_invocation_bank_.reset();
+        MoEOverlayParticipantBankLease joint_bank;
+        if(params_.cpu_joint_layer) {
+            if(invocation.binding_kind==SparseOverlayBindingKind::SetupPriming) {
+                if(invocation.cpu_joint_epoch)return false;
+            } else {
+                const auto* epoch=invocation.cpu_joint_epoch;
+                if(!epoch || !epoch->bankLease() || epoch->family()!=params_.cpu_joint_layer->family() ||
+                   epoch->family().owner_before(params_.cpu_joint_layer->family()) ||
+                   params_.cpu_joint_layer->family().owner_before(epoch->family()) ||
+                   epoch->epoch()!=invocation.engine_binding_generation || epoch->layer()!=params_.layer_idx ||
+                   epoch->participantId()!=params_.cpu_joint_layer->participantId()) {
+                    LOG_ERROR("CPU fragment invocation has a foreign or absent original epoch family");return false;
+                }
+                joint_bank=epoch->bankLease();
+                const auto& layer=joint_bank->layerForModelLayer(params_.layer_idx);
+                if(!invocation.expert_mask || *invocation.expert_mask!=layer.resident_mask ||
+                   invocation.gate_engines.size()!=layer.cpu_fragments.size() ||
+                   invocation.up_engines.size()!=layer.cpu_fragments.size() || invocation.down_engines.size()!=layer.cpu_fragments.size())return false;
+                for(size_t expert=0;expert<layer.cpu_fragments.size();++expert) {
+                    const auto& actual=layer.cpu_fragments[expert];
+                    if(invocation.gate_engines[expert]!=actual.gate().get() || invocation.up_engines[expert]!=actual.up().get() ||
+                       invocation.down_engines[expert]!=actual.down().get()) {
+                        LOG_ERROR("CPU fragment invocation replaced a candidate bank engine");return false;
+                    }
+                }
+            }
+        } else if(invocation.cpu_joint_epoch)return false;
         const size_t expert_count =
             static_cast<size_t>(std::max(params_.num_experts, 0));
         const bool host_packet_binding =
@@ -9722,6 +9759,7 @@ namespace llaminar2
             sparse_overlay_launch_metadata_dirty_ =
                 !host_packet_binding;
         }
+        cpu_joint_invocation_bank_=std::move(joint_bank);
         return true;
     }
 

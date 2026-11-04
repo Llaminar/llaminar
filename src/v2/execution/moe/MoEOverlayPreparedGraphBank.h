@@ -125,17 +125,18 @@ struct MoEOverlayPreparedGraphBank
         if (!request.original_residency || !request.original_residency->isCPUJointParticipant(selected->participant_id))
             throw std::invalid_argument("CPU joint graph bank has no original fragment publication owner");
         const auto published=request.original_residency->initialCPUJointLayer(selected->participant_id,request.layer);
-        const auto acquired=published?published->source():nullptr;
-        if (!acquired || !acquired->cpu_joint_source)
+        const auto acquired=published?published->acquireInitialConstruction():MoEOverlayParticipantBankLease{};
+        const auto selected_source=published?published->sourceSelection():nullptr;
+        if (!acquired || !selected_source || !published->family())
             throw std::runtime_error("CPU joint graph bank has no original source-bound prepared layer");
-        for (const auto &binding:acquired->sources)
-            if (binding.identity.model_id!=request.original_model)
-                throw std::invalid_argument("CPU joint graph bank belongs to a foreign original model context");
-        const auto &source=*acquired->cpu_joint_source;
+        if (published->family()->model()!=request.original_model)
+            throw std::invalid_argument("CPU joint graph bank replaced its original model identity");
+        const auto &source=*selected_source;
+        const auto& initial_layer=acquired->layerForModelLayer(request.layer);
         const auto &geometry=source.ownership().geometry();
         if (source.participant()!=*selected || geometry.experts!=request.experts ||
             geometry.model_columns!=request.d_model || geometry.intermediate_columns!=request.expert_intermediate ||
-            acquired->experts.size()!=static_cast<size_t>(request.experts))
+            initial_layer.cpu_fragments.size()!=static_cast<size_t>(request.experts))
             throw std::invalid_argument("CPU joint graph bank changed original source/model/member geometry");
         MoEOverlayPreparedGraphBank bank;
         bank.gate.resize(request.experts,nullptr);bank.up.resize(request.experts,nullptr);bank.down.resize(request.experts,nullptr);
@@ -145,10 +146,10 @@ struct MoEOverlayPreparedGraphBank
                 throw std::invalid_argument("CPU joint graph bank changed original selected expert membership");
             if (!original)continue;
             const auto *row=request.original_owners->placementFor(request.layer,expert);
-            const auto &triplet=acquired->experts[static_cast<size_t>(expert)];
-            if (!row || row->shard_cohort!=source.cohort() || !triplet.complete())
+            const auto &triplet=initial_layer.cpu_fragments[static_cast<size_t>(expert)];
+            if (!row || row->shard_cohort!=source.cohort() || !triplet.valid())
                 throw std::invalid_argument("CPU joint graph bank replaced its original source cohort or prepared triplet");
-            bank.gate[expert]=triplet.gate.get();bank.up[expert]=triplet.up.get();bank.down[expert]=triplet.down.get();
+            bank.gate[expert]=triplet.gate().get();bank.up[expert]=triplet.up().get();bank.down[expert]=triplet.down().get();
         }
         bank.local_intermediate=source.ownership().projection(WeightRole::MoEExpertUp).rows;
         bank.cpu_joint_layer=published;

@@ -108,24 +108,54 @@ namespace llaminar2
     }
 
     MoEOverlayResidencyOwnershipKind MoEOverlayResidencySnapshot::ownershipKind() const noexcept
-    { return joint_?MoEOverlayResidencyOwnershipKind::CPUJointFragments:MoEOverlayResidencyOwnershipKind::WholeExperts; }
+    {
+        return joint_ ? MoEOverlayResidencyOwnershipKind::CPUJointFragments
+                      : MoEOverlayResidencyOwnershipKind::WholeExperts;
+    }
+
     std::shared_ptr<const MoEExpertOwnerMap> MoEOverlayResidencySnapshot::jointOwnerMap() const noexcept
-    { return joint_?joint_->preparation->cpuJointOwnerMap():nullptr; }
+    {
+        return joint_ ? joint_->live_owners : nullptr;
+    }
+
+    std::shared_ptr<const MoEExpertOverlayPreparationPlan>
+    MoEOverlayResidencySnapshot::originalProjectionPreparation() const noexcept
+    {
+        return joint_ ? joint_->preparation : nullptr;
+    }
+
+    const MoEExpertOwnerMap &MoEOverlayResidencySnapshot::placementOwnerMap() const
+    {
+        if (!joint_)
+            return owner_map;
+        if (!joint_->live_owners)
+            throw std::logic_error("Joint snapshot lost its canonical live placement");
+        return *joint_->live_owners;
+    }
+
     const MoEExpertOwnerMap& MoEOverlayResidencySnapshot::originalOwnerMap() const
     {
-        if(joint_) {
-            const auto original=jointOwnerMap();
-            if(!original)throw std::logic_error("Joint snapshot lost its original source map");
-            return *original;
-        }
-        return owner_map;
+        if (!joint_)
+            return owner_map;
+        const auto original = joint_->preparation->cpuJointOwnerMap();
+        if (!original)
+            throw std::logic_error("Joint snapshot lost its original source map");
+        return *original;
     }
+
     bool MoEOverlayResidencySnapshot::valid() const noexcept
     {
-        if(!epoch || !placement_plan)return false;
-        if(joint_)return epoch==1 && placement_plan==joint_->plan && bool(jointOwnerMap()) && layered_ownership.empty() &&
-            owner_map.owners().empty() && owner_map.participants().empty();
-        return !layered_ownership.empty() && placement_plan->first_model_layer==layered_ownership.firstModelLayer();
+        if (!epoch || !placement_plan)
+            return false;
+        if (joint_)
+            return epoch == joint_->epoch && joint_->source_plan && joint_->preparation &&
+                   joint_->live_owners && !joint_->live_owners->owners().empty() &&
+                   placement_plan.get() == joint_->live_plan.get() &&
+                   !placement_plan.owner_before(joint_->live_plan) &&
+                   !joint_->live_plan.owner_before(placement_plan) && layered_ownership.empty() &&
+                   owner_map.owners().empty() && owner_map.participants().empty();
+        return !layered_ownership.empty() &&
+               placement_plan->first_model_layer == layered_ownership.firstModelLayer();
     }
 
     namespace
@@ -7255,11 +7285,45 @@ namespace llaminar2
     }
 
     std::shared_ptr<const MoEOverlayResidencySnapshot>
-    MoEOverlayResidencyAuthority::buildSnapshot(
-        uint64_t epoch,
-        MoERoutedExpertPlacementPlan plan,
-        const MoERoutedExpertModelMetadata &metadata,
-        const MoEExpertOwnerMap *previous_owners,
+    MoEOverlayResidencyAuthority::prepareCPUJointPlacementCandidate(
+        const std::shared_ptr<const MoEOverlayResidencySnapshot> &expected_live,
+        uint64_t expected_epoch, std::vector<RoutedExpertLayerPlacement> placements) const
+    {
+        const auto previous = snapshot();
+        const auto same_owner = [](const auto &a, const auto &b)
+        { return a.get() == b.get() && !a.owner_before(b) && !b.owner_before(a); };
+        if (!previous || !expected_live || !same_owner(previous, expected_live) ||
+            previous->epoch != expected_epoch || !previous->valid() || !previous->joint_ ||
+            !initial_snapshot_ || !initial_snapshot_->joint_ ||
+            !same_owner(previous->joint_->source_plan, initial_snapshot_->joint_->source_plan) ||
+            !same_owner(previous->joint_->preparation, config_.projection_preparation))
+            throw std::logic_error("Joint candidate requires this authority's exact live epoch and "
+                                   "original source publication");
+        if (previous->epoch == std::numeric_limits<uint64_t>::max())
+            throw std::overflow_error("Joint candidate epoch cannot advance past UINT64_MAX");
+        // Only tier assignments are proposed. Original topology, precision,
+        // cohort cuts, placement policy and preparation remain one authority.
+        auto plan = *previous->joint_->source_plan;
+        plan.placements = std::move(placements);
+        const auto live =
+            std::make_shared<const MoEExpertOwnerMap>(MoEExpertOwnerMap::buildShardTransition(
+                plan, previous->placementOwnerMap(), previous->originalOwnerMap()));
+        auto candidate = std::make_shared<MoEOverlayResidencySnapshot>();
+        candidate->epoch = previous->epoch + 1;
+        candidate->placement_plan =
+            std::make_shared<const MoERoutedExpertPlacementPlan>(std::move(plan));
+        candidate->joint_.emplace(MoEOverlayResidencySnapshot::CPUJointDefinition{
+            previous->joint_->source_plan, previous->joint_->preparation, candidate->epoch,
+            candidate->placement_plan, live});
+        if (!candidate->valid())
+            throw std::logic_error(
+                "Joint candidate producer did not seal a complete live placement");
+        return candidate;
+    }
+
+    std::shared_ptr<const MoEOverlayResidencySnapshot> MoEOverlayResidencyAuthority::buildSnapshot(
+        uint64_t epoch, MoERoutedExpertPlacementPlan plan,
+        const MoERoutedExpertModelMetadata &metadata, const MoEExpertOwnerMap *previous_owners,
         const MoELayeredExpertOwnership *explicit_ownership,
         std::shared_ptr<const MoEExpertOverlayPreparationPlan> joint_preparation)
     {
@@ -7289,8 +7353,10 @@ namespace llaminar2
             requireJointSource(plan,metadata,*joint_preparation);
             auto snapshot=std::make_shared<MoEOverlayResidencySnapshot>();
             snapshot->epoch=epoch;snapshot->placement_plan=std::make_shared<const MoERoutedExpertPlacementPlan>(std::move(plan));
+            const auto original_owners = joint_preparation->cpuJointOwnerMap();
             snapshot->joint_.emplace(MoEOverlayResidencySnapshot::CPUJointDefinition{
-                snapshot->placement_plan,std::move(joint_preparation)});
+                snapshot->placement_plan, std::move(joint_preparation), epoch,
+                snapshot->placement_plan, original_owners});
             return snapshot;
         }
         if(joint_preparation && joint_preparation->cpuJointOwnerMap())

@@ -11515,24 +11515,28 @@ namespace llaminar2
                                     auto residency = config_.moe.expert_overlay_participant_residency;
                                     std::string error;
                                     if (!prepared_weight_store_ || !config_.moe.expert_overlay_cpu_joint_context ||
-                                        !residency->registerInitialCPUJointLayer(registry, prepared_weight_store_->modelId(),
-                                            target_participant, layer_idx, &error))
+                                        !residency->registerInitialCPUJointBank(registry, prepared_weight_store_->modelId(),
+                                            target_participant, &error))
                                         throw std::runtime_error("Qwen35 colocated CPU fragment has no original prepared source/context: " + error);
                                     auto frame = residency->initialCPUJointLayer(target_participant, layer_idx);
                                     const auto arena = local_params.serial_compact_buffer_arena;
                                     if (cpu_llep_state)
                                         throw std::logic_error("Qwen35 Static CPU joint fragments do not support current-batch LLEP");
-                                    if (!frame || !frame->source() || !frame->source()->cpu_joint_source ||
+                                    if (!frame || !frame->sourceSelection() ||
                                         !arena || !arena->cpuJointLayout() || !arena->cpuJointLayout()->isRoot() ||
                                         !canonical_route_ticket_storage)
                                         throw std::logic_error("Qwen35 colocated CPU fragment requires its original root arena and canonical ticket");
-                                    const auto &source = *frame->source();
+                                    const auto construction = frame->acquireInitialConstruction();
+                                    if (!construction)
+                                        throw std::logic_error("Qwen35 CPU fragment lost its initial construction bank");
+                                    const auto &source = *frame->sourceSelection();
+                                    const auto &initial_layer = construction->layerForModelLayer(layer_idx);
                                     local_params.cpu_joint_layer = frame;
                                     local_params.return_layout = MoEOverlayReturnLayout::ParticipantTokenPartials;
                                     local_params.gate_exps = nullptr;
                                     local_params.up_exps = nullptr;
                                     local_params.down_exps = nullptr;
-                                    local_params.expert_intermediate = source.cpu_joint_source->ownership()
+                                    local_params.expert_intermediate = source.ownership()
                                         .projection(WeightRole::MoEExpertUp).rows;
                                     local_params.cpu_joint_route_producer = MoELocalExpertStage::CPUJointRouteProducerBinding{
                                         .packed_rows = arena->cpuJointPackedRecords(),
@@ -11552,12 +11556,12 @@ namespace llaminar2
                                     local_params.prepared_gate_gemm.assign(config_.moe.num_experts, nullptr);
                                     local_params.prepared_up_gemm.assign(config_.moe.num_experts, nullptr);
                                     local_params.prepared_down_gemm.assign(config_.moe.num_experts, nullptr);
-                                    for (const int expert : source.cpu_joint_source->expertIds())
+                                    for (const int expert : source.expertIds())
                                     {
-                                        const auto &engines = source.experts.at(static_cast<size_t>(expert));
-                                        local_params.prepared_gate_gemm[expert] = engines.gate.get();
-                                        local_params.prepared_up_gemm[expert] = engines.up.get();
-                                        local_params.prepared_down_gemm[expert] = engines.down.get();
+                                        const auto &engines = initial_layer.cpu_fragments.at(static_cast<size_t>(expert));
+                                        local_params.prepared_gate_gemm[expert] = engines.gate().get();
+                                        local_params.prepared_up_gemm[expert] = engines.up().get();
+                                        local_params.prepared_down_gemm[expert] = engines.down().get();
                                     }
                                 }
                                 if (!joint_local_target) if (const auto *participant = owner_map_lifetime->participantForId(target_participant))
@@ -11716,7 +11720,7 @@ namespace llaminar2
                             local_collective_name = local_name + "_rooted_fragment_combine";
                             graph.addNode(local_collective_name, std::make_unique<MoECPUExpertShardRouteStage>(
                                 MoECPUExpertShardRouteStage::Params{
-                                    .original_source = local_params.cpu_joint_layer->source()->cpu_joint_source,
+                                    .original_source = local_params.cpu_joint_layer->sourceSelection(),
                                     .tp = config_.moe.expert_overlay_cpu_joint_context.get(),
                                     .packed_records = arena->cpuJointPackedRecords().get(),
                                     .combined_routes = arena->cpuCanonicalRoutes().get(),

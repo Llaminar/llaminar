@@ -778,6 +778,8 @@ namespace llaminar2
             std::span<ITensorGemm *const> down_engines;     ///< Global-id-indexed down engines.
             /** Exact CPU-only hidden rows borrowed for this host packet. */
             CPUTransportedHiddenRows cpu_transported_hidden;
+            /** Exact acquired fixed-family CPU fragment epoch; copied as an RCU reader until GEMM completes. */
+            const MoEOverlayParticipantResidencyRegistry::CPUJointLayer* cpu_joint_epoch=nullptr;
         };
 
         /**
@@ -1682,6 +1684,8 @@ namespace llaminar2
         int cpu_workspace_row_capacity_ = 0; ///< Original setup envelope, independent of smaller packet publications.
         /** @brief Residency generation currently certified by the bound tables. */
         uint64_t sparse_overlay_engine_binding_generation_ = 0;
+        MoEOverlayParticipantBankLease cpu_joint_invocation_bank_; ///< One execute-scoped reader, never an idle bank cache.
+
         /**
          * @brief Whether the next sparse replay must republish placement metadata.
          *

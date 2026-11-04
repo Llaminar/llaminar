@@ -2699,15 +2699,19 @@ namespace llaminar2
                         prepared_payloads;
                     std::string residency_error;
                     std::shared_ptr<const MoEOverlayParticipantResidencyRegistry::CPUJointLayer> joint_layer;
+                    MoEOverlayParticipantBankLease construction_bank;
                     if(joint) {
                         if(!config_.cpu_joint_context || !prepared_store_ ||
-                           !config_.participant_residency->registerInitialCPUJointLayer(registry,prepared_store_->modelId(),
-                               endpoint->participant_id,layer,&residency_error))
+                           !config_.participant_residency->registerInitialCPUJointBank(registry,prepared_store_->modelId(),
+                               endpoint->participant_id,&residency_error))
                             throw std::runtime_error("CPU joint follower has no original prepared source/domain: "+residency_error);
                         joint_layer=config_.participant_residency->initialCPUJointLayer(endpoint->participant_id,layer);
-                        if(!joint_layer || !joint_layer->source() || !joint_layer->source()->cpu_joint_source ||
+                        if(!joint_layer || !joint_layer->sourceSelection() ||
                            !compact_arena->cpuJointLayout() || !compact_arena->cpuJointPackedRecords())
                             throw std::runtime_error("CPU joint follower lost original fragment publication or serial roots");
+                        construction_bank=joint_layer->acquireInitialConstruction();
+                        if(!construction_bank)
+                            throw std::runtime_error("CPU joint follower requires its complete initial prepared bank");
                     }
                     if (!joint && (!resolveMoEOverlayPreparedExpertPayloads(
                             registry,
@@ -2764,7 +2768,7 @@ namespace llaminar2
                     local_params.num_experts = num_experts;
                     local_params.top_k = top_k;
                     local_params.d_model = d_model;
-                    local_params.expert_intermediate = joint?joint_layer->source()->cpu_joint_source->ownership()
+                    local_params.expert_intermediate = joint?joint_layer->sourceSelection()->ownership()
                         .projection(WeightRole::MoEExpertUp).rows:expert_intermediate;
                     local_params.layer_idx = layer;
                     local_params.cpu_workspace_source = cpuExpertWorkspaceSource(
@@ -2786,12 +2790,14 @@ namespace llaminar2
                         local_params.prepared_gate_gemm.assign(num_experts,nullptr);
                         local_params.prepared_up_gemm.assign(num_experts,nullptr);
                         local_params.prepared_down_gemm.assign(num_experts,nullptr);
-                        const auto &source=*joint_layer->source();
-                        for(const int expert:source.cpu_joint_source->expertIds()) {
-                            const auto &engines=source.experts.at(static_cast<size_t>(expert));
-                            local_params.prepared_gate_gemm[expert]=engines.gate.get();
-                            local_params.prepared_up_gemm[expert]=engines.up.get();
-                            local_params.prepared_down_gemm[expert]=engines.down.get();
+                        // Borrow the installed source bank only while binding
+                        // constructor inputs; each invocation acquires its own epoch.
+                        const auto &source=construction_bank->layerForModelLayer(layer);
+                        for(const int expert:joint_layer->sourceSelection()->expertIds()) {
+                            const auto &engines=source.cpu_fragments.at(static_cast<size_t>(expert));
+                            local_params.prepared_gate_gemm[expert]=engines.gate().get();
+                            local_params.prepared_up_gemm[expert]=engines.up().get();
+                            local_params.prepared_down_gemm[expert]=engines.down().get();
                         }
                     }
                     if(!joint)(void)registry.populateExpertEnginesForParticipant(
@@ -2823,7 +2829,7 @@ namespace llaminar2
                     if(joint) {
                         const auto &geometry=*compact_arena->cpuJointLayout();
                         joint_collective=std::make_unique<MoECPUExpertShardRouteStage>(MoECPUExpertShardRouteStage::Params{
-                            .original_source=joint_layer->source()->cpu_joint_source,
+                            .original_source=joint_layer->sourceSelection(),
                             .tp=config_.cpu_joint_context.get(),.packed_records=compact_arena->cpuJointPackedRecords().get(),
                             .combined_routes=geometry.isRoot()?compact_arena->cpuCanonicalRoutes().get():nullptr,
                             .source_ranges=compact_arena->cpuJointSourceRanges(),

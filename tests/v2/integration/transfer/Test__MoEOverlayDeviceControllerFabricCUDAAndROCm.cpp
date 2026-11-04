@@ -3865,15 +3865,17 @@ namespace llaminar2::test
         MoEOverlayParticipantPreparedTransfers prepared;
         prepared.status = MoEOverlayResidencyStageStartStatus::Started;
         prepared.migrations.resize(batch.migrations.size());
-        for (auto &migration : prepared.migrations)
+        for (size_t index=0;index<prepared.migrations.size();++index)
         {
+            auto &migration=prepared.migrations[index];
             /*
              * Both lifetimes belong to sibling ROCm devices on this process.
              * They are deliberately incomplete because this participant must
              * never inspect or export them.
              */
-            migration.destination_arrival =
-                std::make_shared<MoEOverlayPreparedExpertArrival>();
+            migration.destination_arrivals.push_back({
+                batch.migrations[index].destination.owner_participant,
+                std::make_shared<MoEOverlayPreparedExpertArrival>()});
         }
 
         std::string error;

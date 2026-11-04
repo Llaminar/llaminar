@@ -227,6 +227,18 @@ namespace
         bool aborted_ = false;
     };
 
+    /** @brief Checked singleton geometry for identity-only component transfer fixtures. */
+    std::shared_ptr<MoEOverlayPreparedProjectionCompletion> identityCompletion(
+        std::shared_ptr<MoEOverlayPreparedExpertArrival> arrival,
+        ExpertTierWeightProjection projection, std::shared_ptr<ITensorGemm> engine)
+    {
+        const MoEExpertProjectionOwnership::Projection whole{
+            MoEProjectionResidence::ExpertOwner, 1, 1, 0, 1, 0, 1};
+        return std::make_shared<MoEOverlayPreparedProjectionCompletion>(
+            std::vector{ExpertTierWeightProjectionIntersection::between(whole, whole)},
+            std::move(arrival), projection, [engine = std::move(engine)] { return engine; });
+    }
+
     /** @brief Scripted physical provider that publishes complete or partial arrivals. */
     class IdentityTransferProvider final
         : public IMoEOverlayParticipantTransferProvider
@@ -251,37 +263,40 @@ namespace
             {
                 auto &entry = prepared.migrations[index];
                 const auto &migration = transaction.migrations[index];
+                entry.operations.resize(3);
+                for(size_t role=0;role<3;++role)
+                    entry.operations[role] = {
+                        .projection=static_cast<ExpertTierWeightProjection>(role),
+                        .destination_participant=migration.destination.owner_participant,
+                        .source_participant=migration.source.owner_participant};
+                std::shared_ptr<MoEOverlayPreparedExpertArrival> arrival;
                 if (!std::binary_search(
                         local_destination_participants.begin(),
                         local_destination_participants.end(),
                         migration.destination.owner_participant))
                 {
-                    for (auto &projection : entry.projections)
+                    for (auto &piece : entry.operations)
                     {
-                        projection =
+                        piece.operation =
                             std::make_unique<ReadyProjectionTransfer>();
                     }
                     continue;
                 }
 
-                entry.destination_arrival =
-                    std::make_shared<MoEOverlayPreparedExpertArrival>();
+                arrival = std::make_shared<MoEOverlayPreparedExpertArrival>();
+                entry.destination_arrivals.push_back({migration.destination.owner_participant,arrival});
                 const auto engines = payload(
                     2000 + migration.destination.owner_participant * 100 +
                     migration.expert_id * 10);
-                entry.projections[0] =
+                entry.operations[0].operation =
                     std::make_unique<MoEOverlayPreparedProjectionOperation>(
                         std::make_unique<ReadyProjectionTransfer>(),
-                        entry.destination_arrival,
-                        ExpertTierWeightProjection::Gate,
-                        engines.gate());
-                entry.projections[1] =
+                        identityCompletion(arrival, ExpertTierWeightProjection::Gate, engines.gate()), 0);
+                entry.operations[1].operation =
                     std::make_unique<MoEOverlayPreparedProjectionOperation>(
                         std::make_unique<ReadyProjectionTransfer>(),
-                        entry.destination_arrival,
-                        ExpertTierWeightProjection::Up,
-                        engines.up());
-                entry.projections[2] = omit_down_
+                        identityCompletion(arrival, ExpertTierWeightProjection::Up, engines.up()), 0);
+                entry.operations[2].operation = omit_down_
                                            ? std::unique_ptr<
                                                  IMoEOverlayTierTransferOperation>(
                                                  std::make_unique<
@@ -292,9 +307,7 @@ namespace
                                                      MoEOverlayPreparedProjectionOperation>(
                                                      std::make_unique<
                                                          ReadyProjectionTransfer>(),
-                                                     entry.destination_arrival,
-                                                     ExpertTierWeightProjection::Down,
-                                                     engines.down()));
+                                                     identityCompletion(arrival, ExpertTierWeightProjection::Down, engines.down()), 0));
             }
             return prepared;
         }
@@ -2876,3 +2889,5 @@ TEST(Test__MoEOverlayParticipantResidency, PipelineStageRuntimeRetainsFixedDownB
 }
 
 #include "PreparedSourceNonemptyBankContract.inc"
+
+#include "PreparedProjectionIntersectionContract.inc"

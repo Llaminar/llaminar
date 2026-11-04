@@ -10,6 +10,8 @@
  */
 
 #include "MoEOverlayParticipantMigration.h"
+#include "MoEExpertShardCohort.h"
+#include "MoEOverlayPreparedWeightSource.h"
 
 #include "../../utils/Logger.h"
 #include "../../utils/PerfStatsCollector.h"
@@ -19,6 +21,7 @@
 #include <exception>
 #include <stdexcept>
 #include <utility>
+#include <tuple>
 
 namespace llaminar2
 {
@@ -81,10 +84,10 @@ namespace llaminar2
             {
                 auto endpoint = registry->endpoint(participant_id);
                 const auto *previous_participant =
-                    transaction.previous->owner_map.participantForId(
+                    transaction.previous->placementOwnerMap().participantForId(
                         participant_id);
                 const auto *candidate_participant =
-                    transaction.candidate->owner_map.participantForId(
+                    transaction.candidate->placementOwnerMap().participantForId(
                         participant_id);
                 if (!endpoint || !previous_participant ||
                     !candidate_participant ||
@@ -132,12 +135,13 @@ namespace llaminar2
                     for (const auto *snapshot :
                          {transaction.previous.get(), transaction.candidate.get()})
                     {
-                        snapshot->owner_map.requireLayerGeometry(
+                        snapshot->placementOwnerMap().requireLayerGeometry(
                             endpoint->numLayers(), endpoint->numExperts(),
                             endpoint->firstModelLayer());
-                        if (snapshot->layered_ownership.firstModelLayer() != endpoint->firstModelLayer() ||
+                        if (snapshot->ownershipKind()==MoEOverlayResidencyOwnershipKind::WholeExperts &&
+                            (snapshot->layered_ownership.firstModelLayer() != endpoint->firstModelLayer() ||
                             snapshot->layered_ownership.layerCount() != endpoint->numLayers() ||
-                            snapshot->layered_ownership.expertCount() != endpoint->numExperts())
+                            snapshot->layered_ownership.expertCount() != endpoint->numExperts()))
                             throw std::logic_error(
                                 "ExpertOverlay migration snapshot belongs to another model stage");
                     }
@@ -163,30 +167,24 @@ namespace llaminar2
              * Remove departures only from unpublished clones.  Arrivals are
              * applied later, after their three physical operations are Ready.
              */
-            for (const auto &migration : transaction.migrations)
-            {
-                const auto found = std::find_if(
-                    candidates.begin(),
-                    candidates.end(),
-                    [&migration](const auto &candidate)
-                    {
-                        return candidate.participant_id ==
-                               migration.source.owner_participant;
-                    });
-                if (found == candidates.end())
-                    continue;
-                if (!found->bank.containsModelLayer(migration.layer_idx) ||
-                    migration.expert_id < 0 ||
-                    migration.expert_id >= found->endpoint->numExperts())
-                {
-                    if (error)
-                        *error = "ExpertOverlay migration departure is outside local bank geometry";
-                    candidates.clear();
-                    return MoEOverlayResidencyStageStartStatus::Failed;
+            try {
+                for(const auto& migration:transaction.migrations) {
+                    const auto target=MoEExpertPlacementTarget::fromPlacement(migration.source);
+                    if(!target)throw std::logic_error("Candidate departure has no checked original source target");
+                    for(size_t member=0;member<target->participantCount();++member) {
+                        const int id=target->participantId(member);
+                        const auto found=std::find_if(candidates.begin(),candidates.end(),[&](const auto& local){return local.participant_id==id;});
+                        if(found==candidates.end())continue;
+                        auto& layer=found->bank.layerForModelLayer(migration.layer_idx);
+                        if(migration.expert_id<0 || size_t(migration.expert_id)>=layer.resident_mask.size() || !layer.resident_mask[size_t(migration.expert_id)])
+                            throw std::logic_error("Candidate departure lost an original source bank resident");
+                        layer.clearExpert(migration.expert_id);
+                    }
                 }
-                found->bank.layerForModelLayer(migration.layer_idx)
-                    .clearExpert(migration.expert_id);
+            } catch(const std::exception& exception) {
+                if(error)*error=exception.what();candidates.clear();return MoEOverlayResidencyStageStartStatus::Failed;
             }
+
             return MoEOverlayResidencyStageStartStatus::Started;
         }
 
@@ -237,8 +235,7 @@ namespace llaminar2
                 std::shared_ptr<const MoEOverlayResidencySnapshot> candidate,
                 std::vector<MoEOverlayTierMigration> migrations,
                 std::vector<LocalCandidateBank> local_candidates,
-                std::vector<std::shared_ptr<MoEOverlayPreparedExpertArrival>>
-                    arrivals,
+                std::vector<std::vector<MoEOverlayParticipantDestinationArrival>> arrivals,
                 std::string perf_device)
                 : registry_(std::move(registry)),
                   transfer_provider_(std::move(transfer_provider)),
@@ -295,36 +292,26 @@ namespace llaminar2
                          ++index)
                     {
                         const auto &migration = migrations_[index];
-                        const auto local_candidate = std::find_if(
-                            local_candidates_.begin(),
-                            local_candidates_.end(),
-                            [&migration](const auto &entry)
-                            {
-                                return entry.participant_id ==
-                                       migration.destination.owner_participant;
-                            });
-                        if (local_candidate == local_candidates_.end())
-                            continue;
-                        if (!arrivals_[index])
-                        {
-                            throw std::logic_error(
-                                "ExpertOverlay local destination has no prepared arrival authority");
+                        for(const auto& destination:arrivals_[index]) {
+                            const auto local=std::find_if(local_candidates_.begin(),local_candidates_.end(),[&](const auto& entry){return entry.participant_id==destination.participant_id;});
+                            if(local==local_candidates_.end() || !destination.arrival)
+                                throw std::logic_error("Candidate arrival has no exact local participant owner");
+                            auto& layer=local->bank.layerForModelLayer(migration.layer_idx);
+                            std::string arrival_error;
+                            if(layer.cpu_fragment_family) {
+                                MoEOverlayPreparedCPUFragmentPayload fragment;
+                                if(destination.arrival->destinationEpoch()!=candidate_->epoch ||
+                                   !destination.arrival->completeCPUFragment(fragment,&arrival_error))
+                                    throw std::runtime_error(arrival_error.empty()?"Candidate CPU fragment arrival has no exact completed epoch":arrival_error);
+                                layer.setResidentCPUFragment(migration.expert_id,std::move(fragment));
+                            } else {
+                                MoEOverlayPreparedExpertPayload payload;
+                                if(!destination.arrival->completePayload(payload,&arrival_error))
+                                    throw std::runtime_error(arrival_error.empty()?"Candidate whole payload remains incomplete":arrival_error);
+                                layer.setResidentExpert(migration.expert_id,std::move(payload));
+                            }
                         }
 
-                        MoEOverlayPreparedExpertPayload payload;
-                        std::string arrival_error;
-                        if (!arrivals_[index]->completePayload(
-                                payload, &arrival_error))
-                        {
-                            throw std::runtime_error(
-                                arrival_error.empty()
-                                    ? "ExpertOverlay destination payload is incomplete after transfer readiness"
-                                    : arrival_error);
-                        }
-                        local_candidate
-                            ->bank.layerForModelLayer(migration.layer_idx)
-                            .setResidentExpert(
-                                migration.expert_id, std::move(payload));
                     }
 
                     /*
@@ -349,7 +336,7 @@ namespace llaminar2
                              ++layer)
                         {
                             const auto expected =
-                                candidate_->owner_map.expertMaskForParticipant(
+                                candidate_->placementOwnerMap().expertMaskForParticipant(
                                     layer,
                                     local.participant_id,
                                     local.endpoint->numExperts());
@@ -715,8 +702,7 @@ namespace llaminar2
             std::shared_ptr<const MoEOverlayResidencySnapshot> candidate_;
             std::vector<MoEOverlayTierMigration> migrations_;
             std::vector<LocalCandidateBank> local_candidates_;
-            std::vector<std::shared_ptr<MoEOverlayPreparedExpertArrival>>
-                arrivals_;
+            std::vector<std::vector<MoEOverlayParticipantDestinationArrival>> arrivals_;
             std::unique_ptr<IMoEOverlayInactiveBankTransaction>
                 device_bank_transaction_;
             std::string perf_device_;
@@ -729,20 +715,154 @@ namespace llaminar2
         flattenOperations(MoEOverlayParticipantPreparedTransfers &prepared)
         {
             std::vector<std::unique_ptr<IMoEOverlayTierTransferOperation>> flat;
-            flat.reserve(
-                prepared.migrations.size() *
-                kMoEOverlayExpertProjectionCount);
+            size_t count=0;
+            for(const auto& migration:prepared.migrations)count+=migration.operations.size();
+            flat.reserve(count);
             for (auto &migration : prepared.migrations)
             {
-                for (auto &projection : migration.projections)
+                for (auto &piece : migration.operations)
                 {
-                    if (projection)
-                        flat.push_back(std::move(projection));
+                    if (piece.operation)
+                        flat.push_back(std::move(piece.operation));
                 }
             }
             return flat;
         }
     } // namespace
+
+    bool MoEOverlayPreparedCPUFragmentPayload::validateRole(
+        const MoEExpertShardCohort &cohort, std::size_t member, ExpertTierWeightProjection role,
+        const std::shared_ptr<ITensorGemm> &engine, std::string *error)
+    {
+        if (error)
+            error->clear();
+        const auto reject = [&](const std::string &message)
+        {
+            if (error)
+                *error = message;
+            return false;
+        };
+        if (member >= cohort.participants().size() || !engine || static_cast<unsigned>(role) > 2)
+            return reject("CPU fragment role requires its original member and actual local engine");
+        const auto local = cohort.localManifest(member);
+        const auto expected =
+            std::find_if(local.projections.begin(), local.projections.end(),
+                         [role](const auto &projection) { return projection.projection == role; });
+        if (expected == local.projections.end())
+            return reject("CPU fragment role is absent from its original source manifest");
+        MoEOverlayPreparedWeightSource source;
+        if (!resolveMoEOverlayPreparedWeightSource(
+                engine, cohort.participants()[member].address.toLocalDeviceId(), source,
+                error))
+            return false;
+        int rows = 0, columns = 0;
+        if (source.kind == MoEOverlayPreparedWeightSourceKind::CpuNativeVnni)
+        {
+            rows = source.cpu_packed->N;
+            columns = source.cpu_packed->K;
+        }
+        else if (source.kind == MoEOverlayPreparedWeightSourceKind::CpuContiguousFloating)
+        {
+            rows = source.floating.n;
+            columns = source.floating.k;
+        }
+        else
+            return reject("CPU fragment arrival cannot adopt a foreign GPU prepared engine");
+        if (rows != expected->N || columns != expected->K || source.format != expected->format)
+            return reject("CPU fragment engine differs from its original local projection "
+                          "geometry/source format");
+        return true;
+    }
+
+    MoEOverlayPreparedCPUFragmentPayload::MoEOverlayPreparedCPUFragmentPayload(
+        ModelContextId model, std::shared_ptr<const MoEExpertOverlayPreparationPlan> preparation,
+        std::shared_ptr<const MoEExpertShardCohort> cohort, std::size_t member, int expert,
+        std::array<std::shared_ptr<ITensorGemm>, 3> engines)
+        : model_(model), preparation_(std::move(preparation)), cohort_(std::move(cohort)),
+          member_(member), expert_(expert), engines_(std::move(engines))
+    {
+        if (!model_.value || !preparation_ || !cohort_ ||
+            member_ >= cohort_->participants().size() || expert_ < 0 ||
+            expert_ >= cohort_->ownership(member_).geometry().experts)
+            throw std::invalid_argument("CPU fragment payload requires original "
+                                        "model/preparation/cohort/member/expert provenance");
+        for (std::size_t role = 0; role < engines_.size(); ++role)
+        {
+            std::string error;
+            if (!validateRole(*cohort_, member_, static_cast<ExpertTierWeightProjection>(role),
+                              engines_[role], &error))
+                throw std::invalid_argument(error);
+        }
+    }
+
+    bool MoEOverlayPreparedCPUFragmentPayload::valid() const noexcept
+    {
+        return model_.value && preparation_ && cohort_ && engines_[0] && engines_[1] && engines_[2];
+    }
+
+    bool MoEOverlayPreparedCPUFragmentPayload::sameIdentity(
+        const MoEOverlayPreparedCPUFragmentPayload &other) const noexcept
+    {
+        const auto same = [](const auto &a, const auto &b)
+        { return a.get() == b.get() && !a.owner_before(b) && !b.owner_before(a); };
+        if (empty() || other.empty())
+            return empty() && other.empty();
+        return model_.value == other.model_.value && member_ == other.member_ &&
+               expert_ == other.expert_ && same(cohort_, other.cohort_) &&
+               same(preparation_, other.preparation_) && same(engines_[0], other.engines_[0]) &&
+               same(engines_[1], other.engines_[1]) && same(engines_[2], other.engines_[2]);
+    }
+
+    MoEOverlayPreparedExpertArrival::MoEOverlayPreparedExpertArrival(
+        ModelContextId model, std::shared_ptr<const MoEExpertOverlayPreparationPlan> preparation,
+        std::shared_ptr<const MoEExpertShardCohort> cohort, std::size_t member,
+        uint64_t candidate_epoch, int expert)
+        : fragment_destination_(CPUFragmentDestination{
+              model, std::move(preparation), std::move(cohort), member, candidate_epoch, expert}),
+          projections_(DeviceMoEProjectionSet::CompleteExpert)
+    {
+        const auto &destination = *fragment_destination_;
+        if (!destination.model.value || !destination.preparation || !destination.cohort ||
+            !destination.epoch || destination.member >= destination.cohort->participants().size() ||
+            destination.expert < 0 ||
+            destination.expert >=
+                destination.cohort->ownership(destination.member).geometry().experts)
+            throw std::invalid_argument(
+                "CPU fragment arrival requires its original fixed-cohort candidate destination");
+    }
+
+    bool MoEOverlayPreparedExpertArrival::completeCPUFragment(
+        MoEOverlayPreparedCPUFragmentPayload &payload, std::string *error) const
+    {
+        if (error)
+            error->clear();
+        std::lock_guard lock(mutex_);
+        payload = {};
+        if (!fragment_destination_ || !failure_.empty() || !engines_[0] || !engines_[1] ||
+            !engines_[2])
+        {
+            if (error)
+                *error =
+                    !failure_.empty()
+                        ? failure_
+                        : "CPU fragment arrival is wrong-arm or lacks its complete local triplet";
+            return false;
+        }
+        const auto &destination = *fragment_destination_;
+        try
+        {
+            payload = MoEOverlayPreparedCPUFragmentPayload(
+                destination.model, destination.preparation, destination.cohort, destination.member,
+                destination.expert, engines_);
+            return true;
+        }
+        catch (const std::exception &exception)
+        {
+            if (error)
+                *error = exception.what();
+            return false;
+        }
+    }
 
     MoEOverlayPreparedExpertArrival::MoEOverlayPreparedExpertArrival(DeviceMoEProjectionSet projections)
         : projections_(projections)
@@ -775,8 +895,12 @@ namespace llaminar2
         }
         try
         {
+            if (fragment_destination_ && !MoEOverlayPreparedCPUFragmentPayload::validateRole(
+                *fragment_destination_->cohort, fragment_destination_->member, projection, engine, error))
+                return false;
             auto &field = projectionField(engines_, projection);
-            if (field && field.get() != engine.get())
+            if (field && (field.get() != engine.get() || (fragment_destination_ &&
+                (field.owner_before(engine) || engine.owner_before(field)))))
             {
                 if (error)
                     *error = "ExpertOverlay projection was published with a different engine identity";
@@ -818,6 +942,12 @@ namespace llaminar2
             payload = {};
             return false;
         }
+        if (fragment_destination_)
+        {
+            if (error) *error = "CPU fragment arrival cannot produce a whole-expert payload";
+            payload = {};
+            return false;
+        }
         if (!engines_[0] || !engines_[1] ||
             (projections_ == DeviceMoEProjectionSet::CompleteExpert && !engines_[2]))
         {
@@ -832,39 +962,144 @@ namespace llaminar2
         return true;
     }
 
-    MoEOverlayPreparedProjectionOperation::
-        MoEOverlayPreparedProjectionOperation(
-            std::unique_ptr<IMoEOverlayTierTransferOperation> operation,
-            std::shared_ptr<MoEOverlayPreparedExpertArrival> arrival,
-            ExpertTierWeightProjection projection,
-            std::shared_ptr<ITensorGemm> engine)
-        : operation_(std::move(operation)),
-          arrival_(std::move(arrival)),
-          projection_(projection),
-          engine_(std::move(engine))
+    MoEOverlayPreparedProjectionCompletion::MoEOverlayPreparedProjectionCompletion(
+        std::vector<ExpertTierWeightProjectionIntersection> intersections,
+        std::shared_ptr<MoEOverlayPreparedExpertArrival> arrival,
+        ExpertTierWeightProjection projection,
+        std::function<std::shared_ptr<ITensorGemm>()> engine_provider)
+        : intersections_(std::move(intersections)), arrival_(std::move(arrival)),
+          projection_(projection), engine_provider_(std::move(engine_provider)),
+          claimed_(intersections_.size(), false), ready_(intersections_.size(), false)
     {
-        if (!operation_ || !arrival_ || !engine_)
-        {
+        if (!arrival_ || !engine_provider_ || intersections_.empty() ||
+            static_cast<unsigned>(projection_) >
+                static_cast<unsigned>(ExpertTierWeightProjection::Down) ||
+            (projection_ == ExpertTierWeightProjection::Down &&
+             arrival_->projections() != DeviceMoEProjectionSet::CompleteExpert))
             throw std::invalid_argument(
-                "ExpertOverlay prepared projection requires operation, arrival, and engine ownership");
+                "ExpertOverlay completion requires a known role, coverage and final engine owner");
+        const auto &destination = intersections_.front().destination();
+        uint64_t covered = 0;
+        for (std::size_t i = 0; i < intersections_.size(); ++i)
+        {
+            const auto &piece = intersections_[i];
+            if (piece.empty() || piece.destination() != destination)
+                throw std::invalid_argument(
+                    "ExpertOverlay completion has empty or foreign destination coverage");
+            for (std::size_t j = 0; j < i; ++j)
+            {
+                const auto &other = intersections_[j];
+                if (std::max(piece.firstRow(), other.firstRow()) <
+                        std::min(piece.firstRow() + piece.rows(),
+                                 other.firstRow() + other.rows()) &&
+                    std::max(piece.firstColumn(), other.firstColumn()) <
+                        std::min(piece.firstColumn() + piece.columns(),
+                                 other.firstColumn() + other.columns()))
+                    throw std::invalid_argument("ExpertOverlay completion intersections overlap");
+            }
+            // All disjoint pieces are contained in this positive int-sized
+            // destination, so their area sum is bounded by its uint64 area.
+            covered += uint64_t(piece.rows()) * uint64_t(piece.columns());
         }
+        if (covered != uint64_t(destination.rows) * uint64_t(destination.columns))
+            throw std::invalid_argument(
+                "ExpertOverlay completion intersections leave a destination gap");
+    }
+
+    void MoEOverlayPreparedProjectionCompletion::claim(std::size_t piece)
+    {
+        std::lock_guard lock(mutex_);
+        if (piece >= claimed_.size() || claimed_[piece])
+            throw std::invalid_argument(
+                "ExpertOverlay completion piece requires one original operation owner");
+        claimed_[piece] = true;
+    }
+
+    bool MoEOverlayPreparedProjectionCompletion::failed(std::string *error) const noexcept
+    {
+        std::lock_guard lock(mutex_);
+        if (failure_.empty())
+            return false;
+        if (error)
+            *error = failure_;
+        return true;
+    }
+
+    void MoEOverlayPreparedProjectionCompletion::fail(std::string error) noexcept
+    {
+        std::lock_guard lock(mutex_);
+        if (failure_.empty())
+            failure_ = std::move(error);
+        (void)arrival_->fail(failure_);
+    }
+
+    bool MoEOverlayPreparedProjectionCompletion::ready(std::size_t piece,
+                                                       std::string *error) noexcept
+    {
+        std::lock_guard lock(mutex_);
+        if (!failure_.empty())
+        {
+            if (error)
+                *error = failure_;
+            return false;
+        }
+        ready_[piece] = true; // Only a uniquely claimed operation can call this private edge.
+        if (published_ ||
+            !std::all_of(ready_.begin(), ready_.end(), [](bool value) { return value; }))
+            return true;
+        try
+        {
+            auto engine = engine_provider_();
+            if (!engine || !arrival_->publish(projection_, std::move(engine), &failure_))
+            {
+                if (failure_.empty())
+                    failure_ =
+                        "ExpertOverlay completed intersections lack the final destination engine";
+            }
+            else
+            {
+                published_ = true;
+                return true;
+            }
+        }
+        catch (const std::exception &exception)
+        {
+            failure_ = exception.what();
+        }
+        catch (...)
+        {
+            failure_ = "ExpertOverlay final destination engine provider failed";
+        }
+        (void)arrival_->fail(failure_);
+        if (error)
+            *error = failure_;
+        return false;
+    }
+
+    MoEOverlayPreparedProjectionOperation::MoEOverlayPreparedProjectionOperation(
+        std::unique_ptr<IMoEOverlayTierTransferOperation> operation,
+        std::shared_ptr<MoEOverlayPreparedProjectionCompletion> completion, std::size_t piece)
+        : operation_(std::move(operation)), completion_(std::move(completion)), piece_(piece)
+    {
+        if (!operation_ || !completion_)
+            throw std::invalid_argument(
+                "ExpertOverlay prepared piece requires physical operation and checked completion");
+        completion_->claim(piece_);
     }
 
     MoEOverlayResidencyWaveProgress
-    MoEOverlayPreparedProjectionOperation::poll(
-        std::string *error) noexcept
+    MoEOverlayPreparedProjectionOperation::poll(std::string *error) noexcept
     {
         if (error)
             error->clear();
-        if (aborted_)
+        if (aborted_ || completion_->failed(error))
         {
-            if (error)
+            if (aborted_ && error)
                 *error = "ExpertOverlay prepared projection was aborted";
             return MoEOverlayResidencyWaveProgress::Failed;
         }
-        if (published_)
+        if (ready_)
             return MoEOverlayResidencyWaveProgress::Ready;
-
         std::string operation_error;
         const auto progress = operation_->poll(&operation_error);
         if (progress == MoEOverlayResidencyWaveProgress::Pending)
@@ -873,24 +1108,14 @@ namespace llaminar2
         {
             if (operation_error.empty())
                 operation_error = "ExpertOverlay physical projection transfer failed";
-            (void)arrival_->fail(operation_error);
+            completion_->fail(operation_error);
             if (error)
-                *error = std::move(operation_error);
+                *error = operation_error;
             return progress;
         }
-
-        std::string publication_error;
-        if (!arrival_->publish(
-                projection_, engine_, &publication_error))
-        {
-            if (publication_error.empty())
-                publication_error = "ExpertOverlay prepared projection publication failed";
-            (void)arrival_->fail(publication_error);
-            if (error)
-                *error = std::move(publication_error);
+        if (!completion_->ready(piece_, error))
             return MoEOverlayResidencyWaveProgress::Failed;
-        }
-        published_ = true;
+        ready_ = true;
         return MoEOverlayResidencyWaveProgress::Ready;
     }
 
@@ -899,14 +1124,12 @@ namespace llaminar2
         if (aborted_)
             return;
         aborted_ = true;
-        (void)arrival_->fail(
-            "ExpertOverlay prepared projection was discarded before publication");
+        completion_->fail("ExpertOverlay prepared projection was discarded before publication");
         operation_->abort();
     }
 
     MoEOverlayResidencyWaveProgress
-    MoEOverlayPreparedProjectionOperation::pollAbort(
-        std::string *error) noexcept
+    MoEOverlayPreparedProjectionOperation::pollAbort(std::string *error) noexcept
     {
         if (!aborted_)
         {
@@ -918,10 +1141,9 @@ namespace llaminar2
     }
 
     std::optional<ExpertTierProjectionTransferMeasurement>
-    MoEOverlayPreparedProjectionOperation::completedMeasurement()
-        const noexcept
+    MoEOverlayPreparedProjectionOperation::completedMeasurement() const noexcept
     {
-        if (!published_ || aborted_ || !operation_)
+        if (!ready_ || aborted_ || completion_->failed(nullptr))
             return std::nullopt;
         return operation_->completedMeasurement();
     }
@@ -1000,15 +1222,13 @@ namespace llaminar2
             return result;
         }
 
-        std::vector<std::shared_ptr<MoEOverlayPreparedExpertArrival>> arrivals(
-            transaction.migrations.size());
+        std::vector<std::vector<MoEOverlayParticipantDestinationArrival>> arrivals(transaction.migrations.size());
         for (std::size_t index = 0;
              index < std::min(
                  prepared.migrations.size(), transaction.migrations.size());
              ++index)
         {
-            arrivals[index] =
-                prepared.migrations[index].destination_arrival;
+            arrivals[index]=prepared.migrations[index].destination_arrivals;
         }
 
         auto inactive_bank = std::make_unique<ParticipantInactiveBankTransaction>(
@@ -1042,26 +1262,48 @@ namespace llaminar2
                  index < prepared.migrations.size();
                  ++index)
             {
-                const bool local_destination = containsParticipant(
-                    local_ids,
-                    transaction.migrations[index]
-                        .destination.owner_participant);
-                const bool exact_arrival =
-                    static_cast<bool>(prepared.migrations[index]
-                                          .destination_arrival) ==
-                    local_destination;
-                const bool complete_operations = std::all_of(
-                    prepared.migrations[index].projections.begin(),
-                    prepared.migrations[index].projections.end(),
-                    [](const auto &operation)
-                    {
-                        return operation != nullptr;
-                    });
-                if (!exact_arrival || !complete_operations)
-                {
-                    started_shape_ok = false;
-                    break;
+                const auto& migration=transaction.migrations[index];
+                const auto source=MoEExpertPlacementTarget::fromPlacement(migration.source);
+                const auto destination=MoEExpertPlacementTarget::fromPlacement(migration.destination);
+                if(!source || !destination){started_shape_ok=false;break;}
+                const auto memberIndex=[](const MoEExpertPlacementTarget& target,int id)->std::optional<size_t>{
+                    for(size_t member=0;member<target.participantCount();++member)if(target.participantId(member)==id)return member;
+                    return std::nullopt;
+                };
+                std::optional<std::tuple<unsigned,size_t,size_t>> prior;
+                const auto& record=prepared.migrations[index];
+                for(const auto& piece:record.operations) {
+                    const auto src=memberIndex(*source,piece.source_participant),dst=memberIndex(*destination,piece.destination_participant);
+                    const auto role=static_cast<unsigned>(piece.projection);
+                    if(!piece.operation || !src || !dst || role>=kMoEOverlayExpertProjectionCount){started_shape_ok=false;break;}
+                    const auto order=std::tuple{role,*dst,*src};
+                    if(prior && !(*prior<order)){started_shape_ok=false;break;}prior=order;
                 }
+                if(!started_shape_ok)break;
+                size_t local_arrival=0;
+                for(size_t member=0;member<destination->participantCount();++member) {
+                    const int id=destination->participantId(member);
+                    if(!containsParticipant(config_.registry->localParticipantIds(),id))continue;
+                    if(local_arrival>=record.destination_arrivals.size() || record.destination_arrivals[local_arrival].participant_id!=id ||
+                       !record.destination_arrivals[local_arrival].arrival){started_shape_ok=false;break;}
+                    const auto& arrival=record.destination_arrivals[local_arrival++].arrival;
+                    if(arrival->isCPUJointFragment()!=config_.registry->isCPUJointParticipant(id) ||
+                       (arrival->isCPUJointFragment() && arrival->destinationEpoch()!=transaction.candidate->epoch)) {started_shape_ok=false;break;}
+                    for(size_t previous=0;previous+1<local_arrival;++previous)
+                        if(record.destination_arrivals[previous].arrival.get()==arrival.get()){started_shape_ok=false;break;}
+                    // Each required role has real/protocol work. Exact native
+                    // intersection coverage remains the all-piece completion's proof.
+                    for(unsigned role=0;role<kMoEOverlayExpertProjectionCount;++role) {
+                        if(arrival->projections()==DeviceMoEProjectionSet::GateUp && role==unsigned(ExpertTierWeightProjection::Down))continue;
+                        if(std::none_of(record.operations.begin(),record.operations.end(),[&](const auto& piece){return piece.destination_participant==id && unsigned(piece.projection)==role;}))started_shape_ok=false;
+                    }
+                }
+                if(local_arrival!=record.destination_arrivals.size()){started_shape_ok=false;}
+                const auto local_ids=config_.registry->localParticipantIds();
+                const bool local_source=std::any_of(local_ids.begin(),local_ids.end(),[&](int id){return bool(memberIndex(*source,id));});
+                if((local_source || local_arrival) && record.operations.empty())started_shape_ok=false;
+                if(!started_shape_ok)break;
+
             }
         }
 

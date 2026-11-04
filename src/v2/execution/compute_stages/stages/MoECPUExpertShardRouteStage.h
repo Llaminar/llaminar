@@ -118,6 +118,14 @@ public:
     /** @return Existing borrowed tensor requirements; no private allocation or capacity ledger. */
     StageBufferRequirements getBufferRequirements() const override;
 private:
+    /**
+     * @brief Execute using the packet's exact existing participant epoch bank.
+     * @param ctx Original scheduling context; native CPU authority remains separately authenticated.
+     * @param completed_bank Optional recipient of the successful follower's retained bank reader.
+     * @return False only through the existing fatal publication path.
+     */
+    bool executeWithBank(IDeviceContext* ctx,MoEOverlayParticipantBankLease* completed_bank);
+
     /** @return Whether the original immutable ticket binding still names this exact layer, shape and GPU. */
     bool hasOriginalCanonicalTicket() const noexcept;
     /** @return Original immutable tensor/geometry diagnostics, without probing runtime state. */

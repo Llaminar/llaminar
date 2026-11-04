@@ -34,9 +34,10 @@ private:
         MoEOverlayActivationEpochIdentity identity,std::uint32_t stage,
         std::shared_ptr<const CPUExpertShardSourceSelection> source,
         std::shared_ptr<IGlobalTPContext> context,int root,
-        std::shared_ptr<const MoEOverlayParticipantResidencyRegistry::CPUJointLayer> prepared)
+        std::shared_ptr<const MoEOverlayParticipantResidencyRegistry::CPUJointLayer> prepared,
+        MoEOverlayParticipantBankLease bank)
         :control_(control),identity_(identity),stage_(stage),source_(std::move(source)),
-         context_(std::move(context)),root_(root),prepared_(std::move(prepared)){}
+         context_(std::move(context)),root_(root),prepared_(std::move(prepared)),bank_(std::move(bank)){}
     const MoEOverlayActivationEpochControl *control_;
     MoEOverlayActivationEpochIdentity identity_;
     std::uint32_t stage_;
@@ -44,5 +45,6 @@ private:
     std::shared_ptr<IGlobalTPContext> context_;
     int root_;
     std::shared_ptr<const MoEOverlayParticipantResidencyRegistry::CPUJointLayer> prepared_;
+    MoEOverlayParticipantBankLease bank_; ///< Same completed epoch survives until the sole final return edge.
 };
 } // namespace llaminar2

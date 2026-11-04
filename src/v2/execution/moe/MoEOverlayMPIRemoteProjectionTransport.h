@@ -138,14 +138,15 @@ namespace llaminar2
         [[nodiscard]] virtual bool complete() const noexcept = 0;
 
         /**
-         * @brief Publish the prepared execution object after final-byte readiness.
+         * @brief Finalize the prepared execution object after final-byte readiness.
          * @param error Optional exact publication diagnostic.
-         * @return True only when the destination may participate in bank commit.
+         * @return True only when original final storage is complete and may finish its transport operation.
          *
          * The MPI operation calls this once after @ref complete becomes true and
          * before releasing its lane. Device-free storage oracles may implement
-         * an explicit no-op; production endpoints use it to publish the exact
-         * prepared engine into their candidate expert arrival authority.
+         * an explicit no-op. Production endpoints finalize their reserved engine;
+         * candidate arrival publication is a separate outer-operation edge and
+         * requires every checked destination intersection to report Ready.
          */
         virtual bool publishFinal(std::string *error = nullptr) noexcept = 0;
 

@@ -77,8 +77,8 @@ MoECPUExpertShardRouteStage::MoECPUExpertShardRouteStage(Params params)
     if(sparse && (!p.original_return_rows || (root && !p.original_canonical_ticket && (!p.original_preweighted_routes ||
        p.original_return_route_capacity<slots))))
         throw std::invalid_argument("CPU shard sparse return requires the exact original endpoint return bank");
-    if(p.original_prepared_layer && (!p.original_prepared_layer->source() ||
-       p.original_prepared_layer->source()->cpu_joint_source!=p.original_source ||
+    if(p.original_prepared_layer && (!p.original_prepared_layer->sourceSelection() ||
+       p.original_prepared_layer->sourceSelection()!=p.original_source ||
        p.original_prepared_layer->participantId()!=source.participant().participant_id ||
        p.original_prepared_layer->layer()!=source.layer()))
         throw std::invalid_argument("CPU shard gather replaced its original prepared source publication");
@@ -113,10 +113,14 @@ MoECPUExpertShardRouteStage::MoECPUExpertShardRouteStage(Params params)
         }
     }
 }
-bool MoECPUExpertShardRouteStage::execute(IDeviceContext *ctx) {
+bool MoECPUExpertShardRouteStage::execute(IDeviceContext* ctx)
+{return executeWithBank(ctx,nullptr);}
+bool MoECPUExpertShardRouteStage::executeWithBank(IDeviceContext *ctx,MoEOverlayParticipantBankLease* completed_bank) {
     auto &p=params_;
     std::optional<MoEOverlayCanonicalRouteReturnTicketStorage::Publication> publication;
     size_t local=0, gathered=0;
+    MoEOverlayParticipantBankLease invocation_bank;
+    const auto finish=[&](){if(completed_bank)*completed_bank=invocation_bank;return true;};
     const auto reject=[&](const char* reason){
         // Preserve the exact original rejection before requestAbort may terminate
         // the MPI job. These are borrowed host metadata, never runtime probes.
@@ -140,6 +144,12 @@ bool MoECPUExpertShardRouteStage::execute(IDeviceContext *ctx) {
         }
         p.tp->requestAbort();return false;
     };
+    if(p.original_sparse_routes) {
+        if(!p.original_prepared_layer)return reject("original_prepared_layer_missing");
+        auto epoch=p.original_prepared_layer->acquireEpoch(p.original_sparse_routes->residency_epoch);
+        if(!epoch)return reject("original_sparse_epoch_bank");
+        invocation_bank=epoch->bankLease();
+    }
     if(p.original_canonical_ticket) {
         const auto* native=dynamic_cast<const GlobalTPContext*>(p.tp);
         const auto* input=p.original_sparse_routes;
@@ -148,7 +158,7 @@ bool MoECPUExpertShardRouteStage::execute(IDeviceContext *ctx) {
         if(!native->authenticatesOriginalCPUExpertBorrow(p.original_tp_owner))return reject("original_native_context_borrow");
         if(!p.original_prepared_layer)return reject("original_prepared_layer_missing");
         if(!input)return reject("original_sparse_packet_missing");
-        if(input->residency_epoch!=p.original_prepared_layer->epoch())return reject("original_sparse_epoch");
+        if(!invocation_bank || input->residency_epoch!=invocation_bank->epoch)return reject("original_sparse_epoch");
         if(input->key.layer_idx!=p.original_source->layer())return reject("original_sparse_layer");
         if(input->target_participant!=p.original_source->participant().participant_id)return reject("original_sparse_participant");
         publication.emplace(p.original_canonical_ticket->arm(input->residency_epoch));
@@ -207,7 +217,7 @@ bool MoECPUExpertShardRouteStage::execute(IDeviceContext *ctx) {
             p.original_return_rows->live_row_count=0u;
             p.original_return_rows->layout=MoEOverlayReturnLayout::CanonicalExpertRoutes;
         }
-        publish();return true;
+        publish();return finish();
     }
     std::optional<cpu::moe::CanonicalShardSparseRouteView> sparse_view;
     if(sparse)sparse_view=cpu::moe::CanonicalShardSparseRouteView{
@@ -217,7 +227,8 @@ bool MoECPUExpertShardRouteStage::execute(IDeviceContext *ctx) {
     if(!cpu::moe::combineCanonicalShardRouteRecords({
         {records,gathered*canonical_moe_route_record::recordWidth(p.columns)},p.source_ranges,
         {p.route_indices?p.route_indices->data():nullptr,p.route_indices?slots:0},
-        {p.route_weights?p.route_weights->data():nullptr,p.route_weights?slots:0},p.original_source->expertIds(),
+        {p.route_weights?p.route_weights->data():nullptr,p.route_weights?slots:0},
+        invocation_bank?std::span<const int>(invocation_bank->layerForModelLayer(p.original_source->layer()).cpu_fragment_expert_ids):p.original_source->expertIds(),
         p.participant_route_maps,p.required_route_weights,
         {p.combined_routes->mutable_data(),slots*static_cast<size_t>(p.columns)},
         p.original_source->ownership().geometry().experts,p.rows,p.top_k,p.columns,sparse_view})) return reject("canonical_fixed_order_combine");
@@ -230,7 +241,7 @@ bool MoECPUExpertShardRouteStage::execute(IDeviceContext *ctx) {
         p.original_return_rows->layout=MoEOverlayReturnLayout::CanonicalExpertRoutes;
     }
     publish();
-    return true;
+    return finish();
 }
 bool MoECPUExpertShardRouteStage::acceptsSchedulingContext(DeviceId scheduling_device) const noexcept {
     return scheduling_device.is_cpu() ||
@@ -274,8 +285,8 @@ std::optional<CPUExpertShardRouteCompletion> MoECPUExpertShardRouteStage::execut
     const auto* native=dynamic_cast<const GlobalTPContext*>(params_.tp);
     const char* invalid = !native ? "original_native_context_type"
         : !params_.original_prepared_layer ? "original_prepared_layer_missing"
-        : !params_.original_prepared_layer->source() ? "original_prepared_source_missing"
-        : params_.original_prepared_layer->source()->cpu_joint_source!=params_.original_source ? "original_source_lease"
+        : !params_.original_prepared_layer->sourceSelection() ? "original_prepared_source_missing"
+        : params_.original_prepared_layer->sourceSelection()!=params_.original_source ? "original_source_lease"
         : !native->authenticatesOriginalCPUExpertBorrow(params_.original_tp_owner) ? "original_native_context_borrow"
         : !params_.original_tp_owner || params_.original_tp_owner.get()!=params_.tp ? "original_native_context_owner"
         : !protocol.matchesActiveIdentity(identity) ? "original_protocol_identity"
@@ -298,7 +309,8 @@ std::optional<CPUExpertShardRouteCompletion> MoECPUExpertShardRouteStage::execut
         (role!=MoEOverlayInferenceGraphRole::MainPrefill && role!=MoEOverlayInferenceGraphRole::MainDecode &&
          role!=MoEOverlayInferenceGraphRole::MTPDraft && role!=MoEOverlayInferenceGraphRole::MTPGroupedVerifier) ||
         original->key.histogram_source!=expected_phase)return reject_original("original_graph_phase");
-    if(!execute(ctx))return std::nullopt; // The actual execution logs its precise rejection before abort.
+    MoEOverlayParticipantBankLease completed_bank;
+    if(!executeWithBank(ctx,&completed_bank))return std::nullopt; // Exact epoch retained through final return.
     if(!protocol.matchesActiveIdentity(identity)) {
         LOG_ERROR("[MoECPUExpertShardRouteStage] Original endpoint identity changed after execute: stage=" << params_.stage_name);
         return std::nullopt;
@@ -307,7 +319,7 @@ std::optional<CPUExpertShardRouteCompletion> MoECPUExpertShardRouteStage::execut
         const auto &input=*params_.original_sparse_routes;
         auto &output=*params_.original_return_rows;
         const auto &dispatch=protocol.control_->buffers[moeOverlayActivationBufferIndex(stage)].dispatch_descriptor;
-        if(input.residency_epoch!=params_.original_prepared_layer->epoch() ||
+        if(!completed_bank || input.residency_epoch!=completed_bank->epoch ||
            input.residency_epoch!=dispatch.placement_epoch || input.live_row_count!=dispatch.live_rows ||
            input.live_entry_count!=dispatch.live_entries || input.target_participant!=source.participant().participant_id ||
            output.residency_epoch!=input.residency_epoch || output.source_participant!=input.target_participant ||
@@ -338,7 +350,7 @@ std::optional<CPUExpertShardRouteCompletion> MoECPUExpertShardRouteStage::execut
         } else output.live_row_count=0;
     }
     return CPUExpertShardRouteCompletion(protocol.control_,identity,stage,params_.original_source,
-        params_.original_tp_owner,params_.root_participant,params_.original_prepared_layer);
+        params_.original_tp_owner,params_.root_participant,params_.original_prepared_layer,std::move(completed_bank));
 }
 StageBufferRequirements MoECPUExpertShardRouteStage::getBufferRequirements() const {
     StageBufferRequirements r;

@@ -294,11 +294,12 @@ namespace llaminar2
                      expert_offset < expert_ids.size(); ++expert_offset)
                 {
                     const int expert_id = expert_ids[expert_offset];
-                    const auto *old_owner = previous->ownerFor(
-                        placement.layer,
-                        expert_id);
+                    const auto *old_owner = previous->placementFor(placement.layer, expert_id);
                     if (!old_owner || old_owner->tier_idx != tier_idx)
                         continue;
+                    if (old_owner->shard_cohort)
+                        throw std::logic_error(
+                            "A retained CPU cohort cannot become a scalar whole owner");
 
                     const auto participant_it = std::find(
                         participant_ids.begin(),
@@ -543,6 +544,130 @@ namespace llaminar2
         canonicalizeOwnerOrder(result.owners_);
         if(result.owners_.size()!=plan.placements.size()*experts)
             throw std::logic_error("CPU shard placement lost original logical expert coverage");
+        return result;
+    }
+
+    MoEExpertOwnerMap
+    MoEExpertOwnerMap::buildShardTransition(const MoERoutedExpertPlacementPlan &plan,
+                                            const MoEExpertOwnerMap &previous,
+                                            const MoEExpertOwnerMap &original)
+    {
+        const auto validation = validateMoERoutedExpertPlacementPlan(plan);
+        if (!plan.usesExpertOverlayAuthority() || !usesCPUJointFragments(plan) ||
+            plan.placements.empty() || !validation.ok())
+            throw std::invalid_argument(
+                "Joint placement transition requires complete unchanged source topology");
+        MoEExpertOwnerMap result;
+        result.participants_ = declaredParticipants(plan, {.reject_tensor_sharded_domains = false});
+        if (result.participants_ != original.participants_ ||
+            result.participants_ != previous.participants_)
+            throw std::invalid_argument(
+                "Joint placement transition changed original participant topology");
+        std::size_t total = 0;
+        for (const auto &placement : plan.placements)
+        {
+            const auto experts = placement.routed_expert_tier.size();
+            total += experts;
+            // These short-lived aliases accelerate this layer's construction;
+            // the original map remains the sole source of cohort identity.
+            std::vector<std::shared_ptr<const MoEExpertShardCohort>> cohorts(
+                plan.routed_tiers.size());
+            std::vector<std::size_t> source_counts(plan.routed_tiers.size(), 0);
+            std::vector<std::size_t> previous_counts(plan.routed_tiers.size(), 0);
+            std::vector<std::size_t> candidate_counts(plan.routed_tiers.size(), 0);
+            const auto checked_tier = [&](const MoEExpertOwner *row, int expert) -> std::size_t
+            {
+                if (!row || row->layer_idx != placement.layer || row->expert_id != expert ||
+                    !row->resident || row->tier_idx < 0 ||
+                    std::size_t(row->tier_idx) >= plan.routed_tiers.size() ||
+                    !MoEExpertPlacementTarget::fromPlacement(*row))
+                    throw std::invalid_argument(
+                        "Joint placement transition has foreign original layer/expert coordinates");
+                return std::size_t(row->tier_idx);
+            };
+            for (std::size_t expert = 0; expert < experts; ++expert)
+            {
+                const auto *source = original.placementFor(placement.layer, int(expert));
+                const auto tier = checked_tier(source, int(expert));
+                const auto &domain =
+                    requireDomain(plan, plan.routed_tiers[tier].domain, "joint transition");
+                const bool joint =
+                    domain.routed_compute_policy == RoutedExpertComputePolicy::TensorSharded &&
+                    domain.participants.size() > 1 && domain.participants.front().isCPU();
+                if (joint != bool(source->shard_cohort))
+                    throw std::invalid_argument(
+                        "Joint placement transition changed original projection ownership");
+                if (source->shard_cohort)
+                {
+                    auto &retained = cohorts[tier];
+                    if (retained && (retained.get() != source->shard_cohort.get() ||
+                                     retained.owner_before(source->shard_cohort) ||
+                                     source->shard_cohort.owner_before(retained)))
+                        throw std::invalid_argument(
+                            "Joint source tier contains different original cohort owners");
+                    retained = source->shard_cohort;
+                }
+                ++source_counts[tier];
+            }
+            for (std::size_t expert = 0; expert < experts; ++expert)
+            {
+                const auto *old = previous.placementFor(placement.layer, int(expert));
+                const auto tier = checked_tier(old, int(expert));
+                if (cohorts[tier])
+                {
+                    if (old->shard_cohort.get() != cohorts[tier].get() ||
+                        old->shard_cohort.owner_before(cohorts[tier]) ||
+                        cohorts[tier].owner_before(old->shard_cohort))
+                        throw std::invalid_argument(
+                            "Joint live placement replaced original source cohort/cuts");
+                }
+                else if (old->shard_cohort)
+                    throw std::invalid_argument(
+                        "Joint live placement introduced a foreign source cohort");
+                ++previous_counts[tier];
+                const int destination = placement.routed_expert_tier[expert];
+                if (destination < 0 || std::size_t(destination) >= candidate_counts.size())
+                    throw std::invalid_argument(
+                        "Joint placement transition has a foreign destination tier");
+                ++candidate_counts[std::size_t(destination)];
+            }
+            if (source_counts != previous_counts || source_counts != candidate_counts)
+                throw std::invalid_argument(
+                    "Joint placement transition changes original per-layer tier capacity");
+            for (std::size_t tier = 0; tier < plan.routed_tiers.size(); ++tier)
+            {
+                if (!cohorts[tier])
+                {
+                    auto owners = buildLayerTierOwners(result, placement, int(tier),
+                                                       plan.owner_order, &previous);
+                    result.owners_.insert(result.owners_.end(),
+                                          std::make_move_iterator(owners.begin()),
+                                          std::make_move_iterator(owners.end()));
+                    continue;
+                }
+                for (std::size_t expert = 0; expert < experts; ++expert)
+                {
+                    if (placement.routed_expert_tier[expert] != int(tier))
+                        continue;
+                    MoEExpertOwner row;
+                    row.layer_idx = placement.layer;
+                    row.expert_id = int(expert);
+                    row.tier_idx = int(tier);
+                    row.owner_participant = -1;
+                    row.device = DeviceId::invalid();
+                    row.resident = true;
+                    row.tier_name = plan.routed_tiers[tier].name;
+                    row.domain_name = plan.routed_tiers[tier].domain;
+                    row.shard_cohort = cohorts[tier];
+                    result.owners_.push_back(std::move(row));
+                }
+            }
+        }
+        if (original.owners_.size() != total || previous.owners_.size() != total ||
+            result.owners_.size() != total)
+            throw std::invalid_argument(
+                "Joint placement transition changes complete original source geometry");
+        canonicalizeOwnerOrder(result.owners_);
         return result;
     }
 

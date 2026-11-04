@@ -504,7 +504,7 @@ namespace
                 return false;
             }
             effective_tiers = &snapshot.placement_plan->routed_tiers;
-            effective_owner_map = &snapshot.originalOwnerMap();
+            effective_owner_map = &snapshot.placementOwnerMap();
             residency_epoch = snapshot.epoch;
         }
         else if (params_.residency_authority)
@@ -564,7 +564,7 @@ namespace
                 return false;
             }
             effective_tiers = &snapshot.placement_plan->routed_tiers;
-            effective_owner_map = &snapshot.originalOwnerMap();
+            effective_owner_map = &snapshot.placementOwnerMap();
             residency_epoch = snapshot.epoch;
             if (requested_epoch != 0u &&
                 residency_epoch != requested_epoch)
@@ -721,7 +721,7 @@ namespace
                     {
                         if (!result.residency_lease ||
                             (**result.residency_lease).ownershipKind() != MoEOverlayResidencyOwnershipKind::CPUJointFragments ||
-                            &(**result.residency_lease).originalOwnerMap() != effective_owner_map)
+                            &(**result.residency_lease).placementOwnerMap() != effective_owner_map)
                         {
                             LOG_ERROR("[MoEExpertDispatchStage] CPU joint dispatch lacks its original residency lease");
                             return false;
@@ -863,7 +863,7 @@ namespace
             const auto current_snapshot =
                 params_.residency_authority->snapshot();
             const auto *first_owner = current_snapshot
-                                          ? current_snapshot->originalOwnerMap().placementFor(
+                                          ? current_snapshot->placementOwnerMap().placementFor(
                                                 placement.layer,
                                                 0)
                                           : nullptr;

@@ -1070,7 +1070,7 @@ namespace llaminar2
                 const auto &binding=*params_.cpu_joint_route_producer;
                 if(!params_.device_id.is_cpu() || !params_.serial_compact_buffer_arena ||
                    params_.expert_weight_resolution_policy!=ExpertWeightResolutionPolicy::RegistryOnly ||
-                   !params_.cpu_joint_layer || !params_.cpu_joint_layer->source() ||
+                   !params_.cpu_joint_layer || !params_.cpu_joint_layer->sourceSelection() ||
                    !binding.valid() || !params_.serial_compact_buffer_arena->cpuJointLayout() ||
                    params_.serial_compact_buffer_arena->cpuJointPackedRecords()!=binding.packed_rows ||
                    params_.serial_compact_buffer_arena->cpuJointLayout()->cohort()->participants()[
@@ -2749,10 +2749,12 @@ namespace llaminar2
         output.target_participant = input.source_participant;
         output.live_row_count = 0;
         output.layout = params_.return_layout;
+        std::optional<MoEOverlayParticipantResidencyRegistry::CPUJointLayer> execution_joint_layer;
         if(params_.cpu_joint_route_producer) {
             const auto &publication=*params_.cpu_joint_layer;
-            if(input.residency_epoch!=publication.epoch() || publication.participantId()!=params_.runtime_participant_index ||
-               publication.layer()!=params_.layer_idx || !publication.source() ||
+            execution_joint_layer=publication.acquireEpoch(input.residency_epoch);
+            if(!execution_joint_layer || publication.participantId()!=params_.runtime_participant_index ||
+               publication.layer()!=params_.layer_idx || !publication.sourceSelection() ||
                !canonical_moe_route_record::writeRecordCount(params_.cpu_joint_route_producer->packed_rows->mutable_data(),
                    params_.cpu_joint_route_producer->packed_rows->numel(),0)) {
                 LOG_ERROR("CPU joint producer received a foreign/retired original fragment packet");return false;
@@ -2774,6 +2776,10 @@ namespace llaminar2
 
         MoEOverlayParticipantBankLease execution_residency_bank;
         const MoEOverlayParticipantLayerBank *execution_layer_bank = nullptr;
+        if(execution_joint_layer) {
+            execution_residency_bank=execution_joint_layer->bankLease();
+            execution_layer_bank=&execution_residency_bank->layerForModelLayer(params_.layer_idx);
+        }
         const auto *cpu_llep_state =
             params_.cpu_current_batch_llep_state.get();
         const bool cpu_llep_transaction = cpu_llep_state != nullptr;
@@ -3393,14 +3399,17 @@ namespace llaminar2
                             return false;
                         }
                     }
-                    const auto &engines =
-                        execution_layer_bank->experts[expert_index];
-                    invocation_gate_engines_[expert_index] =
-                        transient ? transient->gate.get() : engines.gate().get();
-                    invocation_up_engines_[expert_index] =
-                        transient ? transient->up.get() : engines.up().get();
-                    invocation_down_engines_[expert_index] =
-                        transient ? transient->down.get() : engines.down().get();
+                    if(execution_layer_bank->cpu_fragment_family) {
+                        const auto& fragment=execution_layer_bank->cpu_fragments[expert_index];
+                        invocation_gate_engines_[expert_index]=fragment.gate().get();
+                        invocation_up_engines_[expert_index]=fragment.up().get();
+                        invocation_down_engines_[expert_index]=fragment.down().get();
+                    } else {
+                        const auto& engines=execution_layer_bank->experts[expert_index];
+                        invocation_gate_engines_[expert_index]=transient?transient->gate.get():engines.gate().get();
+                        invocation_up_engines_[expert_index]=transient?transient->up.get():engines.up().get();
+                        invocation_down_engines_[expert_index]=transient?transient->down.get():engines.down().get();
+                    }
                 }
             }
             else
@@ -3509,6 +3518,7 @@ namespace llaminar2
                             .compact_to_source_row =
                                 compact_hidden_source_rows_,
                         },
+                        .cpu_joint_epoch=execution_joint_layer?&*execution_joint_layer:nullptr,
                     }))
             {
                 LOG_ERROR(

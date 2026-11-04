@@ -10,7 +10,12 @@ namespace llaminar2 {
 bool CPUExpertShardRouteCompletion::matches(const MoEOverlayActivationEpochControl &control,
     const MoEOverlayActivationEpochIdentity &identity,std::uint32_t stage) const noexcept {
     const auto* native=dynamic_cast<const GlobalTPContext*>(context_.get());
-    if(!native || !prepared_ || !prepared_->source() || prepared_->source()->cpu_joint_source!=source_ ||
+    if(!native || !prepared_ || !prepared_->sourceSelection() || prepared_->sourceSelection()!=source_ ||
+       !bank_ || bank_->participant_id!=prepared_->participantId() || !bank_->containsModelLayer(prepared_->layer()) ||
+       bank_->layerForModelLayer(prepared_->layer()).cpu_fragment_family!=prepared_->family() ||
+       bank_->layerForModelLayer(prepared_->layer()).cpu_fragment_family.owner_before(prepared_->family()) ||
+       prepared_->family().owner_before(bank_->layerForModelLayer(prepared_->layer()).cpu_fragment_family) ||
+       bank_->epoch!=control.buffers[moeOverlayActivationBufferIndex(stage)].dispatch_descriptor.placement_epoch ||
        !native->authenticatesOriginalCPUExpertBorrow(context_) || control_!=&control || identity_!=identity || stage_!=stage || !source_ || !context_ ||
        context_->isAbortRequested() || identity.digest!=moeOverlayActivationIdentityDigest(identity) ||
        identity.return_role!=control.channel.return_role || identity.target_participant_id!=source_->participant().participant_id ||

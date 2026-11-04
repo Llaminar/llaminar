@@ -37907,6 +37907,7 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2CPUExpertShardExecutionTests.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2CPUJointPreparedSourceTests.cmake)
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2CPUJointStaticResidencyTests.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2CPUFragmentResidencyTests.cmake)
 add_v2_test(V2_Integration_QFNCPUJointMTPSourceServingRole
     COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
         --gtest_filter=Qwen4ExpSourceAdmissionCases.ActualCPUJointPlanRequiresOriginalRankDomainsAndFollowerRole:Qwen4ExpSourceAdmissionMTPEvidence.CPUOverlayTPMaterializationIsNotOrdinaryDeferredSetup:Qwen4ExpSourceAdmissionMTPEvidence.SharedCPUCounterIdentityRetainsPlanMultiplicityAndDeferredHostIsExplicit

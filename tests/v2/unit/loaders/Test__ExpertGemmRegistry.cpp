@@ -1185,3 +1185,9 @@ TEST(StaticProjectionPreparedSource, NativeDescriptorOwnsGeometryAndOriginalCode
 #include "CPUTensorTP1PreparedStaticReplay.inc"
 
 #include "CPUPreparedSourceBindingContract.inc"
+
+#include "CPUFragmentPayloadContract.inc"
+
+#include "CPUFragmentEpochBankContract.inc"
+
+#include "CPUJointInitialBankPrepassContract.inc"

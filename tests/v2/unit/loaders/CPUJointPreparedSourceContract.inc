@@ -21,6 +21,7 @@
 #include "utils/MPIContext.h"
 #include "utils/CPUProjectionTestWorkspace.h"
 #include "utils/CPUJointSourceTestPlan.h"
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <unistd.h>
@@ -237,8 +238,15 @@ public:
 };
 /** @brief Own only this fixture's generated source, removed after loader/mapping retirement. */
 struct JointOriginalFile {
+ inline static std::atomic<uint64_t> next_id{0};
+ JointOriginalFile()=default;
+ JointOriginalFile(const JointOriginalFile&)=delete;
+ JointOriginalFile& operator=(const JointOriginalFile&)=delete;
+ // Several live source contexts can share a process. Each owns only its
+ // unique file, so retiring an older fixture cannot unlink a newer source.
  std::filesystem::path path=std::filesystem::temp_directory_path()/
-  ("llaminar_cpu_joint_original_"+std::to_string(getpid())+".gguf");
+  ("llaminar_cpu_joint_original_"+std::to_string(getpid())+"_"+
+   std::to_string(next_id.fetch_add(1,std::memory_order_relaxed))+".gguf");
  ~JointOriginalFile(){std::error_code error;std::filesystem::remove(path,error);}
 };
 }
