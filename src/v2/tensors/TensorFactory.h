@@ -16,6 +16,8 @@
 #include <memory>
 #include <vector>
 #include <cstddef>
+#include <span>
+#include <functional>
 
 #include <numa.h>
 #include <numaif.h>
@@ -223,12 +225,24 @@ namespace llaminar2
          * @param type Quantization type.
          * @param shape Tensor dimensions.
          * @param raw_data Exact packed bytes; ownership is transferred.
+         * @param original_allocator Original valid CPU allocator, independent of NUMA placement.
          * @return Quantized tensor owning the original aligned allocation.
          */
         std::unique_ptr<TensorBase> createQuantizedOwned(
             TensorType type,
             const std::vector<size_t> &shape,
-            AlignedVector<uint8_t> raw_data);
+            AlignedVector<uint8_t> raw_data,DeviceId original_allocator=DeviceId::cpu());
+
+        /**
+         * @brief Adopt already allocated native final storage without changing NUMA policy or copying.
+         * @param type Actual native source encoding.
+         * @param shape Actual final runtime shape.
+         * @param raw_data Same original admitted persistent root, moved into the tensor.
+         * @param original_allocator Original valid CPU allocator named by that root.
+         * @return Concrete native tensor retaining exactly that final owner.
+         */
+        static std::unique_ptr<TensorBase> adoptQuantizedFinalStorage(TensorType type,
+            const std::vector<size_t>& shape,AlignedVector<uint8_t> raw_data,DeviceId original_allocator);
 
         /**
          * @brief Create quantized tensor with zero-copy mmap-backed data
@@ -249,6 +263,22 @@ namespace llaminar2
                                                             const uint8_t *mmap_data,
                                                             size_t byte_size,
                                                             std::shared_ptr<void> mmap_lifetime_owner);
+
+        /**
+         * @brief Borrow one genuine compact encoded window for synchronous canonical codec operations.
+         * @param type Original native encoding, never a converted or guessed codebook.
+         * @param rows Actual compact N extent present in native_bytes.
+         * @param columns Actual group-aligned compact K extent present in native_bytes.
+         * @param native_bytes Exact contiguous encoded window; retained only by the caller.
+         * @param consume Synchronous codec operation; the tensor must not escape this callback.
+         * @throws std::invalid_argument For empty input or a non-native codec type.
+         *
+         * This object describes only bytes actually present, never a synthetic
+         * whole matrix. It owns no payload or converted/dequantization cache.
+         */
+        static void visitNativeWeightWindow(TensorType type,size_t rows,size_t columns,
+            std::span<const std::byte> native_bytes,
+            const std::function<void(const TensorBase&)>& consume);
 
         /**
          * @brief Ensure NUMA memory binding is active for the calling thread
@@ -300,6 +330,17 @@ namespace llaminar2
         static bool isNumaAvailable();
 
     private:
+        /**
+         * @brief Single native codec dispatcher shared by mmap tensors and synchronous source windows.
+         * @param type Original native encoding.
+         * @param shape Actual dimensions represented by these bytes.
+         * @param bytes Original readable encoded region.
+         * @param size Exact encoded byte extent.
+         * @param owner Actual optional retained lifetime owner; empty only for caller-scoped borrowing.
+         * @return Concrete codec object borrowing exactly that region without data allocation.
+         */
+        static std::unique_ptr<TensorBase> borrowQuantizedNativeStorage(TensorType type,
+            const std::vector<size_t>& shape,const uint8_t* bytes,size_t size,std::shared_ptr<void> owner);
         int mpi_rank_;
         int numa_node_; // CPU backend allocation authority; -1 means aggregate.
 

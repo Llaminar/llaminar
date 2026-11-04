@@ -8,6 +8,7 @@
  */
 
 #include "MoEOverlayNodeLocalRankBatchTransport.h"
+#include "MoECPUExpertShardReturnRole.h"
 #include "MoEOverlaySharedBackingStartup.h"
 #include "MoEOverlayRankBatchTelemetry.h"
 
@@ -843,6 +844,13 @@ namespace llaminar2
     class MoEOverlayNodeLocalRankBatchTransport::Mapping final
     {
     public:
+        /** @return Exact original shared-matrix membership, never a caller count. */
+        std::size_t participantCount() const noexcept { return participants_.size(); }
+        /** @return Original first control row for this immutable family. */
+        const MoEOverlayActivationEpochControl* familyControls(std::size_t family) const {
+            if(family>=activation_family_count_)throw std::out_of_range("Original shared family controls are absent");
+            return activation_controls_+family*participants_.size();
+        }
         explicit Mapping(const MoEOverlayRankBatchTransportConfig &config)
             : participants_(config.workspace->participantIds()),
               max_rows_(config.max_rows_per_participant),
@@ -1299,6 +1307,11 @@ namespace llaminar2
 
             const auto &family =
                 config.activation_graph_families[graph_family_ordinal];
+            const MoEOverlayActivationLaneEndpoint target{
+                .world_rank=config.target_world_rank,.participant_id=participants_[participant_index],
+                .tier_priority=config.target_tier_priority,.domain_ordinal=config.domain_ordinal};
+            const auto return_role=originalCPUExpertShardReturnRole(config.original_cpu_joint_owners.get(),target,family.model_layer_indices);
+            if(return_role!=MoEOverlayActivationReturnRole::Ordinary)nonce=fnv1a(nonce,&return_role,sizeof(return_role));
             return {
                 .channel_nonce = nonce,
                 .topology_fingerprint_low =
@@ -1317,6 +1330,7 @@ namespace llaminar2
                 .lane_ordinal = static_cast<std::uint32_t>(lane_index),
                 .graph_role_mask = family.graph_role_mask,
                 .model_layer_indices = family.model_layer_indices,
+                .return_role=return_role,
             };
         }
 
@@ -1875,6 +1889,9 @@ namespace llaminar2
             .target_participant_id = target_participant_id,
             .graph_family_ordinal = graph_family_ordinal,
             .mapped_region = mapped_region_,
+            .shared_dispatch_consumer_count = mapping_->participantCount(),
+            .shared_dispatch_controls_device = static_cast<const MoEOverlayActivationEpochControl*>(alias(
+                mapping_->familyControls(graph_family_ordinal),mapping_->participantCount()*sizeof(MoEOverlayActivationEpochControl))),
             .shared_dispatch_hidden_rows_fp32 =
                 static_cast<float *>(alias(
                     shared_activation_rows, activation_bytes)),

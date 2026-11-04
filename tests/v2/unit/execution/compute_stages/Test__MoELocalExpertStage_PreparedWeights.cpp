@@ -2082,3 +2082,5 @@ TEST(Test__MoELocalExpertStage_PreparedWeights, ParamsHasOnlyMoERuntimeTableAndN
     EXPECT_FALSE(has_peer_participants<P>::value);
     EXPECT_FALSE(has_prepared_participants<P>::value);
 }
+
+#include "CPUCanonicalPreweightReplay.inc"

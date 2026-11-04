@@ -3030,7 +3030,7 @@ namespace llaminar2
 
         // --- Startup GPU weight loading pipeline (LoadOrchestrator) ---
         int repack_slots = 3;     ///< Ring-buffer slot count for startup GPU repack pipeline (LLAMINAR_ROCM_REPACK_SLOTS)
-        int repack_budget_mb = 512; ///< Per-GPU pinned-host startup staging cap in MiB, mirrored by per-GPU device scratch; 0=unlimited (LLAMINAR_GPU_LOAD_STAGING_MB, legacy LLAMINAR_ROCM_REPACK_BUDGET_MB)
+        int repack_budget_mb = 512; ///< Shared startup limit in MiB: each GPU pinned-host/device staging ring and each rank's bounded CPU-joint native source window. These concurrent roots are admitted separately; 0=unlimited (LLAMINAR_GPU_LOAD_STAGING_MB, legacy LLAMINAR_ROCM_REPACK_BUDGET_MB)
         int repack_streams = 3;   ///< H2D stream count for startup GPU repack pipeline (LLAMINAR_ROCM_REPACK_STREAMS)
 
         ROCmConfig()

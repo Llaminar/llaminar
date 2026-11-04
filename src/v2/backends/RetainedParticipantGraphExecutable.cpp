@@ -167,6 +167,17 @@ PhysicalMemoryPlan RetainedParticipantGraphExecutable::definitionBOM(PhysicalMem
 PhysicalMemoryPlan RetainedParticipantGraphExecutable::hostBOMWithSelection(const PooledRemoteGraphProgram& program,
     PhysicalMemoryResource host,PhysicalMemoryResource gpu,const std::optional<NativeAuxiliaryResourceSelection>& selected,
     std::size_t nativeObjectBytes){
+    std::optional<NativeAuxiliaryResourceAllowance> allowance;
+    if(selected){
+        if(!selected->program)throw std::invalid_argument("Remote graph selection omitted its original program");
+        allowance.emplace(NativeAuxiliaryResourceAllowance{selected->hostBytes,selected->deviceBytes,selected->evidence,
+            selected->lifetime,*selected->program,selected->remoteFamily});
+    }
+    return hostBOMWithAllowance(program,host,gpu,allowance,nativeObjectBytes);
+}
+PhysicalMemoryPlan RetainedParticipantGraphExecutable::hostBOMWithAllowance(const PooledRemoteGraphProgram& program,
+    PhysicalMemoryResource host,PhysicalMemoryResource gpu,const std::optional<NativeAuxiliaryResourceAllowance>& selected,
+    std::size_t nativeObjectBytes){
     const auto& geometry=program.geometry();
     if(!host.valid() || host.device!=DeviceId::cpu() || !gpu.valid() ||
         PhysicalMemoryAllocatorIdentity{gpu.world_rank,gpu.device}!=geometry.owner || host.world_rank!=gpu.world_rank || !nativeObjectBytes)
@@ -180,7 +191,7 @@ PhysicalMemoryPlan RetainedParticipantGraphExecutable::hostBOMWithSelection(cons
     plan.add(host,PhysicalMemoryOwner::NativeStorageGraphExecutable,sizeof(RecordingCapture));
     if(selected){
         if(!selected->hostBytes || selected->deviceBytes || selected->lifetime!=NativePhysicalLifetime::ProcessRuntime ||
-            !selected->program || *selected->program!=NativeAuxiliaryResourceProgram::pooledRemoteOwner(program) ||
+            selected->program!=NativeAuxiliaryResourceProgram::pooledRemoteOwner(program) ||
             !selected->remoteFamily || !selected->remoteFamily->accepts(program.limits(),PooledRemoteGraphProgramClass::argumentLayout()))
             throw std::invalid_argument("Remote graph host program cannot borrow device bytes or a shorter untested lifetime");
         plan.add(host,PhysicalMemoryOwner::NativeStorageGraphExecutable,selected->hostBytes);
@@ -189,9 +200,9 @@ PhysicalMemoryPlan RetainedParticipantGraphExecutable::hostBOMWithSelection(cons
 }
 PhysicalMemoryPlan RetainedParticipantGraphExecutable::hostBOM(const PooledRemoteGraphProgram& program,
     PhysicalMemoryResource host,PhysicalMemoryResource gpu){
-    const auto selected=NativeAuxiliaryResourceCatalog::require(program.geometry().owner.device,
+    const auto allowance=NativeAuxiliaryResourceCatalog::allowance(program.geometry().owner.device.type,
         NativeAuxiliaryResourceProgram::pooledRemoteOwner(program));
-    return hostBOMWithSelection(program,host,gpu,selected,nativeGraphCaptureObjectBytes(program.geometry().owner.device));
+    return hostBOMWithAllowance(program,host,gpu,allowance,nativeGraphCaptureObjectBytes(program.geometry().owner.device));
 }
 std::shared_ptr<RetainedParticipantGraphExecutable> RetainedParticipantGraphExecutable::create(
     const PreparedGPUContextUsePermit& original,void* stream,const PooledRemoteGraphProgram& program){

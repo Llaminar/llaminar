@@ -1,4 +1,6 @@
 #include "PreparedWeightStore.h"
+#include "tensors/PreparedCPUWeightTensor.h"
+#include "execution/moe/CPUExpertShardSourceSelection.h"
 #include "loaders/PreparedWeightIdentityContract.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "GPUVramPreflight.h"
@@ -222,18 +224,58 @@ namespace llaminar2
         const PreparedWeightKind kind = inferPreparedKind(device);
         validateBindingForStore(binding, model_id_, kind);
 
+        auto requested_placement = CPUWeightStoragePlacement::local();
+        if(binding.cpu_joint_source) {
+            const auto& selection=*binding.cpu_joint_source;
+            const auto& member=selection.participant();
+            if(device!=DeviceId::cpu() || !binding.projection_ownership ||
+               selection.ownership()!=*binding.projection_ownership ||
+               selection.layer()!=binding.identity.layer || !selection.contains(binding.identity.expert) ||
+               member.domain_name!=binding.identity.overlay_domain ||
+               member.world_rank!=binding.identity.overlay_participant_world_rank ||
+               member.domain_participant_index!=binding.identity.overlay_participant_index)
+                throw std::invalid_argument("CPU joint preparation changed its original source/NUMA member");
+            requested_placement=CPUWeightStoragePlacement::onNode(member.address.numa_node);
+        }
+        // Resolve the requested physical node before the single accounting
+        // boundary. Final factory calls receive only this normalized placement;
+        // no joint-fragment branch may overwrite its admitted authority.
         auto placement = CPUWeightStoragePlacement::local();
         if (device.is_cpu())
         {
             if (const auto authority = physicalMemoryAuthority())
-                placement = CPUWeightStoragePlacement::accounted(authority, device, memory_owner, placement);
+                placement = CPUWeightStoragePlacement::accounted(authority, device, memory_owner, requested_placement);
             else
                 throw std::logic_error("CPU GEMM preparation requires the admitted physical-memory authority");
         }
 
-        auto owned = llaminar::v2::kernels::KernelFactory::prepareGemmHandleLocal(
-            binding.tensor, device, llaminar::v2::kernels::KernelFactory::GemmPreparationKind::AUTO,
-            binding.floating_operand_precision, placement);
+        using Factory=llaminar::v2::kernels::KernelFactory;
+        std::shared_ptr<Factory::PreparedGemmHandle> owned;
+        if(binding.cpu_joint_source) {
+            if(binding.floating_operand_precision!=FloatingActivationOperandPrecision::Native)
+                throw std::invalid_argument("CPU joint source requires its original native arithmetic");
+            // The existing expert factory owns final floating bytes as well as
+            // native packed bytes on the declared NUMA node. Dense GEMM's
+            // borrowed floating source is not a fragment placement certificate.
+            auto kernel=Factory::prepareExpertGemmLocal(
+                std::shared_ptr<const TensorBase>(binding.tensor_owner),device,
+                Factory::GemmPreparationKind::AUTO, placement);
+            if(kernel) {
+                const auto* unpackable=IINT8Unpackable::fromTensor(binding.tensor);
+                const auto kind=unpackable && unpackable->vnniFormatInfo()
+                    ? Factory::GemmPreparationKind::CPU_PACKED : Factory::GemmPreparationKind::FLOATING_POINT;
+                owned=std::make_shared<Factory::PreparedGemmHandle>();
+                owned->tensor=binding.tensor;owned->device_id=device;owned->kind=kind;
+                owned->variant=static_cast<int>(binding.tensor->native_type());
+                owned->prepared_weights=std::make_shared<Factory::PreparedGemmWeights>();
+                owned->prepared_weights->kind=kind;
+                owned->prepared_weights->owned_kernel=std::move(kernel);
+                owned->prepared_weights->kernel=owned->prepared_weights->owned_kernel.get();
+            }
+        } else {
+            owned=Factory::prepareGemmHandleLocal(binding.tensor,device,Factory::GemmPreparationKind::AUTO,
+                binding.floating_operand_precision, placement);
+        }
         if (!owned)
             throw std::runtime_error("PreparedWeightStore::prepareGemm failed for: " + binding.identity.canonical_name);
 
@@ -564,6 +606,16 @@ namespace llaminar2
         return handle->prepared_weights->kernel;
     }
 
+    std::shared_ptr<ITensorGemm> PreparedWeightStore::gemmKernelLifetime(const PreparedWeightRef& ref) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found=entries_.find(keyFor(ref));
+        if(found==entries_.end() || !samePreparedRef(found->second.ref,ref))return {};
+        const auto& handle=found->second.owned_handle;
+        if(!handle || !handle->prepared_weights || !handle->prepared_weights->kernel)return {};
+        return std::shared_ptr<ITensorGemm>(handle,handle->prepared_weights->kernel);
+    }
+
     std::optional<PreparedWeightRef> PreparedWeightStore::preparedRefForBinding(
         uint64_t binding_id,
         DeviceId device) const
@@ -683,6 +735,33 @@ namespace llaminar2
             throw std::runtime_error("PreparedWeightStore::prepareEmbedding requires a tensor binding: " + binding.identity.canonical_name);
 
         const DeviceId device = binding.residency.resident_device.value_or(binding.residency.home_device);
+
+        if(device.is_cpu() && binding.prepared && binding.prepared->kind==PreparedWeightKind::CPUResidentTensor) {
+            // The common reader has already committed the only persistent raw
+            // root. Embedding execution borrows that exact Store-owned tensor;
+            // it must neither copy nor acquire another physical allocation.
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                const auto it=entries_.find(keyFor(*binding.prepared));
+                if(it==entries_.end() || !samePreparedRef(it->second.ref,*binding.prepared) ||
+                   !it->second.binding.identity.sameSourceDefinition(binding.identity) ||
+                   !(it->second.binding.slice==binding.slice) ||
+                   it->second.binding.native_source!=binding.native_source ||
+                   it->second.binding.tensor_owner!=binding.tensor_owner ||
+                   !binding.tensor_owner || binding.tensor_owner.get()!=binding.tensor)
+                    throw std::invalid_argument("CPU embedding alias requires its exact completed final source owner");
+            }
+            auto handle=llaminar::v2::kernels::KernelFactory::prepareEmbeddingHandleFromFinalCPUStorage(
+                std::shared_ptr<const TensorBase>(binding.tensor_owner),d_model,vocab_offset,total_vocab);
+            validatePreparedEmbeddingHandle(binding,device,handle.get());
+            auto ref=makeRef(binding.binding_id,PreparedWeightKind::PreparedEmbedding,device);
+            auto stored=binding;stored.prepared=ref;
+            std::lock_guard<std::mutex> lock(mutex_);
+            if(embedding_entries_.contains(keyFor(ref)))throw std::logic_error("CPU embedding final owner already published");
+            embedding_entries_.emplace(keyFor(ref),EmbeddingEntry{std::move(stored),ref,std::move(handle),nullptr});
+            binding.tensor->publishPreparedDeviceState();
+            return ref;
+        }
 
         /*
          * Acquire the exact claim before entering the backend allocator. The
@@ -1239,4 +1318,6 @@ namespace llaminar2
         }
         return count;
     }
+#include "CPUPreparedWeightStore.inc"
+
 }

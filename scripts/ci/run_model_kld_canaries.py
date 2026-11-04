@@ -116,6 +116,66 @@ def retire(process,container):
     if container:subprocess.run(['docker','rm',container],check=True,stdout=subprocess.DEVNULL,timeout=30)
 
 
+def original_local_launch(args, adapter, image, output, native_command, environment):
+    """Select only the existing direct launch or explicitly authored original MPI launch.
+
+    The typed corpus config owns MPI population. MPI and production inventory
+    own rankfile/NUMA meaning; this function never parses or replans affinity.
+    Every launch input remains pinned through original process retirement.
+    """
+    rankfile=getattr(args,'mpi_rankfile',None)
+    world=1
+    if adapter is not None:
+        configuration=adapter.topology['expected_config']['configuration']
+        world=configuration.get('mpi_procs',0)
+        require(type(world) is int and world>=0,'Invalid original configured MPI population')
+        world=max(1,world)
+    if rankfile is None:
+        require(world==1,'Distributed observer requires an explicit --mpi-rankfile')
+        return native_command,{},None
+    require(image is None and args.binary is not None and adapter is not None and world>1,
+            'Explicit MPI rankfile requires a local declared distributed corpus observer')
+    rankfile=Path(rankfile).resolve(strict=True)
+    require(rankfile.is_file(),'MPI rankfile is not a regular file')
+    launcher=(args.binary.parent/'llaminar_mpi_session').resolve(strict=True)
+    require(launcher.is_file() and os.access(launcher,os.X_OK),'Missing original executable MPI session launcher')
+    selected=shutil.which('mpirun',path=environment['PATH'])
+    require(selected is not None,'Missing original mpirun; no alternate launcher is permitted')
+    mpi=Path(selected).resolve(strict=True)
+    pins={str(path):identity(path) for path in (rankfile,launcher,mpi)}
+    binding='core'
+    session_base=output/'mpi-session'
+    require(not session_base.exists() and not session_base.is_symlink(),
+            'Original MPI session base must be fresh and non-symlink')
+    unchanged(pins)
+    session_base.mkdir()
+    command=[str(launcher),'--session-base',str(session_base),'--',str(mpi),'-np',str(world),
+             '--rankfile',str(rankfile),'--bind-to',binding,'--report-bindings']
+    command+=['--mca','mpi_leave_pinned','1','--mca','btl_vader_single_copy_mechanism','none',
+              '--mca','orte_allowed_exit_without_sync','1','--',*native_command]
+    proof=dict(schema='llaminar.original-mpi-rankfile-launch.v1',world_size=world,
+               rankfile=dict(path=str(rankfile),stat=pins[str(rankfile)]),
+               session_launcher=dict(path=str(launcher),stat=pins[str(launcher)]),
+               mpi_launcher=dict(path=str(mpi),stat=pins[str(mpi)]),
+               binding=binding,overlap_policy='strict',
+               performance_comparison_eligible=True)
+    unchanged(pins)
+    return command,pins,proof
+
+
+def preserve_original_rank_reports(adapter, payload, output):
+    """Retain only exact original rank metadata after native retirement, before raw-logit cleanup."""
+    if adapter is None:return
+    world=adapter.topology['expected_config']['configuration'].get('mpi_procs',0)
+    if type(world) is not int or world<=1:return
+    for rank in range(world):
+        path=payload/f'rank-{rank}.json'
+        if path.exists():
+            require(not path.is_symlink() and path.is_file() and path.resolve().parent==payload.resolve(),
+                    'Original rank metadata escapes native artifact owner')
+            shutil.copyfile(path,output/path.name)
+
+
 def execute_cell(args,corpus,model,backend,model_path,output,image,*,adapter=None):
     """Bracket admission, inference, teardown and scoring with owned evidence."""
     output.mkdir();payload=output/'logits'
@@ -130,7 +190,7 @@ def execute_cell(args,corpus,model,backend,model_path,output,image,*,adapter=Non
     cell=dict(complete=False,passed=False,model=model,backend=backend,phase='admission',container_id=None,devices=[backend+':0'])
     if adapter is not None:cell.update(topology_id=adapter.topology['id'],devices=adapter.devices)
     controller=output/'controller.json';write_json(controller,cell)
-    process=None;container=None;armed=False;retired=False;code=None
+    process=None;container=None;armed=False;retired=False;code=None;launch_pins={}
     try:
         env=dict(PATH=os.environ['PATH'],OMP_NUM_THREADS=str(physical_workers()),OMP_PLACES='cores',OMP_PROC_BIND='false',
                  OPENBLAS_NUM_THREADS='1',LLAMINAR_LOG_LEVEL='INFO',LLAMINAR_PERF_STATS_FILTER=FILTER)
@@ -147,8 +207,12 @@ def execute_cell(args,corpus,model,backend,model_path,output,image,*,adapter=Non
             env.update(adapter.environment)
             env['LD_LIBRARY_PATH']=str(args.binary.parent)
             env['LLAMINAR_PERF_STATS_FILTER']=FILTER+',sampling.rank_resident_condition_host_logits_publications'
+            if adapter.topology['expected_config'].get('configuration', {}).get('mpi_procs', 1) > 1:
+                # Passive original fragment/transport evidence; no extra device clocks or probes.
+                env['LLAMINAR_PERF_STATS_FILTER'] += ',moe_overlay,moe_canonical_publication'
             workload_path,engine_argv=adapter.prepare(sys.modules[__name__],args,output,env)
             cell.update(environment=env,workload=str(workload_path),engine_argv=engine_argv)
+        require(image is None or getattr(args,'mpi_rankfile',None) is None, 'MPI rankfiles are local diagnostics only')
         if image:
             candidate='llaminar-kld-'+uuid.uuid4().hex
             command=['docker','create','--name',candidate,'--init',*docker_paths.coding_owner_arguments(),
@@ -168,10 +232,14 @@ def execute_cell(args,corpus,model,backend,model_path,output,image,*,adapter=Non
             env['LLAMINAR_PERF_STATS_JSON']=str(output/'perf-stats.json')
             command=[str(args.binary),'--workload',str(entry['workload_path']) if adapter is None else str(workload_path),
                      '--output',str(payload),'--',*(engine_arguments(model_path,backend,physical_workers()) if adapter is None else engine_argv)]
+        if not image:
+            command,launch_pins,launch_proof=original_local_launch(args,adapter,image,output,command,env)
+            if launch_proof is not None:cell['native_launch']=launch_proof
         cell.update(phase='native',command=command);write_json(controller,cell)
         driver.begin(output/'driver-state.json');armed=True
         manifest=dict(backends=[backend] if adapter is None else adapter.backends,cells={'canary':{'controller':str(controller)}},filesystems={'output':str(output)})
         with (output/'native.log').open('x') as log,(output/'resources.jsonl').open('x') as observations:
+            unchanged(launch_pins)
             process=subprocess.Popen(command,env=env if not image else None,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
             local_owner=OwnedProcessTree(process.pid) if image is None else None
             started=time.monotonic()
@@ -187,6 +255,7 @@ def execute_cell(args,corpus,model,backend,model_path,output,image,*,adapter=Non
         driver_ok=driver.finish(output/'driver-state.json',output/'canary.driver-diagnostics.json');armed=False
         require(driver_ok,'GPU driver window failed')
         driver.validate_evidence(output)
+        unchanged(launch_pins)
         require(code==0,'Native canary observer failed')
         unchanged(corpus['inputs'])
         if adapter is None:
@@ -213,6 +282,7 @@ def execute_cell(args,corpus,model,backend,model_path,output,image,*,adapter=Non
             cell.update(complete=True,native_retired=retired,returncode=code,phase='retired' if retired else 'failed_retirement')
             if adapter is not None and retired and (payload/'logits.json').is_file():
                 shutil.copyfile(payload/'logits.json',output/'native-observation.json')
+            if retired:preserve_original_rank_reports(adapter,payload,output)
             if not args.keep_logits and retired:
                 if adapter is None:shutil.rmtree(payload)
                 elif payload.is_dir():shutil.rmtree(payload)
@@ -281,7 +351,7 @@ def run_corpus_v2(args):
             'Local corpus diagnostic requires Integration or Release')
     args.corpus_root=args.corpus_root.resolve(strict=True)
     paired=getattr(args,'_paired_selection',None)
-    corpus=paired.corpus if paired is not None else v2.load_corpus(args.corpus_root,catalog=args.corpus_catalog)
+    corpus=paired.corpus if paired is not None else v2.load_corpus(args.corpus_root,catalog=args.corpus_catalog,manifest_path=getattr(args,'corpus_manifest',None))
     selected=select_topologies(corpus,args.topology_id)
     pilot_path=getattr(args,'absolute_pilot',None)
     pilot=None;pilot_scope=None;pilot_pin=None
@@ -371,6 +441,8 @@ def main(argv=None):
     parser.add_argument('--keep-logits',action='store_true')
     parser.add_argument('--paired-cell',help='One exact source-profiled canonical ProductionParity case; requires current prerequisites')
     parser.add_argument('--corpus-catalog',type=Path,help='Explicit approved schema2 corpus; local diagnostics only')
+    parser.add_argument('--corpus-manifest',type=Path,help='Explicit catalog-bound v2 metadata; references remain inside --corpus-root')
+    parser.add_argument('--mpi-rankfile',type=Path,help='Original MPI rankfile for a declared local distributed observer')
     parser.add_argument('--topology-id',action='append',help='Repeat declared corpus topology IDs; omission selects its complete inventory')
     parser.add_argument('--baseline-report',type=Path)
     parser.add_argument('--baseline-approval',type=Path)
@@ -379,6 +451,10 @@ def main(argv=None):
     parser.add_argument('--prerequisites-report',type=Path,help='Optional genuine current canonical prerequisite receipt; no synthesized replacement')
     args=parser.parse_args(argv)
     require(not args.container_image or not args.keep_logits,'CI always removes raw candidate logits')
+    require(args.corpus_manifest is None or (args.corpus_catalog is not None and args.paired_cell is None),
+            'Explicit corpus manifest requires v2 explicit catalog; paired document authority is unchanged')
+    require(args.mpi_rankfile is None or (args.binary is not None and args.corpus_catalog is not None),
+            'MPI rankfile requires a local explicit-catalog corpus diagnostic')
     if args.paired_cell is not None:
         select_paired_corpus(args)
     if args.corpus_catalog:

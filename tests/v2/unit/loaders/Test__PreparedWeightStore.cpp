@@ -827,3 +827,5 @@ TEST(Test__PreparedWeightStore, RegistrationRejectsRealKernelPrecisionMismatchBe
         EXPECT_TRUE(tensor.hasPreparedDeviceState());
     }
 }
+
+#include "PreparedCPUWeightTensorLifecycle.inc"

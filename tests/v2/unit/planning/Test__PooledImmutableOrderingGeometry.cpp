@@ -66,10 +66,28 @@ TEST(PooledImmutableOrderingGeometry, NonlinearGroupFloorAndGrowthMatchActualPro
         }
     }
 }
-/** @test Public planning cannot turn toy recorded bounds into installed native admission. */
-TEST(PooledImmutableOrderingGeometry, InstalledUnqualifiedSourceRemainsClosed){
-    const std::vector<Allocator> owners{{0,DeviceId::cuda(7)}};const std::array slots{0u};const auto g=geometry(slots,owners,owners.front());
-    const std::array devices{observed(owners.front())};
-    EXPECT_ANY_THROW(g.mandatoryBOM(devices,observed({0,DeviceId::cpu()})));
+/** @test Cold installed bounds price remote resources without granting native creation authority. */
+TEST(PooledImmutableOrderingGeometry, InstalledColdBoundsDoNotCreateOrQualifyWorkers){
+    for(const auto device:{DeviceId::cuda(7),DeviceId::rocm(7)}) {
+        SCOPED_TRACE(device.toString());
+        const std::vector<Allocator> owners{{0,device}};
+        const std::array slots{0u};
+        const auto g=geometry(slots,owners,owners.front());
+        const std::array devices{observed(owners.front())};
+        const auto host=observed({0,DeviceId::cpu()});
+        auto& pool=GPUDeviceContextPool::instance();
+        EXPECT_THROW((void)pool.retainExistingContextProvenance(device),std::logic_error);
+        const auto cold=g.mandatoryBOM(devices,host);
+        const auto* hostLine=cold.find(Allocator{0,DeviceId::cpu()});
+        const auto* deviceLine=cold.find(owners.front());
+        ASSERT_NE(hostLine,nullptr);ASSERT_NE(deviceLine,nullptr);
+        EXPECT_GT(hostLine->bytes(PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent),0u);
+        EXPECT_GT(deviceLine->bytes(PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent),0u);
+        // Cold pricing carries no worker, generation or source capability. The
+        // actual production creation selector must still reject this endpoint.
+        EXPECT_THROW((void)NativeAuxiliaryResourceCatalog::require(device,
+            NativeAuxiliaryResourceProgram::ordering(NativeOrderingEventProgram::pooledSource())),std::logic_error);
+        EXPECT_THROW((void)pool.retainExistingContextProvenance(device),std::logic_error);
+    }
 }
 }}

@@ -36,6 +36,7 @@
 namespace llaminar2
 {
     class MoEOverlayEconomyCalibrationLayerCatalog;
+    class MoEExpertOverlayPreparationPlan;
     namespace test
     {
         struct MoEOverlayResidencyAuthorityConcurrencyPeer;
@@ -312,6 +313,9 @@ namespace llaminar2
         [[nodiscard]] bool valid(bool has_migrations) const noexcept;
     };
 
+    /** @brief Physical ownership representation; joint fragments never have a scalar whole owner. */
+    enum class MoEOverlayResidencyOwnershipKind { WholeExperts, CPUJointFragments };
+
     /** @brief Immutable placement state consumed by one or more dispatch tickets. */
     struct MoEOverlayResidencySnapshot
     {
@@ -320,14 +324,22 @@ namespace llaminar2
         MoEExpertOwnerMap owner_map;
         MoELayeredExpertOwnership layered_ownership;
 
-        /** @return Whether the published plan and compact owners name one stage. */
-        bool valid() const noexcept
-        {
-            return epoch > 0 && placement_plan != nullptr &&
-                   !layered_ownership.empty() &&
-                   placement_plan->first_model_layer ==
-                       layered_ownership.firstModelLayer();
-        }
+        /** @return Constant-time validity of the constructor-validated immutable ownership arm. */
+        bool valid() const noexcept;
+        /** @return Explicit physical representation; never infer joint ownership from a scalar sentinel. */
+        MoEOverlayResidencyOwnershipKind ownershipKind() const noexcept;
+        /** @return Same original source map for joint fragments; ordinary owner map otherwise. */
+        const MoEExpertOwnerMap& originalOwnerMap() const;
+        /** @return Shared original joint map or null for ordinary whole experts. */
+        std::shared_ptr<const MoEExpertOwnerMap> jointOwnerMap() const noexcept;
+    private:
+        friend class MoEOverlayResidencyAuthority;
+        /** @brief Original immutable definition; only cold authority construction may install this arm. */
+        struct CPUJointDefinition {
+            std::shared_ptr<const MoERoutedExpertPlacementPlan> plan;
+            std::shared_ptr<const MoEExpertOverlayPreparationPlan> preparation;
+        };
+        std::optional<CPUJointDefinition> joint_; ///< No public scalar field can manufacture fragment ownership.
     };
 
     /** @brief Typed intent separating publishable placement from calibration. */
@@ -920,6 +932,8 @@ namespace llaminar2
              */
             MoERoutedExpertPlacementPlan initial_plan;
             MoERoutedExpertModelMetadata model_metadata;
+            /** Original closed source preparation; required for static CPU joint fragments only. */
+            std::shared_ptr<const MoEExpertOverlayPreparationPlan> projection_preparation;
             /**
              * Durable maintenance intent, independent of epoch-one placement.
              * `Observe` records routing evidence without permitting movement;
@@ -1498,7 +1512,8 @@ namespace llaminar2
             MoERoutedExpertPlacementPlan plan,
             const MoERoutedExpertModelMetadata &metadata,
             const MoEExpertOwnerMap *previous_owners,
-            const MoELayeredExpertOwnership *explicit_ownership = nullptr);
+            const MoELayeredExpertOwnership *explicit_ownership = nullptr,
+            std::shared_ptr<const MoEExpertOverlayPreparationPlan> joint_preparation = {});
         /** @brief Validate profiles and build allocation-free lookup state. */
         static std::unique_ptr<EconomyState> buildEconomyState(
             const Config &config,

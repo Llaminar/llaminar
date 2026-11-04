@@ -53,6 +53,9 @@
 #include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
 #include "loaders/ImmutableRowTable.h"
 #include "OrchestrationRunner.h"
+#include "collective/GlobalTPContext.h"
+#include "collective/NativeCPUCollectiveProgram.h"
+#include <variant>
 #include "execution/moe/MoEOverlayCPUHostMaintenance.h"
 #include "execution/moe/ExpertHistogramServingRegime.h"
 #include "planning/ResolvedRankOrchestration.h"
@@ -3313,6 +3316,13 @@ namespace llaminar2
         moe_overlay_inference_transaction_follower_.reset();
         moe_overlay_inference_transaction_coordinator_.reset();
         runner_.reset();
+        if(cpu_expert_shard_ctx_) {
+            // SHUTDOWN has stopped the original workers and runner destruction
+            // released every stage/cache borrow. The still-live domain now
+            // proves actual all-member unmap before creator backing retirement.
+            if(!cpu_expert_shard_ctx_->retireOriginalCPUExpertDomain())std::terminate();
+            cpu_expert_shard_ctx_.reset();
+        }
         if (preparedContextSealBoundary() == ModelContextPhysicalSealBoundary::RetiredImmutableSources ||
             (moe_pipeline_prepared_plan_ && preparedContextSealBoundary() == ModelContextPhysicalSealBoundary::LiveMutableResidency))
         {
@@ -18678,7 +18688,10 @@ namespace llaminar2
                     .gpu_weight_load = gpu_weight_load,
                     .snapshot_capacity = snapshot_capture_setup_.enabled()
                         ? snapshot_capture_setup_.memory_capacity : GraphSnapshotMemoryCapacity{},
-                    .model_graph_topology_variant_count = model_graph_topology_variant_count};
+                    .model_graph_topology_variant_count = model_graph_topology_variant_count,
+                    .original_expert_manifest=layer_weight_manifest,
+                    .weight_precision=WeightPrecision::NATIVE,
+                    .native_source_placement=model_ctx_->concreteLoader().nativeWeightSourcePlacement()};
 
                 /** A successful local admission retains the exact inputs it priced. */
                 struct LocalCapacityCandidate
@@ -19206,6 +19219,7 @@ namespace llaminar2
 
     bool OrchestrationRunner::initializeMoEExpertOverlayResidencyAuthority()
     {
+        if(cpu_expert_shard_ctx_)return setError("CPU expert domain requires original terminal shutdown before replacement");
         shutdownMoEExpertOverlayResidencyMaintenance(
             MoEOverlayMaintenanceDrainIntent::ResetComposition);
         moe_overlay_device_controller_graph_service_.reset();
@@ -19260,9 +19274,10 @@ namespace llaminar2
                 .plan = *plan, .metadata = metadata, .loader = model_ctx_->concreteLoader(),
                 .rebalance = config_.moe_rebalance, .storage_policy = capacity_policy,
                 .capacity = *moe_expert_overlay_memory_admission_,
-                .memory = physical_memory_authority_, .world_rank = current_rank, .world_size = world_size});
+                .memory = physical_memory_authority_, .world_rank = current_rank, .world_size = world_size,
+                .original_model=ModelContextId{reinterpret_cast<uint64_t>(model_ctx_.get())}});
             const auto &economy_layer_catalog = setup.authority()->economyLayerCatalog();
-            const auto &owner_map = setup.authority()->snapshot()->owner_map;
+            const auto &owner_map = setup.authority()->snapshot()->originalOwnerMap();
             if (plan->authority_execution ==
                 MoEOverlayAuthorityExecutionKind::DeviceResident)
             {
@@ -19499,6 +19514,7 @@ namespace llaminar2
             moe_expert_overlay_residency_authority_ = setup.authority();
             moe_expert_overlay_participant_residency_ = setup.residency();
             moe_expert_overlay_interference_probe_ = setup.interference();
+            if(!initializeCPUExpertShardDomain())return false;
         }
         catch (const std::exception &error)
         {
@@ -19509,6 +19525,71 @@ namespace llaminar2
         }
 
         return true;
+    }
+
+    bool OrchestrationRunner::initializeCPUExpertShardDomain()
+    {
+        const auto snapshot=moe_expert_overlay_residency_authority_->snapshot();
+        if(!snapshot || !snapshot->jointOwnerMap())return true;
+        const auto &plan=*snapshot->placement_plan;
+        if(config_.moe_rebalance.mode!=MoERebalanceRuntimeMode::Off ||
+           moe_expert_overlay_residency_authority_->migrationEnabled())
+            return setError("CPU expert tensor-sharded domain currently requires Static immutable placement");
+        const auto world=moe_expert_overlay_mpi_ctx_?moe_expert_overlay_mpi_ctx_:mpi_ctx_;
+        if(!world || !physical_memory_authority_)return setError("CPU expert domain lost original world/PMA authority");
+        std::optional<NativeCPUCollectiveProgram> program;
+        std::optional<std::variant<NativeCPUCollectiveProgram::DomainUse,NativeCPUCollectiveProgram::ProcessUse>> use;
+        const auto prepare=runRankSynchronizedInitializationPhase("CPU expert original domain geometry",
+            {0,"cpu_expert_original_domain_geometry"},InitializationConsensusScope::ExpertOverlayContext,[&] {
+                int domain_ordinal=-1;
+                for(size_t d=0;d<plan.domains.size();++d) {
+                    const auto &candidate=plan.domains[d];
+                    if(candidate.routed_compute_policy!=RoutedExpertComputePolicy::TensorSharded || candidate.participants.size()<=1 ||
+                       !std::all_of(candidate.participants.begin(),candidate.participants.end(),[](const auto& p){return p.isCPU();}))continue;
+                    if(domain_ordinal!=-1)throw std::invalid_argument("CPU joint serving currently requires one original expert domain");
+                    domain_ordinal=static_cast<int>(d);
+                }
+                if(domain_ordinal<0)throw std::logic_error("Original CPU joint source has no declared domain");
+                const auto &domain=plan.domains[static_cast<size_t>(domain_ordinal)];
+                std::shared_ptr<const MoEExpertShardCohort> cohort;
+                for(const auto &row:snapshot->originalOwnerMap().owners())if(row.domain_name==domain.name && row.shard_cohort) {
+                    if(!cohort)cohort=row.shard_cohort;
+                    else if(cohort->participants().size()!=row.shard_cohort->participants().size() ||
+                        !std::equal(cohort->participants().begin(),cohort->participants().end(),row.shard_cohort->participants().begin()))
+                        throw std::invalid_argument("CPU expert source layers changed original domain membership");
+                }
+                if(!cohort || domain.scope!=ExecutionDomainScope::NODE_LOCAL)
+                    throw std::invalid_argument("CPU joint serving requires positive original native fragments and NODE_LOCAL membership");
+                std::vector<NativeCPUCollectiveProgram::Participant> members;
+                int original_node=-1;
+                for(const auto &member:cohort->participants()) {
+                    if(member.world_rank<0 || static_cast<size_t>(member.world_rank)>=cluster_inventory_.ranks.size())
+                        throw std::invalid_argument("CPU expert source contains foreign original rank");
+                    const auto &rank=cluster_inventory_.ranks[static_cast<size_t>(member.world_rank)];
+                    if(rank.rank!=member.world_rank || rank.cpu.numa_node!=member.address.numa_node ||
+                       (original_node>=0 && rank.node_id!=original_node))
+                        throw std::invalid_argument("CPU expert source does not match original physical NODE_LOCAL/NUMA inventory");
+                    original_node=rank.node_id;members.push_back({member.world_rank,member.address});
+                }
+                program.emplace(NativeCPUCollectiveProgram::expertShardRoutePartials(domain_ordinal,domain.backend,std::move(members)));
+                return true;
+            });
+        if(!prepare)return false;
+        if(!runRankSynchronizedInitializationPhase("CPU expert original domain commitment",
+            {1,"cpu_expert_original_domain_commitment"},InitializationConsensusScope::ExpertOverlayContext,[&] {
+                const bool included=std::any_of(program->participants().begin(),program->participants().end(),
+                    [&](const auto& member){return member.world_rank==world->rank();});
+                if(included)use.emplace(std::in_place_type<NativeCPUCollectiveProgram::DomainUse>,
+                    program->admit(physical_memory_authority_,world->rank()));
+                else use.emplace(std::in_place_type<NativeCPUCollectiveProgram::ProcessUse>,
+                    program->admitExcludedParent(physical_memory_authority_,world->rank()));
+                return true;
+            }))return false;
+        return runRankSynchronizedInitializationPhase("CPU expert native original domain",
+            {2,"cpu_expert_native_original_domain"},InitializationConsensusScope::ExpertOverlayContext,[&] {
+                cpu_expert_shard_ctx_=GlobalTPContext::createAdmittedCPUExpertDomain(world->communicator(),*program,std::move(*use));
+                return true;
+            });
     }
 
     bool OrchestrationRunner::
@@ -19693,11 +19774,25 @@ namespace llaminar2
             return true;
         }
 
+        if(initial_snapshot->jointOwnerMap()) {
+            if(config_.moe_rebalance.mode!=MoERebalanceRuntimeMode::Off ||
+               moe_expert_overlay_residency_authority_->migrationEnabled() ||
+               !moe_expert_overlay_participant_residency_->projectionPreparation() ||
+               moe_expert_overlay_participant_residency_->projectionPreparation()->cpuJointOwnerMap().get()!=
+                   initial_snapshot->jointOwnerMap().get())
+                return setError("Static CPU joint startup lost its original immutable fragment authority");
+            if(!run_maintenance_phase("bindStaticJointTransferAndServingGraphs",[&] {
+                return bindMoEOverlayTransferProgressAndMaterializeServingGraphFamily();
+            }))return false;
+            PerfStatsCollector::addCounter("moe_overlay_residency","maintenance_not_started",1.0,
+                "model_setup",perf_device,{{"runtime_mode","off"},{"reason","static_joint_native_source"},{"movement","false"}});
+            return true;
+        }
         const auto maintenance_world = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
         const bool local_cpu_host_maintenance = maintenance_world && maintenance_world->world_size() == 1 &&
             initial_snapshot->placement_plan->authority_execution == MoEOverlayAuthorityExecutionKind::HostResident &&
             config_.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic &&
-            std::all_of(initial_snapshot->owner_map.participants().begin(), initial_snapshot->owner_map.participants().end(),
+            std::all_of(initial_snapshot->originalOwnerMap().participants().begin(), initial_snapshot->originalOwnerMap().participants().end(),
                 [](const auto &participant) { return participant.device.is_cpu(); });
         std::vector<MoEOverlayParticipantLayerServiceTotals>
             prepared_service_measurements;
@@ -19833,7 +19928,7 @@ namespace llaminar2
                             .maximum_participants_per_cycle =
                                 std::max<std::size_t>(
                                     1u,
-                                    initial_snapshot->owner_map
+                                    initial_snapshot->originalOwnerMap()
                                         .participants().size()),
                             .maximum_concurrent_cycles =
                                 capacity_policy.maximum_concurrent_cycles,
@@ -19862,7 +19957,7 @@ namespace llaminar2
                             MoEOverlayMPIEconomyEvidenceExchange>(
                             MoEOverlayMPIEconomyEvidenceExchange::Config{
                                 .mpi_context = overlay_world,
-                                .owner_map = initial_snapshot->owner_map,
+                                .owner_map = initial_snapshot->originalOwnerMap(),
                                 .production_topology = production_topology,
                                 .perf_device = perf_device,
                             });
@@ -19937,7 +20032,7 @@ namespace llaminar2
                             .maximum_participants_per_cycle =
                                 std::max<std::size_t>(
                                     1u,
-                                    initial_snapshot->owner_map
+                                    initial_snapshot->originalOwnerMap()
                                         .participants().size()),
                             .maximum_concurrent_cycles =
                                 capacity_policy.maximum_concurrent_cycles,
@@ -20348,7 +20443,7 @@ namespace llaminar2
                     .maximum_participants_per_cycle =
                         std::max<std::size_t>(
                             1,
-                            initial_snapshot->owner_map
+                            initial_snapshot->originalOwnerMap()
                                 .participants().size()),
                     .maximum_concurrent_cycles =
                         config_.moe_rebalance
@@ -20399,7 +20494,7 @@ namespace llaminar2
                     MoEOverlayMPIEconomyEvidenceExchange>(
                     MoEOverlayMPIEconomyEvidenceExchange::Config{
                         .mpi_context = overlay_world,
-                        .owner_map = initial_snapshot->owner_map,
+                        .owner_map = initial_snapshot->originalOwnerMap(),
                         .production_topology = production_topology,
                         .perf_device = perf_device,
                     });
@@ -20520,7 +20615,7 @@ namespace llaminar2
 
                 std::vector<int> expected_local_gpu_participants;
                 for (const auto &participant :
-                     initial_snapshot->owner_map.participants())
+                     initial_snapshot->originalOwnerMap().participants())
                 {
                     if (participant.device.is_gpu() &&
                         (!participant.world_rank_known ||
@@ -20605,7 +20700,7 @@ namespace llaminar2
                         .maximum_participants_per_cycle =
                             std::max<std::size_t>(
                                 1,
-                                initial_snapshot->owner_map
+                                initial_snapshot->originalOwnerMap()
                                     .participants().size()),
                         .maximum_concurrent_cycles =
                             capacity_policy.maximum_concurrent_cycles,
@@ -20836,7 +20931,7 @@ namespace llaminar2
                   std::to_string(local_ids.size())},
                  {"global_participants",
                   std::to_string(
-                      initial_snapshot->owner_map.participants().size())},
+                      initial_snapshot->originalOwnerMap().participants().size())},
                  {"world_rank", std::to_string(world_rank)},
                  {"world_size", std::to_string(world_size)},
                  {"distributed", distributed ? "true" : "false"},
@@ -22029,6 +22124,19 @@ namespace llaminar2
                         resources.push_back({world_rank,device,found->memory_bytes,
                             PhysicalMemoryAuthority::admissionCapacity(found->free_memory_bytes,config_.memoryLimitBytes(device.type))});
                     }
+                    if(config_.moe_routed_expert_plan && config_.moe_routed_expert_plan->usesExpertOverlayAuthority()){
+                        // The one source PMA must retain the SAME topology-wide
+                        // registry later frozen by global capacity admission.
+                        // Only its explicit local devices below create workers.
+                        const int world_size=overlay_world?overlay_world->world_size():1;
+                        const auto execution=resolveMoEExpertOverlayExecutionPlan(config_.moe_routed_expert_plan,
+                            {.current_world_rank=world_rank,.world_size=world_size});
+                        const auto metadata=resolveMoERoutedExpertModelMetadataForModel(*model_ctx_,retainedMTPConfig());
+                        const auto policy=resolveMoEOverlayCapacityAdmissionPolicy(*config_.moe_routed_expert_plan,
+                            config_,world_size,metadata.num_layers,metadata.num_experts);
+                        resources=originalMoEOverlayNativePreparationResources(execution,cluster_inventory_,config_,policy,
+                            plan_.runtime.ngram_table_policy);
+                    }
                     source=NativeContextPreparation::create(resources,world_rank,unique_gpus);
                     try {
                         std::vector<PreparedGPUContextUsePermit> creation;
@@ -22302,6 +22410,11 @@ namespace llaminar2
             .plan = plan_,
             .inventory = cluster_inventory_.ranks.at(plan_.rank),
             .weight_load_geometry = fresh_gpu_weight_load_geometry,
+            .native_weight_source_policy = retained_prepared_weight_plan_validated_
+                ? std::nullopt : std::optional{configuredGPUWeightLoadMemoryPolicy()},
+            .weight_precision = WeightPrecision::NATIVE,
+            .native_source_placement = retained_prepared_weight_plan_validated_
+                ? std::nullopt : std::optional{model_ctx_->concreteLoader().nativeWeightSourcePlacement()},
             .snapshot_capacity = snapshot_capture_setup_.enabled()
                 ? std::optional{snapshot_capture_setup_.memory_capacity} : std::nullopt,
             .captured_prefill_buckets = std::move(captured_prefill_buckets),
@@ -22780,7 +22893,7 @@ namespace llaminar2
                     "received no valid frozen owner-map snapshot");
             }
             const auto &placement = *snapshot->placement_plan;
-            const auto &owner_map = snapshot->owner_map;
+            const auto &owner_map = snapshot->originalOwnerMap();
             const int source_participant_id =
                 placement.continuation_domain_spec.logical_root_participant;
             const auto *const source =
@@ -23003,6 +23116,7 @@ namespace llaminar2
                                 .activation_layout =
                                     channel.mapping_layout,
                                 .local_lanes = local_lanes,
+                                .original_cpu_joint_owners=snapshot->jointOwnerMap(),
                             };
                         auto transport = same_rank ?
                             createMoEOverlayRankLocalGPUActivationTransport(std::move(transport_config)) :
@@ -23386,6 +23500,7 @@ namespace llaminar2
                             resolveMTPRetainedDraftCapacity(active_mtp),
                         .max_request_count =
                             std::max(1, plan_.runtime.batch_size),
+                        .cpu_joint_context=cpu_expert_shard_ctx_,
                     };
     }
 
@@ -23400,7 +23515,7 @@ namespace llaminar2
             if (!snapshot || !snapshot->valid() || !context)
                 return setError("Expert endpoint construction lost original admitted ownership");
             const auto endpoints = MoEOverlayHostServiceContract::resolveAdmitted(
-                *config_.moe_routed_expert_plan, snapshot->owner_map, *context);
+                *config_.moe_routed_expert_plan, snapshot->originalOwnerMap(), *context);
             if (endpoints.requiresRankLocalInferencePublisher() &&
                 (!hasLocalTP() || plan_.usesLocalPP() || requiresNamedDomainGlobalGraph(config_)))
                 return setError("Same-rank cross-vendor expert endpoints require their original flat LocalTP parent; other enclosing graph roles are not implemented");
@@ -24212,7 +24327,7 @@ namespace llaminar2
 
                     const auto topology =
                         makeMoEOverlayInferenceTopologyIdentity(
-                            snapshot->owner_map,
+                            snapshot->originalOwnerMap(),
                             graph_family,
                             source_rank,
                             rank_plan.world_rank);
@@ -24262,7 +24377,7 @@ namespace llaminar2
                     snapshot->placement_plan->continuation_domain_spec
                         .logical_root_participant;
                 const auto *const ticket_authority =
-                    snapshot->owner_map.participantForId(
+                    snapshot->originalOwnerMap().participantForId(
                         logical_root_participant);
                 if (!ticket_authority ||
                     ticket_authority->domain_name !=
@@ -24284,7 +24399,7 @@ namespace llaminar2
                         static_cast<std::size_t>(continuation_participants),
                         MoEOverlayInferenceCompletionBoundaryKind::Unspecified);
                 for (const auto &participant :
-                     snapshot->owner_map.participants())
+                     snapshot->originalOwnerMap().participants())
                 {
                     if (participant.domain_name !=
                             execution->continuation_domain ||
@@ -24846,6 +24961,7 @@ namespace llaminar2
             moe_expert_overlay_residency_authority_;
         mdo_config.moe_expert_overlay_participant_residency =
             moe_expert_overlay_participant_residency_;
+        mdo_config.moe_expert_overlay_cpu_joint_context=cpu_expert_shard_ctx_;
         mdo_config.moe_expert_overlay_decode_histogram =
             moe_expert_overlay_decode_histogram_;
         mdo_config.moe_expert_overlay_mpi_ctx = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
@@ -24862,7 +24978,7 @@ namespace llaminar2
             if (!snapshot || !snapshot->valid() || !context)
                 return setError("Rank auxiliary expert selection lost its original admitted ownership");
             const auto endpoints = MoEOverlayHostServiceContract::resolveAdmitted(
-                *config_.moe_routed_expert_plan, snapshot->owner_map, *context);
+                *config_.moe_routed_expert_plan, snapshot->originalOwnerMap(), *context);
             if (endpoints.requiresRankLocalInferencePublisher())
                 mdo_config.rank_local_expert_endpoints = makeMoEOverlayParticipantConfig(
                     MoEOverlayParticipantGraphOwnership::RankLocalAuxiliary);
@@ -25059,6 +25175,7 @@ namespace llaminar2
             moe_expert_overlay_residency_authority_;
         runner_config.moe_expert_overlay_participant_residency =
             moe_expert_overlay_participant_residency_;
+        runner_config.moe_expert_overlay_cpu_joint_context=cpu_expert_shard_ctx_;
         runner_config.moe_expert_overlay_decode_histogram =
             moe_expert_overlay_decode_histogram_;
         runner_config.moe_expert_overlay_mpi_ctx = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
@@ -26039,6 +26156,16 @@ namespace llaminar2
         shutdownMoEExpertOverlayResidencyMaintenance(
             MoEOverlayMaintenanceDrainIntent::TerminalContextSeal);
         flushPrefixCacheOnShutdown();
+    }
+
+    void OrchestrationRunner::abortMPIWorkers(const std::string& reason)
+    {
+        if (mpi_ctx_ && mpi_ctx_->world_size() > 1 &&
+            mpi_ctx_->rank() != mpi_coordinated_root_rank_)
+        {
+            terminateFailedMPIWorkerCommand("coordinated cancellation", reason);
+        }
+        shutdownMPIWorkers();
     }
 
     [[noreturn]] void OrchestrationRunner::terminateFailedMPIWorkerCommand(

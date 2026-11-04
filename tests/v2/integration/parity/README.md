@@ -629,6 +629,14 @@ or `diagnostic` role. Required groups supply every absolute mean, offset,
 row, tail, total-variation and agreement limit; diagnostic groups carry no
 limits. Missing or foreign groups fail before native admission.
 
+A reviewed required-group policy may explicitly add `bounded_row_outliers`
+with `maximum_rows` and `maximum_kl_nats`. Only that many rows may exceed the
+ordinary `maximum.row_kl_nats`, and none may exceed the additional ceiling.
+Every row still contributes to prompt-balanced means, per-offset means, tails,
+total variation, agreement and paired-delta checks. The report retains the
+outlier count and row identities; absent this object, the ordinary ceiling
+applies to every row. This option never changes a reference or drops a row.
+
 An initial pilot reports `REQUIRED_GROUPS_GREEN` or `REQUIRED_GROUPS_RED`.
 Its diagnostic groups remain unavailable, paired deltas remain null, and
 the result does not qualify the complete corpus, model, topology or image.
@@ -1376,3 +1384,24 @@ Older/missing-field documents reject; refresh reviewed binding metadata through
 the canonical exporter/parser while preserving histories/source/policy limits.
 Prior numerical observations retain their original source/config identity and
 must not be relabeled as execution of a new backing policy.
+
+
+### CPU expert tensor-shard full-stage history diagnosis
+
+`Qwen4ExpCPUJointWorld2FullStage/Qwen4ExpCPUJointFullStageTest.ProductionParity`
+uses the original QFN numerical framework with one MPI rank per physical socket.
+Its declared Static RAM MTP-Off/capacity-zero case has the GPU continuation and
+NUMA0 expert fragment on rank0, NUMA1 fragment on rank1, and unchanged GPU64/CPU448
+expert identities. This diagnostic requires an explicit `--history-replay`
+descriptor bound to its exact cell and original full-stage reference. It is not a
+frozen-panel or source-admission certificate.
+
+All original required checkpoints and six CSV comparisons remain intact. Only
+the continuation compares complete snapshots and issues public inference;
+followers execute the original production worker loop. The original MPI context
+and its published physical socket inventory are retained by the Runner factory.
+Distributed history launches retain their registered socket binding and requested
+workers per rank, and reject oversubscription/overlap controls. Completed per-rank
+CPU resource records prove distinct original sockets, live CPU work and retirement.
+Single-rank frozen-history launch behavior is unchanged. No active-MTP, dynamic
+expert migration or absent physical socket qualification is added here.

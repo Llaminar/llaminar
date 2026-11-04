@@ -1,6 +1,12 @@
 /**
  * @file CPUCanonicalRouteReducer.cpp
  * @brief Stable-team implementation of ordered canonical CPU MoE reduction.
+ *
+ * Joint expert fragments retain independent prepared-engine execution. Their
+ * unweighted down rows are combined in immutable cohort order before the
+ * existing canonical top-k FMA fold. Callers own every input/scratch/output
+ * allocation through the ordinary PMA; this kernel neither prices nor places
+ * experts and never allocates or changes worker-team width.
  */
 
 #include "CPUCanonicalRouteReducer.h"
@@ -203,6 +209,129 @@ namespace llaminar2::cpu::moe
         };
         OMP_WORKSHARE_REGION(reduce_tasks);
         return true;
+    }
+
+    bool combineCanonicalRouteDownPartialsOrdered(
+        const CanonicalRouteDownPartialCombineArgs &args)
+    {
+        if (args.ordered_participants.size() < 2 || args.ordered_participants.size() > 8 ||
+            args.rows < 0 || args.top_k <= 0 || args.columns <= 0) return false;
+        if (args.rows == 0) return true;
+        const auto maximum = std::numeric_limits<size_t>::max();
+        const auto rows = static_cast<size_t>(args.rows);
+        const auto top_k = static_cast<size_t>(args.top_k);
+        const auto columns = static_cast<size_t>(args.columns);
+        if (rows > maximum / top_k || rows * top_k > maximum / columns) return false;
+        const auto slots = rows * top_k;
+        const auto elements = slots * columns;
+        if (elements > maximum / sizeof(float) || !args.route_weights ||
+            args.combined_route_rows.size() < elements || !args.combined_route_rows.data()) return false;
+        const auto plan = planCanonicalRouteFold(args.rows,args.top_k,args.columns);
+        if (!plan.parallel_tasks || plan.parallel_tasks > static_cast<size_t>(std::numeric_limits<long long>::max()))
+            return false;
+        // Validate the complete byte geometry before publishing even one scratch element.
+        const auto overlap = [](const void *left,size_t leftBytes,const void *right,size_t rightBytes) {
+            const auto a=reinterpret_cast<std::uintptr_t>(left),b=reinterpret_cast<std::uintptr_t>(right);
+            if (leftBytes>std::numeric_limits<std::uintptr_t>::max()-a ||
+                rightBytes>std::numeric_limits<std::uintptr_t>::max()-b) return true;
+            return a<b+rightBytes && b<a+leftBytes;
+        };
+        const auto bytes=elements*sizeof(float),weightBytes=slots*sizeof(float);
+        if (overlap(args.combined_route_rows.data(),bytes,args.route_weights,weightBytes)) return false;
+        for (size_t participant=0;participant<args.ordered_participants.size();++participant) {
+            const auto &bank=args.ordered_participants[participant];
+            const auto input=bank.values;
+            const auto inputBytes=bank.record_for_route_slot.empty()?bytes:input.size_bytes();
+            if ((!input.empty() && !input.data()) || input.size()>maximum/sizeof(float) ||
+                overlap(input.data(),inputBytes,args.combined_route_rows.data(),bytes)) return false;
+            if (bank.record_for_route_slot.empty()) {
+                if (input.size()<elements) return false;
+            } else {
+                if (bank.record_for_route_slot.size()!=slots) return false;
+                const auto width=columns+1;
+                if (input.size()%width) return false;
+                for (size_t slot=0;slot<slots;++slot) {
+                    const auto record=bank.record_for_route_slot[slot];
+                    if (args.route_weights[slot]==0.0f) {
+                        if (record!=-1) return false;
+                        continue;
+                    }
+                    if (record<0 || static_cast<size_t>(record)>=input.size()/width) return false;
+                    if (canonical_moe_route_record::readFlatRouteSlot(
+                            input.data()+static_cast<size_t>(record)*width,args.columns)!=slot) return false;
+                }
+            }
+            for (size_t prior=0;prior<participant;++prior)
+                if (overlap(input.data(),inputBytes,args.ordered_participants[prior].values.data(),
+                            args.ordered_participants[prior].record_for_route_slot.empty()?bytes:
+                                args.ordered_participants[prior].values.size_bytes())) return false;
+            if (!bank.record_for_route_slot.empty() &&
+                (overlap(bank.record_for_route_slot.data(),bank.record_for_route_slot.size_bytes(),
+                         args.combined_route_rows.data(),bytes) ||
+                 overlap(bank.record_for_route_slot.data(),bank.record_for_route_slot.size_bytes(),
+                         args.route_weights,weightBytes))) return false;
+        }
+        const auto partialRow=[&](size_t participant,size_t slot,size_t first) {
+            const auto &bank=args.ordered_participants[participant];
+            const auto offset=bank.record_for_route_slot.empty()?slot*columns:
+                static_cast<size_t>(bank.record_for_route_slot[slot])*(columns+1);
+            return bank.values.data()+offset+first;
+        };
+        const auto combine = [&](size_t task) {
+            const auto row=task/static_cast<size_t>(plan.column_tiles_per_row);
+            const auto first=static_cast<int>(task%static_cast<size_t>(plan.column_tiles_per_row))*plan.column_tile;
+            const auto count=std::min(plan.column_tile,args.columns-first);
+            for (size_t route=0;route<top_k;++route) {
+                const auto slot=row*top_k+route;
+                if (args.route_weights[slot]==0.0f) continue;
+                const auto offset=slot*columns+static_cast<size_t>(first);
+                float *const destination=args.combined_route_rows.data()+offset;
+                std::copy_n(partialRow(0,slot,static_cast<size_t>(first)),count,destination);
+                // Separate explicit vector additions retain every participant rounding point.
+                for (size_t participant=1;participant<args.ordered_participants.size();++participant)
+                    primitives::vec_add(destination,destination,
+                        partialRow(participant,slot,static_cast<size_t>(first)),count);
+            }
+        };
+        if (plan.executor==CanonicalRouteFoldExecutor::CallerThread) {
+            for (size_t task=0;task<plan.parallel_tasks;++task) combine(task);
+        } else {
+            auto work=[&]() {
+#pragma omp for schedule(static)
+                for (long long task=0;task<static_cast<long long>(plan.parallel_tasks);++task)
+                    combine(static_cast<size_t>(task));
+            };
+            OMP_WORKSHARE_REGION(work);
+        }
+        return true;
+    }
+
+    bool reduceCanonicalRouteDownPartialsOrderedFMA(
+        const CanonicalRouteDownPartialFoldArgs &args, CanonicalRouteFoldPlan *used_plan)
+    {
+        // Authenticate the complete destination before the unweighted combine writes scratch.
+        if (args.rows<0 || args.top_k<=0 || args.columns<=0) return false;
+        if (args.rows==0) return args.ordered_participants.size()>=2 && args.ordered_participants.size()<=8;
+        const size_t rows=static_cast<size_t>(args.rows),k=static_cast<size_t>(args.top_k),h=static_cast<size_t>(args.columns);
+        const auto max=std::numeric_limits<size_t>::max();
+        if (!args.output || rows>max/k || rows*k>max/h || rows*k*h>max/sizeof(float)) return false;
+        const auto outputBytes=rows*h*sizeof(float);
+        const auto overlap=[&](const void *pointer,size_t bytes) {
+            const auto a=reinterpret_cast<std::uintptr_t>(pointer),b=reinterpret_cast<std::uintptr_t>(args.output);
+            return bytes>std::numeric_limits<std::uintptr_t>::max()-a ||
+                   outputBytes>std::numeric_limits<std::uintptr_t>::max()-b || (a<b+outputBytes && b<a+bytes);
+        };
+        if (overlap(args.combined_route_rows.data(),rows*k*h*sizeof(float)) ||
+            overlap(args.route_weights,rows*k*sizeof(float))) return false;
+        for (const auto &bank:args.ordered_participants)
+            if (bank.values.size()>max/sizeof(float) || overlap(bank.values.data(),
+                bank.record_for_route_slot.empty()?rows*k*h*sizeof(float):bank.values.size_bytes()) ||
+                (!bank.record_for_route_slot.empty() &&
+                 overlap(bank.record_for_route_slot.data(),bank.record_for_route_slot.size_bytes()))) return false;
+        if (!combineCanonicalRouteDownPartialsOrdered({args.ordered_participants,args.combined_route_rows,
+                                                       args.route_weights,args.rows,args.top_k,args.columns})) return false;
+        return reduceCanonicalRouteRowsOrderedFMA({args.combined_route_rows.data(),args.route_weights,
+            nullptr,args.output,args.rows,args.top_k,args.columns},used_plan);
     }
 
     const char *canonicalRouteFoldExecutorName(

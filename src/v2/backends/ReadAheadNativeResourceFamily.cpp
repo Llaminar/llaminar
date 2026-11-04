@@ -45,11 +45,12 @@ ReadAheadNativeResourceCertificate ReadAheadNativeResourceFamily::requireInstall
 }
 PhysicalMemoryPlan ReadAheadNativeResourceFamily::bom(DeviceId selected,
     PhysicalMemoryResource host,PhysicalMemoryResource device){
-    const auto certificate=requireInstalledCertificate(selected);
-    if(host.device!=DeviceId::cpu() || device.device!=selected || host.world_rank!=device.world_rank)
+    if(!selected.is_gpu())throw std::invalid_argument("Read-ahead BOM requires an exact GPU endpoint");
+    const auto allowance=NativeAuxiliaryResourceCatalog::allowance(selected.type,NativeAuxiliaryResourceProgram::readAheadSide());
+    if(!host.valid() || !device.valid() || host.device!=DeviceId::cpu() || device.device!=selected || host.world_rank!=device.world_rank)
         throw std::invalid_argument("Read-ahead opaque-family BOM changed original host/device allocators");
-    PhysicalMemoryPlanBuilder builder;builder.add(host,PhysicalMemoryOwner::NativeReadAheadFamily,certificate.hostBytes());
-    builder.add(device,PhysicalMemoryOwner::NativeReadAheadFamily,certificate.deviceBytes());return builder.build();
+    PhysicalMemoryPlanBuilder builder;builder.add(host,PhysicalMemoryOwner::NativeReadAheadFamily,allowance.hostBytes);
+    builder.add(device,PhysicalMemoryOwner::NativeReadAheadFamily,allowance.deviceBytes);return builder.build();
 }
 std::shared_ptr<ReadAheadNativeResourceFamily> ReadAheadNativeResourceFamily::materialize(
     std::shared_ptr<PhysicalMemoryAuthority> memory,std::shared_ptr<IWorkerGPUContext> worker,

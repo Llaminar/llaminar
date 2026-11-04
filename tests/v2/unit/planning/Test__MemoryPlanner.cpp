@@ -5081,3 +5081,5 @@ TEST(Test__MemoryPlanner, OriginalNativeLoadedClosureConcurrentModuleReplay){
     for(int iteration=0;iteration<20;++iteration)EXPECT_EQ(Access::loadedClosure(reinterpret_cast<const void*>(&::getpid)),first);
     loader.request_stop();loader.join();EXPECT_FALSE(failed);EXPECT_GT(completed.load(),0u);
 }
+
+#include "LocalNativePreparationBOMContract.inc"

@@ -850,6 +850,7 @@ struct MemoryPlanner::SharedOwnerIdentities
 {
     std::set<std::tuple<int,std::string,RetainedHostServiceRole>> host_service_instances; ///< Typed physical instance identities, never capacity counters.
     std::set<const PhysicalMemoryAuthority*> native_context_sources; ///< Immutable source identity deduplication, never another capacity ledger.
+    std::map<std::pair<int,DeviceId>,size_t> native_weight_source_windows; ///< One immutable serialized source-window maximum per original CPU allocator.
     std::set<std::pair<int, std::string>> prefix_archives;
     std::set<std::pair<int, std::string>> read_ahead_contexts; ///< Actual single-parent concurrency groups; variants share one entry, never another ledger.
     std::set<std::pair<int, std::string>> native_table_allocators; ///< One host table or one resident copy per GPU PLE consumer.
@@ -891,8 +892,46 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
             if(source->memory()->worldRank()!=cfg.world_rank)
                 throw std::logic_error("Native source mandatory plan crossed physical MPI ranks");
             if(cfg.device.is_gpu())source->requireSelectedDevice(cfg.device);
-            if(shared.native_context_sources.insert(source->memory().get()).second)
-                native_context_bom=source->mandatoryBOM();
+            if(!shared.native_context_sources.contains(source->memory().get())){
+                // The original source retains the complete global registry so
+                // native claim indices survive final admission. This output is
+                // a rank-local bill: foreign zero rows must not become local
+                // graph devices or sender-owned capacity-wire records.
+                PhysicalMemoryPlanBuilder local;
+                for(const auto& row:source->mandatoryBOM().resources()){
+                    if(row.resource().world_rank!=cfg.world_rank){
+                        // totalBytes includes already-resident charges. Never
+                        // hide a foreign live obligation as a zero increment.
+                        if(row.totalBytes()!=0)
+                            throw std::logic_error("Native preparation rank-local BOM contains foreign physical charges");
+                        continue;
+                    }
+                    local.add(row);
+                }
+                native_context_bom=local.build();
+                // Failed validation must not mark this source as contributed.
+                shared.native_context_sources.insert(source->memory().get());
+            }
+        }
+        if(!cfg.device.is_cpu() && cfg.native_weight_load_staging)
+            throw std::invalid_argument("Common CPU source staging cannot be attached to a GPU ring");
+        size_t native_weight_source_staging_bytes=0;
+        if(cfg.device.is_cpu() && (cfg.weight_load_staging.host_bytes || cfg.native_weight_load_staging)) {
+            const auto& declared=cfg.native_weight_load_staging;
+            if(!declared || !declared->maximum_units_per_window || !declared->native_bytes ||
+               declared->scratch_offset<declared->native_bytes ||
+               declared->scratch_bytes>declared->physical_bytes ||
+               declared->scratch_offset>declared->physical_bytes-declared->scratch_bytes ||
+               declared->physical_bytes!=cfg.weight_load_staging.host_bytes)
+                throw std::invalid_argument("CPU source staging requires its exact original native input and scratch declaration");
+            // The original common CPU source mutex holds reader and consumer
+            // through final commit/raw retirement. Those declarations share a
+            // maximum; independently live GPU upload rings remain additive.
+            auto& maximum=shared.native_weight_source_windows[{cfg.world_rank,cfg.device}];
+            if(declared->physical_bytes>maximum) {
+                native_weight_source_staging_bytes=declared->physical_bytes-maximum;
+                maximum=declared->physical_bytes;
+            }
         }
         PhysicalMemoryPlan executor_service_bom;
         if(cfg.retained_host_services&&cfg.retained_host_services->contains({cfg.world_rank,cfg.device,RetainedHostServiceRole::ExecutorParentTicket})&&
@@ -1124,13 +1163,14 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
         if (cfg.concurrent_workspace_owners == 0u)
             throw std::invalid_argument(
                 "Memory planning requires a positive workspace-owner count");
-        if (cfg.weight_load_staging.enabled() && !cfg.device.is_gpu())
-        {
-            throw std::invalid_argument(
-                "Weight-load staging can only be attached to a GPU device plan");
-        }
-        if ((cfg.weight_load_staging.device_bytes == 0u) !=
-            (cfg.weight_load_staging.host_bytes == 0u))
+        // CPU source windows have only host backing and were authenticated
+        // above against the original common source declaration. GPU upload rings
+        // retain their paired device/pinned-host contract.
+        if (cfg.device.is_cpu() && cfg.weight_load_staging.device_bytes != 0u)
+            throw std::invalid_argument("CPU source staging cannot declare GPU backing");
+        if (cfg.device.is_gpu() &&
+            ((cfg.weight_load_staging.device_bytes == 0u) !=
+             (cfg.weight_load_staging.host_bytes == 0u)))
         {
             throw std::invalid_argument(
                 "GPU weight-load staging requires both device and pinned-host byte authorities");
@@ -1482,9 +1522,9 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
         auto weight_est = physical_weight_uses
             ? WeightMemoryEstimator::estimatePhysical(*physical_weight_uses, PreparedWeightUseIntent::PublishCreator,
                 profile, cfg.device, cfg.shard_index, cfg.total_shards, cfg.first_layer, weight_last_layer,
-                cfg.weight_residency, cfg.tensor_parallel_assignment, weight_components)
+                cfg.weight_residency, cfg.tensor_parallel_assignment, weight_components, cfg.native_source_placement)
             : WeightMemoryEstimator::estimate(profile, cfg.device, cfg.shard_index, cfg.total_shards,
-                cfg.first_layer, weight_last_layer, cfg.weight_residency, cfg.tensor_parallel_assignment, weight_components);
+                cfg.first_layer, weight_last_layer, cfg.weight_residency, cfg.tensor_parallel_assignment, weight_components, cfg.native_source_placement);
         primary_weight_bytes = weight_est.device_bytes;
 
         for (std::size_t set_index = 0;
@@ -1553,7 +1593,7 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                         weight_last_layer,
                         sidecar_residency,
                         std::nullopt,
-                        weight_components);
+                        weight_components, cfg.native_source_placement);
                 additional_weight_bytes = checkedAdd(
                     additional_weight_bytes,
                     sidecar_estimate.device_bytes,
@@ -1585,7 +1625,7 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                         weight_last_layer,
                         mirrored_residency,
                         std::nullopt,
-                        weight_components);
+                        weight_components, cfg.native_source_placement);
                 const std::size_t component_bytes =
                     additional_set ==
                             AdditionalPersistentWeightSet::
@@ -1639,7 +1679,7 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                         profile.totalLayerCount() - 1,
                         sidecar_residency,
                         std::nullopt,
-                        WeightComponentScope::LayersOnly);
+                        WeightComponentScope::LayersOnly, cfg.native_source_placement);
                 additional_weight_bytes = checkedAdd(
                     additional_weight_bytes,
                     sidecar.device_bytes,
@@ -2135,10 +2175,7 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                 cfg.first_layer,
                 last_layer,
                 activation_seq);
-            workspace_bytes =
-                WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(
-                    profile,
-                    WorkspaceMemoryGeometry{
+            const WorkspaceMemoryGeometry invocation_geometry{
                     .device = cfg.device,
                     .device_compute_units = cfg.device_compute_units,
                     .cpu_execution = cfg.cpu_execution,
@@ -2178,7 +2215,15 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                         .apportioned_routed_experts = true,
                         .generation_request_capacity = cfg.generation_request_capacity,
                         .compact_routed_expert_token_rows = compact_routed_expert_token_rows,
-                    });
+                    };
+            const auto* joint = cfg.device.is_cpu() && cfg.cpu_serial_expert_storage
+                ? &cfg.cpu_serial_expert_storage->envelope->admitted()->jointRoutes() : nullptr;
+            // Source metadata stays whole. Only the existing kernel contract's
+            // N/K invocation geometry follows the exact retained F ownership.
+            workspace_bytes = joint && *joint
+                ? WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(profile,invocation_geometry,
+                    (*joint)->cohort()->ownership((*joint)->member()))
+                : WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(profile,invocation_geometry);
         }
 
         bool ordinary_cpu_grouped_roots_charged = false;
@@ -2348,7 +2393,7 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                 PhysicalMemoryOwner::WeightLoadStaging,
                 cfg.device.is_gpu()
                     ? cfg.weight_load_staging.device_bytes
-                    : 0u);
+                    : native_weight_source_staging_bytes);
         DeviceMemoryPlan dev_plan(
             bom_builder.build(), max_seq, activation_seq);
 

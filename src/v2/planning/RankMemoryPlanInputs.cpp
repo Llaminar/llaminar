@@ -25,10 +25,80 @@
 #include "backends/DeviceAddressAdapter.h"
 #include "config/BackendSelector.h"
 #include "execution/mtp/DeviceGenerationExecutionPolicy.h"
+#include "planning/WeightShardGeometry.h"
+#include "memory/CPUSerialExpertStorageLayout.h"
+#include "loaders/PreparedWeightIdentityContract.h"
+#include "loaders/PreparedWeightRepresentationContract.h"
+#include "kernels/cpu/gemm/CPUWeightPreparationGeometry.h"
+#include "execution/local_execution/graph/SchemaFactoryRegistry.h"
 #include <span>
 
 namespace llaminar2
 {
+    std::optional<NativeWeightLoadStagingGeometry> quoteCPUWeightSourceStaging(
+        const ModelMemoryProfile& profile,const DevicePlanConfig& cfg,
+        GPUWeightLoadMemoryPolicy policy,WeightPrecision precision,CPUStoragePlacement placement)
+    {
+        if(!cfg.device.is_cpu())throw std::invalid_argument("CPU source quote requires its original CPU participant");
+        const auto schema=SchemaFactoryRegistry::getWeightShardingConfig(profile.architecture);
+        const auto terminal=SchemaFactoryRegistry::getFactory(profile.architecture)->terminalInputWeightNames();
+        const int last=cfg.last_layer<0?profile.mainLayerCount()-1:cfg.last_layer;
+        const bool continuation=cfg.execution_role==DeviceExecutionMemoryRole::ContinuationGraph;
+        const bool terminal_owner=continuation && last>=profile.mainLayerCount()-1;
+        const bool routed_owner=cfg.serial_routed_expert_participant_count>0 ||
+            cfg.routed_expert_compact_buffer_lifetime==RoutedExpertCompactBufferLifetime::PerLayerGraphOwned;
+        const bool tied_head=std::none_of(profile.tensors.begin(),profile.tensors.end(),[](const auto& tensor){
+            return inferWeightRole(tensor.name)==WeightRole::LMHead;
+        });
+        WeightShardGeometryResolver source(profile,cfg.device,cfg.shard_index,cfg.total_shards,cfg.tensor_parallel_assignment);
+        std::optional<NativeWeightLoadStagingGeometry> maximum;
+        for(const auto& tensor:profile.tensors) {
+            const auto original_role=inferWeightRole(tensor.name);
+            const bool head_alias=original_role==WeightRole::Embedding && terminal_owner && tied_head;
+            const auto role=head_alias?WeightRole::LMHead:original_role;
+            auto semantic=tensor;
+            if(head_alias)semantic.name="output.weight";
+            const bool routed=isRoutedExpertRole(role);
+            if(routed && !routed_owner)continue;
+            if(!routed && !continuation)continue;
+            if(tensor.layer_index>=0) {
+                const bool main=tensor.layer_index>=cfg.first_layer && tensor.layer_index<=last &&
+                    tensor.layer_index<profile.mainLayerCount();
+                const bool predictor=terminal_owner && cfg.mtp_enabled && tensor.layer_index>=profile.mainLayerCount() &&
+                    tensor.layer_index<profile.totalLayerCount();
+                if(!main && !predictor)continue;
+            } else {
+                if(original_role==WeightRole::Embedding && !cfg.owns_embedding && !head_alias)continue;
+                if(!terminal_owner && std::find(terminal.begin(),terminal.end(),tensor.name)!=terminal.end())continue;
+            }
+            const auto type=tensorTypeFromName(tensor.quant_type);
+            if(!type)throw std::invalid_argument("CPU source quote has unknown original tensor format: "+tensor.quant_type);
+            const auto joint=cfg.cpu_serial_expert_storage
+                ? cfg.cpu_serial_expert_storage->envelope->admitted()->jointRoutes():std::optional<CPUJointExpertRouteStorageLayout>{};
+            const auto shape=routed && joint
+                ? source.resolve(semantic,joint->cohort()->ownership(joint->member()),size_t(profile.expert_count))
+                : source.resolve(semantic,routed?std::optional<size_t>{size_t(profile.expert_count)}:std::nullopt);
+            const size_t rows=shape.matrix()?shape.matrix()->rows:1;
+            const size_t columns=shape.matrix()?shape.matrix()->columns:shape.elements();
+            if(!rows || !columns)continue; // An actual empty shard has no source transaction.
+            const auto classification=PreparedWeightIdentityContract::classifyOriginalMatrix(role,cfg.device);
+            const bool prepared=routed || (shape.matrix() && classification!=PreparedGemmClassification::Rejected &&
+                (classification!=PreparedGemmClassification::RequiresSchema || !schema.isNonGemmWeight(semantic.name)));
+            const auto execution=PreparedWeightRepresentationContract::resolve(role,*type,tensor.name,profile.architecture,
+                debugEnv().gemm.gdn_projection_arithmetic,debugEnv().gemm.moe_router_arithmetic);
+            const auto operand=PreparedWeightRepresentationContract::operandPrecision(role,tensor.name,profile.architecture,
+                debugEnv().gemm.gdn_projection_arithmetic,debugEnv().gemm.moe_router_arithmetic);
+            const auto destination=PreparedWeightRepresentationContract::resolveCPUWeightPrecision(role,*type,precision,execution,operand);
+            const auto quote=quoteCPUWeightPreparation(*type,rows,columns,destination,
+                prepared?CPUWeightConsumer::PreparedGemm:CPUWeightConsumer::ResidentTensor,operand);
+            if(!quote)continue; // Explicit direct writes into the final admitted resident root.
+            const auto geometry=resolveNativeWeightLoadStaging(*quote,placement,
+                policy.staging_budget_bytes?std::optional<size_t>{policy.staging_budget_bytes}:std::nullopt);
+            if(!maximum || geometry.physical_bytes>maximum->physical_bytes)maximum=geometry;
+        }
+        return maximum;
+    }
+
     PipelineStageTransferMemory PipelineStageTransferMemory::forStage(const RankExecutionPlan &parent, size_t stage)
     {
         const auto &devices = parent.local_pp_devices;
@@ -625,6 +695,7 @@ namespace llaminar2
         }
         // PP overrides final layer ranges after makeConfigForDevice; resolve only now.
         for (auto &input : device_configs){
+            if (request.native_source_placement) input.native_source_placement=*request.native_source_placement;
             input.native_context_preparation=request.plan.runtime.native_context_preparation;
             input.retained_host_services=request.plan.runtime.retained_host_services;
             if(input.native_context_preparation){
@@ -645,6 +716,14 @@ namespace llaminar2
                 }
             }
             resolveQwenSparseAttentionDeviceProgram(profile, input, request.plan.runtime);
+            if(input.device.is_cpu() && request.native_weight_source_policy) {
+                if(!request.native_source_placement)
+                    throw std::invalid_argument("Fresh CPU source staging requires its original loader allocation placement");
+                input.native_weight_load_staging=quoteCPUWeightSourceStaging(profile,input,*request.native_weight_source_policy,
+                    request.weight_precision,*request.native_source_placement);
+                input.weight_load_staging.host_bytes=input.native_weight_load_staging
+                    ? input.native_weight_load_staging->physical_bytes:0;
+            }
         }
         return device_configs;
     }

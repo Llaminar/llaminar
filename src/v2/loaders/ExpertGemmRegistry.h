@@ -26,8 +26,12 @@
 
 namespace llaminar2
 {
+    class PreparedWeightStore;
+
 
     class ITensorGemm;
+
+    struct MoEExpertOwnerParticipant;
 
     /// Registry for pre-prepared MoE expert GEMM engines.
     /// Populated by the unified GPU weight pipeline, queried by graph builders.
@@ -89,8 +93,9 @@ namespace llaminar2
         {
             ParticipantLayerScope scope;
             MoEExpertProjectionOwnership projection;
-            std::vector<ParticipantExpertBinding> experts; ///< Original ordinal E order, all three roles.
-            std::vector<WeightBinding> sources; ///< Original frozen views, in expert-major G/U/D order.
+            std::vector<ParticipantExpertBinding> experts; ///< Original ordinal E order; CPU unselected entries remain empty.
+            std::vector<WeightBinding> sources; ///< Original frozen views, in selected expert-major G/U/D order.
+            std::shared_ptr<const CPUExpertShardSourceSelection> cpu_joint_source; ///< Closed CPU fragment selection; dense experts has empty unselected entries.
         };
 
         /**
@@ -99,6 +104,11 @@ namespace llaminar2
          * @return Existing participant/layer key, including actual target device.
          * @throws std::invalid_argument for absent/foreign scope or non-static source ownership.
          */
+        /** @brief Check exact original native source/window geometry, including retired metadata.
+         * @param source Original frozen static matrix binding.
+         * @note This validates source identity only; it grants no prepared-engine readiness.
+         */
+        static void validateStaticProjectionSource(const WeightBinding &source);
         [[nodiscard]] static ParticipantLayerScope staticProjectionScope(const WeightBinding &source);
 
         /**
@@ -109,15 +119,24 @@ namespace llaminar2
          * @throws std::invalid_argument for invalid source, geometry or engine ownership.
          * @throws std::logic_error for any duplicate key or replacement by another source.
          */
+        /**
+         * @brief Publish a streamed CPU fragment only from its actual committed model store.
+         * @param source Original retained identity/cohort and committed final binding.
+         * @param store Same original model/PMA store issuing the completed binding/ref.
+         * @throws std::invalid_argument For passive metadata, foreign source or another engine owner.
+         * @note GPU registration retains its readable original-parent law below.
+         */
+        void registerCommittedCPUProjection(const WeightBinding &source, const PreparedWeightStore &store);
+
         void registerStaticProjection(const WeightBinding &source, ITensorGemm *engine,
                                       std::shared_ptr<ITensorGemm> owner);
 
         /**
-         * @brief Acquire exactly all E triplets using the original frozen source declarations.
+         * @brief Acquire the exact full-E GPU or closed selected-ID CPU triplets from original frozen declarations.
          * @param scope Explicit original domain/device/rank/participant/layer.
          * @param projection Complete expected original F partition, not just local dimensions.
-         * @param sources Exact 3E frozen matrices, with one original G/U/D binding per expert.
-         * @return Owned complete layer, or nullopt when no engine has been registered.
+         * @param sources Exact frozen matrices: 3E for GPU or three per originally selected CPU expert.
+         * @return Owned source-bound layer, or nullopt when no engine has been registered.
          * @throws std::invalid_argument for duplicate/incomplete/foreign source declarations.
          * @throws std::logic_error for a stale source owner, different partition or partial published layer.
          *
@@ -126,6 +145,22 @@ namespace llaminar2
         [[nodiscard]] std::optional<StaticProjectionLayer> acquireStaticProjectionLayer(
             const ParticipantLayerScope &scope, const MoEExpertProjectionOwnership &projection,
             std::span<const WeightBinding> sources) const;
+
+        /**
+         * @brief Borrow only already-prepared CPU fragments from their retained original source declarations.
+         * @param original_model Original model store lifetime, never an unscoped engine lookup.
+         * @param original_participant Exact original rank/NUMA/domain/tier/member descriptor.
+         * @param layer Original model layer, not a compact source index.
+         * @return Source-bound selected layer lease, or nullopt when wholly absent.
+         * @throws std::invalid_argument For invalid model/member or foreign/whole-owner sources.
+         * @throws std::logic_error For an incomplete/stale prepared layer.
+         *
+         * Graph callers have no frozen tensor inventory of their own. This reads
+         * the SAME declarations retained at registration and delegates complete
+         * acquisition; it never reconstructs IDs from compact tensor geometry.
+         */
+        [[nodiscard]] std::optional<StaticProjectionLayer> acquireCPUJointLayer(
+            ModelContextId original_model,const MoEExpertOwnerParticipant& original_participant,int layer) const;
 
         ExpertGemmRegistry() = default;
         ~ExpertGemmRegistry() = default;

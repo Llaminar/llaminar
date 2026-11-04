@@ -999,11 +999,12 @@ namespace llaminar2
         }
         std::atomic<bool> error_flag{false};
 
-        auto placement = ctx.initial_cpu_storage_placement.value_or(
-            enforce_numa_placement
-                ? CPUWeightStoragePlacement::onNode(target_numa_node)
-                : CPUWeightStoragePlacement::local());
-        if (!ctx.initial_cpu_storage_placement && ctx.prepared_store)
+        // Original NUMA intent chooses physical placement; the actual Store
+        // supplies the sole admission authority for every new packed root.
+        auto placement = enforce_numa_placement
+            ? CPUWeightStoragePlacement::onNode(target_numa_node)
+            : CPUWeightStoragePlacement::local();
+        if (ctx.prepared_store)
             placement = CPUWeightStoragePlacement::accounted(
                 ctx.prepared_store->physicalMemoryAuthority(),
                 ctx.device_id, ctx.persistent_weight_owner, placement);
@@ -1796,13 +1797,6 @@ namespace llaminar2
         const int gpu_ordinal = ctx.device_id.is_cuda()
                                     ? ctx.device_id.cuda_ordinal()
                                     : ctx.device_id.rocm_ordinal();
-        IBackend *backend = getBackendFor(ctx.device_id);
-        if (!backend)
-        {
-            LOG_ERROR("[MoEWeightService::GPU-rebalance] No backend for "
-                      << ctx.device_id.to_string());
-            return false;
-        }
 
         // Weight groups: gate, up, down
         struct WeightGroup
@@ -1817,13 +1811,6 @@ namespace llaminar2
         };
         resolveExpertSlabRefs(ctx, /*create_if_missing=*/false);
 
-        auto orchestrator = std::make_shared<LoadOrchestrator>(
-            backend,
-            requirePhysicalMemoryAuthority(
-                ctx,
-                "GPU expert rebalance preparation"),
-            PhysicalMemoryOwner::RoutedExpertWeights);
-        orchestrator->addDevice(gpu_ordinal);
 
         size_t max_raw_bytes = 0;
         size_t total_planned = 0;
@@ -1990,6 +1977,24 @@ namespace llaminar2
                                                                << ctx.device_id.to_string() << " (layer " << ctx.layer_idx << ")");
             return true;
         }
+
+        // Original cached triplets need no new loader/backend resources. Only
+        // authenticated missing payloads enter the original native pipeline.
+        IBackend *backend = getBackendFor(ctx.device_id);
+        if (!backend)
+        {
+            LOG_ERROR("[MoEWeightService::GPU-rebalance] No backend for "
+                      << ctx.device_id.to_string());
+            return false;
+        }
+
+        auto orchestrator = std::make_shared<LoadOrchestrator>(
+            backend,
+            requirePhysicalMemoryAuthority(
+                ctx,
+                "GPU expert rebalance preparation"),
+            PhysicalMemoryOwner::RoutedExpertWeights);
+        orchestrator->addDevice(gpu_ordinal);
 
         // Phase 1: Plan weights for new experts
         for (auto &grp : groups)

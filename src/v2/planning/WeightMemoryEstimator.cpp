@@ -11,6 +11,10 @@
 #include "planning/PreparedWeightPhysicalUses.h"
 #include "planning/ModelMemoryProfile.h"
 #include "planning/WeightShardGeometry.h"
+#include "kernels/cpu/gemm/CPUWeightPreparationMemory.h"
+#include "loaders/PreparedWeightIdentityContract.h"
+#include "execution/local_execution/graph/SchemaFactoryRegistry.h"
+#include "memory/CPUStorageRoot.h"
 #include "execution/moe/MoEExpertProjectionOwnership.h"
 #include "kernels/common/NativeEmbeddingLayout.h"
 #include "loaders/PreparedWeightRepresentationContract.h"
@@ -31,7 +35,7 @@
  * Native estimates mirror GGUF block layouts from BlockStructures.h. GPU estimates
  * mirror the separated native-VNNI layout used by WeightVRAMPool/CUDA/ROCm packers:
  * per-32-value payload bytes plus FP16 scales and optional FP16 mins/Q2_K emins.
- * CPU estimates intentionally preserve the existing VNNI-expanded planning model.
+ * CPU estimates preserve each actual matrix instance and the canonical final allocator footprint.
  */
 
 namespace llaminar2
@@ -380,21 +384,21 @@ namespace llaminar2
         const DeviceWeightResidency &residency,
         const std::optional<DeviceShardingAssignment>
             &tensor_parallel_assignment,
-        WeightComponentScope components)
+        WeightComponentScope components, CPUStoragePlacement native_source_placement)
     {
         return estimateImpl(profile, device, shard_index, total_shards, first_layer, last_layer, residency,
-            tensor_parallel_assignment, components, nullptr, PreparedWeightUseIntent::PublishCreator);
+            tensor_parallel_assignment, components, nullptr, PreparedWeightUseIntent::PublishCreator, native_source_placement);
     }
 
     WeightEstimate WeightMemoryEstimator::estimatePhysical(PreparedWeightPhysicalUses &uses,
         PreparedWeightUseIntent intent, const ModelMemoryProfile &profile, DeviceId device,
         int shard_index, int total_shards, int first_layer, int last_layer,
         const DeviceWeightResidency &residency,
-        const std::optional<DeviceShardingAssignment> &tensor_parallel_assignment, WeightComponentScope components)
+        const std::optional<DeviceShardingAssignment> &tensor_parallel_assignment, WeightComponentScope components, CPUStoragePlacement native_source_placement)
     {
         uses.requireScope(profile, device, components);
         return estimateImpl(profile, device, shard_index, total_shards, first_layer, last_layer, residency,
-            tensor_parallel_assignment, components, &uses, intent);
+            tensor_parallel_assignment, components, &uses, intent, native_source_placement);
     }
 
     WeightEstimate WeightMemoryEstimator::estimateImpl(
@@ -407,7 +411,8 @@ namespace llaminar2
         const DeviceWeightResidency &residency,
         const std::optional<DeviceShardingAssignment>
             &tensor_parallel_assignment,
-        WeightComponentScope components, PreparedWeightPhysicalUses *uses, PreparedWeightUseIntent intent)
+        WeightComponentScope components, PreparedWeightPhysicalUses *uses, PreparedWeightUseIntent intent,
+        CPUStoragePlacement native_source_placement)
     {
         if (total_shards <= 0 || shard_index < 0 ||
             shard_index >= total_shards)
@@ -514,7 +519,54 @@ namespace llaminar2
                 PreparedWeightRepresentationContract::resolve(
                     role, std::string_view(t.quant_type), t.name, profile.architecture,
                     debugEnv().gemm.gdn_projection_arithmetic, debugEnv().gemm.moe_router_arithmetic);
-            if (prepared_representation != ModelPreparedWeightRepresentation::SourceNative)
+            if (device.is_cpu())
+            {
+                const auto type = tensorTypeFromName(t.quant_type);
+                if (!type) throw std::invalid_argument("CPU final weight estimate has unknown original source format: " + t.quant_type);
+                const auto operand = PreparedWeightRepresentationContract::operandPrecision(role,t.name,profile.architecture,
+                    debugEnv().gemm.gdn_projection_arithmetic,debugEnv().gemm.moe_router_arithmetic);
+                const auto precision = PreparedWeightRepresentationContract::resolveCPUWeightPrecision(
+                    role,*type,WeightPrecision::NATIVE,prepared_representation,operand);
+                TensorType final_type=*type;
+                if (precision==WeightPrecision::CONVERT_TO_FP32) final_type=TensorType::FP32;
+                else if (precision==WeightPrecision::CONVERT_TO_FP16) final_type=TensorType::FP16;
+                else if (precision==WeightPrecision::CONVERT_TO_BF16) final_type=TensorType::BF16;
+                const auto &matrix=geometry.matrix();
+                const auto classification=PreparedWeightIdentityContract::classifyOriginalMatrix(role,device);
+                bool gemm=matrix && classification==PreparedGemmClassification::Gemm;
+                if (matrix && classification==PreparedGemmClassification::RequiresSchema)
+                    gemm=!SchemaFactoryRegistry::getWeightShardingConfig(profile.architecture).isNonGemmWeight(t.name);
+                const auto checked_product=[](size_t a,size_t b) {
+                    if (b && a>std::numeric_limits<size_t>::max()/b)
+                        throw std::overflow_error("CPU final weight physical extent overflows");
+                    return a*b;
+                };
+                const auto placement=native_source_placement;
+                const bool floating=final_type==TensorType::FP32 || final_type==TensorType::FP16 || final_type==TensorType::BF16;
+                if (gemm && !floating)
+                {
+                    // Each expert is prepared independently. Padding N only
+                    // after flattening E would underprice every short expert.
+                    const auto footprint=CPUWeightPreparationMemory::sourceNative(
+                        tensorTypeName(final_type),matrix->rows,matrix->columns);
+                    device_size=checked_product(placement.physicalBytes<uint8_t>(footprint.persistent_payload_bytes),matrix->instances);
+                }
+                else if (floating)
+                {
+                    const size_t instances=gemm?matrix->instances:1;
+                    const size_t elements=gemm?checked_product(matrix->rows,matrix->columns):selected_elements;
+                    device_size=checked_product(final_type==TensorType::FP32?
+                        placement.physicalBytes<float>(elements):placement.physicalBytes<uint16_t>(elements),instances);
+                }
+                else
+                {
+                    // Lookup tables, scalar parameters and native resident
+                    // parents own their actual encoded root, not VNNI padding.
+                    device_size=placement.physicalBytes<uint8_t>(native);
+                    if (isEmbeddingTensor(t.name)) est.prepared_embedding_bytes+=device_size;
+                }
+            }
+            else if (prepared_representation != ModelPreparedWeightRepresentation::SourceNative)
             {
                 /*
                  * These bytes replace the source codebook in the persistent
@@ -581,12 +633,7 @@ namespace llaminar2
                 }
             }
             else
-            {
-                // CPU: VNNI packing
-                float bytes_per_weight = getCPUPackedBytesPerWeight(t.quant_type);
-                device_size = static_cast<size_t>(
-                    static_cast<float>(selected_elements) * bytes_per_weight);
-            }
+                throw std::invalid_argument("Final weight estimate requires a CPU or GPU allocator");
             if (uses && std::holds_alternative<PreparedWeightPhysicalAlias>(
                     uses->record(profile, device, t, geometry, geometry_resolver.sourceStorageView(t), intent)))
             {
@@ -628,10 +675,12 @@ namespace llaminar2
                     accumulate(head, !owns_embedding);
                     const auto tied_bytes = est.lm_head_bytes - previous_head;
                     est.tied_lm_head_bytes += tied_bytes;
-                    // CPU's existing prepared-source contract shares a tied
-                    // tensor within the same participant. A GPU has a separate
-                    // GEMM pool entry, including for FP32/FP16/BF16 sources.
-                    if (device.is_cpu() && owns_embedding)
+                    // Floating CPU execution borrows the SAME genuine final
+                    // raw owner. Native lookup bytes and VNNI packed output
+                    // are distinct physical layouts on CPU as well as GPU.
+                    const auto original_type=tensorTypeFromName(t.quant_type);
+                    if (device.is_cpu() && owns_embedding && original_type &&
+                        (*original_type==TensorType::FP32 || *original_type==TensorType::FP16 || *original_type==TensorType::BF16))
                         est.device_bytes = before;
                 }
                 continue;

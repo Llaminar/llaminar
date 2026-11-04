@@ -7,6 +7,9 @@
  * no platform-specific code (no SIMD intrinsics, no CUDA kernels).
  */
 
+#include <optional>
+#include <string_view>
+
 namespace llaminar2
 {
 
@@ -178,6 +181,20 @@ namespace llaminar2
         default:
             return false;
         }
+    }
+
+    /**
+     * @brief Decode original GGUF/profile scalar names through the canonical tensor enum.
+     * @param name Original inventory label; F32/F16 retain their GGUF aliases.
+     * @return Exact source enum, or absence for an unknown inventory label.
+     */
+    inline std::optional<TensorType> tensorTypeFromName(std::string_view name)
+    {
+        if(name=="F32")return TensorType::FP32;
+        if(name=="F16")return TensorType::FP16;
+        for(int value=0;value<=static_cast<int>(TensorType::AQ8);++value)
+            if(name==tensorTypeName(static_cast<TensorType>(value)))return static_cast<TensorType>(value);
+        return std::nullopt;
     }
 
 } // namespace llaminar2

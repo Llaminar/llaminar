@@ -66,7 +66,9 @@ namespace llaminar2
         PreparedWeightIdentityContract(std::vector<size_t> shape, TensorType type,
             FloatingActivationOperandPrecision precision, WeightSliceSpec slice,
             std::optional<MoEExpertProjectionOwnership> projection,
-            std::shared_ptr<TensorBase> original_projection);
+            std::shared_ptr<TensorBase> original_projection,
+            std::shared_ptr<const CPUExpertShardSourceSelection> cpu_joint_source = {},
+            std::optional<NativeWeightSourceProjection> native_source = {});
         /** @return Whether no source coordinates or projection have been declared. */
         static bool emptySlice(const WeightSliceSpec &slice);
         /** @return Whether the exact existing full-source normalization applies. */
@@ -77,5 +79,7 @@ namespace llaminar2
         WeightSliceSpec slice_;
         std::optional<MoEExpertProjectionOwnership> projection_;
         std::shared_ptr<TensorBase> original_projection_;
+        std::optional<NativeWeightSourceProjection> native_source_; ///< Exact original native geometry/range retained across final preparation.
+        std::shared_ptr<const CPUExpertShardSourceSelection> cpu_joint_source_; ///< Original CPU member/selection, never inferred from shape.
     };
 }

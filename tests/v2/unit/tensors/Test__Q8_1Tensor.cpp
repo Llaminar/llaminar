@@ -20,14 +20,11 @@ using namespace llaminar2;
 
 namespace
 {
+    /** @brief Construct actual mutable activation storage, with native per-row padding. */
     std::shared_ptr<Q8_1Tensor> create_empty_q8_1_tensor(int rows, int cols)
     {
-        const size_t total_elements = static_cast<size_t>(rows) * static_cast<size_t>(cols);
-        const size_t total_blocks = (total_elements + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
-        std::vector<uint8_t> raw(total_blocks * sizeof(Q8_1Block), 0);
         return std::make_shared<Q8_1Tensor>(
-            std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)},
-            raw);
+            std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)});
     }
 }
 
@@ -233,12 +230,9 @@ TEST(Test__Q8_1Tensor, NativeQ8_1Addition)
     ASSERT_NE(q8_1_a, nullptr);
     ASSERT_NE(q8_1_b, nullptr);
 
-    // Create output tensor
-    const size_t n_blocks = elements / 32;
-    std::vector<uint8_t> raw_output(n_blocks * sizeof(Q8_1Block), 0);
-    auto q8_1_output = std::make_shared<Q8_1Tensor>(
-        std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)},
-        raw_output);
+    // The output is an activation buffer; immutable weight construction must
+    // never be used to obtain writable block storage.
+    auto q8_1_output = create_empty_q8_1_tensor(rows, cols);
 
     // Use q8_1_add_q8_1 SIMD primitive
     simd::q8_1_add_q8_1(

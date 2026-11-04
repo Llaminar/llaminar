@@ -35,12 +35,58 @@
 namespace llaminar2::accuracy
 {
 /** @brief Existing supported public-runner execution surfaces; no serving selector. */
-enum class QFNObservationSurface { CPU, GPUCPUOverlay, CPUTailPipeline, HomogeneousLocalTP, GPUCPULocalTP };
+enum class QFNObservationSurface { CPU, GPUCPUOverlay, CPUTailPipeline, HomogeneousLocalTP, GPUCPULocalTP, CPUExpertFollower };
 
 /** @brief Reject invalid diagnostic input without device work or partial output. */
 inline void requireQFN(bool condition, const char *message)
 {
     if (!condition) throw std::invalid_argument(message);
+}
+
+/**
+ * @brief Authenticate the one declared distributed Static CPU fragment observation surface.
+ * @param config Original complete parser value, still revalidated by production admission.
+ * @return False for historical single-rank requests; true only for an exact GPU authority plus CPU joint cohort.
+ * @throws std::invalid_argument For unresolved, foreign, apportioned or active/migrating distributed intent.
+ * @note This grants no source, weight, collective or native readiness. Production retains those authorities.
+ */
+inline bool qfnDistributedCPUJointIntent(const OrchestrationConfig& config) {
+    if(config.mpi_procs<=1)return false;
+    requireQFN(config.mpi_procs>=2 && config.mpi_procs<=8 && config.hostfile.empty() &&
+        !config.execution_rank_selection && config.moe_routed_expert_plan &&
+        config.moe_routed_expert_plan->usesExpertOverlayAuthority(),
+        "QFN distributed observer requires one rank per CPU socket with rank-zero GPU continuation");
+    const auto& plan=*config.moe_routed_expert_plan;
+    requireQFN(plan.domains.size()==2 && plan.continuation_domain==plan.base_model_domain &&
+        plan.continuation_domain==plan.shared_expert_domain && config.moe_rebalance.mode==MoERebalanceRuntimeMode::Off &&
+        plan.residency_policy==RoutedExpertResidencyPolicy::StaticById && config.pp_stage_definitions.empty(),
+        "QFN distributed observer supports only Static single-continuation CPU joint admission");
+    const RoutedExpertDomain* source=nullptr;const RoutedExpertDomain* joint=nullptr;
+    for(const auto& domain:plan.domains) {
+        if(domain.name==plan.continuation_domain)source=&domain;else joint=&domain;
+    }
+    requireQFN(source && joint && source->participants.size()==1 && source->participants.front().isGPU() &&
+        (source->scope==ExecutionDomainScope::SINGLE || source->scope==ExecutionDomainScope::RANK_LOCAL) &&
+        source->owner_rank==0 && (source->world_ranks.empty() || source->world_ranks==std::vector<int>{0}),
+        "QFN distributed observer lost its exact rank-zero GPU continuation");
+    requireQFN(joint->scope==ExecutionDomainScope::NODE_LOCAL &&
+        (joint->backend==CollectiveBackendType::UPI || joint->backend==CollectiveBackendType::MPI) &&
+        joint->routed_compute_policy==RoutedExpertComputePolicy::TensorSharded &&
+        joint->participants.size()==size_t(config.mpi_procs) && joint->world_ranks.size()==joint->participants.size() &&
+        joint->participants.size()>=2 && joint->participants.size()<=8 &&
+        joint->routed_phase_policy==RoutedExpertPhasePolicy::Uniform &&
+        joint->routed_decode_assignment_policy==RoutedExpertAssignmentPolicy::StaticOwner &&
+        joint->routed_prefill_assignment_policy==RoutedExpertAssignmentPolicy::StaticOwner,
+        "QFN distributed observer requires the original uniform CPU tensor-shard cohort");
+    std::set<int> nodes,ranks;
+    for(size_t i=0;i<joint->participants.size();++i) {
+        const auto& endpoint=joint->participants[i];
+        requireQFN(endpoint.isCPU() && endpoint.device_ordinal==0 && endpoint.numa_node>=0 &&
+            nodes.insert(endpoint.numa_node).second && joint->world_ranks[i]>=0 &&
+            joint->world_ranks[i]<config.mpi_procs && ranks.insert(joint->world_ranks[i]).second,
+            "QFN distributed observer has missing/duplicate/foreign CPU rank or NUMA identity");
+    }
+    return true;
 }
 
 /**
@@ -163,6 +209,94 @@ private:
 };
 
 /**
+ * @brief Require the retained rank plan to belong to the actual original MPI participant.
+ * @param plan Original runner plan; never copied or reconstructed for observation.
+ * @param actual_rank Rank from the application's existing MPI context.
+ * @throws std::invalid_argument If the observer borrowed another rank's physical plan.
+ */
+inline void requireQFNOriginalRank(const RankExecutionPlan& plan, int actual_rank)
+{
+    requireQFN(actual_rank >= 0 && plan.rank == actual_rank,
+               "QFN observer rank plan does not belong to its original MPI rank");
+}
+
+/**
+ * @brief Authenticate a physical address against its original rank plan's canonical host.
+ * @param plan Original inventory-resolved rank plan, authenticated against the MPI rank by the caller.
+ * @param address Original physical address declared by that plan or its prepared expert domain.
+ * @return True for local aliases or the exact retained canonical hostname; no host discovery occurs.
+ */
+inline bool qfnAddressOwnedByRank(const RankExecutionPlan& plan, const GlobalDeviceAddress& address)
+{
+    return address.isLocal() || (!plan.hostname.empty() && address.hostname == plan.hostname);
+}
+
+/** @brief Passive original source dimensions and participant logit capability; no readiness authority. */
+struct QFNSourceGeometry {
+    std::string runner_architecture;
+    std::string model_architecture;
+    int main_layers;
+    int source_vocabulary;
+    int experts;
+    int runner_vocabulary;
+};
+
+/**
+ * @brief Check original source geometry separately from participant logit capability.
+ * @param actual Passive values read from the original loader/model and real runner.
+ * @param config Original parsed serving configuration.
+ * @param plan Original rank plan, already authenticated against the MPI rank.
+ * @param joint_follower True only for the worker-loop observation callback.
+ * @throws std::invalid_argument With exact observed field values on disagreement.
+ * @note Expert-only followers expose zero logits; this never changes source geometry.
+ */
+inline void requireQFNSourceGeometry(const QFNSourceGeometry& actual,
+    const OrchestrationConfig& config, const RankExecutionPlan& plan, bool joint_follower)
+{
+    nlohmann::json compared={{"rank",plan.rank},{"primary_hostname",plan.primary_device.hostname},
+        {"primary_device_ordinal",plan.primary_device.device_ordinal},{"primary_numa",plan.primary_device.numa_node}};
+    if(joint_follower && config.moe_routed_expert_plan) {
+        compared["original_cohort_endpoints"]=nlohmann::json::array();
+        for(const auto& domain:config.moe_routed_expert_plan->domains) {
+            if(domain.name==config.moe_routed_expert_plan->continuation_domain)continue;
+            for(size_t i=0;i<domain.participants.size();++i) {
+                const auto& endpoint=domain.participants[i];
+                compared["original_cohort_endpoints"].push_back({{"domain",domain.name},
+                    {"world_rank",i<domain.world_ranks.size()?domain.world_ranks[i]:-1},
+                    {"hostname",endpoint.hostname},{"device_ordinal",endpoint.device_ordinal},{"numa",endpoint.numa_node}});
+            }
+        }
+    }
+    const auto check=[&](bool valid,const char* field) {
+        if(!valid) throw std::invalid_argument(std::string("QFN observer actual original source geometry differs: ")+field+
+            "; observed="+nlohmann::json({{"runner_architecture",actual.runner_architecture},
+                {"model_architecture",actual.model_architecture},{"main_layers",actual.main_layers},
+                {"source_vocabulary",actual.source_vocabulary},{"experts",actual.experts},
+                {"runner_vocabulary",actual.runner_vocabulary}}).dump()+"; compared="+compared.dump());
+    };
+    check(actual.runner_architecture=="qwen4exp","runner_architecture");
+    check(actual.model_architecture=="qwen4exp","model_architecture");
+    check(actual.main_layers==48,"main_layers");
+    check(actual.source_vocabulary==248320,"source_vocabulary");
+    check(actual.experts==512,"experts");
+    if(joint_follower) {
+        check(qfnDistributedCPUJointIntent(config) && plan.rank>0 && plan.rank<config.mpi_procs &&
+            plan.primary_device.isCPU() && qfnAddressOwnedByRank(plan,plan.primary_device),"follower_rank");
+        bool member=false;
+        for(const auto& domain:config.moe_routed_expert_plan->domains) {
+            if(domain.name==config.moe_routed_expert_plan->continuation_domain) continue;
+            for(size_t i=0;i<domain.participants.size();++i) {
+                const auto& endpoint=domain.participants[i];
+                member|=domain.world_ranks[i]==plan.rank && qfnAddressOwnedByRank(plan,endpoint) &&
+                    endpoint.isCPU() && endpoint.device_ordinal==0 && endpoint.numa_node>=0;
+            }
+        }
+        check(member,"original_cohort_rank");
+    }
+    check(actual.runner_vocabulary== (joint_follower?0:248320),"runner_vocabulary");
+}
+
+/**
  * @brief Classify the actual already-admitted rank plan, without constructing one.
  * @param plan Existing production runner's original rank-local plan.
  * @return Physical host-logit/forced-row shape only; actual prepared expert ownership refines LocalTP before graph certification.
@@ -177,7 +311,7 @@ inline QFNObservationSurface qfnObservationSurface(const RankExecutionPlan &plan
         std::set<DeviceId> devices;
         for (const auto &address : plan.local_pp_devices)
         {
-            requireQFN(address.isLocal() && devices.insert(address.toLocalDeviceId()).second,
+            requireQFN(qfnAddressOwnedByRank(plan, address) && devices.insert(address.toLocalDeviceId()).second,
                        "QFN observer pipeline has foreign or duplicate physical devices");
             cuda |= address.device_type == DeviceType::CUDA;
             rocm |= address.device_type == DeviceType::ROCm;
@@ -197,19 +331,101 @@ inline QFNObservationSurface qfnObservationSurface(const RankExecutionPlan &plan
         requireQFN(backend==DeviceType::CUDA || backend==DeviceType::ROCm,"QFN LocalTP requires actual GPU compute participants");
         std::set<DeviceId> devices;
         for (const auto &address : plan.local_tp_devices)
-            requireQFN(address.isLocal() && address.device_type == backend &&
+            requireQFN(qfnAddressOwnedByRank(plan, address) && address.device_type == backend &&
                        devices.insert(address.toLocalDeviceId()).second,
                        "QFN observer LocalTP has foreign, mixed or duplicate physical devices");
-        requireQFN(plan.primary_device.isLocal() &&
+        requireQFN(qfnAddressOwnedByRank(plan, plan.primary_device) &&
             std::find(plan.local_tp_devices.begin(),plan.local_tp_devices.end(),plan.primary_device)!=plan.local_tp_devices.end(),
             "QFN LocalTP primary is outside its original physical cohort");
         return QFNObservationSurface::HomogeneousLocalTP;
     }
-    requireQFN(plan.primary_device.isLocal(), "QFN observer requires local physical ownership");
+    requireQFN(qfnAddressOwnedByRank(plan, plan.primary_device), "QFN observer requires local physical ownership");
     if (plan.primary_device.device_type == DeviceType::CPU) return QFNObservationSurface::CPU;
     requireQFN(plan.primary_device.device_type == DeviceType::CUDA || plan.primary_device.device_type == DeviceType::ROCm,
                "QFN observer unsupported primary backend");
     return QFNObservationSurface::GPUCPUOverlay;
+}
+
+/**
+ * @brief Classify an expert-only follower against its original prepared CPU domain.
+ * @param config Actual parsed distributed Static source intent.
+ * @param plan Actual runner plan, already checked against the original MPI rank.
+ * @param original_plan Retained source preparation rank plan from the same owner.
+ * @param prepared Original retained routed source placement; never reconstructed.
+ * @return Expert-only surface with no full-model/logit capability.
+ * @throws std::invalid_argument For foreign rank, domain, source or unsupported topology.
+ * @note This passive geometry check grants no readiness. The caller must still
+ * authenticate the actual model/Store/PMA and every original prepared cohort lease.
+ */
+inline QFNObservationSurface qfnCPUJointFollowerSurface(const OrchestrationConfig &config,
+    const RankExecutionPlan &plan, const RankExecutionPlan &original_plan,
+    const MoERoutedExpertPlacementPlan &prepared)
+{
+    const auto reject = [&](bool valid, const char *field) {
+        if (!valid) throw std::invalid_argument(std::string("QFN original CPU follower domain differs: ")+field+
+            "; rank="+std::to_string(plan.rank)+" prepared_rank="+std::to_string(original_plan.rank)+
+            " domain="+std::to_string(plan.global_tp_domain_id.value_or(-1))+
+            " member="+std::to_string(plan.global_tp_rank_in_domain)+
+            " population="+std::to_string(plan.global_tp_domain_size));
+    };
+    reject(qfnDistributedCPUJointIntent(config), "distributed_intent");
+    reject(plan.rank>0 && plan.rank<config.mpi_procs && original_plan.rank==plan.rank,
+           "original_rank");
+    reject(!plan.usesPipelineParallel() && !plan.usesLocalPP() && !plan.usesLocalTP() &&
+        plan.local_pp_devices.empty() &&
+        std::all_of(plan.local_tp_devices.begin(),plan.local_tp_devices.end(),[&](const auto &address) {
+            return address.isCPU() && qfnAddressOwnedByRank(plan,address);
+        }) && plan.primary_device.isCPU() && qfnAddressOwnedByRank(plan,plan.primary_device), "expert_only_topology");
+    reject(plan.usesGlobalTP() && plan.global_tp_domain_id==original_plan.global_tp_domain_id &&
+        plan.global_tp_rank_in_domain==original_plan.global_tp_rank_in_domain &&
+        plan.global_tp_domain_size==original_plan.global_tp_domain_size, "retained_global_domain");
+    const auto &intent=*config.moe_routed_expert_plan;
+    const auto requested=std::find_if(intent.domains.begin(),intent.domains.end(),[&](const auto &domain) {
+        return domain.name!=intent.continuation_domain;
+    });
+    const auto source=std::find_if(prepared.domains.begin(),prepared.domains.end(),[&](const auto &domain) {
+        return requested!=intent.domains.end() && domain.name==requested->name;
+    });
+    reject(source!=prepared.domains.end() && requested!=intent.domains.end(), "original_source_domain");
+    reject(prepared.usesExpertOverlayAuthority() && prepared.domains.size()==intent.domains.size() &&
+        prepared.continuation_domain==intent.continuation_domain &&
+        prepared.residency_policy==intent.residency_policy &&
+        source->participants.size()==requested->participants.size() && source->world_ranks==requested->world_ranks &&
+        source->backend==requested->backend && source->scope==requested->scope &&
+        source->routed_compute_policy==RoutedExpertComputePolicy::TensorSharded &&
+        source->routed_phase_policy==requested->routed_phase_policy &&
+        source->routed_decode_assignment_policy==requested->routed_decode_assignment_policy &&
+        source->routed_prefill_assignment_policy==requested->routed_prefill_assignment_policy,
+        "original_source_cohort");
+    const auto participation=std::find_if(plan.my_domains.begin(),plan.my_domains.end(),[&](const auto &domain) {
+        return domain.domain_id==*plan.global_tp_domain_id;
+    });
+    const auto retained=std::find_if(original_plan.my_domains.begin(),original_plan.my_domains.end(),[&](const auto &domain) {
+        return domain.domain_id==*plan.global_tp_domain_id;
+    });
+    reject(participation!=plan.my_domains.end() && retained!=original_plan.my_domains.end() &&
+        plan.my_domains.size()==1 && original_plan.my_domains.size()==1, "original_participation");
+    reject(participation->domain_name==source->name && participation->backend==source->backend &&
+        participation->devices==retained->devices && participation->domain_name==retained->domain_name &&
+        participation->backend==retained->backend && participation->my_index_in_domain==retained->my_index_in_domain &&
+        participation->my_index_in_domain==plan.global_tp_rank_in_domain &&
+        plan.global_tp_domain_size==int(source->participants.size()) &&
+        participation->devices.size()==source->participants.size(), "original_domain_geometry");
+    auto ranks=source->world_ranks;std::sort(ranks.begin(),ranks.end());
+    reject(plan.global_tp_rank_in_domain>=0 && plan.global_tp_rank_in_domain<int(ranks.size()) &&
+        ranks[size_t(plan.global_tp_rank_in_domain)]==plan.rank, "original_member_rank");
+    for(size_t i=0;i<source->participants.size();++i) {
+        const auto &actual=participation->devices[i];const auto &expected=source->participants[i];
+        const auto &authored=requested->participants[i];
+        reject(expected.isCPU() && expected.device_ordinal==authored.device_ordinal &&
+            expected.numa_node==authored.numa_node && qfnAddressOwnedByRank(plan,authored), "authored_member_endpoint");
+        reject(actual.isCPU() && actual.device_ordinal==expected.device_ordinal && actual.numa_node==expected.numa_node &&
+            qfnAddressOwnedByRank(plan,actual) && qfnAddressOwnedByRank(plan,expected), "original_member_endpoint");
+    }
+    reject(std::any_of(prepared.routed_tiers.begin(),prepared.routed_tiers.end(),[&](const auto &tier) {
+        return tier.domain==source->name;
+    }) && !prepared.placements.empty(), "prepared_source_membership");
+    return QFNObservationSurface::CPUExpertFollower;
 }
 
 /**
@@ -237,7 +453,7 @@ inline QFNObservationSurface qfnPreparedLocalTPSurface(const RankExecutionPlan& 
         requireQFN(domain!=prepared.domains.end()&&!domain->participants.empty(),"QFN selected expert tier has no original domain");
         std::set<DeviceId> unique;
         for(const auto& address:domain->participants){
-            requireQFN(address.isLocal()&&unique.insert(address.toLocalDeviceId()).second,"QFN expert domain has foreign or duplicate ownership");
+            requireQFN(qfnAddressOwnedByRank(physical, address)&&unique.insert(address.toLocalDeviceId()).second,"QFN expert domain has foreign or duplicate ownership");
             if(address.device_type==DeviceType::CPU){cpu=true;continue;}
             requireQFN(std::any_of(physical.local_tp_devices.begin(),physical.local_tp_devices.end(),[&](const auto& member){
                     return member.toLocalDeviceId()==address.toLocalDeviceId();
@@ -466,12 +682,40 @@ public:
         requireQFN(serializeOrchestrationConfig(expected) == serializeOrchestrationConfig(config) &&
                    selected.at("runtime_config_digest") == qfnMetadataDigest(selected.at("expected_config")),
                    "QFN observer CLI differs from its source-owned production configuration");
+        const bool distributed_joint=qfnDistributedCPUJointIntent(config);
         requireQFN(config.planning_mode != OrchestrationPlanningMode::Automatic && (config.tp_scope == TPScope::AUTO || config.tp_scope == TPScope::RANK_LOCAL),
                    "QFN observer requires source-owned explicit rank-local placement");
+        std::set<std::string> observed_domains;
         for (const auto &domain : config.domain_definitions)
-            requireQFN((domain.scope == TPScope::AUTO || domain.scope == TPScope::RANK_LOCAL) &&
-                       (!domain.owner_rank || *domain.owner_rank == 0) && domain.explicit_ranks.empty(),
-                       "QFN observer rejects cross-rank domain intent");
+        {
+            if (!distributed_joint)
+            {
+                requireQFN((domain.scope == TPScope::AUTO || domain.scope == TPScope::RANK_LOCAL) &&
+                           (!domain.owner_rank || *domain.owner_rank == 0) && domain.explicit_ranks.empty(),
+                           "QFN observer rejects cross-rank domain intent");
+                continue;
+            }
+            // This is the parser's original execution inventory, not another
+            // placement authority. Require every authored domain to describe
+            // exactly the already-approved source/cohort, including policies.
+            const auto &approved = config.moe_routed_expert_plan->domains;
+            const auto found = std::find_if(approved.begin(), approved.end(),
+                [&](const auto &candidate) { return candidate.name == domain.name; });
+            requireQFN(found != approved.end() && observed_domains.insert(domain.name).second,
+                       "QFN observer has foreign or duplicate distributed domain intent");
+            const auto expected_domain = DomainDefinition::fromExecutionDomainDefinition(
+                found->toExecutionDomainDefinition());
+            requireQFN(domain.devices == expected_domain.devices && domain.weights == expected_domain.weights &&
+                       domain.backend == expected_domain.backend && domain.scope == expected_domain.scope &&
+                       domain.owner_rank == expected_domain.owner_rank && domain.explicit_ranks == expected_domain.explicit_ranks &&
+                       domain.routed_compute_policy == expected_domain.routed_compute_policy &&
+                       domain.routed_phase_policy == expected_domain.routed_phase_policy &&
+                       domain.routed_decode_assignment_policy == expected_domain.routed_decode_assignment_policy &&
+                       domain.routed_prefill_assignment_policy == expected_domain.routed_prefill_assignment_policy,
+                       "QFN observer distributed inventory differs from original source/cohort");
+        }
+        requireQFN(!distributed_joint || observed_domains.size() == config.moe_routed_expert_plan->domains.size(),
+                   "QFN observer is missing an original distributed domain");
         requireQFN(config.mtp_activation_policy == MTPActivationPolicy::Disabled && !config.mtp.enabled &&
                    !config.prefix_cache.enabled && config.activation_precision == "fp32" &&
                    config.kv_cache_precision == "fp16" && config.prefill_max_bucket_size == 512 && config.max_seq_len > 0,
@@ -518,10 +762,10 @@ public:
         }
         if (config.moe_routed_expert_plan)
             for (const auto &domain : config.moe_routed_expert_plan->domains)
-                requireQFN((domain.scope == ExecutionDomainScope::SINGLE || domain.scope == ExecutionDomainScope::RANK_LOCAL) &&
+                requireQFN(distributed_joint || ((domain.scope == ExecutionDomainScope::SINGLE || domain.scope == ExecutionDomainScope::RANK_LOCAL) &&
                            (domain.owner_rank == -1 || domain.owner_rank == 0) &&
                            std::all_of(domain.world_ranks.begin(), domain.world_ranks.end(),
-                                       [](int rank) { return rank == 0; }),
+                                       [](int rank) { return rank == 0; })),
                            "QFN observer rejects cross-rank routed authority");
         requireQFN(config.shared_predictor.has_value() == source.contains("shared_predictor"),
                    "QFN paired source declaration/descriptor disagree");

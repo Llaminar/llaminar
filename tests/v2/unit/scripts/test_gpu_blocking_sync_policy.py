@@ -199,6 +199,23 @@ class TestGPUBlockingSyncPolicy(unittest.TestCase):
                     with temporary:
                         self.assertEqual(not validate(root, (fixture,)), accepted)
 
+    def test_failed_weight_loading_retirement_cannot_authorize_hot_waits(self) -> None:
+        """Only final failed-startup retirement may join its two owned streams."""
+        allowance, = (entry for entry in ALLOWANCES
+                      if entry.path == "src/v2/loaders/gpu_pipeline/DeviceLoadPipeline.cpp"
+                      and entry.caller == "DeviceLoadPipeline::release")
+        self.assertEqual((allowance.kind, allowance.count, allowance.category),
+                         ("worker_stream", 2, "lifecycle"))
+        fixture = dataclasses.replace(allowance, path="src/v2/example.cpp")
+        for caller, count, accepted in (("release", 2, True), ("release", 3, False),
+                                        ("workerLoop", 2, False), ("launch", 2, False)):
+            with self.subTest(caller=caller, count=count):
+                temporary, root = self.make_repo(
+                    f"void DeviceLoadPipeline::{caller}() {{"
+                    + "backend_.synchronizeStream(stream, device_id_);" * count + "}")
+                with temporary:
+                    self.assertEqual(not validate(root, (fixture,)), accepted)
+
     def test_pipeline_forward_only_event_budget_never_authorizes_device_or_stream_drain(self) -> None:
         """A terminal event allowance cannot disguise a stronger blocking primitive."""
         for caller in ("finishForwardOnly", "retireForwardOnlyBeforeStageRelease"):

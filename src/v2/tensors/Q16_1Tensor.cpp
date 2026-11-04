@@ -298,7 +298,8 @@ namespace llaminar2
             dequant_cache_.assign(total_elements, 0.0f);
         }
 
-        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+        if (!data_ptr) throw std::runtime_error("Q16_1 tensor raw source was retired");
         const size_t bs = static_cast<size_t>(block_size_);
         const size_t blocks_per_row = (cols + bs - 1) / bs;
 
@@ -407,8 +408,8 @@ namespace llaminar2
         {
             raw_data_.clear();
             raw_data_.shrink_to_fit();
-            raw_data_released_ = true;
         }
+        raw_data_released_ = true;
     }
 
     // ============================================================================
@@ -436,7 +437,8 @@ namespace llaminar2
     {
         const size_t bs = static_cast<size_t>(block_size_);
         const size_t blocks_per_row_ = (shape_[1] + bs - 1) / bs;
-        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+        if (!data_ptr) throw std::runtime_error("Q16_1 tensor raw source was retired");
 
         switch (block_size_)
         {
@@ -465,7 +467,8 @@ namespace llaminar2
     {
         const size_t bs = static_cast<size_t>(block_size_);
         const size_t blocks_per_row_ = (shape_[1] + bs - 1) / bs;
-        const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+        if (!data_ptr) throw std::runtime_error("Q16_1 tensor raw source was retired");
 
         switch (block_size_)
         {

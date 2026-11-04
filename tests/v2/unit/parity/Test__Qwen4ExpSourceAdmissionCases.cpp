@@ -551,6 +551,63 @@ TEST(Qwen4ExpSourceAdmissionCases, ActualCPUExecutionPlanRejectsDroppedReordered
     EXPECT_THROW(requireQwen4ExpSourceExecutionPlan(cell, 0, authored, actual, missing), std::invalid_argument);
 }
 
+/** @test Original world-rank domains prove CPU fragments independently of a follower's control endpoint. */
+TEST(Qwen4ExpSourceAdmissionCases, ActualCPUJointPlanRequiresOriginalRankDomainsAndFollowerRole)
+{
+    const auto cell = qwen4ExpCPUJointWorld2SourceAdmissionCases().front();
+    const auto hardware = sourceEvidenceHardware();
+    ASSERT_EQ(cell.topology.mpi_ranks, 2);
+    for (int rank = 0; rank < cell.topology.mpi_ranks; ++rank)
+    {
+        SCOPED_TRACE(rank);
+        const auto authored = cell.makeOrchestrationConfig(kMainModelPath, rank);
+        RankExecutionPlan actual;
+        actual.rank = rank;
+        actual.hostname = "fixture-host";
+        actual.last_layer = 47;
+        sourceEvidenceDomains(authored, actual);
+        ASSERT_EQ(actual.my_domains.size(), 2u);
+        if (rank == 0)
+        {
+            actual.primary_device = sourceEvidenceResolved(GlobalDeviceAddress::rocm(0));
+            actual.local_tp_backend = CollectiveBackendType::RCCL;
+        }
+        else
+        {
+            actual.my_domains.erase(actual.my_domains.begin());
+            actual.my_domains.front().my_index_in_domain = 1;
+            // This is exactly the follower control endpoint, not NUMA0 ownership.
+            actual.primary_device = GlobalDeviceAddress::cpu();
+            actual.local_tp_backend = CollectiveBackendType::AUTO;
+        }
+        EXPECT_NO_THROW(requireQwen4ExpSourceExecutionPlan(cell, rank, authored, actual, hardware));
+        const std::vector<std::pair<const char *, std::function<void(RankExecutionPlan &)>>> mutations{
+            {"missing original CPU domain", [](auto &p) { p.my_domains.pop_back(); }},
+            {"wrong CPU participant index", [](auto &p) { p.my_domains.back().my_index_in_domain ^= 1; }},
+            {"aliased CPU NUMA endpoint", [](auto &p) { p.my_domains.back().devices[1] = p.my_domains.back().devices[0]; }},
+            {"changed CPU collective", [](auto &p) { p.my_domains.back().backend = CollectiveBackendType::HOST; }},
+            {"extra original domain copy", [](auto &p) { p.my_domains.push_back(p.my_domains.back()); }},
+            {"unintended local TP", [](auto &p) { p.local_tp_devices = p.my_domains.back().devices; }},
+            {"unintended pipeline", [](auto &p) { p.local_pp_devices = {p.primary_device}; }},
+            {"foreign world rank", [](auto &p) { p.rank ^= 1; }},
+            {"lost original source layer", [](auto &p) { p.last_layer = 46; }},
+        };
+        for (const auto &[label, mutate] : mutations)
+        {
+            SCOPED_TRACE(label);
+            auto changed = actual;
+            mutate(changed);
+            EXPECT_THROW(requireQwen4ExpSourceExecutionPlan(cell, rank, authored, changed, hardware), std::invalid_argument);
+        }
+        if (rank != 0)
+        {
+            auto foreign_continuation = actual;
+            foreign_continuation.primary_device = sourceEvidenceResolved(GlobalDeviceAddress::rocm(0));
+            EXPECT_THROW(requireQwen4ExpSourceExecutionPlan(cell, rank, authored, foreign_continuation, hardware), std::invalid_argument);
+        }
+    }
+}
+
 /** @test PP roots alone cannot certify complete stage TP groups, layers, domain ownership or collectives. */
 TEST(Qwen4ExpSourceAdmissionCases, ActualPipelineRejectsForeignStageRootsMembershipAndLayerBoundaries)
 {
@@ -1582,3 +1639,47 @@ TEST(Qwen4ExpSourceAdmissionCases, GPUAdaptiveDynamicDepthDoesNotCertifyPhysical
     EXPECT_EQ(movement,32u);EXPECT_EQ(dynamicDepth,16u);EXPECT_EQ(both,8u);
 }
 }
+
+namespace llaminar2::test::parity::qwen4exp {
+/** @test The sole new source seed keeps original world2 socket roles and the complete public parser projection. */
+TEST(Qwen4ExpSourceAdmissionCases, CPUJointWorld2StaticRAMOffUsesExactSocketRoles) {
+    const auto& cases=qwen4ExpCPUJointWorld2SourceAdmissionCases();ASSERT_EQ(cases.size(),1u);
+    const auto& cell=cases.front();EXPECT_EQ(cell.mtp,ModelParityMTP::Off);
+    EXPECT_EQ(cell.retained_mtp_draft_capacity,0);EXPECT_FALSE(cell.model.shared_predictor);
+    EXPECT_EQ(cell.activation_precision,ActivationPrecision::FP32);
+    EXPECT_EQ(cell.kv_cache_precision,KVCachePrecision::FP16);
+    ASSERT_TRUE(cell.ngram_table_policy);EXPECT_EQ(cell.ngram_table_policy->storage,ImmutableRowStoragePreference::RAM);
+    EXPECT_EQ(cell.expert_overlay,std::optional{ModelParityExpertOverlayPolicy{}});
+    EXPECT_EQ(cell.topology.kind,ModelParityTopologyKind::NodeMultiDomain);EXPECT_EQ(cell.topology.mpi_ranks,2);
+    ASSERT_EQ(cell.topology.participants.size(),3u);
+    EXPECT_EQ(cell.topology.participants[0],(ModelParityParticipant{GlobalDeviceAddress::rocm(0),0}));
+    EXPECT_EQ(cell.topology.participants[1],(ModelParityParticipant{GlobalDeviceAddress::cpu(0),0}));
+    EXPECT_EQ(cell.topology.participants[2],(ModelParityParticipant{GlobalDeviceAddress::cpu(1),1}));
+    const auto parsed=sourcePublicConfig(cell);
+    EXPECT_EQ(parsed.mpi_procs,2);EXPECT_EQ(parsed.moe_rebalance.mode,MoERebalanceRuntimeMode::Off);
+    ASSERT_TRUE(parsed.moe_routed_expert_plan);ASSERT_EQ(parsed.moe_routed_expert_plan->domains.size(),2u);
+    EXPECT_TRUE(MoEExpertOwnerMap::usesCPUJointFragments(*parsed.moe_routed_expert_plan));
+    EXPECT_EQ(parsed.moe_routed_expert_plan->routed_tiers.front().max_experts_per_layer,64);
+    EXPECT_EQ(parsed.moe_routed_expert_plan->routed_tiers.back().max_experts_per_layer,448);
+    const auto& cpu=parsed.moe_routed_expert_plan->domains.back();
+    EXPECT_EQ(cpu.scope,ExecutionDomainScope::NODE_LOCAL);EXPECT_EQ(cpu.backend,CollectiveBackendType::UPI);
+    EXPECT_EQ(cpu.routed_compute_policy,RoutedExpertComputePolicy::TensorSharded);
+    EXPECT_EQ(cpu.world_ranks,(std::vector<int>{0,1}));
+    EXPECT_EQ(cpu.participants,(std::vector<GlobalDeviceAddress>{GlobalDeviceAddress::cpu(0),GlobalDeviceAddress::cpu(1)}));
+    EXPECT_TRUE(qwen4ExpCPUJointSourceHasContinuation(cell,0));EXPECT_FALSE(qwen4ExpCPUJointSourceHasContinuation(cell,1));
+    EXPECT_THROW(qwen4ExpCPUJointSourceHasContinuation(cell,2),std::invalid_argument);
+    for(int rank=0;rank<2;++rank) {
+        const auto native=qwen4ExpSourceAdmissionConfig(cell,cell.model.model_path,rank);
+        ASSERT_TRUE(native.moe_routed_expert_plan);
+        EXPECT_EQ(native.moe_routed_expert_plan->domains.back().toExecutionDomainDefinition().toString(),cpu.toExecutionDomainDefinition().toString());
+        EXPECT_EQ(native.shared_predictor,parsed.shared_predictor);
+        EXPECT_EQ(native.ngram_table_policy,parsed.ngram_table_policy);
+        EXPECT_FALSE(native.mtp.enabled);EXPECT_EQ(native.mtp.graph_capacity_draft_tokens,0);
+        EXPECT_TRUE(native.prefix_cache.enabled); // Existing canonical source policy, not prefix-Off observer equivalence.
+    }
+    // Original CPU2TP remains rank-local; never relabel it as one rank per socket.
+    const auto local=qwen4ExpProductionTopology(Qwen4ExpParityTopology::CPU2TP);
+    EXPECT_EQ(local.mpi_ranks,1);ASSERT_EQ(local.participants.size(),2u);
+    EXPECT_EQ(local.participants[0].world_rank,0);EXPECT_EQ(local.participants[1].world_rank,0);
+}
+} // namespace llaminar2::test::parity::qwen4exp

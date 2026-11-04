@@ -7,6 +7,9 @@
  * each reach the common planning-publication consensus before any rank advances.
  * Selected apply configurations use that same transport and failure lifecycle.
  * These are startup collectives, not host decisions in a captured request loop.
+ * Native calibration samples use the same original-coordinate window reader as
+ * model preparation. Reads populate the existing final sample owner directly;
+ * there is no second matrix-sized reader allocation or retained source parent.
  */
 #include "planning/PlanningModelMetadata.h"
 #include "planning/PlanningPublication.h"
@@ -15,6 +18,8 @@
 #include "execution/mtp/MTPWeightManifest.h"
 #include "loaders/ModelLoader.h"
 #include "loaders/WeightIdentity.h"
+#include "loaders/NativeWeightLoadStaging.h"
+#include "tensors/NativeWeightSourceRange.h"
 #include "tensors/TensorFactory.h"
 #include "utils/MPIContext.h"
 #include <array>
@@ -217,11 +222,9 @@ namespace llaminar2
         return {n, k, multiply(n, multiply(k / block, block_bytes))};
     }
 
-    /** @brief Keep the matrix borrow, parent allocation and claim in retirement order. */
+    /** @brief Retain the final native sample whose storage carries its own admission lease. */
     struct PlanningLoadedModelSample::Storage final
     {
-        PhysicalMemoryAllocationLease claim;
-        std::shared_ptr<TensorBase> parent;
         std::shared_ptr<TensorBase> matrix;
     };
 
@@ -241,17 +244,21 @@ namespace llaminar2
         if (!memory || !host_device.is_cpu())
             throw std::invalid_argument("Planning sample reception requires an admitted CPU allocator");
         auto payload = std::make_shared<Storage>();
-        payload->claim = memory->claimNewAllocation(host_device, PhysicalMemoryOwner::ModelSourcePayload,
-            geometry.source_bytes);
-        const auto context = MPIContextFactory::self();
-        TensorFactory factory(*context);
+        const auto allocate = [&]<typename T>(size_t count) {
+            return CPUStorageRoot<T>(count, PhysicalMemoryOwner::ModelSourcePayload, host_device,
+                CPUStoragePlacement::local(), CPUStorageInitialization::Uninitialized).allocate(memory);
+        };
         const std::vector<size_t> shape{geometry.n, geometry.k};
         // Allocation/first touch runs on the rank's affined setup thread. The
         // initialized tensor is the final receive address, not a staging copy.
-        if (type == TensorType::FP32) payload->matrix = factory.createFP32(shape, host_device);
-        else if (type == TensorType::FP16) payload->matrix = factory.createFP16(shape);
-        else if (type == TensorType::BF16) payload->matrix = factory.createBF16(shape);
-        else payload->matrix = factory.createQuantizedOwned(type, shape, AlignedVector<uint8_t>(geometry.source_bytes));
+        if (type == TensorType::FP32) payload->matrix = std::make_shared<FP32Tensor>(
+            shape, allocate.template operator()<float>(geometry.n * geometry.k), host_device);
+        else if (type == TensorType::FP16) payload->matrix = std::make_shared<FP16Tensor>(
+            shape, allocate.template operator()<uint16_t>(geometry.source_bytes / sizeof(uint16_t)), host_device);
+        else if (type == TensorType::BF16) payload->matrix = std::make_shared<BF16Tensor>(
+            shape, allocate.template operator()<uint16_t>(geometry.source_bytes / sizeof(uint16_t)), host_device);
+        else payload->matrix = TensorFactory::adoptQuantizedFinalStorage(
+            type, shape, allocate.template operator()<uint8_t>(geometry.source_bytes), host_device);
         if (!payload->matrix || payload->matrix->size_bytes() != geometry.source_bytes)
             throw std::runtime_error("Planning sample receive allocation disagrees with native extent");
         return PlanningLoadedModelSample(std::move(payload));
@@ -269,33 +276,40 @@ namespace llaminar2
         const auto geometry = sampleGeometry(request);
         if (!memory || !host_device.is_cpu())
             throw std::invalid_argument("Planning source sampling requires an admitted CPU allocator");
-        auto payload = std::make_shared<PlanningLoadedModelSample::Storage>();
-        payload->claim = memory->claimNewAllocation(host_device, PhysicalMemoryOwner::ModelSourcePayload,
-            geometry.source_bytes);
-        const auto reader_claim = memory->claimNewAllocation(host_device, PhysicalMemoryOwner::WeightLoadStaging,
-            geometry.source_bytes);
-        payload->parent = std::visit([&](const auto &selection) -> std::shared_ptr<TensorBase> {
+        // Share the original authority's source transaction with every model
+        // manager. The final sample survives this scope, but no temporary input
+        // allocation escapes it (the reader writes directly to final storage).
+        const auto transaction = memory->acquireCPUWeightSourceTransaction(host_device);
+        const auto original = storage_->loader.nativeWeightSourceGeometry(request.tensor_name);
+        auto result = PlanningLoadedModelSample::allocateReceive(
+            original.original_type, geometry, memory, host_device);
+        NativeWeightSourceWindow range{
+            .rows = geometry.n,
+            .columns = geometry.k,
+            .native_row_bytes = geometry.source_bytes / geometry.n};
+        std::visit([&](const auto &selection) {
             using Selection = std::decay_t<decltype(selection)>;
             if constexpr (std::is_same_v<Selection, PlanningMatrixColumns>)
-                return storage_->loader.loadTensorColumnSlice(request.tensor_name, selection.first, selection.last, host_device);
+                range.first_column = selection.first;
             else if constexpr (std::is_same_v<Selection, PlanningExpertMatrix>)
-                return storage_->loader.loadTensorExpertSlice(request.tensor_name, selection.index, selection.index + 1, host_device);
-            else
-            {
-                const size_t first = [&] {
-                    if constexpr (std::is_same_v<Selection, PlanningMatrixRows>) return selection.first;
-                    else return size_t{0};
-                }();
-                return storage_->loader.loadTensorRowSlice(request.tensor_name, first, first + geometry.n, host_device);
-            }
+                range.original_expert = selection.index;
+            else if constexpr (std::is_same_v<Selection, PlanningMatrixRows>)
+                range.first_row = selection.first;
         }, request.selection);
-        if (!payload->parent || !payload->parent->raw_data() || payload->parent->size_bytes() != geometry.source_bytes)
-            throw std::runtime_error("Planning source sample did not materialize its exact native extent");
-        payload->matrix = std::holds_alternative<PlanningExpertMatrix>(request.selection)
-            ? payload->parent->create_view({geometry.n, geometry.k}) : payload->parent;
-        if (!payload->matrix || payload->matrix->shape() != std::vector<size_t>{geometry.n, geometry.k})
-            throw std::runtime_error("Planning source sample did not publish its exact matrix geometry");
-        return PlanningLoadedModelSample(std::move(payload));
+        const auto budget = configuredNativeWeightLoadStagingBudgetBytes();
+        const size_t capacity = budget ? std::min(*budget, geometry.source_bytes) : geometry.source_bytes;
+        auto destination = std::span<std::byte>(static_cast<std::byte *>(result.receiveData()), geometry.source_bytes);
+        forEachNativeWeightSourceWindow(original, range, capacity, [&](const NativeWeightSourceWindow &window) {
+            // A complete-row window is contiguous in the final selected matrix.
+            // Oversized rows instead write one native-group strip at a time.
+            const size_t offset = (window.first_row - range.first_row) * range.native_row_bytes +
+                ((window.first_column - range.first_column) / original.native_group_elements) * original.native_group_bytes;
+            if (offset > destination.size() || window.nativeBytes() > destination.size() - offset)
+                throw std::logic_error("Planning source window exceeds its final native sample");
+            storage_->loader.readNativeWeightSourceWindow(request.tensor_name, window,
+                destination.subspan(offset, window.nativeBytes()));
+        });
+        return result;
     }
 
     size_t maximumGGUFTensorPayloadBytes(const GGUFModel &model)

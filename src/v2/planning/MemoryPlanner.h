@@ -12,6 +12,7 @@
  */
 
 #pragma once
+#include "loaders/NativeWeightLoadStaging.h"
 #include "backends/NativeOrderingEventBudgetProjection.h"
 #include "backends/CPUExecutionGeometry.h"
 #include "planning/MemoryPlan.h"
@@ -280,11 +281,12 @@ struct DevicePlanConfig
     std::size_t retained_immutable_lookup_staging_bytes = 0u; ///< Actual provider request-scratch lease, excluding runner channels.
 
     /**
-     * @brief Exact transient weight-load allocations for this GPU.
+     * @brief Exact transient allocations for the original CPU source or GPU upload owner.
      *
      * The device and pinned-host rings are separate physical owners even
-     * though they share one upload geometry. CPU plans and certified retained
-     * weights leave both values at zero. A non-zero host value requires
+     * though they share one upload geometry. CPU source transactions use host bytes only and their typed
+     * native input/scratch declaration below. Certified retained preparation
+     * leaves both values at zero. A non-zero GPU host value requires
      * @ref associated_host_memory so it can be charged to the rank-local CPU
      * allocator rather than hidden in the GPU subtotal.
      */
@@ -299,8 +301,12 @@ struct DevicePlanConfig
             return device_bytes != 0u || host_bytes != 0u;
         }
     } weight_load_staging;
+    /** Fresh common CPU native-input/consumer scratch root, independent of graph workspace. */
+    std::optional<NativeWeightLoadStagingGeometry> native_weight_load_staging;
+    /** Original CPU final/source allocation policy; standalone metadata plans use explicit native heap semantics. */
+    CPUStoragePlacement native_source_placement = CPUStoragePlacement::local();
     /** Exact original loader tuple that authored the staging bytes above.
-     * Absent for retained preparation and CPU resources; never derived from table extent. */
+     * Absent for retained preparation and CPU sources; never derived from table extent. */
     std::optional<GPUWeightLoadMemoryGeometry> ordinary_weight_load_geometry;
 
     /**

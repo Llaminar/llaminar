@@ -82,6 +82,9 @@ extern "C" bool hipMoEOverlayActivationPackDispatch(
             dim3(blocksFor(hidden_elements)), dim3(kThreads), 0u, hip_stream,
             *launch);
     }
+    if (launch->shared_row_writer)
+        hipLaunchKernelGGL(llaminar2::moe_activation_packet_device::packSharedDispatchUnionKernel,
+            dim3(launch->physical_rows),dim3(kThreads),0u,hip_stream,*launch);
     return launchAccepted();
 }
 

@@ -68,6 +68,8 @@ namespace llaminar2
         RetainedHostServiceRuntime, ///< Separately qualified process-retained libc/TLS backing.
         NativePreparationGraphExecutable, ///< Closed startup calibration graph, isolated from serving reservations.
         NativeStorageGraphExecutable, ///< Retained storage graph definitions, isolated from model/follower reservations.
+        NativeCPUCollectiveDomain, ///< Opaque native CPU domain, released only after original communicator/backend retirement.
+        NativeCPUCollectiveProcessPool, ///< Incremental first-domain MPI pool, retained through original MPI_Finalize.
         Count,                    ///< Sentinel; never a valid charge owner.
     };
 
@@ -137,6 +139,10 @@ namespace llaminar2
             return "retained_host_service_storage";
         case PhysicalMemoryOwner::RetainedHostServiceRuntime:
             return "retained_host_service_runtime";
+        case PhysicalMemoryOwner::NativeCPUCollectiveDomain:
+            return "native_cpu_collective_domain";
+        case PhysicalMemoryOwner::NativeCPUCollectiveProcessPool:
+            return "native_cpu_collective_process_pool";
         case PhysicalMemoryOwner::Count:
             break;
         }

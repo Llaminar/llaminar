@@ -10,6 +10,8 @@
  * 5. Different bindings get separate embedding entries
  * 6. Null tensor input throws
  * 7. Move semantics are safe (no double-free)
+ * 8. Final CPU storage is shared with lookup without a second allocation, and
+ *    its original physical-memory owner survives source/window retirement.
  */
 
 #include <gtest/gtest.h>
@@ -28,13 +30,17 @@
 #include "kernels/KernelFactory.h"
 #include "kernels/common/NativeEmbeddingLayout.h"
 #include "kernels/common/PreparedEmbeddingWeights.h"
+#include "kernels/cpu/ops/CPUEmbeddingKernelT.h"
 #include "loaders/PreparedWeightStore.h"
+#include "memory/CPUStorageRoot.h"
 #include "planning/PhysicalMemoryAuthority.h"
+#include "tensors/TensorFactory.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorSlice.h"
 #include "utils/DebugEnv.h"
 #include "../../utils/TestTensorFactory.h"
 #include "../../utils/EmbeddingVerifierFormats.h"
+#include "../../mocks/MockMPIContext.h"
 
 using namespace llaminar::v2::kernels;
 using namespace llaminar2;
@@ -504,4 +510,296 @@ TEST(PreparedEmbeddingUploadContract, RejectsMissingUnboundAndWrongDeviceBeforeA
         EXPECT_THROW(KernelFactory::prepareEmbeddingHandleLocal(
             tensor.get(), 256, device, wrong_device.get()), std::invalid_argument);
     }
+}
+
+namespace
+{
+    /**
+     * @brief Admit only the final CPU table; a duplicate prepared root cannot fit.
+     * @param bytes Physical allocator extent of the final native table.
+     * @param device Exact CPU allocator, independent of NUMA placement.
+     * @return Original authority retained by the actual final storage root.
+     */
+    std::shared_ptr<PhysicalMemoryAuthority> admitFinalEmbedding(size_t bytes, DeviceId device)
+    {
+        PhysicalMemoryPlanBuilder builder;
+        builder.add(PhysicalMemoryResource{.world_rank = 0, .device = device,
+            .total_bytes = bytes, .admission_available_bytes = bytes},
+            PhysicalMemoryOwner::PrimaryModelWeights, bytes);
+        return std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(builder.build()), 0);
+    }
+
+    /** @return Actual live final-weight bytes in the original CPU allocator. */
+    size_t embeddingClaim(const std::shared_ptr<PhysicalMemoryAuthority> &memory,
+                          DeviceId device = DeviceId::cpu())
+    {
+        return memory->claimedBytes(device, PhysicalMemoryOwner::PrimaryModelWeights,
+            PhysicalMemoryMaterializationKind::NewAllocation);
+    }
+
+    /**
+     * @brief Populate a final admitted root with unchanged native fixture bytes.
+     * @param source Original native table whose format and payload are preserved.
+     * @param memory Authority admitting the final root, not an extra prepared copy.
+     * @return Owning tensor that adopts the same allocated pointer and lease.
+     */
+    std::shared_ptr<const TensorBase> finalNativeEmbedding(
+        const TensorBase &source, const std::shared_ptr<PhysicalMemoryAuthority> &memory,
+        DeviceId device = DeviceId::cpu())
+    {
+        const CPUStorageRoot<uint8_t> root(source.size_bytes(),
+            PhysicalMemoryOwner::PrimaryModelWeights, device,
+            CPUStoragePlacement::local(), CPUStorageInitialization::Uninitialized);
+        auto bytes = root.allocate(memory);
+        std::memcpy(bytes.data(), source.raw_data(), source.size_bytes());
+        return TensorFactory::adoptQuantizedFinalStorage(
+            source.native_type(), source.shape(), std::move(bytes), device);
+    }
+}
+
+/** @test All native formats retain one final root through dirty partial lookups and handle retirement. */
+TEST_F(Test__PreparedEmbeddingWeightsLifecycle, FinalCPUStorageAllFormatsRetainOneOwnerAndExecute)
+{
+    constexpr size_t rows = 7, width = 256;
+    const std::array<int, rows> tokens{6, 0, 3, 6, 2, 0, 1};
+    for (const auto &format : quantizedVerifierFormats())
+    for (const DeviceId device : {DeviceId::cpu(), DeviceId(DeviceType::CPU, 1)})
+    {
+        SCOPED_TRACE(format.label);
+        SCOPED_TRACE(device.to_string());
+        auto source = format.create({rows, width}, 73491);
+        const size_t bytes = CPUStoragePlacement::local().physicalBytes<uint8_t>(source->size_bytes());
+        auto memory = admitFinalEmbedding(bytes, device);
+        auto final_tensor = finalNativeEmbedding(*source, memory, device);
+        ASSERT_EQ(final_tensor->home_device(), device);
+        const auto *const original_tensor = final_tensor.get();
+        const void *const original_bytes = final_tensor->raw_data();
+        std::weak_ptr<const TensorBase> owner = final_tensor;
+        auto handle = KernelFactory::prepareEmbeddingHandleFromFinalCPUStorage(final_tensor, width);
+        ASSERT_NE(handle, nullptr);
+        ASSERT_NE(handle->weights, nullptr);
+        EXPECT_EQ(handle->tensor, original_tensor);
+        EXPECT_EQ(handle->weights->device_data, original_bytes);
+        EXPECT_EQ(handle->weights->retainedFinalCPUTensor().get(), original_tensor);
+        EXPECT_FALSE(final_tensor.owner_before(handle->weights->retainedFinalCPUTensor()));
+        EXPECT_FALSE(handle->weights->retainedFinalCPUTensor().owner_before(final_tensor));
+        ASSERT_EQ(embeddingClaim(memory, device), bytes);
+        EXPECT_EQ(handle->device_id, device);
+        {
+            auto view = std::const_pointer_cast<TensorBase>(final_tensor)->create_view({3, width}, width);
+            ASSERT_NE(view, nullptr);
+            EXPECT_TRUE(view->is_view());
+            EXPECT_EQ(view->home_device(), device);
+            auto nested = view->create_view({1, width}, width);
+            EXPECT_EQ(nested->home_device(), device);
+        }
+        EXPECT_EQ(std::memcmp(original_bytes, source->raw_data(), source->size_bytes()), 0);
+
+        FP32Tensor expected({rows, width}), actual({rows, width});
+        for (size_t row = 0; row < rows; ++row)
+            source->to_fp32_row(tokens[row], expected.mutable_data() + row * width);
+        source.reset();
+        final_tensor.reset();
+        ASSERT_FALSE(owner.expired());
+        CPUEmbeddingKernelT<FP32Tensor> kernel;
+        for (int live_rows : {7, 3, 1, 7, 2})
+        {
+            std::fill_n(actual.mutable_data(), rows * width, -93.f);
+            ASSERT_TRUE(kernel.apply_tensor(handle->tensor, tokens.data(), live_rows, width, &actual));
+            EXPECT_EQ(std::memcmp(actual.data(), expected.data(), live_rows * width * sizeof(float)), 0);
+            for (size_t i = live_rows * width; i < rows * width; ++i)
+                EXPECT_EQ(actual.data()[i], -93.f);
+            EXPECT_EQ(embeddingClaim(memory, device), bytes);
+        }
+        // Store/graph aliases can outlive the handle: the original final tensor
+        // and its sole PMA lease must retire only with the last actual consumer.
+        auto retained = handle->weights;
+        handle.reset();
+        EXPECT_FALSE(owner.expired());
+        EXPECT_EQ(embeddingClaim(memory, device), bytes);
+        retained.reset();
+        EXPECT_TRUE(owner.expired());
+        EXPECT_EQ(embeddingClaim(memory, device), 0u);
+    }
+}
+
+/** @test Final storage moves preserve its exact CPU identity and never backend-free an alias. */
+TEST_F(Test__PreparedEmbeddingWeightsLifecycle, FinalCPUStorageMovesPreserveExactAllocator)
+{
+    const DeviceId cpu1(DeviceType::CPU, 1);
+    auto source = TestTensorFactory::createQ8_1Random({7, 256}, -1.f, 1.f, 1901);
+    const CPUStorageRoot<uint8_t> root(source->size_bytes(),
+        PhysicalMemoryOwner::PrimaryModelWeights, cpu1,
+        CPUStoragePlacement::local(), CPUStorageInitialization::Uninitialized);
+    auto memory = admitFinalEmbedding(root.physicalBytes(), cpu1);
+    auto bytes = root.allocate(memory);
+    std::memcpy(bytes.data(), source->raw_data(), source->size_bytes());
+    std::shared_ptr<const TensorBase> final_tensor = std::make_shared<Q8_1Tensor>(
+        source->shape(), std::move(bytes), cpu1);
+    std::weak_ptr<const TensorBase> original_owner = final_tensor;
+    auto handle = KernelFactory::prepareEmbeddingHandleFromFinalCPUStorage(final_tensor, 256, 11, 31);
+    ASSERT_EQ(handle->device_id, cpu1);
+    EXPECT_EQ(handle->weights->device_id, cpu1);
+    EXPECT_EQ(handle->weights->vocab_offset, 11u);
+    EXPECT_EQ(handle->weights->total_vocab, 31u);
+    const void *const original_bytes = final_tensor->raw_data();
+    final_tensor.reset();
+    {
+        PreparedEmbeddingWeights moved(std::move(*handle->weights));
+        EXPECT_EQ(handle->weights->device_data, nullptr);
+        EXPECT_EQ(handle->weights->retainedFinalCPUTensor(), nullptr);
+        EXPECT_EQ(moved.device_data, original_bytes);
+        EXPECT_EQ(moved.device_id, cpu1);
+        PreparedEmbeddingWeights assigned;
+        assigned = std::move(moved);
+        EXPECT_EQ(moved.device_data, nullptr);
+        EXPECT_EQ(moved.retainedFinalCPUTensor(), nullptr);
+        EXPECT_EQ(assigned.device_data, original_bytes);
+        EXPECT_EQ(assigned.retainedFinalCPUTensor()->home_device(), cpu1);
+        EXPECT_EQ(embeddingClaim(memory, cpu1), root.physicalBytes());
+        handle.reset();
+        EXPECT_FALSE(original_owner.expired());
+    }
+    EXPECT_TRUE(original_owner.expired());
+    EXPECT_EQ(embeddingClaim(memory, cpu1), 0u);
+}
+
+/** @test Borrowed/mapped storage and incompatible geometry cannot masquerade as final native roots. */
+TEST_F(Test__PreparedEmbeddingWeightsLifecycle, FinalCPUStorageRejectsInvalidOwnershipAndGeometry)
+{
+    EXPECT_THROW(KernelFactory::prepareEmbeddingHandleFromFinalCPUStorage({}, 256), std::invalid_argument);
+    auto source = std::shared_ptr<TensorBase>(TestTensorFactory::createQ4_0Random({7, 256}, 1349));
+    const auto prepare = [](std::shared_ptr<const TensorBase> tensor, int width = 256,
+                            size_t offset = 0, size_t total = 0)
+    { return KernelFactory::prepareEmbeddingHandleFromFinalCPUStorage(std::move(tensor), width, offset, total); };
+    EXPECT_THROW(prepare(std::make_shared<FP32Tensor>(std::vector<size_t>{7, 256})), std::invalid_argument);
+    EXPECT_THROW(prepare(source, 0), std::invalid_argument);
+    EXPECT_THROW(prepare(source, 128), std::invalid_argument);
+    EXPECT_THROW(prepare(source, 256, 8, 14), std::invalid_argument);
+    EXPECT_THROW(prepare(source, 256, 21, 14), std::invalid_argument);
+    auto view = source->create_view({7, 256});
+    ASSERT_NE(view, nullptr);
+    EXPECT_THROW(prepare(view), std::invalid_argument);
+    MockMPIContext context;
+    auto borrowed = TensorFactory(context).createQuantizedZeroCopy(source->native_type(), source->shape(),
+        static_cast<const uint8_t *>(source->raw_data()), source->size_bytes(), source);
+    EXPECT_THROW(prepare(std::move(borrowed)), std::invalid_argument);
+    source->release_host_weight_data();
+    EXPECT_THROW(prepare(source), std::invalid_argument);
+}
+
+/** @test Every native row view reports borrowing and is rejected by final-root adoption. */
+TEST_F(Test__PreparedEmbeddingWeightsLifecycle, FinalCPUStorageAllFormatViewsReportBorrowedOwnership)
+{
+    for (const auto &format : quantizedVerifierFormats())
+    {
+        SCOPED_TRACE(format.label);
+        auto source = std::shared_ptr<TensorBase>(format.create({7, 256}, 2301));
+        ASSERT_FALSE(source->is_view());
+        auto view = source->create_view({3, 256}, 256);
+        ASSERT_NE(view, nullptr);
+        EXPECT_TRUE(view->is_view());
+        EXPECT_THROW(KernelFactory::prepareEmbeddingHandleFromFinalCPUStorage(view, 256), std::invalid_argument);
+        auto nested = view->create_view({1, 256}, 256);
+        ASSERT_NE(nested, nullptr);
+        EXPECT_TRUE(nested->is_view());
+        EXPECT_THROW(KernelFactory::prepareEmbeddingHandleFromFinalCPUStorage(nested, 256), std::invalid_argument);
+    }
+}
+
+/** @test Rebinding or charging an adopted alias fails without retiring the original live tensor. */
+TEST_F(Test__PreparedEmbeddingWeightsLifecycle, FinalCPUStorageRejectsDuplicateBackingAndClaim)
+{
+    auto source = TestTensorFactory::createQ4_0Random({7, 256}, 5341);
+    const size_t bytes = CPUStoragePlacement::local().physicalBytes<uint8_t>(source->size_bytes());
+    auto memory = admitFinalEmbedding(bytes, DeviceId::cpu());
+    auto final_tensor = finalNativeEmbedding(*source, memory);
+    auto handle = KernelFactory::prepareEmbeddingHandleFromFinalCPUStorage(final_tensor, 256);
+    EXPECT_THROW(handle->weights->bindFinalCPUStorage(final_tensor), std::logic_error);
+    auto other_memory = admitFinalEmbedding(source->size_bytes(), DeviceId::cpu());
+    auto extra_claim = other_memory->claimNewAllocation(DeviceId::cpu(),
+        PhysicalMemoryOwner::PrimaryModelWeights, source->size_bytes());
+    EXPECT_THROW(handle->weights->bindPhysicalMemoryLease(std::move(extra_claim)), std::logic_error);
+    EXPECT_EQ(embeddingClaim(other_memory), 0u);
+    EXPECT_EQ(embeddingClaim(memory), bytes);
+    EXPECT_EQ(handle->weights->device_data, final_tensor->raw_data());
+    EXPECT_EQ(handle->weights->retainedFinalCPUTensor().get(), final_tensor.get());
+}
+
+/** @test Native final adoption rejects a foreign allocator before exposing a tensor. */
+TEST_F(Test__PreparedEmbeddingWeightsLifecycle, FinalCPUStorageAllFormatsRejectForeignAllocators)
+{
+    for (const auto &format : quantizedVerifierFormats())
+    for (const auto device : {DeviceId::invalid(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        SCOPED_TRACE(format.label);
+        EXPECT_THROW(TensorFactory::adoptQuantizedFinalStorage(
+            format.tensor_type, {7, 256}, AlignedVector<uint8_t>{}, device), std::invalid_argument);
+    }
+}
+
+/** @test The runtime Q8_1 native-window decoder borrows exact bytes and retains a supplied real owner. */
+TEST_F(Test__PreparedEmbeddingWeightsLifecycle, BorrowedQ81SourceRetainsOwnerAndRevokesViews)
+{
+    auto source = std::shared_ptr<TensorBase>(TestTensorFactory::createQ8_1Random({7, 256}, -1.f, 1.f, 9137));
+    std::weak_ptr<TensorBase> owner = source;
+    const auto *raw = static_cast<const uint8_t *>(source->raw_data());
+    auto borrowed = std::make_shared<Q8_1Tensor>(source->shape(), raw, source->size_bytes(), std::shared_ptr<void>(source));
+    EXPECT_EQ(borrowed->raw_data(), raw);
+    EXPECT_TRUE(borrowed->is_view());
+    EXPECT_FALSE(borrowed->is_mutable());
+    EXPECT_THROW(borrowed->mutable_q8_1_blocks(), std::logic_error);
+    EXPECT_THROW(KernelFactory::prepareEmbeddingHandleFromFinalCPUStorage(borrowed, 256), std::invalid_argument);
+    auto child = borrowed->create_view({3, 256}, 256);
+    auto nested = child->create_view({1, 256}, 256);
+    std::array<float, 256> expected{}, actual{};
+    source->to_fp32_row(2, expected.data());
+    source.reset();
+    child.reset();
+    EXPECT_FALSE(owner.expired());
+    nested->to_fp32_row(0, actual.data());
+    EXPECT_EQ(std::memcmp(expected.data(), actual.data(), sizeof(expected)), 0);
+    borrowed->release_host_weight_data();
+    EXPECT_TRUE(owner.expired());
+    EXPECT_EQ(nested->raw_data(), nullptr);
+    EXPECT_TRUE(nested->is_raw_data_released());
+
+    auto scoped_source = TestTensorFactory::createQ8_1Random({1, 256}, -1.f, 1.f, 9781);
+    const auto *scoped_bytes = static_cast<const uint8_t *>(scoped_source->raw_data());
+    // The real source visitor owns this input span throughout its synchronous
+    // callback. No fake lifetime owner or second native allocation is needed.
+    Q8_1Tensor scoped(scoped_source->shape(), scoped_bytes, scoped_source->size_bytes(), std::shared_ptr<void>{});
+    EXPECT_EQ(scoped.raw_data(), scoped_bytes);
+    scoped.to_fp32_row(0, actual.data());
+    scoped_source->to_fp32_row(0, expected.data());
+    EXPECT_EQ(std::memcmp(expected.data(), actual.data(), sizeof(expected)), 0);
+    EXPECT_THROW((Q8_1Tensor({1, 256}, nullptr, scoped_source->size_bytes(), std::shared_ptr<void>{})), std::invalid_argument);
+    EXPECT_THROW((Q8_1Tensor({1, 256}, scoped_bytes, scoped_source->size_bytes() - 1, std::shared_ptr<void>{})), std::invalid_argument);
+}
+
+/** @test The final weight factory preserves the root and seals activation writes before publication. */
+TEST_F(Test__PreparedEmbeddingWeightsLifecycle, FinalCPUStorageQ81IsImmutable)
+{
+    auto source = TestTensorFactory::createQ8_1Random({7, 256}, -1.f, 1.f, 1781);
+    const auto cpu1 = DeviceId{DeviceType::CPU, 1};
+    const auto physical_bytes = CPUStoragePlacement::local().physicalBytes<uint8_t>(source->size_bytes());
+    auto memory = admitFinalEmbedding(physical_bytes, cpu1);
+    auto published = finalNativeEmbedding(*source, memory, cpu1);
+    auto final = std::dynamic_pointer_cast<const Q8_1Tensor>(published);
+    ASSERT_TRUE(final);
+    EXPECT_FALSE(final->is_mutable());
+    EXPECT_EQ(final->home_device(), cpu1);
+    EXPECT_EQ(std::memcmp(final->raw_data(), source->raw_data(), source->size_bytes()), 0);
+    // Factory publication returns const ownership, but a later service retaining
+    // the concrete owner still must not obtain mutable activation blocks.
+    auto retained = std::const_pointer_cast<Q8_1Tensor>(final);
+    EXPECT_THROW(retained->mutable_q8_1_blocks(), std::logic_error);
+    auto view = std::dynamic_pointer_cast<Q8_1Tensor>(retained->create_view({1, 256}));
+    ASSERT_TRUE(view);
+    EXPECT_FALSE(view->is_mutable());
+    EXPECT_THROW(view->mutable_q8_1_blocks(), std::logic_error);
+    Q8_1Tensor activation({1, 256});
+    EXPECT_TRUE(activation.is_mutable());
+    EXPECT_NE(activation.mutable_q8_1_blocks(), nullptr);
 }

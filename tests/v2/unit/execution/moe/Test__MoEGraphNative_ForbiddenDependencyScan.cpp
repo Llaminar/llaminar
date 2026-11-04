@@ -2492,7 +2492,7 @@ namespace llaminar2::test
             "compact_result = static_cast<const float *>(\n                family->pinned_transfer->data(",
             output_materialization);
         const size_t aggregation_complete = execute_body.find(
-            "output.live_row_count = canonical_packet ? active_routes_.size() : output_input_rows_.size()",
+            "output.live_row_count =",
             pinned_output_read);
         const size_t elapsed_service = execute_body.find(
             "service_completed_at - service_start",
@@ -2508,6 +2508,17 @@ namespace llaminar2::test
         ASSERT_NE(output_materialization, std::string::npos);
         ASSERT_NE(pinned_output_read, std::string::npos);
         ASSERT_NE(aggregation_complete, std::string::npos);
+        const size_t aggregation_end = execute_body.find(';', aggregation_complete);
+        ASSERT_NE(aggregation_end, std::string::npos);
+        const std::string aggregation = execute_body.substr(
+            aggregation_complete, aggregation_end - aggregation_complete);
+        EXPECT_NE(aggregation.find("canonical_packet"), std::string::npos);
+        EXPECT_NE(aggregation.find("active_routes_.size()"), std::string::npos);
+        EXPECT_NE(aggregation.find("output_input_rows_.size()"), std::string::npos);
+        EXPECT_TRUE(std::regex_search(aggregation, std::regex(
+            R"(cpu_joint_route_producer\s*\?\s*0u\s*:)")))
+            << "A fragment producer cannot advertise a completed route return "
+               "before its explicit rooted collective";
         ASSERT_NE(elapsed_service, std::string::npos);
         ASSERT_NE(publish, std::string::npos);
         ASSERT_NE(diagnostic_publish, std::string::npos);
@@ -4420,12 +4431,13 @@ namespace llaminar2::test
             << "Keep the empty-endpoint topology invariant documented at the "
                "allocation boundary";
         EXPECT_NE(
-            qwen_graph.find(
-                "if (hasActiveExpertMask(local_params.expert_mask) &&\n"
-                "                            !MoELocalExpertStage::prepareExpertGemmEngines("),
+            withoutWhitespace(qwen_graph).find(
+                "if(!joint_local_target&&hasActiveExpertMask(local_params.expert_mask)&&"
+                "!MoELocalExpertStage::prepareExpertGemmEngines("),
             std::string::npos)
             << "The continuation graph must retain a mapped endpoint whose "
-               "initial residency mask is empty";
+               "initial residency mask is empty; original CPU fragments use "
+               "their separate prepared source rather than whole-expert engines";
     }
 
     /**
@@ -11694,12 +11706,13 @@ namespace llaminar2::test
             {
                 // This standalone diagnostic consumes completed path/publication
                 // records to reject an incomplete observation. It never owns
-                // model progress. Keep the exception confined to its two
+                // model progress. Keep the exception confined to its named
                 // observation functions, not the execution loop or core.
                 std::string non_observer_source = contents;
                 for (const auto signature : {
                          "json requireQFNPath(",
-                         "std::uint64_t qfnTPHostPublications(std::size_t participants)"})
+                         "std::uint64_t qfnTPHostPublications(std::size_t participants)",
+                         "json completedQFNRankPathRecords()"})
                 {
                     const auto observer = braceBalancedDeclarationRegion(
                         non_observer_source, signature);

@@ -247,6 +247,25 @@ def _quantile(values, fraction):
     return values[low]+(values[high]-values[low])*(location-low)
 
 
+def _bounded_row_outliers(item):
+    """Validate an explicit count/cap pair; every row remains in all aggregates.
+
+    This changes only the ordinary maximum-row comparison, never the mean,
+    per-step, tail, variation or agreement policies. Absence preserves the
+    original all-rows maximum exactly.
+    """
+    if 'bounded_row_outliers' not in item:
+        return None
+    allowance = item['bounded_row_outliers']
+    require(type(allowance) is dict and set(allowance) == {'maximum_rows', 'maximum_kl_nats'},
+            'Invalid bounded row outlier fields')
+    count = allowance['maximum_rows']
+    require(type(count) is int and count > 0, 'Invalid bounded row outlier count')
+    cap = _number(allowance['maximum_kl_nats'], 'bounded row outlier cap')
+    require(cap > item['maximum']['row_kl_nats'], 'Bounded row outlier cap must exceed ordinary row limit')
+    return allowance
+
+
 def _limits(calibration, manifest, baseline, approval, group_keys):
     """Admit complete explicit calibration; no implicit numeric ceiling or borrowed baseline."""
     if calibration is None: return {}
@@ -271,6 +290,7 @@ def _limits(calibration, manifest, baseline, approval, group_keys):
                 'Invalid calibrated probability limit')
         tail = _number(item.get('tail_threshold_kl_nats'), 'tail threshold')
         require(tail <= maximum['row_kl_nats'], 'Tail threshold exceeds catastrophe ceiling')
+        _bounded_row_outliers(item)
         result[key] = item
     require(set(result) == set(group_keys), 'Missing calibration group')
     return result
@@ -299,6 +319,7 @@ def _absolute_pilot_limits(policy, manifest, group_keys):
         require(role in ('required', 'diagnostic'), 'Invalid absolute pilot group role')
         if role == 'required':
             fields |= {'maximum', 'minimum', 'tail_threshold_kl_nats'}
+            if 'bounded_row_outliers' in item: fields.add('bounded_row_outliers')
         require(set(item) == fields, 'Unexpected/missing absolute pilot group fields')
         roles[key] = role
         if role == 'diagnostic': continue
@@ -313,6 +334,7 @@ def _absolute_pilot_limits(policy, manifest, group_keys):
                 'Invalid absolute pilot probability limit')
         tail = _number(item['tail_threshold_kl_nats'], 'tail threshold')
         require(tail <= maximum['row_kl_nats'], 'Absolute pilot tail exceeds catastrophe ceiling')
+        _bounded_row_outliers(item)
         limits[key] = item
     require(set(roles) == set(group_keys), 'Missing absolute pilot group')
     require(bool(limits), 'Absolute pilot needs at least one required group')
@@ -386,6 +408,16 @@ def summarize(manifest, candidate, baseline=None, baseline_approval=None, *, cal
             summary['tail_fraction'] = _prompt_mean(rows, lambda r: float(r['metrics']['kl_nats'] > threshold))
             summary['mean_tail_excess_kl_nats'] = _prompt_mean(rows, lambda r: max(0., r['metrics']['kl_nats']-threshold))
             bad = [name for name, bound in policy['maximum'].items() if summary[name] > bound]
+            allowance = _bounded_row_outliers(policy)
+            if allowance is not None:
+                require(allowance['maximum_rows'] <= len(rows), 'Bounded row outlier count exceeds group population')
+                excess = [r for r in rows if r['metrics']['kl_nats'] > policy['maximum']['row_kl_nats']]
+                summary['bounded_row_outliers'] = dict(
+                    ordinary_row_limit_kl_nats=policy['maximum']['row_kl_nats'],
+                    maximum_rows=allowance['maximum_rows'], maximum_kl_nats=allowance['maximum_kl_nats'],
+                    observed_count=len(excess), observed_rows=[r['row_id'] for r in excess])
+                if len(excess) <= allowance['maximum_rows'] and summary['row_kl_nats'] <= allowance['maximum_kl_nats']:
+                    bad = [name for name in bad if name != 'row_kl_nats']
             bad += [name for name, bound in policy['minimum'].items() if summary[name] < bound]
             summary['passed'] = not bad
             for name in bad: failures.append(dict(zip(GROUP_FIELDS, key), criterion=name))
@@ -461,7 +493,7 @@ def _case_frames(manifest, document):
     return cases
 
 
-def load_corpus(root, *, catalog):
+def load_corpus(root, *, catalog, manifest_path=None):
     """Load an explicitly approved v2 generation through canonical path/stat authority.
 
     Only metadata and file extents are read here. Full vocabulary payloads are
@@ -472,7 +504,12 @@ def load_corpus(root, *, catalog):
     approval = json.loads(catalog.read_text())
     require(type(approval) is dict and set(approval) == {'schema', 'manifest_digest'} and approval['schema'] == 2,
             'Explicit v2 corpus approval required')
-    manifest_path = root/'manifest.json'; manifest = json.loads(manifest_path.read_text())
+    # The explicit catalog still authenticates every byte of this small metadata
+    # document. Only metadata may be external; reference paths remain confined
+    # to the original root below, including aliases and traversal rejection.
+    manifest_path = (root/'manifest.json') if manifest_path is None else Path(manifest_path).resolve(strict=True)
+    require(manifest_path.is_file(), 'Explicit corpus manifest must be a regular file')
+    manifest = json.loads(manifest_path.read_text())
     require(metadata_digest(manifest) == approval['manifest_digest'], 'Unapproved corpus generation')
     validate_manifest(manifest)
     reference = manifest.get('reference', {})
@@ -492,6 +529,68 @@ def load_corpus(root, *, catalog):
                 'Truncated/extra full-vocabulary reference')
         inputs[str(payload)] = identity(payload); payloads[case['history_id']] = payload
     return dict(manifest=manifest, reference=report, reference_payloads=payloads, inputs=inputs)
+
+
+def validate_distributed_rank_reports(manifest, topology, document, report_path):
+    """Require every original coordinated rank's closed source/path/retirement artifact.
+
+    The original typed config determines membership. This reads passive native
+    reports only; it creates no runtime readiness or numerical observations.
+    Historical one-rank reports keep their existing shape and validation.
+    """
+    import json
+    world = topology['expected_config'].get('configuration', {}).get('mpi_procs', 1)
+    require(type(world) is int and world >= 0, 'Malformed original MPI membership')
+    if world <= 1:
+        require('distributed_observer' not in document, 'Unexpected distributed observer identity')
+        return {}
+    group = document.get('distributed_observer')
+    require(type(group) is dict and group.get('world_size') == world and
+            group.get('authority_rank') == 0 and
+            group.get('rank_reports') == [f'rank-{rank}.json' for rank in range(world)],
+            'Missing/partial distributed observer membership')
+    domains = topology['expected_config']['configuration'].get('moe_routed_expert_plan', {}).get('domains', [])
+    joint = [domain for domain in domains if domain.get('routed_compute_policy') == 'TensorSharded' and
+             domain.get('participants') and all(endpoint.get('device_type') == 'CPU' for endpoint in domain['participants'])]
+    require(len(joint) == 1 and sorted(joint[0].get('world_ranks', [])) == list(range(world)),
+            'Distributed original CPU cohort membership incomplete')
+    ordered_members = joint[0]['world_ranks']
+    root = Path(report_path).parent.resolve(strict=True)
+    pins = {}; owners = set()
+    for rank, relative in enumerate(group['rank_reports']):
+        path = (root / relative).resolve(strict=True)
+        require(path.parent == root and path.is_file(), 'Distributed rank report escapes original artifact owner')
+        pin = identity(path)
+        require((pin[1], pin[2]) not in owners, 'Aliased distributed rank report')
+        owners.add((pin[1], pin[2])); pins[str(path)] = pin
+        observed = json.loads(path.read_text())
+        require(observed.get('schema') == 'llaminar.qfn-observer-rank.v1' and
+                observed.get('rank') == rank and observed.get('world_size') == world and
+                observed.get('authority_rank') == 0 and
+                observed.get('role') == ('authority' if rank == 0 else 'follower') and
+                observed.get('complete') is True and observed.get('native_retired') is True and
+                observed.get('runtime_config_digest') == topology['runtime_config_digest'] and
+                observed.get('corpus_manifest_digest') == metadata_digest(manifest),
+                'Distributed rank identity/retirement incomplete')
+        owner = observed.get('actual_owner', {})
+        require(owner.get('original_pma_owner') is True and
+                owner.get('source_file_set_identity') == document.get('native_identity', {}).get('actual_source_descriptor_sha256'),
+                'Distributed rank source/PMA identity differs')
+        records = observed.get('path_records')
+        require(type(records) is list and records and all(type(record) is dict for record in records),
+                'Missing distributed rank path evidence')
+        if rank in ordered_members:
+            for phase in ('prefill', 'decode'):
+                calls = [record for record in records if record.get('domain') == 'moe_canonical_publication' and
+                         record.get('name') == 'cpu_packed_route_gather_calls' and record.get('phase') == phase and
+                         record.get('tags', {}).get('expert_compute') == 'tensor_sharded' and
+                         record['tags'].get('participant') == str(ordered_members.index(rank)) and
+                         record['tags'].get('degree') == str(world) and record['tags'].get('root') == '0']
+                require(calls and all(type(record.get('count')) is int and record['count'] > 0 and
+                                  type(record.get('value')) in (int, float) and math.isfinite(record['value']) and
+                                  record['value'] > 0 for record in calls),
+                        'Missing original CPU fragment gather phase evidence')
+    return pins
 
 
 def score_observation(corpus, report_path):
@@ -525,6 +624,7 @@ def score_observation(corpus, report_path):
     reset_case = document.get('reset_case')
     _case_frames(dict(manifest, histories=[reset_history]), dict(cases=[reset_case]))
     pins = {str(report_path): identity(report_path)}; outputs = []
+    pins.update(validate_distributed_rank_reports(manifest, topology, document, report_path))
     for case in cases:
         payload = Path(case.get('logits_file', '')).resolve(strict=True)
         require(payload.is_relative_to(report_path.parent), 'Native payload escapes artifact owner')

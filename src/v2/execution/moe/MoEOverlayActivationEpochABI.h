@@ -78,7 +78,7 @@ namespace llaminar2
     inline constexpr std::uint32_t kMoEOverlayActivationMagic = 0x41454f4du;
 
     /** Current binary layout and semantic-contract version. */
-    inline constexpr std::uint32_t kMoEOverlayActivationABIVersion = 5u;
+    inline constexpr std::uint32_t kMoEOverlayActivationABIVersion = 7u;
 
     /** Device endpoint participating in one sparse activation round trip. */
     enum class MoEOverlayActivationEndpoint : std::uint32_t
@@ -162,6 +162,37 @@ namespace llaminar2
      * change therefore requires a new channel instead of accepting a vaguely
      * compatible transaction.
      */
+    /** @brief Immutable logical return role derived from original source ownership. */
+    enum class MoEOverlayActivationReturnRole : std::uint32_t {
+        Ordinary = 0, ///< Existing one-participant logical expert result.
+        StaticJointRoot = 1, ///< One combined result after original CPU fragment collective.
+        StaticJointContributor = 2, ///< Metadata-only completion after actual fragment gather.
+    };
+    /** @param role Exact wire policy word.
+     * @return Whether this ABI declares the immutable return policy. */
+    [[nodiscard]] LLAMINAR_MOE_ACTIVATION_HD constexpr bool
+    moeOverlayActivationReturnRoleValid(std::uint32_t role) noexcept {
+        return role<=static_cast<std::uint32_t>(MoEOverlayActivationReturnRole::StaticJointContributor);
+    }
+    /**
+     * @brief Validate actual return counts without confusing completed work and payload.
+     * @param role Original immutable channel policy.
+     * @param returned_rows Actual payload rows in the return descriptor.
+     * @param returned_entries Actual payload entries in the return descriptor.
+     * @param dispatched_rows Actual original work rows.
+     * @param dispatched_entries Actual original work entries.
+     * @return True only for an ordinary exact return or the explicit no-payload contributor.
+     */
+    [[nodiscard]] LLAMINAR_MOE_ACTIVATION_HD constexpr bool
+    moeOverlayActivationReturnCountsMatch(std::uint32_t role,
+        std::uint64_t returned_rows,std::uint64_t returned_entries,
+        std::uint64_t dispatched_rows,std::uint64_t dispatched_entries) noexcept {
+        return moeOverlayActivationReturnRoleValid(role) &&
+            (role==static_cast<std::uint32_t>(MoEOverlayActivationReturnRole::StaticJointContributor)
+                ? returned_rows==0 && returned_entries==0
+                : returned_rows==dispatched_rows && returned_entries==dispatched_entries);
+    }
+
     struct alignas(64) MoEOverlayActivationChannelHeader
     {
         std::uint32_t magic = kMoEOverlayActivationMagic;
@@ -184,7 +215,9 @@ namespace llaminar2
         std::uint32_t lane_ordinal = 0u;
         /** Bit N admits @ref MoEOverlayInferenceGraphRole value N. */
         std::uint32_t graph_role_mask = 0u;
-        std::uint64_t reserved[4] = {};
+        std::uint32_t return_role = 0u; ///< Original logical contribution policy, never live routing state.
+        std::uint32_t reserved_return_role = 0u;
+        std::uint64_t reserved[3] = {};
     };
 
     /**
@@ -263,7 +296,8 @@ namespace llaminar2
         std::int32_t sidecar_depth = -1;
         std::uint32_t stage_count = 0u;
         std::uint32_t lane_ordinal = 0u;
-        std::uint32_t reserved[5] = {};
+        std::uint32_t return_role = 0u; ///< Authenticated original channel return policy.
+        std::uint32_t reserved[4] = {};
 
         bool operator==(
             const MoEOverlayActivationEpochIdentity &) const = default;
@@ -346,6 +380,7 @@ namespace llaminar2
         LLAMINAR_MOE_ACTIVATION_MIX(sidecar_depth);
         LLAMINAR_MOE_ACTIVATION_MIX(stage_count);
         LLAMINAR_MOE_ACTIVATION_MIX(lane_ordinal);
+        LLAMINAR_MOE_ACTIVATION_MIX(return_role);
 #undef LLAMINAR_MOE_ACTIVATION_MIX
         if (digest.low == 0u)
             digest.low = 0x9e3779b97f4a7c15ull;
@@ -444,6 +479,13 @@ namespace llaminar2
 
         /** Number of authenticated payload descriptors this endpoint published. */
         std::uint64_t published_stage_count = 0u;
+
+        /**
+         * Actual shared hidden-matrix bytes written once by this group's GPU
+         * publisher. Other consumers report zero; logical descriptor totals
+         * remain separate. Read only after the original terminal publication.
+         */
+        std::uint64_t published_shared_hidden_bytes = 0u;
 
         /*
          * These totals are deliberately part of the endpoint-owned ABI rather

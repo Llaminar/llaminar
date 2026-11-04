@@ -48,10 +48,13 @@ inline void retireQFNFinalOwner(std::unique_ptr<IOrchestrationRunner>& runner,
  * @brief Observe under one exported owner, then retire runner and original final model on every exit.
  * @param runner Actual initialized application runner; consumed before this call returns.
  * @param observe Callback borrowing only the same exported contract, with no escaping model/workspace aliases.
+ * @param before_failure_cleanup Original coordinated-lane cancellation, or the historical no-op policy.
  * @throws Original observer failure after successful cleanup; combined primary/cleanup diagnostic if cleanup also fails.
  */
-template<class Observe>
-void observeQFNWithFinalOwner(std::unique_ptr<IOrchestrationRunner>& runner,Observe&& observe) {
+namespace detail {
+template<class Observe,class BeforeFailureCleanup>
+void observeQFNFinalOwner(std::unique_ptr<IOrchestrationRunner>& runner,Observe&& observe,
+                          BeforeFailureCleanup&& before_failure_cleanup) {
     std::optional<ModelContextReuseContract> owner;
     std::exception_ptr primary;
     try {
@@ -62,6 +65,9 @@ void observeQFNWithFinalOwner(std::unique_ptr<IOrchestrationRunner>& runner,Obse
         std::forward<Observe>(observe)(std::as_const(*owner));
     }catch(...){
         primary=std::current_exception();
+        // Cancel the original command lanes before any local model/native teardown,
+        // including a failure while exporting the original admitted model owner.
+        std::forward<BeforeFailureCleanup>(before_failure_cleanup)(primary);
         // Native retirement can fail fatally after a partially submitted
         // request. Preserve the original observation error before cleanup.
         std::cerr << "QFN observation failed before final retirement: "
@@ -75,4 +81,47 @@ void observeQFNWithFinalOwner(std::unique_ptr<IOrchestrationRunner>& runner,Obse
     }
     if(primary)std::rethrow_exception(primary);
 }
+} // namespace detail
+/**
+ * @brief Observe and retire the historical single-rank owner with its unchanged failure policy.
+ * @param runner Original initialized runner consumed after observation.
+ * @param observe Callback borrowing only the same original exported model.
+ * @throws Original observation/retirement error according to the shared final-owner scope.
+ */
+template<class Observe>
+void observeQFNWithFinalOwner(std::unique_ptr<IOrchestrationRunner>& runner,Observe&& observe) {
+    detail::observeQFNFinalOwner(runner,std::forward<Observe>(observe),[](const std::exception_ptr&){});
+}
+/**
+ * @brief Use production's sole coordinated command owner before final original model retirement.
+ * @param runner Original initialized runner, consumed by the existing final-owner scope.
+ * @param authority Original AppContext coordinated role; never inferred from arrival.
+ * @param observe Authority-only frozen-history observation callback.
+ * @param record_follower Passive original-owner/path record after the actual worker loop returns.
+ * @note Followers execute the original worker loop, not independent history replay.
+ */
+template<class Observe,class RecordFollower>
+void observeQFNCoordinatedWithFinalOwner(std::unique_ptr<IOrchestrationRunner>& runner,
+                                        bool authority,Observe&& observe,RecordFollower&& record_follower) {
+    if(!runner)throw std::invalid_argument("QFN coordinated observer lost original runner");
+    runner->setMPICoordinatedMode(true);
+    bool follower_loop_returned = false;
+    detail::observeQFNFinalOwner(runner,[&](const ModelContextReuseContract& owner) {
+        if(!authority){
+            runner->runMPIWorkerLoop();
+            follower_loop_returned = true;
+            std::forward<RecordFollower>(record_follower)(owner);
+            return;
+        }
+        std::forward<Observe>(observe)(owner);
+        runner->shutdownMPIWorkers();
+    },[&](const std::exception_ptr&) {
+        // A passive follower record runs only after the original command loop
+        // has returned. It owns local final retirement, never a root command.
+        // Earlier failures still terminate the existing coordinated lane.
+        if(authority || !follower_loop_returned)
+            runner->abortMPIWorkers("QFN frozen-history observation failed");
+    });
+}
+
 }

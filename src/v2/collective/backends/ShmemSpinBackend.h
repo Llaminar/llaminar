@@ -22,10 +22,13 @@
  */
 
 #pragma once
+#include "../RootedFloatRecordRange.h"
 
 #include "../ICollectiveBackend.h"
 #include "UPIBackend.h"
 #include "utils/MPISessionOwner.h"
+#include "planning/PhysicalMemoryAuthority.h"
+#include "tensors/AlignedVector.h"
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -105,6 +108,15 @@ namespace llaminar2
                    static_cast<size_t>(rank) * CHUNK_CAPACITY;
         }
 
+        /** @brief Exact original file extent and page-mapped physical span, one creator only. */
+        struct AllocationGeometry { size_t logical_bytes; size_t mapped_bytes; };
+        /** @return The same allocation-owner rounding used by native host mappings. */
+        static AllocationGeometry allocationGeometry(int ranks) {
+            if(ranks<=0 || ranks>8)throw std::invalid_argument("Shared CPU expert arena requires1..8 actual participants");
+            const auto logical=compute_size(ranks);
+            using Bytes=AlignedVector<std::byte>;
+            return {logical,Bytes::requiredAllocationBytes(logical,64,Bytes::StorageKind::AnonymousPageMapping)};
+        }
         /// Total arena size in bytes for a given rank count
         static size_t compute_size(int num_ranks)
         {
@@ -139,7 +151,8 @@ namespace llaminar2
          *                        the native shared-memory SUM contract
          */
         ShmemSpinBackend(int domain_id, int my_rank,
-                         std::unique_ptr<UPICollectiveBackend> general_backend);
+                         std::unique_ptr<UPICollectiveBackend> general_backend,
+                         std::shared_ptr<PhysicalMemoryAuthority> original_memory = {});
 
         ~ShmemSpinBackend() override;
 
@@ -224,6 +237,11 @@ namespace llaminar2
             int root_rank,
             size_t &gathered_record_count);
 
+        /** @brief Same original gather with root-only authenticated compact source ranges. */
+        bool gatherVariableFloatRecordsToRoot(
+            const float *, size_t, float *, size_t, size_t, int, size_t &,
+            std::span<RootedFloatRecordRange>);
+
         bool synchronize() override;
 
         // =====================================================================
@@ -296,6 +314,11 @@ namespace llaminar2
                                        const uint16_t *b, size_t count);
 
     private:
+        friend class GlobalTPContext;
+        /** @return True only after successful local unmap; original creator backing remains retained. */
+        bool closeOriginalExpertMapping() noexcept;
+        /** @brief Release creator backing only after the original domain's all-member unmap acknowledgement. */
+        void retireOriginalExpertBacking();
         /**
          * @brief Construct, map, first-touch, and anonymize one shared arena.
          *
@@ -330,6 +353,11 @@ namespace llaminar2
         std::string shm_name_;               ///< Exact root-relative basename published during setup
         MPISessionOwner::SharedFile shared_file_;
         std::optional<MPISessionOwner::SharedDirectory> shared_directory_;
+        bool original_expert_mapping_closed_=false;
+        bool original_expert_backing_retired_=false;
+        size_t arena_mapping_bytes_ = 0; ///< Page-rounded mapping span; file and protocol keep logical extent.
+        std::shared_ptr<PhysicalMemoryAuthority> original_memory_; ///< Same admitted domain PMA, never a second ledger.
+        PhysicalMemoryAllocationLease arena_creator_claim_; ///< Only native rank0 owns physical arena pages.
         size_t arena_size_ = 0;              ///< Mapped size in bytes (for munmap)
         ShmemSpinArena *arena_ = nullptr;     ///< Mapped shared-memory arena
 

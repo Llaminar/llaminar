@@ -219,10 +219,11 @@ namespace
             const std::string name = "blk.0.ffn_gate_exps.weight";
             const size_t bytes = standalone->size_bytes();
             fixture.writePayload(name, 7 * bytes, {static_cast<const uint8_t *>(standalone->raw_data()), bytes});
+            const auto physical = CPUStoragePlacement::local().physicalBytes<uint8_t>(bytes);
             const PhysicalMemoryResource resource{.world_rank = 0, .device = DeviceId::cpu(),
-                .total_bytes = 2 * bytes, .admission_available_bytes = 2 * bytes};
+                .total_bytes = physical + bytes, .admission_available_bytes = physical + bytes};
             PhysicalMemoryPlanBuilder bom;
-            bom.add(resource, PhysicalMemoryOwner::ModelSourcePayload, bytes);
+            bom.add(resource, PhysicalMemoryOwner::ModelSourcePayload, physical);
             bom.add(resource, PhysicalMemoryOwner::WeightLoadStaging, bytes);
             auto memory = std::make_shared<PhysicalMemoryAuthority>(
                 std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(bom.build()), 0);

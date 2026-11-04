@@ -5,6 +5,9 @@
  * Borrowed rank-two source-weight views report whole block-padded rows, matching
  * their row-slice pointer arithmetic. Other ranks retain their existing extent
  * authority; no GGUF parent-axis or packed-activation layout is inferred here.
+ * Raw release revokes the current tensor only. Borrowers consult their original
+ * parent release state before pointer arithmetic, so parent retirement cannot
+ * leave an apparently live offset pointer while siblings remain independent.
  *
  * ============================================================================
  * INTERFACE HIERARCHY AND USAGE
@@ -786,7 +789,7 @@ namespace llaminar2
          * @note Implements ITensor::raw_data() - delegates to raw_host_data_ptr()
          * @note Always returns HOST pointer even if tensor is on GPU
          */
-        const void *raw_data() const override { return raw_host_data_ptr(); }
+        const void *raw_data() const override { return is_raw_data_released() ? nullptr : raw_host_data_ptr(); }
 
         /**
          * @brief Get raw mutable pointer to data buffer
@@ -797,6 +800,7 @@ namespace llaminar2
          */
         void *raw_mutable_data() override
         {
+            if (is_raw_data_released()) return nullptr;
             invalidateGpuData(); // Host is about to be modified, GPU copy is now stale
             return raw_host_data_ptr();
         }
@@ -2540,6 +2544,7 @@ namespace llaminar2
          */
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
+            if (is_raw_data_released()) throw std::runtime_error("Floating tensor raw source was retired");
             // Calculate starting position for this block
             const size_t cols = shape_[1];
             const size_t k_start = k_block_offset * FP32_BLOCK_SIZE;
@@ -2561,6 +2566,7 @@ namespace llaminar2
 
         const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
         {
+            if (is_raw_data_released()) throw std::runtime_error("Floating tensor raw source was retired");
             // Return pointer to raw FP32 data for this block
             const size_t cols = shape_[1];
             const size_t k_start = k_block_offset * FP32_BLOCK_SIZE;
@@ -2588,7 +2594,7 @@ namespace llaminar2
             raw_data_released_ = true;
         }
 
-        bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_raw_data_released() const override { return raw_data_released_ || (parent_ && parent_->is_raw_data_released()); }
 
         void release_host_weight_data() override
         {
@@ -2748,7 +2754,7 @@ namespace llaminar2
         }
 
         /** @return True after this tensor's host-weight release transition. */
-        bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_raw_data_released() const override { return raw_data_released_ || (parent_ && parent_->is_raw_data_released()); }
 
         void release_host_weight_data() override
         {
@@ -2818,6 +2824,7 @@ namespace llaminar2
 
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
+            if (is_raw_data_released()) throw std::runtime_error("Floating tensor raw source was retired");
             // Calculate starting position for this block
             const size_t cols = shape_[1];
             const size_t k_start = k_block_offset * FP16_BLOCK_SIZE;
@@ -2842,6 +2849,7 @@ namespace llaminar2
 
         const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
         {
+            if (is_raw_data_released()) throw std::runtime_error("Floating tensor raw source was retired");
             // Return pointer to raw FP16 data for this block
             const size_t cols = shape_[1];
             const size_t k_start = k_block_offset * FP16_BLOCK_SIZE;
@@ -2861,10 +2869,12 @@ namespace llaminar2
         // FP16-specific interface
         const uint16_t *fp16_data() const
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? (parent_data_ptr_->data() + view_offset_) : host_fp16_data_.data();
         }
         uint16_t *mutable_fp16_data()
         {
+            if (is_raw_data_released()) return nullptr;
             dequant_cache_.clear();
             if (is_view_ && parent_)
             {
@@ -2992,7 +3002,7 @@ namespace llaminar2
         }
 
         /** @return True after this tensor's host-weight release transition. */
-        bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_raw_data_released() const override { return raw_data_released_ || (parent_ && parent_->is_raw_data_released()); }
 
         void release_host_weight_data() override
         {
@@ -3063,6 +3073,7 @@ namespace llaminar2
         // ITensorGemmTileDataProvider interface - for GEMM kernels to decode BF16→FP32 on-the-fly
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
+            if (is_raw_data_released()) throw std::runtime_error("Floating tensor raw source was retired");
             // BF16 tensors are NOT block-quantized - they're element-wise BF16 values
             // For compatibility with micro-kernel template, treat each row as contiguous "blocks"
             // where block_size = number of columns
@@ -3078,6 +3089,7 @@ namespace llaminar2
 
         const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
         {
+            if (is_raw_data_released()) throw std::runtime_error("Floating tensor raw source was retired");
             // Return pointer to raw BF16 data for this row
             const size_t cols = shape_[1];
             return bf16_data() + row_idx * cols;
@@ -3090,10 +3102,12 @@ namespace llaminar2
         // BF16-specific interface (deprecated - use TensorBase methods instead)
         const uint16_t *bf16_data() const
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? (parent_data_ptr_->data() + view_offset_) : host_bf16_data_.data();
         }
         uint16_t *mutable_bf16_data()
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? (parent_data_ptr_->data() + view_offset_) : host_bf16_data_.data();
         }
         void from_fp32(const float *fp32_data, size_t count);
@@ -3544,9 +3558,11 @@ namespace llaminar2
          * @brief Adopt aligned IQ4_NL blocks without copying.
          * @param shape Logical tensor dimensions.
          * @param raw_data Complete native blocks; ownership is transferred.
-         * @throws std::invalid_argument If byte count and shape disagree.
+         * @param device Original CPU allocator identity; unrelated to NUMA first-touch placement.
+         * @throws std::invalid_argument If the device is not a valid CPU or byte count and shape disagree.
          */
-        IQ4_NLTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
+        IQ4_NLTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data,
+            DeviceId device = DeviceId::cpu());
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ4_NLTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                      size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -3579,10 +3595,10 @@ namespace llaminar2
             {
                 raw_data_.clear();
                 raw_data_.shrink_to_fit();
-                raw_data_released_ = true;
             }
+            raw_data_released_ = true;
         }
-        bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_raw_data_released() const override { return raw_data_released_ || (parent_ && parent_->is_raw_data_released()); }
         bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
@@ -3616,7 +3632,8 @@ namespace llaminar2
             float *mins = nullptr) const override
         {
             const size_t blocks_per_row = (shape_[1] + IQ4_NLBlock::BLOCK_SIZE - 1) / IQ4_NLBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ4_NLBlock *blocks = reinterpret_cast<const IQ4_NLBlock *>(data_ptr);
             const size_t base_block = superblock_idx * 8;
             const IQ4_NLBlock *src = &blocks[row_idx * blocks_per_row + base_block];
@@ -3675,7 +3692,7 @@ namespace llaminar2
         size_t element_count() const { return shape_[0] * shape_[1]; }
 
         // Raw data access (raw_blocks provides access via TensorBase pattern)
-        const uint8_t *raw_blocks() const { return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data(); }
+        const uint8_t *raw_blocks() const { return static_cast<const uint8_t *>(raw_host_data_ptr()); }
         size_t raw_size() const
         {
             if (is_view_)
@@ -3702,7 +3719,8 @@ namespace llaminar2
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t blocks_per_row = (shape_[1] + IQ4_NLBlock::BLOCK_SIZE - 1) / IQ4_NLBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ4_NLBlock *blocks = reinterpret_cast<const IQ4_NLBlock *>(data_ptr);
             const size_t block_idx = row_idx * blocks_per_row + k_block_offset;
             decodeBlock(blocks[block_idx], output);
@@ -3713,7 +3731,8 @@ namespace llaminar2
         get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
         {
             const size_t blocks_per_row = (shape_[1] + IQ4_NLBlock::BLOCK_SIZE - 1) / IQ4_NLBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ4_NLBlock *blocks = reinterpret_cast<const IQ4_NLBlock *>(data_ptr);
             const size_t block_idx = row_idx * blocks_per_row + k_block_offset;
             return &blocks[block_idx];
@@ -3739,10 +3758,12 @@ namespace llaminar2
         // ===== Lazy Transfer Accessors (Phase 3) =====
         void *raw_host_data_ptr() override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         const void *raw_host_data_ptr() const override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
@@ -3810,9 +3831,11 @@ namespace llaminar2
          * @brief Adopt aligned Q8_0 blocks without copying.
          * @param shape Logical tensor dimensions.
          * @param raw_data Complete native blocks; ownership is transferred.
-         * @throws std::invalid_argument If byte count and shape disagree.
+         * @param device Original CPU allocator identity; unrelated to NUMA first-touch placement.
+         * @throws std::invalid_argument If the device is not a valid CPU or byte count and shape disagree.
          */
-        Q8_0Tensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
+        Q8_0Tensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data,
+            DeviceId device = DeviceId::cpu());
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q8_0Tensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -3844,10 +3867,10 @@ namespace llaminar2
             {
                 raw_data_.clear();
                 raw_data_.shrink_to_fit();
-                raw_data_released_ = true;
             }
+            raw_data_released_ = true;
         }
-        bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_raw_data_released() const override { return raw_data_released_ || (parent_ && parent_->is_raw_data_released()); }
         bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
@@ -3908,7 +3931,8 @@ namespace llaminar2
             float *mins = nullptr) const override
         {
             const size_t blocks_per_row = (shape_[1] + Q8_0Block::BLOCK_SIZE - 1) / Q8_0Block::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q8_0Block *blocks = reinterpret_cast<const Q8_0Block *>(data_ptr);
             const size_t base_block = superblock_idx * 8;
 
@@ -3956,7 +3980,8 @@ namespace llaminar2
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t blocks_per_row = (shape_[1] + Q8_0Block::BLOCK_SIZE - 1) / Q8_0Block::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q8_0Block *blocks = reinterpret_cast<const Q8_0Block *>(data_ptr);
             const Q8_0Block &block = blocks[row_idx * blocks_per_row + k_block_offset];
             decodeBlock(block, output);
@@ -3967,7 +3992,8 @@ namespace llaminar2
         get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
         {
             const size_t blocks_per_row = (shape_[1] + Q8_0Block::BLOCK_SIZE - 1) / Q8_0Block::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q8_0Block *blocks = reinterpret_cast<const Q8_0Block *>(data_ptr);
             return &blocks[row_idx * blocks_per_row + k_block_offset];
         }
@@ -3998,10 +4024,12 @@ namespace llaminar2
         // ===== Lazy Transfer Accessors (Phase 3) =====
         void *raw_host_data_ptr() override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         const void *raw_host_data_ptr() const override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
@@ -4122,6 +4150,27 @@ namespace llaminar2
         Q8_1Tensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> storage,
                    DeviceId device = DeviceId::cpu());
 
+        /**
+         * @brief Publish final native weights by adopting their existing CPU allocation.
+         * @param shape Complete two-dimensional logical matrix.
+         * @param storage Exact native bytes and their existing physical allocation lease.
+         * @param device Original CPU allocator identity, independent of NUMA placement.
+         * @return Immutable weight owner without copying or allocating another payload.
+         */
+        static std::unique_ptr<Q8_1Tensor> adoptImmutableCPUStorage(
+            const std::vector<size_t> &shape, AlignedVector<uint8_t> storage, DeviceId device);
+
+        /**
+         * @brief Borrow immutable native row bytes without allocating an input copy.
+         * @param shape Exact two-dimensional native window geometry.
+         * @param source Original Q8_1 blocks, live throughout the borrowing scope.
+         * @param byte_size Exact row-padded extent of the supplied source.
+         * @param owner Optional backing owner; the synchronous source visitor borrows its caller's span.
+         * @throws std::invalid_argument For null storage or inconsistent native extent.
+         */
+        Q8_1Tensor(const std::vector<size_t> &shape, const uint8_t *source,
+                   size_t byte_size, std::shared_ptr<void> owner);
+
         ~Q8_1Tensor() override;
 
         // TensorBase interface
@@ -4168,10 +4217,10 @@ namespace llaminar2
             {
                 raw_data_.clear();
                 raw_data_.shrink_to_fit();
-                raw_data_released_ = true;
             }
+            raw_data_released_ = true;
         }
-        bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_raw_data_released() const override { return raw_data_released_ || (parent_ && parent_->is_raw_data_released()); }
 
         void release_host_weight_data() override
         {
@@ -4181,6 +4230,7 @@ namespace llaminar2
                 decltype(dequant_cache_) tmp;
                 std::swap(dequant_cache_, tmp);
             }
+            source_owner_.reset();
         }
 
         // Format conversion (TensorBase interface)
@@ -4232,7 +4282,8 @@ namespace llaminar2
             float *mins = nullptr) const override
         {
             const size_t blocks_per_row = (shape_[1] + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q8_1Block *blocks = reinterpret_cast<const Q8_1Block *>(data_ptr);
             const size_t base_block = superblock_idx * 8;
 
@@ -4300,6 +4351,9 @@ namespace llaminar2
         // View support (row-slice only - preserves K dimension)
         bool is_view() const override { return is_view_; }
 
+        /** @return Whether a supplied external backing owner is retained by this source view. */
+        bool is_mmap_data() const override { return source_owner_ != nullptr; }
+
         /**
          * @brief Check if tensor is mutable (activation buffer with FP32 cache)
          * @return true if tensor was created as mutable activation buffer
@@ -4354,7 +4408,8 @@ namespace llaminar2
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t blocks_per_row = (shape_[1] + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q8_1Block *blocks = reinterpret_cast<const Q8_1Block *>(data_ptr);
             const Q8_1Block &block = blocks[row_idx * blocks_per_row + k_block_offset];
             decodeBlock(block, output);
@@ -4365,7 +4420,8 @@ namespace llaminar2
         get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
         {
             const size_t blocks_per_row = (shape_[1] + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q8_1Block *blocks = reinterpret_cast<const Q8_1Block *>(data_ptr);
             return &blocks[row_idx * blocks_per_row + k_block_offset];
         }
@@ -4384,7 +4440,8 @@ namespace llaminar2
          */
         const Q8_1Block *q8_1_blocks() const
         {
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             return reinterpret_cast<const Q8_1Block *>(data_ptr);
         }
 
@@ -4395,6 +4452,8 @@ namespace llaminar2
          */
         Q8_1Block *mutable_q8_1_blocks()
         {
+            if (!is_mutable_)
+                throw std::logic_error("Immutable Q8_1 weights cannot publish mutable activation blocks");
             // Invalidate dequant cache since blocks are being modified
             dequant_cache_.clear();
 
@@ -4409,9 +4468,8 @@ namespace llaminar2
                 }
             }
 
-            uint8_t *data_ptr = is_view_
-                                    ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_)
-                                    : raw_data_.data();
+            auto *data_ptr = static_cast<uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             return reinterpret_cast<Q8_1Block *>(data_ptr);
         }
 
@@ -4499,10 +4557,12 @@ namespace llaminar2
         // ===== Lazy Transfer Accessors (Phase 3) =====
         void *raw_host_data_ptr() override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         const void *raw_host_data_ptr() const override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         /** @return Native row-padded activation extent for a borrowed row view. */
@@ -4531,6 +4591,7 @@ namespace llaminar2
         bool raw_data_released_ = false;   // Track if raw data was released after GEMM pack
         bool is_mutable_ = false;          // True if constructed as mutable activation buffer
         mutable bool cache_dirty_ = false; // True if dequant_cache_ has uncommitted writes
+        std::shared_ptr<void> source_owner_; ///< Optional real owner for immutable borrowed native bytes.
 
         // Private view constructor
         Q8_1Tensor(const std::vector<size_t> &shape,
@@ -4677,7 +4738,7 @@ namespace llaminar2
 
         // Memory management
         void release_raw_data() override;
-        bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_raw_data_released() const override { return raw_data_released_ || (parent_ && parent_->is_raw_data_released()); }
 
         void release_host_weight_data() override
         {
@@ -4793,7 +4854,8 @@ namespace llaminar2
         {
             if (block_size_ != Q16BlockSize::BLOCK_32)
                 return nullptr;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             return reinterpret_cast<const Q16_1Block *>(data_ptr);
         }
         Q16_1Block *mutable_as_block_32()
@@ -4801,9 +4863,8 @@ namespace llaminar2
             if (block_size_ != Q16BlockSize::BLOCK_32)
                 return nullptr;
             clear_dequant_cache_and_parent();
-            uint8_t *data_ptr = is_view_
-                                    ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_)
-                                    : raw_data_.data();
+            auto *data_ptr = static_cast<uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             return reinterpret_cast<Q16_1Block *>(data_ptr);
         }
 
@@ -4812,7 +4873,8 @@ namespace llaminar2
         {
             if (block_size_ != Q16BlockSize::BLOCK_64)
                 return nullptr;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             return reinterpret_cast<const Q16_1Block_64 *>(data_ptr);
         }
         Q16_1Block_64 *mutable_as_block_64()
@@ -4820,9 +4882,8 @@ namespace llaminar2
             if (block_size_ != Q16BlockSize::BLOCK_64)
                 return nullptr;
             clear_dequant_cache_and_parent();
-            uint8_t *data_ptr = is_view_
-                                    ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_)
-                                    : raw_data_.data();
+            auto *data_ptr = static_cast<uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             return reinterpret_cast<Q16_1Block_64 *>(data_ptr);
         }
 
@@ -4831,7 +4892,8 @@ namespace llaminar2
         {
             if (block_size_ != Q16BlockSize::BLOCK_128)
                 return nullptr;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             return reinterpret_cast<const Q16_1Block_128 *>(data_ptr);
         }
         Q16_1Block_128 *mutable_as_block_128()
@@ -4839,9 +4901,8 @@ namespace llaminar2
             if (block_size_ != Q16BlockSize::BLOCK_128)
                 return nullptr;
             clear_dequant_cache_and_parent();
-            uint8_t *data_ptr = is_view_
-                                    ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_)
-                                    : raw_data_.data();
+            auto *data_ptr = static_cast<uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             return reinterpret_cast<Q16_1Block_128 *>(data_ptr);
         }
 
@@ -4918,7 +4979,8 @@ namespace llaminar2
                 LOG_ERROR("[Q16_1Tensor] Use as_block_64() or as_block_128() for this tensor");
             }
 #endif
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             return reinterpret_cast<const Q16_1Block *>(data_ptr);
         }
 
@@ -4935,9 +4997,8 @@ namespace llaminar2
             }
 #endif
             clear_dequant_cache_and_parent();
-            uint8_t *data_ptr = is_view_
-                                    ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_)
-                                    : raw_data_.data();
+            auto *data_ptr = static_cast<uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             return reinterpret_cast<Q16_1Block *>(data_ptr);
         }
 
@@ -4984,10 +5045,12 @@ namespace llaminar2
     protected:
         void *raw_host_data_ptr() override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         const void *raw_host_data_ptr() const override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         size_t byte_size() const override { return raw_data_.size(); }
@@ -5102,9 +5165,11 @@ namespace llaminar2
          * @brief Adopt aligned Q4_0 blocks without copying.
          * @param shape Logical tensor dimensions.
          * @param raw_data Complete native blocks; ownership is transferred.
-         * @throws std::invalid_argument If byte count and shape disagree.
+         * @param device Original CPU allocator identity; unrelated to NUMA first-touch placement.
+         * @throws std::invalid_argument If the device is not a valid CPU or byte count and shape disagree.
          */
-        Q4_0Tensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
+        Q4_0Tensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data,
+            DeviceId device = DeviceId::cpu());
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q4_0Tensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -5136,10 +5201,12 @@ namespace llaminar2
             {
                 raw_data_.clear();
                 raw_data_.shrink_to_fit();
-                raw_data_released_ = true;
             }
+            raw_data_released_ = true;
         }
-        bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_raw_data_released() const override { return raw_data_released_ || (parent_ && parent_->is_raw_data_released()); }
+        /** @return True for borrowed native rows; only an owning root can become final prepared storage. */
+        bool is_view() const override { return is_view_; }
         bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
@@ -5193,7 +5260,8 @@ namespace llaminar2
             float *mins = nullptr) const override
         {
             const size_t blocks_per_row = (shape_[1] + Q4_0Block::BLOCK_SIZE - 1) / Q4_0Block::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q4_0Block *blocks = reinterpret_cast<const Q4_0Block *>(data_ptr);
             const size_t base_block = superblock_idx * 8;
             const Q4_0Block *src = &blocks[row_idx * blocks_per_row + base_block];
@@ -5228,7 +5296,8 @@ namespace llaminar2
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t blocks_per_row = (shape_[1] + Q4_0Block::BLOCK_SIZE - 1) / Q4_0Block::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q4_0Block *blocks = reinterpret_cast<const Q4_0Block *>(data_ptr);
             decodeBlock(blocks[row_idx * blocks_per_row + k_block_offset], output);
         }
@@ -5238,7 +5307,8 @@ namespace llaminar2
         get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
         {
             const size_t blocks_per_row = (shape_[1] + Q4_0Block::BLOCK_SIZE - 1) / Q4_0Block::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q4_0Block *blocks = reinterpret_cast<const Q4_0Block *>(data_ptr);
             return &blocks[row_idx * blocks_per_row + k_block_offset];
         }
@@ -5263,10 +5333,12 @@ namespace llaminar2
         // ===== Lazy Transfer Accessors (Phase 3) =====
         void *raw_host_data_ptr() override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         const void *raw_host_data_ptr() const override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
@@ -5332,9 +5404,11 @@ namespace llaminar2
          * @brief Adopt aligned Q4_1 blocks without copying.
          * @param shape Logical tensor dimensions.
          * @param raw_data Complete native blocks; ownership is transferred.
-         * @throws std::invalid_argument If byte count and shape disagree.
+         * @param device Original CPU allocator identity; unrelated to NUMA first-touch placement.
+         * @throws std::invalid_argument If the device is not a valid CPU or byte count and shape disagree.
          */
-        Q4_1Tensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
+        Q4_1Tensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data,
+            DeviceId device = DeviceId::cpu());
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q4_1Tensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -5366,10 +5440,12 @@ namespace llaminar2
             {
                 raw_data_.clear();
                 raw_data_.shrink_to_fit();
-                raw_data_released_ = true;
             }
+            raw_data_released_ = true;
         }
-        bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_raw_data_released() const override { return raw_data_released_ || (parent_ && parent_->is_raw_data_released()); }
+        /** @return True for borrowed native rows; only an owning root can become final prepared storage. */
+        bool is_view() const override { return is_view_; }
         bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
@@ -5427,7 +5503,8 @@ namespace llaminar2
             float *mins = nullptr) const override
         {
             const size_t blocks_per_row = (shape_[1] + Q4_1Block::BLOCK_SIZE - 1) / Q4_1Block::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q4_1Block *blocks = reinterpret_cast<const Q4_1Block *>(data_ptr);
             const size_t base_block = superblock_idx * 8;
             const Q4_1Block *src = &blocks[row_idx * blocks_per_row + base_block];
@@ -5462,7 +5539,8 @@ namespace llaminar2
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t blocks_per_row = (shape_[1] + Q4_1Block::BLOCK_SIZE - 1) / Q4_1Block::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q4_1Block *blocks = reinterpret_cast<const Q4_1Block *>(data_ptr);
             decodeBlock(blocks[row_idx * blocks_per_row + k_block_offset], output);
         }
@@ -5472,7 +5550,8 @@ namespace llaminar2
         get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
         {
             const size_t blocks_per_row = (shape_[1] + Q4_1Block::BLOCK_SIZE - 1) / Q4_1Block::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q4_1Block *blocks = reinterpret_cast<const Q4_1Block *>(data_ptr);
             return &blocks[row_idx * blocks_per_row + k_block_offset];
         }
@@ -5497,10 +5576,12 @@ namespace llaminar2
         // ===== Lazy Transfer Accessors (Phase 3) =====
         void *raw_host_data_ptr() override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         const void *raw_host_data_ptr() const override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
@@ -5565,9 +5646,11 @@ namespace llaminar2
          * @brief Adopt aligned Q5_0 blocks without copying.
          * @param shape Logical tensor dimensions.
          * @param raw_data Complete native blocks; ownership is transferred.
-         * @throws std::invalid_argument If byte count and shape disagree.
+         * @param device Original CPU allocator identity; unrelated to NUMA first-touch placement.
+         * @throws std::invalid_argument If the device is not a valid CPU or byte count and shape disagree.
          */
-        Q5_0Tensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
+        Q5_0Tensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data,
+            DeviceId device = DeviceId::cpu());
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q5_0Tensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -5598,10 +5681,12 @@ namespace llaminar2
             {
                 raw_data_.clear();
                 raw_data_.shrink_to_fit();
-                raw_data_released_ = true;
             }
+            raw_data_released_ = true;
         }
-        bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_raw_data_released() const override { return raw_data_released_ || (parent_ && parent_->is_raw_data_released()); }
+        /** @return True for borrowed native rows; only an owning root can become final prepared storage. */
+        bool is_view() const override { return is_view_; }
         bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
@@ -5647,7 +5732,8 @@ namespace llaminar2
             float *mins = nullptr) const override
         {
             const size_t blocks_per_row = (shape_[1] + Q5_0Block::BLOCK_SIZE - 1) / Q5_0Block::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q5_0Block *blocks = reinterpret_cast<const Q5_0Block *>(data_ptr);
             const size_t base_block = superblock_idx * 8;
             const Q5_0Block *src = &blocks[row_idx * blocks_per_row + base_block];
@@ -5685,7 +5771,8 @@ namespace llaminar2
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t blocks_per_row = (shape_[1] + Q5_0Block::BLOCK_SIZE - 1) / Q5_0Block::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q5_0Block *blocks = reinterpret_cast<const Q5_0Block *>(data_ptr);
             decodeBlock(blocks[row_idx * blocks_per_row + k_block_offset], output);
         }
@@ -5695,7 +5782,8 @@ namespace llaminar2
         get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
         {
             const size_t blocks_per_row = (shape_[1] + Q5_0Block::BLOCK_SIZE - 1) / Q5_0Block::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q5_0Block *blocks = reinterpret_cast<const Q5_0Block *>(data_ptr);
             return &blocks[row_idx * blocks_per_row + k_block_offset];
         }
@@ -5720,10 +5808,12 @@ namespace llaminar2
         // ===== Lazy Transfer Accessors (Phase 3) =====
         void *raw_host_data_ptr() override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         const void *raw_host_data_ptr() const override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
@@ -5788,9 +5878,11 @@ namespace llaminar2
          * @brief Adopt aligned Q5_1 blocks without copying.
          * @param shape Logical tensor dimensions.
          * @param raw_data Complete native blocks; ownership is transferred.
-         * @throws std::invalid_argument If byte count and shape disagree.
+         * @param device Original CPU allocator identity; unrelated to NUMA first-touch placement.
+         * @throws std::invalid_argument If the device is not a valid CPU or byte count and shape disagree.
          */
-        Q5_1Tensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
+        Q5_1Tensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data,
+            DeviceId device = DeviceId::cpu());
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q5_1Tensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -5821,10 +5913,12 @@ namespace llaminar2
             {
                 raw_data_.clear();
                 raw_data_.shrink_to_fit();
-                raw_data_released_ = true;
             }
+            raw_data_released_ = true;
         }
-        bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_raw_data_released() const override { return raw_data_released_ || (parent_ && parent_->is_raw_data_released()); }
+        /** @return True for borrowed native rows; only an owning root can become final prepared storage. */
+        bool is_view() const override { return is_view_; }
         bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
@@ -5870,7 +5964,8 @@ namespace llaminar2
             float *mins = nullptr) const override
         {
             const size_t blocks_per_row = (shape_[1] + Q5_1Block::BLOCK_SIZE - 1) / Q5_1Block::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q5_1Block *blocks = reinterpret_cast<const Q5_1Block *>(data_ptr);
             const size_t base_block = superblock_idx * 8;
             const Q5_1Block *src = &blocks[row_idx * blocks_per_row + base_block];
@@ -5908,7 +6003,8 @@ namespace llaminar2
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t blocks_per_row = (shape_[1] + Q5_1Block::BLOCK_SIZE - 1) / Q5_1Block::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q5_1Block *blocks = reinterpret_cast<const Q5_1Block *>(data_ptr);
             decodeBlock(blocks[row_idx * blocks_per_row + k_block_offset], output);
         }
@@ -5918,7 +6014,8 @@ namespace llaminar2
         get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
         {
             const size_t blocks_per_row = (shape_[1] + Q5_1Block::BLOCK_SIZE - 1) / Q5_1Block::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q5_1Block *blocks = reinterpret_cast<const Q5_1Block *>(data_ptr);
             return &blocks[row_idx * blocks_per_row + k_block_offset];
         }
@@ -5943,10 +6040,12 @@ namespace llaminar2
         // ===== Lazy Transfer Accessors (Phase 3) =====
         void *raw_host_data_ptr() override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         const void *raw_host_data_ptr() const override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
@@ -6007,9 +6106,11 @@ namespace llaminar2
          * @brief Adopt aligned Q6_K blocks without copying.
          * @param shape Logical tensor dimensions.
          * @param raw_data Complete native blocks; ownership is transferred.
-         * @throws std::invalid_argument If byte count and shape disagree.
+         * @param device Original CPU allocator identity; unrelated to NUMA first-touch placement.
+         * @throws std::invalid_argument If the device is not a valid CPU or byte count and shape disagree.
          */
-        Q6_KTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
+        Q6_KTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data,
+            DeviceId device = DeviceId::cpu());
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q6_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -6040,10 +6141,12 @@ namespace llaminar2
             {
                 raw_data_.clear();
                 raw_data_.shrink_to_fit();
-                raw_data_released_ = true;
             }
+            raw_data_released_ = true;
         }
-        bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_raw_data_released() const override { return raw_data_released_ || (parent_ && parent_->is_raw_data_released()); }
+        /** @return True for borrowed native rows; only an owning root can become final prepared storage. */
+        bool is_view() const override { return is_view_; }
         bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
@@ -6089,7 +6192,8 @@ namespace llaminar2
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t blocks_per_row = (shape_[1] + Q6_KBlock::BLOCK_SIZE - 1) / Q6_KBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q6_KBlock *blocks = reinterpret_cast<const Q6_KBlock *>(data_ptr);
             decodeBlock(blocks[row_idx * blocks_per_row + k_block_offset], output);
         }
@@ -6099,7 +6203,8 @@ namespace llaminar2
         get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
         {
             const size_t blocks_per_row = (shape_[1] + Q6_KBlock::BLOCK_SIZE - 1) / Q6_KBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q6_KBlock *blocks = reinterpret_cast<const Q6_KBlock *>(data_ptr);
             return &blocks[row_idx * blocks_per_row + k_block_offset];
         }
@@ -6127,10 +6232,12 @@ namespace llaminar2
         // ===== Lazy Transfer Accessors (Phase 3) =====
         void *raw_host_data_ptr() override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         const void *raw_host_data_ptr() const override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
@@ -6189,9 +6296,11 @@ namespace llaminar2
          * @brief Adopt aligned Q2_K blocks without copying.
          * @param shape Logical tensor dimensions.
          * @param raw_data Complete native blocks; ownership is transferred.
-         * @throws std::invalid_argument If byte count and shape disagree.
+         * @param device Original CPU allocator identity; unrelated to NUMA first-touch placement.
+         * @throws std::invalid_argument If the device is not a valid CPU or byte count and shape disagree.
          */
-        Q2_KTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
+        Q2_KTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data,
+            DeviceId device = DeviceId::cpu());
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q2_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -6222,10 +6331,12 @@ namespace llaminar2
             {
                 raw_data_.clear();
                 raw_data_.shrink_to_fit();
-                raw_data_released_ = true;
             }
+            raw_data_released_ = true;
         }
-        bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_raw_data_released() const override { return raw_data_released_ || (parent_ && parent_->is_raw_data_released()); }
+        /** @return True for borrowed native rows; only an owning root can become final prepared storage. */
+        bool is_view() const override { return is_view_; }
         bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
@@ -6274,7 +6385,8 @@ namespace llaminar2
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t blocks_per_row = (shape_[1] + Q2_KBlock::BLOCK_SIZE - 1) / Q2_KBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q2_KBlock *blocks = reinterpret_cast<const Q2_KBlock *>(data_ptr);
             decodeBlock(blocks[row_idx * blocks_per_row + k_block_offset], output);
         }
@@ -6284,7 +6396,8 @@ namespace llaminar2
         get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
         {
             const size_t blocks_per_row = (shape_[1] + Q2_KBlock::BLOCK_SIZE - 1) / Q2_KBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q2_KBlock *blocks = reinterpret_cast<const Q2_KBlock *>(data_ptr);
             return &blocks[row_idx * blocks_per_row + k_block_offset];
         }
@@ -6308,10 +6421,12 @@ namespace llaminar2
         // ===== Lazy Transfer Accessors (Phase 3) =====
         void *raw_host_data_ptr() override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         const void *raw_host_data_ptr() const override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
@@ -6372,9 +6487,11 @@ namespace llaminar2
          * @brief Adopt aligned Q5_K blocks without copying.
          * @param shape Logical tensor dimensions.
          * @param raw_data Complete native blocks; ownership is transferred.
-         * @throws std::invalid_argument If byte count and shape disagree.
+         * @param device Original CPU allocator identity; unrelated to NUMA first-touch placement.
+         * @throws std::invalid_argument If the device is not a valid CPU or byte count and shape disagree.
          */
-        Q5_KTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
+        Q5_KTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data,
+            DeviceId device = DeviceId::cpu());
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q5_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -6417,10 +6534,12 @@ namespace llaminar2
             {
                 raw_data_.clear();
                 raw_data_.shrink_to_fit();
-                raw_data_released_ = true;
             }
+            raw_data_released_ = true;
         }
-        bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_raw_data_released() const override { return raw_data_released_ || (parent_ && parent_->is_raw_data_released()); }
+        /** @return True for borrowed native rows; only an owning root can become final prepared storage. */
+        bool is_view() const override { return is_view_; }
         bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
@@ -6459,7 +6578,8 @@ namespace llaminar2
         {
             const size_t blocks_per_row = (shape_[1] + Q5_KBlock::BLOCK_SIZE - 1) / Q5_KBlock::BLOCK_SIZE;
             // Use view-aware data pointer
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q5_KBlock *blocks = reinterpret_cast<const Q5_KBlock *>(data_ptr);
             const Q5_KBlock &block = blocks[row_idx * blocks_per_row + k_block_offset];
             decodeBlock(block, output);
@@ -6471,7 +6591,8 @@ namespace llaminar2
         {
             const size_t blocks_per_row = (shape_[1] + Q5_KBlock::BLOCK_SIZE - 1) / Q5_KBlock::BLOCK_SIZE;
             // Use view-aware data pointer
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q5_KBlock *blocks = reinterpret_cast<const Q5_KBlock *>(data_ptr);
             return &blocks[row_idx * blocks_per_row + k_block_offset];
         }
@@ -6494,10 +6615,12 @@ namespace llaminar2
         // ===== Lazy Transfer Accessors (Phase 3) =====
         void *raw_host_data_ptr() override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         const void *raw_host_data_ptr() const override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
@@ -6558,9 +6681,11 @@ namespace llaminar2
          * @brief Adopt aligned Q3_K blocks without copying.
          * @param shape Logical tensor dimensions.
          * @param raw_data Complete native blocks; ownership is transferred.
-         * @throws std::invalid_argument If byte count and shape disagree.
+         * @param device Original CPU allocator identity; unrelated to NUMA first-touch placement.
+         * @throws std::invalid_argument If the device is not a valid CPU or byte count and shape disagree.
          */
-        Q3_KTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
+        Q3_KTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data,
+            DeviceId device = DeviceId::cpu());
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q3_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -6591,10 +6716,12 @@ namespace llaminar2
             {
                 raw_data_.clear();
                 raw_data_.shrink_to_fit();
-                raw_data_released_ = true;
             }
+            raw_data_released_ = true;
         }
-        bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_raw_data_released() const override { return raw_data_released_ || (parent_ && parent_->is_raw_data_released()); }
+        /** @return True for borrowed native rows; only an owning root can become final prepared storage. */
+        bool is_view() const override { return is_view_; }
         bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
@@ -6643,7 +6770,8 @@ namespace llaminar2
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t blocks_per_row = (shape_[1] + Q3_KBlock::BLOCK_SIZE - 1) / Q3_KBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q3_KBlock *blocks = reinterpret_cast<const Q3_KBlock *>(data_ptr);
             decodeBlock(blocks[row_idx * blocks_per_row + k_block_offset], output);
         }
@@ -6653,7 +6781,8 @@ namespace llaminar2
         get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
         {
             const size_t blocks_per_row = (shape_[1] + Q3_KBlock::BLOCK_SIZE - 1) / Q3_KBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q3_KBlock *blocks = reinterpret_cast<const Q3_KBlock *>(data_ptr);
             return &blocks[row_idx * blocks_per_row + k_block_offset];
         }
@@ -6678,10 +6807,12 @@ namespace llaminar2
         // ===== Lazy Transfer Accessors (Phase 3) =====
         void *raw_host_data_ptr() override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         const void *raw_host_data_ptr() const override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
@@ -6740,9 +6871,11 @@ namespace llaminar2
          * @brief Adopt aligned Q4_K blocks without copying.
          * @param shape Logical tensor dimensions.
          * @param raw_data Complete native blocks; ownership is transferred.
-         * @throws std::invalid_argument If byte count and shape disagree.
+         * @param device Original CPU allocator identity; unrelated to NUMA first-touch placement.
+         * @throws std::invalid_argument If the device is not a valid CPU or byte count and shape disagree.
          */
-        Q4_KTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
+        Q4_KTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data,
+            DeviceId device = DeviceId::cpu());
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q4_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -6773,10 +6906,12 @@ namespace llaminar2
             {
                 raw_data_.clear();
                 raw_data_.shrink_to_fit();
-                raw_data_released_ = true;
             }
+            raw_data_released_ = true;
         }
-        bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_raw_data_released() const override { return raw_data_released_ || (parent_ && parent_->is_raw_data_released()); }
+        /** @return True for borrowed native rows; only an owning root can become final prepared storage. */
+        bool is_view() const override { return is_view_; }
         bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
@@ -6827,7 +6962,8 @@ namespace llaminar2
         {
             const size_t blocks_per_row = (shape_[1] + Q4_KBlock::BLOCK_SIZE - 1) / Q4_KBlock::BLOCK_SIZE;
             // Use view-aware data pointer
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q4_KBlock *blocks = reinterpret_cast<const Q4_KBlock *>(data_ptr);
             const Q4_KBlock &block = blocks[row_idx * blocks_per_row + k_block_offset];
             decodeBlock(block, output);
@@ -6839,7 +6975,8 @@ namespace llaminar2
         {
             const size_t blocks_per_row = (shape_[1] + Q4_KBlock::BLOCK_SIZE - 1) / Q4_KBlock::BLOCK_SIZE;
             // Use view-aware data pointer
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q4_KBlock *blocks = reinterpret_cast<const Q4_KBlock *>(data_ptr);
             return &blocks[row_idx * blocks_per_row + k_block_offset];
         }
@@ -6862,10 +6999,12 @@ namespace llaminar2
         // ===== Lazy Transfer Accessors (Phase 3) =====
         void *raw_host_data_ptr() override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         const void *raw_host_data_ptr() const override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
@@ -6926,9 +7065,11 @@ namespace llaminar2
          * @brief Adopt aligned Q8_K blocks without copying.
          * @param shape Logical tensor dimensions.
          * @param raw_data Complete native blocks; ownership is transferred.
-         * @throws std::invalid_argument If byte count and shape disagree.
+         * @param device Original CPU allocator identity; unrelated to NUMA first-touch placement.
+         * @throws std::invalid_argument If the device is not a valid CPU or byte count and shape disagree.
          */
-        Q8_KTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
+        Q8_KTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data,
+            DeviceId device = DeviceId::cpu());
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q8_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -6959,10 +7100,12 @@ namespace llaminar2
             {
                 raw_data_.clear();
                 raw_data_.shrink_to_fit();
-                raw_data_released_ = true;
             }
+            raw_data_released_ = true;
         }
-        bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_raw_data_released() const override { return raw_data_released_ || (parent_ && parent_->is_raw_data_released()); }
+        /** @return True for borrowed native rows; only an owning root can become final prepared storage. */
+        bool is_view() const override { return is_view_; }
         bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
@@ -7055,7 +7198,8 @@ namespace llaminar2
         {
             const size_t blocks_per_row = (shape_[1] + Q8_KBlock::BLOCK_SIZE - 1) / Q8_KBlock::BLOCK_SIZE;
             // Use view-aware data pointer
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q8_KBlock *blocks = reinterpret_cast<const Q8_KBlock *>(data_ptr);
             const Q8_KBlock &block = blocks[row_idx * blocks_per_row + k_block_offset];
             decodeBlock(block, output);
@@ -7067,7 +7211,8 @@ namespace llaminar2
         {
             const size_t blocks_per_row = (shape_[1] + Q8_KBlock::BLOCK_SIZE - 1) / Q8_KBlock::BLOCK_SIZE;
             // Use view-aware data pointer
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const Q8_KBlock *blocks = reinterpret_cast<const Q8_KBlock *>(data_ptr);
             return &blocks[row_idx * blocks_per_row + k_block_offset];
         }
@@ -7090,10 +7235,12 @@ namespace llaminar2
         // ===== Lazy Transfer Accessors (Phase 3) =====
         void *raw_host_data_ptr() override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         const void *raw_host_data_ptr() const override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
@@ -7154,9 +7301,11 @@ namespace llaminar2
          * @brief Adopt aligned IQ4_XS blocks without copying.
          * @param shape Logical tensor dimensions.
          * @param raw_data Complete native blocks; ownership is transferred.
-         * @throws std::invalid_argument If byte count and shape disagree.
+         * @param device Original CPU allocator identity; unrelated to NUMA first-touch placement.
+         * @throws std::invalid_argument If the device is not a valid CPU or byte count and shape disagree.
          */
-        IQ4_XSTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
+        IQ4_XSTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data,
+            DeviceId device = DeviceId::cpu());
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ4_XSTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                      size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -7187,10 +7336,10 @@ namespace llaminar2
             {
                 raw_data_.clear();
                 raw_data_.shrink_to_fit();
-                raw_data_released_ = true;
             }
+            raw_data_released_ = true;
         }
-        bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_raw_data_released() const override { return raw_data_released_ || (parent_ && parent_->is_raw_data_released()); }
         bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
@@ -7228,7 +7377,8 @@ namespace llaminar2
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t super_blocks_per_row = (shape_[1] + IQ4_XSBlock::BLOCK_SIZE - 1) / IQ4_XSBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ4_XSBlock *blocks = reinterpret_cast<const IQ4_XSBlock *>(data_ptr);
 
             const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
@@ -7249,7 +7399,8 @@ namespace llaminar2
         get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
         {
             const size_t super_blocks_per_row = (shape_[1] + IQ4_XSBlock::BLOCK_SIZE - 1) / IQ4_XSBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ4_XSBlock *blocks = reinterpret_cast<const IQ4_XSBlock *>(data_ptr);
 
             const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
@@ -7265,7 +7416,8 @@ namespace llaminar2
         __attribute__((always_inline)) void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override
         {
             const size_t super_blocks_per_row = (shape_[1] + IQ4_XSBlock::BLOCK_SIZE - 1) / IQ4_XSBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ4_XSBlock *blocks = reinterpret_cast<const IQ4_XSBlock *>(data_ptr);
 
             const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
@@ -7277,7 +7429,8 @@ namespace llaminar2
         __attribute__((always_inline)) float get_block_scale(size_t row_idx, size_t k_block_offset) const override
         {
             const size_t super_blocks_per_row = (shape_[1] + IQ4_XSBlock::BLOCK_SIZE - 1) / IQ4_XSBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ4_XSBlock *blocks = reinterpret_cast<const IQ4_XSBlock *>(data_ptr);
 
             const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
@@ -7308,10 +7461,12 @@ namespace llaminar2
         // ===== Lazy Transfer Accessors (Phase 3) =====
         void *raw_host_data_ptr() override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         const void *raw_host_data_ptr() const override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
@@ -7367,9 +7522,11 @@ namespace llaminar2
          * @brief Adopt aligned IQ2_XXS blocks without copying.
          * @param shape Logical tensor dimensions.
          * @param raw_data Complete native blocks; ownership is transferred.
-         * @throws std::invalid_argument If byte count and shape disagree.
+         * @param device Original CPU allocator identity; unrelated to NUMA first-touch placement.
+         * @throws std::invalid_argument If the device is not a valid CPU or byte count and shape disagree.
          */
-        IQ2_XXSTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
+        IQ2_XXSTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data,
+            DeviceId device = DeviceId::cpu());
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ2_XXSTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                       size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -7400,10 +7557,10 @@ namespace llaminar2
             {
                 raw_data_.clear();
                 raw_data_.shrink_to_fit();
-                raw_data_released_ = true;
             }
+            raw_data_released_ = true;
         }
-        bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_raw_data_released() const override { return raw_data_released_ || (parent_ && parent_->is_raw_data_released()); }
         bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
@@ -7441,7 +7598,8 @@ namespace llaminar2
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t blocks_per_row = (shape_[1] + IQ2_XXSBlock::BLOCK_SIZE - 1) / IQ2_XXSBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ2_XXSBlock *blocks = reinterpret_cast<const IQ2_XXSBlock *>(data_ptr);
             const size_t block_idx = row_idx * blocks_per_row + k_block_offset;
             decodeBlock(blocks[block_idx], output);
@@ -7452,7 +7610,8 @@ namespace llaminar2
         get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
         {
             const size_t blocks_per_row = (shape_[1] + IQ2_XXSBlock::BLOCK_SIZE - 1) / IQ2_XXSBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ2_XXSBlock *blocks = reinterpret_cast<const IQ2_XXSBlock *>(data_ptr);
             const size_t block_idx = row_idx * blocks_per_row + k_block_offset;
             return &blocks[block_idx];
@@ -7462,7 +7621,8 @@ namespace llaminar2
         __attribute__((always_inline)) void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override
         {
             const size_t super_blocks_per_row = (shape_[1] + IQ2_XXSBlock::BLOCK_SIZE - 1) / IQ2_XXSBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ2_XXSBlock *blocks = reinterpret_cast<const IQ2_XXSBlock *>(data_ptr);
 
             const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
@@ -7474,7 +7634,8 @@ namespace llaminar2
         __attribute__((always_inline)) float get_block_scale(size_t row_idx, size_t k_block_offset) const override
         {
             const size_t super_blocks_per_row = (shape_[1] + IQ2_XXSBlock::BLOCK_SIZE - 1) / IQ2_XXSBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ2_XXSBlock *blocks = reinterpret_cast<const IQ2_XXSBlock *>(data_ptr);
 
             const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
@@ -7509,10 +7670,12 @@ namespace llaminar2
         // ===== Lazy Transfer Accessors (Phase 3) =====
         void *raw_host_data_ptr() override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         const void *raw_host_data_ptr() const override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
@@ -7568,9 +7731,11 @@ namespace llaminar2
          * @brief Adopt aligned IQ2_XS blocks without copying.
          * @param shape Logical tensor dimensions.
          * @param raw_data Complete native blocks; ownership is transferred.
-         * @throws std::invalid_argument If byte count and shape disagree.
+         * @param device Original CPU allocator identity; unrelated to NUMA first-touch placement.
+         * @throws std::invalid_argument If the device is not a valid CPU or byte count and shape disagree.
          */
-        IQ2_XSTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
+        IQ2_XSTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data,
+            DeviceId device = DeviceId::cpu());
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ2_XSTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                      size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -7601,10 +7766,10 @@ namespace llaminar2
             {
                 raw_data_.clear();
                 raw_data_.shrink_to_fit();
-                raw_data_released_ = true;
             }
+            raw_data_released_ = true;
         }
-        bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_raw_data_released() const override { return raw_data_released_ || (parent_ && parent_->is_raw_data_released()); }
         bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
@@ -7642,7 +7807,8 @@ namespace llaminar2
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t blocks_per_row = (shape_[1] + IQ2_XSBlock::BLOCK_SIZE - 1) / IQ2_XSBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ2_XSBlock *blocks = reinterpret_cast<const IQ2_XSBlock *>(data_ptr);
             const size_t block_idx = row_idx * blocks_per_row + k_block_offset;
             decodeBlock(blocks[block_idx], output);
@@ -7653,7 +7819,8 @@ namespace llaminar2
         get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
         {
             const size_t blocks_per_row = (shape_[1] + IQ2_XSBlock::BLOCK_SIZE - 1) / IQ2_XSBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ2_XSBlock *blocks = reinterpret_cast<const IQ2_XSBlock *>(data_ptr);
             const size_t block_idx = row_idx * blocks_per_row + k_block_offset;
             return &blocks[block_idx];
@@ -7663,7 +7830,8 @@ namespace llaminar2
         __attribute__((always_inline)) void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override
         {
             const size_t super_blocks_per_row = (shape_[1] + IQ2_XSBlock::BLOCK_SIZE - 1) / IQ2_XSBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ2_XSBlock *blocks = reinterpret_cast<const IQ2_XSBlock *>(data_ptr);
 
             const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
@@ -7675,7 +7843,8 @@ namespace llaminar2
         __attribute__((always_inline)) float get_block_scale(size_t row_idx, size_t k_block_offset) const override
         {
             const size_t super_blocks_per_row = (shape_[1] + IQ2_XSBlock::BLOCK_SIZE - 1) / IQ2_XSBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ2_XSBlock *blocks = reinterpret_cast<const IQ2_XSBlock *>(data_ptr);
 
             const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
@@ -7710,10 +7879,12 @@ namespace llaminar2
         // ===== Lazy Transfer Accessors (Phase 3) =====
         void *raw_host_data_ptr() override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         const void *raw_host_data_ptr() const override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
@@ -7769,9 +7940,11 @@ namespace llaminar2
          * @brief Adopt aligned IQ3_XXS blocks without copying.
          * @param shape Logical tensor dimensions.
          * @param raw_data Complete native blocks; ownership is transferred.
-         * @throws std::invalid_argument If byte count and shape disagree.
+         * @param device Original CPU allocator identity; unrelated to NUMA first-touch placement.
+         * @throws std::invalid_argument If the device is not a valid CPU or byte count and shape disagree.
          */
-        IQ3_XXSTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
+        IQ3_XXSTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data,
+            DeviceId device = DeviceId::cpu());
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ3_XXSTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                       size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -7802,10 +7975,10 @@ namespace llaminar2
             {
                 raw_data_.clear();
                 raw_data_.shrink_to_fit();
-                raw_data_released_ = true;
             }
+            raw_data_released_ = true;
         }
-        bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_raw_data_released() const override { return raw_data_released_ || (parent_ && parent_->is_raw_data_released()); }
         bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
@@ -7843,7 +8016,8 @@ namespace llaminar2
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t super_blocks_per_row = (shape_[1] + IQ3_XXSBlock::BLOCK_SIZE - 1) / IQ3_XXSBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ3_XXSBlock *blocks = reinterpret_cast<const IQ3_XXSBlock *>(data_ptr);
 
             const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
@@ -7857,7 +8031,8 @@ namespace llaminar2
         get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
         {
             const size_t super_blocks_per_row = (shape_[1] + IQ3_XXSBlock::BLOCK_SIZE - 1) / IQ3_XXSBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ3_XXSBlock *blocks = reinterpret_cast<const IQ3_XXSBlock *>(data_ptr);
 
             const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
@@ -7872,7 +8047,8 @@ namespace llaminar2
         __attribute__((always_inline)) void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override
         {
             const size_t super_blocks_per_row = (shape_[1] + IQ3_XXSBlock::BLOCK_SIZE - 1) / IQ3_XXSBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ3_XXSBlock *blocks = reinterpret_cast<const IQ3_XXSBlock *>(data_ptr);
 
             const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
@@ -7884,7 +8060,8 @@ namespace llaminar2
         __attribute__((always_inline)) float get_block_scale(size_t row_idx, size_t k_block_offset) const override
         {
             const size_t super_blocks_per_row = (shape_[1] + IQ3_XXSBlock::BLOCK_SIZE - 1) / IQ3_XXSBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ3_XXSBlock *blocks = reinterpret_cast<const IQ3_XXSBlock *>(data_ptr);
 
             const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
@@ -7915,10 +8092,12 @@ namespace llaminar2
         // ===== Lazy Transfer Accessors (Phase 3) =====
         void *raw_host_data_ptr() override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         const void *raw_host_data_ptr() const override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
@@ -7974,9 +8153,11 @@ namespace llaminar2
          * @brief Adopt aligned IQ2_S blocks without copying.
          * @param shape Logical tensor dimensions.
          * @param raw_data Complete native blocks; ownership is transferred.
-         * @throws std::invalid_argument If byte count and shape disagree.
+         * @param device Original CPU allocator identity; unrelated to NUMA first-touch placement.
+         * @throws std::invalid_argument If the device is not a valid CPU or byte count and shape disagree.
          */
-        IQ2_STensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
+        IQ2_STensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data,
+            DeviceId device = DeviceId::cpu());
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ2_STensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                     size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -8007,10 +8188,10 @@ namespace llaminar2
             {
                 raw_data_.clear();
                 raw_data_.shrink_to_fit();
-                raw_data_released_ = true;
             }
+            raw_data_released_ = true;
         }
-        bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_raw_data_released() const override { return raw_data_released_ || (parent_ && parent_->is_raw_data_released()); }
         bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
@@ -8048,7 +8229,8 @@ namespace llaminar2
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t blocks_per_row = (shape_[1] + IQ2_SBlock::BLOCK_SIZE - 1) / IQ2_SBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ2_SBlock *blocks = reinterpret_cast<const IQ2_SBlock *>(data_ptr);
             const size_t block_idx = row_idx * blocks_per_row + k_block_offset;
             decodeBlock(blocks[block_idx], output);
@@ -8059,7 +8241,8 @@ namespace llaminar2
         get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
         {
             const size_t blocks_per_row = (shape_[1] + IQ2_SBlock::BLOCK_SIZE - 1) / IQ2_SBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ2_SBlock *blocks = reinterpret_cast<const IQ2_SBlock *>(data_ptr);
             const size_t block_idx = row_idx * blocks_per_row + k_block_offset;
             return &blocks[block_idx];
@@ -8069,7 +8252,8 @@ namespace llaminar2
         __attribute__((always_inline)) void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override
         {
             const size_t super_blocks_per_row = (shape_[1] + IQ2_SBlock::BLOCK_SIZE - 1) / IQ2_SBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ2_SBlock *blocks = reinterpret_cast<const IQ2_SBlock *>(data_ptr);
 
             const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
@@ -8081,7 +8265,8 @@ namespace llaminar2
         __attribute__((always_inline)) float get_block_scale(size_t row_idx, size_t k_block_offset) const override
         {
             const size_t super_blocks_per_row = (shape_[1] + IQ2_SBlock::BLOCK_SIZE - 1) / IQ2_SBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ2_SBlock *blocks = reinterpret_cast<const IQ2_SBlock *>(data_ptr);
 
             const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
@@ -8116,10 +8301,12 @@ namespace llaminar2
         // ===== Lazy Transfer Accessors (Phase 3) =====
         void *raw_host_data_ptr() override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         const void *raw_host_data_ptr() const override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
@@ -8175,9 +8362,11 @@ namespace llaminar2
          * @brief Adopt aligned IQ3_S blocks without copying.
          * @param shape Logical tensor dimensions.
          * @param raw_data Complete native blocks; ownership is transferred.
-         * @throws std::invalid_argument If byte count and shape disagree.
+         * @param device Original CPU allocator identity; unrelated to NUMA first-touch placement.
+         * @throws std::invalid_argument If the device is not a valid CPU or byte count and shape disagree.
          */
-        IQ3_STensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
+        IQ3_STensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data,
+            DeviceId device = DeviceId::cpu());
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ3_STensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                     size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -8208,10 +8397,10 @@ namespace llaminar2
             {
                 raw_data_.clear();
                 raw_data_.shrink_to_fit();
-                raw_data_released_ = true;
             }
+            raw_data_released_ = true;
         }
-        bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_raw_data_released() const override { return raw_data_released_ || (parent_ && parent_->is_raw_data_released()); }
         bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
@@ -8249,7 +8438,8 @@ namespace llaminar2
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t super_blocks_per_row = (shape_[1] + IQ3_SBlock::BLOCK_SIZE - 1) / IQ3_SBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ3_SBlock *blocks = reinterpret_cast<const IQ3_SBlock *>(data_ptr);
 
             const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
@@ -8263,7 +8453,8 @@ namespace llaminar2
         get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
         {
             const size_t super_blocks_per_row = (shape_[1] + IQ3_SBlock::BLOCK_SIZE - 1) / IQ3_SBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ3_SBlock *blocks = reinterpret_cast<const IQ3_SBlock *>(data_ptr);
 
             const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
@@ -8274,7 +8465,8 @@ namespace llaminar2
         __attribute__((always_inline)) void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override
         {
             const size_t super_blocks_per_row = (shape_[1] + IQ3_SBlock::BLOCK_SIZE - 1) / IQ3_SBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ3_SBlock *blocks = reinterpret_cast<const IQ3_SBlock *>(data_ptr);
 
             const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
@@ -8286,7 +8478,8 @@ namespace llaminar2
         __attribute__((always_inline)) float get_block_scale(size_t row_idx, size_t k_block_offset) const override
         {
             const size_t super_blocks_per_row = (shape_[1] + IQ3_SBlock::BLOCK_SIZE - 1) / IQ3_SBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ3_SBlock *blocks = reinterpret_cast<const IQ3_SBlock *>(data_ptr);
 
             const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
@@ -8321,10 +8514,12 @@ namespace llaminar2
         // ===== Lazy Transfer Accessors (Phase 3) =====
         void *raw_host_data_ptr() override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         const void *raw_host_data_ptr() const override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
@@ -8380,9 +8575,11 @@ namespace llaminar2
          * @brief Adopt aligned IQ1_S blocks without copying.
          * @param shape Logical tensor dimensions.
          * @param raw_data Complete native blocks; ownership is transferred.
-         * @throws std::invalid_argument If byte count and shape disagree.
+         * @param device Original CPU allocator identity; unrelated to NUMA first-touch placement.
+         * @throws std::invalid_argument If the device is not a valid CPU or byte count and shape disagree.
          */
-        IQ1_STensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
+        IQ1_STensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data,
+            DeviceId device = DeviceId::cpu());
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ1_STensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                     size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -8413,10 +8610,10 @@ namespace llaminar2
             {
                 raw_data_.clear();
                 raw_data_.shrink_to_fit();
-                raw_data_released_ = true;
             }
+            raw_data_released_ = true;
         }
-        bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_raw_data_released() const override { return raw_data_released_ || (parent_ && parent_->is_raw_data_released()); }
         bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
@@ -8454,7 +8651,8 @@ namespace llaminar2
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t blocks_per_row = (shape_[1] + IQ1_SBlock::BLOCK_SIZE - 1) / IQ1_SBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ1_SBlock *blocks = reinterpret_cast<const IQ1_SBlock *>(data_ptr);
             const size_t block_idx = row_idx * blocks_per_row + k_block_offset;
             decodeBlock(blocks[block_idx], output);
@@ -8465,7 +8663,8 @@ namespace llaminar2
         get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
         {
             const size_t blocks_per_row = (shape_[1] + IQ1_SBlock::BLOCK_SIZE - 1) / IQ1_SBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ1_SBlock *blocks = reinterpret_cast<const IQ1_SBlock *>(data_ptr);
             const size_t block_idx = row_idx * blocks_per_row + k_block_offset;
             return &blocks[block_idx];
@@ -8475,7 +8674,8 @@ namespace llaminar2
         __attribute__((always_inline)) void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override
         {
             const size_t super_blocks_per_row = (shape_[1] + IQ1_SBlock::BLOCK_SIZE - 1) / IQ1_SBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ1_SBlock *blocks = reinterpret_cast<const IQ1_SBlock *>(data_ptr);
 
             const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
@@ -8487,7 +8687,8 @@ namespace llaminar2
         __attribute__((always_inline)) float get_block_scale(size_t row_idx, size_t k_block_offset) const override
         {
             const size_t super_blocks_per_row = (shape_[1] + IQ1_SBlock::BLOCK_SIZE - 1) / IQ1_SBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ1_SBlock *blocks = reinterpret_cast<const IQ1_SBlock *>(data_ptr);
 
             const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
@@ -8522,10 +8723,12 @@ namespace llaminar2
         // ===== Lazy Transfer Accessors (Phase 3) =====
         void *raw_host_data_ptr() override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         const void *raw_host_data_ptr() const override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
@@ -8581,9 +8784,11 @@ namespace llaminar2
          * @brief Adopt aligned IQ1_M blocks without copying.
          * @param shape Logical tensor dimensions.
          * @param raw_data Complete native blocks; ownership is transferred.
-         * @throws std::invalid_argument If byte count and shape disagree.
+         * @param device Original CPU allocator identity; unrelated to NUMA first-touch placement.
+         * @throws std::invalid_argument If the device is not a valid CPU or byte count and shape disagree.
          */
-        IQ1_MTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
+        IQ1_MTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data,
+            DeviceId device = DeviceId::cpu());
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ1_MTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                     size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -8614,10 +8819,10 @@ namespace llaminar2
             {
                 raw_data_.clear();
                 raw_data_.shrink_to_fit();
-                raw_data_released_ = true;
             }
+            raw_data_released_ = true;
         }
-        bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_raw_data_released() const override { return raw_data_released_ || (parent_ && parent_->is_raw_data_released()); }
         bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
@@ -8655,7 +8860,8 @@ namespace llaminar2
         __attribute__((always_inline)) void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
         {
             const size_t blocks_per_row = (shape_[1] + IQ1_MBlock::BLOCK_SIZE - 1) / IQ1_MBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ1_MBlock *blocks = reinterpret_cast<const IQ1_MBlock *>(data_ptr);
             const size_t block_idx = row_idx * blocks_per_row + k_block_offset;
             decodeBlock(blocks[block_idx], output);
@@ -8666,7 +8872,8 @@ namespace llaminar2
         get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
         {
             const size_t blocks_per_row = (shape_[1] + IQ1_MBlock::BLOCK_SIZE - 1) / IQ1_MBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ1_MBlock *blocks = reinterpret_cast<const IQ1_MBlock *>(data_ptr);
             const size_t block_idx = row_idx * blocks_per_row + k_block_offset;
             return &blocks[block_idx];
@@ -8676,7 +8883,8 @@ namespace llaminar2
         __attribute__((always_inline)) void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override
         {
             const size_t super_blocks_per_row = (shape_[1] + IQ1_MBlock::BLOCK_SIZE - 1) / IQ1_MBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ1_MBlock *blocks = reinterpret_cast<const IQ1_MBlock *>(data_ptr);
 
             const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
@@ -8688,7 +8896,8 @@ namespace llaminar2
         __attribute__((always_inline)) float get_block_scale(size_t row_idx, size_t k_block_offset) const override
         {
             const size_t super_blocks_per_row = (shape_[1] + IQ1_MBlock::BLOCK_SIZE - 1) / IQ1_MBlock::BLOCK_SIZE;
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const IQ1_MBlock *blocks = reinterpret_cast<const IQ1_MBlock *>(data_ptr);
 
             const size_t super_block_idx = (row_idx * super_blocks_per_row) + (k_block_offset / 8);
@@ -8723,10 +8932,12 @@ namespace llaminar2
         // ===== Lazy Transfer Accessors (Phase 3) =====
         void *raw_host_data_ptr() override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         const void *raw_host_data_ptr() const override
         {
+            if (is_raw_data_released()) return nullptr;
             return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
         }
         /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */

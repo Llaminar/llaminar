@@ -39,10 +39,11 @@ std::string NativeAuxiliaryResourceCatalog::portableSourceIdentity(const NativeC
 std::string NativeAuxiliaryResourceCatalog::liveSourceIdentity(const NativeContextBirthKey& k){
     std::string out=portableSourceIdentity(k);for(const auto& s:{k.device.toString(),k.physical_uuid,k.visibility_identity,std::to_string(k.visible_device_count)})append(out,s);return hash(out);
 }
-NativeAuxiliaryResourceSelection NativeAuxiliaryResourceCatalog::select(const NativeContextBirthKey& k,std::uint64_t generation,
-    NativeAuxiliaryResourceProgram program,std::string_view resource,std::span<const detail::NativeAuxiliaryQualifiedClass> rows){
-    k.requireComplete();if(!generation || resource.empty())throw std::invalid_argument("Native auxiliary class requires original generation/source");
-    for(const auto& row:rows){if(row.backend!=k.device.type)continue;
+NativeAuxiliaryResourceAllowance NativeAuxiliaryResourceCatalog::selectAllowance(DeviceType backend,
+    NativeAuxiliaryResourceProgram program,std::span<const detail::NativeAuxiliaryQualifiedClass> rows){
+    if(backend!=DeviceType::CUDA && backend!=DeviceType::ROCm)
+        throw std::invalid_argument("Native auxiliary allowance requires a supported GPU backend");
+    for(const auto& row:rows){if(row.backend!=backend)continue;
         if(row.remoteFamily && (!row.remoteFamily->valid() || !row.program.isPooledRemoteOwner() ||
             !row.remoteFamily->accepts(row.program.remoteProgramClass().limits(),PooledRemoteGraphProgramClass::argumentLayout())))
             throw std::logic_error("Installed remote graph family has invalid reviewed source scope");
@@ -55,8 +56,17 @@ NativeAuxiliaryResourceSelection NativeAuxiliaryResourceCatalog::select(const Na
         if(program.isPooledRemoteOwner() && (row.deviceBytes || row.lifetime!=NativePhysicalLifetime::ProcessRuntime))
             throw std::logic_error("Remote graph host class must keep original device bytes separate and retain host backing through ProcessRuntime");
         const auto hostBytes=program.isPooledRemoteOwner()?PooledRemoteGraphHostAllowance::scaledBytes(program.remoteProgramClass().limits().maximumNodes,row.hostBytes):row.hostBytes;
-        return {hostBytes,row.deviceBytes,std::string(row.evidence),liveSourceIdentity(k),std::string(resource),row.lifetime,generation,program,row.remoteFamily};}
-    throw std::runtime_error("Native auxiliary program is unqualified: no reviewed source/runtime/program class for "+k.device.toString()+" "+program.identity());
+        return {hostBytes,row.deviceBytes,std::string(row.evidence),row.lifetime,program,row.remoteFamily};}
+    throw std::runtime_error("Native auxiliary program is unqualified: no reviewed source/runtime/program class for "+std::to_string(static_cast<unsigned>(backend))+" "+program.identity());
+}
+NativeAuxiliaryResourceAllowance NativeAuxiliaryResourceCatalog::allowance(DeviceType backend,NativeAuxiliaryResourceProgram program){
+    return selectAllowance(backend,program,detail::kNativeAuxiliaryQualifiedClasses);
+}
+NativeAuxiliaryResourceSelection NativeAuxiliaryResourceCatalog::select(const NativeContextBirthKey& k,std::uint64_t generation,
+    NativeAuxiliaryResourceProgram program,std::string_view resource,std::span<const detail::NativeAuxiliaryQualifiedClass> rows){
+    k.requireComplete();if(!generation || resource.empty())throw std::invalid_argument("Native auxiliary class requires original generation/source");
+    const auto bound=selectAllowance(k.device.type,program,rows);
+    return {bound.hostBytes,bound.deviceBytes,bound.evidence,liveSourceIdentity(k),std::string(resource),bound.lifetime,generation,program,bound.remoteFamily};
 }
 NativeAuxiliaryResourceSelection NativeAuxiliaryResourceCatalog::require(DeviceId device,NativeAuxiliaryResourceProgram program){
     if(!device.is_gpu())throw std::invalid_argument("Native auxiliary program requires an actual GPU");

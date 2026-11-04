@@ -12,6 +12,7 @@
 #pragma once
 
 #include "IGlobalTPContext.h"
+#include "NativeCPUCollectiveProgram.h"
 #include "ICollectiveBackend.h"
 #include "backends/UPIBackend.h"
 #include "config/OrchestrationConfig.h" // For CollectiveBackendType
@@ -21,6 +22,7 @@
 #include <string>
 #include <vector>
 #include <optional>
+#include <variant>
 #include <mpi.h>
 
 namespace llaminar2
@@ -112,6 +114,27 @@ namespace llaminar2
          * @param backend_type Explicit collective policy for this domain.
          * @return Unique pointer to GlobalTPContext, or nullptr on error
          */
+        /**
+         * @brief Create the original declared CPU expert domain under its same-PMA runtime commitment.
+         * @param base_comm Existing original parent communicator; every rank enters the same split.
+         * @param program Immutable ordered expert partial-routing domain.
+         * @param use Exact member-domain or excluded-parent process scope, never fabricated membership.
+         * @return Original retained context, or null only for an excluded rank.
+         * @throws std::invalid_argument Collectively before native entry for foreign/missing tokens.
+         */
+        static std::shared_ptr<GlobalTPContext> createAdmittedCPUExpertDomain(
+            MPI_Comm base_comm,const NativeCPUCollectiveProgram &program,
+            std::variant<NativeCPUCollectiveProgram::DomainUse,NativeCPUCollectiveProgram::ProcessUse> use);
+        /**
+         * @brief Retire the original domain after all local graph/worker borrowers have stopped.
+         * @return True after local unmap, original all-member terminal acknowledgement,
+         *         creator-only backing release and actual communicator destruction.
+         * @note Explicit shutdown only. Destruction never enters a collective.
+         */
+        bool retireOriginalCPUExpertDomain();
+        /** @return Whether a borrower shares this still-live admitted native domain's original control block. */
+        bool authenticatesOriginalCPUExpertBorrow(const std::shared_ptr<IGlobalTPContext>& borrower) const noexcept;
+
         static std::unique_ptr<GlobalTPContext> createWithSplit(
             MPI_Comm base_comm,
             int domain_id,
@@ -194,6 +217,10 @@ namespace llaminar2
             int root_index,
             size_t &gathered_record_count,
             const std::string &stage_name) override;
+        /** @copydoc IGlobalTPContext::gatherVariableFloatRecordsToRoot */
+        bool gatherVariableFloatRecordsToRoot(
+            const float *, size_t, float *, size_t, size_t, int,
+            size_t &, const std::string &, std::span<RootedFloatRecordRange>) override;
         bool broadcastFloatElements(
             TensorBase *tensor,
             size_t element_count,
@@ -254,6 +281,11 @@ namespace llaminar2
         std::string collectiveBackendNameForDiagnostics() const;
 
     private:
+        /** @brief Shared original gather body; ranges never alter the wire protocol. */
+        bool gatherVariableFloatRecordsToRootImpl(
+            const float *, size_t, float *, size_t, size_t, int,
+            size_t &, const std::string &, std::span<RootedFloatRecordRange>);
+
         // Private constructor - use factory methods
         GlobalTPContext(
             MPI_Comm domain_comm,
@@ -264,11 +296,19 @@ namespace llaminar2
             bool owns_communicator,
             CollectiveBackendType backend_type = CollectiveBackendType::UPI,
             std::vector<int> node_ids = {},
-            std::optional<GlobalDeviceAddress> local_device = std::nullopt);
+            std::optional<GlobalDeviceAddress> local_device = std::nullopt,
+            std::shared_ptr<PhysicalMemoryAuthority> original_memory = {});
+        /** @brief Shared native constructor path; only the closed admitted factory supplies a PMA. */
+        static std::unique_ptr<GlobalTPContext> createWithSplitImpl(MPI_Comm base_comm,int domain_id,
+            int color,int key,std::optional<GlobalDeviceAddress> local_device,const std::string& hostfile,
+            CollectiveBackendType backend,std::shared_ptr<PhysicalMemoryAuthority> original_memory);
 
         /// Auto-detect node IDs by gathering hostnames over domain_comm_
         void detectNodeIds();
 
+        std::optional<NativeCPUCollectiveProgram::DomainUse> cpu_program_use_; ///< Original native duty, released only at explicit shutdown.
+        bool cpu_program_retired_=false;
+        std::weak_ptr<GlobalTPContext> original_cpu_owner_; ///< Original shared control block counts retained graph/worker borrowers.
         MPI_Comm domain_comm_;                        ///< Domain-specific MPI communicator
         /**
          * @brief Private point-to-point lane for rooted canonical publication.

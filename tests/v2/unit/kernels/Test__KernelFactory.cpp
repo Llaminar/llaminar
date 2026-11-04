@@ -995,3 +995,39 @@ TEST(PreparedExpertServiceView, DeclaredRouterPublicationReplaysWithoutAllocatio
     for (const auto &line : memory->rankAttestation())
         EXPECT_EQ(line.materialized_new_bytes, 0u);
 }
+
+/** @test Original admitted NUMA/root policy survives independent execution-geometry validation. */
+TEST(PreparedExpertServiceView, CPUWorkspaceDeclaredNUMAPlacementRetainsExactGeometry)
+{
+    for(const int numa:{0,1,4,8})
+    for(const auto initialization:{CPUStorageInitialization::Zero,CPUStorageInitialization::Uninitialized}) {
+        CPUGroupedMoESerialWorkspace::Config config{
+            .row_capacity=3,.d_model=35,.expert_intermediate=33,
+            .num_experts=4,.routing_top_k=2,.device_id=DeviceId::cpu()};
+        const auto declared=std::make_shared<const CPUGroupedMoEStorageLayout>(
+            CPUGroupedMoEStorageLayout::declare(3,35,33,4,2,DeviceId::cpu(),
+                CPUStoragePlacement::onNode(numa),initialization));
+        config.declared_storage=declared;
+        for(int replay=0;replay<3;++replay) {
+            EXPECT_EQ(CPUGroupedMoESerialWorkspace::storageLayout(config),*declared);
+            EXPECT_EQ(CPUGroupedMoESerialWorkspace::plannedAllocationBytes(config),declared->physicalBytes());
+        }
+        // Original local F is33, not the whole-model F65. The same exact
+        // equality guard must still reject a full-width execution request.
+        auto wrong=config;wrong.expert_intermediate=65;
+        EXPECT_THROW((void)CPUGroupedMoESerialWorkspace::plannedAllocationBytes(wrong),std::logic_error);
+        EXPECT_THROW((void)CPUGroupedMoESerialWorkspace(wrong),std::logic_error);
+        wrong=config;wrong.d_model=36;
+        EXPECT_THROW((void)CPUGroupedMoESerialWorkspace::plannedAllocationBytes(wrong),std::logic_error);
+        wrong=config;wrong.row_capacity=4;
+        EXPECT_THROW((void)CPUGroupedMoESerialWorkspace::plannedAllocationBytes(wrong),std::logic_error);
+        auto malformed=std::make_shared<CPUGroupedMoEStorageLayout>(*declared);
+        --malformed->route_capacity;wrong=config;wrong.declared_storage=malformed;
+        EXPECT_THROW((void)CPUGroupedMoESerialWorkspace::plannedAllocationBytes(wrong),std::logic_error);
+    }
+    // Standalone ordinary policy stays exactly local/zero without a declaration.
+    CPUGroupedMoESerialWorkspace::Config ordinary{.row_capacity=3,.d_model=35,.expert_intermediate=33,
+        .num_experts=4,.routing_top_k=2,.device_id=DeviceId::cpu()};
+    EXPECT_EQ(CPUGroupedMoESerialWorkspace::storageLayout(ordinary),
+        CPUGroupedMoEStorageLayout::declare(3,35,33,4,2,DeviceId::cpu()));
+}

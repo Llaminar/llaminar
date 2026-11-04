@@ -31,6 +31,8 @@
 #include "utils/MPIContext.h"
 #include "mocks/MockModelLoader.h"
 #include "utils/EmbeddingVerifierFormats.h"
+#include "utils/CPUWeightPlanTestAdmission.h"
+#include "loaders/PreparedWeightStore.h"
 
 using namespace llaminar2::test;
 
@@ -391,6 +393,37 @@ protected:
         mock_loader_->addFP32RandomTensor("blk.0.ffn_down.weight", {128, 512}, -1.0f, 1.0f, 108);
     }
 
+    /** @brief Declare all retained final CPU consumers before the first actual source read. */
+    void admit(WeightManager& manager, std::vector<WeightRequirement> requirements)
+    {
+        InferenceStrategy original;
+        original.model_id={98201};
+        for(const auto& requirement:requirements)
+            if(std::find(original.devices.begin(),original.devices.end(),requirement.target_device)==original.devices.end())
+                original.devices.push_back(requirement.target_device);
+        WeightPlan plan(original);
+        for(auto& requirement:requirements)plan.add(std::move(requirement));
+        ASSERT_TRUE(manager.preparedWeightStore()->bindModelIdIfUnset(original.model_id));
+        admitCPUWeightPlansForTest(manager,*mock_loader_,{&plan});
+    }
+    /** @return The exact original source rectangle and participant scope used by this test consumer. */
+    WeightRequirement source(const char* name, DeviceId device=DeviceId::cpu(),
+        WeightDerivationKind derivation=WeightDerivationKind::Source,
+        size_t row=0,size_t rows=0,size_t column=0,size_t columns=0,int rank=-1)
+    {
+        WeightRequirement requirement;
+        requirement.canonical_name=name;requirement.role=inferWeightRole(name);
+        requirement.layer=inferWeightLayer(name);requirement.target_device=device;
+        requirement.derivation=derivation;
+        if(derivation!=WeightDerivationKind::Source) {
+            requirement.slice.row_start=row;requirement.slice.row_count=rows;
+            requirement.slice.col_start=column;requirement.slice.col_count=columns;
+            requirement.slice.inner_is_presliced=true;
+        }
+        if(rank>=0){requirement.tp_domain=0;requirement.tp_rank_or_device_index=rank;}
+        return requirement;
+    }
+
     std::shared_ptr<MockModelLoader> mock_loader_;
 };
 
@@ -456,6 +489,8 @@ TEST_F(WeightManagerInstanceTest, GetWeight_LoadsTensorOnFirstCall)
                      WeightDistributionStrategy::REPLICATED,
                      WeightPrecision::NATIVE);
 
+    admit(wm,{source("token_embd.weight")});
+
     auto tensor = wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
 
     ASSERT_NE(tensor, nullptr);
@@ -469,6 +504,8 @@ TEST_F(WeightManagerInstanceTest, GetWeight_CacheHitOnSecondCall)
     WeightManager wm(*mock_loader_, nullptr, nullptr,
                      WeightDistributionStrategy::REPLICATED,
                      WeightPrecision::NATIVE);
+
+    admit(wm,{source("token_embd.weight")});
 
     auto tensor1 = wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
     auto tensor2 = wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
@@ -485,6 +522,8 @@ TEST_F(WeightManagerInstanceTest, GetWeight_DifferentWeightsAreCachedSeparately)
                      WeightDistributionStrategy::REPLICATED,
                      WeightPrecision::NATIVE);
 
+    admit(wm,{source("token_embd.weight"),source("output_norm.weight")});
+
     auto embd = wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
     auto norm = wm.getWeightForDevice("output_norm.weight", DeviceId::cpu(), 0);
 
@@ -499,6 +538,8 @@ TEST_F(WeightManagerInstanceTest, GetWeight_1DTensor)
     WeightManager wm(*mock_loader_, nullptr, nullptr,
                      WeightDistributionStrategy::REPLICATED,
                      WeightPrecision::NATIVE);
+
+    admit(wm,{source("output_norm.weight")});
 
     auto tensor = wm.getWeightForDevice("output_norm.weight", DeviceId::cpu(), 0);
 
@@ -525,6 +566,8 @@ TEST_F(WeightManagerInstanceTest, GetWeight_MultipleLayers)
                      WeightPrecision::NATIVE);
 
     // Load weights from layer 0
+    admit(wm,{source("blk.0.attn_q.weight"),source("blk.0.attn_k.weight"),source("blk.0.attn_v.weight")});
+
     auto q = wm.getWeightForDevice("blk.0.attn_q.weight", DeviceId::cpu(), 0);
     auto k = wm.getWeightForDevice("blk.0.attn_k.weight", DeviceId::cpu(), 0);
     auto v = wm.getWeightForDevice("blk.0.attn_v.weight", DeviceId::cpu(), 0);
@@ -558,6 +601,8 @@ TEST_F(WeightManagerInstanceTest, CacheSize_IncrementsOnLoad)
                      WeightDistributionStrategy::REPLICATED,
                      WeightPrecision::NATIVE);
 
+    admit(wm,{source("token_embd.weight"),source("output_norm.weight")});
+
     wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
     EXPECT_EQ(wm.cacheSize(), 1);
 
@@ -575,6 +620,8 @@ TEST_F(WeightManagerInstanceTest, ClearCache_RemovesAllEntries)
                      WeightDistributionStrategy::REPLICATED,
                      WeightPrecision::NATIVE);
 
+    admit(wm,{source("token_embd.weight"),source("output_norm.weight")});
+
     wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
     wm.getWeightForDevice("output_norm.weight", DeviceId::cpu(), 0);
     EXPECT_EQ(wm.cacheSize(), 2);
@@ -589,6 +636,8 @@ TEST_F(WeightManagerInstanceTest, ClearCache_AllowsReload)
                      WeightDistributionStrategy::REPLICATED,
                      WeightPrecision::NATIVE);
 
+    admit(wm,{source("token_embd.weight")});
+
     auto tensor1 = wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
     ASSERT_NE(tensor1, nullptr);
 
@@ -597,8 +646,8 @@ TEST_F(WeightManagerInstanceTest, ClearCache_AllowsReload)
     auto tensor2 = wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
     ASSERT_NE(tensor2, nullptr);
 
-    // Should be a different instance after cache clear
-    // (Note: same data but different allocation)
+    // Clearing lookup indexes does not retire the original Store-owned final root.
+    EXPECT_EQ(tensor1,tensor2);
     EXPECT_EQ(wm.cacheSize(), 1);
 }
 
@@ -638,6 +687,8 @@ TEST_F(WeightManagerInstanceTest, Sharded_ReplicatesNormWeights)
     wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
     // Norm weights should be fully replicated
+    admit(wm,{source("blk.0.attn_norm.weight")});
+
     auto norm = wm.getWeightForDevice("blk.0.attn_norm.weight", DeviceId::cpu(), 0);
     ASSERT_NE(norm, nullptr);
     EXPECT_EQ(norm->shape()[0], 128); // Full size, not sharded
@@ -655,6 +706,8 @@ TEST_F(WeightManagerInstanceTest, Sharded_ReplicatesEmbedding)
     wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
     // Embedding should be fully replicated
+    admit(wm,{source("token_embd.weight")});
+
     auto embd = wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
     ASSERT_NE(embd, nullptr);
     EXPECT_EQ(embd->shape()[0], 1000);
@@ -877,16 +930,9 @@ TEST_F(WeightManagerInstanceTest, InterleavedStrategy_LoadsTensor)
                      WeightDistributionStrategy::INTERLEAVED,
                      WeightPrecision::NATIVE);
 
-    // INTERLEAVED strategy should still load tensors (falls back to replicated for now)
-    auto tensor = wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
-
-    // May return nullptr if not implemented, or tensor if fallback works
-    // The important thing is it doesn't crash
-    if (tensor)
-    {
-        EXPECT_EQ(tensor->shape()[0], 1000);
-        EXPECT_EQ(tensor->shape()[1], 128);
-    }
+    EXPECT_THROW(wm.getWeightForDevice("token_embd.weight",DeviceId::cpu(),0),std::logic_error);
+    EXPECT_EQ(mock_loader_->nativeSourceReadCallCount(),0u);
+    EXPECT_EQ(wm.cacheSize(),0u);
 }
 
 // -----------------------------------------------------------------------------
@@ -903,6 +949,8 @@ TEST_F(WeightManagerInstanceTest, GetDecodeWeight_ColumnParallel_SlicesTailRows)
     wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
     // Q weight is column-parallel, should slice tail rows
+    admit(wm,{source("blk.0.attn_q.weight",DeviceId::cpu(),WeightDerivationKind::DecodeShard,64,64,0,128)});
+
     auto decode_shard = wm.getDecodeWeight("blk.0.attn_q.weight", DeviceId::cpu(), 0.5f, 0);
 
     ASSERT_NE(decode_shard, nullptr);
@@ -921,6 +969,8 @@ TEST_F(WeightManagerInstanceTest, GetDecodeWeight_InputParallel_SlicesTailColumn
     wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
     // Wo weight is input-parallel, should slice tail columns
+    admit(wm,{source("blk.0.attn_output.weight",DeviceId::cpu(),WeightDerivationKind::DecodeShard,0,128,64,64)});
+
     auto decode_shard = wm.getDecodeWeight("blk.0.attn_output.weight", DeviceId::cpu(), 0.5f, 0);
 
     ASSERT_NE(decode_shard, nullptr);
@@ -939,6 +989,8 @@ TEST_F(WeightManagerInstanceTest, GetDecodeWeight_FFNDown_InputParallel)
     wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
     // FFN down is input-parallel, should slice tail columns
+    admit(wm,{source("blk.0.ffn_down.weight",DeviceId::cpu(),WeightDerivationKind::DecodeShard,0,128,384,128)});
+
     auto decode_shard = wm.getDecodeWeight("blk.0.ffn_down.weight", DeviceId::cpu(), 0.25f, 0);
 
     ASSERT_NE(decode_shard, nullptr);
@@ -957,6 +1009,8 @@ TEST_F(WeightManagerInstanceTest, GetDecodeWeight_ReplicatedWeight_ReturnsFullCo
     wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
     // Norm weights are replicated, should return full tensor
+    admit(wm,{source("blk.0.attn_norm.weight")});
+
     auto decode_shard = wm.getDecodeWeight("blk.0.attn_norm.weight", DeviceId::cpu(), 0.5f, 0);
 
     ASSERT_NE(decode_shard, nullptr);
@@ -973,6 +1027,8 @@ TEST_F(WeightManagerInstanceTest, GetDecodeWeight_CachesSeparately)
     wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
     // Load both regular and decode weights
+    admit(wm,{source("blk.0.attn_q.weight"),source("blk.0.attn_q.weight",DeviceId::cpu(),WeightDerivationKind::DecodeShard,64,64,0,128)});
+
     auto regular = wm.getWeightForDevice("blk.0.attn_q.weight", DeviceId::cpu(), 0);
     auto decode = wm.getDecodeWeight("blk.0.attn_q.weight", DeviceId::cpu(), 0.5f, 0);
 
@@ -999,6 +1055,8 @@ TEST_F(WeightManagerInstanceTest, GetDecodeWeight_CacheHitOnSecondCall)
 
     Qwen2SchemaFactory schema_factory;
     wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+
+    admit(wm,{source("blk.0.attn_q.weight",DeviceId::cpu(),WeightDerivationKind::DecodeShard,64,64,0,128)});
 
     auto decode1 = wm.getDecodeWeight("blk.0.attn_q.weight", DeviceId::cpu(), 0.5f, 0);
     auto decode2 = wm.getDecodeWeight("blk.0.attn_q.weight", DeviceId::cpu(), 0.5f, 0);
@@ -1069,6 +1127,8 @@ TEST_F(WeightManagerInstanceTest, Sharded_TwoRanks_Rank0GetsFirstHalf)
     wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
     // Q weight [128, 128] should be column-sliced to [64, 128] for rank 0
+    admit(wm,{source("blk.0.attn_q.weight",DeviceId::cpu(),WeightDerivationKind::RowSlice,0,64,0,0,0)});
+
     auto q = wm.getWeightForDevice("blk.0.attn_q.weight", DeviceId::cpu(), 0);
     ASSERT_NE(q, nullptr);
     EXPECT_EQ(q->shape()[0], 64);  // half of 128
@@ -1087,6 +1147,8 @@ TEST_F(WeightManagerInstanceTest, Sharded_TwoRanks_Rank1GetsSecondHalf)
     wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
     // Q weight [128, 128] should be column-sliced to [64, 128] for rank 1
+    admit(wm,{source("blk.0.attn_q.weight",DeviceId::cpu(),WeightDerivationKind::RowSlice,64,64,0,0,1)});
+
     auto q = wm.getWeightForDevice("blk.0.attn_q.weight", DeviceId::cpu(), 0);
     ASSERT_NE(q, nullptr);
     EXPECT_EQ(q->shape()[0], 64);  // half of 128
@@ -1105,6 +1167,8 @@ TEST_F(WeightManagerInstanceTest, Sharded_InputParallel_SlicesColumns)
     wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
     // FFN down [128, 512] is input-parallel, should slice columns to [128, 256]
+    admit(wm,{source("blk.0.ffn_down.weight",DeviceId::cpu(),WeightDerivationKind::ColumnSlice,0,0,0,256,0)});
+
     auto down = wm.getWeightForDevice("blk.0.ffn_down.weight", DeviceId::cpu(), 0);
     ASSERT_NE(down, nullptr);
     EXPECT_EQ(down->shape()[0], 128); // output dim unchanged
@@ -1123,6 +1187,8 @@ TEST_F(WeightManagerInstanceTest, Sharded_ColumnParallel_GateUp)
     wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
     // Gate [512, 128] is column-parallel, should slice rows to [256, 128]
+    admit(wm,{source("blk.0.ffn_gate.weight",DeviceId::cpu(),WeightDerivationKind::RowSlice,0,256,0,0,0),source("blk.0.ffn_up.weight",DeviceId::cpu(),WeightDerivationKind::RowSlice,0,256,0,0,0)});
+
     auto gate = wm.getWeightForDevice("blk.0.ffn_gate.weight", DeviceId::cpu(), 0);
     ASSERT_NE(gate, nullptr);
     EXPECT_EQ(gate->shape()[0], 256); // half of 512
@@ -1481,7 +1547,6 @@ TEST_F(WeightManagerComputeSliceBoundariesTest,
        ExpertApportionmentReplacesPreTopologyFullSourceClone)
 {
     constexpr const char *kExpertWeight = "blk.0.ffn_gate_exps.weight";
-    const DeviceId cpu = DeviceId::cpu();
     const DeviceId cuda0(DeviceType::CUDA, 0);
 
     Qwen2SchemaFactory schema_factory;
@@ -1495,7 +1560,7 @@ TEST_F(WeightManagerComputeSliceBoundariesTest,
                      WeightPrecision::NATIVE);
     wm.configure(source_config);
 
-    ASSERT_NE(wm.getWeightForDevice(kExpertWeight, cpu, 0), nullptr);
+    // This is a genuine GPU-preparation source request, not a CPU final expert parent.
     auto full_clone = wm.getWeightForDevice(kExpertWeight, cuda0, 0);
     ASSERT_NE(full_clone, nullptr);
     ASSERT_EQ(full_clone->shape(), (std::vector<size_t>{128, 64, 8}));
@@ -1825,6 +1890,8 @@ TEST_F(WeightManagerInstanceTest, GetWeightForDevice_FirstDeviceGetsOriginal)
 
     DeviceId cpu = DeviceId::cpu();
 
+    admit(wm,{source("token_embd.weight")});
+
     auto tensor1 = wm.getWeightForDevice("token_embd.weight", cpu, 0);
     auto tensor2 = wm.getWeightForDevice("token_embd.weight", cpu, 0);
 
@@ -1842,6 +1909,8 @@ TEST_F(WeightManagerInstanceTest, GetWeightForDevice_DifferentDevicesGetClones)
 
     DeviceId cpu = DeviceId::cpu();
     DeviceId cuda0 = DeviceId(DeviceType::CUDA, 0);
+
+    admit(wm,{source("token_embd.weight")});
 
     auto tensor_cpu = wm.getWeightForDevice("token_embd.weight", cpu, 0);
     auto tensor_cuda = wm.getWeightForDevice("token_embd.weight", cuda0, 0);
@@ -1887,6 +1956,11 @@ TEST_F(WeightManagerInstanceTest, PreloadForDevices_SingleDevice)
     wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
     // First load some weights
+    std::vector<WeightRequirement> population;
+    for(const auto device:std::vector<DeviceId>{DeviceId::cpu()})
+        for(const auto& name:mock_loader_->materializationNames())population.push_back(source(name.c_str(),device));
+    admit(wm,std::move(population));
+
     wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
     wm.getWeightForDevice("blk.0.attn_q.weight", DeviceId::cpu(), 0);
 
@@ -1908,6 +1982,11 @@ TEST_F(WeightManagerInstanceTest, PreloadForDevices_MultipleCpuDevices)
     wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
     // Load a weight first
+    std::vector<WeightRequirement> population;
+    for(const auto device:std::vector<DeviceId>{DeviceId::cpu(),DeviceId(DeviceType::CPU,1)})
+        for(const auto& name:mock_loader_->materializationNames())population.push_back(source(name.c_str(),device));
+    admit(wm,std::move(population));
+
     wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
 
     // Unit preload stays device-free. Native GPU embedding upload and capture
@@ -2099,7 +2178,7 @@ int main(int argc, char **argv)
     return RUN_ALL_TESTS();
 }
 
-/** @test CPU TP retains exact independent shards/raw replicas across reset and reordered replay. */
+/** @test CPU TP retains original committed shards/raw replicas across cache reset and reordered logical access. */
 TEST(WeightManagerCPUShardCache, LogicalRanksPreserveSlicesRawReplicasAndFullSources)
 {
     MockModelLoader loader;
@@ -2115,9 +2194,8 @@ TEST(WeightManagerCPUShardCache, LogicalRanksPreserveSlicesRawReplicasAndFullSou
     const auto original_query=loader.loadTensor(query);
     const auto original_output=loader.loadTensor(output);
     const auto original_expert=loader.loadTensor(expert);
-    // This explicit source contract permits sharing immutable preparation data;
-    // ordinary raw norms below deliberately retain their default host ownership.
-    original_expert->setHostResident();
+    // Raw expert parents are source inventory only; CPU execution consumes the
+    // separately authenticated complete prepared bank, never this 3D tensor.
     // Actual storage is CPU in every lane. GPU assignment identities exercise
     // materialize's supported explicit host lookup without initializing a GPU.
     for(const auto backend:{DeviceType::CPU,DeviceType::CUDA,DeviceType::ROCm})
@@ -2129,6 +2207,36 @@ TEST(WeightManagerCPUShardCache, LogicalRanksPreserveSlicesRawReplicasAndFullSou
         const auto assignment=std::make_shared<TensorParallelConfig>(TensorParallelConfig::equalSplit(
             2,8,2,64,64,std::vector<DeviceId>{DeviceId(backend,0),DeviceId(backend,backend==DeviceType::CPU?0:1)}));
         manager.setTensorParallelConfig(assignment);
+        InferenceStrategy strategy;
+        strategy.model_id=ModelContextId{59000u+static_cast<unsigned>(backend)};
+        strategy.devices={DeviceId::cpu()};strategy.tp_degree=2;
+        WeightPlan declared(strategy);
+        for(int rank=0;rank<2;++rank)for(const auto& name:{query,output,norm}) {
+            WeightRequirement requirement;
+            requirement.canonical_name=name;requirement.role=inferWeightRole(name);
+            requirement.target_device=DeviceId::cpu();requirement.tp_domain=0;
+            requirement.tp_rank_or_device_index=rank;
+            requirement.host_policy=WeightHostPolicy::RequiredForCPUExecution;
+            if(name==query) {
+                requirement.derivation=WeightDerivationKind::RowSlice;
+                requirement.slice={.row_start=size_t(rank*16),.row_count=16,.inner_is_presliced=true};
+            } else if(name==output) {
+                requirement.derivation=WeightDerivationKind::ColumnSlice;
+                requirement.slice={.col_start=size_t(rank*16),.col_count=16,.inner_is_presliced=true};
+            }
+            declared.add(std::move(requirement));
+        }
+        WeightPlan full_source_plan(strategy);
+        WeightRequirement full_source_requirement;
+        full_source_requirement.canonical_name=query;
+        full_source_requirement.target_device=DeviceId::cpu();
+        full_source_requirement.bypass_tensor_parallel=true;
+        full_source_requirement.host_policy=WeightHostPolicy::RequiredForCPUExecution;
+        full_source_plan.add(std::move(full_source_requirement));
+        ASSERT_TRUE(manager.preparedWeightStore()->bindModelIdIfUnset(strategy.model_id));
+        test::admitCPUWeightPlansForTest(manager,loader,{&declared,&full_source_plan});
+        const auto initial_reads=loader.nativeSourceReadCallCount();
+        size_t completed_reads=initial_reads;
         std::vector<std::shared_ptr<TensorBase>> previous;
         for(int replay=0;replay<3;++replay)
         {
@@ -2162,26 +2270,27 @@ TEST(WeightManagerCPUShardCache, LogicalRanksPreserveSlicesRawReplicasAndFullSou
                     EXPECT_EQ(q_bytes[row*32+col],q_source[(rank*16+row)*32+col]);
                 for(size_t row=0;row<32;++row)for(size_t col=0;col<16;++col)
                     EXPECT_EQ(o_bytes[row*16+col],o_source[row*32+rank*16+col]);
+                const auto before_hits=loader.nativeSourceReadCallCount();
                 EXPECT_EQ(manager.getShardedWeightForAssignment(query,DeviceId::cpu(),assignment->forRank(rank),0),queries[rank]);
                 EXPECT_EQ(manager.getShardedWeightForAssignment(output,DeviceId::cpu(),assignment->forRank(rank),0),outputs[rank]);
                 EXPECT_EQ(manager.getShardedWeightForAssignment(norm,DeviceId::cpu(),assignment->forRank(rank),0),norms[rank]);
-                EXPECT_EQ(manager.getShardedWeightForAssignment(expert,DeviceId::cpu(),assignment->forRank(rank),0),original_expert);
+                EXPECT_THROW((void)manager.getShardedWeightForAssignment(expert,DeviceId::cpu(),assignment->forRank(rank),0),std::logic_error);
+                EXPECT_EQ(loader.nativeSourceReadCallCount(),before_hits);
+                EXPECT_EQ(original_expert->shape(),(std::vector<size_t>{32,32,2}));
             }
             EXPECT_NE(queries[0],queries[1]);EXPECT_NE(outputs[0],outputs[1]);EXPECT_NE(norms[0],norms[1]);
             EXPECT_NE(norms[0]->raw_data(),norms[1]->raw_data());
             // The public declarative bypass requests the complete immutable
             // source without changing this manager's retained TP declaration.
-            WeightPlan full_source_plan;
-            WeightRequirement full_source_requirement;
-            full_source_requirement.canonical_name=query;
-            full_source_requirement.target_device=DeviceId::cpu();
-            full_source_requirement.bypass_tensor_parallel=true;
-            full_source_requirement.host_policy=WeightHostPolicy::RequiredForCPUExecution;
-            full_source_plan.add(std::move(full_source_requirement));
             const auto full_source_bindings=manager.materialize(full_source_plan);
             ASSERT_EQ(full_source_bindings.bindings().size(),1u);
             const auto full=full_source_bindings.bindings().front().tensor;
             ASSERT_TRUE(full);EXPECT_EQ(full->shape(),(std::vector<size_t>{32,32}));
+            EXPECT_EQ(std::memcmp(full->raw_data(),original_query->raw_data(),original_query->size_bytes()),0);
+            if(replay==0) {
+                completed_reads=loader.nativeSourceReadCallCount();
+                EXPECT_GT(completed_reads,initial_reads);
+            } else EXPECT_EQ(loader.nativeSourceReadCallCount(),completed_reads);
             EXPECT_NE(full,queries[0].get());EXPECT_NE(full,queries[1].get());
             std::unordered_set<const TensorBase *> visited;
             manager.forEachPreparedWeight([&](const std::string &name,TensorBase *tensor)
@@ -2192,9 +2301,10 @@ TEST(WeightManagerCPUShardCache, LogicalRanksPreserveSlicesRawReplicasAndFullSou
             for(const auto &tensor:queries)EXPECT_EQ(visited.count(tensor.get()),1u);
             for(const auto &tensor:outputs)EXPECT_EQ(visited.count(tensor.get()),1u);
             for(const auto &tensor:norms)EXPECT_EQ(visited.count(tensor.get()),1u);
-            // Keep prior objects alive so pointer inequality proves recreation,
-            // rather than relying on allocator addresses after cache retirement.
-            if(!previous.empty())for(int rank=0;rank<2;++rank)EXPECT_NE(norms[rank],previous[rank]);
+            // clearCache retires logical indexes, not the original Store's
+            // completed roots. Raw replicas retain their distinct rank owner
+            // across reset and must not reread or rebuild those weights.
+            if(!previous.empty())for(int rank=0;rank<2;++rank)EXPECT_EQ(norms[rank],previous[rank]);
             previous=norms;
             manager.clearCache();
         }
@@ -2244,160 +2354,149 @@ TEST(WeightManagerCPUShardCache, GPUImmutableHostSourceEnumerationRetainsCanonic
 namespace
 {
 /**
- * @brief Instrument only the real explicit-source boundary used by materialize().
+ * @brief Observe the actual common reader over one genuine tensor-backed native source.
  *
- * The original rectangular source remains available to a generic load so the
- * old null-selection fallthrough would succeed visibly. The explicit result is
- * independently controlled; counters distinguish that forbidden parent access
- * from metadata inspection and the one requested subset load.
+ * This in-memory fixture exposes original K4/N3/E4 directory facts and encoded
+ * bytes. It implements no subset loader or prepared parent: Manager and the
+ * original Store consume selected source windows into final admitted owners.
  */
 class ExplicitExpertSelectionLoader final : public MockModelLoader
 {
 public:
-    static constexpr const char *Name = "blk.0.ffn_gate_exps.weight";
-    /** @brief Retain a small native source and an independently selected response. */
-    explicit ExplicitExpertSelectionLoader(std::shared_ptr<TensorBase> selected)
-        : selected_(std::move(selected))
-    {
-        setBlockCount(1);
-        setEmbeddingLength(4);
-        setHeadCount(1);
-        setHeadCountKV(1);
-        setFeedForwardLength(3);
-        setVocabSize(4);
-        auto original = std::make_shared<FP32Tensor>(std::vector<size_t>{4, 3, 4});
-        for (size_t value = 0; value < 48; ++value)
-            original->mutable_data()[value] = static_cast<float>(value);
-        addTensor(Name, std::move(original));
+    static constexpr const char *Name="blk.0.ffn_gate_exps.weight";
+    /** @brief Retain independently identifiable original native expert rows. */
+    ExplicitExpertSelectionLoader() {
+        setBlockCount(1);setEmbeddingLength(4);setHeadCount(1);setHeadCountKV(1);
+        setFeedForwardLength(3);setVocabSize(4);
+        auto original=std::make_shared<FP32Tensor>(std::vector<size_t>{4,3,4});
+        for(size_t value=0;value<48;++value)original->mutable_data()[value]=float(value);
+        addTensor(Name,std::move(original));
     }
-    /** @brief Count any attempted generic full-parent access before delegating to the real mock loader. */
-    std::shared_ptr<TensorBase> loadTensor(const std::string &name, DeviceId device,
-        WeightPrecision precision) override
-    {
-        ++full_parent_calls;
-        return MockModelLoader::loadTensor(name, device, precision);
+    /** @brief Keep authoritative native metadata except an explicitly adversarial source declaration. */
+    NativeWeightSourceGeometry nativeWeightSourceGeometry(const std::string& name)override {
+        ++geometry_calls;auto source=MockModelLoader::nativeWeightSourceGeometry(name);
+        if(foreign_shape)source.original_shape=*foreign_shape;
+        return source;
     }
-    /** @brief Observe exact explicit arguments and return the authored result unchanged. */
-    std::shared_ptr<TensorBase> loadTensorExpertSelection(const std::string &name,
-        const std::vector<size_t> &experts, DeviceId device, WeightPrecision precision) override
-    {
-        ++selection_calls;
-        selected_name = name;
-        selected_ids = experts;
-        selected_device = device;
-        selected_precision = precision;
-        return selected_;
+    /** @brief Observe only actual useful original coordinates; inject absence before any copy. */
+    void readNativeWeightSourceWindow(const std::string& name,const NativeWeightSourceWindow& window,
+        std::span<std::byte> bytes)override {
+        ++native_calls;native_names.push_back(name);native_windows.push_back(window);
+        if(unavailable)throw std::runtime_error("Explicit original native expert source unavailable");
+        MockModelLoader::readNativeWeightSourceWindow(name,window,bytes);
     }
-    int full_parent_calls = 0;
-    int selection_calls = 0;
-    std::string selected_name;
-    std::vector<size_t> selected_ids;
-    DeviceId selected_device = DeviceId::invalid();
-    WeightPrecision selected_precision = WeightPrecision::NATIVE;
-private:
-    std::shared_ptr<TensorBase> selected_;
+    /** @brief A generic whole-parent call cannot replace an explicit source request. */
+    std::shared_ptr<TensorBase> loadTensor(const std::string&,DeviceId,WeightPrecision)override {
+        ++full_parent_calls;throw std::logic_error("Explicit source entered forbidden whole-parent loader");
+    }
+    /** @brief Retired CPU subset loading is forbidden even when original source bytes exist. */
+    std::shared_ptr<TensorBase> loadTensorExpertSelection(const std::string&,const std::vector<size_t>&,
+        DeviceId,WeightPrecision)override {
+        ++selection_calls;throw std::logic_error("Explicit source entered retired compact-parent loader");
+    }
+    bool unavailable=false;
+    std::optional<std::vector<size_t>> foreign_shape;
+    size_t geometry_calls=0,native_calls=0,full_parent_calls=0,selection_calls=0;
+    std::vector<std::string> native_names;
+    std::vector<NativeWeightSourceWindow> native_windows;
 };
-
-/** @return One exact non-contiguous original expert-axis requirement, without matrix projection or conversion. */
-WeightPlan explicitExpertSelectionPlan(bool required = true)
-{
-    WeightPlan plan;
-    WeightRequirement request;
-    request.canonical_name = ExplicitExpertSelectionLoader::Name;
-    request.required = required;
-    request.role = WeightRole::MoEExpertGate;
-    request.derivation = WeightDerivationKind::ExpertSlice;
-    request.layer = 0;
-    request.target_device = DeviceId::cpu();
-    request.host_policy = WeightHostPolicy::RequiredForCPUExecution;
-    request.overlay_domain = "selected_cpu";
-    request.overlay_participant_world_rank = 0;
-    request.overlay_participant_index = 1;
-    request.slice.source_rows = request.slice.row_count = 4;
-    request.slice.source_cols = request.slice.col_count = 3;
-    request.slice.expert_start = 1;
-    request.slice.expert_count = 2;
-    request.slice.expert_ids = {1, 3};
-    plan.add(std::move(request));
-    return plan;
+/** @return Identified exact non-contiguous original expert requirement, with no live prepared fields. */
+WeightPlan explicitExpertSelectionPlan(bool required=true) {
+    WeightPlan plan(InferenceStrategy{.model_id=ModelContextId{583}});
+    WeightRequirement request;request.canonical_name=ExplicitExpertSelectionLoader::Name;
+    request.required=required;request.role=WeightRole::MoEExpertGate;
+    request.derivation=WeightDerivationKind::ExpertSlice;request.layer=0;
+    request.target_device=DeviceId::cpu();request.host_policy=WeightHostPolicy::RequiredForCPUExecution;
+    request.overlay_domain="selected_cpu";request.overlay_participant_world_rank=0;request.overlay_participant_index=1;
+    request.slice.source_rows=request.slice.row_count=4;request.slice.source_cols=request.slice.col_count=3;
+    request.slice.expert_start=1;request.slice.expert_count=2;request.slice.expert_ids={1,3};
+    plan.add(std::move(request));return plan;
 }
 } // namespace
 
-/** @test A failed explicit expert request is fatal even if the generic parent exists or the binding is optional. */
-TEST(WeightManagerExpertSourceSelection, RejectsUnavailableSelectionWithoutFullParentLoad)
-{
-    for (bool required : {false, true})
-    {
-        SCOPED_TRACE(required);
-        ExplicitExpertSelectionLoader loader(nullptr);
-        WeightManager manager(loader, nullptr, nullptr,
-            WeightDistributionStrategy::REPLICATED, WeightPrecision::NATIVE);
-        EXPECT_THROW((void)manager.materialize(explicitExpertSelectionPlan(required)), std::runtime_error);
-        EXPECT_EQ(loader.selection_calls, 1);
-        EXPECT_EQ(loader.full_parent_calls, 0)
-            << "An explicit subset failure must not enter generic full-parent loading";
-        EXPECT_EQ(loader.selected_ids, (std::vector<size_t>{1, 3}));
+/** @test Failed actual native reading is fatal for required/optional selections despite an available full source. */
+TEST(WeightManagerExpertSourceSelection, RejectsUnavailableSelectionWithoutFullParentLoad) {
+    for(const bool required:{false,true}) {
+        SCOPED_TRACE(required);ExplicitExpertSelectionLoader loader;
+        WeightManager manager(loader,nullptr,nullptr,WeightDistributionStrategy::REPLICATED,WeightPrecision::NATIVE);
+        const auto plan=explicitExpertSelectionPlan(required);admitCPUWeightPlansForTest(manager,loader,{&plan});
+        loader.unavailable=true;
+        try {(void)manager.materialize(plan);FAIL()<<"Unavailable original source unexpectedly published";}
+        catch(const std::runtime_error& error){EXPECT_STREQ(error.what(),"Explicit original native expert source unavailable");}
+        EXPECT_EQ(loader.native_calls,1u);ASSERT_EQ(loader.native_windows.size(),1u);
+        EXPECT_EQ(loader.native_windows.front().original_expert,1u);
+        EXPECT_EQ(loader.native_windows.front().rows,3u);EXPECT_EQ(loader.native_windows.front().columns,4u);
+        EXPECT_EQ(loader.full_parent_calls,0u);EXPECT_EQ(loader.selection_calls,0u);
+        EXPECT_EQ(manager.physicalMemoryAuthority()->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::PrimaryModelWeights,
+            PhysicalMemoryMaterializationKind::NewAllocation),0u);
+        EXPECT_EQ(manager.physicalMemoryAuthority()->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::WeightLoadStaging,
+            PhysicalMemoryMaterializationKind::NewAllocation),0u);
     }
 }
 
-/** @test Expert-axis-only requests preserve the exact original K/N axes and selected E extent. */
-TEST(WeightManagerExpertSourceSelection, RejectsWrongRankExpertCountOrMatrixAxesWithoutFullParentLoad)
-{
-    const std::vector<std::vector<size_t>> wrong_shapes{
-        {12, 2}, {4, 3, 1}, {4, 3, 4}, {5, 3, 2}, {4, 2, 2}, {3, 4, 2}};
-    for (const auto &shape : wrong_shapes)
-    {
-        SCOPED_TRACE(::testing::PrintToString(shape));
-        auto selected = std::make_shared<FP32Tensor>(shape);
-        ExplicitExpertSelectionLoader loader(selected);
-        WeightManager manager(loader, nullptr, nullptr,
-            WeightDistributionStrategy::REPLICATED, WeightPrecision::NATIVE);
-        EXPECT_THROW((void)manager.materialize(explicitExpertSelectionPlan()), std::runtime_error);
-        EXPECT_EQ(loader.selection_calls, 1);
-        EXPECT_EQ(loader.full_parent_calls, 0);
-    }
-}
-
-/** @test A genuine native non-contiguous subset retains exact slots, type and logical binding across repeated materialization. */
-TEST(WeightManagerExpertSourceSelection, PreservesExactNativeSubsetBinding)
-{
-    auto selected = std::make_shared<FP32Tensor>(std::vector<size_t>{4, 3, 2});
-    for (size_t value = 0; value < 12; ++value)
-    {
-        selected->mutable_data()[value] = static_cast<float>(12 + value);
-        selected->mutable_data()[12 + value] = static_cast<float>(36 + value);
-    }
-    ExplicitExpertSelectionLoader loader(selected);
-    WeightManager manager(loader, nullptr, nullptr,
-        WeightDistributionStrategy::REPLICATED, WeightPrecision::NATIVE);
-    for (int repeat = 0; repeat < 2; ++repeat)
-    {
-        const auto frozen = manager.materialize(explicitExpertSelectionPlan());
-        ASSERT_EQ(frozen.bindings().size(), 1u);
-        const auto &binding = frozen.bindings().front();
-        ASSERT_EQ(binding.tensor, selected.get());
-        EXPECT_EQ(binding.tensor->shape(), (std::vector<size_t>{4, 3, 2}));
-        EXPECT_EQ(binding.tensor->native_type(), TensorType::FP32);
-        EXPECT_EQ(binding.identity.derivation, WeightDerivationKind::ExpertSlice);
-        EXPECT_EQ(binding.identity.overlay_domain, "selected_cpu");
-        EXPECT_EQ(binding.identity.overlay_participant_world_rank, 0);
-        EXPECT_EQ(binding.identity.overlay_participant_index, 1);
-        EXPECT_TRUE(binding.slice.inner_is_presliced);
-        EXPECT_EQ(binding.slice.expert_ids, (std::vector<int>{1, 3}));
-        EXPECT_EQ(binding.slice.expert_count, 2u);
-        EXPECT_EQ(binding.slice.row_count, 4u);
-        EXPECT_EQ(binding.slice.col_count, 3u);
-        const auto *data = static_cast<const float *>(binding.tensor->raw_data());
-        for (size_t value = 0; value < 12; ++value)
-        {
-            EXPECT_EQ(data[value], static_cast<float>(12 + value));
-            EXPECT_EQ(data[12 + value], static_cast<float>(36 + value));
+/** @test Native rank/axes/E facts and read extent cannot silently replace an exact selected source. */
+TEST(WeightManagerExpertSourceSelection, RejectsWrongRankExpertCountOrMatrixAxesWithoutFullParentLoad) {
+    const std::vector<std::vector<size_t>> wrong_shapes{{12,2},{4,3,1},{4,3,4},{5,3,2},{4,2,2},{3,4,2}};
+    for(const auto& shape:wrong_shapes) {
+        SCOPED_TRACE(::testing::PrintToString(shape));ExplicitExpertSelectionLoader loader;
+        WeightManager manager(loader,nullptr,nullptr,WeightDistributionStrategy::REPLICATED,WeightPrecision::NATIVE);
+        const auto plan=explicitExpertSelectionPlan();admitCPUWeightPlansForTest(manager,loader,{&plan});
+        const auto before=loader.geometry_calls;
+        if(shape==std::vector<size_t>{4,3,4}) {
+            // E4 is valid ORIGINAL directory metadata, but the reader cannot
+            // substitute its whole4-expert extent for one selected matrix.
+            const auto original=loader.nativeWeightSourceGeometry(ExplicitExpertSelectionLoader::Name);
+            const auto source=projectNativeWeightSource(plan.requirements().front(),original);ASSERT_EQ(source.size(),2u);
+            std::array<std::byte,48*sizeof(float)> sentinel;sentinel.fill(std::byte{0xcd});
+            try {loader.readNativeWeightSourceWindow(ExplicitExpertSelectionLoader::Name,source.front().range,sentinel);
+                FAIL()<<"Whole source extent replaced one selected native matrix";}
+            catch(const std::invalid_argument& error){EXPECT_STREQ(error.what(),"Mock native window disagrees with its original tensor");}
+            EXPECT_TRUE(std::all_of(sentinel.begin(),sentinel.end(),[](auto byte){return byte==std::byte{0xcd};}));
+            EXPECT_EQ(loader.native_calls,1u);
+        } else {
+            loader.foreign_shape=shape;
+            try {(void)manager.materialize(plan);FAIL()<<"Foreign original source geometry unexpectedly published";}
+            catch(const std::invalid_argument& error){EXPECT_NE(std::string(error.what()).find("projection"),std::string::npos)<<error.what();}
+            EXPECT_GT(loader.geometry_calls,before);EXPECT_EQ(loader.native_calls,0u);
         }
+        EXPECT_EQ(loader.full_parent_calls,0u);EXPECT_EQ(loader.selection_calls,0u);
+        EXPECT_EQ(manager.physicalMemoryAuthority()->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::PrimaryModelWeights,
+            PhysicalMemoryMaterializationKind::NewAllocation),0u);
     }
-    EXPECT_EQ(loader.selection_calls, 2);
-    EXPECT_EQ(loader.full_parent_calls, 0);
-    EXPECT_EQ(loader.selected_name, ExplicitExpertSelectionLoader::Name);
-    EXPECT_EQ(loader.selected_ids, (std::vector<size_t>{1, 3}));
-    EXPECT_EQ(loader.selected_device, DeviceId::cpu());
-    EXPECT_EQ(loader.selected_precision, WeightPrecision::NATIVE);
 }
+
+/** @test Two actual final matrices retain exact sparse IDs/native bytes and reuse the same final owners. */
+TEST(WeightManagerExpertSourceSelection, PreservesExactNativeSubsetBinding) {
+    ExplicitExpertSelectionLoader loader;
+    WeightManager manager(loader,nullptr,nullptr,WeightDistributionStrategy::REPLICATED,WeightPrecision::NATIVE);
+    const auto plan=explicitExpertSelectionPlan();admitCPUWeightPlansForTest(manager,loader,{&plan});
+    std::vector<TensorBase*> first;
+    for(int repeat=0;repeat<2;++repeat) {
+        const auto frozen=manager.materialize(plan);ASSERT_EQ(frozen.bindings().size(),2u);
+        for(size_t ordinal=0;ordinal<2;++ordinal) {
+            const int expert=ordinal?3:1;const auto& binding=frozen.bindings()[ordinal];
+            ASSERT_NE(binding.tensor,nullptr);EXPECT_EQ(binding.tensor->shape(),(std::vector<size_t>{3,4}));
+            EXPECT_EQ(binding.tensor->native_type(),TensorType::FP32);EXPECT_EQ(binding.identity.expert,expert);
+            EXPECT_EQ(binding.identity.derivation,WeightDerivationKind::ExpertSlice);
+            EXPECT_EQ(binding.identity.overlay_domain,"selected_cpu");EXPECT_EQ(binding.identity.overlay_participant_world_rank,0);
+            EXPECT_EQ(binding.identity.overlay_participant_index,1);EXPECT_TRUE(binding.slice.inner_is_presliced);
+            EXPECT_EQ(binding.slice.expert_ids,(std::vector<int>{expert}));EXPECT_EQ(binding.slice.expert_count,1u);
+            EXPECT_EQ(binding.slice.row_count,3u);EXPECT_EQ(binding.slice.col_count,4u);
+            ASSERT_TRUE(binding.native_source);EXPECT_EQ(binding.native_source->original.original_shape,(std::vector<size_t>{4,3,4}));
+            EXPECT_EQ(binding.native_source->range.original_expert,size_t(expert));
+            EXPECT_EQ(binding.native_source->range.selected_expert_ordinal,ordinal);EXPECT_FALSE(binding.projection_source_owner);
+            ASSERT_TRUE(binding.prepared);EXPECT_EQ(binding.prepared->device,DeviceId::cpu());
+            EXPECT_EQ(binding.prepared->kind,PreparedWeightKind::CpuPackedGemm);
+            ASSERT_TRUE(manager.preparedWeightStore()->gemmKernelLifetime(*binding.prepared));
+            const auto* data=static_cast<const float*>(binding.tensor->raw_data());ASSERT_NE(data,nullptr);
+            for(size_t value=0;value<12;++value)EXPECT_EQ(data[value],float(size_t(expert)*12+value));
+            if(!repeat)first.push_back(binding.tensor);else EXPECT_EQ(binding.tensor,first[ordinal]);
+        }
+        EXPECT_EQ(loader.native_calls,2u); // Repeat must not reread or replace either final owner.
+    }
+    ASSERT_EQ(loader.native_windows.size(),2u);EXPECT_EQ(loader.native_windows[0].original_expert,1u);
+    EXPECT_EQ(loader.native_windows[1].original_expert,3u);EXPECT_EQ(loader.full_parent_calls,0u);EXPECT_EQ(loader.selection_calls,0u);
+    EXPECT_EQ(loader.native_names,(std::vector<std::string>{ExplicitExpertSelectionLoader::Name,ExplicitExpertSelectionLoader::Name}));
+}
+
+#include "CPUFinalWeightCacheContract.inc"

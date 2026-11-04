@@ -18,6 +18,7 @@
  */
 
 #include "MoEOverlayLocalCapacityPlanner.h"
+#include "loaders/NativeWeightLoadStaging.h"
 #include "backends/NativeContextPreparation.h"
 #include "utils/DebugEnv.h"
 #include "planning/RankMemoryPlanInputs.h"
@@ -26,6 +27,9 @@
 #include "backends/RetainedParticipantGraphExecutable.h"
 #include "MoEOverlayNoPeerResidency.h"
 #include "collective/LocalTPCollectiveInventory.h"
+#include "collective/NativeCPUCollectiveProgram.h"
+#include "collective/backends/ShmemSpinBackend.h"
+#include "MoEExpertOwnerMap.h"
 
 #include "planning/ActivationBufferSizing.h"
 #include "planning/CapturedGraphMemoryEstimator.h"
@@ -368,6 +372,79 @@ namespace llaminar2
 
     namespace
     {
+        /** @brief Cold immutable declaration only; the existing runner owns the one real domain/context. */
+        struct CPUJointFixedDeclaration {
+            NativeCPUCollectiveProgram program;
+            std::shared_ptr<const MoEExpertShardCohort> cohort;
+            std::optional<size_t> member;
+        };
+        /** @brief Resolve original native source before quotas, never through a whole-owner map.
+         * All retained layer classes must share the same physical serial H/localF
+         * and original membership. Exact per-layer source authority stays with
+         * preparation/registry leases rather than this allocation declaration.
+         */
+        std::optional<CPUJointFixedDeclaration> cpuJointFixedDeclaration(
+            const MoEOverlayLocalCapacityPlannerInput& input) {
+            const auto& plan=*input.overlay_plan;
+            if(!MoEExpertOwnerMap::usesCPUJointFragments(plan))return std::nullopt;
+            const RoutedExpertDomain* joint=nullptr;int ordinal=-1;
+            for(size_t d=0;d<plan.domains.size();++d) {
+                const auto& domain=plan.domains[d];
+                if(domain.routed_compute_policy!=RoutedExpertComputePolicy::TensorSharded || domain.participants.size()<=1 ||
+                   std::none_of(plan.routed_tiers.begin(),plan.routed_tiers.end(),[&](const auto& tier){return tier.domain==domain.name;}) ||
+                   std::none_of(domain.participants.begin(),domain.participants.end(),[](const auto& address){return address.isCPU();}))continue;
+                if(joint)throw std::invalid_argument("CPU joint first execution requires one original CPU shard domain/context");
+                if(domain.scope!=ExecutionDomainScope::NODE_LOCAL || (domain.participants.size()<2 || domain.participants.size()>8) ||
+                   domain.world_ranks.size()!=domain.participants.size() ||
+                   !std::all_of(domain.participants.begin(),domain.participants.end(),[](const auto& address){return address.isCPU();}))
+                    throw std::invalid_argument("CPU joint fixed geometry requires original bound NODE_LOCAL CPU2–CPU8 membership");
+                if(d>size_t(std::numeric_limits<int>::max()))throw std::overflow_error("CPU joint original domain ordinal exceeds native identity");
+                joint=&domain;ordinal=static_cast<int>(d);
+            }
+            if(!joint)return std::nullopt;
+            if(input.rank_plan->runtime.moe_rebalance.mode!=MoERebalanceRuntimeMode::Off)
+                throw std::invalid_argument("CPU joint fixed geometry supports Static only; cohort movement is not implemented");
+            if(!input.cluster_inventory || input.original_expert_manifest.empty())
+                throw std::invalid_argument("CPU joint fixed geometry requires original source manifest and cluster membership before quotas");
+            if(joint->name==plan.continuation_domain)
+                throw std::invalid_argument("CPU joint first execution requires an expert domain distinct from continuation");
+            std::vector<MoEExpertShardCohort::Participant> members;
+            for(const auto& declared:MoEExpertOwnerMap::declaredParticipants(plan,{.reject_tensor_sharded_domains=false}))
+                if(declared.domain_name==joint->name) {
+                    if(!declared.world_rank_known || declared.domain_participant_index!=static_cast<int>(members.size()))
+                        throw std::invalid_argument("CPU joint fixed geometry lost original participant order/rank");
+                    members.push_back({declared.participant_id,declared.world_rank,declared.address});
+                }
+            if(members.size()!=joint->participants.size())
+                throw std::invalid_argument("CPU joint first execution requires one original routed tier for its source cohort");
+            for(size_t i=0;i<members.size();++i) {
+                const auto& actual=input.cluster_inventory->getRank(members[i].world_rank);
+                if(actual.rank!=members[i].world_rank || (actual.cpu.type!=DeviceType::CPU || actual.cpu.local_device_id!=0) ||
+                   (actual.cpu.numa_node>=0 && actual.cpu.numa_node!=members[i].address.numa_node))
+                    throw std::invalid_argument("CPU joint fixed geometry differs from original rank/NUMA inventory");
+                if(input.cluster_inventory->connectionBetweenRanks(members.front().world_rank,members[i].world_rank).locality()==RankConnectionLocality::CrossNode)
+                    throw std::invalid_argument("CPU joint NODE_LOCAL cohort crosses original physical node membership");
+            }
+            std::set<int> expected;
+            for(int i=0;i<input.graph_family.main_layer_count;++i)expected.insert(input.graph_family.first_model_layer+i);
+            expected.insert(input.graph_family.mtp_source_layers.begin(),input.graph_family.mtp_source_layers.end());
+            std::vector<MoEOverlayLayerWeightManifest> retained;
+            for(const auto& layer:input.original_expert_manifest)if(expected.contains(layer.layer_idx))retained.push_back(layer);
+            if(retained.size()!=expected.size())throw std::invalid_argument("CPU joint fixed geometry omitted/duplicated original retained source layers");
+            const auto& profile=*input.model_profile;
+            auto cohort=CPUJointExpertRouteStorageLayout::checkedSerialCohort(retained,
+                {.experts=profile.expert_count,.model_columns=profile.d_model,.intermediate_columns=profile.expert_feed_forward_length},members);
+            std::vector<NativeCPUCollectiveProgram::Participant> native_members;
+            std::vector<DeviceId> devices;
+            std::optional<size_t> local;
+            for(size_t i=0;i<members.size();++i) {
+                native_members.push_back({members[i].world_rank,members[i].address});devices.push_back(DeviceId::cpu());
+                if(members[i].world_rank==input.rank_plan->rank)local=i;
+            }
+            return CPUJointFixedDeclaration{NativeCPUCollectiveProgram::expertShardRoutePartials(ordinal,
+                BackendSelector::resolve(joint->backend,devices),std::move(native_members)),std::move(cohort),local};
+        }
+
         /** @brief Distinct stage owners awaiting the shared MemoryPlanner transaction. */
         struct PreparedLocalCapacity
         {
@@ -375,6 +452,7 @@ namespace llaminar2
             std::set<DeviceId> resource_devices;
             std::set<DeviceId> endpoint_devices;
             MoEOverlayActivationChannelPlan activation_channel_plan;
+            std::optional<CPUJointFixedDeclaration> cpu_joint;
         };
 
         /**
@@ -447,6 +525,9 @@ namespace llaminar2
                             rank_plan.runtime.mtp)));
             }
 
+            auto cpu_joint=cpuJointFixedDeclaration(input);
+            if(cpu_joint && (transfer || rank_plan.usesLocalPP() || rank_plan.usesPipelineParallel()))
+                throw std::invalid_argument("CPU joint pipeline execution has no original shared context handoff; ordinary PP is unchanged");
             const auto bound =
                 MoEOverlayCapacityAdmission::boundParticipants(overlay_plan);
             const auto continuation_shards =
@@ -537,7 +618,7 @@ namespace llaminar2
                 }
             }
             std::set<DeviceId> resource_devices = endpoint_devices;
-            if (input.require_host_memory_authority || needs_host_demand)
+            if (input.require_host_memory_authority || needs_host_demand || cpu_joint)
                 resource_devices.insert(DeviceId::cpu());
             for (const auto &charge : activation_channel_plan.staging_charges)
             {
@@ -774,14 +855,25 @@ namespace llaminar2
                     std::sort(admission->controller_devices.begin(),admission->controller_devices.end());
                     admission->controller_devices.erase(std::unique(admission->controller_devices.begin(),
                         admission->controller_devices.end()),admission->controller_devices.end());
+                    std::optional<CPUJointExpertRouteStorageLayout> joint_routes;
+                    if(cpu_joint) {
+                        if(!cpu_joint->member || admission->participant_ids.size()!=1 ||
+                           admission->participant_ids.front()!=cpu_joint->cohort->participants()[*cpu_joint->member].participant_id)
+                            throw std::invalid_argument("CPU joint fixed roots require their sole original local participant");
+                        joint_routes.emplace(cpu_joint->cohort,*cpu_joint->member,
+                            static_cast<size_t>(std::max(overlay_segment_rows,config.mtp_enabled?config.mtp_target_query_rows:1)),profile.expert_used_count);
+                    }
+                    const bool canonical_routes=!joint_routes || joint_routes->isRoot();
+                    const int local_intermediate=joint_routes?joint_routes->intermediate():profile.expert_feed_forward_length;
                     admission->envelope=std::make_shared<const CPUSerialExpertStorageEnvelope>(device,
                         overlay_segment_rows,config.mtp_enabled?config.mtp_target_query_rows:1,
                         profile.d_model,profile.expert_used_count,capture.prefill_graph_bucket_sizes,
                         capture.prefill_graph_min_seq,
-                        size_t(capture.prefill_graph_max_cached_buckets)-kExpertOverlayPrefillGraphIdentityReserve,true,
+                        size_t(capture.prefill_graph_max_cached_buckets)-kExpertOverlayPrefillGraphIdentityReserve,
+                        canonical_routes,
                         continuation_shards.empty()?CPUSerialExpertFamilyPolicy::PublishedSchedule:
                             CPUSerialExpertFamilyPolicy::LocalPowerOfTwo,
-                        profile.expert_feed_forward_length,profile.expert_count);
+                        local_intermediate,profile.expert_count,std::move(joint_routes));
                     config.cpu_serial_expert_storage=std::move(admission);
                     config.concurrent_workspace_owners=config.cpu_serial_expert_storage->controller_devices.size();
                 }
@@ -985,6 +1077,19 @@ namespace llaminar2
                         config.ngram_table_placement=rank_plan.runtime.ngram_table_placement;
                     }
             }
+            for(auto& config:configs)if(config.device.is_cpu()) {
+                const auto joint=config.cpu_serial_expert_storage
+                    ? config.cpu_serial_expert_storage->envelope->admitted()->jointRoutes():std::optional<CPUJointExpertRouteStorageLayout>{};
+                if(joint)config.native_source_placement=joint->packed().placement();
+                else if(input.native_source_placement)config.native_source_placement=*input.native_source_placement;
+                if(!input.gpu_weight_load)continue;
+                if(!joint && !input.native_source_placement)
+                    throw std::invalid_argument("Fresh CPU source staging requires its original loader allocation placement");
+                config.native_weight_load_staging=quoteCPUWeightSourceStaging(profile,config,input.gpu_weight_load->policy,
+                    input.weight_precision,config.native_source_placement);
+                config.weight_load_staging.host_bytes=config.native_weight_load_staging
+                    ? config.native_weight_load_staging->physical_bytes:0;
+            }
             // CPU service demand belongs to this same fixed-owner transaction,
             // before expert quotas or lowest-priority table placement. Reused
             // runtime plans retain their original declaration session unchanged.
@@ -1013,7 +1118,8 @@ namespace llaminar2
                 if(config.associated_host_memory)config.associated_host_memory=source->originalResource(DeviceId::cpu());
             }
             return {.device_inputs = std::move(configs), .resource_devices = std::move(resource_devices),
-                .endpoint_devices = std::move(endpoint_devices), .activation_channel_plan = std::move(activation_channel_plan)};
+                .endpoint_devices = std::move(endpoint_devices), .activation_channel_plan = std::move(activation_channel_plan),
+                .cpu_joint=std::move(cpu_joint)};
         }
 
         /**
@@ -1138,6 +1244,18 @@ namespace llaminar2
                 }
                 const std::size_t captured_graph_bytes = device.is_gpu()
                     ? estimateCapturedGraphExecutableBytes(device, captured_inventory) : 0u;
+                if(device==DeviceId::cpu() && prepared.cpu_joint) {
+                    const auto& joint=*prepared.cpu_joint;
+                    // EVERY parent rank enters the same split, even excluded GPU
+                    // continuations. Only actual members own domain/arena bytes.
+                    NativeCPUCollectiveProgram::contributeProcessPoolBOM(physical_plan_builder,resource);
+                    if(joint.member) {
+                        joint.program.contributeDomainBOM(physical_plan_builder,resource,rank_plan.rank);
+                        if(*joint.member==0 && joint.program.backend()==CollectiveBackendType::UPI)
+                            physical_plan_builder.add(resource,PhysicalMemoryOwner::ActivationTransportStaging,
+                                ShmemSpinArena::allocationGeometry(static_cast<int>(joint.program.participants().size())).mapped_bytes);
+                    }
+                }
                 PhysicalMemoryBOMBuilder additions(resource);
                 // Startup probes reuse one serial scratch family on each CPU
                 // resource. Price it before automatic expert capacity fills RAM;

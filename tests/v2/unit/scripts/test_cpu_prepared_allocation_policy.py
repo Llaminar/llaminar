@@ -61,11 +61,6 @@ class CPUPreparedAllocationPolicyTests(unittest.TestCase):
                                "auto bypass=&KernelFactory::createGemm;"):
                 self.assertTrue(scan_source(f"src/v2/{directory}/example.cpp","void owner(){"+expression+"}"))
 
-    def test_optional_initial_context_cannot_receive_unaccounted_placement(self):
-        source="void owner(){ctx.initial_cpu_storage_placement="+OWNED+";}"
-        self.assertEqual(scan_source(PATH,source),[])
-        source="void owner(){ctx.initial_cpu_storage_placement=CPUWeightStoragePlacement::local();}"
-        self.assertTrue(scan_source(PATH,source))
 
     def test_comments_regular_raw_and_character_literals_are_ignored(self):
         source=r'''void owner(){
@@ -119,6 +114,27 @@ class CPUPreparedAllocationPolicyTests(unittest.TestCase):
         mutated=source.replace(needle,"binding.floating_operand_precision, CPUWeightStoragePlacement::local()")
         self.assertTrue(scan_source(path,mutated))
 
+    def test_real_joint_factory_requires_same_accounted_placement(self):
+        path="src/v2/loaders/PreparedWeightStore.cpp"
+        source=(Path(__file__).resolve().parents[4]/path).read_text(encoding="utf-8")
+        self.assertEqual(scan_source(path,source),[])
+        needle="Factory::GemmPreparationKind::AUTO, placement"
+        self.assertEqual(source.count(needle),1)
+        self.assertTrue(scan_source(path,source.replace(needle,
+            "Factory::GemmPreparationKind::AUTO, requested_placement")))
+        self.assertTrue(scan_source(path,source.replace(needle,
+            "Factory::GemmPreparationKind::AUTO, CPUWeightStoragePlacement::onNode(0)")))
+
+    def test_real_joint_requested_node_cannot_rebind_admitted_policy(self):
+        path="src/v2/loaders/PreparedWeightStore.cpp"
+        source=(Path(__file__).resolve().parents[4]/path).read_text(encoding="utf-8")
+        marker="        using Factory=llaminar::v2::kernels::KernelFactory;"
+        self.assertEqual(source.count(marker),1)
+        rebound=source.replace(marker,"        placement = requested_placement;\n"+marker)
+        self.assertTrue(scan_source(path,rebound))
+        rebound=source.replace(marker,"        placement = CPUWeightStoragePlacement::onNode(0);\n"+marker)
+        self.assertTrue(scan_source(path,rebound))
+
     def test_real_service_valid_call_does_not_hide_new_fallback(self):
         root=Path(__file__).resolve().parents[4]
         path="src/v2/execution/moe/MoEExpertWeightService.cpp"
@@ -156,15 +172,15 @@ class CPUPreparedAllocationPolicyTests(unittest.TestCase):
         source="void owner(){auto bypass=&KernelFactory::prepareExpertGemmLocal;}"
         self.assertTrue(scan_source(PATH,source))
 
-    def test_real_initial_override_setter_rejects_unaccounted_mutation(self):
+    def test_real_service_accounting_cannot_be_replaced_by_local_storage(self):
+        """The actual initial preparation retains its original PMA issuer."""
         root=Path(__file__).resolve().parents[4]
-        path="src/v2/loaders/WeightManager.cpp"
+        path="src/v2/execution/moe/MoEExpertWeightService.cpp"
         source=(root/path).read_text(encoding="utf-8")
         self.assertEqual(scan_source(path,source),[])
-        pattern=r"ctx\.initial_cpu_storage_placement\s*=\s*CPUWeightStoragePlacement::accounted\([^;]+;"
-        match=re.search(pattern,source)
+        match=re.search(r"placement\s*=\s*CPUWeightStoragePlacement::accounted\([^;]+;",source)
         self.assertIsNotNone(match)
-        mutated=(source[:match.start()]+"ctx.initial_cpu_storage_placement=CPUWeightStoragePlacement::local();"+
+        mutated=(source[:match.start()]+"placement=CPUWeightStoragePlacement::local();"+
                  source[match.end():])
         self.assertTrue(scan_source(path,mutated))
 
@@ -195,25 +211,25 @@ class CPUPreparedAllocationPolicyTests(unittest.TestCase):
         root=Path(__file__).resolve().parents[4]
         path="src/v2/execution/moe/MoEExpertWeightService.cpp"
         source=(root/path).read_text(encoding="utf-8")
-        needle="if (!ctx.initial_cpu_storage_placement && ctx.prepared_store)"
-        self.assertEqual(source.count(needle),1)
-        for replacement in ("if (false)","if (false) "+needle,
-                            "if (ctx.prepared_store)"):
-            self.assertTrue(scan_source(path,source.replace(needle,replacement)))
-
-    def test_real_initial_override_rejects_emplace_and_unsupported_aliases(self):
-        root=Path(__file__).resolve().parents[4]
-        path="src/v2/loaders/WeightManager.cpp"
-        source=(root/path).read_text(encoding="utf-8")
-        match=re.search(r"ctx\.initial_cpu_storage_placement\s*=\s*CPUWeightStoragePlacement::accounted\([^;]+;",source)
+        match=re.search(r"if\s*\(ctx\.prepared_store\)(?=\s*placement\s*=\s*CPUWeightStoragePlacement::accounted)",source)
         self.assertIsNotNone(match)
-        for replacement in (
-            "ctx.initial_cpu_storage_placement.emplace(CPUWeightStoragePlacement::local());",
-            "ctx.initial_cpu_storage_placement.emplace(CPUWeightStoragePlacement::onNode(0));",
-            "ctx.initial_cpu_storage_placement.reset();",
-            "auto& alias=ctx.initial_cpu_storage_placement;alias=CPUWeightStoragePlacement::local();"):
-            with self.subTest(replacement=replacement):
-                mutated=source[:match.start()]+replacement+source[match.end():]
+        for replacement in ("if (false)","if (false) "+match.group(),"if (true)"):
+            mutated=source[:match.start()]+replacement+source[match.end():]
+            self.assertTrue(scan_source(path,mutated))
+
+    def test_real_service_accounted_placement_cannot_be_rebound(self):
+        """A later direct or aliased mutation cannot escape the checked final policy."""
+        root=Path(__file__).resolve().parents[4]
+        path="src/v2/execution/moe/MoEExpertWeightService.cpp"
+        source=(root/path).read_text(encoding="utf-8")
+        self.assertEqual(scan_source(path,source),[])
+        match=re.search(r"placement\s*=\s*CPUWeightStoragePlacement::accounted\([^;]+;",source)
+        self.assertIsNotNone(match)
+        for mutation in ("placement=CPUWeightStoragePlacement::local();",
+                         "placement=CPUWeightStoragePlacement::onNode(0);",
+                         "auto& alias=placement;alias=CPUWeightStoragePlacement::local();"):
+            with self.subTest(mutation=mutation):
+                mutated=source[:match.end()]+mutation+source[match.end():]
                 self.assertTrue(scan_source(path,mutated))
 
     def test_unbound_manager_construction_forms_fail_in_production_roles(self):

@@ -104,6 +104,7 @@ namespace llaminar2
     namespace detail
     {
         struct PhysicalMemoryOpaqueContextRootState;
+        struct PhysicalMemoryReservationState;
         /** @brief One typed instance use record, never another byte/allocation ledger. */
         struct PhysicalMemoryHostServiceInstanceRecord {
             RetainedHostServiceInstance instance;
@@ -118,6 +119,7 @@ namespace llaminar2
             std::vector<std::shared_ptr<PhysicalMemoryHostServiceInstanceRecord>> host_service_instances; ///< Original instance lifecycle only; all byte claims remain above.
             struct ResourceClaims
             {
+                std::weak_ptr<PhysicalMemoryReservationState> cpu_collective_pool_borrow; ///< Readonly borrow of the sole original MPI session reservation, never resident bytes.
                 // Direct leases describe fixed backing allocations.
                 std::array<std::size_t, PhysicalMemoryBOM::ownerCount()>
                     new_allocations{};
@@ -196,6 +198,9 @@ namespace llaminar2
             PhysicalMemoryAuthorityPhase phase = PhysicalMemoryAuthorityPhase::Admitted;
             bool preparation_frozen = false;
             mutable std::mutex mutex;
+            // One common CPU load arena across all model managers sharing this
+            // rank ledger. No accounting operation waits while holding mutex.
+            std::mutex cpu_weight_source_mutex;
         };
 
         /** @brief Epoch lifecycle facts; all mutation holds authority->mutex. */
@@ -273,6 +278,18 @@ namespace llaminar2
             std::size_t native_preclaimed_bytes = 0u;
             bool registered = false;
         };
+
+        /** @brief Observe the original pool commitment without issuing another reservation.
+         * The original session keeps the strong root until successful MPI_Finalize.
+         * A borrower cannot materialize this capacity or extend its physical lifetime. */
+        std::size_t borrowedCPUCollectivePoolBytes(
+            const PhysicalMemoryMaterializationState::ResourceClaims& claims,
+            std::size_t owner)
+        {
+            if (owner != static_cast<std::size_t>(PhysicalMemoryOwner::NativeCPUCollectiveProcessPool)) return 0;
+            const auto original = claims.cpu_collective_pool_borrow.lock();
+            return original ? original->capacity_bytes : 0;
+        }
 
         /** @brief One actual source-owned reservation family in the canonical authority. */
         struct PhysicalMemoryOpaqueContextRootState {
@@ -936,8 +953,23 @@ namespace llaminar2
                     "Native admission is not a fully published frozen Preparing source");
             const auto &resources = final->plan().resources();
             if (resources.size() != state.observations.size())
-                throw std::invalid_argument(
-                    "Final native admission changes/drops the original physical resource registry");
+            {
+                // Report the two cold declarations directly. A rank-local source
+                // presented with a topology-wide certificate must be diagnosable
+                // without another model launch or live device probe.
+                std::ostringstream diagnostic;
+                diagnostic << "Final native admission changes/drops the original physical resource registry"
+                           << "; source_rank=" << epoch->world_rank << " original=[";
+                for (const auto &resource : state.observations)
+                    diagnostic << PhysicalMemoryAllocatorIdentity{
+                        resource.world_rank, resource.device}.toString() << ' ';
+                diagnostic << "] final=[";
+                for (const auto &bom : resources)
+                    diagnostic << PhysicalMemoryAllocatorIdentity{
+                        bom.resource().world_rank, bom.resource().device}.toString() << ' ';
+                diagnostic << ']';
+                throw std::invalid_argument(diagnostic.str());
+            }
             for (std::size_t i = 0; i < resources.size(); ++i)
             {
                 const auto &original = state.observations[i];
@@ -1778,7 +1810,7 @@ namespace llaminar2
             const std::size_t direct =
                 claims.new_allocations[owner_index] + claims.preparation_committed[owner_index];
             const std::size_t reserved =
-                claims.new_reservation_capacity[owner_index];
+                claims.new_reservation_capacity[owner_index] + detail::borrowedCPUCollectivePoolBytes(claims, owner_index);
             if (direct > limit || reserved > limit - direct ||
                 bytes > limit - direct - reserved)
             {
@@ -1836,7 +1868,7 @@ namespace llaminar2
                 : claims.adopted_residency[owner_index];
         const std::size_t reserved = kind == PhysicalMemoryMaterializationKind::NewAllocation
                                          ? claims.new_reservation_capacity[owner_index] +
-                                               claims.preparation_committed[owner_index]
+                                               claims.preparation_committed[owner_index] + detail::borrowedCPUCollectivePoolBytes(claims, owner_index)
                                          : 0u;
         if (counter > limit || reserved > limit - counter ||
             bytes > limit - counter - reserved)
@@ -1938,7 +1970,7 @@ namespace llaminar2
         {
             return claims.new_allocations[owner_index] +
                    claims.new_reservation_capacity[owner_index] +
-                   claims.preparation_committed[owner_index];
+                   claims.preparation_committed[owner_index] + detail::borrowedCPUCollectivePoolBytes(claims, owner_index);
         }
         return claims.adopted_residency[owner_index];
     }
@@ -1968,7 +2000,7 @@ namespace llaminar2
         const std::size_t direct =
             claims.new_allocations[owner_index] + claims.preparation_committed[owner_index];
         const std::size_t reserved =
-            claims.new_reservation_capacity[owner_index];
+            claims.new_reservation_capacity[owner_index] + detail::borrowedCPUCollectivePoolBytes(claims, owner_index);
         if (direct > limit || reserved > limit - direct)
             std::terminate();
         return limit - direct - reserved;
@@ -2078,7 +2110,7 @@ namespace llaminar2
                 const auto &claims = state_->claims[resource];
                 if (claims.new_allocations[owner_index] +
                             claims.new_reservation_capacity[owner_index] +
-                            claims.preparation_committed[owner_index] !=
+                            claims.preparation_committed[owner_index] + detail::borrowedCPUCollectivePoolBytes(claims, owner_index) !=
                         charge.incrementalBytes() ||
                     claims.adopted_residency[owner_index] != charge.already_resident_bytes)
                 {
@@ -2104,7 +2136,7 @@ namespace llaminar2
                 const auto &claims = state_->claims[resource];
                 const std::size_t committed_new = claims.new_allocations[owner_index] +
                                                   claims.new_reservation_capacity[owner_index] +
-                                                  claims.preparation_committed[owner_index];
+                                                  claims.preparation_committed[owner_index] + detail::borrowedCPUCollectivePoolBytes(claims, owner_index);
                 if (committed_new == charge.incrementalBytes() &&
                     claims.adopted_residency[owner_index] ==
                         charge.already_resident_bytes)
@@ -2145,6 +2177,8 @@ namespace llaminar2
                     admitted ? &state_->certificate->plan().resources()[resource].charge(kind)
                              : nullptr;
                 std::size_t opaque=0;
+                const auto borrowed = detail::borrowedCPUCollectivePoolBytes(claims, owner);
+                if (kind == PhysicalMemoryOwner::NativeCPUCollectiveDomain || kind == PhysicalMemoryOwner::NativeCPUCollectiveProcessPool) opaque = claims.new_reservation_capacity[owner];
                 for(auto* root=state_->opaque_contexts;root;root=root->next)
                     for(const auto& reservation:root->reservations)
                         if(reservation->registered && reservation->resource_index==resource && ownerIndex(reservation->owner)==owner)
@@ -2163,16 +2197,54 @@ namespace llaminar2
                     .committed_new_bytes = checkedAdd(
                         checkedAdd(claims.new_allocations[owner],
                                    claims.new_reservation_capacity[owner], "source commitments"),
-                        claims.preparation_committed[owner], "preparation commitments"),
+                        checkedAdd(claims.preparation_committed[owner], borrowed, "borrowed MPI pool obligation"), "preparation commitments"),
                     .adopted_resident_bytes = claims.adopted_residency[owner],
                     .preparation_committed_bytes = claims.preparation_committed[owner],
                     .preparation_materialized_bytes = claims.preparation_materialized[owner],
                     .native_declared_preclaimed_bytes = claims.native_declared_preclaimed[owner],
+                    .borrowed_opaque_runtime_committed_bytes = borrowed,
                     .opaque_runtime_committed_bytes = opaque,
                 });
             }
         }
         return result;
+    }
+
+    /** @brief Retain the sole original owner until the source lock has retired. */
+    struct PhysicalMemoryCPUWeightSourceLease::State
+    {
+        std::shared_ptr<PhysicalMemoryAuthority> original;
+        std::shared_ptr<detail::PhysicalMemoryMaterializationState> materialization;
+        std::unique_lock<std::mutex> lock;
+        /** @brief Wait only on the CPU source mutex, never the accounting mutex. */
+        State(std::shared_ptr<PhysicalMemoryAuthority> owner,
+              std::shared_ptr<detail::PhysicalMemoryMaterializationState> state)
+            : original(std::move(owner)), materialization(std::move(state)),
+              lock(materialization->cpu_weight_source_mutex) {}
+    };
+    PhysicalMemoryCPUWeightSourceLease::PhysicalMemoryCPUWeightSourceLease(std::unique_ptr<State> state)
+        : state_(std::move(state)) {}
+    PhysicalMemoryCPUWeightSourceLease::PhysicalMemoryCPUWeightSourceLease(PhysicalMemoryCPUWeightSourceLease &&) noexcept = default;
+    PhysicalMemoryCPUWeightSourceLease &PhysicalMemoryCPUWeightSourceLease::operator=(PhysicalMemoryCPUWeightSourceLease &&) noexcept = default;
+    PhysicalMemoryCPUWeightSourceLease::~PhysicalMemoryCPUWeightSourceLease() noexcept = default;
+
+    PhysicalMemoryCPUWeightSourceLease PhysicalMemoryAuthority::acquireCPUWeightSourceTransaction(DeviceId original_allocator)
+    {
+        auto original = weak_from_this().lock();
+        if (!original || original.get() != this || !original_allocator.is_valid() || !original_allocator.is_cpu())
+            throw std::logic_error("CPU weight source transaction requires its original shared physical authority and CPU allocator");
+        // No accounting mutex is held during source-lock acquisition. A waiting
+        // manager cannot prevent the previous arena's actual lease from retiring.
+        auto scope = std::make_unique<PhysicalMemoryCPUWeightSourceLease::State>(
+            std::move(original), ledger_.state_);
+        {
+            std::lock_guard lock(ledger_.state_->mutex);
+            const PhysicalMemoryAllocatorIdentity cpu{.world_rank = world_rank_, .device = original_allocator};
+            if (ledger_.state_->phase != PhysicalMemoryAuthorityPhase::Admitted ||
+                !ledger_.state_->certificate || !ledger_.state_->certificate->plan().find(cpu))
+                throw std::logic_error("CPU weight source transaction requires final original rank CPU admission");
+        }
+        return PhysicalMemoryCPUWeightSourceLease(std::move(scope));
     }
 
     /** @brief Lease teardown runs after the actual worker and existing byte claims have retired. */
@@ -2202,6 +2274,43 @@ namespace llaminar2
         if(!state_)std::terminate();std::lock_guard lock(state_->authority->mutex);
         if(!state_->record->active)std::terminate();state_->record->published=true;
     }
+    void PhysicalMemoryAuthority::borrowCPUCollectiveProcessPool(const PhysicalMemoryOwnerReservation& original)
+    {
+        const auto root = original.state_;
+        if (!root || root->owner != PhysicalMemoryOwner::NativeCPUCollectiveProcessPool || !root->capacity_bytes)
+            throw std::logic_error("MPI process pool borrow requires its original named reservation");
+        const auto source = original.allocatorIdentity();
+        if (source.world_rank != world_rank_ || source.device != DeviceId::cpu())
+            throw std::logic_error("MPI process pool borrow names a foreign CPU allocator");
+        const auto target = ledger_.state_;
+        if (target == root->authority) {
+            std::lock_guard lock(target->mutex);
+            if (target->phase != PhysicalMemoryAuthorityPhase::Admitted || !target->certificate || !root->registered || root->materialized_bytes)
+                throw std::logic_error("MPI process pool original commitment is not live/admitted");
+            return; // Already committed by this very ledger, never another reservation.
+        }
+        const auto certificate = requireAdmitted(*target);
+        const auto& resources = certificate->plan().resources();
+        std::scoped_lock lock(target->mutex, root->authority->mutex);
+        if (target->phase != PhysicalMemoryAuthorityPhase::Admitted || target->certificate != certificate ||
+            root->authority->phase != PhysicalMemoryAuthorityPhase::Admitted || !root->authority->certificate)
+            throw std::logic_error("MPI process pool admission identity changed before locked publication");
+        const auto found = std::find_if(resources.begin(), resources.end(), [&](const auto& bom){ return matches(bom.resource(), source); });
+        const auto owner = ownerIndex(root->owner);
+        if (found == resources.end() || found->charge(root->owner).incrementalBytes() != root->capacity_bytes ||
+            found->charge(root->owner).already_resident_bytes != 0 ||
+            found->resource().total_bytes != root->authority->certificate->plan().resources()[root->resource_index].resource().total_bytes || !root->registered || root->materialized_bytes != 0)
+            throw std::logic_error("MPI process pool borrow requires matching admitted potential growth, never resident credit");
+        auto& claims = target->claims[static_cast<std::size_t>(found-resources.begin())];
+        if (const auto previous = claims.cpu_collective_pool_borrow.lock()) {
+            if (previous != root) throw std::logic_error("MPI process pool borrow already belongs to another original session");
+            return;
+        }
+        if (claims.new_allocations[owner] || claims.new_reservation_capacity[owner] || claims.preparation_committed[owner])
+            throw std::logic_error("MPI process pool borrow cannot duplicate a local commitment");
+        claims.cpu_collective_pool_borrow = root;
+    }
+
     void PhysicalMemoryAuthority::requireOriginalHostServiceOwner(const std::shared_ptr<PhysicalMemoryAuthority>& memory)const{
         const auto original=weak_from_this().lock();
         if(!memory||memory.get()!=this||!original||original.get()!=this||original.owner_before(memory)||memory.owner_before(original))
@@ -2546,6 +2655,7 @@ namespace llaminar2
                    << " adopted_resident=" << row.adopted_resident_bytes
                    << " preparation_committed=" << row.preparation_committed_bytes
                    << " preparation_materialized=" << row.preparation_materialized_bytes
+                   << " borrowed_opaque_runtime_committed=" << row.borrowed_opaque_runtime_committed_bytes
                    << " opaque_runtime_committed=" << row.opaque_runtime_committed_bytes
                    << " native_declared_preclaimed=" << row.native_declared_preclaimed_bytes
                    << " committed=" << (row.committed() ? "true" : "false")

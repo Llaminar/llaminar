@@ -112,6 +112,9 @@ namespace llaminar2
 
     const float *BF16Tensor::data() const
     {
+        // A separately materialized FP32 cache remains owned; raw retirement
+        // forbids refreshing it through a retired parent vector.
+        if (is_raw_data_released()) return dequant_cache_.empty() ? nullptr : dequant_cache_.data();
         assertValid("BF16Tensor::data");
 
         // Lazy dequantization to FP32 cache
@@ -137,6 +140,7 @@ namespace llaminar2
 
     float *BF16Tensor::mutable_data()
     {
+        if (is_raw_data_released()) return nullptr;
         assertValid("BF16Tensor::mutable_data");
         throw std::runtime_error("BF16Tensor::mutable_data: BF16 tensors are immutable (use from_fp32 to update)");
     }
@@ -147,6 +151,7 @@ namespace llaminar2
 
     void *BF16Tensor::raw_host_data_ptr()
     {
+        if (is_raw_data_released()) return nullptr;
         if (is_view_)
         {
             return parent_data_ptr_->data() + view_offset_;
@@ -156,6 +161,7 @@ namespace llaminar2
 
     const void *BF16Tensor::raw_host_data_ptr() const
     {
+        if (is_raw_data_released()) return nullptr;
         if (is_view_)
         {
             return parent_data_ptr_->data() + view_offset_;

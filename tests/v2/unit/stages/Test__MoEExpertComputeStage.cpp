@@ -1294,6 +1294,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_OutputNonZero_Q4K)
     const auto params_admission = test::admitCPUExpertStageForTest(
         params, PhysicalMemoryOwner::PrimaryModelWeights);
     ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(params));
+    ExpertGemmRegistry params_registry;publishCPUExpertStageRegistryForTest(params,params_registry);
 
     MoEExpertComputeStage stage(params);
     auto workspace = bindExpertWorkspace(stage, params);
@@ -1379,6 +1380,7 @@ TEST_F(MoEExpertComputeStageTest,
     const auto router_params_admission = test::admitCPUExpertStageForTest(
         router_params, PhysicalMemoryOwner::PrimaryModelWeights);
     ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(router_params));
+    ExpertGemmRegistry router_params_registry;publishCPUExpertStageRegistryForTest(router_params,router_params_registry);
     MoEExpertComputeStage router_stage(router_params);
     auto router_workspace = bindExpertWorkspace(router_stage, router_params);
     ASSERT_TRUE(router_stage.execute(cpu_ctx_.get()));
@@ -1392,6 +1394,7 @@ TEST_F(MoEExpertComputeStageTest,
     const auto transported_params_admission = test::admitCPUExpertStageForTest(
         transported_params, PhysicalMemoryOwner::PrimaryModelWeights);
     ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(transported_params));
+    ExpertGemmRegistry transported_params_registry;publishCPUExpertStageRegistryForTest(transported_params,transported_params_registry);
     MoEExpertComputeStage transported_stage(std::move(transported_params));
     test::CPUStageTestWorkspace transported_workspace(transported_stage, 1);
     ASSERT_TRUE(transported_stage.execute(cpu_ctx_.get()));
@@ -1462,6 +1465,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_OutputNonZero_Q5K)
     const auto params_admission = test::admitCPUExpertStageForTest(
         params, PhysicalMemoryOwner::PrimaryModelWeights);
     ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(params));
+    ExpertGemmRegistry params_registry;publishCPUExpertStageRegistryForTest(params,params_registry);
 
     MoEExpertComputeStage stage(params);
     auto workspace = bindExpertWorkspace(stage, params);
@@ -1522,6 +1526,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_MultipleTokens)
     const auto params_admission = test::admitCPUExpertStageForTest(
         params, PhysicalMemoryOwner::PrimaryModelWeights);
     ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(params));
+    ExpertGemmRegistry params_registry;publishCPUExpertStageRegistryForTest(params,params_registry);
 
     MoEExpertComputeStage stage(params);
     auto workspace = bindExpertWorkspace(stage, params);
@@ -1756,6 +1761,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_All
             {
                 return false;
             }
+            ExpertGemmRegistry params_registry;publishCPUExpertStageRegistryForTest(params,params_registry);
             MoEExpertComputeStage stage(params);
             auto workspace = bindExpertWorkspace(stage, params);
             return stage.execute(cpu_ctx_.get());
@@ -2572,6 +2578,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_IQ3
             params, PhysicalMemoryOwner::PrimaryModelWeights);
         if (!MoEExpertComputeStage::prepareExpertGemmEngines(params))
             return false;
+        ExpertGemmRegistry params_registry;publishCPUExpertStageRegistryForTest(params,params_registry);
         MoEExpertComputeStage stage(params);
         auto workspace = bindExpertWorkspace(stage, params);
         return stage.execute(cpu_ctx_.get());
@@ -2680,6 +2687,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_Qwe
             params, PhysicalMemoryOwner::PrimaryModelWeights);
         if (!MoEExpertComputeStage::prepareExpertGemmEngines(params))
             return false;
+        ExpertGemmRegistry params_registry;publishCPUExpertStageRegistryForTest(params,params_registry);
         MoEExpertComputeStage stage(params);
         auto workspace = bindExpertWorkspace(stage, params);
         return stage.execute(cpu_ctx_.get());
@@ -2848,11 +2856,12 @@ TEST_F(MoEExpertComputeStageTest, MTPMoESidecarReusesPreparedExpertSlabsAfterRaw
 
     PreparedWeightStore store(ModelContextId{1234});
     auto initial = make_params();
-    initial.prepared_store = &store;
     ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(initial));
+    initial.prepared_store = &store;
     const auto initial_admission = test::admitCPUExpertStageForTest(
         initial, PhysicalMemoryOwner::PrimaryModelWeights);
     ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(initial));
+    ExpertGemmRegistry initial_registry;publishCPUExpertStageRegistryForTest(initial,initial_registry);
     ASSERT_TRUE(initial.gate_slab_ref.has_value());
     EXPECT_EQ(store.totalPopulatedExperts(), static_cast<size_t>(local_count * 3));
 
@@ -2864,7 +2873,8 @@ TEST_F(MoEExpertComputeStageTest, MTPMoESidecarReusesPreparedExpertSlabsAfterRaw
     ASSERT_TRUE(down_exps->is_raw_data_released());
 
     auto sidecar = make_params();
-    sidecar.prepared_store = &store;
+    sidecar.prepared_store = &store;sidecar.expert_registry=&initial_registry;
+    sidecar.gate_slab_ref=initial.gate_slab_ref;sidecar.up_slab_ref=initial.up_slab_ref;sidecar.down_slab_ref=initial.down_slab_ref;
     ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(sidecar));
     const auto sidecar_admission = test::admitCPUExpertStageForTest(
         sidecar, PhysicalMemoryOwner::PrimaryModelWeights);
@@ -2933,6 +2943,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_DifferentTokensGetDifferentOutputs)
     const auto params_admission = test::admitCPUExpertStageForTest(
         params, PhysicalMemoryOwner::PrimaryModelWeights);
     ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(params));
+    ExpertGemmRegistry params_registry;publishCPUExpertStageRegistryForTest(params,params_registry);
 
     MoEExpertComputeStage stage(params);
     auto workspace = bindExpertWorkspace(stage, params);
@@ -2992,6 +3003,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_NormTopKProbSumsToOne)
         const auto params_admission = test::admitCPUExpertStageForTest(
             params, PhysicalMemoryOwner::PrimaryModelWeights);
         ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(params));
+    ExpertGemmRegistry params_registry;publishCPUExpertStageRegistryForTest(params,params_registry);
 
         MoEExpertComputeStage stage(params);
         auto workspace = bindExpertWorkspace(stage, params);
@@ -3022,6 +3034,7 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_NormTopKProbSumsToOne)
         const auto params_admission = test::admitCPUExpertStageForTest(
             params, PhysicalMemoryOwner::PrimaryModelWeights);
         ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(params));
+    ExpertGemmRegistry params_registry;publishCPUExpertStageRegistryForTest(params,params_registry);
 
         MoEExpertComputeStage stage(params);
         auto workspace = bindExpertWorkspace(stage, params);
@@ -3691,6 +3704,7 @@ TEST_F(MoEExpertComputeStageTest, DeclaredCPUWorkspacePreservesRouterOwnerAndRep
         ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(ep));
         auto admission=admitCPUExpertStageForTest(ep,PhysicalMemoryOwner::PrimaryModelWeights);
         ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(ep));
+    ExpertGemmRegistry ep_registry;publishCPUExpertStageRegistryForTest(ep,ep_registry);
         MoERoutingStage router(rp);
         MoEExpertComputeStage expert(ep);
         auto requirements=expert.getWorkspaceRequirements(rows);

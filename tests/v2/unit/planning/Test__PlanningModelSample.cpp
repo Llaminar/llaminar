@@ -5,8 +5,9 @@
  * Tiny temporary fixtures cover every GGUF weight format without preparing a
  * kernel or touching a GPU. Nonzero byte patterns expose wrong offsets, column
  * strides and expert selection. PMA assertions prove source aliases retain
- * their claim after the metadata owner retires and failed reads release both
- * source and temporary-reader claims. These are not numerical model proofs.
+ * their claim after the metadata owner retires and failed reads release final
+ * storage. Direct window reads require no duplicate source-sized staging.
+ * These are not numerical model proofs.
  */
 #include "../../utils/ScopedGDNProjectionArithmetic.h"
 #include "planning/PlanningModelMetadata.h"
@@ -164,10 +165,11 @@ namespace
         return bytes;
     }
 
-    /** @return A device-free PMA envelope admitting exactly the two read allocations. */
-    std::shared_ptr<PhysicalMemoryAuthority> admit(size_t source_bytes, size_t staging_bytes)
+    /** @return A device-free PMA envelope admitting final payload and optional consumer scratch. */
+    std::shared_ptr<PhysicalMemoryAuthority> admit(size_t source_bytes, size_t staging_bytes,
+                                                 DeviceId allocator = DeviceId::cpu())
     {
-        const PhysicalMemoryResource resource{.world_rank = 0, .device = DeviceId::cpu(),
+        const PhysicalMemoryResource resource{.world_rank = 0, .device = allocator,
             .total_bytes = source_bytes + staging_bytes + 1, .admission_available_bytes = source_bytes + staging_bytes + 1};
         PhysicalMemoryPlanBuilder plan;
         plan.add(resource, PhysicalMemoryOwner::ModelSourcePayload, source_bytes);
@@ -177,9 +179,10 @@ namespace
     }
 
     /** @return Current new allocation claims, never a second ledger. */
-    size_t claimed(const std::shared_ptr<PhysicalMemoryAuthority> &memory, PhysicalMemoryOwner owner)
+    size_t claimed(const std::shared_ptr<PhysicalMemoryAuthority> &memory, PhysicalMemoryOwner owner,
+                   DeviceId allocator = DeviceId::cpu())
     {
-        return memory->claimedBytes(DeviceId::cpu(), owner, PhysicalMemoryMaterializationKind::NewAllocation);
+        return memory->claimedBytes(allocator, owner, PhysicalMemoryMaterializationKind::NewAllocation);
     }
 }
 
@@ -207,12 +210,12 @@ TEST(PlanningModelSample, EveryNativeFormatReadsExactDenseRowsAndColumns)
             EXPECT_EQ(received.executionFormat(), received.format());
             EXPECT_EQ(received.executionPayloadBytes(), received.geometry().source_bytes);
             const auto geometry = received.geometry();
-            auto memory = admit(geometry.source_bytes, geometry.source_bytes);
+            auto memory = admit(geometry.physicalBytes(), 0);
             std::optional sample(PlanningMatrixSamplePublication::publish(nullptr, received, memory,
                 DeviceId::cpu(), [&] { return received.load(source, memory, DeviceId::cpu()); }));
             const auto &tensor = sample->tensor();
             EXPECT_EQ(tensor.shape(), (std::vector<size_t>{geometry.n, geometry.k}));
-            EXPECT_EQ(claimed(memory, PhysicalMemoryOwner::ModelSourcePayload), geometry.source_bytes);
+            EXPECT_EQ(claimed(memory, PhysicalMemoryOwner::ModelSourcePayload), geometry.physicalBytes());
             EXPECT_EQ(claimed(memory, PhysicalMemoryOwner::WeightLoadStaging), 0u);
             const auto *actual = static_cast<const uint8_t *>(tensor.raw_data());
             if (selection < 2)
@@ -251,7 +254,7 @@ TEST(PlanningModelSample, RuntimePromotionPreservesNativeWireIdentityForEverySou
     }
 }
 
-TEST(PlanningModelSample, EveryNativeExpertViewRetainsItsParentAndLeaseAfterSourceDestruction)
+TEST(PlanningModelSample, EveryNativeExpertSurvivesSourceOwnerRetirement)
 {
     for (auto format : sourceFormats())
     {
@@ -260,7 +263,7 @@ TEST(PlanningModelSample, EveryNativeExpertViewRetainsItsParentAndLeaseAfterSour
         const std::string name = "blk.0.ffn_gate_exps.weight";
         const auto expected = populate(fixture.path(), name);
         const auto bytes_per_expert = expected.size() / 8;
-        auto memory = admit(bytes_per_expert, bytes_per_expert);
+        auto memory = admit(CPUStoragePlacement::local().physicalBytes<uint8_t>(bytes_per_expert), 0);
         std::optional<PlanningLoadedMatrixSample> sample;
         {
             PlanningModelSource source(fixture.path());
@@ -270,14 +273,39 @@ TEST(PlanningModelSample, EveryNativeExpertViewRetainsItsParentAndLeaseAfterSour
         ASSERT_TRUE(sample.has_value());
         EXPECT_EQ(sample->tensor().shape(), (std::vector<size_t>{512, 256}));
         EXPECT_EQ(sample->tensor().size_bytes(), bytes_per_expert);
-        EXPECT_EQ(claimed(memory, PhysicalMemoryOwner::ModelSourcePayload), bytes_per_expert);
+        EXPECT_EQ(claimed(memory, PhysicalMemoryOwner::ModelSourcePayload), CPUStoragePlacement::local().physicalBytes<uint8_t>(bytes_per_expert));
         EXPECT_EQ(std::memcmp(sample->tensor().raw_data(), expected.data() + 7 * bytes_per_expert, bytes_per_expert), 0);
         auto borrower = sample;
         sample.reset();
-        EXPECT_EQ(claimed(memory, PhysicalMemoryOwner::ModelSourcePayload), bytes_per_expert);
+        EXPECT_EQ(claimed(memory, PhysicalMemoryOwner::ModelSourcePayload), CPUStoragePlacement::local().physicalBytes<uint8_t>(bytes_per_expert));
         borrower.reset();
         EXPECT_EQ(claimed(memory, PhysicalMemoryOwner::ModelSourcePayload), 0u);
         EXPECT_EQ(claimed(memory, PhysicalMemoryOwner::WeightLoadStaging), 0u);
+    }
+}
+
+/** @test Final native samples and their source transaction retain the original nonzero CPU allocator. */
+TEST(PlanningModelSample, EveryNativeFormatRetainsExplicitCPUAllocator)
+{
+    const DeviceId allocator(DeviceType::CPU, 1);
+    for (const auto format : sourceFormats())
+    {
+        SCOPED_TRACE(static_cast<int>(format));
+        test::PlanningGGUFFixture fixture(true, false, format, 512);
+        const std::string name = "blk.0.ffn_gate_exps.weight";
+        const auto expected = populate(fixture.path(), name);
+        const size_t bytes = expected.size() / 8;
+        auto memory = admit(CPUStoragePlacement::local().physicalBytes<uint8_t>(bytes), 0, allocator);
+        {
+            PlanningModelSource source(fixture.path());
+            auto sample = source.loadSample({name, PlanningExpertMatrix{3}}, memory, allocator);
+            EXPECT_EQ(sample.tensor().home_device(), allocator);
+            EXPECT_EQ(sample.tensor().size_bytes(), bytes);
+            EXPECT_EQ(std::memcmp(sample.tensor().raw_data(), expected.data() + 3 * bytes, bytes), 0);
+            EXPECT_EQ(claimed(memory, PhysicalMemoryOwner::ModelSourcePayload, allocator), CPUStoragePlacement::local().physicalBytes<uint8_t>(bytes));
+            EXPECT_EQ(claimed(memory, PhysicalMemoryOwner::WeightLoadStaging, allocator), 0u);
+        }
+        EXPECT_EQ(claimed(memory, PhysicalMemoryOwner::ModelSourcePayload, allocator), 0u);
     }
 }
 
@@ -292,7 +320,7 @@ TEST(PlanningModelSample, MatrixWireRejectsMalformedOrChangedSourceBeforeAllocat
         const auto plan = PlanningMatrixSamplePlan::resolve(source,
             {"blk.0.ffn_down.weight", PlanningMatrixColumns{256, 512}});
         const auto bytes = plan.serialize();
-        auto memory = admit(plan.geometry().source_bytes, plan.geometry().source_bytes);
+        auto memory = admit(plan.geometry().physicalBytes(), plan.geometry().source_bytes);
         for (int defect = 0; defect < 18; ++defect)
         {
             auto malformed = nlohmann::json::parse(bytes);
@@ -348,7 +376,7 @@ TEST(PlanningModelSample, InvalidSelectionAndAdmissionFailBeforeSourceReads)
         EXPECT_THROW((void)source.sampleGeometry(request), std::invalid_argument);
     const PlanningModelSampleRequest request{expert, PlanningExpertMatrix{3}};
     const auto geometry = source.sampleGeometry(request);
-    auto memory = admit(geometry.source_bytes, geometry.source_bytes - 1);
+    auto memory = admit(geometry.physicalBytes() - 1, 0);
     EXPECT_THROW((void)source.loadSample(request, memory, DeviceId::cpu()), std::exception);
     EXPECT_EQ(claimed(memory, PhysicalMemoryOwner::ModelSourcePayload), 0u);
     EXPECT_EQ(claimed(memory, PhysicalMemoryOwner::WeightLoadStaging), 0u);
@@ -356,17 +384,52 @@ TEST(PlanningModelSample, InvalidSelectionAndAdmissionFailBeforeSourceReads)
     EXPECT_THROW((void)source.loadSample(request, memory, DeviceId::cuda(0)), std::invalid_argument);
 }
 
-TEST(PlanningModelSample, TruncatedPayloadReadReleasesBothClaims)
+TEST(PlanningModelSample, TruncatedPayloadReadReleasesFinalStorage)
 {
     test::PlanningGGUFFixture fixture;
     PlanningModelSource source(fixture.path());
     const PlanningModelSampleRequest request{"blk.1.ffn_down.weight", PlanningWholeMatrix{}};
     const auto geometry = source.sampleGeometry(request);
-    auto memory = admit(geometry.source_bytes, geometry.source_bytes);
+    auto memory = admit(geometry.physicalBytes(), 0);
     std::filesystem::resize_file(fixture.path(), source.loader().getModel().data_offset);
     EXPECT_THROW((void)source.loadSample(request, memory, DeviceId::cpu()), std::runtime_error);
     EXPECT_EQ(claimed(memory, PhysicalMemoryOwner::ModelSourcePayload), 0u);
     EXPECT_EQ(claimed(memory, PhysicalMemoryOwner::WeightLoadStaging), 0u);
+}
+
+/** @test A final native matrix larger than the startup cap needs no second matrix or parent. */
+TEST(PlanningModelSample, OversizedFinalSampleStreamsWithoutReaderAllocation)
+{
+    struct RestoreBudget final
+    {
+        int original = debugEnv().rocm.repack_budget_mb;
+        /** @brief Restore the existing shared startup policy on every exit. */
+        ~RestoreBudget() { mutableDebugEnv().rocm.repack_budget_mb = original; }
+    } restore;
+    mutableDebugEnv().rocm.repack_budget_mb = 1;
+    // One 1.5 MiB expert finishes with a partial final window at the 1 MiB cap.
+    // The original 12 MiB parent remains only in the fixture file.
+    test::PlanningGGUFFixture fixture(true, false, GGUFTensorType::F32, 1536);
+    const std::string name = "blk.0.ffn_gate_exps.weight";
+    const auto expected = populate(fixture.path(), name);
+    PlanningModelSource source(fixture.path());
+    const PlanningModelSampleRequest request{name, PlanningExpertMatrix{5}};
+    const auto geometry = source.sampleGeometry(request);
+    ASSERT_GT(geometry.source_bytes, 1024u * 1024u);
+    auto memory = admit(geometry.physicalBytes(), 0);
+    for (const int cap_mb : {1, 0, 1})
+    {
+        mutableDebugEnv().rocm.repack_budget_mb = cap_mb;
+        {
+            auto sample = source.loadSample(request, memory, DeviceId::cpu());
+            EXPECT_EQ(sample.tensor().shape(), (std::vector<size_t>{1536, 256}));
+            EXPECT_EQ(std::memcmp(sample.tensor().raw_data(),
+                expected.data() + 5 * geometry.source_bytes, geometry.source_bytes), 0);
+            EXPECT_EQ(claimed(memory, PhysicalMemoryOwner::ModelSourcePayload), geometry.physicalBytes());
+            EXPECT_EQ(claimed(memory, PhysicalMemoryOwner::WeightLoadStaging), 0u);
+        }
+        EXPECT_EQ(claimed(memory, PhysicalMemoryOwner::ModelSourcePayload), 0u);
+    }
 }
 
 /** @test CPU/GPU samples share source identity and reject partial or mixed experts before I/O. */

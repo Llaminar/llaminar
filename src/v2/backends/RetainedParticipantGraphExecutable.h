@@ -159,6 +159,19 @@ private:
     static PhysicalMemoryPlan hostBOMWithSelection(const PooledRemoteGraphProgram&,
         PhysicalMemoryResource,PhysicalMemoryResource,const std::optional<NativeAuxiliaryResourceSelection>&,
         std::size_t compiledNativeObjectBytes);
+    /**
+     * @brief Combine exact wrapper storage and opaque limits without native creation.
+     * @param program Original retained graph geometry and owner.
+     * @param host CPU allocator observation on the owner's rank.
+     * @param gpu Exact GPU allocator observation for the same owner.
+     * @param allowance Reviewed program limits, absent only for known-root replay.
+     * @param compiledNativeObjectBytes Original adapter's compiled wrapper size.
+     * @return A physical BOM with no worker or native creation authority.
+     * @throws std::invalid_argument For incompatible ownership, geometry or limits.
+     */
+    static PhysicalMemoryPlan hostBOMWithAllowance(const PooledRemoteGraphProgram& program,
+        PhysicalMemoryResource host,PhysicalMemoryResource gpu,const std::optional<NativeAuxiliaryResourceAllowance>& allowance,
+        std::size_t compiledNativeObjectBytes);
     /** @brief Construct only after original PMA tokens and retirement slot exist. */
     RetainedParticipantGraphExecutable(std::shared_ptr<IWorkerGPUContext>,std::shared_ptr<PhysicalMemoryAuthority>,std::uint64_t,DeviceId,void*,NativeContextRetirementSlot,
         std::unique_ptr<IContextNativeRetirementObligation>);

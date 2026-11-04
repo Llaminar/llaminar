@@ -11,6 +11,7 @@
  */
 
 #include "planning/WorkspaceMemoryEstimator.h"
+#include "execution/moe/MoEExpertProjectionOwnership.h"
 #include "models/qwen4exp/Qwen4ExpPredictorProjectionGeometry.h"
 #include "models/qwen4exp/Qwen4ExpProjectionWorkspace.h"
 
@@ -635,6 +636,17 @@ bool workspaceOwnsTensorImpl(
            isRetainedMTPSidecarLayer(tensor, profile, geometry);
 }
 
+/** @brief Normalize one original routed parent to [N,K] without replacing its full source expert axis. */
+WorkspaceMatrixShape routedExpertSourceMatrixShape(const TensorSizeInfo& tensor,const ModelMemoryProfile& profile)
+{
+    if(tensor.K==0 || tensor.elements<tensor.K || tensor.elements%tensor.K!=0)return {};
+    const auto rows=tensor.elements/tensor.K;
+    if(profile.expert_count<=0 || rows%static_cast<size_t>(profile.expert_count)!=0)
+        throw std::runtime_error("Routed expert workspace cannot recover one matrix from "+tensor.name);
+    return {.output_columns=checkedWorkspaceDimension(rows/static_cast<size_t>(profile.expert_count),"expert output columns"),
+        .input_columns=checkedWorkspaceDimension(tensor.K,"expert input columns")};
+}
+
 /**
  * @brief Resolve the exact local N/K shape used by prepared weight loading.
  *
@@ -649,32 +661,9 @@ WorkspaceMatrixShape localWorkspaceMatrixShape(
     const WeightShardingConfig& sharding,
     bool force_full_terminal)
 {
-    if (tensor.K == 0u || tensor.elements < tensor.K ||
-        tensor.elements % tensor.K != 0u)
-    {
-        return {};
-    }
-    std::size_t output_columns = tensor.elements / tensor.K;
-    std::size_t input_columns = tensor.K;
-
-    if (isRoutedExpertWeight(tensor.name))
-    {
-        if (profile.expert_count <= 0 ||
-            output_columns % static_cast<std::size_t>(profile.expert_count) !=
-                0u)
-        {
-            throw std::runtime_error(
-                "Routed expert workspace cannot recover one matrix from " +
-                tensor.name);
-        }
-        output_columns /= static_cast<std::size_t>(profile.expert_count);
-        return {
-            .output_columns = checkedWorkspaceDimension(
-                output_columns, "expert output columns"),
-            .input_columns = checkedWorkspaceDimension(
-                input_columns, "expert input columns"),
-        };
-    }
+    if(isRoutedExpertWeight(tensor.name))return routedExpertSourceMatrixShape(tensor,profile);
+    if (tensor.K == 0u || tensor.elements < tensor.K || tensor.elements % tensor.K != 0u)return {};
+    std::size_t output_columns=tensor.elements/tensor.K,input_columns=tensor.K;
 
     const bool replicated_sidecar = isRetainedMTPSidecarLayer(tensor,profile,geometry) &&
         predictorIsReplicated(profile,geometry);
@@ -2646,6 +2635,39 @@ size_t WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(
             std::to_string(direct_requirements.buffers.size()) +
             " admitted_bytes=" + std::to_string(bytes));
     return bytes;
+}
+
+size_t WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(const ModelMemoryProfile& profile,
+    const WorkspaceMemoryGeometry& geometry,const MoEExpertProjectionOwnership& original)
+{
+    const auto source=original.geometry();
+    if(!geometry.device.is_cpu() || geometry.gpu_gdn_retention || original.intermediateIntervals().empty() ||
+       source.experts!=profile.expert_count || source.model_columns!=profile.d_model ||
+       source.intermediate_columns!=profile.expert_feed_forward_length || profile.expert_used_count<=0)
+        throw std::invalid_argument("CPU joint invocation workspace requires the same original complete source and F fragment");
+    (void)weightScopeOwnsEmbedding(geometry.weight_components);
+    (void)weightScopeOwnsTerminal(geometry.weight_components);
+    const int rows=compactRoutedExpertWorkspaceRows(profile,geometry).second;
+    auto requirements=cpuSwiGLUWorkspaceRequirements(rows,original.projection(WeightRole::MoEExpertUp).rows);
+    bool found=false;
+    for(const auto& tensor:profile.tensors) {
+        if(!isRoutedExpertWeight(tensor.name))continue;
+        // Actual original MoE parents are layer-owned. This source-bound arm
+        // cannot use a terminal/global name as an implicit projection source.
+        if(tensor.layer_index<0)throw std::invalid_argument("CPU joint projection requires its original model-global layer");
+        if(!((tensor.layer_index>=geometry.first_layer && tensor.layer_index<=geometry.last_layer) ||
+             isRetainedMTPSidecarLayer(tensor,profile,geometry)))continue;
+        const auto shape=routedExpertSourceMatrixShape(tensor,profile);
+        const auto local=original.projection(inferWeightRole(tensor.name));
+        if(!shape.valid() || local.source_rows!=shape.output_columns || local.source_columns!=shape.input_columns)
+            throw std::invalid_argument("CPU joint invocation projection differs from original source N/K");
+        requirements.merge(CPUProjectionWorkspaceContract::sourceNative(tensor.quant_type,
+            {.rows=rows,.n=local.rows,.k=local.columns,.workers=geometry.device_compute_units,
+             .execution=geometry.cpu_execution,.numerical_policy=CPUProjectionNumericalPolicy::GPUAlignedExpert}));
+        found=true;
+    }
+    if(!found)throw std::invalid_argument("CPU joint invocation workspace omitted original owned projection sources");
+    return requirements.total_bytes_with_alignment();
 }
 
 } // namespace llaminar2

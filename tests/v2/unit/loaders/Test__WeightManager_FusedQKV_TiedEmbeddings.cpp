@@ -21,6 +21,7 @@
 #include <vector>
 #include <cstring>
 #include <cmath>
+#include <numeric>
 
 #include "loaders/WeightManager.h"
 #include "models/qwen35/Qwen35Schema.h"
@@ -28,9 +29,51 @@
 #include "tensors/TensorSlice.h"
 #include "mocks/MockModelLoader.h"
 #include "utils/MPIContext.h"
+#include "utils/CPUWeightPlanTestAdmission.h"
+#include "loaders/PreparedWeightStore.h"
 
 using namespace llaminar2;
 using namespace llaminar2::test;
+
+namespace {
+/** @brief Declare exact original fused blocks, vocabulary rows and replicas before CPU loading. */
+void admitFusedSources(WeightManager& manager,IModelLoader& loader,int rank,int degree,
+    std::vector<size_t> fused_blocks)
+{
+    InferenceStrategy original;original.model_id={98502};original.devices={DeviceId::cpu()};original.tp_degree=degree;
+    WeightPlan plan(original);
+    for(const auto& name:loader.materializationNames()) {
+        const auto source=loader.nativeWeightSourceGeometry(name);
+        WeightRequirement request;request.canonical_name=name;request.role=inferWeightRole(name);
+        request.layer=inferWeightLayer(name);request.target_device=DeviceId::cpu();
+        request.tp_domain=0;request.tp_rank_or_device_index=rank;
+        if(source.original_shape.size()==2 && manager.getShardingMode(name)==ShardingMode::COLUMN_PARALLEL) {
+            const size_t rows=source.original_shape[1],columns=source.original_shape[0];
+            if(name.ends_with("attn_qkv.weight") && std::accumulate(fused_blocks.begin(),fused_blocks.end(),size_t{0})==rows) {
+                NativeWeightSourceAssembly assembly{.axis=NativeWeightSourceAssembly::Axis::Rows,.final_rows=0,.final_columns=columns};
+                size_t origin=0;
+                for(const size_t block:fused_blocks) {
+                    const size_t start=block*size_t(rank)/size_t(degree),end=block*size_t(rank+1)/size_t(degree);
+                    assembly.segments.push_back({0,0,origin+start,end-start,0,columns,
+                        columns/source.native_group_elements*source.native_group_bytes});
+                    assembly.final_rows+=end-start;origin+=block;
+                }
+                request.derivation=WeightDerivationKind::FusedSubblockConcat;
+                request.native_source_assembly=std::move(assembly);
+            } else {
+                request.derivation=WeightDerivationKind::RowSlice;
+                request.slice.row_start=rows*size_t(rank)/size_t(degree);
+                request.slice.row_count=rows*size_t(rank+1)/size_t(degree)-request.slice.row_start;
+                request.slice.inner_is_presliced=true;
+            }
+        }
+        plan.add(std::move(request));
+    }
+    if(!manager.preparedWeightStore()->bindModelIdIfUnset(original.model_id))
+        throw std::logic_error("Fused fixture replaced its original model owner");
+    admitCPUWeightPlansForTest(manager,loader,{&plan});
+}
+}
 
 // =============================================================================
 // FusedQKV Sub-Block Sharding Tests
@@ -110,6 +153,7 @@ protected:
             WeightDistributionStrategy::SHARDED,
             WeightPrecision::NATIVE);
         wm->setWeightShardingConfig(sharding_config_);
+        admitFusedSources(*wm,*mock_loader_,rank,world_size,{SUB_BLOCK_ROWS,SUB_BLOCK_ROWS,SUB_BLOCK_ROWS});
         return wm;
     }
 
@@ -350,6 +394,7 @@ protected:
             WeightDistributionStrategy::SHARDED,
             WeightPrecision::NATIVE);
         wm->setWeightShardingConfig(sharding_config_);
+        admitFusedSources(*wm,*mock_loader_,rank,world_size,{32,32,32});
         return wm;
     }
 
@@ -565,6 +610,7 @@ protected:
             WeightPrecision::NATIVE);
         wm->setWeightShardingConfig(sharding_config_);
         wm->setModelDimensions(N_HEADS, N_KV_HEADS, HEAD_DIM);
+        admitFusedSources(*wm,*mock_loader_,rank,world_size,{N_HEADS*HEAD_DIM,N_KV_HEADS*HEAD_DIM,N_KV_HEADS*HEAD_DIM});
         return wm;
     }
 

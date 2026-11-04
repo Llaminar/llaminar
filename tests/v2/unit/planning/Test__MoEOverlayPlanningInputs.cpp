@@ -98,7 +98,8 @@ namespace llaminar2
                     .inventory = inventory, .execution = execution, .capacity_policy = policy,
                     .retained_mtp = rank.runtime.mtp, .graph_family = family,
                     .prefill = {.bucket_rows = buckets, .minimum_sequence_rows = 1, .maximum_cached_buckets = 16},
-                    .gpu_weight_load = {.maximum_source_bytes = 1234}};
+                    .gpu_weight_load = {.maximum_source_bytes = 1234},
+                    .native_source_placement = CPUStoragePlacement::local()};
             }
 
             /**
@@ -704,6 +705,7 @@ namespace llaminar2
                         if(backend!=DeviceType::CPU) observed.gpus.push_back({.type=backend,.local_device_id=0,
                             .memory_bytes=256ull<<30,.free_memory_bytes=256ull<<30,.compute_units=60});
                         auto request=f.request();
+                        request.native_source_placement=loader.nativeWeightSourcePlacement();
                         request.gpu_weight_load={.policy=GPUWeightLoadMemoryPolicy{},
                             .maximum_source_bytes=maximumGGUFTensorPayloadBytes(source.main)};
                         if(interval!=std::pair{0,47}) request.pipeline_stage=FactoryPPStageConfig{

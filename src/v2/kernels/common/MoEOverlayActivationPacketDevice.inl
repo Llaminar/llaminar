@@ -23,6 +23,17 @@
 #include <cuda/atomic>
 #endif
 
+// Launch descriptors are immutable capture state. CUDA must address the
+// original parameter storage when helpers borrow it; a per-thread copy would
+// materialize the joint-membership words and inflate local-memory pressure.
+#if defined(__CUDACC__) && !defined(__HIPCC__)
+#define LLAMINAR_MOE_PACKET_GRID_CONSTANT const __grid_constant__
+#else
+#define LLAMINAR_MOE_PACKET_GRID_CONSTANT const
+#endif
+
+#include "execution/moe/MoEOverlaySharedDispatchSelection.h"
+
 namespace llaminar2::moe_activation_packet_device
 {
     /** Threads in the portable CUDA/HIP deterministic metadata compactor. */
@@ -343,6 +354,7 @@ namespace llaminar2::moe_activation_packet_device
         status->last_consumed_stage = grant->last_consumed_stage;
         status->last_published_stage = grant->last_published_stage;
         status->published_payload_bytes = grant->published_payload_bytes;
+        status->published_shared_hidden_bytes = grant->published_shared_hidden_bytes;
         status->published_live_rows = grant->published_live_rows;
         status->published_live_entries = grant->published_live_entries;
         status->published_stage_count = grant->published_stage_count;
@@ -394,6 +406,8 @@ namespace llaminar2::moe_activation_packet_device
             grant ? grant->last_published_stage : -1;
         status->published_payload_bytes =
             grant ? grant->published_payload_bytes : 0u;
+        status->published_shared_hidden_bytes =
+            grant ? grant->published_shared_hidden_bytes : 0u;
         status->published_live_rows =
             grant ? grant->published_live_rows : 0u;
         status->published_live_entries =
@@ -422,7 +436,7 @@ namespace llaminar2::moe_activation_packet_device
      * otherwise hidden inside @ref acquireOrValidateGrant.
      */
     __device__ __forceinline__ std::uint32_t dispatchAdmissionDiagnostic(
-        MoEOverlayActivationDispatchPackLaunch launch,
+        const MoEOverlayActivationDispatchPackLaunch &launch,
         bool grant_acquired) noexcept
     {
         const DeviceMoEOverlayEpochTicket ticket = launch.placement.ticket
@@ -546,6 +560,8 @@ namespace llaminar2::moe_activation_packet_device
             identity.epoch_generation == 0u ||
             identity.stage_count != channel.stage_count ||
             identity.lane_ordinal != channel.lane_ordinal ||
+            identity.return_role != channel.return_role ||
+            !moeOverlayActivationReturnRoleValid(identity.return_role) ||
             identity.channel_nonce != channel.channel_nonce ||
             identity.workspace_generation != channel.workspace_generation ||
             identity.stage_manifest_digest != channel.stage_manifest_digest ||
@@ -753,7 +769,7 @@ namespace llaminar2::moe_activation_packet_device
      * so every peer retained graph drains through the ordinary protocol edge.
      */
     __device__ __forceinline__ DispatchMetadataPreparation
-    prepareDispatchMetadata(MoEOverlayActivationDispatchPackLaunch launch)
+    prepareDispatchMetadata(const MoEOverlayActivationDispatchPackLaunch &launch)
     {
         auto *control = launch.control;
         constexpr auto endpoint = MoEOverlayActivationEndpoint::Continuation;
@@ -782,6 +798,10 @@ namespace llaminar2::moe_activation_packet_device
             placement_ticket.epoch == 0u ||
             placement_generation == 0u ||
             placement_ticket.epoch != launch.grant->placement_epoch ||
+            !launch.static_joint_membership.acceptsEpoch(placement_ticket.epoch) ||
+            launch.static_joint_membership.enabled() !=
+                (control->channel.return_role != static_cast<std::uint32_t>(
+                    MoEOverlayActivationReturnRole::Ordinary)) ||
             placement_bank >= kDeviceMoEOverlayEpochBankCount ||
             !selected_placement.valid() ||
             static_cast<std::uint64_t>(*selected_placement.epoch) !=
@@ -859,7 +879,7 @@ namespace llaminar2::moe_activation_packet_device
      * @return Whether the expert, weight, and placement entry are valid.
      */
     __device__ __forceinline__ bool decodeDispatchRoute(
-        MoEOverlayActivationDispatchPackLaunch launch,
+        const MoEOverlayActivationDispatchPackLaunch &launch,
         const std::int32_t *route_participants,
         std::size_t route_slot,
         std::int32_t *expert,
@@ -877,17 +897,24 @@ namespace llaminar2::moe_activation_packet_device
         const auto expert_id = static_cast<std::int32_t>(expert_fp32);
         const std::int32_t route_participant =
             route_participants[expert_id];
-        if (route_participant < -1)
-            return false;
         *expert = expert_id;
         *weight = route_weight;
-        *participant = route_participant;
-        return true;
+        // Resolve this exact lane's source cohort, without inventing a whole
+        // owner or changing the original router-slot/weight publication order.
+        // Metadata's existing complete-prefix validation also authenticates the
+        // publisher's entire immutable union before any shared row is written.
+        if(launch.shared_row_target_count) {
+            std::int32_t resolved=-1;
+            if(!launch.shared_joint_union.validFor(launch.placement.expert_count,launch.model_layer_index,launch.grant->placement_epoch) ||
+               !launch.shared_joint_union.accepts(expert_id,route_participant))return false;
+        }
+        return launch.static_joint_membership.resolve(
+            expert_id, route_participant, participant);
     }
 
     /** @brief Publish the authenticated descriptor for one compact packet. */
     __device__ __forceinline__ void finishDispatchMetadata(
-        MoEOverlayActivationDispatchPackLaunch launch,
+        const MoEOverlayActivationDispatchPackLaunch &launch,
         std::uint64_t compact_rows,
         std::uint64_t compact_entries)
     {
@@ -948,7 +975,7 @@ namespace llaminar2::moe_activation_packet_device
 
     /** @brief Deterministically compact one target's row-major route metadata. */
     __device__ __forceinline__ void packDispatchMetadata(
-        MoEOverlayActivationDispatchPackLaunch launch)
+        const MoEOverlayActivationDispatchPackLaunch &launch)
     {
         constexpr auto endpoint = MoEOverlayActivationEndpoint::Continuation;
         constexpr auto operation =
@@ -1060,7 +1087,7 @@ namespace llaminar2::moe_activation_packet_device
      */
     // Both backend bridges launch this exact scan width, not 1024 work items.
     static __global__ __launch_bounds__(kDispatchMetadataBlockThreads) void packDispatchMetadataKernel(
-        MoEOverlayActivationDispatchPackLaunch launch)
+        LLAMINAR_MOE_PACKET_GRID_CONSTANT MoEOverlayActivationDispatchPackLaunch launch)
     {
         __shared__ DispatchMetadataScanValue
             scan[kDispatchMetadataBlockThreads];
@@ -1270,11 +1297,11 @@ namespace llaminar2::moe_activation_packet_device
      * the exact general lookup. This path deliberately avoids a fixed-capacity
      * copy-engine transaction at every MoE layer, which is more expensive than
      * direct mapped access for decode-sized packets on the measured topology.
-     * Shared-physical bulk launches deliberately skip this kernel because the
-     * transfer engine publishes their complete source matrix once per channel.
+     * Shared-physical launches use the separate union writer, which publishes
+     * each original row required by this channel group exactly once.
      */
     static __global__ void packDispatchHiddenKernel(
-        MoEOverlayActivationDispatchPackLaunch launch)
+        LLAMINAR_MOE_PACKET_GRID_CONSTANT MoEOverlayActivationDispatchPackLaunch launch)
     {
         __shared__ std::uint64_t block_live_rows;
         __shared__ std::uint32_t block_endpoint_state;
@@ -1342,6 +1369,37 @@ namespace llaminar2::moe_activation_packet_device
                 static_cast<std::size_t>(source_row) *
                     static_cast<std::size_t>(launch.packet.d_model) +
                 column];
+    }
+
+    /**
+     * @brief Write each needed original row once into the original shared matrix.
+     * Metadata on this same stream has already validated the complete route
+     * prefix and immutable group. Each CTA owns one original row; inactive and
+     * unrequested rows remain untouched. No capacity DMA or union scratch exists.
+     */
+    static __global__ void packSharedDispatchUnionKernel(
+        LLAMINAR_MOE_PACKET_GRID_CONSTANT MoEOverlayActivationDispatchPackLaunch launch)
+    {
+        __shared__ std::uint32_t needed;
+        const auto row=static_cast<std::int32_t>(blockIdx.x);
+        if(threadIdx.x==0u) {
+            needed=0u;
+            const auto active=launch.active_row_count_device ? *launch.active_row_count_device : launch.physical_rows;
+            if(launch.grant->state==raw(MoEOverlayActivationEndpointState::Active) && row<active) {
+                const auto bank=static_cast<std::uint32_t>(launch.placement.ticket->selector&1u);
+                const auto* routes=launch.placement.banks[bank].route_participants;
+                needed=selectMoEOverlaySharedRow(launch,routes,launch.grant->placement_epoch,row)==
+                    MoEOverlaySharedRowDecision::Needed;
+            }
+        }
+        __syncthreads();
+        if(!needed)return;
+        for(std::int32_t column=threadIdx.x;column<launch.packet.d_model;column+=blockDim.x)
+            copyMoEOverlaySharedRowElement(launch,row,column);
+        __syncthreads();
+        if(threadIdx.x==0u)
+            atomicAdd(reinterpret_cast<unsigned long long*>(&launch.grant->published_shared_hidden_bytes),
+                static_cast<unsigned long long>(launch.packet.d_model)*sizeof(float));
     }
 
     /** @brief Validate the exact dispatch descriptor before follower reads. */
@@ -2287,8 +2345,9 @@ namespace llaminar2::moe_activation_packet_device
                             packet.stage_ordinal,
                             packet.model_layer_index,
                             block_timeline) &&
-                        descriptor.live_entries == packet.grant->live_entries &&
-                        descriptor.live_rows == packet.grant->live_rows &&
+                        moeOverlayActivationReturnCountsMatch(control->channel.return_role,
+                            descriptor.live_rows,descriptor.live_entries,
+                            packet.grant->live_rows,packet.grant->live_entries) &&
                         descriptor.live_entries <= packet.returned.route_slot_capacity &&
                         descriptor.live_entries <= descriptor.live_rows *
                             static_cast<std::uint64_t>(packet.dispatch.top_k) &&
@@ -2679,7 +2738,7 @@ namespace llaminar2::moe_activation_packet_device
      * peer graph instead of leaving it resident in a permanent wait.
      */
     __device__ __forceinline__ void packSingleRowDispatchBody(
-        MoEOverlayActivationSingleRowDispatchPackLaunch launch)
+        const MoEOverlayActivationSingleRowDispatchPackLaunch &launch)
     {
         auto &packet = launch.packet;
         __shared__ std::uint64_t live_rows;
@@ -2725,7 +2784,7 @@ namespace llaminar2::moe_activation_packet_device
     // CUDA and HIP launch 512 threads for mapped single-row payloads. Keeping
     // this bound explicit prevents an unnecessarily restricted register budget.
     static __global__ __launch_bounds__(512) void packSingleRowDispatchKernel(
-        MoEOverlayActivationSingleRowDispatchPackLaunch launch)
+        LLAMINAR_MOE_PACKET_GRID_CONSTANT MoEOverlayActivationSingleRowDispatchPackLaunch launch)
     {
         if (blockIdx.x == 0u)
             packSingleRowDispatchBody(launch);
@@ -2998,3 +3057,5 @@ namespace llaminar2::moe_activation_packet_device
         }
     }
 } // namespace llaminar2::moe_activation_packet_device
+
+#undef LLAMINAR_MOE_PACKET_GRID_CONSTANT

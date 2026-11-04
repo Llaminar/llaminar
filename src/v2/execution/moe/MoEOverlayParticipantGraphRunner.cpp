@@ -22,6 +22,8 @@
  */
 
 #include "MoEOverlayParticipantGraphRunner.h"
+#include "execution/compute_stages/stages/MoECPUExpertShardRouteStage.h"
+#include "execution/moe/CPUExpertShardSourceSelection.h"
 #include "MoEOverlayHostServiceContract.h"
 #include "MoEOverlayParticipantResidency.h"
 #include "MoEExpertOverlayPreparationPlan.h"
@@ -317,6 +319,7 @@ namespace llaminar2
             int model_layer_index = -1;
             std::uint32_t stage_ordinal = 0u;
             std::unique_ptr<MoELocalExpertStage> local_expert;
+            std::unique_ptr<MoECPUExpertShardRouteStage> joint_route_collective; ///< Explicit original-domain edge before root weighting/return.
         };
 
         /** @brief One serial host follower for a planner-declared CPU endpoint. */
@@ -1298,12 +1301,12 @@ namespace llaminar2
             throw std::invalid_argument(
                 "MoE overlay participant runner received an invalid residency snapshot");
         }
-        const MoEExpertOwnerMap configured_owner_map =
-            MoEExpertOwnerMap::build(*config_.placement_plan);
+        const auto configured_participant_projection = MoEExpertOwnerMap::declaredParticipants(
+            *config_.placement_plan,{.reject_tensor_sharded_domains=false});
         const auto &published_participants =
-            snapshot->owner_map.participants();
+            snapshot->originalOwnerMap().participants();
         const auto &configured_participants =
-            configured_owner_map.participants();
+            configured_participant_projection;
         const bool same_topology =
             snapshot->placement_plan->first_model_layer ==
                 config_.placement_plan->first_model_layer &&
@@ -1333,7 +1336,8 @@ namespace llaminar2
             throw std::invalid_argument(
                 "MoE overlay participant runner authority topology differs from its graph plan");
         }
-        owner_map_ = std::make_unique<MoEExpertOwnerMap>(snapshot->owner_map);
+        owner_map_ = snapshot->jointOwnerMap();
+        if(!owner_map_)owner_map_=std::make_shared<const MoEExpertOwnerMap>(snapshot->originalOwnerMap());
         if (config_.ownership == MoEOverlayParticipantGraphOwnership::RankLocalAuxiliary)
         {
             const auto admitted = MoEOverlayHostServiceContract::resolveAdmitted(
@@ -1603,11 +1607,16 @@ namespace llaminar2
                 arena_config.cpu_canonical_route_storage =
                     MoELocalExpertSerialBufferArena::
                         CPUCanonicalRouteStoragePolicy::RetainSerialMaximum;
+                if(arena_config.cpu_storage_layout->jointRoutes())
+                    arena_config.cpu_canonical_route_storage=arena_config.cpu_storage_layout->jointRoutes()->isRoot()
+                        ?MoELocalExpertSerialBufferArena::CPUCanonicalRouteStoragePolicy::RetainSerialMaximum:
+                         MoELocalExpertSerialBufferArena::CPUCanonicalRouteStoragePolicy::Disabled;
                 arena_config.cpu_grouped_scratch_storage =
                     MoELocalExpertSerialBufferArena::
                         CPUGroupedScratchStoragePolicy::RetainSerialMaximum;
                 arena_config.num_experts = num_experts;
-                arena_config.expert_intermediate = expert_intermediate;
+                arena_config.expert_intermediate = arena_config.cpu_storage_layout->jointRoutes()
+                    ?arena_config.cpu_storage_layout->jointRoutes()->intermediate():expert_intermediate;
             }
             arena_config.logical_participant_id = participant->participant_id;
             arena_config.debug_name =
@@ -1686,10 +1695,15 @@ namespace llaminar2
         {
             ScopedWeightLoadDetailTimer timer(
                 "overlay.weights.build_plan");
-            const auto preparation = MoEExpertOverlayPreparationPlan::build(
-                *runtime_plan_, config_.model_context->concreteLoader())
+            const auto original_preparation=config_.participant_residency->projectionPreparation();
+            if(!original_preparation && residency_authority_->snapshot()->jointOwnerMap())
+                throw std::runtime_error("CPU joint participant weights lost original admitted source preparation");
+            const auto preparation = (original_preparation?*original_preparation:
+                MoEExpertOverlayPreparationPlan::build(*runtime_plan_,config_.model_context->concreteLoader()))
                 .filteredForRank(execution_plan_->currentRankPlan())
                 .filteredForDevices(participantDevices(local_participants_));
+            if(preparation.cpuJointOwnerMap() && preparation.cpuJointOwnerMap().get()!=owner_map_.get())
+                throw std::runtime_error("CPU joint participant preparation replaced original source owner map");
             const auto sources = preparation.sourceWeightPlan(
                 config_.model_context->concreteLoader(), plan.strategy().model_id);
             for (const auto &requirement : sources.requirements())
@@ -1743,7 +1757,8 @@ namespace llaminar2
                     device,
                     frozen_weights_.get(),
                     execution_plan_.get(),
-                    config_.prepared_weight_admission))
+                    config_.prepared_weight_admission,
+                    config_.participant_residency?config_.participant_residency->projectionPreparation():nullptr))
             {
                 throw std::runtime_error(
                     "Failed to prepare exact MoE overlay participant weights on " +
@@ -2694,10 +2709,10 @@ namespace llaminar2
                             endpoint->participant_id));
                 endpoint->layers.reserve(spec.source_layers.size());
 
-                const auto participant_residency =
-                    config_.participant_residency->endpoint(
-                        endpoint->participant_id);
-                if (!participant_residency)
+                const bool joint=config_.participant_residency->isCPUJointParticipant(endpoint->participant_id);
+                const auto participant_residency = joint?std::shared_ptr<MoEOverlayParticipantResidency>{}:
+                    config_.participant_residency->endpoint(endpoint->participant_id);
+                if (!joint && !participant_residency)
                 {
                     throw std::runtime_error(
                         "Mapped ExpertOverlay CPU endpoint is missing its prepared residency authority");
@@ -2716,7 +2731,18 @@ namespace llaminar2
                     std::vector<MoEOverlayPreparedExpertPayload>
                         prepared_payloads;
                     std::string residency_error;
-                    if (!resolveMoEOverlayPreparedExpertPayloads(
+                    std::shared_ptr<const MoEOverlayParticipantResidencyRegistry::CPUJointLayer> joint_layer;
+                    if(joint) {
+                        if(!config_.cpu_joint_context || !prepared_store_ ||
+                           !config_.participant_residency->registerInitialCPUJointLayer(registry,prepared_store_->modelId(),
+                               endpoint->participant_id,layer,&residency_error))
+                            throw std::runtime_error("CPU joint follower has no original prepared source/domain: "+residency_error);
+                        joint_layer=config_.participant_residency->initialCPUJointLayer(endpoint->participant_id,layer);
+                        if(!joint_layer || !joint_layer->source() || !joint_layer->source()->cpu_joint_source ||
+                           !compact_arena->cpuJointLayout() || !compact_arena->cpuJointPackedRecords())
+                            throw std::runtime_error("CPU joint follower lost original fragment publication or serial roots");
+                    }
+                    if (!joint && (!resolveMoEOverlayPreparedExpertPayloads(
                             registry,
                             *binding.participant,
                             layer,
@@ -2730,7 +2756,7 @@ namespace llaminar2
                                  layer,
                                  expert_mask,
                                  prepared_payloads,
-                                 &residency_error))
+                                 &residency_error)))
                     {
                         throw std::runtime_error(
                             "Mapped ExpertOverlay CPU follower could not publish its initial residency bank for layer " +
@@ -2743,7 +2769,7 @@ namespace llaminar2
                     local_params.device_id = endpoint->device;
                     local_params.input_rows_lifetime = endpoint->input_rows;
                     local_params.output_rows_lifetime = endpoint->output_rows;
-                    local_params.cpu_canonical_route_return =
+                    if(!joint)local_params.cpu_canonical_route_return =
                         MoELocalExpertStage::CPUCanonicalRouteReturnBinding{
                             .original_route_slots =
                                 endpoint->lane.dispatch.original_route_slots,
@@ -2755,6 +2781,14 @@ namespace llaminar2
                             .route_slot_capacity =
                                 endpoint->lane.returned.route_slot_capacity,
                         };
+                    if(joint) {
+                        local_params.cpu_joint_layer=joint_layer;
+                        local_params.cpu_joint_route_producer=MoELocalExpertStage::CPUJointRouteProducerBinding{
+                            .packed_rows=compact_arena->cpuJointPackedRecords(),
+                            .original_route_slots=endpoint->lane.dispatch.original_route_slots,
+                            .compact_route_slots=endpoint->lane.dispatch.compact_route_slots,
+                            .route_slot_capacity=endpoint->lane.returned.route_slot_capacity};
+                    }
                     local_params.serial_compact_buffer_arena = compact_arena;
                     local_params.graph_row_capacity =
                         static_cast<size_t>(row_capacity);
@@ -2763,7 +2797,8 @@ namespace llaminar2
                     local_params.num_experts = num_experts;
                     local_params.top_k = top_k;
                     local_params.d_model = d_model;
-                    local_params.expert_intermediate = expert_intermediate;
+                    local_params.expert_intermediate = joint?joint_layer->source()->cpu_joint_source->ownership()
+                        .projection(WeightRole::MoEExpertUp).rows:expert_intermediate;
                     local_params.layer_idx = layer;
                     local_params.cpu_workspace_source = cpuExpertWorkspaceSource(
                         config_.model_context->model(), layer, d_model, expert_intermediate, num_experts);
@@ -2780,7 +2815,19 @@ namespace llaminar2
                         MoELocalExpertStage::
                             ExpertWeightResolutionPolicy::RegistryOnly;
 
-                    (void)registry.populateExpertEnginesForParticipant(
+                    if(joint) {
+                        local_params.prepared_gate_gemm.assign(num_experts,nullptr);
+                        local_params.prepared_up_gemm.assign(num_experts,nullptr);
+                        local_params.prepared_down_gemm.assign(num_experts,nullptr);
+                        const auto &source=*joint_layer->source();
+                        for(const int expert:source.cpu_joint_source->expertIds()) {
+                            const auto &engines=source.experts.at(static_cast<size_t>(expert));
+                            local_params.prepared_gate_gemm[expert]=engines.gate.get();
+                            local_params.prepared_up_gemm[expert]=engines.up.get();
+                            local_params.prepared_down_gemm[expert]=engines.down.get();
+                        }
+                    }
+                    if(!joint)(void)registry.populateExpertEnginesForParticipant(
                         binding.tier->domain,
                         endpoint->device,
                         binding.participant->world_rank,
@@ -2795,7 +2842,7 @@ namespace llaminar2
                      * The epoch-indexed residency bank can install arrivals later,
                      * and the stage resolves that exact bank on every invocation.
                      */
-                    if (hasActiveMask(expert_mask) &&
+                    if (!joint && hasActiveMask(expert_mask) &&
                         !MoELocalExpertStage::prepareExpertGemmEngines(
                             local_params))
                     {
@@ -2805,6 +2852,24 @@ namespace llaminar2
                             std::to_string(endpoint->participant_id));
                     }
 
+                    std::unique_ptr<MoECPUExpertShardRouteStage> joint_collective;
+                    if(joint) {
+                        const auto &geometry=*compact_arena->cpuJointLayout();
+                        joint_collective=std::make_unique<MoECPUExpertShardRouteStage>(MoECPUExpertShardRouteStage::Params{
+                            .original_source=joint_layer->source()->cpu_joint_source,
+                            .tp=config_.cpu_joint_context.get(),.packed_records=compact_arena->cpuJointPackedRecords().get(),
+                            .combined_routes=geometry.isRoot()?compact_arena->cpuCanonicalRoutes().get():nullptr,
+                            .source_ranges=compact_arena->cpuJointSourceRanges(),
+                            .participant_route_maps=compact_arena->cpuJointRouteMaps(),
+                            .required_route_weights=compact_arena->cpuJointRequiredRoutes(),
+                            .rows=row_capacity,.top_k=top_k,.columns=d_model,.root_participant=static_cast<int>(geometry.rootMember()),
+                            .stage_name="cpu_joint_original_routes.layer"+std::to_string(layer),
+                            .original_return_rows=endpoint->output_rows.get(),
+                            .original_preweighted_routes=geometry.isRoot()?endpoint->lane.returned.canonical_route_contributions_fp32:nullptr,
+                            .original_return_route_capacity=endpoint->lane.returned.route_slot_capacity,
+                            .original_sparse_routes=endpoint->input_rows.get(),.original_prepared_layer=joint_layer,
+                            .original_tp_owner=config_.cpu_joint_context});
+                    }
                     endpoint->layers.push_back(
                         CachedParticipantGraph::MappedCPUFollowerLayer{
                             .model_layer_index = layer,
@@ -2814,6 +2879,7 @@ namespace llaminar2
                             .local_expert =
                                 std::make_unique<MoELocalExpertStage>(
                                     std::move(local_params)),
+                            .joint_route_collective=std::move(joint_collective),
                         });
                 }
                 result->mapped_cpu_endpoints.push_back(std::move(endpoint));
@@ -3206,6 +3272,14 @@ namespace llaminar2
                                          expert < num_experts;
                                          ++expert)
                                     {
+                                        const auto *placement=owner_map_->placementFor(layer,expert);
+                                        if(placement && placement->shard_cohort) {
+                                            if(placement->domain_name==binding.participant->domain_name)
+                                                throw std::logic_error("GPU scalar runtime cannot represent its own joint CPU domain");
+                                            auto &external=update.experts[static_cast<size_t>(expert)];
+                                            external.logical_expert_id=expert;external.owner_participant=-1;
+                                            continue; // Original masks dispatch each joint CPU member explicitly.
+                                        }
                                         const auto *const owner =
                                             owner_map_->ownerFor(
                                                 layer, expert);
@@ -5311,8 +5385,16 @@ namespace llaminar2
                 const auto expert_compute_begin = collect_timeline
                                                       ? Clock::now()
                                                       : Clock::time_point{};
-                const bool expert_compute_ok =
-                    layer.local_expert->execute(context_it->second);
+                bool expert_compute_ok = layer.local_expert->execute(context_it->second);
+                std::optional<CPUExpertShardRouteCompletion> joint_completed;
+                if(expert_compute_ok && layer.joint_route_collective) {
+                    joint_completed=layer.joint_route_collective->executeOriginalJointPublication(
+                        context_it->second,protocol,lane->identity,layer.stage_ordinal);
+                    expert_compute_ok=joint_completed.has_value();
+                }
+                const bool joint_contributor=layer.joint_route_collective &&
+                    lane->identity.return_role==static_cast<uint32_t>(MoEOverlayActivationReturnRole::StaticJointContributor);
+                const auto expected_return_rows=joint_contributor?size_t{0}:input.live_row_count;
                 if (collect_timeline)
                 {
                     layer_timing.expert_compute_ns = accumulate_elapsed(
@@ -5321,7 +5403,7 @@ namespace llaminar2
                         Clock::now());
                 }
                 if (!expert_compute_ok ||
-                    output.live_row_count != input.live_row_count ||
+                    output.live_row_count != expected_return_rows ||
                     output.residency_epoch != input.residency_epoch ||
                     output.source_participant != endpoint->participant_id ||
                     output.target_participant != input.source_participant)
@@ -5351,13 +5433,12 @@ namespace llaminar2
                                                           : Clock::time_point{};
                 const std::uint64_t return_bytes =
                     moeOverlayReturnPayloadBytes(
-                        input.live_entry_count,
+                        joint_contributor?size_t{0}:input.live_entry_count,
                         static_cast<std::uint32_t>(input.d_model));
-                if (!protocol.publishReturn(
-                        lane->identity,
-                        layer.stage_ordinal,
-                        return_bytes,
-                        &protocol_error))
+                const bool published=joint_completed
+                    ?protocol.publishJointReturn(lane->identity,layer.stage_ordinal,return_bytes,*joint_completed,&protocol_error)
+                    :protocol.publishReturn(lane->identity,layer.stage_ordinal,return_bytes,&protocol_error);
+                if (!published)
                 {
                     abort_armed();
                     return reject(
@@ -5410,6 +5491,10 @@ namespace llaminar2
             (void)lane.authority->protocol->cancelOriginalInvocation(lane.identity,
                 MoEOverlayActivationStatusCode::ExplicitAbort, &ignored);
         }
+        // The original CPU collective is an independent explicit graph edge.
+        // Releasing GPU/host activation waits cannot complete its missing peer;
+        // preserve GlobalTP's existing fatal abort instead of stranding a gather.
+        if(config_.cpu_joint_context)config_.cpu_joint_context->requestAbort();
     }
 
     MoEOverlayParticipantGraphRunner::MappedFollowerEnqueueJoin
@@ -6090,6 +6175,13 @@ namespace llaminar2
                     "gn_sparse_dispatch",
                     authority.device.to_string(),
                     traffic_tags);
+            }
+            if (traffic->dispatch_shared_hidden_bytes > 0u)
+            {
+                PerfStatsCollector::addCounter(
+                    "moe_overlay", "shared_dispatch_hidden_bytes",
+                    static_cast<double>(traffic->dispatch_shared_hidden_bytes),
+                    "gn_sparse_dispatch", authority.device.to_string(), traffic_tags);
             }
             if (traffic->return_payload_bytes > 0u)
             {

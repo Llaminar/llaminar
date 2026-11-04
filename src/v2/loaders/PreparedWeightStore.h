@@ -1,4 +1,5 @@
 #pragma once
+#include "kernels/cpu/gemm/CPUPreparedWeightWriter.h"
 
 /**
  * @file PreparedWeightStore.h
@@ -80,6 +81,46 @@ namespace llaminar2
          */
         [[nodiscard]] std::shared_ptr<PhysicalMemoryAuthority>
         physicalMemoryAuthority() const;
+
+        /** @brief One Store-issued source transaction; partial final roots cannot become bindings. */
+        class CPUPreparation final {
+        public:
+            ~CPUPreparation();
+            CPUPreparation(const CPUPreparation&)=delete;
+            CPUPreparation& operator=(const CPUPreparation&)=delete;
+            /** @return The SAME consumer geometry used by planner and source transaction. */
+            std::optional<NativeWeightLoadStagingRequest> stagingRequest() const;
+            /** @return Original immutable matrix/range and precision, never inferred from converted storage. */
+            const CPUPreparedWeightSource& source() const & noexcept;
+            /** @brief Synchronously append the next actual original native window using admitted scratch. */
+            void append(const NativeWeightSourceWindow&,std::span<const std::byte>,std::span<std::byte>);
+            /** @brief Let the original reader fill a genuine final destination without an input shadow. */
+            void readDirect(const NativeWeightSourceWindow&,const std::function<void(std::span<std::byte>)>&);
+        private:
+            friend class PreparedWeightStore;
+            struct Impl;
+            explicit CPUPreparation(std::unique_ptr<Impl>);
+            std::unique_ptr<Impl> impl_;
+        };
+
+        /**
+         * @brief Begin one final CPU weight owner from original unmaterialized binding metadata.
+         * @param original Binding identity/selection from the actual frozen plan; tensor/prepared fields are absent.
+         * @param source Actual original source/range plus code-owned resolved precision/consumer.
+         * @param memory_owner Existing original persistent final-weight BOM family.
+         * @param placement Original resolved final CPU placement, independent of read-buffer placement.
+         * @return Store-issued incomplete preparation, retaining original model/PMA identity until commit.
+         * @throws std::invalid_argument For foreign identity, invalid geometry, placement or owner.
+         */
+        std::unique_ptr<CPUPreparation> beginCPUPreparation(WeightBinding original,CPUPreparedWeightSource source,
+            PhysicalMemoryOwner memory_owner,CPUStoragePlacement placement);
+        /**
+         * @brief Commit complete actual engine/root to the existing prepared registry and final binding.
+         * @param preparation Actual transaction issued by this original model/PMA, consumed once.
+         * @return Materialized binding with its real final tensor/prepared ref; no source-only placeholder.
+         * @throws std::logic_error For incomplete, failed, foreign or duplicate preparation.
+         */
+        WeightBinding finishCPUPreparation(std::unique_ptr<CPUPreparation> preparation);
 
         // =========================================================================
         // GEMM Preparation & Resolution
@@ -171,6 +212,16 @@ namespace llaminar2
         /// Resolve GEMM kernel from a prepared ref. O(1) lookup by binding_id.
         /// Returns nullptr if ref not found or handle missing.
         ITensorGemm *gemmKernel(const PreparedWeightRef &ref) const;
+
+        /**
+         * @brief Retain the exact prepared handle allocation while borrowing its GEMM.
+         * @param ref Original store reference, including kind/model/device/binding.
+         * @return Shared alias of the owned handle, or null for an absent/incomplete entry.
+         *
+         * Registry/graph borrowers must not alias the store itself: clearing its
+         * entries would then destroy engines while the store remained alive.
+         */
+        std::shared_ptr<ITensorGemm> gemmKernelLifetime(const PreparedWeightRef& ref) const;
 
         /// Resolve a prepared ref by frozen binding identity. O(1) lookup by binding id.
         /// Returns std::nullopt if the binding has not been prepared for this device.

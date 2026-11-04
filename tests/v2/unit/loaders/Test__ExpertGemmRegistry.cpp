@@ -1173,3 +1173,12 @@ TEST(StaticProjectionPreparedSource, NativeDescriptorOwnsGeometryAndOriginalCode
         EXPECT_EQ(layer->sources.front().tensor->native_type(),TensorType::Q8_0);
     }
 }
+
+#include "CPUJointPreparedSourceContract.inc"
+
+#include "CPUJointStaticResidencyLifecycle.inc"
+#include "CPUJointDispatchContract.inc"
+
+#include "CPUJointGraphOwnershipContract.inc"
+
+#include "CPUTensorTP1PreparedStaticReplay.inc"

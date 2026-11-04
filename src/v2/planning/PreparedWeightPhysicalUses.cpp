@@ -19,18 +19,6 @@
 
 namespace llaminar2
 {
-    namespace
-    {
-        /** @return Actual inventory scalar/codebook enum, or no provable prepared identity. */
-        std::optional<TensorType> inventoryType(std::string_view name)
-        {
-            if (name == "F32") return TensorType::FP32;
-            if (name == "F16") return TensorType::FP16;
-            for (int value = 0; value <= static_cast<int>(TensorType::AQ8); ++value)
-                if (name == tensorTypeName(static_cast<TensorType>(value))) return static_cast<TensorType>(value);
-            return std::nullopt;
-        }
-    }
     PreparedWeightPhysicalUses::PreparedWeightPhysicalUses(const ModelMemoryProfile &profile, DeviceId device,
         WeightComponentScope components)
         : profile_(profile), device_(device), components_(components)
@@ -79,7 +67,7 @@ namespace llaminar2
             }
             catch (const std::exception &) { return std::nullopt; }
         }
-        auto type = inventoryType(tensor.quant_type);
+        auto type = tensorTypeFromName(tensor.quant_type);
         if (!type) return std::nullopt;
         const auto &policy = debugEnv().gemm;
         const auto representation = PreparedWeightRepresentationContract::resolve(role, *type, tensor.name,

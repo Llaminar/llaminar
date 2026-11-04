@@ -19,6 +19,7 @@
 #include "MoEExpertOwnerMap.h"
 #include "MoEOverlayPreparedExpertPayload.h"
 #include "MoEExpertProjectionOwnership.h"
+#include "loaders/ExpertGemmRegistry.h"
 
 #include <array>
 #include <atomic>
@@ -615,6 +616,30 @@ namespace llaminar2
     class MoEOverlayParticipantResidencyRegistry final
     {
     public:
+        /** @brief Distinguish real joint fragments from whole-expert prepared banks. */
+        enum class InitialOwnershipKind { WholeExperts, CPUJointFragments };
+        /** @brief Immutable source-bound fragment publication; only the original registry can construct it. */
+        class CPUJointLayer final {
+        public:
+            /** @return Original configured initial epoch, never a caller-generated sequence. */
+            uint64_t epoch()const noexcept{return epoch_;}
+            /** @return Exact canonical participant identity. */
+            int participantId()const noexcept{return participant_;}
+            /** @return Original model layer. */
+            int layer()const noexcept{return layer_;}
+            /** @return Actual source/engine lease; absent only for a proven empty original selection. */
+            const std::shared_ptr<const ExpertGemmRegistry::StaticProjectionLayer>& source()const noexcept{return source_;}
+        private:
+            friend class MoEOverlayParticipantResidencyRegistry;
+            /** @brief Publish only after exact original source registration validation. */
+            CPUJointLayer(uint64_t epoch,int participant,int layer,
+                std::shared_ptr<const ExpertGemmRegistry::StaticProjectionLayer> source)
+                :epoch_(epoch),participant_(participant),layer_(layer),source_(std::move(source)){}
+            uint64_t epoch_;
+            int participant_,layer_;
+            std::shared_ptr<const ExpertGemmRegistry::StaticProjectionLayer> source_;
+        };
+
         /**
          * @brief One layer selection read from an installed initial bank.
          *
@@ -647,6 +672,7 @@ namespace llaminar2
              * planner-authorized bank.
              */
             bool matches_frozen_owner_map = false;
+            InitialOwnershipKind ownership_kind = InitialOwnershipKind::WholeExperts; ///< Fragment IDs are not whole-expert duplicates.
         };
 
         /**
@@ -686,6 +712,7 @@ namespace llaminar2
             std::shared_ptr<const MoEExpertOverlayPreparationPlan> projection_preparation;
             /** First global model layer owned by all endpoints in this registry. */
             int first_model_layer = 0;
+            ModelContextId original_model; ///< Original context strategy/store identity; required only for joint fragments.
         };
 
         /**
@@ -762,9 +789,27 @@ namespace llaminar2
             const ExpertGemmRegistry &registry,
             std::string *error = nullptr);
 
-        /** @return Process-local endpoint for @p participant_id, or null. */
+        /**
+         * @brief Publish one original source-bound CPU joint layer without a whole-payload alias.
+         * @param registry Original model's prepared engine/source authority.
+         * @param original_model Exact original context/store identity from cold admission.
+         * @param participant_id Original local endpoint, including rank/NUMA identity.
+         * @param layer_idx Original layer in this registry's interval.
+         * @param error Optional precise failure; rejection does not publish partial state.
+         * @return First or exact idempotent publication success.
+         */
+        bool registerInitialCPUJointLayer(const ExpertGemmRegistry& registry,ModelContextId original_model,
+            int participant_id,int layer_idx,std::string* error=nullptr);
+        /** @return Original immutable joint layer at its configured initial epoch, or throw for missing/whole/local mismatch. */
+        std::shared_ptr<const CPUJointLayer> initialCPUJointLayer(int participant_id,int layer_idx)const;
+        /** @return The same layer only if the actual packet carries its exact original epoch. */
+        std::shared_ptr<const CPUJointLayer> cpuJointLayer(int participant_id,int layer_idx,uint64_t actual_epoch)const;
+        /** @return Whether this registered endpoint is a typed CPU joint-fragment participant. */
+        bool isCPUJointParticipant(int participant_id)const noexcept;
+
+        /** @return Process-local whole endpoint, or null if nonlocal; joint access throws instead of fabricating a whole owner. */
         [[nodiscard]] std::shared_ptr<MoEOverlayParticipantResidency>
-        endpoint(int participant_id) const noexcept;
+        endpoint(int participant_id) const;
 
         /** @return Sorted process-local participant ids. */
         [[nodiscard]] std::vector<int> localParticipantIds() const;
@@ -858,8 +903,7 @@ namespace llaminar2
          * This is the initial epoch's identity, never the live device placement.
          * Stage handoff checks it before graph construction or maintenance starts.
          */
-        [[nodiscard]] const MoEExpertOwnerMap &initialOwnerMap() const noexcept
-        { return config_.owner_map; }
+        [[nodiscard]] const MoEExpertOwnerMap &initialOwnerMap() const noexcept;
 
     private:
         /**
@@ -878,6 +922,8 @@ namespace llaminar2
 
         struct EndpointAssembly
         {
+            /** Closed fragment arm; no ordinary MoEOverlayPreparedExpertPayload is created. */
+            std::optional<std::vector<std::shared_ptr<const CPUJointLayer>>> joint_layers;
             std::shared_ptr<MoEOverlayParticipantResidency> endpoint;
             MoEOverlayParticipantResidencyBank initial_bank;
             std::vector<bool> registered_layers;

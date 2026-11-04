@@ -871,3 +871,41 @@ TEST(NgramExecutionProvision,
                      q.execution_provision->requiredBase(),q.native_ordering_events,q.retained_host_services),
                  std::invalid_argument);
 }
+
+/** @test A CPU-only startup receiver restores remote GPU metadata using installed budgets, never a local worker. */
+TEST(NgramExecutionProvision, CPUReceiverRestoresRemoteGPUInstalledPlanningWithoutNativeContext)
+{
+    test::Qwen4ExpPlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    const auto& profile=source.metadata().memoryProfile();
+    for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm})
+    for(const auto preference:{ImmutableRowStoragePreference::RAM,ImmutableRowStoragePreference::MemoryMapped}) {
+        SCOPED_TRACE(::testing::Message()<<int(backend)<<":"<<int(preference));
+        auto config=consumer(backend,preference);
+        // Sender rank0's immutable installed budgeting is metadata. This CPU
+        // receiver owns no prepared native GPU worker for that remote device.
+        config.native_ordering_events=NativeOrderingEventBudgetProjection::installed();
+        const std::vector<std::vector<DevicePlanConfig>> groups{{config}};
+        const auto original=MemoryPlanner::immutableRowTableAdmissionRequest(profile,*config.ngram_execution_policy,
+            groups,MemoryPlanner::immutableRowTableUploadBindings(profile,groups),ImmutableRowTableHostPlacement::onNode(3));
+        ASSERT_TRUE(original);ASSERT_TRUE(original->execution_provision);
+        const auto wire=serializeImmutableRowTableAdmissionRequests(std::array{*original});
+        const auto restored=parseImmutableRowTableAdmissionRequests(wire,0,&profile);
+        ASSERT_EQ(restored.size(),1u);const auto& actual=restored.front();
+        ASSERT_TRUE(actual.execution_provision);
+        EXPECT_EQ(actual.requested,original->requested);
+        EXPECT_EQ(actual.input.extent(),original->input.extent());
+        EXPECT_EQ(actual.input.hostPlacement(),original->input.hostPlacement());
+        EXPECT_EQ(actual.execution_provision->source(),original->execution_provision->source());
+        EXPECT_EQ(actual.execution_provision->consumers(),original->execution_provision->consumers());
+        EXPECT_EQ(actual.execution_provision->executionPlan().summary(),original->execution_provision->executionPlan().summary());
+        EXPECT_EQ(actual.execution_provision->requiredBase().summary(),original->execution_provision->requiredBase().summary());
+        EXPECT_EQ(actual.contributions.ram.summary(),original->contributions.ram.summary());
+        EXPECT_EQ(actual.contributions.mmap.summary(),original->contributions.mmap.summary());
+        EXPECT_THROW(parseImmutableRowTableAdmissionRequests(wire,1,&profile),std::invalid_argument);
+        auto foreign=profile;--foreign.flash_next->ple_table_rows;
+        EXPECT_THROW(parseImmutableRowTableAdmissionRequests(wire,0,&foreign),std::invalid_argument);
+        auto truncated=wire;truncated.pop_back();
+        EXPECT_THROW(parseImmutableRowTableAdmissionRequests(truncated,0,&profile),std::invalid_argument);
+    }
+}

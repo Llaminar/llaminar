@@ -145,9 +145,16 @@ namespace llaminar2
         /** Exact global routed interval, including only this owner's retained sidecars. */
         MoEOverlayInferenceGraphFamilyIdentity graph_family;
         /** Original sealed ordering-program source, copied onto real participant DevicePlanConfigs before BOM construction. */
+        /** Original source-native metadata; joint fixed roots must not infer shape from compact prepared tensors. */
+        std::span<const MoEOverlayLayerWeightManifest> original_expert_manifest;
         NativeOrderingEventBudgetProjection native_ordering_events=NativeOrderingEventBudgetProjection::installed();
         /** Original local or discovery-receipt source; empty evidence cannot authorize a service. */
         RetainedHostServiceBudgetProjection retained_host_services=RetainedHostServiceBudgetProjection::installed({});
+        /** Same original destination representation consumed by WeightManager; ordinary runtime selects NATIVE. */
+        WeightPrecision weight_precision=WeightPrecision::NATIVE;
+        /** Original loader/factory source placement for non-joint CPU components. */
+        std::optional<CPUStoragePlacement> native_source_placement;
+
     };
 
     /** @brief Rank-local fixed BOM plus the exact graph-row shape it priced. */

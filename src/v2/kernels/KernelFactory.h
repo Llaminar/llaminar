@@ -1425,6 +1425,21 @@ namespace llaminar
                     size_t total_vocab = 0);
 
                 /**
+                 * @brief Retain an already-final native CPU embedding without a second storage root.
+                 * @param final_tensor Owning quantized CPU table, populated through the native reader.
+                 * @param d_model Logical width matching the native row layout.
+                 * @param vocab_offset First global vocabulary row in this final shard.
+                 * @param total_vocab Full vocabulary extent; zero means this unsharded table.
+                 * @return Handle retaining the same tensor, native bytes and original allocation lease.
+                 * @throws std::invalid_argument For absent, non-CPU, non-native or inconsistent storage.
+                 * @details Floating embeddings retain their existing direct tensor path.
+                 * No backend allocation, transfer or new admission claim occurs here.
+                 */
+                static std::shared_ptr<llaminar2::PreparedEmbeddingHandle> prepareEmbeddingHandleFromFinalCPUStorage(
+                    std::shared_ptr<const llaminar2::TensorBase> final_tensor,
+                    int d_model, size_t vocab_offset = 0, size_t total_vocab = 0);
+
+                /**
                  * @brief Bind a GPU GEMM to a range in the canonical prepared-weight pool.
                  * @param tensor Logical matrix metadata; no host bytes are read or retained.
                  * @param device Exact device, checked against the pool owner's backend.

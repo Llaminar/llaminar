@@ -1,0 +1,109 @@
+# QFN sharded-expert dynamic residency plan
+
+## Status, prerequisite and first target
+
+Dynamic hot/cold promotion and demotion of sharded experts remain unresolved on CPU and GPU. This plan is an implementation proposal, not a support or qualification claim. It replaces a CPU-only design: all layouts must use the same placement, source, transport, accounting and publication authorities.
+
+First close the common bounded loading, matched Static numerical and process RSS gates in [CPU expert tensor-sharding qualification](QFN_CPU_EXPERT_TENSOR_SHARDING_QUALIFICATION.md). Preserve the model, arithmetic, frozen histories and reference limits. Source admission alone does not certify accuracy, RSS, movement or economy.
+
+The first concrete target is one MI50 continuation GPU and two physical CPU sockets, with rank zero owning the GPU continuation and CPU root, and rank one owning the other CPU fragment. Each CPU expert is tensor-sharded across those sockets. Dynamic movement must promote/demote complete logical experts between the GPU tier and that CPU cohort without assembling a whole CPU expert.
+
+## Scope: fixed admitted layouts
+
+A placement target may be one whole-expert owner or a complete already-admitted shard cohort. Keep each target's membership, physical endpoints, root/reduction policy, cuts, native contexts, captured graph topology and capacity fixed. Migration between two pre-admitted targets may change the expert's physical partition because the targets have different cuts. That is redistribution between existing layouts, not live cohort or graph repartitioning.
+
+Changing an admitted cohort, inventing a new cut, resizing graph storage, adding a domain or changing a reduction tree while serving is outside this slice. CPU singleton placement remains ordinary whole ownership. Generic metadata covers populations through eight; native tests require genuine corresponding sockets/devices and never emulate eight sockets on a two-socket host.
+
+## Multiple tiers and controller movement graph
+
+The required configuration includes two CUDA GPUs as a hot tier, four ROCm GPUs as a warm tier, and two CPU sockets as a cold-capacity tier. Each tier independently declares apportioned whole experts or tensor-sharded experts. The configuration/test dimension includes all eight apportioned/sharded assignments across these three tiers, wherever each selected compute layout is implemented and qualified. An intermediate tier may be apportioned while either endpoint is sharded. Accepting a configuration document is not evidence that its execution layouts work.
+
+The controller constructs one layout-aware movement graph from the original source and destination **tier expert configurations**, including their projection ownership, replicas, cuts, reductions, formats and capacities. Tier order expresses residency policy, not a mandatory transfer itinerary. Support adjacent moves, direct hot-to-cold/cold-to-hot moves that skip the warm residency tier, and capacity-preserving multi-tier cycles. A transport may relay bytes through host staging or another admitted transfer endpoint without installing an expert there. Such a relay is not a residency hop, must not change authoritative placement, and must never require a whole expert to materialize in an apportioned intermediate tier.
+
+Plan each logical migration as the intersections of the actual source and destination layouts. Stage every member/projection required by the destination while retaining old source leases. Treat a multi-tier cycle as one capacity-admitted candidate: no partial tier, shard or replica publication. Commit one exact candidate epoch and retire all replaced roots only after the existing all-rank selector/publication and reader-drain protocol completes. Direct and multi-tier routes retain the same original expert identity throughout; no per-hop competing controller or ownership path is introduced.
+
+Controller economy must combine existing hotness/histogram evidence and hysteresis with the full logical-expert/cohort execution critical path, transfer and reshard cost, topology-dependent transport/relay cost, every member's final/shadow/staging capacity, and actual available overlap. A scalar representative GPU or CPU cannot stand in for a sharded tier. A candidate must preserve per-member capacities across the entire cycle and offer the existing required amortized benefit; tier labels alone do not justify movement. Transport route selection must not silently override the controller's residency decision.
+
+## Grounded support and gaps
+
+| Area | Existing foundation | Unresolved boundary |
+|---|---|---|
+| Whole-expert residency | Scalar owner proposals, prepared participant banks, physical shadow slots, distributed commit/retirement | Cannot encode an expert requiring all members of a shard cohort |
+| CPU intermediate sharding | Source-authenticated Gate/Up F-row stripes and Down K stripes, original cohort/root, compact native gather | Setup is Static-only; snapshot and fragment bank accept initial epoch only; captured fanout is immutable |
+| GPU projection layouts | `MoEExpertProjectionOwnership` describes complete experts and gate/up-owned down-output-column placement; preparation retains source projection geometry | This projection layout differs from CPU F sharding. It does not establish arbitrary GPU tensor-sharded expert execution or dynamic migration |
+| General GPU expert tensor sharding | Domain grammar and typed projection metadata are reusable | Standard factory explicitly rejects tensor-sharded MoE; whole-owner map rejects it by default; the joint cohort factory authenticates CPU members only. Each advertised GPU layout still needs real execution/capture/admission support |
+| CPU/GPU movement | Existing WeightTransferLane converts prepared CPU NativeVNNI and GPU separated formats in bounded chunks; floating edges retain representation | Full-projection N/K contracts lack independent source/destination origins and strides |
+| Same-vendor GPU movement | Physical fabric selects actual peer access or an explicitly admitted no-peer host relay | Whole-region peer/blob contracts cannot silently become shard redistribution |
+| Cross-vendor GPU movement | Existing CrossBackend blob relay and live physical-format provenance | Cohort/range mapping, compatible destination representation and all-member publication need proof; a relay is not GPU shard-compute support |
+
+`GateUpOwnedDownColumns` keeps Gate/Up owner-local and partitions Down output rows while preserving K and its reduction. CPU intermediate sharding instead partitions Gate/Up F and Down K, requiring a rooted sum. The shared design must retain this distinction. Shape metadata is not proof that either graph or movement implementation supports a layout.
+
+### Logical demand and physical work are separate evidence
+
+Count each logical routed expert use exactly once at the original authenticated routing transaction, independent of shard count, replica count or transport relays. Per-shard copies of the same selected route are execution observations, not additional demand. Do not obtain hotness by summing duplicated participant routing histograms. Bind logical demand to original layer/expert, request/transaction and placement epoch so reset and publication cannot count a route twice or attribute it to a foreign epoch.
+
+Retain physical member work, communication volume, overlap and cohort critical-path measurements separately for economy. These may vary with TP degree or replication even when logical demand is identical. Relay-only transfers contribute transport cost and bytes, but leave logical hotness and authoritative residency unchanged.
+
+GPU routing/controller state and candidate publication remain device-owned and event-ordered through the existing native capture/publication contracts. Do not introduce a mutable host histogram mirror, count readback, blocking synchronization, eager execution or recapture to implement movement. Any required heterogeneous boundary must remain explicit in the admitted graph and retain its existing authenticated ticket/epoch authority.
+
+## One placement and source contract
+
+Extend the existing `MoEOverlayResidencyAuthority` proposal/snapshot with a typed whole-owner-or-cohort target. Preserve original model, layer, expert, projection, source N/K and native provenance. Every member's typed projection layout defines owned original coordinates and execution/reduction obligations. Do not select a cohort's first member as a scalar owner, rebuild a competing source map, or create a CPU-only movement registry.
+
+A migration plan intersects source and destination projection ownership in original coordinates. Each transfer rectangle carries both source and destination origins, physical strides, logical/native block extents, epoch, participant and source-layout identity. Validate all intersections before writes: exact required destination coverage, no unintended overlap, no holes, native alignment and compatible representation. Explicit replicas need typed copy semantics; they must not accidentally contribute twice to a sum.
+
+Use actual prepared storage as the source. CPU engines retain NativeVNNI or floating roots; GPU engines retain separated arrays and live format descriptors plus original provenance. Common loading releases raw source parents. Passive source geometry cannot supply raw GGUF bytes, and movement should not introduce a new GGUF reread protocol.
+
+## Existing transport and accounting boundaries
+
+Extend existing lane/manifests/kernel contracts rather than adding a transport:
+
+- Whole-to-sharded selects only destination-owned original rectangles. Sharded-to-whole writes disjoint rectangles into one inactive destination root, with all-member readiness before publication.
+- Sharded-to-sharded transfers the original-coordinate intersections between the two admitted cuts, including different source/destination shard counts. No whole CPU assembly, packed-span concatenation or unnecessary full-expert fanout.
+- CPU/GPU edges use the existing WeightTransferLane and TransferEngine staging/streams. Same-vendor GPU edges use admitted peer regions where available, otherwise the existing explicit relay. Cross-vendor edges use the existing CrossBackend blob transport. Nonlocal endpoints use the physical fabric's existing remote projection protocol, not activation gather or a new communicator.
+- Native movement preserves codebook, scale, minimum and grid-factor semantics. GPU physical formats may have changed after a previous promotion; authenticate the live descriptor with original provenance. Reformat without requantization. Unsupported format/layout combinations fail before staging. Floating K stripes require explicit strided gather/scatter, not contiguous multirow memcpy.
+
+`PhysicalMemoryAuthority` remains the sole ledger. Extend the original capacity/fabric BOM for simultaneous old/new final roots, per-member placement, inactive destinations and actual concurrent lane demand. Reuse `ExpertMigrationStaging`, `ExpertShadowSlots` and existing TransferEngine persistent staging/execution slices. Source engines and transfer readiness remain retained until actual completion; abort cannot free pending DMA or synchronize a destructor. No blanket reserve or second byte authority is permitted.
+
+## Implementation sequence
+
+1. **Make layout capability explicit.** Describe supported whole and sharded targets using original projection coordinates and actual compute/reduction contracts. Retain current guards where GPU execution or movement is absent. Establish the MI50/CPU-cohort target first without inventing general GPU shard support.
+2. **Extend shared proposal and epoch banks.** Add cohort placement to existing transactions, wire validation, participant banks and source leases. Stage every required member/projection under the same candidate epoch and PMA admission. Partial readiness cannot publish.
+3. **Implement rectangular movement.** Extend WeightTransferLane, peer/blob/remote manifests and native kernels with the shared source/destination range contract. Whole projections use identity rectangles. Add bounded intersection iteration for different admitted cuts; preserve native bytes and fixed arithmetic.
+4. **Publish versioned execution placement.** Extend existing versioned placement data to carry cohort fanout and root/reduction roles. Captured pointers/topology stay stable. Publish prepared banks and packet epoch through one selector; never mutate captured host membership bits and assume graphs changed.
+5. **Reuse distributed commit and retirement.** Keep existing reserve, stage, inactive-bank prepare, selector and authority consensus. Pin old epochs across dispatch, compute, reduction, sparse return and ACK. Close old admission, drain leases and retire all old roots through existing consensus. Keep native domain/session lifetime unchanged.
+6. **Integrate economy and qualify.** Existing histogram and rebalance policy must price complete target critical paths and all transfer edges/member storage. Enable a layout/mode only after its functional, numerical, communication and native gates pass. Observe also needs a complete supported evidence path.
+
+## Required tests
+
+### Functional and ownership
+
+Extend existing authority, proposal/protocol, registry, Store and physical-fabric suites. Cover whole-to-sharded, sharded-to-whole and sharded-to-sharded transactions, differing admitted cuts, exact original identities, replicas, empty intersections, stale/foreign epochs, duplicate/missing members, failure at every phase, abort and delayed reader retirement. Metadata sweeps cover one through eight participants without native-hardware claims. Preserve whole-expert controls.
+
+Use real prepared handles/source leases and exact allocator geometry. Prove exact quota, one-byte-short failure, simultaneous old/new roots, bounded staging, partial preparation cleanup and retirement after the last actual reader. No fake readiness or raw-parent substitutes.
+
+### Tier configurations and movement graph
+
+Exercise all eight hot/warm/cold apportioned-versus-sharded assignments as explicit configuration cases, including an apportioned intermediate tier between sharded endpoints. Positive execution cases require actual qualified compute layouts; missing GPU shard implementations remain explicit gaps. Validate adjacent and direct tier-skipping moves, hot/warm/cold exchanges and three-tier capacity-preserving cycles, with failures at each member and publication phase. Prove that a relay leaves the intermediate tier's residency and final-root ownership unchanged and never creates a full intermediate expert. Include asymmetric capacities, unavailable destination members, hysteresis/no-benefit rejection and repeated hotness reversal without placement thrashing.
+
+Mixed projection and replicated targets are additional typed layout dimensions. Preserve the distinction between owner-local Gate/Up with distributed Down output stripes, CPU F stripes with Down K cuts, and explicit full or partial replicas. Validate required coverage per projection and replica role, and reduce each actual contribution exactly once. Do not coerce one layout into another because its tensor byte count happens to match.
+
+Logical demand regressions must feed equivalent original routes through apportioned, TP1, TP2 and TP4 layouts and assert identical per-expert logical counts and hotness decisions. Check physical work counters independently rather than requiring identical participant costs. Cover partial and empty work, repeated captured replay, request reset, epoch transitions and old readers; every genuine route counts once, while replay of execution for the same authenticated transaction cannot duplicate demand. Relay-only hops must change only transport evidence, leaving both residency and hotness unchanged. Run device-free controller contracts where possible and native event/capture proofs on each qualified backend; register focused regressions explicitly in ProductionTestPreflight.
+
+### Accuracy and native formats
+
+Sweep all supported native codebooks and floating formats across nonzero row/K origins and unequal aligned cuts. Compare whole-to-sharded-to-whole and sharded-to-differently-sharded results against independent original representation and production execution oracles. Include previously promoted GPU physical formats and both Down-output and Down-K layouts. Preserve fixed reductions and native quantization; do not replace unsupported movement with requantization.
+
+Keep three separate proof obligations: exact native-format/roundtrip preservation proves representation transport; cross-layout model accuracy proves the changed partition/reduction configuration against its canonical numerical contract; fixed-layout MTP grouped decode must retain serial-row byte equivalence. One proof does not substitute for another, and exact weight movement alone does not establish identical arithmetic across different reduction layouts.
+
+Run matched QFN histories, full-vocabulary metrics and required full-stage checkpoints before and after repeated promotion/demotion and reset. Compare Static and Dynamic with identical source/arithmetic. Existing source or static results cannot certify movement accuracy.
+
+### Communication and economy
+
+Assert actual transferred and collective bytes for partial, empty, skewed and large-to-small work. Only required intersection data and protocol metadata may cross each edge. Allocation padding, unused expert slots, full replicated matrices and duplicate root outputs are not communication extents. Record exact staging high water, PMA ownership, transfer/capture path counters, retirement and movement critical path. Measure production overlap and useful benefit after correctness; a functional but uneconomical path is unfinished.
+
+### Hardware-realistic native matrix
+
+The first required cell is MI50 continuation plus two physical CPU sockets, one MPI rank per socket, with the GPU/CPU root colocated. Exercise existing ShmemSpin and MPI CPU domains, actual promotion/demotion and in-flight old readers. Then cover same-vendor GPU whole/shard edges with real peer and admitted no-peer topology, and CUDA/ROCm mixed-vendor tiers through the existing relay, only where actual supported compute layouts and hardware are available. The concrete two-CUDA/four-ROCm/two-CPU tier configuration requires the corresponding real devices and physical CPU socket/rank binding. Preserve explicit original inventory and GPU UUID visibility masks, including the actual MI50 UUID masks recorded by the qualification owner; never guess ordinal identity or replace an unavailable topology with extra artificial ranks. Record the exact selected masks with each qualification invocation. Do not manufacture extra ranks or advertise unavailable GPU-shard layouts as qualified. Four/eight CPU socket cells require matching physical hardware.
+
+Every production defect needs a focused `ProductionTestPreflight` entry. Reuse existing residency-consensus, tier-migration, CPU shard lifecycle, peer/blob, native repack and backend capture suites. Extend CUDA/ROCm resource/spill compilation and runtime evidence for changed kernels. These constituent tests currently do not certify dynamic sharded-expert residency.

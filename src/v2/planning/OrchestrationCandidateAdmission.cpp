@@ -208,6 +208,9 @@ namespace llaminar2
                 auto local = buildRankMemoryPlanInputs({
                     .model = profile, .plan = rank, .inventory = inventory.ranks.at(rank.rank),
                     .weight_load_geometry = weight_load,
+                    .native_weight_source_policy = policy.weight_load,
+                    .weight_precision = WeightPrecision::NATIVE,
+                    .native_source_placement = loader.nativeWeightSourcePlacement(),
                     .captured_prefill_buckets = policy.prefill_bucket_rows,
                     .max_gpu_memory_bytes = config.memoryLimitBytes(DeviceType::CUDA),
                     .max_cpu_memory_bytes = config.memoryLimitBytes(DeviceType::CPU)});
@@ -287,7 +290,11 @@ namespace llaminar2
                         .prefill = {.bucket_rows = policy.prefill_bucket_rows,
                             .minimum_sequence_rows = policy.minimum_prefill_sequence_rows,
                             .maximum_cached_buckets = policy.maximum_cached_prefill_buckets},
-                        .gpu_weight_load = {.policy = policy.weight_load, .maximum_source_bytes = weight_load.maximum_source_bytes}},
+                        .gpu_weight_load = {.policy = policy.weight_load, .maximum_source_bytes = weight_load.maximum_source_bytes},
+                        .original_expert_manifest=manifest,
+                        .weight_precision=WeightPrecision::NATIVE,
+                        .native_source_placement=ranks[index].numa_node>=0
+                            ? CPUStoragePlacement::onNode(ranks[index].numa_node):CPUStoragePlacement::local()},
                         candidate_rows);
                     inputs.local_capacity.native_ordering_events=policy.native_ordering_events;
                     inputs.local_capacity.retained_host_services = projectPlanningHostServiceBudget(

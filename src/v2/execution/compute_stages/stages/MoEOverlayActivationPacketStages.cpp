@@ -34,6 +34,32 @@ namespace llaminar2
 
     namespace
     {
+        /**
+         * @return Whether this immutable source projection belongs to the original
+         * channel role, target and model layer. The source bitset never replaces
+         * the versioned placement-bank/epoch acquisition performed on device.
+         */
+        bool validJointDispatchMembership(
+            const MoEOverlayStaticJointRouteMembership &membership,
+            const MoEOverlayMappedActivationDeviceLane &lane,
+            std::uint32_t experts, std::int32_t layer) noexcept
+        {
+            return lane.control_host &&
+                   membership.validFor(experts, lane.target_participant_id, layer) &&
+                   membership.enabled() ==
+                       (lane.control_host->channel.return_role !=
+                        static_cast<std::uint32_t>(MoEOverlayActivationReturnRole::Ordinary));
+        }
+
+        /** @return Canonical lane projection; an omitted vector means ordinary lanes only. */
+        const MoEOverlayStaticJointRouteMembership &jointMembershipForLane(
+            const std::vector<MoEOverlayStaticJointRouteMembership> &memberships,
+            std::size_t lane) noexcept
+        {
+            static constexpr MoEOverlayStaticJointRouteMembership ordinary;
+            return memberships.empty() ? ordinary : memberships[lane];
+        }
+
         /** @return Whether the selected execution backend supports native graphs. */
         bool isGPUBackend(ComputeBackendType backend) noexcept
         {
@@ -275,97 +301,6 @@ namespace llaminar2
                           << role
                           << " fused timeline publication binding failed: "
                           << error.what());
-                return false;
-            }
-        }
-
-        /**
-         * @brief Publish a fixed tensor range directly into shared pages.
-         *
-         * This overload is the one-copy shared-physical activation path. It
-         * intentionally bypasses per-lane device bounce buffers while retaining
-         * TransferEngine as the sole residency and exact-stream authority.
-         */
-        bool exportBulkPayload(
-            const MoEOverlayMappedActivationDeviceLane &lane,
-            const AcquiredDeviceTransferInput &source,
-            std::size_t source_offset,
-            std::size_t destination_offset,
-            std::size_t bytes,
-            const char *role)
-        {
-            try
-            {
-                TransferEngine::instance().enqueueDeviceToMappedHost(
-                    source,
-                    source_offset,
-                    *lane.mapped_region,
-                    destination_offset,
-                    bytes);
-                if (PerfStatsCollector::isDomainEnabled(
-                        "moe_overlay_activation_epoch"))
-                {
-                    PerfStatsCollector::addCounter(
-                        "moe_overlay_activation_epoch",
-                        "shared_physical_dispatch_d2h_bytes",
-                        static_cast<double>(bytes),
-                        "graph_setup",
-                        lane.device.toString(),
-                        {{"host_blocking", "false"},
-                         {"payload_layout", "shared_physical_rows"},
-                         {"payload_path", "shared_physical_mapped"},
-                         {"role", role}});
-                }
-                return true;
-            }
-            catch (const std::exception &error)
-            {
-                LOG_ERROR("[MoEOverlayActivationPacketStages] "
-                          << role << " tensor D2H failed: " << error.what());
-                return false;
-            }
-        }
-
-        /** @brief Publish tensor bytes when producer and DMA share one stream. */
-        bool exportTensorBulkPayload(
-            const MoEOverlayMappedActivationDeviceLane &lane,
-            TensorBase *source,
-            std::size_t source_offset,
-            std::size_t destination_offset,
-            std::size_t bytes,
-            void *stream,
-            const char *role)
-        {
-            try
-            {
-                TransferEngine::instance().enqueueDeviceToMappedHost(
-                    source,
-                    source_offset,
-                    *lane.mapped_region,
-                    destination_offset,
-                    bytes,
-                    lane.device,
-                    stream);
-                if (PerfStatsCollector::isDomainEnabled(
-                        "moe_overlay_activation_epoch"))
-                {
-                    PerfStatsCollector::addCounter(
-                        "moe_overlay_activation_epoch",
-                        "shared_physical_dispatch_d2h_bytes",
-                        static_cast<double>(bytes),
-                        "graph_setup",
-                        lane.device.toString(),
-                        {{"host_blocking", "false"},
-                         {"payload_layout", "shared_physical_rows"},
-                         {"payload_path", "shared_physical_mapped"},
-                         {"role", role}});
-                }
-                return true;
-            }
-            catch (const std::exception &error)
-            {
-                LOG_ERROR("[MoEOverlayActivationPacketStages] "
-                          << role << " tensor D2H failed: " << error.what());
                 return false;
             }
         }
@@ -985,6 +920,9 @@ namespace llaminar2
                    params_.model_layer_index) &&
                params_.lane.target_participant_id >= 0 &&
                params_.placement.valid() &&
+               validJointDispatchMembership(
+                   params_.static_joint_membership, params_.lane,
+                   params_.placement.expert_count, params_.model_layer_index) &&
                checkedElements(
                    params_.physical_rows,
                    params_.lane.dispatch.d_model,
@@ -1004,7 +942,9 @@ namespace llaminar2
 
     bool MoEOverlayActivationDispatchPackStage::hasFixedContract() const noexcept
     {
-        return hasStaticContract() && params_.hidden->gpu_data_ptr() &&
+        return hasStaticContract() &&
+               (!params_.lane.dispatchPayload(params_.physical_rows).requiresBulkPublication() ||
+                params_.lane.shared_dispatch_consumer_count==1u) && params_.hidden->gpu_data_ptr() &&
                params_.routing_indices->gpu_data_ptr() &&
                params_.routing_weights->gpu_data_ptr();
     }
@@ -1051,6 +991,7 @@ namespace llaminar2
             .route_weights = static_cast<const float *>(
                 params_.routing_weights->gpu_data_ptr()),
             .placement = params_.placement,
+            .static_joint_membership = params_.static_joint_membership,
             .active_row_count_device = params_.active_row_count_device,
             .packet = payload.packet,
             .hidden_payload_layout = payload.selection.layout,
@@ -1060,6 +1001,7 @@ namespace llaminar2
             .physical_rows = params_.physical_rows,
             .stage_ordinal = params_.stage_ordinal,
             .model_layer_index = params_.model_layer_index,
+            .shared_row_writer = payload.requiresBulkPublication(),
         };
         const std::uint32_t bank =
             moeOverlayActivationBufferIndex(params_.stage_ordinal);
@@ -1095,20 +1037,7 @@ namespace llaminar2
         {
             return false;
         }
-        if (payload.requiresBulkPublication() &&
-            !exportTensorBulkPayload(
-                params_.lane,
-                params_.hidden,
-                0u,
-                payload.hidden_payload_offset,
-                payload_bytes,
-                stream,
-                "shared dispatch"))
-        {
-            return false;
-        }
-
-        /* Metadata, the compact row tables, and optional D2H payload DMA all
+        /* Metadata, compact row tables, and useful shared-row GPU stores all
          * precede this one release edge on the exact capture stream. */
         return publishMappedTimeline(
             params_.lane,
@@ -2111,6 +2040,15 @@ namespace llaminar2
             return false;
 
         const auto &lanes = transaction->lanes();
+        if (!params_.static_joint_memberships.empty() &&
+            params_.static_joint_memberships.size() != lanes.size())
+            return false;
+        for (std::size_t lane = 0u; lane < lanes.size(); ++lane)
+            if (!validJointDispatchMembership(
+                    jointMembershipForLane(params_.static_joint_memberships, lane),
+                    lanes[lane], params_.placement.expert_count,
+                    transaction->modelLayerIndex()))
+                return false;
         std::int32_t d_model = 0;
         std::int32_t top_k = 0;
         std::size_t hidden_elements = 0u;
@@ -2158,11 +2096,34 @@ namespace llaminar2
             return false;
         }
         if (params_.transaction->usesAsynchronousLanes())
-            return params_.transaction->persistentResourcesReady();
+            return params_.transaction->persistentResourcesReady() &&
+                   shared_row_groups_.size()==params_.transaction->lanes().size();
         return
                params_.routing_indices->gpu_data_ptr() &&
                params_.routing_weights->gpu_data_ptr() &&
                descriptor_storage_ && descriptor_storage_->deviceData();
+    }
+
+    bool MoEOverlayActivationDispatchPackBatchStage::prepareSharedRowGroups(void* stream)
+    {
+        if(!stream)return false;
+        const auto& lanes=params_.transaction->lanes();
+        if(!shared_row_groups_.empty())return shared_row_groups_.size()==lanes.size();
+        std::vector<MoEOverlaySharedJointRouteUnion> unions(lanes.size());
+        for(std::size_t writer=0;writer<lanes.size();++writer) {
+            if(!params_.transaction->lanePublishesSharedDispatchPayload(writer))continue;
+            std::vector<MoEOverlaySharedDispatchTarget> members;
+            for(std::size_t member=0;member<lanes.size();++member)
+                if(lanes[member].mapped_region.get()==lanes[writer].mapped_region.get() &&
+                   lanes[member].shared_dispatch_hidden_offset==lanes[writer].shared_dispatch_hidden_offset)
+                    members.push_back({lanes[member].target_participant_id,jointMembershipForLane(params_.static_joint_memberships,member)});
+            if(members.size()>std::numeric_limits<std::uint32_t>::max() ||
+               !lanes[writer].shared_dispatch_controls_device || members.size()!=lanes[writer].shared_dispatch_consumer_count ||
+               members.size()!=params_.transaction->sharedDispatchPayloadLaneCount(writer))return false;
+            unions[writer]=MoEOverlaySharedJointRouteUnion::fromOriginalGroup(params_.placement.expert_count,
+                params_.transaction->modelLayerIndex(),members);
+        }
+        shared_row_groups_=std::move(unions);return true;
     }
 
     bool MoEOverlayActivationDispatchPackBatchStage::prepareDescriptors(
@@ -2189,8 +2150,9 @@ namespace llaminar2
             moeOverlayActivationLeasedTimelineValue(
                 moeOverlayActivationBufferVisit(
                     params_.transaction->stageOrdinal()));
-        for (const auto &lane : lanes)
+        for (std::size_t lane_index = 0u; lane_index < lanes.size(); ++lane_index)
         {
+            const auto &lane = lanes[lane_index];
             const auto payload = lane.dispatchPayload(
                 /*physical_rows=*/1);
             if (!payload.valid() ||
@@ -2216,6 +2178,8 @@ namespace llaminar2
                 .route_weights = static_cast<const float *>(
                     params_.routing_weights->gpu_data_ptr()),
                 .placement = params_.placement,
+                .static_joint_membership = jointMembershipForLane(
+                    params_.static_joint_memberships, lane_index),
                 .active_row_count_device =
                     params_.active_row_count_device,
                 .packet = payload.packet,
@@ -2280,7 +2244,6 @@ namespace llaminar2
                         moeOverlayActivationBufferVisit(
                             transaction.stageOrdinal()));
                 std::size_t logical_lane_payload_bytes = 0u;
-                std::size_t physical_dispatch_payload_bytes = 0u;
                 std::size_t physical_return_payload_bytes = 0u;
                 for (std::size_t lane_index = 0u;
                      lane_index < lanes.size();
@@ -2315,6 +2278,9 @@ namespace llaminar2
                         transaction.physicalRows());
                     if (!payload.valid())
                         return false;
+                    if(!acquired_input.valid() || !acquired_input.includesSource(params_.hidden) ||
+                       acquired_input.device()!=params_.device_id || acquired_input.consumerStream()!=lane_stream)return false;
+                    const bool group=transaction.lanePublishesSharedDispatchPayload(lane_index);
                     const MoEOverlayActivationDispatchPackLaunch launch{
                         .hidden_rows_fp32 = static_cast<const float *>(
                             params_.hidden->gpu_data_ptr()),
@@ -2323,6 +2289,8 @@ namespace llaminar2
                         .route_weights = static_cast<const float *>(
                             params_.routing_weights->gpu_data_ptr()),
                         .placement = params_.placement,
+                        .static_joint_membership = jointMembershipForLane(
+                            params_.static_joint_memberships, lane_index),
                         .active_row_count_device =
                             params_.active_row_count_device,
                         .packet = payload.packet,
@@ -2336,6 +2304,10 @@ namespace llaminar2
                         .stage_ordinal = transaction.stageOrdinal(),
                         .model_layer_index =
                             transaction.modelLayerIndex(),
+                        .shared_row_controls = group ? lane.shared_dispatch_controls_device : nullptr,
+                        .shared_row_target_count = group ? static_cast<std::uint32_t>(transaction.sharedDispatchPayloadLaneCount(lane_index)) : 0u,
+                        .shared_joint_union = group ? shared_row_groups_[lane_index] : MoEOverlaySharedJointRouteUnion{},
+                        .shared_row_writer = group,
                     };
                     if (!moe_kernel_->packMoEOverlayActivationDispatch(
                             packetLaunchContext(lane_stream), launch) ||
@@ -2348,14 +2320,7 @@ namespace llaminar2
                         if (transaction.lanePublishesSharedDispatchPayload(
                                 lane_index))
                         {
-                            if (!exportBulkPayload(
-                                    lane,
-                                    acquired_input,
-                                    0u,
-                                    payload.hidden_payload_offset,
-                                    payload_bytes,
-                                    "shared dispatch lane batch") ||
-                                !gpu_ctx.recordEventChecked(
+                            if (!gpu_ctx.recordEventChecked(
                                     transaction.
                                         sharedDispatchPayloadReadyEvent(
                                             lane_index),
@@ -2364,7 +2329,7 @@ namespace llaminar2
                                 LOG_ERROR("[MoEOverlayActivationDispatchPackBatchStage] Failed to publish one shared physical activation payload");
                                 return false;
                             }
-                            physical_dispatch_payload_bytes += payload_bytes;
+                            // Useful union bytes are device-owned; never report captured capacity as actual traffic.
                             PerfStatsCollector::addCounter(
                                 "moe_overlay_activation_epoch",
                                 "shared_dispatch_payload_publications",
@@ -2422,10 +2387,9 @@ namespace llaminar2
                     {{"lanes", std::to_string(lanes.size())},
                      {"rows", std::to_string(
                           transaction.physicalRows())},
-                     {"logical_lane_bytes", std::to_string(
+                     {"captured_lane_capacity_bytes", std::to_string(
                           logical_lane_payload_bytes)},
-                     {"physical_dispatch_bytes", std::to_string(
-                          physical_dispatch_payload_bytes)},
+                     {"shared_dispatch_payloads_device_counted", "true"},
                      {"physical_return_bytes", std::to_string(
                           physical_return_payload_bytes)},
                      {"shared_dispatch_groups", std::to_string(
@@ -2550,7 +2514,7 @@ namespace llaminar2
         setGPUStream(stream);
         if (params_.transaction->usesAsynchronousLanes())
         {
-            if (!params_.transaction->materializePersistentResources())
+            if (!params_.transaction->materializePersistentResources() || !prepareSharedRowGroups(stream))
                 return false;
             grant_initialization_joined_ = true;
             if (params_.transaction->stageOrdinal() == 0u)

@@ -82,6 +82,7 @@ namespace llaminar2::test { struct RankRetainedStorageRetirementReplayAccess; }
 
 namespace llaminar2
 {
+    class IGlobalTPContext;
     class ResolvedImmutableRowTablePlacement;
     class ReusableExecutionWorkspaceRegistry;
     class MoEOverlayNodeLocalRouteExchange;
@@ -359,6 +360,8 @@ namespace llaminar2
             /** Process-local immutable prepared banks keyed by residency epoch. */
             std::shared_ptr<MoEOverlayParticipantResidencyRegistry>
                 moe_expert_overlay_participant_residency;
+        /** Original CPU expert-domain context; participant-local graph edges borrow, never recreate it. */
+        std::shared_ptr<IGlobalTPContext> moe_expert_overlay_cpu_joint_context;
 
             /// Lifetime owner for the authority's allocation-free route histogram.
             std::shared_ptr<DecodeExpertHistogram>

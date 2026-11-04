@@ -23,6 +23,7 @@
 
 namespace llaminar2
 {
+class MoEExpertProjectionOwnership;
 
 /**
  * @brief Immutable graph and device geometry used by workspace admission.
@@ -235,6 +236,15 @@ public:
     static size_t estimateRoutedExpertParticipant(
         const ModelMemoryProfile& profile,
         const WorkspaceMemoryGeometry& geometry);
+    /** @brief Price the same CPU invocation contract for one original source-native F fragment.
+     * @param profile Unmodified original model/source metadata, including complete expert E.
+     * @param geometry Existing exact CPU rows/worker policy.
+     * @param original_projection Checked original source N/K and exact member F interval.
+     * @return The same kernel-owned workspace union, using role-local N/K without a compact profile shadow.
+     * @throws std::invalid_argument For non-CPU, foreign source or non-fragment ownership.
+     */
+    static size_t estimateRoutedExpertParticipant(const ModelMemoryProfile& profile,
+        const WorkspaceMemoryGeometry& geometry,const MoEExpertProjectionOwnership& original_projection);
 };
 
 } // namespace llaminar2

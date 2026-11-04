@@ -99,14 +99,15 @@ namespace llaminar2
         /**
          * @brief Load one admitted native matrix through the retained production loader.
          * @param request Same selection used to build the sample BOM.
-         * @param memory Rank-bound authority admitting source and transient read bytes.
+         * @param memory Rank-bound authority admitting the final native source sample.
          * @param host_device Exact CPU allocator; GPU preparation is a separate operation.
          * @return A 2-D sample owner retaining source storage and its allocation lease.
          * @throws std::invalid_argument for absent authority, non-CPU placement or bad geometry.
-         * @throws std::runtime_error if the bounded source read or view construction fails.
+         * @throws std::runtime_error if the bounded original-source read fails.
          *
-         * Claims precede all payload allocation. The temporary reader claim retires
-         * on return; the source claim survives this object with the loaded sample.
+         * Claims precede all payload allocation. The common window reader writes
+         * directly into the final sample; no matrix-sized reader buffer exists.
+         * The source claim survives this object with the loaded sample.
          * No tensor/format conversion, hidden payload cache or full-model mapping occurs.
          */
         PlanningLoadedModelSample loadSample(const PlanningModelSampleRequest &request,

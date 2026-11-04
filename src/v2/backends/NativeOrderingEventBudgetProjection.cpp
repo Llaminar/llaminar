@@ -38,13 +38,19 @@ NativeAuxiliaryResourceSelection NativeOrderingEventBudgetProjection::select(Nat
         throw std::invalid_argument("Recorded ordering trace omits this exact device/program");}
     return NativeAuxiliaryResourceCatalog::require(device,NativeAuxiliaryResourceProgram::ordering(program));
 }
+NativeAuxiliaryResourceAllowance NativeOrderingEventBudgetProjection::bounds(NativeOrderingEventProgram program,DeviceId device)const{
+    if(!state_ || !device.is_gpu())throw std::invalid_argument("Ordering projection lacks original source/device");
+    if(!state_->recorded)return NativeAuxiliaryResourceCatalog::allowance(device.type,NativeAuxiliaryResourceProgram::ordering(program));
+    const auto row=select(program,device);
+    return {row.hostBytes,row.deviceBytes,row.evidence,row.lifetime,NativeAuxiliaryResourceProgram::ordering(program),row.remoteFamily};
+}
 namespace {
 void resources(PhysicalMemoryResource host,PhysicalMemoryResource gpu){if(!host.valid() || !gpu.valid() || host.device!=DeviceId::cpu() || !gpu.device.is_gpu() || host.world_rank!=gpu.world_rank)
     throw std::invalid_argument("Ordering group changed its original CPU/GPU observations");}
 PhysicalMemoryOwner owner(NativeOrderingEventProgram program){return program.kind()==NativeOrderingEventProgram::Kind::ReadAheadParentTerminal?PhysicalMemoryOwner::NativeReadAheadParentTerminal:PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent;}
 }
 PhysicalMemoryPlan NativeOrderingEventBudgetProjection::bom(NativeOrderingEventProgram program,PhysicalMemoryResource host,PhysicalMemoryResource gpu)const{
-    resources(host,gpu);const auto selected=select(program,gpu.device);if(!selected.hostBytes)throw std::logic_error("Installed ordering group lacks positive original host commitment");
+    resources(host,gpu);const auto selected=bounds(program,gpu.device);if(!selected.hostBytes)throw std::logic_error("Installed ordering group lacks positive original host commitment");
     PhysicalMemoryPlanBuilder result;result.add(host,owner(program),selected.hostBytes);result.add(gpu,owner(program),selected.deviceBytes);return result.build();
 }
 PhysicalMemoryPlan NativeOrderingEventBudgetProjection::remoteHostBOM(const PooledRemoteGraphProgram& program,PhysicalMemoryResource host,PhysicalMemoryResource gpu)const{
@@ -61,8 +67,13 @@ PhysicalMemoryPlan NativeOrderingEventBudgetProjection::remoteHostBOM(const Pool
 }
 PhysicalMemoryPlan NativeOrderingEventBudgetProjection::growthBOM(NativeOrderingEventProgram floor,NativeOrderingEventProgram actual,PhysicalMemoryResource host,PhysicalMemoryResource gpu)const{
     resources(host,gpu);if(floor.kind()!=actual.kind() || (floor.nonemptyRootMask()&actual.nonemptyRootMask())!=floor.nonemptyRootMask())throw std::invalid_argument("Ordering growth changed role or removed original roots");
-    const auto base=select(floor,gpu.device),full=floor==actual?base:select(actual,gpu.device);
-    if(base.sourceIdentity!=full.sourceIdentity || base.resourceSource!=full.resourceSource || base.contextGeneration!=full.contextGeneration || base.lifetime!=full.lifetime || full.hostBytes<base.hostBytes || full.deviceBytes<base.deviceBytes)throw std::logic_error("Reviewed ordering growth is incompatible or nonmonotone");
+    if(state_ && state_->recorded){
+        const auto base=select(floor,gpu.device),full=floor==actual?base:select(actual,gpu.device);
+        if(base.sourceIdentity!=full.sourceIdentity || base.resourceSource!=full.resourceSource || base.contextGeneration!=full.contextGeneration)
+            throw std::logic_error("Recorded ordering growth changed its original source");
+    }
+    const auto base=bounds(floor,gpu.device),full=floor==actual?base:bounds(actual,gpu.device);
+    if(base.lifetime!=full.lifetime || full.hostBytes<base.hostBytes || full.deviceBytes<base.deviceBytes)throw std::logic_error("Reviewed ordering growth is incompatible or nonmonotone");
     if(floor==actual)return PhysicalMemoryPlanBuilder().build();
     PhysicalMemoryPlanBuilder result;result.add(host,owner(actual),full.hostBytes-base.hostBytes);result.add(gpu,owner(actual),full.deviceBytes-base.deviceBytes);return result.build();
 }

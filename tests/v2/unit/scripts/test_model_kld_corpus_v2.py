@@ -55,6 +55,23 @@ def observation(m, *, replacements=None):
         proofs={key: True for key in corpus.PROOFS}, rows=rows)
 
 
+def write_rank_reports(root, m, document):
+    """Write explicit non-native fixture receipts for the actual passive consumer."""
+    topology=m['topologies'][0];world=topology['expected_config']['configuration']['mpi_procs']
+    document['native_identity']['actual_source_descriptor_sha256']='fixture-original-source'
+    document['distributed_observer']=dict(world_size=world,authority_rank=0,rank_reports=[f'rank-{rank}.json' for rank in range(world)])
+    for rank in range(world):
+        records=[dict(domain='forward_graph',name='fixture-only',count=1,value=1.)]
+        if rank >= 0:
+            records=[dict(domain='moe_canonical_publication',name='cpu_packed_route_gather_calls',
+                          phase=phase,tags=dict(expert_compute='tensor_sharded',participant=str(rank),degree=str(world),root='0'),count=1,value=1.) for phase in ('prefill','decode')]
+        report=dict(schema='llaminar.qfn-observer-rank.v1',rank=rank,world_size=world,authority_rank=0,
+                    role='authority' if rank==0 else 'follower',complete=True,native_retired=True,
+                    runtime_config_digest=topology['runtime_config_digest'],corpus_manifest_digest=metadata_digest(m),
+                    actual_owner=dict(original_pma_owner=True,source_file_set_identity='fixture-original-source'),path_records=records)
+        (root/f'rank-{rank}.json').write_text(json.dumps(report))
+
+
 def approval(m, baseline):
     """Pin fixture metadata explicitly; this is not a published model baseline."""
     return dict(schema='llaminar.model-kld-baseline-approval.v1',
@@ -220,6 +237,90 @@ class QFNAbsolutePilotTest(unittest.TestCase):
                 corpus.summarize(m,candidate,absolute_pilot=policy)
 
 
+class QFNBoundedRowOutlierTest(unittest.TestCase):
+    """Count-bounded row exceptions never remove observations from other gates."""
+    def fixture(self, count=1):
+        m=manifest()
+        replacements={f"b:decode:{i}":[2.5,5.,4.,3.,2.,1.] for i in range(count)}
+        candidate=observation(m,replacements=replacements)
+        policy=absolute_pilot(m)
+        group=next(g for g in policy['groups'] if g['phase']=='decode')
+        actual=full_vocabulary_metrics([6.,5.,4.,3.,2.,1.],[2.5,5.,4.,3.,2.,1.],vocabulary=6)['kl_nats']
+        self.assertGreater(actual,1.2);self.assertLess(actual,1.5)
+        group['maximum']['row_kl_nats']=1.2
+        group['bounded_row_outliers']=dict(maximum_rows=1,maximum_kl_nats=1.5)
+        return m,candidate,policy,group
+
+    def test_zero_one_two_and_upper_cap(self):
+        for count in (0,1,2):
+            m,c,p,g=self.fixture(count)
+            result=corpus.summarize(m,c,absolute_pilot=p)
+            group=next(x for x in result['groups'] if x['phase']=='decode')
+            self.assertEqual(group['passed'],count<=1)
+            self.assertEqual(group['bounded_row_outliers']['observed_count'],count)
+            self.assertEqual(group['bounded_row_outliers']['observed_rows'],[f'b:decode:{i}' for i in range(count)])
+            self.assertEqual(group['mean_kl_nats'],corpus._prompt_mean(
+                [r for r in c['rows'] if r['phase']=='decode'],lambda r:r['metrics']['kl_nats']))
+        m,c,p,g=self.fixture()
+        c=observation(m,replacements={'b:decode:0':[0.,5.,4.,3.,2.,1.]})
+        g['maximum']['row_kl_nats']=1.2;g['bounded_row_outliers']['maximum_kl_nats']=1.5
+        self.assertGreater(next(r for r in c['rows'] if r['row_id']=='b:decode:0')['metrics']['kl_nats'],1.5)
+        self.assertFalse(next(x for x in corpus.summarize(m,c,absolute_pilot=p)['groups'] if x['phase']=='decode')['passed'])
+
+    def test_other_gates_and_default_are_unchanged(self):
+        for section,name,bound in [('maximum','mean_kl_nats',0.),('maximum','step_mean_kl_nats',0.),
+                ('maximum','tail_fraction',0.),('maximum','mean_total_variation',0.),
+                ('minimum','top1_agreement',1.),('minimum','mean_top5_overlap',1.)]:
+            with self.subTest(name=name):
+                m,c,p,g=self.fixture();g[section][name]=bound
+                if name=='mean_top5_overlap':
+                    c=observation(m,replacements={'b:decode:0':[2.5,5.,4.,3.,2.,2.1]})
+                    row=next(r for r in c['rows'] if r['row_id']=='b:decode:0')['metrics']
+                    self.assertGreater(row['kl_nats'],1.2);self.assertLess(row['kl_nats'],1.5)
+                    self.assertLess(row['top5_overlap'],1.)
+                result=corpus.summarize(m,c,absolute_pilot=p)
+                self.assertFalse(next(x for x in result['groups'] if x['phase']=='decode')['passed'])
+                self.assertIn(name,[failure['criterion'] for failure in result['failures']])
+        m,c,p,g=self.fixture();del g['bounded_row_outliers']
+        group=next(x for x in corpus.summarize(m,c,absolute_pilot=p)['groups'] if x['phase']=='decode')
+        self.assertFalse(group['passed']);self.assertNotIn('bounded_row_outliers',group)
+
+    def test_paired_calibration_preserves_mean_and_delta_gates(self):
+        m,c,_,_=self.fixture()
+        baseline=observation(m);approved=approval(m,baseline)
+        policy=calibration(m,baseline,approved)
+        group=next(g for g in policy['groups'] if g['phase']=='decode')
+        group['maximum']['row_kl_nats']=1.2
+        group['bounded_row_outliers']=dict(maximum_rows=1,maximum_kl_nats=1.5)
+        result=corpus.summarize(m,c,baseline,approved,calibration=policy)
+        summary=next(g for g in result['groups'] if g['phase']=='decode')
+        self.assertTrue(summary['passed'])
+        self.assertEqual(summary['bounded_row_outliers']['observed_rows'],['b:decode:0'])
+        self.assertGreater(summary['mean_kl_nats'],0.)
+        self.assertEqual(summary['mean_kl_nats'],summary['paired_mean_kl_delta_nats'])
+        for criterion in ('mean_kl_nats','paired_mean_kl_delta_nats','row_kl_delta_nats'):
+            with self.subTest(criterion=criterion):
+                changed=copy.deepcopy(policy)
+                next(g for g in changed['groups'] if g['phase']=='decode')['maximum'][criterion]=0.
+                failed=corpus.summarize(m,c,baseline,approved,calibration=changed)
+                self.assertIn(criterion,[f['criterion'] for f in failed['failures']])
+                self.assertFalse(next(g for g in failed['groups'] if g['phase']=='decode')['passed'])
+
+    def test_invalid_policy_and_nonfinite_rows_reject(self):
+        invalid=[None,{},dict(maximum_rows=1),dict(maximum_kl_nats=1.5),
+            dict(maximum_rows=True,maximum_kl_nats=10.),dict(maximum_rows=1.5,maximum_kl_nats=10.),
+            dict(maximum_rows=0,maximum_kl_nats=10.),dict(maximum_rows=-1,maximum_kl_nats=10.),
+            dict(maximum_rows=99,maximum_kl_nats=10.),dict(maximum_rows=1,maximum_kl_nats=float('inf')),
+            dict(maximum_rows=1,maximum_kl_nats=float('nan')),dict(maximum_rows=1,maximum_kl_nats=-1.),
+            dict(maximum_rows=1,maximum_kl_nats=0.),dict(maximum_rows=1,maximum_kl_nats=10.,extra=1)]
+        for value in invalid:
+            with self.subTest(value=value):
+                m,c,p,g=self.fixture();g['bounded_row_outliers']=value
+                with self.assertRaises(ValueError):corpus.summarize(m,c,absolute_pilot=p)
+        m,c,p,g=self.fixture();c['rows'][-1]['metrics']['kl_nats']=float('nan')
+        with self.assertRaises(ValueError):corpus.summarize(m,c,absolute_pilot=p)
+
+
 class QFNCorpusV2Test(unittest.TestCase):
     """Actual pure source/schema/aggregation and payload-consumer regressions."""
 
@@ -344,10 +445,15 @@ class QFNCorpusV2Test(unittest.TestCase):
         m['source']['shared_predictor']['path']='/fixture/foreign.gguf'
         with self.assertRaises(ValueError): corpus.validate_manifest(m)
 
-    def test_real_tiny_files_full_extent_reset_and_nonfinite_boundaries(self):
+    def _replay_real_tiny_files_full_extent_reset_and_nonfinite_boundaries(self, distributed=False, external_manifest=False):
         import numpy as np
         with tempfile.TemporaryDirectory() as tmp:
-            root=Path(tmp); m=manifest(); refs=[]; native=[]
+            root=Path(tmp)/'reference';root.mkdir(); m=manifest(); refs=[]; native=[]
+            if distributed:
+                m['topologies'][0]['expected_config']['configuration']={'mpi_procs':2,
+                    'moe_routed_expert_plan':{'domains':[{'routed_compute_policy':'TensorSharded',
+                        'participants':[{'device_type':'CPU'},{'device_type':'CPU'}],'world_ranks':[0,1]}]}}
+                m['topologies'][0]['runtime_config_digest']=metadata_digest(m['topologies'][0]['expected_config'])
             for h in m['histories']:
                 rows=[dict(r,vocabulary=6) for r in corpus.expected_rows(m) if r['history_id']==h['id']]
                 values=np.tile(np.array([6,5,4,3,2,1],dtype='<f4'),(len(rows),1))
@@ -359,12 +465,34 @@ class QFNCorpusV2Test(unittest.TestCase):
             m['reference']['report_digest']=metadata_digest(reference)
             (root/'reference.json').write_text(json.dumps(reference)); (root/'manifest.json').write_text(json.dumps(m))
             catalog=root/'approval.json'; catalog.write_text(json.dumps(dict(schema=2,manifest_digest=metadata_digest(m))))
-            loaded=corpus.load_corpus(root,catalog=catalog)
+            explicit=None
+            if external_manifest:
+                explicit=Path(tmp)/'selected-manifest.json';explicit.write_text(json.dumps(m))
+                baseline=corpus.load_corpus(root,catalog=catalog)
+                with self.assertRaises(OSError):corpus.load_corpus(root,catalog=catalog,manifest_path=Path(tmp)/'absent.json')
+                wrong=Path(tmp)/'wrong-catalog.json';wrong.write_text(json.dumps(dict(schema=2,manifest_digest='0'*64)))
+                with self.assertRaisesRegex(ValueError,'Unapproved'):corpus.load_corpus(root,catalog=wrong,manifest_path=explicit)
+                changed=copy.deepcopy(m);changed['histories'][0]['prompt_ids']=[2,1]
+                explicit.write_text(json.dumps(changed));wrong.write_text(json.dumps(dict(schema=2,manifest_digest=metadata_digest(changed))))
+                with self.assertRaisesRegex(ValueError,'reference'):corpus.load_corpus(root,catalog=wrong,manifest_path=explicit)
+                changed=copy.deepcopy(m);changed['source']['tokenizer_revision']='foreign-reference'
+                explicit.write_text(json.dumps(changed));wrong.write_text(json.dumps(dict(schema=2,manifest_digest=metadata_digest(changed))))
+                with self.assertRaisesRegex(ValueError,'reference'):corpus.load_corpus(root,catalog=wrong,manifest_path=explicit)
+                for escape in ('../reference.json',str(root/'reference.json')):
+                    changed=copy.deepcopy(m);changed['reference']['report']=escape
+                    explicit.write_text(json.dumps(changed));wrong.write_text(json.dumps(dict(schema=2,manifest_digest=metadata_digest(changed))))
+                    with self.assertRaises(ValueError):corpus.load_corpus(root,catalog=wrong,manifest_path=explicit)
+                explicit.write_text(json.dumps(m))
+            loaded=corpus.load_corpus(root,catalog=catalog,manifest_path=explicit)
+            if external_manifest:
+                self.assertEqual(loaded['reference_payloads'],baseline['reference_payloads'])
+                self.assertIn(str(explicit),loaded['inputs'])
             report=observation(m); report.pop('rows'); report.pop('metric'); report['schema']='llaminar.model-kld-observation.v2'
             reset_history=dict(m['histories'][0],id='reset')
             reset_rows=[dict(r,vocabulary=6) for r in corpus.expected_rows(dict(m,histories=[reset_history]))]
             (root/'reset.f32').write_bytes((root/'a-native.f32').read_bytes())
             report.update(cases=native,reset_case=dict(history_id='reset',rows=reset_rows,logits_file=str(root/'reset.f32')))
+            if distributed: write_rank_reports(root,m,report)
             path=root/'native.json'; path.write_text(json.dumps(report))
             bad=copy.deepcopy(report); bad['source_digest']='foreign'; path.write_text(json.dumps(bad))
             with patch.object(corpus,'full_vocabulary_metrics',side_effect=AssertionError('invalid header reached payload math')):
@@ -372,6 +500,34 @@ class QFNCorpusV2Test(unittest.TestCase):
             path.write_text(json.dumps(report))
             scored=corpus.score_observation(loaded,path)
             self.assertEqual(len(scored['rows']),7); self.assertNotIn('passed',scored)
+            if external_manifest:
+                explicit.write_text(json.dumps(m,indent=2)) # Even equivalent metadata must keep its current-run file identity.
+                with self.assertRaises(ValueError):corpus.score_observation(loaded,path)
+                loaded=corpus.load_corpus(root,catalog=catalog,manifest_path=explicit)
+                self.assertEqual(len(corpus.score_observation(loaded,path)['rows']),7)
+            if distributed:
+                authority=root/'rank-0.json';authority_original=authority.read_text()
+                incomplete=json.loads(authority_original);incomplete['path_records'].pop()
+                authority.write_text(json.dumps(incomplete))
+                with self.assertRaisesRegex(ValueError,'gather phase'):corpus.score_observation(loaded,path)
+                authority.write_text(authority_original)
+                receipt=root/'rank-1.json';original_receipt=receipt.read_text();receipt.unlink()
+                with self.assertRaises((ValueError,OSError)):corpus.score_observation(loaded,path)
+                receipt.write_text(original_receipt)
+                for mutation in ('retired','source','phase','rank','config','role','participant','degree'):
+                    bad=json.loads(original_receipt)
+                    if mutation=='retired':bad['native_retired']=False
+                    elif mutation=='source':bad['actual_owner']['source_file_set_identity']='foreign'
+                    elif mutation=='phase':bad['path_records'].pop()
+                    elif mutation=='rank':bad['rank']=0
+                    elif mutation=='config':bad['runtime_config_digest']='foreign'
+                    elif mutation=='role':bad['role']='authority'
+                    elif mutation=='participant':bad['path_records'][0]['tags']['participant']='0'
+                    elif mutation=='degree':bad['path_records'][0]['tags']['degree']='3'
+                    receipt.write_text(json.dumps(bad))
+                    with self.assertRaises(ValueError):corpus.score_observation(loaded,path)
+                receipt.write_text(original_receipt)
+
             original=(root/'b-native.f32').read_bytes()
             (root/'b-native.f32').write_bytes(original[:-4])
             with self.assertRaisesRegex(ValueError,'Truncated'): corpus.score_observation(loaded,path)
@@ -383,8 +539,17 @@ class QFNCorpusV2Test(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'reset'): corpus.score_observation(loaded,path)
             (root/'reset.f32').write_bytes((root/'a-native.f32').read_bytes())
             ref=np.fromfile(root/'b-ref.f32',dtype='<f4'); ref[-1]=np.inf; ref.tofile(root/'b-ref.f32')
-            refreshed=corpus.load_corpus(root,catalog=catalog)
+            refreshed=corpus.load_corpus(root,catalog=catalog,manifest_path=explicit)
             with self.assertRaises(ValueError): corpus.score_observation(refreshed,path)
+
+    def test_real_tiny_files_full_extent_reset_and_nonfinite_boundaries(self):
+        self._replay_real_tiny_files_full_extent_reset_and_nonfinite_boundaries()
+
+    def test_distributed_rank_source_path_and_retirement_reports(self):
+        self._replay_real_tiny_files_full_extent_reset_and_nonfinite_boundaries(distributed=True)
+
+    def test_explicit_metadata_manifest_preserves_original_reference_root(self):
+        self._replay_real_tiny_files_full_extent_reset_and_nonfinite_boundaries(distributed=True,external_manifest=True)
 
     def test_legacy_v1_policy_still_owns_its_original_inventory(self):
         from model_kld_canary import CANARIES,definition,evaluate_rows

@@ -1,60 +1,21 @@
 /**
  * @file Test__LayerWeightStreamer.cpp
- * @brief Unit tests for LayerWeightStreamer (Option B - STREAMING mode)
+ * @brief Device-free construction, CPU no-transfer and statistics contracts.
  *
- * Tests the weight streaming implementation that transfers layer weights
- * from CPU to GPU on demand with LRU caching.
- *
- * These tests use a mock WeightManager approach to avoid requiring actual
- * model files while testing the streaming logic.
+ * A real WeightManager borrows the shared in-memory loader fixture. These
+ * checks need neither model files nor native devices: construction validates
+ * layer geometry and CPU requests exercise the no-transfer lifecycle. GPU
+ * transfer, eviction and asynchronous behavior require native integration tests.
  */
 
 #include "loaders/LayerWeightStreamer.h"
 #include "loaders/WeightManager.h"
-#include "loaders/ModelLoader.h"
+#include "../../mocks/MockModelLoader.h"
 #include "backends/DeviceId.h"
 #include <gtest/gtest.h>
 #include <memory>
 
 using namespace llaminar2;
-
-// =============================================================================
-// Mock WeightManager for Testing
-// =============================================================================
-
-/**
- * @brief Mock weight manager that returns predictable test tensors
- *
- * This mock doesn't require actual model files. It generates small FP32
- * tensors on demand with predictable sizes for testing the streaming logic.
- */
-class MockWeightManager
-{
-public:
-    /// Simulated weight size per tensor (1KB for fast tests)
-    static constexpr size_t WEIGHT_SIZE_BYTES = 1024;
-
-    /// Number of weights per layer (matching Qwen2 structure)
-    static constexpr size_t WEIGHTS_PER_LAYER = 9;
-
-    /// Total memory per layer
-    static constexpr size_t LAYER_MEMORY_BYTES = WEIGHT_SIZE_BYTES * WEIGHTS_PER_LAYER;
-
-    /**
-     * @brief Create a mock weight tensor
-     *
-     * Returns a small FP32 tensor regardless of the actual weight name.
-     * Size is WEIGHT_SIZE_BYTES (1KB = 256 floats).
-     */
-    static std::shared_ptr<TensorBase> createMockWeight(const std::string & /*name*/)
-    {
-        // 256 floats = 1024 bytes
-        auto tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{256});
-        // Initialize with zeros (simulating actual weight data)
-        std::fill(tensor->mutable_data(), tensor->mutable_data() + 256, 0.0f);
-        return tensor;
-    }
-};
 
 // =============================================================================
 // Test Fixture
@@ -63,26 +24,27 @@ public:
 /**
  * @brief Test fixture for LayerWeightStreamer
  *
- * Note: Full tests require integration with real WeightManager and ModelLoader.
- * These unit tests focus on the streaming logic with minimal dependencies.
+ * The loader outlives its borrowing manager. No tensors are required for
+ * constructor checks or CPU no-transfer requests, and no device is initialized.
  */
 class LayerWeightStreamerTest : public ::testing::Test
 {
 protected:
+    /** @brief Construct the real manager with a model-free source and a small declared budget. */
     void SetUp() override
     {
         // Test configuration with small budget for testing eviction
-        config_.gpu_memory_budget = 3 * MockWeightManager::LAYER_MEMORY_BYTES; // Room for 3 layers
+        config_.gpu_memory_budget = 3 * 9 * 1024; // A small explicit test budget; no allocation occurs.
         config_.cache_layer_count = 2;
         config_.eviction_policy = StreamingEvictionPolicy::LRU;
         config_.enable_prefetch = true;
         config_.log_transfer_stats = false;
 
-        // Note: We can't easily construct a real WeightManager without a ModelLoader
-        // and model file. For now, we test the interface behavior that doesn't
-        // require actual weight loading (like CPU device handling).
+        weight_manager_ = std::make_shared<WeightManager>(loader_);
     }
 
+    test::MockModelLoader loader_; ///< Shared source fixture, retained past manager destruction.
+    std::shared_ptr<WeightManager> weight_manager_; ///< Actual production manager, with no native/model resources.
     StreamingConfig config_;
     static constexpr int NUM_LAYERS = 24;
 };
@@ -100,15 +62,12 @@ TEST_F(LayerWeightStreamerTest, ConstructionWithNullWeightManagerThrows)
 
 TEST_F(LayerWeightStreamerTest, ConstructionWithZeroLayersThrows)
 {
-    // We need a valid WeightManager for this test
-    // Skip if we can't create one easily
-    GTEST_SKIP() << "Requires valid WeightManager";
+    EXPECT_THROW(LayerWeightStreamer(weight_manager_, 0, config_), std::invalid_argument);
 }
 
 TEST_F(LayerWeightStreamerTest, ConstructionWithNegativeLayersThrows)
 {
-    // We need a valid WeightManager for this test
-    GTEST_SKIP() << "Requires valid WeightManager";
+    EXPECT_THROW(LayerWeightStreamer(weight_manager_, -1, config_), std::invalid_argument);
 }
 
 // =============================================================================
@@ -117,14 +76,40 @@ TEST_F(LayerWeightStreamerTest, ConstructionWithNegativeLayersThrows)
 
 TEST_F(LayerWeightStreamerTest, MemoryBudgetReturnsConfiguredValue)
 {
-    // We need a valid WeightManager for this test
-    GTEST_SKIP() << "Requires valid WeightManager";
+    LayerWeightStreamer streamer(weight_manager_, NUM_LAYERS, config_);
+    EXPECT_EQ(streamer.memoryBudget(), config_.gpu_memory_budget);
+    EXPECT_EQ(streamer.currentDeviceMemoryUsage(), 0u);
 }
 
 TEST_F(LayerWeightStreamerTest, InitialCacheIsEmpty)
 {
-    // We need a valid WeightManager for this test
-    GTEST_SKIP() << "Requires valid WeightManager";
+    LayerWeightStreamer streamer(weight_manager_, NUM_LAYERS, config_);
+    EXPECT_EQ(streamer.currentDeviceMemoryUsage(), 0u);
+    for (int layer = 0; layer < NUM_LAYERS; ++layer)
+    {
+        EXPECT_FALSE(streamer.isLayerCached(layer, DeviceId::cpu()));
+        EXPECT_FALSE(streamer.isPrefetchInProgress(layer));
+        EXPECT_FALSE(streamer.evictLayer(layer));
+    }
+}
+
+/** @test A rejected streaming request inspects source metadata without loading CPU weights or touching a GPU. */
+TEST_F(LayerWeightStreamerTest, SourceSizeProbeDoesNotMaterializeCPUWeights)
+{
+    loader_.addFP32OnesTensor("blk.0.attn_q.weight", {32, 64});
+    config_.gpu_memory_budget = 1;
+    config_.eviction_policy = StreamingEvictionPolicy::NONE;
+    config_.enable_prefetch = false;
+    LayerWeightStreamer streamer(weight_manager_, NUM_LAYERS, config_);
+    EXPECT_EQ(weight_manager_->originalWeightSourceBytes("blk.0.attn_q.weight"), 32u * 64u * sizeof(float));
+    EXPECT_EQ(weight_manager_->originalWeightSourceBytes("absent.weight"), 0u);
+    // Nonexistent ordinals prove the capacity refusal precedes native work.
+    for (const auto device : {DeviceId::cuda(71), DeviceId::rocm(93)})
+        EXPECT_FALSE(streamer.ensureLayerOnDevice(0, device));
+    EXPECT_EQ(loader_.loadTensorCallCount(), 0u);
+    EXPECT_EQ(loader_.nativeSourceReadCallCount(), 0u);
+    EXPECT_EQ(weight_manager_->cacheSize(), 0u);
+    EXPECT_EQ(streamer.currentDeviceMemoryUsage(), 0u);
 }
 
 // =============================================================================
@@ -132,16 +117,32 @@ TEST_F(LayerWeightStreamerTest, InitialCacheIsEmpty)
 // =============================================================================
 
 /**
- * @test CPU device requests always succeed without caching
+ * @test Valid CPU layer requests perform no transfer or cache mutation.
  *
- * When the target device is CPU, weights are already in host memory,
- * so ensureLayerOnDevice should always return true without any
- * cache operations.
+ * The streamer does not certify loaded model weights. Its CPU branch only
+ * validates the layer index and leaves transfer ownership with the caller.
  */
 TEST_F(LayerWeightStreamerTest, CPUDeviceAlwaysSucceeds)
 {
-    // We need a valid WeightManager for this test
-    GTEST_SKIP() << "Requires valid WeightManager - see integration tests";
+    LayerWeightStreamer streamer(weight_manager_, NUM_LAYERS, config_);
+    for (int layer : {0, NUM_LAYERS - 1})
+    {
+        EXPECT_TRUE(streamer.ensureLayerOnDevice(layer, DeviceId::cpu()));
+        streamer.prefetchLayer(layer, DeviceId::cpu());
+        streamer.releaseLayer(layer);
+        EXPECT_FALSE(streamer.isLayerCached(layer, DeviceId::cpu()));
+        EXPECT_FALSE(streamer.isPrefetchInProgress(layer));
+    }
+    EXPECT_FALSE(streamer.ensureLayerOnDevice(-1, DeviceId::cpu()));
+    EXPECT_FALSE(streamer.ensureLayerOnDevice(NUM_LAYERS, DeviceId::cpu()));
+    streamer.synchronize();
+    streamer.clearCache();
+    EXPECT_EQ(streamer.currentDeviceMemoryUsage(), 0u);
+    const auto observed = streamer.stats();
+    EXPECT_EQ(observed.layers_transferred, 0u);
+    EXPECT_EQ(observed.cache_hits, 0u);
+    EXPECT_EQ(observed.cache_misses, 0u);
+    EXPECT_EQ(observed.bytes_transferred, 0u);
 }
 
 // =============================================================================
@@ -323,125 +324,4 @@ TEST_F(LayerWeightStreamerTest, QwenStyleWeightNaming)
         "ffn_norm.weight"};
 
     EXPECT_EQ(weight_suffixes.size(), 9); // 9 weights per layer
-}
-
-// =============================================================================
-// Integration-Like Tests (require actual WeightManager)
-// =============================================================================
-
-/**
- * These tests are marked DISABLED because they require:
- * 1. A valid ModelLoader with a real model file
- * 2. WeightManager initialization
- * 3. Potentially GPU access
- *
- * They serve as documentation for expected behavior and can be
- * enabled in integration test builds.
- */
-
-TEST_F(LayerWeightStreamerTest, DISABLED_CacheHitBehavior)
-{
-    // Test scenario:
-    // 1. ensureLayerOnDevice(0, cuda:0) -> cache miss, load
-    // 2. ensureLayerOnDevice(0, cuda:0) -> cache hit
-    // 3. Verify stats: 1 miss, 1 hit, 1 transfer
-}
-
-TEST_F(LayerWeightStreamerTest, DISABLED_LRUEvictionOrder)
-{
-    // Test scenario with 3-layer budget:
-    // 1. Load layers 0, 1, 2 (fills cache)
-    // 2. Load layer 3 -> evicts layer 0 (LRU)
-    // 3. Load layer 4 -> evicts layer 1 (LRU)
-    // 4. Access layer 2 -> cache hit, becomes MRU
-    // 5. Load layer 5 -> evicts layer 3 (not 2)
-}
-
-TEST_F(LayerWeightStreamerTest, DISABLED_ReleaseMovesToBackOfLRU)
-{
-    // Test scenario:
-    // 1. Load layers 0, 1, 2
-    // 2. releaseLayer(2) -> moves to back of LRU
-    // 3. Load layer 3 -> should evict layer 2 (not 0)
-}
-
-TEST_F(LayerWeightStreamerTest, DISABLED_PrefetchBehavior)
-{
-    // Test scenario:
-    // 1. prefetchLayer(0, cuda:0) -> starts load
-    // 2. ensureLayerOnDevice(0, cuda:0) -> cache hit from prefetch
-    // 3. Verify stats: prefetch_hits = 1
-}
-
-TEST_F(LayerWeightStreamerTest, DISABLED_PrefetchWasted)
-{
-    // Test scenario (3-layer budget):
-    // 1. Load layers 0, 1, 2
-    // 2. prefetchLayer(3) -> evicts layer 0, loads layer 3
-    // 3. Load layers 0, 1, 2 -> evicts layer 3 before used
-    // 4. Verify stats: prefetch_wasted = 1
-}
-
-TEST_F(LayerWeightStreamerTest, DISABLED_MemoryBudgetEnforcement)
-{
-    // Test scenario:
-    // 1. Set budget to exactly 2 layers
-    // 2. Load layer 0 -> success
-    // 3. Load layer 1 -> success
-    // 4. Load layer 2 -> evicts layer 0, success
-    // 5. Verify currentDeviceMemoryUsage() <= budget
-}
-
-TEST_F(LayerWeightStreamerTest, DISABLED_EvictionPolicyNoneFails)
-{
-    // Test scenario:
-    // 1. Set eviction_policy = NONE, budget = 2 layers
-    // 2. Load layer 0, 1 -> success
-    // 3. Load layer 2 -> should fail (NONE = no eviction)
-}
-
-TEST_F(LayerWeightStreamerTest, DISABLED_PhaseTransitionBehavior)
-{
-    // Test scenario:
-    // 1. onPhaseTransition(PREFILL, DECODE)
-    // 2. Verify any preloading behavior
-    // 3. onPhaseTransition(DECODE, PREFILL)
-    // 4. Verify cache handling
-}
-
-TEST_F(LayerWeightStreamerTest, DISABLED_ClearCacheFreesMemory)
-{
-    // Test scenario:
-    // 1. Load several layers
-    // 2. Verify currentDeviceMemoryUsage() > 0
-    // 3. clearCache()
-    // 4. Verify currentDeviceMemoryUsage() == 0
-}
-
-TEST_F(LayerWeightStreamerTest, DISABLED_InvalidLayerIndexHandling)
-{
-    // Test scenario:
-    // 1. ensureLayerOnDevice(-1, cuda:0) -> returns false
-    // 2. ensureLayerOnDevice(999, cuda:0) -> returns false
-    // 3. No crash or exception
-}
-
-// =============================================================================
-// Thread Safety Tests (require multi-threaded access)
-// =============================================================================
-
-TEST_F(LayerWeightStreamerTest, DISABLED_ConcurrentAccessSafety)
-{
-    // Test scenario:
-    // 1. Launch multiple threads calling ensureLayerOnDevice
-    // 2. Verify no crashes, no data races
-    // 3. Stats are consistent
-}
-
-TEST_F(LayerWeightStreamerTest, DISABLED_StatsThreadSafety)
-{
-    // Test scenario:
-    // 1. Multiple threads calling stats()
-    // 2. One thread calling resetStats()
-    // 3. Verify no crashes
 }

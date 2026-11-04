@@ -73,12 +73,12 @@ class HistoryReplaySelection:
     original_bytes: bytes
 
     def launch(self, command, environment):
-        """Project only an explicit replay's single-rank CPU execution resources.
+        """Project explicit workers without changing the original process population.
 
-        The original context owns the requested worker count. The existing MPI
-        process/participant declaration is retained; socket binding would hide
-        half of this observer's admitted physical worker budget. No command is
-        executed here, and ordinary campaigns never call this projection.
+        Single-rank histories retain their existing whole-affinity projection.
+        Distributed histories retain original socket binding and per-rank workers;
+        the typed native fixture authenticates the original cohort and inventory.
+        No command is executed here, and ordinary campaigns never call this.
         """
         from model_kld_corpus import physical_workers
         for key in ('GOMP_CPU_AFFINITY', 'KMP_HW_SUBSET', 'KMP_PLACE_THREADS', 'OMP_THREAD_LIMIT'):
@@ -86,14 +86,26 @@ class HistoryReplaySelection:
                      'Frozen replay cannot inherit additional CPU resource control: ' + key)
         configuration = self.descriptor['expected_config'].get('configuration', {})
         workers = configuration.get('n_threads')
+        participants = configuration.get('mpi_procs')
         _require(type(workers) is int and workers > 0 and
-                 type(configuration.get('mpi_procs')) is int and
-                 configuration['mpi_procs'] == 1 and workers <= physical_workers(),
-                 'Frozen replay worker request exceeds the original single-rank physical CPU resources')
+                 type(participants) is int and 1 <= participants <= 8 and
+                 workers * participants <= physical_workers(),
+                 'Frozen replay worker request exceeds original rank-population physical CPU resources')
         command = list(command)
+        # CTest's original guardian remains the process/cleanup authority. Split
+        # only its closed public envelope, project the existing MPI body, then
+        # reattach the identical prefix; never execute or resolve another owner.
+        guardian = []
+        if command and Path(command[0]).name == 'llaminar_mpi_session':
+            _require(len(command) >= 5 and Path(command[0]).is_absolute() and
+                     Path(command[0]).is_file() and command[1] == '--session-base' and
+                     Path(command[2]).is_absolute() and Path(command[2]).is_dir() and
+                     command[3] == '--',
+                     'Frozen replay has an incomplete original process-owner envelope')
+            guardian, command = command[:4], command[4:]
         _require(len(command) >= 7 and Path(command[0]).name == 'mpirun' and
-                 command[1:7] == ['-np', '1', '--bind-to', 'socket', '--map-by', 'socket'],
-                 'Frozen replay needs the original canonical single-rank socket launch')
+                 command[1:7] == ['-np', str(participants), '--bind-to', 'socket', '--map-by', 'socket'],
+                 'Frozen replay needs the original canonical rank-population socket launch')
         # Preserve the registered transport MCA options; reject other resource
         # directives rather than accidentally retaining a second affinity owner.
         cursor = 7
@@ -116,10 +128,19 @@ class HistoryReplaySelection:
                          'Frozen replay MPI export differs from the original registered environment')
                 exports[key] = cursor + 1
                 cursor += 2
-        _require(seen == set(expected_mca) and len(command[cursor:]) == 2 and
-                 Path(command[cursor]).is_absolute() and command[cursor + 1].startswith('--gtest_filter='),
+        # The owned canonical launcher publishes an explicit application
+        # boundary. Legacy direct MPI declarations omit it; preserve either
+        # original form and keep resource exports before that boundary.
+        application = cursor + int(cursor < len(command) and command[cursor] == '--')
+        _require(seen == set(expected_mca) and len(command[application:]) == 2 and
+                 Path(command[application]).is_absolute() and
+                 command[application + 1] == '--gtest_filter=' + self.descriptor['canonical_cell'],
                  'Frozen replay cannot represent additional MPI or native launch controls')
-        command[4], command[6] = 'none', 'slot'
+        if participants == 1:
+            command[4], command[6] = 'none', 'slot'
+        # Multi-rank histories retain the original one-rank-per-socket binding.
+        # Actual typed fixture/inventory validates CPU cohort and bound NUMA;
+        # this projection neither creates a topology nor substitutes affinity.
         values = dict(environment)
         filters = values.get('LLAMINAR_PERF_STATS_FILTER', '').split(',')
         _require('forward_graph' in filters, 'Frozen replay lost its canonical runtime evidence filter')
@@ -141,7 +162,7 @@ class HistoryReplaySelection:
         additions = [item for key in resource_keys if key not in exports
                      for item in ('-x', key + '=' + values[key])]
         command[cursor:cursor] = additions
-        return tuple(command), values
+        return tuple(guardian + command), values
 
     def verify_unchanged(self):
         """Recheck metadata/source owners around the existing canonical execution."""
@@ -195,15 +216,51 @@ class HistoryReplaySelection:
         from model_kld_corpus import physical_workers
         cpu = geometry.get('cpu_execution')
         workers = self.descriptor['expected_config'].get('configuration', {}).get('n_threads')
+        participants = self.descriptor['expected_config']['configuration']['mpi_procs']
         _require(type(cpu) is dict and type(workers) is int and workers > 0 and
                  cpu.get('requested_workers') == workers and cpu.get('max_workers') == workers and
                  cpu.get('dynamic') is False and cpu.get('unbound') is True and cpu.get('places') == 'cores' and
-                 cpu.get('allowed_cpus') == sorted(os.sched_getaffinity(0)) and
-                 type(cpu.get('physical_cores')) is int and cpu['physical_cores'] == physical_workers() and cpu['physical_cores'] >= workers and
+                 (cpu.get('allowed_cpus') == sorted(os.sched_getaffinity(0)) if participants == 1 else
+                  type(cpu.get('allowed_cpus')) is list and bool(cpu['allowed_cpus']) and
+                  cpu['allowed_cpus'] == sorted(set(cpu['allowed_cpus'])) and
+                  set(cpu['allowed_cpus']).issubset(os.sched_getaffinity(0))) and
+                 type(cpu.get('physical_cores')) is int and (cpu['physical_cores'] == physical_workers() if participants == 1 else cpu['physical_cores'] <= physical_workers()) and cpu['physical_cores'] >= workers and
                  type(cpu.get('cpu_compute_required')) is bool and
                  type(cpu.get('parallel_work_observed')) is bool and
                  (not cpu['cpu_compute_required'] or cpu['parallel_work_observed']),
                  'Frozen replay did not prove the declared workers and original unbound CPU resources')
+
+        if participants > 1:
+            masks = []; sockets = set(); nodes = set()
+            for rank in range(participants):
+                _, raw = _sha(Path(artifact_directories[0]) / f'history_replay_cpu_rank_{rank}.json', MAXIMUM_DESCRIPTOR_BYTES)
+                record = json.loads(raw)
+                _require(type(record) is dict and record.get('schema') == 'llaminar.model-kld-history-cpu-rank.v1' and
+                         record.get('descriptor_sha256') == self.sha256 and
+                         type(record.get('world_rank')) is int and record['world_rank'] == rank and
+                         type(record.get('world_size')) is int and record['world_size'] == participants and
+                         record.get('runner_retired') is True,
+                         'Frozen history lacks complete original rank retirement/resources')
+                node = record.get('original_node_id'); socket = record.get('socket_id'); numa = record.get('numa_node')
+                _require(all(type(value) is int and value >= 0 for value in (node, socket, numa)) and
+                         (node, socket) not in sockets and (node, numa) not in nodes,
+                         'Frozen history has aliased original physical socket/NUMA resources')
+                sockets.add((node, socket)); nodes.add((node, numa))
+                observed_cpu = record.get('cpu_execution')
+                _require(type(observed_cpu) is dict and observed_cpu.get('requested_workers') == workers and
+                         observed_cpu.get('max_workers') == workers and observed_cpu.get('dynamic') is False and
+                         observed_cpu.get('unbound') is True and observed_cpu.get('places') == 'cores' and
+                         type(observed_cpu.get('physical_cores')) is int and observed_cpu['physical_cores'] >= workers and
+                         observed_cpu.get('cpu_compute_required') is True and observed_cpu.get('parallel_work_observed') is True,
+                         'Frozen history rank lacks actual requested CPU compute workers')
+                mask = observed_cpu.get('allowed_cpus')
+                _require(type(mask) is list and mask and all(type(value) is int and value >= 0 for value in mask) and
+                         mask == sorted(set(mask)) and set(mask).issubset(os.sched_getaffinity(0)) and
+                         all(not set(mask).intersection(previous) for previous in masks),
+                         'Frozen history rank CPU affinities overlap or differ from original available resources')
+                masks.append(set(mask))
+                if rank == 0:
+                    _require(observed_cpu == cpu, 'Frozen history root resource record differs from measured prefill')
 
     def bind(self, artifact_root):
         """Publish an exact immutable handoff beside the original campaign artifacts."""

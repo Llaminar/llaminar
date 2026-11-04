@@ -12,10 +12,12 @@
 #include "integration/parity/ParityTestBase.h"
 #include "integration/parity/ParityArtifactDirectory.h"
 #include "integration/parity/qwen4exp/Qwen4ExpProductionParityCases.h"
+#include "integration/parity/qwen4exp/Qwen4ExpCPUJointParityCases.h"
 #include "integration/parity/qwen4exp/Qwen4ExpGPUAdaptiveParityCases.h"
 #include "integration/parity/ModelParityRuntimeExport.h"
 #include "config/OrchestrationConfigParser.h"
 #include <gtest/gtest.h>
+#include "mocks/MockMPIContext.h"
 #include "mocks/MockOrchestrationRunner.h"
 #include <unistd.h>
 
@@ -822,4 +824,45 @@ TEST(FrozenParityHistoryReplay, NativeExactOwnerRequiresEveryDeclaredEligibleSer
     EXPECT_TRUE(complete.retain().empty());
     EXPECT_EQ(complete.retainedHash(), 9'007'199'254'740'993LL);
 }
+/** @test Exact original CPU joint population retains per-rank public worker requests. */
+TEST(FrozenParityHistoryReplay, OriginalCPUJointWorkersUseTypedWorldMembership)
+{
+    MetadataOwner owner;auto value=descriptor(owner);
+    const auto& cell=qwen4exp::qwen4ExpCPUJointWorld2NumericalCases().front();
+    auto arguments=modelParityDiagnosticBenchmarkArguments(cell);arguments.insert(arguments.begin(),"history-contract");
+    std::vector<char*> argv;for(auto& argument:arguments)argv.push_back(argument.data());
+    auto config=OrchestrationConfigParser{}.parseArgs(static_cast<int>(argv.size()),argv.data());
+    config.n_threads=2;
+    value["expected_config"]=json::parse(serializeOrchestrationConfig(config));
+    const auto replay=checked(value);
+    EXPECT_EQ(replay.requestedCPUWorkers(),2);
+    FrozenParityHistoryReplay::CPUExecutionObservation actual{{0,2},2,2,false,true,"cores"};
+    EXPECT_NO_THROW(replay.requireCPUExecution(actual));
+    actual.physical_cores=1;
+    EXPECT_THROW(replay.requireCPUExecution(actual),std::invalid_argument);
+    config.mpi_procs=4;
+    value["expected_config"]=json::parse(serializeOrchestrationConfig(config));
+    EXPECT_THROW(checked(value).requestedCPUWorkers(),std::invalid_argument);
+}
+
+/** @brief Configuration-only probe; no factory, model or native owner is constructed. */
+class OriginalContextConfigurationProbe final:public ParityTestBase {
+public:
+    std::shared_ptr<IMPIContext> original;
+    void TestBody() override {}
+    std::string getBackendName() override {return "ContextConfigurationContract";}
+    /** @return Existing optional original owner used by the actual fresh construction branch. */
+    std::shared_ptr<IMPIContext> configuredContext() const {return freshParityMPIContext();}
+    /** @return Historical default remains empty, preserving the original helper branch. */
+    std::shared_ptr<IMPIContext> defaultContext() const {return ParityTestBase::freshParityMPIContext();}
+protected:
+    std::shared_ptr<IMPIContext> freshParityMPIContext() const override {return original;}
+};
+/** @test Fresh context configuration retains original identity without linking production helper bodies. */
+TEST(FrozenParityHistoryReplay, FreshContextConfigurationRetainsOriginalOwnerBeforeAdmission) {
+    OriginalContextConfigurationProbe probe;
+    auto original=std::make_shared<MockMPIContext>();probe.original=original;
+    EXPECT_EQ(probe.configuredContext(),original);EXPECT_FALSE(probe.defaultContext());
+}
+
 } // namespace llaminar2::test::parity

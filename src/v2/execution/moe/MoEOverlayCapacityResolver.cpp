@@ -70,6 +70,7 @@ namespace llaminar2
             const MoEOverlayTierCapacityRequest *request = nullptr;
             MoEOverlayResolvedTierCapacity output;
             std::vector<MoEOverlayPreparedExpertFootprint> movable_footprints;
+            std::vector<std::vector<MoEOverlayPreparedExpertFootprint>> fragment_footprints;
         };
 
         [[nodiscard]] std::size_t resourceUsed(
@@ -253,7 +254,8 @@ namespace llaminar2
             std::map<std::string, std::size_t> charges;
             const int quota =
                 tier.output.live_experts_per_layer[static_cast<std::size_t>(layer_idx)];
-            if (tier.request->copy_policy != MoEOverlayTierCopyPolicy::Replicated)
+            if (tier.request->copy_policy != MoEOverlayTierCopyPolicy::Replicated &&
+                tier.request->copy_policy != MoEOverlayTierCopyPolicy::TensorSharded)
             {
                 const std::size_t participant_index =
                     static_cast<std::size_t>(quota) %
@@ -268,11 +270,14 @@ namespace llaminar2
                 return charges;
             }
 
-            for (const auto &participant : tier.request->participants)
+            for (std::size_t p=0;p<tier.request->participants.size();++p)
             {
+                const auto& participant=tier.request->participants[p];
                 const auto resource = resource_index.at(participant.resource_id);
                 const std::size_t bytes = footprintFor(
-                    footprints[static_cast<std::size_t>(layer_idx)],
+                    tier.request->copy_policy==MoEOverlayTierCopyPolicy::TensorSharded
+                        ? tier.fragment_footprints.at(p).at(static_cast<std::size_t>(layer_idx))
+                        : footprints[static_cast<std::size_t>(layer_idx)],
                     resources[resource].memory.build().resource().device,
                     /*shadow=*/false);
                 charges[participant.resource_id] = checkedAdd(
@@ -333,7 +338,8 @@ namespace llaminar2
             const int previous_quota = tier.output.live_experts_per_layer[layer];
             ++tier.output.live_experts_per_layer[layer];
             tier.output.has_live_residency = true;
-            if (tier.request->copy_policy != MoEOverlayTierCopyPolicy::Replicated)
+            if (tier.request->copy_policy != MoEOverlayTierCopyPolicy::Replicated &&
+                tier.request->copy_policy != MoEOverlayTierCopyPolicy::TensorSharded)
             {
                 const std::size_t participant =
                     static_cast<std::size_t>(previous_quota) %
@@ -679,6 +685,30 @@ namespace llaminar2
                 state.output.priority = request.priority;
                 state.output.fallback = request.fallback;
                 state.output.live_experts_per_layer.assign(layer_count, 0);
+                if(request.copy_policy == MoEOverlayTierCopyPolicy::TensorSharded){
+                    if(request.shard_cohorts.size()!=layer_count)
+                        throw std::invalid_argument("Tensor-sharded capacity requires every original layer cohort");
+                    state.output.shard_cohorts=request.shard_cohorts;
+                    state.fragment_footprints.resize(request.participants.size());
+                    for(std::size_t layer=0;layer<layer_count;++layer){
+                        const auto& cohort=request.shard_cohorts[layer];
+                        if(!cohort || cohort->source()!=input.layer_weight_manifest[layer] ||
+                           cohort->participants().size()!=request.participants.size() ||
+                           cohort->ownership(0).geometry().experts!=input.num_experts)
+                            throw std::invalid_argument("Tensor-sharded capacity received foreign/incomplete source geometry");
+                        for(std::size_t p=0;p<request.participants.size();++p){
+                            const auto& endpoint=request.participants[p];const auto& member=cohort->participants()[p];
+                            const auto budget=std::find_if(input.physical_budgets.begin(),input.physical_budgets.end(),
+                                [&](const auto& b){return b.resourceId()==endpoint.resource_id;});
+                            const auto resource=budget->certificate().bom().resource();
+                            if(member.participant_id!=endpoint.participant_id || !resource.device.is_cpu() ||
+                               resource.world_rank!=member.world_rank || endpoint.shadow_slots_per_layer!=0)
+                                throw std::invalid_argument("Tensor-sharded capacity requires exact original CPU resources and no unsupported migration arena");
+                            state.fragment_footprints[p].push_back(MoEOverlayCapacityResolver::preparedFootprints({cohort->localManifest(p)}).front());
+                        }
+                    }
+                }else if(!request.shard_cohorts.empty())
+                    throw std::invalid_argument("Whole-expert capacity cannot borrow shard cohort metadata");
                 state.output.participant_live_copies.assign(
                     request.participants.size(),
                     std::vector<int>(layer_count, 0));
@@ -852,6 +882,7 @@ namespace llaminar2
                         tier.request->participants.size();
                     if (tier.request->copy_policy !=
                             MoEOverlayTierCopyPolicy::Replicated &&
+                        tier.request->copy_policy != MoEOverlayTierCopyPolicy::TensorSharded &&
                         participant_count >
                             static_cast<std::size_t>(input.num_experts))
                     {
@@ -865,8 +896,8 @@ namespace llaminar2
                         throw std::invalid_argument(error.str());
                     }
                     const int source_quota =
-                        tier.request->copy_policy ==
-                                MoEOverlayTierCopyPolicy::Replicated
+                        (tier.request->copy_policy == MoEOverlayTierCopyPolicy::Replicated ||
+                         tier.request->copy_policy == MoEOverlayTierCopyPolicy::TensorSharded)
                             ? 1
                             : static_cast<int>(participant_count);
 

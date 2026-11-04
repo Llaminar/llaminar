@@ -81,9 +81,12 @@ namespace llaminar2
             case RoutedExpertComputePolicy::Replicated:
                 return MoEOverlayTierCopyPolicy::Replicated;
             case RoutedExpertComputePolicy::TensorSharded:
-                throw std::invalid_argument(
-                    "ExpertOverlay exact whole-expert capacity does not yet "
-                    "admit tensor-sharded routed domain '" + domain.name + "'");
+                // A degree-one CPU tensor policy owns the complete matrix.
+                // Only multi-member CPU domains require fragment cohorts;
+                // the authored public compute policy remains unchanged.
+                if (domain.participants.size() == 1 && domain.participants.front().isCPU())
+                    return MoEOverlayTierCopyPolicy::Apportioned;
+                return MoEOverlayTierCopyPolicy::TensorSharded;
             case RoutedExpertComputePolicy::Unspecified:
             case RoutedExpertComputePolicy::Automatic:
                 throw std::invalid_argument(
@@ -819,6 +822,21 @@ namespace llaminar2
                 participant_devices.push_back(device);
             }
 
+            if(request.copy_policy==MoEOverlayTierCopyPolicy::TensorSharded){
+                if(domain.scope!=ExecutionDomainScope::NODE_LOCAL ||
+                   domain.world_ranks.size()!=domain.participants.size() || policy.usesPhysicalResidencyFabric())
+                    throw std::invalid_argument("CPU tensor-shard admission requires original node-local ranks; cohort migration execution is not implemented");
+                std::vector<MoEExpertShardCohort::Participant> members;
+                for(std::size_t p=0;p<domain.participants.size();++p)
+                    members.push_back({request.participants[p].participant_id,
+                        boundParticipantWorldRank(domain,p),domain.participants[p]});
+                for(const auto& layer:layer_weight_manifest)
+                    request.shard_cohorts.push_back(std::make_shared<const MoEExpertShardCohort>(
+                        MoEExpertShardCohort::checked(layer,num_experts,members,
+                            MoEExpertShardCohort::balancedIntervals(layer,static_cast<int>(members.size())))));
+                if(tier.memory_budget_bytes!=0)
+                    throw std::invalid_argument("CPU shard tiers require physical PMA budgets, not an ambiguous aggregate tier byte cap");
+            }
             request.max_live_experts_per_layer.assign(
                 layer_count, num_experts);
             const auto tier_footprints =

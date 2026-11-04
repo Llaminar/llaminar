@@ -93,6 +93,16 @@ namespace llaminar2
             return placement_.allocateUnadmitted<T>(count, CPUStorageInitialization::Uninitialized);
         }
 
+        /** @return Original CPU allocator identity retained by this final allocation policy. */
+        [[nodiscard]] DeviceId allocatorDevice() const noexcept {
+            return authority_ ? allocator_ : DeviceId::cpu();
+        }
+
+        /** @return Original immutable allocation placement, independent of CPU ordinal. */
+        [[nodiscard]] CPUStoragePlacement storagePlacement() const noexcept { return placement_; }
+        /** @return Original admission owner, absent only at existing explicit low-level allocation boundaries. */
+        [[nodiscard]] std::shared_ptr<PhysicalMemoryAuthority> physicalMemoryAuthority() const noexcept { return authority_; }
+
     private:
         /** @brief Construct only through the explicit placement factories. */
         explicit CPUWeightStoragePlacement(CPUStoragePlacement placement) noexcept : placement_(placement) {}

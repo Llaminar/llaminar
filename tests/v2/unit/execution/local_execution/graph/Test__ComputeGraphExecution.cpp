@@ -1398,3 +1398,79 @@ TEST(NativeParallelGraphBranch, FiniteSiblingRejectsEmptySelfDuplicateBeforeMuta
         EXPECT_EQ(main.nodes.size(),1u);EXPECT_TRUE(main.cloned_sources.empty());
     }
 }
+
+/** @test Original rooted gather must finish before any potentially blocking receive. */
+TEST(MoEOverlayRankBatchGraphSchedule, RootedCollectivePrecedesEveryRemoteReceive)
+{
+    for (int peers=1;peers<=8;++peers)
+    for (int repeat=0;repeat<3;++repeat)
+    {
+        ComputeGraph graph;
+        std::vector<MoEOverlayRankBatchGraphLane> remote;
+        int submitted=0; bool produced=false,gathered=false;
+        std::vector<int> returned;
+        auto add=[&](const std::string& name,ComputeStageType type,auto action) {
+            auto stage=std::make_unique<MockComputeStage>(type);
+            stage->setOnExecute(action);
+            graph.addNode(name,std::move(stage),DeviceId::cpu());
+        };
+        // Adversarial insertion: receives appear before their actual producers.
+        for(int i=peers-1;i>=0;--i) {
+            const auto id=std::to_string(7+12*i);
+            add("receive"+id,ComputeStageType::MOE_RANK_BATCH_RETURN_REDUCE,
+                [&,i](IDeviceContext*){EXPECT_TRUE(gathered);EXPECT_EQ(submitted,peers);returned.push_back(i);});
+            add("send"+id,ComputeStageType::MOE_RANK_BATCH_DISPATCH,
+                [&](IDeviceContext*){EXPECT_FALSE(produced);++submitted;});
+        }
+        add("local_return",ComputeStageType::MOE_SPARSE_RETURN_REDUCE,
+            [&](IDeviceContext*){EXPECT_TRUE(gathered);EXPECT_EQ(returned.size(),size_t(peers));});
+        add("gather",ComputeStageType::ROOTED_COLLECTIVE,
+            [&](IDeviceContext*){EXPECT_TRUE(produced);EXPECT_EQ(submitted,peers);EXPECT_TRUE(returned.empty());gathered=true;});
+        add("producer",ComputeStageType::MOE_LOCAL_EXPERT,
+            [&](IDeviceContext*){EXPECT_EQ(submitted,peers);EXPECT_FALSE(gathered);produced=true;});
+        add("local_dispatch",ComputeStageType::MOE_SPARSE_DISPATCH,
+            [&](IDeviceContext*){EXPECT_EQ(submitted,peers);});
+        for(int i=0;i<peers;++i){const auto id=std::to_string(7+12*i);remote.push_back({"send"+id,"receive"+id});}
+        const std::array<MoEOverlayLocalExpertGraphLane,1> local{{{"local_dispatch","producer","local_return","gather"}}};
+        wireMoEOverlayRankBatchForkJoin(graph,remote,local);
+        for(auto* stage:graph.getExecutionStages()) ASSERT_TRUE(stage->execute(nullptr));
+        ASSERT_EQ(returned.size(),size_t(peers));
+        for(int i=0;i<peers;++i)EXPECT_EQ(returned[i],i);
+    }
+}
+
+/** @test Missing, aliased and wrongly typed collectives cannot publish partial edges. */
+TEST(MoEOverlayRankBatchGraphSchedule, RejectsInvalidRootedCollectiveBeforeMutation)
+{
+    ComputeGraph graph;
+    for(const auto& [name,type]:std::vector<std::pair<std::string,ComputeStageType>>{
+        {"send",ComputeStageType::MOE_RANK_BATCH_DISPATCH},{"receive",ComputeStageType::MOE_RANK_BATCH_RETURN_REDUCE},
+        {"dispatch",ComputeStageType::MOE_SPARSE_DISPATCH},{"producer",ComputeStageType::MOE_LOCAL_EXPERT},
+        {"returned",ComputeStageType::MOE_SPARSE_RETURN_REDUCE},{"gather",ComputeStageType::ROOTED_COLLECTIVE}})
+        graph.addNode(name,std::make_unique<MockComputeStage>(type),DeviceId::cpu());
+    const std::array<MoEOverlayRankBatchGraphLane,1> remote{{{"send","receive"}}};
+    for(const auto& collective:std::vector<std::string>{"missing","send","receive","dispatch","producer","returned"}) {
+        const std::array<MoEOverlayLocalExpertGraphLane,1> local{{{"dispatch","producer","returned",collective}}};
+        EXPECT_THROW(wireMoEOverlayRankBatchForkJoin(graph,remote,local),std::invalid_argument);
+        for(const auto& name:{"send","receive","dispatch","producer","returned","gather"})
+            EXPECT_TRUE(graph.getNode(name)->dependencies.empty())<<name;
+    }
+}
+
+#include "execution/compute_stages/stages/MoELocalExpertStage.h"
+#include "execution/compute_stages/stages/MoECPUExpertShardRouteStage.h"
+#include <type_traits>
+
+/** @test Producers borrow scheduling identity; only the explicit collective can mutate the ticket. */
+TEST(MoEOverlayRankBatchGraphSchedule, ProducerTicketBorrowIsConstCollectiveOwnsPublication)
+{
+    using Producer=MoELocalExpertStage::CPUJointRouteProducerBinding;
+    using Collective=MoECPUExpertShardRouteStage::Params;
+    using Borrow=decltype(Producer::deferred_canonical_ticket);
+    using Publisher=decltype(Collective::original_canonical_ticket);
+    static_assert(std::is_const_v<typename Borrow::element_type>);
+    static_assert(!std::is_const_v<typename Publisher::element_type>);
+    static_assert(std::is_constructible_v<Borrow,Publisher>);
+    static_assert(!std::is_constructible_v<Publisher,Borrow>);
+    EXPECT_TRUE((std::is_const_v<typename Borrow::element_type>));
+}

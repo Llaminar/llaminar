@@ -23,6 +23,8 @@
 
 namespace llaminar2
 {
+    class CPUExpertShardRouteCompletion;
+    class MoECPUExpertShardRouteStage;
     /**
      * @brief Backend-agnostic endpoint selected by the topology planner.
      *
@@ -62,6 +64,7 @@ namespace llaminar2
         std::uint32_t graph_role_mask = 0u;
         /** Strictly increasing model-layer indices embedded in the transaction. */
         std::vector<std::int32_t> model_layer_indices;
+        MoEOverlayActivationReturnRole return_role = MoEOverlayActivationReturnRole::Ordinary; ///< Original source-cohort role, fixed at setup.
 
         /** @return Whether the rank pair, topology, and stage manifest are usable. */
         [[nodiscard]] bool valid() const noexcept;
@@ -83,6 +86,8 @@ namespace llaminar2
     {
         std::uint64_t dispatch_payload_bytes = 0u;
         std::uint64_t return_payload_bytes = 0u;
+        /** Unique useful shared hidden bytes; only the group publisher counts them. */
+        std::uint64_t dispatch_shared_hidden_bytes = 0u;
         std::uint64_t dispatch_live_rows = 0u;
         std::uint64_t return_live_rows = 0u;
         std::uint64_t dispatch_live_entries = 0u;
@@ -197,6 +202,19 @@ namespace llaminar2
             std::uint32_t stage_ordinal,
             std::uint64_t payload_bytes,
             std::string *error = nullptr);
+        /**
+         * @brief Publish a joint return only after its real original CPU cohort completed.
+         * @param identity Exact active original invocation.
+         * @param stage_ordinal Original layer operation.
+         * @param payload_bytes Actual root payload bytes; exactly zero for contributors.
+         * @param completed Closed witness minted by the real source-bound collective.
+         * @param error Fatal contract diagnostic on rejection.
+         * @return True only after the existing release publication succeeds.
+         */
+        bool publishJointReturn(const MoEOverlayActivationEpochIdentity &identity,
+            std::uint32_t stage_ordinal,std::uint64_t payload_bytes,
+            const CPUExpertShardRouteCompletion &completed,std::string *error=nullptr);
+
 
         /**
          * @brief Continuation validation and consumption of one return descriptor.
@@ -322,6 +340,11 @@ namespace llaminar2
         }
 
     private:
+        friend class MoECPUExpertShardRouteStage;
+        /** @brief One original publication body; joint scope requires its actual completed witness. */
+        bool publishReturnImpl(const MoEOverlayActivationEpochIdentity &identity,
+            std::uint32_t stage,std::uint64_t bytes,const CPUExpertShardRouteCompletion *completed,std::string *error);
+
         /** @brief Authenticate every immutable published field independently of active/failed scheduler state. */
         bool matchesPublishedIdentity(const MoEOverlayActivationEpochIdentity &identity) const noexcept;
         /** @return Whether identity exactly matches the active authenticated value. */

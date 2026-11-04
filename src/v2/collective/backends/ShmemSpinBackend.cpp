@@ -87,9 +87,10 @@ namespace llaminar2
     // =========================================================================
 
     ShmemSpinBackend::ShmemSpinBackend(int domain_id, int my_rank,
-                                       std::unique_ptr<UPICollectiveBackend> general_backend)
+                                       std::unique_ptr<UPICollectiveBackend> general_backend,
+                                       std::shared_ptr<PhysicalMemoryAuthority> original_memory)
         : domain_id_(domain_id), my_rank_(my_rank),
-          general_backend_(std::move(general_backend))
+          general_backend_(std::move(general_backend)), original_memory_(std::move(original_memory))
     {
         LOG_DEBUG("ShmemSpinBackend: Created for domain " << domain_id_
                                                           << " rank " << my_rank_);
@@ -228,6 +229,7 @@ namespace llaminar2
         // removed after attachment; pre-unlink failures remain under the existing guardian root.
 
         arena_size_ = ShmemSpinArena::compute_size(num_ranks_);
+        arena_mapping_bytes_=original_memory_?ShmemSpinArena::allocationGeometry(num_ranks_).mapped_bytes:arena_size_;
 
         if (!general_backend_ || general_backend_->domainComm() == MPI_COMM_NULL)
         {
@@ -247,7 +249,14 @@ namespace llaminar2
 
         if (my_rank_ == 0)
         {
-            for (int attempt = 0; attempt < kMaxCreateAttempts; ++attempt)
+            // Admission is exact and creator-only. Other original ranks borrow
+            // the same file pages; their mappings are not physical allocations.
+            if(original_memory_) {
+                try { arena_creator_claim_=original_memory_->claimNewAllocation(DeviceId::cpu(),
+                    PhysicalMemoryOwner::ActivationTransportStaging,arena_mapping_bytes_); }
+                catch(const std::exception &error) {last_error_=error.what();create_success=0;}
+            }
+            for (int attempt = 0; create_success && attempt < kMaxCreateAttempts; ++attempt)
             {
                 shm_name_ = makeUniqueShmemName(domain_id_);
 
@@ -330,7 +339,7 @@ namespace llaminar2
         void *ptr = MAP_FAILED;
         if (shared_file_.descriptor() >= 0)
         {
-            ptr = mmap(nullptr, arena_size_,
+            ptr = mmap(nullptr, arena_mapping_bytes_,
                        PROT_READ | PROT_WRITE, MAP_SHARED,
                        shared_file_.descriptor(), 0);
 
@@ -441,11 +450,26 @@ namespace llaminar2
         return true;
     }
 
+    bool ShmemSpinBackend::closeOriginalExpertMapping() noexcept {
+        if(!original_memory_)return false;
+        if(original_expert_mapping_closed_)return true;
+        if(arena_ && munmap(arena_,arena_mapping_bytes_)!=0)return false;
+        arena_=nullptr;original_expert_mapping_closed_=true;
+        return true;
+    }
+    void ShmemSpinBackend::retireOriginalExpertBacking() {
+        if(!original_memory_ || !original_expert_mapping_closed_)
+            throw std::logic_error("Original shared arena backing cannot retire before exact local unmap");
+        if(original_expert_backing_retired_)return;
+        shared_file_={};shared_directory_.reset();arena_creator_claim_={};shm_name_.clear();
+        original_expert_backing_retired_=true;
+    }
+
     void ShmemSpinBackend::teardownSharedMemory()
     {
         if (arena_)
         {
-            munmap(arena_, arena_size_);
+            if(munmap(arena_, arena_mapping_bytes_)!=0)std::terminate();
             arena_ = nullptr;
         }
 
@@ -454,6 +478,7 @@ namespace llaminar2
         // never deleted as though it were the original arena.
         shared_file_={};
         shared_directory_.reset();
+        arena_creator_claim_={};
         shm_name_.clear();
     }
 
@@ -818,15 +843,25 @@ namespace llaminar2
     }
 
     bool ShmemSpinBackend::gatherVariableFloatRecordsToRoot(
+        const float *local, size_t count, float *root, size_t capacity, size_t width,
+        int root_rank, size_t &gathered) {
+        return gatherVariableFloatRecordsToRoot(local,count,root,capacity,width,root_rank,gathered,{});
+    }
+
+    bool ShmemSpinBackend::gatherVariableFloatRecordsToRoot(
         const float *local_records,
         size_t local_record_count,
         float *root_records,
         size_t root_record_capacity,
         size_t record_width_elements,
         int root_rank,
-        size_t &gathered_record_count)
+        size_t &gathered_record_count,
+        std::span<RootedFloatRecordRange> source_ranges)
     {
         gathered_record_count = 0u;
+        for (auto &range:source_ranges) range={};
+        if ((!source_ranges.empty() && my_rank_!=root_rank) ||
+            (!source_ranges.empty() && source_ranges.size()!=static_cast<size_t>(num_ranks_))) return false;
         if (abort_requested_.load(std::memory_order_acquire))
         {
             last_error_ = "ShmemSpinBackend abort has been requested";
@@ -1094,8 +1129,16 @@ namespace llaminar2
             }
         }
 
-        if (my_rank_ == root_rank)
+        if (my_rank_ == root_rank) {
+            if (!source_ranges.empty()) {
+                for (int rank=0;rank<num_ranks_;++rank)
+                    source_ranges[static_cast<size_t>(rank)]={rank,
+                        rooted_publication_element_offsets_[static_cast<size_t>(rank)]/record_width_elements,
+                        rooted_publication_element_counts_[static_cast<size_t>(rank)]/record_width_elements};
+                if (!validRootedFloatRecordRanges(source_ranges,total_elements/record_width_elements)) return false;
+            }
             gathered_record_count = total_elements / record_width_elements;
+        }
         return true;
     }
 

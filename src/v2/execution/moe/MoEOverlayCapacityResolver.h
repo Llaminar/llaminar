@@ -14,11 +14,15 @@
  * limits, and the already-resolved fixed graph/KV bytes.  Tests can therefore
  * exhaust every codebook, topology, and failure mode without occupying a GPU.
  * CPU serial storage declarations survive admission and runtime projection.
+ * Joint tensor-sharded tiers retain logical expert quotas while every original
+ * CPU participant is charged its own native source fragment. Source geometry
+ * is immutable metadata; PMA remains the sole physical-byte authority.
  */
 
 #pragma once
 
 #include "MoEOverlayPhysicalResidencyFabric.h"
+#include "MoEExpertShardCohort.h"
 #include "MoEOverlayHostDemandMemoryPlan.h"
 #include "MoERoutedExpertPlacementPlan.h"
 #include "backends/DeviceId.h"
@@ -51,6 +55,7 @@ namespace llaminar2
         Replicated = 1,  ///< One complete copy on every tier participant.
         /** Movable gate/up owners plus every expert's fixed full-K down slice. */
         GateUpOwnedDownColumns = 2,
+        TensorSharded = 3, ///< Every logical expert jointly owns one exact native F fragment per participant.
     };
 
     /**
@@ -69,6 +74,7 @@ namespace llaminar2
         {
         case MoEOverlayTierCopyPolicy::Apportioned:
         case MoEOverlayTierCopyPolicy::Replicated:
+        case MoEOverlayTierCopyPolicy::TensorSharded:
             return DeviceMoEProjectionSet::CompleteExpert;
         case MoEOverlayTierCopyPolicy::GateUpOwnedDownColumns:
             return DeviceMoEProjectionSet::GateUp;
@@ -208,6 +214,8 @@ namespace llaminar2
         std::vector<int> fixed_live_experts_per_layer;
         std::vector<int> max_live_experts_per_layer;
         std::vector<MoEOverlayTierCapacityParticipant> participants;
+        /** Original source-bound layer cohorts; present only for TensorSharded. */
+        std::vector<std::shared_ptr<const MoEExpertShardCohort>> shard_cohorts;
     };
 
     /** @brief Complete pure input required to resolve one model's live quotas. */
@@ -261,6 +269,8 @@ namespace llaminar2
         std::vector<int> live_experts_per_layer;
         /** Participant-major `[participant][layer]` physical live-copy counts. */
         std::vector<std::vector<int>> participant_live_copies;
+        /** Retained immutable source geometry; counts above are fragments for joint tiers. */
+        std::vector<std::shared_ptr<const MoEExpertShardCohort>> shard_cohorts;
     };
 
     /** @brief Auditable memory BOM for one unique physical resource. */

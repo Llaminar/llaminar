@@ -59,9 +59,10 @@ namespace llaminar2
                 result.preparation[i] = CPUWeightPreparationMemory::sourceNative(
                     result.formats[i], result.matrices[i].n, result.matrices[i].k);
                 addBytes(result.prepared_bytes, result.preparation[i].persistent_bytes);
-                result.staging_bytes = std::max({result.staging_bytes,
-                    origin == PlanningSampleOrigin::LocalGGUF ? result.matrices[i].source_bytes : size_t{0},
-                    result.preparation[i].temporary_bytes});
+                // Native reads populate the final sample directly. Only the
+                // real packer's simultaneous scratch belongs to staging.
+                result.staging_bytes = std::max(result.staging_bytes,
+                    result.preparation[i].temporary_bytes);
             }
             return result;
         }
@@ -93,7 +94,8 @@ namespace llaminar2
                 {.rows = rows, .n = static_cast<int>(description.matrices[projection].n),
                  .k = static_cast<int>(description.matrices[projection].k), .workers = workers,
                  .execution = execution, .numerical_policy = CPUProjectionNumericalPolicy::GPUAlignedExpert}));
-        builder.add(resource, PhysicalMemoryOwner::ModelSourcePayload, description.source_bytes);
+        for (const auto &matrix : description.matrices)
+            builder.add(resource, PhysicalMemoryOwner::ModelSourcePayload, matrix.physicalBytes());
         builder.add(resource, PhysicalMemoryOwner::RoutedExpertWeights, description.prepared_bytes);
         builder.add(resource, PhysicalMemoryOwner::WeightLoadStaging, description.staging_bytes);
         builder.add(resource, PhysicalMemoryOwner::ExecutionWorkspace,
@@ -125,14 +127,11 @@ namespace llaminar2
         using llaminar::v2::kernels::KernelFactory;
         for (size_t i = 0; i < inputs.size(); ++i)
         {
-            std::optional<PhysicalMemoryAllocationLease> packing_claim;
-            if (description.preparation[i].temporary_bytes)
-                packing_claim.emplace(memory->claimNewAllocation(device,
-                    PhysicalMemoryOwner::WeightLoadStaging, description.preparation[i].temporary_bytes));
             // A const shared borrow is kept inside the source-sample scope;
             // it cannot escape its PMA owner through a returned tensor view.
-            // Every declared setup vector is constructor-local; synchronous
-            // preparation destroys them before packing_claim can retire.
+            // The native packer owns its actual admitted scratch root and
+            // source transaction. A wrapper lease would charge those same
+            // physical bytes twice. Floating preparation declares no scratch.
             engines[i] = KernelFactory::prepareExpertGemmLocal(sample.tensor(i).shared_from_this(),device,
                 KernelFactory::GemmPreparationKind::AUTO,CPUWeightStoragePlacement::accounted(
                     memory,device,PhysicalMemoryOwner::RoutedExpertWeights,CPUWeightStoragePlacement::local()));

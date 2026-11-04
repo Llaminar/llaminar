@@ -34,6 +34,7 @@ namespace llaminar2
         std::string dispatch; ///< Consumes immutable routing into participant-owned storage.
         std::string compute;  ///< Produces private expert rows, not the shared reduction output.
         std::string returned; ///< Publishes those rows after the ordered remote returns.
+        std::string collective; ///< Optional explicit rooted fragment combine, before any remote receive.
     };
 
     /**
@@ -49,6 +50,9 @@ namespace llaminar2
      * of topological-sort tie breaking. Local compute writes participant-private
      * storage; only its return touches the shared destination. The ordered return
      * chain preserves arithmetic and lease retirement in O(lanes) graph edges.
+     * An optional explicit rooted collective completes local fragment work
+     * before the first remote receive: that peer may itself be waiting for
+     * these fragments. Numerical returns remain in their original order.
      */
     inline void wireMoEOverlayRankBatchForkJoin(
         ComputeGraph &graph, std::span<const MoEOverlayRankBatchGraphLane> lanes,
@@ -84,6 +88,12 @@ namespace llaminar2
                 compute->stage->type() != ComputeStageType::MOE_LOCAL_EXPERT ||
                 returned->stage->type() != ComputeStageType::MOE_SPARSE_RETURN_REDUCE)
                 throw std::invalid_argument("Sparse local fork requires distinct typed dispatch/compute/return nodes");
+            if (!lane.collective.empty()) {
+                const auto *collective = graph.getNode(lane.collective);
+                if (!collective || !collective->stage || !names.insert(lane.collective).second ||
+                    collective->stage->type() != ComputeStageType::ROOTED_COLLECTIVE)
+                    throw std::invalid_argument("Sparse local fork requires its distinct typed rooted collective");
+            }
         }
         for (const auto &lane : lanes)
             graph.addDependency(lanes.front().returned, lane.dispatch);
@@ -97,15 +107,19 @@ namespace llaminar2
             {
                 const auto &local = local_lanes[index];
                 graph.addDependency(local.compute, local.dispatch);
-                graph.addDependency(local.returned, local.compute);
+                const auto &completed = local.collective.empty() ? local.compute : local.collective;
+                if (!local.collective.empty())graph.addDependency(local.collective, local.compute);
+                graph.addDependency(local.returned, completed);
                 graph.addDependency(local.returned, index == 0
                     ? lanes.back().returned : local_lanes[index - 1].returned);
                 if (index != 0)
-                    graph.addDependency(local.dispatch, local_lanes[index - 1].compute);
+                    graph.addDependency(local.dispatch, local_lanes[index - 1].collective.empty()
+                        ? local_lanes[index - 1].compute : local_lanes[index - 1].collective);
             }
             // The host executor cannot wait on a peer before using its own
             // socket. Private compute may overlap; numerical publication may not.
-            graph.addDependency(lanes.front().returned, local_lanes.back().compute);
+            graph.addDependency(lanes.front().returned, local_lanes.back().collective.empty()
+                ? local_lanes.back().compute : local_lanes.back().collective);
         }
     }
 }

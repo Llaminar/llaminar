@@ -62,6 +62,8 @@
 
 namespace llaminar2
 {
+    class GlobalTPContext;
+
     struct MoEOverlayParticipantGraphRunnerConfig;
     enum class MoEOverlayParticipantGraphOwnership : std::uint8_t;
     enum class ModelContextPhysicalSealBoundary;
@@ -477,6 +479,16 @@ namespace llaminar2
          * command so old residency banks retire before terminal evidence.
          */
         void shutdownMPIWorkers() override;
+
+        /**
+         * @brief Terminate a failed coordinated lane through its original rank authority.
+         * @param reason Original failure detail retained in the fatal worker diagnostic.
+         * @note Roots retain ordinary terminal publication. Followers cannot publish
+         * root commands and terminate the original communicator instead.
+         * @throws std::runtime_error For a fatal follower failure under a scripted
+         * MPI context with no live communicator; a real communicator terminates.
+         */
+        void abortMPIWorkers(const std::string& reason) override;
         int coordinatedRootRank() const override
         {
             return mpi_coordinated_root_rank_;
@@ -635,6 +647,8 @@ namespace llaminar2
          * double-buffered histogram from the exact owner-map geometry.
          */
         bool initializeMoEExpertOverlayResidencyAuthority();
+        /** @brief Materialize the one original Static CPU expert domain after exact source/PMA setup. */
+        bool initializeCPUExpertShardDomain();
 
         /**
          * @brief Identify native GPU controllers in one domain or every PP stage.
@@ -1661,6 +1675,7 @@ namespace llaminar2
         bool model_context_reuse_seal_succeeded_{true};
         /** First terminal seal failure retained until contract invalidation. */
         std::string model_context_reuse_seal_error_;
+        std::shared_ptr<GlobalTPContext> cpu_expert_shard_ctx_; ///< Original declared CPU expert-domain owner; explicit terminal retirement before arena/PMA release.
         std::unique_ptr<ILocalTPContext> local_tp_ctx_;
         std::unique_ptr<ILocalPPContext> local_pp_ctx_;
 

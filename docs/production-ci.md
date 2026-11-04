@@ -130,6 +130,22 @@ python3 scripts/ci/run_develop_image_gate.py \
   --cpu-isa AVX512 --source-admission --output parity-results/develop-pr-gate
 ```
 
+For a focused source diagnostic, set `QFN_SOURCE_CELL` to one exact GTest
+identifier from the installed source inventory and use the same admission driver:
+
+```bash
+python3 scripts/ci/run_qfn_source_admission.py \
+  --build-dir BUILD --output parity-results/source-cell \
+  --exact-cell "$QFN_SOURCE_CELL"
+```
+
+The cell must belong to the authenticated CTest/GTest inventory and be eligible
+on the original native hardware. Required source files, driver checks, cleanup
+and per-rank retirement remain mandatory. The disjoint diagnostic receipt records
+omitted eligible cells and is ineligible for certification, including when only
+one cell is hardware-eligible. Omit `--exact-cell` to run the unchanged complete
+selected source-admission gate used by CI.
+
 After merge, the ordinary develop push workflow below builds/tests **both**
 shipping ISA images and publishes them. Master PR certification remains a
 separate, broader gate.

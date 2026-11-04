@@ -10,6 +10,7 @@
 #include "MoESparseDispatchStage.h"
 
 #include "../../../execution/moe/MoEExpertOverlayProfiler.h"
+#include "../../../execution/moe/MoEExpertShardCohort.h"
 #include "../../../execution/moe/MoEOverlayHostDispatchRows.h"
 #include "../../../execution/moe/MoEOverlayHostRowWork.h"
 #include "../../../tensors/Tensors.h"
@@ -456,6 +457,53 @@ namespace llaminar2
             const float *hidden = captured_ticket
                                       ? captured_ticket->hidden_rows_fp32
                                       : params_.hidden->data();
+            const MoEExpertShardCohort* original_cohort = nullptr;
+            if (params_.dispatch_output && params_.dispatch_output->residency_lease)
+            {
+                const auto& snapshot = **params_.dispatch_output->residency_lease;
+                if (!snapshot.valid() || snapshot.epoch != residency_epoch)
+                {
+                    LOG_ERROR("[MoESparseDispatchStage] Sparse descriptor lost its original residency epoch");
+                    return false;
+                }
+                if (snapshot.ownershipKind() == MoEOverlayResidencyOwnershipKind::CPUJointFragments)
+                {
+                    const auto& owners = snapshot.originalOwnerMap();
+                    bool whole = false;
+                    for (const auto& entry : tier->entries)
+                    {
+                        const auto* placement = owners.placementFor(runtime_key.layer_idx, entry.expert_id);
+                        if (!placement || !placement->resident || placement->tier_idx != tier->tier_index)
+                        {
+                            LOG_ERROR("[MoESparseDispatchStage] Sparse route has no original physical placement");
+                            return false;
+                        }
+                        if (!placement->shard_cohort) { whole = true; continue; }
+                        const auto* cohort = placement->shard_cohort.get();
+                        if (entry.destination_participant >= 0 || (original_cohort && original_cohort != cohort))
+                        {
+                            LOG_ERROR("[MoESparseDispatchStage] CPU joint routes replaced their original cohort destination");
+                            return false;
+                        }
+                        original_cohort = cohort;
+                    }
+                    if (original_cohort)
+                    {
+                        const auto members = original_cohort->participants();
+                        const bool required = std::any_of(members.begin(), members.end(), [&](const auto& member) {
+                            return member.participant_id == params_.target_participant;
+                        });
+                        if (whole || !required)
+                        {
+                            LOG_ERROR("[MoESparseDispatchStage] CPU joint sparse target is outside its original cohort");
+                            return false;
+                        }
+                    }
+                }
+            }
+            // Cohort fanout is authorized by the exact retained snapshot above,
+            // never by an unassigned scalar destination alone. Each member gets
+            // only this original live route prefix, with no duplicate entries.
             const bool participant_targeted = std::any_of(
                 tier->entries.begin(),
                 tier->entries.end(),
@@ -475,9 +523,13 @@ namespace llaminar2
             const auto entry_targets_this_participant =
                 [&](const MoEExpertDispatchEntry &entry)
             {
-                return !participant_targeted ||
-                       entry.destination_participant ==
-                           params_.target_participant;
+                // The joint producer skips zero-weight routes before GEMM.
+                // Compact the same useful prefix for every original member,
+                // preserving original route coordinates while sending no
+                // inactive entry or its otherwise-unused hidden row.
+                return original_cohort ? entry.route_weight != 0.0f
+                    : (!participant_targeted || entry.destination_participant ==
+                           params_.target_participant);
             };
             const size_t expected_entry_count =
                 static_cast<size_t>(std::count_if(

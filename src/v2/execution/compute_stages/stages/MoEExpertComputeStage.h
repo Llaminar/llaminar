@@ -12,6 +12,8 @@
  */
 
 #pragma once
+#include "../../../loaders/ExpertGemmRegistry.h"
+#include "../../moe/MoEOverlayParticipantResidency.h"
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
@@ -422,6 +424,8 @@ namespace llaminar2
             // owned_kernels keeps MoE batch-constructed kernels alive,
             // packed_*_lifetime keeps the shared GPU allocation alive.
             std::vector<std::shared_ptr<ITensorGemm>> moe_owned_kernels;
+            /** Original selected source triplets and native engines; never a whole-owner alias. */
+            std::shared_ptr<const MoEOverlayParticipantResidencyRegistry::CPUJointLayer> cpu_joint_layer;
             std::shared_ptr<void> moe_packed_gate_lifetime;
             std::shared_ptr<void> moe_packed_up_lifetime;
             std::shared_ptr<void> moe_packed_down_lifetime;

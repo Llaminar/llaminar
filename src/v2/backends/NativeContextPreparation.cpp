@@ -132,7 +132,10 @@ void PreparedGPUContextBirth::physicallyRetired(){
 }
 NativeContextPreparation::NativeContextPreparation(std::span<const PhysicalMemoryResource> observations,int rank)
     :source_(new NativeStoragePreparationPmaBinding(observations,rank)){
-    for(const auto& resource:observations)if(resource.device.is_gpu())
+    // The immutable registry is topology-wide, but process ownership and
+    // ordinal namespaces are strictly local. A remote GPU0 is not this
+    // process's GPU0 and must never create or borrow its native context.
+    for(const auto& resource:observations)if(resource.world_rank==rank && resource.device.is_gpu())
         GPUDeviceProcessLifetime::requireOriginalProcessAuthority(resource.device,source_->memory());
 }
 std::shared_ptr<NativeContextPreparation> NativeContextPreparation::create(std::span<const PhysicalMemoryResource> observations,

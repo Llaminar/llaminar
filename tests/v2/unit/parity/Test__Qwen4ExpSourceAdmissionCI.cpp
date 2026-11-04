@@ -188,3 +188,140 @@ TEST(Qwen4ExpSourceAdmissionCI, GPUAdaptiveDiscoveryRetainsAllTypedExpertAndMTPP
     EXPECT_EQ(count,64u);EXPECT_EQ(names.size(),64u);EXPECT_EQ(movement,32u);
     EXPECT_EQ(qwen4ExpGPUAdaptiveProductionCases().size(),4u);
 }
+
+/** @test Native discovery retains both rank0 roles and NUMA1 contributor without a fabricated PLE participant. */
+TEST(Qwen4ExpSourceAdmissionCI, CPUJointWorld2ExportsAllThreeOriginalPhysicalRoles) {
+    const auto cells=qwen4ExpSourceAdmissionParameters(qwen4ExpCPUJointWorld2SourceAdmissionCases());ASSERT_EQ(cells.size(),1u);
+    std::ostringstream text;PrintTo(cells.front(),&text);const auto metadata=nlohmann::json::parse(text.str());
+    EXPECT_EQ(metadata.at("mpi_ranks"),2);EXPECT_FALSE(metadata.at("mtp_enabled").get<bool>());
+    EXPECT_EQ(metadata.at("retained_mtp_draft_capacity"),0);
+    ASSERT_EQ(metadata.at("participants").size(),3u);
+    EXPECT_EQ(metadata.at("participants")[0].at("rank"),0);EXPECT_EQ(metadata.at("participants")[0].at("backend"),"rocm");
+    for(size_t member=0;member<2;++member) {
+        const auto& cpu=metadata.at("participants")[member+1];
+        EXPECT_EQ(cpu.at("rank"),member);EXPECT_EQ(cpu.at("backend"),"cpu");
+        EXPECT_EQ(cpu.at("ordinal"),0);EXPECT_EQ(cpu.at("numa_node"),member);
+    }
+    EXPECT_EQ(cells.front().testName(),qwen4ExpCPUJointWorld2SourceAdmissionCases().front().testName());
+    EXPECT_NE(cells.front().testName().find("2xMPI"),std::string::npos);
+    EXPECT_FALSE(metadata.contains("storage_participants")); // No extra cache owner/follower is invented.
+}
+
+namespace {
+/** @brief Recorded original observations only; no source, backend, communicator or native readiness exists. */
+llaminar2::ClusterInventory originalSocketRecords(int population) {
+    llaminar2::ClusterInventory inventory;
+    for(int member=0;member<population;++member) {
+        llaminar2::RankInventory rank;rank.rank=member;rank.node_id=7;rank.local_rank=member;
+        rank.hostname="label_"+std::to_string(member);rank.cpu.type=llaminar2::DeviceType::CPU;
+        rank.cpu.numa_node=member;
+        for(int socket=0;socket<population;++socket) {
+            llaminar2::CPUSocketInfo fact;fact.socket_id=11+socket*3;fact.numa_node=socket;
+            rank.cpu_socket_info.push_back(fact);
+        }
+        inventory.ranks.push_back(std::move(rank));
+    }
+    return inventory;
+}
+/** @brief Extend only recorded plan membership; no extra hardware/source cases are registered. */
+ModelParityCase recordedSocketCell(int population) {
+    auto cell=qwen4ExpCPUJointWorld2SourceAdmissionCases().front();
+    auto plan=std::make_shared<llaminar2::MoERoutedExpertPlacementPlan>(*cell.topology.expert_overlay_plan);
+    auto& cpu=plan->domains.back();cpu.participants.clear();cpu.world_ranks.clear();
+    cell.topology.participants.resize(1);cell.topology.mpi_ranks=population;
+    for(int member=0;member<population;++member) {
+        cpu.participants.push_back(llaminar2::GlobalDeviceAddress::cpu(member));cpu.world_ranks.push_back(member);
+        cell.topology.participants.push_back({llaminar2::GlobalDeviceAddress::cpu(member),member});
+    }
+    cell.topology.expert_overlay_plan=std::move(plan);return cell;
+}
+}
+/** @test Conditional source metadata cannot infer physical sockets from two available NUMA IDs. */
+TEST(Qwen4ExpSourceAdmissionCI, CPUJointSocketRequirementIsOriginalAndConditional) {
+    const auto& joint=qwen4ExpCPUJointWorld2SourceAdmissionCases().front();
+    std::ostringstream text;PrintTo(Qwen4ExpSourceAdmissionCase{joint},&text);
+    const auto metadata=nlohmann::json::parse(text.str());
+    ASSERT_EQ(metadata.at("cpu_expert_socket_membership").size(),2u);
+    for(int member=0;member<2;++member) {
+        const auto& expected=metadata.at("cpu_expert_socket_membership")[member];
+        EXPECT_EQ(expected.at("rank"),member);EXPECT_EQ(expected.at("numa_node"),member);
+        EXPECT_EQ(expected.at("backend"),"cpu");EXPECT_EQ(expected.at("ordinal"),0);
+        EXPECT_FALSE(expected.contains("socket_id")); // A plan cannot fabricate observed package IDs.
+    }
+    const auto& ordinary=qwen4ExpProductionCases().front();
+    std::ostringstream original;PrintTo(Qwen4ExpSourceAdmissionCase{ordinary},&original);
+    EXPECT_FALSE(nlohmann::json::parse(original.str()).contains("cpu_expert_socket_membership"));
+    EXPECT_TRUE(qwen4ExpCPUJointSocketMembers(ordinary).empty());
+    EXPECT_NO_THROW(requireOriginalCPUJointSocketRanks(ordinary,llaminar2::ClusterInventory{}));
+}
+/** @test The actual bound-rank validator consumes complete original records through eight, independent of labels/arrival. */
+TEST(Qwen4ExpSourceAdmissionCI, CPUJointBoundRanksUseOriginalNodeAndPhysicalSocketIdentity) {
+    for(int population=2;population<=8;++population) {
+        auto cell=recordedSocketCell(population);auto original=originalSocketRecords(population);
+        EXPECT_NO_THROW(requireOriginalCPUJointSocketRanks(cell,original));
+        std::reverse(original.ranks.begin(),original.ranks.end());
+        EXPECT_NO_THROW(requireOriginalCPUJointSocketRanks(cell,original));
+    }
+    const auto cell=recordedSocketCell(2);const auto original=originalSocketRecords(2);
+    for(int mutation=0;mutation<10;++mutation) {
+        auto bad=original;
+        switch(mutation) {
+        case 0:bad.ranks.pop_back();break;
+        case 1:bad.ranks[1].rank=0;break;
+        case 2:bad.ranks[1].cpu.numa_node=0;break;
+        case 3:bad.ranks[1].node_id=8;bad.ranks[1].hostname=bad.ranks[0].hostname;break;
+        case 4:bad.ranks[1].cpu_socket_info[1].socket_id=bad.ranks[1].cpu_socket_info[0].socket_id;break;
+        case 5:bad.ranks[1].cpu_socket_info[1].numa_node=0;break;
+        case 6:bad.ranks[1].cpu_socket_info.clear();break;
+        case 7:bad.ranks[1].cpu_socket_info[1].socket_id=-1;break;
+        case 8:bad.ranks[1].node_id=-1;break;
+        case 9:bad.ranks[1].cpu.type=llaminar2::DeviceType::ROCm;break;
+        }
+        EXPECT_THROW(requireOriginalCPUJointSocketRanks(cell,bad),std::invalid_argument)<<mutation;
+    }
+    auto missing=cell;missing.topology.participants.pop_back();
+    EXPECT_THROW(qwen4ExpCPUJointSocketMembers(missing),std::invalid_argument);
+    auto duplicate=cell;duplicate.topology.participants.push_back(duplicate.topology.participants.back());
+    EXPECT_THROW(qwen4ExpCPUJointSocketMembers(duplicate),std::invalid_argument);
+}
+
+/** @test The actual native hardware publisher projects only original unambiguous socket facts. */
+TEST(Qwen4ExpSourceAdmissionCI, CPUJointNativeSocketProjectionPreservesOriginalFacts) {
+    auto facts=originalSocketRecords(2).ranks.front().cpu_socket_info;
+    EXPECT_EQ(qwen4ExpOriginalSocketForNUMA(facts,0),std::optional<int>{11});
+    EXPECT_EQ(qwen4ExpOriginalSocketForNUMA(facts,1),std::optional<int>{14});
+    EXPECT_FALSE(qwen4ExpOriginalSocketForNUMA(facts,9));
+    EXPECT_FALSE(qwen4ExpOriginalSocketForNUMA(facts,-1));
+    facts.push_back(facts.front());EXPECT_FALSE(qwen4ExpOriginalSocketForNUMA(facts,0));
+    facts.pop_back();facts.front().socket_id=-1;EXPECT_FALSE(qwen4ExpOriginalSocketForNUMA(facts,0));
+    facts.front().socket_id=0;EXPECT_EQ(qwen4ExpOriginalSocketForNUMA(facts,0),std::optional<int>{0});
+}
+
+/** @test Recorded original participant roles owe exact counts; no new source/native topology is claimed. */
+TEST(Qwen4ExpSourceAdmissionCI, CPUJointSourceObservationCountUsesOriginalLocalMembership) {
+    const auto cell=qwen4ExpCPUJointWorld2SourceAdmissionCases().front();
+    auto plan=*cell.topology.expert_overlay_plan;
+    // This generic observer input includes an ORIGINAL declared GPU-only rank,
+    // not an out-of-range integer or a native launch on this two-socket host.
+    plan.domains.front().owner_rank=2;plan.domains.front().world_ranks={2};
+    const auto members=llaminar2::MoEExpertOwnerMap::declaredParticipants(plan,{.reject_tensor_sharded_domains=false});
+    ASSERT_TRUE(std::any_of(members.begin(),members.end(),[](const auto& participant){
+        return participant.world_rank==2 && participant.address.isGPU();}));
+    for(int layer=0;layer<3;++layer) {
+        llaminar2::RoutedExpertLayerPlacement row;row.layer=layer;
+        row.routed_expert_tier.assign(512,1);
+        std::fill_n(row.routed_expert_tier.begin(),plan.routed_tiers.front().max_experts_per_layer,0);
+        plan.placements.push_back(std::move(row));
+    }
+    EXPECT_EQ(qwen4ExpCPUJointSourceExpectedLayerObservations(plan,members,0),3u);
+    EXPECT_EQ(qwen4ExpCPUJointSourceExpectedLayerObservations(plan,members,1),3u);
+    EXPECT_EQ(qwen4ExpCPUJointSourceExpectedLayerObservations(plan,members,2),0u);
+    auto unresolved=members;
+    for(auto& participant:unresolved)if(participant.address.isCPU())participant.world_rank_known=false;
+    EXPECT_THROW(qwen4ExpCPUJointSourceExpectedLayerObservations(plan,unresolved,0),std::invalid_argument);
+    EXPECT_THROW(qwen4ExpCPUJointSourceExpectedLayerObservations(plan,members,-1),std::invalid_argument);
+    auto whole=plan;whole.domains.back().routed_compute_policy=llaminar2::RoutedExpertComputePolicy::Apportioned;
+    EXPECT_EQ(qwen4ExpCPUJointSourceExpectedLayerObservations(whole,members,0),0u);
+    EXPECT_EQ(qwen4ExpCPUJointSourceExpectedLayerObservations(whole,members,1),0u);
+    plan.placements.clear();EXPECT_EQ(qwen4ExpCPUJointSourceExpectedLayerObservations(plan,members,0),0u);
+}

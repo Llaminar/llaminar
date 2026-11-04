@@ -6,9 +6,12 @@
  * metadata. They never discover hardware, read tensor payloads, allocate model
  * state, or substitute a requested topology after admission. Explicit CPU NUMA
  * identities remain distinct even though kernel DeviceId conversion drops NUMA.
+ * Distributed CPU expert ownership is verified from each original domain's
+ * declared ranks; a follower's CPU control endpoint is not its fragment address.
  */
 #pragma once
 #include "Qwen4ExpSourceAdmissionCases.h"
+#include "Qwen4ExpCPUJointSocketEvidence.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "execution/mpi_orchestration/ExecutionPlanBuilder.h"
 #include "execution/moe/MoEExpertOverlayAuthorityPlan.h"
@@ -694,14 +697,37 @@ inline void requireQwen4ExpSourceExecutionPlan(const ModelParityCase &cell, int 
 {
     if (rank < 0 || rank >= cell.topology.mpi_ranks || actual.rank != rank)
         throw std::invalid_argument("QFN source admission plan changed owning rank");
-    if (cell.topology.mpi_ranks != 1)
+    const auto cpu_joint_members = qwen4ExpCPUJointSocketMembers(cell);
+    const bool cpu_joint = !cpu_joint_members.empty();
+    if (cell.topology.mpi_ranks != 1 && !cpu_joint)
         throw std::invalid_argument("QFN gold-free plan proof requires a reviewed rank-local topology");
     const auto expected = canonicalQwen4ExpSourceAdmissionConfig(authored, rank);
     const auto domains = expected.executionDomainDefinitions();
-    if (actual.my_domains.size() != domains.size())
-        throw std::invalid_argument("QFN actual execution domain inventory has a different extent");
+    std::size_t local_domain_count = 0;
     for (const auto &domain : domains)
     {
+        int original_index = 0;
+        if (cpu_joint)
+        {
+            if (domain.scope == ExecutionDomainScope::SINGLE)
+            {
+                if (!domain.owner_rank || domain.participants.size() != 1)
+                    throw std::invalid_argument("QFN original singleton domain lost its owning rank");
+                if (*domain.owner_rank != rank) continue;
+            }
+            else if (domain.scope == ExecutionDomainScope::NODE_LOCAL)
+            {
+                if (domain.ranks.size() != domain.participants.size())
+                    throw std::invalid_argument("QFN original CPU domain lost explicit rank membership");
+                const auto member = std::find(domain.ranks.begin(), domain.ranks.end(), rank);
+                if (member == domain.ranks.end()) continue;
+                if (std::count(domain.ranks.begin(), domain.ranks.end(), rank) != 1)
+                    throw std::invalid_argument("QFN original CPU domain repeats its owning rank");
+                original_index = static_cast<int>(member - domain.ranks.begin());
+            }
+            else throw std::invalid_argument("QFN CPU-joint plan proof has an unreviewed domain scope");
+        }
+        ++local_domain_count;
         const auto found = std::find_if(actual.my_domains.begin(), actual.my_domains.end(), [&](const auto &value) {
             return value.domain_name == domain.name;
         });
@@ -713,7 +739,11 @@ inline void requireQwen4ExpSourceExecutionPlan(const ModelParityCase &cell, int 
         requireQwen4ExpSourceEndpoints(domain.participants, found->devices, actual.hostname, hardware);
         if (found->weights != domain.weights || found->backend != domain.backend)
             throw std::invalid_argument("QFN actual execution domain changed weights or collective");
+        if (cpu_joint && found->my_index_in_domain != original_index)
+            throw std::invalid_argument("QFN actual CPU-joint domain changed original participant position");
     }
+    if (actual.my_domains.size() != local_domain_count)
+        throw std::invalid_argument("QFN actual execution domain inventory has a different extent");
     if (!actual.has_embedding || !actual.has_lm_head)
         throw std::invalid_argument("QFN actual rank-local plan lost embedding or LM-head source ownership");
     if (actual.first_layer != 0 || actual.last_layer != cell.model.transformer_layers - 1)
@@ -759,6 +789,17 @@ inline void requireQwen4ExpSourceExecutionPlan(const ModelParityCase &cell, int 
     if (!actual.local_pp_devices.empty() || !actual.local_pp_layer_boundaries.empty() ||
         !actual.local_pp_stage_tp_info.empty())
         throw std::invalid_argument("QFN non-PP source admission acquired an unintended pipeline");
+    if (cpu_joint && !qwen4ExpCPUJointSourceHasContinuation(cell, rank))
+    {
+        // ResolvedRankOrchestration preserves a CPU control endpoint for an
+        // expert-only follower. The original domain membership above proves its
+        // physical NUMA fragment; the control endpoint cannot replace that proof.
+        if (!actual.primary_device.isCPU() || actual.primary_device.device_ordinal != 0 ||
+            !actual.local_tp_devices.empty() || !actual.local_tp_weights.empty() ||
+            actual.local_tp_backend != CollectiveBackendType::AUTO)
+            throw std::invalid_argument("QFN CPU-joint follower acquired a continuation graph");
+        return;
+    }
     if (expected.moe_routed_expert_plan)
     {
         const auto &name = expected.moe_routed_expert_plan->continuation_domain;

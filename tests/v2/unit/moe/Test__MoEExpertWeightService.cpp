@@ -25,6 +25,10 @@
 #include "backends/DeviceId.h"
 #include "backends/BackendManager.h"
 #include "utils/TestTensorFactory.h"
+#include "utils/CPUPreparedStoreTestAdmission.h"
+#include "utils/GpuPreparedGemmHarness.h"
+#include "backends/GPUDeviceContextPool.h"
+#include <array>
 
 #include <algorithm>
 #include <cstdint>
@@ -144,6 +148,15 @@ namespace
             const PhysicalMemoryResource host{0, device_id, 1u << 25, 1u << 25};
             plan.add(host, PhysicalMemoryOwner::PrimaryModelWeights, 1u << 22);
             plan.add(host, PhysicalMemoryOwner::ExpertMigrationStaging, 1u << 22);
+            // Same canonical immediate-packer quote; one PMA source transaction
+            // serializes these setup workers, so only its actual maximum lives.
+            size_t staging=0;
+            for(const auto& parent:{gate_3d,up_3d,down_3d})for(size_t expert=0;expert<kNumExperts;++expert) {
+                const auto matrix=parent->create_view({parent->shape()[1],parent->shape()[0]},
+                    expert*parent->shape()[0]*parent->shape()[1]);
+                staging=std::max(staging,cpuPreparedStoreTestStagingBytes(*matrix));
+            }
+            plan.add(host,PhysicalMemoryOwner::WeightLoadStaging,staging);
             prepared_store->installPhysicalMemoryAuthority(
                 std::make_shared<PhysicalMemoryAuthority>(
                     std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0));
@@ -206,24 +219,9 @@ namespace
                 &gpu_direct_slot_pool,
                 CPUExpertNUMAPlacement::aggregateDomain(),
                 MoEExpertWeightResolutionPolicy::RawOrPrepared,
-                {},
                 PhysicalMemoryOwner::PrimaryModelWeights};
         }
     };
-
-    bool hasGPU()
-    {
-        return hasROCmBackend() || hasCUDABackend();
-    }
-
-    DeviceId firstGPU()
-    {
-        if (hasROCmBackend())
-            return DeviceId(DeviceType::ROCm, 0);
-        if (hasCUDABackend())
-            return DeviceId(DeviceType::CUDA, 0);
-        return DeviceId::cpu();
-    }
 
     /**
      * @brief Build a rank-bound authority for a cache-only GPU lifecycle test.
@@ -563,9 +561,12 @@ TEST(Test__MoEExpertWeightService, CPUPredictorWarmupReusesCanonicalResidencyBan
         SCOPED_TRACE(apportioned);
         const auto count = apportioned ? kNumExperts / 2 : kNumExperts;
         const auto exact = static_cast<std::size_t>(count) * (2u * gate.persistent_bytes + down.persistent_bytes);
-        const PhysicalMemoryResource resource{0, DeviceId::cpu(), exact, exact};
+        const auto staging=std::max(gate.temporary_bytes,down.temporary_bytes);
+        const PhysicalMemoryResource resource{0, DeviceId::cpu(), exact+staging, exact+staging};
         PhysicalMemoryPlanBuilder bill;
         bill.add(resource, PhysicalMemoryOwner::RoutedExpertWeights, exact);
+        // Synchronous source preparation shares the original PMA transaction.
+        bill.add(resource, PhysicalMemoryOwner::WeightLoadStaging, staging);
         auto authority = std::make_shared<PhysicalMemoryAuthority>(
             std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(bill.build()), 0);
         {
@@ -2262,15 +2263,12 @@ TEST(Test__MoEExpertWeightService, RegisterAndPrepareNewExperts_NoNewExperts)
     }
 }
 
-TEST(Test__MoEExpertWeightService, GPURebalanceRequiresPayloadWhenCacheMissing)
+/** @brief Cold backend-tagged cache/ownership contracts; no native allocation or execution occurs. */
+class MoEExpertWeightServiceGPUCacheContract:public ::testing::TestWithParam<DeviceType>{};
+TEST_P(MoEExpertWeightServiceGPUCacheContract, GPURebalanceRequiresPayloadWhenCacheMissing)
 {
-    if (!hasGPU())
-    {
-        GTEST_SKIP() << "No GPU backend available";
-    }
-
     TestWeightContextOwner owner;
-    owner.device_id = firstGPU();
+    owner.device_id=GetParam()==DeviceType::CUDA?DeviceId::cuda(0):DeviceId::rocm(0);
     owner.expert_mask = {true, false, false, false};
     owner.prepared_gate_gemm.assign(kNumExperts, nullptr);
     owner.prepared_up_gemm.assign(kNumExperts, nullptr);
@@ -2297,49 +2295,65 @@ TEST(Test__MoEExpertWeightService, GPURebalanceRequiresPayloadWhenCacheMissing)
     EXPECT_EQ(owner.prepared_down_gemm[1], nullptr);
 }
 
-TEST(Test__MoEExpertWeightService, GPURebalanceResolvesStoreSlabsWhenCachedRefsMissing)
+/** @test Backend-tagged original slab identity resolves without native engine fabrication. */
+TEST_P(MoEExpertWeightServiceGPUCacheContract, OriginalSlabMetadataResolvesWithoutCachedRefs)
 {
-    if (!hasGPU())
-    {
-        GTEST_SKIP() << "No GPU backend available";
-    }
-
-    TestWeightContextOwner owner;
-    owner.device_id = firstGPU();
-    owner.prepared_gate_gemm.assign(kNumExperts, nullptr);
-    owner.prepared_up_gemm.assign(kNumExperts, nullptr);
-    owner.prepared_down_gemm.assign(kNumExperts, nullptr);
-
+    const auto device=GetParam()==DeviceType::CUDA?DeviceId::cuda(0):DeviceId::rocm(0);
     PreparedWeightStore store(ModelContextId{10});
-    store.installPhysicalMemoryAuthority(
-        noAllocationAuthority(owner.device_id));
-    owner.prepared_store = &store;
-
-    auto gate_ref = store.registerExpertSlab(makeGpuStoreDesc(owner.device_id, WeightRole::MoEExpertGate));
-    auto up_ref = store.registerExpertSlab(makeGpuStoreDesc(owner.device_id, WeightRole::MoEExpertUp));
-    auto down_ref = store.registerExpertSlab(makeGpuStoreDesc(owner.device_id, WeightRole::MoEExpertDown));
-    populateOneExpert(store, gate_ref, 1, fakeGemm(1));
-    populateOneExpert(store, up_ref, 1, fakeGemm(101));
-    populateOneExpert(store, down_ref, 1, fakeGemm(201));
-
-    std::vector<bool> new_mask = {false, true, false, false};
-    auto ctx = owner.buildContext();
-    ASSERT_FALSE(ctx.gate_slab_ref.has_value());
-    ASSERT_FALSE(ctx.up_slab_ref.has_value());
-    ASSERT_FALSE(ctx.down_slab_ref.has_value());
-
-    ASSERT_TRUE(MoEExpertWeightService::registerAndPrepareNewExperts(ctx, new_mask, nullptr));
-
-    EXPECT_EQ(owner.prepared_gate_gemm[1], fakeGemm(1));
-    EXPECT_EQ(owner.prepared_up_gemm[1], fakeGemm(101));
-    EXPECT_EQ(owner.prepared_down_gemm[1], fakeGemm(201));
-    ASSERT_TRUE(ctx.gate_slab_ref.has_value());
-    ASSERT_TRUE(ctx.up_slab_ref.has_value());
-    ASSERT_TRUE(ctx.down_slab_ref.has_value());
-    EXPECT_EQ(ctx.gate_slab_ref->slab_id, gate_ref.slab_id);
-    EXPECT_EQ(ctx.up_slab_ref->slab_id, up_ref.slab_id);
-    EXPECT_EQ(ctx.down_slab_ref->slab_id, down_ref.slab_id);
+    store.installPhysicalMemoryAuthority(noAllocationAuthority(device));
+    for(const auto role:{WeightRole::MoEExpertGate,WeightRole::MoEExpertUp,WeightRole::MoEExpertDown}) {
+        const auto descriptor=makeGpuStoreDesc(device,role);
+        const auto original=store.registerExpertSlab(descriptor);
+        const auto found=store.findExpertSlab(descriptor);
+        ASSERT_TRUE(found);EXPECT_EQ(*found,original);
+        EXPECT_EQ(store.expertGemmKernel(*found,1),nullptr);
+        auto foreign=descriptor;foreign.layer_idx=1;
+        EXPECT_FALSE(store.findExpertSlab(foreign));
+    }
 }
+
+/** @brief Explicit native-only actual pipeline coverage; excluded from the Unit registration. */
+class MoEExpertWeightServiceNativeCacheContract:public ::testing::TestWithParam<DeviceType>{};
+/** @test Actual GPU-owned engines reuse exact original Store slots without a second source/allocation. */
+TEST_P(MoEExpertWeightServiceNativeCacheContract, GPURebalanceResolvesStoreSlabsWhenCachedRefsMissing)
+{
+    const auto device=GetParam()==DeviceType::CUDA?DeviceId::cuda(0):DeviceId::rocm(0);
+    auto& native=GPUDeviceContextPool::instance().getContext(device);
+    native.submitAndWait([&] {
+        TestWeightContextOwner owner;owner.device_id=device;
+        owner.prepared_gate_gemm.assign(kNumExperts,nullptr);
+        owner.prepared_up_gemm.assign(kNumExperts,nullptr);
+        owner.prepared_down_gemm.assign(kNumExperts,nullptr);
+        std::vector<GpuPreparedGemm> actual;actual.reserve(3);
+        PreparedWeightStore store(ModelContextId{10});
+        const auto authority=noAllocationAuthority(device);store.installPhysicalMemoryAuthority(authority);
+        owner.prepared_store=&store;
+        auto ctx=owner.buildContext();ASSERT_TRUE(MoEExpertWeightService::extractExpertViews(ctx));
+        const std::array<WeightRole,3> roles{WeightRole::MoEExpertGate,WeightRole::MoEExpertUp,WeightRole::MoEExpertDown};
+        const std::array<std::shared_ptr<TensorBase>,3> source{owner.expert_gate_views[1],owner.expert_up_views[1],owner.expert_down_views[1]};
+        std::array<ExpertSlabRef,3> original;
+        for(size_t i=0;i<roles.size();++i) {
+            actual.push_back(makeGpuPreparedGemm(source[i].get(),device,"test.service.cache."+std::to_string(i),ModelContextId{9900+i}));
+            ASSERT_NE(actual.back().kernel,nullptr);
+            original[i]=store.registerExpertSlab(makeGpuStoreDesc(device,roles[i]));
+            ExpertArrival arrival;arrival.expert_id=1;arrival.engine=actual.back().kernel;
+            arrival.engine_lifetime=actual.back().store->gemmKernelLifetime(actual.back().ref);
+            ASSERT_TRUE(arrival.engine_lifetime);arrival.derivation=WeightDerivationKind::RebalancedExpertReplica;
+            store.registerArrivedExperts(original[i],{arrival});
+        }
+        ASSERT_FALSE(ctx.gate_slab_ref);ASSERT_FALSE(ctx.up_slab_ref);ASSERT_FALSE(ctx.down_slab_ref);
+        const std::vector<bool> new_mask{false,true,false,false};
+        ASSERT_TRUE(MoEExpertWeightService::registerAndPrepareNewExperts(ctx,new_mask,nullptr));
+        EXPECT_EQ(owner.prepared_gate_gemm[1],actual[0].kernel);
+        EXPECT_EQ(owner.prepared_up_gemm[1],actual[1].kernel);
+        EXPECT_EQ(owner.prepared_down_gemm[1],actual[2].kernel);
+        ASSERT_TRUE(ctx.gate_slab_ref);ASSERT_TRUE(ctx.up_slab_ref);ASSERT_TRUE(ctx.down_slab_ref);
+        EXPECT_EQ(*ctx.gate_slab_ref,original[0]);EXPECT_EQ(*ctx.up_slab_ref,original[1]);EXPECT_EQ(*ctx.down_slab_ref,original[2]);
+        for(const auto& line:authority->rankAttestation())EXPECT_EQ(line.materialized_new_bytes,0u);
+    });
+}
+INSTANTIATE_TEST_SUITE_P(CUDAAndROCm,MoEExpertWeightServiceNativeCacheContract,
+    ::testing::Values(DeviceType::CUDA,DeviceType::ROCm));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Full lifecycle: extract → prepare → release → rebalance
@@ -2455,12 +2469,13 @@ TEST(Test__MoEExpertWeightService, GpuDirectTransferSlotStagingUsesSourceDescrip
  */
 TEST(Test__MoEExpertWeightService, BorrowedArrivalReusesPhysicalOwnerAndArchiveRequiresAdmission)
 {
-    auto make_authority = [](size_t persistent, size_t staging)
+    auto make_authority = [](size_t persistent, size_t staging, size_t source_staging=0)
     {
         PhysicalMemoryPlanBuilder plan;
         const PhysicalMemoryResource host{0, DeviceId::cpu(), 1u << 25, 1u << 25};
         plan.add(host, PhysicalMemoryOwner::PrimaryModelWeights, persistent);
         plan.add(host, PhysicalMemoryOwner::ExpertMigrationStaging, staging);
+        plan.add(host, PhysicalMemoryOwner::WeightLoadStaging, source_staging);
         return std::make_shared<PhysicalMemoryAuthority>(
             std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0);
     };
@@ -2471,7 +2486,10 @@ TEST(Test__MoEExpertWeightService, BorrowedArrivalReusesPhysicalOwnerAndArchiveR
             bytes += line.materialized_new_bytes;
         return bytes;
     };
-    const auto authority = make_authority(1u << 22, 1u << 22);
+    const auto source_staging=std::max(
+        CPUWeightPreparationMemory::sourceNative("Q4_0",kExpertIntermediate,kDModel).temporary_bytes,
+        CPUWeightPreparationMemory::sourceNative("Q4_0",kDModel,kExpertIntermediate).temporary_bytes);
+    const auto authority = make_authority(1u << 22, 1u << 22,source_staging);
     PreparedWeightStore source_store;
     source_store.installPhysicalMemoryAuthority(authority);
     TestWeightContextOwner source;
@@ -2540,3 +2558,6 @@ TEST(Test__MoEExpertWeightService, BorrowedArrivalReusesPhysicalOwnerAndArchiveR
     EXPECT_EQ(destination.prepared_up_gemm[1], nullptr);
     EXPECT_EQ(destination.prepared_down_gemm[1], nullptr);
 }
+
+INSTANTIATE_TEST_SUITE_P(CUDAAndROCm,MoEExpertWeightServiceGPUCacheContract,
+    ::testing::Values(DeviceType::CUDA,DeviceType::ROCm));

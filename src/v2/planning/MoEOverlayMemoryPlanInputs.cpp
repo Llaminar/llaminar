@@ -17,9 +17,62 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <set>
+#include "execution/moe/MoEExpertOwnerMap.h"
+#include "execution/moe/MoEOverlayNoPeerResidency.h"
 
 namespace llaminar2
 {
+std::vector<PhysicalMemoryResource> originalMoEOverlayNativePreparationResources(
+    const MoEExpertOverlayExecutionPlan& execution,const ClusterInventory& inventory,
+    const OrchestrationConfig& config,const MoEOverlayCapacityAdmissionPolicy& policy,
+    const ImmutableRowTablePolicy& ngram)
+{
+    const auto* overlay=config.moe_routed_expert_plan.get();
+    if(!overlay || !overlay->usesExpertOverlayAuthority() || execution.world_size<=0 ||
+       inventory.world_size!=execution.world_size || inventory.ranks.size()!=size_t(execution.world_size) ||
+       execution.rank_plans.size()!=size_t(execution.world_size))
+        throw std::invalid_argument("Native overlay registry requires original complete execution/inventory/policy");
+    const bool host_owner=policy.usesPhysicalResidencyFabric() || MoEExpertOwnerMap::usesCPUJointFragments(*overlay) ||
+        (overlay->authority_execution==MoEOverlayAuthorityExecutionKind::HostResident &&
+         config.moe_rebalance.mode==MoERebalanceRuntimeMode::Dynamic && !MoEOverlayNoPeerResidency::hasNoPeerTopology(*overlay));
+    std::set<std::pair<int,DeviceId>> selected;
+    std::set<int> ranks;
+    for(const auto& rank:execution.rank_plans){
+        if(rank.world_rank<0 || rank.world_rank>=execution.world_size || !ranks.insert(rank.world_rank).second)
+            throw std::invalid_argument("Native overlay registry has foreign or duplicate rank ownership");
+        if(host_owner || !rank.local_devices.empty())selected.emplace(rank.world_rank,DeviceId::cpu());
+        for(const auto device:rank.local_devices){
+            if(!device.is_valid() || (!device.is_cpu() && !device.is_gpu()))
+                throw std::invalid_argument("Native overlay registry has an invalid declared device");
+            selected.emplace(rank.world_rank,device);
+        }
+    }
+    if(ngram.isGPUAdaptive())for(const auto& participant:ngram.gpu_adaptive.placement.declaredParticipants()){
+        if(participant.world_rank<0 || participant.world_rank>=execution.world_size || !participant.device().is_gpu())
+            throw std::invalid_argument("Native overlay storage registry has a foreign declared participant");
+        selected.emplace(participant.world_rank,DeviceId::cpu());selected.emplace(participant.world_rank,participant.device());
+    }
+    std::vector<PhysicalMemoryResource> result;result.reserve(selected.size());
+    for(const auto& [rank,device]:selected){
+        const auto& observed=inventory.getRank(rank);
+        if(observed.rank!=rank)throw std::invalid_argument("Native overlay registry changed original rank observations");
+        std::uint64_t total=0,available=0;
+        if(device.is_cpu()){
+            total=observed.cpu.memory_bytes?observed.cpu.memory_bytes:observed.cpu_memory_bytes;
+            available=observed.cpu.free_memory_bytes;
+        }else{
+            const auto gpu=std::find_if(observed.gpus.begin(),observed.gpus.end(),[&](const auto& g){return g.type==device.type && g.local_device_id==device.ordinal;});
+            if(gpu==observed.gpus.end())throw std::invalid_argument("Native overlay registry device is absent from original rank inventory");
+            total=gpu->memory_bytes;available=gpu->free_memory_bytes;
+        }
+        PhysicalMemoryResource resource{rank,device,total,PhysicalMemoryAuthority::admissionCapacity(available,config.memoryLimitBytes(device.type))};
+        if(!resource.valid())throw std::invalid_argument("Native overlay registry has incomplete original capacity");
+        result.push_back(resource);
+    }
+    return result;
+}
+
 MoEOverlayMemoryPlanInputs buildMoEOverlayMemoryPlanInputs(
     const MoEOverlayMemoryPlanInputRequest &request, int resident_prefill_rows)
 {
@@ -189,7 +242,8 @@ MoEOverlayMemoryPlanInputs buildMoEOverlayMemoryPlanInputs(
             .captured_graph_plan = captured,
             .graph_snapshot_memory = request.snapshot_capacity,
             .gpu_weight_load = request.gpu_weight_load,
-            .graph_family = family},
+            .graph_family = family, .original_expert_manifest=request.original_expert_manifest,
+            .weight_precision=request.weight_precision,.native_source_placement=request.native_source_placement},
         .prefill_segment_rows = segment_rows,
         .model_graph_identity_count = graph_identities};
 }

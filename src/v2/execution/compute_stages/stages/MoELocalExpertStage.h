@@ -22,6 +22,7 @@
  */
 
 #pragma once
+#include "../../../loaders/ExpertGemmRegistry.h"
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
@@ -339,6 +340,19 @@ namespace llaminar2
             return cpu_canonical_routes_;
         }
 
+        /** @return Exact immutable joint root declaration, absent for ordinary CPU1 execution. */
+        const CPUJointExpertRouteStorageLayout *cpuJointLayout() const noexcept {
+            return cpu_storage_layout_ && cpu_storage_layout_->jointRoutes()?&*cpu_storage_layout_->jointRoutes():nullptr;
+        }
+        /** @return Same serial packed producer/receive bank for every mutually exclusive layer. */
+        const std::shared_ptr<FP32Tensor>& cpuJointPackedRecords() const noexcept {return cpu_joint_packed_;}
+        /** @return Original root-only source range scratch; contributors return an empty span. */
+        std::span<RootedFloatRecordRange> cpuJointSourceRanges() noexcept {return {cpu_joint_ranges_.data(),cpu_joint_ranges_.size()};}
+        /** @return Original root-only route map scratch. */
+        std::span<int32_t> cpuJointRouteMaps() noexcept {return {cpu_joint_maps_.data(),cpu_joint_maps_.size()};}
+        /** @return Original root-only required-route scratch. */
+        std::span<float> cpuJointRequiredRoutes() noexcept {return {cpu_joint_required_.data(),cpu_joint_required_.size()};}
+
         /**
          * @brief Return the publication bank prebound to one GPU consumer.
          *
@@ -383,6 +397,11 @@ namespace llaminar2
         size_t allocation_bytes_ = 0;
         size_t pinned_transfer_bytes_ = 0;
         std::vector<TensorFamily> families_;
+        std::shared_ptr<const CPUSerialExpertStorageLayout> cpu_storage_layout_; ///< Original frozen declaration, not an allocation ledger.
+        std::shared_ptr<FP32Tensor> cpu_joint_packed_; ///< Sole packed native producer/receive root for this serial participant.
+        AlignedVector<RootedFloatRecordRange> cpu_joint_ranges_;
+        AlignedVector<int32_t> cpu_joint_maps_;
+        AlignedVector<float> cpu_joint_required_;
         std::shared_ptr<FP32Tensor> cpu_canonical_routes_; ///< Cached maximum-capacity raw rows shared by serial CPU families.
         /** Distinct TransferEngine publication bank consumed by one GPU. */
         std::shared_ptr<MappedHostTransferRegion>
@@ -415,6 +434,24 @@ namespace llaminar2
          * and writes the result into the source GPU's canonical route slot.
          * Timeline publication remains outside this stage.
          */
+        /**
+         * @brief Original graph-owned packed down-partial bank for the explicit CPU cohort collective.
+         *
+         * This producer never applies weights or publishes a return signal.
+         * The following rooted collective owns completion and the original
+         * channel publishes only after that closed witness exists.
+         */
+        struct CPUJointRouteProducerBinding {
+            std::shared_ptr<FP32Tensor> packed_rows;
+            const int32_t *original_route_slots=nullptr;
+            const int32_t *compact_route_slots=nullptr;
+            size_t route_slot_capacity=0;
+            /** Immutable scheduling borrow only. The following explicit collective alone owns publication. */
+            std::shared_ptr<const MoEOverlayCanonicalRouteReturnTicketStorage> deferred_canonical_ticket;
+            /** @return Whether all original setup-owned roots and capacity exist. */
+            bool valid()const noexcept{return packed_rows && original_route_slots && compact_route_slots && route_slot_capacity>0;}
+        };
+
         struct CPUCanonicalRouteReturnBinding
         {
             const int32_t *original_route_slots = nullptr; ///< `[route_slot_capacity]` source-graph slot identities.
@@ -516,6 +553,7 @@ namespace llaminar2
              */
             std::optional<CPUCanonicalRouteReturnBinding>
                 cpu_canonical_route_return;
+            std::optional<CPUJointRouteProducerBinding> cpu_joint_route_producer; ///< Explicit unweighted fragment producer; not a return authority.
             /** Optional same-rank CPU-to-GPU compact canonical return ticket. */
             std::optional<CPUCanonicalRouteTicketReturnBinding>
                 cpu_canonical_route_ticket_return;
@@ -613,6 +651,8 @@ namespace llaminar2
             std::vector<std::shared_ptr<TensorBase>> expert_down_views;
             /// Keeps MoE batch-constructed kernel objects alive alongside the stage.
             std::vector<std::shared_ptr<ITensorGemm>> moe_owned_kernels;
+            /** Original selected source triplets and native engines; never a whole-owner alias. */
+            std::shared_ptr<const MoEOverlayParticipantResidencyRegistry::CPUJointLayer> cpu_joint_layer;
             /// Retains backend-native packed slabs when ownership is stage-local.
             std::shared_ptr<void> moe_packed_gate_lifetime;
             std::shared_ptr<void> moe_packed_up_lifetime;
@@ -763,8 +803,11 @@ namespace llaminar2
         manualGraphBoundaryScheduling() const noexcept override
         {
             return params_.device_id.is_cpu() &&
-                           params_.cpu_canonical_route_ticket_return &&
-                           params_.cpu_canonical_route_ticket_return->valid()
+                           ((params_.cpu_canonical_route_ticket_return &&
+                             params_.cpu_canonical_route_ticket_return->valid()) ||
+                            (params_.cpu_joint_route_producer &&
+                             params_.cpu_joint_route_producer->deferred_canonical_ticket &&
+                             params_.cpu_joint_route_producer->deferred_canonical_ticket->hasValidBoundIdentity()))
                        ? ManualGraphBoundaryScheduling::ConcurrentTicketService
                        : ManualGraphBoundaryScheduling::BetweenExecutableLaunches;
         }
@@ -772,8 +815,8 @@ namespace llaminar2
         ConcurrentManualFailureRole
         concurrentManualFailureRole() const noexcept override
         {
-            return manualGraphBoundaryScheduling() ==
-                           ManualGraphBoundaryScheduling::ConcurrentTicketService
+            return params_.cpu_canonical_route_ticket_return &&
+                           manualGraphBoundaryScheduling() == ManualGraphBoundaryScheduling::ConcurrentTicketService
                        ? ConcurrentManualFailureRole::DeviceIngressPublisher
                        : ConcurrentManualFailureRole::None;
         }
@@ -976,6 +1019,7 @@ namespace llaminar2
         {
             return params_.return_layout == MoEOverlayReturnLayout::CanonicalExpertRoutes ||
                    params_.cpu_canonical_route_return.has_value() ||
+                   params_.cpu_joint_route_producer.has_value() ||
                    params_.cpu_canonical_route_ticket_return.has_value();
         }
         /**

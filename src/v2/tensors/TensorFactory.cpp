@@ -314,58 +314,79 @@ namespace llaminar2
     std::unique_ptr<TensorBase> TensorFactory::createQuantizedOwned(
         TensorType type,
         const std::vector<size_t> &shape,
-        AlignedVector<uint8_t> raw_data)
+        AlignedVector<uint8_t> raw_data,DeviceId original_allocator)
     {
         if (numa_node_ >= 0)
             bindToNumaNode();
 
+        return adoptQuantizedFinalStorage(type,shape,std::move(raw_data),original_allocator);
+    }
+
+    std::unique_ptr<TensorBase> TensorFactory::adoptQuantizedFinalStorage(
+        TensorType type,const std::vector<size_t>& shape,AlignedVector<uint8_t> raw_data,DeviceId original_allocator)
+    {
+        if(!original_allocator.is_valid() || !original_allocator.is_cpu())
+            throw std::invalid_argument("Final native tensor requires its original valid CPU allocator");
         switch (type)
         {
         case TensorType::IQ4_NL:
-            return std::make_unique<IQ4_NLTensor>(shape, std::move(raw_data));
+            return std::make_unique<IQ4_NLTensor>(shape, std::move(raw_data),original_allocator);
+        case TensorType::Q8_1:
+            return Q8_1Tensor::adoptImmutableCPUStorage(shape,std::move(raw_data),original_allocator);
         case TensorType::Q8_0:
-            return std::make_unique<Q8_0Tensor>(shape, std::move(raw_data));
+            return std::make_unique<Q8_0Tensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::Q4_0:
-            return std::make_unique<Q4_0Tensor>(shape, std::move(raw_data));
+            return std::make_unique<Q4_0Tensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::Q4_1:
-            return std::make_unique<Q4_1Tensor>(shape, std::move(raw_data));
+            return std::make_unique<Q4_1Tensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::Q5_0:
-            return std::make_unique<Q5_0Tensor>(shape, std::move(raw_data));
+            return std::make_unique<Q5_0Tensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::Q5_1:
-            return std::make_unique<Q5_1Tensor>(shape, std::move(raw_data));
+            return std::make_unique<Q5_1Tensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::Q6_K:
-            return std::make_unique<Q6_KTensor>(shape, std::move(raw_data));
+            return std::make_unique<Q6_KTensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::Q2_K:
-            return std::make_unique<Q2_KTensor>(shape, std::move(raw_data));
+            return std::make_unique<Q2_KTensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::Q5_K:
-            return std::make_unique<Q5_KTensor>(shape, std::move(raw_data));
+            return std::make_unique<Q5_KTensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::Q3_K:
-            return std::make_unique<Q3_KTensor>(shape, std::move(raw_data));
+            return std::make_unique<Q3_KTensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::Q4_K:
-            return std::make_unique<Q4_KTensor>(shape, std::move(raw_data));
+            return std::make_unique<Q4_KTensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::Q8_K:
-            return std::make_unique<Q8_KTensor>(shape, std::move(raw_data));
+            return std::make_unique<Q8_KTensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::IQ4_XS:
-            return std::make_unique<IQ4_XSTensor>(shape, std::move(raw_data));
+            return std::make_unique<IQ4_XSTensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::IQ2_XXS:
-            return std::make_unique<IQ2_XXSTensor>(shape, std::move(raw_data));
+            return std::make_unique<IQ2_XXSTensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::IQ2_XS:
-            return std::make_unique<IQ2_XSTensor>(shape, std::move(raw_data));
+            return std::make_unique<IQ2_XSTensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::IQ3_XXS:
-            return std::make_unique<IQ3_XXSTensor>(shape, std::move(raw_data));
+            return std::make_unique<IQ3_XXSTensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::IQ2_S:
-            return std::make_unique<IQ2_STensor>(shape, std::move(raw_data));
+            return std::make_unique<IQ2_STensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::IQ3_S:
-            return std::make_unique<IQ3_STensor>(shape, std::move(raw_data));
+            return std::make_unique<IQ3_STensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::IQ1_S:
-            return std::make_unique<IQ1_STensor>(shape, std::move(raw_data));
+            return std::make_unique<IQ1_STensor>(shape, std::move(raw_data),original_allocator);
         case TensorType::IQ1_M:
-            return std::make_unique<IQ1_MTensor>(shape, std::move(raw_data));
+            return std::make_unique<IQ1_MTensor>(shape, std::move(raw_data),original_allocator);
         default:
             throw std::runtime_error(
                 "TensorFactory::createQuantizedOwned: unsupported type " +
                 std::to_string(static_cast<int>(type)));
         }
+    }
+
+    void TensorFactory::visitNativeWeightWindow(TensorType type,size_t rows,size_t columns,
+        std::span<const std::byte> native_bytes,
+        const std::function<void(const TensorBase&)>& consume)
+    {
+        if(!rows || !columns || native_bytes.empty() || !consume)
+            throw std::invalid_argument("Native codec window requires exact nonempty bytes and callback");
+        auto window=borrowQuantizedNativeStorage(type,{rows,columns},
+            reinterpret_cast<const uint8_t*>(native_bytes.data()),native_bytes.size(),{});
+        consume(*window);
     }
 
     std::unique_ptr<TensorBase> TensorFactory::createQuantizedZeroCopy(
@@ -375,12 +396,21 @@ namespace llaminar2
         size_t byte_size,
         std::shared_ptr<void> mmap_lifetime_owner)
     {
+        return borrowQuantizedNativeStorage(type,shape,mmap_data,byte_size,std::move(mmap_lifetime_owner));
+    }
+
+    std::unique_ptr<TensorBase> TensorFactory::borrowQuantizedNativeStorage(
+        TensorType type,const std::vector<size_t>& shape,const uint8_t* mmap_data,
+        size_t byte_size,std::shared_ptr<void> mmap_lifetime_owner)
+    {
         // No NUMA binding needed — data lives in mmap'd memory, not heap-allocated
 
         switch (type)
         {
         case TensorType::IQ4_NL:
             return std::make_unique<IQ4_NLTensor>(shape, mmap_data, byte_size, std::move(mmap_lifetime_owner));
+        case TensorType::Q8_1:
+            return std::make_unique<Q8_1Tensor>(shape,mmap_data,byte_size,std::move(mmap_lifetime_owner));
         case TensorType::Q8_0:
             return std::make_unique<Q8_0Tensor>(shape, mmap_data, byte_size, std::move(mmap_lifetime_owner));
         case TensorType::Q4_0:

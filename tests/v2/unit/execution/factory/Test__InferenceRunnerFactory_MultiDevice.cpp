@@ -147,6 +147,51 @@ namespace
         return compact;
     }
 
+    /**
+     * @test CPU factory construction cannot bypass original-plan admission with eager payload getters.
+     *
+     * The common-loader lifecycle suite executes the admitted writer. This
+     * architecture check additionally protects the concrete GGUF factory, whose
+     * real model/device graph setup belongs to source-admission integration.
+     */
+    TEST(Test__InferenceRunnerFactory_SourceContract, CPUWeightsStartAtAdmittedPlan)
+    {
+        const auto source = readFactorySourceFile("src/v2/execution/factory/InferenceRunnerFactory.cpp");
+        const std::string signature = "static bool configureOrchestratorWeightsImpl(";
+        const auto declaration = source.find(signature);
+        ASSERT_NE(declaration, std::string::npos);
+        const auto definition = source.find(signature, declaration + signature.size());
+        ASSERT_NE(definition, std::string::npos);
+        const auto plan = source.find("auto weight_plan = buildSingleDeviceWeightPlan(", definition);
+        ASSERT_NE(plan, std::string::npos);
+        auto prelude = source.substr(definition, plan - definition);
+        const auto gpu_guard = prelude.find("if (device.is_gpu())");
+        ASSERT_NE(gpu_guard, std::string::npos);
+        const auto open = prelude.find('{', gpu_guard);
+        ASSERT_NE(open, std::string::npos);
+        size_t depth = 1;
+        size_t end = open + 1;
+        for (; end < prelude.size() && depth; ++end)
+        {
+            if (prelude[end] == '{') ++depth;
+            else if (prelude[end] == '}') --depth;
+        }
+        ASSERT_EQ(depth, 0u);
+        const auto gpu_body = withoutFactorySourceWhitespace(prelude.substr(open, end - open));
+        EXPECT_NE(gpu_body.find("getWeightForDevice(name,device,"), std::string::npos);
+        EXPECT_NE(gpu_body.find("getShardedWeightForAssignment(name,device,"), std::string::npos);
+        EXPECT_NE(gpu_body.find("forRank(graph_config.local_rank)"), std::string::npos);
+        EXPECT_EQ(gpu_body.find("DeviceId::cpu("), std::string::npos);
+        prelude.erase(gpu_guard, end - gpu_guard);
+        for (const char *bypass : {"getWeightForDevice(", "getShardedWeightForAssignment(", "hostRamPreflight("})
+            EXPECT_EQ(prelude.find(bypass), std::string::npos) << bypass;
+        const auto admission = source.find("installPreparedWeightStoreForPlan(", plan);
+        const auto materialization = source.find("weight_mgr->materialize(weight_plan)", plan);
+        ASSERT_NE(admission, std::string::npos);
+        ASSERT_NE(materialization, std::string::npos);
+        EXPECT_LT(admission, materialization);
+    }
+
     // =============================================================================
     // Mock LocalTPContext for factory tests
     // =============================================================================

@@ -5322,6 +5322,9 @@ def run_focused_exact_cell(
     owner = select_focused_exact_cell(selected, args.exact_cell)
     history = None
     if getattr(args, "history_replay", None) is not None:
+        # Preserve the registered owner/transport while binding this explicit
+        # history to its authenticated single exact case before projection.
+        owner = _single_exact_cell(owner, args.exact_cell)
         declared_sources = tuple(member for model in owner.model_files
                                  for member in _split_gguf_members(Path(model)))
         history = prepare_history_replay(args.history_replay, args.exact_cell, declared_sources)

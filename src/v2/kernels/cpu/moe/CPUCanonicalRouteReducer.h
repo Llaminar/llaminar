@@ -19,6 +19,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 namespace llaminar2::cpu::moe
 {
@@ -96,6 +97,63 @@ namespace llaminar2::cpu::moe
      */
     bool reduceCanonicalRouteRowsOrderedFMA(
         const CanonicalRouteFoldArgs &args,
+        CanonicalRouteFoldPlan *used_plan = nullptr);
+
+    /**
+     * @brief Original-route partial rows from one member of an admitted expert shard cohort.
+     * The caller orders these immutable spans by the original cohort membership;
+     * each holds only live unweighted [row,top_k,hidden] down-projection values.
+     * This is a borrowed execution input, never placement or allocation authority.
+     */
+    struct CanonicalRouteDownPartialRows
+    {
+        std::span<const float> values;
+        /// Optional original-route -> packed-record map; negative only for inactive routes.
+        std::span<const int32_t> record_for_route_slot{};
+    };
+
+    /** @brief Fixed-order partial reduction followed by the unchanged canonical top-k fold. */
+    struct CanonicalRouteDownPartialFoldArgs
+    {
+        std::span<const CanonicalRouteDownPartialRows> ordered_participants;
+        std::span<float> combined_route_rows; ///< Caller-owned existing PMA-admitted scratch.
+        const float *route_weights = nullptr;
+        float *output = nullptr;
+        int rows = 0; ///< Actual live rows, never allocation capacity; zero writes nothing.
+        int top_k = 0;
+        int columns = 0;
+    };
+
+    /** @brief Unweighted fixed-order combine, before any original top-k weighting. */
+    struct CanonicalRouteDownPartialCombineArgs {
+        std::span<const CanonicalRouteDownPartialRows> ordered_participants;
+        std::span<float> combined_route_rows;
+        const float *route_weights = nullptr; ///< Zero marks an absent original route.
+        int rows = 0;
+        int top_k = 0;
+        int columns = 0;
+    };
+    /**
+     * @brief Combine original cohort partials in FP32 participant order only.
+     * @param args Actual original-route geometry, immutable banks and admitted output.
+     * @return False before output mutation for incomplete/overlapping/malformed inputs.
+     */
+    bool combineCanonicalRouteDownPartialsOrdered(
+        const CanonicalRouteDownPartialCombineArgs &args);
+
+    /**
+     * @brief Combine each expert/route in original participant order before weighting it.
+     * @param args Complete dense original-route banks, live geometry and admitted scratch.
+     * @param used_plan Optional observation of the existing canonical fold launch geometry.
+     * @return False before any mutation for invalid extents or overlapping output/input banks.
+     *
+     * Every element adds participant0,1,... in FP32 order. Only then does the
+     * ordinary serial-row-equivalent ordered-FMA reducer apply original top-k
+     * weights. Folding local experts before adding shards is a different tree
+     * and is deliberately not implemented. No storage or worker is allocated.
+     */
+    bool reduceCanonicalRouteDownPartialsOrderedFMA(
+        const CanonicalRouteDownPartialFoldArgs &args,
         CanonicalRouteFoldPlan *used_plan = nullptr);
 
     /**

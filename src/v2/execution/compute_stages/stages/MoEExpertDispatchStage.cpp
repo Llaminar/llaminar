@@ -14,6 +14,7 @@
 #include "MoEExpertDispatchStage.h"
 
 #include "../../../execution/moe/MoEExpertOverlayProfiler.h"
+#include "../../../execution/moe/MoEExpertShardCohort.h"
 #include "../../../execution/moe/MoEOverlaySparseCollective.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/DebugEnv.h"
@@ -503,7 +504,7 @@ namespace
                 return false;
             }
             effective_tiers = &snapshot.placement_plan->routed_tiers;
-            effective_owner_map = &snapshot.owner_map;
+            effective_owner_map = &snapshot.originalOwnerMap();
             residency_epoch = snapshot.epoch;
         }
         else if (params_.residency_authority)
@@ -563,7 +564,7 @@ namespace
                 return false;
             }
             effective_tiers = &snapshot.placement_plan->routed_tiers;
-            effective_owner_map = &snapshot.owner_map;
+            effective_owner_map = &snapshot.originalOwnerMap();
             residency_epoch = snapshot.epoch;
             if (requested_epoch != 0u &&
                 residency_epoch != requested_epoch)
@@ -640,6 +641,9 @@ namespace
             routed_tiers.size(),
             std::vector<unsigned char>(static_cast<size_t>(logical_seq_len), 0));
 
+        // One immutable cohort per addressed layer/tier is validated once;
+        // route entries retain their original lease rather than a scalar owner.
+        std::vector<const MoEExpertShardCohort*> validated_cohorts(routed_tiers.size(), nullptr);
         for (int token_row = 0; token_row < logical_seq_len; ++token_row)
         {
             for (int route_slot = 0; route_slot < params_.top_k; ++route_slot)
@@ -701,11 +705,11 @@ namespace
                 }
                 else if (effective_owner_map)
                 {
-                    const auto *owner = effective_owner_map->ownerFor(
+                    const auto *owner = effective_owner_map->placementFor(
                         placement.layer, expert_id);
                     if (!owner || !owner->resident ||
                         owner->tier_idx != tier_index ||
-                        owner->owner_participant < 0)
+                        (!owner->shard_cohort && owner->owner_participant < 0))
                     {
                         LOG_ERROR(
                             "[MoEExpertDispatchStage] Active residency epoch has no valid physical owner for layer="
@@ -713,8 +717,47 @@ namespace
                             << " tier=" << tier_index);
                         return false;
                     }
-                    destination_participant =
-                        owner->owner_participant;
+                    if (owner->shard_cohort)
+                    {
+                        if (!result.residency_lease ||
+                            (**result.residency_lease).ownershipKind() != MoEOverlayResidencyOwnershipKind::CPUJointFragments ||
+                            &(**result.residency_lease).originalOwnerMap() != effective_owner_map)
+                        {
+                            LOG_ERROR("[MoEExpertDispatchStage] CPU joint dispatch lacks its original residency lease");
+                            return false;
+                        }
+                        const auto* cohort = owner->shard_cohort.get();
+                        auto*& validated = validated_cohorts[static_cast<size_t>(tier_index)];
+                        if (validated && validated != cohort)
+                        {
+                            LOG_ERROR("[MoEExpertDispatchStage] CPU joint tier changed its original source cohort");
+                            return false;
+                        }
+                        if (!validated)
+                        {
+                            const auto ids = effective_owner_map->participantIdsForTier(tier_index);
+                            const auto members = cohort->participants();
+                            bool exact = ids.size() == members.size() && cohort->source().layer_idx == placement.layer;
+                            for (size_t i = 0; exact && i < members.size(); ++i)
+                            {
+                                const auto* participant = effective_owner_map->participantForId(ids[i]);
+                                exact = participant && participant->participant_id == members[i].participant_id &&
+                                    participant->tier_idx == tier_index && participant->domain_participant_index == static_cast<int>(i) &&
+                                    participant->domain_name == routed_tiers[static_cast<size_t>(tier_index)].domain &&
+                                    participant->world_rank_known && participant->world_rank == members[i].world_rank &&
+                                    participant->address == members[i].address;
+                            }
+                            if (!exact)
+                            {
+                                LOG_ERROR("[MoEExpertDispatchStage] CPU joint dispatch changed original physical cohort membership");
+                                return false;
+                            }
+                            validated = cohort;
+                        }
+                        // No whole-owner scalar exists. The same retained typed
+                        // snapshot supplies actual consumers to sparse dispatch.
+                    }
+                    else destination_participant = owner->owner_participant;
                 }
 
                 auto &tier_dispatch = result.tiers[static_cast<size_t>(tier_index)];
@@ -820,7 +863,7 @@ namespace
             const auto current_snapshot =
                 params_.residency_authority->snapshot();
             const auto *first_owner = current_snapshot
-                                          ? current_snapshot->owner_map.ownerFor(
+                                          ? current_snapshot->originalOwnerMap().placementFor(
                                                 placement.layer,
                                                 0)
                                           : nullptr;
@@ -829,7 +872,7 @@ namespace
                 "dispatch_epoch_leases",
                 1.0,
                 logical_seq_len == 1 ? "decode" : "prefill",
-                first_owner ? first_owner->device.toString()
+                first_owner && !first_owner->shard_cohort ? first_owner->device.toString()
                             : params_.device_id.toString(),
                 {
                     {"epoch", std::to_string(result.residency_epoch)},

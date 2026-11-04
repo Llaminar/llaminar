@@ -181,12 +181,16 @@ class CorpusExecutionTests(unittest.TestCase):
             native['native_identity']['executable_sha256']='foreign';(payload/'logits.json').write_text(json.dumps(native))
             with self.assertRaisesRegex(ValueError,'executable'):a.score(runner,payload,root)
 
-    def test_one_existing_lifecycle_retires_before_failed_native_artifact_cleanup(self):
+    def _replay_original_lifecycle_retirement(self, distributed=False):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);output=root/'cell'
             args=SimpleNamespace(binary=root/'observer',keep_logits=False)
-            a=SimpleNamespace(topology={'id':'fixture'},devices=['cpu:0'],backends=['cpu'],environment={},
+            a=SimpleNamespace(topology={'id':'fixture','expected_config':{'configuration':{'mpi_procs':2 if distributed else 1}}},devices=['cpu:0'],backends=['cpu'],environment={},
                 prepare=Mock(return_value=(root/'workload',[])),score=Mock())
+            if distributed:
+                args.mpi_rankfile=root/'original.rankfile';args.mpi_rankfile.write_text('rank 0=localhost slot=0:0-27\nrank 1=localhost slot=1:0-27\n')
+                for name in ('llaminar_mpi_session','mpirun'):
+                    executable=root/name;executable.write_text('fixture-only-not-a-runtime');executable.chmod(0o700)
             child=Mock(pid=123);child.wait.return_value=1
             # This fixture owns a simulated launch; process traversal itself is
             # exercised with real proc children in OwnedProcessTreeResources.
@@ -194,13 +198,23 @@ class CorpusExecutionTests(unittest.TestCase):
             local_owner.snapshot.return_value={'root':{'pid':123,'start_ticks':1},
                 'processes':[],'retired':[],'memory_scope':'individual_processes_not_summed'}
             events=[]
-            def launch(*unused,**kwargs):
+            def launch(command,**kwargs):
+                if distributed:
+                    self.assertEqual(command[0],str(root/'llaminar_mpi_session'))
+                    self.assertIn(str(args.mpi_rankfile),command);self.assertIn('core',command)
+                    self.assertTrue((output/'mpi-session').is_dir())
+                    self.assertIn(str(args.binary),command)
+                else:self.assertEqual(command[0],str(args.binary))
                 self.assertFalse((output/'logits').exists())
                 (output/'logits').mkdir();(output/'logits/logits.json').write_text('{"complete":false,"fixture":true}')
+                if distributed:
+                    for rank in range(2):
+                        (output/'logits'/f'rank-{rank}.json').write_text(json.dumps(dict(rank=rank,fixture_only=True,complete=False)))
                 return child
             def retire(*unused):events.append('retired');self.assertTrue((output/'logits/logits.json').exists())
             sample=dict(errors=[],cells={'canary':{'errors':[]}},filesystems={'output':{'available_bytes':10**9}})
-            with patch.object(runner,'retire',side_effect=retire),patch.object(runner.driver,'begin'),\
+            with patch.dict(runner.os.environ,{'PATH':str(root)} if distributed else {}), \
+                 patch.object(runner,'retire',side_effect=retire),patch.object(runner.driver,'begin'),\
                  patch.object(runner.driver,'finish',return_value=True),patch.object(runner.driver,'validate_evidence'),\
                  patch.object(runner.resources,'collect',return_value=sample),patch.object(runner.subprocess,'Popen',side_effect=launch),\
                  patch.object(runner,'OwnedProcessTree',return_value=local_owner) as observe:
@@ -213,6 +227,120 @@ class CorpusExecutionTests(unittest.TestCase):
             self.assertFalse((output/'logits').exists())
             self.assertEqual(json.loads((output/'native-observation.json').read_text())['complete'],False)
             self.assertTrue(json.loads((output/'controller.json').read_text())['native_retired'])
+            if distributed:
+                controller=json.loads((output/'controller.json').read_text())
+                self.assertEqual(controller['native_launch']['overlap_policy'],'strict')
+                for rank in range(2):self.assertEqual(json.loads((output/f'rank-{rank}.json').read_text())['rank'],rank)
+
+    def test_one_existing_lifecycle_retires_before_failed_native_artifact_cleanup(self):
+        self._replay_original_lifecycle_retirement()
+
+    def test_rankfile_launch_keeps_original_process_retirement_and_rank_evidence(self):
+        self._replay_original_lifecycle_retirement(distributed=True)
+
+    def test_rankfile_original_process_tree_tracks_and_retires_real_host_children(self):
+        """Host-only failing fixture processes exercise original ownership, never MPI/model readiness."""
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);output=root/'output';rankfile=root/'rankfile';rankfile.write_text('fixture authored mapping, not executed by native MPI')
+            ready=root/'ready'
+            # The fixtures execute real child/join lifetimes and return failure.
+            # No wrapper asserts model/native readiness or numerical success.
+            wrapper='#!/usr/bin/python3\nimport subprocess,sys\np=subprocess.Popen(sys.argv[sys.argv.index("--")+1:]);sys.exit(p.wait())\n'
+            for name in ('llaminar_mpi_session','mpirun'):
+                executable=root/name;executable.write_text(wrapper);executable.chmod(0o700)
+            native=root/'observer'
+            native.write_text('#!/usr/bin/python3\nimport json,pathlib,subprocess,sys,time\n'
+                'out=pathlib.Path(sys.argv[sys.argv.index("--output")+1]);out.mkdir();(out/"logits.json").write_text(json.dumps(dict(fixture_only=True,complete=False)))\n'
+                'p=subprocess.Popen([sys.executable,"-c","import time;time.sleep(.6)"])\n'
+                + 'pathlib.Path('+repr(str(ready))+').write_text("host children live")\n'
+                + 'code=p.wait();sys.exit(1)\n')
+            native.chmod(0o700)
+            args=SimpleNamespace(binary=native,keep_logits=False,mpi_rankfile=rankfile)
+            a=SimpleNamespace(topology={'id':'host-process-fixture','expected_config':{'configuration':{'mpi_procs':2}}},
+                devices=['cpu:0'],backends=['cpu'],environment={},prepare=Mock(return_value=(root/'workload',['--mpi-procs','2'])),score=Mock())
+            sample=dict(errors=[],cells={'canary':{'errors':[]}},filesystems={'output':{'available_bytes':10**9}})
+            def observe_resources(unused):
+                deadline=time.monotonic()+5
+                while not ready.exists():
+                    if time.monotonic()>deadline:raise AssertionError('host fixture did not publish child startup')
+                    time.sleep(.005)
+                return sample
+            with patch.dict(runner.os.environ,{'PATH':str(root)}),patch.object(runner.driver,'begin'),\
+                 patch.object(runner.driver,'finish',return_value=True),patch.object(runner.driver,'validate_evidence'),\
+                 patch.object(runner.resources,'collect',side_effect=observe_resources):
+                with self.assertRaisesRegex(ValueError,'observer failed'):
+                    runner.execute_cell(args,{'inputs':{}},'qwen4exp','cpu',None,output,None,adapter=a)
+            snapshot=json.loads((output/'resources.jsonl').read_text())['local_process_tree']
+            self.assertGreaterEqual(len(snapshot['processes']),4)
+            self.assertEqual(snapshot['memory_scope'],'individual_processes_not_summed')
+            for original in snapshot['processes']:
+                from resource_owned_process_tree import process_stat
+                try:current=process_stat(Path('/proc')/str(original['pid']))
+                except FileNotFoundError:continue
+                self.assertNotEqual(current['start_ticks'],original['start_ticks'])
+            state=json.loads((output/'controller.json').read_text())
+            self.assertTrue((output/'mpi-session').is_dir())
+            self.assertTrue(state['native_retired']);self.assertFalse(state['passed']);self.assertEqual(state['returncode'],1)
+            self.assertFalse((output/'logits').exists());a.score.assert_not_called()
+
+    def test_rankfile_command_is_explicit_pinned_and_old_single_rank_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);rankfile=root/'rankfile';rankfile.write_text('fixture original authored MPI mapping')
+            for name in ('llaminar_mpi_session','mpirun'):
+                executable=root/name;executable.write_text('fixture-only-not-executed');executable.chmod(0o700)
+            args=SimpleNamespace(binary=root/'observer',mpi_rankfile=rankfile)
+            original=[str(args.binary),'--workload','fixture','--output','fixture-output','--','--mpi-procs','2']
+            a=SimpleNamespace(topology={'expected_config':{'configuration':{'mpi_procs':2}}})
+            output=root/'output';output.mkdir()
+            command,pins,proof=runner.original_local_launch(args,a,None,output,original,{'PATH':str(root)})
+            self.assertEqual(command[0],str(root/'llaminar_mpi_session'))
+            self.assertEqual(command[-len(original):],original)
+            self.assertEqual(command[command.index('-np')+1],'2')
+            self.assertEqual(command[command.index('--rankfile')+1],str(rankfile))
+            self.assertNotIn('--oversubscribe',command)
+            self.assertEqual(command[command.index('--bind-to')+1],'core')
+            self.assertTrue((output/'mpi-session').is_dir())
+            self.assertTrue(proof['performance_comparison_eligible'])
+            runner.unchanged(pins)
+            with self.assertRaisesRegex(ValueError,'fresh'):runner.original_local_launch(args,a,None,output,original,{'PATH':str(root)})
+            other=root/'symlink-output';other.mkdir();(other/'mpi-session').symlink_to(root,target_is_directory=True)
+            with self.assertRaisesRegex(ValueError,'fresh'):runner.original_local_launch(args,a,None,other,original,{'PATH':str(root)})
+            rankfile.write_text('changed original mapping')
+            with self.assertRaises(ValueError):runner.unchanged(pins)
+            args.mpi_rankfile=None
+            one=SimpleNamespace(topology={'expected_config':{'configuration':{'mpi_procs':1}}})
+            self.assertEqual(runner.original_local_launch(args,one,None,root,original,{'PATH':str(root)}),(original,{},None))
+            self.assertEqual(runner.original_local_launch(args,None,{'fixture_image':True},root,original,{'PATH':str(root)}),(original,{},None))
+
+    def test_rankfile_missing_scope_and_launcher_fail_before_native_execution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);rankfile=root/'rankfile';rankfile.write_text('fixture')
+            args=SimpleNamespace(binary=root/'observer',mpi_rankfile=None)
+            a=SimpleNamespace(topology={'expected_config':{'configuration':{'mpi_procs':2}}})
+            call=lambda image=None:runner.original_local_launch(args,a,image,root,['fixture-native'],{'PATH':str(root)})
+            with self.assertRaisesRegex(ValueError,'requires an explicit'):call()
+            args.mpi_rankfile=rankfile
+            with self.assertRaisesRegex(ValueError,'local declared'):call({'fixture_image':True})
+            a.topology['expected_config']['configuration']['mpi_procs']=1
+            with self.assertRaisesRegex(ValueError,'local declared'):call()
+            a.topology['expected_config']['configuration']['mpi_procs']=3
+            with self.assertRaises(OSError):call() # No original session launcher; no alternate search.
+            self.assertFalse((root/'mpi-session').exists())
+            launcher=root/'llaminar_mpi_session';launcher.write_text('fixture');launcher.chmod(0o700)
+            with self.assertRaisesRegex(ValueError,'mpirun'):call()
+            args.mpi_rankfile=root/'absent'
+            with self.assertRaises(OSError):call()
+
+    def test_explicit_manifest_and_rankfile_cli_keep_v2_scope(self):
+        with patch.object(runner,'run_corpus_v2',return_value=0) as execute:
+            self.assertEqual(runner.main(['--binary','fixture','--report','report','--corpus-root','reference',
+                '--corpus-catalog','catalog','--corpus-manifest','metadata.json','--mpi-rankfile','rankfile']),0)
+            args=execute.call_args.args[0]
+            self.assertEqual(args.corpus_manifest,Path('metadata.json'));self.assertEqual(args.mpi_rankfile,Path('rankfile'))
+        for extra in (['--corpus-manifest','metadata'],['--mpi-rankfile','rankfile']):
+            with self.subTest(extra=extra),self.assertRaises(ValueError):runner.main(['--binary','fixture','--report','report',*extra])
+        with self.assertRaises(ValueError):runner.main(['--container-image','fixture','--report','report','--corpus-catalog','catalog','--mpi-rankfile','rankfile'])
 
     def test_first_local_collection_preserves_unqualified_uncalibrated_result(self):
         with tempfile.TemporaryDirectory() as temp:

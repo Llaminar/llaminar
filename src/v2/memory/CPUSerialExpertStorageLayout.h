@@ -9,6 +9,7 @@
  */
 #pragma once
 #include "memory/CPUStorageRoot.h"
+#include "memory/CPUJointExpertRouteStorageLayout.h"
 #include "memory/CPUCompactPacketStorageLayout.h"
 #include "memory/CPUGroupedMoEStorageLayout.h"
 #include "memory/CPUMappedPublicationRoot.h"
@@ -45,23 +46,31 @@ public:
      */
     CPUSerialExpertStorageLayout(DeviceId allocator, size_t maximum_rows,
         int hidden_width, int route_width, std::vector<size_t> buckets, bool canonical_routes,
-        int expert_intermediate=0,int num_experts=0,std::optional<DeviceId> publication_consumer=std::nullopt)
+        int expert_intermediate=0,int num_experts=0,std::optional<DeviceId> publication_consumer=std::nullopt,
+        std::optional<CPUJointExpertRouteStorageLayout> joint_routes=std::nullopt)
         : allocator_(allocator), maximum_rows_(maximum_rows), hidden_width_(hidden_width),
           route_width_(route_width), canonical_(canonical_routes
               ? std::optional<CPUStorageRoot<float>>(CPUStorageRoot<float>(
                     multiply(multiply(maximum_rows,positive(route_width)),positive(hidden_width)),
-                    PhysicalMemoryOwner::ActivationArena,allocator)) : std::nullopt),
+                    PhysicalMemoryOwner::ActivationArena,allocator,jointPlacement(joint_routes))) : std::nullopt),
           mapped_(publication_consumer?std::optional<CPUMappedPublicationRoot>(CPUMappedPublicationRoot(
               multiply(multiply(multiply(maximum_rows,positive(route_width)),positive(hidden_width)),sizeof(float)),
               allocator,*publication_consumer)):std::nullopt),
           grouped_(expert_intermediate>0 && num_experts>0?std::optional<CPUGroupedMoEStorageLayout>(
-              CPUGroupedMoEStorageLayout::declare(maximum_rows,hidden_width,expert_intermediate,num_experts,route_width,allocator)):
-              std::nullopt)
+              CPUGroupedMoEStorageLayout::declare(maximum_rows,hidden_width,expert_intermediate,num_experts,route_width,allocator,jointPlacement(joint_routes))):
+              std::nullopt),joint_(std::move(joint_routes))
     {
         if (!allocator.is_cpu() || !maximum_rows || hidden_width <= 0 || route_width <= 0 || buckets.empty() ||
             (publication_consumer && !canonical_routes) || expert_intermediate<0 || num_experts<0 ||
             ((expert_intermediate==0)!=(num_experts==0)))
             throw std::invalid_argument("CPU serial storage requires exact CPU geometry and a declared family manifest");
+        // The original reduction root retains the sole mapped publication
+        // bank beside its CPU combine root. Contributors own no canonical
+        // matrix and cannot acquire a duplicate mapped return bank.
+        if(joint_ && (joint_->maximumRows()!=maximum_rows_ ||
+           joint_->topK()!=route_width_ || joint_->cohort()->ownership(joint_->member()).geometry().model_columns!=hidden_width_ ||
+           joint_->intermediate()!=expert_intermediate || joint_->isRoot()!=canonical_routes))
+            throw std::invalid_argument("CPU joint serial roots differ from original source/member or reduction role");
         if (!std::is_sorted(buckets.begin(),buckets.end()) ||
             std::adjacent_find(buckets.begin(),buckets.end()) != buckets.end() || buckets.back()!=maximum_rows)
             throw std::invalid_argument("CPU serial storage family manifest must be unique, ordered and include its maximum");
@@ -69,7 +78,7 @@ public:
         {
             if (!rows || rows > maximum_rows)
                 throw std::invalid_argument("CPU serial storage has an undeclared or zero family capacity");
-            families_.push_back(CPUCompactPacketStorageLayout::declare(rows,hidden_width,route_width,allocator));
+            families_.push_back(CPUCompactPacketStorageLayout::declare(rows,hidden_width,route_width,allocator,jointPlacement(joint_)));
         }
     }
     /** @return Exact declared CPU allocator. */
@@ -93,6 +102,8 @@ public:
     [[nodiscard]] const std::optional<CPUMappedPublicationRoot>& mappedCanonical() const noexcept { return mapped_; }
     /** @return Setup-owned grouped workspace roots shared only by serial roles. */
     [[nodiscard]] const std::optional<CPUGroupedMoEStorageLayout>& grouped() const noexcept { return grouped_; }
+    /** @return Original joint member route roots, absent for the CPU1 whole-expert path. */
+    const std::optional<CPUJointExpertRouteStorageLayout>& jointRoutes() const noexcept {return joint_;}
     /** @return Exact ExecutionWorkspace contribution of the declared grouped roots. */
     [[nodiscard]] size_t workspaceBytes() const { return grouped_?grouped_->physicalBytes():0; }
     /** @return Exact ActivationArena BOM contribution for one independent owner. */
@@ -100,6 +111,7 @@ public:
     {
         size_t result = canonical_ ? canonical_->physicalBytes() : 0;
         if(mapped_) result=add(result,mapped_->physicalBytes());
+        if(joint_) result=add(result,joint_->physicalBytes());
         for (const auto &family : families_) result = add(result,family.physicalBytes());
         return result;
     }
@@ -145,6 +157,11 @@ public:
         return result;
     }
 private:
+    /** @brief Resolve placement from the original joint member without ambient thread/NUMA guesses. */
+    static CPUStoragePlacement jointPlacement(const std::optional<CPUJointExpertRouteStorageLayout>& joint) {
+        return joint ? CPUStoragePlacement::onNode(joint->cohort()->participants()[joint->member()].address.numa_node)
+                     : CPUStoragePlacement::local();
+    }
     /** @brief Reject invalid signed dimensions before converting element geometry. */
     [[nodiscard]] static size_t positive(int value)
     {
@@ -158,6 +175,7 @@ private:
     std::optional<CPUStorageRoot<float>> canonical_;
     std::optional<CPUMappedPublicationRoot> mapped_;
     std::optional<CPUGroupedMoEStorageLayout> grouped_;
+    std::optional<CPUJointExpertRouteStorageLayout> joint_;
 };
 
 /** @brief Existing materialization policies, selected before storage admission. */
@@ -196,11 +214,12 @@ public:
     CPUSerialExpertStorageEnvelope(DeviceId allocator,int prefill_rows,int decode_rows,
         int hidden_width,int route_width,std::vector<int> bucket_inventory,int bucket_floor,
         size_t bucket_limit,bool canonical_routes,CPUSerialExpertFamilyPolicy family_policy,
-        int expert_intermediate=0,int num_experts=0)
+        int expert_intermediate=0,int num_experts=0,
+        std::optional<CPUJointExpertRouteStorageLayout> joint_routes=std::nullopt)
         : allocator_(allocator),prefill_rows_(prefill_rows),decode_rows_(decode_rows),
           hidden_width_(hidden_width),route_width_(route_width),inventory_(std::move(bucket_inventory)),
           floor_(bucket_floor),limit_(bucket_limit),canonical_(canonical_routes),policy_(family_policy),
-          expert_intermediate_(expert_intermediate),num_experts_(num_experts)
+          expert_intermediate_(expert_intermediate),num_experts_(num_experts),joint_(std::move(joint_routes))
     {
         if(prefill_rows<=0 || decode_rows<=0 || !limit_ ||
             (policy_!=CPUSerialExpertFamilyPolicy::LocalPowerOfTwo && policy_!=CPUSerialExpertFamilyPolicy::PublishedSchedule))
@@ -219,7 +238,7 @@ public:
         return allocator_==other.allocator_ && prefill_rows_==other.prefill_rows_ && decode_rows_==other.decode_rows_ &&
             hidden_width_==other.hidden_width_ && route_width_==other.route_width_ && inventory_==other.inventory_ &&
             floor_==other.floor_ && limit_==other.limit_ && canonical_==other.canonical_ && policy_==other.policy_ &&
-            expert_intermediate_==other.expert_intermediate_ && num_experts_==other.num_experts_;
+            expert_intermediate_==other.expert_intermediate_ && num_experts_==other.num_experts_ && joint_==other.joint_;
     }
     /** @return Exact CPU allocator of this immutable declaration. */
     [[nodiscard]] DeviceId allocator() const noexcept { return allocator_; }
@@ -236,6 +255,8 @@ public:
         int prefill_rows,int decode_rows,const std::vector<int>& prefill_buckets,
         std::optional<DeviceId> publication_consumer=std::nullopt) const
     {
+        if(publication_consumer && joint_ && !joint_->isRoot())
+            throw std::invalid_argument("CPU joint GPU contributor requires a metadata-only ticket; mapped canonical publication is supported only on the original reduction root");
         if((publication_consumer && (policy_!=CPUSerialExpertFamilyPolicy::LocalPowerOfTwo || !publication_consumer->is_gpu())) ||
             prefill_rows<=0 || prefill_rows>prefill_rows_ || decode_rows!=decode_rows_ ||
             prefill_buckets!=retainedRawPrefillGraphBucketLadder(inventory_,prefill_rows,floor_,limit_))
@@ -252,7 +273,8 @@ public:
         rows.push_back(maximum);
         std::sort(rows.begin(),rows.end());rows.erase(std::unique(rows.begin(),rows.end()),rows.end());
         auto layout=std::make_shared<const CPUSerialExpertStorageLayout>(allocator_,maximum,
-            hidden_width_,route_width_,std::move(rows),canonical_,expert_intermediate_,num_experts_,publication_consumer);
+            hidden_width_,route_width_,std::move(rows),canonical_,expert_intermediate_,num_experts_,publication_consumer,
+            joint_?std::optional{joint_->withMaximumRows(maximum)}:std::nullopt);
         const auto mapped_bytes=publication_consumer && admitted_
             ? CPUMappedPublicationRoot(CPUSerialExpertStorageLayout::multiply(
                 admitted_->canonical()->capacity(),sizeof(float)),allocator_,*publication_consumer).physicalBytes() : 0;
@@ -294,6 +316,7 @@ private:
     bool canonical_;
     CPUSerialExpertFamilyPolicy policy_;
     int expert_intermediate_,num_experts_;
+    std::optional<CPUJointExpertRouteStorageLayout> joint_;
     std::shared_ptr<const CPUSerialExpertStorageLayout> admitted_;
 };
 

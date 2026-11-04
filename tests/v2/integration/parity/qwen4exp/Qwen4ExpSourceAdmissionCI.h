@@ -9,6 +9,7 @@
  */
 #pragma once
 #include "Qwen4ExpSourceAdmissionCases.h"
+#include "Qwen4ExpCPUJointSocketEvidence.h"
 #include "../ModelParityRuntimeExport.h"
 #include "backends/HardwareInventory.h"
 #include <algorithm>
@@ -140,6 +141,16 @@ inline void PrintTo(const Qwen4ExpSourceAdmissionCase &cell, std::ostream *out)
         first = false;
     }
     *out << "]";
+    const auto socket_members=qwen4ExpCPUJointSocketMembers(cell);
+    if(!socket_members.empty()) {
+        *out << ",\"cpu_expert_socket_membership\":[";bool first_member=true;
+        for(const auto& member:socket_members) {
+            *out << (first_member?"":",") << "{\"rank\":" << *member.world_rank
+                 << ",\"backend\":\"cpu\",\"ordinal\":0,\"numa_node\":" << member.address.numa_node << '}';
+            first_member=false;
+        }
+        *out << ']';
+    }
     if(cell.ngram_table_policy && cell.ngram_table_policy->isGPUAdaptive() &&
        cell.ngram_table_policy->gpu_adaptive.placement.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal)
     {
@@ -186,10 +197,12 @@ inline void exportQwen4ExpSourceHardware(const std::filesystem::path &path)
     std::ostringstream out;
     out << "{\"qfn_source_hardware_schema\":2,\"scope\":\"local-host-all-ranks\",\"devices\":[";
     bool first = true;
-    const auto append = [&](const char *backend, int ordinal, int numa, std::size_t total = 0u) {
+    const auto append = [&](const char *backend, int ordinal, int numa, std::size_t total = 0u,
+                            std::optional<int> socket = std::nullopt) {
         out << (first ? "" : ",") << "{\"backend\":" << modelParityJsonString(backend)
             << ",\"ordinal\":" << ordinal << ",\"numa_node\":" << numa;
         if (total) out << ",\"total_memory_bytes\":" << total;
+        if (socket) out << ",\"socket_id\":" << *socket;
         out << '}';
         first = false;
     };
@@ -199,7 +212,9 @@ inline void exportQwen4ExpSourceHardware(const std::filesystem::path &path)
     for (const auto locality : localities)
     {
         (void)hardware->cpuDevice(locality);
-        append("cpu", 0, locality);
+        // Preserve old device availability. Publish a socket fact only when
+        // this frozen local-host observation names it without ambiguity.
+        append("cpu", 0, locality,0u,qwen4ExpOriginalSocketForNUMA(hardware->cpu_sockets,locality));
     }
     for (const auto &device : hardware->cuda_devices) append("cuda", device.device_id, device.numa_node, device.total_memory_bytes);
     for (const auto &device : hardware->rocm_devices) append("rocm", device.device_id, device.numa_node, device.total_memory_bytes);

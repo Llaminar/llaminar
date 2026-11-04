@@ -17,6 +17,7 @@
  */
 
 #include "MoEExpertComputeStage.h"
+#include "../../moe/CPUExpertShardSourceSelection.h"
 #include "MoEDeviceRebalanceStage.h"
 #include "../ComputeStageUtils.h"
 #include "../../../backends/GPUDeviceContextPool.h"
@@ -1179,8 +1180,17 @@ namespace llaminar2
     CPUGroupedMoESerialWorkspace::StorageLayout
     CPUGroupedMoESerialWorkspace::storageLayout(const Config &config)
     {
+        // The admitted enclosing declaration owns physical placement and
+        // initialization. Rebuild every execution extent independently while
+        // retaining that exact policy; a default heap declaration would differ
+        // from the original NUMA fragment even when all logical widths match.
+        const auto placement = config.declared_storage
+            ? config.declared_storage->batch.placement() : CPUStoragePlacement::local();
+        const auto initialization = config.declared_storage
+            ? config.declared_storage->batch.initialization() : CPUStorageInitialization::Zero;
         return StorageLayout::declare(config.row_capacity, config.d_model,
-            config.expert_intermediate, config.num_experts, config.routing_top_k, config.device_id);
+            config.expert_intermediate, config.num_experts, config.routing_top_k, config.device_id,
+            placement, initialization);
     }
 
     size_t CPUGroupedMoESerialWorkspace::plannedAllocationBytes(const Config &config)
@@ -1288,6 +1298,37 @@ namespace llaminar2
          * this scalar, but sharing the proof makes the binding API total for
          * both ownership regimes.
          */
+        if (params_.cpu_joint_layer) {
+            const auto &publication=*params_.cpu_joint_layer;
+            if (!publication.source() || publication.layer()!=params_.layer_idx)
+                throw std::invalid_argument("CPU joint invocation has no original published layer");
+            const auto &lease=*publication.source();
+            if (!params_.device_id.is_cpu() || !lease.cpu_joint_source ||
+                params_.expert_weight_resolution_policy!=MoEExpertWeightResolutionPolicy::PreparedRegistryOnly ||
+                params_.canonical_route_arithmetic!=MoECanonicalRouteArithmeticPolicy::UnweightedExpertRowThenOrderedFMA ||
+                !params_.canonical_route_contributions)
+                throw std::invalid_argument("CPU joint expert invocation requires its source-bound unweighted canonical producer");
+            const auto &source=*lease.cpu_joint_source;
+            const auto &geometry=source.ownership().geometry();
+            if (source.layer()!=params_.layer_idx || geometry.experts!=params_.num_experts ||
+                geometry.model_columns!=params_.d_model ||
+                source.ownership().projection(WeightRole::MoEExpertUp).rows!=params_.expert_intermediate ||
+                params_.expert_mask.size()!=static_cast<size_t>(params_.num_experts) ||
+                lease.experts.size()!=static_cast<size_t>(params_.num_experts) ||
+                params_.prepared_gate_gemm.size()!=lease.experts.size() ||
+                params_.prepared_up_gemm.size()!=lease.experts.size() || params_.prepared_down_gemm.size()!=lease.experts.size())
+                throw std::invalid_argument("CPU joint expert invocation changed original source/member geometry");
+            for (int expert=0;expert<params_.num_experts;++expert) {
+                const auto index=static_cast<size_t>(expert);
+                const auto &engines=lease.experts[index];
+                if ((params_.expert_mask[index] && !source.contains(expert)) ||
+                    params_.prepared_gate_gemm[index]!=engines.gate.get() ||
+                    params_.prepared_up_gemm[index]!=engines.up.get() ||
+                    params_.prepared_down_gemm[index]!=engines.down.get() ||
+                    (source.contains(expert) && !engines.complete()))
+                    throw std::invalid_argument("CPU joint expert invocation replaced an original selected native engine");
+            }
+        }
         sparse_overlay_route_width_capacity_ = params_.top_k;
         cpu_workspace_row_capacity_ = params_.seq_len;
         switch (params_.canonical_route_diagnostic_publication)
@@ -2081,7 +2122,6 @@ namespace llaminar2
             &params_.gpu_direct_slot_pool,
             cpu_placement,
             params_.expert_weight_resolution_policy,
-            {},
             params_.persistent_weight_owner};
     }
 
@@ -8392,6 +8432,63 @@ namespace llaminar2
 
     bool MoEExpertComputeStage::extractExpertViews(Params &params)
     {
+        if (params.device_id.is_cpu() && params.prepared_store)
+        {
+            // Model CPU population has already committed exact final engines.
+            // Graph wiring borrows that bank; a raw parent (including a cached
+            // GGUF view) can never trigger another allocation/preparation path.
+            if (!params.prepared_store->physicalMemoryAuthority() || !params.expert_registry ||
+                params.num_experts <= 0 || params.d_model <= 0 || params.expert_intermediate <= 0 || params.layer_idx < 0 ||
+                (!params.expert_mask.empty() && params.expert_mask.size() != size_t(params.num_experts)))
+                throw std::invalid_argument("CPU model experts require their original admitted complete registry and geometry");
+            const int first = params.local_expert_start;
+            const int count = params.local_expert_count < 0 ? params.num_experts : params.local_expert_count;
+            if (first < 0 || first > params.num_experts || count < 0 || count > params.num_experts-first)
+                throw std::invalid_argument("CPU model expert bank has a foreign original ownership interval");
+            std::vector<ITensorGemm *> gate(size_t(params.num_experts),nullptr), up(gate), down(gate);
+            std::vector<std::shared_ptr<ITensorGemm>> owners;
+            for (int expert = 0; expert < params.num_experts; ++expert)
+            {
+                const bool active = !params.expert_mask.empty() ? params.expert_mask[size_t(expert)] :
+                    expert >= first && expert < first+count;
+                if (!active) continue;
+                for (const auto role : {ExpertGemmRegistry::WeightRole::GATE,ExpertGemmRegistry::WeightRole::UP,
+                                       ExpertGemmRegistry::WeightRole::DOWN})
+                {
+                    auto owner = params.expert_registry->getEngineLifetime(params.device_id,params.layer_idx,expert,role);
+                    const bool is_down = role == ExpertGemmRegistry::WeightRole::DOWN;
+                    if (!owner || !owner->weights_converted() ||
+                        owner->get_n() != (is_down ? params.d_model : params.expert_intermediate) ||
+                        owner->get_k() != (is_down ? params.expert_intermediate : params.d_model))
+                        throw std::invalid_argument("CPU model expert registry is missing or replaced an original prepared projection");
+                    auto &target = role == ExpertGemmRegistry::WeightRole::GATE ? gate :
+                        role == ExpertGemmRegistry::WeightRole::UP ? up : down;
+                    target[size_t(expert)] = owner.get();
+                    owners.push_back(std::move(owner));
+                }
+            }
+            if ((!params.prepared_gate_gemm.empty() && params.prepared_gate_gemm != gate) ||
+                (!params.prepared_up_gemm.empty() && params.prepared_up_gemm != up) ||
+                (!params.prepared_down_gemm.empty() && params.prepared_down_gemm != down))
+                throw std::invalid_argument("CPU model expert parameters replaced the original prepared registry bank");
+            if (!params.moe_owned_kernels.empty()) {
+                if (params.moe_owned_kernels.size() != owners.size())
+                    throw std::invalid_argument("CPU model expert parameters changed original bank ownership");
+                for (size_t index = 0; index < owners.size(); ++index)
+                    if (params.moe_owned_kernels[index].get() != owners[index].get() ||
+                        params.moe_owned_kernels[index].owner_before(owners[index]) ||
+                        owners[index].owner_before(params.moe_owned_kernels[index]))
+                        throw std::invalid_argument("CPU model expert parameters borrowed another prepared owner");
+            }
+            params.prepared_gate_gemm = std::move(gate);
+            params.prepared_up_gemm = std::move(up);
+            params.prepared_down_gemm = std::move(down);
+            params.moe_owned_kernels = std::move(owners);
+            params.expert_gate_views.clear(); params.expert_up_views.clear(); params.expert_down_views.clear();
+            params.gate_exps = nullptr; params.up_exps = nullptr; params.down_exps = nullptr;
+            params.expert_weight_resolution_policy = MoEExpertWeightResolutionPolicy::PreparedRegistryOnly;
+            return true;
+        }
         MoEWeightContext ctx{
             params.device_id,
             params.num_experts,
@@ -8424,13 +8521,18 @@ namespace llaminar2
             nullptr,
             CPUExpertNUMAPlacement::forDevice(params.device_id),
             params.expert_weight_resolution_policy,
-            {},
             params.persistent_weight_owner};
         return MoEExpertWeightService::extractExpertViews(ctx);
     }
 
     bool MoEExpertComputeStage::prepareExpertGemmEngines(Params &params)
     {
+        if (params.device_id.is_cpu() && params.expert_weight_resolution_policy == MoEExpertWeightResolutionPolicy::PreparedRegistryOnly)
+        {
+            if (!params.prepared_store)
+                throw std::invalid_argument("CPU prepared-registry preparation lost its original model store");
+            return extractExpertViews(params); // Authenticate only; never extract/read/pack a source parent.
+        }
         if (params.device_id.is_cpu() &&
             params.expert_weight_resolution_policy == MoEExpertWeightResolutionPolicy::RawOrPrepared &&
             (!params.prepared_store || !params.prepared_store->physicalMemoryAuthority()))
@@ -8467,7 +8569,6 @@ namespace llaminar2
             nullptr,
             CPUExpertNUMAPlacement::forDevice(params.device_id),
             params.expert_weight_resolution_policy,
-            {},
             params.persistent_weight_owner};
         bool ok = MoEExpertWeightService::prepareGemmEngines(ctx);
         // Phase C: Copy slab refs back to params for rebalance reuse
@@ -9183,11 +9284,17 @@ namespace llaminar2
     void MoEExpertComputeStage::bindCPUGroupedStorage(
         std::shared_ptr<CPUGroupedMoEStorageBacking> backing)
     {
+        // Logical invocation extents are independently checked against the
+        // original backing. Its NUMA placement and initialization policy remain
+        // authoritative: rebuilding an implicit heap layout would reject a
+        // correctly admitted socket-local fragment without changing any bytes.
         if (!backing || !backing->layout().contains(
                 CPUGroupedMoEStorageLayout::declare(
                     std::max(1, cpu_workspace_row_capacity_), params_.d_model,
                     params_.expert_intermediate, params_.num_experts,
-                    sparse_overlay_route_width_capacity_, params_.device_id)))
+                    sparse_overlay_route_width_capacity_, params_.device_id,
+                    backing->layout().batch.placement(),
+                    backing->layout().batch.initialization())))
             throw std::logic_error("CPU MoE stage requires compatible declared workspace roots");
         if (backing != cpu_grouped_backing_)
         {

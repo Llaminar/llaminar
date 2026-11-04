@@ -33,6 +33,7 @@
 namespace llaminar2
 {
     class TensorBase;
+    class MoEExpertOwnerMap;
 
     /**
      * @brief Complete geometry-selected dispatch payload embedded by a lane.
@@ -82,6 +83,10 @@ namespace llaminar2
         int target_participant_id = -1; ///< Logical participant owning packet compute.
         std::size_t graph_family_ordinal = 0u; ///< Main or one learned MTP graph family.
         std::shared_ptr<const MappedHostTransferRegion> mapped_region; ///< Registration lifetime.
+        /** Original physical-matrix reader count, minted only from Mapping membership. */
+        std::size_t shared_dispatch_consumer_count = 0u;
+        /** Original contiguous family control rows; channel target IDs are immutable. */
+        const MoEOverlayActivationEpochControl* shared_dispatch_controls_device = nullptr;
         /**
          * Activation-only physical-row matrix shared by every participant in
          * this rank-pair mapping. Direct compact packets do not access it.
@@ -387,6 +392,8 @@ namespace llaminar2
          * endpoint ranks deliberately own different local lanes.
          */
         std::vector<MoEOverlayActivationLocalLaneBinding> local_lanes;
+        /** Original source-prepared joint map; only cold source geometry selects return roles. */
+        std::shared_ptr<const MoEExpertOwnerMap> original_cpu_joint_owners;
     };
 
     /**

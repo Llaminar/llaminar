@@ -20,6 +20,7 @@ from qfn_source_admission_image import validate_report, validate_binding
 from production_artifacts import digest, artifact_identity_path
 import run_develop_image_gate as gate
 import qfn_source_admission_image as image_gate
+import run_qfn_source_admission as source_gate
 
 
 def parameter(backend='cpu', ordinal=0, numa_node=0):
@@ -51,6 +52,192 @@ def hardware():
 
 class QFNSourceAdmissionCI(unittest.TestCase):
     """Missing, foreign and stale evidence must fail rather than reduce coverage."""
+
+    def _exact_driver(self, exact=None, *, population=2, ineligible=False, missing=False,
+                      case_error=None, cleanup_error=None):
+        """Exercise the actual driver/gather with synthetic metadata, never native execution."""
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = root / 'original.gguf'
+            model.write_bytes(b'original-source-metadata-fixture')
+            names = ['Source.FullSourceAdmission/Opaque', 'Source.CandidateSourceAdmission/Other'][:population]
+            records = {name: parameter() for name in names}
+            if ineligible:
+                records[names[0]] = parameter('cuda', 0)
+            registered = {name: {'binary': '/original/source-test', 'mpi_ranks': 2, 'test': name,
+                                'properties': {'REQUIRED_FILES': [str(model)]}}
+                          for name in names}
+            if missing:
+                registered[names[0]]['properties']['REQUIRED_FILES'] = [str(root / 'missing.gguf')]
+            def metadata(command, **kwargs):
+                for arg in command:
+                    if arg.startswith('--gtest_output=json:'):
+                        Path(arg.split(':', 1)[1]).write_text('{}')
+                    if arg.startswith('--qfn-source-hardware-inventory='):
+                        Path(arg.split('=', 1)[1]).write_text(json.dumps(hardware()))
+                return SimpleNamespace(returncode=0)
+            output = root / 'result'
+            args = ['--build-dir', str(root), '--output', str(output)]
+            if exact is not None:
+                args += ['--exact-cell', exact]
+            with patch.object(source_gate.subprocess, 'check_output', return_value='{}'), \
+                 patch.object(source_gate.subprocess, 'run', side_effect=metadata), \
+                 patch.object(source_gate, 'registrations', return_value=registered), \
+                 patch.object(source_gate, 'source_parameters', return_value=records), \
+                 patch.object(source_gate, 'run_case', return_value=True, side_effect=case_error) as run, \
+                 patch.object(source_gate, 'cleanup_prefixes', side_effect=cleanup_error) as cleanup:
+                error = None
+                try:
+                    status = source_gate.main(args)
+                except Exception as failure:
+                    error, status = failure, None
+                report = json.loads((output / 'source-admission.json').read_text())
+                return status, error, report, [call.args for call in run.call_args_list], cleanup.call_count
+
+    def test_exact_cell_uses_same_transaction_and_disjoint_receipt(self):
+        exact = 'Source.FullSourceAdmission/Opaque'
+        status, error, report, calls, cleanup = self._exact_driver(exact)
+        self.assertEqual(status, 0);self.assertIsNone(error)
+        self.assertEqual([call[-1] for call in calls], [exact])
+        self.assertEqual(cleanup, 1)
+        self.assertEqual(report['selected_cases'], [exact])
+        self.assertEqual(report['eligible_cases'], [exact, 'Source.CandidateSourceAdmission/Other'])
+        self.assertEqual(report['omitted_eligible_cases'], ['Source.CandidateSourceAdmission/Other'])
+        self.assertEqual(report['schema'], source_gate.SOURCE_ADMISSION_DIAGNOSTIC_SCHEMA)
+        self.assertEqual(report['scope'], 'diagnostic-exact-cell')
+        self.assertFalse(report['full_selected_gate']);self.assertFalse(report['certification_eligible'])
+        self.assertTrue(report['complete']);self.assertTrue(report['all_resources_retired'])
+        self.assertTrue(report['source_files'])
+        with self.assertRaises(ValueError):validate_report(report)
+        # Even a host with only one eligible source cell cannot certify this
+        # explicitly diagnostic invocation by accidental count equality.
+        _, _, singleton, _, _ = self._exact_driver(exact, population=1)
+        self.assertEqual(singleton['discovered'], 1)
+        with self.assertRaises(ValueError):validate_report(singleton)
+        # The absent optional flag preserves the complete existing receipt.
+        status, error, full, calls, cleanup = self._exact_driver()
+        self.assertEqual(status, 0);self.assertIsNone(error)
+        self.assertEqual(len(calls), 2);self.assertEqual(cleanup, 2)
+        self.assertEqual(full['schema'], SOURCE_ADMISSION_REPORT_SCHEMA)
+        self.assertNotIn('scope', full);self.assertNotIn('certification_eligible', full)
+        validate_report(full)
+
+    def test_exact_cell_rejects_missing_ineligible_and_required_files_before_execution(self):
+        exact = 'Source.FullSourceAdmission/Opaque'
+        for requested, options, message in [
+                ('Source.FullSourceAdmission/.*', {}, 'unknown exact'),
+                ('Source.FullSourceAdmission/absent', {}, 'unknown exact'),
+                (exact, {'ineligible': True}, 'hardware-ineligible'),
+                (exact, {'missing': True}, 'missing canonical source GGUF')]:
+            with self.subTest(requested=requested, options=options):
+                status, error, report, calls, cleanup = self._exact_driver(requested, **options)
+                self.assertIsNone(status);self.assertIsInstance(error, ValueError)
+                self.assertIn(message, str(error));self.assertFalse(report['complete'])
+                self.assertEqual(calls, []);self.assertEqual(cleanup, 0)
+                self.assertFalse(report['certification_eligible'])
+        with self.assertRaises(SystemExit):
+            source_gate.main(['--build-dir', '/unused', '--output', '/unused',
+                              '--exact-cell', exact, '--exact-cell', exact])
+
+    def test_exact_cell_preserves_failure_retirement_and_cleanup(self):
+        exact = 'Source.FullSourceAdmission/Opaque'
+        failure = SourceCaseFailure('original assertion', retirement_proved=True, runner_retirement_proved=True)
+        status, error, report, calls, cleanup = self._exact_driver(exact, case_error=failure)
+        self.assertEqual(status, 1);self.assertIsNone(error)
+        self.assertEqual(len(calls), 1);self.assertEqual(cleanup, 1)
+        self.assertFalse(report['passed']);self.assertTrue(report['all_resources_retired'])
+        self.assertIn('original assertion', report['results'][exact]['error'])
+        status, error, report, calls, cleanup = self._exact_driver(exact, cleanup_error=RuntimeError('original cleanup'))
+        self.assertIsNone(status);self.assertIsInstance(error, RuntimeError)
+        self.assertEqual(len(calls), 1);self.assertEqual(cleanup, 1)
+        self.assertFalse(report['complete']);self.assertFalse(report['passed'])
+        self.assertEqual(report['results'][exact]['qualification'], 'infrastructure-failure')
+
+    def test_cpu_joint_socket_selection_uses_original_physical_packages(self):
+        members = [{'rank': rank, 'backend': 'cpu', 'ordinal': 0, 'numa_node': rank} for rank in range(2)]
+        joint = {**parameter(), 'participants': [{'rank': 0, 'backend': 'rocm', 'ordinal': 0, 'numa_node': -1}, *members],
+                 'cpu_expert_socket_membership': copy.deepcopy(members)}
+        observed = {'qfn_source_hardware_schema': 2, 'scope': 'local-host-all-ranks', 'devices': [
+            {'backend': 'cpu', 'ordinal': 0, 'numa_node': 0, 'socket_id': 11},
+            {'backend': 'cpu', 'ordinal': 0, 'numa_node': 1, 'socket_id': 29},
+            {'backend': 'rocm', 'ordinal': 0, 'numa_node': -1}]}
+        old = parameter();old['mpi_ranks'] = 1;old['participants'] = old['participants'][:1]
+        # Historical single-rank source inputs do not acquire the new socket-per-rank obligation.
+        self.assertEqual(select({'old': old, 'joint': joint}, observed), (['old', 'joint'], {}))
+        # Two NUMA IDs in ONE physical socket cannot qualify two socket-bound ranks.
+        aliased = copy.deepcopy(observed);aliased['devices'][1]['socket_id'] = 11
+        selected, unavailable = select({'old': old, 'joint': joint}, aliased)
+        self.assertEqual(selected, ['old'])
+        self.assertEqual(unavailable['joint']['qualification'], 'hardware-ineligible-unqualified')
+        reason = unavailable['joint']['missing'][0]
+        self.assertEqual(reason['role'], 'cpu_expert_distinct_physical_socket')
+        self.assertEqual(reason['reason'], 'original_cpu_socket_alias')
+        self.assertEqual(reason['observed_socket_id'], 11)
+        # CPU socket IDs are scoped to this original local-host observation, not hostname labels.
+        foreign = copy.deepcopy(observed);foreign['scope'] = 'multi-host-unspecified'
+        with self.assertRaises(ValueError):select({'old': old, 'joint': joint}, foreign)
+
+    def test_cpu_joint_socket_selection_rejects_incomplete_stale_and_duplicate_facts(self):
+        members = [{'rank': rank, 'backend': 'cpu', 'ordinal': 0, 'numa_node': rank} for rank in range(2)]
+        joint = {**parameter(), 'participants': copy.deepcopy(members),
+                 'cpu_expert_socket_membership': copy.deepcopy(members)}
+        observed = {'qfn_source_hardware_schema': 2, 'scope': 'local-host-all-ranks', 'devices': [
+            {'backend': 'cpu', 'ordinal': 0, 'numa_node': 0, 'socket_id': 0},
+            {'backend': 'cpu', 'ordinal': 0, 'numa_node': 1, 'socket_id': 1}]}
+        for stale in (None, -1, True, 1.0, '1'):
+            invalid = copy.deepcopy(observed);invalid['devices'][1]['socket_id'] = stale
+            with self.subTest(stale=stale), self.assertRaisesRegex(ValueError, 'socket evidence'):
+                select({'joint': joint}, invalid)
+        absent = copy.deepcopy(observed);del absent['devices'][1]['socket_id']
+        with self.assertRaisesRegex(ValueError, 'socket evidence'):select({'joint': joint}, absent)
+        for mutation in range(6):
+            invalid = copy.deepcopy(joint)
+            if mutation == 0:invalid['cpu_expert_socket_membership'].pop()
+            elif mutation == 1:invalid['cpu_expert_socket_membership'][1]['rank'] = 0
+            elif mutation == 2:invalid['cpu_expert_socket_membership'][1]['numa_node'] = 0
+            elif mutation == 3:invalid['cpu_expert_socket_membership'][1]['rank'] = 2
+            elif mutation == 4:invalid['cpu_expert_socket_membership'][1]['backend'] = 'rocm'
+            elif mutation == 5:invalid['cpu_expert_socket_membership'] = None
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):select({'joint': invalid}, observed)
+        duplicate = copy.deepcopy(observed);duplicate['devices'].append(duplicate['devices'][0])
+        with self.assertRaisesRegex(ValueError, 'duplicate native'):select({'joint': joint}, duplicate)
+
+    def test_ordinary_source_selection_does_not_infer_socket_requirements(self):
+        original = parameter();original['mpi_ranks'] = 1;original['participants'] = original['participants'][:1]
+        observed = hardware()
+        self.assertEqual(select({'old': original}, observed), (['old'], {}))
+        # Old inputs remain byte/schema compatible without a socket fact.
+        observed['devices'][0]['socket_id'] = None
+        self.assertEqual(select({'old': original}, observed), (['old'], {}))
+
+    def test_cpu_joint_completed_source_requires_original_bound_rank_receipts(self):
+        members = [{'rank': rank, 'backend': 'cpu', 'ordinal': 0, 'numa_node': rank} for rank in range(2)]
+        record = {**parameter(), 'participants': members, 'cpu_expert_socket_membership': members}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for rank in range(2):
+                directory = root / f'source-admission/Opaque/rank-{rank}';directory.mkdir(parents=True)
+                (directory / 'retirement.csv').write_text('cell,runner_retired,model_retired,prefix_removed\nOpaque,1,1,1\n')
+                native_completion(root, rank) # Explicit recorded protocol fixture, never native readiness.
+                (directory / 'admission.csv').write_text('cell,layers,initialized,snapshots_enabled,numerical_inference_executed\nOpaque,48,1,0,0\n')
+                (directory / 'admission_memory.txt').write_text('synthetic input for actual consumer replay')
+                (directory / 'mtp-setup.csv').write_text('cell,active,retained_depth,controller_execution_proved\nOpaque,0,0,0\n')
+                (directory / 'cpu-joint-socket-membership.csv').write_text(
+                    'cell,rank,original_node_id,numa_node,socket_id,worker_threads\n'
+                    f'Opaque,{rank},7,{rank},{11+rank*3},28\n')
+            validate_retirement(root, record, contract=SourceAdmissionContract.POSITIVE)
+            path = directory / 'cpu-joint-socket-membership.csv';original = path.read_text();path.unlink()
+            with self.assertRaises((OSError, ValueError)):validate_retirement(root, record, contract=SourceAdmissionContract.POSITIVE)
+            header = original.splitlines()[0]
+            for row in ('Opaque,0,7,1,14,28', 'Opaque,1,8,1,14,28', 'Opaque,1,7,0,14,28',
+                        'Opaque,1,7,1,11,28', 'Opaque,1,7,1,-1,28', 'Opaque,1,7,1,14,0',
+                        'foreign,1,7,1,14,28', 'Opaque,1,7,1,14.0,28', 'Opaque,1,7,1,14,28\nOpaque,1,7,1,14,28'):
+                path.write_text(header+'\n'+row+'\n')
+                with self.subTest(row=row), self.assertRaises(ValueError):
+                    validate_retirement(root, record, contract=SourceAdmissionContract.POSITIVE)
+            path.write_text(original)
+            validate_retirement(root, record, contract=SourceAdmissionContract.POSITIVE)
 
     def test_declared_storage_requires_its_hardware_without_inventing_compute_domains(self):
         record = parameter('cuda', 3)
@@ -743,7 +930,7 @@ class QFNSourceAdmissionCI(unittest.TestCase):
         report['results']['Source.FullSourceAdmission/Opaque']['runner_retirement_proved'] = False
         with self.assertRaises(ValueError):validate_report(report)
 
-    def test_canonical_matrix_custom_main_owns_terminal_publication_before_mpi_finalize(self):
+    def test_canonical_matrix_custom_main_owns_mpi_session_until_native_retirement(self):
         # This exact executable owns a custom main; core_gtest_main is not linked.
         root = Path(__file__).resolve().parents[4]
         cmake = (root / 'tests/v2/CMakeLists.txt').read_text()
@@ -754,13 +941,26 @@ class QFNSourceAdmissionCI(unittest.TestCase):
         main = source[source.index('int main(int argc, char **argv)'):]
         sequence = ['NativeLifetimeCompletion::fromEnvironment()',
                     'runWithNativeLifetimeCompletion<llaminar2::GPUDeviceProcessLifetime>(',
-                    'MPI_Init_thread(', 'RUN_ALL_TESTS()', 'GlobalBackendRouter::shutdown()',
+                    'MPIProcessSession::initialize(argc, argv)', 'RUN_ALL_TESTS()', 'GlobalBackendRouter::shutdown()',
                     'GPUDeviceProcessLifetime::retireActive()', 'return result;',
-                    'completion->publish(result)', 'MPI_Finalize()', '_exit(result)']
-        for token in sequence:
-            self.assertIn(token, main, f"Canonical custom main lost native terminal wiring: {token}")
-        positions = [main.index(token) for token in sequence]
-        self.assertEqual(positions, sorted(positions))
+                    'completion->publish(result)', '_exit(result)']
+        def require_original_session(body):
+            # Native CPU domain admission rejects a bare initialized MPI runtime:
+            # the process owner must retain its pool beyond every model lifetime.
+            for token in sequence:
+                self.assertIn(token, body, f"Canonical custom main lost native terminal wiring: {token}")
+            positions = [body.index(token) for token in sequence]
+            self.assertEqual(positions, sorted(positions))
+            self.assertIn('auto mpi_session = llaminar2::MPIProcessSession::initialize(argc, argv);', body)
+            self.assertNotIn('MPI_Init_thread(', body)
+            self.assertNotIn('MPI_Finalize()', body)
+        require_original_session(main)
+        old_init = main.replace('auto mpi_session = llaminar2::MPIProcessSession::initialize(argc, argv);',
+                                'int provided = 0; MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);')
+        with self.assertRaises(AssertionError):
+            require_original_session(old_init)
+        with self.assertRaises(AssertionError):
+            require_original_session(main.replace('_exit(result)', 'MPI_Finalize(); _exit(result)'))
         self.assertIn('exportQwen4ExpSourceHardware', main)
         self.assertIn('result = 2', main) # Inventory failure still has its original non-GTest status.
 

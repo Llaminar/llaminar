@@ -1516,6 +1516,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/SendActivationsStage.cpp
     execution/compute_stages/stages/ReceiveActivationsStage.cpp
     execution/compute_stages/stages/MoEExpertComputeStage.cpp
+    execution/compute_stages/stages/MoECPUExpertShardRouteStage.cpp
     execution/compute_stages/stages/MoEOverlayPinnedRouteEvidenceViews.cpp
     execution/compute_stages/stages/MoEExpertDispatchStage.cpp
     execution/compute_stages/stages/MoEOverlayTicketPublishStage.cpp
@@ -1632,11 +1633,13 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/MoEGraphRoleRunner.cpp
     execution/moe/MoEOverlayParticipantGraphRunner.cpp
     execution/moe/MoEExpertOverlayPreparationPlan.cpp
+    execution/moe/CPUExpertShardSourceSelection.cpp
     execution/moe/MoEExpertOverlayProfiler.cpp
     execution/moe/MoEExpertOverlayRuntimePlan.cpp
     execution/moe/MoEOverlayInferenceTransaction.cpp
     execution/moe/MoEOverlayInferenceTransactionService.cpp
     execution/moe/MoEOverlayActivationEpochProtocol.cpp
+    execution/moe/CPUExpertShardRouteCompletion.cpp
     execution/moe/MoEOverlayRetainedActivationTransaction.cpp
     execution/moe/MoEOverlayRetainedParentComposer.cpp
     execution/moe/MoEOverlayRankBatchTransport.cpp
@@ -1837,6 +1840,8 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     planning/PlanningWeightServiceModel.cpp
     planning/PlanningRequestCostModel.cpp
     kernels/cpu/gemm/CPUWeightPreparationMemory.cpp
+    kernels/cpu/gemm/CPUWeightPreparationGeometry.cpp
+    kernels/cpu/gemm/CPUPreparedWeightWriter.cpp
     planning/PlanningMPITransferMeasurement.cpp
     planning/ExecutionRankMembership.cpp
     utils/MPIContext.cpp
@@ -1856,6 +1861,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     app/ChatTemplateResolver.cpp
     app/MPIBootstrapPhase.cpp
     app/MPIShutdown.cpp
+    collective/NativeCPUCollectiveProgram.cpp
     app/MPIProcessSession.cpp
     app/RuntimeInitPhase.cpp
     # Subcommands
@@ -1966,6 +1972,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     kernels/qwen4exp/ImmutableFixedHeadLookupKernels.cpp
     kernels/qwen4exp/QwenSparseAttention.cpp
     kernels/cpu/attention/CPUQwenSparseAttention.cpp
+    tensors/PreparedCPUWeightTensor.cpp
     tensors/TensorBase.cpp
     tensors/FP32Tensor.cpp
     tensors/FP32ArenaReshape.cpp
@@ -2029,6 +2036,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     # MoE kernel implementations (routing, gather/scatter, SwiGLU fallback)
     kernels/IMoEKernel.cpp
     kernels/cpu/moe/CPUCanonicalRouteReducer.cpp
+    kernels/cpu/moe/CPUCanonicalShardRouteRecords.cpp
     kernels/cpu/moe/CPUMoEKernel.cpp
     # Kernel dispatch factory (centralized device-aware kernel creation)
     kernels/KernelFactory.cpp

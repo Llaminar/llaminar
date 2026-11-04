@@ -361,7 +361,8 @@ class ModelKLDLifecycleTests(unittest.TestCase):
                 root=Path(temp);model=root/'fixture.gguf';model.write_bytes(b'abcd')
                 corpus={'models':{'dense':{'entry':{'model_file':model.name,'model_bytes':4},'workload_path':root/'input.json'}}}
                 args=SimpleNamespace(binary=root/'binary',keep_logits=False)
-                adapter=SimpleNamespace(environment={},devices=['cuda:0','rocm:0'],topology={'id':'recorded'},
+                adapter=SimpleNamespace(environment={},devices=['cuda:0','rocm:0'],
+                    topology={'id':'recorded','expected_config':{'configuration':{'mpi_procs':1}}},
                     prepare=lambda *_:(root/'input.json',['--no-mtp']),backends=['cuda','rocm']) if corpus_v2 else None
                 with patch.dict(runner.os.environ,parent,clear=True),patch.object(runner,'physical_workers',return_value=1), \
                      patch.object(runner.driver,'begin'),patch.object(runner.driver,'finish',return_value=True), \

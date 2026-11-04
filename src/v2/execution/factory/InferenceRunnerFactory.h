@@ -80,6 +80,8 @@
 
 namespace llaminar2
 {
+    class IGlobalTPContext;
+
     class RetainedHostServiceDeclarations;
 
     // Forward declarations to avoid pulling in full headers
@@ -257,6 +259,8 @@ namespace llaminar2
          */
         std::shared_ptr<MoEOverlayParticipantResidencyRegistry>
             moe_expert_overlay_participant_residency;
+        /** Original CPU expert-domain context; participant-local graph edges borrow, never recreate it. */
+        std::shared_ptr<IGlobalTPContext> moe_expert_overlay_cpu_joint_context;
 
         /**
          * @brief Shared histogram lifetime consumed by the residency authority.

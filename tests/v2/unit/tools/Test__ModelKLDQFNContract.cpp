@@ -7,6 +7,9 @@
  * or runtime proof is minted. The same API is consumed by ModelKLDCanary.
  */
 #include "tools/ModelKLDQFNContract.h"
+#include "config/OrchestrationConfigParser.h"
+#include "execution/moe/MoEExpertOwnerMap.h"
+#include "execution/mpi_orchestration/ExecutionPlanBuilder.h"
 #include <gtest/gtest.h>
 #include <fstream>
 #include <map>
@@ -541,4 +544,317 @@ TEST(ModelKLDQFNContract, HomogeneousLocalTPUsesActualDegreeAndSelectedExpertOwn
     }
 }
 
+/** @brief Build only parser/codec metadata; no source or prepared authority exists in this control. */
+OrchestrationConfig distributedCPUJointConfig(int members) {
+    auto config=cpuConfig();config.mpi_procs=members;config.moe_rebalance.mode=MoERebalanceRuntimeMode::Off;
+    config.device_for_this_rank.reset();
+    auto plan=std::make_shared<MoERoutedExpertPlacementPlan>();plan->enabled=true;
+    plan->continuation_domain="gpu";plan->base_model_domain="gpu";plan->shared_expert_domain="gpu";
+    plan->residency_policy=RoutedExpertResidencyPolicy::StaticById;
+    RoutedExpertDomain gpu;gpu.name="gpu";gpu.scope=ExecutionDomainScope::SINGLE;gpu.backend=CollectiveBackendType::HOST;
+    gpu.owner_rank=0;gpu.participants={GlobalDeviceAddress::rocm(0)};
+    RoutedExpertDomain cpu;cpu.name="cpu";cpu.scope=ExecutionDomainScope::NODE_LOCAL;cpu.backend=CollectiveBackendType::UPI;
+    cpu.routed_compute_policy=RoutedExpertComputePolicy::TensorSharded;
+    for(int member=0;member<members;++member){cpu.participants.push_back(GlobalDeviceAddress::cpu(member));cpu.world_ranks.push_back(member);}
+    plan->domains={gpu,cpu};
+    for(const auto &domain:plan->domains)
+        config.domain_definitions.push_back(DomainDefinition::fromExecutionDomainDefinition(domain.toExecutionDomainDefinition()));
+    config.moe_routed_expert_plan=std::move(plan);return config;
+}
+/** @test Exact distributed intent keeps the same full-history request contract for two through eight members. */
+TEST(ModelKLDQFNContract, DistributedCPUJointUsesOriginalRanksAndFrozenHistory) {
+    for(int members=2;members<=8;++members){auto config=distributedCPUJointConfig(members);
+        EXPECT_TRUE(qfnDistributedCPUJointIntent(config));
+        EXPECT_NO_THROW((void)QFNObserverRequest::parse(descriptor(config),config));
+    }
+    EXPECT_FALSE(qfnDistributedCPUJointIntent(cpuConfig()));
+}
+/** @test Cross-rank exceptions cannot admit whole distribution, a foreign root, aliases or migration. */
+TEST(ModelKLDQFNContract, DistributedCPUJointRejectsForeignPartialAndMigratingIntent) {
+    for(int mutation=0;mutation<10;++mutation){auto config=distributedCPUJointConfig(2);auto& plan=*config.moe_routed_expert_plan;
+        switch(mutation){
+        case 0:plan.domains[1].routed_compute_policy=RoutedExpertComputePolicy::Apportioned;break;
+        case 1:plan.domains[1].world_ranks[0]=-1;break;
+        case 2:plan.domains[1].world_ranks[1]=0;break;
+        case 3:plan.domains[1].participants[1]=plan.domains[1].participants[0];break;
+        case 4:plan.domains[0].owner_rank=1;break;
+        case 5:config.moe_rebalance.mode=MoERebalanceRuntimeMode::Dynamic;break;
+        case 6:config.moe_rebalance.mode=MoERebalanceRuntimeMode::Observe;break;
+        case 7:plan.domains[1].scope=ExecutionDomainScope::GLOBAL;break;
+        case 8:plan.domains[1].world_ranks.pop_back();break;
+        case 9:config.mpi_procs=4;break;
+        }
+        EXPECT_THROW(qfnDistributedCPUJointIntent(config),std::invalid_argument);
+        EXPECT_THROW((void)QFNObserverRequest::parse(descriptor(config),config),std::invalid_argument);
+    }
+}
+
+} // namespace llaminar2::accuracy
+
+namespace llaminar2::accuracy {
+/** @test Parse the literal world2 diagnostic CLI before traversing every request guard. */
+TEST(ModelKLDQFNContract, DistributedCPUJointRealCLITraversesCompleteRequestContract) {
+    auto arguments = nlohmann::json::parse(R"qfn([
+    "qfn-observer-contract",
+    "--mpi-procs",
+    "2",
+    "--activation-precision",
+    "fp32",
+    "--kv-cache-precision",
+    "fp16",
+    "--ngram-storage",
+    "ram",
+    "--ngram-mmap-window-bytes",
+    "65536",
+    "--ngram-mmap-window-count",
+    "1024",
+    "--mtp-graph-capacity-draft-tokens",
+    "0",
+    "--backend",
+    "host",
+    "--moe-routed-expert-placement",
+    "tiered-overlay",
+    "--moe-routed-expert-continuation-domain",
+    "rocm_continuation",
+    "--moe-routed-expert-base-model-domain",
+    "rocm_continuation",
+    "--moe-routed-expert-shared-domain",
+    "rocm_continuation",
+    "--moe-continuation-dense-policy",
+    "replicated",
+    "--moe-routed-expert-owner-order",
+    "ordinal",
+    "--moe-routed-expert-residency",
+    "static-by-id",
+    "--moe-routed-expert-domain",
+    "rocm_continuation=localhost:-1:rocm:0;scope=single;backend=rccl;owner=0;expert_compute=apportioned;expert_phase=uniform;expert_decode_assignment=static-owner;expert_prefill_assignment=static-owner",
+    "--moe-routed-expert-domain",
+    "cpu_capacity=localhost:0:cpu:0,localhost:1:cpu:0;scope=node_local;backend=upi;ranks=0,1;expert_compute=tensor-sharded;expert_phase=uniform;expert_decode_assignment=static-owner;expert_prefill_assignment=static-owner",
+    "--moe-routed-expert-tier",
+    "tier_0@rocm_continuation;priority=0;max-experts-per-layer=64;memory-mb=auto",
+    "--moe-routed-expert-tier",
+    "tier_1@cpu_capacity;priority=10;max-experts-per-layer=448;memory-mb=auto",
+    "--no-mtp",
+    "--mtp-depth-policy",
+    "fixed",
+    "--moe-residency-maintenance",
+    "off",
+    "-m",
+    "/opt/llaminar-models/Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+    "--mtp-model",
+    "/opt/llaminar-models/Qwen3.8-Flash-Next-GGUF/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+    "--context-length",
+    "4096",
+    "--threads",
+    "28",
+    "--no-prefix-cache",
+    "--prefill-max-bucket-size",
+    "512"
+])qfn").get<std::vector<std::string>>();
+    std::vector<char *> argv;for (auto &value : arguments) argv.push_back(value.data());
+    OrchestrationConfigParser parser;
+    const auto original=parser.parseArgs(static_cast<int>(argv.size()),argv.data());
+    ASSERT_EQ(original.mpi_procs,2);ASSERT_EQ(original.domain_definitions.size(),2u);
+    ASSERT_TRUE(qfnDistributedCPUJointIntent(original));
+    const auto request=[](const OrchestrationConfig &config) {
+        auto result=descriptor(config);
+        if(config.shared_predictor) {
+            const auto path=config.shared_predictor->path();
+            result["corpus"]["source"]["shared_predictor"]={
+                {"name",std::filesystem::path(path).filename().string()}, {"path",path},
+                {"bytes",1}, {"object_identity","synthetic-not-original-source"}};
+        }
+        return result;
+    };
+    EXPECT_NO_THROW((void)QFNObserverRequest::parse(request(original),original));
+    for(int mutation=0;mutation<8;++mutation) {
+        auto candidate=original;
+        switch(mutation) {
+        case 0:candidate.domain_definitions.back().explicit_ranks={1,0};break;
+        case 1:candidate.domain_definitions.back().scope=TPScope::GLOBAL;break;
+        case 2:candidate.domain_definitions.back().routed_compute_policy=RoutedExpertComputePolicy::Apportioned;break;
+        case 3:candidate.domain_definitions.back().devices[1]=candidate.domain_definitions.back().devices[0];break;
+        case 4:candidate.domain_definitions.push_back(candidate.domain_definitions.back());break;
+        case 5:candidate.domain_definitions.back().name="foreign";break;
+        case 6:candidate.domain_definitions.pop_back();break;
+        case 7:candidate.domain_definitions.back().backend=CollectiveBackendType::HOST;break;
+        }
+        // Bind the descriptor to the mutated complete config so rejection must
+        // come from the actual domain guard, not config-document inequality.
+        EXPECT_THROW((void)QFNObserverRequest::parse(request(candidate),candidate),std::invalid_argument);
+    }
+}
+/** @test Original full-source geometry remains strict for expert-only worker observations. */
+TEST(ModelKLDQFNContract, SourceGeometrySeparatesFollowerLogitCapability) {
+    auto config=distributedCPUJointConfig(2);
+    RankExecutionPlan plan;plan.rank=1;plan.primary_device=config.moe_routed_expert_plan->domains[1].participants[1];
+    QFNSourceGeometry observed{.runner_architecture="qwen4exp",.model_architecture="qwen4exp",
+        .main_layers=48,.source_vocabulary=248320,.experts=512,.runner_vocabulary=0};
+    EXPECT_NO_THROW(requireQFNSourceGeometry(observed,config,plan,true));
+    for(const auto field:{&QFNSourceGeometry::main_layers,&QFNSourceGeometry::source_vocabulary,
+                         &QFNSourceGeometry::experts,&QFNSourceGeometry::runner_vocabulary}) {
+        auto bad=observed;bad.*field=1;
+        EXPECT_THROW(requireQFNSourceGeometry(bad,config,plan,true),std::invalid_argument);
+    }
+    for(const auto field:{&QFNSourceGeometry::runner_architecture,&QFNSourceGeometry::model_architecture}) {
+        auto bad=observed;bad.*field="foreign";
+        EXPECT_THROW(requireQFNSourceGeometry(bad,config,plan,true),std::invalid_argument);
+    }
+    // General rank scheduling metadata is not its routed source-fragment address.
+    auto foreign=plan;foreign.primary_device.numa_node=0;
+    EXPECT_NO_THROW(requireQFNSourceGeometry(observed,config,foreign,true));
+    auto prepared=*config.moe_routed_expert_plan;
+    RoutedExpertTier cpuTier;cpuTier.domain="cpu";cpuTier.name="cpu-fragments";
+    prepared.routed_tiers={cpuTier};
+    const auto participants=MoEExpertOwnerMap::declaredParticipants(prepared,
+        {.reject_tensor_sharded_domains=false});
+    const auto local=std::find_if(participants.begin(),participants.end(),[](const auto& value){return value.world_rank==1;});
+    ASSERT_NE(local,participants.end());
+    EXPECT_EQ(local->address.numa_node,1);
+    EXPECT_NE(local->address.numa_node,foreign.primary_device.numa_node);
+    foreign.primary_device.hostname="foreign-host";
+    EXPECT_THROW(requireQFNSourceGeometry(observed,config,foreign,true),std::invalid_argument);
+    foreign=plan;foreign.rank=0;
+    EXPECT_THROW(requireQFNSourceGeometry(observed,config,foreign,true),std::invalid_argument);
+    auto root=plan;root.rank=0;root.primary_device=GlobalDeviceAddress::rocm(0);
+    EXPECT_THROW(requireQFNSourceGeometry(observed,config,root,false),std::invalid_argument);
+    auto missing=cpuConfig();
+    EXPECT_THROW(requireQFNSourceGeometry(observed,missing,plan,true),std::invalid_argument);
+    observed.runner_vocabulary=248320;
+    EXPECT_NO_THROW(requireQFNSourceGeometry(observed,config,plan,false));
+    EXPECT_THROW(requireQFNSourceGeometry(observed,config,plan,true),std::invalid_argument);
+}
+
+} // namespace llaminar2::accuracy
+
+namespace llaminar2::accuracy {
+/** @test Observation retains the actual MPI rank and accepts only local aliases or its original canonical host. */
+TEST(ModelKLDQFNContract, OriginalRankAndCanonicalHostOwnership) {
+ for(const int rank:{0,1}) {
+  RankExecutionPlan plan;plan.rank=rank;plan.hostname="original-inventory-node";
+  EXPECT_NO_THROW(requireQFNOriginalRank(plan,rank));
+  EXPECT_THROW(requireQFNOriginalRank(plan,-1),std::invalid_argument);
+  EXPECT_THROW(requireQFNOriginalRank(plan,1-rank),std::invalid_argument);
+  for(const auto backend:{DeviceType::CPU,DeviceType::CUDA,DeviceType::ROCm}) {
+   plan.primary_device=backend==DeviceType::CPU?GlobalDeviceAddress::cpu(0):
+    backend==DeviceType::CUDA?GlobalDeviceAddress::cuda(0):GlobalDeviceAddress::rocm(0);
+   for(const std::string host:{std::string{},std::string{"localhost"},plan.hostname}) {
+    plan.primary_device.hostname=host;
+    EXPECT_TRUE(qfnAddressOwnedByRank(plan,plan.primary_device));
+    EXPECT_EQ(qfnObservationSurface(plan),backend==DeviceType::CPU?QFNObservationSurface::CPU:QFNObservationSurface::GPUCPUOverlay);
+   }
+   plan.primary_device.hostname="foreign-inventory-node";
+   EXPECT_FALSE(qfnAddressOwnedByRank(plan,plan.primary_device));
+   EXPECT_THROW(qfnObservationSurface(plan),std::invalid_argument);
+   plan.primary_device.hostname="original-inventory-node.suffix";
+   EXPECT_FALSE(qfnAddressOwnedByRank(plan,plan.primary_device));
+   plan.primary_device.hostname=plan.hostname;auto missing=plan;missing.hostname.clear();
+   EXPECT_THROW(qfnObservationSurface(missing),std::invalid_argument);
+  }
+ }
+ RankExecutionPlan invalid;invalid.rank=-1;
+ EXPECT_THROW(requireQFNOriginalRank(invalid,-1),std::invalid_argument);
+ EXPECT_THROW(requireQFNOriginalRank(invalid,0),std::invalid_argument);
+}
+/** @test Canonical host matching is shared by TP, CPU-tail PP and original prepared expert-domain validation. */
+TEST(ModelKLDQFNContract, CanonicalHostTPPPAndPreparedDomains) {
+ for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm})for(const int degree:{2,4,8}) {
+  RankExecutionPlan plan;plan.hostname="original-inventory-node";
+  for(int ordinal=0;ordinal<degree;++ordinal) {
+   auto address=backend==DeviceType::CUDA?GlobalDeviceAddress::cuda(ordinal):GlobalDeviceAddress::rocm(ordinal);
+   address.hostname=plan.hostname;plan.local_tp_devices.push_back(address);
+  }
+  plan.primary_device=plan.local_tp_devices.front();
+  EXPECT_EQ(qfnObservationSurface(plan),QFNObservationSurface::HomogeneousLocalTP);
+  MoERoutedExpertPlacementPlan prepared;RoutedExpertDomain gpu;gpu.name="gpu";gpu.participants=plan.local_tp_devices;
+  RoutedExpertDomain cpu;cpu.name="cpu";auto host=GlobalDeviceAddress::cpu(0);host.hostname=plan.hostname;cpu.participants={host};
+  prepared.domains={gpu,cpu};RoutedExpertTier g;g.domain="gpu";RoutedExpertTier c;c.domain="cpu";
+  prepared.routed_tiers={g,c};prepared.placements.push_back({.layer=0,.routed_expert_tier={0,1}});
+  EXPECT_EQ(qfnPreparedLocalTPSurface(plan,prepared),QFNObservationSurface::GPUCPULocalTP);
+  auto foreign=prepared;foreign.domains[1].participants[0].hostname="foreign-inventory-node";
+  EXPECT_THROW(qfnPreparedLocalTPSurface(plan,foreign),std::invalid_argument);
+  foreign=prepared;foreign.domains[0].participants[0].hostname="foreign-inventory-node";
+  EXPECT_THROW(qfnPreparedLocalTPSurface(plan,foreign),std::invalid_argument);
+  auto changed=plan;changed.local_tp_devices.back().hostname="foreign-inventory-node";
+  EXPECT_THROW(qfnObservationSurface(changed),std::invalid_argument);
+  changed=plan;changed.primary_device.hostname="foreign-inventory-node";
+  EXPECT_THROW(qfnObservationSurface(changed),std::invalid_argument);
+ }
+ RankExecutionPlan pipeline;pipeline.hostname="original-inventory-node";
+ pipeline.local_pp_devices={GlobalDeviceAddress::cuda(0),GlobalDeviceAddress::rocm(0),GlobalDeviceAddress::cpu(0)};
+ for(auto& address:pipeline.local_pp_devices)address.hostname=pipeline.hostname;
+ pipeline.primary_device=pipeline.local_pp_devices.front();
+ EXPECT_EQ(qfnObservationSurface(pipeline),QFNObservationSurface::CPUTailPipeline);
+ for(size_t participant=0;participant<pipeline.local_pp_devices.size();++participant) {
+  auto foreign=pipeline;foreign.local_pp_devices[participant].hostname="foreign-inventory-node";
+  EXPECT_THROW(qfnObservationSurface(foreign),std::invalid_argument);
+ }
+}
+}
+
+namespace llaminar2::accuracy {
+/** @test Actual builder GlobalTP metadata is an expert-only follower, never a logit authority. */
+TEST(ModelKLDQFNContract, CPUJointFollowerRetainsOriginalGlobalDomain) {
+    for(int population=2;population<=8;++population) {
+        auto config=distributedCPUJointConfig(population);
+        ClusterInventory inventory;inventory.world_size=population;inventory.node_count=1;
+        for(int rank=0;rank<population;++rank) {
+            RankInventory local;local.rank=rank;local.local_rank=rank;local.node_id=0;
+            local.hostname="original-node";local.cpu.numa_node=rank;
+            local.cpu_sockets=population;local.numa_nodes=population;
+            if(rank==0) {
+                DeviceInfo gpu;gpu.type=DeviceType::ROCm;gpu.local_device_id=0;
+                gpu.uuid="metadata-original-mi50";gpu.numa_node=0;
+                local.gpus.push_back(gpu);
+            }
+            inventory.ranks.push_back(std::move(local));
+        }
+        ModelConfig model;model.name="qwen4exp";model.n_layers=48;model.n_heads=20;
+        model.n_kv_heads=4;model.hidden_size=2560;model.intermediate_size=640;
+        model.vocab_size=248320;model.head_dim=128;
+        const auto plans=ExecutionPlanBuilder().buildAllPlans(config,model,inventory);
+        ASSERT_EQ(plans.size(),size_t(population));
+        auto prepared=*config.moe_routed_expert_plan;
+        RoutedExpertTier gpu;gpu.name="hot";gpu.domain="gpu";
+        RoutedExpertTier cpu;cpu.name="cold";cpu.domain="cpu";
+        prepared.routed_tiers={gpu,cpu};
+        for(int layer=0;layer<48;++layer) {
+            RoutedExpertLayerPlacement placement;placement.layer=layer;
+            placement.routed_expert_tier.assign(512,1);
+            std::fill_n(placement.routed_expert_tier.begin(),64,0);
+            prepared.placements.push_back(std::move(placement));
+        }
+        for(int rank=1;rank<population;++rank) {
+            SCOPED_TRACE(population);
+            SCOPED_TRACE(rank);
+            const auto &plan=plans[size_t(rank)];
+            ASSERT_TRUE(plan.usesGlobalTP());
+            EXPECT_THROW(qfnObservationSurface(plan),std::invalid_argument);
+            EXPECT_EQ(qfnCPUJointFollowerSurface(config,plan,plan,prepared),QFNObservationSurface::CPUExpertFollower);
+            for(int mutation=0;mutation<10;++mutation) {
+                auto wrong=plan;
+                if(mutation==0)wrong.rank=0;
+                if(mutation==1)wrong.global_tp_domain_id.reset();
+                if(mutation==2)wrong.global_tp_domain_size+=1;
+                if(mutation==3)wrong.my_domains.clear();
+                if(mutation==4)wrong.my_domains.front().devices.back().numa_node=population;
+                if(mutation==5)wrong.primary_device=GlobalDeviceAddress::rocm(0);
+                if(mutation==6)wrong.local_tp_devices={GlobalDeviceAddress::cpu(0),GlobalDeviceAddress::cpu(1)};
+                if(mutation==7)wrong.my_domains.front().domain_name="foreign";
+                if(mutation==8)wrong.prev_rank=0;
+                if(mutation==9)wrong.my_domains.front().devices.back().hostname="foreign-node";
+                EXPECT_THROW(qfnCPUJointFollowerSurface(config,wrong,plan,prepared),std::invalid_argument);
+            }
+            auto wrong_source=prepared;wrong_source.domains[1].participants.back().numa_node=population;
+            EXPECT_THROW(qfnCPUJointFollowerSurface(config,plan,plan,wrong_source),std::invalid_argument);
+            wrong_source=prepared;wrong_source.placements.clear();
+            EXPECT_THROW(qfnCPUJointFollowerSurface(config,plan,plan,wrong_source),std::invalid_argument);
+            auto missing=config;missing.moe_routed_expert_plan.reset();
+            EXPECT_THROW(qfnCPUJointFollowerSurface(missing,plan,plan,prepared),std::invalid_argument);
+            auto foreign=plan;foreign.rank=population;
+            EXPECT_THROW(qfnCPUJointFollowerSurface(config,foreign,foreign,prepared),std::invalid_argument);
+        }
+        EXPECT_THROW(qfnCPUJointFollowerSurface(config,plans[0],plans[0],prepared),std::invalid_argument);
+    }
+}
 } // namespace llaminar2::accuracy

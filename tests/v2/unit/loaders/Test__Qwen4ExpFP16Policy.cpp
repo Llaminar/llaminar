@@ -17,6 +17,8 @@
 #include "kernels/cpu/moe/CPUMoEKernel.h"
 #include "../../utils/CPURouterKernelTestAdmission.h"
 #include "loaders/PreparedHalfWeights.h"
+#include "loaders/PreparedWeightIdentityContract.h"
+#include "kernels/cpu/gemm/CPUWeightPreparationGeometry.h"
 #include "loaders/PreparedWeightRepresentationContract.h"
 #include "loaders/PreparedWeightStore.h"
 #include "loaders/WeightManager.h"
@@ -131,11 +133,44 @@ void prove(GDNProjectionArithmetic gdn, MoERouterArithmetic router)
         requirement.host_policy = WeightHostPolicy::RequiredUntilGraphMaterialized;
         plan.add(requirement);
     }
+    // Admit the original plan before loading. The Manager's completed Store is
+    // the same owner consumed by the stage; source tensors remain only oracles.
+    size_t final_bytes = 0, staging_bytes = 0;
+    for (size_t i = 0; i < original.size(); ++i)
+    {
+        const auto name = std::string("blk.0.") + suffixes[i];
+        const auto role = inferWeightRole(name);
+        const auto representation = PreparedWeightRepresentationContract::resolve(
+            role, original[i]->native_type(), name, "qwen4exp", gdn, router);
+        const auto operand = PreparedWeightRepresentationContract::operandPrecision(role, name, "qwen4exp", gdn, router);
+        const auto precision = PreparedWeightRepresentationContract::resolveCPUWeightPrecision(
+            role, original[i]->native_type(), WeightPrecision::NATIVE, representation, operand);
+        const auto classification = PreparedWeightIdentityContract::classifyOriginalMatrix(role, DeviceId::cpu());
+        const bool gemm = classification == PreparedGemmClassification::Gemm;
+        ASSERT_NE(classification, PreparedGemmClassification::RequiresSchema);
+        const auto request = quoteCPUWeightPreparation(original[i]->native_type(), columns[i], K,
+            precision, gemm ? CPUWeightConsumer::PreparedGemm : CPUWeightConsumer::ResidentTensor, operand);
+        if (request)
+            staging_bytes = std::max(staging_bytes, resolveNativeWeightLoadStaging(
+                *request, loader->nativeWeightSourcePlacement(), configuredNativeWeightLoadStagingBudgetBytes()).physical_bytes);
+        // The estimator owns final representation geometry, including native
+        // packing and code-owned model half overrides.
+        auto profile = ModelMemoryProfile::fromGGUF(qwen4MetadataFixture(false));
+        profile.tensors = {{.name=name, .native_bytes=original[i]->size_bytes(),
+            .quant_type=std::string(tensorTypeName(original[i]->native_type())),
+            .elements=original[i]->numel(), .K=K, .layer_index=0}};
+        final_bytes += WeightMemoryEstimator::estimate(profile, DeviceId::cpu()).device_bytes;
+    }
+    PhysicalMemoryPlanBuilder admission;
+    const auto capacity = final_bytes + staging_bytes;
+    const PhysicalMemoryResource resource{0, DeviceId::cpu(), capacity, capacity};
+    admission.add(resource, PhysicalMemoryOwner::PrimaryModelWeights, final_bytes);
+    admission.add(resource, PhysicalMemoryOwner::WeightLoadStaging, staging_bytes);
+    manager.installPhysicalMemoryAuthority(std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(admission.build()), 0));
     const auto frozen = manager.materialize(plan);
-    PreparedWeightStore store(strategy.model_id);
-    std::vector<const TensorBase *> preparedMatrices;
-    for (size_t i = 0; i < 4; ++i) preparedMatrices.push_back(frozen.layer(0, suffixes[i]).tensor);
-    test::admitCPUPreparedStoreForTest(store, preparedMatrices);
+    auto retained_store = manager.preparedWeightStore();
+    auto &store = *retained_store;
     std::array<PreparedWeightRef, 4> refs;
     for (size_t i = 0; i < original.size(); ++i)
     {
@@ -155,7 +190,11 @@ void prove(GDNProjectionArithmetic gdn, MoERouterArithmetic router)
                 ASSERT_EQ(words[j], canonicalPreparedHalfBits(decoded[j]));
         }
         else
-            EXPECT_EQ(binding.tensor, original[i].get());
+        {
+            ASSERT_TRUE(binding.native_source);
+            EXPECT_EQ(binding.native_source->original, loader->nativeWeightSourceGeometry(std::string("blk.0.") + suffixes[i]));
+            EXPECT_NE(binding.tensor, original[i].get());
+        }
         EXPECT_EQ(std::memcmp(original[i]->raw_data(), original_bytes[i].data(), original_bytes[i].size()), 0);
         // The production estimator consumes the exact same original role,
         // name and source format. Compare the selected representation with its
@@ -195,7 +234,11 @@ void prove(GDNProjectionArithmetic gdn, MoERouterArithmetic router)
                          PhysicalMemoryCapacityExhausted);
         }
         if (i < 4)
-            refs[i] = store.prepareGemm(binding);
+        {
+            ASSERT_TRUE(binding.prepared);
+            EXPECT_EQ(binding.prepared->kind, PreparedWeightKind::CpuPackedGemm);
+            refs[i] = *binding.prepared;
+        }
     }
     CPUDeviceContext context(DeviceId::cpu(), 1);
     FP32Tensor input({9, K});

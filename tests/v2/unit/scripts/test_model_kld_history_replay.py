@@ -136,6 +136,46 @@ class FrozenHistoryReplayTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'did not bind'):
             selection.require_binding([str(directory)])
 
+    @patch("os.sched_getaffinity", return_value={0, 1, 2, 3})
+    @patch("model_kld_corpus.physical_workers", return_value=4)
+    def test_socket_rank_receipts_require_all_original_disjoint_retired_members(self, _physical, _affinity):
+        self.value['expected_config']['configuration'].update(n_threads=2, mpi_procs=2)
+        self.publish(); selection=self.prepare()
+        directory=self.root/'joint-artifacts';directory.mkdir()
+        binding=dict(schema='llaminar.model-kld-history-binding.v1', descriptor_sha256=selection.sha256,
+            **{key:self.value[key] for key in ('canonical_cell','history_id','source_digest',
+                'full_stage_metadata_digest','prompt','prompt_ids','continuation_ids','decode_rows','reference_directory')})
+        (directory/'history_replay_binding.json').write_text(json.dumps(binding))
+        cpu=dict(requested_workers=2,max_workers=2,allowed_cpus=[0,1],physical_cores=2,
+            dynamic=False,unbound=True,places='cores',cpu_compute_required=True,parallel_work_observed=True)
+        geometry=dict(schema='llaminar.model-kld-history-prefill-geometry.v1',descriptor_sha256=selection.sha256,
+            canonical_cell=self.cell,history_id='original',capture_mode='production_serving_ladder',
+            bucket_rows=[64,128],minimum_rows=64,logical_rows=2,physical_rows=64,
+            native_replay_required=True,native_replay_observed=True,cpu_execution=cpu)
+        (directory/'history_replay_prefill_geometry.json').write_text(json.dumps(geometry))
+        records=[]
+        for rank in range(2):
+            record=dict(schema='llaminar.model-kld-history-cpu-rank.v1',descriptor_sha256=selection.sha256,
+                world_rank=rank,world_size=2,original_node_id=0,numa_node=rank,socket_id=rank,
+                runner_retired=True,cpu_execution=dict(cpu,allowed_cpus=[rank*2,rank*2+1]))
+            records.append(record)
+            (directory/f'history_replay_cpu_rank_{rank}.json').write_text(json.dumps(record))
+        selection.require_binding([str(directory)])
+        path=directory/'history_replay_cpu_rank_1.json'
+        original=path.read_text();path.unlink()
+        with self.assertRaises(OSError):selection.require_binding([str(directory)])
+        for change in ('rank','socket','affinity','workers','retirement','descriptor'):
+            record=json.loads(original)
+            if change=='rank':record['world_rank']=0
+            if change=='socket':record['socket_id']=0
+            if change=='affinity':record['cpu_execution']['allowed_cpus']=[0,1]
+            if change=='workers':record['cpu_execution']['max_workers']=1
+            if change=='retirement':record['runner_retired']=False
+            if change=='descriptor':record['descriptor_sha256']='f'*64
+            path.write_text(json.dumps(record))
+            with self.assertRaises(ValueError):selection.require_binding([str(directory)])
+        path.write_text(original);selection.require_binding([str(directory)])
+
     def test_six_steps_require_seven_original_reference_teachers(self):
         self.value['decode_rows'] = 6
         self.value['continuation_ids'] = [3, 4, 5, 6, 7, 8, 9]
@@ -196,6 +236,109 @@ class FrozenHistoryReplayTests(unittest.TestCase):
         self.publish()
         with self.assertRaisesRegex(ValueError, 'physical CPU resources'):
             self.prepare().launch(command, environment)
+
+    def test_socket_rank_population_retains_original_launcher_and_per_rank_workers(self):
+        """Metadata-only population projection never substitutes whole-machine affinity."""
+        for participants in (2, 4, 8):
+            self.value['expected_config']['configuration'].update(n_threads=2, mpi_procs=participants)
+            self.publish()
+            command = ('/usr/bin/mpirun', '-np', str(participants), '--bind-to', 'socket', '--map-by', 'socket',
+                '--mca', 'mpi_leave_pinned', '1', '--mca', 'btl_vader_single_copy_mechanism', 'none',
+                '--mca', 'orte_allowed_exit_without_sync', '1',
+                '/native/exact-target', '--gtest_filter=' + self.cell)
+            environment = {'LLAMINAR_PERF_STATS_FILTER': 'forward_graph,immutable_lookup'}
+            with patch('model_kld_corpus.physical_workers', return_value=participants*2):
+                actual, values = self.prepare().launch(command, environment)
+                self.assertEqual(actual[:16], command[:16])
+                self.assertEqual(values['OMP_NUM_THREADS'], '2')
+                self.assertEqual(actual[-2:], command[-2:])
+                with self.assertRaises(ValueError):
+                    self.prepare().launch(command[:2]+('1',)+command[3:], environment)
+                with self.assertRaises(ValueError):
+                    self.prepare().launch(command[:4]+('none',)+command[5:], environment)
+                with self.assertRaises(ValueError):
+                    self.prepare().launch(command[:-2]+('--oversubscribe',)+command[-2:], environment)
+            with patch('model_kld_corpus.physical_workers', return_value=participants*2-1):
+                with self.assertRaises(ValueError):
+                    self.prepare().launch(command, environment)
+
+    def original_mpi_command(self, participants, *, application_boundary=False):
+        """Return original launch metadata only; no child/model/communicator is created."""
+        return ('/usr/bin/mpirun', '-np', str(participants), '--bind-to', 'socket', '--map-by', 'socket',
+            '--mca', 'mpi_leave_pinned', '1', '--mca', 'btl_vader_single_copy_mechanism', 'none',
+            '--mca', 'orte_allowed_exit_without_sync', '1') + (('--',) if application_boundary else ()) + (
+            '/native/exact-target', '--gtest_filter=' + self.cell)
+
+    def test_original_guardian_envelope_preserves_rank_population_and_application_boundary(self):
+        """Actual wrapped grammar preserves its owner/base and legacy direct MPI semantics."""
+        helper = self.root / 'llaminar_mpi_session'
+        helper.write_text('original helper pathname metadata; never executed')
+        session_base = self.root / 'sessions'
+        session_base.mkdir()
+        prefix = (str(helper), '--session-base', str(session_base), '--')
+        environment = {'LLAMINAR_PERF_STATS_FILTER': 'forward_graph,immutable_lookup'}
+        for participants in (1, 2, 4, 8):
+            self.value['expected_config']['configuration'].update(n_threads=2, mpi_procs=participants)
+            self.publish()
+            with patch('model_kld_corpus.physical_workers', return_value=participants*2):
+                for boundary in (False, True):
+                    direct = self.original_mpi_command(participants, application_boundary=boundary)
+                    expected, values = self.prepare().launch(direct, environment)
+                    actual, wrapped_values = self.prepare().launch(prefix + direct, environment)
+                    self.assertEqual(actual[:4], prefix)
+                    self.assertEqual(actual[4:], expected)
+                    self.assertEqual(wrapped_values, values)
+                    self.assertEqual(actual[-2:], direct[-2:])
+                    self.assertEqual(actual.count('--'), 2 if boundary else 1)
+                    self.assertEqual(actual[5:11], ('-np', str(participants), '--bind-to',
+                        'none' if participants == 1 else 'socket', '--map-by',
+                        'slot' if participants == 1 else 'socket'))
+                    self.assertEqual(environment, {'LLAMINAR_PERF_STATS_FILTER': 'forward_graph,immutable_lookup'})
+
+    def test_original_guardian_rejects_incomplete_or_unsupported_envelopes(self):
+        """A pathname/root/application mismatch cannot substitute an unowned launch."""
+        helper = self.root / 'llaminar_mpi_session'; helper.write_text('metadata only')
+        base = self.root / 'sessions'; base.mkdir()
+        direct = self.original_mpi_command(1, application_boundary=True)
+        prefix = (str(helper), '--session-base', str(base), '--')
+        malformed = [prefix[:1], prefix[:2], prefix[:3], prefix,
+            (str(helper), '--other-base', str(base), '--') + direct,
+            (str(helper), '--session-base', 'relative', '--') + direct,
+            ('llaminar_mpi_session', '--session-base', str(base), '--') + direct,
+            (str(self.root/'missing'/'llaminar_mpi_session'), '--session-base', str(base), '--') + direct,
+            (str(helper), '--session-base', str(helper), '--') + direct,
+            (str(helper), '--session-base', str(base), '--unexpected', '--') + direct,
+            prefix + prefix + direct, prefix + ('/usr/bin/python3',) + direct,
+            prefix + direct[:-2], prefix + direct[:-2] + ('--',) + direct[-2:],
+            prefix + direct + ('--history-replay=foreign',)]
+        environment = {'LLAMINAR_PERF_STATS_FILTER': 'forward_graph'}
+        with patch('model_kld_corpus.physical_workers', return_value=4):
+            for command in malformed:
+                with self.subTest(command=command), self.assertRaises(ValueError):
+                    self.prepare().launch(command, environment)
+
+    def test_history_projection_requires_original_exact_registered_filter(self):
+        """Reuse the driver's authenticated aggregate narrowing before history projection."""
+        import run_production_parity_campaigns as driver
+        from dataclasses import replace
+        direct = self.original_mpi_command(1, application_boundary=True)
+        other = 'Original/QFN.ProductionParity/Other'
+        group = driver.CampaignGroup('CPU', 'FP32')
+        owner = driver.CampaignCell(name='synthetic metadata', group=group,
+            gtest_cases=(self.cell, other), command=direct[:-1]+('--gtest_filter='+self.cell+':'+other,),
+            environment=('LLAMINAR_PERF_STATS_FILTER=forward_graph',))
+        exact = driver._single_exact_cell(owner, self.cell)
+        self.assertEqual(exact.gtest_cases, (self.cell,))
+        self.assertEqual(exact.command[:-1], owner.command[:-1])
+        with patch('model_kld_corpus.physical_workers', return_value=4):
+            self.prepare().launch(exact.command, driver._registered_environment(exact))
+            for value in (other, '*', self.cell+':'+other, self.cell+'-*', ''):
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    self.prepare().launch(direct[:-1]+('--gtest_filter='+value,), driver._registered_environment(exact))
+        with self.assertRaises(ValueError):
+            driver._single_exact_cell(owner, 'foreign')
+        with self.assertRaises(ValueError):
+            driver._single_exact_cell(replace(owner, command=direct), self.cell)
 
     @patch("os.sched_getaffinity", return_value={0, 1, 2, 3})
     @patch("model_kld_corpus.physical_workers", return_value=4)

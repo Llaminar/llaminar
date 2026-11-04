@@ -927,3 +927,5 @@ TEST(PhysicalMemoryAuthority,
     EXPECT_EQ(found->materialized_new_bytes, kEnvelopeBytes);
     EXPECT_TRUE(found->complete());
 }
+
+#include "CPUWeightSourceTransactionContract.inc"

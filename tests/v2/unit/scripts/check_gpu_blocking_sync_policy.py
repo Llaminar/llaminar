@@ -443,6 +443,13 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/kernels/KernelFactory.cpp", "KernelFactory::prepareEmbeddingHandleLocal", "backend_sync_copy", 1),
         ("src/v2/loaders/gpu_pipeline/DeviceLoadPipeline.cpp", "workerLoop", "backend_event", 1),
         ("src/v2/loaders/gpu_pipeline/DeviceLoadPipeline.cpp", "DeviceLoadPipeline::processJobs", "worker_stream", 3),
+        # Failed startup may have accepted H2D/repack work before its terminal
+        # event could be recorded. The final pipeline owner joins exactly those
+        # streams before releasing their source slots, events and PMA claims.
+        # A successful processJobs already retired them; inference never enters
+        # this owner. GPUWeightSourceFailureRetirement proves the exceptional
+        # ordering and repeated release, without authorizing hot-path waits.
+        ("src/v2/loaders/gpu_pipeline/DeviceLoadPipeline.cpp", "DeviceLoadPipeline::release", "worker_stream", 2),
         ("src/v2/loaders/gpu_pipeline/WeightTranslator.h", "packGpuWeightsForTransfer", "backend_sync_copy", 4),
         ("src/v2/loaders/gpu_pipeline/WeightTranslator.h", "uploadGpuPackedWeights", "backend_sync_copy", 4),
         ("src/v2/loaders/gpu_pipeline/PinnedRingBuffer.cpp", "PinnedRingBuffer::release", "backend_device", 1),

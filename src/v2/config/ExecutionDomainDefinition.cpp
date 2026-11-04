@@ -296,7 +296,10 @@ namespace llaminar2
 
     bool ExecutionDomainDefinition::supportsRoutedExpertTensorSharding() const
     {
-        return isDomainScopedTP() && hasMultipleParticipants();
+        // A single original CPU owns the complete matrix: TP1 is the exact
+        // degenerate tensor partition, not a policy switch or a fake cohort.
+        return (participants.size()==1 && participants.front().isCPU()) ||
+            (isDomainScopedTP() && hasMultipleParticipants());
     }
 
     bool ExecutionDomainDefinition::samePhysicalParticipants(const ExecutionDomainDefinition &other) const
@@ -447,7 +450,7 @@ namespace llaminar2
         if (routed_compute_policy == RoutedExpertComputePolicy::TensorSharded &&
             !supportsRoutedExpertTensorSharding())
         {
-            errors.push_back("Domain '" + name + "' uses expert_compute=tensor-sharded but is not a multi-participant domain-scoped TP domain");
+            errors.push_back("Domain '" + name + "' uses expert_compute=tensor-sharded but is neither CPU TP1 nor a multi-participant domain-scoped TP domain");
         }
 
         return errors;

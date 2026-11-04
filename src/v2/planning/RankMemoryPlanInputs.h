@@ -79,6 +79,19 @@ namespace llaminar2
     [[nodiscard]] DeviceGenerationExecutionDomain declaredRankDeviceGenerationDomain(
         const RankExecutionPlan &plan);
 
+    /**
+     * @brief Quote the original common CPU reader/consumer transaction for one complete device plan.
+     * @param model Original native metadata inventory.
+     * @param config Final source/shard/component ownership, after PP/TP projection.
+     * @param policy Same original startup cap consumed by the common reader.
+     * @param precision Same explicit destination intent consumed by WeightManager.
+     * @param placement Original CPU source placement, not inferred from allocator ordinal.
+     * @return Maximum serialized input/scratch root, absent for direct final writes only.
+     */
+    std::optional<NativeWeightLoadStagingGeometry> quoteCPUWeightSourceStaging(
+        const ModelMemoryProfile& model,const DevicePlanConfig& config,
+        GPUWeightLoadMemoryPolicy policy,WeightPrecision precision,CPUStoragePlacement placement);
+
     /** @brief Immutable observations and execution policies for one rank BOM. */
     struct RankMemoryPlanInputRequest
     {
@@ -87,6 +100,12 @@ namespace llaminar2
         const RankInventory &inventory; ///< Observation for this same communicator rank.
         /** Fresh upload-ring geometry; absent only for certified retained preparation. */
         std::optional<GPUWeightLoadMemoryGeometry> weight_load_geometry;
+        /** Original fresh common CPU source policy; absent only for certified retained preparation. */
+        std::optional<GPUWeightLoadMemoryPolicy> native_weight_source_policy;
+        /** Same destination representation selected by the original ModelContext/WeightManager. */
+        WeightPrecision weight_precision = WeightPrecision::NATIVE;
+        /** Original loader/factory CPU placement; required for a fresh CPU source transaction. */
+        std::optional<CPUStoragePlacement> native_source_placement;
         /** Explicit diagnostics only; ordinary production has no snapshot owner. */
         std::optional<GraphSnapshotMemoryCapacity> snapshot_capacity;
         /** Present means captured serving; an empty declared ladder is invalid. */

@@ -154,6 +154,13 @@ CUDA/ROCm integration suites. Reject incomplete or incompatible traces and
 report unsupported candidate paths instead of inventing missing observations.
 Replay complements native capture and end-to-end gates; it does not replace them.
 
+Name tests after the contract they prove. Reserve **replay** for replaying
+recorded inputs and initial state through the production implementation against
+an expected outcome. Repeating a synthetic fixture does not by itself make a
+replay test. Construction, ownership, retirement and destruction checks are
+**lifecycle** tests; allocation and layout checks are **contract** or **geometry**
+tests. Use that distinction consistently in test names, labels and documentation.
+
 ### Performance and Observability
 
 23. **Measure production binaries and production workloads.** Canonical server
@@ -879,7 +886,7 @@ The expanded forms split the same intent into
 `--moe-routed-expert-tier 'tier@name;priority=N;...'`. Unlike compact tiers,
 these require explicit `--moe-routed-expert-placement single-domain` or
 `tiered-overlay` to enable placement. Domain options such as `scope`, `owner`,
-`ranks`, `backend`, and `routed_compute` override those
+`ranks`, `backend`, and `expert_compute` override those
 particular axes; do not specify them all unless the topology actually requires
 it. A routed domain accepts single/rank-local/node-local scope, not a global
 TP domain; cross-host overlay connects distinct hardware domains.

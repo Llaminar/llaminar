@@ -13,6 +13,7 @@
 #include "MoEOverlayParticipantResidency.h"
 #include "loaders/ExpertGemmRegistry.h"
 #include "tensors/TensorKernels.h"
+#include "CPUExpertShardSourceSelection.h"
 #include <functional>
 #include <optional>
 #include <stdexcept>
@@ -36,6 +37,9 @@ struct MoEOverlayPreparedGraphBankRequest
     int first_expert;
     int local_experts;
     std::reference_wrapper<const std::vector<bool>> expert_mask;
+    ModelContextId original_model{}; ///< Original PreparedWeightStore model, mandatory for joint source leases.
+    std::shared_ptr<const MoEOverlayParticipantResidencyRegistry> original_residency; ///< Original source-bound publication owner.
+    std::shared_ptr<const MoEExpertOwnerMap> original_owners; ///< SAME source-prepared map, not a recomputed routing alias.
 };
 
 /** @brief Borrowed complete triplets with shared ownership of their actual execution allocations. */
@@ -45,6 +49,9 @@ struct MoEOverlayPreparedGraphBank
     std::vector<ITensorGemm *> up;
     std::vector<ITensorGemm *> down;
     std::vector<std::shared_ptr<ITensorGemm>> owners;
+    /// Exact prepared/source lease; retains original native matrices and selected IDs.
+    std::shared_ptr<const MoEOverlayParticipantResidencyRegistry::CPUJointLayer> cpu_joint_layer;
+    int local_intermediate = 0; ///< Explicit native fragment F, distinct from original model F.
 };
 
 /**
@@ -86,7 +93,9 @@ struct MoEOverlayPreparedGraphBank
     {
         // The canonical owner map supplies complete typed descriptors. Scope
         // only selects among that source; it never synthesizes a second map.
-        const auto owners = MoEExpertOwnerMap::build(runtime.sourcePlan());
+        const auto legacy_owners = request.original_owners ? std::optional<MoEExpertOwnerMap>{} :
+            std::optional<MoEExpertOwnerMap>{MoEExpertOwnerMap::build(runtime.sourcePlan())};
+        const auto &owners=request.original_owners?*request.original_owners:*legacy_owners;
         for (const auto &owner : owners.participants())
         {
             if ((!request.domain.empty() && owner.domain_name != request.domain) ||
@@ -106,6 +115,44 @@ struct MoEOverlayPreparedGraphBank
         required.assign(static_cast<size_t>(request.experts), false);
         for (int expert = request.first_expert; expert < request.first_expert + count; ++expert)
             required[expert] = true;
+    }
+    const auto *domain=runtime.domainForName(selected->domain_name);
+    if (domain && domain->routed_compute_policy==RoutedExpertComputePolicy::TensorSharded &&
+        !(request.device.is_cpu() && domain->participants.size()==1)) {
+        if (!request.device.is_cpu() || domain->scope!=ExecutionDomainScope::NODE_LOCAL ||
+            !request.original_model.value || !request.original_owners)
+            throw std::invalid_argument("CPU joint graph bank requires original model/source placement authority");
+        if (!request.original_residency || !request.original_residency->isCPUJointParticipant(selected->participant_id))
+            throw std::invalid_argument("CPU joint graph bank has no original fragment publication owner");
+        const auto published=request.original_residency->initialCPUJointLayer(selected->participant_id,request.layer);
+        const auto acquired=published?published->source():nullptr;
+        if (!acquired || !acquired->cpu_joint_source)
+            throw std::runtime_error("CPU joint graph bank has no original source-bound prepared layer");
+        for (const auto &binding:acquired->sources)
+            if (binding.identity.model_id!=request.original_model)
+                throw std::invalid_argument("CPU joint graph bank belongs to a foreign original model context");
+        const auto &source=*acquired->cpu_joint_source;
+        const auto &geometry=source.ownership().geometry();
+        if (source.participant()!=*selected || geometry.experts!=request.experts ||
+            geometry.model_columns!=request.d_model || geometry.intermediate_columns!=request.expert_intermediate ||
+            acquired->experts.size()!=static_cast<size_t>(request.experts))
+            throw std::invalid_argument("CPU joint graph bank changed original source/model/member geometry");
+        MoEOverlayPreparedGraphBank bank;
+        bank.gate.resize(request.experts,nullptr);bank.up.resize(request.experts,nullptr);bank.down.resize(request.experts,nullptr);
+        for (int expert=0;expert<request.experts;++expert) {
+            const bool original=source.contains(expert);
+            if (required[expert]!=original)
+                throw std::invalid_argument("CPU joint graph bank changed original selected expert membership");
+            if (!original)continue;
+            const auto *row=request.original_owners->placementFor(request.layer,expert);
+            const auto &triplet=acquired->experts[static_cast<size_t>(expert)];
+            if (!row || row->shard_cohort!=source.cohort() || !triplet.complete())
+                throw std::invalid_argument("CPU joint graph bank replaced its original source cohort or prepared triplet");
+            bank.gate[expert]=triplet.gate.get();bank.up[expert]=triplet.up.get();bank.down[expert]=triplet.down.get();
+        }
+        bank.local_intermediate=source.ownership().projection(WeightRole::MoEExpertUp).rows;
+        bank.cpu_joint_layer=published;
+        return bank;
     }
     std::vector<MoEOverlayPreparedExpertPayload> payloads;
     std::string error;

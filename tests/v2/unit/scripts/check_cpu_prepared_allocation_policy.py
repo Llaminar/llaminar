@@ -157,6 +157,11 @@ def placement_owned(expression: list[Token], body: list[Token], path: str,
     initial, final = writes[0][1], writes[1][1]
     if not accounted(final): return False
     compact = text(body)
+    # These two mutable normalization sites cannot lend a reference/pointer
+    # that changes their value after the checked assignment. Ordinary immutable
+    # value aliases are handled above; mutable aliases have no ownership proof.
+    if re.search(r"&(?:&)?[A-Za-z_]\w*=placement[;,]|=&placement[;,]",compact):
+        return False
     # Only this CPU/GPU binding boundary can conditionally upgrade local policy;
     # the CPU arm rejects a missing model issuer before entering preparation.
     if (path, caller) == ("src/v2/loaders/PreparedWeightStore.cpp", "PreparedWeightStore::prepareGemm"):
@@ -164,13 +169,16 @@ def placement_owned(expression: list[Token], body: list[Token], path: str,
             "if(device.is_cpu()){if(constautoauthority=physicalMemoryAuthority())placement="+
             text(final)+";elsethrowstd::logic_error();}")
         return text(initial) == "CPUWeightStoragePlacement::local()" and expected in compact
-    # The optional initial placement is assigned only by the accounted-field
-    # rule below. Stage entrypoints require their admitted prepared store before
-    # reaching the second normalization arm. Calls still check this exact value.
+    # The service's initial preparation uses its actual target NUMA placement.
+    # Production stage entrypoints require the original prepared Store; only
+    # explicit low-level callers may omit it. No alternate initial override
+    # can bypass the same PMA normalization before a preparation call.
     if (path, caller) == ("src/v2/execution/moe/MoEExpertWeightService.cpp", "MoEExpertWeightService::prepareGemmEngines"):
-        expected = ("autoplacement="+text(initial)+
-            ";if(!ctx.initial_cpu_storage_placement&&ctx.prepared_store)placement="+text(final)+";")
-        return text(initial).startswith("ctx.initial_cpu_storage_placement.value_or(") and expected in compact
+        original = ("enforce_numa_placement?CPUWeightStoragePlacement::onNode(target_numa_node)"
+                    ":CPUWeightStoragePlacement::local()")
+        expected = ("autoplacement="+original+
+                    ";if(ctx.prepared_store)placement="+text(final)+";")
+        return text(initial) == original and expected in compact
     return False
 
 def weight_policy(expression: list[Token], body: list[Token], seen: frozenset[str] = frozenset()) -> bool:
@@ -246,7 +254,7 @@ def scan_source(path: str, raw: str) -> list[Violation]:
     workspace_fixtures: dict[tuple[str,str],int] = {}
     for index, token in enumerate(tokens):
         name = token.text
-        if name not in {*PREPARATION, "allocateUnadmitted", "allocate", "local", "onNode", "createGemm", "DeviceWorkspaceManager", "WorkspaceAllocator", "initial_cpu_storage_placement"}: continue
+        if name not in {*PREPARATION, "allocateUnadmitted", "allocate", "local", "onNode", "createGemm", "DeviceWorkspaceManager", "WorkspaceAllocator"}: continue
         if name in ("local","onNode") and (index < 2 or text(tokens[index-2:index]) != "CPUWeightStoragePlacement::"):
             continue
         if name in ("allocate","createGemm") and not path.startswith(ROLES): continue
@@ -321,33 +329,6 @@ def scan_source(path: str, raw: str) -> list[Violation]:
                 if complete == expected and facade_calls == 1: continue
             reject("allocateUnadmitted is forbidden outside its exact low-level declaration/facade")
             continue
-        if name == "initial_cpu_storage_placement":
-            declaration = "std::optional<CPUWeightStoragePlacement>initial_cpu_storage_placement;"
-            if (path == "src/v2/execution/moe/MoEExpertWeightService.h" and interval is None and
-                text(tokens[max(0,index-6):index+2]) == declaration):
-                continue
-            if index+1 < len(tokens) and tokens[index+1].text == "=":
-                end = index+2
-                while end < len(tokens) and tokens[end].text != ";":
-                    if tokens[end].text in ("(", "[", "{"): end = closing(tokens,end)
-                    end += 1
-                if not placement_owned(tokens[index+2:end],body,path,caller):
-                    reject("initial retained CPU placement must be explicitly accounted")
-                continue
-            # Only the two exact reads in the normalization above are supported.
-            # emplace/reset, member pointers, references and other aliases fail
-            # closed instead of bypassing the explicit assignment rule.
-            complete = tokens[bisect.bisect_right(offsets,interval[0]):bisect.bisect_left(offsets,interval[1])] if interval else []
-            normalization_read = (
-                text(tokens[max(0,index-2):index+4]) == "ctx.initial_cpu_storage_placement.value_or(" or
-                (text(tokens[max(0,index-5):index]) == "if(!ctx." and
-                 text(tokens[index+1:index+6]) == "&&ctx.prepared_store)"))
-            if not ((path,caller) == ("src/v2/execution/moe/MoEExpertWeightService.cpp",
-                    "MoEExpertWeightService::prepareGemmEngines") and normalization_read and
-                sum(entry.text == name for entry in complete) == 2 and
-                placement_owned([Token("placement",token.offset)],complete,path,caller)):
-                reject("unsupported setter or alias of initial retained CPU placement")
-            continue
         if index+1 >= len(tokens) or tokens[index+1].text != "(":
             if name in PREPARATION:
                 reject(f"indirect {name} reference has no checkable placement")
@@ -386,7 +367,7 @@ def scan(root: Path) -> list[Violation]:
         raw=path.read_text(encoding="utf-8")
         if not executable: executable=bool(TOKEN.search(executable_source(raw)))
         preparation=any(name in raw for name in (*PREPARATION,"allocateUnadmitted","CPUWeightStoragePlacement",
-            "createGemm","initial_cpu_storage_placement"))
+            "createGemm"))
         workspace=(not preparation and any(name in raw for name in ("DeviceWorkspaceManager","WorkspaceAllocator")) and
             WORKSPACE_CONSTRUCTION.search(executable_source(raw)))
         if not preparation and not workspace: continue

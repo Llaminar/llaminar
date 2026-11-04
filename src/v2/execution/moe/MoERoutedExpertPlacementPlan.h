@@ -207,9 +207,11 @@ namespace llaminar2
             return std::nullopt;
         }
 
+        /** @return Logical tensor partition geometry, including the exact full-matrix CPU TP1 case. */
         bool supportsRoutedExpertTensorSharding() const
         {
-            return isCollectiveDomain() && hasMultipleParticipants();
+            return (participants.size()==1 && participants.front().isCPU()) ||
+                (isCollectiveDomain() && hasMultipleParticipants());
         }
 
         bool supportsWholeExpertApportionment() const
@@ -1200,7 +1202,7 @@ namespace llaminar2
             if (domain.routed_compute_policy == RoutedExpertComputePolicy::TensorSharded && !domain.supportsRoutedExpertTensorSharding())
             {
                 addError("routed expert domain '" + domain.name +
-                         "' uses expert_compute=tensor-sharded but is not a multi-participant collective domain");
+                         "' uses expert_compute=tensor-sharded but is neither CPU TP1 nor a multi-participant collective domain");
             }
         }
 

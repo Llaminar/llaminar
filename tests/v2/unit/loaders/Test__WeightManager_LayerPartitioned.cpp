@@ -19,6 +19,9 @@
 
 #include "loaders/WeightManager.h"
 #include "loaders/ModelContext.h"
+#include "utils/PlanningGGUFFixture.h"
+#include "utils/CPUWeightPlanTestAdmission.h"
+#include "loaders/PreparedWeightStore.h"
 
 using namespace llaminar2;
 
@@ -29,16 +32,30 @@ using namespace llaminar2;
 class Test__WeightManager_LayerPartitioned : public ::testing::Test
 {
 protected:
-    static constexpr const char* TEST_MODEL_PATH = "models/qwen2.5-0.5b-instruct-q4_0.gguf";
-
+    // The real ModelContext source/PP path consumes a tiny generated original directory.
+    std::unique_ptr<llaminar2::test::PlanningGGUFFixture> source_;
     void SetUp() override
     {
-        // Check model exists
-        std::ifstream f(TEST_MODEL_PATH);
-        if (!f.good())
-        {
-            GTEST_SKIP() << "Test model not found: " << TEST_MODEL_PATH;
+        source_=std::make_unique<llaminar2::test::PlanningGGUFFixture>(false,false,
+            GGUFTensorType::F32,32,std::nullopt,8,
+            llaminar2::test::PlanningGGUFFixture::Geometry::Directory,24);
+    }
+    /** @brief Admit all source consumers permitted by this original PP declaration. */
+    void admit(const std::shared_ptr<ModelContext>& context,int first,int last,bool embedding,bool head)
+    {
+        auto manager=context->concreteWeightManager();
+        auto& loader=context->concreteLoader();
+        InferenceStrategy original;original.model_id={98501};original.devices={DeviceId::cpu()};
+        WeightPlan plan(original);
+        for(const auto& name:loader.materializationNames()) {
+            const int layer=inferWeightLayer(name);
+            if(layer>=0 ? layer<first || layer>=last :
+                (name=="token_embd.weight" ? !embedding : !head))continue;
+            WeightRequirement request;request.canonical_name=name;request.role=inferWeightRole(name);
+            request.layer=layer;request.target_device=DeviceId::cpu();plan.add(std::move(request));
         }
+        ASSERT_TRUE(manager->preparedWeightStore()->bindModelIdIfUnset(original.model_id));
+        llaminar2::test::admitCPUWeightPlansForTest(*manager,loader,{&plan});
     }
 
     /**
@@ -48,10 +65,12 @@ protected:
         int first_layer, int last_layer,
         bool has_embedding, bool has_lm_head)
     {
-        return ModelContext::createForPPStage(
-            TEST_MODEL_PATH,
+        auto context=ModelContext::createForPPStage(
+            source_->path(),
             first_layer, last_layer,
             has_embedding, has_lm_head);
+        if(context)admit(context,first_layer,last_layer,has_embedding,has_lm_head);
+        return context;
     }
 };
 
@@ -193,7 +212,7 @@ TEST_F(Test__WeightManager_LayerPartitioned, AllFFNWeights_InsideRange_Loaded)
     EXPECT_NE(ctx->getWeightForDevice("blk.5.ffn_gate.weight"), nullptr);
     EXPECT_NE(ctx->getWeightForDevice("blk.5.ffn_up.weight"), nullptr);
     EXPECT_NE(ctx->getWeightForDevice("blk.5.ffn_down.weight"), nullptr);
-    EXPECT_NE(ctx->getWeightForDevice("blk.5.ffn_norm.weight"), nullptr);
+    EXPECT_NE(ctx->getWeightForDevice("blk.5.post_attention_norm.weight"), nullptr);
 }
 
 /**
@@ -241,7 +260,8 @@ TEST_F(Test__WeightManager_LayerPartitioned, Strategy_IsLayerPartitioned)
 TEST_F(Test__WeightManager_LayerPartitioned, Stage0_LoadsFewerWeights)
 {
     // Full model context
-    auto full_ctx = ModelContext::create(TEST_MODEL_PATH);
+    auto full_ctx = ModelContext::create(source_->path());
+    if(full_ctx)admit(full_ctx,0,24,true,true);
     ASSERT_NE(full_ctx, nullptr);
 
     // Stage 0: first half

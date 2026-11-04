@@ -14,6 +14,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -24,16 +27,62 @@ namespace llaminar2
     class WeightVRAMPool;
     class PinnedRingBuffer;
 
+    /**
+     * @brief Immutable output-byte source that populates an existing pinned slot.
+     *
+     * Loading-time native conversion may retain its admitted input/scratch arena
+     * and original model reader here instead of materializing a full host matrix.
+     * Concurrent producer lanes may call read(); implementations serialize any
+     * shared scratch through its original authority. This is not a GPU operation.
+     */
+    class WeightJobSource
+    {
+    public:
+        /** @brief Retire retained native-source and scratch owners after all pending jobs. */
+        virtual ~WeightJobSource() = default;
+        /** @return Complete logical output extent, independent of input representation. */
+        [[nodiscard]] size_t sizeBytes() const noexcept { return bytes_; }
+        /**
+         * @brief Fill exactly the requested output range without allocating another output buffer.
+         * @param offset First output byte, relative to this complete logical source.
+         * @param destination Exact live pinned extent, valid only for this call.
+         * @throws std::invalid_argument For empty or out-of-range output requests.
+         * @details An implementation failure propagates to pipeline admission;
+         * partially written bytes are never submitted to the GPU.
+         */
+        void read(size_t offset, std::span<std::byte> destination) const
+        {
+            if (destination.empty() || !destination.data() || offset > bytes_ ||
+                destination.size() > bytes_ - offset)
+                throw std::invalid_argument("Weight source read exceeds its declared output extent");
+            readRange(offset, destination);
+        }
+    protected:
+        /** @brief Declare the complete nonempty output extent before enqueueing. */
+        explicit WeightJobSource(size_t bytes) : bytes_(bytes)
+        {
+            if (!bytes) throw std::invalid_argument("Weight source requires nonempty output storage");
+        }
+        /**
+         * @brief Populate a checked output range through the source's existing owners.
+         * @param offset Valid output-byte offset.
+         * @param destination Live pinned bytes to overwrite completely.
+         */
+        virtual void readRange(size_t offset, std::span<std::byte> destination) const = 0;
+    private:
+        const size_t bytes_; ///< Immutable logical output bytes, not a live memory ledger.
+    };
+
     /// Describes a single weight to be uploaded and repacked on GPU.
     struct WeightJob
     {
         std::string name;          ///< Weight name (must match a planned weight in the pool)
-        const void *host_raw_data; ///< mmap'd raw GGUF block data on host
-        size_t raw_bytes;          ///< Raw GGUF byte count
+        const void *host_raw_data = nullptr; ///< Mapped/native source, absent for a bounded producer.
+        size_t raw_bytes = 0;       ///< Exact native/output byte count for this job.
         RepackFormat format;       ///< GPU repack kernel format dispatch
-        int N;                     ///< Number of output features (rows in weight matrix)
-        int K;                     ///< Number of input features (columns)
-        bool is_asymmetric;        ///< True if format has mins (Q4_K etc.)
+        int N = 0;                 ///< Number of output features (rows in weight matrix)
+        int K = 0;                 ///< Number of input features (columns)
+        bool is_asymmetric = false; ///< True if format has mins (Q4_K etc.)
 
         /**
          * Chunk coordinates for bounded staging.
@@ -70,6 +119,24 @@ namespace llaminar2
          * advance by this capacity.
          */
         int packed_payload_capacity_bytes_per_block = 0;
+
+        /** Owned bounded producer, mutually exclusive with host_raw_data. */
+        std::shared_ptr<const WeightJobSource> bounded_source;
+        /** Output-byte offset in bounded_source; complete-row chunking advances it. */
+        size_t source_offset_bytes = 0;
+
+        /**
+         * @brief Authenticate one concrete source and its complete live range.
+         * @throws std::invalid_argument For absent/ambiguous sources or an invalid range.
+         */
+        void validateSource() const
+        {
+            if (!raw_bytes || static_cast<bool>(host_raw_data) == static_cast<bool>(bounded_source) ||
+                (!bounded_source && source_offset_bytes != 0) ||
+                (bounded_source && (source_offset_bytes > bounded_source->sizeBytes() ||
+                 raw_bytes > bounded_source->sizeBytes() - source_offset_bytes)))
+                throw std::invalid_argument("Weight job requires one exact bounded host source: " + name);
+        }
 
     };
 
@@ -199,6 +266,9 @@ namespace llaminar2
         RepackKernels kernels_;
         int num_streams_;
         bool initialized_ = false;
+        /** Submission lifetime is retired only after every owning stream drains. */
+        enum class WorkLifetime : uint8_t { Retired, Pending };
+        WorkLifetime work_lifetime_ = WorkLifetime::Retired;
         size_t num_processed_ = 0;
 
         // Backend resources (void* for header compatibility)

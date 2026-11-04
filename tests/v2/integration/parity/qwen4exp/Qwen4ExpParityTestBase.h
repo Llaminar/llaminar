@@ -13,6 +13,10 @@
  * follows the original artifact-directory reset and precedes model admission.
  */
 #pragma once
+#include "utils/ScopedMoEParityCoordinatedSession.h"
+#include "utils/MPIContext.h"
+#include "execution/runner/IOrchestrationRunnerFactory.h"
+#include "Qwen4ExpCPUJointSocketEvidence.h"
 #include "config/OrchestrationConfigParser.h"
 #include "tools/ModelKLDQFNOwner.h"
 #include "Qwen4ExpProductionParityCases.h"
@@ -65,6 +69,52 @@ class Qwen4ExpConfigDrivenParityTest : public qwen2::ConfigDrivenParityTest<Deri
 {
 protected:
     using Base = qwen2::ConfigDrivenParityTest<Derived>;
+    /** @brief Retain the original published MPI inventory for the exact CPU socket domain. */
+    void SetUp() override
+    {
+        if(isCPUJointNumericalSurface()) {
+            Base::mpi_ctx_=MPIContextFactory::global();
+            ASSERT_TRUE(Base::mpi_ctx_);
+            const auto inventory=Base::mpi_ctx_->clusterInventory();ASSERT_TRUE(inventory);
+            ASSERT_NO_THROW(requireOriginalCPUJointSocketRanks(
+                static_cast<const Derived*>(this)->modelParityCase(),*inventory));
+        }
+        Base::SetUp();
+    }
+
+    /** @return The same original published MPI owner, without constructing another discovery context. */
+    std::shared_ptr<IMPIContext> freshParityMPIContext() const override
+    {
+        if(!isCPUJointNumericalSurface())return {};
+        if(!Base::mpi_ctx_)throw std::invalid_argument("CPU joint numerical factory lost original MPI owner");
+        return Base::mpi_ctx_;
+    }
+
+    /** @return Participant-local backend for base fixture setup; follower never claims the continuation GPU. */
+    DeviceId getDevice() override
+    {
+        return isCPUJointNumericalSurface()?getDeviceForRank():Base::getDevice();
+    }
+
+    /** @return The original rank's actual continuation or CPU-only follower backend. */
+    DeviceId getDeviceForRank() override
+    {
+        if(!isCPUJointNumericalSurface())return Base::getDeviceForRank();
+        const auto& cell=static_cast<const Derived*>(this)->modelParityCase();
+        const auto& plan=*cell.topology.expert_overlay_plan;
+        const auto domain=std::find_if(plan.domains.begin(),plan.domains.end(),
+            [&](const auto& value){return value.name==plan.continuation_domain;});
+        if(domain==plan.domains.end() || !Base::mpi_ctx_)
+            throw std::invalid_argument("CPU joint numerical fixture lost original rank/domain");
+        const auto rank=Base::mpi_ctx_->rank();
+        if(rank==domain->owner_rank)return domain->participants.front().toLocalDeviceId();
+        const auto members=qwen4ExpCPUJointSocketMembers(cell);
+        const auto member=std::find_if(members.begin(),members.end(),
+            [&](const auto& value){return value.world_rank==rank;});
+        if(member==members.end())throw std::invalid_argument("CPU joint numerical follower is not an original member");
+        return member->address.toLocalDeviceId();
+    }
+
     /**
      * @brief Apply only an explicit exact-cell frozen history before base admission.
      * @throws std::invalid_argument For foreign source/cell, invalid diagnostic
@@ -511,9 +561,79 @@ protected:
      */
     void runQwen4ExpProductionParityCampaign()
     {
-        Base::runProductionParityCampaign();
+        if(!isCPUJointNumericalSurface()) {
+            Base::runProductionParityCampaign();
+            assertLookupReuseAfterProductionProof();
+            return;
+        }
+        accuracy::requireQFN(bool(Base::frozen_history_replay_),
+            "CPU joint stage diagnosis requires an explicit original frozen full-stage history");
+        accuracy::requireQFN(Base::config_.allreduce_stages.empty() &&
+            Base::config_.collective_evidence_source==ParityCollectiveEvidenceSource::PostCollectiveSnapshot,
+            "CPU joint full-stage comparison requires original completed continuation snapshots");
+        Base::beginProductionParityEvidence();
+        ASSERT_TRUE(Base::setupProductionParityPipeline());
+        ASSERT_TRUE(Base::hasOrchestrationRunner());
+        ScopedMoEParityCoordinatedSession session(*Base::orch_runner_);
+        if(!session.isAuthority()) {
+            session.serveFollowerAndFinish();
+            publishCPUJointHistoryResources();
+            return;
+        }
+        Base::runProductionParityCampaignOnInitializedRunner();
         assertLookupReuseAfterProductionProof();
+        session.finishAuthority();
+        publishCPUJointHistoryResources();
     }
+
+    /**
+     * @brief Publish actual per-rank CPU resources after the original worker/runner retirement.
+     * @note The same original inventory supplies rank/socket identity; this does no discovery.
+     */
+    void publishCPUJointHistoryResources()
+    {
+        const auto& cell=static_cast<const Derived*>(this)->modelParityCase();
+        const auto inventory=Base::mpi_ctx_->clusterInventory();
+        accuracy::requireQFN(bool(inventory),"CPU joint history lost original rank inventory");
+        const auto endpoints=requireOriginalCPUJointSocketRanks(cell,*inventory);
+        const int rank=Base::mpi_ctx_->rank();
+        const auto endpoint=std::find_if(endpoints.begin(),endpoints.end(),[&](const auto& value){return value.rank==rank;});
+        const auto original=std::find_if(inventory->ranks.begin(),inventory->ranks.end(),[&](const auto& value){return value.rank==rank;});
+        accuracy::requireQFN(endpoint!=endpoints.end() && original!=inventory->ranks.end(),
+            "CPU joint history omitted its original bound rank");
+        std::string affinity_details;
+        accuracy::requireQFN(MPIBootstrapPhase::verifyStartupThreadAffinity(endpoint->numa_node,false,affinity_details),
+            "CPU joint history affinity differs from original bound NUMA endpoint");
+        const auto cpu=Base::frozen_history_replay_->cpuExecutionEvidence(
+            PerfStatsCollector::snapshot({"kernel.cpu_moe_router_q8_worker_rows"}),
+            FrozenParityHistoryReplay::observeCPUExecution());
+        accuracy::requireQFN(original->cpu_worker_threads==cpu.at("requested_workers").template get<int>(),
+            "CPU joint history worker request differs from original rank inventory");
+        nlohmann::json record={{"schema","llaminar.model-kld-history-cpu-rank.v1"},
+            {"descriptor_sha256",Base::frozen_history_replay_->identity()},
+            {"world_rank",rank},{"world_size",Base::mpi_ctx_->world_size()},
+            {"original_node_id",original->node_id},{"numa_node",endpoint->numa_node},{"socket_id",endpoint->socket},
+            {"cpu_execution",cpu},{"runner_retired",true}};
+        std::ofstream output(Base::ensureResultsDir()/("history_replay_cpu_rank_"+std::to_string(rank)+".json"),std::ios::trunc);
+        output<<record.dump(2)<<'\n';output.close();
+        accuracy::requireQFN(bool(output),"Cannot publish original CPU joint history rank resources");
+    }
+
+    /** @return Whether the exact authored expert domain has real multi-member CPU fragments. */
+    bool isCPUJointNumericalSurface() const
+    {
+        const auto& cell=static_cast<const Derived*>(this)->modelParityCase();
+        return cell.topology.expert_overlay_plan &&
+            MoEExpertOwnerMap::usesCPUJointFragments(*cell.topology.expert_overlay_plan);
+    }
+
+    /** @return Only the real continuation owns reference generation/comparison while peers serve commands. */
+    ParityReferenceGenerationCoordination parityReferenceGenerationCoordination() const override
+    {
+        return isCPUJointNumericalSurface()?ParityReferenceGenerationCoordination::ArtifactAuthorityOnly:
+            Base::parityReferenceGenerationCoordination();
+    }
+
 
     /** @brief Exact functional MTP replay, separate from frozen-history numerical acceptance.
      * Uses the same admitted runner, captured source/remote graphs, prefix

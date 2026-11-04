@@ -1,5 +1,5 @@
 /** @file NativeAuxiliaryResourceCatalog.h
- * @brief Closed auxiliary native program classes from original prepared-source metadata.
+ * @brief One installed auxiliary allowance selector with separate original live creation authority.
  */
 #pragma once
 #include "NativeOrderingEventProgram.h"
@@ -70,6 +70,20 @@ struct NativeAuxiliaryQualifiedClass final {
     std::optional<NativeAuxiliaryRemoteFamilyScope> remoteFamily={};
 };
 }
+/**
+ * @brief Cold supported-backend/program allowance; never a live source or creation capability.
+ *
+ * Cross-rank BOM validation may price the original remote backend without a
+ * local worker. No generation, source identity or native handle is represented;
+ * original live selection and PMA validation remain mandatory at materialization.
+ */
+struct NativeAuxiliaryResourceAllowance final {
+    std::size_t hostBytes,deviceBytes;
+    std::string evidence;
+    NativePhysicalLifetime lifetime;
+    NativeAuxiliaryResourceProgram program;
+    std::optional<NativeAuxiliaryRemoteFamilyScope> remoteFamily={};
+};
 /** @brief Immutable selected limits, distinct from physical materialization or a live ledger. */
 struct NativeAuxiliaryResourceSelection final {
     std::size_t hostBytes,deviceBytes;
@@ -79,9 +93,19 @@ struct NativeAuxiliaryResourceSelection final {
     std::optional<NativeAuxiliaryResourceProgram> program; ///< Exact requested capture class, even when a reviewed family row selected it.
     std::optional<NativeAuxiliaryRemoteFamilyScope> remoteFamily={};
 };
-/** @brief Installed selector consumes the original immutable source key, never queries SDKs or hashes DSOs. */
+/** @brief Cold BOM uses installed backend/program bounds; live creation separately authenticates original immutable source. */
 class NativeAuxiliaryResourceCatalog final {
 public:
+    /**
+     * @brief Price the installed supported family without local native state.
+     * @param backend Exact original observed GPU backend, never a guessed local worker.
+     * @param program Closed immutable operation family and declared geometry.
+     * @return Limits/evidence/lifetime only; no live generation or source capability.
+     * @throws std::invalid_argument For a non-GPU backend.
+     * @throws std::runtime_error When no reviewed installed family accepts the program.
+     */
+    static NativeAuxiliaryResourceAllowance allowance(DeviceType,NativeAuxiliaryResourceProgram);
+    /** @brief Authenticate the original live local worker/generation/source for actual creation. */
     static NativeAuxiliaryResourceSelection require(DeviceId,NativeAuxiliaryResourceProgram);
     /** @return Existing portable native runtime/hardware/count class; application source text is not an input. */
     static std::string portableSourceIdentity(const NativeContextBirthKey&);
@@ -91,6 +115,15 @@ public:
 private:
     friend struct test::NativeOrderingEventGroupReplayAccess;
     friend struct test::PooledRemoteGraphHostReplayAccess;
+    /**
+     * @brief Share row validation between cold BOM and original live creation.
+     * @param backend Original resource backend, independent of the receiving rank.
+     * @param program Operation family and its admitted geometry.
+     * @param rows Installed limits or the explicit replay fixture's immutable rows.
+     * @return Matching limits without a live context identity or creation permit.
+     * @throws std::exception For invalid families or an unsupported program.
+     */
+    static NativeAuxiliaryResourceAllowance selectAllowance(DeviceType,NativeAuxiliaryResourceProgram,std::span<const detail::NativeAuxiliaryQualifiedClass>);
     static NativeAuxiliaryResourceSelection select(const NativeContextBirthKey&,std::uint64_t,NativeAuxiliaryResourceProgram,std::string_view,std::span<const detail::NativeAuxiliaryQualifiedClass>);
 };
 }

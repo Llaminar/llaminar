@@ -145,7 +145,7 @@ namespace llaminar2::test
     TEST(Test__MoEOverlayActivationEpochProtocol,
          FixedABIAndTwoBanksPreservePipelinedRoundTripsAcrossReset)
     {
-        EXPECT_EQ(kMoEOverlayActivationABIVersion, 5u);
+        EXPECT_EQ(kMoEOverlayActivationABIVersion, 7u);
         EXPECT_EQ(sizeof(MoEOverlayActivationEndpointStatus), 128u);
         EXPECT_EQ(sizeof(MoEOverlayActivationEpochControl), 1152u);
         EXPECT_EQ(alignof(MoEOverlayActivationEpochControl), 64u);
@@ -820,6 +820,67 @@ namespace llaminar2::test
         EXPECT_EQ(control.admission.ready_signal, kMoEOverlayActivationAbortTimeline);
         EXPECT_FALSE(protocol.completedTraffic(*identity, &error).has_value());
         EXPECT_FALSE(protocol.reset(*identity, &error));
+    }
+
+    /**
+     * @test Shared physical bytes are an acquired terminal observation and reset
+     * with their original epoch. A publisher may copy rows needed only by sibling
+     * lanes even when this lane's own logical descriptor is empty.
+     */
+    TEST(Test__MoEOverlayActivationEpochProtocol,
+         SharedHiddenTrafficIsTerminalOwnedAndResetWithOriginalEpoch)
+    {
+        const auto config = makeConfig({7});
+        MoEOverlayActivationEpochControl control;
+        MoEOverlayActivationEpochProtocol::initialize(control, config);
+        MoEOverlayActivationEpochProtocol protocol(control, config);
+        std::string error;
+        for (std::uint64_t generation = 1; generation <= 20; ++generation)
+        {
+            const auto identity = protocol.arm(makeTicket(config, generation), generation, 10000, &error);
+            ASSERT_TRUE(identity.has_value()) << error;
+            activateBoth(protocol, *identity);
+            ASSERT_TRUE(protocol.publishDispatch(*identity, 0, 0, 0, 0, &error)) << error;
+            ASSERT_TRUE(protocol.consumeDispatch(*identity, 0, &error).has_value()) << error;
+            // This is a recorded producer observation; no GPU execution is
+            // claimed by the passive protocol/ownership replay.
+            const std::uint64_t observed = generation % 2 ? 1024 : 0;
+            control.continuation_status.published_shared_hidden_bytes = observed;
+            EXPECT_FALSE(protocol.completedTraffic(*identity, &error).has_value());
+            ASSERT_TRUE(protocol.publishReturn(*identity, 0, 0, &error)) << error;
+            ASSERT_TRUE(protocol.consumeReturn(*identity, 0, &error).has_value()) << error;
+            completeBoth(protocol, *identity);
+            const auto traffic = protocol.completedTraffic(*identity, &error);
+            ASSERT_TRUE(traffic.has_value()) << error;
+            EXPECT_EQ(traffic->dispatch_shared_hidden_bytes, observed);
+            EXPECT_EQ(traffic->dispatch_payload_bytes, 0u);
+            EXPECT_EQ(traffic->return_payload_bytes, 0u);
+            EXPECT_EQ(protocol.endpointStatus(MoEOverlayActivationEndpoint::Continuation)
+                .published_shared_hidden_bytes, observed);
+            ASSERT_TRUE(protocol.reset(*identity, &error)) << error;
+            EXPECT_EQ(control.continuation_status.published_shared_hidden_bytes, 0u);
+            EXPECT_EQ(control.follower_status.published_shared_hidden_bytes, 0u);
+            EXPECT_FALSE(protocol.completedTraffic(*identity, &error).has_value());
+        }
+    }
+
+    /** @test A follower cannot author source-owned shared hidden-copy totals. */
+    TEST(Test__MoEOverlayActivationEpochProtocol,
+         SharedHiddenTrafficRejectsForeignPublisher)
+    {
+        const auto config = makeConfig({7});
+        MoEOverlayActivationEpochControl control;
+        MoEOverlayActivationEpochProtocol::initialize(control, config);
+        MoEOverlayActivationEpochProtocol protocol(control, config);
+        std::string error;
+        const auto identity = protocol.arm(makeTicket(config), 1, 10000, &error);
+        ASSERT_TRUE(identity.has_value()) << error;
+        activateBoth(protocol, *identity);
+        runOneStage(protocol, *identity, 0);
+        control.follower_status.published_shared_hidden_bytes = 4;
+        completeBoth(protocol, *identity);
+        EXPECT_FALSE(protocol.completedTraffic(*identity, &error).has_value());
+        EXPECT_NE(error.find("source-owned shared hidden"), std::string::npos);
     }
 
 } // namespace llaminar2::test

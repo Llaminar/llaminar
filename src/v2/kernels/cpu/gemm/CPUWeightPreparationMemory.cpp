@@ -4,7 +4,7 @@
  *
  * Encoding selection and interleaved strides come from the production packer.
  * Its one retained root uses the common native allocator's physical geometry.
- * Setup demand describes the actual simultaneously live source-oriented vectors;
+ * Setup demand describes the actual bounded append workspace;
  * it is not a multiplier over GGUF bytes or an anonymous safety reserve.
  */
 #include "CPUWeightPreparationMemory.h"
@@ -44,25 +44,12 @@ namespace llaminar2
         using namespace cpu::native_vnni;
         const auto footprint = preparedFootprintForFormat(*native);
         const size_t units = multiply((n + 63) / 64, k / 32);
-        const size_t blocks = multiply(units, 64);
         const size_t interleaved = multiply(units, footprint.weight_bytes_per_n_chunk_k_block);
         const auto retained=CPUStoragePlacement::local().physicalBytes<uint8_t>(interleaved);
-        switch (footprint.encoding)
-        {
-        case CPUNativeVNNIEncoding::NibbleLUTSourceScale:
-        case CPUNativeVNNIEncoding::NibbleLUT:
-            // CPU source-order and GPU-interleaved payload vectors coexist
-            // with two scale/min pairs until the final root is complete.
-            // Neither payload survives publication of the prepared engine.
-            return {retained,multiply(blocks,2*native->payload_bytes+4*sizeof(uint16_t)),interleaved};
-        case CPUNativeVNNIEncoding::Q6KNativeDualScale:
-            return {retained,multiply(blocks,native->payload_bytes+2*sizeof(uint16_t)),interleaved};
-        case CPUNativeVNNIEncoding::IQ3SExpandedSourceScale:
-        case CPUNativeVNNIEncoding::ExpandedInt8:
-        case CPUNativeVNNIEncoding::CompactMultiScale:
-            // These encodings use bounded stack blocks directly in final storage.
-            return {retained,0,interleaved};
-        }
-        throw std::logic_error("CPU preparation returned an unknown physical encoding");
+        // The immediate path borrows the caller's original native tensor and
+        // uses the same bounded append workspace for every source codebook.
+        const auto workspace=immediateNativePackScratchGeometry(*native,static_cast<int>(n),
+            static_cast<int>(k),CPUStoragePlacement::local());
+        return {retained,workspace.physical_bytes,interleaved};
     }
 }

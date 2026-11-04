@@ -1846,6 +1846,7 @@ namespace llaminar2
                                                      config_.moe_expert_overlay_residency_authority;
                                                  runner_config.moe_expert_overlay_participant_residency =
                                                      config_.moe_expert_overlay_participant_residency;
+                                                 runner_config.moe_expert_overlay_cpu_joint_context = config_.moe_expert_overlay_cpu_joint_context;
                                                  runner_config.moe_expert_overlay_decode_histogram =
                                                      config_.moe_expert_overlay_decode_histogram;
                                                  runner_config.moe_expert_overlay_mpi_ctx = config_.moe_expert_overlay_mpi_ctx;
@@ -1967,6 +1968,7 @@ namespace llaminar2
                 !same_original(auxiliary.placement_plan, config_.moe_routed_expert_plan) ||
                 !same_original(auxiliary.residency_authority, config_.moe_expert_overlay_residency_authority) ||
                 !same_original(auxiliary.participant_residency, config_.moe_expert_overlay_participant_residency) ||
+                !same_original(auxiliary.cpu_joint_context, config_.moe_expert_overlay_cpu_joint_context) ||
                 !same_original(auxiliary.rank_batch_transport_registry, config_.moe_rank_batch_transport_registry) ||
                 !same_original(auxiliary.device_controller_fabric, config_.moe_device_controller_fabric))
                 throw std::invalid_argument("Rank auxiliary experts require the same original model, residency, controller and transport owners");
@@ -2227,6 +2229,7 @@ namespace llaminar2
                 child_config.moe_expert_overlay_residency_authority;
             runner_config.moe_expert_overlay_participant_residency =
                 child_config.moe_expert_overlay_participant_residency;
+            runner_config.moe_expert_overlay_cpu_joint_context = child_config.moe_expert_overlay_cpu_joint_context;
             runner_config.moe_expert_overlay_decode_histogram =
                 child_config.moe_expert_overlay_decode_histogram;
             runner_config.moe_expert_overlay_mpi_ctx = child_config.moe_expert_overlay_mpi_ctx;

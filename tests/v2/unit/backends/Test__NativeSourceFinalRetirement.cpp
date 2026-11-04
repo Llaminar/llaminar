@@ -243,7 +243,13 @@ public:
  ModelContextReuseContract exported;
  unsigned* exports=nullptr;
  bool failShutdown=false;
- void shutdown()override {if(failShutdown)throw std::runtime_error("recorded terminal failure");OrchestrationRunner::shutdown();}
+ bool failWorkerLoop=false;
+ std::vector<std::string>* commands=nullptr;
+ void setMPICoordinatedMode(bool value)override{if(commands)commands->push_back(value?"coordinated":"uncoordinated");}
+ void runMPIWorkerLoop()override{if(commands)commands->push_back("worker_loop");if(failWorkerLoop)throw std::runtime_error("original follower loop failure");}
+ void shutdownMPIWorkers()override{if(commands)commands->push_back("stop_workers");}
+ void abortMPIWorkers(const std::string&)override{if(commands)commands->push_back("abort_workers");}
+ void shutdown()override {if(commands)commands->push_back("retire");if(failShutdown)throw std::runtime_error("recorded terminal failure");OrchestrationRunner::shutdown();}
  std::optional<ModelContextReuseContract> modelContextReuseContract()const override {++*exports;return exported;}
 };
 /** @brief Exercise the actual QFN fixture observation and teardown edges without running SetUp/model work. */
@@ -299,11 +305,14 @@ TEST(NativeSourceFinalRetirement,QFNParityFixtureSuccessRetiresOriginalObservati
 /** @test A failed observation still crosses actual fixture runner and same-source final retirement. */
 TEST(NativeSourceFinalRetirement,QFNParityFixtureFailureRetiresOriginalObservationOwner){replayQFNFixtureFinalOwner(true);}
 
-/** @brief Replay the actual frontend owner scope through success or a failure before the first history. */
-void replayObserverFinalOwner(bool failBeforeHistory,bool cleanupFailure=false){
+/** @brief Exact follower failure boundary, with no claimed native worker success. */
+enum class FollowerObservationFailure { None, WorkerLoop, PassiveRecord };
+/** @brief Exercise actual frontend ownership through observation and original source retirement. */
+void replayObserverFinalOwner(bool failBeforeHistory,bool cleanupFailure=false,int coordinatedRole=0,
+ FollowerObservationFailure followerFailure=FollowerObservationFailure::None){
  Trace t;active=&t;Backend c(DeviceType::CUDA),r(DeviceType::ROCm);cuda=&c;rocm=&r;
  const std::array devices{DeviceId::cuda(210),DeviceId::rocm(210)};auto source=prepare(devices,NativePhysicalLifetime::ContextGeneration);
- auto actual=std::make_unique<RecordedObserverRunner>();auto* recorded=actual.get();unsigned exports=0;actual->exports=&exports;unsigned expectedExports=1;
+ auto actual=std::make_unique<RecordedObserverRunner>();auto* recorded=actual.get();std::vector<std::string> commands;if(coordinatedRole)actual->commands=&commands;unsigned exports=0;actual->exports=&exports;unsigned expectedExports=1;actual->failWorkerLoop=followerFailure==FollowerObservationFailure::WorkerLoop;
  auto model=ModelContext::createForTesting("recorded-observer-source.gguf",std::make_shared<MockMPIContext>(),1,true);model->bindNativeContextPreparation(source);
  auto workspace=std::make_shared<ReusableExecutionWorkspaceRegistry>();auto authority=std::make_shared<ModelContextReuseAuthority>();
  OrchestrationRunnerResolvedAdmissionTestAccess::exportedSource(*actual,source,model,workspace,authority);
@@ -314,25 +323,40 @@ void replayObserverFinalOwner(bool failBeforeHistory,bool cleanupFailure=false){
  const auto observe=[&](const ModelContextReuseContract& owner){
   EXPECT_EQ(owner.context->nativeContextPreparation(),source);EXPECT_EQ(owner.physical_memory_authority,source->memory());
   EXPECT_EQ(t.resets,0u);EXPECT_EQ(exports,expectedExports);
+  if(coordinatedRole)commands.push_back("observe");
   if(failBeforeHistory)throw std::runtime_error("original failure before first history");
   // The callback borrows this same model through each history/reset observation;
   // it cannot retire or replace the runner's model between observations.
   const auto* original=owner.context.get();
   for(unsigned i=0;i<3;++i){EXPECT_EQ(owner.context.get(),original);++histories;}
  };
+ const auto invoke=[&] {
+  if(coordinatedRole)accuracy::observeQFNCoordinatedWithFinalOwner(runner,coordinatedRole==1,observe,
+    [&](const ModelContextReuseContract& owner){EXPECT_EQ(owner.context->nativeContextPreparation(),source);commands.push_back("follower_record");if(followerFailure==FollowerObservationFailure::PassiveRecord)throw std::runtime_error("original follower record failure");});
+  else accuracy::observeQFNWithFinalOwner(runner,observe);
+ };
  if(cleanupFailure){
   recorded->failShutdown=true;
   ::testing::internal::CaptureStderr();
-  try{accuracy::observeQFNWithFinalOwner(runner,observe);FAIL()<<"Missing terminal failure";}
+  try{invoke();FAIL()<<"Missing terminal failure";}
   catch(const std::runtime_error& error){EXPECT_STREQ(error.what(),"original failure before first history; QFN final retirement failed: recorded terminal failure");}
   const auto diagnostic=::testing::internal::GetCapturedStderr();
   EXPECT_NE(diagnostic.find("QFN observation failed before final retirement: original failure before first history"),std::string::npos);
   EXPECT_TRUE(runner);EXPECT_EQ(t.resets,0u);recorded->failShutdown=false;expectedExports=2;
  }
- if(failBeforeHistory){try{accuracy::observeQFNWithFinalOwner(runner,observe);FAIL()<<"Missing observer failure";}
+ if(followerFailure!=FollowerObservationFailure::None) {
+  try{invoke();FAIL()<<"Missing follower lifecycle failure";}
+  catch(const std::runtime_error& error){EXPECT_STREQ(error.what(),followerFailure==FollowerObservationFailure::WorkerLoop?
+   "original follower loop failure":"original follower record failure");}
+ }
+ else if(failBeforeHistory){try{invoke();FAIL()<<"Missing observer failure";}
   catch(const std::runtime_error& error){EXPECT_STREQ(error.what(),"original failure before first history");}}
- else EXPECT_NO_THROW(accuracy::observeQFNWithFinalOwner(runner,observe));
- EXPECT_EQ(histories,failBeforeHistory?0u:3u);EXPECT_EQ(exports,expectedExports);EXPECT_FALSE(runner);
+ else EXPECT_NO_THROW(invoke());
+ EXPECT_EQ(histories,(failBeforeHistory || coordinatedRole==2)?0u:3u);
+ if(coordinatedRole==1)EXPECT_EQ(commands,(failBeforeHistory?std::vector<std::string>{"coordinated","observe","abort_workers","retire"}:std::vector<std::string>{"coordinated","observe","stop_workers","retire"}));
+ if(coordinatedRole==2)EXPECT_EQ(commands,(followerFailure==FollowerObservationFailure::WorkerLoop?
+  std::vector<std::string>{"coordinated","worker_loop","abort_workers","retire"}:
+  std::vector<std::string>{"coordinated","worker_loop","follower_record","retire"}));EXPECT_EQ(exports,expectedExports);EXPECT_FALSE(runner);
  EXPECT_EQ(t.destroyed,2u);EXPECT_EQ(t.resets,2u);EXPECT_TRUE(t.allDestroyed);
  EXPECT_THROW(accuracy::observeQFNWithFinalOwner(runner,observe),std::invalid_argument);EXPECT_EQ(t.resets,2u);
  EXPECT_NO_THROW(GPUDeviceContextPool::instance().shutdown());
@@ -471,4 +495,38 @@ TEST(NativeSourceFinalRetirement, CPUOnlyPreparationDoesNotRequireGPUInventory){
 // original runner/source/pool/TransferEngine implementations remain unchanged.
 namespace llaminar2 {
 IBackend* getBackendFor(DeviceId device){return device.is_cpu()?getCPUBackend():test::resolve(device);}
+}
+
+namespace llaminar2::test {
+/** @test Only original authority observes histories, then stops workers before physical retirement. */
+TEST(NativeSourceFinalRetirement,QFNDistributedAuthorityStopsBeforeOriginalRetirement){replayObserverFinalOwner(false,false,1);}
+/** @test Original failure aborts worker command flow before final physical teardown. */
+TEST(NativeSourceFinalRetirement,QFNDistributedAuthorityFailureAbortsBeforeOriginalRetirement){replayObserverFinalOwner(true,false,1);}
+/** @test Follower records actual worker-loop completion without independent history/logit observation. */
+TEST(NativeSourceFinalRetirement,QFNDistributedFollowerOnlyRunsOriginalWorkerLoop){replayObserverFinalOwner(false,false,2);}
+
+}
+
+namespace llaminar2::test {
+/** @test Failure after the original follower loop returns retires locally without issuing a root command. */
+TEST(NativeSourceFinalRetirement,QFNDistributedFollowerRecordFailureRetiresWithoutRootAbort) {
+ replayObserverFinalOwner(false,false,2,FollowerObservationFailure::PassiveRecord);
+}
+/** @test A failure inside the original follower command loop still cancels before original retirement. */
+TEST(NativeSourceFinalRetirement,QFNDistributedFollowerLoopFailureAbortsBeforeRetirement) {
+ replayObserverFinalOwner(false,false,2,FollowerObservationFailure::WorkerLoop);
+}
+/** @test Missing original export fails before a worker loop and still invokes its existing cancellation owner. */
+TEST(NativeSourceFinalRetirement,QFNDistributedFollowerMissingOwnerAbortsBeforeLoop) {
+ auto actual=std::make_unique<RecordedObserverRunner>();std::vector<std::string> commands;unsigned exports=0;
+ actual->commands=&commands;actual->exports=&exports;
+ // No model/prepared/PMA owner exists here: this is the negative export boundary,
+ // not an inference-ready or native-success fixture.
+ std::unique_ptr<IOrchestrationRunner> runner=std::move(actual);
+ EXPECT_THROW(accuracy::observeQFNCoordinatedWithFinalOwner(runner,false,
+  [](const ModelContextReuseContract&){ADD_FAILURE()<<"Follower ran authority observation";},
+  [](const ModelContextReuseContract&){ADD_FAILURE()<<"Missing owner reached follower record";}),std::invalid_argument);
+ EXPECT_EQ(commands,(std::vector<std::string>{"coordinated","abort_workers","retire"}));
+ EXPECT_EQ(exports,1u);EXPECT_FALSE(runner);
+}
 }

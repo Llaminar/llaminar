@@ -17,6 +17,11 @@
 
 #pragma once
 
+#include "tensors/NativeWeightSourceWindow.h"
+#include "tensors/NativeWeightSource.h"
+#include "memory/CPUStorageRoot.h"
+#include <span>
+#include <optional>
 #include "../backends/DeviceId.h"
 #include "../execution/config/RuntimeConfig.h"
 #include <memory>
@@ -31,6 +36,7 @@ namespace llaminar2
 {
 
     // Forward declaration - TensorBase is the base tensor type
+    class PhysicalMemoryAuthority;
     class TensorBase;
     struct GGUFModel;
     struct WeightSliceSpec;
@@ -71,6 +77,46 @@ namespace llaminar2
     {
     public:
         virtual ~IModelLoader() = default;
+
+        /**
+         * @brief Borrow the original CPU backend's declared source-allocation placement.
+         * @return Exact bound NUMA mapping or original aggregate heap policy.
+         * @throws std::logic_error For loaders without an original CPU allocation contract.
+         */
+        virtual CPUStoragePlacement nativeWeightSourcePlacement() const
+        {
+            throw std::logic_error("Loader has no original CPU source allocation placement");
+        }
+
+        /**
+         * @brief Return original sealed source format and coordinates without payload reads.
+         * @param name Original tensor name in the same sealed source manifest.
+         * @return Canonical native source geometry, independent of prepared representation.
+         * @throws std::logic_error When the implementation has no native source contract.
+         */
+        virtual NativeWeightSourceGeometry nativeWeightSourceGeometry(const std::string &name)
+        {
+            throw std::logic_error("Loader has no original native weight source geometry");
+        }
+
+        /**
+         * @brief Read one exact native source rectangle into caller-owned storage.
+         * @param name Original sealed tensor name, including paired-source ownership.
+         * @param window Original GGUF K/N/E coordinates and compact native row width.
+         * @param destination Exact nativeBytes() span in an admitted transient or final root.
+         * @throws std::invalid_argument For foreign coordinates, format alignment or extent.
+         * @throws std::runtime_error For unavailable sources or incomplete reads.
+         *
+         * This operation allocates no payload and never faults a source mmap. Consumers
+         * retain source identity and own conversion/packing and the destination lifetime.
+         */
+        virtual void readNativeWeightSourceWindow(
+            const std::string &name, const NativeWeightSourceWindow &window,
+            std::span<std::byte> destination)
+        {
+            throw std::logic_error("Loader has no original native weight source reader");
+        }
+
 
         // =========================================================================
         // Loading / Initialization

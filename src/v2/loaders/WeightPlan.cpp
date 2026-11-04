@@ -12,7 +12,11 @@
  * so graph preparation retains one original persistent owner and source lifetime.
  */
 
+#include "ExpertGemmRegistry.h"
 #include "WeightPlan.h"
+#include "tensors/NativeWeightSourceRange.h"
+#include <limits>
+#include "execution/moe/CPUExpertShardSourceSelection.h"
 
 #include "WeightLifecycleTrace.h"
 #include "MoEExpertSourceView.h"
@@ -88,6 +92,8 @@ namespace llaminar2
             requirement.layer = inferWeightLayer(requirement.canonical_name);
         if (requirement.expert < 0)
             requirement.expert = inferWeightExpert(requirement.canonical_name);
+        if (requirement.cpu_joint_source && !requirement.projection_ownership)
+            throw std::invalid_argument("CPU joint source requires its exact original projection ownership");
         if (requirement.projection_ownership)
         {
             const auto &ownership = *requirement.projection_ownership;
@@ -107,6 +113,15 @@ namespace llaminar2
                 (requirement.overlay_participant_index >= 0 &&
                  requirement.overlay_participant_index != ownership.participant()))
                 throw std::invalid_argument("Static expert projection requires its exact original role/participant source request");
+            if (requirement.cpu_joint_source) {
+                const auto& selected=*requirement.cpu_joint_source;
+                const auto& participant=selected.participant();
+                if(requirement.target_device!=DeviceId::cpu() || selected.layer()!=requirement.layer ||
+                   selected.ownership()!=ownership || requirement.overlay_domain!=participant.domain_name ||
+                   requirement.overlay_participant_world_rank!=participant.world_rank ||
+                   requirement.overlay_participant_index!=participant.domain_participant_index)
+                    throw std::invalid_argument("CPU joint source changed its original member/selection purpose");
+            }
             const auto projection = ownership.projection(requirement.role);
             WeightSliceSpec original;
             // The loader consumes original GGUF [K,N,E], not GEMM [N,K].
@@ -120,6 +135,8 @@ namespace llaminar2
             original.expert_ids.reserve(original.expert_count);
             for (int expert = 0; expert < ownership.geometry().experts; ++expert)
                 original.expert_ids.push_back(expert);
+            if(requirement.cpu_joint_source)
+                original=requirement.cpu_joint_source->sourceLoadSlice(requirement.role);
             // An already normalized requirement may be composed into another
             // plan, but contradictory caller coordinates are never substituted.
             if (!sameSourceSlice(requirement.slice, WeightSliceSpec{}) &&
@@ -290,6 +307,15 @@ namespace llaminar2
         }
     }
 
+    uint64_t staticProjectedExpertBindingId(uint64_t parent,const std::string &name,int expert)
+    {
+        uint64_t identifier=parent ^ 1469598103934665603ull;
+        for(const unsigned char byte:name+"@expert"+std::to_string(expert)) {
+            identifier^=byte;identifier*=1099511628211ull;
+        }
+        return identifier?identifier:1;
+    }
+
     /** @copydoc FrozenModelWeightSet::projectedExpertMatrices */
     FrozenModelWeightSet FrozenModelWeightSet::projectedExpertMatrices() const
     {
@@ -322,6 +348,13 @@ namespace llaminar2
                 builder.addBinding(parent);
                 continue;
             }
+            if(parent.native_source && parent.cpu_joint_source && parent.tensor && parent.tensor->shape().size()==2) {
+                ExpertGemmRegistry::validateStaticProjectionSource(parent);
+                if(!identifiers.insert(parent.binding_id).second)
+                    throw std::logic_error("Static expert matrix binding identity collision");
+                builder.addBinding(parent);
+                continue;
+            }
             if (parent.projection_ownership->hasMovableProjectionSet() ||
                 !parent.tensor || parent.tensor_owner.get() != parent.tensor ||
                 parent.tensor->shape().size() != 3 || !isRoutedExpertRole(parent.identity.role) ||
@@ -331,29 +364,27 @@ namespace llaminar2
                 throw std::runtime_error("Static expert source retired before its matrix bindings were created");
             const auto &ownership = *parent.projection_ownership;
             const MoEExpertSourceView source(parent.tensor->shape(), parent.slice);
-            if (source.experts().size() != static_cast<size_t>(ownership.geometry().experts))
+            if (parent.cpu_joint_source)
+                throw std::invalid_argument("CPU source matrices must be committed by the common bounded consumer");
+            const auto expected_count = size_t(ownership.geometry().experts);
+            if (source.experts().size() != expected_count)
                 throw std::invalid_argument("Static expert source must retain the complete original expert inventory");
-            for (int expert = 0; expert < ownership.geometry().experts; ++expert)
+            for (size_t ordinal=0;ordinal<expected_count;++ordinal)
             {
-                if (source.experts()[static_cast<size_t>(expert)] != expert)
+                const int expert = int(ordinal);
+                if (source.experts()[ordinal] != expert)
                     throw std::invalid_argument("Static expert source does not preserve original ordinal IDs");
                 const auto matrix = source.matrix(expert, parent.identity.role, &ownership);
                 auto view = parent.tensor->create_view({matrix.rows, matrix.columns}, matrix.element_offset);
                 if (!view || view->native_type() != parent.tensor->native_type() ||
-                    parent.tensor->size_bytes() % static_cast<size_t>(ownership.geometry().experts) ||
-                    view->size_bytes() != parent.tensor->size_bytes() / static_cast<size_t>(ownership.geometry().experts))
+                    parent.tensor->size_bytes() % expected_count ||
+                    view->size_bytes() != parent.tensor->size_bytes() / expected_count)
                     throw std::runtime_error("Static expert matrix view lost its native source representation");
                 WeightBinding binding = parent;
                 binding.identity.canonical_name = parent.identity.canonical_name + "@expert" + std::to_string(expert);
                 // Parent identity already binds full source, participant and all
                 // F intervals. Domain-separated byte mixing adds the exact E slot.
-                uint64_t identifier = parent.binding_id ^ 1469598103934665603ull;
-                for (const unsigned char byte : binding.identity.canonical_name)
-                {
-                    identifier ^= byte;
-                    identifier *= 1099511628211ull;
-                }
-                if (!identifier) identifier = 1;
+                const uint64_t identifier=staticProjectedExpertBindingId(parent.binding_id,parent.identity.canonical_name,expert);
                 if (!identifiers.insert(identifier).second)
                     throw std::logic_error("Static expert matrix binding identity collision");
                 binding.binding_id = identifier;
@@ -401,6 +432,92 @@ namespace llaminar2
         return table.to_string();
     }
 
+    std::vector<NativeWeightSourceProjection> projectNativeWeightSource(
+        const WeightRequirement &requirement, const NativeWeightSourceGeometry &source)
+    {
+        if (source.original_shape.empty() || !source.native_group_elements || !source.native_group_bytes)
+            throw std::invalid_argument("Native weight projection needs original source geometry");
+        const size_t k = source.original_shape[0];
+        const size_t n = source.original_shape.size() > 1 ? source.original_shape[1] : 1;
+        size_t outer = 1;
+        for (size_t axis = 2; axis < source.original_shape.size(); ++axis) {
+            if (!source.original_shape[axis] || outer > std::numeric_limits<size_t>::max()/source.original_shape[axis])
+                throw std::invalid_argument("Native weight projection original extent overflows");
+            outer *= source.original_shape[axis];
+        }
+        const auto role = requirement.role == WeightRole::Other ? inferWeightRole(requirement.canonical_name) : requirement.role;
+        const bool experts = source.original_shape.size() == 3 && isRoutedExpertRole(role);
+        if (requirement.native_source_assembly) {
+            if (experts || source.original_shape.size()>2 || requirement.cpu_joint_source || requirement.projection_ownership ||
+                requirement.derivation!=WeightDerivationKind::FusedSubblockConcat ||
+                requirement.slice.row_start || requirement.slice.row_count || requirement.slice.col_start || requirement.slice.col_count ||
+                requirement.slice.expert_start || requirement.slice.expert_count || !requirement.slice.expert_ids.empty() ||
+                !k || k%source.native_group_elements || k/source.native_group_elements>std::numeric_limits<size_t>::max()/source.native_group_bytes)
+                throw std::invalid_argument("Ordered native assembly requires its original unsliced matrix/vector declaration");
+            NativeWeightSourceProjection projection{.original=source,
+                .range={.original_expert=0,.selected_expert_ordinal=0,.first_row=0,.rows=n,
+                    .first_column=0,.columns=k,.native_row_bytes=k/source.native_group_elements*source.native_group_bytes},
+                .matrix_count=1,.assembly=requirement.native_source_assembly};
+            forEachNativeWeightSourceStripe(source,projection.range,projection.assembly,[](const auto &,size_t,size_t) {});
+            return {std::move(projection)};
+        }
+        const auto &slice = requirement.slice;
+        size_t first_k = 0, count_k = k, first_n = 0, count_n = n;
+        if (experts) {
+            if ((slice.source_rows && slice.source_rows != k) || (slice.source_cols && slice.source_cols != n))
+                throw std::invalid_argument("Expert source projection changed original GGUF axes");
+            first_k = slice.row_start; count_k = slice.row_count ? slice.row_count : k;
+            first_n = slice.col_start; count_n = slice.col_count ? slice.col_count : n;
+        } else if (source.original_shape.size() == 1) {
+            if ((slice.source_rows && slice.source_rows != k) || (slice.source_cols && slice.source_cols != 1))
+                throw std::invalid_argument("Vector source projection changed original extent");
+            first_k = slice.row_start; count_k = slice.row_count ? slice.row_count : k;
+        } else {
+            if ((slice.source_rows && slice.source_rows != n) || (slice.source_cols && slice.source_cols != k))
+                throw std::invalid_argument("Matrix source projection changed original runtime axes");
+            first_n = slice.row_start; count_n = slice.row_count ? slice.row_count : n;
+            first_k = slice.col_start; count_k = slice.col_count ? slice.col_count : k;
+        }
+        if (!count_k || !count_n || first_k > k || count_k > k-first_k || first_n > n || count_n > n-first_n ||
+            first_k % source.native_group_elements || count_k % source.native_group_elements ||
+            count_k/source.native_group_elements > std::numeric_limits<size_t>::max()/source.native_group_bytes)
+            throw std::invalid_argument("Native weight projection splits source groups or exceeds original coordinates");
+        NativeWeightSourceProjection projection{.original=source,
+            .range={.original_expert=0,.selected_expert_ordinal=0,.first_row=first_n,.rows=count_n,
+                .first_column=first_k,.columns=count_k,
+                .native_row_bytes=count_k/source.native_group_elements*source.native_group_bytes},
+            .matrix_count=1};
+        if (!experts) {
+            if (source.original_shape.size() > 2 && (first_k || count_k != k || first_n || count_n != n || slice.expert_count || !slice.expert_ids.empty()))
+                throw std::invalid_argument("Resident outer tensors require their complete original declared shape");
+            projection.matrix_count = outer;
+            return {std::move(projection)};
+        }
+        if (requirement.derivation == WeightDerivationKind::ExpertSlice &&
+            slice.expert_ids.empty() && !slice.expert_count)
+            throw std::invalid_argument("Explicit native expert selection is empty");
+        std::vector<NativeWeightSourceProjection> result;
+        const size_t count = !slice.expert_ids.empty() ? slice.expert_ids.size() : slice.expert_count ? slice.expert_count : outer;
+        if (!count || count > size_t(std::numeric_limits<int>::max()) || count > outer || (slice.expert_count && slice.expert_count != count) ||
+            (slice.expert_ids.empty() && (slice.expert_start > outer || count > outer-slice.expert_start)))
+            throw std::invalid_argument("Native expert projection changed original selected count");
+        result.reserve(count);
+        size_t previous = 0;
+        for (size_t ordinal = 0; ordinal < count; ++ordinal) {
+            if (!slice.expert_ids.empty() && slice.expert_ids[ordinal] < 0)
+                throw std::invalid_argument("Native expert projection has a negative original ID");
+            const size_t expert = !slice.expert_ids.empty() ? size_t(slice.expert_ids[ordinal]) : slice.expert_start+ordinal;
+            if (expert >= outer || (ordinal && expert <= previous))
+                throw std::invalid_argument("Native expert projection must retain ordered unique original IDs");
+            auto matrix = projection;
+            matrix.range.original_expert = expert;
+            matrix.range.selected_expert_ordinal = ordinal;
+            result.push_back(std::move(matrix));
+            previous = expert;
+        }
+        return result;
+    }
+
     std::string toString(PreparedWeightKind kind)
     {
         switch (kind)
@@ -411,6 +528,7 @@ namespace llaminar2
         case PreparedWeightKind::RocmInt8PackedGemm: return "RocmInt8PackedGemm";
         case PreparedWeightKind::PreparedEmbedding: return "PreparedEmbedding";
         case PreparedWeightKind::MoeExpertSlab: return "MoeExpertSlab";
+        case PreparedWeightKind::CPUResidentTensor: return "CPUResidentTensor";
         }
         return "None";
     }

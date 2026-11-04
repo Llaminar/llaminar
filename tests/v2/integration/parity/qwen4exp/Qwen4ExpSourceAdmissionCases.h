@@ -20,6 +20,7 @@
 #include "Qwen4ExpMTPAdmissionCases.h"
 #include "Qwen4ExpROCm4OverlayPolicyParityCases.h"
 #include "backends/HardwareInventory.h"
+#include "execution/moe/MoEExpertOwnerMap.h"
 
 #include <array>
 #include <algorithm>
@@ -623,5 +624,64 @@ inline const std::vector<ModelParityCase>& qwen4ExpSharedCoordinatorCUDATP2Adapt
 inline const std::vector<ModelParityCase>& qwen4ExpHardwareProductionSourceAdmissionCases()
 {
     return qwen4ExpHardwareProductionSourceCases();
+}
+/**
+ * @return One source-only real two-socket CPU tensor-shard startup request.
+ * @details Rank0 owns the GPU continuation and NUMA0 fragment; rank1 owns
+ * NUMA1. The immutable512 expert axis remains GPU64/CPU448, StaticOrdinal,
+ * full-RAM ngrams, MTP Off/capacity0. This declares no numerical/native pass.
+ * CPU2TP elsewhere is deliberately different: two local endpoints on rank0.
+ */
+inline const std::vector<ModelParityCase>& qwen4ExpCPUJointWorld2SourceAdmissionCases()
+{
+    static const auto cases=[] {
+        auto definition=qwen4ExpProductionDefinition(Qwen4ExpParityTopology::ROCmCPU);
+        auto plan=std::make_shared<MoERoutedExpertPlacementPlan>(*definition.topology.expert_overlay_plan);
+        auto& cpu=plan->domains.back();
+        cpu.scope=ExecutionDomainScope::NODE_LOCAL;cpu.backend=CollectiveBackendType::UPI;cpu.owner_rank=-1;
+        cpu.participants={GlobalDeviceAddress::cpu(0),GlobalDeviceAddress::cpu(1)};cpu.world_ranks={0,1};
+        cpu.routed_compute_policy=RoutedExpertComputePolicy::TensorSharded;
+        cpu.routed_phase_policy=RoutedExpertPhasePolicy::Uniform;
+        cpu.routed_decode_assignment_policy=cpu.routed_prefill_assignment_policy=RoutedExpertAssignmentPolicy::StaticOwner;
+        plan->routed_tiers.front().max_experts_per_layer=64;
+        plan->routed_tiers.back().max_experts_per_layer=448;
+        definition.topology.test_id="ROCm0_CPU01_TensorSharded_2xMPI_GpuExperts64_CPUExperts448";
+        definition.topology.kind=ModelParityTopologyKind::NodeMultiDomain;
+        definition.topology.mpi_ranks=2;
+        definition.topology.participants={{GlobalDeviceAddress::rocm(0),0},
+            {GlobalDeviceAddress::cpu(0),0},{GlobalDeviceAddress::cpu(1),1}};
+        definition.topology.expert_overlay_plan=std::move(plan);
+        definition.features.mtp=ModelParityAxisProfile::Disabled;
+        definition.features.dynamic_speedup_witness=ModelParityDynamicSpeedupWitness::Disabled;
+        definition.features.ngram_storage={{.storage=ImmutableRowStoragePreference::RAM}};
+        definition.model.maximum_mtp_draft_depth=0;
+        definition.model.shared_predictor.reset(); // Ordinary source-only Off has no inactive predictor prerequisite.
+        std::vector<ModelParityCase> result;
+        for(auto cell:expandModelParityDefinition(definition))
+            if(cell.expert_overlay==std::optional{ModelParityExpertOverlayPolicy{}})
+                result.push_back(std::move(cell));
+        if(result.size()!=1 || result.front().mtp!=ModelParityMTP::Off || result.front().retained_mtp_draft_capacity!=0)
+            throw std::logic_error("CPU joint world2 source request changed its one Static RAM Off identity");
+        return result;
+    }();return cases;
+}
+/**
+ * @brief Project exact continuation rank membership for a joint source observation.
+ * @param cell Original typed source request, not observed runtime behavior.
+ * @param rank Original MPI world rank.
+ * @return Whether this rank owns the original continuation domain.
+ * @throws std::invalid_argument For missing, ambiguous or unresolved original membership.
+ */
+inline bool qwen4ExpCPUJointSourceHasContinuation(const ModelParityCase& cell,int rank)
+{
+    const auto plan=cell.topology.expert_overlay_plan;
+    if(!plan || !MoEExpertOwnerMap::usesCPUJointFragments(*plan) || rank<0 || rank>=cell.topology.mpi_ranks)
+        throw std::invalid_argument("CPU joint source observation requires its original world membership");
+    const auto it=std::find_if(plan->domains.begin(),plan->domains.end(),
+        [&](const auto& domain){return domain.name==plan->continuation_domain;});
+    if(it==plan->domains.end())throw std::invalid_argument("CPU joint source lost its original continuation");
+    if(!it->world_ranks.empty())return std::find(it->world_ranks.begin(),it->world_ranks.end(),rank)!=it->world_ranks.end();
+    if(it->owner_rank<0)throw std::invalid_argument("CPU joint source continuation rank is unresolved");
+    return it->owner_rank==rank;
 }
 } // namespace llaminar2::test::parity::qwen4exp

@@ -59,7 +59,7 @@ std::unique_ptr<PreparedWeightStore> admitCPUExpertStageForTest(
         params.expert_up_views = std::move(extraction.expert_up_views);
         params.expert_down_views = std::move(extraction.expert_down_views);
     }
-    size_t bytes = 0;
+    size_t bytes = 0, staging_bytes = 0;
     for (int expert = 0; expert < params.num_experts; ++expert)
     {
         if (!params.expert_mask.empty() && !params.expert_mask.at(expert))
@@ -83,14 +83,52 @@ std::unique_ptr<PreparedWeightStore> admitCPUExpertStageForTest(
             if (extent > std::numeric_limits<size_t>::max() - bytes)
                 throw std::overflow_error("CPU expert fixture byte count overflows");
             bytes += extent;
+            staging_bytes=std::max(staging_bytes,cpuPreparedStoreTestStagingBytes(*view));
         }
     }
-    const size_t capacity = std::max(size_t{1}, bytes);
+    if(staging_bytes>std::numeric_limits<size_t>::max()-bytes)
+        throw std::overflow_error("CPU expert final and serialized staging extents overflow");
+    const size_t capacity = std::max(size_t{1}, bytes+staging_bytes);
     PhysicalMemoryPlanBuilder plan;
     plan.add({0, params.device_id, capacity, capacity}, owner, bytes);
+    plan.add({0, params.device_id, capacity, capacity},PhysicalMemoryOwner::WeightLoadStaging,staging_bytes);
     params.prepared_store->installPhysicalMemoryAuthority(
         std::make_shared<PhysicalMemoryAuthority>(
             std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()), 0));
     return retained;
 }
+/**
+ * @brief Publish a complete actual Store-issued expert bank into its original test registry.
+ * @param params Actual successfully prepared CPU stage, including original slab references.
+ * @param registry Caller-owned registry retained for every graph/stage borrowing this bank.
+ * @throws std::invalid_argument Before mutation if any original source/owner/projection is missing.
+ * @note This only retains existing engines. It neither packs another tensor nor
+ * grants model/native readiness, and owns no allocation or byte ledger.
+ */
+inline void publishCPUExpertStageRegistryForTest(MoEExpertComputeStage::Params& params,ExpertGemmRegistry& registry) {
+    if(!params.device_id.is_cpu() || !params.prepared_store || !params.prepared_store->physicalMemoryAuthority() ||
+       !params.gate_slab_ref || !params.up_slab_ref || !params.down_slab_ref || params.layer_idx<0)
+        throw std::invalid_argument("CPU fixture publication requires its actual admitted complete Store bank");
+    using Role=ExpertGemmRegistry::WeightRole;
+    struct Projection { int expert;Role role;std::shared_ptr<ITensorGemm> engine; };
+    std::vector<Projection> complete;
+    for(int expert=0;expert<params.num_experts;++expert) {
+        const bool active=!params.expert_mask.empty()?params.expert_mask.at(expert):
+            expert>=params.local_expert_start && (params.local_expert_count<0 || expert<params.local_expert_start+params.local_expert_count);
+        if(!active)continue;
+        for(const auto role:{Role::GATE,Role::UP,Role::DOWN}) {
+            const auto& ref=role==Role::GATE?params.gate_slab_ref:role==Role::UP?params.up_slab_ref:params.down_slab_ref;
+            const auto& pointers=role==Role::GATE?params.prepared_gate_gemm:role==Role::UP?params.prepared_up_gemm:params.prepared_down_gemm;
+            auto owner=params.prepared_store->expertGemmKernelLifetime(*ref,expert);
+            if(!owner || !owner->weights_converted() || pointers.at(expert)!=owner.get() ||
+               owner->get_n()!=(role==Role::DOWN?params.d_model:params.expert_intermediate) ||
+               owner->get_k()!=(role==Role::DOWN?params.expert_intermediate:params.d_model))
+                throw std::invalid_argument("CPU fixture publication changed its original prepared projection");
+            complete.push_back({expert,role,std::move(owner)});
+        }
+    }
+    for(const auto& item:complete)registry.registerEngine(params.device_id,params.layer_idx,item.expert,item.role,item.engine.get(),item.engine);
+    params.expert_registry=&registry;
+}
+
 }

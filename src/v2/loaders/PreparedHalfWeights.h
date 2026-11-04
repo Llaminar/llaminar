@@ -8,6 +8,7 @@
  */
 #pragma once
 #include "tensors/TensorClasses.h"
+#include "memory/CPUWeightStoragePlacement.h"
 #include "tensors/TensorSlice.h"
 #include "kernels/common/DeviceHalfMetadataContract.h"
 #include <algorithm>
@@ -20,6 +21,7 @@ namespace llaminar2
     /**
      * @brief Round original decoded projection weights once into model-owned half words.
      * @param source Host-resident original matrix, including a materialized slice.
+     * @param placement Final root allocation authority and original CPU placement.
      * @return Half-RNE tensor retaining exactly the source logical dimensions.
      * @throws std::invalid_argument For absent/unsupported source tiles, nonfinite
      *         decoded values, or half overflow; no clamp or fallback is applied.
@@ -28,7 +30,8 @@ namespace llaminar2
      * conversion has a different subnormal rounding contract. No intermediate
      * full FP32 matrix, alternate packed scales or second ownership cache exists.
      */
-    inline std::shared_ptr<FP16Tensor> materializePreparedHalfWeights(const TensorBase &source)
+    inline std::shared_ptr<FP16Tensor> materializePreparedHalfWeights(const TensorBase &source,
+        CPUWeightStoragePlacement placement = CPUWeightStoragePlacement::local())
     {
         if (source.shape().size() != 2 || source.rows() == 0 || source.cols() == 0 ||
             source.is_raw_data_released() || source.raw_data() == nullptr)
@@ -40,7 +43,8 @@ namespace llaminar2
         if (!bf16 && (!decoder || decoder->block_size() == 0 || decoder->block_size() > 256 ||
             decoder->decoder_rows() != source.rows() || decoder->decoder_cols() != source.cols()))
             throw std::invalid_argument("Prepared half weights requires an original source decoder with tiles <=256");
-        auto half = std::make_shared<FP16Tensor>(source.shape());
+        auto half = std::make_shared<FP16Tensor>(source.shape(),
+            placement.allocate<uint16_t>(source.numel()), placement.allocatorDevice());
         auto *out = half->mutable_typed_data();
         const auto rows = source.rows(), columns = source.cols();
         // Setup-only source rows are independent. Every worker owns its tile;

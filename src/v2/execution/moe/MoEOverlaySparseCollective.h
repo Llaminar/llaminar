@@ -503,6 +503,78 @@ namespace llaminar2
         ProducerLifecycle producer_lifecycle_ = ProducerLifecycle::Unbound;
     };
 
+    struct MoEOverlaySparseRows;
+    /** @brief Which original source-owned row coordinate indexes unweighted CPU values. */
+    enum class MoEOverlayCanonicalRouteSourceIndex : uint8_t {
+        CompactRouteSlot, ///< Packet compact slots retain the original router's top-k stride.
+        OriginalRouteSlot, ///< Joint fragments combine in original router-slot order before weighting.
+    };
+    /**
+     * @brief Immutable source-coordinate mapping for one CPU route publication.
+     *
+     * Local expert execution can narrow its row width without changing packet
+     * coordinates. Carry that width explicitly; neither allocation capacity nor
+     * the packet's top-k describes the local compute layout in that case.
+     */
+    class MoEOverlayCanonicalRouteSourceLayout final {
+    public:
+        /** @return Source rows addressed by the original router's flat slots. */
+        static MoEOverlayCanonicalRouteSourceLayout originalSlots() noexcept;
+        /** @return Source rows already addressed by packet compact slots. */
+        static MoEOverlayCanonicalRouteSourceLayout compactSlots() noexcept;
+        /**
+         * @brief Describe local compute rows with a narrower live route stride.
+         * @param route_width Exact execution top-k used by the producer.
+         * @return Mapping from packet compact coordinates to those compute rows.
+         * @throws std::invalid_argument If the execution width is zero.
+         */
+        static MoEOverlayCanonicalRouteSourceLayout compactExecutionRows(size_t route_width);
+        /** @return Whether the execution width fits this original packet's top-k. */
+        bool compatibleWith(int packet_top_k) const noexcept;
+        /**
+         * @brief Resolve an authenticated packet entry's unweighted source row.
+         * @param original_slot Original router coordinate for this entry.
+         * @param compact_slot Packet compact coordinate, using packet_top_k.
+         * @param packet_top_k Original dispatch packet row stride.
+         * @return Actual source row, or absence for invalid geometry/coordinates.
+         */
+        std::optional<size_t> rowIndex(int32_t original_slot, int32_t compact_slot,
+            int packet_top_k) const noexcept;
+    private:
+        /** @brief Construct only through the named original/compact layout factories. */
+        MoEOverlayCanonicalRouteSourceLayout(MoEOverlayCanonicalRouteSourceIndex index,
+            size_t execution_width) noexcept : index_(index), execution_width_(execution_width) {}
+        MoEOverlayCanonicalRouteSourceIndex index_;
+        size_t execution_width_; ///< Zero denotes an unchanged flat packet coordinate.
+    };
+    /**
+     * @brief Apply each original router weight once into a disjoint original route matrix.
+     * @param original Complete consumed original sparse packet; no routing is reconstructed.
+     * @param unweighted_rows Actual persistent FP32 source extent.
+     * @param source_layout Exact source row coordinate and execution stride.
+     * @param weighted_rows Actual persistent FP32 destination extent.
+     * @param destination_index Existing ticket/return coordinate, never allocation capacity as traffic.
+     * @return False without publication for invalid complete prefix, overlap, extent or values.
+     */
+    bool preweightMoEOverlayCanonicalRouteRows(const MoEOverlaySparseRows& original,
+        std::span<const float> unweighted_rows,MoEOverlayCanonicalRouteSourceLayout source_layout,
+        std::span<float> weighted_rows,MoEOverlayCanonicalRouteSourceIndex destination_index) noexcept;
+
+    /**
+     * @brief Preweight original route rows once and publish through the existing mapped ticket.
+     * @param ticket Original bound canonical ticket; never rebound or replaced here.
+     * @param publication Its already-armed original producer lease.
+     * @param original Complete consumed original sparse packet.
+     * @param unweighted_rows Persistent source-owned FP32 route matrix, with a whole-row extent.
+     * @param source_layout Exact immutable coordinate and stride of those source rows.
+     * @return False before publication for invalid identity, extent, prefix or nonfinite values.
+     * @note The complete prefix is validated before writes; GPU visibility transfers only through Publication::publish.
+     */
+    bool publishMoEOverlayCanonicalRouteRows(MoEOverlayCanonicalRouteReturnTicketStorage& ticket,
+        MoEOverlayCanonicalRouteReturnTicketStorage::Publication& publication,
+        const MoEOverlaySparseRows& original,std::span<const float> unweighted_rows,
+        MoEOverlayCanonicalRouteSourceLayout source_layout) noexcept;
+
     enum class MoEOverlayCollectiveDirection : uint8_t
     {
         Dispatch = 0,

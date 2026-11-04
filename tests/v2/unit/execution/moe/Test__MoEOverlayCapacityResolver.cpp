@@ -2874,6 +2874,7 @@ namespace llaminar2
             .generation_domain = DeviceGenerationExecutionDomain::HostedBoundary,
             .gpu_weight_load = gpu_weight_load,
             .graph_family = testGraphFamily(profile),
+            .native_source_placement = CPUStoragePlacement::local(),
         };
         const auto result = test::planWithRecordedHostServices(capacity_input);
         rank_plan.runtime.moe_rebalance.mode = MoERebalanceRuntimeMode::Dynamic;
@@ -3124,6 +3125,7 @@ namespace llaminar2
                 .generation_domain = DeviceGenerationExecutionDomain::HostedBoundary,
                 .gpu_weight_load = testGPUWeightLoadCapacityInput(),
                 .graph_family = testGraphFamily(profile),
+                .native_source_placement = CPUStoragePlacement::local(),
             });
             const auto cpu_input = std::find_if(
                 result.device_inputs.begin(), result.device_inputs.end(),
@@ -3390,6 +3392,7 @@ namespace llaminar2
                 .generation_domain = DeviceGenerationExecutionDomain::HostedBoundary,
                 .gpu_weight_load = testGPUWeightLoadCapacityInput(),
                 .graph_family = testGraphFamily(profile),
+                .native_source_placement = CPUStoragePlacement::local(),
             });
         };
         auto small = planForRows(8);
@@ -4093,3 +4096,7 @@ namespace llaminar2
             bytes(PhysicalMemoryOwner::ImmutableTableStorage),source.nativeBytes());
     }
 } // namespace llaminar2
+
+#include "CPUExpertShardAccountingReplay.inc"
+
+#include "CPUJointSerialGeometryContract.inc"

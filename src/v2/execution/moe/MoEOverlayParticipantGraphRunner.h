@@ -186,6 +186,8 @@ namespace llaminar2
         int max_mtp_draft_depth = 0;
         /** @brief Largest request batch represented by one retained transaction. */
         int max_request_count = 1;
+        /** Original once-per-declared-domain CPU shard context; never constructed by a stage. */
+        std::shared_ptr<IGlobalTPContext> cpu_joint_context;
     };
 
     /**
@@ -856,7 +858,7 @@ namespace llaminar2
         MoEOverlayParticipantGraphRunnerConfig config_;
         std::shared_ptr<MoEExpertOverlayRuntimePlan> runtime_plan_;
         std::shared_ptr<MoEExpertOverlayExecutionPlan> execution_plan_;
-        std::unique_ptr<MoEExpertOwnerMap> owner_map_;
+        std::shared_ptr<const MoEExpertOwnerMap> owner_map_;
         std::shared_ptr<MoEOverlayResidencyAuthority> residency_authority_;
         std::shared_ptr<DecodeExpertHistogram> decode_histogram_;
         /** Lock-free timing authority claimed around complete retained graphs. */

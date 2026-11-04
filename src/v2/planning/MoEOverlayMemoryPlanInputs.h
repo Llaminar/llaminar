@@ -17,6 +17,20 @@
 
 namespace llaminar2
 {
+/**
+ * @brief Project the original complete declared allocator registry before local native birth.
+ * @param execution Same canonical rank-role/device resolution used by capacity admission.
+ * @param inventory Original complete startup observations; no fresh memory query occurs.
+ * @param config Original memory-limit and routed policy declaration.
+ * @param policy Same original capacity owner policy, including physical residency fabric.
+ * @param ngram Original explicit lookup placement; only declared storage-only GPUs are added.
+ * @return Canonically ordered immutable observations, with no unused visible GPUs or unowned relay CPU rows.
+ * @throws std::invalid_argument For missing/foreign rank, device or observations.
+ */
+[[nodiscard]] std::vector<PhysicalMemoryResource> originalMoEOverlayNativePreparationResources(
+    const MoEExpertOverlayExecutionPlan&,const ClusterInventory&,const OrchestrationConfig&,
+    const MoEOverlayCapacityAdmissionPolicy&,const ImmutableRowTablePolicy&);
+
 /** @brief Explicit capture-cache policy; callers freeze environment intent once. */
 struct MoEOverlayPrefillMemoryPolicy
 {
@@ -48,6 +62,11 @@ struct MoEOverlayMemoryPlanInputRequest
     std::size_t model_graph_topology_variant_count = 1;
     /** Local child boundary; required when pricing a projected pipeline stage. */
     std::optional<FactoryPPStageConfig> pipeline_stage;
+    /** Original source-native manifest for joint CPU geometry before expert quota selection. */
+    std::span<const MoEOverlayLayerWeightManifest> original_expert_manifest;
+    /** Same original consumer representation and source allocation policy used by loading. */
+    WeightPrecision weight_precision=WeightPrecision::NATIVE;
+    std::optional<CPUStoragePlacement> native_source_placement;
 };
 
 /** @brief Complete local BOM input and the exact schedule/cache identity it prices. */

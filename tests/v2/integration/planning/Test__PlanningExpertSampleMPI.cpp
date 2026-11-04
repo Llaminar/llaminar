@@ -27,6 +27,14 @@ using namespace llaminar2::test;
 
 namespace
 {
+    /** @return Sum of the three independent final native root declarations. */
+    size_t sourcePhysicalBytes(const PlanningExpertSampleDescription &description)
+    {
+        size_t bytes = 0;
+        for (const auto &matrix : description.matrices) bytes += matrix.physicalBytes();
+        return bytes;
+    }
+
     /** @return Exact source selection; nonzero expert index detects parent/offset confusion. */
     PlanningExpertSampleRequest request(size_t expert = 7)
     {
@@ -99,7 +107,7 @@ namespace
         const PhysicalMemoryResource host{.world_rank = mpi->rank(), .device = DeviceId::cpu(),
             .total_bytes = cpu.memory_bytes, .admission_available_bytes = cpu.free_memory_bytes};
         PhysicalMemoryPlanBuilder builder;
-        builder.add(host, PhysicalMemoryOwner::ModelSourcePayload, plan.geometry().source_bytes);
+        builder.add(host, PhysicalMemoryOwner::ModelSourcePayload, plan.geometry().physicalBytes());
         if (mpi->is_root()) builder.add(host, PhysicalMemoryOwner::WeightLoadStaging, plan.geometry().source_bytes);
         return std::make_shared<PhysicalMemoryAuthority>(
             std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(builder.build()), mpi->rank());
@@ -176,7 +184,7 @@ TEST(PlanningMatrixSampleMPI, FailedPublicationRetiresAndTwentyCleanTransactions
             const bool fail = mpi->rank() == failed_rank;
             PhysicalMemoryAllocationLease occupied;
             if (fail && defect == 2) occupied = memory->claimNewAllocation(DeviceId::cpu(),
-                PhysicalMemoryOwner::ModelSourcePayload, plan.geometry().source_bytes);
+                PhysicalMemoryOwner::ModelSourcePayload, plan.geometry().physicalBytes());
             EXPECT_THROW(PlanningMatrixSamplePublication::publish(mpi, plan,
                 fail && defect == 0 ? nullptr : memory,
                 fail && defect == 1 ? DeviceId::cuda(0) : DeviceId::cpu(), load), std::runtime_error);
@@ -240,7 +248,7 @@ void proveFileIndependentService(DeviceId follower_device)
             EXPECT_EQ(loads, mpi->is_root() ? 1 : 0);
             EXPECT_FALSE(std::filesystem::exists(plan.modelPath()));
             EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ModelSourcePayload,
-                PhysicalMemoryMaterializationKind::NewAllocation), plan.description().source_bytes);
+                PhysicalMemoryMaterializationKind::NewAllocation), sourcePhysicalBytes(plan.description()));
             for (size_t i = 0; i < expected.size(); ++i)
             {
                 EXPECT_EQ(sample.tensor(i).native_type(), format.tensor_type);
@@ -324,7 +332,7 @@ TEST(PlanningExpertSampleMPI, AsymmetricFailuresAreCollectiveAndTwentyCleanPubli
             PhysicalMemoryAllocationLease occupied;
             if (fail && defect == 2)
                 occupied = memory->claimNewAllocation(DeviceId::cpu(), PhysicalMemoryOwner::ModelSourcePayload,
-                    plan.description().source_bytes);
+                    sourcePhysicalBytes(plan.description()));
             EXPECT_THROW(PlanningExpertSamplePublication::publish(mpi, plan,
                 fail && defect == 0 ? nullptr : memory,
                 fail && defect == 1 ? DeviceId::cuda(0) : DeviceId::cpu(), root_load), std::runtime_error);

@@ -372,6 +372,17 @@ namespace llaminar2
          */
         bool hasTensor(const std::string &tensor_name) const override;
 
+        /** @copydoc IModelLoader::nativeWeightSourcePlacement */
+        CPUStoragePlacement nativeWeightSourcePlacement() const override;
+
+        /** @copydoc IModelLoader::nativeWeightSourceGeometry */
+        NativeWeightSourceGeometry nativeWeightSourceGeometry(const std::string &name) override;
+
+        /** @copydoc IModelLoader::readNativeWeightSourceWindow */
+        void readNativeWeightSourceWindow(
+            const std::string &name, const NativeWeightSourceWindow &window,
+            std::span<std::byte> destination) override;
+
         /**
          * @brief Get tensor shape without loading the full tensor
          * @param name Tensor name

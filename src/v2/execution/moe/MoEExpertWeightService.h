@@ -204,16 +204,6 @@ struct MoEWeightContext {
     MoEExpertWeightResolutionPolicy weight_resolution_policy =
         MoEExpertWeightResolutionPolicy::RawOrPrepared;
 
-    /**
-     * @brief Initial routed preparation's exact physical allocation authority.
-     *
-     * WeightManager supplies an admitted placement only for newly packed
-     * canonical engines. The packed storage retains its own allocation lease;
-     * registry aliases and graph consumers do not acquire duplicate claims.
-     * Runtime migration continues to use its independently admitted slot pool.
-     */
-    std::optional<CPUWeightStoragePlacement> initial_cpu_storage_placement;
-
     /** @brief Exact persistent owner authored by the frozen weight plan. */
     PhysicalMemoryOwner persistent_weight_owner = PhysicalMemoryOwner::Count;
 

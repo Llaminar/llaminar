@@ -419,15 +419,12 @@ namespace llaminar2
             std::visit([&](const auto &sample) {
                 if constexpr (std::is_same_v<std::decay_t<decltype(sample)>, PlanningExpertSamplePlan>)
                 {
-                    source.add(host, PhysicalMemoryOwner::ModelSourcePayload, sample.description().source_bytes);
-                    source.add(host, PhysicalMemoryOwner::WeightLoadStaging,
-                        rank == 0 ? sample.description().largest_source_bytes : 0);
+                    for (const auto &matrix : sample.description().matrices)
+                        source.add(host, PhysicalMemoryOwner::ModelSourcePayload, matrix.physicalBytes());
                 }
                 else if constexpr (std::is_same_v<std::decay_t<decltype(sample)>, PlanningProjectionServicePlan>)
                 {
-                    source.add(host, PhysicalMemoryOwner::ModelSourcePayload, sample.matrix().geometry().source_bytes);
-                    source.add(host, PhysicalMemoryOwner::WeightLoadStaging,
-                        rank == 0 ? sample.matrix().geometry().source_bytes : 0);
+                    source.add(host, PhysicalMemoryOwner::ModelSourcePayload, sample.matrix().geometry().physicalBytes());
                 }
             }, plan);
             std::vector<PhysicalMemoryPlan> alternatives{source.build()};

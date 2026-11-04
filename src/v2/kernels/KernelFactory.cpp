@@ -3595,6 +3595,30 @@ namespace llaminar
             // Prepared Embedding Weights
             // ==========================================================================
 
+            std::shared_ptr<llaminar2::PreparedEmbeddingHandle> KernelFactory::prepareEmbeddingHandleFromFinalCPUStorage(
+                std::shared_ptr<const llaminar2::TensorBase> final_tensor,
+                int d_model, size_t vocab_offset, size_t total_vocab)
+            {
+                if (!final_tensor || !final_tensor->home_device().is_cpu() ||
+                    final_tensor->shape().size() != 2u ||
+                    !llaminar2::NativeEmbeddingLayout::supports(final_tensor->native_type()))
+                    throw std::invalid_argument("Final CPU embedding requires an owning native CPU matrix");
+                auto weights = std::make_shared<llaminar2::PreparedEmbeddingWeights>();
+                weights->layout = llaminar2::NativeEmbeddingLayout::forSource(
+                    final_tensor->native_type(), final_tensor->rows(), d_model);
+                weights->vocab_size = final_tensor->rows();
+                weights->vocab_offset = vocab_offset;
+                weights->total_vocab = total_vocab ? total_vocab : final_tensor->rows();
+                weights->d_model = d_model;
+                weights->device_id = final_tensor->home_device();
+                weights->bindFinalCPUStorage(std::move(final_tensor));
+                auto handle = std::make_shared<llaminar2::PreparedEmbeddingHandle>();
+                handle->tensor = weights->retainedFinalCPUTensor().get();
+                handle->device_id = weights->device_id;
+                handle->weights = std::move(weights);
+                return handle;
+            }
+
             std::shared_ptr<llaminar2::PreparedEmbeddingHandle> KernelFactory::prepareEmbeddingHandleLocal(
                 const llaminar2::TensorBase *tensor,
                 int d_model,

@@ -17,6 +17,8 @@
 #include "../../utils/QuantizedVerifierFormats.h"
 #include <gtest/gtest.h>
 #include <memory>
+#include <limits>
+#include "loaders/PreparedHalfWeights.h"
 #include <omp.h>
 
 using namespace llaminar2;
@@ -247,7 +249,7 @@ namespace
             {"blk.0.ssm_alpha.weight", PlanningMatrixRows{3, 8}});
         auto memory = memoryFor(plan, device);
         ASSERT_EQ(memory->plannedBytes(DeviceId::cpu(), PhysicalMemoryOwner::PrimaryModelWeights),
-            plan.executionPayloadBytes());
+            CPUStoragePlacement::local().physicalBytes<uint8_t>(plan.executionPayloadBytes()));
         {
             auto sample = plan.load(source, memory, DeviceId::cpu());
             for (const auto allocator : {DeviceId::cpu(), device})
@@ -368,6 +370,98 @@ TEST(PlanningExecutionMeasurementIntegration, CPU_ProjectionFailures) { proveFai
 TEST(PlanningExecutionMeasurementIntegration, CPU_ProjectionOperandPolicyProvenance)
 {
     proveOperandPolicyProvenance();
+}
+/** @brief Odd row slices charge their actual converted root and retire failed allocations. */
+TEST(PlanningExecutionMeasurementIntegration, CPU_ProjectionConvertedRootLifecycle)
+{
+    struct RestorePolicy final
+    {
+        GDNProjectionArithmetic previous = debugEnv().gemm.gdn_projection_arithmetic;
+        ~RestorePolicy() { mutableDebugEnv().gemm.gdn_projection_arithmetic = previous; }
+    } restore;
+    FixedWorkers workers(1);
+    if (!hasCPUBackend()) initCPUBackend(-1);
+    for (const auto source_type : {TensorType::FP32, TensorType::BF16})
+    {
+        SCOPED_TRACE(tensorTypeName(source_type));
+        mutableDebugEnv().gemm.gdn_projection_arithmetic = source_type == TensorType::FP32 ?
+            GDNProjectionArithmetic::FP16AlphaBeta : GDNProjectionArithmetic::FP32;
+        PlanningGGUFFixture fixture(false, false, GGUFTensorType::F32, 256,
+            PlanningGGUFFixture::sourceType(source_type));
+        std::unique_ptr<TensorBase> original;
+        if (source_type == TensorType::FP32) original = TestTensorFactory::createFP32Random({256,256}, 713);
+        else original = TestTensorFactory::createBF16Random({256,256}, 713);
+        fixture.writePayload("blk.0.ssm_alpha.weight", 0,
+            {static_cast<const uint8_t *>(original->raw_data()), original->size_bytes()});
+        PlanningModelSource source(fixture.path());
+        const auto plan = PlanningMatrixSamplePlan::resolve(source,
+            {"blk.0.ssm_alpha.weight", PlanningMatrixRows{0,9}});
+        ASSERT_EQ(plan.geometry().n, 9u);
+        ASSERT_EQ(plan.executionType(), source_type == TensorType::FP32 ? TensorType::FP16 : TensorType::FP32);
+        const auto physical = CPUStoragePlacement::local().physicalBytes<uint8_t>(plan.executionPayloadBytes());
+        EXPECT_GE(physical, plan.executionPayloadBytes());
+        auto memory = memoryFor(plan, DeviceId::cpu());
+        ASSERT_EQ(memory->plannedBytes(DeviceId::cpu(), PhysicalMemoryOwner::PrimaryModelWeights), physical);
+        ASSERT_EQ(memory->plannedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ModelSourcePayload),
+            plan.geometry().physicalBytes());
+        {
+            auto occupied = memory->reserveNewAllocations(DeviceId::cpu(), PhysicalMemoryOwner::ModelSourcePayload, 1);
+            EXPECT_THROW((void)plan.load(source, memory, DeviceId::cpu()), std::logic_error);
+            EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ModelSourcePayload,
+                PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+        }
+        {
+            const auto sample = plan.load(source, memory, DeviceId::cpu());
+            EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ModelSourcePayload,
+                PhysicalMemoryMaterializationKind::NewAllocation), plan.geometry().physicalBytes());
+            if (source_type == TensorType::FP32)
+            {
+                auto half = materializePreparedHalfWeights(sample.tensor(), CPUWeightStoragePlacement::accounted(
+                    memory, DeviceId::cpu(), PhysicalMemoryOwner::PrimaryModelWeights, CPUWeightStoragePlacement::local()));
+                const auto *values = static_cast<const float *>(sample.tensor().raw_data());
+                const auto *words = static_cast<const uint16_t *>(half->raw_data());
+                for (size_t index = 0; index < 9u * 256; ++index)
+                    ASSERT_EQ(words[index], canonicalPreparedHalfBits(values[index]));
+                EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::PrimaryModelWeights,
+                    PhysicalMemoryMaterializationKind::NewAllocation), physical);
+            }
+            EXPECT_NO_THROW((void)PlanningProjectionMeasurement::measure(sample, DeviceId::cpu(), memory, 7));
+            EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::PrimaryModelWeights,
+                PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+            // Exactly one byte unavailable must reject the real converted root,
+            // without leaving its failed allocation or downstream kernel live.
+            auto occupied = memory->reserveNewAllocations(DeviceId::cpu(), PhysicalMemoryOwner::PrimaryModelWeights, 1);
+            EXPECT_THROW((void)PlanningProjectionMeasurement::measure(sample, DeviceId::cpu(), memory, 7), std::logic_error);
+            EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::PrimaryModelWeights,
+                PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+        }
+        expectRetired(*memory, DeviceId::cpu());
+        {
+            const auto sample = plan.load(source, memory, DeviceId::cpu());
+            auto occupied = memory->reserveNewAllocations(DeviceId::cpu(), PhysicalMemoryOwner::ExecutionWorkspace, 1);
+            EXPECT_THROW((void)PlanningProjectionMeasurement::measure(sample, DeviceId::cpu(), memory, 7), std::exception);
+            EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ExecutionWorkspace,
+                PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+            EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::PrimaryModelWeights,
+                PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+        }
+        expectRetired(*memory, DeviceId::cpu());
+        if (source_type == TensorType::FP32)
+        {
+            static_cast<FP32Tensor *>(original.get())->mutable_typed_data()[0] = std::numeric_limits<float>::infinity();
+            fixture.writePayload("blk.0.ssm_alpha.weight", 0,
+                {static_cast<const uint8_t *>(original->raw_data()), original->size_bytes()});
+            PlanningModelSource invalid_source(fixture.path());
+            const auto invalid_plan = PlanningMatrixSamplePlan::resolve(invalid_source,
+                {"blk.0.ssm_alpha.weight", PlanningMatrixRows{0,9}});
+            auto invalid_memory = memoryFor(invalid_plan, DeviceId::cpu());
+            {
+                const auto sample = invalid_plan.load(invalid_source, invalid_memory, DeviceId::cpu());
+                EXPECT_THROW((void)PlanningProjectionMeasurement::measure(sample, DeviceId::cpu(), invalid_memory, 7), std::invalid_argument);
+            }
+            expectRetired(*invalid_memory, DeviceId::cpu());
+        }
+    }
 }
 TEST(PlanningExecutionMeasurementIntegration, CPU_ProjectionArithmetic)
 {

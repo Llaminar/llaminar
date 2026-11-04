@@ -16,49 +16,17 @@
 
 #include <gtest/gtest.h>
 #include <memory>
+#include <cstring>
 
 #include "loaders/PreparedWeightStore.h"
 #include "loaders/WeightManager.h"
 #include "tensors/Tensors.h"
 #include "mocks/MockModelLoader.h"
+#include "utils/CPUWeightPlanTestAdmission.h"
+#include "backends/BackendManager.h"
 
 using namespace llaminar2;
 using namespace llaminar2::test;
-
-namespace
-{
-    void registerPreparedState(
-        PreparedWeightStore &store,
-        const std::shared_ptr<TensorBase> &tensor)
-    {
-        constexpr uint64_t binding_id = 1;
-        WeightBinding binding;
-        binding.binding_id = binding_id;
-        binding.identity = makeSourceWeightIdentity(
-            "test.prepared",
-            ModelContextId{99},
-            binding_id);
-        binding.tensor = tensor.get();
-        binding.residency.home_device = DeviceId::cpu();
-        binding.residency.resident_device = DeviceId::cpu();
-        binding.immutable = true;
-
-        auto handle =
-            std::make_shared<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle>();
-        handle->tensor = tensor.get();
-        handle->device_id = DeviceId::cpu();
-        handle->kind =
-            llaminar::v2::kernels::KernelFactory::GemmPreparationKind::CPU_PACKED;
-        handle->prepared_weights =
-            std::make_shared<llaminar::v2::kernels::KernelFactory::PreparedGemmWeights>();
-
-        store.registerPreparedGemmHandle(
-            binding,
-            PreparedWeightKind::CpuPackedGemm,
-            DeviceId::cpu(),
-            std::move(handle));
-    }
-}
 
 // ============================================================================
 // TestableWeightManager — opens lifecycle gates for release decision tests
@@ -87,6 +55,21 @@ public:
 class Test__WeightManager_PPSafety : public ::testing::Test
 {
 protected:
+    /** @brief Bind the fixture's complete original CPU source population before preparation. */
+    void admit(WeightManager& manager)
+    {
+        InferenceStrategy original;original.model_id={77};original.devices={DeviceId::cpu()};
+        WeightPlan plan(original);
+        for(const auto& name:mock_loader_->materializationNames()) {
+            WeightRequirement request;request.canonical_name=name;request.role=inferWeightRole(name);
+            request.layer=inferWeightLayer(name);request.target_device=DeviceId::cpu();
+            if(request.role==WeightRole::Other)request.expected_prepared_kind=PreparedWeightKind::CPUResidentTensor;
+            plan.add(std::move(request));
+        }
+        ASSERT_TRUE(manager.preparedWeightStore()->bindModelIdIfUnset(original.model_id));
+        admitCPUWeightPlansForTest(manager,*mock_loader_,{&plan});
+    }
+    void SetUp() override {if(!hasCPUBackend())initCPUBackend(-1);}
     std::shared_ptr<MockModelLoader> mock_loader_;
 };
 
@@ -113,6 +96,8 @@ TEST_F(Test__WeightManager_PPSafety, LMHeadStage_WithSeparateOutputWeight_Reject
     wm.setLayerRange(12, 24, false, true);
 
     // output.weight exists → token_embd.weight should be rejected
+    admit(wm);
+
     auto emb = wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
     EXPECT_EQ(emb, nullptr)
         << "LM head stage with separate output.weight must reject token_embd.weight";
@@ -152,6 +137,8 @@ TEST_F(Test__WeightManager_PPSafety, LMHeadStage_WithTiedEmbeddings_AllowsEmbedd
     wm.setLayerRange(12, 24, false, true);
 
     // No output.weight → token_embd.weight should be allowed (tied)
+    admit(wm);
+
     auto emb = wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
     EXPECT_NE(emb, nullptr)
         << "LM head stage with tied embeddings must allow token_embd.weight";
@@ -170,6 +157,8 @@ TEST_F(Test__WeightManager_PPSafety, EmbeddingStage_AlwaysAllowsEmbedding)
     // Embedding stage: layers [0,12), has embedding, no LM head
     wm.setLayerRange(0, 12, true, false);
 
+    admit(wm);
+
     auto emb = wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
     EXPECT_NE(emb, nullptr)
         << "Embedding stage must always allow token_embd.weight";
@@ -186,6 +175,8 @@ TEST_F(Test__WeightManager_PPSafety, MiddleStage_RejectsEmbedding)
     PPSafetyTestableWeightManager wm(*mock_loader_);
     // Middle stage: layers [6,12), no embedding, no LM head
     wm.setLayerRange(6, 12, false, false);
+
+    admit(wm);
 
     auto emb = wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
     EXPECT_EQ(emb, nullptr)
@@ -210,6 +201,8 @@ TEST_F(Test__WeightManager_PPSafety, LMHeadStage_LoadsLayerWeightsInRange)
     wm.setLayerRange(12, 24, false, true);
 
     // Layer 12 is in range [12,24)
+    admit(wm);
+
     auto l12 = wm.getWeightForDevice("blk.12.attn_q.weight", DeviceId::cpu(), 0);
     EXPECT_NE(l12, nullptr) << "Layer 12 should be in range";
 
@@ -243,6 +236,8 @@ TEST_F(Test__WeightManager_PPSafety, LayerRange_AllowsTrailingNextNSidecarWeight
     PPSafetyTestableWeightManager terminal(*mock_loader_);
     terminal.setLayerRange(32, 64, false, true);
 
+    admit(terminal);
+
     auto sidecar_fc = terminal.getWeightForDevice("blk.64.nextn.eh_proj.weight", DeviceId::cpu(), 0);
     EXPECT_NE(sidecar_fc, nullptr)
         << "Terminal PP stage should load the MTP nextn projection outside the main graph range";
@@ -269,11 +264,13 @@ TEST_F(Test__WeightManager_PPSafety, LayerRange_AllowsTrailingNextNSidecarWeight
 TEST_F(Test__WeightManager_PPSafety, ReleaseAll_RetainsCPUOnlyFP32Tensor)
 {
     mock_loader_ = MockModelLoader::createMinimal();
-    mock_loader_->addFP32RandomTensor("test_weight", {64, 64});
+    mock_loader_->addFP32RandomTensor("token_embd.weight", {64, 64});
 
     PPSafetyTestableWeightManager wm(*mock_loader_);
 
-    auto tensor = wm.getWeightForDevice("test_weight", DeviceId::cpu(), 0);
+    admit(wm);
+
+    auto tensor = wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
     ASSERT_NE(tensor, nullptr);
 
     // CPU-only tensor: no device copy
@@ -300,7 +297,7 @@ TEST_F(Test__WeightManager_PPSafety,
        MaterializedCPUConsumerPreventsAcceleratorPreparedHostReclaim)
 {
     mock_loader_ = MockModelLoader::createMinimal();
-    mock_loader_->addFP32RandomTensor("test_weight", {8, 8});
+    mock_loader_->addFP32RandomTensor("blk.0.attn_q.weight", {8, 8});
     PPSafetyTestableWeightManager wm(*mock_loader_);
 
     const auto materialize_for = [&](DeviceId target, WeightHostPolicy policy)
@@ -312,13 +309,15 @@ TEST_F(Test__WeightManager_PPSafety,
         WeightPlan plan(strategy);
 
         WeightRequirement requirement;
-        requirement.canonical_name = "test_weight";
+        requirement.canonical_name = "blk.0.attn_q.weight";
         requirement.target_device = target;
         requirement.lookup_device = DeviceId::cpu();
         requirement.host_policy = policy;
         plan.add(std::move(requirement));
         return wm.materialize(plan);
     };
+
+    admit(wm);
 
     const auto cpu_weights = materialize_for(
         DeviceId::cpu(), WeightHostPolicy::RequiredForCPUExecution);
@@ -327,15 +326,15 @@ TEST_F(Test__WeightManager_PPSafety,
         WeightHostPolicy::ReleasableAfterPreparation);
     ASSERT_EQ(cpu_weights.bindings().size(), 1u);
     ASSERT_EQ(accelerator_weights.bindings().size(), 1u);
-    ASSERT_EQ(
-        cpu_weights.bindings().front().tensor,
-        accelerator_weights.bindings().front().tensor);
+    ASSERT_NE(cpu_weights.bindings().front().tensor,accelerator_weights.bindings().front().tensor);
+    EXPECT_EQ(std::memcmp(cpu_weights.bindings().front().tensor->raw_data(),
+        accelerator_weights.bindings().front().tensor->raw_data(),8*8*sizeof(float)),0);
 
     auto tensor = cpu_weights.bindings().front().tensor_owner;
     ASSERT_NE(tensor, nullptr);
     tensor->setHostResident();
-    PreparedWeightStore prepared_store(ModelContextId{99});
-    registerPreparedState(prepared_store, tensor);
+    ASSERT_TRUE(cpu_weights.bindings().front().prepared);
+    ASSERT_NE(wm.preparedWeightStore()->gemmKernelLifetime(*cpu_weights.bindings().front().prepared),nullptr);
     ASSERT_TRUE(tensor->hasPreparedDeviceState());
 
     EXPECT_EQ(wm.releaseAllHostWeightData(), 0u);
@@ -349,11 +348,13 @@ TEST_F(Test__WeightManager_PPSafety,
 TEST_F(Test__WeightManager_PPSafety, ReleaseAll_RetainsCPUOnlyQuantizedTensor)
 {
     mock_loader_ = MockModelLoader::createMinimal();
-    mock_loader_->addQ8_0RandomTensor("test_weight", {64, 64});
+    mock_loader_->addQ8_0RandomTensor("token_embd.weight", {64, 64});
 
     PPSafetyTestableWeightManager wm(*mock_loader_);
 
-    auto tensor = wm.getWeightForDevice("test_weight", DeviceId::cpu(), 0);
+    admit(wm);
+
+    auto tensor = wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
     ASSERT_NE(tensor, nullptr);
     ASSERT_FALSE(tensor->deviceValid());
 
@@ -369,23 +370,30 @@ TEST_F(Test__WeightManager_PPSafety, ReleaseAll_RetainsCPUOnlyQuantizedTensor)
  * Verifies the safety fix doesn't break the normal release path for
  * tensors that have been explicitly marked as host-resident (mmap-backed).
  */
-TEST_F(Test__WeightManager_PPSafety, ReleaseAll_ReleasesHostResidentWithPrepared)
+TEST_F(Test__WeightManager_PPSafety, ReleaseAll_RetainsFinalCPUEmbeddingWithActualPreparedHandle)
 {
     mock_loader_ = MockModelLoader::createMinimal();
-    mock_loader_->addQ8_0RandomTensor("test_weight", {64, 64});
+    mock_loader_->addQ8_0RandomTensor("token_embd.weight", {64, 64});
 
     PPSafetyTestableWeightManager wm(*mock_loader_);
 
-    auto tensor = wm.getWeightForDevice("test_weight", DeviceId::cpu(), 0);
+    admit(wm);
+
+    auto tensor = wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
     ASSERT_NE(tensor, nullptr);
     tensor->setHostResident();
-    PreparedWeightStore prepared_store(ModelContextId{99});
-    registerPreparedState(prepared_store, tensor);
+    const auto metadata=wm.weightMetadataRegistry()->metadata(tensor.get());
+    ASSERT_TRUE(metadata);
+    WeightBinding binding;binding.binding_id=metadata->identity.instance_id;binding.identity=metadata->identity;
+    binding.tensor=tensor.get();binding.tensor_owner=tensor;binding.residency=metadata->residency;
+    binding.slice=metadata->slice;binding.immutable=true;
+    const auto prepared=wm.preparedWeightStore()->prepareEmbedding(binding,64);
+    ASSERT_TRUE(wm.preparedWeightStore()->embeddingHandle(prepared)!=nullptr);
 
     size_t released = wm.releaseAllHostWeightData();
-    EXPECT_GE(released, 1);
-    EXPECT_TRUE(tensor->is_raw_data_released())
-        << "Host-resident tensor with prepared device state should be released";
+    EXPECT_EQ(released,0u);
+    EXPECT_FALSE(tensor->is_raw_data_released())
+        << "The actual CPU embedding still reads its one final native root";
 }
 
 // ============================================================================
@@ -409,6 +417,8 @@ TEST_F(Test__WeightManager_PPSafety, DefaultPrecision_IsNative)
     WeightManager wm(*mock_loader_);
 
     // Load a quantized tensor — should remain quantized (NATIVE), not FP32
+    admit(wm);
+
     auto tensor = wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
     ASSERT_NE(tensor, nullptr);
 
@@ -423,13 +433,15 @@ TEST_F(Test__WeightManager_PPSafety, DefaultPrecision_IsNative)
 TEST_F(Test__WeightManager_PPSafety, ExplicitNative_KeepsQuantizedFormat)
 {
     mock_loader_ = MockModelLoader::createMinimal();
-    mock_loader_->addQ4_0RandomTensor("test_weight", {256, 64});
+    mock_loader_->addQ4_0RandomTensor("token_embd.weight", {256, 64});
 
     WeightManager wm(*mock_loader_, nullptr, nullptr,
                      WeightDistributionStrategy::REPLICATED,
                      WeightPrecision::NATIVE);
 
-    auto tensor = wm.getWeightForDevice("test_weight", DeviceId::cpu(), 0);
+    admit(wm);
+
+    auto tensor = wm.getWeightForDevice("token_embd.weight", DeviceId::cpu(), 0);
     ASSERT_NE(tensor, nullptr);
     EXPECT_EQ(tensor->native_type(), TensorType::Q4_0)
         << "NATIVE precision must preserve Q4_0 format";

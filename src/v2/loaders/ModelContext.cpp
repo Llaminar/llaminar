@@ -43,6 +43,26 @@ namespace llaminar2
     public:
         explicit ModelLoaderInterfaceWrapper(ModelLoader &loader) : loader_(loader) {}
 
+        /** @copydoc IModelLoader::nativeWeightSourcePlacement */
+        CPUStoragePlacement nativeWeightSourcePlacement() const override
+        {
+            return loader_.nativeWeightSourcePlacement();
+        }
+
+        /** @copydoc IModelLoader::nativeWeightSourceGeometry */
+        NativeWeightSourceGeometry nativeWeightSourceGeometry(const std::string &name) override
+        {
+            return loader_.nativeWeightSourceGeometry(name);
+        }
+
+        /** @copydoc IModelLoader::readNativeWeightSourceWindow */
+        void readNativeWeightSourceWindow(
+            const std::string &name, const NativeWeightSourceWindow &window,
+            std::span<std::byte> destination) override
+        {
+            loader_.readNativeWeightSourceWindow(name, window, destination);
+        }
+
         bool isLoaded() const override { return loader_.isLoaded(); }
         /** @brief Expose the immutable directory owned by the enclosing model context. */
         const GGUFModel *ggufDirectory() const noexcept override { return &loader_.getModel(); }

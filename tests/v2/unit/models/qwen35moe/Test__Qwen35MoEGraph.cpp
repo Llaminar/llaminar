@@ -82,6 +82,12 @@ namespace llaminar2
     struct Qwen35MoEPrefixRuntimeTestPeer
     {
         using Role = Qwen35MoEGraph::MoERuntimeTableRole;
+        /** @brief Exercise the original admitted CPU arena factory without a graph/collective launch. */
+        static std::shared_ptr<MoELocalExpertSerialBufferArena> serialArena(
+            Qwen35MoEGraph& graph,int participant,size_t rows) {
+            return graph.localExpertSerialBufferArenaForParticipant(DeviceId::cpu(),participant,rows,std::nullopt);
+        }
+
         /** @brief Replay the production ownership-to-return decision without GPU materialization. */
         static bool requiresReturn(const MoERoutedExpertPlacementPlan& plan, const MoEExpertOwnerMap& owners,
             int layer, MoERebalanceRuntimeMode mode, std::optional<std::string_view> frontier = std::nullopt) {
@@ -997,7 +1003,7 @@ namespace
      * @param builder Production graph composer receiving its prepared store.
      * @return Store retained until every built graph/stage has retired.
      */
-    std::unique_ptr<PreparedWeightStore> admitStandaloneCPUFFN(
+    std::shared_ptr<PreparedWeightStore> admitStandaloneCPUFFN(
         const GraphConfig &config, const LayerWeights &layer, Qwen35MoEGraph &builder)
     {
         MoEExpertComputeStage::Params params;
@@ -1013,8 +1019,14 @@ namespace
                 params.expert_mask=routed_expert_ownership::expertMaskForParticipant(config.moe.num_experts,
                     config.moe.owner_participant_count,config.moe.owner_participant_index,0,config.moe.owner_order);
         }
-        auto store=admitCPUExpertStageForTest(params,PhysicalMemoryOwner::PrimaryModelWeights);
-        builder.setPreparedWeightStore(store.get());
+        std::shared_ptr<PreparedWeightStore> store=admitCPUExpertStageForTest(params,PhysicalMemoryOwner::PrimaryModelWeights);
+        if(!MoEExpertComputeStage::prepareExpertGemmEngines(params))
+            throw std::runtime_error("Standalone CPU graph fixture could not prepare its actual expert bank");
+        auto context=ModelContext::createForTesting("standalone_cpu_ffn.gguf",nullptr,1,true);
+        auto manager=context->concreteWeightManager();manager->installPhysicalMemoryAuthority(store->physicalMemoryAuthority());
+        manager->setPreparedWeightStore(store);
+        publishCPUExpertStageRegistryForTest(params,manager->expertGemmRegistry());
+        builder.setModelContext(context);builder.setPreparedWeightStore(store.get());
         ModelWeightBindings bindings;
         bindings.physical_memory_owner=PhysicalMemoryOwner::PrimaryModelWeights;
         builder.setWeightBindings(bindings);
@@ -1374,7 +1386,7 @@ TEST(Test__Qwen35MoEGraph, ReplicatedRoutedExpertOutputFeedsCombineDirectlyUnder
     GraphConfig config = makeMoEConfig(tp_ctx.get());
     config.moe.routed_compute_policy = RoutedExpertComputePolicy::Replicated;
     config.moe.local_expert_count = -1;
-    std::unique_ptr<PreparedWeightStore> prepared_admission;
+    std::shared_ptr<PreparedWeightStore> prepared_admission;
     Qwen35MoEGraph graph_builder(config, nullptr);
 
     TensorArena arena;
@@ -1989,7 +2001,7 @@ TEST(Test__Qwen35MoEGraph, ReplicatedOverlayPublishesExplicitRuntimeOwnerMetadat
 TEST(Test__Qwen35MoEGraph, SingleDeviceSharedGateFusesMoECombine)
 {
     GraphConfig config = makeMoEConfig();
-    std::unique_ptr<PreparedWeightStore> prepared_admission;
+    std::shared_ptr<PreparedWeightStore> prepared_admission;
     Qwen35MoEGraph graph_builder(config, nullptr);
 
     TensorArena arena;
@@ -2036,7 +2048,7 @@ TEST(Test__Qwen35MoEGraph, ExpertParallelRoutedExpertOutputUsesPackedRootedCanon
     config.moe.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
     config.moe.local_expert_start = 0;
     config.moe.local_expert_count = 1;
-    std::unique_ptr<PreparedWeightStore> prepared_admission;
+    std::shared_ptr<PreparedWeightStore> prepared_admission;
     Qwen35MoEGraph graph_builder(config, nullptr);
 
     TensorArena arena;
@@ -2464,7 +2476,7 @@ TEST(Test__Qwen35MoEGraph,
     config.mtp.enabled = true;
     config.mtp.draft_tokens = 15;
 
-    std::unique_ptr<PreparedWeightStore> prepared_admission;
+    std::shared_ptr<PreparedWeightStore> prepared_admission;
 
     TestableQwen35MoEGraph graph_builder(config, nullptr);
     graph_builder.setDecodeReplicatedDenseWeightBindings(
@@ -4172,7 +4184,7 @@ TEST(Test__Qwen35MoEGraph, CPUAllPositionMoEVerifierUsesDecodeEquivalentExpertPa
     GraphConfig config = makeMoEConfig();
     config.grouped_mtp_verifier = true;
     config.compute_all_position_logits = true;
-    std::unique_ptr<PreparedWeightStore> prepared_admission;
+    std::shared_ptr<PreparedWeightStore> prepared_admission;
     Qwen35MoEGraph graph_builder(config, nullptr);
 
     TensorArena arena;
@@ -5453,7 +5465,7 @@ TEST(Test__Qwen35MoEGraph, RuntimeHistogramCollectionFollowsMaintenanceMode)
             config.d_model,
             config.moe.num_experts,
             config.moe.top_k);
-        std::unique_ptr<PreparedWeightStore> prepared_admission;
+        std::shared_ptr<PreparedWeightStore> prepared_admission;
         Qwen35MoEGraph builder(config, nullptr);
         prepared_admission=admitStandaloneCPUFFN(config,layer,builder);
         ComputeGraph graph = builder.buildFFNGraph(
@@ -6724,3 +6736,66 @@ TEST(Test__Qwen35MoEGraph, AdmittedPreparedWeightAuthoritiesExcludeOnlyEmptyExte
         EXPECT_EQ(admittedOverlayPreparedWeightDevices(*shared, shared_execution).size(), 5u);
     }
 }
+
+namespace {
+/** @brief Declared rank/NUMA membership only; no source geometry or execution admission is invented. */
+std::shared_ptr<MoERoutedExpertPlacementPlan> preparedJointParticipantPlan(bool empty)
+{
+    auto plan=makeROCmPhaseSplitApportionedOverlayPlan("continuation");
+    plan->routed_tiers[0].fallback=false;
+    plan->routed_tiers[0].max_experts_per_layer=512;
+    plan->routed_tiers[0].resolved_live_experts_per_layer={empty?512:64};
+    plan->domains.push_back(expertDomain("joint_cpu",ExecutionDomainScope::NODE_LOCAL,CollectiveBackendType::MPI,
+        RoutedExpertComputePolicy::TensorSharded,{GlobalDeviceAddress::cpu(0),GlobalDeviceAddress::cpu(1)},{0,1}));
+    plan->routed_tiers.push_back({.name="cpu_fragments",.domain="joint_cpu",.priority=10,
+        .max_experts_per_layer=448,.memory_budget_bytes=4096,.fallback=true,
+        .resolved_live_experts_per_layer={empty?0:448}});
+    plan->placements={{.layer=0,.routed_expert_tier=std::vector<int>(512,empty?0:1)}};
+    if(!empty)std::fill_n(plan->placements[0].routed_expert_tier.begin(),64,0);
+    return plan;
+}
+}
+/** @test Prepared-record membership never constructs a whole-owner map for original joint CPU fragments. */
+TEST(Test__Qwen35MoEGraph, PreparedJointParticipantProjectionDoesNotMintOwners)
+{
+    for(bool empty:{false,true}) {
+        auto plan=preparedJointParticipantPlan(empty);
+        for(int rank:{0,1}) {
+            const auto execution=resolveMoEExpertOverlayExecutionPlan(plan,{.current_world_rank=rank,.world_size=2});
+            const auto before=MoEExpertOwnerMap::initialBuildAttempts();
+            const auto devices=admittedOverlayPreparedWeightDevices(*plan,execution);
+            EXPECT_EQ(MoEExpertOwnerMap::initialBuildAttempts(),before);
+            const auto cpu=std::find(devices.begin(),devices.end(),DeviceId::cpu());
+            EXPECT_EQ(cpu!=devices.end(),!empty);
+            EXPECT_EQ(plan->placements[0].routed_expert_tier.size(),512u);
+            EXPECT_EQ(plan->routed_tiers[1].resolved_live_experts_per_layer[0],empty?0:448);
+        }
+    }
+}
+/** @test Descriptor projection rejects omitted/foreign/reordered members and contradicted frozen zero tiers. */
+TEST(Test__Qwen35MoEGraph, PreparedParticipantDescriptorProjectionIsExact)
+{
+    auto plan=preparedJointParticipantPlan(false);
+    const auto participants=MoEExpertOwnerMap::declaredParticipants(*plan,{.reject_tensor_sharded_domains=false});
+    const auto before=MoEExpertOwnerMap::initialBuildAttempts();
+    EXPECT_EQ(MoEOverlayHostServiceContract::admittedExpertParticipants(*plan,participants),participants);
+    EXPECT_EQ(MoEExpertOwnerMap::initialBuildAttempts(),before);
+    auto invalid=participants;invalid.pop_back();
+    EXPECT_THROW(MoEOverlayHostServiceContract::admittedExpertParticipants(*plan,invalid),std::logic_error);
+    invalid=participants;++invalid.back().world_rank;
+    EXPECT_THROW(MoEOverlayHostServiceContract::admittedExpertParticipants(*plan,invalid),std::logic_error);
+    invalid=participants;std::swap(invalid.front(),invalid.back());
+    EXPECT_THROW(MoEOverlayHostServiceContract::admittedExpertParticipants(*plan,invalid),std::logic_error);
+    invalid=participants;++invalid.back().address.numa_node;
+    EXPECT_THROW(MoEOverlayHostServiceContract::admittedExpertParticipants(*plan,invalid),std::logic_error);
+    auto empty=preparedJointParticipantPlan(true);
+    const auto zero=MoEExpertOwnerMap::declaredParticipants(*empty,{.reject_tensor_sharded_domains=false});
+    EXPECT_EQ(MoEOverlayHostServiceContract::admittedExpertParticipants(*empty,zero).size(),4u);
+    auto unresolved=*empty;unresolved.routed_tiers[1].resolved_live_experts_per_layer.clear();
+    EXPECT_EQ(MoEOverlayHostServiceContract::admittedExpertParticipants(unresolved,zero).size(),zero.size());
+    empty->placements[0].routed_expert_tier.back()=1;
+    EXPECT_THROW(MoEOverlayHostServiceContract::admittedExpertParticipants(*empty,zero),std::logic_error);
+    EXPECT_EQ(MoEExpertOwnerMap::initialBuildAttempts(),before);
+}
+
+#include "CPUJointColocatedSerialArenaLifecycle.inc"

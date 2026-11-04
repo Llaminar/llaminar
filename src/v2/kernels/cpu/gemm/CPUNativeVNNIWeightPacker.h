@@ -18,22 +18,13 @@
  *
  * Weights are arranged in N-blocks of 64 columns for AVX-512 SIMD:
  *
- * ```
- * setup-only source payload: [N_chunks][blocks_per_row][64][payload_bytes]
- *   - N_chunks = ceil(N/64)
- *   - blocks_per_row = ceil(K/32)
- *   - payload_bytes = format-specific (Q4_0=16, IQ4_NL=16, Q6_K=24, etc.)
- *
- * scales: [N_chunks][blocks_per_row][64] × uint16_t
- *   - FP16 scale, or original FP16 superblock base for Q6_K/IQ2_S/IQ4_XS
- *
- * mins: [N_chunks][blocks_per_row][64] × uint16_t (asymmetric/dual-scale)
- *   - FP16 minimum/second scale; Q6_K packs signed coefficients, IQ2_S/IQ4_XS raw source coefficients
- * ```
- *
- * Source payload and metadata are interleaved into the sole retained execution
- * bank before publication. Legacy archive payload sections are accepted during
- * import and retired by the engine publication boundary.
+ * The sole retained execution root is [N_chunks][K_blocks][interleaved unit].
+ * Native source payload/scale/min words are read through the same bounded
+ * native-group append primitive used by streaming preparation. Its scratch is
+ * capped by the common source policy and owned by WeightLoadStaging; no whole
+ * source-order nibble/Q6 matrix is materialized. Legacy archive payload sections
+ * remain import-only and retire at engine publication. Activation rotation
+ * retains its separate existing complete-row arithmetic contract.
  *
  * This layout ensures:
  * - Sequential K-block streaming within an N-chunk → good prefetch/cache line use
@@ -44,8 +35,11 @@
 #pragma once
 
 #include "memory/CPUWeightStoragePlacement.h"
+#include "loaders/NativeWeightLoadStaging.h"
 
 #include <cstdint>
+#include <span>
+#include <limits>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
@@ -1144,6 +1138,26 @@ namespace llaminar2::cpu::native_vnni
         }
     }
 
+#include "CPUNativeVNNIWindowPacking.inc"
+
+    /**
+     * @brief Exact capped workspace for the immediate consumer of already-resident native bytes.
+     * @param format Same canonical append codec, with no second format table.
+     * @param n Useful final rows. @param k Original source columns.
+     * @param placement Same original allocator placement as final prepared storage.
+     * @return Workspace for at most one 64-row chunk, further bounded by the common startup cap.
+     */
+    inline NativeWeightLoadStagingGeometry immediateNativePackScratchGeometry(
+        const NativeVnniFormatInfo& format,int n,int k,CPUStoragePlacement placement)
+    {
+        if(n<=0 || k<=0 || k>std::numeric_limits<int>::max()-31)
+            throw std::invalid_argument("Immediate native pack requires representable positive source geometry");
+        const auto groups=(size_t(k)+31)/32;
+        const auto native_groups=(groups+(format.is_superblock?7:0))/(format.is_superblock?8:1);
+        return resolveNativeWeightLoadStaging({NativePackGroupScratch::checked(format).bytes,0,0,
+            std::min(size_t(n),size_t{64})*native_groups},placement,configuredNativeWeightLoadStagingBudgetBytes());
+    }
+
     /**
      * @brief Pack tensor weights into CPUNativeVNNIPackedWeights.
      *
@@ -1158,6 +1172,7 @@ namespace llaminar2::cpu::native_vnni
      * @param placement   Final destination first-touch policy for every encoding.
      * @return true on success
      */
+
     inline bool packWeightsCPUNativeVNNI(const TensorBase *weights,
                                          CPUNativeVNNIPackedWeights &out,
                                          int row_start = 0, int row_end = -1,
@@ -1236,41 +1251,38 @@ namespace llaminar2::cpu::native_vnni
 
         bool use_superblock = (unpackable->superblock_size() == 256);
 
-        if (out.usesCompactMultiScale())
+        if (!use_rotated_path)
         {
-            // Each worker owns complete final units. Native preparation writes a
-            // bounded one-block stack window, then only the storage order changes.
-            // No dequantize/requantize edge may discard a scale or delta sign.
-            out.native_interleaved = placement.allocate<uint8_t>(
-                static_cast<size_t>(N_chunks) * blocks_per_row * out.interleaved_block_stride);
-#pragma omp parallel for collapse(2) schedule(static)
-            for (int chunk = 0; chunk < N_chunks; ++chunk)
+            // The source already owns native bytes. Only the same append
+            // primitive's workspace is transient; never make a native copy.
+            const auto original_memory=placement.physicalMemoryAuthority();
+            std::optional<PhysicalMemoryCPUWeightSourceLease> source_scope;
+            if(original_memory)
+                source_scope.emplace(original_memory->acquireCPUWeightSourceTransaction(placement.allocatorDevice()));
+            const auto geometry=immediateNativePackScratchGeometry(*fmt,N,K,placement.storagePlacement());
+            auto scratch=original_memory
+                ? CPUStorageRoot<uint8_t>(geometry.native_bytes,PhysicalMemoryOwner::WeightLoadStaging,
+                    placement.allocatorDevice(),placement.storagePlacement(),CPUStorageInitialization::Uninitialized).allocate(original_memory)
+                : placement.allocate<uint8_t>(geometry.native_bytes);
+            initializeNativeWindowOutput(*fmt,N,K,placement,out);
+            const int group_blocks=fmt->is_superblock?8:1;
+            const size_t groups=(size_t(blocks_per_row)+group_blocks-1)/group_blocks;
+            auto bytes=std::span<std::byte>(reinterpret_cast<std::byte*>(scratch.data()),scratch.size());
+            if(geometry.maximum_units_per_window>=groups)
             {
-                for (int kb = 0; kb < blocks_per_row; ++kb)
-                {
-                    uint8_t *const unit = out.native_interleaved.data() +
-                        (static_cast<size_t>(chunk) * blocks_per_row + kb) * out.interleaved_block_stride;
-                    std::memset(unit, 0, out.interleaved_block_stride);
-                    for (int column = 0; column < std::min(64, N - chunk * 64); ++column)
-                    {
-                        uint8_t payload[16]{};
-                        uint16_t primary = 0, secondary = 0;
-                        uint32_t emins = 0;
-                        const VnniPackContext context{
-                            .raw_bytes = nullptr, .N = 1, .K = K,
-                            .blocks_per_row = blocks_per_row, .payload_bytes = out.payload_bytes,
-                            .payload_array = payload, .scales_array = &primary,
-                            .mins_array = &secondary, .emins_array = &emins,
-                            .destination_block_origin = kb, .destination_block_count = 1,
-                        };
-                        unpackable->packVnniBlock(context, row_start + chunk * 64 + column, 0, kb);
-                        for (int byte = 0; byte < out.payload_bytes; ++byte)
-                            unit[(byte / 4) * 256 + column * 4 + byte % 4] = payload[byte];
-                        std::memcpy(unit + out.data_stride + column * 2, &primary, 2);
-                        std::memcpy(unit + out.data_stride + 128 + column * 2, &secondary, 2);
-                        std::memcpy(unit + out.data_stride + 256 + column * 4, &emins, 4);
-                    }
-                }
+                const int rows_per_window=static_cast<int>(std::min(size_t{64},geometry.maximum_units_per_window/groups));
+                for(int row=0;row<N;row+=rows_per_window)
+                    appendNativeWeightGroups(*unpackable,*fmt,K,row_start+row,0,std::min(rows_per_window,N-row),
+                        blocks_per_row,row,0,bytes,out);
+            }
+            else
+            {
+                // Even one full source row may exceed the cap. Visit native
+                // K groups in order, without rebuilding a row-sized shadow.
+                const int blocks_per_window=static_cast<int>(geometry.maximum_units_per_window)*group_blocks;
+                for(int row=0;row<N;++row)for(int kb=0;kb<blocks_per_row;kb+=blocks_per_window)
+                    appendNativeWeightGroups(*unpackable,*fmt,K,row_start+row,kb,1,
+                        std::min(blocks_per_window,blocks_per_row-kb),row,kb,bytes,out);
             }
             return true;
         }
@@ -1410,383 +1422,6 @@ namespace llaminar2::cpu::native_vnni
 
             // Fall through to the INT8 interleaving path below
         }
-        else if (out.usesQ6KNativeDualScale())
-        {
-            // =================================================================
-            // NATIVE Q6_K DUAL-SCALE PATH
-            //
-            // Preserve the exact 24-byte payload emitted for each logical
-            // 32-value block.  The first sixteen bytes carry paired low
-            // nibbles and the final eight bytes carry four two-bit high parts
-            // each. The primary metadata retains the original FP16 base; the
-            // secondary word packs both signed source coefficients. Neither
-            // derived factor is rounded to half during preparation.
-            //
-            // Prepared bytes per 64-column/K block:
-            //   1024 B low-nibble transpose
-            //    512 B high-two-bit transpose
-            //    128 B original half bases
-            //    128 B signed coefficient pairs
-            // = 1792 B, versus 2304 B for the previous requantized INT8 path.
-            // =================================================================
-            std::vector<uint8_t> temp_payload(
-                static_cast<size_t>(blocks_per_row) * N_padded *
-                    fmt->payload_bytes,
-                0);
-            std::vector<uint16_t> temp_primary_scales(
-                static_cast<size_t>(blocks_per_row) * N_padded,
-                0);
-            std::vector<uint16_t> temp_secondary_scales(
-                static_cast<size_t>(blocks_per_row) * N_padded,
-                0);
-
-            VnniPackContext native_context;
-            native_context.raw_bytes = nullptr;
-            native_context.N = N_padded;
-            native_context.K = K;
-            native_context.blocks_per_row = blocks_per_row;
-            native_context.payload_bytes = fmt->payload_bytes;
-            native_context.payload_array = temp_payload.data();
-            native_context.scales_array = temp_primary_scales.data();
-            native_context.mins_array = temp_secondary_scales.data();
-            native_context.emins_array = nullptr;
-
-#pragma omp parallel for schedule(static)
-            for (int n = 0; n < N; ++n)
-            {
-                const int src_row = row_start + n;
-                for (int kb = 0; kb < blocks_per_row; ++kb)
-                    unpackable->packVnniBlock(native_context, src_row, n, kb);
-            }
-
-            const size_t interleaved_total =
-                static_cast<size_t>(N_chunks) * blocks_per_row *
-                out.interleaved_block_stride;
-            out.native_interleaved = placement.allocate<uint8_t>(interleaved_total);
-
-#pragma omp parallel for schedule(static) collapse(2)
-            for (int chunk = 0; chunk < N_chunks; ++chunk)
-            {
-                for (int kb = 0; kb < blocks_per_row; ++kb)
-                {
-                    const int n_cols = std::min(64, N - chunk * 64);
-                    const size_t block_offset =
-                        (static_cast<size_t>(chunk) * blocks_per_row + kb) *
-                        out.interleaved_block_stride;
-                    uint8_t *const destination =
-                        out.native_interleaved.data() + block_offset;
-
-                    // Low nibbles retain the established four-group/ZMM layout.
-                    for (int group = 0; group < 4; ++group)
-                    {
-                        for (int z = 0; z < 4; ++z)
-                        {
-                            uint8_t *const zmm_destination =
-                                destination + group * 256 + z * 64;
-                            for (int lane = 0; lane < 16; ++lane)
-                            {
-                                const int local_column = z * 16 + lane;
-                                if (local_column >= n_cols)
-                                {
-                                    std::memset(zmm_destination + lane * 4, 0, 4);
-                                    continue;
-                                }
-                                const int column = chunk * 64 + local_column;
-                                const size_t linear =
-                                    static_cast<size_t>(kb) * N_padded + column;
-                                const uint8_t *const source =
-                                    temp_payload.data() +
-                                    linear * fmt->payload_bytes + group * 4;
-                                std::memcpy(zmm_destination + lane * 4, source, 4);
-                            }
-                        }
-                    }
-
-                    /*
-                     * Transpose the native two-bit fields into two bitplanes
-                     * for each group/ZMM. The low-nibble vector is ordered as
-                     * sixteen columns of four adjacent K values, so mask bit
-                     * `lane * 4 + index` directly addresses its destination
-                     * byte. Invalid padded columns remain clear.
-                     */
-                    for (int group = 0; group < 8; ++group)
-                    {
-                        for (int z = 0; z < 4; ++z)
-                        {
-                            uint64_t low_bitplane = 0;
-                            uint64_t high_bitplane = 0;
-                            for (int lane = 0; lane < 16; ++lane)
-                            {
-                                const int local_column = z * 16 + lane;
-                                if (local_column >= n_cols)
-                                    continue;
-
-                                const int column =
-                                    chunk * 64 + local_column;
-                                const size_t linear =
-                                    static_cast<size_t>(kb) * N_padded +
-                                    column;
-                                const uint8_t packed_high =
-                                    temp_payload[
-                                        linear * fmt->payload_bytes +
-                                        16 + group];
-                                for (int index = 0; index < 4; ++index)
-                                {
-                                    const uint64_t bit =
-                                        static_cast<uint64_t>(lane * 4 + index);
-                                    const uint8_t high_part =
-                                        static_cast<uint8_t>(
-                                            (packed_high >> (index * 2)) &
-                                            0x03u);
-                                    low_bitplane |=
-                                        static_cast<uint64_t>(high_part & 1u)
-                                        << bit;
-                                    high_bitplane |=
-                                        static_cast<uint64_t>(high_part >> 1)
-                                        << bit;
-                                }
-                            }
-
-                            uint8_t *const high_destination =
-                                destination + 1024 + group * 64 + z * 16;
-                            std::memcpy(
-                                high_destination,
-                                &low_bitplane,
-                                sizeof(low_bitplane));
-                            std::memcpy(
-                                high_destination + sizeof(low_bitplane),
-                                &high_bitplane,
-                                sizeof(high_bitplane));
-                        }
-                    }
-
-                    auto *const primary_scales =
-                        reinterpret_cast<uint16_t *>(destination + 1536);
-                    auto *const secondary_scales =
-                        reinterpret_cast<uint16_t *>(destination + 1664);
-                    for (int local_column = 0; local_column < 64;
-                         ++local_column)
-                    {
-                        if (local_column >= n_cols)
-                        {
-                            primary_scales[local_column] = 0;
-                            secondary_scales[local_column] = 0;
-                            continue;
-                        }
-                        const int column = chunk * 64 + local_column;
-                        const size_t linear =
-                            static_cast<size_t>(kb) * N_padded + column;
-                        primary_scales[local_column] =
-                            temp_primary_scales[linear];
-                        secondary_scales[local_column] =
-                            temp_secondary_scales[linear];
-                    }
-                }
-            }
-        }
-        else if (out.usesNibbleLUT())
-        {
-            // =================================================================
-            // NIBBLE-LUT PATH (Q4_0, IQ4_NL, Q4_1, IQ4_XS)
-            //
-            // Source-order payload is setup scratch, never retained weight
-            // storage. Every execution path consumes the final interleaved bytes.
-            // The GEMV kernel decodes nibbles at runtime via vpshufb LUT.
-            // Memory: 0.5 byte/element (half of INT8).
-            // =================================================================
-
-            temp_scales.assign(total_blocks, 0);
-            temp_mins.assign(total_blocks, 0);
-            std::vector<uint8_t> source_payload(total_blocks * fmt->payload_bytes, 0);
-
-// Pass 1: Extract scales/mins from superblocks
-#pragma omp parallel for schedule(static)
-            for (int n = 0; n < N; ++n)
-            {
-                if (out.usesNibbleLUTSourceScale()) continue; // Original words come from the native source packer below.
-                int src_row = row_start + n;
-                int chunk = n / 64;
-                int n_local = n % 64;
-                int kb = 0;
-
-                if (use_superblock)
-                {
-                    int K_superblocks = blocks_per_row / 8;
-                    for (int sb = 0; sb < K_superblocks; ++sb)
-                    {
-                        int8_t sb_vals[256];
-                        float sb_scales[8];
-                        float sb_mins[8];
-                        unpackable->unpack_superblock_to_int8(src_row, sb, sb_vals, sb_scales, sb_mins);
-
-                        for (int i = 0; i < 8; ++i)
-                        {
-                            size_t idx = (size_t)chunk * blocks_per_row * 64 + (size_t)(kb + i) * 64 + n_local;
-                            temp_scales[idx] = fp32_to_fp16(sb_scales[i]);
-                            temp_mins[idx] = fp32_to_fp16(sb_mins[i]);
-                        }
-                        kb += 8;
-                    }
-                }
-                for (; kb < blocks_per_row; ++kb)
-                {
-                    size_t idx = (size_t)chunk * blocks_per_row * 64 + (size_t)kb * 64 + n_local;
-                    temp_scales[idx] = fp32_to_fp16(unpackable->get_block_scale(src_row, kb));
-                    temp_mins[idx] = fp32_to_fp16(unpackable->get_block_min(src_row, kb));
-                }
-            }
-
-            // Pass 2: Pack native payload via packVnniBlock into temp GPU-interleaved buffer
-            std::vector<uint8_t> temp_payload((size_t)blocks_per_row * N_padded * fmt->payload_bytes, 0);
-            std::vector<uint16_t> temp_scales2((size_t)blocks_per_row * N_padded, 0);
-            std::vector<uint16_t> temp_mins2((size_t)blocks_per_row * N_padded, 0);
-
-            VnniPackContext gpu_ctx;
-            gpu_ctx.raw_bytes = nullptr;
-            gpu_ctx.N = N_padded;
-            gpu_ctx.K = K;
-            gpu_ctx.blocks_per_row = blocks_per_row;
-            gpu_ctx.payload_bytes = fmt->payload_bytes;
-            gpu_ctx.payload_array = temp_payload.data();
-            gpu_ctx.scales_array = temp_scales2.data();
-            gpu_ctx.mins_array = (fmt->is_asymmetric || out.usesNibbleLUTSourceScale()) ? temp_mins2.data() : nullptr;
-            gpu_ctx.emins_array = nullptr;
-
-#pragma omp parallel for schedule(static)
-            for (int n = 0; n < N; ++n)
-            {
-                const int src_row = row_start + n;
-                for (int kb = 0; kb < blocks_per_row; ++kb)
-                {
-                    unpackable->packVnniBlock(gpu_ctx, src_row, n, kb);
-                }
-            }
-
-            // Pass 3: Reorganize from GPU interleaved to CPU blocked layout
-#pragma omp parallel for schedule(static) collapse(2)
-            for (int chunk = 0; chunk < N_chunks; ++chunk)
-            {
-                for (int kb = 0; kb < blocks_per_row; ++kb)
-                {
-                    for (int n_local = 0; n_local < 64; ++n_local)
-                    {
-                        int n = chunk * 64 + n_local;
-                        if (n >= N) continue;
-                        size_t gpu_idx = (size_t)kb * N_padded + n;
-                        size_t cpu_idx = (size_t)chunk * blocks_per_row * 64 + (size_t)kb * 64 + n_local;
-                        if (out.usesNibbleLUTSourceScale())
-                        {
-                            temp_scales[cpu_idx] = temp_scales2[gpu_idx];
-                            temp_mins[cpu_idx] = temp_mins2[gpu_idx];
-                        }
-                        std::memcpy(source_payload.data() + cpu_idx * fmt->payload_bytes,
-                                    temp_payload.data() + gpu_idx * fmt->payload_bytes,
-                                    fmt->payload_bytes);
-                    }
-                }
-            }
-
-            // Pass 4: Build VNNI-interleaved B buffer (4 groups) + inline comp/scales/mins
-            size_t interleaved_total = (size_t)N_chunks * blocks_per_row * out.interleaved_block_stride;
-            // The following parallel pass writes every byte. Avoid a
-            // single-threaded zero fill here because it first-touches the whole
-            // permanent weight buffer on the allocator thread's NUMA node.
-            out.native_interleaved = placement.allocate<uint8_t>(interleaved_total);
-
-#pragma omp parallel for schedule(static) collapse(2)
-            for (int chunk = 0; chunk < N_chunks; ++chunk)
-            {
-                for (int kb = 0; kb < blocks_per_row; ++kb)
-                {
-                    const uint8_t *chunk_payload = source_payload.data() +
-                        ((size_t)chunk * blocks_per_row + kb) * 64 * fmt->payload_bytes;
-                    int n_cols = std::min(64, N - chunk * 64);
-
-                    size_t block_offset = ((size_t)chunk * blocks_per_row + kb) * out.interleaved_block_stride;
-                    uint8_t *interleaved_dst = out.native_interleaved.data() + block_offset;
-
-                    for (int group = 0; group < 4; ++group)
-                    {
-                        for (int z = 0; z < 4; ++z)
-                        {
-                            uint8_t *zmm_dst = interleaved_dst + group * 256 + z * 64;
-                            for (int lane = 0; lane < 16; ++lane)
-                            {
-                                int col = z * 16 + lane;
-                                if (col < n_cols)
-                                {
-                                    const uint8_t *src = chunk_payload + (size_t)col * fmt->payload_bytes;
-                                    zmm_dst[lane * 4 + 0] = src[group * 4 + 0];
-                                    zmm_dst[lane * 4 + 1] = src[group * 4 + 1];
-                                    zmm_dst[lane * 4 + 2] = src[group * 4 + 2];
-                                    zmm_dst[lane * 4 + 3] = src[group * 4 + 3];
-                                }
-                                else
-                                {
-                                    zmm_dst[lane * 4 + 0] = 0;
-                                    zmm_dst[lane * 4 + 1] = 0;
-                                    zmm_dst[lane * 4 + 2] = 0;
-                                    zmm_dst[lane * 4 + 3] = 0;
-                                }
-                            }
-                        }
-                    }
-
-                    // Write comp inline after group data
-                    size_t meta_idx = (size_t)chunk * blocks_per_row * 64 + (size_t)kb * 64;
-                    int16_t *inline_comp = reinterpret_cast<int16_t *>(interleaved_dst + 1024);
-                    for (int col = 0; col < 64; ++col)
-                    {
-                        if (col < n_cols)
-                        {
-                            int8_t decoded[32];
-                            decode_native_block(out.codebook_id,
-                                                chunk_payload + (size_t)col * fmt->payload_bytes,
-                                                decoded);
-                            int32_t sum = 0;
-                            for (int i = 0; i < 32; ++i)
-                                sum += decoded[i];
-                            inline_comp[col] = static_cast<int16_t>(sum);
-                        }
-                        else
-                        {
-                            inline_comp[col] = 0;
-                        }
-                    }
-
-                    // Write scales inline after comp
-                    uint16_t *inline_scales = reinterpret_cast<uint16_t *>(interleaved_dst + 1024 + 128);
-                    std::memcpy(inline_scales, &temp_scales[meta_idx], 64 * sizeof(uint16_t));
-
-                    // Write mins inline after scales (if asymmetric)
-                    if (out.is_asymmetric || out.usesNibbleLUTSourceScale())
-                    {
-                        uint16_t *inline_mins = reinterpret_cast<uint16_t *>(interleaved_dst + 1024 + 256);
-                        std::memcpy(inline_mins, &temp_mins[meta_idx], 64 * sizeof(uint16_t));
-                    }
-                }
-            }
-        }
-        else
-        {
-            // =================================================================
-            // INT8 PRE-DECODED PATH (Q5_0, Q5_1, Q6_K, Q3_K, Q2_K, IQ2/3/1*)
-            //
-            // Decode directly into the final eight-group VNNI layout.  The
-            // GEMV kernel loads these pre-decoded INT8 values directly.
-            // Memory: 1.0 byte/element, with no transient full INT8 matrix.
-            // =================================================================
-            packExpandedInt8Direct(
-                *unpackable,
-                out,
-                row_start,
-                N,
-                blocks_per_row,
-                N_chunks,
-                use_superblock,
-                placement);
-        }
-
         // =================================================================
         // INT8 INTERLEAVING (shared by rotation path and INT8 pre-decoded path)
         //

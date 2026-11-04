@@ -14,6 +14,7 @@
 #pragma once
 
 #include "WeightIdentity.h"
+#include "tensors/NativeWeightSource.h"
 #include "execution/moe/MoEExpertProjectionOwnership.h"
 #include "WeightLifecycleTrace.h"
 #include "kernels/FloatingActivationOperandPrecision.h"
@@ -32,6 +33,8 @@ namespace llaminar2
     class TensorBase;
     struct GraphConfig;
 
+    class CPUExpertShardSourceSelection;
+
     enum class PreparedWeightKind
     {
         None,
@@ -40,6 +43,7 @@ namespace llaminar2
         RocmInt8PackedGemm,
         PreparedEmbedding,
         MoeExpertSlab,
+        CPUResidentTensor, ///< Committed final CPU tensor owner; never a GEMM engine or raw-source cache.
     };
 
     struct PreparedWeightRef
@@ -63,9 +67,19 @@ namespace llaminar2
         bool immutable = false;
         FloatingActivationOperandPrecision floating_operand_precision =
             FloatingActivationOperandPrecision::Native; ///< Sealed before preparation; part of reuse identity.
+        std::shared_ptr<const CPUExpertShardSourceSelection> cpu_joint_source; ///< Closed original CPU joint-fragment purpose; absence preserves existing full-E GPU sources.
+        std::optional<NativeWeightSourceProjection> native_source; ///< Original native source facts retained after committed final preparation; grants no ownership.
         std::optional<MoEExpertProjectionOwnership> projection_ownership; ///< Original static source partition; no topology permission.
         std::shared_ptr<TensorBase> projection_source_owner = {}; ///< Original compact3D source root for exact native staging/coalescing.
     };
+
+    /** @brief Preserve the existing original-parent/expert matrix identity independent of staging windows.
+     * @param parent Original complete requirement binding identity.
+     * @param name Original canonical parent name.
+     * @param expert Original logical expert ID.
+     * @return Existing domain-separated matrix binding identity.
+     */
+    uint64_t staticProjectedExpertBindingId(uint64_t parent,const std::string &name,int expert);
 
     struct WeightRequirement
     {
@@ -89,8 +103,20 @@ namespace llaminar2
         WeightHostPolicy host_policy = WeightHostPolicy::RequiredUntilGraphMaterialized;
         PreparedWeightKind expected_prepared_kind = PreparedWeightKind::None;
         WeightSliceSpec slice;
+        std::optional<NativeWeightSourceAssembly> native_source_assembly; ///< Ordered original native stripes for a dense final consumer, never a compact source parent.
+        std::shared_ptr<const CPUExpertShardSourceSelection> cpu_joint_source; ///< Closed original CPU joint-fragment purpose; absence preserves existing full-E GPU sources.
         std::optional<MoEExpertProjectionOwnership> projection_ownership; ///< When present, the plan derives the sole original-axis slice.
     };
+
+    /**
+     * @brief Project original source coordinates for complete tensors and selected expert matrices.
+     * @param requirement Original plan-owned axes and selected logical IDs.
+     * @param source Original loader geometry in GGUF K/N/outer order.
+     * @return Passive exact source rectangles; this does not allocate or grant source authority.
+     * @throws std::invalid_argument For foreign bounds, unordered IDs or split native groups.
+     */
+    std::vector<NativeWeightSourceProjection> projectNativeWeightSource(
+        const WeightRequirement &requirement, const NativeWeightSourceGeometry &source);
 
     struct InferenceStrategy
     {

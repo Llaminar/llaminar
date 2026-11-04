@@ -19,6 +19,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <tuple>
 
 namespace llaminar2
 {
@@ -93,7 +94,7 @@ namespace llaminar2
     }
 
     /** @brief Whether a Qwen4 immutable scalar/operator weight must materialize as FP32. */
-    inline bool isImmutableFP32WeightRole(WeightRole role) noexcept
+    inline constexpr bool isImmutableFP32WeightRole(WeightRole role) noexcept
     {
         return role == WeightRole::HyperConnectionNorm ||
                role == WeightRole::SparseIndexerNorm ||
@@ -176,6 +177,22 @@ namespace llaminar2
         int overlay_participant_index = -1;
         int overlay_participant_world_rank = -1;
 
+        /**
+         * @brief Compare every immutable source/placement fact, not merely logical object identity.
+         * @param other Original retained Store/plan record required by a publication boundary.
+         * @return True only when model, instance, semantic source and exact participant scope agree.
+         */
+        bool sameSourceDefinition(const WeightIdentity &other) const
+        {
+            return std::tie(model_id.value,logical_id,instance_id,canonical_name,role,derivation,source_instance_id,
+                layer,expert,pp_stage,tp_domain,tp_rank_or_device_index,residency_category,overlay_domain,
+                overlay_participant_index,overlay_participant_world_rank) ==
+                std::tie(other.model_id.value,other.logical_id,other.instance_id,other.canonical_name,other.role,
+                other.derivation,other.source_instance_id,other.layer,other.expert,other.pp_stage,other.tp_domain,
+                other.tp_rank_or_device_index,other.residency_category,other.overlay_domain,
+                other.overlay_participant_index,other.overlay_participant_world_rank);
+        }
+
         bool operator==(const WeightIdentity &other) const
         {
             return model_id == other.model_id && instance_id == other.instance_id;
@@ -202,6 +219,8 @@ namespace llaminar2
          */
         std::vector<int> expert_ids;
         bool inner_is_presliced = false;
+        /** @return Exact original geometry/selection equality, including sparse expert order. */
+        bool operator==(const WeightSliceSpec &) const = default;
     };
 
     struct WeightResidency

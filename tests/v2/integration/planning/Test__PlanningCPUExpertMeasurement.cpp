@@ -210,8 +210,9 @@ TEST(PlanningExecutionMeasurementIntegration, CPU_FloatingPreparedAccounting)
  * @test Exact physical preparation retains one root through independent views.
  *
  * Every native codebook includes a padded N tail. Odd floating K additionally
- * distinguishes logical engine bytes from allocator rounding. Staging encloses
- * synchronous preparation and retires before the final execution owner.
+ * distinguishes logical engine bytes from allocator rounding. The native packer
+ * alone owns bounded setup scratch and retires it before returning the final
+ * execution owner; full/one-byte-short quotas cannot hide a second claim.
  */
 TEST(PlanningExecutionMeasurementIntegration, CPU_PreparedExpertPhysicalStorageAndRetirement)
 {
@@ -248,16 +249,14 @@ TEST(PlanningExecutionMeasurementIntegration, CPU_PreparedExpertPhysicalStorageA
         auto memory=admit(declaration.persistent_bytes);
         const auto live=[&](PhysicalMemoryOwner owner)
         {return memory->claimedBytes(device,owner,PhysicalMemoryMaterializationKind::NewAllocation);};
-        std::optional<PhysicalMemoryAllocationLease> staging;
-        if(declaration.temporary_bytes)
-            staging.emplace(memory->claimNewAllocation(device,PhysicalMemoryOwner::WeightLoadStaging,declaration.temporary_bytes));
+        // Full admitted scratch is available to its actual packer owner;
+        // no manual lease may occupy the same physical bytes outside it.
         auto engine=KernelFactory::prepareExpertGemmLocal(std::shared_ptr<const TensorBase>(tensor),device,
             KernelFactory::GemmPreparationKind::AUTO,CPUWeightStoragePlacement::accounted(
                 memory,device,PhysicalMemoryOwner::RoutedExpertWeights,CPUWeightStoragePlacement::local()));
         ASSERT_NE(engine,nullptr);
         EXPECT_EQ(engine->packedWeightBytes(),declaration.persistent_payload_bytes);
         EXPECT_EQ(live(PhysicalMemoryOwner::RoutedExpertWeights),declaration.persistent_bytes);
-        staging.reset();
         EXPECT_EQ(live(PhysicalMemoryOwner::WeightLoadStaging),0u);
         auto view=KernelFactory::createExpertServiceExecutionView(engine,device);
         ASSERT_NE(view,nullptr);
@@ -266,16 +265,13 @@ TEST(PlanningExecutionMeasurementIntegration, CPU_PreparedExpertPhysicalStorageA
         view.reset();
         EXPECT_EQ(live(PhysicalMemoryOwner::RoutedExpertWeights),0u);
         auto insufficient=admit(declaration.persistent_bytes-1);
-        std::optional<PhysicalMemoryAllocationLease> rejected_staging;
-        if(declaration.temporary_bytes)
-            rejected_staging.emplace(insufficient->claimNewAllocation(device,
-                PhysicalMemoryOwner::WeightLoadStaging,declaration.temporary_bytes));
+        // Only the persistent root is one byte short. The real packer may
+        // claim scratch first, but must retire it when final admission fails.
         EXPECT_THROW((void)KernelFactory::prepareExpertGemmLocal(std::shared_ptr<const TensorBase>(tensor),device,
             KernelFactory::GemmPreparationKind::AUTO,CPUWeightStoragePlacement::accounted(
                 insufficient,device,PhysicalMemoryOwner::RoutedExpertWeights,CPUWeightStoragePlacement::local())),std::logic_error);
         EXPECT_EQ(insufficient->claimedBytes(device,PhysicalMemoryOwner::RoutedExpertWeights,
             PhysicalMemoryMaterializationKind::NewAllocation),0u);
-        rejected_staging.reset();
         EXPECT_EQ(insufficient->claimedBytes(device,PhysicalMemoryOwner::WeightLoadStaging,
             PhysicalMemoryMaterializationKind::NewAllocation),0u);
     }

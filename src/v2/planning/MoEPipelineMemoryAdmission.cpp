@@ -134,7 +134,9 @@ namespace llaminar2
                         .graph_family = stage.family_, .prefill = policy.prefill,
                         .gpu_weight_load = policy.gpu_weight_load, .snapshot_capacity = policy.snapshot_capacity,
                         .model_graph_topology_variant_count = policy.model_graph_topology_variant_count,
-                        .pipeline_stage = child.scope()}, rows);
+                        .pipeline_stage = child.scope(), .original_expert_manifest=stage.manifest_,
+                        .weight_precision=WeightPrecision::NATIVE,
+                        .native_source_placement=loader.nativeWeightSourcePlacement()}, rows);
                     input.local_capacity.native_ordering_events=policy.native_ordering_events;
                     input.local_capacity.retained_host_services=policy.retained_host_services;
                     inputs.push_back(std::move(input.local_capacity));

@@ -1270,3 +1270,6 @@ TEST(RankMemoryPlanInputs, SharedCoordinatorCUDATP2KeepsOppositeVendorStorageAnd
     partialModel.plan.first_layer=1;
     EXPECT_THROW(buildRankMemoryPlanInputs(partialModel.request()),std::invalid_argument);
 }
+
+#include "NativeWeightLoadStagingContract.inc"
+#include "NativeWeightSourceBOMContract.inc"

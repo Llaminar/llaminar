@@ -6,6 +6,8 @@
  */
 
 #include "app/MPIShutdown.h"
+#include "app/MPIProcessSession.h"
+#include <stdexcept>
 #include "collective/BackendRouter.h"
 #include "kernels/KernelFactory.h"
 #include "backends/GPUDeviceProcessLifetime.h"
@@ -20,11 +22,14 @@ namespace llaminar2
     {
         // Guard against double-finalize
         int already_finalized = 0;
-        MPI_Finalized(&already_finalized);
+        if (MPI_Finalized(&already_finalized) != MPI_SUCCESS) throw std::runtime_error("Cannot inspect MPI finalization");
         if (already_finalized)
         {
+            MPIProcessSession::requireNoUnretiredCPUCollectivePool();
             return;
         }
+
+        MPIProcessSession::closeCPUCollectiveAdmission();
 
         // 1. Release GlobalBackendRouter — owns shared_ptr<MPIContext> → MPITopology
         //    which holds MPI communicators (intra_node_comm_, inter_node_comm_).
@@ -41,7 +46,9 @@ namespace llaminar2
         GPUDeviceProcessLifetime::retireActive();
 
         // 4. Now safe to finalize MPI
-        MPI_Finalize();
+        MPIProcessSession::requireCPUCollectiveRetirement();
+        if (MPI_Finalize() != MPI_SUCCESS) throw std::runtime_error("Original MPI_Finalize failed; CPU process pool remains retained");
+        MPIProcessSession::publishFinalizedCPUCollectivePool();
     }
 
 } // namespace llaminar2

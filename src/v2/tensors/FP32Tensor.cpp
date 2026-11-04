@@ -184,6 +184,7 @@ namespace llaminar2
 
     const float *FP32Tensor::data() const
     {
+        if (is_raw_data_released()) return nullptr;
         assertValid("FP32Tensor::data");
 
         LOG_TRACE("[FP32Tensor::data] Called for tensor, host_valid=" << ::llaminar2::isHostValid(coherence_state_) << " device_valid=" << ::llaminar2::isDeviceValid(coherence_state_) << " gpu_data_ptr_=" << (gpu_data_ptr_ ? "set" : "null") << " is_mapped_=" << is_mapped_);
@@ -213,6 +214,7 @@ namespace llaminar2
 
     float *FP32Tensor::mutable_data()
     {
+        if (is_raw_data_released()) return nullptr;
         assertValid("FP32Tensor::mutable_data");
 
         // A mutable host view cannot be granted while newer device data has no
@@ -300,6 +302,7 @@ namespace llaminar2
 
     void *FP32Tensor::raw_host_data_ptr()
     {
+        if (is_raw_data_released()) return nullptr;
         // Mapped tensors use mapped_host_ptr_ from base class
         if (is_mapped_ && mapped_host_ptr_)
         {
@@ -314,6 +317,7 @@ namespace llaminar2
 
     const void *FP32Tensor::raw_host_data_ptr() const
     {
+        if (is_raw_data_released()) return nullptr;
         // Mapped tensors use mapped_host_ptr_ from base class
         if (is_mapped_ && mapped_host_ptr_)
         {

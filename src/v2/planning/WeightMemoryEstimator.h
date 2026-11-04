@@ -7,6 +7,7 @@
  * only; PhysicalMemoryAuthority remains the sole admission and allocation ledger.
  */
 #pragma once
+#include "memory/CPUStorageRoot.h"
 #include "backends/DeviceId.h"
 #include "config/TensorParallelConfig.h"
 #include <cstddef>
@@ -214,6 +215,7 @@ namespace llaminar2
          *        the production topology has one.
          * @param components Global lookup/projection uses actually materialized
          *        by this participant; independent of source aliases and layers.
+         * @param native_source_placement Original CPU loader/participant allocation policy; metadata-only calls explicitly default local.
          * @return Native-source and prepared-device byte inventory.
          */
         static WeightEstimate estimate(
@@ -226,7 +228,8 @@ namespace llaminar2
             const DeviceWeightResidency &residency = {},
             const std::optional<DeviceShardingAssignment>
                 &tensor_parallel_assignment = std::nullopt,
-            WeightComponentScope components = WeightComponentScope::EmbeddingAndTerminal
+            WeightComponentScope components = WeightComponentScope::EmbeddingAndTerminal,
+            CPUStoragePlacement native_source_placement = CPUStoragePlacement::local()
         );
 
         /**
@@ -242,13 +245,14 @@ namespace llaminar2
          * @param residency Actual full/continuation/expert-only residency.
          * @param tensor_parallel_assignment Actual local TP assignment when present.
          * @param components Exact global component uses.
+         * @param native_source_placement Same original CPU placement used by the actual final root allocator.
          * @return Canonical byte inventory of required creators; aliases add no physical bytes.
          */
         static WeightEstimate estimatePhysical(PreparedWeightPhysicalUses &uses, PreparedWeightUseIntent intent,
             const ModelMemoryProfile &profile, DeviceId device, int shard_index, int total_shards,
             int first_layer, int last_layer, const DeviceWeightResidency &residency,
             const std::optional<DeviceShardingAssignment> &tensor_parallel_assignment,
-            WeightComponentScope components);
+            WeightComponentScope components, CPUStoragePlacement native_source_placement = CPUStoragePlacement::local());
 
         /// Bytes per weight element for native (GGUF on-disk) format.
         static float getNativeBytesPerWeight(const std::string &quant_type);
@@ -268,7 +272,8 @@ namespace llaminar2
             int shard_index, int total_shards, int first_layer, int last_layer,
             const DeviceWeightResidency &residency,
             const std::optional<DeviceShardingAssignment> &tensor_parallel_assignment,
-            WeightComponentScope components, PreparedWeightPhysicalUses *uses, PreparedWeightUseIntent intent);
+            WeightComponentScope components, PreparedWeightPhysicalUses *uses, PreparedWeightUseIntent intent,
+            CPUStoragePlacement native_source_placement);
 
     };
 

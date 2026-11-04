@@ -95,6 +95,9 @@ extern "C" bool cudaMoEOverlayActivationPackDispatch(
         llaminar2::moe_activation_packet_device::packDispatchHiddenKernel
             <<<blocksFor(hidden_elements), kThreads, 0u, cuda_stream>>>(*launch);
     }
+    if (launch->shared_row_writer)
+        llaminar2::moe_activation_packet_device::packSharedDispatchUnionKernel
+            <<<launch->physical_rows,kThreads,0u,cuda_stream>>>(*launch);
     return launchAccepted();
 }
 

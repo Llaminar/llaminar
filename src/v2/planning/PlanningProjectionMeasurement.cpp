@@ -177,12 +177,15 @@ namespace llaminar2
             const std::string &identity, size_t &graph_growth)
         {
             const auto &shape = plan;
-            auto host_claim = memory->claimNewAllocation(DeviceId::cpu(),
-                PhysicalMemoryOwner::ExecutionWorkspace, tensorBytes(plan, rows));
+            const auto allocate = [&](size_t count) {
+                return CPUStorageRoot<float>(count, PhysicalMemoryOwner::ExecutionWorkspace, DeviceId::cpu(),
+                    CPUStoragePlacement::local(), CPUStorageInitialization::Uninitialized).allocate(memory);
+            };
             std::optional<PhysicalMemoryAllocationLease> gpu_claim;
             if (device.is_gpu()) gpu_claim.emplace(memory->claimNewAllocation(device,
                 PhysicalMemoryOwner::ExecutionWorkspace, tensorBytes(plan, rows)));
-            FP32Tensor input({size_t(rows), shape.k}), output({size_t(rows), shape.n});
+            FP32Tensor input({size_t(rows), shape.k}, allocate(size_t(rows) * shape.k), DeviceId::cpu());
+            FP32Tensor output({size_t(rows), shape.n}, allocate(size_t(rows) * shape.n), DeviceId::cpu());
             for (size_t row = 0; row < size_t(rows); ++row)
                 for (size_t col = 0; col < shape.k; ++col)
                     input.mutable_typed_data()[row * shape.k + col] =
@@ -225,7 +228,7 @@ namespace llaminar2
         }
         /** @brief Contribute one prepared engine's demand; source ownership is supplied by its caller. */
         void contributePreparedMemory(const ProjectionGeometry &plan,
-            size_t reader_bytes, PhysicalMemoryResource host, PhysicalMemoryResource execution,
+            PhysicalMemoryResource host, PhysicalMemoryResource execution,
             PhysicalMemoryPlanBuilder &builder, int prefill_rows,
             const std::optional<PlanningProjectionCPUObservation> &cpu)
         {
@@ -235,20 +238,23 @@ namespace llaminar2
                 throw std::invalid_argument("Projection sample requires same-rank staging");
             auto workspace = workspaceRequirements(plan, execution.device, 1, cpu);
             workspace.merge(workspaceRequirements(plan, execution.device, prefill_rows, cpu));
-            builder.add(host, PhysicalMemoryOwner::ExecutionWorkspace, tensors);
+            builder.add(host, PhysicalMemoryOwner::ExecutionWorkspace,
+                CPUStoragePlacement::local().physicalBytes<float>(size_t(prefill_rows) * plan.k));
+            builder.add(host, PhysicalMemoryOwner::ExecutionWorkspace,
+                CPUStoragePlacement::local().physicalBytes<float>(size_t(prefill_rows) * plan.n));
             builder.add(execution, PhysicalMemoryOwner::ExecutionWorkspace, workspace.total_bytes_with_alignment());
             if (execution.device.is_cpu())
             {
                 const auto packing = cpuPreparation(plan);
                 builder.add(execution, kWeightOwner, packing.persistent_bytes);
-                builder.add(host, PhysicalMemoryOwner::WeightLoadStaging, std::max(reader_bytes, packing.temporary_bytes));
+                builder.add(host, PhysicalMemoryOwner::WeightLoadStaging, packing.temporary_bytes);
                 return;
             }
             LoadOrchestrator pool;
             planGPUWeight(pool, plan, execution.device);
             const auto staging = resolveGPUWeightLoadMemoryGeometry(plan.payload_bytes, {.staging_stream_count = 3});
             builder.add(execution, kWeightOwner, pool.plannedPersistentBytes(execution.device.gpu_ordinal(), kWeightOwner));
-            builder.add(host, PhysicalMemoryOwner::WeightLoadStaging, std::max(reader_bytes, staging.host_staging_bytes));
+            builder.add(host, PhysicalMemoryOwner::WeightLoadStaging, staging.host_staging_bytes);
             builder.add(execution, PhysicalMemoryOwner::WeightLoadStaging, staging.staging_bytes);
             builder.add(execution, PhysicalMemoryOwner::ExecutionWorkspace, tensors);
             builder.add(execution, PhysicalMemoryOwner::NativeGraphExecutable,
@@ -294,11 +300,9 @@ namespace llaminar2
             {
                 const auto packing = cpuPreparation(plan);
                 prepared_bytes = packing.persistent_bytes;
-                std::optional<PhysicalMemoryAllocationLease> staging;
-                if (packing.temporary_bytes) staging.emplace(memory->claimNewAllocation(device,
-                    PhysicalMemoryOwner::WeightLoadStaging, packing.temporary_bytes));
-                // Setup vectors retire inside this synchronous call. The
-                // retained pack claims its own exact final root before allocation.
+                // The source-native packer alone claims its actual scratch
+                // root and retires it synchronously. Floating kernels borrow
+                // source storage and have no transient packing allocation.
                 cpu_handle = KernelFactory::prepareGemmHandleLocal(&execution,device,
                     KernelFactory::GemmPreparationKind::AUTO,plan.operand_precision,
                     CPUWeightStoragePlacement::accounted(memory,device,kWeightOwner,CPUWeightStoragePlacement::local()));
@@ -361,10 +365,10 @@ namespace llaminar2
         if (origin != PlanningSampleOrigin::LocalGGUF && origin != PlanningSampleOrigin::PublishedPayload)
             throw std::invalid_argument("Projection sample requires a known source origin");
         const auto geometry = ProjectionGeometry::model(plan);
-        contributePreparedMemory(geometry, origin == PlanningSampleOrigin::LocalGGUF ? plan.geometry().source_bytes : 0,
-            host, execution, builder, prefill_rows, cpu);
-        builder.add(host, PhysicalMemoryOwner::ModelSourcePayload, plan.geometry().source_bytes);
-        if (plan.executionType() != plan.tensorType()) builder.add(host, kWeightOwner, geometry.payload_bytes);
+        contributePreparedMemory(geometry, host, execution, builder, prefill_rows, cpu);
+        builder.add(host, PhysicalMemoryOwner::ModelSourcePayload, plan.geometry().physicalBytes());
+        if (plan.executionType() != plan.tensorType())
+            builder.add(host, kWeightOwner, CPUStoragePlacement::local().physicalBytes<uint8_t>(geometry.payload_bytes));
     }
 
     PlanningProjectionObservations PlanningProjectionMeasurement::measure(const PlanningLoadedMatrixSample &sample,
@@ -376,17 +380,18 @@ namespace llaminar2
         // The model loader alone decides runtime promotion. Retain the native
         // source independently and retire the converted owner after all engine
         // borrowers return; neither conversion nor capture is timed arithmetic.
-        std::optional<PhysicalMemoryAllocationLease> converted_claim;
         std::shared_ptr<TensorBase> converted;
         const TensorBase *execution = &sample.tensor();
         if (plan.executionType() != plan.tensorType())
         {
-            converted_claim.emplace(memory->claimNewAllocation(DeviceId::cpu(), kWeightOwner, geometry.payload_bytes));
+            const auto placement = CPUWeightStoragePlacement::accounted(memory,
+                sample.tensor().home_device(), kWeightOwner, CPUWeightStoragePlacement::local());
             if (plan.executionType() == TensorType::FP16)
-                converted = materializePreparedHalfWeights(sample.tensor());
+                converted = materializePreparedHalfWeights(sample.tensor(), placement);
             else
             {
-                auto fp32 = std::make_shared<FP32Tensor>(sample.tensor().shape(), DeviceId::cpu());
+                auto fp32 = std::make_shared<FP32Tensor>(sample.tensor().shape(),
+                    placement.allocate<float>(sample.tensor().numel()), placement.allocatorDevice());
                 sample.tensor().to_fp32(fp32->mutable_typed_data());
                 converted = std::move(fp32);
             }
@@ -403,7 +408,7 @@ namespace llaminar2
         const std::optional<PlanningProjectionCPUObservation> &cpu)
     {
         const auto geometry = ProjectionGeometry::arithmetic();
-        contributePreparedMemory(geometry, 0, host, execution, builder, PlanningFP32ArithmeticPlan::kPrefillRows, cpu);
+        contributePreparedMemory(geometry, host, execution, builder, PlanningFP32ArithmeticPlan::kPrefillRows, cpu);
         // Synthetic operands are setup workspace, never fictitious model bytes.
         builder.add(host, PhysicalMemoryOwner::ExecutionWorkspace, geometry.payload_bytes);
     }

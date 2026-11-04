@@ -163,6 +163,7 @@ protected:
             params, PhysicalMemoryOwner::PrimaryModelWeights);
         if (!MoEExpertComputeStage::prepareExpertGemmEngines(params))
             return false;
+        ExpertGemmRegistry registry;publishCPUExpertStageRegistryForTest(params,registry);
 
         MoEExpertComputeStage stage(params);
         CPUActualRoutedStageTestWorkspace workspace(stage,params,&setup_router_,cpu_ctx_.get());

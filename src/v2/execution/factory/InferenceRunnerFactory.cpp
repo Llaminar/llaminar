@@ -16,8 +16,11 @@
  * Expert source loading and preparation share exact logical endpoint scopes;
  * CPU storage identity alone never selects a sibling NUMA participant.
  * CPU serial storage declarations survive admission and runtime projection.
+ * CPU setup materializes only after the frozen plan binds its original source
+ * and physical authority; no eager CPU payload cache precedes bounded loading.
  */
 
+#include "execution/moe/MoEGraphOwnerProjection.h"
 #include "InferenceRunnerFactory.h"
 #include "DenseDecodeWeightSelection.h"
 #include "planning/TensorParallelSourceDeclaration.h"
@@ -153,6 +156,15 @@ namespace llaminar2
         const InferenceRunnerConfig &config,
         const std::string &architecture);
 
+    /**
+     * @brief Populate graph-local bindings through their original admitted source contract.
+     * @param orchestrator Participant receiving the frozen prepared weight owners.
+     * @param model_ctx Original source directory, loader and weight manager.
+     * @param device Actual final consumer, never a proxy CPU preparation device.
+     * @param config Validated admission and optional PP placement.
+     * @param graph_config Exact graph-owned TP assignment and execution policies.
+     * @return True after all required bindings and prepared owners are installed.
+     */
     static bool configureOrchestratorWeightsImpl(
         DeviceGraphOrchestrator *orchestrator,
         std::shared_ptr<ModelContext> model_ctx,
@@ -488,49 +500,6 @@ namespace llaminar2
                                        return domain.name == name;
                                    });
             return it == plan.domains.end() ? nullptr : &*it;
-        }
-
-        std::optional<RoutedExpertComputePolicy> routedOverlayComputePolicy(
-            const MoERoutedExpertPlacementPlan &plan,
-            std::string *error)
-        {
-            RoutedExpertComputePolicy policy =
-                RoutedExpertComputePolicy::Apportioned;
-            bool saw_policy = false;
-
-            for (const auto &tier : plan.routed_tiers)
-            {
-                const auto *domain = findMoEExpertDomain(plan, tier.domain);
-                if (!domain)
-                    continue;
-
-                if (!saw_policy)
-                {
-                    policy = domain->routed_compute_policy;
-                    saw_policy = true;
-                    continue;
-                }
-
-                if (domain->routed_compute_policy != policy)
-                {
-                    if (error)
-                    {
-                        *error =
-                            "mixed routed expert compute policies are not supported in one graph-native overlay: " +
-                            std::string(
-                                routedExpertComputePolicyToString(policy)) +
-                            " and " +
-                            routedExpertComputePolicyToString(
-                                domain->routed_compute_policy);
-                    }
-                    return std::nullopt;
-                }
-            }
-
-            return saw_policy
-                       ? std::optional<RoutedExpertComputePolicy>(policy)
-                       : std::optional<RoutedExpertComputePolicy>(
-                             RoutedExpertComputePolicy::Apportioned);
         }
 
         /**
@@ -933,6 +902,7 @@ namespace llaminar2
                     config.moe_expert_overlay_residency_authority;
                 graph_config.moe.expert_overlay_participant_residency =
                     config.moe_expert_overlay_participant_residency;
+                graph_config.moe.expert_overlay_cpu_joint_context=config.moe_expert_overlay_cpu_joint_context;
                 graph_config.moe.decode_histogram =
                     config.moe_expert_overlay_decode_histogram.get();
                 graph_config.moe.durable_residency_authority =
@@ -2299,7 +2269,10 @@ namespace llaminar2
 
         if (!scope.participants().empty())
         {
-            const auto preparation = MoEExpertOverlayPreparationPlan::build(*runtime, model_ctx.concreteLoader())
+            const auto original_preparation=graph_config.moe.expert_overlay_participant_residency
+                ?graph_config.moe.expert_overlay_participant_residency->projectionPreparation():nullptr;
+            const auto preparation = MoEExpertOverlayPreparationPlan::forOriginalSource(
+                *runtime, model_ctx.concreteLoader(), original_preparation)
                 .filteredForRank(execution->currentRankPlan()).filteredForGraphScope(*runtime, scope);
             const auto sources = preparation.sourceWeightPlan(
                 model_ctx.concreteLoader(), base_plan.strategy().model_id);
@@ -3667,7 +3640,7 @@ namespace llaminar2
         }
 
         // =====================================================================
-        // Eager load ALL layer weights into cache BEFORE preloading
+        // Validate original source declarations before allocating final weights
         // =====================================================================
         // Use schema factory to determine which weights are required vs optional.
         // This ensures consistent handling: required weights fail if missing,
@@ -3681,9 +3654,6 @@ namespace llaminar2
         const int n_layers = graph_config.n_layers > 0
                                  ? graph_config.n_layers
                                  : model_ctx->blockCount();
-        LOG_DEBUG("[InferenceRunner] Eagerly loading " << n_layers << " layers of weights...");
-        WeightLoadingProfiler::begin(WeightLoadPhase::TENSOR_LOAD);
-        ScopedWeightLoadDetailTimer eager_layer_timer("weights.eager_layer_cache_load");
 
         // Validate all layer weights against schema before loading.
         // Missing required weights are fatal; missing optional weights are skipped.
@@ -3697,7 +3667,6 @@ namespace llaminar2
         if (!validation.success)
         {
             LOG_ERROR("[InferenceRunner] " << validation.error_message());
-            WeightLoadingProfiler::end(WeightLoadPhase::TENSOR_LOAD);
             return false;
         }
         if (!validation.missing_optional.empty())
@@ -3713,231 +3682,84 @@ namespace llaminar2
                 validation,
                 "[InferenceRunner]"))
         {
-            WeightLoadingProfiler::end(WeightLoadPhase::TENSOR_LOAD);
             return false;
         }
 
-        // Use validated weight list (only weights that exist in the model)
-        auto &weights_to_load = validation.weights_to_load;
-        const auto &gguf_model = model_ctx->model();
-
-        // One scoped list drives both eager materialization and progress.
-        // A terminal MTP sidecar needs the embedding table even when the main
-        // pipeline embedding stage lives elsewhere. Tied output heads use the
-        // same table; middle stages own none of these global weights.
-        std::vector<const char *> global_weights;
-        if (!pp_scope || pp_scope->has_embedding ||
-            (pp_scope->has_lm_head &&
-             (retainsMTPGraphCapacity(config.mtp) || !model_ctx->hasTensor("output.weight"))))
-            global_weights.push_back("token_embd.weight");
-        if (!pp_scope || pp_scope->has_lm_head)
+        // CPU consumers read original windows directly into their admitted final
+        // owners below. Eager CPU getters would allocate a second whole source
+        // before the plan has installed its original model/PMA authority.
+        if (device.is_gpu())
         {
-            const auto terminal_weights = schema_factory->terminalInputWeightNames();
-            global_weights.insert(global_weights.end(), terminal_weights.begin(), terminal_weights.end());
-            global_weights.push_back("output.weight");
-        }
-
-        const auto load_graph_participant_weight =
-            [&graph_config, &weight_mgr](const std::string &weight_name)
-            -> std::shared_ptr<TensorBase>
-        {
-            if (!graph_config.tp_config)
-                return weight_mgr->getWeightForDevice(weight_name);
-
-            /*
-             * DeviceId names process-local hardware, not a distributed TP
-             * participant.  In global TP every rank can legitimately call its
-             * local processor cpu:0, so resolving by DeviceId would always pick
-             * the first duplicate assignment.  The graph-owned rank is the
-             * only unambiguous cache identity during eager materialization.
-             */
-            return weight_mgr->getShardedWeightForAssignment(
-                weight_name,
-                DeviceId::cpu(),
-                graph_config.tp_config->forRank(graph_config.local_rank),
-                inferWeightLayer(weight_name));
-        };
-
-        // =====================================================================
-        // Host RAM preflight check: ensure enough memory before loading
-        // =====================================================================
-        if (!hostRamPreflight(
-                gguf_model,
-                weights_to_load,
-                global_weights,
-                device,
-                model_ctx->usesMmap(),
-                graph_config.local_rank))
-        {
-            WeightLoadingProfiler::end(WeightLoadPhase::TENSOR_LOAD);
-            return false;
-        }
-
-        // =====================================================================
-        // CPU progress tracking: track the eager GGUF read phase (Phase 1).
-        // On CPU, this is the real bottleneck (disk I/O + tensor decode).
-        // On GPU, Phase 2 (H2D pipeline) is tracked separately and is the
-        // real bottleneck, so we skip Phase 1 progress for GPU devices.
-        // =====================================================================
-        int eager_progress_idx = -1;
-        std::atomic<size_t> eager_bytes_loaded{0};
-
-        if (device.is_cpu() && weight_mgr->weightLoadProgress())
-        {
-            // Compute total bytes from GGUF metadata (no disk I/O)
-            size_t total_eager_bytes = 0;
-            for (const auto &[name, is_optional] : weights_to_load)
+            ScopedWeightLoadTimer load_timer(WeightLoadPhase::TENSOR_LOAD);
+            ScopedWeightLoadDetailTimer source_timer("weights.gpu_source_preparation");
+            const auto &weights_to_load = validation.weights_to_load;
+            std::vector<const char *> global_weights;
+            if (!pp_scope || pp_scope->has_embedding ||
+                (pp_scope->has_lm_head &&
+                 (retainsMTPGraphCapacity(config.mtp) || !model_ctx->hasTensor("output.weight"))))
+                global_weights.push_back("token_embd.weight");
+            if (!pp_scope || pp_scope->has_lm_head)
             {
-                if (auto *info = gguf_model.findTensor(name))
-                    total_eager_bytes += info->size_bytes;
+                const auto terminal_weights = schema_factory->terminalInputWeightNames();
+                global_weights.insert(global_weights.end(), terminal_weights.begin(), terminal_weights.end());
+                global_weights.push_back("output.weight");
             }
-            // Include global weights
-            for (const char *global_name : global_weights)
+            if (!hostRamPreflight(model_ctx->model(), weights_to_load, global_weights,
+                    device, model_ctx->usesMmap(), graph_config.local_rank))
+                return false;
+
+            const auto load_graph_participant_weight = [&](const std::string &name)
             {
-                if (auto *info = gguf_model.findTensor(global_name))
-                    total_eager_bytes += info->size_bytes;
-            }
-
-            if (total_eager_bytes > 0)
+                // Preserve the actual GPU preparation-source path. A CPU lookup
+                // now means a final CPU consumer, not a generic host mirror.
+                // Explicit rank distinguishes participants sharing a local device ID.
+                return graph_config.tp_config
+                    ? weight_mgr->getShardedWeightForAssignment(name, device,
+                          graph_config.tp_config->forRank(graph_config.local_rank), inferWeightLayer(name))
+                    : weight_mgr->getWeightForDevice(name, device, inferWeightLayer(name));
+            };
+            const unsigned workers = std::min<unsigned>(
+                std::min<unsigned>(8u, std::max(1u, std::thread::hardware_concurrency())),
+                std::max<unsigned>(1u, static_cast<unsigned>(weights_to_load.size())));
+            std::atomic<size_t> next_index{0};
+            std::atomic<bool> failed{false};
+            std::string first_error;
+            std::mutex error_mutex;
+            const auto load_worker = [&]()
             {
-                eager_progress_idx = weight_mgr->weightLoadProgress()->registerDevice(
-                    weight_mgr->weightLoadProgress()->makeDeviceLabel(device.to_string()),
-                    total_eager_bytes);
-            }
-        }
-
-        const unsigned hw_threads = std::max(1u, std::thread::hardware_concurrency());
-        const unsigned target_workers = std::min<unsigned>(8u, hw_threads);
-        const unsigned worker_count = std::min<unsigned>(
-            target_workers,
-            std::max<unsigned>(1u, static_cast<unsigned>(weights_to_load.size())));
-
-        std::atomic<size_t> next_index{0};
-        std::atomic<bool> failed{false};
-        std::string first_error;
-        std::mutex error_mutex;
-
-        auto load_worker = [&]()
-        {
-            while (true)
-            {
-                if (failed.load(std::memory_order_relaxed))
+                while (!failed.load(std::memory_order_relaxed))
                 {
-                    return;
-                }
-
-                const size_t idx = next_index.fetch_add(1, std::memory_order_relaxed);
-                if (idx >= weights_to_load.size())
-                {
-                    return;
-                }
-
-                const auto &[weight_name, is_optional] = weights_to_load[idx];
-                auto weight = load_graph_participant_weight(weight_name);
-
-                if (!weight)
-                {
-                    if (is_optional)
-                    {
-                        // Optional weight missing - this is fine (e.g., model without QKV biases)
-                        LOG_TRACE("[InferenceRunner] Optional weight not present: " << weight_name);
-                    }
-                    else
+                    const size_t index = next_index.fetch_add(1, std::memory_order_relaxed);
+                    if (index >= weights_to_load.size()) return;
+                    const auto &[name, optional] = weights_to_load[index];
+                    if (!load_graph_participant_weight(name) && !optional)
                     {
                         std::lock_guard<std::mutex> lock(error_mutex);
-                        if (!failed.exchange(true, std::memory_order_relaxed))
-                        {
-                            first_error = weight_name;
-                        }
+                        if (!failed.exchange(true, std::memory_order_relaxed)) first_error = name;
                         return;
                     }
                 }
-
-                // Update CPU eager-load progress bar
-                if (eager_progress_idx >= 0)
-                {
-                    if (auto *info = gguf_model.findTensor(weight_name))
-                    {
-                        size_t loaded = eager_bytes_loaded.fetch_add(info->size_bytes, std::memory_order_relaxed) + info->size_bytes;
-                        weight_mgr->weightLoadProgress()->update(eager_progress_idx, loaded);
-                    }
-                }
-            }
-        };
-
-        if (worker_count == 1)
-        {
-            load_worker();
-        }
-        else
-        {
-            LOG_DEBUG("[InferenceRunner] Parallel eager load workers=" << worker_count
-                                                                       << " weights=" << weights_to_load.size());
-            std::vector<std::future<void>> load_tasks;
-            load_tasks.reserve(worker_count);
-            for (unsigned i = 0; i < worker_count; ++i)
+            };
+            if (workers == 1) load_worker();
+            else
             {
-                load_tasks.emplace_back(std::async(std::launch::async, load_worker));
+                std::vector<std::future<void>> tasks;
+                tasks.reserve(workers);
+                for (unsigned index = 0; index < workers; ++index)
+                    tasks.emplace_back(std::async(std::launch::async, load_worker));
+                for (auto &task : tasks) task.get();
             }
-            for (auto &task : load_tasks)
+            if (failed.load(std::memory_order_relaxed))
             {
-                task.get();
+                LOG_ERROR("[InferenceRunner] Failed to load required weight: " << first_error);
+                return false;
             }
-        }
-
-        if (failed.load(std::memory_order_relaxed))
-        {
-            LOG_ERROR("[InferenceRunner] Failed to load required weight: " << first_error);
-            WeightLoadingProfiler::end(WeightLoadPhase::TENSOR_LOAD);
-            return false;
-        }
-
-        LOG_DEBUG("[InferenceRunner] All layer weights loaded into cache");
-        WeightLoadingProfiler::end(WeightLoadPhase::TENSOR_LOAD);
-
-        // =====================================================================
-        // Load global weights BEFORE finalization so they are available for
-        // the GPU pipeline (GEMM packing, non-GEMM upload, embedding prep).
-        // validateLayerWeights only loads blk.N.* per-layer weights; global
-        // weights (output.weight, token_embd.weight, output_norm.weight)
-        // must be loaded separately.
-        //
-        // For tied-embeddings models (Qwen3, Qwen3.5): output.weight is
-        // absent and token_embd.weight is reused as the LM head. The GPU
-        // GEMM pipeline (packGemmWeightsViaPipeline) has tied-embeddings
-        // logic that includes token_embd.weight in the GEMM pipeline when
-        // output.weight is missing — but it can only find the tensor if
-        // it's already in cache_. Loading it here ensures that.
-        //
-        // output_norm.weight is also loaded so uploadNonGemmWeights() can
-        // upload it to GPU during finalization rather than needing a lazy
-        // ensureOnDevice() call later.
-        // =====================================================================
-        {
-            // Load global weights into cache_ using the DEFAULT device (CPU)
-            // so they sit alongside per-layer weights. Do NOT pass `device`
-            // here — passing CUDA:0 would put them in per_device_cache_,
-            // which makes packGemmWeightsViaPipeline() think per_device_cache_
-            // is the primary source and skip all per-layer weights from cache_.
             for (const char *name : global_weights)
-                if (model_ctx->hasTensor(name))
-                    load_graph_participant_weight(name);
-
-            LOG_DEBUG("[InferenceRunner] Global weights loaded into cache");
-
-            // Update progress with global weights and finish
-            if (eager_progress_idx >= 0)
-            {
-                for (const char *global_name : global_weights)
+                if (model_ctx->hasTensor(name) && !load_graph_participant_weight(name))
                 {
-                    if (auto *info = gguf_model.findTensor(global_name))
-                    {
-                        size_t loaded = eager_bytes_loaded.fetch_add(info->size_bytes, std::memory_order_relaxed) + info->size_bytes;
-                        weight_mgr->weightLoadProgress()->update(eager_progress_idx, loaded);
-                    }
+                    LOG_ERROR("[InferenceRunner] Failed to load global weight: " << name);
+                    return false;
                 }
-                weight_mgr->weightLoadProgress()->finish(eager_progress_idx);
-            }
         }
 
         configureWeightManagerForGraph(
@@ -3982,7 +3804,12 @@ namespace llaminar2
         // =====================================================================
         const auto &env = debugEnv();
 
-        FrozenModelWeightSet frozen_weights = weight_mgr->materialize(weight_plan);
+        FrozenModelWeightSet frozen_weights = [&]()
+        {
+            ScopedWeightLoadTimer load_timer(WeightLoadPhase::TENSOR_LOAD);
+            ScopedWeightLoadDetailTimer materialize_timer("weights.binding_materialization");
+            return weight_mgr->materialize(weight_plan);
+        }();
         auto weight_bindings = makeModelWeightBindings(frozen_weights, device);
         auto legacy_weights = toLegacyModelWeights(weight_bindings);
 
@@ -4028,7 +3855,9 @@ namespace llaminar2
                     graphOverlayPreparationScope(*overlay_runtime_plan_for_weight_prep, graph_config, device),
                     &frozen_weights,
                     overlay_execution_plan_for_weight_prep,
-                    config.prepared_weight_admission))
+                    config.prepared_weight_admission,
+                    graph_config.moe.expert_overlay_participant_residency
+                        ?graph_config.moe.expert_overlay_participant_residency->projectionPreparation():nullptr))
             {
                 LOG_ERROR(
                     "[InferenceRunner] Failed to prepare MoE expert "
@@ -4587,7 +4416,9 @@ namespace llaminar2
                     graphOverlayPreparationScope(*overlay_runtime, graph_config, device),
                     &frozen_weights,
                     graph_config.moe.expert_overlay_execution_plan.get(),
-                    config.prepared_weight_admission))
+                    config.prepared_weight_admission,
+                    graph_config.moe.expert_overlay_participant_residency
+                        ?graph_config.moe.expert_overlay_participant_residency->projectionPreparation():nullptr))
             {
                 LOG_ERROR("[InferenceRunner] PP stage expert overlay preparation failed for device "
                           << device.to_string() << " layers [" << pp_cfg.first_layer << ", " << pp_cfg.last_layer << ")");
@@ -4804,7 +4635,9 @@ namespace llaminar2
                                 graphOverlayPreparationScope(*graph_config.moe.expert_overlay_runtime_plan, graph_config, device),
                                 &frozen_weights,
                                 execution_plan,
-                                config.prepared_weight_admission))
+                                config.prepared_weight_admission,
+                                graph_config.moe.expert_overlay_participant_residency
+                                    ? graph_config.moe.expert_overlay_participant_residency->projectionPreparation() : nullptr))
                         {
                             LOG_ERROR("[InferenceRunner] LocalTP failed to prepare MoE expert overlay weights for device "
                                       << device.to_string());
@@ -4966,7 +4799,9 @@ namespace llaminar2
                                 graphOverlayPreparationScope(*graph_config.moe.expert_overlay_runtime_plan, graph_config, device),
                                 orchestrator->frozenWeightSet(),
                                 execution_plan,
-                                config.prepared_weight_admission))
+                                config.prepared_weight_admission,
+                                graph_config.moe.expert_overlay_participant_residency
+                                    ? graph_config.moe.expert_overlay_participant_residency->projectionPreparation() : nullptr))
                         {
                             LOG_ERROR("[InferenceRunner] Full-weight path failed to prepare MoE expert overlay weights for device "
                                       << device.to_string());

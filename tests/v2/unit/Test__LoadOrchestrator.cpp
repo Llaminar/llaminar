@@ -10,6 +10,8 @@
  *
  * The tests cover planning, VRAM preflight accounting, and the finalize() contract
  * that releases temporary staging resources while preserving persistent pool state.
+ * Bounded converted sources exercise the real pinned-lane producer, exact live
+ * transfer extents, failure propagation and owner retirement without a GPU.
  */
 
 #include <algorithm>
@@ -18,6 +20,9 @@
 #include <cstdlib>
 #include <initializer_list>
 #include <memory>
+#include <mutex>
+#include <set>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -59,6 +64,38 @@ namespace llaminar2
                 std::free(ptr);
             }
 
+            /** @brief Execute the raw passthrough transaction on explicit mock streams. */
+            bool deviceCopyAsync(void *dst, const void *src, size_t bytes,
+                                 int device, void *stream) override
+            {
+                if (!stream) throw std::invalid_argument("Raw weight copy requires its exact stream");
+                pending_streams_.insert(stream);
+                return deviceToDevice(dst, src, bytes, device);
+            }
+
+            /** @brief Track an accepted upload whose owner must drain before retirement. */
+            bool hostToDeviceOnStream(void *dst, const void *src, size_t bytes,
+                                      int device, void *stream) override
+            {
+                if (!stream) throw std::invalid_argument("Upload requires its exact stream");
+                pending_streams_.insert(stream);
+                return hostToDevice(dst, src, bytes, device, stream);
+            }
+            /** @brief Retire the exact stream's simulated asynchronous users. */
+            bool synchronizeStream(void *stream, int device) override
+            {
+                pending_streams_.erase(stream);
+                return test::MockBackend::synchronizeStream(stream, device);
+            }
+            /** @brief Observe ordering without silently draining at destruction. */
+            void destroyEvent(void *event, int device) override
+            {
+                if (!pending_streams_.empty()) ++early_retirements_;
+                test::MockBackend::destroyEvent(event, device);
+            }
+            /** @return Native event retirement before an accepted stream finished. */
+            size_t earlyRetirements() const noexcept { return early_retirements_; }
+
             size_t deviceMemoryTotal(int device_id) const override
             {
                 (void)device_id;
@@ -86,6 +123,38 @@ namespace llaminar2
             int allocate_calls_ = 0;
             size_t last_allocate_bytes_ = 0;
             int failing_device_id_ = -1;
+            std::set<void *> pending_streams_;
+            size_t early_retirements_ = 0;
+        };
+
+        /** @brief Test observation independent of the source object's lifetime. */
+        struct SourceReads
+        {
+            std::mutex mutex;
+            std::vector<std::pair<size_t, size_t>> ranges;
+        };
+
+        /** @brief Procedural source with no retained full output matrix. */
+        class PatternWeightSource final : public WeightJobSource
+        {
+        public:
+            /** @brief Declare the exact extent and optional first-range failure. */
+            PatternWeightSource(size_t bytes, std::shared_ptr<SourceReads> reads,
+                                size_t fail_offset = std::numeric_limits<size_t>::max())
+                : WeightJobSource(bytes), reads_(std::move(reads)), fail_offset_(fail_offset) {}
+        private:
+            /** @brief Write only this checked live range, preserving poisoned slot tails. */
+            void readRange(size_t offset, std::span<std::byte> destination) const override
+            {
+                if (offset == fail_offset_)
+                    throw std::runtime_error("deliberate native conversion failure");
+                for (size_t i = 0; i < destination.size(); ++i)
+                    destination[i] = std::byte((offset + i) % 251u);
+                std::lock_guard<std::mutex> lock(reads_->mutex);
+                reads_->ranges.emplace_back(offset, destination.size());
+            }
+            std::shared_ptr<SourceReads> reads_;
+            size_t fail_offset_;
         };
 
         /**
@@ -256,6 +325,158 @@ namespace llaminar2
         EXPECT_EQ(orch.totalPendingBytes(0), raw_bytes);
         ASSERT_NE(orch.getPool(0), nullptr);
         EXPECT_EQ(orch.getPool(0)->maxStagingSlotBytes(), 2 * bytes_per_row);
+    }
+
+    /** @test Conversion writes the existing ring, uploads live rows and retires its sole source owner. */
+    TEST(Test__LoadOrchestrator, BoundedSourceChunksExecuteAndRetireWithoutFullHostOutput)
+    {
+        constexpr int rows = 9, columns = 64;
+        constexpr size_t row_bytes = columns * sizeof(uint16_t);
+        constexpr size_t output_bytes = rows * row_bytes;
+        constexpr size_t prefix_bytes = 2 * row_bytes;
+        constexpr size_t slot_bytes = 2 * row_bytes;
+        BudgetMockBackend backend(16 * kMiB, 16 * kMiB);
+        LoadOrchestrator orch(&backend, kTestOnlyUnadmittedGPUAllocation);
+        orch.addDevice(0);
+        orch.planRawWeight(0, "converted", rows, columns, output_bytes);
+        orch.allocate(slot_bytes, 2);
+        const int allocations = backend.allocateCalls();
+        auto reads = std::make_shared<SourceReads>();
+        auto source = std::make_shared<PatternWeightSource>(prefix_bytes + output_bytes, reads);
+        std::weak_ptr<const WeightJobSource> owner = source;
+        WeightJob job{};
+        job.name = "converted";
+        job.raw_bytes = output_bytes;
+        job.format = RepackFormat::RAW_FP;
+        job.N = rows;
+        job.K = columns;
+        job.bounded_source = source;
+        job.source_offset_bytes = prefix_bytes;
+        orch.addWeightJob(0, job);
+        ASSERT_EQ(orch.pendingJobCount(0), 5u);
+        ASSERT_EQ(orch.totalPendingBytes(0), output_bytes);
+        source.reset();
+        job.bounded_source.reset();
+        ASSERT_FALSE(owner.expired());
+        ASSERT_NO_THROW(orch.load());
+        EXPECT_TRUE(owner.expired());
+        EXPECT_EQ(orch.pendingJobCount(0), 0u);
+        EXPECT_EQ(backend.allocateCalls(), allocations);
+        EXPECT_EQ(backend.getTransferStats().h2d_bytes, output_bytes);
+        EXPECT_EQ(backend.getH2DCount(), 5u);
+        EXPECT_EQ(backend.getD2HCount(), 0u);
+        EXPECT_EQ(backend.getSyncCount(), 0u);
+        const auto slot = orch.getPool(0)->getSlot("converted");
+        ASSERT_TRUE(slot.has_value());
+        for (size_t i = 0; i < output_bytes; ++i)
+            ASSERT_EQ(slot->d_native_vnni_payload[i], (prefix_bytes + i) % 251u) << i;
+        std::sort(reads->ranges.begin(), reads->ranges.end());
+        ASSERT_EQ(reads->ranges.size(), 5u);
+        for (size_t i = 0; i < reads->ranges.size(); ++i)
+        {
+            EXPECT_EQ(reads->ranges[i].first, prefix_bytes + i * slot_bytes);
+            EXPECT_EQ(reads->ranges[i].second, std::min(slot_bytes, output_bytes - i * slot_bytes));
+        }
+        for (const auto &event : backend.getEventRecords())
+            if (event.type == test::MockBackend::EventRecord::RECORD)
+                EXPECT_NE(event.stream, nullptr);
+        orch.finalize();
+        EXPECT_EQ(orch.getPool(0)->stagingSlotCount(), 0u);
+        EXPECT_EQ(backend.getAllocationCount(), 1u);
+        orch.release();
+        EXPECT_EQ(backend.getAllocationCount(), 0u);
+    }
+
+    /** @test Invalid or ambiguous byte sources fail before queue mutation or slot writes. */
+    TEST(Test__LoadOrchestrator, BoundedSourceRejectsInvalidExtentAndAmbiguousOwnership)
+    {
+        auto reads = std::make_shared<SourceReads>();
+        auto source = std::make_shared<PatternWeightSource>(256u, reads);
+        std::array<std::byte, 17> destination;
+        destination.fill(std::byte{91});
+        EXPECT_THROW(source->read(250, destination), std::invalid_argument);
+        EXPECT_THROW(source->read(257, {destination.data(), 1}), std::invalid_argument);
+        EXPECT_THROW(source->read(0, {}), std::invalid_argument);
+        EXPECT_TRUE(reads->ranges.empty());
+        EXPECT_TRUE(std::all_of(destination.begin(), destination.end(),
+            [](std::byte value) { return value == std::byte{91}; }));
+        source->read(239, destination);
+        EXPECT_EQ(destination.front(), std::byte{239});
+        EXPECT_EQ(destination.back(), std::byte{4});
+
+        BudgetMockBackend backend(16 * kMiB, 16 * kMiB);
+        LoadOrchestrator orch(&backend, kTestOnlyUnadmittedGPUAllocation);
+        orch.addDevice(0);
+        orch.planRawWeight(0, "invalid", 2, 64, 256);
+        orch.allocate(128, 2);
+        WeightJob job{};
+        job.name = "invalid";
+        job.raw_bytes = 256;
+        job.N = 2;
+        job.K = 64;
+        job.format = RepackFormat::RAW_FP;
+        EXPECT_THROW(orch.addWeightJob(0, job), std::invalid_argument);
+        job.bounded_source = source;
+        job.source_offset_bytes = 1;
+        EXPECT_THROW(orch.addWeightJob(0, job), std::invalid_argument);
+        job.source_offset_bytes = 0;
+        job.host_raw_data = destination.data();
+        EXPECT_THROW(orch.addWeightJob(0, job), std::invalid_argument);
+        EXPECT_EQ(orch.pendingJobCount(0), 0u);
+        EXPECT_EQ(backend.getH2DCount(), 0u);
+    }
+
+    /** @test A producer exception cannot upload a partial output or escape its joined lane. */
+    TEST(Test__LoadOrchestrator, BoundedSourceFailureDoesNotUploadAndReleasesAfterExit)
+    {
+        BudgetMockBackend backend(16 * kMiB, 16 * kMiB);
+        LoadOrchestrator orch(&backend, kTestOnlyUnadmittedGPUAllocation);
+        orch.addDevice(0);
+        orch.planRawWeight(0, "failing", 3, 64, 3 * 128);
+        orch.allocate(128, 2);
+        auto source = std::make_shared<PatternWeightSource>(3 * 128, std::make_shared<SourceReads>(), 0);
+        std::weak_ptr<const WeightJobSource> owner = source;
+        WeightJob job{};
+        job.name = "failing";
+        job.raw_bytes = 3 * 128;
+        job.N = 3;
+        job.K = 64;
+        job.format = RepackFormat::RAW_FP;
+        job.bounded_source = source;
+        orch.addWeightJob(0, job);
+        source.reset();
+        job.bounded_source.reset();
+        EXPECT_THROW(orch.load(), std::runtime_error);
+        EXPECT_EQ(backend.getH2DCount(), 0u);
+        EXPECT_FALSE(owner.expired());
+        orch.release();
+        EXPECT_TRUE(owner.expired());
+        EXPECT_EQ(backend.getAllocationCount(), 0u);
+    }
+
+    /** @test A later conversion failure drains already accepted uploads before destroying their events. */
+    TEST(Test__LoadOrchestrator, BoundedSourceLaterFailureRetiresAcceptedWorkBeforeEvents)
+    {
+        BudgetMockBackend backend(16 * kMiB, 16 * kMiB);
+        LoadOrchestrator orch(&backend, kTestOnlyUnadmittedGPUAllocation);
+        orch.addDevice(0);
+        orch.planRawWeight(0, "later_failure", 3, 64, 3 * 128);
+        orch.allocate(128, 2);
+        WeightJob job{};
+        job.name = "later_failure";
+        job.raw_bytes = 3 * 128;
+        job.N = 3;
+        job.K = 64;
+        job.format = RepackFormat::RAW_FP;
+        job.bounded_source = std::make_shared<PatternWeightSource>(
+            3 * 128, std::make_shared<SourceReads>(), 128);
+        orch.addWeightJob(0, job);
+        EXPECT_THROW(orch.load(), std::runtime_error);
+        EXPECT_EQ(backend.getH2DCount(), 1u);
+        EXPECT_EQ(backend.earlyRetirements(), 0u);
+        EXPECT_EQ(backend.getStreamSyncCount(), 3u);
+        orch.release();
+        EXPECT_EQ(backend.getAllocationCount(), 0u);
     }
 
     TEST(Test__LoadOrchestrator, OrdersJobsByMappedSourceAddressAndPreservesAliases)

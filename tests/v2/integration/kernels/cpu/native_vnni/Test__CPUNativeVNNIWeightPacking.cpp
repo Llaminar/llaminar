@@ -45,11 +45,15 @@
 #include <barrier>
 
 #include "kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
+#include "kernels/cpu/gemm/CPUPreparedWeightWriter.h"
 #include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/PackedWeightsSerialization.h"
+#include "loaders/PreparedHalfWeights.h"
 #include "tensors/FP16Utils.h"
 #include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeWeightSourceRange.h"
+#include "tensors/TensorFactory.h"
 #include "tensors/TensorClasses.h"
 #include "utils/TestTensorFactory.h"
 
@@ -675,4 +679,6 @@ namespace llaminar2::cpu::native_vnni::test
         ASSERT_EQ(sched_getaffinity(0, sizeof(after), &after), 0);
         EXPECT_TRUE(CPU_EQUAL(&before, &after));
     }
+#include "CPUNativeWeightWindowContract.inc"
+#include "CPUNativeSourceAssemblyContract.inc"
 } // namespace llaminar2::cpu::native_vnni::test

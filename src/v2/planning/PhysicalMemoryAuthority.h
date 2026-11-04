@@ -32,6 +32,7 @@ namespace llaminar2
     class RetainedHostServiceDeclarations;
     struct RetainedHostServiceInstance;
     class NativeContextOpaqueContract;
+    class NativeCPUCollectiveProgram;
     class NativeContextPreparation;
     class GPUDeviceContextPool;
     namespace test { struct NativeContextPreparationReplayAccess; }
@@ -361,6 +362,7 @@ namespace llaminar2
         std::size_t preparation_materialized_bytes = 0u; ///< Published early physical roots.
         std::size_t native_declared_preclaimed_bytes =
             0u; ///< Unpublished native children within source BOM reservations.
+        std::size_t borrowed_opaque_runtime_committed_bytes = 0u; ///< Read-only original CPU process-pool commitment; never another reservation or resident credit.
         std::size_t opaque_runtime_committed_bytes = 0u; ///< Named qualified limits; never reported as exact materialized backing.
 
         /** @return All canonical source commitments, including exact native preparation/SDK roots.
@@ -806,6 +808,7 @@ namespace llaminar2
 
     private:
         friend class PhysicalMemoryMaterializationLedger;
+        friend class PhysicalMemoryAuthority;
         friend class PhysicalMemoryNativeSetupEpoch;
         friend class NativeStoragePreparationPmaBinding;
 
@@ -996,6 +999,33 @@ namespace llaminar2
     };
 
     /**
+     * @brief Move-only CPU source serialization borrowed from the original rank PMA.
+     *
+     * This token owns no byte counter, admission or allocation. It keeps the
+     * original authority alive and serializes source/conversion arenas across
+     * every WeightManager using that authority. The physical arena must retire
+     * before this token, which permits one maximum source BOM per rank.
+     */
+    class PhysicalMemoryCPUWeightSourceLease final
+    {
+    public:
+        /** @brief Transfer the sole lock/lifetime obligation without reacquisition. */
+        PhysicalMemoryCPUWeightSourceLease(PhysicalMemoryCPUWeightSourceLease &&) noexcept;
+        /** @brief Transfer ownership after releasing any previously held scope. */
+        PhysicalMemoryCPUWeightSourceLease &operator=(PhysicalMemoryCPUWeightSourceLease &&) noexcept;
+        /** @brief Release only serialization after the caller's physical arena retires. */
+        ~PhysicalMemoryCPUWeightSourceLease() noexcept;
+        PhysicalMemoryCPUWeightSourceLease(const PhysicalMemoryCPUWeightSourceLease &) = delete;
+        PhysicalMemoryCPUWeightSourceLease &operator=(const PhysicalMemoryCPUWeightSourceLease &) = delete;
+    private:
+        friend class PhysicalMemoryAuthority;
+        struct State;
+        /** @brief Adopt an already locked original authority scope. */
+        explicit PhysicalMemoryCPUWeightSourceLease(std::unique_ptr<State>);
+        std::unique_ptr<State> state_;
+    };
+
+    /**
      * @brief Rank-bound production authority for all live CPU/GPU allocations.
      *
      * Admission is topology-wide so several logical features cannot each fit
@@ -1033,6 +1063,18 @@ namespace llaminar2
         PhysicalMemoryAuthority(const PhysicalMemoryAuthority &) = delete;
         PhysicalMemoryAuthority &operator=(
             const PhysicalMemoryAuthority &) = delete;
+
+        /**
+         * @brief Serialize one CPU source/preparation transaction across this rank authority.
+         * @param original_allocator Exact original admitted rank-local CPU identity; never a NUMA-node inference.
+         * @return Move-only original-authority scope, retained until the arena is destroyed.
+         * @throws std::logic_error Without canonical shared ownership or final CPU admission.
+         * @note Acquisition never holds the claim/release mutex while waiting;
+         * final admission is revalidated after acquiring the separate source lock.
+         * GPU upload/event rings are not serialized by this CPU-only scope.
+         */
+        [[nodiscard]] PhysicalMemoryCPUWeightSourceLease acquireCPUWeightSourceTransaction(
+            DeviceId original_allocator = DeviceId::cpu());
 
         /** @return Canonical phase copied under the materialization mutex. */
         [[nodiscard]] PhysicalMemoryAuthorityPhase phase() const;
@@ -1168,6 +1210,10 @@ namespace llaminar2
             bool include_zero_lines = false) const;
 
     private:
+        friend class NativeCPUCollectiveProgram;
+        friend class MPIProcessSession;
+        /** @brief Retain only the original session's CPU opaque pool reservation as a read-only admission obligation. */
+        void borrowCPUCollectiveProcessPool(const PhysicalMemoryOwnerReservation& original);
         friend class RetainedHostServiceUseToken;
         friend class RetainedHostServiceDeclarations;
         // Canonical ownership is a private service check, not a new public borrow API.

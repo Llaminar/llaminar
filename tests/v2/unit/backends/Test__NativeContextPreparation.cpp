@@ -7,6 +7,7 @@
  * foreign-authority rejection and physical-reset obligation are production code.
  */
 #include "backends/NativeContextPreparation.h"
+#include "planning/MoEOverlayMemoryPlanInputs.h"
 #include "fixtures/backends/NativeContextPreparationReplayAccess.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "mocks/MockWorkerGPUContext.h"
@@ -150,4 +151,119 @@ TEST(NativeContextPreparation, WorkerOutsideExactOriginalObjectExtentCannotPubli
     NativeContextPreparationReplayAccess::physicalReset(scope);
 }
 
+}
+
+namespace llaminar2::test {
+namespace {
+/** @brief Original cold world2 topology; CPU NUMA coordinates are not CPU ordinals. */
+struct GlobalPreparationFixture {
+    OrchestrationConfig config;
+    ClusterInventory inventory;
+    MoEExpertOverlayExecutionPlan execution;
+    MoEOverlayCapacityAdmissionPolicy policy;
+    /**
+     * @brief Resolve original declared roles against recorded per-rank inventory.
+     * @param device Backend/ordinal of the sole locally created worker.
+     * @param joint Whether both original sockets own expert tensor fragments.
+     * @param include_remote_gpu Whether rank one declares a separate same-ordinal GPU.
+     */
+    explicit GlobalPreparationFixture(DeviceId device,bool joint=true,bool include_remote_gpu=true) {
+        auto plan=std::make_shared<MoERoutedExpertPlacementPlan>();
+        plan->enabled=true;plan->topology=RoutedExpertPlacementTopology::TieredOverlay;
+        plan->continuation_domain=plan->base_model_domain=plan->shared_expert_domain="continuation";
+        RoutedExpertDomain gpu;gpu.name="continuation";gpu.scope=ExecutionDomainScope::RANK_LOCAL;
+        gpu.owner_rank=0;gpu.backend=device.is_cuda()?CollectiveBackendType::NCCL:CollectiveBackendType::RCCL;
+        gpu.participants={GlobalDeviceAddress::fromLocalDeviceId(device)};
+        gpu.routed_compute_policy=RoutedExpertComputePolicy::Apportioned;
+        RoutedExpertDomain cpu;cpu.name="cpu";cpu.scope=ExecutionDomainScope::NODE_LOCAL;
+        cpu.owner_rank=-1;cpu.backend=CollectiveBackendType::UPI;
+        cpu.participants=joint?std::vector{GlobalDeviceAddress::cpu(0),GlobalDeviceAddress::cpu(1)}:
+            std::vector{GlobalDeviceAddress::cpu(1)};
+        cpu.world_ranks=joint?std::vector{0,1}:std::vector{1};
+        cpu.routed_compute_policy=joint?RoutedExpertComputePolicy::TensorSharded:RoutedExpertComputePolicy::Apportioned;
+        plan->domains={gpu,cpu};
+        plan->routed_tiers={{.name="gpu",.domain="continuation",.priority=0,.max_experts_per_layer=8},
+            {.name="cpu",.domain="cpu",.priority=2,.max_experts_per_layer=8,.fallback=true}};
+        if(joint && include_remote_gpu) {
+            auto remote=gpu;remote.name="remote_gpu";remote.owner_rank=1;plan->domains.push_back(remote);
+            plan->routed_tiers.insert(plan->routed_tiers.begin()+1,
+                {.name="remote_gpu",.domain="remote_gpu",.priority=1,.max_experts_per_layer=8});
+        }
+        config.moe_routed_expert_plan=plan;config.moe_rebalance.mode=MoERebalanceRuntimeMode::Off;
+        inventory.world_size=joint?2:3;inventory.ranks.resize(inventory.world_size);
+        for(int rank=0;rank<inventory.world_size;++rank) {
+            auto& observed=inventory.ranks[rank];observed.rank=rank;observed.node_id=0;
+            observed.cpu.memory_bytes=128u<<20;observed.cpu.free_memory_bytes=(120u-rank)<<20;
+            observed.cpu.numa_node=rank;
+            DeviceInfo gpuInfo;gpuInfo.type=device.type;gpuInfo.local_device_id=device.ordinal;
+            gpuInfo.memory_bytes=64u<<20;gpuInfo.free_memory_bytes=(60u-rank)<<20;
+            observed.gpus.push_back(gpuInfo); // Relay visibility never creates ownership.
+        }
+        execution=resolveMoEExpertOverlayExecutionPlan(plan,{.current_world_rank=0,.world_size=inventory.world_size});
+    }
+    /** @return Actual production projection from these immutable declarations. */
+    std::vector<PhysicalMemoryResource> resources()const {
+        return originalMoEOverlayNativePreparationResources(execution,inventory,config,policy,{});
+    }
+};
+}
+/** @test Global original registry survives local-only worker birth and exact final admission. */
+TEST(NativeContextPreparation, TopologyRegistryPreservesRemoteSameOrdinalAndExactCertificate) {
+    for(const auto device:{DeviceId::cuda(89),DeviceId::rocm(89)})
+    for(bool remote:{false,true}) {
+        GlobalPreparationFixture fixture(device,true,remote);const auto resources=fixture.resources();
+        ASSERT_EQ(resources.size(),remote?4u:3u);
+        int created=0;
+        NativeContextPreparationReplayAccess::seed(device,[&created,device](std::shared_ptr<PreparedGPUWorkerStack> stack) {
+            ++created;
+            return NativeContextPreparationReplayAccess::construct<StackWorker>(std::move(stack),device.gpu_ordinal());
+        });
+        auto source=NativeContextPreparationReplayAccess::source<StackWorker>(device,resources);
+        {
+            auto local=source->acquire(device);EXPECT_EQ(created,1);
+            auto snapshot=source->closeForPlanning();ASSERT_EQ(snapshot.initialObservations().size(),resources.size());
+            const auto& retained=snapshot.retainedPreparationBOM();
+            const auto* localGPU=retained.find({0,device});const auto* remoteGPU=retained.find({1,device});
+            ASSERT_NE(localGPU,nullptr);
+            EXPECT_GT(localGPU->bytes(PhysicalMemoryOwner::NativeExecutionContext),0u);
+            if(remote) {
+                ASSERT_NE(remoteGPU,nullptr);EXPECT_EQ(remoteGPU->totalBytes(),0u);
+                EXPECT_NE(localGPU->resource().admission_available_bytes,remoteGPU->resource().admission_available_bytes);
+            } else EXPECT_EQ(remoteGPU,nullptr);
+            PhysicalMemoryPlanBuilder dropped,changed,extra(retained);
+            for(const auto& bom:retained.resources()) {
+                if(!(bom.resource().world_rank==1 && bom.resource().device.is_cpu()))dropped.add(bom);
+                if(bom.resource().world_rank==1 && bom.resource().device.is_cpu()) {
+                    auto different=bom.resource();--different.admission_available_bytes;
+                    changed.add(PhysicalMemoryBOMBuilder(different).build());
+                } else changed.add(bom);
+            }
+            extra.add(PhysicalMemoryBOMBuilder({2,DeviceId::cpu(),128u<<20,120u<<20}).build());
+            for(const auto& bad:{dropped.build(),changed.build(),extra.build()}) {
+                EXPECT_THROW(source->admit(std::move(snapshot),std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(bad)),std::invalid_argument);
+                EXPECT_TRUE(snapshot.valid());
+                EXPECT_EQ(source->memory()->phase(),PhysicalMemoryAuthorityPhase::Preparing);
+            }
+            auto certificate=std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(retained);
+            auto final=source->admit(std::move(snapshot),certificate);
+            EXPECT_EQ(source->memory()->admission(),certificate);
+            EXPECT_EQ(local.memory(),source->memory());
+            final->sealForExecution();
+        }
+        auto retirement=GPUDeviceContextPool::instance().beginExclusiveGenerationRetirement(device);
+        NativeContextPreparationReplayAccess::physicalReset(retirement);
+        EXPECT_EQ(opaque(*source),0u);
+    }
+}
+/** @test Unowned relay inventory contributes no resource; malformed ownership cannot extend the registry. */
+TEST(NativeContextPreparation, OriginalRegistryExcludesInactiveRelayAndRejectsForeignOwnership) {
+    GlobalPreparationFixture fixture(DeviceId::cuda(89),false);
+    const auto resources=fixture.resources();ASSERT_EQ(resources.size(),3u);
+    for(const auto& resource:resources)EXPECT_NE(resource.world_rank,2);
+    EXPECT_EQ(std::count_if(resources.begin(),resources.end(),[](const auto& r){return r.world_rank==1 && r.device.is_gpu();}),0);
+    auto missing=fixture;missing.inventory.ranks[0].gpus.clear();
+    EXPECT_THROW(missing.resources(),std::invalid_argument);
+    auto duplicate=fixture;duplicate.execution.rank_plans[2].world_rank=1;
+    EXPECT_THROW(duplicate.resources(),std::invalid_argument);
+}
 }

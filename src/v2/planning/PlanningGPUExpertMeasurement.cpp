@@ -500,13 +500,12 @@ namespace llaminar2
         planWeights(plan, gpu.device, request, description);
         const auto staging = resolveGPUWeightLoadMemoryGeometry(description.largest_source_bytes,
             {.staging_stream_count = 3});
-        builder.add(host, PhysicalMemoryOwner::ModelSourcePayload, description.source_bytes);
-        // Reader and upload staging do not overlap: load all source matrices
-        // first, then allocate the upload ring. Tensor publication occurs after
-        // finalize has retired that ring.
+        for (const auto &matrix : description.matrices)
+            builder.add(host, PhysicalMemoryOwner::ModelSourcePayload, matrix.physicalBytes());
+        // Native reads populate final sample storage directly. The existing
+        // event-ordered upload ring remains the only host staging allocation.
         builder.add(host, PhysicalMemoryOwner::WeightLoadStaging,
-            std::max(origin == PlanningSampleOrigin::LocalGGUF ? description.largest_source_bytes : size_t{0},
-                staging.host_staging_bytes));
+            staging.host_staging_bytes);
         builder.add(gpu, kWeightOwner, plan.plannedPersistentBytes(gpu.device.gpu_ordinal(), kWeightOwner));
         builder.add(gpu, PhysicalMemoryOwner::WeightLoadStaging, staging.staging_bytes);
         builder.add(host, PhysicalMemoryOwner::ExecutionWorkspace, tensorBytes(description, maximumRows()));

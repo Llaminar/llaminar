@@ -15,6 +15,9 @@
 #include "Qwen4ExpProductionParityCases.h"
 #include "integration/parity/ParityArtifactDirectory.h"
 #include "Qwen4ExpSourceAdmissionCases.h"
+#include "Qwen4ExpCPUJointSocketEvidence.h"
+#include "utils/MPIContext.h"
+#include "execution/runner/IOrchestrationRunnerFactory.h"
 #include "integration/parity/ParityPredictorSource.h"
 #include "Qwen4ExpSourceAdmissionEvidence.h"
 #include "Qwen4ExpSourceAdmissionObservation.h"
@@ -31,6 +34,8 @@
 #include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
 #include "loaders/ModelContext.h"
 #include "loaders/PreparedWeightStore.h"
+#include "loaders/ExpertGemmRegistry.h"
+#include "execution/moe/CPUExpertShardSourceSelection.h"
 #include "models/qwen4exp/Qwen4ExpSidecarManifest.h"
 #include "execution/mtp/MTPWeightManifest.h"
 #include "utils/PerfStatsCollector.h"
@@ -491,6 +496,25 @@ inline void expectQwen4ExpSourceLookup(const ModelParityCase &cell, IOrchestrati
     const auto memory = reuse->physical_memory_authority;
     ASSERT_NE(memory, nullptr);
     const auto placement = context->resolvedImmutableRowTablePlacement();
+    if(cell.topology.expert_overlay_plan && MoEExpertOwnerMap::usesCPUJointFragments(*cell.topology.expert_overlay_plan))
+    {
+        int rank=-1;ASSERT_EQ(MPI_Comm_rank(MPI_COMM_WORLD,&rank),MPI_SUCCESS);
+        const bool continuation=qwen4ExpCPUJointSourceHasContinuation(cell,rank);
+        if(placement) for(const auto& consumer:placement->consumers())
+            if(consumer.world_rank==rank) {
+                EXPECT_TRUE(continuation) << "Expert-only CPU follower cannot become a PLE consumer";
+                EXPECT_TRUE(consumer.device.is_gpu()) << "CPU fragments are not continuation PLE consumers";
+            }
+        if(!continuation) {
+            EXPECT_EQ(context->hostImmutableRowProvider(),nullptr);
+            if(placement) for(const auto& allocator:placement->allocators())EXPECT_NE(allocator.world_rank,rank);
+            for(const auto& row:memory->rankAttestation())
+                if(row.identity.world_rank==rank && (row.owner==PhysicalMemoryOwner::ImmutableTableStorage ||
+                    row.owner==PhysicalMemoryOwner::ImmutableLookupStaging))
+                    EXPECT_EQ(row.materialized_new_bytes+row.adopted_resident_bytes,0u);
+            return; // No source/provider or consumer authority is fabricated for the expert follower.
+        }
+    }
     ASSERT_NE(placement, nullptr);
     ASSERT_NE(runner.executionPlan().runtime.ngram_table_placement, nullptr);
     EXPECT_EQ(*runner.executionPlan().runtime.ngram_table_placement, *placement);
@@ -601,9 +625,13 @@ inline void expectQwen4ExpSourceLookup(const ModelParityCase &cell, IOrchestrati
 class Qwen4ExpSourceAdmissionLifetime final
 {
 public:
-    /** @brief Construct the normal runner under one owned cache namespace. @param config Public request. @param cache Owned prefix child. */
-    Qwen4ExpSourceAdmissionLifetime(const OrchestrationConfig &config, std::filesystem::path cache)
-        : cache_(std::move(cache)), runner_(test::TestOrchestrationHelper::create(config))
+    /** @brief Construct the normal runner under one owned cache namespace. @param config Public request. @param cache Owned prefix child.
+     * @param original_context Same original observed MPI owner for CPU-joint setup; absent preserves ordinary construction. */
+    Qwen4ExpSourceAdmissionLifetime(const OrchestrationConfig &config, std::filesystem::path cache,
+        std::shared_ptr<IMPIContext> original_context = {})
+        : cache_(std::move(cache)), runner_(original_context
+            ? createOrchestrationRunnerFactory(std::move(original_context))->createFromOrchestrationConfig(config)
+            : test::TestOrchestrationHelper::create(config))
     {
         if (!runner_) throw std::runtime_error("QFN source admission factory returned no runner");
     }
@@ -896,7 +924,27 @@ void withQwen4ExpSourceAdmission(const ModelParityCase &cell, Observe &&observe,
     auto authored = config;
     if (config.moe_routed_expert_plan)
         authored.moe_routed_expert_plan = std::make_shared<MoERoutedExpertPlacementPlan>(*config.moe_routed_expert_plan);
-    Qwen4ExpSourceAdmissionLifetime lifetime(config, output / "prefix-cache");
+    std::shared_ptr<IMPIContext> original_cpu_joint_context;
+    if(!qwen4ExpCPUJointSocketMembers(cell).empty()) {
+        // Keep the SAME factory/context alive through the Runner: its one
+        // published rank observation is consumed here and later by planning.
+        original_cpu_joint_context=MPIContextFactory::global();
+        ASSERT_TRUE(original_cpu_joint_context);
+        const auto inventory=original_cpu_joint_context->clusterInventory();ASSERT_TRUE(inventory);
+        std::vector<test::CPUExpertSocketEndpoint> endpoints;
+        ASSERT_NO_THROW(endpoints=requireOriginalCPUJointSocketRanks(cell,*inventory));
+        const auto endpoint=std::find_if(endpoints.begin(),endpoints.end(),[&](const auto& item){return item.rank==rank;});
+        ASSERT_NE(endpoint,endpoints.end());
+        const auto original_rank=std::find_if(inventory->ranks.begin(),inventory->ranks.end(),
+            [&](const auto& item){return item.rank==rank;});
+        ASSERT_NE(original_rank,inventory->ranks.end());ASSERT_GT(original_rank->cpu_worker_threads,0);
+        std::ofstream socket_evidence(output / "cpu-joint-socket-membership.csv");ASSERT_TRUE(socket_evidence.is_open());
+        socket_evidence << "cell,rank,original_node_id,numa_node,socket_id,worker_threads\n"
+            << cell.testName() << ',' << rank << ',' << original_rank->node_id << ',' << endpoint->numa_node
+            << ',' << endpoint->socket << ',' << original_rank->cpu_worker_threads << '\n';
+        socket_evidence.flush();ASSERT_TRUE(socket_evidence.good());
+    }
+    Qwen4ExpSourceAdmissionLifetime lifetime(config, output / "prefix-cache",original_cpu_joint_context);
     observeQwen4ExpAdmissionThenRetire(
         [&] { observe(rank, config, authored, lifetime, output); },
         [&] {
@@ -908,6 +956,58 @@ void withQwen4ExpSourceAdmission(const ModelParityCase &cell, Observe &&observe,
             cleanup.flush();
             ASSERT_TRUE(cleanup.good());
         });
+}
+
+/**
+ * @brief Authenticate each local CPU fragment from the original frozen plan and source-bound registry.
+ * @param rank Actual original world rank.
+ * @param original Retained model/PMA/placement export from successful admission.
+ * @note No owner map is rebuilt and no source bytes are loaded or hashed.
+ */
+inline void expectQwen4ExpCPUJointSourceFragments(int rank,const ModelContextReuseContract& original)
+{
+    const auto plan=original.prepared_routed_weight_plan;
+    if(!plan || !MoEExpertOwnerMap::usesCPUJointFragments(*plan))return;
+    ASSERT_TRUE(original.context);ASSERT_TRUE(original.physical_memory_authority);
+    const auto manager=original.context->concreteWeightManager();ASSERT_TRUE(manager);
+    const auto store=manager->preparedWeightStoreIfInitialized();ASSERT_TRUE(store);
+    EXPECT_EQ(store->physicalMemoryAuthority(),original.physical_memory_authority);
+    auto& registry=manager->expertGemmRegistry();
+    const auto participants=MoEExpertOwnerMap::declaredParticipants(*plan,{.reject_tensor_sharded_domains=false});
+    const auto expected_observations=qwen4ExpCPUJointSourceExpectedLayerObservations(*plan,participants,rank);
+    size_t observed=0;
+    for(const auto& participant:participants) {
+        if(participant.world_rank!=rank || !qwen4ExpOriginalCPUJointParticipant(*plan,participant))continue;
+        for(const auto& layer:plan->placements) {
+            const auto lease=registry.acquireCPUJointLayer(store->modelId(),participant,layer.layer);
+            ASSERT_TRUE(lease);ASSERT_TRUE(lease->cpu_joint_source);const auto& source=*lease->cpu_joint_source;
+            EXPECT_EQ(source.participant(),participant);EXPECT_EQ(source.layer(),layer.layer);
+            ASSERT_TRUE(source.cohort());EXPECT_EQ(source.cohort()->source().layer_idx,layer.layer);
+            EXPECT_EQ(source.ownership().geometry().experts,512);
+            EXPECT_EQ(source.participantIndex(),size_t(participant.domain_participant_index));
+            std::vector<int> expected;
+            for(size_t expert=0;expert<layer.routed_expert_tier.size();++expert)
+                if(layer.routed_expert_tier[expert]==participant.tier_idx)expected.push_back(static_cast<int>(expert));
+            if(plan->routed_tiers.at(participant.tier_idx).max_experts_per_layer>0)
+                EXPECT_EQ(expected.size(),size_t(plan->routed_tiers.at(participant.tier_idx).max_experts_per_layer));
+            EXPECT_EQ(std::vector<int>(source.expertIds().begin(),source.expertIds().end()),expected);
+            ASSERT_EQ(lease->experts.size(),layer.routed_expert_tier.size());
+            EXPECT_EQ(lease->sources.size(),expected.size()*3u);
+            for(size_t expert=0;expert<lease->experts.size();++expert) {
+                const auto& engine=lease->experts[expert];const bool selected=source.contains(static_cast<int>(expert));
+                EXPECT_EQ(bool(engine.gate),selected);EXPECT_EQ(bool(engine.up),selected);EXPECT_EQ(bool(engine.down),selected);
+            }
+            for(const auto& binding:lease->sources) {
+                EXPECT_EQ(binding.identity.model_id,store->modelId());ASSERT_TRUE(binding.cpu_joint_source);
+                EXPECT_EQ(*binding.cpu_joint_source,source);ASSERT_TRUE(binding.projection_ownership);
+                EXPECT_EQ(*binding.projection_ownership,source.ownership());
+            }
+            ++observed;
+        }
+    }
+    // A genuine other participant can have no CPU-joint member. Its expected
+    // source observations are zero, not a fabricated local fragment lease.
+    EXPECT_EQ(observed,expected_observations);
 }
 
 /**
@@ -988,6 +1088,7 @@ inline void admitQwen4ExpSource(const ModelParityCase &cell)
     }
     for (const auto &resource : reuse->physical_memory_authority->admission()->plan().resources())
         EXPECT_EQ(resource.bytes(PhysicalMemoryOwner::GraphSnapshotArena), 0u);
+    ASSERT_NO_FATAL_FAILURE(expectQwen4ExpCPUJointSourceFragments(rank,*reuse));
     ASSERT_NO_FATAL_FAILURE(expectQwen4ExpSourceLookup(cell, *runner, *reuse));
     if(const auto setup=model->immutableLookupSetupObservation()) {
         // Serialize the SAME passive setup value used by the assertions and
@@ -1012,9 +1113,12 @@ inline void admitQwen4ExpSource(const ModelParityCase &cell)
     std::ofstream csv(output / "admission.csv");
     ASSERT_TRUE(csv.is_open());
     const auto placement = model->resolvedImmutableRowTablePlacement();
-    ASSERT_NE(placement, nullptr);
+    const bool joint_follower=cell.topology.expert_overlay_plan &&
+        MoEExpertOwnerMap::usesCPUJointFragments(*cell.topology.expert_overlay_plan) &&
+        !qwen4ExpCPUJointSourceHasContinuation(cell,rank);
+    ASSERT_TRUE(joint_follower || placement);
     csv << "cell,layers,initialized,snapshots_enabled,numerical_inference_executed,native_table_bytes\n"
-        << cell.testName() << ",48,1,0,0," << placement->extent().nativeBytes() << '\n';
+        << cell.testName() << ",48,1,0,0," << (joint_follower?0u:placement->extent().nativeBytes()) << '\n';
     csv.flush();
     ASSERT_TRUE(csv.good());
     });

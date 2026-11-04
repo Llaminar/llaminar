@@ -29,11 +29,13 @@ struct CPUCompactPacketStorageLayout
      * @param hidden_width Positive model compute width.
      * @param top_k Positive metadata route width per token.
      * @param allocator Exact physical CPU allocator.
+     * @param placement Original NUMA root policy; ordinary CPU1 retains native heap placement.
      * @return Immutable declarations used by both BOM and construction.
      * @throws std::invalid_argument For invalid dimensions or allocator.
      * @throws std::overflow_error For unrepresentable root capacities.
      */
-    [[nodiscard]] static CPUCompactPacketStorageLayout declare(size_t rows,int hidden_width,int top_k,DeviceId allocator)
+    [[nodiscard]] static CPUCompactPacketStorageLayout declare(size_t rows,int hidden_width,int top_k,DeviceId allocator,
+        CPUStoragePlacement placement=CPUStoragePlacement::local())
     {
         if(!rows || hidden_width<=0 || top_k<=0 || !allocator.is_cpu())
             throw std::invalid_argument("CPU compact packet requires exact positive CPU geometry");
@@ -42,8 +44,8 @@ struct CPUCompactPacketStorageLayout
                 throw std::overflow_error("CPU compact packet root extent overflow");
             return a*b;
         };
-        const auto root=[allocator](size_t count) {
-            return CPUStorageRoot<float>(count,PhysicalMemoryOwner::ActivationArena,allocator);
+        const auto root=[allocator,placement](size_t count) {
+            return CPUStorageRoot<float>(count,PhysicalMemoryOwner::ActivationArena,allocator,placement);
         };
         const auto hidden_elements=multiply(rows,static_cast<size_t>(hidden_width));
         const auto route_elements=multiply(rows,static_cast<size_t>(top_k));

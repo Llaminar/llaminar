@@ -24,10 +24,10 @@ namespace llaminar2
         // Initial import may precede placement admission. Without original
         // layer ownership there is no proof permitting any endpoint omission.
         if (plan.placements.empty()) return execution.currentRankPlan().local_devices;
-        // This is a residency/participant index, never whole-expert dispatch.
-        // Tensor-sharded continuation weights must retain every original shard.
-        const auto owners = MoEExpertOwnerMap::build(plan, {.reject_tensor_sharded_domains = false});
-        const auto admitted = MoEOverlayHostServiceContract::admittedExpertParticipants(plan, owners);
+        // This projection needs only original membership, never whole-expert owner
+        // rows. A joint fragment must not accidentally mint a whole owner here.
+        const auto participants = MoEExpertOwnerMap::declaredParticipants(plan, {.reject_tensor_sharded_domains = false});
+        const auto admitted = MoEOverlayHostServiceContract::admittedExpertParticipants(plan, participants);
         const auto& rank = execution.currentRankPlan();
         const auto endpoint = [&](const auto& participant, DeviceId device) {
             return participant.world_rank_known && participant.world_rank == rank.world_rank && participant.device == device;
@@ -47,7 +47,7 @@ namespace llaminar2
         std::vector<DeviceId> result;
         for (const auto device : rank.local_devices) {
             if (!device.is_valid()) throw std::logic_error("Prepared-weight authority has an invalid original endpoint");
-            const bool declared = std::any_of(owners.participants().begin(), owners.participants().end(),
+            const bool declared = std::any_of(participants.begin(), participants.end(),
                 [&](const auto& participant) { return endpoint(participant, device); });
             const bool live = std::any_of(admitted.begin(), admitted.end(),
                 [&](const auto& participant) { return endpoint(participant, device); });

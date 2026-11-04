@@ -19,7 +19,7 @@ namespace llaminar2
     struct CPUWeightPreparationMemory final
     {
         size_t persistent_bytes; ///< Exact local physical root, retained by actual backing.
-        size_t temporary_bytes;  ///< Exact simultaneous setup vectors, retired before synchronous return.
+        size_t temporary_bytes;  ///< Exact bounded append workspace, retired before synchronous return.
         size_t persistent_payload_bytes; ///< Logical engine payload, excluding allocator rounding.
 
         /**

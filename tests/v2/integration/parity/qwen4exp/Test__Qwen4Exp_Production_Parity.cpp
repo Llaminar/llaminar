@@ -11,7 +11,11 @@
  * sidecar and workspace owners without changing numerical-reference support.
  * Both retain real serving preparation/capture and
  * stop before inference; neither is numerical or performance evidence.
+ * The process entry uses the production MPI session owner, so admitted CPU
+ * collectives retain their original process pool until native finalization.
+ * Terminal evidence follows both MPI and GPU retirement.
  */
+#include "app/MPIProcessSession.h"
 #include "backends/GPUDeviceProcessLifetime.h"
 #include "integration/NativeLifetimeCompletion.h"
 #include "utils/MPISessionOwner.h"
@@ -19,6 +23,7 @@
 #include "Qwen4ExpNgramAdmissionCases.h"
 #include "Qwen4ExpSourceAdmission.h"
 #include "Qwen4ExpSourceAdmissionCases.h"
+#include "Qwen4ExpCPUJointParityCases.h"
 #include "Qwen4ExpSourceAdmissionCI.h"
 #include "Qwen4ExpFixedHeadParityCases.h"
 #include "Qwen4ExpGPUAdaptiveParityCases.h"
@@ -243,6 +248,15 @@ TEST_P(Qwen4ExpMainParityTest, SnapshotAdmission)
     ASSERT_TRUE(csv.good());
 }
 
+/** @brief Same canonical numerical framework, without unrelated source/snapshot-only registrations. */
+class Qwen4ExpCPUJointFullStageTest
+    :public Qwen4ExpConfigDrivenParityTest<Qwen4ExpCPUJointFullStageTest>,public ModelParityCaseParameter {};
+/** @test Original complete frozen-history checkpoints under the actual coordinated socket-rank lifecycle. */
+TEST_P(Qwen4ExpCPUJointFullStageTest,ProductionParity) {runQwen4ExpProductionParityCampaign();}
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpCPUJointWorld2FullStage,Qwen4ExpCPUJointFullStageTest,
+    ::testing::ValuesIn(qwen4ExpCPUJointWorld2NumericalCases()),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
+
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpMain, Qwen4ExpMainParityTest,
     ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpMain", qwen4ExpProductionCases())),
     [](const ::testing::TestParamInfo<ModelParityCase> &info) { return info.param.testName(); });
@@ -336,6 +350,11 @@ TEST_P(Qwen4ExpSourceAdmissionTest, FullSourceAdmission)
 {
     ASSERT_NO_FATAL_FAILURE(admitQwen4ExpSource(modelParityCase()));
 }
+
+// Source-only physical world2; no active MTP/movement or numerical family is added.
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpCPUJointWorld2SourceAdmission, Qwen4ExpSourceAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpCPUJointWorld2SourceAdmissionCases())),
+    [](const ::testing::TestParamInfo<Qwen4ExpSourceAdmissionCase>& info){return info.param.testName();});
 
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpMainSourceAdmission, Qwen4ExpSourceAdmissionTest,
     ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpExpandSourceAdmissionMTP(qwen4ExpProductionCases()))),
@@ -655,14 +674,13 @@ int main(int argc, char **argv)
     if (auto terminal = llaminar2::MPISessionOwner::enterProcess(argc, argv))
         return *terminal;
     const auto completion = llaminar2::test::NativeLifetimeCompletion::fromEnvironment();
-    // The custom matrix entry owns MPI and its original native retirement.
-    // Close the lexical GPU owner and publish before MPI finalization/_exit;
-    // the explicit retireActive call keeps the established backend ordering.
+    // The original MPI session outlives all test runners and their CPU domain
+    // commitments. Its destructor finalizes MPI before the enclosing lexical
+    // GPU lifetime returns and permits terminal publication. Bare MPI_Init
+    // cannot supply that ownership to admitted CPU expert collectives.
     int result = llaminar2::test::runWithNativeLifetimeCompletion<llaminar2::GPUDeviceProcessLifetime>(
         [&] {
-            int provided = 0;
-            MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
-            if (provided < MPI_THREAD_MULTIPLE) MPI_Abort(MPI_COMM_WORLD, 1);
+            auto mpi_session = llaminar2::MPIProcessSession::initialize(argc, argv);
             int result = 0;
             constexpr std::string_view inventory_option = "--qfn-source-hardware-inventory=";
             if (argc == 2 && std::string_view(argv[1]).starts_with(inventory_option))
@@ -680,7 +698,6 @@ int main(int argc, char **argv)
             return result;
         },
         [&](int result) { if (completion) completion->publish(result); });
-    if (MPI_Finalize() != MPI_SUCCESS) result = 3;
     std::cout.flush();
     std::cerr.flush();
     _exit(result);

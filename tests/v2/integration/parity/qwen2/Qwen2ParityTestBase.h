@@ -1289,6 +1289,16 @@ namespace llaminar2::test::parity::qwen2
             ASSERT_TRUE(hasOrchestrationRunner())
                 << "Production parity must enter through the server-facing runner";
 
+            runProductionParityCampaignOnInitializedRunner();
+        }
+
+        /**
+         * @brief Run the unchanged canonical comparisons on the already admitted authority.
+         * @note Distributed fixtures put original followers in the production worker loop first.
+         */
+        void runProductionParityCampaignOnInitializedRunner()
+        {
+            ASSERT_TRUE(hasOrchestrationRunner());
             const auto prefill = runPrefillParity();
             assertParity(prefill);
 

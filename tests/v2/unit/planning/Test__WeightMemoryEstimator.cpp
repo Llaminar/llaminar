@@ -2,6 +2,8 @@
 #include <gtest/gtest.h>
 #include "planning/WeightMemoryEstimator.h"
 #include "planning/WeightShardGeometry.h"
+#include "kernels/cpu/gemm/CPUWeightPreparationMemory.h"
+#include "memory/CPUStorageRoot.h"
 #include "planning/ModelMemoryProfile.h"
 #include "loaders/WeightSlicer.h"
 #include "execution/local_execution/graph/SchemaFactoryRegistry.h"
@@ -302,8 +304,8 @@ TEST(Test__WeightMemoryEstimator, ExactInputAndOutputAxesAllFormatsTP1Through8)
                                 static_cast<size_t>(d.elements() * format.bytes_per_weight));
                     }
                     else
-                        EXPECT_EQ(bytes.device_bytes, static_cast<size_t>(d.elements() *
-                            WeightMemoryEstimator::getCPUPackedBytesPerWeight(format.quant_type)));
+                        EXPECT_EQ(bytes.device_bytes, CPUWeightPreparationMemory::sourceNative(
+                            format.quant_type,d.matrix()->rows,d.matrix()->columns).persistent_bytes);
                 }
             }
         }
@@ -1343,12 +1345,27 @@ TEST(Test__WeightMemoryEstimator, PipelineGlobalComponentsAreNotReplicatedByLaye
                 EXPECT_EQ(middle.lm_head_bytes, 0u);
                 EXPECT_EQ(middle.prepared_embedding_bytes, 0u);
                 EXPECT_GT(terminal.lm_head_bytes, 0u);
-                if (!tied || device.is_gpu())
-                    EXPECT_EQ(entry.device_bytes + terminal.device_bytes, full.device_bytes);
-                else
-                    // Distinct CPU stages cannot share the full model's tied source.
+                const auto original_type = tensorTypeFromName(format.quant_type);
+                ASSERT_TRUE(original_type);
+                const bool floating = *original_type == TensorType::FP32 || *original_type == TensorType::FP16 ||
+                    *original_type == TensorType::BF16;
+                if (device.is_cpu() && tied && !floating)
+                {
+                    // Native lookup retains original encoded bytes; output
+                    // execution owns a distinct final VNNI root even in full PP1.
+                    const auto lookup = NativeEmbeddingLayout::forSource(*original_type,256,256);
+                    EXPECT_EQ(entry.prepared_embedding_bytes,
+                        CPUStoragePlacement::local().physicalBytes<uint8_t>(lookup.byte_size));
+                    EXPECT_EQ(terminal.tied_lm_head_bytes,
+                        CPUWeightPreparationMemory::sourceNative(format.quant_type,256,256).persistent_bytes);
+                }
+                if (tied && device.is_cpu() && floating)
+                    // Only floating full-model lookup/output borrow the same
+                    // final raw owner. Separate pipeline stages own two roots.
                     EXPECT_EQ(entry.device_bytes + terminal.device_bytes,
                               full.device_bytes + terminal.tied_lm_head_bytes);
+                else
+                    EXPECT_EQ(entry.device_bytes + terminal.device_bytes, full.device_bytes);
             }
 }
 
@@ -1390,6 +1407,7 @@ TEST(Test__WeightMemoryEstimator, ContinuationResidencyCountsDenseSharedAndExact
             profile.expert_count,
             {2, 4});
 
+    const auto placement = CPUStoragePlacement::local();
     const auto estimate = WeightMemoryEstimator::estimate(
         profile,
         DeviceId::cpu(),
@@ -1397,23 +1415,31 @@ TEST(Test__WeightMemoryEstimator, ContinuationResidencyCountsDenseSharedAndExact
         1,
         0,
         1,
-        residency);
+        residency, {}, WeightComponentScope::EmbeddingAndTerminal, placement);
 
-    size_t expected = 0;
+    size_t expected_native = 0, expected_final = 0;
     for (const auto &tensor : profile.tensors)
     {
         if (!isSyntheticRoutedExpertTensor(tensor.name))
         {
-            expected += tensor.native_bytes;
+            expected_native += tensor.native_bytes;
+            expected_final += placement.physicalBytes<float>(tensor.elements);
             continue;
         }
         const int selected = tensor.layer_index == 0 ? 2 : 4;
-        expected += tensor.native_bytes * static_cast<size_t>(selected) /
-                    static_cast<size_t>(profile.expert_count);
+        expected_native += tensor.native_bytes * static_cast<size_t>(selected) /
+                           static_cast<size_t>(profile.expert_count);
+        // The common writer commits each selected expert separately. Round
+        // that actual matrix root before multiplying its independent owners.
+        expected_final += placement.physicalBytes<float>(
+            tensor.elements / static_cast<size_t>(profile.expert_count)) * static_cast<size_t>(selected);
     }
-    EXPECT_EQ(estimate.native_bytes, expected);
-    EXPECT_EQ(estimate.device_bytes, expected)
-        << "F32 CPU preparation must preserve the exact selected byte count";
+    EXPECT_EQ(estimate.native_bytes, expected_native);
+    EXPECT_EQ(estimate.device_bytes, expected_final);
+    // The two 100×32 vocabulary matrices are 12,800 useful bytes each, but
+    // independently retained local roots have allocator-rounded capacity.
+    // Logical native inventory must never be mistaken for that live footprint.
+    EXPECT_GT(expected_final, expected_native);
     EXPECT_LT(estimate.device_bytes, profile.total_native_bytes);
 }
 
@@ -1491,3 +1517,5 @@ TEST(Test__WeightMemoryEstimator, NgramTableIsExcludedFromEveryPreparedWeightBac
         EXPECT_EQ(after.lm_head_bytes, before.lm_head_bytes);
     }
 }
+
+#include "CPUExactWeightFootprintContract.inc"

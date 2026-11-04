@@ -4,6 +4,7 @@
  */
 
 #include "MoEOverlayActivationEpochProtocol.h"
+#include "CPUExpertShardRouteCompletion.h"
 
 #include <algorithm>
 #include <atomic>
@@ -127,7 +128,8 @@ namespace llaminar2
 
     bool MoEOverlayActivationEpochConfig::valid() const noexcept
     {
-        if (channel_nonce == 0u || topology_fingerprint_low == 0u ||
+        if (!moeOverlayActivationReturnRoleValid(static_cast<std::uint32_t>(return_role)) ||
+            channel_nonce == 0u || topology_fingerprint_low == 0u ||
             topology_fingerprint_high == 0u || workspace_generation == 0u ||
             !source.valid() || !target.valid() || graph_role_mask == 0u ||
             (source.world_rank == target.world_rank &&
@@ -238,6 +240,7 @@ namespace llaminar2
             config.model_layer_indices.size());
         control.channel.lane_ordinal = config.lane_ordinal;
         control.channel.graph_role_mask = config.graph_role_mask;
+        control.channel.return_role = static_cast<std::uint32_t>(config.return_role);
     }
 
     MoEOverlayActivationEpochProtocol::MoEOverlayActivationEpochProtocol(
@@ -272,7 +275,8 @@ namespace llaminar2
             header.stage_count != config_.model_layer_indices.size() ||
             header.buffer_count != kMoEOverlayActivationBufferCount ||
             header.lane_ordinal != config_.lane_ordinal ||
-            header.graph_role_mask != config_.graph_role_mask)
+            header.graph_role_mask != config_.graph_role_mask ||
+            header.return_role != static_cast<std::uint32_t>(config_.return_role))
         {
             throw std::logic_error(
                 "ExpertOverlay activation epoch mapping disagrees with its exact topology or retained stage manifest");
@@ -380,6 +384,7 @@ namespace llaminar2
             .sidecar_depth = ticket.sidecar_depth,
             .stage_count = control_->channel.stage_count,
             .lane_ordinal = control_->channel.lane_ordinal,
+            .return_role = control_->channel.return_role,
             .reserved = {},
         };
         identity.digest = moeOverlayActivationIdentityDigest(identity);
@@ -710,11 +715,28 @@ namespace llaminar2
     }
 
     bool MoEOverlayActivationEpochProtocol::publishReturn(
+        const MoEOverlayActivationEpochIdentity &identity,std::uint32_t stage,
+        std::uint64_t bytes,std::string *error) {
+        return publishReturnImpl(identity,stage,bytes,nullptr,error);
+    }
+    bool MoEOverlayActivationEpochProtocol::publishJointReturn(
+        const MoEOverlayActivationEpochIdentity &identity,std::uint32_t stage,
+        std::uint64_t bytes,const CPUExpertShardRouteCompletion &completed,std::string *error) {
+        return publishReturnImpl(identity,stage,bytes,&completed,error);
+    }
+
+    bool MoEOverlayActivationEpochProtocol::publishReturnImpl(
         const MoEOverlayActivationEpochIdentity &identity,
         std::uint32_t stage_ordinal,
         std::uint64_t payload_bytes,
+        const CPUExpertShardRouteCompletion *completed,
         std::string *error)
     {
+        const bool joint=config_.return_role!=MoEOverlayActivationReturnRole::Ordinary;
+        if ((joint && (!completed || !completed->matches(*control_,identity,stage_ordinal))) ||
+            (!joint && completed))
+            return fail("Joint CPU return requires its exact completed original cohort witness",error);
+
         constexpr auto endpoint = MoEOverlayActivationEndpoint::Follower;
         constexpr auto operation = MoEOverlayActivationOperation::PublishReturn;
         if (!validateActiveEndpoint(endpoint, identity, operation, error))
@@ -744,9 +766,12 @@ namespace llaminar2
         const std::uint64_t dispatch_observed = acquireValue(
             buffer.dispatch_signal.value);
         const auto dispatch = buffer.dispatch_descriptor;
+        const bool contributor=config_.return_role==MoEOverlayActivationReturnRole::StaticJointContributor;
+        const std::uint64_t return_rows=contributor?0u:dispatch.live_rows;
+        const std::uint64_t return_entries=contributor?0u:dispatch.live_entries;
         if (dispatch_observed != timeline ||
             !validDescriptor(dispatch, identity, stage_ordinal, timeline) ||
-            ((payload_bytes == 0u) != (dispatch.live_rows == 0u)))
+            ((payload_bytes == 0u) != (return_rows == 0u)))
         {
             return reject(
                 endpoint,
@@ -771,8 +796,8 @@ namespace llaminar2
         if (!canAccumulatePublishedTraffic(
                 endpoint_status,
                 payload_bytes,
-                dispatch.live_rows,
-                dispatch.live_entries))
+                return_rows,
+                return_entries))
         {
             return reject(
                 endpoint,
@@ -789,8 +814,8 @@ namespace llaminar2
              * the authenticated dispatch, which may be newer than the host
              * scheduler's immutable floor. */
             .placement_epoch = dispatch.placement_epoch,
-            .live_rows = dispatch.live_rows,
-            .live_entries = dispatch.live_entries,
+            .live_rows = return_rows,
+            .live_entries = return_entries,
             .payload_bytes = payload_bytes,
             .stage_ordinal = stage_ordinal,
             .model_layer_index = layer,
@@ -798,8 +823,8 @@ namespace llaminar2
         accumulatePublishedTraffic(
             endpoint_status,
             payload_bytes,
-            dispatch.live_rows,
-            dispatch.live_entries);
+            return_rows,
+            return_entries);
         atomicValue(buffer.return_signal.value).store(
             timeline, std::memory_order_release);
         atomicValue(endpoint_status.last_published_stage).store(
@@ -877,8 +902,8 @@ namespace llaminar2
         const auto dispatch = buffer.dispatch_descriptor;
         if (observed != timeline ||
             !validDescriptor(descriptor, identity, stage_ordinal, timeline) ||
-            descriptor.live_rows != dispatch.live_rows ||
-            descriptor.live_entries != dispatch.live_entries ||
+            !moeOverlayActivationReturnCountsMatch(control_->channel.return_role,
+                descriptor.live_rows,descriptor.live_entries,dispatch.live_rows,dispatch.live_entries) ||
             descriptor.placement_epoch != dispatch.placement_epoch)
         {
             reject(
@@ -1243,6 +1268,8 @@ namespace llaminar2
             source.published_live_entries);
         snapshot.published_stage_count = acquireValue(
             source.published_stage_count);
+        snapshot.published_shared_hidden_bytes = acquireValue(
+            source.published_shared_hidden_bytes);
         return snapshot;
     }
 
@@ -1307,17 +1334,23 @@ namespace llaminar2
             return std::nullopt;
         }
 
-        const bool row_symmetric =
-            continuation.published_live_rows ==
-            follower.published_live_rows;
+        if (follower.published_shared_hidden_bytes != 0u)
+        {
+            fail("ExpertOverlay follower cannot publish source-owned shared hidden bytes", error);
+            return std::nullopt;
+        }
+
+        const bool row_symmetric = moeOverlayActivationReturnCountsMatch(control_->channel.return_role,
+            follower.published_live_rows,follower.published_live_entries,
+            continuation.published_live_rows,continuation.published_live_entries);
         const bool dispatch_entry_geometry_valid =
             continuation.published_live_rows == 0u
                 ? continuation.published_live_entries == 0u
                 : continuation.published_live_entries >=
                       continuation.published_live_rows;
-        const bool return_entry_geometry_valid =
-            follower.published_live_entries ==
-                continuation.published_live_entries;
+        const bool return_entry_geometry_valid = moeOverlayActivationReturnCountsMatch(control_->channel.return_role,
+            follower.published_live_rows,follower.published_live_entries,
+            continuation.published_live_rows,continuation.published_live_entries);
         const bool entry_geometry_valid =
             dispatch_entry_geometry_valid && return_entry_geometry_valid;
         const bool byte_geometry_valid =
@@ -1338,6 +1371,7 @@ namespace llaminar2
             .dispatch_payload_bytes =
                 continuation.published_payload_bytes,
             .return_payload_bytes = follower.published_payload_bytes,
+            .dispatch_shared_hidden_bytes = continuation.published_shared_hidden_bytes,
             .dispatch_live_rows = continuation.published_live_rows,
             .return_live_rows = follower.published_live_rows,
             .dispatch_live_entries =
@@ -1403,6 +1437,8 @@ namespace llaminar2
                 control_->channel.target_domain_ordinal ||
             identity.stage_count != control_->channel.stage_count ||
             identity.lane_ordinal != control_->channel.lane_ordinal ||
+            identity.return_role != control_->channel.return_role ||
+            !moeOverlayActivationReturnRoleValid(identity.return_role) ||
             identity.epoch_generation == 0u ||
             identity.epoch_generation > kMoEOverlayActivationMaxGeneration)
         {

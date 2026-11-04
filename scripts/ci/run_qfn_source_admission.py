@@ -6,7 +6,9 @@ No topology/depth list or vendor-count heuristic lives here. The exact image's
 native startup inventory selects typed participants; unavailable cells remain
 unqualified. Every selected cell, including candidates, must pass without skips
 and publish per-rank retirement. Canonical GGUF paths are read-only inputs, never
-rewritten into another source tier. Broad optional downloads are suppressed only
+rewritten into another source tier. An explicit --exact-cell diagnostic uses the
+same lifecycle but has a disjoint, certification-ineligible receipt; default
+selection and the full gate are unchanged. Broad optional downloads are suppressed only
 after every selected REQUIRED_FILES input has been validated.
 """
 from __future__ import annotations
@@ -27,6 +29,7 @@ import xml.etree.ElementTree as ET
 from production_artifacts import artifact_identity_path, digest, write_json
 
 SOURCE_ADMISSION_REPORT_SCHEMA = 2  # Runner cleanup plus terminal native lifetime proof.
+SOURCE_ADMISSION_DIAGNOSTIC_SCHEMA = 'llaminar.qfn-source-admission-diagnostic.v1'
 PREFIX = 'V2_Integration_Parity_Qwen4Exp_Production_'
 class SourceAdmissionContract(str, Enum):
     """Disjoint native proof obligations; capacity is not structural support."""
@@ -107,6 +110,46 @@ def valid_unqualified(row: dict) -> bool:
     return True
 
 
+def cpu_joint_socket_requirements(record: dict, declared: set, observed: dict) -> list[dict]:
+    """Join original CPU-joint roles to one original local-host socket observation.
+
+    Missing/stale facts cannot become eligibility. Authoritative socket aliasing
+    is an unavailable physical deployment, not another rank mapping or launch.
+    Ordinary source records have no such requirement and retain their contract.
+    """
+    if 'cpu_expert_socket_membership' not in record:
+        return []
+    members = record['cpu_expert_socket_membership']; world = record['mpi_ranks']
+    if (not isinstance(members, list) or len(members) != world or not 2 <= world <= 8):
+        raise ValueError('incomplete original CPU-joint socket requirement')
+    ranks = set(); nodes = set(); required = []
+    for member in members:
+        if not isinstance(member, dict):
+            raise ValueError('invalid original CPU-joint socket member')
+        rank = member.get('rank'); address = identity(member)
+        if (type(rank) is not int or not 0 <= rank < world or address[0] != 'cpu'
+                or (rank, address) not in declared or rank in ranks or address[2] in nodes):
+            raise ValueError('foreign or duplicate original CPU-joint socket member')
+        ranks.add(rank); nodes.add(address[2]); required.append((member, address))
+    if ranks != set(range(world)):
+        raise ValueError('original CPU-joint socket members omit an original rank')
+    # Missing device identities already have the existing explicit unavailable
+    # record. Do not manufacture socket facts for those missing observations.
+    if any(address not in observed for _, address in required):
+        return []
+    sockets = set(); aliased = []
+    for member, address in required:
+        socket = observed[address].get('socket_id')
+        if type(socket) is not int or socket < 0:
+            raise ValueError('missing or stale original CPU physical-socket evidence')
+        if socket in sockets:
+            aliased.append({**member, 'role': 'cpu_expert_distinct_physical_socket',
+                            'observed_socket_id': socket,
+                            'reason': 'original_cpu_socket_alias'})
+        sockets.add(socket)
+    return aliased
+
+
 def select(records: dict, hardware: dict) -> tuple[list[str], dict]:
     """Select exact typed participants against one native local-host observation."""
     if (type(hardware.get('qfn_source_hardware_schema')) is not int
@@ -174,6 +217,7 @@ def select(records: dict, hardware: dict) -> tuple[list[str], dict]:
                 raise ValueError('source storage coordinator is not an actual compute consumer')
         if {rank for rank, _ in declared} != set(range(ranks)):
             raise ValueError('typed source participants do not cover the declared world')
+        missing.extend(cpu_joint_socket_requirements(record, declared, observed_devices))
         if missing:
             unavailable[exact] = {'qualification': 'hardware-ineligible-unqualified', 'missing': missing}
         elif insufficient:
@@ -184,6 +228,23 @@ def select(records: dict, hardware: dict) -> tuple[list[str], dict]:
     if not selected:
         raise ValueError('source admission has no hardware-eligible cells')
     return selected, unavailable
+
+
+def exact_cell_selection(exact_cell: str | None, records: dict, eligible: list[str],
+                         unavailable: dict) -> list[str]:
+    """Restrict only an explicit diagnostic to one authenticated hardware-eligible GTest ID.
+
+    The caller first authenticates complete CTest/GTest membership and runs the
+    original typed hardware selector. No regex, topology inference, retry or
+    visibility filter can manufacture a missing or unavailable source cell.
+    """
+    if exact_cell is None:
+        return eligible
+    if exact_cell not in records:
+        raise ValueError(f'unknown exact QFN source cell: {exact_cell}')
+    if exact_cell not in eligible:
+        raise ValueError(f'exact QFN source cell is hardware-ineligible: {exact_cell}; {unavailable.get(exact_cell)}')
+    return [exact_cell]
 
 
 def source_parameters(document: dict) -> dict:
@@ -349,11 +410,53 @@ def validate_native_retirement(root: Path, record: dict) -> None:
             raise ValueError('missing or incomplete source process native lifetime retirement')
 
 
+def validate_cpu_joint_rank_evidence(root: Path, record: dict) -> None:
+    """Consume the original bound-rank socket facts, never available-node counts."""
+    if 'cpu_expert_socket_membership' not in record:
+        return
+    members = record['cpu_expert_socket_membership']; world = record['mpi_ranks']
+    if not isinstance(members, list) or len(members) != world or not 2 <= world <= 8:
+        raise ValueError('incomplete original CPU-joint socket requirement')
+    expected = {}
+    for member in members:
+        rank = member.get('rank') if isinstance(member, dict) else None
+        if (type(rank) is not int or not 0 <= rank < world or rank in expected
+                or identity(member)[0] != 'cpu'):
+            raise ValueError('invalid original CPU-joint rank requirement')
+        expected[rank] = member['numa_node']
+    if len(set(expected.values())) != world:
+        raise ValueError('aliased original CPU-joint NUMA requirement')
+    nodes = set(); sockets = set()
+    for rank in range(world):
+        path = source_artifact_directory(root, record['id'], rank) / 'cpu-joint-socket-membership.csv'
+        if path.is_symlink():
+            raise ValueError('foreign symlink in original CPU-joint rank evidence')
+        with path.open() as stream:
+            rows = list(csv.DictReader(stream))
+        if len(rows) != 1 or rows[0].get('cell') != record['id']:
+            raise ValueError('missing original CPU-joint bound-rank evidence')
+        row = rows[0]
+        try:
+            values = {key: int(row[key]) for key in ('rank', 'original_node_id', 'numa_node', 'socket_id', 'worker_threads')}
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError('malformed original CPU-joint socket evidence') from error
+        if (any(str(value) != row[key] for key, value in values.items())
+                or values['rank'] != rank or values['numa_node'] != expected[rank]
+                or min(values['original_node_id'], values['socket_id']) < 0 or values['worker_threads'] <= 0
+                or values['socket_id'] in sockets):
+            raise ValueError('foreign or aliased original CPU-joint bound-rank evidence')
+        nodes.add(values['original_node_id']); sockets.add(values['socket_id'])
+    if len(nodes) != 1:
+        raise ValueError('CPU-joint socket IDs cannot cross original physical-node namespaces')
+
+
 def validate_retirement(root: Path, record: dict, *, contract: SourceAdmissionContract) -> None:
     """Require actual native retirement plus the exact source contract evidence."""
     if not isinstance(contract, SourceAdmissionContract):
         raise ValueError('source retirement requires an explicit typed contract')
     validate_native_retirement(root, record)
+    if contract == SourceAdmissionContract.POSITIVE:
+        validate_cpu_joint_rank_evidence(root, record)
     for rank in range(record['mpi_ranks']):
         directory = source_artifact_directory(root, record['id'], rank)
         receipt = directory / {
@@ -547,10 +650,19 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build-dir', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--exact-cell', action='append', metavar='GTEST_CASE',
+                        help='diagnostic only: one exact eligible source GTest ID; never a full-gate receipt')
     args = parser.parse_args(argv)
+    if len(args.exact_cell or []) > 1:
+        parser.error('--exact-cell accepts exactly one source GTest identifier')
+    exact_cell = args.exact_cell[0] if args.exact_cell else None
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=False)
     report = {'schema': SOURCE_ADMISSION_REPORT_SCHEMA, 'complete': False, 'passed': False, 'results': {}, 'all_resources_retired': False}
+    if exact_cell is not None:
+        report.update(schema=SOURCE_ADMISSION_DIAGNOSTIC_SCHEMA,
+                      scope='diagnostic-exact-cell', full_selected_gate=False,
+                      certification_eligible=False, requested_exact_cell=exact_cell)
     report_path = args.output / 'source-admission.json'
     write_json(report_path, report)
     try:
@@ -575,7 +687,13 @@ def main(argv=None) -> int:
                        env={**environment, 'LLAMINAR_FORCE_CPU_ONLY_STARTUP': '0',
                             'LLAMINAR_SKIP_CUDA_STARTUP': '0', 'LLAMINAR_SKIP_ROCM_STARTUP': '0'},
                        check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
-        selected, unavailable = select(records, json.loads(hardware.read_text()))
+        eligible, unavailable = select(records, json.loads(hardware.read_text()))
+        selected = exact_cell_selection(exact_cell, records, eligible, unavailable)
+        if exact_cell is not None:
+            report.update(eligible_cases=eligible,
+                          omitted_eligible_cases=[case for case in eligible if case != exact_cell])
+            print('[qfn-source-admission] diagnostic exact-cell selection; '
+                  'full_selected_gate=false certification_eligible=false', flush=True)
         print(f'[qfn-source-admission] discovered={len(records)} selected={len(selected)} '
               f'hardware_ineligible_unqualified={len(unavailable)}', flush=True)
         report.update(discovered=len(records), selected=len(selected), hardware_ineligible=len(unavailable),

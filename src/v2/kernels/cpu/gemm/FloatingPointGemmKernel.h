@@ -16,6 +16,9 @@
  * Service-measurement execution handles may alias an existing prepared
  * engine's immutable tensor. Each invocation receives participant-owned
  * SwiGLU scratch; shared prepared engines retain no mutable arena binding.
+ * Bounded loading may supply an already-final CPU tensor. That engine retains
+ * its actual storage owner without copying and forbids retiring those live
+ * bytes as if they were a disposable source window.
  *
  * @author David Sanftenberg
  * @date 2025-11-26
@@ -2284,6 +2287,77 @@ namespace llaminar2
         class FloatingPointGemmKernel : public ITensorGemm, public CPUInvocationWorkspaceConsumer
         {
         private:
+            /** @brief Distinguish disposable source bytes from retained execution bytes. */
+            enum class WeightStorageRelation { BorrowedSource, DetachedCopy, RetainedFinal };
+
+            /** @brief Restrict final-storage construction to its validating named factory. */
+            struct FinalCPUStorageTag {};
+
+            /**
+             * @brief Validate an owning CPU matrix before retaining it as final storage.
+             * @param tensor Fully populated FP32, FP16 or BF16 CPU tensor.
+             * @throws std::invalid_argument For absent, borrowed, mapped, released,
+             *         non-CPU, non-matrix or inconsistent physical storage.
+             * @details Source views and mapped GGUF payloads are not final roots.
+             * The tensor's original allocation lease remains its sole authority.
+             */
+            static void validateFinalCPUStorage(const std::shared_ptr<const TensorBase> &tensor)
+            {
+                if (!tensor || !tensor->home_device().is_cpu() ||
+                    tensor->current_device().has_value() || !tensor->isHostAuthoritative() ||
+                    tensor->is_view() || tensor->is_mmap_data() || tensor->isMapped() ||
+                    tensor->transferStorageOwner() != tensor.get() || !tensor->raw_data() ||
+                    tensor->shape().size() != 2u)
+                    throw std::invalid_argument("Final CPU floating weights require a live owning CPU matrix");
+
+                const size_t n = tensor->shape()[0], k = tensor->shape()[1];
+                const size_t max_dimension = static_cast<size_t>(std::numeric_limits<int>::max());
+                if (!n || !k || n > max_dimension || k > max_dimension ||
+                    n > std::numeric_limits<size_t>::max() / k)
+                    throw std::invalid_argument("Final CPU floating weight geometry is invalid");
+
+                size_t element_bytes = 0;
+                const void *native_data = nullptr;
+                if (tensor->native_type() == TensorType::FP32)
+                {
+                    if (const auto *fp32 = dynamic_cast<const FP32Tensor *>(tensor.get()))
+                    { element_bytes = sizeof(float); native_data = fp32->typed_data(); }
+                }
+                else if (tensor->native_type() == TensorType::FP16)
+                {
+                    if (const auto *fp16 = dynamic_cast<const FP16Tensor *>(tensor.get()))
+                    { element_bytes = sizeof(uint16_t); native_data = fp16->typed_data(); }
+                }
+                else if (tensor->native_type() == TensorType::BF16)
+                {
+                    if (const auto *bf16 = dynamic_cast<const BF16Tensor *>(tensor.get()))
+                    { element_bytes = sizeof(uint16_t); native_data = bf16->typed_data(); }
+                }
+                if (!element_bytes || native_data != tensor->raw_data() ||
+                    n * k > std::numeric_limits<size_t>::max() / element_bytes ||
+                    tensor->size_bytes() != n * k * element_bytes)
+                    throw std::invalid_argument("Final CPU floating weight type and storage disagree");
+            }
+
+            /**
+             * @brief Retain the caller's exact final owner without allocating weight storage.
+             * @param weight_tensor Validated final CPU matrix and its original lease.
+             * @param numerical_policy Immutable reduction policy.
+             * @param operand_precision Immutable activation operand policy.
+             */
+            FloatingPointGemmKernel(FinalCPUStorageTag,
+                std::shared_ptr<const TensorBase> weight_tensor,
+                CPUProjectionNumericalPolicy numerical_policy,
+                FloatingActivationOperandPrecision operand_precision)
+                : weight_tensor_lifetime_(std::move(weight_tensor)),
+                  weight_tensor_(weight_tensor_lifetime_.get()),
+                  numerical_policy_(numerical_policy), operand_precision_(operand_precision),
+                  storage_relation_(WeightStorageRelation::RetainedFinal)
+            {
+                validateFinalCPUStorage(weight_tensor_lifetime_);
+                validateBoundWeight();
+            }
+
             /**
              * @brief Copy one expert view into engine-owned execution storage.
              *
@@ -2402,9 +2476,35 @@ namespace llaminar2
                       cloneExpertExecutionStorage(weight_tensor, placement)),
                   weight_tensor_(weight_tensor_lifetime_.get()),
                   numerical_policy_(numerical_policy), operand_precision_(operand_precision),
-                  owned_weight_bytes_(weight_tensor_lifetime_->size_bytes())
+                  owned_weight_bytes_(weight_tensor_lifetime_->size_bytes()),
+                  storage_relation_(WeightStorageRelation::DetachedCopy)
             {
                 validateBoundWeight();
+            }
+
+            /**
+             * @brief Bind one already-admitted final CPU tensor without a second weight root.
+             * @param final_tensor Fully populated owning CPU matrix; views are rejected.
+             * @param numerical_policy Immutable backend-native or GPU-aligned arithmetic.
+             * @param operand_precision Immutable native/FP32/FP16RNE operand identity.
+             * @return Engine retaining the same tensor and original allocation lease.
+             * @throws std::invalid_argument For invalid storage or incompatible policy.
+             * @details This tensor remains live execution storage. Source retirement
+             * must discard only the bounded input window, never these final bytes.
+             */
+            static std::shared_ptr<FloatingPointGemmKernel> fromFinalCPUStorage(
+                std::shared_ptr<const TensorBase> final_tensor,
+                NumericalPolicy numerical_policy = NumericalPolicy::BackendNative,
+                FloatingActivationOperandPrecision operand_precision = FloatingActivationOperandPrecision::Native)
+            {
+                return std::shared_ptr<FloatingPointGemmKernel>(new FloatingPointGemmKernel(
+                    FinalCPUStorageTag{}, std::move(final_tensor), numerical_policy, operand_precision));
+            }
+
+            /** @return Exact retained execution tensor, shared without copying its storage. */
+            const std::shared_ptr<const TensorBase> &retainedFinalWeightTensor() const noexcept
+            {
+                return weight_tensor_lifetime_;
             }
 
             ~FloatingPointGemmKernel() override = default;
@@ -2431,7 +2531,8 @@ namespace llaminar2
                 : weight_tensor_lifetime_(source, source ? source->weight_tensor_ : nullptr),
                   weight_tensor_(weight_tensor_lifetime_.get()),
                   numerical_policy_(source ? source->numerical_policy_ : NumericalPolicy::BackendNative),
-                  operand_precision_(source ? source->operand_precision_ : FloatingActivationOperandPrecision::Native)
+                  operand_precision_(source ? source->operand_precision_ : FloatingActivationOperandPrecision::Native),
+                  storage_relation_(source ? source->storage_relation_ : WeightStorageRelation::BorrowedSource)
             {
                 if (!source || !weight_tensor_)
                     throw std::invalid_argument("CPU floating execution view requires a prepared source");
@@ -2502,13 +2603,13 @@ namespace llaminar2
 
             /**
              * @brief Confirm that expert preparation detached from loader bytes.
-             * @return Always true for the shared expert constructor's owning
-             *         representation; borrowed dense callers never use the raw
-             *         expert-preparation API.
+             * @return True only when preparation copied to independent storage.
+             *         A retained final tensor is still the engine's live input;
+             *         sharing its owner never authorizes destructive retirement.
              */
             bool canReleaseSourceWeightTensor() const override
             {
-                return weight_tensor_lifetime_ != nullptr;
+                return storage_relation_ == WeightStorageRelation::DetachedCopy;
             }
 
             /**
@@ -4744,6 +4845,7 @@ namespace llaminar2
             NumericalPolicy numerical_policy_ = NumericalPolicy::BackendNative;
             const FloatingActivationOperandPrecision operand_precision_ = FloatingActivationOperandPrecision::Native; ///< Sealed prepared operand identity.
             const size_t owned_weight_bytes_ = 0; ///< Zero for non-allocating execution views.
+            const WeightStorageRelation storage_relation_ = WeightStorageRelation::BorrowedSource; ///< Source retirement follows actual storage identity.
         };
 
     } // namespace gemm

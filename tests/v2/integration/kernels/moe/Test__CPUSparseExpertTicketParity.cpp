@@ -10,6 +10,8 @@
  * The endpoint starts with an empty prepared bank. Its metadata declaration is
  * admitted and bound through the production non-graph workspace allocator,
  * then real prepared experts arrive without rebinding or growing that storage.
+ * The fixture authors the same complete packet key as the actual sparse
+ * dispatch producer; workspace views provide storage and never infer identity.
  */
 
 #include "backends/BackendManager.h"
@@ -147,6 +149,17 @@ void runSparseExpertTicketParity(DeviceId device)
             .return_layout = MoEOverlayReturnLayout::CanonicalExpertRoutes});
         auto input = packets.localExpertInput(0, 0);
         auto output = packets.localExpertOutput(0, 0);
+        // Workspace views are passive storage. The original dispatch caller
+        // owns packet identity; the bound canonical ticket must see layer0,
+        // never the default unassigned layer (-1). Keep the original main
+        // decode arithmetic phase while advancing this fixture's exact steps.
+        input.key = {.generation_id = 1, .step_id = 1,
+            .key_namespace = MoEOverlayCollectiveNamespace::Main,
+            .histogram_source = ExpertHistogramSource::DecodeToken,
+            .mtp_depth = -1, .layer_idx = 0, .tier_idx = 0,
+            .domain_id = 0, .participant_id = 1,
+            .direction = MoEOverlayCollectiveDirection::Dispatch, .sequence = 1};
+        ASSERT_TRUE(input.key.isValid());
         // Preserve the authored coherent families and grouped/canonical roots;
         // freeze their exact common layout before any backing is materialized.
         auto arena = std::make_shared<MoELocalExpertSerialBufferArena>(
@@ -167,6 +180,26 @@ void runSparseExpertTicketParity(DeviceId device)
         auto ticket = std::make_shared<MoEOverlayCanonicalRouteReturnTicketStorage>();
         ticket->bindFixedCapacity(0, capacity, width, device, 1,
             arena->mappedCPUCanonicalRoutes(device), metadata);
+        // A real bound ticket still refuses a foreign original packet layer
+        // before touching payload or release-publishing any success. This
+        // producer lease cancels cold; no captured consumer has been launched.
+        {
+            auto publication = ticket->arm(1u);
+            ASSERT_TRUE(publication);
+            auto foreign = input;
+            foreign.residency_epoch = 1u;
+            foreign.key.layer_idx = ticket->layerIndex() + 1;
+            ticket->originalRouteSlotsHost()[0] = -91;
+            ticket->compactRouteSlotsHost()[0] = -92;
+            ticket->contributionRowsHost()[0] = -93.0f;
+            EXPECT_FALSE(publishMoEOverlayCanonicalRouteRows(*ticket, publication,
+                foreign, {}, MoEOverlayCanonicalRouteSourceLayout::compactSlots()));
+            EXPECT_EQ(ticket->originalRouteSlotsHost()[0], -91);
+            EXPECT_EQ(ticket->compactRouteSlotsHost()[0], -92);
+            EXPECT_EQ(ticket->contributionRowsHost()[0], -93.0f);
+            EXPECT_FALSE(ticket->publicationSucceededFor(1u));
+        }
+        EXPECT_FALSE(ticket->payloadReady());
         MoELocalExpertStage::Params params;
         params.device_id = DeviceId::cpu();
         params.input_rows = &input;
@@ -291,6 +324,11 @@ void runSparseExpertTicketParity(DeviceId device)
             const auto [rows, routes] = shapes[replay];
             SCOPED_TRACE("replay=" + std::to_string(replay) +
                          " rows=" + std::to_string(rows) + " routes=" + std::to_string(routes));
+            input.key.step_id = replay + 1u;
+            input.key.sequence = replay + 1u;
+            ASSERT_TRUE(input.key.isValid());
+            ASSERT_EQ(input.key.layer_idx, ticket->layerIndex());
+            ASSERT_EQ(input.key.participant_id, params.runtime_participant_index);
             input.residency_epoch = 2u + replay / 3u;
             input.live_row_count = rows;
             input.live_entry_count = rows * routes;
@@ -373,3 +411,5 @@ TEST(Test__CrossTierExpertArithmeticParity, CPUCanonicalSparseEndpointAllFormats
 }
 #endif
 } // namespace llaminar2::test
+
+#include "CPUJointPaddedPrefillContract.inc"

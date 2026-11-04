@@ -194,15 +194,15 @@ public:
     };
 
     /**
-     * @brief Read the existing public worker request, rejecting implicit or multi-rank work.
+     * @brief Read the original public worker request for single-rank or exact CPU-joint histories.
      * @return Explicit positive worker count from the original lossless configuration.
-     * @throws std::invalid_argument Without one representable single-rank request.
+     * @throws std::invalid_argument Without positive workers and a supported original typed rank population.
      */
     int requestedCPUWorkers() const
     {
         const auto config = deserializeOrchestrationConfig(value_.at("expected_config").dump());
-        accuracy::requireQFN(config.n_threads > 0 && config.mpi_procs == 1,
-                             "Frozen replay requires explicit positive single-rank CPU workers");
+        accuracy::requireQFN(config.n_threads > 0 && (config.mpi_procs == 1 || accuracy::qfnDistributedCPUJointIntent(config)),
+                             "Frozen replay requires explicit positive workers on its original supported rank population");
         return config.n_threads;
     }
 

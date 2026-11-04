@@ -32,6 +32,27 @@
 namespace llaminar2
 {
 
+    std::unique_ptr<Q8_1Tensor> Q8_1Tensor::adoptImmutableCPUStorage(
+        const std::vector<size_t> &shape, AlignedVector<uint8_t> storage, DeviceId device)
+    {
+        auto tensor = std::make_unique<Q8_1Tensor>(shape, std::move(storage), device);
+        // Seal before publication. Activation construction retains its mutable
+        // contract; the final weight factory never exposes that intermediate state.
+        tensor->is_mutable_ = false;
+        return tensor;
+    }
+
+    Q8_1Tensor::Q8_1Tensor(const std::vector<size_t> &shape, const uint8_t *source,
+        size_t byte_size, std::shared_ptr<void> owner)
+        : shape_(shape), is_view_(true), raw_data_ptr_(source), view_byte_offset_(0),
+          parent_(nullptr), device_(DeviceId::cpu()), device_blocks_(nullptr),
+          is_mutable_(false), cache_dirty_(false), source_owner_(std::move(owner))
+    {
+        if (!source || shape.size() != 2 || !shape[0] || !shape[1] ||
+            byte_size != nativeMatrixExtent<Q8_1Block>(shape[0], shape[1]))
+            throw std::invalid_argument("Q8_1 borrowed source requires its exact nonempty native matrix extent");
+    }
+
     Q8_1Tensor::Q8_1Tensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> storage,
         DeviceId device)
         : shape_(shape), is_view_(false), raw_data_(std::move(storage)), raw_data_ptr_(nullptr),
@@ -291,7 +312,9 @@ namespace llaminar2
         {
             root_data_ptr = raw_data_ptr_;
             root_byte_offset = view_byte_offset_ + byte_offset;
-            root_parent = parent_;
+            // A direct borrowed root has no TensorBase parent. Retain that
+            // root itself so a supplied external source owner outlives children.
+            root_parent = parent_ ? parent_ : std::static_pointer_cast<TensorBase>(shared_from_this());
         }
         else
         {

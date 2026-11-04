@@ -13,8 +13,11 @@
  * storage owner; they neither reinterpret a full-parent stride nor requantize.
  */
 
+#include "memory/CPUStorageRoot.h"
+#include "planning/PhysicalMemoryAuthority.h"
 #include "../utils/Logger.h"
 #include "../utils/WeightLoadingProfiler.h"
+#include "../utils/PerfStatsCollector.h"
 #include "../utils/OpenMPUtils.h"
 #include "ModelLoader.h"
 #include "WeightIdentity.h"
@@ -724,27 +727,14 @@ namespace llaminar2
             payload_access_pattern_ = resolveModelPayloadAccessPattern(
                 payload_access_pattern_, inferWeightRole(tensor.name));
 
-        // Memory-map the file for zero-syscall tensor loading.
-        // Pass NUMA node so mmap pages are bound to the correct socket,
-        // avoiding cross-NUMA bandwidth penalties during GEMV decode.
-        // Device staging does not retain host payload pages, so binding that
-        // transient mapping to one socket provides no ownership benefit.
-        // Sparse CPU selection does retain its selected output tensors on the
-        // factory's NUMA node, but the source mapping still stays lazy: mbind
-        // applies to pages that are actually read without first-touching the
-        // unrelated remainder of the GGUF.
-        const bool device_staging =
-            payload_access_pattern_ ==
-            ModelPayloadAccessPattern::DeviceStaging;
-        const bool demand_paged =
-            payload_access_pattern_ !=
-            ModelPayloadAccessPattern::DenseCpuResident;
-        const int mmap_numa_node =
-            device_staging ? -1
-                           : (factory_ ? factory_->getNumaNode() : -1);
-        const MmapRegion::PrefaultPolicy mmap_prefault_policy =
-            demand_paged ? MmapRegion::PrefaultPolicy::DemandPaged
-                         : MmapRegion::PrefaultPolicy::Auto;
+        // Source mappings retain only original address/file provenance. Final
+        // CPU population now has an admitted consumer root and bounded reads;
+        // no socket count, dense role or source access hint may prefault the
+        // complete GGUF before that owner exists. SSD row-table final mappings
+        // are a separate explicit storage policy, not these source views.
+        const bool device_staging = payload_access_pattern_ == ModelPayloadAccessPattern::DeviceStaging;
+        const int mmap_numa_node = device_staging ? -1 : (factory_ ? factory_->getNumaNode() : -1);
+        constexpr auto mmap_prefault_policy = MmapRegion::PrefaultPolicy::DemandPaged;
         if (use_mmap_)
         {
             mmap_region_ = MmapRegion::create(
@@ -1874,14 +1864,135 @@ namespace llaminar2
         return loadTensorExpertSelectionImpl(tensor_name,{},&slice,device,weight_precision);
     }
 
+    /** @copydoc IModelLoader::nativeWeightSourcePlacement */
+    CPUStoragePlacement ModelLoader::nativeWeightSourcePlacement() const
+    {
+        if (!factory_)
+            throw std::logic_error("Native source placement requires its original CPU tensor factory");
+        const int node = factory_->getNumaNode();
+        return node >= 0 ? CPUStoragePlacement::onNode(node) : CPUStoragePlacement::local();
+    }
+
+    /** @copydoc IModelLoader::nativeWeightSourceGeometry */
+    NativeWeightSourceGeometry ModelLoader::nativeWeightSourceGeometry(const std::string &name)
+    {
+        if (auto *source = sealAndSelectTensorSource(name))
+            return source->nativeWeightSourceGeometry(name);
+        const auto *info = loaded_ ? model_.findTensor(name) : nullptr;
+        if (!info || info->dimensions.empty() || !info->getTypeSize())
+            throw std::invalid_argument("Native weight source geometry requires an original tensor: " + name);
+        NativeWeightSourceGeometry result{
+            .original_shape = {},
+            .original_type = ggufToTensorType(info->type),
+            .native_group_elements = std::max(size_t(1), info->getBlockSize()),
+            .native_group_bytes = info->getTypeSize()};
+        for (auto dimension : info->dimensions) {
+            if (!dimension || dimension > std::numeric_limits<size_t>::max())
+                throw std::invalid_argument("Native weight source has an invalid original dimension");
+            result.original_shape.push_back(size_t(dimension));
+        }
+        // The GGUF parser normalizes only rank-two descriptors to runtime
+        // [N,K]. Source windows always retain actual on-disk [K,N] axes.
+        if (result.original_shape.size() == 2)
+            std::swap(result.original_shape[0], result.original_shape[1]);
+        if (result.original_shape.front() % result.native_group_elements)
+            throw std::invalid_argument("Native weight source K extent splits an original encoded group");
+        return result;
+    }
+
+    /** @copydoc IModelLoader::readNativeWeightSourceWindow */
+    void ModelLoader::readNativeWeightSourceWindow(
+        const std::string &name, const NativeWeightSourceWindow &window,
+        std::span<std::byte> destination)
+    {
+        if (auto *source = sealAndSelectTensorSource(name))
+            return source->readNativeWeightSourceWindow(name, window, destination);
+        if (!loaded_)
+            throw std::logic_error("Native source read requires a loaded original directory");
+        const auto *info = model_.findTensor(name);
+        if (!info || info->dimensions.empty())
+            throw std::invalid_argument("Native source read has no original tensor: " + name);
+        const auto multiply = [](size_t a, size_t b) {
+            if (b && a > std::numeric_limits<size_t>::max() / b)
+                throw std::overflow_error("Native source coordinate extent overflows");
+            return a * b;
+        };
+        const size_t columns = info->dimensions.size() == 2 ? info->dimensions[1] : info->dimensions[0];
+        const size_t rows = info->dimensions.size() == 2 ? info->dimensions[0] :
+            info->dimensions.size() > 1 ? info->dimensions[1] : 1;
+        size_t outer = 1;
+        for (size_t axis = 2; axis < info->dimensions.size(); ++axis)
+            outer = multiply(outer, info->dimensions[axis]);
+        const size_t group = std::max(size_t(1), info->getBlockSize());
+        const size_t block_bytes = info->getTypeSize();
+        if (!columns || !rows || !outer || !block_bytes || columns % group ||
+            window.original_expert >= outer || window.first_row > rows ||
+            window.rows > rows - window.first_row || window.first_column > columns ||
+            window.columns > columns - window.first_column ||
+            window.first_column % group || window.columns % group ||
+            window.native_row_bytes != multiply(window.columns / group, block_bytes) ||
+            (!destination.data() || destination.size() != window.nativeBytes()))
+            throw std::invalid_argument("Native source window disagrees with original coordinates/format: " + name);
+        const size_t row_bytes = multiply(columns / group, block_bytes);
+        const size_t outer_bytes = multiply(rows, row_bytes);
+        if (multiply(outer, outer_bytes) != info->size_bytes)
+            throw std::invalid_argument("Native source directory byte extent disagrees with its original format: " + name);
+        const size_t outer_offset = multiply(window.original_expert, outer_bytes);
+        const size_t row_offset = multiply(window.first_row, row_bytes);
+        const size_t column_offset = multiply(window.first_column / group, block_bytes);
+        if (row_offset > std::numeric_limits<size_t>::max() - outer_offset ||
+            column_offset > std::numeric_limits<size_t>::max() - outer_offset - row_offset)
+            throw std::overflow_error("Native source window offset overflows");
+        const size_t source_offset = outer_offset + row_offset + column_offset;
+        // The original filebuf coalesces strided source gaps. Full-K windows are
+        // a single read; narrow K windows never issue a pread/seek for each row.
+        std::lock_guard<std::mutex> lock(file_mutex_);
+        auto *stream = &file_stream_;
+        uint64_t base = model_.data_offset;
+        if (model_.split_count > 1) {
+            if (info->split_idx >= model_.split_count)
+                throw std::invalid_argument("Native source window has a foreign split index");
+            base = model_.split_data_offsets[info->split_idx];
+            if (info->split_idx) stream = &split_streams_[info->split_idx - 1];
+        }
+        if (info->offset > std::numeric_limits<uint64_t>::max() - base ||
+            source_offset > std::numeric_limits<uint64_t>::max() - base - info->offset ||
+            base + info->offset + source_offset > uint64_t(std::numeric_limits<std::streamoff>::max()))
+            throw std::overflow_error("Native source file offset exceeds stream extent");
+        stream->clear();
+        stream->seekg(std::streamoff(base + info->offset + source_offset), std::ios::beg);
+        if (!*stream) throw std::runtime_error("Cannot seek original native weight source: " + name);
+        const auto read = [&](std::byte *out, size_t bytes) {
+            if (bytes > size_t(std::numeric_limits<std::streamsize>::max()) ||
+                !stream->read(reinterpret_cast<char *>(out), std::streamsize(bytes)))
+                throw std::runtime_error("Short/error buffered read of original native weight source: " + name);
+        };
+        const size_t gap = row_bytes - window.native_row_bytes;
+        if (!gap) read(destination.data(), destination.size());
+        else {
+            if (gap > size_t(std::numeric_limits<std::streamsize>::max()))
+                throw std::overflow_error("Native source row gap exceeds stream extent");
+            for (size_t row = 0; row < window.rows; ++row) {
+                read(destination.data() + row * window.native_row_bytes, window.native_row_bytes);
+                if (row + 1 < window.rows) {
+                    stream->ignore(std::streamsize(gap));
+                    if (!*stream || stream->gcount() != std::streamsize(gap))
+                        throw std::runtime_error("Short/error buffered gap in original native weight source: " + name);
+                }
+            }
+        }
+    }
+
     /** @copydoc ModelLoader::loadTensorExpertSelectionImpl */
     std::shared_ptr<TensorBase> ModelLoader::loadTensorExpertSelectionImpl(
         const std::string &tensor_name,const std::vector<size_t> &selection,
         const WeightSliceSpec *projection,DeviceId device,WeightPrecision weight_precision)
     {
         if (auto *source = sealAndSelectTensorSource(tensor_name))
+        {
             return projection ? source->loadTensorExpertProjectionSlice(tensor_name,*projection,device,weight_precision)
                               : source->loadTensorExpertSelection(tensor_name,selection,device,weight_precision);
+        }
 
         if (!loaded_)
             throw std::runtime_error(
@@ -2003,6 +2114,9 @@ namespace llaminar2
         AlignedVector<uint16_t> fp16_storage;
         AlignedVector<uint16_t> bf16_storage;
         uint8_t *packed_destination = nullptr;
+        const auto allocate_native = [&]<typename T>(AlignedVector<T> &storage,size_t count) {
+            storage.resize_uninitialized(count);
+        };
         {
             ScopedWeightLoadDetailTimer timer(
                 "weights.expert_selection.allocate");
@@ -2012,8 +2126,7 @@ namespace llaminar2
                 if (packed_byte_count % sizeof(float) != 0u)
                     throw std::runtime_error(
                         "[ModelLoader] Invalid FP32 expert-selection byte count for " + tensor_name);
-                fp32_storage.resize_uninitialized(
-                    packed_byte_count / sizeof(float));
+                allocate_native(fp32_storage, packed_byte_count / sizeof(float));
                 packed_destination = reinterpret_cast<uint8_t *>(
                     fp32_storage.data());
                 break;
@@ -2021,8 +2134,7 @@ namespace llaminar2
                 if (packed_byte_count % sizeof(uint16_t) != 0u)
                     throw std::runtime_error(
                         "[ModelLoader] Invalid FP16 expert-selection byte count for " + tensor_name);
-                fp16_storage.resize_uninitialized(
-                    packed_byte_count / sizeof(uint16_t));
+                allocate_native(fp16_storage, packed_byte_count / sizeof(uint16_t));
                 packed_destination = reinterpret_cast<uint8_t *>(
                     fp16_storage.data());
                 break;
@@ -2030,8 +2142,7 @@ namespace llaminar2
                 if (packed_byte_count % sizeof(uint16_t) != 0u)
                     throw std::runtime_error(
                         "[ModelLoader] Invalid BF16 expert-selection byte count for " + tensor_name);
-                bf16_storage.resize_uninitialized(
-                    packed_byte_count / sizeof(uint16_t));
+                allocate_native(bf16_storage, packed_byte_count / sizeof(uint16_t));
                 packed_destination = reinterpret_cast<uint8_t *>(
                     bf16_storage.data());
                 break;
@@ -2042,7 +2153,7 @@ namespace llaminar2
                     // The GGUF copy first-touches the exact final tensor pages.
                     // Avoid zeroing tens of gigabytes that are immediately
                     // overwritten, and retain the allocation through packing.
-                    quantized_storage.resize_uninitialized(packed_byte_count);
+                    allocate_native(quantized_storage,packed_byte_count);
                     packed_destination = quantized_storage.data();
                 }
                 else

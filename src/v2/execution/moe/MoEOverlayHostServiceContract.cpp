@@ -27,6 +27,27 @@ MoEOverlayHostServiceContract MoEOverlayHostServiceContract::resolve(const MoERo
 std::vector<MoEExpertOwnerParticipant> MoEOverlayHostServiceContract::admittedExpertParticipants(
     const MoERoutedExpertPlacementPlan& plan, const MoEExpertOwnerMap& owners)
 {
+    // A genuine owner map retains its stronger original ownership validation.
+    // Membership-only callers must not construct these rows to obtain descriptors.
+    for (const auto& owner : owners.owners()) {
+        if (owner.tier_idx<0 || static_cast<std::size_t>(owner.tier_idx)>=plan.routed_tiers.size() ||
+            owner.domain_name!=plan.routed_tiers[static_cast<std::size_t>(owner.tier_idx)].domain)
+            throw std::logic_error("Admitted host service changed original expert tier identity");
+        const auto& tier=plan.routed_tiers[static_cast<std::size_t>(owner.tier_idx)];
+        if (tier.domain!=plan.continuation_domain && !tier.resolved_live_experts_per_layer.empty() &&
+            std::all_of(tier.resolved_live_experts_per_layer.begin(),tier.resolved_live_experts_per_layer.end(),
+                [](auto count){return count==0;}))
+            throw std::logic_error("Admitted zero host tier still owns an expert contribution");
+    }
+    return admittedExpertParticipants(plan,owners.participants());
+}
+std::vector<MoEExpertOwnerParticipant> MoEOverlayHostServiceContract::admittedExpertParticipants(
+    const MoERoutedExpertPlacementPlan& plan,std::span<const MoEExpertOwnerParticipant> participants)
+{
+    const auto canonical=MoEExpertOwnerMap::declaredParticipants(plan,{.reject_tensor_sharded_domains=false});
+    if (participants.size()!=canonical.size() ||
+        !std::equal(participants.begin(),participants.end(),canonical.begin()))
+        throw std::logic_error("Admitted host service requires complete original ordered participant membership");
     std::vector<bool> permanently_empty(plan.routed_tiers.size(), false);
     for (std::size_t tier = 0; tier < plan.routed_tiers.size(); ++tier) {
         const auto& declaration = plan.routed_tiers[tier];
@@ -41,22 +62,16 @@ std::vector<MoEExpertOwnerParticipant> MoEOverlayHostServiceContract::admittedEx
             throw std::logic_error("Admitted empty host tier has no complete frozen layer quota");
         permanently_empty[tier] = true;
     }
-    for (const auto& owner : owners.owners()) {
-        if (owner.tier_idx < 0 || static_cast<std::size_t>(owner.tier_idx) >= permanently_empty.size() ||
-            owner.domain_name != plan.routed_tiers[static_cast<std::size_t>(owner.tier_idx)].domain)
-            throw std::logic_error("Admitted host service changed original expert tier identity");
-        if (permanently_empty[static_cast<std::size_t>(owner.tier_idx)])
+    for (const auto& layer:plan.placements)for (const auto tier:layer.routed_expert_tier) {
+        if (tier<0 || static_cast<std::size_t>(tier)>=permanently_empty.size())
+            throw std::logic_error("Admitted host service has an invalid original expert tier assignment");
+        if (permanently_empty[static_cast<std::size_t>(tier)])
             throw std::logic_error("Admitted zero host tier still owns an expert contribution");
     }
     std::vector<MoEExpertOwnerParticipant> result;
-    result.reserve(owners.participants().size());
-    for (const auto& participant : owners.participants()) {
-        if (participant.tier_idx < 0 || static_cast<std::size_t>(participant.tier_idx) >= permanently_empty.size() ||
-            participant.domain_name != plan.routed_tiers[static_cast<std::size_t>(participant.tier_idx)].domain)
-            throw std::logic_error("Admitted host service changed original participant tier identity");
-        if (!permanently_empty[static_cast<std::size_t>(participant.tier_idx)])
-            result.push_back(participant);
-    }
+    result.reserve(participants.size());
+    for (const auto& participant:participants)
+        if (!permanently_empty[static_cast<std::size_t>(participant.tier_idx)])result.push_back(participant);
     return result;
 }
 MoEOverlayHostServiceContract MoEOverlayHostServiceContract::resolveAdmitted(

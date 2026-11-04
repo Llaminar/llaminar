@@ -1,0 +1,24 @@
+/**
+ * @file CPUExpertShardRouteCompletion.cpp
+ * @brief Exact source/member/invocation checks before CPU joint return publication.
+ */
+#include "CPUExpertShardRouteCompletion.h"
+#include "collective/GlobalTPContext.h"
+#include "CPUExpertShardSourceSelection.h"
+#include "../../collective/IGlobalTPContext.h"
+namespace llaminar2 {
+bool CPUExpertShardRouteCompletion::matches(const MoEOverlayActivationEpochControl &control,
+    const MoEOverlayActivationEpochIdentity &identity,std::uint32_t stage) const noexcept {
+    const auto* native=dynamic_cast<const GlobalTPContext*>(context_.get());
+    if(!native || !prepared_ || !prepared_->source() || prepared_->source()->cpu_joint_source!=source_ ||
+       !native->authenticatesOriginalCPUExpertBorrow(context_) || control_!=&control || identity_!=identity || stage_!=stage || !source_ || !context_ ||
+       context_->isAbortRequested() || identity.digest!=moeOverlayActivationIdentityDigest(identity) ||
+       identity.return_role!=control.channel.return_role || identity.target_participant_id!=source_->participant().participant_id ||
+       identity.target_world_rank!=source_->participant().world_rank ||
+       source_->participantIndex()!=static_cast<size_t>(context_->myIndex()) ||
+       root_<0 || root_>=context_->degree()) return false;
+    const auto expected=source_->participantIndex()==static_cast<size_t>(root_)
+        ?MoEOverlayActivationReturnRole::StaticJointRoot:MoEOverlayActivationReturnRole::StaticJointContributor;
+    return identity.return_role==static_cast<std::uint32_t>(expected);
+}
+} // namespace llaminar2

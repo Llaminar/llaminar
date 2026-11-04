@@ -12,6 +12,8 @@
 #include "loaders/WeightLifecycleTrace.h"
 #include "loaders/WeightMetadataRegistry.h"
 #include "loaders/WeightManager.h"
+#include "loaders/PreparedWeightStore.h"
+#include "../../utils/CPUWeightPlanTestAdmission.h"
 #include "../../mocks/MockModelLoader.h"
 #include "config/TensorParallelConfig.h"
 #include "tensors/Tensors.h"
@@ -221,10 +223,20 @@ TEST(Test__WeightManagerMetadata, RegistersSourceAndDeviceClone)
 
     WeightManager manager(*loader);
 
+    InferenceStrategy strategy;strategy.model_id=ModelContextId{76};strategy.devices={DeviceId::cpu()};
+    WeightPlan sources(strategy);
+    WeightRequirement original;original.canonical_name="blk.0.attn_norm.weight";original.target_device=DeviceId::cpu();
+    sources.add(original);
+    ASSERT_TRUE(manager.preparedWeightStore()->bindModelIdIfUnset(strategy.model_id));
+    admitCPUWeightPlansForTest(manager,*loader,{&sources});
     auto first = manager.getWeightForDevice("blk.0.attn_norm.weight", DeviceId::cpu());
     ASSERT_NE(first, nullptr);
 
-    auto clone = manager.getWeightForDevice("blk.0.attn_norm.weight", DeviceId::cuda(0));
+    // GPU preparation has an independent original source, not an alias of
+    // the committed CPU execution root. Clone lineage names that actual source.
+    auto gpu_source=manager.getWeightForDevice("blk.0.attn_norm.weight",DeviceId::cuda(0));
+    ASSERT_NE(gpu_source,nullptr);
+    auto clone = manager.getWeightForDevice("blk.0.attn_norm.weight", DeviceId::cuda(1));
     ASSERT_NE(clone, nullptr);
     ASSERT_NE(clone.get(), first.get());
 
@@ -232,6 +244,9 @@ TEST(Test__WeightManagerMetadata, RegistersSourceAndDeviceClone)
     ASSERT_NE(registry, nullptr);
 
     auto source_meta = registry->metadata(first.get());
+    auto gpu_source_meta=registry->metadata(gpu_source.get());
+    ASSERT_TRUE(gpu_source_meta);
+    EXPECT_EQ(gpu_source_meta->identity.derivation,WeightDerivationKind::Source);
     auto clone_meta = registry->metadata(clone.get());
     ASSERT_TRUE(source_meta.has_value());
     ASSERT_TRUE(clone_meta.has_value());
@@ -240,8 +255,8 @@ TEST(Test__WeightManagerMetadata, RegistersSourceAndDeviceClone)
     EXPECT_EQ(source_meta->identity.derivation, WeightDerivationKind::Source);
     EXPECT_EQ(clone_meta->identity.derivation, WeightDerivationKind::DeviceClone);
     ASSERT_TRUE(clone_meta->identity.source_instance_id.has_value());
-    EXPECT_EQ(*clone_meta->identity.source_instance_id, source_meta->identity.instance_id);
-    EXPECT_EQ(clone_meta->residency.home_device, DeviceId::cuda(0));
+    EXPECT_EQ(*clone_meta->identity.source_instance_id, gpu_source_meta->identity.instance_id);
+    EXPECT_EQ(clone_meta->residency.home_device, DeviceId::cuda(1));
 }
 
 TEST(Test__WeightManagerMetadata, MaterializeKeepsPlanIdentityAuthoritative)
@@ -251,24 +266,6 @@ TEST(Test__WeightManagerMetadata, MaterializeKeepsPlanIdentityAuthoritative)
                       .build();
 
     WeightManager manager(*loader);
-    auto embedding = manager.getWeightForDevice("token_embd.weight", DeviceId::cpu());
-    ASSERT_NE(embedding, nullptr);
-
-    /*
-     * Simulate stale metadata for a reused TensorBase address.  Materialization
-     * may use metadata for slice and residency details, but the WeightPlan is
-     * the first-class owner of graph binding identity at runner construction.
-     */
-    auto stale_identity = makeSourceWeightIdentity(
-        "blk.31.ffn_down.weight",
-        ModelContextId{99},
-        123);
-    ASSERT_TRUE(manager.weightMetadataRegistry()->registerWeight(
-        embedding.get(),
-        stale_identity,
-        {},
-        WeightResidency{DeviceId::cpu(), DeviceId::cpu()}));
-
     InferenceStrategy strategy;
     strategy.model_id = ModelContextId{77};
     strategy.devices = {DeviceId::cpu()};
@@ -282,6 +279,26 @@ TEST(Test__WeightManagerMetadata, MaterializeKeepsPlanIdentityAuthoritative)
 
     WeightPlan plan(strategy);
     plan.add(requirement);
+    admitCPUWeightPlansForTest(manager,*loader,{&plan});
+    const auto initial=manager.materialize(plan);
+    auto embedding=initial.global("token_embd.weight").tensor;
+    ASSERT_NE(embedding,nullptr);
+
+    /*
+     * Simulate stale metadata for a reused TensorBase address.  Materialization
+     * may use metadata for slice and residency details, but the WeightPlan is
+     * the first-class owner of graph binding identity at runner construction.
+     */
+    auto stale_identity = makeSourceWeightIdentity(
+        "blk.31.ffn_down.weight",
+        ModelContextId{99},
+        123);
+    ASSERT_TRUE(manager.weightMetadataRegistry()->registerWeight(
+        embedding,
+        stale_identity,
+        {},
+        WeightResidency{DeviceId::cpu(), DeviceId::cpu()}));
+
 
     auto frozen = manager.materialize(plan);
     ASSERT_NO_THROW((void)frozen.global("token_embd.weight"));

@@ -62,6 +62,7 @@
 #include "ParityReferenceCache.h"
 #include "ParityPredictorSource.h"
 #include "ProductionParityPrefixRestorePlan.h"
+#include "execution/runner/IOrchestrationRunnerFactory.h"
 #include "utils/NativeVerifierRowEvidence.h"
 
 #include <gtest/gtest.h>
@@ -6337,6 +6338,13 @@ namespace llaminar2::test::parity
         }
 
         /**
+         * @brief Optional original MPI owner used only by fresh production construction.
+         * @return Empty for historical helper behavior; original published context for distributed fixtures.
+         * @note This configuration hook emits no production factory/helper in metadata-only vtables.
+         */
+        virtual std::shared_ptr<IMPIContext> freshParityMPIContext() const { return {}; }
+
+        /**
          * @brief Install exactly one fresh production runner implementation.
          *
          * The two public overloads differ only at the model-authority boundary;
@@ -6381,7 +6389,10 @@ namespace llaminar2::test::parity
             }
             else
             {
-                orch_runner_ = test::TestOrchestrationHelper::create(runner_config);
+                if(const auto original=freshParityMPIContext())
+                    orch_runner_=createOrchestrationRunnerFactory(original)->createFromOrchestrationConfig(runner_config);
+                else
+                    orch_runner_=test::TestOrchestrationHelper::create(runner_config);
             }
             if (!orch_runner_)
             {

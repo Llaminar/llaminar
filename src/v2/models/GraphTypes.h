@@ -68,6 +68,7 @@ namespace llaminar2
     class ResolvedImmutableRowTablePlacement;
     class IKVCache;
     class IMPIContext;
+    class IGlobalTPContext;
     class ITPContext;
     class ILocalTPContext;
     class ILocalPPContext;
@@ -889,6 +890,11 @@ namespace llaminar2
             /** Process-local prepared-engine banks selected by packet epoch. */
             std::shared_ptr<MoEOverlayParticipantResidencyRegistry>
                 expert_overlay_participant_residency = nullptr;
+
+            /** Original CPU expert-domain context, retained through every local
+             * fragment collective and retired explicitly after graph owners.
+             * GPU-only ranks outside that domain carry no context. */
+            std::shared_ptr<IGlobalTPContext> expert_overlay_cpu_joint_context;
 
             /// Optional MPI context dedicated to overlay domain-worker commands.
             /// It is intentionally separate from the graph-builder MPI context so

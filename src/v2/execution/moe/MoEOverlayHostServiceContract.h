@@ -28,6 +28,16 @@ public:
      */
     static std::vector<MoEExpertOwnerParticipant> admittedExpertParticipants(
         const MoERoutedExpertPlacementPlan& plan, const MoEExpertOwnerMap& owners);
+    /**
+     * @brief Project immutable admitted membership without inventing expert ownership.
+     * @param plan Original frozen logical placements and quotas.
+     * @param participants Complete ordered descriptors from declaredParticipants.
+     * @return Exact original descriptors excluding only proven permanently empty external tiers.
+     * @throws std::logic_error For incomplete/foreign membership or zero-tier contradictions.
+     * This metadata projection cannot authorize whole-expert or fragment dispatch.
+     */
+    static std::vector<MoEExpertOwnerParticipant> admittedExpertParticipants(
+        const MoERoutedExpertPlacementPlan& plan,std::span<const MoEExpertOwnerParticipant> participants);
     /** @brief Classify existing physical rank transport from original tier descriptors. */
     static MoEOverlayHostServiceContract resolve(const MoERoutedExpertPlacementPlan&,std::span<const MoEExpertOwnerParticipant>,const IMPIContext&);
     /** @brief Resolve from original immutable physical topology without constructing an MPI context. */

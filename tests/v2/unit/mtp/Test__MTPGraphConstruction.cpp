@@ -4,7 +4,9 @@
  *
  * These tests exercise the production graph builders and CPU implementations
  * to prove MTP policy, verifier, recurrent-state, and prefix-cache contracts
- * without occupying a GPU in the unit gate.
+ * without occupying a GPU in the unit gate. Explicit CUDA/ROCm parameterized
+ * capture cases run only in their dedicated native integration registrations;
+ * they retain the same production bodies and never choose another backend.
  * Bounded telemetry retains exact lifecycle coordinates in sequence words;
  * tests authenticate those words without rebuilding unbounded tag identities.
  */
@@ -1117,8 +1119,10 @@ namespace
         config.cpu_serial_expert_storage = {std::move(admission)};
     }
 
+    /** @brief Original model bank namespace; CPU storage/engine authority is identical in both scopes. */
+    enum class MTPExpertRegistryScope { Global, OverlayDomains };
     /**
-     * @brief Prepare and publish the tiny overlay's real CPU expert engines.
+     * @brief Prepare and publish the tiny original source's real CPU expert engines.
      *
      * Production ExpertOverlay graphs resolve participant-local engines only
      * through the model-owned ExpertGemmRegistry.  This fixture follows that
@@ -1130,11 +1134,13 @@ namespace
      *
      * @param fixture Owner of the tiny source expert matrices.
      * @param store Model-lifetime prepared-weight authority used by the graph.
-     * @return Model context owning the populated registry, or null on failure.
+     * @param scope Actual ordinary global bank or declared overlay domain publication.
+     * @return Model context retaining the actual complete prepared registry, or null on failure.
      */
-    std::shared_ptr<ModelContext> prepareMTPOverlayCPUExpertRegistry(
+    std::shared_ptr<ModelContext> prepareMTPCPUExpertRegistry(
         const DenseMTPGraphFixture &fixture,
-        PreparedWeightStore &store)
+        PreparedWeightStore &store,
+        MTPExpertRegistryScope scope = MTPExpertRegistryScope::OverlayDomains)
     {
         constexpr int source_layer = 64;
         auto model_ctx = ModelContext::createForTesting(
@@ -1190,14 +1196,10 @@ namespace
             // relative evaluation order of function arguments is unspecified,
             // so spelling both operations inside the call could publish null.
             ITensorGemm *const engine = lifetime.get();
-            registry.registerEngineForDomain(
-                domain,
-                DeviceId::cpu(),
-                source_layer,
-                expert,
-                role,
-                engine,
-                std::move(lifetime));
+            if (scope == MTPExpertRegistryScope::Global)
+                registry.registerEngine(DeviceId::cpu(),source_layer,expert,role,engine,std::move(lifetime));
+            else
+                registry.registerEngineForDomain(domain,DeviceId::cpu(),source_layer,expert,role,engine,std::move(lifetime));
             return true;
         };
 
@@ -1229,16 +1231,6 @@ namespace
                 max_tokens = std::max(max_tokens, layer.cached_tokens);
         }
         return max_tokens;
-    }
-
-    std::optional<DeviceId> firstAvailableGraphCaptureGPU()
-    {
-        auto &pool = GPUDeviceContextPool::instance();
-        if (pool.hasAMDSupport())
-            return DeviceId::rocm(0);
-        if (pool.hasNvidiaSupport())
-            return DeviceId::cuda(0);
-        return std::nullopt;
     }
 
     MoERebalanceController::Config makeTinyRebalanceConfig()
@@ -4775,8 +4767,11 @@ TEST(Test__MTPGraphConstruction, BuildsQwen35MoESidecarGraphWithMoEOutputs)
     graph_builder.setWeights(toLegacyModelWeights(bindings));
 
     PreparedWeightStore store;
-    prepareFrozenGemmWeightsForCPU(*frozen, store);
+    prepareFrozenGemmWeightsForCPU(*frozen, store, PhysicalMemoryOwner::RoutedExpertWeights);
     graph_builder.setPreparedWeightStore(&store);
+    auto model_ctx=prepareMTPCPUExpertRegistry(fixture,store,MTPExpertRegistryScope::Global);
+    ASSERT_NE(model_ctx,nullptr);
+    graph_builder.setModelContext(model_ctx);
 
     auto input = fixture.input();
     auto output = fixture.output();
@@ -4871,7 +4866,7 @@ TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarFromRegistryWithoutRawEx
     PreparedWeightStore store;
     prepareFrozenGemmWeightsForCPU(*frozen, store, PhysicalMemoryOwner::RoutedExpertWeights, &fixture.config);
     graph_builder.setPreparedWeightStore(&store);
-    auto model_ctx = prepareMTPOverlayCPUExpertRegistry(fixture, store);
+    auto model_ctx = prepareMTPCPUExpertRegistry(fixture, store);
     ASSERT_NE(model_ctx, nullptr);
     graph_builder.setModelContext(model_ctx);
 
@@ -4934,7 +4929,7 @@ TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarWithMTPCollectiveNamespa
     PreparedWeightStore store;
     prepareFrozenGemmWeightsForCPU(*frozen, store, PhysicalMemoryOwner::RoutedExpertWeights, &fixture.config);
     graph_builder.setPreparedWeightStore(&store);
-    auto model_ctx = prepareMTPOverlayCPUExpertRegistry(fixture, store);
+    auto model_ctx = prepareMTPCPUExpertRegistry(fixture, store);
     ASSERT_NE(model_ctx, nullptr);
     graph_builder.setModelContext(model_ctx);
 
@@ -5063,8 +5058,11 @@ TEST(Test__MTPGraphConstruction, MoESidecarExecutionAppendsRealKVPayload)
     graph_builder.setWeights(toLegacyModelWeights(bindings));
 
     PreparedWeightStore store;
-    prepareFrozenGemmWeightsForCPU(*frozen, store);
+    prepareFrozenGemmWeightsForCPU(*frozen, store, PhysicalMemoryOwner::RoutedExpertWeights);
     graph_builder.setPreparedWeightStore(&store);
+    auto model_ctx=prepareMTPCPUExpertRegistry(fixture,store,MTPExpertRegistryScope::Global);
+    ASSERT_NE(model_ctx,nullptr);
+    graph_builder.setModelContext(model_ctx);
 
     auto input = fixture.input();
     auto output = fixture.output();
@@ -5103,7 +5101,7 @@ TEST(Test__MTPGraphConstruction, OverlayMoESidecarExecutionAppendsRealKVPayload)
     PreparedWeightStore store;
     prepareFrozenGemmWeightsForCPU(*frozen, store, PhysicalMemoryOwner::RoutedExpertWeights, &fixture.config);
     graph_builder.setPreparedWeightStore(&store);
-    auto model_ctx = prepareMTPOverlayCPUExpertRegistry(fixture, store);
+    auto model_ctx = prepareMTPCPUExpertRegistry(fixture, store);
     ASSERT_NE(model_ctx, nullptr);
     graph_builder.setModelContext(model_ctx);
 
@@ -5816,8 +5814,11 @@ TEST(Test__MTPGraphConstruction, MoESidecarGraphCacheMissesWhenMoEPlacementEpoch
     ASSERT_NE(orchestrator.frozenWeightSet(), nullptr);
 
     PreparedWeightStore store;
-    prepareFrozenGemmWeightsForCPU(*orchestrator.frozenWeightSet(), store);
+    prepareFrozenGemmWeightsForCPU(*orchestrator.frozenWeightSet(), store, PhysicalMemoryOwner::RoutedExpertWeights);
     graph_builder->setPreparedWeightStore(&store);
+    auto model_ctx=prepareMTPCPUExpertRegistry(fixture,store,MTPExpertRegistryScope::Global);
+    ASSERT_NE(model_ctx,nullptr);
+    graph_builder->setModelContext(model_ctx);
 
     auto rebalance_config = makeTinyRebalanceConfig();
     rebalance_config.num_experts = fixture.config.moe.num_experts;
@@ -5901,13 +5902,48 @@ TEST(Test__MTPGraphConstruction, MoESidecarGraphCacheMissesWhenMoEPlacementEpoch
     PerfStatsCollector::reset();
 }
 
-TEST(Test__MTPGraphConstruction, GPUSidecarGraphCacheMaterializesAndUsesFullGraphFromFirstInvocation)
+#include "MTPNativeFixtureAdmission.inc"
+
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
+/**
+ * @brief Resolve native single-participant dimensions before schema/planner construction.
+ * @param config Original model dimensions and authored request capacity.
+ * @param device Exact backend selected by the native registration.
+ *
+ * Mirrors the production factory full-dimension projection, including positive
+ * original vocabulary strides for both canonical logits banks. Source tensors
+ * and the shared CPU fixture remain unchanged.
+ */
+static void configureNativeMTPGraph(GraphConfig &config, DeviceId device)
+{
+    config.default_device = device;
+    config.head_start = 0;
+    config.local_n_heads = config.n_heads;
+    config.local_n_kv_heads = config.n_kv_heads;
+    config.qkv_column_parallel = false;
+    config.local_rank = 0;
+    config.d_ff_local = config.d_ff;
+    config.ffn_column_parallel = false;
+    config.vocab_local = config.vocab_size;
+    config.lm_head_column_parallel = false;
+    config.mtp_request_terminal_hidden_publication = MTPRequestTerminalHiddenPublicationPolicy::GraphCapturedDeviceGeometry;
+    config.mtp_shifted_prefill_hidden_publication = MTPShiftedPrefillHiddenPublicationPolicy::GraphIntegratedKVTransaction;
+    config.mtp_verifier_outcome_ownership = MTPVerifierOutcomeOwnershipPolicy::ParticipantLocal;
+}
+
+/** @brief Explicit native backend ownership; these cases never enter device-free Unit. */
+class MTPNativeGraphConstruction : public ::testing::TestWithParam<DeviceId> {};
+#endif
+
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
+TEST_P(MTPNativeGraphConstruction, GPUSidecarGraphCacheMaterializesAndUsesFullGraphFromFirstInvocation)
 {
     DeviceManager::instance().initialize(-1, false);
 
-    const auto device = firstAvailableGraphCaptureGPU();
-    if (!device.has_value())
-        GTEST_SKIP() << "No GPU backend available for MTP sidecar graph-capture regression";
+    const DeviceId device = GetParam();
+    auto *const backend = getBackendFor(device);
+    ASSERT_NE(backend,nullptr) << "Selected native backend is unavailable";
+    ASSERT_GT(backend->deviceCount(),device.ordinal) << "Selected native endpoint is absent";
 
     ScopedDebugEnv env({
         {"LLAMINAR_GPU_GRAPHS", "1"},
@@ -5915,55 +5951,72 @@ TEST(Test__MTPGraphConstruction, GPUSidecarGraphCacheMaterializesAndUsesFullGrap
     });
     PerfStatsCollector::reset();
 
-    TinyQwen35MTPForwardFixture fixture;
-    fixture.config.default_device = *device;
+    auto source_owner=std::make_shared<TinyQwen35MTPForwardFixture>();
+    auto &fixture=*source_owner;
+    configureNativeMTPGraph(fixture.config, device);
 
     auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    const auto original_sources=makeTinyQwen35MTPFrozenWeightSet(fixture,device);
+    NativeMTPFixtureAdmission admission(graph_builder,fixture.mpi,*original_sources,source_owner,1);
+    auto orchestrator_owner=std::make_unique<DeviceGraphOrchestrator>(admission.dependencies());
+    auto &orchestrator=*orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/1,
         fixture.config.max_seq_len,
-        *device));
+        device));
 
-    auto hidden = orchestrator.inferenceState().hidden;
-    ASSERT_NE(hidden, nullptr);
-    float *terminal_hidden = hidden->mutable_data();
-    ASSERT_NE(terminal_hidden, nullptr);
-    for (int i = 0; i < fixture.config.d_model; ++i)
-        terminal_hidden[i] = 0.01f * static_cast<float>((i % 23) + 1);
-    TransferEngine::publishHostWrite(hidden);
+    admission.prepare();
+    orchestrator.setFrozenWeightSet(admission.takeWeights());
+    ASSERT_NE(orchestrator.frozenWeightSet(),nullptr);
+    // Match factory setup: publish the full stable workspace generation before
+    // graph-integrated terminal-hidden/shifted-KV bindings become executable.
+    ASSERT_TRUE(orchestrator.materializeForwardGraphForShape(1,1));
+    ASSERT_GT(static_cast<const IForwardExecutionHost &>(orchestrator).workspaceGeneration(device),0u);
+    // Actual main execution owns terminal-hidden freshness; a host tensor write cannot publish it.
+    const int bootstrap_token=1;
+    ASSERT_NE(orchestrator.forward(&bootstrap_token,1,1),nullptr);
 
-    auto frozen = makeTinyQwen35MTPFrozenWeightSet(fixture, *device);
-    orchestrator.setFrozenWeightSet(std::move(frozen));
-    ASSERT_NE(orchestrator.frozenWeightSet(), nullptr);
-
-    PreparedWeightStore store;
-    prepareFrozenGemmWeightsForDevice(*orchestrator.frozenWeightSet(), store, *device);
-    graph_builder->setPreparedWeightStore(&store);
-
+    // GPU execution must reject host condition-token entrypoints rather than
+    // silently staging them or synchronizing a sidecar transaction on the host.
+    EXPECT_FALSE(orchestrator.forwardMTP(3));
+    EXPECT_FALSE(orchestrator.forwardMTPForDeviceSampling(3));
+    ASSERT_TRUE(orchestrator.supportsMTPDeviceDraftTokenInput());
+    SamplingParams sampling;
+    sampling.temperature = 1.0f;
+    sampling.top_k = 4;
+    sampling.top_p = 1.0f;
     for (int step = 0; step < 4; ++step)
     {
-        ASSERT_TRUE(orchestrator.forwardMTP(/*draft_condition_token=*/3 + step))
-            << "MTP sidecar failed at step " << step;
+        ASSERT_TRUE(orchestrator.buildStochasticDistributionOnDevice(
+            DeviceLogitsSource::Main, 0, DeviceDistributionBuffer::Target, 0,
+            sampling, fixture.config.vocab_size));
+        ASSERT_TRUE(orchestrator.sampleStochasticDistributionOnDeviceDeferred(
+            DeviceDistributionBuffer::Target, 0, 0.25f));
+        ASSERT_TRUE(orchestrator.forwardMTPFromDeviceTargetAtLivePositionForDeviceSampling(0))
+            << "device-token sidecar failed at step " << step;
+        // Each independent replay ends at the event-aware diagnostic bridge.
+        // This also retires target-slot reads before the next sample overwrites
+        // that slot. The obsolete host drain must remain rejected.
+        if (step == 0)
+            EXPECT_FALSE(orchestrator.flushPendingMTPWork());
+        const float *logits = orchestrator.mtpLogits();
+        ASSERT_NE(logits, nullptr);
+        float abs_sum = 0.0f;
+        for (int i = 0; i < fixture.config.vocab_size; ++i)
+        {
+            ASSERT_TRUE(std::isfinite(logits[i])) << "non-finite MTP logit at " << i;
+            abs_sum += std::abs(logits[i]);
+        }
+        EXPECT_GT(abs_sum, 0.0f);
     }
-
-    const float *logits = orchestrator.mtpLogits();
-    ASSERT_NE(logits, nullptr);
-    float abs_sum = 0.0f;
-    for (int i = 0; i < fixture.config.vocab_size; ++i)
-    {
-        ASSERT_TRUE(std::isfinite(logits[i])) << "non-finite MTP logit at " << i;
-        abs_sum += std::abs(logits[i]);
-    }
-    EXPECT_GT(abs_sum, 0.0f);
 
     const auto records = PerfStatsCollector::snapshot({"mtp"});
     const auto full_graph_tags = PerfStatsCollector::Tags{
-        {"context", "mtp_decode_sidecar"},
+        {"context", "mtp_decode_sidecar_device_target_token_live_position"},
         {"depth", "0"},
-        {"device_tokens", "false"},
-        {"graph_context", "mtp_decode_sidecar"},
+        {"device_tokens", "true"},
+        {"graph_context", "mtp_decode_sidecar_device_target_token_live_position"},
         {"kv_cache_only", "false"},
         {"path", "full_graph"},
         {"seq_len", "1"}};
@@ -5980,11 +6033,12 @@ TEST(Test__MTPGraphConstruction, GPUSidecarGraphCacheMaterializesAndUsesFullGrap
         {"allow_graph_replay", "true"},
         {"heterogeneous_segmented", "false"},
         {"collectives_graph_capturable", "false"},
-        {"context", "mtp_decode_sidecar"},
-        {"defer_final_sync", "false"},
+        {"context", "mtp_decode_sidecar_device_target_token_live_position"},
+        {"defer_final_sync", "true"},
         {"force_recapture", "false"},
         {"has_collectives", "false"},
-        {"invocation_context", "mtp_decode_sidecar"},
+        {"invocation_context", "mtp_decode_sidecar_device_target_token_live_position"},
+        {"replay_plan_policy", "require_full_graph"},
         {"seq_len", "1"}};
     const PerfStatRecord *policy_record = findMTPRecord(
         records,
@@ -5993,17 +6047,39 @@ TEST(Test__MTPGraphConstruction, GPUSidecarGraphCacheMaterializesAndUsesFullGrap
         policy_tags);
     ASSERT_NE(policy_record, nullptr);
     EXPECT_GE(policy_record->value, 3.0);
+    const auto cache_tags = PerfStatsCollector::Tags{
+        {"context", "mtp_decode_sidecar_device_target_token_live_position"},
+        {"depth", "0"}, {"device_tokens", "true"}, {"device_positions", "true"},
+        {"kv_cache_only", "false"}, {"moe_placement_epoch", "0"}, {"seq_len", "1"}};
+    const auto *misses = findMTPRecord(records, PerfStatRecord::Kind::Counter,
+        "sidecar_graph_cache_misses", cache_tags);
+    const auto *hits = findMTPRecord(records, PerfStatRecord::Kind::Counter,
+        "sidecar_graph_cache_hits", cache_tags);
+    ASSERT_NE(misses, nullptr);
+    ASSERT_NE(hits, nullptr);
+    EXPECT_DOUBLE_EQ(misses->value, 1.0);
+    EXPECT_DOUBLE_EQ(hits->value, 3.0);
+    const auto *observations = findMTPRecordContaining(
+        records, PerfStatRecord::Kind::Counter,
+        "pending_logits_stream_observation_waits",
+        {{"role", "mtp_sidecar"}, {"consumer", "mtpLogits"}});
+    ASSERT_NE(observations, nullptr);
+    EXPECT_DOUBLE_EQ(observations->value, 4.0);
 
     PerfStatsCollector::reset();
 }
+#endif
 
-TEST(Test__MTPGraphConstruction, GPUDeviceTokenFirstSidecarCacheIsIndependentFromHostTokenCache)
+
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
+TEST_P(MTPNativeGraphConstruction, GPUDeviceTargetAndDraftSidecarCachesAreIndependent)
 {
     DeviceManager::instance().initialize(-1, false);
 
-    const auto device = firstAvailableGraphCaptureGPU();
-    if (!device.has_value())
-        GTEST_SKIP() << "No GPU backend available for device-token MTP sidecar cache regression";
+    const DeviceId device = GetParam();
+    auto *const backend = getBackendFor(device);
+    ASSERT_NE(backend,nullptr) << "Selected native backend is unavailable";
+    ASSERT_GT(backend->deviceCount(),device.ordinal) << "Selected native endpoint is absent";
 
     ScopedDebugEnv env({
         {"LLAMINAR_GPU_GRAPHS", "1"},
@@ -6011,32 +6087,31 @@ TEST(Test__MTPGraphConstruction, GPUDeviceTokenFirstSidecarCacheIsIndependentFro
     });
     PerfStatsCollector::reset();
 
-    TinyQwen35MTPForwardFixture fixture;
-    fixture.config.default_device = *device;
+    auto source_owner=std::make_shared<TinyQwen35MTPForwardFixture>();
+    auto &fixture=*source_owner;
+    configureNativeMTPGraph(fixture.config, device);
 
     auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    const auto original_sources=makeTinyQwen35MTPFrozenWeightSet(fixture,device);
+    NativeMTPFixtureAdmission admission(graph_builder,fixture.mpi,*original_sources,source_owner,1);
+    auto orchestrator_owner=std::make_unique<DeviceGraphOrchestrator>(admission.dependencies());
+    auto &orchestrator=*orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/1,
         fixture.config.max_seq_len,
-        *device));
+        device));
 
-    auto hidden = orchestrator.inferenceState().hidden;
-    ASSERT_NE(hidden, nullptr);
-    float *terminal_hidden = hidden->mutable_data();
-    ASSERT_NE(terminal_hidden, nullptr);
-    for (int i = 0; i < fixture.config.d_model; ++i)
-        terminal_hidden[i] = 0.01f * static_cast<float>((i % 29) + 1);
-    TransferEngine::publishHostWrite(hidden);
-
-    auto frozen = makeTinyQwen35MTPFrozenWeightSet(fixture, *device);
-    orchestrator.setFrozenWeightSet(std::move(frozen));
-    ASSERT_NE(orchestrator.frozenWeightSet(), nullptr);
-
-    PreparedWeightStore store;
-    prepareFrozenGemmWeightsForDevice(*orchestrator.frozenWeightSet(), store, *device);
-    graph_builder->setPreparedWeightStore(&store);
+    admission.prepare();
+    orchestrator.setFrozenWeightSet(admission.takeWeights());
+    ASSERT_NE(orchestrator.frozenWeightSet(),nullptr);
+    // Match factory setup: publish the full stable workspace generation before
+    // graph-integrated terminal-hidden/shifted-KV bindings become executable.
+    ASSERT_TRUE(orchestrator.materializeForwardGraphForShape(1,1));
+    ASSERT_GT(static_cast<const IForwardExecutionHost &>(orchestrator).workspaceGeneration(device),0u);
+    // Actual main execution owns terminal-hidden freshness; a host tensor write cannot publish it.
+    const int bootstrap_token=1;
+    ASSERT_NE(orchestrator.forward(&bootstrap_token,1,1),nullptr);
     ASSERT_TRUE(orchestrator.supportsDeviceStochasticMTPVerification());
 
     SamplingParams sampling;
@@ -6044,26 +6119,31 @@ TEST(Test__MTPGraphConstruction, GPUDeviceTokenFirstSidecarCacheIsIndependentFro
     sampling.top_k = 4;
     sampling.top_p = 1.0f;
 
+    EXPECT_FALSE(orchestrator.forwardMTPForDeviceSampling(3));
+    ASSERT_TRUE(orchestrator.supportsMTPDeviceDraftTokenInput());
     for (int step = 0; step < 4; ++step)
     {
-        ASSERT_TRUE(orchestrator.forwardMTPForDeviceSampling(/*draft_condition_token=*/3 + step))
-            << "host-token first sidecar failed at step " << step;
         ASSERT_TRUE(orchestrator.buildStochasticDistributionOnDevice(
-            DeviceLogitsSource::MTP,
-            /*row=*/0,
-            DeviceDistributionBuffer::Target,
-            /*slot=*/0,
-            sampling,
-            fixture.config.vocab_size));
+            DeviceLogitsSource::Main, 0, DeviceDistributionBuffer::Target, 0,
+            sampling, fixture.config.vocab_size));
         ASSERT_TRUE(orchestrator.sampleStochasticDistributionOnDeviceDeferred(
-            DeviceDistributionBuffer::Target,
-            /*slot=*/0,
-            /*threshold=*/0.25f));
-        ASSERT_TRUE(
-            orchestrator.forwardMTPFromDeviceTargetAtLivePositionForDeviceSampling(
-                /*target_sample_slot=*/0))
-            << "device-token first sidecar failed at step " << step;
-        ASSERT_TRUE(orchestrator.flushPendingMTPWork());
+            DeviceDistributionBuffer::Target, 0, 0.25f));
+        ASSERT_TRUE(orchestrator.forwardMTPFromDeviceTargetAtLivePositionForDeviceSampling(0));
+        // The draft token/event and MTP_HIDDEN are genuine outputs of the first
+        // sidecar. The chained cache binds those owners, not a host token bank.
+        ASSERT_TRUE(orchestrator.buildStochasticDistributionOnDevice(
+            DeviceLogitsSource::MTP, 0, DeviceDistributionBuffer::Draft, 0,
+            sampling, fixture.config.vocab_size));
+        ASSERT_TRUE(orchestrator.sampleStochasticDistributionOnDeviceDeferred(
+            DeviceDistributionBuffer::Draft, 0, 0.5f));
+        ASSERT_TRUE(orchestrator.forwardMTPFromDeviceDraftAtLivePositionForDeviceSampling(0, 1));
+        // Each pair is an independently observed cache replay. Read its final
+        // output through the event-aware diagnostic bridge before starting the
+        // next pair; never drain a producer or reuse its arenas concurrently.
+        const float *logits = orchestrator.mtpLogits();
+        ASSERT_NE(logits, nullptr);
+        for (int i = 0; i < fixture.config.vocab_size; ++i)
+            ASSERT_TRUE(std::isfinite(logits[i])) << "non-finite MTP logit at " << i;
     }
 
     const auto records = PerfStatsCollector::snapshot({"mtp"});
@@ -6084,55 +6164,72 @@ TEST(Test__MTPGraphConstruction, GPUDeviceTokenFirstSidecarCacheIsIndependentFro
             {"context", context},
             {"depth", "0"},
             {"device_tokens", device_tokens},
+            {"device_positions", device_tokens},
             {"kv_cache_only", "false"},
             {"moe_placement_epoch", "0"},
             {"seq_len", "1"}};
     };
 
-    const auto host_full_graph_tags = capture_tags("mtp_decode_sidecar", "false", "full_graph");
-    const auto device_full_graph_tags = capture_tags(
-        "mtp_decode_sidecar_device_target_token_live_position",
+    const auto target_full_graph_tags = capture_tags("mtp_decode_sidecar_device_target_token_live_position", "true", "full_graph");
+    const auto draft_full_graph_tags = capture_tags(
+        "mtp_decode_sidecar_chain_device_token_live_position",
         "true",
         "full_graph");
 
-    const PerfStatRecord *host_full_graph = findMTPRecord(
-        records, PerfStatRecord::Kind::Counter, "sidecar_graph_capture_path", host_full_graph_tags);
-    ASSERT_NE(host_full_graph, nullptr);
-    EXPECT_GE(host_full_graph->value, 4.0);
+    const PerfStatRecord *target_full_graph = findMTPRecord(
+        records, PerfStatRecord::Kind::Counter, "sidecar_graph_capture_path", target_full_graph_tags);
+    ASSERT_NE(target_full_graph, nullptr);
+    EXPECT_GE(target_full_graph->value, 4.0);
 
-    const PerfStatRecord *device_full_graph = findMTPRecord(
-        records, PerfStatRecord::Kind::Counter, "sidecar_graph_capture_path", device_full_graph_tags);
-    ASSERT_NE(device_full_graph, nullptr);
-    EXPECT_GE(device_full_graph->value, 4.0);
+    const PerfStatRecord *draft_full_graph = findMTPRecord(
+        records, PerfStatRecord::Kind::Counter, "sidecar_graph_capture_path", draft_full_graph_tags);
+    ASSERT_NE(draft_full_graph, nullptr);
+    EXPECT_GE(draft_full_graph->value, 4.0);
 
-    const PerfStatRecord *host_misses = findMTPRecord(
+    const PerfStatRecord *target_misses = findMTPRecord(
         records,
         PerfStatRecord::Kind::Counter,
         "sidecar_graph_cache_misses",
-        cache_tags("mtp_decode_sidecar", "false"));
-    ASSERT_NE(host_misses, nullptr);
-    EXPECT_DOUBLE_EQ(host_misses->value, 1.0);
+        cache_tags("mtp_decode_sidecar_device_target_token_live_position", "true"));
+    ASSERT_NE(target_misses, nullptr);
+    EXPECT_DOUBLE_EQ(target_misses->value, 1.0);
 
-    const PerfStatRecord *device_misses = findMTPRecord(
+    const PerfStatRecord *draft_misses = findMTPRecord(
         records,
         PerfStatRecord::Kind::Counter,
         "sidecar_graph_cache_misses",
         cache_tags(
-            "mtp_decode_sidecar_device_target_token_live_position",
+            "mtp_decode_sidecar_chain_device_token_live_position",
             "true"));
-    ASSERT_NE(device_misses, nullptr);
-    EXPECT_DOUBLE_EQ(device_misses->value, 1.0);
+    ASSERT_NE(draft_misses, nullptr);
+    EXPECT_DOUBLE_EQ(draft_misses->value, 1.0);
+
+    const auto *draft_handoffs = findMTPRecord(
+        records, PerfStatRecord::Kind::Counter,
+        "stochastic_mtp_distribution_stream_handoffs", {{"slot", "0"}});
+    ASSERT_NE(draft_handoffs, nullptr);
+    EXPECT_DOUBLE_EQ(draft_handoffs->value, 4.0);
+    const auto *observations = findMTPRecordContaining(
+        records, PerfStatRecord::Kind::Counter,
+        "pending_logits_stream_observation_waits",
+        {{"role", "mtp_sidecar"}, {"consumer", "mtpLogits"}});
+    ASSERT_NE(observations, nullptr);
+    EXPECT_DOUBLE_EQ(observations->value, 4.0);
 
     PerfStatsCollector::reset();
 }
+#endif
 
-TEST(Test__MTPGraphConstruction, GPUShiftedPrefillSidecarPolicyUsesShiftedPrefillContext)
+
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
+TEST_P(MTPNativeGraphConstruction, GPUShiftedPrefillSidecarPolicyUsesShiftedPrefillContext)
 {
     DeviceManager::instance().initialize(-1, false);
 
-    const auto device = firstAvailableGraphCaptureGPU();
-    if (!device.has_value())
-        GTEST_SKIP() << "No GPU backend available for MTP shifted-prefill context regression";
+    const DeviceId device = GetParam();
+    auto *const backend = getBackendFor(device);
+    ASSERT_NE(backend,nullptr) << "Selected native backend is unavailable";
+    ASSERT_GT(backend->deviceCount(),device.ordinal) << "Selected native endpoint is absent";
 
     ScopedDebugEnv env({
         {"LLAMINAR_GPU_GRAPHS", "1"},
@@ -6140,58 +6237,78 @@ TEST(Test__MTPGraphConstruction, GPUShiftedPrefillSidecarPolicyUsesShiftedPrefil
     });
     PerfStatsCollector::reset();
 
-    TinyQwen35MTPForwardFixture fixture;
-    fixture.config.default_device = *device;
+    auto source_owner=std::make_shared<TinyQwen35MTPForwardFixture>();
+    auto &fixture=*source_owner;
+    configureNativeMTPGraph(fixture.config, device);
+    fixture.config.max_seq_len = 16;
+    // This component admits integrated shifted-prefill and retained serving
+    // graphs. Prefix-cache storage/lifecycle is covered by its native suites;
+    // it is not part of this fixture's original memory declaration.
+    fixture.config.prefix_cache.enabled = false;
 
     auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    const auto original_sources=makeTinyQwen35MTPFrozenWeightSet(fixture,device);
+    NativeMTPFixtureAdmission admission(graph_builder,fixture.mpi,*original_sources,source_owner,1);
+    auto orchestrator_owner=std::make_unique<DeviceGraphOrchestrator>(admission.dependencies());
+    auto &orchestrator=*orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/1,
         fixture.config.max_seq_len,
-        *device));
+        device));
 
-    auto frozen = makeTinyQwen35MTPFrozenWeightSet(fixture, *device);
-    orchestrator.setFrozenWeightSet(std::move(frozen));
-    ASSERT_NE(orchestrator.frozenWeightSet(), nullptr);
+    admission.prepare();
+    orchestrator.setFrozenWeightSet(admission.takeWeights());
+    ASSERT_NE(orchestrator.frozenWeightSet(),nullptr);
+    // Match factory setup: publish the full stable workspace generation before
+    // graph-integrated terminal-hidden/shifted-KV bindings become executable.
+    ASSERT_TRUE(orchestrator.materializeForwardGraphForShape(1,1));
+    ASSERT_GT(static_cast<const IForwardExecutionHost &>(orchestrator).workspaceGeneration(device),0u);
 
-    PreparedWeightStore store;
-    prepareFrozenGemmWeightsForDevice(*orchestrator.frozenWeightSet(), store, *device);
-    graph_builder->setPreparedWeightStore(&store);
-
+    // The serving setup owner retains the admitted prefill executables without
+    // submitting model work. A bare forward call is the lower-level cold path
+    // and cannot certify the serving family's first-request capture contract.
+    ASSERT_TRUE(orchestrator.materializeServingGraphFamilyWithoutLaunch({
+        .prefill_bucket_rows = prefillGraphBucketSizes(fixture.config.max_seq_len),
+        .prefill_pad_token_id = 0,
+        .main_decode_graph = ServingMainDecodeGraphKind::HistoryBearingSerial,
+    }));
     const std::vector<int> prefix_tokens = {1, 2, 3, 4, 5, 6, 7, 8, 9};
     ASSERT_NE(orchestrator.forward(prefix_tokens.data(), static_cast<int>(prefix_tokens.size()), 1), nullptr);
 
-    const auto records = PerfStatsCollector::snapshot({"mtp"});
-    const auto policy_tags = PerfStatsCollector::Tags{
-        {"allow_graph_replay", "true"},
-        {"heterogeneous_segmented", "false"},
-        {"collectives_graph_capturable", "false"},
-        {"context", "mtp_shifted_prefill"},
-        {"defer_final_sync", "false"},
-        {"force_recapture", "false"},
-        {"has_collectives", "false"},
-        {"invocation_context", "mtp_shifted_prefill"},
-        {"seq_len", "4"}};
-    const PerfStatRecord *policy_record = findMTPRecord(
-        records,
-        PerfStatRecord::Kind::Counter,
-        "sidecar_decode_capture_policy",
-        policy_tags);
-    ASSERT_NE(policy_record, nullptr);
-    EXPECT_GE(policy_record->value, 1.0);
+    // Observe completed device-owned counts only through the explicit diagnostic
+    // boundary; ordinary host cache mirrors do not prove captured append progress.
+    PrefixProbeCapturePolicy probe_policy;
+    probe_policy.capture_device_logical_state = true;
+    const auto completed = orchestrator.prefixStateProbe(probe_policy);
+    EXPECT_EQ(maxCachedTokens(completed.kv_caches), 9);
+    EXPECT_EQ(maxCachedTokens(completed.mtp_kv_caches), 8);
+    const auto &terminal = orchestrator.inferenceState().mtp_terminal_hidden_publication;
+    EXPECT_TRUE(terminal.current());
+    EXPECT_EQ(terminal.source(), MTPTerminalHiddenPublication::Source::MainForward);
+    ASSERT_TRUE(std::any_of(completed.prefill_graphs.begin(), completed.prefill_graphs.end(),
+        [](const auto &graph) {
+            return graph.phase == "ready" && graph.capture_count > 0 &&
+                   graph.node_count > 0 && graph.reject_stage_name.empty();
+        })) << "Shifted KV publication must execute in the retained captured prefill graph";
 
-    const auto batch_tags = PerfStatsCollector::Tags{{"rows", "4"}};
-    const PerfStatRecord *batch_record = findMTPRecord(
-        records,
-        PerfStatRecord::Kind::Counter,
-        "shifted_prefill_sidecar_batches",
-        batch_tags);
-    ASSERT_NE(batch_record, nullptr);
-    EXPECT_DOUBLE_EQ(batch_record->value, 2.0);
+    const auto records = PerfStatsCollector::snapshot({"mtp"});
+    double integrated_transactions = 0.0;
+    for (const auto &record : records)
+    {
+        if (record.kind == PerfStatRecord::Kind::Counter && record.domain == "mtp" &&
+            record.name == "shifted_prefill_integrated_graph_transactions" &&
+            recordTagsContain(record, {{"requests", "1"}}))
+            integrated_transactions += record.value;
+        EXPECT_FALSE(record.name == "shifted_prefill_sidecar_batches")
+            << "Integrated GPU prefill must not enter the host sidecar batching path";
+    }
+    EXPECT_GT(integrated_transactions, 0.0);
 
     PerfStatsCollector::reset();
 }
+#endif
+
 
 TEST(Test__MTPGraphConstruction, CPUShiftedPrefillChunksAtConfiguredRuntimeCapacity)
 {
@@ -7842,24 +7959,32 @@ TEST(Test__MTPGraphConstruction, RowIndexedAllPositionLogitsRespectPaddedVerifie
     orchestrator.clearMTPSpecVerifierInputPlan();
 }
 
-TEST(Test__MTPGraphConstruction, GPUStochasticRequestBatchScratchScalesWithConfiguredCapacity)
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
+TEST_P(MTPNativeGraphConstruction, GPUStochasticRequestBatchScratchScalesWithConfiguredCapacity)
 {
     DeviceManager::instance().initialize(-1, false);
 
-    const auto device = firstAvailableGraphCaptureGPU();
-    if (!device.has_value())
-        GTEST_SKIP() << "No GPU backend available for stochastic request-batch scratch regression";
+    const DeviceId device = GetParam();
+    auto *const backend = getBackendFor(device);
+    ASSERT_NE(backend,nullptr) << "Selected native backend is unavailable";
+    ASSERT_GT(backend->deviceCount(),device.ordinal) << "Selected native endpoint is absent";
 
-    TinyQwenForwardFixture fixture(*device, KVCachePrecision::FP32);
+    auto source_owner=std::make_shared<TinyQwen35MTPForwardFixture>();
+    auto &fixture=*source_owner;
+    configureNativeMTPGraph(fixture.config, device);
+    fixture.config.max_request_count=2;
     fixture.config.mtp.max_request_batch = 2;
     fixture.config.mtp.draft_tokens = 3;
-    auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
-    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+    auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
+    const auto original_sources=makeTinyQwen35MTPFrozenWeightSet(fixture,device);
+    NativeMTPFixtureAdmission admission(graph_builder,fixture.mpi,*original_sources,source_owner,2);
+    auto orchestrator_owner=std::make_unique<DeviceGraphOrchestrator>(admission.dependencies());
+    auto &orchestrator=*orchestrator_owner;
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/2,
         fixture.config.max_seq_len,
-        *device));
+        device));
 
     const auto &extension_buffers = orchestrator.inferenceState().extension_buffers;
     auto shape_for = [&](BufferId id) -> const std::vector<size_t> &
@@ -7883,14 +8008,20 @@ TEST(Test__MTPGraphConstruction, GPUStochasticRequestBatchScratchScalesWithConfi
                 ::testing::ElementsAre(size_t{1}, size_t{6}));
     EXPECT_THAT(shape_for(BufferId::STOCHASTIC_DRAFT_SAMPLE_PROBS),
                 ::testing::ElementsAre(size_t{1}, size_t{6}));
+    // A complete depth-3 transaction publishes the leading token plus three
+    // accepted drafts. The sampled bonus is the next ready condition, not a
+    // fifth committed output. Metadata also carries commit-boundary clipping
+    // and the leading committed count in addition to the original ten fields.
     EXPECT_THAT(shape_for(BufferId::STOCHASTIC_BATCH_OUTPUT_TOKENS),
-                ::testing::ElementsAre(size_t{2}, size_t{5}));
+                ::testing::ElementsAre(size_t{2}, size_t{4}));
     EXPECT_THAT(shape_for(BufferId::STOCHASTIC_BATCH_OUTPUT_META),
-                ::testing::ElementsAre(size_t{2}, size_t{10}));
+                ::testing::ElementsAre(size_t{2}, size_t{12}));
     EXPECT_THAT(shape_for(BufferId::MTP_LOGICAL_SEQUENCE_STATE),
                 ::testing::ElementsAre(size_t{7}, size_t{2}))
         << "Published request state and its initialization scratch must have stable arena rows outside graph workspace.";
 }
+#endif
+
 
 TEST(Test__MTPGraphConstruction, GreedyBatchTransactionExecutorRunsOnCPUVerifierGraph)
 {
@@ -8780,3 +8911,10 @@ TEST(Test__MTPGraphConstruction, GDNPreparedQKGraphBindingIsExplicitAndCaptureSt
     catch(const std::invalid_argument& e)
     {EXPECT_NE(std::string(e.what()).find("retained recurrence owner"),std::string::npos);}
 }
+
+#ifdef HAVE_CUDA
+INSTANTIATE_TEST_SUITE_P(CUDA,MTPNativeGraphConstruction,::testing::Values(DeviceId::cuda(0)));
+#endif
+#ifdef HAVE_ROCM
+INSTANTIATE_TEST_SUITE_P(ROCm,MTPNativeGraphConstruction,::testing::Values(DeviceId::rocm(0)));
+#endif

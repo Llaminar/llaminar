@@ -1,9 +1,12 @@
 /**
  * @file MoEExpertOwnerMap.h
- * @brief Graph-native routed-MoE whole-expert ownership authority.
+ * @brief Canonical routed-MoE whole-owner and source-bound shard-cohort placement authority.
  *
  * A placement plan names the tier containing every expert; this type resolves
- * that logical placement to exactly one physical participant. Initial maps use
+ * that logical placement to one whole owner or an explicit joint fragment cohort.
+ * Ordinary graph execution accessors reject joint placement until its real
+ * prepared/collective path exists; no participant is chosen as a false whole
+ * owner. Initial whole-expert maps use
  * the configured ordinal or deterministic-random order. Epoch transitions use
  * the prior immutable map as a stability constraint so experts that remain in
  * a multi-participant tier do not move merely because another expert entered
@@ -13,6 +16,7 @@
 #pragma once
 
 #include "MoELayeredExpertOwnership.h"
+#include <memory>
 #include "MoERoutedExpertPlacementPlan.h"
 #include "backends/DeviceId.h"
 #include "backends/GlobalDeviceAddress.h"
@@ -24,6 +28,8 @@
 
 namespace llaminar2
 {
+    class MoEExpertShardCohort;
+    struct MoEOverlayLayerWeightManifest;
     /** @brief Physical owner and residency metadata for one routed expert. */
     struct MoEExpertOwner
     {
@@ -41,8 +47,13 @@ namespace llaminar2
         bool owner_world_rank_known = false;
         GlobalDeviceAddress address;
 
-        /** @return Equality of the complete logical and physical owner identity. */
-        bool operator==(const MoEExpertOwner &) const = default;
+        /** Joint fragment alternative; when present no single whole-expert owner exists. */
+        std::shared_ptr<const MoEExpertShardCohort> shard_cohort;
+
+        /** @param other Original logical placement and physical fragment definition.
+         * @return Structural metadata equality, independent of a shared cohort wrapper address.
+         * @note Original source liveness and native prepared authority remain separate guards. */
+        bool operator==(const MoEExpertOwner &other) const;
     };
 
     /** @brief Stable participant descriptor referenced by expert owners. */
@@ -91,6 +102,14 @@ namespace llaminar2
             const MoERoutedExpertPlacementPlan &plan,const MoEExpertOwnerMapBuildOptions &options = {});
 
         /**
+         * @brief Classify actual multi-member CPU tensor fragments without constructing owners or quotas.
+         * @param plan Original tier/domain declaration; unused domains do not create expert participants.
+         * @return True only for a referenced tensor-sharded CPU domain with more than one member.
+         * @note Explicit CPU TP1 retains its policy identity and uses full-matrix ordinary storage.
+         */
+        [[nodiscard]] static bool usesCPUJointFragments(const MoERoutedExpertPlacementPlan& plan) noexcept;
+
+        /**
          * @brief Observe actual cold canonical constructor entries, including failures.
          * @return Monotonic process-wide count; scoped deltas prove construction
          * economy without a reset, source mirror or alternate owner authority.
@@ -108,6 +127,31 @@ namespace llaminar2
         static MoEExpertOwnerMap build(
             const MoERoutedExpertPlacementPlan &plan,
             const MoEExpertOwnerMapBuildOptions &options = {});
+
+        /**
+         * @brief Resolve source-native CPU shard cohorts in the canonical placement authority.
+         * @param plan Complete original logical tier placements and bound CPU node-TP membership.
+         * @param manifest Exact original owned layer source contracts, retaining global IDs.
+         * @return One logical placement row per expert, with either a whole owner or a joint cohort.
+         * @throws std::invalid_argument For missing/foreign source, endpoints or unsupported native cuts.
+         * @note This is placement only. Ordinary whole-expert execution access remains rejecting.
+         */
+        static MoEExpertOwnerMap buildShardPlacement(const MoERoutedExpertPlacementPlan& plan,
+            const std::vector<MoEOverlayLayerWeightManifest>& manifest);
+
+        /**
+         * @param layer_idx Original model-global layer.
+         * @param expert_id Original expert ID.
+         * @return The canonical logical placement, explicitly including any shard cohort, or null.
+         */
+        const MoEExpertOwner* placementFor(int layer_idx,int expert_id) const;
+
+        /**
+         * @param layer_idx Original model-global layer.
+         * @param expert_id Original expert ID.
+         * @return Exact physical fragment count; zero if absent, one for a whole owner.
+         */
+        std::size_t fragmentCountForExpert(int layer_idx,int expert_id) const;
 
         /**
          * @brief Build a balanced epoch transition with stable retained owners.
@@ -171,7 +215,8 @@ namespace llaminar2
          * @brief Look up one immutable owner through the canonical coordinate index.
          * @param layer_idx Exact transformer-layer coordinate.
          * @param expert_id Exact routed-expert coordinate within that layer.
-         * @return Owner for the model expert, or null when it is absent.
+         * @return Whole owner for the model expert, or null when it is absent.
+         * @throws std::logic_error When the placement is jointly tensor-sharded; no whole-owner alias exists.
          *
          * Construction sorts the complete relation by `(layer, expert)`, so
          * this graph-facing query is logarithmic rather than scanning every
@@ -194,6 +239,7 @@ namespace llaminar2
          * @brief Report total ownership for one model coordinate.
          * @return Zero for an absent coordinate, otherwise exactly one.
          *
+         * @throws std::logic_error For a joint shard placement: use fragmentCountForExpert.
          * Duplicate ownership is rejected during construction, which makes a
          * larger result unrepresentable in every live map.
          */

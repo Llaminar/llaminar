@@ -174,7 +174,8 @@ namespace
                     .gpu_weight_load = {.maximum_source_bytes = 65536},
                     .pipeline_stage = FactoryPPStageConfig{.first_layer = rank.first_layer, .last_layer = rank.last_layer + 1,
                         .has_embedding = rank.has_embedding, .has_lm_head = rank.has_lm_head,
-                        .generation_domain = declaredRankDeviceGenerationDomain(parent)}}, rows);
+                        .generation_domain = declaredRankDeviceGenerationDomain(parent)},
+                    .native_source_placement = CPUStoragePlacement::local()}, rows);
                 result.push_back(std::move(projected.local_capacity));
             }
             return result;

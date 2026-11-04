@@ -57,8 +57,8 @@ namespace llaminar2
             jobs.begin(), jobs.end(),
             [](const WeightJob &lhs, const WeightJob &rhs)
             {
-                // Invalid jobs remain at the end so processJobs() emits its
-                // existing precise null-source diagnostic before touching them.
+                // Bounded sources retain their declared order after pointer
+                // jobs. Invalid sources receive their diagnostic before staging.
                 const auto lhs_address = lhs.host_raw_data
                                              ? reinterpret_cast<uintptr_t>(lhs.host_raw_data)
                                              : std::numeric_limits<uintptr_t>::max();
@@ -97,7 +97,7 @@ namespace llaminar2
                     "coalesceContiguousWeightJobs requires a non-null immutable source identity for '" +
                     job.name + "'");
             }
-            if (!job.host_raw_data || job.raw_bytes == 0 || job.N <= 0 || job.K <= 0 ||
+            if (job.bounded_source || !job.host_raw_data || job.raw_bytes == 0 || job.N <= 0 || job.K <= 0 ||
                 job.raw_bytes % static_cast<size_t>(job.N) != 0)
             {
                 throw std::invalid_argument(
@@ -274,6 +274,10 @@ namespace llaminar2
                 for (size_t job_index = 0; job_index < jobs.size(); ++job_index)
                 {
                     const auto &job = jobs[job_index];
+                    // A converted source owns its own native input descriptor.
+                    // It writes directly into this same pinned ring below.
+                    if (job.bounded_source)
+                        continue;
                     // MmapRegion owns the process-wide registry of live model
                     // mappings. Resolve the concrete pointer range instead of
                     // trusting a tensor-class hint: expert views and other
@@ -391,6 +395,7 @@ namespace llaminar2
         {
             const void *payload = nullptr;
             size_t file_bytes = 0;
+            size_t bounded_source_bytes = 0;
             double read_ms = 0.0;
             double h2d_wait_ms = 0.0;
             std::string error;
@@ -553,7 +558,25 @@ namespace llaminar2
                             const auto &job = jobs_[job_index];
                             const auto &plan =
                                 file_read_plans_[job_index];
-                            if (plan.fd >= 0)
+                            if (job.bounded_source)
+                            {
+                                try
+                                {
+                                    job.bounded_source->read(job.source_offset_bytes,
+                                        {static_cast<std::byte *>(destination), job.raw_bytes});
+                                    result.payload = destination;
+                                    result.bounded_source_bytes = job.raw_bytes;
+                                }
+                                catch (const std::exception &error)
+                                {
+                                    result.error = error.what();
+                                }
+                                catch (...)
+                                {
+                                    result.error = "bounded weight source threw a nonstandard exception";
+                                }
+                            }
+                            else if (plan.fd >= 0)
                             {
                                 file_reader_.read(
                                     plan,
@@ -760,6 +783,7 @@ namespace llaminar2
         const bool trace_weights = env.weight_lifecycle_trace;
         const bool sync_after_repack_job = env.rocm.sync_after_kernel;
         size_t buffered_file_read_bytes = 0;
+        size_t bounded_source_bytes = 0;
 
         MmapFileReader file_reader;
         std::vector<FileReadPlan> file_read_plans;
@@ -792,10 +816,14 @@ namespace llaminar2
         {
             const int full_n = job.full_N > 0 ? job.full_N : job.N;
             const int full_k = job.full_K > 0 ? job.full_K : job.K;
-            if (job.raw_bytes == 0 || !job.host_raw_data)
+            try
+            {
+                job.validateSource();
+            }
+            catch (const std::exception &error)
             {
                 LOG_ERROR("DeviceLoadPipeline: invalid host source for '" << job.name
-                                                                          << "' raw_bytes=" << job.raw_bytes);
+                          << "': " << error.what());
                 return false;
             }
             if (job.N <= 0 || full_n <= 0 || job.row_offset < 0 ||
@@ -883,6 +911,7 @@ namespace llaminar2
             lane_read_ms[static_cast<size_t>(stream_index)] += staged.read_ms;
             event_wait_ms += staged.h2d_wait_ms;
             buffered_file_read_bytes += staged.file_bytes;
+            bounded_source_bytes += staged.bounded_source_bytes;
 
             if (trace_weights)
             {
@@ -895,7 +924,7 @@ namespace llaminar2
                                                         << " K=" << job.K
                                                         << " source=" << job.host_raw_data
                                                         << " source_mode="
-                                                        << (file_read_plans[job_index].fd >= 0
+                                                        << (job.bounded_source ? "bounded_source" : file_read_plans[job_index].fd >= 0
                                                                 ? "buffered_file"
                                                                 : "memory")
                                                         << " stream_slot=" << stream_index);
@@ -927,6 +956,9 @@ namespace llaminar2
                 return false;
             }
 
+            // An enqueue can report failure after accepting work. Conservatively
+            // retain the ring until its exact streams retire on every exit.
+            work_lifetime_ = WorkLifetime::Pending;
             if (!backend_.hostToDeviceOnStream(
                     staging_ptr,
                     staged.payload,
@@ -1101,6 +1133,7 @@ namespace llaminar2
                 return false;
             }
         }
+        work_lifetime_ = WorkLifetime::Retired;
         const double drain_ms = std::chrono::duration<double, std::milli>(
                                     Clock::now() - drain_start)
                                     .count();
@@ -1149,6 +1182,9 @@ namespace llaminar2
                 static_cast<double>(buffered_file_read_bytes),
                 "load",
                 device);
+            PerfStatsCollector::addCounter(
+                "weight_loading", "gpu_pipeline_bounded_source_bytes",
+                static_cast<double>(bounded_source_bytes), "load", device);
         }
         LOG_DEBUG("DeviceLoadPipeline: device " << device_id_ << " loaded "
                                                 << num_processed_ << " weights, " << std::fixed << std::setprecision(1)
@@ -1163,6 +1199,25 @@ namespace llaminar2
             return;
 
         backend_.setDevice(device_id_);
+
+        if (work_lifetime_ == WorkLifetime::Pending)
+        {
+            // Startup failure is a terminal boundary, never an inference hot
+            // path. Stream destruction alone does not certify completion of
+            // asynchronous users of the pinned/device slots or their events.
+            for (void *stream : h2d_streams_)
+                if (stream && !backend_.synchronizeStream(stream, device_id_))
+                {
+                    LOG_ERROR("DeviceLoadPipeline: cannot retire accepted H2D work on device " << device_id_);
+                    std::terminate();
+                }
+            if (repack_stream_ && !backend_.synchronizeStream(repack_stream_, device_id_))
+            {
+                LOG_ERROR("DeviceLoadPipeline: cannot retire accepted repack work on device " << device_id_);
+                std::terminate();
+            }
+            work_lifetime_ = WorkLifetime::Retired;
+        }
 
         // Destroy events first
         for (auto &ev : repack_done_events_)

@@ -100,10 +100,10 @@ public:
         DeviceId device,void* primaryStream);
     /**
      * @brief Project certified limits through the normal BOM before final admission.
-     * @param selected Actual selected backend/device; certificate selection is internal.
+     * @param selected Original selected backend/device whose installed allowance is priced without a local context.
      * @param host Original CPU0 physical observation from the same source plan.
      * @param device Original exact GPU observation from that plan.
-     * @return Named host/device opaque-family BOM; absent certificates fail closed.
+     * @return Named host/device opaque-family BOM; absent installed families fail closed. Live creation separately requires the original certificate.
      */
     static PhysicalMemoryPlan bom(DeviceId selected,
         PhysicalMemoryResource host,PhysicalMemoryResource device);
