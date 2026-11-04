@@ -27819,6 +27819,8 @@ endif()
 if(HAVE_CUDA)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_CanonicalRouteFold_CUDA
+    V2_Integration_RegisteredHostFullSpan_CUDA
+    V2_Integration_GPUHostRegistrationLifetime_CUDA
     V2_Integration_CUDAResidualAddTailExtents
     V2_Integration_FP32SubnormalContract_CUDA
     V2_Integration_LearnedMTPDepthPolicy_CUDA
@@ -27989,9 +27991,7 @@ if(HAVE_ROCM)
     V2_Integration_ROCmFloatingExpertRetirement
     V2_Integration_ROCmHostMemoryBacking
     V2_Integration_HostRegistrationPageRange
-    V2_Integration_RegisteredHostFullSpan_CUDA
     V2_Integration_RegisteredHostFullSpan_ROCm
-    V2_Integration_GPUHostRegistrationLifetime_CUDA
     V2_Integration_GPUHostRegistrationLifetime_ROCm
     ${V2_ROCM_CROSS_TIER_EXPERT_ARITHMETIC_PREFLIGHT_TESTS}
     V2_Integration_ForcedPolicyHistory_ROCm
