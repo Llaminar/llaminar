@@ -58,6 +58,7 @@
 #include "../../../tensors/NativeQuantisedFormatInfo.h"
 #include "../../../utils/DebugEnv.h"
 #include "ROCmNativeQuantisedDecodeEquivalentMath.h"
+#include "ROCmNativeQuantisedNibbleLUT.h"
 #include "ROCmNativeQuantisedGemmShard.h"
 #include "ROCmDenseProductionPrefillOverlay.h"
 #include "ROCmNativeQuantisedArchitecture.h"
@@ -2949,6 +2950,7 @@ bool LLAMINAR_ROCM_NATIVE_QUANTISED_SHARD_SYMBOL(
     case NATIVE_QUANTISED_GEMM_Q4_0:     LAUNCH_GEMM(NATIVE_QUANTISED_GEMM_Q4_0);
     case NATIVE_QUANTISED_GEMM_IQ4_NL:   LAUNCH_GEMM(NATIVE_QUANTISED_GEMM_IQ4_NL);
     case NATIVE_QUANTISED_GEMM_IQ4_XS_SOURCE: LAUNCH_GEMM(NATIVE_QUANTISED_GEMM_IQ4_XS_SOURCE);
+    case NATIVE_QUANTISED_GEMM_MXFP4:    LAUNCH_GEMM(NATIVE_QUANTISED_GEMM_MXFP4);
 #elif LLAMINAR_ROCM_NATIVE_QUANTISED_SHARD == 1
     case NATIVE_QUANTISED_GEMM_Q4_1:     LAUNCH_GEMM(NATIVE_QUANTISED_GEMM_Q4_1);
     case NATIVE_QUANTISED_GEMM_Q5_0:     LAUNCH_GEMM(NATIVE_QUANTISED_GEMM_Q5_0);

@@ -7749,6 +7749,7 @@ namespace
         {
         case 0:
         case 4:
+        case llaminar2::kNativeQuantisedMXFP4Codebook:
             payload_bytes = 16u;
             return true;
         case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook:

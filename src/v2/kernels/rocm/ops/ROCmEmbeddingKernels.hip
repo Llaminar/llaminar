@@ -587,6 +587,7 @@ extern "C" hipError_t hipOps_embedding_native(
         LLAMINAR_EMBED_SOURCE(IQ3_S);
         LLAMINAR_EMBED_SOURCE(IQ4_NL);
         LLAMINAR_EMBED_SOURCE(IQ4_XS);
+        LLAMINAR_EMBED_SOURCE(MXFP4);
     default: return hipErrorInvalidValue;
     }
 #undef LLAMINAR_EMBED_SOURCE

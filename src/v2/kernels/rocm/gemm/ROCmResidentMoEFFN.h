@@ -83,7 +83,7 @@ public:
         (1u<<kNativeQuantisedExpandedInt8MinCodebook);
     static constexpr std::uint32_t linear_packed_and_subscale=(1u<<0)|(1u<<6)|(1u<<8)|(1u<<9)|(1u<<10);
     static constexpr std::uint32_t iq3_and_iq4_grid=(1u<<4)|(1u<<11)|(1u<<12)|
-        (1u<<kNativeQuantisedIQ4XSSourceScaleCodebook);
+        (1u<<kNativeQuantisedIQ4XSSourceScaleCodebook)|(1u<<kNativeQuantisedMXFP4Codebook);
     static constexpr std::uint32_t iq1_and_iq2_grid=(1u<<13)|(1u<<14)|(1u<<15)|(1u<<16)|(1u<<17);
     static constexpr std::uint32_t all_decoders=affine_and_byte|linear_packed_and_subscale|iq3_and_iq4_grid|iq1_and_iq2_grid;
 
