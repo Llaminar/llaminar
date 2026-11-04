@@ -125,6 +125,8 @@ TEST(MXFP4Format, CatalogAndRepackIdentity)
     EXPECT_EQ(regions.mins_bytes, 0u);
     EXPECT_TRUE(isNativeVnniFormat(TensorType::MXFP4));
     EXPECT_STREQ(tensorTypeName(TensorType::MXFP4), "MXFP4");
+    // Planning resolves GGUF inventory labels through the canonical enum walk.
+    EXPECT_EQ(tensorTypeFromName("MXFP4"), TensorType::MXFP4);
 }
 
 TEST(MXFP4Tensor, DecodeQ8AndExpertViewsAreExact)
