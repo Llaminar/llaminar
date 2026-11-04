@@ -195,6 +195,9 @@ namespace
          { return TestTensorFactory::createQ4_0Random({N, K}); }},
         {"IQ4_NL", 4.5, false, [](size_t N, size_t K)
          { return TestTensorFactory::createIQ4_NLRandom({N, K}); }},
+        // Same prepared geometry/policy as IQ4_NL; only the decoder lookup differs.
+        {"MXFP4", 4.5, false, [](size_t N, size_t K)
+         { return TestTensorFactory::createMXFP4Random({N, K}); }},
         {"Q4_1", 5.0, false, [](size_t N, size_t K)
          { return TestTensorFactory::createQ4_1Random({N, K}); }},
         {"Q5_0", 5.5, false, [](size_t N, size_t K)
@@ -273,6 +276,8 @@ namespace
             return std::make_unique<Q4_0Tensor>(shape, raw_data);
         case TensorType::IQ4_NL:
             return std::make_unique<IQ4_NLTensor>(shape, raw_data);
+        case TensorType::MXFP4:
+            return std::make_unique<MXFP4Tensor>(shape, raw_data);
         case TensorType::Q4_1:
             return std::make_unique<Q4_1Tensor>(shape, raw_data);
         case TensorType::Q5_0:
