@@ -1175,8 +1175,13 @@ namespace
         // Publish the same execution identity as WeightManager and
         // ROCmWeightPacker; retaining source IDs 20/21 here asks the production
         // launcher for codebooks that cannot exist after device preparation.
+        // The integer overload is the arithmetic policy (MXFP4 25 -> IQ4_NL 4);
+        // MXFP4 must keep its own physical decoder, or its rows would time the
+        // IQ4_NL lookup on MXFP4 bytes.
         packed.native_vnni_codebook_id =
-            canonicalDeviceVnniCodebookId(info->codebook_id);
+            info->codebook_id == kNativeVnniMXFP4Codebook
+                ? kNativeVnniMXFP4Codebook
+                : canonicalDeviceVnniCodebookId(info->codebook_id);
         packed.native_vnni_blocks_per_row = static_cast<uint32_t>(blocks_per_row);
         packed.N = N;
         packed.K = K;
