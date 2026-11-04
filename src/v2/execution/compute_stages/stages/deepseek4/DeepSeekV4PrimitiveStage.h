@@ -145,15 +145,16 @@ public:
      * @details DeepSeek-V4 attention state lives in model-owned banks, so the
      * cache holds no attention layers and no append advances its frontier.
      * The terminal layer advances it exactly once per forward on the exact
-     * stream (IKVCache::advanceRecurrentSequenceState), with device-owned
-     * real lengths for padded prefill graphs.
+     * stream (IKVCache::advanceRecurrentSequenceState) by the stage's own row
+     * extent: the device live-row count when bound (padded prefill, including
+     * zero live rows), else every admitted row. This is the same row authority
+     * every DeepSeek-V4 bank kernel consumes, so the frontier and the banks
+     * cannot disagree.
      */
     struct AdvanceSequenceFrontier
     {
         IKVCache *cache;                            ///< Canonical main cache (model_state layers only).
         int layer;                                  ///< Global terminal layer of this graph.
-        int capturedRows;                           ///< Rows per request represented by the graph.
-        const std::int32_t *requestRows;            ///< Device real rows, or null when all rows are real.
         Qwen4ExpIntInput positions;                 ///< Ordering anchor on the row positions.
     };
     /** @brief Grouped low-rank output projection (wo_a). */

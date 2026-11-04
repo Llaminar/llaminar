@@ -12,7 +12,10 @@
  *    context only through the packed pools and bounded indexer scratch;
  *  - the canonical cache charges no KV payload (layers are ModelOwned);
  *  - no full-context K/V conversion scratch is admitted for a cache without
- *    attention layers (formerly ~4 GiB at 1M context).
+ *    attention layers (formerly ~4 GiB at 1M context);
+ *  - the admitted roots equal, root by root, the actual DeepSeekV4Graph
+ *    schema/resolver inventory the orchestrator registers (CPU and GPU
+ *    allocators, several row envelopes).
  */
 #include <gtest/gtest.h>
 
@@ -25,6 +28,11 @@
 #include "planning/ModelMemoryProfile.h"
 #include "planning/PersistentStateMemoryEstimator.h"
 #include "planning/WorkspaceMemoryEstimator.h"
+#include "models/deepseek4/DeepSeekV4Graph.h"
+#include "models/deepseek4/DeepSeekV4GraphConfigBuilder.h"
+#include "../models/deepseek4/DeepSeekV4MetadataFixture.h"
+
+#include <map>
 
 #include <cstdint>
 #include <string>
@@ -176,4 +184,57 @@ TEST(DeepSeekV4Admission, NoKVConversionScratchWithoutAttentionLayers)
     EXPECT_GT(WorkspaceMemoryEstimator::estimate(profile, longContext),
               WorkspaceMemoryEstimator::estimate(profile, geometry) + (std::size_t{1} << 30))
         << "control: a full-attention cache converts the complete context";
+}
+
+TEST(DeepSeekV4Admission, AdmittedRootsEqualTheActualGraphInventory)
+{
+    const auto directory = test::deepSeekV4MetadataFixture();
+    const auto profile = ModelMemoryProfile::fromGGUF(directory);
+    ASSERT_TRUE(profile.deepseek_v4.has_value());
+    for (const auto device : {DeviceId{DeviceType::CPU, 1}, DeviceId::cuda(0)})
+        for (const int rows : {1, 3, 64})
+        {
+            SCOPED_TRACE(::testing::Message() << device.toString() << " rows=" << rows);
+            GraphConfig config;
+            config.default_device = device;
+            DeepSeekV4GraphConfigBuilder::populateFromDirectory(directory, config);
+            config.max_seq_len = 512;
+            config.max_activation_rows = rows;
+            config.max_request_count = 1;
+            DeepSeekV4Graph graph(config, nullptr);
+            // Exactly the orchestrator's registration (no retained MTP roots).
+            const auto actual = GraphArenaStorageLayout::resolve(graph.getSchema(), graph.getResolverConfig(rows), {});
+
+            ActivationGraphMemoryGeometry geometry;
+            geometry.batch_size = 1;
+            geometry.resident_graph_rows = rows;
+            geometry.context_tokens = config.max_seq_len;
+            geometry.local_d_ff = config.d_ff;
+            geometry.local_n_heads = config.n_heads;
+            geometry.local_n_kv_heads = config.n_kv_heads;
+            geometry.local_vocab = config.vocab_size;
+            geometry.last_layer = config.n_layers - 1;
+            geometry.total_shards = 1;
+            geometry.routed_compute_policy = config.moe.routed_compute_policy;
+            geometry.mtp_target_query_rows = 1;
+            geometry.mtp_terminal_logits_layout = config.mtpTerminalLogitsLayout();
+            const auto admitted = ActivationMemoryEstimator::declareSchemaStorage(profile, geometry, device);
+
+            std::map<BufferId, const BufferDescriptor *> want, got;
+            for (const auto &entry : actual.entries()) ASSERT_TRUE(want.emplace(entry.id, &entry.descriptor).second);
+            for (const auto &entry : admitted.entries()) ASSERT_TRUE(got.emplace(entry.id, &entry.descriptor).second);
+            EXPECT_EQ(got.size(), want.size());
+            for (const auto &[id, descriptor] : want)
+            {
+                SCOPED_TRACE(std::string(bufferIdName(id)) + " root " + descriptor->name);
+                const auto found = got.find(id);
+                ASSERT_NE(found, got.end());
+                EXPECT_EQ(found->second->tensor_type, descriptor->tensor_type);
+                EXPECT_EQ(found->second->shape, descriptor->shape);
+            }
+            EXPECT_EQ(linearRootBytes(admitted, false), linearRootBytes(actual, false));
+            if (device.is_gpu())
+                EXPECT_EQ(ActivationMemoryEstimator::estimate(profile, geometry, device),
+                          linearRootBytes(actual, false) + sizeof(std::uint64_t));
+        }
 }

@@ -126,6 +126,7 @@ ComputeGraph DeepSeekV4Graph::buildAttentionGraph(
     const void *position_ids_device, const int32_t *sequence_lengths_device)
 {
     (void)sequence_lengths;
+    (void)sequence_lengths_device; // Row counts come from modelExtensionRows (one row authority).
     if (batch_size != 1)
         throw std::invalid_argument("DeepSeek-V4 graphs currently admit exactly one request per graph");
     if (device.is_rocm())
@@ -313,7 +314,7 @@ ComputeGraph DeepSeekV4Graph::buildAttentionGraph(
     const int terminal_layer = config_.pp_layer_offset + config_.n_layers - 1;
     if (kv_cache && device.is_gpu() && layer_idx == terminal_layer)
         bank_writers.push_back(prim(prefix + "sequence_frontier", Stage::AdvanceSequenceFrontier{kv_cache, layer_idx,
-            seq_len, seq_len == 1 ? nullptr : sequence_lengths_device, positions}, {prefix + "attention"}));
+            positions}, {prefix + "attention"}));
 
     if (!w.output_a || !w.output_a->tensor)
         throw std::invalid_argument("DeepSeek-V4 layer is missing attn_output_a");

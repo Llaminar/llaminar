@@ -27,9 +27,9 @@
  * as half the original when a block's maximum rounds down to 224, but every
  * value is unchanged), so a QAT activation and its packed record agree bitwise.
  *
- * Every function is plain FP32/integer arithmetic with explicit round-to-
- * nearest-even, shared by CPU and CUDA so both backends produce identical
- * bytes. Scale exponents follow kernel.py fast_round_scale bit-for-bit,
+ * Every function is FP32/integer arithmetic with explicit round-to-nearest-
+ * even, shared by CPU and CUDA so both backends produce identical bytes,
+ * including IEEE subnormals (the device side is immune to CUDA FTZ; see mulRn). Scale exponents follow kernel.py fast_round_scale bit-for-bit,
  * including the FP32 rounding of the constants 1/448 and 1/6.
  */
 #pragma once
@@ -131,6 +131,62 @@ DSV4_KV_HD float floatOf(std::uint32_t bits)
     memcpy(&value, &bits, sizeof(value));
     return value;
 }
+
+/**
+ * @name IEEE binary32 arithmetic immune to the CUDA fast-math FTZ policy
+ * @details Production CUDA compiles with `--use_fast_math --ftz=true`, which
+ * turns ordinary float operations into flushing instructions. The QAT, Hadamard,
+ * record-decode and indexer-score arithmetic must keep IEEE subnormal operands
+ * and results (an FP4 code 0.5 at the E8M0 floor is 2^-127), so device code
+ * emits explicit `.rn` PTX without `.ftz` (which also forbids contraction);
+ * host code uses the identical IEEE operations, with `std::fma` for the fused
+ * form. Every op is one correctly rounded binary32 result on both backends.
+ * @{
+ */
+DSV4_KV_HD float mulRn(float a, float b)
+{
+#if defined(__CUDA_ARCH__)
+    float r;
+    asm("mul.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+    return r;
+#else
+    return a * b;
+#endif
+}
+DSV4_KV_HD float addRn(float a, float b)
+{
+#if defined(__CUDA_ARCH__)
+    float r;
+    asm("add.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+    return r;
+#else
+    return a + b;
+#endif
+}
+DSV4_KV_HD float subRn(float a, float b)
+{
+#if defined(__CUDA_ARCH__)
+    float r;
+    asm("sub.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+    return r;
+#else
+    return a - b;
+#endif
+}
+/** @brief Single-rounding a * b + c. */
+DSV4_KV_HD float fmaRn(float a, float b, float c)
+{
+#if defined(__CUDA_ARCH__)
+    float r;
+    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(a), "f"(b), "f"(c));
+    return r;
+#else
+    return std::fma(a, b, c);
+#endif
+}
+/** @brief max(x, +0) from the sign bit (FTZ comparisons would zero a subnormal). */
+DSV4_KV_HD float reluBits(float x) { return (bitsOf(x) >> 31) ? 0.0f : x; }
+/** @} */
 
 /** @brief 2^k for normal exponents k in [-126, 127], built from bits (exact). */
 DSV4_KV_HD float exp2i(int k) { return floatOf(static_cast<std::uint32_t>(k + 127) << 23); }
@@ -240,7 +296,7 @@ DSV4_KV_HD void fakeQuantFP8Block(float *values, int count)
 {
     const int k = fp8ScaleExponent(absMax(values, count));
     const float inverse = exp2i(-k), scale = exp2i(k);
-    for (int i = 0; i < count; ++i) values[i] = decodeE4M3(encodeE4M3(values[i] * inverse)) * scale;
+    for (int i = 0; i < count; ++i) values[i] = mulRn(decodeE4M3(encodeE4M3(mulRn(values[i], inverse))), scale);
 }
 
 /** @brief In-place FP4 QAT of one 32-value block (fp4_act_quant inplace). */
@@ -248,7 +304,7 @@ DSV4_KV_HD void fakeQuantFP4Block(float *values, int count)
 {
     const int k = fp4ScaleExponent(absMax(values, count));
     const float inverse = exp2i(-k), scale = exp2i(k);
-    for (int i = 0; i < count; ++i) values[i] = decodeE2M1(encodeE2M1(values[i] * inverse)) * scale;
+    for (int i = 0; i < count; ++i) values[i] = mulRn(decodeE2M1(encodeE2M1(mulRn(values[i], inverse))), scale);
 }
 
 /** @brief FP32 rounding of n^-0.5 (Python's float `n ** -0.5` passed to the CUDA kernel). */
@@ -266,11 +322,11 @@ DSV4_KV_HD void hadamard(float *values, int n)
             for (int j = i; j < i + h; ++j)
             {
                 const float a = values[j], b = values[j + h];
-                values[j] = a + b;
-                values[j + h] = a - b;
+                values[j] = addRn(a, b);
+                values[j + h] = subRn(a, b);
             }
     const float scale = hadamardScale(n);
-    for (int i = 0; i < n; ++i) values[i] *= scale;
+    for (int i = 0; i < n; ++i) values[i] = mulRn(values[i], scale);
 }
 
 /** @brief Apply @p quant to one head vector in place. */
@@ -298,7 +354,7 @@ DSV4_KV_HD void packKVEntry(const PackedKVEntryFormat &format, const float *valu
         const float *block = values + b * kFP8BlockSize;
         const int k = fp8ScaleExponent(absMax(block, kFP8BlockSize));
         const float inverse = exp2i(-k);
-        for (int i = 0; i < kFP8BlockSize; ++i) entry[b * kFP8BlockSize + i] = encodeE4M3(block[i] * inverse);
+        for (int i = 0; i < kFP8BlockSize; ++i) entry[b * kFP8BlockSize + i] = encodeE4M3(mulRn(block[i], inverse));
         entry[format.scaleOffset() + b] = static_cast<std::uint8_t>(k + 127);
     }
     for (int c = 0; c < format.ropeDim; ++c)
@@ -314,7 +370,7 @@ DSV4_KV_HD void packKVEntry(const PackedKVEntryFormat &format, const float *valu
 DSV4_KV_HD float decodeKVChannel(const PackedKVEntryFormat &format, const std::uint8_t *entry, int c)
 {
     if (c < format.nopeDim())
-        return decodeE4M3(entry[c]) * exp2i(static_cast<int>(entry[format.scaleOffset() + c / kFP8BlockSize]) - 127);
+        return mulRn(decodeE4M3(entry[c]), exp2i(static_cast<int>(entry[format.scaleOffset() + c / kFP8BlockSize]) - 127));
     const int r = format.ropeOffset() + 2 * (c - format.nopeDim());
     return decodeBF16(static_cast<std::uint16_t>(entry[r] | (entry[r + 1] << 8)));
 }
@@ -329,7 +385,7 @@ DSV4_KV_HD void packIndexerKey(const PackedIndexerKeyFormat &format, const float
         const float inverse = exp2i(-k);
         for (int i = 0; i < kFP4BlockSize; i += 2)
             entry[(b * kFP4BlockSize + i) / 2] = static_cast<std::uint8_t>(
-                encodeE2M1(block[i] * inverse) | (encodeE2M1(block[i + 1] * inverse) << 4));
+                encodeE2M1(mulRn(block[i], inverse)) | (encodeE2M1(mulRn(block[i + 1], inverse)) << 4));
         entry[format.scaleOffset() + b] = static_cast<std::uint8_t>(k + 127);
     }
     for (int p = format.scaleOffset() + format.scaleCount(); p < format.entryBytes(); ++p) entry[p] = 0;
@@ -340,15 +396,16 @@ DSV4_KV_HD float decodeIndexerChannel(const PackedIndexerKeyFormat &format, cons
 {
     const std::uint8_t pair = entry[c / 2];
     const std::uint8_t nibble = static_cast<std::uint8_t>((c & 1) ? (pair >> 4) : (pair & 0xFu));
-    return decodeE2M1(nibble) * exp2i(static_cast<int>(entry[format.scaleOffset() + c / kFP4BlockSize]) - 127);
+    return mulRn(decodeE2M1(nibble), exp2i(static_cast<int>(entry[format.scaleOffset() + c / kFP4BlockSize]) - 127));
 }
 
 /**
  * @brief Lightning-indexer q . k for one head against a packed key.
- * @details Each 32-channel block dot of FP4-representable q and k values is
- * exact in FP32 for any summation order (products need <= 4 significant bits
- * and the block sum stays below 2^12 granules), so only the fixed sequential
- * cross-block order matters. CPU and GPU call this same function.
+ * @details Each 32-channel block dot of FP4-representable q and unscaled E2M1
+ * k values is exact in FP32 (products need <= 4 significant bits and the block
+ * sum stays below 2^12 granules); the block sums are scaled and accumulated by
+ * fused multiply-adds in ascending block order. CPU (on pre-decoded keys) and
+ * GPU execute exactly this operation sequence.
  */
 DSV4_KV_HD float indexerDot(const PackedIndexerKeyFormat &format, const float *query, const std::uint8_t *entry)
 {
@@ -359,12 +416,19 @@ DSV4_KV_HD float indexerDot(const PackedIndexerKeyFormat &format, const float *q
         for (int i = 0; i < kFP4BlockSize; i += 2)
         {
             const std::uint8_t pair = entry[(b * kFP4BlockSize + i) / 2];
-            block += query[b * kFP4BlockSize + i] * decodeE2M1(static_cast<std::uint8_t>(pair & 0xFu));
-            block += query[b * kFP4BlockSize + i + 1] * decodeE2M1(static_cast<std::uint8_t>(pair >> 4));
+            block = fmaRn(query[b * kFP4BlockSize + i], decodeE2M1(static_cast<std::uint8_t>(pair & 0xFu)), block);
+            block = fmaRn(query[b * kFP4BlockSize + i + 1], decodeE2M1(static_cast<std::uint8_t>(pair >> 4)), block);
         }
-        dot += block * exp2i(static_cast<int>(entry[format.scaleOffset() + b]) - 127);
+        dot = fmaRn(block, exp2i(static_cast<int>(entry[format.scaleOffset() + b]) - 127), dot);
     }
     return dot;
 }
+
+/** @brief One head's contribution: score' = relu(dot) * (weight * weightScale) + score, one rounding. */
+DSV4_KV_HD float indexerAccumulate(float score, float dot, float weight, float weightScale)
+{
+    return fmaRn(reluBits(dot), mulRn(weight, weightScale), score);
+}
+
 } // namespace qat
 } // namespace llaminar2::deepseek4

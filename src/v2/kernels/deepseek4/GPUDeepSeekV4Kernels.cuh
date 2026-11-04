@@ -12,6 +12,9 @@
  *  - headNormRope / compressorPool / rawStore: one CTA per (row, head) / row,
  *    staging the head vector in shared memory for RMS, RoPE, the QAT
  *    rounding (Hadamard butterflies, per-block scale exponents) and packing.
+ *  - QAT, Hadamard, record packing/decoding and indexer scoring use the
+ *    explicit non-FTZ qat:: operations, so they keep IEEE subnormals and match
+ *    the CPU bundle bit-for-bit despite the TU's fast-math policy.
  *  - indexer: bounded passes of scoreRows rows; each pass scores (row, block
  *    tile) into the admitted scratch, then runs a per-row 4-pass radix
  *    selection of the top-k float keys (ties by lower id).
@@ -186,13 +189,13 @@ __device__ inline void hadamardShared(float *vec, int n)
         {
             const int i = (t / h) * 2 * h + t % h;
             const float x = vec[i], y = vec[i + h];
-            vec[i] = x + y;
-            vec[i + h] = x - y;
+            vec[i] = qat::addRn(x, y);
+            vec[i + h] = qat::subRn(x, y);
         }
         __syncthreads();
     }
     const float scale = qat::hadamardScale(n);
-    for (int c = threadIdx.x; c < n; c += kThreads) vec[c] *= scale;
+    for (int c = threadIdx.x; c < n; c += kThreads) vec[c] = qat::mulRn(vec[c], scale);
     __syncthreads();
 }
 
@@ -219,7 +222,7 @@ __device__ inline void quantizeShared(ActivationQuant quant, float *vec, int dim
             if (c < nope)
             {
                 const int k = exponents[c / kFP8BlockSize];
-                vec[c] = qat::decodeE4M3(qat::encodeE4M3(vec[c] * qat::exp2i(-k))) * qat::exp2i(k);
+                vec[c] = qat::mulRn(qat::decodeE4M3(qat::encodeE4M3(qat::mulRn(vec[c], qat::exp2i(-k)))), qat::exp2i(k));
             }
             else
                 vec[c] = qat::decodeBF16(qat::encodeBF16(vec[c]));
@@ -233,7 +236,7 @@ __device__ inline void quantizeShared(ActivationQuant quant, float *vec, int dim
         for (int c = threadIdx.x; c < dim; c += kThreads)
         {
             const int k = exponents[c / kFP4BlockSize];
-            vec[c] = qat::decodeE2M1(qat::encodeE2M1(vec[c] * qat::exp2i(-k))) * qat::exp2i(k);
+            vec[c] = qat::mulRn(qat::decodeE2M1(qat::encodeE2M1(qat::mulRn(vec[c], qat::exp2i(-k)))), qat::exp2i(k));
         }
         __syncthreads();
     }
@@ -246,7 +249,7 @@ __device__ inline void packKVShared(const PackedKVEntryFormat &format, const flo
     const int nope = format.nopeDim();
     blockExponents(vec, format.scaleCount(), kFP8BlockSize, false, exponents);
     for (int c = threadIdx.x; c < nope; c += kThreads)
-        entry[c] = qat::encodeE4M3(vec[c] * qat::exp2i(-exponents[c / kFP8BlockSize]));
+        entry[c] = qat::encodeE4M3(qat::mulRn(vec[c], qat::exp2i(-exponents[c / kFP8BlockSize])));
     for (int c = threadIdx.x; c < format.ropeDim; c += kThreads)
     {
         const std::uint16_t payload = qat::encodeBF16(vec[nope + c]);
@@ -267,8 +270,8 @@ __device__ inline void packIndexerShared(const PackedIndexerKeyFormat &format, c
     for (int t = threadIdx.x; t < format.headDim / 2; t += kThreads)
     {
         const float inverse = qat::exp2i(-exponents[(2 * t) / kFP4BlockSize]);
-        entry[t] = static_cast<std::uint8_t>(qat::encodeE2M1(vec[2 * t] * inverse) |
-                                             (qat::encodeE2M1(vec[2 * t + 1] * inverse) << 4));
+        entry[t] = static_cast<std::uint8_t>(qat::encodeE2M1(qat::mulRn(vec[2 * t], inverse)) |
+                                             (qat::encodeE2M1(qat::mulRn(vec[2 * t + 1], inverse)) << 4));
     }
     for (int b = threadIdx.x; b < format.entryBytes() - format.scaleOffset(); b += kThreads)
         entry[format.scaleOffset() + b] =
@@ -455,8 +458,7 @@ __global__ __launch_bounds__(kThreads) void indexerScoreKernel(IndexerTopKArgs a
     float score = 0.0f;
     for (int h = 0; h < a.heads; ++h)
     {
-        const float dot = qat::indexerDot(a.format, query + h * dim, entry);
-        score = fmaf(fmaxf(dot, 0.0f), w[h] * a.weightScale, score);
+        score = qat::indexerAccumulate(score, qat::indexerDot(a.format, query + h * dim, entry), w[h], a.weightScale);
     }
     a.scores[static_cast<std::size_t>(blockIdx.y) * a.poolRows + b] = score;
 }
@@ -464,7 +466,10 @@ __global__ __launch_bounds__(kThreads) void indexerScoreKernel(IndexerTopKArgs a
 /** @brief Order-preserving map of a float to an unsigned key (larger float -> larger key). */
 __device__ inline unsigned orderedKey(float value)
 {
-    const unsigned bits = __float_as_uint(value == 0.0f ? 0.0f : value); // -0 ties +0, as on CPU
+    // Bit-level zero test (an FTZ compare would also map subnormals to zero);
+    // -0 ties +0, as in the CPU comparator.
+    const unsigned raw = __float_as_uint(value);
+    const unsigned bits = (raw & 0x7FFFFFFFu) == 0 ? 0u : raw;
     return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 

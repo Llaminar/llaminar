@@ -220,8 +220,9 @@ TEST_F(DeepSeekV4CUDAKernels, IndexerScoresAreBitIdenticalAndBoundedPassesSelect
     for (int r = 0; r < rows; ++r) pos[r] = 1100 + r; // up to 284 visible blocks
     const float weightScale = 1.0f / std::sqrt(static_cast<float>(dim * heads));
     std::vector<std::int32_t> cpuSelected(static_cast<std::size_t>(rows) * topK);
+    std::vector<float> cpuScores(static_cast<std::size_t>(rows) * poolRows, NAN);
     IndexerTopKArgs a{{rows, nullptr}, heads, format, 4, topK, poolRows, rows, pos.data(), query.data(),
-                      weights.data(), weightScale, pool.data(), nullptr, cpuSelected.data()};
+                      weights.data(), weightScale, pool.data(), cpuScores.data(), cpuSelected.data()};
     cpu_->indexerTopK(a, nullptr);
 
     DeviceBuffer<std::int32_t> dPos(rows), dSelected(cpuSelected.size());
@@ -240,6 +241,18 @@ TEST_F(DeepSeekV4CUDAKernels, IndexerScoresAreBitIdenticalAndBoundedPassesSelect
         upload(dSelected, std::vector<std::int32_t>(cpuSelected.size(), -7));
         gpu_->indexerTopK(a, stream_);
         EXPECT_EQ(download(dSelected), cpuSelected) << "scoreRows " << scoreRows;
+        if (scoreRows == rows)
+        {
+            // Every visible score (cancelling signed dots, unequal block scales)
+            // is the same binary32 word on both backends.
+            const auto gpuScores = download(dScores);
+            for (int r = 0; r < rows; ++r)
+                for (int b = 0; b < (pos[r] + 1) / 4; ++b)
+                {
+                    const std::size_t at = static_cast<std::size_t>(r) * poolRows + b;
+                    ASSERT_EQ(qat::bitsOf(gpuScores[at]), qat::bitsOf(cpuScores[at])) << "row " << r << " block " << b;
+                }
+        }
     }
 }
 
@@ -363,4 +376,59 @@ TEST_F(DeepSeekV4CUDAKernels, FrontierOnlyCacheOwnsNoConversionScratchAndAdvance
         ASSERT_TRUE(cache->resetRequestState(reset));
         EXPECT_EQ(frontier(), 0) << "request reset resets data, not topology";
     }
+}
+
+TEST_F(DeepSeekV4CUDAKernels, QATKeepsSubnormalsDespiteFastMathFTZ)
+{
+    // Production CUDA is compiled with --use_fast_math --ftz=true. A normal
+    // input whose Hadamard + FP4 QAT result is subnormal must survive on the
+    // device exactly as on the CPU: [2^-124, 0, ...] (64 wide) rotates to 64
+    // copies of 2^-127 = E2M1 0.5 at the E8M0 floor scale 2^-126.
+    RopePolicy noRope;
+    noRope.ropeDim = 0;
+    std::vector<float> data(64, 0.0f);
+    data[0] = 0x1p-124f;
+    auto cpu = data;
+    HeadNormRopeArgs a{{1, nullptr}, 1, 64, false, 1e-6f, nullptr, noRope, false, ActivationQuant::HadamardFP4,
+                       nullptr, cpu.data()};
+    cpu_->headNormRope(a, nullptr);
+    for (const float v : cpu) ASSERT_EQ(v, 0x1p-127f);
+    DeviceBuffer<float> dData(data.size());
+    a.data = upload(dData, data);
+    gpu_->headNormRope(a, stream_);
+    const auto gpu = download(dData);
+    for (std::size_t i = 0; i < gpu.size(); ++i) ASSERT_EQ(qat::bitsOf(gpu[i]), qat::bitsOf(cpu[i])) << i;
+
+    // The packed minimum-scale record (scale byte 1, code 0.5) decodes and
+    // scores to subnormals on the device: query 2^-7 per channel gives block
+    // sums 2^-3 and a score of 2 * 2^-3 * 2^-126 = 2^-128. A flushing device
+    // would tie it with the zero key at block 0 and select the lower id.
+    const PackedIndexerKeyFormat format{64};
+    std::vector<std::uint8_t> pool(2 * static_cast<std::size_t>(format.entryBytes()));
+    const std::vector<float> zeros(64, 0.0f);
+    qat::packIndexerKey(format, zeros.data(), pool.data());
+    qat::packIndexerKey(format, cpu.data(), pool.data() + format.entryBytes());
+    ASSERT_EQ(pool[format.entryBytes() + format.scaleOffset()], 1);
+    ASSERT_EQ(qat::decodeIndexerChannel(format, pool.data() + format.entryBytes(), 5), 0x1p-127f);
+    std::vector<float> query(64, 0x1p-7f), weights{1.0f};
+    std::vector<std::int32_t> pos{7}, cpuSelected(1), gpuSelected;
+    std::vector<float> cpuScores(2, NAN);
+    IndexerTopKArgs k{{1, nullptr}, 1, format, 4, 1, 2, 1, pos.data(), query.data(), weights.data(), 1.0f,
+                      pool.data(), cpuScores.data(), cpuSelected.data()};
+    cpu_->indexerTopK(k, nullptr);
+    EXPECT_EQ(cpuScores[1], 0x1p-128f);
+    EXPECT_EQ(cpuSelected[0], 1);
+    DeviceBuffer<std::int32_t> dPos(1), dSelected(1);
+    DeviceBuffer<float> dQuery(64), dWeights(1), dScores(2);
+    DeviceBuffer<std::uint8_t> dPool(pool.size());
+    k.positions = upload(dPos, pos);
+    k.query = upload(dQuery, query);
+    k.weights = upload(dWeights, weights);
+    k.pool = upload(dPool, pool);
+    k.scores = dScores.data;
+    k.selected = dSelected.data;
+    gpu_->indexerTopK(k, stream_);
+    const auto gpuScores = download(dScores);
+    EXPECT_EQ(qat::bitsOf(gpuScores[1]), qat::bitsOf(cpuScores[1]));
+    EXPECT_EQ(download(dSelected)[0], 1);
 }
