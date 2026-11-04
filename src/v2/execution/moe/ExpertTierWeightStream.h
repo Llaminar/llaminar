@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -128,6 +129,50 @@ namespace llaminar2
          */
         [[nodiscard]] ExpertTierWeightDeviceLayout deviceLayout() const noexcept;
     };
+
+    /**
+     * @brief Bind canonical native physical traits to one original CPU root/intersection.
+     * @param native_format Existing CPU layout's native format fields; dimensions are derived afresh.
+     * @param owned Exact original source or destination local rectangle.
+     * @param intersection Same checked source/destination overlap used by every consumer.
+     * @param maximum_chunk_bytes Existing admitted bounded lane capacity.
+     * @return Checked CPU-only storage/wire geometry, without a GPU or remote identity.
+     * @throws std::invalid_argument For foreign rectangles, native traits or insufficient capacity.
+     */
+    [[nodiscard]] ExpertTierWeightCPUStorageLayout cpuExpertTierStorageLayoutForIntersection(
+        ExpertTierWeightCPUStorageLayout native_format,
+        MoEExpertProjectionOwnership::Projection owned,
+        const ExpertTierWeightProjectionIntersection &intersection,
+        std::uint32_t maximum_chunk_bytes);
+
+    /**
+     * @brief Copy exact live native columns directly between existing CPU roots.
+     * @param source_layout Checked original source/root geometry.
+     * @param source Immutable whole original local source allocation.
+     * @param destination_layout Same wire intersection and native encoding, independent root stride.
+     * @param destination Existing final destination root, never a temporary parent.
+     * @param first_unit First actual intersection-relative unit.
+     * @param units Actual bounded units, excluding all resident padding.
+     * @param encoded_write_mutex Shared destination-role authority for Q6 nibble RMW; null only for an exclusive writer.
+     * @return False before mutation for incompatible geometry, ranges or aliases.
+     * @note Scalar encoded fields are copied exactly; no decode/requantization or payload scratch exists.
+     */
+    bool copyExpertTierCPUWeightChunk(
+        const ExpertTierWeightCPUStorageLayout &source_layout,
+        std::span<const std::uint8_t> source,
+        const ExpertTierWeightCPUStorageLayout &destination_layout,
+        std::span<std::uint8_t> destination,
+        std::uint32_t first_unit, std::uint32_t units,
+        std::mutex *encoded_write_mutex = nullptr) noexcept;
+
+    /** @brief Scatter live planes under the SAME destination-role Q6 word-write authority. */
+    bool scatterExpertTierCPUWeightChunk(const ExpertTierWeightDeviceLayout &layout,
+        std::span<const std::uint8_t> compact_chunk, std::uint32_t first_unit, std::uint32_t units,
+        std::span<std::uint8_t> cpu_root, std::mutex *encoded_write_mutex) noexcept;
+    /** @brief CPU-only form of the same shared encoded-word writer. */
+    bool scatterExpertTierCPUWeightChunk(const ExpertTierWeightCPUStorageLayout &layout,
+        std::span<const std::uint8_t> compact_chunk, std::uint32_t first_unit, std::uint32_t units,
+        std::span<std::uint8_t> cpu_root, std::mutex *encoded_write_mutex) noexcept;
 
     /** Header for one monotonically ordered stream chunk. */
     struct ExpertTierWeightStreamChunkHeader

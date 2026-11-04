@@ -672,11 +672,100 @@ namespace llaminar2
         };
     }
 
+    ExpertTierWeightCPUStorageLayout cpuExpertTierStorageLayoutForIntersection(
+        ExpertTierWeightCPUStorageLayout format, MoEExpertProjectionOwnership::Projection owned,
+        const ExpertTierWeightProjectionIntersection &intersection, std::uint32_t capacity)
+    {
+        if (intersection.empty() || (owned != intersection.source() && owned != intersection.destination()) ||
+            intersection.columns() % 32 || intersection.firstColumn() % 32 ||
+            intersection.firstColumn() < owned.first_column ||
+            (intersection.firstColumn() - owned.first_column) % 32 ||
+            format.cpu_block_stride == 0 || format.cpu_block_stride % 64 ||
+            format.wire_columns_per_unit == 0 || format.wire_columns_per_unit > 64)
+            throw std::invalid_argument("CPU native intersection requires its original root and canonical format");
+        const auto units = ((uint64_t(intersection.rows()) + format.wire_columns_per_unit - 1) /
+            format.wire_columns_per_unit) * (intersection.columns() / 32);
+        const auto unit_bytes = uint64_t(format.cpu_block_stride / 64) *
+            std::min<uint32_t>(intersection.rows(), format.wire_columns_per_unit);
+        if (units == 0 || units > UINT32_MAX || unit_bytes == 0 || capacity < unit_bytes)
+            throw std::invalid_argument("CPU native intersection exceeds its bounded lane geometry");
+        format.N = intersection.rows(); format.K = intersection.columns();
+        format.blocks_per_row = intersection.columns() / 32;
+        format.cpu_N = owned.rows; format.cpu_K = owned.columns;
+        format.cpu_first_row = intersection.firstRow() - owned.first_row;
+        format.cpu_first_column = intersection.firstColumn() - owned.first_column;
+        format.unit_count = static_cast<uint32_t>(units);
+        format.maximum_units_per_chunk = static_cast<uint32_t>(std::min<uint64_t>(units, capacity / unit_bytes));
+        if (!format.valid()) throw std::invalid_argument("CPU native intersection has invalid canonical storage traits");
+        return format;
+    }
+
     namespace {
+        /**
+         * @brief Copy one encoded column through the shared native plane mapping.
+         *
+         * A root always has64 physical columns per unit. Compact wire units
+         * retain only live columns; their Q6 high-bit bytes are correspondingly
+         * compact. Direct root-to-root movement uses this SAME mapping twice,
+         * without a wire-sized shadow. Only shared Q6 word RMW is serialized.
+         */
+        void copyCPUEncodedColumn(const ExpertTierWeightCPUStorageLayout &layout,
+            std::span<const uint8_t> source, size_t source_base, size_t source_columns, size_t source_column,
+            std::span<uint8_t> destination, size_t destination_base, size_t destination_columns, size_t destination_column,
+            std::mutex *write_mutex = nullptr) noexcept
+        {
+            const size_t payload_per_column = layout.cpu_data_stride / 64;
+            const bool q6 = layout.cpu_encoding == cpu::native_vnni::CPUNativeVNNIEncoding::Q6KNativeDualScale;
+            const auto copy = [&](size_t from, size_t to, size_t bytes) {
+                std::memcpy(destination.data() + to, source.data() + from, bytes);
+            };
+            for (size_t group = 0; group < (q6 ? 4 : payload_per_column / 4); ++group)
+                copy(source_base + group * source_columns * 4 + source_column * 4,
+                     destination_base + group * destination_columns * 4 + destination_column * 4, 4);
+            if (q6)
+                for (size_t group = 0; group < 8; ++group)
+                {
+                    uint8_t value;
+                    if (source_columns == 64)
+                    {
+                        const size_t plane = source_base + 1024 + group * 64 + (source_column / 16) * 16;
+                        const size_t bit = (source_column % 16) * 4;
+                        uint64_t low, high;
+                        std::memcpy(&low, source.data() + plane, 8);
+                        std::memcpy(&high, source.data() + plane + 8, 8);
+                        value = static_cast<uint8_t>(((low >> bit) & 15) | (((high >> bit) & 15) << 4));
+                    }
+                    else value = source[source_base + 16 * source_columns + group * source_columns + source_column];
+                    if (destination_columns == 64)
+                    {
+                        const size_t plane = destination_base + 1024 + group * 64 + (destination_column / 16) * 16;
+                        const size_t bit = (destination_column % 16) * 4;
+                        std::unique_lock<std::mutex> lock;
+                        if (write_mutex) lock = std::unique_lock<std::mutex>(*write_mutex);
+                        uint64_t low, high;
+                        std::memcpy(&low, destination.data() + plane, 8);
+                        std::memcpy(&high, destination.data() + plane + 8, 8);
+                        low = (low & ~(uint64_t(15) << bit)) | (uint64_t(value & 15) << bit);
+                        high = (high & ~(uint64_t(15) << bit)) | (uint64_t(value >> 4) << bit);
+                        std::memcpy(destination.data() + plane, &low, 8);
+                        std::memcpy(destination.data() + plane + 8, &high, 8);
+                    }
+                    else destination[destination_base + 16 * destination_columns + group * destination_columns + destination_column] = value;
+                }
+            const bool compact = layout.cpu_encoding == cpu::native_vnni::CPUNativeVNNIEncoding::CompactMultiScale;
+            const size_t planes = (layout.cpu_block_stride - layout.cpu_data_stride) / 128;
+            for (size_t plane = 0; plane < (compact ? 2 : planes); ++plane)
+                copy(source_base + payload_per_column * source_columns + plane * source_columns * 2 + source_column * 2,
+                     destination_base + payload_per_column * destination_columns + plane * destination_columns * 2 + destination_column * 2, 2);
+            if (compact)
+                copy(source_base + payload_per_column * source_columns + 4 * source_columns + source_column * 4,
+                     destination_base + payload_per_column * destination_columns + 4 * destination_columns + destination_column * 4, 4);
+        }
         /** @brief Shared encoded plane copier; full and partial units use the same original coordinates. */
         template<bool Gather>
         bool copyCPUIntersection(const ExpertTierWeightCPUStorageLayout& layout,
-            std::span<const uint8_t> source,uint32_t first,uint32_t units,std::span<uint8_t> destination) noexcept
+            std::span<const uint8_t> source,uint32_t first,uint32_t units,std::span<uint8_t> destination,
+            std::mutex *write_mutex = nullptr) noexcept
         {
             if(!layout.valid() || units==0 || first>=layout.unit_count || units>layout.unit_count-first ||
                units>layout.maximum_units_per_chunk) return false;
@@ -686,8 +775,6 @@ namespace llaminar2
             if(!x || !y || source.size()>std::numeric_limits<uintptr_t>::max()-x ||
                destination.size()>std::numeric_limits<uintptr_t>::max()-y ||
                (x<y+destination.size() && y<x+source.size()))return false;
-            const size_t payload_per_column=layout.cpu_data_stride/64;
-            const size_t metadata_planes=(layout.cpu_block_stride-layout.cpu_data_stride)/128;
             size_t wire_offset=0;
             for(uint32_t u=first;u<first+units;++u) {
                 const size_t first_n=size_t(u/layout.blocks_per_row)*layout.wire_columns_per_unit;
@@ -706,62 +793,73 @@ namespace llaminar2
                     else std::memcpy(destination.data()+root_unit*layout.cpu_block_stride,source.data()+wire_offset,bytes);
                     wire_offset+=bytes;u+=static_cast<uint32_t>(run-1);continue;
                 }
-                if constexpr(Gather)if(layout.cpu_encoding==cpu::native_vnni::CPUNativeVNNIEncoding::Q6KNativeDualScale && columns==64)
-                    std::memset(destination.data()+wire_offset+1024,0,512);
-                for(size_t column=0;column<columns;++column) {
-                    const size_t cpu_n=layout.cpu_first_row+first_n+column;
-                    const size_t root_unit=(cpu_n/64)*(layout.cpu_K/32)+layout.cpu_first_column/32+kb;
-                    const size_t root_offset=root_unit*layout.cpu_block_stride;
-                    const size_t root_column=cpu_n%64;
-                    const auto copy=[&](size_t cpu,size_t wire,size_t bytes) {
-                        if constexpr(Gather)std::memcpy(destination.data()+wire,source.data()+cpu,bytes);
-                        else std::memcpy(destination.data()+cpu,source.data()+wire,bytes);
-                    };
-                    const bool q6=layout.cpu_encoding==cpu::native_vnni::CPUNativeVNNIEncoding::Q6KNativeDualScale;
-                    for(size_t group=0;group<(q6?4:payload_per_column/4);++group)
-                        copy(root_offset+group*256+root_column*4,wire_offset+group*columns*4+column*4,4);
-                    if(q6)for(size_t group=0;group<8;++group) {
-                        const size_t plane=root_offset+1024+group*64+(root_column/16)*16;
-                        const size_t bit=(root_column%16)*4;
-                        const size_t wire=wire_offset+16*columns+group*columns+column;
-                        uint64_t low,high;
-                        if constexpr(Gather) {
-                            std::memcpy(&low,source.data()+plane,8);std::memcpy(&high,source.data()+plane+8,8);
-                            if(columns==64) {
-                                const size_t wire_plane=wire_offset+1024+group*64+(column/16)*16;
-                                uint64_t wire_low,wire_high;const auto wire_bit=(column%16)*4;
-                                std::memcpy(&wire_low,destination.data()+wire_plane,8);std::memcpy(&wire_high,destination.data()+wire_plane+8,8);
-                                wire_low|=((low>>bit)&15)<<wire_bit;wire_high|=((high>>bit)&15)<<wire_bit;
-                                std::memcpy(destination.data()+wire_plane,&wire_low,8);std::memcpy(destination.data()+wire_plane+8,&wire_high,8);
-                            } else destination[wire]=static_cast<uint8_t>(((low>>bit)&15)|(((high>>bit)&15)<<4));
-                        } else {
-                            std::memcpy(&low,destination.data()+plane,8);std::memcpy(&high,destination.data()+plane+8,8);
-                            uint8_t value=source[wire];
-                            if(columns==64) {
-                                const size_t wire_plane=wire_offset+1024+group*64+(column/16)*16;
-                                uint64_t wire_low,wire_high;const auto wire_bit=(column%16)*4;
-                                std::memcpy(&wire_low,source.data()+wire_plane,8);std::memcpy(&wire_high,source.data()+wire_plane+8,8);
-                                value=static_cast<uint8_t>(((wire_low>>wire_bit)&15)|(((wire_high>>wire_bit)&15)<<4));
-                            }
-                            low=(low&~(uint64_t(15)<<bit))|(uint64_t(value&15)<<bit);
-                            high=(high&~(uint64_t(15)<<bit))|(uint64_t(value>>4)<<bit);
-                            std::memcpy(destination.data()+plane,&low,8);std::memcpy(destination.data()+plane+8,&high,8);
-                        }
-                    }
-                    const bool compact=layout.cpu_encoding==cpu::native_vnni::CPUNativeVNNIEncoding::CompactMultiScale;
-                    for(size_t plane=0;plane<(compact?2:metadata_planes);++plane)
-                        copy(root_offset+layout.cpu_data_stride+plane*128+root_column*2,
-                            wire_offset+payload_per_column*columns+plane*columns*2+column*2,2);
-                    // Compact multi-scale minima are one32-bit field per
-                    // column, not two independent16-bit column planes.
-                    if(compact)copy(root_offset+layout.cpu_data_stride+256+root_column*4,
-                        wire_offset+payload_per_column*columns+4*columns+column*4,4);
+                for (size_t column = 0; column < columns; ++column)
+                {
+                    const size_t cpu_n = layout.cpu_first_row + first_n + column;
+                    const size_t root_unit = (cpu_n / 64) * (layout.cpu_K / 32) + layout.cpu_first_column / 32 + kb;
+                    const size_t root_offset = root_unit * layout.cpu_block_stride;
+                    if constexpr (Gather)
+                        copyCPUEncodedColumn(layout, source, root_offset, 64, cpu_n % 64,
+                            destination, wire_offset, columns, column);
+                    else
+                        copyCPUEncodedColumn(layout, source, wire_offset, columns, column,
+                            destination, root_offset, 64, cpu_n % 64, write_mutex);
                 }
                 wire_offset+=columns*(layout.cpu_block_stride/64);
             }
             return true;
         }
     }
+    bool copyExpertTierCPUWeightChunk(const ExpertTierWeightCPUStorageLayout &from,
+        std::span<const uint8_t> source, const ExpertTierWeightCPUStorageLayout &to,
+        std::span<uint8_t> destination, uint32_t first, uint32_t units,
+        std::mutex *write_mutex) noexcept
+    {
+        if (!from.valid() || !to.valid() || from.N != to.N || from.K != to.K ||
+            from.cpu_codebook_id != to.cpu_codebook_id || from.cpu_is_superblock != to.cpu_is_superblock ||
+            from.cpu_is_asymmetric != to.cpu_is_asymmetric || from.cpu_encoding != to.cpu_encoding ||
+            from.cpu_data_stride != to.cpu_data_stride || from.cpu_block_stride != to.cpu_block_stride ||
+            from.wire_columns_per_unit != to.wire_columns_per_unit || units == 0 || first >= from.unit_count ||
+            units > from.unit_count - first || units > from.maximum_units_per_chunk ||
+            units > to.maximum_units_per_chunk || source.size() != from.cpuStorageBytes() ||
+            destination.size() != to.cpuStorageBytes()) return false;
+        const auto x = reinterpret_cast<uintptr_t>(source.data()), y = reinterpret_cast<uintptr_t>(destination.data());
+        if (!x || !y || source.size() > std::numeric_limits<uintptr_t>::max() - x ||
+            destination.size() > std::numeric_limits<uintptr_t>::max() - y ||
+            (x < y + destination.size() && y < x + source.size())) return false;
+        for (uint32_t unit = first; unit < first + units; ++unit)
+        {
+            const size_t first_n = size_t(unit / from.blocks_per_row) * from.wire_columns_per_unit;
+            const size_t columns = std::min(size_t(from.wire_columns_per_unit), size_t(from.N) - first_n);
+            const size_t kb = unit % from.blocks_per_row;
+            if (columns == 64 && (size_t(from.cpu_first_row) + first_n) % 64 == 0 &&
+                (size_t(to.cpu_first_row) + first_n) % 64 == 0)
+            {
+                const auto source_unit = ((size_t(from.cpu_first_row) + first_n) / 64) * (from.cpu_K / 32) + from.cpu_first_column / 32 + kb;
+                const auto destination_unit = ((size_t(to.cpu_first_row) + first_n) / 64) * (to.cpu_K / 32) + to.cpu_first_column / 32 + kb;
+                const size_t regular_end = size_t(from.N / 64) * from.blocks_per_row;
+                const size_t contiguous = from.cpu_K == from.K && to.cpu_K == to.K &&
+                    from.cpu_first_column == 0 && to.cpu_first_column == 0
+                    ? regular_end - unit : size_t(from.blocks_per_row) - kb;
+                const auto run = std::min(contiguous, size_t(first + units - unit));
+                std::memcpy(destination.data() + destination_unit * to.cpu_block_stride,
+                    source.data() + source_unit * from.cpu_block_stride, run * from.cpu_block_stride);
+                unit += static_cast<uint32_t>(run - 1);
+                continue;
+            }
+            for (size_t column = 0; column < columns; ++column)
+            {
+                const size_t source_n = from.cpu_first_row + first_n + column;
+                const size_t destination_n = to.cpu_first_row + first_n + column;
+                const auto source_unit = (source_n / 64) * (from.cpu_K / 32) + from.cpu_first_column / 32 + kb;
+                const auto destination_unit = (destination_n / 64) * (to.cpu_K / 32) + to.cpu_first_column / 32 + kb;
+                copyCPUEncodedColumn(from, source, source_unit * from.cpu_block_stride, 64, source_n % 64,
+                    destination, destination_unit * to.cpu_block_stride, 64, destination_n % 64, write_mutex);
+            }
+        }
+        return true;
+    }
+
     bool gatherExpertTierCPUWeightChunk(const ExpertTierWeightDeviceLayout& layout,
         std::span<const uint8_t> cpu,uint32_t first,uint32_t units,std::span<uint8_t> wire) noexcept
     {return layout.valid() && copyCPUIntersection<true>(layout.cpuStorage(),cpu,first,units,wire);}
@@ -803,6 +901,15 @@ namespace llaminar2
      * Construction records invalid input rather than throwing so `accept()` can
      * reject all data through the same diagnostic path without partial writes.
      */
+    bool scatterExpertTierCPUWeightChunk(const ExpertTierWeightDeviceLayout &layout,
+        std::span<const uint8_t> wire, uint32_t first, uint32_t units, std::span<uint8_t> cpu,
+        std::mutex *write_mutex) noexcept
+    { return layout.valid() && copyCPUIntersection<false>(layout.cpuStorage(), wire, first, units, cpu, write_mutex); }
+    bool scatterExpertTierCPUWeightChunk(const ExpertTierWeightCPUStorageLayout &layout,
+        std::span<const uint8_t> wire, uint32_t first, uint32_t units, std::span<uint8_t> cpu,
+        std::mutex *write_mutex) noexcept
+    { return copyCPUIntersection<false>(layout, wire, first, units, cpu, write_mutex); }
+
     ExpertTierWeightStreamReceiver::ExpertTierWeightStreamReceiver(
         ExpertTierWeightStreamManifest manifest,
         std::span<uint8_t> final_bytes)

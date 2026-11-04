@@ -9,6 +9,8 @@
  * Cold producer binding authenticates the original context/manager once;
  * weak retained ownership avoids cycles, while scoped source uses protect only
  * active preparation. Existing bank leases retain their own physical engines.
+ * Cold diagnostics inspect the existing retired chain under its writer mutex;
+ * published-slot count is distinct from readers pinning an unpublished node.
  */
 
 #include "MoEOverlayParticipantResidency.h"
@@ -1167,6 +1169,19 @@ namespace llaminar2
                             : 0u;
         }
         return retained;
+    }
+
+    std::optional<uint64_t>
+    MoEOverlayParticipantResidency::retiredEpochReaders(uint64_t epoch) const noexcept
+    {
+        std::lock_guard<std::mutex> lock(state_->writer_mutex_);
+        for (const auto *node = state_->retired_head_.get(); node;
+             node = node->retired_next.get())
+        {
+            if (node->bank.epoch == epoch)
+                return node->reader_count.load(std::memory_order_acquire);
+        }
+        return std::nullopt;
     }
 
     bool MoEOverlayParticipantResidency::hasCandidateCapacity() const noexcept

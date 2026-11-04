@@ -10,6 +10,8 @@
  * participant-local RCU storage without owning routing or global publication.
  * Each bank binds one immutable global layer interval; storage is compact and
  * checked model-layer lookups prevent another pipeline stage from aliasing it.
+ * Withdrawal removes ready publication immediately; the actual retired node
+ * remains owned by this RCU state until its original readers have drained.
  */
 
 #pragma once
@@ -627,8 +629,23 @@ namespace llaminar2
          */
         bool retire(uint64_t epoch) noexcept;
 
-        /** @return Number of ready epochs currently retained by the endpoint. */
+        /**
+         * @return Number of published ready epochs, excluding withdrawn retired nodes
+         *         even while their original readers still prevent reclamation.
+         */
         [[nodiscard]] std::size_t retainedEpochCount() const noexcept;
+
+        /**
+         * @brief Observe one actual retired node's readers at a cold lifecycle boundary.
+         * @param epoch Original withdrawn bank epoch, never a candidate readiness claim.
+         * @return Its actual atomic reader count while the retired node remains present,
+         *         or no value if absent/reclaimed. Zero may precede the next maintenance sweep.
+         * @note Takes the existing maintenance writer mutex to protect node traversal.
+         *       It does not acquire a reader, publish, reclaim, allocate, or retain a
+         *       mirror/ledger. Never use this diagnostic in inference or to admit bytes;
+         *       the original hazard/readers protocol remains the reclamation authority.
+         */
+        [[nodiscard]] std::optional<uint64_t> retiredEpochReaders(uint64_t epoch) const noexcept;
 
         /** @return Whether another complete candidate bank can be installed. */
         [[nodiscard]] bool hasCandidateCapacity() const noexcept;

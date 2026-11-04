@@ -504,11 +504,7 @@ namespace llaminar2::test
         {
             MoEOverlayMPIRemoteProjectionTransport transport({
                 .mpi_context = context,
-                .lane_budget = {
-                    .maximum_participants_per_cycle = 2,
-                    .maximum_concurrent_cycles = 1,
-                    .projections_per_expert = kProjectionCount,
-                },
+                .lane_budget = MoEOverlayRemoteProjectionLaneBudget::fromUniformCycles(2, 1, kProjectionCount),
                 .staging_capacity_bytes = staging_bytes,
                 .perf_device = "rocm1_mpi_remote_projection",
             });

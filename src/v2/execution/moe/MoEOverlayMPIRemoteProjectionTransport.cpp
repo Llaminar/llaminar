@@ -236,10 +236,12 @@ namespace llaminar2
             std::shared_ptr<void> lifetime,
             std::optional<MoEOverlayRemoteProjectionManifest>
                 expected_manifest,
-            MoEOverlayRemoteProjectionManifestMatchPolicy match_policy)
+            MoEOverlayRemoteProjectionManifestMatchPolicy match_policy,
+            std::shared_ptr<std::mutex> encoded_write_mutex)
         : expected_identity_(expected_identity),
           regions_(regions),
           lifetime_(std::move(lifetime)),
+          encoded_write_mutex_(std::move(encoded_write_mutex)),
           expected_manifest_(std::move(expected_manifest)),
           match_policy_(match_policy)
     {
@@ -371,7 +373,7 @@ namespace llaminar2
         }
 
         if(cpu_layout_) {
-            if(!scatterExpertTierCPUWeightChunk(*cpu_layout_,payload,first,units,regions_[0])) {
+            if(!scatterExpertTierCPUWeightChunk(*cpu_layout_,payload,first,units,regions_[0],encoded_write_mutex_.get())) {
                 validator_->abort();setError(error,"Remote native intersection scatter rejected original final storage");
                 return MoEOverlayResidencyWaveProgress::Failed;
             }
@@ -660,14 +662,17 @@ namespace llaminar2
             MoEOverlayResidencyWaveProgress poll(
                 std::string *error) noexcept override
             {
+                // Ready is reached only after genuine admitted transfer and
+                // final ACK. It remains a stable query after that operation
+                // releases its lane; querying it must not touch a later owner.
+                if (state_ == State::Ready)
+                    return MoEOverlayResidencyWaveProgress::Ready;
                 if (lane_released_)
                 {
                     return failProtocol(
                         "Remote projection was polled before atomic lane admission",
                         error);
                 }
-                if (state_ == State::Ready)
-                    return MoEOverlayResidencyWaveProgress::Ready;
                 if (state_ == State::Failed || state_ == State::Aborting ||
                     state_ == State::AbortReady)
                 {
@@ -1578,9 +1583,9 @@ namespace llaminar2
             static_cast<double>(impl_->lanes.size()),
             {{"staging_capacity_bytes",
               std::to_string(config_.staging_capacity_bytes)},
-             {"maximum_participants_per_cycle",
+             {"maximum_pieces_per_projection_wave",
               std::to_string(
-                  config_.lane_budget.maximum_participants_per_cycle)},
+                  config_.lane_budget.maximum_pieces_per_projection_wave)},
              {"maximum_concurrent_cycles",
               std::to_string(
                   config_.lane_budget.maximum_concurrent_cycles)},

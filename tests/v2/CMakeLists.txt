@@ -19326,6 +19326,7 @@ add_v2_test(V2_Integration_MoEOverlayRankBatchForkJoin_MPI
 
 # Test: non-blocking two-phase ExpertOverlay residency votes over real MPI
 add_executable(v2_integration_moe_overlay_residency_consensus_mpi
+    integration/moe/Test__MoEOverlayCPUCohortFabric.cpp
     integration/moe/Test__MoEOverlayMPIResidencyConsensus.cpp
     integration/moe/Test__MoEOverlayMPITransactionPublication.cpp
     integration/mpi_gtest_main.cpp
@@ -19337,11 +19338,25 @@ target_link_libraries(v2_integration_moe_overlay_residency_consensus_mpi
 )
 add_v2_test(V2_Integration_MoEOverlayResidencyConsensus_MPI
     COMMAND $<TARGET_FILE:v2_integration_moe_overlay_residency_consensus_mpi>
+        --gtest_filter=-MoEOverlayCPUCohortFabric.*
     LABELS "V2;Integration;CPU;MoE;Overlay;Residency;Async;TypedLifecycle;MPI;PerfStats;ByteExact;NoBlocking"
     MPI_PROCS 2
     TIMEOUT 60
     NO_MODELS
 )
+
+if(V2_TEST_SOCKETS AND V2_TEST_SOCKETS GREATER_EQUAL 2)
+    add_v2_test(V2_Integration_MoEOverlayCPUCohortPhysicalStagingAbort
+        COMMAND $<TARGET_FILE:v2_integration_moe_overlay_residency_consensus_mpi>
+            --gtest_filter=MoEOverlayCPUCohortFabric.* --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;MoE;MPI;Residency;Transfer;Lifecycle;ByteExact;Contract"
+        MPI_PROCS 2 NO_MODELS TIMEOUT 120
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1"
+            "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1")
+else()
+    message(STATUS "CPU cohort physical fabric: unqualified (requires two discovered physical sockets); no MPI launch")
+endif()
+
 add_v2_test(V2_Integration_ExpertOverlayRetirementProgress_MPI
     COMMAND $<TARGET_FILE:v2_integration_moe_overlay_residency_consensus_mpi>
         --gtest_filter=Test__MoEOverlayMPIResidencyConsensus.QueuedDemandKeepsRetirementConsensusProgressingBeforeNextProposal

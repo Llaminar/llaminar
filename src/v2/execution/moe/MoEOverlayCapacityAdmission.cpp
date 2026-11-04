@@ -12,6 +12,7 @@
 
 #include "MoEOverlayCapacityAdmission.h"
 #include "MoEOverlayNoPeerResidency.h"
+#include "MoEOverlayPhysicalLaneDemand.h"
 
 #include <algorithm>
 #include <limits>
@@ -305,7 +306,9 @@ namespace llaminar2
     MoEOverlayCapacityAdmission::transferStagingBOM(
         const MoERoutedExpertPlacementPlan &plan,
         int world_size,
-        const MoEOverlayCapacityAdmissionPolicy &policy)
+        const MoEOverlayCapacityAdmissionPolicy &policy,
+        const std::vector<MoEOverlayLayerWeightManifest>& original_manifest,
+        int original_experts)
     {
         if (!policy.usesPhysicalResidencyFabric())
             return {};
@@ -327,152 +330,38 @@ namespace llaminar2
                 "ExpertOverlay migration fabric requires positive capacities and a communicator-consistent distributed policy");
         }
 
-        constexpr std::size_t kProjectionCount = 3;
-        constexpr std::size_t kRemoteRolesPerGpu = 2;
-        constexpr std::size_t kBlobSlots = 2;
-        constexpr std::size_t kPinnedRegionsPerBlobSlot = 2;
-
-        const auto participants = boundParticipants(plan);
-        std::map<int, std::map<DeviceId, std::size_t>>
-            participant_multiplicity_by_rank;
-        for (const auto &participant : participants)
-        {
-            if (participant.world_rank < 0 ||
-                participant.world_rank >= world_size)
-            {
-                throw std::invalid_argument(
-                    "ExpertOverlay participant rank lies outside the overlay communicator");
-            }
-            ++participant_multiplicity_by_rank[participant.world_rank]
-                                               [participant.device];
-        }
-
-        std::map<PhysicalKey, std::size_t> bytes_by_resource;
-        const auto addChunks = [&](
-            int world_rank,
-            DeviceId device,
-            std::size_t chunks,
-            const char *what)
-        {
-            const std::size_t bytes = checkedMultiply(
-                chunks, policy.staging_capacity_bytes, what);
-            auto &total = bytes_by_resource[PhysicalKey{world_rank, device}];
-            total = checkedAdd(total, bytes, what);
+        const auto demand=configuredMoEOverlayLaneDemand(plan,original_manifest,original_experts,
+            world_size,policy.maximum_concurrent_cycles,policy.maximum_cycles_per_layer);
+        const auto counts=demand.materializedCounts();
+        std::map<PhysicalKey,std::size_t> bytes_by_resource;
+        const auto add=[&](int rank,DeviceId device,size_t count) {
+            const auto bytes=checkedMultiply(count,policy.staging_capacity_bytes,"physical piece staging chunks");
+            auto& total=bytes_by_resource[{rank,device}];total=checkedAdd(total,bytes,"physical piece staging BOM");
         };
-
-        for (int world_rank = 0; world_rank < world_size; ++world_rank)
-        {
-            const auto found = participant_multiplicity_by_rank.find(
-                world_rank);
-            const std::map<DeviceId, std::size_t> empty;
-            const auto &devices = found ==
-                    participant_multiplicity_by_rank.end()
-                ? empty
-                : found->second;
-
-            /*
-             * A closed cycle visits a logical participant at most once. Thus
-             * one physical edge can carry at most the smaller endpoint
-             * multiplicity per cycle. Materialize that exact upper bound for
-             * every admitted cycle so software never queues one independent
-             * move behind another.
-             */
-            for (const auto &[source, source_multiplicity] : devices)
-            {
-                for (const auto &[destination, destination_multiplicity] :
-                     devices)
-                {
-                    if (source == destination)
-                        continue;
-                    const std::size_t edge_lanes = checkedMultiply(
-                        policy.maximum_concurrent_cycles,
-                        std::min(
-                            source_multiplicity,
-                            destination_multiplicity),
-                        "local parallel migration lanes");
-                    if ((source.is_cpu() && destination.is_gpu()) ||
-                        (source.is_gpu() && destination.is_cpu()))
-                    {
-                        const DeviceId gpu =
-                            source.is_gpu() ? source : destination;
-                        addChunks(
-                            world_rank,
-                            gpu,
-                            checkedMultiply(
-                                kProjectionCount,
-                                edge_lanes,
-                                "local GPU/CPU projection lanes"),
-                            "local GPU/CPU device staging");
-                        addChunks(
-                            world_rank,
-                            DeviceId::cpu(),
-                            checkedMultiply(
-                                kProjectionCount,
-                                edge_lanes,
-                                "local GPU/CPU projection lanes"),
-                            "local GPU/CPU pinned staging");
-                    }
-                    else if (source.is_gpu() && destination.is_gpu() &&
-                             source.type != destination.type)
-                    {
-                        /* Two slots, each with source- and destination-runtime pinned storage. */
-                        addChunks(
-                            world_rank,
-                            DeviceId::cpu(),
-                            checkedMultiply(
-                                kProjectionCount,
-                                checkedMultiply(
-                                    edge_lanes,
-                                    kBlobSlots *
-                                        kPinnedRegionsPerBlobSlot,
-                                    "heterogeneous GPU parallel lanes"),
-                                "heterogeneous GPU blob staging chunks"),
-                            "heterogeneous GPU blob pinned staging");
-                    }
+        for(const auto& [key,count]:counts) {
+            switch(key.kind) {
+            case MoEOverlayPhysicalLaneKind::LocalDevice:
+                if(key.source.is_cpu()!=key.destination.is_cpu()) {
+                    add(key.world_rank,key.source.is_gpu()?key.source:key.destination,count);
+                    add(key.world_rank,DeviceId::cpu(),count);
+                } else if(key.source.is_gpu() && key.destination.is_gpu() && key.source.type!=key.destination.type)
+                    add(key.world_rank,DeviceId::cpu(),checkedMultiply(count,4,"two runtime-pinned regions per double-buffered blob"));
+                break;
+            case MoEOverlayPhysicalLaneKind::RemoteSource:
+            case MoEOverlayPhysicalLaneKind::RemoteDestination:
+                if(policy.distributed_transport) {
+                    add(key.world_rank,key.kind==MoEOverlayPhysicalLaneKind::RemoteSource?key.source:key.destination,count);
+                    add(key.world_rank,DeviceId::cpu(),count);
                 }
+                break;
+            case MoEOverlayPhysicalLaneKind::RemoteProjectionDirectory:
+                if(policy.distributed_transport)for(int rank=0;rank<world_size;++rank)add(rank,DeviceId::cpu(),count);
+                break;
+            case MoEOverlayPhysicalLaneKind::LocalCPUWorker:
+                // Existing NUMA workers copy admitted final roots directly;
+                // neither a rectangle nor a compact tail adds CPU scratch.
+                break;
             }
-
-            if (!policy.distributed_transport)
-                continue;
-
-            for (const auto &[device, multiplicity] : devices)
-            {
-                if (!device.is_gpu())
-                    continue;
-                const std::size_t remote_chunks = checkedMultiply(
-                    checkedMultiply(
-                        kProjectionCount,
-                        kRemoteRolesPerGpu,
-                        "remote GPU projection roles"),
-                    checkedMultiply(
-                        policy.maximum_concurrent_cycles,
-                        multiplicity,
-                        "remote GPU parallel lanes"),
-                    "remote GPU staging chunks");
-                addChunks(
-                    world_rank,
-                    device,
-                    remote_chunks,
-                    "remote GPU device staging");
-                addChunks(
-                    world_rank,
-                    DeviceId::cpu(),
-                    remote_chunks,
-                    "remote GPU pinned staging");
-            }
-
-            /* The MPI data plane retains one host payload per global projection lane. */
-            addChunks(
-                world_rank,
-                DeviceId::cpu(),
-                checkedMultiply(
-                    participants.size(),
-                    checkedMultiply(
-                        kProjectionCount,
-                        policy.maximum_concurrent_cycles,
-                        "remote MPI concurrent projection lanes"),
-                    "remote MPI projection lanes"),
-                "remote MPI payload staging");
         }
 
         std::vector<MoEOverlayTransferStagingCharge> result;
@@ -582,7 +471,7 @@ namespace llaminar2
 
         const auto bound_participants = boundParticipants(plan);
         const auto staging_bom = transferStagingBOM(
-            plan, policy.overlay_world_size, policy);
+            plan, policy.overlay_world_size, policy,layer_weight_manifest,num_experts);
         std::map<PhysicalKey, std::size_t> staging_by_key;
         std::map<PhysicalKey, std::size_t> workspace_by_key;
         for (const auto &charge : staging_bom)

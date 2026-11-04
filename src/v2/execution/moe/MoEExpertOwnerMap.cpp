@@ -983,13 +983,31 @@ namespace llaminar2
         {
             const auto &owner = owners_[index];
             if (owner.layer_idx != first_model_layer + static_cast<int>(index / num_experts) ||
-                owner.expert_id != static_cast<int>(index % num_experts) ||
-                owner.owner_participant < 0 ||
-                static_cast<std::size_t>(owner.owner_participant) >= participants_.size())
+                owner.expert_id != static_cast<int>(index % num_experts))
             {
                 throw std::logic_error(
                     "MoE expert owner map exceeds the requested model or participant geometry");
             }
+            const auto target = MoEExpertPlacementTarget::fromPlacement(owner);
+            if (!target)
+                throw std::logic_error("MoE expert geometry requires a complete physical placement target");
+            for (std::size_t member = 0; member < target->participantCount(); ++member)
+            {
+                const auto *declared = participantForId(target->participantId(member));
+                if (!declared || declared->tier_idx != owner.tier_idx)
+                    throw std::logic_error("MoE expert geometry names an undeclared physical member");
+                if (owner.shard_cohort)
+                {
+                    const auto &fragment = owner.shard_cohort->participants()[member];
+                    if (!declared->device.is_cpu() || !declared->world_rank_known ||
+                        declared->world_rank != fragment.world_rank || declared->address != fragment.address)
+                        throw std::logic_error("MoE expert geometry changed its original CPU cohort member");
+                }
+            }
+            if (owner.shard_cohort &&
+                (owner.shard_cohort->source().layer_idx != owner.layer_idx ||
+                 owner.shard_cohort->ownership(0).geometry().experts != num_experts))
+                throw std::logic_error("MoE expert cohort has foreign original model geometry");
         }
     }
 
@@ -999,6 +1017,12 @@ namespace llaminar2
         int first_model_layer) const
     {
         requireLayerGeometry(num_layers, num_experts, first_model_layer);
+        // Geometry is meaningful for both ownership arms. A scalar execution
+        // table is not: never substitute one cohort member (or -1) for the
+        // complete target after the common geometry check succeeds.
+        if (std::any_of(owners_.begin(), owners_.end(),
+                        [](const auto &owner) { return bool(owner.shard_cohort); }))
+            throw std::logic_error("Scalar layered ownership cannot represent expert shard cohorts");
         std::vector<std::vector<int>> owners(
             static_cast<std::size_t>(num_layers),
             std::vector<int>(static_cast<std::size_t>(num_experts)));

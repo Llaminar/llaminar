@@ -23,6 +23,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <memory>
+#include <mutex>
 #include <string>
 
 namespace llaminar2
@@ -203,6 +205,14 @@ namespace llaminar2
             const ExpertTierWeightProjectionIntersection& intersection,std::string* error=nullptr) noexcept;
 
         /**
+         * @brief Bind the actual final-role encoded-word writer before starting a reserved lane.
+         * @param owner SAME destination-role authority shared with other local/remote pieces; null denotes an exclusive writer.
+         * @throws std::logic_error If a prior transfer can still touch final storage.
+         * @note This controls host encoded-bit writes only, never execution readiness or source authority.
+         */
+        void bindCPUEncodedWriteOwnership(std::shared_ptr<std::mutex> owner);
+
+        /**
          * @brief Advance the state machine using a non-blocking event query.
          * @param error Optional exact query or enqueue failure.
          * @return Current transfer progress after at most one completed chunk.
@@ -333,6 +343,7 @@ namespace llaminar2
         ExpertTierGpuConstProjectionView gpu_source_;
         ExpertTierGpuMutableProjectionView gpu_destination_;
         std::span<std::uint8_t> cpu_destination_;
+        std::shared_ptr<std::mutex> cpu_encoded_write_mutex_;
         std::span<const std::uint8_t> cpu_source_;
         const std::uint8_t *gpu_contiguous_source_ = nullptr;
         std::uint8_t *gpu_contiguous_destination_ = nullptr;

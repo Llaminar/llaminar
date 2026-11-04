@@ -404,6 +404,8 @@ namespace llaminar2
          * @param plan Hardware-bound tier/domain topology.
          * @param world_size Exact overlay communicator size.
          * @param policy Migration materialization and chunk policy.
+         * @param original_manifest Complete original source shapes and native formats.
+         * @param original_experts Full original expert axis, never a tier quota.
          * @return Sorted nonzero rank/device staging charges.
          * @throws std::invalid_argument for inconsistent policy/topology.
          * @throws std::overflow_error when the materialized BOM overflows.
@@ -412,7 +414,9 @@ namespace llaminar2
         transferStagingBOM(
             const MoERoutedExpertPlacementPlan &plan,
             int world_size,
-            const MoEOverlayCapacityAdmissionPolicy &policy);
+            const MoEOverlayCapacityAdmissionPolicy &policy,
+            const std::vector<MoEOverlayLayerWeightManifest>& original_manifest,
+            int original_experts);
 
         /**
          * @brief Build the complete pure input consumed by the byte resolver.

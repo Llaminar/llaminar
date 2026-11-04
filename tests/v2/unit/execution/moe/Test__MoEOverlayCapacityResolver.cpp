@@ -1014,7 +1014,7 @@ namespace llaminar2
         }
         EXPECT_TRUE(
             MoEOverlayCapacityAdmission::transferStagingBOM(
-                plan, 1, policy)
+                plan, 1, policy,{},0)
                 .empty());
 
         auto incomplete_policy = policy;
@@ -1615,7 +1615,7 @@ namespace llaminar2
             .overlay_world_size = 2,
         };
         const auto charges = MoEOverlayCapacityAdmission::transferStagingBOM(
-            plan, /*world_size=*/2, policy);
+            plan, /*world_size=*/2, policy,manifest(1,native_vnni_formats::Q4_0),4);
         const auto bytesFor = [&](int rank, DeviceId device)
         {
             const auto found = std::find_if(
@@ -1645,7 +1645,7 @@ namespace llaminar2
         EXPECT_THROW(
             (void)MoEOverlayCapacityAdmission::transferStagingBOM(
                 plan, /*world_size=*/2,
-                underprovisioned_two_cycle_policy),
+                underprovisioned_two_cycle_policy,manifest(1,native_vnni_formats::Q4_0),4),
             std::invalid_argument);
 
         auto two_cycle_policy = underprovisioned_two_cycle_policy;
@@ -1656,7 +1656,7 @@ namespace llaminar2
                     two_cycle_policy.maximum_cycles_per_layer);
         const auto two_cycle_charges =
             MoEOverlayCapacityAdmission::transferStagingBOM(
-                plan, /*world_size=*/2, two_cycle_policy);
+                plan, /*world_size=*/2, two_cycle_policy,manifest(1,native_vnni_formats::Q4_0),4);
         ASSERT_EQ(two_cycle_charges.size(), charges.size());
         for (std::size_t index = 0; index < charges.size(); ++index)
         {
@@ -1686,7 +1686,7 @@ namespace llaminar2
         const auto broad_charges =
             MoEOverlayCapacityAdmission::transferStagingBOM(
                 plan, /*world_size=*/2,
-                broad_one_cycle_per_layer_policy);
+                broad_one_cycle_per_layer_policy,manifest(8,native_vnni_formats::Q4_0),4);
         ASSERT_EQ(broad_charges.size(), charges.size());
         for (std::size_t index = 0; index < charges.size(); ++index)
         {
@@ -4100,3 +4100,5 @@ namespace llaminar2
 #include "CPUExpertShardAccountingReplay.inc"
 
 #include "CPUJointSerialGeometryContract.inc"
+
+#include "PhysicalProjectionLaneDemandContract.inc"

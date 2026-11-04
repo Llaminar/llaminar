@@ -203,6 +203,20 @@ namespace llaminar2
         std::uint32_t maximum_chunk_bytes);
 
     /**
+     * @brief Author a receiver expectation from its genuine native destination root.
+     * @param identity Original exact physical source/destination protocol identity.
+     * @param destination Actual final CPU destination native storage metadata.
+     * @param intersection Original checked source/destination rectangles.
+     * @param maximum_chunk_bytes Existing admitted transport capacity.
+     * @return Expected manifest only; grants no source payload or readiness authority.
+     * @throws std::invalid_argument For foreign destination geometry/format or capacity.
+     */
+    [[nodiscard]] MoEOverlayRemoteProjectionManifest makeMoEOverlayRemoteCpuDestinationProjectionManifest(
+        const MoEOverlayRemoteProjectionIdentity &identity,
+        const cpu::native_vnni::CPUNativeVNNIPackedWeights &destination,
+        const ExpertTierWeightProjectionIntersection &intersection, std::uint32_t maximum_chunk_bytes);
+
+    /**
      * @brief Wrap a CPU/GPU conversion stream for cross-rank transport.
      * @param identity Exact cross-rank transaction/projection identity.
      * @param stream Valid GPU-to-CPU or CPU-to-GPU conversion manifest.
@@ -246,6 +260,19 @@ namespace llaminar2
         const MoEOverlayRemoteProjectionIdentity &identity,
         const ContiguousFloatingPointWeightDescriptor &source,
         std::uint32_t maximum_chunk_bytes);
+
+    /**
+     * @brief Author only the expected floating wire geometry from a genuine final destination.
+     * @param identity Original exact physical protocol identity.
+     * @param destination Actual retained destination descriptor, CPU or GPU.
+     * @param intersection Same checked original source/destination rectangles.
+     * @param maximum_chunk_bytes Existing admitted transport capacity.
+     * @return Receiver expectation, never a source-storage or native-readiness permit.
+     */
+    [[nodiscard]] MoEOverlayRemoteProjectionManifest makeMoEOverlayRemoteFloatingDestinationProjectionManifest(
+        const MoEOverlayRemoteProjectionIdentity &identity,
+        const ContiguousFloatingPointWeightDescriptor &destination,
+        const ExpertTierWeightProjectionIntersection &intersection, std::uint32_t maximum_chunk_bytes);
 
     /** Select an actual CPU endpoint; no GPU geometry or execution authority is synthesized. */
     enum class MoEOverlayRemoteCPUStorageEndpoint { Source, Destination };

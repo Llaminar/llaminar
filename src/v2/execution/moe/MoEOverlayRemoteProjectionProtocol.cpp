@@ -564,6 +564,30 @@ namespace llaminar2
         return true;
     }
 
+    namespace {
+        /** @brief Validate actual final CPU root metadata against its own canonical physical geometry. */
+        void requireCanonicalCpuRoot(const cpu::native_vnni::CPUNativeVNNIPackedWeights &root,
+            const MoEOverlayRemoteProjectionManifest &format)
+        {
+            if (root.N_padded != format.N_padded || root.blocks_per_row != format.blocks_per_row ||
+                root.encoding != format.cpu_encoding || root.data_stride != static_cast<int>(format.cpu_data_stride) ||
+                root.interleaved_block_stride != format.cpu_block_stride || root.native_interleaved.size() !=
+                    uint64_t(format.N_padded / 64) * format.blocks_per_row * format.cpu_block_stride)
+                throw std::invalid_argument("Remote CPU root does not match its genuine canonical final storage");
+        }
+        /** @brief Seal CPU-only wire geometry without claiming any source payload owner. */
+        MoEOverlayRemoteProjectionManifest sealCpuWire(MoEOverlayRemoteProjectionManifest manifest,
+            uint32_t maximum_chunk_bytes)
+        {
+            manifest.packing = MoEOverlayRemoteProjectionPacking::CpuNativeVnniInterleaved;
+            if (maximum_chunk_bytes < manifest.cpu_block_stride / 64)
+                throw std::invalid_argument("Native CPU capacity cannot contain one exact encoded column");
+            manifest.cpu_wire_columns_per_unit = std::min<uint32_t>(64, maximum_chunk_bytes / (manifest.cpu_block_stride / 64));
+            manifest.region_bytes[0] = uint64_t(manifest.N) * manifest.blocks_per_row * (manifest.cpu_block_stride / 64);
+            return seal(std::move(manifest));
+        }
+    }
+
     MoEOverlayRemoteProjectionManifest
     makeMoEOverlayRemoteCpuProjectionManifest(
         const MoEOverlayRemoteProjectionIdentity &identity,
@@ -581,26 +605,27 @@ namespace llaminar2
             source.N,
             source.K,
             maximum_chunk_bytes);
-        if (!identity.source_device.is_cpu() ||
-            !identity.destination_device.is_cpu() || source.N_padded !=
-                manifest.N_padded || source.blocks_per_row !=
-                manifest.blocks_per_row || source.encoding !=
-                manifest.cpu_encoding || source.data_stride !=
-                static_cast<int>(manifest.cpu_data_stride) ||
-            source.interleaved_block_stride !=
-                manifest.cpu_block_stride || source.native_interleaved.size()!=
-                uint64_t(manifest.N_padded/64)*manifest.blocks_per_row*manifest.cpu_block_stride)
-        {
-            throw std::invalid_argument(
-                "Remote CPU-to-CPU projection source does not match canonical final storage");
-        }
-        manifest.packing = MoEOverlayRemoteProjectionPacking::
-            CpuNativeVnniInterleaved;
-        if(maximum_chunk_bytes < manifest.cpu_block_stride/64)
-            throw std::invalid_argument("Native CPU send capacity cannot contain one encoded column and its required metadata");
-        manifest.cpu_wire_columns_per_unit = std::min<uint32_t>(64,maximum_chunk_bytes/(manifest.cpu_block_stride/64));
-        manifest.region_bytes[0] = uint64_t(manifest.N)*manifest.blocks_per_row*(manifest.cpu_block_stride/64);
-        return seal(std::move(manifest));
+        if (!identity.source_device.is_cpu() || !identity.destination_device.is_cpu())
+            throw std::invalid_argument("Native CPU wire requires its actual original CPU endpoints");
+        requireCanonicalCpuRoot(source, manifest);
+        return sealCpuWire(std::move(manifest), maximum_chunk_bytes);
+    }
+
+    MoEOverlayRemoteProjectionManifest makeMoEOverlayRemoteCpuDestinationProjectionManifest(
+        const MoEOverlayRemoteProjectionIdentity &identity,
+        const cpu::native_vnni::CPUNativeVNNIPackedWeights &destination,
+        const ExpertTierWeightProjectionIntersection &intersection, uint32_t capacity)
+    {
+        if (!identity.source_device.is_cpu() || !identity.destination_device.is_cpu() || intersection.empty() ||
+            destination.N != intersection.destination().rows || destination.K != intersection.destination().columns)
+            throw std::invalid_argument("Native receiver expectation changed its genuine original destination");
+        const NativeVnniSourceIdentity provenance{.codebook_id = destination.codebook_id,
+            .is_superblock = destination.is_superblock, .present = true};
+        const auto actual = baseManifest(identity, provenance, destination.N, destination.K, capacity);
+        requireCanonicalCpuRoot(destination, actual);
+        auto expected = baseManifest(identity, provenance, intersection.source().rows,
+            intersection.source().columns, capacity);
+        return sealCpuWire(std::move(expected), capacity).forCPUIntersection(intersection);
     }
 
     MoEOverlayRemoteProjectionManifest
@@ -713,35 +738,43 @@ namespace llaminar2
         return seal(std::move(manifest));
     }
 
-    MoEOverlayRemoteProjectionManifest
-    makeMoEOverlayRemoteFloatingProjectionManifest(
-        const MoEOverlayRemoteProjectionIdentity &identity,
-        const ContiguousFloatingPointWeightDescriptor &source,
-        std::uint32_t maximum_chunk_bytes)
-    {
-        const auto format = ExpertWeightFormat::floating(source.type);
-        if (!source.valid() || !format.valid() ||
-            !identity.valid() ||
-            maximum_chunk_bytes == 0u)
+    namespace {
+        /** @brief Shared floating metadata builder; only the caller can authenticate actual storage. */
+        MoEOverlayRemoteProjectionManifest floatingProjectionGeometry(
+            const MoEOverlayRemoteProjectionIdentity &identity, TensorType type,
+            int rows, int columns, uint32_t capacity)
         {
-            throw std::invalid_argument(
-                "Remote floating projection requires valid endpoints, storage, precision, and capacity");
+            const auto format = ExpertWeightFormat::floating(type);
+            if (!identity.valid() || !format.valid() || rows <= 0 || columns <= 0 || capacity == 0)
+                throw std::invalid_argument("Floating wire geometry requires original endpoints, precision and bounds");
+            MoEOverlayRemoteProjectionManifest manifest;
+            manifest.packing = MoEOverlayRemoteProjectionPacking::ContiguousFloating;
+            manifest.format_kind = format.kind;
+            manifest.identity = identity;
+            manifest.N = rows; manifest.K = columns; manifest.N_padded = rows;
+            manifest.cpu_encoding = cpu::native_vnni::CPUNativeVNNIEncoding::NibbleLUT;
+            manifest.region_bytes[0] = uint64_t(rows) * columns * format.floatingElementBytes();
+            manifest.maximum_chunk_bytes = capacity;
+            return seal(std::move(manifest));
         }
-
-        MoEOverlayRemoteProjectionManifest manifest;
-        manifest.packing = MoEOverlayRemoteProjectionPacking::
-            ContiguousFloating;
-        manifest.format_kind = format.kind;
-        manifest.identity = identity;
-        manifest.N = source.n;
-        manifest.K = source.k;
-        manifest.N_padded = source.n;
-        manifest.blocks_per_row = 0;
-        manifest.cpu_encoding =
-            cpu::native_vnni::CPUNativeVNNIEncoding::NibbleLUT;
-        manifest.region_bytes[0] = source.bytes;
-        manifest.maximum_chunk_bytes = maximum_chunk_bytes;
-        return seal(std::move(manifest));
+    }
+    MoEOverlayRemoteProjectionManifest makeMoEOverlayRemoteFloatingProjectionManifest(
+        const MoEOverlayRemoteProjectionIdentity &identity,
+        const ContiguousFloatingPointWeightDescriptor &source, uint32_t capacity)
+    {
+        if (!source.valid()) throw std::invalid_argument("Floating remote source requires its genuine retained storage");
+        return floatingProjectionGeometry(identity, source.type, source.n, source.k, capacity);
+    }
+    MoEOverlayRemoteProjectionManifest makeMoEOverlayRemoteFloatingDestinationProjectionManifest(
+        const MoEOverlayRemoteProjectionIdentity &identity,
+        const ContiguousFloatingPointWeightDescriptor &destination,
+        const ExpertTierWeightProjectionIntersection &intersection, uint32_t capacity)
+    {
+        if (!destination.valid() || intersection.empty() || destination.n != intersection.destination().rows ||
+            destination.k != intersection.destination().columns)
+            throw std::invalid_argument("Floating receiver expectation changed its actual original destination");
+        return floatingProjectionGeometry(identity, destination.type, intersection.source().rows,
+            intersection.source().columns, capacity).forFloatingIntersection(intersection);
     }
 
     ExpertTierWeightCPUStorageLayout remoteCpuProjectionStorageLayout(
@@ -752,23 +785,14 @@ namespace llaminar2
            !(source?manifest.identity.source_device:manifest.identity.destination_device).is_cpu())
             throw std::invalid_argument("Native CPU storage layout requires an authenticated actual CPU endpoint");
         const auto& owned=source?manifest.source_projection:manifest.destination_projection;
-        const uint64_t units=((uint64_t(manifest.N)+manifest.cpu_wire_columns_per_unit-1)/manifest.cpu_wire_columns_per_unit)*manifest.blocks_per_row;
-        const uint64_t unit_bytes=(manifest.cpu_block_stride/64)*std::min<uint32_t>(manifest.N,manifest.cpu_wire_columns_per_unit);
-        if(units>UINT32_MAX || unit_bytes==0)
-            throw std::invalid_argument("Native CPU wire unit geometry exceeds its ABI");
-        ExpertTierWeightCPUStorageLayout layout{
-            .N=manifest.N,.K=manifest.K,.blocks_per_row=manifest.blocks_per_row,
-            .cpu_N=owned.rows,.cpu_K=owned.columns,
-            .cpu_first_row=std::max(manifest.source_projection.first_row,manifest.destination_projection.first_row)-owned.first_row,
-            .cpu_first_column=std::max(manifest.source_projection.first_column,manifest.destination_projection.first_column)-owned.first_column,
-            .cpu_codebook_id=manifest.cpu_codebook_id,.cpu_is_asymmetric=manifest.cpu_is_asymmetric,
-            .cpu_is_superblock=manifest.cpu_is_superblock,.cpu_encoding=manifest.cpu_encoding,
-            .cpu_data_stride=manifest.cpu_data_stride,.cpu_block_stride=manifest.cpu_block_stride,
-            .unit_count=static_cast<uint32_t>(units),
-            .maximum_units_per_chunk=static_cast<uint32_t>(std::min<uint64_t>(units,manifest.maximum_chunk_bytes/unit_bytes)),
-            .wire_columns_per_unit=manifest.cpu_wire_columns_per_unit};
-        if(!layout.valid())throw std::invalid_argument("Native CPU endpoint has invalid original root geometry");
-        return layout;
+        ExpertTierWeightCPUStorageLayout format{
+            .cpu_codebook_id = manifest.cpu_codebook_id, .cpu_is_asymmetric = manifest.cpu_is_asymmetric,
+            .cpu_is_superblock = manifest.cpu_is_superblock, .cpu_encoding = manifest.cpu_encoding,
+            .cpu_data_stride = manifest.cpu_data_stride, .cpu_block_stride = manifest.cpu_block_stride,
+            .wire_columns_per_unit = manifest.cpu_wire_columns_per_unit};
+        return cpuExpertTierStorageLayoutForIntersection(format, owned,
+            ExpertTierWeightProjectionIntersection::between(manifest.source_projection, manifest.destination_projection),
+            manifest.maximum_chunk_bytes);
     }
 
     ExpertTierWeightDeviceLayout remoteCpuProjectionDeviceLayout(

@@ -11,6 +11,27 @@ namespace llaminar2::test
 {
     struct MoEOverlayJointPlacementCandidateTestAccess
     {
+        /** @return Source-bound restoration structure only, never publication/readiness. */
+        static MoEOverlayResidencyTransaction restoration(const MoEOverlayResidencyAuthority &authority)
+        {
+            return authority.buildInitialPreparedPlacementRestoration();
+        }
+
+        /**
+         * @brief Exercise real edge/cycle/shadow authoring without enabling runtime maintenance.
+         * @param authority Original authority with its actual current source publication.
+         * @param placements Complete proposed tier assignments; owner identity stays canonical.
+         * @return Genuine unpublished placement transaction, without physical readiness.
+         */
+        static MoEOverlayResidencyTransaction
+        prepareTransaction(const MoEOverlayResidencyAuthority &authority,
+                           std::vector<RoutedExpertLayerPlacement> placements)
+        {
+            const auto live = authority.snapshot();
+            return authority.prepareCPUJointPlacementTransaction(live, live->epoch,
+                                                                 std::move(placements));
+        }
+
         /**
          * @brief Exercise genuine unpublished placement construction without enabling maintenance.
          * @param authority Actual authority retaining original source and current placement.

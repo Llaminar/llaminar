@@ -97,6 +97,7 @@
 #include "../moe/MoEOverlayMPIRemoteProjectionTransport.h"
 #include "../moe/MoEOverlayMPIResidencyConsensus.h"
 #include "../moe/MoEOverlayCapacityAdmission.h"
+#include "execution/moe/MoEOverlayPhysicalLaneDemand.h"
 #include "../moe/MoEOverlayActivationChannelPlan.h"
 #include "../moe/MoEOverlayEconomyCalibrationController.h"
 #include "../moe/MoEOverlayEconomyCertificationController.h"
@@ -19928,17 +19929,9 @@ namespace llaminar2
                      */
                     if (world_size > 1)
                     {
-                        const MoEOverlayRemoteProjectionLaneBudget lane_budget{
-                            .maximum_participants_per_cycle =
-                                std::max<std::size_t>(
-                                    1u,
-                                    initial_snapshot->originalOwnerMap()
-                                        .participants().size()),
-                            .maximum_concurrent_cycles =
-                                capacity_policy.maximum_concurrent_cycles,
-                            .projections_per_expert =
-                                kMoEOverlayExpertProjectionCount,
-                        };
+                        const auto lane_budget=remoteMoEOverlayProjectionLaneBudget(
+                        configuredMoEOverlayLaneDemand(*initial_snapshot->placement_plan,layer_weight_manifest,
+                            metadata.num_experts,world_size,capacity_policy.maximum_concurrent_cycles,capacity_policy.maximum_cycles_per_layer));
                         moe_expert_overlay_remote_projection_transport_ =
                             std::make_shared<
                                 MoEOverlayMPIRemoteProjectionTransport>(
@@ -19999,6 +19992,8 @@ namespace llaminar2
                                             .maximum_execution_streams =
                                                 capacity_policy
                                                     .maximum_execution_streams,
+                                    .maximum_cycles_per_layer = capacity_policy
+                                                    .maximum_cycles_per_layer,
                                             .collect_economy_measurements = true,
                                             .perf_device = perf_device,
                                         });
@@ -20032,16 +20027,7 @@ namespace llaminar2
                                 .perf_device = perf_device,
                             });
                     const auto maximum_migrations_per_wave =
-                        MoEOverlayRemoteProjectionLaneBudget{
-                            .maximum_participants_per_cycle =
-                                std::max<std::size_t>(
-                                    1u,
-                                    initial_snapshot->originalOwnerMap()
-                                        .participants().size()),
-                            .maximum_concurrent_cycles =
-                                capacity_policy.maximum_concurrent_cycles,
-                            .projections_per_expert = 1u,
-                        }
+                        MoEOverlayRemoteProjectionLaneBudget::fromUniformCycles(std::max<std::size_t>( 1u, initial_snapshot->originalOwnerMap() .participants().size()), capacity_policy.maximum_concurrent_cycles, 1u)
                             .projectionOperationCount();
                     if (!maximum_migrations_per_wave)
                     {
@@ -20443,18 +20429,9 @@ namespace llaminar2
                  * and receive staging buffer is materialized now, never on
                  * maintenance or inference paths.
                  */
-                const MoEOverlayRemoteProjectionLaneBudget lane_budget{
-                    .maximum_participants_per_cycle =
-                        std::max<std::size_t>(
-                            1,
-                            initial_snapshot->originalOwnerMap()
-                                .participants().size()),
-                    .maximum_concurrent_cycles =
-                        config_.moe_rebalance
-                            .migration_transfer_slots,
-                    .projections_per_expert =
-                        kMoEOverlayExpertProjectionCount,
-                };
+                const auto lane_budget=remoteMoEOverlayProjectionLaneBudget(
+                        configuredMoEOverlayLaneDemand(*initial_snapshot->placement_plan,layer_weight_manifest,
+                            metadata.num_experts,world_size,capacity_policy.maximum_concurrent_cycles,capacity_policy.maximum_cycles_per_layer));
                 /*
                  * Duplicate every private communicator in one invariant order
                  * on every rank before fallible rank-local slot construction.
@@ -20541,6 +20518,8 @@ namespace llaminar2
                                     .maximum_execution_streams =
                                         capacity_policy
                                             .maximum_execution_streams,
+                                    .maximum_cycles_per_layer = capacity_policy
+                                            .maximum_cycles_per_layer,
                                     .collect_economy_measurements = true,
                                     .perf_device = perf_device,
                                 });
@@ -20700,16 +20679,7 @@ namespace llaminar2
                             .perf_device = perf_device,
                         });
                 const auto maximum_migrations_per_wave =
-                    MoEOverlayRemoteProjectionLaneBudget{
-                        .maximum_participants_per_cycle =
-                            std::max<std::size_t>(
-                                1,
-                                initial_snapshot->originalOwnerMap()
-                                    .participants().size()),
-                        .maximum_concurrent_cycles =
-                            capacity_policy.maximum_concurrent_cycles,
-                        .projections_per_expert = 1,
-                    }
+                    MoEOverlayRemoteProjectionLaneBudget::fromUniformCycles(std::max<std::size_t>( 1, initial_snapshot->originalOwnerMap() .participants().size()), capacity_policy.maximum_concurrent_cycles, 1)
                         .projectionOperationCount();
                 if (!maximum_migrations_per_wave)
                 {

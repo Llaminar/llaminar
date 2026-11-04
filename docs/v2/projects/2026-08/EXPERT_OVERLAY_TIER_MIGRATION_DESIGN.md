@@ -3261,8 +3261,15 @@ capacity rejections, or migration failures.
 
 Transport capacity follows that public knob rather than assuming one cycle.
 `MoEOverlayRemoteProjectionLaneBudget` materializes exactly
-`maximum_participants_per_cycle * maximum_concurrent_cycles * 3` projection
-lanes per rank, with checked zero/overflow rejection. The current tri-tier proof
+`maximum_pieces_per_projection_wave * 3` projection
+lanes per rank, with checked zero/overflow rejection. The piece bound comes
+from complete declared targets and original source-coordinate intersections;
+a cohort is one cycle vertex and can contribute several physical pieces per
+role. Feasible layer-cycle slots obey both the global and layer-local caps;
+their checked wave sum need not factor into a repeated single-layer maximum.
+The shared setup plan distinguishes these migration-piece bounds from
+retained setup ports; neither is reported as actual traffic. Whole-owner
+counts remain unchanged. The tri-tier proof
 therefore uses 288 preallocated remote projection lanes per rank (four
 participants, 24 slots, three projections). Config parser tests cover other
 positive values, and changing the slot count requires model-aware admission

@@ -1737,11 +1737,7 @@ namespace llaminar2::test
         constexpr std::size_t staging_bytes = 97;
         MoEOverlayMPIRemoteProjectionTransport transport({
             .mpi_context = context,
-            .lane_budget = {
-                .maximum_participants_per_cycle = 2,
-                .maximum_concurrent_cycles = 1,
-                .projections_per_expert = 3,
-            },
+            .lane_budget = MoEOverlayRemoteProjectionLaneBudget::fromUniformCycles(2, 1, 3),
             .staging_capacity_bytes = staging_bytes,
             .perf_device = "mpi_remote_projection_cpu_test",
         });
@@ -2055,11 +2051,7 @@ namespace llaminar2::test
         constexpr std::size_t staging_bytes = 97;
         MoEOverlayMPIRemoteProjectionTransport transport({
             .mpi_context = context,
-            .lane_budget = {
-                .maximum_participants_per_cycle = 1,
-                .maximum_concurrent_cycles = 1,
-                .projections_per_expert = 1,
-            },
+            .lane_budget = MoEOverlayRemoteProjectionLaneBudget::fromUniformCycles(1, 1, 1),
             .staging_capacity_bytes = staging_bytes,
             .perf_device = "mpi_remote_projection_restoration_test",
         });
@@ -2278,11 +2270,7 @@ namespace llaminar2::test
             MoEOverlayMPIRemoteProjectionTransport>(
             MoEOverlayMPIRemoteProjectionTransport::Config{
                 .mpi_context = context,
-                .lane_budget = {
-                    .maximum_participants_per_cycle = 2,
-                    .maximum_concurrent_cycles = 1,
-                    .projections_per_expert = 3,
-                },
+                .lane_budget = MoEOverlayRemoteProjectionLaneBudget::fromUniformCycles(2, 1, 3),
                 .staging_capacity_bytes = staging_bytes,
                 .perf_device = "mpi-distributed-physical-cpu",
             });
@@ -2620,11 +2608,7 @@ namespace llaminar2::test
             MoEOverlayMPIRemoteProjectionTransport>(
             MoEOverlayMPIRemoteProjectionTransport::Config{
                 .mpi_context = context,
-                .lane_budget = {
-                    .maximum_participants_per_cycle = 2,
-                    .maximum_concurrent_cycles = 1,
-                    .projections_per_expert = 3,
-                },
+                .lane_budget = MoEOverlayRemoteProjectionLaneBudget::fromUniformCycles(2, 1, 3),
                 .staging_capacity_bytes = staging_bytes,
                 .perf_device = "mpi-distributed-economy-cpu",
             });

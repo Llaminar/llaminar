@@ -133,6 +133,26 @@ namespace llaminar2
         return *joint_->live_owners;
     }
 
+    int MoEOverlayResidencySnapshot::firstModelLayer() const noexcept
+    {
+        return joint_ ? (joint_->source_plan ? joint_->source_plan->first_model_layer : 0)
+                      : layered_ownership.firstModelLayer();
+    }
+
+    int MoEOverlayResidencySnapshot::layerCount() const noexcept
+    {
+        return joint_ ? (joint_->source_plan ? int(joint_->source_plan->placements.size()) : 0)
+                      : layered_ownership.layerCount();
+    }
+
+    int MoEOverlayResidencySnapshot::expertCount() const noexcept
+    {
+        return joint_ ? (joint_->source_plan && !joint_->source_plan->placements.empty()
+                            ? int(joint_->source_plan->placements.front().routed_expert_tier.size())
+                            : 0)
+                      : layered_ownership.expertCount();
+    }
+
     const MoEExpertOwnerMap& MoEOverlayResidencySnapshot::originalOwnerMap() const
     {
         if (!joint_)
@@ -333,12 +353,19 @@ namespace llaminar2
             return capacities;
         }
 
+        /** @return Physical slots at every actual member, derived from the canonical map. */
         std::map<CapacityKey, int> participantCapacities(
             const MoEExpertOwnerMap &owner_map)
         {
             std::map<CapacityKey, int> capacities;
             for (const auto &owner : owner_map.owners())
-                ++capacities[{owner.layer_idx, owner.owner_participant}];
+            {
+                const auto target = MoEExpertPlacementTarget::fromPlacement(owner);
+                if (!target)
+                    throw std::logic_error("Residency capacity requires a complete placement target");
+                for (std::size_t member = 0; member < target->participantCount(); ++member)
+                    ++capacities[{owner.layer_idx, target->participantId(member)}];
+            }
             return capacities;
         }
 
@@ -1656,23 +1683,43 @@ namespace llaminar2
 
     bool MoEOverlayResidencyTransaction::valid() const noexcept
     {
-        if((previous && previous->ownershipKind()==MoEOverlayResidencyOwnershipKind::CPUJointFragments) ||
-           (candidate && candidate->ownershipKind()==MoEOverlayResidencyOwnershipKind::CPUJointFragments))return false;
         if (!previous || !candidate || !previous->valid() ||
             !candidate->valid() || expected_epoch != previous->epoch ||
+            expected_epoch == std::numeric_limits<uint64_t>::max() ||
             candidate->epoch != expected_epoch + 1 ||
-            previous->layered_ownership.firstModelLayer() != candidate->layered_ownership.firstModelLayer() ||
-            previous->layered_ownership.layerCount() != candidate->layered_ownership.layerCount() ||
-            previous->layered_ownership.expertCount() != candidate->layered_ownership.expertCount())
+            previous->ownershipKind() != candidate->ownershipKind() ||
+            previous->firstModelLayer() != candidate->firstModelLayer() ||
+            previous->layerCount() != candidate->layerCount() ||
+            previous->expertCount() != candidate->expertCount())
         {
             return false;
         }
+        const bool joint = previous->ownershipKind() ==
+                           MoEOverlayResidencyOwnershipKind::CPUJointFragments;
+        const auto same_owner = [](const auto &a, const auto &b)
+        { return a.get() == b.get() && !a.owner_before(b) && !b.owner_before(a); };
+        const auto matches_placement = [&](const MoEExpertOwner &canonical,
+                                           const MoEExpertOwner &edge)
+        {
+            if (joint)
+                return canonical == edge && same_owner(canonical.shard_cohort, edge.shard_cohort);
+            return canonical.owner_participant == edge.owner_participant &&
+                   canonical.tier_idx == edge.tier_idx && canonical.device == edge.device;
+        };
+        if (joint &&
+            (!same_owner(previous->joint_->source_plan, candidate->joint_->source_plan) ||
+             !same_owner(previous->joint_->preparation, candidate->joint_->preparation)))
+            return false;
         const bool calibration =
             purpose ==
             MoEOverlayResidencyTransactionPurpose::EconomyCalibration;
         const bool restoration =
             purpose ==
             MoEOverlayResidencyTransactionPurpose::PreparedContextRestoration;
+        if ((!calibration && !restoration &&
+             purpose != MoEOverlayResidencyTransactionPurpose::PlacementChange) ||
+            (joint && calibration))
+            return false;
         if (calibration)
         {
             /*
@@ -1704,9 +1751,9 @@ namespace llaminar2
         if (histogram_window &&
             (!histogram_window->valid() ||
              histogram_window->generation != histogram_generation ||
-             histogram_window->first_model_layer != previous->layered_ownership.firstModelLayer() ||
-             histogram_window->num_layers != previous->layered_ownership.layerCount() ||
-             histogram_window->num_experts != previous->layered_ownership.expertCount()))
+             histogram_window->first_model_layer != previous->firstModelLayer() ||
+             histogram_window->num_layers != previous->layerCount() ||
+             histogram_window->num_experts != previous->expertCount()))
         {
             return false;
         }
@@ -1724,6 +1771,24 @@ namespace llaminar2
             return false;
         }
 
+        const auto &previous_map = previous->placementOwnerMap();
+        const auto &candidate_map = candidate->placementOwnerMap();
+        if (joint)
+        {
+            // Every changed logical placement must have one physical edge.
+            // Otherwise an empty or partial wave could publish uncopied rows.
+            std::size_t changed = 0;
+            for (const auto &destination : candidate_map.owners())
+            {
+                const auto *source = previous_map.placementFor(destination.layer_idx,
+                                                               destination.expert_id);
+                if (!source)
+                    return false;
+                changed += !(*source == destination);
+            }
+            if (changed != migrations.size())
+                return false;
+        }
         if (migrations.empty())
         {
             return migration_cycles.empty() && shadow_requirements.empty() &&
@@ -1763,8 +1828,7 @@ namespace llaminar2
                 migration.source.expert_id != migration.expert_id ||
                 migration.destination.expert_id != migration.expert_id ||
                 migration.source.tier_idx < 0 ||
-                migration.destination.tier_idx < 0 ||
-                migration.destination.owner_participant < 0)
+                migration.destination.tier_idx < 0)
             {
                 return false;
             }
@@ -1791,20 +1855,16 @@ namespace llaminar2
             {
                 return false;
             }
-            const auto *previous_owner = previous->owner_map.ownerFor(
+            const auto *previous_owner = previous_map.placementFor(
                 migration.layer_idx, migration.expert_id);
-            if (!previous_owner ||
-                previous_owner->owner_participant !=
-                    migration.source.owner_participant ||
-                previous_owner->tier_idx != migration.source.tier_idx ||
-                previous_owner->device != migration.source.device)
+            if (!previous_owner || !matches_placement(*previous_owner, migration.source))
             {
                 return false;
             }
             if (calibration)
             {
                 const auto *destination_participant =
-                    previous->owner_map.participantForId(
+                    previous_map.participantForId(
                         migration.destination.owner_participant);
                 if (!destination_participant ||
                     destination_participant->tier_idx !=
@@ -1817,23 +1877,27 @@ namespace llaminar2
             }
             else
             {
-                const auto *candidate_owner = candidate->owner_map.ownerFor(
+                const auto *candidate_owner = candidate_map.placementFor(
                     migration.layer_idx, migration.expert_id);
-                if (!candidate_owner ||
-                    candidate_owner->owner_participant !=
-                        migration.destination.owner_participant ||
-                    candidate_owner->tier_idx !=
-                        migration.destination.tier_idx ||
-                    candidate_owner->device != migration.destination.device)
+                if (!candidate_owner || !matches_placement(*candidate_owner, migration.destination) ||
+                    (joint && *previous_owner == *candidate_owner))
                 {
                     return false;
                 }
+                if (joint && restoration)
+                {
+                    const auto *original = previous->originalOwnerMap().placementFor(
+                        migration.layer_idx, migration.expert_id);
+                    if (!original || !matches_placement(*original, *candidate_owner))
+                        return false;
+                }
             }
-            ++expected_requirements[{
-                migration.layer_idx,
-                migration.destination.tier_idx,
-                migration.destination.owner_participant,
-            }];
+            const auto destination = MoEExpertPlacementTarget::fromPlacement(migration.destination);
+            if (!destination)
+                return false;
+            for (std::size_t member = 0; member < destination->participantCount(); ++member)
+                ++expected_requirements[{migration.layer_idx, destination->tierIndex(),
+                                         destination->participantId(member)}];
         }
 
         std::map<RequirementKey, size_t> actual_requirements;
@@ -3347,8 +3411,16 @@ namespace llaminar2
         const
     {
         const auto current = snapshot();
-        if(current && current->ownershipKind()==MoEOverlayResidencyOwnershipKind::CPUJointFragments)
-            return current.get()==initial_snapshot_.get() && current->valid();
+        if (current && current->ownershipKind() == MoEOverlayResidencyOwnershipKind::CPUJointFragments)
+        {
+            if (!current->valid() || !initial_snapshot_ || !initial_snapshot_->valid())
+                return false;
+            // Epoch identity changes on restoration; the complete fixed target
+            // assignments, rather than the original publication pointer, define reuse.
+            const auto &live = current->placementOwnerMap().owners();
+            const auto &original = initial_snapshot_->placementOwnerMap().owners();
+            return live == original;
+        }
         if (!current || !current->valid() || !initial_snapshot_ ||
             !initial_snapshot_->valid() ||
             current->layered_ownership !=
@@ -3388,6 +3460,12 @@ namespace llaminar2
                 "Prepared-context restoration requires Dynamic ExpertOverlay maintenance");
         }
 
+        return buildInitialPreparedPlacementRestoration();
+    }
+
+    MoEOverlayResidencyTransaction
+    MoEOverlayResidencyAuthority::buildInitialPreparedPlacementRestoration() const
+    {
         const auto previous = snapshot();
         if (!previous || !previous->valid() || !initial_snapshot_ ||
             !initial_snapshot_->valid())
@@ -3422,7 +3500,12 @@ namespace llaminar2
             return result;
         };
 
-        auto target = buildSnapshot(
+        const bool joint = previous->ownershipKind() ==
+                           MoEOverlayResidencyOwnershipKind::CPUJointFragments;
+        auto target = joint
+            ? prepareCPUJointPlacementTransaction(previous, previous->epoch,
+                  initial_snapshot_->placement_plan->placements).candidate
+            : buildSnapshot(
             previous->epoch + 1u,
             *initial_snapshot_->placement_plan,
             config_.model_metadata,
@@ -3501,14 +3584,18 @@ namespace llaminar2
                     placement->routed_expert_tier[
                         static_cast<std::size_t>(migration.expert_id)] =
                         migration.destination.tier_idx;
-                    trial_ownership.assignOwner(
-                        migration.layer_idx,
-                        migration.expert_id,
-                        migration.destination.owner_participant);
+                    if (!joint)
+                        trial_ownership.assignOwner(
+                            migration.layer_idx,
+                            migration.expert_id,
+                            migration.destination.owner_participant);
                 }
             }
 
-            auto trial_snapshot = buildSnapshot(
+            auto trial_snapshot = joint
+                ? prepareCPUJointPlacementTransaction(previous, previous->epoch,
+                      trial_plan.placements).candidate
+                : buildSnapshot(
                 previous->epoch + 1u,
                 std::move(trial_plan),
                 config_.model_metadata,
@@ -7321,6 +7408,25 @@ namespace llaminar2
         return candidate;
     }
 
+    MoEOverlayResidencyTransaction
+    MoEOverlayResidencyAuthority::prepareCPUJointPlacementTransaction(
+        const std::shared_ptr<const MoEOverlayResidencySnapshot> &expected_live,
+        uint64_t expected_epoch, std::vector<RoutedExpertLayerPlacement> placements) const
+    {
+        MoEOverlayResidencyTransaction result;
+        result.expected_epoch = expected_epoch;
+        result.previous = expected_live;
+        result.candidate = prepareCPUJointPlacementCandidate(
+            expected_live, expected_epoch, std::move(placements));
+        requireCapacityPreserving(*result.previous, *result.candidate);
+        result.migrations = buildMigrations(*result.previous, *result.candidate, nullptr, 0);
+        result.migration_cycles = buildMoEOverlayMigrationCycles(result.migrations);
+        result.shadow_requirements = buildMoEOverlayShadowRequirements(result.migrations);
+        if (!result.valid())
+            throw std::logic_error("Joint placement producer did not author a complete transaction");
+        return result;
+    }
+
     std::shared_ptr<const MoEOverlayResidencySnapshot> MoEOverlayResidencyAuthority::buildSnapshot(
         uint64_t epoch, MoERoutedExpertPlacementPlan plan,
         const MoERoutedExpertModelMetadata &metadata, const MoEExpertOwnerMap *previous_owners,
@@ -7400,6 +7506,11 @@ namespace llaminar2
         std::span<const MoELayeredExpertOwnershipChange>
             participant_changes)
     {
+        if ((previous.ownershipKind() == MoEOverlayResidencyOwnershipKind::CPUJointFragments ||
+             candidate.ownershipKind() == MoEOverlayResidencyOwnershipKind::CPUJointFragments) &&
+            !participant_changes.empty())
+            throw std::logic_error(
+                "Joint movement requires complete fixed targets, not scalar participant overrides");
         using ExpertKey = std::pair<int, int>;
         std::map<ExpertKey, int> participant_destinations;
         for (const auto &change : participant_changes)
@@ -7425,9 +7536,9 @@ namespace llaminar2
         }
 
         std::vector<MoEOverlayTierMigration> migrations;
-        for (const auto &destination : candidate.owner_map.owners())
+        for (const auto &destination : candidate.placementOwnerMap().owners())
         {
-            const auto *source = previous.owner_map.ownerFor(
+            const auto *source = previous.placementOwnerMap().placementFor(
                 destination.layer_idx,
                 destination.expert_id);
             if (!source)
@@ -7435,9 +7546,7 @@ namespace llaminar2
                 throw std::logic_error(
                     "Candidate MoE overlay owner has no source owner");
             }
-            if (source->owner_participant == destination.owner_participant &&
-                source->tier_idx == destination.tier_idx &&
-                source->domain_name == destination.domain_name)
+            if (*source == destination)
             {
                 continue;
             }
@@ -7605,8 +7714,8 @@ namespace llaminar2
             throw std::logic_error(
                 "MoE overlay rebalance changed fixed per-layer tier capacity");
         }
-        if (participantCapacities(previous.owner_map) !=
-            participantCapacities(candidate.owner_map))
+        if (participantCapacities(previous.placementOwnerMap()) !=
+            participantCapacities(candidate.placementOwnerMap()))
         {
             throw std::logic_error(
                 "MoE overlay rebalance changed fixed per-layer participant capacity");

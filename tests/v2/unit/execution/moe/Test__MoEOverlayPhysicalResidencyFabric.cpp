@@ -25,6 +25,7 @@
 #include "execution/moe/MoEOverlayPreparedWeightSource.h"
 #include "execution/moe/MoEOverlayTierMigrationTransport.h"
 #include "loaders/ModelLoader.h"
+#include "../../../utils/ExpertTierEncodedColumnOracle.h"
 
 #include <gtest/gtest.h>
 
@@ -461,11 +462,13 @@ namespace
     /**
      * @brief Snapshot the exact live CPU bytes for a prepared payload.
      *
-     * Quantized experts expose their final NativeVNNI buffer; floating experts
-     * expose their exact row-major FP16, BF16, or FP32 buffer. Reading through
-     * the engine interface keeps the assertion independent of slot ownership.
+     * Quantized experts expose every live NativeVNNI column's data, comp,
+     * scale, min and grid fields. Inactive SIMD output columns are not weights
+     * or transfer extents. Floating experts expose all exact row-major bytes.
+     * The independent encoded-column inspector never calls the production
+     * gather/scatter/copy path, and slot ownership cannot change this oracle.
      */
-    std::array<std::vector<std::uint8_t>, 3> preparedBytes(
+    std::array<std::vector<std::uint8_t>, 3> livePreparedBytes(
         const MoEOverlayPreparedExpertPayload &payload)
     {
         std::array<std::vector<std::uint8_t>, 3> result;
@@ -481,9 +484,21 @@ namespace
             if (const auto *packed =
                     engines[projection]->exportCPUNativeVNNIPackedWeights())
             {
-                result[projection].assign(
-                    packed->native_interleaved.begin(),
-                    packed->native_interleaved.end());
+                // Native roots are N-padded for SIMD; only [0,N) columns
+                // execute or move. Inspect every live plane independently of
+                // the production copier, including comp/min/grid fields.
+                if(packed->N<=0 || packed->K<=0 || packed->K%32 || packed->interleaved_block_stride%64)
+                    throw std::runtime_error("Native oracle received invalid physical geometry");
+                ExpertTierWeightCPUStorageLayout layout;
+                layout.cpu_K=packed->K;layout.cpu_data_stride=packed->data_stride;
+                layout.cpu_block_stride=packed->interleaved_block_stride;layout.cpu_encoding=packed->encoding;
+                const std::span<const uint8_t> root(packed->native_interleaved.data(),packed->native_interleaved.size());
+                for(int n=0;n<packed->N;++n)for(int kb=0;kb<packed->K/32;++kb) {
+                    const auto column=test::encodedTierColumn(root,layout,size_t(n),size_t(kb));
+                    if(column.size()!=size_t(packed->interleaved_block_stride)/64)
+                        throw std::runtime_error("Independent native oracle omitted a live encoded field");
+                    result[projection].insert(result[projection].end(),column.begin(),column.end());
+                }
                 continue;
             }
 
@@ -1158,8 +1173,8 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
                     .experts[static_cast<std::size_t>(migration.expert_id)];
             ASSERT_TRUE(arrived.complete());
             EXPECT_EQ(
-                preparedBytes(arrived),
-                preparedBytes(
+                livePreparedBytes(arrived),
+                livePreparedBytes(
                     experts[static_cast<std::size_t>(layer_idx)]
                            [static_cast<std::size_t>(migration.expert_id)]));
         }
@@ -1414,9 +1429,9 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
             makeSourceExpert(1, 2, 177, format_case.format),
         };
         const std::array expected{
-            preparedBytes(experts[0]),
-            preparedBytes(experts[1]),
-            preparedBytes(experts[2]),
+            livePreparedBytes(experts[0]),
+            livePreparedBytes(experts[1]),
+            livePreparedBytes(experts[2]),
         };
         auto registry = makeRegistry(initial_snapshot, experts);
         const auto memory = admitCpuShadowPools(
@@ -1498,7 +1513,7 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
                             migration.expert_id)];
                 ASSERT_TRUE(arrived.complete());
                 EXPECT_EQ(
-                    preparedBytes(arrived),
+                    livePreparedBytes(arrived),
                     expected[static_cast<std::size_t>(migration.expert_id)])
                     << "Published destination bytes differ from expert "
                     << migration.expert_id << " at epoch " << expected_epoch;
@@ -1593,7 +1608,7 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
                     static_cast<std::size_t>(expert_id));
                 ASSERT_TRUE(payload.complete());
                 EXPECT_EQ(
-                    preparedBytes(payload),
+                    livePreparedBytes(payload),
                     expected[static_cast<std::size_t>(expert_id)]);
                 observed[static_cast<std::size_t>(expert_id)] = true;
             }
@@ -1748,7 +1763,7 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric, PipelineStageTransfersAndSealsEver
                         EXPECT_EQ(layer.resident_mask, candidate->owner_map.expertMaskForParticipant(first + row, participant, 2));
                         for (const int expert : {0, 1})
                             if (layer.resident_mask[expert])
-                                EXPECT_EQ(preparedBytes(layer.experts[expert]), preparedBytes(experts[row][expert]));
+                                EXPECT_EQ(livePreparedBytes(layer.experts[expert]), livePreparedBytes(experts[row][expert]));
                     }
                 }
                 previous = candidate;
@@ -1936,6 +1951,52 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric, PreparedGPUServiceMissingResidentC
         {
             EXPECT_NE(std::string(error.what()).find("priced class has no complete resident source"), std::string::npos);
             EXPECT_NE(std::string(error.what()).find("participant=0"), std::string::npos);
+        }
+    }
+}
+
+/** @test The independent equality oracle ignores only inactive padding and detects every live field class. */
+TEST(Test__MoEOverlayPhysicalResidencyFabric, LiveNativeOracleDistinguishesDirtyPaddingAndEveryEncodedField)
+{
+    for(const auto& format:native_vnni_formats::kAllSourceFormats) {
+        SCOPED_TRACE(format.quant_type);
+        const auto source_format=ExpertWeightFormat::nativeVnni({.codebook_id=format.metadata->codebook_id,
+            .is_superblock=format.metadata->is_superblock,.present=true});
+        auto original=makeSourceExpert(0,0,19,source_format);
+        auto changed=makeSourceExpert(1,0,19,source_format);
+        const auto expected=livePreparedBytes(original);
+        ASSERT_EQ(livePreparedBytes(changed),expected);
+        auto engine=changed.gate();
+        const auto* packed=engine->exportCPUNativeVNNIPackedWeights();ASSERT_TRUE(packed);
+        ASSERT_EQ(packed->N,32);ASSERT_GE(packed->N_padded,64);
+        // This source fixture has never been published. Its actual slot owner
+        // grants the retired-storage mutation API, not a const-cast/live write.
+        auto bytes=engine->exportRetiredCPUNativeVNNIStorage();ASSERT_FALSE(bytes.empty());
+        const size_t inactive_data_byte=size_t(packed->N)*4;
+        const auto before=bytes[inactive_data_byte];bytes[inactive_data_byte]^=0x80;
+        EXPECT_NE(bytes[inactive_data_byte],before);
+        EXPECT_EQ(livePreparedBytes(changed),expected);
+        std::vector<size_t> fields;
+        const bool q6=packed->encoding==cpu::native_vnni::CPUNativeVNNIEncoding::Q6KNativeDualScale;
+        for(size_t byte=0;byte<(q6?16:size_t(packed->data_stride)/64);++byte)
+            fields.push_back((byte/4)*256+byte%4);
+        if(q6)for(size_t group=0;group<8;++group) {
+            fields.push_back(1024+group*64);fields.push_back(1024+group*64+8);
+        }
+        const bool compact=packed->encoding==cpu::native_vnni::CPUNativeVNNIEncoding::CompactMultiScale;
+        for(size_t plane=0;plane<(compact?2:(size_t(packed->interleaved_block_stride)-packed->data_stride)/128);++plane)
+            for(size_t byte=0;byte<2;++byte)fields.push_back(packed->data_stride+plane*128+byte);
+        if(compact)for(size_t byte=0;byte<4;++byte)fields.push_back(packed->data_stride+256+byte);
+        for(const size_t byte:fields) {
+            SCOPED_TRACE(byte);const auto saved=bytes[byte];bytes[byte]^=1;
+            EXPECT_NE(livePreparedBytes(changed),expected); // All data/comp/scale/min/grid classes must contribute.
+            bytes[byte]=saved;
+        }
+        EXPECT_EQ(livePreparedBytes(changed),expected);
+        for(size_t role=0;role<3;++role) {
+            const auto& engine=role==0?original.gate():role==1?original.up():original.down();
+            const auto* layout=engine->exportCPUNativeVNNIPackedWeights();ASSERT_TRUE(layout);
+            EXPECT_EQ(expected[role].size(),size_t(layout->N)*(layout->K/32)*(layout->interleaved_block_stride/64));
         }
     }
 }

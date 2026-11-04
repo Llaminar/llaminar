@@ -1141,3 +1141,5 @@ namespace llaminar2
 } // namespace llaminar2
 
 #include "ExpertTierRectangularWeightContract.inc"
+#include <thread>
+#include "ExpertTierDirectCPUProjectionContract.inc"

@@ -357,6 +357,12 @@ namespace llaminar2
         /** @return Actual live placement for this epoch, distinct from original source selection.
          */
         const MoEExpertOwnerMap &placementOwnerMap() const;
+        /** @return Original model-global first layer; zero for an empty snapshot. */
+        int firstModelLayer() const noexcept;
+        /** @return Original layer count, without constructing scalar ownership for cohorts. */
+        int layerCount() const noexcept;
+        /** @return Original logical experts per layer, independent of fragment count. */
+        int expertCount() const noexcept;
         /** @return SAME original joint source/preparation control block, or null for ordinary
          * ownership. */
         std::shared_ptr<const MoEExpertOverlayPreparationPlan>
@@ -364,6 +370,7 @@ namespace llaminar2
 
     private:
         friend class MoEOverlayResidencyAuthority;
+        friend struct MoEOverlayResidencyTransaction;
         /** @brief Sealed source and current placement; only the authority can construct this arm.
          */
         struct CPUJointDefinition {
@@ -1547,6 +1554,29 @@ namespace llaminar2
         std::shared_ptr<const MoEOverlayResidencySnapshot> prepareCPUJointPlacementCandidate(
             const std::shared_ptr<const MoEOverlayResidencySnapshot> &expected_live,
             uint64_t expected_epoch, std::vector<RoutedExpertLayerPlacement> placements) const;
+
+        /**
+         * @brief Author complete physical edges from a genuine fixed-cohort placement proposal.
+         * @param expected_live Exact current publication retained by the transition caller.
+         * @param expected_epoch Current publication epoch, never an unpublished candidate.
+         * @param placements Complete tier assignments with unchanged per-member capacities.
+         * @return Source-authenticated placement transaction with complete cycles and shadows.
+         * @throws std::logic_error For a stale source, invalid transaction or changed capacity.
+         * @throws std::invalid_argument For foreign topology, source geometry or fixed cuts.
+         * @note This construction grants neither physical readiness nor runtime publication;
+         * the existing maintenance and execution qualification guards remain authoritative.
+         */
+        MoEOverlayResidencyTransaction prepareCPUJointPlacementTransaction(
+            const std::shared_ptr<const MoEOverlayResidencySnapshot> &expected_live,
+            uint64_t expected_epoch, std::vector<RoutedExpertLayerPlacement> placements) const;
+
+        /**
+         * @brief Compose source-bound restoration without granting maintenance or readiness.
+         * @return Complete or bounded restoration from the actual current epoch.
+         * @throws std::logic_error For invalid original/current source identity.
+         * @throws std::runtime_error If no complete cycle fits the admitted wave.
+         */
+        MoEOverlayResidencyTransaction buildInitialPreparedPlacementRestoration() const;
 
         /**
          * @brief Validate and materialize one immutable residency epoch.

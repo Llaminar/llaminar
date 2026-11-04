@@ -5694,3 +5694,4 @@ namespace llaminar2::test
 } // namespace llaminar2::test
 
 #include "CPUJointPlacementCandidateContract.inc"
+#include "CPUJointPlacementTransactionContract.inc"

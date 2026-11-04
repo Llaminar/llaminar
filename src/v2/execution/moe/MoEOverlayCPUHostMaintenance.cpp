@@ -15,6 +15,7 @@
 #include "MoEOverlayMPIRemoteProjectionTransport.h"
 #include "collective/CollectiveTimeoutPolicy.h"
 #include <chrono>
+#include <limits>
 #include <stdexcept>
 #include <thread>
 
@@ -75,13 +76,11 @@ namespace llaminar2
             .staging_capacity_bytes = config_.storage.staging_capacity_bytes,
             .maximum_concurrent_cycles = config_.storage.maximum_concurrent_cycles,
             .maximum_execution_streams = config_.storage.maximum_execution_streams,
+                                    .maximum_cycles_per_layer = config_.storage.maximum_cycles_per_layer,
             .collect_economy_measurements = true, .perf_device = config_.perf_device});
         auto factory = std::make_unique<MoEOverlayParticipantPreparedWaveFactory>(MoEOverlayParticipantPreparedWaveFactory::Config{
             .registry = config_.residency, .transfer_provider = fabric, .perf_device = config_.perf_device});
-        const auto count = MoEOverlayRemoteProjectionLaneBudget{
-            .maximum_participants_per_cycle = snapshot->owner_map.participants().size(),
-            .maximum_concurrent_cycles = config_.storage.maximum_concurrent_cycles,
-            .projections_per_expert = 1}.projectionOperationCount();
+        const auto count = MoEOverlayRemoteProjectionLaneBudget::fromUniformCycles(snapshot->owner_map.participants().size(), config_.storage.maximum_concurrent_cycles, 1).projectionOperationCount();
         if (!count) throw std::overflow_error("CPU host migration journal geometry overflow");
         auto journal = std::make_shared<MoEOverlayMigrationMeasurementJournal>(MoEOverlayMigrationMeasurementJournal::Config{
             .maximum_migrations_per_wave = *count});
@@ -167,7 +166,15 @@ namespace llaminar2
         };
         idle();
         const auto snapshot = config_.authority->snapshot();
-        const auto limit = snapshot->layered_ownership.layerCount() * snapshot->layered_ownership.expertCount() + 1;
+        // Every nonempty restoration wave fixes at least one original logical
+        // placement. Fragment member count is not an additional progress unit.
+        const auto layers = snapshot->layerCount();
+        const auto experts = snapshot->expertCount();
+        if (layers <= 0 || experts <= 0 ||
+            std::size_t(layers) > (std::numeric_limits<std::size_t>::max() - 1u) /
+                                      std::size_t(experts))
+            throw std::overflow_error("CPU restoration progress bound has invalid original geometry");
+        const auto limit = std::size_t(layers) * std::size_t(experts) + 1u;
         std::size_t waves = 0;
         while (!config_.authority->initialPreparedPlacementPublished())
         {

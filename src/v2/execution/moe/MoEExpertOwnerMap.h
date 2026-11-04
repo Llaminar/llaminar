@@ -315,12 +315,14 @@ namespace llaminar2
         size_t ownerCountForExpert(int layer_idx, int expert_id) const;
 
         /**
-         * @brief Authenticate complete ownership without allocating a second table.
+         * @brief Authenticate whole or complete-cohort geometry without allocating a second table.
          * @param num_layers Number of owned contiguous layers.
          * @param num_experts Routed experts per owned layer.
          * @param first_model_layer First global model layer in the interval.
          * @throws std::invalid_argument For invalid or overflowing geometry.
          * @throws std::logic_error For incomplete or foreign ownership coordinates.
+         * Every fragment must retain its original physical rank/NUMA member;
+         * success does not make a jointly owned expert a scalar whole owner.
          */
         void requireLayerGeometry(int num_layers, int num_experts, int first_model_layer = 0) const;
 
@@ -336,6 +338,7 @@ namespace llaminar2
          * @param num_experts Exact routed-expert count per layer.
          * @param first_model_layer First model-global layer in the owned interval.
          * @return Compact ownership retaining model-global layer identities.
+         * @throws std::logic_error If any expert requires a shard cohort instead of one owner.
          * @throws std::invalid_argument for non-positive geometry or no participants.
          * @throws std::logic_error when an owner is missing, duplicated, or outside
          *         the requested model geometry.

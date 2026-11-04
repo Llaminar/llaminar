@@ -309,6 +309,12 @@ namespace llaminar2
              */
             std::size_t maximum_execution_streams = 1;
             /**
+             * Existing layer-local cycle cap resolved by original admission.
+             * Direct callers retain their prior uncapped layer policy; production
+             * supplies the same explicit limit used by the single lane BOM.
+             */
+            std::size_t maximum_cycles_per_layer = std::numeric_limits<std::size_t>::max();
+            /**
              * Collect exact device/host timing evidence on local transfer lanes.
              * Dynamic production enables this for economy certification;
              * static residency leaves timing events unmaterialized.
@@ -502,6 +508,7 @@ namespace llaminar2
             const std::vector<MoEOverlayTierMigrationCycle> &migration_cycles,
             const std::vector<MoEOverlayTierShadowRequirement> &
                 shadow_requirements,
+            const MoEOverlayResidencySnapshot *candidate,
             const MoEOverlayDevicePhysicalMovementBatch *device_batch,
             const std::vector<int> &local_destination_participants);
 

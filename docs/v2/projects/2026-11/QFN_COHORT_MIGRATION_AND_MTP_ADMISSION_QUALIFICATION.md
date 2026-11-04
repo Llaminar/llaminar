@@ -32,8 +32,11 @@ residency-authority unit suites also pass. These tests create no extra MPI
 ranks or artificial physical sockets.
 
 Source-authenticated joint placement snapshots and CPU fragment epoch banks
-now pass their component contracts. Complete physical-fragment endpoint wiring,
-live captured membership, global publication and retirement remain unresolved.
+pass their component contracts. Physical-fragment endpoint wiring now stages
+and executes exact destinations on two genuine CPU sockets. Successful staging,
+failed-piece drain and setup rejection each pass 20 repetitions per rank, with
+real retired-reader and reclamation checks. Live captured membership, global
+publication and retirement through complete inference remain unresolved.
 Their runtime guards are unchanged. Component correctness alone does not admit
 a dynamic execution mode. The broader design remains in
 [the dynamic residency plan](QFN_SHARDED_EXPERT_DYNAMIC_RESIDENCY_PLAN.md).
@@ -110,6 +113,80 @@ lifecycle and nonempty-bank contracts repeated 20 times, and CPU maintenance
 coverage. Driver diagnostics are clean and no cases skip. Build114 includes
 the production core, metadata and model-test binaries. These checks establish
 source ownership, not dynamic cohort transfer or full-model correctness.
+
+## Whole/cohort physical transfer and exact lane demand
+
+The physical fabric now enumerates each nonempty original-coordinate
+source/destination intersection for Gate, Up and Down. Each destination engine
+receives all of its pieces, and becomes ready only after their real completion.
+Native CPU movement preserves every live encoded field without transferring
+allocation padding; floating roots retain their independent source/destination
+strides. Shared Q6 storage-word updates use the same local scatter lock across
+CPU, GPU-to-CPU and remote destinations. Source-bank leases survive pending
+copies and abort/drain; no whole CPU expert or fresh GGUF read is introduced.
+
+Admission and runtime demand use the same piece enumerator and fixed targets.
+The retained lane bound obeys both global and per-layer cycle limits, including
+unequal layer costs. Remote piece IDs are assigned from the complete wave before
+rank filtering, preserving unique identities and deliberate gaps for skewed
+members. Metadata covers two through eight members; native qualification uses
+one actual MPI rank on each of the two physical sockets.
+
+The joint transaction author validates its exact current source/preparation,
+every changed logical expert, complete capacity-preserving cycles and every
+member's shadow slots. It neither publishes a candidate nor enables a guarded
+runtime mode. The geometry validator now accepts complete original cohorts
+without converting one member into a scalar owner; scalar table creation still
+rejects cohorts explicitly. Restoration compares the actual live target rows
+to the original placement instead of comparing snapshot pointers. Its bounded
+cycle composer uses the same sealed joint producer; the progress limit comes
+from checked original layer/expert geometry. The new two-layer, nonzero-origin
+source contract proves construction without publication. Genuine changed-epoch
+joint restoration remains pending the complete commit integration.
+
+`common-cpu-host158` passes all 25 selected registrations in 13.27 seconds,
+including the owning suites and repeated focused piece, lane-demand, ordinal,
+transaction, geometry and live-native-byte contracts. `common-cpu-gpu160`
+passes the six-GPU controller-fabric control and both CUDA/ROCm CPU-joint
+padded-prefill contracts (three registrations, 9.06 seconds). No cases skip and
+driver windows are clean. `common-cpu-host163` passes the three owning
+protocol/transport/fabric suites after the terminal-readiness repair.
+
+The native component fixture uses real source contexts, prepared roots, PMA
+owners, MPI lanes and two physical sockets. It delays a real final Down piece,
+checks incomplete readiness, then compares every destination FP32 bit and
+executes one-hot GEMM through the destination engines. Each rank sends and
+receives exactly 147,456 live payload bytes for the swap. Separate cases cover
+failed final-piece drain and setup failure before any copy or MPI request.
+
+This native work exposed a real transport defect: a completed source operation
+released its lane, then a repeated readiness query incorrectly rejected that
+released lane as unadmitted. Terminal Ready now remains stable after the actual
+transfer and final ACK; genuinely unadmitted work still fails. Repeated Ready
+and abort-drained queries must leave all transfer/protocol counters unchanged.
+The successful-copy and setup-failure cases passed in `common-cpu-native162`;
+its remaining failure was an incorrect test expectation that a retired bank
+remains published. Publication is removed immediately while existing readers
+retain its storage. The corrected regression observes the actual retired node
+under its existing maintenance lock, then proves one pending reader, zero after
+real abort/drain, and no retained node after the normal reclamation sweep. It
+adds no ownership state, accounting ledger or inference-path diagnostic call.
+
+Build164 coherently rebuilds the core and ten owning test targets.
+`common-cpu-host165` passes all 12 affected host registrations in 6.92 seconds.
+`common-cpu-native166` passes existing MPI consensus and the new three-case
+physical lifecycle registration in 6.20 seconds. The latter repeats 20 times
+per actual rank. `common-cpu-native167` repeats that registration with complete
+untruncated output (3.41 seconds): 40 successful rank-case records for each of
+the three cases, 120 total, no skips and a clean driver window. Source banks
+remain alive only for their actual pending readers; transfer counters stay
+stable across repeated terminal queries, and final owned weight/shadow bytes
+return to zero. Exact command, full log, repetition summary and driver receipts
+remain under `/tmp/qfn-cpu-joint-qualified-r224/common-cpu-native167/`.
+
+These are component transfer results, not global dynamic placement, restored
+inference, fresh HF KL or Release performance certificates. Full preflight67
+remains unqualified; no broad gate was rerun for this focused slice.
 
 ## CUDA native-program stack
 

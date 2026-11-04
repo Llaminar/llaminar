@@ -20,6 +20,8 @@ namespace llaminar2::test
         struct JointPlacementOriginal
         {
             int expert_count;
+            int layers;
+            int first_layer;
             PlanningGGUFFixture file;
             std::shared_ptr<MPIContext> mpi = MPIContextFactory::self();
             TensorFactory factory{*mpi};
@@ -30,21 +32,25 @@ namespace llaminar2::test
              * @param members Full declared CPU cohort; never a hardware-availability probe.
              * @param whole_members Original inert accelerator owner count for stable-map tests.
              * @param experts Original tiny source E; three experts remain in the CPU tier.
+             * @param layer_count Original contiguous layer count.
+             * @param first Nonzero model-global layer origin when testing selected scopes.
              */
-            explicit JointPlacementOriginal(int members = 2, int whole_members = 1, int experts = 4)
-                : expert_count(experts),
+            explicit JointPlacementOriginal(int members = 2, int whole_members = 1, int experts = 4, int layer_count = 1, int first = 0)
+                : expert_count(experts), layers(layer_count), first_layer(first),
                   file(true, false, GGUFTensorType::F32, 64, std::nullopt, 8,
-                       PlanningGGUFFixture::Geometry::FullAttentionGraph, 1, uint32_t(experts))
+                       PlanningGGUFFixture::Geometry::FullAttentionGraph, uint32_t(first + layer_count), uint32_t(experts))
             {
                 if (!loader.loadModel(file.path()))
                     throw std::runtime_error("Joint placement metadata source failed to parse");
                 plan = cpuJointSourceTestPlan();
-                plan.first_model_layer = 0;
+                plan.first_model_layer = first_layer;
                 plan.routed_tiers[0].max_experts_per_layer = experts - 3;
                 plan.routed_tiers[1].max_experts_per_layer = 3;
                 std::vector<int> tiers(std::size_t(experts), 1);
                 std::fill_n(tiers.begin(), experts - 3, 0);
-                plan.placements = {{.layer = 0, .routed_expert_tier = std::move(tiers)}};
+                plan.placements.clear();
+                for (int layer = first_layer; layer < first_layer + layers; ++layer)
+                    plan.placements.push_back({.layer = layer, .routed_expert_tier = tiers});
                 plan.domains[0].participants.clear();
                 for (int owner = 0; owner < whole_members; ++owner)
                     plan.domains[0].participants.push_back(GlobalDeviceAddress::cuda(owner));
@@ -69,12 +75,12 @@ namespace llaminar2::test
             MoEOverlayResidencyAuthority::Config config() const
             {
                 return {.initial_plan = plan,
-                        .model_metadata = {.num_layers = 1,
+                        .model_metadata = {.num_layers = layers,
                                            .num_experts = expert_count,
                                            .d_model = 256,
                                            .routed_intermediate_size = 64,
-                                           .main_inference_layer_count = 1,
-                                           .first_model_layer = 0},
+                                           .main_inference_layer_count = first_layer + layers,
+                                           .first_model_layer = first_layer},
                         .projection_preparation = preparation,
                         .maintenance_mode = MoERebalanceRuntimeMode::Off,
                         .participant_rebalance_policy = {.enabled = false}};

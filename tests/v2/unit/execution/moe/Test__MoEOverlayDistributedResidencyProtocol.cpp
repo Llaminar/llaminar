@@ -373,32 +373,15 @@ namespace llaminar2::test
         Test__MoEOverlayDistributedResidencyProtocol,
         RemoteProjectionLaneBudgetScalesWithConfiguredCyclesAndRejectsOverflow)
     {
-        const MoEOverlayRemoteProjectionLaneBudget one_cycle{
-            .maximum_participants_per_cycle = 3,
-            .maximum_concurrent_cycles = 1,
-            .projections_per_expert = 3,
-        };
-        const MoEOverlayRemoteProjectionLaneBudget two_cycles{
-            .maximum_participants_per_cycle = 3,
-            .maximum_concurrent_cycles = 2,
-            .projections_per_expert = 3,
-        };
+        const MoEOverlayRemoteProjectionLaneBudget one_cycle = MoEOverlayRemoteProjectionLaneBudget::fromUniformCycles(3, 1, 3);
+        const MoEOverlayRemoteProjectionLaneBudget two_cycles = MoEOverlayRemoteProjectionLaneBudget::fromUniformCycles(3, 2, 3);
         ASSERT_TRUE(one_cycle.projectionOperationCount().has_value());
         ASSERT_TRUE(two_cycles.projectionOperationCount().has_value());
         EXPECT_EQ(*one_cycle.projectionOperationCount(), 9u);
         EXPECT_EQ(*two_cycles.projectionOperationCount(), 18u);
 
-        const MoEOverlayRemoteProjectionLaneBudget zero_participants{
-            .maximum_participants_per_cycle = 0,
-            .maximum_concurrent_cycles = 2,
-            .projections_per_expert = 3,
-        };
-        const MoEOverlayRemoteProjectionLaneBudget overflowing{
-            .maximum_participants_per_cycle =
-                std::numeric_limits<std::size_t>::max(),
-            .maximum_concurrent_cycles = 2,
-            .projections_per_expert = 3,
-        };
+        const MoEOverlayRemoteProjectionLaneBudget zero_participants = MoEOverlayRemoteProjectionLaneBudget::fromUniformCycles(0, 2, 3);
+        const MoEOverlayRemoteProjectionLaneBudget overflowing = MoEOverlayRemoteProjectionLaneBudget::fromUniformCycles(std::numeric_limits<std::size_t>::max(), 2, 3);
         EXPECT_FALSE(
             zero_participants.projectionOperationCount().has_value());
         EXPECT_FALSE(overflowing.projectionOperationCount().has_value());

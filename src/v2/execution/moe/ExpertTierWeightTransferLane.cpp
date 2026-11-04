@@ -11,6 +11,7 @@
  */
 
 #include "ExpertTierWeightTransferLane.h"
+#include "ExpertTierWeightStream.h"
 
 #include "../../backends/BackendManager.h"
 #include "../../backends/GPUDeviceContextPool.h"
@@ -734,6 +735,12 @@ namespace llaminar2
         return true;
     }
 
+    void ExpertTierWeightTransferLane::bindCPUEncodedWriteOwnership(std::shared_ptr<std::mutex> owner)
+    {
+        if (!quiescent()) throw std::logic_error("CPU encoded write ownership requires a quiescent reserved lane");
+        cpu_encoded_write_mutex_ = std::move(owner);
+    }
+
     MappedTransferProgressSlot *ExpertTierWeightTransferLane::serviceCommand() noexcept
     {
         if (!config_.progress.epoch())
@@ -860,7 +867,7 @@ namespace llaminar2
             const auto host_copy_started = std::chrono::steady_clock::now();
             if(isContiguousDirection())std::memcpy(cpu_destination_.data()+floatingOffset(false),pinned_chunk_,in_flight_bytes_);
             else if(!scatterExpertTierCPUWeightChunk(layout_,
-                    {static_cast<const uint8_t*>(pinned_chunk_),in_flight_bytes_},completed_units_,in_flight_units_,cpu_destination_))
+                    {static_cast<const uint8_t*>(pinned_chunk_),in_flight_bytes_},completed_units_,in_flight_units_,cpu_destination_,cpu_encoded_write_mutex_.get()))
                 return fail("CPU expert native intersection scatter failed",error);
             recordHostCopyDuration(
                 std::chrono::steady_clock::now() - host_copy_started);
