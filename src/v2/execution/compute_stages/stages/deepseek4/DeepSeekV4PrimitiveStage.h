@@ -9,12 +9,14 @@
  * graph contracts. Projections and ordinary norms stay in their existing
  * prepared GEMM/RMSNorm stages; this stage owns only model-specific arithmetic
  * and position-indexed state banks (raw window ring, compressor rings and
- * compressed pools). All views and policies are sealed at construction;
+ * compressed pools, stored as packed records in INT32 arena words whose layout
+ * is owned by DeepSeekV4KVFormat.h). All views and policies are sealed at construction;
  * execute verifies prepared storage and submits on the exact executor stream.
  */
 #pragma once
 #include "../qwen4exp/Qwen4ExpPrimitiveStage.h"
 #include "../../../../kernels/deepseek4/DeepSeekV4Kernels.h"
+#include "../../../../kernels/IKVCache.h"
 
 #include <memory>
 #include <optional>
@@ -64,7 +66,7 @@ public:
         int hc, hidden;
         Qwen4ExpFloatBinding input, output;
     };
-    /** @brief In-place per-head RMS (optional gain) and partial RoPE. */
+    /** @brief In-place per-head RMS (optional gain), partial RoPE and optional QAT rounding. */
     struct HeadNormRope
     {
         int heads, headDim;
@@ -73,59 +75,86 @@ public:
         std::optional<Qwen4ExpImmutableWeightBinding> gain;
         deepseek4::RopePolicy rope;
         bool inverse;
+        deepseek4::ActivationQuant quant;           ///< Official QAT post-operation.
         std::optional<Qwen4ExpIntInput> positions;  ///< Required when rope.ropeDim > 0.
         Qwen4ExpFloatBinding data;                  ///< [M, heads*headDim], in place.
     };
-    /** @brief Store compressor projections (score + ape) in the position ring. */
+    /** @brief Carry the chunk's last stateRows() projections (score + ape) into the FP32 state. */
     struct CompressorStore
     {
         deepseek4::CompressorGeometry geometry;
         Qwen4ExpIntInput positions;
-        Qwen4ExpFloatBinding kv, score;
+        Qwen4ExpFloatBinding kv, score;             ///< Chunk scratch [M, projectionWidth].
         Qwen4ExpImmutableWeightBinding ape;         ///< [ratio, projectionWidth] FP32.
-        Qwen4ExpFloatBinding ringKV, ringScore;     ///< Persistent [ringRows, projectionWidth].
+        Qwen4ExpFloatBinding stateKV, stateScore;   ///< Persistent [stateRows, projectionWidth].
     };
-    /** @brief Pool completed blocks into the persistent compressed pool. */
+    /** @brief Pool completed blocks (chunk scratch + carried state) into the packed pool. */
     struct CompressorPool
     {
         deepseek4::CompressorGeometry geometry;
         Qwen4ExpIntInput positions;
-        Qwen4ExpFloatBinding ringKV, ringScore;
+        Qwen4ExpFloatBinding kv, score;             ///< Chunk scratch [M, projectionWidth] (score without ape).
+        Qwen4ExpImmutableWeightBinding ape;         ///< [ratio, projectionWidth] FP32.
+        Qwen4ExpFloatBinding stateKV, stateScore;   ///< Persistent [stateRows, projectionWidth].
         Qwen4ExpImmutableWeightBinding gain;
         float eps;
         deepseek4::RopePolicy rope;
-        Qwen4ExpFloatBinding pool;                  ///< Persistent [poolRows, headDim].
+        Qwen4ExpIntBinding pool;                    ///< Persistent packed [poolRows, entryWords] INT32 words.
     };
-    /** @brief Store raw window rows in the persistent ring. */
+    /** @brief Pack the chunk's last @c window kv rows into the persistent window ring. */
     struct RawStore
     {
-        int headDim, ringRows;
+        deepseek4::PackedKVEntryFormat format;
+        int window;
         Qwen4ExpIntInput positions;
-        Qwen4ExpFloatBinding kv, ring;
+        Qwen4ExpFloatBinding kv;                    ///< [M, headDim] QAT kv.
+        Qwen4ExpIntBinding ring;                    ///< Persistent packed [window, entryWords].
     };
-    /** @brief Lightning-indexer scoring and top-k selection. */
+    /** @brief Lightning-indexer scoring and top-k selection over packed MXFP4 keys. */
     struct IndexerTopK
     {
-        int heads, headDim, ratio, topK, poolRows;
+        int heads;
+        deepseek4::PackedIndexerKeyFormat format;
+        int ratio, topK, poolRows, scoreRows;
         float weightScale;
         Qwen4ExpIntInput positions;
-        Qwen4ExpFloatBinding query, weights, pool;
-        std::optional<Qwen4ExpFloatBinding> scores; ///< [M, poolRows] scratch; required on GPU.
+        Qwen4ExpFloatBinding query, weights;
+        Qwen4ExpIntBinding pool;                    ///< Packed [poolRows, entryWords].
+        std::optional<Qwen4ExpFloatBinding> scores; ///< [scoreRows, poolRows] bounded scratch; required on GPU.
         Qwen4ExpIntBinding selected;                ///< [M, topK].
     };
-    /** @brief Sparse sink attention with output de-rotation. */
+    /** @brief Sparse sink attention with output de-rotation over chunk kv and packed records. */
     struct SparseAttention
     {
-        int heads, headDim, window, rawRingRows, ratio, topK, poolRows;
+        int heads;
+        deepseek4::PackedKVEntryFormat format;
+        int window, ratio, topK, poolRows;
         deepseek4::CompressedAccess access;
         float scale;
         deepseek4::RopePolicy rope;
         Qwen4ExpIntInput positions;
-        Qwen4ExpFloatBinding query, rawRing;
-        std::optional<Qwen4ExpFloatBinding> pool;
+        Qwen4ExpFloatBinding query, chunkKV;        ///< [M, heads*headDim], [M, headDim].
+        Qwen4ExpIntBinding rawRing;                 ///< Packed [window, entryWords].
+        std::optional<Qwen4ExpIntBinding> pool;     ///< Packed [poolRows, entryWords].
         std::optional<Qwen4ExpIntBinding> selected;
         Qwen4ExpImmutableWeightBinding sinks;
         Qwen4ExpFloatBinding output;
+    };
+    /**
+     * @brief Publish the forward's real rows to the canonical cache sequence frontier (GPU).
+     * @details DeepSeek-V4 attention state lives in model-owned banks, so the
+     * cache holds no attention layers and no append advances its frontier.
+     * The terminal layer advances it exactly once per forward on the exact
+     * stream (IKVCache::advanceRecurrentSequenceState), with device-owned
+     * real lengths for padded prefill graphs.
+     */
+    struct AdvanceSequenceFrontier
+    {
+        IKVCache *cache;                            ///< Canonical main cache (model_state layers only).
+        int layer;                                  ///< Global terminal layer of this graph.
+        int capturedRows;                           ///< Rows per request represented by the graph.
+        const std::int32_t *requestRows;            ///< Device real rows, or null when all rows are real.
+        Qwen4ExpIntInput positions;                 ///< Ordering anchor on the row positions.
     };
     /** @brief Grouped low-rank output projection (wo_a). */
     struct GroupedProjection
@@ -148,7 +177,8 @@ public:
     };
     /** @brief Closed operation set; absent operands cannot be represented. */
     using Operation = std::variant<HCRead, HCWrite, HCExpand, HeadNormRope, CompressorStore, CompressorPool,
-                                   RawStore, IndexerTopK, SparseAttention, GroupedProjection, Route>;
+                                   RawStore, IndexerTopK, SparseAttention, GroupedProjection, Route,
+                                   AdvanceSequenceFrontier>;
     /** @brief Immutable graph configuration. */
     struct Params
     {

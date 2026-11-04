@@ -584,7 +584,10 @@ namespace llaminar2
             {
                 const int gdn_idx =
                     layer_map_.toGDNIndex(normalizeLayerIndex(layer));
-                if(gdn_idx<0 || gdn_idx>=static_cast<int>(gdn_states_.size()))return false;
+                // Model-state layers own no cache payload: only their
+                // auxiliary scope (if any) is reset here.
+                if(!layer_map_.isModelState(normalizeLayerIndex(layer)) &&
+                   (gdn_idx<0 || gdn_idx>=static_cast<int>(gdn_states_.size())))return false;
                 if(auto *aux=this->auxiliaryState())aux->reset(
                     {first_layer_index_+normalizeLayerIndex(layer),1,seq_idx,1},context.execution_stream);
                 return true;
@@ -610,6 +613,13 @@ namespace llaminar2
             if (kv_idx >= 0)
             {
                 return ROCmRingKVCacheBase::resetLayerState(kv_idx, context);
+            }
+            if (layer_map_.isModelState(normalizeLayerIndex(layer)))
+            {
+                // No cache payload exists for a model-state layer.
+                if(auto *aux=this->auxiliaryState())aux->reset(
+                    {first_layer_index_+normalizeLayerIndex(layer),1,0,this->request_capacity()},context.execution_stream);
+                return true;
             }
             int gdn_idx = layer_map_.toGDNIndex(normalizeLayerIndex(layer));
             if (gdn_idx < 0 || gdn_idx >= static_cast<int>(gdn_states_.size()))
@@ -718,7 +728,7 @@ namespace llaminar2
         {
             const int local_layer = normalizeLayerIndex(layer);
             return local_layer >= 0 && local_layer < total_layers_ &&
-                   !layer_map_.isFullAttention(local_layer);
+                   layer_map_.isGDN(local_layer);
         }
         bool isFullAttentionLayer(int layer) const override
         {

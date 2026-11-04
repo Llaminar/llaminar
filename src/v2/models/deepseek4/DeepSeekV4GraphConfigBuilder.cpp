@@ -41,6 +41,9 @@ void DeepSeekV4GraphConfigBuilder::populateFromDirectory(const GGUFModel &model,
     config.rope_theta = exact->layer(0).rope.base;
     config.partial_rotary_factor = static_cast<float>(exact->ropeDim()) / static_cast<float>(exact->headDim());
     config.layer_types.assign(static_cast<std::size_t>(layers), "full_attention");
+    // Attention state lives in the DeepSeek-V4 arena banks; the canonical cache
+    // owns only the sequence frontier (model_state layers).
+    config.attention_state_owner = attentionStateOwnerOf(model.architecture);
     config.layer_head_dim.assign(static_cast<std::size_t>(layers), exact->headDim());
     config.moe.num_experts = exact->experts();
     config.moe.top_k = exact->expertsUsed();

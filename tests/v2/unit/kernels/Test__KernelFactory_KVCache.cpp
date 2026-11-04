@@ -465,10 +465,10 @@ namespace llaminar2::test
     {
         HybridKVCacheConfig hybrid;
         hybrid.layer_types = {
-            "linear_attention",
+            "gdn",
             "full_attention",
-            "linear_attention",
-            "linear_attention",
+            "gdn",
+            "gdn",
         };
 
         KVCacheConfig config;
@@ -505,9 +505,9 @@ namespace llaminar2::test
     {
         HybridKVCacheConfig hybrid;
         hybrid.layer_types = {
-            "linear_attention",
+            "gdn",
             "full_attention",
-            "linear_attention",
+            "gdn",
         };
         hybrid.gdn_conv_kernel_size = 3;
         hybrid.gdn_state_size = 2;

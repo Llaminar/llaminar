@@ -20,17 +20,19 @@ shared expert, SwiGLU clamped at 10, YaRN (factor 16, original 64k) on
 compressed layers only. Vision: 32-layer ViT (1024 wide, 2D RoPE) + 3x3 unfold
 aligner; image spans attend bidirectionally and use `exp_probs_b_vl`.
 
-Mathematical oracle: `python/reference/deepseek4.py` (full-recompute FP32),
-validated against llama.cpp b12079 with `scripts/deepseek4/`. Prefill stage
-cosine >= 0.9999 on non-indexer stages; indexer top-k differs only on
-near-ties caused by llama.cpp's Q8 activation quantization.
+Mathematical oracle: `python/reference/deepseek4.py` (full-recompute FP32,
+official QAT rounding on by default, `qat=False` for the pre-QAT formulation),
+validated against llama.cpp b12079 with `scripts/deepseek4/`. Without QAT,
+prefill stage cosine >= 0.9999 on non-indexer stages; indexer top-k differs
+only on near-ties caused by llama.cpp's Q8 activation quantization. llama.cpp
+skips the QAT rounding, so it is no longer the token oracle.
 
 ## Reuse map (QFN primitives)
 
 | DSV4 concept | QFN component | Relation |
 |---|---|---|
 | hc x d residual stream | QFN trunk (`residualWidth()`, embedding trunk expansion, branch read/write/head hooks in `QwenGraphBase`) | Reused plumbing. DSV4 adds a Sinkhorn read/write/head mixer selected by a typed residual-mixer policy next to Qwen4Exp's low-rank GR mixer. |
-| Compressed KV pools, raw window, compressor partial state | `ICacheAuxiliaryState` attached to the canonical cache (pattern of `Qwen4ExpAuxiliaryState`) | Reused lifecycle (reset/rollback/archive). DSV4 owns its own banks: CSA/HCA pools, indexer key pool, overlapping/plain compressor state. |
+| Compressed KV pools, raw window, compressor partial state | Model-owned arena banks (`AttentionStateOwner::ModelBanks`); the canonical cache is a frontier-only hybrid of `model_state` layers | Installed: see "KV cache architecture". An `ICacheAuxiliaryState` owner is still needed for prefix archive/restore and MTP rollback. |
 | Lightning indexer scoring + top-k | `QwenSparseAttention` indexer (relu(q.k) head sum, bounded top-k with stable lower-id ties) | Partly reusable: DSV4 adds learned per-token head weights and selects compressed entries, not token blocks. |
 | Sparse attention | `QwenSparseAttentionStage` (selected raw tokens, GQA, gated) | Different: DSV4 attends window raw entries plus selected/all compressed entries directly, MQA K==V, sinks, inverse RoPE on output. New stage. |
 | MoE pipeline | `Qwen35MoEGraph` routing/dispatch/grouped experts | Reused with extensions: sqrt(softplus) scoring, selection bias, route scale, hash routing, clamped SwiGLU, ungated shared expert. |
@@ -88,6 +90,145 @@ structural feature and are converted with stock llama.cpp.
   A 17-byte layout would need a codebook-specific scale plane in every
   NativeVNNI kernel; not done.
 
+## KV cache architecture (2026-11-04)
+
+DeepSeek-V4 attention state is owned by the model, not the generic KV cache.
+`GraphConfig::attention_state_owner = ModelBanks` (single authority
+`models/AttentionStateOwner.h`) makes `DeviceGraphOrchestrator` build the
+zero-payload hybrid cache: every layer is a typed `model_state`
+`HybridLayerKind`, with no FA slab and no GDN bank. The cache still owns the
+sequence frontier (device head/count rows, request reset). On GPU the terminal
+layer's `AdvanceSequenceFrontier` stage publishes the forward's real rows once
+(`advanceRecurrentSequenceState`, the all-GDN slice contract). CPU positions
+remain orchestrator-owned. `addKVCacheAppend`, the duplicate `kv_v` GEMM and
+`kv_norm_rope_v` are gone. The planner classifies the layers as
+`LayerStateKind::ModelOwned`, which gives 0 KV bytes.
+
+Official QAT (`inference/kernel.py`, `scale_fmt=ue8m0`), shared CPU/CUDA code in
+`kernels/deepseek4/DeepSeekV4KVFormat.h`:
+
+- Window kv and main compressor output: nope channels pass through FP8 E4M3 in
+  blocks of 64, with scale `2^ceil(log2(max(amax,1e-4)*fl(1/448)))`. The rope
+  channels are BF16.
+- Indexer q (after RoPE) and indexer compressor output: Hadamard
+  (Sylvester order, scaled by d^-0.5), then FP4 E2M1 in blocks of 32, with
+  scale `2^ceil(log2(max(amax,6*2^-126)*fl(1/6)))`.
+- Rounding is RNE throughout, and the scale bit formulas match `fast_round_scale`.
+
+`HeadNormRope` applies the QAT as a post-operation, so `K_PROJ` holds exactly
+the stored window values.
+
+Persistent banks are arena roots in INT32 words carrying packed records,
+laid out `[layer region][sequence][rows][record]` (one sequence today):
+
+| Bank | Record | Rows per sequence | Per-token cost (release) |
+|---|---|---|---|
+| raw window ring | 584 B fp8_ds_mla (448 E4M3 + 64 BF16 + 7 UE8M0 + pad) | `window` (128) | fixed 3.2 MB |
+| main compressed pool (CSA/HCA) | 584 B | ctx/4, ctx/128 | 21*146 + 20*4.56 B |
+| indexer pool (CSA) | 68 B MXFP4 (64 B nibbles + 4 E8M0) | ctx/4 | 21*17 B |
+| compressor kv/score state | FP32, as official | 2*ratio | fixed 22 MB |
+| indexer score scratch | FP32 | min(rows, 64 MiB / (4*ctx/4)) | <= 64 MiB |
+
+Each chunk reads its own window keys from `K_PROJ` and its own compressor
+projections from scratch. Earlier positions come from the ring/state, which
+are overwritten only after their readers (`raw_store` after `attention`,
+`comp_store` after `comp_pool`). Blocks that straddle chunks are therefore
+exact for any chunking, and nothing in the window ring or compressor state
+scales with the prefill chunk. The carried banks are zeroed and published once
+at setup (`DeepSeekV4Graph::initializeCacheAuxiliaryState`). Readers decode
+records on the fly. The lightning-indexer per-32-block FP4 dot products are
+exact in FP32, and heads accumulate with fused multiply-add in a fixed order,
+so CPU and CUDA scores are bit-identical. GPU indexer scoring runs in passes of
+`deepSeekV4IndexerScoreRows` rows (`kDeepSeekV4IndexerScoreBudgetBytes` =
+64 MiB), with an exact top-k and an unchanged tie rule (score descending, block
+id ascending).
+
+Admission charges these banks exactly once. The GPU arena is priced from the
+same schema resolution the orchestrator registers, and is cross-checked
+fatally against `deepSeekV4ArenaExtensionBytes` (a unit test proves extension
+bytes equal the resolved declarations). This fixed two defects:
+
+- The GPU activation estimate returned before the DSV4 extension, so no DSV4
+  bank was ever charged on GPU.
+- Caches without attention layers no longer reserve full-context FP32
+  conversion scratch (`CUDARingKVCache`/`ROCmRingKVCache` with `n_layers_==0`),
+  which had cost ~4 GiB at 1M.
+
+Planner dry-run (UD-Q8_K_XL header, `--device cuda:0 --no-prefix-cache`):
+
+| Context | KV old -> new | DSV4 pools | Indexer scratch | Workspace old -> new | Total old -> new |
+|---|---|---|---|---|---|
+| 32K | 2.7 GB -> 0 | 115 MB (0.107 GiB) | 2 MiB at 64 rows | 1.4 -> 1.3 GB | 163.9 -> 161.3 GB |
+| 1M | 86.0 GB -> 0 | 3.68 GB (3.43 GiB) | 64 MiB | 5.3 -> 1.3 GB | 251.1 -> 164.7 GB |
+
+Context-proportional state: 3,514 B/token. vLLM uses 3.4-3.8 KB with an FP8
+indexer; the MXFP4 indexer here is lossless because of the FP4 QAT.
+
+Validation (tiny models, 457-token prompt, greedy):
+
+| Model / path | Tokens vs `deepseek4.py` (QAT) |
+|---|---|
+| dsv4-vision-tiny-ff256-bf16, CPU | 8/8 equal (prefill bucket 512 and 100) |
+| dsv4-vision-tiny-ff256-bf16, CUDA | 8/8 equal, == CPU |
+| dsv4-tiny-q8kxl-layout-bf16exps (UD-Q8_K_XL analogue), CPU and CUDA | 8/8 equal, CPU == CUDA |
+| dsv4-vision-tiny-q8, CUDA | 6/6 equal (bucket 512, 64, 100); ExpertOverlay cuda:0 (8 experts) + cpu:0 identical |
+| dsv4-vision-tiny-q8, CPU | first 3 equal; step 3 picks '070', ref rank 4 (top-1 4.271, rank-4 4.035: 0.24 logits; QAT ref top-1/top-2 margin 0.16). Pre-QAT baseline (old binary): CPU diverged from the reference at step 4 and from CUDA at step 4 |
+
+- `serve` with deterministic chat completions A, B, A gives identical A
+  outputs on CPU and CUDA (request reset).
+- Given Llaminar's own dumped inputs, the indexer pool equals the official
+  compressor output exactly, and the selection equals exact top-k.
+- Stage cosines against the QAT oracle (bf16 model, CPU prefill) are >= 0.997
+  except attention at the CSA layers (0.980 / 0.973). This is near-tie
+  amplification, not an arithmetic error: Llaminar's activations differ from
+  the FP32 oracle by about 1% RMS, and the FP4 QAT turns that into flipped
+  E2M1 codes (about 5% of indexer q values) and different top-k sets on
+  near-ties. The official BF16 path has the same sensitivity.
+
+Kernel resources (ptxas, sm_86 and sm_90, `--warn-on-spills` fatal): every
+DSV4 kernel has 0 spill bytes on both architectures, and
+`CUDARingKVCache.cu` is also spill-free on sm_90. Notable registers at sm_90:
+
+- `sparseAttentionKernel`: 130 registers and 16 KB smem. At 256 threads that
+  is one CTA/SM, which is the occupancy limiter to tune.
+- `indexerScoreKernel`: 39 registers.
+- `compressorPoolKernel` and `headNormRopeKernel`: 37 registers and 3 KB smem.
+- `rawStoreKernel`: 30 registers.
+
+`ncu` is not available inside the dev container, so occupancy and throughput
+profiling is still open.
+
+Regressions:
+
+- `V2_Unit_DeepSeekV4CPUKernels`
+- `V2_Integration_DeepSeekV4CompactKVContracts` (preflight, device-free): QAT
+  hand values, codecs, 584/68 B records, chunk-straddling compressor/window
+  state, bounded scratch, and the single admission inventory.
+- `V2_Integration_CUDA_DeepSeekV4CompactKV` (preflight): byte-exact CUDA vs
+  CPU QAT and packing, device chunking invariance, bit-identical indexer
+  scores, and bounded passes == one pass.
+- `Test__HybridKVCache` model_state map/cache.
+- `V2_Integration_DeepSeekV4ArenaAdmission` (preflight, device-free):
+  - the GPU arena prices every registered root once (cross-checked against
+    the declared inventory), and only the pools and the bounded scratch scale
+    with context;
+  - the canonical cache charges no KV payload;
+  - no K/V conversion scratch exists without attention layers, with a dense
+    control.
+- The CUDA suite also proves that the frontier-only CUDA cache publishes no
+  conversion scratch and advances its device frontier once per forward,
+  including across reset/replay.
+
+Open:
+
+- Prefix archive/restore of the banks: needs an `ICacheAuxiliaryState` owner,
+  and the prefix gate keys on `ModelBanks`.
+- Per-sequence banks for 8-way batching: the layout already has the sequence
+  axis.
+- The GPU indexer selection still emits the selected ids from one thread, and
+  scores re-decode each key per head. Profile and tune both at 1M before
+  production.
+
 ## Official-weight exactness evidence
 
 `scripts/deepseek4/verify_gguf_exactness.py --json` compares one row of each of
@@ -123,8 +264,9 @@ loads the lossy UD-IQ* files.
   env `HOME=/tmp OMP_NUM_THREADS=16 OMP_PLACES=cores OMP_PROC_BIND=close`.
   Health: `GET /health`. No `--mtp`, TP/PP flags or CPU expert tier (the pod's
   default seccomp/no SYS_NICE blocks the CPU expert pool's NUMA calls).
-- Memory: the planner's single-device BOM is 163.9 GiB at 32K (weights 158.8,
-  of which MXFP4 experts 145.1; KV 2.7; workspace 1.4; graphs/activations 0.1).
+- Memory: the planner's single-device BOM is 161.3 GiB at 32K (weights 158.8,
+  of which MXFP4 experts 145.1; KV 0; DeepSeek-V4 arena incl. 0.1 GiB pools
+  0.26; workspace 1.3; graphs 0.1). Before the compact KV it was 163.9 GiB.
   The 2-GPU split is NOT certified: dense/shared weights (~13.7 GiB), KV and the
   continuation workspace live on cuda:0, so an even expert split would put about
   90 GiB on cuda:0 against 93.09 GiB usable. A topology-aware per-device BOM
@@ -150,13 +292,13 @@ vLLM arguments and the corresponding Llaminar state:
 | Checkpoint | official FP8 + MXFP4 safetensors | UD-Q8_K_XL GGUF: same values, FP8 tensors widened to BF16 | FP8 E4M3 128x128 block weight type, rebuilt exactly from the BF16 copy (-4.6 GiB) |
 | Expert weights on GPU | MXFP4, 17 B/32 | 18 B/32 (FP16 scale) | 17-byte MXFP4 GPU layout (-8 GiB) |
 | `--tensor-parallel-size=2` | heads and experts split across both GPUs | DSV4 rejects TP/PP; only ExpertOverlay (dense on cuda:0) | dense TP2 for DSV4 attention/shared (balanced 2-GPU memory) |
-| `--max-model-len=1048576` | 1M | generic KV 88 KB/token + FP32 pools | drop generic cache; FP8/MXFP4 pools (3.4-3.8 KB/token) |
-| `--kv-cache-dtype=fp8`, `--block-size=256` | `fp8_ds_mla` 584 B/entry, FP8 indexer 132 B | FP32 pools | same storage format + official QAT rounding |
+| `--max-model-len=1048576` | 1M | done: no generic KV; 3,514 B/token packed pools (3.43 GiB at 1M) | - |
+| `--kv-cache-dtype=fp8`, `--block-size=256` | `fp8_ds_mla` 584 B/entry, FP8 indexer 132 B | done: 584 B fp8_ds_mla + 68 B MXFP4 indexer (lossless under QAT), official QAT rounding | paged blocks with the prefix cache |
 | `--max-num-seqs=8`, `--max-num-batched-tokens=4096` | 8 concurrent, 4096-token chunks | exactly one request per graph | per-sequence pools, batched DSV4 graph |
 | prefix caching (default) + `SimpleCPUOffloadConnector` 192 GiB | GPU + host tier | rejected for deepseek4 | archive/restore DSV4 rings and pools in the prefix cache |
 | `--speculative-config` DSpark k=5, per-batch [[1,2,5],[3,4,3],[5,8,2]] | drafter in checkpoint | MTP rejected; DSpark absent | DSpark drafter (GGUF `dspark` tensors) + dynamic depth |
 | `--moe-backend=humming` | FP8 MoE activations | int8 (Q8) activations on NativeVNNI | none required for function; numerics differ |
-| `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=64` | indexer scratch cap | `[rows, poolRows]` FP32 score scratch | chunked indexer scoring with a bounded scratch |
+| `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=64` | indexer scratch cap | done: row passes bounded by 64 MiB (`kDeepSeekV4IndexerScoreBudgetBytes`) | - |
 | `--offload-backend=uva --cpu-offload-params vision aligner embed_tokens` | 0.93 GiB/GPU freed | no vision; embedding on GPU | vision tower; optional host embedding |
 | `--compilation-config FULL_AND_PIECEWISE`, async scheduling | full graphs | full captured graphs | equivalent |
 | `--reasoning-parser/--tool-call-parser deepseek_v4`, thinking `high` default | official DSV4 encoding | GGUF Jinja template, generic thinking split | DSV4 encoding (`reasoning_effort`), DSML tool calls |
