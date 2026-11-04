@@ -31,6 +31,7 @@
 
 #include "kernels/common/DeviceNativeVNNIContributionContract.h"
 #include "kernels/common/NativeVNNIPackedBits.h"
+#include "kernels/common/NativeVnniScaleLoad.h"
 
 #include <cstdint>
 #include <iterator>

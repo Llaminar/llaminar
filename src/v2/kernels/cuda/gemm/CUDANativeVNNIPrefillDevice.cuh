@@ -490,6 +490,13 @@ namespace llaminar2::cuda::prefill
         {
             if constexpr (ASYNC_RAW_MODE >= 2)
             {
+                // cp.async copies plane elements verbatim and cannot normalize a
+                // 1-byte E8M0 plane into staged words. A byte plane must copy its
+                // live byte extent into raw staging and normalize it before the
+                // CTA barrier (issue #26 switch); until then this producer only
+                // admits 2-byte planes.
+                static_assert(::llaminar2::nativeVnniScalePlaneBytes(CODEBOOK_ID) == 2,
+                              "async BK64 scale staging requires a 2-byte primary plane");
                 const int chunk = threadIdx.x;
                 if (chunk >= 2 * BN / 8) return;
                 const int half = chunk / (BN / 8);
@@ -548,7 +555,8 @@ namespace llaminar2::cuda::prefill
                     constexpr int PAYLOAD_BYTES = Traits::payload_bytes;
                     const size_t base = (static_cast<size_t>(kb) * N + gcol) * PAYLOAD_BYTES;
                     const uint16_t s = ASYNC_RAW_MODE >= 2 ? uint16_t{0}
-                        : scales_B[static_cast<size_t>(kb) * N + gcol];
+                        : ::llaminar2::native_vnni_scale::loadStagedPrimary<CODEBOOK_ID>(
+                              scales_B, static_cast<size_t>(kb) * N + gcol);
                     const uint8_t *raw_source = ASYNC_RAW_MODE == 0 ? payload + base
                         : reinterpret_cast<const uint8_t *>(&dst_words[word_offset]);
 
@@ -671,9 +679,12 @@ namespace llaminar2::cuda::prefill
                                                  ? (static_cast<size_t>(kb0 + 1) * N + gcol) * PAYLOAD_BYTES
                                                  : size_t{0};
 
-                        const uint16_t s0 = scales_B[static_cast<size_t>(kb0) * N + gcol];
+                        // smem_scales_B carries normalized staged words, never raw plane bytes.
+                        const uint16_t s0 = ::llaminar2::native_vnni_scale::loadStagedPrimary<CODEBOOK_ID>(
+                            scales_B, static_cast<size_t>(kb0) * N + gcol);
                         const uint16_t s1 = has_block1
-                                                ? scales_B[static_cast<size_t>(kb0 + 1) * N + gcol]
+                                                ? ::llaminar2::native_vnni_scale::loadStagedPrimary<CODEBOOK_ID>(
+                                                      scales_B, static_cast<size_t>(kb0 + 1) * N + gcol)
                                                 : uint16_t{0};
 
                         [[maybe_unused]] uint16_t m0 = 0, m1 = 0;

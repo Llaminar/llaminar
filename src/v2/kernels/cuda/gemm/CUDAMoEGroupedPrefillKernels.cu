@@ -287,8 +287,8 @@ namespace
         if constexpr (Traits::is_iq4_lut)
         {
             const float scale = physical_codebook == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook
-                ? llaminar2::cuda_native_vnni::native_vnni_single_scale_rn<llaminar2::kNativeVnniIQ4XSSourceScaleCodebook>(scales[linear], mins[linear])
-                : llaminar2::cuda_native_vnni::fp16_bits_to_float(scales[linear]);
+                ? llaminar2::cuda_native_vnni::native_vnni_single_scale_rn<llaminar2::kNativeVnniIQ4XSSourceScaleCodebook>(::llaminar2::native_vnni_scale::loadStagedPrimary<CodebookId>(scales, linear), mins[linear])
+                : llaminar2::cuda_native_vnni::fp16_bits_to_float(::llaminar2::native_vnni_scale::loadStagedPrimary<CodebookId>(scales, linear));
             return llaminar2::device_native_vnni_contract::singleScaleBlock(
                 dot_lo, scale, activation_scale);
         }
@@ -322,7 +322,7 @@ namespace
                 dot_lo,
                 dot_hi,
                 activation_scale,
-                scales[linear],
+                ::llaminar2::native_vnni_scale::loadStagedPrimary<CodebookId>(scales, linear),
                 secondary_bits,
                 emin_bits,
                 activation_sum_lo + activation_sum_hi,
@@ -885,7 +885,9 @@ namespace
                         {
                             const size_t linear =
                                 static_cast<size_t>(block) * N + column;
-                            scale_bits = weight_scales[linear];
+                            // The slot carries the normalized staged word (low 16 bits).
+                            scale_bits = ::llaminar2::native_vnni_scale::loadStagedPrimary<CodebookId>(
+                                weight_scales, linear);
                             if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_iq4_source_scale)
                                 if (descriptor.codebook_id == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook)
                                     scale_bits |= uint32_t{weight_mins[linear]} << 16;

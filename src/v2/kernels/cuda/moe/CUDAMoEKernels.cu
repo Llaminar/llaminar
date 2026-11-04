@@ -18466,8 +18466,8 @@ namespace
                 dot = __dp4a(a_vals[group], packed_groups[group], dot);
             const float scale = physical_codebook == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook
                 ? llaminar2::cuda_native_vnni::native_vnni_single_scale_rn<llaminar2::kNativeVnniIQ4XSSourceScaleCodebook>(
-                      scale_base[linear], min_base[linear])
-                : llaminar2::cuda_native_vnni::fp16_bits_to_float(scale_base[linear]);
+                      ::llaminar2::native_vnni_scale::loadStagedPrimary<CodebookId>(scale_base, linear), min_base[linear])
+                : llaminar2::cuda_native_vnni::fp16_bits_to_float(::llaminar2::native_vnni_scale::loadStagedPrimary<CodebookId>(scale_base, linear));
             return llaminar2::device_native_vnni_contract::singleScaleBlock(dot, scale, scale_a);
         }
         if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_dual_scale)
@@ -18514,7 +18514,7 @@ namespace
                     dot_lo,
                     dot_hi,
                     scale_a,
-                    scale_base[linear],
+                    ::llaminar2::native_vnni_scale::loadStagedPrimary<CodebookId>(scale_base, linear),
                     min_base ? min_base[linear] : 0u,
                     emin_base ? emin_base[linear] : 0u,
                     sum_lo + sum_hi,
@@ -18543,7 +18543,7 @@ namespace
                     dot,
                     0,
                     scale_a,
-                    scale_base[linear],
+                    ::llaminar2::native_vnni_scale::loadStagedPrimary<CodebookId>(scale_base, linear),
                     min_base ? min_base[linear] : 0u,
                     0u,
                     sum_a,
