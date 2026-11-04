@@ -196,7 +196,7 @@ namespace llaminar2::mxfp4
     static_assert(preparedScaleFP16Bits(0) == 0u && preparedScaleFP16Bits(128) == 0x3c00u);
     static_assert(normalScaleFP32Bits(128) == 0x3f800000u, "2^0 is FP32 one");
     static_assert(normalScaleFP32Bits(kMinNormalFP32Exponent) == 0x00800000u, "2^-126 is the smallest FP32 normal");
-    static_assert(normalScaleFP32Bits(kMaxNativeE8M0Exponent) == 0x7e000000u, "2^124");
+    static_assert(normalScaleFP32Bits(kMaxNativeE8M0Exponent) == 0x7d800000u, "2^124");
     static_assert(!exponentFitsNativeE8M0(1) && !exponentFitsNativeE8M0(253) && exponentFitsNativeE8M0(104));
     static_assert((uint32_t{powerOfTwoBF16Word(128)} << 16) == normalScaleFP32Bits(128));
     static_assert((uint32_t{powerOfTwoBF16Word(2)} << 16) == normalScaleFP32Bits(2));
