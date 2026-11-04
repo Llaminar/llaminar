@@ -33,21 +33,24 @@ TEST(CPUJointGraphOwnership, ExternalJointProjectionPreservesOriginalMembership)
         ASSERT_EQ(continuation.size(), 512u);
         for (int expert = 0; expert < 512; ++expert)
         {
-            EXPECT_EQ(global[expert], expert < 64 ? 0 : -1);
+            EXPECT_EQ(global[expert], expert < 64 ? 0
+                                                  : MoEOverlayRouteTarget::cpuCohort(
+                                                        owners.placementFor(7, expert)->tier_idx)
+                                                        .word());
             EXPECT_EQ(continuation[expert], expert < 64 ? 0 : -1);
             EXPECT_EQ(owners.fragmentCountForExpert(7, expert), expert < 64 ? 1u : static_cast<std::size_t>(members));
         }
         for (const auto &participant : owners.participants())
         {
-            const auto membership = jointRouteMembershipFromMap(owners, 7, 512, participant.participant_id, 11);
+            const auto membership =
+                jointRouteTargetFromMap(owners, 7, 512, participant.participant_id);
             const bool joint = participant.domain_name == "cpu_joint";
             EXPECT_EQ(membership.enabled(), joint);
             for (int expert = 0; expert < 512; ++expert)
             {
-                EXPECT_EQ(membership.contains(expert), joint && expert >= 64);
                 int resolved = -99;
                 ASSERT_TRUE(membership.resolve(expert, global[expert], &resolved));
-                EXPECT_EQ(resolved, joint && expert >= 64 ? participant.participant_id : global[expert]);
+                EXPECT_EQ(resolved, expert < 64 ? 0 : joint ? participant.participant_id : -1);
             }
         }
         EXPECT_THROW(owners.ownerFor(7, 64), std::logic_error);
@@ -55,8 +58,8 @@ TEST(CPUJointGraphOwnership, ExternalJointProjectionPreservesOriginalMembership)
         EXPECT_EQ(domainLocalOwnerParticipantsFromMap(owners, 7, 512, "absent"), std::vector<int>(512, -1));
         EXPECT_TRUE(ownerParticipantsFromMap(owners, 7, 0).empty());
         EXPECT_EQ(ownerParticipantsFromMap(owners, 8, 4), std::vector<int>(4, -1));
-        EXPECT_THROW(jointRouteMembershipFromMap(owners, 7, 512, 999, 11), std::invalid_argument);
-        EXPECT_THROW(jointRouteMembershipFromMap(owners, 7, 512, 1, 0), std::invalid_argument);
+        EXPECT_THROW(jointRouteTargetFromMap(owners, 7, 512, 999), std::invalid_argument);
+        EXPECT_THROW(jointRouteTargetFromMap(owners, 7, 0, 1), std::invalid_argument);
     }
 }
 

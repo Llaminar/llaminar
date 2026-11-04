@@ -3251,7 +3251,13 @@ namespace llaminar2
                                                 throw std::logic_error("GPU scalar runtime cannot represent its own joint CPU domain");
                                             auto &external=update.experts[static_cast<size_t>(expert)];
                                             external.logical_expert_id=expert;external.owner_participant=-1;
-                                            continue; // Original masks dispatch each joint CPU member explicitly.
+                                            update.overlay_route_participant[static_cast<size_t>(
+                                                expert)] =
+                                                MoEOverlayRouteTarget::cpuCohort(
+                                                    placement->tier_idx)
+                                                    .word();
+                                            continue; // Fixed CPU cohort remains external to GPU
+                                                      // compute.
                                         }
                                         const auto *const owner =
                                             owner_map_->ownerFor(
@@ -5371,8 +5377,10 @@ namespace llaminar2
                         context_it->second,protocol,lane->identity,layer.stage_ordinal);
                     expert_compute_ok=joint_completed.has_value();
                 }
-                const bool joint_contributor=layer.joint_route_collective &&
-                    lane->identity.return_role==static_cast<uint32_t>(MoEOverlayActivationReturnRole::StaticJointContributor);
+                const bool joint_contributor =
+                    layer.joint_route_collective &&
+                    lane->identity.return_role ==
+                        static_cast<uint32_t>(MoEOverlayActivationReturnRole::JointContributor);
                 const auto expected_return_rows=joint_contributor?size_t{0}:input.live_row_count;
                 if (collect_timeline)
                 {

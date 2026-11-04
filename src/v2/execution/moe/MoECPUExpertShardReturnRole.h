@@ -8,6 +8,7 @@
  */
 #pragma once
 #include "MoEExpertOwnerMap.h"
+#include "MoEOverlayRouteTarget.h"
 #include "MoEExpertShardCohort.h"
 #include "MoEOverlayActivationEpochProtocol.h"
 #include <span>
@@ -54,11 +55,46 @@ inline MoEOverlayActivationReturnRole originalCPUExpertShardReturnRole(const MoE
         }
         if(ordinary_layers)throw std::invalid_argument("CPU joint channel omitted an original source layer");
         if(whole)throw std::invalid_argument("CPU joint channel cannot alias a whole-expert return publisher");
-        const auto current=cohort->participants().front().participant_id==target.participant_id
-            ?MoEOverlayActivationReturnRole::StaticJointRoot:MoEOverlayActivationReturnRole::StaticJointContributor;
+        const auto current = cohort->participants().front().participant_id == target.participant_id
+                                 ? MoEOverlayActivationReturnRole::JointRoot
+                                 : MoEOverlayActivationReturnRole::JointContributor;
         if(role && *role!=current)throw std::invalid_argument("CPU joint channel changed original root across source layers");
         role=current;
     }
     return role.value_or(MoEOverlayActivationReturnRole::Ordinary);
 }
+/**
+ * @brief Project the fixed original cohort tier from the same authenticated source map.
+ * @param source Same original immutable map used to authenticate the return role.
+ * @param target Exact original target endpoint.
+ * @param layers Same retained model-layer manifest.
+ * @return Fixed cohort target tag, or absent for an ordinary channel.
+ * @throws std::invalid_argument If a retained family changes its original cohort tier.
+ */
+inline std::int32_t
+originalCPUExpertShardCohortTarget(const MoEExpertOwnerMap *source,
+                                   const MoEOverlayActivationLaneEndpoint &target,
+                                   std::span<const int32_t> layers)
+{
+    if (originalCPUExpertShardReturnRole(source, target, layers) ==
+        MoEOverlayActivationReturnRole::Ordinary)
+        return -1;
+    std::optional<int> tier;
+    for (const auto &row : source->owners())
+    {
+        if (!row.shard_cohort ||
+            std::find(layers.begin(), layers.end(), row.layer_idx) == layers.end())
+            continue;
+        const auto members = row.shard_cohort->participants();
+        if (std::none_of(members.begin(), members.end(), [&](const auto &member)
+                         { return member.participant_id == target.participant_id; }))
+            continue;
+        if (tier && *tier != row.tier_idx)
+            throw std::invalid_argument("CPU cohort channel changed its original canonical tier");
+        tier = row.tier_idx;
+    }
+    if (!tier)
+        throw std::invalid_argument("CPU cohort channel has no original tier identity");
+    return MoEOverlayRouteTarget::cpuCohort(*tier).word();
 }
+} // namespace llaminar2

@@ -4,6 +4,7 @@
  */
 
 #include "execution/moe/MoEOverlayActivationEpochProtocol.h"
+#include "execution/moe/MoEOverlayRouteTarget.h"
 
 #include <gtest/gtest.h>
 
@@ -145,7 +146,7 @@ namespace llaminar2::test
     TEST(Test__MoEOverlayActivationEpochProtocol,
          FixedABIAndTwoBanksPreservePipelinedRoundTripsAcrossReset)
     {
-        EXPECT_EQ(kMoEOverlayActivationABIVersion, 7u);
+        EXPECT_EQ(kMoEOverlayActivationABIVersion, 8u);
         EXPECT_EQ(sizeof(MoEOverlayActivationEndpointStatus), 128u);
         EXPECT_EQ(sizeof(MoEOverlayActivationEpochControl), 1152u);
         EXPECT_EQ(alignof(MoEOverlayActivationEpochControl), 64u);
@@ -881,6 +882,38 @@ namespace llaminar2::test
         completeBoth(protocol, *identity);
         EXPECT_FALSE(protocol.completedTraffic(*identity, &error).has_value());
         EXPECT_NE(error.find("source-owned shared hidden"), std::string::npos);
+    }
+
+    /** @test Fixed cohort identity is in channel semantics and every invocation digest. */
+    TEST(Test__MoEOverlayActivationEpochProtocol, FixedCohortTargetIsAuthenticatedAcrossReplay)
+    {
+        auto config = makeConfig({7});
+        config.return_role = MoEOverlayActivationReturnRole::JointRoot;
+        EXPECT_FALSE(config.valid());
+        config.cohort_target = MoEOverlayRouteTarget::cpuCohort(4).word();
+        ASSERT_TRUE(config.valid());
+        MoEOverlayActivationEpochControl control;
+        MoEOverlayActivationEpochProtocol::initialize(control, config);
+        auto foreign = config;
+        foreign.cohort_target = MoEOverlayRouteTarget::cpuCohort(5).word();
+        EXPECT_THROW(MoEOverlayActivationEpochProtocol(control, foreign), std::logic_error);
+        const auto saved_version = control.channel.abi_version;
+        --control.channel.abi_version;
+        EXPECT_THROW(MoEOverlayActivationEpochProtocol(control, config), std::logic_error);
+        control.channel.abi_version = saved_version;
+        MoEOverlayActivationEpochProtocol protocol(control, config);
+        std::string error;
+        const auto identity = protocol.arm(makeTicket(config), 1, 10000, &error);
+        ASSERT_TRUE(identity) << error;
+        EXPECT_EQ(identity->cohort_target, config.cohort_target);
+        auto changed = *identity;
+        changed.cohort_target = foreign.cohort_target;
+        EXPECT_NE(moeOverlayActivationIdentityDigest(changed), identity->digest);
+        changed.digest = moeOverlayActivationIdentityDigest(changed);
+        EXPECT_FALSE(
+            protocol.activate(MoEOverlayActivationEndpoint::Continuation, changed, &error));
+        EXPECT_TRUE(protocol.cancelOriginalInvocation(
+            *identity, MoEOverlayActivationStatusCode::ExplicitAbort, &error));
     }
 
 } // namespace llaminar2::test

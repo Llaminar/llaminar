@@ -9,6 +9,7 @@
  */
 
 #include "MoEOverlayActivationPacketStages.h"
+#include "execution/moe/MoEOverlaySharedDispatchSelection.h"
 
 #include "../../../backends/BackendManager.h"
 #include "../../../backends/GPUDeviceContextPool.h"
@@ -39,24 +40,25 @@ namespace llaminar2
          * channel role, target and model layer. The source bitset never replaces
          * the versioned placement-bank/epoch acquisition performed on device.
          */
-        bool validJointDispatchMembership(
-            const MoEOverlayStaticJointRouteMembership &membership,
-            const MoEOverlayMappedActivationDeviceLane &lane,
-            std::uint32_t experts, std::int32_t layer) noexcept
+        bool validJointDispatchTarget(const MoEOverlayJointRouteTarget &membership,
+                                      const MoEOverlayMappedActivationDeviceLane &lane,
+                                      std::uint32_t experts, std::int32_t layer) noexcept
         {
             return lane.control_host &&
+                   moeOverlayActivationReturnRoleValid(lane.control_host->channel.return_role) &&
                    membership.validFor(experts, lane.target_participant_id, layer) &&
+                   membership.cohortTarget() == lane.control_host->channel.cohort_target &&
                    membership.enabled() ==
                        (lane.control_host->channel.return_role !=
                         static_cast<std::uint32_t>(MoEOverlayActivationReturnRole::Ordinary));
         }
 
         /** @return Canonical lane projection; an omitted vector means ordinary lanes only. */
-        const MoEOverlayStaticJointRouteMembership &jointMembershipForLane(
-            const std::vector<MoEOverlayStaticJointRouteMembership> &memberships,
-            std::size_t lane) noexcept
+        const MoEOverlayJointRouteTarget &
+        jointTargetForLane(const std::vector<MoEOverlayJointRouteTarget> &memberships,
+                           std::size_t lane) noexcept
         {
-            static constexpr MoEOverlayStaticJointRouteMembership ordinary;
+            static constexpr MoEOverlayJointRouteTarget ordinary;
             return memberships.empty() ? ordinary : memberships[lane];
         }
 
@@ -912,32 +914,22 @@ namespace llaminar2
     {
         std::size_t hidden_elements = 0u;
         std::size_t route_elements = 0u;
-        return validLaneStage(
-                   params_.lane,
-                   params_.device_id,
-                   params_.physical_rows,
-                   params_.stage_ordinal,
-                   params_.model_layer_index) &&
-               params_.lane.target_participant_id >= 0 &&
-               params_.placement.valid() &&
-               validJointDispatchMembership(
-                   params_.static_joint_membership, params_.lane,
-                   params_.placement.expert_count, params_.model_layer_index) &&
-               checkedElements(
-                   params_.physical_rows,
-                   params_.lane.dispatch.d_model,
-                   &hidden_elements) &&
-               checkedElements(
-                   params_.physical_rows,
-                   params_.lane.dispatch.top_k,
-                   &route_elements) &&
+        return validLaneStage(params_.lane, params_.device_id, params_.physical_rows,
+                              params_.stage_ordinal, params_.model_layer_index) &&
+               params_.lane.target_participant_id >= 0 && params_.placement.valid() &&
+               validJointDispatchTarget(params_.joint_route_target, params_.lane,
+                                        params_.placement.expert_count,
+                                        params_.model_layer_index) &&
+               checkedElements(params_.physical_rows, params_.lane.dispatch.d_model,
+                               &hidden_elements) &&
+               checkedElements(params_.physical_rows, params_.lane.dispatch.top_k,
+                               &route_elements) &&
                isFP32Capacity(params_.hidden, hidden_elements) &&
                isFP32Capacity(params_.routing_indices, route_elements) &&
                isFP32Capacity(params_.routing_weights, route_elements) &&
                params_.lane.dispatch.row_capacity >=
                    static_cast<std::size_t>(params_.physical_rows) &&
-               params_.lane.dispatch.entry_capacity >= route_elements &&
-               moe_kernel_;
+               params_.lane.dispatch.entry_capacity >= route_elements && moe_kernel_;
     }
 
     bool MoEOverlayActivationDispatchPackStage::hasFixedContract() const noexcept
@@ -984,14 +976,12 @@ namespace llaminar2
         }
 
         const MoEOverlayActivationDispatchPackLaunch launch{
-            .hidden_rows_fp32 =
-                static_cast<const float *>(params_.hidden->gpu_data_ptr()),
-            .route_expert_ids_fp32 = static_cast<const float *>(
-                params_.routing_indices->gpu_data_ptr()),
-            .route_weights = static_cast<const float *>(
-                params_.routing_weights->gpu_data_ptr()),
+            .hidden_rows_fp32 = static_cast<const float *>(params_.hidden->gpu_data_ptr()),
+            .route_expert_ids_fp32 =
+                static_cast<const float *>(params_.routing_indices->gpu_data_ptr()),
+            .route_weights = static_cast<const float *>(params_.routing_weights->gpu_data_ptr()),
             .placement = params_.placement,
-            .static_joint_membership = params_.static_joint_membership,
+            .joint_route_target = params_.joint_route_target,
             .active_row_count_device = params_.active_row_count_device,
             .packet = payload.packet,
             .hidden_payload_layout = payload.selection.layout,
@@ -2040,14 +2030,13 @@ namespace llaminar2
             return false;
 
         const auto &lanes = transaction->lanes();
-        if (!params_.static_joint_memberships.empty() &&
-            params_.static_joint_memberships.size() != lanes.size())
+        if (!params_.joint_route_targets.empty() &&
+            params_.joint_route_targets.size() != lanes.size())
             return false;
         for (std::size_t lane = 0u; lane < lanes.size(); ++lane)
-            if (!validJointDispatchMembership(
-                    jointMembershipForLane(params_.static_joint_memberships, lane),
-                    lanes[lane], params_.placement.expert_count,
-                    transaction->modelLayerIndex()))
+            if (!validJointDispatchTarget(jointTargetForLane(params_.joint_route_targets, lane),
+                                          lanes[lane], params_.placement.expert_count,
+                                          transaction->modelLayerIndex()))
                 return false;
         std::int32_t d_model = 0;
         std::int32_t top_k = 0;
@@ -2096,8 +2085,7 @@ namespace llaminar2
             return false;
         }
         if (params_.transaction->usesAsynchronousLanes())
-            return params_.transaction->persistentResourcesReady() &&
-                   shared_row_groups_.size()==params_.transaction->lanes().size();
+            return params_.transaction->persistentResourcesReady() && shared_row_groups_prepared_;
         return
                params_.routing_indices->gpu_data_ptr() &&
                params_.routing_weights->gpu_data_ptr() &&
@@ -2108,22 +2096,27 @@ namespace llaminar2
     {
         if(!stream)return false;
         const auto& lanes=params_.transaction->lanes();
-        if(!shared_row_groups_.empty())return shared_row_groups_.size()==lanes.size();
-        std::vector<MoEOverlaySharedJointRouteUnion> unions(lanes.size());
+        if (shared_row_groups_prepared_)
+            return true;
         for(std::size_t writer=0;writer<lanes.size();++writer) {
             if(!params_.transaction->lanePublishesSharedDispatchPayload(writer))continue;
             std::vector<MoEOverlaySharedDispatchTarget> members;
             for(std::size_t member=0;member<lanes.size();++member)
                 if(lanes[member].mapped_region.get()==lanes[writer].mapped_region.get() &&
                    lanes[member].shared_dispatch_hidden_offset==lanes[writer].shared_dispatch_hidden_offset)
-                    members.push_back({lanes[member].target_participant_id,jointMembershipForLane(params_.static_joint_memberships,member)});
-            if(members.size()>std::numeric_limits<std::uint32_t>::max() ||
-               !lanes[writer].shared_dispatch_controls_device || members.size()!=lanes[writer].shared_dispatch_consumer_count ||
-               members.size()!=params_.transaction->sharedDispatchPayloadLaneCount(writer))return false;
-            unions[writer]=MoEOverlaySharedJointRouteUnion::fromOriginalGroup(params_.placement.expert_count,
-                params_.transaction->modelLayerIndex(),members);
+                    members.push_back({lanes[member].target_participant_id,
+                                       jointTargetForLane(params_.joint_route_targets, member)});
+            if (members.size() > std::numeric_limits<std::uint32_t>::max() ||
+                !validateMoEOverlaySharedDispatchGroup(params_.placement.expert_count,
+                                                       params_.transaction->modelLayerIndex(),
+                                                       members) ||
+                !lanes[writer].shared_dispatch_controls_device ||
+                members.size() != lanes[writer].shared_dispatch_consumer_count ||
+                members.size() != params_.transaction->sharedDispatchPayloadLaneCount(writer))
+                return false;
         }
-        shared_row_groups_=std::move(unions);return true;
+        shared_row_groups_prepared_ = true;
+        return true;
     }
 
     bool MoEOverlayActivationDispatchPackBatchStage::prepareDescriptors(
@@ -2171,17 +2164,14 @@ namespace llaminar2
                 return false;
             }
             const MoEOverlayActivationDispatchPackLaunch packet{
-                .hidden_rows_fp32 = static_cast<const float *>(
-                    params_.hidden->gpu_data_ptr()),
-                .route_expert_ids_fp32 = static_cast<const float *>(
-                    params_.routing_indices->gpu_data_ptr()),
-                .route_weights = static_cast<const float *>(
-                    params_.routing_weights->gpu_data_ptr()),
+                .hidden_rows_fp32 = static_cast<const float *>(params_.hidden->gpu_data_ptr()),
+                .route_expert_ids_fp32 =
+                    static_cast<const float *>(params_.routing_indices->gpu_data_ptr()),
+                .route_weights =
+                    static_cast<const float *>(params_.routing_weights->gpu_data_ptr()),
                 .placement = params_.placement,
-                .static_joint_membership = jointMembershipForLane(
-                    params_.static_joint_memberships, lane_index),
-                .active_row_count_device =
-                    params_.active_row_count_device,
+                .joint_route_target = jointTargetForLane(params_.joint_route_targets, lane_index),
+                .active_row_count_device = params_.active_row_count_device,
                 .packet = payload.packet,
                 .hidden_payload_layout = payload.selection.layout,
                 .control = lane.control_device,
@@ -2189,8 +2179,7 @@ namespace llaminar2
                 .target_participant_id = lane.target_participant_id,
                 .physical_rows = 1,
                 .stage_ordinal = params_.transaction->stageOrdinal(),
-                .model_layer_index =
-                    params_.transaction->modelLayerIndex(),
+                .model_layer_index = params_.transaction->modelLayerIndex(),
             };
             MoEOverlayActivationSingleRowDispatchPackLaunch launch{
                 .packet = packet,
@@ -2282,31 +2271,30 @@ namespace llaminar2
                        acquired_input.device()!=params_.device_id || acquired_input.consumerStream()!=lane_stream)return false;
                     const bool group=transaction.lanePublishesSharedDispatchPayload(lane_index);
                     const MoEOverlayActivationDispatchPackLaunch launch{
-                        .hidden_rows_fp32 = static_cast<const float *>(
-                            params_.hidden->gpu_data_ptr()),
-                        .route_expert_ids_fp32 = static_cast<const float *>(
-                            params_.routing_indices->gpu_data_ptr()),
-                        .route_weights = static_cast<const float *>(
-                            params_.routing_weights->gpu_data_ptr()),
+                        .hidden_rows_fp32 =
+                            static_cast<const float *>(params_.hidden->gpu_data_ptr()),
+                        .route_expert_ids_fp32 =
+                            static_cast<const float *>(params_.routing_indices->gpu_data_ptr()),
+                        .route_weights =
+                            static_cast<const float *>(params_.routing_weights->gpu_data_ptr()),
                         .placement = params_.placement,
-                        .static_joint_membership = jointMembershipForLane(
-                            params_.static_joint_memberships, lane_index),
-                        .active_row_count_device =
-                            params_.active_row_count_device,
+                        .joint_route_target =
+                            jointTargetForLane(params_.joint_route_targets, lane_index),
+                        .active_row_count_device = params_.active_row_count_device,
                         .packet = payload.packet,
-                        .hidden_payload_layout =
-                            payload.selection.layout,
+                        .hidden_payload_layout = payload.selection.layout,
                         .control = lane.control_device,
                         .grant = lane.grant_device,
-                        .target_participant_id =
-                            lane.target_participant_id,
+                        .target_participant_id = lane.target_participant_id,
                         .physical_rows = transaction.physicalRows(),
                         .stage_ordinal = transaction.stageOrdinal(),
-                        .model_layer_index =
-                            transaction.modelLayerIndex(),
-                        .shared_row_controls = group ? lane.shared_dispatch_controls_device : nullptr,
-                        .shared_row_target_count = group ? static_cast<std::uint32_t>(transaction.sharedDispatchPayloadLaneCount(lane_index)) : 0u,
-                        .shared_joint_union = group ? shared_row_groups_[lane_index] : MoEOverlaySharedJointRouteUnion{},
+                        .model_layer_index = transaction.modelLayerIndex(),
+                        .shared_row_controls =
+                            group ? lane.shared_dispatch_controls_device : nullptr,
+                        .shared_row_target_count =
+                            group ? static_cast<std::uint32_t>(
+                                        transaction.sharedDispatchPayloadLaneCount(lane_index))
+                                  : 0u,
                         .shared_row_writer = group,
                     };
                     if (!moe_kernel_->packMoEOverlayActivationDispatch(

@@ -549,18 +549,15 @@ namespace llaminar2::moe_activation_packet_device
             loadSystemAcquire64(&control->admission.ready_signal);
         const auto admission = snapshotPeerPublished(&control->admission);
         if (channel.magic != kMoEOverlayActivationMagic ||
-            channel.abi_version != kMoEOverlayActivationABIVersion ||
-            channel.channel_nonce == 0u ||
-            channel.buffer_count != kMoEOverlayActivationBufferCount ||
-            channel.stage_count == 0u ||
+            channel.abi_version != kMoEOverlayActivationABIVersion || channel.channel_nonce == 0u ||
+            channel.buffer_count != kMoEOverlayActivationBufferCount || channel.stage_count == 0u ||
             stage_ordinal >= channel.stage_count ||
-            admission_timeline !=
-                kMoEOverlayActivationAdmissionTimeline ||
+            admission_timeline != kMoEOverlayActivationAdmissionTimeline ||
             admission.state != raw(MoEOverlayActivationAdmissionState::Armed) ||
-            identity.epoch_generation == 0u ||
-            identity.stage_count != channel.stage_count ||
+            identity.epoch_generation == 0u || identity.stage_count != channel.stage_count ||
             identity.lane_ordinal != channel.lane_ordinal ||
             identity.return_role != channel.return_role ||
+            identity.cohort_target != channel.cohort_target ||
             !moeOverlayActivationReturnRoleValid(identity.return_role) ||
             identity.channel_nonce != channel.channel_nonce ||
             identity.workspace_generation != channel.workspace_generation ||
@@ -574,16 +571,12 @@ namespace llaminar2::moe_activation_packet_device
             identity.source_domain_ordinal != channel.source_domain_ordinal ||
             identity.target_domain_ordinal != channel.target_domain_ordinal ||
             identity.graph_role >= 32u ||
-            (channel.graph_role_mask &
-             (std::uint32_t{1} << identity.graph_role)) == 0u ||
-            admittedPhysicalRows(identity) !=
-                static_cast<std::uint64_t>(physical_rows) ||
+            (channel.graph_role_mask & (std::uint32_t{1} << identity.graph_role)) == 0u ||
+            admittedPhysicalRows(identity) != static_cast<std::uint64_t>(physical_rows) ||
             (expected_target_participant >= 0 &&
              channel.target_participant_id != expected_target_participant) ||
             !sameDigest(identity.digest, admission.digest) ||
-            !sameDigest(
-                identity.digest,
-                moeOverlayActivationIdentityDigest(identity)))
+            !sameDigest(identity.digest, moeOverlayActivationIdentityDigest(identity)))
         {
             return false;
         }
@@ -794,18 +787,14 @@ namespace llaminar2::moe_activation_packet_device
                 launch.physical_rows,
                 launch.target_participant_id,
                 launch.placement);
-        if (!grant_acquired ||
-            placement_ticket.epoch == 0u ||
-            placement_generation == 0u ||
+        if (!grant_acquired || placement_ticket.epoch == 0u || placement_generation == 0u ||
             placement_ticket.epoch != launch.grant->placement_epoch ||
-            !launch.static_joint_membership.acceptsEpoch(placement_ticket.epoch) ||
-            launch.static_joint_membership.enabled() !=
-                (control->channel.return_role != static_cast<std::uint32_t>(
-                    MoEOverlayActivationReturnRole::Ordinary)) ||
-            placement_bank >= kDeviceMoEOverlayEpochBankCount ||
-            !selected_placement.valid() ||
-            static_cast<std::uint64_t>(*selected_placement.epoch) !=
-                placement_ticket.epoch)
+            launch.joint_route_target.cohortTarget() != control->channel.cohort_target ||
+            launch.joint_route_target.enabled() !=
+                (control->channel.return_role !=
+                 static_cast<std::uint32_t>(MoEOverlayActivationReturnRole::Ordinary)) ||
+            placement_bank >= kDeviceMoEOverlayEpochBankCount || !selected_placement.valid() ||
+            static_cast<std::uint64_t>(*selected_placement.epoch) != placement_ticket.epoch)
         {
             publishFailure(
                 control,
@@ -903,13 +892,13 @@ namespace llaminar2::moe_activation_packet_device
         // owner or changing the original router-slot/weight publication order.
         // Metadata's existing complete-prefix validation also authenticates the
         // publisher's entire immutable union before any shared row is written.
-        if(launch.shared_row_target_count) {
-            std::int32_t resolved=-1;
-            if(!launch.shared_joint_union.validFor(launch.placement.expert_count,launch.model_layer_index,launch.grant->placement_epoch) ||
-               !launch.shared_joint_union.accepts(expert_id,route_participant))return false;
+        if (MoEOverlayRouteTarget::fromWord(route_participant).isCPUCohort() &&
+            moeOverlayJointRouteWeightIsZero(route_weight))
+        {
+            *participant = -1;
+            return true;
         }
-        return launch.static_joint_membership.resolve(
-            expert_id, route_participant, participant);
+        return launch.joint_route_target.resolve(expert_id, route_participant, participant);
     }
 
     /** @brief Publish the authenticated descriptor for one compact packet. */

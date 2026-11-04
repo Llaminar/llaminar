@@ -45,7 +45,7 @@ namespace llaminar2
     namespace
     {
         constexpr uint64_t kSharedChannelMagic = 0x5a43574f454d4c4cULL;
-        constexpr uint32_t kSharedChannelVersion = 6;
+        constexpr uint32_t kSharedChannelVersion = 7;
         constexpr size_t kCacheLine = 64;
 
         enum class PublicationState : uint32_t
@@ -1311,26 +1311,28 @@ namespace llaminar2
                 .world_rank=config.target_world_rank,.participant_id=participants_[participant_index],
                 .tier_priority=config.target_tier_priority,.domain_ordinal=config.domain_ordinal};
             const auto return_role=originalCPUExpertShardReturnRole(config.original_cpu_joint_owners.get(),target,family.model_layer_indices);
+            const auto cohort_target = originalCPUExpertShardCohortTarget(
+                config.original_cpu_joint_owners.get(), target, family.model_layer_indices);
+            nonce = fnv1a(nonce, &cohort_target, sizeof(cohort_target));
             if(return_role!=MoEOverlayActivationReturnRole::Ordinary)nonce=fnv1a(nonce,&return_role,sizeof(return_role));
             return {
                 .channel_nonce = nonce,
-                .topology_fingerprint_low =
-                    config.transaction_topology.topology_fingerprint_low,
-                .topology_fingerprint_high =
-                    config.transaction_topology.topology_fingerprint_high,
-                .workspace_generation =
-                    config.transaction_topology.workspace_generation,
+                .topology_fingerprint_low = config.transaction_topology.topology_fingerprint_low,
+                .topology_fingerprint_high = config.transaction_topology.topology_fingerprint_high,
+                .workspace_generation = config.transaction_topology.workspace_generation,
                 .source = config.source_endpoint,
-                .target = {
-                    .world_rank = config.target_world_rank,
-                    .participant_id = participants_[participant_index],
-                    .tier_priority = config.target_tier_priority,
-                    .domain_ordinal = config.domain_ordinal,
-                },
+                .target =
+                    {
+                        .world_rank = config.target_world_rank,
+                        .participant_id = participants_[participant_index],
+                        .tier_priority = config.target_tier_priority,
+                        .domain_ordinal = config.domain_ordinal,
+                    },
                 .lane_ordinal = static_cast<std::uint32_t>(lane_index),
                 .graph_role_mask = family.graph_role_mask,
                 .model_layer_indices = family.model_layer_indices,
-                .return_role=return_role,
+                .return_role = return_role,
+                .cohort_target = cohort_target,
             };
         }
 

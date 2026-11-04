@@ -13,7 +13,7 @@
 
 #include "MoEExpertOwnerMap.h"
 #include "MoEExpertShardCohort.h"
-#include "MoEOverlayStaticJointRouteMembership.h"
+#include "MoEOverlayJointRouteTarget.h"
 #include <algorithm>
 #include <optional>
 #include <stdexcept>
@@ -75,8 +75,7 @@ namespace llaminar2
      * @param owner_map Original immutable whole/joint expert placement.
      * @param layer_idx Original model-global layer.
      * @param num_experts Original logical expert count.
-     * @return Overlay participant IDs for whole experts, or the existing
-     *         external sentinel -1 for joint CPU collective work.
+     * @return Typed existing route words: global whole participants or original CPU cohort tiers.
      */
     inline std::vector<int> ownerParticipantsFromMap(
         const MoEExpertOwnerMap &owner_map, int layer_idx, int num_experts)
@@ -85,46 +84,48 @@ namespace llaminar2
         for (int expert = 0; expert < num_experts; ++expert)
         {
             const auto *placement = owner_map.placementFor(layer_idx, expert);
-            if (placement && !placement->shard_cohort)
-                owners[static_cast<size_t>(expert)] = placement->owner_participant;
+            if (placement)
+                owners[static_cast<size_t>(expert)] =
+                    placement->shard_cohort
+                        ? MoEOverlayRouteTarget::cpuCohort(placement->tier_idx).word()
+                        : MoEOverlayRouteTarget::whole(placement->owner_participant).word();
         }
         return owners;
     }
 
     /**
-     * @brief Project all original joint experts for one captured destination.
+     * @brief Project the fixed original CPU cohort for one captured destination.
      * @param owner_map Original prepared whole/joint source placement authority.
      * @param layer_idx Original model-global layer.
      * @param num_experts Original expert axis.
      * @param target_participant Original global target, independent of member count.
-     * @param initial_epoch Original Static registry epoch, required for joint lanes.
-     * @return Empty for an ordinary lane; exact immutable membership otherwise.
+     * @return Empty for an ordinary lane; fixed immutable cohort/member geometry otherwise.
      * @throws std::invalid_argument For missing target or incomplete joint metadata.
      */
-    inline MoEOverlayStaticJointRouteMembership jointRouteMembershipFromMap(
-        const MoEExpertOwnerMap &owner_map, int layer_idx, int num_experts,
-        int target_participant, std::uint64_t initial_epoch)
+    inline MoEOverlayJointRouteTarget jointRouteTargetFromMap(const MoEExpertOwnerMap &owner_map,
+                                                              int layer_idx, int num_experts,
+                                                              int target_participant)
     {
         if (!owner_map.participantForId(target_participant) || num_experts <= 0 ||
             num_experts > static_cast<int>(moe_runtime_abi::kMaxExperts))
-            throw std::invalid_argument("Joint dispatch projection requires an original target and expert axis");
-        std::vector<std::int32_t> expert_ids;
-        for (int expert = 0; expert < num_experts; ++expert)
+            throw std::invalid_argument(
+                "Joint route target requires original target/source identity");
+        std::optional<int> tier;
+        for (const auto &row : owner_map.owners())
         {
-            const auto *placement = owner_map.placementFor(layer_idx, expert);
-            if (!placement || !placement->shard_cohort)
+            if (row.layer_idx != layer_idx || !row.shard_cohort)
                 continue;
-            const auto members = placement->shard_cohort->participants();
-            if (std::any_of(members.begin(), members.end(),
-                [target_participant](const auto &member)
-                { return member.participant_id == target_participant; }))
-                expert_ids.push_back(expert);
+            const auto members = row.shard_cohort->participants();
+            if (std::none_of(members.begin(), members.end(), [&](const auto &member)
+                             { return member.participant_id == target_participant; }))
+                continue;
+            if (tier && *tier != row.tier_idx)
+                throw std::invalid_argument("Joint route target changed original cohort tier");
+            tier = row.tier_idx;
         }
-        if (expert_ids.empty())
-            return {};
-        return MoEOverlayStaticJointRouteMembership::fromProjection(
-            static_cast<std::uint32_t>(num_experts), target_participant,
-            layer_idx, initial_epoch, expert_ids);
+        return tier ? MoEOverlayJointRouteTarget::fromOriginalCohort(
+                          num_experts, target_participant, layer_idx, *tier)
+                    : MoEOverlayJointRouteTarget{};
     }
 
     /**

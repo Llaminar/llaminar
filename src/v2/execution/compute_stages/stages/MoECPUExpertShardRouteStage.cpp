@@ -270,8 +270,9 @@ std::optional<CPUExpertShardRouteCompletion> MoECPUExpertShardRouteStage::execut
     IDeviceContext *ctx,MoEOverlayActivationEpochProtocol &protocol,
     const MoEOverlayActivationEpochIdentity &identity,std::uint32_t stage) {
     const auto &source=*params_.original_source;
-    const auto expected=source.participantIndex()==static_cast<size_t>(params_.root_participant)
-        ?MoEOverlayActivationReturnRole::StaticJointRoot:MoEOverlayActivationReturnRole::StaticJointContributor;
+    const auto expected = source.participantIndex() == static_cast<size_t>(params_.root_participant)
+                              ? MoEOverlayActivationReturnRole::JointRoot
+                              : MoEOverlayActivationReturnRole::JointContributor;
     const auto reject_original = [&](const char* reason) -> std::optional<CPUExpertShardRouteCompletion> {
         LOG_ERROR("[MoECPUExpertShardRouteStage] Original endpoint publication rejected: reason=" << reason
             << " stage=" << params_.stage_name << " ordinal=" << stage
@@ -330,7 +331,8 @@ std::optional<CPUExpertShardRouteCompletion> MoECPUExpertShardRouteStage::execut
         // One root publishes each combined route once. Contributors retire
         // metadata only; the continuation's original ordered fold still owns
         // top-k accumulation, after the fixed participant-order addition here.
-        if(expected==MoEOverlayActivationReturnRole::StaticJointRoot) {
+        if (expected == MoEOverlayActivationReturnRole::JointRoot)
+        {
             const auto width=static_cast<size_t>(params_.columns);
             for(size_t entry=0;entry<input.live_entry_count;++entry) {
                 const auto slot=static_cast<size_t>(input.original_route_slots_host[entry]);
@@ -347,7 +349,9 @@ std::optional<CPUExpertShardRouteCompletion> MoECPUExpertShardRouteStage::execut
             }
             for(size_t row=0;row<input.live_row_count;++row)output.row_ids_host[row]=input.row_ids_host[row];
             output.live_row_count=input.live_row_count;
-        } else output.live_row_count=0;
+        }
+        else
+            output.live_row_count = 0;
     }
     return CPUExpertShardRouteCompletion(protocol.control_,identity,stage,params_.original_source,
         params_.original_tp_owner,params_.root_participant,params_.original_prepared_layer,std::move(completed_bank));

@@ -35,8 +35,9 @@ Source-authenticated joint placement snapshots and CPU fragment epoch banks
 pass their component contracts. Physical-fragment endpoint wiring now stages
 and executes exact destinations on two genuine CPU sockets. Successful staging,
 failed-piece drain and setup rejection each pass 20 repetitions per rank, with
-real retired-reader and reclamation checks. Live captured membership, global
-publication and retirement through complete inference remain unresolved.
+real retired-reader and reclamation checks. Live GPU packet membership also
+passes native CUDA/ROCm capture tests. Global publication and retirement through
+complete CPU/GPU inference remain unresolved.
 Their runtime guards are unchanged. Component correctness alone does not admit
 a dynamic execution mode. The broader design remains in
 [the dynamic residency plan](QFN_SHARDED_EXPERT_DYNAMIC_RESIDENCY_PLAN.md).
@@ -187,6 +188,65 @@ remain under `/tmp/qfn-cpu-joint-qualified-r224/common-cpu-native167/`.
 These are component transfer results, not global dynamic placement, restored
 inference, fresh HF KL or Release performance certificates. Full preflight67
 remains unqualified; no broad gate was rerun for this focused slice.
+
+## Live cohort targets in captured GPU packets
+
+The acquired placement bank now supplies each expert's complete target through
+its existing signed route word: a whole participant, absence, or a fixed CPU
+cohort tier. Captured launch metadata retains only original cohort/member
+geometry. It no longer freezes an expert-membership mask or initial epoch.
+Initial graph construction and later bank publication use the same encoding;
+shared-row selection reads that same acquired bank. No extra owner table,
+bitmap bank, mutable host mirror or capacity reserve is introduced.
+
+The channel authenticates its fixed cohort tag as semantic identity. Activation
+ABI 8 and mapping ABI 7 reuse reserved words without growing channel storage.
+Joint routes omit only exact positive/negative zero before entry/row compaction;
+bitwise classification preserves nonzero subnormals under CUDA FTZ. Ordinary
+whole-expert selection and numerical kernels retain their arithmetic. Router
+hotness is still counted before fanout, not once per packet member.
+
+Build168 coherently builds core, both backends and the owning packet/metadata
+suites. CUDA SM80/86/89/90 and HIP gfx906/gfx1100 compile with mandatory spill
+guards intact. Build169 refreshes CPU serving metadata. Host170 passes 16 of
+19 registrations; host173 passes the three repaired cases. Repairs update the
+stale ABI-7 assertion and remove an invalid fixture that put multiple original
+CPU-cohort members in one MPI rank. All valid declared 2/4/8-member GPU packet
+cases remain; these declare metadata, not native four/eight-socket execution.
+Ordinary two-consumer shared-row controls remain. A native mixed GPU/cohort
+shared group still needs separate qualification.
+
+The former device-free sparse-phase fixture fabricated successful empty
+collective completion without an original prepared bank. Its replacement,
+`ActualStageRejectsSparsePhaseWithoutOriginalPreparedBank`, asserts rejection
+before any collective/counter publication or output overwrite across the phase
+inputs. The obsolete name and scripted-success arm are removed. This is a
+source-boundary negative regression; successful sparse-phase publication still
+belongs to genuine prepared rooted service integration.
+
+Native171 correctly rejected the new fixture's prefilled acquired ticket.
+Native174 then rejected a second materialization of an already captured graph.
+The fixture now starts its source ticket empty, obtains the real native reader,
+and retains the actual original `MaterializedUnlaunched` executable. A changed
+placement writes only its reserved bank before native ready/publish/acquire.
+The same captured executable dispatches after that publication, and terminal
+checks prove exact slots, coefficient bits, payload bytes, untouched tails and
+reader release. No production guard was weakened to admit either fixture.
+
+Native174 passes all 47 existing cases in the 51-case owning packet suite,
+plus both explicit shared-union registrations. Its four new cohort cases pass
+after repair in `common-cpu-native176` (four registrations, 8.81 seconds), on
+CUDA and ROCm with no skips and clean driver evidence. The earlier exact-row
+controls also pass on both backends. Build172 and build175 rebuild the repaired
+fixtures. These receipts are under `/tmp/qfn-cpu-joint-qualified-r224/`.
+
+These GPU packet traces use fresh channels and terminal cancellation after
+inspection; they do not invent CPU completion or reset a cancelled channel.
+They prove capture-before-bank-change dispatch, not repeated successful
+GPU-to-CPU compute/return transactions or global cohort movement. The genuine
+two-socket rooted lifecycle test is the next independent obligation. Dynamic
+cohort inference, controller cost qualification, fresh model KL, Release
+performance and complete preflight remain unqualified.
 
 ## CUDA native-program stack
 

@@ -64,7 +64,10 @@ namespace llaminar2
         std::uint32_t graph_role_mask = 0u;
         /** Strictly increasing model-layer indices embedded in the transaction. */
         std::vector<std::int32_t> model_layer_indices;
-        MoEOverlayActivationReturnRole return_role = MoEOverlayActivationReturnRole::Ordinary; ///< Original source-cohort role, fixed at setup.
+        MoEOverlayActivationReturnRole return_role =
+            MoEOverlayActivationReturnRole::Ordinary; ///< Immutable logical return policy.
+        std::int32_t cohort_target =
+            -1; ///< Fixed original CPU cohort tag, never expert membership.
 
         /** @return Whether the rank pair, topology, and stage manifest are usable. */
         [[nodiscard]] bool valid() const noexcept;

@@ -955,14 +955,17 @@ namespace llaminar2
                                               << num_experts);
                 return false;
             }
-            if (std::any_of(
-                    overlay_route_participants.begin(),
-                    overlay_route_participants.end(),
-                    [](int participant) { return participant < -1; }))
+            for (std::size_t expert = 0; expert < overlay_route_participants.size(); ++expert)
             {
-                LOG_ERROR("[Qwen35MoEGraph] " << context
-                                              << ": overlay route participant vector contains a value below -1");
-                return false;
+                if (MoEOverlayRouteTarget::fromWord(overlay_route_participants[expert])
+                        .isCPUCohort() &&
+                    owner_participants[expert] >= 0)
+                {
+                    LOG_ERROR("[Qwen35MoEGraph] "
+                              << context
+                              << ": CPU cohort target conflicts with a local GPU-domain owner");
+                    return false;
+                }
             }
 
             if (runtimeTableHasUsableMaskedDecodeBank(
@@ -12124,16 +12127,12 @@ namespace llaminar2
                     }
 
                     // Each CPU tensor shard consumes the original routed inputs.
-                    // The runtime table keeps joint work external (-1); this cold
-                    // per-lane projection supplies exact original cohort fanout.
-                    const auto joint_dispatch_membership = [&](int target)
+                    // The acquired bank names its current whole/cohort target.
+                    // Capture retains only the fixed original cohort/member geometry.
+                    const auto joint_dispatch_target = [&](int target)
                     {
-                        return jointRouteMembershipFromMap(
-                            *owner_map_lifetime, layer_idx,
-                            config_.moe.num_experts, target,
-                            config_.moe.expert_overlay_participant_residency
-                                ? config_.moe.expert_overlay_participant_residency->initialEpoch()
-                                : 0u);
+                        return jointRouteTargetFromMap(*owner_map_lifetime, layer_idx,
+                                                       config_.moe.num_experts, target);
                     };
 
                     if (use_lane_batch)
@@ -12147,11 +12146,11 @@ namespace llaminar2
                         packet_params.routing_indices = routing_indices;
                         packet_params.routing_weights = routing_weights;
                         packet_params.placement = pinned_route_placement;
-                        packet_params.static_joint_memberships.reserve(
+                        packet_params.joint_route_targets.reserve(
                             mapped_lane_transaction->lanes().size());
                         for (const auto &lane : mapped_lane_transaction->lanes())
-                            packet_params.static_joint_memberships.push_back(
-                                joint_dispatch_membership(lane.target_participant_id));
+                            packet_params.joint_route_targets.push_back(
+                                joint_dispatch_target(lane.target_participant_id));
                         /* A sequence-length scalar is also the live-row count
                          * only for a padded single-request prefill bucket.
                          * During decode it contains the growing KV position,
@@ -12211,8 +12210,8 @@ namespace llaminar2
                             packet_params.routing_indices = routing_indices;
                             packet_params.routing_weights = routing_weights;
                             packet_params.placement = pinned_route_placement;
-                            packet_params.static_joint_membership =
-                                joint_dispatch_membership(binding.lane.target_participant_id);
+                            packet_params.joint_route_target =
+                                joint_dispatch_target(binding.lane.target_participant_id);
                             /* Decode has one live activation row regardless of
                              * the current sequence/KV length. Only padded
                              * prefill buckets may derive live rows from the

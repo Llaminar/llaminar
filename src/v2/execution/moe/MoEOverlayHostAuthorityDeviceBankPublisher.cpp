@@ -10,6 +10,7 @@
  */
 
 #include "MoEOverlayHostAuthorityDeviceBankPublisher.h"
+#include "MoEOverlayRouteTarget.h"
 
 #include "DeviceMoEExpertDescriptorBuilder.h"
 #include "MoEOverlayDeviceControllerRuntimeBinding.h"
@@ -902,6 +903,8 @@ namespace llaminar2
                         auto &descriptor = update.experts[expert];
                         descriptor.logical_expert_id = static_cast<std::int32_t>(expert);
                         descriptor.owner_participant = -1;
+                        update.overlay_route_participant[expert] =
+                            MoEOverlayRouteTarget::cpuCohort(placement->tier_idx).word();
                         continue;
                     }
                     const auto *const owner =

@@ -10,6 +10,7 @@
  */
 
 #pragma once
+#include "MoEOverlayRouteTarget.h"
 
 #include "DeviceMoEOverlayEpochABI.h"
 #include "DeviceMoEOverlayServiceTelemetry.h"
@@ -216,13 +217,15 @@ namespace llaminar2
          *
          * This identity is deliberately distinct from
          * DeviceMoEExpertDescriptor::owner_participant, which is local to one
-         * homogeneous compute domain. Values are stable logical participant
-         * IDs from the global owner map; `-1` means that no overlay endpoint is
-         * assigned. Publishing this array in the same double-buffered bank as
+         * homogeneous compute domain. MoEOverlayRouteTarget encodes either a global
+         * whole participant, the original fixed CPU cohort tier, or absent.
+         * Expert membership changes only by publishing this same bank.
+         * Publishing this array in the same double-buffered bank as
          * residency prevents a captured sparse dispatcher from observing a
          * new owner with an old routing target.
          */
-        int32_t overlay_route_participant[kDeviceMoEMaxExperts] = {};
+        int32_t overlay_route_participant[kDeviceMoEMaxExperts] =
+            {}; ///< Typed whole/cohort target word in this exact epoch.
         uint32_t epoch = 0;
         uint32_t expert_count = 0;
         /// Number of experts resident on more than one participant.
@@ -645,8 +648,8 @@ namespace llaminar2
          *
          * Omission preserves non-overlay callers by deriving each value from
          * the descriptor's domain-local owner. ExpertOverlay construction must
-         * provide the global owner-map values explicitly whenever participant
-         * numbering differs across domains.
+         * provide explicit typed whole/cohort targets from the same global owner map;
+         * a CPU cohort never becomes a domain-local scalar compute owner.
          */
         std::vector<int32_t> overlay_route_participant;
         /**

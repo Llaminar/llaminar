@@ -22662,11 +22662,11 @@ if(HAVE_CUDA AND HAVE_ROCM)
                     --gtest_brief=1
             LABELS "V2;Integration;ProductionTestPreflight;${vendor};MoE;MappedHost;GraphCapture;LivePayload;Lifecycle;Regression"
             MPI_PROCS 1 NO_MODELS TIMEOUT 30)
-        add_v2_test(V2_Integration_StaticJointDispatchFanout_${vendor}
+        add_v2_test(V2_Integration_LiveJointDispatchReplay_${vendor}
             COMMAND $<TARGET_FILE:v2_integration_mapped_activation_packet_cuda_rocm>
-                    --gtest_filter=Test__MappedActivationPacketCUDAAndROCm.${vendor}StaticJointDispatchReachesEveryOriginalCPU2CPU4CPU8Member
+                    --gtest_filter=Test__MappedActivationPacketCUDAAndROCm.${vendor}LiveJointDispatchReplaysEveryOriginalCPU2CPU4CPU8Member
                     --gtest_brief=1
-            LABELS "V2;Integration;ProductionTestPreflight;${vendor};MoE;MappedHost;GraphCapture;StaticJointOwnership;LivePayload;Regression"
+            LABELS "V2;Integration;ProductionTestPreflight;${vendor};MoE;MappedHost;GraphCapture;LiveJointTarget;LivePayload;Replay;Regression"
             MPI_PROCS 1
             TIMEOUT 30
             NO_MODELS

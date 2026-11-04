@@ -2,7 +2,7 @@
  * @file Test__MoEOverlaySharedDispatchSelection.cpp
  * @brief Replay production row selection/copy without GPU or CPU-serving readiness.
  *
- * Immutable original membership and actual mutable router prefixes drive the
+ * Fixed original target geometry and actual live bank/router prefixes drive the
  * same stateless production helpers used by the captured mapped-row writer.
  * Native metadata validation/event/capture tests remain a separate obligation.
  */
@@ -19,7 +19,8 @@ struct SharedRows {
  static constexpr int capacity=65,width=7;
  std::array<float,capacity*width> input{},output{};
  std::array<float,capacity*2> ids{},weights{};
- std::array<std::int32_t,4> routes{99,-1,31,-1};
+ std::array<std::int32_t, 4> routes{99, MoEOverlayRouteTarget::cpuCohort(4).word(), 31,
+                                    MoEOverlayRouteTarget::cpuCohort(4).word()};
  std::vector<MoEOverlaySharedDispatchTarget> targets;
  std::vector<MoEOverlayActivationEpochControl> controls;
  int active=capacity;
@@ -28,7 +29,8 @@ struct SharedRows {
  explicit SharedRows(int degree) {
   const std::array<std::int32_t,2> experts{1,3};
   for(int i=0;i<degree;++i){const int id=7+13*i;
-   targets.push_back({id,MoEOverlayStaticJointRouteMembership::fromProjection(4,id,9,41,experts)});}
+      targets.push_back({id, MoEOverlayJointRouteTarget::fromOriginalCohort(4, id, 9, 4)});
+  }
   targets.push_back({31,{}});
   for(int row=0;row<capacity;++row){ids[2*row]=row%4;ids[2*row+1]=row%4;weights[2*row]=0.75f;weights[2*row+1]=0.25f;}
   for(int i=0;i<capacity*width;++i)input[i]=static_cast<float>(i+1);
@@ -38,9 +40,21 @@ struct SharedRows {
   bind();
  }
  /** @brief Bind immutable recorded original target control rows, without readiness. */
- void bind(){controls.resize(targets.size());for(std::size_t i=0;i<targets.size();++i)controls[i].channel.target_participant_id=targets[i].participant;
-  launch.shared_row_controls=controls.data();launch.shared_row_target_count=controls.size();
-  launch.shared_joint_union=MoEOverlaySharedJointRouteUnion::fromOriginalGroup(4,9,targets);}
+ void bind()
+ {
+     controls.resize(targets.size());
+     for (std::size_t i = 0; i < targets.size(); ++i)
+     {
+         auto &channel = controls[i].channel;
+         channel.target_participant_id = targets[i].participant;
+         channel.cohort_target = targets[i].membership.cohortTarget();
+         channel.return_role = static_cast<std::uint32_t>(
+             targets[i].membership.enabled() ? MoEOverlayActivationReturnRole::JointContributor
+                                             : MoEOverlayActivationReturnRole::Ordinary);
+     }
+     launch.shared_row_controls = controls.data();
+     launch.shared_row_target_count = controls.size();
+ }
  /** @brief Replay exact production row decision and useful element writer. */
  std::uint64_t replay() {
   std::uint64_t bytes=0;
@@ -78,24 +92,74 @@ TEST(MoEOverlaySharedDispatchSelection, SingletonOutsiderAndMalformedMetadataNev
  EXPECT_EQ(selectMoEOverlaySharedRow(f.launch,f.routes.data(),41,2),MoEOverlaySharedRowDecision::Needed);
  EXPECT_EQ(selectMoEOverlaySharedRow(f.launch,f.routes.data(),41,1),MoEOverlaySharedRowDecision::Unneeded);
  EXPECT_EQ(f.replay(),16u*SharedRows::width*sizeof(float));
- const std::array<std::int32_t,2> experts{1,3};
- f.targets={{7,MoEOverlayStaticJointRouteMembership::fromProjection(4,7,9,42,experts)}};
+ f.targets = {{7, MoEOverlayJointRouteTarget::fromOriginalCohort(4, 7, 9, 4)}};
  f.bind();
+ f.controls[0].channel.cohort_target = -1;
  EXPECT_EQ(selectMoEOverlaySharedRow(f.launch,f.routes.data(),41,1),MoEOverlaySharedRowDecision::Invalid);
- f.targets[0]={7,MoEOverlayStaticJointRouteMembership::fromProjection(4,7,9,41,experts)};f.bind();
- f.routes[1]=7;EXPECT_EQ(selectMoEOverlaySharedRow(f.launch,f.routes.data(),41,1),MoEOverlaySharedRowDecision::Invalid);
- f.routes[1]=-1;f.ids[2]=std::numeric_limits<float>::quiet_NaN();
+ f.bind();
+ f.controls[0].channel.return_role = 3u;
+ EXPECT_EQ(selectMoEOverlaySharedRow(f.launch, f.routes.data(), 41, 1),
+           MoEOverlaySharedRowDecision::Invalid);
+ f.bind();
+ f.ids[2] = std::numeric_limits<float>::quiet_NaN();
  EXPECT_EQ(selectMoEOverlaySharedRow(f.launch,f.routes.data(),41,1),MoEOverlaySharedRowDecision::Invalid);
  f.active=66;EXPECT_EQ(selectMoEOverlaySharedRow(f.launch,f.routes.data(),41,0),MoEOverlaySharedRowDecision::Invalid);
 }
+/** @test Changing live membership and zero-weight holes preserve useful unique bytes. */
+TEST(MoEOverlaySharedDispatchSelection, LiveTargetAndZeroWeightReplayNeverCopiesUnusedRows)
+{
+    SharedRows f(2);
+    for (int epoch : {41, 42, 43})
+    {
+        f.routes = {99, 0, 31, 0};
+        f.routes[epoch == 42 ? 0 : 1] = MoEOverlayRouteTarget::cpuCohort(4).word();
+        f.ids.fill(1.f);
+        f.weights.fill(0.f);
+        f.active = 9;
+        f.output.fill(-137.f);
+        EXPECT_EQ(f.replay(), 0u);
+        f.weights[3] = 1.f; // one original slot after a zero route
+        const auto expected = epoch == 42 ? 0u : SharedRows::width * sizeof(float);
+        EXPECT_EQ(f.replay(), expected);
+        for (int row = 0; row < SharedRows::capacity; ++row)
+            for (int col = 0; col < SharedRows::width; ++col)
+                EXPECT_EQ(f.output[row * SharedRows::width + col],
+                          expected && row == 1 ? f.input[row * SharedRows::width + col] : -137.f);
+    }
+}
 
-/** @test Cold group union rejects duplicate, foreign-layer and mixed-epoch inputs. */
-TEST(MoEOverlaySharedDispatchSelection, OriginalGroupUnionRejectsAmbiguousColdProjection) {
- SharedRows f(2);auto members=f.targets;members.push_back(members.front());
- EXPECT_THROW(MoEOverlaySharedJointRouteUnion::fromOriginalGroup(4,9,members),std::invalid_argument);
- const std::array<std::int32_t,1> expert{1};
- members=f.targets;members[0].membership=MoEOverlayStaticJointRouteMembership::fromProjection(4,members[0].participant,10,41,expert);
- EXPECT_THROW(MoEOverlaySharedJointRouteUnion::fromOriginalGroup(4,9,members),std::invalid_argument);
- members=f.targets;members[0].membership=MoEOverlayStaticJointRouteMembership::fromProjection(4,members[0].participant,9,42,expert);
- EXPECT_THROW(MoEOverlaySharedJointRouteUnion::fromOriginalGroup(4,9,members),std::invalid_argument);
+/** @test Original-group validation survives retirement of the frozen expert union. */
+TEST(MoEOverlaySharedDispatchSelection, OriginalGroupRejectsDuplicatesAndForeignGeometry)
+{
+    SharedRows source(2);
+    EXPECT_TRUE(validateMoEOverlaySharedDispatchGroup(4, 9, source.targets));
+    auto duplicate = source.targets;
+    duplicate.push_back(duplicate.front());
+    EXPECT_FALSE(validateMoEOverlaySharedDispatchGroup(4, 9, duplicate));
+    auto foreign = source.targets;
+    foreign[0].membership =
+        MoEOverlayJointRouteTarget::fromOriginalCohort(4, foreign[0].participant, 10, 4);
+    EXPECT_FALSE(validateMoEOverlaySharedDispatchGroup(4, 9, foreign));
+    foreign = source.targets;
+    foreign[0].membership = MoEOverlayJointRouteTarget::fromOriginalCohort(4, 999, 9, 4);
+    EXPECT_FALSE(validateMoEOverlaySharedDispatchGroup(4, 9, foreign));
+    EXPECT_FALSE(validateMoEOverlaySharedDispatchGroup(4, 9, {}));
+}
+
+/** @test Exact signed zero filtering never drops nonzero subnormal coefficients under FTZ. */
+TEST(MoEOverlaySharedDispatchSelection, SignedZerosAndSubnormalWeightsHaveExactLiveSemantics)
+{
+    EXPECT_TRUE(moeOverlayJointRouteWeightIsZero(0.f));
+    EXPECT_TRUE(moeOverlayJointRouteWeightIsZero(-0.f));
+    EXPECT_FALSE(moeOverlayJointRouteWeightIsZero(std::bit_cast<float>(std::uint32_t{1})));
+    EXPECT_FALSE(
+        moeOverlayJointRouteWeightIsZero(std::bit_cast<float>(std::uint32_t{0x80000001u})));
+    SharedRows source(2);
+    source.active = 1;
+    source.ids[0] = source.ids[1] = 1.f;
+    source.weights[0] = -0.f;
+    source.weights[1] = 0.f;
+    EXPECT_EQ(source.replay(), 0u);
+    source.weights[1] = std::bit_cast<float>(std::uint32_t{1});
+    EXPECT_EQ(source.replay(), SharedRows::width * sizeof(float));
 }

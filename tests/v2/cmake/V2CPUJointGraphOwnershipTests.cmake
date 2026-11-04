@@ -4,21 +4,21 @@
 # The existing complete Unit loader target includes these same cases. Explicit
 # production-preflight entries preserve the two defects as focused regressions.
 # Native CPU/NUMA admission and inference remain separate integration obligations.
-add_executable(v2_unit_moe_overlay_static_joint_membership
-    unit/execution/moe/Test__MoEOverlayStaticJointRouteMembership.cpp)
-target_include_directories(v2_unit_moe_overlay_static_joint_membership PRIVATE ${CMAKE_SOURCE_DIR})
-target_compile_features(v2_unit_moe_overlay_static_joint_membership PRIVATE cxx_std_23)
-target_link_libraries(v2_unit_moe_overlay_static_joint_membership PRIVATE GTest::gtest_main)
-add_v2_test(V2_Unit_MoEOverlayStaticJointMembership
-    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_static_joint_membership>
+add_executable(v2_unit_moe_overlay_joint_route_target
+    unit/execution/moe/Test__MoEOverlayJointRouteTarget.cpp)
+target_include_directories(v2_unit_moe_overlay_joint_route_target PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_features(v2_unit_moe_overlay_joint_route_target PRIVATE cxx_std_23)
+target_link_libraries(v2_unit_moe_overlay_joint_route_target PRIVATE GTest::gtest_main)
+add_v2_test(V2_Unit_MoEOverlayJointTargetMembership
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_joint_route_target>
     LABELS "V2;Unit;DeviceFree;MoE;Graph;Contract;Regression"
     NO_MPI NO_MODELS TIMEOUT 30)
-add_v2_test(V2_Integration_MoEOverlayStaticJointMembership
-    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_static_joint_membership>
+add_v2_test(V2_Integration_MoEOverlayJointTargetMembership
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_joint_route_target>
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;Graph;Contract;Regression"
     NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30)
-if(TEST V2_Integration_MoEOverlayStaticJointMembership)
-    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOverlayStaticJointMembership)
+if(TEST V2_Integration_MoEOverlayJointTargetMembership)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOverlayJointTargetMembership)
 endif()
 if(TARGET v2_unit_expert_gemm_registry)
     target_include_directories(v2_unit_expert_gemm_registry PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -70,9 +70,9 @@ endif()
 
 # Source-native fixture metadata must validate before any backend/device setup.
 if(TARGET v2_integration_mapped_activation_packet_cuda_rocm)
-    add_v2_test(V2_Integration_StaticJointSourceFixtureColdPlacement
+    add_v2_test(V2_Integration_JointSourceFixtureColdPlacement
         COMMAND $<TARGET_FILE:v2_integration_mapped_activation_packet_cuda_rocm>
-                --gtest_filter=Test__MappedActivationPacketCUDAAndROCm.StaticJointSourceFixtureHasCompleteOriginalColdPlacement
+                --gtest_filter=Test__MappedActivationPacketCUDAAndROCm.JointSourceFixtureHasCompleteOriginalColdPlacement
                 --gtest_repeat=20 --gtest_brief=1
         LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;SourceOwnership;Contract;Regression"
         MPI_PROCS 1 TIMEOUT 30 NO_MODELS)
@@ -96,3 +96,33 @@ add_v2_test(V2_Integration_MoEGraphComputePolicyContract
 if(TEST V2_Integration_MoEGraphComputePolicyContract)
  list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEGraphComputePolicyContract)
 endif()
+
+# Fixed target identity is semantic channel data, not an unauthenticated reserved word.
+add_v2_test(V2_Integration_LiveCohortChannelIdentityContract
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_activation_epoch_protocol>
+        --gtest_filter=Test__MoEOverlayActivationEpochProtocol.FixedCohortTargetIsAuthenticatedAcrossReplay
+        --gtest_repeat=20 --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;Protocol;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_LiveCohortChannelIdentityContract)
+if(TARGET v2_integration_mapped_activation_packet_cuda_rocm)
+    foreach(vendor IN ITEMS CUDA ROCm)
+        set(_zero_joint_test V2_Integration_JointZeroWeightCompactionReplay_${vendor})
+        add_v2_test(${_zero_joint_test}
+            COMMAND $<TARGET_FILE:v2_integration_mapped_activation_packet_cuda_rocm>
+                --gtest_filter=Test__MappedActivationPacketCUDAAndROCm.${vendor}JointZeroWeightCompactionReplay
+                --gtest_brief=1
+            LABELS "V2;Integration;ProductionTestPreflight;${vendor};MoE;MappedHost;GraphCapture;LivePayload;Replay;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_zero_joint_test})
+    endforeach()
+    unset(_zero_joint_test)
+endif()
+
+add_v2_test(V2_Integration_LiveCohortPlacementBankContract
+    COMMAND $<TARGET_FILE:v2_test_moe_runtime_table>
+        --gtest_filter=Test__MoERuntimeTable.LiveCohortTargetsShareOriginalPlacementBankPublication
+        --gtest_repeat=20 --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;DeviceEpoch;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_LiveCohortPlacementBankContract)

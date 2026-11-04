@@ -57,8 +57,8 @@ namespace llaminar2
             TensorBase *routing_weights = nullptr;
             /** Ticket, banks, and geometry resolved from one runtime table. */
             MoEOverlayRoutePlacementDeviceBinding placement{};
-            /** Original Static CPU cohort membership, empty for whole-owner lanes. */
-            MoEOverlayStaticJointRouteMembership static_joint_membership{};
+            /** Fixed original CPU cohort/member geometry, empty for whole-owner lanes. */
+            MoEOverlayJointRouteTarget joint_route_target{};
             const std::int32_t *active_row_count_device = nullptr;
             std::optional<BufferId> hidden_buffer_id;
             std::optional<BufferId> routing_indices_buffer_id;
@@ -320,8 +320,8 @@ namespace llaminar2
             TensorBase *routing_indices = nullptr;
             TensorBase *routing_weights = nullptr;
             MoEOverlayRoutePlacementDeviceBinding placement{};
-            /** Immutable projections in the transaction's exact canonical lane order. */
-            std::vector<MoEOverlayStaticJointRouteMembership> static_joint_memberships;
+            /** Fixed cohort/member geometry in the transaction's exact canonical lane order. */
+            std::vector<MoEOverlayJointRouteTarget> joint_route_targets;
             const std::int32_t *active_row_count_device = nullptr;
             std::optional<BufferId> hidden_buffer_id;
             std::optional<BufferId> routing_indices_buffer_id;
@@ -385,7 +385,8 @@ namespace llaminar2
 
         /** @brief Materialize original rank-pair target descriptors before capture. */
         bool prepareSharedRowGroups(void* stream);
-        std::vector<MoEOverlaySharedJointRouteUnion> shared_row_groups_;
+        bool shared_row_groups_prepared_ =
+            false; ///< Cold proof for the immutable original lane roster.
 
         Params params_;
         std::unique_ptr<IMoEKernel> moe_kernel_;

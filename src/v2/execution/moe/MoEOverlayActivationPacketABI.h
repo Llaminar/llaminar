@@ -19,8 +19,7 @@
 
 #pragma once
 
-#include "MoEOverlayStaticJointRouteMembership.h"
-#include "MoEOverlaySharedJointRouteUnion.h"
+#include "MoEOverlayJointRouteTarget.h"
 #include "MoEOverlayActivationEpochABI.h"
 #include "MoEOverlayActivationPayloadLayout.h"
 #include "DeviceMoEOverlayEpochABI.h"
@@ -308,7 +307,8 @@ namespace llaminar2
      */
     struct MoEOverlayRoutePlacementBankDeviceView
     {
-        const std::int32_t *route_participants = nullptr; ///< `[expert_count]` global targets.
+        const std::int32_t *route_participants =
+            nullptr;                          ///< `[expert_count]` typed whole/cohort route words.
         const std::uint32_t *epoch = nullptr; ///< Address of the bank's published epoch.
 
         /** @return Whether both immutable captured addresses are present. */
@@ -380,7 +380,8 @@ namespace llaminar2
         const float *route_weights = nullptr; ///< Router-selected weight per slot.
         /** Exact ticket-selected durable placement authority. */
         MoEOverlayRoutePlacementDeviceBinding placement{};
-        MoEOverlayStaticJointRouteMembership static_joint_membership{}; ///< Immutable original target cohort; never a mutable placement shadow.
+        MoEOverlayJointRouteTarget joint_route_target{}; ///< Immutable original target cohort;
+                                                         ///< never a mutable placement shadow.
         const std::int32_t *active_row_count_device = nullptr; ///< Optional live-row scalar.
         MoEOverlayMappedDispatchDeviceView packet{}; ///< Shared output packet.
         MoEOverlayActivationHiddenPayloadLayout hidden_payload_layout =
@@ -395,28 +396,26 @@ namespace llaminar2
         /** Original rank-pair union, present only on its one shared-matrix writer. */
         const MoEOverlayActivationEpochControl* shared_row_controls = nullptr;
         std::uint32_t shared_row_target_count = 0u;
-        MoEOverlaySharedJointRouteUnion shared_joint_union{};
         bool shared_row_writer = false;
 
         /** @return Whether setup supplied a complete immutable launch contract. */
         [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool valid()
             const noexcept
         {
-            return hidden_rows_fp32 && route_expert_ids_fp32 &&
-                   route_weights && placement.valid() &&
+            return hidden_rows_fp32 && route_expert_ids_fp32 && route_weights &&
+                   placement.valid() &&
                    ((shared_row_controls == nullptr) == (shared_row_target_count == 0u)) &&
-                   (!shared_row_writer || hidden_payload_layout==MoEOverlayActivationHiddenPayloadLayout::SharedPhysicalRows) &&
-                   static_joint_membership.validFor(placement.expert_count,target_participant_id,model_layer_index) &&
+                   (!shared_row_writer ||
+                    hidden_payload_layout ==
+                        MoEOverlayActivationHiddenPayloadLayout::SharedPhysicalRows) &&
+                   joint_route_target.validFor(placement.expert_count, target_participant_id,
+                                               model_layer_index) &&
                    packet.valid() &&
-                   isValidMoEOverlayActivationHiddenPayloadLayout(
-                       hidden_payload_layout) &&
-                   control && grant && target_participant_id >= 0 &&
-                   physical_rows > 0 &&
-                   static_cast<std::size_t>(physical_rows) <=
-                       packet.row_capacity &&
-                   packet.entry_capacity >=
-                       static_cast<std::size_t>(physical_rows) *
-                           static_cast<std::size_t>(packet.top_k) &&
+                   isValidMoEOverlayActivationHiddenPayloadLayout(hidden_payload_layout) &&
+                   control && grant && target_participant_id >= 0 && physical_rows > 0 &&
+                   static_cast<std::size_t>(physical_rows) <= packet.row_capacity &&
+                   packet.entry_capacity >= static_cast<std::size_t>(physical_rows) *
+                                                static_cast<std::size_t>(packet.top_k) &&
                    model_layer_index >= 0;
         }
     };

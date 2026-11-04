@@ -1498,6 +1498,49 @@ namespace llaminar2::test
             std::invalid_argument);
     }
 
+    /** @test Existing versioned route words carry cohort targets without claiming local compute. */
+    TEST(Test__MoERuntimeTable, LiveCohortTargetsShareOriginalPlacementBankPublication)
+    {
+        MoERuntimeTable table(DeviceId::cpu(), 1, 4, 2);
+        const auto external = [](MoEPlacementUpdate &update, int expert)
+        {
+            update.experts[expert] = DeviceMoEExpertDescriptor{};
+            update.experts[expert].logical_expert_id = expert;
+            update.local_compute_mask[expert] = 0u;
+            update.replica_role[expert] = static_cast<std::uint8_t>(DeviceMoEReplicaRole::None);
+        };
+        auto first = updateForEpoch(1, 4);
+        first.overlay_route_participant = {17, 23, 17, 41};
+        external(first, 1);
+        first.overlay_route_participant[1] = MoEOverlayRouteTarget::cpuCohort(4).word();
+        ASSERT_TRUE(table.prepareInactiveBank(0, first));
+        ASSERT_TRUE(table.flipActiveBank(0, 1, nullptr));
+        const auto original_bank = table.hostLayerState(0).active_bank;
+        const auto &original = table.hostLayerState(0).banks[original_bank];
+        EXPECT_EQ(original.overlay_route_participant[1],
+                  MoEOverlayRouteTarget::cpuCohort(4).word());
+        EXPECT_EQ(original.experts[1].owner_participant, -1);
+        EXPECT_EQ(original.local_compute_mask[1], 0u);
+        EXPECT_EQ(original.resident_participant_mask[1], 0u);
+        auto second = updateForEpoch(2, 4);
+        second.overlay_route_participant = {17, 23, 17, 41};
+        external(second, 2);
+        second.overlay_route_participant[2] = MoEOverlayRouteTarget::cpuCohort(4).word();
+        ASSERT_TRUE(table.prepareInactiveBank(0, second));
+        ASSERT_TRUE(table.flipActiveBank(0, 2, nullptr));
+        const auto &current = table.hostLayerState(0).banks[1u - original_bank];
+        EXPECT_EQ(current.epoch, 2u);
+        EXPECT_EQ(current.overlay_route_participant[1], 23);
+        EXPECT_EQ(current.overlay_route_participant[2], MoEOverlayRouteTarget::cpuCohort(4).word());
+        EXPECT_EQ(original.epoch, 1u);
+        EXPECT_EQ(original.overlay_route_participant[1],
+                  MoEOverlayRouteTarget::cpuCohort(4).word());
+        auto invalid = updateForEpoch(3, 4);
+        invalid.overlay_route_participant = {17, 23, MoEOverlayRouteTarget::cpuCohort(4).word(),
+                                             41};
+        EXPECT_THROW(table.prepareInactiveBank(0, invalid), std::invalid_argument);
+    }
+
     TEST(Test__MoERuntimeTable, ExplicitResidentParticipantMasksRoundTripAndValidate)
     {
         MoERuntimeTable table(DeviceId::cpu(), 1, 4, 2);

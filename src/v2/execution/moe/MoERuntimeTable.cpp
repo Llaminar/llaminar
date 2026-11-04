@@ -3453,12 +3453,14 @@ namespace llaminar2
                 throw std::invalid_argument(layerPrefix(layer_idx) + "local_compute_mask entries must be 0 or 1");
             if (update.replica_role[expert] > static_cast<uint8_t>(DeviceMoEReplicaRole::PreferredReplica))
                 throw std::invalid_argument(layerPrefix(layer_idx) + "replica_role entries must be valid DeviceMoEReplicaRole values");
-            if (overlayRouteParticipantForUpdate(update, expert) < -1)
-            {
+            const auto route_target =
+                MoEOverlayRouteTarget::fromWord(overlayRouteParticipantForUpdate(update, expert));
+            if (route_target.isCPUCohort() &&
+                (desc.owner_participant >= 0 || update.local_compute_mask[expert] != 0u ||
+                 residentParticipantMaskForUpdate(update, expert) != 0u))
                 throw std::invalid_argument(
                     layerPrefix(layer_idx) +
-                    "overlay_route_participant entries must be -1 or non-negative");
-            }
+                    "CPU cohort target cannot name a GPU-domain compute owner or resident mask");
 
             const uint32_t resident_mask = residentParticipantMaskForUpdate(update, expert);
             if ((resident_mask & ~valid_participant_mask) != 0u)

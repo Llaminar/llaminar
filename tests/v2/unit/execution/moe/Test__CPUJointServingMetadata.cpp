@@ -75,7 +75,11 @@ TEST(CPUJointServingMetadata, OriginalPopulationAndReturnRolesThroughEight) {
             EXPECT_EQ(actual.expertsForParticipant(7,member),(std::vector<int>{0,1,2,3}));
             EXPECT_EQ(actual.fragmentCountForExpert(7,member%4),size_t(population));
             const auto role=originalCPUExpertShardReturnRole(&actual,{.world_rank=member,.participant_id=member},layers);
-            EXPECT_EQ(role,member==0?MoEOverlayActivationReturnRole::StaticJointRoot:MoEOverlayActivationReturnRole::StaticJointContributor);
+            EXPECT_EQ(role, member == 0 ? MoEOverlayActivationReturnRole::JointRoot
+                                        : MoEOverlayActivationReturnRole::JointContributor);
+            EXPECT_EQ(originalCPUExpertShardCohortTarget(
+                          &actual, {.world_rank = member, .participant_id = member}, layers),
+                      MoEOverlayRouteTarget::cpuCohort(first->tier_idx).word());
             EXPECT_TRUE(moeOverlayActivationReturnCountsMatch(uint32_t(role),member==0?3:0,member==0?7:0,3,7));
             EXPECT_FALSE(moeOverlayActivationReturnCountsMatch(uint32_t(role),member==0?0:3,member==0?0:7,3,7));
         }
@@ -96,7 +100,7 @@ namespace {
 class RootExtentRecorder final : public llaminar2::test::ScriptedGlobalTPContext {
 public:
     /** @brief Bind the original participant population and one source ordinal. */
-    RootExtentRecorder(int population,int member,bool complete_empty=false):population_(population),member_(member),ranks_(population),complete_empty_(complete_empty) {
+    RootExtentRecorder(int population,int member):population_(population),member_(member),ranks_(population) {
         std::iota(ranks_.begin(),ranks_.end(),0);
     }
     /** @brief Return the original collective population. */
@@ -113,11 +117,11 @@ public:
     bool gatherVariableFloatRecordsToRoot(const float*,size_t count,float*,size_t capacity,
         size_t width,int root,size_t& gathered,const std::string&,std::span<RootedFloatRecordRange>) override {
         ++calls;observed_count=count;observed_capacity=capacity;observed_width=width;observed_root=root;
-        gathered=0;return complete_empty_; // Scripted empty-record progress is not native/ticket readiness.
+        gathered=0;return false; // Record extent only; never fabricate collective readiness.
     }
     int calls=0,observed_root=-1;size_t observed_count=0,observed_capacity=0,observed_width=0;
 private:
-    int population_,member_;std::vector<int> ranks_;bool complete_empty_;
+    int population_,member_;std::vector<int> ranks_;
 };
 }
 /** @test Asymmetric root/contributor storage cannot alter the original collective extent or live sends. */
@@ -160,8 +164,15 @@ TEST(CPUJointServingMetadata, ActualStageSharesRootExtentAcrossAsymmetricPartici
     }
 }
 
-/** @test Phase comes from the original sparse transaction, even for empty padded decode or one-row prefill. */
-TEST(CPUJointServingMetadata, ActualStagePublishesOriginalSparsePhase) {
+/**
+ * @test Passive phase metadata cannot authorize sparse execution without the original prepared bank.
+ *
+ * These CPU endpoint declarations do not retain real prepared engines or native
+ * collective readiness. Even empty decode/prefill/verifier packets must fail
+ * before transport or publication. Successful phase publication belongs to the
+ * source-bound native rooted service integration, not this metadata fixture.
+ */
+TEST(CPUJointServingMetadata, ActualStageRejectsSparsePhaseWithoutOriginalPreparedBank) {
     struct ObservationScope {
         std::optional<std::string> summary,filter;
         /** @brief Retain caller configuration and enable isolated passive counter observations. */
@@ -189,7 +200,7 @@ TEST(CPUJointServingMetadata, ActualStagePublishesOriginalSparsePhase) {
     for(const auto [capacity,phase]:std::array<std::pair<int,ExpertHistogramSource>,4>{{
         {64,ExpertHistogramSource::DecodeToken},{1,ExpertHistogramSource::PrefillChunk},
         {64,ExpertHistogramSource::GroupedVerifier},{9,ExpertHistogramSource::GroupedVerifier}}}) {
-        RootExtentRecorder tp(2,1,true);
+        RootExtentRecorder tp(2,1);
         FP32Tensor packed({size_t(capacity*(H+1)+1)});
         ASSERT_TRUE(canonical_moe_route_record::writeRecordCount(packed.mutable_data(),packed.numel(),0));
         std::vector<int32_t> slots(capacity),experts(capacity);std::vector<float> weights(capacity);
@@ -200,6 +211,7 @@ TEST(CPUJointServingMetadata, ActualStagePublishesOriginalSparsePhase) {
         sparse.entry_capacity=capacity;sparse.original_route_slots_host=slots.data();
         sparse.expert_ids_host=experts.data();sparse.route_weights_host=weights.data();
         MoEOverlayReturnRows output;
+        output.live_row_count=17; // An invalid source cannot overwrite an earlier result.
         MoECPUExpertShardRouteStage::Params params;
         params.original_source=selected;params.tp=&tp;params.packed_records=&packed;
         params.rows=capacity;params.top_k=K;params.columns=H;params.root_participant=0;
@@ -209,19 +221,14 @@ TEST(CPUJointServingMetadata, ActualStagePublishesOriginalSparsePhase) {
         EXPECT_THROW(MoECPUExpertShardRouteStage{params},std::invalid_argument);
         params.standalone_execution_phase.reset();
         MoECPUExpertShardRouteStage stage(params);
-        ASSERT_TRUE(stage.execute(context.get()));EXPECT_EQ(tp.calls,1);
-        const char *expected=phase==ExpertHistogramSource::DecodeToken?"decode":
-            phase==ExpertHistogramSource::PrefillChunk?"prefill":"grouped_verifier";
+        EXPECT_FALSE(stage.execute(context.get()));
+        EXPECT_EQ(tp.calls,0);
+        EXPECT_EQ(output.live_row_count,17u);
         const auto records=PerfStatsCollector::snapshot({"moe_canonical_publication"});
-        int matches=0;
-        for(const auto &record:records)if(record.tags.contains("stage") && record.tags.at("stage")==params.stage_name) {
-            EXPECT_EQ(record.phase,expected);
-            if(record.name=="cpu_packed_route_gather_calls"){++matches;EXPECT_EQ(record.value,1.0);}
-            if(record.name=="cpu_packed_route_gather_local_bytes")EXPECT_EQ(record.value,0.0);
-        }
-        EXPECT_EQ(matches,1);
+        for(const auto &record:records)
+            EXPECT_FALSE(record.tags.contains("stage") && record.tags.at("stage")==params.stage_name);
         for(const auto invalid:{ExpertHistogramSource::SyntheticTest,static_cast<ExpertHistogramSource>(99)}) {
-            RootExtentRecorder rejected_tp(2,1,true);params.tp=&rejected_tp;
+            RootExtentRecorder rejected_tp(2,1);params.tp=&rejected_tp;
             sparse.key.histogram_source=invalid;
             MoECPUExpertShardRouteStage rejected(params);
             EXPECT_FALSE(rejected.execute(context.get()));EXPECT_EQ(rejected_tp.calls,0);

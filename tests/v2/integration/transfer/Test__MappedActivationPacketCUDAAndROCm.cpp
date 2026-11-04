@@ -17,6 +17,9 @@
  * strides in both backend directions. Early replay also leaves the old admission and return timelines
  * live while the new source graph is queued: both fused and forked paths must
  * wait for the next generation, and explicit abort must drain that wait.
+ * Portable shared-union controls use ordinary rank-pair consumers. Original
+ * CPU cohort declarations retain distinct rank/NUMA members; packet metadata
+ * coverage never advertises several CPU sockets executing in one MPI rank.
  * Paired mock ranks deliver real startup declaration/ACK packets through an
  * explicit replay link; production file authentication and exact live extents
  * remain authoritative before either native backend registers its mapping.
@@ -49,6 +52,7 @@
 #include "utils/PerfStatsCollector.h"
 
 #include <algorithm>
+#include <bit>
 #include <array>
 #include <bit>
 #include <atomic>
@@ -386,7 +390,9 @@ namespace
      * keeps failed assertions from leaving a GPU wait referencing unmapped RAM.
      */
     /** @return Cold original source cohort, including mixed ordinary GPU experts. */
-    std::shared_ptr<const MoEExpertOwnerMap> jointPacketOwners(int degree, DeviceId device)
+    std::shared_ptr<const MoEExpertOwnerMap>
+    jointPacketOwners(int degree, DeviceId device,
+                      const MoEExpertOwnerMap *original = nullptr, bool swapped = false)
     {
         MoERoutedExpertPlacementPlan p; p.enabled=true; p.first_model_layer=kLayers.front();
         p.topology=RoutedExpertPlacementTopology::TieredOverlay;
@@ -400,7 +406,11 @@ namespace
         cpu.routed_compute_policy=RoutedExpertComputePolicy::TensorSharded;
         cpu.routed_phase_policy=RoutedExpertPhasePolicy::Uniform;
         cpu.routed_decode_assignment_policy=cpu.routed_prefill_assignment_policy=RoutedExpertAssignmentPolicy::StaticOwner;
-        for(int member=0;member<degree;++member){cpu.participants.push_back(GlobalDeviceAddress::cpu(member));cpu.world_ranks.push_back(member+1);}
+        for (int member = 0; member < degree; ++member)
+        {
+            cpu.participants.push_back(GlobalDeviceAddress::cpu(member));
+            cpu.world_ranks.push_back(member + 1);
+        }
         RoutedExpertDomain outsider=cpu;outsider.name="outside";outsider.routed_compute_policy=RoutedExpertComputePolicy::Apportioned;
         outsider.participants={GlobalDeviceAddress::cpu(degree)};outsider.world_ranks={degree+1};
         p.domains={gpu,cpu,outsider};
@@ -410,12 +420,24 @@ namespace
         std::vector<MoEOverlayLayerWeightManifest> sources;
         const auto fp=ExpertWeightFormat::floating(TensorType::FP32);
         for(const int layer:kLayers){
-            std::vector<int> tiers(kExpertCount,0);for(int e:{10,14,15,17})tiers[e]=1;
+            std::vector<int> tiers(kExpertCount, 0);
+            if (swapped)
+            {
+                for (int e : {11, 12, 13, 16})
+                    tiers[e] = 1;
+            }
+            else
+            {
+                for (int e : {10, 14, 15, 17})
+                    tiers[e] = 1;
+            }
             p.placements.push_back({.layer=layer,.routed_expert_tier=tiers});
             sources.push_back({.layer_idx=layer,.projections={{{ExpertTierWeightProjection::Gate,64,8,fp},
                 {ExpertTierWeightProjection::Up,64,8,fp},{ExpertTierWeightProjection::Down,8,64,fp}}}});
         }
-        return std::make_shared<const MoEExpertOwnerMap>(MoEExpertOwnerMap::buildShardPlacement(p,sources));
+        return std::make_shared<const MoEExpertOwnerMap>(
+            original ? MoEExpertOwnerMap::buildShardTransition(p, *original, *original)
+                     : MoEExpertOwnerMap::buildShardPlacement(p, sources));
     }
 
     template <std::int32_t Rows, std::int32_t Width = kDModel,
@@ -604,6 +626,13 @@ namespace
                 target_backend_, sizeof(DeviceMoEOverlayEpochTicket));
             target_placement_status_ = allocate(
                 target_backend_, sizeof(DeviceMoEOverlayEpochStatus));
+            if (joint_owners_)
+            {
+                source_epoch_control_ = static_cast<DeviceMoEOverlayEpochControl *>(
+                    allocate(source_backend_, sizeof(DeviceMoEOverlayEpochControl)));
+                source_candidate_epoch_ =
+                    static_cast<std::uint64_t *>(allocate(source_backend_, sizeof(std::uint64_t)));
+            }
             source_active_rows_ = allocate(source_backend_, sizeof(std::int32_t));
             target_active_rows_ = allocate(target_backend_, sizeof(std::int32_t));
             if (!allAllocationsValid())
@@ -797,7 +826,10 @@ namespace
                     MoEOverlayActivationDispatchPackBatchStage::Params
                         dispatch_params;
                     dispatch_params.device_id = source_device_;
-                    if (joint_owners_) dispatch_params.static_joint_memberships = {jointMembership(layer)};
+                    if (joint_owners_)
+                        for (const auto &lane : dispatchSourceLanes())
+                            dispatch_params.joint_route_targets.push_back(
+                                jointMembership(layer, lane.target_participant_id));
                     dispatch_params.transaction = lane_transaction;
                     dispatch_params.hidden = source_hidden_tensor_.get();
                     dispatch_params.routing_indices =
@@ -824,7 +856,8 @@ namespace
                     MoEOverlayActivationDispatchPackStage::Params
                         dispatch_params;
                     dispatch_params.device_id = source_device_;
-                    if (joint_owners_) dispatch_params.static_joint_membership = jointMembership(layer);
+                    if (joint_owners_)
+                        dispatch_params.joint_route_target = jointMembership(layer);
                     dispatch_params.lane = source_lane_;
                     dispatch_params.hidden = source_hidden_tensor_.get();
                     dispatch_params.routing_indices =
@@ -2170,13 +2203,27 @@ namespace
         const std::string &error() const noexcept { return error_; }
 
         /** @brief Capture and inspect dispatch only; original CPU return remains unexecuted. */
-        bool replayJointDispatch()
+        bool replayJointDispatch(int live = -1, bool swapped = false, int zero_pattern = 0,
+                                 std::uint64_t epoch = kPlacementEpoch)
         {
-            if (!joint_owners_ || !arm(1u)) return false;
-            auto* shared_matrix=static_cast<float*>(source_lane_.mapped_region->mutableHostData(
-                source_lane_.shared_dispatch_hidden_offset));
+            if (!joint_owners_ || !acquireCapturedJointSource())
+                return false;
+            if (live >= 0)
+                live_rows_ = live;
+            live_joint_swapped_ = swapped;
+            if (!prepareRecordedJointPlacement(swapped))
+                return false;
+            joint_zero_pattern_ = zero_pattern;
+            live_placement_epoch_ = epoch;
+            if (!publishRecordedJointEpoch() || !arm(++dispatch_replay_generation_))
+                return false;
+            const auto payload = source_lane_.dispatchPayload(kRows);
+            if (!payload.valid())
+                return false;
+            auto *payload_matrix = static_cast<float *>(
+                source_lane_.mapped_region->mutableHostData(payload.hidden_payload_offset));
             constexpr float untouched=-137.0f;
-            std::fill_n(shared_matrix,kRows*kDModel,untouched);
+            std::fill_n(payload_matrix, kRows * kDModel, untouched);
             auto* worker=&GPUDeviceContextPool::instance().getContext(source_device_);
             if (!launchEndpoint(*source_executor_,*source_graph_,source_execution_context_.get(),
                                 source_cache_,source_stream_,worker) ||
@@ -2188,23 +2235,33 @@ namespace
             std::uint64_t rows=0, entries=0;
             for(int row=0;row<live_rows_;++row) {
                 bool seen=false;
-                for(int slot=0;slot<kTopK;++slot) if(jointMembership(kLayers.front()).enabled() && routeParticipant(row*kTopK+slot)==kTargetParticipant){++entries;seen=true;}
+                for (int slot = 0; slot < kTopK; ++slot)
+                    if (selectedJointRoute(row * kTopK + slot))
+                    {
+                        ++entries;
+                        seen = true;
+                    }
                 rows+=seen;
             }
-            bool correct=d.live_rows==rows && d.live_entries==entries &&
-                d.payload_bytes==moeOverlayDispatchPayloadBytes(rows,entries,kDModel) &&
-                d.placement_epoch==kPlacementEpoch && d.model_layer_index==kLayers.front();
+            bool correct =
+                d.live_rows == rows && d.live_entries == entries &&
+                d.payload_bytes == moeOverlayDispatchPayloadBytes(rows, entries, kDModel) &&
+                d.placement_epoch == live_placement_epoch_ &&
+                d.model_layer_index == kLayers.front();
             const auto view=source_transport_->sharedDispatchRows(target_participant_);
             std::size_t compact=0,entry=0;
             for(int row=0;row<live_rows_;++row) {
                 bool seen=false;
                 for(int slot=0;slot<kTopK;++slot) {
                     const auto original=static_cast<std::size_t>(row*kTopK+slot);
-                    if(!jointMembership(kLayers.front()).enabled() || routeParticipant(original)!=kTargetParticipant)continue;
+                    if (!selectedJointRoute(original))
+                        continue;
                     if(!seen)correct=correct && view.row_ids_host[compact]==row && view.entry_offsets_host[compact]==static_cast<int>(entry);
-                    correct=correct && view.expert_ids_host[entry]==static_cast<int>(10+original%8) &&
-                        view.original_route_slots_host[entry]==static_cast<int>(original) &&
-                        view.route_weights_host[entry]==kRouteWeightPattern[original%8];
+                    correct = correct &&
+                              view.expert_ids_host[entry] == static_cast<int>(10 + original % 8) &&
+                              view.original_route_slots_host[entry] == static_cast<int>(original) &&
+                              std::bit_cast<std::uint32_t>(view.route_weights_host[entry]) ==
+                                  std::bit_cast<std::uint32_t>(jointRouteWeight(original));
                     ++entry;seen=true;
                 }
                 compact+=seen;
@@ -2212,20 +2269,40 @@ namespace
             correct=correct && view.entry_offsets_host[compact]==static_cast<int>(entry);
             MoEOverlayActivationDeviceEpochGrant observed{};
             if(!source_backend_->deviceToHost(&observed,source_lane_.grant_device,sizeof(observed),0,source_stream_))return false;
-            correct=correct && observed.published_shared_hidden_bytes==rows*kDModel*sizeof(float);
+            correct =
+                correct &&
+                observed.published_shared_hidden_bytes ==
+                    (payload.selection.usesSharedPhysicalRows() ? rows * kDModel * sizeof(float)
+                                                                : 0u) &&
+                observed.published_payload_bytes == d.payload_bytes &&
+                observed.state ==
+                    static_cast<std::uint32_t>(MoEOverlayActivationEndpointState::Active) &&
+                observed.code ==
+                    static_cast<std::uint32_t>(MoEOverlayActivationStatusCode::Success) &&
+                observed.generation == dispatch_replay_generation_ &&
+                observed.placement_epoch == live_placement_epoch_ &&
+                observed.last_published_stage == 0 && observed.published_stage_count == 1u;
             for(int row=0;row<kRows;++row) {
                 bool needed=false;
-                if(row<live_rows_ && jointMembership(kLayers.front()).enabled())
-                    for(int slot=0;slot<kTopK;++slot)needed=needed || routeParticipant(row*kTopK+slot)==kTargetParticipant;
+                if (row < live_rows_)
+                    for (int slot = 0; slot < kTopK; ++slot)
+                        needed = needed || selectedJointRoute(row * kTopK + slot);
                 for(int col=0;col<kDModel;++col)
-                    correct=correct && shared_matrix[row*kDModel+col]==(needed?sourceValue(row,col):untouched);
+                    correct = correct && payload_matrix[row * kDModel + col] ==
+                                             (needed ? sourceValue(row, col) : untouched);
             }
             std::vector<GPUGraphKernelNodeInfo> kernels;std::string inspection_error;
             const auto* capture=captureFrom(source_cache_);
             if(!capture || !capture->inspectKernelNodes(kernels,&inspection_error))return false;
             const auto writers=std::count_if(kernels.begin(),kernels.end(),[](const auto& node){
                 return node.name.find("packSharedDispatchUnionKernel")!=std::string::npos;});
-            correct=correct && writers==1;
+            const auto compact_writers = std::count_if(
+                kernels.begin(), kernels.end(), [](const auto &node)
+                { return node.name.find("packSingleRowDispatchKernel") != std::string::npos; });
+            correct = correct && writers == (payload.selection.usesSharedPhysicalRows() ? 1 : 0) &&
+                      (payload.selection.usesSharedPhysicalRows() || compact_writers == 1) &&
+                      capture == recorded_source_capture_;
+            correct = releaseRecordedJointEpoch() && correct;
             // No CPU return witness is manufactured: cancel this original dispatch-only invocation.
             const bool cancelled=protocol_->cancelOriginalInvocation(*identity_,MoEOverlayActivationStatusCode::ExplicitAbort,&error_);
             return correct && cancelled;
@@ -2236,8 +2313,25 @@ namespace
          * Every lane is armed from its own original channel/ticket. The source
          * terminal proves row stores; cancellation closes the unfinished CPU work.
          */
-        bool replaySharedUnionGroup()
+        bool replaySharedUnionGroup(int live = -1, bool swapped = false, int zero_pattern = 0,
+                                    std::uint64_t epoch = kPlacementEpoch)
         {
+            if (joint_owners_)
+            {
+                if (!acquireCapturedJointSource())
+                    return false;
+                if (live >= 0)
+                    live_rows_ = live;
+                live_joint_swapped_ = swapped;
+                joint_zero_pattern_ = zero_pattern;
+                if (!prepareRecordedJointPlacement(swapped))
+                    return false;
+                live_placement_epoch_ = epoch;
+                if (!publishRecordedJointEpoch())
+                    return false;
+                ++dispatch_replay_generation_;
+            }
+
             if(dispatch_targets_.size()!=2u)return false;
             struct Armed {std::unique_ptr<MoEOverlayActivationEpochProtocol> protocol;MoEOverlayActivationEpochIdentity identity;bool cancelled=false;};
             std::vector<Armed> armed;
@@ -2246,7 +2340,9 @@ namespace
                 ~CancelAll(){for(auto& h:handles)if(!h.cancelled){std::string error;(void)h.protocol->cancelOriginalInvocation(h.identity,MoEOverlayActivationStatusCode::ExplicitAbort,&error);}}
             } cancellation{armed};
             for(const int target:dispatch_targets_) {
-                if(!initializeProtocol(target) || !arm(1u))return false;
+                if (!initializeProtocol(target) ||
+                    !arm(joint_owners_ ? dispatch_replay_generation_ : 1u))
+                    return false;
                 armed.push_back({std::move(protocol_),*identity_});
             }
             auto* matrix=static_cast<float*>(source_lane_.mapped_region->mutableHostData(source_lane_.shared_dispatch_hidden_offset));
@@ -2262,7 +2358,10 @@ namespace
                 ok=condition && ok;
             };
             std::uint64_t union_rows=0;
-            for(int row=0;row<live_rows_;++row)union_rows+=row%4!=1;
+            for (int row = 0; row < live_rows_; ++row)
+                union_rows += joint_owners_ ? (selectedJointRoute(row * kTopK) ||
+                                               selectedJointRoute(row * kTopK + 1))
+                                            : row % 4 != 1;
             std::uint64_t physical_bytes=0;
             for(const int target:dispatch_targets_) {
                 const auto lane=source_transport_->activationDeviceLane(target,0u,source_device_);
@@ -2273,18 +2372,36 @@ namespace
                 std::uint64_t rows=0,entries=0;
                 constexpr std::array<int,8> routes{7,19,2,2,7,7,19,2};
                 for(int row=0;row<live_rows_;++row){bool seen=false;for(int slot=0;slot<kTopK;++slot)
-                    if(routes[(row*kTopK+slot)%8]==target){++entries;seen=true;}rows+=seen;}
-                require(observed.state==static_cast<std::uint32_t>(MoEOverlayActivationEndpointState::Active) &&
-                    observed.code==static_cast<std::uint32_t>(MoEOverlayActivationStatusCode::Success) &&
-                    observed.generation==1u && observed.last_published_stage==0 && observed.published_stage_count==1u &&
-                    descriptor.digest==observed.digest && descriptor.stage_ordinal==0u &&
-                    descriptor.model_layer_index==kLayers.front() && descriptor.placement_epoch==kPlacementEpoch &&
-                    descriptor.live_rows==rows && descriptor.live_entries==entries &&
-                    descriptor.payload_bytes==moeOverlayDispatchPayloadBytes(rows,entries,kDModel),
-                    "Original shared lane descriptor/state mismatch target="+std::to_string(target));
+                        if (joint_owners_ ? selectedJointRoute(row * kTopK + slot)
+                                          : routes[(row * kTopK + slot) % 8] == target)
+                        {
+                            ++entries;
+                            seen = true;
+                        }
+                    rows += seen;
+                }
+                require(
+                    observed.state ==
+                            static_cast<std::uint32_t>(MoEOverlayActivationEndpointState::Active) &&
+                        observed.code ==
+                            static_cast<std::uint32_t>(MoEOverlayActivationStatusCode::Success) &&
+                        observed.generation == (joint_owners_ ? dispatch_replay_generation_ : 1u) &&
+                        observed.last_published_stage == 0 &&
+                        observed.published_stage_count == 1u &&
+                        descriptor.digest == observed.digest && descriptor.stage_ordinal == 0u &&
+                        descriptor.model_layer_index == kLayers.front() &&
+                        descriptor.placement_epoch == live_placement_epoch_ &&
+                        descriptor.live_rows == rows && descriptor.live_entries == entries &&
+                        descriptor.payload_bytes ==
+                            moeOverlayDispatchPayloadBytes(rows, entries, kDModel),
+                    "Original shared lane descriptor/state mismatch target=" +
+                        std::to_string(target));
             }
             for(int row=0;row<kRows;++row) {
-                const bool needed=row<live_rows_ && row%4!=1;
+                const bool needed =
+                    row < live_rows_ && (joint_owners_ ? (selectedJointRoute(row * kTopK) ||
+                                                          selectedJointRoute(row * kTopK + 1))
+                                                       : row % 4 != 1);
                 for(int col=0;col<kDModel;++col)require(matrix[row*kDModel+col]==(needed?sourceValue(row,col):sentinel),
                     "Shared matrix useful/untouched mismatch at row="+std::to_string(row)+" col="+std::to_string(col));
             }
@@ -2293,6 +2410,12 @@ namespace
             const auto* capture=captureFrom(source_cache_);
             require(capture && capture->inspectKernelNodes(kernels,&inspection),"Shared group kernel inspection failed: "+inspection);
             require(std::count_if(kernels.begin(),kernels.end(),[](const auto& n){return n.name.find("packSharedDispatchUnionKernel")!=std::string::npos;})==1,"Shared group must have exactly one captured payload writer");
+            if (joint_owners_)
+            {
+                require(capture == recorded_source_capture_,
+                        "Original setup capture identity changed");
+                require(releaseRecordedJointEpoch(), "Original acquired epoch did not release");
+            }
             for(auto& handle:armed) {
                 std::string error;
                 const bool cancelled=handle.protocol->cancelOriginalInvocation(handle.identity,MoEOverlayActivationStatusCode::ExplicitAbort,&error);
@@ -2312,41 +2435,207 @@ namespace
         std::vector<int> dispatch_targets_;
 
         /** @return Cold original source-map projection, never CPU readiness. */
-        MoEOverlayStaticJointRouteMembership jointMembership(int layer) const {
-            std::vector<std::int32_t> experts;
-            for (int e=0;e<static_cast<int>(kExpertCount);++e) {
-                const auto* row=joint_owners_->placementFor(layer,e);
-                if(row && row->shard_cohort) for(const auto& p:row->shard_cohort->participants())
-                    if(p.participant_id==target_participant_) experts.push_back(e);
+        MoEOverlayJointRouteTarget jointMembership(int layer, int target = -1) const
+        {
+            if (target < 0)
+                target = target_participant_;
+            for (const auto &row : joint_owners_->owners())
+            {
+                if (row.layer_idx != layer || !row.shard_cohort)
+                    continue;
+                for (const auto &member : row.shard_cohort->participants())
+                    if (member.participant_id == target)
+                        return MoEOverlayJointRouteTarget::fromOriginalCohort(kExpertCount, target,
+                                                                              layer, row.tier_idx);
             }
-            if(experts.empty())return {};
-            return MoEOverlayStaticJointRouteMembership::fromProjection(kExpertCount,target_participant_,layer,kPlacementEpoch,experts);
+            return {};
         }
+        /**
+         * @brief Acquire the original epoch for the already materialized packet graph.
+         * @return True after actual acquisition with the original executable still unlaunched.
+         */
+        bool acquireCapturedJointSource()
+        {
+            // initialize() already materialized this exact source graph. The
+            // transaction must reuse it, never ask setup to capture it again.
+            if (recorded_source_capture_ || !source_cache_.initialized ||
+                source_cache_.executable_submission_state !=
+                    DeviceGraphExecutor::GraphSegmentCache::ExecutableSubmissionState::
+                        MaterializedUnlaunched ||
+                !source_cache_.retained_full_graph_replay.valid() ||
+                !captureFrom(source_cache_))
+            {
+                error_ = "Joint trace requires its original unlaunched captured source";
+                return false;
+            }
+            source_epoch_kernel_ = kernelFor(source_device_);
+            DeviceMoEOverlayEpochControl original{};
+            original.bank_epochs[1] = kPlacementEpoch;
+            original.bank_states[1] =
+                static_cast<std::uint32_t>(DeviceMoEOverlayEpochBankState::Published);
+            original.published_selector = deviceMoEOverlayEpochSelector(3u, 1u);
+            if (!source_epoch_kernel_ ||
+                !source_backend_->hostToDevice(source_epoch_control_, &original, sizeof(original),
+                                               0, source_stream_) ||
+                !source_epoch_kernel_->acquireMoEOverlayEpoch(
+                    {.stream = source_stream_}, source_epoch_control_,
+                    static_cast<DeviceMoEOverlayEpochTicket *>(source_placement_ticket_),
+                    static_cast<DeviceMoEOverlayEpochStatus *>(source_placement_status_)))
+                return false;
+            if (!observeRecordedEpoch(DeviceMoEOverlayEpochOperation::Acquire, kPlacementEpoch, 1u))
+                return false;
+            recorded_source_capture_ = captureFrom(source_cache_);
+            return recorded_source_capture_ != nullptr;
+        }
+        /**
+         * @brief Publish only the reserved peer bank through the original native epoch operations.
+         * @return True after actual acquire; this fixture grants no host/CPU model readiness.
+         */
+        bool publishRecordedJointEpoch()
+        {
+            if (live_placement_epoch_ == kPlacementEpoch)
+                return true;
+            const MoEKernelLaunchContext launch{.stream = source_stream_};
+            auto *ticket = static_cast<DeviceMoEOverlayEpochTicket *>(source_placement_ticket_);
+            auto *status = static_cast<DeviceMoEOverlayEpochStatus *>(source_placement_status_);
+            if (!source_epoch_kernel_->releaseMoEOverlayEpoch(launch, source_epoch_control_, ticket,
+                                                              status) ||
+                !source_backend_->hostToDevice(source_candidate_epoch_, &live_placement_epoch_,
+                                               sizeof(live_placement_epoch_), 0, source_stream_) ||
+                !source_epoch_kernel_->reserveMoEOverlayEpochCandidate(
+                    launch, source_epoch_control_, source_candidate_epoch_, status) ||
+                !observeRecordedEpoch(DeviceMoEOverlayEpochOperation::ReserveCandidate,
+                                      live_placement_epoch_, 0u) ||
+                !initializeSourcePayload(true) ||
+                !source_epoch_kernel_->markMoEOverlayEpochCandidateReady(
+                    launch, source_epoch_control_, source_candidate_epoch_, status) ||
+                !source_epoch_kernel_->publishMoEOverlayEpochCandidate(
+                    launch, source_epoch_control_, source_candidate_epoch_, status) ||
+                !source_epoch_kernel_->acquireMoEOverlayEpoch(launch, source_epoch_control_, ticket,
+                                                              status))
+                return false;
+            return observeRecordedEpoch(DeviceMoEOverlayEpochOperation::Acquire,
+                                        live_placement_epoch_, 0u);
+        }
+        /**
+         * @brief Observe setup-only native status before permitting the next typed operation.
+         * @param operation Original producer that must have completed successfully.
+         * @param epoch Exact recorded epoch, not a host substitute for an acquired ticket.
+         * @param bank Original physical bank selected by that operation.
+         * @return True after its terminal event and exact semantic status match.
+         */
+        bool observeRecordedEpoch(DeviceMoEOverlayEpochOperation operation, std::uint64_t epoch,
+                                  std::uint32_t bank)
+        {
+            if (!source_backend_->recordEvent(source_terminal_, 0, source_stream_) ||
+                !awaitEvent(source_backend_, source_terminal_, std::chrono::seconds(10)))
+                return false;
+            DeviceMoEOverlayEpochStatus observed{};
+            return source_backend_->deviceToHost(&observed, source_placement_status_,
+                                                 sizeof(observed), 0, source_stream_) &&
+                   observed.code ==
+                       static_cast<std::uint32_t>(DeviceMoEOverlayEpochStatusCode::Success) &&
+                   observed.operation == static_cast<std::uint32_t>(operation) &&
+                   observed.epoch == epoch && observed.bank == bank;
+        }
+        /** @return Whether actual native reader release reaches the original terminal event. */
+        bool releaseRecordedJointEpoch()
+        {
+            if (!source_epoch_kernel_->releaseMoEOverlayEpoch(
+                    {.stream = source_stream_}, source_epoch_control_,
+                    static_cast<DeviceMoEOverlayEpochTicket *>(source_placement_ticket_),
+                    static_cast<DeviceMoEOverlayEpochStatus *>(source_placement_status_)) ||
+                !source_backend_->recordEvent(source_terminal_, 0, source_stream_) ||
+                !awaitEvent(source_backend_, source_terminal_, std::chrono::seconds(10)))
+                return false;
+            DeviceMoEOverlayEpochStatus released{};
+            DeviceMoEOverlayEpochControl observed{};
+            return source_backend_->deviceToHost(&released, source_placement_status_,
+                                                 sizeof(released), 0, source_stream_) &&
+                   source_backend_->deviceToHost(&observed, source_epoch_control_, sizeof(observed),
+                                                 0, source_stream_) &&
+                   released.code ==
+                       static_cast<std::uint32_t>(DeviceMoEOverlayEpochStatusCode::Success) &&
+                   observed.bank_readers[0] == 0u && observed.bank_readers[1] == 0u;
+        }
+        const IGPUGraphCapture *recorded_source_capture_ = nullptr;
+        std::unique_ptr<IMoEKernel> source_epoch_kernel_;
+        DeviceMoEOverlayEpochControl *source_epoch_control_ = nullptr;
+        std::uint64_t *source_candidate_epoch_ = nullptr;
+        /** @return Recorded route weight; zero holes retain original slot coordinates. */
+        float jointRouteWeight(std::size_t slot) const noexcept
+        {
+            if (joint_zero_pattern_ == 2 || (joint_zero_pattern_ == 1 && slot % 3 != 1))
+                return 0.f;
+            if (joint_zero_pattern_ == 3)
+                return std::bit_cast<float>(std::uint32_t{1});
+            return kRouteWeightPattern[slot % kRouteWeightPattern.size()];
+        }
+        /** @return Expected live CPU cohort selection, independent of packet compaction. */
+        bool selectedJointRoute(std::size_t slot) const
+        {
+            return jointMembership(kLayers.front()).enabled() &&
+                   (joint_zero_pattern_ != 2 && (joint_zero_pattern_ != 1 || slot % 3 == 1)) &&
+                   ((routeParticipant(slot) == kTargetParticipant) != live_joint_swapped_);
+        }
+        /**
+         * @brief Build recorded candidate metadata through the original fixed-quota transition
+         * builder.
+         * @param swapped Whether the trace exchanges the four original tier assignments.
+         * @return True with the same original cohort/cuts; no global snapshot is published.
+         */
+        bool prepareRecordedJointPlacement(bool swapped)
+        {
+            if (!swapped)
+            {
+                recorded_joint_owners_ = joint_owners_;
+                return true;
+            }
+            for (const auto &row : joint_owners_->owners())
+                if (row.shard_cohort)
+                {
+                    const auto members = row.shard_cohort->participants();
+                    recorded_joint_owners_ =
+                        jointPacketOwners(static_cast<int>(members.size()), source_device_,
+                                          joint_owners_.get(), true);
+                    return true;
+                }
+            return false;
+        }
+        /** @param expert Original source expert. @return Target from the checked recorded map. */
+        int recordedJointTarget(int expert) const
+        {
+            const auto &owners = recorded_joint_owners_ ? *recorded_joint_owners_ : *joint_owners_;
+            const auto *row = owners.placementFor(kLayers.front(), expert);
+            if (!row)
+                throw std::logic_error("Native joint source fixture lost its original expert");
+            return row->shard_cohort ? MoEOverlayRouteTarget::cpuCohort(row->tier_idx).word()
+                                     : MoEOverlayRouteTarget::whole(row->owner_participant).word();
+        }
+        std::shared_ptr<const MoEExpertOwnerMap> recorded_joint_owners_;
+        bool live_joint_swapped_ = false;
+        int joint_zero_pattern_ = 0;
+        std::uint64_t live_placement_epoch_ = kPlacementEpoch;
+        std::uint64_t dispatch_replay_generation_ = 0;
         std::shared_ptr<const MoEExpertOwnerMap> joint_owners_;
         int target_participant_=kTargetParticipant;
         int live_rows_=Rows;
 
         /** @brief Submit one complete retained endpoint graph asynchronously. */
         static bool launchEndpoint(
-            DeviceGraphExecutor &executor,
-            ComputeGraph &graph,
-            IDeviceContext *context,
-            DeviceGraphExecutor::GraphSegmentCache &cache,
-            void *stream,
-            IWorkerGPUContext *worker)
+            DeviceGraphExecutor &executor, ComputeGraph &graph, IDeviceContext *context,
+            DeviceGraphExecutor::GraphSegmentCache &cache, void *stream, IWorkerGPUContext *worker,
+            DeviceGraphExecutor::GraphInitialSubmissionPolicy initial_submission =
+                DeviceGraphExecutor::GraphInitialSubmissionPolicy::CaptureInstantiateAndLaunch)
         {
             return executor.executeWithCachedGraphReplay(
-                graph,
-                context,
-                cache,
-                stream,
-                worker,
+                graph, context, cache, stream, worker,
                 /*collective_nodes=*/nullptr,
                 /*collectives_graph_capturable=*/false,
                 /*force_recapture=*/false,
-                /*defer_final_sync=*/true,
-                {},
-                DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph);
+                /*defer_final_sync=*/true, {},
+                DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph, {}, {}, {},
+                initial_submission);
         }
 
         /** @return Sole complete executable owned by a production full-graph cache. */
@@ -2491,7 +2780,7 @@ namespace
         }
 
         /** @brief Upload deterministic router output before transaction admission. */
-        bool initializeSourcePayload()
+        bool initializeSourcePayload(bool candidate_only = false)
         {
             if (!source_hidden_tensor_ || !source_routing_indices_tensor_ ||
                 !source_routing_weights_tensor_ ||
@@ -2519,8 +2808,9 @@ namespace
             for (std::size_t slot = 0u; slot < kEntries; ++slot)
             {
                 experts[slot] = static_cast<std::int32_t>(10u + slot % 8u);
-                weights[slot] =
-                    kRouteWeightPattern[slot % kRouteWeightPattern.size()];
+                weights[slot] = joint_owners_
+                                    ? jointRouteWeight(slot)
+                                    : kRouteWeightPattern[slot % kRouteWeightPattern.size()];
                 participants[slot] = routeParticipant(slot) == kTargetParticipant
                     ? target_participant_ : (joint_owners_ ? 0 : kSourceParticipant);
                 if(!dispatch_targets_.empty()) {
@@ -2566,38 +2856,47 @@ namespace
                 placement_banks{};
             for (auto &bank : placement_banks)
             {
-                bank.epoch = static_cast<std::uint32_t>(kPlacementEpoch);
+                bank.epoch = static_cast<std::uint32_t>(live_placement_epoch_);
                 bank.expert_count = kExpertCount;
-                std::fill_n(
-                    bank.overlay_route_participant,
-                    kExpertCount,
-                    kSourceParticipant);
+                if (joint_owners_)
+                    for (std::uint32_t expert = 0; expert < kExpertCount; ++expert)
+                        bank.overlay_route_participant[expert] =
+                            recordedJointTarget(static_cast<int>(expert));
+                else
+                    std::fill_n(bank.overlay_route_participant, kExpertCount, kSourceParticipant);
             }
             /* Bank zero is intentionally adversarial. The request ticket selects
              * bank one, whose global owner map reproduces the router oracle. */
             for (std::size_t slot = 0u; slot < kEntries; ++slot)
             {
-                placement_banks[1].overlay_route_participant[
-                    static_cast<std::size_t>(experts[slot])] =
-                    (joint_owners_ && joint_owners_->placementFor(kLayers.front(),experts[slot])->shard_cohort) ? -1 : participants[slot];
+                placement_banks[static_cast<std::size_t>(
+                                    live_placement_epoch_ == kPlacementEpoch ? 1u : 0u)]
+                    .overlay_route_participant[static_cast<std::size_t>(experts[slot])] =
+                    joint_owners_ ? recordedJointTarget(experts[slot]) : participants[slot];
             }
             const DeviceMoEOverlayEpochTicket placement_ticket{
-                .epoch = kPlacementEpoch,
+                .epoch = live_placement_epoch_,
                 .selector = deviceMoEOverlayEpochSelector(
-                    /*generation=*/3u,
-                    /*bank=*/1u),
+                    /*generation=*/3u + live_placement_epoch_ - kPlacementEpoch,
+                    /*bank=*/static_cast<std::uint32_t>(
+                        live_placement_epoch_ == kPlacementEpoch ? 1u : 0u)),
             };
             const DeviceMoEOverlayEpochStatus placement_status{
-                .epoch = kPlacementEpoch,
+                .epoch = live_placement_epoch_,
                 .selector = placement_ticket.selector,
-                .operation = static_cast<std::uint32_t>(
-                    DeviceMoEOverlayEpochOperation::Acquire),
-                .code = static_cast<std::uint32_t>(
-                    DeviceMoEOverlayEpochStatusCode::Success),
+                .operation = static_cast<std::uint32_t>(DeviceMoEOverlayEpochOperation::Acquire),
+                .code = static_cast<std::uint32_t>(DeviceMoEOverlayEpochStatusCode::Success),
                 .bank = placement_ticket.bank(),
-                .observed_state = static_cast<std::uint32_t>(
-                    DeviceMoEOverlayEpochBankState::Published),
+                .observed_state =
+                    static_cast<std::uint32_t>(DeviceMoEOverlayEpochBankState::Published),
             };
+            // Joint traces exercise the actual native acquire operation, which
+            // must start without an existing reader. Only that operation may
+            // publish the source ticket and successful acquisition status.
+            const auto initial_source_ticket = joint_owners_
+                ? DeviceMoEOverlayEpochTicket{} : placement_ticket;
+            const auto initial_source_status = joint_owners_
+                ? DeviceMoEOverlayEpochStatus{} : placement_status;
 
             std::copy(
                 hidden.begin(), hidden.end(),
@@ -2683,30 +2982,26 @@ namespace
             }
 
             const bool uploaded =
-                source_backend_->hostToDevice(
-                    source_placement_banks_, placement_banks.data(),
-                    sizeof(placement_banks), 0, source_stream_) &&
-                source_backend_->hostToDevice(
-                    source_placement_ticket_, &placement_ticket,
-                    sizeof(placement_ticket), 0, source_stream_) &&
-                source_backend_->hostToDevice(
-                    source_placement_status_, &placement_status,
-                    sizeof(placement_status), 0, source_stream_) &&
-                target_backend_->hostToDevice(
-                    target_placement_banks_, placement_banks.data(),
-                    sizeof(placement_banks), 0, target_stream_) &&
-                target_backend_->hostToDevice(
-                    target_placement_ticket_, &placement_ticket,
-                    sizeof(placement_ticket), 0, target_stream_) &&
-                target_backend_->hostToDevice(
-                    target_placement_status_, &placement_status,
-                    sizeof(placement_status), 0, target_stream_) &&
-                source_backend_->hostToDevice(
-                    source_active_rows_, &active_rows, sizeof(active_rows), 0,
-                    source_stream_) &&
-                target_backend_->memset(
-                    target_active_rows_, 0, sizeof(std::int32_t), 0,
-                    target_stream_);
+                source_backend_->hostToDevice(source_placement_banks_, placement_banks.data(),
+                                              candidate_only ? sizeof(DeviceMoEPlacementBank)
+                                                             : sizeof(placement_banks),
+                                              0, source_stream_) &&
+                (candidate_only ||
+                 source_backend_->hostToDevice(source_placement_ticket_, &initial_source_ticket,
+                                               sizeof(initial_source_ticket), 0, source_stream_)) &&
+                (candidate_only ||
+                 source_backend_->hostToDevice(source_placement_status_, &initial_source_status,
+                                               sizeof(initial_source_status), 0, source_stream_)) &&
+                target_backend_->hostToDevice(target_placement_banks_, placement_banks.data(),
+                                              sizeof(placement_banks), 0, target_stream_) &&
+                target_backend_->hostToDevice(target_placement_ticket_, &placement_ticket,
+                                              sizeof(placement_ticket), 0, target_stream_) &&
+                target_backend_->hostToDevice(target_placement_status_, &placement_status,
+                                              sizeof(placement_status), 0, target_stream_) &&
+                source_backend_->hostToDevice(source_active_rows_, &active_rows,
+                                              sizeof(active_rows), 0, source_stream_) &&
+                target_backend_->memset(target_active_rows_, 0, sizeof(std::int32_t), 0,
+                                        target_stream_);
             if (!uploaded)
                 error_ = "could not initialize endpoint device buffers";
             return uploaded;
@@ -2723,23 +3018,25 @@ namespace
                 .topology_fingerprint_low = header.topology_fingerprint_low,
                 .topology_fingerprint_high = header.topology_fingerprint_high,
                 .workspace_generation = header.workspace_generation,
-                .source = {
-                    .world_rank = header.source_world_rank,
-                    .participant_id = header.source_participant_id,
-                    .tier_priority = header.source_tier_priority,
-                    .domain_ordinal = header.source_domain_ordinal,
-                },
-                .target = {
-                    .world_rank = header.target_world_rank,
-                    .participant_id = header.target_participant_id,
-                    .tier_priority = header.target_tier_priority,
-                    .domain_ordinal = header.target_domain_ordinal,
-                },
+                .source =
+                    {
+                        .world_rank = header.source_world_rank,
+                        .participant_id = header.source_participant_id,
+                        .tier_priority = header.source_tier_priority,
+                        .domain_ordinal = header.source_domain_ordinal,
+                    },
+                .target =
+                    {
+                        .world_rank = header.target_world_rank,
+                        .participant_id = header.target_participant_id,
+                        .tier_priority = header.target_tier_priority,
+                        .domain_ordinal = header.target_domain_ordinal,
+                    },
                 .lane_ordinal = header.lane_ordinal,
                 .graph_role_mask = header.graph_role_mask,
-                .model_layer_indices = std::vector<std::int32_t>(
-                    kLayers.begin(), kLayers.end()),
+                .model_layer_indices = std::vector<std::int32_t>(kLayers.begin(), kLayers.end()),
                 .return_role = static_cast<MoEOverlayActivationReturnRole>(header.return_role),
+                .cohort_target = header.cohort_target,
             };
             protocol_ = std::make_unique<MoEOverlayActivationEpochProtocol>(
                 control, protocol_config_);
@@ -4749,33 +5046,86 @@ TEST(Test__MappedActivationPacketCUDAAndROCm,
 }
 
 /** @brief Actual native dispatch fanout without claiming CPU joint return readiness. */
-void runStaticJointPacketFanout(DeviceId device)
+void runLiveJointPacketFanout(DeviceId device)
 {
     for(const int degree:{2,4,8}) {
         const auto owners=jointPacketOwners(degree,device);
         for(auto member=owners->participants().rbegin();member!=owners->participants().rend();++member) {
             if(member->domain_name!="joint" && member->domain_name!="outside")continue;
             SCOPED_TRACE("degree="+std::to_string(degree)+" target="+std::to_string(member->participant_id));
-            for(const int active:{65,1,0,65}) {
-                PacketRoundTrip<65> packet(device,device,owners,member->participant_id,active);
+            // Each recorded trace owns a fresh channel: dispatch-only cancellation is
+            // process-terminal. No follower success/reset is fabricated to reuse it.
+            for (const int pass : {0, 1, 2, 3, 4})
+            {
+                const int live = pass == 1 ? 9 : pass == 2 ? 0 : pass == 3 ? 1 : 65;
+                PacketRoundTrip<65> packet(device, device, owners, member->participant_id, 65);
                 ASSERT_TRUE(packet.initialize())<<packet.error();
-                ASSERT_TRUE(packet.replayJointDispatch())<<packet.error();
+                ASSERT_TRUE(packet.replayJointDispatch(live, pass == 1 || pass == 3,
+                                                       pass == 3   ? 2
+                                                       : pass == 1 ? 1
+                                                                   : 0,
+                                                       kPlacementEpoch + pass))
+                    << packet.error();
+            }
+            for (int pass : {0, 1, 2, 3})
+            {
+                PacketRoundTrip<1> single(device, device, owners, member->participant_id, 1);
+                ASSERT_TRUE(single.initialize()) << single.error();
+                ASSERT_TRUE(single.replayJointDispatch(pass == 2 ? 0 : 1, pass == 1,
+                                                       pass == 3   ? 2
+                                                       : pass == 1 ? 1
+                                                                   : 0,
+                                                       kPlacementEpoch + pass))
+                    << single.error();
             }
         }
     }
 }
-TEST(Test__MappedActivationPacketCUDAAndROCm, CUDAStaticJointDispatchReachesEveryOriginalCPU2CPU4CPU8Member)
+
+TEST(Test__MappedActivationPacketCUDAAndROCm,
+     CUDALiveJointDispatchReplaysEveryOriginalCPU2CPU4CPU8Member)
 {
     if(!backendFor(DeviceId::cuda(0)) || backendFor(DeviceId::cuda(0))->deviceCount()<1) GTEST_SKIP()<<"Requires CUDA";
-    runStaticJointPacketFanout(DeviceId::cuda(0));
+    runLiveJointPacketFanout(DeviceId::cuda(0));
 }
-TEST(Test__MappedActivationPacketCUDAAndROCm, ROCmStaticJointDispatchReachesEveryOriginalCPU2CPU4CPU8Member)
+TEST(Test__MappedActivationPacketCUDAAndROCm,
+     ROCmLiveJointDispatchReplaysEveryOriginalCPU2CPU4CPU8Member)
 {
     if(!backendFor(DeviceId::rocm(0)) || backendFor(DeviceId::rocm(0))->deviceCount()<1) GTEST_SKIP()<<"Requires ROCm";
-    runStaticJointPacketFanout(DeviceId::rocm(0));
+    runLiveJointPacketFanout(DeviceId::rocm(0));
 }
 
-/** @brief Both original CPU targets share one rank-pair matrix and one native writer. */
+/** @brief Focused native regression: exact compact counts and original slots after zero holes. */
+void runJointZeroWeightPacketReplay(DeviceId device)
+{
+    const auto owners = jointPacketOwners(2, device);
+    const auto found =
+        std::find_if(owners->participants().begin(), owners->participants().end(),
+                     [](const auto &participant) { return participant.domain_name == "joint"; });
+    ASSERT_NE(found, owners->participants().end());
+    for (int pattern : {1, 2, 3})
+    {
+        PacketRoundTrip<65> packet(device, device, owners, found->participant_id, 65);
+        ASSERT_TRUE(packet.initialize()) << packet.error();
+        ASSERT_TRUE(packet.replayJointDispatch(pattern == 1 ? 9 : 1, true, pattern,
+                                               kPlacementEpoch + pattern))
+            << packet.error();
+    }
+}
+TEST(Test__MappedActivationPacketCUDAAndROCm, CUDAJointZeroWeightCompactionReplay)
+{
+    if (!backendFor(DeviceId::cuda(0)) || backendFor(DeviceId::cuda(0))->deviceCount() < 1)
+        GTEST_SKIP() << "Requires CUDA";
+    runJointZeroWeightPacketReplay(DeviceId::cuda(0));
+}
+TEST(Test__MappedActivationPacketCUDAAndROCm, ROCmJointZeroWeightCompactionReplay)
+{
+    if (!backendFor(DeviceId::rocm(0)) || backendFor(DeviceId::rocm(0))->deviceCount() < 1)
+        GTEST_SKIP() << "Requires ROCm";
+    runJointZeroWeightPacketReplay(DeviceId::rocm(0));
+}
+
+/** @brief Two ordinary packet consumers share one rank-pair matrix and one native writer. */
 void runSharedPhysicalUnionGroup(DeviceId device)
 {
     for(const auto& targets:{std::vector<int>{7,19},std::vector<int>{19,7}})
@@ -4785,6 +5135,9 @@ void runSharedPhysicalUnionGroup(DeviceId device)
         ASSERT_TRUE(packet.initialize())<<packet.error();
         ASSERT_TRUE(packet.replaySharedUnionGroup())<<packet.error();
     }
+    // Closed CPU cohorts require distinct original ranks. Their valid per-member
+    // live-bank/zero-hole packet cases below remain separate from this ordinary
+    // shared-union proof; no same-rank multi-socket execution is fabricated.
 }
 TEST(Test__MappedActivationPacketCUDAAndROCm, CUDASharedPhysicalUnionHasOneWriterAndOnlyLivePayload)
 {
@@ -4798,7 +5151,7 @@ TEST(Test__MappedActivationPacketCUDAAndROCm, ROCmSharedPhysicalUnionHasOneWrite
 }
 
 /** @test Cold fixture obeys original fallback ordering and retains every real source member. */
-TEST(Test__MappedActivationPacketCUDAAndROCm, StaticJointSourceFixtureHasCompleteOriginalColdPlacement)
+TEST(Test__MappedActivationPacketCUDAAndROCm, JointSourceFixtureHasCompleteOriginalColdPlacement)
 {
     for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})
     for(const int degree:{2,4,8}) {
@@ -4812,12 +5165,36 @@ TEST(Test__MappedActivationPacketCUDAAndROCm, StaticJointSourceFixtureHasComplet
                 ASSERT_NE(row,nullptr);ASSERT_TRUE(row->shard_cohort);
                 ASSERT_EQ(row->shard_cohort->participants().size(),static_cast<std::size_t>(degree));
                 EXPECT_EQ(row->owner_participant,-1);
-                for(const auto& member:row->shard_cohort->participants()) {
+                const auto members=row->shard_cohort->participants();
+                for(size_t index=0;index<members.size();++index) {
+                    const auto& member=members[index];
                     const auto* original=owners->participantForId(member.participant_id);
                     ASSERT_NE(original,nullptr);EXPECT_EQ(original->domain_name,"joint");
                     EXPECT_EQ(original->world_rank,member.world_rank);EXPECT_EQ(original->address,member.address);
+                    EXPECT_EQ(member.world_rank,static_cast<int>(index)+1);
+                    EXPECT_EQ(member.address.numa_node,static_cast<int>(index));
+                    for(size_t previous=0;previous<index;++previous) {
+                        EXPECT_NE(member.world_rank,members[previous].world_rank);
+                        EXPECT_NE(member.address.numa_node,members[previous].address.numa_node);
+                        EXPECT_NE(member.participant_id,members[previous].participant_id);
+                    }
                 }
             }
+        }
+        const auto candidate = jointPacketOwners(degree, device, owners.get(), true);
+        for (const int layer : kLayers)
+        {
+            const auto *original_cohort = owners->placementFor(layer, 10);
+            for (int expert : {11, 12, 13, 16})
+            {
+                const auto *incoming = candidate->placementFor(layer, expert);
+                ASSERT_TRUE(incoming && incoming->shard_cohort);
+                EXPECT_EQ(incoming->shard_cohort, original_cohort->shard_cohort);
+                EXPECT_FALSE(incoming->shard_cohort.owner_before(original_cohort->shard_cohort));
+                EXPECT_FALSE(original_cohort->shard_cohort.owner_before(incoming->shard_cohort));
+            }
+            EXPECT_EQ(candidate->expertsForParticipant(layer, 0).size(), 14u);
+            EXPECT_TRUE(owners->placementFor(layer, 10)->shard_cohort);
         }
         const auto outside=std::find_if(owners->participants().begin(),owners->participants().end(),[](const auto& p){return p.domain_name=="outside";});
         ASSERT_NE(outside,owners->participants().end());
