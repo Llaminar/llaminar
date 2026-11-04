@@ -515,8 +515,22 @@ namespace llaminar2
          * @brief Common physical implementation after either authority validates.
          *
          * Every argument is transport identity or byte/slot work. Keeping the
-         * host transaction and device command wrappers outside this method
-         * prevents the shared data plane from acquiring a second policy input.
+         * device command wrapper outside this method prevents a second policy
+         * input. The optional original transaction is a borrowed authentication
+         * witness for unpublishable cohort shadow arrivals, never reconstructed
+         * placement or an additional movement policy.
+         * @param purpose Original placement, restoration or shadow-calibration intent.
+         * @param expected_epoch Exact installed source epoch.
+         * @param candidate_epoch Exact inactive destination epoch.
+         * @param execution_fingerprint Existing authenticated physical execution identity.
+         * @param migrations Original ordered logical edges.
+         * @param migration_cycles Original closed-cycle grouping.
+         * @param shadow_requirements Original every-destination-member slot bounds.
+         * @param candidate Original host snapshot, null for device commands.
+         * @param device_batch Original device-ledger command, null for host transactions.
+         * @param original_transaction Exact host transaction, null for device commands.
+         * @param local_destination_participants Original sorted local registry participants.
+         * @return Actual owned physical operations or a fenced failure prefix.
          */
         MoEOverlayParticipantPreparedTransfers preparePhysicalTransfers(
             MoEOverlayResidencyTransactionPurpose purpose,
@@ -530,6 +544,7 @@ namespace llaminar2
                 shadow_requirements,
             const MoEOverlayResidencySnapshot *candidate,
             const MoEOverlayDevicePhysicalMovementBatch *device_batch,
+            const MoEOverlayResidencyTransaction *original_transaction,
             const std::vector<int> &local_destination_participants);
 
         /** @brief Retain a completely materialized implementation. */

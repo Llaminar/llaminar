@@ -1719,11 +1719,12 @@ namespace llaminar2
             purpose ==
             MoEOverlayResidencyTransactionPurpose::PreparedContextRestoration;
         if ((!calibration && !restoration &&
-             purpose != MoEOverlayResidencyTransactionPurpose::PlacementChange) ||
-            (joint && calibration))
+             purpose != MoEOverlayResidencyTransactionPurpose::PlacementChange))
             return false;
         if (calibration)
         {
+            if (joint && (migrations.size() != 2 || migration_cycles.size() != 1))
+                return false; // This admitted calibration shape is one reciprocal target pair.
             /*
              * A calibration candidate is deliberately the unchanged live
              * topology at the next private epoch. Only its shadow copies are
@@ -1732,10 +1733,12 @@ namespace llaminar2
             if (calibration_sequence == 0 || histogram_window ||
                 histogram_generation != 0 || host_admission ||
                 economy.enabled ||
-                previous->placement_plan.get() !=
-                    candidate->placement_plan.get() ||
-                previous->layered_ownership !=
-                    candidate->layered_ownership)
+                !same_owner(previous->placement_plan, candidate->placement_plan) ||
+                previous->layered_ownership != candidate->layered_ownership ||
+                (joint && (!same_owner(previous->joint_->live_plan, candidate->joint_->live_plan) ||
+                           !same_owner(previous->joint_->live_owners, candidate->joint_->live_owners))) ||
+                (!joint && (previous->owner_map.owners() != candidate->owner_map.owners() ||
+                            previous->owner_map.participants() != candidate->owner_map.participants())))
             {
                 return false;
             }
@@ -1775,7 +1778,7 @@ namespace llaminar2
 
         const auto &previous_map = previous->placementOwnerMap();
         const auto &candidate_map = candidate->placementOwnerMap();
-        if (joint)
+        if (joint && !calibration)
         {
             // Every changed logical placement must have one physical edge.
             // Otherwise an empty or partial wave could publish uncopied rows.
@@ -1834,6 +1837,8 @@ namespace llaminar2
             {
                 return false;
             }
+            if (calibration && migration.activation_count != 0)
+                return false; // Shadow timing never authors logical routing demand.
             if (histogram_window)
             {
                 if (!histogram_window->containsModelLayer(migration.layer_idx) ||
@@ -1865,16 +1870,45 @@ namespace llaminar2
             }
             if (calibration)
             {
-                const auto *destination_participant =
-                    previous_map.participantForId(
-                        migration.destination.owner_participant);
-                if (!destination_participant ||
-                    destination_participant->tier_idx !=
-                        migration.destination.tier_idx ||
-                    destination_participant->device !=
-                        migration.destination.device)
+                if (joint)
                 {
-                    return false;
+                    // Shadow destinations are complete original targets already
+                    // present in this exact source layer. Borrow the canonical
+                    // member/cut/control block, changing only the migrant expert
+                    // coordinate; calibration never rewrites live ownership.
+                    bool authenticated = false;
+                    for (const auto &resident : previous_map.owners())
+                    {
+                        if (resident.layer_idx != migration.layer_idx) continue;
+                        const auto canonical = MoEExpertPlacementTarget::fromPlacement(resident);
+                        const auto actual = MoEExpertPlacementTarget::fromPlacement(migration.destination);
+                        const auto &destination = migration.destination;
+                        // Compare the actual target without copying strings or
+                        // manufacturing a temporary owner inside noexcept validation.
+                        if (canonical && actual && *canonical == *actual &&
+                            same_owner(resident.shard_cohort, destination.shard_cohort) &&
+                            resident.owner_participant == destination.owner_participant &&
+                            resident.device == destination.device && resident.resident == destination.resident &&
+                            resident.tier_name == destination.tier_name && resident.domain_name == destination.domain_name &&
+                            resident.domain_participant_index == destination.domain_participant_index &&
+                            resident.owner_world_rank == destination.owner_world_rank &&
+                            resident.owner_world_rank_known == destination.owner_world_rank_known &&
+                            resident.address == destination.address)
+                        {
+                            authenticated = true;
+                            break;
+                        }
+                    }
+                    if (!authenticated) return false;
+                }
+                else
+                {
+                    const auto *destination_participant = previous_map.participantForId(
+                        migration.destination.owner_participant);
+                    if (!destination_participant ||
+                        destination_participant->tier_idx != migration.destination.tier_idx ||
+                        destination_participant->device != migration.destination.device)
+                        return false;
                 }
             }
             else
@@ -7409,6 +7443,23 @@ namespace llaminar2
     {
         std::lock_guard<std::mutex> lock(maintenance_mutex_);
         return active_wave_ != nullptr;
+    }
+
+    std::shared_ptr<const MoEOverlayResidencySnapshot>
+    MoEOverlayResidencyAuthority::buildCalibrationShadowSnapshot(
+        const std::shared_ptr<const MoEOverlayResidencySnapshot> &live)
+    {
+        if (!live || !live->valid() || live->epoch == std::numeric_limits<uint64_t>::max())
+            throw std::invalid_argument("Calibration shadow requires a valid non-exhausted original source epoch");
+        auto shadow = std::make_shared<MoEOverlayResidencySnapshot>(*live);
+        shadow->epoch = live->epoch + 1;
+        if (shadow->joint_)
+            shadow->joint_->epoch = shadow->epoch;
+        // All source/placement/control blocks remain identical. This private
+        // epoch names shadow bytes only; no global-current selector is authored.
+        if (!shadow->valid())
+            throw std::logic_error("Calibration shadow lost its original sealed ownership arm");
+        return shadow;
     }
 
     std::shared_ptr<const MoEOverlayResidencySnapshot>

@@ -5289,6 +5289,7 @@ namespace llaminar2
             transaction.shadow_requirements,
             transaction.candidate.get(),
             nullptr,
+            &transaction,
             local_destination_participants);
     }
 
@@ -5339,6 +5340,7 @@ namespace llaminar2
             batch.shadow_requirements,
             nullptr,
             &batch,
+            nullptr,
             local_destination_participants);
         if (prepared.status != MoEOverlayResidencyStageStartStatus::Started)
         {
@@ -5364,6 +5366,7 @@ namespace llaminar2
         const std::vector<MoEOverlayTierShadowRequirement> &shadow_requirements,
         const MoEOverlayResidencySnapshot *candidate,
         const MoEOverlayDevicePhysicalMovementBatch *device_batch,
+        const MoEOverlayResidencyTransaction *original_transaction,
         const std::vector<int> &local_destination_participants)
     {
         MoEOverlayParticipantPreparedTransfers result;
@@ -5441,13 +5444,22 @@ namespace llaminar2
         {
             return fail(error.what());
         }
-        // A cohort wave is a real placement or terminal restoration, not an
-        // unqualified economy-calibration copy with different publication rules.
+        // Cohort calibration borrows the genuine shadow-only transaction. Its
+        // live map is unchanged, so it must not enter the candidate-placement
+        // arrival producer or manufacture a placement change to pass that guard.
         const bool has_cohort = std::any_of(migrations.begin(), migrations.end(),
             [](const auto &edge) { return edge.source.shard_cohort || edge.destination.shard_cohort; });
-        if (has_cohort && purpose != MoEOverlayResidencyTransactionPurpose::PlacementChange &&
-            purpose != MoEOverlayResidencyTransactionPurpose::PreparedContextRestoration)
-            return fail("CPU cohort physical movement does not support economy calibration");
+        if (has_cohort && purpose == MoEOverlayResidencyTransactionPurpose::EconomyCalibration)
+        {
+            if (device_batch || !original_transaction || !original_transaction->valid() ||
+                original_transaction->purpose != purpose || original_transaction->expected_epoch != expected_epoch ||
+                original_transaction->candidate.get() != candidate || candidate->epoch != candidate_epoch ||
+                &original_transaction->migrations != &migrations)
+                return fail("CPU cohort calibration requires its exact original unpublishable shadow transaction");
+        }
+        else if (has_cohort && purpose != MoEOverlayResidencyTransactionPurpose::PlacementChange &&
+                 purpose != MoEOverlayResidencyTransactionPurpose::PreparedContextRestoration)
+            return fail("CPU cohort physical movement has an unsupported transaction purpose");
 
         try
         {
@@ -5733,8 +5745,12 @@ namespace llaminar2
                         std::string arrival_error;
                         if (!candidate || candidate->epoch != candidate_epoch)
                             throw std::invalid_argument("CPU fragment reservation requires its actual original candidate epoch");
-                        arrival = config_.registry->prepareCPUJointArrival(*candidate, participant,
-                            migration.layer_idx, migration.expert_id, &arrival_error);
+                        if (purpose == MoEOverlayResidencyTransactionPurpose::EconomyCalibration)
+                            arrival = config_.registry->prepareCPUJointCalibrationArrival(*original_transaction,
+                                migration_index, participant, &arrival_error);
+                        else
+                            arrival = config_.registry->prepareCPUJointArrival(*candidate, participant,
+                                migration.layer_idx, migration.expert_id, &arrival_error);
                         if (!arrival) throw std::invalid_argument(arrival_error);
                     }
                     else arrival = std::make_shared<MoEOverlayPreparedExpertArrival>();

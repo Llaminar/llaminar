@@ -37,6 +37,7 @@
 namespace llaminar2
 {
     class MoEOverlayEconomyCalibrationLayerCatalog;
+    class MoEOverlayEconomyCalibrationPlanner;
     class MoEExpertOverlayPreparationPlan;
     namespace test
     {
@@ -1491,6 +1492,7 @@ namespace llaminar2
     private:
         /** Device-free regression access for holding a real proposal lock. */
         friend struct test::MoEOverlayResidencyAuthorityConcurrencyPeer;
+        friend class MoEOverlayEconomyCalibrationPlanner;
         friend struct test::MoEOverlayJointPlacementCandidateTestAccess;
 
         /** Sole typed owner of the shared runtime-histogram drain lane. */
@@ -1552,6 +1554,16 @@ namespace llaminar2
          */
         void requireHostDynamicPublicationAuthority(
             const char *operation) const;
+
+        /**
+         * @brief Seal the unchanged source placement at a private shadow-calibration epoch.
+         * @param live Original retained immutable source snapshot, never a rebuilt owner map.
+         * @return Same source/preparation/placement owners with only the private epoch advanced.
+         * @throws std::invalid_argument For missing, invalid or exhausted source epochs.
+         * @note Only the existing calibration planner can author this non-publication metadata.
+         */
+        static std::shared_ptr<const MoEOverlayResidencySnapshot> buildCalibrationShadowSnapshot(
+            const std::shared_ptr<const MoEOverlayResidencySnapshot> &live);
 
         /**
          * @brief Reconstruct a source-bound proposal without granting maintenance/publication.

@@ -84,14 +84,37 @@ TEST(LiveEconomyEvidenceCodec, TruncatedDuplicateForeignAndQuoteMismatchReject) 
 }
 TEST(LiveEconomyEvidenceCodec, MandatoryContextAndCoordinateRemainBound) {
     const auto context=liveCodecContext(1);auto rows=liveCodecRows(*context,0);
-    MoEOverlayMigrationProfileEvidence evidence{.profile_sequence=3,.coordinate={0,8,7},.local_measurements=rows,.context=context};
+    MoEOverlayMigrationProfileEvidence evidence{.profile_sequence=3,.coordinate=recordedWholeMigrationCoordinate(0,8,7),.local_measurements=rows,.context=context};
     ASSERT_TRUE(evidence.valid());evidence.context.reset();EXPECT_FALSE(evidence.valid());
-    evidence.context=context;evidence.coordinate={3,4,7};EXPECT_FALSE(evidence.valid());
+    evidence.context=context;evidence.coordinate=recordedWholeMigrationCoordinate(3,4,7);EXPECT_FALSE(evidence.valid());
     const auto scalar=scalarMoEOverlayMigrationMeasurement(rows[0]);
     EXPECT_FALSE(scalar.geometry);for(const auto &sample:scalar.projections)EXPECT_TRUE(sample);
     const auto cohort=liveCodecContext(2);
     EXPECT_THROW((void)scalarMoEOverlayMigrationMeasurement(liveCodecRows(*cohort,0)[0]),std::invalid_argument);
     rows[0].piece_observations[0].observation.reset();
     EXPECT_THROW((void)scalarMoEOverlayMigrationMeasurement(rows[0]),std::invalid_argument);
+}
+
+TEST(LiveEconomyEvidenceCodec, CompleteCohortIdentityRejectsRepresentativeMemberAlias) {
+    const auto original=liveCodecContext(2);
+    auto identities=original->identities();
+    // Complete-target ordering places the negative cohort tag before a whole owner.
+    std::reverse(identities.begin(),identities.end());
+    const auto context=MoEOverlayMigrationEvidenceContext::checked(
+        std::move(identities),MoEOverlayResidencyTransactionPurpose::EconomyCalibration);
+    auto rows=liveCodecRows(*context,0);
+    MoEOverlayMigrationProfileEvidence evidence{
+        .profile_sequence=3,
+        .coordinate={MoEOverlayRouteTarget::cpuCohort(1),MoEOverlayRouteTarget::whole(0),7},
+        .local_measurements=rows,.context=context};
+    ASSERT_TRUE(evidence.valid());
+    evidence.coordinate.source_target=MoEOverlayRouteTarget::cpuCohort(2);
+    EXPECT_FALSE(evidence.valid());
+    // The previous member-based coordinate check admitted this exact alias.
+    evidence.context=original;evidence.local_measurements=liveCodecRows(*original,0);
+    evidence.coordinate=recordedWholeMigrationCoordinate(0,8,7);
+    EXPECT_FALSE(evidence.valid());
+    evidence.coordinate=recordedWholeMigrationCoordinate(0,9,7);
+    EXPECT_FALSE(evidence.valid());
 }
 }

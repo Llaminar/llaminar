@@ -9,6 +9,7 @@
 #include "utils/PerfStatsCollector.h"
 
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -59,23 +60,23 @@ namespace llaminar2
         if (config_.perf_device.empty())
             config_.perf_device = "expert_overlay";
 
-        const auto &coordinates = config_.planner->requiredCoordinates();
+        const auto &coordinates = config_.planner->requiredTargetCoordinates();
         if (coordinates.empty() ||
-            coordinates != config_.ledger->requiredCoordinates())
+            coordinates != config_.ledger->requiredTargetCoordinates())
         {
             throw std::invalid_argument(
                 "ExpertOverlay transfer profiler and ledger coordinates disagree");
         }
         for (const auto &coordinate : coordinates)
         {
-            if (coordinate.source_participant >=
-                coordinate.destination_participant)
+            if (coordinate.source_target.word() >=
+                coordinate.destination_target.word())
             {
                 continue;
             }
-            const MoEOverlayMigrationMeasurementCoordinate reverse{
-                .source_participant = coordinate.destination_participant,
-                .destination_participant = coordinate.source_participant,
+            const MoEOverlayMigrationTargetCoordinate reverse{
+                .source_target = coordinate.destination_target,
+                .destination_target = coordinate.source_target,
                 .layer = coordinate.layer,
             };
             if (!std::binary_search(
@@ -85,8 +86,8 @@ namespace llaminar2
                     "ExpertOverlay transfer profile is missing a reverse directed coordinate");
             }
             jobs_.push_back({
-                .first_participant = coordinate.source_participant,
-                .second_participant = coordinate.destination_participant,
+                .first_target = coordinate.source_target,
+                .second_target = coordinate.destination_target,
                 .layer = coordinate.layer,
             });
         }
@@ -116,17 +117,13 @@ namespace llaminar2
                 throw std::invalid_argument(
                     "ExpertOverlay reused transfer profile is malformed");
             }
-            std::vector<MoEOverlayMigrationMeasurementCoordinate>
+            std::vector<MoEOverlayMigrationTargetCoordinate>
                 reused_coordinates;
             reused_coordinates.reserve(
                 config_.presealed_measurements->rows.size());
             for (const auto &row : config_.presealed_measurements->rows)
             {
-                reused_coordinates.push_back({
-                    .source_participant = row.source_participant,
-                    .destination_participant = row.destination_participant,
-                    .layer = row.layer,
-                });
+                reused_coordinates.push_back(row.coordinate);
             }
             std::sort(
                 reused_coordinates.begin(), reused_coordinates.end());
@@ -135,6 +132,12 @@ namespace llaminar2
                 throw std::invalid_argument(
                     "ExpertOverlay reused transfer profile does not exactly match the current participant/layer topology");
             }
+            std::string declaration_error;
+            if (!config_.ledger->matchesDeclarations(
+                    *config_.presealed_measurements, &declaration_error))
+                throw std::invalid_argument(declaration_error.empty()
+                    ? "ExpertOverlay reused transfer profile differs from original target declarations"
+                    : declaration_error);
 
             sealed_ = *config_.presealed_measurements;
             accepted_pairs_.store(
@@ -174,13 +177,13 @@ namespace llaminar2
             << " synthetic_inference=false");
     }
 
-    MoEOverlayMigrationMeasurementCoordinate
+    MoEOverlayMigrationTargetCoordinate
     MoEOverlayEconomyCalibrationController::currentCoordinate() const noexcept
     {
         const auto &job = jobs_[job_index_];
         return {
-            .source_participant = job.first_participant,
-            .destination_participant = job.second_participant,
+            .source_target = job.first_target,
+            .destination_target = job.second_target,
             .layer = job.layer,
         };
     }
@@ -277,8 +280,8 @@ namespace llaminar2
 
         const auto &job = jobs_[job_index_];
         const auto transaction = config_.planner->buildPairSwap(
-            job.first_participant,
-            job.second_participant,
+            job.first_target,
+            job.second_target,
             job.layer,
             active_profile_sequence_);
         wave_start_attempts_.fetch_add(1, std::memory_order_relaxed);
@@ -314,7 +317,7 @@ namespace llaminar2
         {
             LOG_DEBUG(
                 "[ExpertOverlay][Economy] Profiling physical pair="
-                << job.first_participant << "<->" << job.second_participant
+                << job.first_target.word() << "<->" << job.second_target.word()
                 << " representative_layer=" << job.layer);
         }
         state_.store(
@@ -485,12 +488,15 @@ namespace llaminar2
     void MoEOverlayEconomyCalibrationController::recordCompletedWave(
         const std::vector<MoEOverlayCompletedMigrationMeasurement> &rows)
     {
-        std::vector<MoEOverlayCompletedMigrationMeasurement> scalar_rows;
-        scalar_rows.reserve(rows.size());
-        for (const auto &row : rows)
-            scalar_rows.push_back(scalarMoEOverlayMigrationMeasurement(row));
+        if (rows.size() != 2)
+            throw std::logic_error("ExpertOverlay calibrated pair lost its exact two logical moves");
+        const auto forward = currentCoordinate();
+        const MoEOverlayMigrationTargetCoordinate reverse{
+            forward.destination_target, forward.source_target, forward.layer};
+        const std::array<MoEOverlayBorrowedTargetMigrationObservation, 2> observations{{
+            {forward, rows[0]}, {reverse, rows[1]}}};
         std::string ledger_error;
-        if (!config_.ledger->recordCompletedWave(scalar_rows, &ledger_error))
+        if (!config_.ledger->recordCompletedTargetWave(observations, &ledger_error))
         {
             throw std::logic_error(
                 ledger_error.empty()
@@ -502,10 +508,10 @@ namespace llaminar2
             config_.perf_device,
             "economy_transport_profile_waves_completed",
             1.0,
-            {{"source_participant",
-              std::to_string(currentCoordinate().source_participant)},
-             {"destination_participant",
-              std::to_string(currentCoordinate().destination_participant)},
+            {{"source_target_word",
+              std::to_string(currentCoordinate().source_target.word())},
+             {"destination_target_word",
+              std::to_string(currentCoordinate().destination_target.word())},
              {"layer", std::to_string(currentCoordinate().layer)}});
         advanceProfileWave();
     }

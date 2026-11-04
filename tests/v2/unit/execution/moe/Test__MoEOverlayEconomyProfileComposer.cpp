@@ -969,3 +969,5 @@ namespace llaminar2::test
         }
     }
 } // namespace llaminar2::test
+
+#include "TargetMigrationNormalizationContract.inc"

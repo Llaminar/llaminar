@@ -503,6 +503,100 @@ namespace llaminar2
         return result;
     }
 
+    bool MoEOverlayQuotedPieceMigrationMeasurement::valid() const noexcept
+    {
+        return quoted_payload_bytes != 0 && measurement.valid() &&
+            quoted_payload_bytes == measurement.bytes &&
+            (measurement.device_nanoseconds || measurement.host_nanoseconds || measurement.transport_nanoseconds);
+    }
+
+    bool MoEOverlayTargetLayerMigrationMeasurement::geometryMatches(
+        const MoEOverlayMigrationTargetCoordinate &coordinate,
+        const MoEOverlayMigrationMeasurementGeometry &geometry) noexcept
+    {
+        const auto matches=[](MoEOverlayRouteTarget tag,const MoEOverlayPhysicalProjectionTarget &target) {
+            if(tag.isWhole())return target.members.size()==1 && target.members.front().participant_id==tag.word();
+            // Canonical CPU shard cohorts contain 2..8 original participants;
+            // TP1 is a whole target, never an alias for a one-member cohort.
+            if(!tag.isCPUCohort() || target.members.size()<2 || target.members.size()>8 ||
+                std::int64_t(target.tier_idx)!=-std::int64_t(tag.word())-2)return false;
+            return std::all_of(target.members.begin(),target.members.end(),[](const auto &member){return member.device.is_cpu();});
+        };
+        return coordinate.valid() && matches(coordinate.source_target,geometry.targets().first) &&
+            matches(coordinate.destination_target,geometry.targets().second);
+    }
+
+    bool MoEOverlayTargetLayerMigrationMeasurement::valid() const noexcept
+    {
+        if(!coordinate.valid() || !wave_wall_nanoseconds ||
+            wave_sample_count<MoEOverlayEconomyProfileComposer::kMinimumMigrationSamples ||
+            inference_interference_nanoseconds || interference_sample_count || pieces.empty())return false;
+        if(geometry) {
+            if(!geometryMatches(coordinate,*geometry) || pieces.size()!=geometry->pieces().size())return false;
+        } else if(!coordinate.source_target.isWhole() || !coordinate.destination_target.isWhole() || pieces.size()!=3)return false;
+        return std::all_of(pieces.begin(),pieces.end(),[](const auto &piece){return piece.valid();});
+    }
+
+    MoEOverlayParticipantLayerMigrationMeasurement MoEOverlayTargetLayerMigrationMeasurement::whole() const
+    {
+        if(!valid() || !coordinate.source_target.isWhole() || !coordinate.destination_target.isWhole() || pieces.size()!=3)
+            throw std::invalid_argument("Complete-target migration evidence cannot enter a whole-only consumer");
+        MoEOverlayParticipantLayerMigrationMeasurement result{
+            .source_participant=coordinate.source_target.word(),.destination_participant=coordinate.destination_target.word(),
+            .layer=coordinate.layer,.wave_wall_nanoseconds=wave_wall_nanoseconds,.wave_sample_count=wave_sample_count,
+            .inference_interference_nanoseconds=inference_interference_nanoseconds,.interference_sample_count=interference_sample_count};
+        for(std::size_t role=0;role<3;++role)result.projections[role]=pieces[role].measurement;
+        return result;
+    }
+
+    MoEOverlayTargetLayerMigrationMeasurement MoEOverlayTargetLayerMigrationMeasurement::fromWhole(
+        const MoEOverlayParticipantLayerMigrationMeasurement &row)
+    {
+        MoEOverlayTargetLayerMigrationMeasurement result{
+            .coordinate={MoEOverlayRouteTarget::whole(row.source_participant),MoEOverlayRouteTarget::whole(row.destination_participant),row.layer},
+            .wave_wall_nanoseconds=row.wave_wall_nanoseconds,.wave_sample_count=row.wave_sample_count,
+            .inference_interference_nanoseconds=row.inference_interference_nanoseconds,.interference_sample_count=row.interference_sample_count};
+        result.pieces.reserve(3);
+        for(const auto &sample:row.projections)result.pieces.push_back({sample.bytes,sample});
+        if(!result.valid())throw std::invalid_argument("Invalid whole-only robust migration evidence");
+        return result;
+    }
+
+    std::vector<MoEOverlayTargetLayerMigrationCost>
+    MoEOverlayEconomyProfileComposer::normalizeMigrationMeasurements(
+        std::vector<MoEOverlayTargetLayerMigrationMeasurement> measurements)
+    {
+        if(measurements.empty())throw std::invalid_argument("Target migration normalization requires complete measured coordinates");
+        std::sort(measurements.begin(),measurements.end(),[](const auto &a,const auto &b){return a.coordinate<b.coordinate;});
+        std::vector<MoEOverlayTargetLayerMigrationCost> result;result.reserve(measurements.size());
+        for(std::size_t i=0;i<measurements.size();++i) {
+            const auto &row=measurements[i];
+            if(!row.valid() || (i && measurements[i-1].coordinate==row.coordinate))
+                throw std::invalid_argument("Target migration evidence has incomplete, repeated or foreign original geometry");
+            auto critical_path=row.wave_wall_nanoseconds;
+            // Preserve max-of-medians: concurrent member/role costs are never added.
+            for(const auto &piece:row.pieces)critical_path=std::max(critical_path,piece.measurement.wall_nanoseconds);
+            result.push_back({row.coordinate,critical_path,0});
+        }
+        return result;
+    }
+
+    std::vector<MoEOverlayParticipantLayerMigrationCost>
+    MoEOverlayEconomyProfileComposer::checkedWholeMigrationCosts(std::vector<MoEOverlayTargetLayerMigrationCost> costs)
+    {
+        std::sort(costs.begin(),costs.end(),[](const auto &a,const auto &b){return a.coordinate<b.coordinate;});
+        std::vector<MoEOverlayParticipantLayerMigrationCost> result;result.reserve(costs.size());
+        for(std::size_t i=0;i<costs.size();++i) {
+            const auto &row=costs[i];
+            if(!row.coordinate.valid() || !row.coordinate.source_target.isWhole() || !row.coordinate.destination_target.isWhole() ||
+                !row.transfer_and_repack_ns || row.inference_interference_ns || (i && costs[i-1].coordinate==row.coordinate))
+                throw std::invalid_argument("Cohort or invalid migration prices cannot enter a whole-only objective");
+            result.push_back({row.coordinate.source_target.word(),row.coordinate.destination_target.word(),row.coordinate.layer,
+                row.transfer_and_repack_ns,row.inference_interference_ns});
+        }
+        return result;
+    }
+
     MoEOverlayCertifiedEconomyProfiles
     MoEOverlayEconomyProfileComposer::compose(
         const MoERoutedExpertPlacementPlan &plan,

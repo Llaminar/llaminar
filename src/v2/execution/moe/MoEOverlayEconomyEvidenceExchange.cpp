@@ -29,18 +29,18 @@ namespace llaminar2
                    left.layer == right.layer && left.expert == right.expert;
         }
 
-        /** @brief Bind the existing job coordinate to actual target members, never an unrelated pair.
-         * @param row Original described forward edge. @param coordinate Existing calibration job identity.
-         * @return Whether both named participants are real members of their respective targets. */
+        /**
+         * @brief Match complete target identity without naming a cohort representative.
+         * @param row Original described forward edge.
+         * @param coordinate Complete target/layer calibration identity.
+         * @return Whether both alternatives match the same original whole or CPU-cohort geometry.
+         */
         bool matchesTargetCoordinate(const MoEOverlayCompletedMigrationMeasurement &row,
-            const MoEOverlayMigrationMeasurementCoordinate &coordinate) noexcept
+            const MoEOverlayMigrationTargetCoordinate &coordinate) noexcept
         {
-            if(!row.geometry)return row.source_participant==coordinate.source_participant &&
-                row.destination_participant==coordinate.destination_participant;
-            const auto contains=[](const auto &target,int id){return std::any_of(target.members.begin(),target.members.end(),
-                [id](const auto &member){return member.participant_id==id;});};
-            return contains(row.geometry->targets().first,coordinate.source_participant) &&
-                contains(row.geometry->targets().second,coordinate.destination_participant);
+            return row.geometry && row.layer == coordinate.layer &&
+                   MoEOverlayTargetLayerMigrationMeasurement::geometryMatches(
+                       coordinate, *row.geometry);
         }
 
         /** @return Non-negative interference without unsigned underflow. */
@@ -58,8 +58,8 @@ namespace llaminar2
     bool MoEOverlayMigrationProfileEvidence::valid() const noexcept
     {
         if (profile_sequence == 0 || !coordinate.valid() ||
-            coordinate.source_participant >=
-                coordinate.destination_participant ||
+            coordinate.source_target.word() >=
+                coordinate.destination_target.word() ||
             local_measurements.size() != 2 || !context || context->purpose()!=MoEOverlayResidencyTransactionPurpose::EconomyCalibration || !context->matches(local_measurements))
         {
             return false;
@@ -67,14 +67,9 @@ namespace llaminar2
         const auto &forward = local_measurements[0];
         const auto &reverse = local_measurements[1];
         return forward.valid() && reverse.valid() && matchesTargetCoordinate(forward,coordinate) &&
-               ((forward.geometry && reverse.geometry &&
-                  forward.geometry->targets().first==reverse.geometry->targets().second &&
-                  forward.geometry->targets().second==reverse.geometry->targets().first) ||
-                (!forward.geometry && !reverse.geometry &&
-                 forward.source_participant==coordinate.source_participant &&
-                 forward.destination_participant==coordinate.destination_participant &&
-                 reverse.source_participant==coordinate.destination_participant &&
-                 reverse.destination_participant==coordinate.source_participant)) &&
+               forward.geometry && reverse.geometry &&
+               forward.geometry->targets().first==reverse.geometry->targets().second &&
+               forward.geometry->targets().second==reverse.geometry->targets().first &&
                forward.layer == coordinate.layer &&
                reverse.layer == coordinate.layer;
     }
@@ -143,8 +138,8 @@ namespace llaminar2
     bool MoEOverlayCalibrationAttemptEvidence::valid() const noexcept
     {
         if (calibration_sequence == 0 || !coordinate.valid() ||
-            coordinate.source_participant >=
-                coordinate.destination_participant ||
+            coordinate.source_target.word() >=
+                coordinate.destination_target.word() ||
             static_cast<std::size_t>(source) >=
                 kExpertHistogramProductionSourceCount ||
             !workload.valid() || workload.source != source ||
@@ -156,14 +151,9 @@ namespace llaminar2
         const auto &forward = local_measurements[0];
         const auto &reverse = local_measurements[1];
         return forward.valid() && reverse.valid() && matchesTargetCoordinate(forward,coordinate) &&
-               ((forward.geometry && reverse.geometry &&
-                  forward.geometry->targets().first==reverse.geometry->targets().second &&
-                  forward.geometry->targets().second==reverse.geometry->targets().first) ||
-                (!forward.geometry && !reverse.geometry &&
-                 forward.source_participant==coordinate.source_participant &&
-                 forward.destination_participant==coordinate.destination_participant &&
-                 reverse.source_participant==coordinate.destination_participant &&
-                 reverse.destination_participant==coordinate.source_participant)) &&
+               forward.geometry && reverse.geometry &&
+               forward.geometry->targets().first==reverse.geometry->targets().second &&
+               forward.geometry->targets().second==reverse.geometry->targets().first &&
                forward.layer == coordinate.layer &&
                reverse.layer == coordinate.layer;
     }

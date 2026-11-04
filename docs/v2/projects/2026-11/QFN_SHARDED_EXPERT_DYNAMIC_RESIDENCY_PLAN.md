@@ -133,13 +133,22 @@ actual two-rank exchanges and CPU/GPU physical controls pass all 23 focused
 registrations in `focused219`, with no skips and clean driver/retirement checks.
 This is not an enabled cohort-calibration or Dynamic execution claim.
 
-The next slice extends the same calibration planner to genuine nonpublishable
-whole/cohort shadow jobs, using one canonical list of checked original targets.
-Whole-only consumers must reject unsupported cohort pricing explicitly. Service
+The same calibration planner now authors genuine nonpublishable whole/cohort
+shadow jobs from one canonical target list. Its typed ledger preserves complete
+piece geometry/quotes with allocation-free recording and robust wave-maximum
+pricing. The actual two-socket Fabric can prepare these authenticated shadows,
+complete/drain them and reuse slots without changing live ownership. All 32
+focused registrations pass after the coherent build, including native MPI,
+CPU/GPU transfer controls and twenty-repeat contracts. See the
+[qualification scope](QFN_COHORT_MIGRATION_AND_MTP_ADMISSION_QUALIFICATION.md#complete-target-shadow-calibration-and-robust-measurements).
+
+The next native witness joins the existing controller, distributed transport,
+actual warmup/measurement waves and typed ledger. Whole-only certification and
+unresolved cohort layer expansion still reject cohort prices explicitly. Service
 measurement must cover the actual fragment computation through rooted combine
 and publication; local fragment durations omit that tail. Preserve one logical
-demand count and charge shared invocation work once. Complete-target ledger,
-composer, certification and publication remain required before enabling movement.
+demand count and charge shared invocation work once. Complete service pricing,
+certification and publication remain required before enabling movement.
 
 ## Required tests
 

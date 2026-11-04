@@ -10,6 +10,7 @@
 #include "execution/moe/MoEOverlayMigrationMeasurementExchange.h"
 #include "execution/moe/MoEOverlayMigrationMeasurementLedger.h"
 #include "utils/RecordedMigrationEvidence.h"
+#include "utils/RecordedTargetLedgerEvidence.h"
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <cstdlib>
@@ -117,5 +118,27 @@ TEST(MeasurementCompletionAllocations, DirectLedgerSingletonProjectionAllocatesN
     const auto after=ledger.stats();EXPECT_EQ(after.completed_waves_observed,before.completed_waves_observed);
     EXPECT_EQ(after.migration_observations_seen,before.migration_observations_seen);
     EXPECT_EQ(after.stored_migration_observations,before.stored_migration_observations);
+}
+}
+
+namespace llaminar2::test {
+TEST(MeasurementCompletionAllocations, TargetLedgerRecordsAndRejectsWithoutNestedAllocation) {
+    const auto declaration=recordedTargetLedgerDeclaration(2,3,ExpertWeightFormat::floating(TensorType::FP32));
+    MoEOverlayMigrationMeasurementLedger ledger({.required_target_measurements={declaration},.warmup_samples_per_coordinate=0,
+        .measurement_identity="target-completion-allocation"});
+    auto row=recordedTargetLedgerObservation(declaration,100,10);
+    const std::array<MoEOverlayBorrowedTargetMigrationObservation,1> view{{{declaration.coordinate,row}}};
+    allocations=0;counting=true;const bool accepted=ledger.recordCompletedTargetWave(view);counting=false;
+    const auto accepted_count=allocations;EXPECT_TRUE(accepted);EXPECT_EQ(accepted_count,0u);
+    const auto before=ledger.stats();row.piece_observations[0].observation.reset();
+    allocations=0;counting=true;const bool rejected=ledger.recordCompletedTargetWave(view);counting=false;
+    const auto rejected_count=allocations;EXPECT_FALSE(rejected);EXPECT_EQ(rejected_count,0u);
+    EXPECT_EQ(ledger.stats().stored_migration_observations,before.stored_migration_observations);
+    row=recordedTargetLedgerObservation(declaration,100,10);
+    ASSERT_TRUE(ledger.recordCompletedTargetWave(view));ASSERT_TRUE(ledger.recordCompletedTargetWave(view));
+    const auto sealed=ledger.seal();auto unquoted=declaration;unquoted.quoted_payload_bytes.clear();
+    MoEOverlayMigrationMeasurementLedger reuse({.required_target_measurements={unquoted},.measurement_identity="no-original-quotes"});
+    allocations=0;counting=true;const bool reused=reuse.matchesDeclarations(sealed);counting=false;
+    const auto reused_count=allocations;EXPECT_FALSE(reused);EXPECT_EQ(reused_count,0u);
 }
 }

@@ -5697,3 +5697,5 @@ namespace llaminar2::test
 #include "CPUJointPlacementTransactionContract.inc"
 
 #include "CPUJointAuthoritativeTargetContract.inc"
+
+#include "CPUJointCalibrationTargetContract.inc"

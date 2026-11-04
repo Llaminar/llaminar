@@ -14,6 +14,7 @@
 
 #include "MoEOverlayInferenceInterferenceProbe.h"
 #include "MoEOverlayMigrationMeasurementExchange.h"
+#include "MoEOverlayMigrationTargetCoordinate.h"
 
 #include <cstdint>
 #include <string>
@@ -33,7 +34,7 @@ namespace llaminar2
     struct MoEOverlayMigrationProfileEvidence
     {
         std::uint64_t profile_sequence = 0;
-        MoEOverlayMigrationMeasurementCoordinate coordinate;
+        MoEOverlayMigrationTargetCoordinate coordinate;
         std::vector<MoEOverlayCompletedMigrationMeasurement>
             local_measurements;
 
@@ -86,7 +87,7 @@ namespace llaminar2
     struct MoEOverlayCalibrationAttemptEvidence
     {
         std::uint64_t calibration_sequence = 0;
-        MoEOverlayMigrationMeasurementCoordinate coordinate;
+        MoEOverlayMigrationTargetCoordinate coordinate;
         ExpertHistogramSource source = ExpertHistogramSource::SyntheticTest;
         MoEOverlayInferenceWorkloadIdentity workload;
         std::uint64_t baseline_nanoseconds = 0;

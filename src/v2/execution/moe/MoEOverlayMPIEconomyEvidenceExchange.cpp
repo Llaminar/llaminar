@@ -45,13 +45,14 @@ namespace llaminar2
         struct EvidenceCountHeader
         {
             std::uint32_t magic = kAttemptMagic;
-            std::uint16_t version = 4;
+            std::uint16_t version = 5;
             std::uint16_t reserved = 0;
             std::int32_t world_rank = -1;
             std::int32_t world_size = 0;
             std::uint64_t calibration_sequence = 0;
-            std::int32_t first_participant = -1;
-            std::int32_t second_participant = -1;
+            /** Complete typed target words, never representative cohort members. */
+            std::int32_t first_target_word = -1;
+            std::int32_t second_target_word = -1;
             std::int32_t layer = -1;
             std::uint32_t source = 0;
             std::int32_t real_rows = 0;
@@ -418,11 +419,11 @@ namespace llaminar2
         void validateEvidenceHeader(const EvidenceCountHeader &wire,int rank) const
         {
             const auto &local=local_attempt;
-            if(wire.magic!=kAttemptMagic || wire.version!=4 || wire.reserved || wire.reserved_result ||
+            if(wire.magic!=kAttemptMagic || wire.version!=5 || wire.reserved || wire.reserved_result ||
                wire.world_rank!=rank || wire.world_size!=config.mpi_context->world_size() ||
                wire.packet_hash!=evidenceHeaderHash(wire) || !wire.packet_hash || wire.exact_overlap>1 ||
-               wire.calibration_sequence!=local.calibration_sequence || wire.first_participant!=local.first_participant ||
-               wire.second_participant!=local.second_participant || wire.layer!=local.layer ||
+               wire.calibration_sequence!=local.calibration_sequence || wire.first_target_word!=local.first_target_word ||
+               wire.second_target_word!=local.second_target_word || wire.layer!=local.layer ||
                wire.source!=local.source || wire.real_rows!=local.real_rows || wire.execution_rows!=local.execution_rows ||
                wire.transaction_count!=local.transaction_count || wire.speculative_depth!=local.speculative_depth ||
                wire.schedule_fingerprint!=local.schedule_fingerprint || wire.evidence_kind!=local.evidence_kind ||
@@ -659,8 +660,8 @@ namespace llaminar2
     {
         if(!local.valid()){++impl_->stats.rejected_packets;assignError(error,"Invalid original-context migration-profile evidence");return false;}
         EvidenceCountHeader wire{};wire.world_rank=impl_->config.mpi_context->rank();wire.world_size=worldSize();wire.evidence_kind=1;
-        wire.calibration_sequence=local.profile_sequence;wire.first_participant=local.coordinate.source_participant;
-        wire.second_participant=local.coordinate.destination_participant;wire.layer=local.coordinate.layer;
+        wire.calibration_sequence=local.profile_sequence;wire.first_target_word=local.coordinate.source_target.word();
+        wire.second_target_word=local.coordinate.destination_target.word();wire.layer=local.coordinate.layer;
         if(!impl_->beginEvidence(wire,local.context,local.local_measurements,Impl::Active::MigrationProfile,error))return false;
         ++impl_->stats.migration_profile_exchanges_started;impl_->record("mpi_economy_migration_profile_exchanges_started");return true;
     }
@@ -675,7 +676,8 @@ namespace llaminar2
             std::vector<MoEOverlayMigrationProfileEvidence> ranks;ranks.reserve(impl_->gathered_attempts.size());
             for(std::size_t rank=0;rank<impl_->gathered_attempts.size();++rank){const auto &wire=impl_->gathered_attempts[rank];
                 ranks.push_back({.profile_sequence=wire.calibration_sequence,
-                    .coordinate={wire.first_participant,wire.second_participant,wire.layer},
+                    .coordinate={MoEOverlayRouteTarget::fromWord(wire.first_target_word),
+                        MoEOverlayRouteTarget::fromWord(wire.second_target_word),wire.layer},
                     .local_measurements=impl_->decodeEvidence(rank),.context=impl_->evidence_context});
             }
             *result=MoEOverlayEconomyEvidenceMerger::mergeMigrationProfile(ranks);
@@ -689,8 +691,8 @@ namespace llaminar2
     {
         if(!local.valid()){++impl_->stats.rejected_packets;assignError(error,"Invalid original-context attempt evidence");return false;}
         EvidenceCountHeader wire{};wire.world_rank=impl_->config.mpi_context->rank();wire.world_size=worldSize();wire.evidence_kind=2;
-        wire.calibration_sequence=local.calibration_sequence;wire.first_participant=local.coordinate.source_participant;
-        wire.second_participant=local.coordinate.destination_participant;wire.layer=local.coordinate.layer;
+        wire.calibration_sequence=local.calibration_sequence;wire.first_target_word=local.coordinate.source_target.word();
+        wire.second_target_word=local.coordinate.destination_target.word();wire.layer=local.coordinate.layer;
         wire.source=static_cast<std::uint32_t>(local.source);wire.real_rows=local.workload.real_rows;
         wire.execution_rows=local.workload.execution_rows;wire.transaction_count=local.workload.transaction_count;
         wire.speculative_depth=local.workload.speculative_depth;wire.schedule_fingerprint=local.workload.schedule_fingerprint;
@@ -710,7 +712,8 @@ namespace llaminar2
             std::vector<MoEOverlayCalibrationAttemptEvidence> ranks;ranks.reserve(impl_->gathered_attempts.size());
             for(std::size_t rank=0;rank<impl_->gathered_attempts.size();++rank){const auto &wire=impl_->gathered_attempts[rank];
                 ranks.push_back({.calibration_sequence=wire.calibration_sequence,
-                    .coordinate={wire.first_participant,wire.second_participant,wire.layer},
+                    .coordinate={MoEOverlayRouteTarget::fromWord(wire.first_target_word),
+                        MoEOverlayRouteTarget::fromWord(wire.second_target_word),wire.layer},
                     .source=static_cast<ExpertHistogramSource>(wire.source),
                     .workload={.source=static_cast<ExpertHistogramSource>(wire.source),.real_rows=wire.real_rows,
                         .execution_rows=wire.execution_rows,.transaction_count=wire.transaction_count,

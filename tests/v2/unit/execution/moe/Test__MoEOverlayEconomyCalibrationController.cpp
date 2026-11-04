@@ -511,7 +511,7 @@ namespace llaminar2::test
         }
 
         /** @brief Complete robust physical row suitable for catalog expansion. */
-        MoEOverlayParticipantLayerMigrationMeasurement migrationRow(
+        MoEOverlayTargetLayerMigrationMeasurement migrationRow(
             int source,
             int destination,
             int layer)
@@ -533,7 +533,7 @@ namespace llaminar2::test
             }
             row.wave_wall_nanoseconds = 200;
             row.wave_sample_count = 3;
-            return row;
+            return MoEOverlayTargetLayerMigrationMeasurement::fromWhole(row);
         }
 
         /** @brief Complete production-owned profiler fixture. */
@@ -744,7 +744,7 @@ namespace llaminar2::test
         ASSERT_NE(sealed, nullptr);
         auto incompatible = *sealed;
         ASSERT_FALSE(incompatible.rows.empty());
-        ++incompatible.rows.front().layer;
+        ++incompatible.rows.front().coordinate.layer;
         ASSERT_TRUE(incompatible.valid());
 
         EXPECT_THROW(
@@ -760,11 +760,7 @@ namespace llaminar2::test
         MoEOverlayEconomyEvidenceMerger,
         MigrationProfileCompletesComplementaryRanksAndRejectsIdentityDrift)
     {
-        const MoEOverlayMigrationMeasurementCoordinate coordinate{
-            .source_participant = 0,
-            .destination_participant = 1,
-            .layer = 0,
-        };
+        const auto coordinate = recordedWholeMigrationCoordinate(0, 1, 0);
         MoEOverlayMigrationProfileEvidence rank_zero{
             .profile_sequence = 19,
             .coordinate = coordinate,
@@ -1460,8 +1456,8 @@ namespace llaminar2::test
             const auto expanded = catalog.expand(measurements);
             ASSERT_EQ(expanded.rows.size(), 6u);
             for (const auto &row : expanded.rows)
-                EXPECT_TRUE(row.layer >= first && row.layer < first + 3);
-            measurements.rows.front().layer = first + 3;
+                EXPECT_TRUE(row.coordinate.layer >= first && row.coordinate.layer < first + 3);
+            measurements.rows.front().coordinate.layer = first + 3;
             EXPECT_THROW((void)catalog.expand(measurements), std::invalid_argument);
         }
         const MoEOverlayEconomyCalibrationLayerCatalog left({layerManifest(32, 96, native_vnni_formats::Q4_0)});

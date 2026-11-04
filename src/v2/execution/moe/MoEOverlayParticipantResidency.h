@@ -44,6 +44,7 @@ namespace llaminar2
     class ITensorGemm;
     class MoEOverlayPreparedExpertArrival;
     struct MoEOverlayResidencySnapshot;
+    struct MoEOverlayResidencyTransaction;
 
     /**
      * @brief Coherent raw service totals for one participant/layer coordinate.
@@ -1005,6 +1006,19 @@ namespace llaminar2
         std::shared_ptr<MoEOverlayPreparedExpertArrival> prepareCPUJointArrival(
             const MoEOverlayResidencySnapshot& candidate,int participant_id,int layer_idx,int expert_id,
             std::string* error=nullptr) const;
+        /**
+         * @brief Issue an unready CPU fragment destination for a genuine shadow calibration edge.
+         * @param transaction Original validated unpublishable EconomyCalibration transaction.
+         * @param migration_index Exact logical edge in that original transaction.
+         * @param participant_id Original local destination member, never a scalar cohort alias.
+         * @param error Optional source/family/edge rejection diagnostic.
+         * @return Unready arrival with actual fixed geometry, or null on rejection.
+         * @note This does not assign live ownership, install a bank or publish an epoch.
+         */
+        std::shared_ptr<MoEOverlayPreparedExpertArrival> prepareCPUJointCalibrationArrival(
+            const MoEOverlayResidencyTransaction &transaction, std::size_t migration_index,
+            int participant_id, std::string *error = nullptr) const;
+
         /**
          * @brief Issue an unready arrival from an exact installed fragment-bank borrow.
          * @param bank Retained original endpoint node; caller keeps this borrow through copy/drain.

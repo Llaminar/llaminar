@@ -24,11 +24,13 @@ auto liveMPIContext(int members,bool empty_rank_one) {
     auto a=recordedMigrationTarget(1,0,0,0);
     auto b=recordedMigrationTarget(members,empty_rank_one?1:2,empty_rank_one?1:2,empty_rank_one?0:1);
     if(empty_rank_one){b.members[0].device=DeviceId::cpu();b.members[0].address=GlobalDeviceAddress::cpu(1);}
+    if(members>1)std::swap(a,b); // Same canonical typed-target order used by calibration.
     const auto format=ExpertWeightFormat::floating(TensorType::FP32);
     const auto forward=MoEOverlayMigrationMeasurementGeometry::checked({a,b},{format,format,format});
     const auto reverse=MoEOverlayMigrationMeasurementGeometry::checked({b,a},{format,format,format});
-    const int owner=members==1?b.members.front().participant_id:-1;
-    return MoEOverlayMigrationEvidenceContext::checked({{1,2,0,owner,0,0,forward},{1,2,owner,0,0,1,reverse}},
+    const int source=a.members.size()==1?a.members.front().participant_id:-1;
+    const int destination=b.members.size()==1?b.members.front().participant_id:-1;
+    return MoEOverlayMigrationEvidenceContext::checked({{1,2,source,destination,0,0,forward},{1,2,destination,source,0,1,reverse}},
         MoEOverlayResidencyTransactionPurpose::EconomyCalibration);
 }
 /** @brief Supply all and only the original endpoint's recorded observations. */
@@ -66,8 +68,12 @@ TEST(Test__MoEOverlayMPIResidencyConsensus, LiveEconomyEvidenceCountsPayloadAndE
         std::size_t global_bytes=0;for(int rank=0;rank<2;++rank)global_bytes+=MoEOverlayEconomyEvidenceCodec::maximumEncodedBytes(*context,rank);
         if(empty&&mpi->rank()==1)EXPECT_EQ(local_bytes,0u);
         const auto before=exchange.stats();
+        const auto coordinate=members==1
+            ? recordedWholeMigrationCoordinate(0,empty?1:2,0)
+            : MoEOverlayMigrationTargetCoordinate{
+                MoEOverlayRouteTarget::cpuCohort(2),MoEOverlayRouteTarget::whole(0),0};
         MoEOverlayMigrationProfileEvidence profile{.profile_sequence=sequence++,
-            .coordinate={0,empty?1:2,0},.local_measurements=rows,.context=context};
+            .coordinate=coordinate,.local_measurements=rows,.context=context};
         std::string error;ASSERT_TRUE(exchange.beginMigrationProfile(profile,&error))<<error;
         const auto merged=finishLiveProfile(exchange);ASSERT_TRUE(merged.valid());ASSERT_TRUE(exchange.idle());
         const auto after=exchange.stats();

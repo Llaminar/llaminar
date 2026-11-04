@@ -1504,11 +1504,7 @@ namespace llaminar2::test
         {
             MoEOverlayCalibrationAttemptEvidence result{
                 .calibration_sequence = 41,
-                .coordinate = {
-                    .source_participant = 0,
-                    .destination_participant = 1,
-                    .layer = 0,
-                },
+                .coordinate = recordedWholeMigrationCoordinate(0,1,0),
                 .source = ExpertHistogramSource::GroupedVerifier,
                 .workload = {
                     .source = ExpertHistogramSource::GroupedVerifier,

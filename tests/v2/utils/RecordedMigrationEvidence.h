@@ -8,8 +8,18 @@
  */
 #pragma once
 #include "execution/moe/MoEOverlayMigrationEvidenceContext.h"
+#include "execution/moe/MoEOverlayMigrationTargetCoordinate.h"
 #include "execution/moe/ExpertTierWeightStream.h"
 namespace llaminar2::test {
+/**
+ * @brief Declare a whole-owner protocol coordinate without a cohort alias.
+ * @param source Original whole participant. @param destination Original whole participant.
+ * @param layer Original model-global layer. @return Typed recorded whole-target identity.
+ */
+inline auto recordedWholeMigrationCoordinate(int source, int destination, int layer) {
+    return MoEOverlayMigrationTargetCoordinate{
+        MoEOverlayRouteTarget::whole(source), MoEOverlayRouteTarget::whole(destination), layer};
+}
 /** @brief Build a complete recorded target using equal original cuts.
  * @param members Participant count. @param first_id First canonical participant ID.
  * @param tier Recorded tier index. @param rank Actual observer rank assigned to this target.

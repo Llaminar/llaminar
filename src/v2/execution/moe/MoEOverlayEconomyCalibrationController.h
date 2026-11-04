@@ -177,13 +177,13 @@ namespace llaminar2
         /** @brief One reciprocal physical endpoint pair at one weight geometry. */
         struct PairJob
         {
-            int first_participant = -1;
-            int second_participant = -1;
+            MoEOverlayRouteTarget first_target;
+            MoEOverlayRouteTarget second_target;
             int layer = -1;
         };
 
         /** @return Stable directed coordinate naming the current reciprocal job. */
-        [[nodiscard]] MoEOverlayMigrationMeasurementCoordinate
+        [[nodiscard]] MoEOverlayMigrationTargetCoordinate
         currentCoordinate() const noexcept;
 
         /** @brief Reserve and launch the next reversible production transfer. */

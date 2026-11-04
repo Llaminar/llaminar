@@ -2,10 +2,10 @@
  * @file MoEOverlayEconomyCalibrationPlanner.h
  * @brief Deterministic non-publishable swap waves for migration calibration.
  *
- * Every directed participant edge must be measured with real prepared model
+ * Every directed complete-target edge must be measured with real prepared model
  * weights and the production physical fabric before economic placement can be
  * certified.  A calibration wave copies one resident expert in each direction
- * between two participants, preserving shadow capacity as a closed cycle.  It
+ * between two original whole/cohort targets, preserving shadow capacity as a closed cycle.  It
  * retains the live residency snapshot unchanged and is typed so neither the
  * transport nor the residency authority can commit it.
  */
@@ -13,6 +13,7 @@
 #pragma once
 
 #include "MoEOverlayMigrationMeasurementLedger.h"
+#include "MoEOverlayMigrationTargetCoordinate.h"
 #include "MoEOverlayPhysicalResidencyFabric.h"
 #include "MoEOverlayParticipantResidency.h"
 #include "MoEOverlayResidencyAuthority.h"
@@ -265,21 +266,39 @@ namespace llaminar2
         /**
          * @brief Validate source availability and retain one immutable epoch.
          * @param config Live snapshot plus one positive byte footprint per layer.
-         * @throws std::invalid_argument When any participant/layer has no source
+         * @throws std::invalid_argument When any admitted target/layer has no source
          *         expert or the model geometry/byte contract is incomplete.
          */
         explicit MoEOverlayEconomyCalibrationPlanner(Config config);
 
-        /** @return Every ordered participant pair/layer in canonical order. */
-        [[nodiscard]] const std::vector<
-            MoEOverlayMigrationMeasurementCoordinate> &
-        requiredCoordinates() const noexcept
-        {
-            return required_coordinates_;
-        }
+        /** @return The single canonical directed complete-target/layer planning list. */
+        [[nodiscard]] const std::vector<MoEOverlayMigrationTargetCoordinate> &
+        requiredTargetCoordinates() const noexcept { return required_target_coordinates_; }
 
         /**
-         * @brief Build one closed bidirectional shadow-copy calibration wave.
+         * @brief Project the canonical list for existing whole-owner evidence consumers.
+         * @return Whole participant/layer coordinates in historical order.
+         * @throws std::logic_error If any coordinate is a cohort; no member substitutes for it.
+         * @note This checked adapter is retired when shared consumers migrate to typed targets.
+         * No second planning list is retained.
+         */
+        [[nodiscard]] std::vector<MoEOverlayMigrationMeasurementCoordinate> requiredCoordinates() const;
+
+        /**
+         * @brief Build the same reciprocal shadow wave for complete original targets.
+         * @param source_target Original whole participant or fixed cohort tag.
+         * @param destination_target Different complete target retained by the live snapshot.
+         * @param layer Global source layer selected by the original calibration catalog.
+         * @param calibration_sequence Positive unique sample identity.
+         * @return Genuine source-bound, non-publishable calibration transaction.
+         * @throws std::invalid_argument For an absent/foreign/member alias or unavailable source.
+         */
+        [[nodiscard]] MoEOverlayResidencyTransaction buildPairSwap(
+            MoEOverlayRouteTarget source_target, MoEOverlayRouteTarget destination_target,
+            int layer, std::uint64_t calibration_sequence) const;
+
+        /**
+         * @brief Checked whole-owner adapter forwarding to the complete-target shadow builder.
          * @param source_participant First endpoint in the pair.
          * @param destination_participant Second endpoint in the pair.
          * @param layer Exact model layer whose prepared geometry is exercised.
@@ -295,10 +314,14 @@ namespace llaminar2
             std::uint64_t calibration_sequence) const;
 
     private:
-        /** @brief Rebind one expert identity to a destination participant. */
-        [[nodiscard]] MoEExpertOwner destinationOwner(
-            const MoEExpertOwner &source,
-            int destination_participant) const;
+        /**
+         * @brief Resolve one original resident expert without inventing source geometry.
+         * @param target Checked route alternative, never a scalar cohort member.
+         * @param layer Original model-global layer.
+         * @return First canonical source expert at the complete original target.
+         * @throws std::invalid_argument For foreign/absent/empty targets.
+         */
+        [[nodiscard]] const MoEExpertOwner &sourceOwner(MoEOverlayRouteTarget target, int layer) const;
 
         /** @brief Classify movement solely through configured integer priority. */
         [[nodiscard]] MoEOverlayTierMigrationDirection direction(
@@ -307,7 +330,6 @@ namespace llaminar2
 
         Config config_;
         std::vector<int> calibration_layers_;
-        std::vector<MoEOverlayMigrationMeasurementCoordinate>
-            required_coordinates_;
+        std::vector<MoEOverlayMigrationTargetCoordinate> required_target_coordinates_;
     };
 } // namespace llaminar2

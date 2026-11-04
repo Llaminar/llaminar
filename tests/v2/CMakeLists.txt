@@ -19338,7 +19338,7 @@ target_link_libraries(v2_integration_moe_overlay_residency_consensus_mpi
 )
 add_v2_test(V2_Integration_MoEOverlayResidencyConsensus_MPI
     COMMAND $<TARGET_FILE:v2_integration_moe_overlay_residency_consensus_mpi>
-        --gtest_filter=-MoEOverlayCPUCohortFabric.*:MoEOverlayGPUCPUCohortFabric.*:MoEOverlayCPUCohortMeasurement.*
+        --gtest_filter=-MoEOverlayCPUCohortFabric.*:MoEOverlayGPUCPUCohortFabric.*:MoEOverlayCPUCohortMeasurement.*:MoEOverlayCPUJointCalibration.*
     LABELS "V2;Integration;CPU;MoE;Overlay;Residency;Async;TypedLifecycle;MPI;PerfStats;ByteExact;NoBlocking"
     MPI_PROCS 2
     TIMEOUT 60

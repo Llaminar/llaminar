@@ -264,4 +264,72 @@ add_v2_test(V2_Integration_MoEOverlayCalibrationCoordinateIdentity
     ENVIRONMENT "${V2_CPU_FRAGMENT_TEST_ENV}")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOverlayCalibrationCoordinateIdentity)
 
+add_v2_test(V2_Integration_MoEOverlayCompleteTargetEvidenceIdentity
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_migration_measurement_ledger>
+        --gtest_filter=LiveEconomyEvidenceCodec.CompleteCohortIdentityRejectsRepresentativeMemberAlias
+        --gtest_repeat=20 --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;ExpertOverlay;Measurement;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "${V2_CPU_FRAGMENT_TEST_ENV}")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOverlayCompleteTargetEvidenceIdentity)
+
+# Append to late V2CPUFragmentResidencyTests.cmake before its environment unset.
+# Source-bound metadata/unsupported-consumer contract; no physical readiness claim.
+add_v2_test(V2_Integration_CPUJointCalibrationTargetContract
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_residency_authority>
+        --gtest_filter=CPUJointCalibrationTargetContract.*
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;ExpertOverlay;Economy;Calibration;Contract;SourceBinding;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "${V2_CPU_FRAGMENT_TEST_ENV}")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUJointCalibrationTargetContract)
+
+# Genuine complete CPU-target shadow calibration; one MPI rank per physical socket.
+if(V2_TEST_SOCKETS AND V2_TEST_SOCKETS GREATER_EQUAL 2)
+    add_v2_test(V2_Integration_CPUJointShadowCalibrationPhysicalFabric
+        COMMAND $<TARGET_FILE:v2_integration_moe_overlay_residency_consensus_mpi>
+            --gtest_filter=MoEOverlayCPUJointCalibration.RealTwoSocketShadowWaveNeverPublishesPlacement
+            --gtest_repeat=20 --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;MoE;MPI;Residency;Transfer;Calibration;Measurement;Lifecycle;Contract"
+        MPI_PROCS 2 NO_MODELS TIMEOUT 120
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1"
+            "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUJointShadowCalibrationPhysicalFabric)
+else()
+    message(STATUS "CPU joint shadow calibration: unqualified without two physical sockets; no MPI launch")
+endif()
+
+# Append within the existing V2CPUFragmentResidencyTests scope, before its CPU environment is unset.
+add_v2_test(V2_Integration_MoEOverlayCompleteTargetLedger
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_migration_measurement_ledger>
+        --gtest_filter=TargetMigrationLedger.* --gtest_repeat=20 --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;ExpertOverlay;Measurement;Ownership;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "${V2_CPU_FRAGMENT_TEST_ENV}")
+add_v2_test(V2_Integration_MoEOverlayCompleteTargetNormalization
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_economy_profile_composer>
+        --gtest_filter=TargetMigrationNormalization.* --gtest_repeat=20 --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;ExpertOverlay;Measurement;Economy;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "${V2_CPU_FRAGMENT_TEST_ENV}")
+add_v2_test(V2_Integration_MoEOverlayCompleteTargetCompletionAllocations
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_measurement_completion_allocations>
+        --gtest_filter=MeasurementCompletionAllocations.TargetLedgerRecordsAndRejectsWithoutNestedAllocation
+        --gtest_repeat=20 --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;ExpertOverlay;Measurement;Ownership;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "${V2_CPU_FRAGMENT_TEST_ENV}")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_MoEOverlayCompleteTargetLedger
+    V2_Integration_MoEOverlayCompleteTargetNormalization
+    V2_Integration_MoEOverlayCompleteTargetCompletionAllocations)
+
+add_v2_test(V2_Integration_MoEOverlayCompleteTargetCardinalityIdentity
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_economy_profile_composer>
+        --gtest_filter=TargetMigrationNormalization.CompleteTargetIdentityRejectsSingletonAndMemberAliases
+        --gtest_repeat=20 --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;ExpertOverlay;Measurement;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "${V2_CPU_FRAGMENT_TEST_ENV}")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOverlayCompleteTargetCardinalityIdentity)
+
 unset(V2_CPU_FRAGMENT_TEST_ENV)

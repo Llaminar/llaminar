@@ -9,6 +9,8 @@
  * Cold producer binding authenticates the original context/manager once;
  * weak retained ownership avoids cycles, while scoped source uses protect only
  * active preparation. Existing bank leases retain their own physical engines.
+ * Shadow calibration arrivals authenticate the original complete-target edge
+ * without assigning its incoming expert to the unchanged live placement.
  * Cold diagnostics inspect the existing retired chain under its writer mutex;
  * published-slot count is distinct from readers pinning an unpublished node.
  */
@@ -1785,6 +1787,68 @@ namespace llaminar2
             return std::shared_ptr<MoEOverlayPreparedExpertArrival>(new MoEOverlayPreparedExpertArrival(
                 config_.original_model,original->preparation(),family->cohort(),family->participantIndex(),candidate.epoch,expert));
         } catch(const std::exception& exception) {if(error)*error=exception.what();return {};}
+    }
+
+    std::shared_ptr<MoEOverlayPreparedExpertArrival>
+    MoEOverlayParticipantResidencyRegistry::prepareCPUJointCalibrationArrival(
+        const MoEOverlayResidencyTransaction &transaction, std::size_t migration_index,
+        int id, std::string *error) const
+    {
+        if (error) error->clear();
+        const auto reject = [&](const char *reason) -> std::shared_ptr<MoEOverlayPreparedExpertArrival>
+        { if (error) *error = reason; return {}; };
+        // Only the closed authority-produced calibration transaction can name
+        // a nonresident shadow destination while retaining unchanged live owners.
+        if (transaction.purpose != MoEOverlayResidencyTransactionPurpose::EconomyCalibration ||
+            !transaction.valid() || migration_index >= transaction.migrations.size())
+            return reject("CPU fragment shadow arrival requires a genuine calibration transaction and edge");
+        auto original = acquireOriginalPreparedSource(error);
+        if (!original) return {};
+        const auto &preparation = config_.projection_preparation;
+        const auto same_preparation = [&](const auto &value)
+        { return value && value.get() == preparation.get() &&
+                 !value.owner_before(preparation) && !preparation.owner_before(value); };
+        if (!same_preparation(original->preparation()) ||
+            !same_preparation(transaction.previous->originalProjectionPreparation()) ||
+            !same_preparation(transaction.candidate->originalProjectionPreparation()))
+            return reject("CPU fragment calibration changed the original prepared source owner");
+        const auto &edge = transaction.migrations[migration_index];
+        const int layer = edge.layer_idx, expert = edge.expert_id;
+        if (!edge.destination.shard_cohort || layer < config_.first_model_layer ||
+            layer - config_.first_model_layer >= config_.num_layers || expert < 0 || expert >= config_.num_experts)
+            return reject("CPU fragment calibration has a foreign destination layer or expert");
+        try
+        {
+            const auto *selected = transaction.previous->placementOwnerMap().participantForId(id);
+            const auto *initial = initialOwnerMap().participantForId(id);
+            if (!selected || !initial || !(*selected == *initial))
+                return reject("CPU fragment calibration changed the original participant");
+            std::shared_lock lock(mutex_);
+            const auto found = endpoints_.find(id);
+            if (found == endpoints_.end() || !found->second.joint_layers || !found->second.endpoint)
+                return reject("CPU fragment calibration has no original local RCU endpoint");
+            auto bank = found->second.endpoint->acquire(transaction.expected_epoch);
+            if (!bank || !bank->containsModelLayer(layer))
+                return reject("CPU fragment calibration lost its original installed epoch");
+            const auto &family = bank->layerForModelLayer(layer).cpu_fragment_family;
+            const auto &cohort = edge.destination.shard_cohort;
+            if (!family || !family->cohort() || family->cohort().get() != cohort.get() ||
+                family->cohort().owner_before(cohort) || cohort.owner_before(family->cohort()) ||
+                family->model() != config_.original_model || !same_preparation(family->preparation()))
+                return reject("CPU fragment calibration changed the original fixed family or model");
+            const auto members = cohort->participants();
+            const auto member = family->participantIndex();
+            if (member >= members.size() || members[member].participant_id != id ||
+                members[member].world_rank != selected->world_rank || members[member].address != selected->address)
+                return reject("CPU fragment calibration has a foreign original cohort member");
+            // The genuine transaction validator authenticates this complete
+            // original destination target. The live bank intentionally does NOT
+            // own the incoming expert; no resident bit or source selection changes.
+            return std::shared_ptr<MoEOverlayPreparedExpertArrival>(new MoEOverlayPreparedExpertArrival(
+                config_.original_model, original->preparation(), cohort, member, transaction.candidate->epoch, expert));
+        }
+        catch (const std::exception &exception)
+        { if (error) *error = exception.what(); return {}; }
     }
 
     std::shared_ptr<MoEOverlayPreparedExpertArrival>

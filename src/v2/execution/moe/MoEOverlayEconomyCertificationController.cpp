@@ -715,9 +715,12 @@ namespace llaminar2
                     std::move(raw_service),
                     config_.production_topology,
                     *config_.layer_catalog);
+        // Service certification still requires complete whole-participant costs.
+        // Typed cohort rows cannot be priced as one representative member.
         measurements.directed_migration =
-            MoEOverlayEconomyProfileComposer::normalizeMigrationMeasurements(
-                expanded_migration_measurements_->rows);
+            MoEOverlayEconomyProfileComposer::checkedWholeMigrationCosts(
+                MoEOverlayEconomyProfileComposer::normalizeMigrationMeasurements(
+                    expanded_migration_measurements_->rows));
 
         const auto snapshot = config_.authority->snapshot();
         if (!snapshot || !snapshot->valid() || !snapshot->placement_plan)

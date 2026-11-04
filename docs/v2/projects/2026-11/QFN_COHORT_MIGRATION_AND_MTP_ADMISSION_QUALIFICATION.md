@@ -521,6 +521,60 @@ endpoint and layer matrices with the original body, twenty times. After build222
 no skips and a clean driver window. Reordered equivalent input remains valid
 through the existing ledger normalization; no timing or numerical limit changes.
 
+## Complete-target shadow calibration and robust measurements
+
+The same calibration planner now retains one canonical typed whole/cohort target
+list. Its integer interface is a checked whole-only projection. Genuine
+`EconomyCalibration` transactions retain the original unchanged placement,
+prepared source and fixed cohort owners at a private shadow epoch; each logical
+edge expands only into its required physical member slots. Metadata contracts
+cover widths two through eight, unequal two/three-member cohorts, zero-quota
+rejection, original controls, missing members and attempts to publish shadows.
+These wider declarations are not native four/eight-socket qualification.
+
+The existing measurement ledger now uses one bounded piece/sample store for
+whole and cohort targets. Completion validates the entire wave before mutation
+and allocates no nested storage. Sealing retains every original cut, source
+format, operation quote and robust sample. Pricing preserves the maximum of the
+whole-wave median and individual piece medians; it never adds concurrent shard
+or projection durations. Imported cohort samples require the original setup-bound
+piece quotes. Whole-only certification and unresolved cohort layer expansion
+continue to reject cohort inputs. The same MPI exchange carries typed target
+words in evidence version 5; readiness/service retain their existing version 3.
+A focused regression rejects both a cohort represented by one member and a whole
+CPU owner relabeled as a one-member cohort; canonical CPU cohorts require 2–8
+members, while TP1 remains a whole target.
+
+The registry now has a purpose-specific unready shadow-arrival producer. It
+requires the genuine original calibration transaction, prepared model/source
+control blocks, installed source epoch and fixed cohort family/member. The normal
+arrival producer still requires candidate live ownership. The Fabric borrows the
+original transaction only during preparation, then uses its existing physical
+operations, source leases, PMA slots, MPI transport, acknowledgements and drain.
+The actual two-socket public factory/composite/journal regression completes twelve
+pieces for two logical rows, rejects prepare/publication, drains, and reuses the
+same slots for a second genuine wave checked against destination bytes and the
+existing CPU GEMM oracle. Expired source admission rejects and final physical
+claims return to zero. This proves physical calibration with actual FP32 sources,
+not native execution of every recorded format or complete controller calibration.
+
+Build224 coherently rebuilt ten owning targets. `focused225` collected every
+failure: 29/32 passed; the new unequal-cohort fixture accidentally copied the
+capacity-tier flag twice, and two old ledger tests exposed changed diagnostic
+wording. The fixture now declares one final capacity tier with unchanged 1/3/3
+quotas; ledger diagnostics again distinguish sealed state, partial observations
+and changing bytes. After build226, `focused227` passes all 32 registrations in
+18.92 seconds, with no skips and a clean driver window. The native shadow,
+exact-live MPI and focused ledger/normalization/identity/allocation entries include
+twenty repetitions. All 271 observed temporary model paths are retired after
+both runs. Full production preflight was not rerun.
+
+The next native witness drives the existing controller through its warmup and
+three actual measured waves with the same distributed transport and typed ledger.
+Complete cohort service/rooted-return pricing and changed-epoch
+publication/inference remain open. No model arithmetic, KL limit, serving-time
+Dynamic cohort guard or Release performance claim changes in this slice.
+
 ## Shared histogram candidate construction
 
 The existing histogram proposal now uses one candidate-construction boundary
