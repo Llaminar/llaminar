@@ -74,6 +74,26 @@ public:
         const ActivationGraphMemoryGeometry &geometry, DeviceId device);
 
     /**
+     * @brief Resolve the production schema's physical roots for any allocator.
+     * @details The one schema/formula projection behind declareCPUStorage()
+     * and device admission of schema-priced models (DeepSeek-V4).
+     */
+    static GraphArenaStorageLayout declareSchemaStorage(const ModelMemoryProfile &profile,
+        const ActivationGraphMemoryGeometry &geometry, DeviceId device);
+
+    /**
+     * @brief Exact GPU graph-arena bytes of a DeepSeek-V4 participant.
+     * @details Sums the same resolved roots the orchestrator registers,
+     * including every DeepSeek-V4 state bank (packed window ring, FP32
+     * compressor state, packed compressed/indexer pools, bounded indexer
+     * scratch), plus request seeds. Cross-checks the declared DeepSeek-V4
+     * roots against deepSeekV4ArenaExtensionBytes(); its canonical cache owns
+     * no KV payload, so these banks are charged exactly once.
+     */
+    static std::size_t deepSeekV4DeviceArenaBytes(const ModelMemoryProfile &profile,
+        const ActivationGraphMemoryGeometry &geometry, DeviceId device);
+
+    /**
      * @brief Price only tier-specific PLE arena roles using the canonical declaration inventory.
      * @param profile Exact source metadata.
      * @param geometry Frozen graph envelope with concrete ngram_lookup.

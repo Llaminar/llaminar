@@ -447,6 +447,7 @@ namespace llaminar2
         DEEPSEEK_V4_SPARSE_ATTENTION,
         DEEPSEEK_V4_GROUPED_PROJECTION,
         DEEPSEEK_V4_ROUTE,
+        DEEPSEEK_V4_SEQUENCE_FRONTIER, ///< Terminal-layer publication of the cache sequence frontier
 
         // GDN (Gated Delta Network) stages
         ATTENTION_OUTPUT_GATE, ///< Sigmoid gate on attention output

@@ -5,17 +5,21 @@
  *
  * Every kernel distributes independent rows (or row x head tasks) through
  * nested-safe OpenMP worksharing; per-row arithmetic is sequential and fixed,
- * so results do not depend on worker count. No kernel allocates on the heap
- * except bounded per-task stack/scratch vectors in the indexer and attention,
- * which hold at most (window + topK or visible blocks) scalars per task.
+ * so results do not depend on worker count. Persistent attention state is
+ * read from and written to packed records (DeepSeekV4KVFormat.h); the
+ * current chunk's projections are read from its scratch, so only O(window)
+ * raw rows and O(ratio) compressor state persist besides the pools. The
+ * only heap use is the indexer's per-row (visible blocks) score vector.
  */
 #include "../../deepseek4/DeepSeekV4Kernels.h"
 #include "../../deepseek4/DeepSeekV4Math.h"
 #include "../../../utils/OpenMPUtils.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -52,8 +56,55 @@ void forTasks(int count, Function function)
     OMP_WORKSHARE_REGION(work);
 }
 
-/** @brief Ring slot of an absolute position. */
-inline int slotOf(int position, int ringRows) { return position % ringRows; }
+/**
+ * @brief First position of a chunk whose live rows carry contiguous positions.
+ * @details Chunk-scratch readers address position p as row p - start; any
+ * other row/position mapping is a fatal graph-construction defect.
+ */
+int contiguousStart(const std::int32_t *positions, int rows)
+{
+    const int start = positions[0];
+    require(start >= 0, "positions must be non-negative");
+    for (int r = 1; r < rows; ++r) require(positions[r] == start + r, "chunk positions must be contiguous");
+    return start;
+}
+
+/** @brief Validate a quantization post-operation against the head geometry. */
+void requireQuant(ActivationQuant quant, int headDim, int ropeDim)
+{
+    if (quant == ActivationQuant::FP8NopeBF16Rope)
+        require(PackedKVEntryFormat{headDim, ropeDim}.valid(), "FP8 QAT requires nope width divisible by 64");
+    else if (quant == ActivationQuant::HadamardFP4)
+        require(PackedIndexerKeyFormat{headDim}.valid(), "Hadamard FP4 QAT requires a power-of-two width >= 32");
+}
+
+/** @brief Exact E4M3 decode table (256 codes). */
+const float *e4m3Table()
+{
+    static const auto table = [] {
+        std::array<float, 256> values{};
+        for (int code = 0; code < 256; ++code) values[code] = qat::decodeE4M3(static_cast<std::uint8_t>(code));
+        return values;
+    }();
+    return table.data();
+}
+
+/** @brief Decode one packed KV record into @p out (exactly qat::decodeKVChannel for every channel). */
+void decodeKVEntry(const PackedKVEntryFormat &format, const std::uint8_t *entry, float *out)
+{
+    const float *table = e4m3Table();
+    const int nope = format.nopeDim();
+    for (int b = 0; b < format.scaleCount(); ++b)
+    {
+        const float scale = qat::exp2i(static_cast<int>(entry[format.scaleOffset() + b]) - 127);
+        for (int i = b * kFP8BlockSize; i < (b + 1) * kFP8BlockSize; ++i) out[i] = table[entry[i]] * scale;
+    }
+    for (int c = 0; c < format.ropeDim; ++c)
+    {
+        const int at = format.ropeOffset() + 2 * c;
+        out[nope + c] = qat::decodeBF16(static_cast<std::uint16_t>(entry[at] | (entry[at + 1] << 8)));
+    }
+}
 
 class CPUDeepSeekV4Kernels final : public IDeepSeekV4Kernels
 {
@@ -145,6 +196,7 @@ public:
         require(a.data && (a.positions || a.rope.ropeDim == 0) && a.headDim >= a.rope.ropeDim &&
                     a.rope.ropeDim % 2 == 0,
                 "headNormRope requires data, positions (when rotating) and headDim >= ropeDim");
+        requireQuant(a.quant, a.headDim, a.rope.ropeDim);
         const int rows = liveRows(a.extent);
         forTasks(rows * a.heads, [&](int task) {
             const int r = task / a.heads;
@@ -157,26 +209,33 @@ public:
                 for (int d = 0; d < a.headDim; ++d) v[d] = v[d] * inv * (a.gain ? a.gain[d] : 1.0f);
             }
             if (a.rope.ropeDim > 0) rotateTail(v, a.headDim, a.rope, a.positions[r], a.inverse);
+            qat::apply(a.quant, v, a.headDim, a.rope.ropeDim);
         });
     }
 
     void compressorStore(const CompressorStoreArgs &a, void *) const override
     {
         const auto &g = a.geometry;
-        require(a.positions && a.kv && a.score && a.ape && a.ringKV && a.ringScore && g.ringRows > 0,
-                "compressorStore requires positions, projections, ape and rings");
+        require(a.positions && a.kv && a.score && a.ape && a.stateKV && a.stateScore,
+                "compressorStore requires positions, projections, ape and state");
         const int rows = liveRows(a.extent);
+        if (rows == 0) return;
+        const int start = contiguousStart(a.positions, rows);
         const int width = g.projectionWidth();
+        const int states = g.stateRows();
+        const int last = start + rows - 1;
+        // Only the final stateRows() positions survive; each slot has one writer.
         forTasks(rows, [&](int r) {
-            const int pos = a.positions[r];
-            const std::size_t slot = static_cast<std::size_t>(slotOf(pos, g.ringRows)) * width;
+            const int pos = start + r;
+            if (pos <= last - states) return;
+            const std::size_t slot = static_cast<std::size_t>(pos % states) * width;
             const float *kv = a.kv + static_cast<std::size_t>(r) * width;
             const float *sc = a.score + static_cast<std::size_t>(r) * width;
             const float *ape = a.ape + static_cast<std::size_t>(pos % g.ratio) * width;
             for (int c = 0; c < width; ++c)
             {
-                a.ringKV[slot + c] = kv[c];
-                a.ringScore[slot + c] = sc[c] + ape[c];
+                a.stateKV[slot + c] = kv[c];
+                a.stateScore[slot + c] = sc[c] + ape[c];
             }
         });
     }
@@ -184,29 +243,47 @@ public:
     void compressorPool(const CompressorPoolArgs &a, void *) const override
     {
         const auto &g = a.geometry;
-        require(a.positions && a.ringKV && a.ringScore && a.gain && a.pool, "compressorPool requires operands");
+        require(a.positions && a.kv && a.score && a.ape && a.stateKV && a.stateScore && a.gain && a.pool,
+                "compressorPool requires operands");
+        require(g.headDim <= kMaxHeadDim && (g.stream == CompressedStream::Indexer
+                    ? PackedIndexerKeyFormat{g.headDim}.valid()
+                    : PackedKVEntryFormat{g.headDim, g.ropeDim}.valid() && g.ropeDim == a.rope.ropeDim),
+                "compressorPool record geometry is not representable");
         const int rows = liveRows(a.extent);
+        if (rows == 0) return;
+        const int start = contiguousStart(a.positions, rows);
         const int width = g.projectionWidth();
+        const int states = g.stateRows();
         const int d = g.headDim;
+        const std::size_t entryBytes = static_cast<std::size_t>(g.entryBytes());
+        // Projection of position p: the chunk scratch, else the carried state.
+        const auto kvAt = [&](int p, int channel) {
+            return p >= start ? a.kv[static_cast<std::size_t>(p - start) * width + channel]
+                              : a.stateKV[static_cast<std::size_t>(p % states) * width + channel];
+        };
+        const auto scoreAt = [&](int p, int channel) {
+            return p >= start ? a.score[static_cast<std::size_t>(p - start) * width + channel] +
+                                    a.ape[static_cast<std::size_t>(p % g.ratio) * width + channel]
+                              : a.stateScore[static_cast<std::size_t>(p % states) * width + channel];
+        };
         forTasks(rows, [&](int r) {
-            const int pos = a.positions[r];
+            const int pos = start + r;
             if ((pos + 1) % g.ratio != 0) return;
             const int block = pos / g.ratio;
             require(block < g.poolRows, "compressed pool capacity exceeded");
-            float *out = a.pool + static_cast<std::size_t>(block) * d;
+            float out[kMaxHeadDim];
             const int first = block * g.ratio;
+            const int entries = g.overlap() ? 2 * g.ratio : g.ratio;
             for (int c = 0; c < d; ++c)
             {
                 // Entries: [previous block, first half] (overlap) then [this block, own half].
                 float m = -std::numeric_limits<float>::infinity();
-                const int entries = g.overlap() ? 2 * g.ratio : g.ratio;
                 for (int e = 0; e < entries; ++e)
                 {
                     const bool prev = g.overlap() && e < g.ratio;
                     const int p = prev ? first - g.ratio + e : first + (g.overlap() ? e - g.ratio : e);
                     if (p < 0) continue;
-                    const int channel = prev ? c : (g.overlap() ? d + c : c);
-                    m = std::max(m, a.ringScore[static_cast<std::size_t>(slotOf(p, g.ringRows)) * width + channel]);
+                    m = std::max(m, scoreAt(p, prev ? c : (g.overlap() ? d + c : c)));
                 }
                 float sum = 0.0f, acc = 0.0f;
                 for (int e = 0; e < entries; ++e)
@@ -215,10 +292,9 @@ public:
                     const int p = prev ? first - g.ratio + e : first + (g.overlap() ? e - g.ratio : e);
                     if (p < 0) continue;
                     const int channel = prev ? c : (g.overlap() ? d + c : c);
-                    const std::size_t at = static_cast<std::size_t>(slotOf(p, g.ringRows)) * width + channel;
-                    const float w = expf(a.ringScore[at] - m);
+                    const float w = expf(scoreAt(p, channel) - m);
                     sum += w;
-                    acc += w * a.ringKV[at];
+                    acc += w * kvAt(p, channel);
                 }
                 out[c] = acc / sum;
             }
@@ -227,43 +303,74 @@ public:
             const float inv = 1.0f / sqrtf(static_cast<float>(ss / d) + a.eps);
             for (int c = 0; c < d; ++c) out[c] = out[c] * inv * a.gain[c];
             rotateTail(out, d, a.rope, block * g.ratio, false);
+            std::uint8_t *entry = a.pool + static_cast<std::size_t>(block) * entryBytes;
+            if (g.stream == CompressedStream::Attention)
+                qat::packKVEntry({d, g.ropeDim}, out, entry);
+            else
+            {
+                qat::hadamard(out, d);
+                qat::packIndexerKey({d}, out, entry);
+            }
         });
     }
 
     void rawStore(const RawStoreArgs &a, void *) const override
     {
-        require(a.positions && a.kv && a.ring && a.ringRows > 0, "rawStore requires operands");
+        require(a.positions && a.kv && a.ring && a.window > 0 && a.format.valid(), "rawStore requires operands");
         const int rows = liveRows(a.extent);
+        if (rows == 0) return;
+        const int start = contiguousStart(a.positions, rows);
+        const int last = start + rows - 1;
+        const std::size_t entryBytes = static_cast<std::size_t>(a.format.entryBytes());
         forTasks(rows, [&](int r) {
-            const float *src = a.kv + static_cast<std::size_t>(r) * a.headDim;
-            std::copy(src, src + a.headDim,
-                      a.ring + static_cast<std::size_t>(slotOf(a.positions[r], a.ringRows)) * a.headDim);
+            const int pos = start + r;
+            if (pos <= last - a.window) return;
+            qat::packKVEntry(a.format, a.kv + static_cast<std::size_t>(r) * a.format.headDim,
+                             a.ring + static_cast<std::size_t>(pos % a.window) * entryBytes);
         });
     }
 
     void indexerTopK(const IndexerTopKArgs &a, void *) const override
     {
-        require(a.positions && a.query && a.weights && a.pool && a.selected && a.topK > 0,
+        require(a.positions && a.query && a.weights && a.pool && a.selected && a.topK > 0 && a.format.valid(),
                 "indexerTopK requires operands");
         const int rows = liveRows(a.extent);
+        const int dim = a.format.headDim;
+        const int blocks = a.format.scaleCount();
+        const std::size_t entryBytes = static_cast<std::size_t>(a.format.entryBytes());
         forTasks(rows, [&](int r) {
             const int visible = std::min((a.positions[r] + 1) / a.ratio, a.poolRows);
             std::vector<std::pair<float, int>> scored(static_cast<std::size_t>(visible));
-            const float *q = a.query + static_cast<std::size_t>(r) * a.heads * a.headDim;
+            const float *q = a.query + static_cast<std::size_t>(r) * a.heads * dim;
             const float *w = a.weights + static_cast<std::size_t>(r) * a.heads;
+            float key[kMaxHeadDim];
+            float scale[kMaxHeadDim / kFP4BlockSize];
             for (int b = 0; b < visible; ++b)
             {
-                const float *k = a.pool + static_cast<std::size_t>(b) * a.headDim;
+                // Decode the key once (unscaled E2M1 values + block scales);
+                // the per-head arithmetic below is qat::indexerDot's order.
+                const std::uint8_t *entry = a.pool + static_cast<std::size_t>(b) * entryBytes;
+                for (int c = 0; c < dim; c += 2)
+                {
+                    key[c] = qat::decodeE2M1(static_cast<std::uint8_t>(entry[c / 2] & 0xFu));
+                    key[c + 1] = qat::decodeE2M1(static_cast<std::uint8_t>(entry[c / 2] >> 4));
+                }
+                for (int j = 0; j < blocks; ++j)
+                    scale[j] = qat::exp2i(static_cast<int>(entry[a.format.scaleOffset() + j]) - 127);
                 float score = 0.0f;
                 for (int h = 0; h < a.heads; ++h)
                 {
+                    const float *qh = q + static_cast<std::size_t>(h) * dim;
                     float dot = 0.0f;
-                    const float *qh = q + static_cast<std::size_t>(h) * a.headDim;
-                    for (int c = 0; c < a.headDim; ++c) dot += qh[c] * k[c];
-                    score += std::max(dot, 0.0f) * (w[h] * a.weightScale);
+                    for (int j = 0; j < blocks; ++j)
+                    {
+                        float partial = 0.0f;
+                        for (int i = j * kFP4BlockSize; i < (j + 1) * kFP4BlockSize; ++i) partial += qh[i] * key[i];
+                        dot += partial * scale[j];
+                    }
+                    score = std::fma(std::max(dot, 0.0f), w[h] * a.weightScale, score);
                 }
                 scored[b] = {score, b};
-                if (a.scores) a.scores[static_cast<std::size_t>(r) * a.poolRows + b] = score;
             }
             const int keep = std::min(a.topK, visible);
             std::partial_sort(scored.begin(), scored.begin() + keep, scored.end(),
@@ -280,53 +387,60 @@ public:
 
     void sparseAttention(const SparseAttentionArgs &a, void *) const override
     {
-        require(a.positions && a.query && a.rawRing && a.sinks && a.output && a.window > 0,
-                "sparseAttention requires operands");
+        require(a.positions && a.query && a.chunkKV && a.rawRing && a.sinks && a.output && a.window > 0 &&
+                    a.format.valid() && a.format.headDim <= kMaxHeadDim && a.format.ropeDim == a.rope.ropeDim,
+                "sparseAttention requires operands and a representable record format");
         require(a.access == CompressedAccess::None || (a.pool && a.ratio > 0),
                 "compressed access requires a pool and ratio");
         require(a.access != CompressedAccess::Selected || (a.selected && a.topK > 0),
                 "selected access requires indexer output");
         const int rows = liveRows(a.extent);
-        const int dim = a.headDim;
+        if (rows == 0) return;
+        const int start = contiguousStart(a.positions, rows);
+        const int dim = a.format.headDim;
+        const std::size_t entryBytes = static_cast<std::size_t>(a.format.entryBytes());
         forTasks(rows * a.heads, [&](int task) {
             const int r = task / a.heads;
             const int h = task % a.heads;
-            const int pos = a.positions[r];
+            const int pos = start + r;
             const float *q = a.query + static_cast<std::size_t>(task) * dim;
-            std::vector<const float *> keys;
-            keys.reserve(static_cast<std::size_t>(a.window + a.topK + 1));
+            float *out = a.output + static_cast<std::size_t>(task) * dim;
+            float decoded[kMaxHeadDim];
+            // Online softmax seeded with the sink: m = sink, l = exp(sink - m) = 1.
+            float m = a.sinks[h], l = 1.0f;
+            std::fill(out, out + dim, 0.0f);
+            const auto attend = [&](const float *key) {
+                float dot = 0.0f;
+                for (int c = 0; c < dim; ++c) dot += q[c] * key[c];
+                const float logit = dot * a.scale;
+                const float mNew = std::max(m, logit);
+                const float correction = expf(m - mNew);
+                const float p = expf(logit - mNew);
+                l = l * correction + p;
+                for (int c = 0; c < dim; ++c) out[c] = out[c] * correction + p * key[c];
+                m = mNew;
+            };
+            const auto attendPacked = [&](const std::uint8_t *entry) {
+                decodeKVEntry(a.format, entry, decoded);
+                attend(decoded);
+            };
             for (int p = std::max(0, pos - a.window + 1); p <= pos; ++p)
-                keys.push_back(a.rawRing + static_cast<std::size_t>(slotOf(p, a.rawRingRows)) * dim);
+            {
+                if (p >= start) attend(a.chunkKV + static_cast<std::size_t>(p - start) * dim);
+                else attendPacked(a.rawRing + static_cast<std::size_t>(p % a.window) * entryBytes);
+            }
             if (a.access == CompressedAccess::All)
             {
                 const int visible = (pos + 1) / a.ratio;
-                for (int b = 0; b < visible; ++b) keys.push_back(a.pool + static_cast<std::size_t>(b) * dim);
+                for (int b = 0; b < visible; ++b) attendPacked(a.pool + static_cast<std::size_t>(b) * entryBytes);
             }
             else if (a.access == CompressedAccess::Selected)
             {
                 const std::int32_t *sel = a.selected + static_cast<std::size_t>(r) * a.topK;
                 for (int i = 0; i < a.topK; ++i)
-                    if (sel[i] >= 0) keys.push_back(a.pool + static_cast<std::size_t>(sel[i]) * dim);
+                    if (sel[i] >= 0) attendPacked(a.pool + static_cast<std::size_t>(sel[i]) * entryBytes);
             }
-            std::vector<float> logits(keys.size());
-            float m = a.sinks[h];
-            for (std::size_t t = 0; t < keys.size(); ++t)
-            {
-                float dot = 0.0f;
-                for (int c = 0; c < dim; ++c) dot += q[c] * keys[t][c];
-                logits[t] = dot * a.scale;
-                m = std::max(m, logits[t]);
-            }
-            float sum = expf(a.sinks[h] - m);
-            float *out = a.output + static_cast<std::size_t>(task) * dim;
-            std::fill(out, out + dim, 0.0f);
-            for (std::size_t t = 0; t < keys.size(); ++t)
-            {
-                const float w = expf(logits[t] - m);
-                sum += w;
-                for (int c = 0; c < dim; ++c) out[c] += w * keys[t][c];
-            }
-            for (int c = 0; c < dim; ++c) out[c] /= sum;
+            for (int c = 0; c < dim; ++c) out[c] /= l;
             rotateTail(out, dim, a.rope, pos, true);
         });
     }
@@ -418,6 +532,12 @@ public:
             }
             for (int i = 0; i < a.topK; ++i) w[i] = w[i] / sum * a.routeScale;
         });
+    }
+
+    void zeroBank(void *destination, std::size_t bytes, void *) const override
+    {
+        require(destination && bytes % 4 == 0, "zeroBank requires 4-byte aligned host storage");
+        std::memset(destination, 0, bytes);
     }
 };
 } // namespace

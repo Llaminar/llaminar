@@ -142,6 +142,12 @@ DeepSeekV4PrimitiveStage::DeepSeekV4PrimitiveStage(Params params)
         },
         [&](const HeadNormRope &a) {
             require(a.rope.ropeDim <= a.headDim && a.rope.ropeDim % 2 == 0, "rope width must fit the head");
+            require(a.quant == deepseek4::ActivationQuant::None ||
+                        (a.headDim <= deepseek4::kMaxHeadDim &&
+                         (a.quant == deepseek4::ActivationQuant::FP8NopeBF16Rope
+                              ? deepseek4::PackedKVEntryFormat{a.headDim, a.rope.ropeDim}.valid()
+                              : deepseek4::PackedIndexerKeyFormat{a.headDim}.valid())),
+                    "QAT post-operation geometry is not representable");
             if (a.rope.ropeDim > 0)
             {
                 require(a.positions.has_value(), "rotation requires row positions");
@@ -153,47 +159,59 @@ DeepSeekV4PrimitiveStage::DeepSeekV4PrimitiveStage(Params params)
         },
         [&](const CompressorStore &a) {
             const auto w = sz(a.geometry.projectionWidth());
-            require(a.geometry.ringRows >= params_.rows.capacity + 2 * a.geometry.ratio,
-                    "compressor ring must hold a full chunk plus two blocks");
             addIntInput(a.positions, rows, "positions");
             add(a.kv, rows, w, Access::Input, "kv");
             add(a.score, rows, w, Access::Input, "score");
             addFP32Weight(a.ape, sz(a.geometry.ratio) * w, "ape");
-            add(a.ringKV, sz(a.geometry.ringRows), w, Access::Output, "ring_kv");
-            add(a.ringScore, sz(a.geometry.ringRows), w, Access::Output, "ring_score");
+            add(a.stateKV, sz(a.geometry.stateRows()), w, Access::Output, "state_kv");
+            add(a.stateScore, sz(a.geometry.stateRows()), w, Access::Output, "state_score");
         },
         [&](const CompressorPool &a) {
-            const auto w = sz(a.geometry.projectionWidth());
+            const auto &g = a.geometry;
+            const auto w = sz(g.projectionWidth());
+            require(g.headDim <= deepseek4::kMaxHeadDim && g.entryBytes() % 4 == 0 &&
+                        (g.stream == deepseek4::CompressedStream::Indexer
+                             ? deepseek4::PackedIndexerKeyFormat{g.headDim}.valid()
+                             : deepseek4::PackedKVEntryFormat{g.headDim, g.ropeDim}.valid() &&
+                                   g.ropeDim == a.rope.ropeDim),
+                    "compressor record geometry is not representable");
             addIntInput(a.positions, rows, "positions");
-            add(a.ringKV, sz(a.geometry.ringRows), w, Access::Input, "ring_kv");
-            add(a.ringScore, sz(a.geometry.ringRows), w, Access::Input, "ring_score");
-            addFP32Weight(a.gain, sz(a.geometry.headDim), "gain");
-            add(a.pool, sz(a.geometry.poolRows), sz(a.geometry.headDim), Access::Output, "pool");
+            add(a.kv, rows, w, Access::Input, "kv");
+            add(a.score, rows, w, Access::Input, "score");
+            addFP32Weight(a.ape, sz(g.ratio) * w, "ape");
+            add(a.stateKV, sz(g.stateRows()), w, Access::Input, "state_kv");
+            add(a.stateScore, sz(g.stateRows()), w, Access::Input, "state_score");
+            addFP32Weight(a.gain, sz(g.headDim), "gain");
+            add(a.pool, sz(g.poolRows), sz(g.entryBytes() / 4), Access::Output, "pool");
         },
         [&](const RawStore &a) {
+            require(a.format.valid() && a.format.headDim <= deepseek4::kMaxHeadDim, "raw record geometry is invalid");
             addIntInput(a.positions, rows, "positions");
-            add(a.kv, rows, sz(a.headDim), Access::Input, "kv");
-            add(a.ring, sz(a.ringRows), sz(a.headDim), Access::Output, "ring");
+            add(a.kv, rows, sz(a.format.headDim), Access::Input, "kv");
+            add(a.ring, sz(a.window), sz(a.format.entryWords()), Access::Output, "ring");
         },
         [&](const IndexerTopK &a) {
+            require(a.format.valid(), "indexer key geometry is invalid");
             addIntInput(a.positions, rows, "positions");
-            add(a.query, rows, sz(a.heads) * sz(a.headDim), Access::Input, "query");
+            add(a.query, rows, sz(a.heads) * sz(a.format.headDim), Access::Input, "query");
             add(a.weights, rows, sz(a.heads), Access::Input, "weights");
-            add(a.pool, sz(a.poolRows), sz(a.headDim), Access::Input, "pool");
+            add(a.pool, sz(a.poolRows), sz(a.format.entryWords()), Access::Input, "pool");
             require(a.scores.has_value() || !device().is_gpu(), "GPU indexer selection requires score scratch");
-            if (a.scores) add(*a.scores, rows, sz(a.poolRows), Access::Output, "scores");
+            if (a.scores) add(*a.scores, sz(a.scoreRows), sz(a.poolRows), Access::Output, "scores");
             add(a.selected, rows, sz(a.topK), Access::Output, "selected");
         },
         [&](const SparseAttention &a) {
-            const auto w = sz(a.heads) * sz(a.headDim);
-            require(a.rawRingRows >= params_.rows.capacity + a.window, "raw ring must hold a chunk plus the window");
+            require(a.format.valid() && a.format.headDim <= deepseek4::kMaxHeadDim &&
+                        a.format.ropeDim == a.rope.ropeDim, "attention record geometry is invalid");
+            const auto w = sz(a.heads) * sz(a.format.headDim);
             addIntInput(a.positions, rows, "positions");
             add(a.query, rows, w, Access::Input, "query");
-            add(a.rawRing, sz(a.rawRingRows), sz(a.headDim), Access::Input, "raw_ring");
+            add(a.chunkKV, rows, sz(a.format.headDim), Access::Input, "chunk_kv");
+            add(a.rawRing, sz(a.window), sz(a.format.entryWords()), Access::Input, "raw_ring");
             if (a.access != deepseek4::CompressedAccess::None)
             {
                 require(a.pool.has_value() && a.ratio > 0, "compressed access requires its pool");
-                add(*a.pool, sz(a.poolRows), sz(a.headDim), Access::Input, "pool");
+                add(*a.pool, sz(a.poolRows), sz(a.format.entryWords()), Access::Input, "pool");
             }
             if (a.access == deepseek4::CompressedAccess::Selected)
             {
@@ -202,6 +220,11 @@ DeepSeekV4PrimitiveStage::DeepSeekV4PrimitiveStage(Params params)
             }
             addFP32Weight(a.sinks, sz(a.heads), "sinks");
             add(a.output, rows, w, Access::Output, "output");
+        },
+        [&](const AdvanceSequenceFrontier &a) {
+            require(device().is_gpu(), "sequence frontier publication is a GPU cache operation");
+            require(a.cache != nullptr && a.capturedRows > 0, "sequence frontier requires its cache and rows");
+            addIntInput(a.positions, rows, "positions");
         },
         [&](const GroupedProjection &a) {
             (void)formatOf(*a.weight.tensor);
@@ -238,9 +261,7 @@ void DeepSeekV4PrimitiveStage::validateAliases() const
                                           input.byteOffset < output.byteOffset + output.bytes();
                     if (!overlaps) continue;
                     const bool exact = input.byteOffset == output.byteOffset && input.bytes() == output.bytes();
-                    const bool stateBank = std::holds_alternative<CompressorPool>(params_.operation) ||
-                                           std::holds_alternative<CompressorStore>(params_.operation);
-                    require((exact && input.alias == AliasPolicy::ExactOutputAliasAllowed) || stateBank,
+                    require(exact && input.alias == AliasPolicy::ExactOutputAliasAllowed,
                             "forbids overlapping output and immutable input views");
                 }
 }
@@ -279,6 +300,13 @@ bool DeepSeekV4PrimitiveStage::execute(IDeviceContext *context)
     const auto f = [&](Qwen4ExpFloatBinding b) { return pointer<const float>(b, Access::Input); };
     const auto out = [&](Qwen4ExpFloatBinding b) { return pointer<float>(b, Access::Output); };
     const auto w32 = [&](Qwen4ExpImmutableWeightBinding b) { return static_cast<const float *>(weightPointer(b.tensor)); };
+    // Packed records travel in INT32 arena words; kernels address their bytes.
+    const auto bytesIn = [&](Qwen4ExpIntBinding b) {
+        return reinterpret_cast<const std::uint8_t *>(pointer<const std::int32_t>(b, Access::Input));
+    };
+    const auto bytesOut = [&](Qwen4ExpIntBinding b) {
+        return reinterpret_cast<std::uint8_t *>(pointer<std::int32_t>(b, Access::Output));
+    };
     const auto rows = rowExtent();
     std::visit(Overload{
         [&](const HCRead &a) {
@@ -293,32 +321,39 @@ bool DeepSeekV4PrimitiveStage::execute(IDeviceContext *context)
         [&](const HCExpand &a) { kernels_->hcExpand({rows, a.hc, a.hidden, f(a.input), out(a.output)}, stream); },
         [&](const HeadNormRope &a) {
             kernels_->headNormRope({rows, a.heads, a.headDim, a.normalize, a.eps, a.gain ? w32(*a.gain) : nullptr,
-                                    a.rope, a.inverse, a.positions ? intInput(*a.positions) : nullptr, out(a.data)},
-                                   stream);
+                                    a.rope, a.inverse, a.quant, a.positions ? intInput(*a.positions) : nullptr,
+                                    out(a.data)}, stream);
         },
         [&](const CompressorStore &a) {
             kernels_->compressorStore({rows, a.geometry, intInput(a.positions), f(a.kv), f(a.score), w32(a.ape),
-                                       out(a.ringKV), out(a.ringScore)}, stream);
+                                       out(a.stateKV), out(a.stateScore)}, stream);
         },
         [&](const CompressorPool &a) {
-            kernels_->compressorPool({rows, a.geometry, intInput(a.positions), f(a.ringKV), f(a.ringScore), w32(a.gain),
-                                      a.eps, a.rope, out(a.pool)}, stream);
+            kernels_->compressorPool({rows, a.geometry, intInput(a.positions), f(a.kv), f(a.score), w32(a.ape),
+                                      f(a.stateKV), f(a.stateScore), w32(a.gain), a.eps, a.rope,
+                                      bytesOut(a.pool)}, stream);
         },
         [&](const RawStore &a) {
-            kernels_->rawStore({rows, a.headDim, a.ringRows, intInput(a.positions), f(a.kv), out(a.ring)}, stream);
+            kernels_->rawStore({rows, a.format, a.window, intInput(a.positions), f(a.kv), bytesOut(a.ring)}, stream);
         },
         [&](const IndexerTopK &a) {
-            kernels_->indexerTopK({rows, a.heads, a.headDim, a.ratio, a.topK, a.poolRows, intInput(a.positions),
-                                   f(a.query), f(a.weights), a.weightScale, f(a.pool),
+            kernels_->indexerTopK({rows, a.heads, a.format, a.ratio, a.topK, a.poolRows, a.scoreRows,
+                                   intInput(a.positions), f(a.query), f(a.weights), a.weightScale, bytesIn(a.pool),
                                    a.scores ? out(*a.scores) : nullptr,
                                    pointer<std::int32_t>(a.selected, Access::Output)}, stream);
         },
         [&](const SparseAttention &a) {
-            kernels_->sparseAttention({rows, a.heads, a.headDim, a.window, a.rawRingRows, a.ratio, a.topK, a.access,
-                                       a.scale, a.rope, intInput(a.positions), f(a.query), f(a.rawRing),
-                                       a.pool ? f(*a.pool) : nullptr,
+            kernels_->sparseAttention({rows, a.heads, a.format, a.window, a.ratio, a.topK, a.access, a.scale, a.rope,
+                                       intInput(a.positions), f(a.query), f(a.chunkKV), bytesIn(a.rawRing),
+                                       a.pool ? bytesIn(*a.pool) : nullptr,
                                        a.selected ? pointer<const std::int32_t>(*a.selected, Access::Input) : nullptr,
                                        w32(a.sinks), out(a.output)}, stream);
+        },
+        [&](const AdvanceSequenceFrontier &a) {
+            // Exactly one device-resident frontier advance per forward, ordered
+            // after the terminal layer on this stage's stream; no host count.
+            if (!a.cache->advanceRecurrentSequenceState(a.layer, 1, a.requestRows, a.capturedRows, stream))
+                throw std::runtime_error("DeepSeekV4 stage: cache rejected the sequence frontier publication");
         },
         [&](const GroupedProjection &a) {
             kernels_->groupedProjection({rows, a.groups, a.rank, a.groupWidth, formatOf(*a.weight.tensor),
@@ -340,7 +375,8 @@ bool DeepSeekV4PrimitiveStage::allowsZeroOutput() const
            std::holds_alternative<CompressorPool>(params_.operation) ||
            std::holds_alternative<RawStore>(params_.operation) ||
            std::holds_alternative<IndexerTopK>(params_.operation) ||
-           std::holds_alternative<Route>(params_.operation);
+           std::holds_alternative<Route>(params_.operation) ||
+           std::holds_alternative<AdvanceSequenceFrontier>(params_.operation);
 }
 
 ComputeStageType DeepSeekV4PrimitiveStage::type() const
@@ -356,7 +392,8 @@ ComputeStageType DeepSeekV4PrimitiveStage::type() const
         [](const IndexerTopK &) { return ComputeStageType::DEEPSEEK_V4_INDEXER_TOPK; },
         [](const SparseAttention &) { return ComputeStageType::DEEPSEEK_V4_SPARSE_ATTENTION; },
         [](const GroupedProjection &) { return ComputeStageType::DEEPSEEK_V4_GROUPED_PROJECTION; },
-        [](const Route &) { return ComputeStageType::DEEPSEEK_V4_ROUTE; }}, params_.operation);
+        [](const Route &) { return ComputeStageType::DEEPSEEK_V4_ROUTE; },
+        [](const AdvanceSequenceFrontier &) { return ComputeStageType::DEEPSEEK_V4_SEQUENCE_FRONTIER; }}, params_.operation);
 }
 
 std::size_t DeepSeekV4PrimitiveStage::estimatedFlops() const
@@ -370,10 +407,11 @@ std::size_t DeepSeekV4PrimitiveStage::estimatedFlops() const
         [=](const CompressorStore &a) { return rows * a.geometry.projectionWidth(); },
         [=](const CompressorPool &a) { return rows * a.geometry.headDim * 8; },
         [=](const RawStore &) { return std::size_t{0}; },
-        [=](const IndexerTopK &a) { return rows * a.poolRows * a.heads * a.headDim * 2; },
-        [=](const SparseAttention &a) { return rows * a.heads * (a.window + a.topK) * a.headDim * 4; },
+        [=](const IndexerTopK &a) { return rows * a.poolRows * a.heads * a.format.headDim * 2; },
+        [=](const SparseAttention &a) { return rows * a.heads * (a.window + a.topK) * a.format.headDim * 4; },
         [=](const GroupedProjection &a) { return rows * a.groups * a.rank * a.groupWidth * 2; },
-        [=](const Route &a) { return rows * a.experts * 8; }}, params_.operation);
+        [=](const Route &a) { return rows * a.experts * 8; },
+        [=](const AdvanceSequenceFrontier &) { return std::size_t{0}; }}, params_.operation);
 }
 
 std::size_t DeepSeekV4PrimitiveStage::estimatedMemoryBytes() const

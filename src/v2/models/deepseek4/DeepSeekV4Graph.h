@@ -34,6 +34,17 @@ public:
     GraphSchema getSchema() const override;
     GraphResolverConfig getResolverConfig(int seq_len) const override;
     void setArena(BufferArena *arena) override;
+    /**
+     * @brief Validate the frontier-only cache and publish the carried state banks.
+     * @details The raw window ring and FP32 compressor state are read by a
+     * graph before it overwrites them (they carry the previous chunk's rows),
+     * so they are graph-external inputs that must be device-valid before the
+     * first transaction. They are zeroed and published once here, before any
+     * capture; their bytes are never read for positions this request has not
+     * written, so request reset needs no further publication. The pools are
+     * always produced in-graph before their readers.
+     */
+    void initializeCacheAuxiliaryState(IKVCache &cache, void *publicationStream) override;
 
     /** @brief DeepSeek-V4 compressed sparse attention block (one participant). */
     ComputeGraph buildAttentionGraph(

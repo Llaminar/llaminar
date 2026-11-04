@@ -21,6 +21,15 @@ namespace llaminar2
 {
     struct ModelMemoryProfile;
 
+    /** @brief Persistent-state family of one model layer, from canonical metadata. */
+    enum class LayerStateKind
+    {
+        FullAttention, ///< Sequence-length-scaled KV payload in the canonical cache.
+        GDN,           ///< Fixed recurrent + short-conv state in the hybrid cache.
+        ModelOwned,    ///< Attention state in model arena banks (DeepSeek-V4); the cache
+                       ///< holds no payload and the arena admission prices the banks.
+    };
+
     /**
      * @brief Persistent cache/state bytes that coexist with graph workspaces.
      */
@@ -43,6 +52,8 @@ namespace llaminar2
         int main_gdn_layers = 0;
         int mtp_full_attention_layers = 0;
         int mtp_gdn_layers = 0;
+        /** Layers whose attention state is priced by the model arena, not the cache. */
+        int main_model_owned_layers = 0;
         /** QSA-only auxiliary owners, separate from dense/full-attention KV owners. */
         int main_sparse_attention_layers = 0;
         int mtp_sparse_attention_layers = 0;
@@ -68,6 +79,16 @@ namespace llaminar2
          * @throws std::invalid_argument for an index outside the model.
          */
         static bool isFullAttentionLayer(const ModelMemoryProfile &profile, int layer);
+
+        /**
+         * @brief Classify one layer's persistent-state owner.
+         * @details The single classifier behind isFullAttentionLayer(), live
+         * cache admission and planning work models. ModelOwned layers
+         * contribute no KV bytes: their banks are charged exactly once by
+         * the architecture's arena extension (deepSeekV4ArenaExtensionBytes).
+         * @throws std::invalid_argument for an index outside the model.
+         */
+        static LayerStateKind layerStateKind(const ModelMemoryProfile &profile, int layer);
 
         /**
          * @brief Reproduce cache-owned persistent allocations for one device.

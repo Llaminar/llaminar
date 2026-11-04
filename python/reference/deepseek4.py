@@ -7,11 +7,26 @@ mathematical oracle for Llaminar stage parity: every stage that Llaminar
 publishes as a snapshot has a named capture here.
 
 Mathematical source of truth is DeepSeek's reference ``inference/model.py``
-(deepseek-ai/DeepSeek-V4-Flash-Vision-Exp @ 6821d6ad) with the QAT activation
-quantization simulations removed (FP8 kv nope dims, FP4 indexer q/k), exactly
-as llama.cpp evaluates the model. The randomized Hadamard rotation that the
-reference applies to indexer q/k is orthogonal and therefore omitted: it does
-not change any dot product in exact arithmetic.
+(deepseek-ai/DeepSeek-V4-Flash-Vision-Exp @ 6821d6ad). The model is
+quantization-aware trained, and ``qat=True`` (the default) reproduces its
+activation rounding points bit-for-bit (kernel.py act_quant / fp4_act_quant
+with ``inplace=True`` and power-of-two scales):
+
+  - window kv and main compressor output: FP8 E4M3 on the leading
+    ``head_dim - rope_dim`` channels in blocks of 64 with scale
+    2^ceil(log2(max(amax, 1e-4) / 448)); the rope channels are BF16 (the
+    official activation dtype, and the BF16 field of Llaminar's packed record);
+  - indexer q (after RoPE) and indexer compressor output: Hadamard rotation
+    scaled by d^-0.5, then FP4 E2M1 in blocks of 32 with scale
+    2^ceil(log2(max(amax, 6 * 2^-126) / 6)).
+
+Llaminar stores exactly these values in its compact persistent banks, so this
+is the parity oracle for its stage dumps. Remaining deliberate deviation: the
+official path also rounds every other activation to BF16 (default dtype); like
+Llaminar (FP32 activations only), this reference keeps them in FP32, so a
+QAT block whose amax sits on a power-of-two boundary can round differently.
+``qat=False`` gives the pre-QAT formulation that llama.cpp evaluates; there the
+Hadamard rotation is omitted because it is orthogonal.
 
 Architecture summary (per main layer):
   - Hyper-connections: the residual stream is ``hc`` (=4) copies [S, hc, D].
@@ -178,6 +193,68 @@ def apply_rope_tail(x: torch.Tensor, pos: torch.Tensor, inv_freq: torch.Tensor, 
     return torch.cat([head, r], dim=-1)
 
 
+def _ceil_log2(t: torch.Tensor) -> torch.Tensor:
+    """kernel.py fast_log2_ceil of positive normal FP32 values (bit manipulation)."""
+    bits = t.contiguous().view(torch.int32)
+    exponent = (bits >> 23) & 0xFF
+    return exponent - 127 + ((bits & 0x7FFFFF) != 0).to(torch.int32)
+
+
+def _exp2i(k: torch.Tensor) -> torch.Tensor:
+    """Exact FP32 2^k for integer k in the normal range."""
+    return ((k + 127).to(torch.int32) << 23).view(torch.float32)
+
+
+def fp8_qat(x: torch.Tensor, block: int = 64) -> torch.Tensor:
+    """act_quant(x, block, 'ue8m0', inplace=True) in FP32: E4M3 round trip with UE8M0 scales."""
+    xb = x.float().unflatten(-1, (-1, block))
+    amax = xb.abs().amax(-1, keepdim=True).clamp_min(torch.tensor(1e-4, dtype=torch.float32))
+    k = _ceil_log2(amax * torch.tensor(1.0 / 448.0, dtype=torch.float32))
+    q = (xb * _exp2i(-k)).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).float()
+    return (q * _exp2i(k)).flatten(-2)
+
+
+def _e2m1_round(v: torch.Tensor) -> torch.Tensor:
+    """Round-to-nearest-even onto {0, 0.5, 1, 1.5, 2, 3, 4, 6} (satfinite), keeping the sign."""
+    a = v.abs().clamp(max=6.0)
+    q = torch.where(a < 2.0, torch.round(a * 2.0) * 0.5,
+                    torch.where(a < 4.0, torch.round(a), torch.round(a * 0.5) * 2.0))
+    return torch.copysign(q, v)
+
+
+def fp4_qat(x: torch.Tensor, block: int = 32) -> torch.Tensor:
+    """fp4_act_quant(x, block, inplace=True) in FP32: E2M1 round trip with E8M0 scales."""
+    xb = x.float().unflatten(-1, (-1, block))
+    amax = xb.abs().amax(-1, keepdim=True).clamp_min(torch.tensor(6.0 * 2.0 ** -126, dtype=torch.float32))
+    k = _ceil_log2(amax * torch.tensor(1.0 / 6.0, dtype=torch.float32))
+    return (_e2m1_round(xb * _exp2i(-k)) * _exp2i(k)).flatten(-2)
+
+
+def hadamard(x: torch.Tensor) -> torch.Tensor:
+    """rotate_activation: Sylvester-order Walsh-Hadamard over the last dim, then * n^-0.5 (FP32 butterflies)."""
+    n = x.shape[-1]
+    y = x.float().clone()
+    h = 1
+    while h < n:
+        v = y.unflatten(-1, (-1, 2, h))
+        a, b = v[..., 0, :].clone(), v[..., 1, :].clone()
+        v[..., 0, :] = a + b
+        v[..., 1, :] = a - b
+        y = v.flatten(-3)
+        h *= 2
+    return y * torch.tensor(n ** -0.5, dtype=torch.float32)
+
+
+def kv_qat(x: torch.Tensor, rope_dim: int) -> torch.Tensor:
+    """Window kv / main compressor QAT: FP8 nope blocks of 64 + BF16 rope channels."""
+    return torch.cat([fp8_qat(x[..., :-rope_dim], 64), x[..., -rope_dim:].to(torch.bfloat16).float()], dim=-1)
+
+
+def indexer_qat(x: torch.Tensor) -> torch.Tensor:
+    """Indexer q / compressor QAT: Hadamard rotation then FP4 blocks of 32."""
+    return fp4_qat(hadamard(x), 32)
+
+
 def rms(x: torch.Tensor, eps: float, weight: Optional[torch.Tensor] = None) -> torch.Tensor:
     y = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
     return y * weight if weight is not None else y
@@ -189,6 +266,7 @@ class DeepSeekV4Reference:
 
     gguf_path: str
     dtype: torch.dtype = torch.float32
+    qat: bool = True  # official QAT rounding of stored kv / indexer q and k (see module docstring)
     cfg: DeepSeekV4Config = field(init=False)
     w: Dict[str, torch.Tensor] = field(init=False)
 
@@ -252,7 +330,10 @@ class DeepSeekV4Reference:
         comp = (kv * sc.softmax(dim=1)).sum(1)
         comp = rms(comp, c.norm_eps, self._t(f"blk.{il}.{prefix}_norm.weight"))
         pos = torch.arange(nb) * ratio
-        return apply_rope_tail(comp, pos, inv_freq, c.rope_dim)
+        comp = apply_rope_tail(comp, pos, inv_freq, c.rope_dim)
+        if self.qat:
+            comp = indexer_qat(comp) if prefix == "indexer_compressor" else kv_qat(comp, c.rope_dim)
+        return comp
 
     def attention(self, x: torch.Tensor, tokens: torch.Tensor, il: int, cap: Callable[[str, torch.Tensor], None]) -> torch.Tensor:
         c = self.cfg
@@ -267,6 +348,8 @@ class DeepSeekV4Reference:
         q = apply_rope_tail(q, pos[:, None], inv_freq, rd)
         kv = rms(x @ self._t(p + "attn_kv.weight").T, c.norm_eps, self._t(p + "attn_kv_a_norm.weight"))
         kv = apply_rope_tail(kv, pos, inv_freq, rd)
+        if self.qat:
+            kv = kv_qat(kv, rd)
         cap("q", q.reshape(S, -1))
         cap("kv", kv)
 
@@ -285,6 +368,8 @@ class DeepSeekV4Reference:
                 IH, ihd = c.index_n_heads, c.index_head_dim
                 iq = (qr @ self._t(p + "indexer.attn_q_b.weight").T).view(S, IH, ihd)
                 iq = apply_rope_tail(iq, pos[:, None], inv_freq, rd)
+                if self.qat:
+                    iq = indexer_qat(iq)
                 ik = self.compress(x, il, "indexer_compressor", ihd, ratio, inv_freq)
                 cap("indexer_q", iq.reshape(S, -1))
                 cap("indexer_k", ik)

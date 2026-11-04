@@ -863,6 +863,29 @@ add_v2_test(V2_Unit_DeepSeekV4CPUKernels
     NO_MODELS
     NO_MPI
 )
+# Device-free DeepSeek-V4 compact-KV invariants: official QAT hand values,
+# 584/68-byte record round trips, chunk-straddling compressor/window state,
+# bounded indexer scratch and the single admission inventory.
+add_v2_test(V2_Integration_DeepSeekV4CompactKVContracts
+    COMMAND $<TARGET_FILE:v2_test_deepseek4_cpu_kernels>
+        --gtest_filter=DeepSeekV4QAT.*:DeepSeekV4BufferLayout.*:DeepSeekV4CPUKernels.Compressor*:DeepSeekV4CPUKernels.Indexer*:DeepSeekV4CPUKernels.SparseAttention*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;DeepSeekV4;KVCache;ByteExact;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+    NO_MPI
+)
+if(HAVE_CUDA)
+    # CUDA replay of the compact-KV kernels against the CPU bundle (byte-exact
+    # QAT/packing, bit-identical indexer scores, bounded-scratch selection).
+    add_executable(v2_test_deepseek4_cuda_kernels
+        integration/kernels/deepseek4/Test__DeepSeekV4CUDAKernels.cpp)
+    target_link_libraries(v2_test_deepseek4_cuda_kernels PRIVATE llaminar2_core GTest::gtest_main CUDA::cudart)
+    add_v2_test(V2_Integration_CUDA_DeepSeekV4CompactKV
+        COMMAND $<TARGET_FILE:v2_test_deepseek4_cuda_kernels>
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;DeepSeekV4;KVCache;ByteExact;Regression"
+        ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=1"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+endif()
 # OCP MXFP4 (GGUF type 39): exact decode, NativeVNNI packing and CPU projection.
 add_executable(v2_test_mxfp4_tensor unit/tensors/Test__MXFP4Tensor.cpp)
 target_link_libraries(v2_test_mxfp4_tensor PRIVATE llaminar2_core GTest::gtest_main)
@@ -26082,6 +26105,7 @@ add_v2_test(V2_Unit_KVCacheMemoryEstimator
 # Test: ActivationMemoryEstimator — activation buffer peak estimation
 add_executable(v2_test_activation_memory_estimator
     unit/planning/Test__ActivationMemoryEstimator.cpp
+    unit/planning/Test__DeepSeekV4Admission.cpp
     unit/planning/Test__CPUGraphArenaDeclarations.cpp
     unit/planning/Test__MoEProjectionArenaGeometry.cpp)
 target_link_libraries(v2_test_activation_memory_estimator llaminar2_core GTest::gtest GTest::gtest_main)
@@ -26094,6 +26118,15 @@ add_v2_test(V2_Integration_MTPShardedTerminalGatherAccounting
     COMMAND $<TARGET_FILE:v2_test_activation_memory_estimator>
         --gtest_filter=Test__ActivationMemoryEstimator.Qwen35MoE122BLocalTP_MatchesDeclarativeArenaByteForByte
     LABELS "V2;Integration;ProductionTestPreflight;MTP;LocalTP;Memory;PhysicalMemoryAuthority;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
+# DeepSeek-V4 model-owned attention state: GPU arena prices every registered
+# root once, the cache charges no KV payload, no conversion scratch exists.
+add_v2_test(V2_Integration_DeepSeekV4ArenaAdmission
+    COMMAND $<TARGET_FILE:v2_test_activation_memory_estimator>
+        --gtest_filter=DeepSeekV4Admission.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;DeepSeekV4;Memory;PhysicalMemoryAuthority;Regression"
     MPI_PROCS 1
     NO_MODELS
 )
@@ -28811,6 +28844,13 @@ if(HAVE_CUDA)
         ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=1"
         MPI_PROCS 1 NO_MODELS TIMEOUT 60)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_HCUpWorkspaceAdmission)
+endif()
+# DeepSeek-V4 compact persistent KV (registered beside V2_Unit_DeepSeekV4CPUKernels).
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_DeepSeekV4CompactKVContracts
+    V2_Integration_DeepSeekV4ArenaAdmission)
+if(HAVE_CUDA)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_DeepSeekV4CompactKV)
 endif()
 
 # Wider residuals cross PP and shifted-prefill boundaries as complete live rows.

@@ -267,6 +267,8 @@ namespace llaminar2
             return "DEEPSEEK_V4_GROUPED_PROJECTION";
         case ComputeStageType::DEEPSEEK_V4_ROUTE:
             return "DEEPSEEK_V4_ROUTE";
+        case ComputeStageType::DEEPSEEK_V4_SEQUENCE_FRONTIER:
+            return "DEEPSEEK_V4_SEQUENCE_FRONTIER";
         case ComputeStageType::QWEN4EXP_COMMIT_CONV_HISTORY:
             return "QWEN4EXP_COMMIT_CONV_HISTORY";
         case ComputeStageType::QWEN4EXP_COMMIT_TOKEN_HISTORY:

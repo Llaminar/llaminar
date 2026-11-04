@@ -9,9 +9,12 @@
  *
  * Kernel shapes:
  *  - hcRead: one CTA per row (sum of squares over hc*H, Sinkhorn in lane 0).
- *  - headNormRope / compressorPool: one CTA per (row, head) / row.
- *  - indexer: a scoring grid (row, block tile) into admitted scratch, then a
- *    per-row 4-pass radix selection of the top-k float keys (ties by lower id).
+ *  - headNormRope / compressorPool / rawStore: one CTA per (row, head) / row,
+ *    staging the head vector in shared memory for RMS, RoPE, the QAT
+ *    rounding (Hadamard butterflies, per-block scale exponents) and packing.
+ *  - indexer: bounded passes of scoreRows rows; each pass scores (row, block
+ *    tile) into the admitted scratch, then runs a per-row 4-pass radix
+ *    selection of the top-k float keys (ties by lower id).
  *  - sparseAttention: one CTA per (row, head); each warp runs an online
  *    softmax over a strided subset of keys, warps merge in shared memory.
  *  - groupedProjection: one warp per output, decoding Q8_0/BF16/FP32 rows.
@@ -20,6 +23,7 @@
 #include "DeepSeekV4Kernels.h"
 #include "DeepSeekV4Math.h"
 
+#include <algorithm>
 #include <cfloat>
 #include <climits>
 #include <cstddef>
@@ -160,6 +164,118 @@ __global__ __launch_bounds__(kThreads) void hcExpandKernel(HCExpandArgs a)
     for (int j = 0; j < a.hc; ++j) a.output[(r * a.hc + j) * a.hidden + d] = v;
 }
 
+// --------------------------------------------------------------------------- QAT / packing helpers
+/** @brief First chunk position; traps unless live row r carries position start + r. */
+__device__ inline int contiguousStart(const std::int32_t *positions, int r)
+{
+    const int start = positions[0];
+    if (start < 0 || positions[r] != start + r) invalidDeviceState();
+    return start;
+}
+
+/**
+ * @brief In-place Hadamard (Sylvester order, scaled by n^-0.5) of a shared vector.
+ * @details Every butterfly stage updates disjoint pairs, so the parallel
+ * stage order reproduces qat::hadamard bit-for-bit. All threads must call.
+ */
+__device__ inline void hadamardShared(float *vec, int n)
+{
+    for (int h = 1; h < n; h *= 2)
+    {
+        for (int t = threadIdx.x; t < n / 2; t += kThreads)
+        {
+            const int i = (t / h) * 2 * h + t % h;
+            const float x = vec[i], y = vec[i + h];
+            vec[i] = x + y;
+            vec[i + h] = x - y;
+        }
+        __syncthreads();
+    }
+    const float scale = qat::hadamardScale(n);
+    for (int c = threadIdx.x; c < n; c += kThreads) vec[c] *= scale;
+    __syncthreads();
+}
+
+/** @brief Per-block scale exponents of a shared vector; all threads must call. */
+__device__ inline void blockExponents(const float *vec, int blocks, int blockSize, bool fp4, int *exponents)
+{
+    for (int b = threadIdx.x; b < blocks; b += kThreads)
+    {
+        const float amax = qat::absMax(vec + b * blockSize, blockSize);
+        exponents[b] = fp4 ? qat::fp4ScaleExponent(amax) : qat::fp8ScaleExponent(amax);
+    }
+    __syncthreads();
+}
+
+/** @brief Apply an ActivationQuant to a shared head vector (qat::apply); all threads must call. */
+__device__ inline void quantizeShared(ActivationQuant quant, float *vec, int dim, int ropeDim, int *exponents)
+{
+    if (quant == ActivationQuant::FP8NopeBF16Rope)
+    {
+        const int nope = dim - ropeDim;
+        blockExponents(vec, nope / kFP8BlockSize, kFP8BlockSize, false, exponents);
+        for (int c = threadIdx.x; c < dim; c += kThreads)
+        {
+            if (c < nope)
+            {
+                const int k = exponents[c / kFP8BlockSize];
+                vec[c] = qat::decodeE4M3(qat::encodeE4M3(vec[c] * qat::exp2i(-k))) * qat::exp2i(k);
+            }
+            else
+                vec[c] = qat::decodeBF16(qat::encodeBF16(vec[c]));
+        }
+        __syncthreads();
+    }
+    else if (quant == ActivationQuant::HadamardFP4)
+    {
+        hadamardShared(vec, dim);
+        blockExponents(vec, dim / kFP4BlockSize, kFP4BlockSize, true, exponents);
+        for (int c = threadIdx.x; c < dim; c += kThreads)
+        {
+            const int k = exponents[c / kFP4BlockSize];
+            vec[c] = qat::decodeE2M1(qat::encodeE2M1(vec[c] * qat::exp2i(-k))) * qat::exp2i(k);
+        }
+        __syncthreads();
+    }
+}
+
+/** @brief qat::packKVEntry of a shared vector; all threads must call. */
+__device__ inline void packKVShared(const PackedKVEntryFormat &format, const float *vec, int *exponents,
+                                    std::uint8_t *entry)
+{
+    const int nope = format.nopeDim();
+    blockExponents(vec, format.scaleCount(), kFP8BlockSize, false, exponents);
+    for (int c = threadIdx.x; c < nope; c += kThreads)
+        entry[c] = qat::encodeE4M3(vec[c] * qat::exp2i(-exponents[c / kFP8BlockSize]));
+    for (int c = threadIdx.x; c < format.ropeDim; c += kThreads)
+    {
+        const std::uint16_t payload = qat::encodeBF16(vec[nope + c]);
+        entry[format.ropeOffset() + 2 * c] = static_cast<std::uint8_t>(payload & 0xFFu);
+        entry[format.ropeOffset() + 2 * c + 1] = static_cast<std::uint8_t>(payload >> 8);
+    }
+    for (int b = threadIdx.x; b < format.entryBytes() - format.scaleOffset(); b += kThreads)
+        entry[format.scaleOffset() + b] =
+            b < format.scaleCount() ? static_cast<std::uint8_t>(exponents[b] + 127) : std::uint8_t{0};
+    __syncthreads();
+}
+
+/** @brief qat::packIndexerKey of a shared (already rotated) vector; all threads must call. */
+__device__ inline void packIndexerShared(const PackedIndexerKeyFormat &format, const float *vec, int *exponents,
+                                         std::uint8_t *entry)
+{
+    blockExponents(vec, format.scaleCount(), kFP4BlockSize, true, exponents);
+    for (int t = threadIdx.x; t < format.headDim / 2; t += kThreads)
+    {
+        const float inverse = qat::exp2i(-exponents[(2 * t) / kFP4BlockSize]);
+        entry[t] = static_cast<std::uint8_t>(qat::encodeE2M1(vec[2 * t] * inverse) |
+                                             (qat::encodeE2M1(vec[2 * t + 1] * inverse) << 4));
+    }
+    for (int b = threadIdx.x; b < format.entryBytes() - format.scaleOffset(); b += kThreads)
+        entry[format.scaleOffset() + b] =
+            b < format.scaleCount() ? static_cast<std::uint8_t>(exponents[b] + 127) : std::uint8_t{0};
+    __syncthreads();
+}
+
 // --------------------------------------------------------------------------- norm + rope
 __global__ __launch_bounds__(kThreads) void headNormRopeKernel(HeadNormRopeArgs a)
 {
@@ -167,28 +283,37 @@ __global__ __launch_bounds__(kThreads) void headNormRopeKernel(HeadNormRopeArgs 
     const int r = task / a.heads;
     if (r >= liveRows(a.extent)) return;
     __shared__ float scratch[kThreads];
+    __shared__ float vec[kMaxHeadDim];
+    __shared__ int exponents[kMaxHeadDim / kFP4BlockSize];
     float *v = a.data + static_cast<std::size_t>(task) * a.headDim;
+    for (int d = threadIdx.x; d < a.headDim; d += kThreads) vec[d] = v[d];
+    __syncthreads();
     if (a.normalize)
     {
         float partial = 0.0f;
-        for (int d = threadIdx.x; d < a.headDim; d += kThreads) partial = fmaf(v[d], v[d], partial);
+        for (int d = threadIdx.x; d < a.headDim; d += kThreads) partial = fmaf(vec[d], vec[d], partial);
         const float ss = blockSum(partial, scratch);
         const float inv = 1.0f / sqrtf(ss / static_cast<float>(a.headDim) + a.eps);
-        for (int d = threadIdx.x; d < a.headDim; d += kThreads) v[d] = v[d] * inv * (a.gain ? a.gain[d] : 1.0f);
+        for (int d = threadIdx.x; d < a.headDim; d += kThreads) vec[d] = vec[d] * inv * (a.gain ? a.gain[d] : 1.0f);
         __syncthreads();
     }
-    if (a.rope.ropeDim == 0) return;
-    const int position = a.positions[r];
-    float *tail = v + (a.headDim - a.rope.ropeDim);
-    for (int pair = threadIdx.x; pair < a.rope.ropeDim / 2; pair += kThreads)
+    if (a.rope.ropeDim > 0)
     {
-        const float angle = static_cast<float>(position) * math::ropeFrequency(a.rope, pair);
-        const float c = cosf(angle);
-        const float s = a.inverse ? -sinf(angle) : sinf(angle);
-        const float x0 = tail[2 * pair], x1 = tail[2 * pair + 1];
-        tail[2 * pair] = x0 * c - x1 * s;
-        tail[2 * pair + 1] = x0 * s + x1 * c;
+        const int position = a.positions[r];
+        float *tail = vec + (a.headDim - a.rope.ropeDim);
+        for (int pair = threadIdx.x; pair < a.rope.ropeDim / 2; pair += kThreads)
+        {
+            const float angle = static_cast<float>(position) * math::ropeFrequency(a.rope, pair);
+            const float c = cosf(angle);
+            const float s = a.inverse ? -sinf(angle) : sinf(angle);
+            const float x0 = tail[2 * pair], x1 = tail[2 * pair + 1];
+            tail[2 * pair] = x0 * c - x1 * s;
+            tail[2 * pair + 1] = x0 * s + x1 * c;
+        }
+        __syncthreads();
     }
+    quantizeShared(a.quant, vec, a.headDim, a.rope.ropeDim, exponents);
+    for (int d = threadIdx.x; d < a.headDim; d += kThreads) v[d] = vec[d];
 }
 
 // --------------------------------------------------------------------------- compressor
@@ -198,11 +323,16 @@ __global__ __launch_bounds__(kThreads) void compressorStoreKernel(CompressorStor
     const std::size_t index = static_cast<std::size_t>(blockIdx.x) * kThreads + threadIdx.x;
     const std::size_t r = index / width;
     const int c = static_cast<int>(index % width);
-    if (r >= static_cast<std::size_t>(liveRows(a.extent))) return;
-    const int pos = a.positions[r];
-    const std::size_t slot = static_cast<std::size_t>(pos % a.geometry.ringRows) * width + c;
-    a.ringKV[slot] = a.kv[index];
-    a.ringScore[slot] = a.score[index] + a.ape[static_cast<std::size_t>(pos % a.geometry.ratio) * width + c];
+    const int live = liveRows(a.extent);
+    if (r >= static_cast<std::size_t>(live)) return;
+    const int start = contiguousStart(a.positions, static_cast<int>(r));
+    const int pos = start + static_cast<int>(r);
+    const int states = a.geometry.stateRows();
+    // Only the final stateRows() positions survive; each slot has one writer.
+    if (pos <= start + live - 1 - states) return;
+    const std::size_t slot = static_cast<std::size_t>(pos % states) * width + c;
+    a.stateKV[slot] = a.kv[index];
+    a.stateScore[slot] = a.score[index] + a.ape[static_cast<std::size_t>(pos % a.geometry.ratio) * width + c];
 }
 
 __global__ __launch_bounds__(kThreads) void compressorPoolKernel(CompressorPoolArgs a)
@@ -210,16 +340,29 @@ __global__ __launch_bounds__(kThreads) void compressorPoolKernel(CompressorPoolA
     const int r = static_cast<int>(blockIdx.x);
     if (r >= liveRows(a.extent)) return;
     const auto &g = a.geometry;
-    const int pos = a.positions[r];
+    const int start = contiguousStart(a.positions, r);
+    const int pos = start + r;
     if ((pos + 1) % g.ratio != 0) return;
     const int block = pos / g.ratio;
     if (block >= g.poolRows) invalidDeviceState();
     __shared__ float scratch[kThreads];
+    __shared__ float vec[kMaxHeadDim];
+    __shared__ int exponents[kMaxHeadDim / kFP4BlockSize];
     const int width = g.projectionWidth();
+    const int states = g.stateRows();
     const int d = g.headDim;
     const int first = block * g.ratio;
     const int entries = g.overlap() ? 2 * g.ratio : g.ratio;
-    float *out = a.pool + static_cast<std::size_t>(block) * d;
+    // Projection of position p: the chunk scratch, else the carried state.
+    const auto kvAt = [&](int p, int ch) {
+        return p >= start ? a.kv[static_cast<std::size_t>(p - start) * width + ch]
+                          : a.stateKV[static_cast<std::size_t>(p % states) * width + ch];
+    };
+    const auto scoreAt = [&](int p, int ch) {
+        return p >= start ? a.score[static_cast<std::size_t>(p - start) * width + ch] +
+                                a.ape[static_cast<std::size_t>(p % g.ratio) * width + ch]
+                          : a.stateScore[static_cast<std::size_t>(p % states) * width + ch];
+    };
     float sq = 0.0f;
     for (int c = threadIdx.x; c < d; c += kThreads)
     {
@@ -229,8 +372,7 @@ __global__ __launch_bounds__(kThreads) void compressorPoolKernel(CompressorPoolA
             const bool prev = g.overlap() && e < g.ratio;
             const int p = prev ? first - g.ratio + e : first + (g.overlap() ? e - g.ratio : e);
             if (p < 0) continue;
-            const int ch = prev ? c : (g.overlap() ? d + c : c);
-            m = fmaxf(m, a.ringScore[static_cast<std::size_t>(p % g.ringRows) * width + ch]);
+            m = fmaxf(m, scoreAt(p, prev ? c : (g.overlap() ? d + c : c)));
         }
         float sum = 0.0f, acc = 0.0f;
         for (int e = 0; e < entries; ++e)
@@ -239,20 +381,19 @@ __global__ __launch_bounds__(kThreads) void compressorPoolKernel(CompressorPoolA
             const int p = prev ? first - g.ratio + e : first + (g.overlap() ? e - g.ratio : e);
             if (p < 0) continue;
             const int ch = prev ? c : (g.overlap() ? d + c : c);
-            const std::size_t at = static_cast<std::size_t>(p % g.ringRows) * width + ch;
-            const float w = expf(a.ringScore[at] - m);
+            const float w = expf(scoreAt(p, ch) - m);
             sum += w;
-            acc = fmaf(w, a.ringKV[at], acc);
+            acc = fmaf(w, kvAt(p, ch), acc);
         }
         const float value = acc / sum;
-        out[c] = value;
+        vec[c] = value;
         sq = fmaf(value, value, sq);
     }
     const float ss = blockSum(sq, scratch);
     const float inv = 1.0f / sqrtf(ss / static_cast<float>(d) + a.eps);
-    for (int c = threadIdx.x; c < d; c += kThreads) out[c] = out[c] * inv * a.gain[c];
+    for (int c = threadIdx.x; c < d; c += kThreads) vec[c] = vec[c] * inv * a.gain[c];
     __syncthreads();
-    float *tail = out + (d - a.rope.ropeDim);
+    float *tail = vec + (d - a.rope.ropeDim);
     for (int pair = threadIdx.x; pair < a.rope.ropeDim / 2; pair += kThreads)
     {
         const float angle = static_cast<float>(block * g.ratio) * math::ropeFrequency(a.rope, pair);
@@ -261,59 +402,81 @@ __global__ __launch_bounds__(kThreads) void compressorPoolKernel(CompressorPoolA
         tail[2 * pair] = x0 * c - x1 * s;
         tail[2 * pair + 1] = x0 * s + x1 * c;
     }
+    __syncthreads();
+    std::uint8_t *entry = a.pool + static_cast<std::size_t>(block) * g.entryBytes();
+    if (g.stream == CompressedStream::Attention)
+        packKVShared({d, g.ropeDim}, vec, exponents, entry);
+    else
+    {
+        hadamardShared(vec, d);
+        packIndexerShared({d}, vec, exponents, entry);
+    }
 }
 
+/** @brief One CTA per live row: pack the last @c window rows into the ring. */
 __global__ __launch_bounds__(kThreads) void rawStoreKernel(RawStoreArgs a)
 {
-    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * kThreads + threadIdx.x;
-    const std::size_t r = index / a.headDim;
-    const int c = static_cast<int>(index % a.headDim);
-    if (r >= static_cast<std::size_t>(liveRows(a.extent))) return;
-    a.ring[static_cast<std::size_t>(a.positions[r] % a.ringRows) * a.headDim + c] = a.kv[index];
+    const int r = static_cast<int>(blockIdx.x);
+    const int live = liveRows(a.extent);
+    if (r >= live) return;
+    const int start = contiguousStart(a.positions, r);
+    const int pos = start + r;
+    if (pos <= start + live - 1 - a.window) return;
+    __shared__ float vec[kMaxHeadDim];
+    __shared__ int exponents[kMaxHeadDim / kFP4BlockSize];
+    const float *src = a.kv + static_cast<std::size_t>(r) * a.format.headDim;
+    for (int c = threadIdx.x; c < a.format.headDim; c += kThreads) vec[c] = src[c];
+    __syncthreads();
+    packKVShared(a.format, vec, exponents,
+                 a.ring + static_cast<std::size_t>(pos % a.window) * a.format.entryBytes());
 }
 
 // --------------------------------------------------------------------------- indexer
-/** @brief Score kernel: grid (row, tile); each thread scores one pool block. */
-__global__ __launch_bounds__(kThreads) void indexerScoreKernel(IndexerTopKArgs a)
+/**
+ * @brief Score kernel for one bounded pass: grid (block tile, pass row).
+ * @details Each thread scores one pool block against all heads with the
+ * shared qat::indexerDot order and a fused-multiply-add head accumulation,
+ * the same arithmetic as the CPU bundle (bit-identical scores).
+ */
+__global__ __launch_bounds__(kThreads) void indexerScoreKernel(IndexerTopKArgs a, int rowBase)
 {
-    const int r = static_cast<int>(blockIdx.y);
+    const int r = rowBase + static_cast<int>(blockIdx.y);
     if (r >= liveRows(a.extent)) return;
+    const int dim = a.format.headDim;
     const int visible = min((a.positions[r] + 1) / a.ratio, a.poolRows);
     const int b = static_cast<int>(blockIdx.x) * kThreads + threadIdx.x;
     extern __shared__ float query[]; // [heads * headDim]
-    const float *q = a.query + static_cast<std::size_t>(r) * a.heads * a.headDim;
-    for (int i = threadIdx.x; i < a.heads * a.headDim; i += kThreads) query[i] = q[i];
+    const float *q = a.query + static_cast<std::size_t>(r) * a.heads * dim;
+    for (int i = threadIdx.x; i < a.heads * dim; i += kThreads) query[i] = q[i];
     __syncthreads();
     if (b >= visible) return;
-    const float *k = a.pool + static_cast<std::size_t>(b) * a.headDim;
+    const std::uint8_t *entry = a.pool + static_cast<std::size_t>(b) * a.format.entryBytes();
     const float *w = a.weights + static_cast<std::size_t>(r) * a.heads;
     float score = 0.0f;
     for (int h = 0; h < a.heads; ++h)
     {
-        float dot = 0.0f;
-        const float *qh = query + h * a.headDim;
-        for (int c = 0; c < a.headDim; ++c) dot = fmaf(qh[c], k[c], dot);
-        score += fmaxf(dot, 0.0f) * (w[h] * a.weightScale);
+        const float dot = qat::indexerDot(a.format, query + h * dim, entry);
+        score = fmaf(fmaxf(dot, 0.0f), w[h] * a.weightScale, score);
     }
-    a.scores[static_cast<std::size_t>(r) * a.poolRows + b] = score;
+    a.scores[static_cast<std::size_t>(blockIdx.y) * a.poolRows + b] = score;
 }
 
 /** @brief Order-preserving map of a float to an unsigned key (larger float -> larger key). */
 __device__ inline unsigned orderedKey(float value)
 {
-    const unsigned bits = __float_as_uint(value);
+    const unsigned bits = __float_as_uint(value == 0.0f ? 0.0f : value); // -0 ties +0, as on CPU
     return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
-/** @brief Per-row radix selection of the top-k keys; output set in ascending block order. */
-__global__ __launch_bounds__(kThreads) void indexerSelectKernel(IndexerTopKArgs a)
+/** @brief Per-row radix selection of the top-k keys of one pass; output set in ascending block order. */
+__global__ __launch_bounds__(kThreads) void indexerSelectKernel(IndexerTopKArgs a, int rowBase)
 {
-    const int r = static_cast<int>(blockIdx.x);
+    const int r = rowBase + static_cast<int>(blockIdx.x);
     if (r >= liveRows(a.extent)) return;
     const int visible = min((a.positions[r] + 1) / a.ratio, a.poolRows);
     const int keep = min(a.topK, visible);
     std::int32_t *out = a.selected + static_cast<std::size_t>(r) * a.topK;
-    const float *scores = a.scores + static_cast<std::size_t>(r) * a.poolRows;
+    const float *scores = a.scores + static_cast<std::size_t>(blockIdx.x) * a.poolRows;
     __shared__ unsigned histogram[256];
     __shared__ unsigned prefix, prefixMask, remaining;
     if (threadIdx.x == 0) { prefix = 0; prefixMask = 0; remaining = static_cast<unsigned>(keep); }
@@ -377,19 +540,22 @@ __global__ __launch_bounds__(kThreads) void sparseAttentionKernel(SparseAttentio
     const int r = task / a.heads;
     const int h = task % a.heads;
     if (r >= liveRows(a.extent)) return;
-    const int dim = a.headDim; // <= 32 * kMaxPerLane
-    constexpr int kMaxPerLane = 16;
+    const int dim = a.format.headDim; // <= 32 * kMaxPerLane
+    constexpr int kMaxPerLane = kMaxHeadDim / 32;
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
-    const int pos = a.positions[r];
+    const int start = contiguousStart(a.positions, r);
+    const int pos = start + r;
+    const std::size_t entryBytes = static_cast<std::size_t>(a.format.entryBytes());
     const float *q = a.query + static_cast<std::size_t>(task) * dim;
     float qv[kMaxPerLane];
     float acc[kMaxPerLane];
     const int perLane = (dim + 31) / 32;
-    for (int i = 0; i < perLane; ++i)
+#pragma unroll
+    for (int i = 0; i < kMaxPerLane; ++i)
     {
         const int c = lane + 32 * i;
-        qv[i] = c < dim ? q[c] : 0.0f;
+        qv[i] = i < perLane && c < dim ? q[c] : 0.0f;
         acc[i] = 0.0f;
     }
     const int rawFirst = max(0, pos - a.window + 1);
@@ -401,9 +567,15 @@ __global__ __launch_bounds__(kThreads) void sparseAttentionKernel(SparseAttentio
     float m = -FLT_MAX, l = 0.0f;
     for (int t = warp; t < total; t += kWarps)
     {
-        const float *key;
+        // Key source: this chunk's QAT kv (FP32), else a packed record.
+        const float *chunkKey = nullptr;
+        const std::uint8_t *entry = nullptr;
         if (t < rawCount)
-            key = a.rawRing + static_cast<std::size_t>((rawFirst + t) % a.rawRingRows) * dim;
+        {
+            const int p = rawFirst + t;
+            if (p >= start) chunkKey = a.chunkKV + static_cast<std::size_t>(p - start) * dim;
+            else entry = a.rawRing + static_cast<std::size_t>(p % a.window) * entryBytes;
+        }
         else
         {
             int block = t - rawCount;
@@ -412,14 +584,17 @@ __global__ __launch_bounds__(kThreads) void sparseAttentionKernel(SparseAttentio
                 block = a.selected[static_cast<std::size_t>(r) * a.topK + block];
                 if (block < 0) continue;
             }
-            key = a.pool + static_cast<std::size_t>(block) * dim;
+            entry = a.pool + static_cast<std::size_t>(block) * entryBytes;
         }
         float kv[kMaxPerLane];
         float dot = 0.0f;
-        for (int i = 0; i < perLane; ++i)
+#pragma unroll
+        for (int i = 0; i < kMaxPerLane; ++i)
         {
             const int c = lane + 32 * i;
-            kv[i] = c < dim ? key[c] : 0.0f;
+            kv[i] = 0.0f;
+            if (i < perLane && c < dim)
+                kv[i] = chunkKey ? chunkKey[c] : qat::decodeKVChannel(a.format, entry, c);
             dot = fmaf(qv[i], kv[i], dot);
         }
         const float logit = warpSum(dot) * a.scale;
@@ -427,13 +602,15 @@ __global__ __launch_bounds__(kThreads) void sparseAttentionKernel(SparseAttentio
         const float correction = expf(m - mNew);
         const float p = expf(logit - mNew);
         l = l * correction + p;
-        for (int i = 0; i < perLane; ++i) acc[i] = acc[i] * correction + p * kv[i];
+#pragma unroll
+        for (int i = 0; i < kMaxPerLane; ++i) acc[i] = acc[i] * correction + p * kv[i];
         m = mNew;
     }
     __shared__ float warpM[kWarps], warpL[kWarps];
     __shared__ float merged[kWarps][32 * kMaxPerLane];
     if (lane == 0) { warpM[warp] = m; warpL[warp] = l; }
-    for (int i = 0; i < perLane; ++i) merged[warp][lane + 32 * i] = acc[i];
+#pragma unroll
+    for (int i = 0; i < kMaxPerLane; ++i) merged[warp][lane + 32 * i] = acc[i];
     __syncthreads();
     if (warp == 0)
     {
@@ -546,6 +723,14 @@ __global__ __launch_bounds__(kThreads) void routeKernel(SqrtSoftplusRouteArgs a)
     for (int i = 0; i < a.topK; ++i) w[i] = w[i] / sum * a.routeScale;
 }
 
+/** @brief Grid-stride zero fill of 32-bit words. */
+__global__ __launch_bounds__(kThreads) void zeroWordsKernel(std::uint32_t *words, std::size_t count)
+{
+    for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * kThreads + threadIdx.x; i < count;
+         i += static_cast<std::size_t>(gridDim.x) * kThreads)
+        words[i] = 0u;
+}
+
 // --------------------------------------------------------------------------- host bundle
 DSV4_NATIVE_STREAM explicitStream(void *stream)
 {
@@ -600,45 +785,68 @@ public:
     }
     void headNormRope(const HeadNormRopeArgs &a, void *stream) const override
     {
-        require(a.data && (a.positions || a.rope.ropeDim == 0) && a.headDim >= a.rope.ropeDim, "headNormRope operands");
+        require(a.data && (a.positions || a.rope.ropeDim == 0) && a.headDim >= a.rope.ropeDim &&
+                    a.headDim <= kMaxHeadDim, "headNormRope operands");
+        require(a.quant == ActivationQuant::None ||
+                    (a.quant == ActivationQuant::FP8NopeBF16Rope ? PackedKVEntryFormat{a.headDim, a.rope.ropeDim}.valid()
+                                                                 : PackedIndexerKeyFormat{a.headDim}.valid()),
+                "headNormRope QAT geometry is not representable");
         headNormRopeKernel<<<grid(static_cast<std::size_t>(a.extent.rows) * a.heads, 1), kThreads, 0,
                              explicitStream(stream)>>>(a);
         checkLaunch("headNormRope");
     }
     void compressorStore(const CompressorStoreArgs &a, void *stream) const override
     {
-        require(a.positions && a.kv && a.score && a.ape && a.ringKV && a.ringScore, "compressorStore operands");
+        require(a.positions && a.kv && a.score && a.ape && a.stateKV && a.stateScore, "compressorStore operands");
         compressorStoreKernel<<<grid(static_cast<std::size_t>(a.extent.rows) * a.geometry.projectionWidth()), kThreads, 0,
                                 explicitStream(stream)>>>(a);
         checkLaunch("compressorStore");
     }
     void compressorPool(const CompressorPoolArgs &a, void *stream) const override
     {
-        require(a.positions && a.ringKV && a.ringScore && a.gain && a.pool, "compressorPool operands");
+        const auto &g = a.geometry;
+        require(a.positions && a.kv && a.score && a.ape && a.stateKV && a.stateScore && a.gain && a.pool &&
+                    g.headDim <= kMaxHeadDim,
+                "compressorPool operands");
+        require(g.stream == CompressedStream::Indexer ? PackedIndexerKeyFormat{g.headDim}.valid()
+                    : PackedKVEntryFormat{g.headDim, g.ropeDim}.valid() && g.ropeDim == a.rope.ropeDim,
+                "compressorPool record geometry is not representable");
         compressorPoolKernel<<<grid(a.extent.rows, 1), kThreads, 0, explicitStream(stream)>>>(a);
         checkLaunch("compressorPool");
     }
     void rawStore(const RawStoreArgs &a, void *stream) const override
     {
-        require(a.positions && a.kv && a.ring, "rawStore operands");
-        rawStoreKernel<<<grid(static_cast<std::size_t>(a.extent.rows) * a.headDim), kThreads, 0, explicitStream(stream)>>>(a);
+        require(a.positions && a.kv && a.ring && a.window > 0 && a.format.valid() && a.format.headDim <= kMaxHeadDim,
+                "rawStore operands");
+        rawStoreKernel<<<grid(a.extent.rows, 1), kThreads, 0, explicitStream(stream)>>>(a);
         checkLaunch("rawStore");
     }
     void indexerTopK(const IndexerTopKArgs &a, void *stream) const override
     {
-        require(a.positions && a.query && a.weights && a.pool && a.selected && a.scores && a.topK > 0,
-                "indexerTopK operands (GPU requires score scratch)");
-        const std::size_t shared = static_cast<std::size_t>(a.heads) * a.headDim * sizeof(float);
+        require(a.positions && a.query && a.weights && a.pool && a.selected && a.scores && a.topK > 0 &&
+                    a.scoreRows > 0 && a.format.valid(),
+                "indexerTopK operands (GPU requires bounded score scratch)");
+        const std::size_t shared = static_cast<std::size_t>(a.heads) * a.format.headDim * sizeof(float);
         require(shared <= 48 * 1024, "indexer query exceeds the default shared-memory budget");
-        const dim3 scoreGrid(grid(a.poolRows), static_cast<unsigned>(a.extent.rows));
-        indexerScoreKernel<<<scoreGrid, kThreads, shared, explicitStream(stream)>>>(a);
-        checkLaunch("indexerScore");
-        indexerSelectKernel<<<grid(a.extent.rows, 1), kThreads, 0, explicitStream(stream)>>>(a);
-        checkLaunch("indexerSelect");
+        const auto native = explicitStream(stream);
+        // Fixed pass count from the admitted row bound: the scratch holds
+        // scoreRows rows, reused in stream order by consecutive passes.
+        for (int base = 0; base < a.extent.rows; base += a.scoreRows)
+        {
+            const int passRows = std::min(a.scoreRows, a.extent.rows - base);
+            const dim3 scoreGrid(grid(a.poolRows), static_cast<unsigned>(passRows));
+            indexerScoreKernel<<<scoreGrid, kThreads, shared, native>>>(a, base);
+            checkLaunch("indexerScore");
+            indexerSelectKernel<<<grid(passRows, 1), kThreads, 0, native>>>(a, base);
+            checkLaunch("indexerSelect");
+        }
     }
     void sparseAttention(const SparseAttentionArgs &a, void *stream) const override
     {
-        require(a.positions && a.query && a.rawRing && a.sinks && a.output && a.headDim <= 512, "sparseAttention operands");
+        require(a.positions && a.query && a.chunkKV && a.rawRing && a.sinks && a.output && a.window > 0 &&
+                    a.format.valid() && a.format.headDim <= kMaxHeadDim && a.format.ropeDim == a.rope.ropeDim,
+                "sparseAttention operands");
+        require(a.access == CompressedAccess::None || (a.pool && a.ratio > 0), "compressed access requires a pool");
         sparseAttentionKernel<<<grid(static_cast<std::size_t>(a.extent.rows) * a.heads, 1), kThreads, 0,
                                 explicitStream(stream)>>>(a);
         checkLaunch("sparseAttention");
@@ -657,6 +865,14 @@ public:
         require(a.hashTable ? (a.tokens != nullptr) : (a.bias != nullptr), "route policy operands");
         routeKernel<<<grid(a.extent.rows, 1), 32, 0, explicitStream(stream)>>>(a);
         checkLaunch("route");
+    }
+    void zeroBank(void *destination, std::size_t bytes, void *stream) const override
+    {
+        require(destination && bytes % 4 == 0, "zeroBank requires 4-byte aligned device storage");
+        const std::size_t words = bytes / 4;
+        zeroWordsKernel<<<std::min<unsigned>(grid(words), 4096u), kThreads, 0, explicitStream(stream)>>>(
+            static_cast<std::uint32_t *>(destination), words);
+        checkLaunch("zeroBank");
     }
 };
 } // namespace DSV4_BACKEND_NAMESPACE

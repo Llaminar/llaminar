@@ -26,13 +26,6 @@ namespace llaminar2
 {
     namespace
     {
-        /** @brief Persistent state family inferred from canonical layer metadata. */
-        enum class LayerStorageKind
-        {
-            FullAttention,
-            GDN,
-        };
-
         /** @brief Reject byte-count overflow before producing an admission contribution. */
         [[nodiscard]] std::size_t checkedAdd(
             std::size_t left,
@@ -65,28 +58,32 @@ namespace llaminar2
         }
 
         /** @brief Prefer concrete tensor geometry to the model's periodic layer map. */
-        LayerStorageKind classifyLayer(
+        LayerStateKind classifyLayer(
             const ModelMemoryProfile &profile,
             int layer)
         {
+            // DeepSeek-V4: raw window, compressor state and compressed/indexer
+            // pools are model arena banks; the cache keeps only the frontier.
+            if (profile.deepseek_v4)
+                return LayerStateKind::ModelOwned;
             if (profile.flash_next)
                 return profile.flashNextLayerKind(layer) == Qwen4ExpLayerKind::GDN
-                    ? LayerStorageKind::GDN : LayerStorageKind::FullAttention;
+                    ? LayerStateKind::GDN : LayerStateKind::FullAttention;
             if (layerHasTensor(profile, layer, ".attn_qkv.weight"))
-                return LayerStorageKind::GDN;
+                return LayerStateKind::GDN;
             if (layerHasTensor(profile, layer, ".attn_q.weight") ||
                 layerHasTensor(profile, layer, ".attn_k.weight") ||
                 layerHasTensor(profile, layer, ".attn_v.weight") ||
                 layerHasTensor(profile, layer, ".attn_output.weight"))
             {
-                return LayerStorageKind::FullAttention;
+                return LayerStateKind::FullAttention;
             }
             if (profile.full_attention_interval > 0 &&
                 (layer + 1) % profile.full_attention_interval != 0)
             {
-                return LayerStorageKind::GDN;
+                return LayerStateKind::GDN;
             }
-            return LayerStorageKind::FullAttention;
+            return LayerStateKind::FullAttention;
         }
 
     } // namespace
@@ -96,7 +93,15 @@ namespace llaminar2
     {
         if (layer < 0 || layer >= profile.totalLayerCount())
             throw std::invalid_argument("KV layer classification index is outside the model");
-        return classifyLayer(profile, layer) == LayerStorageKind::FullAttention;
+        return layerStateKind(profile, layer) == LayerStateKind::FullAttention;
+    }
+
+    LayerStateKind PersistentStateMemoryEstimator::layerStateKind(
+        const ModelMemoryProfile &profile, int layer)
+    {
+        if (layer < 0 || layer >= profile.totalLayerCount())
+            throw std::invalid_argument("Layer state classification index is outside the model");
+        return classifyLayer(profile, layer);
     }
 
     PersistentStateEstimate PersistentStateMemoryEstimator::estimate(
@@ -121,9 +126,10 @@ namespace llaminar2
         // A main-model PP slice still uses the hybrid factory when its model
         // has a GDN layer map, even when this particular slice contains only
         // FA layers. The shifted predictor is a separate attention-only cache.
+        // Model-owned attention state uses the frontier-only hybrid cache.
         result.main_kv_family =
-            profile.gdn_conv_kernel_size > 0 && profile.gdn_state_size > 0 &&
-                    profile.full_attention_interval > 0
+            (profile.gdn_conv_kernel_size > 0 && profile.gdn_state_size > 0 &&
+             profile.full_attention_interval > 0) || profile.deepseek_v4
                 ? KVCacheFamily::Hybrid : KVCacheFamily::AttentionOnly;
         const int main_layer_count =
             profile.mainLayerCount();
@@ -138,13 +144,11 @@ namespace llaminar2
              layer <= last_main_layer;
              ++layer)
         {
-            if (!isFullAttentionLayer(profile, layer))
+            switch (layerStateKind(profile, layer))
             {
-                ++result.main_gdn_layers;
-            }
-            else
-            {
-                ++result.main_full_attention_layers;
+            case LayerStateKind::FullAttention: ++result.main_full_attention_layers; break;
+            case LayerStateKind::GDN: ++result.main_gdn_layers; break;
+            case LayerStateKind::ModelOwned: ++result.main_model_owned_layers; break;
             }
         }
 
@@ -154,13 +158,12 @@ namespace llaminar2
                  layer < profile.totalLayerCount();
                  ++layer)
             {
-                if (!isFullAttentionLayer(profile, layer))
+                switch (layerStateKind(profile, layer))
                 {
-                    ++result.mtp_gdn_layers;
-                }
-                else
-                {
-                    ++result.mtp_full_attention_layers;
+                case LayerStateKind::FullAttention: ++result.mtp_full_attention_layers; break;
+                case LayerStateKind::GDN: ++result.mtp_gdn_layers; break;
+                case LayerStateKind::ModelOwned:
+                    throw std::invalid_argument("Model-owned attention state has no shifted MTP predictor cache");
                 }
             }
         }

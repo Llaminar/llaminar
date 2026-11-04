@@ -20,6 +20,8 @@
 
 #pragma once
 
+#include "../models/AttentionStateOwner.h"
+
 #include "OrchestrationConfig.h"
 #include "TensorParallelConfig.h"
 #include "planning/TensorParallelSourceDeclaration.h"
@@ -210,9 +212,10 @@ namespace llaminar2
         /**
          * @brief Reject runtime features the DeepSeek-V4 graph does not implement yet.
          *
-         * The compressor rings, compressed/indexer pools and raw window live in
-         * graph-arena state that the prefix cache neither archives nor restores,
-         * so a prefix hit would resume over another request's state. MTP/DSpark
+         * Model-owned attention banks (AttentionStateOwner::ModelBanks: the
+         * DeepSeek-V4 raw window, compressor state and compressed/indexer
+         * pools) are neither archived nor restored by the prefix cache, so a
+         * prefix hit would resume over another request's state. MTP/DSpark
          * and dense TP/PP have no DeepSeek-V4 graph either. Multi-device
          * placement uses ExpertOverlay (`--expert-tier`), which is supported.
          */
@@ -221,12 +224,13 @@ namespace llaminar2
             const IModelContext &model,
             TPPPValidationResult &result)
         {
+            if (attentionStateOwnerOf(model.architecture()) == AttentionStateOwner::ModelBanks &&
+                config.prefix_cache.enabled &&
+                config.prefix_cache.storage_mode != PrefixCacheStorageMode::Disabled)
+                result.addError("DeepSeek V4: prefix cache unimplemented (model-owned attention banks are "
+                                "not archived); pass --no-prefix-cache");
             if (model.architecture() != "deepseek4")
                 return;
-            if (config.prefix_cache.enabled &&
-                config.prefix_cache.storage_mode != PrefixCacheStorageMode::Disabled)
-                result.addError("DeepSeek V4: prefix cache unimplemented (compressor and "
-                                "indexer state is not archived); pass --no-prefix-cache");
             if (config.mtp.enabled)
                 result.addError("DeepSeek V4: MTP/DSpark speculative decoding unimplemented; omit --mtp");
             if (config.tp_degree > 1 || config.pp_degree > 1)
