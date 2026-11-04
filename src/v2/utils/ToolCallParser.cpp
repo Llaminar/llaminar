@@ -502,8 +502,13 @@ namespace llaminar2
     //
     // - The section opens at <｜DSML｜tool_calls>, the observed misspellings
     //   <｜DSML｜toolcalls>/<｜DSML｜tool>, or a bare invoke. The official
-    //   encoder writes "\n\n" before the section; that separator belongs to
-    //   the protocol, not to the visible content.
+    //   encoder writes "\n\n" before the section and the official parser
+    //   (encoding_dsv4.py parse_message_from_completion_text, stop token
+    //   "\n\n<｜DSML｜tool_calls") removes it from the content. Deliberate
+    //   difference from vLLM, which keeps it (strip_content_whitespace_with_tools
+    //   = False): replaying vLLM's content re-renders "\n\n\n\n" before the
+    //   section, while this keeps a replayed tool turn byte-identical to the
+    //   trained format.
     // - An invoke ends at </｜DSML｜invoke> or </｜DSML｜tool_calls>.
     // - Parameters: string="true" keeps the raw text; otherwise (or with the
     //   attribute missing) JSON, falling back to the raw text. A parameter ends
