@@ -12,8 +12,10 @@
 
 #include "ToolCallParser.h"
 #include "Logger.h"
+#include "PythonJson.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <iomanip>
 #include <optional>
@@ -486,6 +488,252 @@ namespace llaminar2
     }
 
     // =========================================================================
+    // DeepSeek-V4 DSML parser
+    // =========================================================================
+    //
+    // Grammar (vLLM vllm/parser/deepseek_v4.py, the production comparison
+    // target; reasoning is split before this parser):
+    //
+    //   [content]\n\n<｜DSML｜tool_calls>
+    //   <｜DSML｜invoke name="f">
+    //   <｜DSML｜parameter name="k" string="true|false">v</｜DSML｜parameter>
+    //   </｜DSML｜invoke>
+    //   </｜DSML｜tool_calls>
+    //
+    // - The section opens at <｜DSML｜tool_calls>, the observed misspellings
+    //   <｜DSML｜toolcalls>/<｜DSML｜tool>, or a bare invoke. The official
+    //   encoder writes "\n\n" before the section; that separator belongs to
+    //   the protocol, not to the visible content.
+    // - An invoke ends at </｜DSML｜invoke> or </｜DSML｜tool_calls>.
+    // - Parameters: string="true" keeps the raw text; otherwise (or with the
+    //   attribute missing) JSON, falling back to the raw text. A parameter ends
+    //   at its close tag or at the next parameter head. Arguments are emitted
+    //   with Python json.dumps spelling.
+    // - A tool call ends the turn: text between/after invokes is dropped.
+    // - Fail closed: a section without one complete invoke stays content, and
+    //   an incomplete trailing invoke becomes content after the complete calls.
+
+    namespace
+    {
+        const std::string kDsml = "｜DSML｜";
+        const std::string kDsmlInvokePrefix = "<" + kDsml + "invoke name=\"";
+        const std::string kDsmlInvokeEnd = "</" + kDsml + "invoke>";
+        const std::string kDsmlToolEnd = "</" + kDsml + "tool_calls>";
+        const std::string kDsmlParamStart = "<" + kDsml + "parameter";
+        const std::string kDsmlParamClose = "</" + kDsml + "parameter>";
+        /** @brief Section openers; the separator-owning spellings start earlier and so win ties. */
+        const std::array<std::string, 8> kDsmlOpeners = {
+            "\n\n<" + kDsml + "tool_calls>", "\n\n<" + kDsml + "toolcalls>", "\n\n<" + kDsml + "tool>",
+            "\n\n" + kDsmlInvokePrefix,
+            "<" + kDsml + "tool_calls>", "<" + kDsml + "toolcalls>", "<" + kDsml + "tool>", kDsmlInvokePrefix};
+
+        size_t findDsmlSection(const std::string &text)
+        {
+            size_t best = std::string::npos;
+            for (const auto &opener : kDsmlOpeners)
+                best = std::min(best, text.find(opener));
+            return best;
+        }
+
+        size_t dsmlPartialOpenerLength(const std::string &text)
+        {
+            size_t held = 0;
+            for (const auto &opener : kDsmlOpeners)
+                held = std::max(held, partialMarkerSuffixLength(text, opener));
+            return held;
+        }
+
+        bool isRegexSpace(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'; }
+
+        /**
+         * @brief Match `\s+name="([^"]+)"(?:\s+string="([^"]*)")?\s*>` at @p i.
+         * @return Position after '>' or npos.
+         */
+        size_t matchDsmlParamHead(const std::string &raw, size_t i, std::string &name,
+                                  std::optional<std::string> &is_string)
+        {
+            const size_t ws = i;
+            while (i < raw.size() && isRegexSpace(raw[i])) ++i;
+            if (i == ws || raw.compare(i, 6, "name=\"") != 0) return std::string::npos;
+            i += 6;
+            const size_t name_end = raw.find('"', i);
+            if (name_end == std::string::npos || name_end == i) return std::string::npos;
+            name = raw.substr(i, name_end - i);
+            i = name_end + 1;
+            // Optional string attribute (regex backtracks to "absent" when it does not match).
+            size_t j = i;
+            while (j < raw.size() && isRegexSpace(raw[j])) ++j;
+            is_string.reset();
+            if (j > i && raw.compare(j, 8, "string=\"") == 0)
+            {
+                const size_t value_end = raw.find('"', j + 8);
+                if (value_end != std::string::npos)
+                {
+                    is_string = raw.substr(j + 8, value_end - j - 8);
+                    i = value_end + 1;
+                }
+            }
+            while (i < raw.size() && isRegexSpace(raw[i])) ++i;
+            return i < raw.size() && raw[i] == '>' ? i + 1 : std::string::npos;
+        }
+
+        /** @brief Position of the next `<｜DSML｜parameter\s+name=` at or after @p from. */
+        size_t findDsmlNextParamHead(const std::string &raw, size_t from)
+        {
+            for (size_t p = raw.find(kDsmlParamStart, from); p != std::string::npos;
+                 p = raw.find(kDsmlParamStart, p + 1))
+            {
+                size_t i = p + kDsmlParamStart.size();
+                const size_t ws = i;
+                while (i < raw.size() && isRegexSpace(raw[i])) ++i;
+                if (i > ws && raw.compare(i, 5, "name=") == 0) return p;
+            }
+            return std::string::npos;
+        }
+
+        /** @brief _dsml_arg_converter (complete parameters only). */
+        nlohmann::ordered_json convertDsmlArguments(const std::string &raw)
+        {
+            nlohmann::ordered_json params = nlohmann::ordered_json::object();
+            size_t pos = 0;
+            for (size_t p = raw.find(kDsmlParamStart, pos); p != std::string::npos; p = raw.find(kDsmlParamStart, pos))
+            {
+                std::string name;
+                std::optional<std::string> is_string;
+                const size_t value_start = matchDsmlParamHead(raw, p + kDsmlParamStart.size(), name, is_string);
+                if (value_start == std::string::npos) { pos = p + 1; continue; }
+                const size_t close = raw.find(kDsmlParamClose, value_start);
+                const size_t next = findDsmlNextParamHead(raw, value_start);
+                const size_t end = std::min(close, next);
+                if (end == std::string::npos) { pos = p + 1; continue; }
+                const std::string value = raw.substr(value_start, end - value_start);
+                if (is_string && *is_string == "true")
+                    params[name] = value;
+                else
+                {
+                    auto parsed = nlohmann::ordered_json::parse(value, nullptr, false);
+                    params[name] = parsed.is_discarded() ? nlohmann::ordered_json(value) : std::move(parsed);
+                }
+                pos = end == close ? close + kDsmlParamClose.size() : next;
+            }
+            return params;
+        }
+
+        /** @brief _unwrap_wrapper_args: remove a spurious {"arguments"|"input": {...}} wrapper. */
+        std::string unwrapDsmlWrapperArguments(const nlohmann::ordered_json &args, const json &tools,
+                                               const std::string &function_name)
+        {
+            const std::string original = pythonJsonDumps(args);
+            if (!tools.is_array() || tools.empty() || function_name.empty() || !args.is_object()) return original;
+            const json *properties = nullptr;
+            for (const auto &tool : tools)
+                if (tool.contains("function") && tool["function"].value("name", "") == function_name &&
+                    tool["function"].contains("parameters") && tool["function"]["parameters"].contains("properties") &&
+                    tool["function"]["parameters"]["properties"].is_object())
+                {
+                    properties = &tool["function"]["parameters"]["properties"];
+                    break;
+                }
+            if (!properties || properties->empty()) return original;
+            for (const char *wrapper : {"arguments", "input"})
+            {
+                if (args.size() != 1 || !args.contains(wrapper) || properties->contains(wrapper)) continue;
+                nlohmann::ordered_json inner = args[wrapper];
+                if (inner.is_string())
+                {
+                    inner = nlohmann::ordered_json::parse(inner.get<std::string>(), nullptr, false);
+                    if (inner.is_discarded()) return original;
+                }
+                if (!inner.is_object()) continue;
+                const bool subset = std::all_of(inner.items().begin(), inner.items().end(),
+                                                [&](const auto &item) { return properties->contains(item.key()); });
+                if (subset) return pythonJsonDumps(inner);
+            }
+            return original;
+        }
+    } // namespace
+
+    std::vector<StreamingToolCallSplitter::Event>
+    StreamingToolCallSplitter::drainDeepSeekV4(bool terminal)
+    {
+        std::vector<Event> events;
+        if (phase_ == Phase::Content)
+        {
+            const size_t section = findDsmlSection(buffer_);
+            if (section == std::string::npos)
+            {
+                const size_t held = terminal ? 0u : dsmlPartialOpenerLength(buffer_);
+                if (buffer_.size() > held)
+                {
+                    events.push_back(Event::contentEvent(buffer_.substr(0, buffer_.size() - held)));
+                    buffer_.erase(0, buffer_.size() - held);
+                }
+                return events;
+            }
+            if (section > 0) events.push_back(Event::contentEvent(buffer_.substr(0, section)));
+            buffer_.erase(0, section);
+            phase_ = Phase::ToolBlock;
+            dsml_scan_ = 0;
+            dsml_emitted_ = false;
+        }
+
+        // Tool section: buffer_ retains the whole section so a call-less section
+        // can still be returned verbatim. Emit each invoke once it closes.
+        while (true)
+        {
+            const size_t invoke = buffer_.find(kDsmlInvokePrefix, dsml_scan_);
+            size_t name_end = std::string::npos, args_end = std::string::npos, end_size = 0;
+            if (invoke != std::string::npos)
+            {
+                name_end = buffer_.find("\">", invoke + kDsmlInvokePrefix.size());
+                if (name_end != std::string::npos)
+                {
+                    const size_t a = buffer_.find(kDsmlInvokeEnd, name_end + 2);
+                    const size_t b = buffer_.find(kDsmlToolEnd, name_end + 2);
+                    args_end = std::min(a, b);
+                    if (args_end != std::string::npos) end_size = args_end == a ? kDsmlInvokeEnd.size() : kDsmlToolEnd.size();
+                }
+            }
+            if (args_end == std::string::npos)
+            {
+                if (terminal)
+                {
+                    if (!dsml_emitted_) events.push_back(Event::contentEvent(buffer_));
+                    else if (invoke != std::string::npos) events.push_back(Event::contentEvent(buffer_.substr(invoke)));
+                    buffer_.clear();
+                    phase_ = Phase::Content;
+                }
+                return events;
+            }
+            ToolCall call;
+            call.id = generateToolCallId();
+            call.name = buffer_.substr(invoke + kDsmlInvokePrefix.size(), name_end - invoke - kDsmlInvokePrefix.size());
+            call.arguments = unwrapDsmlWrapperArguments(
+                convertDsmlArguments(buffer_.substr(name_end + 2, args_end - name_end - 2)), tools_, call.name);
+            events.push_back(Event::toolCallEvent(std::move(call)));
+            dsml_emitted_ = true;
+            dsml_scan_ = args_end + end_size;
+        }
+    }
+
+    /** @brief Batch DSML parse through the exact streaming state machine. */
+    static ToolCallParseResult parseDeepSeekV4Dsml(const std::string &text, const json &tools)
+    {
+        StreamingToolCallSplitter splitter(ToolCallFormat::DEEPSEEK_V4_DSML, tools);
+        ToolCallParseResult result;
+        auto fold = [&](std::vector<StreamingToolCallSplitter::Event> events) {
+            for (auto &event : events)
+                if (event.kind == StreamingToolCallSplitter::Event::Kind::ToolCall)
+                    result.tool_calls.push_back(std::move(event.tool_call));
+                else
+                    result.content += event.content;
+        };
+        fold(splitter.process(text));
+        fold(splitter.flush());
+        return result;
+    }
+
+    // =========================================================================
     // Generic format parser (fallback)
     // =========================================================================
     //
@@ -590,6 +838,9 @@ namespace llaminar2
         case ToolCallFormat::QWEN_3_XML:
             return parseQwen3Xml(text, tools);
 
+        case ToolCallFormat::DEEPSEEK_V4_DSML:
+            return parseDeepSeekV4Dsml(text, tools);
+
         case ToolCallFormat::GENERIC:
             return parseGeneric(text);
 
@@ -619,6 +870,9 @@ namespace llaminar2
 
         case ToolCallFormat::LLAMA_3X:
             return text.find("<|python_tag|>") != std::string::npos;
+
+        case ToolCallFormat::DEEPSEEK_V4_DSML:
+            return text.find(kDsmlInvokePrefix) != std::string::npos;
 
         case ToolCallFormat::MISTRAL_NEMO:
             return text.find("[TOOL_CALLS]") != std::string::npos;
@@ -685,6 +939,8 @@ namespace llaminar2
     std::vector<StreamingToolCallSplitter::Event>
     StreamingToolCallSplitter::drain(bool terminal)
     {
+        if (format_ == ToolCallFormat::DEEPSEEK_V4_DSML)
+            return drainDeepSeekV4(terminal);
         std::vector<Event> events;
         if (open_marker_.empty() || close_marker_.empty())
         {

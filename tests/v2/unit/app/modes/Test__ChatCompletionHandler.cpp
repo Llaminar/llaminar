@@ -3103,8 +3103,11 @@ TEST_F(Test__ChatCompletionHandler, StreamingUsagePublishesExactCountsAfterTermi
                 {
                     EXPECT_TRUE(chunks.back()["choices"].empty());
                     EXPECT_EQ(chunks.back()["id"], chunks[0]["id"]);
+                    // prompt_tokens_details mirrors vLLM --enable-prompt-tokens-details;
+                    // this mock runner reports no prefix-cache hit.
                     EXPECT_EQ(chunks.back()["usage"], (json{{"prompt_tokens", 5},
-                        {"completion_tokens", length ? 2 : 3}, {"total_tokens", length ? 7 : 8}}));
+                        {"completion_tokens", length ? 2 : 3}, {"total_tokens", length ? 7 : 8},
+                        {"prompt_tokens_details", {{"cached_tokens", 0}}}}));
                 }
             }
 }

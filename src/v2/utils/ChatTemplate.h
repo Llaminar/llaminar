@@ -47,6 +47,16 @@ namespace llaminar2
         /// Function name for tool result messages (role="tool" only, optional).
         std::string name;
 
+        /**
+         * @brief Client-supplied OpenAI text parts, in order, when content was an array.
+         *
+         * @ref content holds the parts joined by "\n" (vLLM's string content
+         * format) for Jinja templates. Native encoders that consume the OpenAI
+         * part list (DeepSeek-V4 joins parts with a blank line) read this
+         * field instead. Empty for plain-string content.
+         */
+        std::vector<std::string> content_parts;
+
         ChatMessage() = default;
         ChatMessage(const std::string &r, const std::string &c)
             : role(r), content(c) {}
@@ -81,7 +91,25 @@ namespace llaminar2
         ZEPHYR,     ///< Zephyr: <|role|>\ncontent<|endoftext|>
         VICUNA,     ///< Vicuna: USER: content\nASSISTANT:
         COMMAND_R,  ///< Command-R: <|START_OF_TURN_TOKEN|><|USER_TOKEN|>content
+        DEEPSEEK_V4, ///< DeepSeek-V4 native encoder (DeepSeekV4ChatEncoding.h); never Jinja
         UNKNOWN     ///< Unknown format - will use raw prompt
+    };
+
+    /**
+     * @brief Per-request rendering controls.
+     *
+     * A typed bundle so new controls cannot be dropped by an intermediate
+     * positional overload. @ref reasoning_effort is already validated by the
+     * request parser; Jinja templates receive it verbatim as the
+     * `reasoning_effort` variable, the DeepSeek-V4 encoder maps it exactly as
+     * the production vLLM tokenizer does.
+     */
+    struct ChatEncodingOptions
+    {
+        bool add_generation_prompt = true;               ///< Append the assistant prompt prefix.
+        bool enable_thinking = true;                     ///< Effective thinking switch after model defaults.
+        std::optional<std::string> reasoning_effort;     ///< Client value, absent when unspecified.
+        std::string tools_json;                          ///< Order-preserving OpenAI tools array, or empty.
     };
 
     /**
@@ -158,6 +186,18 @@ namespace llaminar2
                           const std::string &tools_json = "") const;
 
         /**
+         * @brief Apply the template with the complete typed request controls.
+         *
+         * DEEPSEEK_V4 renders through the native encoder and throws on any
+         * input it rejects; it never falls back to another format.
+         *
+         * @param messages Conversation in order.
+         * @param options Request rendering controls.
+         * @return Formatted prompt string ready for tokenization.
+         */
+        std::string apply(const std::vector<ChatMessage> &messages, const ChatEncodingOptions &options) const;
+
+        /**
          * @brief Get the detected template type
          */
         ChatTemplateType type() const { return type_; }
@@ -219,7 +259,15 @@ namespace llaminar2
         std::string renderJinja(const std::vector<ChatMessage> &messages,
                                 bool add_generation_prompt,
                                 bool enable_thinking,
-                                const std::string &tools_json = "") const;
+                                const std::string &tools_json = "",
+                                const std::optional<std::string> &reasoning_effort = std::nullopt) const;
+
+        /**
+         * @brief Render through the native DeepSeek-V4 encoder.
+         * @throws std::invalid_argument On input the reference encoder rejects.
+         */
+        std::string renderDeepSeekV4(const std::vector<ChatMessage> &messages,
+                                     const ChatEncodingOptions &options) const;
 
         /**
          * @brief Render without the enable_thinking variable in context

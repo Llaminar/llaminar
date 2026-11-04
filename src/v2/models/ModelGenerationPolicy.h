@@ -60,7 +60,12 @@ namespace llaminar2
 
     private:
         /** @brief Template authority selected from the loaded revision's identity. */
-        enum class TemplateSource { ModelMetadata, Qwen35Maintained };
+        enum class TemplateSource
+        {
+            ModelMetadata,     ///< The GGUF's embedded Jinja template.
+            Qwen35Maintained,  ///< Maintained Qwen 3.5/3.6 community template.
+            DeepSeekV4Native,  ///< Native encoder ported from the official/vLLM DeepSeek-V4 encoder.
+        };
         TemplateSource template_source_ = TemplateSource::ModelMetadata;
         SamplingParams thinking_;
         SamplingParams non_thinking_;

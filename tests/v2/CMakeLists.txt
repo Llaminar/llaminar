@@ -7992,6 +7992,39 @@ add_v2_test(V2_Integration_QwenNativeToolCallProtocol
     NO_MODELS
 )
 
+# DeepSeek-V4 chat protocol: production-vLLM golden prompts, request mapping and
+# DSML tool-call parsing. The golden JSON is embedded so installed runners need
+# no source tree.
+set(DSV4_CHAT_GOLDEN_HEADER "${CMAKE_CURRENT_BINARY_DIR}/model-fixtures/DeepSeekV4ChatGolden.generated.h")
+add_custom_command(OUTPUT "${DSV4_CHAT_GOLDEN_HEADER}"
+    COMMAND ${CMAKE_COMMAND}
+        -DJINJA_INPUT=${CMAKE_CURRENT_SOURCE_DIR}/unit/utils/fixtures/deepseek_v4_chat_encoding_golden.json
+        -DHEADER_OUTPUT=${DSV4_CHAT_GOLDEN_HEADER}
+        -DNAMESPACE=llaminar2::test::dsv4
+        -DSYMBOL=kChatEncodingGolden
+        -DSOURCE_URL=scripts/deepseek4/make_chat_encoding_golden.py
+        -DLICENSE=AGPL-3.0
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/EmbedJinjaTemplate.cmake
+    DEPENDS unit/utils/fixtures/deepseek_v4_chat_encoding_golden.json
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/EmbedJinjaTemplate.cmake
+    VERBATIM)
+add_executable(v2_test_deepseek4_chat_encoding unit/utils/Test__DeepSeekV4ChatEncoding.cpp "${DSV4_CHAT_GOLDEN_HEADER}")
+target_include_directories(v2_test_deepseek4_chat_encoding PRIVATE
+    "${CMAKE_CURRENT_BINARY_DIR}/model-fixtures"
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
+target_link_libraries(v2_test_deepseek4_chat_encoding llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_DeepSeekV4ChatEncoding
+    COMMAND $<TARGET_FILE:v2_test_deepseek4_chat_encoding>
+    LABELS "V2;Unit;DeepSeekV4;ChatTemplate;ToolCalling;TextProcessing"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+# Production defects fixed with this protocol: tool schemas lost the client's
+# key order, text-part content arrays returned HTTP 500, and DeepSeek-V4 was
+# parsed with the Qwen XML grammar.
+add_v2_test(V2_Integration_DeepSeekV4ChatProtocol
+    COMMAND $<TARGET_FILE:v2_test_deepseek4_chat_encoding>
+    LABELS "V2;Integration;ProductionTestPreflight;HTTP;DeepSeekV4;ChatTemplate;ToolCalling;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
 # Note: ArgParser tests removed - replaced by OrchestrationConfigParser tests
 
 # Test: NodeTopology (NUMA/socket topology detection for CPU tensor parallelism)

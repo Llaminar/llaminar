@@ -381,6 +381,7 @@ namespace llaminar2
             case ChatTemplateType::DEEPSEEK:
             case ChatTemplateType::DEEPSEEK2:
             case ChatTemplateType::DEEPSEEK3:
+            case ChatTemplateType::DEEPSEEK_V4:
             case ChatTemplateType::COMMAND_R:
             case ChatTemplateType::UNKNOWN:
             default:
@@ -866,6 +867,16 @@ namespace llaminar2
         // Encode the formatted text
         // Note: We don't add BOS here because the template typically handles it
         return encode(formatted, false, false);
+    }
+
+    std::vector<int> BPETokenizer::encodeChat(
+        const std::vector<ChatMessage> &messages,
+        const ChatEncodingOptions &options) const
+    {
+        if (!chat_template_)
+            throw std::invalid_argument("BPETokenizer::encodeChat requires a chat template for typed rendering");
+        // The template (or native encoder) emits BOS itself.
+        return encode(chat_template_->apply(messages, options), false, false);
     }
 
     std::string BPETokenizer::applyTemplate(
