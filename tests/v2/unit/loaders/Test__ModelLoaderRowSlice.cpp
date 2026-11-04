@@ -306,6 +306,7 @@ namespace llaminar2
                 case GGUFTensorType::IQ2_S: return TensorType::IQ2_S;
                 case GGUFTensorType::IQ4_XS: return TensorType::IQ4_XS;
                 case GGUFTensorType::IQ1_M: return TensorType::IQ1_M;
+                case GGUFTensorType::MXFP4: return TensorType::MXFP4;
                 }
                 throw std::invalid_argument("Unsupported test tensor type");
             }
@@ -1332,7 +1333,8 @@ namespace llaminar2
                 GGUFTensorType::IQ3_S,
                 GGUFTensorType::IQ2_S,
                 GGUFTensorType::IQ4_XS,
-                GGUFTensorType::IQ1_M),
+                GGUFTensorType::IQ1_M,
+                GGUFTensorType::MXFP4),
             [](const ::testing::TestParamInfo<GGUFTensorType> &info)
             {
                 return "Type" +
