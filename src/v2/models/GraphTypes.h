@@ -22,6 +22,7 @@
  */
 
 #pragma once
+#include "AttentionStateOwner.h"
 #include "../execution/mtp/MTPShiftedCacheOrigin.h"
 
 #include "../execution/local_execution/graph/DeviceGraphExecutor.h"
@@ -135,6 +136,10 @@ namespace llaminar2
 
         /** @return Whether the residual stream is a widened multi-branch trunk. */
         [[nodiscard]] bool usesResidualTrunk() const noexcept { return flash_next || deepseek_v4; }
+
+        /// Owner of every layer's attention state (attentionStateOwnerOf). ModelBanks
+        /// builds a frontier-only canonical cache of `model_state` layers.
+        AttentionStateOwner attention_state_owner = AttentionStateOwner::KVCache;
 
         /// Exact admitted attention program; graph construction must not re-read DebugEnv.
         qwen4exp::QwenSparseAttentionArithmetic attention_arithmetic =

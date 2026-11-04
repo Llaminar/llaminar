@@ -66,14 +66,14 @@ namespace llaminar2
 
         /** Exact stable order of fixed-width Flash Next geometry scalars. */
         /** @brief Wire order of the DeepSeek-V4 activation geometry. */
-        constexpr std::array<uint32_t DeepSeekV4MemoryGeometry::*, 16> kDeepSeekV4Fields{
+        constexpr std::array<uint32_t DeepSeekV4MemoryGeometry::*, 17> kDeepSeekV4Fields{
             &DeepSeekV4MemoryGeometry::layers, &DeepSeekV4MemoryGeometry::hidden, &DeepSeekV4MemoryGeometry::hc,
             &DeepSeekV4MemoryGeometry::heads, &DeepSeekV4MemoryGeometry::head_dim, &DeepSeekV4MemoryGeometry::q_rank,
             &DeepSeekV4MemoryGeometry::o_groups, &DeepSeekV4MemoryGeometry::o_rank, &DeepSeekV4MemoryGeometry::window,
             &DeepSeekV4MemoryGeometry::index_heads, &DeepSeekV4MemoryGeometry::index_head_dim,
             &DeepSeekV4MemoryGeometry::index_topk, &DeepSeekV4MemoryGeometry::experts,
             &DeepSeekV4MemoryGeometry::experts_used, &DeepSeekV4MemoryGeometry::csa_layers,
-            &DeepSeekV4MemoryGeometry::hca_layers};
+            &DeepSeekV4MemoryGeometry::hca_layers, &DeepSeekV4MemoryGeometry::rope_dim};
         constexpr std::array<uint32_t Qwen4ExpMemoryGeometry::*, 18> kFlashNextFields{
             &Qwen4ExpMemoryGeometry::residual_width,
             &Qwen4ExpMemoryGeometry::terminal_head_width,

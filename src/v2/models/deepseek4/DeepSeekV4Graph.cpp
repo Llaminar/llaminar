@@ -6,16 +6,23 @@
  *   NORMALIZED = HCRead(trunk)                                      [M, d]
  *   DSV4_QR    = RMS(NORMALIZED . q_a) * q_a_norm                   [M, q_rank]
  *   DSV4_Q     = RoPE_tail(RMS_head(DSV4_QR . q_b))                 [M, H*hd]
- *   K_PROJ     = RoPE_tail(RMS(NORMALIZED . kv) * kv_norm)          [M, hd]  (V_PROJ duplicate for the cache)
- *   raw ring  <- K_PROJ at position % ring
- *   ratio>0:  compressor ring <- (kv, gate + ape); pool <- gated pooling of completed blocks
- *   ratio==4: indexer queries/weights/compressor -> top-k compressed blocks
- *   DSV4_ATTN  = inverse-RoPE(sink softmax attention over window + compressed)
+ *   K_PROJ     = QAT_fp8(RoPE_tail(RMS(NORMALIZED . kv) * kv_norm)) [M, hd]
+ *   ratio>0:  pool <- QAT-packed gated pooling of completed blocks, reading
+ *             this chunk's projections from scratch and earlier positions
+ *             from the FP32 compressor state; then state <- last 2*ratio rows
+ *   ratio==4: indexer q = QAT_fp4(Hadamard(RoPE(qr . idx_q))), weights and its
+ *             own compressor (MXFP4 pool) -> top-k compressed blocks
+ *   DSV4_ATTN  = inverse-RoPE(sink softmax attention over window + compressed),
+ *                window keys from K_PROJ (this chunk) or the packed raw ring
+ *   raw ring  <- packed last `window` rows of K_PROJ (after attention)
  *   DSV4_OA    = grouped wo_a(DSV4_ATTN);  ATTN_PROJ = DSV4_OA . wo_b
  *   trunk      = HCWrite(trunk, ATTN_PROJ)
- * Ordering: every consumer depends on its producers' node names; persistent
- * banks are written before any reader of the same graph and read positions are
- * functions of the row's absolute position only.
+ * The canonical KV cache owns only the sequence frontier (its DeepSeek-V4
+ * layers are model_state layers); on GPU the terminal layer advances it once.
+ * Ordering: every consumer depends on its producers' node names. Persistent
+ * window/state banks are read before they are overwritten (raw_store after
+ * attention, comp_store after comp_pool), and wo_b waits for every bank writer
+ * so the next layer cannot reuse the chunk scratch they read.
  */
 #include "DeepSeekV4Graph.h"
 #include "DeepSeekV4Config.h"
@@ -23,6 +30,10 @@
 #include "../../execution/compute_stages/ComputeStageFactory.h"
 #include "../../execution/local_execution/graph/GraphResolver.h"
 #include "../../memory/BufferArena.h"
+#include "../../backends/ExplicitGPUStream.h"
+#include "../../kernels/IHybridKVCache.h"
+#include "../../kernels/KernelFactory.h"
+#include "../../transfer/TransferEngine.h"
 #include "../../tensors/Tensors.h"
 
 #include <cmath>
@@ -67,17 +78,46 @@ void DeepSeekV4Graph::setArena(BufferArena *arena)
     }
 }
 
+void DeepSeekV4Graph::initializeCacheAuxiliaryState(IKVCache &cache, void *publicationStream)
+{
+    const auto *hybrid = dynamic_cast<const IHybridKVCache *>(&cache);
+    if (config_.attention_state_owner != AttentionStateOwner::ModelBanks || !hybrid ||
+        hybrid->kvLayerCount() != 0 || hybrid->gdnLayerCount() != 0 || cache.n_layers() != config_.n_layers ||
+        cache.first_layer_index() != config_.pp_layer_offset || cache.auxiliaryState())
+        throw std::invalid_argument("DeepSeek-V4 requires its frontier-only cache of model_state layers");
+    const DeviceId device = config_.default_device;
+    if (!device.is_gpu())
+    {
+        if (publicationStream)
+            throw std::invalid_argument("DeepSeek-V4 CPU state banks have no GPU publication stream");
+        return;
+    }
+    (void)ExplicitGPUStream(publicationStream);
+    const auto kernels = llaminar::v2::kernels::KernelFactory::createDeepSeekV4(device);
+    for (const BufferId role : {BufferId::DSV4_RAW_RING, BufferId::DSV4_COMP_RING_KV, BufferId::DSV4_COMP_RING_SCORE,
+                                BufferId::DSV4_IDX_RING_KV, BufferId::DSV4_IDX_RING_SCORE})
+    {
+        auto *bank = buffers_.layer_buffers.get(role);
+        if (!bank)
+            throw std::invalid_argument(std::string("DeepSeek-V4 is missing admitted state bank ") + bufferIdName(role));
+        TransferEngine::allocateDeviceStorage(bank, device);
+        kernels->zeroBank(bank->gpu_data_ptr(), bank->size_bytes(), publicationStream);
+        TransferEngine::publishDeviceWrite(bank, device, publicationStream);
+    }
+}
+
 DeepSeekV4StateLayout DeepSeekV4Graph::stateLayout() const
 {
     const auto &m = *config_.deepseek_v4;
-    const auto *ring = buffers_.layer_buffers.get(BufferId::DSV4_RAW_RING);
-    if (!ring)
-        throw std::invalid_argument("DeepSeek-V4 graph requires its admitted raw-ring bank");
-    const std::size_t per_layer = static_cast<std::size_t>(m.layers()) * m.headDim();
-    if (ring->numel() % per_layer != 0)
-        throw std::logic_error("DeepSeek-V4 raw-ring bank is not a whole number of layer rings");
-    const int ring_rows = static_cast<int>(ring->numel() / per_layer);
-    return deepSeekV4StateLayout(m, ring_rows - m.window(), config_.max_seq_len);
+    auto layout = deepSeekV4StateLayout(m, 1, config_.max_seq_len);
+    // The admitted score scratch fixes the bounded indexer pass height.
+    const auto *scores = buffers_.layer_buffers.get(BufferId::DSV4_IDX_SCORES);
+    if (!scores)
+        throw std::invalid_argument("DeepSeek-V4 graph requires its admitted indexer score scratch");
+    if (scores->numel() % static_cast<std::size_t>(layout.csaPoolRows) != 0)
+        throw std::logic_error("DeepSeek-V4 indexer score scratch is not a whole number of pool rows");
+    layout.indexerScoreRows = static_cast<int>(scores->numel() / static_cast<std::size_t>(layout.csaPoolRows));
+    return layout;
 }
 
 ComputeGraph DeepSeekV4Graph::buildAttentionGraph(
@@ -170,78 +210,82 @@ ComputeGraph DeepSeekV4Graph::buildAttentionGraph(
     // ---------------------------------------------------------------- query
     const auto q_a = gemm(prefix + "q_a", w.q_a, BufferId::NORMALIZED, BufferId::DSV4_QR, normalized);
     const auto q_a_norm = prim(prefix + "q_a_norm", Stage::HeadNormRope{1, m.qLoraRank(), true, eps,
-        gain(w.q_a_norm, "attn_q_a_norm"), no_rope, false, std::nullopt, f32(BufferId::DSV4_QR)}, {q_a});
+        gain(w.q_a_norm, "attn_q_a_norm"), no_rope, false, deepseek4::ActivationQuant::None, std::nullopt,
+        f32(BufferId::DSV4_QR)}, {q_a});
     const auto q_b = gemm(prefix + "q_b", w.q_b, BufferId::DSV4_QR, BufferId::DSV4_Q, q_a_norm);
     const auto q_rope = prim(prefix + "q_norm_rope", Stage::HeadNormRope{m.heads(), hd, true, eps, std::nullopt,
-        policy.rope, false, positions, f32(BufferId::DSV4_Q)}, {q_b});
+        policy.rope, false, deepseek4::ActivationQuant::None, positions, f32(BufferId::DSV4_Q)}, {q_b});
 
-    // ---------------------------------------------------------------- raw kv (+ canonical cache append)
+    // ---------------------------------------------------------------- raw kv (QAT FP8 nope + BF16 rope)
     const auto kv = gemm(prefix + "kv", w.kv, BufferId::NORMALIZED, BufferId::K_PROJ, normalized);
-    const auto kv_v = gemm(prefix + "kv_v", w.kv, BufferId::NORMALIZED, BufferId::V_PROJ, normalized);
     const auto kv_rope = prim(prefix + "kv_norm_rope", Stage::HeadNormRope{1, hd, true, eps,
-        gain(w.kv_norm, "attn_kv_a_norm"), policy.rope, false, positions, f32(BufferId::K_PROJ)}, {kv});
-    const auto kv_rope_v = prim(prefix + "kv_norm_rope_v", Stage::HeadNormRope{1, hd, true, eps,
-        gain(w.kv_norm, "attn_kv_a_norm"), policy.rope, false, positions, f32(BufferId::V_PROJ)}, {kv_v});
-    std::vector<std::string> attention_dependencies{q_rope};
-    if (kv_cache)
-    {
-        const auto execution_policy = resolveAttentionExecutionPolicy(device, true);
-        const auto append = addKVCacheAppend(graph, prefix, buffers, layer_idx, seq_len, batch_size, kv_cache,
-                                             sequence_lengths_device, device, execution_policy, kv_rope, {kv_rope_v});
-        attention_dependencies.push_back(append);
-    }
-    const auto raw_store = prim(prefix + "raw_store", Stage::RawStore{hd, layout.rawRingRows, positions,
-        f32(BufferId::K_PROJ), f32(BufferId::DSV4_RAW_RING, static_cast<std::size_t>(layer_idx) * layout.rawRingRows * hd)},
-        {kv_rope});
-    attention_dependencies.push_back(raw_store);
+        gain(w.kv_norm, "attn_kv_a_norm"), policy.rope, false, deepseek4::ActivationQuant::FP8NopeBF16Rope, positions,
+        f32(BufferId::K_PROJ)}, {kv});
+    std::vector<std::string> attention_dependencies{q_rope, kv_rope};
+    std::vector<std::string> bank_writers;
+    const auto i32at = [&](BufferId role, std::size_t words) {
+        return Qwen4ExpIntBinding{tensor(role), buffers.idFor(role), words * sizeof(std::int32_t)};
+    };
 
     // ---------------------------------------------------------------- compressor + indexer
-    std::optional<Qwen4ExpFloatBinding> pool;
+    std::optional<Qwen4ExpIntBinding> pool;
     std::optional<Qwen4ExpIntBinding> selected;
     int pool_rows = 1;
     if (policy.ratio != 0)
     {
         const deepseek4::CompressorGeometry geometry{policy.ratio, hd,
-            policy.ratio == 4 ? layout.csaRingRows : layout.hcaRingRows,
-            policy.ratio == 4 ? layout.csaPoolRows : layout.hcaPoolRows};
+            policy.ratio == 4 ? layout.csaPoolRows : layout.hcaPoolRows, deepseek4::CompressedStream::Attention,
+            policy.rope.ropeDim};
         pool_rows = geometry.poolRows;
-        const auto ring_offset = layout.compRingElementOffset(m, layer_idx);
-        const auto pool_offset = layout.compPoolElementOffset(m, layer_idx);
+        const auto state_offset = layout.compStateElementOffset(m, layer_idx);
+        const auto pool_offset = layout.compPoolWordOffset(m, layer_idx);
         const auto c_kv = gemm(prefix + "comp_kv", w.compressor.kv, BufferId::NORMALIZED, BufferId::DSV4_COMP_KV, normalized);
         const auto c_sc = gemm(prefix + "comp_gate", w.compressor.gate, BufferId::NORMALIZED, BufferId::DSV4_COMP_SCORE, normalized);
-        const auto c_store = prim(prefix + "comp_store", Stage::CompressorStore{geometry, positions,
-            f32(BufferId::DSV4_COMP_KV), f32(BufferId::DSV4_COMP_SCORE), gain(w.compressor.ape, "attn_compressor_ape"),
-            f32(BufferId::DSV4_COMP_RING_KV, ring_offset), f32(BufferId::DSV4_COMP_RING_SCORE, ring_offset)}, {c_kv, c_sc});
+        const auto ape = gain(w.compressor.ape, "attn_compressor_ape");
         const auto c_pool = prim(prefix + "comp_pool", Stage::CompressorPool{geometry, positions,
-            f32(BufferId::DSV4_COMP_RING_KV, ring_offset), f32(BufferId::DSV4_COMP_RING_SCORE, ring_offset),
+            f32(BufferId::DSV4_COMP_KV), f32(BufferId::DSV4_COMP_SCORE), ape,
+            f32(BufferId::DSV4_COMP_RING_KV, state_offset), f32(BufferId::DSV4_COMP_RING_SCORE, state_offset),
             gain(w.compressor.norm, "attn_compressor_norm"), eps, policy.rope,
-            f32(BufferId::DSV4_COMP_POOL, pool_offset)}, {c_store});
+            i32at(BufferId::DSV4_COMP_POOL, pool_offset)}, {c_kv, c_sc});
+        // The carried state is overwritten only after the pool has read it.
+        const auto c_store = prim(prefix + "comp_store", Stage::CompressorStore{geometry, positions,
+            f32(BufferId::DSV4_COMP_KV), f32(BufferId::DSV4_COMP_SCORE), ape,
+            f32(BufferId::DSV4_COMP_RING_KV, state_offset), f32(BufferId::DSV4_COMP_RING_SCORE, state_offset)},
+            {c_pool});
         attention_dependencies.push_back(c_pool);
-        pool = f32(BufferId::DSV4_COMP_POOL, pool_offset);
+        bank_writers.push_back(c_store);
+        pool = i32at(BufferId::DSV4_COMP_POOL, pool_offset);
         if (policy.ratio == 4)
         {
             const int ihd = m.indexerHeadDim();
-            const deepseek4::CompressorGeometry indexer_geometry{4, ihd, layout.csaRingRows, layout.csaPoolRows};
-            const auto iring = layout.indexerRingElementOffset(m, layer_idx);
-            const auto ipool = layout.indexerPoolElementOffset(m, layer_idx);
+            const deepseek4::CompressorGeometry indexer_geometry{4, ihd, layout.csaPoolRows,
+                deepseek4::CompressedStream::Indexer, 0};
+            const auto istate = layout.indexerStateElementOffset(m, layer_idx);
+            const auto ipool = layout.indexerPoolWordOffset(m, layer_idx);
             const auto i_q = gemm(prefix + "idx_q", w.indexer_q_b, BufferId::DSV4_QR, BufferId::DSV4_IDX_Q, q_a_norm);
             const auto i_q_rope = prim(prefix + "idx_q_rope", Stage::HeadNormRope{m.indexerHeads(), ihd, false, eps,
-                std::nullopt, policy.rope, false, positions, f32(BufferId::DSV4_IDX_Q)}, {i_q});
+                std::nullopt, policy.rope, false, deepseek4::ActivationQuant::HadamardFP4, positions,
+                f32(BufferId::DSV4_IDX_Q)}, {i_q});
             const auto i_w = gemm(prefix + "idx_w", w.indexer_proj, BufferId::NORMALIZED, BufferId::DSV4_IDX_W, normalized);
             const auto i_kv = gemm(prefix + "idx_kv", w.indexer_compressor.kv, BufferId::NORMALIZED, BufferId::DSV4_IDX_KV, normalized);
             const auto i_sc = gemm(prefix + "idx_gate", w.indexer_compressor.gate, BufferId::NORMALIZED, BufferId::DSV4_IDX_SCORE, normalized);
-            const auto i_store = prim(prefix + "idx_store", Stage::CompressorStore{indexer_geometry, positions,
-                f32(BufferId::DSV4_IDX_KV), f32(BufferId::DSV4_IDX_SCORE), gain(w.indexer_compressor.ape, "indexer_compressor_ape"),
-                f32(BufferId::DSV4_IDX_RING_KV, iring), f32(BufferId::DSV4_IDX_RING_SCORE, iring)}, {i_kv, i_sc});
+            const auto i_ape = gain(w.indexer_compressor.ape, "indexer_compressor_ape");
             const auto i_pool = prim(prefix + "idx_pool", Stage::CompressorPool{indexer_geometry, positions,
-                f32(BufferId::DSV4_IDX_RING_KV, iring), f32(BufferId::DSV4_IDX_RING_SCORE, iring),
+                f32(BufferId::DSV4_IDX_KV), f32(BufferId::DSV4_IDX_SCORE), i_ape,
+                f32(BufferId::DSV4_IDX_RING_KV, istate), f32(BufferId::DSV4_IDX_RING_SCORE, istate),
                 gain(w.indexer_compressor.norm, "indexer_compressor_norm"), eps, policy.rope,
-                f32(BufferId::DSV4_IDX_POOL, ipool)}, {i_store});
+                i32at(BufferId::DSV4_IDX_POOL, ipool)}, {i_kv, i_sc});
+            const auto i_store = prim(prefix + "idx_store", Stage::CompressorStore{indexer_geometry, positions,
+                f32(BufferId::DSV4_IDX_KV), f32(BufferId::DSV4_IDX_SCORE), i_ape,
+                f32(BufferId::DSV4_IDX_RING_KV, istate), f32(BufferId::DSV4_IDX_RING_SCORE, istate)}, {i_pool});
+            bank_writers.push_back(i_store);
             const float weight_scale = 1.0f / std::sqrt(static_cast<float>(ihd) * static_cast<float>(m.indexerHeads()));
-            const auto topk = prim(prefix + "idx_topk", Stage::IndexerTopK{m.indexerHeads(), ihd, 4, m.indexerTopK(),
-                layout.csaPoolRows, weight_scale, positions, f32(BufferId::DSV4_IDX_Q), f32(BufferId::DSV4_IDX_W),
-                f32(BufferId::DSV4_IDX_POOL, ipool), f32(BufferId::DSV4_IDX_SCORES), i32(BufferId::DSV4_IDX_SELECTED)},
-                {i_q_rope, i_w, i_pool});
+            std::optional<Qwen4ExpFloatBinding> scores;
+            if (device.is_gpu()) scores = f32(BufferId::DSV4_IDX_SCORES);
+            const auto topk = prim(prefix + "idx_topk", Stage::IndexerTopK{m.indexerHeads(), layout.indexer, 4,
+                m.indexerTopK(), layout.csaPoolRows, layout.indexerScoreRows, weight_scale, positions,
+                f32(BufferId::DSV4_IDX_Q), f32(BufferId::DSV4_IDX_W), i32at(BufferId::DSV4_IDX_POOL, ipool), scores,
+                i32(BufferId::DSV4_IDX_SELECTED)}, {i_q_rope, i_w, i_pool});
             attention_dependencies.push_back(topk);
             selected = i32(BufferId::DSV4_IDX_SELECTED);
         }
@@ -251,13 +295,25 @@ ComputeGraph DeepSeekV4Graph::buildAttentionGraph(
     const auto access = policy.ratio == 0 ? deepseek4::CompressedAccess::None
                       : policy.ratio == 4 ? deepseek4::CompressedAccess::Selected
                                           : deepseek4::CompressedAccess::All;
+    const auto raw_ring = i32at(BufferId::DSV4_RAW_RING, layout.rawRingWordOffset(layer_idx));
     graph.addNode(prefix + "attention", std::make_unique<Stage>(Stage::Params{
         .device_id = device, .mpi_ctx = mpi_ctx_.get(), .rows = stage_rows,
-        .operation = Stage::SparseAttention{m.heads(), hd, m.window(), layout.rawRingRows, policy.ratio,
-            m.indexerTopK(), pool_rows, access, 1.0f / std::sqrt(static_cast<float>(hd)), policy.rope, positions,
-            f32(BufferId::DSV4_Q), f32(BufferId::DSV4_RAW_RING, static_cast<std::size_t>(layer_idx) * layout.rawRingRows * hd),
-            pool, selected, gain(w.sinks, "attn_sinks"), f32(BufferId::DSV4_ATTN)}}), device);
+        .operation = Stage::SparseAttention{m.heads(), layout.kv, m.window(), policy.ratio, m.indexerTopK(), pool_rows,
+            access, 1.0f / std::sqrt(static_cast<float>(hd)), policy.rope, positions, f32(BufferId::DSV4_Q),
+            f32(BufferId::K_PROJ), raw_ring, pool, selected, gain(w.sinks, "attn_sinks"), f32(BufferId::DSV4_ATTN)}}),
+        device);
     for (const auto &dependency : attention_dependencies) graph.addDependency(prefix + "attention", dependency);
+    // The window ring is overwritten only after attention read the previous window.
+    bank_writers.push_back(prim(prefix + "raw_store", Stage::RawStore{layout.kv, m.window(), positions,
+        f32(BufferId::K_PROJ), raw_ring}, {prefix + "attention"}));
+
+    // The cache owns no DeepSeek-V4 payload; the terminal layer publishes the
+    // forward's real rows to its device frontier exactly once (GPU). CPU
+    // execution keeps positions in the orchestrator's host state.
+    const int terminal_layer = config_.pp_layer_offset + config_.n_layers - 1;
+    if (kv_cache && device.is_gpu() && layer_idx == terminal_layer)
+        bank_writers.push_back(prim(prefix + "sequence_frontier", Stage::AdvanceSequenceFrontier{kv_cache, layer_idx,
+            seq_len, seq_len == 1 ? nullptr : sequence_lengths_device, positions}, {prefix + "attention"}));
 
     if (!w.output_a || !w.output_a->tensor)
         throw std::invalid_argument("DeepSeek-V4 layer is missing attn_output_a");
@@ -265,6 +321,9 @@ ComputeGraph DeepSeekV4Graph::buildAttentionGraph(
         m.heads() * hd / m.outputGroups(), DeepSeekV4NativeWeightBinding(*w.output_a->tensor),
         f32(BufferId::DSV4_ATTN), f32(BufferId::DSV4_OA)}, {prefix + "attention"});
     const auto wo_b = gemm(prefix + "wo_b", w.output_b, BufferId::DSV4_OA, BufferId::ATTN_PROJ, wo_a);
+    // Bank writers read this layer's K_PROJ / compressor scratch: the next
+    // layer (ordered after this terminal) must not overwrite it earlier.
+    for (const auto &writer : bank_writers) graph.addDependency(wo_b, writer);
 
     const auto terminal = addBranchBlockWrite(graph, std::move(*read), buffers, wo_b);
     graph.setTerminalNode(terminal);

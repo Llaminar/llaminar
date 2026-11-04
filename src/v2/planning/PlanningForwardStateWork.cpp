@@ -12,6 +12,8 @@
 #include "MemoryPlanner.h"
 #include "PlanningModelMetadata.h"
 #include "PersistentStateMemoryEstimator.h"
+#include "ModelMemoryProfile.h"
+#include "../models/deepseek4/DeepSeekV4BufferLayout.h"
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -33,6 +35,40 @@ namespace llaminar2
         const double rows = rows_;
         return rows * preceding_context_ + rows * (rows + 1.0) / 2.0;
     }
+
+    namespace
+    {
+        /**
+         * @brief Bounded sparse-attention algebra of one model-owned (DeepSeek-V4) layer.
+         * @details The profile carries layer counts rather than each layer's
+         * ratio, so every layer is costed as the model average: per query row
+         * min(window, p + 1) raw keys plus the CSA share of min(topK, p/4)
+         * selected and the HCA share of p/128 compressed keys, and the CSA
+         * share of the indexer scan over p/4 MXFP4 keys. Packed records are
+         * read once per row (no cross-row reuse is claimed), new rows write one
+         * raw record and their completed compressed/indexer blocks.
+         */
+        PlanningAttentionStateWork deepSeekV4SparseAttentionWork(const ModelMemoryProfile &profile,
+                                                                 const PlanningForwardInvocation &invocation)
+        {
+            const auto &g = *profile.deepseek_v4;
+            const double rows = invocation.rows();
+            const double position = invocation.precedingContext() + (rows - 1.0) / 2.0 + 1.0; // mean p + 1
+            const double layers = std::max<double>(1.0, g.layers);
+            const double csa = g.csa_layers / layers, hca = g.hca_layers / layers;
+            const double keys = std::min<double>(g.window, position) +
+                csa * std::min<double>(g.index_topk, std::floor(position / 4.0)) + hca * std::floor(position / 128.0);
+            const double indexed = csa * std::floor(position / 4.0);
+            const double kv_bytes = g.kvFormat().entryBytes(), index_bytes = g.indexerFormat().entryBytes();
+            const double pairs = rows * keys;
+            const double operations = g.heads * pairs * (4.0 * g.head_dim + 5.0) +
+                rows * indexed * g.index_heads * (2.0 * g.index_head_dim + 3.0);
+            return {static_cast<int>(g.heads), 1, static_cast<int>(g.head_dim), pairs, operations,
+                rows * (keys * kv_bytes + indexed * index_bytes),
+                rows * kv_bytes + rows * (csa / 4.0 + hca / 128.0) * kv_bytes + rows * csa / 4.0 * index_bytes,
+                sizeof(float) * rows * (2.0 * g.heads * g.head_dim + 2.0 * g.head_dim)};
+        }
+    } // namespace
 
     std::vector<PlanningLayerStateWork> compilePlanningForwardStateWork(
         const PlanningModelMetadata &model, const DevicePlanConfig &device,
@@ -93,7 +129,13 @@ namespace llaminar2
         const double rows = invocation.rows();
         for (int layer = first; layer <= last; ++layer)
         {
-            if (PersistentStateMemoryEstimator::isFullAttentionLayer(profile, layer))
+            const auto kind = PersistentStateMemoryEstimator::layerStateKind(profile, layer);
+            if (kind == LayerStateKind::ModelOwned)
+            {
+                result.push_back({layer, invocation.rows(), deepSeekV4SparseAttentionWork(profile, invocation)});
+                continue;
+            }
+            if (kind == LayerStateKind::FullAttention)
             {
                 // The codec owner supplies position and fixed-anchor extents.
                 // No CUDA linearization replica, CPU metadata or unused ring

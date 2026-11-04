@@ -16380,6 +16380,28 @@ namespace llaminar2
                               hybrid_config_storage->countKVLayers())
                           << " GDN layers");
             }
+            else if (config.attention_state_owner == AttentionStateOwner::ModelBanks)
+            {
+                /*
+                 * The model's arena banks own every layer's attention state
+                 * (DeepSeek-V4 raw window, compressor state, packed pools).
+                 * The canonical cache is the zero-payload hybrid of
+                 * model_state layers: it still owns the sequence frontier
+                 * (device head/count rows, request reset) that position
+                 * publication consumes, but no KV slab or GDN bank. The
+                 * graph's terminal layer advances that frontier on GPU.
+                 */
+                hybrid_config_storage = std::make_unique<HybridKVCacheConfig>();
+                hybrid_config_storage->first_layer_index = std::max(0, kv_config.first_layer_index);
+                hybrid_config_storage->layer_types.assign(
+                    static_cast<size_t>(std::max(0, n_layers)), kHybridModelStateLayerType);
+                hybrid_config_storage->n_heads = config.n_heads;
+                hybrid_config_storage->local_n_heads = config.local_n_heads;
+                hybrid_config_storage->local_head_start = config.head_start;
+                kv_config.hybrid_config = hybrid_config_storage.get();
+                LOG_DEBUG("[DeviceGraphOrchestrator] Model-owned attention state: frontier-only cache with "
+                          << hybrid_config_storage->countModelStateLayers() << " model_state layers");
+            }
             kv_config.max_seq_len = max_seq_len;
             kv_config.n_kv_heads = n_kv_heads;
             kv_config.head_dim = head_dim;

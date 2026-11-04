@@ -238,24 +238,23 @@ namespace llaminar2
         DSV4_HC_COMB, ///< Sinkhorn hc x hc combination [rows, hc*hc] of the pending block.
         DSV4_QR, ///< Normalized low-rank query [rows, q_lora_rank].
         DSV4_Q, ///< Per-head normalized rotated queries [rows, heads*head_dim].
-        DSV4_KV, ///< Normalized rotated latent [rows, head_dim].
         DSV4_COMP_KV, ///< Compressor kv projection [rows, coff*head_dim].
         DSV4_COMP_SCORE, ///< Compressor gate projection [rows, coff*head_dim].
         DSV4_IDX_Q, ///< Indexer rotated queries [rows, index_heads*index_head_dim].
         DSV4_IDX_W, ///< Indexer head weights [rows, index_heads].
         DSV4_IDX_KV, ///< Indexer compressor kv projection [rows, 2*index_head_dim].
         DSV4_IDX_SCORE, ///< Indexer compressor gate projection [rows, 2*index_head_dim].
-        DSV4_IDX_SCORES, ///< Indexer score scratch [rows, pool_rows].
+        DSV4_IDX_SCORES, ///< Bounded indexer score scratch [score_rows, csa_pool_rows] (<= 64 MiB).
         DSV4_IDX_SELECTED, ///< Selected compressed block ids [rows, index_topk].
         DSV4_ATTN, ///< De-rotated sparse attention output [rows, heads*head_dim].
         DSV4_OA, ///< Grouped low-rank output [rows, groups*rank].
-        DSV4_RAW_RING, ///< Persistent raw window rings of every layer [layers*raw_ring_rows, head_dim].
-        DSV4_COMP_RING_KV, ///< Persistent compressor kv rings of compressed layers.
-        DSV4_COMP_RING_SCORE, ///< Persistent compressor score rings of compressed layers.
-        DSV4_COMP_POOL, ///< Persistent compressed kv pools of compressed layers.
-        DSV4_IDX_RING_KV, ///< Persistent indexer compressor kv rings of ratio-4 layers.
-        DSV4_IDX_RING_SCORE, ///< Persistent indexer compressor score rings of ratio-4 layers.
-        DSV4_IDX_POOL, ///< Persistent indexer key pools of ratio-4 layers.
+        DSV4_RAW_RING, ///< Persistent packed raw window rings [layer][sequence][window] of 584-byte records (INT32 words).
+        DSV4_COMP_RING_KV, ///< Persistent FP32 compressor kv state [layer][sequence][2*ratio] of compressed layers.
+        DSV4_COMP_RING_SCORE, ///< Persistent FP32 compressor score(+ape) state of compressed layers.
+        DSV4_COMP_POOL, ///< Persistent packed compressed kv pools [layer][sequence][ctx/ratio] (INT32 words).
+        DSV4_IDX_RING_KV, ///< Persistent FP32 indexer compressor kv state [layer][sequence][8] of ratio-4 layers.
+        DSV4_IDX_RING_SCORE, ///< Persistent FP32 indexer compressor score(+ape) state of ratio-4 layers.
+        DSV4_IDX_POOL, ///< Persistent packed MXFP4 indexer key pools [layer][sequence][ctx/4] (INT32 words).
         DSV4_ROUTE_IDS, ///< Routed expert ids [rows, top_k] (INT32).
         DSV4_ROUTE_WEIGHTS, ///< Routing weights [rows, top_k].
         DSV4_ROUTER_LOGITS, ///< Router GEMM output [rows, experts].
@@ -592,7 +591,6 @@ namespace llaminar2
         case BufferId::DSV4_HC_COMB: return "DSV4_HC_COMB";
         case BufferId::DSV4_QR: return "DSV4_QR";
         case BufferId::DSV4_Q: return "DSV4_Q";
-        case BufferId::DSV4_KV: return "DSV4_KV";
         case BufferId::DSV4_COMP_KV: return "DSV4_COMP_KV";
         case BufferId::DSV4_COMP_SCORE: return "DSV4_COMP_SCORE";
         case BufferId::DSV4_IDX_Q: return "DSV4_IDX_Q";
