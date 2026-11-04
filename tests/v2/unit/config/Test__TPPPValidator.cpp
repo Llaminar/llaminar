@@ -40,11 +40,8 @@ namespace llaminar2::test
             static std::string p = "test.gguf";
             return p;
         }
-        const std::string &architecture() const override
-        {
-            static std::string a = "qwen2";
-            return a;
-        }
+        std::string architecture_ = "qwen2";
+        const std::string &architecture() const override { return architecture_; }
         std::shared_ptr<IModelLoader> loader() override { return nullptr; }
         std::shared_ptr<TensorBase> getWeightForDevice(const std::string &, DeviceId) override { return nullptr; }
         bool hasTensor(const std::string &name) const override { return tensors_.find(name) != tensors_.end(); }
@@ -519,5 +516,34 @@ TEST_F(Test__TPPPValidator, QueryConsumerSourceStructuralAndResolvedContractsAre
     EXPECT_FALSE(TPPPValidator::validate(config,source).valid);
     EXPECT_EQ(source.materialization_calls,0);
     EXPECT_THROW(TPPPAssignmentMembership::resolved({}),std::invalid_argument);
+}
+/**
+ * DeepSeek-V4 keeps compressor/indexer state in graph arenas the prefix cache
+ * does not archive; a prefix hit would resume over another request's state.
+ * Default prefix caching, MTP and dense TP must fail at admission.
+ */
+TEST_F(Test__TPPPValidator, DeepSeekV4RejectsUnimplementedRuntimeFeatures)
+{
+    model_.architecture_ = "deepseek4";
+    config_.tp_degree = 1;
+    config_.pp_degree = 1;
+    config_.mtp.enabled = false;
+    config_.prefix_cache.enabled = true; // production default
+    auto result = TPPPValidator::validate(config_, model_);
+    ASSERT_FALSE(result.valid);
+    ASSERT_EQ(result.errors.size(), 1u);
+    EXPECT_NE(result.errors[0].find("--no-prefix-cache"), std::string::npos);
+
+    config_.prefix_cache.enabled = false;
+    EXPECT_TRUE(TPPPValidator::validate(config_, model_).valid);
+
+    config_.mtp.enabled = true;
+    EXPECT_FALSE(TPPPValidator::validate(config_, model_).valid);
+    config_.mtp.enabled = false;
+
+    // Other architectures keep their prefix-cache default.
+    model_.architecture_ = "qwen2";
+    config_.prefix_cache.enabled = true;
+    EXPECT_TRUE(TPPPValidator::validate(config_, model_).valid);
 }
 } // namespace llaminar2::test

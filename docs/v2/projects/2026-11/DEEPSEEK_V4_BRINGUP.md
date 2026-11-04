@@ -39,8 +39,9 @@ near-ties caused by llama.cpp's Q8 activation quantization.
 
 1. Single participant, existing quant types (Q8_0/BF16/F32 and the unsloth
    K/IQ expert mixes), CPU + CUDA. ROCm fails with
-   `DeepSeek V4: ROCm unimplemented`. Prefix cache, MTP/DSpark, TP/PP and
-   ExpertOverlay rejected explicitly for `deepseek4` until implemented.
+   `DeepSeek V4: ROCm unimplemented`. Prefix cache, MTP/DSpark and dense
+   TP/PP are rejected explicitly for `deepseek4` until implemented;
+   ExpertOverlay (`--expert-tier`, GPU + CPU tiers) is supported.
 2. MXFP4 tensor type (E8M0 scale + E2M1 LUT; IQ4_NL-shaped kernels).
 3. Multi-GPU for the 144 GiB MXFP4 GGUF (2x H100): TP2 or PP2.
 4. Vision tower/aligner, image-token routing, OpenAI image content arrays.
@@ -51,3 +52,19 @@ near-ties caused by llama.cpp's Q8 activation quantization.
 The release model (>= 81 GiB) cannot run on the development host; tiny random
 checkpoints built by `scripts/deepseek4/make_tiny_checkpoint.py` carry every
 structural feature and are converted with stock llama.cpp.
+
+## Progress (2026-11-04)
+
+- Phase 1 text graph runs on CPU and CUDA (RTX 3090) and under ExpertOverlay
+  (cuda:0 + cpu:0 tiers, token-identical to pure CUDA).
+- Tiny-model evidence: CPU stage cosine >= 0.99 against the FP32 reference
+  for every stage/layer (457-token prompt and decode); CPU greedy tokens equal
+  llama.cpp for 9 tokens; CUDA follows the FP32 reference except at near-ties.
+- SwiGLU clamp implemented in every CPU/CUDA MoE path; a binding clamp (1.0)
+  gives CPU == CUDA tokens and 7/8 equal to llama.cpp.
+- Unsloth UD recipes (IQ2_XS/IQ2_XXS/IQ3_XXS experts, Q5_K/Q6_K shared,
+  Q4_K embed/output) reproduced on a 256-wide tiny model and run on CPU/CUDA.
+- Planner BOM on header-only sparse copies (unsloth rev `87ce1581`): one
+  device needs 115.9 GiB (UD-IQ1_M) / 117.5 GiB (UD-IQ2_XXS) at 32K context
+  because CUDA packs IQ2_XS experts at about 1.41x their GGUF size. A single
+  H100 (93 GiB) therefore needs a CPU expert tier, or two GPUs.
