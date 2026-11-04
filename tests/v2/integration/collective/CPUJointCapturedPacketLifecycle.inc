@@ -9,7 +9,7 @@
  * CPU packet channel, synthetic completion or terminal cancellation substitutes
  * for an ordinary successful invocation/reset.
  */
-#ifdef HAVE_ROCM
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 #include "../../utils/CPUJointSourceTestPlan.h"
 #include "../../utils/PlanningGGUFFixture.h"
 #include "../../utils/ServingGGUFFixturePayload.h"
@@ -32,11 +32,17 @@
 #include "execution/moe/MoEOverlayCapacityResolver.h"
 #include "execution/moe/MoEOverlayNodeLocalRankBatchTransport.h"
 #include "execution/moe/MoEOverlayResidencyAuthority.h"
+#ifdef HAVE_CUDA
+#include "kernels/cuda/moe/CUDAMoEKernel.h"
+#endif
+#ifdef HAVE_ROCM
 #include "kernels/rocm/moe/ROCmMoEKernel.h"
+#endif
 #include "loaders/WeightManager.h"
 #include "memory/BufferArena.h"
 #include "transfer/TransferEngine.h"
 #include "utils/PerfStatsCollector.h"
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -50,6 +56,28 @@ using namespace llaminar2;
 constexpr int rows = 64, hidden = 256, intermediate = 16, experts = 8, top_k = 2;
 constexpr size_t slots = size_t(rows) * top_k;
 constexpr uint64_t workspace_generation = 17;
+constexpr uint64_t invocation_count = 20;
+/** @brief Recorded valid request rows and independently expected CPU cohort work. */
+struct RecordedLayerWork
+{
+    int32_t logical_rows;
+    int32_t cohort_rows;
+};
+constexpr std::array<RecordedLayerWork, 4> live_row_trace{{{9, 9}, {9, 0}, {1, 1}, {9, 9}}};
+/** @brief Build immutable recorded routes to the first two experts of one tier.
+ * @param first_expert First actual expert in the original placement.
+ * @return Exact FP32 expert IDs, retained for every asynchronous replay upload.
+ */
+constexpr std::array<float, rows * top_k> recordedRoutes(int first_expert)
+{
+    std::array<float, rows * top_k> result{};
+    for (int row = 0; row < rows; ++row)
+        for (int slot = 0; slot < top_k; ++slot)
+            result[row * top_k + slot] = float(first_expert + slot);
+    return result;
+}
+constexpr auto cohort_routes = recordedRoutes(2);
+constexpr auto continuation_routes = recordedRoutes(0);
 /** @brief Abort the actual MPI job before admitted owners unwind.
  * @param message Original failure diagnostic. */
 [[noreturn]] inline void abortUnexpected(const char *message) noexcept;
@@ -142,14 +170,31 @@ class Source final
            std::shared_ptr<MoEOverlayCanonicalRouteReturnTicketStorage> canonical)
         : device_(device), transport_(transport), canonical_(std::move(canonical)),
           hidden_({rows, hidden}), indices_({rows, top_k}), weights_({rows, top_k}),
-          output_({slots, size_t(hidden)})
+          output_({slots, size_t(hidden)}), output_poison_(slots * hidden, -991.f)
     {
         backend_ = getBackendFor(device_);
         requireOriginal(backend_ != nullptr, "original source backend");
         stream_ = backend_->createStream(device_.ordinal);
         terminal_ = backend_->createEvent(device_.ordinal);
         requireOriginal(stream_ && terminal_, "original source stream/event");
-        kernel_ = std::make_unique<ROCmMoEKernel>(device_.ordinal);
+        if (device_.is_cuda())
+        {
+#ifdef HAVE_CUDA
+            kernel_ = std::make_unique<CUDAMoEKernel>(device_.ordinal);
+#else
+            throw std::invalid_argument("CUDA rooted packet case requires its compiled backend");
+#endif
+        }
+        else if (device_.is_rocm())
+        {
+#ifdef HAVE_ROCM
+            kernel_ = std::make_unique<ROCmMoEKernel>(device_.ordinal);
+#else
+            throw std::invalid_argument("ROCm rooted packet case requires its compiled backend");
+#endif
+        }
+        else
+            throw std::invalid_argument("Rooted packet case requires its explicit GPU backend");
         banks_ =
             static_cast<DeviceMoEPlacementBank *>(allocate(2 * sizeof(DeviceMoEPlacementBank)));
         epoch_control_ = static_cast<DeviceMoEOverlayEpochControl *>(
@@ -190,7 +235,7 @@ class Source final
         dispatch_ticket_ = std::make_shared<MoEOverlayDispatchTicketStorage>();
         dispatch_ticket_->bindFixedCapacity(0, rows, top_k, hidden, device_, workspace_generation,
                                             metadata, epoch_ticket_);
-        prepareInputs(9);
+        initializeInputs();
         arena_ = std::make_unique<BufferArena>();
         requireOriginal(
             arena_->registerExternalBuffer(BufferId::NORMALIZED, &hidden_) &&
@@ -289,6 +334,7 @@ class Source final
                                     MaterializedUnlaunched,
                         "one original materialized-unlaunched source executable");
         captured_ = cache_.segments.front().capture.get();
+        captured_node_count_ = captured_->nodeCount();
     }
     /** @brief Abort only failure cleanup, drain accepted work before releasing
      * any mapped/root owner. */
@@ -302,8 +348,11 @@ class Source final
                 control, transport_.activationEpochConfig(remote_, 0));
             (void)protocol.cancelOriginalInvocation(protocol.activeIdentity(),
                                                     MoEOverlayActivationStatusCode::ExplicitAbort);
-            backend_->synchronizeStream(stream_, device_.ordinal);
         }
+        // Reset uploads can exist before any graph is submitted. Retain their
+        // immutable staging owner until this exact stream is drained as well.
+        if (backend_ && stream_)
+            backend_->synchronizeStream(stream_, device_.ordinal);
         cache_.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Destroy);
         graph_.reset();
         executor_.reset();
@@ -322,15 +371,20 @@ class Source final
     /** @brief Replay the same executable after original protocol admission. */
     void launch()
     {
+        requireOriginal(!pending_, "one original source submission at a time");
         requireOriginal(dispatch_ticket_->armCapturedPublication(),
                         "original source-local publication reset");
+        // Own failure cleanup before submission: an exception may follow a
+        // native enqueue, which still needs its original abort/drain boundary.
+        pending_ = true;
         requireOriginal(
             submit(DeviceGraphExecutor::GraphInitialSubmissionPolicy::CaptureInstantiateAndLaunch),
             "source retained launch");
+        requireOriginal(addresses() == bound_addresses_, "launch preserves original GPU operand bindings");
         requireOriginal(cache_.segments.size() == 1 &&
-                            cache_.segments.front().capture.get() == captured_,
+                            cache_.segments.front().capture.get() == captured_ &&
+                            captured_->hasExecutable() && captured_->nodeCount() == captured_node_count_,
                         "same captured source executable");
-        pending_ = true;
         requireOriginal(backend_->recordEvent(terminal_, device_.ordinal, stream_),
                         "source terminal event");
     }
@@ -349,30 +403,43 @@ class Source final
         requireOriginal(ready, "source actual round trip deadline");
         pending_ = false;
     }
-    /** @brief Set the recorded next invocation before admission, never during
-     * captured execution.
-     * @param live Original trace logical rows, within retained capacity.
+    /**
+     * @brief Publish recorded routes and reset GPU output before the next admission.
+     * @param live Expected cohort row count from the immutable recorded trace.
+     *
+     * Captured output storage is GPU-owned even before its first launch. A full
+     * overwrite therefore uses the original GPU address and publishes the actual
+     * producer event; it must not reacquire stale host tensor contents.
      */
     void prepareInputs(int live)
     {
-        for (int row = 0; row < rows; ++row)
-        {
-            for (int column = 0; column < hidden; ++column)
-                hidden_.mutable_data()[row * hidden + column] = 0.001f * float(1 + row + column);
-            for (int slot = 0; slot < top_k; ++slot)
-            {
-                indices_.mutable_data()[row * top_k + slot] = float(2 + slot);
-                weights_.mutable_data()[row * top_k + slot] = slot ? 0.75f : 0.25f;
-            }
-        }
-        std::fill_n(output_.mutable_data(), output_.numel(), -991.f);
-        requireOriginal(hidden_.ensureOnDevice(device_, stream_) &&
-                            indices_.ensureOnDevice(device_, stream_) &&
-                            weights_.ensureOnDevice(device_, stream_) &&
-                            output_.ensureOnDevice(device_, stream_) &&
-                            backend_->hostToDevice(active_, &(active_host_ = live), sizeof(live),
-                                                   device_.ordinal, stream_),
-                        "recorded source inputs");
+        requireOriginal(!pending_ && captured_,
+                        "replay reset requires a quiescent retained capture");
+        requireOriginal(addresses() == bound_addresses_, "original GPU replay buffer addresses");
+        const auto recorded = std::find_if(live_row_trace.begin(), live_row_trace.end(),
+            [live](const auto& work) { return work.cohort_rows == live; });
+        requireOriginal(recorded != live_row_trace.end(),
+                        "cohort work missing from recorded trace");
+        // Empty participants still belong to a nonempty model request. Route
+        // that recorded request to the original GPU-owned experts instead of
+        // inventing a zero-row dispatch ticket.
+        const auto& routes = live == 0 ? continuation_routes : cohort_routes;
+        requireOriginal(backend_->hostToDevice(indices_.gpu_data_ptr(), routes.data(),
+                                               routes.size() * sizeof(float),
+                                               device_.ordinal, stream_),
+                        "ordered recorded expert-route publication");
+        TransferEngine::publishDeviceWrite(&indices_, device_, stream_);
+        requireOriginal(backend_->hostToDevice(output_.gpu_data_ptr(), output_poison_.data(),
+                                               output_poison_.size() * sizeof(float),
+                                               device_.ordinal, stream_),
+                        "ordered overwrite of original GPU output storage");
+        TransferEngine::publishDeviceWrite(&output_, device_, stream_);
+        requireOriginal(
+            backend_->hostToDevice(active_, &recorded->logical_rows, sizeof(int32_t),
+                                   device_.ordinal, stream_),
+            "ordered recorded active-count publication");
+        requireOriginal(addresses() == bound_addresses_,
+                        "replay reset must not rebind GPU storage");
     }
     /** @brief Check forwarding, original-slot placement and untouched tails against actual root
      * rows. This is not an independent FFN arithmetic oracle; that remains in its owning
@@ -411,6 +478,15 @@ class Source final
         EXPECT_EQ(std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)), 0)
             << "Actual captured root return changed live rows, original slots or "
                "untouched tails";
+        if (live == live_row_trace.front().cohort_rows)
+        {
+            if (!first_nonempty_output_)
+                first_nonempty_output_ = actual;
+            else
+                EXPECT_EQ(std::memcmp(actual.data(), first_nonempty_output_->data(),
+                                      actual.size() * sizeof(float)), 0)
+                    << "Same recorded nonempty work changed after a genuine success/reset";
+        }
     }
     /** @brief Release the actual source bank reader only after every captured
      * transaction is terminal. */
@@ -432,6 +508,39 @@ class Source final
     }
 
   private:
+    /** @brief Initialize read-only operands once, before capture owns any GPU output. */
+    void initializeInputs()
+    {
+        requireOriginal(!pending_ && !captured_, "cold operand initialization precedes capture");
+        for (int row = 0; row < rows; ++row)
+        {
+            for (int column = 0; column < hidden; ++column)
+                hidden_.mutable_data()[row * hidden + column] = 0.001f * float(1 + row + column);
+            for (int slot = 0; slot < top_k; ++slot)
+            {
+                indices_.mutable_data()[row * top_k + slot] = float(2 + slot);
+                weights_.mutable_data()[row * top_k + slot] = slot ? 0.75f : 0.25f;
+            }
+        }
+        std::fill_n(output_.mutable_data(), output_.numel(), -991.f);
+        requireOriginal(hidden_.ensureOnDevice(device_, stream_) &&
+                            indices_.ensureOnDevice(device_, stream_) &&
+                            weights_.ensureOnDevice(device_, stream_) &&
+                            output_.ensureOnDevice(device_, stream_) &&
+                            backend_->hostToDevice(active_, &live_row_trace.front().logical_rows, sizeof(int32_t),
+                                                   device_.ordinal, stream_),
+                        "recorded source inputs");
+        bound_addresses_ = addresses();
+        requireOriginal(std::all_of(bound_addresses_.begin(), bound_addresses_.end(),
+                                    [](const void *address) { return address != nullptr; }),
+                        "complete original GPU operand bindings");
+    }
+    /** @return Original storage identities only, never a shadow of live tensor values. */
+    std::array<const void *, 5> addresses() const noexcept
+    {
+        return {hidden_.gpu_data_ptr(), indices_.gpu_data_ptr(), weights_.gpu_data_ptr(),
+                output_.gpu_data_ptr(), active_};
+    }
     /** @brief Validate a setup/retirement receipt, not a host substitute for an
      * acquired ticket.
      * @param operation Actual native operation submitted on this source stream.
@@ -500,7 +609,6 @@ class Source final
     DeviceMoEPlacementBank *banks_ = nullptr;
     std::unique_ptr<DeviceMoEPlacementBank[]> initial_banks_;
     DeviceMoEOverlayEpochControl initial_control_{};
-    int32_t active_host_ = 0;
     DeviceMoEOverlayEpochControl *epoch_control_ = nullptr;
     DeviceMoEOverlayEpochTicket *epoch_ticket_ = nullptr;
     DeviceMoEOverlayEpochStatus *epoch_status_ = nullptr;
@@ -508,16 +616,19 @@ class Source final
     int remote_ = -1;
     bool pending_ = false;
     FP32Tensor hidden_, indices_, weights_, output_;
+    const std::vector<float> output_poison_; ///< Cold immutable reset input, retained through every upload.
+    std::array<const void*, 5> bound_addresses_{}; ///< Immutable capture identities, not data mirrors.
     std::unique_ptr<BufferArena> arena_;
     std::unique_ptr<IDeviceContext> context_;
     std::unique_ptr<ComputeGraph> graph_;
     std::unique_ptr<DeviceGraphExecutor> executor_;
     DeviceGraphExecutor::GraphSegmentCache cache_;
     const IGPUGraphCapture *captured_ = nullptr;
+    size_t captured_node_count_ = 0;
+    std::optional<std::vector<float>> first_nonempty_output_; ///< Terminal replay oracle only; never feeds execution.
 };
 
-/** @brief Exercise one actual prepared two-socket source generation, then
- * original reset.
+/** @brief Replay prepared two-socket work through one retained executable and original resets.
  * @param device Original rank0 continuation; the other rank never requests a
  * GPU backend.
  */
@@ -956,17 +1067,22 @@ inline void runOriginal(DeviceId device)
         returned.residency_lease_terminal = MoEOverlayHostDispatchLeaseTerminal::Release;
         local_return = std::make_unique<MoESparseReturnReduceStage>(returned);
     }
-    for (uint64_t generation = 1; generation <= 1; ++generation)
+    for (uint64_t generation = 1; generation <= invocation_count; ++generation)
     {
-        constexpr int live = 9;
+        const auto& recorded = live_row_trace[(generation - 1) % live_row_trace.size()];
+        const int live = recorded.cohort_rows;
+        SCOPED_TRACE("generation=" + std::to_string(generation) + " live=" + std::to_string(live));
         if (rank == 0)
         {
+            // Replay recorded cohort work inside the same valid request/capture
+            // envelope. Empty CPU participants retain positive logical rows.
+            source->prepareInputs(live);
             const auto ticket = makeMoEOverlayInferenceExecutionTicket(
                 config.transaction_topology,
                 {.request_generation = generation,
                  .command_id = generation,
                  .initial_placement_epoch = 1},
-                generation, generation, 1, MoEOverlayInferenceGraphRole::MainPrefill, 1, live,
+                generation, generation, 1, MoEOverlayInferenceGraphRole::MainPrefill, 1, rows,
                 rows);
             requireOriginal(bool(protocol.arm(ticket, generation, 30'000'000'000ull, &error)),
                             error.c_str());
@@ -1024,7 +1140,14 @@ inline void runOriginal(DeviceId device)
         }
         EXPECT_EQ(input.live_row_count, size_t(live));
         EXPECT_EQ(input.live_entry_count, size_t(live * top_k));
+        auto& packed = *arena->cpuJointPackedRecords();
+        const float unused_record = -1000.0f - static_cast<float>(generation);
+        std::fill_n(packed.mutable_data(), packed.numel(), unused_record);
         requireOriginal(compute.execute(local_context.get()), "actual prepared CPU shard compute");
+        EXPECT_TRUE(std::all_of(packed.data() + size_t(live * top_k) * (hidden + 1),
+                               packed.data() + packed.numel() - 1,
+                               [unused_record](float value) { return value == unused_record; }))
+            << "CPU producer touched inactive packed capacity";
         EXPECT_EQ(
             canonical_moe_route_record::readRecordCount(arena->cpuJointPackedRecords()->data(),
                                                         arena->cpuJointPackedRecords()->numel()),
@@ -1045,6 +1168,11 @@ inline void runOriginal(DeviceId device)
                 protocol.complete(MoEOverlayActivationEndpoint::Follower, identity, &error),
                 error.c_str());
         }
+        const size_t gathered_prefix = size_t(live * top_k) * (is_root ? members.size() : 1);
+        EXPECT_TRUE(std::all_of(packed.data() + gathered_prefix * (hidden + 1),
+                               packed.data() + packed.numel() - 1,
+                               [unused_record](float value) { return value == unused_record; }))
+            << "Native gather touched inactive packed capacity";
         EXPECT_EQ(evidence.value("cpu_packed_route_gather_calls") - gathered_calls_before, 1.0);
         EXPECT_EQ(evidence.value("cpu_packed_route_gather_local_bytes") - gathered_bytes_before,
                   double(size_t(live * top_k) * (hidden + 1) * sizeof(float)));
@@ -1109,7 +1237,10 @@ inline void runOriginal(DeviceId device)
                                    PhysicalMemoryMaterializationKind::NewAllocation),
               0u);
     ::testing::Test::RecordProperty("actual_distinct_physical_sockets", 2);
-    ::testing::Test::RecordProperty("actual_complete_packet_invocations", 1);
+    ::testing::Test::RecordProperty("actual_complete_packet_invocations", invocation_count);
+    ::testing::Test::RecordProperty("actual_cohort_live_row_trace", "9,0,1,9 repeated five times");
+    ::testing::Test::RecordProperty("actual_logical_row_trace", "9,9,1,9 repeated five times");
+    ::testing::Test::RecordProperty("actual_admitted_request_rows", rows);
     }
     catch (const std::exception &failure)
     {
@@ -1185,4 +1316,4 @@ inline void run(DeviceId device)
 }
 } // namespace rooted_packet_lifecycle
 
-#endif // HAVE_ROCM
+#endif // HAVE_CUDA || HAVE_ROCM

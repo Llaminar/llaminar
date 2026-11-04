@@ -46,15 +46,29 @@ add_v2_test(V2_Integration_CPUExpertSocketMembershipReplay
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 10)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUExpertSocketMembershipReplay)
 
-# Uses the same original socket-bound MPI guardian as the existing native domain cases.
-if(HAVE_ROCM AND V2_TEST_SOCKETS AND V2_TEST_SOCKETS GREATER_EQUAL 2)
-    set(_cpu_joint_packet_name V2_Integration_CPUJointCapturedRootedRoundTrip_ROCm)
-    add_v2_test(${_cpu_joint_packet_name}
-        COMMAND $<TARGET_FILE:v2_integration_cpu_expert_domain_lifecycle>
-            --gtest_filter=CPUExpertDomainNative.ROCmPreparedRootedPacketRoundTrip
-        LABELS "V2;Integration;ProductionTestPreflight;ROCm;CPU;MoE;MPI;Collective;Lifecycle;Contract"
-        MPI_PROCS 2 NO_MODELS TIMEOUT 60
-        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0" "LLAMINAR_SKIP_CUDA_STARTUP=1"
-            "LLAMINAR_SKIP_ROCM_STARTUP=0" "OMP_NUM_THREADS=1" "OMP_DYNAMIC=false")
-    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_cpu_joint_packet_name})
-endif()
+# The same successful source/rooted/return lifecycle replaces the single-roundtrip case.
+# Each backend reuses one retained executable across 9/0/1/9 CPU-cohort rows;
+# the original request admission remains valid at the fixed captured capacity.
+foreach(_cpu_joint_backend IN ITEMS CUDA ROCm)
+    string(TOUPPER "${_cpu_joint_backend}" _cpu_joint_backend_upper)
+    if(HAVE_${_cpu_joint_backend_upper} AND V2_TEST_SOCKETS AND V2_TEST_SOCKETS GREATER_EQUAL 2)
+        if(_cpu_joint_backend STREQUAL "CUDA")
+            set(_cpu_joint_skip_cuda 0)
+            set(_cpu_joint_skip_rocm 1)
+        else()
+            set(_cpu_joint_skip_cuda 1)
+            set(_cpu_joint_skip_rocm 0)
+        endif()
+        set(_cpu_joint_packet_name "V2_Integration_CPUJointCapturedRootedReplay_${_cpu_joint_backend}")
+        add_v2_test(${_cpu_joint_packet_name}
+            COMMAND $<TARGET_FILE:v2_integration_cpu_expert_domain_lifecycle>
+                "--gtest_filter=CPUExpertDomainNative.${_cpu_joint_backend}PreparedRootedPacketReplay"
+            LABELS "V2;Integration;ProductionTestPreflight;${_cpu_joint_backend};CPU;MoE;MPI;Collective;Lifecycle;Replay;Contract"
+            MPI_PROCS 2 NO_MODELS TIMEOUT 60
+            ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0"
+                "LLAMINAR_SKIP_CUDA_STARTUP=${_cpu_joint_skip_cuda}"
+                "LLAMINAR_SKIP_ROCM_STARTUP=${_cpu_joint_skip_rocm}"
+                "OMP_NUM_THREADS=1" "OMP_DYNAMIC=false")
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_cpu_joint_packet_name})
+    endif()
+endforeach()

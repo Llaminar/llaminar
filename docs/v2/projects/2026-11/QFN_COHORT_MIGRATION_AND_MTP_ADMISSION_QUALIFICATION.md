@@ -244,8 +244,8 @@ These GPU packet traces use fresh channels and terminal cancellation after
 inspection; they do not invent CPU completion or reset a cancelled channel.
 They prove capture-before-bank-change dispatch, not repeated successful
 GPU-to-CPU compute/return transactions or global cohort movement. The first genuine
-two-socket rooted round trip is qualified below; repeated successful reuse and
-CUDA remain separate obligations. Dynamic cohort inference, controller cost
+two-socket rooted round trip and subsequent CUDA/ROCm repeated reuse are
+qualified below. Dynamic cohort inference, controller cost
 qualification, fresh model KL, Release performance and complete preflight
 remain unqualified.
 
@@ -276,11 +276,42 @@ follower activates before waiting for publication and consuming once. Unexpected
 exceptions now report before the admitted native owner unwinds and abort the
 actual MPI job promptly. No production guard was relaxed for these repairs.
 
-This case covers one nonempty prefill invocation followed by successful reset.
-Repeated nonempty/empty/small reuse, CUDA, other successful phases and changed
-placement epochs remain pending. Builds181/183/185/187 and the reduced failure
+This initial case covers one nonempty prefill invocation followed by successful
+reset. The repeated successor below extends its scope. Builds181/183/185/187 and the reduced failure
 receipts retain the path to this first green native result; they are not model
 accuracy or Release performance measurements.
+
+## Repeated captured CUDA/ROCm CPU-cohort return
+
+`common-cpu-native197` passes both canonical native registrations in 6.17 seconds,
+with no skips and clean driver evidence. Each backend retains the same executable,
+original GPU addresses, prepared CPU engines and actual two-socket domain through
+20 successful MainPrefill invocations. The CPU cohort receives 9, 0, 1 and 9 rows,
+repeated five times. Logical request rows are 9, 9, 1 and 9: the empty-participant
+case routes the valid request to the original GPU-owned experts. It does not
+invent a zero-row request or relax the dispatch-ticket contract.
+
+Each invocation checks exact live dispatch and rooted-gather bytes, zero remote
+contributor return bytes, untouched packed/output capacity, genuine completion,
+original protocol reset and source-reader release. Repeated nine-row outputs
+remain byte-identical after intervening empty/small work. Final native-domain
+retirement and temporary model cleanup succeed. The captured graph is neither
+rebuilt nor replaced between invocations.
+
+The repaired test initializes immutable operands before capture; later recorded
+routes, active counts and output poison use the original explicit stream and
+real TransferEngine producer publication. It never downloads an old output to
+overwrite it. Native192/194 retain the fixture failures; build196 and native197
+are the qualifying receipts. The former single ROCm round-trip registration is
+replaced by `V2_Integration_CPUJointCapturedRootedReplay_CUDA` and
+`V2_Integration_CPUJointCapturedRootedReplay_ROCm`, both explicitly registered in
+ProductionTestPreflight. Only these focused checks ran; complete preflight67
+remains unqualified.
+
+This proves repeated prepared compute, rooted forwarding and lifecycle at a
+fixed placement epoch. Decode/grouped phases, changed-epoch publication, full
+model KL and Release performance still require their own gates. Dynamic cohort
+guards remain unchanged.
 
 ## Shared histogram candidate construction
 
