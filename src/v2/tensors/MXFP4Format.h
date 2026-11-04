@@ -111,10 +111,13 @@ namespace llaminar2::mxfp4
     /**
      * @brief Largest E8M0 byte accepted by the native scale plane.
      *
-     * OCP MX defines 0xFF as NaN. ggml decodes it as the finite 2^127, but no
-     * real checkpoint uses it; nonzero blocks with it are rejected, not guessed.
+     * Chosen so every decodable weight stays a finite FP32 value: the largest
+     * doubled code is 12 = 1.5 * 2^3, and 12 * 2^(252-128) = 1.5 * 2^127, while
+     * e = 253 already overflows. OCP MX 0xFF (NaN) is excluded as well. The
+     * exponent predicate bounds individual weights only; dot products and
+     * contributions keep the ordinary IEEE FP32 arithmetic contract.
      */
-    inline constexpr uint8_t kMaxNativeE8M0Exponent = 254;
+    inline constexpr uint8_t kMaxNativeE8M0Exponent = 252;
 
     /** @return Whether exponent byte @p e has an exact normal FP32 scale for the native plane. */
     LLAMINAR_MXFP4_HD constexpr bool exponentFitsNativeE8M0(uint8_t e) noexcept
@@ -155,7 +158,7 @@ namespace llaminar2::mxfp4
      * @param word Candidate word produced by powerOfTwoBF16Word().
      * @param[out] e Plane byte (0 for the zero marker).
      * @return False for any word that is not +0 or a positive normal power of two
-     *         with biased exponent 1..253 (e in [2, 254]).
+     *         with biased exponent 1..251 (e in [2, 252]).
      */
     LLAMINAR_MXFP4_HD constexpr bool e8m0FromPowerOfTwoBF16Word(uint16_t word, uint8_t &e) noexcept
     {
@@ -165,7 +168,7 @@ namespace llaminar2::mxfp4
             return true;
         }
         const unsigned biased = word >> 7;
-        if ((word & 0x807fu) != 0 || biased < 1u || biased > 253u)
+        if ((word & 0x807fu) != 0 || biased < 1u || biased > kMaxNativeE8M0Exponent - 1u)
             return false;
         e = static_cast<uint8_t>(biased + 1u);
         return true;
@@ -193,11 +196,11 @@ namespace llaminar2::mxfp4
     static_assert(preparedScaleFP16Bits(0) == 0u && preparedScaleFP16Bits(128) == 0x3c00u);
     static_assert(normalScaleFP32Bits(128) == 0x3f800000u, "2^0 is FP32 one");
     static_assert(normalScaleFP32Bits(kMinNormalFP32Exponent) == 0x00800000u, "2^-126 is the smallest FP32 normal");
-    static_assert(normalScaleFP32Bits(kMaxNativeE8M0Exponent) == 0x7e800000u, "2^126");
-    static_assert(!exponentFitsNativeE8M0(1) && !exponentFitsNativeE8M0(255) && exponentFitsNativeE8M0(104));
+    static_assert(normalScaleFP32Bits(kMaxNativeE8M0Exponent) == 0x7e000000u, "2^124");
+    static_assert(!exponentFitsNativeE8M0(1) && !exponentFitsNativeE8M0(253) && exponentFitsNativeE8M0(104));
     static_assert((uint32_t{powerOfTwoBF16Word(128)} << 16) == normalScaleFP32Bits(128));
     static_assert((uint32_t{powerOfTwoBF16Word(2)} << 16) == normalScaleFP32Bits(2));
-    static_assert((uint32_t{powerOfTwoBF16Word(254)} << 16) == normalScaleFP32Bits(254));
+    static_assert((uint32_t{powerOfTwoBF16Word(252)} << 16) == normalScaleFP32Bits(252));
 } // namespace llaminar2::mxfp4
 
 #undef LLAMINAR_MXFP4_HD
