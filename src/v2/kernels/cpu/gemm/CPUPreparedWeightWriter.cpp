@@ -82,10 +82,17 @@ struct CPUPreparedWeightWriter::Impl {
    throw std::invalid_argument("CPU GEMM source must be an actual matrix");
   const auto* original_format=native_vnni_formats::forQuantType(tensorTypeName(g.original_type));
   const bool original_floating=g.original_type==TensorType::FP32 || g.original_type==TensorType::FP16 || g.original_type==TensorType::BF16;
-  if(!original_format && !original_floating)throw std::invalid_argument("CPU source has no canonical native geometry");
+  // Integer tables (DeepSeek-V4 token-id hash routing) are one 4-byte value
+  // per element, copied verbatim into a resident INT32 root and never a GEMM.
+  const bool original_integer=g.original_type==TensorType::INT32;
+  if(original_integer && (spec.consumer!=CPUWeightConsumer::ResidentTensor ||
+                          spec.destination_precision!=WeightPrecision::NATIVE))
+   throw std::invalid_argument("CPU INT32 tables are native resident tensors only");
+  if(!original_format && !original_floating && !original_integer)
+   throw std::invalid_argument("CPU source has no canonical native geometry");
   const size_t expected_group=original_format?(original_format->is_superblock?256:32):1;
   const size_t expected_bytes=original_format?cpu::native_vnni::native_block_bytes_for_format(original_format->codebook_id,original_format->is_superblock):
-    (g.original_type==TensorType::FP32?sizeof(float):sizeof(uint16_t));
+    (g.original_type==TensorType::FP32 || original_integer?sizeof(float):sizeof(uint16_t));
   if(g.native_group_elements!=expected_group || g.native_group_bytes!=expected_bytes || g.original_shape[0]%expected_group)
    throw std::invalid_argument("CPU source geometry differs from its original canonical native encoding");
   const size_t k=g.original_shape[0],n=g.original_shape.size()>1?g.original_shape[1]:1;
@@ -153,6 +160,7 @@ struct CPUPreparedWeightWriter::Impl {
    case TensorType::FP32: {auto data=placement.allocate<float>(elements);final_bytes=reinterpret_cast<std::byte*>(data.data());final=std::make_shared<FP32Tensor>(shape,std::move(data),placement.allocatorDevice());break;}
    case TensorType::FP16: {auto data=placement.allocate<uint16_t>(elements);final_bytes=reinterpret_cast<std::byte*>(data.data());final=std::make_shared<FP16Tensor>(shape,std::move(data),placement.allocatorDevice());break;}
    case TensorType::BF16: {auto data=placement.allocate<uint16_t>(elements);final_bytes=reinterpret_cast<std::byte*>(data.data());final=std::make_shared<BF16Tensor>(shape,std::move(data),placement.allocatorDevice());break;}
+   case TensorType::INT32: {auto data=placement.allocate<int32_t>(elements);final_bytes=reinterpret_cast<std::byte*>(data.data());final=std::make_shared<INT32Tensor>(shape,std::move(data),placement.allocatorDevice());break;}
    default: {const size_t row_bytes=q8_conversion?product(final_columns/32,sizeof(Q8_0Block)):product(final_columns/native_group,native_group_bytes);
     auto data=placement.allocate<uint8_t>(product(product(final_rows,row_bytes),spec.matrix_count));final_bytes=reinterpret_cast<std::byte*>(data.data());final=TensorFactory::adoptQuantizedFinalStorage(final_type,shape,std::move(data),placement.allocatorDevice());break;}
   }

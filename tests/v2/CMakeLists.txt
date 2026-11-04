@@ -18356,6 +18356,15 @@ add_v2_test(V2_Integration_CPUNativeWeightWindowContract
     MPI_PROCS 1
     NO_MODELS
 )
+# DeepSeek-V4 startup failed when the bounded CPU loader met the GGUF I32
+# token-id hash table; integer tables are verbatim resident roots only.
+add_v2_test(V2_Integration_CPUIntegerTableSource
+    COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_weight_packing>
+            --gtest_filter=NativeWindowWriterContract.IntegerTablesAreVerbatimResidentOnly
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;DeepSeekV4;Loaders;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
 add_v2_test(V2_Integration_CPUNativeResidentRankContract
     COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_weight_packing>
             --gtest_filter=NativeWindowWriterContract.ResidentParentsPreserveOriginalRankIncludingSingletonOuterAxes:NativeWindowWriterContract.NativeResidentParentsPreserveRankWithoutInventingQ8_1Parents
