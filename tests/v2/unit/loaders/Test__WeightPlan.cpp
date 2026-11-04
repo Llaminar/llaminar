@@ -1458,7 +1458,7 @@ TEST(Test__MoERouterArithmetic, HadamardRejectsEveryQuantizedSourceAndPreservesO
 {
     using C = PreparedWeightRepresentationContract;
     constexpr auto mode = MoERouterArithmetic::NativeHadamard32;
-    for (int raw = 0; raw <= static_cast<int>(TensorType::AQ8); ++raw)
+    for (int raw = 0; raw <= static_cast<int>(TensorType::MXFP4); ++raw)
     {
         const auto type = static_cast<TensorType>(raw);
         if (type == TensorType::FP32 || type == TensorType::FP16 || type == TensorType::BF16) continue;
