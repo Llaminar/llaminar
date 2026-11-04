@@ -398,6 +398,9 @@ namespace llaminar2::test
          * a power-of-two E8M0 exponent chosen so the block maximum maps to 12.
          * Exponents stay inside the exact-FP16 scale window, matching real
          * checkpoints, so every NativeVNNI preparation path accepts the tensor.
+         * Every 13th block is an all-zero block with e = 0, exactly as ggml's
+         * quantizer writes it, so all-format sweeps also cover the scale-+0
+         * preparation of blocks whose exponent has no FP16 form.
          *
          * @param shape Tensor dimensions [rows, cols]; cols must be a multiple of 32.
          * @param seed Random seed.
@@ -415,6 +418,12 @@ namespace llaminar2::test
             auto *blocks = reinterpret_cast<MXFP4Block *>(raw_data.data());
             for (size_t i = 0; i < total_blocks; ++i)
             {
+                if (i % 13 == 5)
+                {
+                    blocks[i].e = 0;
+                    std::memset(blocks[i].qs, 0, sizeof(blocks[i].qs));
+                    continue;
+                }
                 float values[MXFP4Block::BLOCK_SIZE];
                 float max_abs = 0.0f;
                 for (auto &v : values)

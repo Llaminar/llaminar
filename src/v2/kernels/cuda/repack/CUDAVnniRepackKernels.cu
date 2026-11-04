@@ -226,8 +226,9 @@ __global__ void cuda_repack_q4_0_to_vnni(
  * @brief Keep MXFP4 code bytes verbatim and publish the exact FP16 block scale.
  *
  * Source blocks are 17 bytes, so they are read bytewise (no 4-byte alignment).
- * The host reader has already rejected any exponent without an exact FP16
- * scale (mxfp4::exponentFitsFP16), so scaleFP16Bits() is exact here.
+ * The host reader has already rejected any nonzero block without an exact FP16
+ * scale (mxfp4::blockFitsFP16), so preparedScaleFP16Bits() is exact here; an
+ * all-zero block with an unrepresentable exponent publishes scale +0.
  */
 __global__ void cuda_repack_mxfp4_to_vnni(
     const uint8_t* __restrict__ d_raw,
@@ -246,7 +247,7 @@ __global__ void cuda_repack_mxfp4_to_vnni(
 #pragma unroll
     for (int i = 0; i < 16; ++i)
         out[i] = blk[1 + i];
-    d_scales[linear] = llaminar2::mxfp4::scaleFP16Bits(blk[0]);
+    d_scales[linear] = llaminar2::mxfp4::preparedScaleFP16Bits(blk[0]);
 }
 
 // ============================================================================

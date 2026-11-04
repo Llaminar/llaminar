@@ -260,7 +260,7 @@ namespace llaminar2
     void MXFP4Tensor::decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const
     {
         const MXFP4Block &block = blockAt(row_idx, k_block_offset);
-        if (!mxfp4::exponentFitsFP16(block.e))
+        if (!mxfp4::blockFitsFP16(block.e, block.qs))
             throw std::runtime_error("MXFP4Tensor::decode_to_q8_0: block exponent " + std::to_string(block.e) +
                                      " has no exact FP16 scale");
         for (int j = 0; j < 16; ++j)
@@ -268,7 +268,7 @@ namespace llaminar2
             output->qs[j] = mxfp4::kValues[block.qs[j] & 0x0F];
             output->qs[j + 16] = mxfp4::kValues[block.qs[j] >> 4];
         }
-        output->d = mxfp4::scaleFP16Bits(block.e);
+        output->d = mxfp4::preparedScaleFP16Bits(block.e);
     }
 
     void MXFP4Tensor::unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const
@@ -290,13 +290,13 @@ namespace llaminar2
     {
         const size_t linear = vnniLinearIdx(ctx, destination_n, b);
         const auto &blk = typed_data()[static_cast<size_t>(source_n) * ctx.blocks_per_row + b];
-        if (!mxfp4::exponentFitsFP16(blk.e))
+        if (!mxfp4::blockFitsFP16(blk.e, blk.qs))
             throw std::runtime_error("MXFP4Tensor::packVnniBlock: block exponent " + std::to_string(blk.e) +
                                      " (scale 2^" + std::to_string(static_cast<int>(blk.e) - 128) +
                                      ") has no exact FP16 scale; refusing a lossy NativeVNNI preparation");
         // Code bytes keep the IQ4_NL nibble order; codebook 25 selects the MXFP4 lookup.
         std::memcpy(vnniPayloadDst(ctx, linear), blk.qs, 16);
-        ctx.scales_array[linear] = mxfp4::scaleFP16Bits(blk.e);
+        ctx.scales_array[linear] = mxfp4::preparedScaleFP16Bits(blk.e);
     }
 
 } // namespace llaminar2

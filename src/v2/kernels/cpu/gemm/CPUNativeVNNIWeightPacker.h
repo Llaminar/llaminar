@@ -695,10 +695,10 @@ namespace llaminar2::cpu::native_vnni
 
                         if (mxfp4_source)
                         {
-                            if (!mxfp4::exponentFitsFP16(blk[0]))
+                            if (!mxfp4::blockFitsFP16(blk[0], blk + 1))
                                 throw std::invalid_argument(
                                     "MXFP4 block exponent has no exact FP16 scale; refusing lossy repack");
-                            scales_buf[col] = mxfp4::scaleFP16Bits(blk[0]);
+                            scales_buf[col] = mxfp4::preparedScaleFP16Bits(blk[0]);
                         }
                         else
                             std::memcpy(&scales_buf[col], blk, 2);

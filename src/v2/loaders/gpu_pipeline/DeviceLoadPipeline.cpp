@@ -595,13 +595,14 @@ namespace llaminar2
                             if (result.error.empty() && job.format == RepackFormat::MXFP4)
                             {
                                 // The repack kernel stores 2^(e-128) as FP16. Validate every
-                                // exponent here, on the reader thread, so an unrepresentable
+                                // nonzero block here, on the reader thread, so an unrepresentable
                                 // scale fails the load instead of being rounded on device.
+                                // All-zero blocks (ggml writes e = 0) are exact under scale +0.
                                 const auto *bytes = static_cast<const uint8_t *>(result.payload);
                                 for (size_t offset = 0; offset < job.raw_bytes;
                                      offset += mxfp4::kSourceBlockBytes)
                                 {
-                                    if (!mxfp4::exponentFitsFP16(bytes[offset]))
+                                    if (!mxfp4::blockFitsFP16(bytes[offset], bytes + offset + 1))
                                     {
                                         result.error = "MXFP4 block exponent " + std::to_string(bytes[offset]) +
                                                        " in '" + job.name + "' has no exact FP16 scale";
