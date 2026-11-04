@@ -142,8 +142,11 @@ focused registrations pass after the coherent build, including native MPI,
 CPU/GPU transfer controls and twenty-repeat contracts. See the
 [qualification scope](QFN_COHORT_MIGRATION_AND_MTP_ADMISSION_QUALIFICATION.md#complete-target-shadow-calibration-and-robust-measurements).
 
-The next native witness joins the existing controller, distributed transport,
-actual warmup/measurement waves and typed ledger. Whole-only certification and
+The native controller witness now joins the existing distributed transport,
+actual warmup/measurement waves and typed ledger: twenty repetitions complete
+eighty shadow waves with independent rank progress, exact live bytes and final
+reader/PMA retirement. All three selected native registrations pass; production
+code is unchanged from the preceding green slice. Whole-only certification and
 unresolved cohort layer expansion still reject cohort prices explicitly. Service
 measurement must cover the actual fragment computation through rooted combine
 and publication; local fragment durations omit that tail. Preserve one logical

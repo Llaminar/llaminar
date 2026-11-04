@@ -749,3 +749,5 @@ TEST(MoEOverlayGPUCPUCohortFabric, ROCmFloatingOriginalRectangles)
 #include "CPUJointFabricMeasurementContract.inc"
 
 #include "CPUJointShadowCalibrationContract.inc"
+
+#include "CPUJointCalibrationControllerContract.inc"

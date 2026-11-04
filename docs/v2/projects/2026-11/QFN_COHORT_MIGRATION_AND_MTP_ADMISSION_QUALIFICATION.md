@@ -569,11 +569,27 @@ exact-live MPI and focused ledger/normalization/identity/allocation entries incl
 twenty repetitions. All 271 observed temporary model paths are retired after
 both runs. Full production preflight was not rerun.
 
-The next native witness drives the existing controller through its warmup and
-three actual measured waves with the same distributed transport and typed ledger.
+The subsequent controller witness now passes on the same actual two-socket
+source/fabric owners. It drives the existing controller, local/distributed
+transport, MPI consensus and evidence exchange through one warmup and three
+measured reciprocal waves. Original geometry is declared from the genuine
+planner transaction before any observations. Each rank progresses independently;
+the test has no per-poll barrier. Every wave completes physical staging,
+abort/drain and evidence exchange before recording; the two sealed rows each
+retain six pieces and three samples. It verifies zero commits, consumed journals,
+idle lanes, exact live transfer bytes and final reader/PMA retirement. Imported
+cohort reuse remains rejected without original setup-bound quotes.
+
+After build228, `focused229` passes all three native registrations in 5.89 seconds
+with no skips and a clean driver window. The new explicit
+`CPUJointCalibrationControllerPhysicalFabric` registration repeats twenty times,
+for eighty actual controller calibration waves; existing shadow-copy and MPI
+evidence controls also repeat twenty times. All 80 observed temporary model
+paths are retired. This test-only successor changes no production implementation.
+
 Complete cohort service/rooted-return pricing and changed-epoch
 publication/inference remain open. No model arithmetic, KL limit, serving-time
-Dynamic cohort guard or Release performance claim changes in this slice.
+Dynamic cohort guard or Release performance claim changes in these slices.
 
 ## Shared histogram candidate construction
 

@@ -332,4 +332,19 @@ add_v2_test(V2_Integration_MoEOverlayCompleteTargetCardinalityIdentity
     ENVIRONMENT "${V2_CPU_FRAGMENT_TEST_ENV}")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOverlayCompleteTargetCardinalityIdentity)
 
+# Full existing controller + real two-socket Fabric/consensus/evidence + typed Ledger.
+if(V2_TEST_SOCKETS AND V2_TEST_SOCKETS GREATER_EQUAL 2)
+    add_v2_test(V2_Integration_CPUJointCalibrationControllerPhysicalFabric
+        COMMAND $<TARGET_FILE:v2_integration_moe_overlay_residency_consensus_mpi>
+            --gtest_filter=MoEOverlayCPUJointCalibration.RealTwoSocketControllerSealsCompleteTargetMeasurements
+            --gtest_repeat=20 --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;MoE;MPI;Residency;Transfer;Calibration;Measurement;Lifecycle;Contract"
+        MPI_PROCS 2 NO_MODELS TIMEOUT 120
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1"
+            "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUJointCalibrationControllerPhysicalFabric)
+else()
+    message(STATUS "CPU joint calibration controller: unqualified without two physical sockets; no MPI launch")
+endif()
+
 unset(V2_CPU_FRAGMENT_TEST_ENV)
