@@ -103,6 +103,34 @@ TEST(MXFP4Format, LookupAndScalesAreExact)
     EXPECT_EQ(mxfp4::preparedScaleFP16Bits(128), mxfp4::scaleFP16Bits(128));
 }
 
+TEST(MXFP4Format, NativeE8M0ScaleBitsAreExactNormalFP32)
+{
+    // The native E8M0 plane (issue #26) builds the scale from bits on device.
+    // Over its whole domain the result must equal the reference scale and be a
+    // normal FP32 value (CUDA flushes subnormals), and it must agree with the
+    // current FP16 plane wherever that plane is defined.
+    for (int e = 0; e < 256; ++e)
+    {
+        const auto byte = static_cast<uint8_t>(e);
+        if (!mxfp4::exponentFitsNativeE8M0(byte))
+        {
+            EXPECT_TRUE(e < mxfp4::kMinNormalFP32Exponent || e == 255) << e;
+            continue;
+        }
+        const uint32_t built = mxfp4::normalScaleFP32Bits(byte);
+        EXPECT_EQ(built, bits(mxfp4::scaleFP32(byte))) << e;
+        EXPECT_NE(built & 0x7f800000u, 0u) << "subnormal scale for e=" << e;
+        if (mxfp4::exponentFitsFP16(byte))
+            EXPECT_EQ(built, bits(fp16_to_fp32(mxfp4::scaleFP16Bits(byte)))) << e;
+    }
+    // Every exponent the FP16 plane accepts stays accepted by the native plane.
+    for (int e = mxfp4::kMinExactFP16Exponent; e <= mxfp4::kMaxExactFP16Exponent; ++e)
+        EXPECT_TRUE(mxfp4::exponentFitsNativeE8M0(static_cast<uint8_t>(e))) << e;
+    // Until the switch, every physical codebook keeps the FP16 scale plane.
+    for (int codebook = 0; codebook < 32; ++codebook)
+        EXPECT_EQ(nativeVnniScalePlaneBytes(static_cast<uint8_t>(codebook)), 2u) << codebook;
+}
+
 TEST(MXFP4Format, CatalogAndRepackIdentity)
 {
     const auto *format = native_vnni_formats::forQuantType("MXFP4");

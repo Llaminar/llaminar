@@ -626,6 +626,22 @@ namespace llaminar2
     }
 
     /**
+     * @brief Bytes per 32-value block in a physical codebook's primary scale plane.
+     * @param physical_codebook Device/CPU execution codebook (not the arithmetic policy).
+     * @return Scale-plane width; every codebook currently stores one FP16 word.
+     *
+     * Every allocation, BOM and transfer extent derives the primary plane from
+     * this one function, so a codebook can adopt a narrower plane (MXFP4's
+     * native E8M0 byte, issue #26) by changing this declaration together with
+     * its preparation and kernels, never through a second size table.
+     */
+    [[nodiscard]] inline constexpr size_t nativeVnniScalePlaneBytes(uint8_t physical_codebook) noexcept
+    {
+        (void)physical_codebook;
+        return sizeof(uint16_t);
+    }
+
+    /**
      * @brief Compute the exact logical pool regions for one packed matrix.
      *
      * Native-VNNI kernels require K to consist of complete 32-value execution
@@ -643,7 +659,7 @@ namespace llaminar2
         return {
             .payload_bytes =
                 block_count * static_cast<size_t>(format.payload_bytes),
-            .scales_bytes = block_count * sizeof(uint16_t),
+            .scales_bytes = block_count * nativeVnniScalePlaneBytes(physical.codebook_id),
             .mins_bytes =
                 physical.is_asymmetric ? block_count * sizeof(uint16_t) : 0,
             .emins_bytes =
