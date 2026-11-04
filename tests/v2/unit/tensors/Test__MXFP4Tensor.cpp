@@ -7,7 +7,8 @@
  *  - the shared format constants (doubled E2M1 lookup, exact FP16 block scale);
  *  - MXFP4Tensor decode, Q8_0 re-encoding, rank-three expert views;
  *  - NativeVNNI preparation (verbatim codes, exact FP16 scale, hard rejection
- *    of exponents without an exact FP16 scale);
+ *    of exponents without an exact FP16 scale, except all-zero blocks such as
+ *    the e = 0 blocks ggml's quantizer writes, which prepare with scale +0);
  *  - the CPU NativeVNNI GEMV/GEMM on MXFP4 weights against an exact FP64
  *    reference, using activations whose Q8 quantization is lossless so the
  *    only admissible error is FP32 accumulation rounding.
@@ -55,6 +56,17 @@ namespace
         return raw;
     }
 
+    /**
+     * @brief Turn block @p index into an all-zero block the way ggml's quantizer writes it (e = 0).
+     * @param negative_zero Use code 8 (-0) for every element instead of code 0.
+     */
+    void makeZeroBlock(std::vector<uint8_t> &raw, size_t index, uint8_t e = 0, bool negative_zero = false)
+    {
+        auto &block = reinterpret_cast<MXFP4Block *>(raw.data())[index];
+        block.e = e;
+        std::memset(block.qs, negative_zero ? 0x88 : 0x00, sizeof(block.qs));
+    }
+
     uint32_t bits(float v)
     {
         uint32_t out;
@@ -78,6 +90,17 @@ TEST(MXFP4Format, LookupAndScalesAreExact)
     }
     EXPECT_FALSE(mxfp4::exponentFitsFP16(mxfp4::kMinExactFP16Exponent - 1));
     EXPECT_FALSE(mxfp4::exponentFitsFP16(mxfp4::kMaxExactFP16Exponent + 1));
+
+    // Only blocks whose every code is +-0 escape the exponent window.
+    uint8_t qs[16] = {};
+    EXPECT_TRUE(mxfp4::blockFitsFP16(0, qs));
+    std::memset(qs, 0x88, sizeof(qs));
+    EXPECT_TRUE(mxfp4::blockFitsFP16(255, qs));
+    qs[15] = 0x18; // one element with code 1
+    EXPECT_FALSE(mxfp4::blockFitsFP16(0, qs));
+    EXPECT_TRUE(mxfp4::blockFitsFP16(128, qs));
+    EXPECT_EQ(mxfp4::preparedScaleFP16Bits(0), 0u);
+    EXPECT_EQ(mxfp4::preparedScaleFP16Bits(128), mxfp4::scaleFP16Bits(128));
 }
 
 TEST(MXFP4Format, CatalogAndRepackIdentity)
@@ -180,6 +203,57 @@ TEST(MXFP4Tensor, NativeVnniPackingIsVerbatimAndRejectsInexactScales)
             bad_tensor.decode_to_q8_0(0, 1, &q8);
         },
         std::runtime_error);
+    // A nonzero block keeps its rejection even at ggml's zero-block exponent.
+    reinterpret_cast<MXFP4Block *>(bad.data())[1].e = 0;
+    MXFP4Tensor nonzero_e0({N, K}, bad);
+    EXPECT_THROW(nonzero_e0.packVnniBlock(ctx, 0, 0, 1), std::runtime_error);
+}
+
+TEST(MXFP4Tensor, GgmlAllZeroBlocksPrepareExactlyWithZeroScale)
+{
+    // ggml quantize_row_mxfp4_ref writes e = 0 (2^-128, no FP16 form) for an
+    // all-zero block; llama.cpp loads such files, so preparation must as well.
+    constexpr int N = 2, K = 64, bpr = K / 32;
+    auto raw = randomBlocks(N * bpr, 13);
+    makeZeroBlock(raw, 1);
+    makeZeroBlock(raw, 2, 255, true);
+    MXFP4Tensor tensor({N, K}, raw);
+
+    std::vector<uint8_t> payload(N * bpr * 16);
+    std::vector<uint16_t> scales(N * bpr);
+    VnniPackContext ctx{};
+    ctx.N = N;
+    ctx.K = K;
+    ctx.blocks_per_row = bpr;
+    ctx.payload_bytes = 16;
+    ctx.payload_array = payload.data();
+    ctx.scales_array = scales.data();
+    const auto *blocks = reinterpret_cast<const MXFP4Block *>(raw.data());
+    for (int n = 0; n < N; ++n)
+        for (int b = 0; b < bpr; ++b)
+        {
+            ASSERT_NO_THROW(tensor.packVnniBlock(ctx, n, n, b));
+            const size_t linear = vnniLinearIdx(ctx, n, b);
+            const size_t source = static_cast<size_t>(n) * bpr + b;
+            EXPECT_EQ(std::memcmp(payload.data() + linear * 16, blocks[source].qs, 16), 0);
+            EXPECT_EQ(scales[linear], source == 1 || source == 2 ? 0u : mxfp4::scaleFP16Bits(blocks[source].e));
+        }
+
+    for (size_t source : {size_t{1}, size_t{2}})
+    {
+        Q8_0Block q8{};
+        ASSERT_NO_THROW(tensor.decode_to_q8_0(source / bpr, source % bpr, &q8));
+        EXPECT_EQ(q8.d, 0u);
+        for (int j = 0; j < 32; ++j)
+            EXPECT_EQ(q8.qs[j], 0) << "block " << source << " element " << j;
+    }
+    std::vector<float> row(K);
+    for (size_t r = 0; r < N; ++r)
+    {
+        tensor.to_fp32_row(r, row.data());
+        for (size_t k = 0; k < K; ++k)
+            ASSERT_EQ(static_cast<double>(row[k]), referenceValue(blocks[r * bpr + k / 32], static_cast<int>(k % 32)));
+    }
 }
 
 namespace
@@ -205,9 +279,16 @@ namespace
         return a;
     }
 
-    void runCpuProjection(int M, int N, int K, uint32_t seed)
+    /**
+     * @brief CPU NativeVNNI projection against the exact FP64 reference.
+     * @param ggml_zero_blocks Replace every seventh block with a ggml all-zero block (e = 0 or 255).
+     */
+    void runCpuProjection(int M, int N, int K, uint32_t seed, bool ggml_zero_blocks = false)
     {
         auto raw = randomBlocks(static_cast<size_t>(N) * (K / 32), seed);
+        if (ggml_zero_blocks)
+            for (size_t block = 0; block < raw.size() / sizeof(MXFP4Block); block += 7)
+                makeZeroBlock(raw, block, block % 2 ? 255 : 0, block % 3 == 0);
         MXFP4Tensor weights({static_cast<size_t>(N), static_cast<size_t>(K)}, raw);
         cpu::native_vnni::CPUNativeVNNIGemmKernel kernel(&weights);
         ASSERT_TRUE(kernel.isValid());
@@ -246,4 +327,10 @@ TEST(MXFP4CPUNativeVNNI, GemmMatchesExactReference)
 {
     for (int M : {2, 3, 5, 17})
         runCpuProjection(M, 128, 256, 31u + static_cast<uint32_t>(M));
+}
+
+TEST(MXFP4CPUNativeVNNI, GgmlAllZeroBlocksMatchExactReference)
+{
+    for (int M : {1, 5})
+        runCpuProjection(M, 128, 256, 41u + static_cast<uint32_t>(M), true);
 }
