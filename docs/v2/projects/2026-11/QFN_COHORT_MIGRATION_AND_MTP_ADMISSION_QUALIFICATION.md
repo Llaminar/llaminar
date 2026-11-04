@@ -309,9 +309,55 @@ ProductionTestPreflight. Only these focused checks ran; complete preflight67
 remains unqualified.
 
 This proves repeated prepared compute, rooted forwarding and lifecycle at a
-fixed placement epoch. Decode/grouped phases, changed-epoch publication, full
-model KL and Release performance still require their own gates. Dynamic cohort
-guards remain unchanged.
+fixed placement epoch. The following section separately qualifies decode/grouped
+packet reuse. Changed-epoch publication, full-model KL and Release performance
+still require their own gates. Dynamic cohort guards remain unchanged.
+
+## Captured decode and grouped verifier returns
+
+`common-cpu-build212` and `common-cpu-native213` pass all six CUDA/ROCm native
+prefill, decode and verifier registrations in 13.92 seconds. Each case completes
+twenty original invocations on one continuation GPU and two actual CPU socket
+ranks. There are no skips, driver diagnostics are clean, and all twelve temporary
+model files retire. These are the same tiny original prepared-weight integration
+fixtures, not new QFN full-model KL or Release performance results.
+
+The new explicit preflight registrations are
+`V2_Integration_CPUJointCapturedRootedDecodeReplay_CUDA`,
+`V2_Integration_CPUJointCapturedRootedDecodeReplay_ROCm`,
+`V2_Integration_CPUJointCapturedRootedVerifierReplay_CUDA`, and
+`V2_Integration_CPUJointCapturedRootedVerifierReplay_ROCm`.
+Existing prefill registrations remain and pass in the same run.
+
+Each source cold-builds its required exact physical-row captures: prefill 64,
+decode 1, and verifier/serial comparison 1/2/3/4. Those executables share the
+original input/output allocations, source banks, dispatch/return tickets, stream,
+prepared CPU roots and native domain. Each invocation selects a retained
+compatible executable; pointers and native node counts remain stable. The
+one-row/single-follower case uses the canonical single-lane stages, while wider
+rows use the asynchronous batch stages. The CPU follower selects compact or
+shared hidden storage from the authenticated physical extent.
+
+Verifier traces include true physical2/depth1 and physical4/depth3 calls,
+physical3/depth2 with both full and partial CPU work, an empty CPU participant,
+serial row resets and repeated families. Every observed grouped row compares
+byte-for-byte to its actual same-input MainDecode output through this same
+prepared CPU/rooted-return path. Exact dispatch/gather bytes, zero remote
+contributor payload, untouched output tails, terminal publication, successful
+reset and final reader/native retirement also pass. No numerical threshold or
+production kernel changed.
+
+Earlier `common-cpu-native209` and `common-cpu-native211` are retained failed
+fixture evidence. The former used a physical64 capture with smaller exact
+tickets; the latter used a multi-lane one-row stage with only one remote lane.
+Both production checks correctly refused the mismatched fixture. Correcting
+capture identity and using the model builder's existing stage selection resolved
+them without changing deadlines or guards. Their eight orphaned temporary models
+per run were removed after native process retirement.
+
+These results close fixed-epoch decode/grouped packet reuse for the tested
+prepared CPU-cohort path. Changed-epoch publication, complete-target economy,
+dynamic adoption and full-model inference qualification remain required.
 
 ## Floating GPU/CPU-cohort physical rectangles
 

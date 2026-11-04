@@ -6,7 +6,7 @@ Dynamic hot/cold promotion and demotion of sharded experts remain unresolved on 
 
 The common bounded loader and matched Static numerical/RSS slice is checkpointed at `3312168c7`; both physical one- and two-socket panels passed their required groups. See [CPU expert tensor-sharding qualification](QFN_CPU_EXPERT_TENSOR_SHARDING_QUALIFICATION.md) for scope, measured RSS and the reviewed single-row exception. Preserve the model, arithmetic, frozen histories and all aggregate limits. Source admission alone does not certify accuracy, RSS, movement or economy.
 
-The placement metadata slice replaces scalar-only migration vertices with a checked whole-owner or complete-cohort target derived from the existing owner map. The existing cycle builder, physical slot-flow analysis and shadow-slot builder consume that target. Every cohort member contributes one physical fragment slot while the tier records one logical expert. Focused tests cover two through eight members, whole/cohort and cohort/cohort cycles, incomplete members, changed cuts, foreign coordinates and repeated large/empty/small waves. Compact original-coordinate transfer primitives pass their focused CPU/GPU controls. Source-authenticated live joint candidates, exact projection completion and actual CPU-fragment epoch-bank replacement/reader retirement now pass component contracts. A complete initial-bank prepass fixes multi-layer graph startup without retaining old engine roots. The physical fabric now derives actual source/destination intersections, global remote piece identities and matching exact lane demand. Genuine two-socket staging executes exact destination weights; successful staging, failed-piece drain and setup rejection pass 20 repetitions on each actual rank with original source-reader retention and reclamation. Native CUDA/ROCm packet tests now resolve live cohort targets from the acquired placement bank while retaining the original captured executable. These foundations do not enable dynamic joint execution: successful decode/grouped rooted return, global publication, controller economy and complete inference/retirement remain required before the Static-only guards can be removed. [Current qualification](QFN_COHORT_MIGRATION_AND_MTP_ADMISSION_QUALIFICATION.md#wholecohort-physical-transfer-and-exact-lane-demand) records the focused transfer checks and retained real-model dynamic-MTP control.
+The placement metadata slice replaces scalar-only migration vertices with a checked whole-owner or complete-cohort target derived from the existing owner map. The existing cycle builder, physical slot-flow analysis and shadow-slot builder consume that target. Every cohort member contributes one physical fragment slot while the tier records one logical expert. Focused tests cover two through eight members, whole/cohort and cohort/cohort cycles, incomplete members, changed cuts, foreign coordinates and repeated large/empty/small waves. Compact original-coordinate transfer primitives pass their focused CPU/GPU controls. Source-authenticated live joint candidates, exact projection completion and actual CPU-fragment epoch-bank replacement/reader retirement now pass component contracts. A complete initial-bank prepass fixes multi-layer graph startup without retaining old engine roots. The physical fabric now derives actual source/destination intersections, global remote piece identities and matching exact lane demand. Genuine two-socket staging executes exact destination weights; successful staging, failed-piece drain and setup rejection pass 20 repetitions on each actual rank with original source-reader retention and reclamation. Native CUDA/ROCm packet tests now resolve live cohort targets from the acquired placement bank while retaining the original captured executable. These foundations do not enable dynamic joint execution: global publication, controller economy and complete inference/retirement remain required before the Static-only guards can be removed. [Current qualification](QFN_COHORT_MIGRATION_AND_MTP_ADMISSION_QUALIFICATION.md#wholecohort-physical-transfer-and-exact-lane-demand) records the focused transfer checks and retained real-model dynamic-MTP control.
 
 The prepared-bank prerequisite now binds the existing residency registry to its actual original `ModelContext`, concrete `WeightManager`, engine registry and preparation ownership. Expected model IDs alone cannot authenticate a caller-supplied engine registry. This association is installed once at the existing cold producer boundary, with weak retained owners and short-lived source leases; it adds no per-payload provenance table, accounting ledger or retained chain of old roots. All six focused source-binding/lifetime registrations pass, including repeated genuine nonempty-bank controls. Fixed-1, fixed-3 and dynamic native model proofs also pass with this binding, exact serial-token witnesses and complete retirement; dynamic execution covers three controller windows. Complete inference-time candidate publication remains a separate obligation.
 
@@ -22,8 +22,10 @@ passes with exact communication and retirement. Dense whole/cohort proposals now
 round-trip through the existing-size wire and source-bound reconstruction;
 75 authority cases, 30 protocol cases and actual two-rank consensus controls pass.
 Both CUDA and ROCm now pass 20 retained MainPrefill compute/rooted-return/reset
-invocations with real empty/small cohort work and final retirement. Complete cohort
-service/transfer prices, decode/grouped reuse and changed-epoch publication remain required; public Dynamic/adoption guards are unchanged.
+invocations with real empty/small cohort work and final retirement. Decode and grouped-verifier return now also pass twenty invocations per backend,
+with exact-row retained captures and same-input serial-row byte equivalence.
+Complete cohort service/transfer prices and changed-epoch publication remain
+required; public Dynamic/adoption guards are unchanged.
 
 Exact movement observations now retain one immutable original geometry per
 logical move and the explicit coordinate of every physical piece. Completion
@@ -56,7 +58,7 @@ Controller economy must combine existing hotness/histogram evidence and hysteres
 | Area | Existing foundation | Unresolved boundary |
 |---|---|---|
 | Shared residency machinery | Typed whole-owner/cohort proposals, prepared participant banks, physical shadow slots and source-bound distributed reconstruction | Complete cohort service/transfer pricing and changed-epoch publication/retirement still need qualification before Dynamic can admit sharded experts |
-| CPU intermediate sharding | Source-authenticated Gate/Up F-row stripes and Down K stripes, original cohort/root, compact native gather; live placement candidates and fragment epoch banks pass component contracts | Production remains Static-only; two-socket physical staging/abort and native GPU live-target packet dispatch pass. Repeated CUDA/ROCm MainPrefill rooted return passes; decode/grouped return and global publication remain open |
+| CPU intermediate sharding | Source-authenticated Gate/Up F-row stripes and Down K stripes, original cohort/root, compact native gather; live placement candidates and fragment epoch banks pass component contracts | Production remains Static-only; two-socket physical staging/abort and native GPU live-target packet dispatch pass. Repeated CUDA/ROCm prefill, decode and grouped-verifier rooted returns pass at a fixed epoch; global publication remains open |
 | GPU projection layouts | `MoEExpertProjectionOwnership` describes complete experts and gate/up-owned down-output-column placement; preparation retains source projection geometry | This projection layout differs from CPU F sharding. It does not establish arbitrary GPU tensor-sharded expert execution or dynamic migration |
 | General GPU expert tensor sharding | Domain grammar and typed projection metadata are reusable | Standard factory explicitly rejects tensor-sharded MoE; whole-owner map rejects it by default; the joint cohort factory authenticates CPU members only. Each advertised GPU layout still needs real execution/capture/admission support |
 | CPU/GPU and CPU/CPU movement | Existing lane/manifests now carry independent original-coordinate rectangles and compact live encoded planes; focused all-format host/native proofs pass, floating edges retain representation | Physical fabric wires each intersection and requires all actual completions; genuine CPU/CPU staging executes exact destinations. Actual CUDA/ROCm FP32 whole/cohort staging and source retirement now pass. Global cohort publication and performance remain unqualified |
@@ -100,6 +102,32 @@ Extend existing lane/manifests/kernel contracts rather than adding a transport:
 4. **Publish versioned execution placement.** Extend existing versioned placement data to carry cohort fanout and root/reduction roles. Captured pointers/topology stay stable. Publish prepared banks and packet epoch through one selector; never mutate captured host membership bits and assume graphs changed.
 5. **Reuse distributed commit and retirement.** Keep existing reserve, stage, inactive-bank prepare, selector and authority consensus. Pin old epochs across dispatch, compute, reduction, sparse return and ACK. Close old admission, drain leases and retire all old roots through existing consensus. Keep native domain/session lifetime unchanged.
 6. **Integrate economy and qualify.** Existing histogram and rebalance policy must price complete target critical paths and all transfer edges/member storage. Enable a layout/mode only after its functional, numerical, communication and native gates pass. Observe also needs a complete supported evidence path.
+
+### Next cost-exchange integration
+
+Use the existing calibration controller and MPI evidence lane. The actual
+`beginStage` result will retain a measurement-only context containing the
+transaction identity and the same immutable geometry owners emitted by its
+prepared factory. The controller keeps that context through wave drain and
+evidence exchange. It holds no engines, source leases or publication authority.
+
+Whole and cohort operations retain their independent payload quotes in one
+piece-observation representation. The existing scalar-price consumer may
+explicitly project a checked singleton whole-to-whole geometry onto Gate/Up/Down;
+it must keep rejecting cohorts until complete-target pricing is implemented.
+Both migration-profile and attempt exchange require the local checked context.
+Retire their old fixed payload together rather than keeping an unbound wire
+route for old test fixtures.
+
+The same MPI request, communicator and original deadline will cover a fixed
+identity/count-header exchange followed by `MPI_Iallgatherv` of only live
+quote/sample records. Empty observers send required metadata and no payload.
+Decode resolves ordinals against local checked geometry and verifies endpoint
+rank, original coordinates, formats and exact extents; sender layouts cannot
+create authority. Tests cover malformed and incomplete records, empty observers,
+large-to-small reuse, actual transmitted byte counts and abort/drain. Readiness
+and service exchanges keep their existing contracts. This is the next planned
+integration, not an enabled cohort-calibration or Dynamic execution claim.
 
 ## Required tests
 

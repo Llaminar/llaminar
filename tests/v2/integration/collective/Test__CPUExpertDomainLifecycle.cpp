@@ -167,4 +167,21 @@ TEST_F(CPUExpertDomainNative, CUDAPreparedRootedPacketReplay) { rooted_packet_li
 TEST_F(CPUExpertDomainNative, ROCmPreparedRootedPacketReplay) { rooted_packet_lifecycle::run(DeviceId::rocm(0)); }
 #endif
 
+#ifdef HAVE_CUDA
+/** @test Captured MainDecode packet/reset/live-byte path on actual CUDA and two CPU sockets. */
+TEST_F(CPUExpertDomainNative, CUDAPreparedRootedDecodeReplay)
+{ rooted_packet_lifecycle::run(DeviceId::cuda(0), rooted_packet_lifecycle::PacketPhaseScenario::Decode); }
+/** @test Actual CUDA verifier2/3/4 and partial/empty work is byte-identical to same-input serial decode. */
+TEST_F(CPUExpertDomainNative, CUDAPreparedRootedVerifierReplay)
+{ rooted_packet_lifecycle::run(DeviceId::cuda(0), rooted_packet_lifecycle::PacketPhaseScenario::GroupedVerifier); }
+#endif
+#ifdef HAVE_ROCM
+/** @test Captured MainDecode packet/reset/live-byte path on actual ROCm and two CPU sockets. */
+TEST_F(CPUExpertDomainNative, ROCmPreparedRootedDecodeReplay)
+{ rooted_packet_lifecycle::run(DeviceId::rocm(0), rooted_packet_lifecycle::PacketPhaseScenario::Decode); }
+/** @test Actual ROCm verifier2/3/4 and partial/empty work is byte-identical to same-input serial decode. */
+TEST_F(CPUExpertDomainNative, ROCmPreparedRootedVerifierReplay)
+{ rooted_packet_lifecycle::run(DeviceId::rocm(0), rooted_packet_lifecycle::PacketPhaseScenario::GroupedVerifier); }
+#endif
+
 }
