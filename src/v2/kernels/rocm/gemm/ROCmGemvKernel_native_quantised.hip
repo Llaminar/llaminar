@@ -1230,7 +1230,7 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
             const uint8_t* payload = d_payload + linear * Traits::payload_bytes;
 
             // Scale always from global array
-            uint16_t scale_bits = d_block_scales[linear];
+            uint16_t scale_bits = ::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(d_block_scales, linear);
 
             int32_t packed_groups[8];
 
@@ -1697,7 +1697,7 @@ __device__ __forceinline__ void nativeM1ColumnsBody(
                 {
                     const size_t linear = static_cast<size_t>(b) * static_cast<size_t>(N) + static_cast<size_t>(n);
                     const uint8_t* payload = d_payload + linear * Traits::payload_bytes;
-                    const uint16_t scale_bits = d_block_scales[linear];
+                    const uint16_t scale_bits = ::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(d_block_scales, linear);
 
                     // Decode 32 quantized values to 8 packed INT32 words (4 INT8 each)
                     // Nibble layout: qs[j] = lo_nibble(elem_j) | hi_nibble(elem_{j+16})
@@ -6432,7 +6432,7 @@ __device__ __forceinline__ void native_quantised_small_m_commit_single_dot(float
     const uint16_t* scale_base,const uint16_t* min_base,size_t linear,float scale_ab,int32_t sum_a)
 {
     using Traits=NATIVE_QUANTISEDTraits<FMT>;
-    const uint16_t primary=scale_base[linear];
+    const uint16_t primary=::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(scale_base,linear);
     const uint16_t secondary=Traits::requires_secondary_metadata?min_base[linear]:uint16_t{0};
     native_quantised_small_m_commit_single_dot_bits<FMT>(f_acc,block_acc,primary,secondary,scale_ab,sum_a);
 }
@@ -6642,7 +6642,7 @@ __device__ __forceinline__ void native_quantised_small_m_accumulate_decoded_bloc
     size_t linear,float scale_ab,int32_t sum_a)
 {
     using Traits=NATIVE_QUANTISEDTraits<FMT>;
-    const uint16_t primary=scale_base[linear];
+    const uint16_t primary=::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(scale_base,linear);
     const uint16_t secondary=Traits::requires_secondary_metadata?min_base[linear]:uint16_t{0};
     const uint32_t extended=Traits::needs_emin_array?emin_base[linear]:uint32_t{0};
     native_quantised_small_m_accumulate_decoded_block_bits<FMT>(f_acc,a4,packed_groups,payload,

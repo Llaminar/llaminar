@@ -31,6 +31,7 @@
 
 #include "kernels/common/DeviceNativeQuantisedContributionContract.h"
 #include "kernels/common/NativeQuantisedPackedBits.h"
+#include "kernels/common/NativeQuantisedScaleLoad.h"
 
 #include <cstdint>
 #include <iterator>
