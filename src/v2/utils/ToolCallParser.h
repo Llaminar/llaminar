@@ -135,6 +135,7 @@ namespace llaminar2
         std::string buffer_;
         size_t dsml_scan_ = 0;      ///< DSML: first unscanned byte of the buffered tool section.
         bool dsml_emitted_ = false; ///< DSML: whether this section already produced a call.
+        std::string dsml_rejected_; ///< DSML: literal text of non-executable invokes, published at flush.
     };
 
     /**

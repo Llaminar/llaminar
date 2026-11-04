@@ -308,9 +308,32 @@ TEST(Test__DeepSeekV4ChatEncoding, MalformedTypesAndHugeIntegersAreRejected)
     // Model output: an invoke with an inexact typed value, directly or inside a
     // wrapper string, is never executed with a changed number.
     const std::string huge = section(invoke("f", param("id", "18446744073709551617", "false")));
-    auto result = parseDsml(huge);
+    auto result = parseDsml("Lead." + huge);
     EXPECT_TRUE(result.tool_calls.empty());
-    EXPECT_NE(result.content.find("18446744073709551617"), std::string::npos);
+    EXPECT_EQ(result.content, "Lead." + huge); // exact original text, published once
+    // Mixed section: the valid call executes; the rejected invoke is literal once.
+    const std::string bad = invoke("g", param("id", "18446744073709551617", "false"));
+    result = parseDsml(section(invoke("f", param("id", "7", "false")) + bad));
+    ASSERT_EQ(result.tool_calls.size(), 1u);
+    EXPECT_EQ(result.tool_calls[0].arguments, "{\"id\": 7}");
+    EXPECT_EQ(result.content, bad.substr(0, bad.size() - 1)); // the invoke, through its close tag
+    // Streaming publishes the same literal content for every chunking.
+    for (std::size_t chunk : {std::size_t{1}, std::size_t{5}, std::size_t{64}})
+    {
+        StreamingToolCallSplitter splitter(ToolCallFormat::DEEPSEEK_V4_DSML);
+        std::string content;
+        std::size_t calls = 0;
+        const std::string text = "Lead." + huge;
+        const auto fold = [&](std::vector<StreamingToolCallSplitter::Event> events) {
+            for (auto &event : events)
+                if (event.kind == StreamingToolCallSplitter::Event::Kind::ToolCall) ++calls;
+                else content += event.content;
+        };
+        for (std::size_t i = 0; i < text.size(); i += chunk) fold(splitter.process(text.substr(i, chunk)));
+        fold(splitter.flush());
+        EXPECT_EQ(calls, 0u);
+        EXPECT_EQ(content, text) << chunk;
+    }
     const auto tools = nlohmann::json::parse(R"([{"type": "function", "function": {"name": "f",
         "parameters": {"type": "object", "properties": {"id": {"type": "integer"}}}}}])");
     result = parseDsml(section(invoke("f", param("arguments", "{\"id\": 18446744073709551617}", "true"))), tools);
