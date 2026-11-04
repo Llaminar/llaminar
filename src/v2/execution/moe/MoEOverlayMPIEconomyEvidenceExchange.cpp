@@ -271,6 +271,8 @@ namespace llaminar2
         MigrationWire encodeMigration(
             const MoEOverlayCompletedMigrationMeasurement &measurement)
         {
+            if (!measurement.piece_observations.empty() || measurement.geometry)
+                throw std::invalid_argument("Physical piece evidence requires live variable-extent economy wire; scalar packet cannot truncate it");
             MigrationWire wire{
                 .expected_epoch = measurement.expected_epoch,
                 .candidate_epoch = measurement.candidate_epoch,

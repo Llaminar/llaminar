@@ -10,6 +10,7 @@
  */
 
 #include "MoEOverlayParticipantMigration.h"
+#include "MoEOverlayPhysicalProjectionPieces.h"
 #include "MoEExpertShardCohort.h"
 #include "MoEOverlayPreparedWeightSource.h"
 
@@ -1148,6 +1149,10 @@ namespace llaminar2
         return operation_->completedMeasurement();
     }
 
+    std::optional<std::uint64_t> MoEOverlayPreparedProjectionOperation::quotedPayloadBytes() const noexcept
+    { return operation_->quotedPayloadBytes(); }
+
+
     MoEOverlayParticipantPreparedWaveFactory::
         MoEOverlayParticipantPreparedWaveFactory(Config config)
         : config_(std::move(config))
@@ -1272,6 +1277,19 @@ namespace llaminar2
                 };
                 std::optional<std::tuple<unsigned,size_t,size_t>> prior;
                 const auto& record=prepared.migrations[index];
+                if (migration.source.shard_cohort || migration.destination.shard_cohort)
+                {
+                    const auto &cohort = migration.source.shard_cohort ? migration.source.shard_cohort : migration.destination.shard_cohort;
+                    const auto &manifest = cohort->source();
+                    const auto expected = physicalMoEOverlayProjectionLayouts(migration, manifest,
+                        cohort->ownership(0).geometry().experts, transaction.previous->placementOwnerMap());
+                    if (!record.measurement_geometry || record.measurement_geometry->targets() != expected)
+                    { started_shape_ok = false; break; }
+                    for (std::size_t role = 0; role < 3; ++role)
+                        if (record.measurement_geometry->formats()[role] != manifest.projectionForRole(static_cast<ExpertTierWeightProjection>(role)).format)
+                            started_shape_ok = false;
+                    if (!started_shape_ok) break;
+                }
                 for(const auto& piece:record.operations) {
                     const auto src=memberIndex(*source,piece.source_participant),dst=memberIndex(*destination,piece.destination_participant);
                     const auto role=static_cast<unsigned>(piece.projection);
@@ -1307,6 +1325,33 @@ namespace llaminar2
             }
         }
 
+        // The fabric retains every canonical expected global piece, including
+        // ranks with only protocol work. Preserve identity before moving operations.
+        const bool described = std::any_of(prepared.migrations.begin(), prepared.migrations.end(),
+            [](const auto &migration) { return bool(migration.measurement_geometry); });
+        if (described)
+        {
+            result.measurement_geometries.reserve(prepared.migrations.size());
+            for (std::size_t migration = 0; migration < prepared.migrations.size(); ++migration)
+            {
+                const auto &record = prepared.migrations[migration];
+                const auto &geometry = record.measurement_geometry;
+                if (!geometry || geometry->pieces().size() != record.operations.size())
+                { started_shape_ok = false; break; }
+                result.measurement_geometries.push_back(geometry);
+                for (std::size_t piece = 0; piece < record.operations.size(); ++piece)
+                {
+                    const auto &operation = record.operations[piece];
+                    const auto &identity = geometry->pieces()[piece];
+                    if (identity.projection != operation.projection ||
+                        identity.source_participant != operation.source_participant ||
+                        identity.destination_participant != operation.destination_participant)
+                    { started_shape_ok = false; break; }
+                    if (operation.operation)
+                        result.measurement_operations.push_back({migration, piece, operation.requires_local_measurement});
+                }
+            }
+        }
         result.transfers = flattenOperations(prepared);
         result.inactive_bank = std::move(inactive_bank);
         if (!deferred_shape_ok ||

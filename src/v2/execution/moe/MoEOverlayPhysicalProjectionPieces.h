@@ -10,7 +10,7 @@
  */
 #pragma once
 
-#include "ExpertTierWeightDeviceLayout.h"
+#include "MoEOverlayPhysicalProjectionGeometry.h"
 #include "MoEExpertShardCohort.h"
 #include "MoEOverlayResidencyAuthority.h"
 
@@ -23,34 +23,6 @@
 
 namespace llaminar2
 {
-    /** @brief One actual source/destination overlap, without allocation padding. */
-    struct MoEOverlayPhysicalProjectionPiece
-    {
-        ExpertTierWeightProjection projection;
-        std::size_t destination_member;
-        std::size_t source_member;
-        int destination_participant;
-        int source_participant;
-        ExpertTierWeightProjectionIntersection intersection;
-    };
-
-    /** @brief Passive original member geometry; this carries no source or execution permission. */
-    struct MoEOverlayPhysicalProjectionMember
-    {
-        int participant_id = -1;
-        int world_rank = -1;
-        DeviceId device = DeviceId::invalid();
-        GlobalDeviceAddress address;
-        std::array<MoEExpertProjectionOwnership::Projection, 3> projections{};
-    };
-
-    /** @brief One declared whole target or complete fixed-cut target, never a scalar cohort alias. */
-    struct MoEOverlayPhysicalProjectionTarget
-    {
-        int tier_idx = -1;
-        std::vector<MoEOverlayPhysicalProjectionMember> members;
-    };
-
     /**
      * @brief Enumerate only nonempty overlaps of two original target layouts.
      * @param source Complete ordered source target declaration.
@@ -124,9 +96,14 @@ namespace llaminar2
             if (owner.shard_cohort)
             {
                 const auto &cohort = *owner.shard_cohort;
-                if (cohort.source() != source || cohort.participants().empty() ||
+                if (cohort.source().layer_idx != source.layer_idx || cohort.participants().empty() ||
                     cohort.ownership(0).geometry().experts != experts)
                     throw std::invalid_argument("Physical expert cohort changed original source geometry or format");
+                // A valid manifest's array order is not source identity. Every
+                // original role still matches its exact dimensions and format.
+                for (const auto &projection : source.projections)
+                    if (cohort.source().projectionForRole(projection.projection) != projection)
+                        throw std::invalid_argument("Physical expert cohort changed an original role geometry or format");
             }
             for (std::size_t index = 0; index < target.participantCount(); ++index)
             {

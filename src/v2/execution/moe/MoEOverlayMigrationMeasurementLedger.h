@@ -120,6 +120,12 @@ namespace llaminar2
         bool recordCompletedWave(
             const std::vector<MoEOverlayCompletedMigrationMeasurement> &
                 measurements,
+            std::string *error) noexcept;
+
+        /** @brief Take an already-owned completed wave without copying nested metadata.
+         * @param measurements Exact wave-owned observations. @param error Optional rejection reason.
+         * @return Whether the complete observation was accepted atomically. */
+        bool recordCompletedWave(std::vector<MoEOverlayCompletedMigrationMeasurement> &&measurements,
             std::string *error) noexcept override;
 
         /**

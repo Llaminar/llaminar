@@ -247,6 +247,10 @@ namespace llaminar2
             return !work_may_be_in_flight_;
         }
 
+        /** @return Exact payload quote retained by the bound production protocol, independent of observed counters. */
+        [[nodiscard]] std::size_t quotedPayloadBytes() const noexcept
+        { return isContiguousDirection() ? contiguous_total_bytes_ : layout_.chunkBytes(layout_.unit_count); }
+
         /** @brief Return cumulative proof counters for integration assertions. */
         [[nodiscard]] ExpertTierWeightTransferLaneStats stats() const noexcept
         {

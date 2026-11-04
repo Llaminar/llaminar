@@ -25,6 +25,16 @@ Both CUDA and ROCm now pass 20 retained MainPrefill compute/rooted-return/reset
 invocations with real empty/small cohort work and final retirement. Complete cohort
 service/transfer prices, decode/grouped reuse and changed-epoch publication remain required; public Dynamic/adoption guards are unchanged.
 
+Exact movement observations now retain one immutable original geometry per
+logical move and the explicit coordinate of every physical piece. Completion
+checks independent bound payload quotes and hands owned observations to the
+journal without allocation. Twenty focused registrations pass, followed by the
+actual public-factory/composite/journal case repeated twenty times on two
+physical CPU sockets: twelve transfers retain two six-piece logical rows, exact
+bytes and clean source/memory retirement. The existing scalar economy exchange
+still rejects cohort evidence; complete-target calibration and compact
+rank exchange remain prerequisites to enabling dynamic sharded placement.
+
 ## Scope: fixed admitted layouts
 
 A placement target may be one whole-expert owner or a complete already-admitted shard cohort. Keep each target's membership, physical endpoints, root/reduction policy, cuts, native contexts, captured graph topology and capacity fixed. Migration between two pre-admitted targets may change the expert's physical partition because the targets have different cuts. That is redistribution between existing layouts, not live cohort or graph repartitioning.

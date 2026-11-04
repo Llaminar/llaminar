@@ -17,6 +17,7 @@
 #include "MoEOverlayParticipantMigration.h"
 
 #include <array>
+#include <stdexcept>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -66,6 +67,25 @@ namespace llaminar2
 
         /** @return Whether every role appears exactly once with valid metadata. */
         [[nodiscard]] bool valid() const noexcept;
+
+        /**
+         * @brief Resolve a role independently of valid manifest array permutation.
+         * @param role Original gate/up/down projection enum.
+         * @return Its unique original geometry and format.
+         * @throws std::invalid_argument For an absent, duplicate or invalid role.
+         */
+        [[nodiscard]] const MoEOverlayProjectionWeightManifest &projectionForRole(ExpertTierWeightProjection role) const
+        {
+            const MoEOverlayProjectionWeightManifest *result = nullptr;
+            for (const auto &entry : projections)
+                if (entry.projection == role)
+                {
+                    if (result || !entry.valid()) throw std::invalid_argument("Layer manifest has an invalid or duplicate projection role");
+                    result = &entry;
+                }
+            if (!result) throw std::invalid_argument("Layer manifest omits an original projection role");
+            return *result;
+        }
 
         /** @brief Compare layer identity and all three projection contracts. */
         bool operator==(const MoEOverlayLayerWeightManifest &) const = default;

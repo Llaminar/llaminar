@@ -334,6 +334,10 @@ namespace llaminar2
             return !hasInFlightWork();
         }
 
+        /** @return Exact payload quote retained by the bound production protocol, independent of observed counters. */
+        [[nodiscard]] std::size_t quotedPayloadBytes() const noexcept
+        { return protocol_.totalBytes(); }
+
         /** @brief Return cumulative proof counters for integration assertions. */
         [[nodiscard]] ExpertTierGpuBlobTransferLaneStats stats() const noexcept
         {

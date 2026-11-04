@@ -352,6 +352,66 @@ placement publication, graph capture, full-model accuracy or Release economy.
 Only focused checks ran; Dynamic cohort guards and the full-preflight status are
 unchanged.
 
+## Exact physical-piece movement observations
+
+The physical Fabric now seals each logical migration's original targets,
+role-resolved formats and canonical intersections once before polling. The
+participant factory retains that geometry while flattening operations and
+records explicit migration/piece coordinates. A cohort operation is no longer
+attributed by dividing its flattened operation index by three. Logical demand
+and placement remain with their existing authorities.
+
+Each real operation exposes an independent payload quote from its already-bound
+native layout, transfer protocol or accepted remote manifest. Completion checks
+its reported bytes against that quote before accepting the measurement. Ranks
+with neither endpoint retain absent observations. Invalid evidence follows the
+existing abort/drain path; it cannot prepare or publish a candidate bank.
+Source-format lookup uses Gate/Up/Down roles rather than manifest array order.
+
+Immutable geometry and preallocated observation slots move into the bounded
+journal without copying their nested allocations. A dedicated executable proves
+zero C++ allocations during sealed validation and the actual completion handoff;
+its isolated copy-control version fails. This witness excludes cold exchange
+preparation and does not claim all process allocation is intercepted.
+
+Coherent `common-cpu-build204` and `common-cpu-focused205` pass all 20 selected
+registrations in 18.66 seconds, with no skips and clean driver evidence. They
+include the seven owning Unit suites, the five new focused evidence contracts,
+actual CPU/MPI staging, CUDA/ROCm floating transfers and rectangular lanes, and
+both repeated captured rooted returns. All 131 temporary model paths from that
+run are retired. Passive coverage includes whole/cohort and unequal-cut metadata
+through eight members, native formats, mixed-format role permutations, missing
+pieces, wrong byte reports, empty observers and original storage ownership.
+These sweeps do not represent physical eight-socket execution or timing samples.
+
+The explicit new preflight entries are
+`V2_Integration_MoEOverlayPhysicalPieceMeasurement`,
+`V2_Integration_MoEOverlayPhysicalPieceMeasurementMapping`,
+`V2_Integration_MoEOverlayMeasurementCompletionAllocations`,
+`V2_Integration_MoEOverlayPhysicalMeasurementQuoteDrain`, and
+`V2_Integration_MoEOverlayPhysicalPieceFormatPermutation`.
+
+The actual public-factory integration is also green: `common-cpu-build206` and
+`common-cpu-native207` pass the new
+`V2_Integration_CPUJointPhysicalMeasurementAttribution` and existing MPI
+consensus control in 5.67 seconds, with clean driver evidence and no skips. The
+new case repeats twenty times on two genuine physical socket ranks. Its original
+prepared weights enter the public source-bound factory, composite transport and
+owned journal. Two logical moves expand into twelve operations and return two
+six-piece rows. Rank zero reports twelve real samples; rank one reports its six
+actual endpoint samples and no invented observations for the other pieces.
+Every sample and bound quote is exactly 49,152 bytes. Geometry, role, original
+row/column origins, terminal re-poll idempotence, actual abort/drain, original
+source-reader retirement and final/shadow memory reclamation all pass. It stops
+before inactive-bank preparation or global publication, so it does not certify
+controller economy or dynamic placement adoption.
+
+The fixed scalar economy wire and ledger deliberately reject cohort-piece rows.
+Complete-target service/transfer calibration, compact distributed exchange,
+publication and inference qualification remain required before Dynamic cohort
+execution can be enabled. This focused result leaves the complete-preflight
+status and existing numerical gates unchanged.
+
 ## Shared histogram candidate construction
 
 The existing histogram proposal now uses one candidate-construction boundary

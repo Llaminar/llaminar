@@ -183,6 +183,12 @@ namespace llaminar2
     }
 
     bool MoEOverlayMigrationMeasurementLedger::recordCompletedWave(
+        std::vector<MoEOverlayCompletedMigrationMeasurement> &&measurements, std::string *error) noexcept
+    {
+        return recordCompletedWave(static_cast<const std::vector<MoEOverlayCompletedMigrationMeasurement> &>(measurements), error);
+    }
+
+    bool MoEOverlayMigrationMeasurementLedger::recordCompletedWave(
         const std::vector<MoEOverlayCompletedMigrationMeasurement> &measurements,
         std::string *error) noexcept
     {
@@ -209,6 +215,12 @@ namespace llaminar2
         for (std::size_t index = 0; index < measurements.size(); ++index)
         {
             const auto &measurement = measurements[index];
+            if (!measurement.piece_observations.empty() || measurement.geometry)
+            {
+                rejected_observations_.fetch_add(1, std::memory_order_relaxed);
+                assignLedgerError(error, "Physical-piece observations require complete-target calibration coordinates; scalar prices cannot certify them");
+                return false;
+            }
             const MoEOverlayMigrationMeasurementCoordinate coordinate{
                 .source_participant = measurement.source_participant,
                 .destination_participant = measurement.destination_participant,

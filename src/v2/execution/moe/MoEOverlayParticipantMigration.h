@@ -239,6 +239,8 @@ namespace llaminar2
         /** @return Unmodified timing of this physical piece after successful completion. */
         std::optional<ExpertTierProjectionTransferMeasurement>
         completedMeasurement() const noexcept override;
+        /** @return The underlying actual operation quote, with unchanged source lifetime. */
+        std::optional<std::uint64_t> quotedPayloadBytes() const noexcept override;
 
     private:
         std::unique_ptr<IMoEOverlayTierTransferOperation> operation_;
@@ -255,6 +257,7 @@ namespace llaminar2
         int destination_participant=-1; ///< Canonical original target member, never allocation ordinal.
         int source_participant=-1; ///< Canonical original source member.
         std::unique_ptr<IMoEOverlayTierTransferOperation> operation;
+        bool requires_local_measurement = false;
     };
 
     /** @brief One actual local destination's complete role arrival authority. */
@@ -277,6 +280,7 @@ namespace llaminar2
     {
         std::vector<MoEOverlayParticipantProjectionTransfer> operations;
         std::vector<MoEOverlayParticipantDestinationArrival> destination_arrivals;
+        std::shared_ptr<const MoEOverlayMigrationMeasurementGeometry> measurement_geometry;
     };
 
     /** @brief Atomic result of reserving and enqueueing one physical wave. */

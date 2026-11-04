@@ -745,3 +745,5 @@ TEST(MoEOverlayGPUCPUCohortFabric, ROCmFloatingOriginalRectangles)
 #endif
 
 } // namespace llaminar2::test
+
+#include "CPUJointFabricMeasurementContract.inc"

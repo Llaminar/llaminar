@@ -52,7 +52,8 @@ namespace llaminar2
         }
         const auto &forward = local_measurements[0];
         const auto &reverse = local_measurements[1];
-        return forward.valid() && reverse.valid() &&
+        return forward.piece_observations.empty() && !forward.geometry && reverse.piece_observations.empty() && !reverse.geometry &&
+               forward.valid() && reverse.valid() &&
                forward.source_participant ==
                    coordinate.source_participant &&
                forward.destination_participant ==
@@ -69,7 +70,9 @@ namespace llaminar2
     {
         if (measurements.size() != 2)
             return false;
-        return measurements[0].valid() && measurements[1].valid() &&
+        return measurements[0].piece_observations.empty() && !measurements[0].geometry &&
+               measurements[1].piece_observations.empty() && !measurements[1].geometry &&
+               measurements[0].valid() && measurements[1].valid() &&
                measurements[0].source_participant ==
                    measurements[1].destination_participant &&
                measurements[0].destination_participant ==
@@ -139,7 +142,8 @@ namespace llaminar2
         }
         const auto &forward = local_measurements[0];
         const auto &reverse = local_measurements[1];
-        return forward.valid() && reverse.valid() &&
+        return forward.piece_observations.empty() && !forward.geometry && reverse.piece_observations.empty() && !reverse.geometry &&
+               forward.valid() && reverse.valid() &&
                forward.source_participant ==
                    coordinate.source_participant &&
                forward.destination_participant ==

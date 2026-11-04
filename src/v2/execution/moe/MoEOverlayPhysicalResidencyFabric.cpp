@@ -1765,6 +1765,8 @@ namespace llaminar2
                                 : std::move(start_error),
                             error);
                     }
+                    // Capture the protocol quote before polling completion or releasing this lane.
+                    quoted_bytes_ = lane_->lane()->quotedPayloadBytes();
                     started_ = true;
                 }
 
@@ -1841,7 +1843,12 @@ namespace llaminar2
                 return ready_ ? measurement_ : std::nullopt;
             }
 
+            /** @return Actual bound lane quote captured before completion, independent of measurement_. */
+            std::optional<std::uint64_t> quotedPayloadBytes() const noexcept override { return quoted_bytes_; }
+
+
         private:
+            std::optional<std::uint64_t> quoted_bytes_;
             /** @brief Relinquish exact shared-lane ownership once. */
             void releaseLane() noexcept
             {
@@ -1994,6 +2001,8 @@ namespace llaminar2
                                 : std::move(start_error),
                             error);
                     }
+                    // Capture the protocol quote before polling completion or releasing this lane.
+                    quoted_bytes_ = lane_->lane()->quotedPayloadBytes();
                     started_ = true;
                 }
 
@@ -2064,7 +2073,12 @@ namespace llaminar2
                 return ready_ ? measurement_ : std::nullopt;
             }
 
+            /** @return Actual bound lane quote captured before completion, independent of measurement_. */
+            std::optional<std::uint64_t> quotedPayloadBytes() const noexcept override { return quoted_bytes_; }
+
+
         private:
+            std::optional<std::uint64_t> quoted_bytes_;
             /** @brief Return the shared blob lane to its directed edge. */
             void releaseLane() noexcept
             {
@@ -2214,6 +2228,8 @@ namespace llaminar2
                                 : std::move(start_error),
                             error);
                     }
+                    // Capture the protocol quote before polling completion or releasing this lane.
+                    quoted_bytes_ = lane_->lane()->quotedPayloadBytes();
                     started_ = true;
                 }
 
@@ -2284,7 +2300,12 @@ namespace llaminar2
                 return ready_ ? measurement_ : std::nullopt;
             }
 
+            /** @return Actual bound lane quote captured before completion, independent of measurement_. */
+            std::optional<std::uint64_t> quotedPayloadBytes() const noexcept override { return quoted_bytes_; }
+
+
         private:
+            std::optional<std::uint64_t> quoted_bytes_;
             /** @brief Return the shared peer lane to its directed edge. */
             void releaseLane() noexcept
             {
@@ -2347,6 +2368,7 @@ namespace llaminar2
                     throw std::invalid_argument(
                         "ExpertOverlay CPU copy requires exact final storage and ownership");
                 }
+                quoted_bytes_ = cpuCopyBytes(geometry_, source_.size());
                 lane_ = lane_pool->tryAcquire(this);
                 if (!lane_)
                 {
@@ -2471,7 +2493,13 @@ namespace llaminar2
                 return ready_ ? measurement_ : std::nullopt;
             }
 
+            /** @return Same exact native-plane/floating-row quote used by the CPU worker, not observed bytes. */
+            std::optional<std::uint64_t> quotedPayloadBytes() const noexcept override
+            { return quoted_bytes_; }
+
+
         private:
+            std::optional<std::uint64_t> quoted_bytes_;
             /** @brief Return the dedicated worker to its exact address edge. */
             void releaseLane() noexcept
             {
@@ -3072,6 +3100,9 @@ namespace llaminar2
             /** @return Original per-lane measurement without aggregation or changed attribution. */
             std::optional<ExpertTierProjectionTransferMeasurement> completedMeasurement() const noexcept override
             { return operation_->completedMeasurement(); }
+            /** @return Same underlying bound quote; source retention does not replace byte authority. */
+            std::optional<std::uint64_t> quotedPayloadBytes() const noexcept override
+            { return operation_->quotedPayloadBytes(); }
         private:
             /** @brief Consume this operation's one terminal completion edge. */
             MoEOverlayResidencyWaveProgress observe(MoEOverlayResidencyWaveProgress progress) noexcept
@@ -5386,19 +5417,22 @@ namespace llaminar2
         // and operation uses this original role/member order, never the absent
         // scalar owner of a cohort or allocation-capacity sized work.
         std::vector<std::vector<MoEOverlayPhysicalProjectionPiece>> physical_pieces;
+        std::vector<std::shared_ptr<const MoEOverlayMigrationMeasurementGeometry>> measurement_geometries;
         MoEOverlayPhysicalRemotePieceOrdinals remote_piece_ordinals;
         try
         {
             physical_pieces.reserve(migrations.size());
+            measurement_geometries.reserve(migrations.size());
             for (const auto &migration : migrations)
             {
                 const auto source = std::find_if(impl_->original_layer_manifests.begin(), impl_->original_layer_manifests.end(),
                     [&](const auto &entry) { return entry.layer_idx == migration.layer_idx; });
                 if (source == impl_->original_layer_manifests.end())
                     return fail("Physical movement lost its original authenticated layer source");
-                physical_pieces.push_back(physicalMoEOverlayProjectionPieces(migration,
-                    *source, originalFabricGeometry(config_).expertCount(),
-                    config_.initial_snapshot->placementOwnerMap()));
+                const auto geometry = makePhysicalMoEOverlayMeasurementGeometry(migration, *source,
+                    originalFabricGeometry(config_).expertCount(), config_.initial_snapshot->placementOwnerMap());
+                physical_pieces.push_back(physicalMoEOverlayProjectionPieces(geometry->targets().first, geometry->targets().second));
+                measurement_geometries.push_back(geometry);
             }
             remote_piece_ordinals = physicalMoEOverlayRemotePieceOrdinals(physical_pieces,
                 config_.initial_snapshot->placementOwnerMap(), remote_transport ? world_size : 1);
@@ -5820,6 +5854,7 @@ namespace llaminar2
                 auto &prepared = result.migrations[migration_index];
                 const auto &pieces = physical_pieces[migration_index];
                 prepared.operations.resize(pieces.size());
+                prepared.measurement_geometry = std::move(measurement_geometries[migration_index]);
                 const auto destination_target = *MoEExpertPlacementTarget::fromPlacement(migration.destination);
                 for (size_t member = 0; member < destination_target.participantCount(); ++member)
                 {
@@ -5840,6 +5875,7 @@ namespace llaminar2
                     const bool crosses_world_rank = remote_transport && source_participant.world_rank != destination_participant.world_rank;
                     prepared.operations[operation_index] = {.projection = projection,
                         .destination_participant = piece.destination_participant, .source_participant = piece.source_participant};
+                    prepared.operations[operation_index].requires_local_measurement = source_local || destination_local;
                     const auto destination_arrival = destination_local ? destination_arrivals[migration_index].at(piece.destination_participant) : nullptr;
                     DestinationProjectionGroup *const destination_group = destination_local
                         ? &destination_groups[migration_index].at(piece.destination_participant)[projection_index] : nullptr;

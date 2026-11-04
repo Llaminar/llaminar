@@ -864,6 +864,14 @@ namespace llaminar2
                 return state_ == State::Ready ? measurement_ : std::nullopt;
             }
 
+            /** @return Actual source or accepted receiver manifest extent, never inferred from observation bytes. */
+            std::optional<std::uint64_t> quotedPayloadBytes() const noexcept override
+            {
+                if (source_) return source_->manifest().total_bytes;
+                return received_manifest_.total_bytes ? std::optional<std::uint64_t>(received_manifest_.total_bytes) : std::nullopt;
+            }
+
+
         private:
             /** @return Persistent lane storage reserved by this operation. */
             MoEOverlayMPIRemoteProjectionLaneStorage &lane() noexcept

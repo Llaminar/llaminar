@@ -149,6 +149,10 @@ namespace llaminar2
             return !work_may_be_in_flight_;
         }
 
+        /** @return Exact payload quote retained by the bound production protocol, independent of observed counters. */
+        [[nodiscard]] std::size_t quotedPayloadBytes() const noexcept
+        { return submitted_bytes_; }
+
         /** @return Cumulative non-blocking movement evidence. */
         [[nodiscard]] ExpertTierGpuPeerTransferLaneStats stats() const noexcept
         {

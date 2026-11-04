@@ -286,3 +286,7 @@ namespace llaminar2::test
             std::invalid_argument);
     }
 } // namespace llaminar2::test
+
+#include "PhysicalPieceMeasurementContract.inc"
+
+#include "PhysicalMeasurementProducerRoleContract.inc"

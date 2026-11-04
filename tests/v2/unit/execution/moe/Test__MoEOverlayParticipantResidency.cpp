@@ -2891,3 +2891,5 @@ TEST(Test__MoEOverlayParticipantResidency, PipelineStageRuntimeRetainsFixedDownB
 #include "PreparedSourceNonemptyBankContract.inc"
 
 #include "PreparedProjectionIntersectionContract.inc"
+
+#include "PhysicalPieceFlatteningContract.inc"
