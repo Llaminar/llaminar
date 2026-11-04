@@ -100,6 +100,41 @@ namespace llaminar2::mxfp4
         return exponentFitsFP16(e) ? scaleFP16Bits(e) : uint16_t{0};
     }
 
+    /**
+     * @brief Smallest E8M0 byte whose scale 2^(e-128) is a normal FP32 value.
+     *
+     * Kernels that build the FP32 scale from the exponent bits (native E8M0
+     * scale plane) must not produce FP32 subnormals: CUDA builds flush
+     * subnormals to zero (--ftz=true), which would silently lose exactness.
+     */
+    inline constexpr uint8_t kMinNormalFP32Exponent = 128 - 126;
+    /**
+     * @brief Largest E8M0 byte accepted by the native scale plane.
+     *
+     * OCP MX defines 0xFF as NaN. ggml decodes it as the finite 2^127, but no
+     * real checkpoint uses it; nonzero blocks with it are rejected, not guessed.
+     */
+    inline constexpr uint8_t kMaxNativeE8M0Exponent = 254;
+
+    /** @return Whether exponent byte @p e has an exact normal FP32 scale for the native plane. */
+    LLAMINAR_MXFP4_HD constexpr bool exponentFitsNativeE8M0(uint8_t e) noexcept
+    {
+        return e >= kMinNormalFP32Exponent && e <= kMaxNativeE8M0Exponent;
+    }
+
+    /**
+     * @brief IEEE-754 binary32 bits of a normal scale 2^(e - 128).
+     * @param e Exponent byte satisfying exponentFitsNativeE8M0().
+     * @return Bits with biased exponent e - 1 and zero mantissa.
+     *
+     * One integer shift: the device builds the scale without libm, FP16
+     * widening or a lookup table.
+     */
+    LLAMINAR_MXFP4_HD constexpr uint32_t normalScaleFP32Bits(uint8_t e) noexcept
+    {
+        return static_cast<uint32_t>(e - 1u) << 23;
+    }
+
     /** @brief Exact FP32 block scale 2^(e - 128) for any exponent byte. */
     inline float scaleFP32(uint8_t e) noexcept
     {
@@ -120,6 +155,10 @@ namespace llaminar2::mxfp4
     static_assert(scaleFP16Bits(128 + 15) == 0x7800u, "2^15 is the largest FP16 power of two");
     static_assert(!exponentFitsFP16(103) && !exponentFitsFP16(144));
     static_assert(preparedScaleFP16Bits(0) == 0u && preparedScaleFP16Bits(128) == 0x3c00u);
+    static_assert(normalScaleFP32Bits(128) == 0x3f800000u, "2^0 is FP32 one");
+    static_assert(normalScaleFP32Bits(kMinNormalFP32Exponent) == 0x00800000u, "2^-126 is the smallest FP32 normal");
+    static_assert(normalScaleFP32Bits(kMaxNativeE8M0Exponent) == 0x7e800000u, "2^126");
+    static_assert(!exponentFitsNativeE8M0(1) && !exponentFitsNativeE8M0(255) && exponentFitsNativeE8M0(104));
 } // namespace llaminar2::mxfp4
 
 #undef LLAMINAR_MXFP4_HD
