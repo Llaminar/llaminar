@@ -690,6 +690,7 @@ namespace llaminar2
             phase_ = Phase::ToolBlock;
             dsml_scan_ = 0;
             dsml_emitted_ = false;
+            dsml_rejected_.clear();
         }
 
         // Tool section: buffer_ retains the whole section so a call-less section
@@ -713,9 +714,14 @@ namespace llaminar2
             {
                 if (terminal)
                 {
-                    if (!dsml_emitted_) events.push_back(Event::contentEvent(buffer_));
-                    else if (invoke != std::string::npos) events.push_back(Event::contentEvent(buffer_.substr(invoke)));
+                    // Without an executed call the whole section is literal
+                    // content exactly once (rejected invokes included);
+                    // otherwise only rejected invokes and an incomplete tail.
+                    std::string literal = !dsml_emitted_ ? buffer_
+                        : dsml_rejected_ + (invoke != std::string::npos ? buffer_.substr(invoke) : std::string{});
+                    if (!literal.empty()) events.push_back(Event::contentEvent(std::move(literal)));
                     buffer_.clear();
+                    dsml_rejected_.clear();
                     phase_ = Phase::Content;
                 }
                 return events;
@@ -724,8 +730,9 @@ namespace llaminar2
             if (!arguments)
             {
                 // Fail closed: an invoke whose typed value cannot be kept
-                // exactly is returned verbatim instead of executed altered.
-                events.push_back(Event::contentEvent(buffer_.substr(invoke, args_end + end_size - invoke)));
+                // exactly is never executed. Its literal text is published once,
+                // when the section outcome is known (flush below).
+                dsml_rejected_ += buffer_.substr(invoke, args_end + end_size - invoke);
                 dsml_scan_ = args_end + end_size;
                 continue;
             }
