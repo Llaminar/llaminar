@@ -72,9 +72,6 @@ inline constexpr int kMoERouteOwnedGateUpPartitionColumns = 64;
  */
 [[nodiscard]] constexpr bool moeRouteOwnedGateUpPartitionCodebook(std::uint8_t codebook) noexcept
 {
-    // The catalog also lists formats ROCm has no decoder for (MXFP4).
-    if (!nativeVnniCodebookImplementedOnROCm(codebook))
-        return false;
     for (const auto &source : native_vnni_formats::kAllSourceFormats)
         if (canonicalDeviceVnniFormat(*source.metadata).codebook_id == codebook ||
             migrationStableDeviceVnniFormat(*source.metadata).codebook_id == codebook)

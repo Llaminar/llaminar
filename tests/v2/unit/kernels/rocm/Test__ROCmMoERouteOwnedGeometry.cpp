@@ -101,16 +101,13 @@ TEST(ROCmMoERouteOwnedGeometry, ParallelSourcePartitionContract)
         ASSERT_TRUE(addNativeVnniExecutionFormat(envelope,
             canonicalDeviceVnniFormat(*source.metadata).codebook_id,
             {source.metadata->codebook_id, source.metadata->is_superblock, true}, true));
-        const bool implemented = nativeVnniCodebookImplementedOnROCm(
-            canonicalDeviceVnniFormat(*source.metadata).codebook_id);
-        // MXFP4 is the named ROCm gap: route-owned admission must reject it.
-        EXPECT_EQ(moeRouteOwnedGateUpPartitionExecutionValid(P::FourWorkerPlanes,
-            envelope, {.output_columns = 96, .reduction_columns = 2560}), implemented) << source.quant_type;
+        EXPECT_TRUE(moeRouteOwnedGateUpPartitionExecutionValid(P::FourWorkerPlanes,
+            envelope, {.output_columns = 96, .reduction_columns = 2560})) << source.quant_type;
         for (std::uint8_t cb = 0; cb < 32; ++cb)
             if (moeRouteOwnedGateUpLaunchCodebookMask(envelope.execution_codebook_mask) & bit(cb))
-                EXPECT_EQ(moeRouteOwnedGateUpPartitionCodebook(cb), nativeVnniCodebookImplementedOnROCm(cb));
+                EXPECT_TRUE(moeRouteOwnedGateUpPartitionCodebook(cb));
     }
-    for (const auto cb : {1, 2, 3, 18, 20, 21, 22, 25, 31, 255})
+    for (const auto cb : {1, 2, 3, 18, 20, 21, 22, 26, 31, 255})
         EXPECT_FALSE(moeRouteOwnedGateUpPartitionCodebook(cb));
     std::array<std::uint8_t, 32> partitions{};
     EXPECT_EQ(moeRouteOwnedGateUpMaximumKPartitions(corrected, partitions, 2560), 0);
@@ -150,12 +147,6 @@ TEST(ROCmMoERouteOwnedGeometry, AllFormatSharedLayoutHasDisjointGridAndPartials)
                               migrationStableDeviceVnniFormat(*source.metadata).codebook_id})
         {
             if (!seen.insert(cb).second) continue;
-            if (!nativeVnniCodebookImplementedOnROCm(cb))
-            {
-                // MXFP4 has no ROCm decoder, so no route-owned shared layout exists.
-                EXPECT_THROW((void)moeRouteOwnedGateUpK1SharedLayout(cb, P::Serial), std::invalid_argument);
-                continue;
-            }
             const auto serial = moeRouteOwnedGateUpK1SharedLayout(cb, P::Serial);
             const auto grid = cb == 13 ? 1024u * sizeof(std::uint64_t) : 0u;
             EXPECT_EQ(serial.codebook_bytes, grid);

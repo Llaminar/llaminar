@@ -27487,6 +27487,17 @@ add_v2_test(V2_Integration_DeviceLoadPipeline
     LABELS "V2;Integration;WeightLoading;GpuPipeline;CUDA;ROCm;HIP"
     MPI_PROCS 1
 )
+# MXFP4 through the production row-chunked GPU pipeline on each backend:
+# exact payload/scales, ggml zero blocks, and reader-thread inexact-scale failure.
+foreach(_mxfp4_backend CUDA ROCm)
+    if((_mxfp4_backend STREQUAL "CUDA" AND HAVE_CUDA) OR (_mxfp4_backend STREQUAL "ROCm" AND HAVE_ROCM))
+        add_v2_test(V2_Integration_MXFP4DeviceLoadPipeline_${_mxfp4_backend}
+            COMMAND $<TARGET_FILE:v2_integration_device_load_pipeline>
+                --gtest_filter=Test__DeviceLoadPipelineMXFP4.${_mxfp4_backend}RowChunkedSourceIsExactAndInexactScalesFail
+            LABELS "V2;Integration;ProductionTestPreflight;WeightLoading;GpuPipeline;${_mxfp4_backend};MXFP4;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    endif()
+endforeach()
 
 # Backing-aware, exactly-once asynchronous mmap reclaim lifecycle. This is a
 # model-free integration invariant shared by CPU and accelerator model loading.
@@ -28270,6 +28281,16 @@ if(HAVE_ROCM AND TARGET v2_integration_rocm_vnni_repack_kernels)
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;IQ4_XS;SourceFactors;Repack;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmIQ4XSSourceTupleRepack)
+endif()
+
+# MXFP4 17-byte source blocks: exact FP16 scales, ggml zero blocks, offsets and replay.
+if(HAVE_ROCM AND TARGET v2_integration_rocm_vnni_repack_kernels)
+    add_v2_test(V2_Integration_ROCmMXFP4Repack
+        COMMAND $<TARGET_FILE:v2_integration_rocm_vnni_repack_kernels>
+            --gtest_filter=Test__VnniRepackKernels.MXFP4_ExactScalesCodesZeroBlocksOffsetsAndReplay
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;MXFP4;Repack;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmMXFP4Repack)
 endif()
 
 # Explicit focused inventory membership, in addition to registration labels.
