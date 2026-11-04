@@ -53,8 +53,12 @@ namespace llaminar2::native_vnni_scale
     }
 
     /**
-     * @brief FP32 scale of a native E8M0 plane byte.
-     * @param e Stored byte: 0 marks an all-zero block, otherwise e in [2, 254].
+     * @brief FP32 scale of an ADMITTED native E8M0 plane byte.
+     * @param e Stored byte: 0 marks an all-zero block, otherwise e satisfies
+     *        mxfp4::exponentFitsNativeE8M0 (e in [2, 252]).
+     * @pre Validation belongs to the producer/admission authority (preparation,
+     *      repack, tier CPU->GPU inverse); this hot-path decoder does not
+     *      re-check and maps an unadmitted byte to a meaningless power of two.
      */
     LLAMINAR_NVNNI_SCALE_HD float e8m0Scale(std::uint8_t e)
     {

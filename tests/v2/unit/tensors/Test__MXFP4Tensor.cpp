@@ -114,7 +114,7 @@ TEST(MXFP4Format, NativeE8M0ScaleBitsAreExactNormalFP32)
         const auto byte = static_cast<uint8_t>(e);
         if (!mxfp4::exponentFitsNativeE8M0(byte))
         {
-            EXPECT_TRUE(e < mxfp4::kMinNormalFP32Exponent || e == 255) << e;
+            EXPECT_TRUE(e < mxfp4::kMinNormalFP32Exponent || e > mxfp4::kMaxNativeE8M0Exponent) << e;
             continue;
         }
         const uint32_t built = mxfp4::normalScaleFP32Bits(byte);
@@ -146,7 +146,7 @@ TEST(MXFP4Format, PowerOfTwoBF16WordIsExactAndValidated)
         ASSERT_TRUE(mxfp4::e8m0FromPowerOfTwoBF16Word(word, back)) << e;
         EXPECT_EQ(back, byte);
     }
-    // Every other word is rejected: signs, mantissa bits, and exponents 0/254/255.
+    // Every other word is rejected: signs, mantissa bits, and exponents outside [2, 252].
     size_t accepted = 0;
     for (uint32_t word = 0; word < 65536u; ++word)
     {
@@ -156,7 +156,10 @@ TEST(MXFP4Format, PowerOfTwoBF16WordIsExactAndValidated)
         ++accepted;
         EXPECT_EQ(mxfp4::powerOfTwoBF16Word(e), word);
     }
-    EXPECT_EQ(accepted, 1u + 253u); // zero marker plus e in [2, 254]
+    EXPECT_EQ(accepted, 1u + 251u); // zero marker plus e in [2, 252]
+    // Every admitted exponent keeps the largest decodable weight finite.
+    EXPECT_TRUE(std::isfinite(12.0f * mxfp4::scaleFP32(mxfp4::kMaxNativeE8M0Exponent)));
+    EXPECT_FALSE(std::isfinite(12.0f * mxfp4::scaleFP32(mxfp4::kMaxNativeE8M0Exponent + 1)));
 }
 
 TEST(MXFP4Format, CatalogAndRepackIdentity)
