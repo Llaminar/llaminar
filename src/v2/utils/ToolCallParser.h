@@ -138,6 +138,18 @@ namespace llaminar2
     };
 
     /**
+     * @brief Markers that open a tool section even while the model is still reasoning.
+     *
+     * DeepSeek-V4 may begin a DSML tool section before closing "</think>";
+     * vLLM's parser ends reasoning there (REASONING + TOOL_START). Formats
+     * whose calls only follow the reasoning close return an empty list.
+     *
+     * @param format Format selected by the admitted model schema.
+     * @return Exact opener spellings, empty when reasoning never yields to tools.
+     */
+    std::vector<std::string> toolSectionReasoningExits(ToolCallFormat format);
+
+    /**
      * @brief Generate a unique tool call ID (e.g., "call_abc123def456")
      */
     std::string generateToolCallId();

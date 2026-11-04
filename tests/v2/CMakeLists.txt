@@ -8113,6 +8113,11 @@ add_v2_test(V2_Integration_DeepSeekV4ChatProtocol
     COMMAND $<TARGET_FILE:v2_test_deepseek4_chat_encoding>
     LABELS "V2;Integration;ProductionTestPreflight;HTTP;DeepSeekV4;ChatTemplate;ToolCalling;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_DeepSeekV4ToolSectionInsideReasoning
+    COMMAND $<TARGET_FILE:v2_test_chat_completion_handler>
+        --gtest_filter=Test__ChatCompletionHandler.DeepSeekV4ToolSectionInsideReasoningIsExecutable
+    LABELS "V2;Integration;ProductionTestPreflight;HTTP;DeepSeekV4;Reasoning;ToolCalling;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
 # Note: ArgParser tests removed - replaced by OrchestrationConfigParser tests
 

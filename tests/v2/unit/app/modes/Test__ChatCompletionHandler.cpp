@@ -5394,3 +5394,87 @@ TEST_F(Test__ChatCompletionHandler, RuntimeStatsFreshnessIncludesCleanupRetireme
     EXPECT_EQ(complete["tokens"]["completion"], 1);
     EXPECT_EQ(complete["timings"]["latency"]["samples"], 1);
 }
+
+/**
+ * @test DeepSeek-V4 may open a DSML tool section before closing "</think>".
+ * vLLM ends reasoning at the tool opener (REASONING + TOOL_START); the handler
+ * must do the same so the call is executable on both HTTP and SSE, while text
+ * before the opener stays reasoning. Regression: the generic think splitter
+ * kept the whole tool block in reasoning_content and returned no tool_calls.
+ */
+TEST_F(Test__ChatCompletionHandler, DeepSeekV4ToolSectionInsideReasoningIsExecutable)
+{
+    const auto tmpl = ChatTemplate::create(ChatTemplateType::DEEPSEEK_V4);
+    ASSERT_TRUE(tmpl->isThinkingModel());
+    const std::string dsml = "｜DSML｜";
+    const std::string text = "I should look it up.\n\n<" + dsml + "tool_calls>\n<" + dsml +
+        "invoke name=\"get_weather\">\n<" + dsml + "parameter name=\"city\" string=\"true\">Paris</" + dsml +
+        "parameter>\n</" + dsml + "invoke>\n</" + dsml + "tool_calls>";
+    for (const bool stream : {false, true})
+    {
+        SCOPED_TRACE(stream ? "SSE" : "HTTP");
+        auto handler = makeHandler();
+        ON_CALL(*tokenizer_, hasChatTemplate()).WillByDefault(Return(true));
+        ON_CALL(*tokenizer_, getChatTemplate()).WillByDefault(::testing::ReturnRef(*tmpl));
+        ON_CALL(*tokenizer_, encodeChat(_, _, _, _)).WillByDefault(Return(std::vector<int>{1, 2, 3}));
+        ON_CALL(*runner_, prefill(_)).WillByDefault(Return(true));
+        ON_CALL(*tokenizer_, is_stop_token(_)).WillByDefault(Return(false));
+        ON_CALL(*runner_, getToolCallFormat()).WillByDefault(Return(ToolCallFormat::DEEPSEEK_V4_DSML));
+        // One byte per token: every marker straddles tokenizer pieces.
+        {
+            auto sequence = testing::InSequence{};
+            for (size_t i = 0; i < text.size(); ++i)
+            {
+                ON_CALL(*tokenizer_, decode_token(int(1000 + i))).WillByDefault(Return(text.substr(i, 1)));
+                EXPECT_CALL(*runner_, decodeStep()).WillOnce(Return(makeToken(int(1000 + i)))).RetiresOnSaturation();
+            }
+            EXPECT_CALL(*runner_, decodeStep()).WillOnce(Return(makeToken(0, true))).RetiresOnSaturation();
+        }
+        ChatCompletionRequest request;
+        request.messages = {ChatMessage("user", "Weather in Paris?")};
+        request.max_tokens = int(text.size()) + 8;
+        request.stream = stream;
+        request.tools = json::array({json{{"type", "function"}, {"function", {{"name", "get_weather"},
+            {"parameters", {{"type", "object"}, {"properties", {{"city", {{"type", "string"}}}}}}}}}}});
+
+        std::string reasoning, content, name, arguments, finish;
+        if (!stream)
+        {
+            const auto response = handler->handleRequest(request);
+            ASSERT_TRUE(response.ok) << response.json_body;
+            const auto choice = json::parse(response.json_body)["choices"][0];
+            reasoning = choice["message"].value("reasoning_content", "");
+            content = choice["message"]["content"].is_string() ? choice["message"]["content"].get<std::string>() : "";
+            ASSERT_EQ(choice["message"]["tool_calls"].size(), 1u);
+            name = choice["message"]["tool_calls"][0]["function"]["name"];
+            arguments = choice["message"]["tool_calls"][0]["function"]["arguments"];
+            finish = choice["finish_reason"];
+        }
+        else
+        {
+            const auto response = handler->handleStreamingRequest(request, [&](const std::string &line) {
+                if (line.rfind("data: {", 0) != 0) return true;
+                const auto chunk = json::parse(line.substr(6));
+                if (chunk["choices"].empty()) return true;
+                const auto &choice = chunk["choices"][0];
+                const auto &delta = choice["delta"];
+                if (delta.contains("reasoning_content")) reasoning += delta["reasoning_content"].get<std::string>();
+                if (delta.contains("content") && delta["content"].is_string()) content += delta["content"].get<std::string>();
+                if (delta.contains("tool_calls"))
+                    for (const auto &call : delta["tool_calls"])
+                    {
+                        if (call["function"].contains("name")) name += call["function"]["name"].get<std::string>();
+                        if (call["function"].contains("arguments")) arguments += call["function"]["arguments"].get<std::string>();
+                    }
+                if (choice.contains("finish_reason") && choice["finish_reason"].is_string()) finish = choice["finish_reason"];
+                return true;
+            });
+            ASSERT_TRUE(response.ok);
+        }
+        EXPECT_EQ(reasoning, "I should look it up.\n\n");
+        EXPECT_EQ(content, "");
+        EXPECT_EQ(name, "get_weather");
+        EXPECT_EQ(arguments, "{\"city\": \"Paris\"}");
+        EXPECT_EQ(finish, "tool_calls");
+    }
+}

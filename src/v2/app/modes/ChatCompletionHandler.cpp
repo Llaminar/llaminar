@@ -522,8 +522,10 @@ namespace llaminar2
     // StreamingThinkSplitter
     // =========================================================================
 
-    StreamingThinkSplitter::StreamingThinkSplitter(const std::string &end_tag)
-        : end_tag_(end_tag), phase_(end_tag.empty() ? Phase::Content : Phase::Reasoning)
+    StreamingThinkSplitter::StreamingThinkSplitter(const std::string &end_tag,
+                                                   std::vector<std::string> reasoning_exits)
+        : end_tag_(end_tag), reasoning_exits_(std::move(reasoning_exits)),
+          phase_(end_tag.empty() ? Phase::Content : Phase::Reasoning)
     {
     }
 
@@ -540,7 +542,24 @@ namespace llaminar2
         if (phase_ != Phase::Reasoning)
             return drainContent(/*terminal=*/false);
 
-        const auto pos = buffer_.find(end_tag_);
+        // A model-native content opener (a tool section) ends reasoning
+        // without a close marker when it precedes any close; the opener stays
+        // in the buffer as the first answer byte for the tool parser.
+        size_t exit_pos = std::string::npos;
+        for (const auto &marker : reasoning_exits_)
+            exit_pos = std::min(exit_pos, buffer_.find(marker));
+        const auto close_pos = buffer_.find(end_tag_);
+        if (exit_pos != std::string::npos && (close_pos == std::string::npos || exit_pos < close_pos))
+        {
+            std::string reasoning_part = buffer_.substr(0, exit_pos);
+            buffer_.erase(0, exit_pos);
+            phase_ = Phase::Content;
+            if (!reasoning_part.empty())
+                return {"reasoning_content", reasoning_part};
+            return drainContent(/*terminal=*/false);
+        }
+
+        const auto pos = close_pos;
         if (pos != std::string::npos)
         {
             // A single result cannot emit both fields. Retain the answer tail
@@ -553,7 +572,9 @@ namespace llaminar2
             return drainContent(/*terminal=*/false);
         }
 
-        const size_t held = partialMarkerSuffixLength(buffer_, end_tag_);
+        size_t held = partialMarkerSuffixLength(buffer_, end_tag_);
+        for (const auto &marker : reasoning_exits_)
+            held = std::max(held, partialMarkerSuffixLength(buffer_, marker));
         std::string safe = buffer_.substr(0, buffer_.size() - held);
         buffer_.erase(0, buffer_.size() - held);
         return {"reasoning_content", safe};
@@ -1408,7 +1429,8 @@ namespace llaminar2
             if (chat_template.isThinkingModel())
                 thinking_end_tag = chat_template.thinkingEndTag();
         }
-        StreamingThinkSplitter splitter(thinking_end_tag);
+        StreamingThinkSplitter splitter(thinking_end_tag, toolCallParsingEnabled(request)
+            ? toolSectionReasoningExits(runner_.getToolCallFormat()) : std::vector<std::string>{});
         const auto append_output = [&](const StreamingThinkSplitter::SplitResult &part)
         {
             (part.field == "reasoning_content" ? reasoning_content : content) += part.text;
@@ -1818,7 +1840,8 @@ namespace llaminar2
             const auto &chat_template = tokenizer_.getChatTemplate();
             if (chat_template.isThinkingModel())
             {
-                splitter = StreamingThinkSplitter(chat_template.thinkingEndTag());
+                splitter = StreamingThinkSplitter(chat_template.thinkingEndTag(), toolCallParsingEnabled(request)
+                    ? toolSectionReasoningExits(runner_.getToolCallFormat()) : std::vector<std::string>{});
             }
             else
             {

@@ -181,8 +181,16 @@ namespace llaminar2
     class StreamingThinkSplitter
     {
     public:
-        /** @brief Start the reasoning phase with the model's exact closing marker. */
-        explicit StreamingThinkSplitter(const std::string &end_tag);
+        /**
+         * @brief Start the reasoning phase with the model's exact closing marker.
+         * @param end_tag Closing marker; empty disables reasoning framing.
+         * @param reasoning_exits Model-native markers that also end reasoning and
+         *        begin answer text verbatim (DeepSeek-V4 may open a DSML tool
+         *        section before "</think>"). The marker is not consumed: it is
+         *        the first byte of content so the tool parser sees it.
+         */
+        explicit StreamingThinkSplitter(const std::string &end_tag,
+                                        std::vector<std::string> reasoning_exits = {});
 
         /// Construct a no-op splitter (no thinking support)
         StreamingThinkSplitter();
@@ -220,6 +228,7 @@ namespace llaminar2
         SplitResult drainContent(bool terminal);
 
         std::string end_tag_;
+        std::vector<std::string> reasoning_exits_; ///< Content-opening markers accepted while reasoning.
         Phase phase_{Phase::Reasoning}; ///< Single authority for output transitions.
         std::string buffer_;     ///< Buffer for partial end-tag matches
     };
