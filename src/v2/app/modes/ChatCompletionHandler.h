@@ -127,6 +127,9 @@ namespace llaminar2
         CompletionRuntimeOutput runtime_output{CompletionRuntimeOutput::Omit};
                                    ///< Optional immutable outcome, independent of logging/PerfStats.
         std::optional<bool> enable_thinking; ///< Omission selects the loaded model's reasoning default.
+        /// Validated OpenAI reasoning_effort ("none", "minimal", "low", "medium",
+        /// "high", "xhigh", "max"); "none" disables thinking. Absent: model default.
+        std::optional<std::string> reasoning_effort;
         std::string model;          ///< Model identifier from request (optional)
 
         /// Thinking budget: maximum tokens to spend in thinking mode.
@@ -141,6 +144,10 @@ namespace llaminar2
         /// Tool definitions available for the model to call.
         /// JSON array of {type: "function", function: {name, description, parameters}}.
         nlohmann::json tools;
+
+        /// The same tools array with the client's key order, for prompt
+        /// rendering: templates serialize schemas, and key order is visible text.
+        nlohmann::ordered_json tools_ordered;
 
         /// Validated tool choice control; raw request JSON is not retained.
         ToolChoicePolicy tool_choice;

@@ -37,6 +37,7 @@ namespace llaminar2
         FUNCTIONARY,   ///< Functionary v3.x format
         MISTRAL_NEMO,  ///< [TOOL_CALLS] format
         DEEPSEEK_R1,   ///< DeepSeek R1 format (with reasoning extraction)
+        DEEPSEEK_V4_DSML, ///< DeepSeek-V4: \n\n<｜DSML｜tool_calls><｜DSML｜invoke name="f"><｜DSML｜parameter name="k" string="true|false">v</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>
         GENERIC,       ///< Generic fallback (wraps tool calls in JSON code blocks)
     };
 
@@ -61,6 +62,8 @@ namespace llaminar2
             return "Mistral Nemo";
         case ToolCallFormat::DEEPSEEK_R1:
             return "DeepSeek R1";
+        case ToolCallFormat::DEEPSEEK_V4_DSML:
+            return "DeepSeek V4 DSML";
         case ToolCallFormat::GENERIC:
             return "Generic";
         default:

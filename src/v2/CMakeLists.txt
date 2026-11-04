@@ -2067,6 +2067,8 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     utils/Sampler.cpp
     utils/Sha256.cpp
     utils/ChatTemplate.cpp
+    utils/DeepSeekV4ChatEncoding.cpp
+    utils/PythonJson.cpp
     utils/ChatUI.cpp
     utils/ToolCallParser.cpp
     utils/PerfStatsCollector.cpp

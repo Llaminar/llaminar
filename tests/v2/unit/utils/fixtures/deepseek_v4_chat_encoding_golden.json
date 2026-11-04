@@ -1,0 +1,697 @@
+{
+ "source": "vLLM v0.33 deepseek_v4_encoding.py + deepseek_v4.py request mapping",
+ "cases": [
+  {
+   "name": "user_default",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello"
+     }
+    ]
+   },
+   "prompt": "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n<｜User｜>Hello<｜Assistant｜><think>"
+  },
+  {
+   "name": "thinking_off",
+   "request": {
+    "chat_template_kwargs": {
+     "thinking": false
+    },
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello"
+     }
+    ]
+   },
+   "prompt": "<｜begin▁of▁sentence｜><｜User｜>Hello<｜Assistant｜></think>"
+  },
+  {
+   "name": "enable_thinking_off",
+   "request": {
+    "chat_template_kwargs": {
+     "enable_thinking": false
+    },
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello"
+     }
+    ]
+   },
+   "prompt": "<｜begin▁of▁sentence｜><｜User｜>Hello<｜Assistant｜></think>"
+  },
+  {
+   "name": "effort_none",
+   "request": {
+    "reasoning_effort": "none",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ]
+   },
+   "prompt": "<｜begin▁of▁sentence｜><｜User｜>Hi<｜Assistant｜></think>"
+  },
+  {
+   "name": "effort_low",
+   "request": {
+    "reasoning_effort": "low",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ]
+   },
+   "prompt": "<｜begin▁of▁sentence｜><｜User｜>Hi<｜Assistant｜><think>"
+  },
+  {
+   "name": "effort_medium",
+   "request": {
+    "reasoning_effort": "medium",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ]
+   },
+   "prompt": "<｜begin▁of▁sentence｜><｜User｜>Hi<｜Assistant｜><think>"
+  },
+  {
+   "name": "effort_high",
+   "request": {
+    "reasoning_effort": "high",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ]
+   },
+   "prompt": "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n<｜User｜>Hi<｜Assistant｜><think>"
+  },
+  {
+   "name": "effort_xhigh",
+   "request": {
+    "reasoning_effort": "xhigh",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ]
+   },
+   "prompt": "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n<｜User｜>Hi<｜Assistant｜><think>"
+  },
+  {
+   "name": "effort_max",
+   "request": {
+    "reasoning_effort": "max",
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ]
+   },
+   "prompt": "<｜begin▁of▁sentence｜>Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\nYou MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\nDo not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n<｜User｜>Hi<｜Assistant｜><think>"
+  },
+  {
+   "name": "kwargs_effort_max",
+   "request": {
+    "chat_template_kwargs": {
+     "thinking": true,
+     "reasoning_effort": "max"
+    },
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ]
+   },
+   "prompt": "<｜begin▁of▁sentence｜>Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\nYou MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\nDo not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n<｜User｜>Hi<｜Assistant｜><think>"
+  },
+  {
+   "name": "effort_with_thinking_off",
+   "request": {
+    "reasoning_effort": "max",
+    "chat_template_kwargs": {
+     "thinking": false
+    },
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ]
+   },
+   "prompt": "<｜begin▁of▁sentence｜><｜User｜>Hi<｜Assistant｜></think>"
+  },
+  {
+   "name": "system_user",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are terse."
+     },
+     {
+      "role": "user",
+      "content": "2+2?"
+     }
+    ]
+   },
+   "prompt": "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\nYou are terse.<｜User｜>2+2?<｜Assistant｜><think>"
+  },
+  {
+   "name": "multi_turn_reasoning_dropped",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "S"
+     },
+     {
+      "role": "user",
+      "content": "first"
+     },
+     {
+      "role": "assistant",
+      "content": "answer one",
+      "reasoning_content": "thought one"
+     },
+     {
+      "role": "user",
+      "content": "second"
+     }
+    ]
+   },
+   "prompt": "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\nS<｜User｜>first<｜Assistant｜></think>answer one<｜end▁of▁sentence｜><｜User｜>second<｜Assistant｜><think>"
+  },
+  {
+   "name": "multi_turn_chat",
+   "request": {
+    "chat_template_kwargs": {
+     "thinking": false
+    },
+    "messages": [
+     {
+      "role": "user",
+      "content": "first"
+     },
+     {
+      "role": "assistant",
+      "content": "answer one",
+      "reasoning_content": "thought one"
+     },
+     {
+      "role": "user",
+      "content": "second"
+     }
+    ]
+   },
+   "prompt": "<｜begin▁of▁sentence｜><｜User｜>first<｜Assistant｜></think>answer one<｜end▁of▁sentence｜><｜User｜>second<｜Assistant｜></think>"
+  },
+  {
+   "name": "tools_no_system",
+   "request": {
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Weather for a city, \"quoted\" and ünïcode.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City name"
+         },
+         "days": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 14
+         },
+         "threshold": {
+          "type": "number",
+          "default": 0.5,
+          "multipleOf": 1e-07,
+          "exclusiveMaximum": 100.0
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search",
+       "description": "Search the web.\nReturns JSON.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "query"
+        ]
+       }
+      }
+     }
+    ],
+    "messages": [
+     {
+      "role": "user",
+      "content": "Weather in Berlin?"
+     }
+    ]
+   },
+   "prompt": "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like the following:\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"$TOOL_NAME\">\n<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n...\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"get_weather\", \"description\": \"Weather for a city, \\\"quoted\\\" and ünïcode.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1, \"maximum\": 14}, \"threshold\": {\"type\": \"number\", \"default\": 0.5, \"multipleOf\": 1e-07, \"exclusiveMaximum\": 100.0}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}}, \"required\": [\"city\"]}}\n{\"name\": \"search\", \"description\": \"Search the web.\\nReturns JSON.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}}, \"required\": [\"query\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>Weather in Berlin?<｜Assistant｜><think>"
+  },
+  {
+   "name": "tools_with_system",
+   "request": {
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Weather for a city, \"quoted\" and ünïcode.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City name"
+         },
+         "days": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 14
+         },
+         "threshold": {
+          "type": "number",
+          "default": 0.5,
+          "multipleOf": 1e-07,
+          "exclusiveMaximum": 100.0
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     }
+    ],
+    "messages": [
+     {
+      "role": "system",
+      "content": "Use tools."
+     },
+     {
+      "role": "user",
+      "content": "Weather?"
+     }
+    ]
+   },
+   "prompt": "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\nUse tools.\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like the following:\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"$TOOL_NAME\">\n<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n...\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"get_weather\", \"description\": \"Weather for a city, \\\"quoted\\\" and ünïcode.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1, \"maximum\": 14}, \"threshold\": {\"type\": \"number\", \"default\": 0.5, \"multipleOf\": 1e-07, \"exclusiveMaximum\": 100.0}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}}, \"required\": [\"city\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>Weather?<｜Assistant｜><think>"
+  },
+  {
+   "name": "tools_second_system",
+   "request": {
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Weather for a city, \"quoted\" and ünïcode.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City name"
+         },
+         "days": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 14
+         },
+         "threshold": {
+          "type": "number",
+          "default": 0.5,
+          "multipleOf": 1e-07,
+          "exclusiveMaximum": 100.0
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     }
+    ],
+    "messages": [
+     {
+      "role": "user",
+      "content": "x"
+     },
+     {
+      "role": "system",
+      "content": "late system"
+     },
+     {
+      "role": "user",
+      "content": "y"
+     }
+    ]
+   },
+   "prompt": "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n<｜User｜>xlate system\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like the following:\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"$TOOL_NAME\">\n<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n...\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"get_weather\", \"description\": \"Weather for a city, \\\"quoted\\\" and ünïcode.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1, \"maximum\": 14}, \"threshold\": {\"type\": \"number\", \"default\": 0.5, \"multipleOf\": 1e-07, \"exclusiveMaximum\": 100.0}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}}, \"required\": [\"city\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>y<｜Assistant｜><think>"
+  },
+  {
+   "name": "tool_round_trip",
+   "request": {
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Weather for a city, \"quoted\" and ünïcode.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City name"
+         },
+         "days": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 14
+         },
+         "threshold": {
+          "type": "number",
+          "default": 0.5,
+          "multipleOf": 1e-07,
+          "exclusiveMaximum": 100.0
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "search",
+       "description": "Search the web.\nReturns JSON.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "query": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "query"
+        ]
+       }
+      }
+     }
+    ],
+    "messages": [
+     {
+      "role": "user",
+      "content": "Weather and search"
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "reasoning_content": "I need both.",
+      "tool_calls": [
+       {
+        "id": "call_a",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": "{\"city\": \"Berlin\", \"days\": 3, \"tags\": [\"a\", \"\\u00fc\"]}"
+        }
+       },
+       {
+        "id": "call_b",
+        "type": "function",
+        "function": {
+         "name": "search",
+         "arguments": "{\"query\": \"line1\\nline2 \\\"q\\\"\"}"
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_b",
+      "content": "search result"
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_a",
+      "content": "sunny"
+     },
+     {
+      "role": "assistant",
+      "content": "It is sunny.",
+      "reasoning": "Done."
+     },
+     {
+      "role": "user",
+      "content": "Thanks"
+     }
+    ]
+   },
+   "prompt": "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like the following:\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"$TOOL_NAME\">\n<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n...\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"get_weather\", \"description\": \"Weather for a city, \\\"quoted\\\" and ünïcode.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1, \"maximum\": 14}, \"threshold\": {\"type\": \"number\", \"default\": 0.5, \"multipleOf\": 1e-07, \"exclusiveMaximum\": 100.0}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}}, \"required\": [\"city\"]}}\n{\"name\": \"search\", \"description\": \"Search the web.\\nReturns JSON.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}}, \"required\": [\"query\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>Weather and search<｜Assistant｜><think>I need both.</think>\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Berlin</｜DSML｜parameter>\n<｜DSML｜parameter name=\"days\" string=\"false\">3</｜DSML｜parameter>\n<｜DSML｜parameter name=\"tags\" string=\"false\">[\"a\", \"ü\"]</｜DSML｜parameter>\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"search\">\n<｜DSML｜parameter name=\"query\" string=\"true\">line1\nline2 \"q\"</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls><｜end▁of▁sentence｜><｜User｜><tool_result>sunny</tool_result>\n\n<tool_result>search result</tool_result><｜Assistant｜><think>Done.</think>It is sunny.<｜end▁of▁sentence｜><｜User｜>Thanks<｜Assistant｜><think>"
+  },
+  {
+   "name": "tool_round_trip_chat",
+   "request": {
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "description": "Weather for a city, \"quoted\" and ünïcode.",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "city": {
+          "type": "string",
+          "description": "City name"
+         },
+         "days": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 14
+         },
+         "threshold": {
+          "type": "number",
+          "default": 0.5,
+          "multipleOf": 1e-07,
+          "exclusiveMaximum": 100.0
+         },
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         }
+        },
+        "required": [
+         "city"
+        ]
+       }
+      }
+     }
+    ],
+    "chat_template_kwargs": {
+     "thinking": false
+    },
+    "messages": [
+     {
+      "role": "user",
+      "content": "Weather?"
+     },
+     {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+       {
+        "id": "call_a",
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "arguments": "{\"city\": \"Berlin\", \"days\": 3, \"tags\": [\"a\", \"\\u00fc\"]}"
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "call_a",
+      "content": [
+       {
+        "type": "text",
+        "text": "sunny"
+       },
+       {
+        "type": "text",
+        "text": "dry"
+       }
+      ]
+     }
+    ]
+   },
+   "prompt": "<｜begin▁of▁sentence｜>\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜tool_calls>\" block like the following:\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"$TOOL_NAME\">\n<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n...\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"get_weather\", \"description\": \"Weather for a city, \\\"quoted\\\" and ünïcode.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1, \"maximum\": 14}, \"threshold\": {\"type\": \"number\", \"default\": 0.5, \"multipleOf\": 1e-07, \"exclusiveMaximum\": 100.0}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}}, \"required\": [\"city\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>Weather?<｜Assistant｜></think>\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Berlin</｜DSML｜parameter>\n<｜DSML｜parameter name=\"days\" string=\"false\">3</｜DSML｜parameter>\n<｜DSML｜parameter name=\"tags\" string=\"false\">[\"a\", \"ü\"]</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls><｜end▁of▁sentence｜><｜User｜><tool_result>sunny\ndry</tool_result><｜Assistant｜></think>"
+  },
+  {
+   "name": "consecutive_assistant_merge",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "q"
+     },
+     {
+      "role": "assistant",
+      "content": "part one",
+      "reasoning_content": "r1"
+     },
+     {
+      "role": "assistant",
+      "content": "part two",
+      "reasoning_content": "r2"
+     },
+     {
+      "role": "user",
+      "content": "q2"
+     }
+    ]
+   },
+   "prompt": "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n<｜User｜>q<｜Assistant｜></think>part one\n\npart two<｜end▁of▁sentence｜><｜User｜>q2<｜Assistant｜><think>"
+  },
+  {
+   "name": "content_parts",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": [
+       {
+        "type": "text",
+        "text": "sys a"
+       },
+       {
+        "type": "text",
+        "text": "sys b"
+       }
+      ]
+     },
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "text",
+        "text": "line A"
+       },
+       {
+        "type": "text",
+        "text": "line B"
+       }
+      ]
+     }
+    ]
+   },
+   "prompt": "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\nsys a\n\nsys b<｜User｜>line A\n\nline B<｜Assistant｜><think>"
+  },
+  {
+   "name": "unicode_and_specials",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Grüße 你好 \"quotes\" \\ back\nnewline\ttab"
+     }
+    ]
+   },
+   "prompt": "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n<｜User｜>Grüße 你好 \"quotes\" \\ back\nnewline\ttab<｜Assistant｜><think>"
+  },
+  {
+   "name": "trailing_assistant_prefill",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Count"
+     },
+     {
+      "role": "assistant",
+      "content": "1, 2,"
+     }
+    ]
+   },
+   "prompt": "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n<｜User｜>Count<｜Assistant｜><think></think>1, 2,<｜end▁of▁sentence｜><｜Assistant｜><think>"
+  },
+  {
+   "name": "developer_role",
+   "request": {
+    "messages": [
+     {
+      "role": "developer",
+      "content": "dev rules"
+     },
+     {
+      "role": "user",
+      "content": "go"
+     }
+    ]
+   },
+   "prompt": "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n<｜User｜>go<｜Assistant｜><think>"
+  }
+ ]
+}

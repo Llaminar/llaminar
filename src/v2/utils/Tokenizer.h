@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <unordered_map>
 #include <map>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -173,6 +174,27 @@ namespace llaminar2
         }
 
         /**
+         * @brief Encode a conversation with the complete typed request controls.
+         *
+         * Implementations without native support for a control must reject it
+         * rather than drop it: a silently ignored reasoning effort would serve
+         * a different prompt than the client requested.
+         *
+         * @param messages Conversation in order.
+         * @param options Request rendering controls.
+         * @return Encoded token IDs ready for inference.
+         * @throws std::invalid_argument When @p options requests an unsupported control.
+         */
+        virtual std::vector<int> encodeChat(
+            const std::vector<ChatMessage> &messages,
+            const ChatEncodingOptions &options) const
+        {
+            if (options.reasoning_effort)
+                throw std::invalid_argument("This tokenizer does not implement reasoning_effort rendering");
+            return encodeChat(messages, options.add_generation_prompt, options.tools_json, options.enable_thinking);
+        }
+
+        /**
          * @brief Format messages using chat template (without encoding)
          *
          * Useful for debugging or when you need the formatted text.
@@ -257,6 +279,10 @@ namespace llaminar2
             const std::vector<ChatMessage> &messages,
             bool add_generation_prompt = true,
             const std::string &tools_json = "") const override;
+        /** @brief Render with every typed control (reasoning effort included), then tokenize without BOS. */
+        std::vector<int> encodeChat(
+            const std::vector<ChatMessage> &messages,
+            const ChatEncodingOptions &options) const override;
         std::vector<int> encodeChat(
             const std::vector<ChatMessage> &messages,
             bool add_generation_prompt,
