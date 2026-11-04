@@ -241,6 +241,54 @@ TEST_F(Test__CPUEmbeddingGroupedVerifier,
     }
 }
 
+namespace
+{
+    /**
+     * @brief Lookup into an arena-capacity output equals an exact-size output.
+     *
+     * Graph outputs are arena roots with more rows than the live token count.
+     * Rows [0, M) must match an exact-M lookup byte for byte and rows beyond M
+     * must stay untouched. Regression: the native FP16/BF16 path derived its
+     * row pitch from size_bytes()/M, corrupting every row after the first.
+     */
+    template <typename OutputTensorT>
+    void expectCapacityOutputMatchesExact(TensorBase *table, int vocab_size, int d_model)
+    {
+        constexpr int rows = 5, capacity = 16;
+        std::vector<int> tokens(rows);
+        for (int row = 0; row < rows; ++row)
+            tokens[static_cast<size_t>(row)] = (11 + 13 * row) % vocab_size;
+        CPUEmbeddingKernelT<OutputTensorT> kernel;
+        OutputTensorT exact({static_cast<size_t>(rows), static_cast<size_t>(d_model)});
+        OutputTensorT arena({static_cast<size_t>(capacity), static_cast<size_t>(d_model)});
+        std::memset(arena.raw_mutable_data(), 0xA5, arena.size_bytes());
+        ASSERT_TRUE(kernel.apply_tensor(table, tokens.data(), rows, d_model, &exact));
+        ASSERT_TRUE(kernel.apply_tensor(table, tokens.data(), rows, d_model, &arena));
+        expectByteExact(arena.raw_data(), exact.raw_data(), exact.size_bytes(),
+                        std::string(tensorTypeName(table->native_type())) + " -> " +
+                            tensorTypeName(arena.native_type()) + " arena-capacity rows");
+        const auto *tail = static_cast<const uint8_t *>(arena.raw_data()) + exact.size_bytes();
+        for (size_t byte = 0; byte < arena.size_bytes() - exact.size_bytes(); ++byte)
+            ASSERT_EQ(tail[byte], 0xA5) << "row beyond M was written at byte " << byte;
+    }
+} // namespace
+
+/** @brief Every source and output format honours the arena row pitch. */
+TEST_F(Test__CPUEmbeddingGroupedVerifier, ArenaCapacityOutputMatchesExactRowsForAllFormats)
+{
+    constexpr int vocab_size = 67, d_model = 256;
+    uint32_t seed = 9100;
+    for (const auto &format : embeddingVerifierFormats())
+    {
+        SCOPED_TRACE(format.label);
+        auto table = format.create({vocab_size, d_model}, seed++);
+        expectCapacityOutputMatchesExact<FP32Tensor>(table.get(), vocab_size, d_model);
+        expectCapacityOutputMatchesExact<BF16Tensor>(table.get(), vocab_size, d_model);
+        expectCapacityOutputMatchesExact<FP16Tensor>(table.get(), vocab_size, d_model);
+        expectCapacityOutputMatchesExact<Q8_1Tensor>(table.get(), vocab_size, d_model);
+    }
+}
+
 /** @brief Nested TP wrappers retain exact CPU results for every source format. */
 TEST_F(Test__CPUEmbeddingGroupedVerifier, NestedSlicesMatchUnwrappedSourceBytes)
 {
