@@ -8,6 +8,7 @@
  */
 #pragma once
 #include "kernels/common/DeviceNativeQuantisedMatrixDesc.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include <cstdint>
 #if defined(__HIPCC__)
 #define LLAMINAR_MOE_ARITHMETIC_HD __host__ __device__
@@ -51,6 +52,9 @@ struct MoEPrefillSerialM1KPartitionPolicy
         // Q8_1 and Q8_K prepare to the same signed-INT8 arithmetic as Q8_0.
         if (policy_codebook == 20 || policy_codebook == 21)
             policy_codebook = 19;
+        // MXFP4 keeps decoder 25 but shares IQ4_NL's arithmetic policy.
+        if (policy_codebook == llaminar2::kNativeQuantisedMXFP4Codebook)
+            policy_codebook = 4;
         return forCodebook(policy_codebook);
     }
 };

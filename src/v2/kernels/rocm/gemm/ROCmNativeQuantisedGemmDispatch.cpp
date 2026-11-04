@@ -50,6 +50,7 @@ constexpr ROCmNativeQuantisedGemmShardFn shardForCodebook(uint8_t codebook_id)
     case 0:
     case 4:
     case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook:
+    case llaminar2::kNativeQuantisedMXFP4Codebook:
         return rocmGemm_native_quantised_fp32_shard_0;
     case 5:
     case 6:
@@ -81,7 +82,8 @@ constexpr ROCmNativeQuantisedGemmShardFn shardForCodebook(uint8_t codebook_id)
 /** @brief Preserve legacy policy semantics for a self-describing decoder. */
 constexpr uint8_t defaultArithmeticPolicyCodebook(uint8_t codebook_id)
 {
-    return codebook_id == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook ? uint8_t{4} :
+    return codebook_id == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook ||
+                   codebook_id == llaminar2::kNativeQuantisedMXFP4Codebook ? uint8_t{4} :
            codebook_id == llaminar2::kNativeQuantisedExpandedInt8MinCodebook
                ? static_cast<uint8_t>(19)
                : codebook_id;

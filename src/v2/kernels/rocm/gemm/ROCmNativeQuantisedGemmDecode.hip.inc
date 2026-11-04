@@ -13,6 +13,7 @@
 #include <cstdio>
 #include "../../../tensors/NativeQuantisedFormatInfo.h"
 #include "../../../backends/rocm/HipDeviceGuard.h"
+#include "ROCmNativeQuantisedNibbleLUT.h"
 
 // ============================================================================
 // Format tags — full set matching ROCmGemvKernel_native_quantised.hip
@@ -25,6 +26,7 @@ enum NativeQuantisedGemmFormat : uint8_t {
     NATIVE_QUANTISED_GEMM_Q4_0    = 0,   // 4-bit symmetric, linear decode (q - 8)
     NATIVE_QUANTISED_GEMM_IQ4_XS_SOURCE = llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook,
     NATIVE_QUANTISED_GEMM_IQ4_NL  = 4,   // 4-bit symmetric, LUT decode via v_perm_b32
+    NATIVE_QUANTISED_GEMM_MXFP4   = llaminar2::kNativeQuantisedMXFP4Codebook, // IQ4_NL geometry, doubled-E2M1 LUT
     NATIVE_QUANTISED_GEMM_Q4_1    = 5,   // 4-bit asymmetric (q as-is, has min)
     NATIVE_QUANTISED_GEMM_Q5_0    = 6,   // 5-bit symmetric, linear decode (q - 16)
     NATIVE_QUANTISED_GEMM_Q5_1    = 7,   // 5-bit asymmetric (q as-is, has min)
@@ -77,7 +79,8 @@ struct NATIVE_QUANTISEDGemmTraits {
     static constexpr bool is_2bit   = (FMT == NATIVE_QUANTISED_GEMM_Q2_K);
     static constexpr bool is_8bit =
         FMT == NATIVE_QUANTISED_GEMM_Q8_0 || FMT == NATIVE_QUANTISED_GEMM_EXPANDED_INT8_MIN;
-    static constexpr bool uses_lut  = (FMT == NATIVE_QUANTISED_GEMM_IQ4_NL || FMT == NATIVE_QUANTISED_GEMM_IQ4_XS_SOURCE);
+    static constexpr bool uses_lut  = (FMT == NATIVE_QUANTISED_GEMM_IQ4_NL || FMT == NATIVE_QUANTISED_GEMM_IQ4_XS_SOURCE ||
+                                       FMT == NATIVE_QUANTISED_GEMM_MXFP4);
     static constexpr int  payload_bytes =
         is_8bit ? 32 :                              // Q8_0: 32 raw INT8 values
         is_iq1_grid ? 6 :                          // IQ1_S/IQ1_M: qs[4]+qh[2], native size
@@ -273,11 +276,13 @@ __device__ __forceinline__ void decode_block(
             packed_groups[g + 4] = static_cast<int32_t>((((raw[g] >> 4) & NIBBLE_MASK) + SWAR_ADD) ^ SWAR_XOR);
         }
     }
-    else if constexpr (FMT == NATIVE_QUANTISED_GEMM_IQ4_NL || FMT == NATIVE_QUANTISED_GEMM_IQ4_XS_SOURCE)
+    else if constexpr (FMT == NATIVE_QUANTISED_GEMM_IQ4_NL || FMT == NATIVE_QUANTISED_GEMM_IQ4_XS_SOURCE ||
+                       FMT == NATIVE_QUANTISED_GEMM_MXFP4)
     {
-        // IQ4_NL: v_perm_b32 codebook LUT
-        constexpr uint32_t CB_LO_A = 0xBFAD9881u, CB_LO_B = 0xF6EADDCFu;
-        constexpr uint32_t CB_HI_A = 0x26190D01u, CB_HI_B = 0x71594535u;
+        // IQ4_NL / IQ4_XS / MXFP4: v_perm_b32 codebook LUT (only the table differs).
+        constexpr auto lut = llaminar2::rocm::nibble_lut::words<static_cast<int>(FMT)>();
+        constexpr uint32_t CB_LO_A = lut.lo_a, CB_LO_B = lut.lo_b;
+        constexpr uint32_t CB_HI_A = lut.hi_a, CB_HI_B = lut.hi_b;
         constexpr uint32_t MUX_ID = 0x03020100u, MUX_B3 = 0x04040404u;
         #pragma unroll
         for (int g = 0; g < 4; ++g)
