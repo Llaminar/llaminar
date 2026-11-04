@@ -131,6 +131,34 @@ TEST(MXFP4Format, NativeE8M0ScaleBitsAreExactNormalFP32)
         EXPECT_EQ(nativeVnniScalePlaneBytes(static_cast<uint8_t>(codebook)), 2u) << codebook;
 }
 
+TEST(MXFP4Format, PowerOfTwoBF16WordIsExactAndValidated)
+{
+    // CPU units keep a 16-bit scale slot; native E8M0 scales are stored there
+    // as BF16 powers of two that widen by placement (word << 16) alone.
+    for (int e = 0; e < 256; ++e)
+    {
+        const auto byte = static_cast<uint8_t>(e);
+        if (e != 0 && !mxfp4::exponentFitsNativeE8M0(byte))
+            continue;
+        const uint16_t word = mxfp4::powerOfTwoBF16Word(byte);
+        EXPECT_EQ(uint32_t{word} << 16, e == 0 ? 0u : mxfp4::normalScaleFP32Bits(byte)) << e;
+        uint8_t back = 0xff;
+        ASSERT_TRUE(mxfp4::e8m0FromPowerOfTwoBF16Word(word, back)) << e;
+        EXPECT_EQ(back, byte);
+    }
+    // Every other word is rejected: signs, mantissa bits, and exponents 0/254/255.
+    size_t accepted = 0;
+    for (uint32_t word = 0; word < 65536u; ++word)
+    {
+        uint8_t e = 0;
+        if (!mxfp4::e8m0FromPowerOfTwoBF16Word(static_cast<uint16_t>(word), e))
+            continue;
+        ++accepted;
+        EXPECT_EQ(mxfp4::powerOfTwoBF16Word(e), word);
+    }
+    EXPECT_EQ(accepted, 1u + 253u); // zero marker plus e in [2, 254]
+}
+
 TEST(MXFP4Format, CatalogAndRepackIdentity)
 {
     const auto *format = native_vnni_formats::forQuantType("MXFP4");

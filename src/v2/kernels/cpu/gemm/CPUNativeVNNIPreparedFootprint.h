@@ -26,6 +26,19 @@ namespace llaminar2::cpu::native_vnni
      * Cache policy belongs to this execution encoding because it determines
      * the bytes and decode work seen by the hot kernel.
      */
+    /**
+     * @brief Interpretation of the 16-bit primary scale word in CPU units.
+     *
+     * Chosen from the prepared physical representation, never from the source
+     * codebook alone: rotated (expanded INT8) MXFP4 keeps source codebook 25 but
+     * carries ordinary FP16 scales.
+     */
+    enum class CPUNativeVNNIScaleEncoding : std::uint8_t
+    {
+        FP16 = 0,           ///< IEEE binary16 scale (every format today).
+        PowerOfTwoBF16 = 1, ///< Native MXFP4 E8M0 as mxfp4::powerOfTwoBF16Word.
+    };
+
     enum class CPUNativeVNNIEncoding : std::uint8_t
     {
         NibbleLUT = 0,          ///< Four-bit payload decoded in the hot loop.
