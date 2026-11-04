@@ -1123,3 +1123,29 @@ failures remain preserved, not reclassified as passes.
 This is focused calibration evidence only. The broader Unit/preflight gate,
 Dynamic full-model movement, and Release performance remain unqualified here.
 Local evidence is retained under `/tmp/qfn-cpu-joint-qualified-r224/`.
+
+
+## Complete-target histogram ownership (focused285)
+
+Whole-expert and CPU-cohort placement now use the same logical route counters.
+A sharded expert contributes demand once to its complete tier target; members
+do not multiply heat. Accepted ownership publication borrows the immutable
+original map under the existing ownership mutex. Counters and frozen transaction
+histories remain unchanged, and replacing a publication releases its obsolete
+map owner. The initial complete-placement borrow is consumed, so the settings
+view cannot pin that original publication.
+
+The owning DecodeExpertHistogram fixture and its explicit production-preflight
+regression passed in `/tmp/qfn-cpu-joint-qualified-r224/focused285/`, using the
+Integration build recorded in `build284-result.json`. The focused selection
+passed all five registrations in 6.42 seconds, with no skips and clean driver
+evidence. The histogram replay covers declared widths 2 through 8, twenty
+record/freeze/reset cycles per width, nonzero layer origin, rejected ownership
+arm/topology changes, unchanged logical demand and retained/released snapshot
+lifetimes. Widths beyond the host's two sockets are metadata coverage, not native
+four/eight-socket claims. Two header comments were clarified after the run;
+executable code and tests are unchanged.
+
+This checkpoint qualifies histogram ownership only. Dynamic cohort inference,
+placement changes during MTP, full production preflight and Release throughput
+remain separate unqualified gates.

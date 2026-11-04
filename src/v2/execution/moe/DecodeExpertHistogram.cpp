@@ -11,6 +11,10 @@
 
 #include "DecodeExpertHistogram.h"
 #include "MoEOverlayWireIO.h"
+#include "MoEExpertOwnerMap.h"
+#include "MoEExpertShardCohort.h"
+#include <map>
+#include <set>
 #include "planning/PhysicalMemoryAuthority.h"
 #include <algorithm>
 #include <cmath>
@@ -25,6 +29,67 @@ namespace llaminar2
 {
     namespace
     {
+        /**
+         * @param config Original exclusive ownership input.
+         * @return Original model layer origin.
+         * @throws std::invalid_argument For mixed or empty ownership arms.
+         */
+        int histogramFirstLayer(const DecodeExpertHistogramConfig &config)
+        {
+            if (!config.placement_ownership)
+                return config.ownership.firstModelLayer();
+            if (!config.sockets.empty() || config.ownership.layerCount() ||
+                config.placement_ownership->owners().empty())
+                throw std::invalid_argument("Histogram complete placement requires one exclusive nonempty ownership arm");
+            const auto &owners = config.placement_ownership->owners();
+            return std::min_element(owners.begin(), owners.end(), [](const auto &a, const auto &b) {
+                return a.layer_idx < b.layer_idx;
+            })->layer_idx;
+        }
+        /**
+         * @brief Derive cold diagnostics without counting a cohort's demand once per member.
+         * @param map Original immutable complete placement.
+         * @param layer Original layer.
+         * @param experts Exact logical expert count.
+         * @param count Existing bank counter reader.
+         * @return One complete logical target and its existing expert demand sum.
+         * @throws std::invalid_argument For incomplete original expert ownership.
+         */
+        template <class Count>
+        std::vector<ExpertHistogramTargetLoad> completeTargetLoads(
+            const MoEExpertOwnerMap &map, int layer, int experts, Count count)
+        {
+            std::map<int, uint64_t> loads;
+            std::set<int> fragments;
+            for (int expert = 0; expert < experts; ++expert)
+            {
+                const auto *owner = map.placementFor(layer, expert);
+                if (!owner)
+                    throw std::invalid_argument("Histogram complete ownership omitted a logical expert");
+                if (owner->shard_cohort)
+                {
+                    loads.try_emplace(MoEOverlayRouteTarget::cpuCohort(owner->tier_idx).word(), 0);
+                    for (const auto &member : owner->shard_cohort->participants())
+                        fragments.insert(member.participant_id);
+                }
+            }
+            for (const auto &participant : map.participants())
+                if (!fragments.contains(participant.participant_id))
+                    loads.try_emplace(MoEOverlayRouteTarget::whole(participant.participant_id).word(), 0);
+            for (int expert = 0; expert < experts; ++expert)
+            {
+                const auto *owner = map.placementFor(layer, expert);
+                const auto target = owner->shard_cohort
+                    ? MoEOverlayRouteTarget::cpuCohort(owner->tier_idx)
+                    : MoEOverlayRouteTarget::whole(owner->owner_participant);
+                loads.at(target.word()) += count(expert);
+            }
+            std::vector<ExpertHistogramTargetLoad> result;
+            result.reserve(loads.size());
+            for (const auto &[word, activations] : loads)
+                result.push_back({MoEOverlayRouteTarget::fromWord(word), activations});
+            return result;
+        }
         /** @return A checked payload byte sum, never a parallel admission ledger. */
         std::size_t demandBytesAdd(std::size_t lhs, std::uint64_t count,
                                    std::size_t element_bytes)
@@ -840,16 +905,19 @@ namespace llaminar2
 
     DecodeExpertHistogram::DecodeExpertHistogram(DecodeExpertHistogramConfig config)
         : config_(std::move(config)),
-          first_model_layer_(config_.ownership.firstModelLayer()),
+          first_model_layer_(histogramFirstLayer(config_)),
           active_window_size_(config_.window_size),
-          ownership_(config_.ownership)
+          ownership_(config_.ownership),
+          placement_ownership_(std::move(config_.placement_ownership))
     {
         if (config_.window_size <= 0)
         {
             throw std::invalid_argument(
                 "DecodeExpertHistogram requires a positive window size");
         }
-        if (ownership_.layerCount() != config_.num_layers ||
+        if (placement_ownership_)
+            placement_ownership_->requireLayerGeometry(config_.num_layers, config_.num_experts, firstModelLayer());
+        else if (ownership_.layerCount() != config_.num_layers ||
             ownership_.expertCount() != config_.num_experts ||
             ownership_.participantCount() != static_cast<int>(config_.sockets.size()))
         {
@@ -1488,13 +1556,47 @@ namespace llaminar2
         const auto &layer =
             bank_lease.bank().layers[storageIndexForModelLayer(layer_idx)];
         std::lock_guard<std::mutex> lock(ownership_mutex_);
-        const int num_sockets = static_cast<int>(config_.sockets.size());
+        if (placement_ownership_)
+            throw std::logic_error("Scalar socket loads reject complete target ownership");
+        const int num_sockets = ownership_.participantCount();
         std::vector<uint64_t> loads(num_sockets, 0);
         for (int e = 0; e < config_.num_experts; ++e)
         {
             const int sock = ownership_.owner(layer_idx, e);
             loads[sock] += layer.expert_counts[e].load(std::memory_order_relaxed);
         }
+        return loads;
+    }
+
+    std::shared_ptr<const MoEExpertOwnerMap> DecodeExpertHistogram::placementOwnership() const
+    {
+        std::lock_guard<std::mutex> lock(ownership_mutex_);
+        return placement_ownership_;
+    }
+    void DecodeExpertHistogram::updatePlacementOwnership(std::shared_ptr<const MoEExpertOwnerMap> ownership)
+    {
+        if (!ownership)
+            throw std::invalid_argument("Histogram complete ownership publication requires its original map owner");
+        ownership->requireLayerGeometry(config_.num_layers, config_.num_experts, firstModelLayer());
+        std::lock_guard<std::mutex> lock(ownership_mutex_);
+        if (!placement_ownership_ || ownership->participants() != placement_ownership_->participants())
+            throw std::invalid_argument("Histogram complete publication changed ownership arm or physical topology");
+        placement_ownership_ = std::move(ownership);
+    }
+    std::vector<ExpertHistogramTargetLoad> DecodeExpertHistogram::targetLoads(int layer_idx) const
+    {
+        const auto lease = acquireActiveBank();
+        const auto &layer = lease.bank().layers[storageIndexForModelLayer(layer_idx)];
+        std::lock_guard<std::mutex> lock(ownership_mutex_);
+        if (placement_ownership_)
+            return completeTargetLoads(*placement_ownership_, layer_idx, config_.num_experts, [&](int expert) {
+                return layer.expert_counts[expert].load(std::memory_order_relaxed);
+            });
+        std::vector<ExpertHistogramTargetLoad> loads;
+        for (int participant = 0; participant < ownership_.participantCount(); ++participant)
+            loads.push_back({MoEOverlayRouteTarget::whole(participant), 0});
+        for (int expert = 0; expert < config_.num_experts; ++expert)
+            loads[ownership_.owner(layer_idx, expert)].activations += layer.expert_counts[expert].load(std::memory_order_relaxed);
         return loads;
     }
 
@@ -1544,6 +1646,26 @@ namespace llaminar2
     ExpertLoadImbalanceStats DecodeExpertHistogram::placementImbalance(
         const MoELayeredExpertOwnership &ownership) const
     {
+        if (placementOwnership())
+            throw std::logic_error("Scalar imbalance rejects complete placement ownership");
+        return placementImbalanceImpl(&ownership, nullptr);
+    }
+    ExpertLoadImbalanceStats DecodeExpertHistogram::placementImbalance(
+        const MoEExpertOwnerMap &ownership) const
+    {
+        const auto original = placementOwnership();
+        if (!original || ownership.participants() != original->participants())
+            throw std::invalid_argument("Histogram candidate scoring changed complete ownership arm or physical topology");
+        return placementImbalanceImpl(nullptr, &ownership);
+    }
+
+    ExpertLoadImbalanceStats DecodeExpertHistogram::placementImbalanceImpl(
+        const MoELayeredExpertOwnership *scalar, const MoEExpertOwnerMap *complete) const
+    {
+        if ((scalar == nullptr) == (complete == nullptr))
+            throw std::invalid_argument("Histogram scoring requires one ownership arm");
+        if (complete)
+            complete->requireLayerGeometry(config_.num_layers, config_.num_experts, firstModelLayer());
         const auto bank_lease = acquireActiveBank();
         const auto &bank = bank_lease.bank();
         ExpertLoadImbalanceStats stats;
@@ -1552,11 +1674,9 @@ namespace llaminar2
         const int num_sockets = static_cast<int>(config_.sockets.size());
         if (config_.num_layers <= 0 ||
             config_.num_experts <= 0 ||
-            num_sockets <= 0 ||
-            ownership.firstModelLayer() != firstModelLayer() ||
-            ownership.layerCount() != config_.num_layers ||
-            ownership.expertCount() != config_.num_experts ||
-            ownership.participantCount() != num_sockets)
+            (scalar && (num_sockets <= 0 || scalar->firstModelLayer() != firstModelLayer() ||
+                scalar->layerCount() != config_.num_layers || scalar->expertCount() != config_.num_experts ||
+                scalar->participantCount() != num_sockets)))
         {
             return stats;
         }
@@ -1565,17 +1685,29 @@ namespace llaminar2
         double spread_sum = 0.0;
         for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
         {
-            std::vector<uint64_t> loads(static_cast<size_t>(num_sockets), 0);
+            std::vector<uint64_t> loads;
             uint64_t layer_total = 0;
             const auto &layer = bank.layers[storageIndexForModelLayer(layer_idx)];
-            for (int expert_id = 0; expert_id < config_.num_experts; ++expert_id)
+            if (complete)
             {
-                const int socket = ownership.owner(layer_idx, expert_id);
-
-                const uint64_t count =
-                    layer.expert_counts[static_cast<size_t>(expert_id)].load(std::memory_order_relaxed);
-                loads[static_cast<size_t>(socket)] += count;
-                layer_total += count;
+                const auto targets = completeTargetLoads(*complete, layer_idx, config_.num_experts, [&](int expert) {
+                    return layer.expert_counts[expert].load(std::memory_order_relaxed);
+                });
+                for (const auto &target : targets)
+                {
+                    loads.push_back(target.activations);
+                    layer_total += target.activations;
+                }
+            }
+            else
+            {
+                loads.assign(static_cast<size_t>(num_sockets), 0);
+                for (int expert = 0; expert < config_.num_experts; ++expert)
+                {
+                    const auto count = layer.expert_counts[expert].load(std::memory_order_relaxed);
+                    loads[scalar->owner(layer_idx, expert)] += count;
+                    layer_total += count;
+                }
             }
 
             if (layer_total == 0)
@@ -1641,7 +1773,7 @@ namespace llaminar2
     ExpertLoadImbalanceStats DecodeExpertHistogram::currentPlacementImbalance() const
     {
         std::lock_guard<std::mutex> lock(ownership_mutex_);
-        return placementImbalance(ownership_);
+        return placementImbalanceImpl(placement_ownership_ ? nullptr : &ownership_, placement_ownership_.get());
     }
 
     uint64_t DecodeExpertHistogram::windowTokenCount() const
@@ -1825,6 +1957,7 @@ namespace llaminar2
     void DecodeExpertHistogram::updateOwnership(
         const MoELayeredExpertOwnership &ownership)
     {
+        if (placementOwnership()) throw std::logic_error("Scalar ownership publication rejects complete placement ownership");
         if (ownership.firstModelLayer() != firstModelLayer() ||
             ownership.layerCount() != config_.num_layers ||
             ownership.expertCount() != config_.num_experts ||
@@ -1874,6 +2007,19 @@ namespace llaminar2
         }
         ss << "]";
 
+        if (placementOwnership())
+        {
+            const auto loads = targetLoads(layer_idx);
+            ss << ", target_loads=[";
+            for (size_t i = 0; i < loads.size(); ++i)
+            {
+                if (i)
+                    ss << ", ";
+                ss << loads[i].target.word() << ":" << loads[i].activations;
+            }
+            ss << "]";
+            return ss.str();
+        }
         auto loads = socketLoads(layer_idx);
         ss << ", socket_loads=[";
         for (size_t i = 0; i < loads.size(); ++i)

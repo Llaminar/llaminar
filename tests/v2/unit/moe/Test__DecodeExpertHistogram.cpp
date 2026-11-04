@@ -1650,3 +1650,5 @@ TEST(Test__DecodeExpertHistogram, PipelineStageTopologySeparatesMainLayersAndTai
     EXPECT_THROW((void)ExpertHistogramProductionTopology::forRetainedExecution(
         4, 4, static_cast<ExpertHistogramServingRegime>(255)), std::invalid_argument);
 }
+
+#include "CPUJointHistogramOwnershipReplay.inc"

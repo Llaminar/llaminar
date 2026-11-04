@@ -25284,6 +25284,8 @@ add_v2_test(V2_Unit_DecodeExpertHistogram
     LABELS "V2;Unit;MoE;Histogram;DecodeTracking;DynamicPlacement"
 )
 
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2TypedHistogramOwnershipTests.cmake)
+
 # RCU retirement and transport bind one compact pipeline-stage interval.
 add_v2_test(V2_Integration_MoEPipelineStageHistogram
     COMMAND $<TARGET_FILE:v2_test_decode_expert_histogram>
