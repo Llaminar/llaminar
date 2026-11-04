@@ -2176,9 +2176,11 @@ TEST_F(Test__VnniRepackKernels, IQ2_S_SourceFactorsAndPayloadPreserveOffsetsAndT
  * @test MXFP4 17-byte source blocks repack exactly, at unaligned source offsets.
  *
  * Every exact-FP16 exponent (104..143), every 4-bit code, and ggml all-zero
- * blocks with e = 0 and e = 255 (prepared with scale +0) appear. Two chunks
- * write one block-major destination at nonzero row origins; guard rows must
- * keep their sentinel bytes, and a repeated submission must be idempotent.
+ * blocks with e = 0 and e = 255 (prepared with scale +0) appear. Chunks write
+ * one block-major destination at nonzero row origins and guard rows keep their
+ * sentinel bytes. A second pass re-poisons the destination, flips which blocks
+ * are zero (nonzero <-> zero) and uses a different chunk split; each pass is
+ * verified independently, so a first-call defect cannot hide behind a replay.
  */
 TEST_F(Test__VnniRepackKernels, MXFP4_ExactScalesCodesZeroBlocksOffsetsAndReplay)
 {
@@ -2188,68 +2190,86 @@ TEST_F(Test__VnniRepackKernels, MXFP4_ExactScalesCodesZeroBlocksOffsetsAndReplay
     constexpr int blocks_per_row = K / 32;
     constexpr size_t kBlock = llaminar2::mxfp4::kSourceBlockBytes;
     const size_t source_blocks = static_cast<size_t>(source_first + N + 2) * blocks_per_row;
-    std::vector<uint8_t> original(source_blocks * kBlock);
-    for (size_t index = 0; index < source_blocks; ++index)
-    {
-        uint8_t *block = original.data() + index * kBlock;
-        block[0] = static_cast<uint8_t>(llaminar2::mxfp4::kMinExactFP16Exponent + index % 40);
-        for (int byte = 0; byte < 16; ++byte)
-            block[1 + byte] = static_cast<uint8_t>((index * 16 + byte) * 37u);
-        if (index % 11 == 4 || index % 11 == 9)
-        {
-            block[0] = index % 11 == 4 ? 0 : 255;
-            std::memset(block + 1, index % 2 ? 0x88 : 0x00, 16);
-        }
-    }
     const size_t count = static_cast<size_t>(output_N) * blocks_per_row;
+    auto make_source = [&](int pass)
+    {
+        std::vector<uint8_t> original(source_blocks * kBlock);
+        for (size_t index = 0; index < source_blocks; ++index)
+        {
+            uint8_t *block = original.data() + index * kBlock;
+            block[0] = static_cast<uint8_t>(llaminar2::mxfp4::kMinExactFP16Exponent + (index + pass * 7) % 40);
+            for (int byte = 0; byte < 16; ++byte)
+                block[1 + byte] = static_cast<uint8_t>((index * 16 + byte) * 37u + pass * 11u);
+            // Pass 0 and pass 1 zero disjoint block sets.
+            const size_t phase = (index + pass * 5) % 11;
+            if (phase == 4 || phase == 9)
+            {
+                block[0] = phase == 4 ? 0 : 255;
+                std::memset(block + 1, index % 2 ? 0x88 : 0x00, 16);
+            }
+        }
+        return original;
+    };
     // The device source is the unaligned byte stream itself (no 18-byte struct).
-    GpuBuffer<uint8_t> d_source(original.size());
+    GpuBuffer<uint8_t> d_source(source_blocks * kBlock);
     GpuBuffer<uint8_t> d_payload(count * 16);
     GpuBuffer<uint16_t> d_scales(count);
-    std::vector<uint8_t> payload(count * 16);
-    std::vector<uint16_t> scales(count);
     Q6RepackObservationJoin observation(hip_stream_);
-    ASSERT_EQ(hipMemcpyAsync(d_source.ptr, original.data(), original.size(),
-        hipMemcpyHostToDevice, hip_stream_), hipSuccess);
-    ASSERT_EQ(hipMemsetAsync(d_payload.ptr, 0x5a, count * 16, hip_stream_), hipSuccess);
-    ASSERT_EQ(hipMemsetAsync(d_scales.ptr, 0x5a, count * sizeof(uint16_t), hip_stream_), hipSuccess);
-    constexpr int first_count = 31;
-    for (int replay = 0; replay < 2; ++replay)
-        for (const int begin : {0, first_count})
+    std::vector<uint8_t> previous;
+    for (const int pass : {0, 1})
+    {
+        SCOPED_TRACE(::testing::Message() << "pass=" << pass);
+        const auto original = make_source(pass);
+        ASSERT_EQ(hipMemcpyAsync(d_source.ptr, original.data(), original.size(),
+            hipMemcpyHostToDevice, hip_stream_), hipSuccess);
+        ASSERT_EQ(hipMemsetAsync(d_payload.ptr, 0x5a, count * 16, hip_stream_), hipSuccess);
+        ASSERT_EQ(hipMemsetAsync(d_scales.ptr, 0x5a, count * sizeof(uint16_t), hip_stream_), hipSuccess);
+        const int split = pass == 0 ? 31 : 17;
+        for (const int begin : {0, split})
         {
-            const int rows = begin == 0 ? first_count : N - first_count;
+            const int rows = begin == 0 ? split : N - split;
             ASSERT_TRUE(launchVnniRepack(RepackFormat::MXFP4,
                 d_source.ptr + static_cast<size_t>(source_first + begin) * blocks_per_row * kBlock,
                 d_payload.ptr, d_scales.ptr, nullptr, nullptr,
                 rows, K, output_N, output_first + begin, producerStream()));
         }
-    ASSERT_EQ(hipMemcpyAsync(payload.data(), d_payload.ptr, payload.size(),
-        hipMemcpyDeviceToHost, hip_stream_), hipSuccess);
-    ASSERT_EQ(hipMemcpyAsync(scales.data(), d_scales.ptr, count * sizeof(uint16_t),
-        hipMemcpyDeviceToHost, hip_stream_), hipSuccess);
-    ASSERT_EQ(hipStreamSynchronize(hip_stream_), hipSuccess);
-    size_t zero_blocks = 0;
-    for (int block = 0; block < blocks_per_row; ++block)
-        for (int row = 0; row < output_N; ++row)
-        {
-            const size_t at = static_cast<size_t>(block) * output_N + row;
-            SCOPED_TRACE(::testing::Message() << "block=" << block << " row=" << row);
-            if (row < output_first || row >= output_first + N)
+        std::vector<uint8_t> payload(count * 16);
+        std::vector<uint16_t> scales(count);
+        ASSERT_EQ(hipMemcpyAsync(payload.data(), d_payload.ptr, payload.size(),
+            hipMemcpyDeviceToHost, hip_stream_), hipSuccess);
+        ASSERT_EQ(hipMemcpyAsync(scales.data(), d_scales.ptr, count * sizeof(uint16_t),
+            hipMemcpyDeviceToHost, hip_stream_), hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(hip_stream_), hipSuccess);
+        size_t zero_blocks = 0, flipped_to_zero = 0;
+        for (int block = 0; block < blocks_per_row; ++block)
+            for (int row = 0; row < output_N; ++row)
             {
-                EXPECT_EQ(scales[at], 0x5a5a);
-                for (int byte = 0; byte < 16; ++byte)
-                    EXPECT_EQ(payload[at * 16 + byte], 0x5a);
-                continue;
+                const size_t at = static_cast<size_t>(block) * output_N + row;
+                SCOPED_TRACE(::testing::Message() << "block=" << block << " row=" << row);
+                if (row < output_first || row >= output_first + N)
+                {
+                    EXPECT_EQ(scales[at], 0x5a5a);
+                    for (int byte = 0; byte < 16; ++byte)
+                        EXPECT_EQ(payload[at * 16 + byte], 0x5a);
+                    continue;
+                }
+                const size_t source_offset =
+                    (static_cast<size_t>(source_first + row - output_first) * blocks_per_row + block) * kBlock;
+                const uint8_t *source = original.data() + source_offset;
+                ASSERT_TRUE(llaminar2::mxfp4::blockFitsFP16(source[0], source + 1));
+                const bool exact = llaminar2::mxfp4::exponentFitsFP16(source[0]);
+                zero_blocks += exact ? 0u : 1u;
+                if (!exact && !previous.empty() &&
+                    llaminar2::mxfp4::exponentFitsFP16(previous[source_offset]))
+                    ++flipped_to_zero;
+                EXPECT_EQ(scales[at], exact ? llaminar2::mxfp4::scaleFP16Bits(source[0]) : uint16_t{0});
+                EXPECT_EQ(std::memcmp(payload.data() + at * 16, source + 1, 16), 0);
             }
-            const uint8_t *source = original.data() +
-                (static_cast<size_t>(source_first + row - output_first) * blocks_per_row + block) * kBlock;
-            ASSERT_TRUE(llaminar2::mxfp4::blockFitsFP16(source[0], source + 1));
-            const bool exact = llaminar2::mxfp4::exponentFitsFP16(source[0]);
-            zero_blocks += exact ? 0u : 1u;
-            EXPECT_EQ(scales[at], exact ? llaminar2::mxfp4::scaleFP16Bits(source[0]) : uint16_t{0});
-            EXPECT_EQ(std::memcmp(payload.data() + at * 16, source + 1, 16), 0);
-        }
-    EXPECT_GT(zero_blocks, 0u) << "fixture must exercise ggml zero blocks";
+        EXPECT_GT(zero_blocks, 0u) << "fixture must exercise ggml zero blocks";
+        if (pass == 1)
+            EXPECT_GT(flipped_to_zero, 0u) << "replay must turn previously nonzero blocks into zero blocks";
+        previous = original;
+    }
 #endif
 }
 
