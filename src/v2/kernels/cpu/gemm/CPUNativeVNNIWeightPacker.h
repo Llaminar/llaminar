@@ -60,6 +60,7 @@
 #include "tensors/NativeVnniQ6Scale.h"
 #include "tensors/NativeVnniIQ2SScale.h"
 #include "tensors/NativeVnniIQ4XSScale.h"
+#include "tensors/MXFP4Format.h"
 #include "tensors/NativeVnniIQ3SScale.h"
 #include "kernels/common/DeviceFP32NumericalContract.h"
 #include "utils/Logger.h"
@@ -194,6 +195,7 @@ namespace llaminar2::cpu::native_vnni
         case 19: return 34;  // Q8_0Block
         case 20: return 36;  // Q8_1Block
         case 21: return sizeof(Q8_KBlock); // Original FP32-scale Q8_K source block
+        case kNativeVnniMXFP4Codebook: return sizeof(MXFP4Block); // E8M0 + 16 code bytes
         default: return 0;
         }
     }
@@ -658,7 +660,9 @@ namespace llaminar2::cpu::native_vnni
             // ---------------------------------------------------------------
             const int pb = meta.payload_bytes;
             // Payload offset within native block (after scale, optionally after min)
-            const int payload_offset = (codebook_id == 5) ? 4 : 2; // Q4_1=4, others=2
+            // MXFP4 stores one E8M0 byte before its codes; Q4_1 a half scale and min.
+            const bool mxfp4_source = codebook_id == kNativeVnniMXFP4Codebook;
+            const int payload_offset = mxfp4_source ? 1 : ((codebook_id == 5) ? 4 : 2); // Q4_1=4, others=2
 
 #pragma omp parallel for schedule(static) collapse(2)
             for (int chunk = 0; chunk < N_chunks; ++chunk)
@@ -689,7 +693,15 @@ namespace llaminar2::cpu::native_vnni
                         int row = chunk * 64 + col;
                         const uint8_t *blk = native_blocks + row * native_row_stride + kb * block_size;
 
-                        std::memcpy(&scales_buf[col], blk, 2);
+                        if (mxfp4_source)
+                        {
+                            if (!mxfp4::exponentFitsFP16(blk[0]))
+                                throw std::invalid_argument(
+                                    "MXFP4 block exponent has no exact FP16 scale; refusing lossy repack");
+                            scales_buf[col] = mxfp4::scaleFP16Bits(blk[0]);
+                        }
+                        else
+                            std::memcpy(&scales_buf[col], blk, 2);
                         if (codebook_id == 5)
                             std::memcpy(&mins_buf[col], blk + 2, 2);
                         std::memcpy(payload_buf + col * pb, blk + payload_offset, pb);

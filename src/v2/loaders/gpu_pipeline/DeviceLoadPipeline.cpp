@@ -7,6 +7,7 @@
  * mapped GGUF lifetime until all staging work has completed.
  */
 
+#include "tensors/MXFP4Format.h"
 #include "loaders/gpu_pipeline/DeviceLoadPipeline.h"
 #include "loaders/gpu_pipeline/WeightVRAMPool.h"
 #include "loaders/gpu_pipeline/PinnedRingBuffer.h"
@@ -591,6 +592,23 @@ namespace llaminar2
                                 std::memcpy(destination, job.host_raw_data, job.raw_bytes);
                                 result.payload = destination;
                             }
+                            if (result.error.empty() && job.format == RepackFormat::MXFP4)
+                            {
+                                // The repack kernel stores 2^(e-128) as FP16. Validate every
+                                // exponent here, on the reader thread, so an unrepresentable
+                                // scale fails the load instead of being rounded on device.
+                                const auto *bytes = static_cast<const uint8_t *>(result.payload);
+                                for (size_t offset = 0; offset < job.raw_bytes;
+                                     offset += mxfp4::kSourceBlockBytes)
+                                {
+                                    if (!mxfp4::exponentFitsFP16(bytes[offset]))
+                                    {
+                                        result.error = "MXFP4 block exponent " + std::to_string(bytes[offset]) +
+                                                       " in '" + job.name + "' has no exact FP16 scale";
+                                        break;
+                                    }
+                                }
+                            }
                         }
                         result.read_ms =
                             std::chrono::duration<double, std::milli>(
@@ -664,6 +682,8 @@ namespace llaminar2
                 return "IQ1_S";
             case RepackFormat::IQ1_M:
                 return "IQ1_M";
+            case RepackFormat::MXFP4:
+                return "MXFP4";
             case RepackFormat::RAW_FP:
                 return "RAW_FP";
             default:
@@ -775,6 +795,18 @@ namespace llaminar2
         {
             LOG_ERROR("DeviceLoadPipeline: setDevice(" << device_id_ << ") failed");
             return false;
+        }
+
+        if (backend_.backendDeviceType() == DeviceType::ROCm)
+        {
+            for (const auto &job : jobs)
+            {
+                if (job.format == RepackFormat::MXFP4)
+                {
+                    LOG_ERROR("DeviceLoadPipeline: MXFP4: ROCm unimplemented (weight '" << job.name << "')");
+                    return false;
+                }
+            }
         }
 
         const size_t max_staging = pool_.maxStagingSlotBytes();

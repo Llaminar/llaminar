@@ -40,6 +40,7 @@ enum class RepackFormat : uint8_t {
     Q8_0    = 18,  ///< Symmetric 8-bit (32-element blocks, 34 bytes)
     Q8_1    = 19,  ///< Symmetric 8-bit plus precomputed sum (32-element blocks, 36 bytes)
     Q8_K    = 20,  ///< FP32-scaled signed 8-bit K-quant (256-element source blocks, 292 bytes)
+    MXFP4   = 21,  ///< OCP MXFP4 (32-element blocks, 17 bytes: E8M0 + FP4 codes)
     RAW_FP  = 255, ///< Floating-point passthrough (no repack, direct H2D copy)
 };
 
@@ -62,6 +63,7 @@ enum class RepackFormat : uint8_t {
     case RepackFormat::Q4_1:
     case RepackFormat::Q4_K:
     case RepackFormat::IQ4_XS:
+    case RepackFormat::MXFP4:
         return 16;
     case RepackFormat::Q5_0:
     case RepackFormat::Q5_1:
@@ -129,6 +131,7 @@ inline std::optional<RepackFormat> codebookIdToRepackFormat(uint8_t codebook_id,
         case 7:  return RepackFormat::Q5_1;
         case 19: return RepackFormat::Q8_0;
         case 20: return RepackFormat::Q8_1;
+        case kNativeVnniMXFP4Codebook: return RepackFormat::MXFP4;
         default: return std::nullopt;
         }
     } else {

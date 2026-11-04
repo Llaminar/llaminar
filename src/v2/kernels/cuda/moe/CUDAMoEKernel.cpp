@@ -940,6 +940,7 @@ namespace
         case 0:
         case 4:
         case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook:
+        case llaminar2::kNativeVnniMXFP4Codebook:
         case 5:
         case 6:
         case 7:

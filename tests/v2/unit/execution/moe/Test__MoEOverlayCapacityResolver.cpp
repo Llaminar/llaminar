@@ -195,7 +195,8 @@ namespace llaminar2
 
             if (format.codebook_id == 0 ||
                 format.codebook_id == 4 ||
-                format.codebook_id == 5)
+                format.codebook_id == 5 ||
+                format.codebook_id == kNativeVnniMXFP4Codebook)
             {
                 return 1024 + 256 + (format.is_asymmetric ? 128 : 0);
             }
@@ -258,7 +259,8 @@ namespace llaminar2
                 return 13; // Exact inverse preserves original signed-grid payload.
             if (format.codebook_id == 0 ||
                 format.codebook_id == 4 ||
-                format.codebook_id == 5)
+                format.codebook_id == 5 ||
+                format.codebook_id == kNativeVnniMXFP4Codebook)
             {
                 return 16;
             }
@@ -589,7 +591,7 @@ namespace llaminar2
 
     TEST(MoEOverlayCapacityResolver, EveryCataloguedCodebookHasExactCpuAndGpuFootprint)
     {
-        ASSERT_EQ(native_vnni_formats::kAllSourceFormats.size(), 21u);
+        ASSERT_EQ(native_vnni_formats::kAllSourceFormats.size(), 22u);
         for (const auto &source : native_vnni_formats::kAllSourceFormats)
         {
             SCOPED_TRACE(::testing::Message() << source.quant_type);

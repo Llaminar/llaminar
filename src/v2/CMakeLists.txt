@@ -1983,6 +1983,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     tensors/TensorFactory.cpp
     tensors/GPUTensorVerification.cpp
     tensors/IQ4_NLTensor.cpp
+    tensors/MXFP4Tensor.cpp
     # Simple quantization formats (Q8_0, Q8_1, Q16_1, Q4_0, Q4_1, Q5_0, Q5_1)
     tensors/Q8_0Tensor.cpp
     tensors/Q8_1Tensor.cpp

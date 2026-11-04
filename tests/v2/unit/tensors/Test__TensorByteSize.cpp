@@ -153,7 +153,7 @@ void proveNativeRowViewExtent(const char *label)
 /** @test Every source format retains each row's padded block through nested views. */
 TEST(NativeTensorExtent, RowPaddedAllFormatsNestedViewsKeepIndependentSourceStrides)
 {
-    ASSERT_EQ(native_vnni_formats::kAllSourceFormats.size(), 21u);
+    ASSERT_EQ(native_vnni_formats::kAllSourceFormats.size(), 22u);
     proveNativeRowViewExtent<Q4_0Tensor, Q4_0Block>("Q4_0");
     proveNativeRowViewExtent<IQ4_NLTensor, IQ4_NLBlock>("IQ4_NL");
     proveNativeRowViewExtent<IQ4_XSTensor, IQ4_XSBlock>("IQ4_XS");
@@ -175,6 +175,7 @@ TEST(NativeTensorExtent, RowPaddedAllFormatsNestedViewsKeepIndependentSourceStri
     proveNativeRowViewExtent<Q8_0Tensor, Q8_0Block>("Q8_0");
     proveNativeRowViewExtent<Q8_1Tensor, Q8_1Block>("Q8_1");
     proveNativeRowViewExtent<Q8_KTensor, Q8_KBlock>("Q8_K");
+    proveNativeRowViewExtent<MXFP4Tensor, MXFP4Block>("MXFP4");
 }
 
 /** @test Q4_0 reports authoritative owned/mmap bytes and complete borrowed rows. */

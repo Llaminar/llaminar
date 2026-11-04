@@ -328,7 +328,7 @@ TEST_F(Test__CPUEmbeddingGroupedVerifier, NestedSlicesMatchUnwrappedSourceBytes)
 TEST_F(Test__CPUEmbeddingGroupedVerifier,
        CanonicalQuantizedRegistryMatchesTensorAndDevicePackingContracts)
 {
-    constexpr size_t expected_quantized_formats = 21;
+    constexpr size_t expected_quantized_formats = 22;
     ASSERT_EQ(quantizedVerifierFormats().size(), expected_quantized_formats);
     ASSERT_EQ(
         embeddingVerifierFormats().size(),
