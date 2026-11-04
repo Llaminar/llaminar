@@ -23970,6 +23970,15 @@ add_v2_test(V2_Integration_ROCmIQ2SFusedMoEOriginalEquation
         LABELS "V2;Integration;ROCm;MoE;Routing;Gather;Scatter;gfx906"
         MPI_PROCS 1
     )
+    # MXFP4: physical decoder 25 under the IQ4_NL (4) arithmetic policy.
+    # IQ4_NL shares MXFP4's arithmetic policy and the same runtime-table
+    # kernels; running it alongside separates format from path defects.
+    add_v2_test(V2_Integration_ROCm_MoEMXFP4GroupedDecodePolicy
+        COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
+                --gtest_filter=Test__ROCmMoEKernel.GroupedExpertGateUpDecode_IQ4_NLMatchesSerialDecodeBytes:Test__ROCmMoEKernel.GroupedExpertGateUpDecode_MXFP4MatchesSerialDecodeBytes
+                --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;MXFP4;DecodeEquivalent;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 60)
     add_v2_test(V2_Integration_ROCm_MoEColdGroupedVerifierPublisherReplay
         COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
                 --gtest_filter=Test__ROCmMoEKernel.ColdGroupedVerifierPublisherCapturesWithoutComputeStream
