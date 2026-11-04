@@ -12,6 +12,11 @@
 #include "MoEOverlayEconomyProfileComposer.h"
 
 #include "MoEOverlayEconomyCalibrationPlanner.h"
+#include "MoEOverlayPreparedTargetService.h"
+#include "MoEOverlayCPUServiceMeasurement.h"
+#include "MoEExpertShardCohort.h"
+#include <map>
+#include <set>
 #include "../../utils/FNV1a.h"
 
 #include <algorithm>
@@ -759,11 +764,11 @@ namespace llaminar2
             std::make_shared<MoERoutedTierServiceProfile>();
         service_profile->production_topology =
             measurements.production_topology;
-        service_profile->participant_costs.reserve(expected_service_rows);
+        service_profile->target_costs.reserve(expected_service_rows);
         for (const auto &row : measurements.participant_service)
         {
-            service_profile->participant_costs.push_back({
-                .participant_id = row.participant_id,
+            service_profile->target_costs.push_back({
+                .target = MoEOverlayRouteTarget::whole(row.participant_id),
                 .layer = row.layer,
                 .nanoseconds_per_activation =
                     row.nanoseconds_per_activation,
@@ -999,8 +1004,7 @@ namespace llaminar2
             std::make_shared<MoEOverlayMigrationCostProfile>();
         migration_profile->identity =
             profileIdentity("migration", migration_hash);
-        migration_profile->costs =
-            std::move(measurements.directed_migration);
+        migration_profile->setWholeCosts(measurements.directed_migration);
 
         MoEOverlayCertifiedEconomyProfiles result{
             .service = std::move(service_profile),
@@ -1012,6 +1016,279 @@ namespace llaminar2
             throw std::logic_error(
                 "ExpertOverlay economy composer produced an invalid immutable profile bundle");
         }
+        return result;
+    }
+
+    namespace {
+        /** @brief Resolve one actual original execution vertex without fabricating a member owner.
+         * @param map Original checked placement. @param key Original target/layer.
+         * @return Exact cohort, or null for a declared whole target.
+         */
+        std::shared_ptr<const MoEExpertShardCohort> preparedServiceCohort(
+            const MoEExpertOwnerMap& map,MoEOverlayTargetServiceCoordinate key)
+        {
+            if(!key.target.isCPUCohort())return {};
+            const int tier=-int64_t(key.target.word())-2;
+            for(const auto& owner:map.owners())
+                if(owner.layer_idx==key.layer && owner.tier_idx==tier && owner.shard_cohort)
+                    return owner.shard_cohort;
+            throw std::invalid_argument("Prepared service target has no original source-bound cohort");
+        }
+        /** @brief Select the deterministic actual resident on one original target/layer.
+         * @param map Original immutable placement, never a synthetic candidate.
+         * @param key Exact complete target and source layer.
+         * @return Lowest resident global expert ID, or -1 when this layer has no source.
+         */
+        int preparedServiceResidentExpert(const MoEExpertOwnerMap& map,
+            MoEOverlayTargetServiceCoordinate key)
+        {
+            int selected=-1;
+            for(const auto& owner:map.owners())
+                if(owner.layer_idx==key.layer &&
+                    (key.target.isCPUCohort()?owner.shard_cohort &&
+                        owner.tier_idx==-int64_t(key.target.word())-2:
+                        !owner.shard_cohort && owner.owner_participant==key.target.word()))
+                    if(selected<0 || owner.expert_id<selected)selected=owner.expert_id;
+            return selected;
+        }
+        /** @brief Compare fixed member/cut geometry inside an already exact source-format catalog class.
+         * @param a Original first layer cohort. @param b Original second layer cohort.
+         * @return Whether one real prepared sample may price both declarations.
+         */
+        bool samePreparedServiceCuts(const std::shared_ptr<const MoEExpertShardCohort>& a,
+            const std::shared_ptr<const MoEExpertShardCohort>& b)
+        {
+            if(!a || !b)return !a && !b;
+            if(!std::equal(a->participants().begin(),a->participants().end(),b->participants().begin(),b->participants().end()))return false;
+            for(size_t member=0;member<a->participants().size();++member)
+                if(a->ownership(member)!=b->ownership(member))return false;
+            return true;
+        }
+    }
+
+    const ExpertHistogramProductionTopology& MoEOverlayPreparedTargetServicePlan::topology() const noexcept
+    {return *topology_;}
+
+    const MoEOverlayPreparedTargetServicePlan::Entry& MoEOverlayPreparedTargetServicePlan::entry(
+        MoEOverlayTargetServiceCoordinate coordinate) const
+    {
+        const auto found=std::lower_bound(entries_.begin(),entries_.end(),coordinate,
+            [](const auto& entry,const auto& key){return entry.coordinate<key;});
+        if(found==entries_.end() || found->coordinate!=coordinate)
+            throw std::invalid_argument("Prepared service coordinate is outside original target declarations");
+        return *found;
+    }
+
+    std::shared_ptr<const MoEExpertShardCohort> MoEOverlayPreparedTargetServicePlan::cohort(const Entry& value) const
+    {return preparedServiceCohort(snapshot_->placementOwnerMap(),entry(value.coordinate).coordinate);}
+
+    std::shared_ptr<const MoEOverlayPreparedTargetServicePlan> MoEOverlayPreparedTargetServicePlan::checked(
+        std::shared_ptr<const MoEOverlayResidencySnapshot> snapshot,
+        std::shared_ptr<const MoEOverlayEconomyCalibrationLayerCatalog> catalog,
+        const ExpertHistogramProductionTopology& topology)
+    {
+        if(!snapshot || !snapshot->valid() || !catalog || !topology.valid() ||
+            snapshot->firstModelLayer()!=catalog->firstModelLayer() ||
+            snapshot->layerCount()!=int(catalog->layerCount()) ||
+            topology.firstModelLayer()!=catalog->firstModelLayer() || topology.layerCount()!=catalog->layerCount())
+            throw std::invalid_argument("Prepared service requires original sealed source/catalog/phase geometry");
+        const auto& map=snapshot->placementOwnerMap();
+        std::vector<Entry> entries;
+        const auto phaseSource=[](size_t phase){
+            return phase==0?ExpertHistogramSource::DecodeToken:phase==1?ExpertHistogramSource::PrefillChunk:
+                ExpertHistogramSource::GroupedVerifier;
+        };
+        for(int layer=snapshot->firstModelLayer();layer<snapshot->firstModelLayer()+snapshot->layerCount();++layer) {
+            std::map<int,std::pair<int,std::vector<const MoEExpertOwnerParticipant*>>> targets;
+            std::set<int> fragment_ids;
+            for(const auto& owner:map.owners())if(owner.layer_idx==layer && owner.shard_cohort) {
+                const auto target=MoEOverlayRouteTarget::cpuCohort(owner.tier_idx);
+                auto& descriptor=targets[target.word()];descriptor.first=owner.tier_idx;
+                if(descriptor.second.empty())for(const auto& member:owner.shard_cohort->participants()) {
+                    const auto* actual=map.participantForId(member.participant_id);
+                    if(!actual || !actual->world_rank_known || actual->world_rank!=member.world_rank ||
+                        actual->address!=member.address || !actual->device.is_cpu())
+                        throw std::invalid_argument("Prepared service cohort differs from original member inventory");
+                    descriptor.second.push_back(actual);fragment_ids.insert(actual->participant_id);
+                }
+            }
+            for(const auto& member:map.participants())if(!fragment_ids.contains(member.participant_id)) {
+                if(!member.world_rank_known || member.world_rank<0)
+                    throw std::invalid_argument("Prepared service whole target has no original root rank");
+                // A declared joint tier cannot be silently projected as whole when
+                // its initial source/cuts are absent. No cohort is rebuilt from quota.
+                const auto domain=std::find_if(snapshot->placement_plan->domains.begin(),snapshot->placement_plan->domains.end(),
+                    [&](const auto& value){return value.name==member.domain_name;});
+                if(domain!=snapshot->placement_plan->domains.end() && member.device.is_cpu() &&
+                    domain->routed_compute_policy==RoutedExpertComputePolicy::TensorSharded && domain->participants.size()>1)
+                    throw std::invalid_argument("Prepared service joint tier lacks original cohort source geometry");
+                targets.emplace(MoEOverlayRouteTarget::whole(member.participant_id).word(),
+                    std::pair{member.tier_idx,std::vector<const MoEExpertOwnerParticipant*>{&member}});
+            }
+            if(targets.empty())throw std::invalid_argument("Prepared service has no original execution targets");
+            // A completed cohort is one concurrent execution vertex. Existing
+            // scheduling has not certified overlapping vertices as independent;
+            // reject only this NEW profile, preserving legacy whole behavior.
+            for(auto a=targets.begin();a!=targets.end();++a)for(auto b=std::next(a);b!=targets.end();++b)
+                for(const auto* left:a->second.second)for(const auto* right:b->second.second) {
+                    const auto& x=left->address;const auto& y=right->address;
+                    if(x.device_type==y.device_type && x.device_ordinal==y.device_ordinal &&
+                        (!x.isCPU() || x.numa_node==y.numa_node) &&
+                        (left->world_rank==right->world_rank || x.hostname==y.hostname))
+                        throw std::invalid_argument("Prepared target economy does not certify overlapping physical execution targets");
+                }
+            for(const auto& [word,descriptor]:targets) {
+                Entry entry{.coordinate={MoEOverlayRouteTarget::fromWord(word),layer},.tier=descriptor.first,
+                    .root_world_rank=descriptor.second.front()->world_rank,
+                    .measured_invocations=MoEOverlayCPUServiceMeasurement::kMeasuredSamples};
+                entry.sample_layers.fill(-1);
+                for(size_t phase=0;phase<kExpertHistogramProductionSourceCount;++phase)
+                    if(topology.requiresServiceEvidence(layer,phase)) {
+                        // Pool only exact source classes AND original fixed cuts.
+                        // Different cuts remain separate sampled declarations. A
+                        // class member without an actual target resident cannot
+                        // supply a prepared sample; inspect the SAME original
+                        // placement before accepting its equivalent source layer.
+                        const auto group=std::find_if(catalog->groups().begin(),catalog->groups().end(),
+                            [&](const auto& g){return std::binary_search(g.member_layers.begin(),g.member_layers.end(),layer);});
+                        if(group==catalog->groups().end())throw std::invalid_argument("Prepared service omitted an original source class");
+                        for(int candidate:group->member_layers)if(topology.requiresServiceEvidence(candidate,phase) &&
+                            preparedServiceResidentExpert(map,{entry.coordinate.target,candidate})>=0 &&
+                            samePreparedServiceCuts(preparedServiceCohort(map,entry.coordinate),
+                                preparedServiceCohort(map,{entry.coordinate.target,candidate}))) {
+                            entry.sample_layers[phase]=candidate;break;
+                        }
+                        if(entry.sample_layers[phase]<0)throw std::invalid_argument("Prepared service has no exact phase sample layer");
+                        entry.sample_rows[phase]=MoEOverlayCPUServiceMeasurement::rowsForPhase(phaseSource(phase));
+                    }
+                entries.push_back(entry);
+            }
+        }
+        std::sort(entries.begin(),entries.end(),[](const auto& a,const auto& b){return a.coordinate<b.coordinate;});
+        uint64_t hash=kFNV1a64OffsetBasis;hashString(hash,"PreparedTargetInputReadyCanonicalOutput/v1");
+        hashString(hash,catalog->identity());
+        for(const auto& entry:entries) {
+            hashUnsigned(hash,uint64_t(int64_t(entry.coordinate.target.word())));hashUnsigned(hash,entry.coordinate.layer);
+            hashUnsigned(hash,entry.tier);hashUnsigned(hash,entry.root_world_rank);
+            for(size_t phase=0;phase<kExpertHistogramProductionSourceCount;++phase) {
+                hashUnsigned(hash,uint64_t(int64_t(entry.sample_layers[phase])));hashUnsigned(hash,entry.sample_rows[phase]);
+            }
+            const auto cohort=preparedServiceCohort(map,entry.coordinate);
+            if(cohort)for(size_t member=0;member<cohort->participants().size();++member) {
+                const auto& p=cohort->participants()[member];hashUnsigned(hash,p.participant_id);hashUnsigned(hash,p.world_rank);
+                hashString(hash,p.address.toString());
+                for(const auto role:{WeightRole::MoEExpertGate,WeightRole::MoEExpertUp,WeightRole::MoEExpertDown}) {
+                    const auto cut=cohort->ownership(member).projection(role);
+                    hashUnsigned(hash,cut.first_row);hashUnsigned(hash,cut.rows);hashUnsigned(hash,cut.first_column);hashUnsigned(hash,cut.columns);
+                }
+            }
+        }
+        std::ostringstream identity;identity<<"prepared_target_service_"<<std::hex<<hash;
+        auto original=std::shared_ptr<MoEOverlayPreparedTargetServicePlan>(new MoEOverlayPreparedTargetServicePlan(
+            std::move(snapshot),std::move(catalog),std::make_shared<const ExpertHistogramProductionTopology>(topology),
+            std::move(entries),identity.str()));
+        original->original_owner_=original;return original;
+    }
+
+    int MoEOverlayPreparedTargetServicePlan::sampleExpert(const Entry& value,size_t phase) const
+    {
+        const auto& declaration=entry(value.coordinate);
+        if(phase>=kExpertHistogramProductionSourceCount || declaration.sample_layers[phase]<0)
+            throw std::invalid_argument("Prepared service requested an undeclared phase job");
+        const int selected=preparedServiceResidentExpert(snapshot_->placementOwnerMap(),
+            {declaration.coordinate.target,declaration.sample_layers[phase]});
+        if(selected<0)throw std::invalid_argument("Prepared service target class has no actual original resident expert");
+        return selected;
+    }
+
+    void MoEOverlayPreparedTargetServicePlan::requireLocalSamples(
+        std::span<const MoEOverlayPreparedTargetServiceTotals> rows,int world_rank) const
+    {
+        if(world_rank<0)throw std::invalid_argument("Prepared service observer has no original rank");
+        std::set<MoEOverlayTargetServiceCoordinate> seen;
+        for(const auto& row:rows) {
+            const auto& declaration=entry(row.coordinate);
+            if(declaration.root_world_rank!=world_rank || !seen.insert(row.coordinate).second)
+                throw std::invalid_argument("Prepared service has duplicate or nonroot target samples");
+            bool live=false;
+            for(size_t phase=0;phase<kExpertHistogramProductionSourceCount;++phase) {
+                const bool required=declaration.sample_layers[phase]==row.coordinate.layer;
+                if(required) {
+                    const auto activations=declaration.sample_rows[phase]*declaration.measured_invocations;
+                    if(!row.total_nanoseconds[phase] || row.activation_count[phase]!=activations ||
+                        row.sample_count[phase]!=declaration.measured_invocations ||
+                        row.expert_ids[phase]!=sampleExpert(declaration,phase))
+                        throw std::invalid_argument("Prepared service root omitted its exact declared phase sample");
+                    live=true;
+                }else if(row.total_nanoseconds[phase] || row.activation_count[phase] || row.sample_count[phase] || row.expert_ids[phase]!=-1)
+                    throw std::invalid_argument("Prepared service sampled an undeclared class/layer/phase");
+            }
+            if(!live)throw std::invalid_argument("Prepared service payload carries an inactive layer row");
+        }
+        for(const auto& declaration:entries_)if(declaration.root_world_rank==world_rank &&
+            std::find(declaration.sample_layers.begin(),declaration.sample_layers.end(),declaration.coordinate.layer)!=declaration.sample_layers.end() &&
+            !seen.contains(declaration.coordinate))
+            throw std::invalid_argument("Prepared service observer omitted a required root sample row");
+    }
+
+    std::vector<MoERoutedTargetLayerPhaseServiceCost>
+    MoEOverlayEconomyProfileComposer::normalizePreparedService(
+        const MoEOverlayPreparedTargetServicePlan& plan,
+        std::span<const MoEOverlayPreparedTargetServiceTotals> samples)
+    {
+        std::map<int,std::vector<MoEOverlayPreparedTargetServiceTotals>> by_root;
+        for(const auto& entry:plan.entries())by_root.try_emplace(entry.root_world_rank);
+        for(const auto& row:samples)by_root.at(plan.entry(row.coordinate).root_world_rank).push_back(row);
+        for(const auto& [rank,rows]:by_root)plan.requireLocalSamples(rows,rank);
+        std::map<MoEOverlayTargetServiceCoordinate,const MoEOverlayPreparedTargetServiceTotals*> rows;
+        for(const auto& row:samples)if(!rows.emplace(row.coordinate,&row).second)
+            throw std::invalid_argument("Prepared target service repeats a complete root coordinate");
+        std::vector<MoERoutedTargetLayerPhaseServiceCost> result;result.reserve(plan.entries().size());
+        for(const auto& entry:plan.entries()) {
+            MoERoutedTargetLayerPhaseServiceCost price{entry.coordinate.target,entry.coordinate.layer,{}};
+            for(size_t phase=0;phase<kExpertHistogramProductionSourceCount;++phase)if(entry.sample_layers[phase]>=0) {
+                const auto* sample=rows.at({entry.coordinate.target,entry.sample_layers[phase]});
+                const auto count=sample->activation_count[phase],elapsed=sample->total_nanoseconds[phase];
+                price.nanoseconds_per_activation[phase]=elapsed/count+(elapsed%count!=0);
+                if(!price.nanoseconds_per_activation[phase])
+                    throw std::invalid_argument("Prepared target service has no positive normalized phase rate");
+            }
+            result.push_back(price);
+        }
+        return result;
+    }
+
+    std::shared_ptr<const MoERoutedTierServiceProfile>
+    MoEOverlayEconomyProfileComposer::composePreparedService(
+        std::shared_ptr<const MoEOverlayPreparedTargetServicePlan> plan,
+        std::span<const MoEOverlayPreparedTargetServiceTotals> samples)
+    {
+        if(!plan || !plan->authenticates(plan))throw std::invalid_argument("Prepared service composition requires original checked declaration ownership");
+        auto result=std::make_shared<MoERoutedTierServiceProfile>();
+        result->prepared_plan=plan;result->production_topology=plan->topology();
+        result->target_costs=normalizePreparedService(*plan,samples);
+        const auto tier_count=plan->snapshot()->placement_plan->routed_tiers.size();
+        for(size_t tier=0;tier<tier_count;++tier)
+            for(int layer=plan->snapshot()->firstModelLayer();layer<plan->snapshot()->firstModelLayer()+plan->snapshot()->layerCount();++layer) {
+                MoERoutedTierLayerPhaseServiceCost aggregate{int(tier),layer,{}};bool found=false;
+                for(const auto& price:result->target_costs)if(price.layer==layer &&
+                    plan->entry({price.target,layer}).tier==int(tier)) {
+                    found=true;
+                    for(size_t phase=0;phase<kExpertHistogramProductionSourceCount;++phase)
+                        aggregate.nanoseconds_per_activation[phase]=std::max(aggregate.nanoseconds_per_activation[phase],
+                            price.nanoseconds_per_activation[phase]);
+                }
+                if(!found)throw std::invalid_argument("Prepared service omitted an original tier/layer execution target");
+                // A cohort contributes exactly ONE already-complete price; max
+                // only aggregates alternative whole targets in the same tier.
+                result->costs.push_back(aggregate);
+            }
+        uint64_t hash=kFNV1a64OffsetBasis;hashString(hash,plan->identity());
+        for(const auto& row:result->target_costs) {
+            hashUnsigned(hash,uint64_t(int64_t(row.target.word())));hashUnsigned(hash,row.layer);
+            for(const auto price:row.nanoseconds_per_activation)hashUnsigned(hash,price);
+        }
+        result->identity=profileIdentity("prepared_target_service",hash);
         return result;
     }
 

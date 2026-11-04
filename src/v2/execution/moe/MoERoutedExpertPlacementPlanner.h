@@ -15,6 +15,10 @@
 
 #include "DecodeExpertHistogram.h"
 #include "MoERoutedExpertPlacementPlan.h"
+#include "MoEOverlayRouteTarget.h"
+#include <span>
+#include <memory>
+#include <stdexcept>
 
 #include <array>
 #include <cstddef>
@@ -154,6 +158,15 @@ namespace llaminar2
             nanoseconds_per_activation{};
     };
 
+    class MoEOverlayPreparedTargetServicePlan;
+    /** @brief One complete logical target's measured canonical-output service price. */
+    struct MoERoutedTargetLayerPhaseServiceCost
+    {
+        MoEOverlayRouteTarget target;
+        int layer=-1;
+        std::array<uint64_t,kExpertHistogramProductionSourceCount> nanoseconds_per_activation{};
+    };
+
     /**
      * @brief Complete immutable service profile consumed by tier assignment.
      *
@@ -170,8 +183,28 @@ namespace llaminar2
         /** Graph reachability and economy-priced subset for every layer. */
         ExpertHistogramProductionTopology production_topology;
         std::vector<MoERoutedTierLayerPhaseServiceCost> costs;
-        std::vector<MoERoutedParticipantLayerPhaseServiceCost>
-            participant_costs;
+        std::vector<MoERoutedTargetLayerPhaseServiceCost> target_costs;
+        /** Prepared-only metadata; absent retains the existing whole service contract. */
+        std::shared_ptr<const MoEOverlayPreparedTargetServicePlan> prepared_plan;
+        /** @brief Cold compatibility projection, never used per candidate or observation.
+         * @return Whole participant rows. @throws std::invalid_argument For any cohort. */
+        std::vector<MoERoutedParticipantLayerPhaseServiceCost> participantCosts() const {
+            std::vector<MoERoutedParticipantLayerPhaseServiceCost> result;result.reserve(target_costs.size());
+            for(const auto& row:target_costs) {
+                if(!row.target.isWhole())throw std::invalid_argument("Whole service projection rejects a complete cohort");
+                result.push_back({row.target.word(),row.layer,row.nanoseconds_per_activation});
+            }
+            return result;
+        }
+        /** @brief Import explicit legacy whole inputs into the SAME canonical vector.
+         * @param rows Original whole participant prices; no cohort sentinel is legal. */
+        void setParticipantCosts(std::span<const MoERoutedParticipantLayerPhaseServiceCost> rows) {
+            std::vector<MoERoutedTargetLayerPhaseServiceCost> canonical;canonical.reserve(rows.size());
+            for(const auto& row:rows)canonical.push_back({MoEOverlayRouteTarget::whole(row.participant_id),
+                row.layer,row.nanoseconds_per_activation});
+            if(prepared_plan)throw std::invalid_argument("Legacy whole import cannot replace prepared-target provenance");
+            target_costs=std::move(canonical);
+        }
     };
 
     /**

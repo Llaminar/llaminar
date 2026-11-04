@@ -4,10 +4,15 @@
  *
  * This setup probe deliberately excludes serving dispatch and device ingress.
  * Actual context/Store/fragment banks and one original admitted native CPU domain
- * supply the production producer. The independent FP32 oracle is terminal test
+ * supply the production producer. The final cohort-only routed lifetimes also
+ * prove outer target scheduling, root-only exact-live MPI evidence and Composer
+ * normalization without an overlapping whole CPU execution vertex. The independent FP32 oracle is terminal test
  * arithmetic only; it is never an inference or calibration execution path.
  */
 #include "execution/moe/MoEOverlayCPUServiceMeasurement.h"
+#include "execution/moe/MoEOverlayEconomyProfileComposer.h"
+#include "execution/moe/MoEOverlayMPIEconomyEvidenceExchange.h"
+#include "execution/moe/MoEOverlayEconomyEvidenceCodec.h"
 #include "execution/moe/MoEExpertOverlayPreparationPlan.h"
 #include "execution/moe/CPUExpertShardSourceSelection.h"
 #include "backends/BackendManager.h"
@@ -22,6 +27,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <thread>
 
 namespace {
 /** @brief Preserve one original failure instead of allowing a peer to enter another collective.
@@ -85,6 +91,11 @@ TEST_F(CPUExpertDomainNative, PreparedCPUJointComputeRootWallAndRetirement)
     // process session. MPI cannot be reinitialized after GTest suite teardown.
     for(int lifecycle=0;lifecycle<20;++lifecycle) {
     SCOPED_TRACE(lifecycle);
+    // The final two genuine lifetimes route every expert through the complete
+    // original cohort. Continuation remains CPU0, but is not a second routed
+    // execution vertex overlapping that cohort's physical socket.
+    const bool cohort_only = lifecycle >= 18;
+    const int cohort_tier = cohort_only ? 0 : 1;
     std::shared_ptr<PhysicalMemoryAuthority> memory;
     std::weak_ptr<ITensorGemm> retired_gate;
     {
@@ -103,6 +114,12 @@ TEST_F(CPUExpertDomainNative, PreparedCPUJointComputeRootWallAndRetirement)
         plan.domains.back().world_ranks={0,1};
         plan.routed_tiers[0].max_experts_per_layer=2;plan.routed_tiers[1].max_experts_per_layer=2;
         plan.placements={{.layer=0,.routed_expert_tier={0,0,1,1}}};
+        if(cohort_only) {
+            const auto original_cohort_tier=plan.routed_tiers.back();
+            plan.routed_tiers={original_cohort_tier};
+            plan.routed_tiers.front().max_experts_per_layer=e;
+            plan.placements.front().routed_expert_tier.assign(e,0);
+        }
         plan.residency_policy=RoutedExpertResidencyPolicy::StaticById;
         plan.authority_execution=resolveMoEOverlayAuthorityExecutionKind(plan);
         const auto runtime=resolveMoEExpertOverlayRuntimePlan(std::make_shared<const MoERoutedExpertPlacementPlan>(plan),
@@ -145,7 +162,7 @@ TEST_F(CPUExpertDomainNative, PreparedCPUJointComputeRootWallAndRetirement)
         size_t probe_bytes=0;
         for(const auto phase:{ExpertHistogramSource::PrefillChunk,ExpertHistogramSource::DecodeToken,ExpertHistogramSource::GroupedVerifier})
             probe_bytes=std::max(probe_bytes,Service::cpuJointAllocationBytes(selected->cohort(),selected->participantIndex(),phase,invocationBytes(f/2)));
-        if(rank==0)probe_bytes=std::max(probe_bytes,Service::allocationBytes({h,f},invocationBytes(f)));
+        if(rank==0 && !cohort_only)probe_bytes=std::max(probe_bytes,Service::allocationBytes({h,f},invocationBytes(f)));
         const CPUStorageRoot<float> diagnostic_root(rank==0?Service::kMaximumRows*h+1:0,
             PhysicalMemoryOwner::ExecutionWorkspace,DeviceId::cpu());
         const auto capacity=observeSystemMemoryCapacity();
@@ -184,7 +201,7 @@ TEST_F(CPUExpertDomainNative, PreparedCPUJointComputeRootWallAndRetirement)
                     const auto observed=Service::measurePreparedCPUJoint(*registry,1,participant,0,selected_expert,phase,domain,memory,span);
                     EXPECT_EQ(bool(observed),rank==0);
                     if(observed) {
-                        EXPECT_EQ(observed->target.word(),MoEOverlayRouteTarget::cpuCohort(1).word());
+                        EXPECT_EQ(observed->target.word(),MoEOverlayRouteTarget::cpuCohort(cohort_tier).word());
                         EXPECT_EQ(observed->expert,selected_expert);EXPECT_EQ(observed->logical_rows_per_invocation,uint64_t(rows));
                         EXPECT_EQ(observed->measured_invocations,Service::kMeasuredSamples);EXPECT_GT(observed->total_root_wall_nanoseconds,0u);
                         EXPECT_EQ(observed->boundary,Service::PreparedComputeBoundary::InputReadyStartReleaseToCanonicalOutput);
@@ -197,6 +214,79 @@ TEST_F(CPUExpertDomainNative, PreparedCPUJointComputeRootWallAndRetirement)
                     }
                     EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ExecutionWorkspace,PhysicalMemoryMaterializationKind::NewAllocation),baseline);
                 }
+            if(cohort_only) {
+                // This is the actual outer producer and original MPI service
+                // lane, not fabricated wall time or a member-price sum. Both
+                // physical socket ranks execute each admitted phase job; only
+                // the original root publishes its complete canonical output.
+                MoEOverlayResidencyAuthority authority({
+                    .initial_plan=plan,
+                    .model_metadata={.num_layers=1,.num_experts=e,.d_model=h,
+                        .routed_intermediate_size=f,.main_inference_layer_count=1},
+                    .projection_preparation=preparation,
+                    .maintenance_mode=MoERebalanceRuntimeMode::Off,
+                    .participant_rebalance_policy={.enabled=false}});
+                const auto snapshot=authority.snapshot();
+                EXPECT_EQ(snapshot->originalProjectionPreparation(),preparation);
+                const auto catalog=std::make_shared<const MoEOverlayEconomyCalibrationLayerCatalog>(
+                    std::vector<MoEOverlayLayerWeightManifest>{selected->cohort()->source()});
+                const auto phases=ExpertHistogramProductionTopology::forRetainedExecution(
+                    1,1,ExpertHistogramServingRegime::AdaptiveSerialOrMTP);
+                const auto declaration=MoEOverlayPreparedTargetServicePlan::checked(snapshot,catalog,phases);
+                requirePreparedCompute(declaration->entries().size()==1,"one actual complete routed cohort target");
+                MoEOverlayMPIEconomyEvidenceExchange exchange({.mpi_context=world,
+                    .owner_map=snapshot->placementOwnerMap(),.production_topology=phases,
+                    .perf_device="native_prepared_cohort_service"});
+                for(int replay=0;replay<2;++replay) {
+                    const auto before=exchange.stats();
+                    const auto local=Service::measurePreparedTargets(*registry,*declaration,{h,f},domain,memory);
+                    EXPECT_EQ(local.size(),rank==0?1u:0u);
+                    declaration->requireLocalSamples(local,rank);
+                    const auto encoded=MoEOverlayEconomyEvidenceCodec::encodePreparedService(*declaration,local,rank);
+                    const size_t root_bytes=40*kExpertHistogramProductionSourceCount;
+                    EXPECT_EQ(encoded.size(),rank==0?root_bytes:0u);
+                    requirePreparedCompute(exchange.beginPreparedService(declaration,local,&error),error.c_str());
+                    std::vector<MoEOverlayPreparedTargetServiceTotals> complete;
+                    for(;;) {
+                        const auto progress=exchange.pollPreparedService(&complete,&error);
+                        if(progress==MoEOverlayResidencyWaveProgress::Ready)break;
+                        requirePreparedCompute(progress==MoEOverlayResidencyWaveProgress::Pending,error.c_str());
+                        std::this_thread::yield();
+                    }
+                    requirePreparedCompute(complete.size()==1,"complete original root sample after MPI exchange");
+                    const auto& row=complete.front();
+                    if(rank==0) {
+                        requirePreparedCompute(local.size()==1,"original root retained one actual sample");
+                        EXPECT_EQ(row.total_nanoseconds,local.front().total_nanoseconds);
+                        EXPECT_EQ(row.activation_count,local.front().activation_count);
+                        EXPECT_EQ(row.sample_count,local.front().sample_count);
+                        EXPECT_EQ(row.expert_ids,local.front().expert_ids);
+                    }
+                    EXPECT_EQ(row.coordinate.target.word(),MoEOverlayRouteTarget::cpuCohort(0).word());
+                    EXPECT_EQ(row.coordinate.layer,0);
+                    for(size_t phase=0;phase<kExpertHistogramProductionSourceCount;++phase) {
+                        const auto& entry=declaration->entries().front();
+                        EXPECT_EQ(row.expert_ids[phase],declaration->sampleExpert(entry,phase));
+                        EXPECT_GT(row.total_nanoseconds[phase],0u);
+                        EXPECT_EQ(row.sample_count[phase],Service::kMeasuredSamples);
+                        EXPECT_EQ(row.activation_count[phase],entry.sample_rows[phase]*Service::kMeasuredSamples);
+                    }
+                    const auto profile=MoEOverlayEconomyProfileComposer::composePreparedService(declaration,complete);
+                    EXPECT_EQ(profile->prepared_plan,declaration);
+                    requirePreparedCompute(profile->target_costs.size()==1,"one complete composed cohort price");
+                    EXPECT_EQ(profile->target_costs.front().target.word(),MoEOverlayRouteTarget::cpuCohort(0).word());
+                    for(const auto cost:profile->target_costs.front().nanoseconds_per_activation)EXPECT_GT(cost,0u);
+                    const auto after=exchange.stats();
+                    EXPECT_EQ(after.evidence_payload_bytes_sent-before.evidence_payload_bytes_sent,rank==0?root_bytes:0u);
+                    EXPECT_EQ(after.evidence_payload_bytes_received-before.evidence_payload_bytes_received,root_bytes);
+                    EXPECT_EQ(after.evidence_payload_collectives_started-before.evidence_payload_collectives_started,1u);
+                    EXPECT_EQ(authority.snapshot(),snapshot);
+                    EXPECT_FALSE(authority.migrationEnabled());
+                    EXPECT_EQ(registry->initialEpoch(),1u);
+                    EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ExecutionWorkspace,
+                        PhysicalMemoryMaterializationKind::NewAllocation),baseline);
+                }
+            }
             // A raw-pointer alias cannot borrow the original native owner.
             // It is rejected before arming a job or entering any collective;
             // unlike a rank-local failure after admission it does not poison
@@ -206,8 +296,8 @@ TEST_F(CPUExpertDomainNative, PreparedCPUJointComputeRootWallAndRetirement)
             const auto terminal=rank==0?std::span<float>(diagnostic.data(),h):std::span<float>{};
             EXPECT_THROW((void)Service::measurePreparedCPUJoint(*registry,1,participant,0,selected_expert,
                 ExpertHistogramSource::DecodeToken,foreign,memory,terminal),std::invalid_argument);
-            if(rank==0) {
-                EXPECT_EQ(diagnostic[0],-993.0f);
+            if(rank==0)EXPECT_EQ(diagnostic[0],-993.0f);
+            if(rank==0 && !cohort_only) {
                 requirePreparedCompute(whole>=0,"actual whole-owner control participant");
                 const auto bank=registry->endpoint(whole)->acquire(1);
                 EXPECT_GT(Service::measurePrepared(bank->layerForModelLayer(0).experts[0],DeviceId::cpu(),0,
@@ -229,6 +319,8 @@ TEST_F(CPUExpertDomainNative, PreparedCPUJointComputeRootWallAndRetirement)
     }
     ::testing::Test::RecordProperty("service_boundary","input_ready_start_release_to_canonical_output");
     ::testing::Test::RecordProperty("source_domain_lifetimes",20);
+    ::testing::Test::RecordProperty("outer_prepared_target_lifetimes",2);
+    ::testing::Test::RecordProperty("outer_prepared_target_replays",4);
     ::testing::Test::RecordProperty("dispatch_and_ingress_measured",false);
     ::testing::Test::RecordProperty("whole_control_boundary","prepared_ffn_without_collective_start_release");
     } catch(const std::exception& failure){abortPreparedCompute(failure.what());}

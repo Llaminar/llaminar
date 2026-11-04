@@ -533,6 +533,99 @@ namespace llaminar2
             .measured_invocations=kMeasuredSamples,.total_root_wall_nanoseconds=total};
     }
 
+    std::vector<MoEOverlayPreparedTargetServiceTotals>
+    MoEOverlayCPUServiceMeasurement::measurePreparedTargets(
+        const MoEOverlayParticipantResidencyRegistry& registry,
+        const MoEOverlayPreparedTargetServicePlan& plan,Geometry geometry,
+        const std::shared_ptr<IGlobalTPContext>& domain,
+        const std::shared_ptr<PhysicalMemoryAuthority>& memory,
+        const ModelMemoryProfile* profile,const RankInventory* inventory)
+    {
+        auto* native=domain?dynamic_cast<GlobalTPContext*>(domain.get()):nullptr;
+        if(domain && (!native || !native->authenticatesOriginalCPUExpertBorrow(domain)))
+            throw std::invalid_argument("Prepared target sequence requires its original native domain shared owner");
+        // A member can fail a whole job while a peer has already advanced to a
+        // later cohort job. Keep the SAME original abort owner over the entire
+        // deterministic sequence, not just each nested fragment measurement.
+        struct SequenceAbortOnFailure {
+            IGlobalTPContext* original=nullptr;int exceptions=std::uncaught_exceptions();
+            /** @brief Wake original cohort peers if any local preparation/sample fails. */
+            ~SequenceAbortOnFailure(){if(original && std::uncaught_exceptions()>exceptions)original->requestAbort();}
+        } sequence_abort{domain.get()};
+        if(!memory || plan.snapshot()->epoch!=registry.initialEpoch())
+            throw std::invalid_argument("Prepared target jobs require original initial banks and PMA");
+        std::string error;auto source=registry.acquireOriginalPreparedSource(&error);
+        if(!source)throw std::invalid_argument("Prepared target jobs lost original source: "+error);
+        const auto preparation=plan.snapshot()->originalProjectionPreparation();
+        if(preparation && !sameSourceOwner(preparation,source->preparation()))
+            throw std::invalid_argument("Prepared target jobs have foreign source preparation");
+        const auto& original=plan.snapshot()->placementOwnerMap();
+        const auto& source_map=registry.initialOwnerMap();
+        if(original.participants()!=source_map.participants() || original.owners()!=source_map.owners())
+            throw std::invalid_argument("Prepared target jobs changed the original source placement");
+        std::map<MoEOverlayTargetServiceCoordinate,MoEOverlayPreparedTargetServiceTotals> samples;
+        std::map<DeviceId,std::shared_ptr<RetainedParticipantGraphExecutable>> gpu_calibrations;
+        for(const auto& entry:plan.entries())for(size_t phase=0;phase<kExpertHistogramProductionSourceCount;++phase) {
+            if(entry.sample_layers[phase]!=entry.coordinate.layer)continue;
+            const auto source_phase=phase==0?ExpertHistogramSource::DecodeToken:
+                phase==1?ExpertHistogramSource::PrefillChunk:ExpertHistogramSource::GroupedVerifier;
+            const auto cohort=plan.cohort(entry);
+            int participant=-1;
+            if(cohort)for(const auto& member:cohort->participants())
+                if(member.world_rank==memory->worldRank())participant=member.participant_id;
+            if(!cohort && entry.root_world_rank==memory->worldRank())participant=entry.coordinate.target.word();
+            if(participant<0)continue; // No unrelated rank, member alias or synthetic row.
+            const int expert=plan.sampleExpert(entry,phase);
+            uint64_t duration=0;
+            if(cohort) {
+                const auto observation=measurePreparedCPUJoint(registry,registry.initialEpoch(),participant,
+                    entry.coordinate.layer,expert,source_phase,domain,memory);
+                if(!observation)continue;
+                if(observation->target.word()!=entry.coordinate.target.word() ||
+                    observation->logical_rows_per_invocation!=entry.sample_rows[phase] ||
+                    observation->measured_invocations!=entry.measured_invocations)
+                    throw std::logic_error("Prepared CPU target returned another declared job");
+                duration=observation->total_root_wall_nanoseconds;
+            }else {
+                const auto endpoint=registry.endpoint(participant);
+                const auto bank=endpoint?endpoint->acquire(registry.initialEpoch()):MoEOverlayParticipantBankLease{};
+                if(!bank)throw std::invalid_argument("Prepared whole target initial bank is missing");
+                const auto& payload=bank->layerForModelLayer(entry.coordinate.layer).experts.at(expert);
+                const auto device=bank->device;
+                if(device.is_cpu())duration=measurePrepared(payload,device,entry.coordinate.layer,source_phase,geometry,memory);
+                else {
+                    if(!profile || !inventory || inventory->rank!=memory->worldRank())
+                        throw std::invalid_argument("Prepared GPU target requires original source/rank workspace metadata");
+                    const auto physical=std::find_if(inventory->gpus.begin(),inventory->gpus.end(),[&](const auto& gpu){
+                        return gpu.type==device.type && gpu.local_device_id==device.ordinal;
+                    });
+                    if(physical==inventory->gpus.end() || physical->compute_units<=0)
+                        throw std::invalid_argument("Prepared GPU target lost actual compute geometry");
+                    const auto invocation=WorkspaceMemoryEstimator::estimatePreparedExpertService(*profile,
+                        {.device=device,.device_compute_units=physical->compute_units,.resident_graph_rows=kMaximumRows,
+                         .first_layer=plan.catalog()->firstModelLayer(),
+                         .last_layer=plan.catalog()->firstModelLayer()+int(plan.catalog()->layerCount())-1,
+                         .apportioned_routed_experts=true});
+                    auto& calibration=gpu_calibrations[device];
+                    if(!calibration)calibration=PlanningGPUExpertMeasurement::beginPreparedCalibration(device,memory);
+                    duration=PlanningGPUExpertMeasurement::measurePrepared(payload,device,entry.coordinate.layer,source_phase,
+                        geometry.d_model,geometry.intermediate,memory,invocation,calibration);
+                }
+            }
+            auto [found,inserted]=samples.try_emplace(entry.coordinate);
+            auto& row=found->second;row.coordinate=entry.coordinate;
+            if(row.sample_count[phase])throw std::logic_error("Prepared target job produced duplicate phase evidence");
+            row.total_nanoseconds[phase]=duration;
+            row.sample_count[phase]=entry.measured_invocations;
+            row.activation_count[phase]=entry.sample_rows[phase]*entry.measured_invocations;
+            row.expert_ids[phase]=expert;
+        }
+        std::vector<MoEOverlayPreparedTargetServiceTotals> result;result.reserve(samples.size());
+        for(auto& [key,row]:samples)result.push_back(std::move(row));
+        plan.requireLocalSamples(result,memory->worldRank());
+        return result;
+    }
+
     std::vector<MoEOverlayParticipantLayerServiceTotals> MoEOverlayCPUServiceMeasurement::measure(
         const MoEOverlayParticipantResidencyRegistry &registry, uint64_t epoch,
         const MoEOverlayEconomyCalibrationLayerCatalog &catalog,

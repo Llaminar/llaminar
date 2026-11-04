@@ -1556,6 +1556,14 @@ add_v2_routed_expert_policy_unit(
     V2_Unit_MoEOverlayResidencyAuthority
     unit/execution/moe/Test__MoEOverlayResidencyAuthority.cpp
 )
+add_v2_test(V2_Integration_MoETypedMigrationInterferenceReplay
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_residency_authority>
+        --gtest_filter=Test__MoEOverlayResidencyAuthority.TypedMigrationInterferencePreservesAcceptanceAndPayoff
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;Economy;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_MoETypedMigrationInterferenceReplay)
 add_v2_test(V2_Integration_MoEPipelineStageResidencyAuthority
     COMMAND $<TARGET_FILE:v2_unit_moe_overlay_residency_authority>
         --gtest_filter=Test__MoEOverlayResidencyAuthority.PipelineStage*
@@ -1609,6 +1617,12 @@ add_v2_routed_expert_policy_unit(
     v2_unit_moe_overlay_economy_profile_composer
     V2_Unit_MoEOverlayEconomyProfileComposer
     unit/execution/moe/Test__MoEOverlayEconomyProfileComposer.cpp
+)
+add_v2_test(V2_Integration_MoEPreparedTargetEconomyAdaptersReplay
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_economy_profile_composer>
+        --gtest_filter=MoEOverlayEconomyProfileComposer.ColdWholeAdaptersRetainOneCanonicalVectorAndRejectCohorts:MoEOverlayEconomyProfileComposer.PreparedSampleSkipsEquivalentLayerWithoutOriginalTargetResident
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;Economy;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS
 )
 add_v2_test(V2_Integration_MoEPipelineStageEconomy
     COMMAND $<TARGET_FILE:v2_unit_moe_overlay_economy_profile_composer>

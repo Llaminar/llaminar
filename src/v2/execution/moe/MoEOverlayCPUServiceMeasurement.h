@@ -14,6 +14,7 @@
 #include "memory/CPUStorageRoot.h"
 #include "planning/ModelMemoryProfile.h"
 #include "MoEOverlayRouteTarget.h"
+#include "MoEOverlayPreparedTargetService.h"
 #include <optional>
 #include <span>
 
@@ -171,6 +172,22 @@ namespace llaminar2
             const std::shared_ptr<IGlobalTPContext>& original_domain,
             const std::shared_ptr<PhysicalMemoryAuthority>& memory,
             std::span<float> diagnostic_output = {});
+
+        /**
+         * @brief Execute deterministic original prepared-only target/class/phase jobs.
+         * @param registry Original model-bound banks. @param plan Checked original declarations.
+         * @param geometry Full original H/F. @param original_domain Existing CPU expert owner, null only on nonmembers.
+         * @param memory Original PMA. @param model_profile Original workspace source for GPU targets.
+         * @param rank_inventory Same rank's actual backend geometry for GPU targets.
+         * @return Only actual locally rooted samples; cohort contributors emit no rows.
+         * @note This does not import live packet timing or install a service price.
+         */
+        static std::vector<MoEOverlayPreparedTargetServiceTotals> measurePreparedTargets(
+            const MoEOverlayParticipantResidencyRegistry& registry,
+            const MoEOverlayPreparedTargetServicePlan& plan,Geometry geometry,
+            const std::shared_ptr<IGlobalTPContext>& original_domain,
+            const std::shared_ptr<PhysicalMemoryAuthority>& memory,
+            const ModelMemoryProfile* model_profile=nullptr,const RankInventory* rank_inventory=nullptr);
 
         /**
          * @brief Measure missing priced CPU/GPU class/phase coordinates from the initial bank.

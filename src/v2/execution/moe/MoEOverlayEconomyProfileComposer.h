@@ -11,6 +11,7 @@
  */
 
 #pragma once
+#include "MoEOverlayPreparedTargetService.h"
 
 #include "ExpertTierTransferMeasurement.h"
 #include "MoEOverlayMigrationTargetCoordinate.h"
@@ -131,13 +132,6 @@ namespace llaminar2
             const MoEOverlayParticipantLayerMigrationMeasurement &row);
     };
 
-    /** @brief Complete-target movement price; no service or controller capability is implied. */
-    struct MoEOverlayTargetLayerMigrationCost
-    {
-        MoEOverlayMigrationTargetCoordinate coordinate;
-        std::uint64_t transfer_and_repack_ns = 0;
-        std::uint64_t inference_interference_ns = 0;
-    };
 
     /**
      * @brief Validated immutable profiles ready for residency-authority sealing.
@@ -257,6 +251,20 @@ namespace llaminar2
          * @throws std::invalid_argument For any cohort or invalid/duplicate coordinate. */
         [[nodiscard]] static std::vector<MoEOverlayParticipantLayerMigrationCost>
         checkedWholeMigrationCosts(std::vector<MoEOverlayTargetLayerMigrationCost> costs);
+
+        /** @brief Normalize only genuine prepared target samples, never live packet totals.
+         * @param plan Original checked target/source declaration. @param samples Complete root-owned corpus.
+         * @return One rate per original target/layer and phase. */
+        static std::vector<MoERoutedTargetLayerPhaseServiceCost> normalizePreparedService(
+            const MoEOverlayPreparedTargetServicePlan& plan,
+            std::span<const MoEOverlayPreparedTargetServiceTotals> samples);
+        /** @brief Compose the existing tier selection profile from prepared-only complete targets.
+         * @param plan Original checked declaration, retained without engine owners.
+         * @param samples Complete original root-owned sample corpus.
+         * @return Same canonical target vector plus existing tier aggregates. */
+        static std::shared_ptr<const MoERoutedTierServiceProfile> composePreparedService(
+            std::shared_ptr<const MoEOverlayPreparedTargetServicePlan> plan,
+            std::span<const MoEOverlayPreparedTargetServiceTotals> samples);
 
         /**
          * @brief Validate, canonicalize, and compose one complete profile pair.

@@ -24,6 +24,7 @@
  */
 
 #include "MoEOverlayResidencyAuthority.h"
+#include "MoEOverlayPreparedTargetService.h"
 #include "MoEExpertOverlayPreparationPlan.h"
 
 #include "MoEOverlayEconomyCalibrationPlanner.h"
@@ -765,6 +766,21 @@ namespace llaminar2
         }
 
 
+        /** @param owner Original canonical row. @return Its complete logical execution target. */
+        MoEOverlayRouteTarget economyExecutionTarget(const MoEExpertOwner& owner) {
+            if(!MoEExpertPlacementTarget::fromPlacement(owner))
+                throw std::invalid_argument("Economy source has no checked complete target");
+            return owner.shard_cohort?MoEOverlayRouteTarget::cpuCohort(owner.tier_idx):
+                MoEOverlayRouteTarget::whole(owner.owner_participant);
+        }
+        /** @param config Original immutable setup. @return Metadata-only prepared pricing, never runtime permission. */
+        bool preparedOffPricing(const MoEOverlayResidencyAuthority::Config& config) {
+            return jointCPUPlan(config.initial_plan) && config.maintenance_mode==MoERebalanceRuntimeMode::Off &&
+                !config.histogram && !config.participant_rebalance_policy.enabled &&
+                config.phase_service_profile && config.phase_service_profile->prepared_plan &&
+                config.migration_cost_profile && config.migration_economy_policy;
+        }
+
         /**
          * @brief One proposal's borrowed observations and reusable service scratch.
          *
@@ -843,11 +859,12 @@ namespace llaminar2
             ObservedTransactionServiceObjective(
                 ValidatedDecodeExpertHistogramWindowView observed,
                 const ExpertHistogramProductionTopology &topology,
-                std::span<const MoERoutedParticipantLayerPhaseServiceCost *const> rows,
-                std::size_t participants)
-                : observed_(observed), topology_(topology), rows_(rows),
-                  prices_(participants), scratch_(participants)
+                std::span<const MoERoutedTargetLayerPhaseServiceCost *const> rows,
+                std::span<const MoEOverlayRouteTarget> targets)
+                : observed_(observed), topology_(topology), rows_(rows),targets_(targets),
+                  prices_(targets.size()), scratch_(targets.size())
             {
+                const auto participants=targets.size();
                 if (participants == 0 ||
                     participants > std::numeric_limits<std::uint32_t>::max() ||
                     topology.layerCount() != static_cast<std::size_t>(observed.numLayers()) ||
@@ -855,6 +872,16 @@ namespace llaminar2
                     rows.size() != participants * topology.layerCount())
                     throw std::logic_error(
                         "ExpertOverlay observed service objective has invalid certified geometry");
+            }
+
+            /** @param owner Original checked owner. @return Internal logical vertex, never a synthetic participant ID. */
+            int32_t targetIndex(const MoEExpertOwner& owner) const {
+                const auto target=economyExecutionTarget(owner);
+                const auto found=std::lower_bound(targets_.begin(),targets_.end(),target.word(),
+                    [](auto value,int word){return value.word()<word;});
+                if(found==targets_.end() || found->word()!=target.word())
+                    throw std::invalid_argument("Observed economy lacks complete target service evidence");
+                return int32_t(found-targets_.begin());
             }
 
             /** @return Authenticated expert geometry, never inferred from a candidate. */
@@ -1067,7 +1094,8 @@ namespace llaminar2
 
             ValidatedDecodeExpertHistogramWindowView observed_;
             const ExpertHistogramProductionTopology &topology_;
-            std::span<const MoERoutedParticipantLayerPhaseServiceCost *const> rows_;
+            std::span<const MoERoutedTargetLayerPhaseServiceCost *const> rows_;
+            std::span<const MoEOverlayRouteTarget> targets_;
             std::vector<std::uint64_t> prices_;
             std::vector<moe_overlay_economy::ServiceCostPair> scratch_;
             std::optional<PreparedLayer> prepared_layer_;
@@ -1087,9 +1115,9 @@ namespace llaminar2
             std::span<const std::size_t> after_indices)
         {
             std::vector<std::int32_t> before(objective.numExperts(), -1);
-            for (const auto &owner : transaction.previous->owner_map.owners())
+            for (const auto &owner : transaction.previous->placementOwnerMap().owners())
                 if (owner.layer_idx == layer)
-                    before.at(static_cast<std::size_t>(owner.expert_id)) = owner.owner_participant;
+                    before.at(static_cast<std::size_t>(owner.expert_id)) = objective.targetIndex(owner);
             auto after = before;
             const auto apply = [&](std::span<const std::size_t> indices,
                                    std::vector<std::int32_t> &owners)
@@ -1099,10 +1127,10 @@ namespace llaminar2
                     const auto &move = transaction.migrations.at(index);
                     if (move.layer_idx != layer) continue;
                     auto &owner = owners.at(static_cast<std::size_t>(move.expert_id));
-                    if (owner != move.source.owner_participant)
+                    if (owner != objective.targetIndex(move.source))
                         throw std::logic_error(
                             "ExpertOverlay economy migration source disagrees with published ownership");
-                    owner = move.destination.owner_participant;
+                    owner = objective.targetIndex(move.destination);
                 }
             };
             apply(before_indices, before);
@@ -2060,14 +2088,24 @@ namespace llaminar2
         int num_layers = 0;
         int num_experts = 0;
         int tier_count = 0;
-        int participant_count = 0;
+        int participant_count = 0; ///< Number of complete execution targets, not fragment members.
+        std::vector<MoEOverlayRouteTarget> execution_targets;
         ExpertHistogramProductionTopology production_topology;
-        std::vector<const MoERoutedParticipantLayerPhaseServiceCost *>
-            participant_service_cost_rows;
-        std::vector<const MoEOverlayParticipantLayerMigrationCost *>
-            migration_cost_rows;
+        std::vector<const MoERoutedTargetLayerPhaseServiceCost *>
+            participant_service_cost_rows; ///< Historical name: compact complete-target slots, never cohort members.
+        std::vector<const MoEOverlayTargetLayerMigrationCost *>
+            migration_cost_rows; ///< Dense source/destination complete-target slots, not physical participant IDs.
         std::optional<PlacementDemandForecast> forecast;
         std::vector<uint64_t> last_moved_generation;
+
+        /** @param target Actual whole/cohort word. @return Checked internal execution-vertex index. */
+        size_t targetIndex(MoEOverlayRouteTarget target) const {
+            const auto found=std::lower_bound(execution_targets.begin(),execution_targets.end(),target.word(),
+                [](auto value,int word){return value.word()<word;});
+            if(found==execution_targets.end() || found->word()!=target.word())
+                throw std::invalid_argument("Economy target is outside original complete service declarations");
+            return size_t(found-execution_targets.begin());
+        }
 
         /**
          * @brief Authenticate a global layer before indexing stage-local evidence.
@@ -2089,16 +2127,14 @@ namespace llaminar2
          * @return Prevalidated directed endpoint/layer cost row.
          * @throws std::out_of_range If the coordinate exceeds admitted storage.
          */
-        const MoEOverlayParticipantLayerMigrationCost &migrationCost(
-            int source_participant,
-            int destination_participant,
+        const MoEOverlayTargetLayerMigrationCost &migrationCost(
+            MoEOverlayRouteTarget source_target,
+            MoEOverlayRouteTarget destination_target,
             int layer) const
         {
-            const std::size_t participants =
-                static_cast<std::size_t>(participant_count);
+            const std::size_t participants = execution_targets.size();
             return *migration_cost_rows.at(
-                (static_cast<std::size_t>(source_participant) * participants +
-                 static_cast<std::size_t>(destination_participant)) *
+                (targetIndex(source_target) * participants + targetIndex(destination_target)) *
                     static_cast<std::size_t>(num_layers) +
                 storageIndexForModelLayer(layer));
         }
@@ -2132,8 +2168,7 @@ namespace llaminar2
         }
         if (config.migration_economy_policy)
         {
-            if (config.maintenance_mode !=
-                MoERebalanceRuntimeMode::Dynamic)
+            if (config.maintenance_mode != MoERebalanceRuntimeMode::Dynamic && !preparedOffPricing(config))
             {
                 throw std::invalid_argument(
                     "ExpertOverlay migration economics require Dynamic maintenance");
@@ -2207,8 +2242,36 @@ namespace llaminar2
         state->num_experts = config.model_metadata.num_experts;
         state->tier_count = static_cast<int>(
             initial_snapshot.placement_plan->routed_tiers.size());
-        state->participant_count = static_cast<int>(
-            initial_snapshot.owner_map.participants().size());
+        if(service_profile.prepared_plan) {
+            if(!service_profile.prepared_plan->authenticates(service_profile.prepared_plan))
+                throw std::invalid_argument("Prepared service declaration does not retain its original metadata owner");
+            for(const auto& entry:service_profile.prepared_plan->entries())state->execution_targets.push_back(entry.coordinate.target);
+        }else for(const auto& participant:initial_snapshot.placementOwnerMap().participants())
+            state->execution_targets.push_back(MoEOverlayRouteTarget::whole(participant.participant_id));
+        std::sort(state->execution_targets.begin(),state->execution_targets.end(),[](auto a,auto b){return a.word()<b.word();});
+        state->execution_targets.erase(std::unique(state->execution_targets.begin(),state->execution_targets.end(),
+            [](auto a,auto b){return a.word()==b.word();}),state->execution_targets.end());
+        if(state->execution_targets.empty() || state->execution_targets.size()>size_t(INT32_MAX))
+            throw std::invalid_argument("Service profile has no bounded complete execution targets");
+        state->participant_count=int(state->execution_targets.size());
+        if(service_profile.prepared_plan) {
+            const auto& original=*service_profile.prepared_plan->snapshot();
+            if(original.firstModelLayer()!=initial_snapshot.firstModelLayer() || original.layerCount()!=initial_snapshot.layerCount() ||
+                original.expertCount()!=initial_snapshot.expertCount() ||
+                original.placementOwnerMap().participants()!=initial_snapshot.placementOwnerMap().participants() ||
+                original.placementOwnerMap().owners()!=initial_snapshot.placementOwnerMap().owners())
+                throw std::invalid_argument("Prepared service profile belongs to foreign original target/source geometry");
+            const auto source=original.originalProjectionPreparation(),expected=initial_snapshot.originalProjectionPreparation();
+            if(source.get()!=expected.get() || source.owner_before(expected) || expected.owner_before(source))
+                throw std::invalid_argument("Prepared service profile has foreign original preparation ownership");
+            if(config.economy_layer_catalog && (config.economy_layer_catalog.get()!=service_profile.prepared_plan->catalog().get() ||
+                config.economy_layer_catalog.owner_before(service_profile.prepared_plan->catalog()) ||
+                service_profile.prepared_plan->catalog().owner_before(config.economy_layer_catalog)))
+                throw std::invalid_argument("Prepared service profile has a foreign source catalog");
+        }else for(size_t index=0;index<state->execution_targets.size();++index)
+            if(!state->execution_targets[index].isWhole() || state->execution_targets[index].word()!=int(index))
+                throw std::invalid_argument("Legacy service evidence cannot certify cohort target prices");
+
         if (!service_profile.production_topology.valid() ||
             service_profile.production_topology.firstModelLayer() != state->first_model_layer ||
             service_profile.production_topology.layerCount() !=
@@ -2219,23 +2282,6 @@ namespace llaminar2
         }
         state->production_topology =
             service_profile.production_topology;
-        std::vector<bool> participant_ids(
-            static_cast<std::size_t>(state->participant_count), false);
-        for (const auto &participant :
-             initial_snapshot.owner_map.participants())
-        {
-            if (participant.participant_id < 0 ||
-                participant.participant_id >= state->participant_count ||
-                participant_ids[static_cast<std::size_t>(
-                    participant.participant_id)])
-            {
-                throw std::invalid_argument(
-                    "ExpertOverlay economy requires contiguous unique participant ids");
-            }
-            participant_ids[static_cast<std::size_t>(
-                participant.participant_id)] = true;
-        }
-
         const std::size_t service_rows = checkedSizeProduct(
             static_cast<std::size_t>(state->tier_count),
             static_cast<std::size_t>(state->num_layers),
@@ -2279,18 +2325,15 @@ namespace llaminar2
             "participant service-profile geometry");
         state->participant_service_cost_rows.assign(
             participant_service_rows, nullptr);
-        for (const auto &row : service_profile.participant_costs)
+        for (const auto &row : service_profile.target_costs)
         {
-            if (row.participant_id < 0 ||
-                row.participant_id >= state->participant_count ||
-                !config.model_metadata.containsModelLayer(row.layer))
+            if (row.target.isAbsent() || !config.model_metadata.containsModelLayer(row.layer))
             {
                 throw std::invalid_argument(
                     "ExpertOverlay participant service profile row is outside live residency geometry");
             }
             const std::size_t offset =
-                static_cast<std::size_t>(row.participant_id) *
-                    static_cast<std::size_t>(state->num_layers) +
+                state->targetIndex(row.target) * static_cast<std::size_t>(state->num_layers) +
                 state->storageIndexForModelLayer(row.layer);
             if (state->participant_service_cost_rows[offset])
             {
@@ -2314,7 +2357,7 @@ namespace llaminar2
             state->participant_service_cost_rows[offset] = &row;
         }
         if (state->participant_service_cost_rows.size() !=
-                service_profile.participant_costs.size() ||
+                service_profile.target_costs.size() ||
             std::any_of(
                 state->participant_service_cost_rows.begin(),
                 state->participant_service_cost_rows.end(),
@@ -2350,27 +2393,26 @@ namespace llaminar2
         state->migration_cost_rows.assign(migration_slots, nullptr);
         for (const auto &row : migration_profile.costs)
         {
-            if (row.source_participant < 0 ||
-                row.source_participant >= state->participant_count ||
-                row.destination_participant < 0 ||
-                row.destination_participant >= state->participant_count ||
-                row.source_participant == row.destination_participant ||
-                !config.model_metadata.containsModelLayer(row.layer) ||
+            if (!row.coordinate.valid() ||
+                !config.model_metadata.containsModelLayer(row.coordinate.layer) ||
                 row.transfer_and_repack_ns == 0)
             {
                 throw std::invalid_argument(
-                    "ExpertOverlay migration profile has an invalid endpoint, layer, or zero transfer cost");
+                    "Migration profile has invalid original targets/layer/cost");
             }
-            const std::size_t offset =
-                (static_cast<std::size_t>(row.source_participant) *
-                     participants +
-                 static_cast<std::size_t>(row.destination_participant)) *
+            // Interference is a measured nonnegative cost, including positive
+            // values. Retain it in the same canonical row so proposal payoff
+            // charges both transfer/repack and inference interference.
+            const auto source = state->targetIndex(row.coordinate.source_target);
+            const auto destination = state->targetIndex(row.coordinate.destination_target);
+            const auto offset =
+                (source * participants + destination) *
                     static_cast<std::size_t>(state->num_layers) +
-                state->storageIndexForModelLayer(row.layer);
+                state->storageIndexForModelLayer(row.coordinate.layer);
             if (state->migration_cost_rows[offset])
             {
                 throw std::invalid_argument(
-                    "ExpertOverlay migration profile repeats a directed endpoint/layer row");
+                    "Migration profile repeats an original target edge");
             }
             state->migration_cost_rows[offset] = &row;
         }
@@ -2476,7 +2518,8 @@ namespace llaminar2
         if(jointCPUPlan(config_.initial_plan) &&
            (config_.maintenance_mode!=MoERebalanceRuntimeMode::Off || config_.histogram ||
             config_.participant_rebalance_policy.enabled || config_.phase_service_profile ||
-            config_.migration_cost_profile || config_.migration_economy_policy || config_.economy_layer_catalog))
+            config_.migration_cost_profile || config_.migration_economy_policy || config_.economy_layer_catalog) &&
+           !preparedOffPricing(config_))
             throw std::invalid_argument("CPU joint fragments support only Static residency; Observe/Dynamic/migration is not implemented");
         if (observesHistogram() && !config_.histogram)
         {
@@ -2517,10 +2560,10 @@ namespace llaminar2
         }
         if (config_.migration_economy_policy)
         {
-            if (!migrationEnabled())
+            if (!migrationEnabled() && !preparedOffPricing(config_))
             {
                 throw std::invalid_argument(
-                    "ExpertOverlay migration economics require Dynamic maintenance");
+                    "ExpertOverlay migration economics require Dynamic maintenance or source-bound Off prepared pricing");
             }
             if (!config_.migration_economy_policy->valid())
             {
@@ -2536,10 +2579,10 @@ namespace llaminar2
         }
         if (config_.economy_layer_catalog)
         {
-            if (!migrationEnabled())
+            if (!migrationEnabled() && !preparedOffPricing(config_))
             {
                 throw std::invalid_argument(
-                    "ExpertOverlay economy layer catalog requires Dynamic maintenance");
+                    "ExpertOverlay economy layer catalog requires Dynamic maintenance or source-bound Off prepared pricing");
             }
             if (config_.economy_layer_catalog->firstModelLayer() != config_.model_metadata.first_model_layer ||
                 config_.economy_layer_catalog->layerCount() !=
@@ -2558,7 +2601,7 @@ namespace llaminar2
          * ExplicitMasks, or adversarial initial layout to improve over time
          * without lying about how the first physical banks were apportioned.
          */
-        if (migrationEnabled())
+        if (migrationEnabled() || preparedOffPricing(config_))
         {
             planning_template_.residency_policy =
                 RoutedExpertResidencyPolicy::RoutedTierRebalanced;
@@ -3733,8 +3776,9 @@ namespace llaminar2
         // silently suppress an enabled placement axis or price cohort sentinel -1.
         if (joint && config_.participant_rebalance_policy.enabled)
             throw std::logic_error("Fixed CPU cohort candidates do not support scalar participant rearrangement");
-        if (joint && config_.migration_economy_policy)
-            throw std::logic_error("Fixed CPU cohort candidates require certified member/intersection economy prices");
+        if(joint && config_.migration_economy_policy &&
+            (!config_.phase_service_profile || !config_.phase_service_profile->prepared_plan))
+            throw std::logic_error("Fixed CPU cohort candidates require original complete-target prepared service prices");
         if (!window || !window->valid() ||
             window->num_layers != config_.model_metadata.num_layers ||
             window->first_model_layer != config_.model_metadata.first_model_layer ||
@@ -3797,7 +3841,7 @@ namespace llaminar2
             observed_service.emplace(
                 observed_evidence, economy_state_->production_topology,
                 economy_state_->participant_service_cost_rows,
-                static_cast<std::size_t>(economy_state_->participant_count));
+                economy_state_->execution_targets);
 
         MoERoutedExpertPlacementPlannerOptions options;
         options.decode_histogram_window = planning_window;
@@ -4041,10 +4085,8 @@ namespace llaminar2
                             tier_target_transaction.migrations.at(
                                 cycle.migration_indices[1]);
                         return first.layer_idx == second.layer_idx &&
-                               first.source.owner_participant ==
-                                   second.destination.owner_participant &&
-                               first.destination.owner_participant ==
-                                   second.source.owner_participant;
+                               economyExecutionTarget(first.source).word()==economyExecutionTarget(second.destination).word() &&
+                               economyExecutionTarget(first.destination).word()==economyExecutionTarget(second.source).word();
                     }();
                 for (const std::size_t migration_index :
                      cycle.migration_indices)
@@ -4053,9 +4095,8 @@ namespace llaminar2
                         tier_target_transaction.migrations.at(
                             migration_index);
                     const auto &movement = state.migrationCost(
-                        migration.source.owner_participant,
-                        migration.destination.owner_participant,
-                        migration.layer_idx);
+                        economyExecutionTarget(migration.source),
+                        economyExecutionTarget(migration.destination),migration.layer_idx);
                     if (paired_wave_calibrated)
                     {
                         transfer = std::max<WideCost>(
@@ -4622,10 +4663,8 @@ namespace llaminar2
                     const auto &second = candidate.migrations.at(
                         cycle.migration_indices[1]);
                     return first.layer_idx == second.layer_idx &&
-                           first.source.owner_participant ==
-                               second.destination.owner_participant &&
-                           first.destination.owner_participant ==
-                               second.source.owner_participant;
+                           economyExecutionTarget(first.source).word()==economyExecutionTarget(second.destination).word() &&
+                           economyExecutionTarget(first.destination).word()==economyExecutionTarget(second.source).word();
                 }();
             for (const std::size_t migration_index :
                  cycle.migration_indices)
@@ -4633,9 +4672,8 @@ namespace llaminar2
                 const auto &migration =
                     candidate.migrations.at(migration_index);
                 const auto &movement = state.migrationCost(
-                    migration.source.owner_participant,
-                    migration.destination.owner_participant,
-                    migration.layer_idx);
+                    economyExecutionTarget(migration.source),
+                    economyExecutionTarget(migration.destination),migration.layer_idx);
                 if (paired_wave_calibrated)
                 {
                     /*

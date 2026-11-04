@@ -104,6 +104,10 @@ namespace llaminar2
              */
             std::vector<MoEOverlayParticipantLayerServiceTotals>
                 prepared_service_measurements;
+            /** Prepared-only original target context; mutually exclusive with legacy/live sample inputs. */
+            std::shared_ptr<const MoEOverlayPreparedTargetServicePlan> prepared_target_service_plan;
+            std::vector<MoEOverlayPreparedTargetServiceTotals> prepared_target_service_measurements;
+            int prepared_service_world_rank=-1; ///< Original PMA/MPI observer, never inferred from participant order.
             /** Optional all-rank service and attempt evidence lane. */
             std::shared_ptr<IMoEOverlayEconomyEvidenceExchange>
                 evidence_exchange;
@@ -222,6 +226,13 @@ namespace llaminar2
         /** @brief Compose one complete canonical profile bundle. */
         void composeCompleteEvidence(
             std::vector<MoEOverlayParticipantLayerServiceTotals> rows);
+
+        /** @brief Compose only original prepared target evidence, never live packet service.
+         * @param rows Complete root-owned prepared sample corpus. */
+        void composePreparedTargetEvidence(std::vector<MoEOverlayPreparedTargetServiceTotals> rows);
+        /** @brief Same install/rebase/detached lifecycle for either validated profile input.
+         * @param profiles Complete immutable service/movement bundle. */
+        void completeProfiles(MoEOverlayCertifiedEconomyProfiles profiles);
 
         /**
          * @brief Release-publish successful terminal certification.

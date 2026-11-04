@@ -626,9 +626,49 @@ this is a scoped CPU result, not a claim that the complete batch was green.
 
 Receipts remain under `/tmp/qfn-cpu-joint-qualified-r224/`, including
 `prepared-service244-evidence.json`. Full preflight, new model KL and Release
-performance were not run. Next, the existing composer and transaction objective
-must consume complete-target prepared costs without mixing them with live
-dispatch-inclusive measurements or counting a sharded target once per member.
+performance were not run.
+
+The subsequent consumer slice uses one typed target-cost vector and one typed
+migration-cost vector. Checked whole-participant adapters project those same
+rows; there is no duplicate runtime price table or separate cohort controller.
+The existing objective, hotness, hysteresis, payoff horizon, residency rules and
+phase nonregression checks price a complete cohort once. Prepared-only service
+evidence stays distinct from dispatch-inclusive live measurements. Original
+source, sample layer, expert, root rank and measured phase must agree before
+encoding or composition. Equivalent sample layers without a resident expert
+are skipped during sample selection; absence across the entire class is fatal.
+
+Build262 compiled the consumer slice. `focused263` found an unintended validator
+restriction: positive inference-interference costs were rejected, breaking the
+owning authority and native MPI consensus suites. Build266 restores the original
+cost contract. The explicit `MoETypedMigrationInterferenceReplay` regression
+proves that small positive interference is accepted and subtracted from payoff,
+and a large interference cost rejects uneconomical movement. It preserves the
+existing reciprocal-wave maximum instead of charging both edges twice.
+
+`focused267` passes all 14 selected registrations in 26.44 seconds, without
+skips and with clean driver evidence. This includes all 82 authority cases,
+21 consensus cases per actual MPI rank, typed-target source/codec/objective
+contracts, the economy composer and maintenance suites, and the native CPU
+producer. The latter retains twenty real source/domain lifetimes; the last two
+use a cohort-only routed tier with the original CPU0 continuation. Four complete
+outer producer/exchange/composer replays measure prefill, decode and grouped
+verification. The root sends exactly 120 evidence bytes, the contributor zero,
+and both receive 120. Actual durations, sample counts and expert provenance
+survive the exchange unchanged; PMA claims and original owners retire normally.
+`prepared267-evidence.json` records the scoped suite counts.
+
+The remaining affected callers pass in `focused270`: six owning planning,
+rebalancing, calibration/measurement and native transaction/controller-fabric
+registrations, 9.93 seconds, no skips, clean driver evidence. The fabric control
+uses the actual two CUDA and four MI50 devices. These checks retain the existing
+whole-expert behavior after the typed target-cost API change.
+
+The source-bound Off configuration consumes this evidence without permitting
+movement. Complete cohort calibration expansion and changed-epoch publication
+through dynamic inference still require qualification; the runtime guards remain.
+These focused results do not certify full preflight, fresh model KL or Release
+performance.
 
 ## Shared histogram candidate construction
 

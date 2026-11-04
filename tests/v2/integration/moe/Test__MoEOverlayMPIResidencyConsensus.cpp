@@ -435,14 +435,14 @@ namespace llaminar2::test
                              * isolating distributed transaction lifecycle, not
                              * manufacturing an independent skew objective.
                              */
-                            profile->participant_costs = {
+                            profile->setParticipantCosts(std::vector<MoERoutedParticipantLayerPhaseServiceCost>{
                                 {.participant_id = 0,
                                  .layer = 0,
                                  .nanoseconds_per_activation = {10, 20, 30}},
                                 {.participant_id = 1,
                                  .layer = 0,
                                  .nanoseconds_per_activation = {100, 200, 300}},
-                            };
+                            });
                             return profile;
                         }(),
                         .migration_cost_profile = []
@@ -451,7 +451,7 @@ namespace llaminar2::test
                                 MoEOverlayMigrationCostProfile>();
                             profile->identity =
                                 "mpi-maintenance-migration-profile-v1";
-                            profile->costs = {
+                            profile->setWholeCosts(std::vector<MoEOverlayParticipantLayerMigrationCost>{
                                 {.source_participant = 0,
                                  .destination_participant = 1,
                                  .layer = 0,
@@ -460,7 +460,7 @@ namespace llaminar2::test
                                  .destination_participant = 0,
                                  .layer = 0,
                                  .transfer_and_repack_ns = 1},
-                            };
+                            });
                             return profile;
                         }(),
                         .migration_economy_policy =
@@ -580,8 +580,8 @@ namespace llaminar2::test
                     });
                 for (int participant = 0; participant < 3; ++participant)
                 {
-                    service_profile->participant_costs.push_back({
-                        .participant_id = participant,
+                    service_profile->target_costs.push_back({
+                        .target = MoEOverlayRouteTarget::whole(participant),
                         .layer = layer,
                         .nanoseconds_per_activation =
                             participant == 0
@@ -609,10 +609,7 @@ namespace llaminar2::test
                     {
                         if (source == destination)
                             continue;
-                        migration_profile->costs.push_back({
-                            .source_participant = source,
-                            .destination_participant = destination,
-                            .layer = layer,
+                        migration_profile->costs.push_back({.coordinate = {.source_target = MoEOverlayRouteTarget::whole(source), .destination_target = MoEOverlayRouteTarget::whole(destination), .layer = layer},
                             .transfer_and_repack_ns = 1,
                             .inference_interference_ns = 1,
                         });
@@ -2191,18 +2188,18 @@ namespace llaminar2::test
                  .layer = 0,
                  .nanoseconds_per_activation = {100, 100, 100}},
             };
-            service->participant_costs = {
+            service->setParticipantCosts(std::vector<MoERoutedParticipantLayerPhaseServiceCost>{
                 {.participant_id = 0,
                  .layer = 0,
                  .nanoseconds_per_activation = {1, 1, 1}},
                 {.participant_id = 1,
                  .layer = 0,
                  .nanoseconds_per_activation = {100, 100, 100}},
-            };
+            });
             auto migration =
                 std::make_shared<MoEOverlayMigrationCostProfile>();
             migration->identity = "root-migration-profile";
-            migration->costs = {
+            migration->setWholeCosts(std::vector<MoEOverlayParticipantLayerMigrationCost>{
                 {.source_participant = 0,
                  .destination_participant = 1,
                  .layer = 0,
@@ -2211,7 +2208,7 @@ namespace llaminar2::test
                  .destination_participant = 0,
                  .layer = 0,
                  .transfer_and_repack_ns = 1},
-            };
+            });
             authority->installEconomyCertification(
                 std::move(service),
                 std::move(migration),

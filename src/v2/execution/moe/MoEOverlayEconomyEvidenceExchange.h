@@ -15,6 +15,7 @@
 #include "MoEOverlayInferenceInterferenceProbe.h"
 #include "MoEOverlayMigrationMeasurementExchange.h"
 #include "MoEOverlayMigrationTargetCoordinate.h"
+#include "MoEOverlayPreparedTargetService.h"
 
 #include <cstdint>
 #include <string>
@@ -269,6 +270,21 @@ namespace llaminar2
         virtual MoEOverlayResidencyWaveProgress pollService(
             std::vector<MoEOverlayParticipantLayerServiceTotals> *result,
             std::string *error = nullptr) = 0;
+
+        /** @brief Begin prepared-only root evidence on the existing lane; never use live packet totals.
+         * @param plan Original checked declarations. @param local Actual local root samples. @param error Failure diagnostic.
+         * @return Whether this implementation posted the actual prepared exchange. */
+        virtual bool beginPreparedService(std::shared_ptr<const MoEOverlayPreparedTargetServicePlan>,
+            const std::vector<MoEOverlayPreparedTargetServiceTotals>&,std::string* error=nullptr) {
+            if(error)*error="Evidence owner does not implement prepared-target service exchange";return false;
+        }
+        /** @brief Poll actual prepared target evidence; unsupported owners fail rather than use legacy service.
+         * @param result Output corpus. @param error Failure diagnostic. @return Existing lifecycle progress. */
+        virtual MoEOverlayResidencyWaveProgress pollPreparedService(
+            std::vector<MoEOverlayPreparedTargetServiceTotals>*,std::string* error=nullptr) {
+            if(error)*error="Evidence owner does not implement prepared-target service exchange";
+            return MoEOverlayResidencyWaveProgress::Failed;
+        }
 
         /** @return Whether no attempt or service exchange owns resources. */
         [[nodiscard]] virtual bool idle() const noexcept = 0;
