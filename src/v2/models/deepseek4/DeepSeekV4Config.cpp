@@ -219,4 +219,12 @@ int DeepSeekV4Config::countLayers(DeepSeekV4AttentionKind kind) const noexcept
     for (const auto &policy : layer_policy_) count += policy.kind == kind;
     return count;
 }
+
+float deepSeekV4RoutedSwiGLULimit(const GGUFModel &model, int layer)
+{
+    if (model.architecture != "deepseek4")
+        return 0.0f;
+    return DeepSeekV4Config(model).layer(layer).swigluLimit;
+}
+
 } // namespace llaminar2

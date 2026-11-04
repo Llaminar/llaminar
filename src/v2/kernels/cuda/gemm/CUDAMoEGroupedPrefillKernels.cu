@@ -1048,7 +1048,8 @@ namespace
         int total_slots,
         int N,
         int K,
-        int k_partitions)
+        int k_partitions,
+        float swiglu_limit)
     {
         using Geometry = ParallelGateUpGeometry<ColumnsPerBlock>;
         const int directory_index = directoryIndexFromGrid();
@@ -1300,7 +1301,7 @@ namespace
             // supported weight format publishes the same SwiGLU FP32 word.
             const float value = quant_column_active
                                     ? llaminar2::device_swiglu_contract::
-                                          swigluValue(gate, up)
+                                          swigluValue(gate, up, swiglu_limit)
                                     : 0.0f;
 
             float abs_value =
@@ -1339,6 +1340,24 @@ namespace
         }
     }
 
+    /** @brief Clamp-free or DeepSeek-V4-clamped SwiGLU value for one weight codebook.
+     * The non-clamped path is compiled as a separate specialization so the
+     * shared IMMA schedule keeps its original register budget on every arch
+     * that carries no clamp (e.g. sm_121), while the clamped path stays
+     * available for DeepSeek-V4's MXFP4 codebook. */
+    template <bool Clamp>
+    __device__ __forceinline__ float swigluValueWithClamp(
+        float gate, float up, float limit)
+    {
+        if constexpr (Clamp)
+            return llaminar2::device_swiglu_contract::swigluValue(gate, up, limit);
+        else
+        {
+            (void)limit;
+            return llaminar2::device_swiglu_contract::swigluValue(gate, up);
+        }
+    }
+
     /**
      * @brief Execute the proven sixteen-row paired gate/up schedule.
      *
@@ -1348,7 +1367,7 @@ namespace
      * publication. Only the exact SwiGLU value enters shared memory for the
      * unchanged 32-column blockwise quantizer.
      */
-    template <uint8_t CodebookId, int ColumnsPerBlock>
+    template <uint8_t CodebookId, int ColumnsPerBlock, bool Clamp>
     __global__ __launch_bounds__(
         PairedGateUpGeometry<ColumnsPerBlock>::gate_up_threads,
         PairedGateUpGeometry<ColumnsPerBlock>::
@@ -1369,7 +1388,8 @@ namespace
         int total_slots,
         int N,
         int K,
-        int k_partitions)
+        int k_partitions,
+        float swiglu_limit)
     {
         using Geometry = PairedGateUpGeometry<ColumnsPerBlock>;
         const int directory_index = directoryIndexFromGrid();
@@ -1837,9 +1857,10 @@ namespace
                 // Keep the paired schedule byte-identical to serial decode and
                 // to the parallel gate/up schedule for every weight codebook.
                 shared_values[local_row * ColumnsPerBlock + local_column] =
-                    llaminar2::device_swiglu_contract::swigluValue(
+                    swigluValueWithClamp<Clamp>(
                         gate_total[element],
-                        up_total[element]);
+                        up_total[element],
+                        swiglu_limit);
             }
         }
         __syncthreads();
@@ -1990,6 +2011,7 @@ namespace
         int N,
         int K,
         int k_partitions,
+        float swiglu_limit,
         bool &launched)
     {
         if ((codebook_mask & (uint32_t{1} << CodebookId)) == 0)
@@ -2014,13 +2036,16 @@ namespace
             total_slots,
             N,
             K,
-            k_partitions);
+            k_partitions,
+            swiglu_limit);
         launched = true;
         return cudaGetLastError() == cudaSuccess;
     }
 
-    /** Launch one paired gate/up specialization when its mask bit exists. */
-    template <uint8_t CodebookId, int ColumnsPerBlock>
+    /** Launch one paired gate/up specialization when its mask bit exists.
+     * @tparam Clamp Whether this codebook can carry DeepSeek-V4's operand clamp;
+     *        non-clamped instantiation keeps the original register budget. */
+    template <uint8_t CodebookId, int ColumnsPerBlock, bool Clamp>
     bool launchCodebookPairedGateUpSwiGlu(
         uint32_t codebook_mask,
         const dim3 &grid,
@@ -2041,13 +2066,45 @@ namespace
         int N,
         int K,
         int k_partitions,
+        float swiglu_limit,
         bool &launched)
     {
         if ((codebook_mask & (uint32_t{1} << CodebookId)) == 0)
             return true;
-        groupedImmaPairedGateUpSwiGluKernel<
-            CodebookId,
-            ColumnsPerBlock><<<
+        if constexpr (Clamp)
+        {
+            // DeepSeek-V4's clamp applies only to its MXFP4 codebook; the
+            // clamped specialization keeps its own register budget, while the
+            // ordinary path below stays identical to the unclamped build.
+            if (swiglu_limit > 0.0f)
+            {
+                groupedImmaPairedGateUpSwiGluKernel<CodebookId, ColumnsPerBlock, true><<<
+                    grid,
+                    PairedGateUpGeometry<ColumnsPerBlock>::gate_up_threads,
+                    0,
+                    stream>>>(
+                    A_int8,
+                    scales_A,
+                    source_rows,
+                    gate_descriptors,
+                    up_descriptors,
+                    group_counts,
+                    group_offsets,
+                    directory,
+                    swiglu_int8,
+                    swiglu_scales,
+                    directory_entries,
+                    num_experts,
+                    total_slots,
+                    N,
+                    K,
+                    k_partitions,
+                    swiglu_limit);
+                launched = true;
+                return cudaGetLastError() == cudaSuccess;
+            }
+        }
+        groupedImmaPairedGateUpSwiGluKernel<CodebookId, ColumnsPerBlock, false><<<
             grid,
             PairedGateUpGeometry<ColumnsPerBlock>::gate_up_threads,
             0,
@@ -2067,7 +2124,8 @@ namespace
             total_slots,
             N,
             K,
-            k_partitions);
+            k_partitions,
+            swiglu_limit);
         launched = true;
         return cudaGetLastError() == cudaSuccess;
     }
@@ -2154,7 +2212,8 @@ namespace
         int total_slots,
         int N,
         int K,
-        int k_partitions)
+        int k_partitions,
+        float swiglu_limit)
     {
         dim3 grid;
         if (!makeProjectionGrid(N, directory_entries, ColumnsPerBlock, grid))
@@ -2168,7 +2227,7 @@ namespace
                 codebook_mask, grid, stream, A_int8, scales_A, source_rows,     \
                 gate_descriptors, up_descriptors, group_counts, group_offsets,  \
                 directory, swiglu_int8, swiglu_scales, directory_entries,       \
-                num_experts, total_slots, N, K, k_partitions, launched))         \
+                num_experts, total_slots, N, K, k_partitions, swiglu_limit, launched))         \
         {                                                                        \
             return false;                                                        \
         }                                                                        \
@@ -2219,7 +2278,8 @@ namespace
         int total_slots,
         int N,
         int K,
-        int k_partitions)
+        int k_partitions,
+        float swiglu_limit)
     {
         dim3 grid;
         if (!makeProjectionGrid(N, directory_entries, ColumnsPerBlock, grid))
@@ -2229,11 +2289,12 @@ namespace
 #define LAUNCH_PAIRED_GATE_UP_CODEBOOK(CB)                                      \
     do                                                                           \
     {                                                                            \
-        if (!launchCodebookPairedGateUpSwiGlu<CB, ColumnsPerBlock>(              \
+        if (!launchCodebookPairedGateUpSwiGlu<CB, ColumnsPerBlock,              \
+                CB == llaminar2::kNativeQuantisedMXFP4Codebook>(                 \
                 codebook_mask, grid, stream, A_int8, scales_A, source_rows,     \
                 gate_descriptors, up_descriptors, group_counts, group_offsets,  \
                 directory, swiglu_int8, swiglu_scales, directory_entries,       \
-                num_experts, total_slots, N, K, k_partitions, launched))         \
+                num_experts, total_slots, N, K, k_partitions, swiglu_limit, launched))         \
         {                                                                        \
             return false;                                                        \
         }                                                                        \
@@ -2391,7 +2452,8 @@ extern "C" bool cudaMoEGroupedImma_projectGateUpSwiGlu(
     llaminar2::cuda::moe::GroupedImmaColumns columns,
     llaminar2::cuda::moe::GroupedImmaGateUpSchedule schedule,
     int device_idx,
-    void *stream)
+    void *stream,
+    float swiglu_limit)
 {
     codebook_mask = llaminar2::cuda_native_quantised::native_quantised_iq4_launch_mask(codebook_mask);
     if (!d_A_int8 || !d_scales_A || !d_gate_desc_table ||
@@ -2426,13 +2488,13 @@ extern "C" bool cudaMoEGroupedImma_projectGateUpSwiGlu(
                          d_gate_desc_table, d_up_desc_table, d_group_counts,
                          d_group_offsets, d_directory, d_swiglu_int8,
                          d_swiglu_scales, directory_entries, num_experts,
-                         total_slots, N, K, k_partitions)
+                         total_slots, N, K, k_partitions, swiglu_limit)
                    : launchGroupedImmaGateUpTable<32>(
                          codebook_mask, cuda_stream, d_A_int8, d_scales_A, source_rows,
                          d_gate_desc_table, d_up_desc_table, d_group_counts,
                          d_group_offsets, d_directory, d_swiglu_int8,
                          d_swiglu_scales, directory_entries, num_experts,
-                         total_slots, N, K, k_partitions);
+                         total_slots, N, K, k_partitions, swiglu_limit);
     case GroupedImmaColumns::Columns64:
         return paired
                    ? launchGroupedImmaPairedGateUpTable<64>(
@@ -2440,13 +2502,13 @@ extern "C" bool cudaMoEGroupedImma_projectGateUpSwiGlu(
                          d_gate_desc_table, d_up_desc_table, d_group_counts,
                          d_group_offsets, d_directory, d_swiglu_int8,
                          d_swiglu_scales, directory_entries, num_experts,
-                         total_slots, N, K, k_partitions)
+                         total_slots, N, K, k_partitions, swiglu_limit)
                    : launchGroupedImmaGateUpTable<64>(
                          codebook_mask, cuda_stream, d_A_int8, d_scales_A, source_rows,
                          d_gate_desc_table, d_up_desc_table, d_group_counts,
                          d_group_offsets, d_directory, d_swiglu_int8,
                          d_swiglu_scales, directory_entries, num_experts,
-                         total_slots, N, K, k_partitions);
+                         total_slots, N, K, k_partitions, swiglu_limit);
     case GroupedImmaColumns::Columns128:
         return paired
                    ? launchGroupedImmaPairedGateUpTable<128>(
@@ -2454,13 +2516,13 @@ extern "C" bool cudaMoEGroupedImma_projectGateUpSwiGlu(
                          d_gate_desc_table, d_up_desc_table, d_group_counts,
                          d_group_offsets, d_directory, d_swiglu_int8,
                          d_swiglu_scales, directory_entries, num_experts,
-                         total_slots, N, K, k_partitions)
+                         total_slots, N, K, k_partitions, swiglu_limit)
                    : launchGroupedImmaGateUpTable<128>(
                          codebook_mask, cuda_stream, d_A_int8, d_scales_A, source_rows,
                          d_gate_desc_table, d_up_desc_table, d_group_counts,
                          d_group_offsets, d_directory, d_swiglu_int8,
                          d_swiglu_scales, directory_entries, num_experts,
-                         total_slots, N, K, k_partitions);
+                         total_slots, N, K, k_partitions, swiglu_limit);
     case GroupedImmaColumns::Columns256:
         return false;
     }
@@ -2559,7 +2621,8 @@ namespace
                 &attributes,
                 groupedImmaPairedGateUpSwiGluKernel<
                     CodebookId,
-                    ColumnsPerBlock>) != cudaSuccess)
+                    ColumnsPerBlock,
+                    false>) != cudaSuccess)
         {
             (void)cudaGetLastError();
             return false;
@@ -2570,7 +2633,8 @@ namespace
                 &active_blocks,
                 groupedImmaPairedGateUpSwiGluKernel<
                     CodebookId,
-                    ColumnsPerBlock>,
+                    ColumnsPerBlock,
+                    false>,
                 PairedGateUpGeometry<ColumnsPerBlock>::gate_up_threads,
                 0) != cudaSuccess)
         {

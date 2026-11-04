@@ -375,6 +375,7 @@ extern "C"
      * @param schedule Capture-time projection-to-warp ownership policy.
      * @param device_idx CUDA ordinal owning every pointer.
      * @param stream Exact non-null producer stream.
+     * @param swiglu_limit Positive DeepSeek-V4 operand clamp, or 0 for plain SwiGLU.
      * @return true when every required specialization launch was accepted.
      */
     bool cudaMoEGroupedImma_projectGateUpSwiGlu(
@@ -398,7 +399,8 @@ extern "C"
         llaminar2::cuda::moe::GroupedImmaColumns columns,
         llaminar2::cuda::moe::GroupedImmaGateUpSchedule schedule,
         int device_idx,
-        void *stream);
+        void *stream,
+        float swiglu_limit);
 
     /**
      * @brief Inspect one compiled codebook specialization without launching it.

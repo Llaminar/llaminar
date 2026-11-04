@@ -89,4 +89,14 @@ private:
     int context_length_ = 0, vocab_ = 0;
     std::vector<DeepSeekV4LayerPolicy> layer_policy_;
 };
+
+/**
+ * @brief Routed-expert SwiGLU clamp for runners that hold only the GGUF (e.g.
+ *        ExpertOverlay participant graphs).
+ * @return The authenticated `swiglu_clamp_exp` of @p layer for a `deepseek4`
+ *         model, 0 for every other architecture.
+ * @throws std::invalid_argument when DeepSeek-V4 metadata is invalid.
+ */
+float deepSeekV4RoutedSwiGLULimit(const GGUFModel &model, int layer);
+
 } // namespace llaminar2

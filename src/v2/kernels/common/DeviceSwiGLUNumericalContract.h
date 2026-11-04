@@ -127,6 +127,46 @@ namespace llaminar2::device_swiglu_contract
     }
 
     /**
+     * @brief Apply the DeepSeek-V4 SwiGLU operand clamp in place.
+     *
+     * Kernels that evaluate SwiGLU through their own (contract-equivalent)
+     * expression call this immediately before it, so the clamped program differs
+     * from the unclamped one only by these exact min/max operations.
+     *
+     * @param gate Gate value, clamped from above to @p limit.
+     * @param up Up value, clamped to [-limit, limit].
+     * @param limit Positive clamp, or <= 0 to leave both operands unchanged.
+     */
+    LLAMINAR_SWIGLU_CONTRACT_INLINE void clampOperands(float &gate, float &up, float limit)
+    {
+        if (limit > 0.0f)
+        {
+            gate = gate > limit ? limit : gate;
+            up = up > limit ? limit : (up < -limit ? -limit : up);
+        }
+    }
+
+    /**
+     * @brief Clamped SwiGLU used by DeepSeek-V4 experts.
+     *
+     * With a positive @p limit the gate is clamped from above and the up value
+     * symmetrically before the unchanged contract evaluation:
+     * `silu(min(gate, limit)) * clamp(up, -limit, limit)`. A non-positive limit
+     * is the ordinary unclamped SwiGLU, so existing callers passing 0 keep
+     * byte-identical results. min/max are exact operations on every backend.
+     *
+     * @param gate Gate-projection value.
+     * @param up Up-projection value.
+     * @param limit Model clamp (`swiglu_clamp_*`), or <= 0 for none.
+     * @return Deterministic binary32 SwiGLU value.
+     */
+    LLAMINAR_SWIGLU_CONTRACT_INLINE float swigluValue(float gate, float up, float limit)
+    {
+        clampOperands(gate, up, limit);
+        return swigluValue(gate, up);
+    }
+
+    /**
      * @brief Evaluate SiLU alone through the same shared dependency chain.
      * @param value Input activation.
      * @return Deterministic binary32 SiLU value.

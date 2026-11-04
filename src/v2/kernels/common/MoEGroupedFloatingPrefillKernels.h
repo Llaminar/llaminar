@@ -37,7 +37,8 @@ extern "C"
         int seq_len, int total_slots, int top_k, int d_model,
         int intermediate, int num_experts,
         llaminar2::DeviceMoEWeightFormat format, int device_idx, void *stream,
-        const llaminar2::MoEPrefillProjectionExecution &execution);
+        const llaminar2::MoEPrefillProjectionExecution &execution,
+        float swiglu_limit);
 #endif
 #ifdef HAVE_ROCM
     /**

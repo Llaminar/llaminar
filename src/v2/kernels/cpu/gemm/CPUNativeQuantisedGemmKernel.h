@@ -1523,6 +1523,7 @@ namespace llaminar2::cpu::native_quantised
          * @param partial_storage Admitted bank reused only after each phase's readers retire.
          * @param gate_up_ownership Independent requested gate/up ownership; defaults to typed Auto.
          * @param down_ownership Independent requested down ownership; defaults to typed Auto.
+         * @param swiglu_limit Positive DeepSeek-V4 SwiGLU operand clamp, or 0 for none.
          * @return `true` only when every team participant completes every phase.
          * @throws std::invalid_argument Before any phase writes for unsupported explicit ownership.
          */
@@ -1540,7 +1541,8 @@ namespace llaminar2::cpu::native_quantised
             int down_count,
             std::span<float> partial_storage,
             FusedOutputJobOwnership gate_up_ownership = FusedOutputJobOwnership::Auto,
-            FusedOutputJobOwnership down_ownership = FusedOutputJobOwnership::Auto)
+            FusedOutputJobOwnership down_ownership = FusedOutputJobOwnership::Auto,
+            float swiglu_limit = 0.0f)
         {
             if (!gate_up_descriptors || gate_up_count <= 0 ||
                 !down_descriptors || down_count <= 0 ||
@@ -1617,7 +1619,8 @@ namespace llaminar2::cpu::native_quantised
                     route_rows,
                     intermediate,
                     activation_blocks_per_row,
-                    gate_up_descriptors[0].kernel->numerical_policy_);
+                    gate_up_descriptors[0].kernel->numerical_policy_,
+                    swiglu_limit);
 
                 if (!multiply_batched_preq_decode_equivalent(
                         down_descriptors,
