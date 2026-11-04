@@ -335,6 +335,9 @@ public:
         require(a.positions && a.query && a.weights && a.pool && a.selected && a.topK > 0 && a.format.valid(),
                 "indexerTopK requires operands");
         const int rows = liveRows(a.extent);
+        // The CPU bundle scores every row at once; an optional score publication
+        // (diagnostics / cross-backend proof) therefore needs one row per live row.
+        require(!a.scores || a.scoreRows >= rows, "CPU indexer score publication needs scoreRows >= live rows");
         const int dim = a.format.headDim;
         const int blocks = a.format.scaleCount();
         const std::size_t entryBytes = static_cast<std::size_t>(a.format.entryBytes());
@@ -357,6 +360,7 @@ public:
                 }
                 for (int j = 0; j < blocks; ++j)
                     scale[j] = qat::exp2i(static_cast<int>(entry[a.format.scaleOffset() + j]) - 127);
+                // Exactly qat::indexerDot / indexerAccumulate's operation sequence.
                 float score = 0.0f;
                 for (int h = 0; h < a.heads; ++h)
                 {
@@ -365,12 +369,14 @@ public:
                     for (int j = 0; j < blocks; ++j)
                     {
                         float partial = 0.0f;
-                        for (int i = j * kFP4BlockSize; i < (j + 1) * kFP4BlockSize; ++i) partial += qh[i] * key[i];
-                        dot += partial * scale[j];
+                        for (int i = j * kFP4BlockSize; i < (j + 1) * kFP4BlockSize; ++i)
+                            partial = qat::fmaRn(qh[i], key[i], partial);
+                        dot = qat::fmaRn(partial, scale[j], dot);
                     }
-                    score = std::fma(std::max(dot, 0.0f), w[h] * a.weightScale, score);
+                    score = qat::indexerAccumulate(score, dot, w[h], a.weightScale);
                 }
                 scored[b] = {score, b};
+                if (a.scores) a.scores[static_cast<std::size_t>(r) * a.poolRows + b] = score;
             }
             const int keep = std::min(a.topK, visible);
             std::partial_sort(scored.begin(), scored.begin() + keep, scored.end(),
