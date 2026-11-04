@@ -39,6 +39,42 @@ namespace llaminar2
     /** @brief IQ4_XS physical tuple: nibble payload, original half base, raw six-bit coefficient. */
     inline constexpr std::uint8_t kNativeVnniIQ4XSSourceScaleCodebook = 24;
 
+    /**
+     * @brief MXFP4 source and physical codebook.
+     *
+     * The sixteen E2M1 code bytes keep the IQ4_NL nibble order and payload
+     * width; only the 16-entry signed lookup differs (doubled E2M1 values,
+     * mxfp4::kValues). The E8M0 block exponent is stored as the exact FP16
+     * scale 2^(e-128), so integer dot products, scale and contribution
+     * arithmetic are identical to IQ4_NL. Kernel dispatch policies tuned for
+     * IQ4_NL apply unchanged (see nativeVnniPolicyCodebook()).
+     */
+    inline constexpr std::uint8_t kNativeVnniMXFP4Codebook = 25;
+
+    /**
+     * @brief Whether ROCm owns kernels for a physical NativeVNNI codebook.
+     *
+     * MXFP4 (25) is implemented for CPU and CUDA only; ROCm preparation and
+     * admission reject it with an explicit diagnostic instead of reaching a
+     * generic unsupported-format branch. This is the single named ROCm gap.
+     */
+    [[nodiscard]] inline constexpr bool nativeVnniCodebookImplementedOnROCm(uint8_t codebook) noexcept
+    {
+        return codebook != kNativeVnniMXFP4Codebook;
+    }
+
+    /**
+     * @brief Map a physical codebook to the codebook whose tuned dispatch policy it reuses.
+     * @param codebook Physical or source codebook.
+     * @return 4 for the IQ4-shaped nibble-LUT tuples (IQ4_XS source scale, MXFP4),
+     *         otherwise @p codebook unchanged.
+     */
+    [[nodiscard]] inline constexpr uint8_t nativeVnniPolicyCodebook(uint8_t codebook) noexcept
+    {
+        return codebook == kNativeVnniIQ4XSSourceScaleCodebook || codebook == kNativeVnniMXFP4Codebook
+                   ? uint8_t{4} : codebook;
+    }
+
     /** @brief Test the common IQ4 lookup-table payload family.
      * @param codebook Physical accelerator codebook.
      * @return Whether the unchanged IQ4 LUT decodes its nibble payload.
@@ -103,7 +139,7 @@ namespace llaminar2
      * Accelerator execution canonicalizes several GGUF formats onto the same
      * codebook and byte layout.  Migration still needs the original codebook
      * plus superblock bit so a GPU-to-CPU stream can preserve format identity
-     * and a later promotion can authenticate all 21 supported source formats.
+     * and a later promotion can authenticate all 22 supported source formats.
      */
     struct NativeVnniSourceIdentity
     {
@@ -205,6 +241,8 @@ namespace llaminar2
             16, 6, true, true, false, 1.125f};
         inline constexpr NativeVnniFormatInfo IQ1_M{
             17, 6, true, true, false, 1.125f};
+        inline constexpr NativeVnniFormatInfo MXFP4{
+            kNativeVnniMXFP4Codebook, 16, false, false, false, 12.0f};
 
         /**
          * @brief Exhaustive set of quantized source formats accepted by the
@@ -215,7 +253,7 @@ namespace llaminar2
          * adding it here therefore fails totality gates rather than silently
          * omitting it from cross-tier correctness coverage.
          */
-        inline constexpr std::array<NativeVnniSourceFormat, 21>
+        inline constexpr std::array<NativeVnniSourceFormat, 22>
             kAllSourceFormats{{
                 {"IQ4_NL", &IQ4_NL},
                 {"Q8_0", &Q8_0},
@@ -238,6 +276,7 @@ namespace llaminar2
                 {"IQ3_S", &IQ3_S},
                 {"IQ1_S", &IQ1_S},
                 {"IQ1_M", &IQ1_M},
+                {"MXFP4", &MXFP4},
             }};
 
         /**
@@ -317,9 +356,13 @@ namespace llaminar2
     [[nodiscard]] inline constexpr uint8_t canonicalDeviceVnniCodebookId(
         uint8_t source_codebook_id) noexcept
     {
+        // MXFP4 executes as its own physical tuple (25) but shares the IQ4_NL
+        // arithmetic policy: identical payload geometry, FP16 scale and
+        // contribution tree, so IQ4_NL's certified schedules apply verbatim.
         return source_codebook_id == 20 || source_codebook_id == 21
                    ? static_cast<uint8_t>(19)
-                   : source_codebook_id;
+                   : source_codebook_id == kNativeVnniMXFP4Codebook ? uint8_t{4}
+                                                                     : source_codebook_id;
     }
 
     /**
@@ -349,9 +392,11 @@ namespace llaminar2
     canonicalDeviceVnniFormat(const NativeVnniFormatInfo &source) noexcept
     {
         const bool iq4xs = source.codebook_id == 4 && source.is_superblock;
+        const bool mxfp4 = source.codebook_id == kNativeVnniMXFP4Codebook;
         return {
             .codebook_id = iq4xs ? kNativeVnniIQ4XSSourceScaleCodebook
-                                : canonicalDeviceVnniCodebookId(source.codebook_id),
+                         : mxfp4 ? kNativeVnniMXFP4Codebook
+                                 : canonicalDeviceVnniCodebookId(source.codebook_id),
             .payload_bytes_per_block = static_cast<uint8_t>(source.payload_bytes),
             .is_asymmetric = source.is_asymmetric || iq4xs || source.codebook_id == 11,
             .has_emins = source.has_emins,
@@ -405,8 +450,11 @@ namespace llaminar2
         const NativeVnniFormatInfo &source) noexcept
     {
         if (source.codebook_id == 0 || source.codebook_id == 4 ||
-            source.codebook_id == 5 || source.codebook_id == 11)
+            source.codebook_id == 5 || source.codebook_id == 11 ||
+            source.codebook_id == kNativeVnniMXFP4Codebook)
         {
+            // Nibble payloads, including MXFP4 codes with their exact FP16
+            // scale, survive a CPU-tier round trip unchanged.
             return canonicalDeviceVnniFormat(source);
         }
         if (source.codebook_id == 8 ||

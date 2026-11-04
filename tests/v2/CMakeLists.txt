@@ -856,6 +856,17 @@ add_executable(v2_test_qwen4exp_metadata
     unit/loaders/Test__GGUFIntegerArrays.cpp
 )
 target_link_libraries(v2_test_qwen4exp_metadata PRIVATE llaminar2_core GTest::gtest_main)
+# OCP MXFP4 (GGUF type 39): exact decode, NativeVNNI packing and CPU projection.
+add_executable(v2_test_mxfp4_tensor unit/tensors/Test__MXFP4Tensor.cpp)
+target_link_libraries(v2_test_mxfp4_tensor PRIVATE llaminar2_core GTest::gtest_main)
+target_include_directories(v2_test_mxfp4_tensor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_v2_test(V2_Unit_MXFP4Tensor
+    COMMAND $<TARGET_FILE:v2_test_mxfp4_tensor>
+    LABELS "V2;Unit;Tensors;MXFP4;CPU;Kernels"
+    MPI_PROCS 1
+    NO_MODELS
+    NO_MPI
+)
 add_v2_test(V2_Unit_Qwen4ExpMetadata
     COMMAND $<TARGET_FILE:v2_test_qwen4exp_metadata>
     LABELS "V2;Unit;Models;Qwen4Exp;Loaders"

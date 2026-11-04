@@ -12,6 +12,7 @@
 #include "QuantizedVerifierFormats.h"
 #include "kernels/common/DeviceNativeVNNIMatrixDesc.h"
 #include "kernels/cpu/gemm/CPUNativeVNNIDecode.h"
+#include "tensors/MXFP4Format.h"
 #include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 #include <algorithm>
 #include <array>
@@ -229,6 +230,7 @@ cpuWeights(const cpu::native_vnni::CPUNativeVNNIPackedWeights &p) {
             const int q = (byte >> (i < 16 ? 0 : 4)) & 15;
             value = p.codebook_id == 0   ? q - 8
                     : p.codebook_id == 5 ? q
+                    : p.codebook_id == kNativeVnniMXFP4Codebook ? mxfp4::kValues[q]
                                          : kvalues_iq4nl[q];
           } else
             value =
