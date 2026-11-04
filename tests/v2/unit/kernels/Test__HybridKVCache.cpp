@@ -167,6 +167,71 @@ namespace llaminar2::test
         }
     }
 
+    /** @brief Model-state layers own neither KV nor GDN storage; unknown tokens are fatal. */
+    TEST_F(Test__HybridLayerMap, ModelStateLayersOwnNoCacheStorage)
+    {
+        HybridLayerMap map;
+        map.build({"full_attention", kHybridModelStateLayerType, "gdn", kHybridModelStateLayerType});
+        EXPECT_EQ(map.kvLayerCount(), 1);
+        EXPECT_EQ(map.gdnLayerCount(), 1);
+        EXPECT_EQ(map.modelStateLayerCount(), 2);
+        EXPECT_EQ(map.kind(1), HybridLayerKind::ModelState);
+        EXPECT_FALSE(map.isFullAttention(1));
+        EXPECT_FALSE(map.isGDN(1));
+        EXPECT_TRUE(map.isModelState(3));
+        EXPECT_EQ(map.toKVIndex(3), -1);
+        EXPECT_EQ(map.toGDNIndex(3), -1);
+        EXPECT_EQ(map.toGDNIndex(2), 0);
+        EXPECT_THROW(map.build({"full_attention", "linear_attention"}), std::invalid_argument);
+        HybridKVCacheConfig config;
+        config.layer_types = {kHybridModelStateLayerType, "gdn", "full_attention"};
+        EXPECT_EQ(config.countKVLayers(), 1);
+        EXPECT_EQ(config.countGDNLayers(), 1);
+        EXPECT_EQ(config.countModelStateLayers(), 1);
+    }
+
+    /**
+     * @brief A frontier-only (all model_state) CPU cache: no payload, no GDN
+     *        owner, zero priced bytes, request reset and per-layer reset accepted.
+     */
+    TEST(Test__ModelStateHybridKVCache, CPUFrontierOnlyCacheOwnsNoPayload)
+    {
+        HybridKVCacheConfig hybrid;
+        hybrid.layer_types.assign(43, kHybridModelStateLayerType);
+        hybrid.n_heads = 64;
+        KVCacheConfig config;
+        config.precision = ActivationPrecision::FP16;
+        config.device = DeviceId::cpu();
+        config.num_layers = 43;
+        config.batch_size = 1;
+        config.max_seq_len = 1 << 20;
+        config.n_kv_heads = 1;
+        config.head_dim = 512;
+        config.mpi_ctx = &getTestMPIContext();
+        config.hybrid_config = &hybrid;
+        EXPECT_EQ(config.estimateBytes(), 0u);
+        auto cache = KernelFactory::createKVCache(config);
+        ASSERT_NE(cache, nullptr);
+        auto *view = dynamic_cast<IHybridKVCache *>(cache.get());
+        ASSERT_NE(view, nullptr);
+        EXPECT_EQ(cache->n_layers(), 43);
+        EXPECT_EQ(view->kvLayerCount(), 0);
+        EXPECT_EQ(view->gdnLayerCount(), 0);
+        for (int layer = 0; layer < 43; ++layer)
+        {
+            EXPECT_FALSE(view->isGDNLayer(layer));
+            EXPECT_FALSE(view->isFullAttentionLayer(layer));
+            EXPECT_EQ(view->getGDNState(layer), nullptr);
+            EXPECT_EQ(cache->get_cached_tokens(layer), 0);
+        }
+        IKVCache::StateResetContext reset;
+        reset.reason = "model_state_unit";
+        EXPECT_TRUE(cache->resetRequestState(reset));
+        reset.boundary = IKVCache::StateResetBoundary::TestReinitialization;
+        EXPECT_TRUE(cache->resetLayerState(5, reset));
+        EXPECT_TRUE(cache->resetLayerSequenceState(42, 0, reset));
+    }
+
     // =============================================================================
     // Test: canonical GDN geometry and physical byte formulas
     // =============================================================================

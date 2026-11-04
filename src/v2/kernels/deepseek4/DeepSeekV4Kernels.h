@@ -26,12 +26,19 @@
  * never read by GPU launch code. Matrices are contiguous and row-major.
  *
  * Mathematical source: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
- * inference/model.py @ 6821d6ad, without its QAT activation simulations,
- * which is also how llama.cpp evaluates the model. The Python oracle is
- * python/reference/deepseek4.py.
+ * inference/model.py @ 6821d6ad, including its QAT activation rounding
+ * (FP8 window/compressed kv, Hadamard + FP4 indexer q/k). The persistent
+ * banks store exactly those values in compact records (DeepSeekV4KVFormat.h):
+ * the raw window ring and compressed pools are 584-byte fp8_ds_mla entries,
+ * the indexer pool holds 68-byte MXFP4 keys, and only the O(ratio)
+ * compressor state stays FP32. The Python oracle is
+ * python/reference/deepseek4.py (QAT on by default).
  */
 #pragma once
 
+#include "DeepSeekV4KVFormat.h"
+
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 
@@ -126,23 +133,35 @@ struct HCExpandArgs
 };
 
 /**
- * @brief Per-head RMS normalization followed by partial RoPE, in place.
+ * @brief Per-head RMS normalization, partial RoPE and optional QAT rounding, in place.
  * @details y = rms(x) * gain (gain optional), then rotate trailing channels at
- * the row's absolute position (inverse rotation when @c inverse is set).
- * With @c normalize false only the rotation is applied.
+ * the row's absolute position (inverse rotation when @c inverse is set), then
+ * apply @c quant to every head vector (see DeepSeekV4KVFormat.h). With
+ * @c normalize false only the rotation (and quantization) is applied.
  */
 struct HeadNormRopeArgs
 {
     RowExtent extent;                      ///< Live token rows.
     int heads = 1;                         ///< Heads per row.
-    int headDim = 0;                       ///< Channels per head (>= ropeDim).
+    int headDim = 0;                       ///< Channels per head (>= ropeDim, <= kMaxHeadDim).
     bool normalize = true;                 ///< Apply RMS normalization before rotation.
     float eps = 1e-6f;                     ///< RMS epsilon.
     const float *gain = nullptr;           ///< Optional [headDim] gain shared by all heads.
     RopePolicy rope;                       ///< Layer rotation policy.
     bool inverse = false;                  ///< Rotate by -angle (attention output de-rotation).
+    ActivationQuant quant = ActivationQuant::None; ///< Official QAT post-operation.
     const std::int32_t *positions = nullptr; ///< [rows] absolute positions.
     float *data = nullptr;                 ///< [rows, heads, headDim], updated in place.
+};
+
+/** @brief Largest head width any DeepSeek-V4 primitive accepts (GPU shared-memory staging). */
+inline constexpr int kMaxHeadDim = 512;
+
+/** @brief Which compressed stream a compressor produces, and therefore its packed record. */
+enum class CompressedStream : std::uint8_t
+{
+    Attention, ///< Main KV: FP8 nope + BF16 rope (PackedKVEntryFormat).
+    Indexer,   ///< Indexer keys: Hadamard + MXFP4 (PackedIndexerKeyFormat).
 };
 
 /**
@@ -152,76 +171,112 @@ struct HeadNormRopeArgs
  * block b (8 entries per channel). Ratio 128 pools headDim channels of its own
  * 128 tokens. Pooling is a per-channel softmax over entries of
  * (score + ape[position % ratio]) weighting the projected kv.
+ *
+ * Projections of the current chunk are read directly from the chunk's
+ * projection scratch; earlier positions come from the carried state of the
+ * last stateRows() positions (the official kv_state/score_state), slot
+ * position % stateRows(). Rows of one call carry contiguous positions.
  */
 struct CompressorGeometry
 {
     int ratio = 4;          ///< Tokens per block (4 or 128).
     int headDim = 0;        ///< Compressed entry width.
-    int ringRows = 0;       ///< Projection ring capacity (>= max chunk rows + 2 * ratio).
     int poolRows = 0;       ///< Compressed pool capacity (max context / ratio).
+    CompressedStream stream = CompressedStream::Attention; ///< Output record format.
+    int ropeDim = 0;        ///< Rope channels of the record (Attention stream).
     DSV4_HD bool overlap() const noexcept { return ratio == 4; }
     DSV4_HD int projectionWidth() const noexcept { return overlap() ? 2 * headDim : headDim; }
+    DSV4_HD int stateRows() const noexcept { return 2 * ratio; }
+    /** @brief Packed record bytes of one pool row. */
+    DSV4_HD int entryBytes() const noexcept
+    {
+        return stream == CompressedStream::Attention ? PackedKVEntryFormat{headDim, ropeDim}.entryBytes()
+                                                     : PackedIndexerKeyFormat{headDim}.entryBytes();
+    }
 };
 
-/** @brief Store per-token compressor projections into the position-indexed ring. */
+/**
+ * @brief Carry the last stateRows() live positions' projections into the state ring.
+ * @details Runs after the paired pool has read the previous state. Only rows
+ * with position > lastLivePosition - stateRows() are written, so every slot
+ * has at most one writer.
+ */
 struct CompressorStoreArgs
 {
     RowExtent extent;                        ///< Live token rows.
     CompressorGeometry geometry;             ///< Layer stream geometry.
-    const std::int32_t *positions = nullptr; ///< [rows] absolute positions.
+    const std::int32_t *positions = nullptr; ///< [rows] contiguous absolute positions.
     const float *kv = nullptr;               ///< [rows, projectionWidth] kv projection.
     const float *score = nullptr;            ///< [rows, projectionWidth] gate projection.
     const float *ape = nullptr;              ///< [ratio, projectionWidth] learned position bias (FP32).
-    float *ringKV = nullptr;                 ///< [ringRows, projectionWidth] slot = position % ringRows.
-    float *ringScore = nullptr;              ///< [ringRows, projectionWidth] score + ape.
+    float *stateKV = nullptr;                ///< [stateRows, projectionWidth].
+    float *stateScore = nullptr;             ///< [stateRows, projectionWidth] score + ape.
 };
 
-/** @brief Pool every block completed by a live row into the compressed pool. */
+/**
+ * @brief Pool every block completed by a live row, QAT-round it and pack it into the pool.
+ * @details Entry e of the block at position p reads the chunk scratch when
+ * p >= positions[0], else the carried state. The pooled vector is
+ * RMS-normalized with @c gain, rotated at the block's first position, then
+ * quantized: Attention -> FP8 nope + BF16 rope; Indexer -> Hadamard + MXFP4.
+ */
 struct CompressorPoolArgs
 {
     RowExtent extent;                        ///< Live token rows.
     CompressorGeometry geometry;             ///< Layer stream geometry.
-    const std::int32_t *positions = nullptr; ///< [rows] absolute positions.
-    const float *ringKV = nullptr;           ///< Ring written by the paired store.
-    const float *ringScore = nullptr;        ///< Ring written by the paired store.
+    const std::int32_t *positions = nullptr; ///< [rows] contiguous absolute positions.
+    const float *kv = nullptr;               ///< [rows, projectionWidth] chunk kv projection.
+    const float *score = nullptr;            ///< [rows, projectionWidth] chunk gate projection (no ape).
+    const float *ape = nullptr;              ///< [ratio, projectionWidth].
+    const float *stateKV = nullptr;          ///< [stateRows, projectionWidth] carried earlier positions.
+    const float *stateScore = nullptr;       ///< [stateRows, projectionWidth] carried score + ape.
     const float *gain = nullptr;             ///< [headDim] compressor RMSNorm gain.
     float eps = 1e-6f;                       ///< RMS epsilon.
     RopePolicy rope;                         ///< Rotation at block position b * ratio.
-    float *pool = nullptr;                   ///< [poolRows, headDim] completed entries.
+    std::uint8_t *pool = nullptr;            ///< [poolRows, entryBytes] packed completed entries.
 };
 
-/** @brief Store raw (normalized, rotated) window kv rows into a position-indexed ring. */
+/**
+ * @brief Pack the last @c window live kv rows into the persistent raw window ring.
+ * @details Runs after every reader of the previous window (sparse attention).
+ * Slot = position % window; only rows with position > lastLivePosition - window
+ * are written.
+ */
 struct RawStoreArgs
 {
     RowExtent extent;                        ///< Live token rows.
-    int headDim = 0;                         ///< Entry width.
-    int ringRows = 0;                        ///< Capacity (>= max chunk rows + window).
-    const std::int32_t *positions = nullptr; ///< [rows] absolute positions.
-    const float *kv = nullptr;               ///< [rows, headDim].
-    float *ring = nullptr;                   ///< [ringRows, headDim].
+    PackedKVEntryFormat format;              ///< Record layout.
+    int window = 0;                          ///< Ring rows (the attention window).
+    const std::int32_t *positions = nullptr; ///< [rows] contiguous absolute positions.
+    const float *kv = nullptr;               ///< [rows, headDim] QAT-rounded kv.
+    std::uint8_t *ring = nullptr;            ///< [window, entryBytes].
 };
 
 /**
  * @brief Lightning-indexer scoring and bounded top-k over visible blocks.
- * @details score(p, b) = sum_h relu(q[p, h] . k[b]) * w[p, h] for b < (p + 1) / ratio.
- * The @c min(topK, visible) best blocks (score descending, ascending block id
- * on exact ties) are written as a set in ascending block order; remaining
- * slots are -1. GPU backends require @c scores as [rows, poolRows] scratch.
+ * @details score(p, b) = sum_h relu(q[p, h] . k[b]) * (w[p, h] * weightScale),
+ * accumulated over heads with fused multiply-add in ascending head order; each
+ * head dot is qat::indexerDot (exact per 32-block). The min(topK, visible)
+ * best blocks (score descending, ascending block id on exact ties) are
+ * written as a set in ascending block order; remaining slots are -1.
+ * GPU backends score at most @c scoreRows rows per pass into @c scores, so
+ * scratch is bounded independently of the chunk size.
  */
 struct IndexerTopKArgs
 {
     RowExtent extent;                        ///< Live token rows.
     int heads = 0;                           ///< Indexer heads.
-    int headDim = 0;                         ///< Indexer key width.
+    PackedIndexerKeyFormat format;           ///< Key record layout (headDim).
     int ratio = 4;                           ///< Compression ratio of the indexed pool.
     int topK = 0;                            ///< Selection bound.
     int poolRows = 0;                        ///< Pool capacity.
+    int scoreRows = 0;                       ///< Rows per scoring pass (rows of @c scores).
     const std::int32_t *positions = nullptr; ///< [rows] absolute positions.
-    const float *query = nullptr;            ///< [rows, heads, headDim] rotated queries.
+    const float *query = nullptr;            ///< [rows, heads, headDim] rotated FP4-QAT queries.
     const float *weights = nullptr;          ///< [rows, heads] head weights (weights_proj output).
     float weightScale = 1.0f;                ///< Multiplier on @c weights (headDim^-0.5 * heads^-0.5).
-    const float *pool = nullptr;             ///< [poolRows, headDim] compressed indexer keys.
-    float *scores = nullptr;                 ///< [rows, poolRows] scratch (required on GPU, optional on CPU).
+    const std::uint8_t *pool = nullptr;      ///< [poolRows, entryBytes] packed indexer keys.
+    float *scores = nullptr;                 ///< [scoreRows, poolRows] scratch (GPU; unused on CPU).
     std::int32_t *selected = nullptr;        ///< [rows, topK] selected block ids or -1.
 };
 
@@ -235,8 +290,9 @@ enum class CompressedAccess : std::uint8_t
 
 /**
  * @brief Sparse sink attention for one layer.
- * @details For query row p: keys are raw ring rows of positions
- * [max(0, p - window + 1), p] plus compressed entries per @c access. K == V.
+ * @details For query row p: keys are the raw kv of positions
+ * [max(0, p - window + 1), p] (the chunk's QAT kv for positions >= positions[0],
+ * else the packed window ring) plus compressed entries per @c access. K == V.
  * out = sum softmax(q . k * scale) k with the softmax denominator augmented by
  * exp(sink[h]). The output is then de-rotated (inverse RoPE at p).
  */
@@ -244,18 +300,18 @@ struct SparseAttentionArgs
 {
     RowExtent extent;                        ///< Live token rows.
     int heads = 0;                           ///< Query heads.
-    int headDim = 0;                         ///< Head width (== kv width).
-    int window = 0;                          ///< Raw sliding window.
-    int rawRingRows = 0;                     ///< Raw ring capacity.
+    PackedKVEntryFormat format;              ///< Ring/pool record layout; format.headDim is the head width.
+    int window = 0;                          ///< Raw sliding window (= ring rows).
     int ratio = 0;                           ///< Compression ratio (0 = none).
     int topK = 0;                            ///< Row stride of @c selected.
     CompressedAccess access = CompressedAccess::None;
     float scale = 1.0f;                      ///< Softmax scale (headDim^-0.5).
     RopePolicy rope;                         ///< Output de-rotation policy.
-    const std::int32_t *positions = nullptr; ///< [rows] absolute positions.
+    const std::int32_t *positions = nullptr; ///< [rows] contiguous absolute positions.
     const float *query = nullptr;            ///< [rows, heads, headDim] normalized rotated queries.
-    const float *rawRing = nullptr;          ///< [rawRingRows, headDim].
-    const float *pool = nullptr;             ///< [poolRows, headDim] compressed kv (may be null for None).
+    const float *chunkKV = nullptr;          ///< [rows, headDim] QAT kv of this chunk.
+    const std::uint8_t *rawRing = nullptr;   ///< [window, entryBytes] packed earlier positions.
+    const std::uint8_t *pool = nullptr;      ///< [poolRows, entryBytes] packed compressed kv (None: null).
     const std::int32_t *selected = nullptr;  ///< [rows, topK] for Selected.
     const float *sinks = nullptr;            ///< [heads] attention sink logits.
     float *output = nullptr;                 ///< [rows, heads, headDim] de-rotated output.
@@ -340,6 +396,12 @@ public:
     virtual void groupedProjection(const GroupedProjectionArgs &args, void *stream) const = 0;
     /** @brief sqrt(softplus) score or hash MoE routing. */
     virtual void route(const SqrtSoftplusRouteArgs &args, void *stream) const = 0;
+    /**
+     * @brief Zero a persistent state bank once at setup, before any capture.
+     * @param destination Execution-device bytes (4-byte aligned).
+     * @param bytes Multiple of 4.
+     */
+    virtual void zeroBank(void *destination, std::size_t bytes, void *stream) const = 0;
 };
 
 /** @brief Construct the CPU bundle outside captured execution. */

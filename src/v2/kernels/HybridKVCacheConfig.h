@@ -23,7 +23,9 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -177,6 +179,40 @@ namespace llaminar2
     };
 
     /**
+     * @brief Typed per-layer state ownership of a hybrid cache.
+     *
+     * Strings exist only at the GraphConfig/HybridKVCacheConfig boundary;
+     * everything behind HybridLayerMap uses this enum.
+     */
+    enum class HybridLayerKind : std::uint8_t
+    {
+        FullAttention, ///< "full_attention": KV payload in the canonical ring cache.
+        GDN,           ///< "gdn": cache-owned recurrence + short-conv state.
+        ModelState,    ///< "model_state": no cache payload; the model owns the layer's
+                       ///< attention state in its arena banks (DeepSeek-V4). The cache
+                       ///< still owns the sequence frontier.
+    };
+
+    /** @brief Canonical config token of a model-owned-state layer. */
+    inline constexpr const char *kHybridModelStateLayerType = "model_state";
+
+    /**
+     * @brief Parse a layer-type token; unknown tokens are a fatal configuration error.
+     * @throws std::invalid_argument for anything but the three canonical tokens.
+     */
+    inline HybridLayerKind parseHybridLayerKind(const std::string &type)
+    {
+        if (type == "full_attention")
+            return HybridLayerKind::FullAttention;
+        if (type == "gdn")
+            return HybridLayerKind::GDN;
+        if (type == kHybridModelStateLayerType)
+            return HybridLayerKind::ModelState;
+        throw std::invalid_argument("Hybrid KV cache layer type '" + type +
+                                    "' is not full_attention, gdn or model_state");
+    }
+
+    /**
      * @brief Configuration for creating a hybrid KV cache
      *
      * Extends the standard KVCacheConfig with layer type information and
@@ -184,9 +220,9 @@ namespace llaminar2
      */
     struct HybridKVCacheConfig
     {
-        /// Per-layer type: "full_attention" or "gdn"
-        /// Size must equal total n_layers for single-device caches, or the
-        /// local stage layer count for PP stage-local caches.
+        /// Per-layer type: "full_attention", "gdn" or "model_state" (see
+        /// HybridLayerKind). Size must equal total n_layers for single-device
+        /// caches, or the local stage layer count for PP stage-local caches.
         std::vector<std::string> layer_types;
 
         /// Global index of layer_types[0]. Non-zero for PP stage-local caches.
@@ -239,21 +275,22 @@ namespace llaminar2
         }
 
         /// Count the number of full-attention layers
-        int countKVLayers() const
+        int countKVLayers() const { return countLayers(HybridLayerKind::FullAttention); }
+
+        /** @return Number of recurrent/GDN layers in this cache shard. */
+        int countGDNLayers() const { return countLayers(HybridLayerKind::GDN); }
+
+        /** @return Number of layers whose state is owned by the model's own banks. */
+        int countModelStateLayers() const { return countLayers(HybridLayerKind::ModelState); }
+
+        /** @return Layers of @p kind; throws on an unknown layer-type token. */
+        int countLayers(HybridLayerKind kind) const
         {
             int count = 0;
             for (const auto &t : layer_types)
-            {
-                if (t == "full_attention")
+                if (parseHybridLayerKind(t) == kind)
                     ++count;
-            }
             return count;
-        }
-
-        /** @return Number of recurrent/GDN layers in this cache shard. */
-        int countGDNLayers() const
-        {
-            return static_cast<int>(layer_types.size()) - countKVLayers();
         }
     };
 
@@ -261,7 +298,8 @@ namespace llaminar2
      * @brief Layer mapping utility for hybrid KV caches
      *
      * Provides bidirectional mapping between global layer indices (0..n_layers-1)
-     * and compressed KV cache layer indices (0..kv_layer_count-1).
+     * and compressed KV cache layer indices (0..kv_layer_count-1). Model-state
+     * layers have neither a KV nor a GDN index.
      *
      * Example for Qwen 3.5 4B with 36 layers, full_attention_interval=4:
      *   Global:  0  1  2  3  4  5  6  7  8  ...  35
@@ -276,35 +314,65 @@ namespace llaminar2
 
         /**
          * @brief Build the layer mapping from layer type strings
-         * @param layer_types Per-layer type ("full_attention" or "gdn")
+         * @param layer_types Per-layer type tokens (parseHybridLayerKind)
+         * @throws std::invalid_argument on an unknown token
          */
         void build(const std::vector<std::string> &layer_types)
         {
             const int n = static_cast<int>(layer_types.size());
-            global_to_kv_.resize(n, -1);
-            global_to_gdn_.resize(n, -1);
-            is_fa_.resize(n, false);
+            global_to_kv_.assign(n, -1);
+            global_to_gdn_.assign(n, -1);
+            kinds_.assign(n, HybridLayerKind::FullAttention);
 
             int kv_idx = 0;
             int gdn_idx = 0;
+            int model_state = 0;
             for (int i = 0; i < n; ++i)
             {
-                if (layer_types[i] == "full_attention")
+                kinds_[i] = parseHybridLayerKind(layer_types[i]);
+                switch (kinds_[i])
                 {
+                case HybridLayerKind::FullAttention:
                     global_to_kv_[i] = kv_idx++;
-                    is_fa_[i] = true;
-                }
-                else
-                {
+                    break;
+                case HybridLayerKind::GDN:
                     global_to_gdn_[i] = gdn_idx++;
+                    break;
+                case HybridLayerKind::ModelState:
+                    ++model_state;
+                    break;
                 }
             }
             n_total_ = n;
             n_kv_ = kv_idx;
             n_gdn_ = gdn_idx;
+            n_model_state_ = model_state;
 
             LOG_DEBUG("[HybridLayerMap] Built mapping: " << n_total_ << " total layers, "
-                                                         << n_kv_ << " KV (FA), " << n_gdn_ << " GDN");
+                                                         << n_kv_ << " KV (FA), " << n_gdn_ << " GDN, "
+                                                         << n_model_state_ << " model-state");
+        }
+
+        /// Typed kind of a global layer (throws outside the map)
+        HybridLayerKind kind(int global_layer) const
+        {
+            if (global_layer < 0 || global_layer >= n_total_)
+                throw std::out_of_range("HybridLayerMap layer index is outside the cache");
+            return kinds_[global_layer];
+        }
+
+        /// Check if a global layer is a GDN (recurrent) layer
+        bool isGDN(int global_layer) const
+        {
+            return global_layer >= 0 && global_layer < n_total_ &&
+                   kinds_[global_layer] == HybridLayerKind::GDN;
+        }
+
+        /// Check if a global layer's state is model-owned
+        bool isModelState(int global_layer) const
+        {
+            return global_layer >= 0 && global_layer < n_total_ &&
+                   kinds_[global_layer] == HybridLayerKind::ModelState;
         }
 
         /// Map global layer index to KV cache index (-1 if GDN layer)
@@ -328,20 +396,22 @@ namespace llaminar2
         {
             if (global_layer < 0 || global_layer >= n_total_)
                 return false;
-            return is_fa_[global_layer];
+            return kinds_[global_layer] == HybridLayerKind::FullAttention;
         }
 
         int totalLayers() const { return n_total_; }
         int kvLayerCount() const { return n_kv_; }
         int gdnLayerCount() const { return n_gdn_; }
+        int modelStateLayerCount() const { return n_model_state_; }
 
     private:
         std::vector<int> global_to_kv_;  ///< Global layer → KV cache index (-1 for GDN)
         std::vector<int> global_to_gdn_; ///< Global layer → GDN state index (-1 for FA)
-        std::vector<bool> is_fa_;        ///< True if full-attention layer
+        std::vector<HybridLayerKind> kinds_; ///< Typed kind of every layer
         int n_total_ = 0;
         int n_kv_ = 0;
         int n_gdn_ = 0;
+        int n_model_state_ = 0;
     };
 
 } // namespace llaminar2

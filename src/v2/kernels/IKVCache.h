@@ -657,10 +657,11 @@ namespace llaminar2
         }
 
         /**
-         * @brief Publish progress after a GPU recurrent layer without KV appends.
+         * @brief Publish progress after a GPU recurrent or model-state layer without KV appends.
          *
-         * Hybrid caches advance once, at their last recurrent layer, only when
-         * no attention layer already owns the sequence frontier. Other layers
+         * Hybrid caches advance once, at their last layer, only when no
+         * attention layer already owns the sequence frontier (all-GDN slices
+         * and DeepSeek-V4's model_state layers, whose terminal layer calls this). Other layers
          * are explicit no-ops. GPU implementations consume resident real row
          * counts; this interface never observes or mirrors device values.
          *

@@ -7,6 +7,9 @@ DIR is a LLAMINAR_STAGE_DUMP_DIR of a greedy oneshot run. Occurrences of a stage
 are ordered by their dump index; the first has the prompt's row count (prefill),
 later one-row occurrences are decode steps. Decode step k is compared against the
 last row of a full-recompute reference over prompt + generated[:k].
+The reference applies the official QAT rounding (stored kv FP8/BF16, indexer
+q/k Hadamard + FP4) unless --no-qat is given; Llaminar's kv_norm_rope output is
+the QAT-rounded window kv it stores in its packed ring.
 """
 import argparse, glob, os, re, sys
 from pathlib import Path
@@ -58,10 +61,12 @@ def main():
     ap.add_argument("--dump", required=True)
     ap.add_argument("--prompt-tokens", required=True)
     ap.add_argument("--generated", default="")
+    ap.add_argument("--no-qat", action="store_true",
+                    help="compare against the pre-QAT formulation (llama.cpp's); default is the official QAT oracle")
     a = ap.parse_args()
     prompt = [int(t) for t in a.prompt_tokens.split()]
     generated = [int(t) for t in a.generated.split()]
-    ref = DeepSeekV4Reference(a.gguf)
+    ref = DeepSeekV4Reference(a.gguf, qat=not a.no_qat)
     occurrences = {}
     for d in glob.glob(os.path.join(a.dump, "stage_*")):
         m = re.match(r"stage_(\d+)_[A-Z0-9_]+?_(layer\d+)_(.+)_rank\d+$", os.path.basename(d))
