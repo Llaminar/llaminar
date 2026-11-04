@@ -52,18 +52,6 @@ namespace llaminar2
     inline constexpr std::uint8_t kNativeVnniMXFP4Codebook = 25;
 
     /**
-     * @brief Whether ROCm owns kernels for a physical NativeVNNI codebook.
-     *
-     * MXFP4 (25) is implemented for CPU and CUDA only; ROCm preparation and
-     * admission reject it with an explicit diagnostic instead of reaching a
-     * generic unsupported-format branch. This is the single named ROCm gap.
-     */
-    [[nodiscard]] inline constexpr bool nativeVnniCodebookImplementedOnROCm(uint8_t codebook) noexcept
-    {
-        return codebook != kNativeVnniMXFP4Codebook;
-    }
-
-    /**
      * @brief Map a physical codebook to the codebook whose tuned dispatch policy it reuses.
      * @param codebook Physical or source codebook.
      * @return 4 for the IQ4-shaped nibble-LUT tuples (IQ4_XS source scale, MXFP4),

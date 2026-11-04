@@ -13,6 +13,7 @@
 #include "kernels/rocm/repack/ROCmExpertTierWeightKernels.h"
 #include "backends/rocm/HipDeviceGuard.h"
 #include "tensors/NativeVnniIQ3SScale.h"
+#include "kernels/rocm/gemm/ROCmNativeVNNINibbleLUT.h"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -487,7 +488,7 @@ namespace llaminar2
 
         /**
          * @brief Decode one compact value for the CPU compensation vector.
-         * @tparam Codebook Nibble execution codebook 0, 4, or 5.
+         * @tparam Codebook Nibble execution codebook 0, 4, 5 or 25 (MXFP4).
          * @param value Four-bit quantized value.
          * @return Signed/unsigned decoded integer consumed by CPU VNNI.
          */
@@ -499,6 +500,14 @@ namespace llaminar2
                 return static_cast<int>(value) - 8;
             if constexpr (Codebook == 4)
                 return static_cast<int>(kTierIQ4ValuesROCm[value]);
+            if constexpr (Codebook == kNativeVnniMXFP4Codebook)
+            {
+                // Register lookup of the doubled E2M1 values (no constant-memory table).
+                constexpr auto lut = rocm::nibble_lut::words<kNativeVnniMXFP4Codebook>();
+                const std::uint32_t packed = value < 4u ? lut.lo_a : value < 8u ? lut.lo_b
+                    : value < 12u ? lut.hi_a : lut.hi_b;
+                return static_cast<int>(static_cast<std::int8_t>(packed >> ((value & 3u) * 8u)));
+            }
             return static_cast<int>(value);
         }
 
@@ -1060,12 +1069,26 @@ namespace llaminar2
                     hip_stream, source.payload, source.scales, source.mins,
                     layout, first_unit, device_cpu_chunk);
             }
-            else
+            else if (layout.gpu_codebook_id == kNativeVnniMXFP4Codebook)
+            {
+                // Symmetric FP16 scale, no secondary plane; only the lookup differs from 4.
+                hipLaunchKernelGGL(
+                    (gpuToCpuNibbleUnitsROCm<kNativeVnniMXFP4Codebook, false>), grid, block, 0,
+                    hip_stream, source.payload, source.scales, source.mins,
+                    layout, first_unit, device_cpu_chunk);
+            }
+            else if (layout.gpu_codebook_id == 5)
             {
                 hipLaunchKernelGGL(
                     (gpuToCpuNibbleUnitsROCm<5, true>), grid, block, 0,
                     hip_stream, source.payload, source.scales, source.mins,
                     layout, first_unit, device_cpu_chunk);
+            }
+            else
+            {
+                // A nibble layout names exactly one of the decoders above; never
+                // reinterpret an unknown codebook as Q4_1 with a nonexistent min plane.
+                return false;
             }
         }
         else if (layout.cpu_encoding ==

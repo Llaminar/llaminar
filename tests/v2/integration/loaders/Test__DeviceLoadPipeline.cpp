@@ -24,6 +24,7 @@
 #include "loaders/gpu_pipeline/RepackFormat.h"
 #include "backends/BackendManager.h"
 #include "tensors/BlockStructures.h"
+#include "tensors/MXFP4Format.h"
 #include "../../utils/ScopedGPUStream.h"
 
 #ifdef HAVE_ROCM
@@ -700,6 +701,150 @@ TEST(Test__DeviceLoadPipelineCUDA, Q4_0_RowChunkedWeightMatchesUnchunkedLayout)
     EXPECT_EQ(actual_payload, expected_payload);
     EXPECT_EQ(actual_scales, expected_scales);
     orch.release();
+#endif
+}
+
+namespace
+{
+    /**
+     * @brief Deterministic MXFP4 source rows covering every exact exponent,
+     *        every code and ggml all-zero blocks (e = 0 and e = 255).
+     */
+    std::vector<uint8_t> mxfp4PipelineSource(int N, int blocks_per_row)
+    {
+        constexpr size_t kBlock = mxfp4::kSourceBlockBytes;
+        std::vector<uint8_t> raw(static_cast<size_t>(N) * blocks_per_row * kBlock);
+        for (size_t index = 0; index < raw.size() / kBlock; ++index)
+        {
+            uint8_t *block = raw.data() + index * kBlock;
+            block[0] = static_cast<uint8_t>(mxfp4::kMinExactFP16Exponent + index % 40);
+            for (int byte = 0; byte < 16; ++byte)
+                block[1 + byte] = static_cast<uint8_t>((index * 16 + byte) * 29u + 3u);
+            if (index % 13 == 6 || index % 13 == 11)
+            {
+                block[0] = index % 13 == 6 ? 0 : 255;
+                std::memset(block + 1, index % 2 ? 0x88 : 0x00, 16);
+            }
+        }
+        return raw;
+    }
+
+    /**
+     * @brief Load MXFP4 rows through the production row-chunked pipeline and compare
+     *        block-major payload/scales with the exact prepared representation.
+     * @param backend CUDA or ROCm backend selected by the caller.
+     * @param device Device owning the verification stream.
+     * @note LoadOrchestrator selects the backend's own repack launcher.
+     */
+    void expectMXFP4RowChunkedPipelineIsExact(IBackend *backend, DeviceId device)
+    {
+        backend->setDevice(0);
+        test::ScopedGPUStream verification_stream(device);
+        constexpr int N = 67, K = 160, blocks_per_row = K / 32;
+        constexpr size_t kBlock = mxfp4::kSourceBlockBytes;
+        const auto host = mxfp4PipelineSource(N, blocks_per_row);
+        const size_t row_bytes = static_cast<size_t>(blocks_per_row) * kBlock;
+
+        LoadOrchestrator orch(backend, kTestOnlyUnadmittedGPUAllocation);
+        orch.addDevice(0);
+        orch.planWeight(0, "mxfp4_rows", N, K, 16, false, false, host.size());
+        // 16-row staging slots: five chunks, the last one a 3-row tail.
+        orch.allocate(16 * row_bytes, 2);
+
+        WeightJob job;
+        job.name = "mxfp4_rows";
+        job.host_raw_data = host.data();
+        job.raw_bytes = host.size();
+        job.format = RepackFormat::MXFP4;
+        job.N = N;
+        job.K = K;
+        job.is_asymmetric = false;
+        orch.addWeightJob(0, job);
+        ASSERT_NO_THROW(orch.load());
+
+        auto slot = orch.getPool(0)->getSlot(job.name);
+        ASSERT_TRUE(slot.has_value());
+        const size_t count = static_cast<size_t>(N) * blocks_per_row;
+        std::vector<uint8_t> payload(count * 16);
+        std::vector<uint16_t> scales(count);
+        ASSERT_TRUE(backend->deviceToHost(payload.data(), slot->d_native_vnni_payload,
+                                          payload.size(), 0, verification_stream.get()));
+        ASSERT_TRUE(backend->deviceToHost(scales.data(), slot->d_native_vnni_scales,
+                                          scales.size() * sizeof(uint16_t), 0,
+                                          verification_stream.get()));
+        size_t zero_blocks = 0;
+        for (int n = 0; n < N; ++n)
+            for (int b = 0; b < blocks_per_row; ++b)
+            {
+                const uint8_t *source = host.data() + (static_cast<size_t>(n) * blocks_per_row + b) * kBlock;
+                const size_t linear = static_cast<size_t>(b) * N + n;
+                zero_blocks += mxfp4::exponentFitsFP16(source[0]) ? 0u : 1u;
+                EXPECT_EQ(scales[linear], mxfp4::preparedScaleFP16Bits(source[0])) << n << ',' << b;
+                EXPECT_EQ(std::memcmp(payload.data() + linear * 16, source + 1, 16), 0) << n << ',' << b;
+            }
+        EXPECT_GT(zero_blocks, 0u);
+        orch.release();
+    }
+
+    /**
+     * @brief A nonzero block without an exact FP16 scale fails the load on the reader thread.
+     */
+    void expectMXFP4InexactNonzeroBlockFailsLoad(IBackend *backend, const RepackKernels &kernels)
+    {
+        backend->setDevice(0);
+        constexpr int N = 64, K = 64, blocks_per_row = K / 32;
+        auto host = mxfp4PipelineSource(N, blocks_per_row);
+        host[5 * mxfp4::kSourceBlockBytes] = 90; // block 5 keeps nonzero codes
+        ASSERT_FALSE(mxfp4::blockFitsFP16(host[5 * mxfp4::kSourceBlockBytes],
+                                          host.data() + 5 * mxfp4::kSourceBlockBytes + 1));
+        WeightVRAMPool pool;
+        pool.planWeight("mxfp4_inexact", N, K, 16, false, false, host.size());
+        ASSERT_TRUE(pool.allocate(backend, 0, 1));
+        PinnedRingBuffer pinned(host.size(), 1);
+        ASSERT_TRUE(pinned.allocate(backend, 0));
+        DeviceLoadPipeline pipeline(*backend, 0, pool, pinned, kernels, 1);
+        ASSERT_TRUE(pipeline.initialize());
+        WeightJob job;
+        job.name = "mxfp4_inexact";
+        job.host_raw_data = host.data();
+        job.raw_bytes = host.size();
+        job.format = RepackFormat::MXFP4;
+        job.N = N;
+        job.K = K;
+        job.is_asymmetric = false;
+        EXPECT_FALSE(pipeline.processJobs({job}));
+        pinned.release();
+        pool.release();
+    }
+} // namespace
+
+TEST(Test__DeviceLoadPipelineMXFP4, ROCmRowChunkedSourceIsExactAndInexactScalesFail)
+{
+#ifdef HAVE_ROCM
+    auto *backend = getROCmBackend();
+    if (!backend)
+        GTEST_SKIP() << "ROCm backend unavailable";
+    expectMXFP4RowChunkedPipelineIsExact(backend, DeviceId::rocm(0));
+    RepackKernels kernels{};
+    kernels.vnniRepack = launchVnniRepack;
+    expectMXFP4InexactNonzeroBlockFailsLoad(backend, kernels);
+#else
+    GTEST_SKIP() << "HAVE_ROCM not defined";
+#endif
+}
+
+TEST(Test__DeviceLoadPipelineMXFP4, CUDARowChunkedSourceIsExactAndInexactScalesFail)
+{
+#ifdef HAVE_CUDA
+    auto *backend = getCUDABackend();
+    if (!backend)
+        GTEST_SKIP() << "CUDA backend unavailable";
+    expectMXFP4RowChunkedPipelineIsExact(backend, DeviceId::cuda(0));
+    RepackKernels kernels{};
+    kernels.vnniRepack = launchVnniRepackCUDA;
+    expectMXFP4InexactNonzeroBlockFailsLoad(backend, kernels);
+#else
+    GTEST_SKIP() << "HAVE_CUDA not defined";
 #endif
 }
 

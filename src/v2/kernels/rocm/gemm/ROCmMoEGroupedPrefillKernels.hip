@@ -67,6 +67,7 @@
 #include <string>
 #include "../ops/ROCmSwiGLUDecodeEquivalentMath.h"
 #include "ROCmNativeVNNIDecodeEquivalentMath.h"
+#include "ROCmNativeVNNINibbleLUT.h"
 #include "ROCmMoEGroupedPrefillDispatchGenerated.inc"
 #include "ROCmMoEProductionPrefillPolicy.h"
 #include "ROCmMoEGroupedPrefillRoutePolicy.h"
@@ -249,6 +250,7 @@ enum NativeVNNIFormatPrefill : uint8_t {
     NVNNI_PF_Q4_0    = 0,
     NVNNI_PF_IQ4_XS_SOURCE = llaminar2::kNativeVnniIQ4XSSourceScaleCodebook,
     NVNNI_PF_IQ4_NL  = 4,
+    NVNNI_PF_MXFP4   = llaminar2::kNativeVnniMXFP4Codebook,
     NVNNI_PF_Q4_1    = 5,
     NVNNI_PF_Q5_0    = 6,
     NVNNI_PF_Q5_1    = 7,
@@ -303,6 +305,9 @@ struct MoEPrefillSerialM1KPartitionPolicy
         // Q8_1 and Q8_K prepare to the same signed-INT8 arithmetic as Q8_0.
         if (policy_codebook == 20 || policy_codebook == 21)
             policy_codebook = 19;
+        // MXFP4 keeps decoder 25 but shares IQ4_NL's arithmetic policy.
+        if (policy_codebook == llaminar2::kNativeVnniMXFP4Codebook)
+            policy_codebook = 4;
         return forCodebook(policy_codebook);
     }
 };
@@ -340,7 +345,8 @@ struct PrefillNVNNITraits {
         FMT == NVNNI_PF_Q8_0 || FMT == NVNNI_PF_EXPANDED_INT8_MIN;
     static constexpr bool requires_secondary_metadata =
         is_asymmetric || is_dual_scale || FMT == NVNNI_PF_IQ3_S || FMT == NVNNI_PF_IQ4_XS_SOURCE;
-    static constexpr bool uses_lut = (FMT == NVNNI_PF_IQ4_NL || FMT == NVNNI_PF_IQ4_XS_SOURCE);
+    static constexpr bool uses_lut = (FMT == NVNNI_PF_IQ4_NL || FMT == NVNNI_PF_IQ4_XS_SOURCE ||
+                                      FMT == NVNNI_PF_MXFP4);
     static constexpr int payload_bytes =
         is_8bit ? 32 :
         is_iq1_grid ? 6 :
@@ -729,17 +735,20 @@ __device__ __forceinline__ void moe_prefill_decode_groups(
             packed_groups[g + 4] = static_cast<int32_t>(val_hi);
         }
     }
-    else if constexpr (FMT == NVNNI_PF_IQ4_NL || FMT == NVNNI_PF_IQ4_XS_SOURCE) {
+    else if constexpr (FMT == NVNNI_PF_IQ4_NL || FMT == NVNNI_PF_IQ4_XS_SOURCE ||
+                       FMT == NVNNI_PF_MXFP4) {
         /*
          * IQ4_NL / IQ4_XS verifier prefill must follow the same v_perm decode
          * expression as the M=1 MoE row-decode helper.  The removed pair-LUT
          * produced the intended int8 values, but it gave this translation unit
          * a different expression tree and shifted FP32 verifier rows by ULPs.
          */
-        constexpr uint32_t CB_LO_A = 0xBFAD9881u;
-        constexpr uint32_t CB_LO_B = 0xF6EADDCFu;
-        constexpr uint32_t CB_HI_A = 0x26190D01u;
-        constexpr uint32_t CB_HI_B = 0x71594535u;
+        // Only the packed lookup words differ between IQ4 and MXFP4.
+        constexpr auto lut = llaminar2::rocm::nibble_lut::words<static_cast<int>(FMT)>();
+        constexpr uint32_t CB_LO_A = lut.lo_a;
+        constexpr uint32_t CB_LO_B = lut.lo_b;
+        constexpr uint32_t CB_HI_A = lut.hi_a;
+        constexpr uint32_t CB_HI_B = lut.hi_b;
         constexpr uint32_t MUX_IDENTITY = 0x03020100u;
         constexpr uint32_t MUX_BIT3_MASK = 0x04040404u;
         #pragma unroll
@@ -2789,6 +2798,9 @@ __device__ __forceinline__ float moe_prefill_dot_desc_serial_m1_dispatch(
     case NVNNI_PF_IQ4_XS_SOURCE:
         return moe_prefill_dot_desc_serial_m1<NVNNI_PF_IQ4_XS_SOURCE>(
             desc, n, slot_A, slot_scales, N, k_partitions);
+    case NVNNI_PF_MXFP4:
+        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_MXFP4>(
+            desc, n, slot_A, slot_scales, N, k_partitions);
     case NVNNI_PF_Q4_1:
         return moe_prefill_dot_desc_serial_m1<NVNNI_PF_Q4_1>(
             desc, n, slot_A, slot_scales, N, k_partitions);
@@ -3384,7 +3396,7 @@ namespace
         // 19 policy until a dedicated synthetic-format corpus is certified;
         // execution and telemetry retain codebook 23.
         const uint8_t policy_codebook =
-            format == NVNNI_PF_IQ4_XS_SOURCE ? static_cast<uint8_t>(NVNNI_PF_IQ4_NL) :
+            format == NVNNI_PF_IQ4_XS_SOURCE || format == NVNNI_PF_MXFP4 ? static_cast<uint8_t>(NVNNI_PF_IQ4_NL) :
             format == NVNNI_PF_EXPANDED_INT8_MIN
                 ? static_cast<uint8_t>(NVNNI_PF_Q8_0)
                 : static_cast<uint8_t>(format);
@@ -3443,7 +3455,7 @@ namespace
             exact{};
         const auto policy_codebook = [](int codebook)
         {
-            return codebook == NVNNI_PF_IQ4_XS_SOURCE ? static_cast<uint8_t>(NVNNI_PF_IQ4_NL) :
+            return codebook == NVNNI_PF_IQ4_XS_SOURCE || codebook == NVNNI_PF_MXFP4 ? static_cast<uint8_t>(NVNNI_PF_IQ4_NL) :
                    codebook == NVNNI_PF_EXPANDED_INT8_MIN
                        ? static_cast<uint8_t>(NVNNI_PF_Q8_0)
                        : static_cast<uint8_t>(codebook);
@@ -3687,6 +3699,7 @@ auto selectMoERouteOwnedFormat(uint8_t codebook, Select select)
     case NVNNI_PF_Q4_0: return select.template operator()<NVNNI_PF_Q4_0>();
     case NVNNI_PF_IQ4_NL: return select.template operator()<NVNNI_PF_IQ4_NL>();
     case NVNNI_PF_IQ4_XS_SOURCE: return select.template operator()<NVNNI_PF_IQ4_XS_SOURCE>();
+    case NVNNI_PF_MXFP4: return select.template operator()<NVNNI_PF_MXFP4>();
     case NVNNI_PF_Q4_1: return select.template operator()<NVNNI_PF_Q4_1>();
     case NVNNI_PF_Q5_0: return select.template operator()<NVNNI_PF_Q5_0>();
     case NVNNI_PF_Q5_1: return select.template operator()<NVNNI_PF_Q5_1>();
@@ -3889,9 +3902,12 @@ llaminar2::rocm::MoERouteOwnedGateUpAdmission
 llaminar2::rocm::admitMoERouteOwnedGateUpGeometry(
     MoERouteOwnedGateUpGeometry geometry, uint8_t codebook, int device)
 {
+    // Physical decoder bit plus its source arithmetic policy bit (MXFP4 -> IQ4_NL).
     const auto bit = llaminar2::nativeVnniCodebookMaskBit(codebook);
+    const auto policy_bit = llaminar2::nativeVnniCodebookMaskBit(
+        codebook == llaminar2::kNativeVnniMXFP4Codebook ? uint8_t{4} : codebook);
     return admitMoERouteOwnedGateUpGeometry(geometry,
-        llaminar2::NativeVnniExecutionFormatEnvelope{bit, bit}, device);
+        llaminar2::NativeVnniExecutionFormatEnvelope{bit, policy_bit}, device);
 }
 
 llaminar2::rocm::MoERouteOwnedKernelResources
@@ -4158,6 +4174,7 @@ bool rocmMoE_grouped_prefill_query_kernel_resources(
     case NVNNI_PF_Q4_0: QUERY_TILE_M(NVNNI_PF_Q4_0);
     case NVNNI_PF_IQ4_NL: QUERY_TILE_M(NVNNI_PF_IQ4_NL);
     case NVNNI_PF_IQ4_XS_SOURCE: QUERY_TILE_M(NVNNI_PF_IQ4_XS_SOURCE);
+    case NVNNI_PF_MXFP4: QUERY_TILE_M(NVNNI_PF_MXFP4);
     case NVNNI_PF_Q4_1: QUERY_TILE_M(NVNNI_PF_Q4_1);
     case NVNNI_PF_Q5_0: QUERY_TILE_M(NVNNI_PF_Q5_0);
     case NVNNI_PF_Q5_1: QUERY_TILE_M(NVNNI_PF_Q5_1);
@@ -4675,6 +4692,7 @@ bool rocmMoE_grouped_prefill_pipeline(
         LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_Q4_0);
         LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_IQ4_NL);
         LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_IQ4_XS_SOURCE);
+        LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_MXFP4);
         LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_Q4_1);
         LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_Q5_0);
         LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_Q5_1);
@@ -4792,6 +4810,7 @@ bool rocmMoE_grouped_prefill_pipeline(
             LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_Q4_0);
             LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_IQ4_NL);
             LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_IQ4_XS_SOURCE);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_MXFP4);
             LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_Q4_1);
             LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_Q5_0);
             LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_Q5_1);
@@ -4923,6 +4942,7 @@ bool rocmMoE_grouped_prefill_pipeline(
             LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q4_0);
             LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ4_NL);
             LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ4_XS_SOURCE);
+            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_MXFP4);
             LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q4_1);
             LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q5_0);
             LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q5_1);

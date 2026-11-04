@@ -1049,15 +1049,19 @@ namespace llaminar2
             else if (layout.gpu_codebook_id == kNativeVnniMXFP4Codebook)
             {
                 gpuToCpuNibbleUnitsCUDA<kNativeVnniMXFP4Codebook, false><<<grid, block, 0, cuda_stream>>>(
-                    source.payload, source.scales, source.mins, layout.N,
-                    layout.blocks_per_row, first_unit, layout.cpu_block_stride,
+                    source.payload, source.scales, source.mins, layout, first_unit,
                     device_cpu_chunk);
             }
-            else
+            else if (layout.gpu_codebook_id == 5)
             {
                 gpuToCpuNibbleUnitsCUDA<5, true><<<grid, block, 0, cuda_stream>>>(
                     source.payload, source.scales, source.mins, layout, first_unit,
                     device_cpu_chunk);
+            }
+            else
+            {
+                // Never reinterpret an unknown nibble codebook as Q4_1.
+                return false;
             }
         }
         else if (layout.cpu_encoding ==

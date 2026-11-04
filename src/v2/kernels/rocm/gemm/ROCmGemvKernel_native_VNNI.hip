@@ -83,6 +83,7 @@
 #include "kernels/rocm/gemm/ROCmNativeVNNIDecodeDispatchGenerated.inc"
 #include "tensors/NativeVnniFormatInfo.h"
 #include "ROCmNativeVNNIDecodeEquivalentMath.h"
+#include "ROCmNativeVNNINibbleLUT.h"
 #include "ROCmNativeVNNISerialGeometry.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include <exception>
@@ -189,7 +190,8 @@ struct NativeVNNIDecodeGeneratedRuntimeConfig
 static constexpr uint8_t defaultNativeVNNIArithmeticPolicyCodebook(
     uint8_t execution_codebook_id)
 {
-    return execution_codebook_id == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook
+    return execution_codebook_id == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook ||
+                   execution_codebook_id == llaminar2::kNativeVnniMXFP4Codebook
                ? static_cast<uint8_t>(4)
                : execution_codebook_id ==
                    llaminar2::kNativeVnniExpandedInt8MinCodebook
@@ -439,6 +441,7 @@ enum NativeVNNIFormat : uint8_t {
     NVNNI_Q4_0   = 0,   // 4-bit symmetric, linear decode (q - 8)
     NVNNI_IQ4_NL = 4,   // IQ4_NL original half scale
     NVNNI_IQ4_XS_SOURCE = llaminar2::kNativeVnniIQ4XSSourceScaleCodebook, // Original IQ4_XS tuple
+    NVNNI_MXFP4  = llaminar2::kNativeVnniMXFP4Codebook, // OCP MXFP4: IQ4_NL geometry, doubled-E2M1 lookup
     NVNNI_Q4_1   = 5,   // 4-bit asymmetric (q as-is, has min)
     NVNNI_Q5_0   = 6,   // 5-bit symmetric, linear decode (q - 16)
     NVNNI_Q5_1   = 7,   // 5-bit asymmetric (q as-is, has min)
@@ -495,7 +498,11 @@ struct NVNNITraits {
         FMT == NVNNI_Q8_0 || FMT == NVNNI_EXPANDED_INT8_MIN;
     static constexpr bool requires_secondary_metadata =
         is_asymmetric || is_dual_scale || FMT == NVNNI_IQ3_S || FMT == NVNNI_IQ4_XS_SOURCE;
-    static constexpr bool uses_lut      = (FMT == NVNNI_IQ4_NL || FMT == NVNNI_IQ4_XS_SOURCE);
+    static constexpr bool uses_lut      = (FMT == NVNNI_IQ4_NL || FMT == NVNNI_IQ4_XS_SOURCE || FMT == NVNNI_MXFP4);
+    /// Packed signed lookup words of a uses_lut format (kvalues_iq4nl or doubled E2M1).
+    static constexpr llaminar2::rocm::nibble_lut::Words lut =
+        uses_lut ? llaminar2::rocm::nibble_lut::words<uses_lut ? static_cast<int>(FMT) : 4>()
+                 : llaminar2::rocm::nibble_lut::Words{};
     static constexpr int  payload_bytes =
         is_8bit ? 32 :                                // Q8_0: 32 raw INT8 values
         is_iq1_grid ? 6 :                            // IQ1_S(6), IQ1_M(6): qs[4]+qh[2] only
@@ -595,7 +602,7 @@ __device__ __forceinline__ uint32_t rocm_native_vnni_expand_q6_high_fields(
 template <NativeVNNIFormat FMT>
 struct NVNNIGroupedMoESupported {
     static constexpr bool value =
-        FMT == NVNNI_Q4_0 || FMT == NVNNI_IQ4_NL || FMT == NVNNI_IQ4_XS_SOURCE || FMT == NVNNI_Q4_1 ||
+        FMT == NVNNI_Q4_0 || FMT == NVNNI_IQ4_NL || FMT == NVNNI_IQ4_XS_SOURCE || FMT == NVNNI_MXFP4 || FMT == NVNNI_Q4_1 ||
         FMT == NVNNI_Q5_0 || FMT == NVNNI_Q5_1 || FMT == NVNNI_Q6_K ||
         FMT == NVNNI_Q3_K || FMT == NVNNI_Q2_K || FMT == NVNNI_IQ3_S ||
         FMT == NVNNI_IQ3_XXS || FMT == NVNNI_IQ2_S || FMT == NVNNI_IQ2_XS ||
@@ -1661,15 +1668,16 @@ __global__ void gemv_native_vnni_kernel_t(
                         // when nibble >= 8.  This replaces the old shift+and+mul(4-cyc)+bfi chain
                         // with shift+and+or+perm — all 1-cycle ops.
                         //
-                        // Codebook (uint8 representation):
+                        // The packed words come from Traits::lut (IQ4_NL shown; MXFP4 uses
+                        // the doubled E2M1 table). IQ4_NL codebook (uint8 representation):
                         //   0-3:  {0x81, 0x98, 0xAD, 0xBF}  = {-127, -104, -83, -65}
                         //   4-7:  {0xCF, 0xDD, 0xEA, 0xF6}  = {-49, -35, -22, -10}
                         //   8-11: {0x01, 0x0D, 0x19, 0x26}  = {1, 13, 25, 38}
                         //   12-15:{0x35, 0x45, 0x59, 0x71}  = {53, 69, 89, 113}
-                        constexpr uint32_t CB_LO_A = 0xBFAD9881u;  // cb[0..3] (src0 for nibbles 0-7)
-                        constexpr uint32_t CB_LO_B = 0xF6EADDCFu;  // cb[4..7] (src1 for nibbles 0-7)
-                        constexpr uint32_t CB_HI_A = 0x26190D01u;  // cb[8..11] (src0 for nibbles 8-15)
-                        constexpr uint32_t CB_HI_B = 0x71594535u;  // cb[12..15] (src1 for nibbles 8-15)
+                        constexpr uint32_t CB_LO_A = Traits::lut.lo_a;  // cb[0..3] (src0 for nibbles 0-7)
+                        constexpr uint32_t CB_LO_B = Traits::lut.lo_b;  // cb[4..7] (src1 for nibbles 0-7)
+                        constexpr uint32_t CB_HI_A = Traits::lut.hi_a;  // cb[8..11] (src0 for nibbles 8-15)
+                        constexpr uint32_t CB_HI_B = Traits::lut.hi_b;  // cb[12..15] (src1 for nibbles 8-15)
                         constexpr uint32_t MUX_IDENTITY = 0x03020100u;  // byte-identity permutation
                         constexpr uint32_t MUX_BIT3_MASK = 0x04040404u; // bit3 → +4 offset per byte
 
@@ -2554,10 +2562,10 @@ __device__ __forceinline__ void moe_decode_native_vnni_groups(
 
     if constexpr (Traits::uses_lut)
     {
-        constexpr uint32_t CB_LO_A = 0xBFAD9881u;
-        constexpr uint32_t CB_LO_B = 0xF6EADDCFu;
-        constexpr uint32_t CB_HI_A = 0x26190D01u;
-        constexpr uint32_t CB_HI_B = 0x71594535u;
+        constexpr uint32_t CB_LO_A = Traits::lut.lo_a;
+        constexpr uint32_t CB_LO_B = Traits::lut.lo_b;
+        constexpr uint32_t CB_HI_A = Traits::lut.hi_a;
+        constexpr uint32_t CB_HI_B = Traits::lut.hi_b;
         constexpr uint32_t MUX_IDENTITY = 0x03020100u;
         constexpr uint32_t MUX_BIT3_MASK = 0x04040404u;
 
@@ -3588,7 +3596,7 @@ __global__ void moe_grouped_native_vnni_down_runtime_kpart_kernel_t(
  * @brief Return the canonical source policy carried by a device descriptor.
  *
  * Q8_1 and Q8_K keep distinct source identities but intentionally share the
- * Q8_0 accelerator arithmetic policy.  Expanded codebook 23 never supplies a
+ * Q8_0 accelerator arithmetic policy, and MXFP4 shares IQ4_NL's.  Expanded codebook 23 never supplies a
  * policy of its own: its authoritative source identity selects the reduction
  * tree that existed before migration.
  */
@@ -3603,6 +3611,10 @@ moe_native_vnni_descriptor_policy_codebook(
                          : desc->codebook_id;
     if (policy == 20 || policy == 21)
         policy = 19;
+    // MXFP4 executes its own decoder but shares IQ4_NL's certified policy,
+    // exactly as the host canonicalDeviceVnniCodebookId() masks describe it.
+    if (policy == llaminar2::kNativeVnniMXFP4Codebook)
+        policy = 4;
     return policy;
 }
 
@@ -3672,6 +3684,9 @@ __device__ __forceinline__ float moe_native_vnni_dot_desc_range_dynamic(
             *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
     case NVNNI_IQ4_XS_SOURCE:
         return moe_native_vnni_dot_desc_range<NVNNI_IQ4_XS_SOURCE>(
+            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+    case NVNNI_MXFP4:
+        return moe_native_vnni_dot_desc_range<NVNNI_MXFP4>(
             *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
     case NVNNI_Q4_1:
         return moe_native_vnni_dot_desc_range<NVNNI_Q4_1>(
@@ -5198,6 +5213,10 @@ __global__ __launch_bounds__(TILE_N / CPT) void gemv_native_vnni_small_m_batched
         gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_IQ4_XS_SOURCE, Publication>(
             d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m,row_first);
         break;
+    case NVNNI_MXFP4:
+        gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_MXFP4, Publication>(
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m,row_first);
+        break;
     case NVNNI_Q4_1:
         gemv_native_vnni_small_m_batched_shared_body<TILE_N, CPT, ROWS_PER_TILE, NVNNI_Q4_1, Publication>(
             d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, projection, K, partition_blocks, active_m,row_first);
@@ -6020,6 +6039,7 @@ bool rocmMoE_grouped_swiglu_down_native_vnni_decode(
     case NVNNI_Q4_0:     LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_Q4_0);     break;
     case NVNNI_IQ4_NL:   LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_IQ4_NL);   break;
     case NVNNI_IQ4_XS_SOURCE:   LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_IQ4_XS_SOURCE);   break;
+    case NVNNI_MXFP4:   LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_MXFP4);   break;
     case NVNNI_Q4_1:     LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_Q4_1);     break;
     case NVNNI_Q5_0:     LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_Q5_0);     break;
     case NVNNI_Q5_1:     LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_Q5_1);     break;
@@ -6898,6 +6918,7 @@ static bool nativeVNNICodebookSupported(uint8_t codebook_id)
     case NVNNI_Q4_0:
     case NVNNI_IQ4_NL:
     case NVNNI_IQ4_XS_SOURCE:
+    case NVNNI_MXFP4:
     case NVNNI_Q4_1:
     case NVNNI_Q5_0:
     case NVNNI_Q5_1:
@@ -7271,6 +7292,7 @@ bool rocmGemv_native_vnni_small_m_fp32_with_sums_policy(
     case NVNNI_Q4_0:     LAUNCH_SMALL_M(NVNNI_Q4_0);
     case NVNNI_IQ4_NL:   LAUNCH_SMALL_M(NVNNI_IQ4_NL);
     case NVNNI_IQ4_XS_SOURCE:   LAUNCH_SMALL_M(NVNNI_IQ4_XS_SOURCE);
+    case NVNNI_MXFP4:   LAUNCH_SMALL_M(NVNNI_MXFP4);
     case NVNNI_Q4_1:     LAUNCH_SMALL_M(NVNNI_Q4_1);
     case NVNNI_Q5_0:     LAUNCH_SMALL_M(NVNNI_Q5_0);
     case NVNNI_Q5_1:     LAUNCH_SMALL_M(NVNNI_Q5_1);
@@ -7495,6 +7517,7 @@ static bool rocmGemv_native_vnni_small_m_batched_fp32_with_sums_policy_impl(
     case NVNNI_Q4_0:     DISPATCH_BATCHED_FMT(NVNNI_Q4_0);
     case NVNNI_IQ4_NL:   DISPATCH_BATCHED_FMT(NVNNI_IQ4_NL);
     case NVNNI_IQ4_XS_SOURCE:   DISPATCH_BATCHED_FMT(NVNNI_IQ4_XS_SOURCE);
+    case NVNNI_MXFP4:   DISPATCH_BATCHED_FMT(NVNNI_MXFP4);
     case NVNNI_Q4_1:     DISPATCH_BATCHED_FMT(NVNNI_Q4_1);
     case NVNNI_Q5_0:     DISPATCH_BATCHED_FMT(NVNNI_Q5_0);
     case NVNNI_Q5_1:     DISPATCH_BATCHED_FMT(NVNNI_Q5_1);
@@ -8075,6 +8098,7 @@ static bool nativeM1WithReduction(
         case NVNNI_Q4_0:     LAUNCH_NATIVE_VNNI(NVNNI_Q4_0);     break;
         case NVNNI_IQ4_NL:   LAUNCH_NATIVE_VNNI(NVNNI_IQ4_NL);   break;
         case NVNNI_IQ4_XS_SOURCE:   LAUNCH_NATIVE_VNNI(NVNNI_IQ4_XS_SOURCE);   break;
+        case NVNNI_MXFP4:   LAUNCH_NATIVE_VNNI(NVNNI_MXFP4);   break;
         case NVNNI_Q4_1:     LAUNCH_NATIVE_VNNI(NVNNI_Q4_1);     break;
         case NVNNI_Q5_0:     LAUNCH_NATIVE_VNNI(NVNNI_Q5_0);     break;
         case NVNNI_Q5_1:     LAUNCH_NATIVE_VNNI(NVNNI_Q5_1);     break;

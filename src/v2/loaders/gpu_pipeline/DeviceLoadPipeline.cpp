@@ -798,18 +798,6 @@ namespace llaminar2
             return false;
         }
 
-        if (backend_.backendDeviceType() == DeviceType::ROCm)
-        {
-            for (const auto &job : jobs)
-            {
-                if (job.format == RepackFormat::MXFP4)
-                {
-                    LOG_ERROR("DeviceLoadPipeline: MXFP4: ROCm unimplemented (weight '" << job.name << "')");
-                    return false;
-                }
-            }
-        }
-
         const size_t max_staging = pool_.maxStagingSlotBytes();
         const bool profiling = WeightLoadingProfiler::isEnabled();
         const auto &env = debugEnv();
