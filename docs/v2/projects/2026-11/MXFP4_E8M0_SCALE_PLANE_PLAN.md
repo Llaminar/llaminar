@@ -75,5 +75,16 @@ the CPU/CUDA/ROCm gates green.
 - A 1-byte plane changes vectorized scale loads and tile staging, so occupancy,
   VGPRs and spills must be re-measured per target. If the measured optimum
   moves, MXFP4 gets its own dispatch-policy entries.
-- The expert-tier CPU unit stores a 2-byte scale per column. Its wire layout
-  changes with the switch, and the round trip must stay byte-exact.
+- Staged scales (cp.async BK64 tiles, LDS and register slots) move the
+  encoded carrier, and only `decodePrimary` interprets it. The plane-indexing
+  loader is never applied to staged or CPU-unit slots. CUDA BK64 copies 16
+  bytes for 8 columns today (`CUDANativeVNNIPrefillDevice.cuh`), so a byte
+  plane copies 8.
+- The expert-tier CPU unit keeps its 2-byte scale slot, offsets and stride.
+  Only the separated GPU plane shrinks. Native 25 stores a BF16 power-of-two
+  word in the CPU slot: `w = 0` for the zero marker, otherwise
+  `w = (e - 1) << 7`. It widens as `float_bits(uint32(w) << 16)`, which equals
+  `(e - 1) << 23` over the whole admitted range, with no BF16 arithmetic. GPU→CPU
+  conversion encodes it. CPU→GPU validates a positive normal power of two with
+  biased exponent 1..253 and stores `e = (w >> 7) + 1`. These words never go
+  through F16C.
