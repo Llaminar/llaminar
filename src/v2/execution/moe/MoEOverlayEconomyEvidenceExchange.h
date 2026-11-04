@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "MoEOverlayMigrationEvidenceContext.h"
 
 namespace llaminar2
 {
@@ -35,6 +36,9 @@ namespace llaminar2
         MoEOverlayMigrationMeasurementCoordinate coordinate;
         std::vector<MoEOverlayCompletedMigrationMeasurement>
             local_measurements;
+
+        /** Original local prepared-wave metadata; not reconstructed from incoming rows. */
+        std::shared_ptr<const MoEOverlayMigrationEvidenceContext> context;
 
         /** @return Whether identity and the reciprocal pair rows are complete. */
         [[nodiscard]] bool valid() const noexcept;
@@ -90,6 +94,9 @@ namespace llaminar2
         bool exact_overlap = false;
         std::vector<MoEOverlayCompletedMigrationMeasurement>
             local_measurements;
+
+        /** Original local prepared-wave metadata shared through cleanup. */
+        std::shared_ptr<const MoEOverlayMigrationEvidenceContext> context;
 
         /** @return Whether identity, timings, and two-row swap evidence cohere. */
         [[nodiscard]] bool valid() const noexcept;

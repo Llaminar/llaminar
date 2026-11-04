@@ -1,6 +1,10 @@
 /**
  * @file MoEOverlayDistributedResidencyTransport.cpp
  * @brief Non-blocking global agreement for heterogeneous residency waves.
+ *
+ * The wrapper owns consensus and local wave lifetime. Passive measurement
+ * metadata keeps its original owner across that boundary so calibration can
+ * consume it after physical drain without retaining the physical wave itself.
  */
 
 #include "MoEOverlayDistributedResidencyTransport.h"
@@ -1491,6 +1495,10 @@ namespace llaminar2
             break;
         }
 
+        // The caller needs the original metadata after abort/drain. Moving the
+        // local wave into its consensus wrapper must not drop that separate
+        // lifetime or reconstruct geometry from a distributed vote.
+        auto measurement_context = std::move(local_start.measurement_context);
         auto wave = std::make_unique<DistributedResidencyWave>(
             transaction,
             std::move(local_start),
@@ -1512,6 +1520,7 @@ namespace llaminar2
         return {
             .status = MoEOverlayResidencyStageStartStatus::Started,
             .wave = std::move(wave),
+            .measurement_context = std::move(measurement_context),
         };
     }
 

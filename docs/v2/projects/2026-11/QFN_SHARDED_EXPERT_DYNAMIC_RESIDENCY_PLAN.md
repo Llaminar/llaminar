@@ -33,9 +33,11 @@ checks independent bound payload quotes and hands owned observations to the
 journal without allocation. Twenty focused registrations pass, followed by the
 actual public-factory/composite/journal case repeated twenty times on two
 physical CPU sockets: twelve transfers retain two six-piece logical rows, exact
-bytes and clean source/memory retirement. The existing scalar economy exchange
-still rejects cohort evidence; complete-target calibration and compact
-rank exchange remain prerequisites to enabling dynamic sharded placement.
+bytes and clean source/memory retirement. The common economy exchange now
+transports complete whole/cohort observations over exact-live MPI payloads,
+with original local geometry retained through distributed abort/drain.
+Complete-target calibration and service prices, including rooted combine and
+return, remain prerequisites to enabling dynamic sharded placement.
 
 ## Scope: fixed admitted layouts
 
@@ -103,10 +105,10 @@ Extend existing lane/manifests/kernel contracts rather than adding a transport:
 5. **Reuse distributed commit and retirement.** Keep existing reserve, stage, inactive-bank prepare, selector and authority consensus. Pin old epochs across dispatch, compute, reduction, sparse return and ACK. Close old admission, drain leases and retire all old roots through existing consensus. Keep native domain/session lifetime unchanged.
 6. **Integrate economy and qualify.** Existing histogram and rebalance policy must price complete target critical paths and all transfer edges/member storage. Enable a layout/mode only after its functional, numerical, communication and native gates pass. Observe also needs a complete supported evidence path.
 
-### Next cost-exchange integration
+### Qualified common cost-evidence exchange
 
 Use the existing calibration controller and MPI evidence lane. The actual
-`beginStage` result will retain a measurement-only context containing the
+`beginStage` result retains a measurement-only context containing the
 transaction identity and the same immutable geometry owners emitted by its
 prepared factory. The controller keeps that context through wave drain and
 evidence exchange. It holds no engines, source leases or publication authority.
@@ -119,15 +121,25 @@ Both migration-profile and attempt exchange require the local checked context.
 Retire their old fixed payload together rather than keeping an unbound wire
 route for old test fixtures.
 
-The same MPI request, communicator and original deadline will cover a fixed
+The same MPI request, communicator and original deadline cover a fixed
 identity/count-header exchange followed by `MPI_Iallgatherv` of only live
 quote/sample records. Empty observers send required metadata and no payload.
 Decode resolves ordinals against local checked geometry and verifies endpoint
 rank, original coordinates, formats and exact extents; sender layouts cannot
 create authority. Tests cover malformed and incomplete records, empty observers,
 large-to-small reuse, actual transmitted byte counts and abort/drain. Readiness
-and service exchanges keep their existing contracts. This is the next planned
-integration, not an enabled cohort-calibration or Dynamic execution claim.
+and service exchanges keep their existing contracts. The owning Unit suites,
+actual two-rank exchanges and CPU/GPU physical controls pass all 23 focused
+registrations in `focused219`, with no skips and clean driver/retirement checks.
+This is not an enabled cohort-calibration or Dynamic execution claim.
+
+The next slice extends the same calibration planner to genuine nonpublishable
+whole/cohort shadow jobs, using one canonical list of checked original targets.
+Whole-only consumers must reject unsupported cohort pricing explicitly. Service
+measurement must cover the actual fragment computation through rooted combine
+and publication; local fragment durations omit that tail. Preserve one logical
+demand count and charge shared invocation work once. Complete-target ledger,
+composer, certification and publication remain required before enabling movement.
 
 ## Required tests
 

@@ -742,6 +742,8 @@ namespace llaminar2
         Failed,   ///< Validation or enqueue failed; the wave is not retryable.
     };
 
+    class MoEOverlayMigrationEvidenceContext;
+
     /** @brief Typed ownership returned by a transport's non-blocking start. */
     struct MoEOverlayResidencyStageStart
     {
@@ -751,6 +753,9 @@ namespace llaminar2
         /** Partially enqueued unpublished work retained only for async cleanup. */
         std::unique_ptr<IMoEOverlayResidencyWave> cleanup_wave;
         std::string error;
+
+        /** Passive original prepared-wave geometry, retained independently of cleanup. */
+        std::shared_ptr<const MoEOverlayMigrationEvidenceContext> measurement_context;
 
         /** @return Whether status and wave ownership form a valid start result. */
         [[nodiscard]] bool valid() const noexcept

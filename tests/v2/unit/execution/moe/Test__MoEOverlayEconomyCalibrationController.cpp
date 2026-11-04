@@ -14,6 +14,7 @@
 #include "execution/moe/MoEOverlayEconomyEvidenceExchange.h"
 #include "execution/moe/MoEOverlayTierMigrationTransport.h"
 #include "utils/DebugEnv.h"
+#include "utils/RecordedMigrationEvidence.h"
 #include "utils/PerfStatsCollector.h"
 
 #include <gtest/gtest.h>
@@ -145,6 +146,9 @@ namespace llaminar2::test
                                 : MoEOverlayResidencyWaveProgress::Failed;
             }
 
+            /** @return Independently bound recorded payload extent before completion. */
+            std::optional<std::uint64_t> quotedPayloadBytes() const noexcept override {return measurement_.bytes;}
+
             /** @brief Expose timing only after the transfer terminal. */
             std::optional<ExpertTierProjectionTransferMeasurement>
             completedMeasurement() const noexcept override
@@ -243,6 +247,12 @@ namespace llaminar2::test
                 result.status = MoEOverlayResidencyStageStartStatus::Started;
                 result.inactive_bank =
                     std::make_unique<ProfileBank>(observations);
+                for(std::size_t m=0;m<transaction.migrations.size();++m) {
+                    const auto &edge=transaction.migrations[m];
+                    result.measurement_geometries.push_back(recordedWholeMigrationGeometry(
+                        edge.source.owner_participant,edge.destination.owner_participant,0,0));
+                    for(std::size_t role=0;role<3;++role)result.measurement_operations.push_back({m,role,true});
+                }
                 const std::size_t operation_count =
                     transaction.migrations.size() * 3u;
                 for (std::size_t index = 0; index < operation_count; ++index)
@@ -755,7 +765,7 @@ namespace llaminar2::test
             .destination_participant = 1,
             .layer = 0,
         };
-        const MoEOverlayMigrationProfileEvidence rank_zero{
+        MoEOverlayMigrationProfileEvidence rank_zero{
             .profile_sequence = 19,
             .coordinate = coordinate,
             .local_measurements = {
@@ -763,7 +773,7 @@ namespace llaminar2::test
                 partialMigration(1, 0, 1, {0}, 0),
             },
         };
-        const MoEOverlayMigrationProfileEvidence rank_one{
+        MoEOverlayMigrationProfileEvidence rank_one{
             .profile_sequence = 19,
             .coordinate = coordinate,
             .local_measurements = {
@@ -771,6 +781,8 @@ namespace llaminar2::test
                 partialMigration(1, 0, 1, {1, 2}, 1),
             },
         };
+        rank_zero.context=attachRecordedMigrationContext(rank_zero.local_measurements);
+        rank_one.context=attachRecordedMigrationContext(rank_one.local_measurements);
         ASSERT_TRUE(rank_zero.valid());
         ASSERT_TRUE(rank_one.valid());
 
@@ -779,8 +791,9 @@ namespace llaminar2::test
                 {rank_zero, rank_one});
         ASSERT_TRUE(merged.valid());
         ASSERT_EQ(merged.measurements.size(), 2u);
-        for (const auto &migration : merged.measurements)
+        for (const auto &described : merged.measurements)
         {
+            const auto migration=scalarMoEOverlayMigrationMeasurement(described);
             EXPECT_TRUE(std::all_of(
                 migration.projections.begin(),
                 migration.projections.end(),

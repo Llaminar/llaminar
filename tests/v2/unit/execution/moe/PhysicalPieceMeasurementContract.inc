@@ -125,17 +125,32 @@ TEST(PhysicalPieceMeasurementContract, OwnedJournalHandoffPreservesExactOriginal
 }
 #include "execution/moe/MoEOverlayEconomyEvidenceExchange.h"
 namespace llaminar2::test {
-TEST(PhysicalPieceMeasurementContract, ScalarProfileCannotCertifyThePieceArm)
+TEST(PhysicalPieceMeasurementContract, ScalarPricesRejectCohortsAndPartialSingletons)
 {
-    auto forward=pieceRow(1,1,ExpertWeightFormat::floating(TensorType::FP32));
-    auto reverse=forward;auto targets=forward.geometry->targets();std::swap(targets.first,targets.second);
-    reverse.geometry=MoEOverlayMigrationMeasurementGeometry::checked(std::move(targets),forward.geometry->formats());
-    std::swap(reverse.source_participant,reverse.destination_participant);
-    for(std::size_t i=0;i<forward.piece_observations.size();++i) {
-        forward.piece_observations[i]={128+i,recordedPiece(i)};reverse.piece_observations[i]={128+i,recordedPiece(i)};
+    for(int members:{1,2,3,8}) {
+        auto forward=pieceRow(1,members,ExpertWeightFormat::floating(TensorType::FP32));
+        auto reverse=forward;auto targets=forward.geometry->targets();std::swap(targets.first,targets.second);
+        reverse.geometry=MoEOverlayMigrationMeasurementGeometry::checked(std::move(targets),forward.geometry->formats());
+        std::swap(reverse.source_participant,reverse.destination_participant);reverse.expert=12;
+        for(std::size_t i=0;i<forward.piece_observations.size();++i) {
+            forward.piece_observations[i]={128+i,recordedPiece(i)};reverse.piece_observations[i]={128+i,recordedPiece(i)};
+        }
+        ASSERT_TRUE(forward.valid());ASSERT_TRUE(reverse.valid());
+        // Complete evidence is transportable for both targets; scalar prices only describe whole owners.
+        MoEOverlayMigrationProfileResult profile{.measurements={forward,reverse}};ASSERT_TRUE(profile.valid());
+        if(members==1) {
+            const auto scalar=scalarMoEOverlayMigrationMeasurement(forward);
+            EXPECT_FALSE(scalar.geometry);EXPECT_TRUE(scalar.piece_observations.empty());
+            for(std::size_t role=0;role<3;++role)EXPECT_EQ(scalar.projections[role],forward.piece_observations[role].observation);
+            auto partial=forward;partial.piece_observations[0].observation.reset();
+            EXPECT_THROW((void)scalarMoEOverlayMigrationMeasurement(partial),std::invalid_argument);
+            auto inconsistent=forward;++inconsistent.piece_observations[0].observation->bytes;
+            EXPECT_THROW((void)scalarMoEOverlayMigrationMeasurement(inconsistent),std::invalid_argument);
+        } else {
+            EXPECT_THROW((void)scalarMoEOverlayMigrationMeasurement(forward),std::invalid_argument);
+            EXPECT_THROW((void)scalarMoEOverlayMigrationMeasurement(reverse),std::invalid_argument);
+        }
     }
-    ASSERT_TRUE(forward.valid());ASSERT_TRUE(reverse.valid());
-    MoEOverlayMigrationProfileResult profile{.measurements={forward,reverse}};EXPECT_FALSE(profile.valid());
 }
 TEST(PhysicalPieceMeasurementContract, MixedFormatManifestPermutationResolvesByRole)
 {

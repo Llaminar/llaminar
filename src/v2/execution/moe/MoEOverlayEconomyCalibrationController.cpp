@@ -306,6 +306,7 @@ namespace llaminar2
             return;
         }
 
+        measurement_context_ = std::move(started.measurement_context);
         active_wave_ = std::move(started.wave);
         stage_completed_ = false;
         waves_started_.fetch_add(1, std::memory_order_relaxed);
@@ -435,6 +436,7 @@ namespace llaminar2
             .profile_sequence = active_profile_sequence_,
             .coordinate = currentCoordinate(),
             .local_measurements = local_rows_,
+            .context = measurement_context_,
         };
         std::string exchange_error;
         if (!config_.evidence_exchange->beginMigrationProfile(
@@ -483,8 +485,12 @@ namespace llaminar2
     void MoEOverlayEconomyCalibrationController::recordCompletedWave(
         const std::vector<MoEOverlayCompletedMigrationMeasurement> &rows)
     {
+        std::vector<MoEOverlayCompletedMigrationMeasurement> scalar_rows;
+        scalar_rows.reserve(rows.size());
+        for (const auto &row : rows)
+            scalar_rows.push_back(scalarMoEOverlayMigrationMeasurement(row));
         std::string ledger_error;
-        if (!config_.ledger->recordCompletedWave(rows, &ledger_error))
+        if (!config_.ledger->recordCompletedWave(scalar_rows, &ledger_error))
         {
             throw std::logic_error(
                 ledger_error.empty()

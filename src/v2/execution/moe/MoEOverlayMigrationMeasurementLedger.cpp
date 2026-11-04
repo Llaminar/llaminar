@@ -4,6 +4,7 @@
  */
 
 #include "MoEOverlayMigrationMeasurementLedger.h"
+#include "MoEOverlayMigrationEvidenceContext.h"
 
 #include "../../utils/FNV1a.h"
 
@@ -214,8 +215,8 @@ namespace llaminar2
          */
         for (std::size_t index = 0; index < measurements.size(); ++index)
         {
-            const auto &measurement = measurements[index];
-            if (!measurement.piece_observations.empty() || measurement.geometry)
+            MoEOverlayCompletedMigrationMeasurement measurement;
+            if (!projectScalarMoEOverlayMigrationMeasurement(measurements[index],measurement))
             {
                 rejected_observations_.fetch_add(1, std::memory_order_relaxed);
                 assignLedgerError(error, "Physical-piece observations require complete-target calibration coordinates; scalar prices cannot certify them");
@@ -287,8 +288,11 @@ namespace llaminar2
             }
         }
 
-        for (const auto &measurement : measurements)
+        for (const auto &original : measurements)
         {
+            // The full wave was checked above; projection has no allocation or side effects.
+            MoEOverlayCompletedMigrationMeasurement measurement;
+            if (!projectScalarMoEOverlayMigrationMeasurement(original,measurement))std::terminate();
             const MoEOverlayMigrationMeasurementCoordinate coordinate{
                 .source_participant = measurement.source_participant,
                 .destination_participant = measurement.destination_participant,

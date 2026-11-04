@@ -13,6 +13,8 @@
  * all-rank retirement fence; current-epoch inference remains admitted meanwhile.
  */
 
+#include "../../utils/RecordedMigrationEvidence.h"
+#include "execution/moe/MoEOverlayEconomyEvidenceCodec.h"
 #include "execution/moe/MoEOverlayMPIResidencyConsensus.h"
 #include "execution/moe/MoEOverlayMPIEconomyEvidenceExchange.h"
 #include "execution/moe/MoEOverlayMPIResidencyProposalPublisher.h"
@@ -1473,8 +1475,8 @@ namespace llaminar2::test
                 .wave_wall_nanoseconds = static_cast<std::uint64_t>(
                     900 + world_rank),
             };
-            const std::size_t first = world_rank == 0 ? 0u : 1u;
-            const std::size_t count = world_rank == 0 ? 1u : 2u;
+            const std::size_t first = 0u;
+            const std::size_t count = 3u;
             for (std::size_t offset = 0; offset < count; ++offset)
             {
                 const std::size_t projection = first + offset;
@@ -1497,9 +1499,10 @@ namespace llaminar2::test
         /** @brief One exact production workload and local migration pair. */
         MoEOverlayCalibrationAttemptEvidence economyAttempt(
             int world_rank,
-            bool exact_overlap)
+            bool exact_overlap,
+            const MoEExpertOwnerMap &inventory)
         {
-            return {
+            MoEOverlayCalibrationAttemptEvidence result{
                 .calibration_sequence = 41,
                 .coordinate = {
                     .source_participant = 0,
@@ -1527,6 +1530,8 @@ namespace llaminar2::test
                     economyMigration(1, 0, 1, world_rank),
                 },
             };
+            result.context=attachRecordedMigrationContext(result.local_measurements,&inventory);
+            return result;
         }
 
         /** @brief One valid pre-staging identity, optionally rank-divergent. */
@@ -1620,7 +1625,7 @@ namespace llaminar2::test
         EXPECT_TRUE(exchange.idle());
 
         ASSERT_TRUE(exchange.beginAttempt(
-            economyAttempt(context->rank(), true), &error))
+            economyAttempt(context->rank(), true, owner_map), &error))
             << error;
         const auto accepted = finishEconomyAttempt(exchange);
         ASSERT_TRUE(accepted.valid());
@@ -1628,8 +1633,9 @@ namespace llaminar2::test
         ASSERT_EQ(accepted.measurements.size(), 2u);
         EXPECT_EQ(accepted.baseline_nanoseconds, 200u);
         EXPECT_EQ(accepted.concurrent_nanoseconds, 260u);
-        for (const auto &migration : accepted.measurements)
+        for (const auto &described : accepted.measurements)
         {
+            const auto migration=scalarMoEOverlayMigrationMeasurement(described);
             EXPECT_EQ(migration.wave_wall_nanoseconds, 901u);
             EXPECT_TRUE(std::all_of(
                 migration.projections.begin(),
@@ -1642,7 +1648,7 @@ namespace llaminar2::test
         ASSERT_TRUE(exchange.beginAttempt(
             economyAttempt(
                 context->rank(),
-                context->rank() != 1),
+                context->rank() != 1, owner_map),
             &error))
             << error;
         const auto rejected = finishEconomyAttempt(exchange);
@@ -3911,3 +3917,5 @@ namespace llaminar2::test
         EXPECT_EQ(local.retirements, 0);
     }
 } // namespace llaminar2::test
+
+#include "LiveEconomyEvidenceMPIContract.inc"

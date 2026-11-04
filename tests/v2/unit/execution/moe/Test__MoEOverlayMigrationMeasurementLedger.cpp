@@ -290,3 +290,5 @@ namespace llaminar2::test
 #include "PhysicalPieceMeasurementContract.inc"
 
 #include "PhysicalMeasurementProducerRoleContract.inc"
+
+#include "LiveEconomyEvidenceCodecContract.inc"

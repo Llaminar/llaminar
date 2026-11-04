@@ -458,6 +458,59 @@ publication and inference qualification remain required before Dynamic cohort
 execution can be enabled. This focused result leaves the complete-preflight
 status and existing numerical gates unchanged.
 
+## Common live economy evidence
+
+The existing calibration controller retains the same original prepared-wave
+geometry through stage completion, abort/drain and MPI evidence exchange.
+This immutable context is metadata only: it retains no prepared engines,
+source leases, allocation ownership or publication authority. Whole and cohort
+observations use the same independent payload quotes and per-piece samples.
+The scalar price consumer can project only checked complete whole-to-whole
+observations; it still rejects cohort prices and incomplete singleton samples.
+
+Migration-profile and attempt exchange now share one mandatory context-bound
+wire path. The existing private MPI lane first exchanges required identity and
+live counts, then sends only the exact live records with `MPI_Iallgatherv`.
+Both operations share the original deadline and request owner. Empty observers
+send metadata and zero payload bytes. Receiver-local original geometry checks
+the transmitted ordinals, coordinates, formats, rank/device inventory and
+endpoint incidence. Every locally owned piece needs its independent quote and
+valid sample; a duplicate observation on another rank cannot conceal omission.
+Readiness and service protocols remain unchanged. No model/source hashing or
+second transport/accounting authority was added.
+
+The first coherent build found a test include-path defect (`common-cpu-build214`);
+the corrected actual target built in build215. `focused216` passed 17/21
+registrations, exposing a production propagation omission: the distributed
+transport wrapper dropped its local start's measurement context. The wrapper
+now forwards the same owner, independently of physical-wave lifetime. A focused
+lifecycle test proves retention after drain, final release and present/absent/
+present reset. Other failures were stale fixture assumptions: participant IDs
+were treated as MPI ranks, rebuilt domains retained obsolete names, and an old
+test still rejected every described singleton. Those fixtures now use the
+actual inventory and retain cohort/partial/malformed price rejection.
+
+`common-cpu-build218` and `focused219` pass: **23/23 registrations**, 14.79 seconds,
+no skips, clean driver checks. This includes eight owning Unit suites, the actual
+two-rank profile/attempt exchanges repeated twenty times over large, small,
+empty and reused payloads, real two-socket physical staging/journal attribution,
+and CUDA/ROCm floating rectangle controls. All 167 observed temporary model
+paths were retired. Recorded protocol metadata tests do not claim physical
+performance or native four/eight-socket qualification. New focused regressions
+are explicitly registered in `ProductionTestPreflight`; the full suite was
+not rerun for this user-requested scoped slice.
+
+The frozen component packages are `/tmp/qfn-live-economy-wire-r381/` and
+`/tmp/qfn-live-economy-fixtures-r382/`. The former preserves original-code
+negative controls for missing endpoint observations and direct singleton ledger
+consumption. Its private syntax command had an extra include root; only the
+later canonical build and exact-target syntax receipts establish include
+discovery. Root receipts live under `/tmp/qfn-cpu-joint-qualified-r224/`.
+
+Complete-target calibration, service/rooted-combine pricing and changed-epoch
+publication remain open. This checkpoint changes no model arithmetic, KL limit
+or public Dynamic cohort guard, and does not certify Release performance.
+
 ## Shared histogram candidate construction
 
 The existing histogram proposal now uses one candidate-construction boundary

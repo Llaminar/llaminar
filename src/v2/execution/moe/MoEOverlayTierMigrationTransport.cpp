@@ -9,6 +9,7 @@
  */
 
 #include "MoEOverlayTierMigrationTransport.h"
+#include "MoEOverlayMigrationEvidenceContext.h"
 #include "MoEOverlayPhysicalProjectionPieces.h"
 
 #include "../../utils/PerfStatsCollector.h"
@@ -1078,7 +1079,34 @@ namespace llaminar2
                 }
             }
         }
-        if (!described_targets_match || !prepared.valid(expected_transfer_count) || (cohort && prepared.measurement_geometries.empty()) ||
+        const bool collect_measurements =
+            config_.measurement_sink &&
+            (config_.measurement_scope ==
+                 MoEOverlayMigrationMeasurementScope::AllWaves ||
+             transaction.purpose ==
+                 MoEOverlayResidencyTransactionPurpose::EconomyCalibration);
+        std::shared_ptr<const MoEOverlayMigrationEvidenceContext> evidence_context;
+        bool context_valid=true;
+        if (collect_measurements && prepared.status==MoEOverlayResidencyStageStartStatus::Started &&
+            described_targets_match && prepared.valid(expected_transfer_count) &&
+            prepared.measurement_geometries.size()==transaction.migrations.size())
+        {
+            try {
+                std::vector<MoEOverlayMigrationEvidenceIdentity> identities;
+                identities.reserve(transaction.migrations.size());
+                for(std::size_t i=0;i<transaction.migrations.size();++i) {
+                    const auto &edge=transaction.migrations[i];
+                    identities.push_back({transaction.expected_epoch,transaction.candidate->epoch,
+                        edge.source.owner_participant,edge.destination.owner_participant,edge.layer_idx,
+                        edge.expert_id,prepared.measurement_geometries[i]});
+                }
+                evidence_context=MoEOverlayMigrationEvidenceContext::checked(std::move(identities),transaction.purpose);
+            } catch(const std::exception &exception) {
+                context_valid=false;
+                prepared.error=std::string("Invalid original measurement context: ")+exception.what();
+            }
+        }
+        if (!context_valid || !described_targets_match || !prepared.valid(expected_transfer_count) || (cohort && prepared.measurement_geometries.empty()) ||
             (!prepared.measurement_geometries.empty() && prepared.measurement_geometries.size() != transaction.migrations.size()))
         {
             stats_->waves_failed_to_prepare.fetch_add(
@@ -1174,12 +1202,6 @@ namespace llaminar2
             {{"migrations", std::to_string(transaction.migrations.size())},
              {"transfer_operations", std::to_string(actual_transfer_count)}});
 
-        const bool collect_measurements =
-            config_.measurement_sink &&
-            (config_.measurement_scope ==
-                 MoEOverlayMigrationMeasurementScope::AllWaves ||
-             transaction.purpose ==
-                 MoEOverlayResidencyTransactionPurpose::EconomyCalibration);
         std::vector<MoEOverlayCompletedMigrationMeasurement> measurements;
         if (collect_measurements)
         {
@@ -1196,8 +1218,7 @@ namespace llaminar2
                     .layer = migration.layer_idx,
                     .expert = migration.expert_id,
                 });
-                if (!prepared.measurement_geometries.empty() &&
-                    (migration.source.shard_cohort || migration.destination.shard_cohort))
+                if (!prepared.measurement_geometries.empty())
                 {
                     const auto index = measurements.size() - 1;
                     measurements.back().geometry = prepared.measurement_geometries.at(index);
@@ -1225,6 +1246,7 @@ namespace llaminar2
                 collect_measurements &&
                     config_.require_complete_local_measurements,
                 std::move(prepared.measurement_operations)),
+            .measurement_context = std::move(evidence_context),
         };
     }
 

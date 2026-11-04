@@ -209,4 +209,50 @@ else()
     message(STATUS "CPU cohort measurement attribution: unqualified without two physical sockets; no MPI launch")
 endif()
 
+# Context-bound, exact-live movement evidence and rejection lifetime contracts.
+add_v2_test(V2_Integration_MoEOverlayLiveEconomyEvidenceCodec
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_migration_measurement_ledger>
+        --gtest_filter=LiveEconomyEvidenceCodec.* --gtest_repeat=20 --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;ExpertOverlay;Measurement;Protocol;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "${V2_CPU_FRAGMENT_TEST_ENV}")
+add_v2_test(V2_Integration_MoEOverlayMeasurementContextAbortDrain
+    COMMAND $<TARGET_FILE:v2_test_moe_overlay_tier_migration_transport>
+        --gtest_filter=MoEOverlayTierMigrationTransport.InvalidMeasurementContextRetainsActualAbortDrain
+        --gtest_repeat=20 --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;ExpertOverlay;Measurement;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "${V2_CPU_FRAGMENT_TEST_ENV}")
+add_v2_test(V2_Integration_MoEOverlaySingletonLedgerCompletionAllocations
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_measurement_completion_allocations>
+        --gtest_filter=MeasurementCompletionAllocations.DirectLedgerSingletonProjectionAllocatesNothingAndRejectsBeforeMutation
+        --gtest_repeat=20 --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;ExpertOverlay;Measurement;Ownership;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "${V2_CPU_FRAGMENT_TEST_ENV}")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_MoEOverlayLiveEconomyEvidenceCodec
+    V2_Integration_MoEOverlayMeasurementContextAbortDrain
+    V2_Integration_MoEOverlaySingletonLedgerCompletionAllocations)
+
+# MPI entry: existing actual two-rank owning binary, no sockets/GPU qualification claim.
+add_v2_test(V2_Integration_MoEOverlayLiveEconomyEvidence_MPI
+    COMMAND $<TARGET_FILE:v2_integration_moe_overlay_residency_consensus_mpi>
+        --gtest_filter=Test__MoEOverlayMPIResidencyConsensus.LiveEconomyEvidenceCountsPayloadAndEmptyReuse
+        --gtest_repeat=20 --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;ExpertOverlay;Measurement;MPI;Protocol;Regression"
+    MPI_PROCS 2 NO_MODELS TIMEOUT 60
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1"
+        "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOverlayLiveEconomyEvidence_MPI)
+
+add_v2_test(V2_Integration_MoEOverlayDistributedMeasurementContext
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_distributed_residency_transport>
+        --gtest_filter=Test__MoEOverlayDistributedResidencyTransport.OriginalMeasurementContextSurvivesWrapperDrainAndReset
+        --gtest_repeat=20 --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;ExpertOverlay;Measurement;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "${V2_CPU_FRAGMENT_TEST_ENV}")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOverlayDistributedMeasurementContext)
+
 unset(V2_CPU_FRAGMENT_TEST_ENV)

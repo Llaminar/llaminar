@@ -8,6 +8,8 @@
  * These passive observations certify no device timing or native readiness.
  */
 #include "execution/moe/MoEOverlayMigrationMeasurementExchange.h"
+#include "execution/moe/MoEOverlayMigrationMeasurementLedger.h"
+#include "utils/RecordedMigrationEvidence.h"
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <cstdlib>
@@ -83,5 +85,37 @@ TEST(MeasurementCompletionAllocations, OriginalScalarConstCopyStillUsesReservedS
     MoEOverlayMigrationMeasurementJournal journal({.maximum_migrations_per_wave=1});
     allocations=0;counting=true;const bool recorded=journal.recordCompletedWave(wave,nullptr);counting=false;
     const auto count=allocations;EXPECT_TRUE(recorded);EXPECT_EQ(count,0u);
+}
+}
+
+namespace llaminar2::test {
+TEST(MeasurementCompletionAllocations, DirectLedgerSingletonProjectionAllocatesNothingAndRejectsBeforeMutation) {
+    MoEOverlayCompletedMigrationMeasurement scalar{.expected_epoch=1,.candidate_epoch=2,.source_participant=0,
+        .destination_participant=1,.layer=0,.expert=0,.wave_wall_nanoseconds=1};
+    for(auto &sample:scalar.projections)sample=ExpertTierProjectionTransferMeasurement{.sequence=1,.bytes=8192,
+        .wall_nanoseconds=1,.host_nanoseconds=1};
+    std::vector<MoEOverlayCompletedMigrationMeasurement> wave{scalar};
+    const auto context=attachRecordedMigrationContext(wave);
+    MoEOverlayMigrationMeasurementLedger ledger({.required_coordinates={{0,1,0}},.measurement_identity="recorded-allocation-witness"});
+    allocations=0;counting=true;const bool accepted=ledger.recordCompletedWave(wave,nullptr);counting=false;
+    const auto count=allocations;EXPECT_TRUE(accepted);EXPECT_EQ(count,0u);
+    const auto before=ledger.stats();
+    auto partial=wave;partial[0].piece_observations[0].observation.reset();
+    allocations=0;counting=true;const bool rejected_partial=ledger.recordCompletedWave(partial,nullptr);counting=false;
+    const auto partial_count=allocations;EXPECT_FALSE(rejected_partial);EXPECT_EQ(partial_count,0u);
+    auto malformed=wave;malformed[0].piece_observations[0].observation->bytes++;
+    allocations=0;counting=true;const bool rejected_malformed=ledger.recordCompletedWave(malformed,nullptr);counting=false;
+    const auto malformed_count=allocations;EXPECT_FALSE(rejected_malformed);EXPECT_EQ(malformed_count,0u);
+    auto cohort=wave;const auto format=ExpertWeightFormat::floating(TensorType::FP32);
+    cohort[0].geometry=MoEOverlayMigrationMeasurementGeometry::checked(
+        {recordedMigrationTarget(1,0,0,0),recordedMigrationTarget(2,1,1,1)},{format,format,format});
+    cohort[0].destination_participant=-1;cohort[0].piece_observations.resize(6);
+    for(auto &slot:cohort[0].piece_observations)slot={.quoted_payload_bytes=8192,
+        .observation=ExpertTierProjectionTransferMeasurement{.sequence=1,.bytes=8192,.wall_nanoseconds=1,.host_nanoseconds=1}};
+    allocations=0;counting=true;const bool rejected_cohort=ledger.recordCompletedWave(cohort,nullptr);counting=false;
+    const auto cohort_count=allocations;EXPECT_FALSE(rejected_cohort);EXPECT_EQ(cohort_count,0u);
+    const auto after=ledger.stats();EXPECT_EQ(after.completed_waves_observed,before.completed_waves_observed);
+    EXPECT_EQ(after.migration_observations_seen,before.migration_observations_seen);
+    EXPECT_EQ(after.stored_migration_observations,before.stored_migration_observations);
 }
 }

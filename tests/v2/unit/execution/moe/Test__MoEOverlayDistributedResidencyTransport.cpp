@@ -7,9 +7,13 @@
  * failure are exchanged by every participant, that no peer is stranded in a
  * different phase, that a deferred transaction can be retried unchanged, and
  * that no local old bank retires before every rank reaches its lease fence.
+ * Recorded measurement metadata also survives wrapper drain by its original
+ * owner; this lifecycle check grants no physical measurement or source permit.
  */
 
 #include "execution/moe/MoEOverlayDistributedResidencyTransport.h"
+#include "execution/moe/MoEOverlayMigrationEvidenceContext.h"
+#include "execution/moe/ExpertTierWeightStream.h"
 
 #include <gtest/gtest.h>
 
@@ -453,6 +457,7 @@ namespace llaminar2::test
                     return {
                         .status = start_status,
                         .wave = std::make_unique<Wave>(this),
+                        .measurement_context = measurement_context,
                     };
                 case MoEOverlayResidencyStageStartStatus::Deferred:
                     return {
@@ -486,6 +491,8 @@ namespace llaminar2::test
             MoEOverlayResidencyWaveProgress publication_progress =
                 MoEOverlayResidencyWaveProgress::Ready;
             bool failure_owns_cleanup = false;
+            /** Explicit passive metadata; never a scripted physical source permit. */
+            std::shared_ptr<const MoEOverlayMigrationEvidenceContext> measurement_context;
             int begin_calls = 0;
             int stage_polls = 0;
             int prepare_begins = 0;
@@ -780,6 +787,86 @@ namespace llaminar2::test
             }
         }
     } // namespace
+
+    TEST(
+        Test__MoEOverlayDistributedResidencyTransport,
+        OriginalMeasurementContextSurvivesWrapperDrainAndReset)
+    {
+        auto fixture = makeTransaction();
+        DistributedTransportFixture distributed;
+        const auto &transaction = fixture.transaction;
+        const auto &inventory = transaction.previous->originalOwnerMap().participants();
+        const auto metadata = modelMetadata();
+
+        // Passive coordinates come from this fixture's actual declared members
+        // and dimensions. No event, physical timing or source lease is invented.
+        const auto target = [&](int participant_id)
+        {
+            const auto &member = inventory.at(static_cast<std::size_t>(participant_id));
+            const auto whole = MoEProjectionResidence::ExpertOwner;
+            return MoEOverlayPhysicalProjectionTarget{
+                .tier_idx = member.tier_idx,
+                .members = {{
+                    .participant_id = member.participant_id,
+                    .world_rank = member.world_rank,
+                    .device = member.device,
+                    .address = member.address,
+                    .projections = {{
+                        {whole, metadata.routed_intermediate_size, metadata.d_model,
+                         0, metadata.routed_intermediate_size, 0, metadata.d_model},
+                        {whole, metadata.routed_intermediate_size, metadata.d_model,
+                         0, metadata.routed_intermediate_size, 0, metadata.d_model},
+                        {whole, metadata.d_model, metadata.routed_intermediate_size,
+                         0, metadata.d_model, 0, metadata.routed_intermediate_size}}},
+                }},
+            };
+        };
+        std::vector<MoEOverlayMigrationEvidenceIdentity> identities;
+        const auto format = ExpertWeightFormat::floating(TensorType::FP32);
+        for (const auto &migration : transaction.migrations)
+        {
+            identities.push_back({
+                transaction.expected_epoch, transaction.candidate->epoch,
+                migration.source.owner_participant, migration.destination.owner_participant,
+                migration.layer_idx, migration.expert_id,
+                MoEOverlayMigrationMeasurementGeometry::checked(
+                    {target(migration.source.owner_participant),
+                     target(migration.destination.owner_participant)},
+                    {format, format, format}),
+            });
+        }
+
+        for (const bool include_context : {true, false, true})
+        {
+            std::vector<std::weak_ptr<const MoEOverlayMigrationEvidenceContext>> owners;
+            for (auto &local : distributed.locals)
+            {
+                local->measurement_context = include_context
+                    ? MoEOverlayMigrationEvidenceContext::checked(identities, transaction.purpose)
+                    : nullptr;
+                owners.emplace_back(local->measurement_context);
+            }
+            auto starts = startEveryRank(distributed, transaction);
+            for (std::size_t rank = 0; rank < starts.size(); ++rank)
+            {
+                EXPECT_EQ(starts[rank].measurement_context, owners[rank].lock());
+                distributed.locals[rank]->measurement_context.reset();
+                EXPECT_EQ(owners[rank].expired(), !include_context);
+            }
+            for (const auto &result : finishStages(starts))
+                EXPECT_EQ(result.progress, MoEOverlayResidencyWaveProgress::Ready) << result.error;
+            abortEveryRank(starts);
+            for (std::size_t rank = 0; rank < starts.size(); ++rank)
+            {
+                starts[rank].wave.reset();
+                EXPECT_EQ(owners[rank].expired(), !include_context);
+                EXPECT_TRUE(distributed.lanes[rank]->idle());
+            }
+            starts.clear();
+            for (const auto &owner : owners)
+                EXPECT_TRUE(owner.expired());
+        }
+    }
 
     TEST(
         Test__MoEOverlayDistributedResidencyTransport,

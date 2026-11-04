@@ -228,6 +228,8 @@ namespace llaminar2
         std::uint64_t next_profile_sequence_ = 0;
         std::uint64_t active_profile_sequence_ = 0;
         std::unique_ptr<IMoEOverlayResidencyWave> active_wave_;
+        /** Original metadata survives physical abort cleanup until evidence is consumed. */
+        std::shared_ptr<const MoEOverlayMigrationEvidenceContext> measurement_context_;
         std::vector<MoEOverlayCompletedMigrationMeasurement> local_rows_;
         bool stage_completed_ = false;
         bool evidence_exchange_active_ = false;
