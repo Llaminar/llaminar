@@ -1321,7 +1321,7 @@ void native_vnni_gemm_kernel(
             {
                 const size_t linear = static_cast<size_t>(block_global) * N + b_load_n_global;
                 load_payload<PB>(d_payload + linear * PB, b_payload_dw);
-                b_scale_staging = d_block_scales[linear];
+                b_scale_staging = ::llaminar2::native_vnni_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(d_block_scales, linear);
                 if constexpr (Traits::needs_aux_compute)
                     b_aux_staging = d_block_mins[linear];
                 if constexpr (Traits::is_dual_scale_asym) {
@@ -1424,7 +1424,7 @@ void native_vnni_gemm_kernel(
             const int block_global = tile_block_base + b_load_block;
             const size_t linear = static_cast<size_t>(block_global) * N + b_load_n_global;
             load_payload<PB>(d_payload + linear * PB, b_payload_dw);
-            b_scale_staging = d_block_scales[linear];
+            b_scale_staging = ::llaminar2::native_vnni_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(d_block_scales, linear);
             if constexpr (Traits::needs_aux_compute)
                 b_aux_staging = d_block_mins[linear];
             if constexpr (Traits::is_dual_scale_asym) {
@@ -1645,7 +1645,7 @@ void native_vnni_gemm_kernel(
             {
                 const size_t linear = static_cast<size_t>(block_global) * N + b_load_n_global;
                 load_payload<PB>(d_payload + linear * PB, b_payload_dw);
-                b_scale_staging = d_block_scales[linear];
+                b_scale_staging = ::llaminar2::native_vnni_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(d_block_scales, linear);
                 if constexpr (Traits::needs_aux_compute)
                     b_aux_staging = d_block_mins[linear];
                 if constexpr (Traits::is_dual_scale_asym) {
@@ -2175,7 +2175,7 @@ void streaming_lm_head_kernel(
         uint32_t b_payload_dw[Traits::payload_dwords];
         load_payload<PB>(d_payload + linear * PB, b_payload_dw);
 
-        uint16_t scale_bits = d_block_scales[linear];
+        uint16_t scale_bits = ::llaminar2::native_vnni_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(d_block_scales, linear);
 
         uint16_t aux_bits = 0;
         if constexpr (Traits::needs_aux_compute)

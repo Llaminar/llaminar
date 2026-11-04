@@ -946,7 +946,7 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
         for (int g = 0; g < 8; ++g)
             dot = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], packed_groups[g], dot);
 
-        const uint16_t scale_bits = scale_base[linear];
+        const uint16_t scale_bits = ::llaminar2::native_vnni_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(scale_base, linear);
         // Physical24 also admits an IQ4_NL gate/up partner. Resolve the
         // actual descriptor word meaning independently for each projection.
         float block_d;

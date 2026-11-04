@@ -120,6 +120,19 @@ namespace llaminar2::native_vnni_scale
                                                         : widen(staged);
     }
 
+    /**
+     * @brief FP32 scale of a staged native E8M0 word (1-byte planes only).
+     * @param staged mxfp4::powerOfTwoBF16Word of an admitted byte, or 0.
+     *
+     * For call sites that keep their original FP16 expression verbatim in an
+     * `if constexpr` else-branch instead of passing a widening callback (for
+     * example decoder bodies textually included into a class).
+     */
+    LLAMINAR_NVNNI_SCALE_HD float stagedNativeScale(std::uint16_t staged)
+    {
+        return floatFromBits(std::uint32_t{staged} << 16);
+    }
+
     /** @brief Load and decode block @p linear directly from the global plane. */
     template <std::uint8_t Codebook, class Widen>
     LLAMINAR_NVNNI_SCALE_HD float primaryScale(const std::uint16_t *plane, std::size_t linear, Widen widen)

@@ -1185,7 +1185,7 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
             const uint8_t* payload = d_payload + linear * Traits::payload_bytes;
 
             // Scale always from global array
-            uint16_t scale_bits = d_block_scales[linear];
+            uint16_t scale_bits = ::llaminar2::native_vnni_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(d_block_scales, linear);
 
             int32_t packed_groups[8];
 
@@ -1645,7 +1645,7 @@ __global__ void gemv_native_vnni_kernel_t(
                 {
                     const size_t linear = static_cast<size_t>(b) * static_cast<size_t>(N) + static_cast<size_t>(n);
                     const uint8_t* payload = d_payload + linear * Traits::payload_bytes;
-                    const uint16_t scale_bits = d_block_scales[linear];
+                    const uint16_t scale_bits = ::llaminar2::native_vnni_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(d_block_scales, linear);
 
                     // Decode 32 quantized values to 8 packed INT32 words (4 INT8 each)
                     // Nibble layout: qs[j] = lo_nibble(elem_j) | hi_nibble(elem_{j+16})
@@ -4920,7 +4920,7 @@ __device__ __forceinline__ void native_vnni_small_m_accumulate_decoded_block(
         for (int g = 0; g < 8; ++g)
             block_acc = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], packed_groups[g], block_acc);
 
-        const uint16_t scale_bits = scale_base[linear];
+        const uint16_t scale_bits = ::llaminar2::native_vnni_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(scale_base, linear);
         const float block_d = rocm_native_vnni_load_single_weight_scale<FMT>(
             scale_bits, (FMT == NVNNI_IQ3_S || FMT == NVNNI_IQ4_XS_SOURCE) ? min_base[linear] : uint16_t{0});
         if constexpr (Traits::is_asymmetric)

@@ -241,6 +241,8 @@ namespace llaminar2
             std::uint8_t *__restrict__ cpu_chunk,
             std::uint32_t local_unit, bool active = true)
         {
+            static_assert(::llaminar2::nativeVnniScalePlaneBytes(Codebook) == 2,
+                          "tier units copy the 16-bit primary word verbatim (issue #26 switch)");
             const std::uint32_t global_unit = first_unit + local_unit;
             const int N=layout.N,blocks_per_row=layout.blocks_per_row;
             const unsigned columns=expertTierWireColumns(layout,global_unit);
@@ -963,6 +965,9 @@ namespace llaminar2
             const void *stream) noexcept
         {
             return layout.valid() && stream != nullptr && unit_count != 0 &&
+                   // Tier units copy the 16-bit primary word verbatim; a 1-byte plane
+                   // needs the E8M0 <-> BF16 conversion of the #26 switch first.
+                   ::llaminar2::nativeVnniScalePlaneBytes(layout.gpu_codebook_id) == 2 &&
                    first_unit < layout.unit_count &&
                    unit_count <= layout.unit_count - first_unit &&
                    unit_count <= layout.maximum_units_per_chunk &&

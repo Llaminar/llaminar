@@ -8,6 +8,9 @@
  * CUDA decoder: source formats, metadata factors and correction trees therefore
  * cannot drift between ordinary native projection and paired-Q8 projection.
  * Deliberately no include guard: the enclosing typed adapter owns inclusion.
+ * Owners include kernels/common/NativeVnniScaleLoad.h at file scope: primary
+ * scale arguments are normalized staged words (loadStagedPrimary), decoded
+ * here by decodeStagedPrimary so a native E8M0 plane needs no caller change.
  */
     template <uint8_t CODEBOOK_ID>
     struct CodebookTraits
@@ -82,7 +85,9 @@
     /**
      * @brief Resolve the symmetric single-dot scale without a half round trip.
      * @tparam CODEBOOK_ID Physical decoder; IQ4_XS uses source tuple 24.
-     * @param primary_bits Original half base for IQ4_XS, otherwise half scale.
+     * @param primary_bits Normalized staged primary word (loadStagedPrimary):
+     *        original half base for IQ4_XS, otherwise the half scale, or the
+     *        native E8M0 power-of-two word for a 1-byte plane.
      * @param secondary_bits Original encoded six-bit IQ4_XS coefficient.
      * @return Exact source base-times-coefficient rounded once in FP32.
      */
@@ -90,7 +95,11 @@
     __device__ __forceinline__ float native_vnni_single_scale_rn(
         uint16_t primary_bits, uint16_t secondary_bits)
     {
-        const float base = fp16_bits_to_float(primary_bits);
+        float base;
+        if constexpr (::llaminar2::nativeVnniScalePlaneBytes(CODEBOOK_ID) == 1)
+            base = ::llaminar2::native_vnni_scale::stagedNativeScale(primary_bits);
+        else
+            base = fp16_bits_to_float(primary_bits);
         if constexpr (CodebookTraits<CODEBOOK_ID>::is_iq4_source_scale)
             return device_fp32_contract::multiply(
                 base, static_cast<float>(native_vnni_iq4xs_scale::coefficient(secondary_bits)));
