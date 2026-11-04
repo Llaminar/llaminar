@@ -55,6 +55,7 @@ namespace llaminar2::test
             LLAMINAR_PLANNING_GGUF_FORMAT(IQ3_S)
             LLAMINAR_PLANNING_GGUF_FORMAT(IQ4_NL)
             LLAMINAR_PLANNING_GGUF_FORMAT(IQ4_XS)
+            LLAMINAR_PLANNING_GGUF_FORMAT(MXFP4)
 #undef LLAMINAR_PLANNING_GGUF_FORMAT
             default: throw std::invalid_argument("Tensor format has no supported GGUF source encoding");
             }

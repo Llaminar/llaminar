@@ -303,6 +303,8 @@ namespace llaminar2
             return std::make_unique<IQ1_STensor>(shape, raw_data);
         case TensorType::IQ1_M:
             return std::make_unique<IQ1_MTensor>(shape, raw_data);
+        case TensorType::MXFP4:
+            return std::make_unique<MXFP4Tensor>(shape, raw_data);
         default:
             LOG_ERROR("TensorFactory::createQuantized: unsupported type " << static_cast<int>(type));
             std::ostringstream oss;
@@ -361,6 +363,8 @@ namespace llaminar2
             return std::make_unique<IQ1_STensor>(shape, std::move(raw_data));
         case TensorType::IQ1_M:
             return std::make_unique<IQ1_MTensor>(shape, std::move(raw_data));
+        case TensorType::MXFP4:
+            return std::make_unique<MXFP4Tensor>(shape, std::move(raw_data));
         default:
             throw std::runtime_error(
                 "TensorFactory::createQuantizedOwned: unsupported type " +
@@ -419,6 +423,8 @@ namespace llaminar2
             return std::make_unique<IQ1_STensor>(shape, mmap_data, byte_size, std::move(mmap_lifetime_owner));
         case TensorType::IQ1_M:
             return std::make_unique<IQ1_MTensor>(shape, mmap_data, byte_size, std::move(mmap_lifetime_owner));
+        case TensorType::MXFP4:
+            return std::make_unique<MXFP4Tensor>(shape, mmap_data, byte_size, std::move(mmap_lifetime_owner));
         default:
             LOG_ERROR("TensorFactory::createQuantizedZeroCopy: unsupported type " << static_cast<int>(type));
             std::ostringstream oss;

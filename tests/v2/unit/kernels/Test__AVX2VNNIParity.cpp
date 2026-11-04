@@ -1296,6 +1296,7 @@ CHUNK_PARITY_TEST(IQ4_NL, createIQ4_NLRandom, 64, 512)
 // Additional nibble-LUT formats
 CHUNK_PARITY_TEST(Q4_1, createQ4_1Random, 64, 256)
 CHUNK_PARITY_TEST(IQ4_XS, createIQ4_XSRandom, 64, 256)
+CHUNK_PARITY_TEST(MXFP4, createMXFP4Random, 64, 256)
 
 // INT8 pre-decoded formats (per-block)
 CHUNK_PARITY_TEST(Q5_0, createQ5_0Random, 64, 256)
@@ -1364,6 +1365,8 @@ FULL_GEMV_PARITY_TEST(Q5_0, createQ5_0Random, 4096, 896, 50)
 FULL_GEMV_PARITY_TEST(Q4_0, createQ4_0Random, 100, 256, 51)
 FULL_GEMV_PARITY_TEST(Q4_0, createQ4_0Random, 200, 512, 52)
 FULL_GEMV_PARITY_TEST(IQ4_NL, createIQ4_NLRandom, 200, 512, 53)
+FULL_GEMV_PARITY_TEST(MXFP4, createMXFP4Random, 512, 512, 54)
+FULL_GEMV_PARITY_TEST(MXFP4, createMXFP4Random, 200, 512, 55)
 
 // Additional nibble-LUT formats
 FULL_GEMV_PARITY_TEST(Q4_1, createQ4_1Random, 512, 512, 80)
@@ -1461,6 +1464,8 @@ FULL_GEMM_PARITY_TEST(IQ4_NL, createIQ4_NLRandom, 16, 4096, 896, 71)
 // Non-64-aligned N
 FULL_GEMM_PARITY_TEST(Q4_0, createQ4_0Random, 4, 200, 256, 72)
 FULL_GEMM_PARITY_TEST(IQ4_NL, createIQ4_NLRandom, 4, 200, 256, 73)
+FULL_GEMM_PARITY_TEST(MXFP4, createMXFP4Random, 3, 512, 512, 74)
+FULL_GEMM_PARITY_TEST(MXFP4, createMXFP4Random, 4, 200, 256, 75)
 
 // M=1 via GEMM path (should match GEMV)
 FULL_GEMM_PARITY_TEST(Q4_0, createQ4_0Random, 1, 512, 512, 74)

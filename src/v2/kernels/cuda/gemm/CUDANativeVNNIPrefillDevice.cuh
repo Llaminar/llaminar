@@ -588,14 +588,14 @@ namespace llaminar2::cuda::prefill
                                 static_cast<int32_t>(__vsub4((r2 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
                                 static_cast<int32_t>(__vsub4((r3 >> 4) & 0x0F0F0F0Fu, 0x08080808u)));
                         }
-                        else if constexpr (Traits::is_iq4_lut)
+                        else if constexpr (Traits::is_nibble_lut)
                         {
-                            using llaminar2::cuda_native_vnni::iq4nl_decode_word;
+                            using llaminar2::cuda_native_vnni::nibble_lut_decode_word;
                             uint32_t lo0, hi0, lo1, hi1, lo2, hi2, lo3, hi3;
-                            iq4nl_decode_word(r0, lo0, hi0);
-                            iq4nl_decode_word(r1, lo1, hi1);
-                            iq4nl_decode_word(r2, lo2, hi2);
-                            iq4nl_decode_word(r3, lo3, hi3);
+                            nibble_lut_decode_word<CODEBOOK_ID>(r0, lo0, hi0);
+                            nibble_lut_decode_word<CODEBOOK_ID>(r1, lo1, hi1);
+                            nibble_lut_decode_word<CODEBOOK_ID>(r2, lo2, hi2);
+                            nibble_lut_decode_word<CODEBOOK_ID>(r3, lo3, hi3);
                             *reinterpret_cast<int4 *>(&dst_words[word_offset]) = make_int4(
                                 static_cast<int32_t>(lo0), static_cast<int32_t>(lo1),
                                 static_cast<int32_t>(lo2), static_cast<int32_t>(lo3));
@@ -725,14 +725,14 @@ namespace llaminar2::cuda::prefill
                                     static_cast<int32_t>(__vsub4((r2 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
                                     static_cast<int32_t>(__vsub4((r3 >> 4) & 0x0F0F0F0Fu, 0x08080808u)));
                             }
-                            else if constexpr (Traits::is_iq4_lut)
+                            else if constexpr (Traits::is_nibble_lut)
                             {
-                                using llaminar2::cuda_native_vnni::iq4nl_decode_word;
+                                using llaminar2::cuda_native_vnni::nibble_lut_decode_word;
                                 uint32_t lo0, hi0, lo1, hi1, lo2, hi2, lo3, hi3;
-                                iq4nl_decode_word(r0, lo0, hi0);
-                                iq4nl_decode_word(r1, lo1, hi1);
-                                iq4nl_decode_word(r2, lo2, hi2);
-                                iq4nl_decode_word(r3, lo3, hi3);
+                                nibble_lut_decode_word<CODEBOOK_ID>(r0, lo0, hi0);
+                                nibble_lut_decode_word<CODEBOOK_ID>(r1, lo1, hi1);
+                                nibble_lut_decode_word<CODEBOOK_ID>(r2, lo2, hi2);
+                                nibble_lut_decode_word<CODEBOOK_ID>(r3, lo3, hi3);
                                 *reinterpret_cast<int4 *>(&dst_words[0]) = make_int4(
                                     static_cast<int32_t>(lo0), static_cast<int32_t>(lo1),
                                     static_cast<int32_t>(lo2), static_cast<int32_t>(lo3));
@@ -785,14 +785,14 @@ namespace llaminar2::cuda::prefill
                                         static_cast<int32_t>(__vsub4((r2 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
                                         static_cast<int32_t>(__vsub4((r3 >> 4) & 0x0F0F0F0Fu, 0x08080808u)));
                                 }
-                                else if constexpr (Traits::is_iq4_lut)
+                                else if constexpr (Traits::is_nibble_lut)
                                 {
-                                    using llaminar2::cuda_native_vnni::iq4nl_decode_word;
+                                    using llaminar2::cuda_native_vnni::nibble_lut_decode_word;
                                     uint32_t lo0, hi0, lo1, hi1, lo2, hi2, lo3, hi3;
-                                    iq4nl_decode_word(r0, lo0, hi0);
-                                    iq4nl_decode_word(r1, lo1, hi1);
-                                    iq4nl_decode_word(r2, lo2, hi2);
-                                    iq4nl_decode_word(r3, lo3, hi3);
+                                    nibble_lut_decode_word<CODEBOOK_ID>(r0, lo0, hi0);
+                                    nibble_lut_decode_word<CODEBOOK_ID>(r1, lo1, hi1);
+                                    nibble_lut_decode_word<CODEBOOK_ID>(r2, lo2, hi2);
+                                    nibble_lut_decode_word<CODEBOOK_ID>(r3, lo3, hi3);
                                     *reinterpret_cast<int4 *>(&dst_words[8]) = make_int4(
                                         static_cast<int32_t>(lo0), static_cast<int32_t>(lo1),
                                         static_cast<int32_t>(lo2), static_cast<int32_t>(lo3));

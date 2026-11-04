@@ -77,6 +77,7 @@ namespace llaminar2
             {"IQ3_S", sizeof(IQ3_SBlock), IQ3_SBlock::BLOCK_SIZE},
             {"IQ1_S", sizeof(IQ1_SBlock), IQ1_SBlock::BLOCK_SIZE},
             {"IQ1_M", sizeof(IQ1_MBlock), IQ1_MBlock::BLOCK_SIZE},
+            {"MXFP4", sizeof(MXFP4Block), MXFP4Block::BLOCK_SIZE},
         };
 
         const NativeBlockLayout *findNativeBlockLayout(const std::string &quant_type)

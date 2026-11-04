@@ -240,6 +240,8 @@ namespace llaminar2
                 return native(native_vnni_formats::IQ4_XS);
             case GGUFTensorType::IQ1_M:
                 return native(native_vnni_formats::IQ1_M);
+            case GGUFTensorType::MXFP4:
+                return native(native_vnni_formats::MXFP4);
             case GGUFTensorType::F32:
                 return ExpertWeightFormat::floating(TensorType::FP32);
             case GGUFTensorType::F16:

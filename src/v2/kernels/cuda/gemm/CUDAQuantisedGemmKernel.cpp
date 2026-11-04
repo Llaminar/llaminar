@@ -857,6 +857,7 @@ namespace llaminar2
                 case 0:
                 case 4:
                 case kNativeVnniIQ4XSSourceScaleCodebook:
+                case kNativeVnniMXFP4Codebook:
                 case 5:
                 case 6:
                 case 7:
@@ -1144,7 +1145,8 @@ namespace llaminar2
                                  wt == TensorType::IQ2_S ||
                                  wt == TensorType::IQ3_S ||
                                  wt == TensorType::IQ1_S ||
-                                 wt == TensorType::IQ1_M);
+                                 wt == TensorType::IQ1_M ||
+                                 wt == TensorType::MXFP4);
 
             if (!is_quantized)
             {

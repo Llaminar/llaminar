@@ -68,3 +68,22 @@ structural feature and are converted with stock llama.cpp.
   device needs 115.9 GiB (UD-IQ1_M) / 117.5 GiB (UD-IQ2_XXS) at 32K context
   because CUDA packs IQ2_XS experts at about 1.41x their GGUF size. A single
   H100 (93 GiB) therefore needs a CPU expert tier, or two GPUs.
+
+## MXFP4 (2026-11-04)
+
+- Official routed experts are FP4 E2M1 + E8M0/32, bit-identical to GGUF
+  MXFP4 (`scripts/deepseek4/verify_gguf_exactness.py`). unsloth `UD-Q8_K_XL`
+  (MXFP4 experts, BF16 elsewhere) reproduces every sampled official tensor
+  exactly; ggml-org `MXFP4` stores the FP8 projections as Q8_0 (~0.5% error).
+- `TensorType::MXFP4` / codebook 25: the sixteen code bytes keep IQ4_NL's
+  nibble order and payload; the E8M0 exponent becomes the exact FP16 scale
+  2^(e-128). Only the 16-entry lookup differs from IQ4_NL, which supplies the
+  arithmetic policy and certified schedules. Exponents without an exact FP16
+  scale are rejected at preparation (real checkpoint exponents span 2^-9..2^-5).
+- CPU (AVX2/AVX-512 nibble LUT), CUDA (GEMV, dense prefill, grouped MoE
+  prefill/decode incl. IMMA, expert-tier movement) and embeddings support it;
+  ROCm rejects codebook 25 and RepackFormat::MXFP4 explicitly.
+- GPU bytes: 18 per 32 values (1.06x the GGUF). UD-Q8_K_XL needs 158.8 GiB of
+  weights (MXFP4 experts 137.1 -> 145.1 GiB), 163.9 GiB at 32K context.
+  A 17-byte layout would need a codebook-specific scale plane in every
+  NativeVNNI kernel; not done.

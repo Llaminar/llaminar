@@ -93,7 +93,8 @@ namespace llaminar2
          */
         bool isNibbleCodebook(uint8_t codebook) noexcept
         {
-            return codebook == 0 || codebook == 4 || codebook == 5;
+            return codebook == 0 || codebook == 4 || codebook == 5 ||
+                   codebook == kNativeVnniMXFP4Codebook;
         }
 
         /**
@@ -156,7 +157,7 @@ namespace llaminar2
                 {
                     return reject(
                         error,
-                        "Nibble CPU stream requires codebook 0, 4, or 5 and a 16-byte payload");
+                        "Nibble CPU stream requires codebook 0, 4, 5 or 25 (MXFP4) and a 16-byte payload");
                 }
                 codebook = cpu.codebook_id;
                 payload_bytes = 16;

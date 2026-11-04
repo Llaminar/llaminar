@@ -314,7 +314,7 @@ GraphArenaStorageLayout ActivationMemoryEstimator::declareCPUStorage(
     {
         std::size_t elements = 1;
         for (const auto dimension : entry.descriptor.shape) elements *= dimension;
-        LOG_DEBUG("[ActivationMemoryEstimator] Planned arena root: '" << entry.descriptor.name << "' -> "
+        LOG_TRACE("[ActivationMemoryEstimator] Planned arena root: '" << entry.descriptor.name << "' -> "
                   << bufferIdName(entry.id) << " elements=" << elements);
     }
     return layout;

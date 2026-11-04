@@ -44,7 +44,8 @@ namespace llaminar2
         IQ1_M,   // 1-bit medium IQ
         TQ4,     // TurboQuant 4-bit (KV cache values)
         TQ8,     // TurboQuant 8-bit (KV cache values)
-        AQ8      // Cubic-companded int8 attention-key cache blocks
+        AQ8,     // Cubic-companded int8 attention-key cache blocks
+        MXFP4    // OCP MXFP4: E8M0 block exponent + 32 FP4 E2M1 codes (GGUF type 39)
     };
 
     /**
@@ -116,6 +117,8 @@ namespace llaminar2
             return "TQ8";
         case TensorType::AQ8:
             return "AQ8";
+        case TensorType::MXFP4:
+            return "MXFP4";
         default:
             return "UNKNOWN";
         }
@@ -152,6 +155,7 @@ namespace llaminar2
         case TensorType::IQ2_XXS:
         case TensorType::IQ1_S:
         case TensorType::IQ1_M:
+        case TensorType::MXFP4:
             return true;
         default:
             return false;

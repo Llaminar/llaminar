@@ -1159,7 +1159,7 @@ namespace llaminar2
             constexpr int N = 70;
             constexpr int K = 256;
             constexpr std::uint32_t kUnitsPerChunk = 4;
-            ASSERT_EQ(test::quantizedVerifierFormats().size(), 21u);
+            ASSERT_EQ(test::quantizedVerifierFormats().size(), 22u);
 
             TestHIPStream stream;
             bool rejection_contract_checked = false;

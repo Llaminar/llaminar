@@ -160,7 +160,7 @@ namespace llaminar2
                         ? Encoding::NibbleLUTSourceScale
                         : gpu_codebook_id == 11 ? Encoding::IQ3SExpandedSourceScale
                         : gpu_codebook_id == 0 || gpu_codebook_id == 4 ||
-                            gpu_codebook_id == 5
+                            gpu_codebook_id == 5 || gpu_codebook_id == kNativeVnniMXFP4Codebook
                         ? Encoding::NibbleLUT
                         : (gpu_codebook_id == 8
                                ? Encoding::Q6KNativeDualScale
@@ -189,7 +189,8 @@ namespace llaminar2
             case Encoding::NibbleLUT:
                 return gpu_payload_bytes_per_block == 16 &&
                        gpu_is_asymmetric == cpu_is_asymmetric &&
-                       (((gpu_codebook_id == 0 || gpu_codebook_id == 4) &&
+                       (((gpu_codebook_id == 0 || gpu_codebook_id == 4 ||
+                          gpu_codebook_id == kNativeVnniMXFP4Codebook) &&
                          cpu_is_asymmetric == 0) ||
                         (gpu_codebook_id == 5 && cpu_is_asymmetric != 0));
             case Encoding::ExpandedInt8:

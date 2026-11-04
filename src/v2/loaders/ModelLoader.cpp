@@ -134,6 +134,8 @@ namespace llaminar2
                 return std::make_shared<IQ1_STensor>(shape, std::move(raw));
             case TensorType::IQ1_M:
                 return std::make_shared<IQ1_MTensor>(shape, std::move(raw));
+            case TensorType::MXFP4:
+                return std::make_shared<MXFP4Tensor>(shape, std::move(raw));
             default:
                 throw std::runtime_error(
                     "ModelLoader cannot materialize selected experts for tensor type " +
@@ -392,6 +394,8 @@ namespace llaminar2
             return TensorType::IQ1_S;
         case GGUFTensorType::IQ1_M:
             return TensorType::IQ1_M;
+        case GGUFTensorType::MXFP4:
+            return TensorType::MXFP4;
         case GGUFTensorType::I32:
             return TensorType::INT32;
         default:
@@ -425,6 +429,7 @@ namespace llaminar2
         case GGUFTensorType::IQ2_S:
         case GGUFTensorType::IQ4_XS:
         case GGUFTensorType::IQ1_M:
+        case GGUFTensorType::MXFP4:
             return true;
         default:
             return false;
@@ -483,6 +488,8 @@ namespace llaminar2
             return 136; // IQ4_XS uses 256-element super-blocks (136 bytes), not 32-element blocks
         case GGUFTensorType::IQ1_M:
             return 56;
+        case GGUFTensorType::MXFP4:
+            return 17;
         default:
             return 0;
         }
@@ -498,6 +505,7 @@ namespace llaminar2
         case GGUFTensorType::Q5_1:
         case GGUFTensorType::Q8_0:
         case GGUFTensorType::IQ4_NL:
+        case GGUFTensorType::MXFP4:
             return 32;
         case GGUFTensorType::IQ4_XS: // IQ4_XS uses 256-element super-blocks like K-quants
         case GGUFTensorType::Q2_K:
@@ -1239,6 +1247,13 @@ namespace llaminar2
             }
             break;
 
+        case GGUFTensorType::MXFP4:
+            if (factory_)
+                tensor = factory_->createQuantized(TensorType::MXFP4, shape, raw);
+            else
+                tensor = std::make_shared<MXFP4Tensor>(shape, raw);
+            break;
+
         // Simple quantization formats (8-bit, 4-bit)
         case GGUFTensorType::Q8_0:
             if (factory_)
@@ -1816,6 +1831,13 @@ namespace llaminar2
             {
                 tensor = std::make_shared<IQ1_MTensor>(slice_shape, raw);
             }
+            break;
+
+        case GGUFTensorType::MXFP4:
+            if (factory_)
+                tensor = factory_->createQuantized(TensorType::MXFP4, slice_shape, raw);
+            else
+                tensor = std::make_shared<MXFP4Tensor>(slice_shape, raw);
             break;
 
         default:
@@ -2767,6 +2789,13 @@ namespace llaminar2
             }
             break;
 
+        case GGUFTensorType::MXFP4:
+            if (factory_)
+                tensor = factory_->createQuantized(TensorType::MXFP4, slice_shape, raw);
+            else
+                tensor = std::make_shared<MXFP4Tensor>(slice_shape, raw);
+            break;
+
         default:
             LOG_ERROR("[ModelLoader] Unsupported tensor type for column slicing: "
                       << static_cast<int>(info->type));
@@ -3577,6 +3606,9 @@ namespace llaminar2
             case GGUFTensorType::IQ1_M:
                 temp_unique = factory_->createQuantized(TensorType::IQ1_M, shape, raw);
                 break;
+            case GGUFTensorType::MXFP4:
+                temp_unique = factory_->createQuantized(TensorType::MXFP4, shape, raw);
+                break;
             default:
                 LOG_ERROR("[ModelLoader] INT8 dequantization not supported for type: "
                           << static_cast<int>(info->type));
@@ -3647,6 +3679,9 @@ namespace llaminar2
                 break;
             case GGUFTensorType::IQ1_M:
                 temp_unique = std::make_unique<IQ1_MTensor>(shape, raw);
+                break;
+            case GGUFTensorType::MXFP4:
+                temp_unique = std::make_unique<MXFP4Tensor>(shape, raw);
                 break;
             default:
                 LOG_ERROR("[ModelLoader] INT8 dequantization not supported for type: "
@@ -3863,6 +3898,13 @@ namespace llaminar2
         case GGUFTensorType::IQ1_M:
         {
             auto temp_tensor = std::make_shared<IQ1_MTensor>(shape, raw);
+            temp_tensor->to_fp32(fp32_data.data());
+            break;
+        }
+
+        case GGUFTensorType::MXFP4:
+        {
+            auto temp_tensor = std::make_shared<MXFP4Tensor>(shape, raw);
             temp_tensor->to_fp32(fp32_data.data());
             break;
         }
