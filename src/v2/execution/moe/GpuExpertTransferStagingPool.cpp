@@ -100,6 +100,7 @@ namespace llaminar2
                     spec.payload_bytes_per_block,
                     spec.is_asymmetric,
                     spec.has_emins,
+                    spec.scale_plane,
                     /*raw_gguf_bytes=*/0);
             }
         }

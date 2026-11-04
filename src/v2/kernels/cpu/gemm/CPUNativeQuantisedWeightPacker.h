@@ -222,10 +222,14 @@ namespace llaminar2::cpu::native_quantised
 
                         if (mxfp4_source)
                         {
-                            if (!mxfp4::blockFitsFP16(blk[0], blk + 1))
+                            // Native nibble MXFP4 units always carry the exact BF16
+                            // power-of-two word of their E8M0 scale.
+                            if (meta.scaleEncoding() != CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16)
+                                throw std::logic_error("MXFP4 nibble units require the BF16 power-of-two scale encoding");
+                            if (!mxfp4::blockFitsNativeE8M0(blk[0], blk + 1))
                                 throw std::invalid_argument(
-                                    "MXFP4 block exponent has no exact FP16 scale; refusing lossy repack");
-                            scales_buf[col] = mxfp4::preparedScaleFP16Bits(blk[0]);
+                                    "MXFP4 block exponent is outside the native E8M0 range [2, 252]");
+                            scales_buf[col] = mxfp4::powerOfTwoBF16Word(mxfp4::preparedNativeE8M0Byte(blk[0]));
                         }
                         else
                             std::memcpy(&scales_buf[col], blk, 2);
@@ -533,6 +537,7 @@ namespace llaminar2::cpu::native_quantised
                                 .emins_array = nullptr,
                                 .destination_block_origin = first_kb,
                                 .destination_block_count = block_count,
+                                .primary_layout = out.primaryScaleLayout(),
                             };
                             for (int local_kb = 0; local_kb < block_count; ++local_kb)
                             {

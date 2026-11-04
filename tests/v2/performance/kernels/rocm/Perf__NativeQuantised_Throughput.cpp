@@ -1162,7 +1162,11 @@ namespace
             static_cast<size_t>(N) * static_cast<size_t>(blocks_per_row);
         packed.native_quantised_payload.assign(
             total_blocks * static_cast<size_t>(info->payload_bytes), uint8_t{0});
-        packed.native_quantised_scales.assign(total_blocks, uint16_t{0});
+        packed.native_quantised_scales.assign(
+            nativeQuantisedScalePlaneStorageWords(
+                info->codebook_id == kNativeQuantisedMXFP4Codebook ? kNativeQuantisedMXFP4Codebook : info->codebook_id,
+                total_blocks),
+            uint16_t{0});
         packed.native_quantised_mins.clear();
         packed.native_quantised_emins.clear();
         // The secondary plane follows the physical tuple (IQ4_XS source words included).
@@ -1196,6 +1200,7 @@ namespace
         ctx.payload_bytes = info->payload_bytes;
         ctx.payload_array = packed.native_quantised_payload.data();
         ctx.scales_array = packed.native_quantised_scales.data();
+        ctx.primary_layout = gpuPrimaryScaleLayout(packed.native_quantised_codebook_id);
         ctx.mins_array = packed.native_quantised_mins.empty()
                              ? nullptr
                              : packed.native_quantised_mins.data();

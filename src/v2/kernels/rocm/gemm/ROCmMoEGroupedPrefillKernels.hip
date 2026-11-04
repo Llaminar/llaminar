@@ -934,6 +934,10 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
         for (int g = 0; g < 8; ++g)
             dot = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], packed_groups[g], dot);
 
+        // The IQ4 family tag (24) also loads descriptor-4 primaries; both share
+        // the identical 2-byte FP16 plane, so the family load is exact for either.
+        static_assert(::llaminar2::nativeQuantisedScalePlaneBytes(4) ==
+                      ::llaminar2::nativeQuantisedScalePlaneBytes(llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook));
         const uint16_t scale_bits = ::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(scale_base, linear);
         // Physical24 also admits an IQ4_NL gate/up partner. Resolve the
         // actual descriptor word meaning independently for each projection.
