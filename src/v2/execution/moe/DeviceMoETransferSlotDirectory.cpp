@@ -220,11 +220,10 @@ namespace llaminar2
                 return floatingBytes(spec, deviceFormat(spec.format));
             const size_t block_count =
                 static_cast<size_t>(spec.N) * static_cast<size_t>(spec.K / 32);
-            const size_t scales_bytes = block_count * sizeof(uint16_t);
+            const auto planes = NativeVnniMetadataPlaneBytes::of(
+                block_count, spec.codebook_id, spec.is_asymmetric, spec.has_emins);
             return block_count * static_cast<size_t>(spec.payload_bytes_per_block) +
-                   scales_bytes +
-                   (spec.is_asymmetric ? scales_bytes : 0u) +
-                   (spec.has_emins ? block_count * sizeof(uint32_t) : 0u);
+                   planes.scales + planes.secondary + planes.emins;
         }
 
         /** @return Complete wire size, or union capacity when a raw alias is supplied. */
