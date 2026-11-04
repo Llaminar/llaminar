@@ -9,15 +9,16 @@ Prepared MXFP4 (physical codebook 25) currently stores each 32-value block as
 GGUF file. It also accepts only the 40 exponents with an exact FP16 scale,
 `e ∈ [104, 143]`. This work stores the original E8M0 byte in a 1-byte scale
 plane (17 B/32). Kernels build the FP32 scale from bits, which widens the
-accepted domain to `e ∈ [2, 254]`.
+accepted domain to `e ∈ [2, 252]`.
 
 ## Exponent contract
 
 | Exponent byte | FP16 plane (today) | Native E8M0 plane |
 |---|---|---|
 | 104–143 | exact | exact, same FP32 scale bits |
-| 2–103, 144–254 | rejected | exact normal FP32 `2^(e-128)` |
+| 2–103, 144–252 | rejected | exact normal FP32 `2^(e-128)` |
 | 0–1 | rejected | rejected: FP32 subnormal scale, flushed by CUDA `--ftz=true` |
+| 253–254 | rejected | rejected: the largest code (12) times the scale overflows FP32 |
 | 255 | rejected | rejected: OCP MX NaN (ggml decodes it as finite 2^127) |
 | any, all codes ±0 | scale +0 | scale byte 0 → FP32 +0 (ggml writes e = 0) |
 
@@ -63,13 +64,24 @@ the CPU/CUDA/ROCm gates green.
 5. **Evidence:**
    - BOM and capacity tests at 17 B/32;
    - FP16-plane vs E8M0-plane equivalence for every `e ∈ [104, 143]`;
-   - focused regressions for 2/103/144/254 and the rejected 0/1/255;
+   - focused regressions for 2/103/104/143/144/252 and the rejected 0/1/253/255 (nonzero), plus the zero marker emitted only for all-zero payloads;
    - the all-format sweeps on all three backends;
    - paired Release GEMV, grouped MoE and one end-to-end model on CUDA and on
      ROCm gfx906;
    - spill-guard compiles on every shipped architecture.
 
 ## Constraints
+
+- Admission owns validation. `e8m0Scale` / `decodePrimary` assume an admitted
+  byte. Every producer (CPU packer, `packVnniBlock`, CUDA/ROCm repack, tier
+  CPU→GPU inverse) rejects nonzero blocks outside `[2, 252]` and emits the zero
+  marker only for all-zero payloads.
+- The scale encoding is part of sealed preparation and wire identity.
+  `ExpertTierWeightStreamManifest` (version 3 today) must bump its version and
+  hash the encoding, so old FP16 codebook-25 records are never accepted as
+  E8M0 or CPU-BF16 records just because their codebook and strides match.
+- A normal finite scale bounds individual weights, not contributions. Dot
+  products keep the ordinary IEEE FP32 contract.
 
 - 25 remains a distinct physical decoder. It never joins 4/24 launch folding.
 - A 1-byte plane changes vectorized scale loads and tile staging, so occupancy,
@@ -86,5 +98,5 @@ the CPU/CUDA/ROCm gates green.
   `w = (e - 1) << 7`. It widens as `float_bits(uint32(w) << 16)`, which equals
   `(e - 1) << 23` over the whole admitted range, with no BF16 arithmetic. GPU→CPU
   conversion encodes it. CPU→GPU validates a positive normal power of two with
-  biased exponent 1..253 and stores `e = (w >> 7) + 1`. These words never go
+  biased exponent 1..251 and stores `e = (w >> 7) + 1`. These words never go
   through F16C.
