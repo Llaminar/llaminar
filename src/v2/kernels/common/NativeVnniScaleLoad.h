@@ -3,11 +3,12 @@
  * @brief Single read path for the prepared NativeVNNI primary scale plane.
  *
  * Three separate steps, so staged copies never reuse plane addressing:
- * loadEncodedPrimary() reads the stored element from the global plane into a
- * 16-bit carrier; staging (registers, LDS, cp.async tiles) moves that carrier
- * unchanged; decodePrimary() turns a carrier into the FP32 scale consumed by
- * the existing FP32 contribution contract. primaryScale() composes the two
- * for direct global reads.
+ * loadStagedPrimary() reads the stored element from the global plane and
+ * normalizes it to a 16-bit staged word; registers and LDS carry that word;
+ * decodeStagedPrimary() turns it into the FP32 scale consumed by the existing
+ * FP32 contribution contract. primaryScale() composes the two for direct
+ * global reads. Raw byte-plane copies (cp.async) are not staged words until
+ * their copy owner normalizes them.
  *
  * - **2-byte plane (every codebook today).** The loader returns
  *   `widen(plane[linear])`, using the caller's existing backend FP16 widening
@@ -66,61 +67,64 @@ namespace llaminar2::native_vnni_scale
     }
 
     /**
-     * @brief Load one encoded primary-scale element from the global plane.
+     * @brief Load block @p linear from the global plane as a normalized staged word.
      * @tparam Codebook Physical execution codebook (never the arithmetic policy).
      * @param plane Primary scale plane base address.
      * @param linear Block-major linear block index.
-     * @return A 16-bit carrier: FP16 bits for 2-byte planes, the zero-extended
-     *         E8M0 byte for 1-byte planes. Staging (registers, LDS, cp.async
-     *         tiles) moves this carrier; only decodePrimary() interprets it.
+     * @return The staged word that registers and LDS slots carry: the original
+     *         FP16 bits for 2-byte planes; for 1-byte planes the E8M0 byte is
+     *         normalized to mxfp4::powerOfTwoBF16Word (0 stays 0), so staged
+     *         decode is a branch-free placement. A staged word is never a raw
+     *         plane byte: cp.async copies of the raw byte plane must be
+     *         normalized by their copy owner before publication.
      */
     template <std::uint8_t Codebook>
-    LLAMINAR_NVNNI_SCALE_HD std::uint16_t loadEncodedPrimary(const std::uint16_t *plane, std::size_t linear)
+    LLAMINAR_NVNNI_SCALE_HD std::uint16_t loadStagedPrimary(const std::uint16_t *plane, std::size_t linear)
     {
         if constexpr (nativeVnniScalePlaneBytes(Codebook) == 1)
-            return reinterpret_cast<const std::uint8_t *>(plane)[linear];
+            return mxfp4::powerOfTwoBF16Word(reinterpret_cast<const std::uint8_t *>(plane)[linear]);
         else
             return plane[linear];
     }
 
-    /** @brief Runtime-codebook form of loadEncodedPrimary(). */
-    LLAMINAR_NVNNI_SCALE_HD std::uint16_t loadEncodedPrimary(
+    /** @brief Runtime-codebook form of loadStagedPrimary(). */
+    LLAMINAR_NVNNI_SCALE_HD std::uint16_t loadStagedPrimary(
         std::uint8_t codebook, const std::uint16_t *plane, std::size_t linear)
     {
         return nativeVnniScalePlaneBytes(codebook) == 1
-                   ? std::uint16_t{reinterpret_cast<const std::uint8_t *>(plane)[linear]}
+                   ? mxfp4::powerOfTwoBF16Word(reinterpret_cast<const std::uint8_t *>(plane)[linear])
                    : plane[linear];
     }
 
     /**
-     * @brief Decode an encoded carrier (from a plane or from staging) to the FP32 scale.
-     * @tparam Codebook Physical execution codebook that produced @p encoded.
-     * @param encoded Carrier returned by loadEncodedPrimary(), possibly staged.
+     * @brief Decode a staged word (see loadStagedPrimary) to the FP32 scale.
+     * @tparam Codebook Physical execution codebook that produced @p staged.
+     * @param staged Normalized staged word.
      * @param widen Caller's backend FP16-bits-to-FP32 widening (2-byte planes only),
      *        so existing expressions and reduction order are preserved.
      */
     template <std::uint8_t Codebook, class Widen>
-    LLAMINAR_NVNNI_SCALE_HD float decodePrimary(std::uint16_t encoded, Widen widen)
+    LLAMINAR_NVNNI_SCALE_HD float decodeStagedPrimary(std::uint16_t staged, Widen widen)
     {
         if constexpr (nativeVnniScalePlaneBytes(Codebook) == 1)
-            return e8m0Scale(static_cast<std::uint8_t>(encoded));
+            return floatFromBits(std::uint32_t{staged} << 16);
         else
-            return widen(encoded);
+            return widen(staged);
     }
 
-    /** @brief Runtime-codebook form of decodePrimary(). */
+    /** @brief Runtime-codebook form of decodeStagedPrimary(). */
     template <class Widen>
-    LLAMINAR_NVNNI_SCALE_HD float decodePrimary(std::uint8_t codebook, std::uint16_t encoded, Widen widen)
+    LLAMINAR_NVNNI_SCALE_HD float decodeStagedPrimary(std::uint8_t codebook, std::uint16_t staged, Widen widen)
     {
-        return nativeVnniScalePlaneBytes(codebook) == 1 ? e8m0Scale(static_cast<std::uint8_t>(encoded))
-                                                        : widen(encoded);
+        return nativeVnniScalePlaneBytes(codebook) == 1 ? floatFromBits(std::uint32_t{staged} << 16)
+                                                        : widen(staged);
     }
 
     /** @brief Load and decode block @p linear directly from the global plane. */
     template <std::uint8_t Codebook, class Widen>
     LLAMINAR_NVNNI_SCALE_HD float primaryScale(const std::uint16_t *plane, std::size_t linear, Widen widen)
     {
-        return decodePrimary<Codebook>(loadEncodedPrimary<Codebook>(plane, linear), widen);
+        return decodeStagedPrimary<Codebook>(loadStagedPrimary<Codebook>(plane, linear), widen);
     }
 
     /** @brief Runtime-codebook form of primaryScale(). */
@@ -128,7 +132,7 @@ namespace llaminar2::native_vnni_scale
     LLAMINAR_NVNNI_SCALE_HD float primaryScale(
         std::uint8_t codebook, const std::uint16_t *plane, std::size_t linear, Widen widen)
     {
-        return decodePrimary(codebook, loadEncodedPrimary(codebook, plane, linear), widen);
+        return decodeStagedPrimary(codebook, loadStagedPrimary(codebook, plane, linear), widen);
     }
 } // namespace llaminar2::native_vnni_scale
 

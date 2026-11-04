@@ -87,8 +87,12 @@ the CPU/CUDA/ROCm gates green.
 - A 1-byte plane changes vectorized scale loads and tile staging, so occupancy,
   VGPRs and spills must be re-measured per target. If the measured optimum
   moves, MXFP4 gets its own dispatch-policy entries.
-- Staged scales (cp.async BK64 tiles, LDS and register slots) move the
-  encoded carrier, and only `decodePrimary` interprets it. The plane-indexing
+- Staged scales (LDS and register slots) carry a normalized 16-bit word:
+  the original FP16 bits, or for native 25 `powerOfTwoBF16Word(e)`, which
+  `decodeStagedPrimary` places with `<< 16`. cp.async cannot transform data,
+  so BK64 copies only the live byte extent (8 bytes for 8 columns) into raw
+  staging. The copy owner then normalizes it after the async wait and before
+  the existing CTA publication barrier. That schedule stays enabled. The plane-indexing
   loader is never applied to staged or CPU-unit slots. CUDA BK64 copies 16
   bytes for 8 columns today (`CUDANativeVNNIPrefillDevice.cuh`), so a byte
   plane copies 8.
