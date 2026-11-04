@@ -27,6 +27,7 @@
 #include "MoECPUExpertWorkspaceSource.h"
 #include "execution/compute_stages/stages/MoECPUExpertShardRouteStage.h"
 #include "execution/moe/CPUExpertShardSourceSelection.h"
+#include "models/deepseek4/DeepSeekV4Config.h"
 #include "MoEOverlayHostServiceContract.h"
 #include "MoEOverlayParticipantResidency.h"
 #include "MoEExpertOverlayPreparationPlan.h"
@@ -2771,6 +2772,8 @@ namespace llaminar2
                     local_params.expert_intermediate = joint?joint_layer->sourceSelection()->ownership()
                         .projection(WeightRole::MoEExpertUp).rows:expert_intermediate;
                     local_params.layer_idx = layer;
+                    local_params.swiglu_limit = deepSeekV4RoutedSwiGLULimit(
+                        config_.model_context->model(), layer);
                     local_params.cpu_workspace_source = cpuExpertWorkspaceSource(
                         config_.model_context->concreteLoader(), layer, d_model, expert_intermediate, num_experts);
                     local_params.expert_mask = expert_mask;
@@ -3388,6 +3391,8 @@ namespace llaminar2
                             compute_params.expert_intermediate =
                                 expert_intermediate;
                             compute_params.layer_idx = layer;
+                            compute_params.swiglu_limit = deepSeekV4RoutedSwiGLULimit(
+                                config_.model_context->model(), layer);
                             compute_params.expert_mask = expert_mask;
                             compute_params.routing_indices =
                                 tensor_family->routing_indices.get();

@@ -8,9 +8,16 @@
  * indexer selections and attention outputs. Each test compares the ring-based
  * kernels against an independent whole-sequence formulation of DeepSeek's
  * reference (inference/model.py) and against differently chunked execution.
+ * The SwiGLU-clamp regressions prove that every CPU clamp entry point equals
+ * the unchanged SwiGLU program applied to reference-clamped operands.
  */
 #include "kernels/deepseek4/DeepSeekV4Kernels.h"
 #include "kernels/deepseek4/DeepSeekV4Math.h"
+#include "kernels/IMoEKernel.h"
+#include "kernels/KernelFactory.h"
+#include "kernels/common/DeviceSwiGLUNumericalContract.h"
+#include "kernels/cpu/gemm/CPUNativeVNNIGemv.h"
+#include "tensors/TensorClasses.h"
 
 #include <gtest/gtest.h>
 
@@ -282,4 +289,97 @@ TEST(DeepSeekV4CPUKernels, RouteScoreAndHash)
     k->route({{1, nullptr}, experts, topK, 1.0f, logits.data(), nullptr, table.data(), 2, tokens.data(), ids.data(), w.data()}, nullptr);
     EXPECT_EQ(ids, (std::vector<std::int32_t>{3, 1}));
     EXPECT_NEAR(w[0] + w[1], 1.0f, 1e-6f);
+}
+
+// ---------------------------------------------------------------------------
+// SwiGLU operand clamp (DeepSeek-V4 `swiglu_clamp_exp` / `swiglu_clamp_shexp`)
+// ---------------------------------------------------------------------------
+
+namespace
+{
+/** @brief DeepSeek inference/model.py Expert.forward: clamp(up,±L), clamp(gate,max=L). */
+void referenceClamp(float &gate, float &up, float limit)
+{
+    up = std::min(std::max(up, -limit), limit);
+    gate = std::min(gate, limit);
+}
+
+std::uint32_t bits(float value)
+{
+    std::uint32_t out = 0;
+    std::memcpy(&out, &value, sizeof(out));
+    return out;
+}
+} // namespace
+
+TEST(DeepSeekV4SwiGLUClamp, ContractClampsOperandsAndKeepsUnclampedBytes)
+{
+    namespace contract = llaminar2::device_swiglu_contract;
+    const auto gate = randomVector(4096, 71, 12.0f);
+    const auto up = randomVector(4096, 72, 12.0f);
+    int bound = 0;
+    for (std::size_t i = 0; i < gate.size(); ++i)
+    {
+        // limit <= 0 is byte-identical to the ordinary contract.
+        EXPECT_EQ(bits(contract::swigluValue(gate[i], up[i], 0.0f)), bits(contract::swigluValue(gate[i], up[i])));
+        float g = gate[i], u = up[i];
+        referenceClamp(g, u, 10.0f);
+        bound += (g != gate[i]) || (u != up[i]);
+        EXPECT_EQ(bits(contract::swigluValue(gate[i], up[i], 10.0f)), bits(contract::swigluValue(g, u)));
+    }
+    EXPECT_GT(bound, 100) << "fixture must exercise the clamp";
+    // NaN propagates instead of being clamped to a finite value.
+    EXPECT_TRUE(std::isnan(contract::swigluValue(std::nanf(""), 1.0f, 10.0f)));
+}
+
+TEST(DeepSeekV4SwiGLUClamp, CPUMoEKernelClampAndActivation)
+{
+    constexpr int n = 777; // ragged: not a vector multiple
+    const auto gate = randomVector(n, 81, 12.0f);
+    const auto up = randomVector(n, 82, 12.0f);
+    auto kernel = llaminar::v2::kernels::KernelFactory::createMoEKernel(llaminar2::DeviceId::cpu());
+    ASSERT_NE(kernel, nullptr);
+
+    llaminar2::FP32Tensor gate_tensor({static_cast<std::size_t>(n)});
+    llaminar2::FP32Tensor up_tensor({static_cast<std::size_t>(n)});
+    std::memcpy(gate_tensor.mutable_data(), gate.data(), n * sizeof(float));
+    std::memcpy(up_tensor.mutable_data(), up.data(), n * sizeof(float));
+    ASSERT_TRUE(kernel->clampSwiGLUOperands(&gate_tensor, &up_tensor, n, 10.0f));
+    for (int i = 0; i < n; ++i)
+    {
+        float g = gate[i], u = up[i];
+        referenceClamp(g, u, 10.0f);
+        EXPECT_EQ(bits(gate_tensor.data()[i]), bits(g));
+        EXPECT_EQ(bits(up_tensor.data()[i]), bits(u));
+    }
+    // A non-positive limit never touches the operands.
+    ASSERT_TRUE(kernel->clampSwiGLUOperands(&gate_tensor, &up_tensor, n, 0.0f));
+
+    std::vector<float> activated = gate;
+    kernel->setSwiGLULimit(10.0f);
+    kernel->swiGLU(activated.data(), up.data(), n);
+    for (int i = 0; i < n; ++i)
+        EXPECT_EQ(bits(activated[i]),
+                  bits(llaminar2::device_swiglu_contract::swigluValue(gate[i], up[i], 10.0f)));
+}
+
+TEST(DeepSeekV4SwiGLUClamp, GroupedQ8PublicationEqualsPreClampedOperands)
+{
+    constexpr int rows = 3, k = 128, blocks = k / 32;
+    const auto gate = randomVector(rows * k, 91, 12.0f);
+    const auto up = randomVector(rows * k, 92, 12.0f);
+    std::vector<float> gate_clamped = gate, up_clamped = up;
+    for (int i = 0; i < rows * k; ++i)
+        referenceClamp(gate_clamped[i], up_clamped[i], 10.0f);
+
+    for (const auto policy : {llaminar2::CPUProjectionNumericalPolicy::BackendNative,
+                              llaminar2::CPUProjectionNumericalPolicy::GPUAlignedExpert})
+    {
+        std::vector<llaminar2::Q8_1Block> fused(rows * blocks), expected(rows * blocks);
+        llaminar2::cpu::native_vnni::swiglu_quantize_activations_to_q8_1(gate.data(), up.data(), fused.data(),
+                                                       rows, k, blocks, policy, 10.0f);
+        llaminar2::cpu::native_vnni::swiglu_quantize_activations_to_q8_1(gate_clamped.data(), up_clamped.data(), expected.data(),
+                                                       rows, k, blocks, policy, 0.0f);
+        EXPECT_EQ(std::memcmp(fused.data(), expected.data(), fused.size() * sizeof(llaminar2::Q8_1Block)), 0);
+    }
 }

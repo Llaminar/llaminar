@@ -24,6 +24,7 @@
 #include "../../cpu/primitives/SoftmaxPrimitives_New.h"
 #include "../../cpu/primitives/GPUAlignedExpertQ8Primitives.h"
 #include "../../cpu/primitives/SwiGLUPrimitives.h"
+#include "../../common/DeviceSwiGLUNumericalContract.h"
 #include "../../cpu/primitives/VectorPrimitives.h"
 #include "../gemm/CPUNativeVNNIGemv.h"
 #include "../gemm/FloatingPointGemmKernel.h"
@@ -1277,7 +1278,37 @@ namespace llaminar2
 
     void CPUMoEKernel::swiGLU(float *gate, const float *up, int count)
     {
+        if (swiglu_limit_ > 0.0f)
+        {
+            // `up` is read-only here; clamp both operands through the shared
+            // contract while producing the activation in place of `gate`.
+            for (int i = 0; i < count; ++i)
+                gate[i] = device_swiglu_contract::swigluValue(gate[i], up[i], swiglu_limit_);
+            return;
+        }
         primitives::compute_swiglu_gpu_aligned_expert(gate, up, gate, count);
+    }
+
+    bool CPUMoEKernel::clampSwiGLUOperands(ITensor *gate, ITensor *up, int count, float limit)
+    {
+        if (limit <= 0.0f)
+            return true;
+        auto *gate_tensor = dynamic_cast<FP32Tensor *>(gate);
+        auto *up_tensor = dynamic_cast<FP32Tensor *>(up);
+        if (!gate_tensor || !up_tensor || count < 0 ||
+            gate_tensor->numel() < static_cast<size_t>(count) || up_tensor->numel() < static_cast<size_t>(count))
+            return false;
+        float *g = gate_tensor->mutable_data();
+        float *u = up_tensor->mutable_data();
+        // Element-wise and order-free: exact min/max, so any partition is byte-identical.
+        auto clamp = [&]()
+        {
+#pragma omp for schedule(static)
+            for (int i = 0; i < count; ++i)
+                device_swiglu_contract::clampOperands(g[i], u[i], limit);
+        };
+        OMP_WORKSHARE_REGION(clamp);
+        return true;
     }
 
 } // namespace llaminar2

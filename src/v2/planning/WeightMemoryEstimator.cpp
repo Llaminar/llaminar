@@ -19,11 +19,14 @@
 #include "kernels/common/NativeEmbeddingLayout.h"
 #include "loaders/PreparedWeightRepresentationContract.h"
 #include "utils/DebugEnv.h"
+#include "utils/Logger.h"
 #include "tensors/BlockStructures.h"
 #include "tensors/NativeVnniFormatInfo.h"
 
 #include <algorithm>
 #include <limits>
+#include <map>
+#include <memory>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -453,6 +456,10 @@ namespace llaminar2
         const bool owns_terminal = weightScopeOwnsTerminal(components);
 
         WeightEstimate est;
+        // DEBUG-only per-family (native, device) byte breakdown of this estimate.
+        std::unique_ptr<std::map<std::string, std::pair<size_t, size_t>>> debug_families;
+        if (Logger::getInstance().shouldLog(LogLevel::VERBOSITY_DEBUG))
+            debug_families = std::make_unique<std::map<std::string, std::pair<size_t, size_t>>>();
         const WeightShardGeometryResolver geometry_resolver(
             profile, device, shard_index, total_shards, tensor_parallel_assignment);
         const bool has_explicit_lm_head = std::any_of(
@@ -657,6 +664,17 @@ namespace llaminar2
             if (isLMHeadTensor(t.name))
                 est.lm_head_bytes += device_size;
             est.device_bytes += device_size;
+            if (debug_families)
+            {
+                // Collapse "blk.N." so one row summarizes a tensor family per format.
+                std::string family = t.name;
+                if (family.rfind("blk.", 0) == 0)
+                    if (const auto dot = family.find('.', 4); dot != std::string::npos)
+                        family = "blk.N" + family.substr(dot);
+                auto &row = (*debug_families)[family + " " + t.quant_type];
+                row.first += native;
+                row.second += device_size;
+            }
         };
 
         for (const auto &t : profile.tensors)
@@ -692,6 +710,10 @@ namespace llaminar2
             accumulate(t, true);
         }
 
+        if (debug_families)
+            for (const auto &[family, bytes] : *debug_families)
+                LOG_DEBUG("[WeightMemoryEstimator] device=" << device.to_string() << " family=" << family
+                          << " native_bytes=" << bytes.first << " device_bytes=" << bytes.second);
         return est;
     }
 

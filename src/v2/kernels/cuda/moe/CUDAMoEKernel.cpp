@@ -1591,7 +1591,10 @@ extern "C"
         int seq_len, int d_model, const int *device_effective_seq_len,
         int device_idx, void *stream);
 
-    bool cudaMoE_swiglu(float *gate, const float *up, int count, int device_idx, void *stream);
+    bool cudaMoE_swiglu_clamp_operands(float *gate, float *up, int count, float swiglu_limit,
+                                       int device_idx, void *stream);
+    bool cudaMoE_swiglu(float *gate, const float *up, int count, int device_idx, void *stream,
+        float swiglu_limit);
     bool cudaMoE_weighted_add(float *output, const float *input, float weight, int count, int device_idx, void *stream);
 
     bool cudaMoE_count_per_expert(
@@ -1915,7 +1918,8 @@ extern "C"
         uint8_t codebook_id,
         int k_partitions,
         int device_idx,
-        void *stream);
+        void *stream,
+        float swiglu_limit);
 
     bool cudaMoE_grouped_swiglu_down_floating_decode_table(
         const float *const *d_gate_ptrs,
@@ -1931,7 +1935,8 @@ extern "C"
         int num_experts,
         llaminar2::DeviceMoEWeightFormat format,
         int device_idx,
-        void *stream);
+        void *stream,
+        float swiglu_limit);
 
     bool cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart(
         const float *const *d_gate_ptrs,
@@ -1950,7 +1955,8 @@ extern "C"
         uint8_t codebook_id,
         int k_partitions,
         int device_idx,
-        void *stream);
+        void *stream,
+        float swiglu_limit);
 
     bool cudaMoE_grouped_prefill_pipeline(
         const float *d_hidden,
@@ -2004,7 +2010,8 @@ extern "C"
             imma_gateup_schedule,
         int device_idx,
         void *stream,
-        const llaminar2::MoEPrefillProjectionExecution &execution);
+        const llaminar2::MoEPrefillProjectionExecution &execution,
+        float swiglu_limit);
 
 
     bool cudaMoE_reduce_canonical_route_contributions(
@@ -4890,7 +4897,7 @@ namespace llaminar2
     {
         if (count <= 0)
             return;
-        cudaMoE_swiglu(gate, up, count, device_ordinal_, getStream());
+        cudaMoE_swiglu(gate, up, count, device_ordinal_, getStream(), swiglu_limit_);
     }
 
     void CUDAMoEKernel::weightedAdd(float *output, const float *input, float weight, int count)
@@ -6788,6 +6795,27 @@ namespace llaminar2
         swiGLU(static_cast<float *>(gate->gpu_data_ptr()),
                static_cast<const float *>(up->gpu_data_ptr()), count);
         markDeviceWritten(gate, device, stream);
+    }
+
+    bool CUDAMoEKernel::clampSwiGLUOperands(ITensor *gate, ITensor *up, int count, float limit)
+    {
+        if (limit <= 0.0f)
+            return true;
+        if (count <= 0 || !gate || !up || gate->numel() < static_cast<size_t>(count) ||
+            up->numel() < static_cast<size_t>(count))
+            return false;
+        void *stream = requireStream("CUDAMoEKernel::clampSwiGLUOperands");
+        const DeviceId device = deviceId();
+        if (!requireTensorOnDevice(gate, device, stream, "gate") ||
+            !requireTensorOnDevice(up, device, stream, "up"))
+            return false;
+        if (!cudaMoE_swiglu_clamp_operands(static_cast<float *>(gate->gpu_data_ptr()),
+                                           static_cast<float *>(up->gpu_data_ptr()),
+                                           count, limit, device_ordinal_, stream))
+            return false;
+        markDeviceWritten(gate, device, stream);
+        markDeviceWritten(up, device, stream);
+        return true;
     }
 
     void CUDAMoEKernel::weightedAddFromTensors(ITensor *output, ITensor *input, float weight, int count)
@@ -9059,7 +9087,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                         num_experts,
                         gateup_table.weight_format,
                         device_ordinal_,
-                        producer_stream, execution);
+                        producer_stream, execution, swiglu_limit_);
                 },
                 [&](const EnqueuedWorkspaceRead<float> &read)
                 {
@@ -9327,7 +9355,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                     prefill_policy.imma_down_columns,
                     prefill_policy.imma_gateup_schedule,
                     device_ordinal_,
-                    producer_stream, execution);
+                    producer_stream, execution, swiglu_limit_);
             },
             [&](const EnqueuedWorkspaceRead<float> &read)
             {
@@ -9554,7 +9582,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                         num_experts,
                         gateup_table.weight_format,
                         device_ordinal_,
-                        producer_stream, execution);
+                        producer_stream, execution, swiglu_limit_);
                 },
                 [&](const EnqueuedWorkspaceRead<float> &read)
                 {
@@ -9830,7 +9858,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                     prefill_policy.imma_down_columns,
                     prefill_policy.imma_gateup_schedule,
                     device_ordinal_,
-                    producer_stream, execution);
+                    producer_stream, execution, swiglu_limit_);
             },
             [&](const EnqueuedWorkspaceRead<float> &read)
             {
@@ -10449,7 +10477,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                   table.num_experts,
                   table.weight_format,
                   device_ordinal_,
-                  stream)
+                  stream, swiglu_limit_)
             : cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
                   d_gate_ptrs,
                   d_up_ptrs,
@@ -10468,7 +10496,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                   table.codebook_id,
                   k_partitions,
                   device_ordinal_,
-                  stream);
+                  stream, swiglu_limit_);
         if (ok)
         {
             markDeviceWritten(output, device, stream);
@@ -10830,7 +10858,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
             table.codebook_id,
             k_partitions,
             device_ordinal_,
-            stream);
+            stream, swiglu_limit_);
         if (ok)
         {
             markDeviceWritten(output, device, stream);
@@ -11625,7 +11653,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                   down_table.num_experts,
                   down_table.weight_format,
                   device_ordinal_,
-                  stream)
+                  stream, swiglu_limit_)
             : cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
                   d_down_gate_ptrs,
                   d_down_up_ptrs,
@@ -11644,7 +11672,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                   down_table.codebook_id,
                   down_k_partitions,
                   device_ordinal_,
-                  stream);
+                  stream, swiglu_limit_);
         if (!down_ok)
             return false;
 
@@ -11929,7 +11957,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
             table.codebook_id,
             k_partitions,
             device_ordinal_,
-            stream);
+            stream, swiglu_limit_);
 
         if (ok)
         {

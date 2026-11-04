@@ -1378,6 +1378,7 @@ namespace llaminar2::cpu::native_vnni
          * @param down_descriptors Down projections for all local experts.
          * @param down_count Number of valid down descriptors.
          * @param partial_storage Admitted bank reused only after each phase's readers retire.
+         * @param swiglu_limit Positive DeepSeek-V4 SwiGLU operand clamp, or 0 for none.
          * @return `true` only when every team participant completes every phase.
          */
         static bool execute_moe_grouped_ffn_transaction_preq_decode_equivalent(
@@ -1392,7 +1393,8 @@ namespace llaminar2::cpu::native_vnni
             int activation_blocks_per_row,
             const BatchedPrequantizedProjectionDesc *down_descriptors,
             int down_count,
-            std::span<float> partial_storage)
+            std::span<float> partial_storage,
+            float swiglu_limit = 0.0f)
         {
             if (!gate_up_descriptors || gate_up_count <= 0 ||
                 !down_descriptors || down_count <= 0 ||
@@ -1463,7 +1465,8 @@ namespace llaminar2::cpu::native_vnni
                     route_rows,
                     intermediate,
                     activation_blocks_per_row,
-                    gate_up_descriptors[0].kernel->numerical_policy_);
+                    gate_up_descriptors[0].kernel->numerical_policy_,
+                    swiglu_limit);
 
                 if (!multiply_batched_preq_decode_equivalent(
                         down_descriptors,
