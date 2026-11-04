@@ -616,7 +616,10 @@ namespace llaminar2
                     params[name] = value;
                 else
                 {
-                    auto parsed = nlohmann::ordered_json::parse(value, nullptr, false);
+                    // Python keeps integers beyond 64 bits exact; a rounded
+                    // double would be a different argument, so keep the text.
+                    auto parsed = hasOutOfRangeInteger(value) ? nlohmann::ordered_json(nlohmann::ordered_json::value_t::discarded)
+                                                              : nlohmann::ordered_json::parse(value, nullptr, false);
                     params[name] = parsed.is_discarded() ? nlohmann::ordered_json(value) : std::move(parsed);
                 }
                 pos = end == close ? close + kDsmlParamClose.size() : next;

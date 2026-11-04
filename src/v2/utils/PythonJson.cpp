@@ -152,6 +152,38 @@ namespace llaminar2
         return out;
     }
 
+    bool hasOutOfRangeInteger(std::string_view json_text)
+    {
+        // A float token without '.', 'e' or 'E' is an integer nlohmann could
+        // not represent in int64/uint64.
+        struct Detector : nlohmann::json_sax<nlohmann::json>
+        {
+            bool found = false;
+            bool null() override { return true; }
+            bool boolean(bool) override { return true; }
+            bool number_integer(number_integer_t) override { return true; }
+            bool number_unsigned(number_unsigned_t) override { return true; }
+            bool number_float(number_float_t, const string_t &lexeme) override
+            {
+                if (lexeme.find_first_of(".eE") == string_t::npos) found = true;
+                return true;
+            }
+            bool string(string_t &) override { return true; }
+            bool binary(binary_t &) override { return true; }
+            bool start_object(std::size_t) override { return true; }
+            bool key(string_t &) override { return true; }
+            bool end_object() override { return true; }
+            bool start_array(std::size_t) override { return true; }
+            bool end_array() override { return true; }
+            bool parse_error(std::size_t, const std::string &, const nlohmann::detail::exception &) override
+            {
+                return false;
+            }
+        } detector;
+        nlohmann::json::sax_parse(json_text.begin(), json_text.end(), &detector);
+        return detector.found;
+    }
+
     std::string pythonJsonDumps(const nlohmann::ordered_json &value)
     {
         std::string out;
