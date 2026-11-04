@@ -130,7 +130,7 @@ namespace llaminar2
     const float *MXFP4Tensor::data() const
     {
         assertValid("MXFP4Tensor::data");
-        if (raw_data_released_)
+        if (is_raw_data_released())
         {
             LOG_DEBUG("MXFP4Tensor::data() called but raw data was released after GEMM packing");
             return nullptr;
@@ -226,7 +226,8 @@ namespace llaminar2
         if (block_size == MXFP4Block::BLOCK_SIZE && cols2d() % MXFP4Block::BLOCK_SIZE == 0)
         {
             // Native granularity: codes are already integers, the scale is the block scale.
-            const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const auto *all = reinterpret_cast<const MXFP4Block *>(data_ptr);
             const size_t blocks = total / MXFP4Block::BLOCK_SIZE;
 #pragma omp parallel for schedule(static) if (blocks > 1024)
@@ -289,7 +290,9 @@ namespace llaminar2
     void MXFP4Tensor::packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const
     {
         const size_t linear = vnniLinearIdx(ctx, destination_n, b);
-        const auto &blk = typed_data()[static_cast<size_t>(source_n) * ctx.blocks_per_row + b];
+        const auto *all = typed_data();
+        if (!all) throw std::runtime_error("Native tensor raw source was retired");
+        const auto &blk = all[static_cast<size_t>(source_n) * ctx.blocks_per_row + b];
         if (!mxfp4::blockFitsFP16(blk.e, blk.qs))
             throw std::runtime_error("MXFP4Tensor::packVnniBlock: block exponent " + std::to_string(blk.e) +
                                      " (scale 2^" + std::to_string(static_cast<int>(blk.e) - 128) +

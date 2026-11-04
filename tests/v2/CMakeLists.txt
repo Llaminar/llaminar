@@ -867,6 +867,16 @@ add_v2_test(V2_Unit_MXFP4Tensor
     NO_MODELS
     NO_MPI
 )
+# Exact MXFP4 preparation: inexact exponents rejected, ggml all-zero blocks
+# (e = 0 / e > 143) prepared with scale +0 through the production CPU packers.
+add_v2_test(V2_Integration_MXFP4ExactPreparation_CPU
+    COMMAND $<TARGET_FILE:v2_test_mxfp4_tensor>
+        --gtest_filter=MXFP4Tensor.NativeVnniPackingIsVerbatimAndRejectsInexactScales:MXFP4Tensor.GgmlAllZeroBlocksPrepareExactlyWithZeroScale:MXFP4CPUNativeVNNI.GgmlAllZeroBlocksMatchExactReference
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Tensors;MXFP4;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+    NO_MPI
+)
 add_v2_test(V2_Unit_Qwen4ExpMetadata
     COMMAND $<TARGET_FILE:v2_test_qwen4exp_metadata>
     LABELS "V2;Unit;Models;Qwen4Exp;Loaders"
@@ -26581,6 +26591,13 @@ add_v2_test(V2_Unit_CPUEmbeddingGroupedVerifier
     MPI_PROCS 1
 )
 # Original source values are independent of the optimized lookup implementation.
+# Arena-capacity outputs: native FP16/BF16 CPU lookups use the arena row pitch.
+add_v2_test(V2_Integration_EmbeddingArenaCapacityRowPitch_CPU
+    COMMAND $<TARGET_FILE:v2_test_cpu_embedding_grouped_verifier>
+        --gtest_filter=Test__CPUEmbeddingGroupedVerifier.ArenaCapacityOutputMatchesExactRowsForAllFormats
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Embedding;AllFormats;Regression"
+    MPI_PROCS 1 NO_MODELS
+)
 add_v2_test(V2_Integration_EmbeddingSourceRepresentation
     COMMAND $<TARGET_FILE:v2_test_cpu_embedding_grouped_verifier>
         --gtest_filter=Test__CPUEmbeddingGroupedVerifier.NativeLayoutRetainsEverySourceFormatAndRejectsInvalidGeometry
