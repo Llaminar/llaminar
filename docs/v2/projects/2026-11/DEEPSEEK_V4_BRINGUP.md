@@ -134,3 +134,37 @@ loads the lossy UD-IQ* files.
 - Oracle: llama.cpp b12079 (`71efc559a`) CUDA build with
   `-DCMAKE_CUDA_ARCHITECTURES=90`, `llama-server -m <shard1> -ngl 999 -c 32768
   -np 1 --jinja` on the same GPUs (llama.cpp keeps the GGUF at file size).
+
+## Production vLLM parity matrix (target of the 1:1 comparison)
+
+Reference deployment: PCAI P0 evaluation boot of 2026-11-03 (`vision-vram-p0`,
+image `vllm-pcai@sha256:a679f68d…`, exact production arguments), on the
+official safetensors checkpoint `6821d6ad`. Its measured results are the
+baseline; the comparison reruns the same client suite against Llaminar and
+needs no new vLLM boot.
+
+vLLM arguments and the corresponding Llaminar state:
+
+| vLLM setting | Value | Llaminar today | Needed for 1:1 |
+|---|---|---|---|
+| Checkpoint | official FP8 + MXFP4 safetensors | UD-Q8_K_XL GGUF: same values, FP8 tensors widened to BF16 | FP8 E4M3 128x128 block weight type, rebuilt exactly from the BF16 copy (-4.6 GiB) |
+| Expert weights on GPU | MXFP4, 17 B/32 | 18 B/32 (FP16 scale) | 17-byte MXFP4 GPU layout (-8 GiB) |
+| `--tensor-parallel-size=2` | heads and experts split across both GPUs | DSV4 rejects TP/PP; only ExpertOverlay (dense on cuda:0) | dense TP2 for DSV4 attention/shared (balanced 2-GPU memory) |
+| `--max-model-len=1048576` | 1M | generic KV 88 KB/token + FP32 pools | drop generic cache; FP8/MXFP4 pools (3.4-3.8 KB/token) |
+| `--kv-cache-dtype=fp8`, `--block-size=256` | `fp8_ds_mla` 584 B/entry, FP8 indexer 132 B | FP32 pools | same storage format + official QAT rounding |
+| `--max-num-seqs=8`, `--max-num-batched-tokens=4096` | 8 concurrent, 4096-token chunks | exactly one request per graph | per-sequence pools, batched DSV4 graph |
+| prefix caching (default) + `SimpleCPUOffloadConnector` 192 GiB | GPU + host tier | rejected for deepseek4 | archive/restore DSV4 rings and pools in the prefix cache |
+| `--speculative-config` DSpark k=5, per-batch [[1,2,5],[3,4,3],[5,8,2]] | drafter in checkpoint | MTP rejected; DSpark absent | DSpark drafter (GGUF `dspark` tensors) + dynamic depth |
+| `--moe-backend=humming` | FP8 MoE activations | int8 (Q8) activations on NativeVNNI | none required for function; numerics differ |
+| `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=64` | indexer scratch cap | `[rows, poolRows]` FP32 score scratch | chunked indexer scoring with a bounded scratch |
+| `--offload-backend=uva --cpu-offload-params vision aligner embed_tokens` | 0.93 GiB/GPU freed | no vision; embedding on GPU | vision tower; optional host embedding |
+| `--compilation-config FULL_AND_PIECEWISE`, async scheduling | full graphs | full captured graphs | equivalent |
+| `--reasoning-parser/--tool-call-parser deepseek_v4`, thinking `high` default | official DSV4 encoding | GGUF Jinja template, generic thinking split | DSV4 encoding (`reasoning_effort`), DSML tool calls |
+| `--enable-prompt-tokens-details` | cached-token usage | — | report prefix-cache hits in usage |
+| `--attention-config indexer_tp_shard_min_rows` (idxshard candidate) | TP split of indexer prefill rows | n/a without TP | row-sharded indexer once dense TP exists |
+
+Measured vLLM baseline (P0): weights + DSpark 78.61 GiB/GPU, CUDA graphs
+0.92 GiB, KV 6.76 GiB -> 1,129,474 tokens (1.08x of 1M), nvidia-smi
+~94.4 GiB used of 95.8 per GPU. Decode 1 request 206-218 tok/s; 8 concurrent
+943 tok/s total (130 per request); cold 68.7K prompt 4.8 s; cold 273K 25.7 s;
+warm 273K re-ask 0.81 s; host-tier 252K reload 0.74-0.93 s; quality 51/60.
