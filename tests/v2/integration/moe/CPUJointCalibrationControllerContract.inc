@@ -115,6 +115,20 @@ void proveCPUJointCalibrationController()
             }
         }
         EXPECT_THROW((void)sealed->wholeRows(),std::invalid_argument);
+        // Feed the actual sealed native corpus through production source-bound
+        // expansion and the SAME typed Composer used by certification. No new
+        // timing, readiness or physical observation is authored by this check.
+        const MoEOverlayEconomyCalibrationLayerCatalog catalog(original.manifests);
+        const auto expanded=catalog.expand(*sealed,initial);
+        const auto costs=MoEOverlayEconomyProfileComposer::normalizeMigrationMeasurements(expanded.rows);
+        ASSERT_EQ(costs.size(),coordinates.size());
+        for(size_t index=0;index<costs.size();++index) {
+            EXPECT_EQ(costs[index].coordinate,coordinates[index]);
+            EXPECT_GT(costs[index].transfer_and_repack_ns,0u);
+            EXPECT_FALSE(expanded.rows[index].measured_coordinate);
+            EXPECT_EQ(expanded.rows[index].geometry,sealed->rows[index].geometry);
+        }
+
         std::string reuse_error;
         EXPECT_FALSE(ledger->matchesDeclarations(*sealed,&reuse_error)); // No setup-quoted presealed reuse claim.
         EXPECT_NE(reuse_error.find("setup-bound"),std::string::npos)<<reuse_error;

@@ -7,6 +7,7 @@
  * sockets; four/eight-socket execution remains unqualified here.
  */
 #include "execution/moe/MoECPUExpertShardReturnRole.h"
+#include "execution/moe/MoEOverlayCPUServiceMeasurement.h"
 #include "execution/moe/MoEExpertShardCohort.h"
 #include "execution/compute_stages/stages/MoECPUExpertShardRouteStage.h"
 #include "execution/moe/MoEOverlaySparseCollective.h"
@@ -233,5 +234,65 @@ TEST(CPUJointServingMetadata, ActualStageRejectsSparsePhaseWithoutOriginalPrepar
             MoECPUExpertShardRouteStage rejected(params);
             EXPECT_FALSE(rejected.execute(context.get()));EXPECT_EQ(rejected_tp.calls,0);
         }
+    }
+}
+
+/** @test Actual gather construction rejects foreign cohort/member/order before any protocol traffic.
+ * Metadata contexts grant no native readiness; the setup producer rejects them
+ * at its original-owner boundary without changing terminal diagnostic output.
+ */
+TEST(CPUJointServingMetadata, PreparedComputeRejectsForeignDomainBeforeCollectives) {
+    class ForeignDomain final : public test::ScriptedGlobalTPContext {
+    public:
+        int population=2,member=1,node=1;mutable int traffic=0;
+        std::vector<int> ranks{0,1};
+        /** @return Recorded population, not native readiness. */
+        int degree() const override{return population;}
+        /** @return Recorded original member index. */
+        int myIndex() const override{return member;}
+        /** @return Recorded member NUMA endpoint. */
+        GlobalDeviceAddress localDevice() const override{return GlobalDeviceAddress::cpu(node);}
+        /** @return Intra-node declaration, never a native owner. */
+        TPScope scope() const override{return TPScope::NODE_LOCAL;}
+        /** @return The exact recorded order under test. */
+        const std::vector<int>& worldRanks() const override{return ranks;}
+        /** @brief Record accidental protocol entry; never fabricate completion. */
+        bool allgatherBytes(const void*,void*,size_t) const override {++traffic;return false;}
+        /** @brief Record accidental transport; never fabricate output. */
+        bool gatherVariableFloatRecordsToRoot(const float*,size_t,float*,size_t,size_t,int,size_t&,
+            const std::string&,std::span<RootedFloatRecordRange>) override {++traffic;return false;}
+    };
+    const auto original=MoEExpertOwnerMap::buildShardPlacement(declaration(2),{source()});
+    const auto selection=CPUExpertShardSourceSelection::fromOriginalPlacement(original,7,1);
+    FP32Tensor packed({2*(256+1)+1}),indices({1,1}),weights({1,1}),combined({1,256});
+    std::array<RootedFloatRecordRange,2> ranges{};
+    std::array<int32_t,2> maps{};std::array<float,1> required{};
+    for(int foreign=0;foreign<4;++foreign) {
+        auto domain=std::make_shared<ForeignDomain>();
+        if(foreign==0)domain->population=3;
+        if(foreign==1)domain->member=0;
+        if(foreign==2)domain->ranks={1,0};
+        if(foreign==3)domain->node=99;
+        std::fill_n(combined.mutable_data(),combined.numel(),-991.0f);
+        MoECPUExpertShardRouteStage::Params params{
+            .original_source=selection,.tp=domain.get(),.packed_records=&packed,
+            .route_indices=&indices,.route_weights=&weights,.combined_routes=&combined,
+            .source_ranges=ranges,.participant_route_maps=maps,.required_route_weights=required,
+            .rows=1,.top_k=1,.columns=256,.root_participant=0,
+            .stage_name="prepared_compute_foreign_domain",.standalone_execution_phase=ExpertHistogramSource::DecodeToken};
+        const char* expected=foreign<2?"foreign original cohort membership":
+            foreign==2?"reordered original rank membership":"changed original rank/NUMA/source geometry";
+        try {MoECPUExpertShardRouteStage stage(params);ADD_FAILURE()<<"foreign original domain accepted";}
+        catch(const std::invalid_argument& error){EXPECT_NE(std::string(error.what()).find(expected),std::string::npos);}
+        EXPECT_EQ(domain->traffic,0);
+        MoEOverlayParticipantResidencyRegistry registry({
+            .owner_map=MoEExpertOwnerMap::build(declaration(1)),.local_participant_ids={0},
+            .num_layers=1,.num_experts=4,.initial_epoch=1,.first_model_layer=7});
+        std::array<float,256> diagnostic;diagnostic.fill(-993.0f);
+        EXPECT_THROW((void)MoEOverlayCPUServiceMeasurement::measurePreparedCPUJoint(registry,1,1,7,0,
+            ExpertHistogramSource::DecodeToken,domain,nullptr,diagnostic),std::invalid_argument);
+        EXPECT_EQ(domain->traffic,0);
+        EXPECT_TRUE(std::all_of(diagnostic.begin(),diagnostic.end(),[](float x){return x==-993.0f;}));
+        EXPECT_TRUE(std::all_of(combined.data(),combined.data()+combined.numel(),[](float x){return x==-991.0f;}));
     }
 }

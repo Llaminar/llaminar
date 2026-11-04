@@ -224,6 +224,17 @@ namespace llaminar2
             const MoEOverlaySealedMigrationMeasurements &
                 representative_measurements) const;
 
+        /**
+         * @brief Expand measured target rows only across exact original source geometry.
+         * @param measurements Physically measured rows, never already projected evidence.
+         * @param snapshot Original sealed source placement retaining cohort manifests and cuts.
+         * @return Full target/layer corpus with explicit measured-coordinate provenance.
+         * @throws std::invalid_argument For missing samples or changed members, cuts or source formats.
+         */
+        [[nodiscard]] MoEOverlaySealedMigrationMeasurements expand(
+            const MoEOverlaySealedMigrationMeasurements &measurements,
+            std::shared_ptr<const MoEOverlayResidencySnapshot> snapshot) const;
+
     private:
         /**
          * @brief Translate an owned global layer into compact catalog storage.
@@ -232,6 +243,14 @@ namespace llaminar2
          * @throws std::invalid_argument For a layer outside the owned interval.
          */
         [[nodiscard]] std::size_t storageIndexForModelLayer(int layer) const;
+
+        /** @brief Shared expansion implementation for source-bound targets and the checked whole adapter.
+         * @param measurements Original measured corpus. @param snapshot Original source, or null for legacy whole rows.
+         * @return Fully covered corpus preserving each original measurement coordinate.
+         */
+        [[nodiscard]] MoEOverlaySealedMigrationMeasurements expandOriginalMeasurements(
+            const MoEOverlaySealedMigrationMeasurements &measurements,
+            std::shared_ptr<const MoEOverlayResidencySnapshot> snapshot) const;
 
         int first_model_layer_ = 0;
         std::string identity_;

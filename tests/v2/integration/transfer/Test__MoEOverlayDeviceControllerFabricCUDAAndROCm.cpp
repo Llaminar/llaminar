@@ -251,12 +251,7 @@ namespace llaminar2::test
                          layer < layer_count;
                          ++layer)
                     {
-                        migration->costs.push_back({
-                            .source_participant =
-                                static_cast<int>(source),
-                            .destination_participant =
-                                static_cast<int>(destination),
-                            .layer = static_cast<int>(layer),
+                        migration->costs.push_back({.coordinate = {.source_target = MoEOverlayRouteTarget::whole(static_cast<int>(source)), .destination_target = MoEOverlayRouteTarget::whole(static_cast<int>(destination)), .layer = static_cast<int>(layer)},
                             .transfer_and_repack_ns = transfer_cost_ns,
                             .inference_interference_ns = 0u,
                         });

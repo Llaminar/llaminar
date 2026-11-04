@@ -8,6 +8,9 @@
  */
 #pragma once
 #include "MoEOverlayMigrationEvidenceContext.h"
+#include "MoEOverlayPreparedTargetService.h"
+#include <algorithm>
+#include <map>
 #include <cstring>
 #include <limits>
 #include <span>
@@ -132,5 +135,55 @@ public:
                 throw std::invalid_argument("Economy endpoint payload omitted required original piece evidence");
         return rows;
     }
+    /** @brief Exact metadata bytes owned by one original root; inactive phases never travel.
+     * @param plan Original receiver geometry. @param rank Actual observer.
+     * @return One initialized 40-byte record per actual sampled phase. */
+    static size_t preparedServiceBytes(const MoEOverlayPreparedTargetServicePlan& plan,int rank) {
+        constexpr size_t sample_bytes=3*sizeof(int32_t)+sizeof(uint32_t)+3*sizeof(uint64_t);
+        size_t count=0;
+        for(const auto& entry:plan.entries())if(entry.root_world_rank==rank)
+            for(const int layer:entry.sample_layers)if(layer==entry.coordinate.layer)++count;
+        if(count>std::numeric_limits<size_t>::max()/sample_bytes)throw std::overflow_error("Prepared service wire extent overflows");
+        return count*sample_bytes;
+    }
+    /** @brief Encode actual prepared phases against original geometry, not sender layouts.
+     * @param plan Original checked metadata. @param rows Exact local root samples. @param rank Actual observer.
+     * @return Live-only initialized values; unrelated/contributor observers are empty. */
+    static std::vector<std::byte> encodePreparedService(const MoEOverlayPreparedTargetServicePlan& plan,
+        std::span<const MoEOverlayPreparedTargetServiceTotals> rows,int rank) {
+        plan.requireLocalSamples(rows,rank);std::vector<std::byte> result;result.reserve(preparedServiceBytes(plan,rank));
+        for(const auto& row:rows)for(size_t phase=0;phase<kExpertHistogramProductionSourceCount;++phase)
+            if(row.sample_count[phase]) {
+                put(result,int32_t(row.coordinate.target.word()));put(result,int32_t(row.coordinate.layer));put(result,uint32_t(phase));
+                put(result,row.total_nanoseconds[phase]);put(result,row.activation_count[phase]);
+                put(result,row.sample_count[phase]);put(result,int32_t(row.expert_ids[phase]));
+            }
+        if(result.size()!=preparedServiceBytes(plan,rank))throw std::logic_error("Prepared service did not encode its exact live extent");
+        return result;
+    }
+    /** @brief Decode coordinates only against original local declarations.
+     * @param plan Original checked metadata. @param bytes Actual observer payload. @param rank Actual MPI rank.
+     * @return Complete local root samples. @throws std::invalid_argument For missing/foreign/trailing evidence. */
+    static std::vector<MoEOverlayPreparedTargetServiceTotals> decodePreparedService(
+        const MoEOverlayPreparedTargetServicePlan& plan,std::span<const std::byte> bytes,int rank) {
+        if(bytes.size()!=preparedServiceBytes(plan,rank))throw std::invalid_argument("Prepared service payload differs from original exact live phase extent");
+        std::map<MoEOverlayTargetServiceCoordinate,MoEOverlayPreparedTargetServiceTotals> decoded;
+        while(!bytes.empty()) {
+            MoEOverlayTargetServiceCoordinate coordinate{MoEOverlayRouteTarget::fromWord(take<int32_t>(bytes)),take<int32_t>(bytes)};
+            const auto phase=take<uint32_t>(bytes);
+            const auto& declaration=plan.entry(coordinate);
+            if(phase>=kExpertHistogramProductionSourceCount || declaration.root_world_rank!=rank ||
+                declaration.sample_layers[phase]!=coordinate.layer)
+                throw std::invalid_argument("Prepared service phase is outside original root declarations");
+            auto& row=decoded[coordinate];row.coordinate=coordinate;
+            if(row.sample_count[phase])throw std::invalid_argument("Prepared service repeats an original root phase");
+            row.total_nanoseconds[phase]=take<uint64_t>(bytes);row.activation_count[phase]=take<uint64_t>(bytes);
+            row.sample_count[phase]=take<uint64_t>(bytes);row.expert_ids[phase]=take<int32_t>(bytes);
+        }
+        std::vector<MoEOverlayPreparedTargetServiceTotals> rows;rows.reserve(decoded.size());
+        for(auto& [coordinate,row]:decoded)rows.push_back(std::move(row));
+        plan.requireLocalSamples(rows,rank);return rows;
+    }
+
 };
 }

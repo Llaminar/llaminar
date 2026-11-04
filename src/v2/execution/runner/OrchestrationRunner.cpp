@@ -19799,8 +19799,8 @@ namespace llaminar2
             config_.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic &&
             std::all_of(initial_snapshot->originalOwnerMap().participants().begin(), initial_snapshot->originalOwnerMap().participants().end(),
                 [](const auto &participant) { return participant.device.is_cpu(); });
-        std::vector<MoEOverlayParticipantLayerServiceTotals>
-            prepared_service_measurements;
+        std::shared_ptr<const MoEOverlayPreparedTargetServicePlan> prepared_target_service_plan;
+        std::vector<MoEOverlayPreparedTargetServiceTotals> prepared_target_service_measurements;
         if (config_.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic &&
             !local_cpu_host_maintenance &&
             !run_maintenance_phase("measurePreparedExpertService", [&]
@@ -19814,12 +19814,14 @@ namespace llaminar2
                 if (!catalog) return setError("Dynamic overlay lost its prepared-service catalog");
                 const auto topology = ExpertHistogramProductionTopology::forRetainedExecution(
                     metadata.num_layers, metadata.main_inference_layer_count,
-                    expertHistogramServingRegime(mtp));
-                prepared_service_measurements = MoEOverlayCPUServiceMeasurement::measure(
-                    *moe_expert_overlay_participant_residency_, initial_snapshot->epoch,
-                    *catalog, topology,
+                    expertHistogramServingRegime(mtp), metadata.first_model_layer);
+                prepared_target_service_plan = MoEOverlayPreparedTargetServicePlan::checked(
+                    initial_snapshot, catalog, topology);
+                prepared_target_service_measurements = MoEOverlayCPUServiceMeasurement::measurePreparedTargets(
+                    *moe_expert_overlay_participant_residency_, *prepared_target_service_plan,
                     {.d_model = metadata.d_model, .intermediate = metadata.routed_intermediate_size},
-                    physical_memory_authority_, &planningModelMetadata().memoryProfile(), &cluster_inventory_.ranks.at(plan_.rank));
+                    cpu_expert_shard_ctx_, physical_memory_authority_,
+                    &planningModelMetadata().memoryProfile(), &cluster_inventory_.ranks.at(plan_.rank));
                 return true;
             }))
             return false;
@@ -20150,7 +20152,9 @@ namespace llaminar2
                                             .migration_payoff_horizon_tokens,
                                 },
                             .production_topology = production_topology,
-                            .prepared_service_measurements = prepared_service_measurements,
+                            .prepared_target_service_plan = prepared_target_service_plan,
+                            .prepared_target_service_measurements = prepared_target_service_measurements,
+                            .prepared_service_world_rank = physical_memory_authority_->worldRank(),
                             .evidence_exchange =
                                 std::move(economy_evidence_exchange),
                             .perf_device = perf_device,
@@ -20820,7 +20824,9 @@ namespace llaminar2
                                         .migration_payoff_horizon_tokens,
                             },
                         .production_topology = production_topology,
-                        .prepared_service_measurements = prepared_service_measurements,
+                        .prepared_target_service_plan = prepared_target_service_plan,
+                            .prepared_target_service_measurements = prepared_target_service_measurements,
+                            .prepared_service_world_rank = physical_memory_authority_->worldRank(),
                         .evidence_exchange =
                             economy_evidence_exchange,
                         .perf_device = perf_device,

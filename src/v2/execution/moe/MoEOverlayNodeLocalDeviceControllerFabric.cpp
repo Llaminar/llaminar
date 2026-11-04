@@ -2155,7 +2155,7 @@ namespace llaminar2
             throw std::invalid_argument(
                 "certified device economy migration profile has incomplete directed geometry");
         }
-        for (const auto &row : profiles.migration->costs)
+        for (const auto &row : profiles.migration->wholeCosts())
         {
             if (row.source_participant < 0 ||
                 row.destination_participant < 0 || row.layer < 0 ||
