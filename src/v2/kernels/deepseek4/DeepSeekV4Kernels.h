@@ -276,7 +276,8 @@ struct IndexerTopKArgs
     const float *weights = nullptr;          ///< [rows, heads] head weights (weights_proj output).
     float weightScale = 1.0f;                ///< Multiplier on @c weights (headDim^-0.5 * heads^-0.5).
     const std::uint8_t *pool = nullptr;      ///< [poolRows, entryBytes] packed indexer keys.
-    float *scores = nullptr;                 ///< [scoreRows, poolRows] scratch (GPU; unused on CPU).
+    float *scores = nullptr;                 ///< [scoreRows, poolRows] GPU scratch; on CPU an optional
+                                             ///< publication (requires scoreRows >= live rows).
     std::int32_t *selected = nullptr;        ///< [rows, topK] selected block ids or -1.
 };
 

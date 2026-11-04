@@ -223,7 +223,7 @@ DeepSeekV4PrimitiveStage::DeepSeekV4PrimitiveStage(Params params)
         },
         [&](const AdvanceSequenceFrontier &a) {
             require(device().is_gpu(), "sequence frontier publication is a GPU cache operation");
-            require(a.cache != nullptr && a.capturedRows > 0, "sequence frontier requires its cache and rows");
+            require(a.cache != nullptr, "sequence frontier requires its cache");
             addIntInput(a.positions, rows, "positions");
         },
         [&](const GroupedProjection &a) {
@@ -352,7 +352,7 @@ bool DeepSeekV4PrimitiveStage::execute(IDeviceContext *context)
         [&](const AdvanceSequenceFrontier &a) {
             // Exactly one device-resident frontier advance per forward, ordered
             // after the terminal layer on this stage's stream; no host count.
-            if (!a.cache->advanceRecurrentSequenceState(a.layer, 1, a.requestRows, a.capturedRows, stream))
+            if (!a.cache->advanceRecurrentSequenceState(a.layer, 1, rows.liveRows, rows.rows, stream))
                 throw std::runtime_error("DeepSeekV4 stage: cache rejected the sequence frontier publication");
         },
         [&](const GroupedProjection &a) {
