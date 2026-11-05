@@ -37,6 +37,7 @@ namespace llaminar2::test
             SCOPED_TRACE(tensorTypeName(format));
             auto geometry = kSyntheticCPUExecutionGeometry;
             geometry.maximum_native_row_tile = row_tile;
+            geometry.active_isa = row_tile == 2 ? ISALevel::AVX2 : ISALevel::AVX512;
             MoELocalExpertStage::Params params;
             params.device_id = DeviceId::cpu();
             params.num_experts = 8;
