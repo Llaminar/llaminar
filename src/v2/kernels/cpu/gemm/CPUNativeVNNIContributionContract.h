@@ -6,8 +6,10 @@
  * adjacent epochs. The integer dot products are exact, but the surrounding
  * FP32 scale and asymmetric-minimum program must also retain the same rounding
  * boundaries or placement can change a sampled token. This file expresses the
- * device contribution program with AVX2 and AVX-512 intrinsics while retaining
+ * device contribution program with native x86 and AArch64 SIMD while retaining
  * the established fused CPU program for non-expert, backend-native matrices.
+ * ISA-specific leaves share the same packed/numerical contract, not an
+ * instruction-emulation layer or an alternative weight representation.
  */
 
 #pragma once
@@ -15,10 +17,15 @@
 #include "kernels/common/MoEProjectionNumericalContract.h"
 
 #include <cstdint>
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include "CPUNativeNEONContributionContract.h"
+#elif defined(__AVX2__) || defined(__AVX512F__)
 #include <immintrin.h>
+#endif
 
 namespace llaminar2::cpu::native_vnni
 {
+#if defined(__AVX2__) || defined(__AVX512F__)
 #if defined(__GNUC__) && !defined(__clang__)
     /**
      * Prevent contraction while requiring the per-block primitive to inline.
@@ -281,4 +288,5 @@ namespace llaminar2::cpu::native_vnni
 
 #undef LLAMINAR_GPU_ALIGNED_EXPERT_EXACT_FP
 #undef LLAMINAR_GPU_ALIGNED_EXPERT_EXACT_FP_AVX2
+#endif // x86 intrinsic leaves; AArch64 is defined in the native NEON contract
 } // namespace llaminar2::cpu::native_vnni
