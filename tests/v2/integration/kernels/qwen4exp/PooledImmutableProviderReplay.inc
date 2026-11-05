@@ -1008,7 +1008,8 @@ private:
 /** @return Existing loader discriminator, derived from its supported code range rather than a backend-local format list.
  * @note A newly inventoried format outside the current GGUF enum range fails the sweep; it cannot disappear silently. */
 std::optional<GGUFTensorType> providerFormat(TensorType type){
-    for(std::uint32_t code=0;code<=static_cast<std::uint32_t>(GGUFTensorType::BF16);++code){
+    // MXFP4 (39) is the highest supported GGUF code; gaps between BF16 and it are rejected by the loader.
+    for(std::uint32_t code=0;code<=static_cast<std::uint32_t>(GGUFTensorType::MXFP4);++code){
         try{const auto format=static_cast<GGUFTensorType>(code);if(ggufToTensorType(format)==type)return format;}
         catch(const std::invalid_argument&){}
     }
