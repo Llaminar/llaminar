@@ -91,6 +91,20 @@ populations also remain 57,699/1,251, then 1,104/1,104 on reconstruction. The
 improvement does not reduce admitted work. This is one matched diagnostic
 admission pair, not a Release inference-throughput result.
 
+The existing one-MI50 plus two-socket CPU tensor-sharded source cell also passes
+after the change in **171.07 seconds** (`source364`), compared with 300.05 seconds
+in `source348`. It uses one MPI rank/socket, 28 physical workers/rank, original
+GPU64/CPU448 expert ceilings, RAM ngrams, Static/Ordinal, FP32 activations,
+FP16 KV and fixed depth three. Both ranks retire with clean drivers; their
+original predictor-record counts remain 1,728/1,344 and retained depth remains
+three. Only rank zero owns the serving GPU participant and RAM ngram table.
+Its 16 MTP graph constructions total 1.97 seconds. This two-process source check
+is distinct from the CUDA cell's in-process runner reconstruction.
+
+CPU evidence: `/tmp/qfn-cpu-joint-mtp3-source-r348/` and
+`/tmp/qfn-cpu-joint-mtp3-source-r364/`. The indexed CPU/MI50 setup categories are
+in `cpu2-fixed3-indexed-attribution.md` beside the CUDA category reports.
+
 Exact cell identity, build receipts, commands, canonical source reports, driver
 windows and complete logs are in `/tmp/qfn-cuda-shared-mtp3-source-r359/` and
 `/tmp/qfn-cuda-shared-mtp3-source-r363/`. Reproduce through
