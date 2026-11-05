@@ -459,14 +459,34 @@ ImmutableRowTablePlacementSelection ImmutableRowTablePlacementPlanner::select(
             }
             return low;
         };
+        // Establish each owner's individual bound using the same complete
+        // candidate, then raise every feasible owner together. A pooled
+        // directory lives on the coordinator: filling its own cache first can
+        // otherwise consume all directory headroom and starve later owners on
+        // different GPUs. No capacity is subtracted or priced outside the BOM.
+        std::vector<std::size_t> individual(gpu.size(),0);
         for(std::size_t owner=0;owner<gpu.size();++owner)
         {
             const auto ceiling=declaration.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal?
                 declaration.owners[owner].maximum_cache_rows:requested.gpu_adaptive.maximum_gpu_cache_rows;
-            gpu[owner]=solve(ceiling,[&](std::size_t rows) {
+            individual[owner]=solve(ceiling,[&](std::size_t rows) {
                 auto proposed=gpu;proposed[owner]=rows;const auto next=candidate(proposed,0);
                 return next.first && next.second.fits(); });
         }
+        const auto level=solve(*std::max_element(individual.begin(),individual.end()),[&](std::size_t rows) {
+            auto proposed=individual;
+            for(auto& slots:proposed)slots=std::min(slots,rows);
+            const auto next=candidate(proposed,0);return next.first && next.second.fits();
+        });
+        for(std::size_t owner=0;owner<gpu.size();++owner)gpu[owner]=std::min(individual[owner],level);
+        // Spend remaining discrete/alignment headroom without taking back any
+        // balanced grant. Owners with a smaller or zero individual bound do not
+        // cap the other devices. The final pass is monotone and leaves no owner
+        // that can grow independently within its original request and PMA.
+        for(std::size_t owner=0;owner<gpu.size();++owner)
+            gpu[owner]=solve(individual[owner],[&](std::size_t rows) {
+                auto proposed=gpu;proposed[owner]=rows;const auto next=candidate(proposed,0);
+                return next.first && next.second.fits(); });
         const auto ram=solve(requested.gpu_adaptive.host.maximum_cache_rows,[&](std::size_t rows) {
             const auto next=candidate(gpu,rows);return next.first && next.second.fits(); });
         auto complete=candidate(gpu,ram).second;

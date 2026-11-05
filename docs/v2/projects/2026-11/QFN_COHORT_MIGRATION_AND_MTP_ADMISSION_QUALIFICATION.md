@@ -1364,3 +1364,29 @@ that repair and the native transport foundation are outside this narrow
 checkpoint. This result qualifies the exact composition's source admission and
 reuse, not numerical inference, controller execution, Release speed, or the
 complete feature-branch preflight matrix.
+
+## Balanced optional GPU cache grants
+
+The independently checkpointed selector now avoids starving later ngram owners
+when their shared directory consumes coordinator memory. It derives individual
+feasible bounds through the original complete physical plan, raises a common
+capped row grant, then spends remaining discrete headroom without retracting a
+grant. GPU-before-RAM priority, authored owner ceilings and higher-priority
+model/expert/KV allocations are unchanged. This uses the existing PMA candidate;
+it adds neither a separate capacity ledger nor a new placement policy.
+
+The actual planner regression covers CUDA/ROCm metadata populations 1, 2, 4 and
+8, including disabled/small owners, admission wire replay, unchanged original
+owner charges and absence of individually feasible leftover rows. The original
+greedy selector fails this regression (`focused341`); the repaired selector's
+owning suite and explicit `V2_Integration_GPUCacheSharedDirectoryCapacity`
+production-preflight registration pass (`focused344`, 5.64 s for the contract).
+Both owning translation units also pass syntax checks against the independent
+feature checkpoint (`/tmp/qfn-balanced-cache-checkpoint-r435/`). The extraction
+includes only the selector, its existing planner fixture and registration.
+
+The exact development-composition source case above improves from 728,182/0
+cache rows to 524,288/524,288 with the same two GPUs and ceilings. That native
+result still includes separately pending source-lifetime work. The independent
+checkpoint does not certify its complete native transport foundation, the full
+admission matrix, numerical panels or Release performance.

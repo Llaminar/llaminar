@@ -759,10 +759,10 @@ public:
 /** @brief Retire every original recorded source worker before abandoning its Preparing authority. */
 struct SharedPlanningSource final {
     std::shared_ptr<NativeContextPreparation> source;
-    std::array<DeviceId,3> devices{DeviceId::rocm(0),DeviceId::rocm(1),DeviceId::rocm(2)};
+    std::vector<DeviceId> devices;
     /** @brief Bind the actual declared compute/storage endpoints before any source is frozen.
      * @param selected Original physical devices; ordinal equality never aliases different backends. */
-    explicit SharedPlanningSource(std::array<DeviceId,3> selected={DeviceId::rocm(0),DeviceId::rocm(1),DeviceId::rocm(2)})
+    explicit SharedPlanningSource(std::vector<DeviceId> selected)
         :devices(selected){
         using Access=llaminar2::test::NativeContextPreparationReplayAccess;
         std::vector<PhysicalMemoryResource> resources{{0,DeviceId::cpu(),512ull<<30,500ull<<30}};
@@ -782,14 +782,109 @@ struct SharedPlanningSource final {
         source->retireUnadmitted();
     }
 };
+/** @brief Exercise shared-directory pressure through the actual complete planner.
+ * @param backend Original coordinator backend; no native runtime is opened.
+ * @param count Original storage population, independent of compute/TP membership.
+ * @param constrained Whether the last owner has a smaller or disabled grant.
+ * @details A real source-owned geometry prices the coordinator ceiling. The
+ * initial zero-cache BOM still contains every original weight, graph and source
+ * owner. This reproduces greedy admission starving later cards without giving
+ * the fixture another capacity ledger or a fabricated planning authority. */
+void replayBalancedSharedCache(DeviceType backend,std::size_t count,bool constrained)
+{
+    std::vector<DeviceId> devices;
+    for(std::size_t i=0;i<count;++i)devices.emplace_back(backend,static_cast<int>(i));
+    SharedPlanningSource originals(devices);
+    test::Qwen4ExpPlanningGGUFFixture file;PlanningModelSource model(file.path());
+    const auto& profile=model.metadata().memoryProfile();
+    auto requested=policy(0);
+    requested.gpu_adaptive.maximum_gpu_cache_rows=0;
+    requested.gpu_adaptive.gpu_cache_physical_byte_limit=0;
+    requested.gpu_adaptive.placement.mode=AdaptiveGPUCachePlacementMode::DeclaredRankLocal;
+    requested.gpu_adaptive.placement.coordinator=AdaptiveGPUCacheParticipant{0,backend,0};
+    for(const auto device:devices)
+        requested.gpu_adaptive.placement.owners.push_back({{0,device.type,device.ordinal},128,1u<<20});
+    std::vector<std::size_t> balanced(count,16);
+    if(constrained && count>1) {
+        balanced.back()=count==2?1:0;
+        requested.gpu_adaptive.placement.owners.back().maximum_cache_rows=balanced.back();
+        if(!balanced.back())requested.gpu_adaptive.placement.owners.back().cache_physical_byte_limit=0;
+    }
+    const auto projection=test::NativeOrderingEventGroupReplayAccess::projectionWithRemoteGraphs(devices);
+    auto cfg=consumer(backend);
+    cfg.native_context_preparation=originals.source;
+    cfg.native_ordering_events=projection;
+    cfg.ngram_gpu_peer_access=count>1?std::optional{PeerAccessCoverage::None}:std::nullopt;
+    cfg.ngram_execution_policy=requested;
+    std::vector<DevicePlanConfig> configs{cfg};
+    ClusterInventory cluster;cluster.world_size=1;
+    RankInventory rank;rank.rank=0;cluster.ranks.push_back(rank);
+    (void)MemoryPlanner::declareRetainedHostServices(profile,configs,0,nullptr,cluster,test::planningHostServiceProjection());
+    const auto makeRequest=[&] {
+        const std::vector<std::vector<DevicePlanConfig>> groups{configs};
+        auto result=MemoryPlanner::immutableRowTableAdmissionRequest(profile,requested,groups,{},configs.front().ngram_host_placement);
+        if(!result)throw std::logic_error("Shared-cache pressure lost its original source request");
+        return std::move(*result);
+    };
+    const auto initial=makeRequest();
+    const auto envelope=AdaptiveImmutableLookupGeometry::fromLayout(
+        initial.input.gpuAdaptiveLayout(requested,balanced,0,initial.execution_provision->maximumLiveIds()),
+        source(profile),requested.gpu_adaptive);
+    const PhysicalMemoryAllocatorIdentity coordinator{0,devices.front()};
+    requested.gpu_adaptive.placement.owners.front().cache_physical_byte_limit=envelope.gpuSlotDependentBytes(coordinator);
+    configs.front().ngram_execution_policy=requested;
+    const auto q=makeRequest();
+    const auto floor=MemoryPlanner::plan(profile,configs).physicalPlan();
+    const auto selected=ImmutableRowTablePlacementPlanner::select(q,floor);
+    EXPECT_TRUE(selected.physical_plan.fits());
+    const auto actual=AdaptiveImmutableLookupGeometry::fromLayout(selected.placement->gpuAdaptiveLayout(),source(profile),requested.gpu_adaptive);
+    ASSERT_EQ(actual.physical().owners().size(),count);
+    std::vector<std::size_t> admitted;
+    for(std::size_t owner=0;owner<count;++owner) {
+        const auto& row=actual.physical().owners()[owner];
+        if(row.slots<balanced[owner])
+            std::cerr<<"Shared cache starvation: owner="<<owner<<" population="<<count
+                     <<" actual="<<row.slots<<" feasible_balanced="<<balanced[owner]<<'\n';
+        EXPECT_EQ(row.allocator,(PhysicalMemoryAllocatorIdentity{0,devices[owner]}));
+        EXPECT_GE(row.slots,balanced[owner])<<"owner="<<owner<<" population="<<count;
+        EXPECT_LE(row.slots,requested.gpu_adaptive.placement.owners[owner].maximum_cache_rows);
+        EXPECT_LE(actual.gpuSlotDependentBytes(row.allocator),requested.gpu_adaptive.placement.owners[owner].cache_physical_byte_limit);
+        admitted.push_back(row.slots);
+    }
+    // This fixture has ample physical capacity. Any remaining one-row growth
+    // must be stopped by an original owner ceiling, including shared metadata.
+    for(std::size_t owner=0;owner<count;++owner) {
+        if(admitted[owner]==requested.gpu_adaptive.placement.owners[owner].maximum_cache_rows)continue;
+        auto more=admitted;++more[owner];
+        const auto geometry=AdaptiveImmutableLookupGeometry::fromLayout(
+            q.input.gpuAdaptiveLayout(requested,more,0,q.execution_provision->maximumLiveIds()),source(profile),requested.gpu_adaptive);
+        bool exceeds=false;
+        for(std::size_t i=0;i<count;++i)
+            exceeds|=geometry.gpuSlotDependentBytes({0,devices[i]})>requested.gpu_adaptive.placement.owners[i].cache_physical_byte_limit;
+        EXPECT_TRUE(exceeds)<<"Unused feasible GPU row on owner="<<owner;
+    }
+    const auto wire=serializeImmutableRowTableAdmissionRequests(std::array{q});
+    const auto parsed=test::ImmutableRowTableAdmissionWireReplayAccess::parse(wire,0,&profile,projection);
+    ASSERT_EQ(parsed.size(),1u);
+    const auto replay=ImmutableRowTablePlacementPlanner::select(parsed.front(),floor);
+    EXPECT_EQ(*replay.placement,*selected.placement);
+    EXPECT_EQ(replay.physical_plan.summary(),selected.physical_plan.summary());
+    for(const auto& bom:floor.resources())for(std::size_t i=0;i<PhysicalMemoryBOM::ownerCount();++i) {
+        const auto owner=PhysicalMemoryBOM::ownerAt(i);
+        if(owner==PhysicalMemoryOwner::ImmutableTableStorage || owner==PhysicalMemoryOwner::ImmutableLookupStaging ||
+           owner==PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent || owner==PhysicalMemoryOwner::NativeStorageGraphExecutable)continue;
+        const PhysicalMemoryAllocatorIdentity id{bom.resource().world_rank,bom.resource().device};
+        EXPECT_EQ(bytes(selected.physical_plan,id,owner),bom.bytes(owner));
+    }
+}
 /** @brief Actual grouped planner keeps a third physical owner and one source through final selection/wire.
  * @param backend Original homogeneous compute backend.
  * @param cacheRows Declared zero/positive storage-owner cache envelope. */
 void replaySharedPlanning(DeviceType backend=DeviceType::ROCm,std::size_t cacheRows=64)
 {
     const auto devices=backend==DeviceType::CUDA ?
-        std::array{DeviceId::cuda(0),DeviceId::cuda(1),DeviceId::rocm(0)} :
-        std::array{DeviceId::rocm(0),DeviceId::rocm(1),DeviceId::rocm(2)};
+        std::vector{DeviceId::cuda(0),DeviceId::cuda(1),DeviceId::rocm(0)} :
+        std::vector{DeviceId::rocm(0),DeviceId::rocm(1),DeviceId::rocm(2)};
     SharedPlanningSource originals(devices);
     test::Qwen4ExpPlanningGGUFFixture file;PlanningModelSource model(file.path());
     const auto& profile=model.metadata().memoryProfile();
@@ -868,6 +963,17 @@ void replaySharedPlanning(DeviceType backend=DeviceType::ROCm,std::size_t cacheR
     for(const auto owner:{PhysicalMemoryOwner::RetainedHostServiceStorage,PhysicalMemoryOwner::RetainedHostServiceRuntime})
         EXPECT_EQ(bytes(retained,{0,DeviceId::cpu()},owner),bytes(service,{0,DeviceId::cpu()},owner));
 }
+}
+/** @test Shared directory pressure cannot starve feasible owners; C0/small owners do not limit the others. */
+TEST(GPUAdaptiveImmutableLookupAdmission, SharedDirectoryPressureBalancesEveryFeasibleOwner)
+{
+    for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm})
+      for(const auto count:{1u,2u,4u,8u})
+        for(const bool constrained:{false,true}) {
+            SCOPED_TRACE(::testing::Message()<<"backend="<<static_cast<int>(backend)<<" owners="<<count<<" constrained="<<constrained);
+            EXPECT_EXIT({replayBalancedSharedCache(backend,count,constrained);std::cout.flush();std::cerr.flush();
+                std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
+        }
 }
 /** @test Each replay owns its true original process/source/PMA; no authority reset bypass is used. */
 TEST(GPUAdaptiveImmutableLookupAdmission, SharedCoordinatorTP2OriginalPMAAndWireReplay)
