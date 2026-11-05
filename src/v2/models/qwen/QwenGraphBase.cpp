@@ -10,6 +10,8 @@
  * embedding, LM head, TP/PP support, arena management.
  * Arena MTP target rows follow retained admission independently of execution policy.
  * Immutable source views are prepared once; every family retains fresh stages.
+ * Enabled GPU setup diagnostics aggregate host graph-construction categories;
+ * CPU inference construction is deliberately excluded from clock sampling.
  */
 
 #include "QwenGraphBase.h"
@@ -52,6 +54,76 @@ namespace llaminar2
 {
     namespace
     {
+        /**
+         * @brief Accumulate cold GPU graph-construction host costs without stage logging.
+         *
+         * GPU graph construction is setup-only. CPU graphs can be rebuilt during
+         * inference, so they deliberately never sample these clocks. Layer costs
+         * are disjoint; remainder includes embedding, terminal wiring and other
+         * host work. Nested manifest timings emitted by the FFN builder overlap
+         * FFN time and must not be added to this summary.
+         */
+        class ColdForwardBuildTiming final
+        {
+            using Clock = std::chrono::steady_clock; ///< Host setup clock only.
+        public:
+            /** @brief Begin optional setup attribution.
+             * @param device Original graph participant; CPU timing is disabled.
+             */
+            explicit ColdForwardBuildTiming(DeviceId device)
+                : enabled_(device.is_gpu() && PerfStatsCollector::isDomainEnabled("forward_graph")), device_(device)
+            { if (enabled_) started_ = Clock::now(); }
+
+            /** @brief Start one host-only layer construction category.
+             * @return Timer origin, or a default value when disabled.
+             */
+            auto begin() const { return enabled_ ? Clock::now() : Clock::time_point{}; }
+
+            /** @brief Accumulate one disjoint category without allocation.
+             * @param category Binding, attention, FFN or merge slot (0..3).
+             * @param started Origin returned by begin().
+             */
+            void end(unsigned category, Clock::time_point started)
+            {
+                if (enabled_) {
+                    elapsed_[category] += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-started).count();
+                    ++samples_[category];
+                }
+            }
+
+            /** @brief Emit one successful graph summary and bounded PerfStats categories.
+             * @param nodes Actual constructed graph node count.
+             */
+            void finish(std::size_t nodes) const
+            {
+                if (!enabled_) return;
+                const auto total = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-started_).count();
+                const auto remainder = total-elapsed_[0]-elapsed_[1]-elapsed_[2]-elapsed_[3];
+                const auto device = device_.to_string();
+                constexpr const char *names[]{"layer_binding", "attention", "ffn", "merge", "remainder"};
+                for (unsigned i=0;i<5;++i) {
+                    PerfStatsCollector::recordTimingNs("forward_graph", "cold_graph_build_host", i<4 ? elapsed_[i] : remainder,
+                        "setup", device, {{"phase", names[i]}});
+                    if (i<4)
+                        PerfStatsCollector::addCounter("forward_graph", "cold_graph_build_samples", samples_[i],
+                            "setup", device, {{"phase", names[i]}});
+                }
+                LOG_INFO("[ColdForwardGraphBuild] complete device=" << device
+                    << " nodes=" << nodes << " total_ms=" << total/1.0e6
+                    << " binding_ms=" << elapsed_[0]/1.0e6 << " attention_ms=" << elapsed_[1]/1.0e6
+                    << " ffn_ms=" << elapsed_[2]/1.0e6 << " merge_ms=" << elapsed_[3]/1.0e6
+                    << " remainder_ms=" << remainder/1.0e6 << " layer_samples=" << samples_[0]
+                    << " attention_samples=" << samples_[1] << " ffn_samples=" << samples_[2]
+                    << " merge_samples=" << samples_[3]);
+            }
+        private:
+            bool enabled_; ///< Existing enabled PerfStats path, restricted to GPU setup.
+            DeviceId device_; ///< Exact original participant identity.
+            Clock::time_point started_{}; ///< Whole graph setup origin.
+            std::int64_t elapsed_[4]{}; ///< Disjoint scalar category totals.
+            std::uint64_t samples_[4]{}; ///< Actual category invocation counts.
+        };
+
         int embeddingVocabOffsetForDevice(const GraphConfig &config, DeviceId device)
         {
             if (!config.tp_config)
@@ -2187,6 +2259,7 @@ namespace llaminar2
         const ForwardInput &input,
         ForwardOutput &output)
     {
+        ColdForwardBuildTiming setup_timing(config_.default_device);
         ForwardInputConstructionScope model_input_scope(*this,input);
         const int total_tokens = input.batch_size * input.seq_len;
         PrefillCollectiveRowsScope collective_rows_scope(*this, input);
@@ -2305,7 +2378,10 @@ namespace llaminar2
         {
             prev_node=addModelLayerInput(graph,input,layer,device,prev_node,*invocation_prefix);
             // Get layer weights
+            auto category_started = setup_timing.begin();
             LayerWeights layer_weights = layerWeightsForGraph(layer);
+            setup_timing.end(0, category_started);
+            category_started = setup_timing.begin();
 
             // Build attention graph for this layer
             // Pass sequence_lengths for proper batch-aware attention masking
@@ -2315,6 +2391,9 @@ namespace llaminar2
                 input.sequence_lengths, input.position_ids_device,
                 input.sequence_lengths_device);
 
+            setup_timing.end(1, category_started);
+            category_started = setup_timing.begin();
+
             // Get the terminal node of attention sub-graph
             std::string attn_last = attn_graph.terminalNode();
             if (attn_last.empty())
@@ -2323,6 +2402,9 @@ namespace llaminar2
             // Merge attention graph, connecting to previous node
             graph.merge(std::move(attn_graph), prev_node);
 
+            setup_timing.end(3, category_started);
+            category_started = setup_timing.begin();
+
             // Build FFN graph for this layer
             ComputeGraph ffn_graph = buildFFNGraph(
                 layer_weights, buffers_.layer_buffers, layer, input.seq_len,
@@ -2330,6 +2412,9 @@ namespace llaminar2
                 input.device_state_publication_stream,
                 input.sequence_lengths_device,
                 static_cast<const int32_t *>(input.position_ids_device));
+
+            setup_timing.end(2, category_started);
+            category_started = setup_timing.begin();
 
             // Get the terminal node of FFN sub-graph
             std::string ffn_last = ffn_graph.terminalNode();
@@ -2341,6 +2426,7 @@ namespace llaminar2
 
             // Use the determined FFN terminal as the prev node for next layer
             prev_node = ffn_last;
+            setup_timing.end(3, category_started);
         }
 
         // -------------------------------------------------------------------------
@@ -2483,6 +2569,7 @@ namespace llaminar2
                   << graph.size() << " nodes");
 
         invocation_prefix->requireConsumed();
+        setup_timing.finish(graph.size());
         return graph;
     }
 

@@ -5,6 +5,8 @@
  * Original source declarations drive the production materializer and prepared
  * Store. These tests preserve native geometry, exact physical owners and final
  * execution lifetimes across tied aliases, repeated preparation and cleanup.
+ * Device-qualified immutable indexing preserves original candidate ambiguity
+ * and plan-order selection across backend identities and large metadata sets.
  */
 
 #include <gtest/gtest.h>
@@ -1812,3 +1814,118 @@ TEST(CPUWeightPlanAdmissionLifecycle, NativeResidentEmbeddingLookupRetainsExactF
 #include "NativeWeightSourceAssemblyContract.inc"
 
 #include "CPUOverlaySourceOwnerContract.inc"
+
+/**
+ * @brief Exercise the production immutable index across original endpoint widths.
+ *
+ * No backend/tensor/worker is created: DeviceId values describe frozen metadata.
+ * Both vendors may use ordinal zero without becoming the same participant.
+ */
+TEST(Test__FrozenModelWeightSet, IndexedDeviceLookupPreservesOriginalCandidatesAndOrder)
+{
+    for (const int width : {1, 2, 4, 8})
+    for (const bool reverse : {false, true})
+    {
+        SCOPED_TRACE(::testing::Message() << "width=" << width << " reverse=" << reverse);
+        InferenceStrategy strategy;
+        strategy.model_id = ModelContextId{7};
+        ModelWeightSetBuilder builder(strategy);
+        std::vector<DeviceId> devices;
+        for (int member=0; member<width; ++member)
+        {
+            const int ordinal=member/2;
+            devices.push_back(member%2 ? DeviceId::rocm(ordinal) : DeviceId::cuda(ordinal));
+        }
+        for (int offset=0; offset<width; ++offset)
+        {
+            const int member=reverse ? width-1-offset : offset;
+            builder.addBinding(makeBinding("blk.7.attn_q.weight",devices[member]));
+        }
+        auto alias=makeBinding("blk.7.alias.weight",DeviceId::cpu());
+        alias.residency.resident_device=DeviceId::cuda(15);
+        builder.addBinding(std::move(alias));
+        builder.addBinding(makeBinding("token_embd.weight",DeviceId::cpu()));
+        // Suffix parsing follows the canonical name, while the index coordinate
+        // follows the original identity. Preserve even this metadata edge.
+        auto foreign_name=makeBinding("blk.12.attn_k.weight",DeviceId::cuda(15));
+        foreign_name.identity.layer=7;
+        builder.addBinding(std::move(foreign_name));
+        FrozenModelWeightSet frozen(strategy,builder.freezeBindings());
+        const auto &original=frozen.bindings();
+        EXPECT_EQ(frozen.optionalLayer(7,"attn_q.weight"),&original[width-1]);
+        for (int member=0; member<width; ++member)
+        {
+            const int index=reverse ? width-1-member : member;
+            // Home==resident is one original binding, never two candidates.
+            EXPECT_EQ(frozen.optionalLayerForDevice(7,"attn_q.weight",devices[member]),&original[index]);
+        }
+        EXPECT_EQ(frozen.optionalLayerForDevice(7,"attn_q.weight",DeviceId::cuda(15)),nullptr);
+        EXPECT_EQ(frozen.optionalLayerForDevice(7,"missing.weight",devices.front()),nullptr);
+        EXPECT_EQ(frozen.optionalLayerForDevice(8,"attn_q.weight",devices.front()),nullptr);
+        EXPECT_EQ(frozen.optionalLayerForDevice(7,"alias.weight",DeviceId::cpu()),&original[width]);
+        EXPECT_EQ(frozen.optionalLayerForDevice(7,"alias.weight",DeviceId::cuda(15)),&original[width]);
+        EXPECT_EQ(frozen.optionalLayerForDevice(7,"alias.weight",DeviceId::rocm(15)),nullptr);
+        EXPECT_EQ(frozen.optionalLayer(-1,"token_embd.weight"),nullptr);
+        EXPECT_EQ(frozen.optionalLayerForDevice(-1,"token_embd.weight",DeviceId::cpu()),&original[width+1]);
+        EXPECT_EQ(frozen.optionalLayerForDevice(7,"attn_k.weight",DeviceId::cuda(15)),&original[width+2]);
+        EXPECT_EQ(frozen.optionalLayerForDevice(12,"attn_k.weight",DeviceId::cuda(15)),nullptr);
+        auto copied=frozen;
+        EXPECT_EQ(copied.optionalLayer(7,"attn_q.weight"),&copied.bindings()[width-1]);
+        auto moved=std::move(copied);
+        EXPECT_EQ(moved.optionalLayer(7,"attn_q.weight"),&moved.bindings()[width-1]);
+        EXPECT_EQ(moved.optionalLayerForDevice(7,"alias.weight",DeviceId::cuda(15)),&moved.bindings()[width]);
+    }
+}
+
+/** @brief Ambiguity remains a queried-device failure, never a freeze-time failure. */
+TEST(Test__FrozenModelWeightSet, IndexedDeviceLookupRejectsOnlyActualAmbiguousDevice)
+{
+    InferenceStrategy strategy;
+    ModelWeightSetBuilder builder(strategy);
+    auto alias=makeBinding("blk.3.ffn_gate.weight",DeviceId::cuda(0));
+    alias.residency.resident_device=DeviceId::rocm(0);
+    builder.addBinding(std::move(alias));
+    builder.addBinding(makeBinding("blk.3.ffn_gate.weight",DeviceId::rocm(0)));
+    builder.addBinding(makeBinding("blk.3.ffn_gate.weight",DeviceId::cuda(1)));
+    builder.addBinding(makeBinding("token_embd.weight",DeviceId::cuda(0)));
+    builder.addBinding(makeBinding("token_embd.weight",DeviceId::rocm(0)));
+    FrozenModelWeightSet frozen(strategy,builder.freezeBindings());
+    EXPECT_EQ(frozen.optionalLayer(3,"ffn_gate.weight"),&frozen.bindings()[2]);
+    EXPECT_EQ(frozen.optionalLayerForDevice(3,"ffn_gate.weight",DeviceId::cuda(0)),&frozen.bindings()[0]);
+    EXPECT_EQ(frozen.optionalLayerForDevice(3,"ffn_gate.weight",DeviceId::cuda(1)),&frozen.bindings()[2]);
+    EXPECT_THROW(frozen.optionalLayerForDevice(3,"ffn_gate.weight",DeviceId::rocm(0)),std::runtime_error);
+    EXPECT_EQ(frozen.optionalLayerForDevice(3,"ffn_gate.weight",DeviceId::rocm(1)),nullptr);
+    EXPECT_EQ(&frozen.global("token_embd.weight"),&frozen.bindings()[4]);
+    EXPECT_EQ(frozen.optionalLayerForDevice(-1,"token_embd.weight",DeviceId::cuda(0)),&frozen.bindings()[3]);
+    EXPECT_EQ(frozen.optionalLayerForDevice(-1,"token_embd.weight",DeviceId::rocm(0)),&frozen.bindings()[4]);
+}
+
+/**
+ * @brief Large unrelated original expert populations cannot alter named lookup.
+ * @details Original-size metadata sets model the measured source359 cold and
+ * retained binding populations. There is no wall-clock assertion or device work.
+ */
+TEST(Test__FrozenModelWeightSet, IndexedDeviceLookupRetainsLargeOriginalSourceIdentity)
+{
+    for (const std::size_t count : {std::size_t{1104},std::size_t{57699}})
+    {
+        SCOPED_TRACE(count);
+        InferenceStrategy strategy;
+        ModelWeightSetBuilder builder(strategy);
+        for (std::size_t index=0; index<count-2; ++index)
+            builder.addBinding(makeBinding("blk."+std::to_string(index%49)+".expert_"+
+                std::to_string(index)+".weight",DeviceId::cuda(0)));
+        builder.addBinding(makeBinding("blk.7.attn_q.weight",DeviceId::cuda(0)));
+        builder.addBinding(makeBinding("blk.7.attn_q.weight",DeviceId::rocm(0)));
+        FrozenModelWeightSet frozen(strategy,builder.freezeBindings());
+        ASSERT_EQ(frozen.bindings().size(),count);
+        const auto bindings=makeModelWeightBindings(frozen,DeviceId::cuda(0));
+        for (int replay=0; replay<20; ++replay)
+        {
+            EXPECT_EQ(bindings.get_layer_weights(7).wq,&frozen.bindings()[count-2]);
+            EXPECT_EQ(frozen.optionalLayerForDevice(7,"attn_q.weight",DeviceId::rocm(0)),&frozen.bindings()[count-1]);
+            EXPECT_EQ(frozen.optionalLayer(7,"attn_q.weight"),&frozen.bindings()[count-1]);
+            EXPECT_EQ(frozen.optionalLayerForDevice(7,"missing.weight",DeviceId::cuda(0)),nullptr);
+        }
+    }
+}

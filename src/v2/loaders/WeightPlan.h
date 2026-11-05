@@ -8,7 +8,8 @@
  * plan.  In particular, heterogeneous ExpertOverlay plans may contain more
  * than one binding for a routed-expert parent; callers that build a graph for
  * a concrete device must use the device-qualified lookup rather than relying
- * on insertion order.
+ * on insertion order. One immutable candidate index accelerates these queries
+ * without copying residency or changing original binding addresses.
  */
 
 #pragma once
@@ -236,14 +237,26 @@ namespace llaminar2
         const WeightBinding &global(const std::string &canonical_name) const;
         /** @brief Return a required layer binding or throw when absent. */
         const WeightBinding &layer(int layer_idx, const std::string &suffix) const;
-        /** @brief Return an unqualified layer binding, or nullptr when absent. */
+        /**
+         * @brief Return the last in-plan unqualified layer binding.
+         * @param layer_idx Original nonnegative model layer.
+         * @param suffix Canonical layer-relative source name.
+         * @return Original binding address, or nullptr for an absent layer/name.
+         */
         const WeightBinding *optionalLayer(int layer_idx, const std::string &suffix) const;
         /**
          * @brief Return the sole layer binding resident on @p device.
          *
          * A null result means that the device does not own the requested
          * binding.  More than one matching binding is an invalid graph
-         * authority and throws instead of selecting by insertion order.
+         * authority and throws instead of selecting by insertion order. The
+         * immutable name index narrows the candidates; original bindings remain
+         * the sole residency authority, including home/resident aliases.
+         * @param layer_idx Original binding layer coordinate.
+         * @param suffix Canonical layer-relative source name (global name for a negative coordinate).
+         * @param device Exact backend and ordinal, never an ordinal-only alias.
+         * @return Sole original matching binding, or nullptr when absent.
+         * @throws std::runtime_error If more than one original binding matches.
          */
         const WeightBinding *optionalLayerForDevice(
             int layer_idx,
@@ -272,7 +285,11 @@ namespace llaminar2
         std::string renderAuditTable() const;
 
     private:
-        /** @brief Populate the legacy unqualified lookup indexes for one binding. */
+        /**
+         * @brief Index one original binding without copying its ownership.
+         * @param index Stable position in the immutable bindings_ sequence.
+         * @param binding Binding at that position; source order defines legacy lookup.
+         */
         void indexBinding(size_t index, const WeightBinding &binding);
 
         InferenceStrategy strategy_;
@@ -280,7 +297,11 @@ namespace llaminar2
             PhysicalMemoryOwner::PrimaryModelWeights;
         std::vector<WeightBinding> bindings_;
         std::unordered_map<std::string, size_t> global_index_;
-        std::unordered_map<std::string, size_t> layer_index_;
+        // One name index retains all original candidates. Qualified lookup
+        // checks residency here; unqualified lookup explicitly chooses the
+        // greatest sequence index, independent of unordered iteration order.
+        // Negative coordinates preserve qualified global-name queries only.
+        std::unordered_multimap<std::string, size_t> layer_index_;
     };
 
     std::string toString(PreparedWeightKind kind);

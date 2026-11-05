@@ -15,6 +15,8 @@
  * lifetimes; graph-family construction never repacks admitted expert weights.
  * CPU serial storage declarations survive admission and runtime projection.
  * Per-layer CPU packet roots retain their own exact backing allocation claims.
+ * Enabled GPU setup diagnostics attribute complete transfer-profile scans as
+ * nested FFN host work, without timing CPU inference graph construction.
  */
 
 #include "execution/moe/MoEOverlayHostServiceContract.h"
@@ -5584,6 +5586,13 @@ namespace llaminar2
         auto collectGraphRebalanceTransferProfile =
             [&]() -> DeviceMoETransferSlotDirectory::FormatProfile
         {
+            // This conditional full-source scan is nested within FFN construction.
+            // Reuse the enabled cold GPU setup timer; CPU inference must not
+            // acquire clocks or diagnostic string/tag storage on this path.
+            std::optional<PerfStatsCollector::ScopedTimer> scan_timing;
+            if (device.is_gpu() && PerfStatsCollector::isDomainEnabled("forward_graph"))
+                scan_timing.emplace("forward_graph", "cold_graph_build_manifest_scan",
+                    "setup", device.to_string());
             if (projection_arena_)
             {
                 if (!model_ctx_) throw std::logic_error("Projection transfer profile has no model metadata");

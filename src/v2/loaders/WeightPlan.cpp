@@ -2,10 +2,11 @@
  * @file WeightPlan.cpp
  * @brief Implementation of declarative weight plans and frozen binding lookup.
  *
- * Device-qualified lookup deliberately scans the small graph-time binding
- * collection.  Graph construction is cold-path work, and this makes an
- * ambiguity a precise fatal diagnostic instead of an insertion-order-dependent
- * route to the wrong heterogeneous expert slice. Explicit static expert
+ * One immutable name index retains original binding positions, so device-qualified
+ * graph lookup examines only candidates for the requested layer/name. Residency
+ * remains on the original bindings and ambiguity still fails at lookup time;
+ * unordered index iteration never changes legacy last-in-plan selection.
+ * Explicit static expert
  * projections derive original-axis slices from one immutable ownership value;
  * compact matrix views retain that same source/policy through preparation.
  * Static lowering preserves ordinary bindings in the same complete frozen set,
@@ -218,8 +219,11 @@ namespace llaminar2
     {
         if (binding.identity.layer < 0)
             global_index_[binding.identity.canonical_name] = index;
-        else
-            layer_index_[layerKey(binding.identity.layer, suffixForLayerWeight(binding.identity.canonical_name))] = index;
+        // Retain candidates for both residency-qualified and legacy queries.
+        // Indexing negative coordinates preserves the existing qualified global
+        // lookup; optionalLayer still rejects them exactly as before.
+        layer_index_.emplace(layerKey(binding.identity.layer,
+            suffixForLayerWeight(binding.identity.canonical_name)), index);
     }
 
     const WeightBinding &FrozenModelWeightSet::global(const std::string &canonical_name) const
@@ -240,10 +244,20 @@ namespace llaminar2
 
     const WeightBinding *FrozenModelWeightSet::optionalLayer(int layer_idx, const std::string &suffix) const
     {
-        auto it = layer_index_.find(layerKey(layer_idx, suffix));
-        if (it == layer_index_.end())
+        if (layer_idx < 0)
             return nullptr;
-        return &bindings_[it->second];
+        const auto [begin, end] = layer_index_.equal_range(layerKey(layer_idx, suffix));
+        const WeightBinding *match = nullptr;
+        size_t last_index = 0;
+        for (auto it = begin; it != end; ++it)
+        {
+            if (!match || it->second > last_index)
+            {
+                last_index = it->second;
+                match = &bindings_[last_index];
+            }
+        }
+        return match;
     }
 
     const WeightBinding *FrozenModelWeightSet::optionalLayerForDevice(
@@ -252,14 +266,12 @@ namespace llaminar2
         DeviceId device) const
     {
         const WeightBinding *match = nullptr;
-        for (const auto &binding : bindings_)
+        // Construction indexed every original candidate once. Do not scan
+        // unrelated expert matrices for each graph-shaped suffix request.
+        const auto [begin, end] = layer_index_.equal_range(layerKey(layer_idx, suffix));
+        for (auto it = begin; it != end; ++it)
         {
-            if (binding.identity.layer != layer_idx ||
-                suffixForLayerWeight(binding.identity.canonical_name) != suffix)
-            {
-                continue;
-            }
-
+            const auto &binding = bindings_[it->second];
             const bool resident_on_device =
                 binding.residency.home_device == device ||
                 (binding.residency.resident_device &&
