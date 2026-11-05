@@ -183,15 +183,16 @@ void NativeContextPreparation::retireUnadmitted(){
         throw std::logic_error("Admitted native source requires complete model retirement, not birth-only cleanup");
     retireReleasedContexts();
 }
-void NativeContextPreparation::retireReleasedContexts(){retireReleasedContexts(TransferEngine::instance());}
-void NativeContextPreparation::retireReleasedContexts(const TransferEngine& transfers){
+std::size_t NativeContextPreparation::retireReleasedContexts(){return retireReleasedContexts(TransferEngine::instance());}
+std::size_t NativeContextPreparation::retireReleasedContexts(const TransferEngine& transfers){
     if(memory()->phase()!=PhysicalMemoryAuthorityPhase::Preparing && memory()->phase()!=PhysicalMemoryAuthorityPhase::Admitted)
         throw std::logic_error("Original released source is not in a live physical authority phase");
     std::vector<ExclusiveModelRetirementTicket> tickets;
     tickets.reserve(births_.size());
     for(const auto& birth:births_)if(GPUDeviceContextPool::instance().ownsPreparedBirth(birth))
         tickets.push_back(transfers.beginExclusiveNativeContextRetirement(birth->device()));
-    if(!tickets.empty())(void)transfers.completeExclusiveModelRetirements(std::move(tickets));
+    if(tickets.empty())return 0;
+    return transfers.completeExclusiveModelRetirements(std::move(tickets)).size();
 }
 NativePreparationPlanningSnapshot NativeContextPreparation::closeForPlanning(){
     if(mandatory_bom_)throw std::logic_error("Original source preparation was already closed for planning");

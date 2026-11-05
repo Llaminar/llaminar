@@ -26,6 +26,7 @@
 #include "ImmutableLookupNativeOwnership.h"
 #include "backends/NativeContextPreparation.h"
 #include <map>
+#include <optional>
 #include <span>
 #include <condition_variable>
 #include <exception>
@@ -200,6 +201,15 @@ namespace qwen4exp {class PooledImmutableRetainedParticipants;}
         std::shared_ptr<const ResidentImmutableRowTable> residentImmutableRowTable(DeviceId device) const override;
         /** @brief Borrow the source-owned adaptive boundary; original roots and live claims survive the last graph borrow. */
         std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> adaptiveImmutableLookupBoundary(DeviceId device) const override;
+        /**
+         * @brief Observe current model-owned adaptive native roots on one exact allocator.
+         * @param allocator Original rank/device, independent of execution-reader entries.
+         * @return Actual source aggregate or distinct storage-owner lease observation; no value for a query-only or unrelated device.
+         * @throws std::exception For foreign rank/PMA, missing claimed roots or non-disjoint original owners.
+         * @note Historical setup rows never authorize reuse. This borrows surviving live root owners only.
+         */
+        std::optional<ImmutableLookupNativeOwnerObservation> retainedAdaptiveImmutableLookupOwner(
+            PhysicalMemoryAllocatorIdentity allocator)const;
         /** @brief Prepare original remote programs off all participant workers after immutable source materialization.
          * @param graph Actual full source policy; unsupported parent/MTP shapes reject before recording. */
         void prepareAdaptiveImmutableLookupParticipants(const GraphConfig& graph);

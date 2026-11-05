@@ -234,6 +234,55 @@ namespace llaminar2
         return found->second.boundary;
     }
 
+    std::optional<ImmutableLookupNativeOwnerObservation>
+    ModelContext::retainedAdaptiveImmutableLookupOwner(PhysicalMemoryAllocatorIdentity allocator)const
+    {
+        std::lock_guard lock(immutable_row_table_mutex_);
+        if(immutable_row_table_preparation_failure_)std::rethrow_exception(immutable_row_table_preparation_failure_);
+        if(!immutable_row_table_placement_ || !immutable_row_table_placement_->isGPUAdaptive())return std::nullopt;
+        if(!immutable_row_table_authority_ || allocator.world_rank!=immutable_row_table_authority_->worldRank() ||
+           !allocator.device.is_gpu())
+            throw std::invalid_argument("Adaptive retained roots require the original rank and GPU allocator");
+        const auto& placement=*immutable_row_table_placement_;
+        const auto& layout=placement.gpuAdaptiveLayout();
+        const bool consumer=std::find(placement.consumers().begin(),placement.consumers().end(),allocator)!=placement.consumers().end();
+        const bool storage_owner=std::any_of(layout.owners().begin(),layout.owners().end(),[&](const auto& owner){
+            return owner.key.tier==ImmutableRowStorage::VRAM && owner.key.allocator==allocator;
+        });
+        // A prepared expert follower may have no ngram role at all.
+        if(!consumer && !storage_owner)return std::nullopt;
+        const bool source_owner=layout.adaptiveGPUDomain()==ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal
+            ? consumer : AdaptiveImmutableLookupGeometry::sourceLayout(layout,placement.gpuAdaptiveRequest()).consumers().front()==allocator;
+        std::optional<ImmutableLookupNativeOwnerObservation> result;
+        std::vector<const qwen4exp::PooledImmutableSourcePreparedStorage*> seen;
+        for(const auto& [device,entry]:adaptive_lookup_consumers_)
+        {
+            // Query-only execution entries may already have retired. Only real
+            // source boundaries retain the model's original physical roots.
+            if(!entry.boundary)continue;
+            const auto source=entry.boundary->pooledStorage();
+            if(!source)throw std::logic_error("Adaptive retained source lost its original pooled roots");
+            if(std::find(seen.begin(),seen.end(),source.get())!=seen.end())continue;
+            seen.push_back(source.get());
+            const auto observed=source->geometry().projectRetainedOwnerObservation(allocator,
+                [&]{return source->retainedOwnerObservation();},
+                [&](std::size_t index){return source->originalOwners()[index]->retainedOwnerObservation();});
+            if(!observed)continue;
+            if((source->geometry().allocator()==allocator)!=source_owner || (!source_owner && !storage_owner))
+                throw std::logic_error("Adaptive retained observation changed its declared source/storage role");
+            const auto& authority=observed->authority();
+            if(authority.get()!=immutable_row_table_authority_.get() ||
+               authority.owner_before(immutable_row_table_authority_) || immutable_row_table_authority_.owner_before(authority) ||
+               observed->allocator()!=allocator)
+                throw std::logic_error("Adaptive retained root observation changed its original allocator/PMA");
+            if(result)throw std::logic_error("Adaptive retained roots contain overlapping source/owner observations");
+            result=observed;
+        }
+        if(!result && (source_owner || storage_owner))
+            throw std::logic_error("Adaptive retained allocator lost its original live source/storage roots");
+        return result;
+    }
+
     void ModelContext::prepareAdaptiveImmutableLookupParticipants(const GraphConfig& graph)
     {
         std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> boundary;

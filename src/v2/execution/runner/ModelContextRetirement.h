@@ -175,4 +175,22 @@ namespace llaminar2
     retireExclusiveModelContextReuseContract(
         ModelContextReuseContract &contract);
 
+    /** @brief Actual original native generations retired after an invalid final model was discarded. */
+    struct InvalidModelContextDiscardReceipt final {
+        std::size_t native_contexts_retired=0;
+        /** @return Actual completed original-source native reset receipts, not a reusable allocation BOM. */
+        std::size_t retiredDeviceCount()const noexcept{return native_contexts_retired;}
+    };
+    /**
+     * @brief Dispose exclusively owned terminal Invalid state without making it reusable.
+     * @param contract Original failed-seal contract after every runner has released ownership.
+     * @return Actual original-source final retirement evidence; CPU-only disposal has zero native receipts.
+     * @throws std::exception For non-Invalid lifecycle, borrowed owners, foreign source/PMA,
+     * missing GPU source or unproven central-ledger-zero native retirement.
+     * @note Lifecycle and provenance checks precede owner release; native zero-allocation validation follows model/workspace destruction.
+     * This cannot restore reuse or consume RunnerExclusive, Sealing or Reusable contracts.
+     */
+    [[nodiscard]] InvalidModelContextDiscardReceipt discardExclusiveInvalidModelContextReuseContract(
+        ModelContextReuseContract& contract);
+
 } // namespace llaminar2

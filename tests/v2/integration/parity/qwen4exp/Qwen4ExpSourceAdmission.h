@@ -663,8 +663,10 @@ public:
         }
         if (reuse_ && reuse_->context)
         {
-            const auto receipt = retireExclusiveModelContextReuseContract(*reuse_);
-            retired_devices_ = receipt.retiredDeviceCount();
+            if(reuse_->reuse_authority && reuse_->reuse_authority->state()==ModelContextReuseAuthority::State::Invalid)
+                retired_devices_=discardExclusiveInvalidModelContextReuseContract(*reuse_).retiredDeviceCount();
+            else
+                retired_devices_=retireExclusiveModelContextReuseContract(*reuse_).retiredDeviceCount();
         }
         cache_.cleanup();
         finished_ = true;

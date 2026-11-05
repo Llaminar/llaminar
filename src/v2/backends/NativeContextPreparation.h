@@ -88,8 +88,9 @@ public:
      * Context/process reservations keep their original certified retirement lifetime.
      * @throws std::logic_error For live worker aliases or an inactive original source.
      * @throws std::runtime_error For live allocations or incomplete backend reset evidence.
+     * @return Number of actual completed native-context retirement receipts.
      */
-    void retireReleasedContexts();
+    std::size_t retireReleasedContexts();
     /** @return Original frozen declaration merged before optional model/table/expert capacity; never a live byte ledger. */
     const PhysicalMemoryPlan& mandatoryBOM()const;
     /** @brief Require membership in the originally selected worker population without creating or extending it. */
@@ -101,8 +102,11 @@ public:
 private:
     friend struct test::NativeContextPreparationReplayAccess;
     NativeContextPreparation(std::span<const PhysicalMemoryResource>,int);
-    /** @brief Same original retirement body with an explicit infrastructure transfer authority for device-free replay. */
-    void retireReleasedContexts(const TransferEngine&);
+    /** @brief Same original retirement body with an explicit infrastructure transfer authority for device-free replay.
+     * @param transfers Existing transfer authority retaining the actual native backend contract.
+     * @return Number of actual completed original-source native retirement receipts.
+     * @throws std::exception For live owners or incomplete physical retirement evidence. */
+    std::size_t retireReleasedContexts(const TransferEngine& transfers);
     static std::shared_ptr<NativeContextPreparation> createQualified(std::span<const PhysicalMemoryResource>,int,std::span<const NativeContextBirthKey>);
     std::shared_ptr<NativeStoragePreparationPmaBinding> source_;
     std::vector<std::shared_ptr<PreparedGPUContextBirth>> births_;

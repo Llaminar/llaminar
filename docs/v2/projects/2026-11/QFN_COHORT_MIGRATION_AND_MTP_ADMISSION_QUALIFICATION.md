@@ -1203,3 +1203,36 @@ a shared reader as a source owner. Final cleanup also rejected the invalidated
 contract; canonical resource retirement was not proven, although drivers were
 clean. Those separate repairs remain outside this checkpoint. No complete
 preflight, full source matrix, numerical or Release performance pass is claimed.
+
+## Shared physical-root retention and invalid final cleanup (focused313)
+
+Orderly runner teardown removes execution-only reader entries while keeping the
+original model's source and storage roots. Retention now observes those live
+roots by physical allocator: the source aggregate once, or one distinct remote
+owner. A reader without storage and an unrelated prepared expert device add no
+immutable claim. Original PMA/control-block and allocator checks remain strict;
+historical setup telemetry is not a retention authority.
+
+If reuse sealing fails, the resulting Invalid contract now has an explicit
+exclusive final-discard operation. It destroys model/workspace owners before
+the original source's canonical zero-allocation retirement. Its receipt counts
+actual native resets; it cannot mark Invalid state Reusable or fabricate a
+sealed allocation BOM. Borrowed owners, foreign authority/control block and a
+GPU contract without its native source are rejected. CPU-only discard remains
+an explicit supported case.
+
+`build312` and `focused313` passed the three scoped build targets and six test
+registrations (21.31 seconds, no skips, clean drivers). The owning fixtures and
+explicit new preflight entries cover role selection and both Invalid-discard
+cases. Standalone checkpoint syntax checks passed four owning translation units
+per patch in `/tmp/qfn-invalid-discard-checkpoint-r416/` and
+`/tmp/qfn-live-lookup-retention-r414-checkpoint/`.
+
+Native diagnostic `/tmp/qfn-cuda-shared-source-r314/` then sealed both CUDA
+retention rows. Its second runner exposed a separate missing admitted QSA policy,
+so the complete cell remains red. The new failure-cleanup path nevertheless
+proved two actual GPU-generation resets with zero live canonical allocations,
+final model/runner release and prefix removal; `all_resources_retired=true` and
+drivers were clean. These results qualify the repaired boundaries only. The
+pending native transport foundation, full reuse/admission matrix, numerical
+inference and Release throughput are not certified by this checkpoint.

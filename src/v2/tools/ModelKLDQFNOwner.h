@@ -41,7 +41,11 @@ inline void retireQFNFinalOwner(std::unique_ptr<IOrchestrationRunner>& runner,
         if(runner->isInitialized())throw std::runtime_error("QFN observer runner remains initialized after shutdown");
         runner.reset();
     }
-    if(owner && owner->context)(void)retireExclusiveModelContextReuseContract(*owner);
+    if(owner && owner->context){
+        if(owner->reuse_authority && owner->reuse_authority->state()==ModelContextReuseAuthority::State::Invalid)
+            (void)discardExclusiveInvalidModelContextReuseContract(*owner);
+        else (void)retireExclusiveModelContextReuseContract(*owner);
+    }
     owner.reset();
 }
 /**

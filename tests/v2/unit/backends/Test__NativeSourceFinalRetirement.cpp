@@ -79,7 +79,7 @@ public:
 }
 namespace llaminar2::test { namespace {
 /** @brief Observations only; canonical byte accounting stays in original PMA. */
-struct Trace {unsigned destroyed=0,resets=0;bool allDestroyed=true;};
+struct Trace {unsigned destroyed=0,resets=0;bool allDestroyed=true;std::function<void()> beforeReset;};
 Trace* active=nullptr;
 /** @brief Actual mapped original worker storage and prepared thread, with no SDK call. */
 class Worker final:public testing::MockWorkerGPUContext {
@@ -98,6 +98,7 @@ public:
  std::size_t deviceMemoryFree(int)const override{++freeQueries;return 32u<<20;}
  std::size_t deviceMemoryTotal(int)const override{++totalQueries;return 64u<<20;}
  DeviceRuntimeGenerationRetirementResult retireExclusiveDeviceRuntimeGeneration(const DeviceRuntimeGenerationRetirementRequest&)override{
+  if(active->beforeReset)active->beforeReset();
   active->allDestroyed &= active->destroyed==2;++active->resets;
   DeviceRuntimeGenerationRetirementResult v;v.supported=v.success=v.reset_invoked=true;
   v.retired_generation=generation++;v.successor_generation=generation;v.post_reset_state=DeviceRuntimePostResetState::Quiescent;v.driver_free_bytes_before=32u<<20;return v;
@@ -528,5 +529,64 @@ TEST(NativeSourceFinalRetirement,QFNDistributedFollowerMissingOwnerAbortsBeforeL
   [](const ModelContextReuseContract&){ADD_FAILURE()<<"Missing owner reached follower record";}),std::invalid_argument);
  EXPECT_EQ(commands,(std::vector<std::string>{"coordinated","abort_workers","retire"}));
  EXPECT_EQ(exports,1u);EXPECT_FALSE(runner);
+}
+}
+
+namespace llaminar2::test {
+/** @test Terminal failed reuse seals discard original owners without forging Reusable or losing storage-only resets. */
+TEST(NativeSourceFinalRetirement, InvalidFinalContractDiscardsOnlyAfterOriginalOwnersRetire){
+ Trace t;active=&t;Backend c(DeviceType::CUDA),r(DeviceType::ROCm);cuda=&c;rocm=&r;
+ const std::array devices{DeviceId::cuda(241),DeviceId::rocm(241)};auto source=prepare(devices,NativePhysicalLifetime::ContextGeneration);
+ ModelContextReuseContract contract;
+ contract.context=ModelContext::createForTesting("recorded-invalid-final-source.gguf",std::make_shared<MockMPIContext>(),1,true);
+ contract.context->bindNativeContextPreparation(source);contract.physical_memory_authority=source->memory();
+ contract.reusable_execution_workspaces=std::make_shared<ReusableExecutionWorkspaceRegistry>();
+ contract.reuse_authority=std::make_shared<ModelContextReuseAuthority>();
+ EXPECT_THROW((void)discardExclusiveInvalidModelContextReuseContract(contract),std::logic_error);
+ ASSERT_TRUE(contract.reuse_authority->beginSealing());
+ EXPECT_THROW((void)discardExclusiveInvalidModelContextReuseContract(contract),std::logic_error);
+ ASSERT_TRUE(contract.reuse_authority->publishReusable({}));
+ EXPECT_THROW((void)discardExclusiveInvalidModelContextReuseContract(contract),std::logic_error);
+ contract.reuse_authority->invalidate("recorded partial retention seal failure");
+ // Original failed-retirement control stays strict: Invalid is never Reusable.
+ EXPECT_THROW((void)retireExclusiveModelContextReuseContract(contract),std::logic_error);
+ const auto rejectBorrowed=[&]{
+  try{(void)discardExclusiveInvalidModelContextReuseContract(contract);FAIL()<<"Borrowed invalid owner was discarded";}
+  catch(const std::logic_error& error){EXPECT_NE(std::string(error.what()).find("recorded partial retention seal failure"),std::string::npos);}
+  EXPECT_TRUE(contract.context);EXPECT_EQ(t.resets,0u);
+ };
+ {auto borrowed=contract.context;rejectBorrowed();}
+ {auto borrowed=contract.reusable_execution_workspaces;rejectBorrowed();}
+ {auto borrowed=contract.reuse_authority;rejectBorrowed();EXPECT_EQ(borrowed->state(),ModelContextReuseAuthority::State::Invalid);}
+ const auto originalMemory=contract.physical_memory_authority;
+ contract.physical_memory_authority=std::shared_ptr<PhysicalMemoryAuthority>(originalMemory.get(),[](auto*){});
+ EXPECT_THROW((void)discardExclusiveInvalidModelContextReuseContract(contract),std::logic_error);
+ contract.physical_memory_authority=originalMemory;
+ {
+  auto originalModel=std::move(contract.context);
+  contract.context=ModelContext::createForTesting("recorded-absent-original-source.gguf",std::make_shared<MockMPIContext>(),1,true);
+  EXPECT_THROW((void)discardExclusiveInvalidModelContextReuseContract(contract),std::logic_error);
+  EXPECT_TRUE(contract.context);EXPECT_EQ(t.resets,0u);
+  contract.context=std::move(originalModel);
+ }
+ std::weak_ptr<ModelContext> modelLifetime=contract.context;
+ std::weak_ptr<ReusableExecutionWorkspaceRegistry> workspaceLifetime=contract.reusable_execution_workspaces;
+ t.beforeReset=[&]{EXPECT_TRUE(modelLifetime.expired());EXPECT_TRUE(workspaceLifetime.expired());};
+ const auto receipt=discardExclusiveInvalidModelContextReuseContract(contract);
+ EXPECT_EQ(receipt.retiredDeviceCount(),2u);EXPECT_EQ(t.destroyed,2u);EXPECT_EQ(t.resets,2u);EXPECT_TRUE(t.allDestroyed);
+ EXPECT_FALSE(contract.context);EXPECT_FALSE(contract.reuse_authority);EXPECT_FALSE(contract.reusable_execution_workspaces);
+ EXPECT_THROW((void)discardExclusiveInvalidModelContextReuseContract(contract),std::invalid_argument);
+ EXPECT_EQ(source->retireReleasedContexts(),0u);EXPECT_EQ(t.resets,2u);
+ EXPECT_NO_THROW(GPUDeviceContextPool::instance().shutdown());
+}
+/** @test A terminal CPU-only failure releases owners without entering any native reset path. */
+TEST(NativeSourceFinalRetirement, InvalidCpuOnlyContractDiscardsWithoutNativeSource){
+ ModelContextReuseContract contract;contract.context=ModelContext::createForTesting("recorded-invalid-cpu-final.gguf");
+ contract.reusable_execution_workspaces=std::make_shared<ReusableExecutionWorkspaceRegistry>();
+ contract.reuse_authority=std::make_shared<ModelContextReuseAuthority>();contract.reuse_authority->invalidate("recorded CPU seal failure");
+ PhysicalMemoryPlanBuilder builder;builder.add(PhysicalMemoryResource{0,DeviceId::cpu(),1024,1024},PhysicalMemoryOwner::ModelSourcePayload,1);
+ contract.physical_memory_authority=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(builder.build()),0);
+ EXPECT_EQ(discardExclusiveInvalidModelContextReuseContract(contract).retiredDeviceCount(),0u);
+ EXPECT_FALSE(contract.context);EXPECT_FALSE(contract.reuse_authority);
 }
 }

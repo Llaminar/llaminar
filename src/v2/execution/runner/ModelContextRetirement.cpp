@@ -240,4 +240,38 @@ namespace llaminar2
         return receipt;
     }
 
+    InvalidModelContextDiscardReceipt discardExclusiveInvalidModelContextReuseContract(ModelContextReuseContract& contract)
+    {
+        if(!contract.context || !contract.reusable_execution_workspaces || !contract.reuse_authority || !contract.physical_memory_authority)
+            throw std::invalid_argument("Invalid model discard requires complete original final owners");
+        if(contract.reuse_authority->state()!=ModelContextReuseAuthority::State::Invalid)
+            throw std::logic_error("Invalid model discard requires the terminal Invalid lifecycle boundary");
+        const auto diagnostic=contract.reuse_authority->diagnostic();
+        if(contract.context.use_count()!=1u || contract.reusable_execution_workspaces.use_count()!=1u ||
+           contract.reuse_authority.use_count()!=1u)
+            throw std::logic_error("Invalid model discard still has borrowed model/workspace/lifecycle owners: "+diagnostic);
+        auto source=contract.context->nativeContextPreparation();
+        if(source){
+            const auto memory=source->memory();
+            if(memory.get()!=contract.physical_memory_authority.get() || memory.owner_before(contract.physical_memory_authority) ||
+               contract.physical_memory_authority.owner_before(memory))
+                throw std::logic_error("Invalid model discard requires its original source/PMA control block: "+diagnostic);
+        }else{
+            for(const auto& row:contract.physical_memory_authority->rankAttestation())
+                if(row.identity.device.is_gpu())
+                    throw std::logic_error("Invalid GPU model discard requires its original native source: "+diagnostic);
+        }
+        // Invalid means reuse failed, not that physical ownership disappeared.
+        // Keep the original source through final owner destruction and then use
+        // its existing exact central-ledger-zero native retirement transaction.
+        contract.context.reset();
+        contract.reusable_execution_workspaces.reset();
+        contract.physical_memory_authority.reset();
+        contract.reuse_authority.reset();
+        contract.prepared_routed_weight_plan.reset();
+        contract.expert_overlay_memory_admission.reset();
+        contract.routed_weight_authority_identity.clear();
+        return {source ? source->retireReleasedContexts() : 0u};
+    }
+
 } // namespace llaminar2

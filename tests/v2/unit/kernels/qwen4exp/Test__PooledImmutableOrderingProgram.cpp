@@ -16,13 +16,13 @@
 namespace llaminar2::test { namespace {
 namespace q=qwen4exp;
 /** @brief Original checked root geometry with explicit ordered physical owners. */
-auto physical(std::span<const std::uint32_t> slots,DeviceType consumer){
-    const PhysicalMemoryAllocatorIdentity coordinator{0,{consumer,7}};
+auto physical(std::span<const std::uint32_t> slots,DeviceType consumer,bool source_has_cache=false,int source_ordinal=7){
+    const PhysicalMemoryAllocatorIdentity coordinator{0,{consumer,source_ordinal}};
     std::vector<ImmutableRowTableLayoutOwner> roots;
     std::vector<PhysicalMemoryAllocatorIdentity> order;
     bool positive=false;
     for(std::size_t i=0;i<slots.size();++i){
-        order.push_back({0,{i%2?consumer:(consumer==DeviceType::CUDA?DeviceType::ROCm:DeviceType::CUDA),static_cast<int>(i)}});
+        order.push_back(source_has_cache && i==0 ? coordinator : PhysicalMemoryAllocatorIdentity{0,{i%2?consumer:(consumer==DeviceType::CUDA?DeviceType::ROCm:DeviceType::CUDA),static_cast<int>(i)}});
         roots.push_back({{order.back(),ImmutableRowStorage::VRAM},0,slots[i],{}});positive|=slots[i]!=0;
     }
     const std::array tiers{ImmutableRowStorage::VRAM,ImmutableRowStorage::MemoryMapped};
@@ -126,6 +126,89 @@ TEST(PooledImmutableOrderingProgram, SourceReadinessPreservesDeclaredComputeRead
         std::sort(identities.begin(),identities.end());
         EXPECT_EQ(std::unique(identities.begin(),identities.end()),identities.end());
         EXPECT_THROW(q::PooledImmutableSourceGeometry::fromPlans(owners,coordinator,source,0),std::invalid_argument);
+    }
+}
+/** @test Retention selects actual source or owner observations, never an execution-consumer boundary. */
+TEST(PooledImmutableOrderingProgram, RetainedRootProjectionDistinguishesPhysicalOwnersAndReaders)
+{
+    // Recorded claim bytes exercise only the production metadata projection;
+    // they create no PMA observation, root, source boundary or reuse permission.
+    struct RecordedClaims {
+        PhysicalMemoryAllocatorIdentity original;
+        std::size_t table,staging;
+        PhysicalMemoryAllocatorIdentity allocator()const{return original;}
+    };
+    const ImmutableRowTableSource descriptor{.rows=0x100000100ULL,.row_elements=160,.format=GGUFTensorType::IQ4_NL};
+    for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm})for(const bool combined:{false,true})
+    {
+        const auto shape=physical(std::array{3u,5u,0u},backend,combined);
+        const auto policy=q::PooledImmutableCoordinatorGeometry::fromOwners(shape,{65536,1,2},64);
+        const auto coordinator=q::PooledImmutableCoordinatorNativePlan::fromGeometry(shape,policy,701,17);
+        std::vector<q::PooledImmutableOwnerNativePlan> owners;
+        std::vector<RecordedClaims> recorded;
+        for(std::size_t index=0;index<shape.owners().size();++index){
+            owners.push_back(q::PooledImmutableOwnerNativePlan::fromGeometry(shape,policy,index,701,17));
+            recorded.push_back({owners.back().allocator(),11+index*13,17+index*19});
+        }
+        const auto geometry=q::PooledImmutableSourceGeometry::fromPlans(owners,coordinator,descriptor,2);
+        // Source bytes already include any local owner. The helper must return
+        // this unchanged observation, never add that owner's claims again.
+        const RecordedClaims source{geometry.allocator(),101,103};
+        std::vector<PhysicalMemoryAllocatorIdentity> probes{geometry.allocator()};
+        for(const auto& owner:owners)if(owner.allocator()!=geometry.allocator())probes.push_back(owner.allocator());
+        const PhysicalMemoryAllocatorIdentity reader_only{0,{backend,11}},unrelated{0,{backend,12}};
+        probes.push_back(reader_only);probes.push_back(unrelated);
+        for(const auto probe:probes){
+            SCOPED_TRACE(::testing::Message()<<"combined="<<combined<<" target="<<probe.device.toString());
+            int source_calls=0,owner_calls=0;
+            const auto get_source=[&]{
+                ++source_calls;
+                // Original failing behavior asked this source-only boundary
+                // for every consumer, including the foreign shared reader.
+                if(probe!=geometry.allocator())throw std::invalid_argument("recorded foreign source boundary");
+                return source;
+            };
+            const auto get_owner=[&](std::size_t index){++owner_calls;return recorded.at(index);};
+            if(probe!=geometry.allocator()){
+                EXPECT_THROW((void)get_source(),std::invalid_argument);
+                source_calls=0;
+            }
+            const auto observed=geometry.projectRetainedOwnerObservation(probe,get_source,get_owner);
+            if(probe==reader_only || probe==unrelated){
+                EXPECT_FALSE(observed);EXPECT_EQ(source_calls,0);EXPECT_EQ(owner_calls,0);
+            }else{
+                ASSERT_TRUE(observed);EXPECT_EQ(observed->allocator(),probe);
+                if(probe==geometry.allocator()){
+                    EXPECT_EQ(observed->table,101u);EXPECT_EQ(observed->staging,103u);
+                    EXPECT_EQ(source_calls,1);EXPECT_EQ(owner_calls,0);
+                }else{
+                    const auto expected=std::find_if(recorded.begin(),recorded.end(),[&](const auto& row){return row.allocator()==probe;});
+                    ASSERT_NE(expected,recorded.end());
+                    EXPECT_EQ(observed->table,expected->table);EXPECT_EQ(observed->staging,expected->staging);
+                    EXPECT_EQ(source_calls,0);EXPECT_EQ(owner_calls,1);
+                }
+            }
+        }
+        // A copied observation from another allocator cannot be silently credited.
+        EXPECT_THROW(geometry.projectRetainedOwnerObservation(geometry.allocator(),
+            [&]{return RecordedClaims{reader_only,101,103};},[&](std::size_t index){return recorded.at(index);}),std::logic_error);
+    }
+    // Consumer-local sources remain separate original physical owners. A borrow
+    // of source A cannot give source B's rows a second retention credit.
+    for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm})for(const int ordinal:{7,8}){
+        const auto shape=physical(std::array{3u},backend,true,ordinal);
+        const auto policy=q::PooledImmutableCoordinatorGeometry::fromOwners(shape,{65536,1,2},64);
+        const auto coordinator=q::PooledImmutableCoordinatorNativePlan::fromGeometry(shape,policy,701,17);
+        const auto owner=q::PooledImmutableOwnerNativePlan::fromGeometry(shape,policy,0,701,17);
+        const auto geometry=q::PooledImmutableSourceGeometry::fromPlans(owner,coordinator,descriptor,1);
+        int source_calls=0,owner_calls=0;
+        const auto get_source=[&]{++source_calls;return RecordedClaims{geometry.allocator(),211,223};};
+        const auto get_owner=[&](std::size_t){++owner_calls;return RecordedClaims{owner.allocator(),31,37};};
+        const auto local=geometry.projectRetainedOwnerObservation(geometry.allocator(),get_source,get_owner);
+        ASSERT_TRUE(local);EXPECT_EQ(local->table,211u);EXPECT_EQ(local->staging,223u);
+        EXPECT_EQ(source_calls,1);EXPECT_EQ(owner_calls,0);
+        const auto other=geometry.projectRetainedOwnerObservation({0,{backend,ordinal==7?8:7}},get_source,get_owner);
+        EXPECT_FALSE(other);EXPECT_EQ(source_calls,1);EXPECT_EQ(owner_calls,0);
     }
 }
 }}

@@ -21899,19 +21899,18 @@ namespace llaminar2
                         device);
                 size_t immutable_table_bytes=model_ctx_->residentImmutableRowTableBytes(device);
                 size_t immutable_lookup_staging_bytes=0;
-                const auto placement=model_ctx_->resolvedImmutableRowTablePlacement();
-                const bool adaptive_owner=placement && placement->isGPUAdaptive() &&
-                    std::find(placement->consumers().begin(),placement->consumers().end(),
-                        PhysicalMemoryAllocatorIdentity{plan_.rank,device})!=placement->consumers().end();
-                if(adaptive_owner)
+                // Physical roots survive execution-reader teardown. A shared
+                // reader may own remote cache roots, or no immutable roots at
+                // all; neither case creates a source boundary on that device.
+                const auto actual=model_ctx_->retainedAdaptiveImmutableLookupOwner({plan_.rank,device});
+                if(actual)
                 {
-                    const auto boundary=model_ctx_->adaptiveImmutableLookupBoundary(device);
-                    if(!boundary)throw std::invalid_argument("Adaptive retention has no original source boundary");
-                    const auto actual=boundary->pooledStorage()->retainedOwnerObservation();
-                    if(actual.authority().get()!=physical_memory_authority_.get() || actual.allocator()!=PhysicalMemoryAllocatorIdentity{plan_.rank,device})
+                    if(actual->authority().get()!=physical_memory_authority_.get() ||
+                       actual->authority().owner_before(physical_memory_authority_) || physical_memory_authority_.owner_before(actual->authority()) ||
+                       actual->allocator()!=PhysicalMemoryAllocatorIdentity{plan_.rank,device})
                         throw std::invalid_argument("Adaptive retention must observe its exact original GPU/PMA root claims");
-                    immutable_table_bytes=actual.tableStorageBytes();
-                    immutable_lookup_staging_bytes=actual.lookupStagingBytes();
+                    immutable_table_bytes=actual->tableStorageBytes();
+                    immutable_lookup_staging_bytes=actual->lookupStagingBytes();
                 }
                 ModelDeviceMemoryRetention row{
                     .device = device,

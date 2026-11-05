@@ -10,6 +10,9 @@
  * the canonical terminal row is written only after every physical owner retires.
  */
 #pragma once
+#include <optional>
+#include <type_traits>
+#include <stdexcept>
 #include "backends/NativeOrderingEventProgram.h"
 #include "PooledImmutableNativePlan.h"
 #include "tensors/TensorType.h"
@@ -75,6 +78,30 @@ public:
     void requireOriginalPlans(std::span<const PooledImmutableOwnerNativePlan> owners,
         const PooledImmutableCoordinatorNativePlan& coordinator,const ImmutableRowTableSource& source,
         std::uint32_t expected_compute_readers)const;
+    /**
+     * @brief Project only the original native roots physically retained on one allocator.
+     * @param allocator Exact physical endpoint, independent of compute-reader entries.
+     * @param source Read-only getter for the existing source/coordinator/local-owner aggregate.
+     * @param owner Read-only getter for an original storage owner by immutable coordinate.
+     * @return One unchanged observation or no native roots. No capacity or bytes are inferred.
+     * @note Source selection comes first because its aggregate already includes any local owner.
+     */
+    template<class SourceObservation,class OwnerObservation>
+    [[nodiscard]] auto projectRetainedOwnerObservation(PhysicalMemoryAllocatorIdentity allocator,
+        SourceObservation&& source,OwnerObservation&& owner)const
+    {
+        using Observation=std::invoke_result_t<SourceObservation&>;
+        static_assert(std::is_same_v<Observation,std::invoke_result_t<OwnerObservation&,std::size_t>>);
+        const auto checked=[&](Observation observed){
+            if(observed.allocator()!=allocator)
+                throw std::logic_error("Adaptive retained observation has a foreign original allocator");
+            return std::optional<Observation>{observed};
+        };
+        if(allocator==allocator_)return checked(source());
+        for(std::size_t index=0;index<owners_.size();++index)
+            if(owners_[index].allocator()==allocator)return checked(owner(index));
+        return std::optional<Observation>{};
+    }
     /** @return Original immutable ordered cohort; this is not an ownership/location registry. */
     std::span<const PooledImmutableOwnerNativePlan> originalOwners()const noexcept{return owners_;}
     /** @return Complete frozen native operands, including source precision and exact physical offsets. */
