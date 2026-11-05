@@ -1,11 +1,18 @@
 /**
  * @file RMSNormPrimitives.cpp
- * @brief Vectorized RMSNorm implementation (ported from V1)
+ * @brief CPU RMSNorm numerical leaves over original tensor storage.
+ *
+ * ISA-specific leaves retain their declared reduction/inverse/publication
+ * programs. Native ARM consumes original FP32/FP16/BF16/INT32 values through
+ * fixed register reductions and the canonical portable half codec, without
+ * decoded row banks. Caller-owned tensors, gamma and scratch retain their
+ * lifetime/admission authority; synchronous arithmetic creates no new lease.
  * @author David Sanftenberg
  */
 
 #include "RMSNormPrimitives.h"
-#include "utils/DebugEnv.h"
+#include "CPURMSNormBorrow.h"
+#include "../../../tensors/FP16Utils.h"
 #include <omp.h>
 #include <cmath>
 #include <algorithm>
@@ -14,6 +21,9 @@
 
 #include "../../../utils/OpenMPUtils.h"
 #include "../../../utils/CPUFeatures.h"
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include "NEONRMSNormFloatingRows.h"
+#endif
 
 #if defined(__AVX512F__)
 #include <immintrin.h>
@@ -24,65 +34,20 @@
 namespace llaminar2::primitives
 {
 
-    // --- FP16 Scalar ---
-    __attribute__((always_inline)) inline float fp16_to_fp32_scalar(uint16_t h)
+    /** @brief Expand one original half word through the canonical portable codec.
+     * @param value Original FP16 word; @return Exact portable FP32 storage value.
+     */
+    __attribute__((always_inline)) inline float fp16_to_fp32_scalar(uint16_t value)
     {
-        uint32_t sign = (h & 0x8000U) << 16;
-        uint32_t exp = (h & 0x7C00U) >> 10;
-        uint32_t mantissa = h & 0x03FFU;
-        uint32_t fp32_bits;
-        if (exp == 0)
-        {
-            if (mantissa == 0)
-                fp32_bits = sign;
-            else
-            {
-                exp = 1;
-                while ((mantissa & 0x0400U) == 0)
-                {
-                    mantissa <<= 1;
-                    exp--;
-                }
-                mantissa &= 0x03FFU;
-                fp32_bits = sign | ((exp + (127 - 15)) << 23) | (mantissa << 13);
-            }
-        }
-        else if (exp == 0x1F)
-        {
-            fp32_bits = sign | 0x7F800000U | (mantissa << 13);
-        }
-        else
-        {
-            fp32_bits = sign | ((exp + (127 - 15)) << 23) | (mantissa << 13);
-        }
-        float result;
-        std::memcpy(&result, &fp32_bits, sizeof(float));
-        return result;
+        return ::llaminar2::fp16_to_fp32(value);
     }
 
-    __attribute__((always_inline)) inline uint16_t fp32_to_fp16_scalar(float f)
+    /** @brief Publish one half tail through the same normal RNE/payload contract as native ARM.
+     * @param value Normalized FP32 value; @return Canonical FP16 storage word.
+     */
+    __attribute__((always_inline)) inline uint16_t fp32_to_fp16_scalar(float value)
     {
-        uint32_t bits;
-        std::memcpy(&bits, &f, sizeof(float));
-        uint32_t sign = (bits >> 16) & 0x8000U;
-        int32_t exp = ((bits >> 23) & 0xFFU) - 127 + 15;
-        uint32_t mantissa = (bits >> 13) & 0x03FFU;
-        if (exp <= 0)
-        {
-            if (exp < -10)
-                return sign;
-            mantissa |= 0x0400U;
-            mantissa >>= (1 - exp);
-            return sign | mantissa;
-        }
-        else if (exp >= 0x1F)
-        {
-            return sign | 0x7C00U;
-        }
-        else
-        {
-            return sign | (exp << 10) | mantissa;
-        }
+        return ::llaminar2::fp32_to_fp16(value);
     }
 
     // --- BF16 Scalar ---
@@ -424,6 +389,18 @@ namespace llaminar2::primitives
             return s_scalar;
         }
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        /** @brief Reduce one original FP32 row with the native fixed FP64 tree.
+         * @param row Original synchronous row borrow; @param cols Logical count.
+         * @return Native FP64 squared summary, independent of M/team partition.
+         */
+        double compute_sumsq_neon(const float *row, std::size_t cols)
+        {
+            using namespace neon_rmsnorm;
+            return squaredSums(OriginalRows<Storage::FP32, 1>::bind({std::span<const float>(row, cols)}, cols))[0];
+        }
+#endif
+
 // --- ISA stubs for runtime dispatch ---
 #if !defined(__AVX2__)
         double compute_sumsq_avx2(const float *row, std::size_t cols)
@@ -443,117 +420,75 @@ namespace llaminar2::primitives
             return ISA_DISPATCH_RETVAL(compute_sumsq, row, cols);
         }
 
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        /** @brief Execute one shared-gamma original floating tile without serial-call replay.
+         * @tparam Encoding Exact original floating storage.
+         * @tparam Count Physical rows1..4 participating in this tile.
+         * @param bank Complete validated original bank.
+         * @param first Original first row, never a worker-local row coordinate.
+         * @param program Explicit FP64 or T5 FP32 arithmetic policy.
+         */
+        template<neon_rmsnorm::Storage Encoding, std::size_t Count>
+        void native_floating_tile(const rmsnorm_operands::FloatingBorrow<neon_rmsnorm::Unit<Encoding>> &bank,
+                                  std::size_t first, neon_rmsnorm::Accumulation program)
+        {
+            using namespace neon_rmsnorm;
+            std::array<std::span<const Unit<Encoding>>, Count> input;
+            std::array<std::span<Unit<Encoding>>, Count> output;
+            neon_rmsnorm::detail::visit<Count>([&]<std::size_t Row> {
+                input[Row] = bank.sourceRow(first + Row);
+                output[Row] = bank.outputRow(first + Row);
+            });
+            normalize(OriginalRows<Encoding, Count>::bind(input, bank.columns()),
+                      output, bank.gamma(), bank.epsilon(), program);
+        }
+
+        /** @brief Workshare complete native floating tiles, retaining one arithmetic program per row.
+         * @tparam Encoding Exact original/result floating storage.
+         * @param bank Complete checked original banks and policy, with a retained external lease.
+         * @param opts Original execution options, not a second mutable scheduler authority.
+         */
+        template<neon_rmsnorm::Storage Encoding>
+        void native_floating_matrix(const rmsnorm_operands::FloatingBorrow<neon_rmsnorm::Unit<Encoding>> &bank,
+                                    const RMSNormExecOptions &opts)
+        {
+            using namespace neon_rmsnorm;
+            const auto program = opts.t5_compat_mode ? Accumulation::T5FP32 : Accumulation::FP64;
+            const auto tiles = bank.rows()/4 + (bank.rows()%4 != 0);
+            auto work = [&]() {
+#pragma omp for schedule(static)
+                for (std::ptrdiff_t tile = 0; tile < std::ptrdiff_t(tiles); ++tile)
+                {
+                    const auto first = std::size_t(tile)*4;
+                    switch (std::min<std::size_t>(4,bank.rows()-first))
+                    {
+                    case 4: native_floating_tile<Encoding,4>(bank,first,program); break;
+                    case 3: native_floating_tile<Encoding,3>(bank,first,program); break;
+                    case 2: native_floating_tile<Encoding,2>(bank,first,program); break;
+                    case 1: native_floating_tile<Encoding,1>(bank,first,program); break;
+                    }
+                }
+            };
+            // Retained participants must all enter, including small groups for
+            // which a standalone fork/join is not economical.
+            OMP_WORKSHARE_REGION_IF(work, omp_in_parallel() ||
+                (tiles > 1 && want_parallel(bank.rows(),bank.columns(),opts)));
+        }
+
+        /** @brief Authenticate explicit native dispatch; a scalar request is diagnostic intent.
+         * @param opts Original execution intent.
+         * @return Whether this request names the available native ARM program.
+         */
+        bool use_native_rmsnorm(const RMSNormExecOptions &opts)
+        {
+            if (opts.force_scalar) return false;
+            const auto isa = activeISALevel();
+            return isa == ISALevel::NEON || isa == ISALevel::NEONDotProd;
+        }
+#endif
     } // namespace detail
     using namespace detail;
-
-    void rmsnorm_compute_row_sumsq_vectorized(
-        const float *src,
-        std::size_t rows,
-        std::size_t cols,
-        double *row_sumsq,
-        const RMSNormExecOptions &opts)
-    {
-        if (!src || !row_sumsq || rows == 0 || cols == 0)
-            return;
-
-        // T5 compatibility: float32 accumulation
-        if (opts.t5_compat_mode)
-        {
-            bool parallel = want_parallel(rows, cols, opts);
-            if (parallel)
-            {
-                auto do_work = [&]()
-                {
-#pragma omp for schedule(static)
-                    for (long long r = 0; r < (long long)rows; ++r)
-                    {
-                        const float *row = src + (std::size_t)r * cols;
-                        float sum_sq = 0.0f;
-                        for (std::size_t c = 0; c < cols; ++c)
-                        {
-                            float val = row[c];
-                            sum_sq += val * val;
-                        }
-                        row_sumsq[r] = (double)sum_sq;
-                    }
-                };
-                OMP_WORKSHARE_REGION(do_work);
-            }
-            else
-            {
-                // Serial path
-                for (long long r = 0; r < (long long)rows; ++r)
-                {
-                    const float *row = src + (std::size_t)r * cols;
-                    float sum_sq = 0.0f;
-                    for (std::size_t c = 0; c < cols; ++c)
-                    {
-                        float val = row[c];
-                        sum_sq += val * val;
-                    }
-                    row_sumsq[r] = (double)sum_sq;
-                }
-            }
-            return;
-        }
-
-        // Double precision vectorized path
-        bool parallel = want_parallel(rows, cols, opts);
-
-        // Special case: Single row with large columns -> Parallelize reduction
-        if (rows == 1 && parallel)
-        {
-            double total_sum_sq = 0.0;
-
-            // Note: For reduction in nested context, we use OMP_WORKSHARE_REGION
-            // but need manual chunking since omp for reduction can be tricky
-            auto do_reduction = [&]()
-            {
-                int tid = omp_get_thread_num();
-                int nthreads = omp_get_num_threads();
-
-                long long chunk_size = (cols + nthreads - 1) / nthreads;
-                long long start = tid * chunk_size;
-                long long end = std::min((long long)cols, start + chunk_size);
-
-                double local_sum = 0.0;
-                if (start < end)
-                {
-                    local_sum = compute_sumsq_dispatch(src + start, end - start);
-                }
-
-// Thread-safe accumulation
-#pragma omp atomic
-                total_sum_sq += local_sum;
-            };
-            OMP_WORKSHARE_REGION(do_reduction);
-            row_sumsq[0] = total_sum_sq;
-            return;
-        }
-
-        if (parallel)
-        {
-            auto do_work = [&]()
-            {
-#pragma omp for schedule(static)
-                for (long long r = 0; r < (long long)rows; ++r)
-                {
-                    const float *row = src + (std::size_t)r * cols;
-                    row_sumsq[r] = compute_sumsq_dispatch(row, cols);
-                }
-            };
-            OMP_WORKSHARE_REGION(do_work);
-        }
-        else
-        {
-            // Serial path
-            for (long long r = 0; r < (long long)rows; ++r)
-            {
-                const float *row = src + (std::size_t)r * cols;
-                row_sumsq[r] = compute_sumsq_dispatch(row, cols);
-            }
-        }
-    }
 
     void rmsnorm_compute_inv(
         const double *row_sumsq,
@@ -577,159 +512,65 @@ namespace llaminar2::primitives
         }
     }
 
-    void rmsnorm_apply_vectorized(
+
+    void rmsnorm_fused_vectorized(
         const float *src,
         const float *gamma,
-        const float *inv,
+        float *dst,
         std::size_t rows,
         std::size_t cols,
-        float *dst,
+        float epsilon,
         const RMSNormExecOptions &opts)
     {
-        if (!src || !inv || !dst || rows == 0 || cols == 0)
-            return;
-
-        bool parallel = want_parallel(rows, cols, opts);
-        bool has_gamma = (gamma != nullptr);
-
-        // Special case: Single row with large columns -> Parallelize application
-        if (rows == 1 && parallel)
+        const auto bank = rmsnorm_operands::FloatingBorrow<float>::bind(src,gamma,dst,rows,cols,epsilon);
+        bank.requireMetadataReadOnly(&opts,sizeof(opts));
+        if (!::llaminar::v2::beginWorkshare(!bank.empty())) return;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        if (use_native_rmsnorm(opts))
         {
-            float scale = inv[0];
-            if (scale == 0.0f)
-            {
-                std::fill(dst, dst + cols, 0.0f);
-                return;
-            }
-
-            if (has_gamma)
-            {
-                auto do_work = [&]()
-                {
-#pragma omp for schedule(static)
-                    for (long long c = 0; c < (long long)cols; ++c)
-                    {
-                        dst[c] = src[c] * scale * gamma[c];
-                    }
-                };
-                OMP_WORKSHARE_REGION(do_work);
-            }
-            else
-            {
-                auto do_work = [&]()
-                {
-#pragma omp for schedule(static)
-                    for (long long c = 0; c < (long long)cols; ++c)
-                    {
-                        dst[c] = src[c] * scale;
-                    }
-                };
-                OMP_WORKSHARE_REGION(do_work);
-            }
+            native_floating_matrix<neon_rmsnorm::Storage::FP32>(bank,opts);
             return;
         }
-
-        if (parallel)
-        {
-            auto do_work = [&]()
-            {
+#endif
+        // A complete row, its summary and inverse have one elected worker.
+        // No TLS matrix, worker-partitioned arithmetic, atomics or detached
+        // summary/application phases survive. This also seals the x86 M=1
+        // single-worker program across all M and retained-team sizes.
+        auto work = [&]() {
 #pragma omp for schedule(static)
-                for (long long r = 0; r < (long long)rows; ++r)
-                {
-                    const float *row_in = src + (std::size_t)r * cols;
-                    float *row_out = dst + (std::size_t)r * cols;
-                    float scale = inv[(std::size_t)r];
-
-                    if (scale == 0.0f)
-                    {
-                        std::fill(row_out, row_out + cols, 0.0f);
-                        continue;
-                    }
-
-                    if (!has_gamma)
-                    {
-#pragma omp simd
-                        for (long long c = 0; c < (long long)cols; ++c)
-                        {
-                            row_out[c] = row_in[c] * scale;
-                        }
-                    }
-                    else
-                    {
-#pragma omp simd
-                        for (long long c = 0; c < (long long)cols; ++c)
-                        {
-                            row_out[c] = row_in[c] * scale * gamma[c];
-                        }
-                    }
-                }
-            };
-            OMP_WORKSHARE_REGION(do_work);
-        }
-        else
-        {
-            // Serial path
-            for (long long r = 0; r < (long long)rows; ++r)
+            for (std::ptrdiff_t r=0;r<std::ptrdiff_t(bank.rows());++r)
             {
-                const float *row_in = src + (std::size_t)r * cols;
-                float *row_out = dst + (std::size_t)r * cols;
-                float scale = inv[(std::size_t)r];
-
-                if (scale == 0.0f)
+                const auto input=bank.sourceRow(std::size_t(r));
+                const auto output=bank.outputRow(std::size_t(r));
+                double sum;
+                if (opts.t5_compat_mode)
                 {
-                    std::fill(row_out, row_out + cols, 0.0f);
-                    continue;
+                    float partial=0.0f;
+                    for(float value:input) partial=std::fma(value,value,partial);
+                    sum=double(partial);
                 }
-
-                if (!has_gamma)
+                else sum=opts.force_scalar?compute_sumsq_scalar(input.data(),cols):
+                                            compute_sumsq_dispatch(input.data(),cols);
+                if (!std::isfinite(sum))
+                    throw std::domain_error("CPU RMS observed a nonfinite original-row squared summary");
+                float inverse;
+                rmsnorm_compute_inv(&sum,1,cols,epsilon,&inverse);
+                if (inverse==0.0f) std::fill(output.begin(),output.end(),0.0f);
+                else if (gamma)
                 {
-                    for (long long c = 0; c < (long long)cols; ++c)
-                    {
-                        row_out[c] = row_in[c] * scale;
-                    }
+#pragma omp simd
+                    for (std::ptrdiff_t column=0;column<std::ptrdiff_t(cols);++column)
+                        output[std::size_t(column)]=(input[std::size_t(column)]*inverse)*gamma[std::size_t(column)];
                 }
                 else
                 {
-                    for (long long c = 0; c < (long long)cols; ++c)
-                    {
-                        row_out[c] = row_in[c] * scale * gamma[c];
-                    }
+#pragma omp simd
+                    for (std::ptrdiff_t column=0;column<std::ptrdiff_t(cols);++column)
+                        output[std::size_t(column)]=input[std::size_t(column)]*inverse;
                 }
             }
-        }
-    }
-
-    void rmsnorm_fused_vectorized(
-        const float *src,
-        const float *gamma,
-        float *dst,
-        std::size_t rows,
-        std::size_t cols,
-        float epsilon,
-        const RMSNormExecOptions &opts)
-    {
-        thread_local RMSNormScratch tls_scratch;
-        tls_scratch.ensure(rows);
-
-        rmsnorm_compute_row_sumsq_vectorized(src, rows, cols, tls_scratch.row_sumsq.data(), opts);
-        rmsnorm_compute_inv(tls_scratch.row_sumsq.data(), rows, cols, epsilon, tls_scratch.inv.data());
-        rmsnorm_apply_vectorized(src, gamma, tls_scratch.inv.data(), rows, cols, dst, opts);
-    }
-
-    void rmsnorm_fused_vectorized(
-        const float *src,
-        const float *gamma,
-        float *dst,
-        std::size_t rows,
-        std::size_t cols,
-        float epsilon,
-        RMSNormScratch &scratch,
-        const RMSNormExecOptions &opts)
-    {
-        scratch.ensure(rows);
-        rmsnorm_compute_row_sumsq_vectorized(src, rows, cols, scratch.row_sumsq.data(), opts);
-        rmsnorm_compute_inv(scratch.row_sumsq.data(), rows, cols, epsilon, scratch.inv.data());
-        rmsnorm_apply_vectorized(src, gamma, scratch.inv.data(), rows, cols, dst, opts);
+        };
+        OMP_WORKSHARE_REGION_IF(work,omp_in_parallel() || (rows>1 && want_parallel(rows,cols,opts)));
     }
 
     // ========================================================================
@@ -841,6 +682,18 @@ namespace llaminar2::primitives
                 acc += v * v;
             }
             return acc;
+        }
+#endif
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        /** @brief Reduce original INT32 without a lossy intermediate FP32 conversion.
+         * @param row Original full-width integers; @param cols Logical count.
+         * @return Native fixed-tree FP64 squared summary.
+         */
+        double compute_rms_sq_int32_neon(const int32_t *row, std::size_t cols)
+        {
+            using namespace neon_rmsnorm;
+            return squaredSums(OriginalRows<Storage::Int32, 1>::bind({std::span<const int32_t>(row, cols)}, cols))[0];
         }
 #endif
 
@@ -1292,6 +1145,18 @@ namespace llaminar2::primitives
     // FP32 Per-Row Primitives (Testable SIMD variants)
     // ========================================================================
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    void rmsnorm_fused_row_neon(const float *src,const float *gamma,float *dst,
+                               std::size_t cols,float epsilon)
+    {
+        using namespace neon_rmsnorm;
+        const auto bank=rmsnorm_operands::FloatingBorrow<float>::bind(src,gamma,dst,1,cols,epsilon);
+        normalize(OriginalRows<Storage::FP32,1>::bind({bank.sourceRow(0)},cols),
+                  std::array{bank.outputRow(0)},bank.gamma(),epsilon,
+                  Accumulation::FP64,Inverse::FP32Mean);
+    }
+#endif
+
     void rmsnorm_fused_row_scalar(
         const float *src,
         const float *gamma,
@@ -1647,6 +1512,40 @@ namespace llaminar2::primitives
     namespace detail
     {
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        /** @brief Normalize one original encoded row with native arithmetic and exact storage tails.
+         * @tparam Encoding Original FP16/BF16 storage kind.
+         * @param src Original row; @param gamma Immutable original weights, or identity when null.
+         * @param dst Original writable row; @param cols Logical count; @param epsilon Original policy.
+         */
+        template<neon_rmsnorm::Storage Encoding>
+        void native_encoded_rmsnorm_row(const uint16_t *src, const float *gamma,
+                                        uint16_t *dst, std::size_t cols, float epsilon)
+        {
+            using namespace neon_rmsnorm;
+            normalize(OriginalRows<Encoding, 1>::bind({std::span<const uint16_t>(src, cols)}, cols),
+                std::array{std::span<uint16_t>(dst, cols)},
+                gamma ? std::span<const float>(gamma, cols) : std::span<const float>{}, epsilon);
+        }
+        /** @brief Native BF16 original-row normalization with portable RNE publication.
+         * @param src Original BF16; @param gamma Original FP32 gamma; @param dst Original output.
+         * @param cols Logical elements; @param epsilon Original normalization policy.
+         */
+        void bf16_rmsnorm_row_neon(const uint16_t *src, const float *gamma,
+                                   uint16_t *dst, std::size_t cols, float epsilon)
+        {
+            native_encoded_rmsnorm_row<neon_rmsnorm::Storage::BF16>(src, gamma, dst, cols, epsilon);
+        }
+        /** @brief Native FP16 original-row normalization with the FP16Utils storage program.
+         * @param src Original FP16; @param gamma Original FP32 gamma; @param dst Original output.
+         * @param cols Logical elements; @param epsilon Original normalization policy.
+         */
+        void fp16_rmsnorm_row_neon(const uint16_t *src, const float *gamma,
+                                   uint16_t *dst, std::size_t cols, float epsilon)
+        {
+            native_encoded_rmsnorm_row<neon_rmsnorm::Storage::FP16>(src, gamma, dst, cols, epsilon);
+        }
+#endif
         // ========== BF16 RMSNorm Kernels ==========
 
         /// BF16 RMSNorm row kernel - Scalar path
@@ -1973,42 +1872,27 @@ namespace llaminar2::primitives
         float epsilon,
         const RMSNormExecOptions &opts)
     {
-        bool parallel = want_parallel(rows, cols, opts);
-
-        auto do_row_work = [&](std::size_t r)
+        const auto bank=rmsnorm_operands::FloatingBorrow<uint16_t>::bind(src,gamma,dst,rows,cols,epsilon);
+        bank.requireMetadataReadOnly(&opts,sizeof(opts));
+        if (!::llaminar::v2::beginWorkshare(!bank.empty())) return;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        if (use_native_rmsnorm(opts))
         {
-            const uint16_t *src_row = src + r * cols;
-            uint16_t *dst_row = dst + r * cols;
-
-            if (opts.force_scalar)
+            native_floating_matrix<neon_rmsnorm::Storage::BF16>(bank,opts);
+            return;
+        }
+#endif
+        auto work=[&]() {
+#pragma omp for schedule(static)
+            for(std::ptrdiff_t row=0;row<std::ptrdiff_t(rows);++row)
             {
-                bf16_rmsnorm_row_scalar(src_row, gamma, dst_row, cols, epsilon);
-            }
-            else
-            {
-                ISA_DISPATCH_VOID(bf16_rmsnorm_row, src_row, gamma, dst_row, cols, epsilon);
+                const auto input=bank.sourceRow(std::size_t(row));
+                const auto output=bank.outputRow(std::size_t(row));
+                if(opts.force_scalar) bf16_rmsnorm_row_scalar(input.data(),gamma,output.data(),cols,epsilon);
+                else ISA_DISPATCH_VOID(bf16_rmsnorm_row,input.data(),gamma,output.data(),cols,epsilon);
             }
         };
-
-        if (parallel)
-        {
-            auto do_work = [&]()
-            {
-#pragma omp for schedule(static)
-                for (std::size_t r = 0; r < rows; ++r)
-                {
-                    do_row_work(r);
-                }
-            };
-            OMP_WORKSHARE_REGION(do_work);
-        }
-        else
-        {
-            for (std::size_t r = 0; r < rows; ++r)
-            {
-                do_row_work(r);
-            }
-        }
+        OMP_WORKSHARE_REGION_IF(work,omp_in_parallel() || (rows>1 && want_parallel(rows,cols,opts)));
     }
 
     void rmsnorm_fused_fp16_vectorized(
@@ -2020,42 +1904,27 @@ namespace llaminar2::primitives
         float epsilon,
         const RMSNormExecOptions &opts)
     {
-        bool parallel = want_parallel(rows, cols, opts);
-
-        auto do_row_work = [&](std::size_t r)
+        const auto bank=rmsnorm_operands::FloatingBorrow<uint16_t>::bind(src,gamma,dst,rows,cols,epsilon);
+        bank.requireMetadataReadOnly(&opts,sizeof(opts));
+        if (!::llaminar::v2::beginWorkshare(!bank.empty())) return;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        if (use_native_rmsnorm(opts))
         {
-            const uint16_t *src_row = src + r * cols;
-            uint16_t *dst_row = dst + r * cols;
-
-            if (opts.force_scalar)
+            native_floating_matrix<neon_rmsnorm::Storage::FP16>(bank,opts);
+            return;
+        }
+#endif
+        auto work=[&]() {
+#pragma omp for schedule(static)
+            for(std::ptrdiff_t row=0;row<std::ptrdiff_t(rows);++row)
             {
-                fp16_rmsnorm_row_scalar(src_row, gamma, dst_row, cols, epsilon);
-            }
-            else
-            {
-                ISA_DISPATCH_VOID(fp16_rmsnorm_row, src_row, gamma, dst_row, cols, epsilon);
+                const auto input=bank.sourceRow(std::size_t(row));
+                const auto output=bank.outputRow(std::size_t(row));
+                if(opts.force_scalar) fp16_rmsnorm_row_scalar(input.data(),gamma,output.data(),cols,epsilon);
+                else ISA_DISPATCH_VOID(fp16_rmsnorm_row,input.data(),gamma,output.data(),cols,epsilon);
             }
         };
-
-        if (parallel)
-        {
-            auto do_work = [&]()
-            {
-#pragma omp for schedule(static)
-                for (std::size_t r = 0; r < rows; ++r)
-                {
-                    do_row_work(r);
-                }
-            };
-            OMP_WORKSHARE_REGION(do_work);
-        }
-        else
-        {
-            for (std::size_t r = 0; r < rows; ++r)
-            {
-                do_row_work(r);
-            }
-        }
+        OMP_WORKSHARE_REGION_IF(work,omp_in_parallel() || (rows>1 && want_parallel(rows,cols,opts)));
     }
 
     void rmsnorm_quantize_row_scalar(
@@ -2569,53 +2438,6 @@ namespace llaminar2::primitives
 
     namespace
     {
-        /**
-         * @brief Fast integer square root using binary search
-         * Returns floor(sqrt(x))
-         */
-        __attribute__((always_inline)) inline uint32_t isqrt_fast(uint64_t x)
-        {
-            if (x == 0)
-                return 0;
-            if (x == 1)
-                return 1;
-
-            // Initial estimate using CLZ
-            int bits = 64 - __builtin_clzll(x);
-            uint64_t result = 1ULL << ((bits + 1) / 2);
-
-            // Newton-Raphson: 3-4 iterations suffice for 64-bit
-            for (int i = 0; i < 4; ++i)
-            {
-                result = (result + x / result) >> 1;
-            }
-
-            // Adjust if we overshot
-            while (result * result > x)
-                --result;
-
-            return static_cast<uint32_t>(result);
-        }
-
-        /**
-         * @brief Compute integer inverse sqrt in Q16 format
-         * Input: x (raw integer)
-         * Output: (1/sqrt(x)) << 16, or 0 if x is 0
-         */
-        __attribute__((always_inline)) inline uint32_t inv_sqrt_q16(uint64_t x)
-        {
-            if (x == 0)
-                return 0xFFFF; // Large value for zero
-
-            uint32_t sqrt_x = isqrt_fast(x);
-            if (sqrt_x == 0)
-                return 0xFFFF;
-
-            // inv_sqrt = (1 << 16) / sqrt_x, but we want more precision
-            // Use (1 << 32) / sqrt_x, then adjust
-            return static_cast<uint32_t>((1ULL << 24) / sqrt_x); // Q24 format
-        }
-
 #if defined(__AVX512F__)
         /**
          * @brief AVX512 vectorized sum of squares for 32 int8 values
@@ -3311,9 +3133,6 @@ namespace llaminar2::primitives
         int32_t epsilon_scaled = static_cast<int32_t>(epsilon * 1e10f);
         if (epsilon_scaled < 1)
             epsilon_scaled = 1;
-
-        // Get parallelization thresholds from DebugEnv
-        const auto &cfg = debugEnv().rmsnorm;
 
         // ================================================================
         // UNIFIED ROW-PARALLEL APPROACH
