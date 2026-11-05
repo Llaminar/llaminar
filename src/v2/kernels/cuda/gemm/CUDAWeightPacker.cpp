@@ -80,6 +80,9 @@ namespace llaminar2::cuda
                                                     << tensorTypeName(tensor->native_type()));
                 return false;
             }
+            // Self-describing geometry: the uploaders derive exact live extents from it.
+            out.N = N;
+            out.K = K;
 
             const auto physical = canonicalDeviceVnniFormat(*info);
             const int blocks_per_row = K / 32;
