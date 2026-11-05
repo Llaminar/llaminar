@@ -316,7 +316,9 @@ namespace llaminar2::cuda::prefill
         // STAGES_=2 (double-buffered) overlaps load/decode of next tile with compute.
         __shared__ int8_t smem_A[STAGES_][BM * SMEM_STRIDE_64];
         __shared__ int8_t smem_B[STAGES_][BN * SMEM_STRIDE_64];
-        __shared__ uint16_t smem_scales_B[STAGES_][2 * BN];
+        // 16-byte aligned: async metadata copies write 16-byte (FP16 words) or
+        // 8-byte (raw E8M0 bytes) destinations at multiples of their size.
+        __shared__ __align__(16) uint16_t smem_scales_B[STAGES_][2 * BN];
 
         // Activation scales cached in smem to decouple from L1 data cache.
         // Stores 2 FP32 scale values per M-row per K-tile (one per Q4_0 block half).
