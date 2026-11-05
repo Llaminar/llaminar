@@ -1149,3 +1149,27 @@ executable code and tests are unchanged.
 This checkpoint qualifies histogram ownership only. Dynamic cohort inference,
 placement changes during MTP, full production preflight and Release throughput
 remain separate unqualified gates.
+
+## Replicated reader source-frame dependency (focused306)
+
+Source metadata read the original coordinator frame without declaring its arena
+input. A later retained child therefore treated it as an external input and
+rejected the unjoined old completion event. All source metadata actions now
+declare that exact frame, validate its arena binding, and include it in the
+existing storage seal and capture identity. Query-only readers do not acquire
+that dependency; event guards and transport behavior are unchanged.
+
+The focused regression uses the production contract, graph splitter, dependency
+planner and capture ledger. It retains the old declaration as a negative control,
+rejects foreign frame ownership and covers twenty lifetimes for CUDA and ROCm
+metadata. `build305` and `focused306` passed the owning QFN primitive fixture,
+the explicit source-frame preflight regression, and both existing receipt/ACK
+registrations (four tests, 21.70 seconds, no skips, clean drivers).
+
+The native development composition in `/tmp/qfn-cuda-shared-source-r307/`
+subsequently captured both complete CUDA prefill/decode parent families. Its
+final placement-readiness check exposed a separate reader-count identity defect;
+that admission cell remains red, with every resource retired and clean drivers.
+This checkpoint contains only the independently scoped frame fix and regression,
+not the pending native transport or Dynamic cohort changes. It is not complete
+preflight, source admission, numerical or Release performance qualification.

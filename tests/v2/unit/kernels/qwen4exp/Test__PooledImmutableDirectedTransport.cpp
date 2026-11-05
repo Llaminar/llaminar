@@ -8,6 +8,11 @@
  * cross-vendor owner replays and the TransferEngine counted-message suite.
  */
 #include "execution/qwen4exp/PooledImmutableDirectedTransport.h"
+#include "execution/qwen4exp/PooledImmutableReplicatedReaderContract.h"
+#include "execution/local_execution/graph/DeviceGraphExecutor.h"
+#include "execution/local_execution/graph/DeviceGraphCaptureController.h"
+#include "mocks/MockComputeStage.h"
+#include "tensors/Tensors.h"
 #include <gtest/gtest.h>
 #include <array>
 #include <map>
@@ -104,5 +109,66 @@ TEST(PooledImmutableDirectedTransport, ForeignResourcesAndUnsupportedNativeRoute
     const auto native=shape(DeviceId::cuda(7),slots,true);EXPECT_THROW(q::PooledImmutableDirectedTransport::completeBOM(native.physical,native.coordinator,host,native.resources),std::invalid_argument);
     auto foreign=host;foreign.world_rank=1;EXPECT_THROW(q::PooledImmutableDirectedTransport::completeBOM(s.physical,s.coordinator,foreign,s.resources),std::invalid_argument);
     EXPECT_THROW(q::PooledImmutableDirectedTransport::create({}),std::invalid_argument);
+}
+}
+
+namespace llaminar2::test {
+namespace {
+/** @brief Record the actual production metadata contract without creating a native transport or permit. */
+class ReaderContractReplayStage final:public testing::MockComputeStage {
+public:
+    ReaderContractReplayStage(DeviceId device,StageBufferContract contract,bool boundary=false)
+        :MockComputeStage(ComputeStageType::COPY,"reader_contract",device),contract_(std::move(contract)),boundary_(boundary){}
+    StageBufferContract bufferContract()const override{return contract_;}
+    bool requiresGraphCaptureSegmentBoundaryBefore()const override{return boundary_;}
+private:StageBufferContract contract_;bool boundary_;
+};
+}
+/** @test Source metadata imports its exact original frame through the production graph dependency planner. */
+TEST(PooledImmutableDirectedTransport, SourceReaderFrameDeclarativeDependencyReplay){
+    namespace rr=qwen4exp::replicated_reader;
+    using Ledger=GraphCaptureDependencyLedger;
+    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)}){
+        auto frame=std::make_shared<INT8Tensor>(std::vector<size_t>{64});
+        auto foreign=std::make_shared<INT8Tensor>(std::vector<size_t>{64});
+        auto control=std::make_shared<INT32Tensor>(std::vector<size_t>{16});
+        BufferArena arena;
+        EXPECT_THROW(qwen4exp::detail::checkedReplicatedReaderSourceFrame(arena,frame.get()),std::logic_error);
+        ASSERT_TRUE(arena.registerExternalBuffer(BufferId::QFN_POOLED_COORDINATOR_FRAME,frame));
+        ASSERT_TRUE(arena.registerExternalBuffer(BufferId::MTP_GENERATION_CONTROL,control));
+        EXPECT_EQ(qwen4exp::detail::checkedReplicatedReaderSourceFrame(arena,frame.get()),frame.get());
+        EXPECT_THROW(qwen4exp::detail::checkedReplicatedReaderSourceFrame(arena,foreign.get()),std::logic_error);
+        DeviceGraphExecutor executor;executor.setArena(&arena);
+        int stream_token;void* const stream=&stream_token;
+        for(int replay=0;replay<20;++replay)for(const auto action:{rr::Action::PrepareResultHeader,rr::Action::PrepareResult,rr::Action::ConfirmAck}){
+            for(const bool old_contract:{true,false}){
+                auto contract=qwen4exp::detail::replicatedReaderPhaseContract(action,BufferId::MTP_NORM_HIDDEN,{});
+                if(old_contract){contract=StageBufferContract::build();contract.addPreallocatedInOut(BufferId::MTP_GENERATION_CONTROL,"INT32");}
+                ComputeGraph graph;
+                auto producer=StageBufferContract::build();producer.addOutput(BufferId::QFN_POOLED_COORDINATOR_FRAME,"INT8");
+                graph.addNode("original_source_frame",std::make_unique<ReaderContractReplayStage>(device,std::move(producer)),device);
+                graph.addNode("source_header",std::make_unique<ReaderContractReplayStage>(device,std::move(contract),true),device);
+                graph.addDependency("source_header","original_source_frame");
+                DeviceGraphExecutor::GraphSegmentCache plan;
+                DeviceGraphCaptureController::buildCapturePlan(graph,plan,nullptr,false,false,
+                    DeviceGraphExecutor::GraphReplayPlanPolicy::RequireRetainedParentComposition);
+                ASSERT_EQ(plan.segments.size(),2u);
+                const auto& child=plan.segments.back();
+                EXPECT_EQ(child.retained_parent_input_ids.empty(),old_contract);
+                auto ledger=executor.planGraphCaptureDependencies(graph,child.stage_names,device,stream,"replicated_source_frame",child.retained_parent_input_ids,
+                    Ledger::ExternalInputAuthority::BindDeclaredAddressesOnly);
+                ASSERT_TRUE(ledger);ledger->beginCapture();ledger->beginStage(graph.getNode("source_header")->stage.get());
+                EXPECT_EQ(ledger->classifyInput(frame.get(),device,stream),old_contract?
+                    Ledger::InputDisposition::StrictExternal:Ledger::InputDisposition::RetainedParentRecorded);
+                EXPECT_EQ(ledger->classifyInput(foreign.get(),device,stream),Ledger::InputDisposition::StrictExternal);
+                ledger->endCapture();graph.clear();
+            }
+        }
+        for(const auto action:{rr::Action::AcceptResultHeader,rr::Action::AcknowledgeResult}){
+            const auto contract=qwen4exp::detail::replicatedReaderPhaseContract(action,BufferId::MTP_NORM_HIDDEN,{});
+            const auto reads=contract.allArenaReads();
+            EXPECT_TRUE(std::none_of(reads.begin(),reads.end(),[](const auto& row){return row.id==BufferId::QFN_POOLED_COORDINATOR_FRAME;}));
+        }
+    }
 }
 }

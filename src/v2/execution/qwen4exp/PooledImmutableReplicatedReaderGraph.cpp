@@ -7,6 +7,7 @@
  * source frame's actual interval and each reader checks its own live count.
  */
 #include "PooledImmutableReplicatedReaderGraph.h"
+#include "PooledImmutableReplicatedReaderContract.h"
 #include "kernels/qwen4exp/PooledImmutableReplicatedReaderKernels.h"
 #include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
 #include "execution/compute_stages/IComputeStage.h"
@@ -109,8 +110,9 @@ public:
         : IComputeStage(source ? reader->originalSource().device() : reader->originalReader().device()),
           arena_(&arena), transport_(std::move(transport)), reader_(std::move(reader)), control_(control),
           rows_(rows), output_(std::move(output)), count_(std::move(count)), action_(action), source_(source), payload_(payload),
-          prepared_(device(), std::array<TensorBase*,3>{output_.root.get(), control_.owner(),
-              count_ ? count_->root.get() : output_.root.get()})
+          prepared_(device(), std::array<TensorBase*,4>{output_.root.get(), control_.owner(),
+              count_ ? count_->root.get() : output_.root.get(),
+              source_ ? sourceFrame() : output_.root.get()})
     {
         requireDeclarations(*arena_, *transport_, *reader_, device(), control_, rows_, output_, count_);
         const bool sourceAction = action_ == rr::Action::PrepareResultHeader ||
@@ -148,7 +150,7 @@ public:
         const q::adaptive_lookup::pooled::LookupFrame* frame = nullptr;
         if (source_) {
             const auto& coordinator = transport_->sourceBoundary()->pooledStorage()->coordinator();
-            execution.requirePreparedInput(coordinator->roots().frame.get());
+            execution.requirePreparedInput(sourceFrame());
             frame = reinterpret_cast<const q::adaptive_lookup::pooled::LookupFrame*>(
                 static_cast<const std::byte*>(coordinator->roots().frame->gpu_data_ptr()) +
                 coordinator->plan().parameters().frame.control);
@@ -196,6 +198,7 @@ public:
         mix(reinterpret_cast<std::uintptr_t>(transport_.get()));
         mix(reinterpret_cast<std::uintptr_t>(output_.root.get()));
         mix(output_.offset); mix(output_.bytes); mix(static_cast<std::uint64_t>(output_.buffer));
+        if(source_)mix(reinterpret_cast<std::uintptr_t>(sourceFrame()));
         mix(control_.captureIdentity()); mixRows(value, rows_);
         if (count_) { mix(reinterpret_cast<std::uintptr_t>(count_->root.get()));
             mix(count_->offset); mix(count_->bytes); mix(static_cast<std::uint64_t>(count_->buffer)); } mix(static_cast<std::uint64_t>(action_));
@@ -213,15 +216,11 @@ public:
             control_.captureIdentity() == control.captureIdentity() && rows_.captureIdentity() == rows.captureIdentity() &&
             sameSpan(output_, output) && sameCount(count_, count);
     }
-    /** @return Original canonical controller and the actual foreign gather output. */
+    /** @return Original controller, source frame, live count and gather-result dependencies. */
     StageBufferContract bufferContract() const override
     {
-        auto contract = StageBufferContract::build();
-        contract.addPreallocatedInOut(BufferId::MTP_GENERATION_CONTROL, "INT32");
-        if (action_ == rr::Action::AcknowledgeResult) contract.addOutput(output_.buffer, "FP32");
-        if (count_ && count_->buffer != BufferId::MTP_GENERATION_CONTROL)
-            contract.addInput(count_->buffer, "INT32");
-        return contract;
+        return q::detail::replicatedReaderPhaseContract(action_,output_.buffer,
+            count_ ? std::optional(count_->buffer) : std::nullopt);
     }
 protected:
     /** @return Standard PLE output snapshot, preserving the ordinary exact-row bank contract. */
@@ -239,6 +238,11 @@ protected:
         return dump;
     }
 private:
+    /** @return Exact original frame read by every source metadata action, never a reader-owned alias. */
+    TensorBase* sourceFrame() const {
+        return q::detail::checkedReplicatedReaderSourceFrame(*arena_,
+            transport_->sourceBoundary()->pooledStorage()->coordinator()->roots().frame.get());
+    }
     BufferArena* arena_;
     std::shared_ptr<const q::PooledImmutableDirectedTransport> transport_;
     std::shared_ptr<const q::PooledImmutableReplicatedReaderTransport> reader_;
