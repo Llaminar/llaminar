@@ -57,8 +57,9 @@ namespace llaminar2
             bool has_emins = false;          ///< Allocate extended minima.
             uint8_t codebook_id = 0;         ///< Initial descriptor codebook.
             /// Primary scale-plane capacity; the widest plane any format sharing
-            /// this slot needs (set from codebook_id, max-merged for unions).
-            NativeVnniScalePlaneWidth scale_plane = NativeVnniScalePlaneWidth::FP16Word;
+            /// this slot needs. Defaults to codebook_id's own width (declared
+            /// above, so the initializer sees it); unions max-merge explicitly.
+            NativeVnniScalePlaneWidth scale_plane = nativeVnniScalePlaneWidth(codebook_id);
             ExpertWeightFormat format; ///< Original arithmetic identity.
         };
 
