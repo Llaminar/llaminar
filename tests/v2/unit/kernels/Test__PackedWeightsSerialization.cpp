@@ -640,6 +640,29 @@ TEST(Test__PackedWeightsSerialization, MXFP4NativeUnitScaleWordsRoundTripAndReje
         owner.packed().native_interleaved.data(), owner.packed().native_interleaved.size()), 0);
     for (int n = 0; n < 64; ++n)
         EXPECT_EQ(native->packed().blockScale(0, 1, n), owner.packed().blockScale(0, 1, n)) << n;
+    // Fresh version-8 direct receive: describe, allocate, receive sections, adopt.
+    {
+        PackedWeightsTransferDescriptor direct{};
+        PackedWeightsConstSectionViews views{};
+        ASSERT_TRUE(describeTransfer(owner, direct, views));
+        EXPECT_EQ(direct.header.version, PACKED_WEIGHTS_VERSION);
+        auto target = allocateTransferTarget(direct);
+        ASSERT_NE(target.weights, nullptr);
+        for (size_t section = 0; section < PACKED_WEIGHT_SECTION_COUNT; ++section)
+        {
+            ASSERT_EQ(target.sizes[section], views.sizes[section]);
+            if (views.sizes[section] != 0)
+                std::memcpy(target.data[section], views.data[section], views.sizes[section]);
+        }
+        const auto *received = dynamic_cast<const CPUPackedWeights *>(target.weights.get());
+        ASSERT_NE(received, nullptr);
+        EXPECT_EQ(received->packed().scaleEncoding(), CPUNativeVNNIScaleEncoding::PowerOfTwoBF16);
+        EXPECT_EQ(std::memcmp(received->packed().native_interleaved.data(),
+            owner.packed().native_interleaved.data(), owner.packed().native_interleaved.size()), 0);
+        for (int kb = 0; kb < 2; ++kb)
+            for (int n = 0; n < 64; ++n)
+                EXPECT_EQ(received->packed().blockScale(0, kb, n), owner.packed().blockScale(0, kb, n)) << kb << ',' << n;
+    }
     // A version-7 archive with these exact fields carried FP16 scale words.
     const uint32_t old_version = 7;
     std::memcpy(blob.data() + offsetof(PackedWeightsHeader, version), &old_version, sizeof(old_version));

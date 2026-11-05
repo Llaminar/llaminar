@@ -222,8 +222,9 @@ namespace llaminar2::cuda
     extern "C"
     {
         bool cudaQuantGemm_uploadRawBytes(const void *h_src, void **d_dst, size_t bytes, int cuda_device_id);
-        bool cudaQuantGemm_uploadChunkedRawBytes(const void *h_src, void **d_dst, size_t chunks,
-                                                 size_t stride_bytes, size_t live_bytes, int cuda_device_id);
+        bool cudaQuantGemm_uploadPlannedRawBytes(const void *h_src, void **d_dst, size_t allocation_bytes,
+                                                 size_t copies, size_t stride_bytes, size_t copy_bytes,
+                                                 int cuda_device_id);
         void cudaQuantGemm_freeDevice(void *d_ptr, int cuda_device_id);
     }
 
@@ -266,16 +267,19 @@ namespace llaminar2::cuda
             return true;
         };
 
-        // Primary plane: transfer each expert's exact live extent.
+        // Primary plane: execute the shared live-extent upload plan.
         auto uploadScales = [&]() -> bool
         {
+            const auto plan = nativeVnniPrimaryPlaneUploadPlan(
+                codebook_id, static_cast<size_t>(rows_per_expert) * blocks_per_row,
+                static_cast<size_t>(num_experts));
+            if (plan.allocation_bytes != all_scales.size() * sizeof(uint16_t))
+                throw std::runtime_error(
+                    "[MoEBatchPackedWeightsCUDA] Host primary plane does not match its upload plan");
             void *d_mem = nullptr;
-            const bool ok = cudaQuantGemm_uploadChunkedRawBytes(
-                all_scales.data(), &d_mem, static_cast<size_t>(num_experts),
-                scales_per_expert * sizeof(uint16_t),
-                nativeVnniScalePlaneLiveBytes(
-                    codebook_id, static_cast<size_t>(rows_per_expert) * blocks_per_row),
-                cuda_device_id);
+            const bool ok = cudaQuantGemm_uploadPlannedRawBytes(
+                all_scales.data(), &d_mem, plan.allocation_bytes, plan.copies,
+                plan.stride_bytes, plan.copy_bytes, cuda_device_id);
             upload.d_scales = static_cast<uint16_t *>(d_mem);
             return ok;
         };

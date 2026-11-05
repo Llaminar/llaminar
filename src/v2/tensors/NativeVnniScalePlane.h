@@ -112,6 +112,58 @@ namespace llaminar2
     }
 
     /**
+     * @brief Host-to-device copy plan for a primary plane of @p chunks matrices.
+     *
+     * Host-packed planes (one matrix, or a batch of experts) keep word-aligned
+     * storage: each chunk occupies `nativeVnniScalePlaneStorageWords()` words.
+     * The device allocation keeps that stride so per-chunk pointers stay
+     * word-aligned, but only each chunk's live bytes are transferred:
+     * - stride == live (every 2-byte plane, every even 1-byte plane): one copy
+     *   of `chunks * live` bytes;
+     * - odd 1-byte plane: one `live`-byte copy per chunk, skipping the single
+     *   unused storage byte that follows each chunk (it is never read).
+     * Every CUDA/ROCm packed-weight uploader executes exactly this plan.
+     */
+    struct NativeVnniPrimaryPlaneUploadPlan
+    {
+        std::size_t allocation_bytes = 0; ///< chunks * stride (device capacity)
+        std::size_t stride_bytes = 0;     ///< Per-chunk storage stride on host and device
+        std::size_t copies = 0;           ///< Number of H2D copies
+        std::size_t copy_bytes = 0;       ///< Bytes of each copy
+        /** @return Total bytes crossing the bus (`copies * copy_bytes`). */
+        LLAMINAR_NVNNI_PLANE_HD constexpr std::size_t transferredBytes() const noexcept
+        {
+            return copies * copy_bytes;
+        }
+        /** @return Byte offset of copy @p index (same on host and device). */
+        LLAMINAR_NVNNI_PLANE_HD constexpr std::size_t copyOffset(std::size_t index) const noexcept
+        {
+            return copies == 1 ? 0 : index * stride_bytes;
+        }
+    };
+
+    /**
+     * @brief Plan the upload of @p chunks primary planes of @p blocks_per_chunk blocks.
+     * @param physical_codebook Execution codebook selecting the plane width.
+     * @param blocks_per_chunk Live blocks per matrix (rows * K / 32).
+     * @param chunks Number of matrices (1 for a dense weight, E for a batch).
+     */
+    LLAMINAR_NVNNI_PLANE_HD constexpr NativeVnniPrimaryPlaneUploadPlan nativeVnniPrimaryPlaneUploadPlan(
+        std::uint8_t physical_codebook, std::size_t blocks_per_chunk, std::size_t chunks) noexcept
+    {
+        const std::size_t live = nativeVnniScalePlaneLiveBytes(physical_codebook, blocks_per_chunk);
+        const std::size_t stride = nativeVnniScalePlaneStorageWords(physical_codebook, blocks_per_chunk) * 2;
+        NativeVnniPrimaryPlaneUploadPlan plan;
+        plan.allocation_bytes = chunks * stride;
+        plan.stride_bytes = stride;
+        if (chunks == 0 || live == 0)
+            return plan;
+        plan.copies = live == stride ? 1 : chunks;
+        plan.copy_bytes = live == stride ? chunks * live : live;
+        return plan;
+    }
+
+    /**
      * @brief Exact byte extents of one prepared matrix's metadata planes.
      * @param block_count Number of 32-value blocks (rows * K / 32).
      * @param physical_codebook Execution codebook selecting the primary width.

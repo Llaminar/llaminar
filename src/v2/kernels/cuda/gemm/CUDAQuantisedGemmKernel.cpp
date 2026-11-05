@@ -117,6 +117,10 @@ namespace llaminar2
 
             // Upload raw bytes from host to device (nvcc-compiled for CUDA runtime consistency)
             bool cudaQuantGemm_uploadRawBytes(const void *h_src, void **d_dst, size_t bytes, int cuda_device_id);
+            // Execute a NativeVnniPrimaryPlaneUploadPlan (exact live primary-plane extents).
+            bool cudaQuantGemm_uploadPlannedRawBytes(const void *h_src, void **d_dst, size_t allocation_bytes,
+                                                     size_t copies, size_t stride_bytes, size_t copy_bytes,
+                                                     int cuda_device_id);
 
             // Memory movement helpers for prepared tensor projections.
             bool cudaQuantGemm_copyHostToDevice(float *d_dst, const float *h_src, size_t count, int cuda_device_id);
@@ -816,19 +820,21 @@ namespace llaminar2
                 CUDAPackedWeights::DeviceUpload &upload,
                 int cuda_device_id)
             {
-                // The primary plane transfers its exact live extent: an odd
-                // one-byte E8M0 plane leaves its last storage byte unused.
-                const size_t live_scale_bytes = nativeVnniScalePlaneLiveBytes(
+                // The primary plane transfers its exact live extent (shared
+                // upload plan): an odd one-byte E8M0 plane keeps its rounded
+                // storage capacity but never sends the unused byte.
+                const auto plan = nativeVnniPrimaryPlaneUploadPlan(
                     packed.native_codebook_id,
-                    static_cast<size_t>(packed.N) * packed.native_blocks_per_row);
-                if (live_scale_bytes > packed.native_scales.size() * sizeof(uint16_t))
+                    static_cast<size_t>(packed.N) * packed.native_blocks_per_row, 1);
+                if (plan.allocation_bytes != packed.native_scales.size() * sizeof(uint16_t))
                 {
                     throw std::runtime_error(
-                        "[CUDAQuantGemm] Native-VNNI primary plane is smaller than its live extent");
+                        "[CUDAQuantGemm] Native-VNNI primary plane does not match its upload plan");
                 }
                 void *d_scales = nullptr;
-                const bool scales_uploaded = cudaQuantGemm_uploadRawBytes(
-                    packed.native_scales.data(), &d_scales, live_scale_bytes, cuda_device_id);
+                const bool scales_uploaded = cudaQuantGemm_uploadPlannedRawBytes(
+                    packed.native_scales.data(), &d_scales, plan.allocation_bytes,
+                    plan.copies, plan.stride_bytes, plan.copy_bytes, cuda_device_id);
                 upload.d_native_scales = static_cast<uint16_t *>(d_scales);
                 if (!scales_uploaded ||
                     !uploadHostArrayToDevice(packed.native_vnni, &upload.d_native_vnni, cuda_device_id) ||

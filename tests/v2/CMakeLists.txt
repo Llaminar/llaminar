@@ -868,7 +868,7 @@ add_v2_test(V2_Unit_MXFP4Tensor
 # (e = 0 / e > 143) prepared with scale +0 through the production CPU packers.
 add_v2_test(V2_Integration_MXFP4ExactPreparation_CPU
     COMMAND $<TARGET_FILE:v2_test_mxfp4_tensor>
-        --gtest_filter=MXFP4Tensor.NativeVnniPackingIsVerbatimAndRejectsInexactScales:MXFP4Tensor.GgmlAllZeroBlocksPrepareExactlyWithZeroScale:MXFP4CPUNativeVNNI.GgmlAllZeroBlocksMatchExactReference:MXFP4Format.NativeE8M0ScaleBitsAreExactNormalFP32:MXFP4Format.PowerOfTwoBF16WordIsExactAndValidated:MXFP4CPUScaleLoaders.*:MXFP4ScaleCarrier.*:MXFP4Tensor.NativeE8M0LayoutsCoverBoundariesAndRejectUnadmittedExponents
+        --gtest_filter=MXFP4Tensor.NativeVnniPackingIsVerbatimAndRejectsInexactScales:MXFP4Tensor.GgmlAllZeroBlocksPrepareExactlyWithZeroScale:MXFP4CPUNativeVNNI.GgmlAllZeroBlocksMatchExactReference:MXFP4Format.NativeE8M0ScaleBitsAreExactNormalFP32:MXFP4Format.PowerOfTwoBF16WordIsExactAndValidated:MXFP4CPUScaleLoaders.*:MXFP4ScaleCarrier.*:MXFP4Tensor.NativeE8M0LayoutsCoverBoundariesAndRejectUnadmittedExponents:MXFP4ScalePlaneUpload.*
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Tensors;MXFP4;Regression"
     MPI_PROCS 1
     NO_MODELS

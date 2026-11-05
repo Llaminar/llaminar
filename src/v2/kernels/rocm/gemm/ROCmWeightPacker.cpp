@@ -483,30 +483,29 @@ namespace llaminar2
             return true;
         };
 
-        // Primary plane: word-aligned per-expert strides, but only each expert's
-        // live prefix crosses the bus (an odd one-byte E8M0 plane leaves one
-        // storage byte per expert that holds no block and is never read).
+        // Primary plane: execute the shared live-extent upload plan (word-aligned
+        // per-expert strides; an odd one-byte E8M0 plane never sends the unused
+        // storage byte after each expert).
         auto uploadScales = [&](void **d_ptr) -> bool
         {
             *d_ptr = nullptr;
-            const size_t stride = scales_per_expert * sizeof(uint16_t);
-            const size_t live = nativeVnniScalePlaneLiveBytes(
-                codebook_id, static_cast<size_t>(rows_per_expert) * blocks_per_row);
-            if (live > stride)
+            const auto plan = nativeVnniPrimaryPlaneUploadPlan(
+                codebook_id, static_cast<size_t>(rows_per_expert) * blocks_per_row,
+                static_cast<size_t>(num_experts));
+            if (plan.allocation_bytes != all_native_scales.size() * sizeof(uint16_t))
                 throw std::runtime_error(
-                    "MoEBatchPackedWeightsROCm::uploadToDevice live scale extent exceeds its stride");
-            if (live == stride)
-                return uploadBuffer(all_native_scales.data(), all_native_scales.size() * sizeof(uint16_t), d_ptr);
-            *d_ptr = backend->allocate(static_cast<size_t>(num_experts) * stride, rocm_device_id);
+                    "MoEBatchPackedWeightsROCm::uploadToDevice host primary plane does not match its upload plan");
+            if (plan.allocation_bytes == 0)
+                return true;
+            *d_ptr = backend->allocate(plan.allocation_bytes, rocm_device_id);
             if (!*d_ptr)
                 return false;
-            for (int expert = 0; expert < num_experts; ++expert)
+            for (size_t copy = 0; copy < plan.copies; ++copy)
             {
                 if (!backend->hostToDevice(
-                        static_cast<uint8_t *>(*d_ptr) + static_cast<size_t>(expert) * stride,
-                        reinterpret_cast<const uint8_t *>(all_native_scales.data()) +
-                            static_cast<size_t>(expert) * stride,
-                        live, rocm_device_id, setup_stream))
+                        static_cast<uint8_t *>(*d_ptr) + plan.copyOffset(copy),
+                        reinterpret_cast<const uint8_t *>(all_native_scales.data()) + plan.copyOffset(copy),
+                        plan.copy_bytes, rocm_device_id, setup_stream))
                 {
                     backend->free(*d_ptr, rocm_device_id);
                     *d_ptr = nullptr;

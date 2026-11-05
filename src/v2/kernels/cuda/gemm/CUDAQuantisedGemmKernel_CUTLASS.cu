@@ -429,40 +429,42 @@ extern "C"
     }
 
     /**
-     * @brief Allocate a chunked slab and upload only each chunk's live prefix.
+     * @brief Allocate a planned primary-plane slab and execute its H2D copies.
      *
-     * Batched expert planes keep word-aligned per-expert strides; an odd
-     * one-byte E8M0 plane therefore has one storage byte per expert that holds
-     * no block. Only the live bytes cross the bus (one copy when the stride is
-     * exact); the unused device bytes are never read.
+     * Executes a NativeVnniPrimaryPlaneUploadPlan: the allocation keeps the
+     * word-aligned storage stride, and only the planned live bytes cross the
+     * bus (copy i at offset i * stride, or one copy at offset 0). Unused
+     * storage bytes on the device are never read.
      *
-     * @param h_src Host slab of @p chunks * @p stride_bytes bytes.
-     * @param d_dst Receives the device slab of the same capacity.
-     * @param chunks Number of chunks (experts).
-     * @param stride_bytes Per-chunk storage stride.
-     * @param live_bytes Per-chunk live prefix, at most @p stride_bytes.
+     * @param h_src Host slab with the same stride layout.
+     * @param d_dst Receives the device slab of @p allocation_bytes.
+     * @param allocation_bytes Device capacity (chunks * stride).
+     * @param copies Number of copies.
+     * @param stride_bytes Offset step between copies (ignored for one copy).
+     * @param copy_bytes Bytes per copy.
      * @param cuda_device_id Destination device.
      */
-    bool cudaQuantGemm_uploadChunkedRawBytes(
+    bool cudaQuantGemm_uploadPlannedRawBytes(
         const void *h_src,
         void **d_dst,
-        size_t chunks,
+        size_t allocation_bytes,
+        size_t copies,
         size_t stride_bytes,
-        size_t live_bytes,
+        size_t copy_bytes,
         int cuda_device_id)
     {
         *d_dst = nullptr;
-        if (live_bytes > stride_bytes)
-            throw std::runtime_error(
-                "[CUDAQuantGemm] Chunked upload live extent exceeds its stride");
-        if (chunks == 0 || stride_bytes == 0)
+        if (allocation_bytes == 0)
             return true;
-        if (live_bytes == stride_bytes)
-            return cudaQuantGemm_uploadRawBytes(h_src, d_dst, chunks * stride_bytes, cuda_device_id);
+        const size_t last_end = copies == 0 ? 0
+            : (copies == 1 ? copy_bytes : (copies - 1) * stride_bytes + copy_bytes);
+        if (last_end > allocation_bytes || (copies > 1 && copy_bytes > stride_bytes))
+            throw std::runtime_error(
+                "[CUDAQuantGemm] Planned primary-plane upload exceeds its allocation or stride");
         auto *backend = llaminar2::getCUDABackend();
         if (!backend)
             return false;
-        *d_dst = backend->allocate(chunks * stride_bytes, cuda_device_id);
+        *d_dst = backend->allocate(allocation_bytes, cuda_device_id);
         if (!*d_dst)
             return false;
         void *const setup_stream =
@@ -476,12 +478,13 @@ extern "C"
             throw std::runtime_error(
                 "[CUDAQuantGemm] Packed-weight upload has no explicit setup stream");
         }
-        for (size_t chunk = 0; chunk < chunks; ++chunk)
+        for (size_t copy = 0; copy < copies; ++copy)
         {
+            const size_t offset = copies == 1 ? 0 : copy * stride_bytes;
             if (!backend->hostToDevice(
-                    static_cast<uint8_t *>(*d_dst) + chunk * stride_bytes,
-                    static_cast<const uint8_t *>(h_src) + chunk * stride_bytes,
-                    live_bytes,
+                    static_cast<uint8_t *>(*d_dst) + offset,
+                    static_cast<const uint8_t *>(h_src) + offset,
+                    copy_bytes,
                     cuda_device_id,
                     setup_stream))
             {
