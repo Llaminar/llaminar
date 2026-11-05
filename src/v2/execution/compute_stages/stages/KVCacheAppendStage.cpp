@@ -5,6 +5,8 @@
  * Anchored compressed caches own basis initialization and fused K/V encoding on
  * every backend. The stage passes original projections and live row geometry;
  * it must not quantize keys before the request-relative basis is applied.
+ * ISA-specific arithmetic belongs to those reusable codec/kernel authorities,
+ * not to this participant-local publication stage or its include surface.
  */
 
 #include "KVCacheAppendStage.h"
@@ -28,7 +30,6 @@
 #include "../../../tensors/GpuTensorView.h"
 #include "../../../backends/BackendManager.h"
 
-#include <immintrin.h>
 #include <cstring>
 #include <chrono>
 #include <algorithm>
