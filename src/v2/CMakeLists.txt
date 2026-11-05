@@ -1973,6 +1973,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     kernels/cpu/deepseek4/CPUDeepSeekV4Kernels.cpp
     execution/compute_stages/stages/deepseek4/DeepSeekV4PrimitiveStage.cpp
     models/deepseek4/DeepSeekV4Config.cpp
+    models/deepseek4/DeepSeekV4ImagePreprocess.cpp
     models/deepseek4/DeepSeekV4GraphConfigBuilder.cpp
     models/deepseek4/DeepSeekV4BufferLayout.cpp
     models/deepseek4/DeepSeekV4Graph.cpp
@@ -2067,6 +2068,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     utils/Sampler.cpp
     utils/Sha256.cpp
     utils/ChatTemplate.cpp
+    multimodal/ImageIO.cpp
     utils/DeepSeekV4ChatEncoding.cpp
     utils/PythonJson.cpp
     utils/ChatUI.cpp

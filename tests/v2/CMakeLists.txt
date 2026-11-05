@@ -8119,6 +8119,30 @@ add_v2_test(V2_Integration_DeepSeekV4ToolSectionInsideReasoning
     LABELS "V2;Integration;ProductionTestPreflight;HTTP;DeepSeekV4;Reasoning;ToolCalling;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
+# DeepSeek-V4 image admission equals Pillow (golden JSON embedded for installed runners).
+set(DSV4_IMAGE_GOLDEN_HEADER "${CMAKE_CURRENT_BINARY_DIR}/model-fixtures/DeepSeekV4ImageGolden.generated.h")
+add_custom_command(OUTPUT "${DSV4_IMAGE_GOLDEN_HEADER}"
+    COMMAND ${CMAKE_COMMAND}
+        -DJINJA_INPUT=${CMAKE_CURRENT_SOURCE_DIR}/unit/models/deepseek4/fixtures/deepseek_v4_image_preprocess_golden.json
+        -DHEADER_OUTPUT=${DSV4_IMAGE_GOLDEN_HEADER}
+        -DNAMESPACE=llaminar2::test::dsv4
+        -DSYMBOL=kImagePreprocessGolden
+        -DSOURCE_URL=scripts/deepseek4/make_image_preprocess_golden.py
+        -DLICENSE=AGPL-3.0
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/EmbedJinjaTemplate.cmake
+    DEPENDS unit/models/deepseek4/fixtures/deepseek_v4_image_preprocess_golden.json
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/EmbedJinjaTemplate.cmake
+    VERBATIM)
+add_executable(v2_test_deepseek4_image_preprocess unit/models/deepseek4/Test__DeepSeekV4ImagePreprocess.cpp "${DSV4_IMAGE_GOLDEN_HEADER}")
+target_include_directories(v2_test_deepseek4_image_preprocess PRIVATE
+    "${CMAKE_CURRENT_BINARY_DIR}/model-fixtures"
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
+target_link_libraries(v2_test_deepseek4_image_preprocess llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_DeepSeekV4ImagePreprocess
+    COMMAND $<TARGET_FILE:v2_test_deepseek4_image_preprocess>
+    LABELS "V2;Unit;DeepSeekV4;Vision;Multimodal"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+
 # Note: ArgParser tests removed - replaced by OrchestrationConfigParser tests
 
 # Test: NodeTopology (NUMA/socket topology detection for CPU tensor parallelism)
