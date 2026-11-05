@@ -137,7 +137,9 @@ void verify(int codebook, int payload_bytes, int m, int n, int k,
     const size_t weight_blocks = static_cast<size_t>(blocks) * n;
     int partitions = 0, waves = 0;
     const auto policy = static_cast<uint8_t>(
-        codebook == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook ? 4 :
+        // IQ4_XS-source and MXFP4 physical tuples share IQ4_NL's certified policy.
+        codebook == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook ||
+                codebook == llaminar2::kNativeVnniMXFP4Codebook ? 4 :
         codebook == llaminar2::kNativeVnniExpandedInt8MinCodebook ? 19 : codebook);
     ASSERT_TRUE(rocmGemv_native_vnni_query_serial_m1_config_with_policy(
         policy, n, k, &partitions, &waves));
