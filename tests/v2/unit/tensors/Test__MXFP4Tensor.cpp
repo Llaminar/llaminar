@@ -696,7 +696,11 @@ TEST(MXFP4ScalePlaneUpload, UploaderSubmitsExactLiveBytesAtTheCopyBoundary)
             {
                 const size_t offset = static_cast<size_t>(static_cast<uint8_t *>(dst) - device.data());
                 EXPECT_EQ(static_cast<const uint8_t *>(src), host.data() + offset) << "host/device offsets differ";
-                EXPECT_LE(offset + bytes, device.size());
+                if (offset > device.size() || bytes > device.size() - offset)
+                {
+                    ADD_FAILURE() << "copy [" << offset << ", +" << bytes << ") exceeds the allocation";
+                    return false;
+                }
                 submissions.push_back({offset, bytes});
                 std::memcpy(dst, src, bytes);
                 return true;
