@@ -17,6 +17,7 @@
 
 #include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 #include "kernels/common/NativeVnniScaleLoad.h"
+#include "kernels/common/NativeVnniPrimaryPlaneUpload.h"
 #include "tensors/MXFP4Format.h"
 #include "tensors/NativeVnniFormatInfo.h"
 #include "tensors/Tensors.h"
@@ -646,4 +647,112 @@ TEST(MXFP4ScalePlaneUpload, PlanTransfersExactLiveBytesForOddEvenAndWordPlanes)
     const auto odd = nativeVnniPrimaryPlaneUploadPlan(kNativeVnniMXFP4Codebook, 207, 1);
     EXPECT_EQ(odd.allocation_bytes, 208u);
     EXPECT_EQ(odd.transferredBytes(), 207u);
+}
+
+/**
+ * @test The production uploader body submits exactly the live primary-plane
+ * bytes at the copy boundary. Every CUDA/ROCm packed-weight uploader (dense
+ * CUDA, both dense ROCm branches, batched CUDA/ROCm) runs this body and
+ * supplies only its allocate/copy primitives, so recording those primitives
+ * observes the actual submitted offsets and lengths. The plan is not consulted
+ * by the assertions. Also covers the fail-fast storage mismatch and the
+ * ownership contract: memory is published before a failing copy, never freed
+ * by the body.
+ */
+TEST(MXFP4ScalePlaneUpload, UploaderSubmitsExactLiveBytesAtTheCopyBoundary)
+{
+    using llaminar2::kNativeVnniMXFP4Codebook;
+    using llaminar2::NativeVnniPrimaryPlaneUploadStatus;
+    struct Submission { size_t offset; size_t bytes; };
+    struct Case { uint8_t codebook; size_t blocks; size_t chunks; size_t capacity; size_t copied; };
+    // Capacity is the rounded word storage; copied is the live extent.
+    const Case cases[] = {
+        {kNativeVnniMXFP4Codebook, 207, 1, 208, 207},   // odd dense MXFP4
+        {kNativeVnniMXFP4Codebook, 208, 1, 208, 208},   // even dense MXFP4
+        {4, 207, 1, 414, 414},                          // 2-byte IQ4_NL control
+        {kNativeVnniMXFP4Codebook, 207, 5, 1040, 1035}, // odd batched layout
+        {0, 207, 5, 2070, 2070},                        // 2-byte batched control
+    };
+    for (const Case &c : cases)
+    {
+        SCOPED_TRACE(::testing::Message() << "codebook=" << int(c.codebook) << " blocks=" << c.blocks
+                                          << " chunks=" << c.chunks);
+        std::vector<uint8_t> host(c.capacity);
+        for (size_t i = 0; i < host.size(); ++i)
+            host[i] = static_cast<uint8_t>(i * 13 + 1);
+        std::vector<uint8_t> device;
+        std::vector<size_t> allocations;
+        std::vector<Submission> submissions;
+        void *published = nullptr;
+        const auto status = llaminar2::uploadNativeVnniPrimaryPlane(
+            c.codebook, c.blocks, c.chunks, host.data(), host.size(), &published,
+            [&](size_t bytes) -> void *
+            {
+                allocations.push_back(bytes);
+                device.assign(bytes, 0xa5);
+                return device.data();
+            },
+            [&](void *dst, const void *src, size_t bytes)
+            {
+                const size_t offset = static_cast<size_t>(static_cast<uint8_t *>(dst) - device.data());
+                EXPECT_EQ(static_cast<const uint8_t *>(src), host.data() + offset) << "host/device offsets differ";
+                EXPECT_LE(offset + bytes, device.size());
+                submissions.push_back({offset, bytes});
+                std::memcpy(dst, src, bytes);
+                return true;
+            });
+        ASSERT_EQ(status, NativeVnniPrimaryPlaneUploadStatus::Uploaded);
+        EXPECT_EQ(published, device.data());
+        ASSERT_EQ(allocations, std::vector<size_t>{c.capacity});
+        size_t total = 0;
+        for (const auto &submission : submissions)
+            total += submission.bytes;
+        EXPECT_EQ(total, c.copied) << "submitted bytes must equal the live extent";
+        // Every live byte landed; every unused storage byte stayed untouched.
+        const size_t live = c.blocks * llaminar2::nativeVnniScalePlaneBytes(c.codebook);
+        const size_t stride = c.capacity / c.chunks;
+        for (size_t chunk = 0; chunk < c.chunks; ++chunk)
+            for (size_t b = 0; b < stride; ++b)
+            {
+                const size_t at = chunk * stride + b;
+                EXPECT_EQ(device[at], b < live ? host[at] : uint8_t{0xa5}) << "chunk " << chunk << " byte " << b;
+            }
+    }
+
+    // Storage that does not match the plan is rejected before any allocation.
+    {
+        std::vector<uint8_t> host(414);
+        void *published = nullptr;
+        bool allocated = false;
+        EXPECT_THROW((void)llaminar2::uploadNativeVnniPrimaryPlane(
+                         kNativeVnniMXFP4Codebook, 207, 1, host.data(), host.size(), &published,
+                         [&](size_t) -> void * { allocated = true; return nullptr; },
+                         [](void *, const void *, size_t) { return true; }),
+                     std::runtime_error);
+        EXPECT_FALSE(allocated);
+    }
+    // A failing copy reports CopyFailed with the allocation already published.
+    {
+        std::vector<uint8_t> host(1040), device(1040);
+        void *published = nullptr;
+        int copies = 0;
+        EXPECT_EQ(llaminar2::uploadNativeVnniPrimaryPlane(
+                      kNativeVnniMXFP4Codebook, 207, 5, host.data(), host.size(), &published,
+                      [&](size_t) -> void * { return device.data(); },
+                      [&](void *, const void *, size_t) { return ++copies < 3; }),
+                  NativeVnniPrimaryPlaneUploadStatus::CopyFailed);
+        EXPECT_EQ(published, device.data());
+        EXPECT_EQ(copies, 3);
+    }
+    // Allocation failure publishes nothing.
+    {
+        std::vector<uint8_t> host(208);
+        void *published = reinterpret_cast<void *>(uintptr_t{1});
+        EXPECT_EQ(llaminar2::uploadNativeVnniPrimaryPlane(
+                      kNativeVnniMXFP4Codebook, 207, 1, host.data(), host.size(), &published,
+                      [](size_t) -> void * { return nullptr; },
+                      [](void *, const void *, size_t) { return true; }),
+                  NativeVnniPrimaryPlaneUploadStatus::AllocationFailed);
+        EXPECT_EQ(published, nullptr);
+    }
 }

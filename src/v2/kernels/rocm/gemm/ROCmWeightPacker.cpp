@@ -22,6 +22,7 @@
 #include "kernels/common/NativeEmbeddingIQTables.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "ROCmWeightPacker.h"
+#include "kernels/common/NativeVnniPrimaryPlaneUpload.h"
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "ROCmQuantisedGemmKernel.h"
@@ -483,36 +484,19 @@ namespace llaminar2
             return true;
         };
 
-        // Primary plane: execute the shared live-extent upload plan (word-aligned
-        // per-expert strides; an odd one-byte E8M0 plane never sends the unused
-        // storage byte after each expert).
+        // Primary plane: the shared uploader sends each expert's exact live
+        // extent (word-aligned per-expert strides; an odd one-byte E8M0 plane
+        // never sends the unused storage byte after each expert).
         auto uploadScales = [&](void **d_ptr) -> bool
         {
-            *d_ptr = nullptr;
-            const auto plan = nativeVnniPrimaryPlaneUploadPlan(
-                codebook_id, static_cast<size_t>(rows_per_expert) * blocks_per_row,
-                static_cast<size_t>(num_experts));
-            if (plan.allocation_bytes != all_native_scales.size() * sizeof(uint16_t))
-                throw std::runtime_error(
-                    "MoEBatchPackedWeightsROCm::uploadToDevice host primary plane does not match its upload plan");
-            if (plan.allocation_bytes == 0)
-                return true;
-            *d_ptr = backend->allocate(plan.allocation_bytes, rocm_device_id);
-            if (!*d_ptr)
-                return false;
-            for (size_t copy = 0; copy < plan.copies; ++copy)
-            {
-                if (!backend->hostToDevice(
-                        static_cast<uint8_t *>(*d_ptr) + plan.copyOffset(copy),
-                        reinterpret_cast<const uint8_t *>(all_native_scales.data()) + plan.copyOffset(copy),
-                        plan.copy_bytes, rocm_device_id, setup_stream))
-                {
-                    backend->free(*d_ptr, rocm_device_id);
-                    *d_ptr = nullptr;
-                    return false;
-                }
-            }
-            return true;
+            return uploadNativeVnniPrimaryPlane(
+                       codebook_id, static_cast<size_t>(rows_per_expert) * blocks_per_row,
+                       static_cast<size_t>(num_experts), all_native_scales.data(),
+                       all_native_scales.size() * sizeof(uint16_t), d_ptr,
+                       [&](size_t bytes) { return backend->allocate(bytes, rocm_device_id); },
+                       [&](void *dst, const void *src, size_t bytes)
+                       { return backend->hostToDevice(dst, src, bytes, rocm_device_id, setup_stream); }) ==
+                   NativeVnniPrimaryPlaneUploadStatus::Uploaded;
         };
 
         void *d_vnni = nullptr, *d_scales = nullptr, *d_mins = nullptr, *d_emins = nullptr;

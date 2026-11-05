@@ -7,6 +7,9 @@
  */
 
 #include "CUDAWeightPacker.h"
+#include "backends/BackendManager.h"
+#include "backends/GPUDeviceContextPool.h"
+#include "kernels/common/NativeVnniPrimaryPlaneUpload.h"
 
 #include "CUDAQuantisedGemmKernel.h"
 #include "CUDADeviceWorkspace.h"
@@ -222,9 +225,6 @@ namespace llaminar2::cuda
     extern "C"
     {
         bool cudaQuantGemm_uploadRawBytes(const void *h_src, void **d_dst, size_t bytes, int cuda_device_id);
-        bool cudaQuantGemm_uploadPlannedRawBytes(const void *h_src, void **d_dst, size_t allocation_bytes,
-                                                 size_t copies, size_t stride_bytes, size_t copy_bytes,
-                                                 int cuda_device_id);
         void cudaQuantGemm_freeDevice(void *d_ptr, int cuda_device_id);
     }
 
@@ -267,21 +267,25 @@ namespace llaminar2::cuda
             return true;
         };
 
-        // Primary plane: execute the shared live-extent upload plan.
+        // Primary plane: the shared uploader sends each expert's exact live extent.
         auto uploadScales = [&]() -> bool
         {
-            const auto plan = nativeVnniPrimaryPlaneUploadPlan(
-                codebook_id, static_cast<size_t>(rows_per_expert) * blocks_per_row,
-                static_cast<size_t>(num_experts));
-            if (plan.allocation_bytes != all_scales.size() * sizeof(uint16_t))
+            IBackend *const backend = getCUDABackend();
+            void *const setup_stream =
+                GPUDeviceContextPool::instance().getNvidiaContext(cuda_device_id).defaultStream();
+            if (!backend || !setup_stream)
                 throw std::runtime_error(
-                    "[MoEBatchPackedWeightsCUDA] Host primary plane does not match its upload plan");
+                    "[MoEBatchPackedWeightsCUDA] Upload has no CUDA backend or explicit setup stream");
             void *d_mem = nullptr;
-            const bool ok = cudaQuantGemm_uploadPlannedRawBytes(
-                all_scales.data(), &d_mem, plan.allocation_bytes, plan.copies,
-                plan.stride_bytes, plan.copy_bytes, cuda_device_id);
+            const auto status = uploadNativeVnniPrimaryPlane(
+                codebook_id, static_cast<size_t>(rows_per_expert) * blocks_per_row,
+                static_cast<size_t>(num_experts), all_scales.data(),
+                all_scales.size() * sizeof(uint16_t), &d_mem,
+                [&](size_t bytes) { return backend->allocate(bytes, cuda_device_id); },
+                [&](void *dst, const void *src, size_t bytes)
+                { return backend->hostToDevice(dst, src, bytes, cuda_device_id, setup_stream); });
             upload.d_scales = static_cast<uint16_t *>(d_mem);
-            return ok;
+            return status == NativeVnniPrimaryPlaneUploadStatus::Uploaded;
         };
 
         if (!uploadArray(all_vnni, &upload.d_vnni) ||
