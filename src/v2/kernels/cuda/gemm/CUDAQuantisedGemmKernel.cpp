@@ -63,6 +63,7 @@
 #include "tensors/TensorSlice.h"     // TensorSlice - for unwrapping sliced biases
 #include "tensors/BlockStructures.h" // Q8_1Block
 #include "tensors/KernelSnapshotInfo.h"
+#include "tensors/NativeVnniScalePlane.h"
 #include "transfer/TransferEngine.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/device/AlignedWorkspaceSlices.h"
@@ -815,8 +816,22 @@ namespace llaminar2
                 CUDAPackedWeights::DeviceUpload &upload,
                 int cuda_device_id)
             {
-                if (!uploadHostArrayToDevice(packed.native_vnni, &upload.d_native_vnni, cuda_device_id) ||
-                    !uploadHostArrayToDevice(packed.native_scales, &upload.d_native_scales, cuda_device_id) ||
+                // The primary plane transfers its exact live extent: an odd
+                // one-byte E8M0 plane leaves its last storage byte unused.
+                const size_t live_scale_bytes = nativeVnniScalePlaneLiveBytes(
+                    packed.native_codebook_id,
+                    static_cast<size_t>(packed.N) * packed.native_blocks_per_row);
+                if (live_scale_bytes > packed.native_scales.size() * sizeof(uint16_t))
+                {
+                    throw std::runtime_error(
+                        "[CUDAQuantGemm] Native-VNNI primary plane is smaller than its live extent");
+                }
+                void *d_scales = nullptr;
+                const bool scales_uploaded = cudaQuantGemm_uploadRawBytes(
+                    packed.native_scales.data(), &d_scales, live_scale_bytes, cuda_device_id);
+                upload.d_native_scales = static_cast<uint16_t *>(d_scales);
+                if (!scales_uploaded ||
+                    !uploadHostArrayToDevice(packed.native_vnni, &upload.d_native_vnni, cuda_device_id) ||
                     !uploadHostArrayToDevice(packed.native_mins, &upload.d_native_mins, cuda_device_id) ||
                     !uploadHostArrayToDevice(packed.native_emins, &upload.d_native_emins, cuda_device_id))
                 {

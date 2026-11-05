@@ -2836,6 +2836,12 @@ add_v2_test(V2_Unit_PackedWeightsSerialization
     LABELS "V2;Unit;Kernels;Serialization;PackedWeights;MoE"
     MPI_PROCS 1
 )
+# Native MXFP4 tier reference: exact byte plane <-> BF16 unit words, odd counts, malformed words.
+add_v2_test(V2_Integration_MXFP4TierReferenceRoundTrip
+    COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
+        --gtest_filter=ExpertTierWeightStream.MXFP4NativeE8M0PlaneRoundTripsOddCountsAndRejectsMalformedWords:*EveryCpuPreparedEncoding*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;MXFP4;Transfer;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
 # CPU packed-weight archive ABI 8: native MXFP4 unit scale words are BF16 powers of two.
 add_v2_test(V2_Integration_MXFP4PackedWeightsArchiveABI
     COMMAND $<TARGET_FILE:v2_unit_packed_weights_serialization>

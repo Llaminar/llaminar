@@ -578,12 +578,14 @@ namespace llaminar2
          * @param payload Device payload owner.
          * @param scales Device scale owner.
          * @param mins Optional device minimum/secondary-scale owner.
+         * @param scales_bytes Exact live primary-plane bytes (storage may round up).
          * @return Exact-capacity source view.
          */
         ExpertTierGpuConstProjectionView makeConstView(
             const TestCUDABuffer<std::uint8_t> &payload,
             const TestCUDABuffer<std::uint16_t> &scales,
-            const TestCUDABuffer<std::uint16_t> &mins)
+            const TestCUDABuffer<std::uint16_t> &mins,
+            std::size_t scales_bytes)
         {
             return ExpertTierGpuConstProjectionView{
                 .payload = payload.data(),
@@ -591,7 +593,7 @@ namespace llaminar2
                 .mins = mins.data(),
                 .emins = nullptr,
                 .payload_bytes = payload.bytes(),
-                .scales_bytes = scales.bytes(),
+                .scales_bytes = scales_bytes,
                 .mins_bytes = mins.bytes(),
                 .emins_bytes = 0,
             };
@@ -602,12 +604,14 @@ namespace llaminar2
          * @param payload Device payload owner.
          * @param scales Device scale owner.
          * @param mins Optional device minimum/secondary-scale owner.
+         * @param scales_bytes Exact live primary-plane bytes (storage may round up).
          * @return Exact-capacity destination view.
          */
         ExpertTierGpuMutableProjectionView makeMutableView(
             TestCUDABuffer<std::uint8_t> &payload,
             TestCUDABuffer<std::uint16_t> &scales,
-            TestCUDABuffer<std::uint16_t> &mins)
+            TestCUDABuffer<std::uint16_t> &mins,
+            std::size_t scales_bytes)
         {
             return ExpertTierGpuMutableProjectionView{
                 .payload = payload.data(),
@@ -615,7 +619,7 @@ namespace llaminar2
                 .mins = mins.data(),
                 .emins = nullptr,
                 .payload_bytes = payload.bytes(),
-                .scales_bytes = scales.bytes(),
+                .scales_bytes = scales_bytes,
                 .mins_bytes = mins.bytes(),
                 .emins_bytes = 0,
             };
@@ -913,7 +917,7 @@ namespace llaminar2
             ASSERT_EQ(source_scales.upload(source.scales), cudaSuccess);
             ASSERT_EQ(source_mins.upload(source.mins), cudaSuccess);
             const auto source_view =
-                makeConstView(source_payload, source_scales, source_mins);
+                makeConstView(source_payload, source_scales, source_mins, source.scaleLiveBytes());
             ASSERT_TRUE(source_view.validFor(layout));
 
             const std::size_t maximum_chunk_bytes = layout.chunkBytes(2);
@@ -971,7 +975,7 @@ namespace llaminar2
             TestCUDABuffer<std::uint16_t> destination_scales(source.scales.size());
             TestCUDABuffer<std::uint16_t> destination_mins(source.mins.size());
             auto destination_view = makeMutableView(
-                destination_payload, destination_scales, destination_mins);
+                destination_payload, destination_scales, destination_mins, source.scaleLiveBytes());
             ASSERT_TRUE(destination_view.validFor(promotion_layout));
             EXPECT_FALSE(launchCpuToGpuExpertTierChunkCUDA(
                 device_cpu_chunk.data(), device_cpu_chunk.bytes(),
@@ -1095,7 +1099,7 @@ namespace llaminar2
                     .mins = source_mins.data(),
                     .emins = source_emins.data(),
                     .payload_bytes = source_payload.bytes(),
-                    .scales_bytes = source_scales.bytes(),
+                    .scales_bytes = source.scaleLiveBytes(),
                     .mins_bytes = source_mins.bytes(),
                     .emins_bytes = source_emins.bytes(),
                 };
@@ -1188,7 +1192,7 @@ namespace llaminar2
             ASSERT_EQ(source_payload.upload(source.payload), cudaSuccess);
             ASSERT_EQ(source_scales.upload(source.scales), cudaSuccess);
             const auto source_view =
-                makeConstView(source_payload, source_scales, source_mins);
+                makeConstView(source_payload, source_scales, source_mins, source.scaleLiveBytes());
 
             IBackend *backend = getCUDABackend();
             ASSERT_NE(backend, nullptr);
@@ -1255,7 +1259,8 @@ namespace llaminar2
             auto destination_view = makeMutableView(
                 destination_payload,
                 destination_scales,
-                destination_mins);
+                destination_mins,
+                source.scaleLiveBytes());
             ASSERT_TRUE(lane.startCpuToGpu(
                 promotion_layout,
                 expected_cpu.native_interleaved,
@@ -1355,7 +1360,7 @@ namespace llaminar2
                 .mins = source_mins.data(),
                 .emins = source_emins.data(),
                 .payload_bytes = source_payload.bytes(),
-                .scales_bytes = source_scales.bytes(),
+                .scales_bytes = source.scaleLiveBytes(),
                 .mins_bytes = source_mins.bytes(),
                 .emins_bytes = source_emins.bytes(),
             };
@@ -1711,7 +1716,7 @@ namespace llaminar2
                 .is_asymmetric = expected_gpu.is_asymmetric,
                 .has_emins = expected_gpu.has_emins,
                 .vnni_bytes = destination_payload.bytes(),
-                .scales_bytes = destination_scales.bytes(),
+                .scales_bytes = expected_gpu.scaleLiveBytes(),
                 .mins_bytes = destination_mins.bytes(),
                 .emins_bytes = destination_emins.bytes(),
             };
@@ -2704,7 +2709,7 @@ namespace llaminar2
             TestCUDABuffer<std::uint16_t> mins(source.mins.size());
             ASSERT_EQ(payload.upload(source.payload), cudaSuccess);
             ASSERT_EQ(scales.upload(source.scales), cudaSuccess);
-            const auto source_view = makeConstView(payload, scales, mins);
+            const auto source_view = makeConstView(payload, scales, mins, source.scaleLiveBytes());
 
             std::vector<std::int8_t> host_activation(
                 static_cast<std::size_t>(source.K), 1);
@@ -2916,7 +2921,7 @@ namespace llaminar2
             TestCUDABuffer<std::uint16_t> mins(source.mins.size());
             ASSERT_EQ(payload.upload(source.payload), cudaSuccess);
             ASSERT_EQ(scales.upload(source.scales), cudaSuccess);
-            const auto source_view = makeConstView(payload, scales, mins);
+            const auto source_view = makeConstView(payload, scales, mins, source.scaleLiveBytes());
 
             IBackend *backend = getCUDABackend();
             ASSERT_NE(backend, nullptr);
@@ -3139,9 +3144,9 @@ namespace llaminar2
             ASSERT_EQ(input_payload.upload(source.payload),cudaSuccess);
             ASSERT_EQ(input_scales.upload(source.scales),cudaSuccess);ASSERT_EQ(input_coeff.upload(source.mins),cudaSuccess);
             ExpertTierGpuConstProjectionView in{.payload=input_payload.data(),.scales=input_scales.data(),.mins=input_coeff.data(),
-                .payload_bytes=input_payload.bytes(),.scales_bytes=input_scales.bytes(),.mins_bytes=input_coeff.bytes()};
+                .payload_bytes=input_payload.bytes(),.scales_bytes = source.scaleLiveBytes(),.mins_bytes=input_coeff.bytes()};
             ExpertTierGpuMutableProjectionView out{.payload=destination_payload.data(),.scales=destination_scales.data(),.mins=destination_coeff.data(),
-                .payload_bytes=destination_payload.bytes(),.scales_bytes=destination_scales.bytes(),.mins_bytes=destination_coeff.bytes()};
+                .payload_bytes=destination_payload.bytes(),.scales_bytes = source.scaleLiveBytes(),.mins_bytes=destination_coeff.bytes()};
             ASSERT_TRUE(in.validFor(demotion));ASSERT_TRUE(out.validFor(promotion));
             std::vector<std::uint8_t> observed_cpu(chunk.bytes()),observed_payload(source.payload.size());
             std::vector<std::uint16_t> observed_scales(source.scales.size()),observed_coeff(source.mins.size());

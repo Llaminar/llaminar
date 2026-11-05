@@ -429,6 +429,71 @@ extern "C"
     }
 
     /**
+     * @brief Allocate a chunked slab and upload only each chunk's live prefix.
+     *
+     * Batched expert planes keep word-aligned per-expert strides; an odd
+     * one-byte E8M0 plane therefore has one storage byte per expert that holds
+     * no block. Only the live bytes cross the bus (one copy when the stride is
+     * exact); the unused device bytes are never read.
+     *
+     * @param h_src Host slab of @p chunks * @p stride_bytes bytes.
+     * @param d_dst Receives the device slab of the same capacity.
+     * @param chunks Number of chunks (experts).
+     * @param stride_bytes Per-chunk storage stride.
+     * @param live_bytes Per-chunk live prefix, at most @p stride_bytes.
+     * @param cuda_device_id Destination device.
+     */
+    bool cudaQuantGemm_uploadChunkedRawBytes(
+        const void *h_src,
+        void **d_dst,
+        size_t chunks,
+        size_t stride_bytes,
+        size_t live_bytes,
+        int cuda_device_id)
+    {
+        *d_dst = nullptr;
+        if (live_bytes > stride_bytes)
+            throw std::runtime_error(
+                "[CUDAQuantGemm] Chunked upload live extent exceeds its stride");
+        if (chunks == 0 || stride_bytes == 0)
+            return true;
+        if (live_bytes == stride_bytes)
+            return cudaQuantGemm_uploadRawBytes(h_src, d_dst, chunks * stride_bytes, cuda_device_id);
+        auto *backend = llaminar2::getCUDABackend();
+        if (!backend)
+            return false;
+        *d_dst = backend->allocate(chunks * stride_bytes, cuda_device_id);
+        if (!*d_dst)
+            return false;
+        void *const setup_stream =
+            llaminar2::GPUDeviceContextPool::instance()
+                .getNvidiaContext(cuda_device_id)
+                .defaultStream();
+        if (!setup_stream)
+        {
+            backend->free(*d_dst, cuda_device_id);
+            *d_dst = nullptr;
+            throw std::runtime_error(
+                "[CUDAQuantGemm] Packed-weight upload has no explicit setup stream");
+        }
+        for (size_t chunk = 0; chunk < chunks; ++chunk)
+        {
+            if (!backend->hostToDevice(
+                    static_cast<uint8_t *>(*d_dst) + chunk * stride_bytes,
+                    static_cast<const uint8_t *>(h_src) + chunk * stride_bytes,
+                    live_bytes,
+                    cuda_device_id,
+                    setup_stream))
+            {
+                backend->free(*d_dst, cuda_device_id);
+                *d_dst = nullptr;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
      * @brief Allocate and upload setup-owned packed weights through the backend.
      */
     bool cudaQuantGemm_uploadRawBytes(

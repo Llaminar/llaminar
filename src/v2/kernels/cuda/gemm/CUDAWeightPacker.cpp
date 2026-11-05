@@ -222,6 +222,8 @@ namespace llaminar2::cuda
     extern "C"
     {
         bool cudaQuantGemm_uploadRawBytes(const void *h_src, void **d_dst, size_t bytes, int cuda_device_id);
+        bool cudaQuantGemm_uploadChunkedRawBytes(const void *h_src, void **d_dst, size_t chunks,
+                                                 size_t stride_bytes, size_t live_bytes, int cuda_device_id);
         void cudaQuantGemm_freeDevice(void *d_ptr, int cuda_device_id);
     }
 
@@ -264,8 +266,22 @@ namespace llaminar2::cuda
             return true;
         };
 
+        // Primary plane: transfer each expert's exact live extent.
+        auto uploadScales = [&]() -> bool
+        {
+            void *d_mem = nullptr;
+            const bool ok = cudaQuantGemm_uploadChunkedRawBytes(
+                all_scales.data(), &d_mem, static_cast<size_t>(num_experts),
+                scales_per_expert * sizeof(uint16_t),
+                nativeVnniScalePlaneLiveBytes(
+                    codebook_id, static_cast<size_t>(rows_per_expert) * blocks_per_row),
+                cuda_device_id);
+            upload.d_scales = static_cast<uint16_t *>(d_mem);
+            return ok;
+        };
+
         if (!uploadArray(all_vnni, &upload.d_vnni) ||
-            !uploadArray(all_scales, &upload.d_scales) ||
+            !uploadScales() ||
             !uploadArray(all_mins, &upload.d_mins) ||
             !uploadArray(all_emins, &upload.d_emins))
         {

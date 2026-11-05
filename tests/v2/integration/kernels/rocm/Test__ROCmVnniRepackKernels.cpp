@@ -2197,7 +2197,10 @@ TEST_F(Test__VnniRepackKernels, MXFP4_ExactScalesCodesZeroBlocksOffsetsAndReplay
         for (size_t index = 0; index < source_blocks; ++index)
         {
             uint8_t *block = original.data() + index * kBlock;
-            block[0] = static_cast<uint8_t>(llaminar2::mxfp4::kMinExactFP16Exponent + (index + pass * 7) % 40);
+            // Every native exponent [2, 252] (one E8M0 byte per block in the plane).
+            block[0] = static_cast<uint8_t>(llaminar2::mxfp4::kMinNormalFP32Exponent +
+                (index + pass * 7) % (llaminar2::mxfp4::kMaxNativeE8M0Exponent -
+                                      llaminar2::mxfp4::kMinNormalFP32Exponent + 1));
             for (int byte = 0; byte < 16; ++byte)
                 block[1 + byte] = static_cast<uint8_t>((index * 16 + byte) * 37u + pass * 11u);
             // Pass 0 and pass 1 zero disjoint block sets.
@@ -2213,7 +2216,10 @@ TEST_F(Test__VnniRepackKernels, MXFP4_ExactScalesCodesZeroBlocksOffsetsAndReplay
     // The device source is the unaligned byte stream itself (no 18-byte struct).
     GpuBuffer<uint8_t> d_source(source_blocks * kBlock);
     GpuBuffer<uint8_t> d_payload(count * 16);
-    GpuBuffer<uint16_t> d_scales(count);
+    // The 1-byte plane lives in 16-bit storage words; one guard byte follows when count is odd.
+    const size_t scale_words = llaminar2::nativeVnniScalePlaneStorageWords(
+        llaminar2::kNativeVnniMXFP4Codebook, count) + 1;
+    GpuBuffer<uint16_t> d_scales(scale_words);
     Q6RepackObservationJoin observation(hip_stream_);
     std::vector<uint8_t> previous;
     for (const int pass : {0, 1})
@@ -2223,7 +2229,7 @@ TEST_F(Test__VnniRepackKernels, MXFP4_ExactScalesCodesZeroBlocksOffsetsAndReplay
         ASSERT_EQ(hipMemcpyAsync(d_source.ptr, original.data(), original.size(),
             hipMemcpyHostToDevice, hip_stream_), hipSuccess);
         ASSERT_EQ(hipMemsetAsync(d_payload.ptr, 0x5a, count * 16, hip_stream_), hipSuccess);
-        ASSERT_EQ(hipMemsetAsync(d_scales.ptr, 0x5a, count * sizeof(uint16_t), hip_stream_), hipSuccess);
+        ASSERT_EQ(hipMemsetAsync(d_scales.ptr, 0x5a, scale_words * sizeof(uint16_t), hip_stream_), hipSuccess);
         const int split = pass == 0 ? 31 : 17;
         for (const int begin : {0, split})
         {
@@ -2234,10 +2240,10 @@ TEST_F(Test__VnniRepackKernels, MXFP4_ExactScalesCodesZeroBlocksOffsetsAndReplay
                 rows, K, output_N, output_first + begin, producerStream()));
         }
         std::vector<uint8_t> payload(count * 16);
-        std::vector<uint16_t> scales(count);
+        std::vector<uint8_t> scales(scale_words * sizeof(uint16_t));
         ASSERT_EQ(hipMemcpyAsync(payload.data(), d_payload.ptr, payload.size(),
             hipMemcpyDeviceToHost, hip_stream_), hipSuccess);
-        ASSERT_EQ(hipMemcpyAsync(scales.data(), d_scales.ptr, count * sizeof(uint16_t),
+        ASSERT_EQ(hipMemcpyAsync(scales.data(), d_scales.ptr, scales.size(),
             hipMemcpyDeviceToHost, hip_stream_), hipSuccess);
         ASSERT_EQ(hipStreamSynchronize(hip_stream_), hipSuccess);
         size_t zero_blocks = 0, flipped_to_zero = 0;
@@ -2248,7 +2254,7 @@ TEST_F(Test__VnniRepackKernels, MXFP4_ExactScalesCodesZeroBlocksOffsetsAndReplay
                 SCOPED_TRACE(::testing::Message() << "block=" << block << " row=" << row);
                 if (row < output_first || row >= output_first + N)
                 {
-                    EXPECT_EQ(scales[at], 0x5a5a);
+                    EXPECT_EQ(scales[at], 0x5a);
                     for (int byte = 0; byte < 16; ++byte)
                         EXPECT_EQ(payload[at * 16 + byte], 0x5a);
                     continue;
@@ -2256,16 +2262,19 @@ TEST_F(Test__VnniRepackKernels, MXFP4_ExactScalesCodesZeroBlocksOffsetsAndReplay
                 const size_t source_offset =
                     (static_cast<size_t>(source_first + row - output_first) * blocks_per_row + block) * kBlock;
                 const uint8_t *source = original.data() + source_offset;
-                ASSERT_TRUE(llaminar2::mxfp4::blockFitsFP16(source[0], source + 1));
-                const bool exact = llaminar2::mxfp4::exponentFitsFP16(source[0]);
+                ASSERT_TRUE(llaminar2::mxfp4::blockFitsNativeE8M0(source[0], source + 1));
+                const bool exact = llaminar2::mxfp4::exponentFitsNativeE8M0(source[0]);
                 zero_blocks += exact ? 0u : 1u;
                 if (!exact && !previous.empty() &&
-                    llaminar2::mxfp4::exponentFitsFP16(previous[source_offset]))
+                    llaminar2::mxfp4::exponentFitsNativeE8M0(previous[source_offset]))
                     ++flipped_to_zero;
-                EXPECT_EQ(scales[at], exact ? llaminar2::mxfp4::scaleFP16Bits(source[0]) : uint16_t{0});
+                EXPECT_EQ(scales[at], exact ? source[0] : uint8_t{0});
                 EXPECT_EQ(std::memcmp(payload.data() + at * 16, source + 1, 16), 0);
             }
         EXPECT_GT(zero_blocks, 0u) << "fixture must exercise ggml zero blocks";
+        // Nothing beyond the count plane bytes is written.
+        for (size_t byte = count; byte < scales.size(); ++byte)
+            EXPECT_EQ(scales[byte], 0x5a) << "guard byte " << byte;
         if (pass == 1)
             EXPECT_GT(flipped_to_zero, 0u) << "replay must turn previously nonzero blocks into zero blocks";
         previous = original;

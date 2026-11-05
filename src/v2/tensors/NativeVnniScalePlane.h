@@ -99,6 +99,19 @@ namespace llaminar2
     }
 
     /**
+     * @brief Exact live bytes of a primary plane holding @p block_count blocks.
+     *
+     * This is the transfer and device-view length. The storage-word count above
+     * is host capacity only: for an odd 1-byte plane it includes one byte that
+     * belongs to no block and must never be transferred.
+     */
+    LLAMINAR_NVNNI_PLANE_HD constexpr std::size_t nativeVnniScalePlaneLiveBytes(
+        std::uint8_t physical_codebook, std::size_t block_count) noexcept
+    {
+        return block_count * nativeVnniScalePlaneBytes(physical_codebook);
+    }
+
+    /**
      * @brief Exact byte extents of one prepared matrix's metadata planes.
      * @param block_count Number of 32-value blocks (rows * K / 32).
      * @param physical_codebook Execution codebook selecting the primary width.

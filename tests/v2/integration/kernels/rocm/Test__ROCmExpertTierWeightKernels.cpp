@@ -1242,7 +1242,7 @@ namespace llaminar2
                     .mins = source_mins.data(),
                     .emins = source_emins.data(),
                     .payload_bytes = source_payload.bytes(),
-                    .scales_bytes = source_scales.bytes(),
+                    .scales_bytes = source.scaleLiveBytes(),
                     .mins_bytes = source_mins.bytes(),
                     .emins_bytes = source_emins.bytes(),
                 };
@@ -1342,7 +1342,7 @@ namespace llaminar2
                     .mins = destination_mins.data(),
                     .emins = destination_emins.data(),
                     .payload_bytes = destination_payload.bytes(),
-                    .scales_bytes = destination_scales.bytes(),
+                    .scales_bytes = expected_gpu.scaleLiveBytes(),
                     .mins_bytes = destination_mins.bytes(),
                     .emins_bytes = destination_emins.bytes(),
                 };
@@ -1465,7 +1465,7 @@ namespace llaminar2
                 .mins = source_mins.data(),
                 .emins = source_emins.data(),
                 .payload_bytes = source_payload.bytes(),
-                .scales_bytes = source_scales.bytes(),
+                .scales_bytes = source.scaleLiveBytes(),
                 .mins_bytes = source_mins.bytes(),
                 .emins_bytes = source_emins.bytes(),
             };
@@ -1543,7 +1543,7 @@ namespace llaminar2
                 .mins = destination_mins.data(),
                 .emins = destination_emins.data(),
                 .payload_bytes = destination_payload.bytes(),
-                .scales_bytes = destination_scales.bytes(),
+                .scales_bytes = expected_gpu.scaleLiveBytes(),
                 .mins_bytes = destination_mins.bytes(),
                 .emins_bytes = destination_emins.bytes(),
             };
@@ -1805,7 +1805,7 @@ namespace llaminar2
                 .mins = source_mins.data(),
                 .emins = source_emins.data(),
                 .payload_bytes = source_payload.bytes(),
-                .scales_bytes = source_scales.bytes(),
+                .scales_bytes = source.scaleLiveBytes(),
                 .mins_bytes = source_mins.bytes(),
                 .emins_bytes = source_emins.bytes(),
             };
@@ -2163,7 +2163,7 @@ namespace llaminar2
                 .is_asymmetric = expected_gpu.is_asymmetric,
                 .has_emins = expected_gpu.has_emins,
                 .vnni_bytes = destination_payload.bytes(),
-                .scales_bytes = destination_scales.bytes(),
+                .scales_bytes = expected_gpu.scaleLiveBytes(),
                 .mins_bytes = destination_mins.bytes(),
                 .emins_bytes = destination_emins.bytes(),
             };
@@ -2858,7 +2858,7 @@ namespace llaminar2
                 .mins = mins.data(),
                 .emins = emins.data(),
                 .payload_bytes = payload.bytes(),
-                .scales_bytes = scales.bytes(),
+                .scales_bytes = source.scaleLiveBytes(),
                 .mins_bytes = mins.bytes(),
                 .emins_bytes = emins.bytes(),
             };
@@ -3068,7 +3068,7 @@ namespace llaminar2
                 .mins = mins.data(),
                 .emins = emins.data(),
                 .payload_bytes = payload.bytes(),
-                .scales_bytes = scales.bytes(),
+                .scales_bytes = source.scaleLiveBytes(),
                 .mins_bytes = mins.bytes(),
                 .emins_bytes = emins.bytes(),
             };
@@ -3295,9 +3295,9 @@ namespace llaminar2
             ASSERT_EQ(input_payload.upload(source.payload),hipSuccess);
             ASSERT_EQ(input_scales.upload(source.scales),hipSuccess);ASSERT_EQ(input_coeff.upload(source.mins),hipSuccess);
             ExpertTierGpuConstProjectionView in{.payload=input_payload.data(),.scales=input_scales.data(),.mins=input_coeff.data(),
-                .payload_bytes=input_payload.bytes(),.scales_bytes=input_scales.bytes(),.mins_bytes=input_coeff.bytes()};
+                .payload_bytes=input_payload.bytes(),.scales_bytes = source.scaleLiveBytes(),.mins_bytes=input_coeff.bytes()};
             ExpertTierGpuMutableProjectionView out{.payload=destination_payload.data(),.scales=destination_scales.data(),.mins=destination_coeff.data(),
-                .payload_bytes=destination_payload.bytes(),.scales_bytes=destination_scales.bytes(),.mins_bytes=destination_coeff.bytes()};
+                .payload_bytes=destination_payload.bytes(),.scales_bytes = source.scaleLiveBytes(),.mins_bytes=destination_coeff.bytes()};
             ASSERT_TRUE(in.validFor(demotion));ASSERT_TRUE(out.validFor(promotion));
             std::vector<std::uint8_t> observed_cpu(chunk.bytes()),observed_payload(source.payload.size());
             std::vector<std::uint16_t> observed_scales(source.scales.size()),observed_coeff(source.mins.size());
