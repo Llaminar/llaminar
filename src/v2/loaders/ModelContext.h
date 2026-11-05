@@ -232,11 +232,18 @@ namespace qwen4exp {class PooledImmutableRetainedParticipants;}
             std::span<const ImmutableRowTableDevicePreparation> uploads,
             const TransferEngine &transfers);
 
-        /** @brief Retain the original cold source-preparation authority before any table owner exists. */
         /** @brief Retain exactly one final same-PMA CPU service binding; repeated identical publication is idempotent. */
         void bindRetainedHostServices(std::shared_ptr<const RetainedHostServiceDeclarations>,std::shared_ptr<PhysicalMemoryAuthority>,std::span<const RetainedHostServiceInstance>)override;
-        /** @brief Move one exact selected role to its sole consumer. */
-        RetainedHostServiceUseToken takeRetainedHostService(PhysicalMemoryAllocatorIdentity,RetainedHostServiceRole,const std::shared_ptr<PhysicalMemoryAuthority>&)override;
+        /** @brief Exclusively lend the original retained worker; never re-claim its one-shot PMA key.
+         * @param consumer Exact original rank/device consumer selected at admission.
+         * @param role Original independently progressing CPU service role.
+         * @param memory Same admitted PMA object and shared ownership control block.
+         * @return Exclusive idle execution borrow retaining the original worker/program/PMA.
+         * @throws std::logic_error For foreign, absent, consumed, busy or concurrently borrowed instances.
+         * @throws std::exception If first native materialization fails; failure stays consumed.
+         */
+        RetainedHostServiceBorrow borrowRetainedHostService(PhysicalMemoryAllocatorIdentity consumer,RetainedHostServiceRole role,const std::shared_ptr<PhysicalMemoryAuthority>& memory)override;
+        /** @brief Retain the original cold source-preparation authority before any table owner exists. */
         void bindNativeContextPreparation(std::shared_ptr<NativeContextPreparation>);
         /** @return Same original source authority for factory-to-loader typed worker handoff. */
         std::shared_ptr<NativeContextPreparation> nativeContextPreparation() const;
@@ -408,8 +415,8 @@ namespace qwen4exp {class PooledImmutableRetainedParticipants;}
         std::shared_ptr<const RetainedHostServiceDeclarations> host_service_declarations_;
         std::shared_ptr<PhysicalMemoryAuthority> host_service_memory_;
         std::vector<RetainedHostServiceInstance> host_service_selected_;
-        std::shared_ptr<RetainedHostServiceBinding> host_service_binding_; ///< Original admitted tokens, never a second byte ledger.
         std::shared_ptr<NativeContextPreparation> native_context_preparation_; ///< Original same-PMA selected worker owner, never a second resource ledger.
+        std::shared_ptr<RetainedHostServiceBinding> host_service_binding_; ///< Destroy/join retained workers before the original native source; PMA remains sole byte ledger.
         mutable std::mutex immutable_row_table_mutex_;
         std::condition_variable immutable_row_table_ready_;
         std::map<DeviceId, ImmutableRowPreparation> immutable_row_table_preparations_;

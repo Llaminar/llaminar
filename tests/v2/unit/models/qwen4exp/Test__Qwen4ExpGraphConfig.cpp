@@ -12,6 +12,11 @@
 #include "models/qwen4exp/Qwen4ExpGraphConfigBuilder.h"
 #include "models/qwen4exp/Qwen4ExpSchema.h"
 #include "models/GraphTypes.h"
+#include "execution/config/RuntimeConfig.h"
+#include "execution/runner/PreparedWeightAuthorityIdentity.h"
+#include "planning/ImmutableRowTablePlacementPlanner.h"
+#include "memory/CPUSerialExpertStorageLayout.h"
+#include "../../../fixtures/execution/RetainedHostServiceReplayAccess.h"
 #include "models/TerminalInputWeights.h"
 #include "tensors/Tensors.h"
 #include <gtest/gtest.h>
@@ -324,6 +329,135 @@ TEST(Qwen4ExpGraphConfig, AttentionDefaultGraphBindsOnlyItsAdmittedParticipant)
     EXPECT_EQ(gdn_only.attention_arithmetic, A::FixedFP32);
     gdn_only.n_layers = 4;
     EXPECT_THROW(gdn_only.bindAdmittedQwenSparseAttentionProgram({}), std::invalid_argument);
+}
+
+/** @test Complete retained admission selects original CPU I/O and QSA programs without replacing active request state. */
+TEST(Qwen4ExpGraphConfig, RetainedAdmittedRuntimePreservesOriginalProgramsAndFactoryGuards)
+{
+    using namespace qwen4exp;
+    using A=QwenSparseAttentionArithmetic;
+    using S=QwenSparseAttentionPhaseSchedule;
+    for(const auto backend:{DeviceType::CPU,DeviceType::CUDA,DeviceType::ROCm})
+    {
+        const QwenSparseAttentionResolvedPolicy policy=backend==DeviceType::ROCm
+            ? QwenSparseAttentionResolvedPolicy{A::TileFP16WithFP32Totals,S::Prefill8Decode33}
+            : QwenSparseAttentionResolvedPolicy{A::FixedFP32,S::Uniform};
+        const std::vector<DeviceId> devices=backend==DeviceType::CPU
+            ? std::vector<DeviceId>{DeviceId::cpu()}
+            : std::vector<DeviceId>{{backend,0},{backend,1}};
+        std::vector<QwenSparseAttentionParticipantProgram> programs;
+        for(const auto device:devices)programs.emplace_back(device,policy,7,10);
+        RuntimeConfig prepared;
+        prepared.attention_participants=sealQwenSparseAttentionParticipants(std::move(programs));
+        prepared.resident_graph_rows=16;
+        prepared.moe_routed_prefill.overlay_segment_rows=8;
+        prepared.ngram_table_policy.storage=ImmutableRowStoragePreference::RAM;
+        const PhysicalMemoryResource host{0,DeviceId::cpu(),64u<<20,64u<<20};
+        std::vector<PhysicalMemoryResource> consumers;
+        PhysicalMemoryPlanBuilder frozen;
+        for(const auto device:devices){
+            consumers.push_back({0,device,64u<<20,64u<<20});
+            frozen.add(consumers.back(),PhysicalMemoryOwner::PrimaryModelWeights,1u);
+        }
+        const auto input=ImmutableRowTablePlacementInput::forConsumers(
+            ImmutableRowTableExtent::fromNative(GGUFTensorType::IQ4_NL,32,90),host,consumers);
+        prepared.ngram_table_placement=ImmutableRowTablePlacementPlanner::select(
+            prepared.ngram_table_policy,input,frozen.build(),{}).placement;
+        RetainedHostServiceDeclarations::Builder services(0);
+        for(const auto device:devices)
+            services.add({0,device,RetainedHostServiceRole::ImmutableLookupIO},
+                RetainedHostServiceReplayAccess::program(RetainedHostServiceRole::ImmutableLookupIO));
+        prepared.retained_host_services=std::move(services).freeze();
+        const auto cpu_envelope=std::make_shared<const CPUSerialExpertStorageEnvelope>(
+            DeviceId::cpu(),16,2,64,2,std::vector<int>{8,16},8,2,false,CPUSerialExpertFamilyPolicy::LocalPowerOfTwo);
+        const auto cpu_storage=std::make_shared<const CPUSerialExpertStorageAdmission>(CPUSerialExpertStorageAdmission{
+            .allocator={0,DeviceId::cpu()},.participant_ids={3},.controller_devices={DeviceId::cpu()},.envelope=cpu_envelope});
+        EXPECT_GT(cpu_storage->physicalBytes(),0u);
+        prepared.cpu_serial_expert_storage={cpu_storage};
+        RuntimeConfig reused;
+        reused.ngram_table_policy=prepared.ngram_table_policy;
+        reused.mtp.enabled=true;reused.mtp.draft_tokens=1;reused.mtp.graph_capacity_draft_tokens=3;
+        reused.max_seq_len=777;reused.prefix_cache.enabled=true;
+        reused.activation_precision=ActivationPrecision::BF16;
+        EXPECT_FALSE(reused.attention_participants);
+        // Original second failure: declared I/O roles cannot select without
+        // their final source-selected placement, even when weights were reused.
+        EXPECT_THROW(prepared.retained_host_services->selectedForLookup(reused.ngram_table_placement.get()),std::logic_error);
+        for(const auto device:devices)
+        {
+            SCOPED_TRACE(device.toString());
+            GraphConfig graph;
+            graph.default_device=device;
+            Qwen4ExpGraphConfigBuilder::populateFromDirectory(qwen4MetadataFixture(false),graph);
+            graph.pp_layer_offset=7;graph.n_layers=4;
+            graph.max_request_count=1;graph.kv_cache_precision=KVCachePrecision::FP16;
+            // Original failure: a retained fast path supplied no admitted projection.
+            EXPECT_THROW(graph.bindAdmittedQwenSparseAttentionProgram(reused.attention_participants),std::invalid_argument);
+            restoreRetainedAdmittedRuntime(reused,prepared,0);
+            EXPECT_EQ(reused.attention_participants.get(),prepared.attention_participants.get());
+            EXPECT_EQ(reused.ngram_table_placement,prepared.ngram_table_placement);
+            EXPECT_EQ(reused.retained_host_services,prepared.retained_host_services);
+            EXPECT_EQ(reused.retained_host_services->selectedForLookup(reused.ngram_table_placement.get()).size(),devices.size());
+            EXPECT_EQ(reused.cpu_serial_expert_storage,prepared.cpu_serial_expert_storage);
+            EXPECT_EQ(reused.resident_graph_rows,16);
+            EXPECT_EQ(reused.moe_routed_prefill.overlay_segment_rows,8);
+            EXPECT_TRUE(reused.mtp.enabled);EXPECT_EQ(reused.mtp.draft_tokens,1);EXPECT_EQ(reused.mtp.graph_capacity_draft_tokens,3);
+            EXPECT_EQ(reused.max_seq_len,777);EXPECT_TRUE(reused.prefix_cache.enabled);
+            EXPECT_EQ(reused.activation_precision,ActivationPrecision::BF16);
+            EXPECT_FALSE(reused.attention_participants.owner_before(prepared.attention_participants));
+            EXPECT_FALSE(prepared.attention_participants.owner_before(reused.attention_participants));
+            EXPECT_NO_THROW(graph.bindAdmittedQwenSparseAttentionProgram(reused.attention_participants));
+            EXPECT_EQ(graph.attention_arithmetic,policy.arithmetic);
+            EXPECT_EQ(graph.attention_phase_schedule,policy.schedule);
+            reused.attention_participants.reset();
+            // Repeated handoff borrows the original object, rather than resolving
+            // defaults from a new request or accumulating copied participant rows.
+            restoreRetainedAdmittedRuntime(reused,prepared,0);
+            EXPECT_EQ(reused.attention_participants,prepared.attention_participants);
+            auto foreign=graph;foreign.default_device={backend,99};
+            EXPECT_THROW(foreign.bindAdmittedQwenSparseAttentionProgram(reused.attention_participants),std::invalid_argument);
+            // Keep the actual attention layer inside the changed interval;
+            // a GDN-only interval correctly performs no QSA policy lookup.
+            auto interval=graph;interval.n_layers=3;
+            EXPECT_THROW(interval.bindAdmittedQwenSparseAttentionProgram(reused.attention_participants),std::invalid_argument);
+            if(backend==DeviceType::ROCm){
+                auto precision=graph;precision.kv_cache_precision=KVCachePrecision::FP32;
+                EXPECT_THROW(precision.bindAdmittedQwenSparseAttentionProgram(reused.attention_participants),std::invalid_argument);
+                auto capacity=graph;capacity.max_request_count=2;
+                EXPECT_THROW(capacity.bindAdmittedQwenSparseAttentionProgram(reused.attention_participants),std::invalid_argument);
+            }
+            reused.attention_participants.reset();
+        }
+        RuntimeConfig changed;
+        changed.attention_setup_request.arithmetic=backend==DeviceType::ROCm?A::FixedFP32:A::TileFP16WithFP32Totals;
+        EXPECT_THROW(restoreRetainedAdmittedRuntime(changed,prepared,0),std::invalid_argument);
+        EXPECT_FALSE(changed.attention_participants);
+        EXPECT_FALSE(changed.ngram_table_placement);EXPECT_FALSE(changed.retained_host_services);
+        EXPECT_EQ(changed.resident_graph_rows,0);EXPECT_TRUE(changed.cpu_serial_expert_storage.empty());
+        RuntimeConfig wrong_request;
+        wrong_request.ngram_table_policy.storage=ImmutableRowStoragePreference::VRAM;
+        EXPECT_THROW(restoreRetainedAdmittedRuntime(wrong_request,prepared,0),std::invalid_argument);
+        EXPECT_FALSE(wrong_request.ngram_table_placement);EXPECT_FALSE(wrong_request.attention_participants);
+        RuntimeConfig wrong_rank;
+        EXPECT_THROW(restoreRetainedAdmittedRuntime(wrong_rank,prepared,1),std::logic_error);
+        EXPECT_FALSE(wrong_rank.ngram_table_placement);EXPECT_FALSE(wrong_rank.retained_host_services);
+        auto missing_placement=prepared;missing_placement.ngram_table_placement.reset();
+        RuntimeConfig no_partial;
+        no_partial.ngram_table_policy=prepared.ngram_table_policy;
+        EXPECT_THROW(restoreRetainedAdmittedRuntime(no_partial,missing_placement,0),std::logic_error);
+        EXPECT_EQ(no_partial.resident_graph_rows,0);EXPECT_FALSE(no_partial.attention_participants);
+        EXPECT_TRUE(no_partial.cpu_serial_expert_storage.empty());EXPECT_FALSE(no_partial.retained_host_services);
+        // A corrupted/missing retained projection is never repaired by handoff.
+        auto absent=prepared;absent.attention_participants.reset();
+        restoreRetainedAdmittedRuntime(reused,absent,0);
+        EXPECT_FALSE(reused.attention_participants);
+        EXPECT_THROW(admittedQwenSparseAttentionPolicy(reused.attention_participants,devices.front(),7,10),std::invalid_argument);
+        auto duplicate=prepared;
+        duplicate.attention_participants=std::make_shared<const std::vector<QwenSparseAttentionParticipantProgram>>(
+            std::vector<QwenSparseAttentionParticipantProgram>{{devices.front(),policy,7,10},{devices.front(),policy,7,10}});
+        restoreRetainedAdmittedRuntime(reused,duplicate,0);
+        EXPECT_THROW(admittedQwenSparseAttentionPolicy(reused.attention_participants,devices.front(),7,10),std::invalid_argument);
+    }
 }
 
 } // namespace llaminar2::test

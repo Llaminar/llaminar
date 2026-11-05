@@ -212,6 +212,10 @@ public:
         ImmutableLookupLayout layout,std::span<const DeviceId> devices,
         std::shared_ptr<PhysicalMemoryAuthority> memory,DeviceId hostDevice,
         RetainedHostServiceUseToken worker,TransferEngine &transfers=TransferEngine::instance());
+    /** @brief Use the exclusive original model-owned worker with fresh per-runner protocol storage. */
+    static std::shared_ptr<ImmutableLookupService> create(std::shared_ptr<HostImmutableRowProvider> table,
+        ImmutableLookupLayout layout,std::span<const DeviceId> devices,std::shared_ptr<PhysicalMemoryAuthority> memory,
+        DeviceId hostDevice,RetainedHostServiceBorrow worker,TransferEngine &transfers=TransferEngine::instance());
     /** @brief Cancel/retire any outstanding host invocation before owned state is released. */
     ~ImmutableLookupService();
     /** @brief Freeze one exact device alias during setup, retaining this service lifetime. */
@@ -283,11 +287,15 @@ private:
         std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> coordinator,std::shared_ptr<PhysicalMemoryAuthority> memory,void* stream,std::unique_ptr<NativeOrderingEventGroup> group);
     std::vector<std::shared_ptr<PooledImmutableSourcePreparedStorage>> pooled_storages_; ///< Roots only; never retains service/binding and creates no ownership cycle.
     std::mutex pooled_setup_; ///< Setup metadata publication only, independent of live device state.
+    /** @brief Share validation/mapping order for standalone tokens and model-retained borrows. */
+    static std::shared_ptr<ImmutableLookupService> createWorker(std::shared_ptr<HostImmutableRowProvider>,
+        ImmutableLookupLayout,std::span<const DeviceId>,std::shared_ptr<PhysicalMemoryAuthority>,DeviceId,
+        std::variant<RetainedHostServiceUseToken,RetainedHostServiceBorrow>,TransferEngine&);
     /** @brief Construct only through PMA-authenticated create(). */
     ImmutableLookupService(std::shared_ptr<HostImmutableRowProvider> table,
                            std::shared_ptr<ImmutableLookupChannelBacking> backing,ImmutableLookupServiceGeometry geometry,
                            std::shared_ptr<const PhysicalMemoryAuthority> memory,
-                           std::unique_ptr<PreparedRetainedHostService> worker);
+                           RetainedHostServiceBorrow worker);
     /** @brief Allocation-free retained-worker entry. */
     static bool run(void *context);
     /** @brief Complete host I/O lifecycle; failed channels cannot be silently reused. */
@@ -318,7 +326,7 @@ private:
     void abandonGroup(const GroupAdmission& group) noexcept;
     mutable std::mutex lifecycle_;
     std::mutex terminal_join_; ///< Whole-request join only; never held by polling or GPU submission.
-    std::unique_ptr<PreparedRetainedHostService> worker_owner_; ///< Exact admitted stack/object/thread, joined before processor/context destruction.
+    RetainedHostServiceBorrow worker_owner_; ///< Exclusive original worker borrow, returned only after processor invocation retirement.
     RetainedParentTicketServiceWorker& worker_; ///< Alias of the sole typed owner, never a second worker.
     Ticket outstanding_;
     std::uint64_t generation_=0;

@@ -113,9 +113,16 @@ class RetainedHostServiceBinding final {
 public:
     /** @brief Claim/transfer one original instance, rejecting duplicates across separate bindings and models. */
     RetainedHostServiceUseToken take(RetainedHostServiceInstance);
+    /** @brief Materialize once, then exclusively lend the same original worker across runner lifetimes.
+     * @param key Exact selected original rank/device/role/ordinal instance.
+     * @return Exclusive idle borrow retaining the same worker, program and PMA.
+     * @throws std::logic_error For undeclared, consumed, concurrently borrowed or non-idle instances.
+     * @throws std::exception For original native creator failure; the binding remains consumed.
+     */
+    RetainedHostServiceBorrow borrow(RetainedHostServiceInstance key);
 private:
     friend class RetainedHostServiceDeclarations;
-    struct Entry{RetainedHostServiceInstance key;RetainedHostServiceProgram program;bool consumed=false;};
+    struct Entry{RetainedHostServiceInstance key;RetainedHostServiceProgram program;bool consumed=false;std::shared_ptr<PreparedRetainedHostService> prepared;};
     RetainedHostServiceBinding(std::shared_ptr<PhysicalMemoryAuthority>,std::vector<Entry>);
     std::mutex mutex_;
     std::shared_ptr<PhysicalMemoryAuthority> memory_;

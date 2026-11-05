@@ -631,6 +631,19 @@ std::shared_ptr<ImmutableLookupExecutionBoundary> ImmutableLookupExecutionBounda
     std::shared_ptr<HostImmutableRowProvider> table,DeviceId device,std::shared_ptr<TensorBase> protocol,
     std::size_t maximumTokenRows,std::shared_ptr<PhysicalMemoryAuthority> memory,RetainedHostServiceUseToken worker)
 {
+    return createWorker(std::move(table),device,std::move(protocol),maximumTokenRows,std::move(memory),std::move(worker));
+}
+std::shared_ptr<ImmutableLookupExecutionBoundary> ImmutableLookupExecutionBoundary::create(
+    std::shared_ptr<HostImmutableRowProvider> table,DeviceId device,std::shared_ptr<TensorBase> protocol,
+    std::size_t maximumTokenRows,std::shared_ptr<PhysicalMemoryAuthority> memory,RetainedHostServiceBorrow worker)
+{
+    return createWorker(std::move(table),device,std::move(protocol),maximumTokenRows,std::move(memory),std::move(worker));
+}
+std::shared_ptr<ImmutableLookupExecutionBoundary> ImmutableLookupExecutionBoundary::createWorker(
+    std::shared_ptr<HostImmutableRowProvider> table,DeviceId device,std::shared_ptr<TensorBase> protocol,
+    std::size_t maximumTokenRows,std::shared_ptr<PhysicalMemoryAuthority> memory,
+    std::variant<RetainedHostServiceUseToken,RetainedHostServiceBorrow> worker)
+{
     (void)protocolState(protocol,device);
     if(!table||!memory||!device.is_gpu()||
         !maximumTokenRows||maximumTokenRows>std::numeric_limits<std::size_t>::max()/16||
@@ -639,7 +652,8 @@ std::shared_ptr<ImmutableLookupExecutionBoundary> ImmutableLookupExecutionBounda
     const auto format=ggufToTensorType(table->source().format);
     const auto width=static_cast<int>(table->source().row_elements);const auto rowBytes=table->source().rowBytes();
     const auto layout=ImmutableLookupLayout::create(maximumTokenRows*16,rowBytes);
-    auto service=ImmutableLookupService::create(table,layout,std::array{device},memory,table->retainedOwnerObservation().allocator().device,std::move(worker));
+    auto service=std::visit([&](auto&& original){return ImmutableLookupService::create(table,layout,std::array{device},memory,
+        table->retainedOwnerObservation().allocator().device,std::move(original));},std::move(worker));
     std::unique_ptr<IImmutableLookupKernels> kernels;
 #ifdef HAVE_CUDA
     if(device.is_cuda())kernels=createCUDAImmutableLookupKernels(device,format,width,rowBytes);

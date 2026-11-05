@@ -15994,8 +15994,8 @@ namespace llaminar2
             if(config.retained_host_services->contains(role)){
                 const auto& program=config.retained_host_services->program(role);
                 if(!executor_.hasRetainedParentTicketServiceWorker()){
-                    auto token=injected_model_ctx_->takeRetainedHostService({role.worldRank,device},role.role,physical_memory_authority_);
-                    executor_.setRetainedParentTicketServiceWorker(PreparedRetainedHostService::materialize(std::move(token)),physical_memory_authority_);
+                    auto worker=injected_model_ctx_->borrowRetainedHostService({role.worldRank,device},role.role,physical_memory_authority_);
+                    executor_.setRetainedParentTicketServiceWorker(std::move(worker),physical_memory_authority_);
                 }
                 executor_.requireRetainedParentTicketServiceProgram(program,physical_memory_authority_);
             }

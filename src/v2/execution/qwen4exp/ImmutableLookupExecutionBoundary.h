@@ -98,7 +98,11 @@ public:
      */
     static std::shared_ptr<ImmutableLookupExecutionBoundary> create(std::shared_ptr<HostImmutableRowProvider> table,
         DeviceId device,std::shared_ptr<TensorBase> protocol,std::size_t maximumTokenRows,
-        std::shared_ptr<PhysicalMemoryAuthority> memory,RetainedHostServiceUseToken worker);
+        std::shared_ptr<PhysicalMemoryAuthority> memory,RetainedHostServiceBorrow worker);
+    /** @brief Checked standalone ownership adapter for original one-shot source/calibration setup. */
+    static std::shared_ptr<ImmutableLookupExecutionBoundary> create(
+        std::shared_ptr<HostImmutableRowProvider> table,DeviceId device,std::shared_ptr<TensorBase> protocol,
+        std::size_t maximumTokenRows,std::shared_ptr<PhysicalMemoryAuthority> memory,RetainedHostServiceUseToken worker);
     /**
      * @brief Bind one real provider/channel to its existing pooled owner/coordinator roots and retained graph boundary.
      * @param service Actual already-admitted subordinate RAM/SSD source worker.
@@ -176,6 +180,11 @@ public:
     /** @brief Persistent GPU I/O admission identity, with exact admission-stream publication. */
     const std::uint64_t *generation() const {requireProtocolOwner();return generation_;}
 private:
+    /** @brief Preserve original geometry validation before standalone worker birth. */
+    static std::shared_ptr<ImmutableLookupExecutionBoundary> createWorker(
+        std::shared_ptr<HostImmutableRowProvider>,DeviceId,std::shared_ptr<TensorBase>,std::size_t,
+        std::shared_ptr<PhysicalMemoryAuthority>,std::variant<RetainedHostServiceUseToken,RetainedHostServiceBorrow>);
+
     friend struct llaminar2::test::ImmutableLookupSourceAdmissionReplayAccess;
     /** @brief Immutable membership metadata only; never grants native admission or resource authority. */
     struct SourceAdmissionIdentity {

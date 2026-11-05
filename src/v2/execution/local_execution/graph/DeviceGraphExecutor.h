@@ -2639,8 +2639,7 @@ namespace llaminar2
         bool weights_session_cohered_ = false;         ///< True after first forward completes weight coherence for all nodes
         uint64_t snapshot_configuration_epoch_ = 1;   ///< Current semantic snapshot graph-topology identity.
         /** Setup-created worker that lets CPU tickets progress during GPU submission. */
-        std::unique_ptr<PreparedRetainedHostService>
-            retained_parent_ticket_service_worker_;
+        RetainedHostServiceBorrow retained_parent_ticket_service_worker_;
 
         /**
          * @brief Allocate one stage's arena bindings without changing authority.
@@ -3017,6 +3016,8 @@ namespace llaminar2
          * @throws std::logic_error For a missing/wrong role, active/replaced owner or nonidle worker.
          */
         void setRetainedParentTicketServiceWorker(std::unique_ptr<PreparedRetainedHostService> worker,const std::shared_ptr<PhysicalMemoryAuthority>& originalMemory);
+        /** @brief Bind one exclusive idle borrow of the model-retained original worker. */
+        void setRetainedParentTicketServiceWorker(RetainedHostServiceBorrow worker,const std::shared_ptr<PhysicalMemoryAuthority>& originalMemory);
         /** @return Whether the one declared CPU executor role has already been materialized. */
         bool hasRetainedParentTicketServiceWorker()const noexcept;
         /** @brief Authenticate unchanged declared program/source on repeated setup; never creates/replaces a worker. */

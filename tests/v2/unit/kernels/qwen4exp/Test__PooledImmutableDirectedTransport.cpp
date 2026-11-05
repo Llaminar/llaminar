@@ -8,6 +8,7 @@
  * cross-vendor owner replays and the TransferEngine counted-message suite.
  */
 #include "execution/qwen4exp/PooledImmutableDirectedTransport.h"
+#include "execution/qwen4exp/PooledImmutableSourceRootBinding.h"
 #include "execution/qwen4exp/PooledImmutableReplicatedReaderContract.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/local_execution/graph/DeviceGraphCaptureController.h"
@@ -176,5 +177,58 @@ TEST(PooledImmutableDirectedTransport, SourceReaderFrameDeclarativeDependencyRep
             EXPECT_TRUE(std::none_of(reads.begin(),reads.end(),[](const auto& row){return row.id==BufferId::QFN_POOLED_COORDINATOR_FRAME;}));
         }
     }
+}
+}
+
+namespace llaminar2::test {
+/** @test Real source geometry selects local registration by allocator membership, independent of owner or reader count. */
+TEST(PooledImmutableDirectedTransport, RemoteOnlySourceRootRegistration){
+    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})
+        for(const bool has_local:{false,true})for(const unsigned compute_readers:{1u,2u}){
+            const PhysicalMemoryAllocatorIdentity source{0,device};
+            const PhysicalMemoryAllocatorIdentity remote{0,device.is_cuda()?DeviceId::rocm(0):DeviceId::cuda(0)};
+            std::vector<PhysicalMemoryAllocatorIdentity> order;
+            std::vector<ImmutableRowTableLayoutOwner> declared;
+            if(has_local){order.push_back(source);declared.push_back({{source,ImmutableRowStorage::VRAM},0,3,{}});}
+            order.push_back(remote);declared.push_back({{remote,ImmutableRowStorage::VRAM},0,3,{}});
+            std::vector<PhysicalMemoryAllocatorIdentity> consumers{source};
+            if(compute_readers==2)consumers.push_back({0,device.is_cuda()?DeviceId::cuda(1):DeviceId::rocm(1)});
+            const std::array tiers{ImmutableRowStorage::VRAM,ImmutableRowStorage::MemoryMapped};
+            const auto layout=ImmutableRowTableLayoutGeometry::checked(
+                ImmutableRowTableExtent::fromNative(GGUFTensorType::IQ4_NL,0x100000100ULL,90),
+                ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,declared,consumers,{},
+                {{{0,DeviceId::cpu()},ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped)}},
+                {},source,64,ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator);
+            const auto physical=qwen4exp::PooledImmutablePhysicalOwnerGeometry::fromLayout(layout,order,source);
+            const auto policy=qwen4exp::PooledImmutableCoordinatorGeometry::fromOwners(physical,{65536,1,2},64);
+            const auto coordinator=qwen4exp::PooledImmutableCoordinatorNativePlan::fromGeometry(physical,policy,701,17);
+            std::vector<qwen4exp::PooledImmutableOwnerNativePlan> owners;
+            for(unsigned i=0;i<order.size();++i)owners.push_back(qwen4exp::PooledImmutableOwnerNativePlan::fromGeometry(physical,policy,i,701,17));
+            const ImmutableRowTableSource descriptor{.rows=0x100000100ULL,.row_elements=160,.format=GGUFTensorType::IQ4_NL};
+            const auto geometry=qwen4exp::PooledImmutableSourceGeometry::fromPlans(owners,coordinator,descriptor,compute_readers);
+            EXPECT_EQ(geometry.parameters().local_owner!=qwen4exp::adaptive_lookup::None,has_local);
+            for(int lifetime=0;lifetime<20;++lifetime){
+                BufferArena arena;unsigned local_calls=0,coordinator_calls=0,source_calls=0;
+                const auto root=[&](BufferId id){return arena.registerExternalBuffer(id,
+                    std::make_shared<INT8Tensor>(std::vector<size_t>{64}));};
+                const auto local=[&](std::uint32_t coordinate){
+                    // Checked standard indexing retains the original absent-local
+                    // projection failure, without manufacturing a local owner.
+                    EXPECT_EQ(owners.at(coordinate).allocator(),source);++local_calls;
+                    EXPECT_TRUE(root(BufferId::QFN_POOLED_OWNER_CACHE));
+                    EXPECT_TRUE(root(BufferId::QFN_POOLED_OWNER_FRAME));
+                    EXPECT_TRUE(root(BufferId::QFN_POOLED_OWNER_NATIVE));
+                };
+                if(!has_local)EXPECT_THROW(local(geometry.parameters().local_owner),std::out_of_range);
+                qwen4exp::detail::bindOriginalPooledSourceGraphRoots(geometry,local,[&]{
+                    ++coordinator_calls;EXPECT_TRUE(root(BufferId::QFN_POOLED_COORDINATOR_POLICY));
+                    EXPECT_TRUE(root(BufferId::QFN_POOLED_COORDINATOR_FRAME));EXPECT_TRUE(root(BufferId::QFN_POOLED_COORDINATOR_NATIVE));
+                },[&]{++source_calls;EXPECT_TRUE(root(BufferId::QFN_POOLED_SOURCE_FRAME));EXPECT_TRUE(root(BufferId::QFN_POOLED_SOURCE_NATIVE));});
+                EXPECT_EQ(local_calls,has_local?1u:0u);EXPECT_EQ(coordinator_calls,1u);EXPECT_EQ(source_calls,1u);
+                EXPECT_EQ(arena.isRegistered(BufferId::QFN_POOLED_OWNER_FRAME),has_local);
+                EXPECT_TRUE(arena.isRegistered(BufferId::QFN_POOLED_COORDINATOR_FRAME));
+                EXPECT_TRUE(arena.isRegistered(BufferId::QFN_POOLED_SOURCE_FRAME));
+            }
+        }
 }
 }

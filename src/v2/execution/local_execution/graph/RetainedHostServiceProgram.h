@@ -8,11 +8,13 @@
 #pragma once
 #include "planning/PhysicalMemoryAuthority.h"
 #include <memory>
+#include <mutex>
 #include <string>
 #include <pthread.h>
 #include <variant>
 namespace llaminar2 {
 class PreparedRetainedHostService;
+class RetainedHostServiceBorrow;
 class RetainedHostServiceUseToken;
 struct RetainedHostServiceInstanceState;
 class RetainedParentTicketServiceWorker;
@@ -130,7 +132,53 @@ public:
     /** @return Exact original authority retained throughout teardown. */
     const std::shared_ptr<PhysicalMemoryAuthority>& memory()const noexcept;
 private:
+    friend class RetainedHostServiceBorrow;
     explicit PreparedRetainedHostService(std::unique_ptr<RetainedHostServiceInstanceState>);
+    std::mutex borrow_mutex_; ///< Serializes cold exclusive execution ownership, never dispatch.
+    bool borrowed_=false; ///< One protocol/executor may name the worker at a time.
     std::unique_ptr<RetainedHostServiceInstanceState> state_;
 };
+/** @brief Exclusive execution borrow of the same original model-retained worker and PMA.
+ * Return requires Idle, including consumption of a completed invocation by await().
+ * The owner remains alive through the borrow; acquisition never creates another thread.
+ */
+class RetainedHostServiceBorrow final {
+public:
+    RetainedHostServiceBorrow() noexcept=default;
+    /** @brief Fail fatally rather than let an outstanding task retain destroyed protocol state. */
+    ~RetainedHostServiceBorrow() noexcept;
+    RetainedHostServiceBorrow(const RetainedHostServiceBorrow&)=delete;
+    RetainedHostServiceBorrow& operator=(const RetainedHostServiceBorrow&)=delete;
+    /** @brief Transfer exclusive execution ownership without changing the worker. */
+    RetainedHostServiceBorrow(RetainedHostServiceBorrow&&) noexcept;
+    /** @brief Return the prior idle borrow before transferring exclusive ownership. */
+    RetainedHostServiceBorrow& operator=(RetainedHostServiceBorrow&&) noexcept;
+    /** @brief Checked standalone adapter; original token materialization remains one-shot.
+     * @param owner Exact already materialized original service, consumed by this call.
+     * @return Exclusive idle execution borrow retaining the service and its original PMA.
+     * @throws std::logic_error If owner is absent, already borrowed or not idle.
+     */
+    static RetainedHostServiceBorrow own(std::unique_ptr<PreparedRetainedHostService> owner);
+    /** @brief Borrow one retained original worker, rejecting concurrent or non-idle use.
+     * @param owner Same original prepared instance retained by its model binding.
+     * @return Exclusive execution scope without rematerialization or another PMA claim.
+     * @throws std::logic_error If owner is absent, already borrowed or has unconsumed work.
+     */
+    static RetainedHostServiceBorrow acquire(std::shared_ptr<PreparedRetainedHostService> owner);
+    /** @brief Return only after the actual worker has cleared its invocation descriptor.
+     * @throws std::logic_error If the actual worker is not Idle; the borrow remains held.
+     * Empty scopes are already returned and require no operation.
+     */
+    void release();
+    /** @return Whether this scope exclusively owns execution. */
+    explicit operator bool()const noexcept{return bool(owner_);}
+    /** @return Same original prepared instance; empty borrows reject access. */
+    PreparedRetainedHostService* operator->()const;
+    /** @return Same original prepared instance; empty borrows reject access. */
+    PreparedRetainedHostService& operator*()const{return *operator->();}
+private:
+    explicit RetainedHostServiceBorrow(std::shared_ptr<PreparedRetainedHostService> owner):owner_(std::move(owner)){}
+    std::shared_ptr<PreparedRetainedHostService> owner_;
+};
+
 }

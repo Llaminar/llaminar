@@ -10,6 +10,7 @@
 #include "transfer/TransferEngine.h"
 #include "execution/runner/OrchestrationRunner.h"
 #include "execution/runner/ModelContextRetirement.h"
+#include "execution/runner/PreparedWeightAuthorityIdentity.h"
 #include "tools/ModelKLDQFNOwner.h"
 #include "integration/parity/qwen4exp/Qwen4ExpParityTestBase.h"
 #include "execution/mpi_orchestration/ExecutionPlanBuilder.h"
@@ -79,12 +80,14 @@ public:
 }
 namespace llaminar2::test { namespace {
 /** @brief Observations only; canonical byte accounting stays in original PMA. */
-struct Trace {unsigned destroyed=0,resets=0;bool allDestroyed=true;std::function<void()> beforeReset;};
+struct Trace {unsigned destroyed=0,resets=0,created=0,expectedDestroyedBeforeReset=2;bool allDestroyed=true;std::function<void()> beforeReset;};
 Trace* active=nullptr;
 /** @brief Actual mapped original worker storage and prepared thread, with no SDK call. */
 class Worker final:public testing::MockWorkerGPUContext {
 public:
- Worker(int n,std::shared_ptr<PreparedGPUWorkerStack> root):MockWorkerGPUContext(n){thread_.start(std::move(root),[](void*){},nullptr);}
+ /** @brief Observe actual original worker birth before its prepared thread starts.
+  * @param n Original device ordinal. @param root Original PMA-owned stack mapping. */
+ Worker(int n,std::shared_ptr<PreparedGPUWorkerStack> root):MockWorkerGPUContext(n){++active->created;thread_.start(std::move(root),[](void*){},nullptr);}
  ~Worker()override{thread_.join();++active->destroyed;}
 private:PreparedGPUWorkerThread thread_;
 };
@@ -99,7 +102,7 @@ public:
  std::size_t deviceMemoryTotal(int)const override{++totalQueries;return 64u<<20;}
  DeviceRuntimeGenerationRetirementResult retireExclusiveDeviceRuntimeGeneration(const DeviceRuntimeGenerationRetirementRequest&)override{
   if(active->beforeReset)active->beforeReset();
-  active->allDestroyed &= active->destroyed==2;++active->resets;
+  active->allDestroyed &= active->destroyed==active->expectedDestroyedBeforeReset;++active->resets;
   DeviceRuntimeGenerationRetirementResult v;v.supported=v.success=v.reset_invoked=true;
   v.retired_generation=generation++;v.successor_generation=generation;v.post_reset_state=DeviceRuntimePostResetState::Quiescent;v.driver_free_bytes_before=32u<<20;return v;
  }
@@ -588,5 +591,60 @@ TEST(NativeSourceFinalRetirement, InvalidCpuOnlyContractDiscardsWithoutNativeSou
  contract.physical_memory_authority=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(builder.build()),0);
  EXPECT_EQ(discardExclusiveInvalidModelContextReuseContract(contract).retiredDeviceCount(),0u);
  EXPECT_FALSE(contract.context);EXPECT_FALSE(contract.reuse_authority);
+}
+}
+
+namespace llaminar2::test {
+/** @test Admission handoff borrows the same actual source and rejects foreign authority before publishing metadata. */
+TEST(NativeSourceFinalRetirement, RetainedAdmissionKeepsOriginalNativeSource){
+ Trace t;active=&t;Backend c(DeviceType::CUDA),r(DeviceType::ROCm);cuda=&c;rocm=&r;
+ const std::array devices{DeviceId::cuda(242),DeviceId::rocm(242)};
+ const std::array foreignDevices{DeviceId::cuda(243),DeviceId::rocm(243)};
+ auto source=prepare(devices,NativePhysicalLifetime::ContextGeneration);
+ auto foreign=prepare(foreignDevices,NativePhysicalLifetime::ContextGeneration);
+ ASSERT_EQ(t.created,4u);
+ RuntimeConfig original;original.native_context_preparation=source;
+ original.resident_graph_rows=512;original.moe_routed_prefill.overlay_segment_rows=64;
+ const auto originalMemory=source->memory();const auto committed=opaque(originalMemory);
+ std::array<const void*,2> workerIdentity{};
+ for(size_t i=0;i<devices.size();++i)workerIdentity[i]=source->acquire(devices[i]).worker().get();
+ for(int request=0;request<20;++request){
+  RuntimeConfig current;current.resident_graph_rows=17;current.moe_routed_prefill.overlay_segment_rows=9;
+  const auto rejectWithoutMutation=[&](int rank){
+   const auto before=current.native_context_preparation;
+   if(rank<0)EXPECT_THROW(restoreRetainedAdmittedRuntime(current,original,rank),std::invalid_argument);
+   else EXPECT_THROW(restoreRetainedAdmittedRuntime(current,original,rank),std::logic_error);
+   EXPECT_EQ(current.native_context_preparation,before);
+   if(before){EXPECT_FALSE(current.native_context_preparation.owner_before(before));EXPECT_FALSE(before.owner_before(current.native_context_preparation));}
+   EXPECT_EQ(current.resident_graph_rows,17);EXPECT_EQ(current.moe_routed_prefill.overlay_segment_rows,9);
+   EXPECT_FALSE(current.ngram_table_placement);EXPECT_FALSE(current.attention_participants);
+   EXPECT_FALSE(current.retained_host_services);EXPECT_TRUE(current.cpu_serial_expert_storage.empty());
+   EXPECT_EQ(t.created,4u);EXPECT_EQ(t.destroyed,0u);EXPECT_EQ(t.resets,0u);EXPECT_EQ(opaque(originalMemory),committed);
+  };
+  rejectWithoutMutation(-1);rejectWithoutMutation(1);
+  current.native_context_preparation=foreign;rejectWithoutMutation(0);
+  // Same address with independent shared ownership is not the original source.
+  current.native_context_preparation=std::shared_ptr<NativeContextPreparation>(source.get(),[](auto*){});
+  rejectWithoutMutation(0);
+  current.native_context_preparation=source;
+  RuntimeConfig absent;EXPECT_THROW(restoreRetainedAdmittedRuntime(current,absent,0),std::logic_error);
+  EXPECT_EQ(current.native_context_preparation,source);EXPECT_EQ(current.resident_graph_rows,17);
+  current.native_context_preparation.reset();
+  restoreRetainedAdmittedRuntime(current,original,0);
+  EXPECT_EQ(current.native_context_preparation,source);
+  EXPECT_FALSE(current.native_context_preparation.owner_before(source));EXPECT_FALSE(source.owner_before(current.native_context_preparation));
+  EXPECT_EQ(current.native_context_preparation->memory(),originalMemory);
+  EXPECT_EQ(current.resident_graph_rows,512);EXPECT_EQ(current.moe_routed_prefill.overlay_segment_rows,64);
+  restoreRetainedAdmittedRuntime(current,original,0);
+  for(size_t i=0;i<devices.size();++i){const auto retained=source->acquire(devices[i]);EXPECT_EQ(retained.worker().get(),workerIdentity[i]);EXPECT_EQ(retained.memory(),originalMemory);}
+  EXPECT_EQ(t.created,4u);EXPECT_EQ(t.destroyed,0u);EXPECT_EQ(t.resets,0u);EXPECT_EQ(opaque(originalMemory),committed);
+ }
+ // Handoff never acquired another worker or changed original PMA commitments.
+ // The two real source populations retain their independent final retirement.
+ EXPECT_EQ(foreign->retireReleasedContexts(),2u);EXPECT_EQ(t.destroyed,2u);EXPECT_EQ(t.resets,2u);
+ t.expectedDestroyedBeforeReset=4;
+ original.native_context_preparation.reset();
+ EXPECT_EQ(source->retireReleasedContexts(),2u);EXPECT_EQ(t.destroyed,4u);EXPECT_EQ(t.resets,4u);EXPECT_TRUE(t.allDestroyed);
+ EXPECT_NO_THROW(GPUDeviceContextPool::instance().shutdown());
 }
 }

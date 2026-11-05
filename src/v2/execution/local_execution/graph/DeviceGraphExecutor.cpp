@@ -867,6 +867,11 @@ namespace llaminar2
 
     void DeviceGraphExecutor::setRetainedParentTicketServiceWorker(std::unique_ptr<PreparedRetainedHostService> worker,const std::shared_ptr<PhysicalMemoryAuthority>& memory)
     {
+        setRetainedParentTicketServiceWorker(RetainedHostServiceBorrow::own(std::move(worker)),memory);
+    }
+
+    void DeviceGraphExecutor::setRetainedParentTicketServiceWorker(RetainedHostServiceBorrow worker,const std::shared_ptr<PhysicalMemoryAuthority>& memory)
+    {
         if(retained_parent_ticket_service_worker_ || !worker ||
            worker->program().role()!=RetainedHostServiceRole::ExecutorParentTicket || !worker->worker().idle() ||
            worker->memory().get()!=memory.get()||worker->memory().owner_before(memory)||memory.owner_before(worker->memory()))

@@ -16,6 +16,8 @@
 #include <barrier>
 #include <optional>
 #include <thread>
+#include <latch>
+#include <pthread.h>
 namespace llaminar2::test {
 namespace {
 /** @brief One original two-role admission, keeping aggregate quota large enough to expose stealing. */
@@ -56,14 +58,21 @@ TEST(RetainedHostServiceInstances, DuplicateBindingCannotStealDistinctRoleBudget
 }
 /** @test Separate actual ModelContexts share the same original instance lifecycle. */
 TEST(RetainedHostServiceInstances, TwoActualModelContextsCannotConsumeOneInstance){
-    InstanceFixture f;
-    auto first=ModelContext::createForTesting("recorded-host-instance-a.gguf",nullptr,1,false);
-    auto second=ModelContext::createForTesting("recorded-host-instance-b.gguf",nullptr,1,false);
-    first->bindRetainedHostServices(f.declarations,f.memory,f.selected);
-    second->bindRetainedHostServices(f.declarations,f.memory,f.selected);
-    auto token=first->takeRetainedHostService({0,f.ioKey.consumer},f.ioKey.role,f.memory);first.reset();
-    EXPECT_THROW(second->takeRetainedHostService({0,f.ioKey.consumer},f.ioKey.role,f.memory),std::logic_error);
-    EXPECT_NO_THROW(second->takeRetainedHostService({0,f.ticketKey.consumer},f.ticketKey.role,f.memory));
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    ASSERT_EXIT(([]{
+        InstanceFixture f;
+        auto first=ModelContext::createForTesting("recorded-host-instance-a.gguf",nullptr,1,false);
+        auto second=ModelContext::createForTesting("recorded-host-instance-b.gguf",nullptr,1,false);
+        first->bindRetainedHostServices(f.declarations,f.memory,f.selected);
+        second->bindRetainedHostServices(f.declarations,f.memory,f.selected);
+        auto borrowed=first->borrowRetainedHostService({0,f.ioKey.consumer},f.ioKey.role,f.memory);first.reset();
+        EXPECT_THROW(second->borrowRetainedHostService({0,f.ioKey.consumer},f.ioKey.role,f.memory),std::logic_error);
+        auto distinct=second->borrowRetainedHostService({0,f.ticketKey.consumer},f.ticketKey.role,f.memory);
+        EXPECT_TRUE(distinct);distinct.release();second.reset();borrowed.release();
+        EXPECT_EQ(f.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::RetainedHostServiceStorage,
+            PhysicalMemoryMaterializationKind::NewAllocation),0u);
+        GPUDeviceProcessLifetime::retireActive();std::_Exit(::testing::Test::HasFailure()?2:0);
+    }()),::testing::ExitedWithCode(0),"");
 }
 /** @test Concurrent separate bindings have exactly one winner before any native resource exists. */
 TEST(RetainedHostServiceInstances, ConcurrentBindingsPublishExactlyOneOriginalToken){
@@ -134,6 +143,8 @@ namespace llaminar2::test {
 /** @test Actual rank runtime projection retains the original CPU0 grouped service issuer and strict PMA identity. */
 TEST(RetainedHostServiceInstances, RankProjectionRetainsOriginalGroupedSourceBinding)
 {
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    ASSERT_EXIT(([]{
     const auto program=RetainedHostServiceReplayAccess::program(RetainedHostServiceRole::ImmutableLookupIO);
     const RetainedHostServiceInstance key{0,DeviceId::cpu(),RetainedHostServiceRole::ImmutableLookupIO};
     RetainedHostServiceDeclarations::Builder builder(0);
@@ -152,12 +163,93 @@ TEST(RetainedHostServiceInstances, RankProjectionRetainsOriginalGroupedSourceBin
     const std::array selected{key};
     model->bindRetainedHostServices(rank.retained_host_services,memory,selected);
     std::shared_ptr<PhysicalMemoryAuthority> foreign(memory.get(),[](PhysicalMemoryAuthority*){});
-    EXPECT_THROW(model->takeRetainedHostService({0,DeviceId::cpu()},key.role,foreign),std::logic_error);
+    EXPECT_THROW(model->borrowRetainedHostService({0,DeviceId::cpu()},key.role,foreign),std::logic_error);
     auto alias=std::shared_ptr<PhysicalMemoryAuthority>(memory,memory.get());
-    auto token=model->takeRetainedHostService({0,DeviceId::cpu()},key.role,alias);
-    EXPECT_EQ(token.memory().get(),memory.get());
-    EXPECT_FALSE(token.memory().owner_before(memory));
-    EXPECT_FALSE(memory.owner_before(token.memory()));
-    EXPECT_THROW(model->takeRetainedHostService({0,DeviceId::cpu()},key.role,memory),std::logic_error);
+    auto token=model->borrowRetainedHostService({0,DeviceId::cpu()},key.role,alias);
+    EXPECT_EQ(token->memory().get(),memory.get());
+    EXPECT_FALSE(token->memory().owner_before(memory));
+    EXPECT_FALSE(memory.owner_before(token->memory()));
+    EXPECT_THROW(model->borrowRetainedHostService({0,DeviceId::cpu()},key.role,memory),std::logic_error);
+    token.release();model.reset();
+    EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::RetainedHostServiceStorage,
+        PhysicalMemoryMaterializationKind::NewAllocation),0u);
+    GPUDeviceProcessLifetime::retireActive();std::_Exit(::testing::Test::HasFailure()?2:0);
+    }()),::testing::ExitedWithCode(0),"");
+}
+}
+
+namespace llaminar2::test {
+/** @test Retained original workers survive serial runners without reopening either production one-shot role. */
+TEST(RetainedHostServiceInstances, ModelOwnedServicesRetainOriginalWorkerAcrossRunnerBorrows){
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    ASSERT_EXIT(([]{
+        InstanceFixture original,foreign;
+        auto model=ModelContext::createForTesting("recorded-service-retained-model.gguf",nullptr,1,false);
+        auto sibling=ModelContext::createForTesting("recorded-service-foreign-model.gguf",nullptr,1,false);
+        model->bindRetainedHostServices(original.declarations,original.memory,original.selected);
+        sibling->bindRetainedHostServices(original.declarations,original.memory,original.selected);
+        const auto storage=[&]{return original.memory->claimedBytes(DeviceId::cpu(),
+            PhysicalMemoryOwner::RetainedHostServiceStorage,PhysicalMemoryMaterializationKind::NewAllocation);};
+        const auto runtime=[&]{return original.memory->reservedBytes(DeviceId::cpu(),PhysicalMemoryOwner::RetainedHostServiceRuntime);};
+        std::array<PreparedRetainedHostService*,2> services{};
+        std::array<RetainedParentTicketServiceWorker*,2> workers{};
+        std::array<pthread_t,2> threads{};
+        struct Observation {pthread_t thread{};unsigned calls=0;};
+        std::array<Observation,2> observations{};
+        // Materialize each originally admitted role once, then park its SAME
+        // object at the model lifetime boundary after consuming its task slot.
+        for(size_t index=0;index<original.selected.size();++index){
+            const auto key=original.selected[index];
+            auto borrowed=model->borrowRetainedHostService({key.worldRank,key.consumer},key.role,original.memory);
+            ASSERT_TRUE(borrowed);services[index]=&*borrowed;workers[index]=&borrowed->worker();
+            EXPECT_EQ(borrowed->memory(),original.memory);
+            EXPECT_EQ(borrowed->program().identity(),original.declarations->program(key).identity());
+            const auto task=borrowed->worker().dispatch([](void* ptr){auto& value=*static_cast<Observation*>(ptr);value.thread=pthread_self();++value.calls;return true;},&observations[index]);
+            EXPECT_TRUE(borrowed->worker().await(task));threads[index]=observations[index].thread;
+            borrowed.release();EXPECT_FALSE(borrowed);
+        }
+        EXPECT_FALSE(pthread_equal(threads[0],threads[1]));
+        const auto originalStorage=storage(),originalRuntime=runtime();
+        EXPECT_EQ(originalStorage,original.io.allocationBytes()+original.ticket.allocationBytes());
+        EXPECT_GT(originalRuntime,0u);
+        for(unsigned lifetime=0;lifetime<20;++lifetime)for(size_t index=0;index<original.selected.size();++index){
+            const auto key=original.selected[index];
+            auto borrowed=model->borrowRetainedHostService({key.worldRank,key.consumer},key.role,original.memory);
+            ASSERT_TRUE(borrowed);EXPECT_EQ(&*borrowed,services[index]);EXPECT_EQ(&borrowed->worker(),workers[index]);
+            EXPECT_EQ(borrowed->memory(),original.memory);
+            EXPECT_THROW(model->borrowRetainedHostService({key.worldRank,key.consumer},key.role,original.memory),std::logic_error);
+            EXPECT_THROW(sibling->borrowRetainedHostService({key.worldRank,key.consumer},key.role,original.memory),std::logic_error);
+            EXPECT_THROW(model->borrowRetainedHostService({key.worldRank,key.consumer},key.role,foreign.memory),std::logic_error);
+            EXPECT_THROW(model->borrowRetainedHostService({key.worldRank,DeviceId::cuda(99)},key.role,original.memory),std::logic_error);
+            const auto task=borrowed->worker().dispatch([](void* ptr){auto& value=*static_cast<Observation*>(ptr);value.thread=pthread_self();++value.calls;return true;},&observations[index]);
+            EXPECT_TRUE(borrowed->worker().await(task));EXPECT_TRUE(pthread_equal(threads[index],observations[index].thread));
+            auto duplicateBinding=original.bind();
+            EXPECT_THROW(duplicateBinding->take(key),std::logic_error);
+            borrowed.release();EXPECT_FALSE(borrowed);
+            EXPECT_EQ(storage(),originalStorage);EXPECT_EQ(runtime(),originalRuntime);
+        }
+        // A task retains its original caller data until await consumes the
+        // generation. A rejected return must leave that same borrow intact.
+        for(const auto key:original.selected){
+            auto borrowed=model->borrowRetainedHostService({key.worldRank,key.consumer},key.role,original.memory);
+            struct Block {std::latch started{1},finish{1};} block;
+            const auto task=borrowed->worker().dispatch([](void* ptr){auto& b=*static_cast<Block*>(ptr);b.started.count_down();b.finish.wait();return true;},&block);
+            block.started.wait();
+            EXPECT_THROW(borrowed.release(),std::logic_error);EXPECT_TRUE(borrowed);
+            EXPECT_THROW(model->borrowRetainedHostService({key.worldRank,key.consumer},key.role,original.memory),std::logic_error);
+            block.finish.count_down();
+            EXPECT_TRUE(borrowed->worker().await(task));borrowed.release();
+            EXPECT_EQ(storage(),originalStorage);EXPECT_EQ(runtime(),originalRuntime);
+        }
+        for(const auto& observed:observations)EXPECT_EQ(observed.calls,21u);
+        sibling.reset();model.reset();
+        // Actual service destruction joins/unmaps before its exact PMA storage
+        // claim disappears; only process-lifetime runtime commitments remain.
+        EXPECT_EQ(storage(),0u);EXPECT_EQ(runtime(),originalRuntime);
+        auto closed=original.bind();
+        for(const auto key:original.selected)EXPECT_THROW(closed->take(key),std::logic_error);
+        GPUDeviceProcessLifetime::retireActive();
+        std::_Exit(::testing::Test::HasFailure()?2:0);
+    }()),::testing::ExitedWithCode(0),"");
 }
 }

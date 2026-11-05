@@ -1236,3 +1236,102 @@ final model/runner release and prefix removal; `all_resources_retired=true` and
 drivers were clean. These results qualify the repaired boundaries only. The
 pending native transport foundation, full reuse/admission matrix, numerical
 inference and Release throughput are not certified by this checkpoint.
+
+## Retained admission projections and model-owned services
+
+The next retained-runner failures exposed two distinct lifetime mismatches.
+Runner creation was missing immutable projections from the original admission;
+later, a second runner tried to recreate host workers whose original model/PMA
+instances were deliberately one-shot. Neither defect warrants a fresh native
+source, another allocation ledger, or resetting consumed instance ordinals.
+
+`restoreRetainedAdmittedRuntime` now restores seven original projections after
+the existing complete model/weight/topology/layer/MTP validation and before
+runner factories: native context preparation, resident graph rows, overlay
+segment rows, ngram placement, attention participants, CPU serial expert storage,
+and retained host-service declarations. Request-time sampling, prefix, precision,
+context and MTP configuration remain the current request's responsibility.
+Foreign source/rank/placement and conflicting QSA selection reject before
+publication. Remote-only ngram owners also retain their exact source/coordinator
+roots without inventing a local owner.
+
+The existing model service binding now retains each original prepared worker.
+Executors and immutable I/O services acquire an exclusive typed borrow and return
+it only after the original worker is idle and its ticket has been consumed.
+Sequential runners reuse that same worker/program/PMA instance. Concurrent
+borrows, foreign authority/control blocks and repeated physical creation still
+reject. Final model destruction joins workers before releasing native preparation.
+
+Focused evidence from the development composition:
+
+- `focused317` and `focused319` cover the remote-root and metadata contracts.
+  The mixed CUDA TP2/ROCm-only storage source cell `source321` passed in 627.98 s
+  with fixed-depth-1 MTP preparation, all resources retired and clean drivers.
+  This is admission/capture evidence, not MTP execution or numerical inference.
+- `build322-include` and `focused323` passed all four admitted-runtime/native-source
+  contract registrations in 4.12 s, without skips and with clean drivers.
+- `build325` and `focused326` passed all nine service/metadata/worker registrations
+  in 37.96 s. `focused327` passed the four actual CUDA/ROCm executor-ticket and
+  immutable-submission lifetime registrations in 14.67 s. Both runs had no skips
+  and clean driver evidence. The new model-lifetime contract exercises twenty
+  serial borrows, real running work, rejection paths and final storage retirement.
+
+The exact two-CUDA retained-model cell `source328` advanced through both new
+runner constructions and reused prepared weights without new materialization.
+It then rejected stale generation-control pointers retained by the ngram source.
+That separate graph-borrow retirement fix is pending qualification; the cell
+remains red, with all resources retired and clean drivers. Evidence is under
+`/tmp/qfn-cpu-joint-qualified-r224/` and `/tmp/qfn-cuda-shared-source-r328/`.
+
+The feature checkpoint carries only these narrow ownership repairs and their
+explicit preflight regressions. The development composition also contains pending
+native transport and CPU Dynamic work; its focused results do not certify the
+complete feature branch, full preflight, numerical panels or Release performance.
+
+
+## Runner-control retirement and successful retained-source reuse (source331)
+
+The pooled source's generic generation words and checked arena/controller binding
+are runner borrows, not model-owned storage. The development composition now
+retires them after the DGO has joined its original producers and destroyed its
+captured topology. A shared source also waits for its original recurring native
+participants, transport definitions and cache borrowers to retire. Local P1
+sources close at the graph boundary directly. The private typed lifecycle rejects
+active I/O, unconsumed tickets, capture, foreign pointers and lost authorities;
+source data, protocol initialization, cache roots and interval identities survive.
+
+DGO publishes a retirement duty only after successful binding. Null controller
+storage rejects before pointer arithmetic. The focused actual-DGO contract proves
+rejected acquisition retires nothing, and successful acquisition retires exactly
+once through repeated teardown. Both new lifecycle contracts are explicitly
+registered in ProductionTestPreflight; no complete preflight run is claimed.
+
+`build329` rebuilt ten affected targets. `focused330` passed eight registrations;
+the two failures were the new local-source test and its containing suite, because
+the fixture incorrectly used the distributed factory for P1. `build332` corrects
+that fixture through the actual production local graph builder, preserving the
+distributed guard and existing P2–P8 path. `focused333` passes both registrations
+in 9.81 s. The local test alternates two real checked controller bindings through
+twenty lifetimes on CUDA/ROCm backend doubles, preserving original source roots,
+capture identity and staging charges. `focused330-native` also passes all four
+actual CUDA/ROCm ticket/submission-owner lifetime checks in 14.97 s. These fourteen
+unique focused registrations have no skips and clean driver evidence.
+
+The unchanged production patch passed the exact real-model two-CUDA retained
+source cell in `/tmp/qfn-cuda-shared-source-r331/` in **160.86 s**. Both runner
+lifetimes seal identical original prepared-weight, workspace and immutable-table
+retention rows. The replacement runner prepares its complete graphs successfully;
+final cleanup proves both original native generation resets, zero live canonical
+allocations, runner/model release and owned prefix-file removal. The canonical
+report records one selected/executed/passed cell, `all_resources_retired=true`
+and clean drivers. This is native source-admission/reuse evidence for the exact
+MTP-off cell, not numerical inference, Release performance or the full matrix.
+The full native log is preserved beside the report before subsequent CTest runs.
+
+Checkpoint boundary: r426's control-pointer retirement depends on the original
+native teardown frontiers absent from the feature checkpoint. It stays with that
+pending foundation in the development composition; the independent r422/r425
+admission projections, remote-root declaration and model-worker borrowing repairs
+are checkpointed separately. The portability audit is retained at
+`/tmp/qfn-source-generation-checkpoint-r428/PORTABILITY.md`. No partial shared-source
+lifecycle or synthetic retirement authority is imported into the feature branch.

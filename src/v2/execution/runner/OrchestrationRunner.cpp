@@ -18076,6 +18076,13 @@ namespace llaminar2
              */
             retained_prepared_weight_plan_validated_ =
                 retained_prepared_weight_plan_.has_value();
+            if(retained_prepared_weight_plan_validated_)
+            {
+                // Every reuse path consumes the same complete immutable
+                // admission before graph/memory factories run. Keep active
+                // request policy fresh; never replan the retained physical bytes.
+                restoreRetainedAdmittedRuntime(plan_.runtime,retained_prepared_weight_plan_->runtime,plan_.rank);
+            }
 
             /*
              * A preloaded context can either be a freshly parsed model handed
@@ -18483,8 +18490,6 @@ namespace llaminar2
                     *retained_prepared_routed_weight_plan_);
             moe_expert_overlay_memory_admission_ =
                 retained_expert_overlay_memory_admission_;
-            plan_.runtime.cpu_serial_expert_storage = moe_expert_overlay_memory_admission_->cpu_serial_expert_storage;
-            plan_.runtime.retained_host_services=retained_prepared_weight_plan_->runtime.retained_host_services;
             physical_memory_admission_ =
                 moe_expert_overlay_memory_admission_
                     ->physical_memory_admission;
@@ -18516,11 +18521,6 @@ namespace llaminar2
                     }
                 }
             }
-            plan_.runtime.resident_graph_rows =
-                retained_prepared_weight_plan_->runtime.resident_graph_rows;
-            plan_.runtime.moe_routed_prefill.overlay_segment_rows =
-                retained_prepared_weight_plan_
-                    ->runtime.moe_routed_prefill.overlay_segment_rows;
             PerfStatsCollector::addCounter(
                 "weight_loading",
                 "retained_overlay_physical_plan_reuses",
@@ -22618,8 +22618,9 @@ namespace llaminar2
             if (!publishPhysicalMemoryAuthority())
                 return false;
 
-            plan_.runtime.attention_participants =
-                projectAdmittedQwenSparseAttentionPrograms(profile, device_configs, plan_.rank);
+            // The validated reuse handoff already retained the original
+            // attention admission. This footprint check cannot resolve new
+            // defaults or replace that immutable policy object.
             LOG_DEBUG(
                 "[MemoryPlanner] Retained physical-memory authority accepts "
                 "the current runner footprint:\n"

@@ -5,8 +5,14 @@
  * Stage and model-wide consumers use the same ordered policy serialization.
  * Only metadata is inspected; model and cache payloads are never hashed. Active
  * request controls may change within the unchanged admitted capacity envelope.
+ * Complete runtime handoff borrows the original immutable admission after exact plan
+ * validation; participant factories retain their existing geometry checks.
  */
 #include "PreparedWeightAuthorityIdentity.h"
+#include "execution/config/RuntimeConfig.h"
+#include "backends/NativeContextPreparation.h"
+#include "loaders/ResolvedImmutableRowTablePlacement.h"
+#include "execution/local_execution/graph/RetainedHostServiceDeclarations.h"
 #include "execution/moe/MoEOverlayHostServiceContract.h"
 #include "execution/moe/MoEExpertOverlayExecutionPlan.h"
 #include <algorithm>
@@ -66,6 +72,45 @@ namespace llaminar2
             retained.max_request_batch == requested.max_request_batch &&
             retained.sidecar_dense_policy == requested.sidecar_dense_policy &&
             retained.terminal_head_policy == requested.terminal_head_policy;
+    }
+
+    void restoreRetainedAdmittedRuntime(RuntimeConfig& current,const RuntimeConfig& original,int world_rank)
+    {
+        if(world_rank<0)throw std::invalid_argument("Retained runtime admission requires its original physical rank");
+        const auto& source=original.native_context_preparation;
+        const auto& requested_source=current.native_context_preparation;
+        if(requested_source && (!source || requested_source.get()!=source.get() ||
+            requested_source.owner_before(source) || source.owner_before(requested_source)))
+            throw std::logic_error("Retained runtime admission cannot replace its original native source");
+        if(source && source->memory()->worldRank()!=world_rank)
+            throw std::logic_error("Retained runtime source crossed its original physical rank");
+        if(original.attention_participants && current.attention_setup_request!=original.attention_setup_request)
+            throw std::invalid_argument("Retained attention admission has a different startup policy request");
+        const auto& placement=original.ngram_table_placement;
+        if(placement){
+            if(placement->worldRank()!=world_rank)
+                throw std::logic_error("Retained lookup placement crossed its original physical rank");
+            placement->requireRequestedPolicy(current.ngram_table_policy);
+        }
+        if(current.ngram_table_placement && (!placement || *current.ngram_table_placement!=*placement))
+            throw std::logic_error("Retained runtime admission conflicts with an existing lookup placement");
+        if(original.retained_host_services){
+            if(original.retained_host_services->worldRank()!=world_rank)
+                throw std::logic_error("Retained CPU service declaration crossed its original physical rank");
+            // This is the same final placement selector used by the factory.
+            // In particular, a CPU I/O role cannot be restored without its
+            // original selected source. No instance is bound or materialized.
+            (void)original.retained_host_services->selectedForLookup(placement.get());
+        }
+        // Stage the only allocating metadata copy before publishing any field.
+        auto cpu_storage=original.cpu_serial_expert_storage;
+        current.native_context_preparation=source;
+        current.resident_graph_rows=original.resident_graph_rows;
+        current.moe_routed_prefill.overlay_segment_rows=original.moe_routed_prefill.overlay_segment_rows;
+        current.ngram_table_placement=placement;
+        current.attention_participants=original.attention_participants;
+        current.cpu_serial_expert_storage=std::move(cpu_storage);
+        current.retained_host_services=original.retained_host_services;
     }
 
     /**

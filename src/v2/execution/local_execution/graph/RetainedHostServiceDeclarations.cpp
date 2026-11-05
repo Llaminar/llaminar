@@ -115,4 +115,24 @@ RetainedHostServiceUseToken RetainedHostServiceBinding::take(RetainedHostService
     // can consume another instance's original admission.
     return RetainedHostServiceUseToken::claim(memory_,program,key);
 }
+RetainedHostServiceBorrow RetainedHostServiceBinding::borrow(RetainedHostServiceInstance key){
+    std::unique_lock lock(mutex_);
+    auto found=std::find_if(entries_.begin(),entries_.end(),[&](const auto& entry){return entry.key==key;});
+    if(found==entries_.end())throw std::logic_error("CPU service borrow names an undeclared/foreign instance");
+    if(found->prepared)return RetainedHostServiceBorrow::acquire(found->prepared);
+    if(found->consumed)throw std::logic_error("CPU service original instance is already consumed or materializing");
+    // The original PMA key stays OneShot. Failure remains consumed; another
+    // caller may neither race this creator nor retry a partially born worker.
+    found->consumed=true;
+    const auto program=found->program;
+    // entries_ is immutable after construction, so this iterator remains valid
+    // while source/loader validation and the original native creator run unlocked.
+    lock.unlock();
+    auto prepared=std::shared_ptr<PreparedRetainedHostService>(PreparedRetainedHostService::materialize(
+        RetainedHostServiceUseToken::claim(memory_,program,key)));
+    lock.lock();
+    found->prepared=std::move(prepared);
+    return RetainedHostServiceBorrow::acquire(found->prepared);
+}
+
 }

@@ -301,8 +301,26 @@ std::shared_ptr<ImmutableLookupService> ImmutableLookupService::create(std::shar
     ImmutableLookupLayout layout,std::span<const DeviceId> devices,std::shared_ptr<PhysicalMemoryAuthority> memory,
     DeviceId hostDevice,RetainedHostServiceUseToken worker,TransferEngine &transfers)
 {
-    if(worker.program().role()!=RetainedHostServiceRole::ImmutableLookupIO ||
-       worker.memory().get()!=memory.get() || worker.memory().owner_before(memory) || memory.owner_before(worker.memory()))
+    return createWorker(std::move(table),layout,devices,std::move(memory),hostDevice,std::move(worker),transfers);
+}
+std::shared_ptr<ImmutableLookupService> ImmutableLookupService::create(std::shared_ptr<HostImmutableRowProvider> table,
+    ImmutableLookupLayout layout,std::span<const DeviceId> devices,std::shared_ptr<PhysicalMemoryAuthority> memory,
+    DeviceId hostDevice,RetainedHostServiceBorrow worker,TransferEngine &transfers)
+{
+    return createWorker(std::move(table),layout,devices,std::move(memory),hostDevice,std::move(worker),transfers);
+}
+std::shared_ptr<ImmutableLookupService> ImmutableLookupService::createWorker(std::shared_ptr<HostImmutableRowProvider> table,
+    ImmutableLookupLayout layout,std::span<const DeviceId> devices,std::shared_ptr<PhysicalMemoryAuthority> memory,
+    DeviceId hostDevice,std::variant<RetainedHostServiceUseToken,RetainedHostServiceBorrow> worker,TransferEngine &transfers)
+{
+    const auto& program=std::visit([](const auto& original)->const RetainedHostServiceProgram&{
+        if constexpr(std::is_same_v<std::decay_t<decltype(original)>,RetainedHostServiceUseToken>)return original.program();
+        else return original->program();},worker);
+    const auto& originalMemory=std::visit([](const auto& original)->const std::shared_ptr<PhysicalMemoryAuthority>&{
+        if constexpr(std::is_same_v<std::decay_t<decltype(original)>,RetainedHostServiceUseToken>)return original.memory();
+        else return original->memory();},worker);
+    if(program.role()!=RetainedHostServiceRole::ImmutableLookupIO ||
+       originalMemory.get()!=memory.get() || originalMemory.owner_before(memory) || memory.owner_before(originalMemory))
         throw std::logic_error("Immutable lookup requires its original admitted I/O worker role and PMA control block");
     if(!table||!memory||!hostDevice.is_cpu()||devices.empty()||table->source().rowBytes()!=layout.rowBytes()||
         table->retainedOwnerObservation().allocator()!=PhysicalMemoryAllocatorIdentity{memory->worldRank(),hostDevice})
@@ -332,15 +350,19 @@ std::shared_ptr<ImmutableLookupService> ImmutableLookupService::create(std::shar
     // admitted OpenMP partition. Restore the creator before returning; generic
     // retained workers and CPU expert compute placement remain unchanged.
     const ScopedOpenMPPartitionAffinity io_worker_affinity;
+    auto execution=std::visit([](auto&& original)->RetainedHostServiceBorrow{
+        if constexpr(std::is_same_v<std::decay_t<decltype(original)>,RetainedHostServiceUseToken>)
+            return RetainedHostServiceBorrow::own(PreparedRetainedHostService::materialize(std::move(original)));
+        else return std::move(original);},std::move(worker));
     return std::shared_ptr<ImmutableLookupService>(
         new ImmutableLookupService(std::move(table), std::move(backing), geometry,std::move(memory),
-            PreparedRetainedHostService::materialize(std::move(worker))));
+            std::move(execution)));
 }
 
 ImmutableLookupService::ImmutableLookupService(std::shared_ptr<HostImmutableRowProvider> table,
                                                std::shared_ptr<ImmutableLookupChannelBacking> backing,ImmutableLookupServiceGeometry geometry,
                                                std::shared_ptr<const PhysicalMemoryAuthority> memory,
-                                               std::unique_ptr<PreparedRetainedHostService> worker)
+                                               RetainedHostServiceBorrow worker)
     : table_(std::move(table)), backing_(std::move(backing)), memory_(std::move(memory)),
       geometry_(std::move(geometry)),processor_(*table_, backing_->layout,
                  {static_cast<std::byte *>(backing_->mapped->mutableHostData()), backing_->layout.bytes()},

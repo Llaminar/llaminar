@@ -32584,7 +32584,7 @@ add_v2_test(V2_Integration_QwenSparseDefaultSetupAdmission
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparseDefaultSetupAdmission)
 add_v2_test(V2_Integration_QwenSparseDefaultSetupGraph
     COMMAND $<TARGET_FILE:v2_test_qwen4exp_metadata>
-        --gtest_filter=Qwen4ExpGraphConfig.AttentionBasePrefixIdentitySurvivesSetupReload:Qwen4ExpGraphConfig.AttentionDefaultGraphBindsOnlyItsAdmittedParticipant
+        --gtest_filter=Qwen4ExpGraphConfig.AttentionBasePrefixIdentitySurvivesSetupReload:Qwen4ExpGraphConfig.AttentionDefaultGraphBindsOnlyItsAdmittedParticipant:Qwen4ExpGraphConfig.RetainedAdmittedRuntimePreservesOriginalProgramsAndFactoryGuards
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Attention;Admission;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")

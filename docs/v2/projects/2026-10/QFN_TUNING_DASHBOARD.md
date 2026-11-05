@@ -1,6 +1,6 @@
 # QFN tuning dashboard
 
-Updated 2026-11-04. **Keep this file at or below 15,000 UTF-8 bytes.** Replace
+Updated 2026-11-05. **Keep this file at or below 15,000 UTF-8 bytes.** Replace
 status entries in place; put experiment histories, commands, samples and failure
 analysis in the linked tuning notes, not in this dashboard.
 
@@ -29,7 +29,7 @@ logits; component savings do not establish model gain.
 
 | Next action | State / decision |
 |---|---|
-| Admission | [Six-row target][target-matrix]: TP4 and genuine six-GPU follower RAM/SSD source controls each pass 2/2. Matched SSD TP2 passes 8/12; shared-pool continuation owners need native transport completion. Fresh RAM-backed ConsumerLocal controls pass 4/4. Complete regression collection is retained in the follow-up. The focused repair run now passes all 57 registrations, with no skips and clean native retirement/driver checks. Six TP4 cache source controls pass with clean driver/retirement checks. Four rebalancing source controls pass their cases, but two AMD user-pointer workqueue warnings keep that run unqualified. |
+| Admission | Current development composition: exact CUDA TP2 shared-ngram retained-model admission/reuse **passes in 160.86 s**, including both runner lifetimes, complete resource retirement and clean drivers. Fourteen affected focused registrations pass after correcting the local-P1 fixture. Earlier CUDA TP2/ROCm-only storage fixed1 source preparation also passed. Independent admitted-runtime and model-worker repairs are checkpointed separately; control-pointer retirement stays with the pending native foundation. [Scope and evidence](../2026-11/QFN_COHORT_MIGRATION_AND_MTP_ADMISSION_QUALIFICATION.md#runner-control-retirement-and-successful-retained-source-reuse-source331). The [six-row target][target-matrix], new numerical panels and Release economy remain unqualified. |
 | Native lifetime | [Review](QFN_NATIVE_RESOURCE_ALLOWANCE_REVIEW_2026-11-01.md): r65 passes all four source controls, final retirement and driver checks. |
 | Continuation / ngrams | [CPU1/CPU2 Static/RAM accuracy panels](../2026-11/QFN_CPU_EXPERT_TENSOR_SHARDING_QUALIFICATION.md) pass; CPU2 retains one approved KL exception (1.38264 ≤ 1.5), with aggregate limits unchanged. CPU2 fixed1/fixed3/dynamic MTP source admission and native byte-equivalence pass; dynamic covers three controller windows. Whole↔CPU2 staging/abort and source retirement pass, including actual FP32 CUDA/ROCm transfers. Both backends pass 20 invocations each for captured prefill, decode and grouped-verifier compute/rooted return/reset, including serial-row byte equivalence. Typed complete-target planning/measurements and genuine CPU2 shadow calibration pass 32 focused registrations. The native controller also passes twenty repetitions (80 actual warmup/measured waves), with independent rank progress and complete drain/retirement. **Open:** complete cohort service pricing, publication/inference, shared native ngram owners beyond private TP2, Release economy and all six broad rows. [Scoped evidence](../2026-11/QFN_COHORT_MIGRATION_AND_MTP_ADMISSION_QUALIFICATION.md). Dynamic cohort execution is guarded. Complete67 remains red; focused passes do not certify full preflight. |
 

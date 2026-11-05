@@ -8,6 +8,7 @@
  * so reset, rollback and prefix archive share one lifecycle and frontier.
  */
 #include "Qwen4ExpGraph.h"
+#include "execution/qwen4exp/PooledImmutableSourceRootBinding.h"
 #include "execution/qwen4exp/PooledImmutableRetainedParticipants.h"
 #include "collective/ILocalTPContext.h"
 #include "execution/local_execution/graph/ReadAheadParticipantContract.h"
@@ -219,9 +220,11 @@ std::shared_ptr<IRetainedGraphStorageBoundary> Qwen4ExpGraph::retainedStorageBou
         // Register original model-owned external roots only. The shared arena
         // inventory never allocates a second cache, frame or protocol tensor.
         if(arena_){
-            if(const auto local=boundary->pooledStorage()->owner())bindPooledNativeRoots(*arena_,*local);
-            bindPooledNativeRoots(*arena_,*boundary->pooledStorage()->coordinator());
-            bindPooledSourceRoots(*arena_,*boundary);
+            const auto original=boundary->pooledStorage();
+            qwen4exp::detail::bindOriginalPooledSourceGraphRoots(original->geometry(),
+                [&](std::uint32_t){bindPooledNativeRoots(*arena_,*original->owner());},
+                [&]{bindPooledNativeRoots(*arena_,*original->coordinator());},
+                [&]{bindPooledSourceRoots(*arena_,*boundary);});
         }
         lookup_ = std::move(boundary);
         return lookup_;
@@ -248,7 +251,7 @@ std::shared_ptr<IRetainedGraphStorageBoundary> Qwen4ExpGraph::retainedStorageBou
     const auto rows=tensor(BufferId::QFN_PLE_EMBEDDING).rows();
     lookup_=qwen4exp::ImmutableLookupExecutionBoundary::create(
         model_ctx_->hostImmutableRowProvider(),device,std::move(protocol_owner),rows,memory_,
-        model_ctx_->takeRetainedHostService({memory_->worldRank(),device},RetainedHostServiceRole::ImmutableLookupIO,memory_));
+        model_ctx_->borrowRetainedHostService({memory_->worldRank(),device},RetainedHostServiceRole::ImmutableLookupIO,memory_));
     return lookup_;
 }
 std::optional<Qwen4ExpIntBinding> Qwen4ExpGraph::rowParameters(DeviceId device) const

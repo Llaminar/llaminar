@@ -71,10 +71,17 @@ namespace qwen4exp {class PooledImmutableRetainedParticipants;}
         virtual void bindRetainedHostServices(std::shared_ptr<const RetainedHostServiceDeclarations>,
             std::shared_ptr<PhysicalMemoryAuthority>,std::span<const RetainedHostServiceInstance>)
         { throw std::logic_error("Model context does not own admitted retained CPU service declarations"); }
-        /** @brief Consume one original rank-local role token; missing/substituted roles fail before capture. */
-        virtual RetainedHostServiceUseToken takeRetainedHostService(PhysicalMemoryAllocatorIdentity,
-            RetainedHostServiceRole,const std::shared_ptr<PhysicalMemoryAuthority>&)
-        { throw std::logic_error("Model context has no original retained CPU service instance"); }
+        /** @brief Exclusively borrow the same admitted worker across sequential runner lifetimes.
+         * @param consumer Exact original rank/device consumer selected at admission.
+         * @param role Original independently progressing CPU service role.
+         * @param memory Same admitted PMA object and shared ownership control block.
+         * @return Exclusive idle execution borrow retaining the original worker/program/PMA.
+         * @throws std::logic_error For foreign, absent, consumed, busy or concurrently borrowed instances.
+         * @throws std::exception If first native materialization fails; failure stays consumed.
+         */
+        virtual RetainedHostServiceBorrow borrowRetainedHostService(PhysicalMemoryAllocatorIdentity consumer,
+            RetainedHostServiceRole role,const std::shared_ptr<PhysicalMemoryAuthority>& memory)
+        { throw std::logic_error("Model context has no original retained CPU service owner"); }
         virtual ~IModelContext() = default;
 
         // =========================================================================

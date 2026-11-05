@@ -391,7 +391,7 @@ namespace llaminar2
         host_service_selected_.assign(selected.begin(),selected.end());
         host_service_declarations_=std::move(declarations);host_service_memory_=std::move(memory);host_service_binding_=std::move(binding);
     }
-    RetainedHostServiceUseToken ModelContext::takeRetainedHostService(PhysicalMemoryAllocatorIdentity consumer,
+    RetainedHostServiceBorrow ModelContext::borrowRetainedHostService(PhysicalMemoryAllocatorIdentity consumer,
         RetainedHostServiceRole role,const std::shared_ptr<PhysicalMemoryAuthority>& memory)
     {
         const auto binding=[&]{
@@ -400,7 +400,7 @@ namespace llaminar2
                 throw std::logic_error("Model CPU service consumer lost original admitted binding/PMA control block");
             return host_service_binding_;
         }();
-        return binding->take({consumer.world_rank,consumer.device,role});
+        return binding->borrow({consumer.world_rank,consumer.device,role});
     }
 
     void ModelContext::prepareGPUAdaptiveImmutableLookup(const ResolvedImmutableRowTablePlacement &placement,
@@ -595,7 +595,7 @@ namespace llaminar2
                 else for(const auto& original:layout.consumers())consumers.push_back(original.device);
                 auto service=qwen4exp::ImmutableLookupService::create(provider,geometry.channelLayout(),
                     consumers,authority,host.device,
-                    takeRetainedHostService({authority->worldRank(),placement.lookupIOConsumer(consumer)},
+                    borrowRetainedHostService({authority->worldRank(),placement.lookupIOConsumer(consumer)},
                         RetainedHostServiceRole::ImmutableLookupIO,authority));
                 const auto actual=provider->identity();
                 {
