@@ -6,7 +6,19 @@
  * PMA roots. Polling gates delay/fail an actual piece, retaining its copy, ACK
  * and abort/drain. Explicit native cases replace only the whole tier with a
  * genuine rank-zero GPU owner; no global candidate publication is invented.
+ * Joined calibration opts into one original source-admitted GPU worker and
+ * native CPU domain before weights/probe scratch are materialized.
  */
+#include "execution/moe/MoEOverlayCPUServiceMeasurement.h"
+#include "backends/NativeContextPreparation.h"
+#include "backends/RetainedParticipantGraphExecutable.h"
+#include "planning/ModelMemoryProfile.h"
+#include "planning/WorkspaceMemoryEstimator.h"
+#include "collective/GlobalTPContext.h"
+#include "collective/NativeCPUCollectiveProgram.h"
+#include "collective/backends/ShmemSpinBackend.h"
+#include "kernels/cpu/gemm/CPUProjectionWorkspaceContract.h"
+#include "kernels/cpu/CPUInvocationWorkspace.h"
 #include "execution/moe/MoEOverlayPhysicalResidencyFabric.h"
 #include "execution/moe/MoEOverlayPhysicalLaneDemand.h"
 #include "execution/moe/MoEOverlayCapacityAdmission.h"
@@ -113,6 +125,9 @@ struct FabricOriginal {
         PlanningGGUFFixture::Geometry::Directory,1,kExperts};
     std::shared_ptr<MPIContext> mpi;
     std::shared_ptr<TensorFactory> tensors;
+    // Native source outlives the model/engine owners during implicit teardown.
+    std::shared_ptr<NativeContextPreparation> service_native_source;
+    std::optional<PreparedGPUContextUsePermit> service_native_use;
     std::shared_ptr<ModelContext> context;
     std::shared_ptr<const MoERoutedExpertPlacementPlan> plan;
     std::shared_ptr<const MoEExpertOverlayPreparationPlan> preparation;
@@ -122,19 +137,28 @@ struct FabricOriginal {
     std::shared_ptr<MoEOverlayMPIRemoteProjectionTransport> remote;
     std::shared_ptr<MoEOverlayPhysicalResidencyFabric> fabric;
     std::vector<MoEOverlayLayerWeightManifest> manifests;
+    // These optional owners belong to the same original setup/PMA. Default
+    // physical-only tests retain their established allocation/lifetime scope.
+    std::optional<NativeCPUCollectiveProgram> service_program;
+    std::shared_ptr<GlobalTPContext> service_domain;
+    ModelMemoryProfile service_profile;
+    RankInventory service_inventory;
     int whole=-1,last_shard=-1;
     ModelContextId model;
     DeviceId whole_device=DeviceId::cpu();
     /**
      * @brief Parse once, admit exact source/shadow/lane roots and publish genuine initial banks.
      * @param device Explicit whole-owner backend; only rank zero prepares native GPU storage.
+     * @param joined_service Admit the actual service probe/domain on the same original PMA.
      */
-    explicit FabricOriginal(DeviceId device=DeviceId::cpu()):whole_device(device) {
+    explicit FabricOriginal(DeviceId device=DeviceId::cpu(),bool joined_service=false):whole_device(device) {
         if(!device.is_cpu() && !device.is_gpu())
             throw std::invalid_argument("Fabric whole endpoint must be CPU or explicit native GPU");
         int rank=-1,size=0;MPI_Comm_rank(MPI_COMM_WORLD,&rank);MPI_Comm_size(MPI_COMM_WORLD,&size);
         mpi=std::make_shared<MPIContext>(rank,size,MPI_COMM_WORLD);
         const auto sockets=originalFabricSockets(*mpi);
+        if(joined_service && !device.is_gpu())
+            throw std::invalid_argument("Joined prepared service requires disjoint GPUwhole and original CPUcohort");
         if(!hasCPUBackend())initCPUBackend(sockets.at(size_t(rank)).numa_node);
         populateServingGGUFFixture(file);
         tensors=std::make_shared<TensorFactory>(*mpi);
@@ -196,6 +220,41 @@ struct FabricOriginal {
         budget.add(cpu,PhysicalMemoryOwner::RoutedExpertWeights,resident_bytes);
         budget.add(cpu,PhysicalMemoryOwner::ExpertShadowSlots,shadow_bytes);
         budget.add(cpu,PhysicalMemoryOwner::ExpertMigrationStaging,migration_bytes);
+        size_t cpu_service_probe=0,gpu_service_host_probe=0;
+        if(joined_service) {
+            using Service=MoEOverlayCPUServiceMeasurement;
+            service_profile=ModelMemoryProfile::fromLoader(loader);
+            const auto inventory=mpi->clusterInventory();
+            service_inventory=inventory->ranks.at(size_t(rank));
+            std::vector<NativeCPUCollectiveProgram::Participant> members;
+            for(int member=0;member<2;++member)
+                members.push_back({member,GlobalDeviceAddress::cpu(sockets.at(member).numa_node,
+                    inventory->ranks.at(member).hostname)});
+            service_program.emplace(NativeCPUCollectiveProgram::expertShardRoutePartials(
+                1,CollectiveBackendType::UPI,members));
+            const auto member=std::find_if(topology.participants().begin(),topology.participants().end(),[&](const auto& value){
+                return value.domain_name=="cohort" && value.world_rank_known && value.world_rank==rank;
+            });
+            if(member==topology.participants().end())throw std::logic_error("Joined service lost original cohort member");
+            const auto selected=preparation->cpuShardSourceFor(0,*member);
+            if(!selected)throw std::logic_error("Joined service lost original local cohort cuts");
+            auto workspace=cpuSwiGLUWorkspaceRequirements(Service::kMaximumRows,kF/2);
+            for(const auto role:{WeightRole::MoEExpertGate,WeightRole::MoEExpertUp,WeightRole::MoEExpertDown})
+                workspace.merge(CPUProjectionWorkspaceContract::sourceNative(TensorType::FP32,
+                    {.rows=Service::kMaximumRows,.n=role==WeightRole::MoEExpertDown?kH:kF/2,
+                     .k=role==WeightRole::MoEExpertDown?kF/2:kH,.workers=1,
+                     .execution=CPUExecutionGeometry::local(),.numerical_policy=CPUProjectionNumericalPolicy::GPUAlignedExpert}));
+            size_t probe=0;
+            for(const auto phase:{ExpertHistogramSource::PrefillChunk,ExpertHistogramSource::DecodeToken,ExpertHistogramSource::GroupedVerifier})
+                probe=std::max(probe,Service::cpuJointAllocationBytes(selected->cohort(),selected->participantIndex(),phase,
+                    workspace.total_bytes_with_alignment()));
+            cpu_service_probe=probe;
+            service_program->contributeDomainBOM(budget,cpu,rank);
+            NativeCPUCollectiveProgram::contributeProcessPoolBOM(budget,cpu);
+            if(rank==0)budget.add(cpu,PhysicalMemoryOwner::ActivationTransportStaging,
+                ShmemSpinArena::allocationGeometry(2).mapped_bytes);
+        }
+
         if(whole_device.is_gpu() && rank==0) {
             // The same preparation declares the genuine GPU source owners. GPU
             // upload rings coexist with CPU source/fabric staging and are additive.
@@ -214,13 +273,45 @@ struct FabricOriginal {
             if(!backend)throw std::runtime_error("Explicit floating Fabric backend is unavailable");
             const PhysicalMemoryResource gpu{rank,whole_device,backend->deviceMemoryTotal(whole_device.ordinal),
                 backend->deviceMemoryFree(whole_device.ordinal)};
+            if(joined_service) {
+                const std::array observations{cpu,gpu};
+                const std::array selected{whole_device};
+                service_native_source=NativeContextPreparation::create(observations,rank,selected);
+                service_native_use.emplace(service_native_source->acquire(whole_device));
+                context->bindNativeContextPreparation(service_native_source);
+                service_native_source->freezeForPlanning();
+                for(const auto& row:service_native_source->mandatoryBOM().resources())budget.add(row);
+                const auto general=RetainedParticipantGraphExecutable::generalBOM(cpu,gpu);
+                const auto calibration=RetainedParticipantGraphExecutable::calibrationBOM(cpu,gpu);
+                for(const auto& row:general.resources())budget.add(row);
+                for(const auto& row:calibration.resources())budget.add(row);
+                const auto found=std::find_if(service_inventory.gpus.begin(),service_inventory.gpus.end(),[&](const auto& observed){
+                    return observed.type==whole_device.type && observed.local_device_id==whole_device.ordinal;
+                });
+                if(found==service_inventory.gpus.end() || found->compute_units<=0)
+                    throw std::runtime_error("Joined service lost actual GPU inventory geometry");
+                const auto invocation=WorkspaceMemoryEstimator::estimatePreparedExpertService(service_profile,
+                    {.device=whole_device,.device_compute_units=found->compute_units,.resident_graph_rows=MoEOverlayCPUServiceMeasurement::kMaximumRows,
+                     .first_layer=0,.last_layer=0,.apportioned_routed_experts=true});
+                const auto probe=MoEOverlayCPUServiceMeasurement::gpuAllocationBytes({kH,kF},invocation);
+                gpu_service_host_probe=probe.host_bytes;
+                budget.add(gpu,PhysicalMemoryOwner::ExecutionWorkspace,probe.device_bytes);
+            }
             budget.add(gpu,PhysicalMemoryOwner::RoutedExpertWeights,2*footprint.gpu_live_bytes)
                 .add(gpu,PhysicalMemoryOwner::ExpertShadowSlots,gpu_shadow_bytes)
                 .add(gpu,PhysicalMemoryOwner::ExpertMigrationStaging,gpu_migration_bytes)
                 .add(gpu,PhysicalMemoryOwner::WeightLoadStaging,upload.staging_bytes)
                 .add(cpu,PhysicalMemoryOwner::WeightLoadStaging,upload.host_staging_bytes);
         }
-        memory=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(budget.build()),rank);
+        if(joined_service)
+            // Target probes execute serially; shared CPU scratch admission is
+            // the maximum actual family, not the sum of nonconcurrent roots.
+            budget.add(cpu,PhysicalMemoryOwner::ExecutionWorkspace,std::max(cpu_service_probe,gpu_service_host_probe));
+        const auto certificate=std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(budget.build());
+        if(service_native_source) {
+            service_native_source->admitFinal(certificate);
+            memory=service_native_source->memory();
+        } else memory=std::make_shared<PhysicalMemoryAuthority>(certificate,rank);
         auto manager=context->concreteWeightManager();manager->installPhysicalMemoryAuthority(memory);
         const auto frozen=manager->materialize(loading);
         if(!manager->prepareMoEExpertOverlayWeights(*runtime,DeviceId::cpu(),&frozen,nullptr,
@@ -252,6 +343,12 @@ struct FabricOriginal {
             memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ExpertShadowSlots,
                 PhysicalMemoryMaterializationKind::NewAllocation)!=shadow_bytes)
             throw std::runtime_error("CPU cohort fabric source/shadow roots differ from their original exact PMA declarations");
+        if(joined_service) {
+            std::variant<NativeCPUCollectiveProgram::DomainUse,NativeCPUCollectiveProgram::ProcessUse> use(
+                std::in_place_type<NativeCPUCollectiveProgram::DomainUse>,service_program->admit(memory,rank));
+            service_domain=GlobalTPContext::createAdmittedCPUExpertDomain(MPI_COMM_WORLD,*service_program,std::move(use));
+            if(!service_domain)throw std::runtime_error("Joined service original CPU domain was not created");
+        }
     }
     /** @return Original authority-authored swap, without publishing any candidate bank. */
     MoEOverlayResidencyTransaction transaction() const {

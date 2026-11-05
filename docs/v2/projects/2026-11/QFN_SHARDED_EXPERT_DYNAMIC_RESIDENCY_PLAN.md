@@ -24,8 +24,9 @@ round-trip through the existing-size wire and source-bound reconstruction;
 Both CUDA and ROCm now pass 20 retained MainPrefill compute/rooted-return/reset
 invocations with real empty/small cohort work and final retirement. Decode and grouped-verifier return now also pass twenty invocations per backend,
 with exact-row retained captures and same-input serial-row byte equivalence.
-Complete cohort service/transfer prices and changed-epoch publication remain
-required; public Dynamic/adoption guards are unchanged.
+Complete cohort service/transfer prices now have joined native coverage on
+CUDA and ROCm with two physical CPU sockets. Changed-epoch publication and
+inference remain required; public Dynamic/adoption guards are unchanged.
 
 Exact movement observations now retain one immutable original geometry per
 logical move and the explicit coordinate of every physical piece. Completion
@@ -36,8 +37,11 @@ physical CPU sockets: twelve transfers retain two six-piece logical rows, exact
 bytes and clean source/memory retirement. The common economy exchange now
 transports complete whole/cohort observations over exact-live MPI payloads,
 with original local geometry retained through distributed abort/drain.
-Complete-target calibration and service prices, including rooted combine and
-return, remain prerequisites to enabling dynamic sharded placement.
+Joined complete-target service and movement calibration now passes on both
+GPU backends, including rooted combine/return, compact evidence and original
+owner retirement. This uses the same demand, residency and payback policy for
+whole and sharded experts. See [the joined qualification](QFN_JOINED_SERVICE_CALIBRATION_QUALIFICATION.md).
+It does not certify committed inference-time publication or Release economy.
 
 ## Scope: fixed admitted layouts
 

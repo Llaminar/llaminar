@@ -5,19 +5,124 @@
  * Original setup geometry is declared before any sample. The existing
  * controller alone chooses warmup/sample waves and owns every real staging,
  * abort/drain and evidence exchange. No fake-ready factory, source permit,
- * synthetic inference pair or policy loop supplies measurements.
+ * synthetic inference pair or policy loop supplies measurements. GPUwhole+CPU2
+ * variants join actual prepared service and physical movement prices under the
+ * same original source/PMA; calibration never publishes a candidate bank.
  */
 #include "execution/moe/MoEOverlayEconomyCalibrationController.h"
+#include "execution/moe/MoEOverlayEconomyProfileComposer.h"
+#include "execution/moe/MoEOverlayEconomyEvidenceCodec.h"
 #include "execution/moe/MoEOverlayDistributedResidencyTransport.h"
 #include "execution/moe/MoEOverlayMPIResidencyConsensus.h"
 #include "execution/moe/MoEOverlayMPIEconomyEvidenceExchange.h"
 
 namespace llaminar2::test {
 namespace {
-/** @brief Drive the original complete-target calibration policy over real physical/MPI owners. */
-void proveCPUJointCalibrationController()
+/**
+ * @brief Join real original target service into the same existing evidence lane.
+ * @param original Same prepared model/engines/cuts/PMA as the movement controller.
+ * @param catalog Original source-bound layer equivalence authority.
+ * @param topology Same retained phase declaration as the movement evidence.
+ * @param evidence Existing exact-live MPI lane, idle before and after this call.
+ * @return Complete source-bound target prices; no installation/publication permit.
+ */
+std::shared_ptr<const MoERoutedTierServiceProfile> measureJoinedGPUCPUService(
+    FabricOriginal& original,std::shared_ptr<const MoEOverlayEconomyCalibrationLayerCatalog> catalog,
+    const ExpertHistogramProductionTopology& topology,
+    const std::shared_ptr<MoEOverlayMPIEconomyEvidenceExchange>& evidence)
 {
-    FabricOriginal original;
+    using Service=MoEOverlayCPUServiceMeasurement;
+    const auto initial=original.authority->snapshot();
+    const auto declaration=MoEOverlayPreparedTargetServicePlan::checked(initial,std::move(catalog),topology);
+    if(declaration->entries().size()!=2 || !original.service_domain)
+        throw std::logic_error("Joined calibration requires original GPUwhole and complete CPUcohort");
+    bool saw_whole=false,saw_cohort=false;
+    for(const auto& entry:declaration->entries()) {
+        if(entry.root_world_rank!=0)throw std::logic_error("Joined original target root changed");
+        if(entry.coordinate.target.isWhole()) {
+            saw_whole=true;
+            EXPECT_EQ(entry.coordinate.target.word(),original.whole);
+        } else {
+            saw_cohort=true;
+            const auto cohort=declaration->cohort(entry);
+            const auto* owner=initial->placementOwnerMap().placementFor(0,2);
+            if(!owner || !owner->shard_cohort)throw std::logic_error("Joined original expert lost cohort ownership");
+            EXPECT_EQ(cohort,owner->shard_cohort);
+            if(!cohort || cohort->participants().size()!=2)
+                throw std::logic_error("Joined service lost complete original cohort");
+            for(size_t member=0;member<2;++member) {
+                EXPECT_EQ(cohort->participants()[member].world_rank,int(member));
+                EXPECT_EQ(cohort->ownership(member).projection(WeightRole::MoEExpertGate).rows,kF/2);
+                EXPECT_EQ(cohort->ownership(member).projection(WeightRole::MoEExpertDown).columns,kF/2);
+            }
+        }
+    }
+    if(!saw_whole || !saw_cohort)throw std::logic_error("Joined target vector aliased an original member");
+    const int rank=original.mpi->rank();
+    if(rank==0) {
+        const auto endpoint=original.registry->endpoint(original.whole);
+        const auto bank=endpoint?endpoint->acquire(initial->epoch):MoEOverlayParticipantBankLease{};
+        if(!bank || bank->device!=original.whole_device || !original.service_native_source ||
+            original.service_native_source->memory()!=original.memory ||
+            original.context->nativeContextPreparation()!=original.service_native_source)
+            throw std::logic_error("Joined GPU service lost original prepared bank/source/PMA");
+    }
+    const auto before=evidence->stats();
+    const auto local=Service::measurePreparedTargets(*original.registry,*declaration,{kH,kF},
+        original.service_domain,original.memory,&original.service_profile,&original.service_inventory);
+    EXPECT_EQ(local.size(),rank==0?2u:0u);
+    declaration->requireLocalSamples(local,rank);
+    const auto wire=MoEOverlayEconomyEvidenceCodec::encodePreparedService(*declaration,local,rank);
+    const size_t root_bytes=2u*40u*kExpertHistogramProductionSourceCount;
+    EXPECT_EQ(wire.size(),rank==0?root_bytes:0u);
+    std::string error;
+    if(!evidence->beginPreparedService(declaration,local,&error))throw std::runtime_error(error);
+    std::vector<MoEOverlayPreparedTargetServiceTotals> complete;
+    const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(30);
+    for(;;) {
+        const auto progress=evidence->pollPreparedService(&complete,&error);
+        if(progress==Progress::Ready)break;
+        if(progress!=Progress::Pending || std::chrono::steady_clock::now()>=deadline)
+            throw std::runtime_error(error.empty()?"Joined service evidence exceeded original deadline":error);
+        std::this_thread::yield();
+    }
+    if(complete.size()!=2)throw std::logic_error("Joined service omitted an original target");
+    for(const auto& row:complete) {
+        const auto& entry=declaration->entry(row.coordinate);
+        for(size_t phase=0;phase<kExpertHistogramProductionSourceCount;++phase) {
+            EXPECT_GT(row.total_nanoseconds[phase],0u);
+            EXPECT_EQ(row.sample_count[phase],Service::kMeasuredSamples);
+            EXPECT_EQ(row.activation_count[phase],entry.sample_rows[phase]*Service::kMeasuredSamples);
+            EXPECT_EQ(row.expert_ids[phase],declaration->sampleExpert(entry,phase));
+        }
+        if(rank==0) {
+            const auto found=std::find_if(local.begin(),local.end(),[&](const auto& measured){return measured.coordinate==row.coordinate;});
+            if(found==local.end())throw std::logic_error("Joined root lost actual local measurement");
+            EXPECT_EQ(row.total_nanoseconds,found->total_nanoseconds);
+            EXPECT_EQ(row.activation_count,found->activation_count);
+        }
+    }
+    const auto service=MoEOverlayEconomyProfileComposer::composePreparedService(declaration,complete);
+    EXPECT_EQ(service->prepared_plan,declaration);
+    EXPECT_EQ(service->target_costs.size(),2u);
+    for(const auto& target:service->target_costs)
+        for(const auto cost:target.nanoseconds_per_activation)EXPECT_GT(cost,0u);
+    const auto after=evidence->stats();
+    EXPECT_EQ(after.evidence_payload_bytes_sent-before.evidence_payload_bytes_sent,rank==0?root_bytes:0u);
+    EXPECT_EQ(after.evidence_payload_bytes_received-before.evidence_payload_bytes_received,root_bytes);
+    EXPECT_EQ(after.evidence_payload_collectives_started-before.evidence_payload_collectives_started,1u);
+    EXPECT_TRUE(evidence->idle());
+    EXPECT_EQ(original.authority->snapshot(),initial);
+    return service;
+}
+
+/** @brief Drive the original complete-target calibration policy over real physical/MPI owners.
+ * @param whole_device Original whole endpoint; CPU retains existing physical-only test.
+ * @param joined_service Join native measured service for a disjoint whole GPU and CPU2.
+ */
+void proveCPUJointCalibrationController(DeviceId whole_device=DeviceId::cpu(),bool joined_service=false)
+{
+    FabricOriginal original(whole_device,joined_service);
     const auto initial=original.authority->snapshot();
     const auto footprint=MoEOverlayCapacityResolver::preparedFootprints(original.manifests).front();
     auto planner=std::make_shared<MoEOverlayEconomyCalibrationPlanner>(
@@ -61,6 +166,31 @@ void proveCPUJointCalibrationController()
                 .owner_map=initial->placementOwnerMap(),
                 .production_topology=ExpertHistogramProductionTopology::uniform(1,kAllExpertHistogramProductionSources),
                 .perf_device="native-cpu-joint-controller"});
+        std::shared_ptr<const MoERoutedTierServiceProfile> service;
+        if(joined_service) {
+            try {
+                service=measureJoinedGPUCPUService(original,
+                    std::make_shared<const MoEOverlayEconomyCalibrationLayerCatalog>(original.manifests),
+                    ExpertHistogramProductionTopology::uniform(1,kAllExpertHistogramProductionSources),evidence);
+            } catch(const std::exception& failure) {
+                // This also covers checked declarations before the producer's
+                // own abort boundary. Preserve the reason before fatal wake.
+                LOG_ERROR("[CPUJointCalibration] Original joined service/evidence failed rank="
+                    << original.mpi->rank() << ": " << failure.what());
+                original.service_domain->requestAbort();
+                MPI_Abort(MPI_COMM_WORLD,2);
+                throw;
+            } catch(...) {
+                LOG_ERROR("[CPUJointCalibration] Original joined service/evidence failed rank="
+                    << original.mpi->rank() << ": unknown exception");
+                // A nonroot may already be waiting in the original MPI evidence
+                // lane after its cohort work. Abort while domain/source/evidence
+                // owners still live, before stack unwinding can wait on a peer.
+                original.service_domain->requestAbort();
+                MPI_Abort(MPI_COMM_WORLD,2);
+                throw;
+            }
+        }
         MoEOverlayEconomyCalibrationController controller({.planner=planner,.ledger=ledger,
             .journal=journal,.transport=distributed,.evidence_exchange=evidence,
             .perf_device="native-cpu-joint-controller"});
@@ -129,6 +259,22 @@ void proveCPUJointCalibrationController()
             EXPECT_EQ(expanded.rows[index].geometry,sealed->rows[index].geometry);
         }
 
+        if(joined_service) {
+            // Identical completion shape to production prepared-target Composer:
+            // real service rows plus the actual source-bound migration corpus.
+            auto movement=std::make_shared<MoEOverlayMigrationCostProfile>();
+            movement->identity=expanded.identity;
+            movement->costs=costs;
+            const MoEOverlayCertifiedEconomyProfiles profiles{service,movement,{}};
+            EXPECT_TRUE(profiles.valid());
+            EXPECT_EQ(profiles.service->prepared_plan->snapshot(),initial);
+            EXPECT_EQ(profiles.migration->costs.size(),2u);
+            EXPECT_EQ(profiles.migration->costs[0].coordinate.source_target.word(),
+                profiles.migration->costs[1].coordinate.destination_target.word());
+            EXPECT_EQ(profiles.migration->costs[0].coordinate.destination_target.word(),
+                profiles.migration->costs[1].coordinate.source_target.word());
+            EXPECT_FALSE(original.authority->migrationEnabled());
+        }
         std::string reuse_error;
         EXPECT_FALSE(ledger->matchesDeclarations(*sealed,&reuse_error)); // No setup-quoted presealed reuse claim.
         EXPECT_NE(reuse_error.find("setup-bound"),std::string::npos)<<reuse_error;
@@ -138,7 +284,7 @@ void proveCPUJointCalibrationController()
         EXPECT_TRUE(consensus->idle());EXPECT_TRUE(evidence->idle());EXPECT_FALSE(journal->hasUnreadWave());
         EXPECT_EQ(journal->stats().waves_recorded,4u);EXPECT_EQ(journal->stats().waves_consumed,4u);
         EXPECT_EQ(evidence->stats().migration_profile_exchanges_completed,4u);
-        EXPECT_EQ(evidence->stats().evidence_payload_collectives_started,4u);
+        EXPECT_EQ(evidence->stats().evidence_payload_collectives_started,joined_service?5u:4u);
         const uint64_t remote_bytes=4u*uint64_t(3)*kH*kF*sizeof(float)/2;
         EXPECT_EQ(original.remote->stats().bytes_sent,remote_bytes);
         EXPECT_EQ(original.remote->stats().bytes_received,remote_bytes);
@@ -150,7 +296,22 @@ void proveCPUJointCalibrationController()
         auto endpoint=original.registry->endpoint(id);(void)endpoint->retire(initial->epoch);
         EXPECT_FALSE(endpoint->retiredEpochReaders(initial->epoch));
     }
+    if(original.service_domain) {
+        EXPECT_TRUE(original.service_domain->retireOriginalCPUExpertDomain());
+        original.service_domain.reset();
+        EXPECT_EQ(original.memory->reservedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativeCPUCollectiveDomain),0u);
+    }
     original.fabric.reset();original.registry.reset();original.remote.reset();original.context.reset();
+    if(original.service_native_source) {
+        original.service_native_use.reset();
+        EXPECT_EQ(original.service_native_source->retireReleasedContexts(),1u);
+        original.service_native_source.reset();
+    }
+    EXPECT_EQ(original.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ExecutionWorkspace,
+        PhysicalMemoryMaterializationKind::NewAllocation),0u);
+    if(joined_service && original.mpi->rank()==0)
+        EXPECT_EQ(original.memory->claimedBytes(whole_device,PhysicalMemoryOwner::ExecutionWorkspace,
+            PhysicalMemoryMaterializationKind::NewAllocation),0u);
     EXPECT_EQ(original.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::RoutedExpertWeights,
         PhysicalMemoryMaterializationKind::NewAllocation),0u);
     EXPECT_EQ(original.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ExpertShadowSlots,
@@ -163,4 +324,20 @@ TEST(MoEOverlayCPUJointCalibration, RealTwoSocketControllerSealsCompleteTargetMe
     try { proveCPUJointCalibrationController(); }
     catch(const std::exception& error) {ADD_FAILURE()<<error.what();MPI_Abort(MPI_COMM_WORLD,2);throw;}
 }
+#ifdef HAVE_CUDA
+/** @test Native CUDA whole and original CPU2 service/movement form one complete measured profile. */
+TEST(MoEOverlayGPUCPUJointCalibration, CUDAJoinedOriginalPreparedServiceAndMovement)
+{
+    try { proveCPUJointCalibrationController(DeviceId::cuda(0),true); }
+    catch(const std::exception& error) {ADD_FAILURE()<<error.what();MPI_Abort(MPI_COMM_WORLD,2);throw;}
+}
+#endif
+#ifdef HAVE_ROCM
+/** @test One native ROCm whole owner uses no RCCL communicator for original CPU2 measurements. */
+TEST(MoEOverlayGPUCPUJointCalibration, ROCmJoinedOriginalPreparedServiceAndMovement)
+{
+    try { proveCPUJointCalibrationController(DeviceId::rocm(0),true); }
+    catch(const std::exception& error) {ADD_FAILURE()<<error.what();MPI_Abort(MPI_COMM_WORLD,2);throw;}
+}
+#endif
 } // namespace llaminar2::test

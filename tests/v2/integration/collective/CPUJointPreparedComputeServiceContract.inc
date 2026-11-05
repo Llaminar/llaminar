@@ -8,6 +8,8 @@
  * prove outer target scheduling, root-only exact-live MPI evidence and Composer
  * normalization without an overlapping whole CPU execution vertex. The independent FP32 oracle is terminal test
  * arithmetic only; it is never an inference or calibration execution path.
+ * Explicitly selected failure children use these same original owners and
+ * assert that production diagnostics survive the mandatory native MPI abort.
  */
 #include "execution/moe/MoEOverlayCPUServiceMeasurement.h"
 #include "execution/moe/MoEOverlayEconomyProfileComposer.h"
@@ -62,8 +64,8 @@ float preparedComputeOracle(int row,int column,int expert)
     return result;
 }
 
-/** @test Genuine source/bank/domain owners, all three phase families and root-only complete output. */
-TEST_F(CPUExpertDomainNative, PreparedCPUJointComputeRootWallAndRetirement)
+/** @brief Exercise original native owners; rejected children retain their real source/domain. */
+void CPUExpertDomainNative::preparedComputeSourceAndRetirement(PreparedServiceRejection rejection)
 {
     // Setup is rank-local until it enters the original native collectives.
     // Any setup exception must abort the same MPI job before a peer advances.
@@ -94,7 +96,7 @@ TEST_F(CPUExpertDomainNative, PreparedCPUJointComputeRootWallAndRetirement)
     // The final two genuine lifetimes route every expert through the complete
     // original cohort. Continuation remains CPU0, but is not a second routed
     // execution vertex overlapping that cohort's physical socket.
-    const bool cohort_only = lifecycle >= 18;
+    const bool cohort_only = rejection!=PreparedServiceRejection::None || lifecycle >= 18;
     const int cohort_tier = cohort_only ? 0 : 1;
     std::shared_ptr<PhysicalMemoryAuthority> memory;
     std::weak_ptr<ITensorGemm> retired_gate;
@@ -190,6 +192,35 @@ TEST_F(CPUExpertDomainNative, PreparedCPUJointComputeRootWallAndRetirement)
         if(!observed_original_pool){original_pool_admission=memory->admission();observed_original_pool=true;}
         auto domain=GlobalTPContext::createAdmittedCPUExpertDomain(MPI_COMM_WORLD,program,std::move(use));
         requirePreparedCompute(bool(domain),"actual original admitted CPU domain");
+        if(rejection==PreparedServiceRejection::JointInitialEpoch) {
+            // Real source/bank/PMA/domain; only the initial epoch argument is
+            // deliberately invalid. The production boundary must log before
+            // its original native owner fatally aborts the MPI job.
+            (void)Service::measurePreparedCPUJoint(*registry,0,participant,0,selected_expert,
+                ExpertHistogramSource::DecodeToken,domain,memory);
+            FAIL()<<"Original CPU joint epoch rejection unexpectedly returned";
+            return;
+        }
+        if(rejection==PreparedServiceRejection::TargetsMissingPMA) {
+            MoEOverlayResidencyAuthority authority({.initial_plan=plan,
+                .model_metadata={.num_layers=1,.num_experts=e,.d_model=h,
+                    .routed_intermediate_size=f,.main_inference_layer_count=1},
+                .projection_preparation=preparation,
+                .maintenance_mode=MoERebalanceRuntimeMode::Off,
+                .participant_rebalance_policy={.enabled=false}});
+            const auto catalog=std::make_shared<const MoEOverlayEconomyCalibrationLayerCatalog>(
+                std::vector<MoEOverlayLayerWeightManifest>{selected->cohort()->source()});
+            const auto topology=ExpertHistogramProductionTopology::forRetainedExecution(
+                1,1,ExpertHistogramServingRegime::AdaptiveSerialOrMTP);
+            const auto declaration=MoEOverlayPreparedTargetServicePlan::checked(authority.snapshot(),catalog,topology);
+            // Keep the real admitted PMA alive in all owners; omit only this
+            // required caller argument to exercise the outer original guard.
+            (void)Service::measurePreparedTargets(*registry,*declaration,{h,f},domain,
+                std::shared_ptr<PhysicalMemoryAuthority>{});
+            FAIL()<<"Original prepared-target PMA rejection unexpectedly returned";
+            return;
+        }
+
         try {
             auto diagnostic=diagnostic_root.allocate(memory);
             const auto baseline=memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ExecutionWorkspace,PhysicalMemoryMaterializationKind::NewAllocation);
@@ -326,4 +357,15 @@ TEST_F(CPUExpertDomainNative, PreparedCPUJointComputeRootWallAndRetirement)
     } catch(const std::exception& failure){abortPreparedCompute(failure.what());}
       catch(...){abortPreparedCompute("unknown prepared-compute source/setup failure");}
 }
+/** @test Genuine source/bank/domain owners, all phases and root-only complete output. */
+TEST_F(CPUExpertDomainNative, PreparedCPUJointComputeRootWallAndRetirement)
+{ preparedComputeSourceAndRetirement(PreparedServiceRejection::None); }
+
+/** @test Owned failure child only: original nested producer must diagnose before abort. */
+TEST_F(CPUExpertDomainNative, DISABLED_PreparedCPUJointOriginalReasonBeforeAbort)
+{ preparedComputeSourceAndRetirement(PreparedServiceRejection::JointInitialEpoch); }
+
+/** @test Owned failure child only: original outer producer must diagnose before abort. */
+TEST_F(CPUExpertDomainNative, DISABLED_PreparedTargetsOriginalReasonBeforeAbort)
+{ preparedComputeSourceAndRetirement(PreparedServiceRejection::TargetsMissingPMA); }
 } // namespace

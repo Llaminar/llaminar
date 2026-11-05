@@ -45,6 +45,20 @@ if(V2_TEST_SOCKETS AND V2_TEST_SOCKETS GREATER_EQUAL 2)
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1"
             "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUJointPreparedComputeService)
+
+    # Negative jobs must fail through actual source/domain owners, and the
+    # production reason must be visible before the mandatory original MPI abort.
+    add_v2_test(V2_Integration_CPUPreparedServiceOriginalAbortDiagnostic
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/integration/scripts/test_prepared_service_abort_diagnostic.py
+            --helper $<TARGET_FILE:llaminar_mpi_session>
+            --probe $<TARGET_FILE:v2_integration_cpu_expert_domain_lifecycle>
+            --mpirun ${MPIEXEC_EXECUTABLE}
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;MoE;MPI;Collective;Service;Measurement;Lifecycle;Contract;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 90
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1"
+            "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1" "OMP_DYNAMIC=false")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUPreparedServiceOriginalAbortDiagnostic)
 endif()
 
 add_executable(v2_unit_cpu_expert_socket_membership unit/collective/Test__CPUExpertSocketMembership.cpp)

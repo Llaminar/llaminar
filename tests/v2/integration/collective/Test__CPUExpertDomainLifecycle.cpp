@@ -32,6 +32,12 @@ using namespace llaminar2;
 namespace {
 class CPUExpertDomainNative : public ::testing::Test {
 protected:
+    /** @brief Adversarial original-job inputs used only by owned failure children. */
+    enum class PreparedServiceRejection { None, JointInitialEpoch, TargetsMissingPMA };
+    /** @brief Run original source/domain lifecycle or one intentional rejected input.
+     * @param rejection Exact API rejection; None retains the ordinary20 lifecycle test.
+     */
+    void preparedComputeSourceAndRetirement(PreparedServiceRejection rejection);
     static inline std::optional<MPIProcessSession> session;
     static inline std::weak_ptr<const PhysicalMemoryPlanAdmissionCertificate> original_pool_admission;
     static inline bool observed_original_pool = false;

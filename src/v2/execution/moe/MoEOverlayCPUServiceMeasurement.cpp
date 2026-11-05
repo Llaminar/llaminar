@@ -7,6 +7,8 @@
  * the last stage has retired. Different phases/classes reuse that capacity
  * serially. Only the measured service rows survive setup; no graph, weight
  * copy, inference counter, or alternate placement lifecycle is retained.
+ * Original producer errors are diagnosed before fatal native abort wakes peers;
+ * failure cleanup never substitutes a different domain or source.
  */
 #include "MoEOverlayCPUServiceMeasurement.h"
 #include "planning/PlanningGPUExpertMeasurement.h"
@@ -385,11 +387,7 @@ namespace llaminar2
         // After authenticating the original native owner, every rank-local
         // rejection must wake its original peers instead of leaving them in a
         // later collective. No borrowed wrong domain is ever entered.
-        struct AbortOnFailure {
-            IGlobalTPContext& domain; int exceptions=std::uncaught_exceptions();
-            /** @brief Signal the existing native abort when failed setup unwinds. */
-            ~AbortOnFailure() {if(std::uncaught_exceptions()>exceptions)domain.requestAbort();}
-        } abort_on_failure{*domain};
+        try {
         if(!memory || epoch!=registry.initialEpoch() || expert<0)
             throw std::invalid_argument("CPU joint prepared-compute requires original admitted initial source");
         std::string error;
@@ -531,6 +529,21 @@ namespace llaminar2
         return PreparedComputeObservation{.target=MoEOverlayRouteTarget::cpuCohort(placement->tier_idx),
             .layer=layer,.expert=expert,.phase=source_phase,.logical_rows_per_invocation=static_cast<uint64_t>(rows),
             .measured_invocations=kMeasuredSamples,.total_root_wall_nanoseconds=total};
+        } catch(const std::exception& failure) {
+            // Scratch/stages have already unwound, while the authenticated
+            // original domain argument still owns the native peer-wake right.
+            LOG_ERROR("[MoEOverlayCPUServiceMeasurement] Original CPU joint job failed"
+                << " participant=" << participant << " layer=" << layer << " expert=" << expert
+                << " phase=" << static_cast<int>(source_phase) << ": " << failure.what());
+            domain->requestAbort();
+            throw;
+        } catch(...) {
+            LOG_ERROR("[MoEOverlayCPUServiceMeasurement] Original CPU joint job failed"
+                << " participant=" << participant << " layer=" << layer << " expert=" << expert
+                << " phase=" << static_cast<int>(source_phase) << ": unknown exception");
+            domain->requestAbort();
+            throw;
+        }
     }
 
     std::vector<MoEOverlayPreparedTargetServiceTotals>
@@ -547,11 +560,7 @@ namespace llaminar2
         // A member can fail a whole job while a peer has already advanced to a
         // later cohort job. Keep the SAME original abort owner over the entire
         // deterministic sequence, not just each nested fragment measurement.
-        struct SequenceAbortOnFailure {
-            IGlobalTPContext* original=nullptr;int exceptions=std::uncaught_exceptions();
-            /** @brief Wake original cohort peers if any local preparation/sample fails. */
-            ~SequenceAbortOnFailure(){if(original && std::uncaught_exceptions()>exceptions)original->requestAbort();}
-        } sequence_abort{domain.get()};
+        try {
         if(!memory || plan.snapshot()->epoch!=registry.initialEpoch())
             throw std::invalid_argument("Prepared target jobs require original initial banks and PMA");
         std::string error;auto source=registry.acquireOriginalPreparedSource(&error);
@@ -624,6 +633,19 @@ namespace llaminar2
         for(auto& [key,row]:samples)result.push_back(std::move(row));
         plan.requireLocalSamples(result,memory->worldRank());
         return result;
+        } catch(const std::exception& failure) {
+            // A peer may already await a later cohort job. Diagnose the original
+            // rejection before requestAbort fatally terminates the MPI job.
+            LOG_ERROR("[MoEOverlayCPUServiceMeasurement] Original prepared target sequence failed"
+                << " rank=" << (memory?memory->worldRank():-1) << ": " << failure.what());
+            if(domain)domain->requestAbort();
+            throw;
+        } catch(...) {
+            LOG_ERROR("[MoEOverlayCPUServiceMeasurement] Original prepared target sequence failed"
+                << " rank=" << (memory?memory->worldRank():-1) << ": unknown exception");
+            if(domain)domain->requestAbort();
+            throw;
+        }
     }
 
     std::vector<MoEOverlayParticipantLayerServiceTotals> MoEOverlayCPUServiceMeasurement::measure(

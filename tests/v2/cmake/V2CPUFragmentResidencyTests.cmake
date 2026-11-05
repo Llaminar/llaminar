@@ -343,6 +343,31 @@ if(V2_TEST_SOCKETS AND V2_TEST_SOCKETS GREATER_EQUAL 2)
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1"
             "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUJointCalibrationControllerPhysicalFabric)
+
+    # One native GPU owner and the same original two physical CPU ranks. GPU
+    # service uses native events; the CPU collective and movement use original
+    # ShmemSpin/MPI. No multi-GPU NCCL/RCCL communicator is introduced.
+    foreach(_joined_backend CUDA ROCm)
+        if((_joined_backend STREQUAL "CUDA" AND HAVE_CUDA) OR
+           (_joined_backend STREQUAL "ROCm" AND HAVE_ROCM))
+            if(_joined_backend STREQUAL "CUDA")
+                set(_joined_other "LLAMINAR_SKIP_ROCM_STARTUP=1")
+            else()
+                set(_joined_other "LLAMINAR_SKIP_CUDA_STARTUP=1")
+            endif()
+            set(_joined_name V2_Integration_${_joined_backend}_CPUJointPreparedServiceMovementCalibration)
+            add_v2_test(${_joined_name}
+                COMMAND $<TARGET_FILE:v2_integration_moe_overlay_residency_consensus_mpi>
+                    --gtest_filter=MoEOverlayGPUCPUJointCalibration.${_joined_backend}JoinedOriginalPreparedServiceAndMovement
+                LABELS "V2;Integration;ProductionTestPreflight;${_joined_backend};CPU;MoE;MPI;Residency;Transfer;Calibration;Measurement;Lifecycle;Contract"
+                MPI_PROCS 2 NO_MODELS TIMEOUT 120
+                ENVIRONMENT "${_joined_other}" "OMP_NUM_THREADS=1" "OMP_DYNAMIC=false")
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_joined_name})
+        endif()
+    endforeach()
+    unset(_joined_backend)
+    unset(_joined_other)
+    unset(_joined_name)
 else()
     message(STATUS "CPU joint calibration controller: unqualified without two physical sockets; no MPI launch")
 endif()
