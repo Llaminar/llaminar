@@ -263,6 +263,11 @@ INSTANTIATE_TEST_SUITE_P(Qwen4ExpCPUJointWorld2FullStage,Qwen4ExpCPUJointFullSta
     ::testing::ValuesIn(qwen4ExpCPUJointWorld2NumericalCases()),
     [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
 
+/** @test Actual declared host authority, calibrated movement and epoch publication on original GPU/CPU2. */
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpCPUJointWorld2DynamicFullStage,Qwen4ExpCPUJointFullStageTest,
+    ::testing::ValuesIn(qwen4ExpCPUJointWorld2DynamicNumericalCases()),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
+
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpMain, Qwen4ExpMainParityTest,
     ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpMain", qwen4ExpProductionCases())),
     [](const ::testing::TestParamInfo<ModelParityCase> &info) { return info.param.testName(); });

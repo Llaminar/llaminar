@@ -86,16 +86,15 @@ namespace llaminar2
             return source.domain_name != destination.domain_name;
         }
 
-        bool crossesWorldRank() const noexcept
-        {
-            return source.owner_world_rank_known &&
-                   destination.owner_world_rank_known &&
-                   source.owner_world_rank != destination.owner_world_rank;
-        }
+        /** @return Whether a required original member intersection crosses a known MPI rank. */
+        bool crossesWorldRank() const noexcept;
 
+        /** @return Whether actual whole/cohort compute backends differ, without a representative member. */
         bool crossesBackend() const noexcept
         {
-            return source.device.type != destination.device.type;
+            const auto from = source.shard_cohort ? DeviceType::CPU : source.device.type;
+            const auto to = destination.shard_cohort ? DeviceType::CPU : destination.device.type;
+            return from != to;
         }
     };
 
@@ -1522,6 +1521,7 @@ namespace llaminar2
         /** Device-free regression access for holding a real proposal lock. */
         friend struct test::MoEOverlayResidencyAuthorityConcurrencyPeer;
         friend class MoEOverlayEconomyCalibrationPlanner;
+        friend class MoEOverlayInferenceTransactionCoordinator;
         friend struct test::MoEOverlayJointPlacementCandidateTestAccess;
 
         /** Sole typed owner of the shared runtime-histogram drain lane. */
@@ -1704,6 +1704,19 @@ namespace llaminar2
         static void requireCapacityPreserving(
             const MoEOverlayResidencySnapshot &previous,
             const MoEOverlayResidencySnapshot &candidate);
+        /**
+         * @brief Borrow the exact epoch of an already admitted graph sequence.
+         * @param parent Live sequence lease from this same original authority.
+         * @return Independent existing sequence/ticket ownership of that epoch.
+         * @throws std::invalid_argument For empty, moved, foreign or dispatch parents.
+         * @throws std::logic_error If the retained original publication state changed.
+         * @note The coordinator serializes access to parent against its move/destruction.
+         * A parent already excludes publication, so a reserved publication gate
+         * cannot block its descendants. Every returned lease releases its own
+         * original counters; this method neither selects an epoch nor opens a gate.
+         */
+        [[nodiscard]] TicketLease borrowGraphSequenceSnapshot(const TicketLease& parent);
+
         /** @brief Acquire the current publication for one typed reader class. */
         std::optional<TicketLease> tryAcquireCurrentSnapshot(
             TicketLeasePurpose purpose);

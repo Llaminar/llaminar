@@ -65,6 +65,8 @@
 #include "execution/runner/IOrchestrationRunnerFactory.h"
 #include "utils/NativeVerifierRowEvidence.h"
 #include "utils/ScopedMoEParityCoordinatedSession.h"
+#include "app/modes/MoEMovementLedgerJson.h"
+#include "execution/moe/MoEExpertOwnerMap.h"
 
 #include <gtest/gtest.h>
 #include <memory>
@@ -8227,6 +8229,24 @@ namespace llaminar2::test::parity
             EXPECT_GT(global[3], 0.0f)
                 << "Dynamic ExpertOverlay parity applied no moved placement.\n"
                 << summary;
+
+            if(cfg().moe_routed_expert_plan && MoEExpertOwnerMap::usesCPUJointFragments(*cfg().moe_routed_expert_plan)){
+                ASSERT_TRUE(orch_runner_)<<"Dynamic cohort terminal evidence lost its original runner";
+                const auto* info=::testing::UnitTest::GetInstance()->current_test_info();
+                ASSERT_NE(info,nullptr);
+                const auto stats=nlohmann::json::parse(PerfStatsCollector::jsonString({"moe_overlay_residency"}));
+                const auto rank=mpi_ctx_?mpi_ctx_->rank():0;
+                // Serialize the existing owner snapshot only at the closed
+                // original worker boundary. No inference state is read back.
+                const nlohmann::json document={{"schema","llaminar.cohort-parity-movement.v1"},
+                    {"case",std::string(info->test_suite_name())+"."+info->name()},
+                    {"world_rank",rank},{"world_size",mpiWorldSize()},
+                    {"topology",moeMovementTopologyJson(orch_runner_->moeOptimizationMovementTopology())},
+                    {"movement",moeMovementLedgerJson(orch_runner_->moeOptimizationMovementLedger())},
+                    {"records",stats.at("records")}};
+                std::ofstream output(ensureResultsDir()/("cohort_movement_rank_"+std::to_string(rank)+".json"),std::ios::trunc);
+                ASSERT_TRUE(output.is_open());output<<document.dump(2)<<'\n';output.close();ASSERT_TRUE(output.good());
+            }
         }
 
         /** @brief Immutable original layer inventory required by both symmetric and coordinated audits. */
@@ -12368,7 +12388,7 @@ namespace llaminar2::test::parity
          * @brief Require every original declared raw layer checkpoint, independently of diagnostic verdicts.
          * @tparam Layers Ordinary or TP source-indexed records.
          * @param layers Actual comparison banks. @param required Existing phase-specific graph declaration.
-         * @param phase Actual main phase; Decode requires independently authenticated query provenance.
+         * @param phase Mandatory actual main phase; Decode requires independently authenticated query provenance.
          * @return Success only when each declared layer key has one valid typed evidence record.
          *
          * EMBEDDING and LM_HEAD have separate default-invalid witnesses. Optional
@@ -12377,7 +12397,7 @@ namespace llaminar2::test::parity
         template <typename Layers>
         static ::testing::AssertionResult acceptsRequiredRawParityStages(
             const Layers &layers, const std::vector<std::string> &required,
-            ParityForwardPhase phase=ParityForwardPhase::Prefill)
+            ParityForwardPhase phase)
         {
             if (required.empty()) return ::testing::AssertionFailure() << "Final-logit contract has no original required snapshot declaration";
             for (const auto &key : required)

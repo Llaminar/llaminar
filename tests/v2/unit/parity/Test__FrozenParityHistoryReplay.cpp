@@ -16,6 +16,7 @@
 #include "integration/parity/qwen4exp/Qwen4ExpGPUAdaptiveParityCases.h"
 #include "integration/parity/ModelParityRuntimeExport.h"
 #include "config/OrchestrationConfigParser.h"
+#include "execution/moe/MoEExpertOverlayAuthorityPlan.h"
 #include <gtest/gtest.h>
 #include "mocks/MockMPIContext.h"
 #include "mocks/MockOrchestrationRunner.h"
@@ -250,7 +251,25 @@ TEST(FrozenParityHistoryReplay, CanonicalAll48InventoryRemainsMandatory)
     const auto definition = qwen4exp::qwen4ExpProductionDefinition(qwen4exp::Qwen4ExpParityTopology::CPU);
     const auto &keys = definition.graph_snapshot_policy.required_prefill_snapshot_keys;
     ASSERT_FALSE(keys.empty());
-    EXPECT_THROW(replay.requireSnapshotInventory(keys, -1), std::invalid_argument);
+    const auto require_diagnostic = [&](int step, const std::string &key, const char *state) {
+        const auto expected_path = std::filesystem::path(replay.referenceDirectory()) /
+            ((step < 0 ? std::string{} : "decode_step" + std::to_string(step) + "_") + key + ".npy");
+        try
+        {
+            replay.requireSnapshotInventory(keys, step);
+            FAIL() << "Expected the original checkpoint metadata failure";
+        }
+        catch (const std::invalid_argument &error)
+        {
+            const std::string message = error.what();
+            EXPECT_NE(message.find(step < 0 ? "phase=prefill" : "phase=decode"), std::string::npos) << message;
+            EXPECT_NE(message.find(" step=" + std::to_string(step)), std::string::npos) << message;
+            EXPECT_NE(message.find(" key=" + key), std::string::npos) << message;
+            EXPECT_NE(message.find(" path=" + expected_path.string()), std::string::npos) << message;
+            EXPECT_NE(message.find(std::string(" state=") + state), std::string::npos) << message;
+        }
+    };
+    require_diagnostic(-1, keys.front(), "missing");
     for (const auto &key : keys)
     {
         // Deliberately not valid NPY data: this tests only the metadata presence
@@ -259,9 +278,14 @@ TEST(FrozenParityHistoryReplay, CanonicalAll48InventoryRemainsMandatory)
         file << 'x';
     }
     EXPECT_NO_THROW(replay.requireSnapshotInventory(keys, -1));
-    EXPECT_THROW(replay.requireSnapshotInventory(keys, 0), std::invalid_argument);
-    std::filesystem::remove(std::filesystem::path(replay.referenceDirectory()) / (keys.back() + ".npy"));
-    EXPECT_THROW(replay.requireSnapshotInventory(keys, -1), std::invalid_argument);
+    require_diagnostic(0, keys.front(), "missing");
+    const auto last_path = std::filesystem::path(replay.referenceDirectory()) / (keys.back() + ".npy");
+    { std::ofstream empty(last_path, std::ios::trunc); }
+    require_diagnostic(-1, keys.back(), "empty");
+    { std::ofstream restored(last_path); restored << 'x'; }
+    EXPECT_NO_THROW(replay.requireSnapshotInventory(keys, -1));
+    std::filesystem::remove(last_path);
+    require_diagnostic(-1, keys.back(), "missing");
 }
 /** @test Explicit six-step work changes cardinality only and requires the later reference keys. */
 TEST(FrozenParityHistoryReplay, SixStepObservationKeepsLimitsAndRequiresOffsetFive)
@@ -866,3 +890,87 @@ TEST(FrozenParityHistoryReplay, FreshContextConfigurationRetainsOriginalOwnerBef
 }
 
 } // namespace llaminar2::test::parity
+
+/** @test Dynamic placement diagnostic retains the original frozen source/socket request and real movement obligation. */
+TEST(FrozenParityHistoryReplay, CPUJointDynamicSiblingRetainsOriginalSourceAndRequiresMovement)
+{
+    using namespace llaminar2;
+    using namespace llaminar2::test::parity;
+    const auto &original=llaminar2::test::parity::qwen4exp::qwen4ExpCPUJointWorld2NumericalCases().front();
+    const auto &dynamic=llaminar2::test::parity::qwen4exp::qwen4ExpCPUJointWorld2DynamicNumericalCases().front();
+    EXPECT_EQ(dynamic.topology.test_id,original.topology.test_id);
+    EXPECT_EQ(dynamic.topology.mpi_ranks,2);
+    EXPECT_EQ(dynamic.model.model_path,original.model.model_path);
+    ASSERT_TRUE(dynamic.model.shared_predictor);
+    ASSERT_TRUE(original.model.shared_predictor);
+    EXPECT_EQ(dynamic.model.shared_predictor->path(),original.model.shared_predictor->path());
+    EXPECT_EQ(dynamic.mtp,ModelParityMTP::Off);
+    EXPECT_EQ(dynamic.retained_mtp_draft_capacity,0);
+    EXPECT_EQ(dynamic.inventory_role,ModelParityInventoryRole::NumericalDiagnostic);
+    EXPECT_TRUE(dynamic.requiresPhysicalExpertMovement());
+    std::ostringstream dynamic_metadata,static_metadata;
+    PrintTo(dynamic,&dynamic_metadata);PrintTo(original,&static_metadata);
+    EXPECT_TRUE(nlohmann::json::parse(dynamic_metadata.str()).at("runtime").at("cohort_publication_inference").get<bool>());
+    EXPECT_FALSE(nlohmann::json::parse(static_metadata.str()).at("runtime").contains("cohort_publication_inference"));
+
+    for(int rank=0;rank<2;++rank) {
+        const auto config=dynamic.makeOrchestrationConfig(dynamic.model.model_path,rank);
+        EXPECT_EQ(config.moe_rebalance.mode,MoERebalanceRuntimeMode::Dynamic);
+        // The parity adapter declares topology; production rank resolution
+        // seals the authority before admission, weights, or graphs exist.
+        ASSERT_TRUE(config.moe_routed_expert_plan);
+        EXPECT_EQ(config.moe_routed_expert_plan->authority_execution,
+                  MoEOverlayAuthorityExecutionKind::Unresolved);
+        const auto resolved = normalizeMoEExpertOverlayAuthorityPlan({
+            .requested_plan = config.moe_routed_expert_plan,
+            .model_has_routed_experts = true,
+            .world_rank = rank,
+            .residency_maintenance = config.moe_rebalance.mode});
+        ASSERT_TRUE(resolved.plan);
+        EXPECT_EQ(resolved.disposition, MoEExpertOverlayAuthorityPlanDisposition::ExplicitPlan);
+        EXPECT_EQ(resolved.plan->authority_execution, MoEOverlayAuthorityExecutionKind::HostResident);
+        EXPECT_EQ(config.moe_routed_expert_plan->authority_execution,
+                  MoEOverlayAuthorityExecutionKind::Unresolved);
+        EXPECT_EQ(config.moe_routed_expert_plan->domains.back().routed_compute_policy,RoutedExpertComputePolicy::TensorSharded);
+        EXPECT_TRUE(dynamic.toTestConfig().moe_rebalance_exercise.enabled);
+    }
+}
+
+/** @test Actual Dynamic frozen-history worker projection preserves all original source policy. */
+TEST(FrozenParityHistoryReplay, CPUJointDynamicFrozenWorkersPreserveOriginalPolicy)
+{
+    using namespace llaminar2;
+    using namespace llaminar2::test::parity;
+    for (const auto &cell : llaminar2::test::parity::qwen4exp::qwen4ExpCPUJointWorld2DynamicNumericalCases())
+    {
+        MetadataOwner owner;
+        auto value = descriptor(owner);
+        auto arguments = modelParityDiagnosticBenchmarkArguments(cell);
+        arguments.insert(arguments.begin(), "dynamic-history-contract");
+        std::vector<char *> argv;
+        for (auto &argument : arguments) argv.push_back(argument.data());
+        auto config = OrchestrationConfigParser{}.parseArgs(static_cast<int>(argv.size()), argv.data());
+        ASSERT_EQ(config.moe_rebalance.mode, MoERebalanceRuntimeMode::Dynamic);
+        ASSERT_EQ(config.moe_routed_expert_plan->residency_policy, RoutedExpertResidencyPolicy::RoutedTierRebalanced);
+        ASSERT_TRUE(cell.requiresPhysicalExpertMovement());
+        // Metadata-only equivalent of the original source-bound worker handoff:
+        // no team, source payload, model, PMA grant or numerical verdict exists.
+        config.n_threads = 28;
+        value["expected_config"] = json::parse(serializeOrchestrationConfig(config));
+        const auto replay = checked(value);
+        EXPECT_EQ(replay.requestedCPUWorkers(), 28);
+        auto current = config;
+        current.n_threads = 1;
+        EXPECT_NO_THROW(replay.applyCPUWorkers(current));
+        EXPECT_EQ(serializeOrchestrationConfig(current), serializeOrchestrationConfig(config));
+        auto foreign = config;
+        foreign.mpi_procs = 4;
+        value["expected_config"] = json::parse(serializeOrchestrationConfig(foreign));
+        EXPECT_THROW(checked(value).requestedCPUWorkers(), std::invalid_argument);
+        foreign = config;
+        foreign.moe_routed_expert_plan = std::make_shared<MoERoutedExpertPlacementPlan>(*config.moe_routed_expert_plan);
+        foreign.moe_routed_expert_plan->residency_policy = RoutedExpertResidencyPolicy::StaticById;
+        value["expected_config"] = json::parse(serializeOrchestrationConfig(foreign));
+        EXPECT_THROW(checked(value).requestedCPUWorkers(), std::invalid_argument);
+    }
+}

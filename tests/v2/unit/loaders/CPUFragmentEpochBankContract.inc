@@ -7,11 +7,26 @@
  */
 #include "fixtures/moe/MoEOverlayJointPlacementCandidateTestAccess.h"
 #include "execution/moe/MoEOverlayParticipantMigration.h"
+#include <optional>
+#include <cstdlib>
 
 /** @test Original context, closed arrival and fixed CPU family survive a local candidate bank. */
 TEST(CPUFragmentEpochBankContract, OriginalSourceIssuesCandidateAndRetainsOldLease)
 {
     using namespace llaminar2;
+    // The original collector owns reset/configuration; this test retains no
+    // record address or policy epoch while genuine local GEMMs execute.
+    /** @brief Serial test-owned collector policy; restores caller configuration after real CPU execution. */
+    struct EvidenceScope {
+        std::optional<std::string> json,filter;
+        /** @brief Enable only the original residency evidence domain for this fixture. */
+        EvidenceScope(){if(const auto* v=std::getenv("LLAMINAR_PERF_STATS_JSON"))json=v;
+            if(const auto* v=std::getenv("LLAMINAR_PERF_STATS_FILTER"))filter=v;
+            ::setenv("LLAMINAR_PERF_STATS_JSON","1",1);::setenv("LLAMINAR_PERF_STATS_FILTER","moe_overlay_residency",1);PerfStatsCollector::reset();}
+        /** @brief Reset observations and restore the exact caller policy. */
+        ~EvidenceScope(){if(json)::setenv("LLAMINAR_PERF_STATS_JSON",json->c_str(),1);else ::unsetenv("LLAMINAR_PERF_STATS_JSON");
+            if(filter)::setenv("LLAMINAR_PERF_STATS_FILTER",filter->c_str(),1);else ::unsetenv("LLAMINAR_PERF_STATS_FILTER");PerfStatsCollector::reset();}
+    } evidence;
     const auto original = staticJointOriginal();
     auto context = coldSourceContext(original);
     const ModelContextId model{reinterpret_cast<uint64_t>(context.get())};
@@ -109,8 +124,11 @@ TEST(CPUFragmentEpochBankContract, OriginalSourceIssuesCandidateAndRetainsOldLea
     EXPECT_FALSE(arrival->completePayload(whole,&error));
     MoEOverlayPreparedCPUFragmentPayload fragment;
     ASSERT_TRUE(arrival->completeCPUFragment(fragment,&error))<<error;
+    EXPECT_EQ(fragment.arrivalEpoch(),2u);
     EXPECT_EQ(fragment.model(),model); EXPECT_EQ(fragment.cohort(),selected->cohort());
     EXPECT_EQ(fragment.preparation(),original.preparation); EXPECT_EQ(fragment.expertId(),1);
+    EXPECT_EQ(old->bankLease()->layerForModelLayer(7).cpu_fragments[64].arrivalEpoch(),0u);
+    EXPECT_THROW(fragment.recordCompletedExecution(1,1),std::logic_error);
     auto next=*old->bankLease(); next.epoch=2;
     next.layerForModelLayer(7).clearExpert(64);
     next.layerForModelLayer(7).setResidentCPUFragment(1,fragment);
@@ -215,6 +233,12 @@ TEST(CPUFragmentEpochBankContract, OriginalSourceIssuesCandidateAndRetainsOldLea
    for(size_t column=0;column<8;++column)EXPECT_TRUE(std::isfinite(record[column]));
   }
  }
+
+ const auto completed=PerfStatsCollector::snapshot({"moe_overlay_residency.completed_cpu_fragment_execution"});
+ ASSERT_EQ(completed.size(),1u);EXPECT_EQ(completed.front().tags.at("expert"),"1");
+ EXPECT_GT(completed.front().value,0.0);EXPECT_EQ(completed.front().sequence_minimum_words,(std::vector<uint64_t>{2,2}));
+ EXPECT_EQ(completed.front().sequence_maximum_words,(std::vector<uint64_t>{2,2}));
+ EXPECT_EQ(active->bankLease()->layerForModelLayer(7).cpu_fragments[1].arrivalEpoch(),2u);
 
  } // The fixed executor retires before its setup registry owner.
     std::weak_ptr<ModelContext> original_context=context;

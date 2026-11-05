@@ -83,3 +83,23 @@ if(TARGET v2_unit_moe_overlay_inference_transaction)
             "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RankLocalExpertSubmissionResetReplay)
 endif()
+
+# Original host sequence ownership, including pending publication and terminal failures.
+if(TARGET v2_unit_moe_overlay_residency_authority)
+    add_v2_test(V2_Integration_MoEGraphSequenceDescendantLifecycle
+        COMMAND $<TARGET_FILE:v2_unit_moe_overlay_residency_authority>
+            --gtest_filter=Test__MoEOverlayResidencyAuthority.GraphSequenceDescendantsDrainReservedPublication:Test__MoEOverlayResidencyAuthority.GraphSequenceDescendantsRejectInvalidParents
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;ExpertOverlay;Lifecycle;Contract;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEGraphSequenceDescendantLifecycle)
+endif()
+if(TARGET v2_unit_moe_overlay_inference_transaction)
+    add_v2_test(V2_Integration_MoEFinitePlacementScopeLifecycle
+        COMMAND $<TARGET_FILE:v2_unit_moe_overlay_inference_transaction>
+            --gtest_filter=Test__MoEOverlayInferenceTransaction.FinitePlacementScope* --gtest_repeat=20 --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;ExpertOverlay;Lifecycle;Contract;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEFinitePlacementScopeLifecycle)
+endif()

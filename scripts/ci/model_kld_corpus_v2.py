@@ -219,6 +219,10 @@ def validate_observation(manifest, report):
             'Missing native source/binary identity')
     require(all(report.get('proofs', {}).get(k) is True for k in PROOFS), 'Missing source/path/publication/reset/retirement proof')
     _validate_rows(manifest, report)
+    if _same_placement_reset_required(topology):
+        _reset_comparison_frames(manifest, topology, report)
+    else:
+        require('reset_pair' not in report, 'Original reset policy cannot substitute a late placement pair')
     return report
 
 
@@ -493,6 +497,86 @@ def _case_frames(manifest, document):
     return cases
 
 
+def _configured_cpu_joint_domains(configuration):
+    """Project original routed CPU cohorts from the same canonical tier/domain membership.
+
+    This consumes serialized source intent only; native typed admission remains
+    authoritative. Unreferenced storage domains cannot select a reset policy.
+    """
+    plan = configuration.get('moe_routed_expert_plan')
+    if plan is None:
+        return []
+    require(type(plan) is dict, 'Malformed original routed expert plan')
+    tiers = {tier.get('domain') for tier in plan.get('routed_tiers', [])}
+    return [domain for domain in plan.get('domains', []) if domain.get('name') in tiers and
+            domain.get('routed_compute_policy') == 'TensorSharded' and
+            len(domain.get('participants', [])) > 1 and
+            all(endpoint.get('device_type') == 'CPU' for endpoint in domain['participants'])]
+
+
+def _same_placement_reset_required(topology):
+    """Mirror the typed native CPU-joint selection; ordinary Dynamic keeps its exact oracle."""
+    configuration = topology['expected_config'].get('configuration', {})
+    if configuration.get('moe_rebalance', {}).get('mode') != 'Dynamic':
+        return False
+    joint = _configured_cpu_joint_domains(configuration)
+    if not joint:
+        return False
+    plan = configuration['moe_routed_expert_plan']
+    world = configuration.get('mpi_procs')
+    continuation = [domain for domain in plan.get('domains', []) if domain.get('name') == plan.get('continuation_domain')]
+    require(type(world) is int and 2 <= world <= 8 and len(joint) == 1 and
+            plan.get('enabled') is True and plan.get('topology') == 'TieredOverlay' and
+            len(plan.get('domains', [])) == 2 and
+            sorted(joint[0].get('world_ranks', [])) == list(range(world)) and
+            len(joint[0]['participants']) == world and joint[0].get('scope') == 'NODE_LOCAL' and
+            plan.get('residency_policy') == 'RoutedTierRebalanced' and
+            plan.get('authority_execution') in ('Unresolved', 'HostResident') and
+            plan.get('continuation_domain') == plan.get('base_model_domain') == plan.get('shared_expert_domain') and
+            len(continuation) == 1 and len(continuation[0].get('participants', [])) == 1 and
+            continuation[0]['participants'][0].get('device_type') in ('CUDA', 'ROCm') and
+            continuation[0].get('owner_rank') == 0 and continuation[0].get('scope') in ('SINGLE', 'RANK_LOCAL'),
+            'Late reset pair requires original mixed CPU joint host authority')
+    return True
+
+
+def _reset_comparison_frames(manifest, topology, document):
+    """Bind reset operands to original history and the real finite placement scope.
+
+    Dynamic CPU joint observes an explicit late baseline outside the numerical case bank.
+    The returned scope describes the original coordinator's successful checked
+    descendants; it never selects/restores an epoch or replaces source proof.
+    Static retains the original early/late byte comparison and document shape.
+    This metadata validator reads no logits and grants no numerical verdict.
+    """
+    original_history = next(h for h in manifest['histories'] if h['id'] == manifest['reset_control']['history_id'])
+    reset_history = dict(original_history, id=manifest['reset_control']['replay_id'])
+    reset_case = document.get('reset_case')
+    require(type(reset_case) is dict, 'Missing actual reset frame')
+    _case_frames(dict(manifest, histories=[reset_history]), dict(cases=[reset_case]))
+    configuration = topology['expected_config'].get('configuration', {})
+    dynamic = _same_placement_reset_required(topology)
+    if not dynamic:
+        require('reset_pair' not in document, 'Original reset policy cannot substitute a late placement pair')
+        baseline = next(case for case in document['cases'] if case['history_id'] == original_history['id'])
+        return baseline, reset_case, None
+    pair = document.get('reset_pair')
+    require(type(pair) is dict and set(pair) == {'schema', 'history_id', 'baseline', 'placement_scope'} and
+            pair.get('schema') == 'llaminar.qfn-reset-pair.v1' and pair.get('history_id') == original_history['id'],
+            'Dynamic CPU joint reset requires its actual same-placement late baseline pair')
+    baseline = pair['baseline']
+    require(type(baseline) is dict, 'Missing actual late reset baseline frame')
+    _case_frames(dict(manifest, histories=[original_history]), dict(cases=[baseline]))
+    scope = pair['placement_scope']
+    maximum = (1 << 64) - 1
+    require(type(scope) is dict and set(scope) == {'placement_epoch', 'first_sequence_id', 'next_sequence_id'} and
+            all(type(value) is int and 0 <= value <= maximum for value in scope.values()) and
+            scope['placement_epoch'] > 0 and scope['next_sequence_id'] > scope['first_sequence_id'] and
+            scope['next_sequence_id'] - scope['first_sequence_id'] >= 2,
+            'Dynamic reset lacks a successful original placement scope across both requests')
+    return baseline, reset_case, pair
+
+
 def load_corpus(root, *, catalog, manifest_path=None):
     """Load an explicitly approved v2 generation through canonical path/stat authority.
 
@@ -549,9 +633,7 @@ def validate_distributed_rank_reports(manifest, topology, document, report_path)
             group.get('authority_rank') == 0 and
             group.get('rank_reports') == [f'rank-{rank}.json' for rank in range(world)],
             'Missing/partial distributed observer membership')
-    domains = topology['expected_config']['configuration'].get('moe_routed_expert_plan', {}).get('domains', [])
-    joint = [domain for domain in domains if domain.get('routed_compute_policy') == 'TensorSharded' and
-             domain.get('participants') and all(endpoint.get('device_type') == 'CPU' for endpoint in domain['participants'])]
+    joint = _configured_cpu_joint_domains(topology['expected_config']['configuration'])
     require(len(joint) == 1 and sorted(joint[0].get('world_ranks', [])) == list(range(world)),
             'Distributed original CPU cohort membership incomplete')
     ordered_members = joint[0]['world_ranks']
@@ -619,10 +701,7 @@ def score_observation(corpus, report_path):
             all(type(k) is str and type(v) is str and v for k, v in native_identity.items()),
             'Missing native source/binary identity')
     cases = _case_frames(manifest, document)
-    reset_history = dict(next(h for h in manifest['histories'] if h['id'] == manifest['reset_control']['history_id']))
-    reset_history['id'] = manifest['reset_control']['replay_id']
-    reset_case = document.get('reset_case')
-    _case_frames(dict(manifest, histories=[reset_history]), dict(cases=[reset_case]))
+    baseline_case, reset_case, reset_pair = _reset_comparison_frames(manifest, topology, document)
     pins = {str(report_path): identity(report_path)}; outputs = []
     pins.update(validate_distributed_rank_reports(manifest, topology, document, report_path))
     for case in cases:
@@ -636,18 +715,32 @@ def score_observation(corpus, report_path):
             reset_payload.stat().st_size == len(reset_case['rows'])*manifest['vocabulary']*4,
             'Invalid full-row reset artifact')
     pins[str(reset_payload)] = identity(reset_payload)
-    owned = {(identity(p)[1], identity(p)[2]) for p in outputs+[reset_payload]}
-    require(len(owned) == len(outputs)+1, 'Aliased history/reset payload owner')
+    baseline_payload = None
+    if reset_pair is not None:
+        baseline_payload = Path(baseline_case.get('logits_file', '')).resolve(strict=True)
+        require(baseline_payload.is_relative_to(report_path.parent) and baseline_payload.is_file() and
+                baseline_payload.stat().st_size == len(baseline_case['rows'])*manifest['vocabulary']*4,
+                'Invalid full-row late reset baseline artifact')
+        pins[str(baseline_payload)] = identity(baseline_payload)
+    reset_outputs = [reset_payload] + ([baseline_payload] if baseline_payload is not None else [])
+    owned = {(identity(p)[1], identity(p)[2]) for p in outputs+reset_outputs}
+    require(len(owned) == len(outputs)+len(reset_outputs), 'Aliased history/reset payload owner')
     original_payloads = {(identity(p)[1], identity(p)[2]) for p in corpus['reference_payloads'].values()}
     require(not (owned & original_payloads), 'Native output aliases original reference payload')
     unchanged(corpus['inputs']); unchanged(pins)
     import numpy as np
     initial_index = next(i for i,h in enumerate(manifest['histories']) if h['id'] == manifest['reset_control']['history_id'])
     reset_shape = (len(reset_case['rows']), manifest['vocabulary'])
-    initial = np.memmap(outputs[initial_index], dtype='<u4', mode='r', shape=reset_shape)
+    initial = np.memmap(baseline_payload if baseline_payload is not None else outputs[initial_index],
+                        dtype='<u4', mode='r', shape=reset_shape)
     repeated = np.memmap(reset_payload, dtype='<u4', mode='r', shape=reset_shape)
-    require(np.array_equal(initial, repeated), 'Terminal reset changed full-logit bytes')
-    del initial, repeated
+    try:
+        require(np.array_equal(initial, repeated), 'Terminal reset changed full-logit bytes')
+        if reset_pair is not None:
+            require(all(np.isfinite(row).all() for row in initial.view('<f4')),
+                    'Late reset baseline contains nonfinite logits')
+    finally:
+        del initial, repeated
     rows = []
     for case, path in zip(cases, outputs):
         shape = (len(case['rows']), manifest['vocabulary'])
@@ -666,4 +759,6 @@ def score_observation(corpus, report_path):
               'backend', 'topology_id', 'runtime_config_digest', 'arithmetic', 'native_identity', 'proofs')}
     result.update(schema='llaminar.model-kld-metrics.v2', complete=True, metric=METRIC,
                   rows=rows, acceptance='not_evaluated_requires_approved_baseline_and_calibration')
+    if reset_pair is not None:
+        result.update(reset_pair=reset_pair, reset_case=reset_case)
     return validate_observation(manifest, result)

@@ -488,14 +488,8 @@ namespace llaminar2
             MoEOverlayEconomyCalibrationPlanner planner({.live_snapshot = snapshot,
                 .complete_expert_bytes_per_layer = complete_expert_bytes_per_layer_});
             required = planner.requiredTargetCoordinates();
-            for (const auto &coordinate : required)
-            {
-                const auto wave = planner.buildPairSwap(coordinate.source_target,
-                    coordinate.destination_target, coordinate.layer, 1);
-                original_geometry.emplace(coordinate, makePhysicalMoEOverlayMeasurementGeometry(
-                    wave.migrations.front(), manifests.at(storageIndexForModelLayer(coordinate.layer)),
-                    snapshot->expertCount(), snapshot->placementOwnerMap()));
-            }
+            for (const auto &declaration : planner.requiredTargetMeasurements(manifests))
+                original_geometry.emplace(declaration.coordinate, declaration.geometry);
         }
 
         std::map<Coordinate, const MoEOverlayTargetLayerMigrationMeasurement *> observed;
@@ -643,6 +637,51 @@ namespace llaminar2
                 }
         }
         std::sort(required_target_coordinates_.begin(), required_target_coordinates_.end());
+    }
+
+    std::vector<MoEOverlayRequiredTargetMigrationMeasurement>
+    MoEOverlayEconomyCalibrationPlanner::requiredTargetMeasurements(
+        std::span<const MoEOverlayLayerWeightManifest> manifests) const
+    {
+        std::map<int, const MoEOverlayLayerWeightManifest *> source;
+        for (const auto &manifest : manifests)
+        {
+            if (!manifest.valid() || !source.emplace(manifest.layer_idx, &manifest).second)
+                throw std::invalid_argument("Calibration declarations require unique complete original source manifests");
+        }
+        if (source.size() != static_cast<std::size_t>(config_.live_snapshot->layerCount()))
+            throw std::invalid_argument("Calibration declarations omitted original source layers");
+        for (int layer = config_.live_snapshot->firstModelLayer();
+             layer < config_.live_snapshot->firstModelLayer() + config_.live_snapshot->layerCount(); ++layer)
+        {
+            const auto manifest = source.find(layer);
+            if (manifest == source.end())
+                throw std::invalid_argument("Calibration declarations contain a foreign or omitted original source layer");
+            if (config_.live_snapshot->jointOwnerMap())
+            {
+                const auto &owners = config_.live_snapshot->placementOwnerMap().owners();
+                const auto original = std::find_if(owners.begin(), owners.end(), [layer](const auto &owner) {
+                    return owner.layer_idx == layer && owner.shard_cohort;
+                });
+                if (original == owners.end() || original->shard_cohort->source() != *manifest->second)
+                    throw std::invalid_argument("Calibration declaration changed its original cohort source geometry or format");
+            }
+        }
+        std::vector<MoEOverlayRequiredTargetMigrationMeasurement> result;
+        result.reserve(required_target_coordinates_.size());
+        for (const auto &coordinate : required_target_coordinates_)
+        {
+            const auto manifest = source.find(coordinate.layer);
+            if (manifest == source.end())
+                throw std::invalid_argument("Calibration declaration has no original source layer");
+            const auto wave = buildPairSwap(coordinate.source_target,
+                coordinate.destination_target, coordinate.layer, 1);
+            result.push_back({.coordinate = coordinate,
+                .geometry = makePhysicalMoEOverlayMeasurementGeometry(wave.migrations.front(),
+                    *manifest->second, config_.live_snapshot->expertCount(),
+                    config_.live_snapshot->placementOwnerMap())});
+        }
+        return result;
     }
 
     std::vector<MoEOverlayMigrationMeasurementCoordinate>

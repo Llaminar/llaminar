@@ -572,6 +572,98 @@ TEST(MoEOverlayCPUCohortFabric, RealTwoSocketStageDelaysFinalPieceAndExecutesExa
     EXPECT_EQ(original.authority->snapshot()->epoch,1u);
     for(int id:original.registry->localParticipantIds())EXPECT_FALSE(original.registry->endpoint(id)->acquire(2));
 }
+/**
+ * @test A real source-bound seal preserves fragment provenance for the next graph bank.
+ *
+ * Both ranks retain their original GGUF, PMA, member and prepared-source roots.
+ * Initial placement is already canonical: sealing it requires no invented
+ * movement/publication, yet its CPU cohort banks have no whole-expert vector.
+ */
+TEST(MoEOverlayCPUCohortFabric, RealTwoSocketReusableSealRebindsOriginalFragmentsAndSuccessorBanks) {
+    FabricOriginal original;
+    auto manager=original.context->concreteWeightManager();ASSERT_TRUE(manager);
+    auto& engines=manager->expertGemmRegistry();
+    const auto local=original.registry->localParticipantIds();
+    const auto& owners=original.authority->snapshot()->placementOwnerMap();
+    std::vector<std::pair<int,ExpertGemmRegistry::StaticProjectionLayer>> before;
+    for(const int id:local) {
+        if(!original.registry->isCPUJointParticipant(id))continue;
+        const auto* participant=owners.participantForId(id);ASSERT_TRUE(participant);
+        auto layer=engines.acquireCPUJointLayer(original.model,*participant,0);ASSERT_TRUE(layer);
+        before.emplace_back(id,std::move(*layer));
+    }
+    ASSERT_EQ(before.size(),1u); // One actual member on each original physical socket.
+    const auto claimed=original.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::RoutedExpertWeights,
+        PhysicalMemoryMaterializationKind::NewAllocation);
+    std::string error;
+    const auto seal=original.fabric->sealReusableInitialPlacement(1,&error);ASSERT_TRUE(seal)<<error;
+    ASSERT_TRUE(seal->valid());
+    for(const auto& [id,previous]:before) {
+        const auto bank=std::find_if(seal->local_banks.begin(),seal->local_banks.end(),
+            [id](const auto& value){return value.participant_id==id;});
+        ASSERT_NE(bank,seal->local_banks.end());
+        EXPECT_TRUE(bank->layerForModelLayer(0).experts.empty());
+        ASSERT_TRUE(bank->layerForModelLayer(0).cpu_fragment_family);
+    }
+    auto torn=*seal;
+    auto& mask=torn.local_banks.front().layers.front().resident_mask;
+    ASSERT_FALSE(mask.empty());mask.front()=!mask.front();
+    EXPECT_FALSE(engines.replaceParticipantResidencyFromSeal(torn,*original.registry,&error));
+    for(const auto& [id,previous]:before) {
+        const auto unchanged=engines.acquireCPUJointLayer(original.model,*owners.participantForId(id),0);
+        ASSERT_TRUE(unchanged);
+        for(const int expert:previous.cpu_joint_source->expertIds())
+            EXPECT_EQ(unchanged->experts.at(size_t(expert)).gate,previous.experts.at(size_t(expert)).gate);
+    }
+    ASSERT_TRUE(engines.replaceParticipantResidencyFromSeal(*seal,*original.registry,&error))<<error;
+    for(const auto& [id,previous]:before) {
+        const auto* participant=owners.participantForId(id);ASSERT_TRUE(participant);
+        const auto current=engines.acquireCPUJointLayer(original.model,*participant,0);ASSERT_TRUE(current);
+        ASSERT_EQ(current->sources.size(),previous.sources.size());
+        EXPECT_EQ(current->cpu_joint_source,previous.cpu_joint_source);
+        EXPECT_FALSE(current->cpu_joint_source.owner_before(previous.cpu_joint_source));
+        EXPECT_FALSE(previous.cpu_joint_source.owner_before(current->cpu_joint_source));
+        for(size_t index=0;index<previous.sources.size();++index) {
+            const auto& a=previous.sources[index];const auto& b=current->sources[index];
+            EXPECT_EQ(a.binding_id,b.binding_id);EXPECT_EQ(a.native_source,b.native_source);
+            EXPECT_EQ(a.projection_source_owner,b.projection_source_owner);
+            EXPECT_EQ(a.projection_ownership,b.projection_ownership);
+            EXPECT_EQ(a.tensor,b.tensor);EXPECT_EQ(a.tensor_owner,b.tensor_owner);
+            EXPECT_FALSE(a.tensor_owner.owner_before(b.tensor_owner));EXPECT_FALSE(b.tensor_owner.owner_before(a.tensor_owner));
+        }
+        const auto bank=std::find_if(seal->local_banks.begin(),seal->local_banks.end(),
+            [id](const auto& value){return value.participant_id==id;});
+        ASSERT_NE(bank,seal->local_banks.end());
+        for(const int expert:current->cpu_joint_source->expertIds()) {
+            const auto& fragment=bank->layerForModelLayer(0).cpu_fragments.at(size_t(expert));
+            EXPECT_EQ(current->experts.at(size_t(expert)).gate,fragment.gate());
+            EXPECT_EQ(current->experts.at(size_t(expert)).up,fragment.up());
+            EXPECT_EQ(current->experts.at(size_t(expert)).down,fragment.down());
+        }
+    }
+    auto successor=std::make_shared<MoEOverlayParticipantResidencyRegistry>(MoEOverlayParticipantResidencyRegistry::Config{
+        .local_participant_ids=local,.num_layers=1,.num_experts=kExperts,.initial_epoch=1,
+        .retained_epoch_capacity=3,.projection_preparation=original.preparation,.original_model=original.model});
+    ASSERT_TRUE(successor->bindOriginalPreparedContext(original.context,original.preparation,&error))<<error;
+    ASSERT_TRUE(successor->finalizeInitialBanksFromPreparedRegistry(engines,&error))<<error;
+    for(const auto& [id,previous]:before) {
+        const auto frame=successor->initialCPUJointLayer(id,0);ASSERT_TRUE(frame);
+        const auto lease=frame->acquireInitialConstruction();ASSERT_TRUE(lease);
+        const auto current=engines.acquireCPUJointLayer(original.model,*owners.participantForId(id),0);ASSERT_TRUE(current);
+        for(const int expert:current->cpu_joint_source->expertIds()) {
+            const auto& fragment=lease->layerForModelLayer(0).cpu_fragments.at(size_t(expert));
+            ASSERT_TRUE(fragment.valid());EXPECT_EQ(fragment.model(),original.model);
+            EXPECT_EQ(fragment.preparation(),original.preparation);
+            EXPECT_EQ(fragment.gate(),current->experts.at(size_t(expert)).gate);
+            EXPECT_EQ(fragment.up(),current->experts.at(size_t(expert)).up);
+            EXPECT_EQ(fragment.down(),current->experts.at(size_t(expert)).down);
+        }
+    }
+    EXPECT_EQ(original.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::RoutedExpertWeights,
+        PhysicalMemoryMaterializationKind::NewAllocation),claimed);
+    EXPECT_EQ(original.authority->snapshot()->epoch,1u);
+}
+
 /** @test Failed last-piece staging drains real operations before component source-node reclamation. */
 TEST(MoEOverlayCPUCohortFabric, RealTwoSocketFailedFinalPieceDrainsAndRetainsOriginalSourceBank) {
     FabricOriginal original;const auto transaction=original.transaction();ASSERT_TRUE(transaction.valid());

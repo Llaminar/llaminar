@@ -42,11 +42,11 @@ namespace llaminar2::test
                 .transaction = transaction, .candidate_epoch = epoch, .layer = 1, .expert = i,
                 .cycle_index = 0, .cycle_size = static_cast<std::size_t>(count), .direction = direction,
                 .axis = geometry == 2 ? MoEOptimizationMovementAxis::Combined : MoEOptimizationMovementAxis::ParticipantPlacement,
-                .source_participant = source_id, .destination_participant = next,
+                .source = MoEOptimizationMovementEndpoint::whole(source_id, source, (true) ? std::optional<int>{source_id} : std::nullopt), .destination = MoEOptimizationMovementEndpoint::whole(next, destination, (true) ? std::optional<int>{next} : std::nullopt),
                 .source_priority = source_priority, .destination_priority = destination_priority,
-                .source_device = source, .destination_device = destination,
-                .source_world_rank = source_id, .destination_world_rank = next,
-                .source_world_rank_known = true, .destination_world_rank_known = true,
+
+
+
                 .estimated_weight_bytes = 8192, .activation_count = static_cast<std::uint64_t>(10 + i)});
             receipt.promotions += direction == MoEOptimizationMovementDirection::Promotion;
             receipt.demotions += direction == MoEOptimizationMovementDirection::Demotion;

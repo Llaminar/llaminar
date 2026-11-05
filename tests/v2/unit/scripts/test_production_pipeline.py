@@ -4623,6 +4623,9 @@ class InfrastructureTests(unittest.TestCase):
         self.assertIn("patches/rocm-hip-graph-progress-safe-collapse.patch", toolchain)
         self.assertIn("patches/rocm-hip-event-producer-lifetime.patch", toolchain)
         self.assertIn("patches/rocm-hip-graph-kernarg-metadata.patch", toolchain)
+        self.assertIn("patches/rocm-hip-preferred-queue-unshared.patch", toolchain)
+        self.assertIn("scripts/docker/hip-preferred-queue/proof.py", toolchain)
+        self.assertIn("scripts/docker/hip-preferred-queue/selector-contract.cpp.in", toolchain)
         # Those four backports are part of the pinned upstream monorepo now.
         # Applying them again would make the upgrade a second orphaned repair.
         for old_patch in ("node-identity", "queue-placement", "packet-publication", "entry-ordering"):
@@ -4668,7 +4671,9 @@ class InfrastructureTests(unittest.TestCase):
             # SDK rejects stale receipts before any native work or network I/O.
             for name in ("dirname", "sha256sum", "cut"):
                 (commands / name).symlink_to(Path("/usr/bin") / name)
-            for name in ("cmake", "ninja", "ccache", "curl", "git", "python3"):
+            # Proof verification uses Python, never an installed compiler/native SDK.
+            (commands / "python3").symlink_to(Path(sys.executable))
+            for name in ("cmake", "ninja", "ccache", "curl", "git"):
                 tool = commands / name
                 tool.write_text(
                     '#!/bin/sh\necho "unexpected build tool execution" >&2\nexit 97\n',
@@ -4700,21 +4705,27 @@ class InfrastructureTests(unittest.TestCase):
                 ROOT / "scripts/docker/patches/rocm-hip-graph-progress-safe-collapse.patch",
                 ROOT / "scripts/docker/patches/rocm-hip-event-producer-lifetime.patch",
                 ROOT / "scripts/docker/patches/rocm-hip-graph-kernarg-metadata.patch",
+                ROOT / "scripts/docker/patches/rocm-hip-preferred-queue-unshared.patch",
             )
             parts = [pins[key] for key in ("LLAMINAR_ROCM_VERSION", "LLAMINAR_ROCM_DEB_VERSION",
                      "LLAMINAR_ROCM_SYSTEMS_REVISION", "LLAMINAR_HIP_LIBRARY_VERSION")]
             base_count = len(parts)
             parts.extend(hashlib.sha256(path.read_bytes()).hexdigest() for path in patches)
+            from test_hip_runtime_binding import HIPRuntimeAuthority, HIPRuntimeBindingTests
+            authority = HIPRuntimeAuthority.from_source(ROOT)
+            proof_parts = authority.proof_contract.split(":")
+            self.assertEqual(authority.identity, ":".join([*parts, *proof_parts]))
+            HIPRuntimeBindingTests().write_queue_proof(output, authority, library)
             library_digest = hashlib.sha256(library.read_bytes()).hexdigest()
             marker = output / "share/llaminar/hip-graph-runtime.txt"
             receipts = [(f"patch-count-{count}",
-                         [*parts[:base_count + count], library_digest], count == len(patches))
+                         [*parts[:base_count + count], *proof_parts, library_digest], count == len(patches))
                         for count in range(len(patches) + 1)]
             # Authenticate every pin and repair body, as well as a DSO replaced
             # without updating its installation receipt.
-            complete_receipt = [*parts, library_digest]
+            complete_receipt = [*parts, *proof_parts, library_digest]
             receipt_names = ["sdk", "package", "source", "hip-version",
-                             *[path.name for path in patches], "installed-DSO"]
+                             *[path.name for path in patches], "proof-producer", "proof-fixture", "installed-DSO"]
             for index, name in enumerate(receipt_names):
                 stale_receipt = complete_receipt.copy()
                 stale_receipt[index] = "0" * 64

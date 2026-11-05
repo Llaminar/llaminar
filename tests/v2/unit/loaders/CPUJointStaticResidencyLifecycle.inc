@@ -103,9 +103,11 @@ TEST(CPUJointStaticResidency, SameSourceMapAndExplicitJointTicketSchema) {
  EXPECT_THROW(authority.proposeInitialPreparedPlacementRestoration(),std::logic_error);
  std::array<uint32_t,512> output;output.fill(71);std::string error;
  EXPECT_FALSE(authority.tryAcquireCurrentBatchLLEPLease(7,"cpu_joint",2,output,&error));
- EXPECT_NE(error.find("joint"),std::string::npos);for(auto value:output)EXPECT_EQ(value,71u);
+ EXPECT_EQ(error,"Current-batch LLEP cannot reinterpret complete CPU cohort fragment ownership");
+ for(auto value:output)EXPECT_EQ(value,71u);
+ EXPECT_EQ(authority.snapshot(),snapshot);
 }
-/** @test Unimplemented maintenance and foreign source/member/placement arms reject before publication. */
+/** @test Maintenance on a Static plan and foreign source/member/placement arms reject before publication. */
 TEST(CPUJointStaticResidency, RejectsObserveDynamicMissingAndForeignSource) {
  using namespace llaminar2;const auto original=staticJointOriginal();
  for(const auto mode:{MoERebalanceRuntimeMode::Observe,MoERebalanceRuntimeMode::Dynamic}) {

@@ -1416,6 +1416,8 @@ function(add_v2_routed_expert_policy_unit TARGET_NAME TEST_NAME SOURCE_FILE)
     )
 endfunction()
 
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2TypedMovementEndpointTests.cmake)
+
 add_v2_routed_expert_policy_unit(
     v2_unit_moe_continuation_config
     V2_Unit_MoEContinuationConfig
@@ -3617,7 +3619,8 @@ set_tests_properties(V2_Integration_HTTPNativeParentEvidence PROPERTIES
 add_test(NAME V2_Integration_NativeMovementBoundedCoherentEvidence
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_server_graph_capture_perf_policy.py
-            TestServerGraphCapturePerfPolicy.test_runtime_features_native_movement_survives_empty_final_wave)
+            TestServerGraphCapturePerfPolicy.test_runtime_features_native_movement_survives_empty_final_wave
+            TestServerGraphCapturePerfPolicy.test_runtime_features_certify_device_overlay_commits_symmetrically)
 set_tests_properties(V2_Integration_NativeMovementBoundedCoherentEvidence PROPERTIES
     LABELS "V2;Integration;ProductionTestPreflight;MTP;MoE;PerfStats;Regression" TIMEOUT 30)
 
@@ -5393,6 +5396,13 @@ add_v2_test(V2_Integration_QwenSparseQueryProgramOmissionParity
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Parity;Snapshot;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+add_v2_test(V2_Integration_QFNCompleteDecodeQueryEvidence
+    COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+        --gtest_filter=QwenSparseQueryParityEvidence.QFNCompleteDecodeAcceptsOnlyAuthenticatedUnauthoredQueries
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Parity;Snapshot;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QFNCompleteDecodeQueryEvidence)
 add_v2_test(V2_Integration_QFNParityQueryObserverDomain
     COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_production_parity_campaigns.py
@@ -7957,6 +7967,21 @@ add_v2_test(V2_Integration_MoEControllerMovementBoundedEvidence
         --gtest_filter=PerfStatsCardinality.ControllerMovement*
     LABELS "V2;Integration;ProductionTestPreflight;MoE;PerfStats;Regression;DeviceFree"
     MPI_PROCS 1 NO_MODELS NO_MPI TIMEOUT 30)
+add_v2_test(V2_Integration_CohortPublicationInferenceEvidenceContract
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_generation_movement_ledger.py
+        CohortPublicationInferenceTests
+    LABELS "V2;Integration;ProductionTestPreflight;MoE;Lifecycle;Contract;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_CohortCanonicalParityMovementEvidenceContract
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_production_parity_campaigns.py
+        CPUJointMovementArtifactTests
+    LABELS "V2;Integration;ProductionTestPreflight;MoE;Lifecycle;Contract;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_CohortColdBoundExecutionEvidenceContract
+    COMMAND $<TARGET_FILE:v2_test_perf_stats_cardinality>
+        --gtest_filter=PerfStatsCardinality.ColdBoundFragmentExecutionSequenceRetainsOriginalArrivalAcrossReset
+    LABELS "V2;Integration;ProductionTestPreflight;MoE;PerfStats;Contract;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_test(NAME V2_Integration_MoEControllerMovementTransportEvidence
     COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_generation_movement_ledger.py
@@ -12705,7 +12730,7 @@ if(ZLIB_FOUND)
         TEST_PREFIX V2_Integration_Parity_Qwen4Exp_Production
         # Each new original ProcessRuntime source owns a fresh numerical process;
         # existing aggregate families and their IDs remain unchanged.
-        PRODUCTION_ISOLATED_TESTS "Qwen4ExpCPUJointWorld2FullStage/Qwen4ExpCPUJointFullStageTest.ProductionParity/;Qwen4ExpCPUJointWorld2MTPExact/Qwen4ExpMTPExactReplayTest.MTPExactReplay/"
+        PRODUCTION_ISOLATED_TESTS "Qwen4ExpCPUJointWorld2FullStage/Qwen4ExpCPUJointFullStageTest.ProductionParity/;Qwen4ExpCPUJointWorld2DynamicFullStage/Qwen4ExpCPUJointFullStageTest.ProductionParity/;Qwen4ExpCPUJointWorld2MTPExact/Qwen4ExpMTPExactReplayTest.MTPExactReplay/"
             "Qwen4ExpConsumerLocalTP4MovementOrdinalRetained15/Qwen4ExpMainParityTest.ProductionParity/"
             "Qwen4ExpConsumerLocalTP4MovementRandomRetained15/Qwen4ExpMainParityTest.ProductionParity/"
             "Qwen4ExpConsumerLocalTP4StaticRetained15/Qwen4ExpMainParityTest.ProductionParity/"
@@ -30044,6 +30069,13 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativePipelineHist
 
 # CPU packets retain model-global layer identities even when a PP endpoint
 # materializes only its compact local interval of prepared expert engines.
+add_v2_test(V2_Integration_CPUExpertCompletionEpochContract
+    COMMAND $<TARGET_FILE:v2_test_moe_local_expert_stage_prepared_weights>
+        --gtest_filter=Test__MoELocalExpertStage_PreparedWeights.CompletionRejectsChangedPacketEpochForRetainedBank
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;Lifecycle;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUExpertCompletionEpochContract)
 add_v2_test(V2_Integration_CPUExpertPipelineLayerOrigin
     COMMAND $<TARGET_FILE:v2_test_moe_local_expert_stage_prepared_weights>
         --gtest_filter=Test__MoELocalExpertStage_PreparedWeights.CPUPipelineGlobalLayerExecutesExactRetainedExpertBank
@@ -33189,7 +33221,7 @@ endif()
 if(TARGET v2_test_model_parity_definition)
     add_v2_test(V2_Integration_QFNWorld2FrozenHistoryContract
         COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
-            --gtest_filter=FrozenParityHistoryReplay.OriginalCPUJointWorkersUseTypedWorldMembership:FrozenParityHistoryReplay.FreshContextConfigurationRetainsOriginalOwnerBeforeAdmission
+            --gtest_filter=FrozenParityHistoryReplay.OriginalCPUJointWorkersUseTypedWorldMembership:FrozenParityHistoryReplay.FreshContextConfigurationRetainsOriginalOwnerBeforeAdmission:FrozenParityHistoryReplay.CPUJointDynamicSiblingRetainsOriginalSourceAndRequiresMovement
         LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Qwen4Exp;Parity;Ownership;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "OMP_NUM_THREADS=1;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
@@ -34015,6 +34047,21 @@ if(HAVE_ROCM AND NOT V2_PERF_TESTS_ONLY)
     set_property(GLOBAL PROPERTY V2_TEST_BUILD_TARGETS_V2_Integration_HIPRuntimeLoaderBinding
         "llaminar2;v2_integration_hip_graph_argument_geometry;v2_integration_openmp_shadow_runtime")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HIPRuntimeLoaderBinding)
+
+    # Installed runners authenticate actual builder replay without an SDK/compiler.
+    add_test(NAME V2_Integration_HIPPreferredQueueSelection
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_hip_runtime_binding.py
+            --preferred-queue-contract
+            --source-root ${CMAKE_CURRENT_SOURCE_DIR}/../..
+            --binary $<TARGET_FILE:llaminar2>
+            --binary $<TARGET_FILE:v2_integration_hip_graph_argument_geometry>)
+    set_tests_properties(V2_Integration_HIPPreferredQueueSelection PROPERTIES
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;ROCm;HIP;Contract;Regression"
+        TIMEOUT 60)
+    set_property(GLOBAL PROPERTY V2_TEST_BUILD_TARGETS_V2_Integration_HIPPreferredQueueSelection
+        "llaminar2;v2_integration_hip_graph_argument_geometry")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HIPPreferredQueueSelection)
 endif()
 
 # Insert before the canonical ProductionTestPreflight finalizer. This candidate

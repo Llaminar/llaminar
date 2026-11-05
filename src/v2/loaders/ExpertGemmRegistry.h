@@ -27,6 +27,10 @@
 namespace llaminar2
 {
     class PreparedWeightStore;
+    struct MoEOverlayReusableContextSeal;
+    class MoEOverlayParticipantResidencyRegistry;
+    struct MoEOverlayParticipantResidencyBank;
+    namespace test { struct ExpertGemmRegistryResidencyTestAccess; }
 
 
     class ITensorGemm;
@@ -392,29 +396,22 @@ namespace llaminar2
                             std::vector<ITensorGemm *> &down_out) const;
 
         /**
-         * @brief Atomically replace process-local ExpertOverlay residency keys.
+         * @brief Atomically rebind original prepared identities from their actual terminal seal.
+         * @param seal Complete physically canonicalized initial-placement banks.
+         * @param residency Same original participant/fixed-cohort declaration authority.
+         * @param error Receives a precise failure; validation publishes no partial map.
+         * @return True only after one atomic publication of all process-local scopes.
          *
-         * Every supplied scope is first removed from a private copy of the
-         * registry, then rebuilt from @p bindings. Domain aliases are rebuilt
-         * from the same triplets so setup-time format discovery and
-         * participant graph lowering observe one identity. The live map is
-         * swapped only after complete validation and allocation succeed; a
-         * caller can never observe a partially rebound model context.
-         * Projection-partitioned banks are rejected unchanged: a triplet-only
-         * replacement cannot retire their fixed all-expert down slices safely.
-         *
-         * This is a terminal model-lifecycle operation. Inference and graph
-         * construction must already be quiescent, although ordinary readers
-         * remain protected by the registry mutex.
-         *
-         * @param scopes Complete local participant/layer replacement surface.
-         * @param bindings Exact resident triplets contained by those scopes.
-         * @param error Optional precise validation/allocation diagnostic.
-         * @return True after one atomic replacement, false without mutation.
+         * Whole payloads keep their original domain aliases. CPU fragments keep
+         * exact participant keys and original source/Store/layout declarations;
+         * only their actual sealed engine owners change. No whole-expert alias
+         * or source identity is manufactured from a fragment triplet. Other
+         * fixed GPU projection slices remain unsupported and reject unchanged.
+         * This terminal operation requires original inference/graph quiescence.
          */
-        [[nodiscard]] bool replaceParticipantResidency(
-            std::span<const ParticipantLayerScope> scopes,
-            std::span<const ParticipantExpertBinding> bindings,
+        [[nodiscard]] bool replaceParticipantResidencyFromSeal(
+            const MoEOverlayReusableContextSeal &seal,
+            const MoEOverlayParticipantResidencyRegistry &residency,
             std::string *error = nullptr) noexcept;
 
         /// Replace an existing engine (for dynamic rebalancing arrival).
@@ -442,6 +439,23 @@ namespace llaminar2
         void clear();
 
     private:
+        friend struct test::ExpertGemmRegistryResidencyTestAccess;
+        /**
+         * @brief Stage the single registry replacement; unsealed inputs are test-only.
+         * @param scopes Complete checked participant/layer surface.
+         * @param bindings Checked whole payloads; never CPU fragment adapters.
+         * @param banks Canonical banks already authorized by the public seal; component tests may corrupt this input.
+         * @param residency Original declaration authority paired with the banks, null only for untyped corruption tests.
+         * @param error Receives validation/allocation failure before atomic swap.
+         * @return Whether one complete replacement was published.
+         */
+        bool replaceParticipantResidencyImpl(
+            std::span<const ParticipantLayerScope> scopes,
+            std::span<const ParticipantExpertBinding> bindings,
+            std::span<const MoEOverlayParticipantResidencyBank> banks,
+            const MoEOverlayParticipantResidencyRegistry *residency,
+            std::string *error) noexcept;
+
         struct Key
         {
             std::string domain_name;

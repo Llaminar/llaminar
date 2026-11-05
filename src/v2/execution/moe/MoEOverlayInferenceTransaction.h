@@ -34,6 +34,20 @@
 
 namespace llaminar2
 {
+    /**
+     * @brief Passive completed identity of one finite original host-placement scope.
+     *
+     * Sequence IDs are the original coordinator's monotonic IDs. Their half-open
+     * interval contains only fully retired descendants; no independent epoch or
+     * completion counter is maintained. This value cannot admit execution.
+     */
+    struct MoEOverlayInferencePlacementScopeObservation final
+    {
+        std::uint64_t placement_epoch = 0; ///< Original live parent epoch.
+        std::uint64_t first_sequence_id = 0; ///< First original descendant ID.
+        std::uint64_t next_sequence_id = 0; ///< Exclusive end after terminal proof.
+    };
+
     class MoEExpertOwnerMap;
     class IModelLoader;
 

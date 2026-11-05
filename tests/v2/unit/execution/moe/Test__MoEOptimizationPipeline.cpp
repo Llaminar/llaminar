@@ -329,7 +329,7 @@ namespace llaminar2
             second = ledger(identity(1)); second.edges[0].layer = 0;
             EXPECT_THROW(composeMoEOptimizationMovementLedger(MoEOptimizationStages<MoEOptimizationMovementLedger>::seal(
                 {{identity(0), first}, {identity(1), second}})), std::invalid_argument);
-            second = ledger(identity(1)); second.edges[0].destination_device = DeviceId::rocm(0);
+            second = ledger(identity(1)); second.edges[0].destination = MoEOptimizationMovementEndpoint::whole(second.edges[0].destination.whole().participant,DeviceId::rocm(0),second.edges[0].destination.whole().world_rank);
             EXPECT_THROW(composeMoEOptimizationMovementLedger(MoEOptimizationStages<MoEOptimizationMovementLedger>::seal(
                 {{identity(0), first}, {identity(1), second}})), std::invalid_argument);
         }

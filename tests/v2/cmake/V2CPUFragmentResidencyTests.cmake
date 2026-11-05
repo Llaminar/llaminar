@@ -179,7 +179,7 @@ add_v2_test(V2_Integration_MoEOverlayMeasurementCompletionAllocations
     ENVIRONMENT "${V2_CPU_FRAGMENT_TEST_ENV}")
 add_v2_test(V2_Integration_MoEOverlayPhysicalMeasurementQuoteDrain
     COMMAND $<TARGET_FILE:v2_test_moe_overlay_tier_migration_transport>
-        --gtest_filter=MoEOverlayTierMigrationTransport.BoundQuoteRejectsWrongSamplesBeforePrepareAndDrains
+        --gtest_filter=MoEOverlayTierMigrationTransport.BoundQuoteRejectsWrongSamplesBeforePrepareAndDrains:MoEOverlayTierMigrationTransport.TerminalPiecesRetainOriginalQuotesWithoutTimingSamples
         --gtest_repeat=20 --gtest_brief=1
     LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;ExpertOverlay;Measurement;Lifecycle;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
@@ -370,6 +370,64 @@ if(V2_TEST_SOCKETS AND V2_TEST_SOCKETS GREATER_EQUAL 2)
     unset(_joined_name)
 else()
     message(STATUS "CPU joint calibration controller: unqualified without two physical sockets; no MPI launch")
+endif()
+
+
+# Physical-fabric ownership must preserve complete calibration source descriptors.
+add_v2_test(V2_Integration_CPUJointCalibrationManifestLifetime
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_residency_authority>
+        --gtest_filter=CPUJointCalibrationTargetContract.FabricOwnershipPreservesCompleteCalibrationSourceManifest
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;ExpertOverlay;Economy;Calibration;Contract;SourceBinding;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "${V2_CPU_FRAGMENT_TEST_ENV}")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUJointCalibrationManifestLifetime)
+
+# Physical failure cannot vote while a peer still requires matching payload progress.
+add_v2_test(V2_Integration_MoEOverlayPhysicalStageFailureContract
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_distributed_residency_transport>
+        --gtest_filter=Test__MoEOverlayDistributedResidencyTransport.PhysicalStageFailureIsFatalBeforeStagedVote
+        --gtest_repeat=20 --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;ExpertOverlay;Lifecycle;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "${V2_CPU_FRAGMENT_TEST_ENV}")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOverlayPhysicalStageFailureContract)
+
+if(TARGET v2_integration_moe_overlay_residency_consensus_mpi)
+    add_v2_test(V2_Integration_MoEOverlayPhysicalStageMPIAbortContract
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/integration/scripts/test_residency_physical_stage_abort.py
+            --helper $<TARGET_FILE:llaminar_mpi_session>
+            --probe $<TARGET_FILE:v2_integration_moe_overlay_residency_consensus_mpi>
+            --mpirun ${MPIEXEC_EXECUTABLE}
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;MoE;MPI;Lifecycle;Contract;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "${V2_CPU_FRAGMENT_TEST_ENV}")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOverlayPhysicalStageMPIAbortContract)
+endif()
+
+add_v2_test(V2_Integration_CPUJointMultiwaveRestorationBound
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_residency_authority>
+        --gtest_filter=CPUJointPlacementTransactionContract.MultiwaveRestorationUsesCanonicalLogicalBound --gtest_repeat=20 --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;ExpertOverlay;Lifecycle;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "${V2_CPU_FRAGMENT_TEST_ENV}")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUJointMultiwaveRestorationBound)
+
+add_v2_test(V2_Integration_CPUJointReusableRegistryBinding
+    COMMAND $<TARGET_FILE:v2_unit_expert_gemm_registry>
+        --gtest_filter=CPUJointReusableRegistryContract.PreservesCommittedSourceAndConsumesReplacementEnginesAtomically
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;ExpertOverlay;SourceBinding;Lifecycle;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "${V2_CPU_FRAGMENT_TEST_ENV}")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUJointReusableRegistryBinding)
+if(TEST V2_Integration_MoEOverlayCPUCohortPhysicalStagingAbort)
+    add_v2_test(V2_Integration_CPUJointReusableFabricRegistryBinding
+        COMMAND $<TARGET_FILE:v2_integration_moe_overlay_residency_consensus_mpi>
+            --gtest_filter=MoEOverlayCPUCohortFabric.RealTwoSocketReusableSealRebindsOriginalFragmentsAndSuccessorBanks
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;MoE;MPI;Residency;SourceBinding;Lifecycle;Contract;Regression"
+        MPI_PROCS 2 NO_MODELS TIMEOUT 30
+        ENVIRONMENT "${V2_CPU_FRAGMENT_TEST_ENV}")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUJointReusableFabricRegistryBinding)
 endif()
 
 unset(V2_CPU_FRAGMENT_TEST_ENV)

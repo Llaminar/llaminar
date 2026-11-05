@@ -5892,6 +5892,8 @@ namespace llaminar2
                     prepared.operations[operation_index] = {.projection = projection,
                         .destination_participant = piece.destination_participant, .source_participant = piece.source_participant};
                     prepared.operations[operation_index].requires_local_measurement = source_local || destination_local;
+                    prepared.operations[operation_index].observer_world_rank = source_local || destination_local
+                        ? config_.memory_authority->worldRank() : -1;
                     const auto destination_arrival = destination_local ? destination_arrivals[migration_index].at(piece.destination_participant) : nullptr;
                     DestinationProjectionGroup *const destination_group = destination_local
                         ? &destination_groups[migration_index].at(piece.destination_participant)[projection_index] : nullptr;
@@ -6326,27 +6328,17 @@ namespace llaminar2
                                                 output,
                                             std::string *error) -> bool
                                 {
-                                    if (!output || manifest.source_projection != intersection.source() ||
-                                        manifest.destination_projection != intersection.destination())
+                                    if (!output || !manifest.matchesGpuDestinationProjection(
+                                            intersection, destination_format,
+                                            destination_slot.spec.N, destination_slot.spec.K))
                                     {
-                                        if (error) *error = "Remote projection changed its original member intersection";
+                                        if (error) *error = destination_format.isFloating()
+                                            ? "Remote floating ExpertOverlay GPU arrival differs from the model projection contract"
+                                            : "Remote ExpertOverlay GPU arrival differs from the model projection contract";
                                         return false;
                                     }
                                     if (destination_format.isFloating())
                                     {
-                                        if (!output ||
-                                            !manifest
-                                                 .carriesFloatingBytes() ||
-                                            manifest.destination_projection.rows != destination_slot.spec.N ||
-                                            manifest.destination_projection.columns != destination_slot.spec.K ||
-                                            manifest.format_kind !=
-                                                destination_format.kind)
-                                        {
-                                            if (error)
-                                                *error =
-                                                    "Remote floating ExpertOverlay GPU arrival differs from the model projection contract";
-                                            return false;
-                                        }
                                         auto descriptor =
                                             makeGpuFloatingDestinationDescriptor(
                                                 destination_slot,
@@ -6364,23 +6356,6 @@ namespace llaminar2
 
                                     const auto source_identity =
                                         destination_format.native_vnni;
-                                    if (!output ||
-                                        (!manifest.carriesGpuBytes() &&
-                                         !manifest.carriesCpuBytes()) ||
-                                        manifest.N !=
-                                            destination_slot.spec.N ||
-                                        manifest.K !=
-                                            destination_slot.spec.K ||
-                                        manifest.source_codebook_id !=
-                                            source_identity.codebook_id ||
-                                        (manifest.source_is_superblock != 0) !=
-                                            source_identity.is_superblock)
-                                    {
-                                        if (error)
-                                            *error =
-                                                "Remote ExpertOverlay GPU arrival differs from the model projection contract";
-                                        return false;
-                                    }
                                     auto descriptor =
                                         makeGpuDestinationDescriptor(
                                             destination_slot,

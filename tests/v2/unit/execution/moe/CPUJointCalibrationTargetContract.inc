@@ -8,6 +8,7 @@
  * economy consumers remain explicitly unsupported for cohort coordinates.
  */
 #include "execution/moe/MoEOverlayEconomyCalibrationPlanner.h"
+#include "execution/moe/MoEOverlayPhysicalResidencyFabric.h"
 
 TEST(CPUJointCalibrationTargetContract, CompleteOriginalTargetsProduceUnpublishableShadowWaves)
 {
@@ -302,5 +303,55 @@ TEST(CPUJointCalibrationTargetContract, SourceBoundExpansionPreservesMeasuredLay
         EXPECT_THROW((void)catalog.expand(different_cuts, snapshot), std::invalid_argument);
         EXPECT_EQ(authority.snapshot(), snapshot);
         EXPECT_FALSE(authority.migrationEnabled());
+    }
+}
+
+/**
+ * @test Physical-fabric ownership preserves complete source declarations for calibration.
+ *
+ * Representative measurements still require all original layers. These are
+ * immutable source descriptors, not duplicate physical allocations or timings.
+ */
+TEST(CPUJointCalibrationTargetContract, FabricOwnershipPreservesCompleteCalibrationSourceManifest)
+{
+    using namespace llaminar2;
+    using namespace llaminar2::test;
+    for (const int first : {0, 40})
+    {
+        SCOPED_TRACE(first);
+        JointPlacementOriginal original(2, 1, 4, 2, first);
+        MoEOverlayResidencyAuthority authority(original.config());
+        const auto snapshot = authority.snapshot();
+        const std::vector<MoEOverlayLayerWeightManifest> manifests{
+            snapshot->placementOwnerMap().placementFor(first, 1)->shard_cohort->source(),
+            snapshot->placementOwnerMap().placementFor(first + 1, 1)->shard_cohort->source()};
+        const MoEOverlayEconomyCalibrationLayerCatalog catalog(manifests);
+        MoEOverlayEconomyCalibrationPlanner planner({.live_snapshot = snapshot,
+            .complete_expert_bytes_per_layer = catalog.completeExpertBytesPerLayer(),
+            .calibration_layers = catalog.representativeLayers()});
+        // The fabric owns its value copy, while the later planner must still
+        // authenticate the complete original stage, including unmeasured layers.
+        const MoEOverlayPhysicalResidencyFabric::Config fabric_config{
+            .initial_snapshot = snapshot, .layer_weight_manifest = manifests};
+        ASSERT_EQ(fabric_config.layer_weight_manifest, manifests);
+        const auto declarations = planner.requiredTargetMeasurements(manifests);
+        ASSERT_EQ(declarations.size(), planner.requiredTargetCoordinates().size());
+        ASSERT_FALSE(declarations.empty());
+        for (const auto &declaration : declarations)
+        {
+            EXPECT_TRUE(declaration.geometry);
+            EXPECT_EQ(declaration.coordinate.layer, first);
+        }
+        auto missing = manifests;
+        missing.pop_back();
+        EXPECT_THROW((void)planner.requiredTargetMeasurements(missing), std::invalid_argument);
+        EXPECT_THROW((void)planner.requiredTargetMeasurements({}), std::invalid_argument);
+        auto duplicate = manifests;
+        duplicate.back() = duplicate.front();
+        EXPECT_THROW((void)planner.requiredTargetMeasurements(duplicate), std::invalid_argument);
+        auto foreign = manifests;
+        foreign.back().layer_idx = first + 2;
+        EXPECT_THROW((void)planner.requiredTargetMeasurements(foreign), std::invalid_argument);
+        EXPECT_EQ(authority.snapshot(), snapshot);
     }
 }

@@ -295,6 +295,11 @@ namespace llaminar2
         void setDecodeStepTokenBudget(int max_tokens) override;
         bool maybeApplyMoERebalance(uint64_t committed_tokens) override;
         uint64_t moeRuntimeMovementEpoch() const override;
+
+        /** @copydoc IOrchestrationRunner::withMoEOverlayInferencePlacementScope */
+        MoEOverlayInferencePlacementScopeObservation withMoEOverlayInferencePlacementScope(
+            const std::function<void()> &body) override;
+
         MoEOptimizationStatus moeOptimizationStatus() const override;
         /** @copydoc IOrchestrationRunner::moeOptimizationMovementTopology */
         MoEOptimizationMovementTopology moeOptimizationMovementTopology() const override;

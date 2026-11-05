@@ -174,3 +174,83 @@ TEST(Test__MoEOverlayDistributedResidencyProtocol, NativeCpuRectanglesKeepStagin
     }
 }
 } // namespace llaminar2::test
+
+namespace llaminar2::test {
+/** @test Actual GPU destination admission distinguishes compact intersections from original allocation geometry. */
+TEST(Test__MoEOverlayDistributedResidencyProtocol, GpuArrivalAuthenticatesOriginalDestinationAllNativeFormats)
+{
+    using P=MoEExpertProjectionOwnership::Projection;
+    using R=MoEProjectionResidence;
+    const P whole{R::ExpertOwner,256,256,0,256,0,256};
+    const P rows{R::ParticipantOutputSlice,256,256,32,128,0,256};
+    const P columns{R::ParticipantInputSlice,256,256,0,256,64,128};
+    const P offset{R::ParticipantOutputSlice,256,256,64,128,32,128};
+    const std::array cases{std::pair{whole,whole},std::pair{rows,whole},
+        std::pair{whole,columns},std::pair{offset,columns}};
+    auto fixture=makeTransaction();
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const auto &format : native_vnni_formats::kAllSourceFormats)
+    for (const auto &[source,destination] : cases)
+    {
+        SCOPED_TRACE(device.toString());
+        SCOPED_TRACE(format.quant_type);
+        SCOPED_TRACE(source.first_row);
+        SCOPED_TRACE(destination.first_column);
+        cpu::native_vnni::CPUNativeVNNIPackedWeights packed;
+        packed.N=source.rows; packed.K=source.columns; packed.N_padded=(packed.N+63)/64*64;
+        packed.blocks_per_row=packed.K/32;
+        packed.payload_bytes=format.metadata->payload_bytes;
+        packed.codebook_id=format.metadata->codebook_id;
+        packed.is_superblock=format.metadata->is_superblock;
+        packed.is_asymmetric=format.metadata->is_asymmetric;
+        packed.encoding=cpu::native_vnni::preparedEncodingForSource(*format.metadata);
+        packed.data_stride=cpu::native_vnni::preparedDataStride(packed.encoding);
+        packed.interleaved_block_stride=cpu::native_vnni::preparedInterleavedBlockStride(packed.encoding,packed.is_asymmetric);
+        packed.native_interleaved.resize_uninitialized(size_t(packed.N_padded/64)*packed.blocks_per_row*packed.interleaved_block_stride);
+        const auto identity=remoteProjectionIdentity(fixture.transaction,DeviceId::cpu(),device);
+        const auto intersection=ExpertTierWeightProjectionIntersection::between(source,destination);
+        const auto stream=makeCpuToGpuExpertTierWeightStreamManifest(packed,identity.candidate_epoch,
+            identity.layer_idx,identity.expert_id,identity.projection,1).forIntersection(intersection);
+        const auto manifest=makeMoEOverlayRemoteCpuProjectionManifest(identity,stream,4096);
+        ASSERT_TRUE(manifest.valid());
+        const auto model_format=ExpertWeightFormat::nativeVnni({.codebook_id=format.metadata->codebook_id,
+            .is_superblock=format.metadata->is_superblock,.present=true});
+        EXPECT_TRUE(manifest.matchesGpuDestinationProjection(intersection,model_format,destination.rows,destination.columns));
+        EXPECT_EQ(manifest.N,intersection.rows()); EXPECT_EQ(manifest.K,intersection.columns());
+        if (source != whole)
+            EXPECT_TRUE(manifest.N != destination.rows || manifest.K != destination.columns)
+                << "Original compact-wire equality would reject this genuine shard arrival";
+        EXPECT_FALSE(manifest.matchesGpuDestinationProjection(intersection,model_format,destination.rows-1,destination.columns));
+        EXPECT_FALSE(manifest.matchesGpuDestinationProjection(intersection,model_format,destination.rows,destination.columns-32));
+        auto foreign_source=source; foreign_source.residence=R::ParticipantOutputSlice; ++foreign_source.first_row; --foreign_source.rows;
+        EXPECT_FALSE(manifest.matchesGpuDestinationProjection(
+            ExpertTierWeightProjectionIntersection::between(foreign_source,destination),model_format,destination.rows,destination.columns));
+        auto foreign_destination=destination; foreign_destination.residence=R::ParticipantOutputSlice; ++foreign_destination.first_row; --foreign_destination.rows;
+        EXPECT_FALSE(manifest.matchesGpuDestinationProjection(
+            ExpertTierWeightProjectionIntersection::between(source,foreign_destination),model_format,destination.rows,destination.columns));
+        auto wrong_format=model_format; wrong_format.native_vnni.is_superblock=!wrong_format.native_vnni.is_superblock;
+        EXPECT_FALSE(manifest.matchesGpuDestinationProjection(intersection,wrong_format,destination.rows,destination.columns));
+        wrong_format=model_format; ++wrong_format.native_vnni.codebook_id;
+        EXPECT_FALSE(manifest.matchesGpuDestinationProjection(intersection,wrong_format,destination.rows,destination.columns));
+        EXPECT_FALSE(manifest.matchesGpuDestinationProjection(intersection,ExpertWeightFormat::floating(TensorType::FP32),destination.rows,destination.columns));
+        auto changed=manifest; ++changed.source_projection.first_row; changed.manifest_hash=changed.computedHash();
+        EXPECT_FALSE(changed.matchesGpuDestinationProjection(intersection,model_format,destination.rows,destination.columns));
+    }
+    for (const auto type : {TensorType::FP16, TensorType::BF16, TensorType::FP32})
+    for (const auto &[source,destination] : cases)
+    {
+        const auto format=ExpertWeightFormat::floating(type);
+        std::vector<uint8_t> bytes(size_t(source.rows)*source.columns*format.floatingElementBytes());
+        const ContiguousFloatingPointWeightDescriptor descriptor{bytes.data(),type,source.rows,source.columns,bytes.size()};
+        const auto identity=remoteProjectionIdentity(fixture.transaction,DeviceId::cpu(),DeviceId::rocm(0));
+        const auto intersection=ExpertTierWeightProjectionIntersection::between(source,destination);
+        const auto manifest=makeMoEOverlayRemoteFloatingProjectionManifest(identity,descriptor,4096).forFloatingIntersection(intersection);
+        ASSERT_TRUE(manifest.valid());
+        EXPECT_TRUE(manifest.matchesGpuDestinationProjection(intersection,format,destination.rows,destination.columns));
+        EXPECT_FALSE(manifest.matchesGpuDestinationProjection(intersection,format,destination.rows-1,destination.columns));
+        EXPECT_FALSE(manifest.matchesGpuDestinationProjection(intersection,
+            ExpertWeightFormat::floating(type==TensorType::FP32?TensorType::FP16:TensorType::FP32),destination.rows,destination.columns));
+    }
+
+}
+} // namespace llaminar2::test

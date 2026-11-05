@@ -193,12 +193,12 @@ namespace llaminar2
                     .cycle_index = i / 2, .cycle_size = 2,
                     .direction = MoEOptimizationMovementDirection::SamePriority,
                     .axis = MoEOptimizationMovementAxis::ParticipantPlacement,
-                    .source_participant = static_cast<int>(edge.source_participant),
-                    .destination_participant = static_cast<int>(edge.destination_participant),
+                    .source = MoEOptimizationMovementEndpoint::whole(static_cast<int>(edge.source_participant), source.device, (true) ? std::optional<int>{source.world_rank} : std::nullopt),
+                    .destination = MoEOptimizationMovementEndpoint::whole(static_cast<int>(edge.destination_participant), destination.device, (true) ? std::optional<int>{destination.world_rank} : std::nullopt),
                     .source_priority = source.priority, .destination_priority = destination.priority,
-                    .source_device = source.device, .destination_device = destination.device,
-                    .source_world_rank = source.world_rank, .destination_world_rank = destination.world_rank,
-                    .source_world_rank_known = true, .destination_world_rank_known = true,
+
+
+
                     .estimated_weight_bytes = edge.estimated_weight_bytes, .activation_count = edge.activation_count});
             }
         }

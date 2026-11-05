@@ -453,7 +453,10 @@ public:
      * @brief Require the canonical case's complete stage inventory before admission.
      * @param keys Unmodified required snapshot keys from the actual typed case.
      * @param decode_step Negative for prefill, otherwise an original decode offset.
-     * @throws std::invalid_argument For an empty or missing full-stage checkpoint set.
+     * @throws std::invalid_argument For an empty, missing or non-regular checkpoint,
+     *         naming its exact phase, original step, key, path and failure state.
+     * @throws std::filesystem::filesystem_error For metadata I/O failures, retaining
+     *         the original error code with the same checkpoint context.
      *
      * This checks metadata/extents only. Actual typed NPY loading, every raw
      * numerical comparison and six-CSV publication remain in the original gate.
@@ -467,8 +470,25 @@ public:
         for (const auto &key : keys)
         {
             const auto path = std::filesystem::path(referenceDirectory()) / (prefix + key + ".npy");
-            requireQFN(std::filesystem::is_regular_file(path) && std::filesystem::file_size(path) > 0,
-                       "Frozen full-stage reference is incomplete; regenerate exact history before admission");
+            // Format context only on failure; ordinary admission still performs
+            // the same metadata checks and never opens/hashes a tensor payload.
+            const auto failure = [&](const char *state) {
+                return std::string("Frozen full-stage reference inventory failed: phase=") +
+                    (decode_step < 0 ? "prefill" : "decode") +
+                    " step=" + std::to_string(decode_step) + " key=" + key +
+                    " path=" + path.string() + " state=" + state;
+            };
+            try
+            {
+                if (!std::filesystem::is_regular_file(path))
+                    throw std::invalid_argument(failure(std::filesystem::exists(path) ? "non_regular" : "missing"));
+                if (std::filesystem::file_size(path) == 0)
+                    throw std::invalid_argument(failure("empty"));
+            }
+            catch (const std::filesystem::filesystem_error &error)
+            {
+                throw std::filesystem::filesystem_error(failure("metadata_error"), path, error.code());
+            }
         }
     }
 

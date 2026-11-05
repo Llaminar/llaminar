@@ -35,7 +35,7 @@ private:
 /** @brief Decorate the existing whole-operation replay with its exact sealed identity mapping. */
 class RecordedQuotedFactory final:public IMoEOverlayTierPreparedWaveFactory {
 public:
-    explicit RecordedQuotedFactory(bool corrupt,bool unresolved_rank=false):original(unresolved_rank?ScriptedWaveFactory::Mode::TransferFailureWithPendingAbort:ScriptedWaveFactory::Mode::Exact,true),corrupt_(corrupt),unresolved_rank_(unresolved_rank){}
+    explicit RecordedQuotedFactory(bool corrupt,bool unresolved_rank=false,bool timing=true):original(unresolved_rank?ScriptedWaveFactory::Mode::TransferFailureWithPendingAbort:ScriptedWaveFactory::Mode::Exact,timing),corrupt_(corrupt),unresolved_rank_(unresolved_rank){}
     MoEOverlayTierPreparedWave prepare(const MoEOverlayResidencyTransaction &transaction)override {
         auto wave=original.prepare(transaction);
         auto lease=std::make_shared<int>(1);lease_witness=lease;
@@ -53,7 +53,7 @@ public:
                  MoEOverlayPhysicalProjectionTarget{edge.destination.tier_idx,{destination}}},{format,format,format}));
             for(std::size_t role=0;role<3;++role) {
                 const auto index=migration*3+role;
-                wave.measurement_operations.push_back({migration,role,true});
+                wave.measurement_operations.push_back({migration,role,true,unresolved_rank_?-1:0});
                 wave.transfers[index]=std::make_unique<RecordedQuotedOperation>(std::move(wave.transfers[index]),1024+index,corrupt_,lease);
             }
         }
@@ -114,3 +114,51 @@ TEST(MoEOverlayTierMigrationTransport, InvalidMeasurementContextRetainsActualAbo
     EXPECT_GT(factory.original.observations->transfers_destroyed,0u);
 }
 }
+
+namespace llaminar2::test {
+/** @test Recorded actual-progress replay emits each exact piece once with timing collection disabled. */
+TEST(MoEOverlayTierMigrationTransport, TerminalPiecesRetainOriginalQuotesWithoutTimingSamples)
+{
+    ScopedMovementEvidence evidence;
+    auto fixture = makeAuthority();
+    const auto transaction = fixture.authority->proposeFromHistogram();
+    ASSERT_TRUE(transaction.valid());
+    RecordedQuotedFactory factory(false, false, false);
+    MoEOverlayTierMigrationTransport transport({.factory = &factory});
+    auto started = transport.beginStage(transaction);
+    ASSERT_EQ(started.status, MoEOverlayResidencyStageStartStatus::Started);
+    ASSERT_TRUE(started.wave);
+    ASSERT_TRUE(started.measurement_context);
+    std::string error;
+    EXPECT_EQ(started.wave->pollStage(&error), MoEOverlayResidencyWaveProgress::Pending);
+    for (const auto &record : PerfStatsCollector::snapshot({"moe_overlay_residency"}))
+        EXPECT_NE(record.name, "physical_migration_pieces_completed");
+    ASSERT_EQ(started.wave->pollStage(&error), MoEOverlayResidencyWaveProgress::Ready) << error;
+    EXPECT_EQ(started.wave->pollStage(&error), MoEOverlayResidencyWaveProgress::Ready);
+    std::size_t count = 0;
+    uint64_t actual_bytes = 0;
+    for (const auto &record : PerfStatsCollector::snapshot({"moe_overlay_residency"}))
+    {
+        if (record.name != "physical_migration_pieces_completed") continue;
+        ++count;
+        EXPECT_EQ(record.value, 1.0);
+        EXPECT_EQ(record.tags.at("schema_version"), "1");
+        EXPECT_EQ(record.tags.at("observer_world_rank"), "0");
+        EXPECT_EQ(record.tags.at("source_world_rank"), "0");
+        EXPECT_EQ(record.tags.at("destination_world_rank"), "0");
+        EXPECT_EQ(record.tags.at("intersection_rows"), "1");
+        EXPECT_EQ(record.tags.at("intersection_columns"), "1");
+        const auto migration = std::stoull(record.tags.at("migration_index"));
+        const auto piece = std::stoull(record.tags.at("piece_index"));
+        const auto quote = 1024 + migration * 3 + piece;
+        EXPECT_EQ(std::stoull(record.tags.at("payload_bytes")), quote);
+        actual_bytes += quote;
+    }
+    EXPECT_EQ(count, transaction.migrations.size() * 3);
+    EXPECT_EQ(transport.stats().placement_transfer_payload_bytes_completed, actual_bytes);
+    EXPECT_EQ(factory.original.observations->measurement_sink_calls, 0u);
+    EXPECT_EQ(factory.original.observations->bank_begin_publications, 0u);
+    started.wave->abortStaged();
+    EXPECT_EQ(started.wave->pollAbort(&error), MoEOverlayResidencyWaveProgress::Ready);
+}
+} // namespace llaminar2::test

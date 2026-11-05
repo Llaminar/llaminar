@@ -312,6 +312,8 @@ namespace llaminar2
              * @param measurement_sink Optional owner of completed measurements.
              * @param require_complete_local_measurements Whether missing local
              *        timing evidence is fatal.
+             * @param measurement_operations Exact operation-to-original-piece map.
+             * @param evidence_context Same original immutable geometry, retained without timing authority.
              */
             CompositeResidencyWave(
                 std::vector<std::unique_ptr<IMoEOverlayTierTransferOperation>>
@@ -329,7 +331,8 @@ namespace llaminar2
                 std::shared_ptr<IMoEOverlayMigrationMeasurementSink>
                     measurement_sink,
                 bool require_complete_local_measurements,
-                std::vector<MoEOverlayMigrationOperationMeasurement> measurement_operations = {})
+                std::vector<MoEOverlayMigrationOperationMeasurement> measurement_operations = {},
+                std::shared_ptr<const MoEOverlayMigrationEvidenceContext> evidence_context = {})
                 : transfers_(std::move(transfers)),
                   transfer_ready_(transfers_.size(), false),
                   transfer_abort_ready_(transfers_.size(), false),
@@ -340,6 +343,7 @@ namespace llaminar2
                   transfer_progress_authority_(
                       std::move(transfer_progress_authority)),
                   measurement_operations_(std::move(measurement_operations)),
+                  evidence_context_(std::move(evidence_context)),
                   measurements_(std::move(measurements)),
                   measurement_sink_(std::move(measurement_sink)),
                   require_complete_local_measurements_(
@@ -423,14 +427,19 @@ namespace llaminar2
                     {
                         auto completed_measurement =
                             transfers_[index]->completedMeasurement();
-                        if (completed_measurement &&
-                            completed_measurement->valid())
-                        {
-                            completed_projection_payload_bytes_ =
-                                saturatingExpertTierMeasurementAdd(
-                                    completed_projection_payload_bytes_,
-                                    completed_measurement->bytes);
-                        }
+                        const auto submitted_bytes = transfers_[index]->quotedPayloadBytes();
+                        const bool observed_piece = !measurement_operations_.empty() &&
+                            measurement_operations_[index].requires_local_observation;
+                        // Normal placement may disable timing collection. An
+                        // actual Ready operation still authenticates its bound
+                        // payload quote; do not turn absent clock samples into
+                        // zero physical movement or charge protocol-only work.
+                        if (observed_piece && submitted_bytes && *submitted_bytes)
+                            completed_projection_payload_bytes_ = saturatingExpertTierMeasurementAdd(
+                                completed_projection_payload_bytes_, *submitted_bytes);
+                        else if (completed_measurement && completed_measurement->valid())
+                            completed_projection_payload_bytes_ = saturatingExpertTierMeasurementAdd(
+                                completed_projection_payload_bytes_, completed_measurement->bytes);
                         if (!measurements_.empty())
                         {
                             const bool explicit_piece = !measurement_operations_.empty();
@@ -594,6 +603,18 @@ namespace llaminar2
                     }
                 }
 
+                try
+                {
+                    recordCompletedPhysicalPieces();
+                }
+                catch (const std::exception &exception)
+                {
+                    failure_ = exception.what();
+                    assignTierTransportError(error, failure_);
+                    abortStaged();
+                    return MoEOverlayResidencyWaveProgress::Failed;
+                }
+
                 phase_ = Phase::Staged;
                 PerfStatsCollector::addCounter(
                     "moe_overlay_residency",
@@ -637,6 +658,89 @@ namespace llaminar2
                          {"purpose", "placement_change"}});
                 }
                 return MoEOverlayResidencyWaveProgress::Ready;
+            }
+
+            /** @brief Publish only terminal original-piece observations from actual completed operations.
+             * Geometry and rank were retained from the prepared physical factory; timing is optional.
+             * @throws std::invalid_argument For a missing quote or foreign observation identity.
+             */
+            void recordCompletedPhysicalPieces() const
+            {
+                if (!identity_.recordsOptimizationTransferEvidence() || !evidence_context_)
+                    return;
+                const auto &edges = evidence_context_->identities();
+                for (std::size_t operation = 0; operation < measurement_operations_.size(); ++operation)
+                {
+                    const auto &binding = measurement_operations_[operation];
+                    if (!binding.requires_local_observation) continue;
+                    if (binding.migration >= edges.size())
+                        throw std::invalid_argument("Completed physical operation has a foreign original migration ordinal");
+                    const auto &edge = edges[binding.migration];
+                    const auto &geometry = *edge.geometry;
+                    const bool cohort = geometry.targets().first.members.size() > 1 ||
+                        geometry.targets().second.members.size() > 1;
+                    if (binding.observer_world_rank < 0)
+                    {
+                        if (cohort) throw std::invalid_argument("Completed cohort operation omitted its original fabric rank");
+                        continue; // Checked legacy whole fixtures make no per-piece rank claim.
+                    }
+                    if (binding.piece >= geometry.pieces().size() || operation >= transfers_.size())
+                        throw std::invalid_argument("Completed physical operation has a foreign original piece ordinal");
+                    const auto &piece = geometry.pieces()[binding.piece];
+                    const auto from = std::find_if(geometry.targets().first.members.begin(),
+                        geometry.targets().first.members.end(), [&](const auto &member) {
+                            return member.participant_id == piece.source_participant;
+                        });
+                    const auto to = std::find_if(geometry.targets().second.members.begin(),
+                        geometry.targets().second.members.end(), [&](const auto &member) {
+                            return member.participant_id == piece.destination_participant;
+                        });
+                    if (from == geometry.targets().first.members.end() || to == geometry.targets().second.members.end() ||
+                        (binding.observer_world_rank != from->world_rank && binding.observer_world_rank != to->world_rank))
+                        throw std::invalid_argument("Completed physical piece observer is not an original endpoint rank");
+                    const auto bytes = transfers_[operation]->quotedPayloadBytes();
+                    if (!transfer_ready_[operation] || !bytes || !*bytes || !piece.intersection)
+                        throw std::invalid_argument("Completed physical piece omitted its actual ready operation payload quote");
+                    const auto targetWord = [](const MoEOverlayPhysicalProjectionTarget &target) {
+                        return target.members.size() == 1 ? target.members.front().participant_id :
+                            MoEOverlayRouteTarget::cpuCohort(target.tier_idx).word();
+                    };
+                    const auto &intersection = *piece.intersection;
+                    const auto &source = intersection.source();
+                    const auto &destination = intersection.destination();
+                    PerfStatsCollector::addCounter("moe_overlay_residency", "physical_migration_pieces_completed", 1.0,
+                        "maintenance", perf_device_,
+                        {{"schema_version", "1"}, {"purpose", "placement_change"},
+                         {"candidate_epoch", std::to_string(edge.candidate_epoch)},
+                         {"layer", std::to_string(edge.layer)}, {"expert", std::to_string(edge.expert)},
+                         {"migration_index", std::to_string(binding.migration)},
+                         {"piece_index", std::to_string(binding.piece)},
+                         {"piece_count", std::to_string(geometry.pieces().size())},
+                         {"source_target", std::to_string(targetWord(geometry.targets().first))},
+                         {"destination_target", std::to_string(targetWord(geometry.targets().second))},
+                         {"source_participant", std::to_string(piece.source_participant)},
+                         {"destination_participant", std::to_string(piece.destination_participant)},
+                         {"source_world_rank", std::to_string(from->world_rank)},
+                         {"destination_world_rank", std::to_string(to->world_rank)},
+                         {"observer_world_rank", std::to_string(binding.observer_world_rank)},
+                         {"projection", std::to_string(static_cast<unsigned>(piece.projection))},
+                         {"format_kind", std::to_string(static_cast<unsigned>(piece.format.kind))},
+                         {"codebook", std::to_string(piece.format.native_vnni.codebook_id)},
+                         {"is_superblock", piece.format.native_vnni.is_superblock ? "true" : "false"},
+                         {"source_original_rows", std::to_string(source.source_rows)},
+                         {"source_original_columns", std::to_string(source.source_columns)},
+                         {"source_first_row", std::to_string(source.first_row)}, {"source_rows", std::to_string(source.rows)},
+                         {"source_first_column", std::to_string(source.first_column)}, {"source_columns", std::to_string(source.columns)},
+                         {"destination_original_rows", std::to_string(destination.source_rows)},
+                         {"destination_original_columns", std::to_string(destination.source_columns)},
+                         {"destination_first_row", std::to_string(destination.first_row)}, {"destination_rows", std::to_string(destination.rows)},
+                         {"destination_first_column", std::to_string(destination.first_column)}, {"destination_columns", std::to_string(destination.columns)},
+                         {"intersection_first_row", std::to_string(intersection.firstRow())},
+                         {"intersection_first_column", std::to_string(intersection.firstColumn())},
+                         {"intersection_rows", std::to_string(intersection.rows())},
+                         {"intersection_columns", std::to_string(intersection.columns())},
+                         {"payload_bytes", std::to_string(*bytes)}});
+                }
             }
 
             /** @brief Return the exact local prepare-to-ready interval. */
@@ -994,6 +1098,8 @@ namespace llaminar2
             std::shared_ptr<IMoEOverlayTransferProgressAuthority>
                 transfer_progress_authority_;
             std::vector<MoEOverlayMigrationOperationMeasurement> measurement_operations_;
+            std::shared_ptr<const MoEOverlayMigrationEvidenceContext> evidence_context_; ///< Original metadata retained independently of timing.
+
             std::vector<MoEOverlayCompletedMigrationMeasurement>
                 measurements_;
             std::shared_ptr<IMoEOverlayMigrationMeasurementSink>
@@ -1087,8 +1193,9 @@ namespace llaminar2
                  MoEOverlayResidencyTransactionPurpose::EconomyCalibration);
         std::shared_ptr<const MoEOverlayMigrationEvidenceContext> evidence_context;
         bool context_valid=true;
-        if (collect_measurements && prepared.status==MoEOverlayResidencyStageStartStatus::Started &&
+        if (prepared.status==MoEOverlayResidencyStageStartStatus::Started &&
             described_targets_match && prepared.valid(expected_transfer_count) &&
+            !prepared.measurement_geometries.empty() &&
             prepared.measurement_geometries.size()==transaction.migrations.size())
         {
             try {
@@ -1245,7 +1352,7 @@ namespace llaminar2
                 collect_measurements ? config_.measurement_sink : nullptr,
                 collect_measurements &&
                     config_.require_complete_local_measurements,
-                std::move(prepared.measurement_operations)),
+                std::move(prepared.measurement_operations), evidence_context),
             .measurement_context = std::move(evidence_context),
         };
     }

@@ -1492,6 +1492,77 @@ namespace llaminar2
         return true;
     }
 
+    MoEOverlayInferencePlacementScopeObservation
+    MoEOverlayInferenceTransactionCoordinator::withMoEOverlayInferencePlacementScope(
+        const std::function<void()> &body)
+    {
+        if (!body || !config_.residency_authority)
+            throw std::logic_error("Finite placement scope requires its original host authority and body");
+        const auto require_idle = [&] {
+            if (placement_scope_parent_ || execution_sequence_.active() || transaction_count_ != 0 ||
+                (state_ != MoEOverlayInferenceProtocolState::Idle &&
+                 state_ != MoEOverlayInferenceProtocolState::Complete))
+                throw std::logic_error("Finite placement scope cannot overlap a scope or unretired command");
+        };
+        { std::lock_guard lock(mutex_); require_idle(); }
+        // Normal admission may wait behind an existing publisher. No parent or
+        // coordinator lock is held while that original boundary makes progress.
+        auto parent = config_.residency_authority->tryAcquireGraphSequenceSnapshot();
+        if (!parent || !*parent)
+            throw std::logic_error("Finite placement scope could not retain its original current epoch");
+        MoEOverlayInferencePlacementScopeObservation observation;
+        {
+            std::lock_guard lock(mutex_);
+            require_idle();
+            observation = {parent->epoch(), next_sequence_id_, 0};
+            placement_scope_parent_ = std::move(parent);
+        }
+        try
+        {
+            body();
+            std::lock_guard lock(mutex_);
+            if (state_ != MoEOverlayInferenceProtocolState::Complete ||
+                execution_sequence_.active() || transaction_count_ != 0 ||
+                next_sequence_id_ <= observation.first_sequence_id)
+                throw std::logic_error("Finite placement scope lacks complete original descendant terminals");
+            observation.next_sequence_id = next_sequence_id_;
+            placement_scope_parent_.reset();
+            return observation;
+        }
+        catch (...)
+        {
+            const auto original = std::current_exception();
+            bool terminal = false;
+            {
+                std::lock_guard lock(mutex_);
+                terminal = !execution_sequence_.active() && transaction_count_ == 0 &&
+                    (state_ == MoEOverlayInferenceProtocolState::Idle ||
+                     state_ == MoEOverlayInferenceProtocolState::Complete);
+                if (terminal)
+                    placement_scope_parent_.reset();
+            }
+            if (terminal)
+                std::rethrow_exception(original);
+            // Existing MPI abort submission alone is not a peer native-drain
+            // receipt. Never release this parent or report a reusable scope on
+            // that basis. Attempt original failure fan-out, preserve the first
+            // exception in the fatal diagnostic, and retain ownership to exit.
+            std::string abort_error;
+            (void)abortCommand(observation.placement_epoch, 1, &abort_error);
+            try { std::rethrow_exception(original); }
+            catch (const std::exception &error) {
+                std::fprintf(stderr, "[FATAL] Finite placement scope has unproven descendant retirement: %s; abort=%s\n",
+                             error.what(), abort_error.c_str());
+            }
+            catch (...) {
+                std::fprintf(stderr, "[FATAL] Finite placement scope has unproven descendant retirement (non-standard exception); abort=%s\n",
+                             abort_error.c_str());
+            }
+            std::fflush(stderr);
+            std::terminate();
+        }
+    }
+
     bool MoEOverlayInferenceTransactionCoordinator::beginCommand(
         const MoEOverlayInferenceCommandIdentity &command,
         std::string *error)
@@ -1604,8 +1675,12 @@ namespace llaminar2
         std::uint64_t placement_epoch = current_placement_epoch_;
         if (config_.residency_authority)
         {
-            placement_epoch_lease = config_.residency_authority
-                                        ->tryAcquireGraphSequenceSnapshot();
+            if (placement_scope_parent_)
+                placement_epoch_lease = config_.residency_authority
+                    ->borrowGraphSequenceSnapshot(*placement_scope_parent_);
+            else
+                placement_epoch_lease = config_.residency_authority
+                    ->tryAcquireGraphSequenceSnapshot();
             if (!placement_epoch_lease || !*placement_epoch_lease ||
                 placement_epoch_lease->epoch() == 0 ||
                 placement_epoch_lease->epoch() < current_placement_epoch_)

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Device-free adversarial checks of authority-owned HTTP movement evidence.
+## @file test_generation_movement_ledger.py
+# @brief Device-free adversarial checks of the shared typed publication, transport and inference evidence.
+"""Device-free adversarial checks of authority-owned movement evidence.
 
 Synthetic journals exercise schema, closed-cycle, economic and immutable-history
 contracts, including different HTTP and terminal publication cutoffs. Exact
@@ -20,9 +22,28 @@ sys.path.insert(0, str(ROOT / "tests/v2/e2e/server"))
 from generation_movement_ledger import (MovementLedgerObserver, MovementRequirement,
     validate_movement_transport_mirrors, native_movement_sequence, native_movement_edge_words,
     validate_controller_movement_transport, controller_movement_words, controller_movement_edge_words,
-    CONTROLLER_MOVEMENT_TAGS, _CONTROLLER_FIELDS, _CONTROLLER_COUNTER_FIELDS)
+    CONTROLLER_MOVEMENT_TAGS, _CONTROLLER_FIELDS, _CONTROLLER_COUNTER_FIELDS,
+    validate_cohort_publication_inference, validate_cohort_parity_documents)
 from runtime_feature_perf_policy import MovementEvidence, validate_runtime_feature_policy
 from server_execution_contract import RuntimeFeaturePolicy
+
+
+def edge_field(edge, field):
+    """Resolve a test's named semantic field in the canonical typed endpoint."""
+    for side in ("source", "destination"):
+        if field.startswith(side + "_") and field[len(side) + 1:] in ("participant", "device", "world_rank"):
+            return edge[side], field[len(side) + 1:]
+    return edge, field
+
+
+def get_edge_field(edge, field):
+    owner, key = edge_field(edge, field)
+    return owner[key]
+
+
+def set_edge_field(edge, field, value):
+    owner, key = edge_field(edge, field)
+    owner[key] = value
 
 
 def ledger(authority="device", transaction=1, epoch=2, axis="combined"):
@@ -31,11 +52,10 @@ def ledger(authority="device", transaction=1, epoch=2, axis="combined"):
         epoch = transaction
     wave = {"authority": authority, "transaction": transaction, "candidate_epoch": epoch}
     edges = [{**wave, "layer": 3, "expert": expert, "cycle_index": 0, "cycle_size": 2,
-              "movement_axis": axis, "direction": direction, "source_participant": source,
-              "destination_participant": destination, "source_priority": source_priority,
-              "destination_priority": destination_priority, "source_device": source_device,
-              "destination_device": destination_device, "source_world_rank": source,
-              "destination_world_rank": destination, "estimated_weight_bytes": 1024,
+              "movement_axis": axis, "direction": direction,
+              "source": {"kind": "whole", "participant": source, "device": source_device, "world_rank": source},
+              "destination": {"kind": "whole", "participant": destination, "device": destination_device, "world_rank": destination},
+              "source_priority": source_priority, "destination_priority": destination_priority, "estimated_weight_bytes": 1024,
               "activation_count": 0, "blocking_inference": False}
              for expert, source, destination, source_priority, destination_priority, direction, source_device, destination_device in (
                  (7, 0, 1, -20, 17, "demotion", "CUDA:0", "ROCm:0"),
@@ -54,7 +74,7 @@ def ledger(authority="device", transaction=1, epoch=2, axis="combined"):
         "capacity_rejected_cycles": 0, "participant_axis_budget_rejected_cycles": 0,
         "dependent_cohort_candidates": 0, "dependent_cohort_payoff_rejections": 0,
         "physical_cycle_recomposition": False, "capacity_bounded": False, "policy_bounded": False}]
-    return {"schema": 2, "scope": "model_lifetime", "complete": True, "discarded_edges": 0,
+    return {"schema": 4, "scope": "model_lifetime", "complete": True, "discarded_edges": 0,
             "discarded_economy_records": 0, "discarded_host_admission_records": 0,
             "edges": edges, "economy": economy, "host_admissions": admissions}
 
@@ -89,9 +109,9 @@ def controller_transport(journal, ranks=2):
             demotions=sum(e["direction"] == "demotion" for e in edges),
             same_priority_moves=sum(e["direction"] == "same_priority" for e in edges),
             cross_domain_moves=sum(e["source_priority"] != e["destination_priority"] for e in edges),
-            cross_rank_moves=sum(e["source_world_rank"] is not None and e["destination_world_rank"] is not None
-                                 and e["source_world_rank"] != e["destination_world_rank"] for e in edges),
-            cross_backend_moves=sum(e["source_device"].split(":")[0] != e["destination_device"].split(":")[0] for e in edges),
+            cross_rank_moves=sum(e["source"]["world_rank"] is not None and e["destination"]["world_rank"] is not None
+                                 and e["source"]["world_rank"] != e["destination"]["world_rank"] for e in edges),
+            cross_backend_moves=sum(e["source"]["device"].split(":")[0] != e["destination"]["device"].split(":")[0] for e in edges),
             snapshot_observations=64, accepted_cycles=economy["cycle_count"], physical_cycles=economy["cycle_count"], changed_layers=1,
             edges_checked=len(edges), participant_coordinates_checked=2, tier_coordinates_checked=2)
         receipt.update({key: value for key, value in economy.items() if key.endswith("_ns")})
@@ -125,9 +145,9 @@ class MovementLedgerTests(unittest.TestCase):
         """A native swap improves layer spread even when participant totals worsen."""
         value = ledger(axis="participant_placement")
         for edge in value["edges"]:
-            edge.update(source_priority=0, destination_priority=0, direction="same_priority",
-                        source_device=f'CUDA:{edge["source_participant"]}',
-                        destination_device=f'CUDA:{edge["destination_participant"]}')
+            edge.update(source_priority=0, destination_priority=0, direction="same_priority")
+            for side in ("source", "destination"):
+                edge[side]["device"] = f'CUDA:{edge[side]["participant"]}'
         value["economy"] = [{k: v for k, v in value["economy"][0].items() if not k.endswith("_ns")}]
         value["economy"][0].update(
             policy="native_load_spread", accepted_spread_improvement=40,
@@ -175,7 +195,10 @@ class MovementLedgerTests(unittest.TestCase):
         """Build commit-site mirrors, not substitute transport or owner state."""
         return [{"domain": "moe_overlay_residency" if edge["authority"] == "host" else "moe_overlay_controller",
                  "name": "expert_migration_edges" if edge["authority"] == "host" else "dynamic_migration_edges",
-                 "value": 1, "rank": 0, "tags": {**{k: str(v) for k, v in edge.items()},
+                 "value": 1, "rank": 0, "tags": {**{k: str(get_edge_field(edge, k)) for k in
+                    ("candidate_epoch", "layer", "expert", "source_participant", "destination_participant",
+                     "source_priority", "destination_priority", "source_device", "destination_device", "movement_axis", "direction")},
+                    "transaction": str(edge["transaction"]),
                     "policy_owner": edge["authority"], "transaction_purpose": "live_placement_change"}}
                 for edge in journal["edges"]]
 
@@ -338,8 +361,8 @@ class MovementLedgerTests(unittest.TestCase):
         for key in ("cycle_index", "cycle_size", "source_device", "destination_device", "activation_count",
                     "source_world_rank", "destination_world_rank", "expert", "estimated_weight_bytes", "movement_axis"):
             changed = copy.deepcopy(terminal)
-            value = changed[0]["movement"]["edges"][0][key]
-            changed[0]["movement"]["edges"][0][key] = value + 1 if isinstance(value, int) else "wrong"
+            value = get_edge_field(changed[0]["movement"]["edges"][0], key)
+            set_edge_field(changed[0]["movement"]["edges"][0], key, value + 1 if isinstance(value, int) else "wrong")
             with self.subTest(key=key), self.assertRaises(ValueError):
                 validate_controller_movement_transport(records, changed)
         for key, value in (("count", True), ("sequence_word_count", 34), ("sequence_digest_lo", -1),
@@ -447,7 +470,7 @@ class MovementLedgerTests(unittest.TestCase):
             validate_movement_transport_mirrors(journal, changed, terminal)
         for field in ("activation_count", "estimated_weight_bytes", "source_world_rank"):
             changed = copy.deepcopy(terminal)
-            changed[0]["movement"]["edges"][0][field] += 1
+            set_edge_field(changed[0]["movement"]["edges"][0], field, get_edge_field(changed[0]["movement"]["edges"][0], field) + 1)
             with self.subTest(field=field), self.assertRaises(ValueError):
                 validate_movement_transport_mirrors(journal, records, changed)
 
@@ -528,12 +551,12 @@ class MovementLedgerTests(unittest.TestCase):
                             ("source_world_rank", -1), ("estimated_weight_bytes", 0),
                             ("activation_count", 2**64), ("blocking_inference", True)):
             changed = ledger()
-            changed["edges"][0][name] = value
+            set_edge_field(changed["edges"][0], name, value)
             with self.subTest(name=name, value=value), self.assertRaises(ValueError):
                 self.check(changed)
         changed = ledger()
         for edge in changed["edges"]:
-            edge["source_world_rank"] = edge["destination_world_rank"] = None
+            edge["source"]["world_rank"] = edge["destination"]["world_rank"] = None
         self.check(changed)
 
     def test_cycle_coverage_identity_and_conservation_are_exact(self):
@@ -651,7 +674,7 @@ class MovementLedgerTests(unittest.TestCase):
     @classmethod
     def pipeline_evidence(cls, devices=4, reverse=False, shared=False, mtp=False):
         """Independent real scopes may reuse a device and the same uint64 wave IDs."""
-        movement = {"schema": 3, "scope": "model_lifetime", "complete": True, "stages": []}
+        movement = {"schema": 5, "scope": "model_lifetime", "complete": True, "stages": []}
         geometry = {"schema": 2, "scope": "model_lifetime", "authority": "pipeline",
                     "available_axes": ["participant_placement"], "stages": []}
         terminal = {"schema": 2, "scope": "terminal_model_lifetime", "rank": 0, "stages": []}
@@ -666,7 +689,7 @@ class MovementLedgerTests(unittest.TestCase):
             for edge in journal["edges"]:
                 edge["layer"] = end - 1
                 for endpoint in ("source", "destination"):
-                    edge[endpoint + "_device"] = f'{"ROCm" if backend == "rocm" else "CUDA"}:{edge[endpoint + "_participant"]}'
+                    edge[endpoint]["device"] = f'{"ROCm" if backend == "rocm" else "CUDA"}:{edge[endpoint]["participant"]}'
             owned, final = cls.native_transport(journal)
             for record in owned:
                 record["device"] = "ROCm:0" if backend == "rocm" else "CUDA:0"
@@ -714,7 +737,7 @@ class MovementLedgerTests(unittest.TestCase):
             elif mutation == 5:
                 changed["stages"][1]["movement"]["edges"][0]["layer"] = 3
             elif mutation == 6:
-                changed["stages"][1]["movement"]["edges"][0]["destination_device"] = "CUDA:1"
+                changed["stages"][1]["movement"]["edges"][0]["destination"]["device"] = "CUDA:1"
             elif mutation == 7:
                 changed["stages"][1]["identity"]["participants"].append("localhost:-1:rocm:0")
             elif mutation == 8:
@@ -776,6 +799,258 @@ class MovementLedgerTests(unittest.TestCase):
         geometry["available_axes"].append("tier_residency")
         with self.assertRaisesRegex(ValueError, "contradicts"):
             MovementLedgerObserver(MovementRequirement.REQUIRED).observe(response(journal, geometry))
+
+
+
+class CompleteCohortMovementTests(unittest.TestCase):
+    """Recorded original piece metadata complements actual source-body/native transport gates."""
+
+    @staticmethod
+    def recorded(width):
+        """Create a complete recorded F partition; widths4..8 assert metadata, not hardware."""
+        journal = ledger("host", axis="tier_residency")
+        members = []
+        for member in range(width):
+            projections = []
+            for role in range(3):
+                projections.append(dict(projection=role, source_rows=64 * width if role < 2 else 32,
+                    source_columns=32 if role < 2 else 64 * width,
+                    first_row=64 * member if role < 2 else 0, rows=64 if role < 2 else 32,
+                    first_column=0 if role < 2 else 64 * member, columns=32 if role < 2 else 64,
+                    format_kind=0, codebook=0, is_superblock=False))
+            members.append(dict(participant=member + 1, world_rank=member, address=f"localhost:{member}:cpu:0",
+                                numa_node=member, projections=projections))
+        cohort = dict(kind="cpu_cohort", tier=1, layer=3, members=members)
+        whole = dict(kind="whole", participant=0, device="CUDA:0", world_rank=0)
+        journal["edges"][0].update(source=whole, destination=cohort)
+        journal["edges"][1].update(source=copy.deepcopy(cohort), destination=copy.deepcopy(whole))
+        records = []
+        for edge in journal["edges"]:
+            for role in range(3):
+                for index, member in enumerate(members):
+                    local = member["projections"][role]
+                    full = dict(local, first_row=0, first_column=0, rows=local["source_rows"], columns=local["source_columns"])
+                    source_member = whole if edge["source"]["kind"] == "whole" else member
+                    destination_member = member if edge["destination"]["kind"] == "cpu_cohort" else whole
+                    source = full if edge["source"]["kind"] == "whole" else local
+                    destination = local if edge["destination"]["kind"] == "cpu_cohort" else full
+                    tags = dict(schema_version="1", purpose="placement_change", candidate_epoch=str(edge["candidate_epoch"]),
+                        layer="3", expert=str(edge["expert"]), migration_index=str(edge["expert"] - 7),
+                        piece_index=str(role * width + index), piece_count=str(3 * width),
+                        source_target="0" if edge["source"]["kind"] == "whole" else "-3",
+                        destination_target="-3" if edge["destination"]["kind"] == "cpu_cohort" else "0",
+                        source_participant=str(source_member["participant"]), destination_participant=str(destination_member["participant"]),
+                        source_world_rank=str(source_member["world_rank"]), destination_world_rank=str(destination_member["world_rank"]),
+                        projection=str(role), format_kind="0", codebook="0", is_superblock="false", payload_bytes="8192")
+                    for side, projection in (("source", source), ("destination", destination)):
+                        for tag, field in (("original_rows", "source_rows"), ("original_columns", "source_columns"),
+                                           ("first_row", "first_row"), ("rows", "rows"),
+                                           ("first_column", "first_column"), ("columns", "columns")):
+                            tags[side + "_" + tag] = str(projection[field])
+                    for field in ("first_row", "first_column", "rows", "columns"):
+                        tags["intersection_" + field] = str(local[field])
+                    for observer in {source_member["world_rank"], destination_member["world_rank"]}:
+                        records.append(dict(kind="counter", phase="maintenance", domain="moe_overlay_residency", name="physical_migration_pieces_completed",
+                                            value=1, rank=observer, tags=dict(tags, observer_world_rank=str(observer))))
+        return journal, records
+
+    def test_complete_target_piece_observers_cover_every_original_member(self):
+        for width in range(2, 9):
+            journal, records = self.recorded(width)
+            with self.subTest(width=width):
+                validate_movement_transport_mirrors(journal, records)
+                # Staged physical work without an authoritative committed edge
+                # remains unrelated evidence, never another completed move.
+                later = copy.deepcopy(records)
+                for record in later: record["tags"]["candidate_epoch"] = "99"
+                validate_movement_transport_mirrors(journal, records + later)
+
+    def test_partial_collapsed_foreign_and_padding_piece_evidence_rejects(self):
+        journal, records = self.recorded(2)
+        cases = []
+        cases.append((journal, records[1:]))
+        cases.append((journal, records + [copy.deepcopy(records[0])]))
+        for field, value in (("source_target", "1"), ("destination_participant", "0"),
+                             ("destination_world_rank", "9"), ("observer_world_rank", "9"),
+                             ("piece_count", "1"), ("source_rows", "999"),
+                             ("destination_first_row", "999"), ("intersection_rows", "65"),
+                             ("codebook", "1"), ("payload_bytes", "0")):
+            changed = copy.deepcopy(records); changed[0]["tags"][field] = value
+            cases.append((journal, changed))
+        changed = copy.deepcopy(records); changed[0]["value"] = 2; cases.append((journal, changed))
+        changed = copy.deepcopy(journal); changed["edges"][0]["destination"]["members"].pop(); cases.append((changed, records))
+        changed = copy.deepcopy(journal); changed["edges"][0]["destination"]["members"].reverse(); cases.append((changed, records))
+        changed = copy.deepcopy(journal); changed["edges"][0]["source_participant"] = 0; cases.append((changed, records))
+        for index, (current, pieces) in enumerate(cases):
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                validate_movement_transport_mirrors(current, pieces)
+
+    def test_legacy_or_whole_projection_cannot_certify_complete_targets(self):
+        journal, records = self.recorded(2)
+        changed = copy.deepcopy(journal); changed["schema"] = 2
+        with self.assertRaises(ValueError): validate_movement_transport_mirrors(changed, records)
+        with self.assertRaises(ValueError): native_movement_edge_words(journal["edges"][0])
+
+
+
+class CohortPublicationInferenceTests(unittest.TestCase):
+    """Recorded evidence runs the exact shared production-journal validator; it certifies no native topology."""
+    @staticmethod
+    def evidence(width=2):
+        journal, records = CompleteCohortMovementTests.recorded(width)
+        for family in ("edges", "economy", "host_admissions"):
+            for row in journal[family]: row.update(transaction=2, candidate_epoch=2)
+        for row in records: row["tags"]["candidate_epoch"] = "2"
+        edge = journal["edges"][0]
+        for index, member in enumerate(edge["destination"]["members"]):
+            records.append(dict(kind="counter", domain="moe_overlay_residency", name="completed_cpu_fragment_execution",
+                phase="inference", count=1, value=3, sequence_word_count=2,
+                sequence_minimum_words=[2, 2], sequence_maximum_words=[2, 2], rank=member["world_rank"],
+                tags=dict(schema_version="1", layer="3", expert=str(edge["expert"]), participant=str(member["participant"]),
+                          world_rank=str(member["world_rank"]), member=str(index))))
+        for rank in range(width):
+            records.append(dict(kind="counter",domain="moe_overlay_residency",name="old_epoch_retirements",phase="maintenance",
+                                count=1,value=1,rank=rank,tags=dict(epoch="1")))
+            records.append(dict(kind="counter",domain="moe_overlay_residency",name="distributed_retirement_consensus_ready",phase="maintenance",
+                count=1,value=1,rank=rank,tags=dict(expected_epoch="1",candidate_epoch="2",world_rank=str(rank),world_size=str(width),background="true",blocking="false")))
+        return journal, records
+
+    @staticmethod
+    def documents(journal, records, *, case="original", width=2):
+        """Project each original rank's own terminal owner/mirror evidence."""
+        documents=[]
+        for rank in range(width):
+            movement=copy.deepcopy(journal)
+            if rank:
+                movement["economy"]=[]
+                movement["host_admissions"]=[]
+            documents.append(dict(schema="llaminar.cohort-parity-movement.v1", case=case,
+                world_rank=rank, world_size=width, topology=topology("host", ("tier_residency",)),
+                movement=movement, records=[{key:value for key,value in row.items() if key != "rank"}
+                                            for row in records if row["rank"]==rank]))
+        for document in documents:
+            document["records"].append(dict(kind="counter",domain="moe_overlay_residency",
+                name="proposal_publications_completed" if document["world_rank"]==0 else "proposals_received",
+                phase="maintenance",count=len(journal["economy"]),value=len(journal["economy"]),
+                tags=dict(background="true",blocking="false",coordinator_world_rank="0",world_rank=str(document["world_rank"]))))
+        return documents
+
+    def test_complete_committed_original_members_use_arrivals_then_old_epoch_retires(self):
+        journal, records = self.evidence()
+        for _ in range(20): validate_cohort_publication_inference(journal, records,world_size=2)
+        documents = self.documents(journal, records)
+        validate_cohort_parity_documents(documents, case="original", world_size=2)
+        for bad in (documents[:1], documents + documents[:1], [dict(documents[0],case="foreign"), documents[1]]):
+            with self.assertRaises(ValueError): validate_cohort_parity_documents(bad,case="original",world_size=2)
+
+    def test_registered_four_eight_rank_metadata_requires_every_original_observer_and_retirement(self):
+        for width in (4,8):
+            journal,records=self.evidence(width)
+            validate_cohort_publication_inference(journal,records,world_size=width)
+            for name in ("completed_cpu_fragment_execution","old_epoch_retirements","distributed_retirement_consensus_ready"):
+                missing=[row for row in records if not (row["name"]==name and row["rank"]==width-1)]
+                with self.assertRaises(ValueError):validate_cohort_publication_inference(journal,missing,world_size=width)
+            foreign=copy.deepcopy(records)
+            next(row for row in foreign if row["name"]=="distributed_retirement_consensus_ready")["tags"]["world_size"]=str(width+1)
+            with self.assertRaises(ValueError):validate_cohort_publication_inference(journal,foreign,world_size=width)
+            foreign=copy.deepcopy(records)
+            next(row for row in foreign if row["name"]=="old_epoch_retirements")["rank"]=width
+            with self.assertRaises(ValueError):validate_cohort_publication_inference(journal,foreign,world_size=width)
+
+    def test_old_static_unpublished_partial_stale_and_unretired_cannot_certify_incoming_use(self):
+        journal, records = self.evidence()
+        executions = [row for row in records if row["name"] == "completed_cpu_fragment_execution"]
+        cases = [(journal,[row for row in records if row["name"] != "completed_cpu_fragment_execution"]),
+                 (journal,[row for row in records if row is not executions[1]]),
+                 (journal,[row for row in records if row["name"] != "old_epoch_retirements"]),
+                 (empty_ledger(), records)]
+        original_static=copy.deepcopy(records)
+        for row in original_static:
+            if row["name"] == "completed_cpu_fragment_execution":
+                row["sequence_minimum_words"]=[0,2];row["sequence_maximum_words"]=[0,2]
+        cases.append((journal,original_static))
+        keyed_epoch=copy.deepcopy(records)
+        next(row for row in keyed_epoch if row["name"] == "completed_cpu_fragment_execution")["tags"]["epoch"]="2"
+        cases.append((journal,keyed_epoch))
+        too_few_routes=copy.deepcopy(records)
+        observation=next(row for row in too_few_routes if row["name"] == "completed_cpu_fragment_execution")
+        observation.update(count=2,value=1,sequence_word_count=4)
+        cases.append((journal,too_few_routes))
+        for field,value in (("value",1.5),("sequence_maximum_words",[0,2]),("sequence_maximum_words",[2,1]),("rank",99)):
+            changed=copy.deepcopy(records)
+            next(row for row in changed if row["name"] == "completed_cpu_fragment_execution")[field]=value
+            cases.append((journal,changed))
+        for candidate,observations in cases:
+            with self.assertRaises(ValueError): validate_cohort_publication_inference(candidate,observations,world_size=2)
+
+class CohortHostFollowerEvidenceTests(unittest.TestCase):
+    """Replay r549's seven owner policy waves and seventy exact follower edges."""
+    @staticmethod
+    def documents():
+        journal=empty_ledger()
+        records=[]
+        for epoch in range(2,9):
+            base, observed=CohortPublicationInferenceTests.evidence()
+            economy=copy.deepcopy(base["economy"][0])
+            economy.update(transaction=epoch,candidate_epoch=epoch,command_count=10,cycle_count=5)
+            journal["economy"].append(economy)
+            admission=copy.deepcopy(base["host_admissions"][0])
+            admission.update(transaction=epoch,candidate_epoch=epoch,maximum_concurrent_cycles=5)
+            for field in ("candidate_cycles","policy_eligible_cycles","admitted_candidate_cycles","admitted_physical_cycles"):
+                admission[field]=5
+            for field in ("policy_eligible_axes","admitted_candidate_axes","admitted_physical_axes"):
+                admission[field]["tier_residency"]=5
+            journal["host_admissions"].append(admission)
+            for cycle in range(5):
+                for original in base["edges"]:
+                    edge=copy.deepcopy(original)
+                    edge.update(transaction=epoch,candidate_epoch=epoch,cycle_index=cycle,expert=original["expert"]+cycle*2)
+                    journal["edges"].append(edge)
+                for original in observed:
+                    if cycle and original["name"] in ("old_epoch_retirements","distributed_retirement_consensus_ready"):
+                        continue
+                    record=copy.deepcopy(original)
+                    tags=record["tags"]
+                    for field in ("candidate_epoch","expected_epoch","epoch"):
+                        if field in tags:tags[field]=str(epoch-1 if field!="candidate_epoch" else epoch)
+                    if "expert" in tags:tags["expert"]=str(int(tags["expert"])+cycle*2)
+                    if "migration_index" in tags:tags["migration_index"]=str(int(tags["migration_index"])+cycle*2)
+                    if record["name"]=="completed_cpu_fragment_execution":
+                        record["sequence_minimum_words"]=[epoch,epoch]
+                        record["sequence_maximum_words"]=[epoch,epoch]
+                    records.append(record)
+        return CohortPublicationInferenceTests.documents(journal,records,case="r549-shape")
+
+    def test_one_policy_owner_seven_waves_seventy_edges_and_exact_follower_pass(self):
+        documents=self.documents()
+        self.assertEqual([len(documents[0]["movement"][key]) for key in ("economy","host_admissions","edges")],[7,7,70])
+        self.assertEqual([len(documents[1]["movement"][key]) for key in ("economy","host_admissions","edges")],[0,0,70])
+        before=copy.deepcopy(documents)
+        for _ in range(20):
+            validate_cohort_parity_documents(reversed(documents),case="r549-shape",world_size=2)
+        self.assertEqual(documents,before)  # Validation never fills a follower's policy arrays.
+
+    def test_missing_forged_stale_ambiguous_policy_and_physical_proofs_reject(self):
+        original=self.documents()
+        cases=[]
+        for key in ("economy","host_admissions"):
+            bad=copy.deepcopy(original);bad[0]["movement"][key]=[];cases.append(bad)
+            bad=copy.deepcopy(original);bad[1]["movement"][key]=copy.deepcopy(original[0]["movement"][key]);cases.append(bad)
+        bad=copy.deepcopy(original);bad[1]["movement"]=copy.deepcopy(original[0]["movement"]);cases.append(bad)
+        bad=copy.deepcopy(original);bad[0]["movement"],bad[1]["movement"]=bad[1]["movement"],bad[0]["movement"];cases.append(bad)
+        bad=copy.deepcopy(original);bad[1]["records"]=[row for row in bad[1]["records"] if row["name"]!="proposals_received"];cases.append(bad)
+        bad=copy.deepcopy(original);next(row for row in bad[1]["records"] if row["name"]=="proposals_received")["tags"]["coordinator_world_rank"]="1";cases.append(bad)
+        for key,value in (("candidate_epoch",99),("transaction",99),("expert",999)):
+            bad=copy.deepcopy(original);bad[1]["movement"]["edges"][0][key]=value;cases.append(bad)
+        bad=copy.deepcopy(original);bad[1]["movement"]["edges"].reverse();cases.append(bad)
+        bad=copy.deepcopy(original);bad[1]["movement"]["edges"].pop();cases.append(bad)
+        bad=copy.deepcopy(original);bad[1]["topology"]["available_axes"]=["participant_placement"];cases.append(bad)
+        bad=copy.deepcopy(original);bad[1]["records"][0]["rank"]=0;cases.append(bad)
+        for name in ("physical_migration_pieces_completed","completed_cpu_fragment_execution", "old_epoch_retirements", "distributed_retirement_consensus_ready"):
+            bad=copy.deepcopy(original);bad[1]["records"]=[row for row in bad[1]["records"] if row["name"]!=name];cases.append(bad)
+        for index,bad in enumerate(cases):
+            with self.subTest(index=index),self.assertRaises(ValueError):
+                validate_cohort_parity_documents(bad,case="r549-shape",world_size=2)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,8 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import hashlib
+import importlib.util
+import json
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -30,6 +32,12 @@ from unittest.mock import patch
 from test_openmp_runtime_binding import RuntimeBindingError as ELFBindingError, parse_soname, trace_loader
 
 ROOT = Path(__file__).resolve().parents[4]
+_PROOF_SPEC = importlib.util.spec_from_file_location(
+    "hip_preferred_queue_proof", ROOT / "scripts/docker/hip-preferred-queue/proof.py")
+assert _PROOF_SPEC and _PROOF_SPEC.loader
+QUEUE_PROOF = importlib.util.module_from_spec(_PROOF_SPEC)
+_PROOF_SPEC.loader.exec_module(QUEUE_PROOF)
+
 
 
 class HIPRuntimeBindingError(RuntimeError):
@@ -57,6 +65,7 @@ class HIPRuntimeAuthority:
     soname: str
     identity: str
     patches: tuple[tuple[str, str], ...]
+    proof_contract: str = ""
 
     @classmethod
     def from_source(cls, source_root: Path) -> "HIPRuntimeAuthority":
@@ -94,8 +103,21 @@ class HIPRuntimeAuthority:
             patches.append((relative.name, file_digest(docker / relative)))
         if not patches or len({name for name, _ in patches}) != len(patches):
             raise HIPRuntimeBindingError("Missing or duplicated canonical HIP repairs")
-        identity = ":".join([*(pins[key] for key in keys), *(digest for _, digest in patches)])
-        return cls("libamdhip64.so." + version.split(".")[0], identity, tuple(patches))
+        proof_declaration = re.search(r"^hip_proof_files=\(\n(.*?)^\)",
+            (docker / "install-hip-graph-runtime.sh").read_text(), re.M | re.S)
+        if not proof_declaration:
+            raise HIPRuntimeBindingError("Canonical installer omitted HIP proof contract")
+        proof_files = []
+        for line in proof_declaration[1].splitlines():
+            match = re.fullmatch(r'    "\$\{hip_script_dir\}/hip-preferred-queue/([^"/]+)"', line)
+            if not match:
+                raise HIPRuntimeBindingError("Unknown canonical HIP proof declaration")
+            proof_files.append((match[1], file_digest(docker / "hip-preferred-queue" / match[1])))
+        if [name for name, _ in proof_files] != ["proof.py", "selector-contract.cpp.in"]:
+            raise HIPRuntimeBindingError("Incomplete or reordered HIP proof contract")
+        proof_contract = ":".join(digest for _, digest in proof_files)
+        identity = ":".join([*(pins[key] for key in keys), *(digest for _, digest in patches), proof_contract])
+        return cls("libamdhip64.so." + version.split(".")[0], identity, tuple(patches), proof_contract)
 
 
 def parse_hip_runtime(trace: str, expected_soname: str) -> Path:
@@ -142,6 +164,11 @@ def require_installed_receipt(runtime: Path, authority: HIPRuntimeAuthority) -> 
         installed = prefix / "share/licenses/llaminar-hip" / name
         if not installed.is_file() or file_digest(installed) != digest:
             raise HIPRuntimeBindingError("Loaded HIP installed repair differs from current source: " + name)
+    try:
+        QUEUE_PROOF.load_verified(prefix / "share/llaminar/hip-preferred-queue-proof.json",
+                                  authority.identity, declared, authority.proof_contract)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise HIPRuntimeBindingError("Loaded HIP preferred-queue proof rejected: " + str(error)) from error
     if receipt.read_text().strip() != marker:
         raise HIPRuntimeBindingError("HIP installation receipt changed during authentication")
 
@@ -207,6 +234,14 @@ class HIPRuntimeBindingTests(unittest.TestCase):
             '    "${hip_script_dir}/patches/latest.patch"\n)\n')
         for name in ("first.patch", "latest.patch"):
             (source / "patches" / name).write_text("owned repair " + name)
+        with (source / "install-hip-graph-runtime.sh").open("a") as stream:
+            stream.write('hip_proof_files=(\n'
+                '    "${hip_script_dir}/hip-preferred-queue/proof.py"\n'
+                '    "${hip_script_dir}/hip-preferred-queue/selector-contract.cpp.in"\n)\n')
+        (source / "hip-preferred-queue").mkdir()
+        for name in ("proof.py", "selector-contract.cpp.in"):
+            shutil.copyfile(ROOT / "scripts/docker/hip-preferred-queue" / name,
+                            source / "hip-preferred-queue" / name)
         authority = HIPRuntimeAuthority.from_source(directory / "source")
         prefix = directory / "installed"
         (prefix / "lib").mkdir(parents=True)
@@ -217,7 +252,84 @@ class HIPRuntimeBindingTests(unittest.TestCase):
         for name, _ in authority.patches:
             shutil.copyfile(source / "patches" / name, prefix / "share/licenses/llaminar-hip" / name)
         (prefix / "share/llaminar/hip-graph-runtime.txt").write_text(authority.identity + ":" + file_digest(library) + "\n")
+        self.write_queue_proof(prefix, authority, library)
         return authority, library
+
+    def write_queue_proof(self, prefix: Path, authority: HIPRuntimeAuthority, library: Path) -> dict:
+        """Author clearly synthetic receipt bytes for device-free consumer controls only."""
+        names = ["shared preferred must not bypass eligible unshared queue"] + [
+            "finite synthetic consumer control " + str(i) for i in range(1, QUEUE_PROOF.CHECKS)]
+        document = {"schema": QUEUE_PROOF.SCHEMA, "source_identity": authority.identity,
+                    "library_sha256": file_digest(library), "contract_identity": authority.proof_contract,
+                    "original_source_sha256": "1" * 64, "candidate_source_sha256": "2" * 64,
+                    "header_sha256": "3" * 64}
+        for variant, failures in (("original", QUEUE_PROOF.ORIGINAL_FAILURES), ("candidate", 0)):
+            document[variant] = {"compile_exit": 0, "run_exit": int(failures != 0), "failures": failures,
+                "body_sha256": ("4" if variant == "original" else "5") * 64,
+                "cases": [{"ordinal": i + 1, "name": name, "passed": i >= failures}
+                          for i, name in enumerate(names)]}
+        (prefix / "share/llaminar/hip-preferred-queue-proof.json").write_text(json.dumps(document))
+        return document
+
+    def test_preferred_queue_proof_rejects_missing_foreign_or_false_controls(self):
+        """A current DSO cannot excuse absent, stale or weakened actual-body evidence."""
+        mutations = ("missing", "truncated", "schema", "source", "dso", "contract", "native_input",
+                     "same_original", "same_body", "missing_body", "compile", "original_exit", "candidate_exit", "old_green",
+                     "candidate_failed", "missing_case", "changed_matrix", "fractional_count")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as name:
+                root = Path(name)
+                authority, library = self.fixture(root)
+                proof = library.parent.parent / "share/llaminar/hip-preferred-queue-proof.json"
+                document = json.loads(proof.read_text())
+                if mutation == "missing": proof.unlink()
+                elif mutation == "truncated": proof.write_text('{"schema":')
+                else:
+                    if mutation == "schema": document["schema"] = True
+                    elif mutation == "source": document["source_identity"] += ":foreign"
+                    elif mutation == "dso": document["library_sha256"] = "f" * 64
+                    elif mutation == "contract": document["contract_identity"] = "stale"
+                    elif mutation == "native_input": del document["header_sha256"]
+                    elif mutation == "same_original": document["original_source_sha256"] = document["candidate_source_sha256"]
+                    elif mutation == "same_body": document["original"]["body_sha256"] = document["candidate"]["body_sha256"]
+                    elif mutation == "missing_body": del document["candidate"]["body_sha256"]
+                    elif mutation == "compile": document["candidate"]["compile_exit"] = 1
+                    elif mutation == "original_exit": document["original"]["run_exit"] = 0
+                    elif mutation == "candidate_exit": document["candidate"]["run_exit"] = 1
+                    elif mutation == "old_green": document["original"]["failures"] = 0
+                    elif mutation == "candidate_failed": document["candidate"]["cases"][0]["passed"] = False
+                    elif mutation == "missing_case": document["original"]["cases"].pop()
+                    elif mutation == "changed_matrix": document["candidate"]["cases"][0]["name"] = "different inputs"
+                    elif mutation == "fractional_count": document["candidate"]["failures"] = 0.0
+                    proof.write_text(json.dumps(document))
+                with patch.object(QUEUE_PROOF.subprocess, "run", side_effect=AssertionError("runner must not compile/load")):
+                    with self.assertRaisesRegex(HIPRuntimeBindingError, "preferred-queue proof rejected"):
+                        require_installed_receipt(library, authority)
+
+    def test_preferred_queue_reuse_and_staging_reject_stale_proof(self):
+        """Real installer fails before source build or export on a matching but stale proof."""
+        for mode in ("reuse", "stage"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as name:
+                root = Path(name)
+                authority, _ = self.staged_component(root)
+                prefix = root / "builder-sdk"
+                library = prefix / "lib" / ("libamdhip64.so." + authority.identity.split(":")[3])
+                before = file_digest(library)
+                proof = prefix / "share/llaminar/hip-preferred-queue-proof.json"
+                document = json.loads(proof.read_text())
+                document["candidate"]["run_exit"] = 1
+                proof.write_text(json.dumps(document))
+                destination = root / "rejected-export"
+                env = dict(os.environ, ROCM_PATH=str(prefix), HIP_RUNTIME_INSTALL_PREFIX=str(prefix))
+                env.pop("HIP_RUNTIME_STAGE_PREFIX", None)
+                if mode == "stage": env["HIP_RUNTIME_STAGE_PREFIX"] = str(destination)
+                result = subprocess.run(["bash", str(ROOT / "scripts/docker/install-hip-graph-runtime.sh")],
+                    env=env, text=True, capture_output=True, timeout=30)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("HIP preferred-queue proof", result.stderr)
+                self.assertNotIn("Building", result.stdout)
+                self.assertFalse(destination.exists())
+                self.assertEqual(file_digest(library), before)
 
     def test_source_receipt_accepts_local_symlink_and_sdk_component_copy(self):
         """Different deployment inodes with the same source-certified bytes remain valid."""
@@ -260,6 +372,13 @@ class HIPRuntimeBindingTests(unittest.TestCase):
             with self.assertRaisesRegex(HIPRuntimeBindingError, "stale source"):
                 require_installed_receipt(library, changed)
             (source / "patches/latest.patch").write_text("owned repair latest.patch")
+            for name in ("proof.py", "selector-contract.cpp.in"):
+                contract_file = source / "hip-preferred-queue" / name
+                original_contract = contract_file.read_bytes()
+                contract_file.write_bytes(original_contract + b"\n# changed contract\n")
+                with self.subTest(contract=name), self.assertRaisesRegex(HIPRuntimeBindingError, "stale source"):
+                    require_installed_receipt(library, HIPRuntimeAuthority.from_source(root / "source"))
+                contract_file.write_bytes(original_contract)
             pin_file = source / "rocm-release.env"
             original_pins = pin_file.read_text()
             for old, new in (("10.0.0\n", "10.1.0\n"), ("10.0.0-4", "10.0.0-5"),
@@ -339,6 +458,7 @@ class HIPRuntimeBindingTests(unittest.TestCase):
             shutil.copyfile(ROOT / "scripts/docker/patches" / name, licenses / name)
         (prefix / "share/llaminar/hip-graph-runtime.txt").write_text(
             authority.identity + ":" + file_digest(library) + "\n")
+        self.write_queue_proof(prefix, authority, library)
         component = root / "runtime-hip"
         env = dict(os.environ, ROCM_PATH=str(prefix), HIP_RUNTIME_INSTALL_PREFIX=str(prefix),
                    HIP_RUNTIME_STAGE_PREFIX=str(component))
@@ -489,12 +609,22 @@ def main() -> int:
     parser.add_argument("--source-root", type=Path, default=ROOT)
     parser.add_argument("--readelf", default="readelf")
     parser.add_argument("--wrong-runtime-fixture", type=Path)
+    parser.add_argument("--preferred-queue-contract", action="store_true",
+                        help="run only focused device-free queue-proof consumer controls when no binary is given")
     args = parser.parse_args()
+    if args.preferred_queue_contract:
+        suite = unittest.TestSuite([
+            HIPRuntimeBindingTests("test_preferred_queue_proof_rejects_missing_foreign_or_false_controls"),
+            HIPRuntimeBindingTests("test_preferred_queue_reuse_and_staging_reject_stale_proof")])
+        if not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful():
+            return 1
+        if not args.binary:
+            return 0
     if not args.binary:
         if args.wrong_runtime_fixture:
             parser.error("--wrong-runtime-fixture requires --binary")
-        result = unittest.TextTestRunner(verbosity=2).run(
-            unittest.defaultTestLoader.loadTestsFromTestCase(HIPRuntimeBindingTests))
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(HIPRuntimeBindingTests)
+        result = unittest.TextTestRunner(verbosity=2).run(suite)
         return 0 if result.wasSuccessful() else 1
     authority = HIPRuntimeAuthority.from_source(args.source_root.resolve(strict=True))
     for binary in args.binary:

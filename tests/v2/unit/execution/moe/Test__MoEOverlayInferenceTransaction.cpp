@@ -1261,6 +1261,162 @@ namespace llaminar2::test
         EXPECT_EQ(second_target->completeCount(), 1u);
     }
 
+    /** @test A finite parent spans actual command generations while the original publisher waits. */
+    TEST(Test__MoEOverlayInferenceTransaction, FinitePlacementScopeDescendsAcrossRequestGenerations)
+    {
+        // This is an original authority/transport lifecycle proof, not a native
+        // GPU or synthetic physical-bank admission. Existing metadata fixtures
+        // preserve their authored endpoint coordinates.
+        class PublicationTransport final : public IMoEOverlayResidencyTransport {
+        public:
+            class Wave final : public IMoEOverlayResidencyWave {
+            public:
+                explicit Wave(PublicationTransport &owner): owner_(owner) {}
+                MoEOverlayResidencyWaveProgress pollStage(std::string*) noexcept override {return MoEOverlayResidencyWaveProgress::Ready;}
+                bool beginPrepare(std::string*) noexcept override {return true;}
+                MoEOverlayResidencyWaveProgress pollPrepare(std::string*) noexcept override {return MoEOverlayResidencyWaveProgress::Ready;}
+                bool beginPublication(std::string*) noexcept override {++owner_.publications;return true;}
+                MoEOverlayResidencyWaveProgress pollPublication(std::string*) noexcept override {return MoEOverlayResidencyWaveProgress::Ready;}
+                void abortStaged() noexcept override {}
+                void retirePrevious() noexcept override {++owner_.retirements;}
+            private: PublicationTransport &owner_;
+            };
+            MoEOverlayResidencyStageStart beginStage(const MoEOverlayResidencyTransaction&) override {
+                return {.status=MoEOverlayResidencyStageStartStatus::Started,.wave=std::make_unique<Wave>(*this)};
+            }
+            int publications=0,retirements=0;
+        };
+        for(int replay=0;replay<20;++replay) {
+            auto plan=heterogeneousPlan();
+            plan.residency_policy=RoutedExpertResidencyPolicy::RoutedTierRebalanced;
+            plan.routed_tiers[0].max_experts_per_layer=2;
+            DecodeExpertHistogramConfig histogram_config;
+            histogram_config.num_layers=3;histogram_config.num_experts=4;
+            histogram_config.top_k=1;histogram_config.window_size=1;
+            histogram_config.sockets={DeviceId::cuda(0),DeviceId::rocm(0)};
+            histogram_config.ownership=MoELayeredExpertOwnership::uniform(3,2,{0,0,1,1});
+            DecodeExpertHistogram histogram(histogram_config);
+            const std::array<std::uint64_t,4> counts{1,1,100,90};
+            for(int layer=0;layer<3;++layer)histogram.mergeLayerCounts(layer,counts.data(),4,false);
+            auto authority=std::make_shared<MoEOverlayResidencyAuthority>(MoEOverlayResidencyAuthority::Config{
+                .initial_plan=plan,.model_metadata=heterogeneousMetadata(),
+                .maintenance_mode=MoERebalanceRuntimeMode::Dynamic,.histogram=&histogram});
+            auto publisher=std::make_shared<RecordingPublisher>(1);
+            MoEOverlayInferenceTransactionCoordinator coordinator({
+                .publishers={publisher},.graph_plan=coordinatorGraphPlan(1),
+                .continuation_participant_count=1,.ticket_authority_participant_index=0,
+                .participant_completion_boundaries={MoEOverlayInferenceCompletionBoundaryKind::HostSynchronous},
+                .max_transactions_per_command=2,.max_mtp_draft_depth=0,.residency_authority=authority});
+            auto old_reader=authority->tryAcquireTicketSnapshot();ASSERT_TRUE(old_reader);
+            PublicationTransport transport;
+            const auto execute=[&](std::uint64_t generation,std::uint64_t id) {
+                ASSERT_TRUE(coordinator.beginCommand(command(generation,id,1)));
+                ASSERT_TRUE(coordinator.beginGraphSequence(0));
+                EXPECT_EQ(authority->activeTicketCount(),3u); // original reader, parent, child
+                const auto binding=coordinator.beginParticipantGraph({
+                    .graph_role=MoEOverlayInferenceGraphRole::MainDecode,.placement_epoch=1,
+                    .request_count=1,.logical_rows_per_request=1,.physical_rows_per_request=1},0);
+                ASSERT_TRUE(binding.ok)<<binding.error;
+                ASSERT_TRUE(coordinator.armParticipantGraph(binding));
+                ASSERT_TRUE(coordinator.finishParticipantGraph(binding,true));
+                ASSERT_TRUE(coordinator.completeCommand(1));
+                EXPECT_EQ(authority->activeTicketCount(),2u);
+            };
+            const auto scope=coordinator.withMoEOverlayInferencePlacementScope([&] {
+                execute(9,3);
+                auto transaction=authority->proposeFromHistogram();
+                ASSERT_FALSE(transaction.empty());
+                ASSERT_EQ(authority->beginApply(transaction,transport).status,MoEOverlayResidencyApplyStatus::Started);
+                ASSERT_EQ(authority->advanceBackground().status,MoEOverlayResidencyApplyStatus::Preparing);
+                ASSERT_EQ(authority->advanceBackground().status,MoEOverlayResidencyApplyStatus::AwaitingGraphSequenceBoundary);
+                EXPECT_EQ(transport.publications,0);
+                // New request generation, original parent; ordinary current
+                // admission here would deadlock against its own reserved wave.
+                execute(10,4);
+                EXPECT_EQ(transport.publications,0);
+                EXPECT_THROW(coordinator.withMoEOverlayInferencePlacementScope([]{}),std::logic_error);
+            });
+            EXPECT_EQ(scope.placement_epoch,1u);EXPECT_EQ(scope.first_sequence_id,1u);EXPECT_EQ(scope.next_sequence_id,3u);
+            EXPECT_EQ(authority->activeTicketCount(),1u);
+            ASSERT_EQ(authority->advanceBackground().status,MoEOverlayResidencyApplyStatus::Publishing);
+            ASSERT_EQ(authority->advanceBackground().status,MoEOverlayResidencyApplyStatus::Published);
+            EXPECT_EQ(transport.publications,1);EXPECT_EQ(authority->pendingRetirementCount(),1u);
+            EXPECT_EQ(transport.retirements,0);
+            old_reader.reset();
+            EXPECT_EQ(authority->advanceBackground().status,MoEOverlayResidencyApplyStatus::Idle);
+            EXPECT_EQ(authority->pendingRetirementCount(),0u);EXPECT_EQ(transport.retirements,1);
+        }
+    }
+
+    /** @test No successful scope can be invented from an empty callback or failed native command. */
+    TEST(Test__MoEOverlayInferenceTransaction, FinitePlacementScopeRejectsEmptyAndPreservesTerminalException)
+    {
+        auto authority=std::make_shared<MoEOverlayResidencyAuthority>(MoEOverlayResidencyAuthority::Config{
+            .initial_plan=heterogeneousPlan(),.model_metadata=heterogeneousMetadata()});
+        auto publisher=std::make_shared<RecordingPublisher>(1);
+        MoEOverlayInferenceTransactionCoordinator coordinator({
+            .publishers={publisher},.graph_plan=coordinatorGraphPlan(1),
+            .continuation_participant_count=1,.ticket_authority_participant_index=0,
+            .participant_completion_boundaries={MoEOverlayInferenceCompletionBoundaryKind::HostSynchronous},
+            .max_transactions_per_command=2,.max_mtp_draft_depth=0,.residency_authority=authority});
+        EXPECT_THROW(coordinator.withMoEOverlayInferencePlacementScope([]{}),std::logic_error);
+        EXPECT_EQ(authority->activeTicketCount(),0u);
+        bool reached=false;
+        try {coordinator.withMoEOverlayInferencePlacementScope([&] {
+            reached=true;throw std::runtime_error("original request reset failure before command");
+        });FAIL()<<"original exception was swallowed";}
+        catch(const std::runtime_error &error) {EXPECT_TRUE(reached);EXPECT_STREQ(error.what(),"original request reset failure before command");}
+        EXPECT_EQ(authority->activeTicketCount(),0u);
+        bool terminal_throw_entered=false;
+        try {coordinator.withMoEOverlayInferencePlacementScope([&] {
+            ASSERT_TRUE(coordinator.beginCommand(command(9,2,1)));
+            ASSERT_TRUE(coordinator.beginGraphSequence(0));
+            const auto binding=coordinator.beginParticipantGraph({
+                .graph_role=MoEOverlayInferenceGraphRole::MainDecode,.placement_epoch=1,
+                .request_count=1,.logical_rows_per_request=1,.physical_rows_per_request=1},0);
+            ASSERT_TRUE(binding.ok)<<binding.error;
+            ASSERT_TRUE(coordinator.armParticipantGraph(binding));
+            ASSERT_TRUE(coordinator.finishParticipantGraph(binding,true));
+            ASSERT_TRUE(coordinator.completeCommand(1));
+            terminal_throw_entered=true;
+            throw std::runtime_error("original exception after complete request");
+        });FAIL()<<"terminal callback exception was swallowed";}
+        catch(const std::runtime_error &error) {
+            EXPECT_TRUE(terminal_throw_entered);
+            EXPECT_STREQ(error.what(),"original exception after complete request");
+        }
+        EXPECT_EQ(authority->activeTicketCount(),0u);
+        EXPECT_TRUE(coordinator.beginCommand(command(10,3,1)));
+        EXPECT_THROW(coordinator.withMoEOverlayInferencePlacementScope([]{}),std::logic_error);
+        EXPECT_TRUE(coordinator.abortCommand(1,1));
+    }
+
+    /** @test Missing original native receipts retain the parent until the fatal process boundary. */
+    TEST(Test__MoEOverlayInferenceTransaction, FinitePlacementScopeIncompleteChildIsFatalWithOriginalOwner)
+    {
+        EXPECT_EXIT({
+            auto authority=std::make_shared<MoEOverlayResidencyAuthority>(MoEOverlayResidencyAuthority::Config{
+                .initial_plan=heterogeneousPlan(),.model_metadata=heterogeneousMetadata()});
+            auto publisher=std::make_shared<RecordingPublisher>(1);
+            static MoEOverlayResidencyAuthority *fatal_authority=nullptr;
+            static RecordingPublisher *fatal_publisher=nullptr;
+            fatal_authority=authority.get();fatal_publisher=publisher.get();
+            std::set_terminate([] {
+                std::_Exit(fatal_authority->activeTicketCount()==1u && fatal_publisher->abortCount()==1u ? 91:92);
+            });
+            MoEOverlayInferenceTransactionCoordinator coordinator({
+                .publishers={publisher},.graph_plan=coordinatorGraphPlan(1),
+                .continuation_participant_count=1,.ticket_authority_participant_index=0,
+                .participant_completion_boundaries={MoEOverlayInferenceCompletionBoundaryKind::HostSynchronous},
+                .max_transactions_per_command=2,.max_mtp_draft_depth=0,.residency_authority=authority});
+            coordinator.withMoEOverlayInferencePlacementScope([&] {
+                if(!coordinator.beginCommand(command(9,3,1)) || !coordinator.beginGraphSequence(0))std::_Exit(93);
+                throw std::runtime_error("original missing native child receipt");
+            });
+            std::_Exit(94);
+        },::testing::ExitedWithCode(91),"unproven descendant retirement: original missing native child receipt");
+    }
+
     /**
      * @brief A numeric sequence epoch must own its host-RCU lifetime.
      *

@@ -31,6 +31,36 @@ inline const std::vector<ModelParityCase>& qwen4ExpCPUJointWorld2NumericalCases(
     return cases;
 }
 /**
+ * @return One unqualified DynamicOrdinal/MTP-Off sibling on the SAME original socket topology/history.
+ * @note This explicit diagnostic runs the actual orchestration/publication stack.
+ * Moving placement plus MTP still needs an epoch-matched exact oracle; Static
+ * fixed1/fixed3/dynamic-MTP cases are not that qualification.
+ */
+inline const std::vector<ModelParityCase>& qwen4ExpCPUJointWorld2DynamicNumericalCases()
+{
+    static const auto cases=[] {
+        auto definition=qwen4ExpProductionDefinition(Qwen4ExpParityTopology::ROCmCPU);
+        definition.topology=qwen4ExpCPUJointWorld2SourceAdmissionCases().front().topology;
+        definition.features.mtp=ModelParityAxisProfile::Disabled;
+        definition.features.dynamic_speedup_witness=ModelParityDynamicSpeedupWitness::Disabled;
+        definition.features.ngram_storage={{.storage=ImmutableRowStoragePreference::RAM}};
+        definition.model.maximum_mtp_draft_depth=0;
+        definition.model.shared_predictor=SharedPredictorGGUFSource{std::string(kPredictorModelPath)};
+        std::vector<ModelParityCase> result;
+        for(auto cell:expandModelParityDefinition(definition))
+            if(cell.expert_overlay==std::optional{ModelParityExpertOverlayPolicy{
+                .owner_order=RoutedExpertOwnerOrder::Ordinal,.movement=ModelParityExpertMovement::Dynamic}}) {
+                cell.inventory_role=ModelParityInventoryRole::NumericalDiagnostic;
+                result.push_back(std::move(cell));
+            }
+        if(result.size()!=1 || result.front().mtp!=ModelParityMTP::Off || result.front().retained_mtp_draft_capacity!=0)
+            throw std::logic_error("CPU joint Dynamic diagnostic lost its original RAM Off identity");
+        return result;
+    }();
+    return cases;
+}
+
+/**
  * @return Explicit fixed1/fixed3/dynamic native serial/grouped proof requests.
  * @note These retain the original world2 socket/source topology and canonical
  * exact proof. They add no reference-sidecar numerical acceptance or pass badge.

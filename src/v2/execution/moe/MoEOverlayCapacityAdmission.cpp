@@ -713,8 +713,8 @@ namespace llaminar2
 
             if(request.copy_policy==MoEOverlayTierCopyPolicy::TensorSharded){
                 if(domain.scope!=ExecutionDomainScope::NODE_LOCAL ||
-                   domain.world_ranks.size()!=domain.participants.size() || policy.usesPhysicalResidencyFabric())
-                    throw std::invalid_argument("CPU tensor-shard admission requires original node-local ranks; cohort migration execution is not implemented");
+                   domain.world_ranks.size()!=domain.participants.size())
+                    throw std::invalid_argument("CPU tensor-shard admission requires original node-local ranks");
                 std::vector<MoEExpertShardCohort::Participant> members;
                 for(std::size_t p=0;p<domain.participants.size();++p)
                     members.push_back({request.participants[p].participant_id,

@@ -4819,21 +4819,10 @@ namespace llaminar2
                 .cycle_size = cycle_size_by_migration[migration_index],
                 .direction = direction,
                 .axis = migration.axis,
-                .source_participant =
-                    migration.source.owner_participant,
-                .destination_participant =
-                    migration.destination.owner_participant,
+                .source = MoEOptimizationMovementEndpoint::whole(migration.source.owner_participant, migration.source.device, (migration.source.owner_world_rank_known) ? std::optional<int>{migration.source.owner_world_rank} : std::nullopt),
+                .destination = MoEOptimizationMovementEndpoint::whole(migration.destination.owner_participant, migration.destination.device, (migration.destination.owner_world_rank_known) ? std::optional<int>{migration.destination.owner_world_rank} : std::nullopt),
                 .source_priority = source_group->tier_priority,
                 .destination_priority = destination_group->tier_priority,
-                .source_device = migration.source.device,
-                .destination_device = migration.destination.device,
-                .source_world_rank = migration.source.owner_world_rank,
-                .destination_world_rank =
-                    migration.destination.owner_world_rank,
-                .source_world_rank_known =
-                    migration.source.owner_world_rank_known,
-                .destination_world_rank_known =
-                    migration.destination.owner_world_rank_known,
                 .estimated_weight_bytes =
                     static_cast<std::uint64_t>(
                         migration.estimated_weight_bytes),

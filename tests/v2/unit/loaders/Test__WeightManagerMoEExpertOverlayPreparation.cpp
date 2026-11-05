@@ -16,6 +16,7 @@
 #include "execution/moe/MoEOverlayCpuPreparationGate.h"
 #include "execution/moe/MoERoutedExpertPlacementPlanner.h"
 #include "loaders/WeightManager.h"
+#include "../../fixtures/loaders/ExpertGemmRegistryResidencyTestAccess.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "kernels/PackedWeightsSerialization.h"
 #include "loaders/PreparedWeightStore.h"
@@ -913,8 +914,10 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation,
             .down = down0,
         },
     };
+    // Deliberately permute this device-free map through the private validator;
+    // only the physical fabric may supply a production reusable-context seal.
     std::string replacement_error;
-    ASSERT_TRUE(registry.replaceParticipantResidency(
+    ASSERT_TRUE(ExpertGemmRegistryResidencyTestAccess::replace(registry,
         std::span<const ExpertGemmRegistry::ParticipantLayerScope>(&scope, 1u),
         rebound,
         &replacement_error))
@@ -1055,7 +1058,7 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation, RejectsTornBankBeforeLoadin
     // the empty first scope must really read/allocate, rather than hit a cache.
     const ExpertGemmRegistry::ParticipantLayerScope empty_scope{"cpu_cold",DeviceId::cpu(),0,0,0};
     std::string error;
-    ASSERT_TRUE(registry.replaceParticipantResidency({&empty_scope,1},{},&error))<<error;
+    ASSERT_TRUE(ExpertGemmRegistryResidencyTestAccess::replace(registry,{&empty_scope,1},{},&error))<<error;
     ASSERT_TRUE(registry.removeEngineForDomain("cpu_cold",DeviceId::cpu(),1,0,Role::GATE));
     manager.preparedWeightStore()->clear();
     const auto original_reads=loader->nativeSourceReadCallCount();const auto original_live=liveRoutedBytes(*memory);

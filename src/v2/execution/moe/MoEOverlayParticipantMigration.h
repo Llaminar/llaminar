@@ -258,6 +258,7 @@ namespace llaminar2
         int source_participant=-1; ///< Canonical original source member.
         std::unique_ptr<IMoEOverlayTierTransferOperation> operation;
         bool requires_local_measurement = false;
+        int observer_world_rank = -1; ///< Actual original fabric PMA owner; absent for protocol-only work.
     };
 
     /** @brief One actual local destination's complete role arrival authority. */

@@ -561,6 +561,48 @@ OrchestrationConfig distributedCPUJointConfig(int members) {
         config.domain_definitions.push_back(DomainDefinition::fromExecutionDomainDefinition(domain.toExecutionDomainDefinition()));
     config.moe_routed_expert_plan=std::move(plan);return config;
 }
+/**
+ * @test Dynamic observation retains the same complete target/rank request contract.
+ * @note Metadata proves observer admission only; actual movement/publication,
+ * incoming-fragment use and retirement remain mandatory production evidence.
+ */
+TEST(ModelKLDQFNContract, DistributedCPUJointDynamicUsesOriginalHostAuthority)
+{
+    for (int members = 2; members <= 8; ++members)
+    {
+        for (const auto device : {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::rocm(0)})
+        {
+            auto config = distributedCPUJointConfig(members);
+            config.moe_rebalance.mode = MoERebalanceRuntimeMode::Dynamic;
+            auto &plan = *config.moe_routed_expert_plan;
+            plan.residency_policy = RoutedExpertResidencyPolicy::RoutedTierRebalanced;
+            plan.domains.front().participants = {device};
+            plan.routed_tiers = {{.name="gpu", .domain="gpu", .priority=0, .max_experts_per_layer=64},
+                                 {.name="cpu", .domain="cpu", .priority=10, .max_experts_per_layer=448}};
+            config.domain_definitions.clear();
+            for (const auto &domain : plan.domains)
+                config.domain_definitions.push_back(DomainDefinition::fromExecutionDomainDefinition(domain.toExecutionDomainDefinition()));
+            ASSERT_EQ(resolveMoEOverlayAuthorityExecutionKind(plan), MoEOverlayAuthorityExecutionKind::HostResident);
+            EXPECT_TRUE(qfnDistributedCPUJointIntent(config));
+            EXPECT_NO_THROW((void)QFNObserverRequest::parse(descriptor(config), config));
+            const auto original = serializeOrchestrationConfig(config);
+            EXPECT_NO_THROW((void)QFNObserverRequest::parse(descriptor(config), config));
+            EXPECT_EQ(serializeOrchestrationConfig(config), original);
+            plan.authority_execution = MoEOverlayAuthorityExecutionKind::HostResident;
+            EXPECT_TRUE(qfnDistributedCPUJointIntent(config));
+            plan.authority_execution = MoEOverlayAuthorityExecutionKind::DeviceResident;
+            EXPECT_THROW(qfnDistributedCPUJointIntent(config), std::invalid_argument);
+            plan.authority_execution = MoEOverlayAuthorityExecutionKind::Unresolved;
+            plan.residency_policy = RoutedExpertResidencyPolicy::StaticById;
+            EXPECT_THROW(qfnDistributedCPUJointIntent(config), std::invalid_argument);
+            plan.residency_policy = RoutedExpertResidencyPolicy::RoutedTierRebalanced;
+            config.moe_rebalance.mode = MoERebalanceRuntimeMode::Off;
+            EXPECT_THROW(qfnDistributedCPUJointIntent(config), std::invalid_argument);
+            config.moe_rebalance.mode = MoERebalanceRuntimeMode::Observe;
+            EXPECT_THROW(qfnDistributedCPUJointIntent(config), std::invalid_argument);
+        }
+    }
+}
 /** @test Exact distributed intent keeps the same full-history request contract for two through eight members. */
 TEST(ModelKLDQFNContract, DistributedCPUJointUsesOriginalRanksAndFrozenHistory) {
     for(int members=2;members<=8;++members){auto config=distributedCPUJointConfig(members);
@@ -569,7 +611,7 @@ TEST(ModelKLDQFNContract, DistributedCPUJointUsesOriginalRanksAndFrozenHistory) 
     }
     EXPECT_FALSE(qfnDistributedCPUJointIntent(cpuConfig()));
 }
-/** @test Cross-rank exceptions cannot admit whole distribution, a foreign root, aliases or migration. */
+/** @test Foreign geometry and unmatched maintenance/residency intent remain rejected. */
 TEST(ModelKLDQFNContract, DistributedCPUJointRejectsForeignPartialAndMigratingIntent) {
     for(int mutation=0;mutation<10;++mutation){auto config=distributedCPUJointConfig(2);auto& plan=*config.moe_routed_expert_plan;
         switch(mutation){
@@ -667,6 +709,20 @@ TEST(ModelKLDQFNContract, DistributedCPUJointRealCLITraversesCompleteRequestCont
         return result;
     };
     EXPECT_NO_THROW((void)QFNObserverRequest::parse(request(original),original));
+    // Same literal source/transport/quotas; only the authored durable policy changes.
+    auto dynamic_arguments = arguments;
+    for (auto &argument : dynamic_arguments)
+    {
+        if (argument == "static-by-id") argument = "rebalanced";
+        else if (argument == "off") argument = "dynamic";
+    }
+    std::vector<char *> dynamic_argv;
+    for (auto &argument : dynamic_arguments) dynamic_argv.push_back(argument.data());
+    const auto dynamic = parser.parseArgs(static_cast<int>(dynamic_argv.size()), dynamic_argv.data());
+    EXPECT_EQ(dynamic.moe_rebalance.mode, MoERebalanceRuntimeMode::Dynamic);
+    ASSERT_EQ(dynamic.moe_routed_expert_plan->residency_policy, RoutedExpertResidencyPolicy::RoutedTierRebalanced);
+    EXPECT_TRUE(qfnDistributedCPUJointIntent(dynamic));
+    EXPECT_NO_THROW((void)QFNObserverRequest::parse(request(dynamic), dynamic));
     for(int mutation=0;mutation<8;++mutation) {
         auto candidate=original;
         switch(mutation) {
@@ -855,6 +911,43 @@ TEST(ModelKLDQFNContract, CPUJointFollowerRetainsOriginalGlobalDomain) {
             EXPECT_THROW(qfnCPUJointFollowerSurface(config,foreign,foreign,prepared),std::invalid_argument);
         }
         EXPECT_THROW(qfnCPUJointFollowerSurface(config,plans[0],plans[0],prepared),std::invalid_argument);
+    }
+}
+/** @test Reset selection uses the same typed CPU-joint host authority and preserves GPU Dynamic. */
+TEST(ModelKLDQFNContract, ResetComparisonPolicyScopesOnlyOriginalDynamicCPUJoint)
+{
+    EXPECT_EQ(qfnResetComparisonPolicy(cpuConfig()),QFNResetComparisonPolicy::OriginalEarlyReplay);
+    auto gpu=cpuConfig();gpu.device_for_this_rank.reset();gpu.mpi_procs=1;
+    gpu.moe_rebalance.mode=MoERebalanceRuntimeMode::Dynamic;
+    gpu.moe_routed_expert_plan=std::make_shared<MoERoutedExpertPlacementPlan>();
+    auto &gpu_plan=*gpu.moe_routed_expert_plan;
+    gpu_plan.enabled=true;gpu_plan.topology=RoutedExpertPlacementTopology::TieredOverlay;
+    gpu_plan.continuation_domain=gpu_plan.base_model_domain=gpu_plan.shared_expert_domain="gpu";
+    gpu_plan.authority_execution=MoEOverlayAuthorityExecutionKind::DeviceResident;
+    gpu_plan.residency_policy=RoutedExpertResidencyPolicy::RoutedTierRebalanced;
+    RoutedExpertDomain domain;domain.name="gpu";domain.scope=ExecutionDomainScope::RANK_LOCAL;
+    domain.backend=CollectiveBackendType::RCCL;domain.owner_rank=0;
+    domain.routed_compute_policy=RoutedExpertComputePolicy::GateUpOwnedDownColumns;
+    for(int member=0;member<4;++member)domain.participants.push_back(GlobalDeviceAddress::rocm(member));
+    gpu_plan.domains={domain};gpu_plan.routed_tiers={{.name="gpu",.domain="gpu",.priority=0,.max_experts_per_layer=512}};
+    const auto before=serializeOrchestrationConfig(gpu);
+    EXPECT_EQ(qfnResetComparisonPolicy(gpu),QFNResetComparisonPolicy::OriginalEarlyReplay);
+    EXPECT_EQ(serializeOrchestrationConfig(gpu),before);
+    for (int members=2;members<=8;++members)
+    {
+        auto joint=distributedCPUJointConfig(members);
+        auto &plan=*joint.moe_routed_expert_plan;
+        plan.routed_tiers={{.name="gpu",.domain="gpu",.priority=0,.max_experts_per_layer=64},
+                           {.name="cpu",.domain="cpu",.priority=10,.max_experts_per_layer=448}};
+        EXPECT_EQ(qfnResetComparisonPolicy(joint),QFNResetComparisonPolicy::OriginalEarlyReplay);
+        joint.moe_rebalance.mode=MoERebalanceRuntimeMode::Dynamic;
+        plan.residency_policy=RoutedExpertResidencyPolicy::RoutedTierRebalanced;
+        EXPECT_EQ(qfnResetComparisonPolicy(joint),QFNResetComparisonPolicy::SamePlacementLatePair);
+        plan.authority_execution=MoEOverlayAuthorityExecutionKind::DeviceResident;
+        EXPECT_THROW(qfnResetComparisonPolicy(joint),std::invalid_argument);
+        plan.authority_execution=MoEOverlayAuthorityExecutionKind::HostResident;
+        plan.domains.back().world_ranks.front()=members;
+        EXPECT_THROW(qfnResetComparisonPolicy(joint),std::invalid_argument);
     }
 }
 } // namespace llaminar2::accuracy

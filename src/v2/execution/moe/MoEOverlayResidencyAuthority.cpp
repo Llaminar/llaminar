@@ -25,6 +25,7 @@
 
 #include "MoEOverlayResidencyAuthority.h"
 #include "MoEOverlayPreparedTargetService.h"
+#include "MoEOptimizationMovementTopology.h"
 #include "MoEExpertOverlayPreparationPlan.h"
 
 #include "MoEOverlayEconomyCalibrationPlanner.h"
@@ -162,6 +163,35 @@ namespace llaminar2
         if (!original)
             throw std::logic_error("Joint snapshot lost its original source map");
         return *original;
+    }
+
+    bool MoEOverlayTierMigration::crossesWorldRank() const noexcept
+    {
+        if (!source.shard_cohort && !destination.shard_cohort)
+            return source.owner_world_rank_known && destination.owner_world_rank_known &&
+                source.owner_world_rank != destination.owner_world_rank;
+        if (source.shard_cohort && destination.shard_cohort)
+        {
+            for (std::size_t from = 0; from < source.shard_cohort->participants().size(); ++from)
+                for (std::size_t to = 0; to < destination.shard_cohort->participants().size(); ++to)
+                {
+                    // All three CPU fragment projections use the SAME F
+                    // interval (Gate/Up N and Down K). Empty intersections do
+                    // not create remote movement, even if ranks differ.
+                    const auto a = source.shard_cohort->ownership(from).projection(WeightRole::MoEExpertUp);
+                    const auto b = destination.shard_cohort->ownership(to).projection(WeightRole::MoEExpertUp);
+                    if (std::max(a.first_row, b.first_row) <
+                            std::min(a.first_row + a.rows, b.first_row + b.rows) &&
+                        source.shard_cohort->participants()[from].world_rank !=
+                            destination.shard_cohort->participants()[to].world_rank)
+                        return true;
+                }
+            return false;
+        }
+        const auto &cohort = source.shard_cohort ? source.shard_cohort : destination.shard_cohort;
+        const auto &whole = source.shard_cohort ? destination : source;
+        return whole.owner_world_rank_known && std::any_of(cohort->participants().begin(),
+            cohort->participants().end(), [&](const auto &member) { return member.world_rank != whole.owner_world_rank; });
     }
 
     bool MoEOverlayResidencySnapshot::valid() const noexcept
@@ -773,14 +803,6 @@ namespace llaminar2
             return owner.shard_cohort?MoEOverlayRouteTarget::cpuCohort(owner.tier_idx):
                 MoEOverlayRouteTarget::whole(owner.owner_participant);
         }
-        /** @param config Original immutable setup. @return Metadata-only prepared pricing, never runtime permission. */
-        bool preparedOffPricing(const MoEOverlayResidencyAuthority::Config& config) {
-            return jointCPUPlan(config.initial_plan) && config.maintenance_mode==MoERebalanceRuntimeMode::Off &&
-                !config.histogram && !config.participant_rebalance_policy.enabled &&
-                config.phase_service_profile && config.phase_service_profile->prepared_plan &&
-                config.migration_cost_profile && config.migration_economy_policy;
-        }
-
         /**
          * @brief One proposal's borrowed observations and reusable service scratch.
          *
@@ -2168,7 +2190,7 @@ namespace llaminar2
         }
         if (config.migration_economy_policy)
         {
-            if (config.maintenance_mode != MoERebalanceRuntimeMode::Dynamic && !preparedOffPricing(config))
+            if (config.maintenance_mode != MoERebalanceRuntimeMode::Dynamic)
             {
                 throw std::invalid_argument(
                     "ExpertOverlay migration economics require Dynamic maintenance");
@@ -2515,12 +2537,22 @@ namespace llaminar2
             throw std::invalid_argument(
                 "MoE overlay residency authority requires an enabled tiered overlay");
         }
-        if(jointCPUPlan(config_.initial_plan) &&
-           (config_.maintenance_mode!=MoERebalanceRuntimeMode::Off || config_.histogram ||
-            config_.participant_rebalance_policy.enabled || config_.phase_service_profile ||
-            config_.migration_cost_profile || config_.migration_economy_policy || config_.economy_layer_catalog) &&
-           !preparedOffPricing(config_))
-            throw std::invalid_argument("CPU joint fragments support only Static residency; Observe/Dynamic/migration is not implemented");
+        if (jointCPUPlan(config_.initial_plan))
+        {
+            if (config_.maintenance_mode == MoERebalanceRuntimeMode::Off &&
+                (config_.histogram || config_.participant_rebalance_policy.enabled ||
+                 config_.phase_service_profile || config_.migration_cost_profile ||
+                 config_.migration_economy_policy || config_.economy_layer_catalog))
+                throw std::invalid_argument("Static CPU joint placement cannot own maintenance or economic state");
+            if (config_.maintenance_mode == MoERebalanceRuntimeMode::Dynamic &&
+                (config_.initial_plan.authority_execution != MoEOverlayAuthorityExecutionKind::HostResident ||
+                 availableMoEOptimizationMovementAxes(config_.initial_plan) != MoEOptimizationMovementAxes::TierResidency ||
+                 config_.participant_rebalance_policy.enabled ||
+                 std::none_of(config_.initial_plan.domains.begin(), config_.initial_plan.domains.end(),
+                     [](const auto &domain) { return std::any_of(domain.participants.begin(), domain.participants.end(),
+                         [](const auto &address) { return address.isGPU(); }); })))
+                throw std::invalid_argument("Dynamic CPU cohorts require the declared mixed GPU/CPU host authority and complete tier-residency targets; scalar participant rearrangement is unsupported");
+        }
         if (observesHistogram() && !config_.histogram)
         {
             throw std::invalid_argument(
@@ -2560,10 +2592,10 @@ namespace llaminar2
         }
         if (config_.migration_economy_policy)
         {
-            if (!migrationEnabled() && !preparedOffPricing(config_))
+            if (!migrationEnabled())
             {
                 throw std::invalid_argument(
-                    "ExpertOverlay migration economics require Dynamic maintenance or source-bound Off prepared pricing");
+                    "ExpertOverlay migration economics require Dynamic maintenance");
             }
             if (!config_.migration_economy_policy->valid())
             {
@@ -2579,10 +2611,10 @@ namespace llaminar2
         }
         if (config_.economy_layer_catalog)
         {
-            if (!migrationEnabled() && !preparedOffPricing(config_))
+            if (!migrationEnabled())
             {
                 throw std::invalid_argument(
-                    "ExpertOverlay economy layer catalog requires Dynamic maintenance or source-bound Off prepared pricing");
+                    "ExpertOverlay economy layer catalog requires Dynamic maintenance");
             }
             if (config_.economy_layer_catalog->firstModelLayer() != config_.model_metadata.first_model_layer ||
                 config_.economy_layer_catalog->layerCount() !=
@@ -2601,7 +2633,7 @@ namespace llaminar2
          * ExplicitMasks, or adversarial initial layout to improve over time
          * without lying about how the first physical banks were apportioned.
          */
-        if (migrationEnabled() || preparedOffPricing(config_))
+        if (migrationEnabled())
         {
             planning_template_.residency_policy =
                 RoutedExpertResidencyPolicy::RoutedTierRebalanced;
@@ -2667,6 +2699,32 @@ namespace llaminar2
             TicketLeasePurpose::InferenceGraphSequence);
     }
 
+    MoEOverlayResidencyAuthority::TicketLease
+    MoEOverlayResidencyAuthority::borrowGraphSequenceSnapshot(const TicketLease& parent)
+    {
+        if (parent.authority_ != this ||
+            parent.purpose_ != TicketLeasePurpose::InferenceGraphSequence ||
+            !parent.epoch_state_ || !parent.snapshot_)
+            throw std::invalid_argument("Graph-sequence descendant requires its live original sequence parent");
+        const auto state = parent.epoch_state_;
+        if (state->snapshot != parent.snapshot_ ||
+            published_epoch_.load(std::memory_order_acquire) != state ||
+            state->active_graph_sequences.load(std::memory_order_acquire) == 0)
+            throw std::logic_error("Graph-sequence parent lost its original published epoch");
+
+        // The live parent already prevents publication. Unlike a fresh reader,
+        // this descendant must not wait on the gate its own parent is draining.
+        // The caller serializes parent destruction, so its nonzero ownership
+        // spans all increments and closes the publisher's zero-reader race.
+        state->active_tickets.fetch_add(1, std::memory_order_acq_rel);
+        state->active_graph_sequences.fetch_add(1, std::memory_order_acq_rel);
+        active_ticket_count_.fetch_add(1, std::memory_order_acq_rel);
+        TicketLease child(this, state, TicketLeasePurpose::InferenceGraphSequence);
+        PerfStatsCollector::addCounter("moe_overlay_residency", "graph_sequence_epoch_leases",
+            1.0, "inference", config_.perf_device,
+            {{"action", "acquire"}, {"epoch", std::to_string(child.epoch())}});
+        return child;
+    }
     std::optional<MoEOverlayResidencyAuthority::TicketLease>
     MoEOverlayResidencyAuthority::tryAcquireCurrentSnapshot(
         TicketLeasePurpose purpose)
@@ -2848,7 +2906,7 @@ namespace llaminar2
         };
 
         if(config_.projection_preparation && config_.projection_preparation->cpuJointOwnerMap())
-            return reject("Current-batch LLEP cannot reinterpret Static CPU joint fragment ownership");
+            return reject("Current-batch LLEP cannot reinterpret complete CPU cohort fragment ownership");
         if (layer_idx < 0 || domain_name.empty() ||
             domain_participant_count <= 1)
         {
@@ -2964,8 +3022,8 @@ namespace llaminar2
         requireHostDynamicPublicationAuthority(
             const char *operation) const
     {
-        if(config_.projection_preparation && config_.projection_preparation->cpuJointOwnerMap())
-            throw std::logic_error(std::string(operation)+": CPU joint fragment migration is not implemented");
+        if (jointCPUPlan(config_.initial_plan) && config_.maintenance_mode == MoERebalanceRuntimeMode::Off)
+            throw std::logic_error(std::string(operation) + ": Static CPU cohorts have no mutable publication authority");
         if (!migrationEnabled() ||
             config_.initial_plan.authority_execution !=
                 MoEOverlayAuthorityExecutionKind::
@@ -3470,10 +3528,9 @@ namespace llaminar2
             MoEOverlayResidencyTransaction transaction;
             transaction.expected_epoch = previous->epoch;
             transaction.previous = previous;
-            auto unchanged =
-                std::make_shared<MoEOverlayResidencySnapshot>(*previous);
-            unchanged->epoch = previous->epoch + 1;
-            transaction.candidate = std::move(unchanged);
+            // Reuse the authority's checked unchanged-successor constructor;
+            // a public epoch scalar cannot advance the private joint arm.
+            transaction.candidate = buildCalibrationShadowSnapshot(previous);
             return transaction;
         }
         if (hasEconomyCertification() && !optimizationDemandActive())
@@ -7331,8 +7388,11 @@ namespace llaminar2
         }
 
         /* Ownership changes only after the complete inactive bank is visible. */
-        config_.histogram->updateOwnership(
-            transaction.candidate->layered_ownership);
+        if (transaction.candidate->jointOwnerMap())
+            config_.histogram->updatePlacementOwnership(std::shared_ptr<const MoEExpertOwnerMap>(
+                transaction.candidate, &transaction.candidate->placementOwnerMap()));
+        else
+            config_.histogram->updateOwnership(transaction.candidate->layered_ownership);
         recordCommitted(transaction);
 
         auto retirement = std::make_unique<PendingRetirement>();
@@ -8384,22 +8444,10 @@ namespace llaminar2
                         cycle_size_by_migration[migration_index],
                     .direction = typed_direction,
                     .axis = migration.axis,
-                    .source_participant =
-                        migration.source.owner_participant,
-                    .destination_participant =
-                        migration.destination.owner_participant,
+                    .source = MoEOptimizationMovementEndpoint::fromOwner(migration.source),
+                    .destination = MoEOptimizationMovementEndpoint::fromOwner(migration.destination),
                     .source_priority = source_priority,
                     .destination_priority = destination_priority,
-                    .source_device = migration.source.device,
-                    .destination_device = migration.destination.device,
-                    .source_world_rank =
-                        migration.source.owner_world_rank,
-                    .destination_world_rank =
-                        migration.destination.owner_world_rank,
-                    .source_world_rank_known =
-                        migration.source.owner_world_rank_known,
-                    .destination_world_rank_known =
-                        migration.destination.owner_world_rank_known,
                     .estimated_weight_bytes =
                         static_cast<std::uint64_t>(
                             migration.estimated_weight_bytes),
@@ -8426,15 +8474,15 @@ namespace llaminar2
                 << " movement_axis=" << movementAxisName(migration.axis)
                 << " source_priority=" << source_priority
                 << " destination_priority=" << destination_priority
-                << " source_participant="
-                << migration.source.owner_participant
+                << " source_target="
+                << economyExecutionTarget(migration.source).word()
                 << " source_rank="
                 << (migration.source.owner_world_rank_known
                         ? std::to_string(
                               migration.source.owner_world_rank)
                         : "unknown")
-                << " destination_participant="
-                << migration.destination.owner_participant
+                << " destination_target="
+                << economyExecutionTarget(migration.destination).word()
                 << " destination_rank="
                 << (migration.destination.owner_world_rank_known
                         ? std::to_string(
@@ -8473,10 +8521,10 @@ namespace llaminar2
                      std::to_string(destination_priority)},
                     {"source_domain", migration.source.domain_name},
                     {"destination_domain", migration.destination.domain_name},
-                    {"source_participant", std::to_string(
-                         migration.source.owner_participant)},
-                    {"destination_participant", std::to_string(
-                         migration.destination.owner_participant)},
+                    {migration.source.shard_cohort ? "source_target" : "source_participant",
+                     std::to_string(economyExecutionTarget(migration.source).word())},
+                    {migration.destination.shard_cohort ? "destination_target" : "destination_participant",
+                     std::to_string(economyExecutionTarget(migration.destination).word())},
                     {"source_world_rank",
                      migration.source.owner_world_rank_known
                          ? std::to_string(
@@ -8489,8 +8537,8 @@ namespace llaminar2
                          : "unknown"},
                     {"crosses_world_rank",
                      migration.crossesWorldRank() ? "true" : "false"},
-                    {"source_device", migration.source.device.toString()},
-                    {"destination_device", migration.destination.device.toString()},
+                    {"source_device", migration.source.shard_cohort ? "cpu_cohort" : migration.source.device.toString()},
+                    {"destination_device", migration.destination.shard_cohort ? "cpu_cohort" : migration.destination.device.toString()},
                     {"estimated_weight_bytes",
                      std::to_string(migration.estimated_weight_bytes)},
                     {"activation_count", std::to_string(migration.activation_count)},

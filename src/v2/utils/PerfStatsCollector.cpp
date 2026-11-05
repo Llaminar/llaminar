@@ -858,17 +858,14 @@ namespace llaminar2
         ++s.version;
     }
 
-    void PerfStatsCollector::addCounterWithSequence(
-        std::string domain, std::string name, double value,
-        std::initializer_list<uint64_t> words,
-        std::string phase, std::string device, Tags tags)
+    /** @brief Shared collector mutation for both cold-bound and ordinary sequence counters.
+     * @param key Original immutable counter dimensions, prepared by the existing caller API.
+     * @param value Completed observation increment.
+     * @param words Nonempty fixed lifecycle schema, already validated before locking.
+     * @throws std::logic_error For incompatible prior sequence dimensions, before mutation.
+     */
+    static void addCounterSequence(const PerfStatKey& key,double value,std::initializer_list<uint64_t> words)
     {
-        if (!isDomainEnabled(domain))
-            return;
-        if (words.size() == 0u)
-            throw std::invalid_argument("PerfStats counter sequence requires lifecycle words");
-        PerfStatKey key{PerfStatRecord::Kind::Counter, std::move(domain),
-            std::move(name), std::move(phase), std::move(device), std::move(tags)};
         auto &s = state();
         std::lock_guard<std::mutex> lock(s.mutex);
         auto &record = s.records[key];
@@ -884,6 +881,25 @@ namespace llaminar2
         ++record.count;
         record.value += value;
         ++s.version;
+    }
+
+    void PerfStatsCollector::addCounterWithSequence(
+        std::string domain,std::string name,double value,std::initializer_list<uint64_t> words,
+        std::string phase,std::string device,Tags tags)
+    {
+        if(!isDomainEnabled(domain))return;
+        if(words.size()==0u)throw std::invalid_argument("PerfStats counter sequence requires lifecycle words");
+        const PerfStatKey key{PerfStatRecord::Kind::Counter,std::move(domain),std::move(name),
+            std::move(phase),std::move(device),std::move(tags)};
+        addCounterSequence(key,value,words);
+    }
+    void PerfStatsCollector::addCounterWithSequence(const CounterIdentity& identity,double value,
+        std::initializer_list<uint64_t> words)
+    {
+        if(!identity.impl_)throw std::invalid_argument("Counter identity has been moved from");
+        if(!isDomainEnabled(identity.impl_->key.domain))return;
+        if(words.size()==0u)throw std::invalid_argument("PerfStats counter sequence requires lifecycle words");
+        addCounterSequence(identity.impl_->key,value,words);
     }
 
     void PerfStatsCollector::recordTimingNs(

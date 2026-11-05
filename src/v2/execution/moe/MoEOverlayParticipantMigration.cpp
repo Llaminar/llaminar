@@ -778,9 +778,9 @@ namespace llaminar2
     MoEOverlayPreparedCPUFragmentPayload::MoEOverlayPreparedCPUFragmentPayload(
         ModelContextId model, std::shared_ptr<const MoEExpertOverlayPreparationPlan> preparation,
         std::shared_ptr<const MoEExpertShardCohort> cohort, std::size_t member, int expert,
-        std::array<std::shared_ptr<ITensorGemm>, 3> engines)
+        std::array<std::shared_ptr<ITensorGemm>, 3> engines,std::uint64_t arrival_epoch)
         : model_(model), preparation_(std::move(preparation)), cohort_(std::move(cohort)),
-          member_(member), expert_(expert), engines_(std::move(engines))
+          member_(member), expert_(expert), arrival_epoch_(arrival_epoch), engines_(std::move(engines))
     {
         if (!model_.value || !preparation_ || !cohort_ ||
             member_ >= cohort_->participants().size() || expert_ < 0 ||
@@ -794,6 +794,23 @@ namespace llaminar2
                               engines_[role], &error))
                 throw std::invalid_argument(error);
         }
+        if(arrival_epoch_){
+            const auto& member=cohort_->participants()[member_];
+            execution_evidence_.emplace(PerfStatsCollector::bindCounter("moe_overlay_residency",
+                "completed_cpu_fragment_execution","inference",member.address.toLocalDeviceId().toString(),
+                {{"layer",std::to_string(cohort_->source().layer_idx)}, {"expert",std::to_string(expert_)},
+                 {"participant",std::to_string(member.participant_id)}, {"world_rank",std::to_string(member.world_rank)},
+                 {"member",std::to_string(member_)},{"schema_version","1"}}));
+        }
+    }
+
+    void MoEOverlayPreparedCPUFragmentPayload::recordCompletedExecution(std::uint64_t invocation_epoch,std::uint64_t routes)const
+    {
+        if(!arrival_epoch_ || !routes || !PerfStatsCollector::isDomainEnabled("moe_overlay_residency"))return;
+        if(!valid() || !execution_evidence_ || invocation_epoch<arrival_epoch_)
+            throw std::logic_error("CPU fragment execution must use its original completed arrival in an exact successor bank");
+        PerfStatsCollector::addCounterWithSequence(*execution_evidence_,static_cast<double>(routes),
+            {arrival_epoch_,invocation_epoch});
     }
 
     bool MoEOverlayPreparedCPUFragmentPayload::valid() const noexcept
@@ -809,7 +826,7 @@ namespace llaminar2
         if (empty() || other.empty())
             return empty() && other.empty();
         return model_.value == other.model_.value && member_ == other.member_ &&
-               expert_ == other.expert_ && same(cohort_, other.cohort_) &&
+               expert_ == other.expert_ && arrival_epoch_==other.arrival_epoch_ && same(cohort_, other.cohort_) &&
                same(preparation_, other.preparation_) && same(engines_[0], other.engines_[0]) &&
                same(engines_[1], other.engines_[1]) && same(engines_[2], other.engines_[2]);
     }
@@ -854,7 +871,7 @@ namespace llaminar2
         {
             payload = MoEOverlayPreparedCPUFragmentPayload(
                 destination.model, destination.preparation, destination.cohort, destination.member,
-                destination.expert, engines_);
+                destination.expert, engines_,destination.epoch);
             return true;
         }
         catch (const std::exception &exception)
@@ -1348,7 +1365,8 @@ namespace llaminar2
                         identity.destination_participant != operation.destination_participant)
                     { started_shape_ok = false; break; }
                     if (operation.operation)
-                        result.measurement_operations.push_back({migration, piece, operation.requires_local_measurement});
+                        result.measurement_operations.push_back({migration, piece,
+                            operation.requires_local_measurement, operation.observer_world_rank});
                 }
             }
         }

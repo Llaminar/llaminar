@@ -13,6 +13,7 @@
 #include "config/MoERouterArithmeticPolicy.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
+#include "execution/moe/MoEExpertOwnerMap.h"
 #include "execution/local_execution/graph/IGraphExecutor.h"
 #include "kernels/common/QuantizedActivationOperandPrecision.h"
 #include "utils/Sha256.h"
@@ -44,10 +45,10 @@ inline void requireQFN(bool condition, const char *message)
 }
 
 /**
- * @brief Authenticate the one declared distributed Static CPU fragment observation surface.
+ * @brief Authenticate matching Static or HostResident Dynamic distributed CPU joint intent.
  * @param config Original complete parser value, still revalidated by production admission.
  * @return False for historical single-rank requests; true only for an exact GPU authority plus CPU joint cohort.
- * @throws std::invalid_argument For unresolved, foreign, apportioned or active/migrating distributed intent.
+ * @throws std::invalid_argument For foreign topology, incompatible maintenance policy or a non-host dynamic authority.
  * @note This grants no source, weight, collective or native readiness. Production retains those authorities.
  */
 inline bool qfnDistributedCPUJointIntent(const OrchestrationConfig& config) {
@@ -57,10 +58,27 @@ inline bool qfnDistributedCPUJointIntent(const OrchestrationConfig& config) {
         config.moe_routed_expert_plan->usesExpertOverlayAuthority(),
         "QFN distributed observer requires one rank per CPU socket with rank-zero GPU continuation");
     const auto& plan=*config.moe_routed_expert_plan;
-    requireQFN(plan.domains.size()==2 && plan.continuation_domain==plan.base_model_domain &&
-        plan.continuation_domain==plan.shared_expert_domain && config.moe_rebalance.mode==MoERebalanceRuntimeMode::Off &&
-        plan.residency_policy==RoutedExpertResidencyPolicy::StaticById && config.pp_stage_definitions.empty(),
-        "QFN distributed observer supports only Static single-continuation CPU joint admission");
+    const bool static_intent =
+        config.moe_rebalance.mode == MoERebalanceRuntimeMode::Off &&
+        plan.residency_policy == RoutedExpertResidencyPolicy::StaticById;
+    const bool dynamic_intent =
+        config.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic &&
+        plan.residency_policy == RoutedExpertResidencyPolicy::RoutedTierRebalanced;
+    requireQFN(plan.domains.size() == 2 &&
+        plan.continuation_domain == plan.base_model_domain &&
+        plan.continuation_domain == plan.shared_expert_domain &&
+        (static_intent || dynamic_intent) && config.pp_stage_definitions.empty(),
+        "QFN distributed observer requires matching Static/Off or Dynamic/rebalanced single-continuation CPU joint intent");
+    if (dynamic_intent)
+    {
+        // Reuse the production ownership resolver; this diagnostic grants no
+        // service calibration, transfer readiness or publication permission.
+        const auto authority = resolveMoEOverlayAuthorityExecutionKind(plan);
+        requireQFN(authority == MoEOverlayAuthorityExecutionKind::HostResident &&
+            (plan.authority_execution == MoEOverlayAuthorityExecutionKind::Unresolved ||
+             plan.authority_execution == authority),
+            "QFN distributed Dynamic observer requires the original resolved HostResident authority");
+    }
     const RoutedExpertDomain* source=nullptr;const RoutedExpertDomain* joint=nullptr;
     for(const auto& domain:plan.domains) {
         if(domain.name==plan.continuation_domain)source=&domain;else joint=&domain;
@@ -118,6 +136,27 @@ inline nlohmann::json qfnCanonicalConfigurationIntent(const OrchestrationConfig 
     intent["prefill_max_bucket_size"] = maximum;
     intent["prefill_graph_buckets"] = prefillGraphBucketSizes(maximum);
     return intent;
+}
+
+/** @brief Select the original reset arithmetic contract, never an execution fallback. */
+enum class QFNResetComparisonPolicy { OriginalEarlyReplay, SamePlacementLatePair };
+
+/**
+ * @brief Require the finite original placement scope only for authenticated Dynamic CPU joint requests.
+ * @param config Actual source-bound runtime configuration, not an observed epoch or user claim.
+ * @return Late same-placement pair for the original mixed CPU-cohort authority; ordinary modes keep early/replay equality.
+ * @throws std::invalid_argument For an incompatible declared CPU joint topology or authority.
+ * @note DeviceResident GPU Dynamic remains on its existing reset contract; no unsupported scope is attempted.
+ */
+inline QFNResetComparisonPolicy qfnResetComparisonPolicy(const OrchestrationConfig &config)
+{
+    if (config.moe_rebalance.mode != MoERebalanceRuntimeMode::Dynamic ||
+        !config.moe_routed_expert_plan ||
+        !MoEExpertOwnerMap::usesCPUJointFragments(*config.moe_routed_expert_plan))
+        return QFNResetComparisonPolicy::OriginalEarlyReplay;
+    requireQFN(qfnDistributedCPUJointIntent(config),
+               "QFN same-placement reset requires its original distributed CPU joint host authority");
+    return QFNResetComparisonPolicy::SamePlacementLatePair;
 }
 
 /** @return The six actual source-owned arithmetic selectors; no caller-authored path proof. */
@@ -348,7 +387,7 @@ inline QFNObservationSurface qfnObservationSurface(const RankExecutionPlan &plan
 
 /**
  * @brief Classify an expert-only follower against its original prepared CPU domain.
- * @param config Actual parsed distributed Static source intent.
+ * @param config Actual parsed distributed source intent, including its original maintenance policy.
  * @param plan Actual runner plan, already checked against the original MPI rank.
  * @param original_plan Retained source preparation rank plan from the same owner.
  * @param prepared Original retained routed source placement; never reconstructed.

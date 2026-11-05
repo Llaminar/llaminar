@@ -327,3 +327,68 @@ TEST(CPUJointSerialGeometry, SourceWindowIsPrepricedOnRootAndFollowerWithoutChan
  }
 }
 } // namespace llaminar2
+
+namespace llaminar2 {
+/** @test Every original codebook's joint inactive roots fit exactly at each member's local rectangle. */
+TEST(CPUJointSerialGeometry, DynamicShadowBOMUsesOriginalMemberCutsForEveryFormat)
+{
+    std::vector<ExpertWeightFormat> formats;
+    for (const auto &source : native_vnni_formats::kAllSourceFormats)
+        formats.push_back(ExpertWeightFormat::nativeVnni(
+            {source.metadata->codebook_id, source.metadata->is_superblock, true}));
+    for (const auto floating : {TensorType::FP16, TensorType::BF16, TensorType::FP32})
+        formats.push_back(ExpertWeightFormat::floating(floating));
+    for (const auto &format : formats)
+    for (const int width : {2, 3, 4, 8})
+    {
+        SCOPED_TRACE(width);
+        constexpr int experts = 4, hidden = 4096, intermediate = 4096;
+        MoEOverlayCapacityResolverInput input;
+        input.num_experts = experts;
+        for (int layer : {7, 8})
+            input.layer_weight_manifest.push_back({.layer_idx = layer,
+                .projections = {{{ExpertTierWeightProjection::Gate, intermediate, hidden, format},
+                                {ExpertTierWeightProjection::Up, intermediate, hidden, format},
+                                {ExpertTierWeightProjection::Down, hidden, intermediate, format}}}});
+        MoEOverlayTierCapacityRequest request{
+            .tier_index = 0, .tier_name = "original_joint", .priority = 0, .fallback = true,
+            .quota_mode = MoEOverlayLiveQuotaMode::FixedPerLayer,
+            .copy_policy = MoEOverlayTierCopyPolicy::TensorSharded,
+            .fixed_live_experts_per_layer = {experts, experts}};
+        const auto members = serialMembers(width);
+        for (const auto &manifest : input.layer_weight_manifest)
+            request.shard_cohorts.push_back(std::make_shared<const MoEExpertShardCohort>(
+                MoEExpertShardCohort::checked(manifest, experts, members,
+                    MoEExpertShardCohort::balancedIntervals(manifest, width))));
+        std::vector<std::size_t> expected_live, expected_shadow;
+        for (int member = 0; member < width; ++member)
+        {
+            const auto resource = "joint_member_" + std::to_string(member);
+            const auto local = request.shard_cohorts.front()->localManifest(member);
+            const auto footprint = MoEOverlayCapacityResolver::preparedFootprints({local}).front();
+            expected_live.push_back(2 * experts * footprint.cpu_live_bytes);
+            expected_shadow.push_back(2 * footprint.cpu_shadow_bytes);
+            const auto exact = expected_live.back() + expected_shadow.back();
+            PhysicalMemoryBOMBuilder bom({.world_rank = members[member].world_rank,
+                .device = DeviceId::cpu(), .total_bytes = exact, .admission_available_bytes = exact});
+            input.physical_budgets.emplace_back(resource, PhysicalMemoryAdmissionCertificate(bom.build()));
+            request.participants.push_back({.participant_id = members[member].participant_id,
+                .resource_id = resource, .shadow_slots_per_layer = 2, .maximum_concurrent_shadow_slots = 2});
+        }
+        input.tiers = {request};
+        const auto admitted = MoEOverlayCapacityResolver::resolve(input);
+        for (int member = 0; member < width; ++member)
+        {
+            const auto *resource = admitted.resource(request.participants[member].resource_id);
+            ASSERT_NE(resource, nullptr);
+            EXPECT_EQ(resource->bom().bytes(PhysicalMemoryOwner::RoutedExpertWeights), expected_live[member]);
+            EXPECT_EQ(resource->bom().bytes(PhysicalMemoryOwner::ExpertShadowSlots), expected_shadow[member]);
+            EXPECT_EQ(resource->remainingBytes(), 0u);
+            auto short_input = input;
+            auto &budget = short_input.physical_budgets[member];
+            budget = budget.withAvailableBytes(budget.usableBudgetBytes() - 1);
+            EXPECT_THROW((void)MoEOverlayCapacityResolver::resolve(short_input), MoEOverlayCapacityExhausted);
+        }
+    }
+}
+} // namespace llaminar2

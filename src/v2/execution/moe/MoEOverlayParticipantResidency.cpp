@@ -1676,7 +1676,7 @@ namespace llaminar2
                         MoEOverlayPreparedCPUFragmentPayload payload(
                             model, config_.projection_preparation, family->cohort(),
                             family->participantIndex(), expert,
-                            {actual.gate, actual.up, actual.down});
+                            {actual.gate, actual.up, actual.down},0);
                         destination.setResidentCPUFragment(expert, std::move(payload));
                     }
                 }

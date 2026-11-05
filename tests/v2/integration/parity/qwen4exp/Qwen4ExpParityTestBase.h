@@ -244,7 +244,8 @@ protected:
             final_logits ? Qwen4ExpMainEvidencePolicy::FiniteExactObservations : Qwen4ExpMainEvidencePolicy::StrictLayerNumerics);
         if (!complete || !final_logits) return complete;
         return Base::acceptsRequiredRawParityStages(summary.layer_stats,
-            Base::parityGraphSnapshotPolicy(ParityForwardPhase::Prefill).requiredSnapshotKeys(ParityForwardPhase::Prefill));
+            Base::parityGraphSnapshotPolicy(ParityForwardPhase::Prefill).requiredSnapshotKeys(ParityForwardPhase::Prefill),
+            ParityForwardPhase::Prefill);
     }
 
     /** @brief Apply the identical complete-decoder contract to combined TP evidence. */
@@ -259,7 +260,8 @@ protected:
             final_logits ? Qwen4ExpMainEvidencePolicy::FiniteExactObservations : Qwen4ExpMainEvidencePolicy::StrictLayerNumerics);
         if (!complete || !final_logits) return complete;
         return Base::acceptsRequiredRawParityStages(summary.layer_stats,
-            Base::parityGraphSnapshotPolicy(ParityForwardPhase::Prefill).requiredSnapshotKeys(ParityForwardPhase::Prefill));
+            Base::parityGraphSnapshotPolicy(ParityForwardPhase::Prefill).requiredSnapshotKeys(ParityForwardPhase::Prefill),
+            ParityForwardPhase::Prefill);
     }
 
     /** @brief Every requested main decode step retains all original finite/exact decoder observations. */
@@ -271,10 +273,11 @@ protected:
         for (const auto &step : summary.step_stats)
         {
             if (const auto evidence = acceptsQwen4ExpCompletePrefill(step.layer_stats, true, true,
-                    Qwen4ExpMainEvidencePolicy::FiniteExactObservations); !evidence)
+                    Qwen4ExpMainEvidencePolicy::FiniteExactObservations, Qwen4ExpMainEvidencePhase::Decode); !evidence)
                 return ::testing::AssertionFailure() << "QFN decode step " << step.step_idx << ": " << evidence.message();
             if (const auto required = Base::acceptsRequiredRawParityStages(step.layer_stats,
-                    Base::parityGraphSnapshotPolicy(ParityForwardPhase::Decode).requiredSnapshotKeys(ParityForwardPhase::Decode)); !required)
+                    Base::parityGraphSnapshotPolicy(ParityForwardPhase::Decode).requiredSnapshotKeys(ParityForwardPhase::Decode),
+                    ParityForwardPhase::Decode); !required)
                 return required;
         }
         return ::testing::AssertionSuccess();

@@ -12,6 +12,7 @@
 #pragma once
 
 #include "backends/DeviceId.h"
+#include "MoEOptimizationMovementEndpoint.h"
 #include "DeviceMoERebalanceLoadSpreadProof.h"
 #include "MoEOptimizationStages.h"
 
@@ -154,16 +155,10 @@ namespace llaminar2
         /** Logical objective of this edge's authoritative closed cycle. */
         MoEOptimizationMovementAxis axis =
             MoEOptimizationMovementAxis::TierResidency;
-        int source_participant = -1;
-        int destination_participant = -1;
+        MoEOptimizationMovementEndpoint source;
+        MoEOptimizationMovementEndpoint destination;
         int source_priority = 0;
         int destination_priority = 0;
-        DeviceId source_device = DeviceId::invalid();
-        DeviceId destination_device = DeviceId::invalid();
-        int source_world_rank = -1;
-        int destination_world_rank = -1;
-        bool source_world_rank_known = false;
-        bool destination_world_rank_known = false;
         std::uint64_t estimated_weight_bytes = 0u;
         std::uint64_t activation_count = 0u;
         bool blocking_inference = false;
@@ -178,9 +173,7 @@ namespace llaminar2
                     authority == MoEOptimizationAuthority::Device) &&
                    transaction > 0u && candidate_epoch > 0u && layer >= 0 &&
                    expert >= 0 && cycle_size > 0u &&
-                   source_participant >= 0 &&
-                   destination_participant >= 0 &&
-                   source_device.is_valid() && destination_device.is_valid();
+                   source.validForLayer(layer) && destination.validForLayer(layer) && source.target().word() != destination.target().word();
         }
     };
 

@@ -108,8 +108,8 @@ namespace llaminar2::test
             const auto &edge = archive.ledger().edges.front();
             EXPECT_TRUE(edge.valid());
             EXPECT_EQ(edge.source_priority, 17);
-            EXPECT_EQ(edge.source_world_rank, 3);
-            EXPECT_EQ(edge.source_device, geometry(rocm).participants[0].device);
+            EXPECT_EQ(edge.source.whole().world_rank.value_or(-1), 3);
+            EXPECT_EQ(edge.source.whole().device, geometry(rocm).participants[0].device);
             EXPECT_EQ(edge.transaction, 9);
             EXPECT_EQ(edge.axis, MoEOptimizationMovementAxis::ParticipantPlacement);
             EXPECT_EQ(edge.activation_count, 90);
@@ -315,7 +315,20 @@ namespace llaminar2::test
         EXPECT_FALSE(runner.moeOptimizationStatus().quiescentBetweenWaves());
         EXPECT_EQ(runner.moeOptimizationMovementLedger().edges, archive.ledger().edges);
         const auto json = moeMovementLedgerJson(runner.moeOptimizationMovementLedger());
-        EXPECT_EQ(json.at("schema"), 2);
+        EXPECT_EQ(json.at("schema"), 4);
+        EXPECT_EQ(json.at("scope"), "model_lifetime");
+        EXPECT_EQ(json.at("edges").size(), 2);
+        // Forward the complete typed identity, including the non-first root's
+        // original rank/device. Estimated edge bytes remain distinct from the
+        // actual6000-byte native completion receipt asserted above.
+        const auto &wire_edge = json.at("edges").at(0);
+        EXPECT_EQ(wire_edge.at("source"), (nlohmann::json{{"kind", "whole"},
+            {"participant", 0}, {"device", "CUDA:1"}, {"world_rank", 3}}));
+        EXPECT_EQ(wire_edge.at("destination"), (nlohmann::json{{"kind", "whole"},
+            {"participant", 1}, {"device", "CUDA:0"}, {"world_rank", 3}}));
+        EXPECT_EQ(wire_edge.at("estimated_weight_bytes"), 8192);
+        EXPECT_FALSE(wire_edge.contains("source_participant"));
+        EXPECT_FALSE(wire_edge.contains("destination_participant"));
         EXPECT_EQ(json.at("economy").at(0).at("policy"), "native_load_spread");
         EXPECT_EQ(json.at("edges").at(0).at("transaction"), 9);
         // Two roots must not silently select the first child or add duplicates.

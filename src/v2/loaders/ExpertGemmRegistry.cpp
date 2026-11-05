@@ -11,6 +11,7 @@
 
 #include "ExpertGemmRegistry.h"
 #include "PreparedWeightStore.h"
+#include "execution/moe/MoEOverlayPhysicalResidencyFabric.h"
 #include "tensors/NativeWeightSourceRange.h"
 #include "execution/moe/CPUExpertShardSourceSelection.h"
 #include "tensors/TensorKernels.h"
@@ -777,9 +778,153 @@ namespace llaminar2
         return complete;
     }
 
-    bool ExpertGemmRegistry::replaceParticipantResidency(
+    bool ExpertGemmRegistry::replaceParticipantResidencyFromSeal(
+        const MoEOverlayReusableContextSeal &seal,
+        const MoEOverlayParticipantResidencyRegistry &residency,
+        std::string *error) noexcept
+    {
+        if (error) error->clear();
+        try
+        {
+            if (!seal.valid() ||
+                seal.canonical_owner_map.owners() != residency.initialOwnerMap().owners() ||
+                seal.canonical_owner_map.participants() != residency.initialOwnerMap().participants())
+                throw std::invalid_argument("Prepared registry seal differs from its original complete placement authority");
+            const auto &canonical_owner_map = seal.canonical_owner_map;
+
+            std::vector<ExpertGemmRegistry::ParticipantLayerScope> scopes;
+            std::vector<ExpertGemmRegistry::ParticipantExpertBinding>
+                bindings;
+            const auto participant_ids =
+                residency.localParticipantIds();
+            if (seal.local_banks.size() != participant_ids.size())
+            {
+                if (error)
+                {
+                    *error =
+                        "prepared model context seal does not cover every process-local participant";
+                }
+                return false;
+            }
+            for (const int participant_id : participant_ids)
+            {
+                const auto *participant =
+                    canonical_owner_map.participantForId(participant_id);
+                const auto endpoint =
+                    residency.endpoint(
+                        participant_id);
+                if (!participant || !endpoint)
+                {
+                    if (error)
+                    {
+                        *error =
+                            "prepared model context rebind cannot resolve local participant " +
+                            std::to_string(participant_id);
+                    }
+                    return false;
+                }
+                const auto bank = std::find_if(
+                    seal.local_banks.begin(),
+                    seal.local_banks.end(),
+                    [participant_id](
+                        const MoEOverlayParticipantResidencyBank &candidate)
+                    { return candidate.participant_id == participant_id; });
+                if (bank == seal.local_banks.end() ||
+                    !bank->valid(
+                        participant_id,
+                        participant->device,
+                        endpoint->numLayers(),
+                        endpoint->numExperts(),
+                        endpoint->firstModelLayer()))
+                {
+                    if (error)
+                    {
+                        *error =
+                            "prepared model context rebind cannot acquire the complete canonical bank for participant " +
+                            std::to_string(participant_id);
+                    }
+                    return false;
+                }
+
+                const int world_rank = participant->world_rank_known
+                                           ? participant->world_rank
+                                           : -1;
+                for (int layer = endpoint->firstModelLayer(); layer < endpoint->endModelLayer(); ++layer)
+                {
+                    const auto &layer_bank = bank->layerForModelLayer(layer);
+                    const auto expected_mask =
+                        canonical_owner_map.expertMaskForParticipant(
+                            layer,
+                            participant_id,
+                            endpoint->numExperts());
+                    if (layer_bank.resident_mask != expected_mask)
+                    {
+                        if (error)
+                        {
+                            *error =
+                                "prepared model context rebind found a participant bank that disagrees with the published owner map";
+                        }
+                        return false;
+                    }
+
+                    ExpertGemmRegistry::ParticipantLayerScope scope{
+                        .domain_name = participant->domain_name,
+                        .device = participant->device,
+                        .participant_world_rank = world_rank,
+                        .participant_index =
+                            participant->domain_participant_index,
+                        .layer = layer,
+                    };
+                    scopes.push_back(scope);
+                    if (layer_bank.cpu_fragment_family)
+                        continue; // Closed CPU payloads are validated below, never flattened.
+                    for (int expert = 0;
+                         expert < endpoint->numExperts();
+                         ++expert)
+                    {
+                        if (!layer_bank.resident_mask[
+                                static_cast<std::size_t>(expert)])
+                        {
+                            continue;
+                        }
+                        const auto &triplet = layer_bank.experts.at(
+                            static_cast<std::size_t>(expert));
+                        if (!triplet.complete())
+                        {
+                            if (error)
+                            {
+                                *error =
+                                    "prepared model context rebind found an incomplete resident expert triplet";
+                            }
+                            return false;
+                        }
+                        bindings.push_back({
+                            .scope = scope,
+                            .expert = expert,
+                            .gate = triplet.gate(),
+                            .up = triplet.up(),
+                            .down = triplet.down(),
+                        });
+                    }
+                }
+            }
+
+
+            return replaceParticipantResidencyImpl(scopes, bindings, seal.local_banks, &residency, error);
+        }
+        catch (const std::exception &exception)
+        {
+            if (error) *error = std::string("Prepared registry seal rejected before publication: ") + exception.what();
+        }
+        catch (...) { if (error) *error = "Prepared registry seal raised a non-standard exception before publication"; }
+        return false;
+    }
+
+    bool ExpertGemmRegistry::replaceParticipantResidencyImpl(
         std::span<const ParticipantLayerScope> scopes,
         std::span<const ParticipantExpertBinding> bindings,
+        std::span<const MoEOverlayParticipantResidencyBank> banks,
+        const MoEOverlayParticipantResidencyRegistry *residency,
         std::string *error) noexcept
     {
         if (error)
@@ -890,6 +1035,77 @@ namespace llaminar2
             }
 
             std::unique_lock lock(mutex_);
+            if (!residency && !banks.empty())
+                throw std::invalid_argument("Prepared registry replacement lost its original typed seal authority");
+            if (residency)
+            {
+                for (const auto &bank : banks)
+                {
+                    const auto *participant = residency->initialOwnerMap().participantForId(bank.participant_id);
+                    for (std::size_t index = 0; index < bank.layers.size(); ++index)
+                    {
+                        const auto &layer = bank.layers[index];
+                        if (!layer.cpu_fragment_family) continue;
+                        const int model_layer = bank.first_model_layer + static_cast<int>(index);
+                        const auto declared = residency->initialCPUJointLayer(bank.participant_id, model_layer);
+                        const auto &family = layer.cpu_fragment_family;
+                        if (!participant || !declared || !declared->family() ||
+                            family != declared->family() || family.owner_before(declared->family()) ||
+                            declared->family().owner_before(family) || !family->model().value)
+                            throw std::invalid_argument("CPU fragment seal lost its exact original model/preparation/member family");
+                        const auto &selected = declared->sourceSelection();
+                        const ParticipantLayerScope scope{participant->domain_name, participant->device,
+                            participant->world_rank_known ? participant->world_rank : -1,
+                            participant->domain_participant_index, model_layer};
+                        // The family comes from the original declaration even
+                        // when this layer has no selected experts. Never infer
+                        // family or source from the first resident payload.
+                        for (std::size_t expert = 0; expert < layer.resident_mask.size(); ++expert)
+                        {
+                            if (!layer.resident_mask[expert]) continue;
+                            const auto &fragment = layer.cpu_fragments.at(expert);
+                            if (!selected || !selected->contains(static_cast<int>(expert)) ||
+                                !family->accepts(fragment, static_cast<int>(expert)))
+                                throw std::invalid_argument("CPU fragment seal has a foreign original source selection or completed payload");
+                            const std::array<std::shared_ptr<ITensorGemm>,3> engines{
+                                fragment.gate(),fragment.up(),fragment.down()};
+                            for (std::size_t role = 0; role < engines.size(); ++role)
+                            {
+                                Key key{scope.domain_name,scope.device,scope.layer,static_cast<int>(expert),
+                                    static_cast<WeightRole>(role),scope.participant_world_rank,scope.participant_index};
+                                const auto found = engines_.find(key);
+                                if (found == engines_.end() || !found->second.static_source ||
+                                    !found->second.projection_ownership || !found->second.static_source->cpu_joint_source)
+                                    throw std::invalid_argument("CPU fragment seal cannot replace an absent or whole-owner source declaration");
+                                const auto &old = found->second;
+                                const auto &source = *old.static_source;
+                                validateStaticMatrix(source);
+                                if (staticProjectionScope(source) != scope ||
+                                    source.identity.model_id != family->model() ||
+                                    *source.cpu_joint_source != *selected ||
+                                    source.cpu_joint_source->cohort() != family->cohort() ||
+                                    source.cpu_joint_source->cohort().owner_before(family->cohort()) ||
+                                    family->cohort().owner_before(source.cpu_joint_source->cohort()) ||
+                                    source.projection_ownership != old.projection_ownership ||
+                                    source.projection_ownership != selected->ownership() ||
+                                    source.identity.expert != static_cast<int>(expert) ||
+                                    staticRegistryRole(source.identity.role) != static_cast<WeightRole>(role) ||
+                                    !engines[role] || engines[role]->get_n() != int(source.tensor->shape()[0]) ||
+                                    engines[role]->get_k() != int(source.tensor->shape()[1]))
+                                    throw std::invalid_argument("CPU fragment seal changed its committed original Store/source/layout identity");
+                                // Preserve the SAME immutable declaration and
+                                // its Store/source control blocks. Only actual
+                                // canonical engine ownership is replaced.
+                                Entry replacement = old;
+                                replacement.engine = engines[role].get();
+                                replacement.ownership = engines[role];
+                                if (!participant_entries.emplace(key,std::move(replacement)).second)
+                                    throw std::invalid_argument("CPU fragment seal duplicates an original participant role");
+                            }
+                        }
+                    }
+                }
+            }
             auto replacement = engines_;
             for (auto entry = replacement.begin();
                  entry != replacement.end();)
@@ -921,7 +1137,14 @@ namespace llaminar2
                                    key.layer == scope.layer;
                         });
                 if ((participant_match || domain_match) && entry->second.projection_ownership)
-                    throw std::logic_error("Whole-expert residency replacement cannot retire fixed projection slices");
+                {
+                    const auto typed = participant_entries.find(key);
+                    if (!residency || domain_match || !entry->second.static_source ||
+                        !entry->second.static_source->cpu_joint_source || typed == participant_entries.end() ||
+                        typed->second.static_source != entry->second.static_source ||
+                        typed->second.projection_ownership != entry->second.projection_ownership)
+                        throw std::logic_error("Whole-expert residency replacement cannot retire fixed projection slices");
+                }
                 if (participant_match || domain_match)
                     entry = replacement.erase(entry);
                 else

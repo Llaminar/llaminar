@@ -6,6 +6,9 @@
  * finalizers/inventory/writer. They instantiate no model, runner, or backend.
  */
 #include "integration/parity/ParityTestBase.h"
+#include "integration/parity/qwen4exp/Qwen4ExpPrefillAcceptance.h"
+#include "integration/parity/qwen4exp/Qwen4ExpParityTestBase.h"
+#include "integration/parity/qwen4exp/Qwen4ExpCPUJointParityCases.h"
 #include <gtest/gtest.h>
 #include <array>
 #include <chrono>
@@ -26,6 +29,18 @@ public:
     using ParityTestBase::finalizeDecodeLayerNumerics;
     using ParityTestBase::finalizePrefillLayerNumerics;
 };
+/** @brief Detect an accidentally restored implicit phase on the actual raw-evidence API. */
+template<class Probe, class Layers>
+concept RawEvidenceAcceptsImplicitPhase = requires(const Layers &layers, const std::vector<std::string> &keys)
+{
+    Probe::acceptsRequiredRawParityStages(layers, keys);
+};
+static_assert(!RawEvidenceAcceptsImplicitPhase<QueryWorkProbe, std::vector<LayerStats>>,
+    "Raw checkpoint acceptance must require its original Prefill/Decode phase");
+static_assert(requires(const std::vector<LayerStats> &layers, const std::vector<std::string> &keys)
+{
+    QueryWorkProbe::acceptsRequiredRawParityStages(layers, keys, ParityForwardPhase::Decode);
+});
 /**
  * @brief Construct owned acquired metadata independently from the tested history oracle.
  * @param prefix Original acquired prefix. @param live Original acquired live count.
@@ -438,3 +453,105 @@ TEST(QwenSparseQueryParityEvidence, ProgramOmissionAdmittedParticipantSetsAreExa
     }
 }
 }
+
+namespace llaminar2::test::parity
+{
+namespace
+{
+/** @brief Exercise the actual complete QFN virtual acceptance chain without setup or native state. */
+class QFNFinalEvidenceProbe final : public qwen4exp::Qwen4ExpConfigDrivenParityTest<QFNFinalEvidenceProbe>
+{
+public:
+    /** @brief Bind only metadata and original required keys; no fixture SetUp/model loading occurs. */
+    QFNFinalEvidenceProbe()
+    {
+        config_.final_logit_mean_kl = modelParityCase().thresholds.final_logit_mean_kl;
+        for (int layer = 0; layer < 48; ++layer)
+        {
+            auto &keys = config_.graph_snapshot_policy.required_decode_snapshot_keys;
+            keys.push_back("layer" + std::to_string(layer) + "_ATTENTION_OUTPUT");
+            if (layer % 4 == 3)
+                for (const auto *role : {"QSA_INDEXER_RAW_QUERY", "QSA_INDEXER_QUERY"})
+                    keys.push_back("layer" + std::to_string(layer) + "_" + role);
+        }
+        config_.graph_snapshot_policy.required_prefill_snapshot_keys = config_.graph_snapshot_policy.required_decode_snapshot_keys;
+    }
+    /** @return Actual original Dynamic CPU2 case metadata, with all 48 main layers. */
+    const ModelParityCase &modelParityCase() const
+    { return qwen4exp::qwen4ExpCPUJointWorld2DynamicNumericalCases().front(); }
+    /** @return Stable ordinary compatibility view; never used to initialize a runner. */
+    const TestConfig &getTestConfig() const
+    {
+        static const TestConfig value = modelParityCase().toTestConfig();
+        return value;
+    }
+    /** @param summary Actual recorded layer banks. @return Complete two-level QFN Decode verdict. */
+    ::testing::AssertionResult decodeEvidence(const DecodeParitySummary &summary) const
+    { return acceptsAdditionalDecodeEvidence(summary); }
+    /** @param summary Actual recorded layer banks. @return Original strict QFN Prefill verdict. */
+    ::testing::AssertionResult prefillEvidence(const ParityTestSummary &summary) const
+    { return acceptsAdditionalPrefillEvidence(summary); }
+private:
+    /** @brief Satisfy the GTest interface; the host contract calls only public evidence projections. */
+    void TestBody() override {}
+};
+}
+/** @test QFN decode reuses canonical authenticated omission without granting numerical credit. */
+TEST(QwenSparseQueryParityEvidence, QFNCompleteDecodeAcceptsOnlyAuthenticatedUnauthoredQueries)
+{
+    using namespace qwen4exp;
+    const std::array values{1.f, 2.f};
+    const auto attention = compareParityTensorData(values.data(), values.data(), values.size(), "ATTENTION_OUTPUT", .99f);
+    auto prior = omissionRecord(7), completed = omissionRecord(8);
+    prior.device = completed.device = "ROCm:0";
+    const QwenSparseQueryProgramObservation observation{{prior}, {completed}, {"ROCm:0"}};
+    const auto proof = inspectOmittedQwenSparseQueryEvidence(observation, {9, 0, 1, 4096}, 512);
+    ASSERT_TRUE(proof.valid);
+    std::vector<LayerStats> layers(48);
+    for (int layer = 0; layer < 48; ++layer)
+    {
+        layers[layer].layer_idx = layer;
+        layers[layer].stage_results = {attention};
+        if (layer % 4 == 3)
+        {
+            layers[layer].stage_results.push_back(structural("QSA_INDEXER_RAW_QUERY", proof));
+            layers[layer].stage_results.push_back(structural("QSA_INDEXER_QUERY", proof));
+        }
+        QueryWorkProbe::finalizeDecodeLayerNumerics(layers[layer], ParityConfig{}, true);
+    }
+    const QFNFinalEvidenceProbe final_probe;
+    const auto accepts = [&](const auto &records) {
+        DecodeParitySummary summary;
+        DecodeStepStats step; step.step_idx = 0; step.layer_stats = records;
+        summary.step_stats.push_back(std::move(step));
+        return final_probe.decodeEvidence(summary);
+    };
+    EXPECT_TRUE(accepts(layers));
+    EXPECT_FALSE(acceptsQwen4ExpCompletePrefill(layers, true, true,
+        Qwen4ExpMainEvidencePolicy::FiniteExactObservations)); // Prefill still requires actual values.
+    EXPECT_FALSE(layers[3].stage_results[1].evidence_valid);
+    EXPECT_FALSE(layers[3].stage_results[1].passed);
+    EXPECT_EQ(layers[3].stage_results[1].total_elements, 0);
+    for (int mutation = 0; mutation < 6; ++mutation)
+    {
+        auto bad = layers;
+        auto &query = bad[3].stage_results[1];
+        if (mutation == 0) query.query_work_evidence.reset();
+        if (mutation == 1) query.query_work_evidence->history.promptRows = 2052;
+        if (mutation == 2) query.query_work_evidence->omitted_program->expected_devices = {"ROCm:1"};
+        if (mutation == 3) query.evidence_valid = true;
+        if (mutation == 4) query.passed = true;
+        if (mutation == 5) query.query_work_evidence->omitted_program->before = query.query_work_evidence->omitted_program->after;
+        EXPECT_FALSE(accepts(bad)) << mutation;
+    }
+    auto missing = layers; missing.pop_back(); EXPECT_FALSE(accepts(missing));
+    auto missing_query = layers; missing_query[3].stage_results.erase(missing_query[3].stage_results.begin() + 1);
+    EXPECT_FALSE(accepts(missing_query)); // Declared raw inventory cannot be satisfied by complete layers alone.
+    auto duplicate_query = layers; duplicate_query[3].stage_results.push_back(duplicate_query[3].stage_results[1]);
+    EXPECT_FALSE(accepts(duplicate_query));
+    ParityTestSummary prefill; prefill.layer_stats = layers;
+    prefill.embedding_evidence_valid = prefill.lm_head_evidence_valid = true;
+    EXPECT_FALSE(final_probe.prefillEvidence(prefill));
+}
+
+} // namespace llaminar2::test::parity

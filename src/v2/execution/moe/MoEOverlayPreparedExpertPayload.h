@@ -14,6 +14,8 @@
 
 #include "kernels/common/DeviceMoEFloatingMatrixDesc.h"
 #include "loaders/WeightIdentity.h"
+#include "utils/PerfStatsCollector.h"
+#include <optional>
 
 #include <cstddef>
 #include <cstdint>
@@ -73,6 +75,15 @@ namespace llaminar2
         {
             return expert_;
         }
+        /** @return Actual completed arrival epoch; zero denotes the original static source. */
+        std::uint64_t arrivalEpoch()const noexcept{return arrival_epoch_;}
+        /** @brief Record only completed use of these genuine incoming engines.
+         * @param invocation_epoch Exact containing bank selected by the retained invocation lease.
+         * @param routes Positive number of completed logical expert routes.
+         * @throws std::logic_error For an invocation older than its actual arrival.
+         * Static source payloads and disabled evidence publish nothing. Metadata keys are cold-bound.
+         */
+        void recordCompletedExecution(std::uint64_t invocation_epoch,std::uint64_t routes)const;
         /** @return SAME original preparation shared control block. */
         const std::shared_ptr<const MoEExpertOverlayPreparationPlan> &preparation() const noexcept
         {
@@ -121,18 +132,21 @@ namespace llaminar2
          * @param member Original fixed member coordinate.
          * @param expert Exact candidate logical expert; need not belong to the initial selection.
          * @param engines Three actual completed local engines retaining destination storage.
+         * @param arrival_epoch Existing authenticated destination epoch; zero only for initial source construction.
          * @throws std::invalid_argument For absent provenance or incompatible physical engines.
          */
         MoEOverlayPreparedCPUFragmentPayload(
             ModelContextId model,
             std::shared_ptr<const MoEExpertOverlayPreparationPlan> preparation,
             std::shared_ptr<const MoEExpertShardCohort> cohort, std::size_t member, int expert,
-            std::array<std::shared_ptr<ITensorGemm>, 3> engines);
+            std::array<std::shared_ptr<ITensorGemm>, 3> engines,std::uint64_t arrival_epoch);
         ModelContextId model_{};
         std::shared_ptr<const MoEExpertOverlayPreparationPlan> preparation_;
         std::shared_ptr<const MoEExpertShardCohort> cohort_;
         std::size_t member_ = 0;
         int expert_ = -1;
+        std::uint64_t arrival_epoch_=0; ///< Immutable original arrival, retained unchanged across successor banks.
+        std::optional<PerfStatsCollector::CounterIdentity> execution_evidence_; ///< Cold metadata only; collector alone owns observations/reset.
         std::array<std::shared_ptr<ITensorGemm>, 3> engines_{};
     };
 

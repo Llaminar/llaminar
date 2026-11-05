@@ -138,6 +138,10 @@ namespace
         {
         }
 
+        /** @brief Inject one changed protocol certificate after compute, without a concurrent writer. */
+        void rewritePacketEpochAfterCompute(std::uint64_t* epoch,std::uint64_t replacement=0)noexcept
+        { packet_epoch_=epoch;replacement_epoch_=replacement; }
+
         bool supports_device(int) const override { return true; }
 
         bool multiply_tensor(
@@ -186,6 +190,7 @@ namespace
                         static_cast<float>((expert_id_ + 1) * 16 + col);
                 }
             }
+            if(packet_epoch_)*packet_epoch_=replacement_epoch_;
             return true;
         }
 
@@ -248,6 +253,8 @@ namespace
         }
 
     private:
+        std::uint64_t* packet_epoch_=nullptr; ///< Same-thread adversarial protocol mutation only.
+        std::uint64_t replacement_epoch_=0;
         int expert_id_ = -1;
         bool down_projection_ = false;
         size_t binding_calls_ = 0;
@@ -1808,6 +1815,38 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     input.residency_epoch = 2;
     EXPECT_TRUE(stage.execute(&ctx));
     EXPECT_EQ(output.residency_epoch, 2u);
+}
+
+/** @test Completion rejects a changed packet certificate instead of relabelling its retained bank. */
+TEST(Test__MoELocalExpertStage_PreparedWeights, CompletionRejectsChangedPacketEpochForRetainedBank)
+{
+    constexpr int width=8;
+    auto endpoint=std::make_shared<MoEOverlayParticipantResidency>(MoEOverlayParticipantResidency::Config{
+        .participant_id=3,.device=DeviceId::cpu(),.num_layers=1,.num_experts=1,.retained_epoch_capacity=2});
+    auto gate=std::make_shared<CanonicalRouteTestGemm>(0,false);
+    auto up=std::make_shared<CanonicalRouteTestGemm>(0,false);
+    auto down=std::make_shared<CanonicalRouteTestGemm>(0,true);
+    MoEOverlayParticipantResidencyBank bank;bank.epoch=1;bank.participant_id=3;bank.device=DeviceId::cpu();
+    bank.layers.resize(1);bank.layers[0].resident_mask.assign(1,false);bank.layers[0].experts.resize(1);
+    bank.layers[0].setResidentExpert(0,{gate,up,down});
+    std::string error;ASSERT_EQ(prepareAndInstall(*endpoint,bank,&error),MoEOverlayParticipantBankInstallStatus::Installed)<<error;
+    MoEOverlayCollectiveWorkspace packets;packets.ensureCapacity(1,1,width,1,DeviceId::cpu());
+    auto input=packets.localExpertInput(0,0);auto output=packets.localExpertOutput(0,0);
+    input.residency_epoch=1;input.live_row_count=input.live_entry_count=1;
+    input.row_ids_host[0]=0;input.entry_offsets_host[0]=0;input.entry_offsets_host[1]=1;
+    input.expert_ids_host[0]=0;input.route_weights_host[0]=1;std::fill_n(input.hidden_rows_fp32,width,1.0f);
+    MoELocalExpertStage::Params params;params.device_id=DeviceId::cpu();params.input_rows=&input;params.output_rows=&output;
+    params.graph_row_capacity=1;params.num_experts=1;params.top_k=1;params.d_model=width;params.expert_intermediate=16;
+    params.layer_idx=0;params.runtime_participant_index=3;params.expert_mask={true};params.overlay_participant_residency=endpoint;
+    params.prepared_gate_gemm={gate.get()};params.prepared_up_gemm={up.get()};params.prepared_down_gemm={down.get()};
+    MoELocalExpertStage stage(test::admitCPUPerLayerPacketForTest(params));test::CPUStageTestWorkspace workspace(stage);
+    llaminar2::testing::MockDeviceContext context(DeviceId::cpu(),ComputeBackendType::CPU);
+    ASSERT_TRUE(stage.execute(&context));EXPECT_EQ(output.residency_epoch,1u);
+    down->rewritePacketEpochAfterCompute(&input.residency_epoch,2);
+    EXPECT_FALSE(stage.execute(&context));EXPECT_EQ(input.residency_epoch,2u);EXPECT_EQ(output.live_row_count,0u);
+    EXPECT_FALSE(stage.hasPendingDeferredOutput());
+    down->rewritePacketEpochAfterCompute(nullptr);input.residency_epoch=1;
+    EXPECT_TRUE(stage.execute(&context));EXPECT_EQ(output.residency_epoch,1u);
 }
 
 /** @test Real CPU packets address model-global layers within compact PP residency banks. */

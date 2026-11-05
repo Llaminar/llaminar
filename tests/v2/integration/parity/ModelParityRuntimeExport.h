@@ -13,6 +13,7 @@
 #pragma once
 
 #include <iomanip>
+#include "execution/moe/MoEExpertOwnerMap.h"
 #include <map>
 #include <ostream>
 #include <sstream>
@@ -853,8 +854,14 @@ namespace llaminar2::test::parity
             *out << "]}}";
         }
         *out << "]}"
-             << ",\"movement_evidence\":" << modelParityJsonString(modelParityE2EMovementEvidenceName(cell.movementEvidence()))
-             << ",\"server_args\":[";
+             << ",\"movement_evidence\":" << modelParityJsonString(modelParityE2EMovementEvidenceName(cell.movementEvidence()));
+        // This obligation belongs to the sole typed declaration, never a
+        // consumer's test-name or topology-string inference. Existing Static
+        // and non-cohort metadata bytes remain unchanged.
+        if(cell.requiresPhysicalExpertMovement() && cell.topology.expert_overlay_plan &&
+           MoEExpertOwnerMap::usesCPUJointFragments(*cell.topology.expert_overlay_plan))
+            *out << ",\"cohort_publication_inference\":true";
+        *out << ",\"server_args\":[";
         const auto args = modelParityServerArguments(cell);
         for (std::size_t i = 0; i < args.size(); ++i)
             *out << (i ? "," : "") << modelParityJsonString(args[i]);

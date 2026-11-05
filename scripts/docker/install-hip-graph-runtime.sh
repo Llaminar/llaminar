@@ -40,12 +40,20 @@ hip_patches=(
     "${hip_script_dir}/patches/rocm-hip-graph-progress-safe-collapse.patch"
     "${hip_script_dir}/patches/rocm-hip-event-producer-lifetime.patch"
     "${hip_script_dir}/patches/rocm-hip-graph-kernarg-metadata.patch"
+    "${hip_script_dir}/patches/rocm-hip-preferred-queue-unshared.patch"
+)
+# Builder implementation and host fixture are part of the immutable proof
+# identity, so fast reuse cannot silently retain an older contract.
+hip_proof_files=(
+    "${hip_script_dir}/hip-preferred-queue/proof.py"
+    "${hip_script_dir}/hip-preferred-queue/selector-contract.cpp.in"
 )
 hip_library="${hip_prefix}/lib/libamdhip64.so.${LLAMINAR_HIP_LIBRARY_VERSION}"
 # ROCm's package uses a zero Git stamp. Preserve its filename as an alias, not
 # a competing stock artifact: ldconfig prefers the longer versioned filename.
 hip_package_library="${hip_library}-0000000"
 hip_marker="${hip_prefix}/share/llaminar/hip-graph-runtime.txt"
+hip_queue_proof="${hip_prefix}/share/llaminar/hip-preferred-queue-proof.json"
 
 # This source pin is an ABI dependency, not an independently upgradable plugin.
 # Reject a future SDK override until its source revision and repair are reviewed.
@@ -59,6 +67,10 @@ for hip_patch in "${hip_patches[@]}"; do
     hip_identity+=":$(sha256sum "${hip_patch}" | cut -d ' ' -f 1)"
 done
 
+for hip_proof_file in "${hip_proof_files[@]}"; do
+    hip_identity+=":$(sha256sum "${hip_proof_file}" | cut -d ' ' -f 1)"
+done
+
 # Only tiny dependency receipts are hashed, never model files. Including the
 # installed DSO digest detects an apt reinstall that replaces the repaired DSO
 # but leaves our receipt intact. Reuse does not hide a changed runtime.
@@ -67,6 +79,10 @@ if [[ -f "${hip_library}" && -f "${hip_marker}" &&
       "${hip_library}" -ef "${hip_prefix}/lib/libamdhip64.so.7" &&
       "${hip_library}" -ef "${hip_prefix}/lib/libamdhip64.so" &&
       "$(<"${hip_marker}")" == "${hip_identity}:$(sha256sum "${hip_library}" | cut -d ' ' -f 1)" ]]; then
+    # Verification is device/compiler-free and precedes all reuse/export writes.
+    python3 "${hip_script_dir}/hip-preferred-queue/proof.py" \
+        --verify "${hip_queue_proof}" --library "${hip_library}" \
+        --source-identity "${hip_identity}"
     if [[ -n "${HIP_RUNTIME_STAGE_PREFIX:-}" ]]; then
         # Export only the installer-owned component, including the package name
         # that must replace stock HIP in the runtime SDK. Relative aliases make
@@ -106,7 +122,7 @@ if [[ -f "${hip_library}" && -f "${hip_marker}" &&
         install -d "${hip_stage}/lib" "${hip_stage}/share/llaminar" "${hip_stage}/share/licenses"
         cp -P "${hip_library}" "${hip_package_library}" \
             "${hip_prefix}/lib/libamdhip64.so.7" "${hip_prefix}/lib/libamdhip64.so" "${hip_stage}/lib/"
-        cp "${hip_marker}" "${hip_stage}/share/llaminar/"
+        cp "${hip_marker}" "${hip_queue_proof}" "${hip_stage}/share/llaminar/"
         cp -a "${hip_prefix}/share/licenses/llaminar-hip" "${hip_stage}/share/licenses/"
         echo "HIP graph runtime component staged: ${hip_stage}"
     else
@@ -179,5 +195,12 @@ install -m 644 "${hip_build_dir}/systems/projects/clr/LICENSE.md" "${hip_license
 for hip_patch in "${hip_patches[@]}"; do
     install -m 644 "${hip_patch}" "${hip_licenses}/$(basename -- "${hip_patch}")"
 done
+# Retain original-code RED and actual candidate GREEN before publishing success.
+python3 "${hip_script_dir}/hip-preferred-queue/proof.py" \
+    --source-root "${hip_build_dir}/systems/projects/clr" \
+    --patch "${hip_script_dir}/patches/rocm-hip-preferred-queue-unshared.patch" \
+    --compiler "${hip_sdk_root}/lib/llvm/bin/clang++" \
+    --library "${hip_library}" --source-identity "${hip_identity}" \
+    --output "${hip_queue_proof}"
 printf '%s:%s\n' "${hip_identity}" "$(sha256sum "${hip_library}" | cut -d ' ' -f 1)" > "${hip_marker}"
 echo "HIP graph runtime installed: ${hip_library}"

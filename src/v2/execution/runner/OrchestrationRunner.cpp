@@ -45,6 +45,7 @@
  */
 
 #include "execution/local_execution/graph/RetainedHostServiceDeclarations.h"
+#include "execution/moe/MoEOverlayRestorationGeometry.h"
 #include "execution/moe/MoEOverlayRowCandidateFinalization.h"
 #include "execution/diagnostics/QueryKVGeometryObservation.h"
 #include "planning/TensorParallelSourceDeclaration.h"
@@ -17348,6 +17349,23 @@ namespace llaminar2
         return runner_->get_position();
     }
 
+    MoEOverlayInferencePlacementScopeObservation
+    OrchestrationRunner::withMoEOverlayInferencePlacementScope(const std::function<void()> &body)
+    {
+        if (!initialization_lifecycle_.readyForInference() || !runner_ || !model_ctx_ ||
+            !physical_memory_authority_ || !moe_expert_overlay_residency_authority_ ||
+            !moe_overlay_inference_transaction_coordinator_ ||
+            !config_.moe_routed_expert_plan ||
+            !MoEExpertOwnerMap::usesCPUJointFragments(*config_.moe_routed_expert_plan) ||
+            (mpi_ctx_ && mpi_ctx_->rank() != mpi_coordinated_root_rank_))
+            throw std::logic_error("Finite placement scope requires its ready original host-coordinated model/source/PMA root");
+        // Retain the original coordinator (and its original shared authority)
+        // across synchronous public reset/request calls. No replacement runner,
+        // source, physical byte authority, or follower admission is created.
+        const auto coordinator = moe_overlay_inference_transaction_coordinator_;
+        return coordinator->withMoEOverlayInferencePlacementScope(body);
+    }
+
     void OrchestrationRunner::clearCache()
     {
         /*
@@ -19552,9 +19570,8 @@ namespace llaminar2
         const auto snapshot=moe_expert_overlay_residency_authority_->snapshot();
         if(!snapshot || !snapshot->jointOwnerMap())return true;
         const auto &plan=*snapshot->placement_plan;
-        if(config_.moe_rebalance.mode!=MoERebalanceRuntimeMode::Off ||
-           moe_expert_overlay_residency_authority_->migrationEnabled())
-            return setError("CPU expert tensor-sharded domain currently requires Static immutable placement");
+        if(plan.authority_execution!=MoEOverlayAuthorityExecutionKind::HostResident)
+            return setError("CPU expert domain requires its original declared host residency authority");
         const auto world=moe_expert_overlay_mpi_ctx_?moe_expert_overlay_mpi_ctx_:mpi_ctx_;
         if(!world || !physical_memory_authority_)return setError("CPU expert domain lost original world/PMA authority");
         std::optional<NativeCPUCollectiveProgram> program;
@@ -19798,7 +19815,7 @@ namespace llaminar2
             return true;
         }
 
-        if(initial_snapshot->jointOwnerMap()) {
+        if(initial_snapshot->jointOwnerMap() && config_.moe_rebalance.mode==MoERebalanceRuntimeMode::Off) {
             if(config_.moe_rebalance.mode!=MoERebalanceRuntimeMode::Off ||
                moe_expert_overlay_residency_authority_->migrationEnabled() ||
                !moe_expert_overlay_participant_residency_->projectionPreparation() ||
@@ -20402,13 +20419,13 @@ namespace llaminar2
                 ExpertHistogramProductionTopology::forRetainedExecution(
                     metadata.num_layers,
                     metadata.main_inference_layer_count,
-                    expertHistogramServingRegime(mtp));
+                    expertHistogramServingRegime(mtp), metadata.first_model_layer);
             const auto economy_sources =
                 production_topology.economyActiveSources();
-            auto layer_weight_manifest =
+            const auto layer_weight_manifest =
                 buildMoEOverlayLayerWeightManifestFromLoader(model_ctx_->concreteLoader(),
                     metadata.num_layers,
-                    metadata.num_experts);
+                    metadata.num_experts, metadata.first_model_layer);
             const auto calibration_layer_catalog =
                 moe_expert_overlay_residency_authority_
                     ->economyLayerCatalog();
@@ -20526,8 +20543,10 @@ namespace llaminar2
                                     .inventory_authority =
                                         MoEOverlayPhysicalInventoryAuthority::
                                             ParticipantRegistry,
+                                    // Calibration subsequently authenticates the same
+                                    // immutable complete source descriptors.
                                     .layer_weight_manifest =
-                                        std::move(layer_weight_manifest),
+                                        layer_weight_manifest,
                                     .remote_projection_transport =
                                         moe_expert_overlay_remote_projection_transport_,
                                     .shadow_slots_per_endpoint_layer =
@@ -20791,8 +20810,12 @@ namespace llaminar2
                 auto calibration_ledger = std::make_shared<
                     MoEOverlayMigrationMeasurementLedger>(
                     MoEOverlayMigrationMeasurementLedger::Config{
-                        .required_coordinates =
-                            calibration_planner->requiredCoordinates(),
+                        .required_target_measurements = initial_snapshot->jointOwnerMap()
+                            ? calibration_planner->requiredTargetMeasurements(layer_weight_manifest)
+                            : std::vector<MoEOverlayRequiredTargetMigrationMeasurement>{},
+                        .required_coordinates = initial_snapshot->jointOwnerMap()
+                            ? std::vector<MoEOverlayMigrationMeasurementCoordinate>{}
+                            : calibration_planner->requiredCoordinates(),
                         .warmup_samples_per_coordinate = 0,
                         .measured_samples_per_coordinate =
                             MoEOverlayEconomyProfileComposer::
@@ -20854,7 +20877,7 @@ namespace llaminar2
 
             std::shared_ptr<MoEOverlayDeviceServiceTelemetryPublisher>
                 local_device_service_telemetry_publisher;
-            if (local_economy_certification)
+            if (local_economy_certification && !initial_snapshot->jointOwnerMap())
             {
                 for (const auto &binding :
                      host_authority_runtime_bindings)
@@ -21294,130 +21317,17 @@ namespace llaminar2
              * placement, so consulting one here would recreate a host shadow and
              * compare its initial epoch with the device's restored durable epoch.
              */
-            const auto &canonical_owner_map = seal.canonical_owner_map;
-
-            std::vector<ExpertGemmRegistry::ParticipantLayerScope> scopes;
-            std::vector<ExpertGemmRegistry::ParticipantExpertBinding>
-                bindings;
-            const auto participant_ids =
-                residency
-                    ->localParticipantIds();
-            if (seal.local_banks.size() != participant_ids.size())
+            const auto participant_ids = residency->localParticipantIds();
+            std::size_t scope_count = 0, resident_count = 0;
+            for (const auto &bank : seal.local_banks)
             {
-                if (error)
-                {
-                    *error =
-                        "prepared model context seal does not cover every process-local participant";
-                }
-                return false;
+                scope_count += bank.layers.size();
+                for (const auto &layer : bank.layers)
+                    resident_count += std::count(layer.resident_mask.begin(), layer.resident_mask.end(), true);
             }
-            for (const int participant_id : participant_ids)
-            {
-                const auto *participant =
-                    canonical_owner_map.participantForId(participant_id);
-                const auto endpoint =
-                    residency->endpoint(
-                        participant_id);
-                if (!participant || !endpoint)
-                {
-                    if (error)
-                    {
-                        *error =
-                            "prepared model context rebind cannot resolve local participant " +
-                            std::to_string(participant_id);
-                    }
-                    return false;
-                }
-                const auto bank = std::find_if(
-                    seal.local_banks.begin(),
-                    seal.local_banks.end(),
-                    [participant_id](
-                        const MoEOverlayParticipantResidencyBank &candidate)
-                    { return candidate.participant_id == participant_id; });
-                if (bank == seal.local_banks.end() ||
-                    !bank->valid(
-                        participant_id,
-                        participant->device,
-                        endpoint->numLayers(),
-                        endpoint->numExperts(),
-                        endpoint->firstModelLayer()))
-                {
-                    if (error)
-                    {
-                        *error =
-                            "prepared model context rebind cannot acquire the complete canonical bank for participant " +
-                            std::to_string(participant_id);
-                    }
-                    return false;
-                }
-
-                const int world_rank = participant->world_rank_known
-                                           ? participant->world_rank
-                                           : -1;
-                for (int layer = endpoint->firstModelLayer(); layer < endpoint->endModelLayer(); ++layer)
-                {
-                    const auto &layer_bank = bank->layerForModelLayer(layer);
-                    const auto expected_mask =
-                        canonical_owner_map.expertMaskForParticipant(
-                            layer,
-                            participant_id,
-                            endpoint->numExperts());
-                    if (layer_bank.resident_mask != expected_mask)
-                    {
-                        if (error)
-                        {
-                            *error =
-                                "prepared model context rebind found a participant bank that disagrees with the published owner map";
-                        }
-                        return false;
-                    }
-
-                    ExpertGemmRegistry::ParticipantLayerScope scope{
-                        .domain_name = participant->domain_name,
-                        .device = participant->device,
-                        .participant_world_rank = world_rank,
-                        .participant_index =
-                            participant->domain_participant_index,
-                        .layer = layer,
-                    };
-                    scopes.push_back(scope);
-                    for (int expert = 0;
-                         expert < endpoint->numExperts();
-                         ++expert)
-                    {
-                        if (!layer_bank.resident_mask[
-                                static_cast<std::size_t>(expert)])
-                        {
-                            continue;
-                        }
-                        const auto &triplet = layer_bank.experts.at(
-                            static_cast<std::size_t>(expert));
-                        if (!triplet.complete())
-                        {
-                            if (error)
-                            {
-                                *error =
-                                    "prepared model context rebind found an incomplete resident expert triplet";
-                            }
-                            return false;
-                        }
-                        bindings.push_back({
-                            .scope = scope,
-                            .expert = expert,
-                            .gate = triplet.gate(),
-                            .up = triplet.up(),
-                            .down = triplet.down(),
-                        });
-                    }
-                }
-            }
-
             std::string registry_error;
             if (!weight_manager->expertGemmRegistry()
-                     .replaceParticipantResidency(
-                         scopes,
-                         bindings,
-                         &registry_error))
+                     .replaceParticipantResidencyFromSeal(seal, *residency, &registry_error))
             {
                 if (error)
                 {
@@ -21437,9 +21347,9 @@ namespace llaminar2
                  {"local_participants",
                   std::to_string(participant_ids.size())},
                  {"participant_layer_scopes",
-                  std::to_string(scopes.size())},
+                  std::to_string(scope_count)},
                  {"resident_experts",
-                  std::to_string(bindings.size())},
+                  std::to_string(resident_count)},
                  {"compacted_shadow_experts",
                   std::to_string(seal.compacted_shadow_experts)}});
             return true;
@@ -21758,9 +21668,7 @@ namespace llaminar2
             const auto current =
                 moe_expert_overlay_residency_authority_->snapshot();
             const std::size_t maximum_waves = current
-                ? current->layered_ownership.layerCount() *
-                      current->layered_ownership.expertCount() +
-                      1u
+                ? preparedPlacementRestorationWaveLimit(*current)
                 : 0u;
             while (!moe_expert_overlay_residency_authority_
                         ->initialPreparedPlacementPublished())

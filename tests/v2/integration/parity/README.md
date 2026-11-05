@@ -296,7 +296,13 @@ counting for both; wrong-authority or impossible-axis journals fail. Static
 still requires empty journals even when its topology could support movement.
 
 These passive checks do not estimate placement or drive runtime decisions.
-The completed movement journal uses wire schema 2. Each economy record names
+The completed movement journal uses wire schema 4 (schema 5 for pipeline stage envelopes).
+Every edge retains typed `source` and `destination` endpoints. Whole endpoints
+preserve participant/device/known-rank identity; CPU cohorts retain every original
+ordered rank/NUMA member and all gate/up/down source cuts and codebooks. Scalar
+projections reject cohorts. Cohort transport proof joins each committed edge to
+actual completed native-format pieces and every original endpoint observer; it
+never treats staged work or an allocation capacity as completed movement. Each economy record names
 its admitting `policy`: `time_ns` retains the existing exact service/transfer/
 interference equation, while `native_load_spread` retains the homogeneous GPU
 policy's routed-work conservation, accepted swap gain, payload-slot floor and

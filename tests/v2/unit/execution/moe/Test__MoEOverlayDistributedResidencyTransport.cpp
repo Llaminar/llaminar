@@ -3,8 +3,8 @@
  * @brief CPU-only adversarial tests for globally coordinated residency waves.
  *
  * An in-process asynchronous lane models independently progressing MPI ranks.
- * These tests prove that local backpressure, physical failure, and prepare-start
- * failure are exchanged by every participant, that no peer is stranded in a
+ * These tests prove that local backpressure and quiescent prepare-start failure
+ * are exchanged, physical-stage failure aborts before a peer-dependent vote, and no peer is stranded in a
  * different phase, that a deferred transaction can be retried unchanged, and
  * that no local old bank retires before every rank reaches its lease fence.
  * Recorded measurement metadata also survives wrapper drain by its original
@@ -19,6 +19,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -315,6 +317,16 @@ namespace llaminar2::test
                 if (error)
                     error->clear();
                 return progress;
+            }
+
+            /** @brief Terminate the test child only if no Staged vote was submitted. */
+            [[noreturn]] void failPhysicalStage(const std::string &diagnostic) noexcept override
+            {
+                std::fprintf(stderr, "physical-fatal rank=%d generations=%zu reason=%s\n",
+                             world_rank_, next_generation_, diagnostic.c_str());
+                std::fflush(stderr);
+                std::_Exit(!active_ && next_generation_ == 1 &&
+                    diagnostic == "injected local physical stage failure" ? 73 : 74);
             }
 
             /** @return Whether this rank has consumed its active generation. */
@@ -1135,46 +1147,22 @@ namespace llaminar2::test
 
     TEST(
         Test__MoEOverlayDistributedResidencyTransport,
-        PhysicalStageFailureRetainsExactDiagnosticOnOriginatingRank)
+        PhysicalStageFailureIsFatalBeforeStagedVote)
     {
-        auto transaction = makeTransaction();
-        DistributedTransportFixture distributed;
-        distributed.locals[1]->stage_progress =
-            MoEOverlayResidencyWaveProgress::Failed;
-
-        auto starts = startEveryRank(distributed, transaction.transaction);
-        const auto failed = finishStages(starts);
-        for (std::size_t rank = 0; rank < failed.size(); ++rank)
-        {
-            EXPECT_EQ(
-                failed[rank].progress,
-                MoEOverlayResidencyWaveProgress::Failed);
-            EXPECT_NE(
-                failed[rank].error.find("world rank 1"),
-                std::string::npos)
-                << failed[rank].error;
-            EXPECT_NE(failed[rank].error.find("2102"), std::string::npos)
-                << failed[rank].error;
-            if (rank == 1u)
-            {
-                EXPECT_NE(
-                    failed[rank].error.find(
-                        "injected local physical stage failure"),
-                    std::string::npos)
-                    << failed[rank].error;
-            }
-            else
-            {
-                EXPECT_EQ(
-                    failed[rank].error.find(
-                        "injected local physical stage failure"),
-                    std::string::npos)
-                    << "Only the source rank owns the variable diagnostic";
-            }
-        }
-        abortEveryRank(starts);
-        for (const auto &lane : distributed.lanes)
-            EXPECT_TRUE(lane->idle());
+        EXPECT_EXIT({
+            auto transaction = makeTransaction();
+            DistributedTransportFixture distributed;
+            distributed.locals[0]->stage_progress = MoEOverlayResidencyWaveProgress::Pending;
+            distributed.locals[1]->stage_progress = MoEOverlayResidencyWaveProgress::Failed;
+            auto starts = startEveryRank(distributed, transaction.transaction);
+            for (int iteration = 0; iteration != 10; ++iteration)
+                for (auto &start : starts) {
+                    std::string error;
+                    (void)start.wave->pollStage(&error);
+                }
+            std::_Exit(75);
+        }, ::testing::ExitedWithCode(73),
+           "physical-fatal rank=1 generations=1 reason=injected local physical stage failure");
     }
 
     TEST(

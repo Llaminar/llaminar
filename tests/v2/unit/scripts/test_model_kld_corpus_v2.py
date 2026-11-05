@@ -445,14 +445,31 @@ class QFNCorpusV2Test(unittest.TestCase):
         m['source']['shared_predictor']['path']='/fixture/foreign.gguf'
         with self.assertRaises(ValueError): corpus.validate_manifest(m)
 
-    def _replay_real_tiny_files_full_extent_reset_and_nonfinite_boundaries(self, distributed=False, external_manifest=False):
+    def _replay_real_tiny_files_full_extent_reset_and_nonfinite_boundaries(self, distributed=False, external_manifest=False, dynamic=False, gpu_dynamic=False):
         import numpy as np
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)/'reference';root.mkdir(); m=manifest(); refs=[]; native=[]
             if distributed:
                 m['topologies'][0]['expected_config']['configuration']={'mpi_procs':2,
-                    'moe_routed_expert_plan':{'domains':[{'routed_compute_policy':'TensorSharded',
-                        'participants':[{'device_type':'CPU'},{'device_type':'CPU'}],'world_ranks':[0,1]}]}}
+                    'moe_routed_expert_plan':{'enabled':True,'topology':'TieredOverlay','continuation_domain':'gpu','base_model_domain':'gpu','shared_expert_domain':'gpu',
+                        'authority_execution':'HostResident','residency_policy':'StaticById',
+                        'routed_tiers':[{'domain':'gpu'},{'domain':'cpu'}],
+                        'domains':[{'name':'gpu','scope':'SINGLE','owner_rank':0,'participants':[{'device_type':'ROCm'}]},
+                                   {'name':'cpu','scope':'NODE_LOCAL','routed_compute_policy':'TensorSharded',
+                                    'participants':[{'device_type':'CPU'},{'device_type':'CPU'}],'world_ranks':[0,1]}]}}
+                m['topologies'][0]['runtime_config_digest']=metadata_digest(m['topologies'][0]['expected_config'])
+            if dynamic:
+                configuration=m['topologies'][0]['expected_config']['configuration']
+                configuration['moe_rebalance']={'mode':'Dynamic'}
+                configuration['moe_routed_expert_plan']['residency_policy']='RoutedTierRebalanced'
+                m['topologies'][0]['runtime_config_digest']=metadata_digest(m['topologies'][0]['expected_config'])
+            if gpu_dynamic:
+                m['topologies'][0]['backend']='ROCm'
+                m['topologies'][0]['expected_config']={'configuration':{'mpi_procs':1,'moe_rebalance':{'mode':'Dynamic'},
+                    'moe_routed_expert_plan':{'authority_execution':'DeviceResident','residency_policy':'RoutedTierRebalanced',
+                        'routed_tiers':[{'domain':'gpu'}],'domains':[{'name':'gpu','scope':'RANK_LOCAL',
+                            'routed_compute_policy':'GateUpOwnedDownColumns',
+                            'participants':[{'device_type':'ROCm','device_ordinal':i} for i in range(4)]}]}}}
                 m['topologies'][0]['runtime_config_digest']=metadata_digest(m['topologies'][0]['expected_config'])
             for h in m['histories']:
                 rows=[dict(r,vocabulary=6) for r in corpus.expected_rows(m) if r['history_id']==h['id']]
@@ -492,6 +509,15 @@ class QFNCorpusV2Test(unittest.TestCase):
             reset_rows=[dict(r,vocabulary=6) for r in corpus.expected_rows(dict(m,histories=[reset_history]))]
             (root/'reset.f32').write_bytes((root/'a-native.f32').read_bytes())
             report.update(cases=native,reset_case=dict(history_id='reset',rows=reset_rows,logits_file=str(root/'reset.f32')))
+            if dynamic:
+                # This is an honest tiny metadata fixture: the early case and
+                # late baseline deliberately differ, while the real byte scorer
+                # must require equality of the distinct late/replay owners.
+                late=np.fromfile(root/'a-native.f32',dtype='<f4')+1
+                late.tofile(root/'late-baseline.f32');late.tofile(root/'reset.f32')
+                baseline=dict(copy.deepcopy(native[0]),logits_file=str(root/'late-baseline.f32'))
+                report['reset_pair']=dict(schema='llaminar.qfn-reset-pair.v1',history_id='a',baseline=baseline,
+                    placement_scope=dict(placement_epoch=7,first_sequence_id=41,next_sequence_id=45))
             if distributed: write_rank_reports(root,m,report)
             path=root/'native.json'; path.write_text(json.dumps(report))
             bad=copy.deepcopy(report); bad['source_digest']='foreign'; path.write_text(json.dumps(bad))
@@ -505,6 +531,42 @@ class QFNCorpusV2Test(unittest.TestCase):
                 with self.assertRaises(ValueError):corpus.score_observation(loaded,path)
                 loaded=corpus.load_corpus(root,catalog=catalog,manifest_path=explicit)
                 self.assertEqual(len(corpus.score_observation(loaded,path)['rows']),7)
+            if gpu_dynamic:
+                self.assertNotIn('reset_pair',report)
+                self.assertNotIn('reset_pair',scored)
+                bad=copy.deepcopy(report);bad['reset_pair']={}
+                path.write_text(json.dumps(bad))
+                with self.assertRaisesRegex(ValueError,'Original reset policy'):
+                    corpus.score_observation(loaded,path)
+                path.write_text(json.dumps(report))
+            if dynamic:
+                self.assertNotEqual((root/'a-native.f32').read_bytes(),(root/'reset.f32').read_bytes())
+                self.assertEqual(scored['reset_pair'],report['reset_pair'])
+                for mutation in ('missing_pair','missing_baseline','foreign_history','foreign_row','empty_range',
+                                 'one_sequence','zero_epoch','bool_epoch','overflow','extra_scope','alias_initial','alias_reference'):
+                    bad=copy.deepcopy(report)
+                    if mutation=='missing_pair':del bad['reset_pair']
+                    elif mutation=='missing_baseline':bad['reset_pair']['baseline']=None
+                    elif mutation=='foreign_history':bad['reset_pair']['history_id']='b'
+                    elif mutation=='foreign_row':bad['reset_pair']['baseline']['rows'][0]['input_token']=5
+                    elif mutation=='empty_range':bad['reset_pair']['placement_scope']['next_sequence_id']=41
+                    elif mutation=='one_sequence':bad['reset_pair']['placement_scope']['next_sequence_id']=42
+                    elif mutation=='zero_epoch':bad['reset_pair']['placement_scope']['placement_epoch']=0
+                    elif mutation=='bool_epoch':bad['reset_pair']['placement_scope']['placement_epoch']=True
+                    elif mutation=='overflow':bad['reset_pair']['placement_scope']['next_sequence_id']=1<<64
+                    elif mutation=='extra_scope':bad['reset_pair']['placement_scope']['same_placement']=True
+                    elif mutation=='alias_initial':bad['reset_pair']['baseline']['logits_file']=str(root/'a-native.f32')
+                    elif mutation=='alias_reference':bad['reset_pair']['baseline']['logits_file']=str(root/'a-ref.f32')
+                    path.write_text(json.dumps(bad))
+                    with self.subTest(mutation=mutation),self.assertRaises(ValueError):corpus.score_observation(loaded,path)
+                path.write_text(json.dumps(report))
+                # A true proof flag cannot excuse unequal or nonfinite bytes.
+                late_original=(root/'late-baseline.f32').read_bytes()
+                fake=np.frombuffer(late_original,dtype='<f4').copy();fake[0]=np.nan
+                fake.tofile(root/'late-baseline.f32');fake.tofile(root/'reset.f32')
+                with self.assertRaisesRegex(ValueError,'nonfinite'):corpus.score_observation(loaded,path)
+                (root/'late-baseline.f32').write_bytes(late_original);(root/'reset.f32').write_bytes(late_original)
+
             if distributed:
                 authority=root/'rank-0.json';authority_original=authority.read_text()
                 incomplete=json.loads(authority_original);incomplete['path_records'].pop()
@@ -550,6 +612,20 @@ class QFNCorpusV2Test(unittest.TestCase):
 
     def test_explicit_metadata_manifest_preserves_original_reference_root(self):
         self._replay_real_tiny_files_full_extent_reset_and_nonfinite_boundaries(distributed=True,external_manifest=True)
+
+    def test_dynamic_reset_uses_actual_late_same_placement_pair(self):
+        self._replay_real_tiny_files_full_extent_reset_and_nonfinite_boundaries(distributed=True,dynamic=True)
+
+    def test_homogeneous_gpu_dynamic_keeps_original_exact_reset_oracle(self):
+        self._replay_real_tiny_files_full_extent_reset_and_nonfinite_boundaries(gpu_dynamic=True)
+
+    def test_static_reset_rejects_late_pair_substitution(self):
+        m=manifest()
+        history=dict(m['histories'][0],id=m['reset_control']['replay_id'])
+        rows=[dict(row,vocabulary=m['vocabulary']) for row in corpus.expected_rows(dict(m,histories=[history]))]
+        document=dict(reset_case=dict(history_id=history['id'],rows=rows),reset_pair={})
+        with self.assertRaisesRegex(ValueError,'Original reset policy'):
+            corpus._reset_comparison_frames(m,m['topologies'][0],document)
 
     def test_legacy_v1_policy_still_owns_its_original_inventory(self):
         from model_kld_canary import CANARIES,definition,evaluate_rows

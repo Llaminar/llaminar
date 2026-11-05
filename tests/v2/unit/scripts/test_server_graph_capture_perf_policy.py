@@ -319,8 +319,12 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         for backend in ("CUDA", "ROCm"):
             journal = ledger()
             for edge in journal["edges"]:
-                edge["source_device"] = f'{backend}:{edge["source_participant"]}'
-                edge["destination_device"] = f'{backend}:{edge["destination_participant"]}'
+                # Schema4 retains the exact typed endpoint. Native device
+                # authorities have whole endpoints; no cohort is projected
+                # onto a representative participant when changing vendors.
+                for side in ("source", "destination"):
+                    self.assertEqual(edge[side]["kind"], "whole")
+                    edge[side]["device"] = f'{backend}:{edge[side]["participant"]}'
             records, terminal = controller_transport(journal)
             with self.subTest(backend=backend):
                 self.assertIsNone(validate_runtime_feature_policy(records, RuntimeFeaturePolicy(),

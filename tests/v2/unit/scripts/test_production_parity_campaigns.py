@@ -4566,5 +4566,43 @@ class ModelStagingCapacityTests(unittest.TestCase):
         self.assertEqual(list(self.models.glob(".*.copying-*")), [])
 
 
+
+class CPUJointMovementArtifactTests(unittest.TestCase):
+    """Source-owned obligations and registered MPI width drive the shared audit without name parsing."""
+    def test_complete_original_rank_documents_and_freshness_are_required(self):
+        from test_generation_movement_ledger import CohortPublicationInferenceTests, topology
+        for width in (2,4,8):
+            journal,records=CohortPublicationInferenceTests.evidence(width)
+            case="OriginalTypedSuite.ProductionParity/Original"
+            cell=campaigns.CampaignCell("V2_Parity_ProductionCampaign_CPU_ALL_PRECISIONS",campaigns.CampaignGroup("CPU","ALL"),
+                gtest_cases=(case,),command=("mpirun","-np",str(width),"--","original_matrix"))
+            typed={case:dict(model_parity_schema=1,runtime=dict(movement_evidence="required",cohort_publication_inference=True))}
+            bound=campaigns.bind_canonical_movement_obligations([cell],typed)[0]
+            self.assertEqual(bound.cohort_movement_cases,(case,))
+            population=campaigns._preflight_mpi_ranks(bound.name,list(bound.command));self.assertEqual(population,width)
+            with tempfile.TemporaryDirectory() as raw:
+                directory=Path(raw)
+                for rank in range(width):
+                    document=CohortPublicationInferenceTests.documents(journal,records,case=case,width=width)[rank]
+                    (directory/f"cohort_movement_rank_{rank}.json").write_text(json.dumps(document),encoding="utf-8")
+                campaigns.validate_cpu_joint_movement_artifacts(directory,case,0,world_size=population)
+                with self.assertRaises(ValueError): campaigns.validate_cpu_joint_movement_artifacts(directory,case+"foreign",0,world_size=population)
+                stale=directory/f"cohort_movement_rank_{width-1}.json";os.utime(stale,ns=(0,0))
+                with self.assertRaises(ValueError): campaigns.validate_cpu_joint_movement_artifacts(directory,case,1,world_size=population)
+                stale.unlink()
+                with self.assertRaises(ValueError): campaigns.validate_cpu_joint_movement_artifacts(directory,case,0,world_size=population)
+
+    def test_canonical_typed_obligation_cannot_omit_shared_movement_audit(self):
+        case="ArbitraryOriginalSuite.ProductionParity/Original"
+        cell=campaigns.CampaignCell("V2_Parity_ProductionCampaign_CPU_ALL_PRECISIONS",campaigns.CampaignGroup("CPU","ALL"),
+            gtest_cases=(case,),command=("mpirun","-np","4","--","original_matrix"))
+        typed={case:dict(model_parity_schema=1,runtime=dict(movement_evidence="required",cohort_publication_inference=True))}
+        cell=campaigns.bind_canonical_movement_obligations([cell],typed)[0]
+        with tempfile.TemporaryDirectory() as raw:
+            _,_,errors=campaigns.validate_campaign_artifacts(cell,0,revision_results_root=Path(raw))
+            self.assertTrue(any("Dynamic cohort movement proof" in error for error in errors),errors)
+        for invalid in ({}, {case:dict(model_parity_schema=1,runtime=dict(cohort_publication_inference=False))}):
+            with self.assertRaises(ValueError):campaigns.bind_canonical_movement_obligations([cell],invalid)
+
 if __name__ == "__main__":
     unittest.main()

@@ -230,6 +230,16 @@ namespace llaminar2
             std::initializer_list<uint64_t> words,
             std::string phase = {}, std::string device = {}, Tags tags = {});
 
+        /** @brief Fold lifecycle words using cold-bound dimensions, without rebuilding keys.
+         * @param identity Original setup-bound metadata, never a record pointer.
+         * @param value Completed host work increment.
+         * @param words Exact fixed-schema lifecycle coordinates; changing epochs are never keys.
+         * @throws std::invalid_argument For an empty identity or word schema.
+         * @throws std::logic_error For a counter family whose schema changed.
+         */
+        static void addCounterWithSequence(const CounterIdentity& identity,double value,
+            std::initializer_list<uint64_t> words);
+
         static void recordTimingNs(
             std::string domain,
             std::string name,

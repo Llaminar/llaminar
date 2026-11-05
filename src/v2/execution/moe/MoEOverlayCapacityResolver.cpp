@@ -203,14 +203,20 @@ namespace llaminar2
                 throw std::logic_error(
                     "ExpertOverlay shadow geometry and footprint inventories disagree");
             }
-            std::map<ExpertPreparedTripletGeometryKey, std::vector<std::size_t>>
-                layers_by_geometry;
-            for (std::size_t layer = 0; layer < manifest.size(); ++layer)
-                layers_by_geometry[geometryKey(manifest[layer])].push_back(layer);
-
             std::map<std::string, std::size_t> charges;
-            for (const auto &participant : tier.request->participants)
+            for (std::size_t member = 0; member < tier.request->participants.size(); ++member)
             {
+                const auto &participant = tier.request->participants[member];
+                std::map<ExpertPreparedTripletGeometryKey, std::vector<std::size_t>> layers_by_geometry;
+                for (std::size_t layer = 0; layer < manifest.size(); ++layer)
+                {
+                    // A cohort's inactive root stores only this member's actual
+                    // source rectangle. Group the SAME shapes used by physical
+                    // fabric pools; full expert capacity is not a shard reserve.
+                    const auto local = tier.request->copy_policy == MoEOverlayTierCopyPolicy::TensorSharded
+                        ? tier.request->shard_cohorts.at(layer)->localManifest(member) : manifest[layer];
+                    layers_by_geometry[geometryKey(local)].push_back(layer);
+                }
                 const auto found = resource_index.find(participant.resource_id);
                 if (found == resource_index.end())
                     throw std::logic_error("Validated ExpertOverlay resource disappeared");
@@ -233,7 +239,9 @@ namespace llaminar2
                     const std::size_t bytes = checkedMultiply(
                         slots,
                         footprintFor(
-                            footprints[layers.front()],
+                            tier.request->copy_policy == MoEOverlayTierCopyPolicy::TensorSharded
+                                ? tier.fragment_footprints.at(member).at(layers.front())
+                                : footprints[layers.front()],
                             device,
                             /*shadow=*/true),
                         "tier shared-geometry shadow slots");
@@ -702,8 +710,8 @@ namespace llaminar2
                                 [&](const auto& b){return b.resourceId()==endpoint.resource_id;});
                             const auto resource=budget->certificate().bom().resource();
                             if(member.participant_id!=endpoint.participant_id || !resource.device.is_cpu() ||
-                               resource.world_rank!=member.world_rank || endpoint.shadow_slots_per_layer!=0)
-                                throw std::invalid_argument("Tensor-sharded capacity requires exact original CPU resources and no unsupported migration arena");
+                               resource.world_rank!=member.world_rank)
+                                throw std::invalid_argument("Tensor-sharded capacity requires exact original CPU resources");
                             state.fragment_footprints[p].push_back(MoEOverlayCapacityResolver::preparedFootprints({cohort->localManifest(p)}).front());
                         }
                     }

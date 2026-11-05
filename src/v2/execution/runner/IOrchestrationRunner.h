@@ -28,6 +28,8 @@
 #include "../prefix_cache/PrefixCacheStateProbe.h"
 #include "../InferenceReadiness.h"
 #include "../moe/MoEOptimizationStatus.h"
+#include "../moe/MoEOverlayInferenceTransaction.h"
+#include <functional>
 #include "../moe/MoEOptimizationMovementTopology.h"
 #include "../mpi_orchestration/RankExecutionPlan.h"
 #include "../../transfer/TransferEngine.h"
@@ -693,6 +695,7 @@ namespace llaminar2
          */
         virtual uint64_t moeRuntimeMovementEpoch() const { return 0; }
 
+
         /**
          * @brief Observe adaptive MoE lifecycle state from its sole authority.
          *
@@ -1291,6 +1294,21 @@ namespace llaminar2
          * must NOT enable this — they already coordinate inline.
          */
         virtual void setMPICoordinatedMode(bool /*enabled*/) {}
+        /**
+         * @brief Run finite complete requests under the original host placement owner.
+         * @param body Synchronous original requests, including public request resets.
+         * @return Original retained parent and completed descendant sequence IDs.
+         * @throws std::logic_error If this runner has no supported host coordinator.
+         * @note This neither selects an epoch nor supports homogeneous device authority.
+         */
+        virtual MoEOverlayInferencePlacementScopeObservation withMoEOverlayInferencePlacementScope(
+            const std::function<void()> &body)
+        {
+            (void)body;
+            throw std::logic_error("Finite host placement scope is unsupported by this runner");
+        }
+
+
     };
 
 } // namespace llaminar2

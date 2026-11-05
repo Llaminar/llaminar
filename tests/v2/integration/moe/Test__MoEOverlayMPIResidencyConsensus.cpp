@@ -41,12 +41,61 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
+
+/**
+ * @brief Child-only PMPI controls for a deterministic unmatched native payload.
+ *
+ * Disabled by default. A synchronous payload send models permitted rendezvous
+ * behavior without relying on eager limits. Rejecting the already-received
+ * header leaves that payload unmatched. No request/completion is retained or
+ * reordered, and every unrelated MPI call delegates unchanged.
+ */
+namespace physical_stage_failure_child
+{
+    thread_local bool active = false;
+    thread_local int rank = -1;
+    thread_local int sends = 0;
+    thread_local int counts = 0;
+}
+
+/** @brief Observe only the child's third original send (manifest/header/payload). */
+extern "C" int MPI_Isend(const void *buffer, int count, MPI_Datatype datatype,
+                         int destination, int tag, MPI_Comm communicator,
+                         MPI_Request *request)
+{
+    using namespace physical_stage_failure_child;
+    if (active && rank == 1 && ++sends == 3)
+    {
+        const int result = PMPI_Issend(buffer, count, datatype, destination, tag,
+                                      communicator, request);
+        std::fprintf(stderr, "physical-stage-child payload-posted bytes=%d status=%d\n", count, result);
+        std::fflush(stderr);
+        return result;
+    }
+    return PMPI_Isend(buffer, count, datatype, destination, tag, communicator, request);
+}
+
+/** @brief Reject only the child's real second received packet, its chunk header. */
+extern "C" int MPI_Get_count(const MPI_Status *status, MPI_Datatype datatype, int *count)
+{
+    const int result = PMPI_Get_count(status, datatype, count);
+    using namespace physical_stage_failure_child;
+    if (active && rank == 0 && ++counts == 2 && result == MPI_SUCCESS)
+    {
+        *count = 0;
+        std::fprintf(stderr, "physical-stage-child reject-original-header\n");
+        std::fflush(stderr);
+    }
+    return result;
+}
 
 namespace llaminar2::test
 {
@@ -694,8 +743,15 @@ namespace llaminar2::test
 
                 /** @brief Local physical staging is already complete. */
                 MoEOverlayResidencyWaveProgress pollStage(
-                    std::string *) noexcept override
+                    std::string *error) noexcept override
                 {
+                    if (owner_->stage_operation)
+                    {
+                        const auto progress = owner_->stage_operation->poll(error);
+                        if (progress == MoEOverlayResidencyWaveProgress::Failed)
+                            owner_->stage_operation->abort();
+                        return progress;
+                    }
                     return MoEOverlayResidencyWaveProgress::Ready;
                 }
 
@@ -761,6 +817,8 @@ namespace llaminar2::test
                 };
             }
 
+            /** Optional original physical operation; only the negative child supplies it. */
+            std::unique_ptr<IMoEOverlayTierTransferOperation> stage_operation;
             bool defer_start = false;
             bool prepare_begin_ok = true;
             int begin_calls = 0;
@@ -2010,6 +2068,58 @@ namespace llaminar2::test
         EXPECT_EQ(stats.protocol_failures, 0u);
         EXPECT_EQ(stats.inference_stream_waits, 0u);
         EXPECT_EQ(stats.blocking_synchronizations, 0u);
+    }
+
+    /** @test Original distributed wrapper must abort before an unmatched payload can strand its vote. */
+    TEST(Test__MoEOverlayMPIResidencyConsensus,
+         DISABLED_PhysicalHeaderRejectionDuringPayloadIsImmediatelyFatal)
+    {
+        auto context = worldContext();
+        ASSERT_TRUE(requireTwoRanks(*context));
+        auto fixture = realTransaction();
+        auto lane = std::make_shared<MoEOverlayMPIResidencyConsensus>(
+            MoEOverlayMPIResidencyConsensus::Config{.mpi_context=context,
+                                                  .perf_device="physical-stage-fatal-child"});
+        MoEOverlayMPIRemoteProjectionTransport physical({
+            .mpi_context=context,
+            .lane_budget=MoEOverlayRemoteProjectionLaneBudget::fromUniformCycles(1,1,3),
+            .staging_capacity_bytes=97,
+            .perf_device="physical-stage-fatal-child"});
+        auto original = remoteCpuProjection(193);
+        const auto key = remoteProjectionIdentity(1,0,0,ExpertTierWeightProjection::Gate);
+        const auto manifest = makeMoEOverlayRemoteCpuProjectionManifest(key,original,97);
+        auto lifetime = std::make_shared<int>(73);
+        std::vector<std::uint8_t> final_bytes(original.native_interleaved.size(),0xa5);
+        std::shared_ptr<IMoEOverlayRemoteProjectionSourceEndpoint> source;
+        std::shared_ptr<IMoEOverlayRemoteProjectionDestinationEndpoint> destination;
+        if(context->rank()==1)
+            source=std::make_shared<MoEOverlayHostRemoteProjectionSource>(
+                manifest,cpuSourceRegions(original),lifetime);
+        else
+            destination=std::make_shared<MoEOverlayHostRemoteProjectionDestination>(
+                key,cpuDestinationRegions(final_bytes),lifetime);
+        auto reservation=physical.reserve(0,key,source,destination);
+        ASSERT_EQ(reservation.status,MoEOverlayResidencyStageStartStatus::Started)<<reservation.error;
+        ImmediateLocalResidencyTransport local;
+        local.stage_operation=std::move(reservation.operation);
+        MoEOverlayDistributedResidencyTransport distributed({
+            .local_transport=&local,.consensus=lane,.perf_device="physical-stage-fatal-child"});
+        auto start=distributed.beginStage(fixture.transaction);
+        ASSERT_EQ(start.status,MoEOverlayResidencyStageStartStatus::Started)<<start.error;
+        physical_stage_failure_child::rank=context->rank();
+        physical_stage_failure_child::active=true;
+        for(;;)
+        {
+            std::string error;
+            const auto progress=start.wave->pollStage(&error);
+            if(progress!=MoEOverlayResidencyWaveProgress::Pending)
+            {
+                std::fprintf(stderr,"physical-stage-child unexpectedly-returned=%d detail=%s\n",
+                             static_cast<int>(progress),error.c_str());
+                std::fflush(stderr);
+                std::abort();
+            }
+        }
     }
 
     TEST(

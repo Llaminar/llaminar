@@ -293,4 +293,10 @@ namespace llaminar2
     {
         return config_.mpi_context->world_size();
     }
+    void MoEOverlayMPIResidencyConsensus::failPhysicalStage(
+        const std::string &diagnostic) noexcept
+    {
+        abortMoEOverlayMPI(private_communicator_, worldRank(),
+                           "residency_physical_stage", diagnostic);
+    }
 } // namespace llaminar2

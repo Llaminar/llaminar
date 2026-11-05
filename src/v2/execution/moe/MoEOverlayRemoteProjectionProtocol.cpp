@@ -371,6 +371,23 @@ namespace llaminar2
         return seal(result);
     }
 
+    bool MoEOverlayRemoteProjectionManifest::matchesGpuDestinationProjection(
+        const ExpertTierWeightProjectionIntersection &original,
+        ExpertWeightFormat destination_format,
+        int destination_rows, int destination_columns) const noexcept
+    {
+        if (!valid() || !identity.destination_device.is_gpu() || !destination_format.valid() ||
+            source_projection != original.source() || destination_projection != original.destination() ||
+            destination_projection.rows != destination_rows ||
+            destination_projection.columns != destination_columns)
+            return false;
+        if (destination_format.isFloating())
+            return carriesFloatingBytes() && format_kind == destination_format.kind;
+        return (carriesGpuBytes() || carriesCpuBytes()) &&
+            source_codebook_id == destination_format.native_vnni.codebook_id &&
+            (source_is_superblock != 0) == destination_format.native_vnni.is_superblock;
+    }
+
     bool MoEOverlayRemoteProjectionManifest::valid(
         std::string *error) const noexcept
     {

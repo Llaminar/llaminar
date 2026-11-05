@@ -9,6 +9,7 @@
  * disjoint CPU source roots; all declared GPU identities remain metadata only.
  */
 #include <gtest/gtest.h>
+#include "fixtures/loaders/ExpertGemmRegistryResidencyTestAccess.h"
 #include "loaders/ExpertGemmRegistry.h"
 #include "loaders/PreparedWeightStore.h"
 #include "tensors/TensorKernels.h"
@@ -199,7 +200,7 @@ TEST(Test__ExpertGemmRegistry,
     const std::array bindings{expert1, expert0};
 
     std::string error;
-    ASSERT_TRUE(reg.replaceParticipantResidency(scopes, bindings, &error))
+    ASSERT_TRUE(llaminar2::test::ExpertGemmRegistryResidencyTestAccess::replace(reg, scopes, bindings, &error))
         << error;
     EXPECT_EQ(
         reg.getEngineForParticipant(
@@ -229,7 +230,7 @@ TEST(Test__ExpertGemmRegistry,
     auto invalid = expert1;
     invalid.down.reset();
     const std::array invalid_bindings{invalid};
-    EXPECT_FALSE(reg.replaceParticipantResidency(
+    EXPECT_FALSE(llaminar2::test::ExpertGemmRegistryResidencyTestAccess::replace(reg,
         scopes, invalid_bindings, &error));
     EXPECT_FALSE(error.empty());
     EXPECT_EQ(
@@ -801,7 +802,7 @@ TEST(ExpertProjectionPreparedIdentity, RejectsWholeExpertAndNeighbourSliceAdopti
         EXPECT_THROW(registry.populateExpertEnginesForParticipant("compute", device, 2, 1, 0, 1, gates, ups, downs), std::logic_error);
         const ExpertGemmRegistry::ParticipantLayerScope scope{"compute", device, 2, 1, 0};
         std::string error;
-        EXPECT_FALSE(registry.replaceParticipantResidency(std::array{scope}, {}, &error));
+        EXPECT_FALSE(llaminar2::test::ExpertGemmRegistryResidencyTestAccess::replace(registry, std::array{scope}, {}, &error));
         EXPECT_NE(error.find("fixed projection"), std::string::npos);
         EXPECT_NE(registry.getEngineForParticipant("compute", device, 2, 1, 0, 0, Role::DOWN, identity), nullptr);
         auto other = std::make_shared<MockGemm>(3);
@@ -1191,3 +1192,5 @@ TEST(StaticProjectionPreparedSource, NativeDescriptorOwnsGeometryAndOriginalCode
 #include "CPUFragmentEpochBankContract.inc"
 
 #include "CPUJointInitialBankPrepassContract.inc"
+
+#include "CPUJointReusableRegistryContract.inc"

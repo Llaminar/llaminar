@@ -124,7 +124,11 @@ COPY scripts/docker/patches/rocm-hip-graph-empty-segment-publication.patch \
      scripts/docker/patches/rocm-hip-graph-progress-safe-collapse.patch \
      scripts/docker/patches/rocm-hip-event-producer-lifetime.patch \
      scripts/docker/patches/rocm-hip-graph-kernarg-metadata.patch \
+     scripts/docker/patches/rocm-hip-preferred-queue-unshared.patch \
      /tmp/install-scripts/patches/
+COPY scripts/docker/hip-preferred-queue/proof.py \
+     scripts/docker/hip-preferred-queue/selector-contract.cpp.in \
+     /tmp/install-scripts/hip-preferred-queue/
 RUN NINJA_VERSION=${NINJA_VERSION} MODE=build \
     /tmp/install-scripts/install-system-deps.sh
 RUN if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then \

@@ -7,6 +7,7 @@
  * report completed work; all policy receipts remain in their original scope.
  */
 #include "MoEOptimizationPipeline.h"
+#include "MoEExpertShardCohort.h"
 #include <limits>
 #include <stdexcept>
 
@@ -100,12 +101,21 @@ namespace llaminar2
             {
                 const auto &scope = stage.identity;
                 const auto &participants = scope.participants();
+                const auto endpoint_belongs = [&](const MoEOptimizationMovementEndpoint& endpoint) {
+                    if(endpoint.isWhole()) {
+                        const auto& whole=endpoint.whole();
+                        return whole.participant>=0 && static_cast<size_t>(whole.participant)<participants.size() &&
+                            whole.device==participants[whole.participant].toLocalDeviceId();
+                    }
+                    if(!endpoint.isCPUCohort())return false;
+                    for(const auto& member:endpoint.cohort().original->participants())
+                        if(member.participant_id<0 || static_cast<size_t>(member.participant_id)>=participants.size() ||
+                            member.address!=participants[member.participant_id])return false;
+                    return true;
+                };
                 if (!edge.valid() || edge.layer < scope.firstLayer() || edge.layer >= scope.routedLastLayer() ||
-                    static_cast<std::size_t>(edge.source_participant) >= participants.size() ||
-                    static_cast<std::size_t>(edge.destination_participant) >= participants.size() ||
-                    edge.source_device != participants[edge.source_participant].toLocalDeviceId() ||
-                    edge.destination_device != participants[edge.destination_participant].toLocalDeviceId())
-                    throw std::invalid_argument("Pipeline MoE movement contains a foreign layer or participant");
+                    !endpoint_belongs(edge.source) || !endpoint_belongs(edge.destination))
+                    throw std::invalid_argument("Pipeline MoE movement contains a foreign layer or complete endpoint");
             }
         return {.stages = std::move(stages)};
     }

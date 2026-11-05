@@ -92,3 +92,13 @@ if(TARGET v2_test_native_source_final_retirement)
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RetainedAdmissionOriginalNativeSourceContract)
 endif()
+
+if(TARGET v2_test_native_source_final_retirement)
+    add_v2_test(V2_Integration_QFNInvalidReusableSealLifecycle
+        COMMAND $<TARGET_FILE:v2_test_native_source_final_retirement>
+            --gtest_filter=NativeSourceFinalRetirement.QFNInvalidReusableSealRetiresThenRejectsCertification:NativeSourceFinalRetirement.QFNObserverSuccessRetiresSoleOriginalOwner
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Ownership;Lifecycle;Contract;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QFNInvalidReusableSealLifecycle)
+endif()

@@ -7,6 +7,7 @@
  * changing that legacy counting policy or the thresholds also used by decode.
  */
 #pragma once
+#include "../../../utils/QwenSparseQueryParityEvidence.h"
 #include <algorithm>
 #include <gtest/gtest.h>
 
@@ -14,15 +15,18 @@ namespace llaminar2::test::parity::qwen4exp
 {
 /** @brief Numerical policy never changes which original observations must exist. */
 enum class Qwen4ExpMainEvidencePolicy { StrictLayerNumerics, FiniteExactObservations };
+/** @brief Only Decode can prove an intentionally unauthored query from original history. */
+enum class Qwen4ExpMainEvidencePhase { Prefill, Decode };
 
 /**
  * @brief Authenticate each actual raw witness without requiring its diagnostic cosine verdict.
  * @tparam Layer Ordinary or combined TP layer record.
  * @param layer Original source-indexed record with its real comparison bank.
+ * @param phase Original forward phase; Decode requires authenticated query provenance.
  * @return First missing/invalid stage, or success. No default-valid synthetic evidence exists.
  */
 template <typename Layer>
-::testing::AssertionResult acceptsQwen4ExpLayerEvidence(const Layer &layer)
+::testing::AssertionResult acceptsQwen4ExpLayerEvidence(const Layer &layer, Qwen4ExpMainEvidencePhase phase = Qwen4ExpMainEvidencePhase::Prefill)
 {
     if (layer.stages_compared <= 0 || layer.stage_results.empty())
         return ::testing::AssertionFailure() << "QFN structural evidence: no actual stages for decoder " << layer.layer_idx;
@@ -32,7 +36,8 @@ template <typename Layer>
             if constexpr (requires { record.combined_result; }) return record.combined_result;
             else return record;
         }();
-        if (!stage.evidence_valid || (stage.integer_mismatch_count && *stage.integer_mismatch_count != 0))
+        if (!validParityCheckpointEvidence(stage, phase == Qwen4ExpMainEvidencePhase::Decode) ||
+            (stage.integer_mismatch_count && *stage.integer_mismatch_count != 0))
             return ::testing::AssertionFailure() << "QFN structural evidence: missing, nonfinite, malformed or non-exact stage "
                 << stage.stage_name << " in decoder " << layer.layer_idx;
     }
@@ -46,6 +51,7 @@ template <typename Layer>
  * @param embedding_passed Original strict embedding verdict, or actual finite/count witness under the explicit ordinary-logit policy.
  * @param logits_passed Strict logit verdict, or independent actual final-row witness when numerical KL is judged separately.
  * @param policy Strict legacy numerical layers or independently valid finite/exact observations.
+ * @param phase Original forward phase; Decode retains query proofs without numerical credit.
  * @return Success only for good embedding/logits and exactly 48 original main records, or a precise diagnostic.
  *
  * A missing, duplicated or out-of-main record cannot replace any decoder.
@@ -54,7 +60,8 @@ template <typename Layer>
  */
 template <typename Layers>
 ::testing::AssertionResult acceptsQwen4ExpCompletePrefill(const Layers &layers, bool embedding_passed, bool logits_passed,
-    Qwen4ExpMainEvidencePolicy policy = Qwen4ExpMainEvidencePolicy::StrictLayerNumerics)
+    Qwen4ExpMainEvidencePolicy policy = Qwen4ExpMainEvidencePolicy::StrictLayerNumerics,
+    Qwen4ExpMainEvidencePhase phase = Qwen4ExpMainEvidencePhase::Prefill)
 {
     if (!embedding_passed)
         return ::testing::AssertionFailure() << "QFN complete prefill: failed or missing EMBEDDING";
@@ -82,7 +89,7 @@ template <typename Layers>
             if (!layer->passed)
                 return ::testing::AssertionFailure() << "QFN complete prefill: failed decoder index " << index;
         }
-        else if (const auto evidence = acceptsQwen4ExpLayerEvidence(*layer); !evidence)
+        else if (const auto evidence = acceptsQwen4ExpLayerEvidence(*layer, phase); !evidence)
             return evidence;
     }
     // All identities must occur exactly once, with no foreign record. Keep the

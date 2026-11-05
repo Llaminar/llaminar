@@ -3788,6 +3788,7 @@ namespace llaminar2
             return false;
         }
         const auto &input = *params_.input_rows;
+
         if (deferred_lifecycle_ == DeferredLifecycle::ReadyNoWork)
         {
             resetDeferredInvocation();
@@ -3894,6 +3895,16 @@ namespace llaminar2
                 "[MoELocalExpertStage] Host-visible compact output is null after publication");
             return fail_completed_packet();
         }
+        // Validate only after the SAME output/native fence above has closed.
+        // Even a corrupt packet cannot release its bank while GPU work borrows
+        // those engines; no changed certificate may relabel completed output.
+        if(deferred_residency_bank_ && deferred_residency_bank_->epoch!=input.residency_epoch){
+            LOG_ERROR("[MoELocalExpertStage] Completion packet changed its exact retained residency bank"
+                << " layer="<<params_.layer_idx<<" participant="<<params_.runtime_participant_index
+                << " retained_epoch="<<deferred_residency_bank_->epoch<<" packet_epoch="<<input.residency_epoch);
+            return fail_completed_packet();
+        }
+
         const auto output_materialized_at = endpoint_detail_enabled
                                                 ? std::chrono::steady_clock::now()
                                                 : std::chrono::steady_clock::time_point{};
@@ -4401,6 +4412,23 @@ namespace llaminar2
                 std::vector<int>(
                     active_expert_ids.begin(), active_expert_ids.end()),
                 compute_ms);
+        }
+
+        const auto* completed_layer_bank=deferred_residency_bank_
+            ? &deferred_residency_bank_->layerForModelLayer(params_.layer_idx):nullptr;
+        if(completed_layer_bank && completed_layer_bank->cpu_fragment_family &&
+           PerfStatsCollector::isDomainEnabled("moe_overlay_residency")){
+            // The completed route vector is already the invocation's authority.
+            // Fold consecutive equal experts with a scalar; no duplicate counts,
+            // scratch allocation, reordering or changing metadata keys are needed.
+            for(size_t begin=0;begin<active_routes_.size();){
+                const auto expert=active_routes_[begin].expert_id;
+                size_t end=begin+1;
+                while(end<active_routes_.size() && active_routes_[end].expert_id==expert)++end;
+                completed_layer_bank->cpu_fragments.at(size_t(expert)).recordCompletedExecution(
+                    deferred_residency_bank_->epoch,static_cast<std::uint64_t>(end-begin));
+                begin=end;
+            }
         }
 
         /*

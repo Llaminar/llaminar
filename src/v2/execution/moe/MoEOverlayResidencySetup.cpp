@@ -12,6 +12,7 @@
 #include "MoEOverlayParticipantResidency.h"
 #include "MoEOverlayEconomyCalibrationPlanner.h"
 #include "MoEOverlayInferenceInterferenceProbe.h"
+#include "MoEOptimizationMovementTopology.h"
 #include "MoEExpertOverlayPreparationPlan.h"
 #include "loaders/ModelLoader.h"
 #include "utils/PerfStatsCollector.h"
@@ -70,8 +71,8 @@ namespace llaminar2
             preparation=std::make_shared<const MoEExpertOverlayPreparationPlan>(MoEExpertOverlayPreparationPlan::build(*runtime,input.loader));
         }
         const auto joint_map=preparation?preparation->cpuJointOwnerMap():nullptr;
-        if(joint_map && (rebalance.mode!=MoERebalanceRuntimeMode::Off || !input.original_model.value))
-            throw std::invalid_argument("CPU joint runtime setup requires original model identity and Static maintenance; Observe/Dynamic is not implemented");
+        if(joint_map && !input.original_model.value)
+            throw std::invalid_argument("CPU joint runtime setup requires its original model identity");
         std::optional<MoEExpertOwnerMap> whole_owners;
         if(!joint_map)whole_owners=MoEExpertOwnerMap::build(plan);
         const auto& owner_map=joint_map?*joint_map:*whole_owners;
@@ -115,8 +116,13 @@ namespace llaminar2
             DecodeExpertHistogramConfig histogram{
                 .num_layers = metadata.num_layers, .num_experts = metadata.num_experts, .top_k = top_k,
                 .window_size = std::max(1, rebalance.window_size), .token_boundary_layer_idx = *boundary};
-            for (const auto &participant : owner_map.participants()) histogram.sockets.push_back(participant.device);
-            histogram.ownership = owner_map.layeredOwnership(metadata.num_layers, metadata.num_experts, metadata.first_model_layer);
+            if (joint_map)
+                histogram.placement_ownership = joint_map;
+            else
+            {
+                for (const auto &participant : owner_map.participants()) histogram.sockets.push_back(participant.device);
+                histogram.ownership = owner_map.layeredOwnership(metadata.num_layers, metadata.num_experts, metadata.first_model_layer);
+            }
             if (host_dynamic)
             {
                 if (!capacity.host_demand_memory)
@@ -143,7 +149,8 @@ namespace llaminar2
             .histogram_max_window_tokens = static_cast<std::uint64_t>(std::max(0, rebalance.max_window_size)),
             .histogram_window_growth_factor = static_cast<double>(rebalance.window_growth_factor),
             .economy_layer_catalog = std::move(catalog),
-            .participant_rebalance_policy = {.enabled = host_dynamic,
+            .participant_rebalance_policy = {.enabled = host_dynamic &&
+                hasParticipantPlacementAxis(availableMoEOptimizationMovementAxes(plan)),
                 .imbalance_threshold_per_mille = rebalance.dynamic_imbalance_threshold_per_mille,
                 .minimum_improvement_per_mille = rebalance.dynamic_min_improvement_per_mille,
                 .maximum_swaps_per_layer = rebalance.dynamic_max_swaps_per_layer,
@@ -157,7 +164,7 @@ namespace llaminar2
         result.residency_ = std::make_shared<MoEOverlayParticipantResidencyRegistry>(MoEOverlayParticipantResidencyRegistry::Config{
             .owner_map = snapshot->owner_map, .local_participant_ids = std::move(local_ids),
             .num_layers = metadata.num_layers, .num_experts = metadata.num_experts, .initial_epoch = snapshot->epoch,
-            .retained_epoch_capacity = 2, .collect_economy_service_measurements = dynamic,
+            .retained_epoch_capacity = 2, .collect_economy_service_measurements = dynamic && !joint_map,
             .projection_preparation = std::move(preparation), .first_model_layer = metadata.first_model_layer,
             .original_model=input.original_model});
         PerfStatsCollector::addCounter("moe_overlay_residency", "production_authorities_created", 1.0, "model_setup", {},

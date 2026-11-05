@@ -7,6 +7,8 @@
  * mathematics, graph execution, or evidence publication ordering.
  */
 #include "NodeExpertOverlayParityFixture.h"
+#include "app/modes/MoEMovementLedgerJson.h"
+#include <iomanip>
 
 namespace llaminar2::test::parity::qwen35moe::node_overlay
 {
@@ -135,10 +137,12 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
                 continue;
             }
 
+            ASSERT_TRUE(edge.destination.isWhole())
+                << "This scalar promotion witness has no recorded complete-target CPU-fragment execution observation";
             const PromotedExpert promotion{
                 .layer = edge.layer,
                 .expert = edge.expert,
-                .destination_participant = edge.destination_participant,
+                .destination_participant = edge.destination.whole().participant,
                 .candidate_epoch = edge.candidate_epoch,
             };
             if (std::find(
@@ -179,10 +183,8 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
         ASSERT_TRUE(output.is_open()) << path;
         output
             << "domain,name,count,value,transaction,candidate_epoch,layer,expert,"
-               "cycle_index,cycle_size,direction,movement_axis,source_participant,"
-               "destination_participant,"
-               "source_priority,destination_priority,source_device,"
-               "destination_device,source_world_rank,destination_world_rank,"
+               "cycle_index,cycle_size,direction,movement_axis,source_endpoint_json,"
+               "destination_endpoint_json,source_priority,destination_priority,"
                "estimated_weight_bytes,activation_count,blocking_inference,"
                "policy_owner\n";
 
@@ -234,20 +236,9 @@ namespace llaminar2::test::parity::qwen35moe::node_overlay
                 << edge.expert << ',' << edge.cycle_index << ','
                 << edge.cycle_size << ',' << direction_name(edge.direction)
                 << ',' << axis_name(edge.axis) << ','
-                << edge.source_participant << ','
-                << edge.destination_participant << ','
-                << edge.source_priority << ',' << edge.destination_priority
-                << ',' << edge.source_device.toString() << ','
-                << edge.destination_device.toString() << ',';
-            if (edge.source_world_rank_known)
-                output << edge.source_world_rank;
-            else
-                output << "unknown";
-            output << ',';
-            if (edge.destination_world_rank_known)
-                output << edge.destination_world_rank;
-            else
-                output << "unknown";
+                << std::quoted(movement_json_detail::endpointRecord(edge.source).dump(), '"', '"') << ','
+                << std::quoted(movement_json_detail::endpointRecord(edge.destination).dump(), '"', '"') << ','
+                << edge.source_priority << ',' << edge.destination_priority;
             output << ',' << edge.estimated_weight_bytes << ','
                    << edge.activation_count << ','
                    << (edge.blocking_inference ? "true" : "false") << ','

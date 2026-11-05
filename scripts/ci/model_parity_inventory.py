@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file model_parity_inventory.py
+# @brief Authenticate source-owned CTest/GoogleTest metadata once for inventory and qualification consumers.
 """Export canonical model cells without executing numerical or generation tests.
 
 CTest owns exact membership; GoogleTest's typed JSON owns each configuration.
@@ -259,6 +261,45 @@ def matrix_binary(campaign: parity.CampaignCell) -> Path:
     return binaries[0]
 
 
+def discover_parameters(registered: list[parity.CampaignCell], campaigns: list[parity.CampaignCell]) -> dict[str, dict]:
+    """Read original typed GoogleTest JSON once/binary and authenticate complete CTest membership.
+
+    This metadata-only boundary does not stat/map model files, project routes,
+    choose policies or derive topology from names. Numerical, HTTP and inventory
+    consumers share this same reader rather than maintaining another parser.
+    """
+    registered_by_binary = {}
+    registered_names = set()
+    for campaign in registered:
+        names = registered_by_binary.setdefault(matrix_binary(campaign), set())
+        for exact in campaign.gtest_cases:
+            if exact in registered_names:
+                raise ValueError(f"duplicate canonical CTest cell in {campaign.name}: {exact}")
+            registered_names.add(exact)
+            names.add(exact)
+    inventories = {}
+    for campaign in campaigns:
+        binary = matrix_binary(campaign)
+        if binary not in inventories:
+            with tempfile.TemporaryDirectory(prefix="llaminar-cell-discovery-") as directory:
+                output = Path(directory) / "parameters.json"
+                subprocess.run(
+                    [str(binary), "--gtest_list_tests", f"--gtest_output=json:{output}"],
+                    cwd=campaign.working_directory,
+                    env={**os.environ, "LLAMINAR_FORCE_CPU_ONLY_STARTUP": "1",
+                         "HWLOC_COMPONENTS": "-gl,-opencl",
+                         "OMPI_MCA_btl_vader_single_copy_mechanism": "none"},
+                    check=True, capture_output=True, text=True, timeout=30)
+                inventories[binary] = parse_parameters(output.read_text())
+            actual = set(inventories[binary])
+            expected = registered_by_binary[binary]
+            if actual != expected:
+                raise ValueError(f"CTest/GoogleTest inventory mismatch for {binary}: "
+                                 f"unregistered={sorted(actual - expected)} "
+                                 f"missing_from_binary={sorted(expected - actual)}")
+    return {exact:record for inventory in inventories.values() for exact,record in inventory.items()}
+
+
 def discover(args: argparse.Namespace, scope: InventoryScope) -> list[tuple[parity.CampaignCell, str, dict]]:
     """Join exact CTest membership to typed metadata once per matrix executable.
 
@@ -306,44 +347,17 @@ def discover(args: argparse.Namespace, scope: InventoryScope) -> list[tuple[pari
         # including siblings excluded by the cell/backend/campaign selectors;
         # otherwise a filtered diagnostic could conceal a dropped CTest case.
         registered = parity.discover_campaigns(args.build_dir)
-        registered_by_binary = {}
-        registered_names = set()
-        for campaign in registered:
-            names = registered_by_binary.setdefault(matrix_binary(campaign), set())
-            for exact in campaign.gtest_cases:
-                if exact in registered_names:
-                    raise ValueError(f"duplicate canonical CTest cell in {campaign.name}: {exact}")
-                registered_names.add(exact)
-                names.add(exact)
         campaigns = [campaign for campaign in registered
                      if re.fullmatch(args.backend, campaign.group.backends)
                      and re.fullmatch(args.campaign, campaign.name)
                      and any(re.fullmatch(args.cell, exact)
                              for exact in campaign.gtest_cases)]
-        inventories = {}
+        parameters=discover_parameters(registered,campaigns)
         for campaign in campaigns:
-            binary = matrix_binary(campaign)
-            if binary not in inventories:
-                with tempfile.TemporaryDirectory(prefix="llaminar-cell-discovery-") as directory:
-                    output = Path(directory) / "parameters.json"
-                    subprocess.run(
-                        [str(binary), "--gtest_list_tests", f"--gtest_output=json:{output}"],
-                        cwd=campaign.working_directory,
-                        env={**os.environ, "LLAMINAR_FORCE_CPU_ONLY_STARTUP": "1",
-                             "HWLOC_COMPONENTS": "-gl,-opencl",
-                             "OMPI_MCA_btl_vader_single_copy_mechanism": "none"},
-                        check=True, capture_output=True, text=True, timeout=30)
-                    inventories[binary] = parse_parameters(output.read_text())
-                actual = set(inventories[binary])
-                expected = registered_by_binary[binary]
-                if actual != expected:
-                    raise ValueError(f"CTest/GoogleTest inventory mismatch for {binary}: "
-                                     f"unregistered={sorted(actual - expected)} "
-                                     f"missing_from_binary={sorted(expected - actual)}")
             for exact in campaign.gtest_cases:
-                if exact not in inventories[binary]:
-                    raise ValueError(f"stale CTest registration, rebuild {binary}: {exact}")
-                record = inventories[binary][exact]
+                if exact not in parameters:
+                    raise ValueError(f"stale CTest registration, rebuild {matrix_binary(campaign)}: {exact}")
+                record = parameters[exact]
                 if not scope.accepts(record) or not re.fullmatch(args.cell, exact):
                     continue
                 # Keep the target and explicit predictor together, including

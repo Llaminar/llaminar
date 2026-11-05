@@ -206,3 +206,113 @@ TEST(CPUJointAuthoritativeTargetContract, PreparedTargetsRejectOverlappingPhysic
     EXPECT_THROW(MoEOverlayPreparedTargetServicePlan::checked(snapshot, catalog, topology), std::invalid_argument);
     EXPECT_EQ(authority.snapshot(), snapshot);
 }
+
+/** @test The SAME production host authority accepts original complete-target prices and proposes typed swaps. */
+TEST(CPUJointAuthoritativeTargetContract, DynamicUsesOrdinaryAuthorityAndTypedDemandWithoutOffPermission)
+{
+    using namespace llaminar2;
+    using namespace llaminar2::test;
+    JointPlacementOriginal original(2);
+    MoEOverlayResidencyAuthority cold(original.config());
+    const auto snapshot = cold.snapshot();
+    const auto catalog = std::make_shared<const MoEOverlayEconomyCalibrationLayerCatalog>(
+        std::vector<MoEOverlayLayerWeightManifest>{snapshot->placementOwnerMap().placementFor(0, 1)->shard_cohort->source()});
+    const auto topology = ExpertHistogramProductionTopology::uniform(1, kAllExpertHistogramProductionSources);
+    const auto declarations = MoEOverlayPreparedTargetServicePlan::checked(snapshot, catalog, topology);
+    std::vector<MoEOverlayPreparedTargetServiceTotals> recorded;
+    for (const auto &entry : declarations->entries())
+    {
+        MoEOverlayPreparedTargetServiceTotals row{.coordinate = entry.coordinate};
+        for (std::size_t phase = 0; phase < kExpertHistogramProductionSourceCount; ++phase)
+        {
+            row.sample_count[phase] = entry.measured_invocations;
+            row.activation_count[phase] = entry.sample_rows[phase] * entry.measured_invocations;
+            row.total_nanoseconds[phase] = row.activation_count[phase] * (entry.coordinate.target.isWhole() ? 10 : 40);
+            row.expert_ids[phase] = declarations->sampleExpert(entry, phase);
+        }
+        recorded.push_back(row);
+    }
+    // Explicit recorded policy inputs certify this device-free controller test
+    // only. Native service/transport gates provide actual observation evidence.
+    const auto service = MoEOverlayEconomyProfileComposer::composePreparedService(declarations, recorded);
+    auto movement = std::make_shared<MoEOverlayMigrationCostProfile>();
+    movement->identity = "recorded-original-complete-target-policy";
+    MoEOverlayEconomyCalibrationPlanner planner({.live_snapshot = snapshot,
+        .complete_expert_bytes_per_layer = catalog->completeExpertBytesPerLayer()});
+    for (const auto &coordinate : planner.requiredTargetCoordinates())
+        movement->costs.push_back({coordinate, 1, 1});
+    DecodeExpertHistogram histogram({.num_layers = 1, .num_experts = 4, .top_k = 2,
+        .window_size = 1, .placement_ownership = original.preparation->cpuJointOwnerMap()});
+    auto config = original.config();
+    config.maintenance_mode = MoERebalanceRuntimeMode::Dynamic;
+    config.histogram = &histogram;
+    config.phase_service_profile = service;
+    config.migration_cost_profile = movement;
+    config.migration_economy_policy = MoEOverlayMigrationEconomyPolicy{
+        .historical_window_weight = 0, .current_window_weight = 1,
+        .payoff_horizon_tokens = 1000, .minimum_net_benefit_ns = 0, .minimum_residency_generations = 0};
+    config.economy_layer_catalog = catalog;
+    config.shadow_slots_per_endpoint_layer = 1;
+    config.max_concurrent_cycles = 1;
+    MoEOverlayResidencyAuthority authority(config);
+    EXPECT_TRUE(authority.migrationEnabled());
+    EXPECT_TRUE(authority.hasEconomyCertification());
+    const auto window = observedLayerBatches({{{ExpertHistogramSource::DecodeToken, {1, 2}}}}, 4, 2, 17);
+    const auto proposal = authority.proposeFromFrozenHistogramWindow(window);
+    ASSERT_TRUE(proposal.valid());
+    ASSERT_EQ(proposal.migrations.size(), 2u);
+    EXPECT_GT(proposal.economy.projected_net_benefit_ns, 0u);
+    EXPECT_TRUE(proposal.migrations[0].source.shard_cohort || proposal.migrations[1].source.shard_cohort);
+    EXPECT_TRUE(proposal.migrations[0].destination.shard_cohort || proposal.migrations[1].destination.shard_cohort);
+    EXPECT_EQ(authority.snapshot()->epoch, 1u); // Policy cannot publish physical readiness.
+    auto forbidden_off = config; forbidden_off.maintenance_mode = MoERebalanceRuntimeMode::Off;
+    EXPECT_THROW((void)MoEOverlayResidencyAuthority(forbidden_off), std::invalid_argument);
+}
+
+/** @test Movement telemetry counts only live original intersections and actual backends. */
+TEST(CPUJointAuthoritativeTargetContract, CohortRankAndBackendFactsHaveNoScalarSentinelAlias)
+{
+    using namespace llaminar2;
+    using namespace llaminar2::test;
+    JointPlacementOriginal original(2);
+    MoEOverlayResidencyAuthority authority(original.config());
+    const auto &map = authority.snapshot()->placementOwnerMap();
+    const auto &whole = *map.placementFor(0, 0);
+    const auto &joint = *map.placementFor(0, 1);
+    MoEOverlayTierMigration edge{.source = whole, .destination = joint};
+    EXPECT_TRUE(edge.crossesWorldRank());
+    EXPECT_TRUE(edge.crossesBackend());
+    edge.source = joint; edge.destination = whole;
+    EXPECT_TRUE(edge.crossesWorldRank());
+    EXPECT_TRUE(edge.crossesBackend());
+    // Identical fixed cuts have only same-member intersections. Full Cartesian
+    // member counts would falsely claim cross-rank bytes for this empty change.
+    edge.destination = joint;
+    EXPECT_FALSE(edge.crossesWorldRank());
+    EXPECT_FALSE(edge.crossesBackend());
+}
+
+/** @test Observe counts the same logical routes but proves immobility through the ordinary typed API. */
+TEST(CPUJointAuthoritativeTargetContract, ObserveCountsLogicalDemandWithoutPublicationPermission)
+{
+    using namespace llaminar2;
+    using namespace llaminar2::test;
+    JointPlacementOriginal original(2);
+    DecodeExpertHistogram histogram({.num_layers = 1, .num_experts = 4, .top_k = 1,
+        .window_size = 1, .placement_ownership = original.preparation->cpuJointOwnerMap()});
+    auto config = original.config();
+    config.maintenance_mode = MoERebalanceRuntimeMode::Observe;
+    config.histogram = &histogram;
+    MoEOverlayResidencyAuthority authority(config);
+    EXPECT_TRUE(authority.observesHistogram());
+    EXPECT_FALSE(authority.migrationEnabled());
+    const auto initial = authority.snapshot();
+    const auto noop = authority.proposeFromHistogram();
+    ASSERT_TRUE(noop.valid());
+    EXPECT_TRUE(noop.empty());
+    RecordingTransport no_movement(&authority);
+    EXPECT_EQ(authority.beginApply(noop, no_movement).status, MoEOverlayResidencyApplyStatus::StaticNoMovement);
+    EXPECT_TRUE(no_movement.calls.empty());
+    EXPECT_EQ(authority.snapshot(), initial);
+    EXPECT_FALSE(authority.hasEconomyCertification());
+}

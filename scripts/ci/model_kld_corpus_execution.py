@@ -375,7 +375,9 @@ class CorpusExecution:
         result = dict(passed=summary['passed'],verdict=summary['verdict'],metrics=metrics,
             numerical_summary=summary,observations_complete=True,production_path=raw['proofs'],
             native_identity=raw['native_identity'],actual_owner=raw['actual_owner'],path_records=raw['path_records'],
-            reset_byte_equal=True,driver_window_clean=True)
+            reset_byte_equal=metrics['proofs']['reset_byte_equal'],driver_window_clean=True)
+        if 'reset_pair' in metrics:
+            result['reset_pair'] = metrics['reset_pair']
         if self.absolute_pilot is not None:
             result.update(scope=summary['scope'],acceptance_scope=summary['acceptance_scope'],
                 calibrated=False,certification_eligible=False,whole_corpus_accepted=False,

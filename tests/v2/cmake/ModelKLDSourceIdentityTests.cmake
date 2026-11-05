@@ -45,6 +45,14 @@ if(TARGET v2_test_model_parity_definition)
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QFNDistributedObserverIntent)
+    add_v2_test(V2_Integration_QFNDistributedDynamicObserverIntent
+        COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+            --gtest_filter=FrozenParityHistoryReplay.CPUJointDynamicFrozenWorkersPreserveOriginalPolicy:ModelKLDQFNContract.DistributedCPUJointDynamicUsesOriginalHostAuthority:ModelKLDQFNContract.DistributedCPUJointRealCLITraversesCompleteRequestContract:ModelKLDQFNContract.DistributedCPUJointRejectsForeignPartialAndMigratingIntent
+            --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Numerics;Ownership;Replay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QFNDistributedDynamicObserverIntent)
 endif()
 if(TARGET v2_test_native_source_final_retirement)
     foreach(case IN ITEMS AuthorityStopsBeforeOriginalRetirement AuthorityFailureAbortsBeforeOriginalRetirement FollowerOnlyRunsOriginalWorkerLoop)
@@ -126,4 +134,38 @@ if(Python3_Interpreter_FOUND)
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 15
         ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1;MKL_NUM_THREADS=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QFNBoundedRowOutlierPolicy)
+endif()
+
+# Failure attribution retains every original canonical checkpoint and metadata check.
+if(TARGET v2_test_model_parity_definition)
+    add_v2_test(V2_Integration_FrozenHistorySnapshotInventoryDiagnostics
+        COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+            --gtest_filter=FrozenParityHistoryReplay.CanonicalAll48InventoryRemainsMandatory:FrozenParityHistoryReplay.SixStepObservationKeepsLimitsAndRequiresOffsetFive
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Numerics;Contract;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_FrozenHistorySnapshotInventoryDiagnostics)
+endif()
+
+# Late reset operands are original observations, never extra numerical panel rows.
+if(Python3_Interpreter_FOUND)
+    add_v2_test(V2_Integration_QFNDynamicSamePlacementResetObservation
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/../unit/scripts/test_model_kld_corpus_v2.py
+            QFNCorpusV2Test.test_dynamic_reset_uses_actual_late_same_placement_pair
+            QFNCorpusV2Test.test_static_reset_rejects_late_pair_substitution
+            QFNCorpusV2Test.test_homogeneous_gpu_dynamic_keeps_original_exact_reset_oracle
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Numerics;Ownership;Reset;Contract;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 15
+        ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1;MKL_NUM_THREADS=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QFNDynamicSamePlacementResetObservation)
+endif()
+
+if(TARGET v2_test_model_parity_definition)
+    add_v2_test(V2_Integration_QFNResetComparisonPolicy
+        COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+            --gtest_filter=ModelKLDQFNContract.ResetComparisonPolicyScopesOnlyOriginalDynamicCPUJoint
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Numerics;Ownership;Reset;Contract;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 15
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QFNResetComparisonPolicy)
 endif()

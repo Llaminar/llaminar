@@ -153,6 +153,23 @@ namespace llaminar2
         [[nodiscard]] MoEOverlayRemoteProjectionManifest forFloatingIntersection(
             const ExpertTierWeightProjectionIntersection& intersection) const;
 
+        /**
+         * @brief Authenticate one GPU arrival against its original receiving projection.
+         * @param original Exact source/destination ownership intersection admitted by the fabric.
+         * @param destination_format Original model source format retained by the destination slot.
+         * @param destination_rows Complete receiving member allocation rows, not compact wire rows.
+         * @param destination_columns Complete receiving member allocation columns, not wire columns.
+         * @return True only for the authenticated rectangle, storage geometry and source format.
+         *
+         * Compact N/K describe the overlap. The destination projection separately
+         * owns allocation geometry; a shard arrival must not be mistaken for a
+         * complete receiving matrix. No storage or representation is inferred.
+         */
+        [[nodiscard]] bool matchesGpuDestinationProjection(
+            const ExpertTierWeightProjectionIntersection &original,
+            ExpertWeightFormat destination_format,
+            int destination_rows, int destination_columns) const noexcept;
+
         /** @return Canonical non-zero digest over every field except the digest. */
         [[nodiscard]] std::uint64_t computedHash() const noexcept;
 

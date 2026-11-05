@@ -374,7 +374,23 @@ namespace llaminar2
                                                  ? "Local ExpertOverlay staging failed"
                                                  : std::move(local_error);
                         diagnostic = local_stage_error_;
+                        // Report the originating failure before entering the
+                        // vote. A peer may still own an in-flight payload and
+                        // its eventual MPI abort must not hide this cause.
+                        LOG_ERROR(
+                            "[DistributedResidencyWave] Local physical staging failed"
+                            << " world_rank=" << consensus_->worldRank()
+                            << " expected_epoch="
+                            << protocol_.identity().expected_epoch
+                            << " candidate_epoch="
+                            << protocol_.identity().candidate_epoch
+                            << " detail=" << local_stage_error_);
                     }
+
+                    // Once payload progress has started, a failed rank cannot
+                    // wait for peers that still require its matching receives.
+                    if (decision == MoEOverlayDistributedResidencyVoteDecision::Failed)
+                        consensus_->failPhysicalStage(local_stage_error_);
 
                     try
                     {

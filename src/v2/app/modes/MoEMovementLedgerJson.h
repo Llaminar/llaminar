@@ -12,6 +12,7 @@
 #pragma once
 
 #include "execution/moe/MoEOptimizationStatus.h"
+#include "execution/moe/MoEExpertShardCohort.h"
 #include "execution/moe/MoEOptimizationMovementTopology.h"
 #include <nlohmann/json.hpp>
 #include <stdexcept>
@@ -136,6 +137,34 @@ namespace llaminar2::movement_json_detail
                 {"combined", counts.combined}};
     }
 
+    /** @param endpoint Canonical completed target. @return Lossless whole or complete original cohort identity.
+     * @throws std::invalid_argument For absent/incomplete endpoint metadata. */
+    inline nlohmann::json endpointRecord(const MoEOptimizationMovementEndpoint& endpoint) {
+        if(!endpoint.valid())throw std::invalid_argument("Completed movement endpoint is unbound");
+        if(endpoint.isWhole()) {
+            const auto& whole=endpoint.whole();
+            return {{"kind","whole"},{"participant",whole.participant},{"device",whole.device.toString()},
+                {"world_rank",whole.world_rank?nlohmann::json(*whole.world_rank):nlohmann::json(nullptr)}};
+        }
+        const auto& cohort=endpoint.cohort();const auto& source=*cohort.original;
+        auto members=nlohmann::json::array();
+        for(size_t index=0;index<source.participants().size();++index) {
+            const auto& member=source.participants()[index];auto projections=nlohmann::json::array();
+            for(const auto role:{ExpertTierWeightProjection::Gate,ExpertTierWeightProjection::Up,ExpertTierWeightProjection::Down}) {
+                const auto weight_role=role==ExpertTierWeightProjection::Gate?WeightRole::MoEExpertGate:
+                    role==ExpertTierWeightProjection::Up?WeightRole::MoEExpertUp:WeightRole::MoEExpertDown;
+                const auto view=source.ownership(index).projection(weight_role);
+                const auto& format=source.source().projectionForRole(role).format;
+                projections.push_back({{"projection",unsigned(role)},{"source_rows",view.source_rows},{"source_columns",view.source_columns},
+                    {"first_row",view.first_row},{"rows",view.rows},{"first_column",view.first_column},{"columns",view.columns},
+                    {"format_kind",unsigned(format.kind)},{"codebook",format.native_vnni.codebook_id},{"is_superblock",format.native_vnni.is_superblock}});
+            }
+            members.push_back({{"participant",member.participant_id},{"world_rank",member.world_rank},
+                {"address",member.address.toString()},{"numa_node",member.address.numa_node},{"projections",std::move(projections)}});
+        }
+        return {{"kind","cpu_cohort"},{"tier",cohort.tier},{"layer",source.source().layer_idx},{"members",std::move(members)}};
+    }
+
     /**
      * @brief Project an existing durable edge without inventing transfer facts.
      * @param edge Immutable placement publication from the sole authority.
@@ -153,16 +182,8 @@ namespace llaminar2::movement_json_detail
                 {"layer", edge.layer}, {"expert", edge.expert},
                 {"cycle_index", edge.cycle_index}, {"cycle_size", edge.cycle_size},
                 {"direction", directionName(edge.direction)}, {"movement_axis", axisName(edge.axis)},
-                {"source_participant", edge.source_participant},
-                {"destination_participant", edge.destination_participant},
-                {"source_priority", edge.source_priority},
-                {"destination_priority", edge.destination_priority},
-                {"source_device", edge.source_device.toString()},
-                {"destination_device", edge.destination_device.toString()},
-                {"source_world_rank", edge.source_world_rank_known
-                    ? nlohmann::json(edge.source_world_rank) : nlohmann::json(nullptr)},
-                {"destination_world_rank", edge.destination_world_rank_known
-                    ? nlohmann::json(edge.destination_world_rank) : nlohmann::json(nullptr)},
+                {"source", endpointRecord(edge.source)}, {"destination", endpointRecord(edge.destination)},
+                {"source_priority", edge.source_priority}, {"destination_priority", edge.destination_priority},
                 {"estimated_weight_bytes", edge.estimated_weight_bytes},
                 {"activation_count", edge.activation_count},
                 {"blocking_inference", edge.blocking_inference}};
@@ -402,9 +423,9 @@ namespace llaminar2
             for (const auto &stage : ledger.stages.entries())
                 stages.push_back({{"identity", movement_json_detail::stageIdentityJson(stage.identity)},
                     {"movement", moeMovementLedgerJson(stage.value)}});
-            return {{"schema", 3}, {"scope", "model_lifetime"}, {"complete", true}, {"stages", std::move(stages)}};
+            return {{"schema", 5}, {"scope", "model_lifetime"}, {"complete", true}, {"stages", std::move(stages)}};
         }
-        nlohmann::json result = {{"schema", 2}, {"scope", "model_lifetime"},
+        nlohmann::json result = {{"schema", 4}, {"scope", "model_lifetime"},
             {"complete", true}, {"discarded_edges", ledger.discarded_edges},
             {"discarded_economy_records", ledger.discarded_economy_records},
             {"discarded_host_admission_records", ledger.discarded_host_admission_records},

@@ -69,6 +69,11 @@ public:
   for(const auto& gpu:gpus)if(gpu.type==device.type&&gpu.local_device_id==device.ordinal)return gpu.free_memory_bytes;
   throw std::logic_error("Recorded original inventory omitted endpoint");
  }
+ /** @brief Supply a recorded failed seal to the actual shutdown lifecycle, not a replacement native retirement. */
+ static void failOriginalReuseSeal(OrchestrationRunner& runner){
+  runner.model_context_reuse_seal_succeeded_=false;
+  runner.model_context_reuse_seal_error_="recorded original reusable seal failure";
+ }
  /** @brief Withdraw only a deliberately injected foreign authority after the negative invariant test. */
  static void discardForeignAuthority(OrchestrationRunner& runner){runner.model_context_reuse_authority_.reset();}
  static void failedSource(OrchestrationRunner& runner,const std::shared_ptr<NativeContextPreparation>& source,bool createdHere){
@@ -247,13 +252,14 @@ public:
  ModelContextReuseContract exported;
  unsigned* exports=nullptr;
  bool failShutdown=false;
+ bool failReuseSeal=false;
  bool failWorkerLoop=false;
  std::vector<std::string>* commands=nullptr;
  void setMPICoordinatedMode(bool value)override{if(commands)commands->push_back(value?"coordinated":"uncoordinated");}
  void runMPIWorkerLoop()override{if(commands)commands->push_back("worker_loop");if(failWorkerLoop)throw std::runtime_error("original follower loop failure");}
  void shutdownMPIWorkers()override{if(commands)commands->push_back("stop_workers");}
  void abortMPIWorkers(const std::string&)override{if(commands)commands->push_back("abort_workers");}
- void shutdown()override {if(commands)commands->push_back("retire");if(failShutdown)throw std::runtime_error("recorded terminal failure");OrchestrationRunner::shutdown();}
+ void shutdown()override {if(commands)commands->push_back("retire");if(failShutdown)throw std::runtime_error("recorded terminal failure");if(failReuseSeal)OrchestrationRunnerResolvedAdmissionTestAccess::failOriginalReuseSeal(*this);OrchestrationRunner::shutdown();}
  std::optional<ModelContextReuseContract> modelContextReuseContract()const override {++*exports;return exported;}
 };
 /** @brief Exercise the actual QFN fixture observation and teardown edges without running SetUp/model work. */
@@ -379,6 +385,43 @@ TEST(NativeSourceFinalRetirement,QFNObserverBeforeHistoryFailureRetiresSoleOrigi
 /** @test Cleanup failure cannot overwrite the primary observation diagnostic or claim successful retirement. */
 TEST(NativeSourceFinalRetirement,QFNObserverPrimaryAndTerminalFailuresRemainExplicit){replayObserverFinalOwner(true,true);}
 
+/** @test An Invalid exported seal is disposed physically, then rejected without replacing an original failure. */
+TEST(NativeSourceFinalRetirement,QFNInvalidReusableSealRetiresThenRejectsCertification){
+ for(const bool failObservation:{false,true}) {
+  Trace t;active=&t;Backend c(DeviceType::CUDA),r(DeviceType::ROCm);cuda=&c;rocm=&r;
+  const std::array devices{DeviceId::cuda(210),DeviceId::rocm(210)};
+  auto source=prepare(devices,NativePhysicalLifetime::ContextGeneration);
+  auto actual=std::make_unique<RecordedObserverRunner>();actual->failReuseSeal=true;
+  unsigned exports=0;actual->exports=&exports;
+  auto model=ModelContext::createForTesting("recorded-observer-invalid-seal.gguf",std::make_shared<MockMPIContext>(),1,true);
+  model->bindNativeContextPreparation(source);
+  auto workspace=std::make_shared<ReusableExecutionWorkspaceRegistry>();
+  auto authority=std::make_shared<ModelContextReuseAuthority>();
+  OrchestrationRunnerResolvedAdmissionTestAccess::exportedSource(*actual,source,model,workspace,authority);
+  actual->exported.context=model;actual->exported.reusable_execution_workspaces=workspace;
+  actual->exported.reuse_authority=authority;actual->exported.physical_memory_authority=source->memory();
+  model.reset();workspace.reset();authority.reset();
+  std::unique_ptr<IOrchestrationRunner> runner=std::move(actual);
+  ::testing::internal::CaptureStderr();
+  try {
+   accuracy::observeQFNWithFinalOwner(runner,[&](const ModelContextReuseContract& original){
+    EXPECT_EQ(original.context->nativeContextPreparation(),source);
+    if(failObservation)throw std::invalid_argument("original typed observation failure");
+   });
+   FAIL()<<"Invalid seal certified a successful observer lifecycle";
+  } catch(const accuracy::QFNFinalOwnerSealFailure& error) {
+   EXPECT_FALSE(failObservation);EXPECT_NE(std::string(error.what()).find("recorded original reusable seal failure"),std::string::npos);
+  } catch(const std::invalid_argument& error) {
+   EXPECT_TRUE(failObservation);EXPECT_STREQ(error.what(),"original typed observation failure");
+  } catch(const std::exception& error) {ADD_FAILURE()<<error.what();}
+  const auto diagnostic=::testing::internal::GetCapturedStderr();
+  if(failObservation)EXPECT_NE(diagnostic.find("recorded original reusable seal failure"),std::string::npos);
+  EXPECT_FALSE(runner);EXPECT_EQ(exports,1u);
+  EXPECT_EQ(t.resets,2u);EXPECT_EQ(t.destroyed,2u);EXPECT_TRUE(t.allDestroyed);
+  EXPECT_EQ(source->retireReleasedContexts(),0u);EXPECT_EQ(t.resets,2u);
+  EXPECT_NO_THROW(GPUDeviceContextPool::instance().shutdown());
+ }
+}
 /** @test Explicit completed shutdown followed by destruction cannot re-enter reuse sealing. */
 TEST(NativeSourceFinalRetirement,ActualRunnerExportedSourceShutdownThenDestructorIsIdempotent){exportedRunnerShutdown(false,false);}
 /** @test The real source observer's post-init failure retires once, preserving external model ownership. */

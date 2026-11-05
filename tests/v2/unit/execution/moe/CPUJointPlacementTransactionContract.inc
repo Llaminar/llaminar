@@ -8,6 +8,8 @@
  * obligations and are never fabricated by a successful structural validation.
  */
 
+#include "execution/moe/MoEOverlayRestorationGeometry.h"
+
 TEST(CPUJointPlacementTransactionContract, OriginalProducerCoversEveryMemberWithoutDuplicatingDemand)
 {
     using namespace llaminar2;
@@ -251,5 +253,76 @@ TEST(CPUJointPlacementTransactionContract, HistogramBodyBuildsFixedTargetCandida
         EXPECT_THROW(MoEOverlayJointPlacementCandidateTestAccess::histogram(authority, invalid), std::invalid_argument);
         EXPECT_EQ(authority.snapshot(), before);
         EXPECT_THROW(authority.proposeFromFrozenHistogramWindow(observed), std::logic_error);
+    }
+}
+
+/**
+ * @test Original complete CPU-cohort targets restore across multiple bounded waves.
+ * Source directories and ownership are genuine; recording transport certifies
+ * authority/controller lifecycle only, never physical native bank readiness.
+ */
+TEST(CPUJointPlacementTransactionContract, MultiwaveRestorationUsesCanonicalLogicalBound)
+{
+    using namespace llaminar2;
+    using namespace llaminar2::test;
+    EXPECT_THROW(preparedPlacementRestorationWaveLimit(MoEOverlayResidencySnapshot{}),std::logic_error);
+    MoEOverlayResidencyAuthority whole({.initial_plan=threeTierPlan(RoutedExpertResidencyPolicy::StaticById,RoutedExpertOwnerOrder::Ordinal),
+                                       .model_metadata=modelMetadata()});
+    EXPECT_EQ(preparedPlacementRestorationWaveLimit(*whole.snapshot()),
+        whole.snapshot()->layered_ownership.layerCount()*whole.snapshot()->layered_ownership.expertCount()+1u);
+
+    for (int width : {2,4,8}) {
+        SCOPED_TRACE(width);
+        JointPlacementOriginal original(width,1,6,2,1);
+        DecodeExpertHistogram histogram({.num_layers=2,.num_experts=6,.top_k=1,.window_size=1,
+            .placement_ownership=original.preparation->cpuJointOwnerMap()});
+        auto config=original.config();
+        config.maintenance_mode=MoERebalanceRuntimeMode::Dynamic;
+        config.histogram=&histogram;
+        config.shadow_slots_per_endpoint_layer=1;
+        config.max_concurrent_cycles=1;
+        MoEOverlayResidencyAuthority authority(config);
+        RecordingTransport transport(&authority);
+        const auto initial=authority.snapshot();
+        ASSERT_TRUE(initial->valid());
+        ASSERT_EQ(initial->placementOwnerMap().owners().size(),12u);
+        ASSERT_EQ(initial->layered_ownership.layerCount(),0u);
+        ASSERT_EQ(initial->layered_ownership.expertCount(),0u);
+        EXPECT_EQ(preparedPlacementRestorationWaveLimit(*initial),13u);
+        const auto publish=[&](const MoEOverlayResidencyTransaction &transaction) {
+            ASSERT_TRUE(transaction.valid());ASSERT_FALSE(transaction.empty());
+            ASSERT_EQ(transaction.migration_cycles.size(),1u);
+            ASSERT_EQ(authority.beginApply(transaction,transport).status,MoEOverlayResidencyApplyStatus::Started);
+            ASSERT_EQ(authority.advanceBackground().status,MoEOverlayResidencyApplyStatus::Preparing);
+            ASSERT_EQ(authority.advanceBackground().status,MoEOverlayResidencyApplyStatus::Publishing);
+            ASSERT_EQ(authority.advanceBackground().status,MoEOverlayResidencyApplyStatus::Published);
+            ASSERT_EQ(authority.advanceBackground().status,MoEOverlayResidencyApplyStatus::Idle);
+        };
+        // Three source-authored complete swaps require three reciprocal restore
+        // waves at the original one-cycle/one-shadow budget, not a wider BOM.
+        for(int pair=0;pair<3;++pair) {
+            auto placements=authority.snapshot()->placement_plan->placements;
+            std::swap(placements[0].routed_expert_tier[pair],placements[0].routed_expert_tier[pair+3]);
+            publish(MoEOverlayJointPlacementCandidateTestAccess::prepareTransaction(authority,placements));
+        }
+        ASSERT_FALSE(authority.initialPreparedPlacementPublished());
+        const auto live_ledger=authority.movementLedger();
+        const auto limit=preparedPlacementRestorationWaveLimit(*authority.snapshot());
+        std::size_t waves=0;
+        while(!authority.initialPreparedPlacementPublished()) {
+            ASSERT_LE(++waves,limit)<<"Original retained restoration lost bounded progress";
+            const auto transaction=authority.proposeInitialPreparedPlacementRestoration();
+            ASSERT_EQ(transaction.purpose,MoEOverlayResidencyTransactionPurpose::PreparedContextRestoration);
+            ASSERT_EQ(transaction.candidate->originalProjectionPreparation(),original.preparation);
+            publish(transaction);
+        }
+        EXPECT_EQ(waves,3u);
+        EXPECT_GT(waves,initial->layered_ownership.layerCount()*initial->layered_ownership.expertCount()+1u)
+            <<"The original whole-only bound must reject this genuine joint sequence";
+        EXPECT_EQ(authority.snapshot()->placementOwnerMap().owners(),initial->placementOwnerMap().owners());
+        EXPECT_EQ(authority.snapshot()->originalProjectionPreparation(),original.preparation);
+        EXPECT_EQ(authority.activeTicketCount(),0u);EXPECT_EQ(authority.pendingRetirementCount(),0u);
+        EXPECT_EQ(authority.movementLedger().edges,live_ledger.edges)
+            <<"Reuse restoration is not newly profitable policy movement";
     }
 }

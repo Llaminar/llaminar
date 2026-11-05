@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -293,6 +294,15 @@ namespace llaminar2
         /** @return The single canonical directed complete-target/layer planning list. */
         [[nodiscard]] const std::vector<MoEOverlayMigrationTargetCoordinate> &
         requiredTargetCoordinates() const noexcept { return required_target_coordinates_; }
+
+        /**
+         * @brief Describe the exact original prepared-wave geometry for the typed ledger.
+         * @param manifests Complete source-authenticated layer manifests from the original loader.
+         * @return One declaration per canonical coordinate, without fabricated operation quotes or readiness.
+         * @throws std::invalid_argument For missing, duplicate or foreign layer geometry.
+         */
+        [[nodiscard]] std::vector<MoEOverlayRequiredTargetMigrationMeasurement> requiredTargetMeasurements(
+            std::span<const MoEOverlayLayerWeightManifest> manifests) const;
 
         /**
          * @brief Project the canonical list for existing whole-owner evidence consumers.

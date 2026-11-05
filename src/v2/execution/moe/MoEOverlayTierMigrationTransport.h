@@ -139,6 +139,7 @@ namespace llaminar2
         std::size_t migration = 0;
         std::size_t piece = 0;
         bool requires_local_observation = false;
+        int observer_world_rank = -1; ///< Original fabric rank retained independently of optional event timing.
     };
 
     /**

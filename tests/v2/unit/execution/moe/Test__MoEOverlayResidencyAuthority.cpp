@@ -47,6 +47,16 @@ namespace llaminar2::test
      */
     struct MoEOverlayResidencyAuthorityConcurrencyPeer
     {
+        /** @return Actual private descendant primitive, without replacing any admission state. */
+        static MoEOverlayResidencyAuthority::TicketLease borrowSequence(
+            MoEOverlayResidencyAuthority& authority,
+            const MoEOverlayResidencyAuthority::TicketLease& parent)
+        { return authority.borrowGraphSequenceSnapshot(parent); }
+
+        /** @return Weak observation of the actual published lease state, never a new owner. */
+        static std::weak_ptr<const void> publishedEpochLifetime(const MoEOverlayResidencyAuthority& authority)
+        { return authority.published_epoch_.load(std::memory_order_acquire); }
+
         /** @return A lease holding the same mutex as background proposal scoring. */
         static std::unique_lock<std::mutex> holdProposalLock(
             MoEOverlayResidencyAuthority &authority)
@@ -5010,6 +5020,89 @@ namespace llaminar2::test
         auto successor_sequence = authority.tryAcquireGraphSequenceSnapshot();
         ASSERT_TRUE(successor_sequence.has_value());
         EXPECT_EQ(successor_sequence->epoch(), 2u);
+    }
+
+    /** @test Descendants remain admitted through a pending publisher; every original reader must retire. */
+    TEST(Test__MoEOverlayResidencyAuthority, GraphSequenceDescendantsDrainReservedPublication)
+    {
+        for(int replay=0;replay<20;++replay) {
+            auto histogram=histogramWithCounts({90,20,80,10,100,70});
+            MoEOverlayResidencyAuthority authority({
+                .initial_plan=threeTierPlan(RoutedExpertResidencyPolicy::RoutedTierRebalanced,RoutedExpertOwnerOrder::Ordinal),
+                .model_metadata=modelMetadata(),.maintenance_mode=MoERebalanceRuntimeMode::Dynamic,
+                .histogram=histogram.get(),.perf_device="sequence-descendant"});
+            RecordingTransport transport(&authority);
+            auto transaction=authority.proposeFromHistogram();
+            // Initial snapshot metadata intentionally remains model-owned. Observe
+            // reclamation of the actual published reader/counter state instead.
+            const auto old=MoEOverlayResidencyAuthorityConcurrencyPeer::publishedEpochLifetime(authority);
+            auto parent=authority.tryAcquireGraphSequenceSnapshot();ASSERT_TRUE(parent);
+            auto dispatch=authority.tryAcquireTicketSnapshot();ASSERT_TRUE(dispatch);
+            auto early=MoEOverlayResidencyAuthorityConcurrencyPeer::borrowSequence(authority,*parent);
+            ASSERT_EQ(authority.beginApply(transaction,transport).status,MoEOverlayResidencyApplyStatus::Started);
+            transaction={}; // The proposal must not itself retain the old snapshot oracle.
+            ASSERT_EQ(authority.advanceBackground().status,MoEOverlayResidencyApplyStatus::Preparing);
+            ASSERT_EQ(authority.advanceBackground().status,MoEOverlayResidencyApplyStatus::AwaitingGraphSequenceBoundary);
+            // This actual call would deadlock if it reentered current admission.
+            auto child=MoEOverlayResidencyAuthorityConcurrencyPeer::borrowSequence(authority,*parent);
+            EXPECT_EQ(child.epoch(),parent->epoch());EXPECT_EQ(&*child,&**parent);
+            EXPECT_EQ(child.purpose(),MoEOverlayResidencyAuthority::TicketLeasePurpose::InferenceGraphSequence);
+            EXPECT_EQ(authority.activeTicketCount(),4u);
+            bool reached_injected_failure=false;
+            try {
+                auto partial=MoEOverlayResidencyAuthorityConcurrencyPeer::borrowSequence(authority,child);
+                EXPECT_EQ(authority.activeTicketCount(),5u);
+                reached_injected_failure=true;
+                throw std::runtime_error("original child failure");
+            } catch(const std::runtime_error& failure) {
+                EXPECT_TRUE(reached_injected_failure);
+                EXPECT_STREQ(failure.what(),"original child failure");
+            }
+            EXPECT_TRUE(reached_injected_failure);
+            EXPECT_EQ(authority.activeTicketCount(),4u);
+            parent.reset();early={};
+            EXPECT_EQ(authority.activeTicketCount(),2u);
+            EXPECT_EQ(authority.advanceBackground().status,MoEOverlayResidencyApplyStatus::AwaitingGraphSequenceBoundary);
+            EXPECT_EQ(transport.calls,(std::vector<std::string>{"stage","prepare"}));
+            child={};
+            ASSERT_EQ(authority.advanceBackground().status,MoEOverlayResidencyApplyStatus::Publishing);
+            ASSERT_EQ(authority.advanceBackground().status,MoEOverlayResidencyApplyStatus::Published);
+            EXPECT_EQ(authority.snapshot()->epoch,2u);EXPECT_FALSE(old.expired());
+            EXPECT_EQ(authority.pendingRetirementCount(),1u);
+            EXPECT_EQ(authority.stats().old_epoch_retirements,0u);
+            dispatch.reset();
+            EXPECT_EQ(authority.advanceBackground().status,MoEOverlayResidencyApplyStatus::Idle);
+            EXPECT_EQ(authority.activeTicketCount(),0u);
+            EXPECT_EQ(authority.pendingRetirementCount(),0u);
+            EXPECT_EQ(authority.stats().old_epoch_retirements,1u);
+            EXPECT_TRUE(old.expired());
+            auto next=authority.tryAcquireGraphSequenceSnapshot();ASSERT_TRUE(next);EXPECT_EQ(next->epoch(),2u);
+        }
+    }
+
+    /** @test Empty, moved, foreign and wrong-purpose parents cannot mint a reader or alter publication. */
+    TEST(Test__MoEOverlayResidencyAuthority, GraphSequenceDescendantsRejectInvalidParents)
+    {
+        const auto config=[] {return MoEOverlayResidencyAuthority::Config{
+            .initial_plan=threeTierPlan(RoutedExpertResidencyPolicy::RoutedTierRebalanced,RoutedExpertOwnerOrder::Ordinal),
+            .model_metadata=modelMetadata()};};
+        MoEOverlayResidencyAuthority original(config()),foreign(config());
+        MoEOverlayResidencyAuthority::TicketLease empty;
+        EXPECT_THROW(MoEOverlayResidencyAuthorityConcurrencyPeer::borrowSequence(original,empty),std::invalid_argument);
+        auto dispatch=original.tryAcquireTicketSnapshot();ASSERT_TRUE(dispatch);
+        EXPECT_THROW(MoEOverlayResidencyAuthorityConcurrencyPeer::borrowSequence(original,*dispatch),std::invalid_argument);
+        auto exact=original.tryAcquireTicketSnapshot(1);ASSERT_TRUE(exact);
+        EXPECT_THROW(MoEOverlayResidencyAuthorityConcurrencyPeer::borrowSequence(original,*exact),std::invalid_argument);
+        auto parent=original.tryAcquireGraphSequenceSnapshot();ASSERT_TRUE(parent);
+        auto moved=std::move(*parent);
+        EXPECT_THROW(MoEOverlayResidencyAuthorityConcurrencyPeer::borrowSequence(original,*parent),std::invalid_argument);
+        EXPECT_THROW(MoEOverlayResidencyAuthorityConcurrencyPeer::borrowSequence(foreign,moved),std::invalid_argument);
+        EXPECT_EQ(original.activeTicketCount(),3u);EXPECT_EQ(foreign.activeTicketCount(),0u);
+        auto child=MoEOverlayResidencyAuthorityConcurrencyPeer::borrowSequence(original,moved);
+        EXPECT_EQ(original.activeTicketCount(),4u);moved={};child={};dispatch.reset();exact.reset();
+        EXPECT_EQ(original.activeTicketCount(),0u);
+        EXPECT_THROW(MoEOverlayResidencyAuthorityConcurrencyPeer::borrowSequence(original,child),std::invalid_argument);
+        EXPECT_EQ(original.snapshot()->epoch,1u);EXPECT_EQ(foreign.snapshot()->epoch,1u);
     }
 
     /**

@@ -28,10 +28,20 @@ inline std::string qfnObserverFailureText(const std::exception_ptr& failure) {
     try {std::rethrow_exception(failure);} catch(const std::exception& error) {return error.what();}
     catch(...) {return "non-standard QFN observer failure";}
 }
+/** @brief Reusable sealing failed although original final physical disposal completed. */
+class QFNFinalOwnerSealFailure final : public std::runtime_error
+{
+public:
+    /** @brief Preserve the failed reuse outcome after disposal.
+     * @param diagnostic Original typed Invalid authority diagnostic retained before disposal. */
+    explicit QFNFinalOwnerSealFailure(const std::string &diagnostic)
+        : std::runtime_error("QFN final physical retirement completed after reusable seal failure: " + diagnostic) {}
+};
 /**
  * @brief Retire an observer's existing original runner and sole exported model in order.
  * @param runner Actual runner; shutdown and destruction precede final model retirement.
  * @param owner Same original export borrowed by observations; consumed after physical retirement.
+ * @throws QFNFinalOwnerSealFailure After complete disposal if the exported reusable seal failed.
  * @throws std::exception When either original retirement boundary fails.
  */
 inline void retireQFNFinalOwner(std::unique_ptr<IOrchestrationRunner>& runner,
@@ -41,12 +51,19 @@ inline void retireQFNFinalOwner(std::unique_ptr<IOrchestrationRunner>& runner,
         if(runner->isInitialized())throw std::runtime_error("QFN observer runner remains initialized after shutdown");
         runner.reset();
     }
+    std::string failed_seal;
     if(owner && owner->context){
-        if(owner->reuse_authority && owner->reuse_authority->state()==ModelContextReuseAuthority::State::Invalid)
+        if(owner->reuse_authority && owner->reuse_authority->state()==ModelContextReuseAuthority::State::Invalid) {
+            // Failure cleanup is mandatory even when the observation succeeded.
+            // Keep the original diagnostic, complete actual source/PMA disposal,
+            // then reject lifecycle certification rather than certify clean reuse.
+            failed_seal=owner->reuse_authority->diagnostic();
             (void)discardExclusiveInvalidModelContextReuseContract(*owner);
+        }
         else (void)retireExclusiveModelContextReuseContract(*owner);
     }
     owner.reset();
+    if(!failed_seal.empty())throw QFNFinalOwnerSealFailure(failed_seal);
 }
 /**
  * @brief Observe under one exported owner, then retire runner and original final model on every exit.
@@ -79,6 +96,14 @@ void observeQFNFinalOwner(std::unique_ptr<IOrchestrationRunner>& runner,Observe&
     }
     try {
         retireQFNFinalOwner(runner,owner);
+    }catch(const QFNFinalOwnerSealFailure &failure) {
+        if(primary) {
+            // The invalid model is already physically gone. Keep the original
+            // inference exception's type/precedence while exposing both errors.
+            std::cerr << failure.what() << '\n';
+            std::rethrow_exception(primary);
+        }
+        throw;
     }catch(...) {
         if(primary)throw std::runtime_error(qfnObserverFailureText(primary)+"; QFN final retirement failed: "+qfnObserverFailureText(std::current_exception()));
         throw;

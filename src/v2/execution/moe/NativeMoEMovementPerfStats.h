@@ -42,17 +42,17 @@ namespace llaminar2
             !publication.valid() || publication.controller || publication.command_count != edges.size() || edges.size() % 2 != 0)
             throw std::invalid_argument("Native movement telemetry requires one complete physical wave");
         for (const auto &edge : edges)
-            if (!edge.valid() || edge.layer < first_model_layer ||
+            if (!edge.valid() || !edge.source.isWhole() || !edge.destination.isWhole() || edge.layer < first_model_layer ||
                 static_cast<std::uint32_t>(edge.layer - first_model_layer) >= layer_count ||
                 edge.authority != MoEOptimizationAuthority::Device ||
                 edge.transaction != publication.transaction || edge.candidate_epoch != publication.candidate_epoch ||
                 edge.direction != MoEOptimizationMovementDirection::SamePriority ||
                 edge.axis != MoEOptimizationMovementAxis::ParticipantPlacement ||
                 edge.source_priority != edge.destination_priority || edge.blocking_inference ||
-                edge.estimated_weight_bytes == 0 || !edge.source_device.is_gpu() || !edge.destination_device.is_gpu() ||
-                edge.source_device.type != edge.destination_device.type ||
-                (edge.source_world_rank_known && edge.source_world_rank < 0) ||
-                (edge.destination_world_rank_known && edge.destination_world_rank < 0))
+                edge.estimated_weight_bytes == 0 || !edge.source.whole().device.is_gpu() || !edge.destination.whole().device.is_gpu() ||
+                edge.source.whole().device.type != edge.destination.whole().device.type ||
+                (edge.source.whole().world_rank.has_value() && edge.source.whole().world_rank.value_or(-1) < 0) ||
+                (edge.destination.whole().world_rank.has_value() && edge.destination.whole().world_rank.value_or(-1) < 0))
                 throw std::invalid_argument("Native movement telemetry edge disagrees with its completed wave");
         if (!PerfStatsCollector::isDomainEnabled("moe_overlay_controller"))
             return;
@@ -73,15 +73,15 @@ namespace llaminar2
                 {edge.transaction, edge.candidate_epoch,
                  static_cast<std::uint64_t>(edge.layer), static_cast<std::uint64_t>(edge.expert),
                  edge.cycle_index, edge.cycle_size, 0, 1,
-                 static_cast<std::uint64_t>(edge.source_participant), static_cast<std::uint64_t>(edge.destination_participant),
+                 static_cast<std::uint64_t>(edge.source.whole().participant), static_cast<std::uint64_t>(edge.destination.whole().participant),
                  static_cast<std::uint64_t>(static_cast<std::int64_t>(edge.source_priority)),
                  static_cast<std::uint64_t>(static_cast<std::int64_t>(edge.destination_priority)),
-                 edge.source_device.is_cuda() ? 1u : 2u, static_cast<std::uint64_t>(edge.source_device.ordinal),
-                 edge.destination_device.is_cuda() ? 1u : 2u, static_cast<std::uint64_t>(edge.destination_device.ordinal),
-                 edge.source_world_rank_known ? 1u : 0u,
-                 edge.source_world_rank_known ? static_cast<std::uint64_t>(edge.source_world_rank) : 0u,
-                 edge.destination_world_rank_known ? 1u : 0u,
-                 edge.destination_world_rank_known ? static_cast<std::uint64_t>(edge.destination_world_rank) : 0u,
+                 edge.source.whole().device.is_cuda() ? 1u : 2u, static_cast<std::uint64_t>(edge.source.whole().device.ordinal),
+                 edge.destination.whole().device.is_cuda() ? 1u : 2u, static_cast<std::uint64_t>(edge.destination.whole().device.ordinal),
+                 edge.source.whole().world_rank.has_value() ? 1u : 0u,
+                 edge.source.whole().world_rank.has_value() ? static_cast<std::uint64_t>(edge.source.whole().world_rank.value_or(-1)) : 0u,
+                 edge.destination.whole().world_rank.has_value() ? 1u : 0u,
+                 edge.destination.whole().world_rank.has_value() ? static_cast<std::uint64_t>(edge.destination.whole().world_rank.value_or(-1)) : 0u,
                  edge.estimated_weight_bytes, edge.activation_count, 0}, "maintenance", device, tags);
     }
 }

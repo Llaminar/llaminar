@@ -402,8 +402,6 @@ namespace llaminar2
                 joint=&domain;ordinal=static_cast<int>(d);
             }
             if(!joint)return std::nullopt;
-            if(input.rank_plan->runtime.moe_rebalance.mode!=MoERebalanceRuntimeMode::Off)
-                throw std::invalid_argument("CPU joint fixed geometry supports Static only; cohort movement is not implemented");
             if(!input.cluster_inventory || input.original_expert_manifest.empty())
                 throw std::invalid_argument("CPU joint fixed geometry requires original source manifest and cluster membership before quotas");
             if(joint->name==plan.continuation_domain)
@@ -1270,14 +1268,34 @@ namespace llaminar2
                     // input row through the same sparse-participant requirement factory.
                     auto singleton = profile;
                     singleton.expert_used_count = 1;
-                    const auto invocation_bytes = WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(singleton,
-                        {.device = device, .device_compute_units = inventory.cpuWorkerThreads(),
-                         .cpu_execution = inventory.cpu_execution,
-                         .resident_graph_rows = MoEOverlayCPUServiceMeasurement::kMaximumRows,
-                         .first_layer = family.first_model_layer,
-                         .last_layer = family.first_model_layer + family.routedLayerCapacity() - 1});
-                    prepared_service_bytes = MoEOverlayCPUServiceMeasurement::allocationBytes(
-                        {.d_model = profile.d_model, .intermediate = profile.expert_feed_forward_length}, invocation_bytes);
+                    const WorkspaceMemoryGeometry probe_geometry{
+                        .device = device, .device_compute_units = inventory.cpuWorkerThreads(),
+                        .cpu_execution = inventory.cpu_execution,
+                        .resident_graph_rows = MoEOverlayCPUServiceMeasurement::kMaximumRows,
+                        .first_layer = family.first_model_layer,
+                        .last_layer = family.first_model_layer + family.routedLayerCapacity() - 1};
+                    if (prepared.cpu_joint && prepared.cpu_joint->member)
+                    {
+                        const auto &joint = *prepared.cpu_joint;
+                        const auto member = *joint.member;
+                        const auto invocation_bytes = WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(
+                            singleton, probe_geometry, joint.cohort->ownership(member));
+                        // One original domain runs these phases serially. Admit
+                        // its actual fragment, packed rows, rooted fold and start
+                        // release roots; no whole-expert or member-price alias.
+                        for (const auto phase : {ExpertHistogramSource::DecodeToken,
+                                                ExpertHistogramSource::PrefillChunk,
+                                                ExpertHistogramSource::GroupedVerifier})
+                            prepared_service_bytes = std::max(prepared_service_bytes,
+                                MoEOverlayCPUServiceMeasurement::cpuJointAllocationBytes(
+                                    joint.cohort, member, phase, invocation_bytes));
+                    }
+                    else
+                    {
+                        const auto invocation_bytes = WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(singleton, probe_geometry);
+                        prepared_service_bytes = MoEOverlayCPUServiceMeasurement::allocationBytes(
+                            {.d_model = profile.d_model, .intermediate = profile.expert_feed_forward_length}, invocation_bytes);
+                    }
                 }
                 if (device == DeviceId::cpu())
                     prepared_service_bytes = std::max(prepared_service_bytes, gpu_service_host_bytes);

@@ -9,6 +9,9 @@
  * Legacy diagnostics accept one CUDA or ROCm device. The versioned QFN request
  * additionally authenticates supported CPU, CPU-tail and LocalTP runner owners.
  * Both use the production host-logit consumer without arithmetic interposition.
+ * Dynamic CPU joint request reset compares a distinct late baseline and replay under one
+ * original checked placement scope; Static retains its early/late byte oracle.
+ * The ordinary numerical histories and actual movement remain unchanged.
  * Frozen workload and artifact paths are explicit tool arguments, independent
  * of a workspace mount. Both backends use the same observer and phase schedule.
  * A lexical entry owner retires native workers before vendor exit callbacks;
@@ -505,13 +508,43 @@ int runQFNObserver(const json &workload, const std::filesystem::path &output,
             expected_publications+=history.at("decode_rows").get<std::uint64_t>();
         }
         const auto &reset=request.corpus().at("reset_control");
-        json original, replay;
+        json baseline, replay;
         for(const auto &history:request.corpus().at("histories"))
             if(history.at("id")==reset.at("history_id")) { replay=history; break; }
-        for(const auto &value:result["cases"])
-            if(value.at("history_id")==reset.at("history_id")) { original=value; break; }
+        const json original_history = replay;
         replay["id"]=reset.at("replay_id");
-        result["reset_case"]=observeQFNHistory(runner,replay,output);
+        if (accuracy::qfnResetComparisonPolicy(runner.config()) ==
+            accuracy::QFNResetComparisonPolicy::SamePlacementLatePair)
+        {
+            // The ordinary scored histories stay untouched. A moving placement
+            // may use different floating arithmetic than its early occurrence;
+            // prove reset with two new complete requests under the same original
+            // checked parent. Each observe call retains its public clearCache.
+            const auto baseline_output = output / "reset-baseline";
+            requireQFN(std::filesystem::create_directory(baseline_output),
+                       "QFN reset baseline requires a fresh independent artifact owner");
+            const auto scope = runner.withMoEOverlayInferencePlacementScope([&] {
+                baseline = observeQFNHistory(runner, original_history, baseline_output);
+                result["reset_case"] = observeQFNHistory(runner, replay, output);
+            });
+            requireQFN(scope.placement_epoch > 0 && scope.next_sequence_id > scope.first_sequence_id &&
+                       scope.next_sequence_id - scope.first_sequence_id >= 2,
+                       "QFN reset pair did not complete both requests under its original placement scope");
+            result["reset_pair"] = {
+                {"schema", "llaminar.qfn-reset-pair.v1"},
+                {"history_id", reset.at("history_id")}, {"baseline", baseline},
+                {"placement_scope", {{"placement_epoch", scope.placement_epoch},
+                    {"first_sequence_id", scope.first_sequence_id},
+                    {"next_sequence_id", scope.next_sequence_id}}}};
+            expected_publications += original_history.at("decode_rows").get<std::uint64_t>();
+        }
+        else
+        {
+            // Static retains the original early/late exact-byte contract.
+            for(const auto &value:result["cases"])
+                if(value.at("history_id")==reset.at("history_id")) { baseline=value; break; }
+            result["reset_case"]=observeQFNHistory(runner,replay,output);
+        }
         expected_publications+=replay.at("decode_rows").get<std::uint64_t>();
         if(local_tp)
         {
@@ -521,7 +554,7 @@ int runQFNObserver(const json &workload, const std::filesystem::path &output,
             result["tp_host_publications"]={{"before",publication_before},{"after",after},
                 {"observed_decodes_including_reset",expected_publications}};
         }
-        requireQFN(qfnResetBytesEqual(original.at("logits_file").get<std::string>(),
+        requireQFN(qfnResetBytesEqual(baseline.at("logits_file").get<std::string>(),
                     result["reset_case"].at("logits_file").get<std::string>()),"QFN real request reset changed original logits bytes");
         result["path_records"]=requireQFNPath(runner,result["actual_owner"]);
         // Recheck original admitted source/policies before terminal teardown.

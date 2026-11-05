@@ -8,6 +8,7 @@
  * remain offset-aware in calibration, service evidence and reusable bank seals.
  */
 #include "MoEOverlayCPUHostMaintenance.h"
+#include "MoEOverlayRestorationGeometry.h"
 #include "MoEOverlayCPUServiceMeasurement.h"
 #include "MoEOverlayEconomyCalibrationController.h"
 #include "MoEOverlayEconomyCertificationController.h"
@@ -166,15 +167,11 @@ namespace llaminar2
         };
         idle();
         const auto snapshot = config_.authority->snapshot();
-        // Every nonempty restoration wave fixes at least one original logical
-        // placement. Fragment member count is not an additional progress unit.
-        const auto layers = snapshot->layerCount();
-        const auto experts = snapshot->expertCount();
-        if (layers <= 0 || experts <= 0 ||
-            std::size_t(layers) > (std::numeric_limits<std::size_t>::max() - 1u) /
-                                      std::size_t(experts))
-            throw std::overflow_error("CPU restoration progress bound has invalid original geometry");
-        const auto limit = std::size_t(layers) * std::size_t(experts) + 1u;
+        // Same canonical logical bound as rank-wide retained-context sealing.
+        // Fragment width cannot inflate it or erase the joint ownership arm.
+        if (!snapshot)
+            throw std::logic_error("CPU restoration progress bound lost its original snapshot");
+        const auto limit = preparedPlacementRestorationWaveLimit(*snapshot);
         std::size_t waves = 0;
         while (!config_.authority->initialPreparedPlacementPublished())
         {

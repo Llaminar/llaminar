@@ -1587,6 +1587,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/MoEOverlayLocalCapacityPlanner.cpp
     execution/moe/MoEOverlayHostDemandMemoryPlan.cpp
     execution/moe/MoEExpertOverlayAuthorityPlan.cpp
+    execution/moe/MoEOptimizationMovementEndpoint.cpp
     execution/moe/MoEOptimizationMovementTopology.cpp
     execution/moe/MoEOptimizationPipeline.cpp
     execution/moe/MoEExpertOwnerMap.cpp

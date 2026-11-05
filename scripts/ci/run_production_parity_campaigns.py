@@ -60,6 +60,7 @@ a partial ambient locator or an LM-only reference cannot select another history.
 from __future__ import annotations
 
 from production_artifacts import artifact_identity_path
+from generation_movement_ledger import validate_cohort_parity_documents
 
 import argparse
 import csv
@@ -340,6 +341,7 @@ class CampaignCell:
     command: tuple[str, ...] = ()
     environment: tuple[str, ...] = ()
     working_directory: str = ""
+    cohort_movement_cases: tuple[str, ...] = ()  # Source-owned typed qualification obligations.
 
     @property
     def test_type(self) -> str:
@@ -2226,6 +2228,7 @@ def _single_exact_cell(
         command=_exact_registered_command(cell, gtest_case),
         environment=cell.environment,
         working_directory=cell.working_directory,
+        cohort_movement_cases=tuple(case for case in cell.cohort_movement_cases if case == gtest_case),
     )
 
 
@@ -2713,6 +2716,39 @@ def prior_evidence_campaign_counts(
     return counts
 
 
+def bind_canonical_movement_obligations(cells: list[CampaignCell], parameters: dict[str, dict]) -> list[CampaignCell]:
+    """Retain only obligations declared by the original typed metadata, without another axis table."""
+    result=[]
+    for cell in cells:
+        required=[]
+        for case in cell.gtest_cases:
+            record=parameters.get(case)
+            if not isinstance(record,dict) or record.get("model_parity_schema") != 1 or not isinstance(record.get("runtime"),dict):
+                raise ValueError(f"canonical movement obligation lost original typed metadata: {case}")
+            runtime=record["runtime"]
+            if "cohort_publication_inference" in runtime:
+                if runtime["cohort_publication_inference"] is not True or runtime.get("movement_evidence") != "required":
+                    raise ValueError(f"incompatible canonical cohort movement obligation: {case}")
+                if _preflight_mpi_ranks(cell.name,list(cell.command)) is None:
+                    raise ValueError(f"cohort movement requires its original registered MPI population: {case}")
+                required.append(case)
+        result.append(replace(cell,cohort_movement_cases=tuple(required)))
+    return result
+
+
+def validate_cpu_joint_movement_artifacts(directory: Path, gtest_case: str, started_ns: int, *, world_size: int) -> None:
+    """Validate the canonical CPU-joint Dynamic family's complete rank evidence through the shared ledger audit."""
+    # Population is the already registered native process contract, never a
+    # document claim or a parsed topology/test name.
+    documents = []
+    for rank in range(world_size):
+        path = directory / f"cohort_movement_rank_{rank}.json"
+        if not path.is_file() or path.is_symlink() or path.stat().st_mtime_ns < started_ns:
+            raise ValueError(f"missing, foreign or stale original cohort movement evidence: {path.name}")
+        documents.append(json.loads(path.read_text(encoding="utf-8")))
+    validate_cohort_parity_documents(documents, case=gtest_case, world_size=world_size)
+
+
 def validate_campaign_artifacts(
     cell: CampaignCell,
     campaign_started_wall_time_ns: int,
@@ -2744,6 +2780,14 @@ def validate_campaign_artifacts(
             errors.append(str(error))
             continue
         directories.append(str(directory))
+
+        if gtest_case in cell.cohort_movement_cases:
+            try:
+                world_size=_preflight_mpi_ranks(cell.name,list(cell.command))
+                if world_size is None: raise ValueError("canonical cohort lost its original MPI population")
+                validate_cpu_joint_movement_artifacts(directory,gtest_case,campaign_started_wall_time_ns,world_size=world_size)
+            except (OSError,ValueError,TypeError,KeyError) as error:
+                errors.append(f"{gtest_case}: Dynamic cohort movement proof: {error}")
 
         required_headers = _required_csv_headers_for_case(gtest_case)
         for filename, expected_header in required_headers.items():
@@ -5474,6 +5518,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         if args.exact_cell is not None:
             selected = [select_focused_exact_cell(selected, args.exact_cell)]
+        # Reuse the same model-free typed metadata reader as inventory/E2E;
+        # no model samefile/shard projection or isolated runtime is entered.
+        from model_parity_inventory import discover_parameters
+        parameters=discover_parameters(discover_campaigns(args.build_dir),selected)
+        selected=bind_canonical_movement_obligations(selected,parameters)
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
         print(f"production parity campaign error: {error}", file=sys.stderr)
         return 2

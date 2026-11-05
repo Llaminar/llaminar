@@ -744,6 +744,21 @@ namespace llaminar2
             MoEOverlayInferenceWorkloadIdentity workload,
             std::string *error = nullptr);
 
+        /**
+         * @brief Execute finite complete commands under one original host placement.
+         * @param body Original synchronous caller; executes outside the coordinator lock.
+         * @return Exact parent and fully retired original descendant sequence interval.
+         * @throws std::logic_error For unsupported, nested, active or incomplete scope.
+         *
+         * Ordinary current admission remains unchanged outside this scope. Its
+         * checked descendants may enter while publication is reserved because
+         * their live parent already owns that original inference boundary.
+         * A terminal callback exception releases the parent and is rethrown;
+         * missing native completion uses original abort and remains fatal.
+         */
+        MoEOverlayInferencePlacementScopeObservation withMoEOverlayInferencePlacementScope(
+            const std::function<void()> &body);
+
         /** @brief Open one monotonic command on every target publisher. */
         bool beginCommand(
             const MoEOverlayInferenceCommandIdentity &command,
@@ -1158,6 +1173,12 @@ namespace llaminar2
         bool declared_prefill_probe_released_ = false;
         bool declared_prefill_terminal_published_ = false;
         std::string failure_;
+        /**
+         * Original host parent; survives command/request reset. Declared after
+         * config_ so its lease retires before the original shared authority.
+         */
+        std::optional<MoEOverlayResidencyAuthority::TicketLease> placement_scope_parent_;
+
     };
 
     /**
