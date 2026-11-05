@@ -402,7 +402,8 @@ namespace llaminar2::test
          * quantizer writes it, so all-format sweeps also cover the scale-+0
          * preparation of blocks whose exponent has no FP16 form.
          *
-         * @param shape Tensor dimensions [rows, cols]; cols must be a multiple of 32.
+         * @param shape Tensor dimensions [rows, cols]; a partial final block per row is
+         *        stored row-padded, like every other block format.
          * @param seed Random seed.
          */
         static std::unique_ptr<MXFP4Tensor> createMXFP4Random(
@@ -411,7 +412,8 @@ namespace llaminar2::test
         {
             const size_t rows = shape[0];
             const size_t cols = shape[1];
-            const size_t total_blocks = rows * (cols / MXFP4Block::BLOCK_SIZE);
+            const size_t total_blocks =
+                rows * ((cols + MXFP4Block::BLOCK_SIZE - 1) / MXFP4Block::BLOCK_SIZE);
             std::mt19937 rng(seed);
             std::normal_distribution<float> dist(0.0f, 0.1f);
             std::vector<uint8_t> raw_data(total_blocks * sizeof(MXFP4Block));
