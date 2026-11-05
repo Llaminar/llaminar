@@ -41,11 +41,7 @@ namespace llaminar2
     {
         constexpr auto kWeightOwner = PhysicalMemoryOwner::PrimaryModelWeights;
         using llaminar::v2::kernels::KernelFactory;
-#if LLAMINAR_COMPILED_WITH_AVX512
-        constexpr ISALevel kCompiledISA = ISALevel::AVX512;
-#else
-        constexpr ISALevel kCompiledISA = ISALevel::AVX2;
-#endif
+        constexpr ISALevel kCompiledISA = compiledCPUISALevel();
 
         /** @brief Reject failures without assigning a fabricated service rate. */
         void require(bool condition, const char *detail)

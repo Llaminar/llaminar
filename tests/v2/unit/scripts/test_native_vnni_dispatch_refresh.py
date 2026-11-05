@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Device-free regressions for the NativeVNNI dispatch refresh wrapper.
+"""@file test_native_vnni_dispatch_refresh.py
+@brief Device-free regressions for the NativeVNNI dispatch refresh wrapper.
 
 Subprocess fixtures own their binaries, output and Git provenance. These tests
 also run from installed source archives: an enclosing developer checkout must
@@ -3808,6 +3809,7 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertIn("--require-inventory-m-values 2,3,4", stdout)
 
     def test_cpu_generated_verifier_policy_is_checked_in_and_consumed(self) -> None:
+        """@brief Authenticate policy use and request-grid geometry at their current source owners."""
         source_path = (
             REPO_ROOT
             / "src"
@@ -3821,6 +3823,8 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
 
         self.assertTrue(generated_path.is_file(), "CPU verifier generated policy include is missing")
         source = source_path.read_text(encoding="utf-8")
+        self.assertIn('#include "CPUNativeVNNIExecutionContract.h"', source)
+        source += "\n" + (source_path.parent / "CPUNativeVNNIExecutionContract.h").read_text(encoding="utf-8")
         generated_source = generated_path.read_text(encoding="utf-8")
         self.assertIn("CPUNativeVNNIVerifierRowsPolicyGenerated.inc", source)
         self.assertIn("selectCPUNativeVNNIVerifierRowsGeneratedPolicy", source)
@@ -3865,9 +3869,10 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         # ceil(M/4), now expressed without M+3 overflow by the shared row grid.
         # Explicit request work adds only request-aligned holes/suffixes; it must
         # retain four-row reuse in one workshare rather than serialize requests.
-        grid_begin = source.index("class CPUProjectionRowGrid final")
-        grid_end = source.index("int physical_;", grid_begin)
-        grid = re.sub(r"\s+", "", source[grid_begin:grid_end])
+        grid_source = (REPO_ROOT / "src/v2/kernels/cpu/gemm/CPUProjectionRowGrid.h").read_text(encoding="utf-8")
+        grid_begin = grid_source.index("class CPUProjectionRowGrid final")
+        grid_end = grid_source.index("int physical_;", grid_begin)
+        grid = re.sub(r"\s+", "", grid_source[grid_begin:grid_end])
         self.assertIn(
             "returnwork_?work_->requests()*((work_->rowsPerRequest()-1)/width+1):"
             "(physical_-1)/width+1;",
