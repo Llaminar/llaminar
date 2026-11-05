@@ -309,6 +309,14 @@ void run(int m,int n,int k,int kb,Epilogue epilogue,int tile_id=CB==7?2:5) {
         scales[i]=uint16_t(0x2400u+(mixed(i+25)&0x7ffu));
         mins[i]=uint16_t(0xa000u+(mixed(i+51)&0x7ffu));
     }
+    if constexpr (llaminar2::nativeVnniScalePlaneBytes(CB) == 1) {
+        // Native MXFP4: one admitted E8M0 byte per block (2^-10..2^5) plus zero
+        // markers. An odd block count leaves a ragged final word, as in production.
+        auto *bytes = reinterpret_cast<uint8_t *>(scales.data());
+        std::fill(bytes, bytes + scales.size() * sizeof(uint16_t), uint8_t{0});
+        for(std::size_t i=0;i<blocks;++i)
+            bytes[i] = mixed(i+25)%23==7 ? uint8_t{0} : uint8_t(118u+mixed(i+25)%16u);
+    }
     for(std::size_t i=0;i<elements;++i) activation[i]=int(mixed(i+133)%255)-127;
     for(int row=0;row<m;++row) for(int block=0;block<k/32;++block) {
         activation_scales[std::size_t(row)*(k/32)+block]=float(1+mixed(row+block*7)%31)/256;
