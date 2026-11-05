@@ -598,3 +598,52 @@ TEST(MXFP4CPUNativeVNNI, GgmlAllZeroBlocksMatchExactReference)
     for (int M : {1, 5})
         runCpuProjection(M, 128, 256, 41u + static_cast<uint32_t>(M), true);
 }
+
+/**
+ * @test Every CUDA/ROCm packed-weight uploader executes this plan. It must
+ * transfer exactly the live primary-plane bytes, never the rounded storage
+ * byte that follows an odd one-byte E8M0 plane, while keeping word-aligned
+ * per-chunk strides. Controls: even 1-byte planes and 2-byte (FP16) planes
+ * collapse to one exact copy.
+ */
+TEST(MXFP4ScalePlaneUpload, PlanTransfersExactLiveBytesForOddEvenAndWordPlanes)
+{
+    using llaminar2::kNativeVnniMXFP4Codebook;
+    using llaminar2::nativeVnniPrimaryPlaneUploadPlan;
+    struct Case { uint8_t codebook; size_t blocks; size_t chunks; };
+    const Case cases[] = {
+        {kNativeVnniMXFP4Codebook, 207, 1}, {kNativeVnniMXFP4Codebook, 207, 5},
+        {kNativeVnniMXFP4Codebook, 1, 3},   {kNativeVnniMXFP4Codebook, 208, 1},
+        {kNativeVnniMXFP4Codebook, 208, 5}, {4, 207, 5}, {0, 207, 1}, {kNativeVnniMXFP4Codebook, 0, 4}};
+    for (const Case &c : cases)
+    {
+        SCOPED_TRACE(::testing::Message() << "codebook=" << int(c.codebook) << " blocks=" << c.blocks
+                                          << " chunks=" << c.chunks);
+        const size_t width = llaminar2::nativeVnniScalePlaneBytes(c.codebook);
+        const size_t live = c.blocks * width;
+        const size_t stride = llaminar2::nativeVnniScalePlaneStorageWords(c.codebook, c.blocks) * 2;
+        const auto plan = nativeVnniPrimaryPlaneUploadPlan(c.codebook, c.blocks, c.chunks);
+        EXPECT_EQ(plan.allocation_bytes, c.chunks * stride);
+        EXPECT_EQ(plan.stride_bytes, stride);
+        EXPECT_EQ(plan.transferredBytes(), c.chunks * live) << "only live bytes cross the bus";
+        // Byte-level coverage: every live byte is copied exactly once and no
+        // unused storage byte is ever copied.
+        std::vector<int> copied(plan.allocation_bytes, 0);
+        for (size_t copy = 0; copy < plan.copies; ++copy)
+        {
+            ASSERT_LE(plan.copyOffset(copy) + plan.copy_bytes, plan.allocation_bytes);
+            for (size_t b = 0; b < plan.copy_bytes; ++b)
+                ++copied[plan.copyOffset(copy) + b];
+        }
+        for (size_t chunk = 0; chunk < c.chunks; ++chunk)
+            for (size_t b = 0; b < stride; ++b)
+                EXPECT_EQ(copied[chunk * stride + b], b < live ? 1 : 0) << "chunk " << chunk << " byte " << b;
+        // Exact strides need no per-chunk copies.
+        if (live == stride && live != 0)
+            EXPECT_EQ(plan.copies, 1u);
+    }
+    // The odd MXFP4 single matrix keeps one unused capacity byte that is not sent.
+    const auto odd = nativeVnniPrimaryPlaneUploadPlan(kNativeVnniMXFP4Codebook, 207, 1);
+    EXPECT_EQ(odd.allocation_bytes, 208u);
+    EXPECT_EQ(odd.transferredBytes(), 207u);
+}

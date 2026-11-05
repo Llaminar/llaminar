@@ -8,6 +8,7 @@
  * CPU reference packing.
  */
 
+#include <array>
 #include <gtest/gtest.h>
 #include <cstring>
 #include <cstdint>
@@ -714,16 +715,20 @@ namespace
     {
         constexpr size_t kBlock = mxfp4::kSourceBlockBytes;
         std::vector<uint8_t> raw(static_cast<size_t>(N) * blocks_per_row * kBlock);
+        size_t nonzero_ordinal = 0;
         for (size_t index = 0; index < raw.size() / kBlock; ++index)
         {
             uint8_t *block = raw.data() + index * kBlock;
-            // Every native exponent [2, 252], including the extended range
-            // that the former FP16 plane could not represent.
-            block[0] = static_cast<uint8_t>(mxfp4::kMinNormalFP32Exponent +
-                index % (mxfp4::kMaxNativeE8M0Exponent - mxfp4::kMinNormalFP32Exponent + 1));
+            // Nonzero blocks walk every native exponent [2, 252] by ordinal
+            // (including the range the former FP16 plane could not represent),
+            // so the zero controls below never displace an exponent.
+            const bool zero_control = index % 13 == 6 || index % 13 == 11;
+            block[0] = zero_control ? uint8_t{0}
+                : static_cast<uint8_t>(mxfp4::kMinNormalFP32Exponent +
+                      nonzero_ordinal++ % (mxfp4::kMaxNativeE8M0Exponent - mxfp4::kMinNormalFP32Exponent + 1));
             for (int byte = 0; byte < 16; ++byte)
                 block[1 + byte] = static_cast<uint8_t>((index * 16 + byte) * 29u + 3u);
-            if (index % 13 == 6 || index % 13 == 11)
+            if (zero_control)
             {
                 block[0] = index % 13 == 6 ? 0 : 255;
                 std::memset(block + 1, index % 2 ? 0x88 : 0x00, 16);
@@ -777,6 +782,7 @@ namespace
         ASSERT_TRUE(backend->deviceToHost(scales.data(), slot->d_native_vnni_scales,
                                           scales.size(), 0, verification_stream.get()));
         size_t zero_blocks = 0, extended = 0;
+        std::array<bool, 256> seen_exponent{};
         for (int n = 0; n < N; ++n)
             for (int b = 0; b < blocks_per_row; ++b)
             {
@@ -784,11 +790,16 @@ namespace
                 const size_t linear = static_cast<size_t>(b) * N + n;
                 zero_blocks += mxfp4::exponentFitsNativeE8M0(source[0]) ? 0u : 1u;
                 extended += mxfp4::exponentFitsNativeE8M0(source[0]) && !mxfp4::exponentFitsFP16(source[0]) ? 1u : 0u;
+                if (mxfp4::exponentFitsNativeE8M0(source[0]))
+                    seen_exponent[source[0]] = true;
                 EXPECT_EQ(scales[linear], mxfp4::preparedNativeE8M0Byte(source[0])) << n << ',' << b;
                 EXPECT_EQ(std::memcmp(payload.data() + linear * 16, source + 1, 16), 0) << n << ',' << b;
             }
         EXPECT_GT(zero_blocks, 0u);
         EXPECT_GT(extended, 0u) << "fixture must cover exponents outside the former FP16 window";
+        // Totality: the fixture (N=67, K=160) loads every admitted exponent.
+        for (int e = mxfp4::kMinNormalFP32Exponent; e <= mxfp4::kMaxNativeE8M0Exponent; ++e)
+            EXPECT_TRUE(seen_exponent[static_cast<size_t>(e)]) << "exponent " << e << " never loaded";
         orch.release();
     }
 

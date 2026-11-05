@@ -10,6 +10,7 @@
  * not as halves; the independent IQ4_XS oracle extracts literal source bits.
  */
 
+#include <array>
 #include <gtest/gtest.h>
 #include <cstring>
 #include <cstdint>
@@ -2185,29 +2186,42 @@ TEST_F(Test__VnniRepackKernels, IQ2_S_SourceFactorsAndPayloadPreserveOffsetsAndT
 TEST_F(Test__VnniRepackKernels, MXFP4_ExactScalesCodesZeroBlocksOffsetsAndReplay)
 {
 #ifdef HAVE_ROCM
-    constexpr int N = 67, K = 96, source_first = 3;
+    // 67 x 5 = 335 submitted blocks: after the zero controls at least 251
+    // nonzero blocks remain per pass, so every native exponent is submitted.
+    // The 79 x 5 = 395 output plane stays odd (guard byte after the plane).
+    constexpr int N = 67, K = 160, source_first = 3;
     constexpr int output_N = 79, output_first = 5;
     constexpr int blocks_per_row = K / 32;
     constexpr size_t kBlock = llaminar2::mxfp4::kSourceBlockBytes;
+    constexpr int kNativeExponents = llaminar2::mxfp4::kMaxNativeE8M0Exponent -
+                                     llaminar2::mxfp4::kMinNormalFP32Exponent + 1;
+    const size_t submitted_first = static_cast<size_t>(source_first) * blocks_per_row;
+    const size_t submitted_end = submitted_first + static_cast<size_t>(N) * blocks_per_row;
     const size_t source_blocks = static_cast<size_t>(source_first + N + 2) * blocks_per_row;
     const size_t count = static_cast<size_t>(output_N) * blocks_per_row;
     auto make_source = [&](int pass)
     {
         std::vector<uint8_t> original(source_blocks * kBlock);
+        size_t nonzero_ordinal = 0;
         for (size_t index = 0; index < source_blocks; ++index)
         {
             uint8_t *block = original.data() + index * kBlock;
-            // Every native exponent [2, 252] (one E8M0 byte per block in the plane).
-            block[0] = static_cast<uint8_t>(llaminar2::mxfp4::kMinNormalFP32Exponent +
-                (index + pass * 7) % (llaminar2::mxfp4::kMaxNativeE8M0Exponent -
-                                      llaminar2::mxfp4::kMinNormalFP32Exponent + 1));
+            const size_t zero_phase = (index + pass * 5) % 11;
+            const bool zero_control = zero_phase == 4 || zero_phase == 9;
+            const bool submitted = index >= submitted_first && index < submitted_end;
+            // Nonzero submitted blocks walk every native exponent [2, 252] by
+            // ordinal, so zero controls never displace an exponent; pass 1
+            // rotates the assignment so every replayed plane byte changes.
+            block[0] = submitted && !zero_control
+                ? static_cast<uint8_t>(llaminar2::mxfp4::kMinNormalFP32Exponent +
+                      (nonzero_ordinal++ + static_cast<size_t>(pass) * 7) % kNativeExponents)
+                : uint8_t{100};
             for (int byte = 0; byte < 16; ++byte)
                 block[1 + byte] = static_cast<uint8_t>((index * 16 + byte) * 37u + pass * 11u);
             // Pass 0 and pass 1 zero disjoint block sets.
-            const size_t phase = (index + pass * 5) % 11;
-            if (phase == 4 || phase == 9)
+            if (zero_control)
             {
-                block[0] = phase == 4 ? 0 : 255;
+                block[0] = zero_phase == 4 ? 0 : 255;
                 std::memset(block + 1, index % 2 ? 0x88 : 0x00, 16);
             }
         }
@@ -2247,6 +2261,7 @@ TEST_F(Test__VnniRepackKernels, MXFP4_ExactScalesCodesZeroBlocksOffsetsAndReplay
             hipMemcpyDeviceToHost, hip_stream_), hipSuccess);
         ASSERT_EQ(hipStreamSynchronize(hip_stream_), hipSuccess);
         size_t zero_blocks = 0, flipped_to_zero = 0;
+        std::array<bool, 256> seen_exponent{};
         for (int block = 0; block < blocks_per_row; ++block)
             for (int row = 0; row < output_N; ++row)
             {
@@ -2265,6 +2280,8 @@ TEST_F(Test__VnniRepackKernels, MXFP4_ExactScalesCodesZeroBlocksOffsetsAndReplay
                 ASSERT_TRUE(llaminar2::mxfp4::blockFitsNativeE8M0(source[0], source + 1));
                 const bool exact = llaminar2::mxfp4::exponentFitsNativeE8M0(source[0]);
                 zero_blocks += exact ? 0u : 1u;
+                if (exact)
+                    seen_exponent[source[0]] = true;
                 if (!exact && !previous.empty() &&
                     llaminar2::mxfp4::exponentFitsNativeE8M0(previous[source_offset]))
                     ++flipped_to_zero;
@@ -2272,6 +2289,10 @@ TEST_F(Test__VnniRepackKernels, MXFP4_ExactScalesCodesZeroBlocksOffsetsAndReplay
                 EXPECT_EQ(std::memcmp(payload.data() + at * 16, source + 1, 16), 0);
             }
         EXPECT_GT(zero_blocks, 0u) << "fixture must exercise ggml zero blocks";
+        // Totality: every admitted exponent was actually submitted and observed.
+        for (int e = llaminar2::mxfp4::kMinNormalFP32Exponent;
+             e <= llaminar2::mxfp4::kMaxNativeE8M0Exponent; ++e)
+            EXPECT_TRUE(seen_exponent[static_cast<size_t>(e)]) << "exponent " << e << " never submitted";
         // Nothing beyond the count plane bytes is written.
         for (size_t byte = count; byte < scales.size(); ++byte)
             EXPECT_EQ(scales[byte], 0x5a) << "guard byte " << byte;
