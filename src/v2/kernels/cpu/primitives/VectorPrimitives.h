@@ -2,9 +2,11 @@
  * @file VectorPrimitives.h
  * @brief ISA-dispatched vector primitives: dot, axpy, scale
  *
- * Runtime-autoselected scalar / AVX2 / AVX-512 implementations for
- * small FP32 vector operations used by MoE routing, scatter/combine,
- * and gating stages.
+ * Native AArch64 NEON and runtime-autoselected x86 scalar / AVX2 / AVX-512
+ * implementations for FP32 operations used by MoE routing, scatter/combine,
+ * and gating stages. Buffers may be unaligned; n is nonnegative. Elementwise
+ * operations permit exact input/output aliasing, but not partial overlap.
+ * A zero-length call does not access input or elementwise output buffers.
  */
 
 #pragma once
@@ -13,7 +15,13 @@
 
 namespace llaminar2::primitives
 {
-    /// @brief Dot product: returns sum(a[i] * b[i]) for i in [0, n)
+    /**
+     * @brief Compute a dot product with an ISA-fixed reduction tree.
+     * @param a First n-element input vector.
+     * @param b Second n-element input vector.
+     * @param n Number of live input elements; zero returns positive zero.
+     * @return Sum of products in the selected ISA's arithmetic order.
+     */
     float vec_dot(const float *a, const float *b, int n);
 
     /**
@@ -34,13 +42,30 @@ namespace llaminar2::primitives
                            std::size_t row_stride, float *output,
                            std::size_t output_stride);
 
-    /// @brief AXPY: y[i] += alpha * x[i] for i in [0, n)
+    /**
+     * @brief Accumulate y[i] += alpha * x[i], with native FMA on SIMD paths.
+     * @param y n-element in/out vector; may exactly alias x.
+     * @param x n-element input vector.
+     * @param alpha Multiplier applied to x.
+     * @param n Number of live elements.
+     */
     void vec_axpy(float *y, const float *x, float alpha, int n);
 
-    /// @brief Scale in-place: data[i] *= s for i in [0, n)
+    /**
+     * @brief Scale data[i] *= s in place.
+     * @param data n-element in/out vector.
+     * @param s Scaling factor.
+     * @param n Number of live elements.
+     */
     void vec_scale(float *data, float s, int n);
 
-    /// @brief Vector add: out[i] = a[i] + b[i] for i in [0, n)
+    /**
+     * @brief Write out[i] = a[i] + b[i].
+     * @param out n-element destination; may exactly alias either input.
+     * @param a First n-element input vector.
+     * @param b Second n-element input vector.
+     * @param n Number of live elements.
+     */
     void vec_add(float *out, const float *a, const float *b, int n);
 
 } // namespace llaminar2::primitives
