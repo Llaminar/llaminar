@@ -12,6 +12,50 @@ get_filename_component(V2_CPU_ARCHITECTURE_ROOT "${CMAKE_CURRENT_LIST_DIR}/../..
 
 include("${CMAKE_CURRENT_LIST_DIR}/V2CoreFreeTestRegistration.cmake")
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
+foreach(_ctest_metadata_suite IN ITEMS Unit Integration)
+    if(_ctest_metadata_suite STREQUAL "Unit")
+        set(_ctest_metadata_labels V2 Unit CPU DeviceFree Build Ownership)
+    else()
+        set(_ctest_metadata_labels V2 Integration ProductionTestPreflight CPU DeviceFree Build Ownership Regression)
+    endif()
+    v2_add_core_free_test(V2_${_ctest_metadata_suite}_CTestTimeoutOwnerMetadata
+        COMMAND "${Python3_EXECUTABLE}" -B
+            "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_ctest_timeout_metadata.py"
+            --cmake "${CMAKE_COMMAND}" --ctest "${CMAKE_CTEST_COMMAND}" --ninja "${CMAKE_MAKE_PROGRAM}"
+        LABELS ${_ctest_metadata_labels})
+endforeach()
+v2_add_core_free_test(V2_Integration_CTestBuildToolImageContracts
+    COMMAND "${Python3_EXECUTABLE}" -B
+        "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/scripts/test_production_pipeline.py"
+        ImageIdentityTests
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Build Ownership Regression)
+v2_add_core_free_test(V2_Integration_DeviceFreeImageFixtureOwnership
+    COMMAND "${Python3_EXECUTABLE}" -B
+        "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/scripts/test_production_pipeline.py"
+        CrossHostRunnerTests.test_report_artifacts_survive_staging_cleanup_on_success_and_failure
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Build Ownership Regression)
+v2_add_core_free_test(V2_Unit_CPUHostTopology
+    COMMAND "${Python3_EXECUTABLE}" -B
+        "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_host_topology.py"
+    LABELS V2 Unit CPU DeviceFree Topology Build)
+v2_add_core_free_test(V2_Integration_CPUHybridTopologyAdmission
+    COMMAND "${Python3_EXECUTABLE}" -B
+        "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_host_topology.py"
+        CPUHostTopologyTests.test_hybrid_single_package_has_twenty_distinct_sibling_groups
+        CPUHostTopologyTests.test_actual_cmake_gate_ignores_multiline_presentation_geometry
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Topology Build Regression)
+v2_add_core_free_test(V2_Integration_CPUHostTopologyRejectUnknownGeometry
+    COMMAND "${Python3_EXECUTABLE}" -B
+        "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_host_topology.py"
+        CPUHostTopologyTests.test_missing_conflicting_and_unknown_identity_fail_closed
+        CPUHostTopologyTests.test_capture_requires_complete_stable_original_affinity
+        CPUHostTopologyTests.test_cmake_rejects_asymmetric_projection_and_noninteger_counts
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Topology Build Regression)
+v2_add_core_free_test(V2_Integration_CPUHostTopologyReceiptRetirement
+    COMMAND "${Python3_EXECUTABLE}" -B
+        "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_host_topology.py"
+        CPUHostTopologyTests.test_actual_owner_retires_receipt_before_failed_readmission
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Topology Build Ownership Regression)
 v2_add_core_free_test(V2_Unit_OneDNNBuildLifecycle
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_onednn_build_lifecycle.py"
