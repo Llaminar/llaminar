@@ -376,7 +376,7 @@ TEST(CpuAdaptiveImmutableRowCache, EveryOriginalNativeFormatAndCrossWindowRowPre
         GGUFTensorType::Q2_K,GGUFTensorType::Q3_K,GGUFTensorType::Q4_K,GGUFTensorType::Q5_K,GGUFTensorType::Q6_K,
         GGUFTensorType::Q8_K,GGUFTensorType::IQ1_S,GGUFTensorType::IQ1_M,GGUFTensorType::IQ2_XXS,
         GGUFTensorType::IQ2_XS,GGUFTensorType::IQ2_S,GGUFTensorType::IQ3_XXS,GGUFTensorType::IQ3_S,
-        GGUFTensorType::IQ4_NL,GGUFTensorType::IQ4_XS};
+        GGUFTensorType::IQ4_NL,GGUFTensorType::IQ4_XS,GGUFTensorType::MXFP4};
     for(auto type:formats) {
         SCOPED_TRACE(static_cast<int>(type));File f(type,4096,16);const auto g=Geometry::fromLayout(layout(f,3),Host,8);
         auto c=Cache::create(f.source,g,authority(g));const std::array<std::int64_t,8> ids{15,0,4,15,4,7,15,0};
