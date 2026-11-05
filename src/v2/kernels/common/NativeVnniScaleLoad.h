@@ -83,8 +83,9 @@ namespace llaminar2::native_vnni_scale
      *         FP16 bits for 2-byte planes; for 1-byte planes the E8M0 byte is
      *         normalized to mxfp4::powerOfTwoBF16Word (0 stays 0), so staged
      *         decode is a branch-free placement. A staged word is never a raw
-     *         plane byte: cp.async copies of the raw byte plane must be
-     *         normalized by their copy owner before publication.
+     *         plane byte. A stage that holds raw plane bytes instead (CUDA BK64
+     *         async metadata for 1-byte planes) must be read through a
+     *         consumer that applies powerOfTwoBF16Word to each byte.
      */
     template <std::uint8_t Codebook>
     LLAMINAR_NVNNI_SCALE_HD std::uint16_t loadStagedPrimary(const std::uint16_t *plane, std::size_t linear)
