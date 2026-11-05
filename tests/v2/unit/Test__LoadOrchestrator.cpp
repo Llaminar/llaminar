@@ -612,7 +612,7 @@ namespace llaminar2
 
     TEST(Test__LoadOrchestrator, CoalescingIsTotalAcrossEveryGpuRepackFormat)
     {
-        constexpr std::array<RepackFormat, 22> formats = {
+        constexpr std::array<RepackFormat, 23> formats = {
             RepackFormat::Q4_0, RepackFormat::IQ4_NL, RepackFormat::Q4_1,
             RepackFormat::Q5_0, RepackFormat::Q5_1, RepackFormat::Q4_K,
             RepackFormat::Q5_K, RepackFormat::Q6_K, RepackFormat::Q3_K,
@@ -620,7 +620,7 @@ namespace llaminar2
             RepackFormat::IQ3_XXS, RepackFormat::IQ2_S, RepackFormat::IQ2_XS,
             RepackFormat::IQ2_XXS, RepackFormat::IQ1_S, RepackFormat::IQ1_M,
             RepackFormat::Q8_0, RepackFormat::Q8_1, RepackFormat::Q8_K,
-            RepackFormat::RAW_FP,
+            RepackFormat::MXFP4, RepackFormat::RAW_FP,
         };
         std::array<uint8_t, 256> source{};
         int owner = 0;
@@ -653,7 +653,7 @@ namespace llaminar2
 
     TEST(Test__LoadOrchestrator, NativeVnniExpertSubregionsAreGapFreeForEveryCodebook)
     {
-        constexpr std::array<const NativeVnniFormatInfo *, 21> formats = {
+        constexpr std::array<const NativeVnniFormatInfo *, 22> formats = {
             &native_vnni_formats::IQ4_NL, &native_vnni_formats::Q8_0,
             &native_vnni_formats::Q8_1, &native_vnni_formats::Q4_0,
             &native_vnni_formats::Q4_1, &native_vnni_formats::Q5_0,
@@ -664,7 +664,7 @@ namespace llaminar2
             &native_vnni_formats::IQ2_XXS, &native_vnni_formats::IQ2_XS,
             &native_vnni_formats::IQ3_XXS, &native_vnni_formats::IQ2_S,
             &native_vnni_formats::IQ3_S, &native_vnni_formats::IQ1_S,
-            &native_vnni_formats::IQ1_M,
+            &native_vnni_formats::IQ1_M, &native_vnni_formats::MXFP4,
         };
         constexpr size_t expert_count = 15;
         constexpr size_t rows_per_expert = 7;
