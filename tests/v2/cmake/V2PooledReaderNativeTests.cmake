@@ -83,3 +83,37 @@ if(TARGET v2_test_qwen4exp_device_primitives)
         endif()
     endforeach()
 endif()
+
+# Ordinary production PLE early demand: useful trunk retires before the SAME delayed source worker.
+if(TARGET v2_test_qwen4exp_device_primitives)
+    foreach(_causal_backend CUDA ROCm)
+        if((_causal_backend STREQUAL "CUDA" AND HAVE_CUDA) OR (_causal_backend STREQUAL "ROCm" AND HAVE_ROCM))
+            string(TOLOWER "${_causal_backend}" _causal_lock)
+            if(_causal_backend STREQUAL "CUDA")
+                set(_causal_env "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=1")
+            else()
+                set(_causal_env "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
+            endif()
+            foreach(_causal_backing SSD RAM)
+                set(_causal_name "V2_Integration_PooledEarlyCurrentCausal_${_causal_backend}_${_causal_backing}")
+                add_v2_test(${_causal_name}
+                    COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                        --gtest_filter=PooledImmutableProviderSourceDevice.ProductionEarlyCurrent${_causal_backend}${_causal_backing}Causal
+                    LABELS "V2;Integration;ProductionTestPreflight;${_causal_backend};Ngram;ReadAhead;Capture;Component;ByteExact;Lifecycle;Regression"
+                    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 90 RESOURCE_LOCK "${_causal_lock}_gpu_0"
+                    ENVIRONMENT "${_causal_env}")
+                list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_causal_name})
+            endforeach()
+        endif()
+    endforeach()
+endif()
+
+if(TARGET v2_test_qwen4exp_primitives)
+    add_v2_test(V2_Integration_ImmutableLookupClosedWorkerGateLifecycle
+        COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+            --gtest_filter=ImmutableLookupSubordinate.ClosedWorkerGatePreservesOriginalSourceTaskAndRetirement
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Ngram;ReadAhead;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ImmutableLookupClosedWorkerGateLifecycle)
+endif()

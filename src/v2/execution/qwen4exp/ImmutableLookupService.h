@@ -29,6 +29,8 @@
 #include <string>
 #include <utility>
 
+namespace llaminar2::test { struct ImmutableLookupWorkerGateReplayAccess; }
+
 namespace llaminar2::qwen4exp
 {
 /** @brief CPU I/O observations; never sampled mutable inference/controller state. */
@@ -270,6 +272,15 @@ public:
     /** @brief Reject an I/O lane that already release-published a fatal completion. */
     void requireHealthy() const;
 private:
+    friend struct ::llaminar2::test::ImmutableLookupWorkerGateReplayAccess;
+    /** @brief Borrowed allocation-free task descriptor, private to original admission and closed fixture access.
+     * The production entry is always run/this. A diagnostic wrapper must retain
+     * its context through the original worker await and invoke run exactly once.
+     */
+    struct WorkerEntry {
+        RetainedParentTicketServiceWorker::Task task; ///< Same allocation-free worker dispatch entry.
+        void* context; ///< Borrowed original task context retained through await.
+    };
     friend struct ImmutableLookupSubordinateTestAccess;
     friend class ImmutableLookupExecutionBoundary;
     /** @brief Bind original native abort before launch; only the original source boundary can compose it.
@@ -326,8 +337,20 @@ private:
     /** @return The sole host processor for that disjoint mapped frame. */
     ImmutableLookupHostProcessor& processor(std::size_t index);
     const ImmutableLookupHostProcessor& processor(std::size_t index) const;
-    /** @return Shared invocation ticket after dispatching the existing single I/O worker once. */
-    Ticket armImpl(std::uint64_t generation);
+    /** @brief Dispatch the existing worker once under original lifecycle authentication.
+     * @param generation Monotonically increasing original admission identity.
+     * @param entry Non-null borrowed task/context, retained through actual await.
+     * @return Exact original invocation ticket.
+     * @throws std::exception For invalid task, non-idle/stale admission or failed dispatch.
+     */
+    Ticket armImpl(std::uint64_t generation,WorkerEntry entry);
+    /** @brief Admit the sole original channel through its unchanged validation/dispatch authority.
+     * @param generation Original monotonically increasing admission identity.
+     * @param entry Borrowed native CPU-worker entry/context, retained until await.
+     * @return Actual worker ticket after unique channel adoption.
+     * @throws std::exception For plural channels, invalid entry or non-idle admission.
+     */
+    Ticket armSingleChannel(std::uint64_t generation,WorkerEntry entry);
     /** @brief Join/cache the original worker once while holding the whole-terminal mutex. */
     void joinInvocation(Ticket ticket,bool complete_parent);
     /** @brief Cancel/join only a still-owned original group; stale RAII handles cannot affect a successor. */

@@ -11,6 +11,7 @@
 #include "execution/moe/MoEOverlayParticipantGraphRunner.h"
 #include "backends/GPUDeviceProcessLifetime.h"
 #include "execution/qwen4exp/ImmutableLookupService.h"
+#include "fixtures/qwen4exp/ImmutableLookupWorkerGateReplayAccess.h"
 #include "execution/local_execution/graph/RetainedStoragePerfStats.h"
 #include "loaders/ImmutableLookupSetupObservation.h"
 #include "execution/local_execution/orchestrators/TPWorkerPool.h"
@@ -1461,4 +1462,57 @@ TEST(ImmutableLookupSubordinate, ExpertEnqueueFailureCancelsOriginalSourceBefore
     })(),::testing::ExitedWithCode(0),"");
 }
 
+} // namespace llaminar2::qwen4exp
+
+namespace llaminar2::qwen4exp {
+/** @test The closed fixture delays only the original native CPU worker and preserves exact source/retirement on release, cancellation and exceptions. */
+TEST(ImmutableLookupSubordinate, ClosedWorkerGatePreservesOriginalSourceTaskAndRetirement){
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    for(int mode=0;mode<4;++mode){
+    ASSERT_EXIT(([&]{ {
+            ServiceLane lane;using Access=llaminar2::test::ImmutableLookupWorkerGateReplayAccess;
+            std::optional<ImmutableLookupService::Ticket> ticket;
+            EXPECT_THROW((Access::Gate({})),std::invalid_argument);
+            const std::shared_ptr<ImmutableLookupService> foreign_alias(lane.service.get(),[](auto*){});
+            EXPECT_THROW((Access::Gate(foreign_alias)),std::invalid_argument);
+            try{
+                Access::Gate gate(lane.service);ticket=Access::arm(gate,17);
+                const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(2);
+                while(!gate.entered()){if(std::chrono::steady_clock::now()>=deadline)throw std::runtime_error("Original worker did not enter causal gate");std::this_thread::yield();}
+                EXPECT_TRUE(gate.held());EXPECT_EQ(lane.completion().publication,0u);
+                EXPECT_THROW(lane.service->arm(18),std::logic_error);
+                if(mode==2)throw std::runtime_error("original fixture assertion exception");
+                if(mode==3){
+                    // Gate destruction alone must unblock original teardown;
+                    // the worker must not own a strong cycle to its service.
+                }else if(mode==1){
+                    ASSERT_TRUE(lane.service->cancel(*ticket));
+                    ServiceLane::wait(lane.ack().retiredInvocation,ticket->invocation);
+                    EXPECT_FALSE(lane.service->await(*ticket));EXPECT_EQ(lane.completion().publication,0u);
+                }else{
+                    const std::array<std::int64_t,3> ids{3,45,3};const std::array<Intent,3> intents{};
+                    lane.publish(1,ticket->generation,ids,intents);
+                    EXPECT_EQ(lane.completion().publication,0u);gate.release();
+                    ServiceLane::wait(lane.completion().publication,1);
+                    const auto view=lane.binding->deviceView();
+                    for(std::size_t row=0;row<ids.size();++row)EXPECT_EQ(std::memcmp(view.base.nativeRows+row*lane.layout.rowBytes(),
+                        lane.file.bytes.data()+lane.file.source.file_offset+ids[row]*lane.layout.rowBytes(),lane.layout.rowBytes()),0);
+                    lane.close(1,ticket->generation);EXPECT_TRUE(lane.service->await(*ticket));
+                    const auto actual=lane.service->stats();EXPECT_EQ(actual.ids,ids.size());EXPECT_EQ(actual.nativeBytes,ids.size()*lane.layout.rowBytes());
+                }
+                EXPECT_FALSE(gate.timedOut());
+            }catch(const std::runtime_error& failure){
+                EXPECT_EQ(mode,2);EXPECT_STREQ(failure.what(),"original fixture assertion exception");
+                ASSERT_TRUE(ticket);lane.service->cancel(*ticket);EXPECT_FALSE(lane.service->await(*ticket));
+            }
+            if(mode==3){
+                lane.binding.reset();lane.service.reset();
+                EXPECT_EQ(lane.backend.frees,1u);
+                EXPECT_EQ(lane.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::RetainedHostServiceStorage,
+                    PhysicalMemoryMaterializationKind::NewAllocation),0u);
+            }else EXPECT_FALSE(ImmutableLookupSubordinateTestAccess::ownsAcquiredGrant(*lane.service));
+        } GPUDeviceProcessLifetime::retireActive();std::_Exit(::testing::Test::HasFailure()?1:0);
+    })(),::testing::ExitedWithCode(0),"");
+    }
+}
 } // namespace llaminar2::qwen4exp

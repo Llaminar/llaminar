@@ -20,6 +20,29 @@ enum class OwnerAdmission {Original,RejectForeignAuthority};
 enum class ACKInterleaving {None,Cancel900BeforeReady,OriginalUnchecked900};
 /** @brief Recorded activation lifecycle; both modes execute the same production stages and native code. */
 enum class ActivationPreparation {BeforeGraph,ColdGraph};
+/** @brief Fixture terminal marker after actual independent native hash work. */
+class PooledUsefulTrunkTerminal final:public IComputeStage {
+public:
+    /** @brief Bind the exact fixture-native terminal publication.
+     * @param device Original native participant. @param backend Original backend.
+     * @param marker Same PMA-owned mapped publication alias retained through native retirement.
+     */
+    PooledUsefulTrunkTerminal(DeviceId device,IBackend* backend,void* marker):IComputeStage(device),backend_(backend),marker_(marker){}
+    /** @brief Publish only on the original captured stream after useful trunk dependencies retire. */
+    bool execute(IDeviceContext*)override{return backend_->streamPublishTimelineSignal32(requireGPUStream(),marker_,1,device().ordinal);}
+    /** @return Marker has its explicit PMA owner; no tensor transition is hidden. */
+    CoherencePolicy coherencePolicy()const override{return CoherencePolicy::NONE;}
+    /** @return Exact native backend for the original device. */
+    bool supportsBackend(ComputeBackendType backend)const override{return device().is_cuda()?backend==ComputeBackendType::GPU_CUDA:backend==ComputeBackendType::GPU_ROCM;}
+    /** @return Fixture marker category, distinct from a CPU callback. */
+    ComputeStageType type()const override{return ComputeStageType::QWEN4EXP_NGRAM_LOOKUP;}
+    /** @return Complete immutable marker/device identity; replay never rebinds it. */
+    std::uint64_t graphCaptureVariantSignature()const override{return 0x43415553414c0100ULL^reinterpret_cast<std::uintptr_t>(marker_)^(static_cast<std::uint64_t>(device().type)<<48)^static_cast<std::uint64_t>(device().ordinal);}
+    /** @return No tensor snapshot is invented by the fixture terminal marker. */
+    StageDumpInfo buildDumpInfoImpl()const override{return {};}
+private:IBackend* backend_;void* marker_;
+};
+
 #ifdef LLAMINAR_POOLED_NATIVE_PROGRAM_DIAGNOSTIC
 inline constexpr bool ProviderReplayRawDiagnostic=true;
 /** @brief Explicit raw actual-program schedule; it never selects ordinary qualified execution. */
@@ -136,15 +159,21 @@ struct ProviderReplaySpec final {
     std::optional<IdentityRejectionCase> identityRejection;
 #endif
     AdaptiveImmutableRowBacking sourceBacking=AdaptiveImmutableRowBacking::SSD; ///< Real original host source, separate from bounded hostSlots.
+    bool earlyCurrentCausal=false; ///< Closed component obligation through the actual production PLE demand builder.
     /** @brief Validate complete immutable case syntax before selected source/graph creation. */
     void requireComplete()const{
         requireProvider(file && maximum>=16 && uniqueCapacity && uniqueCapacity<=maximum && uniqueCapacity<=file->rows && slots<=file->rows && hostSlots<=file->rows,
             "Provider program has incomplete original geometry");
         (void)providerReplaySourcePolicy(sourceBacking);
+        requireProvider(!earlyCurrentCausal || (tokenQueries && maximum==64 && width==n::OriginalIdWidth::UInt64 &&
+            ownership==OwnerAdmission::Original && interleaving==ACKInterleaving::None && activationPreparation==ActivationPreparation::BeforeGraph),
+            "Causal early-current component requires its original ordinary counted PLE declaration");
         requireProvider(sourceBacking!=AdaptiveImmutableRowBacking::RAM||hostSlots==0,
             "Full RAM source excludes a redundant bounded RAM row cache");
         requireProvider(width==n::OriginalIdWidth::UInt32 || width==n::OriginalIdWidth::UInt64,"Provider program has unknown original ID width");
 #ifdef LLAMINAR_POOLED_NATIVE_PROGRAM_DIAGNOSTIC
+        requireProvider(!earlyCurrentCausal || diagnosticProgram==ProviderReplayDiagnosticProgram::OrdinaryLookup,
+            "Causal production frame cannot adopt a raw side-lane program");
         requireProvider(diagnosticProgram==ProviderReplayDiagnosticProgram::OrdinaryLookup ||
             (diagnosticProgram==ProviderReplayDiagnosticProgram::ReadAheadLookup && tokenQueries &&
              ownership==OwnerAdmission::Original && interleaving==ACKInterleaving::None && activationPreparation==ActivationPreparation::BeforeGraph),
@@ -267,7 +296,7 @@ struct ProviderReplayGeometry final {
     q::PooledImmutableCoordinatorGeometry policy;
     CpuAdaptiveImmutableRowCacheGeometry cpu;
     q::ImmutableLookupLayout channel;
-    std::array<CPUTensorStorageDeclaration,4> declarations;
+    std::vector<CPUTensorStorageDeclaration> declarations;
     std::size_t activation;
     unsigned graphCount;
     PhysicalMemoryPlan payload,retained;
@@ -296,15 +325,23 @@ struct ProviderReplayGeometry final {
         payload.add(host,PhysicalMemoryOwner::ImmutableLookupStaging,q::ImmutableLookupService::hostBytes(channel));
         const auto io=ioProgram.bom(host);
         for(const auto& row:io.resources())payload.add(row.resource(),PhysicalMemoryOwner::RetainedHostServiceStorage,row.bytes(PhysicalMemoryOwner::RetainedHostServiceStorage));
-        const std::array declarations{
+        std::vector declarations{
             CPUTensorStorageDeclaration(1,std::size_t{spec.maximum}*(spec.width==n::OriginalIdWidth::UInt32?1:2),BufferTensorType::INT32,PhysicalMemoryOwner::ActivationArena,DeviceId::cpu()),
             CPUTensorStorageDeclaration(1,1,BufferTensorType::INT32,PhysicalMemoryOwner::ActivationArena,DeviceId::cpu()),
             CPUTensorStorageDeclaration(1,sampling_math::kDeviceGenerationControlCount,BufferTensorType::INT32,PhysicalMemoryOwner::ActivationArena,DeviceId::cpu()),
             CPUTensorStorageDeclaration(spec.tokenQueries?spec.maximum/16:1,spec.tokenQueries?file.columns*16:std::size_t{spec.maximum}*file.columns,BufferTensorType::FP32,PhysicalMemoryOwner::ActivationArena,DeviceId::cpu())};
-        const auto activation=std::size_t{spec.maximum}*(spec.width==n::OriginalIdWidth::UInt32?4:8)+sizeof(int)+sampling_math::kDeviceGenerationControlCount*sizeof(int)+std::size_t{spec.maximum}*file.columns*sizeof(float);
+        auto activation=std::size_t{spec.maximum}*(spec.width==n::OriginalIdWidth::UInt32?4:8)+sizeof(int)+sampling_math::kDeviceGenerationControlCount*sizeof(int)+std::size_t{spec.maximum}*file.columns*sizeof(float);
+        if(spec.earlyCurrentCausal){
+            for(const auto elements:{std::size_t{4},std::size_t{2},std::size_t{128}}){
+                declarations.emplace_back(1,elements,BufferTensorType::INT32,PhysicalMemoryOwner::ActivationArena,DeviceId::cpu());
+                activation+=elements*sizeof(std::int32_t);
+            }
+            const CPUMappedPublicationRoot marker(sizeof(std::uint32_t),DeviceId::cpu(),device);
+            payload.add(host,marker.owner(),marker.physicalBytes());
+        }
         payload.add(gpu,PhysicalMemoryOwner::ActivationArena,activation);
         for(const auto& declaration:declarations)payload.add(host,PhysicalMemoryOwner::ActivationArena,declaration.physicalBytes());
-        unsigned graphCount=spec.tokenQueries?4:3;
+        unsigned graphCount=spec.tokenQueries&&!spec.earlyCurrentCausal?4:3;
 #ifdef LLAMINAR_POOLED_IDENTITY_REJECTION_TESTS
         if(spec.identityRejection)graphCount=spec.identityRejection->action==n::OwnerAction::Pin?4:5;
 #endif
@@ -377,15 +414,19 @@ public:
         requireProvider(bool(code),"Real provider native phase bundle unavailable");code->initialize(*owner,stream);code->initialize(*coordinator,stream);
         boundary=q::ImmutableLookupExecutionBoundary::createPooled(service,sourceGeometry,owner,coordinator,memory,stream);
         arena=std::make_unique<BufferArena>();
-        const std::array roles{BufferId::QFN_NGRAM_ROW_IDS,BufferId::PREFILL_CHUNK_GEOMETRY,BufferId::MTP_GENERATION_CONTROL,BufferId::QFN_PLE_EMBEDDING};
+        const std::array roles{BufferId::QFN_NGRAM_ROW_IDS,BufferId::PREFILL_CHUNK_GEOMETRY,BufferId::MTP_GENERATION_CONTROL,BufferId::QFN_PLE_EMBEDDING,
+            BufferId::REQUEST_TOKEN_IDS,BufferId::QFN_PLE_TOKEN_HISTORY,BufferId::STOCHASTIC_DRAFT_TOKEN_IDS};
         for(std::size_t index=0;index<declarations.size();++index){
             std::shared_ptr<TensorBase> root(declarations[index].materialize(memory));
+            if(index>=4)std::fill_n(static_cast<std::int32_t*>(root->raw_mutable_data()),root->numel(),index==6?-1:0);
             if(index==3)std::fill_n(static_cast<float*>(root->raw_mutable_data()),std::size_t{maximum}*file.columns,-12345.f);
             if(activationPreparation==ActivationPreparation::BeforeGraph || (index!=0 && index!=3)){
                 TransferEngine::prepareDeviceInput(root.get(),device,stream);TransferEngine::requireDeviceInput(root.get(),device,stream);
             }
             requireProvider(arena->registerExternalBuffer(roles[index],root),"Real provider original activation registration failed");
         }
+        if(program.spec.earlyCurrentCausal)
+            causalMarker=TransferEngine::instance().allocateMappedHostRegion(CPUMappedPublicationRoot(sizeof(std::uint32_t),DeviceId::cpu(),device),memory);
         bindPooledNativeRoots(*arena,*owner);bindPooledNativeRoots(*arena,*coordinator);bindPooledSourceRoots(*arena,*boundary);
         control.emplace(DeviceGenerationControlBinding::admit(*arena,device,0));boundary->bindPooledGenerationControl(*control);
         expected.assign(std::size_t{maximum}*file.columns,-12345.f);
@@ -397,7 +438,7 @@ public:
             requireProvider(backend->hostToDeviceOnStream(static_cast<std::byte*>(root->gpu_data_ptr())+offset,poison.data(),poison.size(),device.ordinal,stream),"Real provider payload poison failed");join();
             TransferEngine::publishDeviceWrite(root.get(),device,stream);
         }
-        context=IDeviceContext::create(device,1);build();if(tokenQueries)buildSmallProductionGraph();identity=boundary->captureIdentity();
+        context=IDeviceContext::create(device,1);build();if(tokenQueries&&!program.spec.earlyCurrentCausal)buildSmallProductionGraph();identity=boundary->captureIdentity();
 
     }
     /** @brief Retire actual submissions and worker before any graph/source/backing owner releases. */
@@ -455,7 +496,26 @@ public:
             static_cast<const std::int32_t*>(count->gpu_data_ptr()));
         const auto original=tokenQueries?tokens.repeatEachRow(16):tokens;
         overboundInputs.emplace(n::CoordinatorAction::Begin,coordinator->plan(),n::OriginalRows{original,width},begin);
-        if(tokenQueries)
+        if(originalProgram.spec.earlyCurrentCausal){
+            const Qwen4ExpNativeIntInput query{device,static_cast<const std::int32_t*>(arena->getSharedTensor(BufferId::REQUEST_TOKEN_IDS)->gpu_data_ptr()),4};
+            const Qwen4ExpIntBinding prior(*arena->getSharedTensor(BufferId::QFN_PLE_TOKEN_HISTORY),BufferId::QFN_PLE_TOKEN_HISTORY);
+            const Qwen4ExpIntBinding idBinding(*ids,BufferId::QFN_NGRAM_ROW_IDS);
+            const Qwen4ExpFloatBinding outputBinding(*output,BufferId::QFN_PLE_EMBEDDING);
+            Qwen4ExpPLEContext context{.device=device,.prefix="causal_ple_",.rows={4,Qwen4ExpNativeIntInput{device,static_cast<const std::int32_t*>(count->gpu_data_ptr()),1}},
+                .hidden=1,.epsilon=1e-6f,.nativeFormat=file.type,.nativeRowElements=static_cast<int>(file.columns),.nativeRowBytes=file.row_bytes};
+            context.hash.multipliers={3,5,7};for(int head=0;head<16;++head){context.hash.moduli[head]=7;context.hash.offsets[head]=7*head;}
+            const Qwen4ExpPLEBuffers buffers{query,prior,idBinding,outputBinding,outputBinding,outputBinding,outputBinding,outputBinding,outputBinding,outputBinding,outputBinding};
+            const Qwen4ExpPooledLookupStorage storage{arena.get(),boundary,code,*control,tokens,
+                Qwen4ExpIntBinding(*count,BufferId::PREFILL_CHUNK_GEOMETRY),{}};
+            auto early=Qwen4ExpPooledReadAheadFrame::publish(compute,context,buffers,storage);
+            auto trunk=std::make_unique<Qwen4ExpPrimitiveStage>(Qwen4ExpPrimitiveStage::Params{
+                .device_id=device,.rows=context.rows,.operation=Qwen4ExpPrimitiveStage::NgramHash{query,prior,
+                    Qwen4ExpIntBinding(*arena->getSharedTensor(BufferId::STOCHASTIC_DRAFT_TOKEN_IDS),BufferId::STOCHASTIC_DRAFT_TOKEN_IDS),context.hash}});
+            compute.addNode("causal_useful_trunk",std::move(trunk),device);compute.addDependency("causal_useful_trunk",early->producer());
+            compute.addNode("causal_trunk_complete",std::make_unique<PooledUsefulTrunkTerminal>(device,backend,causalMarker->deviceAlias(device)),device);compute.addDependency("causal_trunk_complete","causal_useful_trunk");
+            const auto hash=compute.getNode("causal_ple_hash")->stage->graphCaptureVariantSignature();
+            early->consume(compute,context,buffers,storage,hash,{"causal_trunk_complete"});early->requireConsumed();
+        }else if(tokenQueries)
             appendPooledImmutablePLELookupGraph(compute,*arena,boundary,code,tokens,
                 {ids,BufferId::QFN_NGRAM_ROW_IDS,0,std::size_t{maximum}*sizeof(std::uint64_t)},
                 q::PooledNativeTensorSpan{count,BufferId::PREFILL_CHUNK_GEOMETRY,0,sizeof(std::int32_t)},*control,
@@ -881,6 +941,7 @@ public:
         EXPECT_EQ(stats.counters.nativeBytes,expectedIds*file.row_bytes);EXPECT_EQ(stats.counters.terminalBytes,24u);
         expectedRequests=expectedIds=0;
     }
+    std::shared_ptr<MappedHostTransferRegion> causalMarker; ///< Exact original PMA-owned terminal witness; never execution input.
     PooledNgramReplayObservation lastObservation{}; ///< Final copied diagnostics, never execution input.
     ProviderFile& file;DeviceId device;IWorkerGPUContext& worker;IBackend* backend;void* stream;std::uint32_t maximum,slots;n::OriginalIdWidth width;bool tokenQueries;ACKInterleaving interleaving;ActivationPreparation activationPreparation;bool measurement=false; ///< Fixture-only terminal observation; original defaults keep their I/O.
     std::shared_ptr<PhysicalMemoryAuthority> memory;PhysicalMemoryAllocationLease activationLease;
@@ -949,7 +1010,7 @@ public:
         std::size_t graphCount=0;for(const auto& program:programs_)graphCount+=program.geometry.graphCount;
         std::cout<<"POOLED_PROVIDER_ADMISSION "<<nlohmann::json{{"original_source",true},{"same_pma",true},{"source_and_known_payload_admitted",true},
             {"whole_native_program_qualified",false},{"cpu_io_exact_stack_object_admitted",true},{"cpu_io_creator_policy",static_cast<unsigned>(io.creatorPolicy())},{"cpu_io_resource_class",io.resourceIdentity()},{"execution_role","raw_actual_program_diagnostic"},{"declared_cases",programs_.size()},
-            {"general_graph_slots",graphCount},{"activation_root_declarations_per_case",4},{"unknown_native_populations",{"general_graph_host","activation_publication_and_capture_dependencies","diagnostic_timing_events","cpu_io_service_libc_tls"}},{"whole_process_byte_completeness",false}}.dump()<<'\n';
+            {"general_graph_slots",graphCount},{"activation_root_declarations_per_case",programs_.front().geometry.declarations.size()},{"unknown_native_populations",{"general_graph_host","activation_publication_and_capture_dependencies","diagnostic_timing_events","cpu_io_service_libc_tls"}},{"whole_process_byte_completeness",false}}.dump()<<'\n';
 #endif
     }
     /** @return Serialized payload envelope plus every independently retained native obligation. */

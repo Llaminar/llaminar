@@ -24,7 +24,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace llaminar2::test { struct ImmutableLookupSourceAdmissionReplayAccess; }
+namespace llaminar2::test { struct ImmutableLookupWorkerGateReplayAccess;  struct ImmutableLookupSourceAdmissionReplayAccess; }
 namespace llaminar2 { class RankOrchestrator; }
 
 namespace llaminar2::qwen4exp
@@ -189,6 +189,14 @@ private:
         std::shared_ptr<HostImmutableRowProvider>,DeviceId,std::shared_ptr<TensorBase>,std::size_t,
         std::shared_ptr<PhysicalMemoryAuthority>,std::variant<RetainedHostServiceUseToken,RetainedHostServiceBorrow>);
 
+    friend struct ::llaminar2::test::ImmutableLookupWorkerGateReplayAccess;
+    /** @brief Preserve original admission while closed fixtures delay only its actual CPU worker entry.
+     * @param generation Original request epoch. @param stream Exact source stream.
+     * @param entry Empty for every production call; borrowed task only for a closed single-channel fixture.
+     * @throws std::exception For foreign/live admission or an injected entry on a plural source.
+     */
+    void beginAdmissionImpl(std::uint64_t generation,void* stream,
+        std::optional<ImmutableLookupService::WorkerEntry> entry);
     friend struct llaminar2::test::ImmutableLookupSourceAdmissionReplayAccess;
     /** @brief Immutable membership metadata only; never grants native admission or resource authority. */
     struct SourceAdmissionIdentity {

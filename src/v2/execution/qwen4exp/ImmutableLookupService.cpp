@@ -521,12 +521,15 @@ std::uint64_t ImmutableSubordinateLookupBinding::captureIdentity() const noexcep
 }
 
 ImmutableLookupService::Ticket ImmutableLookupService::arm(std::uint64_t generation) {
+    return armSingleChannel(generation,{&ImmutableLookupService::run,this});
+}
+ImmutableLookupService::Ticket ImmutableLookupService::armSingleChannel(std::uint64_t generation,WorkerEntry entry) {
     if(geometry_.channelCount()!=1)throw std::logic_error("Multiple source consumers require complete original group admission");
-    auto ticket=armImpl(generation);
+    auto ticket=armImpl(generation,entry);
     std::lock_guard lock(lifecycle_);adopted_[0]=true;return ticket;
 }
 ImmutableLookupService::GroupAdmission ImmutableLookupService::armGroup(std::uint64_t generation) {
-    return GroupAdmission(shared_from_this(),armImpl(generation));
+    return GroupAdmission(shared_from_this(),armImpl(generation,{&ImmutableLookupService::run,this}));
 }
 ImmutableLookupService::Ticket ImmutableLookupService::adoptGroupChannel(const GroupAdmission& group,DeviceId consumer) {
     std::lock_guard lock(lifecycle_);const auto index=channelIndex(consumer);
@@ -535,8 +538,9 @@ ImmutableLookupService::Ticket ImmutableLookupService::adoptGroupChannel(const G
         throw std::logic_error("Source channel requires its unique original complete-group admission");
     adopted_[index]=true;return {outstanding_.generation,outstanding_.invocation,index};
 }
-ImmutableLookupService::Ticket ImmutableLookupService::armImpl(std::uint64_t generation)
+ImmutableLookupService::Ticket ImmutableLookupService::armImpl(std::uint64_t generation,WorkerEntry entry)
 {
+    if(!entry.task || !entry.context)throw std::invalid_argument("Immutable lookup worker entry requires its borrowed task and context");
     std::lock_guard lock(lifecycle_);
     if(state_!=Lifecycle::Idle||outstanding_.valid()||generation==0||generation<=generation_)
         throw std::logic_error("Immutable lookup service requires an idle healthy lane and a newer admission generation");
@@ -545,7 +549,7 @@ ImmutableLookupService::Ticket ImmutableLookupService::armImpl(std::uint64_t gen
     // run() acquires lifecycle_ before reading this immutable ticket. dispatch
     // may wake the retained thread before returning, so publication stays under
     // the same lock until the actual worker invocation has been assigned.
-    const auto invocation=worker_.dispatch(&ImmutableLookupService::run,this);
+    const auto invocation=worker_.dispatch(entry.task,entry.context);
     outstanding_={generation,invocation.generation};
     return outstanding_;
 }

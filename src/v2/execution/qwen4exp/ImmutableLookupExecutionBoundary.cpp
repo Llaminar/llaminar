@@ -915,6 +915,15 @@ ImmutableLookupExecutionBoundary::armSourceGroup(std::span<const SourceAdmission
 }
 void ImmutableLookupExecutionBoundary::beginAdmission(std::uint64_t generation,void *stream)
 {
+    beginAdmissionImpl(generation,stream,std::nullopt);
+}
+void ImmutableLookupExecutionBoundary::beginAdmissionImpl(std::uint64_t generation,void *stream,
+    std::optional<ImmutableLookupService::WorkerEntry> entry)
+{
+    if(entry && armed_.load(std::memory_order_acquire))
+        throw std::logic_error("Closed delayed worker entry cannot replace an active source interval");
+    if(entry && requiresSourceGroupAdmission())
+        throw std::invalid_argument("Closed delayed worker entry requires one original source channel");
     requireProtocolOwner();
     const auto cohort=requireCompleteCohort();
     struct TemporaryLegacyClaim {
@@ -956,7 +965,7 @@ void ImmutableLookupExecutionBoundary::beginAdmission(std::uint64_t generation,v
     }
     if(requiresSourceGroupAdmission()){
         ticket_=pending_group_admission_->ticket;pending_group_admission_.reset();
-    }else ticket_=service_->arm(interval);
+    }else ticket_=entry?service_->armSingleChannel(interval,*entry):service_->arm(interval);
     if (!pooled_)
         admissionRetirement_->beginSubmission(stream);
     try {

@@ -14,6 +14,9 @@
 #include "fixtures/execution/RetainedHostServiceCalibrationAccess.h"
 #endif
 #include "execution/qwen4exp/PooledImmutableLocalLookupGraph.h"
+#include "execution/compute_stages/stages/qwen4exp/Qwen4ExpPLEBuilder.h"
+#include "execution/compute_stages/stages/qwen4exp/Qwen4ExpPrimitiveStage.h"
+#include "memory/CPUMappedPublicationRoot.h"
 #include "execution/qwen4exp/PooledImmutableParticipantReadGraph.h"
 #include "execution/qwen4exp/PooledImmutableCompleteCohort.h"
 #include "execution/qwen4exp/PooledImmutableParticipantRetirementGraph.h"

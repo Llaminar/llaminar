@@ -19,6 +19,12 @@
 #include "fixtures/qwen4exp/PooledImmutableNativeReplayBytes.h"
 #include "fixtures/execution/RetainedHostServiceFixture.h"
 #include "planning/ClusterInventoryGatherer.h"
+#include "fixtures/qwen4exp/ImmutableLookupWorkerGateReplayAccess.h"
+#include "execution/compute_stages/stages/qwen4exp/Qwen4ExpPLEBuilder.h"
+#include "execution/compute_stages/stages/qwen4exp/Qwen4ExpPrimitiveStage.h"
+#include "memory/CPUMappedPublicationRoot.h"
+#include <numeric>
+#include <atomic>
 #ifdef LLAMINAR_POOLED_NATIVE_PROGRAM_DIAGNOSTIC
 #include "fixtures/execution/RetainedHostServiceCalibrationAccess.h"
 #endif
@@ -556,6 +562,69 @@ TEST(PooledImmutableProviderSourceDevice,CooperativeFieldsROCmPinCommitFlagsLate
 {
     exactIdentityNativeRejection(DeviceId::rocm(0),65,n::OwnerAction::Pin,true,identity_fixture::IdentityFault::PinCommitFlags,false);
 }
+#endif
+
+/**
+ * @brief Causal native proof through the real ordinary PLE early-demand builder.
+ * @param device Actual original native participant. @param backing Real SSD or RAM source.
+ * @note No raw diagnostic parent or side lane is used. Useful original hash
+ * work must complete while the original CPU worker is held, then unchanged
+ * native bytes, ACKs and retirement complete after release. This is component
+ * correctness, not model overlap speed or grouped-MTP qualification.
+ */
+void productionEarlyCurrentCausal(DeviceId device,AdaptiveImmutableRowBacking backing){
+    if(!hasCPUBackend())initCPUBackend(-1);
+    std::vector<std::uint64_t> authored(112);std::iota(authored.begin(),authored.end(),0);
+    ProviderReplaySpec spec;spec.file=std::make_shared<ProviderFile>(4096,authored);spec.maximum=64;spec.uniqueCapacity=64;
+    spec.slots=4;spec.hostSlots=backing==AdaptiveImmutableRowBacking::SSD?2:0;spec.width=n::OriginalIdWidth::UInt64;
+    spec.tokenQueries=true;spec.sourceBacking=backing;spec.earlyCurrentCausal=true;
+    ProviderReplayPrograms programs({spec});programs.prepare(device);
+    programs.run(0,[&](ProviderReplay& replay){
+        const auto wait=[&](const auto& predicate,const char* detail){
+            const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(30);
+            while(!predicate()){requireProvider(std::chrono::steady_clock::now()<deadline,detail);std::this_thread::yield();}
+        };
+        for(std::uint64_t request=1;request<=2;++request){
+            ImmutableLookupWorkerGateReplayAccess::Gate gate(replay.service);
+            ImmutableLookupWorkerGateReplayAccess::begin(*replay.boundary,request,replay.stream,gate);
+            replay.join();wait([&]{return gate.entered();},"Original delayed source worker never entered");
+            bool firstFrame=true;
+            for(const std::size_t rows:{4u,1u,0u,4u}){
+                std::vector<std::uint64_t> expected(rows*16);for(std::size_t i=0;i<expected.size();++i)expected[i]=(i%16)*7;
+                replay.prepareTiming(expected);
+                const auto ids=replay.arena->getSharedTensor(BufferId::QFN_NGRAM_ROW_IDS);
+                const auto trunk=replay.arena->getSharedTensor(BufferId::STOCHASTIC_DRAFT_TOKEN_IDS);
+                for(const auto& output:{ids,trunk}){
+                    requireProvider(replay.backend->memset(output->gpu_data_ptr(),0xff,output->size_bytes(),device.ordinal,replay.stream),"Causal output poison failed");
+                    TransferEngine::publishDeviceWrite(output.get(),device,replay.stream);
+                }
+                auto& marker=*static_cast<std::uint32_t*>(replay.causalMarker->mutableHostData());
+                std::atomic_ref<std::uint32_t>(marker).store(0,std::memory_order_release);
+                replay.launchTiming();
+                if(firstFrame){
+                    EXPECT_TRUE(gate.held());
+                    wait([&]{return std::atomic_ref<std::uint32_t>(marker).load(std::memory_order_acquire)==1;},"Useful trunk cannot retire before original delayed response");
+                    EXPECT_TRUE(gate.held());EXPECT_FALSE(gate.timedOut());gate.release();firstFrame=false;
+                }
+                replay.join();replay.validateTiming(expected);
+                const auto actual=replay.read<std::int64_t>(trunk->gpu_data_ptr(),64);
+                for(std::size_t i=0;i<actual.size();++i)EXPECT_EQ(actual[i],i<expected.size()?static_cast<std::int64_t>(expected[i]):-1);
+            }
+            EXPECT_FALSE(gate.timedOut());replay.close();
+        }
+    });programs.retire();
+}
+#if defined(HAVE_CUDA)
+/** @test Original CUDA source cannot delay useful captured trunk work; SSD backing is genuine. */
+TEST(PooledImmutableProviderSourceDevice,ProductionEarlyCurrentCUDASSDCausal){productionEarlyCurrentCausal(DeviceId::cuda(0),AdaptiveImmutableRowBacking::SSD);}
+/** @test Original CUDA RAM source uses the same causal captured handoff, without a redundant RAM cache. */
+TEST(PooledImmutableProviderSourceDevice,ProductionEarlyCurrentCUDARAMCausal){productionEarlyCurrentCausal(DeviceId::cuda(0),AdaptiveImmutableRowBacking::RAM);}
+#endif
+#if defined(HAVE_ROCM)
+/** @test Original ROCm source cannot delay useful captured trunk work; SSD backing is genuine. */
+TEST(PooledImmutableProviderSourceDevice,ProductionEarlyCurrentROCmSSDCausal){productionEarlyCurrentCausal(DeviceId::rocm(0),AdaptiveImmutableRowBacking::SSD);}
+/** @test Original ROCm RAM source uses the same causal captured handoff, without a redundant RAM cache. */
+TEST(PooledImmutableProviderSourceDevice,ProductionEarlyCurrentROCmRAMCausal){productionEarlyCurrentCausal(DeviceId::rocm(0),AdaptiveImmutableRowBacking::RAM);}
 #endif
 
 }
