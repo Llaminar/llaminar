@@ -1163,9 +1163,7 @@ namespace
         packed.native_quantised_payload.assign(
             total_blocks * static_cast<size_t>(info->payload_bytes), uint8_t{0});
         packed.native_quantised_scales.assign(
-            nativeQuantisedScalePlaneStorageWords(
-                info->codebook_id == kNativeQuantisedMXFP4Codebook ? kNativeQuantisedMXFP4Codebook : info->codebook_id,
-                total_blocks),
+            nativeQuantisedScalePlaneStorageWords(canonicalDeviceVnniCodebookId(*info), total_blocks),
             uint16_t{0});
         packed.native_quantised_mins.clear();
         packed.native_quantised_emins.clear();
