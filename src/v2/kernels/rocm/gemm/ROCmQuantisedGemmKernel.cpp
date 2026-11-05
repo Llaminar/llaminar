@@ -6110,16 +6110,19 @@ namespace llaminar2
                             // Allocate FP16 scales buffer
                             if (upload.d_native_quantised_payload)
                             {
-                                // Exact live extent: an odd one-byte E8M0 plane
-                                // leaves its last host storage byte unused.
-                                const size_t scales_bytes = nativeQuantisedScalePlaneLiveBytes(
+                                // Shared upload plan: rounded storage capacity, exact
+                                // live transfer (an odd one-byte E8M0 plane never
+                                // sends its unused storage byte).
+                                const auto scales_plan = nativeQuantisedPrimaryPlaneUploadPlan(
                                     packed_->native_quantised_codebook_id,
-                                    static_cast<size_t>(packed_->N) * packed_->native_quantised_blocks_per_row);
-                                if (scales_bytes > packed_->native_quantised_scales.size() * sizeof(uint16_t))
+                                    static_cast<size_t>(packed_->N) * packed_->native_quantised_blocks_per_row, 1);
+                                if (scales_plan.allocation_bytes != packed_->native_quantised_scales.size() * sizeof(uint16_t) ||
+                                    scales_plan.copies > 1)
                                 {
                                     throw std::runtime_error(
-                                        "[ROCmQuantisedGemmKernel] Native-VNNI primary plane is smaller than its live extent");
+                                        "[ROCmQuantisedGemmKernel] Native-VNNI primary plane does not match its upload plan");
                                 }
+                                const size_t scales_bytes = scales_plan.allocation_bytes;
                                 void *d_scales_tmp = nullptr;
                                 if (!rocmQuantGemm_allocInt8(
                                         reinterpret_cast<int8_t **>(&d_scales_tmp),
@@ -6137,7 +6140,7 @@ namespace llaminar2
                                     err = startupMemcpyAsyncOrSync(
                                         d_scales_tmp,
                                         packed_->native_quantised_scales.data(),
-                                        scales_bytes,
+                                        scales_plan.copy_bytes,
                                         async_upload_enabled,
                                         upload.startup_h2d_stream,
                                         &upload.startup_h2d_pinned_native_scales,
@@ -6439,15 +6442,17 @@ namespace llaminar2
                     return;
                 }
 
-                // Exact live extent (see the startup upload above).
-                const size_t native_scales_bytes = nativeQuantisedScalePlaneLiveBytes(
+                // Shared upload plan (see the startup upload above).
+                const auto native_scales_plan = nativeQuantisedPrimaryPlaneUploadPlan(
                     host_packed.native_quantised_codebook_id,
-                    static_cast<size_t>(host_packed.N) * host_packed.native_quantised_blocks_per_row);
-                if (native_scales_bytes > host_packed.native_quantised_scales.size() * sizeof(uint16_t))
+                    static_cast<size_t>(host_packed.N) * host_packed.native_quantised_blocks_per_row, 1);
+                if (native_scales_plan.allocation_bytes != host_packed.native_quantised_scales.size() * sizeof(uint16_t) ||
+                    native_scales_plan.copies > 1)
                 {
                     throw std::runtime_error(
-                        "[ROCmQuantisedGemmKernel] Native-VNNI primary plane is smaller than its live extent");
+                        "[ROCmQuantisedGemmKernel] Native-VNNI primary plane does not match its upload plan");
                 }
+                const size_t native_scales_bytes = native_scales_plan.allocation_bytes;
                 if (!rocmQuantGemm_allocInt8(
                         reinterpret_cast<int8_t **>(&impl_->d_weights_native_scales),
                         native_scales_bytes,
@@ -6459,7 +6464,7 @@ namespace llaminar2
 
                 err = hipMemcpy(impl_->d_weights_native_scales,
                                 host_packed.native_quantised_scales.data(),
-                                native_scales_bytes,
+                                native_scales_plan.copy_bytes,
                                 hipMemcpyHostToDevice);
                 if (err != hipSuccess)
                 {
