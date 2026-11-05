@@ -7,9 +7,6 @@
  */
 
 #include "CUDAWeightPacker.h"
-#include "backends/BackendManager.h"
-#include "backends/GPUDeviceContextPool.h"
-#include "kernels/common/NativeVnniPrimaryPlaneUpload.h"
 
 #include "CUDAQuantisedGemmKernel.h"
 #include "CUDADeviceWorkspace.h"
@@ -228,6 +225,8 @@ namespace llaminar2::cuda
     extern "C"
     {
         bool cudaQuantGemm_uploadRawBytes(const void *h_src, void **d_dst, size_t bytes, int cuda_device_id);
+        int cudaQuantGemm_uploadPrimaryPlane(uint8_t physical_codebook, size_t blocks_per_chunk, size_t chunks,
+                                             const void *h_src, size_t host_bytes, void **d_dst, int cuda_device_id);
         void cudaQuantGemm_freeDevice(void *d_ptr, int cuda_device_id);
     }
 
@@ -273,22 +272,13 @@ namespace llaminar2::cuda
         // Primary plane: the shared uploader sends each expert's exact live extent.
         auto uploadScales = [&]() -> bool
         {
-            IBackend *const backend = getCUDABackend();
-            void *const setup_stream =
-                GPUDeviceContextPool::instance().getNvidiaContext(cuda_device_id).defaultStream();
-            if (!backend || !setup_stream)
-                throw std::runtime_error(
-                    "[MoEBatchPackedWeightsCUDA] Upload has no CUDA backend or explicit setup stream");
             void *d_mem = nullptr;
-            const auto status = uploadNativeVnniPrimaryPlane(
+            const int status = cudaQuantGemm_uploadPrimaryPlane(
                 codebook_id, static_cast<size_t>(rows_per_expert) * blocks_per_row,
                 static_cast<size_t>(num_experts), all_scales.data(),
-                all_scales.size() * sizeof(uint16_t), &d_mem,
-                [&](size_t bytes) { return backend->allocate(bytes, cuda_device_id); },
-                [&](void *dst, const void *src, size_t bytes)
-                { return backend->hostToDevice(dst, src, bytes, cuda_device_id, setup_stream); });
+                all_scales.size() * sizeof(uint16_t), &d_mem, cuda_device_id);
             upload.d_scales = static_cast<uint16_t *>(d_mem);
-            return status == NativeVnniPrimaryPlaneUploadStatus::Uploaded;
+            return status == 0;
         };
 
         if (!uploadArray(all_vnni, &upload.d_vnni) ||

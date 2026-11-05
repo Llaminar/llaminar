@@ -118,6 +118,9 @@ namespace llaminar2
 
             // Upload raw bytes from host to device (nvcc-compiled for CUDA runtime consistency)
             bool cudaQuantGemm_uploadRawBytes(const void *h_src, void **d_dst, size_t bytes, int cuda_device_id);
+            // Primary-plane setup upload with exact live extents (0 = uploaded).
+            int cudaQuantGemm_uploadPrimaryPlane(uint8_t physical_codebook, size_t blocks_per_chunk, size_t chunks,
+                                                 const void *h_src, size_t host_bytes, void **d_dst, int cuda_device_id);
 
             // Memory movement helpers for prepared tensor projections.
             bool cudaQuantGemm_copyHostToDevice(float *d_dst, const float *h_src, size_t count, int cuda_device_id);
@@ -820,24 +823,13 @@ namespace llaminar2
                 // The shared primary-plane uploader derives the exact live
                 // extent: an odd one-byte E8M0 plane keeps its rounded storage
                 // capacity but never sends the unused byte.
-                IBackend *const backend = getCUDABackend();
-                void *const setup_stream =
-                    GPUDeviceContextPool::instance().getNvidiaContext(cuda_device_id).defaultStream();
-                if (!backend || !setup_stream)
-                {
-                    throw std::runtime_error(
-                        "[CUDAQuantGemm] Packed-weight upload has no CUDA backend or explicit setup stream");
-                }
                 void *d_scales = nullptr;
-                const auto scales_status = uploadNativeVnniPrimaryPlane(
+                const bool scales_uploaded = cudaQuantGemm_uploadPrimaryPlane(
                     packed.native_codebook_id,
                     static_cast<size_t>(packed.N) * packed.native_blocks_per_row, 1,
-                    packed.native_scales.data(), packed.native_scales.size() * sizeof(uint16_t), &d_scales,
-                    [&](size_t bytes) { return backend->allocate(bytes, cuda_device_id); },
-                    [&](void *dst, const void *src, size_t bytes)
-                    { return backend->hostToDevice(dst, src, bytes, cuda_device_id, setup_stream); });
+                    packed.native_scales.data(), packed.native_scales.size() * sizeof(uint16_t),
+                    &d_scales, cuda_device_id) == 0;
                 upload.d_native_scales = static_cast<uint16_t *>(d_scales);
-                const bool scales_uploaded = scales_status == NativeVnniPrimaryPlaneUploadStatus::Uploaded;
                 if (!scales_uploaded ||
                     !uploadHostArrayToDevice(packed.native_vnni, &upload.d_native_vnni, cuda_device_id) ||
                     !uploadHostArrayToDevice(packed.native_mins, &upload.d_native_mins, cuda_device_id) ||

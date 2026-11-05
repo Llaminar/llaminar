@@ -466,6 +466,11 @@ namespace llaminar2
                 "explicit setup stream");
         }
 
+        // The single setup-stream copy primitive for every array of this batch.
+        auto copyToDevice = [&](void *dst, const void *src, size_t bytes) -> bool
+        {
+            return backend->hostToDevice(dst, src, bytes, rocm_device_id, setup_stream);
+        };
         auto uploadBuffer = [&](const void *host_data, size_t bytes, void **d_ptr) -> bool
         {
             *d_ptr = nullptr;
@@ -474,12 +479,7 @@ namespace llaminar2
             *d_ptr = backend->allocate(bytes, rocm_device_id);
             if (!*d_ptr)
                 return false;
-            if (!backend->hostToDevice(
-                    *d_ptr,
-                    host_data,
-                    bytes,
-                    rocm_device_id,
-                    setup_stream))
+            if (!copyToDevice(*d_ptr, host_data, bytes))
             {
                 backend->free(*d_ptr, rocm_device_id);
                 *d_ptr = nullptr;
@@ -498,8 +498,7 @@ namespace llaminar2
                        static_cast<size_t>(num_experts), all_native_scales.data(),
                        all_native_scales.size() * sizeof(uint16_t), d_ptr,
                        [&](size_t bytes) { return backend->allocate(bytes, rocm_device_id); },
-                       [&](void *dst, const void *src, size_t bytes)
-                       { return backend->hostToDevice(dst, src, bytes, rocm_device_id, setup_stream); }) ==
+                       copyToDevice) ==
                    NativeVnniPrimaryPlaneUploadStatus::Uploaded;
         };
 
