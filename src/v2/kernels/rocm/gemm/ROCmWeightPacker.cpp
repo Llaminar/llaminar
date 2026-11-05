@@ -200,6 +200,10 @@ namespace llaminar2
             const int K = static_cast<int>(tensor->cols());
             if ((K % 32) != 0)
                 return false;
+            // The packed container is self-describing: its uploaders derive the
+            // exact live plane extents from this geometry.
+            out.N = N;
+            out.K = K;
 
             const int blocks_per_row = K / 32;
             const int payload_bytes = info->payload_bytes;

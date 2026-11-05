@@ -13,6 +13,7 @@
 #include "kernels/common/DeviceNativeVNNIMatrixDesc.h"
 #include "kernels/cpu/gemm/CPUNativeVNNIDecode.h"
 #include "tensors/MXFP4Format.h"
+#include "tensors/NativeVnniScalePlane.h"
 #include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 #include <algorithm>
 #include <array>
@@ -153,7 +154,9 @@ inline std::array<int8_t, 32> integerPayload(uint8_t codebook,
   return out;
 }
 /** @brief FP64 coefficients from actual compact device planes, including
- * additive and source-factor metadata. */
+ * additive and source-factor metadata.
+ * @param primary Staged primary word (native_vnni_scale::loadStagedPrimary):
+ *        the FP16 scale, or the BF16 power of two of a native E8M0 plane. */
 inline std::array<double, 32> coefficients(uint8_t cb,
                                            std::span<const uint8_t> bytes,
                                            uint16_t primary, uint16_t secondary,
@@ -161,6 +164,12 @@ inline std::array<double, 32> coefficients(uint8_t cb,
   const auto q = integerPayload(cb, bytes);
   std::array<double, 32> out{};
   double lo = fp16_to_fp32(primary), hi = fp16_to_fp32(secondary);
+  if (nativeVnniScalePlaneBytes(cb) == 1) {
+    const uint32_t bits = uint32_t(primary) << 16;
+    float bf16;
+    std::memcpy(&bf16, &bits, sizeof(bf16));
+    lo = bf16;
+  }
   if (cb == 8) {
     hi = lo * int8_t(secondary >> 8);
     lo *= int8_t(secondary & 255);
