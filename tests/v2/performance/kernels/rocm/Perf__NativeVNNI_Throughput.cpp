@@ -1163,9 +1163,7 @@ namespace
         packed.native_vnni_payload.assign(
             total_blocks * static_cast<size_t>(info->payload_bytes), uint8_t{0});
         packed.native_vnni_scales.assign(
-            nativeVnniScalePlaneStorageWords(
-                info->codebook_id == kNativeVnniMXFP4Codebook ? kNativeVnniMXFP4Codebook : info->codebook_id,
-                total_blocks),
+            nativeVnniScalePlaneStorageWords(canonicalDeviceVnniCodebookId(*info), total_blocks),
             uint16_t{0});
         packed.native_vnni_mins.clear();
         packed.native_vnni_emins.clear();

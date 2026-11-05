@@ -15,6 +15,7 @@
 #include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 
 #include <gtest/gtest.h>
+#include "tensors/MXFP4Format.h"
 
 #include <algorithm>
 #include <array>
@@ -83,7 +84,7 @@ namespace llaminar2
                 static_cast<size_t>(projection.N) *
                 projection.blocks_per_row;
             projection.payload.resize(blocks * payload_bytes);
-            projection.scales.resize(blocks);
+            projection.scales.assign(nativeVnniScalePlaneStorageWords(codebook, blocks), 0);
             if (asymmetric)
                 projection.mins.resize(blocks);
 
@@ -101,8 +102,18 @@ namespace llaminar2
                     }
                     projection.payload[block * payload_bytes + byte] = value;
                 }
-                projection.scales[block] = static_cast<uint16_t>(
-                    0x2400u + (block % 0x0800u));
+                if (nativeVnniScalePlaneBytes(codebook) == 1)
+                {
+                    // Native E8M0 plane: the zero marker plus every admitted exponent,
+                    // including the range outside the former FP16 window.
+                    const uint8_t e = block % 17 == 5 ? uint8_t{0}
+                        : static_cast<uint8_t>(mxfp4::kMinNormalFP32Exponent +
+                              block % (mxfp4::kMaxNativeE8M0Exponent - mxfp4::kMinNormalFP32Exponent + 1));
+                    reinterpret_cast<uint8_t *>(projection.scales.data())[block] = e;
+                }
+                else
+                    projection.scales[block] = static_cast<uint16_t>(
+                        0x2400u + (block % 0x0800u));
                 if (asymmetric)
                 {
                     projection.mins[block] = static_cast<uint16_t>(
@@ -341,6 +352,7 @@ namespace llaminar2
             ::testing::Values(
                 makeProjection(0, 16, false, false),
                 makeProjection(4, 16, false, false),
+                makeProjection(kNativeVnniMXFP4Codebook, 16, false, false),
                 makeProjection(kNativeVnniIQ4XSSourceScaleCodebook, 16, true, true),
                 makeProjection(5, 16, true, true),
                 makeProjection(8, 24, true, true),
@@ -350,6 +362,46 @@ namespace llaminar2
                     32,
                     true,
                     false)));
+
+        /**
+         * @test Native MXFP4 GPU<->CPU reference round trip with an odd block count,
+         * and fail-fast rejection of a CPU unit word that is no admitted power of two.
+         */
+        TEST(ExpertTierWeightStream, MXFP4NativeE8M0PlaneRoundTripsOddCountsAndRejectsMalformedWords)
+        {
+            auto source = makeProjection(kNativeVnniMXFP4Codebook, 16, false, false);
+            // Shrink to an odd block count (N = 69 rows, 207 blocks).
+            const int N = 69;
+            HostGpuExpertPackedProjection odd = source;
+            odd.N = N;
+            const size_t blocks = static_cast<size_t>(N) * odd.blocks_per_row;
+            odd.payload.resize(blocks * 16);
+            odd.scales.assign(nativeVnniScalePlaneStorageWords(kNativeVnniMXFP4Codebook, blocks), 0);
+            for (size_t block = 0; block < blocks; ++block)
+                reinterpret_cast<uint8_t *>(odd.scales.data())[block] =
+                    block % 11 == 3 ? uint8_t{0} : static_cast<uint8_t>(2 + (block * 7) % 251);
+            std::string error;
+            ASSERT_TRUE(odd.valid(&error)) << error;
+            cpu::native_vnni::CPUNativeVNNIPackedWeights cpu;
+            ASSERT_TRUE(gpuToCpuExpertPackedReference(odd, cpu, &error)) << error;
+            EXPECT_EQ(cpu.scaleEncoding(), cpu::native_vnni::CPUNativeVNNIScaleEncoding::PowerOfTwoBF16);
+            for (size_t block = 0; block < blocks; ++block)
+            {
+                const int n = static_cast<int>(block % N), kb = static_cast<int>(block / N);
+                EXPECT_EQ(cpu.chunkScales(n / 64, kb)[n % 64],
+                          mxfp4::powerOfTwoBF16Word(reinterpret_cast<const uint8_t *>(odd.scales.data())[block]))
+                    << block;
+            }
+            HostGpuExpertPackedProjection back;
+            ASSERT_TRUE(cpuToGpuExpertPackedReference(cpu, back, &error)) << error;
+            ASSERT_EQ(back.scales.size(), odd.scales.size());
+            EXPECT_EQ(std::memcmp(back.scales.data(), odd.scales.data(), blocks), 0);
+            EXPECT_EQ(back.payload, odd.payload);
+            // A malformed unit word (mantissa bits set) is rejected, not truncated.
+            const_cast<uint16_t *>(cpu.chunkScales(0, 1))[7] = 0x3f81u;
+            HostGpuExpertPackedProjection rejected;
+            EXPECT_FALSE(cpuToGpuExpertPackedReference(cpu, rejected, &error));
+        }
 
         TEST(ExpertTierWeightStream, OrderedChunksWriteDirectlyToFinalBytes)
         {

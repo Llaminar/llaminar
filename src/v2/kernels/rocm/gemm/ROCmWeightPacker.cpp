@@ -483,12 +483,44 @@ namespace llaminar2
             return true;
         };
 
+        // Primary plane: word-aligned per-expert strides, but only each expert's
+        // live prefix crosses the bus (an odd one-byte E8M0 plane leaves one
+        // storage byte per expert that holds no block and is never read).
+        auto uploadScales = [&](void **d_ptr) -> bool
+        {
+            *d_ptr = nullptr;
+            const size_t stride = scales_per_expert * sizeof(uint16_t);
+            const size_t live = nativeVnniScalePlaneLiveBytes(
+                codebook_id, static_cast<size_t>(rows_per_expert) * blocks_per_row);
+            if (live > stride)
+                throw std::runtime_error(
+                    "MoEBatchPackedWeightsROCm::uploadToDevice live scale extent exceeds its stride");
+            if (live == stride)
+                return uploadBuffer(all_native_scales.data(), all_native_scales.size() * sizeof(uint16_t), d_ptr);
+            *d_ptr = backend->allocate(static_cast<size_t>(num_experts) * stride, rocm_device_id);
+            if (!*d_ptr)
+                return false;
+            for (int expert = 0; expert < num_experts; ++expert)
+            {
+                if (!backend->hostToDevice(
+                        static_cast<uint8_t *>(*d_ptr) + static_cast<size_t>(expert) * stride,
+                        reinterpret_cast<const uint8_t *>(all_native_scales.data()) +
+                            static_cast<size_t>(expert) * stride,
+                        live, rocm_device_id, setup_stream))
+                {
+                    backend->free(*d_ptr, rocm_device_id);
+                    *d_ptr = nullptr;
+                    return false;
+                }
+            }
+            return true;
+        };
+
         void *d_vnni = nullptr, *d_scales = nullptr, *d_mins = nullptr, *d_emins = nullptr;
 
         if (!uploadBuffer(all_native_vnni.data(),
                           all_native_vnni.size() * sizeof(uint8_t), &d_vnni) ||
-            !uploadBuffer(all_native_scales.data(),
-                          all_native_scales.size() * sizeof(uint16_t), &d_scales) ||
+            !uploadScales(&d_scales) ||
             !uploadBuffer(all_native_mins.empty() ? nullptr : all_native_mins.data(),
                           all_native_mins.size() * sizeof(uint16_t), &d_mins) ||
             !uploadBuffer(all_native_emins.empty() ? nullptr : all_native_emins.data(),

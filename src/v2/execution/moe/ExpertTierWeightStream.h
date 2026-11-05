@@ -299,6 +299,13 @@ namespace llaminar2
             return native_vnni_scale::loadStagedPrimary(codebook_id, scales.data(), linear);
         }
 
+        /** @return Exact live primary-plane bytes (device-view and transfer length). */
+        [[nodiscard]] size_t scaleLiveBytes() const noexcept
+        {
+            return nativeVnniScalePlaneLiveBytes(
+                codebook_id, static_cast<size_t>(N) * blocks_per_row);
+        }
+
         /**
          * @brief Store a CPU-unit scale word into the exact plane.
          * @return False for a word that the native E8M0 plane cannot represent.

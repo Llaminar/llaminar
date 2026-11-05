@@ -40,6 +40,7 @@
 #include "kernels/rocm/gdn/ROCmGatedNormSingleQ8.h"
 #include "ROCmQuantisedEpilogues.h"
 #include "ROCmQuantisedGemmKernel.h"
+#include "tensors/NativeVnniScalePlane.h"
 #include "kernels/common/GPUQ8ResidualNative.h"
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -5967,7 +5968,16 @@ namespace llaminar2
                             // Allocate FP16 scales buffer
                             if (upload.d_native_vnni_payload)
                             {
-                                const size_t scales_bytes = packed_->native_vnni_scales.size() * sizeof(uint16_t);
+                                // Exact live extent: an odd one-byte E8M0 plane
+                                // leaves its last host storage byte unused.
+                                const size_t scales_bytes = nativeVnniScalePlaneLiveBytes(
+                                    packed_->native_vnni_codebook_id,
+                                    static_cast<size_t>(packed_->N) * packed_->native_vnni_blocks_per_row);
+                                if (scales_bytes > packed_->native_vnni_scales.size() * sizeof(uint16_t))
+                                {
+                                    throw std::runtime_error(
+                                        "[ROCmQuantisedGemmKernel] Native-VNNI primary plane is smaller than its live extent");
+                                }
                                 void *d_scales_tmp = nullptr;
                                 if (!rocmQuantGemm_allocInt8(
                                         reinterpret_cast<int8_t **>(&d_scales_tmp),
@@ -6287,7 +6297,15 @@ namespace llaminar2
                     return;
                 }
 
-                const size_t native_scales_bytes = host_packed.native_vnni_scales.size() * sizeof(uint16_t);
+                // Exact live extent (see the startup upload above).
+                const size_t native_scales_bytes = nativeVnniScalePlaneLiveBytes(
+                    host_packed.native_vnni_codebook_id,
+                    static_cast<size_t>(host_packed.N) * host_packed.native_vnni_blocks_per_row);
+                if (native_scales_bytes > host_packed.native_vnni_scales.size() * sizeof(uint16_t))
+                {
+                    throw std::runtime_error(
+                        "[ROCmQuantisedGemmKernel] Native-VNNI primary plane is smaller than its live extent");
+                }
                 if (!rocmQuantGemm_allocInt8(
                         reinterpret_cast<int8_t **>(&impl_->d_weights_native_scales),
                         native_scales_bytes,
