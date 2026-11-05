@@ -343,6 +343,17 @@ namespace llaminar2
 
         /** @return Sealed active/inactive preparation policy for the admitted source. */
         SharedPredictorMaterialization predictorMaterialization() const noexcept { return predictor_materialization_; }
+        /**
+         * @brief Authenticate the retained original predictor before a runner borrows the model.
+         * @param requested Exact authored source, or absence for a main-only model.
+         * @param materialization Active/inactive preparation required by the original MTP capacity.
+         * @throws std::invalid_argument For changed source presence/path or preparation policy.
+         * @note Uses the child loader's original file path; split directories describe shards,
+         *       and are legitimately empty for an unsplit predictor. No file is reopened.
+         */
+        void requireSharedPredictorSource(const std::optional<SharedPredictorGGUFSource>& requested,
+            SharedPredictorMaterialization materialization) const;
+
 
         /** @return Authenticated predictor policies/native source manifest, or nullptr. */
         const Qwen4ExpSidecarManifest *predictorManifest() const noexcept override;

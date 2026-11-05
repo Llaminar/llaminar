@@ -14,6 +14,8 @@
 #include "execution/moe/MoEOverlayInferenceTransaction.h"
 #include "execution/mtp/MTPWeightManifest.h"
 #include "loaders/ModelContext.h"
+#include "execution/runner/OrchestrationRunner.h"
+#include "execution/local_execution/device/ReusableExecutionWorkspace.h"
 #include "utils/Sha256.h"
 #include "tensors/Tensors.h"
 #include <gtest/gtest.h>
@@ -349,5 +351,79 @@ TEST(ModelLoaderSharedPredictor, CPUJointWorkspaceUsesOriginalSharedPredictorSou
     EXPECT_THROW(originalCPUExpertWorkspaceSourceFormats(loader,48,2560,640,448),std::logic_error);
     EXPECT_THROW(originalCPUExpertWorkspaceSourceFormats(loader,49,2560,640,512),std::logic_error);
     EXPECT_EQ(originalCPUExpertWorkspaceSourceFormats(loader,48,2560,640,512),predictor);
+}
+}
+
+namespace llaminar2::test {
+/** @test The actual original unsplit loader authenticates source and active/inactive policy losslessly. */
+TEST(ModelLoaderSharedPredictor, OriginalUnsplitSourceIdentityRejectsForeignAndMissingReuse) {
+    SidecarFiles files;
+    ModelLoader mainOnly;mainOnly.setUseMmap(false);ASSERT_TRUE(mainOnly.loadModel(files.main_path));
+    EXPECT_NO_THROW(mainOnly.requireSharedPredictorSource(std::nullopt,SharedPredictorMaterialization::Inactive));
+    EXPECT_THROW(mainOnly.requireSharedPredictorSource(SharedPredictorGGUFSource(files.predictor_path),
+        SharedPredictorMaterialization::Active),std::invalid_argument);
+    for(const auto mode:{SharedPredictorMaterialization::Active,SharedPredictorMaterialization::Inactive}){
+        ModelContextConfig config;config.use_mmap=false;config.shared_predictor.emplace(files.predictor_path);
+        config.predictor_materialization=mode;
+        auto model=ModelContext::create(files.main_path,config);ASSERT_TRUE(model);
+        const auto& loader=model->concreteLoader();const auto* original=loader.ggufPredictorDirectory();
+        ASSERT_NE(original,nullptr);ASSERT_TRUE(original->split_paths.empty());
+        // Original failing check treated this valid unsplit directory as an absent source.
+        const bool old_matches=!original->split_paths.empty() && original->split_paths.front()==files.predictor_path;
+        EXPECT_FALSE(old_matches);
+        for(int lifetime=0;lifetime<20;++lifetime){
+            EXPECT_NO_THROW(loader.requireSharedPredictorSource(config.shared_predictor,mode));
+            EXPECT_THROW(loader.requireSharedPredictorSource(std::nullopt,mode),std::invalid_argument);
+            EXPECT_THROW(loader.requireSharedPredictorSource(SharedPredictorGGUFSource(files.main_path),mode),std::invalid_argument);
+            const auto foreign=mode==SharedPredictorMaterialization::Active?SharedPredictorMaterialization::Inactive:SharedPredictorMaterialization::Active;
+            EXPECT_THROW(loader.requireSharedPredictorSource(config.shared_predictor,foreign),std::invalid_argument);
+            EXPECT_EQ(loader.ggufPredictorDirectory(),original);
+        }
+    }
+}
+/** @test Rejected original-model borrows preserve the real reuse authority for its legitimate next runner. */
+TEST(ModelLoaderSharedPredictor, RejectedPredictorBorrowPreservesReusableModelAndAuthority) {
+    SidecarFiles files;ModelContextConfig config;config.use_mmap=false;
+    config.shared_predictor.emplace(files.predictor_path);config.predictor_materialization=SharedPredictorMaterialization::Active;
+    auto model=ModelContext::create(files.main_path,config);ASSERT_TRUE(model);
+    PhysicalMemoryPlanBuilder builder;builder.add({0,DeviceId::cpu(),4096,4096},PhysicalMemoryOwner::ExecutionWorkspace,4096);
+    auto memory=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(builder.build()),0);
+    model->concreteWeightManager()->installPhysicalMemoryAuthority(memory);
+    ModelContextReuseContract contract;contract.context=model;contract.physical_memory_authority=memory;
+    contract.reusable_execution_workspaces=std::make_shared<ReusableExecutionWorkspaceRegistry>();
+    contract.reuse_authority=std::make_shared<ModelContextReuseAuthority>();
+    ASSERT_TRUE(contract.reuse_authority->beginSealing());ASSERT_TRUE(contract.reuse_authority->publishReusable({}));
+    auto requested=OrchestrationConfig::defaults();requested.model_path=files.main_path;
+    requested.shared_predictor=config.shared_predictor;requested.mtp.enabled=true;
+    const auto generation=contract.reuse_authority->generation();
+    for(int rejection=0;rejection<3;++rejection){
+        auto foreign=requested;
+        if(rejection==0)foreign.shared_predictor.reset();
+        if(rejection==1)foreign.shared_predictor.emplace(files.main_path);
+        if(rejection==2){foreign.mtp.enabled=false;foreign.mtp_activation_policy=MTPActivationPolicy::Disabled;}
+        EXPECT_THROW((void)OrchestrationRunner(foreign,nullptr,contract),std::invalid_argument);
+        EXPECT_EQ(contract.reuse_authority->state(),ModelContextReuseAuthority::State::Reusable);
+        EXPECT_EQ(contract.reuse_authority->generation(),generation);
+        EXPECT_EQ(model->concreteWeightManager()->physicalMemoryAuthority(),memory);
+        EXPECT_NO_THROW(model->concreteLoader().requireSharedPredictorSource(config.shared_predictor,
+            SharedPredictorMaterialization::Active));
+    }
+    {
+        OrchestrationRunner accepted(requested,nullptr,contract);
+        EXPECT_EQ(contract.reuse_authority->state(),ModelContextReuseAuthority::State::RunnerExclusive);
+        EXPECT_EQ(contract.reuse_authority->generation(),generation+1);
+        accepted.shutdown();
+    }
+    EXPECT_EQ(contract.reuse_authority->state(),ModelContextReuseAuthority::State::Reusable);
+    auto automatic=requested;automatic.mtp.enabled=false;automatic.mtp_activation_policy=MTPActivationPolicy::Automatic;
+    {
+        OrchestrationRunner accepted(automatic,nullptr,contract);
+        EXPECT_TRUE(accepted.config().mtp.enabled);
+        EXPECT_EQ(accepted.config().mtp_activation_policy,MTPActivationPolicy::Enabled);
+        EXPECT_EQ(contract.reuse_authority->state(),ModelContextReuseAuthority::State::RunnerExclusive);
+        accepted.shutdown();
+    }
+    EXPECT_EQ(contract.reuse_authority->state(),ModelContextReuseAuthority::State::Reusable);
+    EXPECT_NO_THROW(model->concreteLoader().requireSharedPredictorSource(config.shared_predictor,SharedPredictorMaterialization::Active));
 }
 }

@@ -608,6 +608,18 @@ namespace llaminar2
         return nullptr;
     }
 
+    void ModelLoader::requireSharedPredictorSource(
+        const std::optional<SharedPredictorGGUFSource>& requested,
+        SharedPredictorMaterialization materialization) const
+    {
+        std::lock_guard lock(source_mutex_);
+        if(bool(predictor_loader_)!=requested.has_value() ||
+           (predictor_loader_ && predictor_loader_->file_path_!=requested->path()))
+            throw std::invalid_argument("Preloaded ModelContext shared predictor source does not match --mtp-model");
+        if(predictor_loader_ && predictor_materialization_!=materialization)
+            throw std::invalid_argument("Preloaded ModelContext shared predictor materialization policy does not match active MTP");
+    }
+
     const GGUFModel *ModelLoader::ggufPredictorDirectory() const noexcept
     {
         return predictor_loader_ ? &predictor_loader_->getModel() : nullptr;

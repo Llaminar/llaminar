@@ -140,6 +140,7 @@
 #include "../../backends/ComputeBackend.h"
 #include "../../planning/ClusterInventoryGatherer.h"
 #include "../../planning/ModelMemoryProfile.h"
+#include "../../config/OrchestrationStartupPolicy.h"
 #include "../../planning/ActivationBufferSizing.h"
 #include "../../planning/RankMemoryPlanInputs.h"
 #include "../../backends/NativeContextPreparation.h"
@@ -2409,6 +2410,26 @@ namespace llaminar2
         {
             throw std::invalid_argument(
                 "OrchestrationRunner reuse contract has malformed or unscoped ExpertOverlay migration-profile evidence");
+        }
+        // Reject a foreign or differently prepared predictor before consuming
+        // the original reusable lease/retention receipt. Such rejection has no
+        // runtime owner to seal and must leave the model reusable by its owner.
+        const auto& original_loader=model_ctx_->concreteLoader();
+        original_loader.requireSharedPredictorSource(config_.shared_predictor,
+            original_loader.predictorMaterialization());
+        if(config_.shared_predictor){
+            // Automatic intent is resolved by the SAME metadata-only startup
+            // authority used during planning, against this retained source inventory.
+            auto predictor_request=config_;
+            resolveMTPStartupPolicy(predictor_request,ModelMemoryProfile::fromLoader(original_loader));
+            original_loader.requireSharedPredictorSource(config_.shared_predictor,
+                retainsMTPGraphCapacity(predictor_request.mtp)?SharedPredictorMaterialization::Active:
+                    SharedPredictorMaterialization::Inactive);
+            // Carry the canonical startup result forward; later planning applies
+            // the same idempotent resolver instead of reconstructing another policy.
+            config_=std::move(predictor_request);
+            requested_routed_weight_authority_identity_=routedWeightAuthorityRequestIdentity(
+                config_.moe_routed_expert_plan,config_);
         }
         std::string reuse_error;
         if (!model_context_reuse_authority_->acquireRunnerExclusive(
@@ -17969,14 +17990,12 @@ namespace llaminar2
                     model_ctx_->path() + " != " + model_path);
             }
 
-            const auto retained_predictor = model_ctx_->loader()->ggufPredictorDirectory();
-            if (bool(retained_predictor) != config_.shared_predictor.has_value() ||
-                (retained_predictor && (retained_predictor->split_paths.empty() ||
-                    retained_predictor->split_paths.front() != config_.shared_predictor->path())))
-                return setError("Preloaded ModelContext shared predictor source does not match --mtp-model");
-
-            if (retained_predictor && model_ctx_->concreteLoader().predictorMaterialization() != weight_config.predictor_materialization)
-                return setError("Preloaded ModelContext shared predictor materialization policy does not match active MTP");
+            try {
+                model_ctx_->concreteLoader().requireSharedPredictorSource(config_.shared_predictor,
+                    weight_config.predictor_materialization);
+            } catch(const std::invalid_argument& error) {
+                return setError(error.what());
+            }
             const auto weight_manager = model_ctx_->concreteWeightManager();
             if (!weight_manager)
             {

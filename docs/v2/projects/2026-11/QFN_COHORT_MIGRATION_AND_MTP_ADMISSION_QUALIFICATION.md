@@ -1335,3 +1335,32 @@ admission projections, remote-root declaration and model-worker borrowing repair
 are checkpointed separately. The portability audit is retained at
 `/tmp/qfn-source-generation-checkpoint-r428/PORTABILITY.md`. No partial shared-source
 lifecycle or synthetic retirement authority is imported into the feature branch.
+
+## Unsplit predictor reuse and rejected-borrow preservation
+
+An unsplit shared predictor legitimately has an empty GGUF shard list. Reuse now
+authenticates the original child loader's retained source path and preparation
+mode rather than interpreting that list as source identity. Validation precedes
+the model's exclusive runner borrow, so a missing, foreign or incompatible
+predictor request cannot consume the reusable lease or its retention receipt.
+Automatic MTP intent resolves through the existing startup policy against the
+retained loader metadata. No source is reopened, hashed or mirrored.
+
+The actual-loader regressions cover active/inactive preparation, the original
+unsplit failure, repeated valid/refused lookups, rejected runner construction,
+unchanged PMA/reuse generation, and valid explicit/automatic runner lifetimes.
+`V2_Integration_RetainedPredictorSourceReuseContract` is explicitly registered
+in production preflight. In the development composition, that contract passes
+in 0.41 s and its owning `V2_Unit_Qwen4ExpMetadata` suite passes in 3.30 s
+(`focused344`). Both production translation units and the regression also pass
+syntax checks against the feature checkpoint itself (`checkpoint-predictor343`).
+
+The unchanged real-model CUDA TP2 shared-cache fixed-depth-1 source cell passes
+in 511.53 s including driver checks (`/tmp/qfn-cuda-shared-mtp1-source-r347/`).
+Its two runner lifetimes retain the original model, prepared weights and workers,
+with depth-15 capacity, 3,072 predictor records and complete final retirement.
+The composition's separate cache-admission repair gives each GPU 524,288 rows;
+that repair and the native transport foundation are outside this narrow
+checkpoint. This result qualifies the exact composition's source admission and
+reuse, not numerical inference, controller execution, Release speed, or the
+complete feature-branch preflight matrix.
