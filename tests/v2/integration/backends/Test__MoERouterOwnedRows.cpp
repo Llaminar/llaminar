@@ -52,7 +52,7 @@ extern "C"
     bool cudaMoE_route_logits_bf16(const float *, const void *, float *, int, int, int, int, void *);
     bool cudaMoE_softmax_topk(float *, float *, float *, int, int, int, bool, int, void *, const int *, void *);
     bool cudaMoE_scored_router_logit_transform(float *, int, int, int, const float *, const int32_t *, int,
-        const int32_t *, const int *, int, void *);
+        const int32_t *, const int *, int, void *, const float *, int32_t, int32_t);
     bool cudaMoE_scale_route_weights(float *, int, int, float, const int *, int, void *);
 }
 
@@ -119,7 +119,8 @@ namespace
             return logits &&
                 (!scored.enabled || cudaMoE_scored_router_logit_transform(p.logits, p.capacity, p.experts, p.top_k,
                     scored.bias, scored.hash_table, scored.hash_vocab, scored.token_ids, p.live_rows,
-                    device.ordinal, stream)) &&
+                    device.ordinal, stream, scored.image_bias, scored.image_sentinel_base,
+                    scored.image_sentinel_count)) &&
                 cudaMoE_softmax_topk(p.logits, indices, weights, p.capacity,
                     p.experts, p.top_k, p.normalize || scored.enabled, device.ordinal, stream, p.live_rows, nullptr) &&
                 (!scored.enabled || scored.route_scale == 1.0f ||
@@ -175,7 +176,8 @@ namespace
      * @param native_wmma Require actual gfx1100 matrix instructions in the captured owner.
      * @param wave_tile Native K-wave cap embedded in the retained graph. */
     /** @brief Router selection policy under test. */
-    enum class Scoring { Softmax, SqrtSoftplusBias, SqrtSoftplusHash };
+    /** SqrtSoftplusHashVision: hash layer whose image-sentinel rows select by s + exp_probs_b_vl. */
+    enum class Scoring { Softmax, SqrtSoftplusBias, SqrtSoftplusHash, SqrtSoftplusHashVision };
 
     void prove(DeviceId device, MoERouterPreparedFormat format, int capacity, int width,
                int experts, const std::vector<int> &degrees, RouterQ8Basis basis = RouterQ8Basis::Original,
@@ -234,6 +236,10 @@ namespace
             for (int t = 0; t < hash_vocab; ++t)
                 for (int k = 0; k < top_k; ++k)
                     hash_table->mutable_int32_data()[t * top_k + k] = (t * 5 + k * 3) % experts;
+            // Vision: ids 30..34 of the 37-token vocabulary are image sentinels.
+            constexpr int image_base = 30, image_count = 5;
+            auto image_bias = TestTensorFactory::createFP32({size_t(experts)});
+            for (int e = 0; e < experts; ++e) image_bias->mutable_data()[e] = .015f * float((e * 3) % 7) - .04f;
             auto token_ids = TestTensorFactory::createINT32({size_t(capacity)});
             for (int r = 0; r < capacity; ++r) token_ids->mutable_int32_data()[r] = (r * 11 + 3) % hash_vocab;
             auto q8 = TestTensorFactory::createINT32({input_elements / 4 + 1});
@@ -245,7 +251,7 @@ namespace
             for (TensorBase *tensor : std::initializer_list<TensorBase *>{hidden.get(), length.get(), gate.get(), gate_scales.get(),
                 logits.get(), reference_logits.get(), selected.get(), selected_bytes.get(), reference_indices.get(),
                 reference_weights.get(), q8.get(), reference_q8.get(), scales.get(), reference_scales.get(),
-                bias.get(), hash_table.get(), token_ids.get()})
+                bias.get(), hash_table.get(), token_ids.get(), image_bias.get()})
                 require(tensor->ensureOnDevice(device, stream), "Owned router storage");
             MoERouterOwnedRowsLaunch launch{
                 .partition = DeviceRowPartition::balanced(0, 2),
@@ -261,13 +267,17 @@ namespace
                 .selected_bytes = static_cast<uint64_t *>(selected_bytes->gpu_data_ptr())};
             if (scoring != Scoring::Softmax)
             {
-                const bool hash = scoring == Scoring::SqrtSoftplusHash;
+                const bool vision = scoring == Scoring::SqrtSoftplusHashVision;
+                const bool hash = scoring == Scoring::SqrtSoftplusHash || vision;
                 launch.scored = {.enabled = true,
                     .bias = hash ? nullptr : static_cast<const float *>(bias->gpu_data_ptr()),
                     .hash_table = hash ? static_cast<const int32_t *>(hash_table->gpu_data_ptr()) : nullptr,
                     .hash_vocab = hash ? hash_vocab : 0,
                     .token_ids = hash ? static_cast<const int32_t *>(token_ids->gpu_data_ptr()) : nullptr,
-                    .route_scale = 1.5f};
+                    .route_scale = 1.5f,
+                    .image_bias = vision ? static_cast<const float *>(image_bias->gpu_data_ptr()) : nullptr,
+                    .image_sentinel_base = vision ? image_base : 0,
+                    .image_sentinel_count = vision ? image_count : 0};
             }
             auto oracle = launch;
             oracle.logits = static_cast<float *>(reference_logits->gpu_data_ptr());
@@ -479,7 +489,7 @@ namespace
      */
     TEST(MoERouterOwnedRows, CUDAScored)
     {
-        for (const auto scoring : {Scoring::SqrtSoftplusBias, Scoring::SqrtSoftplusHash})
+        for (const auto scoring : {Scoring::SqrtSoftplusBias, Scoring::SqrtSoftplusHash, Scoring::SqrtSoftplusHashVision})
             for (const auto format : {MoERouterPreparedFormat::FP32, MoERouterPreparedFormat::BF16,
                                       MoERouterPreparedFormat::FP16})
             {

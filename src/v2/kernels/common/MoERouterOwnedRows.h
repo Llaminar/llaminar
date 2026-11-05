@@ -37,11 +37,15 @@ namespace llaminar2
         int hash_vocab = 0;
         const std::int32_t *token_ids = nullptr;  ///< [capacity] original-coordinate token ids.
         float route_scale = 1.0f;
+        const float *image_bias = nullptr;        ///< exp_probs_b_vl for image sentinels (vision), or null.
+        std::int32_t image_sentinel_base = 0;
+        std::int32_t image_sentinel_count = 0;
 
         /** @return Exactly one selection authority, with its inputs. */
         [[nodiscard]] bool valid() const noexcept
         {
-            return !enabled || (hash_table ? (token_ids && hash_vocab > 0 && !bias) : bias != nullptr);
+            return !enabled || ((hash_table ? (token_ids && hash_vocab > 0 && !bias) : bias != nullptr) &&
+                                (!image_bias || (token_ids && image_sentinel_count > 0)));
         }
     };
 

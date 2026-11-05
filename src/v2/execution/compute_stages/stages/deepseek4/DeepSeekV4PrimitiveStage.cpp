@@ -220,6 +220,17 @@ DeepSeekV4PrimitiveStage::DeepSeekV4PrimitiveStage(Params params)
             }
             addFP32Weight(a.sinks, sz(a.heads), "sinks");
             add(a.output, rows, w, Access::Output, "output");
+            require(a.tokens.has_value() == (a.imageIds.count > 0), "image-span attention requires tokens and sentinel ids");
+            if (a.tokens) addIntInput(*a.tokens, rows, "tokens");
+        },
+        [&](const ImageMerge &a) {
+            require(a.imageIds.count > 0, "image merge requires the sentinel ids");
+            addIntInput(a.tokens, rows, "tokens");
+            addIntInput(a.positions, rows, "positions");
+            add(a.bank, sz(a.bankRows), sz(a.width), Access::Input, "image_bank");
+            add(a.map, sz(a.mapRows), 1, Access::Input, "image_row_map");
+            add(a.embedding, rows, sz(a.width), Access::Input, "input", AliasPolicy::ExactOutputAliasAllowed);
+            add(a.embedding, rows, sz(a.width), Access::Output, "output");
         },
         [&](const AdvanceSequenceFrontier &a) {
             require(device().is_gpu(), "sequence frontier publication is a GPU cache operation");
@@ -347,7 +358,13 @@ bool DeepSeekV4PrimitiveStage::execute(IDeviceContext *context)
                                        intInput(a.positions), f(a.query), f(a.chunkKV), bytesIn(a.rawRing),
                                        a.pool ? bytesIn(*a.pool) : nullptr,
                                        a.selected ? pointer<const std::int32_t>(*a.selected, Access::Input) : nullptr,
-                                       w32(a.sinks), out(a.output)}, stream);
+                                       w32(a.sinks), out(a.output), a.tokens ? intInput(*a.tokens) : nullptr,
+                                       a.imageIds}, stream);
+        },
+        [&](const ImageMerge &a) {
+            kernels_->imageMerge({rows, a.width, a.bankRows, a.mapRows, a.imageIds, intInput(a.tokens),
+                                  intInput(a.positions), f(a.bank), pointer<const std::int32_t>(a.map, Access::Input),
+                                  out(a.embedding)}, stream);
         },
         [&](const AdvanceSequenceFrontier &a) {
             // Exactly one device-resident frontier advance per forward, ordered
@@ -376,7 +393,8 @@ bool DeepSeekV4PrimitiveStage::allowsZeroOutput() const
            std::holds_alternative<RawStore>(params_.operation) ||
            std::holds_alternative<IndexerTopK>(params_.operation) ||
            std::holds_alternative<Route>(params_.operation) ||
-           std::holds_alternative<AdvanceSequenceFrontier>(params_.operation);
+           std::holds_alternative<AdvanceSequenceFrontier>(params_.operation) ||
+           std::holds_alternative<ImageMerge>(params_.operation);
 }
 
 ComputeStageType DeepSeekV4PrimitiveStage::type() const
@@ -393,7 +411,8 @@ ComputeStageType DeepSeekV4PrimitiveStage::type() const
         [](const SparseAttention &) { return ComputeStageType::DEEPSEEK_V4_SPARSE_ATTENTION; },
         [](const GroupedProjection &) { return ComputeStageType::DEEPSEEK_V4_GROUPED_PROJECTION; },
         [](const Route &) { return ComputeStageType::DEEPSEEK_V4_ROUTE; },
-        [](const AdvanceSequenceFrontier &) { return ComputeStageType::DEEPSEEK_V4_SEQUENCE_FRONTIER; }}, params_.operation);
+        [](const AdvanceSequenceFrontier &) { return ComputeStageType::DEEPSEEK_V4_SEQUENCE_FRONTIER; },
+        [](const ImageMerge &) { return ComputeStageType::DEEPSEEK_V4_IMAGE_MERGE; }}, params_.operation);
 }
 
 std::size_t DeepSeekV4PrimitiveStage::estimatedFlops() const
@@ -411,7 +430,8 @@ std::size_t DeepSeekV4PrimitiveStage::estimatedFlops() const
         [=](const SparseAttention &a) { return rows * a.heads * (a.window + a.topK) * a.format.headDim * 4; },
         [=](const GroupedProjection &a) { return rows * a.groups * a.rank * a.groupWidth * 2; },
         [=](const Route &a) { return rows * a.experts * 8; },
-        [=](const AdvanceSequenceFrontier &) { return std::size_t{0}; }}, params_.operation);
+        [=](const AdvanceSequenceFrontier &) { return std::size_t{0}; },
+        [=](const ImageMerge &) { return std::size_t{0}; }}, params_.operation);
 }
 
 std::size_t DeepSeekV4PrimitiveStage::estimatedMemoryBytes() const

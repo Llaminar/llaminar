@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include "multimodal/PromptImageEncoder.h"
 #include "app/modes/HttpRuntimeStats.h"
 #include "utils/Sampler.h"
 #include "utils/ChatTemplate.h"
@@ -154,6 +155,16 @@ namespace llaminar2
 
         /// Allow model to call multiple tools in a single response.
         bool parallel_tool_calls{false};
+
+        /// One image_url content part: its message/part slot and data: URL.
+        struct ImagePart
+        {
+            std::size_t message = 0; ///< Index into @c messages.
+            std::size_t part = 0;    ///< Index into that message's content_parts.
+            std::string url;         ///< data: URL (validated scheme).
+        };
+        /// Image parts in prompt order; their content_parts slots are empty until setup.
+        std::vector<ImagePart> image_parts;
     };
 
     /**
@@ -253,7 +264,8 @@ namespace llaminar2
         static constexpr int kStreamingPublicationWindowTokens = 16;
 
         ChatCompletionHandler(IOrchestrationRunner &runner, ITokenizer &tokenizer,
-                              const std::string &model_name = "");
+                              const std::string &model_name = "",
+                              std::shared_ptr<const multimodal::IPromptImageEncoder> image_encoder = nullptr);
 
         /**
          * @brief Read completed lifetime counters without touching inference state.
@@ -266,6 +278,13 @@ namespace llaminar2
 
         /** @brief Observe an actual completed HTTP response independently of inference state. */
         void recordHttpResponse(int status) { runtime_stats_.recordHttpResponse(status); }
+
+        /**
+         * @brief Render every image part of @p request as @p placeholder text.
+         * @return A copy whose image content parts hold the placeholder.
+         */
+        static ChatCompletionRequest withImagePlaceholders(const ChatCompletionRequest &request,
+                                                           const std::string &placeholder);
 
         /// Parse a JSON string into a validated ChatCompletionRequest.
         /// On failure, returns an error ChatCompletionResponse.
@@ -330,6 +349,8 @@ namespace llaminar2
         IOrchestrationRunner &runner_;
         ITokenizer &tokenizer_;
         std::string model_name_;
+        /// Request image pipeline (--mmproj); null rejects image parts with 400.
+        std::shared_ptr<const multimodal::IPromptImageEncoder> image_encoder_;
     };
 
 } // namespace llaminar2

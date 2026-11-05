@@ -10,6 +10,7 @@
  */
 #include "DeepSeekV4BufferLayout.h"
 #include "DeepSeekV4Config.h"
+#include "DeepSeekV4ImagePreprocess.h"
 #include "../GraphTypes.h"
 #include "../../execution/local_execution/graph/GraphResolver.h"
 
@@ -65,6 +66,11 @@ const std::vector<DeepSeekV4BufferDeclaration> declarations{
     {BufferId::DSV4_IDX_RING_KV, {"dsv4_idx_ring_kv", {"dsv4_idx_state_elements"}, "fp32", BufferSemantic::InOut}},
     {BufferId::DSV4_IDX_RING_SCORE, {"dsv4_idx_ring_score", {"dsv4_idx_state_elements"}, "fp32", BufferSemantic::InOut}},
     {BufferId::DSV4_IDX_POOL, {"dsv4_idx_pool", {"dsv4_idx_pool_words"}, "int32", BufferSemantic::InOut}},
+    // Vision: request image rows (four learned sentinels at their type index,
+    // then encoded IMAGE rows) and the per-position bank row (-1 = token
+    // embedding). Uploaded at request admission; one element for text models.
+    {BufferId::DSV4_IMAGE_BANK, {"dsv4_image_bank", {"dsv4_image_bank_rows", "d_model"}, "fp32", BufferSemantic::InOut}},
+    {BufferId::DSV4_IMAGE_ROW_MAP, {"dsv4_image_row_map", {"dsv4_image_map_rows"}, "int32", BufferSemantic::InOut}},
 };
 
 /** @brief Sequence slots of every persistent bank (one request per graph today). */
@@ -122,6 +128,8 @@ std::vector<std::pair<std::string, std::size_t>> deepSeekV4Formulas(const DeepSe
         {"dsv4_idx_state_elements", std::max<std::size_t>(1, product(product(g.csa_layers, per_seq), idx_state))},
         {"dsv4_idx_pool_words", std::max<std::size_t>(1,
             product(product(g.csa_layers, per_seq), product(csa_pool, idx_words)))},
+        {"dsv4_image_bank_rows", std::max<std::size_t>(1, g.image_bank_rows)},
+        {"dsv4_image_map_rows", g.image_bank_rows ? product(per_seq, context) : std::size_t{1}},
     };
 }
 
@@ -211,7 +219,7 @@ DeepSeekV4MemoryGeometry DeepSeekV4MemoryGeometry::fromConfig(const DeepSeekV4Co
             u(m.outputGroups()), u(m.outputLoraRank()), u(m.window()), u(m.indexerHeads()), u(m.indexerHeadDim()),
             u(m.indexerTopK()), u(m.experts()), u(m.expertsUsed()),
             u(m.countLayers(DeepSeekV4AttentionKind::Compressed)), u(m.countLayers(DeepSeekV4AttentionKind::Heavy)),
-            u(m.ropeDim())};
+            u(m.ropeDim()), m.visionCapable() ? u(deepseek4::imageBankRows()) : 0u};
 }
 
 std::size_t deepSeekV4ArenaExtensionBytes(const DeepSeekV4MemoryGeometry &g, int rows, int contextTokens)

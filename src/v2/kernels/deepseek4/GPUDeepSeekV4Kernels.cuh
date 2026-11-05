@@ -563,8 +563,10 @@ __global__ __launch_bounds__(kThreads) void sparseAttentionKernel(SparseAttentio
         qv[i] = i < perLane && c < dim ? q[c] : 0.0f;
         acc[i] = 0.0f;
     }
-    const int rawFirst = max(0, pos - a.window + 1);
-    const int rawCount = pos - rawFirst + 1;
+    // Image spans widen the raw window to the whole span (both directions).
+    const auto span = imageSpanExtent(a.tokens, liveRows(a.extent), r, a.imageIds);
+    const int rawFirst = max(0, pos - max(a.window - 1, span.left));
+    const int rawCount = pos + span.right - rawFirst + 1;
     int compCount = 0;
     if (a.access == CompressedAccess::All) compCount = (pos + 1) / a.ratio;
     else if (a.access == CompressedAccess::Selected) compCount = a.topK;
@@ -728,6 +730,21 @@ __global__ __launch_bounds__(kThreads) void routeKernel(SqrtSoftplusRouteArgs a)
     for (int i = 0; i < a.topK; ++i) w[i] = w[i] / sum * a.routeScale;
 }
 
+/** @brief One CTA per row: copy the bank row named by the position map over sentinel embeddings. */
+__global__ __launch_bounds__(kThreads) void imageMergeKernel(ImageMergeArgs a)
+{
+    const int r = static_cast<int>(blockIdx.x);
+    if (r >= liveRows(a.extent) || !a.imageIds.contains(a.tokens[r])) return;
+    const int pos = a.positions[r];
+    if (pos < 0 || pos >= a.mapRows) invalidDeviceState(); // admission keeps every prompt position inside the map
+    const int v = a.map[pos];
+    if (v <= 0) return;
+    if (v > a.bankRows) invalidDeviceState();
+    const float *src = a.bank + static_cast<std::size_t>(v - 1) * a.width;
+    float *dst = a.embedding + static_cast<std::size_t>(r) * a.width;
+    for (int c = threadIdx.x; c < a.width; c += kThreads) dst[c] = src[c];
+}
+
 /** @brief Grid-stride zero fill of 32-bit words. */
 __global__ __launch_bounds__(kThreads) void zeroWordsKernel(std::uint32_t *words, std::size_t count)
 {
@@ -870,6 +887,13 @@ public:
         require(a.hashTable ? (a.tokens != nullptr) : (a.bias != nullptr), "route policy operands");
         routeKernel<<<grid(a.extent.rows, 1), 32, 0, explicitStream(stream)>>>(a);
         checkLaunch("route");
+    }
+    void imageMerge(const ImageMergeArgs &a, void *stream) const override
+    {
+        require(a.tokens && a.positions && a.bank && a.map && a.embedding && a.width > 0 && a.bankRows > 0 &&
+                    a.mapRows > 0, "imageMerge operands");
+        imageMergeKernel<<<grid(a.extent.rows, 1), kThreads, 0, explicitStream(stream)>>>(a);
+        checkLaunch("imageMerge");
     }
     void zeroBank(void *destination, std::size_t bytes, void *stream) const override
     {

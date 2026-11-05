@@ -9605,6 +9605,16 @@ add_v2_test(V2_Integration_DeepSeekV4ToolSectionInsideReasoning
         --gtest_filter=Test__ChatCompletionHandler.DeepSeekV4ToolSectionInsideReasoningIsExecutable
     LABELS "V2;Integration;ProductionTestPreflight;HTTP;DeepSeekV4;Reasoning;ToolCalling;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+# Production defect: image rows were staged before the context check, so an
+# oversized image request returned 400 but left next_prompt_embedding_rows_
+# populated and the following text request failed with a 500. Rows must be
+# staged only after the expanded-length context check, and admission failure
+# must not stage rows for the next request.
+add_v2_test(V2_Integration_DeepSeekV4PromptRowsLifecycle
+    COMMAND $<TARGET_FILE:v2_test_chat_completion_handler>
+        --gtest_filter=Test__ChatCompletionHandler.OversizedImageExpansionIs400AndNeverStagesRows:Test__ChatCompletionHandler.FailedImageAdmissionDoesNotStageRowsForNextRequest
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;DeepSeekV4;Multimodal;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
 # DeepSeek-V4 image admission equals Pillow (golden JSON embedded for installed runners).
 set(DSV4_IMAGE_GOLDEN_HEADER "${CMAKE_CURRENT_BINARY_DIR}/model-fixtures/DeepSeekV4ImageGolden.generated.h")

@@ -701,7 +701,7 @@ namespace llaminar2
         // Extract model name from path for response metadata
         std::string model_name = std::filesystem::path(config.model_path).stem().string();
 
-        ChatCompletionHandler handler(*runner, *tokenizer, model_name);
+        ChatCompletionHandler handler(*runner, *tokenizer, model_name, ctx.image_encoder);
         SerializedInferenceExecutor inference_executor;
         httplib::Server svr;
         g_server_ptr = &svr;

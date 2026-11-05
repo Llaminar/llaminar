@@ -139,6 +139,22 @@ public:
         std::optional<Qwen4ExpIntBinding> selected;
         Qwen4ExpImmutableWeightBinding sinks;
         Qwen4ExpFloatBinding output;
+        std::optional<Qwen4ExpIntInput> tokens;     ///< Vision: chunk token ids (image spans widen the window).
+        deepseek4::ImageSentinelIds imageIds{};
+    };
+    /**
+     * @brief Vision: overwrite image-sentinel embedding rows from the request bank.
+     * @details The bank and its position map are request-admission inputs; the
+     * embedding is updated in place before the hyper-connection expansion.
+     */
+    struct ImageMerge
+    {
+        int width, bankRows, mapRows;
+        deepseek4::ImageSentinelIds imageIds;
+        Qwen4ExpIntInput tokens, positions;
+        Qwen4ExpFloatBinding bank;                  ///< [bankRows, width].
+        Qwen4ExpIntBinding map;                     ///< [mapRows] bank row + 1 (0 = token embedding).
+        Qwen4ExpFloatBinding embedding;             ///< [M, width], in place.
     };
     /**
      * @brief Publish the forward's real rows to the canonical cache sequence frontier (GPU).
@@ -179,7 +195,7 @@ public:
     /** @brief Closed operation set; absent operands cannot be represented. */
     using Operation = std::variant<HCRead, HCWrite, HCExpand, HeadNormRope, CompressorStore, CompressorPool,
                                    RawStore, IndexerTopK, SparseAttention, GroupedProjection, Route,
-                                   AdvanceSequenceFrontier>;
+                                   AdvanceSequenceFrontier, ImageMerge>;
     /** @brief Immutable graph configuration. */
     struct Params
     {

@@ -201,6 +201,22 @@ namespace llaminar2::deepseek4
         return best;
     }
 
+    int maxImageSlotsPerImage(int max_tokens)
+    {
+        const int budget = max_tokens - (kCompressPadTo - 1);
+        int best = 0;
+        for (int h = 1; h < budget; ++h)
+        {
+            if (gridTokens(h * 42, 42, 14, 3).tokens > budget) break;
+            for (int w = 1; w < budget; ++w)
+            {
+                if (gridTokens(h * 42, w * 42, 14, 3).tokens > budget) break;
+                best = std::max(best, h * w);
+            }
+        }
+        return best;
+    }
+
     std::vector<std::int32_t> expandImagePlaceholders(const std::vector<std::int32_t> &tokens,
                                                       const std::vector<PreparedImage> &images)
     {

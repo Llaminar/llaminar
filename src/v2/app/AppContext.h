@@ -12,6 +12,7 @@
 #include "config/OrchestrationConfig.h"
 #include "execution/runner/IOrchestrationRunner.h"
 #include "utils/Tokenizer.h"
+#include "multimodal/PromptImageEncoder.h"
 #include "utils/MPIContext.h"
 #include "app/MPIProcessSession.h"
 #include "utils/Assertions.h"
@@ -45,6 +46,8 @@ namespace llaminar2
         std::shared_ptr<IMPIContext> mpi_ctx;
         std::unique_ptr<IOrchestrationRunner> runner;
         std::shared_ptr<ITokenizer> tokenizer;
+        /// Request image pipeline selected by --mmproj; null for text-only serving.
+        std::shared_ptr<const multimodal::IPromptImageEncoder> image_encoder;
 
         /**
          * @brief Resolve this process's immutable request-command role.
