@@ -1,7 +1,7 @@
 # ARM CPU kernel implementation evidence
 
 Updated: 2026-11-05. Branch `codex/qfn-ngram-continuation-arm64`, based on
-`2cba3ca1d`. This is an in-progress WIP publication; immutable handoffs retain
+`2cba3ca1d`. This is an in-progress draft publication; immutable handoffs retain
 their own base-plus-overlay identities. This record distinguishes verified
 kernel slices from the unfinished objective in
 [the implementation plan](ARM_CPU_INFERENCE_KERNEL_PLAN.md).
@@ -68,6 +68,85 @@ legacy Q24 narrowing defects, INT32 AVX2 low-bit loss, distinct quantizers,
 Q16 FP32-square rounding/complete-block/expansion-alias seams, and unadmitted
 legacy workspace/row buffers. Those require individual executed regressions,
 repairs, explicit preflights and broader qualification; none is closed here.
+
+## Original-Q16 RMSNorm slice (current worktree, not full integration)
+
+The unchanged publice981 production TU fails all three newly focused cases:
+incomplete32-value geometry silently floors rows and writes partial outputs,
+FP32 expansion overwrites original compressed/gamma banks, and a retained empty
+invocation returns after1/3 arrivals. Exact original source/hash and negative
+logs/XML are retained outside the repository. The new checked expansion borrow
+protects complete original source/output/gamma/options spans before worksharing;
+it neither invents physical capacity nor extends a tensor/arena lease.
+
+Native ARM now consumes1..4 original Q16 rows directly. Decode products and
+squares round to FP32 **before** widening into eight fixed FP64 chains. This is
+not floating RMSNorm's FP64-square program. Every physical M shares the same
+K-chain/fold and original FP32 mean/sqrt/divide inverse; gamma loads are shared.
+No decoded row, hot allocation or shadow coefficient bank is introduced.
+Actual M1 bytes cover M1..16/31/33, original prefixes/canaries, K32/64/96/1056
+and workers1..10. An independent256-shape program runs both default and explicit
+`force_scalar` policies, retaining volatile FP32 edges and distinguishing widened
+FP64-square results; stored `sum_qs` is not substituted for squared energy.
+Reference reduction is selected from declared active ISA and scalar intent,
+never observed output: serial scalar, eight-chain NEON/AVX2, sixteen-chain AVX512.
+The separate K128 RN discriminator produces mean words`3c000000` and`3c000001`
+for the respective eight/sixteen programs and checks their distinct inverses and
+actual public bytes. Production AVX512 arithmetic has not been changed. Invalid policies reject, and numeric corruption inside an
+OpenMP collective is fatally diagnosed rather than repaired to zero.
+
+AVX2 now has a genuine vector Q16 body with the same explicit FP32-square
+program. A named unavailable AVX512 entry rejects instead of silently calling
+scalar; existing compiled AVX512 arithmetic remains distinct. Both actual x86
+compiler envelopes pass syntax, **not new native x86 execution or economy**.
+Current GNU14/native ARM passes15 production-TU,9 actual legacy-TU and3 reduction
+cases. Final Mac five-profile170/170 and130preflights×20=2600 raw passes were
+independently parsed from actual XML/raw records, without failures or skips.
+The earlier167/128 checkpoint remains historical. Factory/runtime/workspace and
+the remaining Q8/INT32/residual programs are unfinished.
+
+Retiring the unavailable named AVX512 scalar substitution exposed six old Unit
+calls: the unchanged actual legacy TU passes2/8 and fails6/8 with the precise
+unavailable-envelope diagnostic. Those original negatives remain preserved.
+ISA-neutral accuracy/edge cases now invoke public native dispatch, with the
+original numerical thresholds; a ninth case proves real named AVX512 output or
+precise rejection and untouched output. Available-entry assertions check every
+finite output against the full reference with the unchanged strict`1e-5` bound,
+not a NaN-blind maximum-difference summary. The canonical Unit name is preserved
+in shared core-free registration using the actual production TU; whole-legacy
+and reduction-identity regressions have explicit preflight entries. Source review
+closed the caller/oracle findings, not x86 runtime or whole-engine readiness.
+
+One exact baseline four-row assembly candidate initially loaded span pointers
+from the hot stack and retained summaries around libc sqrt branches. Checked
+contiguous original strides and SIMD-across-row hardware sqrt/divide remove
+those hot stack loads/calls while preserving the independent byte program;
+inactive inverse lanes are1, not0/0. The bounded optimized hot loops use28 SIMD
+register IDs under AppleClang, with no SP access/calls; four d8..d11 ABI saves
+are not hot spills. A separately compiled genuine native GNU14 baseline candidate
+uses23 SIMD register identities across its bounded reduction/publication loops,
+with no hot SP access/calls; its32-byte frame is GPR/cold-exception storage, not
+hot SIMD spill traffic. These static resources are not achieved IPC/cache/
+throughput, PMU evidence or a final `Perf__` certificate.
+
+Native x86 current-source qualification is still pending. Fresh read-only SDK
+probes now directly prove both old CMake and CTest3.28.3, which cannot satisfy the
+real4.x metadata prerequisite. One authenticated SDK-preparation attempt failed
+before any RUN/install: BuildKit tried registry metadata resolution for the local
+base despite`--pull=false`/`--network=none`. Archive`445761da8119c28f4f7fc680f1d32b7df3cf953ba3979f57b3be74c6253b3ea8`
+retains the failure and unchanged35-layer base; no successor or source test ran.
+A separately authorized local-only producer uses the exact local config ID,
+`docker create --pull=never`, authenticated offline official wheels and an owned
+committed layer. Its actual tool/metadata/C++ proofs and immutable successor must
+exist before AVX2/AVX512 tests; this is not permission to weaken tool checks,
+change host packages/services, or claim inherited x86 coverage.
+
+The actual canonical hook was attempted again for this slice. Default AppleClang
+OpenMP discovery failed; explicit genuine Homebrew libomp then reached the same
+fatal`CMakeLists.txt:173` native-macOS memory/placement diagnostic. Neither full
+Unit nor production-preflight target build/test ran. A published draft checkpoint
+therefore uses the documented explicit hook bypass, disclosed as incomplete gate
+evidence rather than a readiness waiver. Hooks remain registered and unchanged.
 
 ## Configure-host topology and evidence retirement
 
@@ -150,6 +229,44 @@ scope. Configure alone failed; app/gate compilation never began. The stopped pac
 heterogeneous topology fix and a new authenticated successor precede any retry.
 No model/GPU/corpus/cluster work or broader test campaign is authorized by this
 build-only attempt.
+
+## Genuine native engine configure successor and compiler frontier
+
+New immutable packetc76b306f…72f74/publice981 with explicit SDK4e8a/indexd211
+received one fresh lab/capacity-admitted CPU-only build window. Main independently
+checks returned archive`37a73cb48f14a1b12775350d28a7e9deab2570ac7c78bf79fe8e5e6d6dad7014`
+(2308502 bytes), all124 raw hashes, all7060 original source-before records,
+actual native config/rootfs identity, real compiler command and topology fields.
+Actual parent configure/generate **passes97.265s**:1 accessible package,20
+eligible cores,1 available thread/core and OMP20, matching original package36,
+core/sibling/affinity0..19 records. CTest4 show-only exposes3420 entries and
+3119 actual SIGTERM/36 pairs; **no tests execute**.
+
+The ordinary unrestricted app/complete-gate target build then **fails90.352s**
+at the unused unconditional `<immintrin.h>` in KVCacheAppendStage.cpp:31.
+Private cgroup peak19,521,458,176 bytes, OOM0; terminal PID0/exit1, no hidden
+success. Genuine parent2136-command database now exists. The source-after
+comparison is recorded as a successful7060-entry verifier summary, not a retained
+immediate per-file map. A read-only supplement later captures the unchanged owned
+source at22:25:44.222002–22:25:44.602449UTC. Main independently verifies archive
+`8db22132…66726`, all10 raw hashes and exact equality of all7060 per-entry
+before/after records (bytes/modes/UID/GID/kinds/link targets). This later capture
+is explicitly not retrodated or reconstructed into immediate evidence. No new
+container/build/package/config activity runs. Prior packet/SDK/results stay
+immutable and the lab window was released.
+
+Main removes that unused header without adding an ISA branch, scalar substitute
+or model-stage arithmetic. A focused Unit/explicit preflight keeps direct ISA
+headers out of this publication stage; native codecs remain authorities.
+The **actual current stage TU** passes genuine GNU14 syntax with the exactc76
+production command and genuine NUMA/oneDNN/dependency closure. The corresponding
+Mac syntax attempt remains RED on unavailable real `numa.h`; no stub is supplied.
+Syntax is not an app/gate build. A new source successor and fresh authorization
+must precede any additional native full build; never patch/retryc76/3bf/662.
+
+The owner-requested commit-message cleanup changes no trees: publicf5b3ab56e
+is tree-identical to originale981, and tag`arm-cpu-checkpoint-e9811f0a2` retains
+all original authenticated ancestors. Frozen packet identities remain unchanged.
 
 ## Linux GCC rounding regression: Spark RED and local repair
 

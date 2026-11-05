@@ -4,8 +4,9 @@
  *
  * ISA-specific leaves retain their declared reduction/inverse/publication
  * programs. Native ARM consumes original FP32/FP16/BF16/INT32 values through
- * fixed register reductions and the canonical portable half codec, without
- * decoded row banks. Caller-owned tensors, gamma and scratch retain their
+ * fixed register reductions and the canonical portable half codec. Native Q16
+ * tiles retain separately rounded FP32 decode/squares before FP64 accumulation;
+ * they share gamma without constructing decoded row banks. Caller-owned tensors, gamma and scratch retain their
  * lifetime/admission authority; synchronous arithmetic creates no new lease.
  * @author David Sanftenberg
  */
@@ -23,12 +24,12 @@
 #include "../../../utils/CPUFeatures.h"
 #if defined(__aarch64__) && defined(__ARM_NEON)
 #include "NEONRMSNormFloatingRows.h"
+#include "NEONRMSNormQ16Rows.h"
 #endif
 
-#if defined(__AVX512F__)
+#if defined(__AVX512F__) || defined(__AVX2__)
 #include <immintrin.h>
-#elif defined(__AVX2__)
-#include <immintrin.h>
+#include "../../../tensors/X86FP32.h"
 #endif
 
 namespace llaminar2::primitives
@@ -474,6 +475,33 @@ namespace llaminar2::primitives
             // which a standalone fork/join is not economical.
             OMP_WORKSHARE_REGION_IF(work, omp_in_parallel() ||
                 (tiles > 1 && want_parallel(bank.rows(),bank.columns(),opts)));
+        }
+
+        /** @brief Workshare complete original Q16 tiles without row replay or decoded storage.
+         * @param bank Checked compressed/expansion banks and original policy.
+         * @param opts Retained execution intent; no new workspace or owner is created.
+         */
+        void native_q16_matrix(const rmsnorm_operands::Q16ExpansionBorrow &bank,const RMSNormExecOptions &opts)
+        {
+            const auto tiles=bank.empty()?0:bank.rows()/4+(bank.rows()%4!=0);
+            auto work=[&](){
+#pragma omp for schedule(static)
+                for(std::ptrdiff_t tile=0;tile<std::ptrdiff_t(tiles);++tile)
+                {
+                    const auto first=std::size_t(tile)*4;
+                    switch(std::min<std::size_t>(4,bank.rows()-first))
+                    {
+                    case 4: neon_rmsnorm::normalizeQ16<4>(bank,first);break;
+                    case 3: neon_rmsnorm::normalizeQ16<3>(bank,first);break;
+                    case 2: neon_rmsnorm::normalizeQ16<2>(bank,first);break;
+                    case 1: neon_rmsnorm::normalizeQ16<1>(bank,first);break;
+                    }
+                }
+            };
+            // Retained small/empty invocations are still collective completion
+            // boundaries, even when a standalone fork would not repay its cost.
+            OMP_WORKSHARE_REGION_IF(work,omp_in_parallel()||
+                (tiles>1&&want_parallel(bank.rows(),bank.columns(),opts)));
         }
 
         /** @brief Authenticate explicit native dispatch; a scalar request is diagnostic intent.
@@ -3270,6 +3298,58 @@ namespace llaminar2::primitives
     // Q16_1 RMSNorm (Q16_1 input → FP32 output)
     // ========================================================================
 
+#if defined(__AVX2__)
+    /** @brief Native AVX2 Q16 program with FP32 squares and eight fixed FP64 chains.
+     * @param input Complete original Q16 row; @param gamma Immutable original weights.
+     * @param output Disjoint floating row; @param cols Complete32-value geometry.
+     * @param epsilon Original finite nonnegative policy.
+     * @throws std::invalid_argument For malformed original spans/aliases/policy.
+     * @throws std::domain_error For a nonfinite summary or undefined inverse.
+     */
+    static void rmsnorm_q16_1_fp32_row_avx2(const Q16_1Block *input,const float *gamma,
+                                           float *output,std::size_t cols,float epsilon)
+    {
+        const auto bank=rmsnorm_operands::Q16ExpansionBorrow::bind(input,gamma,output,1,cols,epsilon);
+        if(bank.empty())return;
+        auto low=_mm256_setzero_pd(),high=_mm256_setzero_pd();
+        for(std::size_t block=0;block<cols/32;++block)
+        {
+            const auto scale=_mm256_set1_ps(input[block].d);
+            for(std::size_t offset=0;offset<32;offset+=8)
+            {
+                const auto codes=_mm_loadu_si128(reinterpret_cast<const __m128i*>(input[block].qs+offset));
+                const auto value=x86_fp32::persistRounded(_mm256_mul_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(codes)),scale));
+                const auto square=x86_fp32::persistRounded(_mm256_mul_ps(value,value));
+                low=_mm256_add_pd(low,_mm256_cvtps_pd(_mm256_castps256_ps128(square)));
+                high=_mm256_add_pd(high,_mm256_cvtps_pd(_mm256_extractf128_ps(square,1)));
+            }
+        }
+        // Match the declared eight-lane native tree, never the worker partition.
+        const auto folded=_mm_add_pd(
+            _mm_add_pd(_mm256_castpd256_pd128(low),_mm256_extractf128_pd(low,1)),
+            _mm_add_pd(_mm256_castpd256_pd128(high),_mm256_extractf128_pd(high,1)));
+        const double sum=_mm_cvtsd_f64(folded)+_mm_cvtsd_f64(_mm_unpackhi_pd(folded,folded));
+        if(!std::isfinite(sum))throw std::domain_error("AVX2 Q16 RMS observed a nonfinite FP32-square summary");
+        const float inverse=1.0f/std::sqrt(float(sum/double(cols))+epsilon);
+        if(!std::isfinite(inverse))throw std::domain_error("AVX2 Q16 RMS inverse is not representable");
+        const auto inv=_mm256_set1_ps(inverse);
+        for(std::size_t block=0;block<cols/32;++block)
+        {
+            const auto scale=_mm256_set1_ps(input[block].d);
+            for(std::size_t offset=0;offset<32;offset+=8)
+            {
+                const auto column=block*32+offset;
+                const auto codes=_mm_loadu_si128(reinterpret_cast<const __m128i*>(input[block].qs+offset));
+                const auto value=x86_fp32::persistRounded(_mm256_mul_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(codes)),scale));
+                const auto normalized=x86_fp32::persistRounded(_mm256_mul_ps(value,inv));
+                _mm256_storeu_ps(output+column,_mm256_mul_ps(normalized,_mm256_loadu_ps(gamma+column)));
+            }
+        }
+    }
+#endif
+
     void rmsnorm_q16_1_fp32_row_scalar(
         const Q16_1Block *input,
         const float *gamma,
@@ -3277,11 +3357,12 @@ namespace llaminar2::primitives
         std::size_t cols,
         float epsilon)
     {
-        if (!input || !gamma || !output || cols == 0)
-            return;
-
+        const auto bank=rmsnorm_operands::Q16ExpansionBorrow::bind(input,gamma,output,1,cols,epsilon);
+        if(bank.empty())return;
         const size_t n_blocks = cols / 32;
 
+        // This distinct program rounds each square to FP32 before widening;
+        // do not replace it with floating RMSNorm's FP64-square reduction.
         // Pass 1: Compute sum of squares with double precision accumulation
         // Dequantize on-the-fly: val = scale * qs
         double sum_sq = 0.0;
@@ -3297,9 +3378,11 @@ namespace llaminar2::primitives
             }
         }
 
-        // Compute RMS and inverse
+        // Compute RMS and inverse through the original FP32-mean program.
+        if(!std::isfinite(sum_sq))throw std::domain_error("Scalar Q16 RMS observed a nonfinite FP32-square summary");
         float rms = std::sqrt(static_cast<float>(sum_sq / cols) + epsilon);
         float inv_rms = 1.0f / rms;
+        if(!std::isfinite(inv_rms))throw std::domain_error("Scalar Q16 RMS inverse is not representable");
 
         // Pass 2: Dequantize + normalize + gamma + write
         for (size_t blk = 0; blk < n_blocks; ++blk)
@@ -3324,9 +3407,8 @@ namespace llaminar2::primitives
         std::size_t cols,
         float epsilon)
     {
-        if (!input || !gamma || !output || cols == 0)
-            return;
-
+        const auto bank=rmsnorm_operands::Q16ExpansionBorrow::bind(input,gamma,output,1,cols,epsilon);
+        if(bank.empty())return;
         const size_t n_blocks = cols / 32;
 
         // Pass 1: Vectorized sum of squares
@@ -3371,8 +3453,11 @@ namespace llaminar2::primitives
         double sum_sq = _mm512_reduce_add_pd(sum_total_d);
 
         // Compute RMS and inverse
+        if(!std::isfinite(sum_sq))throw std::domain_error("AVX512 Q16 RMS observed a nonfinite FP32-square summary");
         float rms = std::sqrt(static_cast<float>(sum_sq / cols) + epsilon);
-        __m512 inv_rms_vec = _mm512_set1_ps(1.0f / rms);
+        const float inverse=1.0f/rms;
+        if(!std::isfinite(inverse))throw std::domain_error("AVX512 Q16 RMS inverse is not representable");
+        __m512 inv_rms_vec = _mm512_set1_ps(inverse);
 
         // Pass 2: Vectorized dequant + normalize + gamma + write
         for (size_t blk = 0; blk < n_blocks; ++blk)
@@ -3408,8 +3493,8 @@ namespace llaminar2::primitives
         std::size_t cols,
         float epsilon)
     {
-        // Fallback to scalar on non-AVX512 systems
-        rmsnorm_q16_1_fp32_row_scalar(input, gamma, output, cols, epsilon);
+        (void)input;(void)gamma;(void)output;(void)cols;(void)epsilon;
+        throw std::runtime_error("Q16 RMS AVX512 entry requires an actual AVX512 compiler envelope");
     }
 #endif
 
@@ -3422,54 +3507,39 @@ namespace llaminar2::primitives
         float epsilon,
         const RMSNormExecOptions &opts)
     {
-        if (!input || !gamma || !output || rows == 0 || cols == 0)
+        const auto bank=rmsnorm_operands::Q16ExpansionBorrow::bind(input,gamma,output,rows,cols,epsilon);
+        bank.requireMetadataReadOnly(&opts,sizeof(opts));
+        if(opts.t5_compat_mode)
+            throw std::invalid_argument("Q16 RMS FP32-square policy is distinct from FP32 T5 accumulation");
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        if(use_native_rmsnorm(opts))
+        {
+            native_q16_matrix(bank,opts);
             return;
-
-        const size_t blocks_per_row = cols / 32;
-
-        // Select implementation based on CPU features
-#if defined(__AVX512F__)
-        auto row_fn = rmsnorm_q16_1_fp32_row_avx512;
-#else
-        auto row_fn = rmsnorm_q16_1_fp32_row_scalar;
+        }
 #endif
-
-        if (opts.force_scalar)
+        auto row_fn=rmsnorm_q16_1_fp32_row_scalar;
+        if(!opts.force_scalar)
         {
-            row_fn = rmsnorm_q16_1_fp32_row_scalar;
-        }
-
-        bool should_parallelize = opts.allow_parallel && (rows * cols >= opts.parallel_threshold_elems);
-
-        if (should_parallelize)
-        {
-            auto do_work = [&]()
+            switch(activeISALevel())
             {
+            case ISALevel::Scalar:break; // An explicitly selected scalar backend, not an ISA replacement.
+#if defined(__AVX2__)
+            case ISALevel::AVX2:row_fn=rmsnorm_q16_1_fp32_row_avx2;break;
+#endif
+#if defined(__AVX512F__)
+            case ISALevel::AVX512:row_fn=rmsnorm_q16_1_fp32_row_avx512;break;
+#endif
+            default:throw std::runtime_error("Q16 RMS active ISA has no matching native compiler implementation");
+            }
+        }
+        const auto blocks=cols/32;
+        auto work=[&](){
 #pragma omp for schedule(static)
-                for (long long r = 0; r < static_cast<long long>(rows); ++r)
-                {
-                    row_fn(
-                        input + r * blocks_per_row,
-                        gamma,
-                        output + r * cols,
-                        cols,
-                        epsilon);
-                }
-            };
-            OMP_WORKSHARE_REGION(do_work);
-            return;
-        }
-
-        // Sequential path
-        for (size_t r = 0; r < rows; ++r)
-        {
-            row_fn(
-                input + r * blocks_per_row,
-                gamma,
-                output + r * cols,
-                cols,
-                epsilon);
-        }
+            for(std::ptrdiff_t row=0;row<std::ptrdiff_t(bank.empty()?0:rows);++row)
+                row_fn(input+std::size_t(row)*blocks,gamma,output+std::size_t(row)*cols,cols,epsilon);
+        };
+        OMP_WORKSHARE_REGION_IF(work,omp_in_parallel()||want_parallel(rows,cols,opts));
     }
 
 } // namespace llaminar2::primitives
