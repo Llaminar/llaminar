@@ -1173,3 +1173,33 @@ that admission cell remains red, with every resource retired and clean drivers.
 This checkpoint contains only the independently scoped frame fix and regression,
 not the pending native transport or Dynamic cohort changes. It is not complete
 preflight, source admission, numerical or Release performance qualification.
+
+## Explicit source reader-count identity (focused310)
+
+Source materialization retained the correct compute-reader count, but readiness
+reconstructed its identity with an implicit count of one. Shared readers and
+physical storage owners are independent dimensions. Both geometry constructors
+and the original-storage readiness interface now require the declared reader
+count explicitly; ModelContext supplies it from the existing resolved geometry.
+Original source, owner ordering, generation and PMA checks remain mandatory.
+
+The contract regression covers reader counts 1/2/4/8 independently of one or
+three storage owners, both GPU vendor metadata, changed counts/source geometry,
+changed owner/coordinator generations and invalid zero readers. These metadata
+widths do not claim native four/eight-device qualification. Its explicit
+preflight registration is `V2_Integration_PooledImmutableSourceComputeReaderReadiness`.
+
+`build308` compiled the five affected targets with the existing spill guards;
+`build309` refreshed the contract-test registration name. `focused310` passed
+all ten selected registrations in 29.88 seconds, with no skips and clean drivers:
+the two owning unit fixtures, readiness/ordering contracts, and CUDA/ROCm owner,
+C0 and positive-capacity source-setup tests. Four owning translation units also
+passed syntax checks against the exact checkpoint composition in
+`/tmp/qfn-reader-count-checkpoint-review-r415/`.
+
+The subsequent native diagnostic `/tmp/qfn-cuda-shared-source-r311/` completed
+initial model admission, then failed at runner reuse because retention queried
+a shared reader as a source owner. Final cleanup also rejected the invalidated
+contract; canonical resource retirement was not proven, although drivers were
+clean. Those separate repairs remain outside this checkpoint. No complete
+preflight, full source matrix, numerical or Release performance pass is claimed.

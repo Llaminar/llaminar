@@ -58,15 +58,15 @@ std::shared_ptr<PooledImmutableSourcePreparedStorage> PooledImmutableSourcePrepa
 PooledImmutableNativeRoots PooledImmutableSourcePreparedStorage::roots()const{return roots_->roots();}
 void PooledImmutableSourcePreparedStorage::requireFor(const PooledImmutablePhysicalOwnerGeometry& physical,
     const PooledImmutableCoordinatorGeometry& coordinator,const ImmutableRowTableSource& source,
-    const std::shared_ptr<const PhysicalMemoryAuthority>& memory)const{
+    std::uint32_t expected_compute_readers,const std::shared_ptr<const PhysicalMemoryAuthority>& memory)const{
     coordinator_->requireAuthority(memory);roots_->requireAuthority(memory);
     const auto& original=coordinator_->plan().parameters();std::vector<PooledImmutableOwnerNativePlan> declarations;
     for(std::size_t i=0;i<owners_.size();++i){owners_[i]->requireAuthority(memory);declarations.push_back(PooledImmutableOwnerNativePlan::fromGeometry(physical,coordinator,i,original.table,original.source_storage_generation));
         if(declarations.back().parameters().identity!=owners_[i]->plan().parameters().identity)throw std::logic_error("Pooled source changed original physical owner declaration");}
     const auto policy=PooledImmutableCoordinatorNativePlan::fromGeometry(physical,coordinator,original.table,original.source_storage_generation);
-    const auto expected=PooledImmutableSourceGeometry::fromPlans(declarations,policy,source);
-    if(policy.parameters().identity!=original.identity || expected.parameters().identity!=geometry_.parameters().identity)
-        throw std::logic_error("Pooled source changed its original source/policy/cohort");
+    if(policy.parameters().identity!=original.identity)
+        throw std::logic_error("Pooled source changed its original coordinator policy");
+    geometry_.requireOriginalPlans(declarations,policy,source,expected_compute_readers);
     captureIdentity();
 }
 ImmutableLookupNativeOwnerObservation PooledImmutableSourcePreparedStorage::retainedOwnerObservation()const{

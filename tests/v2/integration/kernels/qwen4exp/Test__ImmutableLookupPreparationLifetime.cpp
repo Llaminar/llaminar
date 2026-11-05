@@ -214,7 +214,7 @@ void abandonPooledPreparation(DeviceId device)
                     binding.deviceView().base.table,binding.storageGeneration());
                 const auto coordinatorPlan=PooledImmutableCoordinatorNativePlan::fromGeometry(physical,policy,
                     binding.deviceView().base.table,binding.storageGeneration());
-                const auto geometry=PooledImmutableSourceGeometry::fromPlans(ownerPlan,coordinatorPlan,source);
+                const auto geometry=PooledImmutableSourceGeometry::fromPlans(ownerPlan,coordinatorPlan,source,1);
                 const auto stream=ExplicitGPUStream(worker.defaultStream()).get();
                 auto owner=PooledImmutableOwnerPreparedStorage::create(ownerPlan,memory,stream);
                 auto coordinator=PooledImmutableCoordinatorPreparedStorage::create(coordinatorPlan,memory,stream);

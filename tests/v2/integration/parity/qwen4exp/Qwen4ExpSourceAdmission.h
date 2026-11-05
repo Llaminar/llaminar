@@ -429,7 +429,7 @@ inline void expectQwen4ExpSourceGPUAdaptiveConsumer(const ModelParityCase &cell,
     const auto provider_owner=provider->retainedOwnerObservation();
     ASSERT_TRUE(retained->physical_memory_authority);
     const auto &memory=retained->physical_memory_authority;
-    ASSERT_NO_THROW(storage->requireFor(geometry.physical(),geometry.coordinator(),provider->source(),memory));
+    ASSERT_NO_THROW(storage->requireFor(geometry.physical(),geometry.coordinator(),provider->source(),geometry.computeReaderCount(),memory));
     EXPECT_EQ(gpu_owner.authority().get(),memory.get());EXPECT_EQ(source_owner.authority().get(),memory.get());
     EXPECT_EQ(provider_owner.authority().get(),memory.get());
     EXPECT_EQ(gpu_owner.allocator(),gpu);EXPECT_EQ(source_owner.allocator(),host);

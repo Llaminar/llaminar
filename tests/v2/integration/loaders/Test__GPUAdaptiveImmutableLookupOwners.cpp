@@ -231,10 +231,10 @@ void prove(DeviceId device,std::size_t slots)
             EXPECT_EQ(boundary->pooledStorage()->owner()->roots().native.get(),protocol);
             auto foreign=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(component),0);
             EXPECT_THROW(context->prepareImmutableRowTableForConsumer(*placement,foreign,device,std::nullopt,TransferEngine::instance(),AdaptiveImmutableLookupDevicePreparation{device,stream}),std::logic_error);
-            EXPECT_THROW(boundary->pooledStorage()->requireFor(geometry.physical(),geometry.coordinator(),nativeSource(profile),foreign),std::logic_error);
+            EXPECT_THROW(boundary->pooledStorage()->requireFor(geometry.physical(),geometry.coordinator(),nativeSource(profile),geometry.computeReaderCount(),foreign),std::logic_error);
             auto changed=placement->gpuAdaptiveRequest();++changed.gpu_policy.aging_accesses;
             const auto changedPlan=AdaptiveImmutableLookupGeometry::fromLayout(placement->gpuAdaptiveLayout(),nativeSource(profile),changed);
-            EXPECT_THROW(boundary->pooledStorage()->requireFor(changedPlan.physical(),changedPlan.coordinator(),nativeSource(profile),memory),std::logic_error);
+            EXPECT_THROW(boundary->pooledStorage()->requireFor(changedPlan.physical(),changedPlan.coordinator(),nativeSource(profile),changedPlan.computeReaderCount(),memory),std::logic_error);
             EXPECT_EQ(boundary->captureIdentity(),identity);
             worker.submitAndWait([&]{EXPECT_TRUE(backend->synchronizeStream(stream,device.ordinal));});
             graph.reset();

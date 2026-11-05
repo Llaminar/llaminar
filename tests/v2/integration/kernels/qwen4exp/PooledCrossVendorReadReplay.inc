@@ -77,7 +77,7 @@ public:
         workers_[0]->submitAndWait([&]{coordinator_=q::PooledImmutableCoordinatorPreparedStorage::create(cp,memory_,streams_[0]);code_[0]=bundle(sourceDevice);code_[0]->initialize(*coordinator_,streams_[0]);});
         workers_[1]->submitAndWait([&]{owner_=q::PooledImmutableOwnerPreparedStorage::create(op,memory_,streams_[1]);code_[1]=bundle(ownerDevice);code_[1]->initialize(*owner_,streams_[1]);});
         workers_[0]->submitAndWait([&]{
-            boundary_=q::ImmutableLookupExecutionBoundary::createPooled(service_,q::PooledImmutableSourceGeometry::fromPlans(op,cp,source),owner_,coordinator_,memory_,streams_[0]);
+            boundary_=q::ImmutableLookupExecutionBoundary::createPooled(service_,q::PooledImmutableSourceGeometry::fromPlans(op,cp,source,1),owner_,coordinator_,memory_,streams_[0]);
             const std::array roles{BufferId::QFN_NGRAM_ROW_IDS,BufferId::PREFILL_CHUNK_GEOMETRY,BufferId::MTP_GENERATION_CONTROL,BufferId::QFN_PLE_EMBEDDING,BufferId::MTP_GENERATION_RESPONSE_TOKENS};
             for(size_t i=0;i<roles.size();++i){std::shared_ptr<TensorBase> root(declarations[i].materialize(memory_));if(i==3)std::fill_n(static_cast<float*>(root->raw_mutable_data()),Maximum*file_.columns,-12345.f);
                 TransferEngine::prepareDeviceInput(root.get(),devices_[0],streams_[0]);TransferEngine::requireDeviceInput(root.get(),devices_[0],streams_[0]);requireProvider(arenas_[0]->registerExternalBuffer(roles[i],root),"Read component original activation role replaced");}

@@ -828,8 +828,8 @@ TEST(PooledImmutableNative, SourceOwnerCohortIdentityRejectsForeignAllocatorAndR
             const auto actual=q::PooledImmutableOwnerNativePlan::fromGeometry(original,policy,coordinate,701,17);
             EXPECT_NO_THROW(coordinator.requireOwnerPlan(actual));
             std::vector<q::PooledImmutableOwnerNativePlan> cohort;for(std::uint32_t i=0;i<participants;++i)cohort.push_back(q::PooledImmutableOwnerNativePlan::fromGeometry(original,policy,i,701,17));
-            EXPECT_NO_THROW(q::PooledImmutableSourceGeometry::fromPlans(cohort,coordinator,descriptor));
-            if(participants>1)EXPECT_THROW(q::PooledImmutableSourceGeometry::fromPlans(actual,coordinator,descriptor),std::invalid_argument);
+            EXPECT_NO_THROW(q::PooledImmutableSourceGeometry::fromPlans(cohort,coordinator,descriptor,1));
+            if(participants>1)EXPECT_THROW(q::PooledImmutableSourceGeometry::fromPlans(actual,coordinator,descriptor,1),std::invalid_argument);
             const auto allocator=actual.allocator();
             const std::array replacements{
                 PhysicalMemoryAllocatorIdentity{allocator.world_rank+1000,allocator.device},
@@ -845,7 +845,7 @@ TEST(PooledImmutableNative, SourceOwnerCohortIdentityRejectsForeignAllocatorAndR
                     const auto owner=q::PooledImmutableOwnerNativePlan::fromGeometry(foreign,foreignPolicy,candidate,701,17);
                     ASSERT_EQ(owner.parameters().owner.capacity(),capacities[candidate]);
                     EXPECT_THROW(coordinator.requireOwnerPlan(owner),std::invalid_argument);
-                    EXPECT_THROW(q::PooledImmutableSourceGeometry::fromPlans(owner,coordinator,descriptor),std::invalid_argument);
+                    EXPECT_THROW(q::PooledImmutableSourceGeometry::fromPlans(owner,coordinator,descriptor,1),std::invalid_argument);
                 }
             }
         }
@@ -865,7 +865,7 @@ TEST(PooledImmutableNative, ActualSourceCompletionAndPartialAcknowledgementsPres
         ASSERT_NO_THROW(pool.wave<true>());
         const ImmutableRowTableSource descriptor{.path="cpu_parser_original_source",.tensor_name="per_layer_token_embd.weight",
             .file_offset=37,.rows=0x100000100ULL,.row_elements=160,.format=GGUFTensorType::IQ4_NL};
-        const auto geometry=q::PooledImmutableSourceGeometry::fromPlans(pool.owners.front()->plan,pool.plan,descriptor);
+        const auto geometry=q::PooledImmutableSourceGeometry::fromPlans(pool.owners.front()->plan,pool.plan,descriptor,1);
         const auto parameters=geometry.parameters();Bytes frame(parameters.offsets.frame_bytes),native(parameters.offsets.native_bytes);
         std::memset(native.data(),0,parameters.offsets.native_bytes);
         std::array<std::int64_t,16> ids{};std::array<ImmutableRowSubordinateIntent,16> intents{};
@@ -935,7 +935,7 @@ TEST(PooledImmutableNative, RejectedSourcePlanSealsFailureWithoutInventingRetire
         ASSERT_NO_THROW(pool.wave<true>());
         const ImmutableRowTableSource descriptor{.path="cpu_parser_original_source",.tensor_name="per_layer_token_embd.weight",
             .file_offset=37,.rows=0x100000100ULL,.row_elements=160,.format=GGUFTensorType::IQ4_NL};
-        const auto geometry=q::PooledImmutableSourceGeometry::fromPlans(pool.owners.front()->plan,pool.plan,descriptor);
+        const auto geometry=q::PooledImmutableSourceGeometry::fromPlans(pool.owners.front()->plan,pool.plan,descriptor,1);
         const auto parameters=geometry.parameters();Bytes frame(parameters.offsets.frame_bytes),native(parameters.offsets.native_bytes);
         std::memset(native.data(),0,parameters.offsets.native_bytes);
         std::array<std::int64_t,16> ids{};std::array<ImmutableRowSubordinateIntent,16> intents{};
@@ -990,7 +990,7 @@ TEST(PooledImmutableNative, SplitTerminalObservationWaitsForActualRetirementAndR
         .rows=0x100000100ULL,.row_elements=160,.format=GGUFTensorType::IQ4_NL};
     for(const auto slots:{0u,1u,4u}){
         Pool pool(std::array{slots});
-        const auto geometry=q::PooledImmutableSourceGeometry::fromPlans(pool.owners.front()->plan,pool.plan,descriptor);
+        const auto geometry=q::PooledImmutableSourceGeometry::fromPlans(pool.owners.front()->plan,pool.plan,descriptor,1);
         Bytes frame(geometry.parameters().offsets.frame_bytes),native(geometry.parameters().offsets.native_bytes);
         std::memset(native.data(),0,geometry.parameters().offsets.native_bytes);
         std::array<int,sampling_math::kDeviceGenerationControlCount> control{};control[sampling_math::kDeviceGenerationControlOk]=1;
@@ -1046,7 +1046,7 @@ TEST(PooledImmutableNative, BeforeReadyCancellationPreservesConsumedWitnessAndRe
         Pool pool(std::array{capacity});
         const ImmutableRowTableSource descriptor{.path="cpu_original_source",.tensor_name="per_layer_token_embd.weight",
             .file_offset=37,.rows=0x100000100ULL,.row_elements=160,.format=GGUFTensorType::IQ4_NL};
-        const auto geometry=q::PooledImmutableSourceGeometry::fromPlans(pool.owners.front()->plan,pool.plan,descriptor);
+        const auto geometry=q::PooledImmutableSourceGeometry::fromPlans(pool.owners.front()->plan,pool.plan,descriptor,1);
         Bytes frame(geometry.parameters().offsets.frame_bytes),native(geometry.parameters().offsets.native_bytes);
         std::memset(native.data(),0,geometry.parameters().offsets.native_bytes);
         int healthy=1,error=0;
@@ -1345,7 +1345,7 @@ struct DistributedSourceReplay {
     static q::PooledImmutableSourceGeometry sourceGeometry(Pool& pool){
         std::vector<q::PooledImmutableOwnerNativePlan> owners;for(const auto& owner:pool.owners)owners.push_back(owner->plan);
         const ImmutableRowTableSource descriptor{.path="decoded_source_replay",.tensor_name="per_layer_token_embd.weight",.file_offset=37,.rows=0x100000100ULL,.row_elements=160,.format=GGUFTensorType::IQ4_NL};
-        return q::PooledImmutableSourceGeometry::fromPlans(owners,pool.plan,descriptor);
+        return q::PooledImmutableSourceGeometry::fromPlans(owners,pool.plan,descriptor,1);
     }
     explicit DistributedSourceReplay(const std::vector<uint32_t>& capacities,std::optional<std::size_t> local=std::nullopt):pool(capacities,64,{65536,1,2},local),geometry(sourceGeometry(pool)),frame(geometry.parameters().offsets.frame_bytes),native(geometry.parameters().offsets.native_bytes),ids(16),intents(16),mappedAcks(16),args{geometry.parameters(),{geometry.parameters().owner,nullptr,nullptr,nullptr,{}},pool.args,frame.data(),native.data(),{{nullptr,nullptr,nullptr,ids.data(),nullptr,701,16,90},intents.data(),mappedAcks.data()},&healthy,&error}{
         std::memset(native.data(),0,geometry.parameters().offsets.native_bytes);q::pooled_source::protocol(args).admissionGeneration=17;q::pooled_source::invocation(args)=23;

@@ -522,7 +522,7 @@ namespace llaminar2
         {
             // Source authentication is an owner readiness operation, never an
             // empty gather or a CPU readback of warmed GPU cache state.
-            ready->pooledStorage()->requireFor(geometry.physical(),geometry.coordinator(),source,authority);
+            ready->pooledStorage()->requireFor(geometry.physical(),geometry.coordinator(),source,geometry.computeReaderCount(),authority);
             const auto observed=ready->retainedSourceOwnerObservation();
             if(observed.authority().get()!=authority.get() || observed.allocator()!=host ||
                 observed.hostPlacement()!=placement.hostPlacement())
@@ -846,7 +846,7 @@ namespace llaminar2
                     ? AdaptiveImmutableLookupGeometry::forRequester(layout,*source,placement.gpuAdaptiveRequest(),
                         {authority->worldRank(),device})
                     : AdaptiveImmutableLookupGeometry::fromLayout(layout,*source,placement.gpuAdaptiveRequest());
-                boundary->pooledStorage()->requireFor(geometry.physical(),geometry.coordinator(),*source,authority);
+                boundary->pooledStorage()->requireFor(geometry.physical(),geometry.coordinator(),*source,geometry.computeReaderCount(),authority);
                 const auto host=boundary->retainedSourceOwnerObservation();
                 // This is the SAME shared physical/source observation on each
                 // channel, not a per-consumer credit or another reservation.

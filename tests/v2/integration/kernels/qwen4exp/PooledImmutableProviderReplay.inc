@@ -353,7 +353,7 @@ public:
         const auto sourceBinding=service->bindSubordinate(device);
         auto ownerPlan=q::PooledImmutableOwnerNativePlan::fromGeometry(physical,policy,0,sourceBinding.deviceView().base.table,sourceBinding.storageGeneration());
         auto coordinatorPlan=q::PooledImmutableCoordinatorNativePlan::fromGeometry(physical,policy,sourceBinding.deviceView().base.table,sourceBinding.storageGeneration());
-        const auto sourceGeometry=q::PooledImmutableSourceGeometry::fromPlans(ownerPlan,coordinatorPlan,source);
+        const auto sourceGeometry=q::PooledImmutableSourceGeometry::fromPlans(ownerPlan,coordinatorPlan,source,1);
         if(program.spec.ownership==OwnerAdmission::RejectForeignAuthority){
             auto foreign=std::make_shared<PhysicalMemoryAuthority>(memory->admission(),0);
             EXPECT_THROW(q::PooledImmutableOwnerPreparedStorage::create(ownerPlan,foreign,stream),std::logic_error);

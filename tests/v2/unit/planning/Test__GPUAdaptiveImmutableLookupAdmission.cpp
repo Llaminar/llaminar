@@ -429,7 +429,7 @@ TEST(GPUAdaptiveImmutableLookupAdmission, SplitCandidateFloorAndGrowthEqualActua
                     EXPECT_EQ(geometry.coordinator().policyOffsets().bytes%64,0u);
                     const auto owner=qwen4exp::PooledImmutableOwnerNativePlan::fromGeometry(geometry.physical(),geometry.coordinator(),0,701,17);
                     const auto policy=qwen4exp::PooledImmutableCoordinatorNativePlan::fromGeometry(geometry.physical(),geometry.coordinator(),701,17);
-                    const auto sourceGeometry=qwen4exp::PooledImmutableSourceGeometry::fromPlans(owner,policy,nativeSource);
+                    const auto sourceGeometry=qwen4exp::PooledImmutableSourceGeometry::fromPlans(owner,policy,nativeSource,1);
                     const auto& o=owner.parameters();const auto& p=policy.parameters();const auto& io=sourceGeometry.parameters().offsets;
                     EXPECT_EQ(geometry.mandatoryDeviceBytes(),o.frame.bytes+o.native.bytes+p.frame.bytes+p.native.bytes+io.frame_bytes+io.native_bytes);
                     EXPECT_EQ(o.native.reply_capacity,std::min(slots,ids));
@@ -484,7 +484,7 @@ TEST(GPUAdaptiveImmutableLookupAdmission, SplitCandidateResolvedPlacementUsesCom
         const auto roots=[&](const AdaptiveImmutableLookupGeometry& candidate){
             const auto owner=qwen4exp::PooledImmutableOwnerNativePlan::fromGeometry(candidate.physical(),candidate.coordinator(),0,701,17);
             const auto coordinator=qwen4exp::PooledImmutableCoordinatorNativePlan::fromGeometry(candidate.physical(),candidate.coordinator(),701,17);
-            const auto sourceGeometry=qwen4exp::PooledImmutableSourceGeometry::fromPlans(owner,coordinator,nativeSource);
+            const auto sourceGeometry=qwen4exp::PooledImmutableSourceGeometry::fromPlans(owner,coordinator,nativeSource,1);
             const auto& o=owner.parameters();const auto& p=coordinator.parameters();const auto& io=sourceGeometry.parameters().offsets;
             return std::array<std::size_t,2>{o.cache.bytes+p.cache.bytes,
                 o.frame.bytes+o.native.bytes+p.frame.bytes+p.native.bytes+io.frame_bytes+io.native_bytes};

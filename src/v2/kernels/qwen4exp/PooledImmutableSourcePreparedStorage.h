@@ -57,10 +57,12 @@ public:
     PooledImmutableNativeRoots roots()const;
     /** @brief Authenticate exact source-owned native geometry and original PMA before reuse.
      * @param physical Original admitted physical layout. @param coordinator Matching policy geometry.
-     * @param source Original source metadata. @param memory Same original model-owned PMA.
+     * @param source Original source metadata. @param expected_compute_readers Expected declared compute-reader count.
+     * @param memory Same original model-owned PMA.
      * @throws std::exception For foreign policy/source/authority or changed native roots. */
     void requireFor(const PooledImmutablePhysicalOwnerGeometry& physical,const PooledImmutableCoordinatorGeometry& coordinator,
-        const ImmutableRowTableSource& source,const std::shared_ptr<const PhysicalMemoryAuthority>& memory)const;
+        const ImmutableRowTableSource& source,std::uint32_t expected_compute_readers,
+        const std::shared_ptr<const PhysicalMemoryAuthority>& memory)const;
     /** @return Actual original local owner, policy and source root claims, counted exactly once. */
     ImmutableLookupNativeOwnerObservation retainedOwnerObservation()const;
     /** @return Complete actual PMA/native-runtime/address/geometry/owner identity; reject any drift. */

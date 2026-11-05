@@ -81,7 +81,7 @@ void originalSetup(DeviceId device,std::uint32_t slots){
         const auto binding=service->bindSubordinate(device);
         auto ownerPlan=q::PooledImmutableOwnerNativePlan::fromGeometry(physical,policy,0,binding.deviceView().base.table,binding.storageGeneration());
         auto coordinatorPlan=q::PooledImmutableCoordinatorNativePlan::fromGeometry(physical,policy,binding.deviceView().base.table,binding.storageGeneration());
-        auto sourcePlan=q::PooledImmutableSourceGeometry::fromPlans(ownerPlan,coordinatorPlan,source);
+        auto sourcePlan=q::PooledImmutableSourceGeometry::fromPlans(ownerPlan,coordinatorPlan,source,1);
         auto owner=q::PooledImmutableOwnerPreparedStorage::create(ownerPlan,memory,stream);
         auto coordinator=q::PooledImmutableCoordinatorPreparedStorage::create(coordinatorPlan,memory,stream);
         std::shared_ptr<const q::IPooledImmutableNativeKernels> code;
@@ -93,7 +93,7 @@ void originalSetup(DeviceId device,std::uint32_t slots){
 #endif
         requireProvider(bool(code),"Original native setup kernel bundle unavailable");code->initialize(*owner,stream);code->initialize(*coordinator,stream);
         auto boundary=q::ImmutableLookupExecutionBoundary::createPooled(service,sourcePlan,owner,coordinator,memory,stream);
-        owner->requireAuthority(memory);coordinator->requireAuthority(memory);boundary->pooledStorage()->requireFor(physical,policy,source,memory);
+        owner->requireAuthority(memory);coordinator->requireAuthority(memory);boundary->pooledStorage()->requireFor(physical,policy,source,1,memory);
         {const auto actual=GPUDeviceContextPool::instance().retainExistingPreparedContext(device,memory);actual.requireWorker(permit.worker());EXPECT_EQ(actual.generation(),permit.generation());}
         owner->acquireSetup(stream);coordinator->acquireSetup(stream);boundary->pooledStorage()->acquireSetup(stream);
         const auto progress=observe<n::OwnerProgress>(*backend,device,stream,owner->roots().native,ownerPlan.parameters().native.progress);

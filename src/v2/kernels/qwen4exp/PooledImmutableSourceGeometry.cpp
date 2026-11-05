@@ -13,6 +13,7 @@
 #include <limits>
 #include <algorithm>
 #include <stdexcept>
+#include <string>
 namespace llaminar2::qwen4exp {
 namespace {
 /** @return Checked exact byte product before exposing any declaration. */
@@ -77,6 +78,16 @@ PooledImmutableSourceGeometry PooledImmutableSourceGeometry::fromPlans(std::span
         offsets.protocol,offsets.frontier,offsets.record_bytes,offsets.payload_bytes,offsets.invocation,offsets.response_stage,
         offsets.progress,offsets.observation,offsets.observation_ordinal,offsets.reported_ordinal,offsets.seal_receipt,offsets.native_bytes})mix(offset);
     return {{representative,c,offsets,format,static_cast<std::uint32_t>(source.row_elements),identity?identity:1,local,maximum,consumers},coordinator.allocator(),{owners.begin(),owners.end()}};
+}
+void PooledImmutableSourceGeometry::requireOriginalPlans(std::span<const PooledImmutableOwnerNativePlan> owners,
+    const PooledImmutableCoordinatorNativePlan& coordinator,const ImmutableRowTableSource& source,
+    std::uint32_t expected_compute_readers)const{
+    if(expected_compute_readers!=parameters_.consumers)
+        throw std::logic_error("Pooled source compute-reader population changed: expected " +
+            std::to_string(expected_compute_readers) + ", original " + std::to_string(parameters_.consumers));
+    const auto expected=fromPlans(owners,coordinator,source,expected_compute_readers);
+    if(expected.parameters().identity!=parameters_.identity)
+        throw std::logic_error("Pooled source changed its original source/policy/cohort");
 }
 PhysicalMemoryPlan PooledImmutableSourceGeometry::mandatoryBOM(PhysicalMemoryResource resource)const{
     return sourceBOM(allocator_,parameters_.offsets,resource);

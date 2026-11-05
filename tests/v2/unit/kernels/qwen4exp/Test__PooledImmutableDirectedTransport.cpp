@@ -117,9 +117,15 @@ namespace {
 /** @brief Record the actual production metadata contract without creating a native transport or permit. */
 class ReaderContractReplayStage final:public testing::MockComputeStage {
 public:
+    /** @brief Retain a production declaration for metadata-only graph planning.
+     * @param device Participant whose dependency ledger will consume the contract.
+     * @param contract Original source producer or reader metadata declaration.
+     * @param boundary Whether this stage begins the next retained child. */
     ReaderContractReplayStage(DeviceId device,StageBufferContract contract,bool boundary=false)
         :MockComputeStage(ComputeStageType::COPY,"reader_contract",device),contract_(std::move(contract)),boundary_(boundary){}
+    /** @return The unchanged production buffer declaration supplied at construction. */
     StageBufferContract bufferContract()const override{return contract_;}
+    /** @return Whether the real graph splitter must start a retained child here. */
     bool requiresGraphCaptureSegmentBoundaryBefore()const override{return boundary_;}
 private:StageBufferContract contract_;bool boundary_;
 };

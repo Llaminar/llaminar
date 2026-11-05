@@ -69,7 +69,7 @@ struct ReadReplay {
     static q::PooledImmutableSourceGeometry declare(Pool& pool,GGUFTensorType format,std::uint32_t columns=160){
         std::vector<q::PooledImmutableOwnerNativePlan> owners;for(const auto& owner:pool.owners)owners.push_back(owner->plan);
         return q::PooledImmutableSourceGeometry::fromPlans(owners,pool.plan,
-            {"recorded-source","rows",0,pool.args.plan.policy.sourceRows(),columns,format});
+            {"recorded-source","rows",0,pool.args.plan.policy.sourceRows(),columns,format},1);
     }
     ReadReplay(Pool& x,const n::SourceFrontier& frontier,GGUFTensorType format,std::uint32_t columns=160):pool(x),geometry(declare(x,format,columns)),
         frame(geometry.parameters().offsets.frame_bytes),native(geometry.parameters().offsets.native_bytes),

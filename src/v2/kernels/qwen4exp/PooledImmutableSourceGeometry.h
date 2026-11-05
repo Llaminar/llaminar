@@ -42,7 +42,7 @@ class PooledImmutableSourceGeometry final {
 public:
     /**
      * @brief Price exact response and local delivery banks from original source and accepted native declarations.
-     * @param owner Original storage-owner declaration, independent of consumer/coordinator placement.
+     * @param owners Original storage-owner declarations, independent of consumer/coordinator placement.
      * @param coordinator Original global coalescing declaration.
      * @param source Actual immutable provider source metadata; payload is neither read nor hashed.
      * @param consumers Original declared compute-reader cohort, independent of the one CPU source channel.
@@ -51,11 +51,30 @@ public:
      */
     static PooledImmutableSourceGeometry fromPlans(std::span<const PooledImmutableOwnerNativePlan> owners,
         const PooledImmutableCoordinatorNativePlan& coordinator,const ImmutableRowTableSource& source,
-        std::uint32_t consumers=1);
-    /** @brief One-owner spelling delegates to the same complete-cohort validation; never admits a partial cohort. */
+        std::uint32_t consumers);
+    /**
+     * @brief Validate a complete one-owner cohort with an explicitly declared reader population.
+     * @param owner Original sole storage-owner declaration.
+     * @param coordinator Original global coalescing declaration.
+     * @param source Actual immutable provider source metadata.
+     * @param consumers Original compute-reader count, independent of the storage-owner count.
+     * @return The same checked geometry produced by the complete-cohort overload.
+     * @throws std::exception For a partial cohort or incompatible source geometry.
+     */
     static PooledImmutableSourceGeometry fromPlans(const PooledImmutableOwnerNativePlan& owner,
-        const PooledImmutableCoordinatorNativePlan& coordinator,const ImmutableRowTableSource& source)
-    {return fromPlans(std::span{&owner,1},coordinator,source);}
+        const PooledImmutableCoordinatorNativePlan& coordinator,const ImmutableRowTableSource& source,std::uint32_t consumers)
+    {return fromPlans(std::span{&owner,1},coordinator,source,consumers);}
+    /**
+     * @brief Validate the same complete source identity used at materialization.
+     * @param owners Original ordered storage owners, independent of compute readers.
+     * @param coordinator Original coordinator policy and source generation.
+     * @param source Original immutable source metadata.
+     * @param expected_compute_readers Expected declared compute-reader population, never inferred from storage owners.
+     * @throws std::exception For malformed declarations or a changed source/policy/cohort/reader identity.
+     */
+    void requireOriginalPlans(std::span<const PooledImmutableOwnerNativePlan> owners,
+        const PooledImmutableCoordinatorNativePlan& coordinator,const ImmutableRowTableSource& source,
+        std::uint32_t expected_compute_readers)const;
     /** @return Original immutable ordered cohort; this is not an ownership/location registry. */
     std::span<const PooledImmutableOwnerNativePlan> originalOwners()const noexcept{return owners_;}
     /** @return Complete frozen native operands, including source precision and exact physical offsets. */
