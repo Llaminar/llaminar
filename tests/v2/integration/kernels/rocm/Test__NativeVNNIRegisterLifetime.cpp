@@ -177,6 +177,14 @@ void verify(int codebook, int payload_bytes, int m, int n, int k,
         }
         minima[i] = scales[i] | (static_cast<uint32_t>(secondary[i]) << 16);
     }
+    if (llaminar2::nativeVnniScalePlaneBytes(static_cast<uint8_t>(codebook)) == 1)
+    {
+        // Native MXFP4 plane: one admitted E8M0 byte per block (2^-8 .. 2^7),
+        // with zero-marker blocks, in the same word storage.
+        auto *bytes = reinterpret_cast<uint8_t *>(scales.data());
+        for (size_t i = 0; i < weight_blocks; ++i)
+            bytes[i] = mixed(i) % 29 == 3 ? uint8_t{0} : static_cast<uint8_t>(120 + mixed(i) % 16);
+    }
     for (size_t i = 0; i < activation.size(); ++i)
         activation[i] = static_cast<int>(mixed(i + 389) % 255) - 127;
     for (size_t i = 0; i < a_scales.size(); ++i)
