@@ -589,6 +589,7 @@ TEST(CUDANativeVNNIPrefillStaging, CapturedCandidatesMatchRegisterDecode)
     verifyCodebook<5>();
     verifyCodebook<6>();
     verifyCodebook<7>();
+    verifyCodebook<llaminar2::kNativeVnniMXFP4Codebook>();
 }
 
 /** @brief Every staged tile preserves full output/partials over retained replay. */
@@ -613,6 +614,7 @@ TEST(CUDANativeVNNIPrefillStaging, AllStagedTilesMatchRegisterDecode)
     verify.template operator()<5>();
     verify.template operator()<6>();
     verify.template operator()<7>();
+    verify.template operator()<llaminar2::kNativeVnniMXFP4Codebook>();
 }
 
 /** @brief Every diagnostic identity must inspect the kernel it would launch. */
@@ -625,9 +627,11 @@ TEST(CUDANativeVNNIPrefillStaging, ResourceQueriesNameExactStagingSymbols)
     verifyCodebookResources<5>(symbols);
     verifyCodebookResources<6>(symbols);
     verifyCodebookResources<7>(symbols);
+    verifyCodebookResources<llaminar2::kNativeVnniMXFP4Codebook>(symbols);
     // The Q5_1 direct tile-2 family excludes AsyncWeight/AsyncAll. Every other
-    // codebook, arithmetic family and staging schedule has its own symbol.
-    EXPECT_EQ(symbols.size(), 40u - 2u);
+    // codebook (six, including MXFP4), arithmetic family and staging schedule
+    // has its own symbol.
+    EXPECT_EQ(symbols.size(), 48u - 2u);
     using llaminar2::cuda::prefill::PrefillStagingSchedule;
     CUDADensePrefillKernelResources primary{}, auxiliary{};
     // BK256 has no staged-nibble specialization, and tile 1 lacks a copy
