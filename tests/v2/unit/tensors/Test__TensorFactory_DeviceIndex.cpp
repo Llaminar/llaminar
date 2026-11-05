@@ -286,6 +286,7 @@ TEST_F(Test__TensorFactory_DeviceIndex, AllNativeWeightCodebooksAdoptRvalueStora
         {TensorType::IQ3_S, IQ3_SBlock::BLOCK_SIZE, sizeof(IQ3_SBlock)},
         {TensorType::IQ1_S, IQ1_SBlock::BLOCK_SIZE, sizeof(IQ1_SBlock)},
         {TensorType::IQ1_M, IQ1_MBlock::BLOCK_SIZE, sizeof(IQ1_MBlock)},
+        {TensorType::MXFP4, MXFP4Block::BLOCK_SIZE, sizeof(MXFP4Block)},
     };
 
     for (const QuantizedCase &quantized : cases)
