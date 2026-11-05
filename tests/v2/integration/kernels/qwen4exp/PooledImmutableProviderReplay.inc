@@ -117,6 +117,7 @@ private:
     IdentityRejectionCase fault_;
 };
 #endif
+
 /** @brief Complete immutable actual provider case; original byte authoring survives all captures. */
 struct ProviderReplaySpec final {
     std::shared_ptr<ProviderFile> file;
@@ -134,10 +135,14 @@ struct ProviderReplaySpec final {
 #ifdef LLAMINAR_POOLED_IDENTITY_REJECTION_TESTS
     std::optional<IdentityRejectionCase> identityRejection;
 #endif
+    AdaptiveImmutableRowBacking sourceBacking=AdaptiveImmutableRowBacking::SSD; ///< Real original host source, separate from bounded hostSlots.
     /** @brief Validate complete immutable case syntax before selected source/graph creation. */
     void requireComplete()const{
         requireProvider(file && maximum>=16 && uniqueCapacity && uniqueCapacity<=maximum && uniqueCapacity<=file->rows && slots<=file->rows && hostSlots<=file->rows,
             "Provider program has incomplete original geometry");
+        (void)providerReplaySourcePolicy(sourceBacking);
+        requireProvider(sourceBacking!=AdaptiveImmutableRowBacking::RAM||hostSlots==0,
+            "Full RAM source excludes a redundant bounded RAM row cache");
         requireProvider(width==n::OriginalIdWidth::UInt32 || width==n::OriginalIdWidth::UInt64,"Provider program has unknown original ID width");
 #ifdef LLAMINAR_POOLED_NATIVE_PROGRAM_DIAGNOSTIC
         requireProvider(diagnosticProgram==ProviderReplayDiagnosticProgram::OrdinaryLookup ||
@@ -272,11 +277,13 @@ struct ProviderReplayGeometry final {
         const NativeOrderingEventBudgetProjection& ordering=NativeOrderingEventBudgetProjection::installed()){
         spec.requireComplete();
         const auto& file=*spec.file;const auto source=file.descriptor();const PhysicalMemoryAllocatorIdentity gpuId{0,device},hostId{0,DeviceId::cpu()};
-        const std::array tiers{ImmutableRowStorage::VRAM,ImmutableRowStorage::RAM,ImmutableRowStorage::MemoryMapped};
+        const auto sourcePolicy=providerReplaySourcePolicy(spec.sourceBacking);
+        std::vector<ImmutableRowStorage> tiers{ImmutableRowStorage::VRAM,ImmutableRowStorage::RAM};
+        if(sourcePolicy.storage()==ImmutableRowStorage::MemoryMapped)tiers.push_back(ImmutableRowStorage::MemoryMapped);
         auto layout=ImmutableRowTableLayoutGeometry::checked(ImmutableRowTableExtent::fromNative(source.format,source.rows,source.rowBytes()),
             ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,
             {{{gpuId,ImmutableRowStorage::VRAM},0,spec.slots,{}},{{hostId,ImmutableRowStorage::RAM},0,spec.hostSlots,{}}},{gpuId},{},
-            {{hostId,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,4096,2)}},{},spec.slots?std::optional(gpuId):std::nullopt,spec.uniqueCapacity);
+            {{hostId,sourcePolicy}},{},spec.slots?std::optional(gpuId):std::nullopt,spec.uniqueCapacity);
         auto physical=q::PooledImmutablePhysicalOwnerGeometry::fromLayout(layout,std::array{gpuId},gpuId);
         auto policy=q::PooledImmutableCoordinatorGeometry::fromOwners(physical,{65536,1,2},spec.maximum);
         auto cpu=CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPU(layout,hostId,gpuId);

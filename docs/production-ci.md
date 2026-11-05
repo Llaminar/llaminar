@@ -690,6 +690,25 @@ successful completion, copy its result file, then remove the helper. Attached
 stdout is not a metadata authority: short-lived Docker attach can lose output
 even when the process succeeds. Probe failures are fatal, with no retries or
 permission changes; an empty NVIDIA inventory remains distinct from failure.
+The ROCm compiler builder also installs the pinned parallel-LTO remark repair.
+Its linker stays outside the SDK and serving image. Actual two/eight-partition
+compiler controls prove complete final stack records and unchanged device code;
+the original compiler body is the negative control. RCCL selects that exact
+linker through its dependency-owned configuration, names separate per-ISA
+object-record files, and runs the canonical allocation parser before installation.
+RCCL is a pinned external dependency: this resource evidence reports every physical
+spill without claiming zero-spill, native-runtime or performance qualification.
+Project kernel targets retain their independent absolute zero-spill guard.
+Missing, malformed or incomplete records still reject; dependency protocol,
+correctness and performance remain separate qualification gates.
+The compact final allocation proof includes the compiler observations and binds
+the selected DSO and build receipt. Installed production preflight revalidates
+this proof without compiler tools or accelerator access. Missing partitions,
+foreign outputs and stale receipts fail the build. Physical spills in the
+external dependency remain reported; project-owned kernels retain their fatal
+zero-spill guard. Ordinary host dependency links do not participate in the
+collective's native proof.
+
 The compiler builder and runtime install the same source-built RCCL at the same
 library path. Runtime loading uses CMake's exact `RCCL_LIBRARY` selection; it never
 guesses a checkout location or substitutes another packaged collective library.

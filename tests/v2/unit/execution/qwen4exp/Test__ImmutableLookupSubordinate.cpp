@@ -8,6 +8,7 @@
  * No proof factory, substitute provider, device startup or table hash is used.
  */
 #include "fixtures/execution/RetainedHostServiceFixture.h"
+#include "execution/moe/MoEOverlayParticipantGraphRunner.h"
 #include "backends/GPUDeviceProcessLifetime.h"
 #include "execution/qwen4exp/ImmutableLookupService.h"
 #include "execution/local_execution/graph/RetainedStoragePerfStats.h"
@@ -35,9 +36,36 @@
 #include <vector>
 #include <unistd.h>
 
+namespace llaminar2::test {
+/** @brief Exercise the original enqueue/cancellation bodies without constructing a native-ready expert runner. */
+struct PooledExpertSourceFailureContractAccess final {
+    template<class Work,class Cancel> static bool enqueue(Work work,Cancel cancel) {
+        return MoEOverlayParticipantGraphRunner::runOriginalEndpointEnqueue(std::move(work),std::move(cancel));
+    }
+    static void beforeAdmission() {
+        using Runner=MoEOverlayParticipantGraphRunner;
+        Runner::requireColdSourceAliasRefresh(Runner::ServingGraphFamilyLifecycle::Built);
+        Runner::requireColdSourceAliasRefresh(Runner::ServingGraphFamilyLifecycle::Sealed);
+    }
+    static void afterAdmission() {
+        using Runner=MoEOverlayParticipantGraphRunner;
+        Runner::requireColdSourceAliasRefresh(Runner::ServingGraphFamilyLifecycle::ExecutionAdmitted);
+    }
+    static void cancel(const std::function<void()>& original,std::mutex& mutex,std::exception_ptr& failure) noexcept {
+        MoEOverlayParticipantGraphRunner::cancelOriginalPooledSource(original,mutex,failure);
+    }
+};
+}
+
 namespace llaminar2::qwen4exp {
 /** @brief Deterministic interleaving at the real serial borrow boundary; no capability constructor or copied pin logic. */
 struct ImmutableLookupSubordinateTestAccess final {
+    /** @return Recorded abort action bound by actual service ticket validation; grants no GPU readiness/completion. */
+    static std::function<void()> nativeAbort(ImmutableLookupService& service,
+        const ImmutableLookupService::GroupAdmission& original, std::function<void()> signal)
+    {
+        return service.failureCallbackWithNativeAbort(original, std::move(signal));
+    }
     /** @brief Inspect only joined CPU-owned state; callers have already awaited this actual service worker. */
     static bool ownsAcquiredGrant(const ImmutableLookupService &service) {
         if(!service.worker_.idle())throw std::logic_error("Grant observation requires joined worker");
@@ -1330,3 +1358,107 @@ TEST(ImmutableLookupSubordinate, ConsumerLocalTP4AndTP8OriginalServiceRetiresEve
         GPUDeviceProcessLifetime::retireActive();std::_Exit(::testing::Test::HasFailure()?1:0);
     }()),::testing::ExitedWithCode(0),"");
 }
+
+
+namespace llaminar2::qwen4exp {
+/** @brief Actual service callback authenticates original ticket before a recorded native signal, including late CPU-close success. */
+TEST(ImmutableLookupSubordinate, OriginalNativeAbortBindingRejectsSuccessorAndPreservesCPUOutcome)
+{
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    ASSERT_EXIT(([&] {
+        {
+            ServiceLane lane(0, 2, ServiceLaneOrigin::Recorded, true);
+            unsigned signals = 0;
+            auto old = lane.service->armGroup(1);
+            const auto first = lane.service->adoptGroupChannel(old, DeviceId::cuda(0));
+            const auto second = lane.service->adoptGroupChannel(old, DeviceId::cuda(1));
+            const auto oldFailure = ImmutableLookupSubordinateTestAccess::nativeAbort(*lane.service, old, [&] { ++signals; });
+            lane.close(0, 1, 0); lane.close(0, 1, 1);
+            EXPECT_TRUE(lane.service->await(first));
+            EXPECT_TRUE(lane.service->await(second));
+            EXPECT_TRUE(lane.service->finishGroup(old));
+            oldFailure(); // CPU success does not prevent this same original GPU request from failing later.
+            EXPECT_EQ(signals, 1u);
+            EXPECT_TRUE(lane.service->finishGroup(old)); // Never relabel successful CPU I/O as failure.
+            auto current = lane.service->armGroup(2);
+            const auto active = lane.service->adoptGroupChannel(current, DeviceId::cuda(0));
+            EXPECT_THROW(ImmutableLookupSubordinateTestAccess::nativeAbort(*lane.service, old, [&] { ++signals; }), std::logic_error);
+            oldFailure();
+            EXPECT_EQ(signals, 1u); // Old callback cannot abort the successor communicator/request.
+            const auto fail = ImmutableLookupSubordinateTestAccess::nativeAbort(*lane.service, current, [&] { ++signals; });
+            fail(); fail(); // Original cancellation is absorbing and duplicate signal is harmless.
+            EXPECT_EQ(signals, 3u);
+            EXPECT_TRUE(ImmutableLookupProtocol::matchesInvocation(
+                std::atomic_ref(lane.ack(1).cancelledInvocation).load(std::memory_order_acquire),
+                std::atomic_ref(lane.ack(1).cancelledGeneration).load(std::memory_order_acquire),
+                active.generation, active.invocation));
+            EXPECT_FALSE(lane.service->finishGroup(current));
+            EXPECT_FALSE(lane.service->await(active));
+            oldFailure();
+            EXPECT_EQ(signals, 3u);
+        }
+        GPUDeviceProcessLifetime::retireActive();
+        ::_exit(::testing::Test::HasFailure() ? 1 : 0);
+    })(), ::testing::ExitedWithCode(0), "");
+}
+/** @test The original follower lifecycle permits cold aliases only before coordinator execution admission. */
+TEST(ImmutableLookupSubordinate, ExpertAliasRefreshRejectsExecutionAdmission)
+{
+    using Access=llaminar2::test::PooledExpertSourceFailureContractAccess;
+    EXPECT_NO_THROW(Access::beforeAdmission());
+    EXPECT_THROW(Access::afterAdmission(),std::invalid_argument);
+}
+
+/** @test Actual original source cancellation wakes an unfinished zero-row peer after another consumer retired; the enqueue error remains primary. */
+TEST(ImmutableLookupSubordinate, ExpertEnqueueFailureCancelsOriginalSourceBeforePartialDrain)
+{
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    ASSERT_EXIT(([&]{
+        {
+            ServiceLane lane(0,2,ServiceLaneOrigin::Recorded,true);
+            auto group=lane.service->armGroup(1);
+            const auto first=lane.service->adoptGroupChannel(group,DeviceId::cuda(0));
+            const auto missing=lane.service->adoptGroupChannel(group,DeviceId::cuda(1));
+            std::atomic<unsigned> original_native_signals{0};
+            const auto original=ImmutableLookupSubordinateTestAccess::nativeAbort(*lane.service,group,[&] {
+                original_native_signals.fetch_add(1,std::memory_order_release);
+                throw std::runtime_error("recorded original native cancellation fault");
+            });
+            // One accepted empty channel publishes its real close while the
+            // group still owns the missing channel. Group retirement must wait
+            // for exact cancellation; no per-channel terminal is fabricated.
+            lane.close(0,1,0);
+            const auto first_retired=[&] {
+                return ImmutableLookupProtocol::matchesInvocation(
+                    std::atomic_ref(lane.ack(0).retiredInvocation).load(std::memory_order_acquire),
+                    std::atomic_ref(lane.ack(0).retiredGeneration).load(std::memory_order_acquire),first.generation,first.invocation);
+            };
+            std::mutex failure_mutex;std::exception_ptr cancellation_failure;
+            std::atomic<bool> entered_original_throw{false};
+            auto failed=std::async(std::launch::async,[&] {
+                return llaminar2::test::PooledExpertSourceFailureContractAccess::enqueue([&]() -> bool {
+                    entered_original_throw.store(true,std::memory_order_release);
+                    throw std::runtime_error("original expert enqueue failed after source started");
+                },[&]() noexcept {
+                    llaminar2::test::PooledExpertSourceFailureContractAccess::cancel(original,failure_mutex,cancellation_failure);
+                });
+            });
+            try { (void)failed.get();FAIL()<<"Original enqueue failure disappeared"; }
+            catch (const std::runtime_error& error) { EXPECT_STREQ(error.what(),"original expert enqueue failed after source started"); }
+            EXPECT_TRUE(entered_original_throw.load(std::memory_order_acquire));
+            EXPECT_EQ(original_native_signals.load(std::memory_order_acquire),1u);
+            ASSERT_TRUE(cancellation_failure);
+            try { std::rethrow_exception(cancellation_failure); }
+            catch (const std::runtime_error& error) { EXPECT_STREQ(error.what(),"recorded original native cancellation fault"); }
+            EXPECT_FALSE(lane.service->await(missing));EXPECT_FALSE(lane.service->await(first));
+            EXPECT_FALSE(lane.service->finishGroup(group));
+            // The failed original group now owns exact retirement of the
+            // accepted empty channel as well; no retry/new invocation exists.
+            EXPECT_TRUE(first_retired());
+        }
+        GPUDeviceProcessLifetime::retireActive();
+        std::_Exit(::testing::Test::HasFailure()?1:0);
+    })(),::testing::ExitedWithCode(0),"");
+}
+
+} // namespace llaminar2::qwen4exp

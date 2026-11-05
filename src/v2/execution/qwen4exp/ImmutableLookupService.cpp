@@ -579,6 +579,27 @@ std::function<void()> ImmutableLookupService::failureCallback(const GroupAdmissi
         throw std::logic_error("Source failure callback requires its original active group");
     return [original=group.owner_,ticket=group.ticket_]{(void)original->cancel(ticket);};
 }
+std::function<void()> ImmutableLookupService::failureCallbackWithNativeAbort(
+    const GroupAdmission& group, std::function<void()> signal) const
+{
+    std::lock_guard lock(lifecycle_);
+    if (!signal || group.owner_.get() != this || !group.valid() || state_ != Lifecycle::Serving ||
+        group.ticket_.generation != outstanding_.generation || group.ticket_.invocation != outstanding_.invocation)
+        throw std::logic_error("Native source abort requires its original active complete-group admission");
+    return [original = group.owner_, ticket = group.ticket_, signal = std::move(signal)] {
+        std::lock_guard current(original->lifecycle_);
+        // One service arm requires a strictly newer generation. A completed CPU
+        // close may precede native failure; retain its truthful I/O outcome while
+        // still cancelling this SAME original GPU request. A newer arm rejects
+        // this callback before touching that communicator's absorbing abort.
+        if (!ticket.valid() || ticket.generation != original->generation_ ||
+            (original->state_ == Lifecycle::Serving &&
+                ticket.invocation != original->outstanding_.invocation))
+            return;
+        (void)original->cancelLocked(ticket);
+        signal();
+    };
+}
 bool ImmutableLookupService::finishGroup(const GroupAdmission& group) {
     bool cancelMissing=false;
     {
@@ -680,6 +701,10 @@ void ImmutableLookupService::joinInvocation(Ticket ticket,bool complete_parent) 
 bool ImmutableLookupService::cancel(Ticket ticket)
 {
     std::lock_guard lock(lifecycle_);
+    return cancelLocked(ticket);
+}
+bool ImmutableLookupService::cancelLocked(Ticket ticket)
+{
     if(state_!=Lifecycle::Serving || !ticket.valid() || ticket.generation!=outstanding_.generation ||
        ticket.invocation!=outstanding_.invocation)
         return false;

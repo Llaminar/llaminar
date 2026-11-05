@@ -29,11 +29,17 @@ public:
         // Price their CPU0 mapped banks and endpoint GPU cursors here so every
         // floor, optional growth, resolved plan and wire restore retains them.
         const auto channels=PooledImmutableDirectedTransport::completeBOM(
-            physical,geometry.coordinator(),originalCPU0,originalGPUs);
+            physical,geometry.coordinator(),originalCPU0,originalGPUs,
+            geometry.readerGeometry() ? &*geometry.readerGeometry() : nullptr);
         for(const auto& line:channels.resources())result.add(line);
         for(std::uint32_t coordinate=0;coordinate<physical.owners().size();++coordinate){
             const auto& owner=physical.owners()[coordinate];
             if(owner.allocator==physical.coordinator())continue;
+            if (geometry.readerGeometry() && geometry.readerGeometry()->nativeCollective() &&
+                owner.allocator.device.type == physical.coordinator().device.type &&
+                std::find(geometry.readerGeometry()->consumers().begin(), geometry.readerGeometry()->consumers().end(), owner.allocator) !=
+                    geometry.readerGeometry()->consumers().end())
+                continue; // Same actual continuation parent owns these inline stages; no second SDK executable/host class exists.
             if(originalCPU0.device!=DeviceId::cpu() || originalCPU0.world_rank!=owner.allocator.world_rank)
                 throw std::invalid_argument("Remote graph planning requires its original rank CPU0 observation");
             const auto gpu=std::find_if(originalGPUs.begin(),originalGPUs.end(),[&](const auto& resource){

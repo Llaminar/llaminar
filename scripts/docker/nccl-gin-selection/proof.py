@@ -23,11 +23,14 @@ DOCKER = Path(__file__).resolve().parent.parent
 REVISION = "dbc86fd06e8b0c4517b95d8958a09ccacf9520c9"
 PATCHES = tuple("patches/" + name for name in (
     "nccl-capture-reentry.patch", "nccl-device-live-rows.patch",
-    "nccl-gin-auto-selection.patch"))
+    "nccl-gin-auto-selection.patch", "nccl-device-completed-broadcast.patch"))
 INPUTS = (*PATCHES, "nccl-gin-selection/probe.cpp", "nccl-gin-selection/proof.py",
           "patches/nccl-created-thread-ownership.patch", "nccl-thread-lifetime/probe.cpp",
           "nccl-thread-lifetime/proof.py", "patches/nccl-partial-file-cleanup.patch",
-          "shared-file-lifecycle/probe.cpp", "shared-file-lifecycle/proof.py")
+          "shared-file-lifecycle/probe.cpp", "shared-file-lifecycle/proof.py",
+          *("native-completed-broadcast/" + name for name in (
+              "proof.py", "replay.py", "slice_replay.py", "addressed_replay.py", "progress_replay.py", "p2p_launch_replay.py", "p2p_launch_fixture.cpp", "rccl_p2p_launch_fixture.cpp", "rccl_p2p_resources.py", "rccl_p2p_role_replay.py", "p2p_dispatch_replay.py", "completion_replay.py", "cancellation_replay.py",
+              "signal_replay.py", "retirement_replay.py", "original_replay.py", "proxy_replay.py", "work_replay.py", "plan_replay.py", "planner_replay.py", "plan_fixture.h", "barrier_replay.py", "protocol_replay.py")))
 CASES = ("auto-available", "auto-zero-devices", "auto-negative-inventory",
          "auto-query-error", "auto-probe-error", "explicit-GDAKI",
          "explicit-GDAKI-unavailable", "explicit-GDAKI-error", "explicit-proxy",

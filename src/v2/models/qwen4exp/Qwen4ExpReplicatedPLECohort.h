@@ -32,6 +32,19 @@ public:
      */
     void requireConsumer(DeviceId device,int participant) const;
     /**
+     * @brief Authenticate the Rank-owned native materialization boundary for
+     * every original shared-cache reader, independently of physical owner subsets.
+     * @param context Exact original Rank communicator, not an equal membership copy.
+     * @param device Genuine factory child, whose arena remains Rank-owned on failure.
+     * @param participant Original communicator coordinate.
+     * @return True for the complete original shared native reader composition.
+     * A pure reader still records the native result protocol; optional cache
+     * ownership cannot transfer its arena/capture preparation to a child.
+     * Other declared placement families retain their existing setup owner.
+     */
+    bool requiresParentOwnedNativeMaterialization(const ITPContext& context,
+        DeviceId device, int participant) const;
+    /**
      * @brief Order the original shared-source cold phase without serializing TP constructors.
      * @param device Actual participant in this Rank-issued replicated query cohort.
      * @param prepare Original factory operation using this participant's genuine GraphConfig.

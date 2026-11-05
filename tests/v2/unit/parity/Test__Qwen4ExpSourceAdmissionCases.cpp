@@ -11,6 +11,9 @@
  * explicitly smaller dynamic MTP ceiling, independent of retained capacity.
  */
 #include "integration/parity/qwen4exp/Qwen4ExpSourceAdmissionCases.h"
+#include "integration/parity/qwen4exp/Qwen4ExpSharedContinuationMTPSourceCases.h"
+#include "fixtures/models/Qwen4ExpReplicatedPLECohortReplayAccess.h"
+#include "planning/ImmutableRowTablePlacementPlanner.h"
 #include "integration/parity/qwen4exp/Qwen4ExpCPUJointParityCases.h"
 #include "integration/parity/qwen4exp/Qwen4ExpSourceAdmissionEvidence.h"
 #include "integration/parity/qwen4exp/Qwen4ExpGPUAdaptiveParityCases.h"
@@ -1868,6 +1871,187 @@ TEST(Qwen4ExpSourceAdmissionCases, CPUJointExactStartupPreservesHostWideGPUAndEx
 } // namespace llaminar2::test::parity::qwen4exp
 
 namespace llaminar2::test::parity::qwen4exp {
+/** @test Actual CPU follower absence and checked GPU ownership select only original reuse cases. */
+TEST(Qwen4ExpSourceAdmissionCases, SharedContinuationReuseEligibilityPreservesFollowerAndOwnerRoles) {
+    using namespace llaminar2;
+    const auto& follower=qwen4ExpCPUJointWorld2SourceAdmissionCases().front();
+    ASSERT_FALSE(qwen4ExpCPUJointSourceHasContinuation(follower,1));
+    EXPECT_FALSE(qwen4ExpSourceReusesSharedContinuationOwners(nullptr));
+    for(const auto type:{DeviceType::CUDA,DeviceType::ROCm})for(const bool remote:{false,true}){
+        const std::string name=type==DeviceType::CUDA?"cuda":"rocm";
+        const auto resource=[](DeviceId device){return PhysicalMemoryResource{0,device,1ull<<30,1ull<<29};};
+        const std::array consumers{resource({type,1}),resource({type,0})};
+        const auto other=type==DeviceType::CUDA?DeviceType::ROCm:DeviceType::CUDA;
+        std::vector<PhysicalMemoryResource> devices(consumers.begin(),consumers.end());
+        if(remote)devices.push_back(resource({other,0}));
+        ImmutableRowTablePolicy policy{.storage=ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD};
+        const std::string owner=remote?(other==DeviceType::CUDA?"cuda":"rocm"):name;
+        policy.gpu_adaptive.placement=parseAdaptiveGPUCachePlacement(remote?
+            "0:"+owner+":0/64/1048576@0:"+name+":1":
+            "0:"+name+":0/64/1048576,0:"+name+":1/64/1048576@0:"+name+":1");
+        const std::array readerEdges{ImmutableRowTableReaderPeerAccess{{0,{type,1}},{0,{type,0}},PeerAccessCoverage::None}};
+        const auto input=ImmutableRowTablePlacementInput::forConsumers(
+            ImmutableRowTableExtent::fromNative(static_cast<GGUFTensorType>(0),128,64),resource(DeviceId::cpu()),consumers)
+            .withGPUCacheResources(policy,devices).withReaderPeerAccess(readerEdges);
+        const std::vector<size_t> slots(remote?1:2,32);
+        const auto placement=llaminar2::test::Qwen4ExpReplicatedPLECohortReplayAccess::declaration(
+            input.gpuAdaptiveLayout(policy,slots,0,16),policy.gpu_adaptive,16);
+        EXPECT_EQ(qwen4ExpSourceReusesSharedContinuationOwners(placement.get()),!remote);
+    }
+}
+
+}
+
+namespace llaminar2::test::parity::qwen4exp {
+/** @test Canonical source-only projection changes only active MTP and preserves matched seed identity. */
+TEST(Qwen4ExpSourceAdmissionCases, SharedContinuationMTPProjectionPreservesCanonicalMatchedSeeds) {
+    const auto& cells=qwen4ExpSharedContinuationMTPSourceAdmissionCases();
+    size_t seeds=0,ssd=0,ram=0;
+    std::set<std::string> original_names,names;
+    for(const auto* original:{&qwen4ExpHardwareMatchedCacheEconomyCases(),
+                              &qwen4ExpHardwareMatchedCacheRAMBackingEconomyCases()})
+    for(const auto& seed:*original){
+        EXPECT_TRUE(original_names.insert(seed.testName()).second);
+        EXPECT_EQ(seed.mtp,ModelParityMTP::Off);EXPECT_EQ(seed.retained_mtp_draft_capacity,0);
+        const bool eligible=qwen4ExpSharedContinuationSourceSeed(seed);
+        if(!seed.ngram_table_policy->isGPUAdaptive() ||
+           seed.ngram_table_policy->gpu_adaptive.placement.mode==AdaptiveGPUCachePlacementMode::ConsumerLocal)
+            EXPECT_FALSE(eligible);
+        if(!eligible)continue;
+        ++seeds;
+        if(seed.ngram_table_policy->gpu_adaptive.source_backing==AdaptiveImmutableRowBacking::RAM)++ram;
+        else ++ssd;
+        const auto expected=qwen4ExpExpandSourceAdmissionMTP(std::vector<ModelParityCase>{seed});
+        for(const auto& reference:expected)if(reference.mtp!=ModelParityMTP::Off){
+            const auto found=std::find_if(cells.begin(),cells.end(),[&](const auto& cell){return cell.testName()==reference.testName();});
+            ASSERT_NE(found,cells.end());
+            EXPECT_EQ(found->retained_mtp_draft_capacity,15);EXPECT_TRUE(found->model.shared_predictor);
+            EXPECT_EQ(found->topology.expert_overlay_plan,seed.topology.expert_overlay_plan);
+            EXPECT_EQ(found->topology.participants,seed.topology.participants);
+            EXPECT_EQ(found->topology.test_id,seed.topology.test_id);
+            EXPECT_EQ(found->model.model_path,seed.model.model_path);
+            EXPECT_EQ(found->ngram_table_policy,seed.ngram_table_policy);
+            EXPECT_EQ(found->activation_precision,seed.activation_precision);EXPECT_EQ(found->kv_cache_precision,seed.kv_cache_precision);
+            EXPECT_EQ(found->topology.mpi_ranks,seed.topology.mpi_ranks);
+            const auto source_config=seed.toTestConfig(),mtp_config=found->toTestConfig();
+            ASSERT_TRUE(source_config.local_hardware_requirements);ASSERT_TRUE(mtp_config.local_hardware_requirements);
+            EXPECT_EQ(mtp_config.local_hardware_requirements->cuda_devices,source_config.local_hardware_requirements->cuda_devices);
+            EXPECT_EQ(mtp_config.local_hardware_requirements->rocm_devices,source_config.local_hardware_requirements->rocm_devices);
+        }
+    }
+    EXPECT_EQ(seeds,8u);EXPECT_EQ(ssd,4u);EXPECT_EQ(ram,4u);
+    EXPECT_EQ(cells.size(),24u);
+    for(const auto& cell:cells) {
+        EXPECT_NE(cell.mtp,ModelParityMTP::Off);
+        EXPECT_TRUE(names.insert(cell.testName()).second);
+        EXPECT_FALSE(original_names.contains(cell.testName()));
+    }
+    EXPECT_FALSE(qwen4ExpSharedContinuationSourceSeed(qwen4ExpCPUJointWorld2SourceAdmissionCases().front()));
+    for(const auto& cell:qwen4ExpSharedCoordinatorCUDATP2AdaptiveSourceAdmissionSeeds())
+        EXPECT_FALSE(qwen4ExpSharedContinuationSourceSeed(cell));
+}
+}
+
+namespace llaminar2::test::parity::qwen4exp {
+/** @test Q6 candidates retain original physical roles and the exact64-cell setup product. */
+TEST(Qwen4ExpSourceAdmissionCases, ExpertFollowerOwnersRetainOriginalQ6AndAllMTPPolicies) {
+    const auto& seeds=qwen4ExpExpertFollowerOwnerSourceAdmissionSeeds();
+    ASSERT_EQ(seeds.size(),16u);
+    const auto expanded=qwen4ExpExpandSourceAdmissionMTP(seeds);
+    ASSERT_EQ(expanded.size(),64u);
+    std::set<std::string> names;
+    size_t follower=0,both=0,ram=0,positive=0,dynamic=0;
+    for(const auto& seed:seeds){
+        EXPECT_TRUE(names.insert(seed.testName()).second);
+        ASSERT_TRUE(seed.ngram_table_policy);ASSERT_TRUE(seed.expert_overlay);
+        const auto& request=seed.ngram_table_policy->gpu_adaptive;
+        ASSERT_TRUE(request.placement.coordinator);
+        EXPECT_EQ(request.placement.coordinator->device(),DeviceId::cuda(0));
+        EXPECT_EQ(request.placement.owners.size()==4 || request.placement.owners.size()==6,true);
+        const bool has_continuation=request.placement.owners.size()==6;
+        has_continuation?++both:++follower;
+        size_t cuda=0,rocm=0;
+        for(const auto& owner:request.placement.owners){
+            EXPECT_EQ(owner.participant.world_rank,0);
+            if(owner.participant.device().is_cuda())++cuda;else if(owner.participant.device().is_rocm())++rocm;
+            EXPECT_TRUE(owner.maximum_cache_rows==0 || owner.maximum_cache_rows==64);
+        }
+        EXPECT_EQ(cuda,has_continuation?2u:0u);EXPECT_EQ(rocm,4u);
+        if(request.source_backing==AdaptiveImmutableRowBacking::RAM)++ram;
+        if(request.placement.owners.front().maximum_cache_rows==64)++positive;
+        if(seed.expert_overlay->movement==ModelParityExpertMovement::Dynamic)++dynamic;
+        EXPECT_EQ(request.host.maximum_cache_rows,0u);
+        ASSERT_TRUE(seed.topology.expert_overlay_plan);
+        const auto& plan=*seed.topology.expert_overlay_plan;
+        ASSERT_EQ(plan.routed_tiers.size(),3u);
+        EXPECT_EQ(plan.routed_tiers[0].max_experts_per_layer,8);
+        EXPECT_EQ(plan.routed_tiers[1].max_experts_per_layer,8);
+        const auto domain=std::find_if(plan.domains.begin(),plan.domains.end(),[](const auto& d){return d.name=="rocm_followers";});
+        ASSERT_NE(domain,plan.domains.end());EXPECT_EQ(domain->participants.size(),4u);
+        const auto cells=qwen4ExpExpandSourceAdmissionMTP(std::vector<ModelParityCase>{seed});
+        for(const auto& cell:cells){
+            EXPECT_EQ(cell.topology.expert_overlay_plan,seed.topology.expert_overlay_plan);
+            EXPECT_EQ(cell.ngram_table_policy,seed.ngram_table_policy);
+            EXPECT_EQ(cell.expert_overlay,seed.expert_overlay);
+            EXPECT_EQ(cell.model.model_path,seed.model.model_path);
+            EXPECT_EQ(cell.topology.participants,seed.topology.participants);
+        }
+    }
+    EXPECT_EQ(follower,8u);EXPECT_EQ(both,8u);EXPECT_EQ(ram,8u);EXPECT_EQ(positive,8u);EXPECT_EQ(dynamic,8u);
+    names.clear();for(const auto& cell:expanded)EXPECT_TRUE(names.insert(cell.testName()).second);
+    for(const auto policy:{ModelParityExpertOverlayPolicy{},ModelParityExpertOverlayPolicy{
+            .owner_order=RoutedExpertOwnerOrder::Ordinal,.movement=ModelParityExpertMovement::Dynamic}}){
+        const auto execution=qwen4ExpExpertFollowerOwnerExecutionCases(policy);
+        EXPECT_EQ(execution.size(),32u);EXPECT_EQ(qwen4ExpExpertFollowerOwnerNativeExactCases(policy).size(),24u);
+        for(const auto& cell:execution)EXPECT_EQ(cell.expert_overlay,std::optional{policy});
+    }
+    EXPECT_THROW(qwen4ExpExpertFollowerOwnerPressureDefinition(Qwen4ExpHardwareNgramOwners::Continuation),std::invalid_argument);
+}
+}
+
+namespace llaminar2::test::parity::qwen4exp {
+/** @test Original Q6 roles require exact known rank identity, including equal foreign ordinals. */
+TEST(Qwen4ExpSourceAdmissionCases, ExpertLookupOwnerSelectionRequiresOriginalKnownRank) {
+    const auto resource=[](DeviceId device){return PhysicalMemoryResource{0,device,1ull<<30,1ull<<29};};
+    const std::array consumers{resource(DeviceId::cuda(0)),resource(DeviceId::cuda(1))};
+    std::vector<PhysicalMemoryResource> devices(consumers.begin(),consumers.end());
+    for(int ordinal=0;ordinal<4;++ordinal)devices.push_back(resource(DeviceId::rocm(ordinal)));
+    const std::array readerEdges{ImmutableRowTableReaderPeerAccess{
+        {0,DeviceId::cuda(0)},{0,DeviceId::cuda(1)},PeerAccessCoverage::None}};
+    for(const auto& cell:qwen4ExpExpertFollowerOwnerSourceAdmissionSeeds()){
+        ASSERT_TRUE(cell.ngram_table_policy);
+        const auto& policy=*cell.ngram_table_policy;
+        const auto input=ImmutableRowTablePlacementInput::forConsumers(
+            ImmutableRowTableExtent::fromNative(static_cast<GGUFTensorType>(0),128,64),resource(DeviceId::cpu()),consumers)
+            .withGPUCacheResources(policy,devices).withReaderPeerAccess(readerEdges);
+        const std::vector<size_t> slots(policy.gpu_adaptive.placement.owners.size(),0);
+        const auto placement=llaminar2::test::Qwen4ExpReplicatedPLECohortReplayAccess::declaration(
+            input.gpuAdaptiveLayout(policy,slots,0,16),policy.gpu_adaptive,16);
+        const auto owners=qwen4ExpSourceExpertLookupOwners(cell,placement.get());
+        ASSERT_EQ(owners.size(),4u);
+        for(int ordinal=0;ordinal<4;++ordinal)
+            EXPECT_NE(std::find(owners.begin(),owners.end(),PhysicalMemoryAllocatorIdentity{0,DeviceId::rocm(ordinal)}),owners.end());
+        auto changed=cell;
+        auto plan=std::make_shared<MoERoutedExpertPlacementPlan>(*cell.topology.expert_overlay_plan);
+        changed.topology.expert_overlay_plan=plan;
+        const auto domain=std::find_if(plan->domains.begin(),plan->domains.end(),[](const auto& d){return d.name=="rocm_followers";});
+        ASSERT_NE(domain,plan->domains.end());
+        domain->owner_rank=1;domain->world_ranks.clear();
+        EXPECT_TRUE(qwen4ExpSourceExpertLookupOwners(changed,placement.get()).empty())
+            << "Foreign rank's same ROCm ordinals cannot authorize local storage owners";
+        domain->owner_rank=-1;
+        EXPECT_TRUE(qwen4ExpSourceExpertLookupOwners(changed,placement.get()).empty())
+            << "Unresolved original rank cannot authorize a local expert owner";
+        domain->world_ranks={1,0,0,0};
+        const auto partial=qwen4ExpSourceExpertLookupOwners(changed,placement.get());
+        EXPECT_EQ(partial.size(),3u);
+        EXPECT_EQ(std::find(partial.begin(),partial.end(),PhysicalMemoryAllocatorIdentity{0,DeviceId::rocm(0)}),partial.end());
+        EXPECT_FALSE(qwen4ExpSourceReusesSharedContinuationOwners(placement.get()));
+    }
+}
+}
+
+namespace llaminar2::test::parity::qwen4exp {
 /** @test Moving MTP proof retains the original physical source and exact oracle contract. */
 TEST(Qwen4ExpSourceAdmissionCases, CPUJointMovingMTPExactRetainsOriginalRequests)
 {
@@ -1895,3 +2079,150 @@ TEST(Qwen4ExpSourceAdmissionCases, CPUJointMovingMTPExactRetainsOriginalRequests
     EXPECT_EQ(policies,(std::set<ModelParityMTP>{ModelParityMTP::Depth1,ModelParityMTP::Depth3,ModelParityMTP::DynamicDepth}));
 }
 }
+
+namespace llaminar2::test::parity::qwen4exp {
+/** @test Every nonempty original continuation mask preserves native readers, coordinator and follower roles. */
+TEST(Qwen4ExpSourceAdmissionCases, OwnerSubsetMasksExhaustOriginalHardwareDomains)
+{
+    std::size_t masks=0,axes=0,pure_coordinators=0;
+    for(const auto target:kQwen4ExpHardwareTargets) {
+        const auto role=target==Qwen4ExpHardwareTarget::CUDA2ROCm4
+            ? Qwen4ExpHardwareNgramOwners::Both:Qwen4ExpHardwareNgramOwners::Continuation;
+        const auto original=qwen4ExpHardwareTargetDefinition(target,role);
+        const auto& plan=*original.topology.expert_overlay_plan;
+        const auto domain=std::find_if(plan.domains.begin(),plan.domains.end(),
+            [&](const auto& value){return value.name==plan.continuation_domain;});
+        ASSERT_NE(domain,plan.domains.end());
+        const auto degree=domain->participants.size();
+        const auto end=std::uint64_t{1}<<degree;
+        EXPECT_THROW(qwen4ExpOwnerSubsetPressureDefinition(target,0),std::invalid_argument);
+        EXPECT_THROW(qwen4ExpOwnerSubsetPressureDefinition(target,end),std::invalid_argument);
+        for(std::uint64_t mask=1;mask<end;++mask) {
+            const auto definition=qwen4ExpOwnerSubsetPressureDefinition(target,mask);
+            ++masks;if(!(mask&1))++pure_coordinators;
+            EXPECT_EQ(definition.topology.participants,original.topology.participants);
+            ASSERT_EQ(definition.topology.expert_overlay_plan->domains.size(),plan.domains.size());
+            ASSERT_EQ(definition.topology.expert_overlay_plan->routed_tiers.size(),plan.routed_tiers.size());
+            for(std::size_t i=0;i<plan.domains.size();++i)
+                EXPECT_EQ(definition.topology.expert_overlay_plan->domains[i].participants,plan.domains[i].participants);
+            for(std::size_t i=0;i<plan.routed_tiers.size();++i)
+                EXPECT_EQ(definition.topology.expert_overlay_plan->routed_tiers[i].max_experts_per_layer,
+                    plan.routed_tiers[i].max_experts_per_layer);
+            ASSERT_EQ(definition.features.ngram_storage.size(),4u);
+            std::set<std::pair<AdaptiveImmutableRowBacking,bool>> profiles;
+            for(const auto& policy:definition.features.ngram_storage) {
+                ++axes;ASSERT_TRUE(policy.isGPUAdaptive());ASSERT_NO_THROW(policy.validate());
+                const auto& request=policy.gpu_adaptive;
+                ASSERT_TRUE(request.placement.coordinator);
+                EXPECT_EQ(request.placement.coordinator->world_rank,domain->owner_rank);
+                EXPECT_EQ(request.placement.coordinator->device(),
+                    (DeviceId{domain->participants.front().device_type,domain->participants.front().device_ordinal}));
+                std::size_t selected=0,followers=0;
+                for(std::size_t coordinate=0;coordinate<degree;++coordinate) {
+                    const auto& address=domain->participants[coordinate];
+                    const auto found=std::find_if(request.placement.owners.begin(),request.placement.owners.end(),
+                        [&](const auto& owner){return owner.participant.world_rank==domain->owner_rank &&
+                            owner.participant.device()==DeviceId{address.device_type,address.device_ordinal};});
+                    EXPECT_EQ(found!=request.placement.owners.end(),bool(mask&(std::uint64_t{1}<<coordinate)));
+                    if(found!=request.placement.owners.end())++selected;
+                }
+                for(const auto& owner:request.placement.owners) {
+                    EXPECT_EQ(owner.participant.world_rank,0);
+                    if(target==Qwen4ExpHardwareTarget::CUDA2ROCm4 && owner.participant.device().is_rocm())++followers;
+                }
+                EXPECT_EQ(followers,target==Qwen4ExpHardwareTarget::CUDA2ROCm4?4u:0u);
+                EXPECT_EQ(request.placement.owners.size(),selected+followers);
+                profiles.insert({request.source_backing,request.placement.owners.front().maximum_cache_rows!=0});
+            }
+            EXPECT_EQ(profiles.size(),4u);
+        }
+    }
+    EXPECT_EQ(masks,26u);EXPECT_EQ(axes,104u);EXPECT_EQ(pure_coordinators,10u);
+}
+
+/** @test Ten representative requests reuse original source/MTP policies without expanding the expensive product. */
+TEST(Qwen4ExpSourceAdmissionCases, OwnerSubsetRealModelCandidatesKeepBoundedOriginalProduct)
+{
+    const auto& seeds=qwen4ExpOwnerSubsetSourceAdmissionSeeds();ASSERT_EQ(seeds.size(),10u);
+    const auto source=qwen4ExpExpandSourceAdmissionMTP(seeds,Qwen4ExpSourceMTPEnvelope::Retained3);
+    ASSERT_EQ(source.size(),40u);
+    std::set<std::string> names;
+    std::size_t moving=0;
+    for(const auto& seed:seeds) {
+        EXPECT_TRUE(names.insert(seed.testName()).second);
+        EXPECT_EQ(seed.mtp,ModelParityMTP::Off);EXPECT_EQ(seed.retained_mtp_draft_capacity,0);
+        EXPECT_EQ(seed.model.transformer_layers,48);
+        ASSERT_TRUE(seed.ngram_table_policy);ASSERT_TRUE(seed.ngram_table_policy->isGPUAdaptive());
+        ASSERT_TRUE(seed.expert_overlay);
+        if(seed.expert_overlay->movement==ModelParityExpertMovement::Dynamic)++moving;
+        const auto config=seed.toTestConfig();ASSERT_TRUE(config.local_hardware_requirements);
+        EXPECT_TRUE(config.moe_routed_expert_plan);
+    }
+    EXPECT_EQ(moving,2u);names.clear();
+    for(std::size_t index=0;index<source.size();++index) {
+        const auto& cell=source[index];const auto& seed=seeds[index/4];
+        EXPECT_TRUE(names.insert(cell.testName()).second);
+        EXPECT_EQ(cell.topology.expert_overlay_plan,seed.topology.expert_overlay_plan);
+        EXPECT_EQ(cell.topology.participants,seed.topology.participants);
+        EXPECT_EQ(cell.ngram_table_policy,seed.ngram_table_policy);
+        EXPECT_EQ(cell.expert_overlay,seed.expert_overlay);
+        EXPECT_EQ(cell.model.model_path,seed.model.model_path);
+        EXPECT_EQ(cell.retained_mtp_draft_capacity,cell.mtp==ModelParityMTP::Off?0:3);
+    }
+    names.clear();std::size_t numerical=0,exact=0;
+    for(const auto policy:{ModelParityExpertOverlayPolicy{},ModelParityExpertOverlayPolicy{
+            .owner_order=RoutedExpertOwnerOrder::Ordinal,.movement=ModelParityExpertMovement::Dynamic}}) {
+        const auto cells=qwen4ExpOwnerSubsetExecutionCases(policy);
+        const auto native=qwen4ExpOwnerSubsetNativeExactCases(policy);
+        EXPECT_EQ(cells.size(),policy.movement==ModelParityExpertMovement::Static?32u:8u);
+        EXPECT_EQ(native.size(),policy.movement==ModelParityExpertMovement::Static?24u:6u);
+        numerical+=cells.size();exact+=native.size();
+        for(const auto& cell:cells) {
+            EXPECT_TRUE(names.insert(cell.testName()).second);EXPECT_EQ(cell.expert_overlay,std::optional{policy});
+            EXPECT_EQ(cell.retained_mtp_draft_capacity,3);EXPECT_EQ(cell.model.maximum_mtp_draft_depth,3);
+            EXPECT_EQ(cell.inventory_role,ModelParityInventoryRole::NumericalDiagnostic);
+            ASSERT_TRUE(cell.model.shared_predictor);EXPECT_EQ(cell.model.transformer_layers,48);
+            EXPECT_TRUE(cell.toTestConfig().local_hardware_requirements);
+        }
+        for(const auto& cell:native)EXPECT_NE(cell.mtp,ModelParityMTP::Off);
+    }
+    EXPECT_EQ(numerical,40u);EXPECT_EQ(exact,30u);
+    EXPECT_THROW(qwen4ExpOwnerSubsetExecutionCases({.owner_order=RoutedExpertOwnerOrder::Random,
+        .movement=ModelParityExpertMovement::Static}),std::invalid_argument);
+}
+
+/** @test Partial owners, including an unowned coordinator, enter the same real cold recreation source gate. */
+TEST(Qwen4ExpSourceAdmissionCases, OwnerSubsetSourceReuseRequiresOriginalNonemptyMembership)
+{
+    for(const auto type:{DeviceType::CUDA,DeviceType::ROCm})for(const std::size_t degree:{2u,4u}) {
+        const auto resource=[](DeviceId device){return PhysicalMemoryResource{0,device,1ull<<30,1ull<<29};};
+        std::vector<PhysicalMemoryResource> resources;
+        std::vector<PhysicalMemoryAllocatorIdentity> consumers;
+        std::vector<ImmutableRowTableReaderPeerAccess> edges;
+        for(std::size_t coordinate=0;coordinate<degree;++coordinate) {
+            resources.push_back(resource({type,int(coordinate)}));consumers.push_back({0,{type,int(coordinate)}});
+            if(coordinate)edges.push_back({consumers.front(),consumers.back(),PeerAccessCoverage::None});
+        }
+        for(std::uint64_t mask=1;mask<(std::uint64_t{1}<<degree);++mask) {
+            ImmutableRowTablePolicy policy{.storage=ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD};
+            auto& declared=policy.gpu_adaptive.placement;
+            declared.mode=AdaptiveGPUCachePlacementMode::DeclaredRankLocal;
+            declared.coordinator=AdaptiveGPUCacheParticipant{0,type,0};
+            for(std::size_t coordinate=0;coordinate<degree;++coordinate)
+                if(mask&(std::uint64_t{1}<<coordinate))declared.owners.push_back({{0,type,int(coordinate)},64,1u<<20});
+            ASSERT_NO_THROW(policy.validate());ASSERT_TRUE(qwen4ExpSharedContinuationOwnerSet(declared,consumers));
+            const auto input=ImmutableRowTablePlacementInput::forConsumers(
+                ImmutableRowTableExtent::fromNative(static_cast<GGUFTensorType>(0),128,64),resource(DeviceId::cpu()),resources)
+                .withGPUCacheResources(policy,resources).withReaderPeerAccess(edges);
+            const std::vector<std::size_t> slots(declared.owners.size(),32);
+            const auto placement=llaminar2::test::Qwen4ExpReplicatedPLECohortReplayAccess::declaration(
+                input.gpuAdaptiveLayout(policy,slots,0,16),policy.gpu_adaptive,16);
+            EXPECT_TRUE(qwen4ExpSourceReusesSharedContinuationOwners(placement.get()));
+            auto changed=declared;changed.owners.clear();EXPECT_FALSE(qwen4ExpSharedContinuationOwnerSet(changed,consumers));
+            changed=declared;changed.owners.push_back(changed.owners.front());EXPECT_FALSE(qwen4ExpSharedContinuationOwnerSet(changed,consumers));
+            changed=declared;changed.owners.front().participant.world_rank=1;EXPECT_FALSE(qwen4ExpSharedContinuationOwnerSet(changed,consumers));
+            changed=declared;changed.coordinator->world_rank=1;EXPECT_FALSE(qwen4ExpSharedContinuationOwnerSet(changed,consumers));
+        }
+    }
+}
+} // namespace llaminar2::test::parity::qwen4exp

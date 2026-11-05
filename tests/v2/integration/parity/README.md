@@ -672,6 +672,36 @@ model admission. It owns native execution, driver checks and retirement.
 These local source identities do not establish portable image/CI eligibility;
 the benchmark obligation remains `DECLARED_NOT_EXECUTED` until measured.
 
+When the user explicitly requests focused validation, the paired panel has a
+separate diagnostic prerequisite route. First build the selected test owners,
+matrix and canary normally. Run
+`run_production_prerequisites.py --build-dir BUILD --diagnostic-focused-panel --focused-test EXACT_DEVICEFREE_CTEST --output NEW_RECEIPT_DIRECTORY`,
+repeating `--focused-test` for each intended check. Only exact registered,
+bounded, model-free `DeviceFree` Unit/preflight checks are eligible. The producer
+retains their actual CTest output, rejects skips and binds the source, build,
+registrations and executed artifacts. It never runs the complete prerequisite
+gates. These checks provide no native GPU backend regression coverage; retain
+separate actual native evidence when that scope is required.
+
+Then use the same paired invocation with
+`--diagnostic-focused-prerequisites-report NEW_RECEIPT_DIRECTORY/focused-prerequisites.json`
+instead of `--prerequisites-report`. One unchanged source/build may reuse that
+receipt across its bound panels; each execution revalidates it without rerunning
+the checks. This explicit route also admits `NumericalDiagnostic` canonical case
+metadata through a local diagnostic inventory and a source-bound workload
+metadata file outside the corpus root. Every reference payload remains under
+the original corpus root. Histories, tokens, configuration, source identity,
+arithmetic, accuracy policies, driver checks and process retirement use the same
+validators and execution owner as the complete route.
+
+The focused receipt uses `llaminar.focused-panel-prerequisites.v1`. Panel status
+and verdict begin with `DIAGNOSTIC_`, `passed` is null, and reports declare
+`full_preflight=false` and `certification_eligible=false`; actual accuracy rows
+and their separate accuracy verdict remain visible. Complete prerequisite,
+published-image and canonical runtime inventory consumers reject this diagnostic
+evidence. A diagnostic panel never establishes complete prerequisite, model,
+image or release qualification. The default complete route remains unchanged.
+
 Generate a full-stage reference for one existing history with
 `generate_qwen4exp_pipeline_snapshots.py --frozen-history MANIFEST --history-id ID`,
 the original `--model`, any declared inactive `--shared-predictor`, pinned

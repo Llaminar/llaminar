@@ -303,10 +303,11 @@ def select_paired_corpus(args):
     from types import SimpleNamespace
     import re
     import model_parity_inventory as inventory
-    from model_kld_corpus_execution import PairedCorpusSelection
+    from model_kld_corpus_execution import PairedCorpusSelection,PairedMetadataPolicy
+    focused_report=getattr(args,'diagnostic_focused_prerequisites_report',None)
     require(args.binary is not None and args.container_image is None and args.corpus_root is not None and
-            args.prerequisites_report is not None,
-            'Paired canonical acceptance needs a local binary, explicit corpus root and genuine current prerequisites')
+            ((args.prerequisites_report is not None) != (focused_report is not None)),
+            'Paired canonical execution needs local source plus exactly one explicit complete or focused diagnostic prerequisite receipt')
     require(not any((args.corpus_catalog,args.topology_id,args.baseline_report,args.baseline_approval,
                      args.calibration,args.absolute_pilot)),
             'Paired document policy cannot mix independent corpus/topology/numerical selectors')
@@ -315,11 +316,12 @@ def select_paired_corpus(args):
     binary = args.binary.resolve(strict=True)
     selected = inventory.discover(SimpleNamespace(build_dir=binary.parent,manifest=None,
         source_revision=args.source_revision,backend='.*',campaign='.*',cell=re.escape(args.paired_cell)),
-        inventory.InventoryScope.ALL)
+        inventory.InventoryScope.LOCAL_DIAGNOSTIC if focused_report is not None else inventory.InventoryScope.ALL)
     require(len(selected)==1 and selected[0][1]==args.paired_cell,
             'Paired acceptance requires exactly one original registered cell')
     campaign, exact, record = selected[0]
-    selection = PairedCorpusSelection.from_export(exact,record,args.corpus_root,ROOT)
+    selection = PairedCorpusSelection.from_export(exact,record,args.corpus_root,ROOT,
+        metadata_policy=PairedMetadataPolicy.SOURCE_BOUND_DIAGNOSTIC if focused_report is not None else PairedMetadataPolicy.CANONICAL_ROOT)
     matrix = inventory.matrix_binary(campaign).resolve(strict=True)
     selection.pins[str(matrix)] = identity(matrix)
     args._paired_selection = selection
@@ -381,8 +383,16 @@ def run_corpus_v2(args):
     if pilot_path is not None:source_pins[str(pilot_path)]=pilot_pin
     if paired is not None:source_pins.update(paired.pins)
     prerequisite_pins={}
+    focused_report=getattr(args,'diagnostic_focused_prerequisites_report',None)
+    focused_evidence=None
     def check_prerequisites():
+        nonlocal focused_evidence
         unchanged(source_pins)
+        if focused_report is not None:
+            from run_production_prerequisites import validate_focused_panel_prerequisites
+            focused_evidence=validate_focused_panel_prerequisites(args.binary.parent,focused_report)
+            unchanged(prerequisite_pins)
+            return
         if args.prerequisites_report is None:return
         from run_production_prerequisites import validate_source_freshness
         from run_production_parity_campaigns import reuse_unchanged_production_test_preflight
@@ -392,6 +402,10 @@ def run_corpus_v2(args):
     if args.prerequisites_report:
         args.prerequisites_report=args.prerequisites_report.resolve(strict=True)
         prerequisite_pins[str(args.prerequisites_report)]=identity(args.prerequisites_report)
+    if focused_report is not None:
+        require(paired is not None,'Focused prerequisite evidence requires an exact canonical paired cell')
+        focused_report=focused_report.resolve(strict=True)
+        prerequisite_pins[str(focused_report)]=identity(focused_report)
     check_prerequisites()
     state=dict(schema=2,mode='local_fixed_history_diagnostic',complete=False,passed=None,
         source_revision=args.source_revision,diagnostic_only=True,certification_eligible=False,
@@ -409,6 +423,14 @@ def run_corpus_v2(args):
     if paired is not None:
         state.update(mode='local_paired_canonical_accuracy',paired_workload=paired.observation(),
             qualification='local_canonical_paired_numerical_scope_only_no_image_or_benchmark_qualification')
+    if focused_report is not None:
+        state.update(mode='local_paired_focused_diagnostic',full_preflight=False,
+            status='DIAGNOSTIC_PANEL_RUNNING',verdict='DIAGNOSTIC_RUNNING',
+            qualification='explicit_focused_diagnostic_only_no_complete_prerequisites_or_certification',
+            prerequisites=dict(available=True,mode='focused_DeviceFree_diagnostic',full_preflight=False,
+                report=str(focused_report),focused_tests=focused_evidence['focused_tests'],
+                original_completed_ns=focused_evidence['focused_completed_ns'],
+                native_backend_regressions='not_covered_by_DeviceFree_selection'))
     write_json(args.report,state)
     try:
         for topology in selected:
@@ -425,9 +447,18 @@ def run_corpus_v2(args):
         state['verdict']=('GREEN' if state['passed'] else 'RED') if calibrated else 'UNCALIBRATED'
         if pilot is not None:
             state['verdict']='REQUIRED_GROUPS_GREEN' if state['passed'] else 'REQUIRED_GROUPS_RED'
+        # Focused prerequisites never publish a legacy certifiable green/pass.
+        # Raw accuracy rows and required-group result stay intact for diagnosis.
+        if focused_report is not None:
+            state.update(diagnostic_passed=state['passed'],accuracy_verdict=state['verdict'],
+                verdict='DIAGNOSTIC_'+state['verdict'],status='DIAGNOSTIC_PANEL_COMPLETE',passed=None)
         # Exit zero means complete collection; no absent calibration is promoted.
         return 1 if any(c.get('passed') is False for c in state['cells']) else 0
-    except BaseException as error:state['error']=repr(error);raise
+    except BaseException as error:
+        state['error']=repr(error)
+        if focused_report is not None:
+            state.update(status='DIAGNOSTIC_PANEL_FAILED',verdict='DIAGNOSTIC_ERROR',passed=None)
+        raise
     finally:write_json(args.report,state)
 
 
@@ -448,9 +479,14 @@ def main(argv=None):
     parser.add_argument('--baseline-approval',type=Path)
     parser.add_argument('--calibration',type=Path)
     parser.add_argument('--absolute-pilot',type=Path,help='Explicit selected-topology required-group pilot; no whole-corpus acceptance')
-    parser.add_argument('--prerequisites-report',type=Path,help='Optional genuine current canonical prerequisite receipt; no synthesized replacement')
+    prerequisite=parser.add_mutually_exclusive_group()
+    prerequisite.add_argument('--prerequisites-report',type=Path,help='Genuine current complete canonical prerequisite receipt')
+    prerequisite.add_argument('--diagnostic-focused-prerequisites-report',type=Path,
+        help='Explicit paired-only DeviceFree diagnostic receipt; never full preflight/certification')
     args=parser.parse_args(argv)
     require(not args.container_image or not args.keep_logits,'CI always removes raw candidate logits')
+    require(args.diagnostic_focused_prerequisites_report is None or (args.paired_cell is not None and args.binary is not None and args.container_image is None),
+            'Focused prerequisites are an explicit local canonical paired diagnostic only')
     require(args.corpus_manifest is None or (args.corpus_catalog is not None and args.paired_cell is None),
             'Explicit corpus manifest requires v2 explicit catalog; paired document authority is unchanged')
     require(args.mpi_rankfile is None or (args.binary is not None and args.corpus_catalog is not None),

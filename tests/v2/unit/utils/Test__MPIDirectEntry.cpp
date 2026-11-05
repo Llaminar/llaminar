@@ -3,7 +3,8 @@
  * @brief Replay actual MPI/GTest executable mains without initializing runtimes.
  *
  * The target selects the original production E2E main or shared fixture main
- * with LLAMINAR_MPI_ENTRY_SOURCE. Only external APIs are inert. Exact terminal
+ * with LLAMINAR_MPI_ENTRY_SOURCE. The integration variant also compiles the
+ * actual MPIProcessSession and shutdown bodies. Only external APIs are inert. Exact terminal
  * statuses, argument identity, lexical GPU ownership, and entry-before-initialization
  * are checked over repeated runs. Original mode verifies the precise missing-owner observations
  * with ordinary success; an arbitrary failure never counts as a negative proof.
@@ -16,11 +17,16 @@
 #include <string>
 #include <stdexcept>
 #include <vector>
+#ifdef LLAMINAR_MPI_ENTRY_INTEGRATION
+#include <sys/wait.h>
+#include <unistd.h>
+#include <exception>
+#endif
 
 namespace mpi_entry_replay
 {
     enum class Event { Owner, GPUEnter, MPIInit, TestsInit, TestsRun,
-                       CollectiveShutdown, GPURetire, ContextShutdown, MPIFinalize, GPUExit };
+                       CollectiveShutdown, KernelShutdown, GPURetire, ContextShutdown, MPIFinalize, GPUExit };
     std::vector<Event> events;
     std::optional<int> terminal;
     int original_argc = 0;
@@ -28,6 +34,7 @@ namespace mpi_entry_replay
     const llaminar2::GPUDeviceProcessLifetime *gpu_owner = nullptr;
     bool gpu_constructed = false, gpu_retired = false, throw_from_tests = false;
     int mpi_init_result = 0, mpi_provided = 3, mpi_finalize_result = 0;
+    bool mpi_initialized = false, mpi_finalized = false;
 
     /** @brief Stop on any incomplete or changed observation. */
     void require(bool condition)
@@ -51,6 +58,7 @@ namespace mpi_entry_replay
         events.clear(); terminal = status;
         gpu_constructed = false; gpu_retired = false; throw_from_tests = false;
         mpi_init_result = 0; mpi_provided = 3; mpi_finalize_result = 0;
+        mpi_initialized = false; mpi_finalized = false;
     }
 
     /** @brief Verify actual library admission cannot precede the lexical GPU owner. */
@@ -83,6 +91,7 @@ namespace mpi_entry_replay
         if (throw_from_tests) throw std::runtime_error("recorded test-run unwind");
         return 19;
     }
+    void shutdownKernelCache() { events.push_back(Event::KernelShutdown); }
     void shutdownContexts() { events.push_back(Event::ContextShutdown); }
     void shutdownCollectives()
     {
@@ -145,6 +154,7 @@ int MPI_Init_thread(int *argc, char ***argv, int required, int *provided)
     mpi_entry_replay::requireGPUAdmission();
     mpi_entry_replay::events.push_back(mpi_entry_replay::Event::MPIInit);
     *provided = mpi_entry_replay::mpi_provided;
+    mpi_entry_replay::mpi_initialized = mpi_entry_replay::mpi_init_result == 0;
     return mpi_entry_replay::mpi_init_result;
 }
 int MPI_Finalize()
@@ -153,8 +163,28 @@ int MPI_Finalize()
     mpi_entry_replay::require(mpi_entry_replay::gpu_owner && mpi_entry_replay::gpu_retired);
 #endif
     mpi_entry_replay::events.push_back(mpi_entry_replay::Event::MPIFinalize);
+    mpi_entry_replay::mpi_finalized = mpi_entry_replay::mpi_finalize_result == 0;
     return mpi_entry_replay::mpi_finalize_result;
 }
+
+#ifdef LLAMINAR_MPI_ENTRY_INTEGRATION
+/** @brief Witness the actual session's original process-owner prerequisite. */
+void llaminar2::MPISessionOwner::requireProcessOwner()
+{
+    mpi_entry_replay::requireGPUAdmission();
+    mpi_entry_replay::require(!mpi_entry_replay::terminal);
+}
+/** @brief Supply inert native MPI lifecycle observations, never initialize MPI. */
+int MPI_Initialized(int *value) { *value = mpi_entry_replay::mpi_initialized; return 0; }
+/** @brief Supply the exact finalization witness used by actual shutdown. */
+int MPI_Finalized(int *value) { *value = mpi_entry_replay::mpi_finalized; return 0; }
+/** @brief Preserve the actual single-process thread-support agreement value. */
+int MPI_Allreduce(const void *send, void *receive, int count, int datatype, int op, int comm)
+{
+    mpi_entry_replay::require(send == reinterpret_cast<void *>(1) && receive && count == 1 && datatype == 1 && op == 2 && comm == 3);
+    return 0;
+}
+#endif
 
 // Compile the complete selected production main, rather than copying its body.
 #define main llaminarActualMPIEntry
@@ -180,7 +210,7 @@ int main()
 #endif
         Event::TestsInit, Event::TestsRun,
 #ifdef LLAMINAR_MPI_ENTRY_INTEGRATION
-        Event::CollectiveShutdown,
+        Event::CollectiveShutdown, Event::KernelShutdown,
 #endif
 #ifdef LLAMINAR_MPI_ENTRY_ORIGINAL
         Event::ContextShutdown, Event::MPIFinalize
@@ -228,28 +258,61 @@ int main()
 #endif
             Event::TestsInit, Event::TestsRun,
 #ifndef LLAMINAR_MPI_ENTRY_ORIGINAL
+#ifdef LLAMINAR_MPI_ENTRY_INTEGRATION
+            Event::CollectiveShutdown, Event::KernelShutdown, Event::GPURetire, Event::MPIFinalize, Event::GPUExit
+#else
             Event::GPURetire, Event::GPUExit
+#endif
 #endif
         };
         require(events == unwind && gpu_owner == nullptr);
 
 #ifdef LLAMINAR_MPI_ENTRY_INTEGRATION
-        // Early MPI failures return through the actual scope destructor;
-        // finalization failure retires before preserving status3 unchanged.
+        // Actual session initialization throws; an armed unsupported-thread
+        // scope retires MPI before its original exception leaves the entry.
         for (const bool bad_status : {false, true})
         {
             beginReplay();
             mpi_init_result = bad_status ? 7 : 0;
             mpi_provided = bad_status ? 3 : 2;
-            require(llaminarActualMPIEntry(original_argc, argv) == 2);
-            require(events == std::vector<Event>{Event::Owner, Event::GPUEnter,
-                Event::MPIInit, Event::GPURetire, Event::GPUExit});
-            require(gpu_owner == nullptr);
+            try { (void)llaminarActualMPIEntry(original_argc, argv); require(false); }
+            catch (const std::runtime_error &error)
+            {
+                require(std::string(error.what()) == (bad_status ?
+                    "Failed to initialize process MPI runtime" : "Llaminar requires MPI_THREAD_MULTIPLE on every process"));
+            }
+            std::vector<Event> rejected{Event::Owner, Event::GPUEnter, Event::MPIInit};
+            if (!bad_status) rejected.insert(rejected.end(), {Event::CollectiveShutdown, Event::KernelShutdown, Event::GPURetire, Event::MPIFinalize});
+            else rejected.push_back(Event::GPURetire);
+            rejected.push_back(Event::GPUExit);
+            require(events == rejected && gpu_owner == nullptr);
         }
-        beginReplay();
-        mpi_finalize_result = 9;
-        require(llaminarActualMPIEntry(original_argc, argv) == 3);
-        require(events == continuation && gpu_owner == nullptr);
+        // A noexcept session destructor must fail fatally on native finalizer
+        // error. Isolate the actual failing body and observe its original
+        // terminal ordering, rather than inventing a returned status code.
+        if (iteration == 0)
+        {
+            const pid_t child = fork();
+            require(child >= 0);
+            if (child == 0)
+            {
+                beginReplay(); mpi_finalize_result = 9;
+                std::set_terminate([] {
+                    try { std::rethrow_exception(std::current_exception()); }
+                    catch (const std::runtime_error &error)
+                    { require(std::string(error.what()) == "Original MPI_Finalize failed; CPU process pool remains retained"); }
+                    catch (...) { _exit(75); }
+                    require(events == std::vector<Event>{Event::Owner, Event::GPUEnter, Event::MPIInit,
+                        Event::TestsInit, Event::TestsRun, Event::CollectiveShutdown, Event::KernelShutdown,
+                        Event::GPURetire, Event::MPIFinalize});
+                    _exit(73);
+                });
+                (void)llaminarActualMPIEntry(original_argc, argv);
+                _exit(74);
+            }
+            int status = 0;
+            require(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 73);
+        }
 #endif
     }
     std::puts("{\"iterations\":20,\"terminal_cases\":60,\"continuations\":20,\"unwinds\":20,\"complete\":true}");

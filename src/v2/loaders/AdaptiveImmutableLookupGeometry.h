@@ -186,9 +186,8 @@ public:
         if(layout.consumers().size()>1){
             if(source.row_elements>std::numeric_limits<std::uint32_t>::max())
                 throw std::overflow_error("Shared reader output width exceeds its original ABI");
-            readers=qwen4exp::PooledImmutableReplicatedReaderGeometry::checked(requester,layout.consumers(),
-                static_cast<std::uint32_t>(layout.maximumInflightRows()),static_cast<std::uint32_t>(source.row_elements),
-                layout.readerPeerAccess());
+            readers=qwen4exp::PooledImmutableReplicatedReaderGeometry::native(requester,layout.consumers(),
+                static_cast<std::uint32_t>(layout.maximumInflightRows()),static_cast<std::uint32_t>(source.row_elements));
         }
         return {physical, coordinator, host, std::move(actual_roots), std::move(fixed_roots),std::move(readers)};
     }

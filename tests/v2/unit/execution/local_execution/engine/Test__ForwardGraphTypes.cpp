@@ -24,6 +24,7 @@
 #include "execution/compute_stages/IComputeStage.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
 #include "execution/local_execution/graph/DeviceGraphCaptureController.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/local_execution/graph/RetainedParentTicketServiceWorker.h"
 #include "execution/local_execution/engine/ForwardGraphTypes.h"
@@ -478,6 +479,7 @@ namespace
 
         bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override
         {
+            if (prepare_observer_) prepare_observer_(ctx, stream);
             ++prepare_calls_;
             last_ctx_ = ctx;
             last_stream_ = stream;
@@ -487,8 +489,18 @@ namespace
             return stream != nullptr;
         }
 
+        /** @brief Record exact Controller activity transitions without owning native work. */
+        bool transitionGraphCaptureActivity(IDeviceContext *ctx, void *stream,
+                                            GraphCaptureActivityTransition transition) override
+        {
+            if (capture_activity_observer_) capture_activity_observer_(ctx, stream, transition);
+            return true;
+        }
+
         StageDumpInfo buildDumpInfoImpl() const override { return {}; }
 
+        std::function<void(IDeviceContext*, void*, GraphCaptureActivityTransition)> capture_activity_observer_;
+        std::function<void(IDeviceContext*, void*)> prepare_observer_;
         int prepare_calls_ = 0;
         int execute_calls_ = 0;
         bool executed_after_prepare_ = false;
@@ -719,7 +731,21 @@ namespace
         std::string deviceName() const override { return "FakeReplayGPU"; }
         bool isInitialized() const override { return true; }
 
-        void submitAndWait(std::function<void()> work) override { work(); }
+        /** @return True only within this recorded worker's scoped submission. */
+        bool ownsCurrentThread() const noexcept override { return active_worker_ == this; }
+        /** @brief Model original worker entry, nested inline calls and exception restoration. */
+        void submitAndWait(std::function<void()> work) override
+        {
+            if (ownsCurrentThread()) { work(); return; }
+            ++worker_submissions_;
+            if (broken_dispatch_) { work(); return; }
+            struct Restore {
+                const FakeReplayGPUContext* previous;
+                ~Restore() { active_worker_ = previous; }
+            } restore{active_worker_};
+            active_worker_ = this;
+            work();
+        }
         std::future<void> submitAsync(std::function<void()> work) override
         {
             if (asynchronous_submission_)
@@ -806,6 +832,8 @@ namespace
             return createFakeGraphCapture(stream);
         }
 
+        int worker_submissions_ = 0;
+        bool broken_dispatch_ = false;
         int synchronize_stream_calls_ = 0;
         int synchronize_stream_checked_calls_ = 0;
         int destroy_stream_calls_ = 0;
@@ -835,6 +863,7 @@ namespace
             return capture;
         }
 
+        inline static thread_local const FakeReplayGPUContext* active_worker_ = nullptr;
         int device_ordinal_ = 0;
         bool asynchronous_submission_ = false;
         bool create_graph_only_captures_ = false;
@@ -6760,6 +6789,167 @@ TEST(Test__GraphSegmentCache, ReplaySkipsCaptureOnlyPreparation)
     EXPECT_EQ(prep_stage->prepare_calls_, 0)
         << "Capture-only setup must already be embodied by the executable graph.";
     EXPECT_EQ(prep_stage->execute_calls_, 0);
+}
+
+/** @test One actual cold controller dispatch owns preparation, recording and reset replay. */
+TEST(Test__GraphSegmentCache, ColdCaptureOriginalWorkerLifecycle)
+{
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)}) {
+        SCOPED_TRACE(device.toString());
+        FakeReplayGPUContext worker;
+        llaminar2::testing::MockDeviceContext context(device, device.is_cuda()
+            ? ComputeBackendType::GPU_CUDA : ComputeBackendType::GPU_ROCM);
+        for (int replay = 0; replay < 20; ++replay) {
+            SCOPED_TRACE(replay);
+            ComputeGraph graph;
+            auto* stage = addFakeGraphLaunchPrepStage(graph, "original", device);
+            DeviceGraphExecutor::GraphSegmentCache cache;
+            ASSERT_TRUE(cache.ensureCaptureStream(&worker));
+            cache.segments.emplace_back();
+            cache.segments.back().capturable = true;
+            cache.segments.back().stage_names = {"original"};
+            const auto exact_stream = cache.capture_stream;
+            stage->prepare_observer_ = [&](IDeviceContext* actual, void* stream) {
+                EXPECT_TRUE(worker.ownsCurrentThread());
+                EXPECT_EQ(actual, &context);
+                EXPECT_EQ(stream, exact_stream);
+            };
+            bool fail_prebind = false;
+            DeviceGraphCaptureController::ReplayHooks hooks{
+                .prebind_storage = [&](const auto&) {
+                    EXPECT_TRUE(worker.ownsCurrentThread());
+                    if (fail_prebind) throw std::runtime_error("recorded cold preparation failure");
+                    return true;
+                },
+                .cohere_inputs = [](const auto&) { return true; },
+                .execute_node = [&](ComputeNode& node) {
+                    EXPECT_TRUE(worker.ownsCurrentThread());
+                    EXPECT_EQ(node.stage->gpuStream(), exact_stream);
+                    EXPECT_EQ(stage->prepare_calls_, 1);
+                    return node.stage->execute(&context);
+                },
+                .record_snapshot_copies = [](ComputeNode&, void*) { return true; },
+                .post_launch = [](auto&, void*) {},
+            };
+            const auto invoke = [&] {
+                return DeviceGraphCaptureController::executeCapturePhase(
+                    graph, cache, &context, &worker, false, 2, hooks);
+            };
+            // A broken dispatcher must fail at worker entry, before touching any stage.
+            worker.broken_dispatch_ = true;
+            EXPECT_THROW(invoke(), std::logic_error);
+            EXPECT_EQ(stage->prepare_calls_, 0);
+            EXPECT_EQ(stage->execute_calls_, 0);
+            EXPECT_FALSE(worker.ownsCurrentThread());
+            worker.broken_dispatch_ = false;
+            // The original exception unwinds worker identity; the same cache remains usable.
+            fail_prebind = true;
+            EXPECT_THROW(invoke(), std::runtime_error);
+            EXPECT_FALSE(worker.ownsCurrentThread());
+            EXPECT_EQ(stage->prepare_calls_, 0);
+            EXPECT_EQ(stage->execute_calls_, 0);
+            fail_prebind = false;
+            const int before = worker.worker_submissions_;
+            if (replay % 2 == 0) {
+                EXPECT_TRUE(invoke().success);
+            } else {
+                worker.submitAndWait([&] {
+                    const int entered = worker.worker_submissions_;
+                    EXPECT_TRUE(invoke().success);
+                    EXPECT_EQ(worker.worker_submissions_, entered);
+                    EXPECT_TRUE(worker.ownsCurrentThread());
+                });
+            }
+            EXPECT_EQ(worker.worker_submissions_, before + 1);
+            EXPECT_EQ(stage->prepare_calls_, 1);
+            EXPECT_EQ(stage->execute_calls_, 1);
+            EXPECT_FALSE(worker.ownsCurrentThread());
+            cache.reset();
+            graph.clear();
+            EXPECT_FALSE(worker.ownsCurrentThread());
+        }
+    }
+}
+
+/** @test The actual recording hook diagnoses its original stage and unwinds without replacing the exception. */
+TEST(Test__GraphSegmentCache, CaptureHookExceptionPreservesStageContextAndUnwindsActivity)
+{
+    struct RecordedCaptureFailure final : std::logic_error {
+        explicit RecordedCaptureFailure(int token) : std::logic_error("recorded unjoined external producer"), token(token) {}
+        int token;
+    };
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        SCOPED_TRACE(device.toString());
+        FakeReplayGPUContext worker;
+        llaminar2::testing::MockDeviceContext context(device, device.is_cuda()
+            ? ComputeBackendType::GPU_CUDA : ComputeBackendType::GPU_ROCM);
+        ComputeGraph graph;
+        auto *stage = addFakeGraphLaunchPrepStage(graph, "throwing_external_producer", device);
+        DeviceGraphExecutor::GraphSegmentCache cache;
+        cache.perf_context = "decode_diagnostic";
+        ASSERT_TRUE(cache.ensureCaptureStream(&worker));
+        cache.segments.emplace_back();
+        auto &segment = cache.segments.back();
+        segment.capturable = true;
+        segment.stage_names = {"throwing_external_producer"};
+        segment.capture_wave_ordinal = 7;
+        segment.capture_wave_identity = "recorded_source_wave";
+        std::vector<GraphCaptureActivityTransition> activity;
+        stage->capture_activity_observer_ = [&](IDeviceContext *actual, void *stream, auto transition) {
+            EXPECT_EQ(actual, &context);
+            EXPECT_EQ(stream, cache.capture_stream);
+            EXPECT_TRUE(worker.ownsCurrentThread());
+            activity.push_back(transition);
+        };
+        const auto original = std::make_exception_ptr(RecordedCaptureFailure(617));
+        int hook_calls = 0;
+        DeviceGraphCaptureController::ReplayHooks hooks{
+            .prebind_storage = [](const auto &) { return true; },
+            .cohere_inputs = [](const auto &) { return true; },
+            .execute_node = [&](ComputeNode &node) -> bool {
+                ++hook_calls;
+                EXPECT_EQ(node.stage.get(), stage);
+                EXPECT_TRUE(worker.ownsCurrentThread());
+                EXPECT_TRUE(isGraphCaptureActive());
+                std::rethrow_exception(original);
+            },
+            .record_snapshot_copies = [](ComputeNode &, void *) { return true; },
+            .post_launch = [](auto &, void *) {},
+        };
+        std::exception_ptr caught;
+        ::testing::internal::CaptureStderr();
+        try {
+            (void)DeviceGraphCaptureController::executeCapturePhase(
+                graph, cache, &context, &worker, false, 2, hooks);
+        } catch (...) { caught = std::current_exception(); }
+        const std::string diagnostic = ::testing::internal::GetCapturedStderr();
+        ASSERT_TRUE(caught);
+        EXPECT_EQ(caught, original);
+        try { std::rethrow_exception(caught); }
+        catch (const RecordedCaptureFailure &failure) {
+            EXPECT_EQ(failure.token, 617);
+            EXPECT_STREQ(failure.what(), "recorded unjoined external producer");
+        } catch (...) { FAIL() << "Controller replaced the original typed exception"; }
+        EXPECT_EQ(hook_calls, 1);
+        EXPECT_FALSE(worker.ownsCurrentThread());
+        EXPECT_FALSE(isGraphCaptureActive());
+        ASSERT_EQ(activity.size(), 2u);
+        EXPECT_EQ(activity[0], GraphCaptureActivityTransition::Entering);
+        EXPECT_EQ(activity[1], GraphCaptureActivityTransition::Aborted);
+        const auto *capture = dynamic_cast<const FakeReplayGraphCapture *>(segment.capture.get());
+        ASSERT_NE(capture, nullptr);
+        EXPECT_FALSE(capture->capturing_);
+        EXPECT_EQ(capture->begin_capture_calls_, 1);
+        EXPECT_EQ(capture->end_capture_calls_, 1);
+        EXPECT_EQ(capture->instantiate_calls_, 0);
+        EXPECT_EQ(capture->launch_calls_, 0);
+        EXPECT_NE(diagnostic.find("stage=throwing_external_producer"), std::string::npos);
+        EXPECT_NE(diagnostic.find(std::string("type=") + computeStageTypeName(ComputeStageType::COPY)), std::string::npos);
+        EXPECT_NE(diagnostic.find("participant_device=" + device.toString()), std::string::npos);
+        EXPECT_NE(diagnostic.find("segment=0 wave=7 wave_identity=recorded_source_wave context=decode_diagnostic"), std::string::npos);
+        EXPECT_NE(diagnostic.find("exception=recorded unjoined external producer"), std::string::npos);
+    }
 }
 
 TEST(Test__GraphSegmentCache, CapturePhasePreparesGraphLaunchMetadataBeforeRecording)

@@ -9,6 +9,10 @@
  * retained-parent lowering changes the number of physical compiler units.
  * Native parent evidence separately projects that physical inventory through
  * the same schema used for deferred first launch and steady replay.
+ * Cold materialization runs as one job on the participant's original worker;
+ * descriptor preparation and native recording therefore share its thread-local
+ * capture authority as well as its exact stream. This does not move ready
+ * replay or add a per-stage dispatch or device synchronization.
  */
 
 #include "DeviceGraphCaptureController.h"
@@ -4634,6 +4638,25 @@ namespace llaminar2
             return result;
         }
 
+        if (!gpu_ctx->ownsCurrentThread())
+        {
+            // The control-thread caller retains this whole cold transaction
+            // until its original worker returns. Dispatching individual leaves
+            // would split preparation from recording and lose the worker's
+            // capture scope. TP participants are already fanned out by Rank;
+            // each enters its own worker and the existing capture rendezvous.
+            gpu_ctx->submitAndWait([&]
+            {
+                if (!gpu_ctx->ownsCurrentThread())
+                    throw std::logic_error(
+                        "Cold graph capture dispatch did not enter its original GPU worker");
+                result = executeCapturePhase(
+                    graph, segment_cache, ctx, gpu_ctx, has_collective_nodes,
+                    current_step, hooks, initial_submission);
+            });
+            return result;
+        }
+
         if (!segment_cache.ensureCaptureStream(gpu_ctx, ctx->deviceId()))
         {
             LOG_ERROR(
@@ -5117,8 +5140,40 @@ namespace llaminar2
                         };
                         const auto stage_record_begin =
                             PerfStatsCollector::Clock::now();
-                        const bool stage_recorded =
-                            node && node->stage && hooks.execute_node(*node);
+                        bool stage_recorded = false;
+                        try
+                        {
+                            stage_recorded =
+                                node && node->stage && hooks.execute_node(*node);
+                        }
+                        catch (const std::exception &exception)
+                        {
+                            // Preserve the exact throwing stage before RAII closes
+                            // native capture and withdraws stage/worker activity.
+                            LOG_ERROR("[DeviceGraphCaptureController] Stage threw during cached graph capture"
+                                      << " stage=" << stage_name
+                                      << " type=" << observation.stage_type
+                                      << " participant_device=" << ctx->deviceId().toString()
+                                      << " segment=" << segment_index
+                                      << " wave=" << seg.capture_wave_ordinal
+                                      << " wave_identity=" << seg.capture_wave_identity
+                                      << " context=" << segment_cache.perf_context
+                                      << " exception=" << exception.what());
+                            throw;
+                        }
+                        catch (...)
+                        {
+                            LOG_ERROR("[DeviceGraphCaptureController] Stage threw during cached graph capture"
+                                      << " stage=" << stage_name
+                                      << " type=" << observation.stage_type
+                                      << " participant_device=" << ctx->deviceId().toString()
+                                      << " segment=" << segment_index
+                                      << " wave=" << seg.capture_wave_ordinal
+                                      << " wave_identity=" << seg.capture_wave_identity
+                                      << " context=" << segment_cache.perf_context
+                                      << " exception=<non-standard exception>");
+                            throw;
+                        }
                         observation.execute_ns = static_cast<std::uint64_t>(
                             std::max<std::int64_t>(
                                 0,

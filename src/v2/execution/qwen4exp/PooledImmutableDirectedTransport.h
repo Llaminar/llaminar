@@ -2,13 +2,17 @@
  * @file PooledImmutableDirectedTransport.h
  * @brief Original same-PMA directed channel ownership for declared remote immutable cache participants.
  *
- * One remote owner reuses exactly two original channels across Pin, Free,
- * Victim, Source, Publication, Read and retirement. Local owners create none.
+ * Opposite-vendor remote owners reuse two original captured channels across
+ * Pin, Free, Victim, Source, Publication, Read and retirement. Homogeneous native cohorts
+ * continuation owners use their original native completed-byte communicator.
+ * Same-vendor owners outside that communicator are unsupported; local owners
+ * create no remote channel.
  * Participant graphs and recurring hosted transaction submission remain explicit
  * consumers; this owner launches no graph and holds no model or residency state.
  */
 #pragma once
 #include "PooledImmutableDirectedChannelGeometry.h"
+#include "PooledImmutableTransferBinding.h"
 #include "PooledImmutableReplicatedReaderGeometry.h"
 #include "PooledImmutableParticipantRetirementGraph.h"
 #include "ImmutableLookupExecutionBoundary.h"
@@ -38,6 +42,12 @@ public:
     const std::shared_ptr<CapturedTransferChannel>& result() const noexcept { return result_; }
     /** @return Existing reader-to-source ACK channel. */
     const std::shared_ptr<CapturedTransferChannel>& acknowledgement() const noexcept { return acknowledgement_; }
+    /** @return Explicit original NCCL/RCCL route, absent on an original cross-vendor channel. */
+    bool nativeCollective() const noexcept { return bool(native_result_); }
+    /** @return Source-to-reader original native fixed/header and counted payload endpoint. */
+    const PooledImmutableTransferChannel& nativeResult() const noexcept { return native_result_; }
+    /** @return Reader-to-source original native fixed ACK endpoint. */
+    const PooledImmutableTransferChannel& nativeAcknowledgement() const noexcept { return native_acknowledgement_; }
     /** @return Exact source/reader metadata storage priced by the same channel geometry. */
     const std::shared_ptr<DeviceTransferBuffer>& control(CapturedTransferEndpoint side) const;
     /** @brief Reject substituted PMA/control blocks, retired worker generations or endpoint identities. */
@@ -49,28 +59,34 @@ private:
         PreparedGPUContextUsePermit source, PreparedGPUContextUsePermit reader,
         std::shared_ptr<CapturedTransferChannel> result, std::shared_ptr<CapturedTransferChannel> acknowledgement,
         std::array<PhysicalMemoryAllocationLease,2> claims,
-        std::array<std::shared_ptr<DeviceTransferBuffer>,2> controls)
+        std::array<std::shared_ptr<DeviceTransferBuffer>,2> controls,
+        PooledImmutableTransferChannel nativeResult = {}, PooledImmutableTransferChannel nativeAck = {})
         : coordinate_(coordinate), source_(std::move(source)), reader_(std::move(reader)),
           result_(std::move(result)), acknowledgement_(std::move(acknowledgement)),
-          control_claims_(std::move(claims)), controls_(std::move(controls)) {}
+          control_claims_(std::move(claims)), controls_(std::move(controls)),
+          native_result_(std::move(nativeResult)), native_acknowledgement_(std::move(nativeAck)) {}
     std::uint32_t coordinate_;
     PreparedGPUContextUsePermit source_, reader_;
     std::shared_ptr<CapturedTransferChannel> result_, acknowledgement_;
     std::array<PhysicalMemoryAllocationLease,2> control_claims_;
     std::array<std::shared_ptr<DeviceTransferBuffer>,2> controls_;
+    PooledImmutableTransferChannel native_result_, native_acknowledgement_;
 };
 /** @brief Pure BOM projection and actual original TransferEngine materialization, never another admission ledger. */
 class PooledImmutableDirectedTransport final {
 public:
     /** @brief Exact two-channel protocol floor at zero optional owner payload capacity. */
     static PhysicalMemoryPlan mandatoryBOM(const PooledImmutablePhysicalOwnerGeometry&,const PooledImmutableCoordinatorGeometry&,
-        PhysicalMemoryResource host,std::span<const PhysicalMemoryResource> originalGPUResources);
+        PhysicalMemoryResource host,std::span<const PhysicalMemoryResource> originalGPUResources,
+        const PooledImmutableReplicatedReaderGeometry* readers = nullptr);
     /** @brief Exact full two-channel contribution for this candidate's actual owner capacities. */
     static PhysicalMemoryPlan completeBOM(const PooledImmutablePhysicalOwnerGeometry&,const PooledImmutableCoordinatorGeometry&,
-        PhysicalMemoryResource host,std::span<const PhysicalMemoryResource> originalGPUResources);
+        PhysicalMemoryResource host,std::span<const PhysicalMemoryResource> originalGPUResources,
+        const PooledImmutableReplicatedReaderGeometry* readers = nullptr);
     /** @brief Source-owned exact growth above the same ordered protocol floor; add before candidate fits. */
     static PhysicalMemoryPlan slotDependentBOM(const PooledImmutablePhysicalOwnerGeometry&,const PooledImmutableCoordinatorGeometry&,
-        PhysicalMemoryResource host,std::span<const PhysicalMemoryResource> originalGPUResources);
+        PhysicalMemoryResource host,std::span<const PhysicalMemoryResource> originalGPUResources,
+        const PooledImmutableReplicatedReaderGeometry* readers = nullptr);
     /** @brief Bind original source permits/streams and existing directed waves once outside capture.
      * @param boundary Actual service/source owner retaining the original prepared participant cohort.
      * @param originalInventory Original rank discovery owner; required for every explicit same-vendor mapped or peer route.
@@ -78,7 +94,8 @@ public:
      */
     static std::shared_ptr<const PooledImmutableDirectedTransport> create(std::shared_ptr<ImmutableLookupExecutionBoundary> boundary,
         std::shared_ptr<const ClusterInventory> originalInventory = {},
-        std::optional<PooledImmutableReplicatedReaderGeometry> readers = {});
+        std::optional<PooledImmutableReplicatedReaderGeometry> readers = {},
+        std::shared_ptr<const Qwen4ExpReplicatedPLECohort> nativeCohort = {});
     /** @return Original source boundary; foreign readers never reinterpret its device as their own. */
     const std::shared_ptr<ImmutableLookupExecutionBoundary>& sourceBoundary() const noexcept { return boundary_; }
     /** @return Actual foreign compute-reader channels; they are never storage-owner programs. */
@@ -93,6 +110,10 @@ public:
     const PooledImmutableRemoteTransport& remote(std::uint32_t coordinate)const;
 private:
     friend class ImmutableLookupExecutionBoundary;
+    friend class PooledImmutableRetainedParticipants;
+    /** @brief Revoke only original native caller bindings after all enclosing cache/parent borrowers have retired. */
+    void retireOriginalRuntime() const noexcept;
+
     /** @brief Bind the actual whole-request source ticket before any native participant submits. */
     void beginInvocation(CapturedTransferInvocation original) const;
     /** @brief Original physical edge subset; source retirement precedes storage-edge cancellation. */
@@ -103,6 +124,8 @@ private:
      * @param edges Readers cancel immediately; storage owners cancel after the original source terminal proof.
      */
     std::function<void()> failureCallback(CapturedTransferInvocation original, CancellationEdges edges) const;
+    /** @return Signal-only original TP failure action, bound by the service's exact ticket/lifecycle owner before launch. */
+    std::function<void()> nativeFailureSignal() const;
     /** @brief Retire successful channel admission after the original complete native reader frontier. */
     [[nodiscard]] CapturedTransferInvocationRetirement finishInvocation(CapturedTransferInvocation original) const;
 public:
@@ -121,6 +144,7 @@ private:
     /** Original immutable discovery owner, retained until all original channels retire. */
     std::shared_ptr<const ClusterInventory> original_inventory_;
     std::vector<PooledImmutableRemoteTransport> remotes_;
+    std::shared_ptr<const PooledImmutableNativeCompletionStorage> native_completion_;
     std::optional<PooledImmutableReplicatedReaderGeometry> reader_geometry_;
     std::vector<std::shared_ptr<const PooledImmutableReplicatedReaderTransport>> readers_;
 };

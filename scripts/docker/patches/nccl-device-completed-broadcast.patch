@@ -1,0 +1,2290 @@
+--- a/src/collectives.cc
++++ b/src/collectives.cc
+@@ -1,3 +1,10 @@
++/**
++ * @file collectives.cc
++ * @brief Native captured payload metadata with explicit row/byte extent ownership.
++ *
++ * Original transports, channel scheduling and arithmetic remain authoritative;
++ * the typed binding narrows useful payload without a host count observation.
++ */
+ /*************************************************************************
+  * Copyright (c) 2015-2023, NVIDIA CORPORATION. All rights reserved.
+  *
+@@ -7,8 +14,250 @@
+ #include "argcheck.h" // Need some checks here since we access comm
+ #include "collectives.h"
+ #include "enqueue.h"
++#include "group.h"
+ #include "nccl.h"
+ #include "nvtx_payload_schemas.h"
++
++/**
++ * @brief Borrow immutable device abort provenance from the original communicator.
++ * @param comm Original initialized communicator whose lifetime the caller retains.
++ * @param original Host output for immutable device identities only, never GPU values.
++ * @return Native status; absent original identities reject without side effects.
++ * No device value is read, allocation made or native operation issued here.
++ * The caller must strongly retain this same communicator through capture/ACK/retirement.
++ */
++extern "C" __attribute__((visibility("default"))) ncclResult_t
++llaminarNcclCompletionAuthority(ncclComm_t comm, ncclLlaminarCompletionAuthority* original) {
++  if (!comm || !original || !comm->abortFlagDev || !comm->devComm) return ncclInvalidArgument;
++  *original = {comm->abortFlagDev, comm->devComm};
++  return ncclSuccess;
++}
++
++
++/**
++ * @brief Enqueue one addressed completed byte operand on the original communicator.
++ * @param payload Exact local original payload bank; only the named peer consumes it.
++ * @param liveBytes Sender-owned UINT64 extent or receiver's existing acquired field.
++ * @param capacityBytes Retained progress bound, never a payload communication extent.
++ * @param sourceSlice Sender-only original absolute descriptor, otherwise null.
++ * @param sourceCapacityBytes Exact sender source subspan, zero for ordinary prefixes.
++ * @param sourceOffsetOrigin Immutable absolute source subspan origin.
++ * @param peer Original communicator coordinate of the opposite endpoint.
++ * @param sending True only for the original producer endpoint.
++ * @param completion Original local interval, sticky error and native receipt binding.
++ * @param comm Original node-local communicator, retained through terminal retirement.
++ * @param stream Exact explicit endpoint stream after original metadata publication.
++ * @return Native enqueue result; errors never select another transport or operation.
++ * Header and payload close separate native plans. All unrelated communicator
++ * members remain absent from both operations. Capacity steps retain only their
++ * required progress metadata when no useful bytes intersect that step.
++ */
++static ncclResult_t llaminarNcclAddressedCompleted(void* payload, uint64_t* liveBytes,
++    size_t capacityBytes, const ncclLlaminarSourceSlice* sourceSlice,
++    size_t sourceCapacityBytes, uint64_t sourceOffsetOrigin, int peer, bool sending,
++    const ncclLlaminarCompletionOperand* completion, ncclComm_t comm, cudaStream_t stream) {
++  if (!payload || !liveBytes || !completion || !comm ||
++      reinterpret_cast<uintptr_t>(stream) <= 2 || !capacityBytes || capacityBytes > PTRDIFF_MAX ||
++      reinterpret_cast<uintptr_t>(liveBytes) % alignof(uint64_t) ||
++      reinterpret_cast<uintptr_t>(completion) % alignof(ncclLlaminarCompletionOperand))
++    return ncclInvalidArgument;
++  if (ncclGroupDepth != 0) return ncclInvalidUsage;
++  int ranks;
++  NCCLCHECK(ncclCommCount(comm, &ranks));
++  if (ranks < 2 || comm->nNodes != 1 || peer < 0 || peer >= ranks || peer == comm->rank)
++    return ncclInvalidUsage;
++  const size_t bankBytes = sourceSlice ? sourceCapacityBytes : capacityBytes;
++  const uintptr_t a = reinterpret_cast<uintptr_t>(payload), c = reinterpret_cast<uintptr_t>(liveBytes);
++  const uintptr_t q = reinterpret_cast<uintptr_t>(completion), d = reinterpret_cast<uintptr_t>(sourceSlice);
++  if (a > UINTPTR_MAX-bankBytes || c > UINTPTR_MAX-sizeof(uint64_t) ||
++      q > UINTPTR_MAX-sizeof(ncclLlaminarCompletionOperand)) return ncclInvalidArgument;
++  const auto overlap = [](uintptr_t x,size_t xn,uintptr_t y,size_t yn){return x < y+yn && y < x+xn;};
++  if (overlap(a,bankBytes,c,sizeof(uint64_t)) || overlap(a,bankBytes,q,sizeof(ncclLlaminarCompletionOperand)) ||
++      overlap(c,sizeof(uint64_t),q,sizeof(ncclLlaminarCompletionOperand))) return ncclInvalidArgument;
++  if (sourceSlice) {
++    if (!sending || !sourceCapacityBytes || sourceCapacityBytes < capacityBytes || sourceCapacityBytes > PTRDIFF_MAX ||
++        sourceOffsetOrigin > UINT64_MAX-sourceCapacityBytes || d % alignof(ncclLlaminarSourceSlice) ||
++        d > UINTPTR_MAX-sizeof(ncclLlaminarSourceSlice) ||
++        c != d+offsetof(ncclLlaminarSourceSlice,liveBytes) ||
++        overlap(d,sizeof(ncclLlaminarSourceSlice),a,bankBytes) ||
++        overlap(d,sizeof(ncclLlaminarSourceSlice),q,sizeof(ncclLlaminarCompletionOperand))) return ncclInvalidArgument;
++  } else if (sourceCapacityBytes || sourceOffsetOrigin) return ncclInvalidArgument;
++  // The existing fixed eight-byte peer operation publishes the actual sender
++  // extent first. No host dereference, capacity-sized header or extra owner.
++  if (sending) NCCLCHECK(ncclSend(liveBytes,sizeof(uint64_t),ncclInt8,peer,comm,stream));
++  else NCCLCHECK(ncclRecv(liveBytes,sizeof(uint64_t),ncclInt8,peer,comm,stream));
++  ncclInfo info = {sending ? ncclFuncSend : ncclFuncRecv, "AddressedCompletedBytes",
++    nullptr, payload, capacityBytes, ncclInt8, ncclSum, peer, comm, stream, 1, 1};
++  if (sourceSlice) {
++    info.llaminarPayload.binding.slice = {sourceSlice,uint64_t(sourceCapacityBytes),completion};
++    info.llaminarPayload.kind = ncclLlaminarPayloadKind::CompletedSourceSlice;
++    info.llaminarSourceOffsetOrigin = sourceOffsetOrigin;
++  } else {
++    info.llaminarPayload.binding.bytes = {liveBytes,uint64_t(capacityBytes),completion};
++    info.llaminarPayload.kind = ncclLlaminarPayloadKind::CompletedBytes;
++  }
++  return ncclEnqueueCheck(&info);
++}
++/** @brief Send exact device-authored prefix bytes only to the named original peer. @copydetails llaminarNcclAddressedCompleted */
++extern "C" __attribute__((visibility("default"))) ncclResult_t
++llaminarNcclSendCompletedBytes(const void* payload,uint64_t* liveBytes,size_t capacityBytes,int peer,
++    const ncclLlaminarCompletionOperand* completion,ncclComm_t comm,cudaStream_t stream) {
++  return llaminarNcclAddressedCompleted(const_cast<void*>(payload),liveBytes,capacityBytes,nullptr,0,0,peer,true,completion,comm,stream);
++}
++/** @brief Receive an original peer's exact prefix and publish actual native receive evidence. @copydetails llaminarNcclAddressedCompleted */
++extern "C" __attribute__((visibility("default"))) ncclResult_t
++llaminarNcclRecvCompletedBytes(void* payload,uint64_t* liveBytes,size_t capacityBytes,int peer,
++    const ncclLlaminarCompletionOperand* completion,ncclComm_t comm,cudaStream_t stream) {
++  return llaminarNcclAddressedCompleted(payload,liveBytes,capacityBytes,nullptr,0,0,peer,false,completion,comm,stream);
++}
++/** @brief Send one original source-relative slice only to its actual consumer. @copydetails llaminarNcclAddressedCompleted */
++extern "C" __attribute__((visibility("default"))) ncclResult_t
++llaminarNcclSendCompletedSliceOrigin(const void* payload,const ncclLlaminarSourceSlice* slice,
++    size_t sourceCapacityBytes,size_t payloadCapacity,int peer,uint64_t sourceOffsetOrigin,
++    const ncclLlaminarCompletionOperand* completion,ncclComm_t comm,cudaStream_t stream) {
++  if (!slice) return ncclInvalidArgument;
++  return llaminarNcclAddressedCompleted(const_cast<void*>(payload),const_cast<uint64_t*>(&slice->liveBytes),payloadCapacity,
++    slice,sourceCapacityBytes,sourceOffsetOrigin,peer,true,completion,comm,stream);
++}
++
++/**
++ * @brief Broadcast one original UINT64 prefix through native library-selected transports.
++ * @param sendbuff Root payload bank; no receiver contribution is required.
++ * @param recvbuff Original per-participant destination; root in-place is legal.
++ * @param liveBytes Root-authored device communication metadata; receivers acquire into this existing field.
++ * @param capacityBytes Positive retained bound, never useful wire bytes.
++ * @param root Original communicator coordinate, not a device ordinal.
++ * @param completion Original device frame, sticky first-error and required receive receipt.
++ * @param comm Original initialized node-local communicator, retained through native retirement.
++ * @param stream Exact explicit stream after the root's original extent producer.
++ * @return Native enqueue status, without transport fallback or a host count read.
++ * Header and payload close distinct depth0 native plans, preventing receiver
++ * count prefetch in a fused header/payload work pack. Aborted communicators are
++ * not reset/rearmed by this API. Device source-relative slices are unsupported.
++ */
++extern "C" __attribute__((visibility("default"))) ncclResult_t
++llaminarNcclBroadcastCompletedBytes(const void* sendbuff, void* recvbuff,
++    uint64_t* liveBytes, size_t capacityBytes, int root,
++    const ncclLlaminarCompletionOperand* completion, ncclComm_t comm, cudaStream_t stream) {
++  if (!sendbuff || !recvbuff || !liveBytes || !completion || !comm ||
++      reinterpret_cast<uintptr_t>(stream) <= 2 || !capacityBytes || capacityBytes > PTRDIFF_MAX ||
++      reinterpret_cast<uintptr_t>(liveBytes) % alignof(uint64_t) ||
++      (completion && reinterpret_cast<uintptr_t>(completion) % alignof(ncclLlaminarCompletionOperand)))
++    return ncclInvalidArgument;
++  if (ncclGroupDepth != 0) {
++    WARN("Device-byte broadcast requires separate native extent/payload plans; an outer group is invalid");
++    return ncclInvalidUsage;
++  }
++  int ranks;
++  NCCLCHECK(ncclCommCount(comm, &ranks));
++  if (ranks < 2 || comm->nNodes != 1 || root < 0 || root >= ranks) return ncclInvalidUsage;
++  const uintptr_t a = reinterpret_cast<uintptr_t>(sendbuff);
++  const uintptr_t b = reinterpret_cast<uintptr_t>(recvbuff);
++  const uintptr_t c = reinterpret_cast<uintptr_t>(liveBytes);
++  const uintptr_t q = reinterpret_cast<uintptr_t>(completion);
++  const auto overlap = [](uintptr_t x, size_t xn, uintptr_t y, size_t yn) {
++    return x < y + yn && y < x + xn;
++  };
++  if (a > UINTPTR_MAX - capacityBytes || b > UINTPTR_MAX - capacityBytes ||
++      c > UINTPTR_MAX - sizeof(uint64_t) || (q && q > UINTPTR_MAX - sizeof(ncclLlaminarCompletionOperand)))
++    return ncclInvalidArgument;
++  if ((comm->rank == root && a != b && overlap(a, capacityBytes, b, capacityBytes)) ||
++      overlap(c, sizeof(uint64_t), b, capacityBytes) ||
++      (comm->rank == root && overlap(c, sizeof(uint64_t), a, capacityBytes)) ||
++      (q && (overlap(q, sizeof(ncclLlaminarCompletionOperand), c, sizeof(uint64_t)) ||
++          overlap(q, sizeof(ncclLlaminarCompletionOperand), b, capacityBytes) ||
++          (comm->rank == root && overlap(q, sizeof(ncclLlaminarCompletionOperand), a, capacityBytes)))))
++    return ncclInvalidArgument;
++  // Never read the device word here. Ordinary native broadcast leaves the
++  // root's in-place extent unchanged and publishes it to each actual receiver.
++  NCCLCHECK(ncclBroadcast(liveBytes, liveBytes, sizeof(uint64_t), ncclInt8, root, comm, stream));
++  ncclInfo info = {ncclFuncBroadcast, "BroadcastCompletedBytes", sendbuff,
++    recvbuff, capacityBytes, ncclInt8, ncclSum, root, comm, stream,
++    BROADCAST_CHUNKSTEPS, BROADCAST_SLICESTEPS};
++  info.llaminarPayload.binding.bytes = {liveBytes, uint64_t(capacityBytes), completion};
++  info.llaminarPayload.kind = ncclLlaminarPayloadKind::CompletedBytes;
++  return ncclEnqueueCheck(&info);
++}
++
++/**
++ * @brief Broadcast an original device-authored source slice through native transport.
++ * @param sendbuff Original root source bank, never a host-adjusted payload pointer.
++ * @param recvbuff Original destination bank with payloadCapacity bytes admitted.
++ * @param sourceSlice Original root offset/bytes descriptor; null on receivers.
++ * @param liveBytes Root descriptor's liveBytes field or receiver's admitted UINT64 extent.
++ * @param sourceCapacityBytes Exact admitted root subspan bytes; zero on receivers.
++ * @param sourceOffsetOrigin Immutable absolute origin of that subspan; zero on receivers.
++ * @param payloadCapacity Native worst-case progress bound, never useful wire bytes.
++ * @param root Exact original communicator coordinate, independent of device ordinal.
++ * @param completion Original device frame, sticky first-error and actual completion receipt.
++ * @param comm Original initialized node-local communicator.
++ * @param stream Exact original stream after descriptor publication.
++ * @return Native enqueue status; invalid device extents trap before payload mutation.
++ *
++ * Header and payload are separate real native plans. No host reads a device
++ * offset or count; only the root selects a source slice. All receivers acquire
++ * the same source-authored count before their zero-based payload receives.
++ */
++extern "C" __attribute__((visibility("default"))) ncclResult_t
++llaminarNcclBroadcastCompletedSliceOrigin(const void* sendbuff, void* recvbuff,
++    const ncclLlaminarSourceSlice* sourceSlice, uint64_t* liveBytes,
++    size_t sourceCapacityBytes, size_t payloadCapacity, int root, uint64_t sourceOffsetOrigin,
++    const ncclLlaminarCompletionOperand* completion, ncclComm_t comm, cudaStream_t stream) {
++  if (!sendbuff || !recvbuff || !liveBytes || !completion || !comm ||
++      reinterpret_cast<uintptr_t>(stream) <= 2 || !payloadCapacity || payloadCapacity > PTRDIFF_MAX ||
++      reinterpret_cast<uintptr_t>(liveBytes) % alignof(uint64_t) ||
++      (completion && reinterpret_cast<uintptr_t>(completion) % alignof(ncclLlaminarCompletionOperand)))
++    return ncclInvalidArgument;
++  if (ncclGroupDepth != 0) {
++    WARN("Device-slice broadcast requires separate native extent/payload plans; an outer group is invalid");
++    return ncclInvalidUsage;
++  }
++  int ranks;
++  NCCLCHECK(ncclCommCount(comm, &ranks));
++  if (ranks < 2 || comm->nNodes != 1 || root < 0 || root >= ranks) return ncclInvalidUsage;
++  const bool isRoot = comm->rank == root;
++  if (isRoot ? (!sourceSlice || !sourceCapacityBytes || sourceCapacityBytes < payloadCapacity || sourceCapacityBytes > PTRDIFF_MAX || sourceOffsetOrigin > UINT64_MAX - sourceCapacityBytes ||
++      reinterpret_cast<uintptr_t>(sourceSlice) % alignof(ncclLlaminarSourceSlice)) : (sourceSlice || sourceCapacityBytes || sourceOffsetOrigin))
++    return ncclInvalidArgument;
++  const uintptr_t a = reinterpret_cast<uintptr_t>(sendbuff);
++  const uintptr_t b = reinterpret_cast<uintptr_t>(recvbuff);
++  const uintptr_t c = reinterpret_cast<uintptr_t>(liveBytes);
++  const uintptr_t q = reinterpret_cast<uintptr_t>(completion);
++  const uintptr_t d = reinterpret_cast<uintptr_t>(sourceSlice);
++  const auto overlap = [](uintptr_t x, size_t xn, uintptr_t y, size_t yn) {
++    return x < y + yn && y < x + xn;
++  };
++  if (b > UINTPTR_MAX - payloadCapacity || c > UINTPTR_MAX - sizeof(uint64_t) ||
++      (q && q > UINTPTR_MAX - sizeof(ncclLlaminarCompletionOperand)) ||
++      (isRoot && (a > UINTPTR_MAX - sourceCapacityBytes || d > UINTPTR_MAX - sizeof(ncclLlaminarSourceSlice))))
++    return ncclInvalidArgument;
++  if (isRoot && c != d + offsetof(ncclLlaminarSourceSlice, liveBytes)) return ncclInvalidArgument;
++  // Root in-place names its original source bank and is send-only even for
++  // nonzero device offsets. Receivers remain zero-based; distinct root output
++  // explicitly requests the native local slice copy. Partial aliases reject.
++  if (overlap(c, sizeof(uint64_t), b, payloadCapacity) ||
++      (isRoot && ((a != b && overlap(a, sourceCapacityBytes, b, payloadCapacity)) ||
++          overlap(d, sizeof(ncclLlaminarSourceSlice), a, sourceCapacityBytes) ||
++          overlap(d, sizeof(ncclLlaminarSourceSlice), b, payloadCapacity))) ||
++      (q && (overlap(q, sizeof(ncclLlaminarCompletionOperand), c, sizeof(uint64_t)) ||
++          overlap(q, sizeof(ncclLlaminarCompletionOperand), b, payloadCapacity) ||
++          (isRoot && (overlap(q, sizeof(ncclLlaminarCompletionOperand), a, sourceCapacityBytes) ||
++              overlap(q, sizeof(ncclLlaminarCompletionOperand), d, sizeof(ncclLlaminarSourceSlice)))))))
++    return ncclInvalidArgument;
++  NCCLCHECK(ncclBroadcast(liveBytes, liveBytes, sizeof(uint64_t), ncclInt8, root, comm, stream));
++  ncclInfo info = {ncclFuncBroadcast, "BroadcastCompletedSlice", sendbuff,
++    recvbuff, payloadCapacity, ncclInt8, ncclSum, root, comm, stream,
++    BROADCAST_CHUNKSTEPS, BROADCAST_SLICESTEPS};
++  if (isRoot) {
++    info.llaminarPayload.binding.slice = {sourceSlice, uint64_t(sourceCapacityBytes), completion};
++    info.llaminarSourceOffsetOrigin = sourceOffsetOrigin;
++    info.llaminarPayload.kind = ncclLlaminarPayloadKind::CompletedSourceSlice;
++  } else {
++    info.llaminarPayload.binding.bytes = {liveBytes, uint64_t(payloadCapacity), completion};
++    info.llaminarPayload.kind = ncclLlaminarPayloadKind::CompletedBytes;
++  }
++  return ncclEnqueueCheck(&info);
++}
+ 
+ /**
+  * @brief Enqueue a captured, node-local byte allgather with device-owned rows.
+@@ -38,7 +287,7 @@
+   ncclInfo info = {ncclFuncAllGather, "AllGatherDeviceRows", sendbuff,
+     recvbuff, capacityRows * rowBytes, ncclInt8, ncclSum, 0, comm, stream,
+     ALLGATHER_CHUNKSTEPS, ALLGATHER_SLICESTEPS};
+-  info.llaminarRows = {liveRows, {uint32_t(rowBytes), uint32_t(capacityRows)}, outgoingPayloadBytes};
++  info.llaminarPayload.binding.rows = {liveRows, {uint32_t(rowBytes), uint32_t(capacityRows)}, outgoingPayloadBytes};
+   return ncclEnqueueCheck(&info);
+ }
+ 
+@@ -80,7 +329,7 @@
+     sendbuff, recvbuff, capacityRows * elementsPerRow, datatype, op, 0, comm, stream,
+     scatter ? REDUCESCATTER_CHUNKSTEPS : ALLREDUCE_CHUNKSTEPS,
+     scatter ? REDUCESCATTER_SLICESTEPS : ALLREDUCE_SLICESTEPS};
+-  info.llaminarRows = {liveRows, {uint32_t(elementsPerRow * typeBytes), uint32_t(capacityRows)}, outgoingPayloadBytes};
++  info.llaminarPayload.binding.rows = {liveRows, {uint32_t(elementsPerRow * typeBytes), uint32_t(capacityRows)}, outgoingPayloadBytes};
+   return ncclEnqueueCheck(&info);
+ }
+ 
+@@ -308,3 +557,11 @@
+     1, 1 };
+   return ncclEnqueueCheck(&info);
+ }
++
++/**
++ * @brief Completed-byte semantic contract: origin bounds and abortable host GROUP barriers.
++ * @return Protocol 2; independent of vendor release, receipt version and work layout.
++ * This host-only constant performs no runtime/device/communicator operation.
++ */
++extern "C" __attribute__((visibility("default"))) uint32_t
++llaminarNcclCompletedProtocolVersion(void) { return 3; }
+--- a/src/device/broadcast.h
++++ b/src/device/broadcast.h
+@@ -1,3 +1,10 @@
++/**
++ * @file broadcast.h
++ * @brief Native captured payload metadata with explicit row/byte extent ownership.
++ *
++ * Original transports, channel scheduling and arithmetic remain authoritative;
++ * the typed binding narrows useful payload without a host count observation.
++ */
+ /*************************************************************************
+  * Copyright (c) 2015-2022, NVIDIA CORPORATION. All rights reserved.
+  *
+@@ -7,10 +14,12 @@
+ #include "device.h"
+ #include "collectives.h"
+ #include "primitives.h"
++#include "llaminar_device_payload.h"
++#include "llaminar_device_completion.h"
+ 
+ namespace {
+   template<typename T, typename RedOp, typename Proto>
+-  __device__ __forceinline__ void runRing(int tid, int nthreads, struct ncclDevWorkColl* work) {
++  __device__ __forceinline__ void runRingFixed(int tid, int nthreads, struct ncclDevWorkColl* work) {
+     ncclRing *ring = &ncclShmem.channel.ring;
+     const int rank = ring->userRanks[0];
+     const int nextRank = ring->userRanks[1];
+@@ -61,24 +70,166 @@
+   }
+ }
+ 
++
++namespace {
++  template<typename T, typename RedOp, typename Proto, bool NodeLocal, int Mode>
++  __device__ __forceinline__ void runRingMode(int tid, int nthreads, struct ncclDevWorkColl* work) {
++    ncclRing *ring = &ncclShmem.channel.ring;
++    const int rank = ring->userRanks[0];
++    const int nextRank = ring->userRanks[1];
++    const int root = work->root;
++    ssize_t totalCount;
++    ssize_t chunkCount;
++    ssize_t channelCount;
++    ssize_t gridOffset;
++    ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T), &totalCount, &gridOffset, &channelCount, &chunkCount);
++    size_t offset;
++    int nelem;
++    int workNthreads;
++    const bool isNetOffload = !NodeLocal && work->isOneRPN && work->netRegUsed;
++    if ((Mode == int(ncclLlaminarPayloadKind::CompletedBytes) ||
++         Mode == int(ncclLlaminarPayloadKind::CompletedSourceSlice)) &&
++        (!work->oneNode || work->netRegUsed)) {
++#if defined(__HIP_DEVICE_COMPILE__)
++      __builtin_trap();
++#else
++      asm volatile("trap;");
++#endif
++    }
++
++    ncclLlaminarBeginCompletion(work, tid);
++    T *inputBuf = (T*)work->sendbuff;
++    T *outputBuf = (T*)work->recvbuff;
++    size_t sourceSliceEnd = ~size_t(0);
++    if (Mode == int(ncclLlaminarPayloadKind::CompletedSourceSlice)) {
++      // Only the actual root has a source-relative descriptor. Receivers retain
++      // the separately broadcast original UINT64 prefix and zero-based output.
++      if (rank != root || sizeof(T) != 1) {
++#if defined(__HIP_DEVICE_COMPILE__)
++        __builtin_trap();
++#else
++        asm volatile("trap;");
++#endif
++      }
++      const auto slice = ncclLlaminarResolveSourceSlice(work->llaminarPayload.binding.slice,
++          size_t(totalCount), work->llaminarSourceOffsetOrigin);
++      inputBuf += slice.byteOffset;
++      sourceSliceEnd = size_t(slice.liveBytes);
++    }
++
++    workNthreads = isNetOffload ? WARP_SIZE : nthreads;
++
++    if (tid < workNthreads) {
++      // Coverity reports that the callee treats &ring->next as an array.  However, due to the use of
++      // FanSymmetric<1>, only the first element is ever accessed, so it's fine.
++      // coverity[callee_ptr_arith:FALSE]
++      Primitives<T, RedOp, FanSymmetric<1>, 1, Proto, 0>
++        prims(tid, workNthreads, &ring->prev, &ring->next, inputBuf, outputBuf, work->redOpArg, 0, 0, 0, work);
++
++      for (size_t elemOffset = 0; elemOffset < channelCount; elemOffset += chunkCount) {
++        offset = gridOffset + elemOffset;
++        nelem = min(chunkCount, channelCount - elemOffset);
++        // Only useful payload narrows. Every original chunk and acknowledgement
++        // remains present, including empty slices on native SHM/proxy paths.
++        nelem = ncclLlaminarPayload<T, size_t, Mode>(work, tid, offset, nelem, nextRank == root ? 0 : 1, sourceSliceEnd);
++
++        if (rank == root) {
++          // Root in-place is defined by its ORIGINAL bank, before applying the
++          // device source origin. It sends only and never overwrites that bank.
++          if (work->sendbuff == work->recvbuff || isNetOffload) {
++            prims.directSend(offset, offset, nelem);
++          } else {
++            prims.directCopySend(offset, offset, nelem);
++          }
++        } else if (nextRank == root) {
++          prims.directRecv(offset, nelem);
++        } else {
++          prims.directRecvCopyDirectSend(offset, offset, nelem);
++        }
++      }
++    } else if (inputBuf != outputBuf && rank == root) {
++      inputBuf = inputBuf + gridOffset;
++      outputBuf = outputBuf + gridOffset;
++      reduceCopy<COLL_UNROLL, RedOp, T, 0, 1, 1, 0, 1, 1, /*PreOpSrcs=*/0>
++        (tid - workNthreads, nthreads - workNthreads, work->redOpArg, &work->redOpArg, false, 1, (void**)&inputBuf, 1, (void**)&outputBuf, channelCount);
++    }
++    if (isNetOffload) barrier_sync(14, nthreads);
++      ncclLlaminarFinishCompletion(work, tid,
++        Mode == int(ncclLlaminarPayloadKind::CompletedSourceSlice)
++            ? sourceSliceEnd : work->llaminarPayload.binding.resolved.liveBytes);
++}
++
++}
++
+ template<typename T, typename RedOp>
+ struct RunWorkColl<ncclFuncBroadcast, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPLE> {
++  /** @brief Retain one capture-identity payload mode through the original Ring body. */
++  template<int Mode>
++  __device__ __forceinline__ void runNodeLocalMode(int tid, int nthreads, ncclDevWorkColl* work) {
++    using Proto = ProtoSimple<BROADCAST_CHUNKSTEPS/BROADCAST_SLICESTEPS, BROADCAST_SLICESTEPS>;
++    if constexpr (Mode == 0) {
++      runRingFixed<T, RedOp, Proto>(tid, nthreads, work);
++    } else {
++      runRingMode<T, RedOp, Proto, true, Mode>(tid, nthreads, work);
++    }
++  }
++
++  /** @brief Execute the original Ring primitive after whole-plan node-local admission. */
++  __device__ __forceinline__ void runNodeLocal(int tid, int nthreads, struct ncclDevWorkColl* work) {
++    using Proto = ProtoSimple<BROADCAST_CHUNKSTEPS/BROADCAST_SLICESTEPS, BROADCAST_SLICESTEPS>;
++    runRingFixed<T, RedOp, Proto>(tid, nthreads, work);
++  }
++
+   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
+     using Proto = ProtoSimple<BROADCAST_CHUNKSTEPS/BROADCAST_SLICESTEPS, BROADCAST_SLICESTEPS>;
+-    runRing<T, RedOp, Proto>(tid, nthreads, work);
++    runRingFixed<T, RedOp, Proto>(tid, nthreads, work);
+   }
+ };
+ 
+ template<typename T, typename RedOp>
+ struct RunWorkColl<ncclFuncBroadcast, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_LL> {
++  /** @brief Retain one capture-identity payload mode through the original Ring body. */
++  template<int Mode>
++  __device__ __forceinline__ void runNodeLocalMode(int tid, int nthreads, ncclDevWorkColl* work) {
++    using Proto = ProtoLL;
++    if constexpr (Mode == 0) {
++      runRingFixed<T, RedOp, Proto>(tid, nthreads, work);
++    } else {
++      runRingMode<T, RedOp, Proto, true, Mode>(tid, nthreads, work);
++    }
++  }
++
++  /** @brief Execute the original Ring primitive after whole-plan node-local admission. */
++  __device__ __forceinline__ void runNodeLocal(int tid, int nthreads, struct ncclDevWorkColl* work) {
++    using Proto = ProtoLL;
++    runRingFixed<T, RedOp, Proto>(tid, nthreads, work);
++  }
++
+   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
+-    runRing<T, RedOp, ProtoLL>(tid, nthreads, work);
++    runRingFixed<T, RedOp, ProtoLL>(tid, nthreads, work);
+   }
+ };
+ 
+ template<typename T, typename RedOp>
+ struct RunWorkColl<ncclFuncBroadcast, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_LL128> {
++  /** @brief Retain one capture-identity payload mode through the original Ring body. */
++  template<int Mode>
++  __device__ __forceinline__ void runNodeLocalMode(int tid, int nthreads, ncclDevWorkColl* work) {
++    using Proto = ProtoLL128;
++    if constexpr (Mode == 0) {
++      runRingFixed<T, RedOp, Proto>(tid, nthreads, work);
++    } else {
++      runRingMode<T, RedOp, Proto, true, Mode>(tid, nthreads, work);
++    }
++  }
++
++  /** @brief Execute the original Ring primitive after whole-plan node-local admission. */
++  __device__ __forceinline__ void runNodeLocal(int tid, int nthreads, struct ncclDevWorkColl* work) {
++    using Proto = ProtoLL128;
++    runRingFixed<T, RedOp, Proto>(tid, nthreads, work);
++  }
++
+   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
+-    runRing<T, RedOp, ProtoLL128>(tid, nthreads, work);
++    runRingFixed<T, RedOp, ProtoLL128>(tid, nthreads, work);
+   }
+ };
+--- a/src/device/common.cu
++++ b/src/device/common.cu
+@@ -1,3 +1,10 @@
++/**
++ * @file common.cu
++ * @brief Original native entrypoints and passive terminal connector-progress observation.
++ * The observation reads existing device-owned progress on the exact ordered
++ * stream. It does not mutate progress, payload, topology, lifetime, admission
++ * or inference state, and allocates no storage.
++ */
+ /*************************************************************************
+  * Copyright (c) 2015-2021, NVIDIA CORPORATION. All rights reserved.
+  *
+@@ -22,3 +29,80 @@
+ }
+ 
+ __device__ void ncclDevFunc_Nop() {}
++
++/**
++ * @brief Read original native connector progress after ordered work.
++ * @param original Original retained device communicator.
++ * @param abortProvenance Exact original abort identity, never a downloaded value.
++ * @param peer Actual distinct original communicator coordinate.
++ * @param output Persistent admitted observation storage with the native shape.
++ */
++__global__ __launch_bounds__(64,1) void ncclDevKernel_P2pProgressObservation(
++    const ncclKernelComm* original,const volatile uint32_t* abortProvenance,int peer,
++    ncclLlaminarP2pProgress* output) {
++  if(threadIdx.x || blockIdx.x)return;
++  if(!original || !original->channels || original->abortFlag!=abortProvenance ||
++      original->nNodes!=1 || peer<0 || peer>=original->nRanks || peer==original->rank) {
++#if defined(__HIP_DEVICE_COMPILE__)
++    __builtin_trap();
++#else
++    asm volatile("trap;");
++#endif
++  }
++  auto* channels=reinterpret_cast<uint64_t*>(output+1);
++  uint64_t totalSent=0,totalReceived=0;
++#pragma unroll 1
++  for(int channel=0;channel<MAXCHANNELS;++channel) {
++    uint64_t sent=0,received=0;
++    auto* rows=original->channels[channel].peers;
++    auto* endpoint=rows?rows[peer]:nullptr;
++    if(endpoint) {
++#pragma unroll 1
++      for(int connection=0;connection<NCCL_MAX_CONNS;++connection) {
++        sent+=endpoint->send[connection].step;
++        received+=endpoint->recv[connection].step;
++      }
++    }
++    channels[2*channel]=sent;
++    channels[2*channel+1]=received;
++    totalSent+=sent;totalReceived+=received;
++  }
++  output->sentSteps=totalSent;
++  output->receivedSteps=totalReceived;
++}
++
++/**
++ * @brief Return only immutable compiled observation geometry.
++ * @param shape Host output for native channel/storage geometry, never device state.
++ * @return Native status; this creates no communicator, allocation or GPU operation.
++ */
++extern "C" __attribute__((visibility("default"))) ncclResult_t
++llaminarNcclP2pProgressGeometry(ncclLlaminarP2pProgressShape* shape) {
++  if(!shape)return ncclInvalidArgument;
++  *shape={sizeof(ncclLlaminarP2pProgress)+2*sizeof(uint64_t)*MAXCHANNELS,MAXCHANNELS,0};
++  return ncclSuccess;
++}
++
++/**
++ * @brief Enqueue terminal-only observation of original connector authorities.
++ * @param original Immutable provenance from the same retained native cohort.
++ * @param peer Actual distinct coordinate, validated against the original device.
++ * @param output Exact persistent admitted device bank.
++ * @param bytes Exact immutable native geometry returned by the same library.
++ * @param stream Exact explicit original stream, ordered after observed work.
++ * @return Native launch result; invalid/missing inputs never fabricate progress.
++ * The caller retains its actual cohort and bank through terminal observation.
++ * Production inference never consumes this diagnostic readout.
++ */
++extern "C" __attribute__((visibility("default"))) ncclResult_t
++llaminarNcclObserveP2pProgress(const ncclLlaminarCompletionAuthority* original,
++    int peer,ncclLlaminarP2pProgress* output,size_t bytes,cudaStream_t stream) {
++  if(!original || !original->deviceCommunicator || !original->abortFlag || !output ||
++      reinterpret_cast<uintptr_t>(stream)<=2 || peer<0 ||
++      reinterpret_cast<uintptr_t>(output)%alignof(ncclLlaminarP2pProgress) ||
++      bytes!=sizeof(ncclLlaminarP2pProgress)+2*sizeof(uint64_t)*MAXCHANNELS)
++    return ncclInvalidArgument;
++  ncclDevKernel_P2pProgressObservation<<<1,64,0,stream>>>(
++      static_cast<const ncclKernelComm*>(original->deviceCommunicator),original->abortFlag,peer,output);
++  return cudaGetLastError()==cudaSuccess ? ncclSuccess : ncclUnhandledCudaError;
++}
+--- a/src/device/common.h
++++ b/src/device/common.h
+@@ -1,3 +1,9 @@
++/**
++ * @file common.h
++ * @brief Native work publication and typed complete-batch kernel dispatch.
++ * Direct P2P has its own admitted geometry and rejects foreign work instead
++ * of inheriting the indirect all-collective function ABI's register budget.
++ */
+ /*************************************************************************
+  * Copyright (c) 2017-2022, NVIDIA CORPORATION. All rights reserved.
+  *
+@@ -225,22 +231,26 @@
+         // This lane owns the pointer word; resolve it before shared publication.
+         // Keep parameter/global loads separate: taking a generic parameter
+         // address would force the complete 4-KiB argument bank onto the stack.
+-        static_assert(offsetof(ncclDevWorkColl, llaminarRows) % 16 == 0,
++        static_assert(offsetof(ncclDevWorkColl, llaminarPayload) % 16 == 0,
+             "The row binding must occupy the first words of its native pack");
+         if (batch.workType != ncclDevWorkTypeP2p &&
+-            packInWork == offsetof(ncclDevWorkColl, llaminarRows) / 16)
+-          tmp.x = ncclLlaminarResolveRowWord(tmp.x, tmp.y);
++            packInWork == offsetof(ncclDevWorkColl, llaminarPayload) / 16)
++          tmp.x = ncclLlaminarResolvePayloadWord(tmp.x, tmp.y,
++              *reinterpret_cast<const uint64_t*>(src + 24), ncclShmem.args.comm->abortFlag);
+       } else {
+         char* src = (char*)ncclShmem.args.workBuf + ((batch.offsetBase + srcWork*workSize + packInWork*16) & ncclShmem.args.workMask);
+         tmp = *(ulong2*)src; // becomes ld.v2.u64
+         // This lane owns the pointer word; resolve it before shared publication.
+         // Keep parameter/global loads separate: taking a generic parameter
+         // address would force the complete 4-KiB argument bank onto the stack.
+-        static_assert(offsetof(ncclDevWorkColl, llaminarRows) % 16 == 0,
++        static_assert(offsetof(ncclDevWorkColl, llaminarPayload) % 16 == 0,
+             "The row binding must occupy the first words of its native pack");
+         if (batch.workType != ncclDevWorkTypeP2p &&
+-            packInWork == offsetof(ncclDevWorkColl, llaminarRows) / 16)
+-          tmp.x = ncclLlaminarResolveRowWord(tmp.x, tmp.y);
++            packInWork == offsetof(ncclDevWorkColl, llaminarPayload) / 16)
++          tmp.x = ncclLlaminarResolvePayloadWord(tmp.x, tmp.y,
++              *reinterpret_cast<const uint64_t*>((char*)ncclShmem.args.workBuf +
++                  ncclLlaminarWorkWord(batch.offsetBase + srcWork*workSize + packInWork*16,
++                      24u, ncclShmem.args.workMask)), ncclShmem.args.comm->abortFlag);
+       }
+       char* dst = ncclShmem.workStorage;
+       dst += (workCursor + dstWork)*workSize + packInWork*16;
+@@ -282,16 +292,16 @@
+ enum class ncclWorkNetworkPolicy { Native, NodeLocal };
+ 
+ template<ncclFunc_t Fn, typename T, typename RedOp, int Algo, int Proto,
+-         ncclWorkNetworkPolicy Network = ncclWorkNetworkPolicy::Native>
++         ncclWorkNetworkPolicy Network = ncclWorkNetworkPolicy::Native, int PayloadMode = -1>
+ struct RunWorkBatch;
+ 
+ // Specialized for P2p in sendrecv.h
+-template<typename T, typename RedOp>
+-struct RunWorkBatch<ncclFuncSendRecv, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPLE>;
++template<typename T, typename RedOp, ncclWorkNetworkPolicy Network>
++struct RunWorkBatch<ncclFuncSendRecv, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPLE, Network>;
+ 
+ // Specialized here for non-P2p (Coll and CollReg)
+ template<ncclFunc_t Fn, typename T, typename RedOp, int Algo, int Proto,
+-         ncclWorkNetworkPolicy Network>
++         ncclWorkNetworkPolicy Network, int PayloadMode>
+ struct RunWorkBatch {
+   // This __forceinline__ is necessary. The compiler was inserting a function call
+   // here from the LL ncclKernel.
+@@ -323,9 +333,16 @@
+       // coverity[device_thread_diverged:FALSE]
+       if (tid < subtn) {
+         if constexpr (Network == ncclWorkNetworkPolicy::NodeLocal) {
+-          static_assert(Fn == ncclFuncAllGather && Algo == NCCL_ALGO_RING &&
+-                        Proto == NCCL_PROTO_SIMPLE, "Unimplemented local entry");
+-          RunWorkColl<Fn, T, RedOp, Algo, Proto>().runNodeLocal(tid, subtn, work);
++          static_assert(Algo == NCCL_ALGO_RING &&
++                        (Fn == ncclFuncBroadcast ||
++                         (Fn == ncclFuncAllGather && Proto == NCCL_PROTO_SIMPLE)),
++                        "Unimplemented local entry");
++          if constexpr (PayloadMode >= 0) {
++            if (int(work->llaminarPayload.kind) != PayloadMode) asm volatile("trap;");
++            RunWorkColl<Fn, T, RedOp, Algo, Proto>().template runNodeLocalMode<PayloadMode>(tid, subtn, work);
++          } else {
++            RunWorkColl<Fn, T, RedOp, Algo, Proto>().runNodeLocal(tid, subtn, work);
++          }
+         } else {
+           RunWorkColl<Fn, T, RedOp, Algo, Proto>().run(tid, subtn, work);
+         }
+@@ -367,7 +384,7 @@
+ }
+ 
+ /** @brief A sealed single-function plan cannot enter indirect mixed dispatch. */
+-enum class ncclKernelBatchPolicy { MixedFunctions, UniformFunction };
++enum class ncclKernelBatchPolicy { MixedFunctions, UniformFunction, LocalP2p256 };
+ 
+ /**
+  * @brief Replay published native work with its complete admitted function policy.
+@@ -431,7 +448,12 @@
+ 
+   while (ncclShmem.aborted == 0) {
+     profiler(START);
+-    if constexpr (BatchPolicy == ncclKernelBatchPolicy::UniformFunction) {
++    if constexpr (BatchPolicy != ncclKernelBatchPolicy::MixedFunctions) {
++      if constexpr (BatchPolicy == ncclKernelBatchPolicy::LocalP2p256) {
++        if (tn != NCCL_LLAMINAR_LOCAL_P2P_NTHREADS ||
++            ncclShmem.workType != ncclDevWorkTypeP2p || ncclShmem.nWorks < 1 ||
++            ncclShmem.nWorks > NCCL_LLAMINAR_LOCAL_P2P_MAX_WORKS) asm volatile("trap;");
++      }
+       static_assert(SpecializedFnId >= 0, "A uniform plan needs a concrete function");
+       if (ncclShmem.funcId != (unsigned)SpecializedFnId) asm volatile("trap;");
+       SpecializedRunWorkBatch().run();
+@@ -462,13 +484,30 @@
+ #define DEFINE_ncclDevKernel_nop(suffix, coll, redop, ty, algo, proto, specializedFnId) \
+   __global__ void ncclDevKernel_##suffix(ncclDevKernelArgs4K NCCL_GRID_CONSTANT const args4K) {}
+ 
+-/** @brief Direct kernel only for the planner's sealed single-function batches. */
++/**
++ * @brief Direct kernel for the planner's original single-function batches.
++ * Ordinary P2P keeps native network capability here: only the separate complete
++ * connector seal may select the 256-thread NodeLocal P2P specialization.
++ */
+ #define DEFINE_ncclDevKernelUniform(suffix, coll, redop, ty, algo, proto, specializedFnId) \
+   __launch_bounds__(NCCL_MAX_NTHREADS, 1) \
+   __global__ void ncclDevKernel_Uniform_##suffix(ncclDevKernelArgs4K NCCL_GRID_CONSTANT const args4K) { \
+     ncclKernelMain<specializedFnId, RunWorkBatch<coll, ty, redop<ty>, algo, proto, \
+-      ncclWorkNetworkPolicy::NodeLocal>, \
++      coll == ncclFuncSendRecv ? ncclWorkNetworkPolicy::Native : ncclWorkNetworkPolicy::NodeLocal>, \
+       ncclKernelBatchPolicy::UniformFunction>(&args4K.args); \
++  }
++
++/**
++ * @brief Entry for the host seal's local device-progress P2P work only.
++ * The 256-thread bound deliberately owns an independent compiler resource
++ * envelope; no indirect device function is emitted or called by this entry.
++ * Existing primitive order, chunk geometry and live-byte partition are reused.
++ */
++#define DEFINE_ncclDevKernelLocalP2p(specializedFnId) \
++  __global__ __launch_bounds__(NCCL_LLAMINAR_LOCAL_P2P_NTHREADS, 1) \
++  void ncclDevKernel_LocalP2p(ncclDevKernelArgs4K NCCL_GRID_CONSTANT const args4K) { \
++    ncclKernelMain<specializedFnId, RunWorkBatch<ncclFuncSendRecv, int8_t, FuncCopy<int8_t>, \
++      NCCL_ALGO_RING, NCCL_PROTO_SIMPLE, ncclWorkNetworkPolicy::NodeLocal>, ncclKernelBatchPolicy::LocalP2p256>(&args4K.args); \
+   }
+ 
+ #define DEFINE_ncclDevFunc(suffix, coll, redop, ty, algo, proto) \
+@@ -477,3 +516,12 @@
+   }
+ 
+ #endif
++
++/** @brief Original native Ring progress with one immutable payload mode and bounded block. */
++#define DEFINE_ncclDevKernelByteMode(symbol, proto, fnId, mode) \
++  __launch_bounds__(128, 1) \
++  __global__ void symbol(ncclDevKernelArgs4K NCCL_GRID_CONSTANT const args) { \
++    ncclKernelMain<fnId, RunWorkBatch<ncclFuncBroadcast, int8_t, FuncCopy<int8_t>, \
++      NCCL_ALGO_RING, proto, ncclWorkNetworkPolicy::NodeLocal, mode>, \
++      ncclKernelBatchPolicy::UniformFunction>(&args.args); \
++  }
+--- a/src/device/generate.py
++++ b/src/device/generate.py
+@@ -1,4 +1,12 @@
+ #!/usr/bin/env python3
++"""Generate native function and uniform kernel entries.
++
++Broadcast retains its selected Ring protocol in a dedicated uniform entry so
++fixed metadata and completed byte traffic share the original native algorithm
++without the generic indirect-call stack frame. Host plan admission still
++validates every channel before selecting a uniform kernel. The sealed local
++P2P entry has its own 256-thread geometry and fatal compiler spill rule.
++"""
+ import os
+ import sys
+ import shutil
+@@ -155,6 +163,8 @@
+         (coll in ("AllReduce", "ReduceScatter") and algo in ("RING", "TREE") and
+          redop in ("Sum", "MinMax") and ty in ("i8", "u8", "i32", "u32", "f16", "f32", "bf16"))):
+       return (coll, redop, ty, algo, proto)
++    if coll == "Broadcast" and algo == "RING":
++      return (coll, redop, ty, algo, proto)
+     if coll=="Nop": return ("Generic", None, None, None, None)
+     if coll=="SendRecv": return ("SendRecv", None, None, None, None)
+     if coll in ("AllGather","Broadcast"): return (coll, None, None, "RING", "LL")
+@@ -208,11 +218,17 @@
+ primary_to_index = {fn: i for (i,fn) in zip(range(len(primary_funcs)), primary_funcs)}
+ 
+ kernel_funcs = sorted(set(best_kernel(*fn) for fn in primary_funcs))
++p2p_fn = next((fn for fn in primary_funcs if fn[0] == "SendRecv"), None)
++p2p_count = int(p2p_fn is not None)
+ 
+ # Direct entries retain exactly the native function ID and protocol. Host
+ # admission must inspect the entire plan before selecting this inventory.
+ uniform_funcs = [fn for fn in primary_funcs if fn[0] == "AllGather" and
+                  fn[3] == "RING" and fn[4] == "SIMPLE"]
++byte_funcs = [fn for fn in primary_funcs if fn[0] == "Broadcast" and fn[3] == "RING"]
++byte_entries = [(fn, mode) for fn in byte_funcs for mode in range(3)]
++def byte_symbol(fn, mode):
++  return paste("_", "ncclDevKernel_Bytes", *fn, str(mode))
+ 
+ ################################################################################
+ 
+@@ -286,7 +302,11 @@
+   for fn in uniform_funcs:
+     out("__global__ void %s(ncclDevKernelArgs4K const);\n" %
+         paste("_", "ncclDevKernel_Uniform", *fn))
+-  out("extern int const ncclDevKernelCount = %d;\n" % (len(kernel_funcs) + len(uniform_funcs)))
++  for fn,mode in byte_entries:
++    out("__global__ void %s(ncclDevKernelArgs4K const);\n" % byte_symbol(fn,mode))
++  if p2p_fn is not None: out("__global__ void ncclDevKernel_LocalP2p(ncclDevKernelArgs4K const);\n")
++  out("extern int const ncclDevLocalP2pKernelIndex = %d;\n" % (len(kernel_funcs) + len(uniform_funcs) + len(byte_entries) if p2p_fn is not None else -1))
++  out("extern int const ncclDevKernelCount = %d;\n" % (len(kernel_funcs) + len(uniform_funcs) + len(byte_entries) + p2p_count))
+   out("void* ncclDevKernelList[] = {\n")
+   index = 0
+   for kfn in kernel_funcs:
+@@ -298,6 +318,9 @@
+     index += 1
+   for fn in uniform_funcs:
+     out("(void*)%s,\n" % paste("_", "ncclDevKernel_Uniform", *fn))
++  for fn,mode in byte_entries:
++    out("(void*)%s,\n" % byte_symbol(fn,mode))
++  if p2p_fn is not None: out("(void*)ncclDevKernel_LocalP2p,\n")
+   out("nullptr};\n")
+   out("\n")
+ 
+@@ -308,6 +331,9 @@
+     out("  %7d, /*%4d %s*/\n" % (cudart or 0, index, sym));
+   for fn in uniform_funcs:
+     out("  %d, // sealed uniform entry\n" % required_cuda(*fn)[0])
++  for fn,mode in byte_entries:
++    out("  %d, // immutable payload mode\n" % required_cuda(*fn)[0])
++  if p2p_fn is not None: out("  0, // sealed local direct-P2P entry\n")
+   out("};\n")
+   out("\n")
+ 
+@@ -339,6 +365,11 @@
+   for fn in primary_funcs:
+     out("%d,\n" % (len(kernel_funcs) + uniform_funcs.index(fn) if fn in uniform_funcs else -1))
+   out("-1};\n")
++  out("extern int const ncclDevByteKernelIndexForFunc[][3] = {\n")
++  for fn in primary_funcs:
++    indices = [len(kernel_funcs) + len(uniform_funcs) + byte_entries.index((fn,m)) if (fn,m) in byte_entries else -1 for m in range(3)]
++    out("{%d,%d,%d},\n" % tuple(indices))
++  out("{-1,-1,-1}};\n")
+ 
+ # Maps to .cu filename which implements this func. The only constraint is that
+ # "coll" is reflected in the name: formally that no two funcs having different
+@@ -360,6 +391,8 @@
+ 
+ name_to_funcs = partition_by_name(fn for fn in primary_funcs if fn[0]!="Nop")
+ name_to_kernels = partition_by_name(kfn for kfn in kernel_funcs if kfn[0]!="Generic")
++if p2p_fn is not None:
++  name_to_funcs["sendrecv_local_p2p.cu"] = ("SendRecv", [])
+ 
+ files = ""
+ for name in sorted(name_to_funcs.keys()):
+@@ -384,6 +417,11 @@
+   # come from the suffix-erased file (e.g. 'gensrc/all_reduce.cu')
+   for name in impl_names:
+     coll = name_to_funcs[name][0]
++    if name == "sendrecv_local_p2p.cu":
++      # Every kernel in this project-owned TU has fatal spill diagnostics.
++      # Legacy indirect entries remain in their original, separate TU.
++      out("$(OBJDIR)/genobj/{name}.o: NVCUFLAGS += -Xptxas=-warn-spills,-Werror\n"
++          .format(name=name))
+     out(
+       "$(OBJDIR)/genobj/{name}.o: $(OBJDIR)/gensrc $(OBJDIR)/genobj/{lower_coll}.cu.d\n"
+       "\t" "$(call COMPILE,$@,$(OBJDIR)/gensrc/{name})\n"
+@@ -432,6 +470,14 @@
+       '#include "{lower_coll}.h"\n'
+       .format(lower_coll=coll_camel_to_lower[coll])
+     )
++
++    if name == "sendrecv_local_p2p.cu":
++      out("DEFINE_ncclDevKernelLocalP2p(%d)\n" % primary_to_index[p2p_fn])
++
++    for fn,mode in byte_entries:
++      if fn[0] == "Broadcast" and name == "broadcast.cu":
++        out("DEFINE_ncclDevKernelByteMode({sym}, NCCL_PROTO_{proto}, {fn_id}, {mode})\n".format(
++            sym=byte_symbol(fn,mode), proto=fn[4], fn_id=primary_to_index[fn], mode=mode))
+ 
+     (_, kfns) = name_to_kernels.get(name) or (None, [])
+     for kfn in kfns:
+--- /dev/null
++++ b/src/device/llaminar_device_completion.h
+@@ -0,0 +1,87 @@
++/** @file llaminar_device_completion.h
++ * @brief Native original-stream receive evidence after every counted primitive.
++ * Included after native shared/primitive declarations; this is no separate kernel.
++ */
++#ifndef LLAMINAR_NATIVE_DEVICE_COMPLETION_H_
++#define LLAMINAR_NATIVE_DEVICE_COMPLETION_H_
++
++/** @brief Authenticate required device metadata before entering any native payload primitive.
++ * @param work Original shared native work and immutable metadata binding.
++ * @param tid Native work-group thread index; only its original writer publishes.
++ */
++__device__ __forceinline__ void ncclLlaminarBeginCompletionOperand(const volatile ncclLlaminarCompletionOperand* original, int tid, bool primary) {
++  if (!original || original->reserved || !original->table || !original->admission ||
++      !original->sequence || !original->message || !original->firstError || !original->receipt || original->failureCode <= 0 ||
++      reinterpret_cast<uintptr_t>(original->table) % alignof(uint64_t) ||
++      reinterpret_cast<uintptr_t>(original->admission) % alignof(uint64_t) ||
++      reinterpret_cast<uintptr_t>(original->sequence) % alignof(uint64_t) ||
++      reinterpret_cast<uintptr_t>(original->firstError) % alignof(int32_t) ||
++      reinterpret_cast<uintptr_t>(original->receipt) % alignof(ncclLlaminarByteCompletion) ||
++      (original->outgoingPayloadBytes && reinterpret_cast<uintptr_t>(original->outgoingPayloadBytes) % alignof(unsigned long long))) {
++#if defined(__HIP_DEVICE_COMPILE__)
++    __builtin_trap();
++#else
++    asm volatile("trap;");
++#endif
++  }
++  if (tid == 0) {
++    if (!*original->table || !*original->admission || !*original->sequence ||
++        ncclLlaminarAcquireAbort(ncclShmem.comm.abortFlag))
++      atomicCAS(original->firstError, 0, original->failureCode);
++    if (primary) {
++      auto* receipt = original->receipt;
++      // Only this original channel publishes a disposition. Every channel can
++      // veto it through the SAME sticky error after its own native primitives.
++      atomicExch(reinterpret_cast<unsigned int*>(&receipt->phase),
++          static_cast<unsigned int>(ncclLlaminarCompletionPhase::Pending));
++      receipt->table = *original->table;
++      receipt->admission = *original->admission;
++      receipt->sequence = *original->sequence;
++      receipt->bytes = 0;
++      receipt->nativeAbortFlag = ncclShmem.comm.abortFlag;
++      receipt->nativeCommunicator = ncclShmem.args.comm;
++      receipt->message = original->message;
++      receipt->reserved = 0;
++    }
++  }
++}
++/**
++ * @brief Publish actual native completion after the primitive destructor's original barrier.
++ * @param work Original shared native work, retained through the final primitive barrier.
++ * @param tid Native work-group thread index.
++ * @param liveBytes Actual resolved total useful extent, not a capacity or byte observer.
++ * Every channel performs abort/error publication, including zero useful bytes.
++ * ACK must be ordered after the WHOLE native launch, then check this original
++ * flag again for late cancellation and the original sticky first-error field.
++ */
++__device__ __forceinline__ void ncclLlaminarFinishCompletionOperand(
++    const volatile ncclLlaminarCompletionOperand* original, int tid, size_t liveBytes, bool primary) {
++  if (tid != 0) return;
++  if (ncclShmem.aborted || ncclLlaminarAcquireAbort(ncclShmem.comm.abortFlag))
++    atomicCAS(original->firstError, 0, original->failureCode);
++  if (primary) {
++    auto* receipt = original->receipt;
++    receipt->bytes = liveBytes;
++    __threadfence();
++    const auto phase = atomicAdd(original->firstError, 0) == 0
++        ? ncclLlaminarCompletionPhase::Completed : ncclLlaminarCompletionPhase::Aborted;
++    atomicExch(reinterpret_cast<unsigned int*>(&receipt->phase), static_cast<unsigned int>(phase));
++  }
++}
++
++
++/** @brief Authenticate the original collective operand before any native payload primitive.
++ * @param work Actual native collective work. @param tid Original primitive group index. */
++__device__ __forceinline__ void ncclLlaminarBeginCompletion(const ncclDevWorkColl* work,int tid) {
++  if(work->llaminarPayload.kind != ncclLlaminarPayloadKind::Rows)
++    ncclLlaminarBeginCompletionOperand(work->llaminarPayload.binding.completed.completion,tid,ncclShmem.channelId==work->channelLo);
++}
++/** @brief Publish after the actual collective primitive's destructor and original barrier.
++ * @param work Actual native work. @param tid Original primitive group index.
++ * @param liveBytes Exact useful bytes, never capacity. */
++__device__ __forceinline__ void ncclLlaminarFinishCompletion(const ncclDevWorkColl* work,int tid,size_t liveBytes) {
++  if(work->llaminarPayload.kind != ncclLlaminarPayloadKind::Rows)
++    ncclLlaminarFinishCompletionOperand(work->llaminarPayload.binding.completed.completion,tid,liveBytes,ncclShmem.channelId==work->channelLo);
++}
++
++#endif
+--- /dev/null
++++ b/src/device/llaminar_device_p2p.h
+@@ -0,0 +1,72 @@
++/**
++ * @file llaminar_device_p2p.h
++ * @brief Exact useful-byte clipping and completion in original addressed native P2P work.
++ * Original capacity-derived channels and transport remain authoritative. The
++ * separately sealed device-progress entry advances only live work, with one
++ * zero-byte operation for a selected empty channel. Native progress is unchanged.
++ */
++#ifndef LLAMINAR_NATIVE_DEVICE_P2P_H_
++#define LLAMINAR_NATIVE_DEVICE_P2P_H_
++#include "llaminar_device_payload.h"
++#include "llaminar_device_completion.h"
++/** @brief One immutable per-invocation view of original device-authored metadata. */
++struct ncclLlaminarP2pExtent {size_t liveBytes, localBytes, sourceOffset; bool primary;};
++/**
++ * @brief Resolve only the actual endpoint's borrowed count after its separate header plan.
++ * @param work Original shared peer work, whose native startup already partitioned capacity.
++ * @param sending The actual local producer/consumer half of this work.
++ * @return Exact global/local useful extent and producer-only original source offset.
++ */
++__device__ __forceinline__ ncclLlaminarP2pExtent ncclLlaminarResolveP2p(
++    const ncclDevWorkP2p* work,bool sending) {
++  const auto& transfer=sending?work->sendTransfer:work->recvTransfer;
++  const size_t localCapacity=sending?work->sendBytes:work->recvBytes;
++  const auto kind=transfer.payload.kind;
++  if(kind==ncclLlaminarPayloadKind::Rows && !transfer.payload.active())
++    return {localCapacity,localCapacity,0,false};
++  if(!transfer.payload.active() || !transfer.capacityBytes || (kind!=ncclLlaminarPayloadKind::CompletedBytes &&
++      kind!=ncclLlaminarPayloadKind::CompletedSourceSlice) ||
++      (kind==ncclLlaminarPayloadKind::CompletedSourceSlice && !sending)) {
++#if defined(__HIP_DEVICE_COMPILE__)
++    __builtin_trap();
++#else
++    asm volatile("trap;");
++#endif
++  }
++  size_t live=0,offset=0;
++  // Aborted header receives grant no validity to stale count/slice storage.
++  if(!ncclLlaminarAcquireAbort(ncclShmem.comm.abortFlag)) {
++    if(kind==ncclLlaminarPayloadKind::CompletedSourceSlice) {
++      const auto slice=ncclLlaminarResolveSourceSlice(transfer.payload.binding.slice,
++          transfer.capacityBytes,transfer.sourceOffsetOrigin);
++      live=slice.liveBytes;offset=slice.byteOffset;
++    }else live=ncclLlaminarResolvePayloadWord(
++        reinterpret_cast<uint64_t>(transfer.payload.binding.bytes.bytes),transfer.capacityBytes,
++        uint64_t(kind),ncclShmem.comm.abortFlag);
++  }
++  const int nParts=sending?work->nSendChannels:work->nRecvChannels;
++  const int part=ncclP2pChannelToPart(work->nP2pChannels,work->channelBase,ncclShmem.channelId);
++  size_t first,last;ncclP2pPartBounds(nParts,part,transfer.capacityBytes,&first,&last);
++  const size_t local=first>=live?0:min(last-first,live-first);
++  // Empty capacity parts still perform the original protocol handoff, but
++  // their borrowed address stays inside the admitted original source bank.
++  // A zero-byte end descriptor is valid; adding that end offset after native
++  // capacity partitioning would otherwise form an out-of-bank pointer.
++  return {live,local,local?offset:0,part==0};
++}
++/** @brief Clip one required native step to useful bytes and count only its actual sends.
++ * @param work Original addressed work. @param sending Actual operation half.
++ * @param tid Original primitive thread. @param extent Exact local useful extent.
++ * @param cursor Original capacity step offset. @param count Original step width.
++ * @return Actual useful payload width; zero still executes required protocol progress. */
++__device__ __forceinline__ int ncclLlaminarP2pCount(const ncclDevWorkP2p* work,bool sending,
++    int tid,const ncclLlaminarP2pExtent& extent,size_t cursor,int count) {
++  const auto& transfer=sending?work->sendTransfer:work->recvTransfer;
++  if(!transfer.payload.active())return count;
++  const int useful=cursor>=extent.localBytes?0:int(min(size_t(count),extent.localBytes-cursor));
++  const auto* original=transfer.payload.binding.bytes.completion;
++  if(sending && tid==0 && original->outgoingPayloadBytes)
++    atomicAdd(original->outgoingPayloadBytes,static_cast<unsigned long long>(useful));
++  return useful;
++}
++#endif
+--- a/src/device/llaminar_device_payload.h
++++ b/src/device/llaminar_device_payload.h
+@@ -9,6 +9,21 @@
+ #ifndef LLAMINAR_NATIVE_DEVICE_PAYLOAD_H_
+ #define LLAMINAR_NATIVE_DEVICE_PAYLOAD_H_
+ 
++/** @brief Acquire the exact native communicator's absorbing abort authority.
++ * @param address Original native device-visible abort word, never a replacement flag.
++ * @return Current absorbing abort disposition using the backend's system acquire.
++ */
++__device__ __forceinline__ uint32_t ncclLlaminarAcquireAbort(const volatile uint32_t* address) {
++#if defined(__CUDA_ARCH__)
++  uint32_t value;
++  asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(value) : "l"(address) : "memory");
++  return value;
++#elif defined(__HIP_DEVICE_COMPILE__)
++  return __atomic_load_n(address, __ATOMIC_ACQUIRE);
++#else
++  return *address;
++#endif
++}
+ /**
+  * @brief Resolve the captured pointer word before its shared work-pack store.
+  * @param pointerWord Borrowed device pointer, or zero for ordinary native work.
+@@ -39,6 +54,90 @@
+ }
+ 
+ /**
++ * @brief Resolve a tagged original binding before native shared work publication.
++ * @param pointerWord Original device address, never a host-read count value.
++ * @param geometryWord Row geometry or full UINT64 admitted byte capacity.
++ * @param kindWord Low32 typed mode and high32 reserved, both validated.
++ * @param nativeAbort Original native communicator abort authority; required for completed byte count.
++ */
++__device__ __forceinline__ uint64_t ncclLlaminarResolvePayloadWord(
++    uint64_t pointerWord, uint64_t geometryWord, uint64_t kindWord,
++    const volatile uint32_t* nativeAbort) {
++  const uint32_t kind = uint32_t(kindWord);
++  if ((kindWord >> 32) != 0 || kind > uint32_t(ncclLlaminarPayloadKind::CompletedSourceSlice)) {
++#if defined(__HIP_DEVICE_COMPILE__)
++    __builtin_trap();
++#else
++    asm volatile("trap;");
++#endif
++  }
++  // A source slice is root-only. Keep its original descriptor in shared work;
++  // Ring resolves BOTH fields after obtaining the actual admitted total count.
++  // This avoids a second lane writing RCCL's adjacent geometry pack.
++  if (kind == uint32_t(ncclLlaminarPayloadKind::CompletedSourceSlice)) return pointerWord;
++  if (kind == uint32_t(ncclLlaminarPayloadKind::Rows))
++    return ncclLlaminarResolveRowWord(pointerWord, geometryWord);
++  if (!pointerWord || !geometryWord || !nativeAbort) {
++#if defined(__HIP_DEVICE_COMPILE__)
++    __builtin_trap();
++#else
++    asm volatile("trap;");
++#endif
++  }
++  // The ordered native count receive may terminate on abort with stale FIFO
++  // data. It grants no count validity in that disposition. The absorbing
++  // ORIGINAL native abort is acquired before any mutable count is observed.
++  if (ncclLlaminarAcquireAbort(nativeAbort)) return 0;
++  const uint64_t bytes = *reinterpret_cast<const uint64_t*>(pointerWord);
++  if (bytes > geometryWord) {
++#if defined(__HIP_DEVICE_COMPILE__)
++    __builtin_trap();
++#else
++    asm volatile("trap;");
++#endif
++  }
++  return bytes;
++}
++
++/**
++ * @brief Validate an original source slice before any native payload primitive.
++ * @param binding Root-only original descriptor and admitted source bank.
++ * @param payloadCapacity Actual native count summed across original channels.
++ * @param sourceOffsetOrigin Immutable absolute lower bound of the exact admitted source subspan.
++ * @return Immutable local snapshot; no communication or host observation.
++ */
++__device__ __forceinline__ ncclLlaminarSourceSlice ncclLlaminarResolveSourceSlice(
++    const ncclLlaminarDeviceSlice& binding, size_t payloadCapacity, uint64_t sourceOffsetOrigin) {
++  if (!binding.slice || !binding.sourceCapacityBytes) {
++#if defined(__HIP_DEVICE_COMPILE__)
++    __builtin_trap();
++#else
++    asm volatile("trap;");
++#endif
++  }
++  ncclLlaminarSourceSlice value = *binding.slice;
++  // Establish the admitted lower bound before subtraction, including empty payloads.
++  if (value.byteOffset < sourceOffsetOrigin) {
++#if defined(__HIP_DEVICE_COMPILE__)
++    __builtin_trap();
++#else
++    asm volatile("trap;");
++#endif
++  }
++  value.byteOffset -= sourceOffsetOrigin;
++  if (value.byteOffset > binding.sourceCapacityBytes ||
++      value.liveBytes > binding.sourceCapacityBytes - value.byteOffset ||
++      value.liveBytes > payloadCapacity) {
++#if defined(__HIP_DEVICE_COMPILE__)
++    __builtin_trap();
++#else
++    asm volatile("trap;");
++#endif
++  }
++  return value;
++}
++
++/**
+  * @brief Return the exact primitive count and optionally observe its sends.
+  * @param work Prepared shared descriptor; its observer never drives progress.
+  * @param tid Thread within the native primitive group, not necessarily the CTA.
+@@ -50,22 +149,33 @@
+  * Callers must retain the original loop/step schedule. Receipts accumulate the
+  * same count the primitive consumes, not an independently predicted byte count.
+  */
+-template<typename T, typename Offset>
++template<typename T, typename Offset, int Mode = -1>
+ __device__ __forceinline__ int ncclLlaminarPayload(
+     const ncclDevWorkColl* work, int tid, Offset offset,
+-    int elements, int sends) {
++    int elements, int sends, size_t sourceSliceEnd = ~size_t(0)) {
+   // Reload immutable shared metadata at the use site. Volatile prevents the
+   // compiler retaining an extra 64-bit end across a large native primitive.
+-  const volatile ncclLlaminarResolvedRows& extent = work->llaminarResolvedRows;
+-  const size_t endBytes = extent.liveBytes;
++  const volatile ncclLlaminarResolvedRows& extent = work->llaminarPayload.binding.resolved;
++  const auto kind = Mode < 0 ? work->llaminarPayload.kind : static_cast<ncclLlaminarPayloadKind>(Mode);
++  const size_t endBytes = kind == ncclLlaminarPayloadKind::CompletedSourceSlice ?
++      sourceSliceEnd : extent.liveBytes;
++  if (kind == ncclLlaminarPayloadKind::CompletedSourceSlice &&
++      sourceSliceEnd == ~size_t(0)) {
++#if defined(__HIP_DEVICE_COMPILE__)
++    __builtin_trap();
++#else
++    asm volatile("trap;");
++#endif
++  }
+   if (endBytes == ~size_t(0)) return elements;
+   const size_t end = endBytes / sizeof(T);
+   const size_t begin = size_t(offset);
+   const int count = elements <= 0 || begin >= end ? 0 :
+       int(min(size_t(elements), end - begin));
+-  if (tid == 0 && sends != 0 && extent.outgoingPayloadBytes)
+-    atomicAdd(extent.outgoingPayloadBytes,
+-        static_cast<unsigned long long>(count) * sizeof(T) * sends);
++  auto* observer = kind == ncclLlaminarPayloadKind::Rows
++      ? extent.outgoingPayloadBytes : work->llaminarPayload.binding.completed.completion->outgoingPayloadBytes;
++  if (tid == 0 && sends != 0 && observer)
++    atomicAdd(observer, static_cast<unsigned long long>(count) * sizeof(T) * sends);
+   return count;
+ }
+ 
+--- a/src/device/primitives.h
++++ b/src/device/primitives.h
+@@ -1,3 +1,9 @@
++/**
++ * @file primitives.h
++ * @brief Native protocol primitives with explicit selected network capability.
++ * Native is the unchanged general default. Only a complete host-sealed local
++ * entry may instantiate NodeLocal and omit unreachable device-plugin unpack.
++ */
+ /*************************************************************************
+  * Copyright (c) 2016-2022, NVIDIA CORPORATION. All rights reserved.
+  *
+@@ -21,7 +27,8 @@
+  * to how that protocol operates with a consistent interface so that our
+  * algorithm code can operate protocol parametrically.
+  */
+-template<int SlicePerChunk_1, int StepPerSlice_1, int Unroll_1 = COLL_UNROLL, int MultimemSrcs_1 = 0, int MultimemDsts_1 = 0>
++template<int SlicePerChunk_1, int StepPerSlice_1, int Unroll_1 = COLL_UNROLL, int MultimemSrcs_1 = 0, int MultimemDsts_1 = 0,
++         ncclWorkNetworkPolicy Network_1 = ncclWorkNetworkPolicy::Native>
+ struct ProtoSimple {
+   static constexpr int Id = NCCL_PROTO_SIMPLE;
+   static constexpr int SlicePerChunk = SlicePerChunk_1;
+@@ -29,6 +36,7 @@
+   static constexpr int Unroll = Unroll_1;
+   static constexpr int MultimemSrcs = MultimemSrcs_1;
+   static constexpr int MultimemDsts = MultimemDsts_1;
++  static constexpr ncclWorkNetworkPolicy Network = Network_1;
+ 
+   // Data bytes (no flags etc) in one step of the fifo queue.
+   __device__ static int calcBytePerStep() {
+--- a/src/device/prims_simple.h
++++ b/src/device/prims_simple.h
+@@ -1,3 +1,9 @@
++/**
++ * @file prims_simple.h
++ * @brief Native SIMPLE protocol progress and selected local/plugin capability.
++ * The local specialization preserves peer steps, data pointers, copy arithmetic
++ * and barriers while eliminating plugin code proven absent by the host seal.
++ */
+ /*************************************************************************
+  * Copyright (c) 2016-2022, NVIDIA CORPORATION. All rights reserved.
+  *
+@@ -14,9 +20,9 @@
+ };
+ 
+ template<typename T, typename RedOp, typename Fan, int Direct,
+-         int SlicePerChunk, int StepPerSlice, int Unroll, int P2p, int MultimemSrcs, int MultimemDsts, bool isNetOffload>
++         int SlicePerChunk, int StepPerSlice, int Unroll, int P2p, int MultimemSrcs, int MultimemDsts, bool isNetOffload, ncclWorkNetworkPolicy Network>
+ class Primitives<
+-    T, RedOp, Fan, Direct, ProtoSimple<SlicePerChunk, StepPerSlice, Unroll, MultimemSrcs, MultimemDsts>, P2p, isNetOffload
++    T, RedOp, Fan, Direct, ProtoSimple<SlicePerChunk, StepPerSlice, Unroll, MultimemSrcs, MultimemDsts, Network>, P2p, isNetOffload
+   > {
+   static constexpr int MaxRecv = Fan::MaxRecv, MaxSend = Fan::MaxSend;
+   static constexpr int Input=0, Output=1;
+@@ -162,7 +168,7 @@
+         // coverity[dead_error_line]
+         ptrs[index] = connEltsFifo + (step%NCCL_STEPS)*connStepSize;
+       }
+-      if (flags & NetDeviceUnpack) {
++      if (Network == ncclWorkNetworkPolicy::Native && (flags & NetDeviceUnpack)) {
+         ncclNetDeviceIncrementHead(group, index);
+       }
+       step += StepPerSlice;
+@@ -238,7 +244,7 @@
+         /* if user abort the kernel, we don't need to actually perform copy/reduce; just set size
+          * to 0 to avoid unnecessary workload. */
+         int workSize = ncclShmem.aborted ? 0 : sliceSize;
+-        if (flags & AnyNetDeviceUnpack) {
++        if (Network == ncclWorkNetworkPolicy::Native && (flags & AnyNetDeviceUnpack)) {
+           ncclNetDeviceUnpack<Recv>(tid, tidInBlock, nworkers, group, ncclShmem.groups[group].devicePlugin.unpack.unpackNetDeviceIndexMask, Src, workSize);
+           // Sync here to make sure all workers are reading from the updated srcs)
+           subBarrier();
+@@ -485,7 +491,11 @@
+ 
+   __device__ __forceinline__ void loadRecvConn(ncclDevChannelPeer *peer, int connIndex, uint32_t direct, int ipcRegFlag, int netRegFlag) {
+     conn = &peer->recv[connIndex];
+-    if (conn->netDeviceHandle.netDeviceType == NCCL_NET_DEVICE_UNPACK) {
++    if (Network == ncclWorkNetworkPolicy::NodeLocal &&
++        (conn->netDeviceHandle.handle || conn->netDeviceHandle.netDeviceType!=NCCL_NET_DEVICE_HOST ||
++         (conn->flags & NCCL_DIRECT_NIC))) asm volatile("trap;");
++    if (Network == ncclWorkNetworkPolicy::Native &&
++        conn->netDeviceHandle.netDeviceType == NCCL_NET_DEVICE_UNPACK) {
+       // handle must be a device ptr
+       netDeviceHandle = conn->netDeviceHandle.handle;
+       // Cache the handle
+@@ -647,7 +657,10 @@
+       // coverity[overrun-call] => Coverity think prims.index can be greater than 1
+       if (flags & (RoleWaitSend|RolePostSend)) loadSendConn(ncclShmem.channel.peers[peer], connIndexSend, collWork ? collWork->direct : 0, sendIpcReg, sendNetReg);
+ 
+-      if (barrierAny(flags & NetDeviceUnpack)) {
++      // Preserve the constructor's native participant barrier even though a
++      // sealed local connection has no device-plugin publication to perform.
++      const bool anyNetUnpack=barrierAny(Network == ncclWorkNetworkPolicy::Native ? (flags & NetDeviceUnpack) : 0);
++      if (Network == ncclWorkNetworkPolicy::Native && anyNetUnpack) {
+         flags |= AnyNetDeviceUnpack;
+         // RoleWaitRecv starts at tid=0, so this creates the bitmask of which recv peers
+         // have NetDeviceUnpack.
+@@ -715,7 +728,7 @@
+       while (*ptr != -1) if (checkAbort(flags, Aborted, spins)) break;
+     }
+ 
+-    if (flags & NetDeviceUnpack) {
++    if (Network == ncclWorkNetworkPolicy::Native && (flags & NetDeviceUnpack)) {
+       ncclNetDeviceSaveHead(netDeviceHandle, group, index);
+     }
+ 
+--- a/src/device/sendrecv.h
++++ b/src/device/sendrecv.h
+@@ -1,3 +1,9 @@
++/**
++ * @file sendrecv.h
++ * @brief Original addressed P2P counts and local/native protocol specialization.
++ * The sealed entry keeps original capacity geometry and receipts while
++ * its device-only primitive progress follows the resolved live extent.
++ */
+ /*************************************************************************
+  * Copyright (c) 2015-2022, NVIDIA CORPORATION. All rights reserved.
+  *
+@@ -7,43 +13,78 @@
+ #include "device.h"
+ #include "collectives.h"
+ #include "primitives.h"
+-
+-template<typename T, typename RedOp>
+-struct RunWorkBatch<ncclFuncSendRecv, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPLE> {
++#include "llaminar_device_p2p.h"
++
++template<typename T, typename RedOp, ncclWorkNetworkPolicy Network>
++struct RunWorkBatch<ncclFuncSendRecv, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPLE, Network> {
+   static_assert(sizeof(T)==1, "SendRecv only works on single byte types T.");
+ 
+   template<typename Proto>
+   __device__ void runSend(int tid, int tn, int group, struct ncclDevWorkP2p* work) {
+     size_t bytes = work->sendBytes;
++    const auto extent=ncclLlaminarResolveP2p(work,true);
++    const auto& transfer=work->sendTransfer;
++    // The complete original connector seal excludes host/proxy progress for
++    // this entry. Both endpoints acquired the same device header, so their
++    // original device step authorities advance only useful protocol work.
++    // The do/while retains one zero-byte operation on every selected empty
++    // channel; original capacity-derived parts/chunks and Native work remain.
++    if constexpr(Network==ncclWorkNetworkPolicy::NodeLocal) {
++      if(transfer.payload.active())bytes=extent.localBytes;
++    }
++    if(transfer.payload.active())ncclLlaminarBeginCompletionOperand(
++        transfer.payload.binding.bytes.completion,tid,extent.primary);
++
+     bool useLargeChunk = (work->sendIpcReg && ncclShmem.comm.isAllNvlink) || work->sendNetReg;
+     int chunkSize = useLargeChunk ? NCCL_MAX_NET_SIZE : u32fp8Decode(work->sendChunkSize_u32fp8);
+     int stepSize = useLargeChunk ? NCCL_MAX_NET_SIZE : ncclShmem.comm.p2pChunkSize;
++    { // Primitive destructor completes original native ordering before receipt publication.
+     Primitives<T, RedOp, FanAsymmetric<0, 1>, 1, Proto, 1>
+-      prims(tid, tn, nullptr, &work->sendRank, work->sendAddr, nullptr,
++      prims(tid, tn, nullptr, &work->sendRank, static_cast<char*>(work->sendAddr)+extent.sourceOffset, nullptr,
+             /*redOpArg(ignored)=*/0, group, 1, 1, nullptr, work, stepSize);
+     size_t cursor = 0;
+     do {
+       int n = min(size_t(chunkSize), bytes-cursor);
+-      prims.directSend(cursor, cursor, n);
++      prims.directSend(cursor, cursor, ncclLlaminarP2pCount(work,true,tid,extent,cursor,n));
+       cursor += n;
+     } while (cursor < bytes);
++    }
++    if(transfer.payload.active())ncclLlaminarFinishCompletionOperand(
++        transfer.payload.binding.bytes.completion,tid,extent.liveBytes,extent.primary);
+   }
+ 
+   template<typename Proto>
+   __device__ void runRecv(int tid, int tn, int group, struct ncclDevWorkP2p* work) {
+     size_t bytes = work->recvBytes;
++    const auto extent=ncclLlaminarResolveP2p(work,false);
++    const auto& transfer=work->recvTransfer;
++    // The complete original connector seal excludes host/proxy progress for
++    // this entry. Both endpoints acquired the same device header, so their
++    // original device step authorities advance only useful protocol work.
++    // The do/while retains one zero-byte operation on every selected empty
++    // channel; original capacity-derived parts/chunks and Native work remain.
++    if constexpr(Network==ncclWorkNetworkPolicy::NodeLocal) {
++      if(transfer.payload.active())bytes=extent.localBytes;
++    }
++    if(transfer.payload.active())ncclLlaminarBeginCompletionOperand(
++        transfer.payload.binding.bytes.completion,tid,extent.primary);
++
+     bool useLargeChunk = (work->recvIpcReg && ncclShmem.comm.isAllNvlink) || work->recvNetReg;
+     int chunkSize = useLargeChunk ? NCCL_MAX_NET_SIZE : u32fp8Decode(work->recvChunkSize_u32fp8);
+     int stepSize = useLargeChunk ? NCCL_MAX_NET_SIZE : ncclShmem.comm.p2pChunkSize;
++    { // Primitive destructor completes original native ordering before receipt publication.
+     Primitives<T, RedOp, FanAsymmetric<1, 0>, 1, Proto, 1>
+       prims(tid, tn, &work->recvRank, nullptr, nullptr, work->recvAddr,
+             /*redOpArg(ignored)=*/0, group, 1, 1, nullptr, work, stepSize);
+     size_t cursor = 0;
+     do {
+       int n = min(size_t(chunkSize), bytes-cursor);
+-      prims.directRecv(cursor, n);
++      prims.directRecv(cursor, ncclLlaminarP2pCount(work,false,tid,extent,cursor,n));
+       cursor += n;
+     } while (cursor < bytes);
++    }
++    if(transfer.payload.active())ncclLlaminarFinishCompletionOperand(
++        transfer.payload.binding.bytes.completion,tid,extent.liveBytes,extent.primary);
+   }
+ 
+   __device__ __forceinline__ void run() {
+@@ -160,13 +201,13 @@
+       if (work->sendProtoLL) {
+         runSend<ProtoLL>(subtid, subtn, group, work);
+       } else {
+-        runSend<ProtoSimple<1,1>>(subtid, subtn, group, work);
++        runSend<ProtoSimple<1,1,COLL_UNROLL,0,0,Network>>(subtid, subtn, group, work);
+       }
+     } else {
+       if (work->recvProtoLL) {
+         runRecv<ProtoLL>(subtid, subtn, group, work);
+       } else {
+-        runRecv<ProtoSimple<1,1>>(subtid, subtn, group, work);
++        runRecv<ProtoSimple<1,1,COLL_UNROLL,0,0,Network>>(subtid, subtn, group, work);
+       }
+     }
+   }
+--- a/src/enqueue.cc
++++ b/src/enqueue.cc
+@@ -21,6 +21,7 @@
+ #include "cudawrap.h"
+ #include "profiler.h"
+ #include "transport.h"
++#include "llaminar_p2p_launch.h"
+ #include "register_inline.h"
+ #include "ce_coll.h"
+ #include "nvtx.h"
+@@ -187,34 +188,52 @@
+   }
+ }
+ 
++/** @brief Existing generated function population, used before indexing native tables. */
++extern int const ncclDevFuncIdCount;
++
+ /**
+  * @brief Resolve a sealed uniform entry from every batch, never just the first.
+  * @param batches Final channel-interleaved work descriptors.
+  * @param count Number of valid descriptors.
+  * @param threads Complete plan block width, including native synchronization warps.
+  * @param nodeLocal Whether all communicator participants share one physical host.
++ * @param plan Original finalized host work pack, before its native launch.
+  * @return Native initialized entry or null for mixed/unlisted work.
+  */
+ static void* uniformKernelForPlan(struct ncclDevWorkBatch const* batches, int count, int threads,
+-                                 bool nodeLocal) {
+-  if (count == 0 || !nodeLocal) return nullptr;
++                                 bool nodeLocal, ncclKernelPlan* plan) {
++  if (!batches || !plan || count <= 0 || !nodeLocal || threads <= 0 ||
++      batches[0].funcId >= unsigned(ncclDevFuncIdCount)) return nullptr;
+   // The entry keeps the existing native compiler/worker budget. Admission
+   // validates the complete serialized plan without resizing native progress.
+   if (threads > NCCL_MAX_NTHREADS) return nullptr;
+   for (int b = 1; b < count; ++b) {
+     if (batches[b].funcId != batches[0].funcId) return nullptr;
+   }
++  if (threads <= 128 && ncclDevByteKernelIndexForFunc[batches[0].funcId][0] >= 0) {
++    int mode = -1;
++    for (auto* node = ncclIntruQueueHead(&plan->workQueue); node; node = node->next) {
++      if ((node->workType != ncclDevWorkTypeColl && node->workType != ncclDevWorkTypeCollReg) ||
++          node->size < int(sizeof(ncclDevWorkColl))) return nullptr;
++      const auto* work = reinterpret_cast<const ncclDevWorkColl*>(node + 1);
++      const int actual = int(work->llaminarPayload.kind);
++      if (actual < 0 || actual > 2 || (mode >= 0 && mode != actual) ||
++          (actual == 0 && work->llaminarPayload.active())) return nullptr;
++      mode = actual;
++    }
++    if (mode >= 0) return ncclDevKernelList[ncclDevByteKernelIndexForFunc[batches[0].funcId][mode]];
++  }
+   const int index = ncclDevUniformKernelIndexForFunc[batches[0].funcId];
+   return index < 0 ? nullptr : ncclDevKernelList[index];
+ }
+ 
+ /** @brief Freeze launch identity with native storage and peer progress. */
+-static void finishPlan(struct ncclComm* comm, struct ncclKernelPlan* plan) {
++static ncclResult_t finishPlan(struct ncclComm* comm, struct ncclKernelPlan* plan) {
+   ncclKernelPlanner::WipPlan::Channel* wipChannels = comm->planner.wipPlan.channels;
+   size_t workBytes = plan->workBytes;
+   size_t batchBytes = plan->nWorkBatches*sizeof(struct ncclDevWorkBatch);
+ 
+-  if (plan->isSymColl) return;
++  if (plan->isSymColl) return ncclSuccess;
+   plan->threadPerBlock = std::max(plan->threadPerBlock, NCCL_MIN_NTHREADS);
+ 
+   // If we can fit everything into the kernel args we do so.
+@@ -254,9 +273,28 @@
+     } while (tmpMask != 0);
+   }
+ 
+-  if (void* uniform = uniformKernelForPlan(batchZero, batchIx, plan->threadPerBlock, comm->nNodes == 1)) {
+-    plan->kernelFn = uniform;
+-    plan->kernelSpecialized = true;
++  const auto p2pSeal=ncclLlaminarSealP2pLaunch(comm,plan,batchZero,batchIx);
++  auto binding=ncclLlaminarBindP2pLaunch(plan,p2pSeal);
++  if (binding!=ncclSuccess) {
++    WARN("Addressed P2P cannot seal its complete local launch: status=%d",int(p2pSeal.status));
++  } else if (p2pSeal.status!=ncclP2pLaunchStatus::Sealed) {
++    if (void* uniform = uniformKernelForPlan(batchZero, batchIx, plan->threadPerBlock, comm->nNodes == 1, plan)) {
++      plan->kernelFn = uniform;
++      plan->kernelSpecialized = true;
++    } else {
++      // A selected completed operation has no generic or fixed transport path.
++      // Authenticate the final original host work pack before any native launch.
++      for (auto* node = ncclIntruQueueHead(&plan->workQueue); node; node = node->next) {
++        if (node->workType == ncclDevWorkTypeColl || node->workType == ncclDevWorkTypeCollReg) {
++          const auto* work = reinterpret_cast<const ncclDevWorkColl*>(node + 1);
++          if (work->llaminarPayload.kind == ncclLlaminarPayloadKind::CompletedBytes ||
++              work->llaminarPayload.kind == ncclLlaminarPayloadKind::CompletedSourceSlice) {
++            WARN("Completed Broadcast has no admitted mode/width-native entry");
++            binding=ncclInvalidUsage;
++          }
++        }
++      }
++    }
+   }
+ 
+   // Merge-sort per-channel proxy-op lists by opCount when merging them into plan->proxyOpQueue
+@@ -288,6 +326,8 @@
+     nHeads -= opNext ? 0 : 1;
+     ncclIntruQueueEnqueue(&plan->proxyOpQueue, op);
+   }
++  // Complete native source/proxy ownership is drained even when sealing failed.
++  return binding;
+ }
+ 
+ NCCL_PARAM(GraphRegister, "GRAPH_REGISTER", 1);
+@@ -334,10 +374,18 @@
+       goto next;
+     }
+     ncclRegisterCollBuffers(comm, task, regBufSend, regBufRecv, &planner->collCleanupQueue, &regNeedConnect);
++    if ((task->llaminarPayload.kind == ncclLlaminarPayloadKind::CompletedBytes ||
++         task->llaminarPayload.kind == ncclLlaminarPayloadKind::CompletedSourceSlice) &&
++        (task->regBufType & NCCL_NET_REG_BUFFER)) {
++      WARN("Device-byte broadcast does not implement network-registered/offload plans");
++      return ncclInvalidUsage;
++    }
++
+ 
+     devWork.sendbuff = (void*)task->sendbuff;
+     devWork.recvbuff = (void*)task->recvbuff;
+-    devWork.llaminarRows = task->llaminarRows;
++    devWork.llaminarPayload = task->llaminarPayload;
++    devWork.llaminarSourceOffsetOrigin = task->llaminarSourceOffsetOrigin;
+     devWork.sendbuffOffset = task->sendbuffOffset;
+     devWork.recvbuffOffset = task->recvbuffOffset;
+     devWork.sendbuffRmtAddrs = task->sendbuffRmtAddrs;
+@@ -398,7 +446,7 @@
+     // Symmetric kernels have a different work ABI. Never silently drop the
+     // producer's live count if native selection chooses that unimplemented ABI.
+     for (auto* sym = ncclIntruQueueHead(&planner->collSymTaskQueue); sym; sym = sym->next) {
+-      if (sym->llaminarRows.rows) {
++      if (sym->llaminarPayload.active()) {
+         WARN("Device-row prototype does not implement symmetric collectives");
+         return ncclInvalidUsage;
+       }
+@@ -460,12 +508,19 @@
+         struct ncclTaskColl* next = aggBeg->next;
+         aggBeg->algorithm = agg.algorithm;
+         aggBeg->protocol = agg.protocol;
+-        if (aggBeg->llaminarRows.rows &&
+-            !((aggBeg->func == ncclFuncAllGather || aggBeg->func == ncclFuncReduceScatter) ?
++        if (aggBeg->llaminarPayload.active() &&
++            !((aggBeg->llaminarPayload.kind == ncclLlaminarPayloadKind::CompletedBytes ||
++              aggBeg->llaminarPayload.kind == ncclLlaminarPayloadKind::CompletedSourceSlice) ?
++                (aggBeg->func == ncclFuncBroadcast && agg.algorithm == NCCL_ALGO_RING) :
++                ((aggBeg->func == ncclFuncAllGather || aggBeg->func == ncclFuncReduceScatter) ?
+                 agg.algorithm == NCCL_ALGO_RING :
+                 (aggBeg->func == ncclFuncAllReduce &&
+-                 (agg.algorithm == NCCL_ALGO_RING || agg.algorithm == NCCL_ALGO_TREE)))) {
+-          WARN("Device-row prototype requires native RING gather/scatter or RING/TREE allreduce");
++                 (agg.algorithm == NCCL_ALGO_RING || agg.algorithm == NCCL_ALGO_TREE))))) {
++          if (aggBeg->llaminarPayload.kind == ncclLlaminarPayloadKind::CompletedBytes ||
++              aggBeg->llaminarPayload.kind == ncclLlaminarPayloadKind::CompletedSourceSlice)
++            WARN("Device-byte broadcast requires native node-local RING Broadcast");
++          else
++            WARN("Device-row prototype requires native RING gather/scatter or RING/TREE allreduce");
+           return ncclInvalidUsage;
+         }
+         if (aggBeg->protocol == NCCL_PROTO_LL) aggBeg->trafficBytes *= 4;
+@@ -844,6 +899,8 @@
+   ) {
+   ncclResult_t ret = ncclSuccess;
+   constexpr int connIndex = 1;
++  const bool completed[2] = {p2pTasks[0] && p2pTasks[0]->llaminarTransfer.payload.active(),
++                             p2pTasks[1] && p2pTasks[1]->llaminarTransfer.payload.active()};
+   bool selfSend = (sendRank == comm->rank);
+   // recv: dir=0, send: dir=1
+   void* addrs[2] = {recvAddr, sendAddr};
+@@ -904,6 +961,13 @@
+     chunkSize[dir] = chunkDataSize[dir];
+     if (protocol[dir] == NCCL_PROTO_LL) chunkSize[dir] *= 2;
+ 
++    // A host-registered network operation embeds its buffer address in proxy
++    // work. Device source offsets cannot alter that address; this completed
++    // protocol has no such offload ABI and must reject before registration.
++    if (completed[dir] && network[dir]) {
++      WARN("Addressed completed bytes require original node-local P2P/SHM transport, not network/offload work");
++      return ncclInvalidUsage;
++    }
+     if (network[dir]) {
+       bool pxnUsed = !ncclPxnDisable(comm) && comm->isAllNvlink && comm->maxLocalRanks > 1;
+       if (bytes[dir] > 0 && proxySameProcess[dir] && protocol[dir] == NCCL_PROTO_SIMPLE && (!pxnUsed)) {
+@@ -931,7 +995,9 @@
+       void* regAddr = NULL;
+       if (conn->conn.flags & (NCCL_P2P_WRITE | NCCL_P2P_READ)) {
+         // We require users registering buffers on both sides
+-        NCCLCHECKGOTO(ncclRegisterP2pIpcBuffer(comm, addrs[dir], bytes[dir], peerRank, &regFlag, &regAddr, &plan->cleanupQueue), ret, cleanup);
++        NCCLCHECKGOTO(ncclRegisterP2pIpcBuffer(comm, addrs[dir],
++          completed[dir] && p2pTasks[dir]->llaminarTransfer.payload.kind == ncclLlaminarPayloadKind::CompletedSourceSlice
++            ? p2pTasks[dir]->llaminarTransfer.payload.binding.slice.sourceCapacityBytes : bytes[dir], peerRank, &regFlag, &regAddr, &plan->cleanupQueue), ret, cleanup);
+         if (regFlag) {
+           if (dir == 0 && (conn->conn.flags & NCCL_P2P_WRITE)) recvAddr = regAddr;
+           else if (dir == 1 && (conn->conn.flags & NCCL_P2P_READ)) sendAddr = regAddr;
+@@ -967,6 +1033,8 @@
+ 
+   struct ncclDevWorkP2p* work;
+   work = (struct ncclDevWorkP2p*)(workNode+1);
++  work->sendTransfer = p2pTasks[1] ? p2pTasks[1]->llaminarTransfer : ncclLlaminarP2pTransfer{};
++  work->recvTransfer = p2pTasks[0] ? p2pTasks[0]->llaminarTransfer : ncclLlaminarP2pTransfer{};
+   work->nP2pChannels = comm->p2pnChannels;
+   work->channelBase = base;
+   work->nSendChannels = nChannels[1];
+@@ -1382,9 +1450,19 @@
+   return;
+ }
+ 
+-static ncclResult_t reclaimPlan(struct ncclComm* comm, struct ncclCommCallback* me) {
+-  struct ncclKernelPlan* plan = (struct ncclKernelPlan*)me; // cast from first member `reclaim`
+-  if (plan->persistent) {
++/** @brief A captured plan acquires graph references only after publication. */
++enum class ncclKernelPlanPublication { Pending, Published };
++
++/**
++ * @brief Retire one complete native plan at its exact publication boundary.
++ * @param comm Native resource owner.
++ * @param plan Complete native task, proxy and cleanup inventory.
++ * @param publication Whether graph references and persistent GPU work exist.
++ * @return Native cleanup result; pending plans never release unacquired refs.
++ */
++static ncclResult_t reclaimPlanStorage(struct ncclComm* comm, struct ncclKernelPlan* plan,
++                                     ncclKernelPlanPublication publication) {
++  if (publication==ncclKernelPlanPublication::Published && plan->persistent) {
+     comm->sharedRes->persistentRefs -= 1;
+     comm->localPersistentRefs -= 1;
+     if (plan->workStorageType == ncclDevWorkStorageTypePersistent) {
+@@ -1433,6 +1511,11 @@
+   // Free plan struct
+   ncclMemoryPoolFree(&comm->memPool_ncclKernelPlan, plan);
+   return ncclSuccess;
++}
++
++/** @brief Native graph/callback retirement after its reference was published. */
++static ncclResult_t reclaimPlan(struct ncclComm* comm, struct ncclCommCallback* me) {
++  return reclaimPlanStorage(comm,reinterpret_cast<ncclKernelPlan*>(me),ncclKernelPlanPublication::Published);
+ }
+ 
+ static void persistentDestructor(void* plans_) {
+@@ -1527,7 +1610,15 @@
+           }
+         }
+ 
+-        finishPlan(comm, plan);
++        result=finishPlan(comm,plan);
++        if (result!=ncclSuccess) {
++          const auto cleanup=ncclLlaminarRetirePendingP2pPlanSet(planner,plan,
++              [comm](ncclKernelPlan* pending) {
++                return reclaimPlanStorage(comm,pending,ncclKernelPlanPublication::Pending);
++              });
++          if (cleanup!=ncclSuccess) WARN("Unpublished P2P plan retirement failed: %d",int(cleanup));
++          goto failure;
++        }
+         if (plan->workBytes != 0) {
+           ncclIntruQueueEnqueue(&planner->planQueue, plan);
+           nPlans += 1;
+@@ -1949,6 +2040,15 @@
+       if (nt % 128 == 0) nt /= 2;
+       else break;
+     }
++  }
++  // The completed family retains its original Ring channels/chunks but uses a
++  // bounded native block. Its immutable-mode entry has an independently proven
++  // register budget; this does not change generic collectives or fixed P2P.
++  if (info->llaminarPayload.kind == ncclLlaminarPayloadKind::CompletedBytes ||
++      info->llaminarPayload.kind == ncclLlaminarPayloadKind::CompletedSourceSlice) {
++    if (info->func != ncclFuncBroadcast || info->algorithm != NCCL_ALGO_RING)
++      return ncclInvalidUsage;
++    nt = std::min(nt, info->protocol == NCCL_PROTO_SIMPLE ? 96 : 128);
+   }
+   if (info->protocol == NCCL_PROTO_SIMPLE) {
+     if (info->algorithm == NCCL_ALGO_RING) nt += WARP_SIZE; // Extra warp for sync
+@@ -2452,6 +2552,8 @@
+   p2p->datatype = datatype;
+   p2p->root = peer;
+   p2p->bytes = nBytes;
++  p2p->llaminarTransfer = {info->llaminarPayload, uint64_t(nBytes), info->llaminarSourceOffsetOrigin};
++
+   p2p->eActivationMask = ncclProfilerApiState.eActivationMask;
+   p2p->groupApiEventHandle = ncclProfilerApiState.groupApiEventHandle;
+   p2p->p2pApiEventHandle = ncclProfilerApiState.p2pApiEventHandle;
+@@ -2522,7 +2624,8 @@
+   t->sendbuff = info->sendbuff;
+   t->recvbuff = info->recvbuff;
+   t->count = info->count;
+-  t->llaminarRows = info->llaminarRows;
++  t->llaminarPayload = info->llaminarPayload;
++  t->llaminarSourceOffsetOrigin = info->llaminarSourceOffsetOrigin;
+   t->root = info->root;
+   t->datatype = info->datatype;
+   size_t elementSize = ncclTypeSize(t->datatype);
+@@ -2557,7 +2660,7 @@
+ 
+   // Copy-engine plans encode static copy sizes, so this experimental ABI must
+   // reject that selection rather than quietly copying the capacity bank.
+-  if (info->llaminarRows.rows) {
++  if (info->llaminarPayload.active()) {
+     WARN("Device-row prototype does not implement CE collective plans");
+     return ncclInvalidUsage;
+   }
+@@ -2580,7 +2683,8 @@
+   t->sendbuff = info->sendbuff;
+   t->recvbuff = info->recvbuff;
+   t->count = info->count;
+-  t->llaminarRows = info->llaminarRows;
++  t->llaminarPayload = info->llaminarPayload;
++  t->llaminarSourceOffsetOrigin = info->llaminarSourceOffsetOrigin;
+   t->root = info->root;
+   t->datatype = info->datatype;
+   size_t elementSize = ncclTypeSize(t->datatype);
+@@ -2679,6 +2783,7 @@
+ }
+ 
+ ncclResult_t ncclEnqueueCheck(struct ncclInfo* info) {
++  if (!info->llaminarPayload.valid()) return ncclInvalidArgument;
+   // Early-out on invalid or revoked communicator
+   ncclResult_t ret = CommCheck(info->comm, info->opName, "comm");
+   if (ret != ncclSuccess) return ncclGroupErrCheck(ret);
+--- a/src/group.cc
++++ b/src/group.cc
+@@ -278,6 +278,39 @@
+   goto exit;
+ }
+ 
++/**
++ * @brief Leave the original native launch barrier, or propagate its original abort.
++ * @param comm Original initialized communicator; no gate or arrival is fabricated.
++ * @param reduction Receives the original barrier sum only on successful completion.
++ * @return Native failure on cancellation, before a kernel launch or success finish.
++ * This host-only out half retains the original counter/gate/phase protocol. A
++ * missing peer cannot be repaired by publishing a synthetic gate or contribution.
++ * Aborted communicators remain absorbing and are destroyed only after graph owners.
++ */
++static ncclResult_t ncclLlaminarIntraBarrierOutAbortable(ncclComm* comm, uint32_t* reduction) {
++  if (!comm || !reduction || !comm->intraComm0 || !comm->abortFlag) return ncclInternalError;
++  const auto aborted = [comm]() {
++    return __atomic_load_n(comm->abortFlag, __ATOMIC_ACQUIRE) != 0;
++  };
++  if (aborted()) return ncclInternalError;
++  ncclComm* comm0 = comm->intraComm0;
++  comm->intraBarrierPhase ^= 1;
++  const uint32_t phase = comm->intraBarrierPhase;
++  uint64_t gate = __atomic_load_n(&comm0->intraBarrierGate, __ATOMIC_RELAXED);
++  if ((gate & 1) != phase) {
++    const uint64_t t0 = clockNano();
++    do {
++      if (aborted()) return ncclInternalError;
++      if (clockNano() - t0 >= 5 * 1000) sched_yield();
++      gate = __atomic_load_n(&comm0->intraBarrierGate, __ATOMIC_RELAXED);
++    } while ((gate & 1) != phase);
++  }
++  if (comm->intraRanks != 1) __atomic_thread_fence(__ATOMIC_ACQUIRE);
++  if (aborted()) return ncclInternalError;
++  *reduction = uint32_t(gate >> 32);
++  return ncclSuccess;
++}
++
+ static ncclResult_t doLaunches(struct ncclComm* head) {
+   ncclResult_t result = ncclSuccess;
+   struct ncclComm* cliqueHead = head;
+@@ -314,7 +347,9 @@
+         struct ncclComm* next = comm->groupNext[ncclGroupTaskTypeCollective];
+         if (useBarrier) {
+           // Barrier reduction result tells us if this was the final round.
+-          moreRounds = 0 != ncclCommIntraBarrierOut(comm);
++          uint32_t originalReduction = 0;
++          NCCLCHECKGOTO(ncclLlaminarIntraBarrierOutAbortable(comm, &originalReduction), result, failure);
++          moreRounds = originalReduction != 0;
+         } else {
+           moreRounds |= comm->planner.unlaunchedPlansHead != nullptr;
+         }
+--- a/src/include/comm.h
++++ b/src/include/comm.h
+@@ -1,3 +1,10 @@
++/**
++ * @file comm.h
++ * @brief Native captured payload metadata with explicit row/byte extent ownership.
++ *
++ * Original transports, channel scheduling and arithmetic remain authoritative;
++ * the typed binding narrows useful payload without a host count observation.
++ */
+ /*************************************************************************
+  * Copyright (c) 2015-2022, NVIDIA CORPORATION. All rights reserved.
+  *
+@@ -194,7 +201,8 @@
+   void const* sendbuff;
+   void* recvbuff;
+   size_t count;
+-  ncclLlaminarDeviceRows llaminarRows;
++  ncclLlaminarDevicePayload llaminarPayload;
++  uint64_t llaminarSourceOffsetOrigin; // Immutable admitted source origin, never host-read device state.
+   int root;
+   ncclDataType_t datatype;
+   ncclRedOp_t opHost;
+@@ -241,6 +249,8 @@
+   ncclDataType_t datatype;
+   int root;
+   size_t bytes;
++  ncclLlaminarP2pTransfer llaminarTransfer{}; // Exact original peer operand; no host count.
++
+ 
+   // Profiler plugin
+   int eActivationMask;
+--- a/src/include/device.h
++++ b/src/include/device.h
+@@ -96,6 +96,10 @@
+ #define MAXCHANNELS 64
+ #define NCCL_MAX_LOCAL_RANKS 72
+ #define NCCL_MAX_NTHREADS 640
++
++/** Independent direct-P2P launch contract: two or more warps per work. */
++#define NCCL_LLAMINAR_LOCAL_P2P_NTHREADS 256
++#define NCCL_LLAMINAR_LOCAL_P2P_MAX_WORKS (NCCL_LLAMINAR_LOCAL_P2P_NTHREADS/(2*WARP_SIZE))
+ #define NCCL_MIN_NTHREADS (4*WARP_SIZE)
+ #define NCCL_SIMPLE_MAX_NTHREADS 512
+ #define NCCL_SIMPLE_EXTRA_GROUP_IF_NTHREADS_GE (3*WARP_SIZE)
+@@ -242,6 +246,7 @@
+ struct ncclKernelComm;
+ 
+ struct alignas(16) ncclDevWorkP2p {
++  ncclLlaminarP2pTransfer sendTransfer{}, recvTransfer{}; // Distinct endpoint receipts, never shared across edges.
+   void *sendAddr, *recvAddr;
+   size_t sendBytes, recvBytes;
+   int sendRank, recvRank;
+@@ -315,11 +320,12 @@
+   uint64_t redOpArg;
+   // Host enqueue constructs the producer member. Native work loading alone
+   // activates the resolved member, then publishes it to all primitive threads.
+-  union {
+-    ncclLlaminarDeviceRows llaminarRows;
+-    ncclLlaminarResolvedRows llaminarResolvedRows;
+-  };
+-};
++  ncclLlaminarDevicePayload llaminarPayload;
++  uint64_t llaminarSourceOffsetOrigin; // Immutable admitted source lower bound, copied with original native work.
++};
++static_assert(sizeof(ncclDevWorkColl) == 144 && alignof(ncclDevWorkColl) == 16 &&
++    offsetof(ncclDevWorkColl, llaminarSourceOffsetOrigin) == 128,
++    "Completed source origin must preserve the declared native work-pack geometry");
+ 
+ 
+ __host__ __device__ constexpr int ncclProtoGrainSize(int proto) {
+@@ -557,6 +563,10 @@
+ 
+ /** @brief Generated kernel-list index for a sealed function, or -1 if unlisted. */
+ extern int const ncclDevUniformKernelIndexForFunc[];
++/** @brief Initialized direct local-P2P entry index, or -1 when absent. */
++extern int const ncclDevLocalP2pKernelIndex;
++/** @brief Whole-plan admitted Broadcast mode entries: Rows, completed prefix, completed slice. */
++extern int const ncclDevByteKernelIndexForFunc[][3];
+ 
+ // Launch a one-rank reduction on stream.
+ ncclResult_t ncclLaunchOneRank(void* dst, void const* src, size_t nElts, struct ncclDevRedOpFull redOp, ncclDataType_t type, cudaStream_t stream);
+--- a/src/include/info.h
++++ b/src/include/info.h
+@@ -1,3 +1,10 @@
++/**
++ * @file info.h
++ * @brief Native captured payload metadata with explicit row/byte extent ownership.
++ *
++ * Original transports, channel scheduling and arithmetic remain authoritative;
++ * the typed binding narrows useful payload without a host count observation.
++ */
+ /*************************************************************************
+  * Copyright (c) 2019-2022, NVIDIA CORPORATION. All rights reserved.
+  *
+@@ -29,7 +36,8 @@
+   // Algorithm details
+   int chunkSteps;
+   int sliceSteps;
+-  ncclLlaminarDeviceRows llaminarRows{};
++  ncclLlaminarDevicePayload llaminarPayload{};
++  uint64_t llaminarSourceOffsetOrigin = 0; // Immutable admitted root-subspan origin.
+ };
+ 
+ #endif
+--- a/src/include/llaminar_device_extent.h
++++ b/src/include/llaminar_device_extent.h
+@@ -56,4 +56,157 @@
+ };
+ static_assert(sizeof(ncclLlaminarResolvedRows) == sizeof(ncclLlaminarDeviceRows),
+     "Resolving a row binding must not enlarge the native work ABI");
+-#endif
++
++/** @brief Original device operation disposition; zero is deliberately uncompleted. */
++enum class ncclLlaminarCompletionPhase : uint32_t { Pending = 0, Completed = 1, Aborted = 2 };
++/**
++ * @brief Immutable layout of a terminal-only original connector observation.
++ * Every reported channel is an actual native channel. Its two step words are
++ * observations, never a second progress ledger or an inference decision input.
++ */
++struct ncclLlaminarP2pProgressShape {
++  uint64_t bytes;
++  uint32_t channels;
++  uint32_t reserved;
++};
++/** @brief Sum followed by one sent/received UINT64 pair per original channel. */
++struct ncclLlaminarP2pProgress {
++  uint64_t sentSteps;
++  uint64_t receivedSteps;
++};
++static_assert(sizeof(ncclLlaminarP2pProgressShape)==16,"Native progress layout ABI");
++static_assert(sizeof(ncclLlaminarP2pProgress)==16,"Native progress observation ABI");
++
++/** @brief Exact immutable original communicator and abort identities. */
++struct ncclLlaminarCompletionAuthority {
++  const volatile uint32_t* abortFlag;
++  const void* deviceCommunicator;
++};
++/** @brief Native-written receive evidence, observed only after the whole original launch. */
++struct ncclLlaminarByteCompletion {
++  uint64_t table, admission, sequence, bytes;
++  const volatile uint32_t* nativeAbortFlag;
++  const void* nativeCommunicator;
++  uint64_t message;
++  ncclLlaminarCompletionPhase phase;
++  uint32_t reserved;
++};
++/**
++ * @brief Borrow original immutable-for-operation frame fields and sticky error authority.
++ * Native work never advances these fields or clears an error. The receipt and
++ * passive counter are protocol outputs, not execution/scheduling authorities.
++ */
++struct ncclLlaminarCompletionOperand {
++  const uint64_t* table;
++  const uint64_t* admission;
++  const uint64_t* sequence;
++  int32_t* firstError;
++  ncclLlaminarByteCompletion* receipt;
++  unsigned long long* outgoingPayloadBytes;
++  uint64_t message;
++  int32_t failureCode;
++  uint32_t reserved;
++};
++static_assert(sizeof(ncclLlaminarByteCompletion) == 64 && sizeof(ncclLlaminarCompletionOperand) == 64 && sizeof(ncclLlaminarCompletionAuthority) == 16,
++    "Native completion uses fixed protocol metadata, never capacity-sized storage");
++
++/**
++ * @brief Exact completion law shared by device ACK and recorded actual-body replay.
++ * @param receipt Actual native output after its whole-launch dependency.
++ * @param table Original source table identity.
++ * @param admission Original retained interval admission.
++ * @param sequence Original lookup sequence.
++ * @param bytes Exact expected live bytes, including zero.
++ * @param message Original static operation key.
++ * @param expected Original communicator capability, not receipt-selected pointers.
++ * @param nativeAbort Acquired original flag after the whole native launch dependency.
++ * @param firstError Snapshot of the same original sticky failure field.
++ * @return True only for fresh successful receive evidence and exact original identity.
++ * This observes neither a byte counter nor host execution state. A prior error
++ * vetoes success even when a different channel published Completed first.
++ */
++#if defined(__CUDACC__) || defined(__HIPCC__)
++__host__ __device__
++#endif
++constexpr bool ncclLlaminarCompletionMatches(const ncclLlaminarByteCompletion& receipt,
++    uint64_t table, uint64_t admission, uint64_t sequence, uint64_t bytes,
++    uint64_t message, ncclLlaminarCompletionAuthority expected, uint32_t nativeAbort, int32_t firstError) {
++  return table && admission && sequence && message && expected.abortFlag && expected.deviceCommunicator && !nativeAbort && !firstError &&
++      receipt.reserved == 0 && receipt.phase == ncclLlaminarCompletionPhase::Completed &&
++      receipt.table == table && receipt.admission == admission && receipt.sequence == sequence &&
++      receipt.bytes == bytes && receipt.message == message && receipt.nativeAbortFlag == expected.abortFlag &&
++      receipt.nativeCommunicator == expected.deviceCommunicator;
++}
++
++/** @brief True UINT64 byte-prefix binding; source metadata, not host execution state. */
++struct ncclLlaminarDeviceBytes {
++  const uint64_t* bytes;
++  uint64_t capacityBytes;
++  const ncclLlaminarCompletionOperand* completion;
++};
++/** @brief Original source-relative metadata, published before native capture replay. */
++struct ncclLlaminarSourceSlice {
++  uint64_t byteOffset;
++  uint64_t liveBytes;
++};
++/** @brief Root-only source bank and original metadata; no receiver offset bank exists. */
++struct ncclLlaminarDeviceSlice {
++  const ncclLlaminarSourceSlice* slice;
++  uint64_t sourceCapacityBytes;
++  const ncclLlaminarCompletionOperand* completion;
++};
++/** @brief Frozen native binding interpretation; unknown modes are invalid work. */
++enum class ncclLlaminarPayloadKind : uint32_t { Rows = 0, CompletedBytes = 1, CompletedSourceSlice = 2 };
++/** @brief Explicit typed32-byte work binding; existing row ABI structs are unchanged. */
++struct ncclLlaminarDevicePayload {
++  union Binding {
++    ncclLlaminarDeviceRows rows;
++    ncclLlaminarDeviceBytes bytes;
++    ncclLlaminarDeviceSlice slice;
++    ncclLlaminarResolvedRows resolved;
++    struct ResolvedCompleted { size_t liveBytes; ncclLlaminarRowGeometry geometry;
++      const ncclLlaminarCompletionOperand* completion; } completed;
++  } binding;
++  ncclLlaminarPayloadKind kind;
++  uint32_t reserved;
++  /** @return Whether the original host descriptor has a device-owned extent. */
++#if defined(__CUDACC__) || defined(__HIPCC__)
++  __host__ __device__
++#endif
++  bool active() const {
++    return kind == ncclLlaminarPayloadKind::Rows ? binding.rows.rows != nullptr :
++      kind == ncclLlaminarPayloadKind::CompletedBytes ? binding.bytes.bytes != nullptr :
++      kind == ncclLlaminarPayloadKind::CompletedSourceSlice ? binding.slice.slice != nullptr : false;
++  }
++  /** @return Whether mode/reserved and byte-binding representation are well formed. */
++  bool valid() const {
++    return reserved == 0 && (kind == ncclLlaminarPayloadKind::Rows ||
++      (kind == ncclLlaminarPayloadKind::CompletedBytes && binding.bytes.bytes && binding.bytes.capacityBytes && binding.bytes.completion) ||
++      (kind == ncclLlaminarPayloadKind::CompletedSourceSlice && binding.slice.slice && binding.slice.sourceCapacityBytes && binding.slice.completion));
++  }
++};
++static_assert(sizeof(ncclLlaminarSourceSlice) == 16 && sizeof(ncclLlaminarDeviceSlice) == 24,
++    "Source slices retain the existing fixed native work binding size");
++static_assert(sizeof(ncclLlaminarDeviceRows) == 24 && sizeof(ncclLlaminarDeviceBytes) == 24,
++    "Row and byte operands retain the native64-bit binding ABI");
++static_assert(sizeof(ncclLlaminarDevicePayload) == 32 &&
++    offsetof(ncclLlaminarDevicePayload, kind) == 24 &&
++    offsetof(ncclLlaminarDevicePayload, reserved) == 28,
++    "Typed payload work packing requires its complete32-byte representation");
++/** @brief Independently mask every metadata word across a native FIFO wrap. */
++#if defined(__CUDACC__) || defined(__HIPCC__)
++__host__ __device__
++#endif
++constexpr uint32_t ncclLlaminarWorkWord(uint32_t packOffset, uint32_t offset, uint32_t mask) {
++  return (packOffset + offset) & mask;
++}
++/** @brief Immutable original peer work: count/slice authority plus retained progress geometry. */
++struct ncclLlaminarP2pTransfer {
++  ncclLlaminarDevicePayload payload{};
++  uint64_t capacityBytes = 0;
++  uint64_t sourceOffsetOrigin = 0;
++};
++static_assert(sizeof(ncclLlaminarP2pTransfer) % 16 == 0,
++    "Original P2P work operands remain complete native loader packs");
++
++#endif
+--- /dev/null
++++ b/src/include/llaminar_p2p_launch.h
+@@ -0,0 +1,178 @@
++/**
++ * @file llaminar_p2p_launch.h
++ * @brief Seal actual native P2P batches, source work and selected connections.
++ *
++ * This transient planner proof owns no allocation or progress ledger. The
++ * serialized batches and native connector remain the sole work/transport
++ * authorities. Counted payloads require this direct entry; ordinary foreign
++ * native work retains its existing kernel and transport semantics.
++ */
++#ifndef NCCL_LLAMINAR_P2P_LAUNCH_H_
++#define NCCL_LLAMINAR_P2P_LAUNCH_H_
++#include "comm.h"
++#include "transport.h"
++#include <vector>
++
++/** @brief Whether the public API requires device-owned counted progress. */
++enum class ncclP2pLaunchRequirement { OrdinaryNative, DeviceCounted };
++/** @brief Complete outcome of validating the direct entry's physical inputs. */
++enum class ncclP2pLaunchStatus { Sealed, Empty, ForeignWork, Geometry, Connection };
++/** @brief Immutable publication result; invalid required work cannot launch. */
++struct ncclP2pLaunchSeal {
++  ncclP2pLaunchRequirement requirement;
++  ncclP2pLaunchStatus status;
++};
++
++/**
++ * @brief Resolve a serialized work offset against the actual retained source list.
++ * @param plan Native plan whose source list owns every published work byte.
++ * @param wanted Exact byte offset from the serialized batch.
++ * @return Exact P2P descriptor or null for interior, missing or foreign storage.
++ */
++inline ncclDevWorkP2p const* ncclLlaminarP2pWorkAt(ncclKernelPlan const* plan, size_t wanted) {
++  size_t offset = 0;
++  for (auto* node = plan->workQueue.head; node; node = node->next) {
++    if (node->size < 0 || offset > plan->workBytes || size_t(node->size) > plan->workBytes-offset) return nullptr;
++    if (offset == wanted)
++      return node->workType == ncclDevWorkTypeP2p && node->size == sizeof(ncclDevWorkP2p)
++          ? reinterpret_cast<ncclDevWorkP2p const*>(node+1) : nullptr;
++    offset += size_t(node->size);
++    if (offset > wanted) return nullptr;
++  }
++  return nullptr;
++}
++
++/**
++ * @brief Validate the active direction's actual connected device-progress transport.
++ * @param comm Fully connected native communicator.
++ * @param channel Actual channel selected by the serialized batch chain.
++ * @param peer Native work's actual peer rank.
++ * @param send Whether this is the send connector at native P2P connection index1.
++ * @return True only for selected local P2P/SHM without proxy/CE/network progress.
++ */
++inline bool ncclLlaminarP2pConnection(ncclComm const* comm, int channel, int peer, bool send) {
++  if (peer < 0 || peer >= comm->nRanks || channel < 0 || channel >= MAXCHANNELS ||
++      !comm->channels[channel].peers || !comm->channels[channel].peers[peer]) return false;
++  auto const* endpoint = comm->channels[channel].peers[peer];
++  auto const* conn = send ? &endpoint->send[1] : &endpoint->recv[1];
++  auto const* p2p = send ? &p2pTransport.send : &p2pTransport.recv;
++  auto const* shm = send ? &shmTransport.send : &shmTransport.recv;
++  return conn->connected && (conn->transportComm == p2p || conn->transportComm == shm) &&
++      !conn->proxyConn.proxyProgress && !conn->proxyConn.proxyGinProgress &&
++      !(conn->conn.flags & NCCL_DIRECT_NIC) && !conn->conn.netDeviceHandle.handle &&
++      conn->conn.netDeviceHandle.netDeviceType==NCCL_NET_DEVICE_HOST;
++}
++
++/**
++ * @brief Prove every channel chain, work reference and active connection before launch.
++ * @param comm Native communicator supplying actual physical-host and connector facts.
++ * @param plan Complete native source work/task inventory, before publication.
++ * @param batches Actual final channel-interleaved serialized batch array.
++ * @param count Exact array length.
++ * @return A typed seal; required DeviceCounted work fails if it is not Sealed.
++ *
++ * Eight warps support at most four works under the unchanged P2P scheduler.
++ * Extension batches are rejected because their fused count is not independent.
++ * All references resolve to actual source-list boundaries and every batch is
++ * visited exactly once through the same per-channel links the device replays.
++ */
++inline ncclP2pLaunchSeal ncclLlaminarSealP2pLaunch(ncclComm const* comm,
++    ncclKernelPlan const* plan, ncclDevWorkBatch const* batches, int count) {
++  ncclP2pLaunchRequirement requirement = ncclP2pLaunchRequirement::OrdinaryNative;
++  for (auto* task = plan->p2pTaskQueue.head; task; task = task->next) {
++    const auto& payload=task->llaminarTransfer.payload;
++    // Completion kind is required even for a malformed absent binding: it must
++    // never silently select the ordinary indirect entry without its receipt.
++    if (payload.active() || payload.kind==ncclLlaminarPayloadKind::CompletedBytes ||
++        payload.kind==ncclLlaminarPayloadKind::CompletedSourceSlice)
++      requirement=ncclP2pLaunchRequirement::DeviceCounted;
++  }
++  const auto reject = [&](ncclP2pLaunchStatus status) { return ncclP2pLaunchSeal{requirement,status}; };
++  if (count <= 0 || !plan->channelMask) return reject(ncclP2pLaunchStatus::Empty);
++  if (!batches || count != plan->nWorkBatches || comm->nNodes != 1 ||
++      comm->p2pnChannels <= 0 || comm->p2pnChannels > MAXCHANNELS ||
++      (comm->p2pnChannels & (comm->p2pnChannels-1)))
++    return reject(ncclP2pLaunchStatus::Geometry);
++  for (auto* node = plan->workQueue.head; node; node = node->next)
++    if (node->workType != ncclDevWorkTypeP2p || node->size != sizeof(ncclDevWorkP2p))
++      return reject(ncclP2pLaunchStatus::ForeignWork);
++  std::vector<unsigned char> visited(size_t(count),0);
++  int root = 0, seen = 0;
++  for (int channel=0; channel<MAXCHANNELS; ++channel) {
++    if (!(plan->channelMask & (uint64_t(1)<<channel))) continue;
++    int index = root++;
++    for (;;) {
++      if (index < 0 || index >= count || visited[index]) return reject(ncclP2pLaunchStatus::Geometry);
++      visited[index]=1; ++seen;
++      auto const& batch=batches[index];
++      if (batch.workType != ncclDevWorkTypeP2p || batch.funcId != ncclDevFuncId_P2p())
++        return reject(ncclP2pLaunchStatus::ForeignWork);
++      const int works=__builtin_popcountll(batch.offsetBitset);
++      if (batch.nextExtends || works<1 || works>NCCL_LLAMINAR_LOCAL_P2P_MAX_WORKS)
++        return reject(ncclP2pLaunchStatus::Geometry);
++      for (int bit=0; bit<64; ++bit) {
++        if (!(batch.offsetBitset & (uint64_t(1)<<bit))) continue;
++        const size_t offset=size_t(batch.offsetBase)+size_t(bit)*sizeof(ncclDevWorkP2p);
++        auto const* work=ncclLlaminarP2pWorkAt(plan,offset);
++        if (!work) return reject(ncclP2pLaunchStatus::ForeignWork);
++        if (work->sendNetReg || work->recvNetReg) return reject(ncclP2pLaunchStatus::Connection);
++        if (work->nP2pChannels!=comm->p2pnChannels || work->channelBase>=comm->p2pnChannels ||
++            work->nSendChannels>comm->p2pnChannels || work->nRecvChannels>comm->p2pnChannels)
++          return reject(ncclP2pLaunchStatus::Geometry);
++        const int part=(channel-work->channelBase)&(comm->p2pnChannels-1);
++        const bool send=part<work->nSendChannels, recv=part<work->nRecvChannels;
++        if (!send && !recv) return reject(ncclP2pLaunchStatus::Geometry);
++        if (work->sendRank==comm->rank) {
++          if (!send || !recv || work->recvRank!=comm->rank || work->sendBytes!=work->recvBytes)
++            return reject(ncclP2pLaunchStatus::Geometry);
++        } else if ((send && !ncclLlaminarP2pConnection(comm,channel,work->sendRank,true)) ||
++                   (recv && !ncclLlaminarP2pConnection(comm,channel,work->recvRank,false)))
++          return reject(ncclP2pLaunchStatus::Connection);
++      }
++      if (!batch.nextJump) break;
++      if (batch.nextJump > unsigned(count-1-index)) return reject(ncclP2pLaunchStatus::Geometry);
++      index += batch.nextJump;
++    }
++  }
++  return reject(seen==count ? ncclP2pLaunchStatus::Sealed : ncclP2pLaunchStatus::Geometry);
++}
++/**
++ * @brief Publish the proven entry and geometry atomically at the plan boundary.
++ * @param plan Native plan receiving its immutable captured launch identity.
++ * @param seal Result from the complete actual-input validator.
++ * @return InvalidUsage before mutation for foreign required work or absent entry.
++ * Ordinary unsealed native work retains its original kernel and geometry.
++ */
++inline ncclResult_t ncclLlaminarBindP2pLaunch(ncclKernelPlan* plan, ncclP2pLaunchSeal seal) {
++  if (seal.status!=ncclP2pLaunchStatus::Sealed)
++    return seal.requirement==ncclP2pLaunchRequirement::DeviceCounted ? ncclInvalidUsage : ncclSuccess;
++  if (ncclDevLocalP2pKernelIndex<0 || ncclDevLocalP2pKernelIndex>=ncclDevKernelCount ||
++      !ncclDevKernelList[ncclDevLocalP2pKernelIndex]) return ncclInvalidUsage;
++  plan->kernelFn=ncclDevKernelList[ncclDevLocalP2pKernelIndex];
++  plan->kernelSpecialized=true;
++  plan->threadPerBlock=NCCL_LLAMINAR_LOCAL_P2P_NTHREADS;
++  return ncclSuccess;
++}
++/**
++ * @brief Drain all unpublished owners if a later plan rejects before publication.
++ * @param planner Actual native queue containing earlier unpublished plans.
++ * @param rejected Complete current plan, not yet enqueued.
++ * @param retire Typed pending-phase retirement supplied by the native owner.
++ * @return First cleanup error after every owner has been visited exactly once.
++ *
++ * Native group cleanup assumes persistent queued plans already have graph
++ * references. At this earlier boundary no plan has acquired those references.
++ */
++template<class RetirePending>
++inline ncclResult_t ncclLlaminarRetirePendingP2pPlanSet(ncclKernelPlanner* planner,
++    ncclKernelPlan* rejected, RetirePending retire) {
++  ncclResult_t result=retire(rejected);
++  while (!ncclIntruQueueEmpty(&planner->planQueue)) {
++    auto* earlier=ncclIntruQueueDequeue(&planner->planQueue);
++    const auto status=retire(earlier);
++    if (result==ncclSuccess) result=status;
++  }
++  planner->unlaunchedPlansHead=nullptr;
++  return result;
++}
++#endif
+--- a/src/init.cc
++++ b/src/init.cc
+@@ -1,3 +1,8 @@
++/** @file init.cc
++ * @brief Original communicator construction/reclamation and signal-only captured abort.
++ * The completed-byte signal borrows existing abort words; native definitions and
++ * terminal proof still precede the unchanged original communicator reclamation.
++ */
+ /*************************************************************************
+  * Copyright (c) 2015-2022, NVIDIA CORPORATION. All rights reserved.
+  *
+@@ -2401,6 +2406,19 @@
+   __atomic_store_n(comm->abortFlagDev, value, __ATOMIC_RELEASE);
+   return ncclSuccess;
+ }
++/**
++ * @brief Signal only the original absorbing abort words for completed-byte work.
++ * Graph/event owners must still prove native termination and retire definitions
++ * before ordinary communicator reclamation. This never destroys or rearms a comm.
++ * @param comm Original initialized communicator retained by the caller.
++ * @return Native status; no alternate flag, GPU copy or allocation is introduced.
++ */
++extern "C" __attribute__((visibility("default"))) ncclResult_t
++llaminarNcclSignalCompletionAbort(ncclComm_t comm) {
++  if (!comm || !comm->abortFlag || !comm->abortFlagDev) return ncclInvalidArgument;
++  return setCommAbortFlags(comm, 1);
++}
++
+ 
+ NCCL_API(ncclResult_t, ncclCommRevoke, ncclComm_t comm, int revokeFlags);
+ struct ncclCommRevokeAsyncJob {
+--- a/src/libnccl.map
++++ b/src/libnccl.map
+@@ -1,7 +1,21 @@
++/* @file libnccl.map
++ * @brief Export only the completed native byte ABI alongside original fixed/row APIs.
++ * Observer-only private prototypes are intentionally absent from the public table.
++ */
+ {
+     global:
+         nccl*;
+         pnccl*;
++        llaminarNcclCompletionAuthority;
++        llaminarNcclP2pProgressGeometry;
++        llaminarNcclObserveP2pProgress;
++        llaminarNcclSignalCompletionAbort;
++        llaminarNcclCompletedProtocolVersion;
++        llaminarNcclSendCompletedBytes;
++        llaminarNcclRecvCompletedBytes;
++        llaminarNcclSendCompletedSliceOrigin;
++        llaminarNcclBroadcastCompletedBytes;
++        llaminarNcclBroadcastCompletedSliceOrigin;
+         llaminarNcclAllGatherDeviceRows;
+         llaminarNcclAllReduceDeviceRows;
+         llaminarNcclReduceScatterDeviceRows;
+--- a/src/proxy.cc
++++ b/src/proxy.cc
+@@ -1633,7 +1633,10 @@
+   int npeers = 0;
+   int stop = PROXY_RUNNING;
+   int asyncOpCount = 0;
+-  while (stop == PROXY_RUNNING || npeers > 0) {
++  // Abort wakes native host/device work but does not retire captured readers.
++  // Only ncclProxyStop's existing release-store permits resource reclamation.
++  while (stop == PROXY_RUNNING || npeers > 0 ||
++         (stop == PROXY_ABORT && !__atomic_load_n(&proxyState->stop, __ATOMIC_ACQUIRE))) {
+     /* Even if local comm aborts, we cannot let proxy thread exit if we still have peer
+      * connections. Need to wait until all other related comms call abort and safely exit
+      * together, or we could face segmentation fault. */

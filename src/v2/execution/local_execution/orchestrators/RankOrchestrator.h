@@ -56,6 +56,7 @@
 
 #include "IRankOrchestrator.h"
 #include <exception>
+#include <algorithm>
 #include "TPWorkerPool.h"
 #include "../../../backends/GlobalDeviceAddress.h"
 #include "../../../config/OrchestrationConfig.h"
@@ -72,6 +73,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <type_traits>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -1743,6 +1745,27 @@ namespace llaminar2
         /** @brief Original source invocation retained across all TP participant launches and terminal closes. */
         friend struct test::RankRetainedStorageRetirementReplayAccess;
         /**
+         * @brief Snapshot distinct original model-published source owners, independently of child success.
+         * @param consumers Canonical ModelContext entries, locked by the caller during enumeration.
+         * @param belongs Predicate authenticating the original parent or an actual returned child.
+         * @return Each selected non-null participant once, in canonical publication order.
+         * @note Failed constructors can publish sources without returning a DGO. Their model entries
+         * still own retirement obligations; a successful-child roster is not a publication ledger.
+         */
+        template<class Consumers, class Belongs>
+        static auto originalPublishedStorageParticipants(const Consumers& consumers, Belongs belongs)
+        {
+            using Owner = decltype(consumers.begin()->second.participants);
+            std::vector<Owner> originals;
+            for (const auto& [device, consumer] : consumers) {
+                const auto& original = consumer.participants;
+                if (original && belongs(device, original) &&
+                    std::find(originals.begin(), originals.end(), original) == originals.end())
+                    originals.push_back(original);
+            }
+            return originals;
+        }
+        /**
          * @brief Retire every original participant and its group, preserving the first failure.
          * @param participants Original participant owners, in authored order.
          * @param retire Terminal-only operation on one original owner; it must retain native failure guards.
@@ -1772,6 +1795,76 @@ namespace llaminar2
             // A later missing native proof outranks any earlier service failure.
             if (unproven) std::rethrow_exception(unproven);
             if (semantic) std::rethrow_exception(semantic);
+        }
+        /**
+         * @brief Prove original source producers before releasing mapped storage waits on a failed host attempt.
+         * @param participants Actual original source/reader DGO owners.
+         * @param cancel Same original request CPU/reader/native failure signal, never a storage-release guess.
+         * @param prove Producer-only original native terminal publication; no follower terminal wait.
+         * @param cancelStorage Exact original StorageOwners cancellation, permitted only after every source proof.
+         * @throws First unproven terminal/cancellation failure after attempting every source producer.
+         */
+        template<class Participants,class Cancel,class Prove,class CancelStorage>
+        static void failOriginalSourceAttempt(const Participants& participants,Cancel cancel,Prove prove,CancelStorage cancelStorage) {
+            std::exception_ptr cancellation_failure;
+            try { cancel(); } catch (...) { cancellation_failure=std::current_exception(); }
+            retireOriginalStorageParticipants(participants,prove,[]{},[&] {
+                // Every original producer is now physically proven. Attempt
+                // exact storage cancellation even if the earlier failure
+                // signal reported an ownership error, then retain its first
+                // exception. Neither cancellation phase may manufacture the
+                // typed semantic "already retired" classification.
+                try { cancelStorage(); }
+                catch (...) { if (!cancellation_failure) cancellation_failure=std::current_exception(); }
+                if (cancellation_failure) {
+                    try { std::rethrow_exception(cancellation_failure); }
+                    catch (const std::exception& failure) {
+                        std::throw_with_nested(std::runtime_error(std::string("Original source cancellation phase failed: ")+failure.what()));
+                    }
+                    catch (...) {
+                        std::throw_with_nested(std::runtime_error("Original source cancellation phase failed with a non-standard exception"));
+                    }
+                }
+            });
+        }
+        /** @brief Close a failed host attempt off all original participant workers before outer publisher abort drains owners. */
+        void failRetainedSourceAttempt(const char* operation) noexcept;
+        /** @brief Withdraw collected source-specific TP failure captures before final channel teardown or source rearm. */
+        void retireRetainedSourceFailureCallback();
+        /**
+         * @brief Consume every original constructor result before propagating failure.
+         * @param futures Exactly the submitted construction jobs; no replacement jobs.
+         * @param retain Nonthrowing transfer into the original pre-reserved child owner.
+         * @param abort Signal the original cohort before waiting for another result.
+         * @param first Original async-launch failure, if submission was partial.
+         * @return First original exception after all submitted jobs were consumed.
+         * This helper owns no protocol state and grants no native completion proof.
+         */
+        template<class Futures, class Retain, class Abort>
+        static std::exception_ptr collectOriginalParticipantConstructors(
+            Futures& futures, Retain retain, Abort abort, std::exception_ptr first = {})
+        {
+            using Result = decltype(futures.front().get());
+            static_assert(std::is_nothrow_invocable_v<Retain, Result>);
+            const auto signal = [&] {
+                try { abort(); }
+                catch (...) { if (!first) first = std::current_exception(); }
+            };
+            if (first) signal();
+            for (auto& future : futures) {
+                try {
+                    auto result = future.get();
+                    if (result.failure) {
+                        if (!first) first = result.failure;
+                        signal();
+                    }
+                    retain(std::move(result));
+                } catch (...) {
+                    if (!first) first = std::current_exception();
+                    signal();
+                }
+            }
+            return first;
         }
         struct RetainedSourceAdmission;
         std::unique_ptr<RetainedSourceAdmission> retained_source_admission_;
@@ -1816,6 +1909,12 @@ namespace llaminar2
          * @brief Initialize device runners from configuration
          */
         void initializeDeviceRunners();
+
+        /** @brief Retire all original child graph borrowers, then detach runtime
+         * storage authorities before any child arena or collective context dies.
+         * Also closes successfully constructed siblings after a constructor fails.
+         */
+        void retireChildTopologyBeforeSharedStorageDetach();
 
         /**
          * @brief Whether this rank owns the main forward logits boundary.

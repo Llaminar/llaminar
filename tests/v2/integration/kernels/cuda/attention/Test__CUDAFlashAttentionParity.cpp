@@ -4691,6 +4691,23 @@ TEST_F(Test__CUDAFlashAttentionParity, CapturedAppendThenAttention_FP16Cache_Qwe
 }
 
 /**
+ * @test Repeated original cache births publish metadata before independent-stream append/capture.
+ * @note Replays the exact failed FP16/head8/M9 shape through 20 original births;
+ * the existing all-native-format matrix retains the remaining format proof.
+ */
+TEST_F(Test__CUDAFlashAttentionParity, ColdSequenceMetadataInitializationIndependentStreamReplay)
+{
+    for(int replay=0;replay<20;++replay){
+        constexpr auto format=ActivationPrecision::FP16;
+        SCOPED_TRACE("cold metadata lifetime="+std::to_string(replay)+" precision="+std::to_string(static_cast<int>(format)));
+        runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+            9,30,8,1,256,"Cold metadata independent stream",format,8,16);
+        if(::testing::Test::HasFatalFailure())return;
+    }
+}
+
+
+/**
  * @brief Prove every supported CUDA grouped-attention depth against serial decode.
  *
  * Prefix-cache suffix prefills are not constrained to the historically common
@@ -4708,6 +4725,7 @@ TEST_F(Test__CUDAFlashAttentionParity, CapturedAppendThenAttention_FP16Cache_Qwe
  * GQA ownership. Every grouped FP32 output row must match the corresponding
  * M=1 CUDA decode row byte-for-byte.
  */
+
 TEST_F(
     Test__CUDAFlashAttentionParity,
     CapturedAppendThenAttention_AllNativeKVFormats_Qwen36LocalTPM2To16RoPEOnReadRowsMatchSerialDecode)

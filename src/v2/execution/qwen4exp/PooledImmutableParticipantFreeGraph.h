@@ -72,7 +72,7 @@ public:
     /** @return Immutable exact original free geometry. */
     const PooledImmutableFreeEdge& declaration()const noexcept{return declaration_;}
     /** @return Actual fixed/sliced/counted endpoint; C0 never has a decision/Grant transaction. */
-    const CapturedTransferBinding& binding(PooledFreeWireRole role,CapturedTransferEndpoint endpoint)const;
+    const PooledImmutableTransferBinding& binding(PooledFreeWireRole role,CapturedTransferEndpoint endpoint)const;
     /** @return Original owner Invocation plus exact acquired free-plan/frontier operands. */
     PooledNativeOperandSpans ownerInputs(pooled_native::OwnerAction action)const;
     /** @return Original coordinator's exact Availability/Grant/completion inputs. */
@@ -80,7 +80,7 @@ public:
     /** @return Full original Pin plus every retained free binding identity; live values stay excluded. */
     uint64_t captureIdentity()const;
 private:
-    using Pair=std::pair<CapturedTransferBinding,CapturedTransferBinding>;
+    using Pair=std::pair<PooledImmutableTransferBinding,PooledImmutableTransferBinding>;
     using Bindings=std::array<std::optional<Pair>,6>;
     /** @brief Construct only after actual original roots/PMA and all exact endpoint bindings are checked. */
     PooledImmutableCapturedFreeWave(std::shared_ptr<const PooledImmutableCapturedPinReturn> pin,

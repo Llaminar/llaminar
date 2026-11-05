@@ -7,6 +7,10 @@ vacuous negative controls or a dependency layer missing the production patch.
 """
 
 import copy
+import hashlib
+import os
+import re
+import subprocess
 import importlib.util
 import json
 from pathlib import Path
@@ -67,6 +71,88 @@ class RCCLProtocolProofTests(unittest.TestCase):
         for path, suffix in (("Dockerfile", "-smallag-${rccl_small_allgather_patch_sha}"),
                              ("src/v2/CMakeLists.txt", "-smallag-${RCCL_SMALL_ALLGATHER_PATCH_HASH}")):
             self.assertIn(suffix, (ROOT / path).read_text())
+
+    def test_actual_canonical_producers_preserve_strict_repair_receipts(self):
+        """Execute real CMake/Docker identity producers against unchanged installed consumers."""
+        def fixture_module(name):
+            spec = importlib.util.spec_from_file_location(name, ROOT / "tests/v2/unit/scripts" / (name + ".py"))
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+
+        thread = fixture_module("test_rccl_thread_lifetime")
+        smallag = fixture_module("test_rccl_small_allgather_policy")
+        thread_case = thread.RCCLThreadProofTests()
+        thread_case.setUp()
+        self.addCleanup(thread_case.doCleanups)
+        smallag_case = smallag.NativeSmallAllGatherProofTests()
+        smallag_case.setUp()
+        self.addCleanup(smallag_case.doCleanups)
+
+        def accepted(receipt):
+            protocol_report = copy.deepcopy(self.report)
+            protocol_report["rccl_receipt"] = receipt
+            PROOF.verify_report(protocol_report, self.library)
+            thread_report = copy.deepcopy(thread_case.report)
+            thread_report["build_receipt"] = receipt
+            thread.PROOF.verify_report(thread_report, thread_case.library)
+            smallag_report = copy.deepcopy(smallag_case.report)
+            smallag_report["rccl_receipt"] = receipt
+            smallag.P.verify(smallag_report, smallag_case.library)
+
+        pairs = [
+            ("COMPLETED", "completed", "rccl-device-completed-broadcast.patch"),
+            ("CAPTURE", "capture", "rccl-hip-capture-event-wait.patch"),
+            ("ROWS", "rows", "rccl-device-live-rows.patch"),
+            ("HOST_STORAGE", "storage", "rccl-native-host-storage.patch"),
+            ("SHM", "shm", "rccl-partial-file-cleanup.patch"),
+            ("SELECTOR", "selector", "rccl-collective-selector-taxonomy.patch"),
+            ("THREAD", "thread", "rccl-created-thread-lifetime.patch"),
+            ("PROTOCOL", "protocol", "rccl-communicator-protocol-defaults.patch"),
+            ("SMALL_ALLGATHER", "small_allgather", "rccl-small-allgather-ll-policy.patch"),
+        ]
+        cmake = (ROOT / "src/v2/CMakeLists.txt").read_text()
+        pin = re.search(r'set\(RCCL_GIT_REF "([^"]+)"\)', cmake).group(1)
+        variables = {"RCCL_COMMIT": pin, "RCCL_GPU_TARGETS": "gfx906;gfx1100",
+                     "RCCL_LTO_RECEIPT_HASH": "a" * 64, "RCCL_LTO_PRODUCER_HASH": "b" * 64}
+        environment = dict(os.environ, RCCL_GIT_REF=pin, rccl_lto_receipt_sha="a" * 64,
+                           rccl_lto_producer_sha="b" * 64,
+                           rccl_target_hash=hashlib.sha256(b"gfx906;gfx1100").hexdigest())
+        for upper, lower, patch in pairs:
+            value = PROOF.digest(ROOT / "scripts/docker/patches" / patch)
+            variables["RCCL_" + upper + "_PATCH_HASH"] = value
+            environment["rccl_" + lower + "_patch_sha"] = value
+        start = cmake.index('    set(RCCL_BUILD_ID "')
+        end = cmake.index("    # Check if RCCL build is up-to-date", start)
+        script = self.directory / "receipt.cmake"
+        output = self.directory / "receipt.txt"
+        script.write_text("".join('set(' + key + ' "' + value + '")\n' for key, value in variables.items())
+                          + cmake[start:end] + '\nfile(WRITE "' + str(output) + '" "${RCCL_BUILD_ID}")\n')
+        result = subprocess.run(["cmake", "-P", str(script)], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        cmake_receipt = output.read_text()
+        docker = (ROOT / "Dockerfile").read_text()
+        producer = next(line.strip().removesuffix("\\").rstrip() for line in docker.splitlines()
+                        if line.strip().startswith("printf '%s\\n' \"targets-${rccl_target_hash}"))
+        result = subprocess.run(["bash", "-c", producer], env=environment,
+                                capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        docker_receipt = result.stdout.strip()
+        self.assertEqual(cmake_receipt, docker_receipt)
+        for receipt in (cmake_receipt, docker_receipt):
+            accepted(receipt)
+            self.assertLess(receipt.index("-llvm-lto-"), receipt.index("-thread-"))
+            self.assertLess(receipt.index("-producer-"), receipt.index("-thread-"))
+            for label, patch in (("thread", thread.PROOF.PATCH), ("protocol", PROOF.PATCH),
+                                 ("smallag", smallag.P.PATCH)):
+                exact = "-" + label + "-" + PROOF.digest(ROOT / patch)
+                for changed in (receipt.replace(exact, ""), receipt.replace(exact, "-" + label + "-" + "0" * 64)):
+                    with self.subTest(label=label, changed=changed), self.assertRaises(RuntimeError):
+                        accepted(changed)
+            compiler_metadata = "-llvm-lto-" + "a" * 64 + "-producer-" + "b" * 64
+            original_order = receipt.replace(compiler_metadata, "") + compiler_metadata
+            with self.assertRaises(RuntimeError):
+                accepted(original_order)
 
     def test_changed_runtime_fails(self):
         """Replacing the selected DSO invalidates earlier proof immediately."""

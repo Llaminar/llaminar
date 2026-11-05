@@ -110,4 +110,76 @@ TEST(PooledImmutableReadGraph, RecordedOrderingPartialSourceSetupRetainsOriginal
         }()),::testing::ExitedWithCode(0),"");
     }
 }
+/**
+ * @test Actual source factories preserve storage across serial canonical controller lifetimes.
+ * Backend doubles cover metadata ownership; no native completion is fabricated.
+ */
+TEST(PooledImmutableReadGraph, CanonicalGenerationBorrowRetiresBeforeRunnerAddressReplacement) {
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    for(const auto type:{DeviceType::CUDA,DeviceType::ROCm}) {
+        ASSERT_EXIT(([&]{
+            const PooledOriginalRecipe recipe{{2u},false,0,false,type};
+            PooledImmutableOriginalPrograms programs({recipe});auto c=programs.make(recipe);
+            ASSERT_FALSE(c.localBinding);ASSERT_TRUE(c.sourceMembers.empty());
+            ASSERT_TRUE(c.ownerGraphs.empty());ASSERT_TRUE(c.forwards.front()==nullptr);
+            ASSERT_EQ(c.graph.retainedStorageBoundary(),c.boundary);
+            ASSERT_FALSE(c.complete.first.empty());ASSERT_FALSE(c.complete.last.empty());
+            const auto device=DeviceId{type,0};const auto source=c.boundary->pooledStorage();
+            const auto identity=c.boundary->captureIdentity();
+            const auto bytes=c.memory->claimedBytes(device,PhysicalMemoryOwner::ImmutableLookupStaging,
+                PhysicalMemoryMaterializationKind::NewAllocation);
+            const auto retire=[&](RetainedStorageGenerationControl words){
+                PooledImmutableFactoryReplayAccess::retireGenerationControl(*c.boundary,words);
+            };
+            const RetainedStorageGenerationControl original{c.control->healthy(),c.control->error()};
+            EXPECT_THROW(retire({original.error,original.healthy}),std::logic_error);
+            {
+                GraphCaptureGuard recording;
+                EXPECT_THROW(retire(original),std::logic_error);
+                EXPECT_EQ(c.boundary->generationControl().healthy,original.healthy);
+            }
+            // Release the actual fixture topology before its graph-retirement frontier.
+            c.graph.clear();for(auto& graph:c.ownerGraphs)if(graph)graph->clear();
+            retire(original);
+            EXPECT_THROW(c.boundary->generationControl(),std::logic_error);
+            EXPECT_THROW(retire(original),std::logic_error);
+            // Reuse freed, already admitted output capacity for a second controller;
+            // retain the first owner so both canonical addresses remain distinct.
+            c.arena=BufferArena{};c.readOutput.reset();
+            ASSERT_TRUE(c.arena.registerExternalBuffer(BufferId::MTP_GENERATION_CONTROL,c.controller));
+            c.control=DeviceGenerationControlBinding::admit(c.arena,device,0);
+            const CPUTensorStorageDeclaration declaration(1,sampling_math::kDeviceGenerationControlCount,
+                BufferTensorType::INT32,PhysicalMemoryOwner::ActivationArena,DeviceId::cpu());
+            auto lease=c.memory->claimNewAllocation(device,PhysicalMemoryOwner::ActivationArena,
+                sampling_math::kDeviceGenerationControlCount*sizeof(int32_t));
+            std::shared_ptr<TensorBase> controller=declaration.materialize(c.memory);
+            TransferEngine::prepareDeviceInput(controller.get(),device,c.originalSourceStream);
+            TransferEngine::requireDeviceInput(controller.get(),device,c.originalSourceStream);
+            BufferArena arena;ASSERT_TRUE(arena.registerExternalBuffer(BufferId::MTP_GENERATION_CONTROL,controller));
+            const auto next=DeviceGenerationControlBinding::admit(arena,device,0);
+            ASSERT_NE(next.healthy(),original.healthy);ASSERT_NE(next.error(),original.error);
+            for(int lifetime=0;lifetime<20;++lifetime){
+                SCOPED_TRACE(lifetime);
+                const auto& selected=lifetime%2?*c.control:next;
+                const auto& other=lifetime%2?next:*c.control;
+                const RetainedStorageGenerationControl words{selected.healthy(),selected.error()};
+                c.boundary->bindPooledGenerationControl(selected);
+                EXPECT_NO_THROW(c.boundary->bindPooledGenerationControl(selected));
+                EXPECT_THROW(c.boundary->bindPooledGenerationControl(other),std::invalid_argument);
+                EXPECT_THROW(c.boundary->bindGenerationControl({other.healthy(),other.error()}),std::invalid_argument);
+                EXPECT_THROW(retire({other.healthy(),other.error()}),std::logic_error);
+                EXPECT_EQ(c.boundary->generationControl().healthy,words.healthy);
+                EXPECT_EQ(c.boundary->generationControl().error,words.error);
+                EXPECT_EQ(c.boundary->pooledStorage(),source);EXPECT_EQ(c.boundary->captureIdentity(),identity);
+                EXPECT_EQ(c.memory->claimedBytes(device,PhysicalMemoryOwner::ImmutableLookupStaging,
+                    PhysicalMemoryMaterializationKind::NewAllocation),bytes);
+                retire(words);
+                EXPECT_THROW(c.boundary->generationControl(),std::logic_error);
+                EXPECT_THROW(retire(words),std::logic_error);
+            }
+            std::_Exit(::testing::Test::HasFailure()?2:0);
+        }()),::testing::ExitedWithCode(0),"");
+    }
+}
+
 }

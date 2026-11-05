@@ -19,6 +19,7 @@
 #include "AdaptiveImmutableLookupGeometry.h"
 #include "execution/qwen4exp/ImmutableLookupExecutionBoundary.h"
 #include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
+#include "execution/qwen4exp/PooledImmutableParticipantExecutionPolicy.h"
 #include "kernels/qwen4exp/PooledImmutableNativeKernels.h"
 #include <array>
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
@@ -312,10 +313,7 @@ namespace llaminar2
             if(!boundary->isPooled() || boundary->device()!=graph.default_device)
                 throw std::logic_error("Remote participant preparation changed its original source boundary");
             const auto storage=boundary->pooledStorage();
-            const bool remote=std::any_of(storage->originalOwners().begin(),storage->originalOwners().end(),[&](const auto& owner){
-                return owner->plan().allocator()!=storage->coordinator()->plan().allocator();
-            });
-            if(!remote)return;
+            if(!qwen4exp::PooledImmutableParticipantExecutionPolicy::requiresRetainedParticipants(storage->geometry()))return;
             if(consumer.participants){
                 auto retained=consumer.participants;lock.unlock();retained->requireForPolicy(graph);return;
             }
@@ -358,6 +356,45 @@ namespace llaminar2
         }
         if(found->second.participant_failure)std::rethrow_exception(found->second.participant_failure);
         return found->second.participants;
+    }
+
+    void ModelContext::retireAdaptiveImmutableLookupParticipants(
+        const std::shared_ptr<qwen4exp::PooledImmutableRetainedParticipants>& original)
+    {
+        if (!original) throw std::invalid_argument("Runtime retirement requires original participants");
+        {
+            std::lock_guard lock(immutable_row_table_mutex_);
+            bool matched = false;
+            for (const auto& [device, consumer] : adaptive_lookup_consumers_) {
+                if (consumer.participants != original) continue;
+                matched = true;
+                if (consumer.participant_preparation &&
+                    consumer.participant_preparation->state == ImmutableRowPreparationState::Preparing)
+                    throw std::logic_error("Original participant preparation is still running");
+            }
+            if (!matched) throw std::logic_error("Runtime retirement replaced its original model participants");
+        }
+        // Backend graph destruction must not hold the model's preparation mutex.
+        // The runner still owns every arena and collective context at this edge.
+        original->retireOriginalRuntimeBeforeArenaRelease();
+        std::lock_guard lock(immutable_row_table_mutex_);
+        for (auto it = adaptive_lookup_consumers_.begin(); it != adaptive_lookup_consumers_.end();) {
+            auto& consumer = it->second;
+            if (consumer.participants != original) { ++it; continue; }
+            if (!consumer.boundary && !consumer.participant_failure) {
+                // Query-only entries own no physical source roots. Recreate them
+                // from the next runner's authenticated original reader cohort.
+                it = adaptive_lookup_consumers_.erase(it);
+                continue;
+            }
+            consumer.participants.reset();
+            // Detach graph borrowers, never erase an original poisoned-source
+            // diagnostic. Cold failure and the service's absorbing Failed state
+            // retain their existing refusal paths; only orderly reuse proceeds.
+            if (!consumer.participant_failure)
+                consumer.participant_preparation.reset();
+            ++it;
+        }
     }
 
     void ModelContext::bindNativeContextPreparation(std::shared_ptr<NativeContextPreparation> source)
@@ -465,19 +502,13 @@ namespace llaminar2
         if(requestedOwners.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal)
         {
             requestedOwners.validate();
-            const bool needsPeerObservation = std::any_of(requestedOwners.owners.begin(), requestedOwners.owners.end(),
-                [&](const auto& owner) {
-                    return owner.participant != *requestedOwners.coordinator &&
-                        owner.participant.backend == requestedOwners.coordinator->backend;
-                });
-            if (needsPeerObservation) {
-                const auto inventory = immutable_source_mpi_ ? immutable_source_mpi_->clusterInventory() : nullptr;
-                if (!inventory || immutable_source_mpi_->rank() != authority->worldRank())
-                    throw std::logic_error("NoPeer pooled source requires its original rank inventory owner");
-                const auto original = ImmutableRowTableDirectedTransportPolicy::observe(requestedOwners,
-                    inventory->getRank(authority->worldRank()));
-                if (original != layout.peerAccess())
-                    throw std::logic_error("Pooled source changed its original declared peer coverage");
+            for (const auto& owner : requestedOwners.owners) {
+                if (owner.participant == *requestedOwners.coordinator ||
+                    owner.participant.backend != requestedOwners.coordinator->backend) continue;
+                const PhysicalMemoryAllocatorIdentity allocator{owner.participant.world_rank, owner.participant.device()};
+                if (layout.consumers().size() < 2 ||
+                    std::find(layout.consumers().begin(), layout.consumers().end(), allocator) == layout.consumers().end())
+                    throw std::invalid_argument("Homogeneous pooled storage requires its original inline continuation/native collective role");
             }
             // Layout metadata canonicalizes allocator keys. The executable
             // physical coordinate order remains the authored owner request,
@@ -502,10 +533,12 @@ namespace llaminar2
             for(const auto& owner:orderedOwners){
                 if(owner.world_rank!=authority->worldRank())
                     throw std::invalid_argument("Cross-rank source requires its admitted native rank factory");
-                // The original inventory observation above selects an explicit
-                // mapped or peer route. Reuse the same policy validator here;
-                // a same-vendor endpoint is never an automatic peer fallback.
-                ImmutableRowTableDirectedTransportPolicy::require(requester,owner,layout.peerAccess());
+                // Native homogeneous transport is authenticated later against
+                // the actual Rank cohort before any capture. Here the original
+                // resolved role and source permit authenticate physical roots.
+                // Cross-vendor movement keeps its original endpoint contract.
+                if (owner != requester && owner.device.type != requester.device.type)
+                    ImmutableRowTableDirectedTransportPolicy::require(requester,owner,layout.peerAccess());
                 participantPermits.push_back(nativeSource->acquire(owner.device));
             }
             if(coordinatorPermit->worker()->ownsCurrentThread() ||

@@ -103,5 +103,190 @@ namespace
         EXPECT_EQ(call.payload_receipt, &counter);
         EXPECT_EQ(counter, 0x2468ace013579bdfULL);
     }
+    /** @test Known fixed headers/ACKs use only the ordinary native API. */
+    TEST_F(NativeRowsABI, NativeBytesFixedHasNoDynamicHeaderOrCountBinding)
+    {
+        const auto bytes = NativeCollectiveBytes::fixed(64);
+        ASSERT_EQ(native_rows_abi::nativeBroadcastBytes(source_.data(), destination_.data(),
+            bytes, 1, communicator_.data(), stream_.data()), native_rows_abi::ncclSuccess);
+        const auto call = llaminarNativeRowsABIObservation();
+        EXPECT_EQ(call.fixed_calls, 1u);
+        EXPECT_EQ(call.byte_prefix_calls, 0u);
+        EXPECT_EQ(call.byte_slice_calls, 0u);
+        EXPECT_EQ(call.elements, 64u);
+        EXPECT_EQ(call.datatype, static_cast<int>(native_rows_abi::ncclInt8));
+        EXPECT_EQ(call.root, 1);
+        EXPECT_EQ(call.live_bytes, nullptr);
+        EXPECT_EQ(call.communicator, communicator_.data());
+        EXPECT_EQ(call.stream, stream_.data());
+    }
+
+    /** @test An inaccessible device word is retained exactly, never truncated or host-read. */
+    TEST_F(NativeRowsABI, NativeBytesPrefixPreservesOriginalCountReceiptAndStream)
+    {
+        auto* extent = reinterpret_cast<std::uint64_t*>(std::uintptr_t{0x1000});
+        auto* completion = reinterpret_cast<const ncclLlaminarCompletionOperand*>(std::uintptr_t{0x6000});
+        const auto bytes = NativeCollectiveBytes::prefix(extent, 737280, completion);
+        ASSERT_EQ(native_rows_abi::nativeBroadcastBytes(source_.data(), destination_.data(),
+            bytes, 1, communicator_.data(), stream_.data()), native_rows_abi::ncclSuccess);
+        const auto call = llaminarNativeRowsABIObservation();
+        EXPECT_EQ(call.fixed_calls, 0u);
+        EXPECT_EQ(call.byte_prefix_calls, 1u);
+        EXPECT_EQ(call.byte_slice_calls, 0u);
+        EXPECT_EQ(call.live_bytes, extent);
+        EXPECT_EQ(call.capacity_bytes, 737280u);
+        EXPECT_EQ(call.completion, completion);
+        EXPECT_EQ(call.send, source_.data());
+        EXPECT_EQ(call.receive, destination_.data());
+        EXPECT_EQ(call.communicator, communicator_.data());
+        EXPECT_EQ(call.stream, stream_.data());
+    }
+
+    /** @test Source and receiver operands keep distinct original metadata roles. */
+    TEST_F(NativeRowsABI, NativeBytesSliceUsesRootDescriptorAndSeparateReceiverExtent)
+    {
+        auto* slice = reinterpret_cast<NativeByteSourceSlice*>(std::uintptr_t{0x2000});
+        const auto root_bytes = NativeCollectiveBytes::sourceSlice(slice, 8192, 4099,
+            reinterpret_cast<const ncclLlaminarCompletionOperand*>(0x6000), 0x1234567800000000ULL);
+        ASSERT_EQ(native_rows_abi::nativeBroadcastBytes(source_.data(), destination_.data(),
+            root_bytes, 1, communicator_.data(), stream_.data()), native_rows_abi::ncclSuccess);
+        auto call = llaminarNativeRowsABIObservation();
+        EXPECT_EQ(call.byte_slice_calls, 1u);
+        EXPECT_EQ(call.fixed_calls, 0u);
+        EXPECT_EQ(call.byte_prefix_calls, 0u);
+        EXPECT_EQ(call.source_slice, slice);
+        EXPECT_EQ(reinterpret_cast<std::uintptr_t>(call.live_bytes), 0x2008u);
+        EXPECT_EQ(call.source_capacity_bytes, 8192u);
+        EXPECT_EQ(call.source_offset_origin, 0x1234567800000000ULL);
+        EXPECT_EQ(call.capacity_bytes, 4099u);
+        EXPECT_EQ(call.root, 1);
+        llaminarNativeRowsABIReset();
+        auto* receiver = reinterpret_cast<std::uint64_t*>(std::uintptr_t{0x3000});
+        const auto receive_bytes = NativeCollectiveBytes::receiveSlice(receiver, 4099, reinterpret_cast<const ncclLlaminarCompletionOperand*>(0x6000));
+        ASSERT_EQ(native_rows_abi::nativeBroadcastBytes(source_.data(), destination_.data(),
+            receive_bytes, 1, communicator_.data(), stream_.data()), native_rows_abi::ncclSuccess);
+        call = llaminarNativeRowsABIObservation();
+        EXPECT_EQ(call.source_slice, nullptr);
+        EXPECT_EQ(call.live_bytes, receiver);
+        EXPECT_EQ(call.source_capacity_bytes, 0u);
+        EXPECT_EQ(call.source_offset_origin, 0u);
+        EXPECT_EQ(call.capacity_bytes, 4099u);
+        EXPECT_EQ(call.root, 1);
+    }
+
+    /** @test Only the actual communicator root can retain a source-relative descriptor. */
+    TEST_F(NativeRowsABI, NativeBytesRolesUseOriginalCommunicatorCoordinates)
+    {
+        auto* slice = reinterpret_cast<NativeByteSourceSlice*>(std::uintptr_t{0x2000});
+        auto* extent = reinterpret_cast<std::uint64_t*>(std::uintptr_t{0x3000});
+        const auto source = NativeCollectiveBytes::sourceSlice(slice, 8192, 4099, reinterpret_cast<const ncclLlaminarCompletionOperand*>(0x6000));
+        const auto receive = NativeCollectiveBytes::receiveSlice(extent, 4099, reinterpret_cast<const ncclLlaminarCompletionOperand*>(0x6000));
+        for (int degree : {2, 4, 8})
+            for (int participant = 0; participant < degree; ++participant)
+            {
+                EXPECT_EQ(source.participantValid(degree, participant, 1), participant == 1);
+                EXPECT_EQ(receive.participantValid(degree, participant, 1), participant != 1);
+            }
+        EXPECT_FALSE(source.participantValid(1, 0, 0));
+        EXPECT_FALSE(source.participantValid(2, -1, 1));
+        EXPECT_FALSE(source.participantValid(2, 1, 2));
+    }
+
+    /** @test Actual addressed loader dispatch preserves exact peer, role and original device metadata identity. */
+    TEST_F(NativeRowsABI, AddressedBytesUseOnlyActualOriginalEndpointsAndExactOperands) {
+        auto* extent=reinterpret_cast<std::uint64_t*>(0x3000);
+        const auto* completion=reinterpret_cast<const ncclLlaminarCompletionOperand*>(0x6000);
+        const NativeByteEdge edge(3,6);const auto prefix=NativeCollectiveBytes::prefix(extent,4099,completion);
+        ASSERT_EQ(native_rows_abi::nativeTransferBytes(source_.data(),prefix,edge,3,communicator_.data(),stream_.data()),native_rows_abi::ncclSuccess);
+        auto call=llaminarNativeRowsABIObservation();EXPECT_EQ(call.send,source_.data());EXPECT_EQ(call.receive,nullptr);EXPECT_EQ(call.root,6);
+        EXPECT_EQ(call.live_bytes,extent);EXPECT_EQ(call.capacity_bytes,4099u);EXPECT_EQ(call.completion,completion);
+        llaminarNativeRowsABIReset();
+        ASSERT_EQ(native_rows_abi::nativeTransferBytes(destination_.data(),prefix,edge,6,communicator_.data(),stream_.data()),native_rows_abi::ncclSuccess);
+        call=llaminarNativeRowsABIObservation();EXPECT_EQ(call.send,nullptr);EXPECT_EQ(call.receive,destination_.data());EXPECT_EQ(call.root,3);
+        llaminarNativeRowsABIReset();
+        EXPECT_EQ(native_rows_abi::nativeTransferBytes(destination_.data(),prefix,edge,2,communicator_.data(),stream_.data()),native_rows_abi::ncclInvalidArgument);
+        EXPECT_EQ(llaminarNativeRowsABIObservation().byte_prefix_calls,0u);
+        auto* slice=reinterpret_cast<NativeByteSourceSlice*>(0x2000);
+        const auto sliced=NativeCollectiveBytes::sourceSlice(slice,8192,4099,completion,0x12340000);
+        ASSERT_EQ(native_rows_abi::nativeTransferBytes(source_.data(),sliced,edge,3,communicator_.data(),stream_.data()),native_rows_abi::ncclSuccess);
+        call=llaminarNativeRowsABIObservation();EXPECT_EQ(call.source_slice,slice);EXPECT_EQ(call.source_offset_origin,0x12340000u);
+        EXPECT_EQ(call.source_capacity_bytes,8192u);EXPECT_EQ(call.capacity_bytes,4099u);EXPECT_EQ(call.root,6);
+        llaminarNativeRowsABIReset();
+        EXPECT_EQ(native_rows_abi::nativeTransferBytes(destination_.data(),sliced,edge,6,communicator_.data(),stream_.data()),native_rows_abi::ncclInvalidArgument);
+        const auto receive=NativeCollectiveBytes::receiveSlice(extent,4099,completion);
+        EXPECT_EQ(native_rows_abi::nativeTransferBytes(source_.data(),receive,edge,3,communicator_.data(),stream_.data()),native_rows_abi::ncclInvalidArgument);
+        EXPECT_EQ(llaminarNativeRowsABIObservation().byte_prefix_calls,0u);EXPECT_EQ(llaminarNativeRowsABIObservation().byte_slice_calls,0u);
+    }
+
+    /** @test Invalid geometry fails without reading any device publication. */
+    TEST_F(NativeRowsABI, NativeBytesRejectInvalidStaticGeometryAndDefaultStreams)
+    {
+        EXPECT_THROW(NativeCollectiveBytes::fixed(0), std::invalid_argument);
+        EXPECT_THROW(NativeCollectiveBytes::prefix(nullptr, 8, reinterpret_cast<const ncclLlaminarCompletionOperand*>(0x6000)), std::invalid_argument);
+        EXPECT_THROW(NativeCollectiveBytes::sourceSlice(nullptr, 16, 8, reinterpret_cast<const ncclLlaminarCompletionOperand*>(0x6000)), std::invalid_argument);
+        EXPECT_THROW(NativeCollectiveBytes::sourceSlice(reinterpret_cast<NativeByteSourceSlice*>(0x2000), 4, 8, reinterpret_cast<const ncclLlaminarCompletionOperand*>(0x6000)), std::invalid_argument);
+        EXPECT_THROW(NativeCollectiveBytes::prefix(reinterpret_cast<std::uint64_t*>(0x1001), 8, reinterpret_cast<const ncclLlaminarCompletionOperand*>(0x6000)), std::invalid_argument);
+        EXPECT_THROW(NativeCollectiveBytes::prefix(reinterpret_cast<std::uint64_t*>(0x1000), 8, nullptr), std::invalid_argument);
+        EXPECT_THROW(NativeCollectiveBytes::prefix(reinterpret_cast<std::uint64_t*>(0x1000), 8,
+            reinterpret_cast<const ncclLlaminarCompletionOperand*>(0x6001)), std::invalid_argument);
+        for (std::uintptr_t stream : {0, 1, 2})
+            EXPECT_EQ(native_rows_abi::nativeBroadcastBytes(source_.data(), destination_.data(),
+                NativeCollectiveBytes::fixed(8), 0, communicator_.data(), reinterpret_cast<void*>(stream)),
+                native_rows_abi::ncclInvalidArgument);
+        const auto call = llaminarNativeRowsABIObservation();
+        EXPECT_EQ(call.fixed_calls, 0u);
+        EXPECT_EQ(call.byte_prefix_calls, 0u);
+        EXPECT_EQ(call.byte_slice_calls, 0u);
+    }
+
+    /** @test Original native communicator capability is metadata-only and never guessed from ordinal. */
+    TEST_F(NativeRowsABI, NativeBytesOriginalCompletionAuthorityPreservesExactPointerIdentity)
+    {
+        ncclLlaminarCompletionAuthority original{};
+        ASSERT_EQ(native_rows_abi::nativeCompletionAuthority(communicator_.data(), &original), native_rows_abi::ncclSuccess);
+        const auto call = llaminarNativeRowsABIObservation();
+        EXPECT_EQ(call.authority_calls, 1u);
+        EXPECT_EQ(call.communicator, communicator_.data());
+        EXPECT_EQ(original.abortFlag, reinterpret_cast<const std::uint32_t*>(0x4000));
+        EXPECT_EQ(original.deviceCommunicator, reinterpret_cast<const void*>(0x5000));
+        EXPECT_EQ(native_rows_abi::nativeCompletionAuthority(nullptr, &original), native_rows_abi::ncclInvalidArgument);
+        EXPECT_EQ(native_rows_abi::nativeCompletionAuthority(communicator_.data(), nullptr), native_rows_abi::ncclInvalidArgument);
+        EXPECT_EQ(native_rows_abi::signalNativeCompletionAbort(communicator_.data()), native_rows_abi::ncclSuccess);
+        EXPECT_EQ(llaminarNativeRowsABIObservation().abort_signal_calls, 1u);
+        EXPECT_EQ(native_rows_abi::signalNativeCompletionAbort(nullptr), native_rows_abi::ncclInvalidArgument);
+    }
+
+    /** @test Zero bytes require exact fresh native success rather than a passive count. */
+    TEST_F(NativeRowsABI, NativeBytesCompletionRejectsEmptyStaleForeignAndCancelledEvidence)
+    {
+        std::uint32_t abort = 0;
+        const ncclLlaminarCompletionAuthority original{&abort, reinterpret_cast<void*>(0x5000)};
+        ncclLlaminarByteCompletion receipt{17, 23, 31, 0, &abort, original.deviceCommunicator,
+            51, ncclLlaminarCompletionPhase::Completed, 0};
+        const auto accepted = [&](const auto& observed, auto authority, std::uint32_t cancellation, int first_error) {
+            return ncclLlaminarCompletionMatches(observed, 17, 23, 31, 0, 51, authority, cancellation, first_error);
+        };
+        ASSERT_TRUE(accepted(receipt, original, 0, 0));
+        for (int fault = 0; fault < 8; ++fault)
+        {
+            auto observed = receipt;
+            auto authority = original;
+            std::uint32_t cancellation = 0;
+            int first_error = 0;
+            switch (fault)
+            {
+            case 0: observed.phase = ncclLlaminarCompletionPhase::Pending; break;
+            case 1: observed.admission++; break;
+            case 2: observed.sequence++; break;
+            case 3: observed.message++; break;
+            case 4: observed.bytes++; break;
+            case 5: authority.deviceCommunicator = reinterpret_cast<void*>(0x7000); break;
+            case 6: cancellation = 1; break;
+            case 7: first_error = 37; break;
+            }
+            EXPECT_FALSE(accepted(observed, authority, cancellation, first_error)) << fault;
+        }
+    }
+
 }
 } // namespace llaminar2::test

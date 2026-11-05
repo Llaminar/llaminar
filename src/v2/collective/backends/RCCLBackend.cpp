@@ -1880,6 +1880,63 @@ namespace llaminar2
 #endif
     }
 
+    /** @copydoc ICollectiveBackend::signalNativeCompletionAbort */
+    bool RCCLBackend::signalNativeCompletionAbort()
+    {
+#ifdef HAVE_RCCL
+        return initialized_ && coordinator_ && is_multi_gpu_single_process_ && coordinator_->signalNativeCompletionAbort();
+#else
+        return false;
+#endif
+    }
+
+    /** @copydoc ICollectiveBackend::nativeCompletionAuthority */
+    NativeCompletionAuthority RCCLBackend::nativeCompletionAuthority(int participant)
+    {
+#ifdef HAVE_RCCL
+        if (initialized_ && coordinator_ && is_multi_gpu_single_process_)
+            return coordinator_->nativeCompletionAuthority(participant);
+#else
+        (void)participant;
+#endif
+        return {};
+    }
+
+    /** @copydoc ICollectiveBackend::nativeTransferBytesOnStream */
+    NativeCollectiveEnqueueResult RCCLBackend::nativeTransferBytesOnStream(void* payload,const NativeCollectiveBytes& bytes, NativeByteEdge edge, int participant, void* stream)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_ || !coordinator_ || !is_multi_gpu_single_process_)
+            return NativeCollectiveEnqueueResult::failure(
+                "RCCL native addressed bytes requires its initialized original local communicator");
+        auto result = coordinator_->nativeTransferBytesOnStream(payload, bytes, edge, participant, stream);
+        if (!result)
+            return NativeCollectiveEnqueueResult::failure("RCCL native addressed bytes failed: " + result.message());
+        return result;
+#else
+        (void)payload; (void)bytes; (void)edge; (void)participant; (void)stream;
+        return NativeCollectiveEnqueueResult::failure("RCCL not available");
+#endif
+    }
+
+    /** @copydoc ICollectiveBackend::nativeBroadcastBytesOnStream */
+    NativeCollectiveEnqueueResult RCCLBackend::nativeBroadcastBytesOnStream(const void* send, void* receive,
+        const NativeCollectiveBytes& bytes, int root, int participant, void* stream)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_ || !coordinator_ || !is_multi_gpu_single_process_)
+            return NativeCollectiveEnqueueResult::failure(
+                "RCCL native byte Broadcast requires its initialized original local communicator");
+        auto result = coordinator_->nativeBroadcastBytesOnStream(send, receive, bytes, root, participant, stream);
+        if (!result)
+            return NativeCollectiveEnqueueResult::failure("RCCL native byte Broadcast failed: " + result.message());
+        return result;
+#else
+        (void)send; (void)receive; (void)bytes; (void)root; (void)participant; (void)stream;
+        return NativeCollectiveEnqueueResult::failure("RCCL not available");
+#endif
+    }
+
     bool RCCLBackend::nativeRowsOnStream(
         NativeRowCollective operation, const void *send, void *receive,
         const NativeCollectiveRows &rows, CollectiveDataType dtype,

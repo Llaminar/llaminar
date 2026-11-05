@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include "collective/NativeCollectiveBytes.h"
+
 #include "ICollectiveCoordinator.h"
 #include "../ICollectiveBackend.h" // For CollectiveDataType, CollectiveOp
 #include "../backends/NCCLNetworkPolicy.h"
@@ -260,6 +262,29 @@ namespace llaminar2
         bool reduceScatterSingleDeviceOnStream(
             const void *send_buf, void *recv_buf, size_t receive_count,
             CollectiveDataType dtype, int device_idx, void *stream);
+
+        /** @copydoc ICollectiveBackend::signalNativeCompletionAbort */
+        bool signalNativeCompletionAbort();
+
+        /** @copydoc ICollectiveBackend::nativeCompletionAuthority */
+        NativeCompletionAuthority nativeCompletionAuthority(int participant);
+
+        /** @copydoc ICollectiveBackend::nativeTransferBytesOnStream */
+        NativeCollectiveEnqueueResult nativeTransferBytesOnStream(void* payload,const NativeCollectiveBytes& bytes,
+            NativeByteEdge edge,int participant,void* stream);
+
+        /**
+         * @brief Record original fixed/prefix/slice bytes on a native rooted stream.
+         * @param send Original root source bank (unused contribution on receivers).
+         * @param receive Original participant-local destination bank.
+         * @param bytes Borrowed original communication metadata and admitted bounds.
+         * @param root Original communicator coordinate, never a device ordinal.
+         * @param participant Calling original communicator coordinate.
+         * @param stream Exact original producer/consumer stream.
+         * @return Successful native enqueue, with no host count read or fallback.
+         */
+        NativeCollectiveEnqueueResult nativeBroadcastBytesOnStream(const void* send, void* receive,
+            const NativeCollectiveBytes& bytes, int root, int participant, void* stream);
 
         /** @copydoc ICollectiveBackend::nativeRowsOnStream */
         bool nativeRowsOnStream(

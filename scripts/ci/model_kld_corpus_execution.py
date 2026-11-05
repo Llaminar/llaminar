@@ -7,6 +7,7 @@ from numerical acceptance and unexecuted benchmark obligations.
 """
 from pathlib import Path
 from dataclasses import dataclass
+from enum import Enum
 import hashlib
 import json
 
@@ -143,6 +144,12 @@ def validate_absolute_pilot(policy, manifest, topology):
         diagnostic_verdict='UNAVAILABLE', whole_corpus_accepted=False)
 
 
+class PairedMetadataPolicy(str, Enum):
+    """Bound metadata location only; reference payload containment never changes."""
+    CANONICAL_ROOT = "canonical_root_manifest"
+    SOURCE_BOUND_DIAGNOSTIC = "source_bound_external_diagnostic_manifest"
+
+
 @dataclass(frozen=True)
 class PairedCorpusSelection:
     """One existing exact canonical case and its pinned local document obligations.
@@ -161,7 +168,7 @@ class PairedCorpusSelection:
     canonical_arguments: list
 
     @classmethod
-    def from_export(cls, exact, record, corpus_root, document_root):
+    def from_export(cls, exact, record, corpus_root, document_root, *, metadata_policy=PairedMetadataPolicy.CANONICAL_ROOT):
         """Authenticate all declared small documents before selecting or launching a model."""
         require(type(record) is dict and record.get('model_parity_schema') == 1 and
                 type(exact) is str and '.ProductionParity/' in exact,
@@ -212,9 +219,15 @@ class PairedCorpusSelection:
             require(type(document) is dict, 'Paired document must be a JSON object: '+name)
             paths[name], pins[str(path)], documents[name] = path, pin, document
         root = Path(corpus_root).resolve(strict=True)
-        require(paths['workload']==(root/'manifest.json').resolve(strict=True),
-                'Paired workload must be the exact approved corpus manifest, not a searched generation')
-        corpus = corpus_v2.load_corpus(root, catalog=paths['catalog'])
+        require(isinstance(metadata_policy,PairedMetadataPolicy),'Unknown paired metadata-location policy')
+        if metadata_policy == PairedMetadataPolicy.CANONICAL_ROOT:
+            require(paths['workload']==(root/'manifest.json').resolve(strict=True),
+                    'Paired workload must be the exact approved corpus manifest, not a searched generation')
+            corpus = corpus_v2.load_corpus(root, catalog=paths['catalog'])
+        else:
+            # Only the source-owned paired document selects this bounded metadata.
+            # load_corpus retains original-root containment for every reference byte.
+            corpus = corpus_v2.load_corpus(root, catalog=paths['catalog'],manifest_path=paths['workload'])
         require(corpus['manifest']==documents['workload'], 'Paired corpus differs from its declared workload')
         matches = [t for t in corpus['manifest']['topologies'] if t['canonical_cell']==exact]
         require(len(matches)==1, 'Paired corpus needs exactly one topology for the original exact cell')

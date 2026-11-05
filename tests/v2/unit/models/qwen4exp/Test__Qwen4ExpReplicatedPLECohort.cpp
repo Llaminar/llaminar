@@ -239,3 +239,113 @@ TEST(Qwen4ExpReplicatedPLECohort, SharedColdSourceFailureAbortsAndUnblocksOrigin
     const auto calls=context.calls();ASSERT_EQ(calls.size(),1u);
     EXPECT_EQ(calls.front().phase,"qfn-shared-source-materialized");EXPECT_EQ(calls.front().participant,0);
 }
+
+/** @test Parent deferral is exact immutable metadata, never native readiness. */
+TEST(Qwen4ExpReplicatedPLECohort, SharedNativeFactoryRequiresItsOriginalRankOwnedMaterialization)
+{
+    const Qwen4ExpConfig source(sourceMetadata());
+    MockModelContext model;
+    for (const auto type : {DeviceType::CUDA, DeviceType::ROCm}) {
+        const std::string backend = type == DeviceType::CUDA ? "cuda" : "rocm";
+        ImmutableRowTablePolicy policy{.storage=ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD};
+        policy.gpu_adaptive.placement=parseAdaptiveGPUCachePlacement(
+            "0:"+backend+":0/0/0,0:"+backend+":1/0/0@0:"+backend+":1");
+        const auto resource=[](DeviceId device){return PhysicalMemoryResource{0,device,1ull<<30,1ull<<29};};
+        const std::array devices{resource(DeviceId(type,0)),resource(DeviceId(type,1))};
+        const std::array consumers{devices[1],devices[0]};
+        const std::array readerEdges{ImmutableRowTableReaderPeerAccess{
+            {0,DeviceId(type,1)},{0,DeviceId(type,0)},PeerAccessCoverage::None}};
+        const auto& n=source.ngrams();
+        const auto input=ImmutableRowTablePlacementInput::forConsumers(
+            ImmutableRowTableExtent::fromNative(n.table.type,n.table.dimensions[0],n.row_bytes),resource(DeviceId::cpu()),consumers)
+            .withGPUCacheResources(policy,devices)
+            .withReaderPeerAccess(readerEdges);
+        const std::array<size_t,2> empty{};
+        auto placement=Qwen4ExpReplicatedPLECohortReplayAccess::declaration(
+            input.gpuAdaptiveLayout(policy,empty,0,16),policy.gpu_adaptive,n.row_elements);
+        MockLocalTPContext context, foreign;
+        const auto members=owners(2,type);configure(context,members);configure(foreign,members);
+        auto cohort=Qwen4ExpReplicatedPLECohortReplayAccess::cohort(context,model,placement,source);
+        for(int coordinate=0;coordinate<2;++coordinate) {
+            EXPECT_TRUE(cohort->requiresParentOwnedNativeMaterialization(context,members[coordinate].device,coordinate));
+            EXPECT_THROW(cohort->requiresParentOwnedNativeMaterialization(foreign,members[coordinate].device,coordinate),std::invalid_argument);
+            EXPECT_THROW(cohort->requiresParentOwnedNativeMaterialization(context,members[coordinate].device,1-coordinate),std::invalid_argument);
+        }
+    }
+    MockLocalTPContext dedicated;configure(dedicated,owners(2,DeviceType::ROCm));
+    auto placement=coldSharedDeclaration(source);
+    auto cohort=Qwen4ExpReplicatedPLECohortReplayAccess::cohort(dedicated,model,placement,source);
+    EXPECT_TRUE(cohort->requiresParentOwnedNativeMaterialization(dedicated,DeviceId::rocm(1),0));
+}
+
+/** @test Original Rank owns native materialization even when coordinator or sibling is a pure reader. */
+TEST(Qwen4ExpReplicatedPLECohort, SharedOwnerSubsetsKeepParentMaterializationAndExactPhysicalGeometry)
+{
+    const Qwen4ExpConfig source(sourceMetadata());MockModelContext model;
+    for(const auto type:{DeviceType::CUDA,DeviceType::ROCm})
+        for(unsigned mask=1;mask<4;++mask)
+            for(int coordinator=0;coordinator<2;++coordinator)
+                for(const std::size_t capacity:{0u,2u})
+                    for(const auto backing:{AdaptiveImmutableRowBacking::RAM,AdaptiveImmutableRowBacking::SSD}){
+                        SCOPED_TRACE(::testing::Message()<<int(type)<<":"<<mask<<":"<<coordinator<<":"<<capacity<<":"<<int(backing));
+                        const std::string backend=type==DeviceType::CUDA?"cuda":"rocm";
+                        std::string declaration;
+                        for(unsigned owner=0;owner<2;++owner)if(mask&(1u<<owner)){
+                            if(!declaration.empty())declaration+=",";
+                            declaration+="0:"+backend+":"+std::to_string(owner)+"/"+std::to_string(capacity)+"/"+std::to_string(capacity?1048576:0);
+                        }
+                        ImmutableRowTablePolicy policy{.storage=ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD};
+                        policy.gpu_adaptive.source_backing=backing;
+                        policy.gpu_adaptive.placement=parseAdaptiveGPUCachePlacement(declaration+"@0:"+backend+":"+std::to_string(coordinator));
+                        const auto resource=[](DeviceId device){return PhysicalMemoryResource{0,device,1ull<<30,1ull<<29};};
+                        const std::array devices{resource(DeviceId(type,0)),resource(DeviceId(type,1))};
+                        const std::array consumers{devices[1],devices[0]};const auto& n=source.ngrams();
+                        const auto input=ImmutableRowTablePlacementInput::forConsumers(
+                            ImmutableRowTableExtent::fromNative(n.table.type,n.table.dimensions[0],n.row_bytes),resource(DeviceId::cpu()),consumers)
+                            .withGPUCacheResources(policy,devices);
+                        const std::vector<std::size_t> slots(policy.gpu_adaptive.placement.owners.size(),capacity);
+                        const auto layout=input.gpuAdaptiveLayout(policy,slots,0,16);
+                        EXPECT_FALSE(layout.peerAccess());EXPECT_TRUE(layout.readerPeerAccess().empty());
+                        for(unsigned participant=0;participant<2;++participant){
+                            const auto found=std::find_if(layout.owners().begin(),layout.owners().end(),[&](const auto& owner){
+                                return owner.key.tier==ImmutableRowStorage::VRAM && owner.key.allocator.device==DeviceId(type,int(participant));});
+                            if(mask&(1u<<participant)){
+                                ASSERT_NE(found,layout.owners().end());EXPECT_EQ(found->cache_rows,capacity);
+                                EXPECT_EQ(layout.nativePayloadBytes(found->key),capacity*n.row_bytes);
+                            }else EXPECT_EQ(found,layout.owners().end());
+                        }
+                        auto placement=Qwen4ExpReplicatedPLECohortReplayAccess::declaration(layout,policy.gpu_adaptive,n.row_elements);
+                        MockLocalTPContext context,foreign;const auto members=owners(2,type);configure(context,members);configure(foreign,members);
+                        auto cohort=Qwen4ExpReplicatedPLECohortReplayAccess::cohort(context,model,placement,source);
+                        for(int coordinate=0;coordinate<2;++coordinate){
+                            EXPECT_TRUE(cohort->requiresParentOwnedNativeMaterialization(context,members[coordinate].device,coordinate));
+                            EXPECT_THROW(cohort->requiresParentOwnedNativeMaterialization(foreign,members[coordinate].device,coordinate),std::invalid_argument);
+                        }
+                    }
+}
+
+/** @test Every original addressed reader keeps Rank-owned materialization without manufacturing a physical cache role. */
+TEST(Qwen4ExpReplicatedPLECohort, AddressedReadersEveryDegreeKeepOriginalParentMaterialization) {
+    const Qwen4ExpConfig source(sourceMetadata());MockModelContext model;const auto& n=source.ngrams();
+    const auto resource=[](DeviceId d){return PhysicalMemoryResource{0,d,1ull<<30,1ull<<29};};
+    for(const auto type:{DeviceType::CUDA,DeviceType::ROCm})for(const int degree:{2,4,8})for(const int coordinator:{0,degree-1})
+        for(const bool ownerIsSource:{false,true})for(const std::size_t capacity:{0u,2u}) {
+            const std::string backend=type==DeviceType::CUDA?"cuda":"rocm";const int owner=ownerIsSource?coordinator:(coordinator+1)%degree;
+            ImmutableRowTablePolicy policy{.storage=ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD};
+            policy.gpu_adaptive.placement=parseAdaptiveGPUCachePlacement("0:"+backend+":"+std::to_string(owner)+"/"+
+                std::to_string(capacity)+"/"+std::to_string(capacity?1048576:0)+"@0:"+backend+":"+std::to_string(coordinator));
+            const auto members=owners(degree,type);std::vector<PhysicalMemoryResource> resources;
+            for(const auto member:members)resources.push_back(resource(member.device));
+            const auto input=ImmutableRowTablePlacementInput::forConsumers(
+                ImmutableRowTableExtent::fromNative(n.table.type,n.table.dimensions[0],n.row_bytes),resource(DeviceId::cpu()),resources)
+                .withGPUCacheResources(policy,resources);
+            const std::array<std::size_t,1> slots{capacity};
+            auto placement=Qwen4ExpReplicatedPLECohortReplayAccess::declaration(input.gpuAdaptiveLayout(policy,slots,0,16),policy.gpu_adaptive,n.row_elements);
+            MockLocalTPContext context,foreign;configure(context,members);configure(foreign,members);
+            auto cohort=Qwen4ExpReplicatedPLECohortReplayAccess::cohort(context,model,placement,source);
+            for(int coordinate=0;coordinate<degree;++coordinate){
+                EXPECT_TRUE(cohort->requiresParentOwnedNativeMaterialization(context,members[coordinate].device,coordinate));
+                EXPECT_THROW(cohort->requiresParentOwnedNativeMaterialization(foreign,members[coordinate].device,coordinate),std::invalid_argument);
+            }
+        }
+}

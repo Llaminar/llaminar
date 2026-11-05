@@ -12,6 +12,7 @@
 #include "Qwen4ExpProductionParityCases.h"
 #include "Qwen4ExpFixedHeadParityCases.h"
 #include "Qwen4ExpGPUAdaptiveParityCases.h"
+#include "Qwen4ExpOwnerSubsetParityCases.h"
 #include "Qwen4ExpMatchedCacheEconomyCases.h"
 #include "Qwen4ExpFullROCmTP4ParityCases.h"
 #include "Qwen4ExpROCm4OverlayPolicyParityCases.h"
@@ -31,7 +32,11 @@ using QFNCaseFamilies = std::map<std::string, std::vector<ModelParityCase>>;
 /** @return Original case producers in their unchanged registration families. */
 inline QFNCaseFamilies qfnOriginalCaseFamilies()
 {
-    return {{"Qwen4ExpConsumerLocalTP4MovementOrdinalRetained15", qwen4ExpConsumerLocalTP4MovementCases(RoutedExpertOwnerOrder::Ordinal)},
+    return {{"Qwen4ExpOwnerSubsetStaticOrdinalCandidate", qwen4ExpOwnerSubsetExecutionCases(ModelParityExpertOverlayPolicy{})},
+            {"Qwen4ExpOwnerSubsetDynamicOrdinalCandidate", qwen4ExpOwnerSubsetExecutionCases({.owner_order=RoutedExpertOwnerOrder::Ordinal,.movement=ModelParityExpertMovement::Dynamic})},
+            {"Qwen4ExpExpertFollowerOwnerStaticOrdinalCandidate", qwen4ExpExpertFollowerOwnerExecutionCases(ModelParityExpertOverlayPolicy{})},
+            {"Qwen4ExpExpertFollowerOwnerDynamicOrdinalCandidate", qwen4ExpExpertFollowerOwnerExecutionCases({.owner_order=RoutedExpertOwnerOrder::Ordinal,.movement=ModelParityExpertMovement::Dynamic})},
+            {"Qwen4ExpConsumerLocalTP4MovementOrdinalRetained15", qwen4ExpConsumerLocalTP4MovementCases(RoutedExpertOwnerOrder::Ordinal)},
             {"Qwen4ExpConsumerLocalTP4MovementRandomRetained15", qwen4ExpConsumerLocalTP4MovementCases(RoutedExpertOwnerOrder::Random)},
             {"Qwen4ExpConsumerLocalTP4StaticRetained15", qwen4ExpConsumerLocalTP4ExecutionCases()},
             {"Qwen4ExpHardwareProductionDefaults", qwen4ExpHardwareProductionSourceCases()},

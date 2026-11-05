@@ -46,13 +46,13 @@ OrchestrationConfig parseSharedArguments(std::vector<std::string> arguments)
 }
 }
 
-/** @test Adding execution families preserves the separately authored source-only eight cells. */
+/** @test Source backing expansion preserves original execution families and Off/active capacity. */
 TEST(Qwen4ExpSharedCoordinatorTP2Execution, OriginalSourceAdmissionKeepsOffZeroAndActiveFifteen)
 {
     const auto& seeds=qwen4ExpSharedCoordinatorTP2AdaptiveSourceAdmissionSeeds();
-    ASSERT_EQ(seeds.size(),2u);
+    ASSERT_EQ(seeds.size(),4u);
     const auto original=qwen4ExpExpandSourceAdmissionMTP(seeds);
-    ASSERT_EQ(original.size(),8u);
+    ASSERT_EQ(original.size(),16u);
     std::vector<nlohmann::json> before;
     for(const auto& cell:original){
         before.push_back(exportedShared(cell));

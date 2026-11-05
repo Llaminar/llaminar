@@ -471,6 +471,13 @@ namespace
             publishAbort();
             drain(source_backend_, source_stream_, source_terminal_);
             drain(target_backend_, target_stream_, target_terminal_);
+            if (terminal_timeout_observed_)
+            {
+                reportRetiredGrant("continuation", source_backend_, source_stream_,
+                                   source_terminal_, source_lane_);
+                reportRetiredGrant("follower", target_backend_, target_stream_,
+                                   target_terminal_, target_lane_);
+            }
             source_cache_.reset(
                 DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::
                     Destroy);
@@ -1897,11 +1904,38 @@ namespace
             }
             if (!source_ready || !target_ready)
             {
-                const auto &control =
+                terminal_timeout_observed_ = true;
+                auto &control =
                     source_transport_->activationEpochControl(
                         target_participant_, 0u);
+                auto &target_control = target_transport_->activationEpochControl(
+                    target_participant_, 0u);
+                bool source_initialized = false;
+                bool target_initialized = false;
+                const bool source_initialization_query = source_backend_->queryEvent(
+                    source_lane_.grant_initialization_event, source_device_.ordinal,
+                    &source_initialized);
+                const bool target_initialization_query = target_lane_.device.is_gpu() &&
+                    target_backend_->queryEvent(target_lane_.grant_initialization_event,
+                                                target_device_.ordinal, &target_initialized);
                 error_ =
                     "packet transaction terminal event did not complete"
+                    " grants(source/target)=" +
+                    std::to_string(reinterpret_cast<std::uintptr_t>(source_lane_.grant_device)) + "/" +
+                    std::to_string(reinterpret_cast<std::uintptr_t>(target_lane_.grant_device)) +
+                    " initialization(query/ready,query/ready)=" +
+                    std::to_string(source_initialization_query) + "/" +
+                    std::to_string(source_initialized) + "," +
+                    std::to_string(target_initialization_query) + "/" +
+                    std::to_string(target_initialized) +
+                    " admission(source_ready/target_ready/source_generation/target_generation)=" +
+                    std::to_string(std::atomic_ref(control.admission.ready_signal).load(std::memory_order_acquire)) + "/" +
+                    std::to_string(std::atomic_ref(target_control.admission.ready_signal).load(std::memory_order_acquire)) + "/" +
+                    std::to_string(std::atomic_ref(control.admission.last_generation).load(std::memory_order_acquire)) + "/" +
+                    std::to_string(std::atomic_ref(target_control.admission.last_generation).load(std::memory_order_acquire)) +
+                    " endpoint_last_timeline(continuation/follower)=" +
+                    std::to_string(control.continuation_status.observed_timeline) + "/" +
+                    std::to_string(control.follower_status.observed_timeline) +
                     " source(query/ready)=" +
                     std::to_string(source_query_ok) + "/" +
                     std::to_string(source_ready) +
@@ -1981,7 +2015,7 @@ namespace
                 return false;
             }
             const auto expected_live_rows = static_cast<std::int32_t>(
-                targetLiveRows(kRows));
+                targetLiveRows(live_rows_));
             if (target_live_rows != expected_live_rows)
             {
                 const auto &control =
@@ -2031,6 +2065,7 @@ namespace
                          ++column)
                     {
                         const float expected =
+                            row < live_rows_ &&
                             routeParticipant(original_slot) ==
                                     target_participant_
                                 ? kRouteWeightPattern[
@@ -2132,24 +2167,24 @@ namespace
                 *identity_, &traffic_error);
             const std::uint64_t expected_stage_count = kLayers.size();
             const std::uint64_t expected_rows =
-                targetLiveRows(kRows) * expected_stage_count;
+                targetLiveRows(live_rows_) * expected_stage_count;
             const std::uint64_t expected_entries =
-                targetLiveEntries(kRows) * expected_stage_count;
+                targetLiveEntries(live_rows_) * expected_stage_count;
             const std::uint64_t expected_dispatch_bytes =
                 moeOverlayDispatchPayloadBytes(
-                    targetLiveRows(kRows),
-                    targetLiveEntries(kRows),
+                    targetLiveRows(live_rows_),
+                    targetLiveEntries(live_rows_),
                     static_cast<std::uint32_t>(kDModel)) *
                 expected_stage_count;
             const std::uint64_t expected_return_bytes =
                 moeOverlayReturnPayloadBytes(
-                    targetLiveEntries(kRows),
+                    targetLiveEntries(live_rows_),
                     static_cast<std::uint32_t>(kDModel)) *
                 expected_stage_count;
             if (!traffic ||
                 traffic->dispatch_payload_bytes != expected_dispatch_bytes ||
                 traffic->dispatch_shared_hidden_bytes != (kUsesSingleRowDirectPacket ? 0u :
-                    targetLiveRows(kRows)*kDModel*sizeof(float)*expected_stage_count) ||
+                    targetLiveRows(live_rows_)*kDModel*sizeof(float)*expected_stage_count) ||
                 traffic->return_payload_bytes != expected_return_bytes ||
                 traffic->dispatch_live_rows != expected_rows ||
                 traffic->return_live_rows != expected_rows ||
@@ -2197,6 +2232,39 @@ namespace
             identity_.reset();
             terminals_recorded_ = false;
             return true;
+        }
+
+        /**
+         * @brief Change replay inputs after the preceding native terminals.
+         * @param live_rows Exact next live extent, bounded by captured geometry.
+         * @param bias New exactly representable source payload bias.
+         * @return True when original stream uploads completed successfully.
+         *
+         * Keep the old completed admission published: the queued-source proof
+         * must wait for its successor generation rather than reuse this one.
+         * No tensor address, capture geometry, or placement policy changes.
+         */
+        bool preparePublicationReplayInputs(int live_rows, float bias)
+        {
+            if (!identity_ || !terminals_recorded_ || source_queued_ahead_ ||
+                live_rows < 0 || live_rows > Rows)
+                return false;
+            bool source_ready = false;
+            bool target_ready = false;
+            if (!source_backend_->queryEvent(source_terminal_, 0, &source_ready) ||
+                !target_backend_->queryEvent(target_terminal_, 0, &target_ready) ||
+                !source_ready || !target_ready)
+                return false;
+            const auto &control = source_transport_->activationEpochControl(
+                target_participant_, 0u);
+            if (control.continuation_status.state !=
+                    static_cast<std::uint32_t>(MoEOverlayActivationEndpointState::Complete) ||
+                control.follower_status.state !=
+                    static_cast<std::uint32_t>(MoEOverlayActivationEndpointState::Complete))
+                return false;
+            live_rows_ = live_rows;
+            payload_bias_ = bias;
+            return initializeSourcePayload();
         }
 
         /** @return Stable diagnostic from the first failed setup/operation. */
@@ -2620,6 +2688,7 @@ namespace
         std::shared_ptr<const MoEExpertOwnerMap> joint_owners_;
         int target_participant_=kTargetParticipant;
         int live_rows_=Rows;
+        float payload_bias_ = 0.0f;
 
         /** @brief Submit one complete retained endpoint graph asynchronously. */
         static bool launchEndpoint(
@@ -2716,9 +2785,9 @@ namespace
         }
 
         /** @return Deterministic source activation value for one logical row. */
-        static float sourceValue(std::int32_t row, std::int32_t column)
+        float sourceValue(std::int32_t row, std::int32_t column) const
         {
-            return static_cast<float>(row * 100 + column) + 0.25f;
+            return static_cast<float>(row * 100 + column) + 0.25f + payload_bias_;
         }
 
         /** @brief Allocate and remember one exact-device buffer. */
@@ -3135,10 +3204,55 @@ namespace
             }
         }
 
+        /**
+         * @brief Diagnose an existing private grant only after abort has drained it.
+         * @param role Endpoint name in this fixture's timeout evidence.
+         * @param backend Original endpoint backend.
+         * @param stream Original endpoint stream, never a diagnostic replacement.
+         * @param terminal Event recorded after the existing abort publication.
+         * @param lane Original grant and mapped-lane owner retained until teardown.
+         *
+         * A copy on a stalled stream would itself block. Query the post-abort
+         * terminal first and skip inspection unless that original stream drained.
+         * This failure-only fixture observation adds no production state mirror.
+         */
+        static void reportRetiredGrant(
+            const char *role, IBackend *backend, void *stream, void *terminal,
+            const MoEOverlayMappedActivationDeviceLane &lane) noexcept
+        {
+            bool ready = false;
+            if (!backend || !stream || !terminal || !lane.device.is_gpu() ||
+                !lane.grant_device ||
+                !backend->queryEvent(terminal, lane.device.ordinal, &ready) || !ready)
+            {
+                std::cerr << "[packet-timeout] " << role
+                          << " post-abort grant inspection unavailable\n";
+                return;
+            }
+            MoEOverlayActivationDeviceEpochGrant observed{};
+            if (!backend->deviceToHost(&observed, lane.grant_device, sizeof(observed),
+                                       lane.device.ordinal, stream))
+            {
+                std::cerr << "[packet-timeout] " << role << " grant copy failed\n";
+                return;
+            }
+            std::cerr << "[packet-timeout] " << role
+                      << " post-abort generation=" << observed.generation
+                      << " endpoint=" << observed.endpoint
+                      << " state=" << observed.state
+                      << " code=" << observed.code
+                      << " physical_rows=" << observed.physical_rows
+                      << " last_published=" << observed.last_published_stage
+                      << " last_consumed=" << observed.last_consumed_stage
+                      << " digest_valid=" << observed.digest.valid()
+                      << '\n';
+        }
+
         DeviceId source_device_;
         DeviceId target_device_;
         IBackend *source_backend_ = nullptr;
         IBackend *target_backend_ = nullptr;
+        bool terminal_timeout_observed_ = false; ///< Enables failure-only post-drain diagnostics.
         std::unique_ptr<MoEOverlayNodeLocalRankBatchTransport> source_transport_;
         std::unique_ptr<MoEOverlayNodeLocalRankBatchTransport> target_transport_;
         MoEOverlayMappedActivationDeviceLane source_lane_;
@@ -3218,6 +3332,8 @@ namespace
     void runRoleAssignment(DeviceId source, DeviceId target,
                            std::uint64_t generations = 2u)
     {
+        SCOPED_TRACE(::testing::Message() << "physical_rows=" << Rows
+            << " backing_rows=" << BackingRows << " width=" << Width);
         ScopedActivationEpochPerfStats perf_stats;
         PacketRoundTrip<Rows, Width, BackingRows> transaction(source, target);
         ASSERT_TRUE(transaction.initialize()) << transaction.error();
@@ -3373,6 +3489,7 @@ namespace
 
         for (std::uint64_t generation = 1u; generation <= generations; ++generation)
         {
+            SCOPED_TRACE(::testing::Message() << "generation=" << generation);
             ASSERT_TRUE(transaction.poisonCapacitySuffix()) << transaction.error();
             const auto submit_begin = std::chrono::steady_clock::now();
             ASSERT_TRUE(transaction.submit(generation)) << transaction.error();
@@ -3403,6 +3520,46 @@ namespace
             /*generation=*/2u))
             << transaction.error();
         ASSERT_TRUE(transaction.awaitAndValidate()) << transaction.error();
+        ASSERT_TRUE(transaction.retire()) << transaction.error();
+    }
+
+    /**
+     * @brief Replay changing peer metadata through retained real packet graphs.
+     * @tparam Rows Original physical packet rows.
+     * @tparam BackingRows Original tensor capacity, including poisoned suffix.
+     * @param device Actual backend device used by both original endpoints.
+     */
+    template <int Rows, int BackingRows = Rows>
+    void runChangedPublicationReplay(DeviceId device)
+    {
+        PacketRoundTrip<Rows, kDModel, BackingRows> transaction(device, device);
+        ASSERT_TRUE(transaction.initialize()) << transaction.error();
+        ASSERT_TRUE(transaction.poisonCapacitySuffix()) << transaction.error();
+        ASSERT_TRUE(transaction.submit(1u)) << transaction.error();
+        ASSERT_TRUE(transaction.awaitAndValidate()) << transaction.error();
+        constexpr std::array<int, 4> live_rows{Rows, Rows - 1, 0, 1};
+        for (std::uint64_t generation = 2; generation <= 20; ++generation)
+        {
+            ASSERT_TRUE(transaction.preparePublicationReplayInputs(
+                live_rows[(generation - 2) % live_rows.size()],
+                static_cast<float>(generation * 16))) << transaction.error();
+            ASSERT_TRUE(transaction.poisonCapacitySuffix()) << transaction.error();
+            if (generation % 2 == 0)
+            {
+                // Submit before successor admission identity is published.
+                ASSERT_TRUE(transaction.queueSourceBeforePriorRetirement())
+                    << transaction.error();
+                ASSERT_TRUE(transaction.releaseQueuedSourceWithGeneration(generation))
+                    << transaction.error();
+            }
+            else
+            {
+                ASSERT_TRUE(transaction.retire()) << transaction.error();
+                // The existing follower-first submit delays descriptor publication.
+                ASSERT_TRUE(transaction.submit(generation)) << transaction.error();
+            }
+            ASSERT_TRUE(transaction.awaitAndValidate()) << transaction.error();
+        }
         ASSERT_TRUE(transaction.retire()) << transaction.error();
     }
 
@@ -5222,4 +5379,24 @@ TEST(Test__MappedActivationPacketCUDAAndROCm, ROCmExactRowsWithinFourRowBacking)
     runRoleAssignment<4, kDModel, 4>(DeviceId::rocm(0), DeviceId::rocm(0), 2);
     runRoleAssignment<3, kDModel, 4>(DeviceId::rocm(0), DeviceId::rocm(0), 20);
     runRoleAssignment<1, kDModel, 4>(DeviceId::rocm(0), DeviceId::rocm(0), 20);
+}
+
+/** @test CUDA retained packet graphs acquire changed admission and descriptor publications. */
+TEST(Test__MappedActivationPacketCUDAAndROCm, CUDAChangedPublicationReplay)
+{
+    ASSERT_NE(getCUDABackend(), nullptr);
+    ASSERT_GT(getCUDABackend()->deviceCount(), 0);
+    runChangedPublicationReplay<1>(DeviceId::cuda(0));
+    runChangedPublicationReplay<3, 4>(DeviceId::cuda(0));
+    runChangedPublicationReplay<4>(DeviceId::cuda(0));
+}
+
+/** @test ROCm retained packet graphs acquire changed admission and descriptor publications. */
+TEST(Test__MappedActivationPacketCUDAAndROCm, ROCmChangedPublicationReplay)
+{
+    ASSERT_NE(getROCmBackend(), nullptr);
+    ASSERT_GT(getROCmBackend()->deviceCount(), 0);
+    runChangedPublicationReplay<1>(DeviceId::rocm(0));
+    runChangedPublicationReplay<3, 4>(DeviceId::rocm(0));
+    runChangedPublicationReplay<4>(DeviceId::rocm(0));
 }

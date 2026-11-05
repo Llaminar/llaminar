@@ -431,6 +431,26 @@ the canonical image build, not only the locally installed GPU's target. Record
 the target set with the validation evidence. Passing native-device runtime
 tests does not prove register allocation on the other shipped targets.
 
+Parallel full-LTO RCCL builds use the builder-owned fixed linker installed by
+`scripts/docker/install-rocm-lto-linker.sh`. Its source/patch pins belong to
+`scripts/docker/rocm-release.env`; it recompiles one LLVM backend translation
+unit and links the SDK's matching static archives, preserving parallel native
+partitions. The installer proves original-code record loss and complete repaired
+records on every shipping target, including unchanged final device bytes. Each
+ISA has distinct object-partition YAML files; assembly-only diagnostic records
+cannot substitute for actual object-backend allocation evidence. The canonical
+spill parser reads every final kernel and helper. RCCL is a pinned external
+dependency: its complete resource evidence reports physical spill usage and does
+not certify zero spills, protocol correctness, native execution or performance.
+Absolute zero-spill enforcement remains unchanged for project kernel targets. Host `fmt`/utility links keep
+their host role; only the exact RCCL DSO output undergoes the native final-link
+audit. `V2_Integration_RCCLFinalParallelLTOResourceEvidence` verifies the
+source/compiler/DSO-bound compact proof without an SDK or accelerator. These are
+build and test artifacts, not inference-time source hashing or device probes.
+Local additional ISA selections require compiler proof for those explicit targets
+as well as the shipping set. `RCCL_LTO_LINKER_PREFIX` can name that separately
+proved compiler artifact; it cannot select an unqualified linker executable.
+
 ROCm user-space package/source pins and the stable SDK alias belong only to
 `scripts/docker/rocm-release.env`. Development and release images use the shared
 `scripts/docker/install-rocm.sh` installer; local builds must select that same

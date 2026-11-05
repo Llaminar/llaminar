@@ -12,6 +12,7 @@
 #include "PooledImmutableOwnerPlanOps.h"
 #include "kernels/common/DeviceRowRange.h"
 #include "transfer/CapturedTransferChannelProtocol.h"
+#include "collective/NativeCollectiveCompletion.h"
 #include <cstddef>
 namespace llaminar2::qwen4exp
 {
@@ -259,6 +260,13 @@ struct OwnerArgs
     OwnerInputs input;
     CapturedTransferReceiveCompletion original_invocation = CapturedTransferReceiveCompletion::notRequired();
 };
+/** @brief Native inline owner arguments; mapped owner argument layout remains unchanged. */
+struct NativeOwnerArgs
+{
+    OwnerArgs owner;
+    ncclLlaminarCompletionAuthority original_invocation;
+};
+static_assert(std::is_standard_layout_v<NativeOwnerArgs> && offsetof(NativeOwnerArgs, owner) == 0);
 /** @brief Coordinator inputs retain the original counted prefix, actual admission producer and acquired peers. */
 struct CoordinatorInputs
 {

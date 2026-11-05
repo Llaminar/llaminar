@@ -384,6 +384,9 @@ ALLOWANCES: tuple[Allowance, ...] = (
     ),
     *reviewed(
         "lifecycle",
+        # Sole cold metadata publication event, completed before raw sequence
+        # pointers reach independent streams; never a reset/append/capture wait.
+        ("src/v2/kernels/KVCacheMetadataInitialization.h", "completeColdKVMetadataInitialization", "backend_event", 1),
         # A graph can complete a command before its independently queued idle
         # service pass retires. Model destruction must join that exact finite
         # pass before freeing its cursor/inbox; no inference caller may join it.

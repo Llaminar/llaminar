@@ -238,6 +238,13 @@ public:
     /** @brief Hash storage preparation belongs to capture admission, never a token replay. */
     GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
     { return hash_prepared_?GraphLaunchPreparationPolicy::CaptureOnly:GraphLaunchPreparationPolicy::None; }
+    /**
+     * @brief Authenticate the original typed hash output without observing device values.
+     * @param root Original packed-ID allocation. @param buffer Original arena role.
+     * @param offset Exact byte subview. @param bytes Complete declared INT64 output extent.
+     * @return True only for the existing NgramHash operation and its unchanged output binding.
+     */
+    bool matchesNgramHashOutput(const TensorBase* root,BufferId buffer,std::size_t offset,std::size_t bytes)const noexcept;
     /** @brief Return the semantic operation tag without inspecting live device state. */
     ComputeStageType type() const override;
     /** @brief Distinguish an additional captured diagnostic input view from ordinary normalization. */

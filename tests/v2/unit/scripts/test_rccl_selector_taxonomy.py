@@ -83,18 +83,27 @@ class SelectorProofTests(unittest.TestCase):
         # The whole ordered pin remains mandatory: adding shared-file and thread repairs must
         # not disconnect selector, protocol or small-AllGather source identities.
         self.assertIn(
-            '${RCCL_GIT_REF}-capture-${rccl_capture_patch_sha}'
+            '${RCCL_GIT_REF}-completed-${rccl_completed_patch_sha}-capture-${rccl_capture_patch_sha}'
             '-rows-${rccl_rows_patch_sha}-storage-${rccl_storage_patch_sha}'
             '-shm-${rccl_shm_patch_sha}-selector-${rccl_selector_patch_sha}-thread-${rccl_thread_patch_sha}'
             '-protocol-${rccl_protocol_patch_sha}-smallag-${rccl_small_allgather_patch_sha}',
             (ROOT / 'Dockerfile').read_text())
         self.assertIn(
-            '${RCCL_COMMIT}-capture-${RCCL_CAPTURE_PATCH_HASH}'
+            '${RCCL_COMMIT}-completed-${RCCL_COMPLETED_PATCH_HASH}-capture-${RCCL_CAPTURE_PATCH_HASH}'
             '-rows-${RCCL_ROWS_PATCH_HASH}-storage-${RCCL_HOST_STORAGE_PATCH_HASH}'
             '-shm-${RCCL_SHM_PATCH_HASH}-selector-${RCCL_SELECTOR_PATCH_HASH}-thread-${RCCL_THREAD_PATCH_HASH}'
             '-protocol-${RCCL_PROTOCOL_PATCH_HASH}-smallag-${RCCL_SMALL_ALLGATHER_PATCH_HASH}',
             (ROOT / 'src/v2/CMakeLists.txt').read_text())
         self.assertIn(patch, (ROOT / 'src/v2/CMakeLists.txt').read_text())
+        # Compiler provenance precedes, and never truncates, the strict repair suffix.
+        self.assertIn(
+            'targets-${rccl_target_hash}-llvm-lto-${rccl_lto_receipt_sha}'
+            '-producer-${rccl_lto_producer_sha}-${RCCL_GIT_REF}-completed-',
+            (ROOT / 'Dockerfile').read_text())
+        self.assertIn(
+            'string(PREPEND RCCL_BUILD_ID "targets-${RCCL_TARGET_POLICY_HASH}'
+            '-llvm-lto-${RCCL_LTO_RECEIPT_HASH}-producer-${RCCL_LTO_PRODUCER_HASH}-")',
+            (ROOT / 'src/v2/CMakeLists.txt').read_text())
 
     def test_missing_each_native_pin_and_closure_rejects(self):
         """All five real source/enum files and compiler/receipt metadata are mandatory."""

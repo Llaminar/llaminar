@@ -116,6 +116,15 @@ namespace llaminar2
     {
         if (config.pp_stage_config)
             return true;
+        if (graph_config.ngram_replicated_ple_cohort && graph_config.tp_ctx &&
+            graph_config.ngram_replicated_ple_cohort->requiresParentOwnedNativeMaterialization(
+                *graph_config.tp_ctx, graph_config.default_device, graph_config.tp_device_idx))
+        {
+            // The original Rank must own ALL child arenas before a native
+            // capture can fail. Its existing concurrent serving-family
+            // materializer seals these exact children before readiness.
+            return true;
+        }
 
         const bool cpu_expert_family = graph_config.default_device.is_cpu() &&
             (architecture == "qwen35moe" || architecture == "qwen4exp") && graph_config.moe.num_experts > 0;

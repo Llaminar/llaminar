@@ -65,6 +65,7 @@ export PATH="${ROCM_PATH}/bin:${ROCM_PATH}/lib/llvm/bin:${PATH}"
 export LD_LIBRARY_PATH="${ROCM_PATH}/lib:${ROCM_PATH}/lib/llvm/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
 if [[ "${MODE}" != runtime ]]; then
+    bash "${rocm_script_dir}/install-rocm-lto-linker.sh"
     bash "${rocm_script_dir}/install-hip-graph-runtime.sh"
     bash "${rocm_script_dir}/install-rocblas.sh"
 fi

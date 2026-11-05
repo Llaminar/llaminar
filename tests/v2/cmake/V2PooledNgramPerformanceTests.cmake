@@ -80,21 +80,33 @@ if(HAVE_CUDA OR HAVE_ROCM)
         endforeach()
         list(REMOVE_DUPLICATES _locks)
         list(REMOVE_DUPLICATES _backends)
-        foreach(_tokens 1 8 64 512)
-            math(EXPR _ids "16 * ${_tokens}")
-            foreach(_scenario warm_hits alternating_sets mixed churn empty duplicate_control)
-                set(_slots "${_ids}")
-                if(_scenario STREQUAL "churn")
-                    math(EXPR _slots "${_ids} / 2")
-                endif()
-                add_v2_test(V2_Perf_PooledNgram_${_placement}_M${_tokens}_${_scenario}
-                    COMMAND $<TARGET_FILE:v2_perf_pooled_ngram_lookup>
-                        --placement ${_kind} --continuation ${_source} --owner ${_owner}
-                        --tokens ${_tokens} --capacity-tokens ${_tokens} --gpu-slots ${_slots}
-                        --ram-slots 2 --locality scattered --scenario ${_scenario} --samples 5 --table-rows 1048576
-                    LABELS "V2;Performance;Ngram;Pooled;NativeReplay;${_backends};JSON"
-                    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30 RESOURCE_LOCK "${_locks}"
-                    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=${_skip_cuda};LLAMINAR_SKIP_ROCM_STARTUP=${_skip_rocm};LLAMINAR_LOG_LEVEL=ERROR")
+        foreach(_source_backing ssd ram)
+            set(_source_args)
+            set(_source_suffix "")
+            set(_source_ram_slots 2)
+            set(_source_label SourceSSD)
+            if(_source_backing STREQUAL "ram")
+                set(_source_args --source-backing ram)
+                set(_source_suffix _RAMSource)
+                set(_source_ram_slots 0)
+                set(_source_label SourceRAM)
+            endif()
+            foreach(_tokens 1 8 64 512)
+                math(EXPR _ids "16 * ${_tokens}")
+                foreach(_scenario warm_hits alternating_sets mixed churn empty duplicate_control)
+                    set(_slots "${_ids}")
+                    if(_scenario STREQUAL "churn")
+                        math(EXPR _slots "${_ids} / 2")
+                    endif()
+                    add_v2_test(V2_Perf_PooledNgram_${_placement}_M${_tokens}_${_scenario}${_source_suffix}
+                        COMMAND $<TARGET_FILE:v2_perf_pooled_ngram_lookup>
+                            --placement ${_kind} ${_source_args} --continuation ${_source} --owner ${_owner}
+                            --tokens ${_tokens} --capacity-tokens ${_tokens} --gpu-slots ${_slots}
+                            --ram-slots ${_source_ram_slots} --locality scattered --scenario ${_scenario} --samples 5 --table-rows 1048576
+                        LABELS "V2;Performance;Ngram;Pooled;NativeReplay;${_backends};${_source_label};JSON"
+                        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30 RESOURCE_LOCK "${_locks}"
+                        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=${_skip_cuda};LLAMINAR_SKIP_ROCM_STARTUP=${_skip_rocm};LLAMINAR_LOG_LEVEL=ERROR")
+                endforeach()
             endforeach()
         endforeach()
     endforeach()
@@ -135,7 +147,7 @@ if(TARGET v2_perf_pooled_ngram_lookup AND NOT V2_PERF_TESTS_ONLY)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledConsumerLocalEconomyDeclarations)
 endif()
 
-# Four discoverable actual shared-source cells retain the existing source trace,
+# Discoverable actual shared-source populations retain the existing source trace,
 # original process owner and two request intervals on the same captured graphs.
 # Performance is deliberately separate from production-preflight correctness.
 if(TARGET v2_perf_pooled_ngram_lookup)
@@ -150,25 +162,47 @@ if(TARGET v2_perf_pooled_ngram_lookup)
             else()
                 set(_group_skip_rocm 0)
             endif()
-            foreach(_group_mode C0Alternating PositiveChurn)
-                if(_group_mode STREQUAL "C0Alternating")
-                    set(_group_slots 0)
-                    set(_group_scenario alternating_sets)
-                else()
-                    set(_group_slots 64)
-                    set(_group_scenario churn)
-                endif()
-                add_v2_test(V2_Perf_PooledNgram_ConsumerLocal${_group_backend}2_${_group_mode}ResetReplay
-                    COMMAND $<TARGET_FILE:v2_perf_pooled_ngram_lookup>
-                        --placement consumer_local --continuation ${_group_cli}:0
-                        --consumers ${_group_cli}:0,${_group_cli}:1
-                        --tokens 8 --capacity-tokens 64 --gpu-slots ${_group_slots}
-                        --ram-slots 8 --locality scattered --scenario ${_group_scenario}
-                        --samples 5 --requests 2 --cold-attempt 0 --table-rows 1048576
-                    LABELS "V2;Performance;Ngram;Pooled;ConsumerLocal;SharedSource;NativeReplay;Diagnostic;Unprofiled;${_group_backend};JSON"
-                    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
-                    RESOURCE_LOCK "${_group_cli}_gpu_0;${_group_cli}_gpu_1"
-                    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=${_group_skip_cuda};LLAMINAR_SKIP_ROCM_STARTUP=${_group_skip_rocm};LLAMINAR_LOG_LEVEL=ERROR")
+            foreach(_group_count 1 2 4 8)
+                set(_group_consumers)
+                set(_group_locks)
+                math(EXPR _group_last "${_group_count} - 1")
+                foreach(_group_index RANGE 0 ${_group_last})
+                    list(APPEND _group_consumers "${_group_cli}:${_group_index}")
+                    list(APPEND _group_locks "${_group_cli}_gpu_${_group_index}")
+                endforeach()
+                list(JOIN _group_consumers "," _group_consumer_cli)
+                foreach(_group_backing ssd ram)
+                    set(_group_source_args)
+                    set(_group_source_suffix "")
+                    set(_group_ram_slots 8)
+                    set(_group_source_label SourceSSD)
+                    if(_group_backing STREQUAL "ram")
+                        set(_group_source_args --source-backing ram)
+                        set(_group_source_suffix _RAMSource)
+                        set(_group_ram_slots 0)
+                        set(_group_source_label SourceRAM)
+                    endif()
+                    foreach(_group_mode C0Alternating PositiveChurn)
+                        if(_group_mode STREQUAL "C0Alternating")
+                            set(_group_slots 0)
+                            set(_group_scenario alternating_sets)
+                        else()
+                            set(_group_slots 64)
+                            set(_group_scenario churn)
+                        endif()
+                        add_v2_test(V2_Perf_PooledNgram_ConsumerLocal${_group_backend}${_group_count}_${_group_mode}ResetReplay${_group_source_suffix}
+                            COMMAND $<TARGET_FILE:v2_perf_pooled_ngram_lookup>
+                                --placement consumer_local ${_group_source_args} --continuation ${_group_cli}:0
+                                --consumers ${_group_consumer_cli}
+                                --tokens 8 --capacity-tokens 64 --gpu-slots ${_group_slots}
+                                --ram-slots ${_group_ram_slots} --locality scattered --scenario ${_group_scenario}
+                                --samples 5 --requests 2 --cold-attempt 0 --table-rows 1048576
+                            LABELS "V2;Performance;Ngram;Pooled;ConsumerLocal;SharedSource;NativeReplay;Diagnostic;Unprofiled;${_group_backend};Devices${_group_count};${_group_source_label};JSON"
+                            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+                            RESOURCE_LOCK "${_group_locks}"
+                            ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=${_group_skip_cuda};LLAMINAR_SKIP_ROCM_STARTUP=${_group_skip_rocm};LLAMINAR_LOG_LEVEL=ERROR")
+                    endforeach()
+                endforeach()
             endforeach()
         endif()
     endforeach()

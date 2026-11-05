@@ -170,7 +170,8 @@ ImmutableRowTableLayoutGeometry ImmutableRowTableLayoutGeometry::checked(
     std::vector<ImmutableRowTableReplicaGroup> replicas,
     std::optional<PhysicalMemoryAllocatorIdentity> coordinator,std::uint64_t inflight,
     ImmutableRowTableAdaptiveGPUDomain gpu_domain, std::optional<PeerAccessCoverage> peer_access,
-    std::vector<ImmutableRowTableReaderPeerAccess> reader_peer_access) {
+    std::vector<ImmutableRowTableReaderPeerAccess> reader_peer_access,
+    std::optional<PhysicalMemoryAllocatorIdentity> declared_transport_coordinator) {
     if (gpu_domain != ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator &&
         gpu_domain != ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal)
         throw std::invalid_argument("Unknown adaptive GPU domain policy");
@@ -228,12 +229,6 @@ ImmutableRowTableLayoutGeometry ImmutableRowTableLayoutGeometry::checked(
             if(!consumer.device.is_gpu() || consumer.world_rank!=original.world_rank || consumer.device.type!=original.device.type)
                 throw std::invalid_argument("Directed readers require original homogeneous rank-local GPU membership");
     }
-    if (peer_access && std::none_of(owners.begin(), owners.end(), [&](const auto& owner) {
-            return owner.key.tier == ImmutableRowStorage::VRAM &&
-                std::find(consumers.begin(),consumers.end(),owner.key.allocator)==consumers.end() &&
-                owner.key.allocator.device.type == consumers.front().device.type;
-        }))
-        throw std::invalid_argument("Directed geometry has no declared same-vendor remote storage owner");
     // Reader transport is a separate required star. Do not let physical owner
     // observations authorize a compute-reader edge or silently reorder endpoints.
     std::sort(reader_peer_access.begin(), reader_peer_access.end(),
@@ -255,6 +250,34 @@ ImmutableRowTableLayoutGeometry ImmutableRowTableLayoutGeometry::checked(
     }
     if (!reader_peer_access.empty() && reader_peer_access.size() + 1 != consumers.size())
         throw std::invalid_argument("Shared reader peer metadata omits a declared compute reader");
+    // A compute reader can also own cache payload. Remote is relative to the
+    // original authored coordinator, never to membership in the consumer set.
+    // C0 has no directory owner: retain the already-authenticated declaration or
+    // complete reader star instead of guessing from sorted consumer order.
+    auto directed_coordinator = coordinator;
+    if (!reader_peer_access.empty()) {
+        const auto original = reader_peer_access.front().coordinator;
+        if (directed_coordinator && *directed_coordinator != original)
+            throw std::invalid_argument("Directed storage and reader coordinators disagree");
+        directed_coordinator = original;
+    }
+    if (declared_transport_coordinator) {
+        if (residency != ImmutableRowTableResidency::Adaptive ||
+            gpu_domain != ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator ||
+            !declared_transport_coordinator->valid() || !declared_transport_coordinator->device.is_gpu() ||
+            std::find(consumers.begin(), consumers.end(), *declared_transport_coordinator) == consumers.end() ||
+            (directed_coordinator && *directed_coordinator != *declared_transport_coordinator))
+            throw std::invalid_argument("Declared transport coordinator changed its original consumer/directory authority");
+        directed_coordinator = declared_transport_coordinator;
+    }
+    if (!directed_coordinator && consumers.size() == 1) directed_coordinator = consumers.front();
+    if (peer_access && (!directed_coordinator ||
+        std::none_of(owners.begin(), owners.end(), [&](const auto& owner) {
+            return owner.key.tier == ImmutableRowStorage::VRAM &&
+                owner.key.allocator != *directed_coordinator &&
+                owner.key.allocator.device.type == directed_coordinator->device.type;
+        })))
+        throw std::invalid_argument("Directed geometry has no declared same-vendor remote storage owner");
     std::uint64_t records=0;
     if(residency==ImmutableRowTableResidency::Adaptive) {
         if(services.empty())throw std::invalid_argument("Adaptive cache requires one explicit original host backing");

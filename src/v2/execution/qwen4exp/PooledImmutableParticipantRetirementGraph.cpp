@@ -8,6 +8,7 @@
  */
 #include "PooledImmutableParticipantRetirementGraph.h"
 #include "PooledImmutableReplicatedReaderGraph.h"
+#include "PooledImmutableReplicatedReaderGraph.h"
 #include "PooledImmutableDirectedOperation.h"
 #include "PooledImmutableDirectedMessageGeometry.h"
 #include "execution/compute_stages/stages/qwen4exp/PooledImmutableNativePhaseStage.h"
@@ -51,19 +52,19 @@ std::shared_ptr<const PooledImmutableCapturedRetirementWave> PooledImmutableCapt
     if(isGraphCaptureActive() || !read || !memory)throw std::invalid_argument("Retirement needs original cold read/PMA");read->requireCurrent();
     const auto source=read->publication()->sourceWave();const auto pin=source->previous()->previous()->pin();const auto forward=pin->forward();
     forward->ownerStorage()->requireAuthority(memory);forward->coordinatorStorage()->requireAuthority(memory);
-    if(!forward->channel_ || !pin->channel_ || !forward->declaration().capturedChannelTransport())throw std::invalid_argument("Retirement native/rank transport needs complete qualified factory");
+    if(!forward->channel_ || !pin->channel_ || (!forward->channel_.nativeCollective() && !forward->declaration().capturedChannelTransport()))throw std::invalid_argument("Retirement native/rank transport needs complete qualified factory");
     auto out=std::shared_ptr<PooledImmutableCapturedRetirementWave>(new PooledImmutableCapturedRetirementWave(read,memory));
-    const auto own=forward->ownerStorage()->roots(),src=source->boundary()->pooledStorage()->roots();const auto& o=forward->ownerStorage()->plan().parameters();const auto& s=source->boundary()->pooledStorage()->geometry().parameters();auto& transfer=TransferEngine::instance();
+    const auto own=forward->ownerStorage()->roots(),src=source->boundary()->pooledStorage()->roots();const auto& o=forward->ownerStorage()->plan().parameters();const auto& s=source->boundary()->pooledStorage()->geometry().parameters();
     for(unsigned i=0;i<3;++i){const auto role=static_cast<PooledRetirementWireRole>(i);if(role==PooledRetirementWireRole::Releases && !o.native.reply_capacity)continue;
         const auto from=out->source(role),to=out->destination(role);const bool back=reverse(role);const auto key=((forward->declaration().identity()^(160+i))*1099511628211ULL)|1;
-        auto send=transfer.bindCapturedTransfer(back?pin->channel_:forward->channel_,CapturedTransferEndpoint::Producer,{key,from.bytes},root(back?own:src,from.buffer),from.offset);
-        auto receive=transfer.bindCapturedTransfer(back?pin->channel_:forward->channel_,CapturedTransferEndpoint::Consumer,{key,from.bytes},root(back?src:own,to.buffer),to.offset);
-        if(role==PooledRetirementWireRole::Releases){send=transfer.bindDeviceCountedTransfer(std::move(send),own.native,o.native.progress+offsetof(n::OwnerProgress,release_bytes));receive=transfer.bindDeviceCountedTransfer(std::move(receive),src.native,s.offsets.record_bytes);}
+        auto send=(back?pin->channel_:forward->channel_).bind(CapturedTransferEndpoint::Producer,{key,from.bytes},root(back?own:src,from.buffer),from.offset);
+        auto receive=(back?pin->channel_:forward->channel_).bind(CapturedTransferEndpoint::Consumer,{key,from.bytes},root(back?src:own,to.buffer),to.offset);
+        if(role==PooledRetirementWireRole::Releases){send=std::move(send).withDeviceCounted(own.native,o.native.progress+offsetof(n::OwnerProgress,release_bytes),PooledNativeCountedMessage::Releases);receive=std::move(receive).withDeviceCounted(src.native,s.offsets.record_bytes,PooledNativeCountedMessage::Releases);}
         out->bindings_[i].emplace(std::move(send),std::move(receive));
     }out->requireCurrent();return out;
 }
 void PooledImmutableCapturedRetirementWave::requireCurrent()const{read_->requireCurrent();const auto source=read_->publication()->sourceWave();pooledSourceOwner(source)->requireAuthority(memory_);source->boundary()->pooledStorage()->coordinator()->requireAuthority(memory_);source->boundary()->pooledStorage()->captureIdentity();}
-const CapturedTransferBinding& PooledImmutableCapturedRetirementWave::binding(PooledRetirementWireRole role,CapturedTransferEndpoint side)const{requireCurrent();const auto& pair=bindings_[index(role)];if(!pair || (side!=CapturedTransferEndpoint::Producer && side!=CapturedTransferEndpoint::Consumer))throw std::invalid_argument("Retirement missing/C0 endpoint");return side==CapturedTransferEndpoint::Producer?pair->first:pair->second;}
+const PooledImmutableTransferBinding& PooledImmutableCapturedRetirementWave::binding(PooledRetirementWireRole role,CapturedTransferEndpoint side)const{requireCurrent();const auto& pair=bindings_[index(role)];if(!pair || (side!=CapturedTransferEndpoint::Producer && side!=CapturedTransferEndpoint::Consumer))throw std::invalid_argument("Retirement missing/C0 endpoint");return side==CapturedTransferEndpoint::Producer?pair->first:pair->second;}
 PooledNativeOperandSpans PooledImmutableCapturedRetirementWave::ownerInputs(n::OwnerAction action)const{
     requireCurrent();const auto source=read_->publication()->sourceWave();const auto owner=pooledSourceOwner(source);const auto& o=owner->plan().parameters();
     auto out=source->previous()->previous()->pin()->forward()->ownerInputs(n::OwnerAction::Begin);
@@ -86,26 +87,26 @@ public:
     q::PooledImmutableDirectedTransferOperation directedTransferOperation()const{
         requireDeclarations();const auto& binding=edge_->binding(role_,side_);
         return {q::PooledImmutableDirectedWireFamily::Retirement,static_cast<std::uint32_t>(role_),side_,
-            binding.message().bytes,binding.extentSource(),binding.hasSourceSlice()};
+            binding.message().bytes,binding.extentSource(),binding.hasSourceSlice(),binding.nativeCollective()?q::PooledImmutableDirectedTransportKind::NativeCollective:q::PooledImmutableDirectedTransportKind::CapturedChannel};
     }
 
     /** @brief Retain the exact owner/arena/role and freeze the original transfer identity. */
     PooledRetirementTransferStage(BufferArena& arena,std::shared_ptr<const q::PooledImmutableCapturedRetirementWave> edge,q::PooledRetirementWireRole role,CapturedTransferEndpoint side)
-        :IComputeStage(ownerEndpoint(role,side)?q::pooledSourceOwner(edge->read()->publication()->sourceWave())->plan().allocator().device:edge->read()->publication()->sourceWave()->boundary()->device()),arena_(&arena),edge_(std::move(edge)),role_(role),side_(side){requireDeclarations();identity_=graphCaptureVariantSignature();}
+        :IComputeStage(ownerEndpoint(role,side)?q::pooledSourceOwner(edge->read()->publication()->sourceWave())->plan().allocator().device:edge->read()->publication()->sourceWave()->boundary()->device()),arena_(&arena),edge_(std::move(edge)),role_(role),side_(side){requireDeclarations();identity_=graphCaptureVariantSignature();native_collective_=edge_->binding(role_,side_).nativeCollective();}
     /** @brief Acquire only exact original setup events on the participant's nondefault stream. */
     bool prepareGraphLaunch(IDeviceContext* context,void* stream)override{
         if(!context || context->deviceId()!=device() || !stream || reinterpret_cast<uintptr_t>(stream)<=2)throw std::invalid_argument("Retirement requires exact participant/nondefault stream");
         requireDeclarations();if(identity_!=graphCaptureVariantSignature())throw std::logic_error("Retirement capture drift");
         const auto source=edge_->read()->publication()->sourceWave();
         if(ownerEndpoint(role_,side_))q::pooledSourceOwner(source)->acquireSetup(stream);else source->boundary()->pooledStorage()->acquireSetup(stream);
-        setGPUStream(stream);return true;
+        edge_->binding(role_,side_).prepare(stream);setGPUStream(stream);return true;
     }
     /** @brief Enqueue the exact fixed/counted transfer under original event-aware publication. */
-    bool execute(IDeviceContext* context)override{if(!context || context->deviceId()!=device())throw std::invalid_argument("Retirement changed participant");requireDeclarations();if(identity_!=graphCaptureVariantSignature())throw std::logic_error("Retirement binding changed");TransferEngine::instance().enqueueCapturedTransfer(edge_->binding(role_,side_),requireGPUStream());return true;}
+    bool execute(IDeviceContext* context)override{if(!context || context->deviceId()!=device())throw std::invalid_argument("Retirement changed participant");requireDeclarations();if(identity_!=graphCaptureVariantSignature())throw std::logic_error("Retirement binding changed");edge_->binding(role_,side_).enqueue(requireGPUStream());return true;}
     /** @return Explicit participant-local graph collective role. */
     ComputeStageType type()const override{return ComputeStageType::QWEN4EXP_POOLED_DIRECTED_TRANSFER;}
     /** @return This original bound endpoint executes native device-counted transfer kernels, independently from collective-runtime capture. */
-    CollectiveGraphCaptureAuthority collectiveGraphCaptureAuthority()const noexcept override{return CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;}
+    CollectiveGraphCaptureAuthority collectiveGraphCaptureAuthority()const noexcept override{return native_collective_?CollectiveGraphCaptureAuthority::RuntimeBackend:CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;}
     /** @return Exact diagnostic leaf family. */
     std::string name()const override{return "PooledImmutableDirectedRetirement";}
     /** @return Setup waits belong only to retained cold capture. */
@@ -139,7 +140,9 @@ private:
         if(arena_->getTensor(span.buffer)!=original.get())throw std::logic_error("Retirement replaced original payload/metadata root");
         if(role_==q::PooledRetirementWireRole::Releases){const auto role=side_==CapturedTransferEndpoint::Producer?BufferId::QFN_POOLED_OWNER_NATIVE:BufferId::QFN_POOLED_SOURCE_NATIVE;if(arena_->getTensor(role)!=roots.native.get())throw std::logic_error("Retirement replaced original UInt64 extent root");}
     }
-    BufferArena* arena_;std::shared_ptr<const q::PooledImmutableCapturedRetirementWave> edge_;q::PooledRetirementWireRole role_;CapturedTransferEndpoint side_;uint64_t identity_=0;
+    BufferArena* arena_;std::shared_ptr<const q::PooledImmutableCapturedRetirementWave> edge_;q::PooledRetirementWireRole role_;CapturedTransferEndpoint side_;
+    bool native_collective_=false; // Cold-selected original transport; capture policy never probes runtime state.
+    uint64_t identity_=0;
 };
 /** @brief Reject every duplicate/existing target name before any graph node is added. */
 void freeNames(const ComputeGraph& graph,const std::vector<std::string>& names){std::set<std::string> unique;for(const auto& name:names)if(name.empty() || graph.getNode(name) || !unique.insert(name).second)throw std::invalid_argument("Retirement changed original unique node names");}
@@ -147,7 +150,8 @@ void freeNames(const ComputeGraph& graph,const std::vector<std::string>& names){
 q::PooledImmutableReadParticipant readMember(const q::PooledImmutableRetirementParticipant& member){return std::visit([](const auto& value)->q::PooledImmutableReadParticipant{if(!value)throw std::invalid_argument("Retirement lost actual member");using T=std::decay_t<decltype(*value)>;if constexpr(std::is_same_v<T,q::PooledImmutableLocalOwnerBinding>)return value;else return value->read();},member);}
 }
 PooledPinParticipantNodes appendPooledRetirementOwner(ComputeGraph& graph,BufferArena& arena,
-    std::shared_ptr<const q::PooledImmutableCapturedRetirementWave> original,std::shared_ptr<const q::IPooledImmutableNativeKernels> code,const std::string& lastReadSent,const std::string& prefix){
+    std::shared_ptr<const q::PooledImmutableCapturedRetirementWave> original,std::shared_ptr<const q::IPooledImmutableNativeKernels> code,const std::string& lastReadSent,const std::string& prefix,
+    const PooledImmutableReplicatedConsumerCompletion* consumer){
     if(isGraphCaptureActive() || !original || !code || prefix.empty())throw std::invalid_argument("Retirement owner needs original cold read/code");original->requireCurrent();
     requirePooledReadOwnerCompletion(graph,original->read(),lastReadSent);const auto owner=q::pooledSourceOwner(original->read()->publication()->sourceWave());const auto device=owner->plan().allocator().device;
     if(code->backend()!=device.type)throw std::invalid_argument("Retirement owner changed backend code");const bool positive=owner->plan().parameters().native.reply_capacity!=0;
@@ -157,6 +161,13 @@ PooledPinParticipantNodes appendPooledRetirementOwner(ComputeGraph& graph,Buffer
     const auto phase=[&](n::OwnerAction action){return std::make_unique<PooledImmutableNativePhaseStage>(arena,code,PooledImmutableNativePhaseStage::Owner{action,owner,q::PooledImmutableOwnerOperands(action,owner->plan(),original->ownerInputs(action))});};
     stages.push_back(wire(q::PooledRetirementWireRole::ReadersRetired,CapturedTransferEndpoint::Consumer));stages.push_back(phase(n::OwnerAction::AcquireReaderRetirement));stages.push_back(phase(n::OwnerAction::DrainSourceFailure));stages.push_back(phase(n::OwnerAction::Release));stages.push_back(positive?wire(q::PooledRetirementWireRole::Releases,CapturedTransferEndpoint::Producer):nullptr);stages.push_back(phase(n::OwnerAction::Retire));stages.push_back(phase(n::OwnerAction::RetiredWire));stages.push_back(wire(q::PooledRetirementWireRole::Retired,CapturedTransferEndpoint::Producer));
     auto prior=lastReadSent;for(size_t i=0;i<stages.size();++i)if(stages[i]){graph.addNode(names[i],std::move(stages[i]),device);graph.addDependency(names[i],prior);prior=names[i];}
+    if (consumer) {
+        requirePooledReplicatedConsumerCompletion(graph, *consumer);
+        if (consumer->reader->originalReader().device() != device ||
+            consumer->transport->remote(owner->plan().parameters().owner.coordinate()).retirement != original)
+            throw std::invalid_argument("Inline retirement changed its original colocated reader/physical owner");
+        graph.addDependency(names.front(), consumer->sent);
+    }
     return {names.front(),prior};
 }
 PooledImmutableRetirementCompletion appendPooledRetirementCoordinator(ComputeGraph& graph,BufferArena& arena,
@@ -210,10 +221,32 @@ PooledImmutableRetirementCompletion appendPooledRetirementCoordinator(ComputeGra
     graph.addDependency(out.finished,prior);graph.addDependency(out.observed,out.finished);out.coordinator={out.readersRetired,out.observed};return out;
 }
 void requirePooledRetirementOwnerCompletion(const ComputeGraph& graph,
-    const std::shared_ptr<const q::PooledImmutableCapturedRetirementWave>& original,const std::string& retiredSent){
+    const std::shared_ptr<const q::PooledImmutableCapturedRetirementWave>& original,const std::string& retiredSent,
+    const PooledImmutableReplicatedConsumerCompletion* consumer){
     if(isGraphCaptureActive() || !original || retiredSent.empty())throw std::invalid_argument("Retirement owner completion needs original cold holder");original->requireCurrent();
     const auto owner=q::pooledSourceOwner(original->read()->publication()->sourceWave());const auto device=owner->plan().allocator().device;
-    const auto prior=[&](const std::string& name){const auto* node=graph.getNode(name);if(!node || node->device!=device || node->dependencies.size()!=1)throw std::invalid_argument("Retirement owner lost exact original predecessor");return node->dependencies.front();};
+    if (consumer) {
+        requirePooledReplicatedConsumerCompletion(graph, *consumer);
+        if (consumer->reader->originalReader().device() != device ||
+            consumer->transport->remote(owner->plan().parameters().owner.coordinate()).retirement != original)
+            throw std::invalid_argument("Inline retirement completion replaced its original colocated reader");
+    }
+    const auto prior = [&](const std::string& name) {
+        const auto* node = graph.getNode(name);
+        if (!node || node->device != device)
+            throw std::invalid_argument("Retirement owner lost its exact original participant");
+        const auto* stage = dynamic_cast<const PooledRetirementTransferStage*>(node->stage.get());
+        if (consumer && stage && stage->matches(original.get(), q::PooledRetirementWireRole::ReadersRetired,
+                CapturedTransferEndpoint::Consumer)) {
+            const auto ack = std::find(node->dependencies.begin(), node->dependencies.end(), consumer->sent);
+            if (node->dependencies.size() != 2 || ack == node->dependencies.end())
+                throw std::invalid_argument("Inline retirement lost its exact original reader ACK dependency");
+            return node->dependencies[ack == node->dependencies.begin() ? 1 : 0];
+        }
+        if (node->dependencies.size() != 1)
+            throw std::invalid_argument("Retirement owner lost exact original predecessor");
+        return node->dependencies.front();
+    };
     const auto endpoint=[&](const std::string& name,q::PooledRetirementWireRole role,CapturedTransferEndpoint side){const auto* node=graph.getNode(name);const auto* stage=node?dynamic_cast<const PooledRetirementTransferStage*>(node->stage.get()):nullptr;if(!stage || !stage->matches(original.get(),role,side) || node->device!=device)throw std::invalid_argument("Retirement owner replaced original endpoint");};
     const auto phase=[&](const std::string& name,n::OwnerAction action){const auto* node=graph.getNode(name);const auto* stage=node?dynamic_cast<const PooledImmutableNativePhaseStage*>(node->stage.get()):nullptr;const auto* value=stage?std::get_if<PooledImmutableNativePhaseStage::Owner>(&stage->phase()):nullptr;const q::PooledImmutableOwnerOperands expected(action,owner->plan(),original->ownerInputs(action));if(!node || node->device!=device || !value || value->action!=action || value->storage!=owner || value->operands.declarationIdentity()!=expected.declarationIdentity())throw std::invalid_argument("Retirement owner replaced original physical phase/operands");};
     auto current=retiredSent;endpoint(current,q::PooledRetirementWireRole::Retired,CapturedTransferEndpoint::Producer);current=prior(current);
@@ -273,4 +306,23 @@ std::optional<qwen4exp::PooledImmutableDirectedTransferOperation> describePooled
     if(const auto* original=dynamic_cast<const PooledRetirementTransferStage*>(&stage))return original->directedTransferOperation();
     return std::nullopt;
 }
+std::string findPooledRetirementOwnerCompletion(const ComputeGraph& graph,
+    const std::shared_ptr<const q::PooledImmutableCapturedRetirementWave>& original,
+    const PooledImmutableReplicatedConsumerCompletion& consumer)
+{
+    if (isGraphCaptureActive() || !original)
+        throw std::invalid_argument("Original inline retirement inventory belongs to cold actual graph validation");
+    std::string result;
+    for (const auto& name : graph.getExecutionOrder()) {
+        const auto* node = graph.getNode(name);
+        const auto* stage = node ? dynamic_cast<const PooledRetirementTransferStage*>(node->stage.get()) : nullptr;
+        if (!stage || !stage->matches(original.get(), q::PooledRetirementWireRole::Retired, CapturedTransferEndpoint::Producer)) continue;
+        if (!result.empty()) throw std::logic_error("Actual inline owner graph has duplicate original Retired producers");
+        requirePooledRetirementOwnerCompletion(graph, original, name, &consumer);
+        result = name;
+    }
+    if (result.empty()) throw std::invalid_argument("Actual inline owner graph has no original Retired producer");
+    return result;
+}
+
 }

@@ -139,6 +139,40 @@ class LauncherTest(unittest.TestCase):
             guard.audit_device_allocations({"kernel": guard.FunctionAllocation(),
                 "other_arch": guard.FunctionAllocation([guard.StackSlot("Spill", 4)])}, kernels)
 
+    @staticmethod
+    def partition_notes(parts):
+        """Preserve actual LLVM LTO note multiplicity rather than merging its records."""
+        return guard.json.dumps([{"NoteSections": [{"NoteSection": {
+            "Notes": [{"AMDGPU Metadata": part} for part in parts]}}]}])
+
+    def audit_partition_notes(self, parts):
+        """Replay actual final-object inspection with only the native inspection tools doubled."""
+        results = [" [7] .hip_fatbin PROGBITS", "",
+                   "hipv4-amdgcn-amd-amdhsa--gfx906\n", "", self.partition_notes(parts)]
+        with patch.object(guard, "run_tool", side_effect=results):
+            return guard.audit_rocm_object(Path("partitioned.o"), Path("/llvm"))
+
+    def test_all_eight_lto_partition_notes_preserve_final_spilling_kernel(self):
+        parts = [metadata(name=f"partition{i}", vgpr="1" if i == 7 else "0") for i in range(8)]
+        kernels = self.audit_partition_notes(parts)
+        self.assertEqual(len(kernels), 8)
+        self.assertEqual(kernels[-1], guard.KernelSpills("partition7", 0, 1))
+        functions = {kernel.name: guard.FunctionAllocation() for kernel in kernels}
+        functions["partition7"] = guard.FunctionAllocation([guard.StackSlot("Spill", 4)])
+        with self.assertRaisesRegex(guard.SpillGuardError, "partition7: 1 memory spill slots"):
+            guard.audit_device_allocations(functions, kernels)
+
+    def test_repeated_kernel_across_lto_notes_is_fatal_even_when_records_agree(self):
+        for last in [metadata(), metadata(vgpr="9")]:
+            with self.subTest(last=last), self.assertRaisesRegex(guard.SpillGuardError, "duplicate final kernel"):
+                self.audit_partition_notes([metadata(), last])
+
+    def test_missing_or_malformed_final_partition_metadata_is_fatal(self):
+        for parts in [[], [metadata(name="first"), None], [metadata(name="first"), "not metadata"],
+                      [metadata(name="first"), metadata(name="last").replace(".vgpr_spill_count: 0", ".vgpr_spill_count: invalid")]]:
+            with self.subTest(parts=parts), self.assertRaises(guard.SpillGuardError):
+                self.audit_partition_notes(parts)
+
     def test_host_only_object(self):
         with patch.object(guard, "run_tool", return_value=" [1] .text PROGBITS"):
             self.assertEqual(guard.audit_rocm_object(Path("host.o"), Path("/llvm")), [])

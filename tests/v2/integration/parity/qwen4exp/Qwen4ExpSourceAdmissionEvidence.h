@@ -11,6 +11,7 @@
  */
 #pragma once
 #include "Qwen4ExpSourceAdmissionCases.h"
+#include "Qwen4ExpSourceReuseEligibility.h"
 #include "Qwen4ExpCPUJointSocketEvidence.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "execution/mpi_orchestration/ExecutionPlanBuilder.h"

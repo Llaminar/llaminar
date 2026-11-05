@@ -985,12 +985,39 @@ if(HAVE_ROCM)
     file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-communicator-protocol-defaults.patch" RCCL_PROTOCOL_PATCH_HASH)
     file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-collective-selector-taxonomy.patch" RCCL_SELECTOR_PATCH_HASH)
     file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-small-allgather-ll-policy.patch" RCCL_SMALL_ALLGATHER_PATCH_HASH)
-    set(RCCL_BUILD_ID "${RCCL_COMMIT}-capture-${RCCL_CAPTURE_PATCH_HASH}-rows-${RCCL_ROWS_PATCH_HASH}-storage-${RCCL_HOST_STORAGE_PATCH_HASH}-shm-${RCCL_SHM_PATCH_HASH}-selector-${RCCL_SELECTOR_PATCH_HASH}-thread-${RCCL_THREAD_PATCH_HASH}-protocol-${RCCL_PROTOCOL_PATCH_HASH}-smallag-${RCCL_SMALL_ALLGATHER_PATCH_HASH}")
+    file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-device-completed-broadcast.patch" RCCL_COMPLETED_PATCH_HASH)
+    # This is a nested dependency/compiler contract, not an inference admission
+    # policy. The fixed builder-owned linker preserves full parallel LTO and
+    # emits final physical allocation records for every native partition.
+    set(RCCL_LTO_ARTIFACT_SCRIPT "${REPO_ROOT}/scripts/docker/llvm-lto-linker/artifact.py")
+    set(RCCL_LTO_CACHE "${RCCL_BUILD_DIR}/llaminar-final-link.cmake")
+    set(RCCL_LTO_LINKER_PREFIX "" CACHE PATH
+        "Explicit proved linker prefix; empty selects the canonical ROCm pin")
+    set(RCCL_LTO_PREFIX_ARGS)
+    if(RCCL_LTO_LINKER_PREFIX)
+        list(APPEND RCCL_LTO_PREFIX_ARGS --linker-prefix "${RCCL_LTO_LINKER_PREFIX}")
+    endif()
+    execute_process(
+        COMMAND ${Python3_EXECUTABLE} "${RCCL_LTO_ARTIFACT_SCRIPT}" configure
+            --sdk "${ROCM_PATH}" --pins "${REPO_ROOT}/scripts/docker/rocm-release.env"
+            --spill-guard "${REPO_ROOT}/scripts/build/gpu_spill_guard.py"
+            --library "${RCCL_BUILD_DIR}/librccl.so.1.0"
+            --architectures "${RCCL_GPU_TARGETS}" --write-cache "${RCCL_LTO_CACHE}"
+            ${RCCL_LTO_PREFIX_ARGS}
+        RESULT_VARIABLE RCCL_LTO_CONFIG_RESULT ERROR_VARIABLE RCCL_LTO_CONFIG_ERROR)
+    if(NOT RCCL_LTO_CONFIG_RESULT EQUAL 0)
+        message(FATAL_ERROR "RCCL final-link compiler contract failed: ${RCCL_LTO_CONFIG_ERROR}")
+    endif()
+    file(READ "${RCCL_BUILD_DIR}/llaminar-final-allocation/configuration.json" RCCL_LTO_CONFIGURATION)
+    string(JSON RCCL_LTO_RECEIPT_HASH GET "${RCCL_LTO_CONFIGURATION}" linker_receipt_sha256)
+    file(SHA256 "${RCCL_LTO_ARTIFACT_SCRIPT}" RCCL_LTO_PRODUCER_HASH)
+    set(RCCL_BUILD_ID "${RCCL_COMMIT}-completed-${RCCL_COMPLETED_PATCH_HASH}-capture-${RCCL_CAPTURE_PATCH_HASH}-rows-${RCCL_ROWS_PATCH_HASH}-storage-${RCCL_HOST_STORAGE_PATCH_HASH}-shm-${RCCL_SHM_PATCH_HASH}-selector-${RCCL_SELECTOR_PATCH_HASH}-thread-${RCCL_THREAD_PATCH_HASH}-protocol-${RCCL_PROTOCOL_PATCH_HASH}-smallag-${RCCL_SMALL_ALLGATHER_PATCH_HASH}")
     
     # A changed requested target set requires new actual device binaries even
     # when the pinned patched source is unchanged.
     string(SHA256 RCCL_TARGET_POLICY_HASH "${RCCL_GPU_TARGETS}")
-    string(PREPEND RCCL_BUILD_ID "targets-${RCCL_TARGET_POLICY_HASH}-")
+    # Compiler metadata precedes the strict thread/protocol/smallAG repair suffix.
+    string(PREPEND RCCL_BUILD_ID "targets-${RCCL_TARGET_POLICY_HASH}-llvm-lto-${RCCL_LTO_RECEIPT_HASH}-producer-${RCCL_LTO_PRODUCER_HASH}-")
 
     # Check if RCCL build is up-to-date
     set(RCCL_VERSION_FILE "${RCCL_BUILD_DIR}/.llaminar-rccl-commit")
@@ -1026,6 +1053,7 @@ if(HAVE_ROCM)
             -B "${RCCL_BUILD_DIR}"
             -S "${RCCL_EXTERNAL_DIR}"
             -G Ninja
+            -C "${RCCL_LTO_CACHE}"
             -DCMAKE_MAKE_PROGRAM:FILEPATH=${CMAKE_MAKE_PROGRAM}
             -DCMAKE_BUILD_TYPE=Release
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
@@ -1066,11 +1094,32 @@ if(HAVE_ROCM)
         endif()
         
         # Write version file for cache validation
-        file(WRITE "${RCCL_VERSION_FILE}" "${RCCL_BUILD_ID}\n")
+        # The final receipt denotes a fully audited artifact, not merely a
+        # completed native linker process. Preserve any prior receipt on failure.
+        file(WRITE "${RCCL_VERSION_FILE}.pending" "${RCCL_BUILD_ID}\n")
+        execute_process(
+            COMMAND ${Python3_EXECUTABLE} "${RCCL_LTO_ARTIFACT_SCRIPT}" compile
+                --sdk "${ROCM_PATH}" --spec "${RCCL_BUILD_DIR}/llaminar-final-allocation/configuration.json"
+                --report "${RCCL_BUILD_DIR}/llaminar-final-allocation.json" --receipt "${RCCL_VERSION_FILE}.pending"
+            RESULT_VARIABLE RCCL_LTO_AUDIT_RESULT ERROR_VARIABLE RCCL_LTO_AUDIT_ERROR)
+        if(NOT RCCL_LTO_AUDIT_RESULT EQUAL 0)
+            message(FATAL_ERROR "RCCL final physical resource evidence failed: ${RCCL_LTO_AUDIT_ERROR}")
+        endif()
+        file(RENAME "${RCCL_VERSION_FILE}.pending" "${RCCL_VERSION_FILE}")
         
         message(STATUS "V2: RCCL built successfully in ${RCCL_BUILD_DIR}")
     else()
         message(STATUS "V2: RCCL already built in ${RCCL_BUILD_DIR}")
+    endif()
+    execute_process(
+        COMMAND ${Python3_EXECUTABLE} "${RCCL_LTO_ARTIFACT_SCRIPT}" verify
+            --report "${RCCL_BUILD_DIR}/llaminar-final-allocation.json"
+            --library "${RCCL_BUILD_DIR}/librccl.so.1.0" --receipt "${RCCL_VERSION_FILE}"
+            --spill-guard "${REPO_ROOT}/scripts/build/gpu_spill_guard.py"
+            --architectures "${RCCL_GPU_TARGETS}"
+        RESULT_VARIABLE RCCL_LTO_VERIFY_RESULT ERROR_VARIABLE RCCL_LTO_VERIFY_ERROR)
+    if(NOT RCCL_LTO_VERIFY_RESULT EQUAL 0)
+        message(FATAL_ERROR "RCCL build artifact has no current complete resource evidence: ${RCCL_LTO_VERIFY_ERROR}")
     endif()
     endif() # LLAMINAR_BUILD_RCCL_FROM_SOURCE
     
@@ -2616,6 +2665,8 @@ target_sources(llaminar2_core PRIVATE
     execution/qwen4exp/PooledImmutableLocalLookupGraph.cpp
     execution/qwen4exp/PooledImmutableParticipantPinGraph.cpp
     execution/qwen4exp/PooledImmutableDirectedTransport.cpp
+    execution/qwen4exp/PooledImmutableNativeTransfer.cpp
+    execution/qwen4exp/PooledImmutableTransferBinding.cpp
     execution/qwen4exp/PooledImmutableParticipantFreeGraph.cpp
     execution/qwen4exp/PooledImmutableParticipantVictimGraph.cpp
     execution/qwen4exp/PooledImmutableParticipantLocalGraph.cpp

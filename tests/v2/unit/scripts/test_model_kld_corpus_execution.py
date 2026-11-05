@@ -505,6 +505,106 @@ def paired_fixture(root):
 class PairedCorpusExecutionTests(unittest.TestCase):
     """Join real APIs through synthetic documents; never launch a model process."""
 
+    def test_focused_receipt_selects_only_explicit_local_diagnostic_inventory(self):
+        """The opt-in admits no canonical/runtime eligibility for a diagnostic case."""
+        import model_parity_inventory as inventory
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);c,t,exact,record=paired_fixture(root)
+            (root/'observer').write_text('not executable');(root/'matrix').write_text('not executable')
+            record['inventory_role']='numerical_diagnostic'
+            args=AbsolutePilotExecutionTests().args(root,None)
+            args.corpus_catalog=None;args.paired_cell=exact
+            args.diagnostic_focused_prerequisites_report=root/'focused-fixture-not-a-native-receipt'
+            with patch.object(inventory,'discover',return_value=[(SimpleNamespace(name='original'),exact,record)]) as discover, \
+                 patch.object(inventory,'matrix_binary',return_value=root/'matrix'), \
+                 patch.object(adapter.corpus_v2,'load_corpus',return_value=c):
+                runner.select_paired_corpus(args)
+            self.assertIs(discover.call_args.args[1],inventory.InventoryScope.LOCAL_DIAGNOSTIC)
+            args.prerequisites_report=root/'complete'
+            with patch.object(inventory,'discover') as discover,self.assertRaises(ValueError):
+                runner.select_paired_corpus(args)
+            discover.assert_not_called()
+
+    def test_focused_panel_keeps_accuracy_rows_and_never_publishes_certifiable_green(self):
+        """All actual work remains in the original adapter; only prerequisite scope changes."""
+        for passed in (True,False):
+            with self.subTest(passed=passed),tempfile.TemporaryDirectory() as temp:
+                root=Path(temp);c,t,exact,record=paired_fixture(root)
+                (root/'observer').write_text('not executable')
+                (root/'CMakeCache.txt').write_text('CMAKE_BUILD_TYPE:STRING=Integration\n')
+                selected=self.selection(root,c,exact,record)
+                for name in ('scripts/ci/run_model_kld_canaries.py','scripts/ci/model_kld_corpus_execution.py',
+                    'scripts/ci/model_kld_corpus_v2.py','scripts/ci/full_vocabulary_metrics.py',
+                    'src/v2/tools/ModelKLDCanary.cpp','src/v2/tools/ModelKLDQFNContract.h'):
+                    path=root/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_text('honestly synthetic test source')
+                args=AbsolutePilotExecutionTests().args(root,selected.paths['pilot'])
+                args._paired_selection=selected;args.corpus_catalog=selected.paths['catalog'];args.topology_id=[t['id']]
+                args.diagnostic_focused_prerequisites_report=root/'focused.json'
+                args.diagnostic_focused_prerequisites_report.write_text('fixture; validator mocked, never native evidence')
+                result=dict(complete=True,observations_complete=True,passed=passed,verdict='GREEN' if passed else 'RED')
+                scope=dict(focused_tests=['V2_Integration_FixtureDeviceFree'],focused_completed_ns=123)
+                with patch.object(runner,'ROOT',root), \
+                     patch('run_production_prerequisites.validate_focused_panel_prerequisites',return_value=scope) as focused, \
+                     patch('run_production_prerequisites.validate_source_freshness') as full_source, \
+                     patch('run_production_parity_campaigns.reuse_unchanged_production_test_preflight') as full, \
+                     patch.object(runner,'execute_cell',return_value=result) as execute:
+                    self.assertEqual(runner.run_corpus_v2(args),0 if passed else 1)
+                self.assertEqual(focused.call_count,3);full.assert_not_called();full_source.assert_not_called()
+                self.assertIs(execute.call_args.kwargs['adapter'].paired,selected)
+                report=json.loads(args.report.read_text())
+                self.assertEqual(report['mode'],'local_paired_focused_diagnostic')
+                self.assertEqual(report['verdict'],'DIAGNOSTIC_REQUIRED_GROUPS_GREEN' if passed else 'DIAGNOSTIC_REQUIRED_GROUPS_RED')
+                self.assertIsNone(report['passed']);self.assertEqual(report['diagnostic_passed'],passed)
+                self.assertEqual(report['cells'],[result]);self.assertFalse(report['full_preflight'])
+                self.assertFalse(report['certification_eligible']);self.assertTrue(report['diagnostic_only'])
+                self.assertEqual(report['prerequisites']['original_completed_ns'],123)
+                self.assertEqual(report['prerequisites']['native_backend_regressions'],'not_covered_by_DeviceFree_selection')
+
+    def test_stale_focused_receipt_and_nonpaired_option_fail_before_native_work(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);c,t,exact,record=paired_fixture(root)
+            (root/'observer').write_text('not executable')
+            (root/'CMakeCache.txt').write_text('CMAKE_BUILD_TYPE:STRING=Integration\n')
+            selected=self.selection(root,c,exact,record)
+            for name in ('scripts/ci/run_model_kld_canaries.py','scripts/ci/model_kld_corpus_execution.py',
+                'scripts/ci/model_kld_corpus_v2.py','scripts/ci/full_vocabulary_metrics.py',
+                'src/v2/tools/ModelKLDCanary.cpp','src/v2/tools/ModelKLDQFNContract.h'):
+                path=root/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_text('fixture source')
+            args=AbsolutePilotExecutionTests().args(root,selected.paths['pilot'])
+            args._paired_selection=selected;args.corpus_catalog=selected.paths['catalog'];args.topology_id=[t['id']]
+            args.diagnostic_focused_prerequisites_report=root/'focused.json'
+            args.diagnostic_focused_prerequisites_report.write_text('{}')
+            with patch.object(runner,'ROOT',root), \
+                 patch('run_production_prerequisites.validate_focused_panel_prerequisites',side_effect=ValueError('stale focused')),\
+                 patch.object(runner,'execute_cell') as execute:
+                with self.assertRaisesRegex(ValueError,'stale focused'):runner.run_corpus_v2(args)
+                execute.assert_not_called()
+        with self.assertRaises(ValueError):
+            runner.main(['--binary','fixture','--report','report','--diagnostic-focused-prerequisites-report','focused'])
+        with self.assertRaises(SystemExit):
+            runner.main(['--binary','fixture','--report','report','--paired-cell','exact',
+                '--prerequisites-report','complete','--diagnostic-focused-prerequisites-report','focused'])
+
+    def test_external_metadata_requires_explicit_policy_and_original_contained_payloads(self):
+        """Only the bound document changes location; no new reference alias is granted."""
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);c,t,exact,record=paired_fixture(root)
+            external=root/'metadata';external.mkdir()
+            old=Path(record['paired_workload']['accuracy']['workload']['path'])
+            target=external/'manifest.json';target.write_bytes(old.read_bytes())
+            record['paired_workload']['accuracy']['workload']['path']=str(target)
+            with patch.object(adapter.corpus_v2,'load_corpus',return_value=c) as load:
+                with self.assertRaisesRegex(ValueError,'exact approved corpus manifest'):
+                    adapter.PairedCorpusSelection.from_export(exact,record,root,root)
+                load.assert_not_called()
+                selected=adapter.PairedCorpusSelection.from_export(exact,record,root,root,
+                    metadata_policy=adapter.PairedMetadataPolicy.SOURCE_BOUND_DIAGNOSTIC)
+                self.assertEqual(load.call_args.kwargs['manifest_path'],target)
+                self.assertEqual(load.call_args.args[0],root)
+                self.assertEqual(selected.paths['workload'],target)
+            with self.assertRaisesRegex(ValueError,'policy'):
+                adapter.PairedCorpusSelection.from_export(exact,record,root,root,metadata_policy='untyped')
+
     def selection(self,root,c,exact,record):
         with patch.object(adapter.corpus_v2,'load_corpus',return_value=c):
             return adapter.PairedCorpusSelection.from_export(exact,record,root,root)

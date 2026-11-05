@@ -11,10 +11,13 @@
 #include "transfer/CapturedTransferChannel.h"
 #include "transfer/CapturedTransferKernelPlan.h"
 #include <optional>
+#include <stdexcept>
 namespace llaminar2 {class IComputeStage;}
 namespace llaminar2::qwen4exp {
 /** @brief Closed semantic wire families in their original participant-local program. */
 enum class PooledImmutableDirectedWireFamily:std::uint32_t {Pin,PinReturn,Free,Victim,Source,Publication,Read,Retirement};
+/** @brief Cold-selected transport; native library recipes cannot use a flat kernel count. */
+enum class PooledImmutableDirectedTransportKind : std::uint8_t {CapturedChannel,NativeCollective};
 /** @brief One actual capture-frozen endpoint, excluding physical pointers and mutable counts. */
 struct PooledImmutableDirectedTransferOperation final {
     PooledImmutableDirectedWireFamily family;
@@ -23,8 +26,9 @@ struct PooledImmutableDirectedTransferOperation final {
     std::uint64_t maximumBytes;
     CapturedTransferExtentSource extent;
     bool sourceSlice;
+    PooledImmutableDirectedTransportKind transport=PooledImmutableDirectedTransportKind::CapturedChannel;
     /** @return Native invocations from the very selector used by CUDA and HIP. */
-    unsigned kernelCount()const{return capturedTransferKernelPlan(maximumBytes)==CapturedTransferKernelPlan::SingleBlock?1u:2u;}
+    unsigned kernelCount()const{if(transport!=PooledImmutableDirectedTransportKind::CapturedChannel)throw std::logic_error("Native collective has no captured-channel flat kernel recipe");return capturedTransferKernelPlan(maximumBytes)==CapturedTransferKernelPlan::SingleBlock?1u:2u;}
     bool operator==(const PooledImmutableDirectedTransferOperation&)const=default;
 };
 }

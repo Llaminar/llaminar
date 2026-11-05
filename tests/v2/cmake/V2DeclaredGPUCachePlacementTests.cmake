@@ -1,4 +1,11 @@
-# Exact public requests and original resource roles; no native/model qualification.
+#[=[
+@file V2DeclaredGPUCachePlacementTests.cmake
+@brief Register exact declared cache ownership and source-role planning contracts.
+
+Device-free tests exercise public requests and original resource identities,
+including compute participants that also own storage and zero-capacity layouts.
+Separate native and model admission gates retain their execution obligations.
+]=]
 if(TARGET v2_test_model_parity_definition)
     target_sources(v2_test_model_parity_definition PRIVATE
         unit/planning/Test__DeclaredGPUCachePlacement.cpp)
@@ -9,6 +16,13 @@ if(TARGET v2_test_model_parity_definition)
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_DeclaredGPUCachePlacementReplay)
+    add_v2_test(V2_Integration_DeclaredGPUCacheContinuationOwnerPlanningReplay
+        COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+            --gtest_filter=DeclaredGPUCachePlacement.ContinuationOwnersRetainAuthoredCoordinatorAtPositiveAndZeroCapacity
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Qwen4Exp;Admission;Ownership;Replay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_DeclaredGPUCacheContinuationOwnerPlanningReplay)
 endif()
 
 add_v2_test(V2_Integration_DeclaredGPUCacheStorageRoleDiscoveryReplay
@@ -103,7 +117,7 @@ endif()
 if(TARGET v2_test_model_parity_definition)
     add_v2_test(V2_Integration_SharedCoordinatorAdaptiveLookupGeometryReplay
         COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
-            --gtest_filter=DeclaredGPUCachePlacement.SharedCoordinatorReadersPreserveOneSourceAndExactResultACKBOM:DeclaredGPUCachePlacement.SharedCoordinatorTP2SourceSiblingsPreserveOriginalPolicies:DeclaredGPUCachePlacement.SharedCoordinatorCUDATP2SourceSiblingsPreserveOriginalPoliciesAndStorageRole
+            --gtest_filter=DeclaredGPUCachePlacement.SharedCoordinatorReadersPreserveOneSourceAndExactResultACKBOM:DeclaredGPUCachePlacement.SharedCoordinatorTP2SourceSiblingsPreserveOriginalPolicies:DeclaredGPUCachePlacement.SharedCoordinatorCUDATP2SourceSiblingsPreserveOriginalPoliciesAndStorageRole:DeclaredGPUCachePlacement.SharedCoordinatorRAMSourceMTPKeepsDistinctOriginalProducts
             --gtest_repeat=20
         LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Qwen4Exp;TP;Ownership;TraceReplay;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30

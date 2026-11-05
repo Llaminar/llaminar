@@ -12,6 +12,8 @@
 #include "execution/qwen4exp/ImmutableLookupExecutionBoundary.h"
 #include "kernels/qwen4exp/PooledImmutableNativeOperands.h"
 namespace llaminar2 {
+class ComputeGraph;
+struct ComputeNode;
 /** @brief Bind only original source-root aliases; the arena acquires no second physical claim. */
 void bindPooledSourceRoots(BufferArena& arena,const qwen4exp::ImmutableLookupExecutionBoundary& boundary);
 /** @brief One fixed captured real-provider operation, with canonical control and explicit original output. */
@@ -38,6 +40,22 @@ public:
         std::uint32_t owner,const DeviceGenerationControlBinding& control)const {
         return boundary_.get()==boundary && action_==action && owner_==owner && control_.captureIdentity()==control.captureIdentity();
     }
+    /** @return Whether this is the exact source-owned demand publication/response operation. */
+    bool matchesDemand(const qwen4exp::ImmutableLookupExecutionBoundary* boundary,qwen4exp::PooledSourceAction action)const noexcept {
+        return boundary_.get()==boundary && action_==action && owner_==qwen4exp::adaptive_lookup::None;
+    }
+    /**
+     * @brief Seal only this original AcquireResponse's consumed cold trunk join.
+     * @param graph Actual source graph retaining the same boundary.
+     * @param node Actual response node with its sole original Publish predecessor.
+     * @param published Actual source Publish producer.
+     * @param trunk Actual same-participant trunk terminal producers.
+     * This is graph construction metadata, never a runtime completion or readiness flag.
+     */
+    void bindCurrentDemandTrunk(const ComputeGraph& graph,const ComputeNode& node,
+        const std::string& published,const std::vector<std::string>& trunk);
+    /** @return Only the consumed exact trunk dependencies admitted beside the original protocol edge. */
+    const std::vector<std::string>& currentDemandTrunk()const noexcept{return demand_trunk_;}
     /** @return Exact original reader output root/role/range; used by terminal cold insertion. */
     bool matchesReadOutput(const qwen4exp::PooledNativeTensorSpan& output)const noexcept {
         return output_ && output_->root==output.root && output_->buffer==output.buffer && output_->offset==output.offset && output_->bytes==output.bytes;
@@ -73,5 +91,6 @@ private:
     std::optional<Qwen4ExpPreparedStorage> prepared_;
     std::shared_ptr<const CapturedDeviceStorageLease> captured_; ///< Retires before the original strong output Tensor owner.
     std::uint64_t identity_=0;
+    std::vector<std::string> demand_trunk_; ///< Immutable consumed graph join; original source still owns every runtime state and byte.
 };
 }

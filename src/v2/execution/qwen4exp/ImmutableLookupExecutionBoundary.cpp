@@ -802,6 +802,8 @@ ImmutableLookupExecutionBoundary::SourceGroupAdmission::SourceGroupAdmission(
             throw std::logic_error("Shared source admission requires its original complete reader transport");
         shared_reader_transport_ = retained->transport();
         shared_reader_transport_->beginInvocation({admission_.generation(), admission_.invocation()});
+        if (auto native = shared_reader_transport_->nativeFailureSignal())
+            original_native_failure_ = service_->failureCallbackWithNativeAbort(admission_, std::move(native));
     }
 }
 ImmutableLookupExecutionBoundary::SourceGroupAdmission::~SourceGroupAdmission() noexcept
@@ -810,6 +812,7 @@ ImmutableLookupExecutionBoundary::SourceGroupAdmission::~SourceGroupAdmission() 
         // Abandonment cancels only CPU/reader progress. A missing source
         // proof must not erase storage release/SourceFrontier/Retired packets.
         // Original model/graph owners retain those channels and native duties.
+        if (shared_reader_transport_ && original_native_failure_) original_native_failure_();
         if (shared_reader_transport_)
             shared_reader_transport_->failureCallback({admission_.generation(), admission_.invocation()}, PooledImmutableDirectedTransport::CancellationEdges::ComputeReaders)();
         if (service_ && !finished_) (void)finish();
@@ -831,7 +834,7 @@ bool ImmutableLookupExecutionBoundary::SourceGroupAdmission::reuses(
 }
 std::function<void()> ImmutableLookupExecutionBoundary::SourceGroupAdmission::failureCallback() const
 {
-    auto source = service_->failureCallback(admission_);
+    auto source = original_native_failure_ ? original_native_failure_ : service_->failureCallback(admission_);
     if (!shared_reader_transport_) return source;
     auto channels = shared_reader_transport_->failureCallback({admission_.generation(), admission_.invocation()}, PooledImmutableDirectedTransport::CancellationEdges::ComputeReaders);
     return [source = std::move(source), channels = std::move(channels)] {
@@ -861,10 +864,11 @@ void ImmutableLookupExecutionBoundary::SourceGroupAdmission::cancelStorageChanne
         shared_reader_transport_->failureCallback({admission_.generation(), admission_.invocation()},
             PooledImmutableDirectedTransport::CancellationEdges::StorageOwners)();
 }
-bool ImmutableLookupExecutionBoundary::SourceGroupAdmission::finishNativeChannelsAfterProof()
+bool ImmutableLookupExecutionBoundary::SourceGroupAdmission::finishNativeChannelsAfterProof(bool originalRequestFailed)
 {
     if (!finished_)
         throw std::logic_error("Shared reader native retirement preceded original CPU/adopted-right cleanup");
+    result_ = result_ && !originalRequestFailed;
     if (!shared_reader_transport_) return result_;
     const auto outcome = shared_reader_transport_->finishInvocation({admission_.generation(), admission_.invocation()});
     result_ = result_ && outcome == CapturedTransferInvocationRetirement::Completed;
@@ -996,14 +1000,53 @@ void ImmutableLookupExecutionBoundary::beginAdmission(std::uint64_t generation,v
 }
 void ImmutableLookupExecutionBoundary::bindGenerationControl(RetainedStorageGenerationControl control)
 {
-    if(!control.healthy||!control.error||control.healthy==control.error||
+    if(generationBorrow_==GenerationBorrow::GraphRetired ||
+       !control.healthy||!control.error||control.healthy==control.error||
        (control_.healthy&&(control_.healthy!=control.healthy||control_.error!=control.error)))
         throw std::invalid_argument("Immutable lookup requires immutable canonical generation health/error addresses");
-    control_=control;
+    control_=control;generationBorrow_=GenerationBorrow::GraphBorrowed;
+}
+void ImmutableLookupExecutionBoundary::clearRetiredGenerationControl()noexcept
+{
+    // Only runner-address borrows retire. Source geometry/code, setup events,
+    // protocol initialization and monotonically increasing I/O intervals survive.
+    if(pooled_)pooled_->control.reset();
+    control_={};generationBorrow_=GenerationBorrow::Unbound;
+}
+void ImmutableLookupExecutionBoundary::retireGenerationControl(RetainedStorageGenerationControl original)
+{
+    if(generationBorrow_!=GenerationBorrow::GraphBorrowed || !original.healthy || !original.error ||
+       original.healthy!=control_.healthy || original.error!=control_.error)
+        throw std::logic_error("Immutable lookup graph retirement replaced its original canonical controller");
+    if(isGraphCaptureActive() || hasActiveInterval() || pending_group_admission_ || ticket_.valid())
+        throw std::logic_error("Immutable lookup graph retirement requires original terminal/adopted I/O retirement");
+    requireProtocolOwner();
+    if(pooled_ && pooled_->control){
+        pooled_->control->requireFor(device());
+        if(pooled_->control->healthy()!=original.healthy || pooled_->control->error()!=original.error)
+            throw std::logic_error("Immutable lookup graph retirement changed its original canonical arena binding");
+    }
+    const auto cohort=completeCohort_.load(std::memory_order_acquire).lock();
+    if(!cohort && cohortOwnerClaim_.test(std::memory_order_acquire))
+        throw std::logic_error("Immutable lookup graph retirement lost its original participant authority");
+    generationBorrow_=GenerationBorrow::GraphRetired;
+    if(!cohort)clearRetiredGenerationControl();
+}
+void ImmutableLookupExecutionBoundary::retireParticipantGenerationControl(const PooledImmutableRetainedParticipants& original)
+{
+    const auto cohort=completeCohort_.load(std::memory_order_acquire).lock();
+    if(!cohort || cohort.get()!=&original || !cohortOwnerClaim_.test(std::memory_order_acquire))
+        throw std::logic_error("Immutable lookup participant retirement replaced its original source authority");
+    if(isGraphCaptureActive() || hasActiveInterval() || pending_group_admission_ || ticket_.valid() ||
+       generationBorrow_==GenerationBorrow::GraphBorrowed)
+        throw std::logic_error("Immutable lookup participant retirement requires original graph and I/O borrow closure");
+    // Unbound is valid for failed cold preparation before any controller was
+    // borrowed. It never authorizes replacement of an existing graph binding.
+    clearRetiredGenerationControl();
 }
 RetainedStorageGenerationControl ImmutableLookupExecutionBoundary::generationControl() const
 {
-    if(!control_.healthy||!control_.error)throw std::logic_error("Immutable lookup stage has no bound canonical generation failure words");
+    if(generationBorrow_!=GenerationBorrow::GraphBorrowed || !control_.healthy||!control_.error)throw std::logic_error("Immutable lookup stage has no bound canonical generation failure words");
     return control_;
 }
 void ImmutableLookupExecutionBoundary::requireArmedForLaunch() const

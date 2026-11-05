@@ -62,7 +62,7 @@ public:
     /** @return Immutable original suffix geometry. */
     const PooledImmutableVictimEdge& declaration()const noexcept{return declaration_;}
     /** @return Exact fixed/sliced/counted local endpoint; C0 never has decision/Grant bindings. */
-    const CapturedTransferBinding& binding(PooledVictimWireRole role,CapturedTransferEndpoint endpoint)const;
+    const PooledImmutableTransferBinding& binding(PooledVictimWireRole role,CapturedTransferEndpoint endpoint)const;
     /** @return Exact original Invocation plus acquired victim header/count prefix; no dummy C0 inputs. */
     PooledNativeOperandSpans ownerInputs(pooled_native::OwnerAction action)const;
     /** @return Exact original PlanVictims/Grant/complete-receipt inputs. */
@@ -70,7 +70,7 @@ public:
     /** @return Complete original free plus all actual victim bindings. */
     uint64_t captureIdentity()const;
 private:
-    using Pair=std::pair<CapturedTransferBinding,CapturedTransferBinding>;
+    using Pair=std::pair<PooledImmutableTransferBinding,PooledImmutableTransferBinding>;
     using Bindings=std::array<std::optional<Pair>,4>;
     /** @brief Construct only after all original bindings and same-PMA retention succeed. */
     PooledImmutableCapturedVictimWave(std::shared_ptr<const PooledImmutableCapturedFreeWave> previous,

@@ -19,6 +19,8 @@
  */
 
 #pragma once
+#include <mutex>
+#include "execution/local_execution/engine/ForwardGraphTypes.h"
 
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
@@ -44,7 +46,9 @@
 
 namespace llaminar2
 {
-    namespace test { struct MoEOverlayParticipantNativeRetirementReplayAccess; }
+    namespace qwen4exp { class PooledImmutableRetainedParticipants; }
+
+    namespace test { struct MoEOverlayParticipantNativeRetirementReplayAccess; struct PooledExpertSourceFailureContractAccess; }
     class ComputeGraph;
     class ModelContext;
     class MoELocalExpertSerialBufferArena;
@@ -344,6 +348,29 @@ namespace llaminar2
 
     private:
         friend struct test::MoEOverlayParticipantNativeRetirementReplayAccess;
+        friend struct test::PooledExpertSourceFailureContractAccess;
+        /**
+         * @brief Publish original source cancellation without replacing an enqueue failure or skipping joins.
+         * @param cancellation Same Rank source/ticket callback bound before launch.
+         * @param failure_mutex Protects only concurrent exception publication, never held while cancelling.
+         * @param failure First cancellation exception retained by the original submission through drain.
+         */
+        static void cancelOriginalPooledSource(const std::function<void()>& cancellation,
+            std::mutex& failure_mutex,std::exception_ptr& failure) noexcept;
+        friend class RankOrchestrator;
+        /** @brief Bind actual source cache owners after original continuation setup and before follower capture. */
+        void bindOriginalPooledSourceFamily(
+            std::shared_ptr<qwen4exp::PooledImmutableRetainedParticipants> original,
+            std::vector<RetainedForwardSourceDefinition> definitions);
+        /** @brief Close follower native/cache borrows before the original source arenas retire. */
+        void retireOriginalPooledStorageAttachments();
+        /** @brief Retain the SAME Rank source/ticket cancellation until all original jobs drain at teardown. */
+        void bindOriginalPooledSourceCancellation(std::function<void()> cancellation);
+        /** @brief Rank clears the request callback only after complete original SDK/native/channel retirement. */
+        void clearOriginalPooledSourceCancellation() noexcept { original_pooled_source_cancellation_={}; }
+        std::shared_ptr<const std::function<void()>> original_pooled_source_cancellation_; ///< Captures service/ticket/native abort only, never Rank or this runner.
+        std::shared_ptr<qwen4exp::PooledImmutableRetainedParticipants> original_pooled_participants_;
+        std::vector<RetainedForwardSourceDefinition> original_pooled_source_family_;
         friend class OrchestrationRunner; // Original cold coordinator construction owns the sole binding.
         /**
          * @brief Bind the existing coordinator publisher to original same-rank endpoints.
@@ -606,6 +633,21 @@ namespace llaminar2
                     out.error = exception.what();
                 }
                 return out;
+            }
+            /**
+             * @brief Admit the actual follower publication and collect every host SDK enqueue before continuation.
+             * @param descriptor Original continuation graph descriptor.
+             * @param submit Actual ticket/family selection and complete original all-submit operation.
+             * @param collect Actual original host enqueue-future collector; no GPU terminal wait belongs here.
+             * @return Continuation permission only after every SDK enqueue succeeds; partial failure keeps its original slot for drain.
+             */
+            template<class Submit,class Collect>
+            MoEOverlayPublishedInferenceTransaction publishOriginalFollowers(
+                const MoEOverlayInferenceExecutionDescriptor& descriptor,Submit submit,Collect collect)
+            {
+                return publish(descriptor,[&](const auto& ticket,std::string* error) {
+                    return submit(ticket,error) && collect(error);
+                });
             }
             /** @brief Join the exact original handle before advancing its existing protocol slot. */
             template <class Join>
@@ -948,8 +990,14 @@ namespace llaminar2
         enum class ServingGraphFamilyLifecycle : std::uint8_t
         {
             Built,  ///< Rank-local graph objects exist but cannot accept tickets.
-            Sealed, ///< Every declared endpoint is certified for transaction zero.
+            Sealed, ///< Every declared endpoint is certified for transaction zero; cold diagnostic aliases may still extend.
+            ExecutionAdmitted, ///< Original coordinator installed; source aliases/topology are immutable.
         };
+        /** @brief Reject changed source aliases after the existing original execution-admission frontier. */
+        static void requireColdSourceAliasRefresh(ServingGraphFamilyLifecycle lifecycle) {
+            if (lifecycle == ServingGraphFamilyLifecycle::ExecutionAdmitted)
+                throw std::invalid_argument("Expert storage source aliases are immutable after original execution admission");
+        }
         /** Sole authority for request-ticket admission into this graph family. */
         ServingGraphFamilyLifecycle serving_graph_family_lifecycle_ =
             ServingGraphFamilyLifecycle::Built;

@@ -64,6 +64,18 @@ public:
         }
         return result;
     }
+    /**
+     * @brief Declare full/chained learned drafts: one token for each live request.
+     * @param requests Original admitted request-batch bound, independent of verifier width.
+     * @param storage_rows Existing admitted packet capacities; no storage is added.
+     * @return Every reachable exact request count; shifted KV-only prefills are excluded.
+     * @throws std::invalid_argument If the original storage does not cover the request bound.
+     */
+    static MoEOverlayFollowerRowGeometry declareDraft(int requests,
+        std::span<const std::size_t> storage_rows)
+    {
+        return declare(requests,requests,{},storage_rows);
+    }
     /** @return Original declared exact execution identities; this owns no packet storage. */
     const std::vector<Shape>& shapes() const noexcept {return shapes_;}
     /**

@@ -731,7 +731,7 @@ namespace llaminar2
             return;
         }
 
-        LOG_ERROR("[LocalTPContext] Fatal cancellation published; communicator abort is deferred "
+        LOG_ERROR("[LocalTPContext] Fatal cancellation published; communicator destruction is deferred "
                   "until native graph owners are released"
                   << " context_id=" << context_id_
                   << " context=" << static_cast<const void *>(this));
@@ -763,6 +763,25 @@ namespace llaminar2
         barrier_cv_.notify_all();
         grouped_onstream_allreduce_cv_.notify_all();
         graph_capture_boundary_cv_.notify_all();
+
+        // Readiness publishes the original backend and its immutable communicator
+        // handles. Never take a collective/native launch mutex here: a peer may
+        // be inside GROUP launch waiting for the participant that just failed.
+        // This uses only existing absorbing abort words, after releasing the
+        // HOST predicate lock and waking every original host rendezvous.
+        if (backend_initialized_.load(std::memory_order_acquire) && backend_impl_ &&
+            (backend_ == CollectiveBackendType::NCCL || backend_ == CollectiveBackendType::RCCL) &&
+            backend_impl_->isMultiGpuSingleProcess())
+        {
+            bool original_ready = true;
+            for (int participant = 0; participant < degree(); ++participant)
+                original_ready = original_ready && backend_impl_->nativeCompletionAuthority(participant).valid();
+            if (original_ready && !backend_impl_->signalNativeCompletionAbort())
+            {
+                LOG_ERROR("Original native cancellation failed after host admission closed; graph borrowers remain live");
+                std::terminate();
+            }
+        }
     }
 
     void LocalTPContext::abortBackendAfterGraphOwnersReleased() noexcept
@@ -3411,6 +3430,79 @@ namespace llaminar2
             send_count,
             dtype,
             isGraphCaptureActive());
+        return true;
+    }
+
+    /** @copydoc ILocalTPContext::signalNativeCompletionAbort */
+    bool LocalTPContext::signalNativeCompletionAbort()
+    {
+        if (!backend_initialized_ || !backend_impl_ ||
+            (backend_ != CollectiveBackendType::NCCL && backend_ != CollectiveBackendType::RCCL) ||
+            !backend_impl_->isMultiGpuSingleProcess()) return false;
+        // Close future host admissions without destroying native graph borrowers.
+        requestAbort();
+        return backend_impl_->signalNativeCompletionAbort();
+    }
+
+    /** @copydoc ILocalTPContext::nativeCompletionAuthority */
+    NativeCompletionAuthority LocalTPContext::nativeCompletionAuthority(int participant)
+    {
+        if (abort_requested_.load(std::memory_order_acquire) || participant < 0 || participant >= degree() || !backend_initialized_ || !backend_impl_ ||
+            (backend_ != CollectiveBackendType::NCCL && backend_ != CollectiveBackendType::RCCL) ||
+            !backend_impl_->isMultiGpuSingleProcess())
+            throw std::logic_error("Native completion requires the original initialized local communicator participant");
+        auto original = backend_impl_->nativeCompletionAuthority(participant);
+        if (!original.valid())
+            throw std::logic_error("Native library cannot provide original completed-byte authority");
+        return original;
+    }
+
+    /** @copydoc ILocalTPContext::nativeTransferBytesOnStream */
+    bool LocalTPContext::nativeTransferBytesOnStream(void* payload,const NativeCollectiveBytes& bytes, NativeByteEdge edge, int participant, void* stream,
+        const std::string& stage_name)
+    {
+        if (abort_requested_.load(std::memory_order_acquire) || !payload || reinterpret_cast<std::uintptr_t>(stream) <= 2 ||
+            (!edge.contains(degree(),participant) || !bytes.participantValid(degree(), participant, edge.producer())) ||
+            !backend_initialized_ || !backend_impl_ ||
+            (backend_ != CollectiveBackendType::NCCL && backend_ != CollectiveBackendType::RCCL) ||
+            !backend_impl_->isMultiGpuSingleProcess())
+        {
+            LOG_ERROR("LocalTP addressed bytes rejected its original native operands stage=" << stage_name);
+            return false;
+        }
+        const auto result = backend_impl_->nativeTransferBytesOnStream(payload, bytes, edge, participant, stream);
+        if (!result)
+        {
+            LOG_ERROR("LocalTP addressed bytes failed stage=" << stage_name
+                << " backend_error=" << result.message());
+            requestAbort();
+            return false;
+        }
+        return true;
+    }
+
+    /** @copydoc ILocalTPContext::nativeBroadcastBytesOnStream */
+    bool LocalTPContext::nativeBroadcastBytesOnStream(const void* send, void* receive,
+        const NativeCollectiveBytes& bytes, int root, int participant, void* stream,
+        const std::string& stage_name)
+    {
+        if (abort_requested_.load(std::memory_order_acquire) || !send || !receive || reinterpret_cast<std::uintptr_t>(stream) <= 2 ||
+            !bytes.participantValid(degree(), participant, root) ||
+            !backend_initialized_ || !backend_impl_ ||
+            (backend_ != CollectiveBackendType::NCCL && backend_ != CollectiveBackendType::RCCL) ||
+            !backend_impl_->isMultiGpuSingleProcess())
+        {
+            LOG_ERROR("LocalTP byte Broadcast rejected its original native operands stage=" << stage_name);
+            return false;
+        }
+        const auto result = backend_impl_->nativeBroadcastBytesOnStream(send, receive, bytes, root, participant, stream);
+        if (!result)
+        {
+            LOG_ERROR("LocalTP byte Broadcast failed stage=" << stage_name
+                << " backend_error=" << result.message());
+            requestAbort();
+            return false;
+        }
         return true;
     }
 

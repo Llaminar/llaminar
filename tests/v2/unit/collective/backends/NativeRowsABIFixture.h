@@ -30,6 +30,17 @@ struct NativeRowsABICall final
     unsigned fixed_calls = 0;
     unsigned counted_calls = 0;
     unsigned unexpected_calls = 0;
+    unsigned byte_prefix_calls = 0;
+    unsigned byte_slice_calls = 0;
+    unsigned authority_calls = 0;
+    unsigned abort_signal_calls = 0;
+    const ncclLlaminarCompletionOperand* completion = nullptr;
+    std::uint64_t* live_bytes = nullptr;
+    const llaminar2::NativeByteSourceSlice* source_slice = nullptr;
+    std::size_t capacity_bytes = 0;
+    std::size_t source_capacity_bytes = 0;
+    std::uint64_t source_offset_origin = 0;
+    int root = -1;
     const void *send = nullptr;
     void *receive = nullptr;
     std::size_t elements = 0;

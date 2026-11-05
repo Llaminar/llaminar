@@ -7,6 +7,8 @@
  * Extracted from DeviceGraphExecutor.cpp. Geometry-only workspace topologies
  * carry a monotone execution purpose through moves/merges, so an allocator's
  * declaration can never become a retained executable by losing its input tag.
+ * Merging retains a source fragment's storage lifetime together with its
+ * participant metadata; query-only fragments never acquire a source lane.
  */
 
 #include "ComputeGraph.h"
@@ -550,6 +552,7 @@ namespace llaminar2
         nodes_.clear();
         participant_source_plan_.reset();
         participant_definition_domain_.reset();
+        participant_source_variants_.clear();
         storage_boundary_.reset();
         read_ahead_branch_.reset();
         read_ahead_phase_identity_=0;
@@ -602,13 +605,24 @@ namespace llaminar2
     {
         if(other.read_ahead_branch_)
             throw std::logic_error("Read-ahead graphs must be retained as complete native parents, not merged into another topology");
+        // Source fragments own an exclusive storage lane; query-only fragments
+        // intentionally do not. Transfer the original optional ownership with
+        // the topology instead of making every model builder rebind a lane.
+        // Validate all ownership conflicts first: a rejected reader/source merge
+        // must not install a lane before discovering a foreign participant domain.
+        if(storage_boundary_ && other.storage_boundary_ && storage_boundary_!=other.storage_boundary_)
+            throw std::invalid_argument("ComputeGraph merge changed its original immutable storage boundary");
+        if(participant_definition_domain_ && other.participant_definition_domain_ &&
+            *participant_definition_domain_!=*other.participant_definition_domain_)
+            throw std::invalid_argument("ComputeGraph merge changed its original participant definition domain");
+        if(participant_source_plan_ && other.participant_source_plan_ && participant_source_plan_!=other.participant_source_plan_)
+            throw std::logic_error("One retained source parent cannot hide multiple participant invocation plans");
+        if (!participant_source_variants_.empty() || !other.participant_source_variants_.empty())
+            throw std::logic_error("A sealed expert source-family association cannot be merged into another graph");
+        if(other.storage_boundary_)setRetainedStorageBoundary(other.storage_boundary_);
         if(other.participant_definition_domain_)setRetainedParticipantDefinitionDomain(*other.participant_definition_domain_);
         if(other.participant_source_plan_)
-        {
-            if(participant_source_plan_ && participant_source_plan_!=other.participant_source_plan_)
-                throw std::logic_error("One retained source parent cannot hide multiple participant invocation plans");
             setRetainedParticipantSourcePlan(other.participant_source_plan_);
-        }
 
         if(other.isWorkspaceDeclaration())markWorkspaceDeclaration();
         if (other.nodes_.empty())

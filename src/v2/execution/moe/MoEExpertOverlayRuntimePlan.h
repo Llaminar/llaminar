@@ -33,6 +33,9 @@ namespace llaminar2
         bool owned_by_current_rank = false;
         bool locally_addressable = false;
         DeviceId local_device = DeviceId::invalid();
+
+        /** @return Equality of every immutable address, rank and ownership projection. */
+        bool operator==(const MoEOverlayDomainParticipant &) const = default;
     };
 
     /** @brief Immutable domain geometry, not a mutable collective-readiness ledger. */
@@ -63,6 +66,9 @@ namespace llaminar2
         int routed_tier_count = 0;
         bool routed_rebalance_controller_eligible = false;
         std::string rebalance_domain_id;
+
+        /** @return Complete ordered descriptor equality, without granting collective readiness. */
+        bool operator==(const MoEOverlayRuntimeDomain &) const = default;
 
         /**
          * @brief Validate this domain specifically as a dense continuation.

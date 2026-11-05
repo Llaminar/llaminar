@@ -2561,4 +2561,45 @@ TEST(PooledImmutableNative, CancelledUnlaunchedOwnerRequiresOriginalInitializedD
     }
 }
 
+/** @test Original native-parent cancellation suppresses work without hiding prior faults or manufacturing physical release. */
+TEST(PooledImmutableNative, OriginalNativeAbortPreservesPinnedDutiesAndEarlierOwnerFaults)
+{
+    for (const std::uint32_t capacity : {0u, 2u}) {
+        Pool pool(std::array{capacity});
+        const std::array<std::uint64_t, 1> rows{17};
+        ASSERT_NO_THROW(pool.complete(rows));
+        ASSERT_NO_THROW(pool.begin(rows, 2));
+        auto& args = pool.owners.front()->args;
+        auto* frame = n::ownerView<a::Slot64>(args).frame;
+        if (capacity) EXPECT_GT(frame->held_pins, 0u);
+        volatile std::uint32_t originalAbort = 0;
+        const std::uint64_t originalCommunicator = 53;
+        ncclLlaminarCompletionAuthority original{};
+        EXPECT_FALSE(n::suppressAbortedNativeOwner<a::Slot64>(args, original, 1));
+        original = {&originalAbort, &originalCommunicator};
+        EXPECT_FALSE(n::suppressAbortedNativeOwner<a::Slot64>(args, original, 0));
+        for (const auto status : {a::Status::Success, a::Status::Cancelled, a::Status::SourceFailure,
+                 a::Status::InvalidGeometry, a::Status::InvalidPhase, a::Status::Invariant, a::Status::Exhausted}) {
+            frame->status = status; // Recorded original first-fault publication before cancellation arrives.
+            const auto beforeFrame = pool.owners.front()->frame.blocks;
+            const auto beforeCache = pool.owners.front()->cache.blocks;
+            const auto beforeNative = pool.owners.front()->native.blocks;
+            const bool cancellable = status == a::Status::Success || status == a::Status::Cancelled ||
+                status == a::Status::SourceFailure;
+            EXPECT_EQ(n::suppressAbortedNativeOwner<a::Slot64>(args, original, 1), cancellable);
+            EXPECT_EQ(std::memcmp(beforeFrame.data(), pool.owners.front()->frame.blocks.data(),
+                beforeFrame.size() * sizeof(Bytes::Block)), 0);
+            if (!beforeCache.empty()) EXPECT_EQ(std::memcmp(beforeCache.data(), pool.owners.front()->cache.blocks.data(),
+                beforeCache.size() * sizeof(Bytes::Block)), 0);
+            EXPECT_EQ(std::memcmp(beforeNative.data(), pool.owners.front()->native.blocks.data(),
+                beforeNative.size() * sizeof(Bytes::Block)), 0);
+            EXPECT_EQ(frame->status, status);
+        }
+        // The binding is required on both original native identities; an
+        // incomplete decoded capability cannot suppress an existing phase.
+        original.deviceCommunicator = nullptr;
+        EXPECT_FALSE(n::suppressAbortedNativeOwner<a::Slot64>(args, original, 1));
+    }
+}
+
 } // namespace llaminar2::test

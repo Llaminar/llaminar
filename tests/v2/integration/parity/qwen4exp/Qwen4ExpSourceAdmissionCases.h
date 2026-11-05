@@ -6,8 +6,12 @@
  * four explicit host-table requests each. An additive CUDA/CPU 15/33-layer family
  * retains the same full15 MTP dimension. Twelve rejection cases retain unsupported internally sharded
  * expert requests across GPU-plus-CPU tiers, pairing RAM with fixed-head VRAM.
+ * Shared coordinator source seeds retain SSD and full-RAM backing independently
+ * of existing matched-cache economy controls and their native receipts.
  * ConsumerLocal TP2 adds the existing C0/C64 axes with StaticOrdinal expert
  * policy and all four original MTP setup modes; actual grouped runtime must materialize.
+ * Q6 expert-owner candidates preserve Follower/Both roles and distinct static/
+ * dynamic expert requests over RAM/SSD C0/C64 and the same four MTP modes.
  * These are plain source-admission fixture inputs, never numerical campaign
  * registrations or claims that absent hardware or an unadmitted BOM is supported.
  * Reference metadata remains immutable provenance; the plain fixture does not
@@ -17,6 +21,7 @@
 
 #include "Qwen4ExpFixedHeadParityCases.h"
 #include "Qwen4ExpGPUAdaptiveParityCases.h"
+#include "Qwen4ExpOwnerSubsetParityCases.h"
 #include "Qwen4ExpMTPAdmissionCases.h"
 #include "Qwen4ExpROCm4OverlayPolicyParityCases.h"
 #include "backends/HardwareInventory.h"
@@ -101,6 +106,28 @@ inline std::vector<ModelParityCase> qwen4ExpExpandSourceAdmissionMTP(
     return result;
 }
 
+/**
+ * @return Sixteen original Q6 Off seeds, keeping static and movement obligations distinct.
+ * @details Existing MTP projection derives64 setup candidates; no inference is executed here.
+ */
+inline const std::vector<ModelParityCase>& qwen4ExpExpertFollowerOwnerSourceAdmissionSeeds()
+{
+    static const auto cases=[] {
+        std::vector<ModelParityCase> result;
+        for(const auto owners:{Qwen4ExpHardwareNgramOwners::Follower,Qwen4ExpHardwareNgramOwners::Both}){
+            auto definition=qwen4ExpExpertFollowerOwnerPressureDefinition(owners);
+            definition.features.mtp=ModelParityAxisProfile::Disabled;
+            definition.features.dynamic_speedup_witness=ModelParityDynamicSpeedupWitness::Disabled;
+            definition.model.shared_predictor.reset();definition.model.maximum_mtp_draft_depth=0;
+            for(auto cell:expandModelParityDefinition(definition))
+                if(cell.expert_overlay && cell.expert_overlay->owner_order==RoutedExpertOwnerOrder::Ordinal &&
+                   (cell.expert_overlay->movement==ModelParityExpertMovement::Static ||
+                    cell.expert_overlay->movement==ModelParityExpertMovement::Dynamic))result.push_back(std::move(cell));
+        }
+        if(result.size()!=16)throw std::logic_error("Q6 expert-owner source candidate product changed");
+        return result;
+    }();return cases;
+}
 /**
  * @return Four ConsumerLocal TP2 C0/C64 StaticOrdinal seeds over the existing original source/topology builder.
  * @note Policy expansion below supplies Off/Fixed1/Fixed3/Dynamic setup gates.
@@ -602,28 +629,54 @@ inline const std::vector<ModelParityCase> &qwen4ExpRejectedSourceAdmissionCases(
     }();
     return cases;
 }
-/** @return Original StaticOrdinal C0/C64 shared-source seeds; existing expansion supplies Off/1/3/Dynamic. */
+/**
+ * @brief Extend an original shared source definition over existing SSD/RAM backing.
+ * @param definition Original authored compute/storage owners and C0/C64 policies.
+ * @return Original two SSD StaticOrdinal seeds first, then their two RAM siblings.
+ * @throws std::logic_error If the existing source/cache product is incomplete.
+ * @throws std::invalid_argument For non-SSD, active-MTP or non-adaptive input seeds.
+ * @note Only source admission expands. Numerical/economy/runtime families and
+ * matched-cache RAM controls retain their original products and qualification.
+ */
+inline std::vector<ModelParityCase> qwen4ExpSharedCoordinatorBackingSourceSeeds(
+    const ModelParityDefinition& definition)
+{
+    std::vector<ModelParityCase> result;
+    for(auto cell:expandModelParityDefinition(definition))
+        if(cell.expert_overlay==std::optional{ModelParityExpertOverlayPolicy{}})
+            result.push_back(std::move(cell));
+    if(result.size()!=2)
+        throw std::logic_error("Shared coordinator source lost original SSD C0/C64 seeds");
+    for(const auto& seed:result)
+        if(!seed.ngram_table_policy || !seed.ngram_table_policy->isGPUAdaptive() ||
+           seed.ngram_table_policy->gpu_adaptive.source_backing!=AdaptiveImmutableRowBacking::SSD ||
+           seed.mtp!=ModelParityMTP::Off || seed.retained_mtp_draft_capacity!=0)
+            throw std::invalid_argument("Shared source backing expansion requires original SSD Off seeds");
+    // Preserve original source IDs/order. Full RAM owns its whole immutable
+    // backing and rejects a redundant host row cache; GPU owner requests stay
+    // byte-identical and PMA remains responsible for actual native admission.
+    for(size_t index=0;index<2;++index) {
+        auto ram=result[index];
+        auto& request=ram.ngram_table_policy->gpu_adaptive;
+        request.source_backing=AdaptiveImmutableRowBacking::RAM;
+        request.host={};
+        ram.ngram_table_policy->validate();
+        result.push_back(std::move(ram));
+    }
+    return result;
+}
+/** @return Original ROCm TP2 C0/C64 shared owners crossed with SSD/RAM; existing MTP expander supplies Off/1/3/Dynamic. */
 inline const std::vector<ModelParityCase>& qwen4ExpSharedCoordinatorTP2AdaptiveSourceAdmissionSeeds()
 {
-    static const auto cases=[] {
-        std::vector<ModelParityCase> result;
-        for(auto cell:expandModelParityDefinition(qwen4ExpSharedCoordinatorTP2AdaptiveDefinition()))
-            if(cell.expert_overlay==std::optional{ModelParityExpertOverlayPolicy{}})result.push_back(std::move(cell));
-        if(result.size()!=2)throw std::logic_error("Shared coordinator source family lost its C0/C64 original product");
-        return result;
-    }();
+    static const auto cases=qwen4ExpSharedCoordinatorBackingSourceSeeds(
+        qwen4ExpSharedCoordinatorTP2AdaptiveDefinition());
     return cases;
 }
-/** @return Distinct CUDA TP2 +ROCm-storage C0/C64 source seeds; original MTP expansion retains all four lanes. */
+/** @return Original CUDA TP2 and ROCm-only storage C0/C64 owners crossed with SSD/RAM, without extra ranks. */
 inline const std::vector<ModelParityCase>& qwen4ExpSharedCoordinatorCUDATP2AdaptiveSourceAdmissionSeeds()
 {
-    static const auto cases=[] {
-        std::vector<ModelParityCase> result;
-        for(auto cell:expandModelParityDefinition(qwen4ExpSharedCoordinatorCUDATP2AdaptiveDefinition()))
-            if(cell.expert_overlay==std::optional{ModelParityExpertOverlayPolicy{}})result.push_back(std::move(cell));
-        if(result.size()!=2)throw std::logic_error("CUDA shared coordinator source family lost its C0/C64 original product");
-        return result;
-    }();
+    static const auto cases=qwen4ExpSharedCoordinatorBackingSourceSeeds(
+        qwen4ExpSharedCoordinatorCUDATP2AdaptiveDefinition());
     return cases;
 }
 /** @return The same twelve production-default source controls, without speculative policy expansion. */

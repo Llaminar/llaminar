@@ -22,6 +22,7 @@
 #include "execution/local_execution/graph/RetainedHostServiceDeclarations.h"
 #include "execution/diagnostics/QueryKVGeometryObservation.h"
 #include "DeviceGraphOrchestrator.h"
+#include "loaders/ModelContext.h"
 #include "MTPGraphPolicyScopes.h"
 #include "execution/moe/MoEExpertOverlayExecutionPlan.h"
 #include "../../../backends/BackendManager.h"
@@ -4579,6 +4580,49 @@ namespace llaminar2
 
     DeviceGraphOrchestrator::~DeviceGraphOrchestrator()
     {
+        retireExecutionTopologyBeforeSharedStorageDetach();
+        // A singleton DGO is its own complete parent owner. Shared participants
+        // are detached by Rank only AFTER every child has crossed this phase.
+        if (auto model = std::dynamic_pointer_cast<ModelContext>(injected_model_ctx_)) {
+            std::shared_ptr<qwen4exp::PooledImmutableRetainedParticipants> original;
+            {
+                std::lock_guard lock(model->immutable_row_table_mutex_);
+                const auto found = model->adaptive_lookup_consumers_.find(state_.device_id);
+                if (found != model->adaptive_lookup_consumers_.end()) {
+                    const auto candidate = found->second.participants;
+                    std::size_t consumers = 0;
+                    for (const auto& [device, consumer] : model->adaptive_lookup_consumers_)
+                        if (candidate && consumer.participants == candidate) ++consumers;
+                    if (consumers == 1) original = candidate;
+                }
+            }
+            if (original) model->retireAdaptiveImmutableLookupParticipants(original);
+        }
+
+        /*
+         * Captured executables were the final borrowers of named workspace
+         * pointers. Only now may the allocator discard its publication map and
+         * expose the unchanged primary allocation to another runner. The
+         * registry retains failure state so OrchestrationRunner can invalidate
+         * the enclosing model-context contract after this destructor returns.
+         */
+        if (reusable_workspace_lease_)
+        {
+            std::string reuse_error;
+            if (!reusable_workspace_lease_->publishReusable(&reuse_error))
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] Could not seal reusable execution workspace on "
+                    << state_.device_id.toString() << ": "
+                    << (reuse_error.empty()
+                            ? std::string("unknown workspace lifecycle failure")
+                            : reuse_error));
+            }
+        }
+    }
+
+    void DeviceGraphOrchestrator::retireExecutionTopologyBeforeSharedStorageDetach() noexcept
+    {
         /*
          * Close every published GPU ownership edge before reverse-order member
          * destruction can release BufferArena storage ahead of graph caches and
@@ -4612,26 +4656,12 @@ namespace llaminar2
          */
         destroyCapturedExecutionTopologyBeforeArenaRelease();
 
-        /*
-         * Captured executables were the final borrowers of named workspace
-         * pointers. Only now may the allocator discard its publication map and
-         * expose the unchanged primary allocation to another runner. The
-         * registry retains failure state so OrchestrationRunner can invalidate
-         * the enclosing model-context contract after this destructor returns.
-         */
-        if (reusable_workspace_lease_)
-        {
-            std::string reuse_error;
-            if (!reusable_workspace_lease_->publishReusable(&reuse_error))
-            {
-                LOG_ERROR(
-                    "[DeviceGraphOrchestrator] Could not seal reusable execution workspace on "
-                    << state_.device_id.toString() << ": "
-                    << (reuse_error.empty()
-                            ? std::string("unknown workspace lifecycle failure")
-                            : reuse_error));
-            }
-        }
+        // The source/channel may outlive this runner. Retire only its exact
+        // canonical controller borrow, after every producer and native graph.
+        // Recurring participants retain their separate definition frontier;
+        // Rank closes that before any arena storage may become reusable.
+        retireRetainedStorageGenerationBinding();
+
     }
 
     void DeviceGraphOrchestrator::retirePublishedDeviceWorkBeforeArenaRelease() noexcept

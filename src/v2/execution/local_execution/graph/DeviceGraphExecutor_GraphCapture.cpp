@@ -2317,7 +2317,7 @@ namespace llaminar2
             definition->requireDefinition();
             if(cache.original_storage_attachment)throw std::logic_error("Original finite storage body already attached to this cache");
             cache.original_storage_attachment=definition->definition().plan->prepareOriginalStorageAttachment(
-                receiver,parent,cache.auxiliary_branch.get(),definition);
+                receiver,parent,cache.auxiliary_branch.get(),definition,graph);
             if(cache.original_storage_attachment)return cache.original_storage_attachment->attachTo(parent,cache.auxiliary_branch.get());
         }
         return !cache.auxiliary_branch || cache.auxiliary_branch->attach(parent);
@@ -2338,19 +2338,35 @@ namespace llaminar2
         const auto bind_on_original_worker=[&]{
             if(!worker->ownsCurrentThread())
                 throw std::logic_error("Original source preparation dispatch did not enter its actual worker");
+            // Early input publication authenticates this stream before the cache
+            // selects its capture variant. Derive only immutable graph identity,
+            // never live request counts or device values, from the actual graph.
+            // Initialized replay uses its sealed variant and constant-time
+            // provenance checks; it must not rescan stage launch descriptors.
+            const auto variant=cache.initialized ? cache.capture_variant_signature :
+                DeviceGraphCaptureController::computeCaptureVariantSignature(graph);
+            if(!arena_ || !variant || (cache.initialized && !cache.participant_preparation_stream) ||
+               (cache.capture_variant_signature && cache.capture_variant_signature!=variant))
+                throw std::logic_error("Original source preparation has missing arena or changed selected graph variant");
             if(!cache.participant_preparation_stream)
                 cache.participant_preparation_stream.reset(new RetainedGraphParticipantPreparationStream(original,cache.capture_stream,
                     RetainedGraphParticipantPreparationStream::Definition{&graph,arena_,graph.topologyGeneration(),
-                        cache.capture_variant_signature,source->definitionDomain(),source}));
+                        variant,source->definitionDomain(),source}));
+            const auto& definition=cache.participant_preparation_stream->definition();
+            if(definition.graph!=&graph || definition.arena!=arena_ ||
+               definition.topology_generation!=graph.topologyGeneration() || definition.variant!=variant ||
+               definition.domain!=source->definitionDomain() || definition.plan!=source ||
+               definition.plan.owner_before(source) || source.owner_before(definition.plan))
+                throw std::logic_error("Original source preparation changed its immutable graph/arena/topology/variant/plan");
             cache.participant_preparation_stream->requireLive(original);
             if(cache.participant_preparation_stream->stream()!=cache.capture_stream)
                 throw std::logic_error("Original source cache replaced its preparation stream without retirement");
-            source->authenticatePreparationStream(cache.participant_preparation_stream);
+            if(cache.initialized)cache.participant_preparation_stream->requireCurrentDefinition();
+            else source->authenticatePreparationStream(cache.participant_preparation_stream);
         };
-        // executeWithCachedGraphReplay is also entered from the control thread.
-        // Native stream creation already marshals to this worker; this cold
-        // capability publication must use the SAME authority before preparation.
-        // This call site is first-capture setup only, never steady replay.
+        // Early forward input publication and later capture both use this entry.
+        // Preserve the existing exact-worker authority for control-thread callers;
+        // ready caches validate their sealed borrow without repeating cold setup.
         if(worker->ownsCurrentThread())bind_on_original_worker();
         else worker->submitAndWait(bind_on_original_worker);
     }

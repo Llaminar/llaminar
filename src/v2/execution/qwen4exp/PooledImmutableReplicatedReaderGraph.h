@@ -26,6 +26,22 @@ struct PooledImmutableReplicatedReaderCompletion final {
     std::vector<Reader> readers;
     std::string sourceRead;
 };
+/** @brief Original foreign result/ACK node inventory, never native retirement authority. */
+struct PooledImmutableReplicatedConsumerCompletion final {
+    std::shared_ptr<const qwen4exp::PooledImmutableDirectedTransport> transport;
+    std::shared_ptr<const qwen4exp::PooledImmutableReplicatedReaderTransport> reader;
+    DeviceGenerationControlBinding control;
+    DeviceRowRange rows;
+    qwen4exp::PooledNativeTensorSpan output;
+    std::optional<qwen4exp::PooledNativeTensorSpan> count;
+    std::string header, accepted, payload, acknowledged, sent;
+};
+/** @return Exact typed ACK inventory in this actual cold recipient graph; duplicate or foreign definitions reject. */
+PooledImmutableReplicatedConsumerCompletion findPooledReplicatedConsumerCompletion(const ComputeGraph& graph,
+    const std::shared_ptr<const qwen4exp::PooledImmutableDirectedTransport>& transport, DeviceId device);
+/** @brief Authenticate the exact original foreign reader phases, receive receipt and ACK dependency chain. */
+void requirePooledReplicatedConsumerCompletion(const ComputeGraph& graph,
+    const PooledImmutableReplicatedConsumerCompletion& completion);
 /**
  * @brief Append source result sends and exact ACK validators after the original optimized Read.
  * @return Complete original node inventory; every ACK gates existing ReadersRetired.
@@ -44,7 +60,8 @@ PooledImmutableLookupGraphEndpoints appendPooledReplicatedReader(
     DeviceGenerationControlBinding control, DeviceRowRange originalRows,
     const qwen4exp::PooledNativeTensorSpan& output, const std::string& prefix,
     const std::string& outputIdentity,
-    std::optional<qwen4exp::PooledNativeTensorSpan> count = {});
+    std::optional<qwen4exp::PooledNativeTensorSpan> count = {},
+    PooledImmutableReplicatedConsumerCompletion* completion = nullptr);
 /** @brief Authenticate the exact original validators and every ACK→ReadersRetired dependency. */
 void requirePooledReplicatedReaderCompletion(const ComputeGraph& graph,
     const PooledImmutableReplicatedReaderCompletion& completion, const std::string& readersRetired);

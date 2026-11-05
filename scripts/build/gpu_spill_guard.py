@@ -140,10 +140,22 @@ def audit_rocm_object(path: Path, llvm_bin: Path) -> list[KernelSpills]:
                         for obj in notes for section in obj.get("NoteSections", [])
                         for note in section["NoteSection"]["Notes"]
                         if "AMDGPU Metadata" in note]
-            if len(metadata) != 1:
-                raise SpillGuardError(f"{target}: missing unique final AMDGPU metadata")
-            for kernel in parse_metadata(metadata[0]):
-                kernels.append(kernel)
+            if not metadata:
+                raise SpillGuardError(f"{target}: missing final AMDGPU metadata")
+            # Device LTO emits one metadata note per backend partition. Every
+            # partition is final allocation evidence; selecting the first note
+            # loses kernels. Names must be unique within this target, even if
+            # repeated records happen to agree. Distinct targets may legitimately
+            # repeat a name and still require their own allocation observations.
+            names: set[str] = set()
+            for partition in metadata:
+                if not isinstance(partition, str):
+                    raise SpillGuardError(f"{target}: malformed final AMDGPU metadata partition")
+                for kernel in parse_metadata(partition):
+                    if kernel.name in names:
+                        raise SpillGuardError(f"{target}: duplicate final kernel metadata: {kernel.name}")
+                    names.add(kernel.name)
+                    kernels.append(kernel)
     return kernels
 
 

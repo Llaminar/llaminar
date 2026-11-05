@@ -5,7 +5,12 @@
  * Workers execute CPU-only jobs. The source gate models native enqueue
  * backpressure, not GPU completion or model state. No vendor API is loaded.
  */
+#include "execution/moe/MoEOverlayFollowerRowGeometry.h"
+
 #include <gtest/gtest.h>
+#include "execution/local_execution/engine/ForwardGraphTypes.h"
+#include "execution/moe/MoEExpertOverlayExecutionPlan.h"
+#include "execution/qwen4exp/PooledImmutableParticipantExecutionPolicy.h"
 #include "execution/local_execution/graph/RetainedGraphParticipantEnqueueGroup.h"
 #include "mocks/MockWorkerGPUContext.h"
 #include "mocks/MockComputeStage.h"
@@ -14,6 +19,7 @@
 #include "memory/BufferArena.h"
 #include "execution/local_execution/graph/IRetainedGraphParticipants.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
+#include "execution/local_execution/graph/DeviceGraphCaptureController.h"
 #include "fixtures/execution/RetainedGraphParticipantsReplayAccess.h"
 #include "fixtures/backends/NativeContextPreparationReplayAccess.h"
 #include <atomic>
@@ -163,7 +169,7 @@ TEST(RetainedGraphParticipantEnqueueGroup, ColdOriginalPreparationMarshalsOffWor
   {
    const auto original=source->acquire(device);auto* worker=static_cast<ColdPreparationWorker*>(original.worker().get());
    auto plan=std::make_shared<ColdPreparationPlan>(original);ComputeGraph graph;graph.setRetainedParticipantSourcePlan(plan);
-   DeviceGraphExecutor executor;DeviceGraphExecutor::GraphSegmentCache cache;void* const exact=reinterpret_cast<void*>(0x8170);
+   DeviceGraphExecutor executor;BufferArena bindingArena;executor.setArena(&bindingArena);DeviceGraphExecutor::GraphSegmentCache cache;void* const exact=reinterpret_cast<void*>(0x8170);
    ASSERT_TRUE(cache.bindBorrowedCaptureStream(worker,exact,device,false));
    cache.retained_parent_capture=std::make_unique<testing::MockGPUGraphCapture>(exact);ASSERT_TRUE(cache.retained_parent_capture->beginCapture());ASSERT_TRUE(cache.retained_parent_capture->endCapture());ASSERT_TRUE(cache.retained_parent_capture->instantiate());
    EXPECT_FALSE(worker->ownsCurrentThread());const auto before=worker->submissions;
@@ -188,7 +194,7 @@ TEST(RetainedGraphParticipantEnqueueGroup, ColdOriginalPreparationRejectsForeign
  A::seed(device,[device](auto stack){return A::construct<ColdPreparationWorker>(std::move(stack),device.ordinal);});auto source=A::source<ColdPreparationWorker>(device);ColdPreparationRetirement retirement{device};
  {
   const auto original=source->acquire(device);auto* worker=static_cast<ColdPreparationWorker*>(original.worker().get());auto plan=std::make_shared<ColdPreparationPlan>(original);
-  ComputeGraph graph;graph.setRetainedParticipantSourcePlan(plan);DeviceGraphExecutor executor;DeviceGraphExecutor::GraphSegmentCache cache;testing::MockWorkerGPUContext foreign(72);
+  ComputeGraph graph;graph.setRetainedParticipantSourcePlan(plan);DeviceGraphExecutor executor;BufferArena bindingArena;executor.setArena(&bindingArena);DeviceGraphExecutor::GraphSegmentCache cache;testing::MockWorkerGPUContext foreign(72);
   const auto before=worker->submissions;
   EXPECT_THROW(RetainedGraphParticipantsReplayAccess::bindPreparation(executor,graph,cache,nullptr),std::invalid_argument);
   EXPECT_THROW(RetainedGraphParticipantsReplayAccess::bindPreparation(executor,graph,cache,&foreign),std::invalid_argument);

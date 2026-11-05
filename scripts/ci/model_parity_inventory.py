@@ -148,6 +148,7 @@ def select_cross_host_scenario_from_manifest(document: dict, exact: str) -> dict
 class InventoryScope(str, Enum):
     """Select a projection of existing cells, never a different configuration."""
     ALL = "all"
+    LOCAL_DIAGNOSTIC = "local-diagnostic"
     GENERATION = "generation"
     E2E = "e2e"
     CROSS_HOST_E2E = "cross-host-e2e"
@@ -167,7 +168,9 @@ class InventoryScope(str, Enum):
         if role == "numerical_diagnostic":
             if record["e2e"] is not None or record.get("cross_host_e2e"):
                 raise ValueError("numerical diagnostic cannot declare runtime certification eligibility")
-            return False
+            # Only an explicit local diagnostic can inspect these source-owned
+            # mathematical candidates. Ordinary/runtime inventories stay closed.
+            return self == InventoryScope.LOCAL_DIAGNOSTIC
         if self == InventoryScope.CROSS_HOST_E2E:
             return bool(cross_host_scenarios(record))
         if self == InventoryScope.GENERATION:
@@ -175,7 +178,7 @@ class InventoryScope(str, Enum):
             # another topology. Fixed depths remain mathematical diagnostics.
             from generation_regression_http import MTPPolicy, generation_profile
             return MTPPolicy(generation_profile(record)["mtp_policy"]) in (MTPPolicy.OFF, MTPPolicy.DYNAMIC)
-        return self == InventoryScope.ALL or record["e2e"] is not None
+        return self in (InventoryScope.ALL, InventoryScope.LOCAL_DIAGNOSTIC) or record["e2e"] is not None
 
 
 def model_source_fields(record: dict) -> dict[str, str]:
@@ -317,6 +320,8 @@ def discover(args: argparse.Namespace, scope: InventoryScope) -> list[tuple[pari
         # Existing E2E manifests predate the general projection. They remain
         # valid E2E inputs, but cannot assert coverage of untagged cells.
         declared = InventoryScope(manifest.get("scope", "e2e"))
+        if declared == InventoryScope.LOCAL_DIAGNOSTIC and scope != InventoryScope.LOCAL_DIAGNOSTIC:
+            raise ValueError("a local diagnostic manifest cannot become a canonical runtime inventory")
         if scope == InventoryScope.ALL and declared != InventoryScope.ALL:
             raise ValueError("the full matrix requires an all-cell manifest")
         if scope == InventoryScope.GENERATION and declared not in (InventoryScope.ALL, InventoryScope.GENERATION):

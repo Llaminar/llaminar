@@ -1,0 +1,36 @@
+--- a/llvm/lib/LTO/LTOBackend.cpp
++++ b/llvm/lib/LTO/LTOBackend.cpp
+@@ -569,8 +569,33 @@
+               std::unique_ptr<TargetMachine> TM =
+                   createTargetMachine(CodegenC.Conf, T, *MPartInCtx);
+ 
++              // A partition has a distinct LLVMContext. Its diagnostic handler
++              // prints analysis remarks, but cannot serialize them through the
++              // regular-LTO context's streamer. Give every final backend its
++              // own file and lifetime; object/assembly rounds must not overwrite
++              // one another when -save-temps requests both forms of codegen.
++              const Config &Conf = CodegenC.Conf;
++              std::string RemarksFilename;
++              if (!Conf.RemarksFilename.empty())
++                RemarksFilename =
++                    (Twine(Conf.RemarksFilename) + ".part." + Twine(ThreadId) +
++                     (CodegenC.CGFileType == CodeGenFileType::AssemblyFile
++                          ? ".asm."
++                          : ".obj.") +
++                     Conf.RemarksFormat)
++                        .str();
++              auto RemarksOrErr = lto::setupLLVMOptimizationRemarks(
++                  Ctx, RemarksFilename, Conf.RemarksPasses, Conf.RemarksFormat,
++                  Conf.RemarksWithHotness, Conf.RemarksHotnessThreshold);
++              if (!RemarksOrErr)
++                report_fatal_error(RemarksOrErr.takeError());
++              auto DiagnosticOutputFile = std::move(*RemarksOrErr);
++
+               codegen(CodegenC, TM.get(), AddStream, ThreadId, *MPartInCtx,
+                       CombinedIndex);
++              if (Error Err = lto::finalizeOptimizationRemarks(
++                      std::move(DiagnosticOutputFile)))
++                report_fatal_error(std::move(Err));
+             },
+             // Pass BC using std::move to ensure that it get moved rather than
+             // copied into the thread's context.

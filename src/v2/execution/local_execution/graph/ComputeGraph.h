@@ -279,6 +279,35 @@ namespace llaminar2
                 throw std::invalid_argument("Graph changed its original source definition domain");
             if(!participant_definition_domain_){participant_definition_domain_=domain;noteTopologyMutation();}
         }
+        /**
+         * @brief Associate exact source signature variants with one original expert follower parent.
+         * @param definitions Complete checked source variants of the same finite family/row shape.
+         * Every token retains the same original transport domain. This cold
+         * graph metadata grants neither an independent enqueue nor a source permit.
+         * A source-free family leaves this association absent.
+         */
+        void setRetainedParticipantSourceVariants(
+            std::vector<std::shared_ptr<const RetainedGraphParticipantPreparationStream>> definitions)
+        {
+            if (definitions.empty() || !participant_source_variants_.empty() || participant_source_plan_)
+                throw std::invalid_argument("Expert parent source variants are missing or already bound");
+            const auto domain = definitions.front() ? definitions.front()->definition().domain
+                : RetainedGraphParticipantDefinitionDomain{};
+            for (const auto& definition : definitions)
+            {
+                if (!definition || definition->definition().domain != domain)
+                    throw std::invalid_argument("Expert parent source variants have foreign original domains");
+                definition->requireCurrentDefinition();
+            }
+            if (participant_definition_domain_ && *participant_definition_domain_ != domain)
+                throw std::invalid_argument("Expert parent source variants changed the declared domain");
+            setRetainedParticipantDefinitionDomain(domain);
+            participant_source_variants_ = std::move(definitions);
+            noteTopologyMutation();
+        }
+        /** @return Original cold source associations, never a newest-token lookup. */
+        const auto& retainedParticipantSourceVariants() const noexcept { return participant_source_variants_; }
+
         /** @return Original graph-declared source relation; no-PLE graphs have none. */
         const auto& retainedParticipantDefinitionDomain()const noexcept{return participant_definition_domain_;}
 
@@ -666,6 +695,7 @@ namespace llaminar2
         std::uint64_t read_ahead_phase_identity_=0; ///< Typed phase and selected implementation, independent of M.
         std::optional<GraphReadAheadBranch> read_ahead_branch_; ///< Immutable native stream/event topology. ///< Explicit retained native I/O lane.
         std::optional<RetainedGraphParticipantDefinitionDomain> participant_definition_domain_;
+        std::vector<std::shared_ptr<const RetainedGraphParticipantPreparationStream>> participant_source_variants_;
     };
 
 } // namespace llaminar2

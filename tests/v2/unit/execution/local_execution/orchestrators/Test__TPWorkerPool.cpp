@@ -21,6 +21,17 @@
 
 namespace llaminar2::test
 {
+    /** @brief Observe only the existing mutex-owned callback/collector frontier; grants no execution authority. */
+    struct TPWorkerPoolCallbackLifecycleAccess {
+        static bool retiring(TPWorkerPool& pool) {
+            std::lock_guard lock(pool.mutex_);return pool.active_collectors_ != 0;
+        }
+        static bool failurePublishedWithResult(TPWorkerPool& pool) {
+            std::lock_guard lock(pool.mutex_);
+            return pool.failure_callback_generation_ == pool.collected_generation_;
+        }
+    };
+
     namespace
     {
         using namespace std::chrono_literals;
@@ -325,3 +336,64 @@ namespace llaminar2::test
     }
 
 } // namespace llaminar2::test
+
+namespace llaminar2::test {
+/** @test Participant completion cannot retire a still-running source callback or its delayed captured destructor. */
+TEST(Test__TPWorkerPool, CollectedFailureCallbackRetiresOriginalCaptureBeforeReplacement)
+{
+    TPWorkerPool pool(2);
+    std::promise<void> entered,release_callback,destruction_started,release_destruction;
+    auto entered_future=entered.get_future();auto callback_gate=release_callback.get_future().share();
+    auto destruction_future=destruction_started.get_future();auto destruction_gate=release_destruction.get_future().share();
+    std::atomic<bool> destroyed{false};std::atomic<unsigned> ordinary_aborts{0};
+    struct OriginalCapture {
+        std::promise<void>& entered;std::shared_future<void> release;std::atomic<bool>& destroyed;
+        OriginalCapture(std::promise<void>& entered,std::shared_future<void> release,std::atomic<bool>& destroyed)
+            :entered(entered),release(std::move(release)),destroyed(destroyed) {}
+        ~OriginalCapture(){entered.set_value();release.wait();destroyed.store(true,std::memory_order_release);}
+    };
+    auto original=std::make_shared<OriginalCapture>(destruction_started,destruction_gate,destroyed);
+    const std::weak_ptr<OriginalCapture> lifetime=original;
+    pool.setFailureCallback([original,&entered,callback_gate]{entered.set_value();callback_gate.wait();});
+    original.reset();
+    std::future<void> retired;bool callback_released=false,destruction_released=false;
+    struct Cleanup {
+        std::promise<void>& callback;std::promise<void>& destruction;bool& callback_released;bool& destruction_released;std::future<void>& retired;
+        ~Cleanup(){if(!callback_released)callback.set_value();if(!destruction_released)destruction.set_value();if(retired.valid())retired.wait();}
+    } cleanup{release_callback,release_destruction,callback_released,destruction_released,retired};
+    pool.dispatch([](std::size_t participant){return participant != 0;});
+    const auto results=pool.collectAll();ASSERT_EQ(results.size(),2u);
+    EXPECT_TRUE(TPWorkerPoolCallbackLifecycleAccess::failurePublishedWithResult(pool));
+    entered_future.get(); // Real callback is active even though original participant results are already collected.
+    retired=std::async(std::launch::async,[&]{pool.retireFailureCallback([&]{ordinary_aborts.fetch_add(1);});});
+    while (!TPWorkerPoolCallbackLifecycleAccess::retiring(pool) &&
+        retired.wait_for(std::chrono::seconds(0)) != std::future_status::ready) std::this_thread::yield();
+    ASSERT_TRUE(TPWorkerPoolCallbackLifecycleAccess::retiring(pool));
+    EXPECT_EQ(retired.wait_for(std::chrono::seconds(0)),std::future_status::timeout);
+    EXPECT_THROW(pool.dispatch([](std::size_t){return true;}),std::logic_error);
+    EXPECT_FALSE(lifetime.expired());
+    release_callback.set_value();callback_released=true;
+    destruction_future.get(); // Last source capture is destroying, not merely removed from the mutable slot.
+    EXPECT_FALSE(destroyed.load(std::memory_order_acquire));
+    EXPECT_EQ(retired.wait_for(std::chrono::seconds(0)),std::future_status::timeout);
+    release_destruction.set_value();destruction_released=true;retired.get();
+    EXPECT_TRUE(destroyed.load(std::memory_order_acquire));EXPECT_TRUE(lifetime.expired());
+    pool.dispatch([](std::size_t){return false;});(void)pool.collectAll();
+    pool.retireFailureCallback([&]{ordinary_aborts.fetch_add(1);});
+    EXPECT_EQ(ordinary_aborts.load(),1u); // Ordinary TP abort remains installed after source-specific withdrawal.
+}
+/** @test Every collected failure generation owns its callback before replacement; stale source captures cannot cross rearm. */
+TEST(Test__TPWorkerPool, CallbackRetirementFencesEveryCollectedFailureGeneration)
+{
+    TPWorkerPool pool(2);std::atomic<unsigned> original_calls{0},ordinary_calls{0};
+    for (unsigned generation=0;generation<20;++generation) {
+        pool.setFailureCallback([&]{original_calls.fetch_add(1,std::memory_order_release);});
+        pool.dispatch([](std::size_t participant){return participant != 0;});
+        (void)pool.collectAll();
+        EXPECT_TRUE(TPWorkerPoolCallbackLifecycleAccess::failurePublishedWithResult(pool));
+        pool.retireFailureCallback([&]{ordinary_calls.fetch_add(1,std::memory_order_release);});
+        EXPECT_EQ(original_calls.load(std::memory_order_acquire),generation+1u);
+        EXPECT_EQ(ordinary_calls.load(std::memory_order_acquire),0u);
+    }
+}
+}

@@ -6,6 +6,10 @@
  */
 #include <type_traits>
 #include <latch>
+#include <future>
+#include <mutex>
+#include <map>
+#include <chrono>
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/mtp/DeviceGenerationGraphProgram.h"
@@ -40,6 +44,10 @@ struct DeviceGraphOrchestratorLiveStateTestAccess {
         runner.device_generation_storage_.control_device=words;
         runner.device_generation_terminal_host_ready_event_=std::shared_ptr<void>(new int(1),[](void* p){delete static_cast<int*>(p);});
     }
+    /** @brief Invoke the original cold acquisition without admitting an I/O interval. */
+    static void prepareBinding(DeviceGraphOrchestrator& runner){runner.prepareRetainedStorageBinding();}
+    /** @return Whether the actual DGO acquired its original graph-retirement duty. */
+    static bool ownsBinding(const DeviceGraphOrchestrator& runner){return bool(runner.retained_storage_boundary_);}
     /** @brief Advance only the original host request epoch for a completed/reset interval. */
     static void epoch(DeviceGraphOrchestrator& runner,std::uint64_t value){runner.session_epoch_=value;}
     /** @brief Invoke the same original-stream binder used by ordinary and MTP parents. */
@@ -63,7 +71,14 @@ struct DeviceGraphOrchestratorLiveStateTestAccess {
     /** @return Original already-owned terminal event; creates no event. */
     static void* terminalEvent(const DeviceGraphOrchestrator& runner){return runner.device_generation_terminal_host_ready_event_.get();}
     /** @brief Withdraw test-only borrowed words before normal DGO destruction. */
-    static void clear(DeviceGraphOrchestrator& runner){runner.state_.device_id=DeviceId::cpu();runner.device_generation_storage_.control_device=nullptr;runner.device_generation_terminal_host_ready_event_.reset();}
+    static void clear(DeviceGraphOrchestrator& runner){
+        // These fixtures never submit native topology. Retire the actual empty
+        // graph inventory and its mock borrow while the injected words live;
+        // only then withdraw those test-owned words before ordinary teardown.
+        runner.destroyCapturedExecutionTopologyBeforeArenaRelease();
+        runner.retireRetainedStorageGenerationBinding();
+        runner.state_.device_id=DeviceId::cpu();runner.device_generation_storage_.control_device=nullptr;runner.device_generation_terminal_host_ready_event_.reset();
+    }
 };
 template<class Owner> concept PublicSharedChannelFinisher = requires(Owner& owner) {
     owner.finishNativeChannelsAfterProof();
@@ -94,6 +109,21 @@ struct RankRetainedStorageRetirementReplayAccess {
     static void awaitGroup(RankOrchestrator &rank) { rank.awaitRetainedSourceAdmission(); }
     /** @return Opaque identity only; no private source state or device state is fabricated. */
     static const void* admission(const RankOrchestrator& rank){return rank.retained_source_admission_.get();}
+    /** @return Actual passive model-publication selection, with no manufactured native authority. */
+    template<class Consumers, class Belongs>
+    static auto published(const Consumers& consumers, Belongs belongs) {
+        return RankOrchestrator::originalPublishedStorageParticipants(consumers, belongs);
+    }
+    /** @brief Invoke actual cold all-result aggregation without native/materialization capability. */
+    template<class Futures,class Retain,class Abort>
+    static auto collect(Futures& futures,Retain retain,Abort abort,std::exception_ptr first={}) {
+        return RankOrchestrator::collectOriginalParticipantConstructors(futures,retain,abort,first);
+    }
+    /** @brief Execute the original failure frontier without creating native proof or a substitute controller. */
+    template<class Participants,class Cancel,class Prove,class CancelStorage>
+    static void failedAttempt(const Participants& participants,Cancel cancel,Prove prove,CancelStorage cancelStorage) {
+        RankOrchestrator::failOriginalSourceAttempt(participants,cancel,prove,cancelStorage);
+    }
     template<class Participants,class Retire,class Finish,class AfterProof>
     static void retire(const Participants& participants,Retire retire,Finish finish,AfterProof afterProof){
         RankOrchestrator::retireOriginalStorageParticipants(participants,retire,finish,afterProof);
@@ -142,12 +172,18 @@ public:
         EXPECT_EQ(actual.original().device(),original.device());original.requireWorker(actual.original().worker());
         EXPECT_EQ(actual.original().memory(),original.memory());parent.emplace(actual);
     }
-    std::exception_ptr awaitFailure;std::function<void()> beforeAwait;mutable std::vector<int> trace;const int* expectedHealthy=nullptr;const int* expectedComplete=nullptr;int admissions=0;mutable int closes=0;bool active=false,failAdmission=false,failClose=false,failAwait=false;
+    std::exception_ptr awaitFailure;std::function<void()> beforeAwait;mutable std::vector<int> trace;const int* expectedHealthy=nullptr;const int* expectedComplete=nullptr;int admissions=0;mutable int closes=0;bool active=false,failAdmission=false,failClose=false,failAwait=false,failBind=false;int retirements=0;
     explicit Boundary(const PreparedGPUContextUsePermit& source):original(source),stream(source.worker()->defaultStream()){}
     DeviceId device()const noexcept override{return original.device();}
     std::uint64_t captureIdentity()const noexcept override{return 19;}
     std::optional<PreparedGPUContextUsePermit> retainedParticipantSource()const override{return original;}
-    void bindGenerationControl(RetainedStorageGenerationControl c)override{control=c;}
+    void bindGenerationControl(RetainedStorageGenerationControl c)override{if(failBind)throw std::runtime_error("original binding rejected");control=c;}
+    /** @brief Retire only the fixture's exact idle graph borrow. */
+    void retireGenerationControl(RetainedStorageGenerationControl old)override{
+        if(active || old.healthy!=control.healthy || old.error!=control.error)
+            throw std::logic_error("Fixture graph borrow is active or foreign");
+        ++retirements;control={};
+    }
     RetainedStorageGenerationControl generationControl()const override{return control;}
     void beginAdmission(std::uint64_t epoch,void* exact)override{EXPECT_TRUE(original.worker()->ownsCurrentThread());EXPECT_EQ(epoch,7u);EXPECT_EQ(exact,stream);++admissions;trace.push_back(1);if(failAdmission)throw std::runtime_error("original admission failure");active=true;}
     bool hasActiveInterval()const noexcept override{return active;}
@@ -269,7 +305,11 @@ public:
     /** @copydoc qwen4exp::IImmutableLookupKernels::consume */
     void consume(const qwen4exp::ImmutableLookupConsumeArgs&,void*)const override{ADD_FAILURE()<<"Admission replay must not execute a lookup";}
     /** @copydoc qwen4exp::IImmutableLookupKernels::close */
+    mutable unsigned closes=0; ///< Passive doubled ABI observation, not native execution evidence.
+    bool failClose=false; ///< Inject only a missing native close proof; original host owners remain real.
     void close(const qwen4exp::ImmutableLookupCloseArgs& args,void*)const override{
+        ++closes;
+        if(failClose)throw std::runtime_error("original reset producer proof missing");
         std::atomic_ref(args.channel.acknowledgement->closedGeneration).store(*args.generation,std::memory_order_release);
     }
 };
@@ -279,6 +319,14 @@ public:
     /** @brief Admit the full three-case original program set before creating any source owner. */
     explicit RankSourceProgram(DeviceType type):backend(type),devices{{{type,0},{type,1}}}{
         groupNative=&backend;
+        // Ordinary native registration exists in production even when the
+        // original source already published its prepared worker. This double
+        // supplies only that registration: creating any new context is fatal.
+        GPUContextFactory forbidBirth=[](int)->std::unique_ptr<IWorkerGPUContext>{
+            throw std::logic_error("Original source fixture forbids unrelated context creation");
+        };
+        if(type==DeviceType::CUDA)GPUDeviceContextPool::instance().registerNvidiaFactory(forbidBirth,2);
+        else GPUDeviceContextPool::instance().registerAMDFactory(forbidBirth,2);
         char path[]="/tmp/rank-original-source-XXXXXX";
         fd=::mkstemp(path);requireFile(fd>=0);filename=path;
         std::array<float,16> rows{};requireFile(::write(fd,rows.data(),sizeof(rows))==sizeof(rows));
@@ -289,6 +337,9 @@ public:
             PhysicalMemoryResource{0,devices[1],std::size_t{2}<<30,std::size_t{2}<<30}};
         source=Access::source<Worker>(devices,observations);
         for(std::size_t i=0;i<devices.size();++i)permits[i].emplace(source->acquire(devices[i]));
+        for(std::size_t i=0;i<devices.size();++i)
+            if(&GPUDeviceContextPool::instance().getContext(devices[i])!=permits[i]->worker().get())
+                throw std::logic_error("Ordinary lookup replaced the original prepared source worker");
         source->freezeForPlanning();
         PhysicalMemoryPlanBuilder bom(source->mandatoryBOM());
         const auto host=source->originalResource(DeviceId::cpu());
@@ -438,6 +489,27 @@ TEST(RetainedStorageRequestWorker,SourceGroupMembershipPreservesAuthoredTPOrderA
         EXPECT_FALSE(Membership::reuses(canonical,aliased));
         EXPECT_FALSE(Membership::same({foreign,a,7},authored[1]));
     }
+}
+/** @test Actual DGO retirement consumes each acquired borrow once and never retires rejected acquisition. */
+TEST(RetainedStorageRequestWorker,GenerationBindingRetiresOnlyAcquiredBorrowOnce){
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    for(auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})ASSERT_EXIT(([&]{
+        Source source(device);std::shared_ptr<Boundary> rejected;
+        {Runner fixture(source);rejected=fixture.boundary;rejected->failBind=true;
+         EXPECT_THROW(Peer::prepareBinding(*fixture.runner),std::runtime_error);
+         EXPECT_FALSE(Peer::ownsBinding(*fixture.runner));EXPECT_EQ(rejected->retirements,0);
+         EXPECT_EQ(rejected->generationControl().healthy,nullptr);}
+        EXPECT_EQ(rejected->retirements,0);rejected.reset();
+        std::shared_ptr<Boundary> acquired;
+        {Runner fixture(source);acquired=fixture.boundary;
+         EXPECT_NO_THROW(Peer::prepareBinding(*fixture.runner));
+         EXPECT_TRUE(Peer::ownsBinding(*fixture.runner));
+         Peer::clear(*fixture.runner);EXPECT_FALSE(Peer::ownsBinding(*fixture.runner));
+         EXPECT_EQ(acquired->retirements,1);
+         Peer::clear(*fixture.runner);EXPECT_EQ(acquired->retirements,1);}
+        EXPECT_EQ(acquired->retirements,1);acquired.reset();
+        source.retire();std::_Exit(::testing::Test::HasFailure()?2:0);
+    }()),::testing::ExitedWithCode(0),"");
 }
 TEST(RetainedStorageRequestWorker,EveryMainSourceRoleArmsBeforeLiveStateMutation){
     GTEST_FLAG_SET(death_test_style,"threadsafe");for(auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})ASSERT_EXIT(([&]{
@@ -794,4 +866,244 @@ TEST(RetainedStorageRequestWorker, SharedReaderChannelsRetireOnlyAfterAllOrigina
         [] { throw std::range_error("missing original group proof"); }, [&] { ++channels; }), std::range_error);
     EXPECT_EQ(channels, 0);
 }
+} // namespace llaminar2::test
+
+/** @test First/middle/last cold failures signal peers before all results are drained. */
+TEST(RetainedStorageRequestWorker, RankConstructionConsumesAllOriginalResultsBeforeTeardown)
+{
+    struct Result { int index; std::exception_ptr failure; };
+    for(int failed=0;failed<3;++failed) for(bool throws:{false,true}) {
+        std::promise<void> released;auto ready=released.get_future().share();
+        std::once_flag once;std::atomic<int> aborts=0,finished=0;
+        std::vector<std::future<Result>> futures;
+        for(int index=0;index<3;++index) futures.push_back(std::async(std::launch::async,[&,index] {
+            if(index>failed && ready.wait_for(std::chrono::seconds(1))!=std::future_status::ready)
+                throw std::runtime_error("original peer was not aborted before drain");
+            ++finished;
+            if(index==failed) {
+                const auto original=std::make_exception_ptr(std::runtime_error("original constructor "+std::to_string(index)));
+                if(throws)std::rethrow_exception(original);
+                return Result{index,original};
+            }
+            return Result{index,{}};
+        }));
+        std::vector<int> retained;retained.reserve(3);
+        const auto error=llaminar2::test::RankRetainedStorageRetirementReplayAccess::collect(futures,
+            [&](Result result)noexcept{retained.push_back(result.index);},
+            [&]{++aborts;std::call_once(once,[&]{released.set_value();});});
+        EXPECT_EQ(finished,3);EXPECT_GT(aborts,0);ASSERT_TRUE(error);
+        try{std::rethrow_exception(error);}catch(const std::runtime_error& failure){
+            EXPECT_EQ(failure.what(),"original constructor "+std::to_string(failed));
+        }
+        EXPECT_EQ(retained.size(),throws?2u:3u);
+        for(auto& future:futures)EXPECT_FALSE(future.valid());
+    }
+}
+
+/** @test Partial async submission retains its original error and aborts before any peer wait. */
+TEST(RetainedStorageRequestWorker, RankPartialConstructionSubmissionAbortsBeforeJoiningOriginalJobs)
+{
+    struct Result { int index; std::exception_ptr failure; };
+    std::promise<void> released;auto ready=released.get_future().share();
+    std::once_flag once;std::vector<std::future<Result>> futures;
+    for(int index=0;index<2;++index)futures.push_back(std::async(std::launch::async,[&,index]{
+        if(ready.wait_for(std::chrono::seconds(1))!=std::future_status::ready)
+            throw std::runtime_error("partial launch peers were not aborted");
+        return Result{index,{}};
+    }));
+    std::vector<int> retained;retained.reserve(2);
+    const auto original=std::make_exception_ptr(std::runtime_error("original async launch failure"));
+    const auto observed=llaminar2::test::RankRetainedStorageRetirementReplayAccess::collect(futures,
+        [&](Result result)noexcept{retained.push_back(result.index);},
+        [&]{std::call_once(once,[&]{released.set_value();});},original);
+    EXPECT_EQ(observed,original);EXPECT_EQ(retained,(std::vector<int>{0,1}));
+    for(auto& future:futures)EXPECT_FALSE(future.valid());
+}
+
+/** @test Failed child construction cannot strand a published source behind a dead original parent. */
+TEST(RetainedStorageRequestWorker, FailedConstructorsRetireOriginalPublishedSourceBeforeParent)
+{
+    using Access = llaminar2::test::RankRetainedStorageRetirementReplayAccess;
+    struct Source { const void* cohort; bool retired = false; };
+    struct Consumer { std::shared_ptr<Source> participants; std::exception_ptr poison; };
+    struct Result { bool runner; std::exception_ptr failure; };
+    for (bool returnedSibling : {false, true}) {
+        int originalParent = 0, foreignParent = 0;
+        bool parentAlive = true;
+        const auto poison = std::make_exception_ptr(std::runtime_error("original poisoned cold source"));
+        auto original = std::make_shared<Source>(Source{&originalParent});
+        auto foreign = std::make_shared<Source>(Source{&foreignParent});
+        std::map<int, Consumer> published{{0, {original, poison}}, {1, {original, poison}},
+            {2, {foreign, {}}}, {3, {{}, poison}}};
+        // Publication is already complete when these original constructor
+        // results arrive. Failed constructors return no DGO whose device could
+        // recover this source from the successful-child roster.
+        std::vector<std::future<Result>> futures;
+        std::promise<Result> sourceJob, peerJob;
+        futures.push_back(sourceJob.get_future()); futures.push_back(peerJob.get_future());
+        sourceJob.set_value({false, poison}); peerJob.set_value({returnedSibling, {}});
+        int returned = 0, aborts = 0;
+        const auto failure = Access::collect(futures, [&](Result value) noexcept { returned += value.runner; },
+            [&] { ++aborts; });
+        ASSERT_EQ(failure, poison); EXPECT_EQ(returned, returnedSibling ? 1 : 0); EXPECT_GT(aborts, 0);
+        // Retain the original successful-child-only production loop as a
+        // negative control. These are metadata API doubles, not native owners.
+        struct Child { virtual ~Child() = default; };
+        struct DeviceGraphOrchestrator : Child { struct { int device_id; } state_; };
+        std::vector<std::unique_ptr<Child>> device_runners_;
+        if (returnedSibling) {
+            auto child = std::make_unique<DeviceGraphOrchestrator>(); child->state_.device_id = 1;
+            device_runners_.push_back(std::move(child));
+        }
+        struct Model { decltype(published)& adaptive_lookup_consumers_; } originalModel{published};
+        const auto* model = &originalModel;
+        std::vector<std::shared_ptr<Source>> originalSelection;
+        { auto& originals = originalSelection;
+            for (const auto& runner : device_runners_) {
+                const auto* device = dynamic_cast<const DeviceGraphOrchestrator*>(runner.get());
+                if (!device) continue;
+                const auto found = model->adaptive_lookup_consumers_.find(device->state_.device_id);
+                if (found == model->adaptive_lookup_consumers_.end() || !found->second.participants) continue;
+                const auto& original = found->second.participants;
+                if (std::find(originals.begin(), originals.end(), original) == originals.end())
+                    originals.push_back(original);
+            }
+        }
+        EXPECT_EQ(originalSelection.size(), returnedSibling ? 1u : 0u);
+        originalSelection.clear();
+        const auto originals = Access::published(published, [&](int, const auto& source) {
+            return source->cohort == &originalParent;
+        });
+        ASSERT_EQ(originals.size(), 1u); ASSERT_EQ(originals.front(), original);
+        // Use the actual Rank retirement fanout as well as its publication
+        // selector. The original model entries retain poison after detachment.
+        Access::retire(originals, [&](const auto& source) {
+            ASSERT_TRUE(parentAlive); ASSERT_FALSE(source->retired); source->retired = true;
+            for (auto& [device, consumer] : published)
+                if (consumer.participants == source) consumer.participants.reset();
+        }, [] {});
+        parentAlive = false;
+        EXPECT_TRUE(original->retired); EXPECT_FALSE(foreign->retired);
+        EXPECT_EQ(published.at(2).participants, foreign);
+        EXPECT_EQ(published.at(0).poison, poison); EXPECT_EQ(published.at(1).poison, poison);
+        EXPECT_EQ(published.at(3).poison, poison);
+        EXPECT_TRUE(Access::published(published, [&](int, const auto& source) {
+            return source->cohort == &originalParent;
+        }).empty());
+        // Final model release has no remaining original runtime borrow.
+        published.clear();
+        EXPECT_EQ(original.use_count(), 2); // local and already-retired snapshot only
+    }
+}
+
+namespace llaminar2::test {
+/** @test The actual Rank source-attempt failure publishes original DGO producer proof before outer command abort. */
+TEST(RetainedStorageRequestWorker, FailedHostAttemptProvesOriginalProducersBeforeOwnerDrain)
+{
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    for (const auto type : {DeviceType::CUDA,DeviceType::ROCm}) ASSERT_EXIT(([&] {
+        {
+            RankSourceProgram program(type);
+            {
+                RankSourceCohort failed(program,0);
+                EXPECT_FALSE(failed.forward(0));
+                // Peer one was actually admitted before peer zero returned
+                // false. The production Attempt already closed that producer
+                // through its original DGO/event owner, without awaiting peers.
+                EXPECT_EQ(failed.kernels[1]->closes,1u);
+                EXPECT_NE(RankRetainedStorageRetirementReplayAccess::admission(*failed.rank),nullptr);
+                EXPECT_THROW(failed.forward(),std::logic_error);
+                failed.close(true);
+                EXPECT_THROW(RankRetainedStorageRetirementReplayAccess::awaitGroup(*failed.rank),RetiredStorageRequestFailure);
+            }
+            {
+                // A fresh legitimate runner uses the SAME actual source/PMA
+                // and original workers after failed owners fully retire.
+                RankSourceCohort replacement(program,1);
+                ASSERT_TRUE(replacement.forward());replacement.close();
+                EXPECT_NO_THROW(RankRetainedStorageRetirementReplayAccess::awaitGroup(*replacement.rank));
+            }
+        }
+        std::_Exit(::testing::Test::HasFailure()?2:0);
+    }()),::testing::ExitedWithCode(0),"");
+}
+/** @test Recorded accepted-owner waits release only after all original producer proofs; missing proof never fabricates readiness. */
+TEST(RetainedStorageRequestWorker, FailedHostAttemptOrdersPartialOwnerReleaseAndPreservesMissingProof)
+{
+    using Access=RankRetainedStorageRetirementReplayAccess;
+    const std::array producers{0,1};
+    for (const int missing : {-1,0,1}) {
+        std::vector<int> order;bool storage_cancelled=false;
+        const auto operation=[&] {
+            Access::failedAttempt(producers,[&] {order.push_back(10);},[&](int participant) {
+                order.push_back(participant);
+                if (participant==missing) throw std::runtime_error(participant?"original reader producer proof missing":"original source producer proof missing");
+            },[&] {order.push_back(20);storage_cancelled=true;});
+        };
+        if (missing<0) {
+            EXPECT_NO_THROW(operation());EXPECT_TRUE(storage_cancelled);
+            EXPECT_EQ(order,(std::vector<int>{10,0,1,20}));
+            // This is the later synchronous publisher-abort frontier. It can
+            // now drain a previously accepted finite owner body waiting source.
+            EXPECT_TRUE(storage_cancelled);order.push_back(30);
+            EXPECT_EQ(order.back(),30);
+        } else {
+            try {operation();FAIL()<<"Original producer proof failure disappeared";}
+            catch (const std::runtime_error& error) {EXPECT_STREQ(error.what(),missing?"original reader producer proof missing":"original source producer proof missing");}
+            EXPECT_FALSE(storage_cancelled);EXPECT_EQ(order,(std::vector<int>{10,0,1}));
+        }
+    }
+    std::vector<int> attempted;bool released=false;
+    EXPECT_THROW(Access::failedAttempt(producers,[]{throw std::runtime_error("original cancellation identity lost");},
+        [&](int participant){attempted.push_back(participant);},[&]{released=true;}),std::runtime_error);
+    EXPECT_EQ(attempted,(std::vector<int>{0,1}));EXPECT_TRUE(released);
+    for (const bool storage_phase : {false,true}) {
+        attempted.clear();released=false;
+        const auto fail=[&] {
+            Access::failedAttempt(producers,[&] {
+                if (!storage_phase) throw Access::failedService("original typed signal failure");
+            },[&](int participant){attempted.push_back(participant);},[&] {
+                released=true;
+                if (storage_phase) throw Access::failedService("original typed storage cancellation failure");
+            });
+        };
+        try {fail();FAIL()<<"Cancellation-phase failure disappeared";}
+        catch (const RetiredStorageRequestFailure&) {FAIL()<<"Cancellation cannot certify semantic-only retirement";}
+        catch (const std::runtime_error& error) {
+            EXPECT_NE(std::string(error.what()).find(storage_phase?"original typed storage cancellation failure":"original typed signal failure"),std::string::npos);
+        }
+        EXPECT_EQ(attempted,(std::vector<int>{0,1}));EXPECT_TRUE(released);
+    }
+}
+}
+
+namespace llaminar2::test {
+/** @test Failed reset retains the original source borrow until exact producer proof can actually retire it. */
+TEST(RetainedStorageRequestWorker, FailedResetRetainsOriginalSourceAndCallbackOwnership)
+{
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    for(const auto type:{DeviceType::CUDA,DeviceType::ROCm})ASSERT_EXIT(([&] {
+        ::dup2(STDERR_FILENO,STDOUT_FILENO);
+        {
+            RankSourceProgram program(type);RankSourceCohort original(program,0);
+            ASSERT_TRUE(original.forward());
+            const auto identity=RankRetainedStorageRetirementReplayAccess::admission(*original.rank);
+            original.kernels[0]->failClose=true;
+            try {
+                original.rank->resetInferenceState(InferenceStateResetRequest::requestBoundary("missing-original-proof"));
+                FAIL()<<"Missing original reset proof was accepted";
+            } catch(const std::runtime_error& error) {
+                EXPECT_STREQ(error.what(),"Original grouped reset could not join prior GPU producers");
+            }
+            EXPECT_EQ(RankRetainedStorageRetirementReplayAccess::admission(*original.rank),identity);
+            EXPECT_TRUE(original.boundaries[0]->hasActiveInterval());
+            EXPECT_THROW(original.forward(),std::logic_error);
+            original.kernels[0]->failClose=false;
+            original.close(true);
+            EXPECT_THROW(RankRetainedStorageRetirementReplayAccess::awaitGroup(*original.rank),RetiredStorageRequestFailure);
+        }
+        std::_Exit(::testing::Test::HasFailure()?2:0);
+    })(),::testing::ExitedWithCode(0),"");
+}
+
 } // namespace llaminar2::test

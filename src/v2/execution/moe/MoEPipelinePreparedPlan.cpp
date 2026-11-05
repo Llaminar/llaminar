@@ -6,6 +6,8 @@
  * residency constructor. Only the immutable initial placements cross runner
  * lifetimes; the same PMA remains the sole allocator authority throughout.
  * CPU root declarations remain stage-owned across child projection and reuse.
+ * Every fresh stage registry receives the identity of this same retained model,
+ * so later prepared-source binding authenticates the actual original owner.
  */
 #include "MoEPipelinePreparedPlan.h"
 #include "MoEOverlayCPUHostMaintenance.h"
@@ -84,7 +86,8 @@ namespace llaminar2
             const auto setup = MoEOverlayResidencySetup::create({
                 .plan = plan, .metadata = prepared.metadata, .loader = loader,
                 .rebalance = requested.config().moe_rebalance, .storage_policy = admitted.storagePolicy(),
-                .capacity = *admitted.capacity(), .memory = memory});
+                .capacity = *admitted.capacity(), .memory = memory,
+                .original_model = ModelContextId{reinterpret_cast<uint64_t>(model.get())}});
             std::shared_ptr<MoEOverlayCPUHostMaintenance> host_maintenance;
             if (requested.config().moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic &&
                 plan.authority_execution == MoEOverlayAuthorityExecutionKind::HostResident &&

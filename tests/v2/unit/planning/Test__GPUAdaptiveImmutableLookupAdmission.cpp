@@ -28,6 +28,7 @@
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <array>
+#include <iostream>
 #include <limits>
 #include <type_traits>
 using namespace llaminar2;
@@ -877,23 +878,27 @@ void replayBalancedSharedCache(DeviceType backend,std::size_t count,bool constra
         EXPECT_EQ(bytes(selected.physical_plan,id,owner),bom.bytes(owner));
     }
 }
-/** @brief Actual grouped planner keeps a third physical owner and one source through final selection/wire.
+/** @brief Actual grouped planner keeps original native continuation owners or opposite-vendor storage through selection/wire.
  * @param backend Original homogeneous compute backend.
  * @param cacheRows Declared zero/positive storage-owner cache envelope. */
 void replaySharedPlanning(DeviceType backend=DeviceType::ROCm,std::size_t cacheRows=64)
 {
     const auto devices=backend==DeviceType::CUDA ?
         std::vector{DeviceId::cuda(0),DeviceId::cuda(1),DeviceId::rocm(0)} :
-        std::vector{DeviceId::rocm(0),DeviceId::rocm(1),DeviceId::rocm(2)};
+        std::vector{DeviceId::rocm(0),DeviceId::rocm(1)};
     SharedPlanningSource originals(devices);
     test::Qwen4ExpPlanningGGUFFixture file;PlanningModelSource model(file.path());
     const auto& profile=model.metadata().memoryProfile();
     std::vector<DevicePlanConfig> configs{consumer(backend),consumer(backend)};
     auto requested=policy(64);
     requested.gpu_adaptive.maximum_gpu_cache_rows=0;requested.gpu_adaptive.gpu_cache_physical_byte_limit=0;
-    requested.gpu_adaptive.placement={AdaptiveGPUCachePlacementMode::DeclaredRankLocal,
-        {{{0,devices[2].type,devices[2].ordinal},cacheRows,1048576}},
-        AdaptiveGPUCacheParticipant{0,devices[1].type,devices[1].ordinal}};
+    requested.gpu_adaptive.placement.mode=AdaptiveGPUCachePlacementMode::DeclaredRankLocal;
+    requested.gpu_adaptive.placement.coordinator=AdaptiveGPUCacheParticipant{0,devices[1].type,devices[1].ordinal};
+    requested.gpu_adaptive.placement.owners.clear();
+    if(backend==DeviceType::CUDA)
+        requested.gpu_adaptive.placement.owners.push_back({{0,devices[2].type,devices[2].ordinal},cacheRows,1048576});
+    else for(const auto device:devices)
+        requested.gpu_adaptive.placement.owners.push_back({{0,device.type,device.ordinal},cacheRows,1048576});
     const auto projection=test::NativeOrderingEventGroupReplayAccess::projectionWithRemoteGraphs(originals.devices);
     const auto assignment=TensorParallelConfig::equalSplit(2,profile.n_heads,profile.n_kv_heads,
         profile.d_ff,profile.vocab_size,std::vector<DeviceId>{originals.devices[1],originals.devices[0]});
@@ -920,13 +925,18 @@ void replaySharedPlanning(DeviceType backend=DeviceType::ROCm,std::size_t cacheR
     const auto geometry=AdaptiveImmutableLookupGeometry::fromLayout(selected.placement->gpuAdaptiveLayout(),source(profile),requested.gpu_adaptive);
     ASSERT_TRUE(geometry.readerGeometry());
     EXPECT_EQ(geometry.physical().coordinator().device,devices[1]);
-    ASSERT_EQ(geometry.physical().owners().size(),1u);
-    EXPECT_EQ(geometry.physical().owners().front().allocator.device,devices[2]);
-    EXPECT_EQ(geometry.physical().owners().front().slots,cacheRows);
+    ASSERT_EQ(geometry.physical().owners().size(),backend==DeviceType::CUDA?1u:2u);
+    for(size_t owner=0;owner<geometry.physical().owners().size();++owner){
+        EXPECT_EQ(geometry.physical().owners()[owner].allocator.device,devices[backend==DeviceType::CUDA?2:owner]);
+        EXPECT_EQ(geometry.physical().owners()[owner].slots,cacheRows);
+    }
+    ASSERT_TRUE(geometry.readerGeometry()->nativeCollective());
+    EXPECT_THROW(geometry.readerGeometry()->payloadStorage({0,devices[0]}),std::logic_error);
+    EXPECT_THROW(geometry.readerGeometry()->resultMemory({0,devices[0]}),std::logic_error);
+    EXPECT_THROW(geometry.readerGeometry()->acknowledgementMemory({0,devices[0]}),std::logic_error);
     EXPECT_EQ(geometry.computeReaderCount(),2u);
     if(backend==DeviceType::CUDA){
         EXPECT_FALSE(geometry.physical().peerAccess());
-        EXPECT_EQ(geometry.readerGeometry()->payloadStorage({0,devices[0]}),CapturedTransferPayloadStorage::MappedHost);
         const auto transport=qwen4exp::PooledImmutableDirectedChannelGeometry::fromGeometry(
             geometry.physical(),geometry.coordinator(),0);
         EXPECT_EQ(transport.forwardMemory().producer_payload_bytes,0u);
@@ -935,7 +945,8 @@ void replaySharedPlanning(DeviceType backend=DeviceType::ROCm,std::size_t cacheR
         EXPECT_GT(transport.reverseMemory().mapped_host_bytes,0u);
     }
     EXPECT_EQ(geometry.host().slots(),64u);
-    EXPECT_EQ(geometry.mandatoryDeviceBytes({0,devices[0]}),0u);
+    if(backend==DeviceType::CUDA) EXPECT_EQ(geometry.mandatoryDeviceBytes({0,devices[0]}),0u);
+    else EXPECT_GT(geometry.mandatoryDeviceBytes({0,devices[0]}),0u);
     for(const auto& identity:q.execution_provision->consumers()){
         const auto cfg=std::find_if(configs.begin(),configs.end(),[&](const auto& value){return value.device==identity.resource.device;});
         ASSERT_NE(cfg,configs.end());EXPECT_EQ(identity.tp_coordinate,cfg->shard_index);
@@ -952,7 +963,10 @@ void replaySharedPlanning(DeviceType backend=DeviceType::ROCm,std::size_t cacheR
     const auto retained=MemoryPlanner::plan(profile,resolved).physicalPlan();
     EXPECT_FALSE(selected.physical_plan.requiredFootprintMismatch(retained));
     EXPECT_FALSE(retained.requiredFootprintMismatch(selected.physical_plan));
-    EXPECT_EQ(bytes(retained,{0,devices[0]},PhysicalMemoryOwner::ImmutableLookupStaging),0u);
+    // A compute reader that also owns rows retains its original owner frame
+    // and native staging. A reader without storage still contributes zero.
+    EXPECT_EQ(bytes(retained,{0,devices[0]},PhysicalMemoryOwner::ImmutableLookupStaging),
+        geometry.mandatoryDeviceBytes({0,devices[0]}));
     EXPECT_GT(bytes(retained,{0,devices[0]},PhysicalMemoryOwner::ActivationTransportStaging),0u);
     const auto source_view=AdaptiveImmutableLookupGeometry::sourceLayout(selected.placement->gpuAdaptiveLayout(),requested.gpu_adaptive);
     const auto one=AdaptiveImmutableLookupGeometry::fromLayout(source_view,source(profile),requested.gpu_adaptive);
@@ -978,14 +992,16 @@ TEST(GPUAdaptiveImmutableLookupAdmission, SharedDirectoryPressureBalancesEveryFe
 /** @test Each replay owns its true original process/source/PMA; no authority reset bypass is used. */
 TEST(GPUAdaptiveImmutableLookupAdmission, SharedCoordinatorTP2OriginalPMAAndWireReplay)
 {
-    EXPECT_EXIT({replaySharedPlanning();std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
+    for(const std::size_t rows:{0u,64u})
+        EXPECT_EXIT({replaySharedPlanning(DeviceType::ROCm,rows);std::cout.flush();std::cerr.flush();std::_Exit(::testing::Test::HasFailure()?1:0);},
+            ::testing::ExitedWithCode(0),"");
 }
 
 /** @test The actual original three-device source funds CUDA NoPeer readers and ROCm storage once across C0/positive wire replay. */
 TEST(GPUAdaptiveImmutableLookupAdmission, SharedCoordinatorCUDATP2OriginalPMAAndMappedWireReplay)
 {
     for(const std::size_t rows:{0u,64u})
-        EXPECT_EXIT({replaySharedPlanning(DeviceType::CUDA,rows);std::_Exit(::testing::Test::HasFailure()?1:0);},
+        EXPECT_EXIT({replaySharedPlanning(DeviceType::CUDA,rows);std::cout.flush();std::cerr.flush();std::_Exit(::testing::Test::HasFailure()?1:0);},
             ::testing::ExitedWithCode(0),"");
 }
 

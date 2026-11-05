@@ -8,6 +8,8 @@
  * inference or reads/hashes tensor payloads. Whole, fixed-head and adaptive
  * layouts retain distinct owner contracts; planned capacity is not live bytes.
  * The runner and model certificate remain alive throughout every observation.
+ * Expert-owner source proofs retain only weak native-parent witnesses across
+ * original-contract reuse; attachment evidence explicitly claims no execution.
  * Active policies authenticate real retained sidecar/forward setup; they do not
  * claim generation-controller execution or numerical sidecar certification.
  */
@@ -165,6 +167,56 @@ inline void expectQwen4ExpSourceDomains(OrchestrationConfig authored, const Orch
 
 
 /**
+ * @brief Authenticate actual cold expert-parent attachments through the existing original participant authority.
+ * @param cell Unchanged canonical case.
+ * @param original SAME retained model/source/PMA contract used by ordinary source proof.
+ * @param output Owned rank evidence file for this original or replacement lifetime.
+ * @param observations Weak original native-parent witnesses returned for the existing reuse frontier.
+ * @throws std::exception For stale original participant/worker/parent authority.
+ * @note Parent attachment proves setup only, never execution, useful traffic or cache movement.
+ */
+inline void expectQwen4ExpSourceExpertLookupParents(const ModelParityCase& cell,
+    const ModelContextReuseContract& original,const std::filesystem::path& output,
+    std::vector<::llaminar2::qwen4exp::PooledImmutableRetainedParticipants::ExpertOwnerParentObservation>& observations)
+{
+    const auto placement=original.context->resolvedImmutableRowTablePlacement();
+    const auto expected=qwen4ExpSourceExpertLookupOwners(cell,placement.get());
+    if(expected.empty())return;
+    ASSERT_TRUE(placement->gpuAdaptiveRequest().placement.coordinator);
+    const auto coordinator=placement->gpuAdaptiveRequest().placement.coordinator->device();
+    const auto participants=original.context->adaptiveImmutableLookupParticipants(coordinator);
+    ASSERT_TRUE(participants);ASSERT_NO_THROW(participants->requireCurrent());
+    observations=participants->expertOwnerParentObservations();
+    ASSERT_EQ(observations.size(),expected.size());
+    std::vector<PhysicalMemoryAllocatorIdentity> seen;
+    std::ofstream proof(output);ASSERT_TRUE(proof.is_open());
+    proof<<"world_rank,device,owner_coordinate,worker_generation,attached_parents,source_variants,execution_proven\n";
+    for(const auto& actual:observations){
+        EXPECT_EQ(std::find(seen.begin(),seen.end(),actual.allocator),seen.end());
+        seen.push_back(actual.allocator);
+        ASSERT_NE(std::find(expected.begin(),expected.end(),actual.allocator),expected.end());
+        EXPECT_EQ(actual.allocator.world_rank,original.physical_memory_authority->worldRank());
+        const auto& declared=placement->gpuAdaptiveRequest().placement.owners;
+        ASSERT_LT(actual.owner_coordinate,declared.size());
+        EXPECT_EQ(actual.allocator,(PhysicalMemoryAllocatorIdentity{
+            declared[actual.owner_coordinate].participant.world_rank,
+            declared[actual.owner_coordinate].participant.device()}));
+        EXPECT_EQ(actual.memory_identity,original.physical_memory_authority.get());
+        const auto permit=participants->originalParticipant(actual.allocator.device);
+        EXPECT_EQ(actual.worker_generation,permit.generation());
+        const auto worker=actual.worker.lock();ASSERT_TRUE(worker);EXPECT_EQ(worker,permit.worker());
+        EXPECT_EQ(permit.memory(),original.physical_memory_authority);
+        EXPECT_FALSE(permit.memory().owner_before(original.physical_memory_authority));
+        EXPECT_FALSE(original.physical_memory_authority.owner_before(permit.memory()));
+        ASSERT_FALSE(actual.parent_lifetimes.empty());EXPECT_GT(actual.source_variant_count,0u);
+        for(const auto& parent:actual.parent_lifetimes)EXPECT_FALSE(parent.expired());
+        proof<<actual.allocator.world_rank<<','<<actual.allocator.device.toString()<<','<<actual.owner_coordinate<<','
+            <<actual.worker_generation<<','<<actual.parent_lifetimes.size()<<','<<actual.source_variant_count<<",0\n";
+    }
+    proof.flush();ASSERT_TRUE(proof.good());
+}
+
+/**
  * @brief Authenticate a GPU-adaptive source, cache roots and their actual leases.
  * @param cell Exact canonical request, including zero/positive cache ceilings.
  * @param runner Successfully initialized real production runner.
@@ -247,14 +299,32 @@ inline void expectQwen4ExpSourceGPUAdaptiveConsumer(const ModelParityCase &cell,
                 EXPECT_NO_THROW(permit->requireWorker(existing.worker()));
             }
             EXPECT_EQ((*reader)->originalSource().device(),coordinator.device);
-            EXPECT_EQ((*reader)->result()->endpointDevice(CapturedTransferEndpoint::Producer),coordinator.device);
-            EXPECT_EQ((*reader)->result()->endpointDevice(CapturedTransferEndpoint::Consumer),gpu.device);
-            EXPECT_EQ((*reader)->acknowledgement()->endpointDevice(CapturedTransferEndpoint::Producer),gpu.device);
-            EXPECT_EQ((*reader)->acknowledgement()->endpointDevice(CapturedTransferEndpoint::Consumer),coordinator.device);
-            EXPECT_EQ((*reader)->result()->capacityBytes(),std::max(readers.resultMaximum(),sizeof(::llaminar2::qwen4exp::replicated_reader::Header)));
-            EXPECT_EQ((*reader)->result()->payloadStorage(), readers.payloadStorage(gpu));
-            EXPECT_EQ((*reader)->acknowledgement()->payloadStorage(), readers.payloadStorage(gpu));
-            EXPECT_EQ((*reader)->acknowledgement()->capacityBytes(),sizeof(::llaminar2::qwen4exp::replicated_reader::Header));
+            if (readers.nativeCollective()) {
+                ASSERT_TRUE((*reader)->nativeCollective());
+                EXPECT_FALSE((*reader)->result());
+                EXPECT_FALSE((*reader)->acknowledgement());
+                const auto& result = (*reader)->nativeResult();
+                const auto& ack = (*reader)->nativeAcknowledgement();
+                ASSERT_TRUE(result.nativeStorage());
+                EXPECT_EQ(result.nativeStorage(), ack.nativeStorage());
+                EXPECT_EQ(result.endpointDevice(CapturedTransferEndpoint::Producer), coordinator.device);
+                EXPECT_EQ(result.endpointDevice(CapturedTransferEndpoint::Consumer), gpu.device);
+                EXPECT_EQ(ack.endpointDevice(CapturedTransferEndpoint::Producer), gpu.device);
+                EXPECT_EQ(ack.endpointDevice(CapturedTransferEndpoint::Consumer), coordinator.device);
+                EXPECT_EQ(result.maximumBytes(), std::max(readers.resultMaximum(), sizeof(::llaminar2::qwen4exp::replicated_reader::Header)));
+                EXPECT_EQ(ack.maximumBytes(), sizeof(::llaminar2::qwen4exp::replicated_reader::Header));
+                EXPECT_TRUE(result.nativeStorage()->authority(gpu.device).valid());
+                EXPECT_EQ(result.nativeStorage()->cohort()->modelOwner(), context);
+            } else {
+                EXPECT_EQ((*reader)->result()->endpointDevice(CapturedTransferEndpoint::Producer),coordinator.device);
+                EXPECT_EQ((*reader)->result()->endpointDevice(CapturedTransferEndpoint::Consumer),gpu.device);
+                EXPECT_EQ((*reader)->acknowledgement()->endpointDevice(CapturedTransferEndpoint::Producer),gpu.device);
+                EXPECT_EQ((*reader)->acknowledgement()->endpointDevice(CapturedTransferEndpoint::Consumer),coordinator.device);
+                EXPECT_EQ((*reader)->result()->capacityBytes(),std::max(readers.resultMaximum(),sizeof(::llaminar2::qwen4exp::replicated_reader::Header)));
+                EXPECT_EQ((*reader)->result()->payloadStorage(), readers.payloadStorage(gpu));
+                EXPECT_EQ((*reader)->acknowledgement()->payloadStorage(), readers.payloadStorage(gpu));
+                EXPECT_EQ((*reader)->acknowledgement()->capacityBytes(),sizeof(::llaminar2::qwen4exp::replicated_reader::Header));
+            }
             const auto& control = (*reader)->control(CapturedTransferEndpoint::Consumer);
             ASSERT_TRUE(control);
             EXPECT_TRUE(control->isBound());
@@ -268,12 +338,34 @@ inline void expectQwen4ExpSourceGPUAdaptiveConsumer(const ModelParityCase &cell,
             EXPECT_EQ(context->residentImmutableRowTable(gpu.device),nullptr);
             EXPECT_EQ(context->residentImmutableRowTableBytes(gpu.device),0u);
             const auto geometry = AdaptiveImmutableLookupGeometry::fromLayout(layout,provider->source(),request);
-            EXPECT_EQ(geometry.gpuCacheBytes(gpu),0u);
-            EXPECT_EQ(geometry.mandatoryDeviceBytes(gpu),0u);
-            for (const auto& row : memory->rankAttestation()) {
-                if (row.identity != gpu || (row.owner != PhysicalMemoryOwner::ImmutableTableStorage &&
-                    row.owner != PhysicalMemoryOwner::ImmutableLookupStaging)) continue;
-                EXPECT_EQ(row.materialized_new_bytes + row.adopted_resident_bytes,0u);
+            const auto physicalOwner = std::find_if(sourceBoundary->pooledStorage()->originalOwners().begin(),
+                sourceBoundary->pooledStorage()->originalOwners().end(), [&](const auto& owner) {
+                    return owner->plan().allocator() == gpu;
+                });
+            if (physicalOwner == sourceBoundary->pooledStorage()->originalOwners().end()) {
+                EXPECT_EQ(geometry.gpuCacheBytes(gpu), 0u);
+                EXPECT_EQ(geometry.mandatoryDeviceBytes(gpu), 0u);
+                for (const auto& row : memory->rankAttestation()) {
+                    if (row.identity != gpu || (row.owner != PhysicalMemoryOwner::ImmutableTableStorage &&
+                        row.owner != PhysicalMemoryOwner::ImmutableLookupStaging)) continue;
+                    EXPECT_EQ(row.materialized_new_bytes + row.adopted_resident_bytes, 0u);
+                }
+            } else {
+                // A continuation reader may own real evictable row slots, but
+                // never another CPU table/channel/source boundary. Authenticate
+                // those SAME roots once through the original source owner view.
+                const auto actual = (*physicalOwner)->retainedOwnerObservation();
+                EXPECT_EQ(actual.authority(), memory);
+                EXPECT_FALSE(actual.authority().owner_before(memory));
+                EXPECT_FALSE(memory.owner_before(actual.authority()));
+                EXPECT_EQ(actual.allocator(), gpu);
+                EXPECT_EQ(actual.tableStorageBytes(), geometry.gpuCacheBytes(gpu));
+                EXPECT_EQ(actual.lookupStagingBytes(), geometry.mandatoryDeviceBytes(gpu));
+                ASSERT_NO_FATAL_FAILURE(expectQwen4ExpSourceLease(*memory, gpu,
+                    PhysicalMemoryOwner::ImmutableTableStorage, actual.tableStorageBytes()));
+                ASSERT_NO_FATAL_FAILURE(expectQwen4ExpSourceLease(*memory, gpu,
+                    PhysicalMemoryOwner::ImmutableLookupStaging, actual.lookupStagingBytes()));
+                EXPECT_TRUE(participants->hasEmbeddedParticipant(gpu.device));
             }
             // The coordinator iteration below authenticates shared source and
             // provider statistics exactly once. Reader observations do not add
@@ -651,6 +743,23 @@ public:
         if (!reuse_) reuse_ = runner().modelContextReuseContract();
         return reuse_;
     }
+    /**
+     * @brief Recreate the next actual runner from the SAME original reuse contract.
+     * Old graph/parent borrowers retire before this returns; immutable source,
+     * prepared weights, physical caches and PMA remain original model owners.
+     * @param config Identical public policy, revalidated by the normal factory.
+     */
+    void recreateFromOriginalContract(const OrchestrationConfig& config)
+    {
+        if (finished_ || !runner_) throw std::logic_error("Original source lifetime is not reusable");
+        if (!reuse_) reuse_ = runner().modelContextReuseContract();
+        if (!reuse_ || !reuse_->context) throw std::logic_error("Original source has no reusable model contract");
+        runner_->shutdown();
+        if (runner_->isInitialized()) throw std::runtime_error("Original runner native retirement remains unproven");
+        runner_.reset();
+        runner_ = test::TestOrchestrationHelper::create(config, *reuse_);
+        if (!runner_) throw std::runtime_error("Original source reuse factory returned no second runner");
+    }
     /** @brief Close runner, final model and owned disk in that order. @throws std::exception On any unproven retirement. */
     void finish()
     {
@@ -1023,8 +1132,15 @@ inline void expectQwen4ExpCPUJointSourceFragments(int rank,const ModelContextReu
  * Successful setup authenticates exact original sources, actual execution plan,
  * retained native owners and snapshot-zero PMA before final exclusive retirement.
  */
-inline void admitQwen4ExpSource(const ModelParityCase &cell)
+/** @brief Materialize the original full source and optionally require its existing cold recreation proof.
+ * @param cell Original real-model source request; no test creates a model authority.
+ * @param recreation Require original role eligibility and execute the same cold lifecycle assertions.
+ */
+inline void admitQwen4ExpSource(const ModelParityCase &cell,
+    Qwen4ExpSourceRecreationProof recreation = Qwen4ExpSourceRecreationProof::FromOriginalRoles)
 {
+    ASSERT_TRUE(recreation==Qwen4ExpSourceRecreationProof::FromOriginalRoles ||
+        recreation==Qwen4ExpSourceRecreationProof::Required);
     withQwen4ExpSourceAdmission(cell, [&](int rank, const OrchestrationConfig &config,
         const OrchestrationConfig &authored, Qwen4ExpSourceAdmissionLifetime &lifetime,
         const std::filesystem::path &output) {
@@ -1096,6 +1212,8 @@ inline void admitQwen4ExpSource(const ModelParityCase &cell)
         EXPECT_EQ(resource.bytes(PhysicalMemoryOwner::GraphSnapshotArena), 0u);
     ASSERT_NO_FATAL_FAILURE(expectQwen4ExpCPUJointSourceFragments(rank,*reuse));
     ASSERT_NO_FATAL_FAILURE(expectQwen4ExpSourceLookup(cell, *runner, *reuse));
+    std::vector<::llaminar2::qwen4exp::PooledImmutableRetainedParticipants::ExpertOwnerParentObservation> old_expert_parents;
+    ASSERT_NO_FATAL_FAILURE(expectQwen4ExpSourceExpertLookupParents(cell,*reuse,output/"ngram-expert-owner-attachments.csv",old_expert_parents));
     if(const auto setup=model->immutableLookupSetupObservation()) {
         // Serialize the SAME passive setup value used by the assertions and
         // benchmark family, once per rank, independent of consumer borrows.
@@ -1127,6 +1245,67 @@ inline void admitQwen4ExpSource(const ModelParityCase &cell)
         << cell.testName() << ",48,1,0,0," << (joint_follower?0u:placement->extent().nativeBytes()) << '\n';
     csv.flush();
     ASSERT_TRUE(csv.good());
+    const bool original_recreation = qwen4ExpSourceReusesSharedContinuationOwners(placement.get()) || !old_expert_parents.empty();
+    if (recreation == Qwen4ExpSourceRecreationProof::Required)
+        ASSERT_TRUE(original_recreation) << "This source candidate requires original cold recreation/retirement";
+    if (original_recreation) {
+        // Keep only weak execution witnesses: a strong alias here would
+        // itself prevent the runner-bound participant authority from dying.
+        using Participants = ::llaminar2::qwen4exp::PooledImmutableRetainedParticipants;
+        std::vector<std::weak_ptr<Participants>> old;
+        std::vector<std::shared_ptr<::llaminar2::qwen4exp::ImmutableLookupExecutionBoundary>> boundaries;
+        for (const auto consumer : placement->consumers()) {
+            old.emplace_back(model->adaptiveImmutableLookupParticipants(consumer.device));
+            boundaries.push_back(model->adaptiveImmutableLookupBoundary(consumer.device));
+        }
+        const auto source = model->nativeContextPreparation();
+        const auto setup = model->immutableLookupSetupObservation();
+        lifetime.recreateFromOriginalContract(config);
+        for (const auto& witness : old) EXPECT_TRUE(witness.expired())
+            << "Old runner participants retained its borrowed Rank context";
+        for(const auto& owner:old_expert_parents)
+            for(const auto& parent:owner.parent_lifetimes)EXPECT_TRUE(parent.expired())
+                << "Original expert-owner native parent survived runner retirement";
+        runner = &lifetime.runner();
+        runner->disableSnapshotCapture();
+        ASSERT_TRUE(runner->initialize()) << runner->lastError();
+        EXPECT_EQ(runner->modelContextForDiagnostics(), model.get());
+        EXPECT_EQ(model->nativeContextPreparation(), source);
+        EXPECT_EQ(model->concreteWeightManager()->preparedWeightStoreIfInitialized(), store);
+        EXPECT_EQ(model->immutableLookupSetupObservation(), setup);
+        const auto& second = lifetime.reuseContract();
+        ASSERT_TRUE(second);EXPECT_EQ(second->physical_memory_authority, reuse->physical_memory_authority);
+        std::size_t coordinate = 0;
+        for (const auto consumer : placement->consumers()) {
+            const auto current = model->adaptiveImmutableLookupParticipants(consumer.device);
+            ASSERT_NE(current, nullptr);ASSERT_NO_THROW(current->requireCurrent());
+            EXPECT_TRUE(old[coordinate].owner_before(current) || current.owner_before(old[coordinate]));
+            EXPECT_EQ(model->adaptiveImmutableLookupBoundary(consumer.device), boundaries[coordinate]);
+            ++coordinate;
+        }
+        ASSERT_NO_FATAL_FAILURE(expectQwen4ExpSourceLookup(cell, *runner, *second));
+        std::vector<::llaminar2::qwen4exp::PooledImmutableRetainedParticipants::ExpertOwnerParentObservation> replacement;
+        ASSERT_NO_FATAL_FAILURE(expectQwen4ExpSourceExpertLookupParents(cell,*second,output/"ngram-expert-owner-attachments-replacement.csv",replacement));
+        ASSERT_EQ(replacement.size(),old_expert_parents.size());
+        for(const auto& actual:replacement){
+            const auto before=std::find_if(old_expert_parents.begin(),old_expert_parents.end(),
+                [&](const auto& owner){return owner.allocator==actual.allocator;});
+            ASSERT_NE(before,old_expert_parents.end());
+            EXPECT_EQ(actual.worker_generation,before->worker_generation);
+            EXPECT_EQ(actual.memory_identity,before->memory_identity);
+            EXPECT_EQ(actual.owner_coordinate,before->owner_coordinate);
+            EXPECT_EQ(actual.source_variant_count,before->source_variant_count);
+            EXPECT_EQ(actual.parent_lifetimes.size(),before->parent_lifetimes.size());
+            for(const auto& parent:actual.parent_lifetimes)
+                for(const auto& previous:before->parent_lifetimes)
+                    EXPECT_TRUE(parent.owner_before(previous) || previous.owner_before(parent))
+                        << "Replacement expert parent reused an old attachment control block";
+            EXPECT_FALSE(actual.worker.owner_before(before->worker));
+            EXPECT_FALSE(before->worker.owner_before(actual.worker));
+        }
+        if(!::testing::Test::HasFailure())
+            ::testing::Test::RecordProperty("original_shared_source_cold_recreation","completed");
+    }
     });
 }
 

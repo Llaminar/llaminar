@@ -17,6 +17,7 @@ struct PooledOriginalRecipe {
     std::uint32_t local=q::adaptive_lookup::None;
     bool nativeIds=false;
     DeviceType source=DeviceType::CUDA;
+    std::uint32_t originalIds=4; ///< Exact original query words;16 supports one genuine sixteen-head PLE query.
     bool operator==(const PooledOriginalRecipe&)const=default;
 };
 /** @brief Recorded native worker body lives in the actual preclaimed compiled object/stack root. */
@@ -32,7 +33,7 @@ public:
         if(recipes_.empty())throw std::invalid_argument("Original source replay needs its complete declared case set");
         std::vector<PhysicalMemoryPlan> payloads;PhysicalMemoryPlanBuilder retained;std::vector<DeviceId> devices;
         for(std::size_t ordinal=0;ordinal<recipes_.size();++ordinal){const auto& recipe=recipes_[ordinal];
-            SourceGraphCase declaration(recipe.capacities,recipe.reverse,recipe.local,recipe.nativeIds,recipe.source,backends_,nullptr,{},SourceGraphRecipePhase::DeclareOnly,ordinal);
+            SourceGraphCase declaration(recipe.capacities,recipe.reverse,recipe.local,recipe.nativeIds,recipe.source,backends_,nullptr,{},SourceGraphRecipePhase::DeclareOnly,ordinal,recipe.originalIds);
             PhysicalMemoryPlanBuilder payload;
             for(const auto& row:declaration.declaredProgram.resources())for(unsigned i=0;i<static_cast<unsigned>(PhysicalMemoryOwner::Count);++i){
                 const auto owner=static_cast<PhysicalMemoryOwner>(i);const auto charge=row.charge(owner);
@@ -57,7 +58,19 @@ public:
     SourceGraphCase make(PooledOriginalRecipe recipe,std::shared_ptr<PhysicalMemoryAuthority>* observation=nullptr){
         if(retired_ || next_>=recipes_.size() || recipe!=recipes_[next_])throw std::logic_error("Original source recipe changed or was not predeclared");
         const auto ordinal=next_++;
-        return SourceGraphCase(recipe.capacities,recipe.reverse,recipe.local,recipe.nativeIds,recipe.source,backends_,observation,source_->memory(),SourceGraphRecipePhase::Materialize,ordinal);
+        return SourceGraphCase(recipe.capacities,recipe.reverse,recipe.local,recipe.nativeIds,recipe.source,backends_,observation,source_->memory(),SourceGraphRecipePhase::Materialize,ordinal,recipe.originalIds);
+    }
+    /**
+     * @brief Materialize the same recipe and retain its original Preparing-source worker permits.
+     * @param recipe Next immutable predeclared case. No native completion/readiness is fabricated.
+     * @return Actual original local phase roots plus validated original source-worker provenance.
+     * @throws std::logic_error For undeclared/reordered or already-retired recipes.
+     */
+    SourceGraphCase makeWithPreparedWorkers(PooledOriginalRecipe recipe){
+        if(retired_ || next_>=recipes_.size() || recipe!=recipes_[next_])throw std::logic_error("Original source recipe changed or was not predeclared");
+        const auto ordinal=next_++;
+        return SourceGraphCase(recipe.capacities,recipe.reverse,recipe.local,recipe.nativeIds,recipe.source,backends_,nullptr,
+            source_->memory(),SourceGraphRecipePhase::Materialize,ordinal,recipe.originalIds,source_);
     }
     /** @brief Replay the actual original validated reset after aliases/handles have retired. */
     void retire(){if(retired_)return;permits_.clear();PooledImmutableFactoryReplayAccess::retireFixtureGenerations();retired_=true;}

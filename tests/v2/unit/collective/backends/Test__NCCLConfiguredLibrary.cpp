@@ -33,6 +33,10 @@ namespace
         std::vector<int> flags;
         unsigned symbolCalls = 0, closeCalls = 0;
         bool admitSymbols = false;
+        std::uint32_t completedProtocol = 3;
+        unsigned completedProtocolCalls = 0;
+        unsigned completedProtocolLookups = 0;
+        bool omitCompletedProtocol = false;
         std::string missingSymbol;
         unsigned liveCallbackCloses = 0, safeCallbackCloses = 0;
     } observation;
@@ -54,10 +58,18 @@ namespace
     {
         std::abort();
     }
+    /** @return Recorded host-only protocol value, without any native runtime callback. */
+    std::uint32_t recordedCompletedProtocol()
+    { ++observation.completedProtocolCalls; return observation.completedProtocol; }
     /** @brief Return inert uncalled symbols only for explicit successful-load traces. */
     void *recordSymbol(void *, const char *name)
     {
         ++observation.symbolCalls;
+        if (std::string_view(name) == "llaminarNcclCompletedProtocolVersion")
+            ++observation.completedProtocolLookups;
+        if (observation.admitSymbols && observation.missingSymbol != name &&
+            std::string_view(name) == "llaminarNcclCompletedProtocolVersion")
+            return observation.omitCompletedProtocol ? nullptr : reinterpret_cast<void*>(&recordedCompletedProtocol);
         return observation.admitSymbols && observation.missingSymbol != name
                    ? reinterpret_cast<void *>(&unexpectedNativeCall)
                    : nullptr;
@@ -353,6 +365,87 @@ namespace
                 EXPECT_EQ(observation.safeCallbackCloses, 1u);
                 EXPECT_EQ(loader::ncclCommInitAll(nullptr, 0, nullptr), loader::ncclInternalError);
             }
+    }
+#endif
+
+#if !defined(LLAMINAR_NCCL_TEST_ORIGINAL)
+    /** @test Origin-only, old and future DSOs reject before callback admission or another path search. */
+    TEST_F(NCCLConfiguredLibrary, CompletedProtocolRejectsMissingOldAndFutureWithoutCallbacks)
+    {
+        for (const unsigned version : {0u,1u,2u,4u})
+        {
+            for (const bool missing : {false,true})
+            {
+                loader::unload(); observation = {}; observation.admitSymbols = true;
+                observation.completedProtocol = version;
+                if (missing) observation.missingSymbol = "llaminarNcclCompletedProtocolVersion";
+                EXPECT_FALSE(loader::load(selectedLibrary));
+                EXPECT_FALSE(loader::isLoaded());
+                EXPECT_EQ(observation.paths.size(),1u);
+                EXPECT_EQ(observation.completedProtocolCalls,missing?0u:1u);
+                EXPECT_EQ(observation.closeCalls,1u);
+                EXPECT_EQ(observation.liveCallbackCloses,0u);
+                EXPECT_EQ(loader::fp_completion_signal,nullptr);
+                EXPECT_EQ(loader::fp_completion_authority,nullptr);
+                EXPECT_EQ(loader::fp_device_bytes_broadcast,nullptr);
+                EXPECT_EQ(loader::fp_device_slice_broadcast,nullptr);
+                EXPECT_NE(std::string(loader::getLastError()).find("completed-byte protocol requires version 3"),std::string::npos);
+            }
+        }
+    }
+    /** @test Every addressed dependency export is mandatory and partial admission withdraws all callback authorities. */
+    TEST_F(NCCLConfiguredLibrary, AddressedExportsRejectPartialAdmissionAndWithdrawCallbacks) {
+        for(const char* symbol:{"llaminarNcclSendCompletedBytes","llaminarNcclRecvCompletedBytes","llaminarNcclSendCompletedSliceOrigin"}) {
+            loader::unload();observation={};observation.admitSymbols=true;observation.missingSymbol=symbol;
+            EXPECT_FALSE(loader::load(selectedLibrary));EXPECT_FALSE(loader::isLoaded());
+            EXPECT_EQ(observation.paths.size(),1u);EXPECT_EQ(observation.closeCalls,1u);EXPECT_EQ(observation.liveCallbackCloses,0u);
+            EXPECT_EQ(loader::fp_device_bytes_send,nullptr);EXPECT_EQ(loader::fp_device_bytes_recv,nullptr);EXPECT_EQ(loader::fp_device_slice_send,nullptr);
+            EXPECT_EQ(loader::fp_completion_signal,nullptr);EXPECT_EQ(loader::fp_completion_authority,nullptr);
+        }
+    }
+    /** @test An earlier base-symbol failure wins over missing/wrong semantic markers without invoking them. */
+    TEST_F(NCCLConfiguredLibrary, EarlierRequiredSymbolWinsOverCompletedProtocolFailure)
+    {
+        for (const bool omit : {false,true})
+        {
+            loader::unload(); observation = {}; observation.admitSymbols = true;
+            observation.missingSymbol = "ncclGetUniqueId";
+            observation.completedProtocol = 1; observation.omitCompletedProtocol = omit;
+            EXPECT_FALSE(loader::load(selectedLibrary));
+            EXPECT_FALSE(loader::isLoaded());
+            EXPECT_EQ(observation.completedProtocolCalls,0u);
+            EXPECT_EQ(observation.completedProtocolLookups,0u);
+            EXPECT_EQ(observation.closeCalls,1u);
+            EXPECT_EQ(observation.liveCallbackCloses,0u);
+            EXPECT_NE(std::string(loader::getLastError()).find("ncclGetUniqueId"),std::string::npos);
+            EXPECT_EQ(std::string(loader::getLastError()).find("completed-byte protocol"),std::string::npos);
+            EXPECT_EQ(loader::fp_completion_signal,nullptr);
+            EXPECT_EQ(loader::fp_completion_authority,nullptr);
+            EXPECT_EQ(loader::fp_device_bytes_broadcast,nullptr);
+            EXPECT_EQ(loader::fp_device_slice_broadcast,nullptr);
+        }
+    }
+    /** @test Missing selected byte ABIs fail before calling any fixed or unrelated native callback. */
+    TEST_F(NCCLConfiguredLibrary, MissingNativeByteABIHasNoFixedFallback)
+    {
+        for (const auto* missing : {"llaminarNcclBroadcastCompletedBytes", "llaminarNcclBroadcastCompletedSliceOrigin", "llaminarNcclCompletionAuthority", "llaminarNcclSignalCompletionAbort"})
+        {
+            loader::unload();
+            observation = {};
+            observation.admitSymbols = true;
+            observation.missingSymbol = missing;
+            ASSERT_FALSE(loader::load(selectedLibrary));
+            auto* extent = reinterpret_cast<std::uint64_t*>(std::uintptr_t{0x1000});
+            const auto bytes = std::string(missing) != "llaminarNcclBroadcastCompletedSliceOrigin"
+                ? llaminar2::NativeCollectiveBytes::prefix(extent, 512, reinterpret_cast<const ncclLlaminarCompletionOperand*>(0x6000))
+                : llaminar2::NativeCollectiveBytes::receiveSlice(extent, 512, reinterpret_cast<const ncclLlaminarCompletionOperand*>(0x6000));
+            EXPECT_EQ(loader::nativeBroadcastBytes(reinterpret_cast<void*>(0x2000),
+                reinterpret_cast<void*>(0x3000), bytes, 1, reinterpret_cast<void*>(0x4000),
+                reinterpret_cast<void*>(0x5000)), loader::ncclInvalidUsage);
+            // Any ordinary/fallback native call reaches unexpectedNativeCall
+            // and aborts. Only the selected absent ABI may produce this result.
+            EXPECT_FALSE(loader::isLoaded());
+        }
     }
 #endif
 

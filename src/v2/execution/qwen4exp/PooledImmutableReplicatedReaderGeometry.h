@@ -19,6 +19,8 @@
 #include <vector>
 
 namespace llaminar2::qwen4exp {
+/** @brief Frozen homogeneous native or diagnostic captured endpoint law; peer coverage never selects native CCL. */
+enum class PooledImmutableReaderTransportKind : std::uint8_t { CapturedChannel, NativeCollective };
 /** @brief Immutable original compute-reader order around one source coordinator. */
 class PooledImmutableReplicatedReaderGeometry final {
 public:
@@ -35,7 +37,8 @@ public:
         PhysicalMemoryAllocatorIdentity coordinator,
         std::span<const PhysicalMemoryAllocatorIdentity> consumers,
         std::uint32_t maximumOriginal, std::uint32_t rowElements,
-        std::span<const ImmutableRowTableReaderPeerAccess> peerAccess = {})
+        std::span<const ImmutableRowTableReaderPeerAccess> peerAccess = {},
+        PooledImmutableReaderTransportKind transport = PooledImmutableReaderTransportKind::CapturedChannel)
     {
         if (consumers.size() < 2 || consumers.size() > std::numeric_limits<std::uint32_t>::max() ||
             coordinator.world_rank < 0 || !coordinator.device.is_valid() || !coordinator.device.is_gpu() ||
@@ -52,6 +55,14 @@ public:
         }
         if (sources != 1)
             throw std::invalid_argument("Shared PLE source must be one exact original compute reader");
+        if (transport != PooledImmutableReaderTransportKind::CapturedChannel &&
+            transport != PooledImmutableReaderTransportKind::NativeCollective)
+            throw std::invalid_argument("Shared PLE reader has an unknown declared transport");
+        if (transport == PooledImmutableReaderTransportKind::NativeCollective) {
+            if (!peerAccess.empty())
+                throw std::invalid_argument("Native reader transport does not consume a peer-selected route");
+            return {coordinator, {consumers.begin(), consumers.end()}, maximumOriginal, rowElements, {}, transport};
+        }
         if (peerAccess.size() + 1 != consumers.size())
             throw std::invalid_argument("Shared PLE readers require every original peer/NoPeer edge before BOM");
         std::vector<ImmutableRowTableReaderPeerAccess> edges;
@@ -65,8 +76,17 @@ public:
                 throw std::invalid_argument("Shared PLE reader transport has missing, duplicate or incompatible original coverage");
             edges.push_back(*found);
         }
-        return {coordinator, {consumers.begin(), consumers.end()}, maximumOriginal, rowElements, std::move(edges)};
+        return {coordinator, {consumers.begin(), consumers.end()}, maximumOriginal, rowElements, std::move(edges), transport};
     }
+    /** @brief Declare native homogeneous endpoints before BOM, independently of hardware P2P coverage. */
+    static PooledImmutableReplicatedReaderGeometry native(
+        PhysicalMemoryAllocatorIdentity coordinator, std::span<const PhysicalMemoryAllocatorIdentity> consumers,
+        std::uint32_t maximumOriginal, std::uint32_t rowElements)
+    {
+        return checked(coordinator, consumers, maximumOriginal, rowElements, {}, PooledImmutableReaderTransportKind::NativeCollective);
+    }
+    /** @return True only for original NCCL/RCCL operations; this metadata grants no communicator readiness. */
+    bool nativeCollective() const noexcept { return transport_ == PooledImmutableReaderTransportKind::NativeCollective; }
     /** @return Original source, never the first reader selected by enumeration. */
     PhysicalMemoryAllocatorIdentity coordinator() const noexcept { return coordinator_; }
     /** @return Exact declared reader order; storage-only GPUs are absent. */
@@ -87,6 +107,7 @@ public:
     /** @return Exact original bidirectional observation for the specified foreign reader. */
     PeerAccessCoverage peerAccess(PhysicalMemoryAllocatorIdentity reader) const
     {
+        if (nativeCollective()) throw std::logic_error("Native reader geometry has no peer-selected captured route");
         const auto found = std::find_if(peer_access_.begin(), peer_access_.end(),
             [&](const auto &edge) { return edge.reader == reader; });
         if (found == peer_access_.end())
@@ -138,6 +159,7 @@ public:
             if (consumer == coordinator_) continue;
             result.add(source, PhysicalMemoryOwner::ActivationTransportStaging, sizeof(replicated_reader::Control));
             result.add(endpoint, PhysicalMemoryOwner::ActivationTransportStaging, sizeof(replicated_reader::Control));
+            if (nativeCollective()) continue; // One original native bank is contributed with the full source/owner protocol.
             const auto forward = resultMemory(consumer);
             const auto reverse = acknowledgementMemory(consumer);
             result.add(source, PhysicalMemoryOwner::ActivationTransportStaging, forward.producer_payload_bytes);
@@ -154,12 +176,13 @@ private:
     /** @brief Publish only complete immutable metadata after all coordinates/overflow checks. */
     PooledImmutableReplicatedReaderGeometry(PhysicalMemoryAllocatorIdentity coordinator,
         std::vector<PhysicalMemoryAllocatorIdentity> consumers, std::uint32_t maximumOriginal,
-        std::uint32_t rowElements, std::vector<ImmutableRowTableReaderPeerAccess> peerAccess)
+        std::uint32_t rowElements, std::vector<ImmutableRowTableReaderPeerAccess> peerAccess, PooledImmutableReaderTransportKind transport)
         : coordinator_(coordinator), consumers_(std::move(consumers)),
-          maximum_original_(maximumOriginal), row_elements_(rowElements), peer_access_(std::move(peerAccess)) {}
+          maximum_original_(maximumOriginal), row_elements_(rowElements), peer_access_(std::move(peerAccess)), transport_(transport) {}
     PhysicalMemoryAllocatorIdentity coordinator_;
     std::vector<PhysicalMemoryAllocatorIdentity> consumers_;
     std::uint32_t maximum_original_, row_elements_;
     std::vector<ImmutableRowTableReaderPeerAccess> peer_access_;
+    PooledImmutableReaderTransportKind transport_;
 };
 } // namespace llaminar2::qwen4exp

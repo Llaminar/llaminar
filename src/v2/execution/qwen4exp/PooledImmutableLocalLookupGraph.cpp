@@ -9,6 +9,8 @@
  */
 #include "PooledImmutableLocalLookupGraph.h"
 #include "PooledImmutableParticipantPinGraph.h"
+#include "PooledImmutableReplicatedReaderGraph.h"
+#include "execution/compute_stages/stages/qwen4exp/Qwen4ExpPrimitiveStage.h"
 #include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include <stdexcept>
@@ -24,21 +26,29 @@ void input(q::PooledNativeOperandSpans& spans,q::PooledNativeOperand role,std::s
 PooledImmutableLookupGraphEndpoints appendPooledImmutableLocalLookupGraph(ComputeGraph& graph,BufferArena& arena,
     std::shared_ptr<q::ImmutableLookupExecutionBoundary> boundary,std::shared_ptr<const q::IPooledImmutableNativeKernels> code,
     n::OriginalRows original,q::PooledNativeOperandSpans begin,DeviceGenerationControlBinding control,
-    q::PooledNativeTensorSpan output,const std::string& identity,const std::string& outputIdentity){
+    q::PooledNativeTensorSpan output,const std::string& identity,const std::string& outputIdentity,
+    std::shared_ptr<PooledImmutableLocalRetirementCompletion>* retirement){
     if(isGraphCaptureActive() || !boundary || !boundary->isPooled() || !code || identity.empty())
         throw std::invalid_argument("Local pooled lookup graph requires its original real-provider boundary outside capture");
     const auto source=boundary->pooledStorage();const auto owner=source->owner();const auto coordinator=source->coordinator();
     const auto& o=owner->plan().parameters();const auto& c=coordinator->plan().parameters();const auto& so=source->geometry().parameters().offsets;
     if(o.owner.participants()!=1 || o.owner.coordinate()!=0 || o.device!=c.device || o.device!=boundary->device() || code->backend()!=o.device.type)
         throw std::invalid_argument("Pooled graph edge requires explicit directed owner transport; local wiring cannot represent its declared endpoints");
+    if(!begin[static_cast<unsigned>(q::PooledNativeOperand::Ids)])
+        throw std::invalid_argument("Local pooled lookup omitted its original ID operand");
     graph.setRetainedStorageBoundary(boundary);
     const auto own=owner->roots(),coord=coordinator->roots(),src=source->roots();
     const auto capacity=o.native.reply_capacity;PooledImmutableLookupGraphEndpoints endpoints;std::size_t ordinal=0;
+    auto completion=std::shared_ptr<PooledImmutableLocalRetirementCompletion>(
+        new PooledImmutableLocalRetirementCompletion(boundary,control,original,
+            *begin[static_cast<unsigned>(q::PooledNativeOperand::Ids)],output));
     const auto append=[&](std::unique_ptr<IComputeStage> stage,const std::string& semanticName=std::string{}){
         const auto name=semanticName.empty()?identity+"/"+std::to_string(ordinal++):semanticName;graph.addNode(name,std::move(stage),boundary->device());
         if(endpoints.first.empty())endpoints.first=name;
         if(!endpoints.last.empty())graph.addDependency(name,endpoints.last);
         endpoints.last=name;
+        const auto* node=graph.getNode(name);
+        completion->phases.push_back({name,node->stage.get(),node->dependencies});
     };
     const auto sourceInput=[&](q::PooledNativeOperandSpans& spans,q::PooledNativeOperand role){
         input(spans,role,src.native,BufferId::QFN_POOLED_SOURCE_NATIVE,so.frontier,sizeof(n::SourceFrontier));
@@ -120,19 +130,83 @@ PooledImmutableLookupGraphEndpoints appendPooledImmutableLocalLookupGraph(Comput
     coordinatorPhase(n::CoordinatorAction::PlanVictims);ownerPhase(n::OwnerAction::AcceptVictim);ownerPhase(n::OwnerAction::ExecuteVictim);
     coordinatorPhase(n::CoordinatorAction::AcquireVictims);ownerPhase(n::OwnerAction::VictimReceipt);coordinatorPhase(n::CoordinatorAction::CompleteVictims);
     sourcePhase(q::PooledSourceAction::Plan);coordinatorPhase(n::CoordinatorAction::SealSource);ownerPhase(n::OwnerAction::SealSource);
-    sourcePhase(q::PooledSourceAction::AcquireSeal,0);sourcePhase(q::PooledSourceAction::Publish);sourcePhase(q::PooledSourceAction::AcquireResponse);
+    sourcePhase(q::PooledSourceAction::AcquireSeal,0);sourcePhase(q::PooledSourceAction::Publish);
+    const auto published=endpoints.last;
+    sourcePhase(q::PooledSourceAction::AcquireResponse);
+    endpoints.demand=PooledImmutableDemandFrontier{PooledImmutableDemandRole::Source,published,endpoints.last};
     sourcePhase(q::PooledSourceAction::PackOwner,0);sourcePhase(q::PooledSourceAction::RetireResponse);
     ownerPhase(n::OwnerAction::ApplySourceDelivery,n::SourceCondition::AfterSuccess);
     ownerPhase(n::OwnerAction::ValidateFills,n::SourceCondition::AfterSuccess);ownerPhase(n::OwnerAction::AcquirePublication,n::SourceCondition::AfterSuccess);
     sourcePhase(q::PooledSourceAction::BeforeReady);
     ownerPhase(n::OwnerAction::MakeReady,n::SourceCondition::AfterSuccess);ownerPhase(n::OwnerAction::ReadyReceipt,n::SourceCondition::AfterSuccess);
     coordinatorPhase(n::CoordinatorAction::Publish,n::SourceCondition::AfterSuccess);
-    sourcePhase(q::PooledSourceAction::Read);sourcePhase(q::PooledSourceAction::ReadersRetired);
+    sourcePhase(q::PooledSourceAction::Read);completion->read=endpoints.last;
+    sourcePhase(q::PooledSourceAction::ReadersRetired);completion->readersRetired=endpoints.last;
     ownerPhase(n::OwnerAction::CancelSource,n::SourceCondition::AfterFailure);ownerPhase(n::OwnerAction::Release);
     coordinatorPhase(n::CoordinatorAction::Cancel,n::SourceCondition::AfterFailure);
     ownerPhase(n::OwnerAction::Retire);coordinatorPhase(n::CoordinatorAction::Finish);
     sourcePhase(q::PooledSourceAction::ObserveRetired);
+    completion->first=endpoints.first;completion->last=endpoints.last;
+    requirePooledLocalRetirementCompletion(graph,*completion);
+    if(retirement)*retirement=std::move(completion);
     return endpoints;
+}
+void requirePooledLocalRetirementCompletion(const ComputeGraph& graph,
+    const PooledImmutableLocalRetirementCompletion& original){
+    if(isGraphCaptureActive() || !original.boundary || !original.boundary->isPooled() ||
+       original.phases.empty() || original.first!=original.phases.front().name ||
+       original.last!=original.phases.back().name)
+        throw std::invalid_argument("Local retirement lost its original complete graph inventory");
+    const auto storage=original.boundary->pooledStorage();
+    if(storage->originalOwners().size()!=1 || storage->owner()!=storage->originalOwners().front() ||
+       storage->owner()->plan().allocator()!=storage->coordinator()->plan().allocator())
+        throw std::invalid_argument("Local retirement changed its sole original physical owner");
+    original.control.requireFor(original.boundary->device());
+    for(const auto& phase:original.phases){
+        const auto* node=graph.getNode(phase.name);
+        if(!node || node->device!=original.boundary->device() || node->stage.get()!=phase.stage)
+            throw std::invalid_argument("Local retirement replaced an original phase");
+        auto expected=phase.dependencies;
+        if(phase.name==original.first){
+            // The model inserts its original Hash after this fragment is built.
+            // Admit only the exact typed producer of this Begin's ID subview.
+            for(const auto& name:node->dependencies){
+                const auto* producer=graph.getNode(name);
+                const auto* hash=producer?dynamic_cast<const Qwen4ExpPrimitiveStage*>(producer->stage.get()):nullptr;
+                if(!producer || producer->device!=original.boundary->device() || !hash || hash->device()!=original.boundary->device() ||
+                   !hash->matchesNgramHashOutput(original.inputIds.root.get(),original.inputIds.buffer,
+                       original.inputIds.offset,original.inputIds.bytes))
+                    throw std::invalid_argument("Local retirement changed its original external query producer");
+            }
+            if(node->dependencies.size()>1)
+                throw std::invalid_argument("Local retirement duplicated its original query producer");
+            expected=node->dependencies;
+        }
+        if(const auto* source=dynamic_cast<const PooledImmutableSourcePhaseStage*>(node->stage.get());
+           source && source->matchesDemand(original.boundary.get(),q::PooledSourceAction::AcquireResponse))
+            expected.insert(expected.end(),source->currentDemandTrunk().begin(),source->currentDemandTrunk().end());
+        if(phase.name==original.readersRetired && original.readers)
+            for(const auto& reader:original.readers->readers)expected.push_back(reader.ackValidated);
+        if(node->dependencies!=expected)
+            throw std::invalid_argument("Local retirement changed an original phase dependency");
+    }
+    const auto sourcePhase=[&](const std::string& name,q::PooledSourceAction action){
+        const auto* node=graph.getNode(name);
+        const auto* stage=node?dynamic_cast<const PooledImmutableSourcePhaseStage*>(node->stage.get()):nullptr;
+        if(!stage || !stage->matchesOriginal(original.boundary.get(),action,q::adaptive_lookup::None,original.control))
+            throw std::invalid_argument("Local retirement changed its original source/control frontier");
+    };
+    sourcePhase(original.read,q::PooledSourceAction::Read);
+    const auto* read=dynamic_cast<const PooledImmutableSourcePhaseStage*>(graph.getNode(original.read)->stage.get());
+    if(!read->matchesReadOutput(original.output))
+        throw std::invalid_argument("Local retirement replaced the original result span");
+    sourcePhase(original.readersRetired,q::PooledSourceAction::ReadersRetired);
+    sourcePhase(original.last,q::PooledSourceAction::ObserveRetired);
+    if(original.readers){
+        if(original.readers->sourceRead!=original.read)
+            throw std::invalid_argument("Local retirement changed its actual shared result producer");
+        requirePooledReplicatedReaderCompletion(graph,*original.readers,original.readersRetired);
+    }
 }
 PooledImmutableLookupGraphEndpoints appendPooledImmutablePLELookupGraph(ComputeGraph& graph,BufferArena& arena,
     std::shared_ptr<q::ImmutableLookupExecutionBoundary> boundary,std::shared_ptr<const q::IPooledImmutableNativeKernels> code,

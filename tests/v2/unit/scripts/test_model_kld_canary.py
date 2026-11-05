@@ -98,6 +98,14 @@ class ModelKLDReportTests(unittest.TestCase):
             cpu_isa='AVX512',corpus_manifest_digest='d'*64,**kwargs)
     def test_complete_valid_report(self):
         self.check(canary_report())
+
+    def test_focused_status_cannot_be_admitted_even_if_other_diagnostic_flags_are_ignored(self):
+        """Published-image consumers refuse every explicit diagnostic marker."""
+        for field,value in [('full_preflight',False),('mode','local_paired_focused_diagnostic'),
+                            ('verdict','DIAGNOSTIC_REQUIRED_GROUPS_GREEN'),
+                            ('status','DIAGNOSTIC_PANEL_COMPLETE')]:
+            report=canary_report();report[field]=value
+            with self.subTest(field=field),self.assertRaises(ValueError):self.check(report)
     def test_all_run_identities_and_completed_lifetime_are_required(self):
         for key,value in [('source_revision','b'*40),('image','sha256:'+'2'*64),('cpu_isa','AVX2'),
                           ('corpus_manifest_digest','e'*64),('diagnostic_only',True),('complete',False),('schema',True)]:

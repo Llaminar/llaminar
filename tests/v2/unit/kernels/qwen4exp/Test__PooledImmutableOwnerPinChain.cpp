@@ -7,6 +7,11 @@
  */
 #include "fixtures/qwen4exp/PooledImmutableOriginalProgramReplay.h"
 #include "loaders/ImmutableLookupSetupObservation.h"
+#include "execution/qwen4exp/PooledImmutableDemandFrontier.h"
+#include "execution/qwen4exp/PooledImmutableDirectedLookupGraph.h"
+#include "execution/qwen4exp/PooledImmutableParticipantRetirementGraph.h"
+#include "execution/compute_stages/stages/qwen4exp/Qwen4ExpPLEBuilder.h"
+#include <typeinfo>
 namespace llaminar2::test {
 TEST(PooledImmutableOwnerPinChain, OriginalConcretePositiveAndC0ChainsPass){for(uint32_t capacity:{0u,3u}){OwnerChainCase c(capacity);
     EXPECT_NO_THROW(requirePooledPinOwnerCompletion(c.graph,c.returned,c.complete.last));const auto before=c.graph.getExecutionOrder().size();
@@ -582,3 +587,288 @@ TEST(PooledImmutableOwnerPinChain, ImmutableSetupCapacityUsesOriginalDisjointRoo
     }
 }
 } // namespace llaminar2::test
+
+namespace llaminar2::test {
+namespace {
+/** @brief Independent same-device trunk marker; only original protocol nodes claim source/native effects. */
+class CurrentDemandTrunk final:public IComputeStage {
+public:
+    explicit CurrentDemandTrunk(DeviceId device):IComputeStage(device){}
+    bool execute(IDeviceContext*)override{return true;}
+    ComputeStageType type()const override{return ComputeStageType::QWEN4EXP_POOLED_SOURCE_PHASE;}
+    bool supportsBackend(ComputeBackendType)const override{return false;}
+    StageBufferRequirements getBufferRequirements()const override{return {};}
+    StageBufferContract bufferContract()const override{return {};}
+    StageDumpInfo buildDumpInfoImpl()const override{return {};}
+};
+/** @brief Declare two ordinary trunk nodes after the actual protocol prefix, preserving order. */
+void declareDemandTrunk(ComputeGraph& graph,DeviceId device,const std::string& prefix){
+    graph.addNode("trunk/root",std::make_unique<CurrentDemandTrunk>(device),device);
+    graph.addNode("trunk/terminal",std::make_unique<CurrentDemandTrunk>(device),device);
+    graph.addDependency("trunk/root",prefix);graph.addDependency("trunk/terminal","trunk/root");
+}
+/** @return Actual topological position, independent of node insertion order. */
+std::size_t demandPosition(const ComputeGraph& graph,const std::string& name){
+    const auto& order=graph.getExecutionOrder();return std::find(order.begin(),order.end(),name)-order.begin();
+}
+}
+/** @test Current source demand issues once before trunk, consumes late and retains exact original source lifecycle. */
+TEST(PooledImmutableCurrentDemand, SourcePublishedBeforeTrunkAndResponseAfterTrunkLifecycle){
+    std::vector<PooledOriginalRecipe> recipes;
+    for(const bool zero:{true,false})recipes.push_back(PooledOriginalRecipe{zero?std::vector<uint32_t>{0,0}:std::vector<uint32_t>{1,3},true});
+    PooledImmutableOriginalPrograms programs(recipes);
+    for(const auto& recipe:recipes){
+        auto c=programs.make(recipe);
+        auto source=appendPooledSourceCoordinatorMembers(c.graph,c.arena,c.sourceMembers,c.boundary,c.coordCode,*c.control,c.complete.last,"source",nullptr);
+        const auto ready=appendPooledPublicationCoordinator(c.graph,c.arena,source,publicationMembers(c),c.coordCode,"publication");
+        std::vector<q::PooledImmutableReadParticipant> readers;
+        for(const auto& member:ready.owners)readers.emplace_back(q::PooledImmutableCapturedReadWave::bind(std::get<std::shared_ptr<const q::PooledImmutableCapturedPublicationWave>>(member),c.memory));
+        const auto read=appendPooledReadCoordinator(c.graph,c.arena,ready,readers,
+            {c.readOutput,BufferId::QFN_PLE_EMBEDDING,0,16*160*sizeof(float)},"read","original_output");
+        std::vector<q::PooledImmutableRetirementParticipant> retiring;
+        for(const auto& member:read.owners)retiring.emplace_back(q::PooledImmutableCapturedRetirementWave::bind(std::get<std::shared_ptr<const q::PooledImmutableCapturedReadWave>>(member),c.memory));
+        const auto retired=appendPooledRetirementCoordinator(c.graph,c.arena,read,retiring,c.coordCode,"retirement");
+        c.graph.setRetainedStorageBoundary(c.boundary);
+        PooledImmutableDemandFrontier frontier{PooledImmutableDemandRole::Source,source.published,source.acquired};
+        PooledImmutableDemandHandoff handoff(c.graph,frontier,71,91);
+        EXPECT_THROW(handoff.requireConsumed(),std::logic_error);
+        declareDemandTrunk(c.graph,c.boundary->device(),source.published);
+        EXPECT_THROW(handoff.consume(c.graph,72,91,{"trunk/terminal"}),std::invalid_argument);
+        EXPECT_THROW(handoff.consume(c.graph,71,92,{"trunk/terminal"}),std::invalid_argument);
+        ComputeGraph foreign;
+        EXPECT_THROW(handoff.consume(foreign,71,91,{"trunk/terminal"}),std::invalid_argument);
+        EXPECT_THROW(handoff.consume(c.graph,71,91,{source.published}),std::invalid_argument);
+        {GraphCaptureGuard capture;EXPECT_THROW(handoff.consume(c.graph,71,91,{"trunk/terminal"}),std::logic_error);}
+        const auto beforeSuffixJoin=c.graph.topologyGeneration();
+        const auto beforeSuffixOrder=c.graph.getExecutionOrder();
+        EXPECT_THROW(handoff.consume(c.graph,71,91,{retired.coordinator.last}),std::invalid_argument);
+        EXPECT_EQ(c.graph.topologyGeneration(),beforeSuffixJoin);EXPECT_EQ(c.graph.getExecutionOrder(),beforeSuffixOrder);
+        // A second ancestry branch reaches response even though the first reaches Publish.
+        c.graph.addNode("trunk/bad_join",std::make_unique<CurrentDemandTrunk>(c.boundary->device()),c.boundary->device());
+        c.graph.addDependency("trunk/bad_join",source.published);c.graph.addDependency("trunk/bad_join",source.acquired);
+        const auto beforeMixedJoin=c.graph.topologyGeneration();
+        EXPECT_THROW(handoff.consume(c.graph,71,91,{"trunk/bad_join"}),std::invalid_argument);
+        EXPECT_EQ(c.graph.topologyGeneration(),beforeMixedJoin);
+        EXPECT_NO_THROW(handoff.consume(c.graph,71,91,{"trunk/terminal"}));
+        EXPECT_NO_THROW(handoff.requireConsumed());
+        EXPECT_THROW(handoff.consume(c.graph,71,91,{"trunk/terminal"}),std::invalid_argument);
+        EXPECT_LT(demandPosition(c.graph,source.published),demandPosition(c.graph,"trunk/root"));
+        EXPECT_LT(demandPosition(c.graph,"trunk/terminal"),demandPosition(c.graph,source.acquired));
+        EXPECT_NO_THROW(requirePooledSourceCoordinatorCompletion(c.graph,source));
+        EXPECT_NO_THROW(requirePooledRetirementCompletion(c.graph,retired));
+        const auto order=c.graph.getExecutionOrder();
+        for(int replay=0;replay<20;++replay){c.graph.reset();EXPECT_EQ(c.graph.getExecutionOrder(),order);EXPECT_NO_THROW(handoff.requireConsumed());}
+        auto* response=c.graph.getNode(source.acquired);
+        response->dependencies.push_back("trunk/root");
+        EXPECT_THROW(requirePooledRetirementCompletion(c.graph,retired),std::invalid_argument);
+        response->dependencies.pop_back();
+        response->dependencies.erase(std::remove(response->dependencies.begin(),response->dependencies.end(),source.published),response->dependencies.end());
+        EXPECT_THROW(requirePooledSourceCoordinatorCompletion(c.graph,source),std::invalid_argument);
+        EXPECT_THROW(requirePooledRetirementCompletion(c.graph,retired),std::invalid_argument);
+        response->dependencies.push_back(source.sealed);
+        EXPECT_THROW(requirePooledRetirementCompletion(c.graph,retired),std::invalid_argument);
+    }
+}
+/** @test The actual addressed owner stops at seal-send, including C0, with exactly one original protocol predecessor. */
+TEST(PooledImmutableCurrentDemand, InlineSealBeforeTrunkFirstResponseAfterTrunkPreservesOriginalProof){
+    const std::vector<PooledOriginalRecipe> recipes{{{0,0},true},{{1,3},true}};
+    PooledImmutableOriginalPrograms programs(recipes);
+    for(const auto& recipe:recipes){auto c=programs.make(recipe);
+        for(std::size_t i=0;i<c.owners.size();++i){
+            auto& graph=*c.ownerGraphs[i];
+            PooledImmutableDemandFrontier frontier;
+            const auto source=appendPooledSourceOwnerFill(graph,*c.ownerArenas[i],c.sources[i],c.ownerCode,c.ownerVictims[i].last,"source",&frontier);
+            graph.setRetainedParticipantDefinitionDomain({c.boundary->device(),c.sources[i].get()});
+            PooledImmutableDemandHandoff handoff(graph,frontier,71,91);
+            const bool positive=c.sources[i]->hasPayload();
+            EXPECT_EQ(frontier.published,"source/seal_receipt_send");
+            EXPECT_EQ(frontier.consume,positive?"source/fill_receive":"source/terminal_receive");
+            declareDemandTrunk(graph,c.owners[i]->plan().allocator().device,frontier.published);
+            const auto beforeSuffixJoin=graph.topologyGeneration();const auto beforeSuffixOrder=graph.getExecutionOrder();
+            EXPECT_THROW(handoff.consume(graph,71,91,{source.last}),std::invalid_argument);
+            EXPECT_EQ(graph.topologyGeneration(),beforeSuffixJoin);EXPECT_EQ(graph.getExecutionOrder(),beforeSuffixOrder);
+            EXPECT_NO_THROW(handoff.consume(graph,71,91,{"trunk/terminal"}));
+            EXPECT_NO_THROW(requirePooledSourceOwnerCompletion(graph,c.sources[i],source.last));
+            EXPECT_LT(demandPosition(graph,frontier.published),demandPosition(graph,"trunk/root"));
+            EXPECT_LT(demandPosition(graph,"trunk/terminal"),demandPosition(graph,frontier.consume));
+            const auto order=graph.getExecutionOrder();for(int replay=0;replay<20;++replay){graph.reset();EXPECT_EQ(graph.getExecutionOrder(),order);}
+            auto* response=graph.getNode(frontier.consume);
+            response->dependencies.push_back("trunk/root");
+            EXPECT_THROW(requirePooledSourceOwnerCompletion(graph,c.sources[i],source.last),std::invalid_argument);
+            response->dependencies.pop_back();
+            response->dependencies.erase(std::remove(response->dependencies.begin(),response->dependencies.end(),"trunk/terminal"),response->dependencies.end());
+            EXPECT_THROW(requirePooledSourceOwnerCompletion(graph,c.sources[i],source.last),std::invalid_argument);
+        }
+    }
+}
+/** @test Foreign/pure-reader descriptors cannot turn an owner/source node into another protocol role. */
+TEST(PooledImmutableCurrentDemand, ActualEndpointRolesRejectForgedPureReaderAndWrongCut){
+    const PooledOriginalRecipe recipe{{0,1},true};PooledImmutableOriginalPrograms programs({recipe});auto c=programs.make(recipe);
+    const auto source=appendPooledSourceCoordinatorMembers(c.graph,c.arena,c.sourceMembers,c.boundary,c.coordCode,*c.control,c.complete.last,"source",nullptr);
+    c.graph.setRetainedStorageBoundary(c.boundary);
+    EXPECT_THROW((PooledImmutableDemandHandoff(c.graph,{PooledImmutableDemandRole::Source,source.planned,source.acquired},71,91)),std::invalid_argument);
+    EXPECT_THROW((PooledImmutableDemandHandoff(c.graph,{PooledImmutableDemandRole::PureReader,{},source.acquired},71,91)),std::invalid_argument);
+    EXPECT_THROW((PooledImmutableDemandHandoff(c.graph,{PooledImmutableDemandRole::Source,source.published,source.acquired},0,91)),std::invalid_argument);
+}
+}
+
+namespace llaminar2::test {
+/** @test Real factory allocations may differ while complete source/query geometry stays identical. */
+TEST(PooledImmutableCurrentDemand, RealFactoryRegenerationConsumesOriginalFrameAndRejectsPrecisionDrift){
+    const PooledOriginalRecipe recipe{{3},false,0,true,DeviceType::CUDA,16};
+    PooledImmutableOriginalPrograms programs({recipe});auto c=programs.make(recipe);
+    ASSERT_TRUE(c.queryTokens);ASSERT_TRUE(c.queryPrior);
+    const auto& declared=c.boundary->pooledStorage()->geometry().parameters();
+    Qwen4ExpPLEContext context{.device=DeviceId::cuda(0),.prefix="L1_ple_",.rows={1},.hidden=1,.epsilon=1e-6f,
+        .nativeFormat=declared.format,.nativeRowElements=static_cast<int>(declared.row_elements),.nativeRowBytes=declared.owner.row_bytes};
+    context.hash.multipliers={9007199254740993ULL,9007199254740995ULL,9007199254740997ULL};
+    for(int head=0;head<16;++head){context.hash.moduli[head]=7;context.hash.offsets[head]=7*head;}
+    const Qwen4ExpFloatBinding output(*c.readOutput,BufferId::QFN_PLE_EMBEDDING);
+    const Qwen4ExpPLEBuffers buffers{
+        Qwen4ExpNativeIntInput{context.device,static_cast<const std::int32_t*>(c.queryTokens->gpu_data_ptr()),1},
+        Qwen4ExpIntBinding(*c.queryPrior,BufferId::QFN_PLE_TOKEN_HISTORY),Qwen4ExpIntBinding(*c.ids,BufferId::QFN_NGRAM_ROW_IDS),
+        output,output,output,output,output,output,output,output};
+    std::shared_ptr<const q::IPooledImmutableNativeKernels> first=q::createCUDAPooledImmutableNativeKernels();
+    std::shared_ptr<const q::IPooledImmutableNativeKernels> second=q::createCUDAPooledImmutableNativeKernels();
+    ASSERT_TRUE(first);ASSERT_TRUE(second);EXPECT_NE(first.get(),second.get());EXPECT_EQ(typeid(*first),typeid(*second));
+    Qwen4ExpPooledLookupStorage storage{&c.arena,c.boundary,first,*c.control,DeviceRowRange::fullyActive(1),{}, {}};
+    ComputeGraph graph;
+    auto frame=Qwen4ExpPooledReadAheadFrame::publish(graph,context,buffers,storage);
+    ASSERT_TRUE(graph.getNode("L1_ple_hash"));
+    EXPECT_THROW(frame->requireConsumed(),std::logic_error);
+    declareDemandTrunk(graph,context.device,frame->producer());
+    const auto hash=graph.getNode("L1_ple_hash")->stage->graphCaptureVariantSignature();
+    auto regenerated=storage;regenerated.code=second;
+    auto changed=context;changed.nativeRowBytes++;
+    EXPECT_THROW(frame->consume(graph,changed,buffers,regenerated,hash,{"trunk/terminal"}),std::invalid_argument);
+    changed=context;changed.nativeRowElements++;
+    EXPECT_THROW(frame->consume(graph,changed,buffers,regenerated,hash,{"trunk/terminal"}),std::invalid_argument);
+    changed=context;changed.nativeFormat=TensorType::FP32;
+    EXPECT_THROW(frame->consume(graph,changed,buffers,regenerated,hash,{"trunk/terminal"}),std::invalid_argument);
+    auto foreign=regenerated;foreign.boundary.reset();
+    EXPECT_THROW(frame->consume(graph,context,buffers,foreign,hash,{"trunk/terminal"}),std::invalid_argument);
+    EXPECT_NO_THROW(frame->consume(graph,context,buffers,regenerated,hash,{"trunk/terminal"}));
+    EXPECT_NO_THROW(frame->requireConsumed());
+    EXPECT_THROW(frame->consume(graph,context,buffers,regenerated,hash,{"trunk/terminal"}),std::invalid_argument);
+    EXPECT_LT(demandPosition(graph,"trunk/terminal"),demandPosition(graph,"L1_ple_gather"));
+}
+}
+
+namespace llaminar2::test {
+/** @test Counted prefill retains original count, sixteen-head expansion and exact graph identity across partial/empty reset records. */
+TEST(PooledImmutableCurrentDemand, CountedPrefillKeepsOriginalLiveExtentAuthorityAcrossResetRecords){
+    const PooledOriginalRecipe recipe{{3},false,0,true,DeviceType::CUDA,64};
+    PooledImmutableOriginalPrograms programs({recipe});auto c=programs.make(recipe);
+    ASSERT_TRUE(c.queryLive);const auto device=c.boundary->device();
+    auto* live=static_cast<std::int32_t*>(c.queryLive->gpu_data_ptr());ASSERT_NE(live,nullptr);
+    const Qwen4ExpNativeIntInput liveInput{device,live,1};
+    const auto& declared=c.boundary->pooledStorage()->geometry().parameters();
+    Qwen4ExpPLEContext context{.device=device,.prefix="L1_ple_",.rows={4,liveInput},.hidden=1,.epsilon=1e-6f,
+        .nativeFormat=declared.format,.nativeRowElements=static_cast<int>(declared.row_elements),.nativeRowBytes=declared.owner.row_bytes};
+    context.hash.multipliers={9007199254740993ULL,9007199254740995ULL,9007199254740997ULL};
+    for(int head=0;head<16;++head){context.hash.moduli[head]=7;context.hash.offsets[head]=7*head;}
+    const Qwen4ExpFloatBinding output(*c.readOutput,BufferId::QFN_PLE_EMBEDDING);
+    const Qwen4ExpPLEBuffers buffers{
+        Qwen4ExpNativeIntInput{device,static_cast<const std::int32_t*>(c.queryTokens->gpu_data_ptr()),4},
+        Qwen4ExpIntBinding(*c.queryPrior,BufferId::QFN_PLE_TOKEN_HISTORY),Qwen4ExpIntBinding(*c.ids,BufferId::QFN_NGRAM_ROW_IDS),
+        output,output,output,output,output,output,output,output};
+    const auto rows=DeviceRowRange::deviceCounted(4,live);
+    const Qwen4ExpPooledLookupStorage storage{&c.arena,c.boundary,c.coordCode,*c.control,rows,
+        Qwen4ExpIntBinding(*c.queryLive,BufferId::PREFILL_CHUNK_GEOMETRY),{}};
+    ComputeGraph graph;auto frame=Qwen4ExpPooledReadAheadFrame::publish(graph,context,buffers,storage);
+    declareDemandTrunk(graph,device,frame->producer());
+    const auto hash=graph.getNode("L1_ple_hash")->stage->graphCaptureVariantSignature();
+    EXPECT_NO_THROW(frame->consume(graph,context,buffers,storage,hash,{"trunk/terminal"}));
+    const PooledImmutableNativePhaseStage::Coordinator* begin=nullptr;
+    for(const auto& name:graph.getExecutionOrder()){
+        const auto* stage=dynamic_cast<const PooledImmutableNativePhaseStage*>(graph.getNode(name)->stage.get());
+        if(!stage)continue;const auto* candidate=std::get_if<PooledImmutableNativePhaseStage::Coordinator>(&stage->phase());
+        if(candidate && candidate->action==n::CoordinatorAction::Begin){ASSERT_EQ(begin,nullptr);begin=candidate;}
+    }
+    ASSERT_NE(begin,nullptr);
+    const q::PooledImmutableCoordinatorOperands expected(n::CoordinatorAction::Begin,c.coordinator->plan(),
+        n::OriginalRows{rows.repeatEachRow(16),n::OriginalIdWidth::UInt64},begin->operands.spans());
+    const auto query=begin->operands.declarationIdentity();
+    EXPECT_EQ(query,expected.declarationIdentity());
+    const auto order=graph.getExecutionOrder();
+    for(int replay=0;replay<20;++replay)for(const int count:{4,1,0,3,0}){
+        // Recorded API-double device memory, not a production host mirror or receipt.
+        *live=count;graph.reset();EXPECT_EQ(graph.getExecutionOrder(),order);
+        EXPECT_EQ(graph.getNode("L1_ple_hash")->stage->graphCaptureVariantSignature(),hash);
+        EXPECT_EQ(begin->operands.declarationIdentity(),query);
+        EXPECT_NO_THROW(frame->requireConsumed());
+    }
+}
+}
+
+namespace llaminar2::test {
+/**
+ * @test The actual P1 directed factory uses the complete local source graph,
+ * preserving its original unallocated distributed frontier and late model joins.
+ * Native SDK operations are doubled; this proves construction, not execution.
+ */
+TEST(PooledImmutableOwnerPinChain, SoleLocalDirectedSourceKeepsOriginalPhasesAndModelJoins)
+{
+    std::vector<PooledOriginalRecipe> recipes;
+    for(const auto type:{DeviceType::CUDA,DeviceType::ROCm})for(const auto slots:{0u,3u})
+        recipes.push_back({{slots},false,0,true,type,64});
+    PooledImmutableOriginalPrograms programs(recipes);
+    for(const auto& recipe:recipes){
+        auto c=programs.makeWithPreparedWorkers(recipe);const auto device=c.boundary->device();
+        const auto transport=q::PooledImmutableDirectedTransport::create(c.boundary);
+        ASSERT_TRUE(transport->remotes().empty());ASSERT_TRUE(transport->readers().empty());
+        EXPECT_THROW(q::PooledImmutableLocalOwnerBinding::bind(c.coordinator,c.owners.front(),c.memory),std::invalid_argument);
+
+        EXPECT_EQ(c.coordinator->plan().parameters().native.ingress_frontier,0u);
+        for(const bool counted:{false,true}){
+            auto* live=static_cast<std::int32_t*>(c.queryLive->gpu_data_ptr());
+            const auto tokens=counted?DeviceRowRange::deviceCounted(4,live):DeviceRowRange::fullyActive(4);
+            q::PooledNativeOperandSpans begin{};
+            begin[static_cast<unsigned>(q::PooledNativeOperand::Ids)]=q::PooledNativeTensorSpan{c.ids,BufferId::QFN_NGRAM_ROW_IDS,0,64*sizeof(std::uint64_t)};
+            if(counted)begin[static_cast<unsigned>(q::PooledNativeOperand::OriginalCount)]=q::PooledNativeTensorSpan{c.queryLive,BufferId::PREFILL_CHUNK_GEOMETRY,0,sizeof(std::int32_t)};
+            const auto& p=c.boundary->pooledStorage()->geometry().parameters();
+            begin[static_cast<unsigned>(q::PooledNativeOperand::Admission)]=q::PooledNativeTensorSpan{
+                c.boundary->pooledStorage()->roots().native,BufferId::QFN_POOLED_SOURCE_NATIVE,
+                p.offsets.protocol+offsetof(q::ImmutableLookupDeviceState,admissionGeneration),sizeof(std::uint64_t)};
+            ComputeGraph graph;
+            const auto completed=appendPooledImmutableDirectedLookupGraph(graph,c.arena,c.boundary,transport,c.coordCode,
+                {tokens.repeatEachRow(16),n::OriginalIdWidth::UInt64},begin,*c.control,
+                {c.readOutput,BufferId::QFN_PLE_EMBEDDING,0,64*160*sizeof(float)},"p1","p1/output");
+            const auto local=std::get<std::shared_ptr<const PooledImmutableLocalRetirementCompletion>>(completed.retirement);
+            ASSERT_TRUE(local);EXPECT_NO_THROW(requirePooledSourceRetirementCompletion(graph,completed.retirement));
+            // Use the real model hash constructor and the same exact typed
+            // demand/trunk handoff as Qwen4ExpPooledReadAheadFrame.
+            q::NgramHashPolicy policy;policy.multipliers={9007199254740993ULL,9007199254740995ULL,9007199254740997ULL};
+            for(unsigned head=0;head<16;++head){policy.moduli[head]=7;policy.offsets[head]=7*head;}
+            Qwen4ExpStageRows rows{4};
+            if(counted)rows.liveRows=Qwen4ExpNativeIntInput{device,live,1};
+            graph.addNode("model/hash",std::make_unique<Qwen4ExpPrimitiveStage>(Qwen4ExpPrimitiveStage::Params{
+                .device_id=device,.rows=rows,.operation=Qwen4ExpPrimitiveStage::NgramHash{
+                    Qwen4ExpNativeIntInput{device,static_cast<const std::int32_t*>(c.queryTokens->gpu_data_ptr()),4},
+                    Qwen4ExpIntBinding(*c.queryPrior,BufferId::QFN_PLE_TOKEN_HISTORY),
+                    Qwen4ExpIntBinding(*c.ids,BufferId::QFN_NGRAM_ROW_IDS),policy}}),device);
+            graph.addDependency(completed.source.first,"model/hash");
+            ASSERT_TRUE(completed.source.demand);
+            declareDemandTrunk(graph,device,completed.source.demand->published);
+            bindPooledDemandConsumption(graph,*completed.source.demand,{"trunk/terminal"});
+            EXPECT_NO_THROW(requirePooledSourceRetirementCompletion(graph,completed.retirement));
+            // Each internal phase still needs its original predecessor. A
+            // missing release/read/retirement edge cannot become clean reuse.
+            for(const auto& name:graph.getExecutionOrder()){
+                if(name==completed.source.first || name.starts_with("model/") || name.starts_with("trunk/"))continue;
+                auto* node=graph.getNode(name);if(node->dependencies.empty())continue;
+                const auto saved=node->dependencies;node->dependencies.clear();
+                EXPECT_THROW(requirePooledSourceRetirementCompletion(graph,completed.retirement),std::invalid_argument)<<name;
+                node->dependencies=saved;
+            }
+            auto* first=graph.getNode(completed.source.first);first->dependencies={"trunk/terminal"};
+            EXPECT_THROW(requirePooledSourceRetirementCompletion(graph,completed.retirement),std::invalid_argument);
+            first->dependencies={"model/hash"};
+            auto* read=graph.getNode(local->readNode());read->device=DeviceId::cpu();
+            EXPECT_THROW(requirePooledSourceRetirementCompletion(graph,completed.retirement),std::invalid_argument);
+            read->device=device;
+            EXPECT_NO_THROW(requirePooledSourceRetirementCompletion(graph,completed.retirement));
+        }
+    }
+}
+}

@@ -246,6 +246,21 @@ namespace llaminar2
             const std::vector<const TensorBase *> &shards,
             TensorBase *output) override;
         bool reduceScatter(const TensorBase *input, TensorBase *output_shard) override;
+        /** @copydoc ICollectiveBackend::signalNativeCompletionAbort */
+        bool signalNativeCompletionAbort() override;
+
+        /** @copydoc ICollectiveBackend::nativeCompletionAuthority */
+        NativeCompletionAuthority nativeCompletionAuthority(int participant) override;
+
+        /** @copydoc ILocalTPContext::nativeTransferBytesOnStream */
+        bool nativeTransferBytesOnStream(void* payload,const NativeCollectiveBytes& bytes,
+            NativeByteEdge edge,int participant,void* stream,const std::string& stage_name) override;
+
+        /** @copydoc ILocalTPContext::nativeBroadcastBytesOnStream */
+        bool nativeBroadcastBytesOnStream(const void* send, void* receive,
+            const NativeCollectiveBytes& bytes, int root, int participant, void* stream,
+            const std::string& stage_name) override;
+
         /** @copydoc ILocalTPContext::nativeRowsOnStream */
         bool nativeRowsOnStream(
             NativeRowCollective operation, const void *send, void *receive,
@@ -375,7 +390,8 @@ namespace llaminar2
          * @brief Publish fatal cancellation without destroying graph-owned communicators.
          *
          * The first caller closes collective admission and wakes every LocalTP
-         * rendezvous. NCCL/RCCL destruction is deliberately deferred to this
+         * rendezvous and signals fully ready original native abort words without
+         * destroying their graph borrowers. NCCL/RCCL destruction is deliberately deferred to this
          * context's destruction boundary because native graph executables may
          * retain communicator references until their owning device runners are
          * destroyed.
@@ -433,8 +449,8 @@ namespace llaminar2
         /// Device group for backend initialization
         DeviceGroup device_group_;
 
-        /// Track if backend was successfully initialized
-        bool backend_initialized_ = false;
+        /// Publishes immutable backend/communicator readiness to cancellation callers.
+        std::atomic<bool> backend_initialized_{false};
 
         // =====================================================================
         // Barrier Synchronization State

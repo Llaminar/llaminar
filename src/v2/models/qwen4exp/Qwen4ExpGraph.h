@@ -88,6 +88,7 @@ protected:
     std::optional<std::string> addModelAttentionConsumer(ComputeGraph &graph,const AttentionConsumerBinding &binding) override;
 private:
   struct EarlyPrefix;
+  struct PooledPrefix;
   struct ResidentPrefix;
   /** @brief Resolve the original admitted PLE source for both prefix and consumer construction. */
   Qwen4ExpPLEBuilder::LookupStorage pleLookupStorage(const ForwardInput&,DeviceId,Qwen4ExpStageRows,Qwen4ExpAuxiliaryState&);

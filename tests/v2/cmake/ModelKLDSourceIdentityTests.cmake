@@ -2,6 +2,28 @@
 @file ModelKLDSourceIdentityTests.cmake
 @brief Explicit frozen-source identity and coordinated original-owner observer replays.
 ]]
+# Focused diagnostics use a distinct receipt/report type and cannot certify the
+# complete gates. Replay the actual producer/consumer bodies without a model.
+if(Python3_Interpreter_FOUND)
+    add_v2_test(V2_Integration_ModelKLDFocusedPrerequisiteDiagnostic
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/../unit/scripts/test_production_prerequisite_reuse.py
+            FocusedPanelPrerequisiteTests
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Numerics;Contract;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 15
+        ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1;MKL_NUM_THREADS=1")
+    add_v2_test(V2_Integration_ModelKLDFocusedPairedDiagnostic
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/../unit/scripts/test_model_kld_corpus_execution.py
+            PairedCorpusExecutionTests.test_focused_receipt_selects_only_explicit_local_diagnostic_inventory
+            PairedCorpusExecutionTests.test_focused_panel_keeps_accuracy_rows_and_never_publishes_certifiable_green
+            PairedCorpusExecutionTests.test_stale_focused_receipt_and_nonpaired_option_fail_before_native_work
+            PairedCorpusExecutionTests.test_external_metadata_requires_explicit_policy_and_original_contained_payloads
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Numerics;Contract;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 15
+        ENVIRONMENT "OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1;MKL_NUM_THREADS=1")
+    foreach(case IN ITEMS ModelKLDFocusedPrerequisiteDiagnostic ModelKLDFocusedPairedDiagnostic)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_${case})
+    endforeach()
+endif()
 # Persistent reference file identity survives Linux device renumbering while
 # current-run pins still reject mount/file changes. These are model-free replays.
 if(TARGET v2_test_model_parity_definition)

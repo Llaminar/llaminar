@@ -1217,3 +1217,5 @@ TEST(CapturedTransferChannelFloor, ROCm_MappedReverse_M512737280) {
         {.capacity=737280,.bytes={737280},.offsets={16},.replays=25,.patterns=2,
          .peer_storage=PeerStorage::PrivateScratch,.measure_floor=true,.fixed_native_collective=false,.warmups=3});
 }
+
+#include "NativeCompletedReaderReplay.inc"

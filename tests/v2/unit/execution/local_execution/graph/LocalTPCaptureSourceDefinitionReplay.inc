@@ -14,7 +14,7 @@ public:
     explicit ColdDefinitionReplayPlan(PreparedGPUContextUsePermit original):original_(std::move(original)){}
     const PreparedGPUContextUsePermit& originalSource()const noexcept override{return original_;}
     void authenticatePreparationStream(std::shared_ptr<const RetainedGraphParticipantPreparationStream> value)const override{value->requireDefinition();}
-    uint64_t captureIdentity()const noexcept override{return 511;}
+    uint64_t captureIdentity()const noexcept override{++identityProjections;return 511;}
     void authenticateRecordingOwner(const IGPUGraphCapture&)const override{throw std::logic_error("Unit definition has no executable");}
     std::shared_ptr<IRetainedGraphParticipantInvocation> bindOriginalSource(const RetainedGraphParticipantSourceSeal&)const override{
         throw std::logic_error("Cold definition cannot mint an executable invocation");
@@ -26,21 +26,25 @@ public:
     void requireRecordedIdentity(const RetainedGraphParticipantPreparationStream& value)const{
         value.requireLive(original_);const auto& d=value.definition();
         if(d.plan.get()!=this || d.graph!=graph || d.arena!=arena || d.domain!=definitionDomain() ||
-           !graph || d.topology_generation!=graph->topologyGeneration() || d.variant!=511 ||
+           !graph || d.topology_generation!=graph->topologyGeneration() || d.variant!=expectedVariant ||
            graph->retainedParticipantSourcePlan().get()!=this)
             throw std::logic_error("Recorded source definition changed its original graph/count/retirement identity");
     }
     void requireCurrentPreparedSourceDefinition(const RetainedGraphParticipantPreparationStream& value)const override{++warmValidations;requireRecordedIdentity(value);}
     std::unique_ptr<IRetainedGraphParticipantStorageAttachment> prepareOriginalStorageAttachment(
         DeviceId receiver,IGPUGraphCapture& parent,IGraphCaptureAuxiliaryBranch* progress,
-        std::shared_ptr<const RetainedGraphParticipantPreparationStream> token)const override{
+        std::shared_ptr<const RetainedGraphParticipantPreparationStream> token,const ComputeGraph& receiverGraph)const override{
         requirePreparedSourceDefinition(*token);++attachments;
+        if (!receiverGraph.retainedParticipantDefinitionDomain() ||
+            *receiverGraph.retainedParticipantDefinitionDomain() != token->definition().domain)
+            throw std::logic_error("Recorded source attachment changed its actual recipient graph/domain");
         if(!attach)throw std::logic_error("Recorded adapter omitted its original attachment result");
         return attach(receiver,parent,progress,std::move(token));
     }
-    mutable unsigned attachments=0,coldValidations=0,warmValidations=0;
+    mutable unsigned attachments=0,coldValidations=0,warmValidations=0,identityProjections=0;
     std::function<std::unique_ptr<IRetainedGraphParticipantStorageAttachment>(DeviceId,IGPUGraphCapture&,IGraphCaptureAuxiliaryBranch*,
         std::shared_ptr<const RetainedGraphParticipantPreparationStream>)> attach;
+    uint64_t expectedVariant=511;
     const ComputeGraph* graph=nullptr;
     const void* arena=nullptr;
 private:PreparedGPUContextUsePermit original_;
@@ -258,4 +262,280 @@ TEST(RetainedGraphParticipantEnqueueGroup, ColdStorageValidationSealsOnceAndReje
     RetainedGraphParticipantsReplayAccess::retire(*replacement);
     EXPECT_THROW(replacement->requireCurrentDefinition(),std::logic_error);
 }
+/** @test Incomplete original definitions name the missing field before invoking the source plan. */
+TEST(RetainedGraphParticipantEnqueueGroup, ColdDefinitionNamesEveryMissingDeclaration){
+    using A=NativeContextPreparationReplayAccess;const auto device=DeviceId::cuda(96);
+    A::seed(device,[device](auto stack){return A::construct<ColdPreparationWorker>(std::move(stack),device.ordinal);});
+    auto source=A::source<ColdPreparationWorker>(device);ColdPreparationRetirement retirement{device};
+    ColdDefinitionReplay original(source->acquire(device));
+    const auto complete=original.token->definition();
+    using Definition=RetainedGraphParticipantPreparationStream::Definition;
+    const std::pair<const char*,std::function<void(Definition&)>> cases[]={
+        {"plan",[](auto& d){d.plan.reset();}}, {"graph",[](auto& d){d.graph=nullptr;}},
+        {"arena",[](auto& d){d.arena=nullptr;}}, {"topology_generation",[](auto& d){d.topology_generation=0;}},
+        {"variant",[](auto& d){d.variant=0;}}, {"domain.source",[](auto& d){d.domain.source=DeviceId::invalid();}},
+        {"domain.authority",[](auto& d){d.domain.authority=nullptr;}}};
+    for(const auto& [field,remove]:cases){
+        SCOPED_TRACE(field);auto incomplete=complete;remove(incomplete);
+        const auto token=RetainedGraphParticipantsReplayAccess::definition(original.original,original.token->stream(),incomplete);
+        const auto before=original.plan->coldValidations;
+        try{token->requireDefinition();FAIL()<<"Missing declaration accepted";}
+        catch(const std::logic_error& error){EXPECT_EQ(std::string(error.what()),
+            std::string("Original source preparation has no complete declarative definition: missing ")+field);}
+        EXPECT_EQ(original.plan->coldValidations,before);
+        RetainedGraphParticipantsReplayAccess::retire(*token);
+    }
+    EXPECT_NO_THROW(original.token->requireDefinition());
+}
+/** @test Actual early binder seals graph identity before cache selection and rejects replacement. */
+TEST(RetainedGraphParticipantEnqueueGroup, EarlyBinderUsesActualImmutableGraphIdentity){
+    using A=NativeContextPreparationReplayAccess;
+    for(const auto device:{DeviceId::cuda(97),DeviceId::rocm(97)}){
+        A::seed(device,[device](auto stack){return A::construct<ColdPreparationWorker>(std::move(stack),device.ordinal);});
+        auto source=A::source<ColdPreparationWorker>(device);ColdPreparationRetirement retirement{device};
+        for(int replay=0;replay<20;++replay){
+            ColdDefinitionReplay original(source->acquire(device));BufferArena arena,foreignArena;
+            original.plan->arena=&arena;
+            original.plan->expectedVariant=DeviceGraphCaptureController::computeCaptureVariantSignature(original.graph);
+            DeviceGraphExecutor executor;executor.setArena(&arena);DeviceGraphExecutor::GraphSegmentCache cache;
+            auto* worker=original.original.worker().get();
+            ASSERT_TRUE(cache.bindBorrowedCaptureStream(worker,original.token->stream(),device,false));
+            ASSERT_EQ(cache.capture_variant_signature,0u);
+            RetainedGraphParticipantsReplayAccess::bindPreparation(executor,original.graph,cache,worker);
+            const auto sealed=cache.participant_preparation_stream;ASSERT_TRUE(sealed);
+            EXPECT_NO_THROW(sealed->requireDefinition());
+            EXPECT_EQ(sealed->definition().arena,&arena);
+            EXPECT_EQ(sealed->definition().variant,original.plan->expectedVariant);
+            EXPECT_EQ(cache.capture_variant_signature,0u);
+            cache.capture_variant_signature=DeviceGraphCaptureController::computeCaptureVariantSignature(original.graph);
+            worker->submitAndWait([&]{
+                EXPECT_NO_THROW(RetainedGraphParticipantsReplayAccess::bindPreparation(executor,original.graph,cache,worker));
+                EXPECT_EQ(cache.participant_preparation_stream,sealed);
+            });
+            // Ready replay checks the sealed original borrow without repeating
+            // source structural validation or the graph launch-signature walk.
+            cache.initialized=true;
+            const auto cold=original.plan->coldValidations,warm=original.plan->warmValidations;
+            const auto projections=original.plan->identityProjections;
+            for(int request=0;request<20;++request)
+                RetainedGraphParticipantsReplayAccess::bindPreparation(executor,original.graph,cache,worker);
+            EXPECT_EQ(original.plan->coldValidations,cold);
+            EXPECT_EQ(original.plan->warmValidations,warm+20);
+            EXPECT_EQ(original.plan->identityProjections,projections);
+            auto foreignControl=sealed->definition();
+            foreignControl.plan=std::shared_ptr<const IRetainedGraphParticipantSourcePlan>(original.plan.get(),[](auto*){});
+            const auto counterfeit=RetainedGraphParticipantsReplayAccess::definition(
+                original.original,original.token->stream(),foreignControl);
+            cache.participant_preparation_stream=counterfeit;
+            EXPECT_THROW(RetainedGraphParticipantsReplayAccess::bindPreparation(executor,original.graph,cache,worker),std::logic_error);
+            RetainedGraphParticipantsReplayAccess::retire(*counterfeit);
+            cache.participant_preparation_stream=sealed;
+            cache.initialized=false;
+            ++cache.capture_variant_signature;
+            EXPECT_THROW(RetainedGraphParticipantsReplayAccess::bindPreparation(executor,original.graph,cache,worker),std::logic_error);
+            cache.capture_variant_signature=sealed->definition().variant;
+            executor.setArena(&foreignArena);
+            EXPECT_THROW(RetainedGraphParticipantsReplayAccess::bindPreparation(executor,original.graph,cache,worker),std::logic_error);
+            executor.setArena(&arena);
+            ComputeGraph foreign;foreign.setRetainedParticipantSourcePlan(original.plan);
+            EXPECT_THROW(RetainedGraphParticipantsReplayAccess::bindPreparation(executor,foreign,cache,worker),std::logic_error);
+            original.graph.clear();original.graph.setRetainedParticipantSourcePlan(original.plan);
+            cache.capture_variant_signature=0;
+            EXPECT_THROW(RetainedGraphParticipantsReplayAccess::bindPreparation(executor,original.graph,cache,worker),std::logic_error);
+            cache.reset();EXPECT_THROW(sealed->requireDefinition(),std::logic_error);
+        }
+    }
+}
+/** @test Exact original finite source variants and source-free sidecars keep distinct ownership contracts. */
+TEST(RetainedGraphParticipantEnqueueGroup, ExpertSourceFamilyOriginalVariantsAndSourceFreeLifecycle)
+{
+    using A=NativeContextPreparationReplayAccess;
+    for (const auto device : {DeviceId::cuda(96),DeviceId::rocm(96)}) {
+        A::seed(device,[device](auto stack){return A::construct<ColdPreparationWorker>(std::move(stack),device.ordinal);});
+        auto source=A::source<ColdPreparationWorker>(device);ColdPreparationRetirement retirement{device};
+        ColdDefinitionReplay recorded(source->acquire(device));recorded.token->requireDefinition();
+        for (int repeat=0;repeat<20;++repeat) {
+            std::vector<RetainedForwardSourceDefinition> definitions;
+            for (const bool decode : {false,true}) {
+                ForwardGraphSignature signature;
+                signature.seq_len=3;signature.batch_size=1;signature.device=device;signature.decode=decode;
+                definitions.push_back(RetainedForwardSourceDefinition::checked(signature,
+                    decode?MoEOverlayInferenceGraphRole::MainDecode:MoEOverlayInferenceGraphRole::MainPrefill,
+                    3,recorded.graph,recorded.plan->expectedVariant,recorded.token));
+            }
+            auto selected=retainedExpertSourceVariants(definitions,false,3);
+            ASSERT_EQ(selected.size(),1u);EXPECT_EQ(selected.front(),recorded.token);
+            ComputeGraph follower;
+            follower.setRetainedParticipantSourceVariants(selected);
+            EXPECT_EQ(follower.retainedParticipantSourceVariants().front(),recorded.token);
+            EXPECT_EQ(*follower.retainedParticipantDefinitionDomain(),recorded.plan->definitionDomain());
+            EXPECT_THROW(follower.setRetainedParticipantSourceVariants(selected),std::invalid_argument);
+            follower.clear();EXPECT_TRUE(follower.retainedParticipantSourceVariants().empty());
+            // Source-free projections carry an immutable cold fact, not a live
+            // raw graph borrow. Consumption remains safe after declaration scope.
+            std::vector<RetainedForwardSourceDefinition> sidecars;
+            {
+                ComputeGraph sidecar;
+                sidecars.push_back(RetainedForwardSourceDefinition::checked(std::nullopt,
+                    MoEOverlayInferenceGraphRole::MTPDraft,3,sidecar,73,{}));
+            }
+            EXPECT_TRUE(retainedExpertSourceVariants(sidecars,true,3).empty());
+            EXPECT_THROW(retainedExpertSourceVariants(sidecars,false,3),std::invalid_argument);
+        }
+    }
+}
+/** @test Partial, stale, foreign and conflicting associations reject before an actual follower graph mutates. */
+TEST(RetainedGraphParticipantEnqueueGroup, ExpertSourceFamilyRejectsMissingForeignAndPartialBindings)
+{
+    using A=NativeContextPreparationReplayAccess;const auto device=DeviceId::cuda(97);
+    A::seed(device,[device](auto stack){return A::construct<ColdPreparationWorker>(std::move(stack),device.ordinal);});
+    auto source=A::source<ColdPreparationWorker>(device);ColdPreparationRetirement retirement{device};
+    ColdDefinitionReplay recorded(source->acquire(device));recorded.token->requireDefinition();
+    ForwardGraphSignature signature;signature.seq_len=1;signature.batch_size=1;signature.device=device;signature.decode=true;
+    const auto original=RetainedForwardSourceDefinition::checked(signature,MoEOverlayInferenceGraphRole::MainDecode,
+        1,recorded.graph,recorded.plan->expectedVariant,recorded.token);
+    ComputeGraph foreign,follower;
+    EXPECT_THROW(RetainedForwardSourceDefinition::checked(signature,MoEOverlayInferenceGraphRole::MainDecode,
+        1,foreign,recorded.plan->expectedVariant,recorded.token),std::invalid_argument);
+    EXPECT_THROW(RetainedForwardSourceDefinition::checked(signature,MoEOverlayInferenceGraphRole::MainDecode,
+        1,recorded.graph,recorded.plan->expectedVariant,{}),std::invalid_argument);
+    const std::vector<RetainedForwardSourceDefinition> originals{original};
+    EXPECT_THROW(retainedExpertSourceVariants(originals,false,2),std::invalid_argument);
+    EXPECT_THROW(retainedExpertSourceVariants({},false,1),std::invalid_argument);
+    const auto source_free=RetainedForwardSourceDefinition::checked(signature,MoEOverlayInferenceGraphRole::MainDecode,
+        1,foreign,73,{});
+    const std::vector<RetainedForwardSourceDefinition> mixed{original,source_free};
+    EXPECT_THROW(retainedExpertSourceVariants(mixed,false,1),std::invalid_argument);
+    ColdDefinitionReplay other(source->acquire(device));other.token->requireDefinition();
+    const auto other_definition=RetainedForwardSourceDefinition::checked(signature,MoEOverlayInferenceGraphRole::MainDecode,
+        1,other.graph,other.plan->expectedVariant,other.token);
+    const std::vector<RetainedForwardSourceDefinition> foreign_domain{original,other_definition};
+    EXPECT_THROW(retainedExpertSourceVariants(foreign_domain,false,1),std::invalid_argument);
+    EXPECT_TRUE(follower.retainedParticipantSourceVariants().empty());EXPECT_FALSE(follower.retainedParticipantDefinitionDomain());
+    RetainedGraphParticipantsReplayAccess::retire(*recorded.token);
+    EXPECT_THROW(retainedExpertSourceVariants(originals,false,1),std::logic_error);
+    EXPECT_TRUE(follower.retainedParticipantSourceVariants().empty());
+}
+/** @test A structurally plausible physical owner gains no expert role from discovery or continuation membership. */
+TEST(RetainedGraphParticipantEnqueueGroup, ExpertOwnerRequiresOriginalExecutionRole)
+{
+    using A=NativeContextPreparationReplayAccess;
+    for (const auto device : {DeviceId::cuda(98),DeviceId::rocm(98)}) {
+        A::seed(device,[device](auto stack){return A::construct<ColdPreparationWorker>(std::move(stack),device.ordinal);});
+        auto source=A::source<ColdPreparationWorker>(device);ColdPreparationRetirement retirement{device};
+        const auto original=source->acquire(device);
+        MoEExpertOverlayExecutionPlan execution;execution.continuation_domain="original_continuation";
+        execution.domains.emplace_back();auto& domain=execution.domains.back();domain.name=execution.continuation_domain;
+        domain.participants.emplace_back();auto& participant=domain.participants.back();
+        participant.local_device=device;participant.world_rank=original.memory()->worldRank();
+        participant.owned_by_current_rank=true;participant.locally_addressable=true;
+        using Policy=qwen4exp::PooledImmutableParticipantExecutionPolicy;
+        EXPECT_FALSE(Policy::declaresExpertOwner(execution,original));
+        domain.name="actual_expert_follower";EXPECT_TRUE(Policy::declaresExpertOwner(execution,original));
+        participant.owned_by_current_rank=false;EXPECT_FALSE(Policy::declaresExpertOwner(execution,original));participant.owned_by_current_rank=true;
+        participant.locally_addressable=false;EXPECT_FALSE(Policy::declaresExpertOwner(execution,original));participant.locally_addressable=true;
+        ++participant.world_rank;EXPECT_FALSE(Policy::declaresExpertOwner(execution,original));--participant.world_rank;
+        participant.local_device=DeviceId::cpu();EXPECT_FALSE(Policy::declaresExpertOwner(execution,original));
+    }
+}
+
+/** @test Partial follower-family construction releases every actual cache body before revoking the original source token. */
+TEST(RetainedGraphParticipantEnqueueGroup, ExpertSourceFamilyPartialParentsRetireBeforeOriginalSource)
+{
+    using A=NativeContextPreparationReplayAccess;const auto device=DeviceId::rocm(99);
+    A::seed(device,[device](auto stack){return A::construct<ColdPreparationWorker>(std::move(stack),device.ordinal);});
+    auto source=A::source<ColdPreparationWorker>(device);ColdPreparationRetirement retirement{device};
+    ColdDefinitionReplay original(source->acquire(device));original.token->requireDefinition();DeviceGraphExecutor executor;
+    ForwardGraphSignature signature;signature.seq_len=1;signature.batch_size=1;signature.device=device;signature.decode=true;
+    const std::array definitions{RetainedForwardSourceDefinition::checked(signature,MoEOverlayInferenceGraphRole::MainDecode,
+        1,original.graph,original.plan->expectedVariant,original.token)};
+    const auto variants=retainedExpertSourceVariants(definitions,false,1);
+    for (unsigned repeat=0;repeat<20;++repeat) {
+        std::array<bool,4> native_destroyed{};std::array<unsigned,4> releases{};
+        std::array<ComputeGraph,4> followers;
+        std::array<DeviceGraphExecutor::GraphSegmentCache,4> caches;
+        unsigned attached=0;
+        try {
+            for (unsigned i=0;i<4;++i) {
+                auto& cache=caches[i];auto& graph=followers[i];
+                ASSERT_TRUE(cache.bindBorrowedCaptureStream(original.original.worker().get(),original.token->stream(),device,false));
+                graph.setRetainedParticipantSourceVariants(variants);
+                cache.recorded_source_definition=original.token;
+                cache.retained_parent_capture=std::make_unique<testing::MockGPUGraphCapture>(cache.capture_stream,[&,i]{native_destroyed[i]=true;});
+                auto& parent=*cache.retained_parent_capture;ASSERT_TRUE(parent.beginCapture());ASSERT_TRUE(parent.endCapture());
+                original.plan->attach=[&,i](DeviceId,IGPUGraphCapture& actual,IGraphCaptureAuxiliaryBranch*,auto token) {
+                    auto body=std::make_unique<ColdAttachmentProbe>(actual,std::move(token),native_destroyed[i],releases[i]);
+                    body->nativeAssemble=[&,i] {
+                        EXPECT_TRUE(caches[i].original_storage_attachment);
+                        if (i==1) throw std::runtime_error("original second follower partial attachment");
+                        return true;
+                    };
+                    return body;
+                };
+                ASSERT_TRUE(RetainedGraphParticipantsReplayAccess::attachStorage(executor,graph,cache,device,parent));
+                ASSERT_TRUE(parent.instantiate());++attached;
+            }
+            FAIL()<<"Original partial attachment failure disappeared";
+        } catch (const std::runtime_error& failure) {
+            EXPECT_STREQ(failure.what(),"original second follower partial attachment");
+        }
+        EXPECT_EQ(attached,1u);EXPECT_EQ(releases[0],0u);EXPECT_EQ(releases[1],0u);
+        EXPECT_NO_THROW(original.token->requireCurrentDefinition());
+        for (unsigned i=0;i<4;++i) {
+            caches[i].reset();followers[i].clear();
+            EXPECT_EQ(releases[i],i<2?1u:0u);
+            if (i<2) EXPECT_TRUE(native_destroyed[i]);
+        }
+        // Actual cache reset destroys native graph handles first, then body
+        // borrows. Only this completed frontier permits source revocation.
+        EXPECT_NO_THROW(original.token->requireCurrentDefinition());
+    }
+    RetainedGraphParticipantsReplayAccess::retire(*original.token);
+    EXPECT_THROW(original.token->requireCurrentDefinition(),std::logic_error);
+}
+
+/** @test Additive cold aliases stage atomically, preserve old invocations and reject stale/foreign replacement. */
+TEST(RetainedGraphParticipantEnqueueGroup, ExpertSourceFamilyAliasRefreshKeepsOriginalInvocations)
+{
+    using A=NativeContextPreparationReplayAccess;const auto device=DeviceId::rocm(100);
+    A::seed(device,[device](auto stack){return A::construct<ColdPreparationWorker>(std::move(stack),device.ordinal);});
+    auto source=A::source<ColdPreparationWorker>(device);ColdPreparationRetirement retirement{device};
+    ColdDefinitionReplay original(source->acquire(device));original.token->requireDefinition();
+    const auto next=RetainedGraphParticipantsReplayAccess::definition(original.original,original.token->stream(),original.token->definition());
+    next->requireDefinition();
+    std::vector<std::shared_ptr<const RetainedGraphParticipantPreparationStream>> prior{original.token},proposed{next};
+    const auto extended=retainedSourceVariantExtension(prior,proposed);
+    ASSERT_EQ(extended.size(),2u);EXPECT_EQ(extended.front(),original.token);EXPECT_EQ(extended.back(),next);
+    EXPECT_EQ(prior.size(),1u);EXPECT_EQ(prior.front(),original.token);
+    EXPECT_EQ(retainedSourceVariantExtension(extended,proposed),extended);
+    EXPECT_NO_THROW(original.token->requireCurrentDefinition());
+    EXPECT_NO_THROW(next->requireCurrentDefinition());
+    ColdDefinitionReplay foreign(source->acquire(device));foreign.token->requireDefinition();
+    const std::vector<std::shared_ptr<const RetainedGraphParticipantPreparationStream>> incompatible{next,foreign.token};
+    EXPECT_THROW(retainedSourceVariantExtension(prior,incompatible),std::invalid_argument);
+    EXPECT_EQ(prior.size(),1u);EXPECT_EQ(prior.front(),original.token); // Whole proposed set fails before publication.
+    RetainedGraphParticipantsReplayAccess::retire(*next);
+    EXPECT_THROW(retainedSourceVariantExtension(prior,proposed),std::logic_error);
+    EXPECT_NO_THROW(original.token->requireCurrentDefinition()); // The original alias remains a valid invocation.
+}
+
+/** @brief Actual draft geometry follows request batches, independently of verifier/prefill rows. */
+TEST(RetainedGraphParticipantEnqueueGroup, ExpertSourceFamilyDraftRequestManifest)
+{
+    const std::vector<std::size_t> backing{1,2,4,8,16,32};
+    const std::vector<int> prefill{8,32};
+    const auto main=MoEOverlayFollowerRowGeometry::declare(32,16,prefill,backing);
+    for(int rows=1;rows<=16;++rows)ASSERT_NE(main.forRows(rows),nullptr);
+    ASSERT_NE(main.forRows(32),nullptr);
+    for(const int requests:{1,2,4,8})
+    {
+        const auto draft=MoEOverlayFollowerRowGeometry::declareDraft(requests,backing);
+        ASSERT_EQ(draft.shapes().size(),static_cast<std::size_t>(requests));
+        for(int count=1;count<=requests;++count)ASSERT_NE(draft.forRows(count),nullptr);
+        EXPECT_EQ(draft.forRows(requests+1),nullptr);
+        EXPECT_EQ(draft.forRows(32),nullptr); // KV-only shifted prefill is not a draft ticket.
+    }
+    EXPECT_THROW(MoEOverlayFollowerRowGeometry::declareDraft(33,backing),std::invalid_argument);
+}
+
 } // namespace llaminar2::test

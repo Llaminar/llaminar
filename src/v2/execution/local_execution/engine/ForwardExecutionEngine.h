@@ -927,6 +927,17 @@ namespace llaminar2
         };
 
         /**
+         * @brief Borrow the actual sealed finite graph definitions for one cold setup topology.
+         * @param snapshot_identity Original executor snapshot topology selected by the Rank.
+         * @return Exact materialized cache owners, including source-free declarations.
+         * @throws std::exception If a source-bearing executable lacks its matching preparation.
+         * No ordering is inferred from this set: each finite graph declares its
+         * own optional source occurrence, and family association uses its exact signature.
+         */
+        std::vector<RetainedForwardSourceDefinition> retainedSourceGraphDefinitions(
+            uint64_t snapshot_identity) const;
+
+        /**
          * @brief Immutable identity of one exact retained decode replay plan.
          *
          * Unlike @ref DeviceLoopGraphTemplateView, this view deliberately

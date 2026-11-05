@@ -65,8 +65,8 @@ public:
         friend struct ::llaminar2::test::ImmutableLookupSourceAdmissionReplayAccess;
         /** @brief Cancel original storage edges only after every submitted source producer terminal is proven. */
         void cancelStorageChannelsAfterSourceProof();
-        /** @brief Retire channels only after Rank's complete original native-proof aggregation. */
-        bool finishNativeChannelsAfterProof();
+        /** @brief Retire channels only after Rank's complete original native-proof aggregation; request failure remains absorbing. */
+        bool finishNativeChannelsAfterProof(bool originalRequestFailed = false);
         /** @brief Retain only the original service/group and original native boundary owners. */
         SourceGroupAdmission(std::shared_ptr<ImmutableLookupService> service,
             ImmutableLookupService::GroupAdmission admission,std::vector<SourceAdmissionParticipant> participants);
@@ -74,6 +74,8 @@ public:
         std::vector<SourceAdmissionParticipant> participants_;
         ImmutableLookupService::GroupAdmission admission_;
         std::shared_ptr<const PooledImmutableDirectedTransport> shared_reader_transport_;
+        // Original prelaunch callback ownership, not a request/progress ledger.
+        std::function<void()> original_native_failure_;
         bool finished_=false,result_=false;
     };
     /** @return Whether actual CPU channels or compute readers require the original parent admission. */
@@ -180,6 +182,8 @@ public:
     /** @brief Persistent GPU I/O admission identity, with exact admission-stream publication. */
     const std::uint64_t *generation() const {requireProtocolOwner();return generation_;}
 private:
+    /** @copydoc IRetainedGraphStorageBoundary::retireGenerationControl */
+    void retireGenerationControl(RetainedStorageGenerationControl original)override;
     /** @brief Preserve original geometry validation before standalone worker birth. */
     static std::shared_ptr<ImmutableLookupExecutionBoundary> createWorker(
         std::shared_ptr<HostImmutableRowProvider>,DeviceId,std::shared_ptr<TensorBase>,std::size_t,
@@ -261,6 +265,13 @@ private:
     void bindCompleteCohort(const std::shared_ptr<PooledImmutableCompleteCohort>& cohort);
     /** @brief Publish only the checked model-owned recurring participant authority. */
     void bindRetainedParticipants(const std::shared_ptr<PooledImmutableRetainedParticipants>&);
+    /** @brief Consume the participant frontier after its original native definitions and borrowers retire.
+     * @param original Exact existing recurring authority, still holding the source claim.
+     * @throws std::logic_error For another authority, an active interval or an unretired graph borrow.
+     */
+    void retireParticipantGenerationControl(const PooledImmutableRetainedParticipants& original);
+    /** @brief Drop only retired runner pointers; original source/protocol/event owners remain unchanged. */
+    void clearRetiredGenerationControl()noexcept;
     /** @brief Lock the complete owner through each distributed lifecycle operation. */
     std::shared_ptr<PooledImmutableRetirementAuthority> requireCompleteCohort()const;
     /** @brief Reject changed original tensor/native device/capacity/backend generation before any operation. */
@@ -304,6 +315,9 @@ private:
     std::uint64_t requestEpoch_=0,intervalGeneration_=0; ///< Host-owned immutable I/O admission identity only.
     ImmutableLookupAdmissionArgs::ProtocolInitialization initialization_=ImmutableLookupAdmissionArgs::ProtocolInitialization::InitializeOnce;
     std::atomic<bool> armed_{false};
+    /** @brief The graph and optional native participant definitions borrow one canonical controller. */
+    enum class GenerationBorrow {Unbound,GraphBorrowed,GraphRetired};
+    GenerationBorrow generationBorrow_=GenerationBorrow::Unbound;
     RetainedStorageGenerationControl control_;
     ImmutableLookupServiceStats intervalStart_; ///< Snapshot of I/O counters before the worker starts.
     std::optional<RetainedStorageTerminalObservation> terminal_; ///< Immutable only after worker join.

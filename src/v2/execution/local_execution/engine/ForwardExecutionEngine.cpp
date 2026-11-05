@@ -2648,6 +2648,47 @@ namespace llaminar2
         return true;
     }
 
+    std::vector<RetainedForwardSourceDefinition>
+    ForwardExecutionEngine::retainedSourceGraphDefinitions(uint64_t snapshot_identity) const
+    {
+        if (!snapshot_identity)
+            throw std::invalid_argument("Finite source family requires its original snapshot topology");
+        std::vector<RetainedForwardSourceDefinition> result;
+        for (const auto& [signature, cache] : cache_)
+        {
+            if (signature.snapshot_configuration_identity != snapshot_identity ||
+                !cache.valid || !cache.graph || !cache.segment_cache.initialized)
+                continue;
+            const auto& native = cache.segment_cache;
+            if (native.needs_capture || !native.successful_capture_count ||
+                !native.capture_variant_signature)
+                throw std::logic_error("Finite source family contains an incomplete captured graph");
+            const auto& declaration = cache.graph->retainedParticipantSourcePlan();
+            const auto& preparation = native.participant_preparation_stream;
+            if (static_cast<bool>(declaration) != static_cast<bool>(preparation))
+                throw std::logic_error("Finite source family lost its exact optional source preparation");
+            if (preparation)
+            {
+                preparation->requireCurrentDefinition();
+                const auto& definition = preparation->definition();
+                if (definition.graph != cache.graph.get() || definition.plan != declaration ||
+                    definition.topology_generation != cache.graph->topologyGeneration() ||
+                    definition.variant != native.capture_variant_signature)
+                    throw std::logic_error("Finite source family substituted its original graph definition");
+            }
+            const auto role = signature.execution_role == ForwardExecutionRole::GroupedMTPVerifier
+                ? MoEOverlayInferenceGraphRole::MTPGroupedVerifier
+                : signature.decode ? MoEOverlayInferenceGraphRole::MainDecode
+                                   : MoEOverlayInferenceGraphRole::MainPrefill;
+            const auto rows = static_cast<int64_t>(signature.batch_size) * signature.seq_len;
+            if (rows <= 0 || rows > std::numeric_limits<int>::max())
+                throw std::logic_error("Finite source family has no original physical row geometry");
+            result.push_back(RetainedForwardSourceDefinition::checked(signature,role,static_cast<int>(rows),
+                *cache.graph,native.capture_variant_signature,preparation));
+        }
+        return result;
+    }
+
     std::optional<ForwardExecutionEngine::RetainedDecodeGraphView>
     ForwardExecutionEngine::retainedDecodeGraph(
         const ForwardGraphSignature &signature,

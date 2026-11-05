@@ -34,6 +34,7 @@
  */
 
 #include "RankOrchestrator.h"
+#include "execution/qwen4exp/PooledImmutableRetainedParticipants.h"
 #include "execution/moe/MoEOverlayCPUHostMaintenance.h"
 #include "snapshots/SnapshotAuthoredTokenRows.h"
 #include "PipelineResidualWidth.h"
@@ -925,16 +926,63 @@ namespace llaminar2
         std::function<void()> cancel;
         /** @brief Cancel failed execution without discarding any original adopted retirement right. */
         struct Attempt {
-            std::unique_ptr<RetainedSourceAdmission> &owner;
+            RankOrchestrator& rank;
+            std::unique_ptr<RetainedSourceAdmission>& owner;
+            const char* operation;
             bool keep = false;
-            ~Attempt() {
-                if (!keep && owner) {
-                    owner->failed = true;
-                    owner->cancel();
-                }
+            /** @brief Bind the exact host Rank/source scope before its original worker fanout. */
+            Attempt(RankOrchestrator& rank,std::unique_ptr<RetainedSourceAdmission>& owner,const char* operation)
+                :rank(rank),owner(owner),operation(operation) {}
+            /** @brief Worker results have drained before this scope unwinds; missing native proof remains fatal. */
+            ~Attempt() noexcept {
+                if (!keep && owner) rank.failRetainedSourceAttempt(operation);
             }
         };
     };
+
+    void RankOrchestrator::retireRetainedSourceFailureCallback()
+    {
+        if (!tp_worker_pool_) return;
+        tp_worker_pool_->retireFailureCallback([context=tp_ctx_.get()] {
+            if (context) context->requestAbort();
+        });
+    }
+
+    void RankOrchestrator::failRetainedSourceAttempt(const char* operation) noexcept
+    {
+        if (!retained_source_admission_) return;
+        retained_source_admission_->failed=true;
+        try {
+            failOriginalSourceAttempt(device_runners_,retained_source_admission_->cancel,[&](const auto& runner) {
+                if (auto* device=dynamic_cast<DeviceGraphOrchestrator*>(runner.get()))
+                    device->prepareGroupedRetainedStorageProducerProof(operation);
+            },[&] {
+                std::exception_ptr failure;
+                try { retained_source_admission_->original->cancelStorageChannelsAfterSourceProof(); }
+                catch (...) { failure=std::current_exception(); }
+                // Sources are proven and exact owner waits released before
+                // awaiting the existing independent collective-abort worker.
+                // Channels remain admitted until the later full retirement.
+                try { retireRetainedSourceFailureCallback(); }
+                catch (...) { if (!failure) failure=std::current_exception(); }
+                if (failure) std::rethrow_exception(failure);
+            });
+        } catch (const RetiredStorageRequestFailure& failure) {
+            // Every native producer proof completed and exact storage release
+            // was attempted. Keep the failed request owned for its ordinary
+            // final group/native retirement; never turn it into reusable state.
+            LOG_ERROR("[RankOrchestrator] Failed source attempt preserved retired service failure operation="
+                << operation << " reason=" << failure.what());
+        } catch (const std::exception& failure) {
+            LOG_ERROR("[RankOrchestrator] Failed source attempt has no complete original producer proof operation="
+                << operation << " reason=" << failure.what());
+            std::terminate();
+        } catch (...) {
+            LOG_ERROR("[RankOrchestrator] Failed source attempt has no complete original producer proof operation="
+                << operation << " reason=non-standard original retirement failure");
+            std::terminate();
+        }
+    }
 
     void RankOrchestrator::prepareRetainedSourceAdmission()
     {
@@ -976,6 +1024,8 @@ namespace llaminar2
             if (context) context->requestAbort();
             if (failure) std::rethrow_exception(failure);
         });
+        if (rank_local_expert_endpoints_)
+            rank_local_expert_endpoints_->bindOriginalPooledSourceCancellation(retained->cancel);
         retained_source_admission_=std::move(retained);
     }
 
@@ -989,6 +1039,7 @@ namespace llaminar2
                 if (auto *device = dynamic_cast<DeviceGraphOrchestrator *>(runner.get()))
                     device->awaitGroupedRetainedStorageTerminal();
             }, [&] {
+                retireRetainedSourceFailureCallback();
                 const bool success = retained_source_admission_->original->finish();
                 if (!success)
                     throw RetiredStorageRequestFailure("Original TP source group failed terminal request retirement");
@@ -998,11 +1049,17 @@ namespace llaminar2
                 // A lost cancellation identity also forbids host channel
                 // retirement, but never skips another original peer's join.
                 if (prior_unproven) std::rethrow_exception(prior_unproven);
-                if (!retained_source_admission_->original->finishNativeChannelsAfterProof())
+                if (!retained_source_admission_->original->finishNativeChannelsAfterProof(retained_source_admission_->failed))
                     throw RetiredStorageRequestFailure("Original shared reader channels retired a cancelled request");
             });
+            if (rank_local_expert_endpoints_)
+                rank_local_expert_endpoints_->clearOriginalPooledSourceCancellation();
             retained_source_admission_.reset();
         } catch (const RetiredStorageRequestFailure &) {
+            // The aggregation's typed semantic result comes only after every
+            // original native proof and exact channel retirement was attempted.
+            if (rank_local_expert_endpoints_)
+                rank_local_expert_endpoints_->clearOriginalPooledSourceCancellation();
             if (!retained_source_admission_)
                 throw std::logic_error("Retired failed source group lost its original owner");
             retained_source_admission_->retired_failure = std::current_exception();
@@ -1021,6 +1078,40 @@ namespace llaminar2
         if (pp_device_generation_)
             pp_device_generation_->retireForwardOnlyBeforeStageRelease();
         retained_source_admission_.reset();
+        retireChildTopologyBeforeSharedStorageDetach();
+    }
+
+    void RankOrchestrator::retireChildTopologyBeforeSharedStorageDetach()
+    {
+        // The original follower parent owns finite storage siblings. Close
+        // those exact native/cache borrows before any continuation source cache
+        // revokes its preparation token or releases its original arena.
+        if (rank_local_expert_endpoints_)
+            rank_local_expert_endpoints_->retireOriginalPooledStorageAttachments();
+        // Keep EVERY arena and original collective context alive until all
+        // child caches/auxiliary parents have released their native borrowers.
+        for (const auto& runner : device_runners_)
+            if (auto* device = dynamic_cast<DeviceGraphOrchestrator*>(runner.get()))
+                device->retireExecutionTopologyBeforeSharedStorageDetach();
+        if (auto model = std::dynamic_pointer_cast<ModelContext>(model_ctx_)) {
+            std::vector<std::shared_ptr<qwen4exp::PooledImmutableRetainedParticipants>> originals;
+            {
+                std::lock_guard lock(model->immutable_row_table_mutex_);
+                originals = originalPublishedStorageParticipants(model->adaptive_lookup_consumers_,
+                    [&](DeviceId device, const auto& original) {
+                        // A throwing DGO constructor never appears in device_runners_.
+                        // Its already-published shared source still borrows this exact
+                        // Rank communicator and must retire before tp_ctx_ unwinds.
+                        if (original->belongsToOriginalCohort(replicated_ple_cohort_)) return true;
+                        return std::any_of(device_runners_.begin(), device_runners_.end(), [&](const auto& runner) {
+                            const auto* child = dynamic_cast<const DeviceGraphOrchestrator*>(runner.get());
+                            return child && child->state_.device_id == device;
+                        });
+                    });
+            }
+            for (const auto& original : originals)
+                model->retireAdaptiveImmutableLookupParticipants(original);
+        }
     }
 
     void RankOrchestrator::initializeRankMTPScratch()
@@ -1117,7 +1208,7 @@ namespace llaminar2
                config_.nested_pp_stage_config->has_lm_head;
     }
 
-    void RankOrchestrator::initializeDeviceRunners()
+    void RankOrchestrator::initializeDeviceRunners() try
     {
         if (!tp_ctx_)
         {
@@ -1770,11 +1861,13 @@ namespace llaminar2
             std::unique_ptr<IInferenceRunner> runner;
             int device_idx;
             std::string error;
+            std::exception_ptr failure;
         };
 
         const int num_devices = static_cast<int>(devices.size());
         std::vector<std::future<RunnerResult>> futures;
         futures.reserve(num_devices);
+        std::exception_ptr constructor_failure;
 
         for (int device_idx = 0; device_idx < num_devices; ++device_idx)
         {
@@ -1894,11 +1987,23 @@ namespace llaminar2
                                              }
                                              catch (const std::exception &e)
                                              {
+                                                 result.failure = std::current_exception();
+                                                 if (tp_ctx_) tp_ctx_->requestAbort();
                                                  result.error = std::string("Exception creating runner for device ") +
                                                                 std::to_string(device_idx) + ": " + e.what();
                                                  if (cpu_preparation)
                                                      cpu_preparation->publishFailureIfProducer(
                                                          result.error);
+                                             }
+                                             catch (...) {
+                                                 if (tp_ctx_) tp_ctx_->requestAbort();
+                                                 if (cpu_preparation_gate)
+                                                     cpu_preparation_gate->publishFailure("Original TP constructor failed");
+                                                 throw;
+                                             }
+                                             if (!result.error.empty()) {
+                                                 if (!result.failure) result.failure = std::make_exception_ptr(std::runtime_error(result.error));
+                                                 if (tp_ctx_) tp_ctx_->requestAbort();
                                              }
                                              return result;
                                          }));
@@ -1907,49 +2012,54 @@ namespace llaminar2
             {
                 // A failed async launch must wake any already launched
                 // dependent instead of leaving its future blocked forever.
+                if (tp_ctx_) tp_ctx_->requestAbort();
                 if (cpu_preparation_gate)
                     cpu_preparation_gate->publishFailure(
                         "RankOrchestrator could not launch all device runner constructors");
-                throw;
+                constructor_failure = std::current_exception();
+                break;
             }
         }
 
-        // Collect results in device order
-        for (auto &fut : futures)
-        {
-            auto result = fut.get();
-            if (!result.error.empty())
-            {
-                throw std::runtime_error(result.error);
-            }
-
+        // Consume ALL constructor futures before propagating the first error.
+        // Abort is signalled at discovery, before waiting for any peer barrier.
+        std::vector<int> constructed_indices;
+        constructed_indices.reserve(futures.size());
+        device_runners_.reserve(futures.size());
+        constructor_failure = collectOriginalParticipantConstructors(futures,
+            [&](RunnerResult result) noexcept {
+                if (result.runner) {
+                    constructed_indices.push_back(result.device_idx);
+                    device_runners_.push_back(std::move(result.runner));
+                }
+            }, [&] { if (tp_ctx_) tp_ctx_->requestAbort(); }, constructor_failure);
+        if (constructor_failure) std::rethrow_exception(constructor_failure);
+        for (std::size_t i = 0; i < device_runners_.size(); ++i) {
+            auto& runner = device_runners_[i];
             // Cast to DeviceGraphOrchestrator for setPPStageConfig (construction-time only)
             if (config_.nested_pp_stage_config.has_value())
             {
-                auto *device_orchestrator = dynamic_cast<DeviceGraphOrchestrator *>(result.runner.get());
+                auto *device_orchestrator = dynamic_cast<DeviceGraphOrchestrator *>(runner.get());
                 if (device_orchestrator)
                 {
                     device_orchestrator->setHostResidentReleaseEnabled(false);
                     device_orchestrator->setPPStageConfig(config_.nested_pp_stage_config.value());
-                    LOG_DEBUG("RankOrchestrator: Set PP stage config on device " << result.device_idx
+                    LOG_DEBUG("RankOrchestrator: Set PP stage config on device " << constructed_indices[i]
                                                                                  << " (layers " << config_.nested_pp_stage_config->first_layer
                                                                                  << "-" << config_.nested_pp_stage_config->last_layer
                                                                                  << " has_lm_head=" << config_.nested_pp_stage_config->has_lm_head << ")");
                 }
-                else if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(result.runner.get()))
+                else if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(runner.get()))
                 {
                     dgo->setHostResidentReleaseEnabled(false);
                 }
             }
-            else if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(result.runner.get()))
+            else if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(runner.get()))
             {
                 dgo->setHostResidentReleaseEnabled(false);
             }
 
-            // Store as IInferenceRunner (decoupled from concrete DGO type)
-            device_runners_.push_back(std::move(result.runner));
-
-            LOG_DEBUG("RankOrchestrator: Successfully created runner for device " << result.device_idx);
+            LOG_DEBUG("RankOrchestrator: Successfully created runner for device " << constructed_indices[i]);
         }
 
         // Continuation banks are now published in the same original registry.
@@ -2080,6 +2190,25 @@ namespace llaminar2
         }
 
         wireLocalTPMoERuntimeHistogramSyncs();
+    }
+    catch (...) {
+        const auto failure = std::current_exception();
+        if (tp_ctx_) tp_ctx_->requestAbort();
+        // Every successfully created sibling is retained in device_runners_ by
+        // the all-result collection below. No future destroys its arena first.
+        try {
+            retireChildTopologyBeforeSharedStorageDetach();
+        } catch (...) {
+            // A constructor exception otherwise unwinds child arenas even when
+            // original native retirement is unproven. Preserve both diagnostics
+            // and stop BEFORE C++ member cleanup can release those live roots.
+            try { std::rethrow_exception(failure); }
+            catch (const std::exception& error) { LOG_ERROR("Original TP construction failure: " << error.what()); }
+            catch (...) { LOG_ERROR("Original TP construction raised a non-standard exception"); }
+            LOG_ERROR("Original TP construction cleanup could not prove every native parent retired");
+            std::terminate();
+        }
+        std::rethrow_exception(failure);
     }
 
     // =========================================================================
@@ -3136,6 +3265,33 @@ namespace llaminar2
         if (!all_success)
             return false;
 
+        if (rank_local_expert_endpoints_) {
+            std::shared_ptr<qwen4exp::PooledImmutableRetainedParticipants> original;
+            std::vector<RetainedForwardSourceDefinition> original_definitions;
+            for (const auto& child : device_runners_) {
+                const auto* device = dynamic_cast<const DeviceGraphOrchestrator*>(child.get());
+                if (!device) continue;
+                auto definitions = device->retainedExpertSourceFamilyDefinitions();
+                const auto source = std::find_if(definitions.begin(),definitions.end(),[](const auto& definition) {
+                    return static_cast<bool>(definition.source);
+                });
+                if (source == definitions.end()) continue;
+                if (original)
+                    throw std::invalid_argument("Rank expert storage family has multiple original continuation source owners");
+                auto model = std::dynamic_pointer_cast<ModelContext>(model_ctx_);
+                if (!model)
+                    throw std::invalid_argument("Rank expert storage family lost its actual original ModelContext");
+                original = model->adaptiveImmutableLookupParticipants(source->source->originalSource().device());
+                if (!original || !original->belongsToOriginalCohort(replicated_ple_cohort_))
+                    throw std::invalid_argument("Rank expert storage family changed its original declared source cohort");
+                original_definitions = std::move(definitions);
+            }
+            if (original)
+                rank_local_expert_endpoints_->bindOriginalPooledSourceFamily(std::move(original),std::move(original_definitions));
+            if (retained_source_admission_)
+                rank_local_expert_endpoints_->bindOriginalPooledSourceCancellation(retained_source_admission_->cancel);
+        }
+
         if (rank_local_expert_endpoints_ &&
             !rank_local_expert_endpoints_->materializeServingGraphFamilyWithoutLaunch(plan))
             return false;
@@ -3374,7 +3530,7 @@ namespace llaminar2
         // the request. Admit the complete source cohort before either worker
         // reaches its participant-local storage prelude.
         prepareRetainedSourceAdmission();
-        RetainedSourceAdmission::Attempt source_attempt{retained_source_admission_};
+        RetainedSourceAdmission::Attempt source_attempt{*this,retained_source_admission_,__func__};
 
         if (!tp_worker_pool_)
         {
@@ -3814,7 +3970,7 @@ namespace llaminar2
         // Grouped rows share the same original request/source cohort as scalar
         // conditions; a verifier may be their first execution after restore.
         prepareRetainedSourceAdmission();
-        RetainedSourceAdmission::Attempt source_attempt{retained_source_admission_};
+        RetainedSourceAdmission::Attempt source_attempt{*this,retained_source_admission_,__func__};
 
         if (!tp_worker_pool_)
         {
@@ -4271,7 +4427,7 @@ namespace llaminar2
             return false;
         }
         prepareRetainedSourceAdmission();
-        RetainedSourceAdmission::Attempt source_attempt{retained_source_admission_};
+        RetainedSourceAdmission::Attempt source_attempt{*this,retained_source_admission_,__func__};
 
         const bool restored_prefix_bridge =
             dispatch == MainForwardDispatch::RestoredPrefixMTPDecodeBridge;
@@ -6737,7 +6893,7 @@ namespace llaminar2
         // This transaction executes the main model before its sidecar. Keep
         // source admission at the rank boundary, before concurrent child work.
         prepareRetainedSourceAdmission();
-        RetainedSourceAdmission::Attempt source_attempt{retained_source_admission_};
+        RetainedSourceAdmission::Attempt source_attempt{*this,retained_source_admission_,__func__};
 
         if (!tp_worker_pool_)
         {
@@ -7002,7 +7158,7 @@ namespace llaminar2
         if (effect == LocalTPConditionEffect::ForwardMainRow)
         {
             prepareRetainedSourceAdmission();
-            source_attempt.emplace(retained_source_admission_);
+            source_attempt.emplace(*this,retained_source_admission_,__func__);
         }
 
         if (!tp_worker_pool_)
@@ -12835,7 +12991,7 @@ namespace llaminar2
             return false;
         }
         prepareRetainedSourceAdmission();
-        RetainedSourceAdmission::Attempt source_attempt{retained_source_admission_};
+        RetainedSourceAdmission::Attempt source_attempt{*this,retained_source_admission_,__func__};
 
         materialized_device_generation_execution_policy_.reset();
         materialized_device_generation_loop_topology_.reset();
@@ -13450,6 +13606,7 @@ namespace llaminar2
             DeviceGenerationExecutionPolicy::
                 HostScheduledCapturedTransactions)
         {
+            RetainedSourceAdmission::Attempt source_attempt{*this,retained_source_admission_,__func__};
             if (admitted_device_generation_max_new_tokens_ <= 0)
             {
                 LOG_ERROR("[RankOrchestrator] Hosted device-generation loop has no admitted transaction bound");
@@ -13480,6 +13637,7 @@ namespace llaminar2
                           "all_participants_before_ticket_wait"},
                          {"execution",
                           "hosted_ticket_selected_captured_transactions"}});
+                    source_attempt.keep=true;
                     return true;
                 }
             }
@@ -13564,7 +13722,7 @@ namespace llaminar2
             return false;
         }
 
-        RetainedSourceAdmission::Attempt source_attempt{retained_source_admission_};
+        RetainedSourceAdmission::Attempt source_attempt{*this,retained_source_admission_,__func__};
         std::vector<DeviceGenerationTerminalResult> participant_results;
         participant_results.reserve(participants.size());
         for (size_t participant_index = 0;
@@ -16043,7 +16201,7 @@ namespace llaminar2
         }
 
         prepareRetainedSourceAdmission();
-        RetainedSourceAdmission::Attempt source_attempt{retained_source_admission_};
+        RetainedSourceAdmission::Attempt source_attempt{*this,retained_source_admission_,__func__};
 
         LOG_DEBUG("RankOrchestrator::" << operation
                                         << ": batch_size=" << token_batches.size()
@@ -16251,10 +16409,16 @@ namespace llaminar2
                 },[]{},[]{});
             }catch(...){
                 const auto original=std::current_exception();
-                // Only cancel/join the original CPU owner. Adopted GPU duties
-                // remain with their original DGOs; no missing event is invented.
-                try{(void)retained_source_admission_->original->finish();}catch(...){}
-                retained_source_admission_.reset();
+                // Missing producer proof cannot release source/native owners or
+                // make this request reusable. Withdraw the collected TP callback
+                // before any future teardown, retaining this exact failed borrow
+                // and the original proof error even if callback retirement fails.
+                retained_source_admission_->failed=true;
+                try { retireRetainedSourceFailureCallback(); }
+                catch(const std::exception& error) {
+                    LOG_ERROR("[RankOrchestrator] Failed reset could not retire its original callback: " << error.what());
+                }
+                catch(...) { LOG_ERROR("[RankOrchestrator] Failed reset could not retire its original callback"); }
                 std::rethrow_exception(original);
             }
             std::exception_ptr cancellationFailure;

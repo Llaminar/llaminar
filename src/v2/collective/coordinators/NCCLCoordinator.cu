@@ -1672,6 +1672,115 @@ namespace llaminar2
 #endif
     }
 
+    /** @copydoc ICollectiveBackend::signalNativeCompletionAbort */
+    bool NCCLCoordinator::signalNativeCompletionAbort()
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_.load() || comms_.size() != static_cast<std::size_t>(num_devices_)) return false;
+        for (const auto comm : comms_)
+            if (!comm || nccl::signalNativeCompletionAbort(static_cast<nccl::ncclComm_t>(comm)) != nccl::ncclSuccess)
+                return false;
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    /** @copydoc ICollectiveBackend::nativeCompletionAuthority */
+    NativeCompletionAuthority NCCLCoordinator::nativeCompletionAuthority(int participant)
+    {
+#ifdef HAVE_NCCL
+        if (initialized_.load() && participant >= 0 && participant < num_devices_) {
+            ncclLlaminarCompletionAuthority original{};
+            if (nccl::nativeCompletionAuthority(static_cast<nccl::ncclComm_t>(comms_[participant]), &original) == nccl::ncclSuccess &&
+                original.abortFlag && original.deviceCommunicator)
+                return NativeCompletionAuthority(original);
+        }
+#else
+        (void)participant;
+#endif
+        return {};
+    }
+
+    /** @copydoc ICollectiveBackend::nativeTransferBytesOnStream */
+    NativeCollectiveEnqueueResult NCCLCoordinator::nativeTransferBytesOnStream(void* payload,const NativeCollectiveBytes& bytes, NativeByteEdge edge, int participant, void* stream)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_.load() || !payload ||
+            reinterpret_cast<std::uintptr_t>(stream) <= 2 ||
+            (!edge.contains(num_devices_,participant) || !bytes.participantValid(num_devices_, participant, edge.producer())))
+        {
+            return NativeCollectiveEnqueueResult::failure("NCCL addressed bytes changed its original participant/root/buffer/stream");
+        }
+        const auto selected = cudaSetDevice(device_ordinals_[participant]);
+        if (selected != cudaSuccess)
+        {
+            return NativeCollectiveEnqueueResult::failure(std::string("NCCL addressed bytes device selection failed: ") + cudaGetErrorString(selected));
+        }
+        const auto producer_error = cudaGetLastError();
+        if (producer_error != cudaSuccess)
+        {
+            return NativeCollectiveEnqueueResult::failure(std::string("NCCL addressed bytes original producer failed: ") + cudaGetErrorString(producer_error));
+        }
+        const auto result = nccl::nativeTransferBytes(payload, bytes, edge, participant,
+            static_cast<nccl::ncclComm_t>(comms_[participant]), stream);
+        if (result != nccl::ncclSuccess)
+        {
+            return NativeCollectiveEnqueueResult::failure(std::string("NCCL addressed bytes enqueue failed: ") +
+                nccl::ncclGetErrorString(result));
+        }
+        const auto enqueue_error = cudaGetLastError();
+        if (enqueue_error != cudaSuccess)
+        {
+            return NativeCollectiveEnqueueResult::failure(std::string("NCCL addressed bytes runtime enqueue failed: ") + cudaGetErrorString(enqueue_error));
+        }
+        return NativeCollectiveEnqueueResult::success();
+#else
+        (void)payload; (void)bytes; (void)edge; (void)participant; (void)stream;
+        return NativeCollectiveEnqueueResult::failure("NCCL not available");
+#endif
+    }
+
+    /** @copydoc ICollectiveBackend::nativeBroadcastBytesOnStream */
+    NativeCollectiveEnqueueResult NCCLCoordinator::nativeBroadcastBytesOnStream(const void* send, void* receive,
+        const NativeCollectiveBytes& bytes, int root, int participant, void* stream)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_.load() || !send || !receive ||
+            reinterpret_cast<std::uintptr_t>(stream) <= 2 ||
+            !bytes.participantValid(num_devices_, participant, root))
+        {
+            return NativeCollectiveEnqueueResult::failure("NCCL byte Broadcast changed its original participant/root/buffer/stream");
+        }
+        const auto selected = cudaSetDevice(device_ordinals_[participant]);
+        if (selected != cudaSuccess)
+        {
+            return NativeCollectiveEnqueueResult::failure(std::string("NCCL byte Broadcast device selection failed: ") + cudaGetErrorString(selected));
+        }
+        const auto producer_error = cudaGetLastError();
+        if (producer_error != cudaSuccess)
+        {
+            return NativeCollectiveEnqueueResult::failure(std::string("NCCL byte Broadcast original producer failed: ") + cudaGetErrorString(producer_error));
+        }
+        const auto result = nccl::nativeBroadcastBytes(send, receive, bytes, root,
+            static_cast<nccl::ncclComm_t>(comms_[participant]), stream);
+        if (result != nccl::ncclSuccess)
+        {
+            return NativeCollectiveEnqueueResult::failure(std::string("NCCL byte Broadcast enqueue failed: ") +
+                nccl::ncclGetErrorString(result));
+        }
+        const auto enqueue_error = cudaGetLastError();
+        if (enqueue_error != cudaSuccess)
+        {
+            return NativeCollectiveEnqueueResult::failure(std::string("NCCL byte Broadcast runtime enqueue failed: ") + cudaGetErrorString(enqueue_error));
+        }
+        return NativeCollectiveEnqueueResult::success();
+#else
+        (void)send; (void)receive; (void)bytes; (void)root; (void)participant; (void)stream;
+        return NativeCollectiveEnqueueResult::failure("NCCL not available");
+#endif
+    }
+
     bool NCCLCoordinator::nativeRowsOnStream(
         NativeRowCollective operation, const void *send, void *receive,
         const NativeCollectiveRows &rows, CollectiveDataType dtype,

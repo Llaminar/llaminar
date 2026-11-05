@@ -10,6 +10,7 @@
  * the explicit setup event plus every lazy canonical Tensor publication event.
  */
 #include "PooledImmutableNativeRootStorage.h"
+#include "models/qwen4exp/Qwen4ExpReplicatedPLECohort.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include <stdexcept>
@@ -202,14 +203,60 @@ void PooledImmutableOwnerPreparedStorage::requireAuthority(const std::shared_ptr
 ImmutableLookupNativeOwnerObservation PooledImmutableOwnerPreparedStorage::retainedOwnerObservation()const{return roots_->retainedOwnerObservation();}
 void PooledImmutableOwnerPreparedStorage::bindInvocationChannel(const CapturedTransferBinding& original)
 {
-    if (isGraphCaptureActive() || original_invocation_ || original.device() != plan_.parameters().device ||
+    if (isGraphCaptureActive() || original_invocation_ || native_invocation_cohort_ || original.device() != plan_.parameters().device ||
         original.role() != CapturedTransferEndpoint::Consumer)
         throw std::logic_error("Pooled owner cancellation requires its once-bound original invocation receiver");
     original_invocation_ = std::make_shared<const CapturedTransferBinding>(original);
 }
+void PooledImmutableOwnerPreparedStorage::bindNativeInvocation(
+    std::shared_ptr<const Qwen4ExpReplicatedPLECohort> cohort, int participant)
+{
+    if (isGraphCaptureActive() || original_invocation_ || native_invocation_cohort_ || !cohort)
+        throw std::logic_error("Pooled native owner requires its once-bound original continuation invocation");
+    cohort->requireConsumer(plan_.parameters().device, participant);
+    const auto original = cohort->context().nativeCompletionAuthority(participant);
+    if (cohort->context().degree() != 2 || !original.valid())
+        throw std::invalid_argument("Pooled native owner requires its actual original TP2 communicator");
+    native_invocation_participant_ = participant;
+    native_invocation_authority_ = original.binding();
+    native_invocation_cohort_ = std::move(cohort);
+}
+void PooledImmutableOwnerPreparedStorage::releaseInvocationChannel(const CapturedTransferBinding& original)
+{
+    if (isGraphCaptureActive() || !original_invocation_ || native_invocation_cohort_ ||
+        original_invocation_->captureIdentity() != original.captureIdentity())
+        throw std::logic_error("Retiring pooled invocation changed its original captured binding");
+    original_invocation_.reset();
+}
+void PooledImmutableOwnerPreparedStorage::releaseNativeInvocation(
+    const std::shared_ptr<const Qwen4ExpReplicatedPLECohort>& original, int participant)
+{
+    if (isGraphCaptureActive() || original_invocation_ || !original || native_invocation_cohort_.get() != original.get() ||
+        native_invocation_cohort_.owner_before(original) || original.owner_before(native_invocation_cohort_) ||
+        native_invocation_participant_ != participant)
+        throw std::logic_error("Retiring native pooled invocation changed its original cohort/control block");
+    native_invocation_authority_ = {};
+    native_invocation_participant_ = -1;
+    native_invocation_cohort_.reset();
+}
+ncclLlaminarCompletionAuthority PooledImmutableOwnerPreparedStorage::nativeInvocationAuthority() const
+{
+    if (!native_invocation_cohort_) return {};
+    native_invocation_cohort_->requireConsumer(plan_.parameters().device, native_invocation_participant_);
+    if (!native_invocation_authority_.abortFlag || !native_invocation_authority_.deviceCommunicator)
+        throw std::logic_error("Pooled native owner lost its original communicator/abort authority");
+    return native_invocation_authority_;
+}
 std::uint64_t PooledImmutableOwnerPreparedStorage::invocationChannelIdentity() const
 {
-    return original_invocation_ ? original_invocation_->captureIdentity() : 0;
+    if (original_invocation_) return original_invocation_->captureIdentity();
+    if (!native_invocation_cohort_) return 0;
+    const auto original = nativeInvocationAuthority();
+    std::uint64_t value = reinterpret_cast<std::uintptr_t>(&native_invocation_cohort_->context());
+    value = (value ^ reinterpret_cast<std::uintptr_t>(original.abortFlag)) * 1099511628211ULL;
+    value = (value ^ reinterpret_cast<std::uintptr_t>(original.deviceCommunicator)) * 1099511628211ULL;
+    value = (value ^ static_cast<unsigned>(native_invocation_participant_)) * 1099511628211ULL;
+    return value ? value : 1;
 }
 CapturedTransferReceiveCompletion PooledImmutableOwnerPreparedStorage::invocationReceiveCompletion(void* exact_stream) const
 {

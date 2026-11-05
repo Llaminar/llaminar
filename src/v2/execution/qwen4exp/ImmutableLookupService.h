@@ -271,6 +271,14 @@ public:
     void requireHealthy() const;
 private:
     friend struct ImmutableLookupSubordinateTestAccess;
+    friend class ImmutableLookupExecutionBoundary;
+    /** @brief Bind original native abort before launch; only the original source boundary can compose it.
+     * The existing service lifecycle mutex authenticates the original admission
+     * before signaling. CPU close success is never rewritten as failed I/O.
+     */
+    std::function<void()> failureCallbackWithNativeAbort(const GroupAdmission&, std::function<void()> signal) const;
+    /** @brief Publish cancellation under the already-held original lifecycle mutex. */
+    bool cancelLocked(Ticket ticket);
     friend class ImmutableSubordinateLookupBinding; ///< Original source/backing validation and closed setup
                                                     ///< factory.
     /**

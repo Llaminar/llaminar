@@ -76,6 +76,22 @@ template<class Slot> QFN_ADAPTIVE_HD bool cancelledIdleOwner(const OwnerArgs& a,
 {
     return a.original_invocation.cancelledReceive(cancellation) && idleOwnerForCancelledInvocation<Slot>(a);
 }
+/**
+ * @brief Suppress work only for the exact original aborted native parent, preserving prior owner faults.
+ * @param a Original physical owner and immutable native communicator capability.
+ * @param abort System-acquired original native abort flag, never a copied host decision.
+ * @return True for absorbing native cancellation; false for absent authority or a prior invariant/phase fault.
+ * @note No frame, pin, reservation or status is mutated. Failed request storage
+ * remains owned until every original native parent retires; this is not a
+ * successful source close or permission to reuse an aborted communicator.
+ */
+template<class Slot> QFN_ADAPTIVE_HD bool suppressAbortedNativeOwner(const OwnerArgs& a, ncclLlaminarCompletionAuthority original, std::uint32_t abort)
+{
+    if (!original.abortFlag || !original.deviceCommunicator || !abort)
+        return false;
+    const auto status = ownerView<Slot>(a).frame->status;
+    return status == Status::Success || status == Status::Cancelled || status == Status::SourceFailure;
+}
 /** @return One actual typed owner plan executor over original admitted banks. */
 template<class Slot> QFN_ADAPTIVE_HD p::OwnerPlanOperations<Slot> allocation(const OwnerArgs& a)
 {

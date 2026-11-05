@@ -11,6 +11,9 @@
 #include "PooledImmutableCoordinatorState.h"
 #include "kernels/common/SamplingMath.h"
 #include "transfer/CapturedTransferChannelProtocol.h"
+#include "collective/NativeCollectiveCompletion.h"
+#include <initializer_list>
+#include <stdexcept>
 
 namespace llaminar2::qwen4exp::replicated_reader {
 namespace p = adaptive_lookup::pooled;
@@ -46,11 +49,40 @@ QFN_ADAPTIVE_HD inline bool valid(Geometry g)
             (~std::uint64_t{0}) / sizeof(float);
 }
 
+/** @brief Original fixed Header/result/ACK operation roles, not independent transport channels. */
+enum class Wire : std::uint32_t { Header, Payload, Ack };
+/** @return Native logical operation key shared across exclusive shape variants; frame/shape are validated separately. */
+inline std::uint64_t nativeMessageKey(Wire wire, Geometry geometry, std::uint32_t version)
+{
+    if (!valid(geometry) || !version || static_cast<std::uint32_t>(wire) > static_cast<std::uint32_t>(Wire::Ack))
+        throw std::invalid_argument("Native reader message requires its original declared role/geometry/version");
+    std::uint64_t value = 0x51464e5245414445ULL;
+    for (const auto word : {static_cast<std::uint64_t>(wire), std::uint64_t{geometry.coordinate},
+            std::uint64_t{geometry.row_elements}, std::uint64_t{version}, std::uint64_t{0x4e434c5f52454144ULL}})
+        value = (value ^ word) * 1099511628211ULL;
+    return value ? value : 1;
+}
+
 /** @return Original first-error validity; controller Ok is deliberately not an admission surrogate. */
 QFN_ADAPTIVE_HD inline bool forwardValid(const int* first_error)
 {
     return first_error &&
         *first_error == static_cast<int>(sampling_math::DeviceGenerationError::None);
+}
+
+/**
+ * @return Declared fixed Header extent only after its whole original native launch.
+ * @param original Immutable authority of that exact native communicator.
+ * @param aborted System-acquired original communicator abort, never a header-selected pointer.
+ * @param first_error Same original sticky controller error.
+ * This is not a counted completion receipt. Fixed Broadcast has a declared
+ * extent; original native launch ordering and failure propagation establish its
+ * delivery. An aborted or failed operation cannot reuse an old matching header.
+ */
+QFN_ADAPTIVE_HD inline std::uint64_t nativeFixedHeaderBytes(
+    ncclLlaminarCompletionAuthority original, std::uint32_t aborted, std::int32_t first_error)
+{
+    return original.abortFlag && original.deviceCommunicator && !aborted && !first_error ? sizeof(Header) : 0;
 }
 
 /** @return Exact required output bytes, never the allocated maximum. */

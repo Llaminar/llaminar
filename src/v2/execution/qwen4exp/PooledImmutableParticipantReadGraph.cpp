@@ -44,22 +44,22 @@ PooledPinWireSpan PooledImmutableCapturedReadWave::destination(PooledReadWireRol
 std::shared_ptr<const PooledImmutableCapturedReadWave> PooledImmutableCapturedReadWave::bind(
     std::shared_ptr<const PooledImmutableCapturedPublicationWave> publication,std::shared_ptr<PhysicalMemoryAuthority> memory){
     if(isGraphCaptureActive() || !publication || !memory)throw std::invalid_argument("Read binding needs original cold publication/PMA");publication->requireCurrent();const auto source=publication->sourceWave();const auto pin=source->previous()->previous()->pin();const auto forward=pin->forward();forward->ownerStorage()->requireAuthority(memory);forward->coordinatorStorage()->requireAuthority(memory);
-    if(!forward->channel_ || !pin->channel_ || !forward->declaration().capturedChannelTransport())throw std::invalid_argument("Read native/rank transport needs complete qualified factory");
-    auto out=std::shared_ptr<PooledImmutableCapturedReadWave>(new PooledImmutableCapturedReadWave(publication,memory));const auto own=forward->ownerStorage()->roots(),coord=forward->coordinatorStorage()->roots(),src=source->boundary()->pooledStorage()->roots();const auto& o=forward->ownerStorage()->plan().parameters();const auto& c=forward->coordinatorStorage()->plan().parameters();const auto& s=source->boundary()->pooledStorage()->geometry().parameters();auto& transfer=TransferEngine::instance();
+    if(!forward->channel_ || !pin->channel_ || (!forward->channel_.nativeCollective() && !forward->declaration().capturedChannelTransport()))throw std::invalid_argument("Read native/rank transport needs complete qualified factory");
+    auto out=std::shared_ptr<PooledImmutableCapturedReadWave>(new PooledImmutableCapturedReadWave(publication,memory));const auto own=forward->ownerStorage()->roots(),coord=forward->coordinatorStorage()->roots(),src=source->boundary()->pooledStorage()->roots();const auto& o=forward->ownerStorage()->plan().parameters();const auto& c=forward->coordinatorStorage()->plan().parameters();const auto& s=source->boundary()->pooledStorage()->geometry().parameters();
     for(unsigned i=0;i<4;++i){const auto role=static_cast<PooledReadWireRole>(i);if(!o.native.reply_capacity && (role==PooledReadWireRole::Requests || role==PooledReadWireRole::Rows))continue;
         const bool back=reverse(role);const auto from=out->source(role),to=out->destination(role);const auto channel=back?pin->channel_:forward->channel_;const auto key=((forward->declaration().identity()^(128+i))*1099511628211ULL)|1;const auto origin=back?own:role==PooledReadWireRole::Requests?coord:src;const auto target=back?src:own;
         const auto maximum=role==PooledReadWireRole::Requests?to.bytes:from.bytes;
-        auto send=transfer.bindCapturedTransfer(channel,CapturedTransferEndpoint::Producer,{key,maximum},root(origin,from.buffer),from.offset);
-        auto receive=transfer.bindCapturedTransfer(channel,CapturedTransferEndpoint::Consumer,{key,maximum},root(target,to.buffer),to.offset);
-        if(role==PooledReadWireRole::Requests){send=transfer.bindDeviceSlicedTransfer(std::move(send),coord.native,c.native.pin_slices+size_t{o.owner.coordinate()}*sizeof(n::DirectedSlice),from.bytes,0);
-            receive=transfer.bindDeviceCountedTransfer(std::move(receive),own.native,o.native.ingress+offsetof(n::OwnerIngress,record_bytes));}
-        else if(role==PooledReadWireRole::Rows){send=transfer.bindDeviceCountedTransfer(std::move(send),own.native,o.native.ingress+offsetof(n::OwnerIngress,payload_bytes));
-            receive=transfer.bindDeviceCountedTransfer(std::move(receive),src.native,s.offsets.payload_bytes);}
+        auto send=(channel).bind(CapturedTransferEndpoint::Producer,{key,maximum},root(origin,from.buffer),from.offset);
+        auto receive=(channel).bind(CapturedTransferEndpoint::Consumer,{key,maximum},root(target,to.buffer),to.offset);
+        if(role==PooledReadWireRole::Requests){send=std::move(send).withDeviceSliced(coord.native,c.native.pin_slices+size_t{o.owner.coordinate()}*sizeof(n::DirectedSlice),from.bytes,0,PooledNativeCountedMessage::ReadRequests);
+            receive=std::move(receive).withDeviceCounted(own.native,o.native.ingress+offsetof(n::OwnerIngress,record_bytes),PooledNativeCountedMessage::ReadRequests);}
+        else if(role==PooledReadWireRole::Rows){send=std::move(send).withDeviceCounted(own.native,o.native.ingress+offsetof(n::OwnerIngress,payload_bytes),PooledNativeCountedMessage::ReadRows);
+            receive=std::move(receive).withDeviceCounted(src.native,s.offsets.payload_bytes,PooledNativeCountedMessage::ReadRows);}
         out->bindings_[i].emplace(std::move(send),std::move(receive));
     }out->requireCurrent();return out;
 }
 void PooledImmutableCapturedReadWave::requireCurrent()const{publication_->requireCurrent();const auto source=publication_->sourceWave();pooledSourceOwner(source)->requireAuthority(memory_);source->boundary()->pooledStorage()->coordinator()->requireAuthority(memory_);source->boundary()->pooledStorage()->captureIdentity();}
-const CapturedTransferBinding& PooledImmutableCapturedReadWave::binding(PooledReadWireRole role,CapturedTransferEndpoint side)const{requireCurrent();const auto& pair=bindings_[index(role)];if(!pair || (side!=CapturedTransferEndpoint::Producer && side!=CapturedTransferEndpoint::Consumer))throw std::invalid_argument("Read missing/C0 endpoint");return side==CapturedTransferEndpoint::Producer?pair->first:pair->second;}
+const PooledImmutableTransferBinding& PooledImmutableCapturedReadWave::binding(PooledReadWireRole role,CapturedTransferEndpoint side)const{requireCurrent();const auto& pair=bindings_[index(role)];if(!pair || (side!=CapturedTransferEndpoint::Producer && side!=CapturedTransferEndpoint::Consumer))throw std::invalid_argument("Read missing/C0 endpoint");return side==CapturedTransferEndpoint::Producer?pair->first:pair->second;}
 PooledNativeOperandSpans PooledImmutableCapturedReadWave::ownerInputs()const{
     requireCurrent();const auto source=publication_->sourceWave();const auto owner=pooledSourceOwner(source);const auto& o=owner->plan().parameters();const auto roots=owner->roots();auto out=source->previous()->previous()->pin()->forward()->ownerInputs(pooled_native::OwnerAction::Begin);
     const auto operand=[&](PooledNativeOperand role,PooledPinWireSpan span){if(span.bytes)out[static_cast<size_t>(role)]=PooledNativeTensorSpan{root(roots,span.buffer),span.buffer,span.offset,span.bytes};};
@@ -81,18 +81,18 @@ public:
     q::PooledImmutableDirectedTransferOperation directedTransferOperation()const{
         requireDeclarations();const auto& binding=edge_->binding(role_,side_);
         return {q::PooledImmutableDirectedWireFamily::Read,static_cast<std::uint32_t>(role_),side_,
-            binding.message().bytes,binding.extentSource(),binding.hasSourceSlice()};
+            binding.message().bytes,binding.extentSource(),binding.hasSourceSlice(),binding.nativeCollective()?q::PooledImmutableDirectedTransportKind::NativeCollective:q::PooledImmutableDirectedTransportKind::CapturedChannel};
     }
 
     /** @brief Bind original arena roles and one immutable endpoint before capture. */
-    PooledReadTransferStage(BufferArena& arena,std::shared_ptr<const q::PooledImmutableCapturedReadWave> edge,q::PooledReadWireRole role,CapturedTransferEndpoint side):IComputeStage(ownerEndpoint(role,side)?q::pooledSourceOwner(edge->publication()->sourceWave())->plan().allocator().device:edge->publication()->sourceWave()->boundary()->device()),arena_(&arena),edge_(std::move(edge)),role_(role),side_(side){requireDeclarations();identity_=graphCaptureVariantSignature();}
+    PooledReadTransferStage(BufferArena& arena,std::shared_ptr<const q::PooledImmutableCapturedReadWave> edge,q::PooledReadWireRole role,CapturedTransferEndpoint side):IComputeStage(ownerEndpoint(role,side)?q::pooledSourceOwner(edge->publication()->sourceWave())->plan().allocator().device:edge->publication()->sourceWave()->boundary()->device()),arena_(&arena),edge_(std::move(edge)),role_(role),side_(side){requireDeclarations();identity_=graphCaptureVariantSignature();native_collective_=edge_->binding(role_,side_).nativeCollective();}
     /** @brief Acquire exact original setup events on the actual participant stream. */
-    bool prepareGraphLaunch(IDeviceContext* context,void* stream)override{if(!context || context->deviceId()!=device() || !stream || reinterpret_cast<uintptr_t>(stream)<=2)throw std::invalid_argument("Read endpoint requires exact participant/stream");requireDeclarations();if(identity_!=graphCaptureVariantSignature())throw std::logic_error("Read capture identity changed");if(ownerEndpoint(role_,side_))q::pooledSourceOwner(edge_->publication()->sourceWave())->acquireSetup(stream);else edge_->publication()->sourceWave()->boundary()->pooledStorage()->acquireSetup(stream);setGPUStream(stream);return true;}
+    bool prepareGraphLaunch(IDeviceContext* context,void* stream)override{if(!context || context->deviceId()!=device() || !stream || reinterpret_cast<uintptr_t>(stream)<=2)throw std::invalid_argument("Read endpoint requires exact participant/stream");requireDeclarations();if(identity_!=graphCaptureVariantSignature())throw std::logic_error("Read capture identity changed");if(ownerEndpoint(role_,side_))q::pooledSourceOwner(edge_->publication()->sourceWave())->acquireSetup(stream);else edge_->publication()->sourceWave()->boundary()->pooledStorage()->acquireSetup(stream);edge_->binding(role_,side_).prepare(stream);setGPUStream(stream);return true;}
     /** @brief Submit the actual fixed/sliced/counted message without a host count read. */
-    bool execute(IDeviceContext* context)override{if(!context || context->deviceId()!=device())throw std::invalid_argument("Read endpoint changed device");requireDeclarations();if(identity_!=graphCaptureVariantSignature())throw std::logic_error("Read endpoint changed");TransferEngine::instance().enqueueCapturedTransfer(edge_->binding(role_,side_),requireGPUStream());return true;}
+    bool execute(IDeviceContext* context)override{if(!context || context->deviceId()!=device())throw std::invalid_argument("Read endpoint changed device");requireDeclarations();if(identity_!=graphCaptureVariantSignature())throw std::logic_error("Read endpoint changed");edge_->binding(role_,side_).enqueue(requireGPUStream());return true;}
     ComputeStageType type()const override{return ComputeStageType::QWEN4EXP_POOLED_DIRECTED_TRANSFER;}
     /** @return This original bound endpoint executes native device-counted transfer kernels, independently from collective-runtime capture. */
-    CollectiveGraphCaptureAuthority collectiveGraphCaptureAuthority()const noexcept override{return CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;}
+    CollectiveGraphCaptureAuthority collectiveGraphCaptureAuthority()const noexcept override{return native_collective_?CollectiveGraphCaptureAuthority::RuntimeBackend:CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;}
     std::string name()const override{return "PooledImmutableDirectedRead";}
     GraphLaunchPreparationPolicy graphLaunchPreparationPolicy()const override{return GraphLaunchPreparationPolicy::CaptureOnly;}
     bool supportsPaddedPrefillRealLengthContract()const override{return true;}
@@ -113,7 +113,9 @@ private:
     void requireDeclarations()const{if(!arena_ || !edge_)throw std::logic_error("Read lost original owner");edge_->requireCurrent();(void)edge_->binding(role_,side_);const auto source=edge_->publication()->sourceWave();const bool own=ownerEndpoint(role_,side_);const auto storage=source->boundary()->pooledStorage();const auto roots=own?q::pooledSourceOwner(source)->roots():storage->roots();const auto span=side_==CapturedTransferEndpoint::Producer?edge_->source(role_):edge_->destination(role_);const auto native=own?BufferId::QFN_POOLED_OWNER_NATIVE:BufferId::QFN_POOLED_SOURCE_NATIVE;
         auto payload=span.buffer==BufferId::QFN_POOLED_COORDINATOR_NATIVE?storage->coordinator()->roots().native:(span.buffer==BufferId::QFN_POOLED_SOURCE_FRAME || span.buffer==BufferId::QFN_POOLED_OWNER_FRAME?roots.frame:roots.native);
         if(arena_->getTensor(span.buffer)!=payload.get() || arena_->getTensor(native)!=roots.native.get())throw std::logic_error("Read replaced original payload/descriptor/count root");}
-    BufferArena* arena_;std::shared_ptr<const q::PooledImmutableCapturedReadWave> edge_;q::PooledReadWireRole role_;CapturedTransferEndpoint side_;uint64_t identity_=0;
+    BufferArena* arena_;std::shared_ptr<const q::PooledImmutableCapturedReadWave> edge_;q::PooledReadWireRole role_;CapturedTransferEndpoint side_;
+    bool native_collective_=false; // Cold-selected original transport; capture policy never probes runtime state.
+    uint64_t identity_=0;
 };
 /** @brief Reject all naming collisions before graph mutation. */
 void names(const ComputeGraph& graph,std::span<const std::string> values){std::set<std::string> unique;for(const auto& value:values)if(value.empty() || graph.getNode(value) || !unique.insert(value).second)throw std::invalid_argument("Read would replace an original graph node");}
@@ -175,6 +177,26 @@ void requirePooledReadOwnerCompletion(const ComputeGraph& graph,const std::share
     const auto* value=node(prior);const auto* stage=dynamic_cast<const PooledImmutableNativePhaseStage*>(value->stage.get());const auto* actual=stage?std::get_if<PooledImmutableNativePhaseStage::Owner>(&stage->phase()):nullptr;const q::PooledImmutableOwnerOperands expected(n::OwnerAction::ReadRows,storage->plan(),original->ownerInputs(),n::SourceCondition::AfterSuccess);if(!actual || actual->storage!=storage || actual->action!=n::OwnerAction::ReadRows || actual->operands.declarationIdentity()!=expected.declarationIdentity())throw std::invalid_argument("Read owner replaced actual pinned-byte producer");prior=value->dependencies.front();
     if(storage->plan().parameters().native.reply_capacity)prior=endpoint(prior,q::PooledReadWireRole::Requests,CapturedTransferEndpoint::Consumer);prior=endpoint(prior,q::PooledReadWireRole::Outcome,CapturedTransferEndpoint::Consumer);requirePooledPublicationOwnerCompletion(graph,original->publication(),prior);
 }
+std::string findPooledReadOwnerCompletion(const ComputeGraph& graph,
+    const std::shared_ptr<const q::PooledImmutableCapturedReadWave>& original)
+{
+    if (isGraphCaptureActive() || !original)
+        throw std::invalid_argument("Original inline Read inventory belongs to cold actual graph validation");
+    const auto owner = q::pooledSourceOwner(original->publication()->sourceWave());
+    const auto role = owner->plan().parameters().native.reply_capacity ? q::PooledReadWireRole::Rows : q::PooledReadWireRole::Receipt;
+    std::string result;
+    for (const auto& name : graph.getExecutionOrder()) {
+        const auto* node = graph.getNode(name);
+        const auto* stage = node ? dynamic_cast<const PooledReadTransferStage*>(node->stage.get()) : nullptr;
+        if (!stage || !stage->matches(original.get(), role, CapturedTransferEndpoint::Producer)) continue;
+        if (!result.empty()) throw std::logic_error("Actual inline owner graph has duplicate original Read terminals");
+        requirePooledReadOwnerCompletion(graph, original, name);
+        result = name;
+    }
+    if (result.empty()) throw std::invalid_argument("Actual inline owner graph has no original Read terminal");
+    return result;
+}
+
 }
 
 namespace llaminar2 {

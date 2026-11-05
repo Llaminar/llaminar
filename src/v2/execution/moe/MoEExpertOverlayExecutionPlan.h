@@ -81,6 +81,9 @@ namespace llaminar2
         bool loads_worker_fallback_experts = false;
         bool loads_expert_weights = false;
 
+        /** @return Complete immutable role, loading and membership equality. */
+        bool operator==(const OverlayRankPlan &) const = default;
+
         bool hasRole(OverlayRankRole role) const;
         bool ownsDomain(const std::string &domain_name) const;
         bool hasLocalDevice(DeviceId device) const;
@@ -114,6 +117,13 @@ namespace llaminar2
         std::vector<MoEOverlayRuntimeDomain> domains;
         std::vector<OverlayRankPlan> rank_plans;
         OverlayRankPlan current_rank;
+
+        /**
+         * @return Equality of every rank-local policy descriptor, including ordered domains.
+         * @note Factories derive these values independently for sibling graphs. This
+         * comparison proves policy agreement, never shared model/communicator ownership.
+         */
+        bool operator==(const MoEExpertOverlayExecutionPlan &) const = default;
 
         const OverlayRankPlan &currentRankPlan() const { return current_rank; }
         const OverlayRankPlan *rankPlanFor(int world_rank) const;

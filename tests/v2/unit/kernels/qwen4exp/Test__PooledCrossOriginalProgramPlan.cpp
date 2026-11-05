@@ -69,6 +69,14 @@ TEST(PooledCrossOriginalProgramPlan, SourceAndStorageRolesPriceBothChannelsBefor
         EXPECT_THROW(crossVendorReadProgramBOM(std::span<const CrossVendorReadReplayGeometry>{}),std::invalid_argument);
         EXPECT_NE(specs[0].file->descriptor().path,specs[1].file->descriptor().path);
         EXPECT_NE(specs[0].file->rows,specs[1].file->rows); // Dense-width and sparse Slot64 programs share ONE original PMA.
+        // Same source/remote owners retain an actual RAM source with no redundant row cache.
+        auto ramSpec=specs[0];ramSpec.sourceBacking=AdaptiveImmutableRowBacking::RAM;ramSpec.slots=3;
+        const auto ramGeometry=CrossVendorReadReplayGeometry::create(ramSpec,sourceDevice,ownerDevice,*session,io,ordering);
+        EXPECT_EQ(ramGeometry.cpuGeometry.sourceStorage(),ImmutableRowStorage::RAM);
+        EXPECT_EQ(ramGeometry.cpuGeometry.storageBytes(),0u);
+        EXPECT_EQ(ramGeometry.payload.find({0,DeviceId::cpu()})->bytes(PhysicalMemoryOwner::ImmutableTableStorage),ramGeometry.cpuGeometry.sourceBytes());
+        EXPECT_EQ(ramGeometry.cpuGeometry.sourceBytes(),ImmutableRowTable::physicalBytes(file->descriptor(),providerReplaySourcePolicy(ramSpec.sourceBacking)));
+        ramSpec.ramSlots=1;EXPECT_THROW(ramSpec.requireComplete(),std::runtime_error);
         const auto bom=crossVendorReadProgramBOM(declarations);const auto* compute=bom.find({0,sourceDevice});const auto* storage=bom.find({0,ownerDevice});ASSERT_NE(compute,nullptr);ASSERT_NE(storage,nullptr);
         EXPECT_EQ(compute->bytes(PhysicalMemoryOwner::NativeGraphExecutable),6*GPUGraphMemoryContract::reservationBytesPerExecutable(sourceDevice,GPUGraphExecutableClass::General));
         EXPECT_EQ(storage->bytes(PhysicalMemoryOwner::NativeGraphExecutable),2*GPUGraphMemoryContract::reservationBytesPerExecutable(ownerDevice,GPUGraphExecutableClass::General));

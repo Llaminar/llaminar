@@ -13,6 +13,8 @@
  * old pins retain their exact bytes until the last reader releases the slot.
  * The existing processor owns channel sequence/admission authentication. Its
  * completed grants keep bounded CPU read records, never a GPU location shadow.
+ * Subordinate membership resolves through the original requester-specific GPU
+ * coordinator; ConsumerLocal never invents a shared global coordinator.
  */
 #include "CpuAdaptiveImmutableRowCache.h"
 #include "memory/NUMAAllocator.h"
@@ -120,7 +122,10 @@ CpuAdaptiveImmutableRowCacheGeometry CpuAdaptiveImmutableRowCacheGeometry::forSu
             throw std::invalid_argument("Subordinate CPU source has a foreign GPU owner");
         gpu_slots=countPlus(gpu_slots,owner.cache_rows);
     }
-    if((gpu_slots && layout.gpuCoordinator()!=requester) || (!gpu_slots && layout.gpuCoordinator()))
+    // The layout owns both policies: ConsumerLocal has no global coordinator,
+    // while SharedCoordinator must still authenticate its original sole reader.
+    const auto coordinator=layout.gpuCoordinatorFor(requester);
+    if((gpu_slots && coordinator!=requester) || (!gpu_slots && coordinator))
         throw std::invalid_argument("Subordinate CPU source requester differs from the actual GPU coordinator");
     if(layout.sourceServices().size()!=1 || layout.sourceServices().front().allocator!=host)
         throw std::invalid_argument("Subordinate CPU source requires its sole original rank-local host service");

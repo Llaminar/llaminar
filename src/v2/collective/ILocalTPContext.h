@@ -21,6 +21,7 @@
 #include "../backends/GlobalDeviceAddress.h"
 #include "../config/OrchestrationConfig.h"
 #include "../tensors/ITensor.h"
+#include "collective/NativeCollectiveBytes.h"
 #include "ICollectiveBackend.h"
 #include "ITPContext.h"
 #include "NativeAllreduceRequestRows.h"
@@ -299,6 +300,39 @@ namespace llaminar2
         {
             (void)rank_major_send; (void)local_receive; (void)receive_count;
             (void)dtype; (void)device_index; (void)producer_stream; (void)stage_name;
+            return false;
+        }
+
+        /** @brief Signal the original completed-family communicator abort words without reclaiming it.
+         * @return Whether every original participant received the absorbing signal.
+         * Native graph/event owners still require terminal proof before definition and communicator retirement.
+         */
+        virtual bool signalNativeCompletionAbort() { return false; }
+
+        /** @brief Borrow immutable original native completion provenance during cold preparation.
+         * @param participant Original local communicator coordinate.
+         * @return Unbound only for unsupported/uninitialized backend; callers must reject it.
+         * No device state is read and no native operation/allocation is issued.
+         */
+        virtual NativeCompletionAuthority nativeCompletionAuthority(int participant)
+        { (void)participant; return {}; }
+
+        /**
+         * @brief Record original fixed/prefix/slice bytes on a native rooted stream.
+         * @param send Original root source bank (unused contribution on receivers).
+         * @param receive Original participant-local destination bank.
+         * @param bytes Borrowed original communication metadata and admitted bounds.
+         * @param root Original communicator coordinate, never a device ordinal.
+         * @param participant Calling original communicator coordinate.
+         * @param stream Exact original producer/consumer stream.
+         * @param stage_name Stable original graph-operation name for error attribution.
+         * @return Successful native enqueue, with no host count read or fallback.
+         */
+        virtual bool nativeBroadcastBytesOnStream(const void* send, void* receive,
+            const NativeCollectiveBytes& bytes, int root, int participant, void* stream,
+            const std::string& stage_name)
+        {
+            (void)send; (void)receive; (void)bytes; (void)root; (void)participant; (void)stream; (void)stage_name;
             return false;
         }
 
@@ -936,6 +970,17 @@ namespace llaminar2
          */
         virtual bool graphCaptureBoundaryOnStream(const std::string& name,int participant,void* stream,int timeout_ms,LocalTPCaptureSourceDefinition& definition)
         {throw std::logic_error("LocalTP has no typed source-definition stream boundary");}
+
+        /** @brief Record only the named original producer/consumer byte edge.
+         * @param payload Original local endpoint bank. @param bytes Borrowed count/slice authority.
+         * @param edge Exact original communicator edge. @param participant Actual caller coordinate.
+         * @param stream Exact non-null original endpoint stream. @param stage_name Stable diagnostic identity.
+         * @return Native enqueue success; unrelated members and unsupported backends fail before mutation. */
+        virtual bool nativeTransferBytesOnStream(void* payload,const NativeCollectiveBytes& bytes,
+            NativeByteEdge edge,int participant,void* stream,const std::string& stage_name) {
+            (void)payload;(void)bytes;(void)edge;(void)participant;(void)stream;(void)stage_name;return false;
+        }
+
 
     };
 

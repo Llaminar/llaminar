@@ -21,7 +21,7 @@ public:
     /** @return Actual original read owner; no initialized communicator or replacement roots are adopted. */
     const std::shared_ptr<const PooledImmutableCapturedReadWave>& read()const noexcept{return read_;}
     /** @return Exact fixed/counted endpoint; C0 Releases has no wire endpoint. */
-    const CapturedTransferBinding& binding(PooledRetirementWireRole role,CapturedTransferEndpoint side)const;
+    const PooledImmutableTransferBinding& binding(PooledRetirementWireRole role,CapturedTransferEndpoint side)const;
     /** @return Original fixed admitted source/receiver span; capacity is never the live release extent. */
     PooledPinWireSpan source(PooledRetirementWireRole role)const;
     PooledPinWireSpan destination(PooledRetirementWireRole role)const;
@@ -30,7 +30,7 @@ public:
     /** @return Complete retained root/count/channel/action identity, excluding device-live values. */
     std::uint64_t captureIdentity()const;
 private:
-    using Pair=std::pair<CapturedTransferBinding,CapturedTransferBinding>;
+    using Pair=std::pair<PooledImmutableTransferBinding,PooledImmutableTransferBinding>;
     /** @brief Only the checked cold binder publishes this immutable original-owner holder. */
     PooledImmutableCapturedRetirementWave(std::shared_ptr<const PooledImmutableCapturedReadWave> read,std::shared_ptr<PhysicalMemoryAuthority> memory):read_(std::move(read)),memory_(std::move(memory)){}
     std::shared_ptr<const PooledImmutableCapturedReadWave> read_;
@@ -41,6 +41,7 @@ private:
 using PooledImmutableRetirementParticipant=std::variant<std::shared_ptr<const PooledImmutableLocalOwnerBinding>,std::shared_ptr<const PooledImmutableCapturedRetirementWave>>;
 }
 namespace llaminar2 {
+struct PooledImmutableReplicatedConsumerCompletion;
 struct PooledImmutableReplicatedReaderCompletion;
 /** @brief Concrete original terminal producer/read inventory; no physical pin or execution-state shadow. */
 struct PooledImmutableRetirementCompletion {
@@ -55,14 +56,21 @@ struct PooledImmutableRetirementCompletion {
 /** @brief Append real remote last-reader gate→drain→exact releases→actual Retire→nominal Retired60. */
 PooledPinParticipantNodes appendPooledRetirementOwner(ComputeGraph& graph,BufferArena& arena,
     std::shared_ptr<const qwen4exp::PooledImmutableCapturedRetirementWave> original,
-    std::shared_ptr<const qwen4exp::IPooledImmutableNativeKernels> code,const std::string& lastReadSent,const std::string& prefix);
+    std::shared_ptr<const qwen4exp::IPooledImmutableNativeKernels> code,const std::string& lastReadSent,const std::string& prefix,
+    const PooledImmutableReplicatedConsumerCompletion* consumer = nullptr);
 /** @brief Append full ordered local/remote terminal protocol behind the authenticated real output/drain node. */
 PooledImmutableRetirementCompletion appendPooledRetirementCoordinator(ComputeGraph& graph,BufferArena& arena,
     const PooledImmutableReadCompletion& read,std::span<const qwen4exp::PooledImmutableRetirementParticipant> owners,
     std::shared_ptr<const qwen4exp::IPooledImmutableNativeKernels> code,const std::string& prefix);
 /** @brief Authenticate every actual owner phase and send before replacement/reset/close insertion. */
 void requirePooledRetirementOwnerCompletion(const ComputeGraph& graph,
-    const std::shared_ptr<const qwen4exp::PooledImmutableCapturedRetirementWave>& original,const std::string& retiredSent);
+    const std::shared_ptr<const qwen4exp::PooledImmutableCapturedRetirementWave>& original,const std::string& retiredSent,
+    const PooledImmutableReplicatedConsumerCompletion* consumer = nullptr);
 /** @brief Authenticate true last reader, exact original phases/roots/channels and all reuse/commit edges. */
 void requirePooledRetirementCompletion(const ComputeGraph& graph,const PooledImmutableRetirementCompletion& original);
+/** @return Exact original Retired producer following the same typed consumer ACK in this cold actual graph. */
+std::string findPooledRetirementOwnerCompletion(const ComputeGraph& graph,
+    const std::shared_ptr<const qwen4exp::PooledImmutableCapturedRetirementWave>& original,
+    const PooledImmutableReplicatedConsumerCompletion& consumer);
+
 }

@@ -21,6 +21,8 @@
 
 #pragma once
 
+#include "collective/NativeCollectiveBytes.h"
+
 #include "../ICollectiveBackend.h"
 #include "../DeviceGroup.h"
 #include "../coordinators/NCCLCoordinator.h"
@@ -307,6 +309,29 @@ namespace llaminar2
             int device_idx,
             void *stream) override;
         bool supportsReduceSingleDeviceOnStream() const override;
+
+        /** @copydoc ICollectiveBackend::signalNativeCompletionAbort */
+        bool signalNativeCompletionAbort() override;
+
+        /** @copydoc ICollectiveBackend::nativeCompletionAuthority */
+        NativeCompletionAuthority nativeCompletionAuthority(int participant) override;
+
+        /** @copydoc ICollectiveBackend::nativeTransferBytesOnStream */
+        NativeCollectiveEnqueueResult nativeTransferBytesOnStream(void* payload,const NativeCollectiveBytes& bytes,
+            NativeByteEdge edge,int participant,void* stream) override;
+
+        /**
+         * @brief Record original fixed/prefix/slice bytes on a native rooted stream.
+         * @param send Original root source bank (unused contribution on receivers).
+         * @param receive Original participant-local destination bank.
+         * @param bytes Borrowed original communication metadata and admitted bounds.
+         * @param root Original communicator coordinate, never a device ordinal.
+         * @param participant Calling original communicator coordinate.
+         * @param stream Exact original producer/consumer stream.
+         * @return Successful native enqueue, with no host count read or fallback.
+         */
+        NativeCollectiveEnqueueResult nativeBroadcastBytesOnStream(const void* send, void* receive,
+            const NativeCollectiveBytes& bytes, int root, int participant, void* stream) override;
 
         /** @copydoc ICollectiveBackend::nativeRowsOnStream */
         bool nativeRowsOnStream(

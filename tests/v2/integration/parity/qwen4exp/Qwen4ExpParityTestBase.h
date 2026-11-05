@@ -784,10 +784,33 @@ protected:
                 roots.push_back(boundary->pooledStorage()->roots());
                 return roots;
             };
+            struct ReaderWitness final {
+                PhysicalMemoryAllocatorIdentity consumer;
+                std::shared_ptr<::llaminar2::qwen4exp::PooledImmutableRetainedParticipants> participants;
+                std::shared_ptr<const ::llaminar2::qwen4exp::PooledImmutableReplicatedReaderTransport> reader;
+            };
+            std::vector<ReaderWitness> reader_witnesses;
             std::vector<ConsumerWitness> witnesses;
             for (const auto consumer : placement->gpuAdaptiveLayout().consumers()) {
                 const auto boundary=context->adaptiveImmutableLookupBoundary(consumer.device);
-                ASSERT_TRUE(boundary);
+                const auto role=qwen4ExpAdaptiveExecutionRole(placement->gpuAdaptiveLayout(),placement->gpuAdaptiveRequest(),consumer);
+                if(role==Qwen4ExpAdaptiveExecutionRole::QueryReader){
+                    // The shared source identity proof above already authenticates
+                    // this reader's native result/ACK/control roots and SAME PMA.
+                    // Keep that actual typed transport as the stability witness;
+                    // a null boundary alone is never accepted as reader proof.
+                    ASSERT_FALSE(boundary);
+                    const auto participants=context->adaptiveImmutableLookupParticipants(consumer.device);
+                    ASSERT_TRUE(participants);ASSERT_NO_THROW(participants->requireCurrent());
+                    ASSERT_TRUE(participants->transport());
+                    const auto readers=participants->transport()->readers();
+                    const auto reader=std::find_if(readers.begin(),readers.end(),[&](const auto& value){
+                        return value->originalReader().device()==consumer.device;});
+                    ASSERT_NE(reader,readers.end());ASSERT_NO_THROW((*reader)->requireCurrent());
+                    reader_witnesses.push_back({consumer,participants,*reader});
+                    continue;
+                }
+                ASSERT_TRUE(boundary) << "Original coordinator/independent consumer has no source boundary";
                 witnesses.push_back({boundary,boundary->retainedSourceOwnerObservation(),
                     retainedRoots(boundary),boundary->captureIdentity()});
             }
@@ -816,31 +839,50 @@ protected:
             for(const auto token:generation.tokens)generation_record<<token<<' ';
             generation_record<<'\n';generation_record.flush();ASSERT_TRUE(generation_record.good());
             const auto records=PerfStatsCollector::snapshot({"immutable_lookup"});
+            const auto native_submissions=PerfStatsCollector::snapshot({"ngram_lookup"});
+            EXPECT_TRUE(PerfStatsCollector::writeCsv(
+                (Base::ensureResultsDir()/"ngram_expert_runtime.csv").string(),
+                {"ngram_lookup","moe_overlay","forward_graph"}))
+                << "Cannot retain original source/reader/expert terminal evidence";
+            for(const auto& record:native_submissions){
+                if(record.name!="retained_source_native_invocations" && record.name!="retained_remote_native_enqueues")continue;
+                ASSERT_TRUE(std::any_of(witnesses.begin(),witnesses.end(),[&](const auto& witness){
+                    return witness.boundary->device().toString()==record.device;}))
+                    << "Native source observation names a foreign or query-only reader";
+            }
             for (const auto& witness : witnesses) {
                 const auto& boundary = witness.boundary;
                 if (boundary->retainedParticipantSource())
                 {
-                    double source_invocations = 0;
-                    double remote_enqueues = 0;
-                    for (const auto &record : PerfStatsCollector::snapshot({"ngram_lookup"}))
-                    {
-                        if (record.kind != PerfStatRecord::Kind::Counter ||
-                            record.device != boundary->device().toString())
-                            continue;
-                        if (record.name == "retained_source_native_invocations")
-                            source_invocations += record.value;
-                        if (record.name == "retained_remote_native_enqueues")
-                            remote_enqueues += record.value;
+                    const auto participants=context->adaptiveImmutableLookupParticipants(boundary->device());
+                    ASSERT_TRUE(participants);ASSERT_NO_THROW(participants->requireCurrent());
+                    std::vector<Qwen4ExpAdaptiveOwnerExecution> owners;
+                    for(const auto& owner:boundary->pooledStorage()->geometry().originalOwners())
+                        owners.push_back({owner.allocator(),participants->hasEmbeddedParticipant(owner.allocator().device)});
+                    std::vector<PerfStatRecord> source_submissions;
+                    for(const auto& record:native_submissions)
+                        if(record.device==boundary->device().toString())source_submissions.push_back(record);
+                    ASSERT_NO_THROW(requireQwen4ExpAdaptiveNativeSubmissions(source_submissions,
+                        {placement->worldRank(),boundary->device()},owners));
+                    const auto expert_owners=qwen4ExpSourceExpertLookupOwners(test_case,placement.get());
+                    if(!expert_owners.empty()){
+                        ASSERT_TRUE(test_case.topology.expert_overlay_plan);
+                        const auto observed=participants->expertOwnerParentObservations();
+                        ASSERT_EQ(observed.size(),expert_owners.size());
+                        for(const auto& expert:expert_owners){
+                            EXPECT_TRUE(participants->hasEmbeddedParticipant(expert.device));
+                            const auto actual=std::find_if(observed.begin(),observed.end(),[&](const auto& value){return value.allocator==expert;});
+                            ASSERT_NE(actual,observed.end());
+                            ASSERT_FALSE(actual->parent_lifetimes.empty());
+                            for(const auto& parent:actual->parent_lifetimes)EXPECT_FALSE(parent.expired());
+                        }
+                        // Actual completed model packets, retained from the SAME
+                        // frozen campaign across the lookup-only reporting reset,
+                        // prove useful work. Attachment/submission alone cannot.
+                        ASSERT_NO_THROW(requireQwen4ExpEmbeddedExpertWork(
+                            PerfStatsCollector::snapshot({"forward_graph","moe_overlay"}),
+                            *test_case.topology.expert_overlay_plan,expert_owners));
                     }
-                    const auto owners = boundary->pooledStorage()->geometry().originalOwners();
-                    const auto remote_count = std::count_if(owners.begin(), owners.end(),
-                        [&](const auto &owner) {
-                            return owner.allocator().device != boundary->device() &&
-                                   owner.allocator().device.is_gpu();
-                        });
-                    EXPECT_GT(source_invocations, 0);
-                    EXPECT_GT(remote_count, 0);
-                    EXPECT_EQ(remote_enqueues, source_invocations * remote_count);
                 }
             }
             std::ofstream csv(Base::ensureResultsDir()/"ngram_storage.csv");ASSERT_TRUE(csv.is_open());
@@ -865,6 +907,16 @@ protected:
                 }
                 EXPECT_EQ(boundary->captureIdentity(),witness.identity);
                 EXPECT_EQ(context->adaptiveImmutableLookupBoundary(boundary->device()).get(),boundary.get());
+            }
+            for(const auto& witness:reader_witnesses){
+                EXPECT_FALSE(context->adaptiveImmutableLookupBoundary(witness.consumer.device));
+                const auto current=context->adaptiveImmutableLookupParticipants(witness.consumer.device);
+                ASSERT_EQ(current,witness.participants);ASSERT_NO_THROW(current->requireCurrent());
+                const auto readers=current->transport()->readers();
+                const auto reader=std::find_if(readers.begin(),readers.end(),[&](const auto& value){
+                    return value->originalReader().device()==witness.consumer.device;});
+                ASSERT_NE(reader,readers.end());EXPECT_EQ(*reader,witness.reader);
+                ASSERT_NO_THROW(witness.reader->requireCurrent());
             }
             ASSERT_EQ(Base::activeModelContextForDiagnostics(),context);
             EXPECT_EQ(context->hostImmutableRowProvider().get(),provider_before.get());

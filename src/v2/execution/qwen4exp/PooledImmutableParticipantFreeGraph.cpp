@@ -73,28 +73,28 @@ std::shared_ptr<const PooledImmutableCapturedFreeWave> PooledImmutableCapturedFr
     if(isGraphCaptureActive() || !pin || !memory)throw std::invalid_argument("Free wave binding requires actual cold Pin owners and same PMA");
     pin->requireCurrent();const auto forward=pin->forward();forward->coordinatorStorage()->requireAuthority(memory);forward->ownerStorage()->requireAuthority(memory);
     auto d=PooledImmutableFreeEdge::fromOriginal(forward->declaration());
-    if(!d.original().capturedChannelTransport() || !forward->channel_ || !pin->channel_ || memory->worldRank()!=d.original().sender().world_rank)
-        throw std::invalid_argument("Free wave needs actual original cross-vendor channels; native/rank factory remains guarded");
-    const auto coord=forward->coordinatorStorage()->roots(),own=forward->ownerStorage()->roots();auto& transfer=TransferEngine::instance();Bindings bindings{};
+    if((!forward->channel_.nativeCollective() && !d.original().capturedChannelTransport()) || !forward->channel_ || !pin->channel_ || memory->worldRank()!=d.original().sender().world_rank)
+        throw std::invalid_argument("Free wave needs its original authenticated native or captured channel owners");
+    const auto coord=forward->coordinatorStorage()->roots(),own=forward->ownerStorage()->roots();Bindings bindings{};
     for(unsigned index=0;index<6;++index){const auto role=static_cast<PooledFreeWireRole>(index);
         if(!d.hasPayload() && (role==PooledFreeWireRole::Decisions || role==PooledFreeWireRole::Grants))continue;
         const bool back=reverse(role);const auto& channel=back?pin->channel_:forward->channel_;const auto source=d.source(role),destination=d.destination(role);
         const auto maxBytes=role==PooledFreeWireRole::Decisions?d.maximumDecisionBytes():source.bytes;
-        auto send=transfer.bindCapturedTransfer(channel,CapturedTransferEndpoint::Producer,{d.messageKey(role),maxBytes},root(back?own:coord,source.buffer),source.offset);
-        auto receive=transfer.bindCapturedTransfer(channel,CapturedTransferEndpoint::Consumer,{d.messageKey(role),maxBytes},root(back?coord:own,destination.buffer),destination.offset);
+        auto send=(channel).bind(CapturedTransferEndpoint::Producer,{d.messageKey(role),maxBytes},root(back?own:coord,source.buffer),source.offset);
+        auto receive=(channel).bind(CapturedTransferEndpoint::Consumer,{d.messageKey(role),maxBytes},root(back?coord:own,destination.buffer),destination.offset);
         if(role==PooledFreeWireRole::Decisions){const auto slice=d.decisionSlice(),count=*d.decisionCount();
-            send=transfer.bindDeviceSlicedTransfer(std::move(send),coord.native,slice.offset,source.bytes,source.offset);
-            receive=transfer.bindDeviceCountedTransfer(std::move(receive),own.native,count.offset);
+            send=std::move(send).withDeviceSliced(coord.native,slice.offset,source.bytes,source.offset,PooledNativeCountedMessage::FreeDecisions);
+            receive=std::move(receive).withDeviceCounted(own.native,count.offset,PooledNativeCountedMessage::FreeDecisions);
         }else if(role==PooledFreeWireRole::Grants){const auto count=d.grantCount(),incoming=*d.incomingGrantCount();
-            send=transfer.bindDeviceCountedTransfer(std::move(send),own.native,count.offset);
-            receive=transfer.bindDeviceCountedTransfer(std::move(receive),coord.native,incoming.offset);
+            send=std::move(send).withDeviceCounted(own.native,count.offset,PooledNativeCountedMessage::FreeGrants);
+            receive=std::move(receive).withDeviceCounted(coord.native,incoming.offset,PooledNativeCountedMessage::FreeGrants);
         }
         bindings[index].emplace(std::move(send),std::move(receive));
     }
     return std::shared_ptr<const PooledImmutableCapturedFreeWave>(new PooledImmutableCapturedFreeWave(std::move(pin),std::move(memory),std::move(d),std::move(bindings)));
 }
 void PooledImmutableCapturedFreeWave::requireCurrent()const{pin_->requireCurrent();pin_->forward()->coordinatorStorage()->requireAuthority(memory_);pin_->forward()->ownerStorage()->requireAuthority(memory_);}
-const CapturedTransferBinding& PooledImmutableCapturedFreeWave::binding(PooledFreeWireRole role,CapturedTransferEndpoint endpoint)const {
+const PooledImmutableTransferBinding& PooledImmutableCapturedFreeWave::binding(PooledFreeWireRole role,CapturedTransferEndpoint endpoint)const {
     requireCurrent();const auto index=roleIndex(role);if(endpoint!=CapturedTransferEndpoint::Producer && endpoint!=CapturedTransferEndpoint::Consumer)throw std::invalid_argument("Unknown free-wave endpoint");
     if(!bindings_[index])throw std::invalid_argument("C0 free wave has no decision/Grant payload transaction");return endpoint==CapturedTransferEndpoint::Producer?bindings_[index]->first:bindings_[index]->second;
 }
@@ -133,12 +133,12 @@ public:
     q::PooledImmutableDirectedTransferOperation directedTransferOperation()const{
         requireDeclarations();const auto& binding=edge_->binding(role_,endpoint_);
         return {q::PooledImmutableDirectedWireFamily::Free,static_cast<std::uint32_t>(role_),endpoint_,
-            binding.message().bytes,binding.extentSource(),binding.hasSourceSlice()};
+            binding.message().bytes,binding.extentSource(),binding.hasSourceSlice(),binding.nativeCollective()?q::PooledImmutableDirectedTransportKind::NativeCollective:q::PooledImmutableDirectedTransportKind::CapturedChannel};
     }
 
     /** @brief Retain original prepared owners and their actual endpoint before freezing the capture identity. */
     PooledFreeTransferStage(BufferArena& arena,std::shared_ptr<const q::PooledImmutableCapturedFreeWave> edge,q::PooledFreeWireRole role,CapturedTransferEndpoint endpoint)
-        :IComputeStage((reverseFree(role)==(endpoint==CapturedTransferEndpoint::Producer))?edge->declaration().original().receiver().device:edge->declaration().original().sender().device),arena_(&arena),edge_(std::move(edge)),role_(role),endpoint_(endpoint){requireDeclarations();identity_=graphCaptureVariantSignature();}
+        :IComputeStage((reverseFree(role)==(endpoint==CapturedTransferEndpoint::Producer))?edge->declaration().original().receiver().device:edge->declaration().original().sender().device),arena_(&arena),edge_(std::move(edge)),role_(role),endpoint_(endpoint){requireDeclarations();identity_=graphCaptureVariantSignature();native_collective_=edge_->binding(role_,endpoint_).nativeCollective();}
     /** @return Exact original retained free-wave holder/action/endpoint for subsequent wave authentication. */
     bool matches(const q::PooledImmutableCapturedFreeWave* edge,q::PooledFreeWireRole role,CapturedTransferEndpoint endpoint)const noexcept
     {return edge_.get()==edge && role_==role && endpoint_==endpoint;}
@@ -147,17 +147,17 @@ public:
         if(!context || context->deviceId()!=device() || !stream || reinterpret_cast<uintptr_t>(stream)<=2)throw std::invalid_argument("Free endpoint needs original participant/exact setup stream");
         requireDeclarations();if(identity_!=graphCaptureVariantSignature())throw std::logic_error("Free endpoint capture drift");
         const bool own=reverseFree(role_)==(endpoint_==CapturedTransferEndpoint::Producer);
-        if(own)edge_->pin()->forward()->ownerStorage()->acquireSetup(stream);else edge_->pin()->forward()->coordinatorStorage()->acquireSetup(stream);setGPUStream(stream);return true;
+        if(own)edge_->pin()->forward()->ownerStorage()->acquireSetup(stream);else edge_->pin()->forward()->coordinatorStorage()->acquireSetup(stream);edge_->binding(role_,endpoint_).prepare(stream);setGPUStream(stream);return true;
     }
     /** @brief Submit one public exact fixed/sliced/counted transfer with its original publication ownership. */
     bool execute(IDeviceContext* context)override {
         if(!context || context->deviceId()!=device())throw std::invalid_argument("Free endpoint execution moved participants");
-        requireDeclarations();if(identity_!=graphCaptureVariantSignature())throw std::logic_error("Free endpoint binding changed");TransferEngine::instance().enqueueCapturedTransfer(edge_->binding(role_,endpoint_),requireGPUStream());return true;
+        requireDeclarations();if(identity_!=graphCaptureVariantSignature())throw std::logic_error("Free endpoint binding changed");edge_->binding(role_,endpoint_).enqueue(requireGPUStream());return true;
     }
     /** @return Explicit graph collective classification. */
     ComputeStageType type()const override{return ComputeStageType::QWEN4EXP_POOLED_DIRECTED_TRANSFER;}
     /** @return This original bound endpoint executes native device-counted transfer kernels, independently from collective-runtime capture. */
-    CollectiveGraphCaptureAuthority collectiveGraphCaptureAuthority()const noexcept override{return CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;}
+    CollectiveGraphCaptureAuthority collectiveGraphCaptureAuthority()const noexcept override{return native_collective_?CollectiveGraphCaptureAuthority::RuntimeBackend:CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;}
     /** @return Nominal phase name. */
     std::string name()const override{return "PooledImmutableDirectedFree";}
     /** @return Complete original binding, action and endpoint identity, excluding live device values. */
@@ -193,7 +193,9 @@ private:
         const auto span=endpoint_==CapturedTransferEndpoint::Producer?edge_->declaration().source(role_):edge_->declaration().destination(role_);
         if(arena_->getTensor(native)!=roots.native.get() || (span.buffer==frame && arena_->getTensor(frame)!=roots.frame.get()))throw std::logic_error("Free endpoint arena replaced original native/frame authority");
     }
-    BufferArena* arena_;std::shared_ptr<const q::PooledImmutableCapturedFreeWave> edge_;q::PooledFreeWireRole role_;CapturedTransferEndpoint endpoint_;uint64_t identity_=0;
+    BufferArena* arena_;std::shared_ptr<const q::PooledImmutableCapturedFreeWave> edge_;q::PooledFreeWireRole role_;CapturedTransferEndpoint endpoint_;
+    bool native_collective_=false; // Cold-selected original transport; capture policy never probes runtime state.
+    uint64_t identity_=0;
 };
 /** @brief Validate all pending node names before declaring this participant's graph extension. */
 void freeNames(const ComputeGraph& graph,std::span<const std::string> names){std::set<std::string> unique;for(const auto& name:names)if(name.empty() || graph.getNode(name) || !unique.insert(name).second)throw std::invalid_argument("Free wave has a missing/duplicate existing node name");}

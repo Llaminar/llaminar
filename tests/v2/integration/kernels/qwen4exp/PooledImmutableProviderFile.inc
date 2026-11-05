@@ -4,6 +4,21 @@
  */
 /** @brief Fail the exact requested native cell without a skip or alternate path. */
 void requireProvider(bool ok,const char* reason){if(!ok)throw std::runtime_error(reason);}
+/**
+ * @brief Translate the existing typed source backing without changing cache policy.
+ * @param backing Original full-RAM or bounded SSD source selection.
+ * @param windowBytes Exact SSD window extent, ignored only by the typed RAM policy factory.
+ * @param windowCount Exact SSD window population.
+ * @return Canonical storage policy used by geometry, BOM and actual materialization.
+ * @throws std::invalid_argument For an invalid typed backing or SSD window geometry.
+ */
+inline ImmutableRowTableStoragePolicy providerReplaySourcePolicy(AdaptiveImmutableRowBacking backing,
+    std::size_t windowBytes=4096,std::size_t windowCount=2){
+    AdaptiveVRAMRAMSSDRequest request;request.source_backing=backing;
+    const auto storage=request.sourceStorage();
+    return storage==ImmutableRowStorage::RAM?ImmutableRowTableStoragePolicy::forStorage(storage):
+        ImmutableRowTableStoragePolicy::forStorage(storage,windowBytes,windowCount);
+}
 /** @brief Author original rows at their full source coordinates; sparse holes are file layout, never transmitted padding. */
 class ProviderFile final {
 public:

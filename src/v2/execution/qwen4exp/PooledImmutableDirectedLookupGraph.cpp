@@ -34,11 +34,36 @@ PooledImmutableDirectedLookupEndpoints appendPooledImmutableDirectedLookupGraph(
     if(isGraphCaptureActive() || !boundary || !boundary->isPooled() || !transport || !code || identity.empty() || output_identity.empty())
         throw std::invalid_argument("Directed lookup requires original source, transport, code and output before capture");
     transport->requireCurrent();
+    if(transport->sourceBoundary()!=boundary)
+        throw std::invalid_argument("Directed lookup changed its original source boundary");
     const auto storage=boundary->pooledStorage();const auto& prepared=storage->retainedPreparedSourceWorkers();
     if(!prepared || storage->originalOwners().empty() || code->backend()!=boundary->device().type)
         throw std::invalid_argument("Directed lookup requires its consumed original multiowner source and source-native code");
     const auto coordinator=storage->coordinator();const auto memory=prepared->source()->memory();
     const auto source_allocator=coordinator->plan().allocator();
+    // P1 has no distributed ingress frontier. Its actual existing local graph
+    // owns Read/release; only compute-result/ACK channels are added for readers.
+    if(storage->originalOwners().size()==1 &&
+       storage->originalOwners().front()->plan().allocator()==source_allocator){
+        if(!transport->remotes().empty())
+            throw std::invalid_argument("Sole local owner cannot retain a remote storage program");
+        bindPooledNativeRoots(arena,*coordinator);
+        bindPooledNativeRoots(arena,*storage->originalOwners().front());
+        bindPooledSourceRoots(arena,*boundary);
+        ComputeGraph fragment;
+        std::shared_ptr<PooledImmutableLocalRetirementCompletion> terminal;
+        const auto count=begin[static_cast<unsigned>(q::PooledNativeOperand::OriginalCount)];
+        const auto endpoints=appendPooledImmutableLocalLookupGraph(fragment,arena,boundary,code,
+            original,std::move(begin),control,std::move(output),identity,output_identity,&terminal);
+        if(storage->geometry().parameters().consumers>1)
+            terminal->readers=appendPooledReplicatedSourceReaders(fragment,arena,transport,control,
+                original.rows,terminal->output,terminal->read,terminal->readersRetired,identity+"/readers",count);
+        PooledImmutableSourceRetirementCompletion completion{
+            std::shared_ptr<const PooledImmutableLocalRetirementCompletion>(std::move(terminal))};
+        requirePooledSourceRetirementCompletion(fragment,completion);
+        publishFragment(graph,std::move(fragment));graph.setRetainedStorageBoundary(std::move(boundary));
+        return {endpoints,std::move(completion)};
+    }
     std::shared_ptr<const q::PooledImmutableLocalOwnerBinding> local;
     std::vector<q::PooledImmutablePinParticipant> pins;
     std::vector<q::PooledImmutableFreeParticipant> free_members;
@@ -110,7 +135,20 @@ PooledImmutableDirectedLookupEndpoints appendPooledImmutableDirectedLookupGraph(
     requirePooledRetirementCompletion(fragment,retired);
     const auto last=retired.coordinator.last;
     publishFragment(graph,std::move(fragment));graph.setRetainedStorageBoundary(std::move(boundary));
-    return {{first,last},std::move(retired)};
+    return {{first,last,PooledImmutableDemandFrontier{PooledImmutableDemandRole::Source,source.published,source.acquired}},std::move(retired)};
+}
+void requirePooledSourceRetirementCompletion(const ComputeGraph& graph,
+    const PooledImmutableSourceRetirementCompletion& original){
+    std::visit([&](const auto& completion){
+        using T=std::decay_t<decltype(completion)>;
+        if constexpr(std::is_same_v<T,PooledImmutableRetirementCompletion>)
+            requirePooledRetirementCompletion(graph,completion);
+        else{
+            if(!completion || !completion->sourceBoundary() || (completion->sourceBoundary()->pooledStorage()->geometry().parameters().consumers>1 && !completion->sharedReaders()))
+                throw std::invalid_argument("Local recurring source omitted original shared-reader completion");
+            requirePooledLocalRetirementCompletion(graph,*completion);
+        }
+    },original);
 }
 PooledPinParticipantNodes appendPooledImmutableDirectedOwnerGraph(ComputeGraph& graph,BufferArena& arena,
     const q::PooledImmutableRemoteTransport& remote,std::shared_ptr<const q::IPooledImmutableNativeKernels> code,
@@ -136,4 +174,50 @@ PooledPinParticipantNodes appendPooledImmutableDirectedOwnerGraph(ComputeGraph& 
     q::PooledImmutableDirectedOwnerProgram::requireActual(fragment,remote.pin->ownerStorage()->plan(),remote.pin->coordinatorStorage()->plan(),program);
     publishFragment(graph,std::move(fragment));return {pin.first,retired.last};
 }
+PooledPinParticipantNodes appendPooledImmutableInlineOwnerPrefix(
+    ComputeGraph& graph, BufferArena& arena,
+    const q::PooledImmutableRemoteTransport& remote,
+    std::shared_ptr<const q::IPooledImmutableNativeKernels> code,
+    const std::string& identity, PooledImmutableDemandFrontier* demand)
+{
+    if (isGraphCaptureActive() || !remote.pin || !remote.retirement || !code || identity.empty())
+        throw std::invalid_argument("Inline storage requires its original cold addressed owner declaration");
+    remote.retirement->requireCurrent();
+    if (remote.coordinate != remote.pin->declaration().coordinate() ||
+        code->backend() != remote.pin->declaration().receiver().device.type)
+        throw std::invalid_argument("Inline storage changed its original owner coordinate or native backend");
+    bindPooledNativeRoots(arena, *remote.pin->ownerStorage());
+    const auto pin = appendPooledPinReceiver(graph, arena, remote.pin, code, identity + "/pin");
+    const auto returned = appendPooledPinOwnerReturn(graph, arena, remote.returned, code,
+        pin.last, identity + "/return");
+    const auto free = appendPooledFreeOwnerWave(graph, arena, remote.free, code,
+        returned.last, identity + "/free");
+    const auto victim = appendPooledVictimOwnerWave(graph, arena, remote.victim, code,
+        free.last, identity + "/victim");
+    const auto source = appendPooledSourceOwnerFill(graph, arena, remote.source, code,
+        victim.last, identity + "/source", demand);
+    const auto publication = appendPooledPublicationOwner(graph, arena, remote.publication, code,
+        source.last, identity + "/publication");
+    const auto read = appendPooledReadOwner(graph, arena, remote.read, code,
+        publication.last, identity + "/read");
+    requirePooledReadOwnerCompletion(graph, remote.read, read.last);
+    return {pin.first, read.last};
+}
+
+PooledPinParticipantNodes appendPooledImmutableInlineOwnerRetirement(
+    ComputeGraph& graph, BufferArena& arena,
+    const q::PooledImmutableRemoteTransport& remote,
+    std::shared_ptr<const q::IPooledImmutableNativeKernels> code,
+    const std::string& rowsSent, const PooledImmutableReplicatedConsumerCompletion& consumer,
+    const std::string& identity)
+{
+    if (isGraphCaptureActive() || !remote.retirement || !code || identity.empty())
+        throw std::invalid_argument("Inline storage retirement requires its original cold read declaration");
+    requirePooledReplicatedConsumerCompletion(graph, consumer);
+    const auto retired = appendPooledRetirementOwner(graph, arena, remote.retirement, code,
+        rowsSent, identity, &consumer);
+    requirePooledRetirementOwnerCompletion(graph, remote.retirement, retired.last, &consumer);
+    return retired;
+}
+
 }

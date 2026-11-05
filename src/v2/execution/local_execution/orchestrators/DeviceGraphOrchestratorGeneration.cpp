@@ -203,6 +203,10 @@ void DeviceGraphOrchestrator::awaitGroupedRetainedStorageTerminal()
 
 void DeviceGraphOrchestrator::prepareGroupedRetainedStorageReset(const InferenceStateResetRequest& request)
 {
+    prepareGroupedRetainedStorageProducerProof(request.reason);
+}
+void DeviceGraphOrchestrator::prepareGroupedRetainedStorageProducerProof(const char* reason)
+{
     const auto [declared,epoch]=retainedStorageSourceAdmission();
     (void)epoch;
     const auto boundary=std::dynamic_pointer_cast<qwen4exp::ImmutableLookupExecutionBoundary>(declared);
@@ -214,7 +218,7 @@ void DeviceGraphOrchestrator::prepareGroupedRetainedStorageReset(const Inference
     // Preserve the original reset order. This drains only already-published
     // maintenance diagnostics; the later reset sees the same owner retired.
     drainCompletedDeviceMoERebalanceMaintenanceDiagnostics("request_reset",
-        request.reason?request.reason:"request-boundary");
+        reason?reason:"request-boundary");
     auto* stream=explicitGPUStreamForOperation("requestStateResetTransaction");
     if(!joinPriorDeviceWorkForRequestStateReset(stream,"grouped-source-terminal",RetainedStorageTerminalPhase::PublishOnly))
         throw std::runtime_error("Original grouped reset could not join prior GPU producers");
@@ -234,13 +238,32 @@ void DeviceGraphOrchestrator::prepareRetainedStorageBinding()
     const auto declared=graph_builder_?graph_builder_->retainedStorageBoundary(state_.device_id):nullptr;
     if(retained_storage_boundary_&&declared!=retained_storage_boundary_)
         throw std::logic_error("Immutable storage lane changed while captured generation retained its addresses");
-    retained_storage_boundary_=declared;
     if(declared)
     {
         if(declared->device()!=state_.device_id)
             throw std::logic_error("Immutable storage admission names another GPU participant");
+        if(!device_generation_storage_.control_device)
+            throw std::logic_error("Immutable storage binding requires its original canonical controller storage");
         declared->bindGenerationControl({device_generation_storage_.control_device+sampling_math::kDeviceGenerationControlOk,
             device_generation_storage_.control_device+sampling_math::kDeviceGenerationControlErrorCode});
+    }
+    // Only successful acquisition publishes a retirement duty. A foreign or
+    // throwing bind never grants this runner ownership of somebody else's borrow.
+    retained_storage_boundary_=declared;
+}
+void DeviceGraphOrchestrator::retireRetainedStorageGenerationBinding()noexcept
+{
+    if(!retained_storage_boundary_)return;
+    try{
+        if(!device_generation_storage_.control_device)
+            throw std::logic_error("Original storage graph borrow lost its canonical controller storage");
+        retained_storage_boundary_->retireGenerationControl({
+            device_generation_storage_.control_device+sampling_math::kDeviceGenerationControlOk,
+            device_generation_storage_.control_device+sampling_math::kDeviceGenerationControlErrorCode});
+        retained_storage_boundary_.reset();
+    }catch(const std::exception& error){
+        LOG_ERROR("[DeviceGraphOrchestrator] Original storage graph-borrow retirement failed: "<<error.what());
+        std::terminate();
     }
 }
 bool DeviceGraphOrchestrator::beginRetainedStorageAdmission(void *stream)

@@ -687,6 +687,9 @@ namespace llaminar2
         // Only the original Rank can order these phases across every participant.
         /** @brief Join original prior producers and publish this grouped channel's reset close before any TP peer awaits. */
         void prepareGroupedRetainedStorageReset(const InferenceStateResetRequest& request);
+        /** @brief Publish only the existing original producer terminal proof; no request data reset or peer service await. */
+        void prepareGroupedRetainedStorageProducerProof(const char* reason);
+
         /** @brief Complete this original native result bridge, deferring only the shared CPU service await to its TP parent. */
         bool finishGroupedDeviceResidentGeneration(DeviceGenerationTerminalResult* result);
         /** @brief Consume this adopted channel only after all TP native terminal bridges have completed. */
@@ -2785,6 +2788,14 @@ namespace llaminar2
                              NativeDeviceExecutableFamily
                        : ServingGraphPreparationKind::EagerHostGraph;
         }
+
+        /**
+         * @brief Project actual finite continuation and learned-sidecar graph owners for cold Rank attachment.
+         * @return Sealed source-bearing or source-free definitions with original role/row/capture identity.
+         * The Rank consumes this only after continuation family materialization;
+         * callers may not manufacture a missing sidecar or infer it from layer counts.
+         */
+        std::vector<RetainedForwardSourceDefinition> retainedExpertSourceFamilyDefinitions() const;
 
         /** @copydoc IInferenceRunner::materializeServingGraphFamilyWithoutLaunch */
         bool materializeServingGraphFamilyWithoutLaunch(
@@ -10362,6 +10373,13 @@ namespace llaminar2
         void retirePublishedDeviceWorkBeforeArenaRelease() noexcept;
 
         /**
+         * @brief Retire every original native/cache borrower while all rank child
+         * arenas remain alive. Rank invokes this phase for ALL children before
+         * detaching shared storage definitions or destroying any child arena.
+         */
+        void retireExecutionTopologyBeforeSharedStorageDetach() noexcept;
+
+        /**
          * @brief Retire model references to context-owned execution streams.
          *
          * Runtime MoE tables may retain exact producer stream identities so a
@@ -11375,6 +11393,11 @@ namespace llaminar2
         bool beginRetainedStorageAdmission(void *stream);
         /** @brief Resolve setup-owned lane and bind canonical control addresses before graph construction. */
         void prepareRetainedStorageBinding();
+        /** @brief Return the exact acquired graph borrow after original producer/topology closure.
+         * No unacquired binding is retired; missing controller storage is fatal.
+         * Only the existing runner retirement sequence may call this helper.
+         */
+        void retireRetainedStorageGenerationBinding()noexcept;
         /** @brief Resolve one setup-recorded close fragment after the complete native WHILE. */
         std::span<const DeviceControlledLoopEntryFragment> retainedStorageTerminalFragments();
         /** @brief Submit the pre-recorded terminal branch named by an authenticated hosted terminal ticket. */

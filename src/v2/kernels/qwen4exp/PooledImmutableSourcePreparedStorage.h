@@ -13,6 +13,7 @@
 #include "backends/NativeContextPreparation.h"
 #include <optional>
 namespace llaminar2 {class ModelContext;}
+namespace llaminar2::test {struct PooledImmutableFactoryReplayAccess;}
 namespace llaminar2::qwen4exp {
 class ImmutableLookupService;
 /** @brief Immutable original-worker ownership consumed by actual source-root materialization. */
@@ -72,6 +73,7 @@ public:
 private:
     friend class ImmutableLookupService;
     friend class ::llaminar2::ModelContext;
+    friend struct ::llaminar2::test::PooledImmutableFactoryReplayAccess;
     /** @brief Retain only workers actually consumed by the ModelContext materialization body, once. */
     void bindPreparedSourceWorkers(std::shared_ptr<NativeContextPreparation>,PreparedGPUContextUsePermit,
         std::vector<PreparedGPUContextUsePermit>);

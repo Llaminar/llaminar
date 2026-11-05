@@ -36,6 +36,7 @@
 #include "PooledImmutableReadOps.h"
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include "GPUPooledImmutableCoalescing.cuh"
 #include "GPUPooledImmutableExactIdentity.cuh"
 #include "GPUPooledImmutableOwnerValidation.cuh"
@@ -52,6 +53,31 @@ template<class Slot> __global__ __launch_bounds__(Threads,2) void initializeSlot
 }
 /** @brief Publish the actual once-only owner setup identity after all slot producers. */
 template<class Slot> __global__ void sealOwnerKernel(n::OwnerArgs a){n::sealOwner<Slot>(a);}
+/** @return The same owner operations over mapped or native-inline immutable arguments. */
+template<class Args> __host__ __device__ const n::OwnerArgs& originalOwnerArgs(const Args& value)
+{
+    if constexpr (std::is_same_v<Args, n::NativeOwnerArgs>) return value.owner;
+    else return value;
+}
+/** @return Block-uniform original native cancellation without physical release or first-fault erasure. */
+template<class Slot> __device__ bool abortedNativeOwner(const n::NativeOwnerArgs& value)
+{
+    __shared__ std::uint32_t cancelled;
+    if (threadIdx.x == 0) {
+        std::uint32_t abort = 0;
+        if (value.original_invocation.abortFlag) {
+#if defined(QFN_POOLED_NATIVE_CUDA)
+            auto* address = const_cast<std::uint32_t*>(value.original_invocation.abortFlag);
+            abort = cuda::atomic_ref<std::uint32_t, cuda::thread_scope_system>(*address).load(cuda::memory_order_acquire);
+#else
+            abort = __hip_atomic_load(value.original_invocation.abortFlag, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+#endif
+        }
+        cancelled = n::suppressAbortedNativeOwner<Slot>(value.owner, value.original_invocation, abort) ? 1u : 0u;
+    }
+    __syncthreads();
+    return cancelled != 0;
+}
 /** @return Rare cancellation drain over only original endpoint and owner state; normal work reads no mapped word. */
 template<class Slot> __device__ bool cancelledIdleOwner(const n::OwnerArgs& a)
 {
@@ -64,10 +90,18 @@ template<class Slot> __device__ bool cancelledIdleOwner(const n::OwnerArgs& a)
 #endif
     return n::cancelledIdleOwner<Slot>(a, cancellation);
 }
-/** @brief One real ordered owner state mutation; no row payload work runs here. */
-template<n::OwnerAction Action,class Slot> __global__ void ownerPhase(n::OwnerArgs a)
+/** @return Original mapped cancellation, or native parent abort for the explicit native-only specialization. */
+template<class Slot, class Args> __device__ bool cancelledOwnerWork(const Args& value)
 {
-    if (cancelledIdleOwner<Slot>(a)) return;
+    if constexpr (std::is_same_v<Args, n::NativeOwnerArgs>)
+        if (abortedNativeOwner<Slot>(value)) return true;
+    return cancelledIdleOwner<Slot>(originalOwnerArgs(value));
+}
+/** @brief One real ordered owner state mutation; no row payload work runs here. */
+template<n::OwnerAction Action,class Slot,class Args> __global__ void ownerPhase(Args supplied)
+{
+    const auto& a = originalOwnerArgs(supplied);
+    if (cancelledOwnerWork<Slot>(supplied)) return;
     bool succeeded;
     if constexpr(Action==n::OwnerAction::Pin || Action==n::OwnerAction::AcceptFree || Action==n::OwnerAction::AcceptVictim)
         succeeded=n::CooperativeOwnerValidation<Slot>::template run<Action>(a);
@@ -83,9 +117,10 @@ template<n::OwnerAction Action,class Slot> __global__ void ownerPhase(n::OwnerAr
     }
 }
 /** @brief Copy only the current immutable actual grant prefix to reusable directed transport staging. */
-template<n::OwnerAction Action, class Slot> __global__ __launch_bounds__(Threads,2) void publishReplies(n::OwnerArgs a)
+template<n::OwnerAction Action, class Slot,class Args> __global__ __launch_bounds__(Threads,2) void publishReplies(Args supplied)
 {
-    if (cancelledIdleOwner<Slot>(a)) return;
+    const auto& a = originalOwnerArgs(supplied);
+    if (cancelledOwnerWork<Slot>(supplied)) return;
     const auto bytes=n::progress(a).reply_bytes;
     if(bytes%sizeof(p::Grant) || bytes/sizeof(p::Grant)>a.plan.native.reply_capacity)return;
     const auto count=bytes/sizeof(p::Grant);
@@ -95,9 +130,10 @@ template<n::OwnerAction Action, class Slot> __global__ __launch_bounds__(Threads
     for(auto i=std::uint64_t{blockIdx.x}*Threads+threadIdx.x;i<count;i+=std::uint64_t{gridDim.x}*Threads)output[i]=source[i];
 }
 /** @brief Fill exactly live unchanged native row bytes; slot stride padding is never copied. */
-template<class Slot> __global__ __launch_bounds__(Threads,2) void copyRows(n::OwnerArgs a)
+template<class Slot,class Args> __global__ __launch_bounds__(Threads,2) void copyRows(Args supplied)
 {
-    if (cancelledIdleOwner<Slot>(a)) return;
+    const auto& a = originalOwnerArgs(supplied);
+    if (cancelledOwnerWork<Slot>(supplied)) return;
     if(n::progress(a).delivery!=n::Delivery::Validated || n::ownerView<Slot>(a).frame->status!=adaptive_lookup::Status::Success)return;
     const auto count=n::allocationFrame(a).count;
     const auto bytes=std::uint64_t{count}*a.plan.row_bytes;
@@ -107,17 +143,24 @@ template<class Slot> __global__ __launch_bounds__(Threads,2) void copyRows(n::Ow
     }
 }
 /** @brief Pack only actual validated pinned bytes, excluding all native slot stride padding. */
-template<class Slot> __global__ __launch_bounds__(Threads,2) void copyHits(n::OwnerArgs a){
-    if (cancelledIdleOwner<Slot>(a)) return;
+template<class Slot,class Args> __global__ __launch_bounds__(Threads,2) void copyHits(Args supplied){
+    const auto& a = originalOwnerArgs(supplied);
+    if (cancelledOwnerWork<Slot>(supplied)) return;
     if(n::progress(a).delivery!=n::Delivery::Validated)return;
     const auto bytes=n::at<n::OwnerIngress>(a.native,a.plan.native.ingress)->payload_bytes;
     for(auto i=std::uint64_t{blockIdx.x}*Threads+threadIdx.x;i<bytes;i+=std::uint64_t{gridDim.x}*Threads)
         a.native[a.plan.native.source_payload+i]=*n::hitReadByte(a,i);
 }
 /** @brief Publish fresh receipt64/count only after every ordered packed-byte writer. */
-template<class Slot> __global__ void hitsComplete(n::OwnerArgs a){if (!cancelledIdleOwner<Slot>(a)) (void)n::completeHitRead<Slot>(a);}
+template<class Slot,class Args> __global__ void hitsComplete(Args supplied)
+{
+    if (!cancelledOwnerWork<Slot>(supplied)) (void)n::completeHitRead<Slot>(originalOwnerArgs(supplied));
+}
 /** @brief Actual copy completion is published only after every disjoint payload writer's launch completes. */
-template<class Slot> __global__ void copyComplete(n::OwnerArgs a){if (!cancelledIdleOwner<Slot>(a)) n::copied<Slot>(a);}
+template<class Slot,class Args> __global__ void copyComplete(Args supplied)
+{
+    if (!cancelledOwnerWork<Slot>(supplied)) n::copied<Slot>(originalOwnerArgs(supplied));
+}
 /** @brief Seed only actual coordinator controls. */
 __global__ void seedCoordinatorKernel(n::CoordinatorSetupArgs a){n::seedCoordinator(a);}
 /** @brief Write one exact immutable owner geometry record from setup scalars, without a host payload mirror. */
@@ -190,6 +233,15 @@ protected:
         if(a.plan.owner.rowWidth()==adaptive_lookup::RowKeyWidth::UInt32)ownerAction<adaptive_lookup::Slot32>(action,a,stream);
         else ownerAction<adaptive_lookup::Slot64>(action,a,stream);
     }
+    /** @brief Record native-only inline owner entry; original mapped arguments/dispatch remain distinct. */
+    void launchNativeOwner(n::OwnerAction action, const n::NativeOwnerArgs& a, void* exact) const override
+    {
+        require(a.owner.plan.device, exact);
+        const auto stream = static_cast<QFN_NATIVE_STREAM>(exact);
+        if (a.owner.plan.owner.rowWidth() == adaptive_lookup::RowKeyWidth::UInt32)
+            ownerAction<adaptive_lookup::Slot32>(action, a, stream);
+        else ownerAction<adaptive_lookup::Slot64>(action, a, stream);
+    }
     /** @brief Record the exact fixed coordinator phase without host count readbacks or hidden collectives. */
     void launch(n::CoordinatorAction action,const n::CoordinatorArgs& a,const n::CoordinatorQuery* query,void* exact)const override
     {
@@ -235,25 +287,26 @@ private:
         sealOwnerKernel<Slot><<<1,1,0,stream>>>(a);checked();
     }
     /** @brief Execute one closed owner phase specialization and publish only its actual live reply prefix. */
-    template<n::OwnerAction Action,class Slot> static void submitOwner(const n::OwnerArgs& a,QFN_NATIVE_STREAM stream)
+    template<n::OwnerAction Action,class Slot,class Args> static void submitOwner(const Args& supplied,QFN_NATIVE_STREAM stream)
     {
+        const auto& a = originalOwnerArgs(supplied);
         constexpr auto lanes=Action==n::OwnerAction::Pin || Action==n::OwnerAction::AcceptFree || Action==n::OwnerAction::AcceptVictim?Threads:1;
-        ownerPhase<Action,Slot><<<1,lanes,0,stream>>>(a);checked();
+        ownerPhase<Action,Slot><<<1,lanes,0,stream>>>(supplied);checked();
         if constexpr(n::OwnerLaunchPlan<Action>::publishesReplies)
-            if(a.plan.native.reply_capacity){publishReplies<Action,Slot><<<blocks(a.plan.native.reply_capacity),Threads,0,stream>>>(a);checked();}
+            if(a.plan.native.reply_capacity){publishReplies<Action,Slot><<<blocks(a.plan.native.reply_capacity),Threads,0,stream>>>(supplied);checked();}
         if constexpr(n::OwnerLaunchPlan<Action>::readsRows){
-            if(a.plan.native.reply_capacity){copyHits<Slot><<<blocks(std::uint64_t{a.plan.native.reply_capacity}*a.plan.row_bytes),Threads,0,stream>>>(a);checked();}
-            hitsComplete<Slot><<<1,1,0,stream>>>(a);checked();
+            if(a.plan.native.reply_capacity){copyHits<Slot><<<blocks(std::uint64_t{a.plan.native.reply_capacity}*a.plan.row_bytes),Threads,0,stream>>>(supplied);checked();}
+            hitsComplete<Slot><<<1,1,0,stream>>>(supplied);checked();
         }
         if constexpr(n::OwnerLaunchPlan<Action>::appliesSource){
             if(a.plan.native.reply_capacity){
-                copyRows<Slot><<<blocks(std::uint64_t{a.plan.native.reply_capacity}*a.plan.row_bytes),Threads,0,stream>>>(a);checked();
+                copyRows<Slot><<<blocks(std::uint64_t{a.plan.native.reply_capacity}*a.plan.row_bytes),Threads,0,stream>>>(supplied);checked();
             }
-            copyComplete<Slot><<<1,1,0,stream>>>(a);checked();
+            copyComplete<Slot><<<1,1,0,stream>>>(supplied);checked();
         }
     }
     /** @brief Closed owner dispatch keeps each candidate's compiler resource evidence isolated by kernel symbol. */
-    template<class Slot> static void ownerAction(n::OwnerAction action,const n::OwnerArgs& a,QFN_NATIVE_STREAM stream)
+    template<class Slot,class Args> static void ownerAction(n::OwnerAction action,const Args& a,QFN_NATIVE_STREAM stream)
     {
         switch(action){
 #define QFN_OWNER_CASE(Name) case n::OwnerAction::Name:submitOwner<n::OwnerAction::Name,Slot>(a,stream);return;

@@ -9,11 +9,45 @@
 #pragma once
 #include "execution/config/RuntimeConfig.h"
 #include "kernels/common/SamplingMath.h"
+#include <memory>
 #include <stdexcept>
+namespace llaminar2 { struct GraphConfig; struct MoEExpertOverlayExecutionPlan; class PreparedGPUContextUsePermit; }
 namespace llaminar2::qwen4exp {
-/** @brief Shared setup/admission validation for the singleton hosted source. */
+class PooledImmutableSourceGeometry;
+/** @brief Shared setup/admission validation for the hosted source and its original readers. */
 class PooledImmutableParticipantExecutionPolicy final {
 public:
+    /**
+     * @brief Decide whether the original source needs retained cross-device participants.
+     * @param source Checked source geometry with independent storage-owner and compute-reader populations.
+     * @return True when results have multiple readers or any storage owner differs from the coordinator.
+     * @note Cache capacity does not determine communication: a query-only reader still
+     * consumes results, and a zero-capacity remote owner still participates in the protocol.
+     */
+    static bool requiresRetainedParticipants(const PooledImmutableSourceGeometry& source) noexcept;
+    /** @brief Policy projection only; actual reader membership is authenticated by its retained cohort. */
+    enum class GraphRole { Source, ReplicatedReader };
+    /**
+     * @brief Check the complete hosted graph descriptor without treating a derived value as identity.
+     * @param original Source graph's retained immutable execution descriptor.
+     * @param participant Actual participant graph, after original model/cohort membership validation.
+     * @param role Source keeps its exact descriptor; a sibling reader derives an equal descriptor.
+     * @throws std::invalid_argument For missing, foreign, partial or changed execution policy.
+     * @note This grants no source, communicator, native storage or execution capability.
+     */
+    static void requireGraphDescriptor(
+        const std::shared_ptr<const MoEExpertOverlayExecutionPlan>& original,
+        const GraphConfig& participant, GraphRole role);
+    /**
+     * @brief Check an original prepared physical owner against the actual expert execution descriptor.
+     * @param original Same immutable descriptor retained by the original source/cohort.
+     * @param owner Exact prepared source permit, not a discovered device/TP-domain guess.
+     * @return True only for an owned, locally addressable noncontinuation expert participant at its original rank.
+     * This projection grants no worker, parent or storage capability; full
+     * source/PMA/capture authentication remains mandatory before attachment.
+     */
+    static bool declaresExpertOwner(const MoEExpertOverlayExecutionPlan& original,
+        const PreparedGPUContextUsePermit& owner);
     /** @brief Validate retained capacity and the initial request without repricing it.
      * @param config Original runtime graph/arena envelope and request policy.
      * @throws std::invalid_argument For invalid capacity, batching or request policy. */

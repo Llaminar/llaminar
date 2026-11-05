@@ -6,6 +6,7 @@
  * or a replacement cache implementation. The production parity fixture consumes
  * the very same validator after preserving the original raw counter CSV.
  */
+#include "integration/parity/qwen4exp/Qwen4ExpGPUAdaptiveParityCases.h"
 #include "integration/parity/qwen4exp/Qwen4ExpGPUAdaptiveLookupEvidence.h"
 #include "planning/ImmutableRowTablePlacementPlanner.h"
 #include <gtest/gtest.h>
@@ -387,5 +388,121 @@ TEST(Qwen4ExpGPUAdaptiveLookupEvidence, FullRAMSourceRequiresExactModeAndZeroWin
     }
     for(auto& record:records)if(record.name=="window_misses")record.value=1;
     EXPECT_THROW(requireQwen4ExpGPUAdaptiveLookupEvidence(records,DeviceId::cuda(0),90,8192,0,0,AdaptiveImmutableRowBacking::RAM),std::invalid_argument);
+}
+}
+
+namespace llaminar2::test::parity::qwen4exp {
+/** @test Shared query readers have result/ACK roles, not a duplicate source/cache publisher. */
+TEST(Qwen4ExpGPUAdaptiveLookupEvidence, SharedCoordinatorRetainsSoleSourceAndExactReaderRoles) {
+    const auto resource=[](DeviceId device){return PhysicalMemoryResource{0,device,1ull<<34,1ull<<34};};
+    const std::array consumers{resource(DeviceId::cuda(0)),resource(DeviceId::cuda(1))};
+    std::vector<PhysicalMemoryResource> devices(consumers.begin(),consumers.end());
+    ImmutableRowTablePolicy policy{.storage=ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD};
+    policy.gpu_adaptive.placement.mode=AdaptiveGPUCachePlacementMode::DeclaredRankLocal;
+    policy.gpu_adaptive.placement.coordinator=AdaptiveGPUCacheParticipant{0,DeviceType::CUDA,0};
+    for(int ordinal=0;ordinal<4;++ordinal){
+        devices.push_back(resource(DeviceId::rocm(ordinal)));
+        policy.gpu_adaptive.placement.owners.push_back({{0,DeviceType::ROCm,ordinal},0,0});
+    }
+    const std::array edges{ImmutableRowTableReaderPeerAccess{{0,DeviceId::cuda(0)},{0,DeviceId::cuda(1)},PeerAccessCoverage::None}};
+    const auto input=ImmutableRowTablePlacementInput::forConsumers(
+        ImmutableRowTableExtent::fromNative(GGUFTensorType::IQ4_NL,128,90),resource(DeviceId::cpu()),consumers)
+        .withGPUCacheResources(policy,devices).withReaderPeerAccess(edges);
+    const std::vector<size_t> slots(4,0);
+    const auto layout=input.gpuAdaptiveLayout(policy,slots,0,8192);
+    const ImmutableRowTableSource source{.rows=128,.row_elements=160,.format=GGUFTensorType::IQ4_NL};
+    EXPECT_EQ(qwen4ExpAdaptiveExecutionRole(layout,policy.gpu_adaptive,{0,DeviceId::cuda(0)}),Qwen4ExpAdaptiveExecutionRole::SourceBoundary);
+    EXPECT_EQ(qwen4ExpAdaptiveExecutionRole(layout,policy.gpu_adaptive,{0,DeviceId::cuda(1)}),Qwen4ExpAdaptiveExecutionRole::QueryReader);
+    EXPECT_THROW(qwen4ExpAdaptiveExecutionRole(layout,policy.gpu_adaptive,{1,DeviceId::cuda(1)}),std::invalid_argument);
+    auto missing=policy.gpu_adaptive;missing.placement.coordinator.reset();
+    EXPECT_THROW(qwen4ExpAdaptiveExecutionRole(layout,missing,{0,DeviceId::cuda(0)}),std::invalid_argument);
+    const auto check=[&](const auto& records){return requireQwen4ExpGPUAdaptiveCohortEvidence(records,layout,source,policy.gpu_adaptive);};
+    const auto records=example(DeviceId::cuda(0),true);
+    const auto actual=check(records);ASSERT_EQ(actual.size(),1u);EXPECT_EQ(actual.front().device.completed_live_ids,48u);
+    auto zero_reader=records;
+    for(const auto& original:records)if(original.tags.at("storage")=="vram"){
+        auto record=original;record.device=DeviceId::cuda(1).toString();record.value=0;zero_reader.push_back(std::move(record));
+    }
+    EXPECT_NO_THROW(check(zero_reader));
+    auto forged=zero_reader;forged.back().value=1;EXPECT_THROW(check(forged),std::invalid_argument);
+    auto partial=zero_reader;partial.pop_back();EXPECT_THROW(check(partial),std::invalid_argument);
+    auto wrong_count=zero_reader;wrong_count.back().count=2;EXPECT_THROW(check(wrong_count),std::invalid_argument);
+    auto wrong_request=zero_reader;for(auto& record:wrong_request)if(record.device==DeviceId::cuda(1).toString())record.tags["request"]="1";
+    EXPECT_THROW(check(wrong_request),std::invalid_argument);
+    auto duplicate_source=records;
+    for(const auto& original:records)if(original.tags.at("storage")!="vram"){
+        auto record=original;record.device=DeviceId::cuda(1).toString();duplicate_source.push_back(std::move(record));
+    }
+    EXPECT_THROW(check(duplicate_source),std::invalid_argument);
+    auto foreign=zero_reader;foreign.back().device=DeviceId::cuda(2).toString();EXPECT_THROW(check(foreign),std::invalid_argument);
+    auto no_coordinator=zero_reader;std::erase_if(no_coordinator,[](const auto& record){return record.device==DeviceId::cuda(0).toString();});
+    EXPECT_THROW(check(no_coordinator),std::invalid_argument);
+    auto ram_policy=policy;ram_policy.gpu_adaptive.source_backing=AdaptiveImmutableRowBacking::RAM;
+    const auto ram_input=ImmutableRowTablePlacementInput::forConsumers(
+        ImmutableRowTableExtent::fromNative(GGUFTensorType::IQ4_NL,128,90),resource(DeviceId::cpu()),consumers)
+        .withGPUCacheResources(ram_policy,devices).withReaderPeerAccess(edges);
+    const auto ram_layout=ram_input.gpuAdaptiveLayout(ram_policy,slots,0,8192);
+    auto ram_records=records;
+    for(auto& record:ram_records){
+        if(record.tags.at("storage")!="vram")record.tags["storage"]=std::string(hostImmutableRowModeName(HostImmutableRowMode::AdaptiveFullRAM));
+        if(record.name=="window_hits" || record.name=="window_misses" || record.name=="window_evictions")record.value=0;
+    }
+    EXPECT_NO_THROW(requireQwen4ExpGPUAdaptiveCohortEvidence(ram_records,ram_layout,source,ram_policy.gpu_adaptive));
+    ram_records.back().tags["storage"]=std::string(hostImmutableRowModeName(HostImmutableRowMode::AdaptiveRAMSSD));
+    EXPECT_THROW(requireQwen4ExpGPUAdaptiveCohortEvidence(ram_records,ram_layout,source,ram_policy.gpu_adaptive),std::invalid_argument);
+}
+
+/** @test Actual embedded expert/inline-reader owners never count as independent native enqueues. */
+TEST(Qwen4ExpGPUAdaptiveLookupEvidence, NativeSubmissionsExcludeActualEmbeddedOwners) {
+    const PhysicalMemoryAllocatorIdentity coordinator{0,DeviceId::cuda(0)};
+    std::vector<Qwen4ExpAdaptiveOwnerExecution> owners{{coordinator,true},{{0,DeviceId::cuda(1)},true}};
+    for(int ordinal=0;ordinal<4;++ordinal)owners.push_back({{0,DeviceId::rocm(ordinal)},true});
+    std::vector<PerfStatRecord> records;
+    for(const auto name:{"retained_source_native_invocations","retained_remote_native_enqueues"})
+        records.push_back({.kind=PerfStatRecord::Kind::Counter,.domain="ngram_lookup",.name=name,
+            .phase="hosted_transaction",.device=coordinator.device.toString(),.tags={{"policy","retained_hosted"}},
+            .count=3,.value=name==std::string_view("retained_source_native_invocations")?3.:0.});
+    EXPECT_NO_THROW(requireQwen4ExpAdaptiveNativeSubmissions(records,coordinator,owners));
+    auto forged=records;forged.back().value=15;EXPECT_THROW(requireQwen4ExpAdaptiveNativeSubmissions(forged,coordinator,owners),std::invalid_argument);
+    auto missing=records;missing.erase(missing.begin());EXPECT_THROW(requireQwen4ExpAdaptiveNativeSubmissions(missing,coordinator,owners),std::invalid_argument);
+    auto wrong_count=records;wrong_count.back().count=2;EXPECT_THROW(requireQwen4ExpAdaptiveNativeSubmissions(wrong_count,coordinator,owners),std::invalid_argument);
+    auto foreign=records;foreign.front().device=DeviceId::cuda(1).toString();EXPECT_THROW(requireQwen4ExpAdaptiveNativeSubmissions(foreign,coordinator,owners),std::invalid_argument);
+    owners.back().embedded=false;records.back().value=3;
+    EXPECT_NO_THROW(requireQwen4ExpAdaptiveNativeSubmissions(records,coordinator,owners));
+}
+}
+
+namespace llaminar2::test::parity::qwen4exp {
+/** @test Cold attachment or a foreign/fractional route cannot substitute for every follower's completed useful work. */
+TEST(Qwen4ExpGPUAdaptiveLookupEvidence, EveryEmbeddedExpertRequiresOriginalCompletedUsefulWork) {
+    const auto definition=qwen4ExpHardwareTargetDefinition(Qwen4ExpHardwareTarget::CUDA2ROCm4,Qwen4ExpHardwareNgramOwners::Follower);
+    const auto& plan=*definition.topology.expert_overlay_plan;
+    const auto participants=MoEExpertOwnerMap::declaredParticipants(plan,{.reject_tensor_sharded_domains=false});
+    std::vector<PhysicalMemoryAllocatorIdentity> owners;
+    std::vector<PerfStatRecord> records;
+    for(const auto& participant:participants)if(participant.device.is_rocm()){
+        owners.push_back({participant.world_rank,participant.device});
+        records.push_back({.kind=PerfStatRecord::Kind::Counter,.domain="forward_graph",.name="moe_overlay_local_expert_active_routes",
+            .phase="moe_overlay",.device=participant.device.toString(),.tags={{"completion","device_owned_epoch_complete"},
+            {"identity_source","device_owned_activation_epoch"},{"device_kind","ROCm"},{"input_rows","1"},{"output_rows","1"},
+            {"participant",std::to_string(participant.participant_id)},{"tier",std::to_string(participant.tier_idx)},
+            {"service_source","prefill"}},.count=1,.value=1});
+        records.push_back({.kind=PerfStatRecord::Kind::Counter,.domain="moe_overlay",.name="device_epoch_gpu_rows",
+            .phase="gn_local_expert",.device=participant.device.toString(),.tags={{"completion","device_owned_epoch_complete"},
+            {"domain_kind","GPU"},{"participant",std::to_string(participant.participant_id)},
+            {"tier",std::to_string(participant.tier_idx)},{"transport","local"}},.count=1,.value=1});
+    }
+    ASSERT_EQ(owners.size(),4u);
+    const auto check=[&](const auto& rows){requireQwen4ExpEmbeddedExpertWork(rows,plan,owners);};
+    EXPECT_NO_THROW(check(records));
+    auto missing=records;missing.pop_back();EXPECT_THROW(check(missing),std::invalid_argument);
+    auto cold=records;cold.front().tags["completion"]="attached_only";EXPECT_THROW(check(cold),std::invalid_argument);
+    auto fractional=records;fractional.front().value=.5;EXPECT_THROW(check(fractional),std::invalid_argument);
+    auto foreign=records;foreign.front().device=DeviceId::cuda(0).toString();EXPECT_THROW(check(foreign),std::invalid_argument);
+    auto wrong_tier=records;wrong_tier.front().tags["tier"]="99";EXPECT_THROW(check(wrong_tier),std::invalid_argument);
+    auto empty=records;empty.front().value=0;EXPECT_THROW(check(empty),std::invalid_argument);
+    auto no_rows=records;no_rows.front().tags["input_rows"]="0";EXPECT_THROW(check(no_rows),std::invalid_argument);
+    auto foreign_owners=owners;foreign_owners.front().world_rank=1;
+    EXPECT_THROW(requireQwen4ExpEmbeddedExpertWork(records,plan,foreign_owners),std::invalid_argument);
 }
 }

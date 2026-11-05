@@ -26,13 +26,13 @@ public:
     PooledPinWireSpan source(PooledReadWireRole role)const;
     PooledPinWireSpan destination(PooledReadWireRole role)const;
     /** @return Original fixed/directed/counted endpoint; C0 requests/rows have no endpoint. */
-    const CapturedTransferBinding& binding(PooledReadWireRole role,CapturedTransferEndpoint side)const;
+    const PooledImmutableTransferBinding& binding(PooledReadWireRole role,CapturedTransferEndpoint side)const;
     /** @return Original acquired Invocation48, Grant64/count and terminal source outcome operands. */
     PooledNativeOperandSpans ownerInputs()const;
     /** @return Complete frozen original pointer/root/count/descriptor/channel identity, excluding live values. */
     std::uint64_t captureIdentity()const;
 private:
-    using Pair=std::pair<CapturedTransferBinding,CapturedTransferBinding>;
+    using Pair=std::pair<PooledImmutableTransferBinding,PooledImmutableTransferBinding>;
     /** @brief Publish an immutable holder only through the checked cold binder. */
     PooledImmutableCapturedReadWave(std::shared_ptr<const PooledImmutableCapturedPublicationWave> publication,
         std::shared_ptr<PhysicalMemoryAuthority> memory):publication_(std::move(publication)),memory_(std::move(memory)){}
@@ -75,4 +75,8 @@ void requirePooledReadCompletion(const ComputeGraph& graph,const PooledImmutable
 /** @brief Authenticate exact original owner receipt/row send chain before any physical release successor. */
 void requirePooledReadOwnerCompletion(const ComputeGraph& graph,
     const std::shared_ptr<const qwen4exp::PooledImmutableCapturedReadWave>& original,const std::string& rowsSent);
+/** @return Actual original owner's final row-send/receipt stage in this cold recipient graph; missing/duplicate holders reject. */
+std::string findPooledReadOwnerCompletion(const ComputeGraph& graph,
+    const std::shared_ptr<const qwen4exp::PooledImmutableCapturedReadWave>& original);
+
 }

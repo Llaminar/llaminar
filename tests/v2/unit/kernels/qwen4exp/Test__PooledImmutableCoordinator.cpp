@@ -758,3 +758,82 @@ TEST(PooledImmutableCoordinator, ReplicatedReadersGeometryBOMReplay)
     }
 }
 } // namespace llaminar2::test
+
+namespace llaminar2::test {
+/** @brief Fixed native extent depends on original launch/failure authority, never a stale mapped byte publication. */
+TEST(PooledImmutableCoordinator, NativeFixedHeaderPreservesOriginalFailureReplay)
+{
+    namespace rr = qwen4exp::replicated_reader;
+    std::uint32_t abort = 0;
+    int communicator = 0;
+    const ncclLlaminarCompletionAuthority original{&abort, &communicator};
+    EXPECT_EQ(rr::nativeFixedHeaderBytes(original, 0, 0), sizeof(rr::Header));
+    EXPECT_EQ(rr::nativeFixedHeaderBytes(original, 1, 0), 0u);
+    EXPECT_EQ(rr::nativeFixedHeaderBytes(original, 0, 7), 0u);
+    EXPECT_EQ(rr::nativeFixedHeaderBytes({nullptr, &communicator}, 0, 0), 0u);
+    EXPECT_EQ(rr::nativeFixedHeaderBytes({&abort, nullptr}, 0, 0), 0u);
+    EXPECT_EQ(rr::nativeFixedHeaderBytes({}, 0, 0), 0u);
+}
+
+/** @brief Decoded native receipt law rejects stale/partial/empty replay even with zero abort/error flags.
+ * These recorded structs test the actual production matching/reader arithmetic;
+ * they do not manufacture a native-ready context or prove a GPU launch completed.
+ */
+TEST(PooledImmutableCoordinator, NativeReaderFreshReceiptAndCurrentACKReplay)
+{
+    namespace rr = qwen4exp::replicated_reader;
+    namespace state = qwen4exp::adaptive_lookup::pooled;
+    constexpr rr::Geometry geometry{1, 2, 256, 64};
+    std::uint32_t abort = 0;
+    int communicator = 0;
+    const ncclLlaminarCompletionAuthority original{&abort, &communicator};
+    constexpr std::uint64_t message = 99;
+    int error = 0;
+    state::LookupFrame frame{};
+    frame.interval = {11, 7, 1};
+    frame.phase = state::LookupPhase::Ready;
+    frame.status = qwen4exp::adaptive_lookup::Status::Success;
+    for (const auto count : {256u, 16u, 0u, 64u}) {
+        frame.original_ids = count;
+        rr::Header header{}, reply{};
+        ASSERT_TRUE(rr::prepare(frame, geometry, 1, &error, header));
+        const auto fixedBytes = rr::nativeFixedHeaderBytes(original, 0, error);
+        ASSERT_TRUE(rr::accept(header, fixedBytes, geometry, 1, frame.interval.table, count, &error, reply));
+        const auto bytes = rr::outputBytes(geometry, count);
+        ncclLlaminarByteCompletion receipt{frame.interval.table, frame.interval.admission,
+            frame.interval.sequence, bytes, original.abortFlag, original.deviceCommunicator,
+            message, ncclLlaminarCompletionPhase::Completed, 0};
+        const auto matches = [&](const ncclLlaminarByteCompletion& actual, std::uint64_t expectedBytes) {
+            return ncclLlaminarCompletionMatches(actual, reply.interval.table, reply.interval.admission,
+                reply.interval.sequence, expectedBytes, message, original, 0, error);
+        };
+        ASSERT_TRUE(matches(receipt, bytes));
+        auto stale = receipt;
+        ++stale.sequence;
+        EXPECT_FALSE(matches(stale, bytes));
+        stale = receipt;
+        stale.phase = ncclLlaminarCompletionPhase::Pending;
+        EXPECT_FALSE(matches(stale, bytes));
+        stale = receipt;
+        stale.phase = ncclLlaminarCompletionPhase::Aborted;
+        EXPECT_FALSE(matches(stale, bytes));
+        stale = receipt;
+        ++stale.bytes;
+        EXPECT_FALSE(matches(stale, bytes));
+        auto rejected = reply;
+        EXPECT_FALSE(rr::acknowledge(rejected, bytes, geometry, &error,
+            matches(stale, bytes) ? CapturedTransferStatus::Ready : CapturedTransferStatus::InvalidPhase));
+        EXPECT_FALSE(rr::confirm(rejected, fixedBytes, frame, geometry, 1, &error));
+        ASSERT_TRUE(rr::acknowledge(reply, bytes, geometry, &error, CapturedTransferStatus::Ready));
+        ASSERT_TRUE(rr::confirm(reply, fixedBytes, frame, geometry, 1, &error));
+        ++frame.interval.sequence;
+        EXPECT_FALSE(rr::confirm(reply, fixedBytes, frame, geometry, 1, &error));
+        // A stale Header can pass shape acceptance; a fresh current receipt
+        // cannot match its old interval, so it cannot produce a successful ACK.
+        ASSERT_TRUE(rr::accept(header, fixedBytes, geometry, 1, frame.interval.table, count, &error, reply));
+        ++receipt.sequence;
+        EXPECT_FALSE(matches(receipt, bytes));
+    }
+}
+
+} // namespace llaminar2::test

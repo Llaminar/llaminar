@@ -164,6 +164,7 @@ public:
      * @param gpu_domain Explicit shared-directory or independent consumer-local adaptive policy.
      * @param peer_access Original inventory classification of coordinator and same-vendor storage owners; None selects mapped payload and Complete selects producer-owned peer payload.
      * @param reader_peer_access Original exact coordinator-to-reader peer classifications, separately from storage owners.
+     * @param declared_transport_coordinator Exact authored shared transport source, retained at C0 without creating a directory.
      * @return Checked immutable metadata; PMA remains sole admission/materialization authority.
      * @throws std::invalid_argument For invalid identities, coverage, modes, capacities or policies.
      * @throws std::overflow_error For unrepresentable source, slot or record arithmetic.
@@ -184,7 +185,8 @@ public:
         std::uint64_t maximum_inflight_rows = 0,
         ImmutableRowTableAdaptiveGPUDomain gpu_domain = ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator,
         std::optional<PeerAccessCoverage> peer_access = std::nullopt,
-        std::vector<ImmutableRowTableReaderPeerAccess> reader_peer_access = {});
+        std::vector<ImmutableRowTableReaderPeerAccess> reader_peer_access = {},
+        std::optional<PhysicalMemoryAllocatorIdentity> declared_transport_coordinator = std::nullopt);
     /**
      * @brief Project the EXISTING admitted whole-tier modes through the same invariant implementation.
      * @param storage Existing concrete mode and original mmap geometry.

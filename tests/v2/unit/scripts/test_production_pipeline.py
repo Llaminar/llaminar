@@ -1593,7 +1593,8 @@ class RoutineGenerationPolicyTests(unittest.TestCase):
             with self.subTest(role=role), self.assertRaisesRegex(ValueError, "unknown inventory role"):
                 generation_corpus.InventoryScope.ALL.accepts({**record, "inventory_role": role})
         for scope in generation_corpus.InventoryScope:
-            self.assertFalse(scope.accepts({**record, "inventory_role": "numerical_diagnostic"}))
+            self.assertEqual(scope.accepts({**record, "inventory_role": "numerical_diagnostic"}),
+                             scope == generation_corpus.InventoryScope.LOCAL_DIAGNOSTIC)
         with self.assertRaisesRegex(ValueError, "runtime certification eligibility"):
             generation_corpus.InventoryScope.ALL.accepts({**record, "inventory_role": "numerical_diagnostic", "e2e": {}})
         self.assertTrue(generation_corpus.InventoryScope.ALL.accepts(record))
@@ -4600,8 +4601,18 @@ class InfrastructureTests(unittest.TestCase):
         self.assertIn('-G Ninja', owner)
         self.assertIn('-DCMAKE_MAKE_PROGRAM:FILEPATH=${CMAKE_MAKE_PROGRAM}', owner)
         successful_build = owner.index('if(NOT RCCL_BUILD_RESULT EQUAL 0)')
-        authenticated_receipt = owner.index('file(WRITE "${RCCL_VERSION_FILE}"')
-        self.assertLess(successful_build, authenticated_receipt)
+        pending_receipt = owner.index('file(WRITE "${RCCL_VERSION_FILE}.pending"')
+        resource_compile = owner.index('"${RCCL_LTO_ARTIFACT_SCRIPT}" compile')
+        resource_failure = owner.index('if(NOT RCCL_LTO_AUDIT_RESULT EQUAL 0)')
+        authenticated_receipt = owner.index(
+            'file(RENAME "${RCCL_VERSION_FILE}.pending" "${RCCL_VERSION_FILE}")')
+        self.assertLess(successful_build, pending_receipt)
+        self.assertLess(pending_receipt, resource_compile)
+        self.assertLess(resource_compile, resource_failure)
+        self.assertLess(resource_failure, authenticated_receipt)
+        self.assertIn('message(FATAL_ERROR "RCCL final physical resource evidence failed:',
+                      owner[resource_failure:authenticated_receipt])
+        self.assertNotIn('file(WRITE "${RCCL_VERSION_FILE}"', owner)
 
     def test_hip_runtime_repair_is_shared_by_builder_and_shipping_image(self):
         """A green builder cannot ship the uncorrected distribution HIP DSO.

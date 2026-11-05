@@ -7,6 +7,7 @@
  * No binding materializes storage, transports to self or duplicates PMA claims.
  */
 #include "PooledImmutableParticipantLocalGraph.h"
+#include "execution/compute_stages/stages/qwen4exp/PooledImmutableSourcePhaseStage.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include <stdexcept>
 #include <type_traits>
@@ -151,6 +152,14 @@ void requirePooledOriginalDependencies(const ComputeGraph& graph,const std::stri
     const auto* node=graph.getNode(consumer);
     if(!node)throw std::invalid_argument("Pooled phase dependency authentication lost its actual consumer");
     auto actual=node->dependencies;
+    if(const auto* source=dynamic_cast<const PooledImmutableSourcePhaseStage*>(node->stage.get())){
+        for(const auto& trunk:source->currentDemandTrunk()){
+            if(std::count(actual.begin(),actual.end(),trunk)!=1 || !graph.getNode(trunk) ||
+               std::find(expected.begin(),expected.end(),trunk)!=expected.end())
+                throw std::invalid_argument("Consumed source demand lost or aliased its original trunk join");
+            actual.erase(std::find(actual.begin(),actual.end(),trunk));
+        }
+    }
     std::sort(actual.begin(),actual.end());std::sort(expected.begin(),expected.end());
     expected.erase(std::unique(expected.begin(),expected.end()),expected.end());
     if(actual!=expected)throw std::invalid_argument("Pooled phase has missing/foreign/out-of-order original predecessors");

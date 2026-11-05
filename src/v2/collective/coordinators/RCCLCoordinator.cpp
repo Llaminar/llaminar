@@ -1750,6 +1750,117 @@ namespace llaminar2
 #endif
     }
 
+    /** @copydoc ICollectiveBackend::signalNativeCompletionAbort */
+    bool RCCLCoordinator::signalNativeCompletionAbort()
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load() || comms_.size() != static_cast<std::size_t>(num_devices_)) return false;
+        for (const auto comm : comms_)
+            if (!comm || rccl::signalNativeCompletionAbort(static_cast<rccl::ncclComm_t>(comm)) != rccl::ncclSuccess)
+                return false;
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    /** @copydoc ICollectiveBackend::nativeCompletionAuthority */
+    NativeCompletionAuthority RCCLCoordinator::nativeCompletionAuthority(int participant)
+    {
+#ifdef HAVE_RCCL
+        if (initialized_.load() && participant >= 0 && participant < num_devices_) {
+            ncclLlaminarCompletionAuthority original{};
+            if (rccl::nativeCompletionAuthority(static_cast<rccl::ncclComm_t>(comms_[participant]), &original) == rccl::ncclSuccess &&
+                original.abortFlag && original.deviceCommunicator)
+                return NativeCompletionAuthority(original);
+        }
+#else
+        (void)participant;
+#endif
+        return {};
+    }
+
+    /** @copydoc ICollectiveBackend::nativeTransferBytesOnStream */
+    NativeCollectiveEnqueueResult RCCLCoordinator::nativeTransferBytesOnStream(void* payload,const NativeCollectiveBytes& bytes, NativeByteEdge edge, int participant, void* stream)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load() || !payload ||
+            reinterpret_cast<std::uintptr_t>(stream) <= 2 ||
+            (!edge.contains(num_devices_,participant) || !bytes.participantValid(num_devices_, participant, edge.producer())))
+        {
+            return NativeCollectiveEnqueueResult::failure("RCCL addressed bytes changed its original participant/root/buffer/stream");
+        }
+        const auto selected = selectHipDevice(device_ordinals_[participant]);
+        if (selected != hipSuccess)
+        {
+            return NativeCollectiveEnqueueResult::failure(std::string("RCCL addressed bytes device selection failed: ") + hipGetErrorString(selected));
+        }
+        const auto producer_error = hipGetLastError();
+        if (producer_error != hipSuccess)
+        {
+            return NativeCollectiveEnqueueResult::failure(std::string("RCCL addressed bytes original producer failed: ") + hipGetErrorString(producer_error));
+        }
+        const auto result = rccl::nativeTransferBytes(payload, bytes, edge, participant,
+            static_cast<rccl::ncclComm_t>(comms_[participant]), stream);
+        if (result != rccl::ncclSuccess)
+        {
+            return NativeCollectiveEnqueueResult::failure(std::string("RCCL addressed bytes enqueue failed: ") +
+                rccl::ncclGetErrorString(result));
+        }
+        const auto enqueue_error = hipGetLastError();
+        if (enqueue_error != hipSuccess)
+        {
+            return NativeCollectiveEnqueueResult::failure(std::string("RCCL addressed bytes runtime enqueue failed: ") + hipGetErrorString(enqueue_error));
+        }
+        collective_performed_.store(true);
+        return NativeCollectiveEnqueueResult::success();
+#else
+        (void)payload; (void)bytes; (void)edge; (void)participant; (void)stream;
+        return NativeCollectiveEnqueueResult::failure("RCCL not available");
+#endif
+    }
+
+    /** @copydoc ICollectiveBackend::nativeBroadcastBytesOnStream */
+    NativeCollectiveEnqueueResult RCCLCoordinator::nativeBroadcastBytesOnStream(const void* send, void* receive,
+        const NativeCollectiveBytes& bytes, int root, int participant, void* stream)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load() || !send || !receive ||
+            reinterpret_cast<std::uintptr_t>(stream) <= 2 ||
+            !bytes.participantValid(num_devices_, participant, root))
+        {
+            return NativeCollectiveEnqueueResult::failure("RCCL byte Broadcast changed its original participant/root/buffer/stream");
+        }
+        const auto selected = selectHipDevice(device_ordinals_[participant]);
+        if (selected != hipSuccess)
+        {
+            return NativeCollectiveEnqueueResult::failure(std::string("RCCL byte Broadcast device selection failed: ") + hipGetErrorString(selected));
+        }
+        const auto producer_error = hipGetLastError();
+        if (producer_error != hipSuccess)
+        {
+            return NativeCollectiveEnqueueResult::failure(std::string("RCCL byte Broadcast original producer failed: ") + hipGetErrorString(producer_error));
+        }
+        const auto result = rccl::nativeBroadcastBytes(send, receive, bytes, root,
+            static_cast<rccl::ncclComm_t>(comms_[participant]), stream);
+        if (result != rccl::ncclSuccess)
+        {
+            return NativeCollectiveEnqueueResult::failure(std::string("RCCL byte Broadcast enqueue failed: ") +
+                rccl::ncclGetErrorString(result));
+        }
+        const auto enqueue_error = hipGetLastError();
+        if (enqueue_error != hipSuccess)
+        {
+            return NativeCollectiveEnqueueResult::failure(std::string("RCCL byte Broadcast runtime enqueue failed: ") + hipGetErrorString(enqueue_error));
+        }
+        collective_performed_.store(true);
+        return NativeCollectiveEnqueueResult::success();
+#else
+        (void)send; (void)receive; (void)bytes; (void)root; (void)participant; (void)stream;
+        return NativeCollectiveEnqueueResult::failure("RCCL not available");
+#endif
+    }
+
     bool RCCLCoordinator::nativeRowsOnStream(
         NativeRowCollective operation, const void *send, void *receive,
         const NativeCollectiveRows &rows, CollectiveDataType dtype,

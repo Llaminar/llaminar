@@ -8,6 +8,7 @@
  */
 #pragma once
 #include "execution/moe/ExpertTierWeightDeviceLayout.h"
+#include "kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -27,5 +28,31 @@ inline std::vector<uint8_t> expertTierWireOracle(const ExpertTierWeightDeviceLay
     if(!gatherExpertTierCPUWeightChunk(layout,root,first,count,result))
         throw std::invalid_argument("CPU reference root cannot form exact native transfer chunk");
     return result;
+}
+/**
+ * @brief Identify an expanded-INT8 root byte by original physical column coordinates.
+ * @param root Original independently packed CPU reference and its physical strides.
+ * @param offset Byte in the complete root allocation.
+ * @return Original N coordinate, including allocation-only padded columns.
+ * @throws std::invalid_argument If this is not the documented INT8/16-bit-plane layout.
+ *
+ * This oracle does not inspect transfer writes, gather/scatter output, or zero
+ * values. Eight four-byte weight groups precede 64-column 16-bit metadata
+ * planes; all use the SAME original N column. It deliberately rejects other
+ * encodings instead of inferring their live extent from implementation writes.
+ */
+inline size_t expertTierExpandedCPUByteRow(
+    const cpu::native_vnni::CPUNativeVNNIPackedWeights &root, size_t offset)
+{
+    constexpr size_t data_bytes = 64u * 32u;
+    const size_t stride = root.interleaved_block_stride;
+    if (!root.usesExpandedInt8() || root.N <= 0 || root.K <= 0 || root.K % 32 ||
+        stride != data_bytes + 256u + (root.is_asymmetric ? 128u : 0u) ||
+        root.blocks_per_row != root.K / 32 || offset >= root.native_interleaved.size())
+        throw std::invalid_argument("Expanded CPU byte oracle requires its original INT8 root");
+    const size_t unit = offset / stride, within = offset % stride;
+    const size_t column = within < data_bytes
+        ? (within % (64u * 4u)) / 4u : ((within - data_bytes) % 128u) / 2u;
+    return (unit / root.blocks_per_row) * 64u + column;
 }
 }

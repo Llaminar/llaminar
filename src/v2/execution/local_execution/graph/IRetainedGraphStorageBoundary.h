@@ -21,6 +21,7 @@
 namespace llaminar2
 {
 class RankOrchestrator;
+class DeviceGraphOrchestrator;
 namespace qwen4exp { class ImmutableLookupExecutionBoundary; }
 namespace test { struct RankRetainedStorageRetirementReplayAccess; }
 /**
@@ -100,5 +101,14 @@ public:
     virtual void awaitTerminal()=0;
     /** @brief Return this joined interval's immutable I/O evidence; reject a live/unobserved interval. */
     virtual RetainedStorageTerminalObservation terminalObservation() const=0;
+protected:
+    friend class DeviceGraphOrchestrator;
+    /** @brief Retire only this runner's exact graph borrow after producer/native-topology closure.
+     * @param original Same canonical health/error addresses bound by this runner.
+     * @throws std::logic_error For active intervals or a foreign/unbound original binding.
+     * Distributed sources retain their controller borrow until original participant retirement too.
+     */
+    virtual void retireGenerationControl(RetainedStorageGenerationControl original)=0;
+
 };
 } // namespace llaminar2

@@ -12,8 +12,9 @@
 #include "planning/PhysicalMemoryAuthority.h"
 #include "loaders/ImmutableLookupNativeOwnership.h"
 #include "tensors/TensorClasses.h"
+#include "collective/NativeCollectiveCompletion.h"
 #include <memory>
-namespace llaminar2 {class NativeOrderingEventGroup;namespace test {struct PooledImmutableFactoryReplayAccess;}}
+namespace llaminar2 {class Qwen4ExpReplicatedPLECohort;class NativeOrderingEventGroup;namespace test {struct PooledImmutableFactoryReplayAccess;}}
 namespace llaminar2 { class CapturedTransferBinding; class CapturedTransferReceiveCompletion; }
 namespace llaminar2::qwen4exp
 {
@@ -75,8 +76,19 @@ private:
         std::shared_ptr<PhysicalMemoryAuthority> memory,void* stream,std::unique_ptr<NativeOrderingEventGroup> group);
     friend class IPooledImmutableNativeKernels;
     friend class PooledImmutableCapturedPinEdge;
+    friend class PooledImmutableTransferBinding;
+    /** @brief Release only this exact cold/captured invocation after its original graphs have retired. */
+    void releaseInvocationChannel(const CapturedTransferBinding& original);
+    /** @brief Drop one original immutable native cohort borrow after actual parent retirement, never on request reset. */
+    void releaseNativeInvocation(const std::shared_ptr<const Qwen4ExpReplicatedPLECohort>& original, int participant);
+
     /** @brief Bind once to the original owner invocation receiver before any graph is recorded. */
     void bindInvocationChannel(const CapturedTransferBinding& original);
+    /** @brief Bind only an original continuation reader's native abort capability before any parent capture. */
+    void bindNativeInvocation(std::shared_ptr<const Qwen4ExpReplicatedPLECohort> cohort, int participant);
+    /** @return Original immutable native communicator/abort identity; absent on mapped/local owners. */
+    ncclLlaminarCompletionAuthority nativeInvocationAuthority() const;
+
     /** @brief Construct only around the one exact materialized claim owner. */
     PooledImmutableOwnerPreparedStorage(PooledImmutableOwnerNativePlan plan,std::shared_ptr<detail::PooledNativeRootStorage> roots)
         :plan_(std::move(plan)),roots_(std::move(roots)){}
@@ -84,6 +96,9 @@ private:
     std::shared_ptr<detail::PooledNativeRootStorage> roots_;
     /** Destroy the original allocation borrow before releasing its physical root/claim owner. */
     std::shared_ptr<const CapturedTransferBinding> original_invocation_;
+    std::shared_ptr<const Qwen4ExpReplicatedPLECohort> native_invocation_cohort_;
+    int native_invocation_participant_ = -1;
+    ncclLlaminarCompletionAuthority native_invocation_authority_{}; ///< Immutable original borrow remains valid through abort and physical retirement.
 };
 /** @brief One independent coordinator allocation set, including complete static P geometry. */
 class PooledImmutableCoordinatorPreparedStorage final

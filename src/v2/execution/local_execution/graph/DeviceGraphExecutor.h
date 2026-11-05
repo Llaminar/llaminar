@@ -2456,12 +2456,6 @@ namespace llaminar2
          *        becomes part of immutable graph-cache identity.
          * @return true on success
          */
-        /** @brief Bind the existing cache stream on the authenticated original worker during cold capture setup.
-         * @details Control-thread callers dispatch only this binding to the original worker;
-         * worker-thread callers run inline. Native stream identity/ownership never changes.
-         * @throws std::invalid_argument For missing/foreign workers or null/default cache streams.
-         * @throws std::logic_error If dispatched binding did not enter the original worker.
-         */
         /**
          * @brief Attach only the exact matched source definition to its actual sealed parent.
          * @param graph Actual receiver graph with its original declared source domain.
@@ -2472,6 +2466,18 @@ namespace llaminar2
          * @throws std::exception Before foreign/stale source, parent, stream or duplicate ownership.
          */
         bool attachRetainedParticipantStorageParent(ComputeGraph& graph,GraphSegmentCache& cache,DeviceId receiver,IGPUGraphCapture& parent);
+        /**
+         * @brief Authenticate the existing cache stream on its original worker.
+         * @details Early forward setup derives the immutable graph identity before
+         * cache variant selection. Ready caches validate their sealed borrow without
+         * rescanning the graph. Control-thread callers dispatch to the original
+         * worker; calls already on that worker run inline.
+         * @param graph Actual source graph carrying its original participant plan.
+         * @param cache Original cache retaining its exact preparation stream.
+         * @param worker Original source worker, never a same-device substitute.
+         * @throws std::invalid_argument For missing/foreign workers or default streams.
+         * @throws std::logic_error For changed provenance or failed worker dispatch.
+         */
         void bindRetainedParticipantPreparationStream(ComputeGraph&,GraphSegmentCache&,IWorkerGPUContext*);
         /** @brief Authenticate the exact native parent capture on its original worker during cold sealing.
          * @throws std::invalid_argument For foreign workers or incomplete/changed native capture streams.

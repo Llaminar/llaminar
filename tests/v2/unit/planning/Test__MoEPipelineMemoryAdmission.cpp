@@ -33,6 +33,7 @@
 #include "fixtures/backends/NativeOrderingEventGroupReplayAccess.h"
 #include "mocks/MockWorkerGPUContext.h"
 #include "backends/GPUDeviceProcessLifetime.h"
+#include <array>
 #include <map>
 #include <set>
 
@@ -479,6 +480,68 @@ TEST_P(MoEPipelinePreparedPlanTest, AllFormatsModesAndFreshRuntimeLifetimes)
                     EXPECT_EQ(memory->rankAttestationSummary(), before);
                     EXPECT_FALSE(model->concreteWeightManager()->preparedWeightStoreIfInitialized());
                 }
+    }
+}
+
+/** @test Actual retained context identity reaches every fresh CPU/CUDA/ROCm pipeline registry. */
+TEST(MoEPipelinePreparedSource, OriginalContextAuthenticatesEveryStageAndRejectsForeignRebinding)
+{
+    PlanningGGUFFixture file(true,true);
+    PlanningModelSource source(file.path());
+    auto model=metadataContext(file.path());
+    auto foreign=metadataContext(file.path()); // Same path/metadata is not the same owner.
+    const auto context=MPIContextFactory::self();
+    const std::array<std::array<DeviceType,2>,3> backends{{
+        {DeviceType::CPU,DeviceType::CUDA},{DeviceType::CUDA,DeviceType::ROCm},{DeviceType::ROCm,DeviceType::CPU}}};
+    for(const auto& pair:backends)for(const int depth:{0,1,3,-1}) {
+        SCOPED_TRACE(::testing::Message()<<int(pair[0])<<'/'<<int(pair[1])<<" depth="<<depth);
+        auto input=proposal(source,1,false);
+        input.config.moe_rebalance.mode=MoERebalanceRuntimeMode::Off;
+        auto observed=inventory(1);observed.ranks.front().cpu.numa_node=0;
+        observed.ranks.front().numa_nodes=1;observed.buildNodeAggregations();
+        input.membership=ExecutionRankMembership(observed,{0});
+        ASSERT_EQ(input.config.domain_definitions.size(),2u);
+        for(size_t stage=0;stage<pair.size();++stage) {
+            auto& domain=input.config.domain_definitions[stage];
+            const auto backend=pair[stage];
+            domain.devices={backend==DeviceType::CPU?GlobalDeviceAddress::cpu(0):
+                backend==DeviceType::CUDA?GlobalDeviceAddress::cuda(0):GlobalDeviceAddress::rocm(0)};
+            domain.backend=backend==DeviceType::CPU?CollectiveBackendType::UPI:
+                backend==DeviceType::CUDA?CollectiveBackendType::NCCL:CollectiveBackendType::RCCL;
+        }
+        input.config.mtp_activation_policy=depth==0?MTPActivationPolicy::Disabled:MTPActivationPolicy::Automatic;
+        input.config.mtp.depth_policy.mode=depth<0?MTPDepthPolicyMode::Dynamic:MTPDepthPolicyMode::Fixed;
+        input.config.mtp.draft_tokens=depth>0?depth:3;
+        input.config.mtp.graph_capacity_draft_tokens=depth==0?0:15;
+        const auto admitted=AdmittedOrchestrationCandidate::admit(input,source,policy());
+        const auto prepared=MoEPipelinePreparedPlan::create(admitted.pipelineMemory(),model);
+        auto memory=std::make_shared<PhysicalMemoryAuthority>(prepared->admission()->physicalAdmission(),0);
+        const auto before=memory->rankAttestationSummary();
+        ExecutionPlanBuilder builder;
+        const auto topology=ResolvedRankOrchestration::resolve(input.config,source.metadata(),observed,builder,0);
+        for(int lifetime=0;lifetime<2;++lifetime) {
+            const auto bindings=prepared->createRuntimeBindings(model->concreteLoader(),memory,context,topology);
+            ASSERT_EQ(bindings.size(),2u);
+            for(const auto& binding:bindings) {
+                const auto& registry=binding->owners().residency;
+                ASSERT_NE(registry,nullptr);
+                EXPECT_EQ(registry->originalModel(),ModelContextId{reinterpret_cast<uint64_t>(model.get())});
+                const auto preparation=registry->projectionPreparation();std::string error;
+                EXPECT_FALSE(registry->bindOriginalPreparedContext(foreign,preparation,&error));
+                EXPECT_EQ(error,"Prepared source requires its actual original ModelContext identity");
+                EXPECT_FALSE(registry->acquireOriginalPreparedSource());
+                ASSERT_TRUE(registry->bindOriginalPreparedContext(model,preparation,&error))<<error;
+                auto use=registry->acquireOriginalPreparedSource(&error);ASSERT_TRUE(use)<<error;
+                EXPECT_EQ(&use->registry(),&model->concreteWeightManager()->expertGemmRegistry());
+                EXPECT_EQ(use->preparation(),preparation);
+                auto alias=std::shared_ptr<ModelContext>(model.get(),[](ModelContext*){});
+                EXPECT_FALSE(registry->bindOriginalPreparedContext(alias,preparation,&error));
+                EXPECT_EQ(error,"Prepared source cannot replace its original shared context/manager owner");
+                EXPECT_TRUE(registry->bindOriginalPreparedContext(model,preparation,&error))<<error;
+            }
+        }
+        EXPECT_EQ(memory->rankAttestationSummary(),before);
+        EXPECT_FALSE(model->concreteWeightManager()->preparedWeightStoreIfInitialized());
     }
 }
 

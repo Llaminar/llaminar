@@ -23,6 +23,7 @@
 #include "Qwen4ExpNgramAdmissionCases.h"
 #include "Qwen4ExpSourceAdmission.h"
 #include "Qwen4ExpSourceAdmissionCases.h"
+#include "Qwen4ExpSharedContinuationMTPSourceCases.h"
 #include "Qwen4ExpCPUJointParityCases.h"
 #include "Qwen4ExpSourceAdmissionCI.h"
 #include "Qwen4ExpFixedHeadParityCases.h"
@@ -731,6 +732,11 @@ INSTANTIATE_TEST_SUITE_P(Qwen4ExpHardwareProductionDefaultsSourceAdmission, Qwen
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpHardwareMatchedCacheEconomy, Qwen4ExpMainParityTest,
     ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpHardwareMatchedCacheEconomy", qwen4ExpHardwareMatchedCacheEconomyCases())),
     [](const ::testing::TestParamInfo<ModelParityCase>& info) { return info.param.testName(); });
+// Active MTP source materialization is independent of the unchanged Off economy baseline.
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpSharedContinuationMTPSourceAdmission, Qwen4ExpSourceAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpSharedContinuationMTPSourceAdmissionCases())),
+    [](const ::testing::TestParamInfo<Qwen4ExpSourceAdmissionCase>& info){return info.param.testName();});
+
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpHardwareMatchedCacheEconomySourceAdmission, Qwen4ExpSourceAdmissionTest,
     ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpHardwareMatchedCacheEconomyCases())),
     [](const ::testing::TestParamInfo<Qwen4ExpSourceAdmissionCase>& info) { return info.param.testName(); });
@@ -761,4 +767,47 @@ INSTANTIATE_TEST_SUITE_P(Qwen4ExpConsumerLocalTP4MovementRandomRetained15, Qwen4
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpConsumerLocalTP4MovementSourceAdmission, Qwen4ExpSourceAdmissionTest,
     ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpExpandSourceAdmissionMTP(
         qwen4ExpConsumerLocalTP4MovementSourceAdmissionSeeds()))),
+    [](const auto& info){return info.param.testName();});
+
+// Unexecuted Q6 candidates retain distinct setup, numerical and exact-MTP obligations.
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpExpertFollowerOwnerSourceAdmissionCandidate, Qwen4ExpCandidateSourceAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpExpandSourceAdmissionMTP(qwen4ExpExpertFollowerOwnerSourceAdmissionSeeds()))),
+    [](const ::testing::TestParamInfo<Qwen4ExpSourceAdmissionCase>& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpExpertFollowerOwnerStaticOrdinalCandidate, Qwen4ExpMainParityTest,
+    ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpExpertFollowerOwnerStaticOrdinalCandidate",qwen4ExpExpertFollowerOwnerExecutionCases(ModelParityExpertOverlayPolicy{}))),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpExpertFollowerOwnerStaticOrdinalCandidateExact, Qwen4ExpMTPExactReplayTest,
+    ::testing::ValuesIn(qwen4ExpExpertFollowerOwnerNativeExactCases(ModelParityExpertOverlayPolicy{})),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpExpertFollowerOwnerDynamicOrdinalCandidate, Qwen4ExpMainParityTest,
+    ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpExpertFollowerOwnerDynamicOrdinalCandidate",qwen4ExpExpertFollowerOwnerExecutionCases(ModelParityExpertOverlayPolicy{.owner_order=RoutedExpertOwnerOrder::Ordinal,.movement=ModelParityExpertMovement::Dynamic}))),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpExpertFollowerOwnerDynamicOrdinalCandidateExact, Qwen4ExpMTPExactReplayTest,
+    ::testing::ValuesIn(qwen4ExpExpertFollowerOwnerNativeExactCases(ModelParityExpertOverlayPolicy{.owner_order=RoutedExpertOwnerOrder::Ordinal,.movement=ModelParityExpertMovement::Dynamic})),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
+
+//40 source /40 numerical /30 active exact candidates; declarations are not qualification.
+class Qwen4ExpOwnerSubsetSourceAdmissionTest : public ::testing::Test, public Qwen4ExpSourceAdmissionParameter {};
+/** @test Real subset source admission must consume actual original cold recreation and retirement. */
+TEST_P(Qwen4ExpOwnerSubsetSourceAdmissionTest, CandidateSourceAdmission)
+{
+    ASSERT_NO_FATAL_FAILURE(admitQwen4ExpSource(modelParityCase(),Qwen4ExpSourceRecreationProof::Required));
+}
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpOwnerSubsetSourceAdmissionCandidate, Qwen4ExpOwnerSubsetSourceAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpExpandSourceAdmissionMTP(
+        qwen4ExpOwnerSubsetSourceAdmissionSeeds(),Qwen4ExpSourceMTPEnvelope::Retained3))),
+    [](const auto& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpOwnerSubsetStaticOrdinalCandidate, Qwen4ExpMainParityTest,
+    ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpOwnerSubsetStaticOrdinalCandidate",
+        qwen4ExpOwnerSubsetExecutionCases(ModelParityExpertOverlayPolicy{}))),
+    [](const auto& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpOwnerSubsetDynamicOrdinalCandidate, Qwen4ExpMainParityTest,
+    ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpOwnerSubsetDynamicOrdinalCandidate",
+        qwen4ExpOwnerSubsetExecutionCases({.owner_order=RoutedExpertOwnerOrder::Ordinal,.movement=ModelParityExpertMovement::Dynamic}))),
+    [](const auto& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpOwnerSubsetStaticOrdinalCandidateExact, Qwen4ExpMTPExactReplayTest,
+    ::testing::ValuesIn(qwen4ExpOwnerSubsetNativeExactCases(ModelParityExpertOverlayPolicy{})),
+    [](const auto& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpOwnerSubsetDynamicOrdinalCandidateExact, Qwen4ExpMTPExactReplayTest,
+    ::testing::ValuesIn(qwen4ExpOwnerSubsetNativeExactCases({.owner_order=RoutedExpertOwnerOrder::Ordinal,.movement=ModelParityExpertMovement::Dynamic})),
     [](const auto& info){return info.param.testName();});

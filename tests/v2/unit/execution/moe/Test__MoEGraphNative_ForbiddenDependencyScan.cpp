@@ -12054,9 +12054,21 @@ namespace llaminar2::test
                 "allocatePersistentTransferExecutionLanes("),
             1u)
             << "One physical pool per GPU must precede logical lane expansion";
+        // Piece/cycle command multiplicity does not multiply physical queues.
+        // Authenticate the actual allocator argument and its separate policy.
         EXPECT_NE(
-            materialize.find("parallelLaneCount(multiplicity)"),
+            materialize.find("physicalStreamCount(multiplicity)"),
             std::string::npos);
+        const auto physical_streams = braceBalancedDeclarationRegion(
+            materialize, "const auto physicalStreamCount =");
+        ASSERT_FALSE(physical_streams.empty());
+        EXPECT_NE(physical_streams.find("config.maximum_execution_streams"),std::string::npos);
+        EXPECT_NE(withoutWhitespace(physical_streams).find(
+            "multiplicity*config.maximum_execution_streams"),std::string::npos);
+        EXPECT_EQ(physical_streams.find("maximum_concurrent_cycles"),std::string::npos);
+        EXPECT_NE(materialize.find("parallelLaneCount(participant_multiplicity.at(device))"),
+            std::string::npos)
+            << "Command/progress capacity still owns the independent cycle budget";
         EXPECT_NE(
             materialize.find(".execution = executionLane("),
             std::string::npos);

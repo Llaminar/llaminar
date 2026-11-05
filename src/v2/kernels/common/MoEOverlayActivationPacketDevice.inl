@@ -543,10 +543,12 @@ namespace llaminar2::moe_activation_packet_device
     {
         if (!control || physical_rows <= 0)
             return false;
-        const auto channel = snapshotPeerPublished(&control->channel);
-        const auto identity = snapshotPeerPublished(&control->identity);
+        // The publication word owns visibility of every peer record below.
+        // Snapshotting identity before this acquire cannot borrow its ordering.
         const std::uint64_t admission_timeline =
             loadSystemAcquire64(&control->admission.ready_signal);
+        const auto channel = snapshotPeerPublished(&control->channel);
+        const auto identity = snapshotPeerPublished(&control->identity);
         const auto admission = snapshotPeerPublished(&control->admission);
         if (channel.magic != kMoEOverlayActivationMagic ||
             channel.abi_version != kMoEOverlayActivationABIVersion || channel.channel_nonce == 0u ||
@@ -1445,10 +1447,12 @@ namespace llaminar2::moe_activation_packet_device
                 moeOverlayActivationBufferVisit(launch.stage_ordinal));
         const auto &buffer = control->buffers[
             moeOverlayActivationBufferIndex(launch.stage_ordinal)];
-        const auto descriptor = snapshotPeerPublished(
-            &buffer.dispatch_descriptor);
         const std::uint64_t dispatch_timeline =
             loadSystemAcquire64(&buffer.dispatch_signal.value);
+        // Keep this helper's peer snapshot inside its own acquire edge even
+        // when its current fused caller already waited on the same signal.
+        const auto descriptor = snapshotPeerPublished(
+            &buffer.dispatch_descriptor);
         bool valid = dispatch_timeline == timeline &&
                      validDescriptor(
                          descriptor,
@@ -1653,10 +1657,12 @@ namespace llaminar2::moe_activation_packet_device
                     const auto &buffer = control->buffers[
                         moeOverlayActivationBufferIndex(
                             launch.stage_ordinal)];
-                    const auto descriptor = snapshotPeerPublished(
-                        &buffer.dispatch_descriptor);
                     block_dispatch_timeline = loadSystemAcquire64(
                         &buffer.dispatch_signal.value);
+                    // A prior stream/copy-engine wait does not replace the
+                    // compute-kernel acquire that precedes these peer reads.
+                    const auto descriptor = snapshotPeerPublished(
+                        &buffer.dispatch_descriptor);
                     block_live_rows = descriptor.live_rows;
                     block_live_entries = descriptor.live_entries;
                     block_header_ready = 1u;

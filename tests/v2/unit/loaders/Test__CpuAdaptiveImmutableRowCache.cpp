@@ -5,6 +5,8 @@
  * Small original-format files exercise the actual SSD service, same source
  * identity, actual physical authority and complete cache implementation. No
  * backend startup, GPU, model source, prepared weights or alternate ledger.
+ * Requester-specific subordinate geometry retains one original host source/PMA
+ * across ConsumerLocal populations; GPU populations here are metadata only.
  */
 #include "loaders/CpuAdaptiveImmutableRowCache.h"
 #include <gtest/gtest.h>
@@ -80,6 +82,108 @@ auto sourceWork(const ImmutableRowTableStats &s) {
         s.requests,s.rows,s.copied_bytes,s.window_hits,s.window_misses,s.window_evictions};
 }
 }
+/** @test One/many local consumers own one exact host source without a synthetic global coordinator. */
+TEST(CpuAdaptiveImmutableRowCache, ConsumerLocalSubordinateGeometryKeepsExactPMAAndRequesterAuthority) {
+    File f;
+    for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm})
+        for(const auto backing:{Storage::RAM,Storage::MemoryMapped})
+            for(const auto gpu_slots:{0u,2u}) {
+                std::vector<Storage> tiers{Storage::VRAM,Storage::RAM};
+                if(backing==Storage::MemoryMapped)tiers.push_back(backing);
+                const auto source_policy=backing==Storage::RAM?ImmutableRowTableStoragePolicy::forStorage(backing):
+                    ImmutableRowTableStoragePolicy::forStorage(backing,4096,2);
+                std::size_t source_bytes=0,previous_execution=0;
+                for(const std::size_t count:{1u,2u,4u,8u}) {
+                    SCOPED_TRACE("backend="+std::to_string(int(backend))+" backing="+
+                        std::to_string(int(backing))+" slots="+std::to_string(gpu_slots)+" consumers="+std::to_string(count));
+                    std::vector<Id> consumers;std::vector<ImmutableRowTableLayoutOwner> owners;
+                    for(size_t index=0;index<count;++index) {
+                        consumers.push_back({0,DeviceId(backend,int(index))});
+                        owners.push_back({{consumers.back(),Storage::VRAM},0,gpu_slots,{}});
+                    }
+                    owners.push_back({{Host,Storage::RAM},0,backing==Storage::RAM?0u:2u,{}});
+                    const auto declared=ImmutableRowTableLayoutGeometry::checked(
+                        ImmutableRowTableExtent::fromNative(f.source.format,f.source.rows,f.source.rowBytes()),
+                        ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,owners,consumers,{},
+                        {{Host,source_policy}},{},std::nullopt,8,
+                        ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal);
+                    EXPECT_FALSE(declared.gpuCoordinator());
+                    for(const auto consumer:consumers)
+                        EXPECT_EQ(declared.gpuCoordinatorFor(consumer),gpu_slots?std::optional(consumer):std::nullopt);
+                    const auto geometry=Geometry::forSubordinateGPUs(declared,Host);
+                    EXPECT_EQ(geometry.sourceStorage(),backing);
+                    if(count==1) {
+                        const auto singular=Geometry::forSubordinateGPU(declared,Host,consumers.front());
+                        EXPECT_EQ(singular.sourceBytes(),geometry.sourceBytes());
+                        EXPECT_EQ(singular.storageBytes(),geometry.storageBytes());
+                        EXPECT_EQ(singular.executionBytes(),geometry.executionBytes());
+                        if(gpu_slots) {
+                            const auto shared_good=ImmutableRowTableLayoutGeometry::checked(
+                                declared.extent(),ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,
+                                owners,consumers,{},{{Host,source_policy}},{},consumers.front(),8);
+                            EXPECT_NO_THROW((void)Geometry::forSubordinateGPU(shared_good,Host,consumers.front()));
+                            auto missing=owners;missing.erase(missing.begin());
+                            EXPECT_THROW((void)ImmutableRowTableLayoutGeometry::checked(
+                                declared.extent(),ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,
+                                missing,consumers,{},{{Host,source_policy}},{},std::nullopt,8,
+                                ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal),std::invalid_argument);
+                            const Id other{0,DeviceId(backend,1)};
+                            auto shared_owners=owners;
+                            shared_owners.push_back({{other,Storage::VRAM},0,gpu_slots,{}});
+                            const auto shared=ImmutableRowTableLayoutGeometry::checked(
+                                declared.extent(),ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,
+                                shared_owners,consumers,{},{{Host,source_policy}},{},other,8);
+                            EXPECT_EQ(shared.gpuCoordinatorFor(consumers.front()),other);
+                            EXPECT_THROW((void)Geometry::forSubordinateGPU(shared,Host,consumers.front()),std::invalid_argument);
+                            EXPECT_THROW((void)Geometry::forSubordinateGPU(shared,Host,other),std::invalid_argument);
+                            auto foreign_owners=owners;
+                            foreign_owners.push_back({{{1,DeviceId(backend,1)},Storage::VRAM},0,gpu_slots,{}});
+                            const auto foreign=ImmutableRowTableLayoutGeometry::checked(
+                                declared.extent(),ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,
+                                foreign_owners,consumers,{},{{Host,source_policy}},{},consumers.front(),8);
+                            EXPECT_THROW((void)Geometry::forSubordinateGPU(foreign,Host,consumers.front()),std::invalid_argument);
+                        }
+                    }
+                    if(!source_bytes)source_bytes=geometry.sourceBytes();
+                    EXPECT_EQ(geometry.sourceBytes(),source_bytes);
+                    EXPECT_GE(geometry.executionBytes(),previous_execution);previous_execution=geometry.executionBytes();
+                    const auto bom=geometry.bom(host());const auto* line=bom.find(Host);ASSERT_NE(line,nullptr);
+                    EXPECT_EQ(line->bytes(PhysicalMemoryOwner::ImmutableTableStorage),geometry.sourceBytes()+geometry.storageBytes());
+                    EXPECT_EQ(line->bytes(PhysicalMemoryOwner::ImmutableLookupStaging),geometry.executionBytes());
+                    auto memory=authority(geometry);auto cache=Cache::create(f.source,geometry,memory);
+                    EXPECT_EQ(claimed(memory,PhysicalMemoryOwner::ImmutableTableStorage),line->bytes(PhysicalMemoryOwner::ImmutableTableStorage));
+                    EXPECT_EQ(claimed(memory,PhysicalMemoryOwner::ImmutableLookupStaging),geometry.executionBytes());
+                    EXPECT_EQ(bom.resources().size(),1u);
+                    EXPECT_EQ(bom.find({0,DeviceId(backend,0)}),nullptr);
+                    cache->authenticateSource();
+                    const auto source_observation=cache->sourceStats();
+                    EXPECT_EQ(source_observation.storage,backing);
+                    EXPECT_EQ(source_observation.physical_budget_bytes,geometry.sourceBytes());
+                    if(backing==Storage::RAM){
+                        EXPECT_EQ(source_observation.mapped_virtual_bytes,0u);
+                        EXPECT_EQ(geometry.storageBytes(),0u);
+                        auto redundant=owners;
+                        for(auto& owner:redundant)if(owner.key.tier==Storage::RAM)owner.cache_rows=2;
+                        EXPECT_THROW((void)ImmutableRowTableLayoutGeometry::checked(
+                            declared.extent(),ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,
+                            redundant,consumers,{},{{Host,source_policy}},{},std::nullopt,8,
+                            ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal),std::invalid_argument);
+                    }
+                    const std::array<std::int64_t,1> requested{1};
+                    std::vector<std::byte> response(f.source.rowBytes());
+                    EXPECT_THROW((void)cache->gather(requested,response),std::invalid_argument);
+                    EXPECT_THROW((void)geometry.bom({1,DeviceId::cpu(),1ull<<34,1ull<<34}),std::invalid_argument);
+                    if(count>1)EXPECT_THROW((void)Geometry::forSubordinateGPU(declared,Host,consumers.front()),std::invalid_argument);
+                    EXPECT_THROW((void)Geometry::forSubordinateGPUs(declared,{1,DeviceId::cpu()}),std::invalid_argument);
+                    EXPECT_THROW((void)Geometry::forSubordinateGPU(declared,Host,{0,DeviceId(backend,int(count))}),std::invalid_argument);
+                    EXPECT_THROW((void)Geometry::forSubordinateGPU(declared,Host,{1,consumers.front().device}),std::invalid_argument);
+                    cache.reset();
+                    EXPECT_EQ(claimed(memory,PhysicalMemoryOwner::ImmutableTableStorage),0u);
+                    EXPECT_EQ(claimed(memory,PhysicalMemoryOwner::ImmutableLookupStaging),0u);
+                }
+            }
+}
+
 TEST(CpuAdaptiveImmutableRowCache, ReadyReuseAuthenticationDoesNotGatherOrChangeWarmPolicy) {
     File f;const auto g=Geometry::fromLayout(layout(f,2,true),Host,2);
     auto p=authority(g);auto c=Cache::create(f.source,g,p);
@@ -170,6 +274,9 @@ TEST(CpuAdaptiveImmutableRowCache, SourceScatterPreservesHolesAndCountsOnlySelec
         std::array<std::byte,720> out;out.fill(std::byte{0x63});
         const std::array<ImmutableRowTableScatterRow,3> rows{{{45,1},{3,4},{45,7}}};
         const auto before=source.stats();source.gatherScattered(rows,out);const auto after=source.stats();
+        EXPECT_EQ(after.storage,storage);
+        EXPECT_EQ(after.physical_budget_bytes,ImmutableRowTable::physicalBytes(f.source,policy));
+        if(storage==Storage::RAM)EXPECT_EQ(after.mapped_virtual_bytes,0u);
         EXPECT_EQ(after.source_metadata_checks-before.source_metadata_checks,2u);
         EXPECT_EQ(after.rows-before.rows,3u);EXPECT_EQ(after.copied_bytes-before.copied_bytes,270u);
         for(std::size_t i=0;i<8;++i) {

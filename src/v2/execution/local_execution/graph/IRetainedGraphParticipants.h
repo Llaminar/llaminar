@@ -9,6 +9,9 @@
  */
 #pragma once
 #include <atomic>
+#include <algorithm>
+#include <span>
+#include <vector>
 #include "collective/LocalTPCaptureSourceDefinition.h"
 #include "RetainedGraphParticipantEnqueueGroup.h"
 #include "backends/DeviceId.h"
@@ -18,6 +21,7 @@
 #include <mutex>
 #include <exception>
 #include <stdexcept>
+#include <string>
 namespace llaminar2 {
 namespace qwen4exp {class PooledImmutableRetainedParticipants;}
 class ComputeGraph;
@@ -110,6 +114,41 @@ private:
     Definition definition_;
     mutable std::atomic<bool> definition_authenticated_{false};
 };
+/**
+ * @brief Stage an additive cold alias extension without modifying any existing attachment.
+ * @param previous Exact original source tokens already retained by one finite parent.
+ * @param proposed Complete validated compatible source variants selected at the cold setup frontier.
+ * @return Deduplicated old-plus-new aliases after every token/domain/PMA/generation check succeeds.
+ * @throws std::exception Before publication for absent, stale or foreign source identity.
+ * This is immutable topology metadata staging, not an execution permit. The
+ * original participant owner separately validates each actual source occurrence
+ * and commits all parent vectors only after the whole family passes.
+ */
+inline std::vector<std::shared_ptr<const RetainedGraphParticipantPreparationStream>>
+retainedSourceVariantExtension(
+    std::span<const std::shared_ptr<const RetainedGraphParticipantPreparationStream>> previous,
+    std::span<const std::shared_ptr<const RetainedGraphParticipantPreparationStream>> proposed)
+{
+    if (previous.empty() || proposed.empty() || !previous.front())
+        throw std::invalid_argument("Source alias refresh requires its original complete finite association");
+    const auto& original = previous.front()->originalSource();
+    const auto domain = previous.front()->definition().domain;
+    std::vector<std::shared_ptr<const RetainedGraphParticipantPreparationStream>> result;
+    const auto append = [&](const auto& values) {
+        for (const auto& value : values) {
+            if (!value) throw std::invalid_argument("Source alias refresh contains an absent original definition");
+            value->requireCurrentDefinition();
+            value->requireLive(original);
+            if (value->definition().domain != domain)
+                throw std::invalid_argument("Source alias refresh contains a foreign original domain");
+            const auto prior = std::find(result.begin(),result.end(),value);
+            if (prior == result.end()) result.push_back(value);
+            else if (prior->owner_before(value) || value.owner_before(*prior))
+                throw std::invalid_argument("Source alias refresh substituted an original token control block");
+        }
+    };
+    append(previous);append(proposed);return result;
+}
 /** @brief Exact original source capture ownership; no mutable token/model state is observed. */
 struct RetainedGraphParticipantSourceIdentity final {
     const ComputeGraph* graph=nullptr;
@@ -200,6 +239,7 @@ public:
     /**
      * @brief Attach an actual colocated storage body to its matched original native parent.
      * @param receiver Actual parent device from the canonical capture controller.
+     * @param receiverGraph Actual original recipient graph, whose inline owner/reader stages must authenticate before attachment.
      * @param parent Original sealed, uninstantiated per-device parent.
      * @param progress Original optional progress contribution; never replaced or fabricated.
      * @param definition Exact source-cache token returned by the matched cold boundary.
@@ -208,7 +248,7 @@ public:
      */
     virtual std::unique_ptr<IRetainedGraphParticipantStorageAttachment> prepareOriginalStorageAttachment(
         DeviceId,IGPUGraphCapture&,IGraphCaptureAuxiliaryBranch*,
-        std::shared_ptr<const RetainedGraphParticipantPreparationStream>)const{return {};}
+        std::shared_ptr<const RetainedGraphParticipantPreparationStream>,const ComputeGraph&)const{return {};}
     /** @brief Authenticate one exact original storage definition independently of kernel/library recipe. */
     virtual void requirePreparedStorageDefinition(const RetainedParticipantGraphExecutable&)const
     {throw std::logic_error("Source plan has no original storage definition binding");}
@@ -220,9 +260,13 @@ public:
 /** @brief Validate only after the original revocable cache token proves its graph/plan lifetime. */
 inline void RetainedGraphParticipantPreparationStream::requireDefinition()const {
     requireLive(original_);
-    if(!definition_.plan || !definition_.graph || !definition_.arena || !definition_.topology_generation ||
-       !definition_.variant || !definition_.domain.source.is_gpu() || !definition_.domain.authority)
-        throw std::logic_error("Original source preparation has no complete declarative definition");
+    // Name only the absent declaration, never log pointers or live device words.
+    const char* missing = !definition_.plan ? "plan" : !definition_.graph ? "graph" :
+        !definition_.arena ? "arena" : !definition_.topology_generation ? "topology_generation" :
+        !definition_.variant ? "variant" : !definition_.domain.source.is_gpu() ? "domain.source" :
+        !definition_.domain.authority ? "domain.authority" : nullptr;
+    if(missing)
+        throw std::logic_error(std::string("Original source preparation has no complete declarative definition: missing ")+missing);
     definition_.plan->requirePreparedSourceDefinition(*this);
     definition_authenticated_.store(true,std::memory_order_release);
 }

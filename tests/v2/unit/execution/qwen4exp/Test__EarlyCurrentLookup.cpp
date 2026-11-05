@@ -18,6 +18,8 @@ public:
     DeviceId device() const noexcept override { return DeviceId::cuda(0); }
     std::uint64_t captureIdentity() const noexcept override { return 17; }
     void bindGenerationControl(RetainedStorageGenerationControl) override { throw std::logic_error("No native service"); }
+    /** @brief Reject fabricated retirement for a construction-only identity. */
+    void retireGenerationControl(RetainedStorageGenerationControl) override { throw std::logic_error("No native service"); }
     RetainedStorageGenerationControl generationControl() const override { return {}; }
     void beginAdmission(std::uint64_t,void*) override { throw std::logic_error("No native service"); }
     bool hasActiveInterval() const noexcept override { return false; }

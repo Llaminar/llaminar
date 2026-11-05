@@ -190,3 +190,63 @@ TEST(Test__MoEOverlayInferenceTransaction, RankLocalCallablePublisherCancelsDela
  replayQueuedLocalPublication(1);replayQueuedLocalPublication(2);
 }
 } // namespace llaminar2::test
+
+namespace llaminar2::test {
+/** @test Actual publish/state/join guards cannot permit continuation while an original SDK enqueue remains pending. */
+TEST(Test__MoEOverlayInferenceTransaction, RankLocalOriginalEnqueuesCompleteBeforeContinuationReplay)
+{
+    using Access=MoEOverlayParticipantNativeRetirementReplayAccess;
+    enum class FirstBoundary {HostJoin,PublicationReturned};
+    for (const int outcome : {0,1,2}) for (unsigned repeat=0;repeat<20;++repeat) {
+        LocalPublicationState state(localPublicationConfig());std::string error;
+        ASSERT_TRUE(state.begin({9,3,41},&error));
+        std::promise<void> release;auto gate=release.get_future().share();
+        std::array<std::future<void>,2> queued;
+        std::promise<FirstBoundary> first;auto first_boundary=first.get_future();
+        std::atomic_flag boundary_reported=ATOMIC_FLAG_INIT;
+        const auto report=[&](FirstBoundary value) {
+            if (!boundary_reported.test_and_set(std::memory_order_acq_rel)) first.set_value(value);
+        };
+        std::atomic<unsigned> cancelled{0};unsigned consumed=0,native_terminal_observations=0;
+        const auto cancel=[&]() noexcept {cancelled.fetch_add(1,std::memory_order_release);};
+        bool released=false;
+        struct OriginalQueuedLifetime {
+            std::promise<void>& release;bool& released;std::array<std::future<void>,2>& queued;
+            ~OriginalQueuedLifetime(){if(!released)release.set_value();for(auto& future:queued)if(future.valid())future.wait();}
+        } lifetime{release,released,queued};
+        auto publication=std::async(std::launch::async,[&] {
+            auto result=state.publishOriginalFollowers(localPublicationDescriptor(1,73,41),[&](const auto&,std::string*) {
+                queued[0]=std::async(std::launch::async,[]{});
+                queued[1]=std::async(std::launch::async,[&] {
+                    gate.wait();
+                    if (!Access::enqueue([&] {
+                        if (outcome==2) throw std::runtime_error("original delayed SDK enqueue failure");
+                        return outcome==0;
+                    },cancel)) throw std::runtime_error("original delayed SDK enqueue failure");
+                });
+                return true;
+            },[&](std::string* failure) {
+                report(FirstBoundary::HostJoin);
+                return Access::joinMutable(queued,[&](auto& future){++consumed;future.get();},cancel,failure);
+            });
+            report(FirstBoundary::PublicationReturned);return result;
+        });
+        // This is a causal checkpoint, not a timing/sleep oracle. The original
+        // queue-only implementation reports PublicationReturned first instead.
+        EXPECT_EQ(first_boundary.get(),FirstBoundary::HostJoin);
+        EXPECT_EQ(publication.wait_for(std::chrono::seconds(0)),std::future_status::timeout);
+        release.set_value();released=true;
+        const auto result=publication.get();EXPECT_EQ(consumed,2u);
+        EXPECT_EQ(native_terminal_observations,0u) << "Publication collects host SDK results without GPU terminal observation";
+        if (outcome==0) {
+            ASSERT_TRUE(result.ok)<<result.error;EXPECT_EQ(cancelled.load(),0u);
+            EXPECT_TRUE(state.retire(result,[&](std::string*){++native_terminal_observations;return true;},&error));
+            EXPECT_EQ(native_terminal_observations,1u);
+        } else {
+            EXPECT_FALSE(result.ok);EXPECT_EQ(result.error,"original delayed SDK enqueue failure");
+            EXPECT_GT(cancelled.load(),0u);
+            EXPECT_TRUE(state.abort(41,7,[](std::string*){return true;},&error));
+        }
+    }
+}
+}

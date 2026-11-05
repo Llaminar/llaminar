@@ -2170,6 +2170,141 @@ TEST(Test__LocalTPRCCLGraphCapture, RCCLAllreduce_OnStreamGraphCapture_Completes
 }
 
 /**
+ * @test Original RCCL communicator/streams admit three retained fragment captures and their HIP parent.
+ *
+ * Repeated prefill tests destroy one standalone graph before the next capture.
+ * This keeps all three original fragments alive until the production HIP parent
+ * imports them, exposing stale native stream/capture membership on reentry.
+ * HIP has no CUDA conditional nodes: its production ordered-timeline importer
+ * flattens these supported nodes rather than exercising CUDA-only graph adoption.
+ * Every fragment owns a distinct rooted-reduce output so a missing child cannot
+ * hide behind another collective. Roots rotate across both original participants;
+ * only the declared root may consume a reduce result. Reset inputs and alternating submission order prove five
+ * actual parent replays without executing a model or a test-only graph path.
+ */
+TEST(Test__LocalTPRCCLGraphCapture, RCCLRetainedParentFragmentReentry)
+{
+    auto* backend=getROCmBackend();ASSERT_NE(backend,nullptr);
+    ASSERT_GE(backend->deviceCount(),2)<<"Requires two original ROCm participants";
+    auto original_context=createLocalTPContext({GlobalDeviceAddress::rocm(0),GlobalDeviceAddress::rocm(1)},
+        {},CollectiveBackendType::RCCL);
+    ASSERT_NE(original_context,nullptr);
+    constexpr size_t count=257,parts=3;
+    /** @brief Scope-owned original native resources, installed before any partial allocation. */
+    struct Resources final {
+        std::unique_ptr<ILocalTPContext> context;
+        std::array<float*,2> inputs{};
+        std::array<std::array<float*,parts>,2> outputs{};
+        std::array<hipStream_t,2> streams{};
+        std::array<std::unique_ptr<HIPGraphCapture>,2> parents;
+        bool submitted=false;
+        /** @brief Drain original submissions, then retire captures before their exact pointers/streams. */
+        ~Resources() noexcept {
+            if(submitted && ::testing::Test::HasFailure() && !context->signalNativeCompletionAbort())
+                std::terminate();
+            const auto require=[](hipError_t status){
+                if(status!=hipSuccess){ADD_FAILURE()<<"Original fragment resource retirement failed: "<<hipGetErrorString(status);std::terminate();}
+            };
+            for(int rank=0;rank<2;++rank){
+                if(!streams[rank] && !inputs[rank] && !parents[rank] &&
+                   std::all_of(outputs[rank].begin(),outputs[rank].end(),[](auto p){return p==nullptr;}))continue;
+                require(hipSetDevice(rank));
+                if(streams[rank])require(hipStreamSynchronize(streams[rank]));
+                parents[rank].reset();
+                if(inputs[rank])require(hipFree(inputs[rank]));
+                for(auto output:outputs[rank])if(output)require(hipFree(output));
+                if(streams[rank])require(hipStreamDestroy(streams[rank]));
+            }
+        }
+    } resources;
+    resources.context=std::move(original_context);
+    auto& context=resources.context;
+    auto& inputs=resources.inputs;auto& outputs=resources.outputs;
+    auto& streams=resources.streams;auto& parents=resources.parents;
+    for(int rank=0;rank<2;++rank){
+        allocateAndUpload(rank,std::vector<float>(count,float(rank+1)),&inputs[rank]);
+        ASSERT_FALSE(::testing::Test::HasFatalFailure());
+        for(auto& output:outputs[rank]){
+            allocateAndUpload(rank,std::vector<float>(count,0.0f),&output);
+            ASSERT_FALSE(::testing::Test::HasFatalFailure());
+        }
+        ASSERT_EQ(hipSetDevice(rank),hipSuccess);
+        ASSERT_EQ(hipStreamCreateWithFlags(&streams[rank],hipStreamNonBlocking),hipSuccess);
+        parents[rank]=std::make_unique<HIPGraphCapture>(streams[rank],rank);
+    }
+    Barrier boundary(2);std::atomic<bool> failed{false};
+    const auto record=[&](int rank){
+        if(hipSetDevice(rank)!=hipSuccess)failed.store(true);
+        std::array<std::unique_ptr<IGPUGraphCapture>,parts> fragments;
+        std::array<GPUOrderedTimelineStep,parts> steps;
+        size_t expected_nodes=0;
+        for(size_t part=0;part<parts;++part){
+            fragments[part]=parents[rank]->createOrderedTimelineFragment();
+            const bool began=fragments[part] && fragments[part]->beginCapture();
+            EXPECT_TRUE(began)<<"fragment="<<part<<" rank="<<rank;
+            if(!began)failed.store(true);
+            boundary.arriveAndWait();
+            const bool admitted=!failed.load();boundary.arriveAndWait();
+            if(admitted){
+                GraphCaptureGuard guard;
+                const int root=static_cast<int>(part%2);
+                const bool reduced=context->reduceRawOnStream(inputs[rank],outputs[rank][part],count,
+                    CollectiveDataType::FLOAT32,CollectiveOp::ALLREDUCE_SUM,root,rank,streams[rank],"retained_fragment_reduce");
+                EXPECT_TRUE(reduced)<<"fragment="<<part<<" rank="<<rank;
+                if(!reduced)failed.store(true);
+            }
+            boundary.arriveAndWait();
+            if(began && !fragments[part]->endCapture())failed.store(true);
+            boundary.arriveAndWait();
+            const bool continue_recording=!failed.load();
+            // Both ranks snapshot this completed iteration before either can
+            // begin the next capture and publish a new failure.
+            boundary.arriveAndWait();
+            if(!continue_recording)break;
+            expected_nodes+=fragments[part]->nodeCount();
+            steps[part]={.name="RCCL fragment",.kind=GPUOrderedTimelineStepKind::CapturedFragment,
+                .capture=fragments[part].get()};
+        }
+        if(!failed.load()){
+            const bool built=parents[rank]->buildOrderedTimelineTransaction(steps);
+            EXPECT_TRUE(built);
+            if(!built)failed.store(true);
+            if(built){
+                const bool complete=parents[rank]->nodeCount()==expected_nodes;
+                EXPECT_EQ(parents[rank]->nodeCount(),expected_nodes);
+                if(!complete)failed.store(true);
+                const bool instantiated=complete && parents[rank]->instantiate();
+                EXPECT_TRUE(instantiated);if(!instantiated)failed.store(true);
+            }
+        }
+    };
+    std::thread first(record,0),second(record,1);first.join();second.join();
+    if(!failed.load())for(int replay=0;replay<5;++replay){
+        SCOPED_TRACE(replay);
+        std::array<std::vector<float>,2> values{std::vector<float>(count,float(replay+1)),
+            std::vector<float>(count,float(replay+2))};
+        for(int rank=0;rank<2;++rank){
+            ASSERT_EQ(hipSetDevice(rank),hipSuccess);
+            ASSERT_EQ(hipMemcpyAsync(inputs[rank],values[rank].data(),count*sizeof(float),
+                hipMemcpyHostToDevice,streams[rank]),hipSuccess);
+        }
+        // Submit every original participant before the terminal test-only wait.
+        for(int index=0;index<2;++index){const int rank=(index+replay)%2;
+            ASSERT_EQ(hipSetDevice(rank),hipSuccess);
+            resources.submitted=true;ASSERT_TRUE(parents[rank]->launch());}
+        for(int rank=0;rank<2;++rank){
+            ASSERT_EQ(hipSetDevice(rank),hipSuccess);ASSERT_EQ(hipStreamSynchronize(streams[rank]),hipSuccess);
+            for(size_t part=0;part<parts;++part){
+                if(rank!=static_cast<int>(part%2))continue; // Reduce output belongs only to this original root.
+                std::vector<float> actual(count);downloadDeviceVector(rank,outputs[rank][part],&actual);
+                for(const auto value:actual)EXPECT_EQ(value,float(2*replay+3))<<"rank="<<rank<<" fragment="<<part;
+            }
+        }
+    }
+    EXPECT_FALSE(failed.load());
+}
+
+/**
  * @brief Prefill-sized RCCL on-stream graph capture must be legal.
  *
  * The Qwen3.6 MoE ROCm2TP prefix tests capture an embedding_allreduce over a

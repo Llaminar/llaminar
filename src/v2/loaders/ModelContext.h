@@ -372,6 +372,16 @@ namespace qwen4exp {class PooledImmutableRetainedParticipants;}
         }
 
     private:
+        friend class RankOrchestrator;
+        friend class DeviceGraphOrchestrator;
+        /**
+         * @brief Detach one runner's exact participant authority after all native
+         * parents and graph-cache borrowers retire, while their arenas remain live.
+         * Physical table/cache/source/PMA owners are retained for model reuse.
+         * @param original Exact runtime authority retained by the retiring runner.
+         */
+        void retireAdaptiveImmutableLookupParticipants(
+            const std::shared_ptr<qwen4exp::PooledImmutableRetainedParticipants>& original);
         // Private constructor - use create() factory method
     private:
         /**

@@ -23,6 +23,8 @@
 
 #include "MoEOverlayParticipantGraphRunner.h"
 #include "MoEOverlayPreparedGraphBank.h"
+#include <mutex>
+#include "execution/qwen4exp/PooledImmutableRetainedParticipants.h"
 #include "MoEOverlayMTPSourceContract.h"
 #include "MoEOverlayFollowerRowGeometry.h"
 #include "MoECPUExpertWorkspaceSource.h"
@@ -926,8 +928,8 @@ namespace llaminar2
             std::shared_ptr<MappedTransferProgressEpoch> epoch)
     {
         if (!epoch || !epoch->device().is_gpu() ||
-            serving_graph_family_lifecycle_ ==
-                ServingGraphFamilyLifecycle::Sealed)
+            serving_graph_family_lifecycle_ !=
+                ServingGraphFamilyLifecycle::Built)
         {
             LOG_ERROR(
                 "[MoEOverlayParticipantGraphRunner] Transfer-progress epoch installation requires one local GPU before follower graph sealing");
@@ -977,6 +979,97 @@ namespace llaminar2
             }
         }
         return true;
+    }
+
+    void MoEOverlayParticipantGraphRunner::bindOriginalPooledSourceFamily(
+        std::shared_ptr<qwen4exp::PooledImmutableRetainedParticipants> original,
+        std::vector<RetainedForwardSourceDefinition> definitions)
+    {
+        if (!original || definitions.empty() || config_.ownership != MoEOverlayParticipantGraphOwnership::RankLocalAuxiliary)
+            throw std::invalid_argument("Expert storage family requires its actual original Rank source");
+        original->requireCurrent();
+        for (const auto& definition : definitions) definition.requireCurrent();
+        if (original_pooled_participants_) {
+            if (original_pooled_participants_ != original ||
+                original_pooled_participants_.owner_before(original) || original.owner_before(original_pooled_participants_))
+                throw std::invalid_argument("Expert storage family changed its original source owner");
+            const bool same = original_pooled_source_family_.size() == definitions.size() &&
+                std::all_of(original_pooled_source_family_.begin(),original_pooled_source_family_.end(),[&](const auto& prior) {
+                    return std::any_of(definitions.begin(),definitions.end(),[&](const auto& current) {
+                        return prior.graph_identity == current.graph_identity && prior.source == current.source &&
+                            !prior.source.owner_before(current.source) && !current.source.owner_before(prior.source) &&
+                            prior.signature == current.signature && prior.role == current.role && prior.physical_rows == current.physical_rows &&
+                            prior.topology_generation == current.topology_generation && prior.capture_variant_signature == current.capture_variant_signature;
+                    });
+                });
+            if (same) return;
+            requireColdSourceAliasRefresh(serving_graph_family_lifecycle_);
+            if (serving_graph_family_lifecycle_ == ServingGraphFamilyLifecycle::Sealed) {
+                std::vector<qwen4exp::PooledImmutableRetainedParticipants::OriginalExpertSourceBinding> bindings;
+                const auto stage = [&](const CachedParticipantGraph* family) {
+                    if (!family) return;
+                    for (const auto& shape : family->mapped_gpu_shapes) for (const auto& endpoint : shape.endpoints) {
+                        if (!endpoint || !original->hasOriginalExpertOwner(endpoint->device)) continue;
+                        bindings.push_back({endpoint->device,endpoint->graph.get(),retainedExpertSourceVariants(definitions,
+                            family->role == ParticipantGraphFamilyRole::MTPDraft,shape.physical_rows)});
+                    }
+                };
+                stage(main_graph_.get());
+                for (const auto& sidecar : mtp_sidecar_graphs_) stage(sidecar.get());
+                original->refreshOriginalExpertSourceVariants(bindings);
+            }
+        }
+        original_pooled_source_family_ = std::move(definitions);
+        original_pooled_participants_ = std::move(original);
+    }
+
+    void MoEOverlayParticipantGraphRunner::cancelOriginalPooledSource(const std::function<void()>& cancellation,
+        std::mutex& failure_mutex,std::exception_ptr& failure) noexcept
+    {
+        if (!cancellation) return;
+        try { cancellation(); }
+        catch (...) {
+            // Invoke outside this metadata lock: the original service/channel
+            // authority owns its own short mapped-publication locks and never
+            // waits for an expert worker or native terminal here.
+            std::lock_guard lock(failure_mutex);
+            if (!failure) failure = std::current_exception();
+        }
+    }
+
+    void MoEOverlayParticipantGraphRunner::bindOriginalPooledSourceCancellation(std::function<void()> cancellation)
+    {
+        if (!original_pooled_participants_) return;
+        if (!cancellation)
+            throw std::invalid_argument("Expert storage execution requires its original Rank source cancellation");
+        // Rank replaces this only when its prior source invocation has crossed
+        // the existing complete native/channel retirement frontier. Enqueued
+        // original worker jobs never observe a concurrent request rebind.
+        original_pooled_source_cancellation_ = std::make_shared<const std::function<void()>>(std::move(cancellation));
+    }
+
+    void MoEOverlayParticipantGraphRunner::retireOriginalPooledStorageAttachments()
+    {
+        if (!original_pooled_participants_) return;
+        const auto retire = [&](CachedParticipantGraph* family) {
+            if (!family) return;
+            for (auto& shape : family->mapped_gpu_shapes) for (auto& endpoint : shape.endpoints) {
+                if (!endpoint || !original_pooled_participants_->hasOriginalExpertOwner(endpoint->device)) continue;
+                auto* worker = participantWorkerContext(endpoint->device);
+                if (!worker || worker->ownsCurrentThread())
+                    throw std::logic_error("Expert storage retirement requires its original off-worker owner");
+                worker->submitAndWait([&] {
+                    endpoint->cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Preserve);
+                });
+            }
+        };
+        retire(main_graph_.get());
+        for (auto& sidecar : mtp_sidecar_graphs_) retire(sidecar.get());
+        original_pooled_source_family_.clear();
+        // Every original worker FIFO and native parent has drained above. The
+        // callback owns no runner/model back-reference and dies only now.
+        original_pooled_source_cancellation_ = {};
+        original_pooled_participants_.reset();
     }
 
     bool MoEOverlayParticipantGraphRunner::
@@ -1034,8 +1127,14 @@ namespace llaminar2
             return false;
         }
 
-        if (serving_graph_family_lifecycle_ ==
-            ServingGraphFamilyLifecycle::Sealed)
+        const auto require_original_source_associations = [&] {
+            if (!original_pooled_participants_) return;
+            for (const auto& definition : original_pooled_source_family_)
+                if (definition.source) original_pooled_participants_->requireInvocation(*definition.source);
+        };
+
+        if (serving_graph_family_lifecycle_ !=
+            ServingGraphFamilyLifecycle::Built)
         {
             for (const CachedParticipantGraph *family : families)
             {
@@ -1055,6 +1154,7 @@ namespace llaminar2
                     }
                 }
             }
+            require_original_source_associations();
             return true;
         }
 
@@ -1104,8 +1204,27 @@ namespace llaminar2
                                 "Mapped follower could not resolve its final native capture owner");
                         }
 
-                        const auto branch_factory =
-                            branch_factory_for(endpoint->device);
+                        auto branch_factory = branch_factory_for(endpoint->device);
+                        if (original_pooled_participants_ && original_pooled_participants_->hasOriginalExpertOwner(endpoint->device)) {
+                            const auto original = original_pooled_participants_->originalParticipant(endpoint->device);
+                            const auto actual = GPUDeviceContextPool::instance().retainExistingPreparedContext(endpoint->device,original.memory());
+                            original.requireWorker(actual.worker());
+                            if (actual.worker().get() != worker || actual.generation() != original.generation())
+                                throw std::invalid_argument("Expert storage parent changed its original worker/PMA generation");
+                            auto sources = retainedExpertSourceVariants(original_pooled_source_family_,
+                                family->role == ParticipantGraphFamilyRole::MTPDraft,shape.physical_rows);
+                            if (!sources.empty()) {
+                                original_pooled_participants_->bindOriginalExpertSourceVariants(endpoint->device,*endpoint->graph,sources);
+                                const auto source = sources.front();
+                                branch_factory.source_definition_boundary = [source](const std::string&,void*,LocalTPCaptureSourceDefinition& handoff) {
+                                    source->requireCurrentDefinition();
+                                    if (handoff.publication || handoff.domain != source->definition().domain)
+                                        throw std::invalid_argument("Expert storage capture changed its original source-family definition");
+                                    handoff.result = source;
+                                    return true;
+                                };
+                            }
+                        }
                         bool materialized = false;
                         worker->submitAndWait(
                             [&]()
@@ -1241,6 +1360,7 @@ namespace llaminar2
             return false;
         }
 
+        require_original_source_associations();
         serving_graph_family_lifecycle_ =
             ServingGraphFamilyLifecycle::Sealed;
         PerfStatsCollector::addCounter(
@@ -2646,9 +2766,14 @@ namespace llaminar2
             // declared decode bound, including dynamic widths such as M3.
             std::vector<std::size_t> storage_rows;
             for(const auto& family:first_arena->families())storage_rows.push_back(family.row_capacity);
-            const auto row_geometry=MoEOverlayFollowerRowGeometry::declare(
-                row_capacity,config_.max_decode_activation_rows,
-                config_.prefill_graph_row_shapes,storage_rows);
+            // Learned drafts execute one token per request. Verifier widths
+            // and shifted KV-only prefills belong to the continuation family;
+            // neither declares a routed expert invocation for this parent.
+            const bool draft_family=spec.role==ParticipantGraphFamilyRole::MTPDraft;
+            const auto row_geometry=draft_family
+                ?MoEOverlayFollowerRowGeometry::declareDraft(config_.max_request_count,storage_rows)
+                :MoEOverlayFollowerRowGeometry::declare(row_capacity,config_.max_decode_activation_rows,
+                    config_.prefill_graph_row_shapes,storage_rows);
             const auto& row_shapes=row_geometry.shapes();
 
             /*
@@ -4518,6 +4643,9 @@ namespace llaminar2
         CachedParticipantGraph *cached = nullptr;
         MoEOverlayInferenceTransactionTicket ticket;
         bool native_terminals_joined = false;
+        std::shared_ptr<const std::function<void()>> original_source_cancellation; ///< Immutable SAME request callback retained by this original submission through every enqueue/drain.
+        std::mutex source_cancellation_failure_mutex;
+        std::exception_ptr source_cancellation_failure; ///< First cancellation fault, retained until all original native jobs drain.
 
         /**
          * @brief Reuse cold-allocated metadata after its original native proof.
@@ -4533,6 +4661,8 @@ namespace llaminar2
             cached = &original;
             ticket = next;
             native_terminals_joined = false;
+            source_cancellation_failure = {};
+            original_source_cancellation = {};
             shape = nullptr;
             collect_timeline = false;
             physical_rows_u64 = 0u;
@@ -4692,8 +4822,8 @@ namespace llaminar2
         using PreparedGpuSubmission = MappedFollowerTransaction::PreparedGpuSubmission;
         using SubmittedGpuTerminal = MappedFollowerTransaction::SubmittedGpuTerminal;
         collect_timeline = PerfStatsCollector::isDomainEnabled("moe_overlay_participant_graph");
-        if (serving_graph_family_lifecycle_ !=
-            ServingGraphFamilyLifecycle::Sealed)
+        if (serving_graph_family_lifecycle_ ==
+            ServingGraphFamilyLifecycle::Built)
         {
             return reject(
                 "Mapped ExpertOverlay follower received a ticket before its physical-fabric graph branches were sealed");
@@ -4899,6 +5029,15 @@ namespace llaminar2
                     .graph_submitted = false,
                 });
             }
+        }
+
+        if (original_pooled_participants_ && !submission.original_source_cancellation &&
+            std::any_of(prepared_gpu_submissions.begin(),prepared_gpu_submissions.end(),[&](const auto& prepared) {
+                return original_pooled_participants_->hasOriginalExpertOwner(prepared.endpoint->device);
+            })) {
+            (void)cancel_unsubmitted_boundaries();
+            abort_armed();
+            return reject("Expert storage submission lacks its exact original source cancellation binding");
         }
 
         // Queue every original worker before returning to continuation launch.
@@ -5467,6 +5606,9 @@ namespace llaminar2
     void MoEOverlayParticipantGraphRunner::cancelMappedFollowerTransaction(
         MappedFollowerTransaction &submission) noexcept
     {
+        if (submission.original_source_cancellation)
+            cancelOriginalPooledSource(*submission.original_source_cancellation,
+                submission.source_cancellation_failure_mutex,submission.source_cancellation_failure);
         for (const auto &lane : submission.armed)
         {
             if (!lane.authority || !lane.authority->protocol)
@@ -5554,6 +5696,16 @@ namespace llaminar2
             if (!receipt.cancelUnsubmitted(boundary.generation))
                 result.missing_terminal = true;
         }
+        {
+            std::lock_guard lock(submission.source_cancellation_failure_mutex);
+            if (submission.source_cancellation_failure) {
+                result.successful = false;
+                const auto prefix = result.first_error.empty() ? std::string{} : std::string("; ");
+                try { std::rethrow_exception(submission.source_cancellation_failure); }
+                catch (const std::exception& error) { result.first_error += prefix + "Original pooled source cancellation failed: " + error.what(); }
+                catch (...) { result.first_error += prefix + "Original pooled source cancellation failed with a non-standard exception"; }
+            }
+        }
         return result;
     }
 
@@ -5601,6 +5753,14 @@ namespace llaminar2
         // Native proof permits teardown only. Aborted packets, policy state and
         // maintenance receipts are never reset or published as successful work.
         submission.native_terminals_joined = true;
+        submission.original_source_cancellation = {};
+        {
+            std::lock_guard lock(submission.source_cancellation_failure_mutex);
+            if (submission.source_cancellation_failure) {
+                if (error) *error = enqueues.first_error;
+                return false;
+            }
+        }
         return true;
     }
 
@@ -5896,6 +6056,7 @@ namespace llaminar2
                 return reject("Original unsubmitted expert admission has not been cancelled");
         }
         submission.native_terminals_joined = true;
+        submission.original_source_cancellation = {};
 
         /* Endpoint completion is a final independent rendezvous after all
          * exact local work and GPU terminal events have retired. */
@@ -6446,15 +6607,27 @@ namespace llaminar2
         MoEOverlayPublishedInferenceTransaction publish(
             const MoEOverlayInferenceExecutionDescriptor &descriptor) override
         {
-            auto result = state_.publish(descriptor, [&](const auto &ticket, std::string *error)
+            auto result = state_.publishOriginalFollowers(descriptor, [&](const auto &ticket, std::string *error)
             {
                 submission_->reset(*original_->main_graph_, ticket);
+                submission_->original_source_cancellation = original_->original_pooled_source_cancellation_;
                 const auto selection = original_->selectRetainedGraph(ticket, error);
                 if (!selection)
                     return false;
                 submission_->cached = selection->graph;
                 selection_ = *selection;
-                return original_->submitMappedFollowerTransaction(*submission_, error);
+                return original_->submitMappedFollowerTransaction(*submission_,error);
+            }, [&](std::string* error) {
+                // This consumes only native SDK enqueue futures. The captured
+                // expert/storage bodies remain asynchronous; actual GPU/event
+                // terminal proof belongs to retire(), never publication.
+                const auto enqueues=original_->joinMappedFollowerEnqueues(*submission_);
+                if (!enqueues.successful || enqueues.missing_terminal) {
+                    if (error) *error=enqueues.first_error.empty()
+                        ? "Original expert host enqueue lacks its exact terminal publication" : enqueues.first_error;
+                    return false;
+                }
+                return true;
             });
             if (!result.ok && state_.active() &&
                 submission_->ticket == *state_.activeTicket())
@@ -6514,7 +6687,9 @@ namespace llaminar2
     {
         if (!original)
             throw std::invalid_argument("Local expert publisher requires its original runner owner");
-        return std::make_shared<RankLocalInferencePublisher>(std::move(original));
+        auto publisher = std::make_shared<RankLocalInferencePublisher>(original);
+        original->serving_graph_family_lifecycle_ = ServingGraphFamilyLifecycle::ExecutionAdmitted;
+        return publisher;
     }
 
     std::optional<MoEOverlayParticipantGraphRunner::RetainedGraphSelection>

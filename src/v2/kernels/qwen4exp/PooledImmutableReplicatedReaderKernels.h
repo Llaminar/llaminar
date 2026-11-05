@@ -10,6 +10,7 @@
 #include "PooledImmutableReplicatedReaderOps.h"
 #include "kernels/common/DeviceRowRange.h"
 #include "backends/DeviceId.h"
+#include "collective/NativeCollectiveCompletion.h"
 
 namespace llaminar2::qwen4exp::replicated_reader {
 /** @brief Fixed metadata producers and validators surrounding explicit transfer nodes. */
@@ -31,6 +32,9 @@ struct NativeArgs {
     int* healthy;
     int* first_error;
     CapturedTransferReceiveCompletion payload_completion;
+    NativeReceiveCompletionView native_payload_completion = NativeReceiveCompletionView::notRequired();
+    ncclLlaminarCompletionAuthority native_fixed_header{}; ///< Exact fixed Header/ACK launch authority, not a receipt.
+    std::uint64_t native_payload_message = 0; ///< Original static operation key, never inferred from bytes.
 };
 /** @brief Submit only immutable metadata work on its original non-default CUDA stream. */
 void enqueueCUDAPooledReplicatedReader(Action action, NativeArgs args, void* exact_stream);

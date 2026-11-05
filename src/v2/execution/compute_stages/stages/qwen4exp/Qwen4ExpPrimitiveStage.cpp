@@ -379,6 +379,12 @@ bool Qwen4ExpPrimitiveStage::allowsZeroOutput() const
     return norm && norm->input_role == BranchNormInputRole::PredictorHidden;
 }
 
+bool Qwen4ExpPrimitiveStage::matchesNgramHashOutput(const TensorBase* root,BufferId buffer,
+    std::size_t offset,std::size_t bytes)const noexcept{
+    const auto* hash=std::get_if<NgramHash>(&params_.operation);
+    return hash && hash->outputWords.tensor==root && hash->outputWords.buffer==buffer &&
+        hash->outputWords.byteOffset==offset && bytes==std::size_t(params_.rows.capacity)*16*sizeof(std::uint64_t);
+}
 ComputeStageType Qwen4ExpPrimitiveStage::type() const
 {
     return std::visit(Overload{

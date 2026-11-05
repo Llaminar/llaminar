@@ -267,6 +267,36 @@ namespace llaminar2
         return true;
     }
 
+    std::vector<RetainedForwardSourceDefinition>
+    DeviceGraphOrchestrator::retainedExpertSourceFamilyDefinitions() const
+    {
+        if (!forward_engine_ || serving_graph_family_lifecycle_ != ServingGraphFamilyLifecycle::Sealed)
+            throw std::logic_error("Expert storage attachment requires the sealed original continuation family");
+        auto result = forward_engine_->retainedSourceGraphDefinitions(executor_.snapshotConfigurationEpoch());
+        const auto append_sidecar = [&](const MTPSidecarGraphCache& cache)
+        {
+            if (!cache.valid || !cache.graph || !cache.segment_cache.initialized)
+                return;
+            const auto& native = cache.segment_cache;
+            if (native.needs_capture || !native.successful_capture_count ||
+                !native.capture_variant_signature || cache.seq_len <= 0 || cache.batch_size <= 0)
+                throw std::logic_error("Expert storage attachment found an incomplete original sidecar");
+            if (cache.graph->retainedParticipantSourcePlan() ||
+                cache.graph->retainedParticipantDefinitionDomain() || native.participant_preparation_stream)
+                throw std::logic_error("Learned sidecar storage requires its explicit original source-family association");
+            const auto rows = static_cast<int64_t>(cache.seq_len) * cache.batch_size;
+            if (rows <= 0 || rows > std::numeric_limits<int>::max())
+                throw std::logic_error("Expert storage attachment sidecar row geometry overflows its original finite parent");
+            result.push_back(RetainedForwardSourceDefinition::checked(std::nullopt,
+                MoEOverlayInferenceGraphRole::MTPDraft,static_cast<int>(rows),*cache.graph,
+                native.capture_variant_signature,{}));
+        };
+        for (const auto* cache : {&mtp_sidecar_depth0_cache_, &mtp_sidecar_depth0_device_token_cache_,
+                &mtp_sidecar_depth0_chained_cache_, &mtp_sidecar_depth0_chained_device_token_cache_})
+            append_sidecar(*cache);
+        return result;
+    }
+
     bool DeviceGraphOrchestrator::materializeServingGraphFamilyWithoutLaunch(
         const ServingGraphFamilyMaterializationPlan &requested_plan)
     {

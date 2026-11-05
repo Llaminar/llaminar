@@ -37,7 +37,7 @@ using Weight=Qwen4ExpImmutableWeightBinding;
 using PLEAppend=std::string (*)(ComputeGraph &,const Qwen4ExpPLEContext &,
     const Qwen4ExpPLEWeights &,const Qwen4ExpPLEBuffers &,
     Qwen4ExpPLEBuilder::LookupStorage,const std::vector<std::string> &,
-    Qwen4ExpEarlyLookupFrame*,Qwen4ExpResidentReadAheadFrame*);
+    Qwen4ExpEarlyLookupFrame*,Qwen4ExpResidentReadAheadFrame*,Qwen4ExpPooledReadAheadFrame*);
 static_assert(std::is_same_v<decltype(&Qwen4ExpPLEBuilder::append),PLEAppend>);
 static_assert(std::is_convertible_v<ImmutableLookupStage::CPUStorage,Qwen4ExpPLEBuilder::LookupStorage>);
 static_assert(std::is_convertible_v<ImmutableLookupStage::GPUStorage,Qwen4ExpPLEBuilder::LookupStorage>);

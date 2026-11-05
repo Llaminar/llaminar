@@ -5,7 +5,8 @@
  * Fixed original IQ4_NL160/90B input traces and capture/validation code are shared
  * with native correctness tests. Preparation/admission/poison/oracles are outside
  * timing; native events cover the full source operation, including protocol waits.
- * Host wall covers submission through complete native cohort completion. The
+ * Authored consumer populations use disjoint original channels without a fixed
+ * two-device limit. Host wall covers submission through complete native cohort completion. The
  * original service remains armed across frames and terminally joins afterward. No observed device value selects a workload or repairs its state.
  */
 #ifdef LLAMINAR_POOLED_NATIVE_PROGRAM_DIAGNOSTIC
@@ -79,6 +80,7 @@ struct Options {
     std::string placement,scenario;
     ngram_replay::Shape shape;
     std::uint32_t gpu_slots=0,ram_slots=2,samples=9;
+    AdaptiveImmutableRowBacking sourceBacking=AdaptiveImmutableRowBacking::SSD; ///< Actual full-RAM or SSD source, never inferred from row-cache slots.
     std::vector<DeviceId> consumers; ///< Explicit actual ConsumerLocal membership, never storage-owner inference.
     std::uint32_t requests=1; ///< Explicit original request-reset replay count for grouped diagnostics only.
     std::size_t mmapWindowBytes=4096,mmapWindowCount=2; ///< Explicit original ConsumerLocal source policy; defaults preserve stress trace.
@@ -104,7 +106,11 @@ DeviceId device(std::string_view text){const auto colon=text.find(':');requirePr
  * @param argc Original count. @param argv Original argument vector. @return Checked one-cell selection. */
 Options options(int argc,char** argv){Options o;bool slots=false,tokens=false,capacity=false;
     for(int i=1;i<argc;++i){const std::string_view key=argv[i];requireProvider(i+1<argc,"Missing measurement argument value");const std::string_view value=argv[++i];
-        if(key=="--continuation")o.continuation=device(value);else if(key=="--owner")o.owner=device(value);
+        if(key=="--source-backing"){
+            requireProvider(value=="ram"||value=="ssd","Source backing must be explicit ram or ssd");
+            o.sourceBacking=value=="ram"?AdaptiveImmutableRowBacking::RAM:AdaptiveImmutableRowBacking::SSD;
+        }
+        else if(key=="--continuation")o.continuation=device(value);else if(key=="--owner")o.owner=device(value);
         else if(key=="--consumers"){
             std::size_t begin=0;
             while(begin<value.size()){
@@ -165,15 +171,21 @@ Options options(int argc,char** argv){Options o;bool slots=false,tokens=false,ca
     requireProvider(o.placement=="local"||o.placement=="cross_vendor"||o.placement=="consumer_local"||o.placement=="no_peer","Placement must be local, cross_vendor, consumer_local or explicit no_peer");
     requireProvider(!o.mmapGeometryProvided || o.placement=="consumer_local",
         "Explicit mmap geometry is supported only by the ConsumerLocal actor");
-    (void)ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,o.mmapWindowBytes,o.mmapWindowCount);
+    (void)providerReplaySourcePolicy(o.sourceBacking,o.mmapWindowBytes,o.mmapWindowCount);
+    if(o.sourceBacking==AdaptiveImmutableRowBacking::RAM)
+        requireProvider(o.ram_slots==0&&!o.mmapGeometryProvided&&!o.coldAttempt,
+            "Full RAM source requires --ram-slots 0 and excludes SSD mmap/cold-advice options");
     if(o.placement=="consumer_local"){
 #ifdef LLAMINAR_POOLED_NATIVE_PROGRAM_DIAGNOSTIC
         requireProvider(o.diagnosticProgram==ProviderReplayDiagnosticProgram::OrdinaryLookup,
             "Grouped read-ahead/remote diagnostic composition is not bound; ordinary ConsumerLocal timing is explicit");
 #endif
-        requireProvider(o.consumers.size()==2&&o.consumers.front()==o.continuation&&
-            o.consumers[0]!=o.consumers[1]&&o.consumers[0].type==o.consumers[1].type,
-            "ConsumerLocal timing requires two distinct homogeneous GPU consumers with continuation first");
+        requireProvider(!o.consumers.empty()&&o.consumers.front()==o.continuation,
+            "ConsumerLocal timing requires actual GPU consumers with continuation first");
+        std::set<DeviceId> uniqueConsumers;
+        for(const auto consumer:o.consumers)
+            requireProvider(consumer.is_gpu()&&consumer.type==o.continuation.type&&uniqueConsumers.insert(consumer).second,
+                "ConsumerLocal timing requires unique homogeneous GPU consumers");
         requireProvider(!o.owner.is_valid()||o.owner==o.continuation,"ConsumerLocal owners are each original consumer, not one shared storage owner");
         o.owner=o.continuation;
     }else requireProvider(o.consumers.empty()&&!o.coldAttempt&&o.requests==1,"Grouped consumer/cold options require consumer_local placement");
@@ -223,7 +235,9 @@ struct LocalActor {
     std::unique_ptr<ProviderReplay> fixture;
     /** @brief Admit the same original source/payload program before any actual native fixture body. */
     static ProviderReplayPrograms prepare(std::shared_ptr<ProviderFile> file,const Options& o){
-        ProviderReplayPrograms result({{std::move(file),o.shape.capacity_tokens*16,o.gpu_slots,o.ram_slots,n::OriginalIdWidth::UInt64,true,OwnerAdmission::Original,ACKInterleaving::None,ActivationPreparation::BeforeGraph,o.shape.capacity_tokens*16,true}});
+        ProviderReplaySpec spec{std::move(file),o.shape.capacity_tokens*16,o.gpu_slots,o.ram_slots,n::OriginalIdWidth::UInt64,true,OwnerAdmission::Original,ACKInterleaving::None,ActivationPreparation::BeforeGraph,o.shape.capacity_tokens*16,true};
+        spec.sourceBacking=o.sourceBacking;
+        ProviderReplayPrograms result({std::move(spec)});
 #ifdef LLAMINAR_POOLED_NATIVE_PROGRAM_DIAGNOSTIC
         result.setDiagnosticProgram(o.diagnosticProgram);
 #endif
@@ -265,7 +279,9 @@ struct CrossActor {
     std::unique_ptr<CrossVendorReadReplay> fixture;
     /** @brief Declare only the actual source plus remote storage population, never a pretend compute domain. */
     static CrossVendorReadReplayPrograms prepare(std::shared_ptr<ProviderFile> file,const Options& o){
-        CrossVendorReadReplayPrograms result({{std::move(file),o.gpu_slots,o.shape.capacity_tokens*16,o.shape.capacity_tokens*16,o.ram_slots}});
+        CrossVendorReadReplaySpec spec{std::move(file),o.gpu_slots,o.shape.capacity_tokens*16,o.shape.capacity_tokens*16,o.ram_slots};
+        spec.sourceBacking=o.sourceBacking;
+        CrossVendorReadReplayPrograms result({std::move(spec)});
         result.prepare(o.continuation,o.owner);return result;
     }
     /** @brief Bind sole original graph owners before the unchanged cold source/remote stage recording. */
@@ -347,9 +363,9 @@ template<class Actor>void measure(Actor& actor,ProviderFile& file,const Options&
         requireProvider(observed.source_rows+observed.gpu_hits==observed.unique_ids&&observed.source_native_bytes==observed.source_rows*ngram_replay::RowBytes,"Native source live extent disagrees with actual unique work");
         nlohmann::json row={{"schema",1},{"production_program_qualified",!ProviderReplayRawDiagnostic && o.placement!="no_peer"},{"raw_native_program_diagnostic",ProviderReplayRawDiagnostic},{"kind",o.placement=="local"?"local_pooled":(o.placement=="no_peer"?"no_peer_pooled_candidate":"cross_vendor_pooled")},{"continuation",o.continuation.toString()},{"owners",{o.owner.toString()}},
             {"format","IQ4_NL"},{"width",ngram_replay::Width},{"row_bytes",ngram_replay::RowBytes},{"tokens",observed.live_ids/16},{"capacity_tokens",o.shape.capacity_tokens},{"live_ids",observed.live_ids},{"unique_ids",observed.unique_ids},
-            {"scenario",o.scenario},{"phase",declared.phase},{"gpu_slots",o.gpu_slots},{"ram_slots",o.ram_slots},{"sample",sample},{"event_us",event},{"wall_us",wall},
+            {"source_backing",o.sourceBacking==AdaptiveImmutableRowBacking::RAM?"ram":"ssd"},{"scenario",o.scenario},{"phase",declared.phase},{"gpu_slots",o.gpu_slots},{"ram_slots",o.ram_slots},{"sample",sample},{"event_us",event},{"wall_us",wall},
             {"gpu_hits",observed.gpu_hits},{"source_rows",observed.source_rows},{"promotions",observed.promotions},{"evictions",observed.evictions},{"source_native_bytes",observed.source_native_bytes},{"hit_wire_bytes",observed.hit_wire_bytes},
-            {"demotion_copy_bytes",nullptr},{"physical_ssd_read_bytes",nullptr},{"ram_cache_hits",nullptr},{"mapped_source_rows",nullptr},{"ram_promotions",nullptr},{"ram_evictions",nullptr},{"byte_validation",true},{"cache_regime","source_page_warmed_fixed_trajectory"},
+            {"demotion_copy_bytes",nullptr},{"physical_ssd_read_bytes",nullptr},{"ram_cache_hits",nullptr},{"mapped_source_rows",nullptr},{"ram_promotions",nullptr},{"ram_evictions",nullptr},{"byte_validation",true},{"cache_regime",o.sourceBacking==AdaptiveImmutableRowBacking::RAM?"ram_resident_source":"source_page_warmed_fixed_trajectory"},
             {"native_pattern",ngram_replay::NativePattern},{"trace_schedule",ngram_replay::Schedule},{"prelude_frames",ngram_replay::PreludeFrames},{"trajectory_index",ngram_replay::PreludeFrames+sample},{"source_locality",o.shape.locality==ngram_replay::Locality::Scattered?"affine_scattered":"contiguous_locality_control"},{"table_rows",o.shape.table_rows},{"table_bytes",o.shape.table_rows*ngram_replay::RowBytes},{"full_qfn_table",false},
             {"event_scope","source_complete_lookup_protocol_including_remote_waits"},{"wall_scope","open_interval_lookup_submit_through_complete_cohort_wait_with_outer_event_overhead"},{"admission_uploads_oracles_timed",false},{"event_includes_host_submission_gaps",o.placement!="local"},{"timing_event_worker_roundtrips",0},
             {"lookup_submission_worker_calls",o.placement=="local"?1:2},{"completion_collection_worker_calls",o.placement=="local"?0:2},
@@ -363,13 +379,13 @@ template<class Actor>void measure(Actor& actor,ProviderFile& file,const Options&
     }
     const auto percentile=[](std::vector<double> values,std::size_t percent){std::sort(values.begin(),values.end());return values[(values.size()*percent+99)/100-1];};
     std::cout<<"NGRAM_PERF_SUMMARY "<<nlohmann::json{{"schema",1},{"kind",o.placement=="local"?"local_pooled":(o.placement=="no_peer"?"no_peer_pooled_candidate":"cross_vendor_pooled")},
-        {"continuation",o.continuation.toString()},{"scenario",o.scenario},{"samples",o.samples},{"latency_unit","microseconds_per_completed_lookup_request"},
+        {"continuation",o.continuation.toString()},{"source_backing",o.sourceBacking==AdaptiveImmutableRowBacking::RAM?"ram":"ssd"},{"scenario",o.scenario},{"samples",o.samples},{"latency_unit","microseconds_per_completed_lookup_request"},
         {"wall_p50_us",percentile(wallSamples,50)},{"wall_p95_us",percentile(wallSamples,95)},{"wall_max_us",*std::max_element(wallSamples.begin(),wallSamples.end())},
         {"event_p50_us",percentile(eventSamples,50)},{"event_p95_us",percentile(eventSamples,95)},{"event_max_us",*std::max_element(eventSamples.begin(),eventSamples.end())},
         {"quantile_method","nearest_rank_small_sample_diagnostic_raw_samples_retained"},{"per_row_amortization_primary",false}}.dump()<<'\n';
     const auto closing=std::chrono::steady_clock::now();actor.close();const auto closed=std::chrono::steady_clock::now();
     std::cout<<"NGRAM_PERF_TERMINAL "<<nlohmann::json{{"schema",1},{"kind",o.placement=="local"?"local_pooled":(o.placement=="no_peer"?"no_peer_pooled_candidate":"cross_vendor_pooled")},
-        {"continuation",o.continuation.toString()},{"scenario",o.scenario},{"terminal_close_us",std::chrono::duration<double,std::micro>(closed-closing).count()},
+        {"continuation",o.continuation.toString()},{"source_backing",o.sourceBacking==AdaptiveImmutableRowBacking::RAM?"ram":"ssd"},{"scenario",o.scenario},{"terminal_close_us",std::chrono::duration<double,std::micro>(closed-closing).count()},
         {"scope","captured_service_terminal_close_and_original_worker_join_outside_lookup_timing"}}.dump()<<'\n';
 }
 /** @brief Exact owned-file residency and process I/O observations, outside the timed native interval. */
@@ -428,95 +444,149 @@ ImmutableRowTableLayoutGeometry consumerLocalLayout(const Options& o,const Immut
         owners.push_back({{{0,consumer},ImmutableRowStorage::VRAM},0,o.gpu_slots,{}});
     }
     owners.push_back({{host,ImmutableRowStorage::RAM},0,o.ram_slots,{}});
-    const std::array tiers{ImmutableRowStorage::VRAM,ImmutableRowStorage::RAM,ImmutableRowStorage::MemoryMapped};
+    const auto sourcePolicy=providerReplaySourcePolicy(o.sourceBacking,o.mmapWindowBytes,o.mmapWindowCount);
+    std::vector<ImmutableRowStorage> tiers{ImmutableRowStorage::VRAM,ImmutableRowStorage::RAM};
+    if(sourcePolicy.storage()==ImmutableRowStorage::MemoryMapped)tiers.push_back(ImmutableRowStorage::MemoryMapped);
     return ImmutableRowTableLayoutGeometry::checked(
         ImmutableRowTableExtent::fromNative(source.format,source.rows,source.rowBytes()),
         ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,std::move(owners),consumers,{},
-        {{host,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,o.mmapWindowBytes,o.mmapWindowCount)}},{},std::nullopt,
+        {{host,sourcePolicy}},{},std::nullopt,
         o.shape.capacity_tokens*16,ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal);
 }
 /** @brief Preserve the existing fixture's original independent GPU and shared host admission policies. */
 AdaptiveVRAMRAMSSDRequest consumerLocalRequest(const Options& o){
     AdaptiveVRAMRAMSSDRequest request;
+    request.source_backing=o.sourceBacking;
     request.maximum_gpu_cache_rows=o.gpu_slots;
     request.gpu_policy={65536,1,2};
     request.host.maximum_cache_rows=o.ram_slots;
     return request;
 }
+/**
+ * @brief Drain every submitted callback before its borrowed measurement scope ends.
+ * @param pending Empty future storage reserved for the exact participant count before timing.
+ * @param count Original number of callbacks to enqueue.
+ * @param enqueue Submit one original participant; may throw before returning a future.
+ * @throws Any first enqueue error, otherwise the first callback error in authored order.
+ * @note Later callback errors never hide an earlier submission failure. No callback
+ * may borrow caller scratch beyond this function, including partial enqueue failure.
+ */
+template<class Enqueue>
+void enqueueAndDrain(std::vector<std::future<void>>& pending,std::size_t count,Enqueue&& enqueue){
+    requireProvider(pending.empty()&&pending.capacity()>=count,"Measurement futures require exact pre-reserved storage");
+    std::exception_ptr primary;
+    try{for(std::size_t i=0;i<count;++i)pending.push_back(enqueue(i));}
+    catch(...){primary=std::current_exception();}
+    for(auto& future:pending)try{future.get();}catch(...){if(!primary)primary=std::current_exception();}
+    if(primary)std::rethrow_exception(primary);
+}
+/** @brief Exercise the actual sample helper with deferred callbacks and no workers or runtimes. */
+void proveMeasurementDrain(){
+    for(const int failure:{0,1,2}){
+        std::vector<std::future<void>> pending;pending.reserve(3);
+        std::array<bool,3> completed{};
+        bool caught=false;
+        try{
+            enqueueAndDrain(pending,3,[&](std::size_t i){
+                if(i==2&&failure!=1)throw std::runtime_error("original enqueue failure");
+                return std::async(std::launch::deferred,[&,i]{
+                    completed[i]=true;
+                    if(i==0&&failure!=0)throw std::runtime_error("original callback failure");
+                });
+            });
+        }catch(const std::runtime_error& error){
+            caught=true;
+            requireProvider(std::string_view(error.what())==(failure==1?"original callback failure":"original enqueue failure"),
+                "Measurement drain replaced its original primary error");
+        }
+        requireProvider(caught&&completed[0]&&completed[1]&&(completed[2]==(failure==1)),
+            "Measurement callback outlived borrowed timing scratch after failure");
+        for(const auto& future:pending)requireProvider(!future.valid(),"Measurement future was not consumed before returning");
+    }
+}
 /** @brief Replay actual CLI and plural geometry with no prepared context, backend probe or native creation. */
 void proveConsumerLocalDeclarations(){
+    proveMeasurementDrain();
     const ImmutableRowTableSource source{.path="unused-pure-geometry",.tensor_name="per_layer_token_embd.weight",
         .rows=1048576,.row_elements=ngram_replay::Width,.format=GGUFTensorType::IQ4_NL};
-    for(const auto backend:{std::string("cuda"),std::string("rocm")}){
-        for(const auto slots:{std::string("0"),std::string("64")}){
-            std::vector<std::string> args{"component","--placement","consumer_local","--continuation",backend+":0",
-                "--consumers",backend+":0,"+backend+":1","--tokens","8","--capacity-tokens","64",
-                "--gpu-slots",slots,"--ram-slots","8","--scenario","alternating_sets","--requests","2","--cold-attempt","1"};
-            const auto parseArgs=[&]{
-                std::vector<char*> argv;
-                for(auto& arg:args)argv.push_back(arg.data());
-                return options(static_cast<int>(argv.size()),argv.data());
-            };
-            const auto defaults=parseArgs();
-            requireProvider(defaults.mmapWindowBytes==4096&&defaults.mmapWindowCount==2,
-                "Default ConsumerLocal mmap stress geometry changed");
-            args.insert(args.end(),{"--mmap-window-bytes","65536","--mmap-window-count","1024"});
-            const auto parsed=parseArgs();
-            const auto layout=consumerLocalLayout(parsed,source);
-            const auto request=consumerLocalRequest(parsed);
-            requireProvider(layout.sourceServices().size()==1&&
-                layout.sourceServices().front().windows.windowBytes()==65536&&
-                layout.sourceServices().front().windows.windowCount()==1024,
-                "Explicit mmap geometry lost the original layout/source policy");
-
-            const auto shared=AdaptiveImmutableLookupGeometry::sharedHostGeometry(layout,request);
-            requireProvider(shared.sourceBytes()==ImmutableRowTable::physicalBytes(source,layout.sourceServices().front().windows),
-                "Explicit mmap source BOM differs from original source storage authority");
-            const auto defaultLayout=consumerLocalLayout(defaults,source);
-            const auto defaultHost=AdaptiveImmutableLookupGeometry::sharedHostGeometry(defaultLayout,consumerLocalRequest(defaults));
-            requireProvider(shared.sourceBytes()>defaultHost.sourceBytes(),"Larger mmap geometry did not reach original source BOM");
-
-            requireProvider(layout.consumers().size()==2&&layout.adaptiveGPUDomain()==ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal,
-                "CLI lost actual plural ConsumerLocal membership");
-            std::optional<q::ImmutableLookupLayout> channel;
-            for(const auto consumer:layout.consumers()){
-                const auto local=AdaptiveImmutableLookupGeometry::forRequester(layout,source,request,consumer);
-                requireProvider(local.physical().owners().size()==1&&local.physical().owners().front().allocator==consumer,
-                    "Consumer-local owner projection changed actual requester");
-                requireProvider(shared.executionBytes()>local.host().executionBytes(),"Shared source lost its concurrent grant storage");
-                channel=local.channelLayout();
-            }
-            const auto frames=q::ImmutableLookupServiceGeometry::checked(*channel,parsed.consumers);
-            requireProvider(frames.channelCount()==2&&frames.offset(0)!=frames.offset(1)&&
-                frames.offset(1)>=frames.offset(0)+channel->bytes(),"Consumer service frames alias");
-            const auto rejectGeometry=[&](std::size_t index,const std::string& invalid){
-                const auto saved=args[index];args[index]=invalid;bool bad=false;
-                try{(void)parseArgs();}catch(const std::exception&){bad=true;}
-                args[index]=saved;requireProvider(bad,"Invalid or unsupported explicit mmap geometry was accepted");
-            };
-            rejectGeometry(args.size()-3,"0");
-            rejectGeometry(args.size()-3,"1"); // Original source policy owns page alignment.
-            rejectGeometry(args.size()-1,"0");
-            rejectGeometry(2,"local"); // Explicit geometry must not be ignored by another actor.
-            args[6]=backend+":0,"+backend+":0";
-            bool rejected=false;
-            try{(void)parseArgs();}catch(const std::exception&){rejected=true;}
-            requireProvider(rejected,"Duplicate consumer CLI was accepted");
-            args[6]=backend+":0,"+(backend=="cuda"?"rocm:0":"cuda:0");
-            rejected=false;
-            try{(void)parseArgs();}catch(const std::exception&){rejected=true;}
-            requireProvider(rejected,"Mixed-vendor compute cohort was silently changed");
-            args[6]=backend+":1,"+backend+":0";
-            rejected=false;
-            try{(void)parseArgs();}catch(const std::exception&){rejected=true;}
-            requireProvider(rejected,"Foreign first continuation was accepted");
-        }
-    }
-    std::cout<<"POOLED_CONSUMER_LOCAL_DECLARATIONS_PASS backends=2 capacities=0,64 original_channels=2 native_creation=0\n";
+    for(const auto backend:{std::string("cuda"),std::string("rocm")})
+        for(const std::size_t participantCount:{1u,2u,4u,8u})
+            for(const auto slots:{std::string("0"),std::string("64")})
+                for(const auto backing:{AdaptiveImmutableRowBacking::SSD,AdaptiveImmutableRowBacking::RAM}){
+                    const bool ssd=backing==AdaptiveImmutableRowBacking::SSD;
+                    std::string consumerList;
+                    for(std::size_t i=0;i<participantCount;++i){if(i)consumerList+=',';consumerList+=backend+":"+std::to_string(i);}
+                    std::vector<std::string> args{"component","--placement","consumer_local","--continuation",backend+":0",
+                        "--consumers",consumerList,"--tokens","8","--capacity-tokens","64","--gpu-slots",slots,
+                        "--ram-slots",ssd?"8":"0","--scenario","alternating_sets","--requests","2","--cold-attempt",ssd?"1":"0"};
+                    if(!ssd)args.insert(args.end(),{"--source-backing","ram"});
+                    const auto parseArgs=[&]{std::vector<char*> argv;for(auto& arg:args)argv.push_back(arg.data());
+                        return options(static_cast<int>(argv.size()),argv.data());};
+                    const auto defaults=parseArgs();
+                    requireProvider(defaults.sourceBacking==backing,"CLI lost its actual typed source backing");
+                    if(ssd){
+                        requireProvider(defaults.mmapWindowBytes==4096&&defaults.mmapWindowCount==2,
+                            "Default SSD mmap stress geometry changed");
+                        args.insert(args.end(),{"--mmap-window-bytes","65536","--mmap-window-count","1024"});
+                    }
+                    const auto parsed=parseArgs();
+                    const auto layout=consumerLocalLayout(parsed,source);
+                    const auto request=consumerLocalRequest(parsed);
+                    const auto sourcePolicy=providerReplaySourcePolicy(backing,parsed.mmapWindowBytes,parsed.mmapWindowCount);
+                    requireProvider(layout.sourceServices().size()==1&&
+                        layout.sourceServices().front().windows.storage()==request.sourceStorage(),
+                        "Source layout changed its original RAM/SSD backing");
+                    if(ssd)requireProvider(layout.sourceServices().front().windows.windowBytes()==65536&&
+                        layout.sourceServices().front().windows.windowCount()==1024,"Explicit SSD mmap policy lost its original geometry");
+                    const auto shared=AdaptiveImmutableLookupGeometry::sharedHostGeometry(layout,request);
+                    requireProvider(shared.sourceStorage()==request.sourceStorage()&&
+                        shared.sourceBytes()==ImmutableRowTable::physicalBytes(source,sourcePolicy),
+                        "Source BOM differs from the actual original storage authority");
+                    const auto defaultLayout=consumerLocalLayout(defaults,source);
+                    const auto defaultHost=AdaptiveImmutableLookupGeometry::sharedHostGeometry(defaultLayout,consumerLocalRequest(defaults));
+                    if(ssd)requireProvider(shared.sourceBytes()>defaultHost.sourceBytes(),"Larger mmap geometry did not reach original source BOM");
+                    else requireProvider(shared.sourceBytes()==defaultHost.sourceBytes()&&shared.storageBytes()==0,
+                        "Full RAM source retained redundant bounded RAM cache payload");
+                    requireProvider(layout.consumers().size()==participantCount&&
+                        layout.adaptiveGPUDomain()==ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal,"CLI lost ConsumerLocal membership");
+                    std::optional<q::ImmutableLookupLayout> channel;
+                    for(const auto consumer:layout.consumers()){
+                        const auto local=AdaptiveImmutableLookupGeometry::forRequester(layout,source,request,consumer);
+                        requireProvider(local.physical().owners().size()==1&&local.physical().owners().front().allocator==consumer,
+                            "Consumer-local projection changed the actual requester");
+                        requireProvider(shared.executionBytes()>=local.host().executionBytes(),"Shared source lost original grant storage");
+                        if(participantCount>1)requireProvider(shared.executionBytes()>local.host().executionBytes(),"Shared source lost concurrent grant storage");
+                        channel=local.channelLayout();
+                    }
+                    const auto frames=q::ImmutableLookupServiceGeometry::checked(*channel,parsed.consumers);
+                    const auto stride=(channel->bytes()+63)/64*64;
+                    requireProvider(frames.channelCount()==participantCount&&frames.bytes()==stride*participantCount&&
+                        frames.hostBytes()==TransferEngine::mappedHostRegionAllocationBytes(frames.bytes()),"Complete channel BOM changed");
+                    for(std::size_t i=0;i<participantCount;++i)requireProvider(frames.device(i)==parsed.consumers[i]&&
+                        frames.offset(i)==i*stride&&frames.offset(i)+channel->bytes()<=frames.bytes(),"Original service frames alias or reorder");
+                    const auto reject=[&](std::size_t index,const std::string& value){
+                        const auto saved=args[index];args[index]=value;bool bad=false;
+                        try{(void)parseArgs();}catch(const std::exception&){bad=true;}
+                        args[index]=saved;requireProvider(bad,"Incompatible explicit source/cache declaration was accepted");
+                    };
+                    if(ssd){reject(args.size()-3,"0");reject(args.size()-3,"1");reject(args.size()-1,"0");reject(2,"local");}
+                    else{
+                        reject(14,"8");reject(20,"1");
+                        const auto count=args.size();args.insert(args.end(),{"--mmap-window-count","1024"});
+                        bool rejected=false;try{(void)parseArgs();}catch(const std::exception&){rejected=true;}
+                        args.resize(count);requireProvider(rejected,"Full RAM source accepted SSD mmap options");
+                        reject(args.size()-1,"unknown");
+                    }
+                    reject(6,backend+":0,"+backend+":0");
+                    reject(6,backend+":0,"+(backend=="cuda"?"rocm:0":"cuda:0"));
+                    reject(6,backend+":1,"+backend+":0");reject(6,"");
+                }
+    std::cout<<"POOLED_CONSUMER_LOCAL_DECLARATIONS_PASS backings=ssd,ram backends=2 capacities=0,64 participant_counts=1,2,4,8 native_creation=0\n";
 }
 
 /** @brief Actual concurrent ConsumerLocal native owners around one original subordinate source and I/O worker.
- * Uses the existing production plural layout projections and complete-group admission.
+ * Uses original per-requester layout projections and the exact individual or
+ * complete-group admission required by the authored population.
  * All graphs remain participant-local and the existing native byte oracle is unchanged.
  */
 class ConsumerLocalActor final {
@@ -544,8 +614,9 @@ public:
         const auto declarations=std::move(services).freeze();
         const auto ioBOM=declarations->bom(instance,cpu);
         for(const auto& row:ioBOM.resources())bom.add(row);
-        const ProviderReplaySpec spec{file_,o.shape.capacity_tokens*16,o.gpu_slots,o.ram_slots,n::OriginalIdWidth::UInt64,
+        ProviderReplaySpec spec{file_,o.shape.capacity_tokens*16,o.gpu_slots,o.ram_slots,n::OriginalIdWidth::UInt64,
             true,OwnerAdmission::Original,ACKInterleaving::None,ActivationPreparation::BeforeGraph,o.shape.capacity_tokens*16,true};
+        spec.sourceBacking=o.sourceBacking;
         for(const auto consumer:o.consumers){
             auto geometry=ProviderReplayGeometry::create(spec,consumer,*session_,io);
             const auto local=AdaptiveImmutableLookupGeometry::forRequester(layout,source,request,{0,consumer});
@@ -562,6 +633,8 @@ public:
         session_->admit(bom.build());
         auto binding=declarations->bind(session_->memory(),std::span{&instance,std::size_t{1}});
         provider_=HostImmutableRowProvider::fromSubordinateAdaptiveCache(CpuAdaptiveImmutableRowCache::create(source,shared,session_->memory()));
+        requireProvider(provider_->sourceStats().storage==request.sourceStorage()&&
+            provider_->sourceStats().physical_budget_bytes==shared.sourceBytes(),"Materialized source differs from its original typed backing/BOM");
         service_=q::ImmutableLookupService::create(provider_,programs_.front().geometry.channel,o.consumers,
             session_->memory(),DeviceId::cpu(),binding->take(instance));
         try{
@@ -578,39 +651,42 @@ public:
     }
     /** @brief Retain one source authority through all graph, payload and native-reset teardown. */
     ~ConsumerLocalActor()noexcept{try{release();}catch(const std::exception& failure){std::cerr<<"FATAL grouped provider cleanup: "<<failure.what()<<'\n';std::terminate();}}
-    /** @brief Arm all exact channel tickets before either participant publishes admission or lookup work. */
+    /** @brief Arm all exact channel tickets before any participant publishes admission or lookup work. */
     void admit(){
         std::vector<q::ImmutableLookupExecutionBoundary::SourceAdmissionParticipant> members;
         ++requestEpoch_;
         for(const auto& fixture:fixtures_)members.push_back({fixture->boundary,requestEpoch_});
-        group_=q::ImmutableLookupExecutionBoundary::armSourceGroup(members);
+        // A single original channel uses its existing individual admission;
+        // plural channels require the same complete source-group authority.
+        if(members.size()>1)group_=q::ImmutableLookupExecutionBoundary::armSourceGroup(members);
         for(std::size_t i=0;i<fixtures_.size();++i)worker(i).submitAndWait([&,i]{fixtures_[i]->admit(requestEpoch_);});
     }
-    /** @brief Prepare both channels outside timing, then submit both exact original streams before any completion collection. */
+    /** @brief Prepare all channels outside timing, then submit all exact original streams before any completion collection. */
     void sample(std::span<const std::uint64_t> ids,std::optional<std::uint32_t> expectedHits,bool report,std::uint32_t index){
         for(std::size_t i=0;i<fixtures_.size();++i)worker(i).submitAndWait([&,i]{fixtures_[i]->prepareTiming(ids);});
-        const auto beforeAdvice=observeGroupSource(*file_,ids);
+        const bool ssd=o.sourceBacking==AdaptiveImmutableRowBacking::SSD;
+        const auto beforeAdvice=ssd?observeGroupSource(*file_,ids):GroupSourceObservation{};
         const auto advice=o.coldAttempt?::posix_fadvise(file_->fd,0,0,POSIX_FADV_DONTNEED):0;
-        auto before=observeGroupSource(*file_,ids);
+        auto before=ssd?observeGroupSource(*file_,ids):GroupSourceObservation{};
         observeGroupCounters(before);
-        std::array<double,2> completionUs{};
-        std::array<double,2> eventUs{};
+        // Measurement-only host scratch is sized before the timed interval.
+        std::vector<double> completionUs(fixtures_.size()),eventUs(fixtures_.size());
         std::vector<std::future<void>> pending;
+        pending.reserve(fixtures_.size());
         const auto start=std::chrono::steady_clock::now();
-        for(std::size_t i=0;i<fixtures_.size();++i)pending.push_back(worker(i).submitAsync([&,i]{
-            events_[i]->begin(fixtures_[i]->stream);
-            fixtures_[i]->launchTiming();
-            events_[i]->end(fixtures_[i]->stream);
-            fixtures_[i]->join();
-            completionUs[i]=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-start).count();
-        }));
-        std::exception_ptr primary;
-        for(auto& future:pending)try{future.get();}catch(...){if(!primary)primary=std::current_exception();}
-        if(primary)std::rethrow_exception(primary);
+        enqueueAndDrain(pending,fixtures_.size(),[&](std::size_t i){
+            return worker(i).submitAsync([&,i]{
+                events_[i]->begin(fixtures_[i]->stream);
+                fixtures_[i]->launchTiming();
+                events_[i]->end(fixtures_[i]->stream);
+                fixtures_[i]->join();
+                completionUs[i]=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-start).count();
+            });
+        });
         const auto complete=std::chrono::steady_clock::now();
         GroupSourceObservation completedCounters;
         observeGroupCounters(completedCounters);
-        auto after=observeGroupSource(*file_,ids);
+        auto after=ssd?observeGroupSource(*file_,ids):GroupSourceObservation{};
         after.readBytes=completedCounters.readBytes;
         after.usage=completedCounters.usage;
         nlohmann::json channels=nlohmann::json::array();
@@ -629,32 +705,34 @@ public:
         }
         requireAssertions();
         if(!report)return;
-        const bool known=before.readBytes&&after.readBytes&&*after.readBytes>=*before.readBytes;
+        const bool known=ssd&&before.readBytes&&after.readBytes&&*after.readBytes>=*before.readBytes;
         const auto bytes=known?*after.readBytes-*before.readBytes:0;
         const bool cold=o.coldAttempt&&advice==0&&before.livePages&&before.residentLive==0&&known&&bytes&&before.filesystemType!=0x01021994;
-        std::cout<<"NGRAM_GROUP_SAMPLE "<<nlohmann::json{{"schema",1},{"kind","consumer_local_pooled"},
+        std::cout<<"NGRAM_GROUP_SAMPLE "<<nlohmann::json{{"schema",1},{"kind","consumer_local_pooled"},{"participant_count",programs_.size()},
             {"profile","component_only"},{"production_program_qualified",!ProviderReplayRawDiagnostic},
-            {"raw_native_program_diagnostic",ProviderReplayRawDiagnostic},{"full_model_tp_qualified",false},{"request_epoch",requestEpoch_},{"sample",index},{"scenario",o.scenario},
+            {"raw_native_program_diagnostic",ProviderReplayRawDiagnostic},{"full_model_tp_qualified",false},{"request_epoch",requestEpoch_},{"sample",index},{"source_backing",o.sourceBacking==AdaptiveImmutableRowBacking::RAM?"ram":"ssd"},{"scenario",o.scenario},
             {"trace_schedule",ngram_replay::Schedule},{"trajectory_index",ngram_replay::PreludeFrames+index},
             {"tokens_per_consumer",ids.size()/16},{"capacity_tokens_per_consumer",o.shape.capacity_tokens},
             {"query_heads_per_consumer",16},{"format","IQ4_NL"},{"width",file_->columns},{"row_bytes",file_->row_bytes},
-            {"mmap_window_bytes",o.mmapWindowBytes},{"mmap_window_count",o.mmapWindowCount},
+            {"mmap_window_bytes",o.sourceBacking==AdaptiveImmutableRowBacking::SSD?nlohmann::json(o.mmapWindowBytes):nlohmann::json(nullptr)},{"mmap_window_count",o.sourceBacking==AdaptiveImmutableRowBacking::SSD?nlohmann::json(o.mmapWindowCount):nlohmann::json(nullptr)},
             {"table_rows",file_->rows},{"full_qfn_table",false},{"gpu_slots_per_consumer",o.gpu_slots},{"shared_ram_slots",o.ram_slots},
             {"channels",channels},{"group_wall_us",std::chrono::duration<double,std::micro>(complete-start).count()},
-            {"scope","both_original_enqueues_through_all_native_completion_excluding_inputs_oracles_and_terminal"},
+            {"scope","all_original_enqueues_through_all_native_completion_excluding_inputs_oracles_and_terminal"},
             {"source_copies",1},{"io_workers",1},{"physical_io_scope","process_not_per_file_or_channel_attribution"},
             {"read_bytes",known?nlohmann::json(bytes):nlohmann::json(nullptr)},
             {"major_faults",after.usage.ru_majflt-before.usage.ru_majflt},{"minor_faults",after.usage.ru_minflt-before.usage.ru_minflt},
-            {"cache_regime",cold?"os_cold_confirmed_block_io":o.coldAttempt?"file_cold_attempt_unconfirmed":before.residentLive==before.livePages?"os_hot_live_pages":"mixed_os_residency"},
+            {"cache_regime",!ssd?"ram_resident_source":cold?"os_cold_confirmed_block_io":o.coldAttempt?"file_cold_attempt_unconfirmed":before.residentLive==before.livePages?"os_hot_live_pages":"mixed_os_residency"},
             {"file_advice_result",o.coldAttempt?nlohmann::json(advice):nlohmann::json(nullptr)},
-            {"live_pages",before.livePages},{"resident_live_before",before.residentLive},{"resident_live_after",after.residentLive},
-            {"file_pages",before.filePages},{"resident_file_before_advice",beforeAdvice.residentFile},
-            {"resident_file_before",before.residentFile},{"resident_file_after",after.residentFile},
-            {"filesystem_type",before.filesystemType},{"source_is_sparse_authored_component",true},{"byte_validation",true}}.dump()<<'\n';
+            {"live_pages",o.sourceBacking==AdaptiveImmutableRowBacking::SSD?nlohmann::json(before.livePages):nlohmann::json(nullptr)},{"resident_live_before",o.sourceBacking==AdaptiveImmutableRowBacking::SSD?nlohmann::json(before.residentLive):nlohmann::json(nullptr)},{"resident_live_after",o.sourceBacking==AdaptiveImmutableRowBacking::SSD?nlohmann::json(after.residentLive):nlohmann::json(nullptr)},
+            {"file_pages",o.sourceBacking==AdaptiveImmutableRowBacking::SSD?nlohmann::json(before.filePages):nlohmann::json(nullptr)},{"resident_file_before_advice",o.sourceBacking==AdaptiveImmutableRowBacking::SSD?nlohmann::json(beforeAdvice.residentFile):nlohmann::json(nullptr)},
+            {"resident_file_before",o.sourceBacking==AdaptiveImmutableRowBacking::SSD?nlohmann::json(before.residentFile):nlohmann::json(nullptr)},{"resident_file_after",o.sourceBacking==AdaptiveImmutableRowBacking::SSD?nlohmann::json(after.residentFile):nlohmann::json(nullptr)},
+            {"filesystem_type",o.sourceBacking==AdaptiveImmutableRowBacking::SSD?nlohmann::json(before.filesystemType):nlohmann::json(nullptr)},{"source_is_sparse_authored_component",true},{"byte_validation",true}}.dump()<<'\n';
     }
-    /** @brief Publish and join BOTH original native terminals before consuming either shared-service channel await. */
+    /** @brief Publish and join all original native terminals before consuming any shared-service channel await. */
     void close(){
-        if(!group_)return;
+        if(!group_&&!std::any_of(fixtures_.begin(),fixtures_.end(),[](const auto& fixture){
+            return fixture&&fixture->boundary&&fixture->boundary->hasActiveInterval();
+        }))return;
         std::exception_ptr primary;
         for(std::size_t i=0;i<fixtures_.size();++i)if(fixtures_[i]->boundary->hasActiveInterval())try{
             worker(i).submitAndWait([&,i]{fixtures_[i]->publishClose();graphs_[i]->publishRequestTerminal();fixtures_[i]->join();});
@@ -676,8 +754,9 @@ public:
         }
         requireAssertions();
         const auto source=provider_->sourceStats();
-        std::cout<<"NGRAM_GROUP_TERMINAL "<<nlohmann::json{{"schema",1},{"channels",channels},{"shared_source",true},
-            {"mmap_window_bytes",o.mmapWindowBytes},{"mmap_window_count",o.mmapWindowCount},
+        std::cout<<"NGRAM_GROUP_TERMINAL "<<nlohmann::json{{"schema",1},{"participant_count",programs_.size()},{"channels",channels},{"shared_source",true},
+            {"source_backing",o.sourceBacking==AdaptiveImmutableRowBacking::RAM?"ram":"ssd"},
+            {"mmap_window_bytes",o.sourceBacking==AdaptiveImmutableRowBacking::SSD?nlohmann::json(o.mmapWindowBytes):nlohmann::json(nullptr)},{"mmap_window_count",o.sourceBacking==AdaptiveImmutableRowBacking::SSD?nlohmann::json(o.mmapWindowCount):nlohmann::json(nullptr)},
             {"shared_cache",true},{"same_pma",true},{"all_original_channel_terminals_retired",true},
             {"source_requests_cumulative",source.requests},{"source_rows_cumulative",source.rows},
             {"source_copied_bytes_cumulative",source.copied_bytes},{"source_window_hits_cumulative",source.window_hits},
@@ -735,7 +814,10 @@ void measureConsumerLocal(std::shared_ptr<ProviderFile> file,const Options& o){
  */
 void calibrateRemote(std::shared_ptr<ProviderFile> file,const Options& o){
     std::vector<CrossVendorReadReplaySpec> specs;
-    for(std::uint32_t instance=0;instance<o.lifetimes;++instance)specs.push_back({file,o.gpu_slots,o.shape.capacity_tokens*16,o.shape.capacity_tokens*16,o.ram_slots,true,o.remoteHandshake});
+    for(std::uint32_t instance=0;instance<o.lifetimes;++instance){
+        CrossVendorReadReplaySpec spec{file,o.gpu_slots,o.shape.capacity_tokens*16,o.shape.capacity_tokens*16,o.ram_slots,true,o.remoteHandshake};
+        spec.sourceBacking=o.sourceBacking;specs.push_back(std::move(spec));
+    }
     CrossVendorReadReplayPrograms programs(std::move(specs));programs.prepare(o.continuation,o.owner);
     for(std::uint32_t instance=0;instance<o.lifetimes;++instance)programs.run(instance,[&](CrossVendorReadReplay& replay){
         const auto receipt=programs.program(instance).calibration;requireProvider(bool(receipt),"Authored remote instance lost its original diagnostic receipt");
@@ -790,6 +872,14 @@ void run(const Options& o){
 } // namespace llaminar2::test
 /** @brief Own process-native retirement; every assertion/exception fails the measurement. */
 int main(int argc,char** argv){
+    if(argc==2&&std::string_view(argv[1])=="--help"){
+        std::cout<<"Pooled lookup measurement: --placement local|cross_vendor|consumer_local|no_peer --continuation cuda:N|rocm:N\n"
+            <<"--source-backing ssd|ram (default ssd); full RAM requires --ram-slots 0.\n"
+            <<"--ram-slots is a bounded SSD-source RAM row cache, never full-table RAM backing.\n"
+            <<"SSD ConsumerLocal may declare --mmap-window-bytes/--mmap-window-count and --cold-attempt; RAM rejects those options.\n"
+            <<"ConsumerLocal requires --consumers with unique homogeneous devices and continuation first. --self-test creates no native resources.\n";
+        return 0;
+    }
     if(argc==2&&std::string_view(argv[1])=="--self-test"){
         try{llaminar2::test::proveConsumerLocalDeclarations();return 0;}
         catch(const std::exception& failure){std::cerr<<"FATAL "<<failure.what()<<'\n';return 1;}

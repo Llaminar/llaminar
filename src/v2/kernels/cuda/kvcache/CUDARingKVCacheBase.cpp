@@ -14,6 +14,7 @@
 #include "../../../utils/Logger.h"
 #include <cuda_runtime.h>
 #include <algorithm>
+#include "../../KVCacheMetadataInitialization.h"
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -166,8 +167,16 @@ namespace llaminar2
     // Graph Capture Device Params Management
     // =========================================================================
 
+    /**
+     * @brief Construct and complete canonical sequence rows before publishing raw device pointers.
+     * @throws std::logic_error If invoked inside captured execution.
+     * @throws std::runtime_error If original allocation, zero submission or cold event completion fails.
+     * @note Constructor/allocation only; ordinary reset and append keep their caller-stream ordering.
+     */
     void CUDARingKVCacheBase::allocateDeviceParams()
     {
+        if (isGraphCaptureActive())
+            throw std::logic_error("CUDARingKVCacheBase metadata construction is cold setup, never captured execution");
         // Recurrent-only slices still checkpoint one frontier per request;
         // payload entry tables remain empty and no attention horizon is allocated.
         const int num_entries = sequence_geometry_.rows() * batch_size_;
@@ -205,6 +214,20 @@ namespace llaminar2
             freeDeviceParams();
             throw std::runtime_error(
                 "[CUDARingKVCacheBase] Failed to initialize mandatory device sequence metadata");
+        }
+
+        // These two zeroes were enqueued on the exact original setup stream,
+        // while later callers may append/reset/capture on unrelated nonblocking
+        // streams. Complete only this cold producer event before publishing raw
+        // sequence pointers. No request/token operation waits or rerecords it.
+        try
+        {
+            detail::completeColdKVMetadataInitialization(*backend, device_id_, init_stream);
+        }
+        catch (...)
+        {
+            freeDeviceParams();
+            throw;
         }
 
         LOG_DEBUG("[CUDARingKVCacheBase] Allocated device params for graph capture: "

@@ -8,6 +8,7 @@
  * Cross-vendor declarations prove geometry only, not native transport or runtime eligibility.
  */
 #include "loaders/ImmutableRowTableLayoutGeometry.h"
+#include "loaders/AdaptiveImmutableLookupGeometry.h"
 #include <gtest/gtest.h>
 #include <array>
 #include <algorithm>
@@ -313,5 +314,39 @@ TEST(ImmutableRowTableLayoutGeometry, MixedVendorFixedRangesRetainExactNativeCov
     collision[1].key=cuda;
     EXPECT_THROW(Layout::checked(extent(),tiers({Storage::VRAM,Storage::RAM}),Residency::Fixed,
         collision,consumers,ranges,{}),std::invalid_argument);
+}
+
+/** @test Source-only physical owners need no invented remote observation, including C0 source projection. */
+TEST(ImmutableRowTableLayoutGeometry, SharedOwnerSubsetSourceProjectionSeparatesReadersFromRemoteOwners) {
+    for(const auto type:{DeviceType::CUDA,DeviceType::ROCm})
+        for(unsigned mask=1;mask<4;++mask)
+            for(int source=0;source<2;++source)
+                for(const std::uint64_t capacity:{0u,2u}) {
+                    const Id coordinator{0,DeviceId(type,source)};
+                    const std::vector<Id> readers{{0,DeviceId(type,1)},{0,DeviceId(type,0)}};
+                    std::vector<ImmutableRowTableLayoutOwner> owners;
+                    std::string declaration;const std::string backend=type==DeviceType::CUDA?"cuda":"rocm";
+                    for(unsigned owner=0;owner<2;++owner)if(mask&(1u<<owner)) {
+                        owners.push_back({{{0,DeviceId(type,int(owner))},Storage::VRAM},0,capacity,{}});
+                        if(!declaration.empty())declaration+=",";
+                        declaration+="0:"+backend+":"+std::to_string(owner)+"/"+std::to_string(capacity)+"/"+std::to_string(capacity?1048576:0);
+                    }
+                    AdaptiveVRAMRAMSSDRequest request;
+                    request.placement=parseAdaptiveGPUCachePlacement(declaration+"@0:"+backend+":"+std::to_string(source));
+                    const auto directory=capacity?std::optional{coordinator}:std::nullopt;
+                    const auto layout=Layout::checked(extent(),tiers({Storage::VRAM,Storage::MemoryMapped}),Residency::Adaptive,
+                        owners,readers,{}, {service()}, {},directory,16,ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator,
+                        std::nullopt,{},coordinator);
+                    const auto projected=AdaptiveImmutableLookupGeometry::sourceLayout(layout,request);
+                    ASSERT_EQ(projected.consumers().size(),1u);EXPECT_EQ(projected.consumers().front(),coordinator);
+                    EXPECT_EQ(projected.owners().size(),owners.size());EXPECT_FALSE(projected.peerAccess());
+                    EXPECT_TRUE(projected.readerPeerAccess().empty());
+                    for(const auto& owner:owners)EXPECT_EQ(projected.nativePayloadBytes(owner.key),capacity*extent().rowBytes());
+                    // A reader transport declaration cannot authenticate a
+                    // nonexistent physical-owner peer edge.
+                    if(mask==(1u<<source))EXPECT_THROW(Layout::checked(extent(),layout.tiers(),Residency::Adaptive,
+                        owners,readers,{}, {service()}, {},directory,16,ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator,
+                        PeerAccessCoverage::Complete,{},coordinator),std::invalid_argument);
+                }
 }
 } // namespace llaminar2::test

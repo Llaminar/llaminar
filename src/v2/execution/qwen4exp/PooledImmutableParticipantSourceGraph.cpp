@@ -56,17 +56,17 @@ std::shared_ptr<const PooledImmutableCapturedSourceWave> PooledImmutableCaptured
     previous->requireCurrent();const auto pin=previous->previous()->pin();const auto forward=pin->forward();const auto source=boundary->pooledStorage();const auto coordinate=previous->declaration().coordinate();
     forward->ownerStorage()->requireAuthority(memory);forward->coordinatorStorage()->requireAuthority(memory);
     if(source->coordinator()!=forward->coordinatorStorage() || coordinate>=source->originalOwners().size() || source->originalOwners()[coordinate]!=forward->ownerStorage() ||
-        !source->geometry().parameters().offsets.seal_receipt || !forward->declaration().capturedChannelTransport() || !forward->channel_ || !pin->channel_)
+        !source->geometry().parameters().offsets.seal_receipt || (!forward->channel_.nativeCollective() && !forward->declaration().capturedChannelTransport()) || !forward->channel_ || !pin->channel_)
         throw std::invalid_argument("Source fill requires original all-remote r5 cross-vendor cohort; native/rank/mixed-local factory remains guarded");
     source->coordinator()->requireAuthority(memory);source->captureIdentity();
     // The original service binding authenticated source roots against this same PMA at publication.
     // No second allocation/channel is created here.
     auto candidate=std::shared_ptr<PooledImmutableCapturedSourceWave>(new PooledImmutableCapturedSourceWave(previous,boundary,memory,{}));
-    const auto src=source->roots(),own=forward->ownerStorage()->roots();const auto& offsets=source->geometry().parameters().offsets;auto& transfer=TransferEngine::instance();
+    const auto src=source->roots(),own=forward->ownerStorage()->roots();const auto& offsets=source->geometry().parameters().offsets;
     for(unsigned i=0;i<5;++i){const auto role=static_cast<PooledSourceWireRole>(i);if(!candidate->hasPayload() && (role==PooledSourceWireRole::Fills || role==PooledSourceWireRole::Payload))continue;const bool back=reverse(role);const auto& channel=back?pin->channel_:forward->channel_;const auto from=candidate->source(role),to=candidate->destination(role);const auto key=((forward->declaration().identity()^(48+i))*1099511628211ULL)|1;
-        auto send=transfer.bindCapturedTransfer(channel,CapturedTransferEndpoint::Producer,{key,from.bytes},root(back?own:src,from.buffer),from.offset);
-        auto receive=transfer.bindCapturedTransfer(channel,CapturedTransferEndpoint::Consumer,{key,from.bytes},root(back?src:own,to.buffer),to.offset);
-        if(role==PooledSourceWireRole::Fills || role==PooledSourceWireRole::Payload){const bool fills=role==PooledSourceWireRole::Fills;const auto& p=forward->ownerStorage()->plan().parameters();send=transfer.bindDeviceCountedTransfer(std::move(send),src.native,fills?offsets.record_bytes:offsets.payload_bytes);receive=transfer.bindDeviceCountedTransfer(std::move(receive),own.native,p.native.ingress+(fills?offsetof(n::OwnerIngress,record_bytes):offsetof(n::OwnerIngress,payload_bytes)));}
+        auto send=(channel).bind(CapturedTransferEndpoint::Producer,{key,from.bytes},root(back?own:src,from.buffer),from.offset);
+        auto receive=(channel).bind(CapturedTransferEndpoint::Consumer,{key,from.bytes},root(back?src:own,to.buffer),to.offset);
+        if(role==PooledSourceWireRole::Fills || role==PooledSourceWireRole::Payload){const bool fills=role==PooledSourceWireRole::Fills;const auto& p=forward->ownerStorage()->plan().parameters();send=std::move(send).withDeviceCounted(src.native,fills?offsets.record_bytes:offsets.payload_bytes,fills?PooledNativeCountedMessage::SourceFills:PooledNativeCountedMessage::SourcePayload);receive=std::move(receive).withDeviceCounted(own.native,p.native.ingress+(fills?offsetof(n::OwnerIngress,record_bytes):offsetof(n::OwnerIngress,payload_bytes)),fills?PooledNativeCountedMessage::SourceFills:PooledNativeCountedMessage::SourcePayload);}
         candidate->bindings_[i].emplace(std::move(send),std::move(receive));
     }
     candidate->requireCurrent();return candidate;
@@ -77,7 +77,7 @@ void PooledImmutableCapturedSourceWave::requireCurrent()const{
     if(storage->coordinator()!=forward->coordinatorStorage() || coordinate()>=storage->originalOwners().size() || storage->originalOwners()[coordinate()]!=forward->ownerStorage())throw std::logic_error("Source fill replaced original source/owner/coordinator");
     storage->captureIdentity();
 }
-const CapturedTransferBinding& PooledImmutableCapturedSourceWave::binding(PooledSourceWireRole role,CapturedTransferEndpoint endpoint)const{
+const PooledImmutableTransferBinding& PooledImmutableCapturedSourceWave::binding(PooledSourceWireRole role,CapturedTransferEndpoint endpoint)const{
     requireCurrent();const auto i=roleIndex(role);if(endpoint!=CapturedTransferEndpoint::Producer && endpoint!=CapturedTransferEndpoint::Consumer)throw std::invalid_argument("Invalid source endpoint");if(!bindings_[i])throw std::invalid_argument("C0 source owner has no Fill/payload transaction");return endpoint==CapturedTransferEndpoint::Producer?bindings_[i]->first:bindings_[i]->second;
 }
 PooledNativeOperandSpans PooledImmutableCapturedSourceWave::ownerInputs(n::OwnerAction action)const{
@@ -144,23 +144,23 @@ public:
     q::PooledImmutableDirectedTransferOperation directedTransferOperation()const{
         requireDeclarations();const auto& binding=edge_->binding(role_,side_);
         return {q::PooledImmutableDirectedWireFamily::Source,static_cast<std::uint32_t>(role_),side_,
-            binding.message().bytes,binding.extentSource(),binding.hasSourceSlice()};
+            binding.message().bytes,binding.extentSource(),binding.hasSourceSlice(),binding.nativeCollective()?q::PooledImmutableDirectedTransportKind::NativeCollective:q::PooledImmutableDirectedTransportKind::CapturedChannel};
     }
 
     /** @brief Retain original endpoint/root/channel authority and freeze complete variant identity. */
     PooledSourceTransferStage(BufferArena& arena,std::shared_ptr<const q::PooledImmutableCapturedSourceWave> edge,q::PooledSourceWireRole role,CapturedTransferEndpoint side)
-        :IComputeStage(ownerEndpoint(role,side)?edge->previous()->previous()->pin()->forward()->ownerStorage()->plan().allocator().device:edge->boundary()->device()),arena_(&arena),edge_(std::move(edge)),role_(role),side_(side){requireDeclarations();identity_=graphCaptureVariantSignature();}
+        :IComputeStage(ownerEndpoint(role,side)?edge->previous()->previous()->pin()->forward()->ownerStorage()->plan().allocator().device:edge->boundary()->device()),arena_(&arena),edge_(std::move(edge)),role_(role),side_(side){requireDeclarations();identity_=graphCaptureVariantSignature();native_collective_=edge_->binding(role_,side_).nativeCollective();}
     /** @brief Join only this participant's exact original setup events on its captured stream. */
     bool prepareGraphLaunch(IDeviceContext* context,void* stream)override{
         if(!context || context->deviceId()!=device() || !stream || reinterpret_cast<uintptr_t>(stream)<=2)throw std::invalid_argument("Source endpoint needs exact participant/nondefault stream");requireDeclarations();if(identity_!=graphCaptureVariantSignature())throw std::logic_error("Source endpoint capture identity drift");
-        if(ownerEndpoint(role_,side_))edge_->previous()->previous()->pin()->forward()->ownerStorage()->acquireSetup(stream);else edge_->boundary()->pooledStorage()->acquireSetup(stream);setGPUStream(stream);return true;
+        if(ownerEndpoint(role_,side_))edge_->previous()->previous()->pin()->forward()->ownerStorage()->acquireSetup(stream);else edge_->boundary()->pooledStorage()->acquireSetup(stream);edge_->binding(role_,side_).prepare(stream);setGPUStream(stream);return true;
     }
     /** @brief Submit only the actual fixed/counted transfer; no live value reaches the host. */
-    bool execute(IDeviceContext* context)override{if(!context || context->deviceId()!=device())throw std::invalid_argument("Source transfer changed participant");requireDeclarations();if(identity_!=graphCaptureVariantSignature())throw std::logic_error("Source transfer identity drift");TransferEngine::instance().enqueueCapturedTransfer(edge_->binding(role_,side_),requireGPUStream());return true;}
+    bool execute(IDeviceContext* context)override{if(!context || context->deviceId()!=device())throw std::invalid_argument("Source transfer changed participant");requireDeclarations();if(identity_!=graphCaptureVariantSignature())throw std::logic_error("Source transfer identity drift");edge_->binding(role_,side_).enqueue(requireGPUStream());return true;}
     /** @return Explicit graph collective, never a hidden multidevice compute phase. */
     ComputeStageType type()const override{return ComputeStageType::QWEN4EXP_POOLED_DIRECTED_TRANSFER;}
     /** @return This original bound endpoint executes native device-counted transfer kernels, independently from collective-runtime capture. */
-    CollectiveGraphCaptureAuthority collectiveGraphCaptureAuthority()const noexcept override{return CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;}
+    CollectiveGraphCaptureAuthority collectiveGraphCaptureAuthority()const noexcept override{return native_collective_?CollectiveGraphCaptureAuthority::RuntimeBackend:CollectiveGraphCaptureAuthority::ParticipantLocalCapturedTransfer;}
     /** @return Nominal component name. */
     std::string name()const override{return "PooledImmutableDirectedSource";}
     /** @return Complete original endpoint identity with no mutable count/cursor value. */
@@ -189,7 +189,37 @@ private:
         const auto native=owner?BufferId::QFN_POOLED_OWNER_NATIVE:BufferId::QFN_POOLED_SOURCE_NATIVE,frame=owner?BufferId::QFN_POOLED_OWNER_FRAME:BufferId::QFN_POOLED_SOURCE_FRAME;const auto span=side_==CapturedTransferEndpoint::Producer?edge_->source(role_):edge_->destination(role_);
         if(arena_->getTensor(native)!=roots.native.get() || (span.buffer==frame && arena_->getTensor(frame)!=roots.frame.get()))throw std::logic_error("Source endpoint arena replaced original root authority");
     }
-    BufferArena* arena_;std::shared_ptr<const q::PooledImmutableCapturedSourceWave> edge_;q::PooledSourceWireRole role_;CapturedTransferEndpoint side_;uint64_t identity_=0;
+public:
+    /** @brief Seal one consumed graph-local trunk join on this exact first response receive. */
+    void bindDemandJoin(const ComputeGraph& graph,const ComputeNode& node,const std::string& published,const std::vector<std::string>& trunk){
+        if(!demand_trunk_.empty() || side_!=CapturedTransferEndpoint::Consumer ||
+           role_!=(edge_->hasPayload()?q::PooledSourceWireRole::Fills:q::PooledSourceWireRole::TerminalFrontier) ||
+           node.dependencies.size()!=1 || node.dependencies.front()!=published || trunk.empty())
+            throw std::invalid_argument("Inline demand join lost its sole original seal-send predecessor");
+        const auto* before=graph.getNode(published);
+        const auto* stage=before?dynamic_cast<const PooledSourceTransferStage*>(before->stage.get()):nullptr;
+        if(!stage || !stage->matches(edge_.get(),q::PooledSourceWireRole::SealReceipt,CapturedTransferEndpoint::Producer))
+            throw std::invalid_argument("Inline demand join substituted its original seal receipt");
+        for(const auto& name:trunk)if(name==published || !graph.getNode(name) || graph.getNode(name)->device!=node.device)
+            throw std::invalid_argument("Inline demand join lacks actual same-participant trunk readiness");
+        demand_trunk_=trunk;
+    }
+    /** @return Sole original protocol predecessor after checking every declared consumed trunk edge. */
+    std::string protocolPredecessor(const ComputeGraph& graph,const ComputeNode& node)const{
+        for(const auto& name:demand_trunk_)if(std::count(node.dependencies.begin(),node.dependencies.end(),name)!=1 || !graph.getNode(name))
+            throw std::invalid_argument("Inline consumed demand lost an actual trunk dependency");
+        std::string original;
+        for(const auto& name:node.dependencies)if(std::find(demand_trunk_.begin(),demand_trunk_.end(),name)==demand_trunk_.end()){
+            if(!original.empty() || !graph.getNode(name))throw std::invalid_argument("Source owner lost sole original protocol predecessor");original=name;
+        }
+        if(original.empty())throw std::invalid_argument("Source owner omitted original protocol predecessor");
+        return original;
+    }
+private:
+    std::vector<std::string> demand_trunk_; ///< Cold graph declaration; no live execution or readiness state.
+    BufferArena* arena_;std::shared_ptr<const q::PooledImmutableCapturedSourceWave> edge_;q::PooledSourceWireRole role_;CapturedTransferEndpoint side_;
+    bool native_collective_=false; // Cold-selected original transport; capture policy never probes runtime state.
+    uint64_t identity_=0;
 };
 /** @brief Reject duplicate/missing node names before any new source graph mutation. */
 void sourceNames(const ComputeGraph& graph,std::span<const std::string> names){std::set<std::string> unique;for(const auto& name:names)if(name.empty() || graph.getNode(name) || !unique.insert(name).second)throw std::invalid_argument("Source fill graph would replace an existing node");}
@@ -199,7 +229,11 @@ void requirePooledSourceOwnerCompletion(const ComputeGraph& graph,
     const std::shared_ptr<const q::PooledImmutableCapturedSourceWave>& edge,const std::string& fillOutcome)
 {
     if(isGraphCaptureActive() || !edge)throw std::invalid_argument("Publication requires original cold source owner");edge->requireCurrent();const auto storage=edge->previous()->previous()->pin()->forward()->ownerStorage();const auto device=storage->plan().allocator().device;
-    const auto prior=[&](const ComputeNode* node){if(!node || node->device!=device || node->dependencies.size()!=1 || !graph.getNode(node->dependencies.front()))throw std::invalid_argument("Source owner lost sole original producer");return node->dependencies.front();};
+    const auto prior=[&](const ComputeNode* node){
+        if(!node || node->device!=device)throw std::invalid_argument("Source owner lost original participant");
+        if(const auto* transfer=dynamic_cast<const PooledSourceTransferStage*>(node->stage.get()))return transfer->protocolPredecessor(graph,*node);
+        if(node->dependencies.size()!=1 || !graph.getNode(node->dependencies.front()))throw std::invalid_argument("Source owner lost sole original producer");
+        return node->dependencies.front();};
     const auto phase=[&](const std::string& name,n::OwnerAction action){const auto* node=graph.getNode(name);const auto* stage=node?dynamic_cast<const PooledImmutableNativePhaseStage*>(node->stage.get()):nullptr;const auto* value=stage?std::get_if<PooledImmutableNativePhaseStage::Owner>(&stage->phase()):nullptr;const auto condition=action==n::OwnerAction::SealSource || action==n::OwnerAction::DrainSourceFailure?n::SourceCondition::Always:n::SourceCondition::AfterSuccess;const q::PooledImmutableOwnerOperands expected(action,storage->plan(),edge->ownerInputs(action),condition);
         if(!value || value->action!=action || value->storage!=storage || value->operands.declarationIdentity()!=expected.declarationIdentity())throw std::invalid_argument("Source owner replaced actual original phase/operands");return node;};
     const auto endpoint=[&](const std::string& name,q::PooledSourceWireRole role,CapturedTransferEndpoint side){const auto* node=graph.getNode(name);const auto* stage=node?dynamic_cast<const PooledSourceTransferStage*>(node->stage.get()):nullptr;if(!stage || !stage->matches(edge.get(),role,side))throw std::invalid_argument("Source owner replaced original endpoint/channel");return node;};
@@ -230,14 +264,16 @@ void requirePooledSourceCoordinatorCompletion(const ComputeGraph& graph,const Po
     if(original.coordinator.last!=prior)throw std::invalid_argument("Source completion replaced actual last packet reader/outcome");
 }
 PooledPinParticipantNodes appendPooledSourceOwnerFill(ComputeGraph& graph,BufferArena& arena,
-    std::shared_ptr<const q::PooledImmutableCapturedSourceWave> edge,std::shared_ptr<const q::IPooledImmutableNativeKernels> code,const std::string& sentVictims,const std::string& prefix)
+    std::shared_ptr<const q::PooledImmutableCapturedSourceWave> edge,std::shared_ptr<const q::IPooledImmutableNativeKernels> code,const std::string& sentVictims,const std::string& prefix, PooledImmutableDemandFrontier* demand)
 {
     if(isGraphCaptureActive() || !edge || !code || prefix.empty())throw std::invalid_argument("Source owner graph needs original cold owners/code");edge->requireCurrent();const auto owner=edge->previous()->previous()->pin()->forward()->ownerStorage();const auto device=owner->plan().allocator().device;if(code->backend()!=device.type)throw std::invalid_argument("Source owner code changed backend");
     requirePooledVictimOwnerCompletion(graph,edge->previous(),sentVictims);
     const std::array suffixes{"initial_receive","seal_source","seal_receipt_send","fill_receive","payload_receive","terminal_receive","drain_source_failure","apply_source","validate_fills","fill_outcome"};std::vector<std::string> names;for(const auto* suffix:suffixes)names.push_back(prefix+"/"+suffix);sourceNames(graph,names);std::vector<std::unique_ptr<IComputeStage>> stages;
     const auto transfer=[&](q::PooledSourceWireRole role,CapturedTransferEndpoint side){return std::make_unique<PooledSourceTransferStage>(arena,edge,role,side);};const auto phase=[&](n::OwnerAction action){return std::make_unique<PooledImmutableNativePhaseStage>(arena,code,PooledImmutableNativePhaseStage::Owner{action,owner,q::PooledImmutableOwnerOperands(action,owner->plan(),edge->ownerInputs(action),(action==n::OwnerAction::SealSource || action==n::OwnerAction::DrainSourceFailure)?n::SourceCondition::Always:n::SourceCondition::AfterSuccess)});};
     stages.push_back(transfer(q::PooledSourceWireRole::InitialFrontier,CapturedTransferEndpoint::Consumer));stages.push_back(phase(n::OwnerAction::SealSource));stages.push_back(transfer(q::PooledSourceWireRole::SealReceipt,CapturedTransferEndpoint::Producer));stages.push_back(edge->hasPayload()?transfer(q::PooledSourceWireRole::Fills,CapturedTransferEndpoint::Consumer):nullptr);stages.push_back(edge->hasPayload()?transfer(q::PooledSourceWireRole::Payload,CapturedTransferEndpoint::Consumer):nullptr);stages.push_back(transfer(q::PooledSourceWireRole::TerminalFrontier,CapturedTransferEndpoint::Consumer));stages.push_back(phase(n::OwnerAction::DrainSourceFailure));stages.push_back(phase(n::OwnerAction::ApplySourceDelivery));stages.push_back(phase(n::OwnerAction::ValidateFills));stages.push_back(phase(n::OwnerAction::DrainSourceFailure));
-    auto prior=sentVictims;for(size_t i=0;i<stages.size();++i)if(stages[i]){graph.addNode(names[i],std::move(stages[i]),device);graph.addDependency(names[i],prior);prior=names[i];}return {names.front(),prior};
+    auto prior=sentVictims;for(size_t i=0;i<stages.size();++i)if(stages[i]){graph.addNode(names[i],std::move(stages[i]),device);graph.addDependency(names[i],prior);prior=names[i];}
+    if(demand)*demand={PooledImmutableDemandRole::InlineOwner,names[2],names[edge->hasPayload()?3:5]};
+    return {names.front(),prior};
 }
 PooledPinParticipantNodes appendPooledSourceCoordinatorFill(ComputeGraph& graph,BufferArena& arena,
     std::span<const std::shared_ptr<const q::PooledImmutableCapturedSourceWave>> owners,std::shared_ptr<const q::IPooledImmutableNativeKernels> code,DeviceGenerationControlBinding control,
@@ -299,5 +335,79 @@ namespace llaminar2 {
 std::optional<qwen4exp::PooledImmutableDirectedTransferOperation> describePooledSourceTransfer(const IComputeStage& stage){
     if(const auto* original=dynamic_cast<const PooledSourceTransferStage*>(&stage))return original->directedTransferOperation();
     return std::nullopt;
+}
+}
+
+namespace llaminar2 {
+void bindPooledInlineDemandConsumption(ComputeGraph& graph,const PooledImmutableDemandFrontier& frontier,
+    const std::vector<std::string>& trunk){
+    if(frontier.role!=PooledImmutableDemandRole::InlineOwner)throw std::invalid_argument("Only an actual inline owner may bind its response join");
+    auto* node=graph.getNode(frontier.consume);
+    auto* stage=node?dynamic_cast<PooledSourceTransferStage*>(node->stage.get()):nullptr;
+    if(!stage)throw std::invalid_argument("Inline demand join lost its original response endpoint");
+    stage->bindDemandJoin(graph,*node,frontier.published,trunk);
+    for(const auto& name:trunk)graph.addDependency(frontier.consume,name);
+}
+}
+
+namespace llaminar2 {
+bool isPooledPureReaderDemandHeader(const ComputeNode& node,const RetainedGraphParticipantDefinitionDomain& domain);
+void validatePooledDemandFrontier(const ComputeGraph& graph,const PooledImmutableDemandFrontier& f){
+    if(isGraphCaptureActive())throw std::logic_error("Pooled demand handoff must seal before native graph capture");
+    if(f.role!=PooledImmutableDemandRole::Source && f.role!=PooledImmutableDemandRole::InlineOwner && f.role!=PooledImmutableDemandRole::PureReader)
+        throw std::invalid_argument("Pooled demand has an unknown original role");
+    const auto* consume=graph.getNode(f.consume);
+    if(!consume || !consume->stage)throw std::invalid_argument("Pooled demand lost its actual delayed endpoint");
+    if(f.role==PooledImmutableDemandRole::PureReader){
+        if(!f.published.empty() || !graph.retainedParticipantDefinitionDomain() || !isPooledPureReaderDemandHeader(*consume,*graph.retainedParticipantDefinitionDomain()))
+            throw std::invalid_argument("Pure reader demand cannot invent source publication or another receive role");
+        return;
+    }
+    const auto* publish=graph.getNode(f.published);
+    if(!publish || publish->device!=consume->device ||
+       std::count(consume->dependencies.begin(),consume->dependencies.end(),f.published)!=1)
+        throw std::invalid_argument("Pooled demand lost its original immediate protocol edge");
+    if(f.role==PooledImmutableDemandRole::Source){
+        const auto boundary=std::dynamic_pointer_cast<q::ImmutableLookupExecutionBoundary>(graph.retainedStorageBoundary());
+        const auto* issued=dynamic_cast<const PooledImmutableSourcePhaseStage*>(publish->stage.get());
+        const auto* delayed=dynamic_cast<const PooledImmutableSourcePhaseStage*>(consume->stage.get());
+        if(!boundary || !issued || !delayed || !issued->matchesDemand(boundary.get(),q::PooledSourceAction::Publish) ||
+           !delayed->matchesDemand(boundary.get(),q::PooledSourceAction::AcquireResponse))
+            throw std::invalid_argument("Source demand substituted its exact Publish/AcquireResponse authority");
+    }else{
+        const auto* issued=dynamic_cast<const PooledSourceTransferStage*>(publish->stage.get());
+        const auto* delayed=dynamic_cast<const PooledSourceTransferStage*>(consume->stage.get());
+        if(!issued || !delayed)throw std::invalid_argument("Inline demand substituted its addressed transfer endpoints");
+        // bindDemandJoin further authenticates the same original edge and exact first response role.
+    }
+}
+void bindPooledDemandConsumption(ComputeGraph& graph,const PooledImmutableDemandFrontier& frontier,
+    const std::vector<std::string>& trunk){
+    validatePooledDemandFrontier(graph,frontier);
+    if(frontier.role==PooledImmutableDemandRole::InlineOwner)bindPooledInlineDemandConsumption(graph,frontier,trunk);
+    else {
+        if(frontier.role==PooledImmutableDemandRole::Source){
+            auto* source=dynamic_cast<PooledImmutableSourcePhaseStage*>(graph.getNode(frontier.consume)->stage.get());
+            source->bindCurrentDemandTrunk(graph,*graph.getNode(frontier.consume),frontier.published,trunk);
+        }
+        for(const auto& name:trunk)graph.addDependency(frontier.consume,name);
+    }
+}
+}
+
+namespace llaminar2 {
+void PooledImmutableSourcePhaseStage::bindCurrentDemandTrunk(const ComputeGraph& graph,const ComputeNode& node,
+    const std::string& published,const std::vector<std::string>& trunk){
+    if(!demand_trunk_.empty() || action_!=qwen4exp::PooledSourceAction::AcquireResponse ||
+       graph.retainedStorageBoundary().get()!=boundary_.get() || node.stage.get()!=this || node.device!=device() ||
+       node.dependencies!=std::vector<std::string>{published} || trunk.empty())
+        throw std::invalid_argument("Source demand join lost its original response/Publish authority");
+    const auto* before=graph.getNode(published);
+    const auto* source=before?dynamic_cast<const PooledImmutableSourcePhaseStage*>(before->stage.get()):nullptr;
+    if(!source || !source->matchesDemand(boundary_.get(),qwen4exp::PooledSourceAction::Publish))
+        throw std::invalid_argument("Source demand join substituted its actual Publish operation");
+    for(const auto& name:trunk)if(name==published || !graph.getNode(name) || graph.getNode(name)->device!=device())
+        throw std::invalid_argument("Source demand join has no actual same-participant trunk producer");
+    demand_trunk_=trunk;
 }
 }

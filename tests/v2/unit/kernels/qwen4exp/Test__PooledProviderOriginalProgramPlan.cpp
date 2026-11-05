@@ -68,6 +68,15 @@ TEST(PooledProviderOriginalProgramPlan, PayloadEnvelopeAndAdditiveNativePrograms
         auto malformed=specs.back();malformed.maximum=33;
         EXPECT_THROW(ProviderReplayPrograms(std::vector{malformed}),std::runtime_error);
         std::vector<ProviderReplayGeometry> geometries;for(const auto& spec:specs)geometries.push_back(ProviderReplayGeometry::create(spec,device,*session,RetainedHostServiceReplayAccess::program(RetainedHostServiceRole::ImmutableLookupIO),projection));
+        // Full RAM changes the original source root, never the bounded host cache.
+        auto ramSpec=specs[1];ramSpec.sourceBacking=AdaptiveImmutableRowBacking::RAM;ramSpec.hostSlots=0;
+        const auto ramGeometry=ProviderReplayGeometry::create(ramSpec,device,*session,
+            RetainedHostServiceReplayAccess::program(RetainedHostServiceRole::ImmutableLookupIO),projection);
+        EXPECT_EQ(ramGeometry.cpu.sourceStorage(),ImmutableRowStorage::RAM);
+        EXPECT_EQ(ramGeometry.cpu.storageBytes(),0u);
+        EXPECT_EQ(ramGeometry.payload.find({0,DeviceId::cpu()})->bytes(PhysicalMemoryOwner::ImmutableTableStorage),ramGeometry.cpu.sourceBytes());
+        EXPECT_EQ(ramGeometry.cpu.sourceBytes(),ImmutableRowTable::physicalBytes(file->descriptor(),providerReplaySourcePolicy(ramSpec.sourceBacking)));
+        ramSpec.hostSlots=1;EXPECT_THROW(ramSpec.requireComplete(),std::runtime_error);
         const auto full=ProviderReplayPrograms::programBOM(geometries);const auto* gpu=full.find({0,device});const auto* host=full.find({0,DeviceId::cpu()});
         ASSERT_NE(gpu,nullptr);ASSERT_NE(host,nullptr);
         EXPECT_EQ(gpu->bytes(PhysicalMemoryOwner::NativeGraphExecutable),10*GPUGraphMemoryContract::reservationBytesPerExecutable(device,GPUGraphExecutableClass::General));

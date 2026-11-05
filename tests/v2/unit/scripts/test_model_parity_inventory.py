@@ -67,6 +67,23 @@ class InventoryTests(unittest.TestCase):
         exported = inventory.export_manifest(full, "revision", inventory.InventoryScope.ALL)
         self.assertEqual(exported, self.document)
 
+    def test_local_diagnostic_scope_never_promotes_a_candidate_to_runtime_inventory(self):
+        """The explicit projection is inspectable but cannot masquerade as ALL/E2E."""
+        candidate=row("candidate",False)
+        candidate["configuration"]["inventory_role"]="numerical_diagnostic"
+        self.document["scope"]="local-diagnostic";self.document["cells"]=[candidate]
+        selected=self.discover(inventory.InventoryScope.LOCAL_DIAGNOSTIC)
+        self.assertEqual([exact for _,exact,_ in selected],["candidate"])
+        for scope in inventory.InventoryScope:
+            if scope==inventory.InventoryScope.LOCAL_DIAGNOSTIC:continue
+            with self.subTest(scope=scope),self.assertRaisesRegex(ValueError,"local diagnostic manifest"):
+                self.discover(scope)
+            self.assertFalse(scope.accepts(candidate["configuration"]))
+        self.assertTrue(inventory.InventoryScope.LOCAL_DIAGNOSTIC.accepts(candidate["configuration"]))
+        candidate["configuration"]["e2e"]={}
+        with self.assertRaisesRegex(ValueError,"certification eligibility"):
+            inventory.InventoryScope.LOCAL_DIAGNOSTIC.accepts(candidate["configuration"])
+
     def test_explicit_predictor_is_required_in_manifest_even_for_mtp_off(self):
         """The optional second source is not discarded by inactive MTP policy."""
         source = self.document["cells"][0]

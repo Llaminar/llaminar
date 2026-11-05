@@ -340,6 +340,25 @@ class TestGPUBlockingSyncPolicy(unittest.TestCase):
                 with temporary:
                     self.assertEqual(not validate(root, (fixture_allowance,)), accepted)
 
+    def test_cold_kv_metadata_wait_cannot_escape_into_execution(self) -> None:
+        """One exact cold helper wait cannot authorize extra/reset/append/capture waits."""
+        allowance, = (entry for entry in ALLOWANCES if entry.caller == "completeColdKVMetadataInitialization")
+        self.assertEqual((allowance.category, allowance.kind, allowance.count), ("lifecycle", "backend_event", 1))
+        fixture_allowance = dataclasses.replace(allowance, path="src/v2/example.cpp")
+        for caller, count, accepted in (
+            ("completeColdKVMetadataInitialization", 1, True),
+            ("completeColdKVMetadataInitialization", 2, False),
+            ("completeColdKVMetadataInitialization", 0, False),
+            ("allocateDeviceParams", 1, False),
+            ("resetRequestState", 1, False),
+            ("appendWithStream", 1, False),
+            ("captureGraph", 1, False),
+        ):
+            with self.subTest(caller=caller, count=count):
+                temporary, root = self.make_repo(f"void {caller}() {{" + "backend.waitForEvent(event, ordinal);" * count + "}")
+                with temporary:
+                    self.assertEqual(not validate(root, (fixture_allowance,)), accepted)
+
     def test_immutable_submission_owner_wait_cannot_escape_into_serving(self) -> None:
         """One failed-submission/last-owner event never permits normal serving waits."""
         allowance, = (

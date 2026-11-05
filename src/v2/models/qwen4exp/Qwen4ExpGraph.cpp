@@ -14,6 +14,7 @@
 #include "execution/local_execution/graph/ReadAheadParticipantContract.h"
 #include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
 #include "Qwen4ExpConfig.h"
+#include "Qwen4ExpReplicatedPLECohort.h"
 #include "../../execution/prefix_cache/PrefixCacheFingerprint.h"
 #include "Qwen4ExpBufferLayout.h"
 #include "Qwen4ExpTrunkBinding.h"
@@ -482,6 +483,13 @@ struct Qwen4ExpGraph::EarlyPrefix final : ModelInvocationPrefix {
     std::string terminal() const override { return frame->producer(); }
     void requireConsumed() const override { frame->requireConsumed(); }
 };
+/** @brief Exact original pooled source/owner/reader frame owned by this one lexical graph build. */
+struct Qwen4ExpGraph::PooledPrefix final : ModelInvocationPrefix {
+    std::unique_ptr<Qwen4ExpPooledReadAheadFrame> frame;
+    explicit PooledPrefix(std::unique_ptr<Qwen4ExpPooledReadAheadFrame> value):frame(std::move(value)){}
+    std::string terminal()const override{return frame->producer();}
+    void requireConsumed()const override{frame->requireConsumed();}
+};
 /** @brief Lexically scoped current-demand resident prefix, independent of hosted protocol frames. */
 struct Qwen4ExpGraph::ResidentPrefix final : ModelInvocationPrefix {
     std::unique_ptr<Qwen4ExpResidentReadAheadFrame> frame;
@@ -515,9 +523,18 @@ std::unique_ptr<QwenGraphBase::ModelInvocationPrefix> Qwen4ExpGraph::addModelInv
     if(shape!=ModelInvocationShape::FullLocal || input.execution_role!=ForwardExecutionRole::MainInference ||
        config_.grouped_mtp_verifier || config_.pipeline_config ||
        !device.is_gpu() || input.batch_size!=1)
-        throw std::invalid_argument("Early current hosted lookup candidate requires ordinary complete single-participant local GPU forward; PP/MTP and multi-participant/non-local TP roles are unqualified");
-    if(!config_.ngram_table_placement || config_.ngram_table_placement->isGPUAdaptive() || config_.ngram_replicated_ple_cohort)
-        throw std::invalid_argument("Early current hosted lookup candidate requires an admitted ordinary hosted source");
+        throw std::invalid_argument("Early current hosted lookup candidate requires ordinary complete local GPU forward; PP/grouped MTP and request batches are unqualified");
+    if(!config_.ngram_table_placement)
+        throw std::invalid_argument("Early current lookup candidate requires its actual admitted source placement");
+    const bool pooledCandidate=!residentCandidate && config_.ngram_table_placement->isGPUAdaptive();
+    if(!pooledCandidate && (config_.ngram_table_placement->isGPUAdaptive() || config_.ngram_replicated_ple_cohort))
+        throw std::invalid_argument("Resident or whole-source read-ahead cannot adopt pooled/shared ownership");
+    if(pooledCandidate && config_.ngram_replicated_ple_cohort){
+        const auto* local=dynamic_cast<const ILocalTPContext*>(config_.tp_ctx);
+        if(!local || !local->isLocal() || local->degree()<2 || local->devices().size()!=static_cast<std::size_t>(local->degree()) ||
+           &config_.ngram_replicated_ple_cohort->context()!=local)
+            throw std::invalid_argument("Pooled read-ahead requires the same original addressed native shared reader communicator");
+    } else
     {
         const ILocalTPContext* local=nullptr;
         if(config_.tp_ctx)
@@ -541,7 +558,7 @@ std::unique_ptr<QwenGraphBase::ModelInvocationPrefix> Qwen4ExpGraph::addModelInv
             throw std::invalid_argument("Read-ahead continuation still owns a partial model assignment");
     }
     const auto tier=config_.ngram_table_placement->lookupForConsumer({config_.ngram_table_placement->worldRank(),device});
-    if(!residentCandidate && immutableRowLookupUsesNativeDeviceStorage(tier))
+    if(!residentCandidate && !pooledCandidate && immutableRowLookupUsesNativeDeviceStorage(tier))
         throw std::invalid_argument("Early current hosted lookup candidate does not implement resident/fixed-head GPU overlap");
     const auto prefix="layer"+std::to_string(config_.flash_next->ngrams().decoder_layer)+"_ple_";
     const auto context=pleContext(input,device,prefix);
@@ -567,6 +584,19 @@ std::unique_ptr<QwenGraphBase::ModelInvocationPrefix> Qwen4ExpGraph::addModelInv
             owner.ple(0).acceptedTokens,integer(BufferId::QFN_NGRAM_ROW_IDS),fp32(BufferId::QFN_PLE_EMBEDDING),
             *resident,config_.ngram_read_ahead_resources));
     }
+    if(pooledCandidate){
+        const Qwen4ExpIntInput tokens=Qwen4ExpNativeIntInput{device,static_cast<const std::int32_t*>(input.token_ids_device),static_cast<std::size_t>(input.seq_len)};
+        const auto declaration=std::holds_alternative<Qwen4ExpPooledLookupStorage>(storage)
+            ?Qwen4ExpPooledLookupDeclaration{std::get<Qwen4ExpPooledLookupStorage>(storage)}
+            :std::holds_alternative<Qwen4ExpPooledReaderLookupStorage>(storage)
+                ?Qwen4ExpPooledLookupDeclaration{std::get<Qwen4ExpPooledReaderLookupStorage>(storage)}
+                :throw std::invalid_argument("Pooled read-ahead lost its actual source or shared-reader declaration");
+        return std::make_unique<PooledPrefix>(Qwen4ExpPooledReadAheadFrame::publish(graph,context,
+            {tokens,owner.ple(0).acceptedTokens,integer(BufferId::QFN_NGRAM_ROW_IDS),
+             fp32(BufferId::QFN_PLE_EMBEDDING),fp32(BufferId::QFN_PLE_KEY),fp32(BufferId::QFN_PLE_VALUE),
+             fp32(BufferId::QFN_PLE_QUERY),fp32(BufferId::QFN_PLE_GATED),fp32(BufferId::QFN_PLE_NORMALIZED),
+             owner.ple(0).acceptedConvolution,qwen4ExpTrunkBinding(buffers_.layer_buffers)},declaration));
+    }
     const auto* hosted=whole?std::get_if<ImmutableLookupStage::GPUStorage>(whole):nullptr;
     if(!hosted)throw std::invalid_argument("Early lookup candidate lost its original hosted GPU source");
     const Qwen4ExpIntInput tokens=Qwen4ExpNativeIntInput{device,static_cast<const std::int32_t*>(input.token_ids_device),static_cast<std::size_t>(input.seq_len)};
@@ -580,12 +610,13 @@ std::string Qwen4ExpGraph::addModelLayerInput(ComputeGraph &graph,const ForwardI
     const auto &ngram=config_.flash_next->ngrams();
     if(layer!=static_cast<int>(ngram.decoder_layer))return dependency;
     auto* early=dynamic_cast<EarlyPrefix*>(&invocationPrefix);
+    auto* pooledEarly=dynamic_cast<PooledPrefix*>(&invocationPrefix);
     auto* residentEarly=dynamic_cast<ResidentPrefix*>(&invocationPrefix);
     const bool executable=executableForwardSubmissionIntent(input.graph_submission_intent);
     if((executable && config_.ngram_lookup_schedule==GraphConfig::NgramLookupSchedule::EarlyCurrentResidentDecodeGPUCandidate &&
         input.execution_phase==ForwardExecutionPhase::Decode)!=(residentEarly!=nullptr))
         throw std::invalid_argument("PLE consumer lost or forged its selected graph-local resident read-ahead frame");
-    if((executable && config_.ngram_lookup_schedule==GraphConfig::NgramLookupSchedule::EarlyCurrentHostedCandidate)!=(early!=nullptr))
+    if((executable && config_.ngram_lookup_schedule==GraphConfig::NgramLookupSchedule::EarlyCurrentHostedCandidate)!=((early!=nullptr)||(pooledEarly!=nullptr)))
         throw std::invalid_argument("PLE consumer lost or forged its selected graph-local early lookup frame");
     const std::string prefix="layer"+std::to_string(layer)+"_ple_";
     const auto context=pleContext(input,device,prefix);
@@ -616,7 +647,8 @@ std::string Qwen4ExpGraph::addModelLayerInput(ComputeGraph &graph,const ForwardI
             fp32(BufferId::QFN_PLE_EMBEDDING),fp32(BufferId::QFN_PLE_KEY),fp32(BufferId::QFN_PLE_VALUE),
             fp32(BufferId::QFN_PLE_QUERY),fp32(BufferId::QFN_PLE_GATED),fp32(BufferId::QFN_PLE_NORMALIZED),
             prior?prior->convolution():history.acceptedConvolution,qwen4ExpTrunkBinding(buffers_.layer_buffers)},storage,
-        dependencies,early?early->frame.get():nullptr,residentEarly?residentEarly->frame.get():nullptr);
+        dependencies,early?early->frame.get():nullptr,residentEarly?residentEarly->frame.get():nullptr,
+        pooledEarly?pooledEarly->frame.get():nullptr);
     if(prior)
         return owner.appendVerifierPLERetain(graph,prefix,std::move(*prior),tokenRows,normalized,{terminal,prefix+"conv_norm"});
     return owner.appendAcceptedPLECommit(graph,prefix,0,rows,{rows.liveRows,rows.capacity},tokenRows,

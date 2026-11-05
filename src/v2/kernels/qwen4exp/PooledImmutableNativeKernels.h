@@ -47,6 +47,11 @@ protected:
     /** @brief Submit a complete coordinator operation with device-owned live counts. */
     virtual void launch(pooled_native::CoordinatorAction,const pooled_native::CoordinatorArgs&,
         const pooled_native::CoordinatorQuery*,void*)const=0;
+    /** @brief Native inline entry using the same owner operations and the original parent abort capability.
+     * Backends without this new entry reject; they never select the mapped implementation. */
+    virtual void launchNativeOwner(pooled_native::OwnerAction, const pooled_native::NativeOwnerArgs&, void*) const
+    { throw std::logic_error("This pooled backend has no original native inline owner entry"); }
+
 };
 /** @return CUDA code bundle without runtime discovery, source binding or allocation. */
 std::unique_ptr<IPooledImmutableNativeKernels> createCUDAPooledImmutableNativeKernels();

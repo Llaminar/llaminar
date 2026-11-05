@@ -11,6 +11,7 @@
 #pragma once
 #include "PooledImmutableLocalLookupGraph.h"
 #include "transfer/CapturedTransferChannel.h"
+#include "PooledImmutableTransferBinding.h"
 namespace llaminar2::qwen4exp
 {
 /** @brief Nominal wire roles; storage alignment can never be selected as their live extent. */
@@ -127,6 +128,7 @@ public:
      * @param senderSetupStream Exact original ordinary source setup stream.
      * @param receiverSetupStream Exact original ordinary receiver setup stream.
      * @param originalInventory Retained original endpoint topology, required for peer payload materialization.
+     * @param nativeCompletion Original admitted native TP completion bank; absent retains captured transport.
      * @return Retained original endpoint bindings; no native communicator or runtime eligibility is issued.
      * @throws std::exception For wrong cohort/generation/PMA/roots/endpoints, capture-time binding or a missing native transport.
      */
@@ -134,7 +136,10 @@ public:
         std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> coordinator,
         std::shared_ptr<PooledImmutableOwnerPreparedStorage> owner,std::shared_ptr<PhysicalMemoryAuthority> memory,
         void* senderSetupStream,void* receiverSetupStream,
-        std::shared_ptr<const ClusterInventory> originalInventory = {});
+        std::shared_ptr<const ClusterInventory> originalInventory = {},
+        std::shared_ptr<const PooledImmutableNativeCompletionStorage> nativeCompletion = {});
+    /** @brief Cold failure and final graph-owner destruction release the exact original invocation binding. */
+    ~PooledImmutableCapturedPinEdge() noexcept;
     /** @return Original immutable edge declaration. */
     const PooledImmutablePinEdge& declaration()const noexcept{return declaration_;}
     /** @return Retained actual original coordinator owner. */
@@ -146,11 +151,16 @@ public:
     /** @return Exact original invocation and command receive inputs for actual existing Owner Begin/Pin stages. */
     PooledNativeOperandSpans ownerInputs(pooled_native::OwnerAction action)const;
     /** @return Original captured endpoint for one nominal phase; C0 commands have no binding. */
-    const CapturedTransferBinding& binding(PooledPinWireRole role,CapturedTransferEndpoint endpoint)const;
+    const PooledImmutableTransferBinding& binding(PooledPinWireRole role,CapturedTransferEndpoint endpoint)const;
     /** @return Complete immutable endpoint/root/source-slice identity for graph caching. */
     uint64_t captureIdentity()const;
 private:
     friend class PooledImmutableDirectedTransport;
+    friend class PooledImmutableRetainedParticipants;
+    /** @brief Original source owner invokes this only after every captured parent/borrower retired. */
+    void retireOriginalInvocation() const;
+    mutable bool owns_invocation_ = false; ///< Cold RAII binding ownership, never GPU progress.
+
     friend class PooledImmutableCapturedPinReturn;
     friend class PooledImmutableCapturedFreeWave;
     friend class PooledImmutableCapturedVictimWave;
@@ -162,9 +172,9 @@ private:
     PooledImmutableCapturedPinEdge(PooledImmutablePinEdge declaration,
         std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> coordinator,
         std::shared_ptr<PooledImmutableOwnerPreparedStorage> owner,std::shared_ptr<PhysicalMemoryAuthority> memory,
-        std::shared_ptr<CapturedTransferChannel> channel,CapturedTransferBinding invocationSend,CapturedTransferBinding invocationReceive,
-        CapturedTransferBinding frontierSend,CapturedTransferBinding frontierReceive,
-        std::optional<CapturedTransferBinding> commandSend,std::optional<CapturedTransferBinding> commandReceive,
+        PooledImmutableTransferChannel channel,PooledImmutableTransferBinding invocationSend,PooledImmutableTransferBinding invocationReceive,
+        PooledImmutableTransferBinding frontierSend,PooledImmutableTransferBinding frontierReceive,
+        std::optional<PooledImmutableTransferBinding> commandSend,std::optional<PooledImmutableTransferBinding> commandReceive,
         std::shared_ptr<const ClusterInventory> originalInventory);
     PooledImmutablePinEdge declaration_;
     std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> coordinator_;
@@ -172,9 +182,9 @@ private:
     std::shared_ptr<PhysicalMemoryAuthority> memory_;
     uint64_t coordinator_identity_,owner_identity_;
     std::shared_ptr<const ClusterInventory> original_inventory_;
-    std::shared_ptr<CapturedTransferChannel> channel_; // Same priced source channel, phase-reused by the free wave.
-    CapturedTransferBinding invocation_send_,invocation_receive_,frontier_send_,frontier_receive_;
-    std::optional<CapturedTransferBinding> command_send_,command_receive_;
+    PooledImmutableTransferChannel channel_; // Same priced source channel, phase-reused by the free wave.
+    PooledImmutableTransferBinding invocation_send_,invocation_receive_,frontier_send_,frontier_receive_;
+    std::optional<PooledImmutableTransferBinding> command_send_,command_receive_;
 };
 /** @brief Original reverse Pin reply/header bindings, retaining the same forward/cohort/PMA owner. */
 class PooledImmutableCapturedPinReturn final
@@ -192,7 +202,7 @@ public:
     /** @brief Reject any original PMA/root/cohort or captured storage drift. */
     void requireCurrent()const;
     /** @return Exact returned Grant or PinHeader endpoint; C0 has no Grant message. */
-    const CapturedTransferBinding& binding(PooledPinWireRole role,CapturedTransferEndpoint endpoint)const;
+    const PooledImmutableTransferBinding& binding(PooledPinWireRole role,CapturedTransferEndpoint endpoint)const;
     /** @return Existing actual AcquirePins/SealPins schema over the serial bank/full ordered frontier. */
     PooledNativeOperandSpans coordinatorInputs(pooled_native::CoordinatorAction action)const;
     /** @return Original forward plus every actual reverse binding/capture identity. */
@@ -207,14 +217,14 @@ private:
     friend class PooledImmutableCapturedRetirementWave;
     /** @brief Construct only after original roots and public transfer bindings are admitted/retained. */
     PooledImmutableCapturedPinReturn(std::shared_ptr<const PooledImmutableCapturedPinEdge> forward,
-        std::shared_ptr<PhysicalMemoryAuthority> memory,std::shared_ptr<CapturedTransferChannel> channel,
-        CapturedTransferBinding headerSend,CapturedTransferBinding headerReceive,
-        std::optional<CapturedTransferBinding> replySend,std::optional<CapturedTransferBinding> replyReceive);
+        std::shared_ptr<PhysicalMemoryAuthority> memory,PooledImmutableTransferChannel channel,
+        PooledImmutableTransferBinding headerSend,PooledImmutableTransferBinding headerReceive,
+        std::optional<PooledImmutableTransferBinding> replySend,std::optional<PooledImmutableTransferBinding> replyReceive);
     std::shared_ptr<const PooledImmutableCapturedPinEdge> forward_;
     std::shared_ptr<PhysicalMemoryAuthority> memory_;
-    std::shared_ptr<CapturedTransferChannel> channel_; // Same reverse channel; no free-wave payload allocation.
-    CapturedTransferBinding header_send_,header_receive_;
-    std::optional<CapturedTransferBinding> reply_send_,reply_receive_;
+    PooledImmutableTransferChannel channel_; // Same reverse channel; no free-wave payload allocation.
+    PooledImmutableTransferBinding header_send_,header_receive_;
+    std::optional<PooledImmutableTransferBinding> reply_send_,reply_receive_;
 };
 }
 namespace llaminar2

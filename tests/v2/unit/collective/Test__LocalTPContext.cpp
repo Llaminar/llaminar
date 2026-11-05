@@ -31,6 +31,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <future>
+#include "../../fixtures/collective/PooledNativeCollectiveReplayAccess.h"
+#include <functional>
 #include <fstream>
 #include <mutex>
 #include <sstream>
@@ -3205,5 +3207,116 @@ TEST_F(Test__LocalTPContext, GDNLayoutIdentityRejectsSameSizeForeignParticipantB
         if (mismatch)
             EXPECT_FALSE(
                 ctx->graphCaptureBoundaryRendezvous(first.captureLayoutIdentity(7), 0, 30000));
+    }
+}
+
+
+/**
+ * @brief Metadata-only backend double for actual LocalTP cancellation ownership.
+ * Recorded pointers prove construction/control ordering, never native readiness,
+ * transport completion or executable capture. Literal SDK barrier replay is a
+ * separate prerequisite; the actual native pair gate remains required.
+ */
+class OriginalNativeAbortBackend final : public MockCollectiveBackend
+{
+public:
+    bool all_authorities_present = true;
+    int missing_participant = -1;
+    std::atomic<int> signal_calls{0};
+    std::uint32_t original_abort[2]{};
+    std::uint64_t original_communicator[2]{71, 73};
+    std::function<void()> signal_observer;
+
+    /** @return Original recorded pointer identity only; no device value is read. */
+    NativeCompletionAuthority nativeCompletionAuthority(int participant) override
+    {
+        if (!all_authorities_present || participant < 0 || participant >= 2 ||
+            participant == missing_participant)
+            return {};
+        return PooledNativeCollectiveReplayAccess::recorded(
+            {&original_abort[participant], &original_communicator[participant]});
+    }
+
+    /** @brief Observe actual host publication before the original absorbing flag write. */
+    bool signalNativeCompletionAbort() override
+    {
+        signal_calls.fetch_add(1, std::memory_order_relaxed);
+        if (signal_observer)
+            signal_observer();
+        for (auto& flag : original_abort)
+            __atomic_store_n(&flag, std::uint32_t{1}, __ATOMIC_RELEASE);
+        return true;
+    }
+};
+
+/** @test Actual cancellation releases host waiters before non-destructive native signaling. */
+TEST_F(Test__LocalTPContext, ReadyNativeAbortSignalsAfterHostWakeAndDefersDestruction)
+{
+    for (const auto type : {CollectiveBackendType::NCCL, CollectiveBackendType::RCCL})
+    {
+        std::atomic<int> destroyed{0};
+        auto context = createLocalTPContext({cpu0_, GlobalDeviceAddress::cpu(1)}, {},
+            CollectiveBackendType::HOST);
+        auto* actual = dynamic_cast<LocalTPContext*>(context.get());
+        ASSERT_NE(actual, nullptr);
+        auto backend = std::make_unique<OriginalNativeAbortBackend>();
+        auto* recorded = backend.get();
+        recorded->external_abort_call_count = &destroyed;
+        actual->setBackendForTesting(std::move(backend), type, true);
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        std::promise<void> entered;
+        auto waiter = std::async(std::launch::async, [&] {
+            entered.set_value();
+            return actual->graphCaptureBoundaryRendezvous("native_abort_original_waiter", 0, 1000);
+        });
+        entered.get_future().wait();
+        EXPECT_EQ(waiter.wait_for(std::chrono::milliseconds(5)), std::future_status::timeout);
+        recorded->signal_observer = [&] {
+            EXPECT_TRUE(actual->isAbortRequested());
+            // Reenter the same actual abort path: it must acquire the original
+            // HOST mutex, return idempotently, and never recursively signal.
+            actual->requestAbort();
+            EXPECT_EQ(destroyed.load(std::memory_order_relaxed), 0);
+        };
+        actual->requestAbort();
+        ASSERT_EQ(waiter.wait_until(deadline), std::future_status::ready);
+        EXPECT_FALSE(waiter.get());
+        actual->requestAbort();
+        EXPECT_EQ(recorded->signal_calls.load(std::memory_order_relaxed), 1);
+        for (const auto& flag : recorded->original_abort)
+            EXPECT_EQ(__atomic_load_n(&flag, __ATOMIC_ACQUIRE), 1u);
+        EXPECT_EQ(destroyed.load(std::memory_order_relaxed), 0);
+        context.reset();
+        EXPECT_EQ(destroyed.load(std::memory_order_relaxed), 1);
+    }
+}
+
+/** @test Uninitialized, incomplete and foreign backends acquire no native abort capability. */
+TEST_F(Test__LocalTPContext, NativeAbortIgnoresUnreadyOrForeignBackend)
+{
+    struct Case { CollectiveBackendType backend; bool initialized; bool all_present; int missing; };
+    for (const auto scenario : {
+        Case{CollectiveBackendType::NCCL, false, true, -1},
+        Case{CollectiveBackendType::NCCL, true, false, -1},
+        Case{CollectiveBackendType::RCCL, true, true, 1},
+        Case{CollectiveBackendType::HOST, true, true, -1},
+        Case{CollectiveBackendType::HETEROGENEOUS, true, true, -1}})
+    {
+        auto context = createLocalTPContext({cpu0_, GlobalDeviceAddress::cpu(1)}, {},
+            CollectiveBackendType::HOST);
+        auto* actual = dynamic_cast<LocalTPContext*>(context.get());
+        ASSERT_NE(actual, nullptr);
+        auto backend = std::make_unique<OriginalNativeAbortBackend>();
+        auto* recorded = backend.get();
+        recorded->all_authorities_present = scenario.all_present;
+        recorded->missing_participant = scenario.missing;
+        actual->setBackendForTesting(std::move(backend), scenario.backend, scenario.initialized);
+        actual->requestAbort();
+        actual->requestAbort();
+        EXPECT_TRUE(actual->isAbortRequested());
+        EXPECT_EQ(recorded->signal_calls.load(std::memory_order_relaxed), 0);
+        for (const auto& flag : recorded->original_abort)
+            EXPECT_EQ(__atomic_load_n(&flag, __ATOMIC_ACQUIRE), 0u);
     }
 }

@@ -7,6 +7,7 @@
  * publication, remote readers and complete native factories remain guarded.
  */
 #pragma once
+#include "PooledImmutableDemandFrontier.h"
 #include "PooledImmutableParticipantVictimGraph.h"
 #include "PooledImmutableParticipantLocalGraph.h"
 #include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
@@ -40,13 +41,13 @@ public:
     PooledPinWireSpan source(PooledSourceWireRole role)const;
     PooledPinWireSpan destination(PooledSourceWireRole role)const;
     /** @return Original fixed/counted binding; C0 data roles reject. */
-    const CapturedTransferBinding& binding(PooledSourceWireRole role,CapturedTransferEndpoint endpoint)const;
+    const PooledImmutableTransferBinding& binding(PooledSourceWireRole role,CapturedTransferEndpoint endpoint)const;
     /** @return Exact original inputs for Seal/Apply/Validate; terminal outcome is distinct from reusable header. */
     PooledNativeOperandSpans ownerInputs(pooled_native::OwnerAction action)const;
     /** @return Complete source/edge/binding identity excluding mutable source protocol values. */
     uint64_t captureIdentity()const;
 private:
-    using Pair=std::pair<CapturedTransferBinding,CapturedTransferBinding>;
+    using Pair=std::pair<PooledImmutableTransferBinding,PooledImmutableTransferBinding>;
     using Bindings=std::array<std::optional<Pair>,5>;
     /** @brief Only complete original-authority validation publishes a source endpoint holder. */
     PooledImmutableCapturedSourceWave(std::shared_ptr<const PooledImmutableCapturedVictimWave> previous,
@@ -98,7 +99,7 @@ void requirePooledSourceOwnerCompletion(const ComputeGraph& graph,
  * @return Participant-local span ending with guaranteed typed success/failure PublishHeader56. */
 PooledPinParticipantNodes appendPooledSourceOwnerFill(ComputeGraph& graph,BufferArena& arena,
     std::shared_ptr<const qwen4exp::PooledImmutableCapturedSourceWave> edge,
-    std::shared_ptr<const qwen4exp::IPooledImmutableNativeKernels> code,const std::string& sentVictims,const std::string& prefix);
+    std::shared_ptr<const qwen4exp::IPooledImmutableNativeKernels> code,const std::string& sentVictims,const std::string& prefix, PooledImmutableDemandFrontier* demand=nullptr);
 /** @brief Append the sole original request, all-owner seal acquisition, compact packets and truthful source retirement.
  * @param completeVictims Exact original ALL-owner CompleteVictims; no local completion may be fabricated.
  * @param control Original coordinator generation controller, retained by the source boundary.
@@ -107,4 +108,16 @@ PooledPinParticipantNodes appendPooledSourceCoordinatorFill(ComputeGraph& graph,
     std::span<const std::shared_ptr<const qwen4exp::PooledImmutableCapturedSourceWave>> owners,
     std::shared_ptr<const qwen4exp::IPooledImmutableNativeKernels> code,DeviceGenerationControlBinding control,
     const std::string& completeVictims,const std::string& prefix);
+}
+
+namespace llaminar2 {
+/**
+ * @brief Seal the actual inline owner's first response wait after ordinary trunk readiness.
+ * @param graph Original graph with the complete addressed owner protocol.
+ * @param frontier Original seal-send and first response-receive descriptor.
+ * @param trunk Actual same-participant trunk producers, never the demand prefix.
+ * Only this consumed join may supplement the otherwise sole protocol predecessor.
+ */
+void bindPooledInlineDemandConsumption(ComputeGraph& graph,const PooledImmutableDemandFrontier& frontier,
+    const std::vector<std::string>& trunk);
 }

@@ -2,13 +2,15 @@
  * @file RCCLPartialDependency.cpp
  * @brief Device-free, deliberately incomplete DSO for loader publication tests.
  *
- * Required symbols before the final group-end symbol can resolve, but admission
+ * The lookup-only completed protocol3 marker and required callbacks before the
+ * final group-end symbol can resolve, but admission
  * must fail and withdraw every callback. No stub initializes a device. The
  * unique anchor makes this DSO an ordinary executable dependency, so installed
  * test runners retain it through normal library-closure staging rather than
  * an embedded build path or a compiler dependency at test time.
  */
 #include "collective/backends/RCCLHostTransportStorage.h"
+#include <cstdint>
 
 namespace
 {
@@ -47,11 +49,25 @@ LLAMINAR_PARTIAL_RCCL_SYMBOL(ncclReduceScatter)
 LLAMINAR_PARTIAL_RCCL_SYMBOL(llaminarNcclAllGatherDeviceRows)
 LLAMINAR_PARTIAL_RCCL_SYMBOL(llaminarNcclAllReduceDeviceRows)
 LLAMINAR_PARTIAL_RCCL_SYMBOL(llaminarNcclReduceScatterDeviceRows)
+LLAMINAR_PARTIAL_RCCL_SYMBOL(llaminarNcclSignalCompletionAbort)
+LLAMINAR_PARTIAL_RCCL_SYMBOL(llaminarNcclCompletionAuthority)
+LLAMINAR_PARTIAL_RCCL_SYMBOL(llaminarNcclSendCompletedBytes)
+LLAMINAR_PARTIAL_RCCL_SYMBOL(llaminarNcclRecvCompletedBytes)
+LLAMINAR_PARTIAL_RCCL_SYMBOL(llaminarNcclSendCompletedSliceOrigin)
+LLAMINAR_PARTIAL_RCCL_SYMBOL(llaminarNcclBroadcastCompletedBytes)
+LLAMINAR_PARTIAL_RCCL_SYMBOL(llaminarNcclBroadcastCompletedSliceOrigin)
 LLAMINAR_PARTIAL_RCCL_SYMBOL(ncclSend)
 LLAMINAR_PARTIAL_RCCL_SYMBOL(ncclRecv)
 LLAMINAR_PARTIAL_RCCL_SYMBOL(ncclGroupStart)
 // ncclGroupEnd is intentionally absent: admission fails after resolving storage.
 #undef LLAMINAR_PARTIAL_RCCL_SYMBOL
+
+/**
+ * @brief Satisfy only the loader's passive protocol3 query before the intended late failure.
+ * @return The required version3 marker; no communicator, transport or device is initialized.
+ * The fixture remains deliberately inadmissible because ncclGroupEnd is absent.
+ */
+extern "C" std::uint32_t llaminarNcclCompletedProtocolVersion() { return 3; }
 
 /**
  * @brief Count an illicit use of a resolved-but-unpublished diagnostic callback.

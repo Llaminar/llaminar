@@ -22,6 +22,8 @@
 
 #pragma once
 
+#include "collective/NativeCollectiveBytes.h"
+
 #include "../backends/DeviceId.h"
 #include "../backends/DeviceType.h"
 #include "../config/OrchestrationConfig.h" // For CollectiveBackendType (canonical definition)
@@ -55,6 +57,8 @@ namespace llaminar2
         ALLGATHER,      ///< Gather slices from all devices into full buffer
         REDUCE_SCATTER, ///< Reduce then scatter result slices
         BROADCAST       ///< Broadcast from one device to all
+
+
     };
 
     /**
@@ -1293,6 +1297,37 @@ namespace llaminar2
             return false;
         }
 
+        /** @brief Signal the original completed-family communicator abort words without reclaiming it.
+         * @return Whether every original participant received the absorbing signal.
+         * Native graph/event owners still require terminal proof before definition and communicator retirement.
+         */
+        virtual bool signalNativeCompletionAbort() { return false; }
+
+        /** @brief Borrow immutable original native completion provenance during cold preparation.
+         * @param participant Original local communicator coordinate.
+         * @return Unbound only for unsupported/uninitialized backend; callers must reject it.
+         * No device state is read and no native operation/allocation is issued.
+         */
+        virtual NativeCompletionAuthority nativeCompletionAuthority(int participant)
+        { (void)participant; return {}; }
+
+        /**
+         * @brief Record original fixed/prefix/slice bytes on a native rooted stream.
+         * @param send Original root source bank (unused contribution on receivers).
+         * @param receive Original participant-local destination bank.
+         * @param bytes Borrowed original communication metadata and admitted bounds.
+         * @param root Original communicator coordinate, never a device ordinal.
+         * @param participant Calling original communicator coordinate.
+         * @param stream Exact original producer/consumer stream.
+         * @return Caller-owned native enqueue outcome, with no shared diagnostic, host count read or fallback.
+         */
+        virtual NativeCollectiveEnqueueResult nativeBroadcastBytesOnStream(const void* send, void* receive,
+            const NativeCollectiveBytes& bytes, int root, int participant, void* stream)
+        {
+            (void)send; (void)receive; (void)bytes; (void)root; (void)participant; (void)stream;
+            return NativeCollectiveEnqueueResult::failure("Original backend does not support native byte Broadcast");
+        }
+
         /**
          * @brief Submit equal-prefix rows without communicating inactive capacity.
          * @param operation Native gather, allreduce or reduce-scatter semantics.
@@ -1682,6 +1717,17 @@ namespace llaminar2
         {
             return false; // Most backends don't need registration
         }
+        /** @brief Enqueue only an actual original peer edge; unrelated members contribute nothing.
+         * @param payload Original local bank. @param bytes Original count/slice binding.
+         * @param edge Exact immutable source/consumer coordinates. @param participant Calling coordinate.
+         * @param stream Exact endpoint stream. @return Caller-owned enqueue outcome, without alternate routes. */
+        virtual NativeCollectiveEnqueueResult nativeTransferBytesOnStream(void* payload,const NativeCollectiveBytes& bytes,
+            NativeByteEdge edge,int participant,void* stream) {
+            (void)payload;(void)bytes;(void)edge;(void)participant;(void)stream;
+            return NativeCollectiveEnqueueResult::failure("Original backend does not implement addressed completed bytes");
+        }
+
+
     };
 
     /**

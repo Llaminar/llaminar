@@ -19,6 +19,7 @@
 #include "../graph/IGraphBuilder.h" // For ForwardOutput
 #include "PrefillGraphCache.h"
 #include "../../mtp/MTPConditionForwardPurpose.h"
+#include "../../moe/MoEOverlayActivationEpochABI.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -360,6 +361,128 @@ namespace llaminar2
                        other.snapshot_configuration_identity;
         }
     };
+
+    /**
+     * @brief Cold borrowed identity of an actually materialized finite forward graph.
+     *
+     * The exact cache signature distinguishes prefill, decode, verifier and
+     * diagnostic variants. A null source is a proved source-free graph,
+     * never permission to substitute another graph's preparation token.
+     * The owning engine must outlive every follower attachment borrowing it.
+     */
+    class RetainedForwardSourceDefinition final
+    {
+    public:
+        const std::optional<ForwardGraphSignature> signature; ///< Exact FEE key; learned sidecars have their original distinct graph owner.
+        const MoEOverlayInferenceGraphRole role;
+        const int physical_rows;
+        const void* const graph_identity; ///< Opaque cold identity only; source-free consumers never dereference it.
+        const uint64_t topology_generation;
+        const uint64_t capture_variant_signature;
+        const std::shared_ptr<const RetainedGraphParticipantPreparationStream> source;
+        /**
+         * @brief Project the actual finite graph declaration after its owning cache materializes.
+         * @param signature Original FEE key, absent only for an actual learned-sidecar cache.
+         * @param role Original serving transaction role.
+         * @param physical_rows Actual finite graph row specialization.
+         * @param graph Actual cache-owned declaration, inspected only at this cold frontier.
+         * @param variant Original cache's immutable capture variant.
+         * @param source Exact original preparation token, absent only when this graph declares no source.
+         * @return Immutable declaration metadata; this grants no native launch or physical authority.
+         */
+        static RetainedForwardSourceDefinition checked(std::optional<ForwardGraphSignature> signature,
+            MoEOverlayInferenceGraphRole role, int physical_rows, const ComputeGraph& graph, uint64_t variant,
+            std::shared_ptr<const RetainedGraphParticipantPreparationStream> source)
+        {
+            if (role == MoEOverlayInferenceGraphRole::None || physical_rows <= 0 || !variant || !graph.topologyGeneration())
+                throw std::invalid_argument("Finite source projection requires its complete original graph declaration");
+            if (static_cast<bool>(graph.retainedParticipantSourcePlan()) != static_cast<bool>(source) ||
+                (!source && graph.retainedParticipantDefinitionDomain()))
+                throw std::invalid_argument("Finite source projection changed its actual optional source declaration");
+            if (source) {
+                source->requireCurrentDefinition();
+                if (source->definition().graph != &graph || source->definition().plan != graph.retainedParticipantSourcePlan() ||
+                    source->definition().variant != variant || source->definition().topology_generation != graph.topologyGeneration())
+                    throw std::invalid_argument("Finite source projection substituted its exact original cache definition");
+            }
+            return RetainedForwardSourceDefinition(std::move(signature),role,physical_rows,&graph,
+                graph.topologyGeneration(),variant,std::move(source));
+        }
+        /** @brief Reauthenticate a borrowed source before accessing its original graph; source-free values own no graph borrow. */
+        void requireCurrent() const
+        {
+            if (!source) return;
+            source->requireCurrentDefinition();
+            const auto& original = source->definition();
+            if (original.graph != graph_identity || original.topology_generation != topology_generation ||
+                original.variant != capture_variant_signature)
+                throw std::invalid_argument("Finite source projection changed its original live definition");
+        }
+    private:
+        RetainedForwardSourceDefinition(std::optional<ForwardGraphSignature> signature,
+            MoEOverlayInferenceGraphRole role,int rows,const void* graph,uint64_t topology,uint64_t variant,
+            std::shared_ptr<const RetainedGraphParticipantPreparationStream> source)
+            :signature(std::move(signature)),role(role),physical_rows(rows),graph_identity(graph),
+             topology_generation(topology),capture_variant_signature(variant),source(std::move(source)) {}
+    };
+
+    /**
+     * @brief Select the exact optional source association of an original finite expert parent.
+     * @param definitions Actual retained continuation/sidecar cache projections.
+     * @param draft Select the existing learned-sidecar family, rather than Main.
+     * @param physical_rows Exact follower specialization, never allocation capacity.
+     * @return All compatible original signature tokens, or empty for proved source-free work.
+     * @throws std::exception For missing, stale, foreign or conflicting source declarations.
+     * This is cold metadata validation. It neither launches nor grants an
+     * executable/source capability, and it never guesses an absent family.
+     */
+    inline std::vector<std::shared_ptr<const RetainedGraphParticipantPreparationStream>>
+    retainedExpertSourceVariants(std::span<const RetainedForwardSourceDefinition> definitions,
+        bool draft, int physical_rows)
+    {
+        if (physical_rows <= 0)
+            throw std::invalid_argument("Expert source family requires positive original row geometry");
+        bool found = false;
+        std::optional<bool> source_bearing;
+        std::vector<std::shared_ptr<const RetainedGraphParticipantPreparationStream>> result;
+        for (const auto& definition : definitions)
+        {
+            const bool is_draft = definition.role == MoEOverlayInferenceGraphRole::MTPDraft;
+            if (is_draft != draft || definition.physical_rows != physical_rows) continue;
+            definition.requireCurrent();
+            if (definition.signature) {
+                const auto& signature = *definition.signature;
+                const auto rows = static_cast<int64_t>(signature.batch_size) * signature.seq_len;
+                const auto role = signature.execution_role == ForwardExecutionRole::GroupedMTPVerifier
+                    ? MoEOverlayInferenceGraphRole::MTPGroupedVerifier
+                    : signature.decode ? MoEOverlayInferenceGraphRole::MainDecode : MoEOverlayInferenceGraphRole::MainPrefill;
+                if (rows != definition.physical_rows || role != definition.role)
+                    throw std::invalid_argument("Expert source family changed its original forward role or physical rows");
+            } else if (!is_draft) {
+                throw std::invalid_argument("Main expert source family lost its exact original forward signature");
+            }
+            found = true;
+            const bool has_source = static_cast<bool>(definition.source);
+            if (source_bearing && *source_bearing != has_source)
+                throw std::invalid_argument("One expert parent cannot mix source-bearing and source-free continuation variants");
+            source_bearing = has_source;
+            if (!has_source) continue;
+            definition.source->requireCurrentDefinition();
+            const auto& original = definition.source->definition();
+            if (original.graph != definition.graph_identity || original.topology_generation != definition.topology_generation ||
+                original.variant != definition.capture_variant_signature)
+                throw std::invalid_argument("Expert source family substituted its exact original cache definition");
+            if (!result.empty() && result.front()->definition().domain != original.domain)
+                throw std::invalid_argument("Expert source family contains a foreign original source domain");
+            const auto prior = std::find(result.begin(),result.end(),definition.source);
+            if (prior == result.end()) result.push_back(definition.source);
+            else if (prior->owner_before(definition.source) || definition.source.owner_before(*prior))
+                throw std::invalid_argument("Expert source family substituted a source token control block");
+        }
+        if (!found)
+            throw std::invalid_argument("Expert owner has no complete original source-family row association");
+        return result;
+    }
 
     /**
      * @brief Derive diagnostic-arena sharing solely from captured graph identity.

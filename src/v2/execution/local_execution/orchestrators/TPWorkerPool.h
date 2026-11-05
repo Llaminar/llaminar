@@ -47,6 +47,8 @@
 
 namespace llaminar2
 {
+    namespace test { struct TPWorkerPoolCallbackLifecycleAccess; }
+
     /** @brief Separate independent GPU control from inherited CPU/composed compute placement. */
     enum class TPWorkerHostPlacement
     {
@@ -291,7 +293,32 @@ namespace llaminar2
             failure_callback_ = std::move(cb);
         }
 
+        /**
+         * @brief Retire the collected generation's failure callable before replacing its original request authority.
+         * @param replacement Ordinary TP abort behavior retained after source-specific ownership is withdrawn.
+         * @throws std::logic_error If participant work remains uncollected or the failure worker would wait on itself.
+         * Only the existing failure-control thread is awaited. No GPU event,
+         * stream, participant job or new worker is created here. Its captured
+         * callable is destroyed before the completion generation is published.
+         */
+        void retireFailureCallback(std::function<void()> replacement)
+        {
+            if (std::this_thread::get_id()==failure_callback_worker_.get_id())
+                throw std::logic_error("Failure callback cannot retire its own original worker");
+            std::unique_lock lock(mutex_);
+            if (generation_ != collected_generation_ || active_collectors_ != 0)
+                throw std::logic_error("Failure callback retirement requires its collected original generation");
+            const auto target=failure_callback_generation_;
+            ++active_collectors_; // Existing dispatch exclusion also owns this terminal replacement.
+            failure_callback_cv_.wait(lock,[&]{return shutdown_ || completed_failure_callback_generation_>=target;});
+            --active_collectors_;
+            if (shutdown_)
+                throw std::logic_error("Failure callback retirement encountered an original pool shutdown");
+            failure_callback_=std::move(replacement);
+        }
+
     private:
+        friend struct test::TPWorkerPoolCallbackLifecycleAccess;
         void workerLoop(size_t index)
         {
             uint64_t last_gen = 0;
@@ -375,6 +402,8 @@ namespace llaminar2
                         result.success = false;
                     }
 
+                    if (schedule_failure_callback)
+                        failure_callback_generation_=std::max(failure_callback_generation_,work_generation);
                     results_[index] = std::move(result);
                     const size_t completed =
                         completed_count_.fetch_add(
@@ -405,13 +434,7 @@ namespace llaminar2
                      * coordinator. A collective abort is allowed to block, but a
                      * participant completion can never again be held behind it.
                      */
-                    {
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        failure_callback_generation_ = std::max(
-                            failure_callback_generation_,
-                            work_generation);
-                    }
-                    failure_callback_cv_.notify_one();
+                    failure_callback_cv_.notify_all();
                 }
             }
         }
@@ -427,31 +450,29 @@ namespace llaminar2
          */
         void failureCallbackLoop()
         {
-            uint64_t handled_generation = 0;
             while (true)
             {
                 std::function<void()> callback;
+                uint64_t callback_generation=0;
                 {
                     std::unique_lock<std::mutex> lock(mutex_);
                     failure_callback_cv_.wait(
                         lock,
-                        [this, handled_generation]()
+                        [this]()
                         {
                             return shutdown_ ||
                                    failure_callback_generation_ >
-                                       handled_generation;
+                                       completed_failure_callback_generation_;
                         });
                     if (shutdown_)
                         return;
-                    handled_generation = failure_callback_generation_;
+                    callback_generation = failure_callback_generation_;
                     callback = failure_callback_;
                 }
 
-                if (!callback)
-                    continue;
                 try
                 {
-                    callback();
+                    if (callback) callback();
                 }
                 catch (const std::exception &error)
                 {
@@ -464,6 +485,12 @@ namespace llaminar2
                     LOG_ERROR("[TPWorkerPool] Fatal non-standard collective-abort callback exception");
                     std::terminate();
                 }
+                callback={}; // Drop original source/channel captures BEFORE publishing retirement.
+                {
+                    std::lock_guard lock(mutex_);
+                    completed_failure_callback_generation_=std::max(completed_failure_callback_generation_,callback_generation);
+                }
+                failure_callback_cv_.notify_all();
             }
         }
 
@@ -479,6 +506,7 @@ namespace llaminar2
         std::function<bool(size_t)> work_fn_;
         std::function<void()> failure_callback_;
         uint64_t failure_callback_generation_ = 0;
+        uint64_t completed_failure_callback_generation_ = 0; ///< Same existing failure-worker generation, published only after its callable releases.
         uint64_t generation_ = 0;
         uint64_t completed_generation_ = 0;
         uint64_t collected_generation_ = 0;

@@ -77,6 +77,47 @@ struct Qwen4ExpPooledReaderLookupStorage {
     DeviceRowRange originalRows;
     std::optional<Qwen4ExpIntBinding> count; ///< Same original arena-owned primitive count, retained through capture/reset.
 };
+/** @brief Existing source versus query-only reader declaration, without selecting another transport. */
+using Qwen4ExpPooledLookupDeclaration=std::variant<Qwen4ExpPooledLookupStorage,Qwen4ExpPooledReaderLookupStorage>;
+/**
+ * @brief One graph-local ordinary pooled demand, split at actual protocol frontiers.
+ *
+ * The original protocol is built exactly once. Only its first response wait is
+ * delayed until PLE trunk readiness; native counts, channels and retirement stay
+ * with their existing source/owner/reader authorities. A pure reader has no
+ * pre-trunk transport or publication; its original local Hash and participant
+ * relation remain intact.
+ */
+class Qwen4ExpPooledReadAheadFrame final {
+public:
+    /** @brief Append original Hash/protocol nodes and issue their actual typed early demand frontier. */
+    static std::unique_ptr<Qwen4ExpPooledReadAheadFrame> publish(ComputeGraph& graph,
+        const Qwen4ExpPLEContext& context,const Qwen4ExpPLEBuffers& buffers,Qwen4ExpPooledLookupDeclaration storage);
+    Qwen4ExpPooledReadAheadFrame(const Qwen4ExpPooledReadAheadFrame&)=delete;
+    Qwen4ExpPooledReadAheadFrame& operator=(const Qwen4ExpPooledReadAheadFrame&)=delete;
+    /** @return Source Publish, inline seal-send or original local Hash for a pure reader. */
+    const std::string& producer()const noexcept{return handoff_.producer().empty()?hash_producer_:handoff_.producer();}
+    /** @brief Validate original declaration and seal exactly one late response join after actual trunk work. */
+    std::string consume(ComputeGraph& graph,const Qwen4ExpPLEContext& context,const Qwen4ExpPLEBuffers& buffers,
+        const Qwen4ExpPooledLookupDeclaration& storage,std::uint64_t hash,const std::vector<std::string>& trunk);
+    /** @brief Refuse an incomplete graph construction, independently of runtime request state. */
+    void requireConsumed()const;
+private:
+    /** @brief Retain only cold original graph/query/source declarations after the real builders authenticate them. */
+    Qwen4ExpPooledReadAheadFrame(ComputeGraph& graph,Qwen4ExpPooledLookupDeclaration storage,
+        Qwen4ExpPLEBuffers buffers,const Qwen4ExpPLEContext& context,std::uint64_t hash,PooledImmutableLookupGraphEndpoints endpoints);
+    ComputeGraph* graph_;
+    Qwen4ExpPooledLookupDeclaration storage_;
+    Qwen4ExpPLEBuffers buffers_;
+    DeviceId device_;
+    TensorType format_;
+    int row_elements_;
+    std::size_t row_bytes_;
+    std::uint64_t hash_;
+    PooledImmutableLookupGraphEndpoints endpoints_;
+    std::string hash_producer_;
+    PooledImmutableDemandHandoff handoff_;
+};
 /**
  * @brief Graph-local exact-once current-demand publication, never request execution state.
  * The retained boundary owns the one device generation/sequence and pinned response.
@@ -157,6 +198,6 @@ public:
     static std::string append(ComputeGraph &graph,const Qwen4ExpPLEContext &context,
         const Qwen4ExpPLEWeights &weights,const Qwen4ExpPLEBuffers &buffers,
         LookupStorage storage,const std::vector<std::string> &dependencies,Qwen4ExpEarlyLookupFrame* early=nullptr,
-        Qwen4ExpResidentReadAheadFrame* residentEarly=nullptr);
+        Qwen4ExpResidentReadAheadFrame* residentEarly=nullptr,Qwen4ExpPooledReadAheadFrame* pooledEarly=nullptr);
 };
 } // namespace llaminar2

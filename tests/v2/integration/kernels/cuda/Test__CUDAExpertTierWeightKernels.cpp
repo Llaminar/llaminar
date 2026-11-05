@@ -14,6 +14,7 @@
  * remains the independent physical4 control with no secondary plane.
  */
 
+#include "execution/moe/MoEOverlayMPIRemoteProjectionTransport.h"
 #include "utils/ExpertTierWeightWireTestOracle.h"
 
 #include "execution/moe/ExpertTierWeightStream.h"
@@ -1617,17 +1618,12 @@ namespace llaminar2
         }
 
         /**
-         * @test Promoted asymmetric CPU weights remain executable on CUDA.
+         * @test Partial-N Q5_1 remote promotion and demotion preserve every live byte.
          *
-         * Q5_1 loses its compact 5-bit representation in the CPU cold tier.
-         * Promotion must therefore publish execution codebook 23: signed INT8
-         * payload plus the original FP16 minimum. This test streams those real
-         * CPU-native bytes through the persistent production lane, then compares
-         * CUDA decode and verifier-depth output words against the original
-         * compact codebook-7 matrix. N=512,K=2048 deliberately selects a
-         * different generated serial split-K count for source codebook 7 and
-         * physical codebook 23 on Ampere, proving that promotion retains the
-         * source arithmetic policy rather than merely decoding equal values.
+         * N70/K96 retains a 128-column CPU allocation but communicates only
+         * 70 live columns. GPU payload and metadata are checked against the
+         * original CPU oracle. The final CPU allocation must contain exact
+         * live encoded planes and untouched poison in allocation-only columns.
          */
         TEST_F(
             CUDAExpertTierWeightKernelsTest,
@@ -1804,9 +1800,30 @@ namespace llaminar2
                 };
             MoEOverlayRemoteProjectionChunkCursor cursor(
                 promotion_manifest, cpu_regions);
+            ASSERT_TRUE(cursor.requiresCPUStaging());
+            // The original CPU root is gathered into one exclusive bounded
+            // send lane. Retain it until beginChunk/pollChunk reports the
+            // exact native copy complete before reusing it for the next chunk.
+            const auto send_staging = TransferEngine::instance().allocatePinnedHostBuffer(
+                promotion_manifest.maximum_chunk_bytes, DeviceId::cuda(0));
+            ASSERT_TRUE(send_staging->isBound());
+            ASSERT_EQ(send_staging->sizeBytes(), promotion_manifest.maximum_chunk_bytes);
+            ASSERT_LT(send_staging->sizeBytes(), cpu_regions[0].size());
+            ASSERT_LT(send_staging->sizeBytes(), promotion_manifest.total_bytes);
+            const std::span<std::uint8_t> send_bytes{
+                static_cast<std::uint8_t *>(send_staging->mutableData()), send_staging->sizeBytes()};
+            const auto source_hash = expertTierWeightBytesHash(cpu_regions[0]);
+            EXPECT_FALSE(cursor.takeNext().has_value());
+            EXPECT_FALSE(cursor.complete()); // Missing staging cannot advance source ownership.
             std::uint64_t promotion_chunks = 0;
-            while (auto chunk = cursor.takeNext())
+            std::uint64_t promotion_wire_bytes = 0;
+            while (auto chunk = cursor.takeNext(send_bytes))
             {
+                ASSERT_EQ(chunk->payload.data(), send_bytes.data());
+                ASSERT_GT(chunk->payload.size(), 0u);
+                ASSERT_LE(chunk->payload.size(), send_bytes.size());
+                ASSERT_EQ(chunk->header.payload_bytes, chunk->payload.size());
+                promotion_wire_bytes += chunk->payload.size();
                 auto progress = destination.beginChunk(
                     chunk->header, chunk->payload, &error);
                 const auto deadline = std::chrono::steady_clock::now() +
@@ -1822,6 +1839,8 @@ namespace llaminar2
                 ++promotion_chunks;
             }
             ASSERT_TRUE(cursor.complete());
+            EXPECT_EQ(promotion_wire_bytes, promotion_manifest.total_bytes);
+            EXPECT_EQ(expertTierWeightBytesHash(cpu_regions[0]), source_hash);
             ASSERT_TRUE(destination.complete());
             ASSERT_TRUE(destination.publishFinal(&error)) << error;
             ASSERT_NE(destination.preparedEngine(), nullptr);
@@ -1887,12 +1906,21 @@ namespace llaminar2
                 ExpertTierSourceReadiness::publishedResidencyBank(
                     promoted_epoch),
                 source_lifetime);
-            MoEOverlayRemoteProjectionChunkValidator validator(
-                demotion_manifest);
-            std::vector<std::uint8_t> redemoted_cpu_bytes(
+            auto cpu_destination_owner = std::make_shared<std::vector<std::uint8_t>>(
                 cpu_weights.native_interleaved.size(), 0xa5u);
+            auto &redemoted_cpu_bytes = *cpu_destination_owner;
+            // Wire units are compact transfer order, not native interleaved
+            // CPU allocation offsets. Exercise the production destination's
+            // authenticated scatter into the original final representation.
+            MoEOverlayHostRemoteProjectionDestination cpu_destination(
+                demotion_identity,
+                {std::span<std::uint8_t>(redemoted_cpu_bytes), {}, {}, {}},
+                cpu_destination_owner,
+                demotion_manifest);
+            ASSERT_TRUE(cpu_destination.beginManifest(demotion_manifest, &error)) << error;
             std::uint64_t demotion_chunks = 0;
-            while (!validator.complete())
+            std::uint64_t demotion_wire_bytes = 0;
+            while (!cpu_destination.complete())
             {
                 MoEOverlayRemoteProjectionChunkView chunk;
                 auto progress = source.pollNextChunk(&chunk, &error);
@@ -1906,24 +1934,32 @@ namespace llaminar2
                 }
                 ASSERT_EQ(progress, MoEOverlayResidencyWaveProgress::Ready)
                     << error;
-                ASSERT_TRUE(validator.accept(
-                    chunk.header, chunk.payload, &error))
-                    << error;
-                std::memcpy(
-                    redemoted_cpu_bytes.data() + chunk.header.region_offset,
-                    chunk.payload.data(),
-                    chunk.payload.size());
+                ASSERT_EQ(cpu_destination.beginChunk(
+                              chunk.header, chunk.payload, &error),
+                          MoEOverlayResidencyWaveProgress::Ready) << error;
+                demotion_wire_bytes += chunk.payload.size();
                 ASSERT_TRUE(source.acknowledgeChunkSent(
                     chunk.header, &error))
                     << error;
                 ++demotion_chunks;
             }
+            EXPECT_EQ(demotion_wire_bytes, demotion_manifest.total_bytes);
+            ASSERT_TRUE(cpu_destination.publishFinal(&error)) << error;
             EXPECT_EQ(redemoted_cpu_bytes.size(),
                       cpu_weights.native_interleaved.size());
-            EXPECT_TRUE(std::equal(
-                redemoted_cpu_bytes.begin(),
-                redemoted_cpu_bytes.end(),
-                cpu_weights.native_interleaved.begin()));
+            // Original packing coordinates, not observed transfer writes,
+            // determine every expected byte, including untouched padding.
+            std::vector<std::uint8_t> expected_cpu_bytes(redemoted_cpu_bytes.size(), 0xa5u);
+            size_t live_bytes = 0;
+            for (size_t byte = 0; byte < expected_cpu_bytes.size(); ++byte)
+                if (test::expertTierExpandedCPUByteRow(cpu_weights, byte) < size_t(N))
+                {
+                    expected_cpu_bytes[byte] = cpu_weights.native_interleaved[byte];
+                    ++live_bytes;
+                }
+            EXPECT_EQ(demotion_wire_bytes, live_bytes);
+            EXPECT_LT(live_bytes, expected_cpu_bytes.size());
+            EXPECT_EQ(redemoted_cpu_bytes, expected_cpu_bytes);
             EXPECT_GT(promotion_chunks, 1u);
             EXPECT_GT(demotion_chunks, 1u);
 

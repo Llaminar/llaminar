@@ -6,6 +6,8 @@
  * inherited unchanged. Pressure families retain their authored eight GPU experts;
  * production hardware experiments retain the original PMA-selected expert policy.
  * Cache admission never changes either expert declaration.
+ * Q6 pressure candidates keep actual four-device expert followers distinct from
+ * continuation cache owners; source, numerical and exact-MTP gates stay separate.
  * Cell declaration grants no numerical, serving, performance or E2E certificate.
  */
 #pragma once
@@ -354,6 +356,11 @@ inline std::vector<ModelParityCase> qwen4ExpSharedCoordinatorTP2NativeExactCases
 }
 /** @brief Exact six requested hardware rows; actual board identity remains native evidence. */
 enum class Qwen4ExpHardwareTarget { ROCm1, ROCm2, ROCm4, CUDA1, CUDA2, CUDA2ROCm4 };
+/** @brief The six authored hardware rows, shared by whole-source and subset projections. */
+inline constexpr std::array kQwen4ExpHardwareTargets{
+    Qwen4ExpHardwareTarget::ROCm1, Qwen4ExpHardwareTarget::ROCm2,
+    Qwen4ExpHardwareTarget::ROCm4, Qwen4ExpHardwareTarget::CUDA1,
+    Qwen4ExpHardwareTarget::CUDA2, Qwen4ExpHardwareTarget::CUDA2ROCm4};
 /** @brief Requested physical cache roles, never inferred from spare hardware. */
 enum class Qwen4ExpHardwareNgramOwners { Continuation, Follower, Both };
 
@@ -456,6 +463,66 @@ inline ModelParityDefinition qwen4ExpHardwareTargetDefinition(
     return definition;
 }
 /**
+ * @brief Derive the actual four-expert-follower pressure workload without a topology copy.
+ * @param owners Original Follower or Both declaration; Continuation uses existing families.
+ * @return Same model, quotas, domains and math with only C0/C64 and RAM/SSD source axes.
+ * @throws std::invalid_argument For an owner role outside this explicit candidate family.
+ * @throws std::logic_error If the original cache pressure product changes.
+ * @note C64 is a correctness pressure ceiling, never a performance budget or admitted grant.
+ */
+inline ModelParityDefinition qwen4ExpExpertFollowerOwnerPressureDefinition(Qwen4ExpHardwareNgramOwners owners)
+{
+    if(owners!=Qwen4ExpHardwareNgramOwners::Follower && owners!=Qwen4ExpHardwareNgramOwners::Both)
+        throw std::invalid_argument("Q6 expert-owner candidates require Follower or Both");
+    auto definition=qwen4ExpHardwareTargetDefinition(Qwen4ExpHardwareTarget::CUDA2ROCm4,owners);
+    std::vector<ImmutableRowTablePolicy> axes;
+    for(const auto& original:definition.features.ngram_storage){
+        if(!original.isGPUAdaptive() || original.gpu_adaptive.host.maximum_cache_rows!=0)continue;
+        for(const auto backing:{AdaptiveImmutableRowBacking::SSD,AdaptiveImmutableRowBacking::RAM}){
+            auto policy=original;policy.gpu_adaptive.source_backing=backing;policy.validate();axes.push_back(std::move(policy));
+        }
+    }
+    if(axes.size()!=4)throw std::logic_error("Q6 expert-owner pressure axes lost C0/C64 RAM/SSD");
+    definition.features.ngram_storage=std::move(axes);
+    definition.topology.test_id+="_ExpertOwnerPressureCandidate";
+    return definition;
+}
+/**
+ * @brief Preserve distinct static and real-moving numerical obligations on the original Q6 workload.
+ * @param policy StaticOrdinal or DynamicOrdinal, never an implicit substituted policy.
+ * @return Thirty-two candidates per policy over owner/backing/cache and Off/1/3/Dynamic.
+ * @throws std::invalid_argument For another expert policy.
+ * @throws std::logic_error If the exact execution product changes.
+ * @note Registration is not execution, admission, numerical or performance qualification.
+ */
+inline std::vector<ModelParityCase> qwen4ExpExpertFollowerOwnerExecutionCases(ModelParityExpertOverlayPolicy policy)
+{
+    if(policy.owner_order!=RoutedExpertOwnerOrder::Ordinal ||
+       (policy.movement!=ModelParityExpertMovement::Static && policy.movement!=ModelParityExpertMovement::Dynamic))
+        throw std::invalid_argument("Q6 expert-owner candidates require StaticOrdinal or DynamicOrdinal");
+    std::vector<ModelParityCase> result;
+    for(const auto owners:{Qwen4ExpHardwareNgramOwners::Follower,Qwen4ExpHardwareNgramOwners::Both})
+        for(auto cell:expandModelParityDefinition(qwen4ExpExpertFollowerOwnerPressureDefinition(owners)))
+            if(cell.expert_overlay==std::optional{policy} &&
+               (cell.mtp==ModelParityMTP::Off || cell.mtp==ModelParityMTP::Depth1 ||
+                cell.mtp==ModelParityMTP::Depth3 || cell.mtp==ModelParityMTP::DynamicDepth)){
+                cell.topology.test_id+="_R15";result.push_back(std::move(cell));
+            }
+    if(result.size()!=32)throw std::logic_error("Q6 expert-owner execution candidate product changed");
+    return result;
+}
+/**
+ * @brief Select active candidates for the existing same-configuration exact-MTP replay.
+ * @param policy SAME expert policy as numerical candidates and their original Off controls.
+ * @return Twenty-four active candidates; no serial production path is introduced.
+ */
+inline std::vector<ModelParityCase> qwen4ExpExpertFollowerOwnerNativeExactCases(ModelParityExpertOverlayPolicy policy)
+{
+    auto result=qwen4ExpExpertFollowerOwnerExecutionCases(policy);
+    std::erase_if(result,[](const auto& cell){return cell.mtp==ModelParityMTP::Off;});
+    return result;
+}
+/**
  * @brief Supported whole-source controls for the six hardware rows, without colocation admission.
  * @return Twelve Off/StaticOrdinal RAM or SSD-mmap cases with production expert ceilings.
  * @details Zero expert ceilings use original PMA residency planning, not zero
@@ -467,9 +534,7 @@ inline const std::vector<ModelParityCase>& qwen4ExpHardwareProductionSourceCases
 {
     static const auto cases = [] {
         std::vector<ModelParityCase> result;
-        for (const auto target : {Qwen4ExpHardwareTarget::ROCm1, Qwen4ExpHardwareTarget::ROCm2,
-                Qwen4ExpHardwareTarget::ROCm4, Qwen4ExpHardwareTarget::CUDA1,
-                Qwen4ExpHardwareTarget::CUDA2, Qwen4ExpHardwareTarget::CUDA2ROCm4}) {
+        for (const auto target : kQwen4ExpHardwareTargets) {
             auto definition = qwen4ExpHardwareTargetDefinition(target);
             auto plan = std::make_shared<MoERoutedExpertPlacementPlan>(*definition.topology.expert_overlay_plan);
             for (auto& tier : plan->routed_tiers) {

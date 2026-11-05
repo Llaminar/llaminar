@@ -221,8 +221,10 @@ namespace llaminar2
                plan.usesGlobalTP() || plan.prev_rank || plan.next_rank ||
                plan.first_layer!=0 || (plan.last_layer>=0 && plan.last_layer!=profile.mainLayerCount()-1) ||
                !plan.has_embedding || !plan.has_lm_head ||
-               (sharedReaders ? devices.size()!=2 : (devices.size()!=2 && devices.size()!=4 && devices.size()!=8)))
-                throw std::invalid_argument(consumerLocal
+               (devices.size()!=2 && devices.size()!=4 && devices.size()!=8))
+                throw std::invalid_argument(sharedReaders
+                    ? "Shared replicated adaptive lookup requires full-main rank-local homogeneous GPU TP degree2/4/8 with original addressed native completion"
+                    : consumerLocal
                     ? "ConsumerLocal adaptive lookup requires full-main rank-local homogeneous GPU TP degree 2/4/8, without PP/global TP"
                     : "FixedHeadSharded requires full-main rank-local homogeneous GPU TP degree2/4/8, without PP/global TP");
             const auto type=devices.front().device_type;
@@ -235,20 +237,19 @@ namespace llaminar2
                 const auto member=[&](DeviceId device){return std::any_of(devices.begin(),devices.end(),[&](const auto& value){return value.toLocalDeviceId()==device;});};
                 if((type!=DeviceType::ROCm && type!=DeviceType::CUDA) ||
                    coordinator.world_rank!=plan.rank || !member(coordinator.device()))
-                    throw std::invalid_argument("Shared replicated PLE requires authored homogeneous CUDA/ROCm TP2 coordinator membership");
-                // Both supported compute arms use the same original replicated
-                // query/source protocol. CUDA readers retain their explicit
-                // cached peer classification; ROCm storage remains storage-only,
-                // never another TP participant or an implicit local replica.
-                size_t storage=0;
-                for(const auto& owner:placement.owners){
-                    if(owner.participant.world_rank!=plan.rank ||
-                       (owner.participant!=coordinator && !owner.participant.device().is_rocm()) ||
-                       (owner.participant!=coordinator && member(owner.participant.device())))
-                        throw std::invalid_argument("Shared replicated PLE requires a distinct ROCm storage-only GPU or the authored coordinator");
-                    storage+=!member(owner.participant.device());
+                    throw std::invalid_argument("Shared replicated PLE requires authored homogeneous CUDA/ROCm coordinator membership");
+                // Physical cache ownership is independent of original reader
+                // membership. A native owner may be any original continuation;
+                // every other owner uses the existing opposite-vendor channel.
+                // Neither role grants a new communicator or execution authority.
+                for (const auto& owner : placement.owners) {
+                    if (owner.participant.world_rank != plan.rank)
+                        throw std::invalid_argument("Shared PLE storage owner crossed its original rank authority");
+                    if (owner.participant.device().type == type && !member(owner.participant.device()))
+                        throw std::invalid_argument("Shared PLE same-vendor storage owner is outside the original native communicator; this topology is unqualified and unsupported");
+                    if (!owner.participant.device().is_gpu())
+                        throw std::invalid_argument("Shared PLE storage owner is not an original GPU participant");
                 }
-                if(storage!=1)throw std::invalid_argument("Shared replicated PLE first topology requires exactly one third storage-only GPU");
             }
         }
         return (ngram.isFixedHeadSharded() || consumerLocal || sharedReaders)?ImmutableRowTableTPTopology::HomogeneousFullMainRankLocal:
@@ -665,27 +666,17 @@ namespace llaminar2
         {
             const auto layer = static_cast<int>(profile.flash_next->ple_decoder_layer);
             std::vector<ImmutableRowTableReaderPeerAccess> reader_peer_access;
-            const auto &ngram_policy = request.plan.runtime.ngram_table_policy;
-            if (ngram_policy.isGPUAdaptive() &&
-                ngram_policy.gpu_adaptive.placement.mode == AdaptiveGPUCachePlacementMode::DeclaredRankLocal) {
-                std::vector<PhysicalMemoryAllocatorIdentity> readers;
-                for (const auto &cfg : device_configs)
-                    if (cfg.execution_role == DeviceExecutionMemoryRole::ContinuationGraph &&
-                        cfg.first_layer <= layer && (cfg.last_layer < 0 || cfg.last_layer >= layer))
-                        readers.push_back({cfg.world_rank, cfg.device});
-                if (readers.size() > 1) {
-                    const auto &coordinator = *ngram_policy.gpu_adaptive.placement.coordinator;
-                    reader_peer_access = ImmutableRowTableDirectedTransportPolicy::observeReaders(
-                        {coordinator.world_rank, coordinator.device()}, readers, request.inventory);
-                }
-            }
+            // Original native NCCL/RCCL owns homogeneous peer selection;
+            // serialized peer flags are not an alternate shared-cache route.
             for (auto &cfg : device_configs)
                 if (cfg.execution_role == DeviceExecutionMemoryRole::ContinuationGraph &&
                     cfg.first_layer <= layer && (cfg.last_layer < 0 || cfg.last_layer >= layer))
                 {
                     cfg.ngram_execution_policy = request.plan.runtime.ngram_table_policy;
                     cfg.ngram_reader_peer_access = reader_peer_access;
-                    if (request.plan.runtime.ngram_table_policy.isGPUAdaptive())
+                    if (request.plan.runtime.ngram_table_policy.isGPUAdaptive() &&
+                        !(request.plan.usesLocalTP() && request.plan.runtime.ngram_table_policy.gpu_adaptive.placement.mode ==
+                            AdaptiveGPUCachePlacementMode::DeclaredRankLocal))
                         cfg.ngram_gpu_peer_access = ImmutableRowTableDirectedTransportPolicy::observe(
                             request.plan.runtime.ngram_table_policy.gpu_adaptive.placement, request.inventory);
                     cfg.ngram_lookup_schedule = request.plan.runtime.ngram_lookup_schedule;

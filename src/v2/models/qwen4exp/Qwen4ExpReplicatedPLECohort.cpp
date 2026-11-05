@@ -12,6 +12,7 @@
 #include "interfaces/IModelContext.h"
 #include "execution/mtp/DeviceGenerationContract.h"
 #include "loaders/ResidentImmutableRowTable.h"
+#include "utils/Logger.h"
 #include <algorithm>
 #include <stdexcept>
 namespace llaminar2 {
@@ -89,6 +90,20 @@ ILocalTPContext &Qwen4ExpReplicatedPLECohort::context() const
         throw std::logic_error("Fixed-head PLE communicator changed after Rank composition");
     return *context_;
 }
+bool Qwen4ExpReplicatedPLECohort::requiresParentOwnedNativeMaterialization(
+    const ITPContext& context, DeviceId device, int participant) const
+{
+    requireConsumer(device, participant);
+    if (&context != context_)
+        throw std::invalid_argument("Shared native factory changed its original Rank parent");
+    if (!placement_->isGPUAdaptive()) return false;
+    // Every original reader records the same native result protocol, including
+    // a pure reader with no physical cache. Only the Rank owns all arenas before
+    // any participant capture, so optional owner subsets cannot change this
+    // materialization boundary. Opposite-vendor owners retain their own parents.
+    return placement_->gpuAdaptiveRequest().placement.mode == AdaptiveGPUCachePlacementMode::DeclaredRankLocal;
+}
+
 void Qwen4ExpReplicatedPLECohort::requireConsumer(DeviceId device,int participant) const
 {
     const auto &ctx=context();
@@ -124,7 +139,8 @@ void Qwen4ExpReplicatedPLECohort::prepareSharedSource(
     requireConsumer(device, index);
     const auto rendezvous = [&](const char* phase) {
         if (!tp.graphCaptureBoundaryRendezvous(phase, index, 30000))
-            throw std::runtime_error("Shared source original cold materialization boundary failed");
+            throw std::runtime_error(std::string("Shared source original cold materialization boundary failed: ") +
+                phase + " participant=" + std::to_string(index));
     };
     try
     {
@@ -134,8 +150,20 @@ void Qwen4ExpReplicatedPLECohort::prepareSharedSource(
         if (!source) prepare();
         rendezvous("qfn-shared-readers-materialized");
     }
+    catch (const std::exception &failure)
+    {
+        // Several participants fail together after the first cold error. The
+        // rank's future join can observe a peer's aborted rendezvous first;
+        // retain the actual local cause before publishing that absorbing abort.
+        LOG_ERROR("[Qwen4ExpReplicatedPLECohort] Shared source setup failed device=" << device.toString()
+            << " participant=" << index << " cause=" << failure.what());
+        tp.requestAbort();
+        throw;
+    }
     catch (...)
     {
+        LOG_ERROR("[Qwen4ExpReplicatedPLECohort] Shared source setup failed device=" << device.toString()
+            << " participant=" << index << " cause=non-standard exception");
         tp.requestAbort();
         throw;
     }

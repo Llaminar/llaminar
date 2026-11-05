@@ -33,6 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy the shared installers and run the same ones the release image uses,
 # so the dev environment tracks production 1:1.
 COPY scripts/docker /tmp/install-scripts
+COPY scripts/build/gpu_spill_guard.py /tmp/build/gpu_spill_guard.py
 RUN chmod +x /tmp/install-scripts/*.sh
 RUN NINJA_VERSION=${NINJA_VERSION} MODE=build \
     /tmp/install-scripts/install-system-deps.sh

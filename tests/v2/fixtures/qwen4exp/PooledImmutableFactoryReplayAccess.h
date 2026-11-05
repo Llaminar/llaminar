@@ -13,6 +13,15 @@
 namespace llaminar2::test {
 struct PooledImmutableFactoryReplayAccess final {
     /**
+     * @brief Exercise original controller retirement after fixture graph borrowers release.
+     * @param boundary Actual source boundary, with no replacement owner or native proof.
+     * @param original Exact controller words borrowed by the retired fixture graph.
+     * @note Native producer completion remains a separate hardware obligation.
+     */
+    static void retireGenerationControl(qwen4exp::ImmutableLookupExecutionBoundary& boundary,
+        RetainedStorageGenerationControl original) { boundary.retireGenerationControl(original); }
+
+    /**
      * @brief Withdraw only the recorded boundary's weak authority to replay missing terminal proof.
      * @param boundary Original fixture boundary; its actual cohort owner remains retained by the test.
      */
@@ -22,6 +31,18 @@ struct PooledImmutableFactoryReplayAccess final {
             std::weak_ptr<qwen4exp::PooledImmutableRetirementAuthority>{}, std::memory_order_release);
     }
 
+    /**
+     * @brief Consume the fixture's actual Preparing-source permits after original root materialization.
+     * @param storage Actual source root initialized by the existing factory body.
+     * @param source Its original admitted source; no PreparedBirth or terminal proof is invented.
+     * @note Native API work is doubled; this grants graph-construction evidence only.
+     */
+    static void bindOriginalPreparedWorkers(qwen4exp::PooledImmutableSourcePreparedStorage& storage,
+        const std::shared_ptr<NativeContextPreparation>& source){
+        std::vector<PreparedGPUContextUsePermit> owners;
+        for(const auto& owner:storage.originalOwners())owners.push_back(source->acquire(owner->plan().allocator().device));
+        storage.bindPreparedSourceWorkers(source,source->acquire(storage.coordinator()->plan().allocator().device),std::move(owners));
+    }
     /** @brief Append the actual plan's closed program using sealed recorded observations. */
     static void addOrdering(PhysicalMemoryPlanBuilder& builder,NativeOrderingEventProgram program,
         PhysicalMemoryResource host,PhysicalMemoryResource gpu){

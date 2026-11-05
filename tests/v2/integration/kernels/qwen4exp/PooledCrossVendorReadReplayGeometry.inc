@@ -8,8 +8,12 @@ struct CrossVendorReadReplaySpec final {
 #ifdef LLAMINAR_POOLED_NATIVE_PROGRAM_DIAGNOSTIC
     bool authoredRemote=false,handshake=false;
 #endif
+    AdaptiveImmutableRowBacking sourceBacking=AdaptiveImmutableRowBacking::SSD; ///< Same actual source backing as the prepared provider.
     /** @brief Reject incomplete geometry before source preparation or any capture owner exists. */
     void requireComplete()const{
+        (void)providerReplaySourcePolicy(sourceBacking);
+        requireProvider(sourceBacking!=AdaptiveImmutableRowBacking::RAM||ramSlots==0,
+            "Full RAM source excludes a redundant bounded RAM row cache");
         requireProvider(file && maximum>=16 && !(maximum%16) && unique && unique<=maximum && unique<=file->rows && slots<=file->rows,
             "Cross-vendor program requires its complete original source/row geometry");
     }
@@ -34,11 +38,13 @@ struct CrossVendorReadReplayGeometry final {
         spec.requireComplete();
         const PhysicalMemoryAllocatorIdentity sourceId{0,sourceDevice},ownerId{0,ownerDevice},hostId{0,DeviceId::cpu()};
         const auto& file_=*spec.file;const auto Maximum=spec.maximum,Unique=spec.unique,slots=spec.slots,ramSlots=spec.ramSlots;
-        const auto source=file_.descriptor();const std::array tiers{ImmutableRowStorage::VRAM,ImmutableRowStorage::RAM,ImmutableRowStorage::MemoryMapped};
+        const auto source=file_.descriptor();const auto sourcePolicy=providerReplaySourcePolicy(spec.sourceBacking);
+        std::vector<ImmutableRowStorage> tiers{ImmutableRowStorage::VRAM,ImmutableRowStorage::RAM};
+        if(sourcePolicy.storage()==ImmutableRowStorage::MemoryMapped)tiers.push_back(ImmutableRowStorage::MemoryMapped);
         const auto layout=ImmutableRowTableLayoutGeometry::checked(ImmutableRowTableExtent::fromNative(source.format,source.rows,source.rowBytes()),
             ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,
             {{{ownerId,ImmutableRowStorage::VRAM},0,slots,{}},{{hostId,ImmutableRowStorage::RAM},0,ramSlots,{}}},{sourceId},{},
-            {{hostId,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,4096,2)}},{},slots?std::optional(sourceId):std::nullopt,Unique,ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator,peerAccess);
+            {{hostId,sourcePolicy}},{},slots?std::optional(sourceId):std::nullopt,Unique,ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator,peerAccess);
         const auto physical=q::PooledImmutablePhysicalOwnerGeometry::fromLayout(layout,std::array{ownerId},sourceId);
         const auto policy=q::PooledImmutableCoordinatorGeometry::fromOwners(physical,{65536,1,2},Maximum);
         const auto cpuGeometry=CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPU(layout,hostId,sourceId);

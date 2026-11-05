@@ -22,14 +22,14 @@ public:
     /** @return Original source holder, retaining its provider and worker through true last reader. */
     const std::shared_ptr<const PooledImmutableCapturedSourceWave>& sourceWave()const noexcept{return source_;}
     /** @return Original fixed metadata endpoint; no row count or model value is read on host. */
-    const CapturedTransferBinding& binding(PooledPublicationWireRole role,CapturedTransferEndpoint side)const;
+    const PooledImmutableTransferBinding& binding(PooledPublicationWireRole role,CapturedTransferEndpoint side)const;
     /** @return Original root subrange; exact wire bytes are distinct from storage capacity. */
     PooledPinWireSpan source(PooledPublicationWireRole role)const;
     PooledPinWireSpan destination(PooledPublicationWireRole role)const;
     /** @return Complete original root/channel/role/capture identity, excluding mutable protocol values. */
     uint64_t captureIdentity()const;
 private:
-    using Pair=std::pair<CapturedTransferBinding,CapturedTransferBinding>;
+    using Pair=std::pair<PooledImmutableTransferBinding,PooledImmutableTransferBinding>;
     /** @brief Only a fully checked original source publishes this immutable holder. */
     PooledImmutableCapturedPublicationWave(std::shared_ptr<const PooledImmutableCapturedSourceWave> source,std::shared_ptr<PhysicalMemoryAuthority> memory):source_(std::move(source)),memory_(std::move(memory)){}
     std::shared_ptr<const PooledImmutableCapturedSourceWave> source_;

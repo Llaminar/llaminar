@@ -24,6 +24,19 @@ __device__ inline std::uint64_t readerSystemAcquire(const std::uint64_t* address
     return __hip_atomic_load(address, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
 #endif
 }
+/** @brief Acquire the actual original native communicator abort word, including late cancellation.
+ * @param address Immutable pointer minted by that original communicator's lifetime owner.
+ * @return Current native transport abort; no model/controller value is downloaded.
+ */
+__device__ inline std::uint32_t readerSystemAcquire(const volatile std::uint32_t* address)
+{
+#if defined(QFN_POOLED_NATIVE_CUDA)
+    cuda::atomic_ref<std::uint32_t,cuda::thread_scope_system> word(*const_cast<std::uint32_t*>(address));
+    return word.load(cuda::memory_order_acquire);
+#else
+    return __hip_atomic_load(address, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+#endif
+}
 /** @brief Reload descriptor fields after their original publication acquire, avoiding stale mapped cache lines. */
 __device__ inline std::uint64_t readerPublishedWord(const std::uint64_t* address)
 {
@@ -52,7 +65,9 @@ __global__ void replicatedReader(rr::NativeArgs args)
         accepted = accepted && args.source_frame->interval.table == args.source_table;
         if (!accepted) args.publication->status = rr::Status::Cancelled;
     } else if constexpr (Action == rr::Action::AcceptResultHeader) {
-        accepted = rr::accept(*args.received, *args.received_bytes, args.geometry,
+        const auto bytes = args.native_fixed_header.abortFlag ? rr::nativeFixedHeaderBytes(
+            args.native_fixed_header, readerSystemAcquire(args.native_fixed_header.abortFlag), *args.first_error) : *args.received_bytes;
+        accepted = rr::accept(*args.received, bytes, args.geometry,
             args.version, args.source_table, static_cast<std::uint32_t>(args.original_rows.activeRows()),
             args.first_error, *args.publication);
     } else if constexpr (Action == rr::Action::PrepareResult) {
@@ -63,16 +78,40 @@ __global__ void replicatedReader(rr::NativeArgs args)
         *args.published_bytes = accepted ?
             rr::outputBytes(args.geometry, args.source_frame->original_ids) : 0;
     } else if constexpr (Action == rr::Action::AcknowledgeResult) {
-        const auto* original = args.payload_completion.publication();
-        const auto epoch = readerSystemAcquire(&original->epoch);
-        const CapturedTransferMessage message{readerPublishedWord(&original->message.key),
-            readerPublishedWord(&original->message.bytes)};
-        const auto cancellation = readerSystemAcquire(args.payload_completion.cancellationAddress());
-        const auto status = args.payload_completion.status(*args.received_bytes, cancellation, epoch, message);
+        CapturedTransferStatus status;
+        if (args.native_payload_completion.valid()) {
+            // This action is a separate dependent kernel AFTER the whole native
+            // launch, not a first-channel callback. Any channel's sticky failure
+            // and a late original communicator abort veto apparent completion.
+            const auto aborted = readerSystemAcquire(args.native_payload_completion.abortAddress());
+            const auto& interval = args.publication->interval;
+            status = args.native_payload_completion.matches(interval.table, interval.admission,
+                interval.sequence, *args.received_bytes, args.native_payload_message,
+                aborted, *args.first_error) ? CapturedTransferStatus::Ready : CapturedTransferStatus::InvalidPhase;
+        } else {
+            const auto* original = args.payload_completion.publication();
+            const auto epoch = readerSystemAcquire(&original->epoch);
+            const CapturedTransferMessage message{readerPublishedWord(&original->message.key),
+                readerPublishedWord(&original->message.bytes)};
+            const auto cancellation = readerSystemAcquire(args.payload_completion.cancellationAddress());
+            status = args.payload_completion.status(*args.received_bytes, cancellation, epoch, message);
+        }
         accepted = rr::acknowledge(*args.publication, *args.received_bytes,
             args.geometry, args.first_error, status);
     } else if constexpr (Action == rr::Action::ConfirmAck) {
-        accepted = rr::confirm(*args.received, *args.received_bytes, *args.source_frame,
+        accepted = true;
+        if (args.native_payload_completion.valid()) {
+            // The source also vetoes a late abort between payload and fixed ACK.
+            // This is its own completed payload record, never the reader's remote pointer.
+            const auto aborted = readerSystemAcquire(args.native_payload_completion.abortAddress());
+            const auto& interval = args.source_frame->interval;
+            accepted = args.native_payload_completion.matches(interval.table, interval.admission,
+                interval.sequence, rr::outputBytes(args.geometry, args.source_frame->original_ids),
+                args.native_payload_message, aborted, *args.first_error);
+        }
+        const auto bytes = args.native_fixed_header.abortFlag ? rr::nativeFixedHeaderBytes(
+            args.native_fixed_header, readerSystemAcquire(args.native_fixed_header.abortFlag), *args.first_error) : *args.received_bytes;
+        accepted = accepted && rr::confirm(*args.received, bytes, *args.source_frame,
             args.geometry, args.version, args.first_error);
     }
     if (!accepted) failReplicatedReader(args);
@@ -92,12 +131,21 @@ void QFN_READER_ENQUEUE(Action action, NativeArgs args, void* exact_stream)
     const bool receives = action == Action::AcceptResultHeader || action == Action::AcknowledgeResult || action == Action::ConfirmAck;
     const bool publishes = action == Action::PrepareResultHeader || action == Action::AcceptResultHeader ||
         action == Action::AcknowledgeResult;
-    if (!valid(args.geometry) || !args.version || !args.source_table || !args.healthy || !args.first_error ||
+    const bool fixedNative = args.native_fixed_header.abortFlag && args.native_fixed_header.deviceCommunicator;
+    if (bool(args.native_fixed_header.abortFlag) != bool(args.native_fixed_header.deviceCommunicator) ||
+        (fixedNative && action != Action::AcceptResultHeader && action != Action::ConfirmAck) ||
+        (action == Action::ConfirmAck && fixedNative != args.native_payload_completion.valid()) ||
+        !valid(args.geometry) || !args.version || !args.source_table || !args.healthy || !args.first_error ||
         (source && !args.source_frame) || (receives && !args.received_bytes) ||
         ((action == Action::AcceptResultHeader || action == Action::ConfirmAck) && !args.received) ||
         (publishes && !args.publication) ||
         (action == Action::PrepareResult && !args.published_bytes) ||
-        (action == Action::AcknowledgeResult && !args.payload_completion.valid()))
+        (action == Action::AcknowledgeResult &&
+            (args.payload_completion.valid() == args.native_payload_completion.valid() ||
+                (args.native_payload_completion.valid() && !args.native_payload_message))) ||
+        (action == Action::ConfirmAck &&
+            (args.payload_completion.valid() ||
+                (args.native_payload_completion.valid() && !args.native_payload_message))))
         throw std::invalid_argument("Replicated PLE reader requires its complete original operands");
     const auto stream = static_cast<QFN_NATIVE_STREAM>(exact_stream);
 #define QFN_READER_CASE(Name) case Action::Name: \

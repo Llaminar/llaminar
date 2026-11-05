@@ -25,6 +25,7 @@
 #include "../../utils/CPUExecutionTestGeometry.h"
 #include "fixtures/backends/NativeContextPreparationReplayAccess.h"
 #include "mocks/MockWorkerGPUContext.h"
+#include "backends/NativeAuxiliaryResourceCatalog.h"
 #include <gtest/gtest.h>
 #include <limits>
 #include <algorithm>
@@ -1084,8 +1085,8 @@ TEST(RankMemoryPlanInputs, DirectTokenHistoryOwnerFollowsTerminalAcrossOneToEigh
     }
 }
 
-/** @test Original selected policy survives planning and factory projection; its
- * absent native certificate rejects before final physical admission/creation. */
+/** @test Original selected policy prices exactly its installed side-family BOM
+ * before final admission; fixture-only parent terminals never enter serving. */
 TEST(RankMemoryPlanInputs, ReadAheadOriginalPolicyRequiresCertifiedBOMBeforeAdmission)
 {
     test::Qwen4ExpPlanningGGUFFixture file;
@@ -1130,18 +1131,31 @@ TEST(RankMemoryPlanInputs, ReadAheadOriginalPolicyRequiresCertifiedBOMBeforeAdmi
                   fixture.plan.runtime.ngram_lookup_schedule);
         EXPECT_EQ(InferenceRunnerConfig::fromRuntime(fixture.plan.runtime).ngram_lookup_schedule,
                   fixture.plan.runtime.ngram_lookup_schedule);
-        try
-        {
-            (void)MemoryPlanner::plan(fixture.model,inputs);
-            FAIL()<<"Uncertified resource family reached physical admission";
-        }
-        catch(const std::runtime_error& error)
-        {
-            EXPECT_NE(std::string(error.what()).find("unqualified"),std::string::npos)<<error.what();
-            EXPECT_NE(std::string(error.what()).find("side-stream1-ordering2-v1"),std::string::npos)<<error.what();
-            EXPECT_EQ(original->memory()->phase(),PhysicalMemoryAuthorityPhase::Preparing);
-            EXPECT_EQ(GPUDeviceContextPool::instance().retainExistingContextProvenance(device).originalBirthKey().get(),originalKey.get());
-        }
+        const auto expected=NativeAuxiliaryResourceCatalog::allowance(backend,
+            NativeAuxiliaryResourceProgram::readAheadSide());
+        const auto planned=MemoryPlanner::plan(fixture.model,inputs);
+        const auto* host=planned.physicalPlan().find({inputs.front().world_rank,DeviceId::cpu()});
+        const auto* gpu=planned.physicalPlan().find({inputs.front().world_rank,device});
+        ASSERT_NE(host,nullptr);ASSERT_NE(gpu,nullptr);
+        EXPECT_EQ(host->bytes(PhysicalMemoryOwner::NativeReadAheadFamily),expected.hostBytes);
+        EXPECT_EQ(gpu->bytes(PhysicalMemoryOwner::NativeReadAheadFamily),expected.deviceBytes);
+        EXPECT_EQ(host->bytes(PhysicalMemoryOwner::NativeReadAheadParentTerminal),0u);
+        EXPECT_EQ(gpu->bytes(PhysicalMemoryOwner::NativeReadAheadParentTerminal),0u);
+        // This original 24GiB-free fixture cannot fit the full 48-layer source.
+        // Qualification adds its exact BOM; it never advertises extra capacity.
+        EXPECT_FALSE(planned.fits());
+        EXPECT_THROW((void)planned.admit(),PhysicalMemoryCapacityExhausted);
+        // Planning seals a BOM, not a live creation permit or final source mutation.
+        EXPECT_EQ(original->memory()->phase(),PhysicalMemoryAuthorityPhase::Preparing);
+        EXPECT_EQ(GPUDeviceContextPool::instance().retainExistingContextProvenance(device).originalBirthKey().get(),originalKey.get());
+        auto ordinary=inputs;
+        ordinary.front().ngram_lookup_schedule=ImmutableLookupSchedule::ConsumerScheduled;
+        const auto serial=MemoryPlanner::plan(fixture.model,ordinary);
+        for(const auto& resource:serial.physicalPlan().resources())
+            EXPECT_EQ(resource.bytes(PhysicalMemoryOwner::NativeReadAheadFamily),0u);
+        auto incompatible=inputs;incompatible.front().concurrent_workspace_owners=2;
+        EXPECT_THROW((void)MemoryPlanner::plan(fixture.model,incompatible),std::invalid_argument);
+        EXPECT_EQ(original->memory()->phase(),PhysicalMemoryAuthorityPhase::Preparing);
     }
 }
 
@@ -1165,19 +1179,17 @@ TEST(RankMemoryPlanInputs, ReadAheadSelectionSnapshotSurvivesDebugMutationAndAda
     EXPECT_EQ(InferenceRunnerConfig::fromRuntime(frozen).ngram_lookup_schedule,frozen.ngram_lookup_schedule);
 }
 
-/** @test Original Rank TP coordinates stay authored while one third GPU serves shared storage. */
+/** @test Original Rank TP coordinates stay authored while both continuation GPUs also own shared storage. */
 TEST(RankMemoryPlanInputs, SharedCoordinatorTP2KeepsOriginalComputeAndStorageRoles)
 {
     test::Qwen4ExpPlanningGGUFFixture file;
     PlanningModelSource source(file.path());
     Fixture fixture(DeviceType::ROCm,2);
     fixture.model=source.metadata().memoryProfile();fixture.plan.last_layer=47;
-    auto storage=fixture.inventory.gpus.front();storage.local_device_id=2;storage.uuid="storage-only-2";
-    fixture.inventory.gpus.push_back(storage);
-    fixture.inventory.p2p_rocm_count=3;fixture.inventory.p2p_rocm.assign(9,false);
+    fixture.inventory.p2p_rocm_count=2;fixture.inventory.p2p_rocm.assign(4,false);
     fixture.plan.runtime.ngram_table_policy.storage=ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD;
     fixture.plan.runtime.ngram_table_policy.gpu_adaptive.placement=
-        parseAdaptiveGPUCachePlacement("0:rocm:2/64/1048576@0:rocm:1");
+        parseAdaptiveGPUCachePlacement("0:rocm:0/64/1048576,0:rocm:1/64/1048576@0:rocm:1");
     std::reverse(fixture.plan.local_tp_devices.begin(),fixture.plan.local_tp_devices.end());
     fixture.plan.primary_device=fixture.plan.local_tp_devices.front();
     const auto inputs=buildRankMemoryPlanInputs(fixture.request());
@@ -1188,13 +1200,16 @@ TEST(RankMemoryPlanInputs, SharedCoordinatorTP2KeepsOriginalComputeAndStorageRol
         EXPECT_EQ(inputs[coordinate].ngram_tp_topology,ImmutableRowTableTPTopology::HomogeneousFullMainRankLocal);
         ASSERT_TRUE(inputs[coordinate].ngram_execution_policy);
         EXPECT_EQ(inputs[coordinate].ngram_execution_policy->lookupIOConsumer(inputs[coordinate].device,2),DeviceId::rocm(1));
-        EXPECT_EQ(inputs[coordinate].ngram_gpu_peer_access,PeerAccessCoverage::None);
-        EXPECT_NE(inputs[coordinate].device,DeviceId::rocm(2));
+        EXPECT_FALSE(inputs[coordinate].ngram_gpu_peer_access); // Native library owns homogeneous peer selection.
+        const auto& owners=inputs[coordinate].ngram_execution_policy->gpu_adaptive.placement.owners;
+        ASSERT_EQ(owners.size(),2u);
+        EXPECT_EQ(owners[coordinate].participant.device(),(DeviceId::rocm(int(coordinate))));
+        EXPECT_TRUE(inputs[coordinate].ngram_reader_peer_access.empty());
     }
     auto missing=fixture;
     missing.plan.runtime.ngram_table_policy.gpu_adaptive.placement=
         parseAdaptiveGPUCachePlacement("0:rocm:1/64/1048576@0:rocm:1");
-    EXPECT_THROW(buildRankMemoryPlanInputs(missing.request()),std::invalid_argument);
+    EXPECT_NO_THROW(buildRankMemoryPlanInputs(missing.request()));
     auto foreign=fixture;
     foreign.plan.runtime.ngram_table_policy.gpu_adaptive.placement=
         parseAdaptiveGPUCachePlacement("0:rocm:2/64/1048576@0:rocm:3");
@@ -1242,20 +1257,18 @@ TEST(RankMemoryPlanInputs, SharedCoordinatorCUDATP2KeepsOppositeVendorStorageAnd
         EXPECT_EQ(input.shard_index,static_cast<int>(coordinate));
         EXPECT_EQ(input.ngram_tp_topology,ImmutableRowTableTPTopology::HomogeneousFullMainRankLocal);
         EXPECT_FALSE(input.ngram_gpu_peer_access); // Cross-vendor storage has no same-vendor observation.
-        ASSERT_EQ(input.ngram_reader_peer_access.size(),1u);
-        EXPECT_EQ(input.ngram_reader_peer_access.front(),(ImmutableRowTableReaderPeerAccess{
-            {0,DeviceId::cuda(1)},{0,DeviceId::cuda(0)},PeerAccessCoverage::None}));
+        EXPECT_TRUE(input.ngram_reader_peer_access.empty()); // No serialized captured-channel route for native readers.
         ASSERT_TRUE(input.ngram_execution_policy);
         EXPECT_EQ(input.ngram_execution_policy->lookupIOConsumer(input.device,2),DeviceId::cuda(1));
         EXPECT_NE(input.device,DeviceId::rocm(0));
     }
     auto partial=fixture;
     partial.inventory.p2p_cuda[1]=true;
-    EXPECT_THROW(buildRankMemoryPlanInputs(partial.request()),std::invalid_argument);
+    EXPECT_NO_THROW(buildRankMemoryPlanInputs(partial.request())); // Native CCL, including partial P2P coverage.
     auto computeOwner=fixture;
     computeOwner.plan.runtime.ngram_table_policy.gpu_adaptive.placement=
         parseAdaptiveGPUCachePlacement("0:cuda:0/64/1048576@0:cuda:1");
-    EXPECT_THROW(buildRankMemoryPlanInputs(computeOwner.request()),std::invalid_argument);
+    EXPECT_NO_THROW(buildRankMemoryPlanInputs(computeOwner.request()));
     auto unsupportedStorage=fixture;
     unsupportedStorage.plan.runtime.ngram_table_policy.gpu_adaptive.placement=
         parseAdaptiveGPUCachePlacement("0:cuda:2/64/1048576@0:cuda:1");
@@ -1273,3 +1286,141 @@ TEST(RankMemoryPlanInputs, SharedCoordinatorCUDATP2KeepsOppositeVendorStorageAnd
 
 #include "NativeWeightLoadStagingContract.inc"
 #include "NativeWeightSourceBOMContract.inc"
+
+
+/** @brief Actual Rank inputs preserve both continuation shards and native ownership independently of P2P coverage. */
+TEST(RankMemoryPlanInputs, SharedAllContinuationOwnersUseOriginalNativeTP2AcrossPeerCoverage)
+{
+    test::Qwen4ExpPlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    for (const auto type : {DeviceType::CUDA, DeviceType::ROCm})
+        for (const auto coverage : {0u, 1u, 2u})
+            for (const auto capacity : {0u, 64u}) {
+                Fixture fixture(type, 2);
+                fixture.model = source.metadata().memoryProfile();
+                fixture.plan.last_layer = 47;
+                auto& matrix = type == DeviceType::CUDA ? fixture.inventory.p2p_cuda : fixture.inventory.p2p_rocm;
+                auto& count = type == DeviceType::CUDA ? fixture.inventory.p2p_cuda_count : fixture.inventory.p2p_rocm_count;
+                count = 2; matrix.assign(4, false);
+                matrix[1] = coverage > 0; matrix[2] = coverage > 1;
+                const auto backend = type == DeviceType::CUDA ? "cuda" : "rocm";
+                fixture.plan.runtime.ngram_table_policy.storage = ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD;
+                fixture.plan.runtime.ngram_table_policy.gpu_adaptive.placement = parseAdaptiveGPUCachePlacement(
+                    "0:" + std::string(backend) + ":0/" + std::to_string(capacity) + "/" + std::to_string(capacity ? 1048576 : 0) + ",0:" + backend +
+                    ":1/" + std::to_string(capacity / 2) + "/" + std::to_string(capacity ? 524288 : 0) + "@0:" + backend + ":1");
+                std::reverse(fixture.plan.local_tp_devices.begin(), fixture.plan.local_tp_devices.end());
+                fixture.plan.primary_device = fixture.plan.local_tp_devices.front();
+                const auto inputs = buildRankMemoryPlanInputs(fixture.request());
+                ASSERT_EQ(inputs.size(), 2u);
+                for (std::size_t coordinate = 0; coordinate < inputs.size(); ++coordinate) {
+                    const auto& input = inputs[coordinate];
+                    EXPECT_EQ(input.device, fixture.plan.local_tp_devices[coordinate].toLocalDeviceId());
+                    EXPECT_EQ(input.shard_index, static_cast<int>(coordinate));
+                    EXPECT_EQ(input.ngram_tp_topology, ImmutableRowTableTPTopology::HomogeneousFullMainRankLocal);
+                    ASSERT_TRUE(input.ngram_execution_policy);
+                    EXPECT_EQ(input.ngram_execution_policy->lookupIOConsumer(input.device, 2), (DeviceId{type, 1}));
+                    EXPECT_FALSE(input.ngram_gpu_peer_access);
+                    EXPECT_TRUE(input.ngram_reader_peer_access.empty());
+                }
+                auto incomplete = fixture;
+                incomplete.plan.runtime.ngram_table_policy.gpu_adaptive.placement.owners.pop_back();
+                EXPECT_NO_THROW(buildRankMemoryPlanInputs(incomplete.request()));
+                auto partialModel = fixture;
+                partialModel.plan.first_layer = 1;
+                EXPECT_THROW(buildRankMemoryPlanInputs(partialModel.request()), std::invalid_argument);
+            }
+}
+
+/** @test A declared third same-vendor owner fails at original planning before native materialization. */
+TEST(RankMemoryPlanInputs, SharedOutsideNativeCohortOwnerRejectsAtAdmission)
+{
+    test::Qwen4ExpPlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    for (const auto type : {DeviceType::CUDA, DeviceType::ROCm}) {
+        Fixture fixture(type, 2);
+        fixture.model = source.metadata().memoryProfile();
+        fixture.plan.last_layer = 47;
+        auto storage = fixture.inventory.gpus.front();
+        storage.local_device_id = 2;
+        storage.uuid = "outside-native-cohort";
+        fixture.inventory.gpus.push_back(storage);
+        const auto backend = type == DeviceType::CUDA ? "cuda" : "rocm";
+        fixture.plan.runtime.ngram_table_policy.storage = ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD;
+        fixture.plan.runtime.ngram_table_policy.gpu_adaptive.placement = parseAdaptiveGPUCachePlacement(
+            "0:" + std::string(backend) + ":2/64/1048576@0:" + backend + ":0");
+        try {
+            (void)buildRankMemoryPlanInputs(fixture.request());
+            FAIL() << "Outside-cohort native owner was admitted";
+        } catch (const std::invalid_argument& error) {
+            EXPECT_NE(std::string(error.what()).find("outside the original native communicator"), std::string::npos);
+        }
+    }
+}
+
+/** @test Owner subsets and mapped owners never change original native reader coordinates or cache intent. */
+TEST(RankMemoryPlanInputs, SharedOwnerSubsetsPreserveOriginalNativeReadersAcrossBackends)
+{
+    test::Qwen4ExpPlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    for (const auto type : {DeviceType::CUDA,DeviceType::ROCm})
+        for (unsigned mask=1;mask<4;++mask)
+            for (int coordinator=0;coordinator<2;++coordinator)
+                for (const unsigned capacity : {0u,64u})
+                    for (const bool mapped : {false,true}) {
+                        SCOPED_TRACE(::testing::Message()<<int(type)<<":"<<mask<<":"<<coordinator<<":"<<capacity<<":"<<mapped);
+                        Fixture fixture(type,2);fixture.model=source.metadata().memoryProfile();fixture.plan.last_layer=47;
+                        const std::string backend=type==DeviceType::CUDA?"cuda":"rocm";
+                        const std::string opposite=type==DeviceType::CUDA?"rocm":"cuda";
+                        std::string owners;
+                        for(unsigned owner=0;owner<2;++owner)if(mask&(1u<<owner)){
+                            if(!owners.empty())owners+=",";
+                            owners+="0:"+backend+":"+std::to_string(owner)+"/"+std::to_string(capacity)+"/"+std::to_string(capacity?1048576:0);
+                        }
+                        if(mapped){
+                            auto storage=fixture.inventory.gpus.front();storage.type=type==DeviceType::CUDA?DeviceType::ROCm:DeviceType::CUDA;
+                            storage.local_device_id=0;storage.uuid="opposite-original-owner";fixture.inventory.gpus.push_back(storage);
+                            owners+=",0:"+opposite+":0/"+std::to_string(capacity)+"/"+std::to_string(capacity?1048576:0);
+                        }
+                        auto& policy=fixture.plan.runtime.ngram_table_policy;
+                        policy.storage=ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD;
+                        policy.gpu_adaptive.placement=parseAdaptiveGPUCachePlacement(owners+"@0:"+backend+":"+std::to_string(coordinator));
+                        const auto expected=policy.gpu_adaptive.placement;
+                        std::reverse(fixture.plan.local_tp_devices.begin(),fixture.plan.local_tp_devices.end());
+                        fixture.plan.primary_device=fixture.plan.local_tp_devices.front();
+                        const auto inputs=buildRankMemoryPlanInputs(fixture.request());ASSERT_EQ(inputs.size(),2u);
+                        for(std::size_t coordinate=0;coordinate<inputs.size();++coordinate){
+                            EXPECT_EQ(inputs[coordinate].device,fixture.plan.local_tp_devices[coordinate].toLocalDeviceId());
+                            EXPECT_EQ(inputs[coordinate].shard_index,int(coordinate));
+                            ASSERT_TRUE(inputs[coordinate].ngram_execution_policy);
+                            EXPECT_EQ(inputs[coordinate].ngram_execution_policy->gpu_adaptive.placement,expected);
+                            EXPECT_EQ(inputs[coordinate].ngram_execution_policy->lookupIOConsumer(inputs[coordinate].device,2),(DeviceId{type,coordinator}));
+                            EXPECT_FALSE(inputs[coordinate].ngram_gpu_peer_access);
+                            EXPECT_TRUE(inputs[coordinate].ngram_reader_peer_access.empty());
+                        }
+                        auto foreignHost=fixture;foreignHost.plan.local_tp_devices[1].hostname="foreign";
+                        EXPECT_THROW(buildRankMemoryPlanInputs(foreignHost.request()),std::invalid_argument);
+                        auto foreignRank=fixture;foreignRank.plan.runtime.ngram_table_policy.gpu_adaptive.placement.owners.front().participant.world_rank=1;
+                        EXPECT_THROW(buildRankMemoryPlanInputs(foreignRank.request()),std::invalid_argument);
+                    }
+}
+
+/** @test Original TP4/8 owner subsets retain exact homogeneous readers and no unrelated mapped route. */
+TEST(RankMemoryPlanInputs, AddressedSharedOwnersRetainOriginalReadersEveryDegree) {
+    test::Qwen4ExpPlanningGGUFFixture file;PlanningModelSource source(file.path());
+    for(const auto type:{DeviceType::CUDA,DeviceType::ROCm})for(const int degree:{2,4,8})
+        for(const int coordinator:{0,degree-1})for(const bool ownsSource:{false,true})for(const unsigned capacity:{0u,64u}) {
+            Fixture fixture(type,degree);fixture.model=source.metadata().memoryProfile();fixture.plan.last_layer=47;
+            const std::string backend=type==DeviceType::CUDA?"cuda":"rocm";
+            const int owner=ownsSource?coordinator:(coordinator+1)%degree;
+            auto& policy=fixture.plan.runtime.ngram_table_policy;policy.storage=ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD;
+            policy.gpu_adaptive.placement=parseAdaptiveGPUCachePlacement("0:"+backend+":"+std::to_string(owner)+"/"+
+                std::to_string(capacity)+"/"+std::to_string(capacity?1048576:0)+"@0:"+backend+":"+std::to_string(coordinator));
+            std::reverse(fixture.plan.local_tp_devices.begin(),fixture.plan.local_tp_devices.end());fixture.plan.primary_device=fixture.plan.local_tp_devices.front();
+            const auto inputs=buildRankMemoryPlanInputs(fixture.request());ASSERT_EQ(inputs.size(),std::size_t(degree));
+            for(std::size_t coordinate=0;coordinate<inputs.size();++coordinate){
+                EXPECT_EQ(inputs[coordinate].device,fixture.plan.local_tp_devices[coordinate].toLocalDeviceId());
+                EXPECT_EQ(inputs[coordinate].shard_index,int(coordinate));ASSERT_TRUE(inputs[coordinate].ngram_execution_policy);
+                EXPECT_EQ(inputs[coordinate].ngram_execution_policy->gpu_adaptive.placement,policy.gpu_adaptive.placement);
+            }
+        }
+}

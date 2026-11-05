@@ -161,6 +161,12 @@ void replicatedReaderNativeReplay(DeviceId source, DeviceId destination)
             ack.received_bytes = static_cast<const std::uint64_t*>(received_count->deviceData());
             launchReader(destination, reader::Action::AcknowledgeResult, ack, reader_stream);
             auto confirm = args;
+            // ConfirmAck consumes the returned fixed ACK header, not the payload
+            // receive receipt already authenticated by AcknowledgeResult. Keep
+            // the original malformed operand as a no-launch rejection control.
+            EXPECT_THROW(launchReader(destination, reader::Action::ConfirmAck,
+                confirm, reader_stream), std::invalid_argument);
+            confirm.payload_completion = CapturedTransferReceiveCompletion::notRequired();
             confirm.received = &bank->reply;
             launchReader(destination, reader::Action::ConfirmAck, confirm, reader_stream);
             capture.finish();

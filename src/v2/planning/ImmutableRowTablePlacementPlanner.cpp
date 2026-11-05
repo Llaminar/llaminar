@@ -1,4 +1,3 @@
-#include "execution/qwen4exp/PooledImmutableRetainedParticipantBudget.h"
 /**
  * @file ImmutableRowTablePlacementPlanner.cpp
  * @brief Select a concrete native-table candidate using only canonical PMA fit decisions.
@@ -6,7 +5,10 @@
  * Complete candidates extend a frozen higher-priority plan. A failed candidate
  * cannot change model/expert placement or graph/KV geometry. Explicit preferences
  * evaluate one candidate only; Automatic selection ends before materialization.
+ * Shared transport retains its authored source at zero cache capacity without
+ * manufacturing a live GPU directory or changing compute participant roles.
  */
+#include "execution/qwen4exp/PooledImmutableRetainedParticipantBudget.h"
 #include "ImmutableRowTablePlacementPlanner.h"
 #include "ImmutableRowTableHostAuthority.h"
 #include "loaders/ImmutableRowTable.h"
@@ -243,7 +245,7 @@ ImmutableRowTableLayoutGeometry ImmutableRowTablePlacementInput::gpuAdaptiveLayo
             requested.gpu_adaptive.sourceStorage(),requested.window_bytes,requested.window_count)}},{},
         !independent && active?std::optional{requester}:std::nullopt,maximum_live_ids,
         independent ? ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal : ImmutableRowTableAdaptiveGPUDomain::SharedCoordinator,
-        gpu_peer_access_, reader_peer_access_);
+        gpu_peer_access_, reader_peer_access_, declared ? std::optional{requester} : std::nullopt);
 }
 std::size_t immutableRowTableMaximumLiveIds(int ordinary_rows,int batch,std::size_t heads,
     int verifier_rows,int retained_rows)
