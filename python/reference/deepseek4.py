@@ -353,9 +353,9 @@ class DeepSeekV4Reference:
         cap("q", q.reshape(S, -1))
         cap("kv", kv)
 
-        # key-visibility mask over [raw S | compressed nb]
-        j = torch.arange(S)
-        raw_vis = (j[None, :] <= pos[:, None]) & (pos[:, None] - j[None, :] < c.window)
+        # key-visibility mask over [raw S | compressed nb]; image spans widen the raw window
+        from .deepseek4_vision import raw_window_visibility
+        raw_vis = raw_window_visibility(tokens, c.window)
         keys, vis = kv, raw_vis
         ratio = c.compress_ratios[il]
         if ratio:
@@ -408,10 +408,15 @@ class DeepSeekV4Reference:
         p = f"blk.{il}."
         scores = F.softplus(x @ self._t(p + "ffn_gate_inp.weight").T).sqrt()
         cap("router_scores", scores)
+        from .deepseek4_vision import is_sentinel
+        image = is_sentinel(tokens)
         if il < c.n_hash_layers:
             idx = self._t(p + "ffn_gate_tid2eid.weight")[tokens].long()
         else:
             idx = (scores + self._t(p + "exp_probs_b.bias")).topk(c.n_expert_used, dim=-1).indices
+        if bool(image.any()):
+            vl = (scores + self._t(p + "exp_probs_b_vl.bias")).topk(c.n_expert_used, dim=-1).indices
+            idx = torch.where(image[:, None], vl, idx)
         wts = scores.gather(1, idx)
         wts = wts / wts.sum(-1, keepdim=True) * c.route_scale
         cap("router_ids", idx.to(x.dtype))
@@ -433,8 +438,14 @@ class DeepSeekV4Reference:
         cap("moe_shared", sh)
         return y + sh
 
-    def forward(self, tokens: Sequence[int], capture: Optional[Callable[[str, torch.Tensor], None]] = None) -> torch.Tensor:
-        """Run the full causal sequence; returns logits for every position [S, vocab]."""
+    def forward(self, tokens: Sequence[int], capture: Optional[Callable[[str, torch.Tensor], None]] = None,
+                image_rows: Optional[torch.Tensor] = None, sentinel_table: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Run the full causal sequence; returns logits for every position [S, vocab].
+
+        With image sentinels in ``tokens`` (see ``deepseek4_vision``), ``image_rows``
+        are the aligner outputs of every IMAGE sentinel in order and
+        ``sentinel_table`` the five learned sentinel vectors.
+        """
         c = self.cfg
         tokens = torch.as_tensor(list(tokens), dtype=torch.long)
         S = tokens.numel()
@@ -446,6 +457,9 @@ class DeepSeekV4Reference:
             return f
 
         x = self._t("token_embd.weight")[tokens]
+        if sentinel_table is not None:
+            from .deepseek4_vision import merge_embeddings
+            x = merge_embeddings(x, tokens, image_rows, sentinel_table)
         h = x[:, None, :].repeat(1, c.hc_mult, 1)
         cap_fn(-1)("embedding", x)
         for il in range(c.n_layer):
@@ -482,13 +496,14 @@ class DeepSeekV4Reference:
         cap_fn(-1)("logits", logits)
         return logits
 
-    def greedy(self, prompt: Sequence[int], n_decode: int, capture_step: Optional[Callable[[int, str, torch.Tensor], None]] = None) -> List[int]:
+    def greedy(self, prompt: Sequence[int], n_decode: int, capture_step: Optional[Callable[[int, str, torch.Tensor], None]] = None,
+               image_rows: Optional[torch.Tensor] = None, sentinel_table: Optional[torch.Tensor] = None) -> List[int]:
         """Prefill then ``n_decode`` greedy steps (full recompute per step); returns generated ids."""
         seq = list(prompt)
         out: List[int] = []
         for step in range(n_decode + 1):
             cb = (lambda n, t, s=step: capture_step(s, n, t)) if capture_step else None
-            logits = self.forward(seq, cb)
+            logits = self.forward(seq, cb, image_rows, sentinel_table)
             nxt = int(logits[-1].argmax())
             out.append(nxt)
             seq.append(nxt)
