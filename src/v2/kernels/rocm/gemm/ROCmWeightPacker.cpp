@@ -200,6 +200,10 @@ namespace llaminar2
             const int K = static_cast<int>(tensor->cols());
             if (N <= 0 || K <= 0 || (K % 32) != 0)
                 return false;
+            // The packed container is self-describing: its uploaders derive the
+            // exact live plane extents from this geometry.
+            out.N = N;
+            out.K = K;
 
             // The direct native entry owns a complete prepared matrix, just
             // like the source-default wrapper. Descriptor publication must not
