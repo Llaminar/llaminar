@@ -12,6 +12,7 @@
 #include "planning/ModelMemoryProfile.h"
 #include "kernels/common/SparseQueryExecutionProgram.h"
 #include "../models/qwen4exp/Qwen4ExpConfig.h"
+#include "../models/clover/CloverMoEConfig.h"
 #include "../models/qwen4exp/Qwen4ExpSidecarManifest.h"
 #include "../models/qwen4exp/Qwen4ExpPublishedGeometry.h"
 #include <array>
@@ -416,7 +417,13 @@ namespace llaminar2
         ModelMemoryProfile profile;
 
         profile.architecture = model.architecture;
-        if (model.architecture == "qwen4exp")
+        if (model.architecture == "clover_moe")
+        {
+            // Authenticate before costing. The graph consumes this same source
+            // contract, including the original export's implicit shared expert.
+            CloverMoEConfig(model).populate(profile);
+        }
+        else if (model.architecture == "qwen4exp")
         {
             const Qwen4ExpConfig config(model);
             profile.n_layers = config.mainLayers();
@@ -531,7 +538,11 @@ namespace llaminar2
         profile.total_native_bytes = 0;
         profile.tensors.reserve(model.tensors.size());
 
-        for (const auto &tensor : model.tensors) appendNativeTensor(profile, tensor);
+        for (const auto &tensor : model.tensors)
+        {
+            if (model.architecture == "clover_moe" && CloverMoEConfig::isDiffusionOnlyTensor(tensor.name)) continue;
+            appendNativeTensor(profile, tensor);
+        }
 
         return profile;
     }

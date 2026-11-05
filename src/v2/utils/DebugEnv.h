@@ -412,7 +412,7 @@ namespace llaminar2
          * with FP32 accumulation/output. Decode and verifier use one fixed
          * reduction tree; ordinary GPU prefill uses floating GEMM.
          * The default FP16MoEAlphaBeta applies half operands only to original floating
-         * qwen35moe and qwen4exp alpha/beta matrices; dense GDN stays native. Explicit FP16AlphaBeta
+         * registered hybrid MoE alpha/beta matrices; dense GDN stays native. Explicit FP16AlphaBeta
          * selects alpha/beta for both dense and MoE models. Experts, routers and full-attention keep their own policy.
          */
         GDNProjectionArithmetic gdn_projection_arithmetic = kDefaultGDNProjectionArithmetic;

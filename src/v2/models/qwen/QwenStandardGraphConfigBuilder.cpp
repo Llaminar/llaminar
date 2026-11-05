@@ -1,6 +1,10 @@
 /**
  * @file QwenStandardGraphConfigBuilder.cpp
- * @brief Implementation of QwenStandardGraphConfigBuilder
+ * @brief Shared Qwen-family execution configuration and architecture-builder selection.
+ *
+ * Model-specific builders authenticate their original source before reusing
+ * participant placement and weight-binding machinery. Clover retains a distinct
+ * source contract even though its causal operators share the hybrid MoE graph.
  * @author David Sanftenberg
  * @date January 2026
  */
@@ -13,6 +17,7 @@
 #include "../qwen35/Qwen35GraphConfigBuilder.h"
 #include "../qwen35moe/Qwen35MoEGraphConfigBuilder.h"
 #include "../qwen4exp/Qwen4ExpGraphConfigBuilder.h"
+#include "../clover/CloverMoEGraphConfigBuilder.h"
 #include <algorithm>
 #include <cmath>
 #include <numeric>
@@ -47,6 +52,8 @@ namespace llaminar2
         }
         if (model_type == "qwen4exp")
             return std::make_unique<Qwen4ExpGraphConfigBuilder>();
+        if (model_type == "clover_moe")
+            return std::make_unique<CloverMoEGraphConfigBuilder>();
         return nullptr;
     }
 

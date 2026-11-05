@@ -392,6 +392,11 @@ handles, and `TransferEngine` is the public movement/coherence authority. See
 the architecture document above before changing orchestration or graph
 ownership.
 
+For `clover_moe` source, graph or qualification changes, read
+`src/v2/models/clover/README.md`. Its source identity and validated causal geometry
+remain distinct from the shared Qwen operators; Preview diffusion operands do not
+enable diffusion execution or contribute to causal weight materialization.
+
 HTTP serving uses one stable inference worker and bounded generation admission,
 with independent HTTP capacity for discovery and passive `GET /stats` reads.
 Stats project immutable terminal observations and host wall clocks; they must
