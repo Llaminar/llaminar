@@ -1,6 +1,7 @@
 # MXFP4 native E8M0 scale plane (issue #26)
 
-Status: in progress, stacked on PR #25 (`feat/mxfp4-weights`).
+Status: implemented in PR #27, stacked on PR #25 (`feat/mxfp4-weights`).
+Stages 1–4 are complete; stage 5 evidence is summarised in the PR body.
 
 ## Goal
 
@@ -76,10 +77,14 @@ the CPU/CUDA/ROCm gates green.
   byte. Every producer (CPU packer, `packVnniBlock`, CUDA/ROCm repack, tier
   CPU→GPU inverse) rejects nonzero blocks outside `[2, 252]` and emits the zero
   marker only for all-zero payloads.
-- The scale encoding is part of sealed preparation and wire identity.
-  `ExpertTierWeightStreamManifest` (version 3 today) must bump its version and
-  hash the encoding, so old FP16 codebook-25 records are never accepted as
-  E8M0 or CPU-BF16 records just because their codebook and strides match.
+- The scale encoding is part of sealed preparation and wire identity. Every
+  format that could carry an old FP16 codebook-25 record bumps its version,
+  so such a record is never accepted as E8M0 or CPU-BF16 just because its
+  codebook and strides match:
+  - `ExpertTierWeightStreamManifest` v4;
+  - remote projection ABI 5;
+  - GPU packed weights v5;
+  - CPU packed archive (`PACKED_WEIGHTS_VERSION`) 8.
 - A normal finite scale bounds individual weights, not contributions. Dot
   products keep the ordinary IEEE FP32 contract.
 
@@ -89,13 +94,16 @@ the CPU/CUDA/ROCm gates green.
   moves, MXFP4 gets its own dispatch-policy entries.
 - Staged scales (LDS and register slots) carry a normalized 16-bit word:
   the original FP16 bits, or for native 25 `powerOfTwoBF16Word(e)`, which
-  `decodeStagedPrimary` places with `<< 16`. cp.async cannot transform data,
-  so BK64 copies only the live byte extent (8 bytes for 8 columns) into raw
-  staging. The copy owner then normalizes it after the async wait and before
-  the existing CTA publication barrier. That schedule stays enabled. The plane-indexing
-  loader is never applied to staged or CPU-unit slots. CUDA BK64 copies 16
-  bytes for 8 columns today (`CUDANativeVNNIPrefillDevice.cuh`), so a byte
-  plane copies 8.
+  `decodeStagedPrimary` places with `<< 16`. cp.async copies elements
+  verbatim and cannot normalize a byte plane. In CUDA BK64 staging
+  (`CUDANativeVNNIPrefillDevice.cuh`) the native-25 primary metadata is
+  therefore loaded synchronously as eight scalar bytes and normalized directly
+  into the shared staged-word slots. Inactive columns get 0. Payloads and the
+  secondary plane keep their cp.async schedule, and compute reads the staged
+  scales only after the existing CTA barrier. This is a schedule difference
+  from the FP16 plane's 16-byte cp.async; the paired prefill measurements in
+  the PR identify it. The plane-indexing loader is never applied to staged or
+  CPU-unit slots.
 - The expert-tier CPU unit keeps its 2-byte scale slot, offsets and stride.
   Only the separated GPU plane shrinks. Native 25 stores a BF16 power-of-two
   word in the CPU slot: `w = 0` for the zero marker, otherwise
