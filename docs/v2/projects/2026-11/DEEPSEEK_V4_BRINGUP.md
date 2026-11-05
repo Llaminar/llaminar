@@ -327,3 +327,36 @@ Measured vLLM baseline (P0): weights + DSpark 78.61 GiB/GPU, CUDA graphs
 ~94.4 GiB used of 95.8 per GPU. Decode 1 request 206-218 tok/s; 8 concurrent
 943 tok/s total (130 per request); cold 68.7K prompt 4.8 s; cold 273K 25.7 s;
 warm 273K re-ask 0.81 s; host-tier 252K reload 0.74-0.93 s; quality 51/60.
+
+## Vision (DeepSeek-V4-Flash-Vision-Exp image input)
+
+Authorities: official `inference/{image_processor,vision,model}.py`; prompt
+layout of production vLLM (`vllm/models/deepseek_v4/common/mm_preprocess.py`,
+in-vocab sentinels `129257 + type`, `3 - start % 4` IMAGE_PAD prefix);
+weights from the llama.cpp `deepseek4v` mmproj (`--mmproj`, unsloth
+`mmproj-BF16.gguf` / `mmproj-F16.gguf`).
+
+Done:
+- Reference `python/reference/deepseek4_vision.py`: ViT + aligner equal the
+  official `vision.py` to 1e-6; end to end on exact-size images greedy tokens
+  equal llama.cpp mtmd (6/6, 6/6, 4/6).
+- Host admission `multimodal/ImageIO` + `DeepSeekV4ImagePreprocess`: Pillow-
+  exact decode (PNG), resize and pad, BF16 patches, blocks, expansion
+  (`V2_Unit_DeepSeekV4ImagePreprocess`). JPEG decodes with stb (may differ from
+  libjpeg-turbo by a few code values).
+
+Runtime design (in progress):
+- Vision tower placement: host CPU (FP32 BLAS), like production vLLM's UVA
+  offload of `vision`/`aligner`; its outputs are request input. A GPU tower is
+  later performance work. Host weights are FP32 copies of the mmproj tensors.
+- Text graph: image rows enter after the embedding lookup from an arena
+  image bank `[bank_rows, d_model]` indexed through a per-position row map;
+  START/PAD/NEWLINE/END take the four learned vectors. Every sentinel routes
+  with `exp_probs_b_vl` (hash layers included); raw-window attention of span
+  tokens covers the whole `[START, END]` span (`get_window_topk_idxs_visible`),
+  derived in-kernel from the chunk token ids.
+- Prefill chunk scheduling never splits an image span (atomic spans in the
+  scheduler policy; every span is shorter than the largest prefill bucket).
+- Admission: the runner hands prepared images to the continuation
+  participant before prefill; the bank and row map are uploaded once per
+  request (initial I/O). Multi-rank placements reject images explicitly.
