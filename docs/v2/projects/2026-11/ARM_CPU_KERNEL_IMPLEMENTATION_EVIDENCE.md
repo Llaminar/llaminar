@@ -10,6 +10,82 @@ kernel slices from the unfinished objective in
 production factory/workspace bindings, real models, HTTP/MTP/prefix campaigns,
 exact-overlay installation and final `Perf__` scaling have not passed.
 
+## 2026-11-05 RMSNorm integration checkpoint (incomplete)
+
+The new native `NEONRMSNormReduction.h` consumes original noncontiguous
+FP32/FP16/BF16/full-width INT32 rows in shared-traversal tiles1..4. Four fixed
+FP64 chains/eight lane positions and a fixed fold are independent of M/workers.
+T5 is a separate increasing-column FP32 FMA program vectorized across rows.
+Independent finite-domain references and actual native M=1 calls cover original
+prefix/padding and K fringes through8192. Integer conversion widens before FP64,
+retaining low bits above2^24. This reducer proof alone is not RMSNorm integration.
+
+A native production-TU regression now reproduces three original ownership
+failures, after adding genuine NEON math seams but before changing ownership:
+
+-1×12288 all-ones, retained3: all12288 values are1.7320247888565063 instead
+of0.9999949932098389. Each caller used its private4096 partial, not the12288
+original-row summary. This is an owner defect, not last-bit reduction drift.
+- A delayed retained small exact-alias call transforms the same row three times
+and returns while only1/3 participants have arrived.
+- An empty retained invocation also returns at1/3 arrivals.
+
+The frozen TU SHA256 is
+`e6a7f1f54bb86f126676665bc2b0e14fa757db5ee7d160bbfecaa051374cfaef`;
+raw XML/logs remain outside the repository. It is not an untouched old ARM
+engine build. The repair makes summary, inverse and publication one complete
+worker-owned row/tile transaction, eliminates FP32 TLS scratch/atomic partials,
+protects original full banks/gamma/options before stores, and completes retained
+small/empty calls. Unused detached FP32 summary/application entrypoints and the
+unused FP32 scratch overload were retired rather than retained as a second path.
+
+`NEONRMSNormFloatingRows.h` shares gamma and directly publishes original encoded
+rows with bounded register tails. Staged guarded FP64-mean versus per-row
+FP32-mean inverses remain explicit, distinct programs. The old truncating scalar
+half publication now uses `FP16Utils`; native lanes use `NEONFP16`, not F16C as a
+universal subnormal/payload oracle. The current production-TU floating sweep
+checks M1..16/31/33, original prefixes/canaries, independent formulas and actual
+M=1 bytes for all three floating formats/T5, including retained workers1..10.
+All eight production-TU cases now pass, including explicit half normal-rounding
+lanes and distinct inverse programs. The complete fresh five-profile matrix
+passes151/151 each; all115 configured preflights pass20 repetitions (2300 raw
+passes). Exact current scope and preserved RED runs are recorded below.
+
+Native BF16/FP16 factory source now calls original-storage matrix primitives
+instead of allocating/decoding whole FP32 rows. Actual factory-TU C++23 syntax
+passes with genuine dependencies and `-Werror=switch`; factory runtime, residual
+conversion/workspace paths and whole-engine gates remain unqualified. Do not
+infer complete RMSNorm or MTP inference support from these passes.
+
+Static exact-header resource diagnosis found an outlined compile-time visitor
+that moved accumulators through memory each K iteration. Direct compile-time
+visits remove that call/memory edge: the Rows4 FP32 hot loop has16 native FP64
+FMA instructions per8 columns/row,24 SIMD register identities, and no stack
+accesses/calls. This is static resource evidence, not PMU or throughput evidence.
+
+Source-only RMSNorm audit also identified open Q8 epsilon/gamma-cache/no-op and
+legacy Q24 narrowing defects, INT32 AVX2 low-bit loss, distinct quantizers,
+Q16 FP32-square rounding/complete-block/expansion-alias seams, and unadmitted
+legacy workspace/row buffers. Those require individual executed regressions,
+repairs, explicit preflights and broader qualification; none is closed here.
+
+## Native Spark engine build-only checkpoint
+
+Fresh packet `3bf350a5…a80ba` supersedes the withheld `662c0ac5…ac8e`;662 must
+not be executed or patched. The native validator reports exact SDK content
+import authentication, real oneDNN3.11.3 install and no OOM, then a first
+**configuration** failure: heterogeneous `lscpu` emits multiline socket/core/
+thread fields and `V2TestGateFinalization.cmake` cannot evaluate `4 * 1\\n1`.
+The application/Unit/preflight build command never started. Native sysfs and
+`lscpu` CSV also disagree about core identities; first-row trimming or CSV
+deduplication is not an acceptable repair. The returned archive SHA256 is
+`15497193eeb13213c06c0d202ac031f59e2a24776b38a9bc25c72a0a57362c67`.
+Main independently rechecked its archive digest; detailed raw-record inspection
+is still in progress, not replaced by the validator's report. The stopped packet remains immutable; a source-owned
+heterogeneous topology fix and a new authenticated successor precede any retry.
+No model/GPU/corpus/cluster work or broader test campaign is authorized by this
+build-only attempt.
+
 ## Linux GCC rounding regression: Spark RED and local repair
 
 The first immutable Spark snapshot (`SHA256SUMS` `c59c5ef2…8152`) built on
@@ -68,6 +144,40 @@ all-ISA ties-away assumption is not valid. Preserve the declared per-ISA
 program while distinguishing that oracle issue from possible unretained decode
 products using actual native ISA/value evidence. No x86 production fix or
 broad x86 certificate is claimed.
+
+### Native x86 value/ISA diagnosis and focused repair
+
+The external native GCC14.2 witness preserves each original publication rule.
+AVX2 has73 mismatches against its separate ties-away program; AVX512 also has73
+against its separate nearest-even program, rather than the generic oracle's166.
+Both split as Q16+Q16=0, Q16+FP32=38, Q16+Q8=35; all73 match the independently
+explicit FusedA candidate, with0 unexplained. Initial MXCSR is`1f80`, actual
+compiled/runtime routes agree, and named production wrappers contain the FMAs
+(the reference candidates' instructions are excluded). Raw archive SHA256:
+`7df8431e2ec08e75dd3c2cc0a45bb2c0817e67feef64af3c883ddd096290285a`.
+This establishes a helper arithmetic defect, not deployed-model/token impact.
+
+`X86FP32.h` now retains eight-/sixteen-lane product results in vector registers;
+only the three fixed32 Q16 add routines' AVX2/AVX512 decode products use it.
+Nearest-even versus ties-away, thresholds, scale/inverse trees, clamps and sums
+are unchanged. The independent test now names those source-declared programs
+through the active runtime ISA rather than assuming one program everywhere.
+A signed-half-tie reference check and a halfway-product pair, both operand
+orders and disjoint/left/right output reuse, strengthen the regression; the
+pair has its own explicit preflight entry. Old-source negatives, repaired
+native x86 runtime/ISA/resource checks and broader x86 compatibility remain
+required; local cross-code-generation is not execution evidence.
+
+Nine rebuilt local ARM configurations now pass126/126 (five Mac, GNU13 and
+GNU14 Linux baseline/DotProd). All94 current preflights pass20 repetitions on
+Mac DotProd. The earlier Spark125/125 result remains bound to its older
+immutable source; it does not certify this repair until a fresh validation.
+
+A separate genuine native GNU14.2 SDK built from official Ubuntu24.04 ARM
+packages compiles, links and runs C++23 `<print>` plus atomic shared-pointer
+publication without replacement headers or global FP changes. This closes the
+identified GNU13 library prerequisite for subsequent Linux engine builds, not
+any unexecuted engine/factory/model gate.
 
 ## Implemented numerical and ISA foundations
 
@@ -712,31 +822,117 @@ stale source/policy/checker/configuration, source-level command changes,
 missing/modified assembly and wider/unexercised instruction claims. The failed
 rebuild regression has its own explicit `ProductionTestPreflight` entry.
 
+## Native FA2 policy and real dependency closure
+
+The actual FP32 CPUFlash class now parses under native C++23 with
+`-Werror=switch` and no unhandled NEON identity. Production and the existing tile
+tournament consume one compiler/runtime mapping and cache-observation seam.
+The initial ARM policy chooses a canonical256-row span without importing x86
+measurements or fabricating private cache/line capacity. Existing x86 measured
+bands remain unchanged. Device-free tests cover all12storage pairs, native and
+foreign identities, exact overrides, unknown cache fields, footprint overflow
+and widened parallel geometry. Genuine x86 CPUID observations now reject
+unproven/shared private caches and wrapped sizes instead of borrowing legacy
+convenience defaults; inventory and FA2 consume that same record. The shared
+policy target also runs both Q16 reduction-range tests. This is policy/syntax
+proof, not an executed FA2/KV/cache-lease/request/factory certificate.
+
+A genuine GNU14.2/OpenMPI4.1.6/NUMA/OpenSSL CPU-only Linux configure now builds
+and installs canonical oneDNN v3.11.3, commit
+74d04752d9eaefff6a9ff62466c4d20b155e5bca. Earlier unrestricted compilations
+exhausted the VM; isolated exact failed TUs with unchanged production flags
+measured maximum child RSS2214664–2231712KiB, about2.1GiB. Those diagnoses
+are not full-build passes. The new phase owner retains configured objects after
+failure, publishes only complete installed-manifest closure, binds compiler
+ARG1/toolchain identity and exposes both command streams. Source-origin checks
+reject without deleting existing work; the discarded old probe status/stderr
+do not establish its underlying cause retrospectively. Seventeen real
+CMake/Ninja/Git lifecycle/serialization cases pass without a counterfeit SDK,
+including successful same-size/same-mtime repair and exact manifested-library
+selection despite an unlisted higher-priority shadow. Invalid owned install
+surfaces retire before rebuilding, retaining compilation objects; mandatory
+compiler ARG1 belongs to both child arguments and cache identity. Retirement
+intent now persists across receipt removal, rejected symlinks and partial
+cleanup; every configure/install attempt checks surface ownership. Build and
+install are separate actual phases so a benign failed compilation retains its
+configured work. New two-invocation and interrupted-retirement regressions fail
+the unchanged staged662 owner with actual outside-prefix writes and changed
+same-mtime header bytes, then pass the repaired owner. That staged packet was
+explicitly withheld from execution; it is not silently patched or certified.
+Nested destination directory links are also rejected before every producer,
+including ordinary failed-compile retries without an install receipt. A third
+old-owner regression observes real writes through `include/oneapi`; the repaired
+owner leaves the outside tree untouched. Only existing in-surface library-file
+symlinks are admitted. Lifecycle schema3 migrates ambiguous old states once.
+
+A separately preserved genuine SDK adds Ubuntu GMock1.14 to GNU14.2/OpenMPI4.1.6;
+whose local OCI index is
+`c8131fc0939590e3cf27dca5cf461e95e16210941c28050816e28abf2650a02d`
+compiles/links/runs real C++23 print, atomic shared-pointer and GMock facilities.
+The same exported Linux/arm64 manifest is
+`b6644c2d668a5ec7441d34430560184a148bba2ce94b7b644033e1d2592e8af7`,
+with runtime config
+`fe2a76833b40124566c7e9fa1e83cc097821a675a50abe8f411b6479cf9e0038`.
+Archive/index/config/all seven layers were independently hashed; classic
+Docker may expose that config as its image ID instead of the local OCI index.
+This is an explicit content-identity binding, not permission to change SDKs.
+Full engine configuration/generation now succeeds. Its first actual build
+exposed C-only OpenMPI AArch64 internal atomic headers in the C++ native
+component. A thin genuine C11 ORTE adapter now owns those headers/layout asserts;
+the unchanged typed environment/readiness policy stays C++17 behind a narrow C
+ABI. No SDK macro or atomic emulation was introduced. Component/helper/probe
+builds and four actual Linux preflights (native C ABI, live environment, source
+policy and native daemon success) pass. The ABI test reads MPI state through the
+exact CMake-selected MPI DSO, not an assumed transitive dependency. A prior
+Mac-bind runtime-root UID mismatch remains RED; an explicitly owned native
+Linux POSIX session volume passes without relaxing UID/inode checks. Full
+application/core, complete canonical gates and serving remain open. Its next
+ordinary full core build exhausted the8GiB VM on ComputeStageFactory.cpp and
+FusedQKVGEMMStage.cpp; no semantic compile or executable success is inferred.
+The genuine SDK archive was SHA-verified on WSL; an adequate-memory Spark
+build-only attempt requires a fresh authenticated successor and capacity window,
+not a smaller worker budget or a changed source branch.
+
 ## Latest functional verification
 
-Each native build row below rebuilt the repaired focused sources and ran all125 CTest
-registrations. These are native CPU-only leaf/build checks, not the complete
-CMake-owned Unit/preflight inventory of the engine.
+The completed five-Mac checkpoint below rebuilt151 focused registrations;
+Linux126 and Spark125 rows deliberately retain older source scopes. These are
+native CPU-only leaf/build checks, not the complete CMake-owned Unit/preflight
+inventory of the engine.
 
 | Build | Result |
 |---|---|
-| AppleClang Release, baseline NEON | PASS,125/125 |
-| AppleClang Release, NEON_DOTPROD | PASS,125/125; explicit ASIMD and SDOT suites execute |
-| AppleClang Debug, strict warnings (`-Wall -Wextra -Wpedantic -Werror`) | PASS,125/125 |
-| AppleClang Integration + ASan/UBSan, NEON_DOTPROD | PASS,125/125 |
-| Homebrew LLVM Release, baseline NEON | PASS,125/125 |
-| GCC13.3 Release, baseline NEON, native Linux/arm64 VM on this M1 | PASS,125/125; not a Spark rerun |
-| GCC13.3 Release, NEON_DOTPROD, same native Linux VM | PASS,125/125; not a Spark rerun |
+| AppleClang Release, baseline NEON | PASS,151/151;4.01s |
+| AppleClang Release, NEON_DOTPROD | PASS,151/151;4.06s; explicit ASIMD/SDOT execute |
+| AppleClang Debug, strict warnings (`-Wall -Wextra -Wpedantic -Werror`) | PASS,151/151;10.61s |
+| AppleClang Integration + ASan/UBSan, NEON_DOTPROD | PASS,151/151;19.86s |
+| Homebrew LLVM Release, baseline NEON | PASS,151/151;3.98s |
+| GCC13.3 Release, baseline/DotProd, native Linux/arm64 VM on this M1 | PASS,126/126 each; not a Spark rerun |
+| GCC14.2 Release, baseline/DotProd, same native Linux VM | PASS,126/126 each; genuine C++23 SDK |
 | GB10 Spark hosts×NEON/DotProd, immutable successor `391c8481…6128` | PASS,125/125 in each of four lanes;93 preflights included |
 | Shared compact 8/16-column templates and the actual focused metadata-test block under x86 AVX2/AVX512 flags | PASS, syntax only for those projection templates |
-| Supplemental WSL GCC14.2 typed-arithmetic target, AVX2/AVX512 | FAIL native73/166 assertions; scalar PASS; not a full x86 gate |
+| Historical WSL GCC14.2 typed target, old391c source | RED native73/166 assertions; scalar PASS; preserved diagnosis |
+| Repaired WSL GCC14.2 complete focused projects, `eb3120f8…69a37` | PASS AVX2 80/80, AVX51282/82;55preflights each,0fail/skip |
 | Canonical pre-commit with real OpenMP configured | FAIL at the explicit native-macOS memory/placement implementation gate; full Unit/preflight not run |
 | `git diff --check` | PASS |
 
-All93 currently configured `ProductionTestPreflight` entries passed twenty
-consecutive repetitions in both Mac DotProd Release and native Linux GCC13.3
-baseline Release (the complete configured label, superseding the earlier87-entry
-checkpoint):
+All115 current configured preflights pass20 repetitions; raw output
+contains2300passes, with no fail/skip. Raw current logs/XML are outside the
+repository at `/tmp/llaminar-arm-policy-matrix-gYPR1Adn`; every nested testcase
+and the2300 raw passed records were independently parsed. The first expanded
+checkpoint attempt remains RED at strict compilation of unused legacy RMS
+configuration/integer-root helpers; those dead helpers were removed, not
+warning-suppressed. Historical139/105 and135/101 checkpoints also passed20.
+The intervening
+136-test sanitizer run remains RED:135/136 pass, with
+`V2_Integration_CPUNativeNEONProjectionBatch` hitting the ordinary30-second
+boundary during concurrent vendor compilation. Contention is context, not an
+established cause. No byte assertion failed in that log. Its unchanged binary
+was copied and hashed before/after20 isolated-window repetitions: all20 pass
+in226.74s without changing workers, coverage or the timeout. The subsequent
+complete139-test five-Mac matrix/105-entry stress and current151/115 pass do
+not erase or retrospectively explain the timeout. Earlier94-entry Mac and
+93-entry native Linux GNU13.3 passes retain their narrower historical scopes. Neither receipt is a claim of full engine preflight:
 native actual-owner execution, batch/leaf arithmetic, empty-team completion,
 original rows, phase-write aliases, retained primary reuse, owner minima,
 workspace/recursive-type ABI, typed arithmetic/geometry, coefficient rejection,
@@ -748,11 +944,15 @@ compressed-centroid math/borrow checks, rotation arithmetic/ownership/fringes/fi
 softmax arithmetic/accuracy/FP16 metadata/range/coordinates/alignment/worksharing,
 original-cache floating/integer/query-quantization attention arithmetic/admission,
 standalone ownership headers, lexical timing-authority release/lifecycle,
-GCC-sensitive separate Newton/typed-add rounding and compiler-envelope/nested-
-response/native-assembly checks. Repeat stress after further implementation changes; these remain
+GCC-sensitive separate Newton/typed-add rounding, operand-order/exact-reuse
+product boundaries, native FA2 policy/geometry and dependency lifecycle, and
+compiler-envelope/nested-response/native-assembly checks. Repeat stress after further implementation changes; these remain
 CPU kernel/build checks, not engine certificates. The first transparency draft
 is an explicitly unqualified WIP checkpoint using the repository-documented
 WIP commit procedure; neither canonical pre-commit nor readiness is claimed.
+The periodic checkpoint again ran the registered canonical hook and got the
+same explicit Darwin memory/placement failure before complete gates. Its
+repository-documented WIP commit bypass is disclosed, not a passing gate.
 
 The complete NativeVNNI refresh Python file was also attempted: 118 tests ran,
 63 failed; the shell-driver fixtures encounter unported Linux-only `lscpu`
@@ -766,6 +966,21 @@ low/high half words inside packed metadata, opaque-word widening, complete
 Q4 nibble/Q5 high-bit domains, full signed-byte pair extrema, original Q6
 signed coefficient pairs, and IQ2_S/IQ3_S/IQ4_XS coefficient domains. Existing
 reciprocal/Q8/subnormal/cancellation proofs remain in the shared focused suite.
+
+### Repaired native x86 evidence
+
+Returned archive SHA256
+`212303df8052203ca6b0fb375d97c87e6e070c0575fef24d9e3e986186d85b61`
+was independently verified. Raw native JUnit confirms80/80 AVX2 and82/82
+AVX512 with55preflights each; four typed cases each pass20/20 outside CTest.
+New tests against unchanged old391c headers fail73 native and3 alias assertions
+per ISA, while scalar and signed-program controls pass. The unchanged external
+probe reports declaredSeparate0 and per-op0/0/0 on both ISAs; all16 included
+probe/binary hashes verify. The retained AVX512 nearest-even program correctly
+has95 generic-away disagreements, not95 new failures. Named wrapper FMA sites
+fall from4/4/4 and6/2/6 to zero; AVX2 retains its existing temporary bank/frame,
+and the inspected AVX512 wrappers have no stack accesses. Static96-element
+witnesses do not establish PMU throughput or a whole-engine spill certificate.
 
 ## Preliminary ISA tuning, not timing certification
 
@@ -812,7 +1027,10 @@ They are ignored working artifacts, not published corpus/certification payloads.
   native entrypoints. Header parsing and small-owner execution do not certify
   the full engine path.
 - Finish floating/nonlinear/RoPE, attention/KV/TurboQuant, GDN/QFN, MoE/sampling
-  and stage/transport SIMD coverage from the source inventory.
+  and stage/transport SIMD coverage from the source inventory. Native FA2
+  tail/rescale exponentials remain to be unified and runtime-qualified; retire
+  the existing AQ8 `key[D]` decoded-head scratch in favor of original-code
+  streaming arithmetic rather than blessing it as a bounded cache mirror.
 - Complete Darwin memory/topology/cache observation, loader/process/MPI
   lifecycle and robust native serving. Full configuration still rejects the
   Linux-only memory backend; that is implementation work, not an external impasse.
