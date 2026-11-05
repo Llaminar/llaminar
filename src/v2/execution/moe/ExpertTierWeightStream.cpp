@@ -1342,12 +1342,17 @@ namespace llaminar2
                                 interleavedValueOffset(cpu, n, kb, value)];
                     }
                     // Compensation is CPU-only derived metadata and is not returned.
+                    // The CPU unit word becomes the exact GPU plane element (one
+                    // E8M0 byte for MXFP4, the FP16 word otherwise).
+                    uint16_t cpu_scale_word = 0;
                     std::memcpy(
-                        &output.scales[linear],
+                        &cpu_scale_word,
                         cpu.native_interleaved.data() +
                             unit + cpu.data_stride + 128u +
                             static_cast<size_t>(n % 64) * sizeof(uint16_t),
                         sizeof(uint16_t));
+                    if (!output.setScaleWord(linear, cpu_scale_word))
+                        return reject(error, "CPU unit scale word is not an admitted native E8M0 power of two");
                     if (cpu.is_asymmetric || cpu.usesNibbleLUTSourceScale())
                     {
                         std::memcpy(
@@ -1395,15 +1400,13 @@ namespace llaminar2
                             cpu.native_interleaved[
                                 interleavedValueOffset(cpu, n, kb, value)];
                     }
-                    uint16_t cpu_scale_word = 0;
+                    // Expanded INT8 units carry ordinary FP16 scales (2-byte plane).
                     std::memcpy(
-                        &cpu_scale_word,
+                        &output.scales[linear],
                         cpu.native_interleaved.data() +
                             unit + cpu.data_stride + 128u +
                             static_cast<size_t>(n % 64) * sizeof(uint16_t),
                         sizeof(uint16_t));
-                    if (!output.setScaleWord(linear, cpu_scale_word))
-                        return reject(error, "CPU unit scale word is not an admitted native E8M0 power of two");
                     if (cpu.is_asymmetric)
                     {
                         std::memcpy(
