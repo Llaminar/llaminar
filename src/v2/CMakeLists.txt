@@ -1974,6 +1974,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/deepseek4/DeepSeekV4PrimitiveStage.cpp
     models/deepseek4/DeepSeekV4Config.cpp
     models/deepseek4/DeepSeekV4ImagePreprocess.cpp
+    models/deepseek4/DeepSeekV4VisionEncoder.cpp
     models/deepseek4/DeepSeekV4GraphConfigBuilder.cpp
     models/deepseek4/DeepSeekV4BufferLayout.cpp
     models/deepseek4/DeepSeekV4Graph.cpp

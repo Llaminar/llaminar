@@ -8143,6 +8143,29 @@ add_v2_test(V2_Unit_DeepSeekV4ImagePreprocess
     LABELS "V2;Unit;DeepSeekV4;Vision;Multimodal"
     MPI_PROCS 1 NO_MODELS TIMEOUT 60)
 
+set(DSV4_VISION_GOLDEN_HEADER "${CMAKE_CURRENT_BINARY_DIR}/model-fixtures/DeepSeekV4VisionEncoderGolden.generated.h")
+add_custom_command(OUTPUT "${DSV4_VISION_GOLDEN_HEADER}"
+    COMMAND ${CMAKE_COMMAND}
+        -DJINJA_INPUT=${CMAKE_CURRENT_SOURCE_DIR}/unit/models/deepseek4/fixtures/deepseek_v4_vision_encoder_golden.json
+        -DHEADER_OUTPUT=${DSV4_VISION_GOLDEN_HEADER}
+        -DNAMESPACE=llaminar2::test::dsv4
+        -DSYMBOL=kVisionEncoderGolden
+        -DSOURCE_URL=scripts/deepseek4/make_vision_encoder_golden.py
+        -DLICENSE=AGPL-3.0
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/EmbedJinjaTemplate.cmake
+    DEPENDS unit/models/deepseek4/fixtures/deepseek_v4_vision_encoder_golden.json
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/EmbedJinjaTemplate.cmake
+    VERBATIM)
+add_executable(v2_test_deepseek4_vision_encoder unit/models/deepseek4/Test__DeepSeekV4VisionEncoder.cpp "${DSV4_VISION_GOLDEN_HEADER}")
+target_include_directories(v2_test_deepseek4_vision_encoder PRIVATE
+    "${CMAKE_CURRENT_BINARY_DIR}/model-fixtures"
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
+target_link_libraries(v2_test_deepseek4_vision_encoder llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_DeepSeekV4VisionEncoder
+    COMMAND $<TARGET_FILE:v2_test_deepseek4_vision_encoder>
+    LABELS "V2;Unit;DeepSeekV4;Vision;Multimodal"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+
 # Note: ArgParser tests removed - replaced by OrchestrationConfigParser tests
 
 # Test: NodeTopology (NUMA/socket topology detection for CPU tensor parallelism)
