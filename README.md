@@ -1386,9 +1386,12 @@ memory, topology and MPI lifecycle still need porting.
 Published images remain x86-64 only.
 
 To build the focused device-free checks on an Apple Silicon Mac with Xcode
-Command Line Tools, CMake, Ninja, Python 3, GoogleTest, OpenMP, MPI headers/libraries
-and optional ccache installed (Homebrew packages:
-`cmake ninja python googletest libomp open-mpi ccache`):
+Command Line Tools, CMake/CTest 4 or newer, Ninja, Python 3, GoogleTest, OpenMP,
+MPI headers/libraries and optional ccache installed (Homebrew packages:
+`cmake ninja python googletest libomp open-mpi ccache`). Test builds require
+CTest's actual timeout-owner JSON properties; runtime signal support in older
+CTest versions alone does not satisfy that evidence contract. Container tool
+pins are owned by `scripts/docker/install-system-deps.sh`.
 
 ```bash
 OMP_PREFIX="$(brew --prefix libomp)"
