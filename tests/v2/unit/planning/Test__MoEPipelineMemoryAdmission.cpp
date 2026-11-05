@@ -172,7 +172,7 @@ TEST_P(MoEPipelineMemoryAdmission, AllFormatsMTPModesAndBothVendorOrders)
     const int width = GetParam() / 2;
     // Q8_1 is a runtime-prepared format, not a supported GGUF source encoding.
     EXPECT_THROW(PlanningGGUFFixture::sourceType(TensorType::Q8_1), std::invalid_argument);
-    ASSERT_EQ(formats().size(), 23u);
+    ASSERT_EQ(formats().size(), 24u); // Includes MXFP4.
     for (const auto format : formats())
     {
         PlanningGGUFFixture file(true, true, PlanningGGUFFixture::sourceType(format));

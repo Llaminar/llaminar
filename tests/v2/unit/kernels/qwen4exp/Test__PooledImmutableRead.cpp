@@ -243,7 +243,7 @@ TEST(PooledImmutableRead, AllNativeFormatsRetainExactQuantizedRowsAndCodebookByt
         GGUFTensorType::Q4_0,GGUFTensorType::Q4_1,GGUFTensorType::Q5_0,GGUFTensorType::Q5_1,GGUFTensorType::Q8_0,
         GGUFTensorType::Q2_K,GGUFTensorType::Q3_K,GGUFTensorType::Q4_K,GGUFTensorType::Q5_K,GGUFTensorType::Q6_K,GGUFTensorType::Q8_K,
         GGUFTensorType::IQ1_S,GGUFTensorType::IQ1_M,GGUFTensorType::IQ2_XXS,GGUFTensorType::IQ2_XS,GGUFTensorType::IQ2_S,
-        GGUFTensorType::IQ3_XXS,GGUFTensorType::IQ3_S,GGUFTensorType::IQ4_NL,GGUFTensorType::IQ4_XS};
+        GGUFTensorType::IQ3_XXS,GGUFTensorType::IQ3_S,GGUFTensorType::IQ4_NL,GGUFTensorType::IQ4_XS,GGUFTensorType::MXFP4};
     for(const auto format:formats){const ImmutableRowTableSource source{"recorded","rows",0,0x100000100ULL,256,format};
         Pool pool(std::array{2u,0u,1u},64,{65536,1,2},std::nullopt,format,source.rowBytes());pool.complete(std::array<std::uint64_t,3>{101,102,103});
         pool.begin(std::array<std::uint64_t,5>{103,101,103,104,105});pool.wave<false>();pool.wave<true>();pool.finish([&](const n::SourceFrontier& frontier){

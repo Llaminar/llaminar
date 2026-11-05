@@ -1165,7 +1165,8 @@ namespace
         packed.native_vnni_scales.assign(total_blocks, uint16_t{0});
         packed.native_vnni_mins.clear();
         packed.native_vnni_emins.clear();
-        if (info->is_asymmetric)
+        // The secondary plane follows the physical tuple (IQ4_XS source words included).
+        if (canonicalDeviceVnniFormat(*info).is_asymmetric)
             packed.native_vnni_mins.assign(total_blocks, uint16_t{0});
         if (info->has_emins)
             packed.native_vnni_emins.assign(total_blocks, uint32_t{0});
@@ -1175,13 +1176,14 @@ namespace
         // Publish the same execution identity as WeightManager and
         // ROCmWeightPacker; retaining source IDs 20/21 here asks the production
         // launcher for codebooks that cannot exist after device preparation.
-        // The integer overload is the arithmetic policy (MXFP4 25 -> IQ4_NL 4);
-        // MXFP4 must keep its own physical decoder, or its rows would time the
-        // IQ4_NL lookup on MXFP4 bytes.
-        packed.native_vnni_codebook_id =
-            info->codebook_id == kNativeVnniMXFP4Codebook
-                ? kNativeVnniMXFP4Codebook
-                : canonicalDeviceVnniCodebookId(info->codebook_id);
+        // The descriptor overload names the physical decoder (MXFP4 25, IQ4_XS
+        // tuple 24); the integer overload would be the arithmetic policy.
+        packed.native_vnni_codebook_id = canonicalDeviceVnniCodebookId(*info);
+        packed.native_source_identity = {
+            .codebook_id = info->codebook_id,
+            .is_superblock = info->is_superblock,
+            .present = true,
+        };
         packed.native_vnni_blocks_per_row = static_cast<uint32_t>(blocks_per_row);
         packed.N = N;
         packed.K = K;
