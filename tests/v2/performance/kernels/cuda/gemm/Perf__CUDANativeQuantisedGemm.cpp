@@ -1870,7 +1870,7 @@ namespace
         static const std::vector<FormatSpec> formats = []
         {
             auto all = kFormats;
-            all.push_back({"MXFP4", kNativeQuantisedMXFP4Codebook, [](size_t n, size_t k)
+            all.push_back({"MXFP4", llaminar2::kNativeQuantisedMXFP4Codebook, [](size_t n, size_t k)
                            { return TestTensorFactory::createMXFP4Random({n, k}); }});
             return all;
         }();
