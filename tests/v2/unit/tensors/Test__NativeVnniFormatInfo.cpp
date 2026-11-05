@@ -345,7 +345,9 @@ TEST(Test__NativeVnniFormatInfo, PackedRegionSizingMatchesCanonicalMetadata)
         EXPECT_EQ(
             regions.payload_bytes,
             blocks * static_cast<size_t>(expected.payload_bytes));
-        EXPECT_EQ(regions.scales_bytes, blocks * sizeof(uint16_t));
+        // Primary plane width follows the physical codebook (1 B for native MXFP4).
+        EXPECT_EQ(regions.scales_bytes,
+                  blocks * nativeVnniScalePlaneBytes(canonicalDeviceVnniCodebookId(*format)));
         EXPECT_EQ(
             regions.mins_bytes,
             (expected.is_asymmetric || expected.name == "IQ4_XS" || expected.name == "IQ3_S")

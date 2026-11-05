@@ -429,6 +429,8 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/execution/moe/MoERuntimeTable.cpp", "synchronizeMirror", "worker_stream", 1),
         ("src/v2/execution/moe/MoERuntimeTable.cpp", "copyHostToMirror", "backend_sync_copy", 1),
         ("src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel_CUTLASS.cu", "cudaQuantGemm_uploadRawBytes", "backend_sync_copy", 1),
+        # Setup-only primary-plane upload (exact live E8M0 extents), sibling of uploadRawBytes.
+        ("src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel_CUTLASS.cu", "cudaQuantGemm_uploadPrimaryPlane", "backend_sync_copy", 1),
         ("src/v2/kernels/cuda/gemm/CUDANativeVNNIGemvShardImpl.cu.inc", "cudaRowMajorWeights_create", "raw_stream", 1),
         ("src/v2/kernels/cuda/kvcache/CUDARingKVCache.cu", "CUDARingKVCache<Precision>::initializeBatchedEntryPointerTables", "backend_sync_copy", 2),
         ("src/v2/kernels/cuda/kvcache/CUDARingKVCacheTQ.cu", "CUDARingKVCacheTQ::CUDARingKVCacheTQ", "raw_stream", 1),
