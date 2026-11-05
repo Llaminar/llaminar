@@ -8159,11 +8159,19 @@ add_custom_command(OUTPUT "${DSV4_VISION_GOLDEN_HEADER}"
 add_executable(v2_test_deepseek4_vision_encoder unit/models/deepseek4/Test__DeepSeekV4VisionEncoder.cpp "${DSV4_VISION_GOLDEN_HEADER}")
 target_include_directories(v2_test_deepseek4_vision_encoder PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/model-fixtures"
+    ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
 target_link_libraries(v2_test_deepseek4_vision_encoder llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_DeepSeekV4VisionEncoder
     COMMAND $<TARGET_FILE:v2_test_deepseek4_vision_encoder>
     LABELS "V2;Unit;DeepSeekV4;Vision;Multimodal"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+# --mmproj failed to load because the 4D patch embedding was reordered like a
+# 2D GGUF tensor; the file-loaded tower must equal the in-memory one.
+add_v2_test(V2_Integration_DeepSeekV4MmprojLoad
+    COMMAND $<TARGET_FILE:v2_test_deepseek4_vision_encoder>
+            --gtest_filter=DeepSeekV4VisionEncoder.MmprojFileLoadsTheSameTower
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;DeepSeekV4;Vision;Loaders;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 60)
 
 # Note: ArgParser tests removed - replaced by OrchestrationConfigParser tests
