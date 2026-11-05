@@ -479,6 +479,38 @@ namespace llaminar2::cuda::prefill
         };
 
         /**
+         * Native E8M0 (1-byte plane) under the async metadata schedules keeps
+         * the raw plane bytes in shared memory, at byte index
+         * metadata_index(col, slot) of the stage's scale storage. cp.async
+         * copies verbatim, so the bytes are widened to staged words only at the
+         * consumer read, and there is no extra pass between the copy wait and
+         * the CTA barrier. Every other format and schedule stores staged words.
+         */
+        constexpr bool BYTE_STAGED_SCALES =
+            ASYNC_RAW_MODE >= 2 && ::llaminar2::nativeVnniScalePlaneBytes(CODEBOOK_ID) == 1;
+
+        /** @brief Store one staged scale word into the stage's scale slot. */
+        auto store_staged_scale = [&](int stage, int index, uint16_t word) __attribute__((always_inline))
+        {
+            if constexpr (BYTE_STAGED_SCALES)
+                // Inverse of powerOfTwoBF16Word for an admitted word (0 stays 0).
+                reinterpret_cast<uint8_t *>(&smem_scales_B[stage][0])[index] =
+                    word == 0 ? uint8_t{0} : static_cast<uint8_t>((word >> 7) + 1u);
+            else
+                smem_scales_B[stage][index] = word;
+        };
+
+        /** @brief Read one staged scale word published in the stage's scale slot. */
+        auto load_staged_scale = [&](int stage, int index) __attribute__((always_inline)) -> uint16_t
+        {
+            if constexpr (BYTE_STAGED_SCALES)
+                return ::llaminar2::mxfp4::powerOfTwoBF16Word(
+                    reinterpret_cast<const uint8_t *>(&smem_scales_B[stage][0])[index]);
+            else
+                return smem_scales_B[stage][index];
+        };
+
+        /**
          * @brief Publish half metadata in the existing allocation before use.
          *
          * Aligned eight-column groups use native async copies. Ragged source
@@ -510,19 +542,24 @@ namespace llaminar2::cuda::prefill
                                 ? source[source_index + i] : uint16_t{0};
                     }
                 };
-                if constexpr (::llaminar2::nativeVnniScalePlaneBytes(CODEBOOK_ID) == 1)
+                if constexpr (BYTE_STAGED_SCALES)
                 {
-                    // cp.async copies elements verbatim and cannot normalize a
-                    // 1-byte E8M0 plane. The eight live scale bytes are loaded and
-                    // normalized to staged words here; compute reads them only
-                    // after the CTA barrier that also joins the async payloads.
-                    uint16_t *destination = &smem_scales_B[stage][metadata_index(col, half)];
+                    // Raw E8M0 bytes, widened by load_staged_scale at the consumer.
+                    uint8_t *destination = reinterpret_cast<uint8_t *>(&smem_scales_B[stage][0]) +
+                                           metadata_index(col, half);
+                    const uint8_t *live = reinterpret_cast<const uint8_t *>(scales_B) + source_index;
+                    if (vector_valid && (reinterpret_cast<uintptr_t>(live) & 7u) == 0)
+                    {
+                        const uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(destination));
+                        asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n"
+                            :: "r"(address), "l"(live) : "memory");
+                    }
+                    else
+                    {
 #pragma unroll
-                    for (int i = 0; i < 8; ++i)
-                        destination[i] = kb < num_q40_blocks && gcol + i < N
-                            ? ::llaminar2::native_vnni_scale::loadStagedPrimary<CODEBOOK_ID>(
-                                  scales_B, source_index + i)
-                            : uint16_t{0};
+                        for (int i = 0; i < 8; ++i)
+                            destination[i] = kb < num_q40_blocks && gcol + i < N ? live[i] : uint8_t{0};
+                    }
                 }
                 else
                     stage_metadata(scales_B, &smem_scales_B[stage][metadata_index(col, half)]);
@@ -687,7 +724,7 @@ namespace llaminar2::cuda::prefill
                                                  ? (static_cast<size_t>(kb0 + 1) * N + gcol) * PAYLOAD_BYTES
                                                  : size_t{0};
 
-                        // smem_scales_B carries normalized staged words, never raw plane bytes.
+                        // Staged words; store_staged_scale keeps raw bytes only under BYTE_STAGED_SCALES.
                         const uint16_t s0 = ::llaminar2::native_vnni_scale::loadStagedPrimary<CODEBOOK_ID>(
                             scales_B, static_cast<size_t>(kb0) * N + gcol);
                         const uint16_t s1 = has_block1
@@ -847,8 +884,8 @@ namespace llaminar2::cuda::prefill
                             *reinterpret_cast<int4 *>(&dst_words[12]) = make_int4(0, 0, 0, 0);
                         }
 
-                        smem_scales_B[stage][metadata_index(col, 0)] = s0;
-                        smem_scales_B[stage][metadata_index(col, 1)] = s1;
+                        store_staged_scale(stage, metadata_index(col, 0), s0);
+                        store_staged_scale(stage, metadata_index(col, 1), s1);
 
                         if constexpr (NEEDS_MINS)
                         {
@@ -873,8 +910,8 @@ namespace llaminar2::cuda::prefill
 #pragma unroll
                         for (int g = 0; g < 16; ++g)
                             dst_words[g] = 0;
-                        smem_scales_B[stage][metadata_index(col, 0)] = uint16_t{0};
-                        smem_scales_B[stage][metadata_index(col, 1)] = uint16_t{0};
+                        store_staged_scale(stage, metadata_index(col, 0), uint16_t{0});
+                        store_staged_scale(stage, metadata_index(col, 1), uint16_t{0});
                         if constexpr (NEEDS_MINS)
                         {
                             smem_mins_B[stage][metadata_index(col, 0)] = uint16_t{0};
@@ -1011,8 +1048,8 @@ namespace llaminar2::cuda::prefill
                         const int lc0 = b_col_base + frag_col(lane_id, 0);
                         const int lc1 = b_col_base + frag_col(lane_id, 1);
                         const uint16_t scale_bits[2] = {
-                            smem_scales_B[stage][metadata_index(lc0, scale_slot)],
-                            smem_scales_B[stage][metadata_index(lc1, scale_slot)]};
+                            load_staged_scale(stage, metadata_index(lc0, scale_slot)),
+                            load_staged_scale(stage, metadata_index(lc1, scale_slot))};
                         const uint16_t secondary_bits[2] = {
                             NEEDS_MINS
                                 ? smem_mins_B[stage][metadata_index(lc0, scale_slot)]
