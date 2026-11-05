@@ -13,6 +13,8 @@
  * failure before native family creation. This file cannot mint test certificates.
  */
 #include "backends/ReadAheadNativeResourceFamily.h"
+#include "backends/NativeContextPreparation.h"
+#include "backends/NativeAuxiliaryResourceCatalog.h"
 #include "backends/ReadAheadNativeParentTerminal.h"
 #include "backends/BackendManager.h"
 #include "backends/ComputeBackend.h"
@@ -263,21 +265,32 @@ void prove(DeviceId device,bool snapshots=false)
     const auto cpu=observed(DeviceId::cpu()),gpu=observed(device);
     // No declaration can supply a byte allowance or bypass source certification.
     auto familyPlan=ReadAheadNativeResourceFamily::bom(device,cpu,gpu);
-    PhysicalMemoryPlanBuilder plan(familyPlan);
+    const std::array observations{cpu,gpu};
+    const std::array selected{device};
+    auto source=NativeContextPreparation::create(observations,0,selected);
+    std::optional<PreparedGPUContextUsePermit> permit(source->acquire(device));
+    const auto memory=source->memory();
+    source->freezeForPlanning();
+    PhysicalMemoryPlanBuilder plan(source->mandatoryBOM());
+    for(const auto& resource:familyPlan.resources())plan.add(resource);
     const auto terminalPlan=ReadAheadNativeParentTerminal::bom(device,cpu,gpu);
     for(const auto& resource:terminalPlan.resources())plan.add(resource);
     plan.add(gpu,PhysicalMemoryOwner::ActivationArena,payloadBytes+signalBytes);
     if(snapshots)plan.add(gpu,PhysicalMemoryOwner::GraphSnapshotArena,2*elements*sizeof(float));
     plan.add(gpu,PhysicalMemoryOwner::NativeGraphExecutable,2*GPUGraphMemoryContract::reservationBytesPerExecutable(device));
-    auto memory=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()),0);
+    source->admitFinal(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()));
     // A BOM entry alone does not reserve a physical obligation. Retain the
     // existing graph-contract tokens through original context reset, including
     // driver backing that survives destruction of both retained executables.
     auto graphReservation=memory->reserveNewAllocations(device,PhysicalMemoryOwner::NativeGraphExecutable,
         2*GPUGraphMemoryContract::reservationBytesPerExecutable(device));
     auto* backend=getBackendFor(device);require(backend!=nullptr,"Read-ahead native backend unavailable");
-    auto& worker=GPUDeviceContextPool::instance().getContext(device);
-    auto strongWorker=GPUDeviceContextPool::instance().retainExistingContext(device);
+    {const auto original=GPUDeviceContextPool::instance().retainExistingPreparedContext(device,memory);
+        original.requireWorker(permit->worker());}
+    auto strongWorker=permit->worker();
+    auto& worker=*strongWorker;
+    // The preparation borrow ends before Storage obtains its exclusive reset ticket.
+    permit.reset();
     require(strongWorker!=nullptr,"Read-ahead original worker is unavailable");
     std::optional<ExclusiveModelRetirementTicket> retirement;
     std::exception_ptr failure;
@@ -428,15 +441,27 @@ void prove(DeviceId device,bool snapshots=false)
             "Read-ahead native fixture did not retire its original physical context");
         graphReservation={};
         for(const auto allocator:{DeviceId::cpu(),device})
-            for(const auto owner:{PhysicalMemoryOwner::NativeReadAheadFamily,PhysicalMemoryOwner::NativeReadAheadParentTerminal,
-                                 PhysicalMemoryOwner::NativeGraphExecutable,PhysicalMemoryOwner::ActivationArena,
+            for(const auto owner:{PhysicalMemoryOwner::NativeGraphExecutable,PhysicalMemoryOwner::ActivationArena,
                                  PhysicalMemoryOwner::GraphSnapshotArena})
             {
                 EXPECT_EQ(memory->reservedBytes(allocator,owner),0u);
                 EXPECT_EQ(memory->claimedBytes(allocator,owner,PhysicalMemoryMaterializationKind::NewAllocation),0u);
             }
+        // Destroyed handles do not release opaque process-runtime commitments.
+        // The SAME original PMA retains exactly the installed typed allowances.
+        for(const auto& entry:std::array{
+            std::pair{PhysicalMemoryOwner::NativeReadAheadFamily,NativeAuxiliaryResourceProgram::readAheadSide()},
+            std::pair{PhysicalMemoryOwner::NativeReadAheadParentTerminal,NativeAuxiliaryResourceProgram::ordering(NativeOrderingEventProgram::readAheadParentTerminal())}})
+        {
+            const auto allowance=NativeAuxiliaryResourceCatalog::allowance(device.type,entry.second);
+            ASSERT_EQ(allowance.lifetime,NativePhysicalLifetime::ProcessRuntime);
+            EXPECT_EQ(memory->reservedBytes(DeviceId::cpu(),entry.first),allowance.hostBytes);
+            EXPECT_EQ(memory->reservedBytes(device,entry.first),allowance.deviceBytes);
+            EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),entry.first,PhysicalMemoryMaterializationKind::NewAllocation),0u);
+            EXPECT_EQ(memory->claimedBytes(device,entry.first,PhysicalMemoryMaterializationKind::NewAllocation),0u);
+        }
         std::cout<<"read_ahead_context_retired device="<<device.toString()
-            <<" generation="<<retired.retired_context_generation<<" reset=1 same_pma_empty=1\n";
+            <<" generation="<<retired.retired_context_generation<<" reset=1 same_pma_process_commitments_retained=1\n";
     }
     else require(bool(failure),"Read-ahead fixture omitted its original storage retirement ticket");
     if(failure)std::rethrow_exception(failure);

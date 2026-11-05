@@ -7,6 +7,7 @@
 #include "backends/NativeAuxiliaryQualifiedLimits.h"
 #include "fixtures/backends/NativeOrderingEventGroupReplayAccess.h"
 #include <gtest/gtest.h>
+#include <algorithm>
 namespace llaminar2::test {
 namespace {
 /** @return Complete recorded runtime/hardware/count metadata from an installed tested class; no native creator runs. */
@@ -84,6 +85,38 @@ TEST(NativeAllowanceEligibility, InvalidResourceFamilyAndLifetimeStillReject){
  rows[0].lifetime=NativePhysicalLifetime::ProcessRuntime;
  EXPECT_THROW(NativeOrderingEventGroupReplayAccess::select(key,0,p,"family",rows),std::invalid_argument);
  EXPECT_THROW(NativeOrderingEventGroupReplayAccess::select(key,1,NativeAuxiliaryResourceProgram::readAheadSide(),"family",rows),std::runtime_error);
+}
+
+/** @test Installed side/parent limits ignore fingerprints while live provenance stays exact. */
+TEST(NativeAllowanceEligibility, ReadAheadInstalledFamiliesKeepOriginalIdentityWithoutFingerprintSelection){
+ for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm}){
+  const auto found=std::find_if(detail::kNativeContextQualifiedClasses.begin(),detail::kNativeContextQualifiedClasses.end(),
+      [&](const auto& row){return row.backend==backend;});
+  ASSERT_NE(found,detail::kNativeContextQualifiedClasses.end());
+  const auto first=recorded(*found);auto changed=first;
+  changed.source_sha256="independent application revision";
+  changed.backend_sha256=changed.runtime_sha256=changed.driver_sha256=changed.runtime_policy_sha256=std::string(64,'f');
+  changed.runtime_version+=".patch";changed.driver_version+=".patch";
+  changed.architecture+="-supported";changed.compute_units++;changed.native_wave_width*=2;
+  changed.context_object_bytes++;changed.context_object_alignment*=2;
+  changed.worker_stack_bytes+=4096;changed.pthread_defaults_identity="different-valid-defaults";
+  for(const auto program:{NativeAuxiliaryResourceProgram::readAheadSide(),
+      NativeAuxiliaryResourceProgram::ordering(NativeOrderingEventProgram::readAheadParentTerminal())}){
+   const auto a=NativeOrderingEventGroupReplayAccess::select(first,11,program,"original-resource-source",detail::kNativeAuxiliaryQualifiedClasses);
+   const auto b=NativeOrderingEventGroupReplayAccess::select(changed,12,program,"changed-resource-source",detail::kNativeAuxiliaryQualifiedClasses);
+   const auto installed=NativeAuxiliaryResourceCatalog::allowance(backend,program);
+   EXPECT_EQ(a.hostBytes,installed.hostBytes);EXPECT_EQ(b.hostBytes,a.hostBytes);
+   EXPECT_EQ(a.deviceBytes,installed.deviceBytes);EXPECT_EQ(b.deviceBytes,a.deviceBytes);
+   EXPECT_EQ(a.evidence,b.evidence);EXPECT_EQ(b.lifetime,NativePhysicalLifetime::ProcessRuntime);
+   EXPECT_EQ(a.program,program);EXPECT_EQ(b.program,program);
+   EXPECT_EQ(a.contextGeneration,11u);EXPECT_EQ(b.contextGeneration,12u);
+   EXPECT_EQ(a.sourceIdentity,NativeAuxiliaryResourceCatalog::liveSourceIdentity(first));
+   EXPECT_EQ(b.sourceIdentity,NativeAuxiliaryResourceCatalog::liveSourceIdentity(changed));
+   EXPECT_NE(a.sourceIdentity,b.sourceIdentity);
+   EXPECT_EQ(b.resourceSource,"changed-resource-source");
+   EXPECT_THROW(NativeOrderingEventGroupReplayAccess::select(changed,0,program,"source",detail::kNativeAuxiliaryQualifiedClasses),std::invalid_argument);
+  }
+ }
 }
 
 }

@@ -4,8 +4,8 @@
  *
  * This event is not part of the one-stream/two-event read-ahead family. A
  * strong alias retains its separate same-PMA commitment until all actual
- * readers retire. Production certificate selection is closed and initially
- * empty; diagnostic calibration is the only route to justified native bounds.
+ * readers retire. Production selection uses the independently qualified parent
+ * family allowance; it cannot borrow the side stream's physical commitment.
  * A distinct closed diagnostic variant shares the original creator/destructor
  * while granting no numeric bound or PMA opaque reservation.
  */

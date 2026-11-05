@@ -3,7 +3,7 @@
  * @brief Device-free replay of original PMA commitments, native failure rollback and event retirement.
  *
  * Private replay certificates carry synthetic bounds solely to exercise the
- * actual resource owner. The public production catalog remains empty. A mock
+ * actual resource owner without changing the public production catalog. A mock
  * worker authenticates pre-create reservations and exact event/stream identity;
  * no GPU runtime or manufactured resource qualification is involved.
  */

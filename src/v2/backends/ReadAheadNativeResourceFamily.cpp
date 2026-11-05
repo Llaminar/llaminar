@@ -2,9 +2,10 @@
  * @file ReadAheadNativeResourceFamily.cpp
  * @brief Pre-create certified same-authority commitments and exact event-owned retirement.
  *
- * The compiled certificate catalog is intentionally empty until native evidence
- * authenticates the complete runtime/source closure and handle-teardown pool
- * retirement. A successful API call is not evidence of physical pool release.
+ * The compiled catalog prices supported native resource families separately
+ * from their original physical provenance. Process-retained native backing
+ * stays charged after handle destruction and context reset; a successful API
+ * call is not evidence of physical pool release.
  * Device-free replay injects a private certificate solely to test lifecycle;
  * production cannot supply a byte allowance or stamp its own certificate.
  */

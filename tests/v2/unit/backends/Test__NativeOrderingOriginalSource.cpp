@@ -53,14 +53,17 @@ TEST(NativeOrderingOriginalSource, FirstInstalledCommonClaimAuthenticatesActualS
                 EXPECT_STREQ(error.what(),"Ordinary physical storage requires the final Admitted authority phase");
             }
             EXPECT_EQ(memory->phase(),PhysicalMemoryAuthorityPhase::Preparing);
-            // Side-stream and parent families remain independently unsupported.
+            // Supported side/parent families cannot allocate from a Preparing source.
 
-            EXPECT_THROW(ReadAheadNativeResourceFamily::materialize(memory,permit.worker(),device,reinterpret_cast<void*>(100)),std::runtime_error);
-            EXPECT_THROW(ReadAheadNativeParentTerminal::materialize(memory,permit.worker(),device),std::runtime_error);
+            EXPECT_THROW(ReadAheadNativeResourceFamily::materialize(memory,permit.worker(),device,reinterpret_cast<void*>(100)),std::logic_error);
+            EXPECT_THROW(ReadAheadNativeParentTerminal::materialize(memory,permit.worker(),device),std::logic_error);
             // Ledger reads themselves require Admitted. Freeze only the original
             // source BOM before proving that the rejected calls reserved nothing.
             source->freezeForPlanning();
             source->admitFinal(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(source->mandatoryBOM()));
+            // Mandatory-only admission grants no auxiliary-family budget.
+            EXPECT_THROW(ReadAheadNativeResourceFamily::materialize(memory,permit.worker(),device,reinterpret_cast<void*>(100)),std::logic_error);
+            EXPECT_THROW(ReadAheadNativeParentTerminal::materialize(memory,permit.worker(),device),std::logic_error);
             for(const auto owner:{PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent,PhysicalMemoryOwner::NativeReadAheadFamily,PhysicalMemoryOwner::NativeReadAheadParentTerminal}){
                 EXPECT_EQ(memory->reservedBytes(DeviceId::cpu(),owner),0u);
                 EXPECT_EQ(memory->reservedBytes(device,owner),0u);

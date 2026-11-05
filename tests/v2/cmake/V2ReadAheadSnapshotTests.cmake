@@ -32,7 +32,8 @@ foreach(_snapshot_backend IN ITEMS CUDA ROCm)
         add_v2_test(V2_Integration_ReadAheadCapturedSnapshot_${_snapshot_backend}
             COMMAND $<TARGET_FILE:${_snapshot_target}>
                 --gtest_filter=ReadAheadCapturedOverlap.${_snapshot_backend}CapturedSnapshotPublication
-            LABELS "V2;Integration;GraphCapture;ReadAhead;Snapshot;NativeQualification;UnqualifiedCandidate;Replay;Regression;${_snapshot_backend}"
+            LABELS "V2;Integration;ProductionTestPreflight;GraphCapture;ReadAhead;Snapshot;NativeQualification;Replay;Regression;${_snapshot_backend}"
             MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ReadAheadCapturedSnapshot_${_snapshot_backend})
     endif()
 endforeach()

@@ -13,15 +13,19 @@
  * ceilings; planned instance multiplicity contributes additively to original PMA.
  * These explicit conservative ceilings are opaque retained commitments, not
  * exact allocation sizes or automatically fitted peaks. They remain charged
- * through ProcessRuntime. Unmeasured side-stream, parent and timing
- * programs are deliberately absent and cannot borrow these limits.
+ * through ProcessRuntime. The read-ahead side/parent families each passed 40
+ * native lifetimes, 800 captured replays and three partial-creator controls on
+ * CUDA and ROCm. Their allowances deliberately exceed observed heap/queue
+ * growth; ordinary graph storage remains independently charged. These family
+ * allowances do not depend on application, runtime or hardware fingerprints.
+ * Unmeasured programs cannot borrow another family's allowance.
  */
 #pragma once
 #include "NativeAuxiliaryResourceCatalog.h"
 #include <array>
 namespace llaminar2::detail {
 /** @brief Supported backend/resource families own the stated units through their original physical lifetime. */
-inline constexpr std::array<NativeAuxiliaryQualifiedClass,14> kNativeAuxiliaryQualifiedClasses{{
+inline constexpr std::array<NativeAuxiliaryQualifiedClass,18> kNativeAuxiliaryQualifiedClasses{{
     NativeAuxiliaryQualifiedClass{
         .backend = DeviceType::CUDA,
         .program = NativeAuxiliaryResourceProgram::ordering(NativeOrderingEventProgram::pooledOwner(false)),
@@ -137,6 +141,43 @@ inline constexpr std::array<NativeAuxiliaryQualifiedClass,14> kNativeAuxiliaryQu
         .lifetime = NativePhysicalLifetime::ProcessRuntime,
         .remoteFamily = NativeAuxiliaryRemoteFamilyScope{PooledRemoteGraphProgramClass::familyVersion(),
             {69,68,GPUFlatGraphLimits::bit(GPUFlatGraphNodeKind::Kernel)}, {3,448,8}},
+    },
+    // One side queue and two ordering events, with headroom for native pool
+    // granularity and lazy creation. Both backends retain the same portable
+    // units; these are conservative commitments, not fitted allocation peaks.
+    NativeAuxiliaryQualifiedClass{
+        .backend = DeviceType::CUDA,
+        .program = NativeAuxiliaryResourceProgram::readAheadSide(),
+        .hostBytes = 4u * 1024u * 1024u,
+        .deviceBytes = 16u * 1024u * 1024u,
+        .evidence = "220fa9fcb0cd4b0fc31d0b25c0215941eba3bafe15b55213ce4681336d438279",
+        .lifetime = NativePhysicalLifetime::ProcessRuntime,
+    },
+    NativeAuxiliaryQualifiedClass{
+        .backend = DeviceType::ROCm,
+        .program = NativeAuxiliaryResourceProgram::readAheadSide(),
+        .hostBytes = 4u * 1024u * 1024u,
+        .deviceBytes = 16u * 1024u * 1024u,
+        .evidence = "220fa9fcb0cd4b0fc31d0b25c0215941eba3bafe15b55213ce4681336d438279",
+        .lifetime = NativePhysicalLifetime::ProcessRuntime,
+    },
+    // The independent parent terminal uses the established one-event units.
+    // Destroying its handle does not prove that the runtime pool released it.
+    NativeAuxiliaryQualifiedClass{
+        .backend = DeviceType::CUDA,
+        .program = NativeAuxiliaryResourceProgram::ordering(NativeOrderingEventProgram::readAheadParentTerminal()),
+        .hostBytes = 512u * 1024u,
+        .deviceBytes = 2u * 1024u * 1024u,
+        .evidence = "220fa9fcb0cd4b0fc31d0b25c0215941eba3bafe15b55213ce4681336d438279",
+        .lifetime = NativePhysicalLifetime::ProcessRuntime,
+    },
+    NativeAuxiliaryQualifiedClass{
+        .backend = DeviceType::ROCm,
+        .program = NativeAuxiliaryResourceProgram::ordering(NativeOrderingEventProgram::readAheadParentTerminal()),
+        .hostBytes = 512u * 1024u,
+        .deviceBytes = 2u * 1024u * 1024u,
+        .evidence = "220fa9fcb0cd4b0fc31d0b25c0215941eba3bafe15b55213ce4681336d438279",
+        .lifetime = NativePhysicalLifetime::ProcessRuntime,
     },
 }};
 }

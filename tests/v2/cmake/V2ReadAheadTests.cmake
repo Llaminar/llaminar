@@ -45,10 +45,7 @@ add_v2_test(V2_Integration_ReadAheadDiagnosticSelectionReplay
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ReadAheadDiagnosticSelectionReplay)
 endif()
 
-# These candidates deliberately fail with a precise missing native-family
-# certificate until their backend/source closure is qualified. They stay in the
-# explicit native qualification lane; device-free production replay above is
-# already an unconditional preflight requirement.
+# Native parents prove admitted source ownership, causal ordering and reset.
 foreach(_read_ahead_backend IN ITEMS CUDA ROCm)
     if((_read_ahead_backend STREQUAL "CUDA" AND HAVE_CUDA) OR
        (_read_ahead_backend STREQUAL "ROCm" AND HAVE_ROCM))
@@ -65,18 +62,22 @@ foreach(_read_ahead_backend IN ITEMS CUDA ROCm)
                 -Wl,--whole-archive ${_read_ahead_suffix}_backend -Wl,--no-whole-archive
                 -Wl,--end-group GTest::gtest GTest::gtest_main)
         endif()
+        # Native source preparation needs the same lexical GPU process owner
+        # as production entrypoints; plain GoogleTest main owns no runtime.
+        v2_bind_gpu_process_test_entry(${_read_ahead_target} v2_core_gtest_main)
         # Immutable startup inventory discovery may touch either vendor. Declare
         # this before registration so physical ownership and locks are complete.
         v2_test_device_scope(${_read_ahead_target} FullInventory)
         add_v2_test(V2_Integration_ReadAheadCapturedOverlap_${_read_ahead_backend}
             COMMAND $<TARGET_FILE:${_read_ahead_target}>
                 --gtest_filter=*CausalForkJoinAndMatchedReplay
-            LABELS "V2;Integration;GraphCapture;ReadAhead;NativeQualification;UnqualifiedCandidate;Replay;Regression;${_read_ahead_backend}"
+            LABELS "V2;Integration;ProductionTestPreflight;GraphCapture;ReadAhead;NativeQualification;Replay;Regression;${_read_ahead_backend}"
             MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ReadAheadCapturedOverlap_${_read_ahead_backend})
         add_v2_test(V2_Perf_ReadAheadMatchedReplay_${_read_ahead_backend}
             COMMAND $<TARGET_FILE:${_read_ahead_target}>
                 --gtest_filter=*CausalForkJoinAndMatchedReplay
-            LABELS "V2;Performance;ReadAhead;NativeQualification;UnqualifiedCandidate;Unprofiled;${_read_ahead_backend}"
+            LABELS "V2;Performance;ReadAhead;NativeQualification;Unprofiled;${_read_ahead_backend}"
             MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
     endif()
 endforeach()

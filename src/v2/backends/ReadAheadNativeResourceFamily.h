@@ -5,8 +5,8 @@
  * This family owns infrastructure only, never GPU inference state. A closed
  * source-bound certificate must price both physical allocators before native
  * creation. Reservations are certified opaque commitments, never reported as
- * exact materialized allocations. There is deliberately no production
- * certificate until the actual closure and retirement bound are qualified.
+ * exact materialized allocations. Supported resource families use reviewed
+ * conservative allowances and retain their original physical provenance.
  * An explicit private diagnostic variant grants no certificate or commitment;
  * its constructors are defined only in the named guarded test fixture.
  */
@@ -42,8 +42,8 @@ struct ReadAheadNativeResourceRequest final {
 };
 /**
  * @brief Source-minted certified upper limits, not caller-supplied reserve bytes.
- * @details A future installed certificate must prove teardown retires its
- * opaque pool commitment, not merely that native handle destruction succeeds.
+ * @details The installed lifetime determines when an opaque commitment can
+ * retire. Handle destruction cannot release process-retained native backing.
  */
 class ReadAheadNativeResourceCertificate final {
 public:
