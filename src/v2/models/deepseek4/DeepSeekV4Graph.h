@@ -20,6 +20,10 @@
 
 #include "../qwen35moe/Qwen35MoEGraph.h"
 #include "DeepSeekV4BufferLayout.h"
+#include "../../execution/compute_stages/stages/qwen4exp/Qwen4ExpPrimitiveStage.h"
+#include "../../kernels/deepseek4/DeepSeekV4Kernels.h"
+
+#include <optional>
 
 namespace llaminar2
 {
@@ -63,5 +67,11 @@ public:
 private:
     /** @brief State-bank geometry derived from the admitted raw-ring allocation. */
     DeepSeekV4StateLayout stateLayout() const;
+    /** @return The vision image bank and position map of a vision checkpoint. */
+    std::optional<PromptEmbeddingBank> promptEmbeddingBank() const override;
+    /** @return Vision sentinel ids of a vision checkpoint, or the disabled set for text-only. */
+    deepseek4::ImageSentinelIds imageSentinelIds() const;
+    /** @return Vision: this forward's execution-device token row; nullopt for text-only checkpoints. */
+    std::optional<Qwen4ExpIntInput> imageTokens(int rows, DeviceId device) const;
 };
 } // namespace llaminar2

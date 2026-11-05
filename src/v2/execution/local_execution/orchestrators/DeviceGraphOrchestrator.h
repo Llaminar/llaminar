@@ -2420,6 +2420,13 @@ namespace llaminar2
         bool initializePromptRepetitionHistory(
             std::span<const int32_t> unique_tokens, int request_index = 0) override;
 
+        /**
+         * @brief Stage the next request's prompt-embedding rows (multimodal), or clear them.
+         * @details CPU writes the host bank now; GPU uploads at the next prefill
+         * request-input admission on its admission stream.
+         */
+        bool stagePromptEmbeddingRows(std::shared_ptr<const PromptEmbeddingRows> rows) override;
+
         bool configureMTPRequestPenaltyPolicy(
             const MTPRequestPenaltyPolicy &policy) override;
         bool prepareGreedyAllPositionBatchOutcomeGraph(
@@ -6738,6 +6745,13 @@ namespace llaminar2
 
         /// Graph builder (declarative layer)
         std::shared_ptr<IGraphBuilder> graph_builder_;
+        /// Next request's prompt-embedding rows; retained as the H2D source until replaced.
+        std::shared_ptr<const PromptEmbeddingRows> staged_prompt_embeddings_;
+        std::vector<std::int32_t> prompt_embedding_map_host_; ///< H2D source of the map prefix.
+        std::size_t prompt_embedding_map_extent_ = 0;         ///< Positions the last admitted map named.
+        bool prompt_embeddings_pending_ = false;              ///< GPU upload owed at the next prefill admission.
+        /** @brief Upload staged prompt-embedding rows and map on the request-admission stream. */
+        bool admitPromptEmbeddingRowsOnDevice(IBackend &backend, void *stream);
 
         /// Graph executor
         DeviceGraphExecutor executor_;

@@ -78,6 +78,13 @@ public:
     const DeepSeekV4LayerPolicy &layer(int layer) const { return layer_policy_.at(static_cast<std::size_t>(layer)); }
     /** @brief Number of main layers with the given attention kind. */
     int countLayers(DeepSeekV4AttentionKind kind) const noexcept;
+    /**
+     * @brief Whether the checkpoint is a vision variant (every layer has exp_probs_b_vl).
+     * @details Such a checkpoint admits image sentinels: its arena carries the image
+     * bank and row map whether or not an mmproj is configured, so planning and
+     * allocation agree from the GGUF alone.
+     */
+    bool visionCapable() const noexcept { return vision_capable_; }
 
 private:
     int layers_ = 0, hidden_ = 0, hc_mult_ = 0, heads_ = 0, head_dim_ = 0, rope_dim_ = 0;
@@ -87,6 +94,7 @@ private:
     int index_heads_ = 0, index_head_dim_ = 0, index_topk_ = 0, sinkhorn_iters_ = 0;
     float hc_eps_ = 0.0f, norm_eps_ = 0.0f;
     int context_length_ = 0, vocab_ = 0;
+    bool vision_capable_ = false;
     std::vector<DeepSeekV4LayerPolicy> layer_policy_;
 };
 

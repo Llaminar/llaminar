@@ -344,6 +344,111 @@ TEST(DeepSeekV4CPUKernels, SparseAttentionChunkingMatchesDecode)
     }
 }
 
+TEST(DeepSeekV4CPUKernels, ImageSpanExtentFollowsGetImageVisible)
+{
+    // vLLM ids: base + {START 0, PAD 1, IMAGE 2, NEWLINE 3, END 4}.
+    const ImageSentinelIds ids{1000, 5};
+    const std::int32_t S = 1000, P = 1001, I = 1002, N = 1003, E = 1004;
+    // text, pad prefix, block 1 [3,8), block 2 directly after [8,11), text, unterminated block.
+    const std::vector<std::int32_t> t{7, P, P, S, I, I, N, E, S, I, E, 9, S, I};
+    const int rows = static_cast<int>(t.size());
+    const auto at = [&](int r) { return imageSpanExtent(t.data(), rows, r, ids); };
+    for (int r : {0, 1, 2, 11, 12, 13})
+        EXPECT_EQ(at(r).left + at(r).right, 0) << "row " << r << " is outside every complete span";
+    for (int r = 3; r < 8; ++r)
+    {
+        EXPECT_EQ(at(r).left, r - 3);
+        EXPECT_EQ(at(r).right, 7 - r);
+    }
+    for (int r = 8; r < 11; ++r)
+    {
+        EXPECT_EQ(at(r).left, r - 8);
+        EXPECT_EQ(at(r).right, 10 - r);
+    }
+    EXPECT_EQ(imageSpanExtent(t.data(), rows, 5, ImageSentinelIds{}).right, 0) << "count 0 disables vision";
+    EXPECT_EQ(imageSpanExtent(nullptr, rows, 5, ids).right, 0);
+}
+
+TEST(DeepSeekV4CPUKernels, SparseAttentionImageSpansAreBidirectionalAndChunkSafe)
+{
+    // A block wider than the window: every span row sees the whole span (both
+    // directions), rows outside keep the causal window, and any chunking that
+    // keeps the span whole reproduces the whole-prompt result bit for bit.
+    const int heads = 2, dim = 128, rope_dim = 64, window = 3, seq = 14, ratio = 4;
+    const PackedKVEntryFormat format{dim, rope_dim};
+    const RopePolicy rope = RopePolicy::make(rope_dim, 10000.0f, 0, 1.0f, 32.0f, 1.0f);
+    const ImageSentinelIds ids{1000, 5};
+    std::vector<std::int32_t> tokens{5, 6, 1001, 1000, 1002, 1002, 1003, 1002, 1004, 7, 8, 9, 10, 11};
+    auto q = randomVector(seq * heads * dim, 60);
+    const auto baseKV = randomVector(seq * dim, 61);
+    std::vector<std::uint8_t> pool(static_cast<std::size_t>(seq / ratio) * format.entryBytes());
+    auto poolValues = randomVector((seq / ratio) * dim, 62);
+    for (int b = 0; b < seq / ratio; ++b)
+        qat::packKVEntry(format, &poolValues[b * dim], &pool[static_cast<std::size_t>(b) * format.entryBytes()]);
+    std::vector<float> sinks{0.1f, -0.2f};
+    auto k = kernels();
+    auto run = [&](const std::vector<int> &cuts, std::vector<float> kv, const std::int32_t *tok) {
+        for (int p = 0; p < seq; ++p) qat::apply(ActivationQuant::FP8NopeBF16Rope, &kv[p * dim], dim, rope_dim);
+        std::vector<std::uint8_t> ring(static_cast<std::size_t>(window) * format.entryBytes(), 0xEE);
+        std::vector<float> out(q.size());
+        for (std::size_t c = 0; c + 1 < cuts.size(); ++c)
+        {
+            const int start = cuts[c], rows = cuts[c + 1] - cuts[c];
+            std::vector<std::int32_t> pos(rows);
+            for (int r = 0; r < rows; ++r) pos[r] = start + r;
+            SparseAttentionArgs a{{rows, nullptr}, heads, format, window, ratio, 0, CompressedAccess::All,
+                                  1.0f / std::sqrt(float(dim)), rope, pos.data(), &q[start * heads * dim],
+                                  &kv[start * dim], ring.data(), pool.data(), nullptr, sinks.data(),
+                                  &out[start * heads * dim], tok ? tok + start : nullptr, tok ? ids : ImageSentinelIds{}};
+            k->sparseAttention(a, nullptr);
+            RawStoreArgs s{{rows, nullptr}, format, window, pos.data(), &kv[start * dim], ring.data()};
+            k->rawStore(s, nullptr);
+        }
+        return out;
+    };
+    const auto row = [&](const std::vector<float> &o, int r) {
+        return std::vector<float>(o.begin() + r * heads * dim, o.begin() + (r + 1) * heads * dim);
+    };
+    const auto whole = run({0, seq}, baseKV, tokens.data());
+    const auto text = run({0, seq}, baseKV, nullptr);
+    // Rows before the span and the pad prefix are unaffected by vision.
+    for (int r : {0, 1, 2}) EXPECT_EQ(row(whole, r), row(text, r)) << "row " << r;
+    // A span row attends to the span END (a future key): perturbing it changes row 4.
+    auto bumped = baseKV;
+    for (int c = 0; c < dim; ++c) bumped[8 * dim + c] += 1.0f;
+    const auto future = run({0, seq}, bumped, tokens.data());
+    EXPECT_NE(row(future, 4), row(whole, 4)) << "span rows see the whole block";
+    EXPECT_EQ(row(future, 2), row(whole, 2)) << "rows before the block do not see it";
+    // The START key (outside row 7's causal window of 3) is visible to row 7.
+    auto startBumped = baseKV;
+    for (int c = 0; c < dim; ++c) startBumped[3 * dim + c] += 1.0f;
+    EXPECT_NE(row(run({0, seq}, startBumped, tokens.data()), 7), row(whole, 7));
+    EXPECT_EQ(row(run({0, seq}, startBumped, nullptr), 7), row(text, 7)) << "text rows keep the causal window";
+    // Chunkings that keep [3, 9) whole are exact.
+    for (const auto &cuts : std::vector<std::vector<int>>{{0, 3, 9, seq}, {0, 1, 2, 3, 9, 12, seq}, {0, 9, 10, seq}})
+    {
+        const auto chunked = run(cuts, baseKV, tokens.data());
+        for (std::size_t i = 0; i < whole.size(); ++i) ASSERT_EQ(whole[i], chunked[i]);
+    }
+}
+
+TEST(DeepSeekV4CPUKernels, ImageMergeOverwritesOnlyMappedSentinelRows)
+{
+    const int width = 4, rows = 5;
+    const ImageSentinelIds ids{1000, 5};
+    std::vector<std::int32_t> tokens{5, 1000, 1002, 1004, 1002};
+    std::vector<std::int32_t> positions{10, 11, 12, 13, 14};
+    std::vector<float> bank{1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3};
+    // Position 14 is a sentinel with map 0 (not part of an admitted image): it keeps its embedding.
+    std::vector<std::int32_t> map(16, 0);
+    map[11] = 1, map[12] = 3, map[13] = 2, map[10] = 2;
+    std::vector<float> emb(rows * width, -1.0f);
+    kernels()->imageMerge({{rows, nullptr}, width, 3, 16, ids, tokens.data(), positions.data(), bank.data(), map.data(),
+                           emb.data()}, nullptr);
+    const std::vector<float> expected{-1, -1, -1, -1, 1, 1, 1, 1, 3, 3, 3, 3, 2, 2, 2, 2, -1, -1, -1, -1};
+    EXPECT_EQ(emb, expected) << "text token at a mapped position and an unmapped sentinel stay";
+}
+
 TEST(DeepSeekV4CPUKernels, GroupedProjectionQ8MatchesDequantized)
 {
     const int rows = 2, groups = 2, rank = 3, width = 64;

@@ -647,6 +647,112 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_SetsSamplingParams_BeforePrefi
     EXPECT_LT(sp_pos, prefill_pos) << "setSamplingParams must be called before prefill";
 }
 
+/** @brief Fake model image pipeline: placeholder token 99 expands to three IMAGE rows. */
+class FakePromptImageEncoder final : public multimodal::IPromptImageEncoder
+{
+public:
+    const std::string &placeholderText() const noexcept override { return text_; }
+    std::int32_t placeholderToken() const noexcept override { return 99; }
+    int maxImagesPerRequest() const noexcept override { return 2; }
+    multimodal::ExpandedPrompt expand(const std::vector<std::int32_t> &tokens,
+                                      const std::vector<std::vector<std::uint8_t>> &images) const override
+    {
+        multimodal::ExpandedPrompt out;
+        auto rows = std::make_shared<PromptEmbeddingRows>();
+        rows->width = 1;
+        std::size_t image = 0;
+        for (const auto t : tokens)
+        {
+            if (t != 99) { out.tokens.push_back(t); rows->position_rows.push_back(0); continue; }
+            if (image >= images.size()) throw std::invalid_argument("more placeholders than images");
+            for (int i = 0; i < 3; ++i)
+            {
+                out.tokens.push_back(7);
+                rows->rows.push_back(static_cast<float>(images[image].size()));
+                rows->position_rows.push_back(static_cast<std::int32_t>(rows->rows.size()));
+            }
+            ++image;
+        }
+        if (image != images.size()) throw std::invalid_argument("fewer placeholders than images");
+        out.rows = rows;
+        return out;
+    }
+
+private:
+    std::string text_ = "<IMG>";
+};
+
+/** @test Image parts need a vision projector; without one the request is a 400 before any inference. */
+TEST_F(Test__ChatCompletionHandler, ImagePartsWithoutProjectorAre400)
+{
+    auto handler = makeHandler();
+    EXPECT_CALL(*runner_, prefill(_)).Times(0);
+    EXPECT_CALL(*runner_, setNextPromptEmbeddingRows(_)).Times(0);
+    ON_CALL(*tokenizer_, encodeChat(_, _, _)).WillByDefault(Return(std::vector<int>{1, 2}));
+    ChatCompletionResponse error;
+    const auto request = ChatCompletionHandler::parseRequest(
+        R"({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}], "max_tokens": 2})",
+        error);
+    ASSERT_TRUE(request) << error.json_body;
+    const auto response = handler->handleRequest(*request);
+    EXPECT_FALSE(response.ok);
+    EXPECT_EQ(response.http_status, 400);
+    EXPECT_NE(response.json_body.find("--mmproj"), std::string::npos) << response.json_body;
+}
+
+/** @test Images render as placeholders, expand after encoding and reach the runner with their rows before prefill. */
+TEST_F(Test__ChatCompletionHandler, ImagePartsExpandAndStageRowsBeforePrefill)
+{
+    auto handler = std::make_unique<ChatCompletionHandler>(*runner_, *tokenizer_, "", std::make_shared<FakePromptImageEncoder>());
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Invoke([](const std::vector<ChatMessage> &messages, bool, const std::string &) {
+            // The placeholder text sits in the image's content part.
+            EXPECT_EQ(messages.at(0).content_parts.at(1), "<IMG>");
+            return std::vector<int>{1, 99, 2};
+        }));
+    ON_CALL(*tokenizer_, is_stop_token(_)).WillByDefault(Return(false));
+    std::vector<std::string> order;
+    std::shared_ptr<const PromptEmbeddingRows> staged;
+    EXPECT_CALL(*runner_, setNextPromptEmbeddingRows(_))
+        .WillOnce(Invoke([&](std::shared_ptr<const PromptEmbeddingRows> rows) {
+            order.push_back("rows");
+            staged = std::move(rows);
+            return true;
+        }));
+    EXPECT_CALL(*runner_, prefill(_))
+        .WillOnce(Invoke([&](const std::vector<int32_t> &tokens) {
+            order.push_back("prefill");
+            EXPECT_EQ(tokens, (std::vector<int32_t>{1, 7, 7, 7, 2}));
+            return true;
+        }));
+    EXPECT_CALL(*runner_, decodeStep()).WillOnce(Return(makeToken(42, /*is_complete=*/true)));
+    ChatCompletionResponse error;
+    // "AAAA" decodes to three bytes.
+    const auto request = ChatCompletionHandler::parseRequest(
+        R"({"messages": [{"role": "user", "content": [{"type": "text", "text": "Look:"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}], "max_tokens": 2})",
+        error);
+    ASSERT_TRUE(request) << error.json_body;
+    const auto response = handler->handleRequest(*request);
+    EXPECT_TRUE(response.ok) << response.json_body;
+    EXPECT_EQ(order, (std::vector<std::string>{"rows", "prefill"}));
+    ASSERT_TRUE(staged);
+    EXPECT_EQ(staged->rows, (std::vector<float>{3, 3, 3}));
+    EXPECT_EQ(staged->position_rows, (std::vector<std::int32_t>{0, 1, 2, 3, 0}));
+
+    // Undecodable data and too many images are client errors.
+    for (const char *body : {
+             R"({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,@@@"}}]}]})",
+             R"({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:,a"}},
+                 {"type": "image_url", "image_url": {"url": "data:,a"}}, {"type": "image_url", "image_url": {"url": "data:,a"}}]}]})"})
+    {
+        const auto bad = ChatCompletionHandler::parseRequest(body, error);
+        ASSERT_TRUE(bad) << error.json_body;
+        const auto rejected = handler->handleRequest(*bad);
+        EXPECT_EQ(rejected.http_status, 400) << body << " -> " << rejected.json_body;
+    }
+}
+
 TEST_F(Test__ChatCompletionHandler, HandleRequest_PassesSamplingParams_ToRunner)
 {
     auto handler = makeHandler();

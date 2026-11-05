@@ -1034,6 +1034,9 @@ namespace llaminar2
         bool initializePromptRepetitionHistory(
             std::span<const int32_t> unique_tokens, int request_index = 0) override;
 
+        /** @brief Stage prompt-embedding rows on every participant (each owns its bank). */
+        bool stagePromptEmbeddingRows(std::shared_ptr<const PromptEmbeddingRows> rows) override;
+
         bool configureMTPRequestPenaltyPolicy(
             const MTPRequestPenaltyPolicy &policy) override;
         bool prepareGreedyAllPositionBatchOutcomeGraph(

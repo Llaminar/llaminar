@@ -1260,7 +1260,8 @@ extern "C"
     bool cudaMoE_scored_router_logit_transform(
         float *logits, int seq_len, int num_experts, int top_k,
         const float *bias, const int32_t *hash_table, int hash_vocab, const int32_t *token_ids,
-        const int *effective_seq_len, int device_idx, void *stream);
+        const int *effective_seq_len, int device_idx, void *stream,
+        const float *image_bias, int32_t image_base, int32_t image_count);
     bool cudaMoE_scale_route_weights(float *weights, int seq_len, int top_k, float scale,
                                      const int *effective_seq_len, int device_idx, void *stream);
     bool cudaMoE_scale_runtime_route_weights(void *runtime_layer, float *legacy_weights, int top_k, float scale,
@@ -4821,7 +4822,10 @@ namespace llaminar2
                 .selected = owned->selected, .selected_bytes = owned->selected_bytes,
                 .scored = {.enabled = !router_scoring_.isSoftmax(), .bias = router_scoring_.selection_bias,
                            .hash_table = router_scoring_.hash_table, .hash_vocab = router_scoring_.hash_vocab,
-                           .token_ids = router_scoring_.token_ids, .route_scale = router_scoring_.route_scale}};
+                           .token_ids = router_scoring_.token_ids, .route_scale = router_scoring_.route_scale,
+                           .image_bias = router_scoring_.image_bias,
+                           .image_sentinel_base = router_scoring_.image_sentinel_base,
+                           .image_sentinel_count = router_scoring_.image_sentinel_count}};
             const bool submitted = cuda::routeOwnedRows(launch, stream, router_q8_prefill_hardware_);
             if (submitted && gate_type == TensorType::FP16)
                 PerfStatsCollector::addCounter("cuda_moe", "router_fp16_owned_operands", 1.0, {}, {},
@@ -4856,7 +4860,8 @@ namespace llaminar2
         if (scored &&
             !cudaMoE_scored_router_logit_transform(d_route_logits_, seq_len, num_experts, top_k,
                 router_scoring_.selection_bias, router_scoring_.hash_table, router_scoring_.hash_vocab,
-                router_scoring_.token_ids, device_effective_seq_len, device_ordinal_, getStream()))
+                router_scoring_.token_ids, device_effective_seq_len, device_ordinal_, getStream(),
+                router_scoring_.image_bias, router_scoring_.image_sentinel_base, router_scoring_.image_sentinel_count))
             return false;
         if (!cudaMoE_softmax_topk(d_route_logits_, output_indices, output_weights,
                                   seq_len, num_experts, top_k, normalize_weights || scored,
@@ -5495,7 +5500,9 @@ namespace llaminar2
             }
             if (!cudaMoE_scored_router_logit_transform(d_route_logits_, 1, num_experts, top_k,
                     router_scoring_.selection_bias, router_scoring_.hash_table, router_scoring_.hash_vocab,
-                    router_scoring_.token_ids, nullptr, device_ordinal_, stream))
+                    router_scoring_.token_ids, nullptr, device_ordinal_, stream,
+                    router_scoring_.image_bias, router_scoring_.image_sentinel_base,
+                    router_scoring_.image_sentinel_count))
                 return false;
             normalize_weights = true;
         }

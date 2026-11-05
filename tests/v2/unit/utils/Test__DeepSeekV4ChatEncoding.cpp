@@ -134,6 +134,27 @@ TEST(Test__DeepSeekV4ChatEncoding, ToolSchemaKeyOrderSurvivesRequestParsing)
     EXPECT_NE(prompt.find("\"properties\": {\"zeta\": {\"type\": \"string\"}, \"alpha\""), std::string::npos) << prompt;
 }
 
+/** @test Image parts keep their slot and render as the placeholder exactly as vLLM's encoder flattens them. */
+TEST(Test__DeepSeekV4ChatEncoding, ImagePartsRenderAsPlaceholdersInOrder)
+{
+    ChatCompletionResponse error;
+    const auto request = ChatCompletionHandler::parseRequest(
+        R"({"messages": [{"role": "user", "content": [{"type": "text", "text": "What is this?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            {"type": "text", "text": "Be brief."}]}], "chat_template_kwargs": {"thinking": false}})", error);
+    ASSERT_TRUE(request) << error.json_body;
+    ASSERT_EQ(request->image_parts.size(), 1u);
+    EXPECT_EQ(request->image_parts[0].message, 0u);
+    EXPECT_EQ(request->image_parts[0].part, 1u);
+    EXPECT_EQ(request->image_parts[0].url, "data:image/png;base64,AAAA");
+    const auto rendered = ChatCompletionHandler::withImagePlaceholders(*request, "<｜deepseek_image｜>");
+    ChatEncodingOptions options;
+    options.enable_thinking = false;
+    // deepseek_v4_encoding.encode_messages(..., thinking_mode="chat") of the same request.
+    EXPECT_EQ(ChatTemplate::create(ChatTemplateType::DEEPSEEK_V4)->apply(rendered.messages, options),
+              "<｜begin▁of▁sentence｜><｜User｜>What is this?\n\n<｜deepseek_image｜>\n\nBe brief.<｜Assistant｜></think>");
+}
+
 /** @test Request admission: images, unknown efforts and conflicting thinking controls are 400s. */
 TEST(Test__DeepSeekV4ChatEncoding, RequestAdmissionRejectsUnsupportedOrConflictingControls)
 {
@@ -143,6 +164,10 @@ TEST(Test__DeepSeekV4ChatEncoding, RequestAdmissionRejectsUnsupportedOrConflicti
         EXPECT_EQ(error.http_status, 400) << body;
     };
     reject(R"({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}]})");
+    reject(R"({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://a/b.png"}}]}]})");
+    reject(R"({"messages": [{"role": "system", "content": [{"type": "image_url", "image_url": {"url": "data:,"}}]}]})");
+    reject(R"({"messages": [{"role": "user", "content": [{"type": "image", "image": "data:,"}]}]})");
+    reject(R"({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {}}]}]})");
     reject(R"({"messages": [{"role": "user", "content": [{"type": "text"}]}]})");
     reject(R"({"messages": [{"role": "user", "content": 7}]})");
     reject(R"({"messages": [{"role": "user", "content": "x"}], "reasoning_effort": "ultra"})");

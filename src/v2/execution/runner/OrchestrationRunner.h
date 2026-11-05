@@ -281,6 +281,7 @@ namespace llaminar2
         // =====================================================================
 
         bool prefill(const std::vector<int32_t> &tokens) override;
+        bool setNextPromptEmbeddingRows(std::shared_ptr<const PromptEmbeddingRows> rows) override;
         bool supportsPrefillBatch(int request_batch) const override;
         bool prefillBatch(
             const std::vector<std::vector<int32_t>> &token_batches) override;
@@ -1681,6 +1682,10 @@ namespace llaminar2
 
         // Execution infrastructure
         std::unique_ptr<IInferenceRunner> runner_;
+        /// Multimodal rows of the next prefill(); moved out (consumed) by it.
+        std::shared_ptr<const PromptEmbeddingRows> next_prompt_embedding_rows_;
+        /// Atomic prefill spans of the request being prefilled (absolute positions).
+        std::vector<std::pair<int, int>> prompt_atomic_spans_;
 
         /**
          * @brief Typed setup policy for graph-resident diagnostic copies.

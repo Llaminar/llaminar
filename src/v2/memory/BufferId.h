@@ -255,6 +255,8 @@ namespace llaminar2
         DSV4_IDX_RING_KV, ///< Persistent FP32 indexer compressor kv state [layer][sequence][8] of ratio-4 layers.
         DSV4_IDX_RING_SCORE, ///< Persistent FP32 indexer compressor score(+ape) state of ratio-4 layers.
         DSV4_IDX_POOL, ///< Persistent packed MXFP4 indexer key pools [layer][sequence][ctx/4] (INT32 words).
+        DSV4_IMAGE_BANK, ///< Vision request rows [sentinels + image slots, d_model] uploaded at admission.
+        DSV4_IMAGE_ROW_MAP, ///< Vision bank row per absolute position [ctx] (INT32, -1 = token embedding).
         DSV4_ROUTE_IDS, ///< Routed expert ids [rows, top_k] (INT32).
         DSV4_ROUTE_WEIGHTS, ///< Routing weights [rows, top_k].
         DSV4_ROUTER_LOGITS, ///< Router GEMM output [rows, experts].
@@ -601,6 +603,8 @@ namespace llaminar2
         case BufferId::DSV4_IDX_SELECTED: return "DSV4_IDX_SELECTED";
         case BufferId::DSV4_ATTN: return "DSV4_ATTN";
         case BufferId::DSV4_OA: return "DSV4_OA";
+        case BufferId::DSV4_IMAGE_BANK: return "DSV4_IMAGE_BANK";
+        case BufferId::DSV4_IMAGE_ROW_MAP: return "DSV4_IMAGE_ROW_MAP";
         case BufferId::DSV4_RAW_RING: return "DSV4_RAW_RING";
         case BufferId::DSV4_COMP_RING_KV: return "DSV4_COMP_RING_KV";
         case BufferId::DSV4_COMP_RING_SCORE: return "DSV4_COMP_RING_SCORE";

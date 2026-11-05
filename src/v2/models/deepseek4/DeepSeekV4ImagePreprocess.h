@@ -84,6 +84,18 @@ namespace llaminar2::deepseek4
     /** @brief Largest ViT patch count any admitted image can produce (capacity of the encoder). */
     int maxPatchesPerImage(const VisionPreprocessConfig &config);
 
+    /** @brief Largest IMAGE-slot count (aligner grid area) of one image under the token budget. */
+    int maxImageSlotsPerImage(int max_tokens = 384);
+
+    /** @brief Images one request may carry; sizes the device image bank. */
+    inline constexpr int kMaxImagesPerRequest = 8;
+
+    /** @brief Image bank rows: one learned row per sentinel type (at its type index) then IMAGE rows. */
+    inline int imageBankRows(int max_tokens = 384)
+    {
+        return kImageSentinelCount + kMaxImagesPerRequest * maxImageSlotsPerImage(max_tokens);
+    }
+
     /**
      * @brief Expand every placeholder token into its compressor-aligned sentinel block.
      * @param tokens Prompt token ids from the chat encoder.

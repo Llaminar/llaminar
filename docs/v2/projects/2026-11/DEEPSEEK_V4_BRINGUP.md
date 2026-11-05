@@ -345,18 +345,64 @@ Done:
   (`V2_Unit_DeepSeekV4ImagePreprocess`). JPEG decodes with stb (may differ from
   libjpeg-turbo by a few code values).
 
-Runtime design (in progress):
-- Vision tower placement: host CPU (FP32 BLAS), like production vLLM's UVA
-  offload of `vision`/`aligner`; its outputs are request input. A GPU tower is
-  later performance work. Host weights are FP32 copies of the mmproj tensors.
-- Text graph: image rows enter after the embedding lookup from an arena
-  image bank `[bank_rows, d_model]` indexed through a per-position row map;
-  START/PAD/NEWLINE/END take the four learned vectors. Every sentinel routes
-  with `exp_probs_b_vl` (hash layers included); raw-window attention of span
-  tokens covers the whole `[START, END]` span (`get_window_topk_idxs_visible`),
-  derived in-kernel from the chunk token ids.
-- Prefill chunk scheduling never splits an image span (atomic spans in the
-  scheduler policy; every span is shorter than the largest prefill bucket).
-- Admission: the runner hands prepared images to the continuation
-  participant before prefill; the bank and row map are uploaded once per
-  request (initial I/O). Multi-rank placements reject images explicitly.
+Runtime (implemented, CPU and CUDA):
+- `--mmproj <gguf>` loads the llama.cpp `deepseek4v` projector into a host
+  FP32 tower (`DeepSeekV4VisionEncoder`, oneDNN sgemm) after checking from
+  GGUF metadata that the text model is a vision checkpoint
+  (`exp_probs_b_vl` on every layer, `DeepSeekV4Config::visionCapable`).
+  `app/PromptImageEncoderFactory` owns this; production vLLM likewise keeps the
+  tower off the GPU (UVA offload). A GPU tower is later performance work.
+- Request side (`multimodal/PromptImageEncoder`, DSV4 implementation
+  `DeepSeekV4PromptImages`): OpenAI `image_url` parts with `data:` URLs in user
+  messages render as `<｜deepseek_image｜>` content parts (vLLM's
+  `flatten_content_blocks`), the conversation is encoded, then each
+  placeholder expands to its padded sentinel block. The result is an immutable
+  `PromptEmbeddingRows`: bank rows (one learned row per sentinel type at its
+  type index, then every image's aligner rows in block order), a per-position
+  map, and the atomic `[START, END]` spans. Remote URLs, images outside user
+  messages, more than 8 images, undecodable data and forged sentinel text are
+  400s; a server without `--mmproj` answers 400 instead of dropping images.
+  Single-shot chat accepts `--image <file>` (repeatable) for diagnostics.
+- Admission: `IOrchestrationRunner::setNextPromptEmbeddingRows` attaches the
+  rows to exactly one `prefill()`, which requires position 0 and a single
+  rank and stages them on every participant
+  (`IInferenceRunner::stagePromptEmbeddingRows`). The participant's graph
+  exposes its arena roots (`IGraphBuilder::promptEmbeddingBank`:
+  `DSV4_IMAGE_BANK [5 + 8 x max slots, d_model]`, `DSV4_IMAGE_ROW_MAP [ctx]`).
+  CPU writes them on the host; GPU uploads them in the canonical
+  request-input admission transaction (same stream, before its readiness
+  event), clearing the previous request's map prefix. Text requests stage
+  null. Both roots are priced by the DSV4 arena BOM; a text checkpoint
+  declares one element each.
+- Graph: `DeepSeekV4PrimitiveStage::ImageMerge` overwrites sentinel rows of
+  the embedding before the hyper-connection expansion; `SparseAttention`
+  takes the chunk token ids and widens the raw window of span rows to the
+  whole span in both directions (`imageSpanExtent` = `get_image_visible`);
+  the MoE router selects image-sentinel rows by `s + exp_probs_b_vl` on every
+  layer, hash layers included (CPU router, CUDA legacy and owned-row router).
+- Prefill chunking never splits a span: `PrefillChunkSchedulerPolicy::
+  atomic_spans` ends a chunk before a span that would straddle it; a span
+  longer than the largest admitted bucket fails planning (block <= 381 rows,
+  so a 384/512-row bucket is required on GPU).
+
+Vision validation (tiny `dsv4-vision-tiny-ff256-bf16` + its f32 mmproj,
+greedy, prompt `[image] Describe the picture.`, thinking high):
+- Stage dumps vs `deepseek4.py` with image rows (CPU): merged embedding equal
+  to 2.6e-6; per-row attention and layer-output errors of image rows are at
+  the text rows' level (Q8_0 attention weights with quantized activations
+  give ~1% per-projection differences vs the float reference on both); router
+  ids of image rows at the hash layers 0-2 match the vl-bias selection for
+  98.5/93/93% of rows (remaining flips are score near-ties), text rows 100%.
+- Tokens: 616x266 image: CUDA 4/6 equal to the reference, CPU 2/6; 588x588:
+  CPU == CUDA byte-identical, diverging from the reference at a 0.009-logit
+  near-tie at step 1, then following the reference's next choice.
+- HTTP server (CPU and CUDA): image, text, image requests in sequence give
+  the oneshot tokens each time (the map reset between requests holds).
+- Note: short BOS-prefixed chat prompts on these tiny models diverge from the
+  float reference after the first token for text-only requests too (old
+  image `dsv4-2190fcad1895` identical); the 457-token prompt below stays
+  equal. This is the Q8 activation precision of the tiny random model, not a
+  vision defect.
+
+Not yet: GPU vision tower, multi-rank image requests, prefix caching of image
+prompts (prefix cache is rejected for DSV4), image-content-aware prefix keys.

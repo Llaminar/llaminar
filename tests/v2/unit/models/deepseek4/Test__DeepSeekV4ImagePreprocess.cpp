@@ -8,6 +8,7 @@
  * IMAGE-slot order, PNG decoding of every Pillow mode, prompt expansion.
  */
 #include "models/deepseek4/DeepSeekV4ImagePreprocess.h"
+#include "models/deepseek4/DeepSeekV4PromptImages.h"
 #include "multimodal/ImageIO.h"
 #include "utils/Sha256.h"
 
@@ -114,4 +115,81 @@ TEST(DeepSeekV4ImagePreprocess, DataUrlsAndBase64)
     EXPECT_THROW(multimodal::decodeBase64("T!=="), std::invalid_argument);
     EXPECT_EQ(multimodal::pythonRound(2.5), 2);
     EXPECT_EQ(multimodal::pythonRound(3.5), 4);
+}
+
+
+namespace
+{
+/** @brief A prepared image with only the block geometry (no pixels) for prompt-expansion tests. */
+llaminar2::deepseek4::PreparedImage blockOnly(int llm_h, int llm_w)
+{
+    llaminar2::deepseek4::PreparedImage image;
+    image.llm_h = llm_h;
+    image.llm_w = llm_w;
+    llaminar2::deepseek4::buildImageBlock(llm_h, llm_w, image.block, image.perm);
+    return image;
+}
+} // namespace
+
+TEST(DeepSeekV4ImagePreprocess, PromptBankMapsEverySentinelAndSpansEachBlock)
+{
+    using namespace llaminar2::deepseek4;
+    const int width = 3;
+    const auto a = blockOnly(2, 3), b = blockOnly(1, 2);
+    std::vector<std::vector<float>> encoded;
+    for (const auto *image : {&a, &b})
+    {
+        std::vector<float> rows;
+        for (std::size_t j = 0; j < image->perm.size(); ++j)
+            rows.insert(rows.end(), {100.0f + float(encoded.size()), float(j), 0.0f});
+        encoded.push_back(rows);
+    }
+    std::array<std::vector<float>, kImageSentinelCount> learned;
+    std::array<const std::vector<float> *, kImageSentinelCount> sentinels{};
+    for (int t = 0; t < kImageSentinelCount; ++t)
+    {
+        learned[t] = std::vector<float>(width, float(t));
+        sentinels[t] = &learned[t];
+    }
+    const std::vector<std::int32_t> prompt{1, 2, kImagePlaceholderToken, 3, kImagePlaceholderToken, 4};
+    const auto out = DeepSeekV4PromptImageEncoder::expandPrepared(prompt, {a, b}, encoded, sentinels, width);
+    ASSERT_EQ(out.tokens, expandImagePlaceholders(prompt, {a, b}));
+    const auto &rows = *out.rows;
+    ASSERT_TRUE(rows.valid());
+    ASSERT_EQ(rows.position_rows.size(), out.tokens.size());
+    ASSERT_EQ(rows.rowCount(), kImageSentinelCount + a.perm.size() + b.perm.size());
+    ASSERT_EQ(rows.atomic_spans.size(), 2u);
+    std::size_t image_rows = 0;
+    for (std::size_t p = 0; p < out.tokens.size(); ++p)
+    {
+        const auto token = out.tokens[p];
+        const int v = rows.position_rows[p];
+        if (!isImageSentinel(token))
+        {
+            EXPECT_EQ(v, 0) << "text position " << p;
+            continue;
+        }
+        ASSERT_GT(v, 0) << "sentinel position " << p;
+        const float *row = &rows.rows[static_cast<std::size_t>(v - 1) * width];
+        if (token == kImageSentinelBase + static_cast<int>(ImageSentinel::Image))
+        {
+            EXPECT_GE(row[0], 100.0f);
+            EXPECT_EQ(static_cast<std::size_t>(v - 1), kImageSentinelCount + image_rows) << "IMAGE rows in block order";
+            ++image_rows;
+        }
+        else
+            EXPECT_EQ(row[0], float(token - kImageSentinelBase)) << "learned sentinel row at its type index";
+    }
+    EXPECT_EQ(image_rows, a.perm.size() + b.perm.size());
+    for (const auto &[begin, end] : rows.atomic_spans)
+    {
+        EXPECT_EQ(out.tokens[begin], kImageSentinelBase + static_cast<int>(ImageSentinel::Start));
+        EXPECT_EQ(out.tokens[end - 1], kImageSentinelBase + static_cast<int>(ImageSentinel::End));
+        EXPECT_EQ(begin % kCompressPadTo, kCompressPadTo - 1) << "blocks start one row before a compressor boundary";
+    }
+    // Client text that forges sentinels is a 400, not a silent misalignment.
+    std::vector<std::int32_t> forged{1, kImageSentinelBase + static_cast<int>(ImageSentinel::End), 2};
+    EXPECT_THROW(DeepSeekV4PromptImageEncoder::expandPrepared(forged, {}, {}, sentinels, width), std::invalid_argument);
+    EXPECT_THROW(DeepSeekV4PromptImageEncoder::expandPrepared(prompt, {a}, {encoded[0]}, sentinels, width),
+                 std::invalid_argument);
 }

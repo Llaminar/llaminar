@@ -448,6 +448,7 @@ namespace llaminar2
         DEEPSEEK_V4_GROUPED_PROJECTION,
         DEEPSEEK_V4_ROUTE,
         DEEPSEEK_V4_SEQUENCE_FRONTIER, ///< Terminal-layer publication of the cache sequence frontier
+        DEEPSEEK_V4_IMAGE_MERGE, ///< Vision: image-sentinel embedding rows from the request image bank
 
         // GDN (Gated Delta Network) stages
         ATTENTION_OUTPUT_GATE, ///< Sigmoid gate on attention output

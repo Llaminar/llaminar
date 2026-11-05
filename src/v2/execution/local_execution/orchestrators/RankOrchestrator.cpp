@@ -9575,6 +9575,15 @@ namespace llaminar2
         return true;
     }
 
+    bool RankOrchestrator::stagePromptEmbeddingRows(std::shared_ptr<const PromptEmbeddingRows> rows)
+    {
+        for (auto *group : {&device_runners_, &pp_stage_runners_})
+            for (const auto &runner : *group)
+                if (!runner || !runner->stagePromptEmbeddingRows(rows))
+                    return false;
+        return true;
+    }
+
     bool RankOrchestrator::configureMTPRequestPenaltyPolicy(
         const MTPRequestPenaltyPolicy &policy)
     {

@@ -884,7 +884,11 @@ namespace llaminar2
             policy.hash_table = static_cast<const int32_t *>(address(params_.scoring_hash_table));
             policy.hash_vocab = params_.scoring_hash_table ? static_cast<int>(params_.scoring_hash_table->rows()) : 0;
             policy.token_ids = params_.scoring_token_ids;
-            if (policy.hash_table ? !policy.token_ids : !policy.selection_bias)
+            policy.image_bias = static_cast<const float *>(address(params_.scoring_image_bias));
+            policy.image_sentinel_base = params_.scoring_image_sentinel_base;
+            policy.image_sentinel_count = params_.scoring_image_sentinel_count;
+            if ((policy.hash_table ? !policy.token_ids : !policy.selection_bias) ||
+                (policy.image_bias && (!policy.token_ids || policy.image_sentinel_count <= 0)))
             {
                 LOG_ERROR("[MoERoutingStage] scoring policy lacks its bias or hash-routing operands");
                 return false;
@@ -1661,6 +1665,8 @@ namespace llaminar2
             contract.addWeight(const_cast<TensorBase *>(params_.scoring_selection_bias));
         if (params_.scoring_hash_table)
             contract.addWeight(const_cast<TensorBase *>(params_.scoring_hash_table));
+        if (params_.scoring_image_bias)
+            contract.addWeight(const_cast<TensorBase *>(params_.scoring_image_bias));
 
         return contract;
     }

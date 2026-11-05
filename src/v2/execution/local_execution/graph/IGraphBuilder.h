@@ -1085,6 +1085,24 @@ namespace llaminar2
         virtual void initializeCacheAuxiliaryState(IKVCache &cache, void *publicationStream)
         { (void)cache; (void)publicationStream; }
 
+        /** @brief Admitted arena roots that receive a request's prompt-embedding replacement rows. */
+        struct PromptEmbeddingBank
+        {
+            TensorBase *rows = nullptr;  ///< FP32 [capacity rows, width].
+            TensorBase *map = nullptr;   ///< INT32 [map capacity] row index + 1 per absolute position.
+            int width = 0;               ///< Row width (d_model).
+        };
+
+        /**
+         * @brief The model's prompt-embedding bank, when it accepts multimodal rows.
+         * @return Null for models without one; such a participant rejects every
+         *         non-empty request (no silent text-only fallback).
+         * @details Storage is allocated and the map zeroed by
+         * initializeCacheAuxiliaryState(); the participant writes it only at
+         * request admission, before any graph reads it.
+         */
+        virtual std::optional<PromptEmbeddingBank> promptEmbeddingBank() const { return std::nullopt; }
+
         // =====================================================================
         // Core Graph Building Methods
         // =====================================================================

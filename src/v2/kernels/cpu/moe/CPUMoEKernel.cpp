@@ -1047,7 +1047,9 @@ namespace llaminar2
                     }
                     thread_local std::vector<int> chosen;
                     chosen.resize(static_cast<size_t>(top_k));
-                    if (router_scoring_.hash_table)
+                    const bool image_row = router_scoring_.image_bias && router_scoring_.token_ids &&
+                        router_scoring_.isImageToken(router_scoring_.token_ids[row]);
+                    if (router_scoring_.hash_table && !image_row)
                     {
                         const int token = router_scoring_.token_ids[row];
                         for (int k = 0; k < top_k; ++k)
@@ -1058,7 +1060,7 @@ namespace llaminar2
                         thread_local std::vector<int> order;
                         order.resize(static_cast<size_t>(num_experts));
                         std::iota(order.begin(), order.end(), 0);
-                        const float *bias = router_scoring_.selection_bias;
+                        const float *bias = image_row ? router_scoring_.image_bias : router_scoring_.selection_bias;
                         std::partial_sort(order.begin(), order.begin() + top_k, order.end(),
                             [probabilities, bias](int left, int right) {
                                 const float l = probabilities[left] + bias[left];

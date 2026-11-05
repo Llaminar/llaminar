@@ -3731,8 +3731,10 @@ namespace llaminar2
             // nonterminal remainder must use its smaller existing graph too.
             // For example, 448 live rows under a 384-row cap require 384+64,
             // not 384+384. This changes neither row authority nor KV extent.
-            const auto policy = PrefillChunkSchedulerPolicy::forRetainedBucketFamily(
+            auto policy = PrefillChunkSchedulerPolicy::forRetainedBucketFamily(
                 buckets, runner_->get_position(), token_count);
+            // Model-declared atomic spans (image blocks) of this request.
+            policy.atomic_spans = prompt_atomic_spans_;
 
             PrefillChunkSchedule chunk_schedule = planPrefillChunkSchedule(policy);
             if (!chunk_schedule)
@@ -3955,8 +3957,19 @@ namespace llaminar2
         }
     }
 
+    bool OrchestrationRunner::setNextPromptEmbeddingRows(std::shared_ptr<const PromptEmbeddingRows> rows)
+    {
+        if (rows && !rows->valid())
+            return setError("Prompt-embedding rows are malformed");
+        next_prompt_embedding_rows_ = std::move(rows);
+        return true;
+    }
+
     bool OrchestrationRunner::prefill(const std::vector<int32_t> &prompt_tokens)
     {
+        // Multimodal rows belong to exactly this request, even when it fails.
+        auto prompt_rows = std::move(next_prompt_embedding_rows_);
+        next_prompt_embedding_rows_.reset();
         if (!initialization_lifecycle_.readyForInference())
         {
             setError("Runner not initialized");
@@ -4019,6 +4032,20 @@ namespace llaminar2
             return setError(
                 "Inference runner rejected request penalty policy at "
                 "request admission");
+        }
+        {
+            // A text request stages null, clearing the previous request's rows.
+            if (prompt_rows && prompt_rows->position_rows.size() > prompt_tokens.size())
+                return setError("Prompt-embedding rows name positions beyond the prompt");
+            // The bank map is indexed by absolute position: multimodal rows
+            // require a fresh sequence (no restored prefix or prior turn).
+            if (prompt_rows && runner_->get_position() != 0)
+                return setError("Multimodal prompt rows require a prefill from position 0");
+            prompt_atomic_spans_ = prompt_rows ? prompt_rows->atomic_spans : std::vector<std::pair<int, int>>{};
+            if (prompt_rows && mpi_coordinated_world)
+                return setError("Multimodal prompt rows are not implemented for multi-rank placements");
+            if (!runner_->stagePromptEmbeddingRows(std::move(prompt_rows)))
+                return setError("Inference runner rejected the request's prompt-embedding rows");
         }
 
         mtp_bypassed_ = false;

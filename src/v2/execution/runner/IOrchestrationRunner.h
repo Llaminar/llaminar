@@ -20,6 +20,7 @@
  */
 
 #pragma once
+#include "../PromptEmbeddingRows.h"
 #include "snapshots/SnapshotInfo.h"
 
 #include "execution/prefix_cache/PrefixCacheTelemetry.h"
@@ -501,6 +502,18 @@ namespace llaminar2
          * @return true on success, false on failure (check lastError())
          */
         virtual bool prefill(const std::vector<int32_t> &tokens) = 0;
+
+        /**
+         * @brief Attach prompt-embedding replacement rows (multimodal input) to the next prefill().
+         * @param rows Immutable rows indexed by prompt position; consumed by exactly one prefill().
+         * @return False when this runner cannot apply multimodal rows at all.
+         * @details A runner that accepts the rows must apply them or fail that
+         * prefill; it may never silently run the prompt as text.
+         */
+        virtual bool setNextPromptEmbeddingRows(std::shared_ptr<const PromptEmbeddingRows> rows)
+        {
+            return !rows;
+        }
 
         /**
          * @brief Observe completion of the latest inference transaction for host timing.

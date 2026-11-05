@@ -1394,6 +1394,13 @@ namespace llaminar2
             .setter = setters::assignString(&OrchestrationConfig::model_path),
         });
         spec.add({
+            .long_name = "--mmproj",
+            .category = "Model Configuration",
+            .value_label = "<path>",
+            .description = "Vision projector GGUF (llama.cpp mmproj) enabling image input for a vision checkpoint",
+            .setter = setters::assignString(&OrchestrationConfig::mmproj_path),
+        });
+        spec.add({
             .short_name = "-c",
             .long_name = "--context-length",
             .category = "Model Configuration",
@@ -1534,6 +1541,14 @@ namespace llaminar2
             .value_label = "<name>",
             .description = "Override chat template (chatml, llama3, etc.)",
             .setter = setters::assignString(&OrchestrationConfig::chat_template_override),
+        });
+        spec.add({
+            .long_name = "--image",
+            .category = "Chat Configuration",
+            .value_label = "<path>",
+            .description = "Single-shot chat: attach an image file before the prompt (repeatable; requires --mmproj)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &config, const std::string &value) { config.image_paths.push_back(value); }),
         });
 
         // --- Benchmark Configuration -----------------------------------------

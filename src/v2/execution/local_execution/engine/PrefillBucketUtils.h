@@ -12,6 +12,7 @@
 #pragma once
 
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace llaminar2
@@ -73,6 +74,12 @@ namespace llaminar2
         int max_rebalance_interval_tokens = 0; ///< Real tokens before rebalance is required; 0 disables force flag.
         int real_token_start = 0;             ///< First real token offset covered by this schedule.
         int real_token_count = 0;             ///< Number of real tokens covered by this schedule.
+        /**
+         * Absolute [begin, end) position ranges no chunk boundary may split
+         * (image blocks attend bidirectionally inside one forward). Sorted,
+         * disjoint; a span longer than the chunk target fails planning.
+         */
+        std::vector<std::pair<int, int>> atomic_spans;
     };
 
     /**

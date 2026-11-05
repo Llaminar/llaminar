@@ -11,6 +11,7 @@
  */
 
 #pragma once
+#include "../../PromptEmbeddingRows.h"
 #include "snapshots/SnapshotInfo.h"
 
 #include "execution/prefix_cache/PrefixCacheTelemetry.h"
@@ -3097,6 +3098,16 @@ namespace llaminar2
             if (primaryDeviceId().is_gpu())
                 throw std::logic_error("GPU runner has no prompt repetition-history admission");
             return true;
+        }
+
+        /**
+         * @brief Stage the next request's prompt-embedding replacement rows (multimodal input).
+         * @param rows Immutable rows, or null for a text-only request (clears prior rows).
+         * @return False when this runner cannot apply non-null rows; never drops them silently.
+         */
+        virtual bool stagePromptEmbeddingRows(std::shared_ptr<const PromptEmbeddingRows> rows)
+        {
+            return !rows;
         }
 
         virtual bool configureMTPRequestPenaltyPolicy(

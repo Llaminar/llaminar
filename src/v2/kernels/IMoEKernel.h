@@ -267,7 +267,21 @@ namespace llaminar2
         float route_scale = 1.0f;                ///< Multiplier after normalization.
         const int32_t *hash_table = nullptr;     ///< [vocab, top_k] INT32 (hash routing) or null.
         int hash_vocab = 0;                      ///< Rows of @c hash_table.
-        const int32_t *token_ids = nullptr;      ///< [rows] routed token ids (hash routing).
+        const int32_t *token_ids = nullptr;      ///< [rows] routed token ids (hash routing, image sentinels).
+        /**
+         * DeepSeek-V4 vision: rows whose token is one of the @c image_sentinel_count
+         * ids starting at @c image_sentinel_base select by s + @c image_bias on every
+         * layer (hash layers included); weights stay the unbiased s. Null disables.
+         */
+        const float *image_bias = nullptr;       ///< [num_experts] exp_probs_b_vl.
+        int32_t image_sentinel_base = 0;
+        int32_t image_sentinel_count = 0;
+
+        /** @return Whether @p token routes with the image bias. */
+        [[nodiscard]] bool isImageToken(int32_t token) const noexcept
+        {
+            return image_bias && token >= image_sentinel_base && token < image_sentinel_base + image_sentinel_count;
+        }
 
         /** @return Whether this is the ordinary softmax router. */
         [[nodiscard]] bool isSoftmax() const noexcept { return function == Function::Softmax; }

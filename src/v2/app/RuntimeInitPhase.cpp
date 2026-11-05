@@ -15,6 +15,7 @@
  * Excluded discovery processes retire without acquiring an inference runner.
  */
 
+#include "PromptImageEncoderFactory.h"
 #include "app/RuntimeInitPhase.h"
 #include "app/MPIBootstrapPhase.h"
 #include "app/ChatTemplateResolver.h"
@@ -428,6 +429,7 @@ namespace llaminar2
 
             OrchestrationConfig ready_config;
             std::shared_ptr<ITokenizer> tokenizer;
+            std::shared_ptr<const multimodal::IPromptImageEncoder> image_encoder;
             phase("prepare_frontend_context", [&]
             {
                 config = runner->config();
@@ -437,6 +439,17 @@ namespace llaminar2
                 tokenizer = runner->tokenizer();
                 if (!tokenizer) throw std::runtime_error("Runner did not publish a tokenizer");
                 ChatTemplateResolver::resolve(config.chat_template_override, tokenizer, mpi_ctx->rank());
+                if (!config.image_paths.empty() && config.mmproj_path.empty())
+                    throw std::invalid_argument("--image requires --mmproj");
+                // Multi-rank placements reject image requests at prefill
+                // admission; the tower is host-only and needs no device.
+                image_encoder = createPromptImageEncoder(config.mmproj_path, config.model_path, *mpi_ctx);
+                if (image_encoder)
+                {
+                    const auto ids = tokenizer->encode(image_encoder->placeholderText(), false);
+                    if (ids.size() != 1 || ids.front() != image_encoder->placeholderToken())
+                        throw std::invalid_argument("the tokenizer does not map the image placeholder to its token");
+                }
                 return true;
             });
 
@@ -450,7 +463,8 @@ namespace llaminar2
                 .config = std::move(ready_config),
                 .mpi_ctx = std::move(mpi_ctx),
                 .runner = std::move(runner),
-                .tokenizer = std::move(tokenizer)};
+                .tokenizer = std::move(tokenizer),
+                .image_encoder = std::move(image_encoder)};
         }
         catch (const std::exception &error)
         {

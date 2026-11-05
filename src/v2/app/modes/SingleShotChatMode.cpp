@@ -7,6 +7,8 @@
  * and handlers before the runner, contexts and outer session are destroyed.
  */
 
+#include <iterator>
+#include <fstream>
 #include "app/modes/SingleShotChatMode.h"
 #include "app/AppContext.h"
 #include "app/modes/ConsoleOutput.h"
@@ -114,10 +116,39 @@ namespace llaminar2
             {
                 conversation.push_back(ChatMessage("system", config.system_prompt));
             }
-            conversation.push_back(ChatMessage("user", config.prompt));
+            ChatMessage user("user", config.prompt);
+            std::vector<std::vector<std::uint8_t>> images;
+            if (!config.image_paths.empty())
+            {
+                if (!ctx.image_encoder)
+                    throw std::invalid_argument("--image requires --mmproj");
+                // Images precede the prompt text, each as its own content part
+                // (OpenAI order: image parts, then the question).
+                for (const auto &path : config.image_paths)
+                {
+                    std::ifstream file(path, std::ios::binary);
+                    if (!file) throw std::invalid_argument("cannot read image " + path);
+                    images.emplace_back(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+                    user.content_parts.push_back(ctx.image_encoder->placeholderText());
+                }
+                user.content_parts.push_back(config.prompt);
+                user.content.clear();
+                for (std::size_t i = 0; i < user.content_parts.size(); ++i)
+                    user.content += (i ? "\n" : "") + user.content_parts[i];
+            }
+            conversation.push_back(std::move(user));
 
             auto encoded = tokenizer->encodeChat(conversation, /*add_generation_prompt=*/true);
             token_ids.assign(encoded.begin(), encoded.end());
+            if (!images.empty())
+            {
+                auto expanded = ctx.image_encoder->expand(token_ids, images);
+                token_ids = std::move(expanded.tokens);
+                if (!runner->setNextPromptEmbeddingRows(std::move(expanded.rows)))
+                    throw std::runtime_error("runner rejected image input: " + runner->lastError());
+                LOG_INFO("Attached " << images.size() << " image(s); prompt expanded to " << token_ids.size()
+                                     << " tokens");
+            }
             token_count = static_cast<int>(token_ids.size());
 
             if (token_ids.empty())
@@ -127,7 +158,11 @@ namespace llaminar2
             }
             else
             {
-                LOG_DEBUG("Encoded " << token_count << " tokens with chat template");
+                LOG_DEBUG("Encoded " << token_count << " tokens with chat template: " << [&] {
+                    std::string ids;
+                    for (const auto id : token_ids) ids += std::to_string(id) + " ";
+                    return ids;
+                }());
             }
         }
         catch (const std::exception &e)

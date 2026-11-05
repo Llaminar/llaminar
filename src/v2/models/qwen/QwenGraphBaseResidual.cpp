@@ -11,6 +11,7 @@
 #include "../qwen4exp/Qwen4ExpConfig.h"
 #include "../qwen4exp/Qwen4ExpHCUpArithmetic.h"
 #include "../deepseek4/DeepSeekV4Config.h"
+#include "../deepseek4/DeepSeekV4ImagePreprocess.h"
 #include "../../execution/compute_stages/stages/deepseek4/DeepSeekV4PrimitiveStage.h"
 #include "../../execution/compute_stages/ComputeStageFactory.h"
 #include <stdexcept>
@@ -293,11 +294,40 @@ std::string QwenGraphBase::addEmbeddingTrunkExpansion(ComputeGraph &graph,
     if (config_.deepseek_v4)
     {
         using Stage = DeepSeekV4PrimitiveStage;
+        std::string expand_dependency = dependency;
+        if (config_.deepseek_v4->visionCapable())
+        {
+            // Vision: image-sentinel rows take the request bank row named by
+            // the position map (learned sentinel vectors and encoded IMAGE
+            // rows) before the trunk expansion. Text rows are untouched.
+            auto *bank = buffers_.layer_buffers.get(BufferId::DSV4_IMAGE_BANK);
+            auto *map = buffers_.layer_buffers.get(BufferId::DSV4_IMAGE_ROW_MAP);
+            const auto &input = modelForwardInput();
+            const auto *tokens = device.is_gpu() ? static_cast<const std::int32_t *>(input.token_ids_device)
+                                                 : reinterpret_cast<const std::int32_t *>(input.token_ids);
+            const auto *positions = device.is_gpu() ? static_cast<const std::int32_t *>(input.position_ids_device)
+                                                    : reinterpret_cast<const std::int32_t *>(input.position_ids);
+            if (!bank || !map || !tokens || !positions || bank->numel() % static_cast<std::size_t>(config_.d_model))
+                throw std::invalid_argument("DeepSeek-V4 vision embedding requires its image bank, row map, tokens and positions");
+            const auto count = static_cast<std::size_t>(rows);
+            graph.addNode("embedding_image_merge", std::make_unique<Stage>(Stage::Params{
+                .device_id = device, .mpi_ctx = mpi_ctx_.get(), .rows = modelExtensionRows(rows, device),
+                .operation = Stage::ImageMerge{config_.d_model,
+                    static_cast<int>(bank->numel() / static_cast<std::size_t>(config_.d_model)),
+                    static_cast<int>(map->numel()),
+                    {deepseek4::kImageSentinelBase, deepseek4::kImageSentinelCount},
+                    Qwen4ExpIntInput(Qwen4ExpNativeIntInput{device, tokens, count}),
+                    Qwen4ExpIntInput(Qwen4ExpNativeIntInput{device, positions, count}),
+                    {*bank, BufferId::DSV4_IMAGE_BANK}, {*map, BufferId::DSV4_IMAGE_ROW_MAP},
+                    {*embedding, BufferId::QFN_EMBEDDING_ROWS}}}), device);
+            graph.addDependency("embedding_image_merge", dependency);
+            expand_dependency = "embedding_image_merge";
+        }
         graph.addNode("embedding_expand", std::make_unique<Stage>(Stage::Params{
             .device_id = device, .mpi_ctx = mpi_ctx_.get(), .rows = modelExtensionRows(rows, device),
             .operation = Stage::HCExpand{config_.deepseek_v4->hcMult(), config_.d_model,
                 {*embedding, BufferId::QFN_EMBEDDING_ROWS}, {*trunk, BufferId::HIDDEN_STATE}}}), device);
-        graph.addDependency("embedding_expand", dependency);
+        graph.addDependency("embedding_expand", expand_dependency);
         return "embedding_expand";
     }
     using Stage = Qwen4ExpPrimitiveStage;

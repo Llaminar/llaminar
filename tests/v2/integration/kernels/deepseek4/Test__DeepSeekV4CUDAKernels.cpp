@@ -323,6 +323,105 @@ TEST_F(DeepSeekV4CUDAKernels, SparseAttentionMatchesCPUAndChunking)
     }
 }
 
+TEST_F(DeepSeekV4CUDAKernels, ImageSpanAttentionAndMergeMatchCPU)
+{
+    // Vision: an image block wider than the window attends bidirectionally on
+    // device exactly as on CPU; span-preserving chunkings are bit-identical and
+    // the sentinel merge is a byte copy.
+    const int heads = 4, window = 8, seq = 48, ratio = 4;
+    const PackedKVEntryFormat format{512, 64};
+    const RopePolicy rope = RopePolicy::make(64, 10000.0f, 0, 1.0f, 32.0f, 1.0f);
+    const ImageSentinelIds ids{1000, 5};
+    std::vector<std::int32_t> tokens(seq, 7);
+    tokens[10] = 1001; // compressor-alignment pad: outside the span
+    tokens[11] = 1000;
+    for (int p = 12; p < 34; ++p) tokens[p] = (p % 7 == 0) ? 1003 : 1002;
+    tokens[34] = 1004;
+    auto q = randomVector(static_cast<std::size_t>(seq) * heads * 512, 71);
+    auto kv = randomVector(static_cast<std::size_t>(seq) * 512, 72);
+    for (int p = 0; p < seq; ++p) qat::apply(ActivationQuant::FP8NopeBF16Rope, &kv[p * 512], 512, 64);
+    const int blocks = seq / ratio;
+    std::vector<std::uint8_t> pool(static_cast<std::size_t>(blocks) * format.entryBytes());
+    auto poolValues = randomVector(static_cast<std::size_t>(blocks) * 512, 73);
+    for (int b = 0; b < blocks; ++b)
+        qat::packKVEntry(format, &poolValues[b * 512], &pool[static_cast<std::size_t>(b) * format.entryBytes()]);
+    std::vector<float> sinks{0.3f, -0.4f, 0.0f, 1.0f};
+    const std::vector<std::vector<int>> cuts{{0, seq}, {0, 11, 35, seq}, {0, 5, 11, 35, 40, seq}};
+
+    const auto runCPU = [&](const std::vector<int> &cut) {
+        std::vector<std::uint8_t> ring(static_cast<std::size_t>(window) * format.entryBytes(), 0xEE);
+        std::vector<float> out(q.size());
+        for (std::size_t c = 0; c + 1 < cut.size(); ++c)
+        {
+            const int start = cut[c], rows = cut[c + 1] - cut[c];
+            std::vector<std::int32_t> pos(rows);
+            for (int r = 0; r < rows; ++r) pos[r] = start + r;
+            cpu_->sparseAttention({{rows, nullptr}, heads, format, window, ratio, 0, CompressedAccess::All,
+                                   1.0f / std::sqrt(512.0f), rope, pos.data(), &q[start * heads * 512], &kv[start * 512],
+                                   ring.data(), pool.data(), nullptr, sinks.data(), &out[start * heads * 512],
+                                   &tokens[start], ids}, nullptr);
+            cpu_->rawStore({{rows, nullptr}, format, window, pos.data(), &kv[start * 512], ring.data()}, nullptr);
+        }
+        return out;
+    };
+    DeviceBuffer<float> dQ(q.size()), dKV(kv.size()), dSinks(sinks.size()), dOut(q.size());
+    DeviceBuffer<std::uint8_t> dPool(pool.size()), dRing(static_cast<std::size_t>(window) * format.entryBytes());
+    DeviceBuffer<std::int32_t> dPos(seq), dTokens(seq);
+    upload(dQ, q);
+    upload(dKV, kv);
+    upload(dSinks, sinks);
+    upload(dPool, pool);
+    upload(dTokens, tokens);
+    const auto runGPU = [&](const std::vector<int> &cut) {
+        for (std::size_t c = 0; c + 1 < cut.size(); ++c)
+        {
+            const int start = cut[c], rows = cut[c + 1] - cut[c];
+            std::vector<std::int32_t> pos(rows);
+            for (int r = 0; r < rows; ++r) pos[r] = start + r;
+            upload(dPos, pos);
+            gpu_->sparseAttention({{rows, nullptr}, heads, format, window, ratio, 0, CompressedAccess::All,
+                                   1.0f / std::sqrt(512.0f), rope, dPos.data, dQ.data + start * heads * 512,
+                                   dKV.data + start * 512, dRing.data, dPool.data, nullptr, dSinks.data,
+                                   dOut.data + start * heads * 512, dTokens.data + start, ids}, stream_);
+            gpu_->rawStore({{rows, nullptr}, format, window, dPos.data, dKV.data + start * 512, dRing.data}, stream_);
+        }
+        return download(dOut);
+    };
+    const auto cpu = runCPU(cuts[0]);
+    const auto gpuWhole = runGPU(cuts[0]);
+    for (std::size_t i = 0; i < cpu.size(); ++i) ASSERT_NEAR(gpuWhole[i], cpu[i], 2e-5f * (1.0f + std::fabs(cpu[i])));
+    for (const auto &cut : cuts)
+    {
+        const auto gpu = runGPU(cut);
+        for (std::size_t i = 0; i < cpu.size(); ++i) ASSERT_EQ(gpu[i], gpuWhole[i]);
+        const auto chunkedCPU = runCPU(cut);
+        for (std::size_t i = 0; i < cpu.size(); ++i) ASSERT_EQ(chunkedCPU[i], cpu[i]);
+    }
+
+    // Merge: only sentinel rows with a nonzero map entry take their bank row.
+    const int width = 96, bankRows = 6, mapRows = 64;
+    auto bank = randomVector(static_cast<std::size_t>(bankRows) * width, 74);
+    std::vector<std::int32_t> map(mapRows, 0);
+    for (int p = 11; p <= 34; ++p) map[p] = 1 + (p % bankRows);
+    map[3] = 2; // text token at a mapped position keeps its embedding
+    std::vector<std::int32_t> pos(seq);
+    for (int r = 0; r < seq; ++r) pos[r] = r;
+    const auto embedding = randomVector(static_cast<std::size_t>(seq) * width, 75);
+    auto expected = embedding;
+    cpu_->imageMerge({{seq, nullptr}, width, bankRows, mapRows, ids, tokens.data(), pos.data(), bank.data(), map.data(),
+                      expected.data()}, nullptr);
+    DeviceBuffer<float> dBank(bank.size()), dEmb(embedding.size());
+    DeviceBuffer<std::int32_t> dMap(map.size()), dAll(seq);
+    upload(dBank, bank);
+    upload(dMap, map);
+    upload(dAll, pos);
+    upload(dEmb, embedding);
+    gpu_->imageMerge({{seq, nullptr}, width, bankRows, mapRows, ids, dTokens.data, dAll.data, dBank.data, dMap.data,
+                      dEmb.data}, stream_);
+    EXPECT_EQ(download(dEmb), expected);
+    EXPECT_NE(expected, embedding);
+}
+
 TEST_F(DeepSeekV4CUDAKernels, FrontierOnlyCacheOwnsNoConversionScratchAndAdvancesOnce)
 {
     using namespace llaminar2;

@@ -211,6 +211,18 @@ DeepSeekV4Config::DeepSeekV4Config(const GGUFModel &model)
         else if (!model.findTensor(p + "exp_probs_b.bias"))
             reject(p + "exp_probs_b.bias", "score-routed layer requires a selection bias");
     }
+    // Vision variants carry the image routing bias on every layer; a partial
+    // set is a malformed checkpoint rather than a text model.
+    int vl_layers = 0;
+    for (int il = 0; il < layers_; ++il)
+        if (const auto *t = model.findTensor("blk." + std::to_string(il) + ".exp_probs_b_vl.bias"))
+        {
+            requireTensor(model, t->name, {static_cast<uint64_t>(experts_)});
+            ++vl_layers;
+        }
+    if (vl_layers != 0 && vl_layers != layers_)
+        reject("exp_probs_b_vl.bias", "a vision checkpoint needs the image routing bias on every layer");
+    vision_capable_ = vl_layers == layers_;
 }
 
 int DeepSeekV4Config::countLayers(DeepSeekV4AttentionKind kind) const noexcept

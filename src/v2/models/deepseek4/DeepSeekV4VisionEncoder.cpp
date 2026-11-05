@@ -276,8 +276,11 @@ namespace llaminar2::deepseek4
             auto tensor = loader.loadTensor(name, DeviceId::cpu(), WeightPrecision::NATIVE);
             if (!tensor) throw std::invalid_argument("DeepSeek-V4 mmproj tensor " + name + " could not be read");
             VisionHostTensor host;
-            // Llaminar tensor shapes are outermost-first; the encoder uses ggml order (ne0 first).
-            host.shape.assign(tensor->shape().rbegin(), tensor->shape().rend());
+            // The encoder uses ggml order (ne0 first). The loader swaps only
+            // 2D GGUF dimensions into [rows, cols]; other ranks keep ggml order.
+            const auto &shape = tensor->shape();
+            if (shape.size() == 2) host.shape.assign(shape.rbegin(), shape.rend());
+            else host.shape.assign(shape.begin(), shape.end());
             host.data.resize(tensor->numel());
             tensor->to_fp32(host.data.data());
             tensors.emplace(name, std::move(host));

@@ -20,6 +20,7 @@
 #include "execution/moe/MoEOverlayHostServiceContract.h"
 #include "Qwen35MoEGraph.h"
 #include "../deepseek4/DeepSeekV4Config.h"
+#include "../deepseek4/DeepSeekV4ImagePreprocess.h"
 #include "execution/moe/MoEOverlayPreparedGraphBank.h"
 #include "execution/moe/MoEGraphOwnerProjection.h"
 #include "execution/moe/MoECPUExpertWorkspaceSource.h"
@@ -7374,13 +7375,27 @@ namespace llaminar2
                 const auto &dsv4 = *config_.deepseek_v4;
                 route_params.scoring_function = MoERouterScoringPolicy::Function::SqrtSoftplus;
                 route_params.scoring_route_scale = dsv4.routeScale();
+                const auto execution_token_ids = [&] {
+                    const auto &input = modelForwardInput();
+                    return device.is_gpu() ? static_cast<const int32_t *>(input.token_ids_device)
+                                           : reinterpret_cast<const int32_t *>(input.token_ids);
+                };
+                if (dsv4.visionCapable())
+                {
+                    // Image sentinels select with exp_probs_b_vl on every
+                    // layer (hash layers included); the sentinel ids are
+                    // inside the chunk's ordinary token row.
+                    route_params.scoring_image_bias = layer.deepseek_v4.router_bias_vl;
+                    route_params.scoring_image_sentinel_base = deepseek4::kImageSentinelBase;
+                    route_params.scoring_image_sentinel_count = deepseek4::kImageSentinelCount;
+                    route_params.scoring_token_ids = execution_token_ids();
+                    if (!route_params.scoring_image_bias || !route_params.scoring_token_ids)
+                        throw std::invalid_argument("DeepSeek-V4 vision routing requires exp_probs_b_vl and token ids");
+                }
                 if (dsv4.layer(layer_idx).hashRouted)
                 {
-                    const auto &input = modelForwardInput();
                     route_params.scoring_hash_table = layer.deepseek_v4.hash_table;
-                    route_params.scoring_token_ids = device.is_gpu()
-                        ? static_cast<const int32_t *>(input.token_ids_device)
-                        : reinterpret_cast<const int32_t *>(input.token_ids);
+                    route_params.scoring_token_ids = execution_token_ids();
                     if (!route_params.scoring_hash_table || !route_params.scoring_token_ids)
                         throw std::invalid_argument("DeepSeek-V4 hash routing requires its table and execution-device token ids");
                 }

@@ -430,7 +430,11 @@ public:
                 decodeKVEntry(a.format, entry, decoded);
                 attend(decoded);
             };
-            for (int p = std::max(0, pos - a.window + 1); p <= pos; ++p)
+            // Image spans widen the raw window to the whole span (both
+            // directions); span keys are in this chunk (spans never straddle).
+            const auto span = imageSpanExtent(a.tokens, rows, r, a.imageIds);
+            const int first = std::max(0, pos - std::max(a.window - 1, span.left));
+            for (int p = first; p <= pos + span.right; ++p)
             {
                 if (p >= start) attend(a.chunkKV + static_cast<std::size_t>(p - start) * dim);
                 else attendPacked(a.rawRing + static_cast<std::size_t>(p % a.window) * entryBytes);
@@ -448,6 +452,23 @@ public:
             }
             for (int c = 0; c < dim; ++c) out[c] /= l;
             rotateTail(out, dim, a.rope, pos, true);
+        });
+    }
+
+    void imageMerge(const ImageMergeArgs &a, void *) const override
+    {
+        require(a.tokens && a.positions && a.bank && a.map && a.embedding && a.width > 0 && a.bankRows > 0 &&
+                    a.mapRows > 0, "imageMerge requires operands");
+        const int rows = liveRows(a.extent);
+        forTasks(rows, [&](int r) {
+            if (!a.imageIds.contains(a.tokens[r])) return;
+            const int pos = a.positions[r];
+            require(pos >= 0 && pos < a.mapRows, "image sentinel position outside the admitted map");
+            const int v = a.map[pos];
+            if (v <= 0) return;
+            require(v <= a.bankRows, "image map names a row outside the admitted bank");
+            std::copy_n(a.bank + static_cast<std::size_t>(v - 1) * a.width, a.width,
+                        a.embedding + static_cast<std::size_t>(r) * a.width);
         });
     }
 

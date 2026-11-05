@@ -21122,7 +21122,8 @@ namespace
         float *__restrict__ logits, int seq_len, int num_experts, int top_k,
         const float *__restrict__ bias, const int32_t *__restrict__ hash_table, int hash_vocab,
         const int32_t *__restrict__ token_ids, const int *__restrict__ effective_seq_len,
-        llaminar2::DeviceRowPartition partition = {})
+        llaminar2::DeviceRowPartition partition = {}, const float *__restrict__ image_bias = nullptr,
+        int32_t image_base = 0, int32_t image_count = 0)
     {
         // Partitioned (owned-row) routing keeps compact local logit rows while
         // hash routing reads the token at the row's original coordinate.
@@ -21149,15 +21150,24 @@ namespace
         __shared__ float best_value[kThreads];
         __shared__ int best_index[kThreads];
         float *row_logits = logits + static_cast<size_t>(row) * num_experts;
+        // DeepSeek-V4 vision: image sentinels select by s + exp_probs_b_vl on every layer.
+        bool image_row = false;
+        if (image_bias && token_ids)
+        {
+            const int32_t token = token_ids[token_row];
+            image_row = token >= image_base && token < image_base + image_count;
+        }
+        const bool hashed = hash_table && !image_row;
+        const float *select_bias = image_row ? image_bias : bias;
         for (int e = threadIdx.x; e < num_experts; e += blockDim.x)
         {
             const float x = row_logits[e];
             const float s = sqrtf(x > 20.0f ? x : log1pf(expf(x)));
             scores[e] = s;
-            keys[e] = hash_table ? 0.0f : s + bias[e];
+            keys[e] = hashed ? 0.0f : s + select_bias[e];
         }
         __syncthreads();
-        if (hash_table)
+        if (hashed)
         {
             if (threadIdx.x == 0)
             {
@@ -21257,14 +21267,17 @@ extern "C"
     bool cudaMoE_scored_router_logit_transform(
         float *logits, int seq_len, int num_experts, int top_k,
         const float *bias, const int32_t *hash_table, int hash_vocab, const int32_t *token_ids,
-        const int *effective_seq_len, int device_idx, void *stream)
+        const int *effective_seq_len, int device_idx, void *stream,
+        const float *image_bias, int32_t image_base, int32_t image_count)
     {
         if (!logits || !stream || seq_len <= 0 || num_experts <= 0 || num_experts > kMaxExperts ||
-            top_k <= 0 || top_k > kMaxTopK || top_k > num_experts || (hash_table ? !token_ids : !bias))
+            top_k <= 0 || top_k > kMaxTopK || top_k > num_experts || (hash_table ? !token_ids : !bias) ||
+            (image_bias && !token_ids))
             return false;
         cudaSetDevice(device_idx);
         scored_router_logit_transform_kernel<<<seq_len, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
-            logits, seq_len, num_experts, top_k, bias, hash_table, hash_vocab, token_ids, effective_seq_len);
+            logits, seq_len, num_experts, top_k, bias, hash_table, hash_vocab, token_ids, effective_seq_len,
+            {}, image_bias, image_base, image_count);
         return finishLaunch("cudaMoE_scored_router_logit_transform");
     }
 
@@ -25780,7 +25793,8 @@ namespace llaminar2::cuda
         {
             scored_router_logit_transform_kernel<true><<<rows, kThreads, 0, native_stream>>>(
                 launch.logits, launch.capacity, launch.experts, launch.top_k, scored.bias,
-                scored.hash_table, scored.hash_vocab, scored.token_ids, launch.live_rows, launch.partition);
+                scored.hash_table, scored.hash_vocab, scored.token_ids, launch.live_rows, launch.partition,
+                scored.image_bias, scored.image_sentinel_base, scored.image_sentinel_count);
             if (!finishLaunch("cudaMoE_owned_scored_transform")) return false;
         }
         softmax_topk_kernel<true><<<std::max(1, rows), kThreads, 0, native_stream>>>(

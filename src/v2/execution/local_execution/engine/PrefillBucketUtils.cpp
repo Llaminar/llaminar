@@ -8,6 +8,7 @@
  * available.
  */
 
+#include <string>
 #include "PrefillBucketUtils.h"
 
 #include "utils/PrefillGraphBucketDefaults.h"
@@ -370,7 +371,24 @@ namespace llaminar2
         while (local_offset < policy.real_token_count)
         {
             const int remaining = policy.real_token_count - local_offset;
-            const int real_count = std::min(remaining, chunk_target);
+            int real_count = std::min(remaining, chunk_target);
+            // A chunk may not end inside an atomic span (e.g. a bidirectional
+            // image block): end before it instead, so the next chunk holds it.
+            const int chunk_begin = policy.real_token_start + local_offset;
+            for (const auto &[span_begin, span_end] : policy.atomic_spans)
+            {
+                const int chunk_end = chunk_begin + real_count;
+                if (span_begin >= chunk_end || span_end <= chunk_end) continue;
+                if (span_begin <= chunk_begin)
+                {
+                    schedule.error = "atomic prefill span [" + std::to_string(span_begin) + ", " +
+                                     std::to_string(span_end) + ") exceeds the largest prefill chunk of " +
+                                     std::to_string(chunk_target) + " rows";
+                    schedule.chunks.clear();
+                    return schedule;
+                }
+                real_count = span_begin - chunk_begin;
+            }
             /*
              * An explicit chunk interval is also a fixed physical graph
              * contract.  In particular, its final short tail must replay the

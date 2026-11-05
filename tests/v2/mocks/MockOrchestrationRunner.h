@@ -87,6 +87,7 @@ namespace llaminar2::test
 
         // Inference
         MOCK_METHOD(bool, prefill, (const std::vector<int32_t> &tokens), (override));
+        MOCK_METHOD(bool, setNextPromptEmbeddingRows, (std::shared_ptr<const PromptEmbeddingRows> rows), (override));
         MOCK_METHOD(bool, supportsPrefillBatch, (int request_batch), (const, override));
         MOCK_METHOD(bool, prefillBatch,
                     (const std::vector<std::vector<int32_t>> &token_batches), (override));

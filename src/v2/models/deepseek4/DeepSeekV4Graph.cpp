@@ -26,6 +26,7 @@
  */
 #include "DeepSeekV4Graph.h"
 #include "DeepSeekV4Config.h"
+#include "DeepSeekV4ImagePreprocess.h"
 #include "../../execution/compute_stages/stages/deepseek4/DeepSeekV4PrimitiveStage.h"
 #include "../../execution/compute_stages/ComputeStageFactory.h"
 #include "../../execution/local_execution/graph/GraphResolver.h"
@@ -37,6 +38,7 @@
 #include "../../tensors/Tensors.h"
 
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 
 namespace llaminar2
@@ -86,14 +88,26 @@ void DeepSeekV4Graph::initializeCacheAuxiliaryState(IKVCache &cache, void *publi
         cache.first_layer_index() != config_.pp_layer_offset || cache.auxiliaryState())
         throw std::invalid_argument("DeepSeek-V4 requires its frontier-only cache of model_state layers");
     const DeviceId device = config_.default_device;
+    const auto bank = promptEmbeddingBank();
     if (!device.is_gpu())
     {
         if (publicationStream)
             throw std::invalid_argument("DeepSeek-V4 CPU state banks have no GPU publication stream");
+        // Host-owned vision map: every position keeps its token embedding
+        // until a request admits image rows.
+        if (bank)
+            std::memset(bank->map->raw_mutable_data(), 0, bank->map->size_bytes());
         return;
     }
     (void)ExplicitGPUStream(publicationStream);
     const auto kernels = llaminar::v2::kernels::KernelFactory::createDeepSeekV4(device);
+    if (bank)
+        for (TensorBase *root : {bank->rows, bank->map})
+        {
+            TransferEngine::allocateDeviceStorage(root, device);
+            kernels->zeroBank(root->gpu_data_ptr(), root->size_bytes(), publicationStream);
+            TransferEngine::publishDeviceWrite(root, device, publicationStream);
+        }
     for (const BufferId role : {BufferId::DSV4_RAW_RING, BufferId::DSV4_COMP_RING_KV, BufferId::DSV4_COMP_RING_SCORE,
                                 BufferId::DSV4_IDX_RING_KV, BufferId::DSV4_IDX_RING_SCORE})
     {
@@ -104,6 +118,33 @@ void DeepSeekV4Graph::initializeCacheAuxiliaryState(IKVCache &cache, void *publi
         kernels->zeroBank(bank->gpu_data_ptr(), bank->size_bytes(), publicationStream);
         TransferEngine::publishDeviceWrite(bank, device, publicationStream);
     }
+}
+
+std::optional<IGraphBuilder::PromptEmbeddingBank> DeepSeekV4Graph::promptEmbeddingBank() const
+{
+    if (!config_.deepseek_v4->visionCapable()) return std::nullopt;
+    auto *rows = buffers_.layer_buffers.get(BufferId::DSV4_IMAGE_BANK);
+    auto *map = buffers_.layer_buffers.get(BufferId::DSV4_IMAGE_ROW_MAP);
+    if (!rows || !map)
+        throw std::invalid_argument("DeepSeek-V4 vision checkpoint is missing its admitted image bank or row map");
+    return PromptEmbeddingBank{rows, map, config_.d_model};
+}
+
+deepseek4::ImageSentinelIds DeepSeekV4Graph::imageSentinelIds() const
+{
+    if (!config_.deepseek_v4->visionCapable()) return {};
+    return {deepseek4::kImageSentinelBase, deepseek4::kImageSentinelCount};
+}
+
+std::optional<Qwen4ExpIntInput> DeepSeekV4Graph::imageTokens(int rows, DeviceId device) const
+{
+    if (!config_.deepseek_v4->visionCapable()) return std::nullopt;
+    const auto &input = modelForwardInput();
+    const auto *tokens = device.is_gpu() ? static_cast<const std::int32_t *>(input.token_ids_device)
+                                         : reinterpret_cast<const std::int32_t *>(input.token_ids);
+    if (!tokens)
+        throw std::invalid_argument("DeepSeek-V4 vision attention requires execution-device token ids");
+    return Qwen4ExpIntInput(Qwen4ExpNativeIntInput{device, tokens, static_cast<std::size_t>(rows)});
 }
 
 DeepSeekV4StateLayout DeepSeekV4Graph::stateLayout() const
@@ -301,7 +342,8 @@ ComputeGraph DeepSeekV4Graph::buildAttentionGraph(
         .device_id = device, .mpi_ctx = mpi_ctx_.get(), .rows = stage_rows,
         .operation = Stage::SparseAttention{m.heads(), layout.kv, m.window(), policy.ratio, m.indexerTopK(), pool_rows,
             access, 1.0f / std::sqrt(static_cast<float>(hd)), policy.rope, positions, f32(BufferId::DSV4_Q),
-            f32(BufferId::K_PROJ), raw_ring, pool, selected, gain(w.sinks, "attn_sinks"), f32(BufferId::DSV4_ATTN)}}),
+            f32(BufferId::K_PROJ), raw_ring, pool, selected, gain(w.sinks, "attn_sinks"), f32(BufferId::DSV4_ATTN),
+            imageTokens(rows, device), imageSentinelIds()}}),
         device);
     for (const auto &dependency : attention_dependencies) graph.addDependency(prefix + "attention", dependency);
     // The window ring is overwritten only after attention read the previous window.

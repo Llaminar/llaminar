@@ -831,6 +831,43 @@ TEST(Test__PrefillGraphCache, DeviceResidentBucketEntryRequiresPreviousForwardCo
                     }
 }
 
+/** @test A chunk never ends inside an atomic span (image block); it ends before it instead. */
+TEST(Test__PrefillGraphCache, ChunkScheduleKeepsAtomicSpansWhole)
+{
+    auto policy = PrefillChunkSchedulerPolicy::forRetainedBucketFamily({64, 128, 256}, 0, 700);
+    policy.atomic_spans = {{200, 300}, {500, 520}, {520, 640}};
+    const auto schedule = planPrefillChunkSchedule(policy);
+    ASSERT_TRUE(schedule) << schedule.error;
+    int next = 0;
+    for (const auto &chunk : schedule.chunks)
+    {
+        EXPECT_EQ(chunk.token_offset, next);
+        const int end = chunk.token_offset + chunk.real_count;
+        for (const auto &[begin, span_end] : policy.atomic_spans)
+            EXPECT_FALSE(begin < end && end < span_end) << "chunk ends at " << end << " inside a span";
+        EXPECT_GE(chunk.bucket_seq_len, chunk.real_count);
+        next = end;
+    }
+    EXPECT_EQ(next, 700);
+    ASSERT_GE(schedule.chunks.size(), 2u);
+    EXPECT_EQ(schedule.chunks[0].real_count, 200) << "the first chunk stops before [200, 300)";
+    EXPECT_EQ(schedule.chunks[0].bucket_seq_len, 256);
+
+    // A span longer than the largest chunk cannot be scheduled.
+    policy.atomic_spans = {{10, 300}};
+    const auto rejected = planPrefillChunkSchedule(policy);
+    EXPECT_FALSE(rejected);
+    EXPECT_NE(rejected.error.find("atomic prefill span"), std::string::npos);
+
+    // Spans only constrain boundaries: one chunk holding everything is unchanged.
+    auto single = PrefillChunkSchedulerPolicy::forRetainedBucketFamily({64, 128, 256}, 0, 100);
+    single.atomic_spans = {{10, 90}};
+    const auto whole = planPrefillChunkSchedule(single);
+    ASSERT_TRUE(whole);
+    ASSERT_EQ(whole.chunks.size(), 1u);
+    EXPECT_EQ(whole.chunks[0].real_count, 100);
+}
+
 /** @test Production family selection never expands an exact admitted tail. */
 TEST(Test__PrefillGraphCache, RetainedBucketFamilyPreservesEconomicalRemainders)
 {

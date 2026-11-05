@@ -24,6 +24,7 @@
  * next request without re-tokenizing content or probing mutable execution state.
  */
 
+#include "multimodal/ImageIO.h"
 #include "app/modes/ChatCompletionHandler.h"
 #include "app/modes/MoEMovementLedgerJson.h"
 #include "app/modes/PrefixMovementJson.h"
@@ -462,6 +463,18 @@ namespace llaminar2
          * clause supplies the required/specific choice semantics without
          * teaching the HTTP loop about any model-native output grammar.
          */
+        /** @return The URL of an OpenAI image_url part (object or bare-string form). */
+        template <class Json>
+        std::optional<std::string> imagePartUrl(const Json &part)
+        {
+            if (!part.contains("image_url")) return std::nullopt;
+            const auto &value = part["image_url"];
+            if (value.is_string()) return value.template get<std::string>();
+            if (value.is_object() && value.contains("url") && value["url"].is_string())
+                return value["url"].template get<std::string>();
+            return std::nullopt;
+        }
+
         std::vector<ChatMessage> toolPolicyMessages(
             const ChatCompletionRequest &request)
         {
@@ -640,10 +653,28 @@ namespace llaminar2
 
     ChatCompletionHandler::ChatCompletionHandler(
         IOrchestrationRunner &runner, ITokenizer &tokenizer,
-        const std::string &model_name)
+        const std::string &model_name,
+        std::shared_ptr<const multimodal::IPromptImageEncoder> image_encoder)
         : runtime_stats_(runner.prefixCacheTelemetrySources()),
-          runner_(runner), tokenizer_(tokenizer), model_name_(model_name)
+          runner_(runner), tokenizer_(tokenizer), model_name_(model_name),
+          image_encoder_(std::move(image_encoder))
     {
+    }
+
+    ChatCompletionRequest ChatCompletionHandler::withImagePlaceholders(const ChatCompletionRequest &request,
+                                                                       const std::string &placeholder)
+    {
+        ChatCompletionRequest rendered = request;
+        for (const auto &part : request.image_parts)
+        {
+            auto &message = rendered.messages.at(part.message);
+            message.content_parts.at(part.part) = placeholder;
+            // Templates read the "\n"-joined string; native encoders the parts.
+            message.content.clear();
+            for (std::size_t p = 0; p < message.content_parts.size(); ++p)
+                message.content += (p ? "\n" : "") + message.content_parts[p];
+        }
+        return rendered;
     }
 
     ChatCompletionResponse ChatCompletionHandler::handleUnhandledRequestException(
@@ -755,9 +786,10 @@ namespace llaminar2
                         {"type", "invalid_request_error"}}}});
                     return std::nullopt;
                 }
-            // Content is a string, null, or an array of OpenAI text parts.
-            // No Llaminar model has a vision tower yet: an image is rejected
-            // here rather than silently dropped from the prompt.
+            // Content is a string, null, or an array of OpenAI text parts and
+            // (user messages only) image_url parts carrying a data: URL. Whether
+            // the served model accepts images is decided at setup; nothing is
+            // silently dropped from the prompt.
             if (msg.contains("content") && !msg["content"].is_null() && !msg["content"].is_string())
             {
                 bool valid = msg["content"].is_array();
@@ -767,10 +799,24 @@ namespace llaminar2
                     {
                         const std::string type = part.is_object() && part.contains("type") &&
                                 part["type"].is_string() ? part["type"].get<std::string>() : "";
-                        if (type == "image_url" || type == "image" || type == "input_image")
+                        if (type == "image_url")
+                        {
+                            const auto url = imagePartUrl(part);
+                            if (role != "user")
+                                problem = "image content parts are only supported in user messages";
+                            else if (!url)
+                                problem = "image_url parts need an image_url.url string";
+                            else if (url->rfind("data:", 0) != 0)
+                                problem = "only data: image URLs are supported (remote URLs are not fetched)";
+                            else
+                                continue;
+                            valid = false;
+                            break;
+                        }
+                        if (type == "image" || type == "input_image")
                         {
                             valid = false;
-                            problem = "image content parts are not supported by this server";
+                            problem = "image parts must use the OpenAI image_url form";
                             break;
                         }
                         if (type != "text" || !part.contains("text") || !part["text"].is_string())
@@ -1175,7 +1221,17 @@ namespace llaminar2
             else if (msg.contains("content") && msg["content"].is_array())
             {
                 for (const auto &part : msg["content"])
+                {
+                    if (part["type"].get<std::string>() == "image_url")
+                    {
+                        // Rendered as the model's placeholder at setup.
+                        request.image_parts.push_back({request.messages.size(), cm.content_parts.size(),
+                                                       *imagePartUrl(part)});
+                        cm.content_parts.emplace_back();
+                        continue;
+                    }
                     cm.content_parts.push_back(part["text"].get<std::string>());
+                }
                 for (std::size_t i = 0; i < cm.content_parts.size(); ++i)
                     cm.content += (i ? "\n" : "") + cm.content_parts[i];
                 if (cm.role == "tool")
@@ -1305,8 +1361,39 @@ namespace llaminar2
          */
         runner_.setStopTokens(tokenizer_.stop_tokens());
 
+        // Images: render each as the model's placeholder part, decode its
+        // data: URL, and expand the placeholder tokens after encoding.
+        std::vector<std::vector<std::uint8_t>> images;
+        std::optional<ChatCompletionRequest> rendered_request;
+        if (!request.image_parts.empty())
+        {
+            const auto reject = [&](const std::string &message) {
+                error_out.http_status = 400;
+                error_out.json_body = dumpJsonForHttp({{"error", {
+                    {"message", message}, {"type", "invalid_request_error"}, {"param", "messages"}}}});
+                return -1;
+            };
+            if (!image_encoder_)
+                return reject("this server has no vision projector; start it with --mmproj to accept images");
+            if (static_cast<int>(request.image_parts.size()) > image_encoder_->maxImagesPerRequest())
+                return reject("a request may carry at most " +
+                              std::to_string(image_encoder_->maxImagesPerRequest()) + " images");
+            for (std::size_t i = 0; i < request.image_parts.size(); ++i)
+            {
+                try
+                {
+                    images.push_back(multimodal::decodeDataUrl(request.image_parts[i].url));
+                }
+                catch (const std::exception &error)
+                {
+                    return reject("image " + std::to_string(i) + ": " + error.what());
+                }
+            }
+            rendered_request = withImagePlaceholders(request, image_encoder_->placeholderText());
+        }
+
         // Encode with chat template (pass tools for tool-aware templates)
-        const auto prompt_messages = toolPolicyMessages(request);
+        const auto prompt_messages = toolPolicyMessages(rendered_request ? *rendered_request : request);
         ChatEncodingOptions encoding;
         encoding.add_generation_prompt = true;
         encoding.enable_thinking = thinkingEnabled(request);
@@ -1337,6 +1424,32 @@ namespace llaminar2
             json err = {{"error", {{"message", "Failed to encode conversation with chat template"}, {"type", "server_error"}}}};
             error_out.json_body = dumpJsonForHttp(err);
             return -1;
+        }
+
+        if (!images.empty())
+        {
+            multimodal::ExpandedPrompt expanded;
+            try
+            {
+                expanded = image_encoder_->expand(
+                    std::vector<std::int32_t>(token_ids.begin(), token_ids.end()), images);
+            }
+            catch (const std::invalid_argument &error)
+            {
+                error_out.http_status = 400;
+                error_out.json_body = dumpJsonForHttp({{"error", {
+                    {"message", std::string("Cannot admit images: ") + error.what()},
+                    {"type", "invalid_request_error"}, {"param", "messages"}}}});
+                return -1;
+            }
+            token_ids.assign(expanded.tokens.begin(), expanded.tokens.end());
+            if (!runner_.setNextPromptEmbeddingRows(std::move(expanded.rows)))
+            {
+                error_out.http_status = 500;
+                error_out.json_body = dumpJsonForHttp({{"error", {
+                    {"message", "Runner rejected image input: " + runner_.lastError()}, {"type", "server_error"}}}});
+                return -1;
+            }
         }
 
         int prompt_tokens = static_cast<int>(token_ids.size());

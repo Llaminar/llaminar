@@ -372,6 +372,8 @@ namespace llaminar2
         std::string model_path; ///< Path to GGUF model file
         /** Explicit optional shared predictor artifact; main metadata and globals remain authoritative. */
         std::optional<SharedPredictorGGUFSource> shared_predictor;
+        /** Optional vision projector GGUF (llama.cpp mmproj); enables image input for vision checkpoints. */
+        std::string mmproj_path;
         int max_seq_len = 4096; ///< Maximum sequence length
         /**
          * Explicit captured-prefill cap, distinct from KV context capacity.
@@ -409,6 +411,7 @@ namespace llaminar2
         bool single_shot_chat = false;      ///< Single prompt with chat template
         std::string system_prompt;          ///< System message
         std::string chat_template_override; ///< Template override
+        std::vector<std::string> image_paths; ///< Single-shot chat: image files placed before the prompt (needs --mmproj)
 
         // =========================================================================
         // Benchmark Configuration

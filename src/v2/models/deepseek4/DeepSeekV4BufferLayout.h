@@ -52,6 +52,7 @@ struct DeepSeekV4MemoryGeometry
     uint32_t layers = 0, hidden = 0, hc = 0, heads = 0, head_dim = 0, q_rank = 0, o_groups = 0, o_rank = 0;
     uint32_t window = 0, index_heads = 0, index_head_dim = 0, index_topk = 0, experts = 0, experts_used = 0;
     uint32_t csa_layers = 0, hca_layers = 0, rope_dim = 0;
+    uint32_t image_bank_rows = 0; ///< Vision checkpoints: sentinel + IMAGE bank rows (0 for text-only).
     /** @brief Project an authenticated config. */
     static DeepSeekV4MemoryGeometry fromConfig(const DeepSeekV4Config &model);
     /** @brief Packed attention record of the raw ring and compressed pools. */

@@ -281,6 +281,78 @@ struct IndexerTopKArgs
     std::int32_t *selected = nullptr;        ///< [rows, topK] selected block ids or -1.
 };
 
+/**
+ * @brief Vision sentinel ids of DeepSeek-V4-Flash-Vision-Exp image blocks.
+ * @details In-vocab ids ``base + type`` with types START 0, PAD 1, IMAGE 2,
+ * NEWLINE 3, END 4 (vLLM's spelling of the official out-of-vocab scheme).
+ */
+struct ImageSentinelIds
+{
+    std::int32_t base = 0;  ///< First sentinel id; @c count 0 disables vision handling.
+    std::int32_t count = 0; ///< 5 for DeepSeek-V4 vision.
+    DSV4_HD bool contains(std::int32_t token) const noexcept { return count > 0 && token >= base && token < base + count; }
+    DSV4_HD bool isStart(std::int32_t token) const noexcept { return count > 0 && token == base; }
+    DSV4_HD bool isEnd(std::int32_t token) const noexcept { return count > 0 && token == base + count - 1; }
+};
+
+/** @brief Raw-key extents of a row inside an image span (``get_image_visible``). */
+struct ImageSpanExtent
+{
+    int left = 0;  ///< Keys back to the span START (0 outside spans).
+    int right = 0; ///< Keys forward to the span END (0 outside spans).
+};
+
+/**
+ * @brief ``get_image_visible`` for row @p r of a chunk whose spans are complete.
+ * @details A row is inside a span when it lies on a contiguous sentinel run that
+ * reaches a START at or before it and an END at or after it, crossing no other
+ * END/START. IMAGE_PAD sentinels before a START (compressor alignment) are
+ * outside. The scheduler never splits a span across chunks.
+ */
+DSV4_HD ImageSpanExtent imageSpanExtent(const std::int32_t *tokens, int rows, int r, ImageSentinelIds ids)
+{
+    ImageSpanExtent e;
+    if (!tokens || !ids.contains(tokens[r])) return e;
+    int start = -1;
+    for (int k = r; k >= 0 && ids.contains(tokens[k]); --k)
+    {
+        if (ids.isStart(tokens[k])) { start = k; break; }
+        if (k < r && ids.isEnd(tokens[k])) break;
+    }
+    if (start < 0) return e;
+    int end = -1;
+    for (int k = r; k < rows && ids.contains(tokens[k]); ++k)
+    {
+        if (ids.isEnd(tokens[k])) { end = k; break; }
+        if (k > r && ids.isStart(tokens[k])) break;
+    }
+    if (end < 0) return e;
+    e.left = r - start;
+    e.right = end - r;
+    return e;
+}
+
+/**
+ * @brief Overwrite image-sentinel embedding rows from the request image bank.
+ * @details Row r with a sentinel token and ``map[positions[r]] = v > 0`` takes
+ * ``bank[v - 1]`` (the learned START/PAD/NEWLINE/END vector or an encoded
+ * IMAGE row); every other row keeps its token embedding. ``map`` is zero
+ * outside the admitted request's image blocks.
+ */
+struct ImageMergeArgs
+{
+    RowExtent extent;                        ///< Live token rows.
+    int width = 0;                           ///< d_model.
+    int bankRows = 0;                        ///< Admitted bank rows.
+    int mapRows = 0;                         ///< Admitted map rows (context).
+    ImageSentinelIds imageIds;
+    const std::int32_t *tokens = nullptr;    ///< [rows] token ids.
+    const std::int32_t *positions = nullptr; ///< [rows] absolute positions.
+    const float *bank = nullptr;             ///< [bankRows, width].
+    const std::int32_t *map = nullptr;       ///< [mapRows] bank row + 1, 0 = token embedding.
+    float *embedding = nullptr;              ///< [rows, width], updated in place.
+};
+
 /** @brief Which compressed entries a query attends to. */
 enum class CompressedAccess : std::uint8_t
 {
@@ -316,6 +388,13 @@ struct SparseAttentionArgs
     const std::int32_t *selected = nullptr;  ///< [rows, topK] for Selected.
     const float *sinks = nullptr;            ///< [heads] attention sink logits.
     float *output = nullptr;                 ///< [rows, heads, headDim] de-rotated output.
+    /**
+     * Vision: chunk token ids and sentinel ids. Rows inside an image span see
+     * raw keys [pos - max(window - 1, left), pos + right] (the whole span,
+     * both directions); null tokens keep the causal window.
+     */
+    const std::int32_t *tokens = nullptr;
+    ImageSentinelIds imageIds;
 };
 
 /** @brief Storage format of a grouped projection weight. */
@@ -397,6 +476,8 @@ public:
     virtual void groupedProjection(const GroupedProjectionArgs &args, void *stream) const = 0;
     /** @brief sqrt(softplus) score or hash MoE routing. */
     virtual void route(const SqrtSoftplusRouteArgs &args, void *stream) const = 0;
+    /** @brief Overwrite image-sentinel embedding rows from the request image bank. */
+    virtual void imageMerge(const ImageMergeArgs &args, void *stream) const = 0;
     /**
      * @brief Zero a persistent state bank once at setup, before any capture.
      * @param destination Execution-device bytes (4-byte aligned).
