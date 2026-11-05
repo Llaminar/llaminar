@@ -717,7 +717,10 @@ namespace
         for (size_t index = 0; index < raw.size() / kBlock; ++index)
         {
             uint8_t *block = raw.data() + index * kBlock;
-            block[0] = static_cast<uint8_t>(mxfp4::kMinExactFP16Exponent + index % 40);
+            // Every native exponent [2, 252], including the extended range
+            // that the former FP16 plane could not represent.
+            block[0] = static_cast<uint8_t>(mxfp4::kMinNormalFP32Exponent +
+                index % (mxfp4::kMaxNativeE8M0Exponent - mxfp4::kMinNormalFP32Exponent + 1));
             for (int byte = 0; byte < 16; ++byte)
                 block[1 + byte] = static_cast<uint8_t>((index * 16 + byte) * 29u + 3u);
             if (index % 13 == 6 || index % 13 == 11)
@@ -765,38 +768,43 @@ namespace
         auto slot = orch.getPool(0)->getSlot(job.name);
         ASSERT_TRUE(slot.has_value());
         const size_t count = static_cast<size_t>(N) * blocks_per_row;
+        // The pool holds exactly one E8M0 byte per block (17 B/32 with payload).
+        ASSERT_EQ(slot->scales_bytes, count);
         std::vector<uint8_t> payload(count * 16);
-        std::vector<uint16_t> scales(count);
+        std::vector<uint8_t> scales(count);
         ASSERT_TRUE(backend->deviceToHost(payload.data(), slot->d_native_vnni_payload,
                                           payload.size(), 0, verification_stream.get()));
         ASSERT_TRUE(backend->deviceToHost(scales.data(), slot->d_native_vnni_scales,
-                                          scales.size() * sizeof(uint16_t), 0,
-                                          verification_stream.get()));
-        size_t zero_blocks = 0;
+                                          scales.size(), 0, verification_stream.get()));
+        size_t zero_blocks = 0, extended = 0;
         for (int n = 0; n < N; ++n)
             for (int b = 0; b < blocks_per_row; ++b)
             {
                 const uint8_t *source = host.data() + (static_cast<size_t>(n) * blocks_per_row + b) * kBlock;
                 const size_t linear = static_cast<size_t>(b) * N + n;
-                zero_blocks += mxfp4::exponentFitsFP16(source[0]) ? 0u : 1u;
-                EXPECT_EQ(scales[linear], mxfp4::preparedScaleFP16Bits(source[0])) << n << ',' << b;
+                zero_blocks += mxfp4::exponentFitsNativeE8M0(source[0]) ? 0u : 1u;
+                extended += mxfp4::exponentFitsNativeE8M0(source[0]) && !mxfp4::exponentFitsFP16(source[0]) ? 1u : 0u;
+                EXPECT_EQ(scales[linear], mxfp4::preparedNativeE8M0Byte(source[0])) << n << ',' << b;
                 EXPECT_EQ(std::memcmp(payload.data() + linear * 16, source + 1, 16), 0) << n << ',' << b;
             }
         EXPECT_GT(zero_blocks, 0u);
+        EXPECT_GT(extended, 0u) << "fixture must cover exponents outside the former FP16 window";
         orch.release();
     }
 
     /**
-     * @brief A nonzero block without an exact FP16 scale fails the load on the reader thread.
+     * @brief A nonzero block outside the native E8M0 range fails the load on the reader thread.
+     * @param exponent Rejected exponent: 0/1 (FP32 subnormal), 253/254 (weights overflow), 255 (NaN).
      */
-    void expectMXFP4InexactNonzeroBlockFailsLoad(IBackend *backend, const RepackKernels &kernels)
+    void expectMXFP4UnadmittedNonzeroBlockFailsLoad(IBackend *backend, const RepackKernels &kernels, uint8_t exponent)
     {
         backend->setDevice(0);
+        SCOPED_TRACE(static_cast<int>(exponent));
         constexpr int N = 64, K = 64, blocks_per_row = K / 32;
         auto host = mxfp4PipelineSource(N, blocks_per_row);
-        host[5 * mxfp4::kSourceBlockBytes] = 90; // block 5 keeps nonzero codes
-        ASSERT_FALSE(mxfp4::blockFitsFP16(host[5 * mxfp4::kSourceBlockBytes],
-                                          host.data() + 5 * mxfp4::kSourceBlockBytes + 1));
+        host[5 * mxfp4::kSourceBlockBytes] = exponent; // block 5 keeps nonzero codes
+        ASSERT_FALSE(mxfp4::blockFitsNativeE8M0(host[5 * mxfp4::kSourceBlockBytes],
+                                                host.data() + 5 * mxfp4::kSourceBlockBytes + 1));
         WeightVRAMPool pool;
         pool.planWeight("mxfp4_inexact", N, K, 16, false, false, NativeVnniScalePlaneWidth::E8M0Byte, host.size());
         ASSERT_TRUE(pool.allocate(backend, 0, 1));
@@ -827,7 +835,8 @@ TEST(Test__DeviceLoadPipelineMXFP4, ROCmRowChunkedSourceIsExactAndInexactScalesF
     expectMXFP4RowChunkedPipelineIsExact(backend, DeviceId::rocm(0));
     RepackKernels kernels{};
     kernels.vnniRepack = launchVnniRepack;
-    expectMXFP4InexactNonzeroBlockFailsLoad(backend, kernels);
+    for (const uint8_t exponent : {0, 1, 253, 254, 255})
+        expectMXFP4UnadmittedNonzeroBlockFailsLoad(backend, kernels, exponent);
 #else
     GTEST_SKIP() << "HAVE_ROCM not defined";
 #endif
@@ -842,7 +851,8 @@ TEST(Test__DeviceLoadPipelineMXFP4, CUDARowChunkedSourceIsExactAndInexactScalesF
     expectMXFP4RowChunkedPipelineIsExact(backend, DeviceId::cuda(0));
     RepackKernels kernels{};
     kernels.vnniRepack = launchVnniRepackCUDA;
-    expectMXFP4InexactNonzeroBlockFailsLoad(backend, kernels);
+    for (const uint8_t exponent : {0, 1, 253, 254, 255})
+        expectMXFP4UnadmittedNonzeroBlockFailsLoad(backend, kernels, exponent);
 #else
     GTEST_SKIP() << "HAVE_CUDA not defined";
 #endif
