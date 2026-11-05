@@ -1494,6 +1494,12 @@ namespace llaminar2
         }
 
     private:
+        /** @brief Clear invocation-owned engine indexes before releasing their exact RCU reader.
+         * @note Packet-published tables clear on normal return and exceptions. Explicit complete-bank
+         * construction retains its original source-bound table contract. No allocation or publication.
+         */
+        void releaseCPUJointInvocation() noexcept;
+
         /**
          * @brief Query the already-selected weight-descriptor authority.
          * @return True only for request-pinned runtime placement descriptors.

@@ -2768,7 +2768,19 @@ namespace
             return out_handle->valid();
         }
 
-        int vocab_size() const override { return VOCAB_SIZE; }
+        /** @brief Exact exception origin injected after real command admission. */
+        enum class DecodeVocabularyFailure { None, Standard, NonStandard };
+        /** @brief Inject a terminal diagnostic failure through the actual MTP vocabulary seam.
+         * @param failure Exact exception kind; None restores the original observation.
+         */
+        void setDecodeVocabularyFailure(DecodeVocabularyFailure failure) { decode_vocabulary_failure_ = failure; }
+        int vocab_size() const override
+        {
+            if (decode_vocabulary_failure_ == DecodeVocabularyFailure::Standard)
+                throw std::logic_error("original MTP vocabulary failure after command admission");
+            if (decode_vocabulary_failure_ == DecodeVocabularyFailure::NonStandard) throw 77;
+            return VOCAB_SIZE;
+        }
 
         void clear_cache() override
         {
@@ -7350,6 +7362,7 @@ namespace
         int publish_mtp_spec_state_batch_count_{0};
         int publish_grouped_decode_equivalent_mtp_spec_state_batch_count_{0};
         int publish_device_resident_mtp_spec_state_count_{0};
+        DecodeVocabularyFailure decode_vocabulary_failure_{DecodeVocabularyFailure::None};
         int position_{0};
         int batch_capacity_{1};
         int padded_seq_len_{0};
@@ -18746,6 +18759,69 @@ namespace
                 << "Second decode in cycle " << cycle << " should call forward";
 
             runner->clearCache();
+        }
+    }
+
+
+    /** @test Original exceptions are visible before the actual command guard checks its MPI world. */
+    TEST_F(Test__PrefillDecodeTransition, MTPCommandExceptionDiagnosticPrecedesFailureAbort)
+    {
+        struct LogLevelRestore {
+            LogLevel original=Logger::getInstance().getLogLevel();
+            ~LogLevelRestore() { Logger::getInstance().setLogLevel(original); }
+        } log_level;
+        Logger::getInstance().setLogLevel(LogLevel::ERROR);
+        class DiagnosticMPI final : public llaminar2::test::MockMPIContext
+        {
+        public:
+            DiagnosticMPI() : MockMPIContext(0,2) {}
+            /** @return Existing null scripted communicator, after observing original guard ordering. */
+            MPI_Comm communicator() const override
+            {
+                if (armed)
+                {
+                    ++guard_checks;
+                    const auto lines=Logger::getInstance().recent_lines();
+                    diagnostic_preceded_guard=std::any_of(lines.begin(),lines.end(),[&](const auto &line) {
+                        return line.find(expected_diagnostic)!=std::string::npos;
+                    });
+                }
+                return MPI_COMM_NULL; // Existing scripted transport; never a fabricated live MPI world.
+            }
+            bool armed=false;
+            std::string expected_diagnostic;
+            mutable unsigned guard_checks=0;
+            mutable bool diagnostic_preceded_guard=false;
+        };
+        using Failure=MockInferenceRunner::DecodeVocabularyFailure;
+        for (const auto failure : {Failure::Standard,Failure::NonStandard})
+        {
+            SCOPED_TRACE(static_cast<int>(failure));
+            auto mpi=std::make_shared<DiagnosticMPI>();
+            auto [runner,mock]=createRunner(true,true,{},mpi,true);
+            runner->setMPICoordinatedMode(true);
+            ASSERT_TRUE(runner->prefill({1,2,3,4,5}));
+            mpi->reset_call_counts();
+            mpi->expected_diagnostic=failure==Failure::Standard
+                ? "DECODE_STEP threw before its command terminal: original MTP vocabulary failure after command admission"
+                : "DECODE_STEP threw before its command terminal: non-standard exception";
+            mpi->armed=true;
+            mock->setDecodeVocabularyFailure(failure);
+            bool original_caught=false;
+            try { (void)runner->decodeStep(); }
+            catch (const std::logic_error &error)
+            {
+                EXPECT_EQ(failure,Failure::Standard);
+                EXPECT_STREQ(error.what(),"original MTP vocabulary failure after command admission");
+                original_caught=true;
+            }
+            catch (int value) { EXPECT_EQ(failure,Failure::NonStandard);EXPECT_EQ(value,77);original_caught=true; }
+            mock->setDecodeVocabularyFailure(Failure::None);
+            mpi->armed=false;
+            EXPECT_TRUE(original_caught);
+            EXPECT_GE(mpi->broadcast_call_count(),2u); // Original command tag and policy payload were published.
+            EXPECT_EQ(mpi->guard_checks,1u);
+            EXPECT_TRUE(mpi->diagnostic_preceded_guard);
         }
     }
 

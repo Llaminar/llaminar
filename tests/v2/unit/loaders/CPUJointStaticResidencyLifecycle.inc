@@ -9,6 +9,7 @@
  * The retained-executor case uses real prepared CPU engines and repeated sparse packet execution.
  */
 #include "execution/compute_stages/stages/MoELocalExpertStage.h"
+#include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "utils/CPUProjectionTestWorkspace.h"
 #include "execution/moe/CanonicalMoERouteRecord.h"
 #include "mocks/MockComputeStage.h"
@@ -16,6 +17,7 @@
 #include "execution/moe/MoEOverlayParticipantResidency.h"
 #include "execution/moe/MoEOverlayResidencySetup.h"
 #include "execution/moe/MoEOverlayPreparedGraphBank.h"
+#include "execution/moe/MoECPUExpertWorkspaceSource.h"
 #include "kernels/cpu/gemm/CPUWeightPreparationGeometry.h"
 namespace {
 /** @brief Retain both original declared plan and its single source-authenticated preparation. */
@@ -27,28 +29,42 @@ struct StaticJointOriginal {
  std::shared_ptr<llaminar2::TensorFactory> factory;
  std::shared_ptr<llaminar2::ModelLoader> loader;
 };
-/** @return Actual source-aware preparation; no private selection or map constructor bypass. */
-StaticJointOriginal staticJointOriginal(int rank=0) {
+/** @brief Build actual tiny GGUF source tensors and the canonical source preparation.
+ * @param rank Original metadata rank whose real local CPU backing executes this actor.
+ * @param members Complete original CPU cohort width.
+ * @param serial_layers Include distinct real layers six/seven for shared serial-root validation.
+ * @return Actual source-aware preparation; no private selection or map constructor bypass.
+ */
+StaticJointOriginal staticJointOriginal(int rank=0,int members=2,bool serial_layers=false) {
  using namespace llaminar2;auto file=std::make_shared<JointOriginalFile>();
  {
   std::ofstream stream(file->path,std::ios::binary|std::ios::trunc);
-  stream.write("GGUF",4);jointScalar(stream,uint32_t{3});jointScalar(stream,uint64_t{3});jointScalar(stream,uint64_t{3});
+  stream.write("GGUF",4);jointScalar(stream,uint32_t{3});jointScalar(stream,uint64_t(serial_layers?6:3));jointScalar(stream,uint64_t{3});
   jointString(stream,"general.architecture");jointScalar(stream,uint32_t{8});jointString(stream,"llama");
   jointString(stream,"llama.expert_count");jointScalar(stream,uint32_t{4});jointScalar(stream,uint32_t{512});
   jointString(stream,"llama.expert_used_count");jointScalar(stream,uint32_t{4});jointScalar(stream,uint32_t{4});
-  for(int role=0;role<3;++role) {
-   jointString(stream,"blk.7.ffn_"+std::string(role==0?"gate":role==1?"up":"down")+"_exps.weight");
+  for(int source=0;source<(serial_layers?2:1);++source)for(int role=0;role<3;++role) {
+   jointString(stream,"blk."+std::to_string(serial_layers?6+source:7)+".ffn_"+std::string(role==0?"gate":role==1?"up":"down")+"_exps.weight");
    jointScalar(stream,uint32_t{3});jointScalar(stream,uint64_t(role==2?20:8));jointScalar(stream,uint64_t(role==2?8:20));
-   jointScalar(stream,uint64_t{512});jointScalar(stream,uint32_t{0});jointScalar(stream,uint64_t(role)*512*20*8*sizeof(float));
+   jointScalar(stream,uint64_t{512});jointScalar(stream,uint32_t{0});jointScalar(stream,uint64_t(source*3+role)*512*20*8*sizeof(float));
   }
   const auto at=size_t(stream.tellp());std::vector<char> pad((at+31)/32*32-at,0);stream.write(pad.data(),std::streamsize(pad.size()));
-  for(int role=0;role<3;++role)for(int expert=0;expert<512;++expert)for(int i=0;i<160;++i)jointScalar(stream,float(expert));
+  for(int source=0;source<(serial_layers?2:1);++source)for(int role=0;role<3;++role)for(int expert=0;expert<512;++expert)for(int i=0;i<160;++i)jointScalar(stream,float(expert+source));
   if(!stream)throw std::runtime_error("Static original source fixture write failed");
  }
  const auto mpi=std::make_shared<MPIContext>(0,1,MPI_COMM_NULL);
  const auto factory=std::make_shared<TensorFactory>(*mpi);const auto loader=std::make_shared<ModelLoader>(factory.get());
  if(!loader->loadModel(file->path.string()))throw std::runtime_error("Static original source fixture load failed");
  auto plan=jointSourcePlan();
+ if(serial_layers) {
+  auto first=plan.placements.front();first.layer=6;
+  plan.placements.insert(plan.placements.begin(),std::move(first));plan.first_model_layer=6;
+ }
+ if(members<2 || members>8 || rank<0 || rank>=members)throw std::invalid_argument("Original CPU cohort fixture requires a supported exact member");
+ for(auto& domain:plan.domains)if(domain.name=="cpu_joint") {
+  domain.participants.clear();domain.world_ranks.clear();
+  for(int member=0;member<members;++member){domain.participants.push_back(GlobalDeviceAddress::cpu(member));domain.world_ranks.push_back(member);}
+ }
  // Each device-free component actor uses this process's genuine local backing.
  // Other ranks remain original metadata, not physical socket execution.
  for(auto& domain:plan.domains)if(domain.name=="cpu_joint")
@@ -64,8 +80,8 @@ StaticJointOriginal staticJointOriginal(int rank=0) {
 llaminar2::MoEOverlayResidencyAuthority::Config staticJointConfig(const StaticJointOriginal& original) {
  using namespace llaminar2;
  return {.initial_plan=*original.plan,
-  .model_metadata={.num_layers=1,.num_experts=512,.d_model=8,.routed_intermediate_size=20,
-    .main_inference_layer_count=8,.first_model_layer=7},
+  .model_metadata={.num_layers=static_cast<int>(original.plan->placements.size()),.num_experts=512,.d_model=8,.routed_intermediate_size=20,
+    .main_inference_layer_count=8,.first_model_layer=original.plan->first_model_layer},
   .projection_preparation=original.preparation,.maintenance_mode=MoERebalanceRuntimeMode::Off,
   .participant_rebalance_policy={.enabled=false}};
 }
@@ -243,9 +259,34 @@ TEST(CPUJointStaticResidency, RetainedExecutorStartsWithOriginalSourceEngines) {
   .compact_route_slots=compact_slots.data(),.route_slot_capacity=2};
  params.expert_mask.assign(512,false);params.prepared_gate_gemm.assign(512,nullptr);
  params.prepared_up_gemm.assign(512,nullptr);params.prepared_down_gemm.assign(512,nullptr);
- for(int expert:selected->expertIds()) {
-  params.expert_mask[expert]=true;const auto& e=published->acquireInitialConstruction()->layerForModelLayer(7).cpu_fragments[expert];
-  params.prepared_gate_gemm[expert]=e.gate().get();params.prepared_up_gemm[expert]=e.up().get();params.prepared_down_gemm[expert]=e.down().get();
+ const auto formats=originalCPUExpertWorkspaceSourceFormats(*original.loader,7,8,20,512);
+ params.cpu_workspace_source=MoELocalExpertStage::CPUExpertWorkspaceSource{
+  .gate=formats[0],.up=formats[1],.down=formats[2],.workers=omp_in_parallel()?omp_get_num_threads():omp_get_max_threads(),.execution=CPUExecutionGeometry::local()};
+ {
+  // The generic complete-bank graph has its own explicit valid cold lifecycle.
+  // It authenticates actual initial engines; the packet graph below retains none.
+  const auto construction=published->acquireInitialConstruction();ASSERT_TRUE(construction);
+  FP32Tensor complete_input({2,8}),complete_indices({2,1}),complete_weights({2,1}),complete_output({2,8});
+  MoEExpertComputeStage::Params complete;
+  complete.device_id=DeviceId::cpu();complete.input=&complete_input;complete.output=&complete_output;
+  complete.routing_indices=&complete_indices;complete.routing_weights=&complete_weights;
+  complete.seq_len=2;complete.d_model=8;complete.num_experts=512;complete.top_k=1;
+  complete.expert_intermediate=10;complete.layer_idx=7;complete.cpu_joint_layer=published;
+  complete.expert_weight_resolution_policy=MoEExpertWeightResolutionPolicy::PreparedRegistryOnly;
+  complete.prepared_engine_binding_lifecycle=MoEPreparedEngineBindingLifecycle::CompleteAtConstruction;
+  complete.canonical_route_contributions=arena->cpuCanonicalRoutes().get();
+  complete.canonical_route_arithmetic=MoECanonicalRouteArithmeticPolicy::UnweightedExpertRowThenOrderedFMA;
+  complete.canonical_route_layout=MoECanonicalRoutePublicationLayout::DenseOriginalRouteSlots;
+  complete.cpu_grouped_serial_workspace=arena->cpuGroupedWorkspace();
+  complete.cpu_router_q8_input_publication=CPURouterQ8InputPublicationPolicy::PublishTransportedRows;
+  complete.expert_mask.assign(512,false);complete.prepared_gate_gemm.assign(512,nullptr);
+  complete.prepared_up_gemm.assign(512,nullptr);complete.prepared_down_gemm.assign(512,nullptr);
+  for(int expert:selected->expertIds()) {
+   const auto& engine=construction->layerForModelLayer(7).cpu_fragments[expert];
+   complete.expert_mask[expert]=true;complete.prepared_gate_gemm[expert]=engine.gate().get();
+   complete.prepared_up_gemm[expert]=engine.up().get();complete.prepared_down_gemm[expert]=engine.down().get();
+  }
+  EXPECT_NO_THROW((void)MoEExpertComputeStage(std::move(complete)));
  }
  MoELocalExpertStage stage(params);test::CPUStageTestWorkspace workspace(stage);
  // Source publication, not mutable registry/store entries, retains the engines.
@@ -258,9 +299,9 @@ TEST(CPUJointStaticResidency, RetainedExecutorStartsWithOriginalSourceEngines) {
    arena->cpuJointPackedRecords()->numel()),live);
   EXPECT_EQ(published->sourceSelection(),selected);
  }
- auto replaced=params;replaced.prepared_gate_gemm[64]=params.prepared_up_gemm[64];
+ auto replaced=params;replaced.prepared_gate_gemm[64]=published->acquireInitialConstruction()->layerForModelLayer(7).cpu_fragments[64].gate().get();
  EXPECT_THROW((void)MoELocalExpertStage(replaced),std::invalid_argument);
- auto missing=params;missing.prepared_down_gemm[64]=nullptr;
+ auto missing=params;missing.cpu_workspace_source.reset();
  EXPECT_THROW((void)MoELocalExpertStage(missing),std::invalid_argument);
 }
 

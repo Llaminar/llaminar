@@ -747,6 +747,16 @@ namespace llaminar2
             const std::shared_ptr<const MoEExpertOverlayPreparationPlan> &preparation,
             std::string *error = nullptr);
         /**
+         * @brief Seal original local CPU fragment sources after weight preparation, before graphs.
+         * @param context Actual original ModelContext owning the completed prepared registry.
+         * @param error Original identity or incomplete/retired bootstrap diagnostic.
+         * @return True after original context binding and every local CPU source publication.
+         * @note This cold admission never reconstructs a retired initial bank. Lazy graph
+         * declarations use acquireOriginalPreparedSource instead of repeating admission.
+         */
+        bool admitInitialCPUJointGraphSources(const std::shared_ptr<ModelContext> &context,
+                                             std::string *error = nullptr);
+        /**
          * @brief Retain only the successfully bound live original source for cold preparation.
          * @param error Exact missing/expired/replaced-owner diagnostic.
          * @return A real source use or no value; unbound component APIs grant no permit.

@@ -91,6 +91,10 @@ INSTANTIATE_TEST_SUITE_P(Qwen4ExpCPUJointWorld2MTPExact, Qwen4ExpMTPExactReplayT
     [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
 
 
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpCPUJointWorld2DynamicMTPExact, Qwen4ExpMTPExactReplayTest,
+    ::testing::ValuesIn(qwen4ExpCPUJointWorld2DynamicMTPExactCases()),
+    [](const ::testing::TestParamInfo<ModelParityCase> &info) { return info.param.testName(); });
+
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpOppositeVendorMTPRetained15Exact, Qwen4ExpMTPExactReplayTest,
     ::testing::ValuesIn(qwen4ExpOppositeVendorMTPRetained15Cases()),
     [](const ::testing::TestParamInfo<ModelParityCase> &info) { return info.param.testName(); });

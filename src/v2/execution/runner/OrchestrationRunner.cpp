@@ -15291,6 +15291,10 @@ namespace llaminar2
         ScopedMoEOverlayRootCommand overlay_decode_command(
             moe_overlay_inference_transaction_coordinator_);
 
+        // Keep the diagnostic catch inside both command guards. Catching after
+        // their destruction is too late: a live MPI world has already aborted.
+        try
+        {
         const std::uint64_t retired_prefill_tokens =
             moe_overlay_pending_prefill_progress_tokens_.exchange(
                 0u, std::memory_order_acq_rel);
@@ -15504,6 +15508,7 @@ namespace llaminar2
                             mtp_result.error =
                                 "ExpertOverlay MTP command completion failed: " +
                                 command_error;
+                            LOG_ERROR("[OrchestrationRunner] " << mtp_result.error);
                             result = std::move(mtp_result);
                             return result;
                         }
@@ -15960,6 +15965,20 @@ namespace llaminar2
         }
         decode_command_failure_abort.markCompleted();
         return result;
+        }
+        catch (const std::exception &error)
+        {
+            if (result.error.empty()) result.error = error.what();
+            LOG_ERROR("[OrchestrationRunner] DECODE_STEP threw before its command terminal: "
+                      << error.what());
+            throw; // Preserve the original exception in scripted/local callers.
+        }
+        catch (...)
+        {
+            if (result.error.empty()) result.error = "DECODE_STEP threw a non-standard exception";
+            LOG_ERROR("[OrchestrationRunner] DECODE_STEP threw before its command terminal: non-standard exception");
+            throw;
+        }
     }
 
     GenerationResult OrchestrationRunner::forceDecodeToken(int32_t token)

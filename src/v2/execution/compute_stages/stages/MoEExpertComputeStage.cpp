@@ -1299,6 +1299,29 @@ namespace llaminar2
          * both ownership regimes.
          */
         if (params_.cpu_joint_layer) {
+            if(params_.prepared_engine_binding_lifecycle==MoEPreparedEngineBindingLifecycle::SparseOverlayInvocationPublished) {
+            const auto &publication=*params_.cpu_joint_layer;
+            if (publication.bankLease() || !publication.sourceSelection() || !publication.family() || publication.layer()!=params_.layer_idx ||
+                publication.family()->cohort()!=publication.sourceSelection()->cohort() ||
+                publication.family()->participantIndex()!=publication.sourceSelection()->participantIndex())
+                throw std::invalid_argument("CPU joint invocation has no original published source family");
+            if (!params_.device_id.is_cpu() ||
+                params_.expert_weight_resolution_policy!=MoEExpertWeightResolutionPolicy::PreparedRegistryOnly ||
+                params_.prepared_engine_binding_lifecycle!=MoEPreparedEngineBindingLifecycle::SparseOverlayInvocationPublished ||
+                params_.canonical_route_arithmetic!=MoECanonicalRouteArithmeticPolicy::UnweightedExpertRowThenOrderedFMA ||
+                !params_.canonical_route_contributions)
+                throw std::invalid_argument("CPU joint expert invocation requires its source-bound packet-published canonical producer");
+            const auto &source=*publication.sourceSelection();const auto &geometry=source.ownership().geometry();
+            const auto empty=[](const auto& engines){return std::all_of(engines.begin(),engines.end(),[](auto* engine){return engine==nullptr;});};
+            if(source.layer()!=params_.layer_idx || geometry.experts!=params_.num_experts || geometry.model_columns!=params_.d_model ||
+               source.ownership().projection(WeightRole::MoEExpertUp).rows!=params_.expert_intermediate ||
+               params_.expert_mask.size()!=static_cast<size_t>(params_.num_experts) ||
+               std::any_of(params_.expert_mask.begin(),params_.expert_mask.end(),[](bool active){return active;}) ||
+               !empty(params_.prepared_gate_gemm) || !empty(params_.prepared_up_gemm) || !empty(params_.prepared_down_gemm))
+                throw std::invalid_argument("CPU joint expert setup changed original source geometry or supplied epoch engine pointers");
+            } else if(params_.prepared_engine_binding_lifecycle==MoEPreparedEngineBindingLifecycle::CompleteAtConstruction) {
+                // The generic complete-bank graph remains a distinct explicit
+                // cold contract. It cannot adopt a retired bootstrap bank.
             const auto &publication=*params_.cpu_joint_layer;
             const auto construction=publication.acquireInitialConstruction();
             if (!publication.sourceSelection() || !construction || publication.layer()!=params_.layer_idx)
@@ -1328,6 +1351,9 @@ namespace llaminar2
                     params_.prepared_down_gemm[index]!=engines.down().get() ||
                     (source.contains(expert) && !engines.valid()))
                     throw std::invalid_argument("CPU joint expert invocation replaced an original selected native engine");
+            }
+            } else {
+                throw std::invalid_argument("Unknown CPU joint prepared-engine binding lifecycle");
             }
         }
         sparse_overlay_route_width_capacity_ = params_.top_k;
@@ -2682,15 +2708,38 @@ namespace llaminar2
                    : MoEOverlayServicePhaseHint::Prefill;
     }
 
+    void MoEExpertComputeStage::releaseCPUJointInvocation() noexcept
+    {
+        if(!params_.cpu_joint_layer)return;
+        if(params_.prepared_engine_binding_lifecycle!=MoEPreparedEngineBindingLifecycle::SparseOverlayInvocationPublished) {
+            cpu_joint_invocation_bank_.reset();
+            return;
+        }
+        // CPU prepared engines take scratch as an invocation argument and
+        // retain no stage workspace (CPUInvocationWorkspaceConsumer). Revoke
+        // only these graph-owned indexes before dropping the exact reader;
+        // later workspace inspection cannot dereference a retired engine.
+        std::fill(params_.prepared_gate_gemm.begin(),params_.prepared_gate_gemm.end(),nullptr);
+        std::fill(params_.prepared_up_gemm.begin(),params_.prepared_up_gemm.end(),nullptr);
+        std::fill(params_.prepared_down_gemm.begin(),params_.prepared_down_gemm.end(),nullptr);
+        std::fill(cached_gate_gemm_.begin(),cached_gate_gemm_.end(),nullptr);
+        std::fill(cached_up_gemm_.begin(),cached_up_gemm_.end(),nullptr);
+        std::fill(cached_down_gemm_.begin(),cached_down_gemm_.end(),nullptr);
+        std::fill(params_.expert_mask.begin(),params_.expert_mask.end(),false);
+        grouped_gateup_desc_table_dirty_=true;grouped_down_desc_table_dirty_=true;
+        runtime_grouped_decode_launch_state_prepared_=false;
+        cpu_joint_invocation_bank_.reset();
+    }
+
     bool MoEExpertComputeStage::execute(IDeviceContext *ctx)
     {
         if(params_.cpu_joint_layer && !cpu_joint_invocation_bank_) {
             LOG_ERROR("CPU fragment execution requires its exact bound packet-epoch RCU lease");return false;
         }
         struct InvocationBankScope {
-            MoEOverlayParticipantBankLease& bank;
-            ~InvocationBankScope(){bank.reset();}
-        } release_after_gemm{cpu_joint_invocation_bank_};
+            MoEExpertComputeStage &stage;
+            ~InvocationBankScope(){stage.releaseCPUJointInvocation();}
+        } release_after_gemm{*this};
         if (!overlay_service_telemetry_layer_)
             return executeWithoutServiceTelemetry(ctx);
         if (!ctx || !overlay_service_sample_ ||
@@ -9489,7 +9538,7 @@ namespace llaminar2
         const SparseOverlayInvocation &invocation)
     {
         // A rejected new packet cannot leave a previous lease executable.
-        cpu_joint_invocation_bank_.reset();
+        releaseCPUJointInvocation();
         MoEOverlayParticipantBankLease joint_bank;
         if(params_.cpu_joint_layer) {
             if(invocation.binding_kind==SparseOverlayBindingKind::SetupPriming) {

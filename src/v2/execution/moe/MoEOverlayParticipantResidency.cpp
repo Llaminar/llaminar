@@ -1584,6 +1584,30 @@ namespace llaminar2
             error->clear();
         return true;
     }
+    bool MoEOverlayParticipantResidencyRegistry::admitInitialCPUJointGraphSources(
+        const std::shared_ptr<ModelContext> &context, std::string *error)
+    {
+        const auto participants = localParticipantIds();
+        if (std::none_of(participants.begin(), participants.end(),
+                         [this](int id) { return isCPUJointParticipant(id); }))
+        {
+            if (error) error->clear();
+            return true;
+        }
+        // Weight preparation has completed on the original cold owner. Bind
+        // that owner before any graph consumes the immutable source declaration;
+        // maintenance finalization is later and cannot establish this dependency.
+        if (!bindOriginalPreparedContext(context, config_.projection_preparation, error))
+            return false;
+        auto source = acquireOriginalPreparedSource(error);
+        if (!source) return false;
+        for (const int id : participants)
+            if (isCPUJointParticipant(id) &&
+                !registerInitialCPUJointBank(source->registry(), config_.original_model, id, error))
+                return false;
+        return true;
+    }
+
     bool MoEOverlayParticipantResidencyRegistry::registerInitialCPUJointBank(
         const ExpertGemmRegistry &registry, ModelContextId model, int id, std::string *error)
     {

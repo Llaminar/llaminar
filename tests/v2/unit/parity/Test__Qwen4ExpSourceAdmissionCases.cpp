@@ -1866,3 +1866,32 @@ TEST(Qwen4ExpSourceAdmissionCases, CPUJointExactStartupPreservesHostWideGPUAndEx
     EXPECT_FALSE(RuntimeInitPhase::requiresHostWideAcceleratorVisibility(cpu_only, 1));
 }
 } // namespace llaminar2::test::parity::qwen4exp
+
+namespace llaminar2::test::parity::qwen4exp {
+/** @test Moving MTP proof retains the original physical source and exact oracle contract. */
+TEST(Qwen4ExpSourceAdmissionCases, CPUJointMovingMTPExactRetainsOriginalRequests)
+{
+    const auto &original=qwen4ExpCPUJointWorld2MTPExactCases();
+    const auto &moving=qwen4ExpCPUJointWorld2DynamicMTPExactCases();
+    ASSERT_EQ(moving.size(),3u);
+    std::set<ModelParityMTP> policies;
+    for(const auto &cell:moving) {
+        policies.insert(cell.mtp);
+        const auto source=std::find_if(original.begin(),original.end(),[&](const auto &value){return value.mtp==cell.mtp;});
+        ASSERT_NE(source,original.end());
+        EXPECT_EQ(cell.topology.participants,source->topology.participants);
+        EXPECT_EQ(cell.topology.mpi_ranks,2);
+        EXPECT_EQ(cell.retained_mtp_draft_capacity,3);
+        EXPECT_EQ(cell.model.maximum_mtp_draft_depth,3);
+        EXPECT_EQ(cell.model.shared_predictor,source->model.shared_predictor);
+        EXPECT_EQ(cell.ngram_table_policy,source->ngram_table_policy);
+        EXPECT_EQ(cell.expert_overlay->owner_order,source->expert_overlay->owner_order);
+        EXPECT_EQ(cell.expert_overlay->movement,ModelParityExpertMovement::Dynamic);
+        EXPECT_EQ(cell.dynamic_evidence,ModelParityDynamicEvidence::EconomicMovement);
+        EXPECT_EQ(source->expert_overlay->movement,ModelParityExpertMovement::Static);
+        EXPECT_EQ(cell.collective_evidence_source,ParityCollectiveEvidenceSource::PostCollectiveSnapshot);
+        EXPECT_NE(cell.testName(),source->testName());
+    }
+    EXPECT_EQ(policies,(std::set<ModelParityMTP>{ModelParityMTP::Depth1,ModelParityMTP::Depth3,ModelParityMTP::DynamicDepth}));
+}
+}

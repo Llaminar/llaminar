@@ -1260,18 +1260,6 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
     local_params.prepared_gate_gemm.assign(experts, nullptr);
     local_params.prepared_up_gemm.assign(experts, nullptr);
     local_params.prepared_down_gemm.assign(experts, nullptr);
-    {
-        const auto initial = layer->acquireInitialConstruction();
-        requireOriginal(bool(initial), "actual initial bank borrow");
-        for (int expert : selected->expertIds())
-        {
-            const auto &e = initial->layerForModelLayer(0).cpu_fragments[expert];
-            local_params.expert_mask[expert] = true;
-            local_params.prepared_gate_gemm[expert] = e.gate().get();
-            local_params.prepared_up_gemm[expert] = e.up().get();
-            local_params.prepared_down_gemm[expert] = e.down().get();
-        }
-    } // Cold construction borrow ends before any invocation.
     MoELocalExpertStage compute(local_params);
     const auto actual_requirements = compute.getWorkspaceRequirements(rows);
     requireOriginal(!actual_requirements.cpu_grouped_moe_storage &&

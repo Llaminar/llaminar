@@ -3599,6 +3599,18 @@ namespace llaminar2
 
         LOG_DEBUG("[InferenceRunner] DeviceGraphOrchestrator created successfully");
 
+        // All local weight work, including the authored CPU preparation join,
+        // precedes this cold graph boundary. Later lazy families only borrow
+        // the sealed source declaration; they must not re-admit bootstrap banks.
+        if (const auto &residency = graph_config.moe.expert_overlay_participant_residency;
+            residency && !config.pp_stage_config)
+        {
+            std::string error;
+            if (!residency->admitInitialCPUJointGraphSources(
+                    std::dynamic_pointer_cast<ModelContext>(model_ctx), &error))
+                throw std::runtime_error("CPU joint cold graph admission failed: " + error);
+        }
+
         prepareParticipantImmutableRowTable(model_ctx, graph_config);
 
         if (!materializeIndependentFactoryGraphFamily(
@@ -4811,6 +4823,18 @@ namespace llaminar2
                 }
                 orchestrator->initializePreparedWeightStore(device);
             }
+        }
+
+        // All local weight work, including the authored CPU preparation join,
+        // precedes this cold graph boundary. Later lazy families only borrow
+        // the sealed source declaration; they must not re-admit bootstrap banks.
+        if (const auto &residency = graph_config.moe.expert_overlay_participant_residency;
+            residency && !config.pp_stage_config)
+        {
+            std::string error;
+            if (!residency->admitInitialCPUJointGraphSources(
+                    std::dynamic_pointer_cast<ModelContext>(model_ctx), &error))
+                throw std::runtime_error("CPU joint cold graph admission failed: " + error);
         }
 
         prepareParticipantImmutableRowTable(model_ctx, graph_config);

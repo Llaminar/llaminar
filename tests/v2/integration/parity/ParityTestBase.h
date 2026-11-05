@@ -10057,10 +10057,43 @@ namespace llaminar2::test::parity
         void runProductionParityMTPCheckpointProof(DecodeParitySummary &summary,
             MTPParityProofPurpose purpose, const NativeMTPParityCheckpointAttempt *native_attempt)
         {
-            auto profile_scope = profileParityScope("mtp_proof.total");
             if (config_.mtp_expectation == ParityMTPExpectation::Disabled)
                 return;
+            ASSERT_NE(orch_runner_, nullptr);
+            runProductionParityMTPCheckpointComparisons(summary, purpose, native_attempt);
+        }
 
+        /** @return Whether the original runtime owns a moving host CPU-cohort placement. */
+        bool productionParityMTPUsesMovingCPUJoint() const
+        {
+            const auto &runtime = orch_runner_->config();
+            return runtime.moe_routed_expert_plan &&
+                MoEExpertOwnerMap::usesCPUJointFragments(*runtime.moe_routed_expert_plan) &&
+                runtime.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic;
+        }
+
+        /** @brief Keep just one real serial/grouped comparison at its original placement.
+         * @param body Existing public request/reset calls and their unchanged exact comparison.
+         * @note Maintenance notifications remain active. Publication is released
+         * between comparisons; no parent spans the outer history or movement proof.
+         */
+        void withProductionParityMTPComparisonPlacement(const std::function<void()> &body)
+        {
+            if (productionParityMTPUsesMovingCPUJoint())
+                orch_runner_->withMoEOverlayInferencePlacementScope(body);
+            else
+                body();
+        }
+
+        /** @brief Run primary, adaptive and acceptance comparisons with independent placement ancestry.
+         * @param summary Original numerical accumulator.
+         * @param purpose Reference numerical or native exact contract.
+         * @param native_attempt Original frozen checkpoint, present only for native exact proof.
+         */
+        void runProductionParityMTPCheckpointComparisons(DecodeParitySummary &summary,
+            MTPParityProofPurpose purpose, const NativeMTPParityCheckpointAttempt *native_attempt)
+        {
+            auto profile_scope = profileParityScope("mtp_proof.total");
             ASSERT_NE(orch_runner_.get(), nullptr)
                 << "Production MTP proof requires the server-facing runner";
             ASSERT_GT(config_.mtp_expected_draft_depth, 0);
@@ -10109,9 +10142,12 @@ namespace llaminar2::test::parity
                 ? (activePrimaryDevice().is_gpu() ? 2 : limited_depth + 1)
                 : dynamic_depth ? adaptive_witness.serial_oracle_tokens
                 : (activePrimaryDevice().is_gpu() ? 2 : limited_depth + 1);
+            std::optional<std::vector<int32_t>> serial_oracle;
+            ProductionParityMTPTransactionBoundary boundary{};
+            const auto primary_comparison = [&] {
             PrefixRuntimeStateSnapshot checkpoint_input;
             std::string serial_oracle_error;
-            const auto serial_oracle = captureProductionParityMTPSerialOracle(
+            serial_oracle = captureProductionParityMTPSerialOracle(
                 transaction_prompt, serial_oracle_output_count, 0u,
                 &serial_oracle_error, &checkpoint_input);
             ASSERT_TRUE(serial_oracle.has_value())
@@ -10279,7 +10315,7 @@ namespace llaminar2::test::parity
                     checkpoint_serial.begin(),
                     checkpoint_serial.begin() + static_cast<std::ptrdiff_t>(result.tokens.size()));
 
-                ProductionParityMTPTransactionBoundary boundary{
+                boundary = ProductionParityMTPTransactionBoundary{
                     .requested_draft_depth =
                         before.mtp_current_depth > 0
                             ? before.mtp_current_depth
@@ -10368,10 +10404,27 @@ namespace llaminar2::test::parity
                 else
                     observeComparedProductionParityMTPTransaction(boundary, *serial_oracle);
 
+            }
+            };
+            withProductionParityMTPComparisonPlacement(primary_comparison);
+            if (::testing::Test::HasFatalFailure() ||
+                (native_attempt && !native_attempt->selection.acceptedPrefixRows()))
+                return;
+
                 if (dynamic_depth)
                 {
-                    const auto &policy_serial_oracle = native_attempt
-                        ? native_attempt->policy_serial_oracle : *serial_oracle;
+                    const auto adaptive_comparison = [&] {
+                    std::optional<std::vector<int32_t>> placement_serial_oracle;
+                    if (productionParityMTPUsesMovingCPUJoint())
+                    {
+                        std::string error;
+                        placement_serial_oracle = captureProductionParityMTPSerialOracle(
+                            prompt, adaptive_witness.serial_oracle_tokens, std::nullopt, &error);
+                        ASSERT_TRUE(placement_serial_oracle) << error;
+                    }
+                    const auto &policy_serial_oracle = placement_serial_oracle
+                        ? *placement_serial_oracle
+                        : native_attempt ? native_attempt->policy_serial_oracle : *serial_oracle;
                     /*
                      * Numerical snapshots have already been consumed. Start a
                      * fresh server-facing request without a stop token, then
@@ -10503,6 +10556,9 @@ namespace llaminar2::test::parity
                     ASSERT_GE(
                         witness_after.mtp_accepted_tokens,
                         witness_before.mtp_accepted_tokens);
+                    };
+                    withProductionParityMTPComparisonPlacement(adaptive_comparison);
+                    if (::testing::Test::HasFatalFailure()) return;
                     // The adaptive workload retains rejection coverage even
                     // when its first draft is wrong. Acceptance has its own
                     // independently authenticated checkpoint and continuation.
@@ -10512,7 +10568,6 @@ namespace llaminar2::test::parity
                 }
                 production_parity_mtp_transaction_boundaries_.push_back(
                     std::move(boundary));
-            }
         }
 
         /**
@@ -10529,6 +10584,24 @@ namespace llaminar2::test::parity
          * convolution, and terminal state through a complete byte comparison.
          */
         void runProductionParityMTPAcceptanceWitness(
+            ProductionParityMTPTransactionBoundary &boundary,
+            MTPParityProofPurpose purpose = MTPParityProofPurpose::ReferenceNumerics,
+            const std::vector<int32_t> *native_accepting_prompt = nullptr,
+            int native_history_rows = 0)
+        {
+            withProductionParityMTPComparisonPlacement([&] {
+                runProductionParityMTPAcceptanceAtOriginalPlacement(
+                    boundary, purpose, native_accepting_prompt, native_history_rows);
+            });
+        }
+
+        /** @brief Consume the unchanged acceptance/continuation proof within its caller's placement.
+         * @param boundary Original checkpoint evidence receiving actual acceptance observations.
+         * @param purpose Original numerical or native exact purpose.
+         * @param native_accepting_prompt Previously authenticated original native checkpoint.
+         * @param native_history_rows Original finite functional-history bound.
+         */
+        void runProductionParityMTPAcceptanceAtOriginalPlacement(
             ProductionParityMTPTransactionBoundary &boundary,
             MTPParityProofPurpose purpose = MTPParityProofPurpose::ReferenceNumerics,
             const std::vector<int32_t> *native_accepting_prompt = nullptr,

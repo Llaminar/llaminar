@@ -22,6 +22,7 @@
  */
 
 #include "MoEOverlayParticipantGraphRunner.h"
+#include "MoEOverlayPreparedGraphBank.h"
 #include "MoEOverlayMTPSourceContract.h"
 #include "MoEOverlayFollowerRowGeometry.h"
 #include "MoECPUExpertWorkspaceSource.h"
@@ -778,6 +779,14 @@ namespace llaminar2
             ScopedWeightLoadDetailTimer timer(
                 "overlay.graph.prepare_participant_weights");
             prepareParticipantWeights();
+        }
+        // Participant weights are complete before any expert graph is declared.
+        // Establish original context/source identity here, not from a lazy builder.
+        {
+            std::string error;
+            if (!config_.participant_residency->admitInitialCPUJointGraphSources(
+                    config_.model_context, &error))
+                throw std::runtime_error("Participant CPU joint cold graph admission failed: " + error);
         }
         {
             ScopedWeightLoadDetailTimer timer(
@@ -2699,19 +2708,15 @@ namespace llaminar2
                         prepared_payloads;
                     std::string residency_error;
                     std::shared_ptr<const MoEOverlayParticipantResidencyRegistry::CPUJointLayer> joint_layer;
-                    MoEOverlayParticipantBankLease construction_bank;
                     if(joint) {
-                        if(!config_.cpu_joint_context || !prepared_store_ ||
-                           !config_.participant_residency->registerInitialCPUJointBank(registry,prepared_store_->modelId(),
-                               endpoint->participant_id,&residency_error))
-                            throw std::runtime_error("CPU joint follower has no original prepared source/domain: "+residency_error);
-                        joint_layer=config_.participant_residency->initialCPUJointLayer(endpoint->participant_id,layer);
+                        if(!config_.cpu_joint_context || !prepared_store_)
+                            throw std::runtime_error("CPU joint follower has no original prepared source/domain");
+                        joint_layer=adoptMoEOverlayCPUJointGraphDeclaration(*config_.participant_residency,registry,
+                            prepared_store_->modelId(),endpoint->participant_id,layer,num_experts,d_model,expert_intermediate);
                         if(!joint_layer || !joint_layer->sourceSelection() ||
                            !compact_arena->cpuJointLayout() || !compact_arena->cpuJointPackedRecords())
                             throw std::runtime_error("CPU joint follower lost original fragment publication or serial roots");
-                        construction_bank=joint_layer->acquireInitialConstruction();
-                        if(!construction_bank)
-                            throw std::runtime_error("CPU joint follower requires its complete initial prepared bank");
+
                     }
                     if (!joint && (!resolveMoEOverlayPreparedExpertPayloads(
                             registry,
@@ -2790,15 +2795,7 @@ namespace llaminar2
                         local_params.prepared_gate_gemm.assign(num_experts,nullptr);
                         local_params.prepared_up_gemm.assign(num_experts,nullptr);
                         local_params.prepared_down_gemm.assign(num_experts,nullptr);
-                        // Borrow the installed source bank only while binding
-                        // constructor inputs; each invocation acquires its own epoch.
-                        const auto &source=construction_bank->layerForModelLayer(layer);
-                        for(const int expert:joint_layer->sourceSelection()->expertIds()) {
-                            const auto &engines=source.cpu_fragments.at(static_cast<size_t>(expert));
-                            local_params.prepared_gate_gemm[expert]=engines.gate().get();
-                            local_params.prepared_up_gemm[expert]=engines.up().get();
-                            local_params.prepared_down_gemm[expert]=engines.down().get();
-                        }
+                        local_params.expert_mask.assign(num_experts,false);
                     }
                     if(!joint)(void)registry.populateExpertEnginesForParticipant(
                         binding.tier->domain,

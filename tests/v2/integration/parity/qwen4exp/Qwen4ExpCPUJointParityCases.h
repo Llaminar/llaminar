@@ -31,10 +31,10 @@ inline const std::vector<ModelParityCase>& qwen4ExpCPUJointWorld2NumericalCases(
     return cases;
 }
 /**
- * @return One unqualified DynamicOrdinal/MTP-Off sibling on the SAME original socket topology/history.
+ * @return One DynamicOrdinal/MTP-Off diagnostic on the SAME original socket topology/history.
  * @note This explicit diagnostic runs the actual orchestration/publication stack.
- * Moving placement plus MTP still needs an epoch-matched exact oracle; Static
- * fixed1/fixed3/dynamic-MTP cases are not that qualification.
+ * Active MTP uses the separate same-placement exact comparisons below; this
+ * Off diagnostic does not supply active predictor or grouped-verifier evidence.
  */
 inline const std::vector<ModelParityCase>& qwen4ExpCPUJointWorld2DynamicNumericalCases()
 {
@@ -72,6 +72,28 @@ inline const std::vector<ModelParityCase>& qwen4ExpCPUJointWorld2MTPExactCases()
         for(auto cell:qwen4ExpCPUJointWorld2MTPSourceAdmissionCases()) {
             if(cell.mtp==ModelParityMTP::Off)continue;
             cell.inventory_role=ModelParityInventoryRole::NumericalDiagnostic;
+            cell.collective_evidence_source=ParityCollectiveEvidenceSource::PostCollectiveSnapshot;
+            cell.thresholds.allreduce_stages.clear();
+            result.push_back(std::move(cell));
+        }
+        return result;
+    }();
+    return cases;
+}
+
+/**
+ * @return Original CPU2 source fixed1/fixed3/dynamic-depth exact requests with Dynamic placement.
+ * @note Each primary serial/grouped comparison borrows one original placement;
+ * publication remains unrestricted between primary, adaptive and acceptance
+ * comparisons. Each comparison consumes its own same-placement serial oracle.
+ */
+inline const std::vector<ModelParityCase>& qwen4ExpCPUJointWorld2DynamicMTPExactCases()
+{
+    static const auto cases=[] {
+        std::vector<ModelParityCase> result;
+        for(auto cell:qwen4ExpExpandSourceAdmissionMTP(
+                qwen4ExpCPUJointWorld2DynamicNumericalCases(),Qwen4ExpSourceMTPEnvelope::Retained3)) {
+            if(cell.mtp==ModelParityMTP::Off)continue;
             cell.collective_evidence_source=ParityCollectiveEvidenceSource::PostCollectiveSnapshot;
             cell.thresholds.allreduce_stages.clear();
             result.push_back(std::move(cell));

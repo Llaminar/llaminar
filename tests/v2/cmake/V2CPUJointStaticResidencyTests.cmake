@@ -100,3 +100,47 @@ add_v2_test(V2_Integration_CPUJointMTPSourceContract
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUJointMTPSourceContract)
 
 endif()
+
+# Actual decodeStep exception unwinding must log the original failure before fatal MPI retirement.
+if(TARGET v2_unit_prefill_decode_transition)
+    add_v2_test(V2_Integration_MTPCommandExceptionDiagnostic
+        COMMAND $<TARGET_FILE:v2_unit_prefill_decode_transition>
+            --gtest_filter=Test__PrefillDecodeTransition.MTPCommandExceptionDiagnosticPrecedesFailureAbort
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MTP;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MTPCommandExceptionDiagnostic)
+endif()
+
+# Original source metadata remains valid after the bootstrap bank retires; packets own engine epochs.
+if(TARGET v2_unit_expert_gemm_registry)
+    add_v2_test(V2_Integration_CPUJointLateGraphSourceLifecycle
+        COMMAND $<TARGET_FILE:v2_unit_expert_gemm_registry>
+            --gtest_filter=CPUFragmentEpochBankContract.LateSourceOnlyGraphSurvivesBankRetirementAndExceptions
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;PreparedWeights;SourceBinding;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1" "OMP_DYNAMIC=false")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUJointLateGraphSourceLifecycle)
+endif()
+
+# Complete prepared weights establish the original cold source before either graph consumer runs.
+if(TARGET v2_unit_expert_gemm_registry)
+    add_v2_test(V2_Integration_CPUJointColdGraphAdmissionLifecycle
+        COMMAND $<TARGET_FILE:v2_unit_expert_gemm_registry>
+            --gtest_filter=CPUFragmentEpochBankContract.ColdGraphAdmissionBindsOriginalSourceBeforeDeclaration
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;PreparedWeights;SourceBinding;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1" "OMP_DYNAMIC=false")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUJointColdGraphAdmissionLifecycle)
+endif()
+
+# Actual layer sources remain distinct while mutually exclusive layers share checked physical route roots.
+if(TARGET v2_unit_expert_gemm_registry)
+    add_v2_test(V2_Integration_CPUJointSerialSourceGeometryLifecycle
+        COMMAND $<TARGET_FILE:v2_unit_expert_gemm_registry>
+            --gtest_filter=CPUFragmentEpochBankContract.DistinctLayerSourcesShareOriginalSerialGeometry
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;PreparedWeights;SourceBinding;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1" "OMP_DYNAMIC=false")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUJointSerialSourceGeometryLifecycle)
+endif()

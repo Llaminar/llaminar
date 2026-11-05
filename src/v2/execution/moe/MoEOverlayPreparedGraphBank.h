@@ -11,6 +11,7 @@
 #include "MoEExpertOverlayGraphScope.h"
 #include "MoEExpertOwnerMap.h"
 #include "MoEOverlayParticipantResidency.h"
+#include "MoEExpertOverlayPreparationPlan.h"
 #include "loaders/ExpertGemmRegistry.h"
 #include "tensors/TensorKernels.h"
 #include "CPUExpertShardSourceSelection.h"
@@ -22,6 +23,53 @@
 
 namespace llaminar2
 {
+/**
+ * @brief Borrow only the authenticated immutable CPU source/family declaration for a lazy graph.
+ * @param residency Original source-bound participant registry, already published at setup.
+ * @param registry SAME model-owned prepared registry; no engine table is borrowed.
+ * @param model Actual original model identity.
+ * @param participant Original local CPU member; no representative-member projection.
+ * @param layer Original model-global layer.
+ * @param experts Complete logical expert axis.
+ * @param columns Original model width.
+ * @param intermediate Original unsliced expert F width.
+ * @return Cold family/source metadata owning no initial/current epoch reader or engine pointer.
+ * @throws std::invalid_argument For a foreign source/model/member/preparation/geometry.
+ * @throws std::logic_error For missing source publication or expired original owners.
+ * @note The packet remains the sole execution-epoch authority. Initial bank
+ * retirement never invalidates immutable source geometry or authorizes resurrection.
+ */
+inline std::shared_ptr<const MoEOverlayParticipantResidencyRegistry::CPUJointLayer>
+adoptMoEOverlayCPUJointGraphDeclaration(const MoEOverlayParticipantResidencyRegistry &residency,
+    const ExpertGemmRegistry &registry,ModelContextId model,int participant,int layer,
+    int experts,int columns,int intermediate)
+{
+    std::string error;
+    const auto original=residency.acquireOriginalPreparedSource(&error);
+    if(!original)throw std::logic_error("CPU joint graph lost its original prepared source: "+error);
+    if(&original->registry()!=&registry || !model.value || residency.originalModel()!=model ||
+       !residency.isCPUJointParticipant(participant) || experts<=0 || columns<=0 || intermediate<=0)
+        throw std::invalid_argument("CPU joint graph changed its original model/registry/member geometry");
+    const auto declaration=residency.initialCPUJointLayer(participant,layer);
+    const auto source=declaration->sourceSelection();const auto family=declaration->family();
+    if(!source)throw std::invalid_argument("CPU joint graph requires an original selected source declaration; initially empty cohorts are not supported");
+    const auto preparation=original->preparation();
+    const auto* owner=residency.initialOwnerMap().participantForId(participant);
+    if(!family || !preparation || !owner || !owner->device.is_cpu() ||
+       !preparation->cpuJointOwnerMap() || preparation->cpuJointOwnerMap().get()!=&residency.initialOwnerMap() ||
+       family->model()!=model || family->preparation()!=preparation ||
+       family->preparation().owner_before(preparation) || preparation.owner_before(family->preparation()) ||
+       family->cohort()!=source->cohort() || family->cohort().owner_before(source->cohort()) ||
+       source->cohort().owner_before(family->cohort()) || family->participantIndex()!=source->participantIndex())
+        throw std::invalid_argument("CPU joint graph replaced its original source/preparation/family");
+    const auto expected=preparation->cpuShardSourceFor(layer,*owner);
+    const auto& geometry=source->ownership().geometry();
+    if(!expected || *source!=*expected || source->participant()!=*owner || source->layer()!=layer ||
+       geometry.experts!=experts || geometry.model_columns!=columns || geometry.intermediate_columns!=intermediate)
+        throw std::invalid_argument("CPU joint graph changed its original source selection or projection");
+    return declaration;
+}
+
 /** @brief Declarative logical ownership and global expert extent of one graph bank. */
 struct MoEOverlayPreparedGraphBankRequest
 {

@@ -41,3 +41,14 @@ if(Python3_Interpreter_FOUND)
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 15)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpCPUJointPhysicalSocketSelection)
 endif()
+
+# Canonical moving-placement MTP cells preserve original physical metadata.
+if(TARGET v2_test_model_parity_definition)
+    add_v2_test(V2_Integration_Qwen4ExpCPUJointMovingMTPMetadata
+        COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+            --gtest_filter=Qwen4ExpSourceAdmissionCases.CPUJointMovingMTPExactRetainsOriginalRequests
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Qwen4Exp;MTP;Ownership;Contract;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpCPUJointMovingMTPMetadata)
+endif()

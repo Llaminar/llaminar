@@ -1036,6 +1036,36 @@ namespace llaminar2
         if(params_.device_id.is_cpu() && params_.serial_compact_buffer_arena && params_.physical_memory_authority &&
             params_.physical_memory_authority!=params_.serial_compact_buffer_arena->physicalMemoryAuthority())
             throw std::invalid_argument("CPU serial packet and stage dependency name different physical authorities");
+        if(params_.cpu_joint_layer) {
+            const auto nonempty=[](const auto& engines){return std::any_of(engines.begin(),engines.end(),[](auto* e){return e!=nullptr;});};
+            const auto& publication=*params_.cpu_joint_layer;
+            const auto family=publication.family();
+            const auto* layout=params_.serial_compact_buffer_arena?params_.serial_compact_buffer_arena->cpuJointLayout():nullptr;
+            if(publication.bankLease())
+                throw std::invalid_argument("CPU joint graph setup retained an execution bank");
+            if(!family || !family->cohort())
+                throw std::invalid_argument("CPU joint graph setup has no original source family");
+            if(!layout)
+                throw std::invalid_argument("CPU joint graph setup has no admitted serial route layout");
+            if(family->participantIndex()!=layout->member())
+                throw std::invalid_argument("CPU joint graph setup changed its original serial member coordinate");
+            // The serial arena is checked across every retained layer and owns
+            // only shared physical roots. Its representative cohort is NOT the
+            // per-layer source authority; formats/layer lifetimes may differ.
+            // Exact original endpoints and all projection cuts must still match.
+            const auto source_members=family->cohort()->participants();
+            const auto arena_members=layout->cohort()->participants();
+            if(source_members.size()!=arena_members.size() ||
+               !std::equal(source_members.begin(),source_members.end(),arena_members.begin()))
+                throw std::invalid_argument("CPU joint graph setup changed original ordered serial participants");
+            for(size_t member=0;member<source_members.size();++member)
+                if(family->cohort()->ownership(member)!=layout->cohort()->ownership(member))
+                    throw std::invalid_argument("CPU joint graph setup changed original serial projection geometry");
+            if(!params_.cpu_workspace_source || params_.gate_exps || params_.up_exps || params_.down_exps ||
+               nonempty(params_.prepared_gate_gemm) || nonempty(params_.prepared_up_gemm) || nonempty(params_.prepared_down_gemm) ||
+               std::any_of(params_.expert_mask.begin(),params_.expert_mask.end(),[](bool active){return active;}))
+                throw std::invalid_argument("CPU joint graph setup requires source workspace metadata and no epoch engine pointers");
+        }
         if (!params_.input_rows && params_.input_rows_lifetime)
             params_.input_rows = params_.input_rows_lifetime.get();
         if (!params_.output_rows && params_.output_rows_lifetime)
@@ -1197,9 +1227,8 @@ namespace llaminar2
             invocation_expert_mask_.resize(expert_count, false);
             if (params_.cpu_joint_layer)
             {
-                // The retained joint executor authenticates these exact source
-                // engines during construction, before any sparse packet exists.
-                // Ordinary epoch-mutable endpoints still start with empty tables.
+                // The immutable source declares workspace only. Every engine
+                // arrives later with its exact packet-epoch reader.
                 invocation_gate_engines_ = params_.prepared_gate_gemm;
                 invocation_up_engines_ = params_.prepared_up_gemm;
                 invocation_down_engines_ = params_.prepared_down_gemm;
@@ -1394,7 +1423,7 @@ namespace llaminar2
                 ? MoEExpertWeightResolutionPolicy::PreparedRegistryOnly
                 : MoEExpertWeightResolutionPolicy::RawOrPrepared;
         compute_params.prepared_engine_binding_lifecycle =
-            registry_only && !params_.cpu_joint_layer
+            registry_only
                 ? MoEPreparedEngineBindingLifecycle::
                       SparseOverlayInvocationPublished
                 : MoEPreparedEngineBindingLifecycle::

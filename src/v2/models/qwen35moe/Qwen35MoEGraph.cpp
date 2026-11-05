@@ -11525,12 +11525,11 @@ namespace llaminar2
                                 if (joint_local_target)
                                 {
                                     auto residency = config_.moe.expert_overlay_participant_residency;
-                                    std::string error;
-                                    if (!prepared_weight_store_ || !config_.moe.expert_overlay_cpu_joint_context ||
-                                        !residency->registerInitialCPUJointBank(registry, prepared_weight_store_->modelId(),
-                                            target_participant, &error))
-                                        throw std::runtime_error("Qwen35 colocated CPU fragment has no original prepared source/context: " + error);
-                                    auto frame = residency->initialCPUJointLayer(target_participant, layer_idx);
+                                    if (!prepared_weight_store_ || !config_.moe.expert_overlay_cpu_joint_context)
+                                        throw std::runtime_error("Qwen35 colocated CPU fragment has no original prepared source/context");
+                                    auto frame = adoptMoEOverlayCPUJointGraphDeclaration(*residency,registry,
+                                        prepared_weight_store_->modelId(),target_participant,layer_idx,
+                                        config_.moe.num_experts,config_.d_model,expert_intermediate);
                                     const auto arena = local_params.serial_compact_buffer_arena;
                                     if (cpu_llep_state)
                                         throw std::logic_error("Qwen35 Static CPU joint fragments do not support current-batch LLEP");
@@ -11538,11 +11537,7 @@ namespace llaminar2
                                         !arena || !arena->cpuJointLayout() || !arena->cpuJointLayout()->isRoot() ||
                                         !canonical_route_ticket_storage)
                                         throw std::logic_error("Qwen35 colocated CPU fragment requires its original root arena and canonical ticket");
-                                    const auto construction = frame->acquireInitialConstruction();
-                                    if (!construction)
-                                        throw std::logic_error("Qwen35 CPU fragment lost its initial construction bank");
                                     const auto &source = *frame->sourceSelection();
-                                    const auto &initial_layer = construction->layerForModelLayer(layer_idx);
                                     local_params.cpu_joint_layer = frame;
                                     local_params.return_layout = MoEOverlayReturnLayout::ParticipantTokenPartials;
                                     local_params.gate_exps = nullptr;
@@ -11568,13 +11563,7 @@ namespace llaminar2
                                     local_params.prepared_gate_gemm.assign(config_.moe.num_experts, nullptr);
                                     local_params.prepared_up_gemm.assign(config_.moe.num_experts, nullptr);
                                     local_params.prepared_down_gemm.assign(config_.moe.num_experts, nullptr);
-                                    for (const int expert : source.expertIds())
-                                    {
-                                        const auto &engines = initial_layer.cpu_fragments.at(static_cast<size_t>(expert));
-                                        local_params.prepared_gate_gemm[expert] = engines.gate().get();
-                                        local_params.prepared_up_gemm[expert] = engines.up().get();
-                                        local_params.prepared_down_gemm[expert] = engines.down().get();
-                                    }
+                                    local_params.expert_mask.assign(config_.moe.num_experts,false);
                                 }
                                 if (!joint_local_target) if (const auto *participant = owner_map_lifetime->participantForId(target_participant))
                                 {
