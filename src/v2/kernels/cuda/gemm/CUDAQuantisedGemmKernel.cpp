@@ -64,6 +64,7 @@
 #include "tensors/BlockStructures.h" // Q8_1Block
 #include "tensors/KernelSnapshotInfo.h"
 #include "tensors/NativeVnniScalePlane.h"
+#include "kernels/common/NativeVnniPrimaryPlaneUpload.h"
 #include "transfer/TransferEngine.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/device/AlignedWorkspaceSlices.h"
@@ -117,10 +118,6 @@ namespace llaminar2
 
             // Upload raw bytes from host to device (nvcc-compiled for CUDA runtime consistency)
             bool cudaQuantGemm_uploadRawBytes(const void *h_src, void **d_dst, size_t bytes, int cuda_device_id);
-            // Execute a NativeVnniPrimaryPlaneUploadPlan (exact live primary-plane extents).
-            bool cudaQuantGemm_uploadPlannedRawBytes(const void *h_src, void **d_dst, size_t allocation_bytes,
-                                                     size_t copies, size_t stride_bytes, size_t copy_bytes,
-                                                     int cuda_device_id);
 
             // Memory movement helpers for prepared tensor projections.
             bool cudaQuantGemm_copyHostToDevice(float *d_dst, const float *h_src, size_t count, int cuda_device_id);
@@ -820,22 +817,27 @@ namespace llaminar2
                 CUDAPackedWeights::DeviceUpload &upload,
                 int cuda_device_id)
             {
-                // The primary plane transfers its exact live extent (shared
-                // upload plan): an odd one-byte E8M0 plane keeps its rounded
-                // storage capacity but never sends the unused byte.
-                const auto plan = nativeVnniPrimaryPlaneUploadPlan(
-                    packed.native_codebook_id,
-                    static_cast<size_t>(packed.N) * packed.native_blocks_per_row, 1);
-                if (plan.allocation_bytes != packed.native_scales.size() * sizeof(uint16_t))
+                // The shared primary-plane uploader derives the exact live
+                // extent: an odd one-byte E8M0 plane keeps its rounded storage
+                // capacity but never sends the unused byte.
+                IBackend *const backend = getCUDABackend();
+                void *const setup_stream =
+                    GPUDeviceContextPool::instance().getNvidiaContext(cuda_device_id).defaultStream();
+                if (!backend || !setup_stream)
                 {
                     throw std::runtime_error(
-                        "[CUDAQuantGemm] Native-VNNI primary plane does not match its upload plan");
+                        "[CUDAQuantGemm] Packed-weight upload has no CUDA backend or explicit setup stream");
                 }
                 void *d_scales = nullptr;
-                const bool scales_uploaded = cudaQuantGemm_uploadPlannedRawBytes(
-                    packed.native_scales.data(), &d_scales, plan.allocation_bytes,
-                    plan.copies, plan.stride_bytes, plan.copy_bytes, cuda_device_id);
+                const auto scales_status = uploadNativeVnniPrimaryPlane(
+                    packed.native_codebook_id,
+                    static_cast<size_t>(packed.N) * packed.native_blocks_per_row, 1,
+                    packed.native_scales.data(), packed.native_scales.size() * sizeof(uint16_t), &d_scales,
+                    [&](size_t bytes) { return backend->allocate(bytes, cuda_device_id); },
+                    [&](void *dst, const void *src, size_t bytes)
+                    { return backend->hostToDevice(dst, src, bytes, cuda_device_id, setup_stream); });
                 upload.d_native_scales = static_cast<uint16_t *>(d_scales);
+                const bool scales_uploaded = scales_status == NativeVnniPrimaryPlaneUploadStatus::Uploaded;
                 if (!scales_uploaded ||
                     !uploadHostArrayToDevice(packed.native_vnni, &upload.d_native_vnni, cuda_device_id) ||
                     !uploadHostArrayToDevice(packed.native_mins, &upload.d_native_mins, cuda_device_id) ||
