@@ -3744,6 +3744,13 @@ namespace llaminar2
                 return setError(failure_message + " (chunk planning failed: " +
                                 chunk_schedule.error + ")");
             }
+            LOG_DEBUG("[OrchestrationRunner] Prefill chunk schedule: " << [&] {
+                std::string text;
+                for (const auto &chunk : chunk_schedule.chunks)
+                    text += "[" + std::to_string(chunk.token_offset) + "+" + std::to_string(chunk.real_count) + "/" +
+                            std::to_string(chunk.bucket_seq_len) + "] ";
+                return text + "atomic_spans=" + std::to_string(policy.atomic_spans.size());
+            }());
 
             uint64_t local_padding_rows = 0;
             for (const auto &chunk : chunk_schedule.chunks)
