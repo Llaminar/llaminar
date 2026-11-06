@@ -71,7 +71,7 @@ template<class Function>decltype(auto) withDecoder(const native_bank::Binding&bi
  * @param query Original/produced query basis; @param isa Cold-admitted execution ISA.
  * @return Original finite dot, with no decoded head or whole-operation scalar replay.
  */
-template<class Row>[[gnu::always_inline]] float score(const Row&row,const float*query,ISALevel isa)noexcept
+template<class Row>[[gnu::always_inline]] inline float score(const Row&row,const float*query,ISALevel isa)noexcept
 {
 #if defined(__AVX512F__)
     if(isa==ISALevel::AVX512)
@@ -91,7 +91,7 @@ template<class Row>[[gnu::always_inline]] float score(const Row&row,const float*
  * @tparam Lane Original coordinate within a native eight-coordinate fragment.
  * @param values Original computed lanes; @return The exact original FP32 word.
  */
-template<unsigned Lane>[[gnu::always_inline]] float lane(native::Fragment8 values)noexcept
+template<unsigned Lane>[[gnu::always_inline]] inline float lane(native::Fragment8 values)noexcept
 {
     static_assert(Lane<8);
 #if LLAMINAR_COMPILED_WITH_NEON
@@ -107,7 +107,7 @@ template<unsigned Lane>[[gnu::always_inline]] float lane(native::Fragment8 value
  * @param matrix Original admitted row-major rotation; @param base Original coordinate base.
  * @param output Exclusive spatial-basis result; @param isa Admitted native program.
  */
-template<unsigned Lane>[[gnu::always_inline]] void transposeCoordinate(native::Fragment8 weighted,const float*matrix,int base,float*output,ISALevel isa)noexcept
+template<unsigned Lane>[[gnu::always_inline]] inline void transposeCoordinate(native::Fragment8 weighted,const float*matrix,int base,float*output,ISALevel isa)noexcept
 {
     const auto value=lane<Lane>(weighted);const auto*coefficients=matrix+std::size_t(base+Lane)*256;
 #if defined(__AVX512F__)
@@ -138,7 +138,7 @@ template<unsigned Lane>[[gnu::always_inline]] void transposeCoordinate(native::F
  * @param matrix Original rotation; @param base Original coordinate base.
  * @param output Exclusive result; @param isa Admitted native program; @param indices Ordered index token.
  */
-template<unsigned...Lanes>[[gnu::always_inline]] void transposeFragment(native::Fragment8 weighted,const float*matrix,int base,float*output,ISALevel isa,std::integer_sequence<unsigned,Lanes...>indices)noexcept
+template<unsigned...Lanes>[[gnu::always_inline]] inline void transposeFragment(native::Fragment8 weighted,const float*matrix,int base,float*output,ISALevel isa,std::integer_sequence<unsigned,Lanes...>indices)noexcept
 {
     (void)indices;(transposeCoordinate<Lanes>(weighted,matrix,base,output,isa),...);
 }

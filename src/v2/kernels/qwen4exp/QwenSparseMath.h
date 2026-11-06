@@ -5,7 +5,10 @@
  * Arithmetic between casts is FP32. FP16/BF16 round to nearest even at pooling,
  * RMSNorm output, rotary operands, and rotary output, matching the independent
  * Transformers 28034545c35a reference rather than treating FP32 storage as an
- * implicit precision policy. There is no backend-owned persistent state here.
+ * implicit precision policy. Host analytic factors execute the two declared
+ * public float elementary functions separately: some libm paired routines have
+ * different last bits, so their compiler substitution is not numerically neutral.
+ * There is no backend-owned persistent state here.
  */
 #pragma once
 #include "QwenSparseAttention.h"
@@ -30,7 +33,41 @@ extern "C" __device__ float __nv_sinf(float);
 
 namespace llaminar2::qwen4exp::detail
 {
-/** @brief Resolve FP32 checkpoint rotary factors with explicit partial rotary width. */
+#if !defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__)
+/** @brief Execute the declared distinct host cosf/sinf operations with one unchanged FP32 angle.
+ * @param angle Original completed FP32 angle; @param cosine Public cosf result.
+ * @param sine Public sinf result.
+ * @details The second argument is an opaque identity dependent on the completed
+ * cosine. After inlining the compiler cannot merge different argument values
+ * into a paired libm call. This emits no instruction, memory fence or FP-mode
+ * change, and does not replace either public elementary function with an
+ * approximation or a private platform ABI. Device policies remain separate.
+ */
+[[gnu::always_inline]] inline void hostSeparateSinCos(float angle,float&cosine,float&sine)noexcept
+{
+    cosine=::cosf(angle);
+#if defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
+    asm volatile("" : "+w"(angle) : "w"(cosine));
+#elif defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    asm volatile("" : "+x"(angle) : "x"(cosine));
+#else
+#error "QSA host elementary-function boundaries require a native AArch64 or x86-64 GNU-compatible register ABI"
+#endif
+    sine=::sinf(angle);
+}
+#endif
+/** @brief Resolve original FP32 rotary factors under the declared source-specific program.
+ * @param source Admitted table, HF analytic, or ordinary-engine source.
+ * @param cosine Original cosine plane for the table source; @param sine Original sine plane.
+ * @param position Absolute original position; @param pair Original split-half pair index.
+ * @param rotaryDim Original even rotary prefix width; @param theta Original analytic base.
+ * @param c Produced FP32 cosine; @param s Produced FP32 sine.
+ * @param inverseFrequencies Original setup-owned HF reciprocal-power invariants, when supplied.
+ * @param negativeLogTheta Original setup-owned exponent scalar for the ordinary-engine source.
+ * @details Device HF/engine calls retain their distinct declared intrinsics.
+ * Host calls retain the public cosf/sinf pair as two operations, independent of
+ * the compiler's libm combining decisions. This owns no coefficient storage.
+ */
 QWEN_SPARSE_HD void rotaryFactors(QwenSparseRotarySource source,const float *cosine,const float *sine,
     int position,int pair,int rotaryDim,float theta,float &c,float &s,
     const float *inverseFrequencies=nullptr,float negativeLogTheta=0.0f)
@@ -58,7 +95,7 @@ QWEN_SPARSE_HD void rotaryFactors(QwenSparseRotarySource source,const float *cos
         if(source==QwenSparseRotarySource::CanonicalEngineTheta) { c=::__cosf(angle);s=::__sinf(angle); }
         else { c=::cosf(angle);s=::sinf(angle); }
 #else
-        c=::cosf(angle);s=::sinf(angle);
+        hostSeparateSinCos(angle,c,s);
 #endif
     }
 }

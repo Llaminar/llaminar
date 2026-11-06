@@ -17,6 +17,7 @@
 #include "kernels/qwen4exp/QwenSparseBoundedSelection.h"
 #include "utils/OpenMPUtils.h"
 #include "CPUQwenSparseExecution.h"
+#include "CPUQwenSparseIndexerProgram.h"
 #include "utils/CPUFeatures.h"
 #include <algorithm>
 #include <array>
@@ -71,39 +72,81 @@ ISALevel nativeISA()
 void prepare(const float *input, const float *weight, int position,
              const QwenSparseIndexer &p, float *output)
 {
-    float rounded[128], squares[128], normalized[128];
-    for (int d = 0; d < 128; ++d)
+    // The representation is dispatched once, never once per coordinate. Every
+    // admitted mode owns the same original 128-square tree and cast boundaries.
+    switch(p.representation)
     {
-        rounded[d] = detail::roundRepresentation(input[d], p.representation);
-        squares[d] = rounded[d] * rounded[d];
+    case QwenSparseScalar::FP32:return ::llaminar2::cpu::qsa_native::indexer::prepare<QwenSparseScalar::FP32>(input,weight,position,p,output);
+    case QwenSparseScalar::FP16:return ::llaminar2::cpu::qsa_native::indexer::prepare<QwenSparseScalar::FP16>(input,weight,position,p,output);
+    case QwenSparseScalar::BF16:return ::llaminar2::cpu::qsa_native::indexer::prepare<QwenSparseScalar::BF16>(input,weight,position,p,output);
     }
-    for (int width = 64; width; width /= 2)
-        for (int d = 0; d < width; ++d) squares[d] += squares[d + width];
-    const float inverse = 1.0f / std::sqrt(squares[0] / 128.0f + p.norm_epsilon);
-    if(!std::isfinite(inverse)||inverse<=0)invalidNumeric("indexer RMS summary");
-    for (int d = 0; d < 128; ++d)
-    {
-        normalized[d] = detail::roundRepresentation((rounded[d] * inverse) * weight[d], p.representation);
-        if(!std::isfinite(normalized[d]))invalidNumeric("indexer normalized representation");
-    }
-    const int half = p.rotary_dim / 2;
-    for (int d = 0; d < 128; ++d)
-    {
-        if (d >= p.rotary_dim) { output[d] = normalized[d]; continue; }
-        const int pair = d % half;
-        float cosine,sine;
-        detail::rotaryFactors(p.rotary_source,p.cosine,p.sine,position,pair,p.rotary_dim,p.rope_theta,cosine,sine,p.inverse_frequencies.data());
-        const float c = detail::roundRepresentation(cosine, p.representation);
-        const float s = detail::roundRepresentation(sine, p.representation);
-        const float partner = d < half ? -normalized[d + half] : normalized[d - half];
-        const float first = detail::roundRepresentation(normalized[d] * c, p.representation);
-        const float second = detail::roundRepresentation(partner * s, p.representation);
-        const auto result=detail::roundRepresentation(first+second,p.representation);
-        if(!std::isfinite(result))invalidNumeric("indexer rotary representation");
-        output[d]=result;
-    }
+    ::llaminar2::cpu::qsa_native::rejectProgram();
 }
 
+/** @brief Dispatch one original four-row pool to the exact native representation program.
+ * @param raw Original raw128-coordinate roots; no projected operand is copied.
+ * @param weight Original converted key normalization weights.
+ * @param position Original block-start RoPE position; @param p Original admitted policy.
+ * @param output Exclusive prepared128-coordinate pool.
+ */
+void preparePool(const std::array<const float*,4>&raw,const float*weight,int position,const QwenSparseIndexer&p,float*output)noexcept
+{
+    switch(p.representation)
+    {
+    case QwenSparseScalar::FP32:return ::llaminar2::cpu::qsa_native::indexer::preparePool<QwenSparseScalar::FP32>(raw,weight,position,p,output);
+    case QwenSparseScalar::FP16:return ::llaminar2::cpu::qsa_native::indexer::preparePool<QwenSparseScalar::FP16>(raw,weight,position,p,output);
+    case QwenSparseScalar::BF16:return ::llaminar2::cpu::qsa_native::indexer::preparePool<QwenSparseScalar::BF16>(raw,weight,position,p,output);
+    }
+    ::llaminar2::cpu::qsa_native::rejectProgram();
+}
+/** @brief Tie original pool loads to the completed preceding head without changing the root.
+ * @param original Original admitted128-coordinate pool root.
+ * @param completed Completed preceding head sum, or positive zero before head0.
+ * @return The identical original pointer bits, with a compiler-only dependency.
+ * @details Streaming each head's fragments bounds vector liveness instead of
+ * retaining the entire pool across heads. This identity copies no operand and
+ * establishes no allocation, lease, publication or runtime synchronization.
+ */
+[[gnu::always_inline]] inline const float* followScoreHead(const float*original,float completed)noexcept
+{
+#if defined(__aarch64__)
+    asm volatile("" : "+r"(original) : "w"(completed));
+#elif defined(__x86_64__)
+    asm volatile("" : "+r"(original) : "x"(completed));
+#else
+#error "CPU QSA score-head ordering requires a native AArch64 or x86-64 GNU-compatible register ABI"
+#endif
+    return original;
+}
+/** @brief Score the complete original pool frontier for one already-admitted ranking row.
+ * @param query Original produced four-head query row, exactly4*128 coordinates.
+ * @param pools Original persistent128-coordinate pool rows; never a decoded mirror.
+ * @param scores Exclusive original output row for the declared complete pools.
+ * @param blocks Original visible complete-pool count, strictly greater than512.
+ * @param isa Original execution-admitted native arithmetic program.
+ * @details One call covers every block/head in this score phase, not a complete
+ * M1 indexer operation. Keeping its original roots/geometry in value arguments
+ * bounds GPR liveness independently of the caller's selection heap and policy.
+ * No per-dot call, operand copy, allocation or new collective edge is introduced.
+ * Every head retains the declared ordered native FMA chains/fold, finite check,
+ * ReLU, increasing-head addition and final separate FP32 scale.
+ */
+[[gnu::noinline]] void scorePools(const float*query,const float*pools,float*scores,int blocks,ISALevel isa)noexcept
+{
+    for(int block=0;block<blocks;++block)
+    {
+        float score=0.0f;const float*headPool=pools+std::size_t(block)*128;
+        for(int head=0;head<4;++head)
+        {
+            headPool=followScoreHead(headPool,score);
+            const auto value=::llaminar2::cpu::qsa_native::dot<128>(query+std::size_t(head)*128,headPool,isa);
+            if(!std::isfinite(value))invalidNumeric("indexer native score");
+            score+=std::max(0.0f,value);
+        }
+        if(!std::isfinite(score))invalidNumeric("indexer head-score sum");
+        scores[block]=score*0.08838834764831844055f;
+    }
+}
 /** @brief Resolve a transaction-relative raw key without touching future rows.
  * @param p Original tail/current-projection roots and replay.
  * @param token Original logical token; @return Exact original raw128-coordinate row.
@@ -131,7 +174,9 @@ bool selectRow(const QwenSparseIndexer &p, int row)
     const int blocks = visible / QwenSparsePool;
     const int keep = std::min(blocks, QwenSparseBlocks);
     auto *selected = p.selected + std::size_t(row) * QwenSparseSelected;
-    const auto *scores = p.scores + std::size_t(row) * p.block_capacity;
+    // No-ranking replay intentionally owns no score bank. Even forming a
+    // nonzero offset from its null root is UB, despite never reading a score.
+    const auto *scores = blocks>QwenSparseBlocks ? p.scores+std::size_t(row)*p.block_capacity : nullptr;
     std::array<std::int32_t, QwenSparseBlocks> heap;
     if (blocks <= QwenSparseBlocks)
         for (int block = 0; block < blocks; ++block) heap[block] = block;
@@ -227,16 +272,8 @@ void cpuQwenSparseIndexer(const QwenSparseIndexer &p)
 #pragma omp for schedule(static)
         for (int block = first_block; block < complete_blocks; ++block)
         {
-            float pooled[128];
-            for (int d = 0; d < 128; ++d)
-            {
-                float sum = detail::roundRepresentation(rawKey(p, block * 4)[d], p.representation);
-                for (int member = 1; member < 4; ++member)
-                    sum += detail::roundRepresentation(rawKey(p, block * 4 + member)[d], p.representation);
-                pooled[d] = detail::roundRepresentation(sum * 0.25f, p.representation);
-            }
-            prepare(pooled, p.key_norm, replay.position_origin + block * 4, p,
-                    p.pooled_keys + std::size_t(block) * 128);
+            const std::array<const float*,4>raw{rawKey(p,block*4),rawKey(p,block*4+1),rawKey(p,block*4+2),rawKey(p,block*4+3)};
+            preparePool(raw,p.key_norm,replay.position_origin+block*4,p,p.pooled_keys+std::size_t(block)*128);
         }
 #pragma omp for schedule(static)
         for (int row_head = queryHeads.first; row_head < queryHeads.end; ++row_head)
@@ -255,19 +292,8 @@ void cpuQwenSparseIndexer(const QwenSparseIndexer &p)
             {
                 const int blocks = (replay.prefix_tokens + row + 1) / QwenSparsePool;
                 if (!noRanking && blocks > QwenSparseBlocks)
-                    for (int block = 0; block < blocks; ++block)
-                    {
-                        float score = 0.0f;
-                        for (int head = 0; head < 4; ++head)
-                        {
-                            const auto value=::llaminar2::cpu::qsa_native::dot<128>(p.prepared_query+(std::size_t(row)*4+head)*128,
-                                p.pooled_keys+std::size_t(block)*128,isa);
-                            if(!std::isfinite(value))invalidNumeric("indexer native score");
-                            score+=std::max(0.0f,value);
-                        }
-                        if(!std::isfinite(score))invalidNumeric("indexer head-score sum");
-                        p.scores[std::size_t(row) * p.block_capacity + block] = score * 0.08838834764831844055f;
-                    }
+                    scorePools(p.prepared_query+std::size_t(row)*4*128,p.pooled_keys,
+                        p.scores+std::size_t(row)*p.block_capacity,blocks,isa);
             }
             if(!selectRow(p,row))invalidNumeric("indexer bounded selection");
         }
