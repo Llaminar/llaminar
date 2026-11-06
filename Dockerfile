@@ -352,9 +352,10 @@ RUN set -e; \
 
 # Python dependencies for the reference tests + parity gates. Pulls the
 # CPU-only PyTorch wheel (~250 MB) plus our transformers fork. Cached as a
-# separate layer keyed only on requirements.txt so source edits don't
-# invalidate it.
+# separate layer keyed on the complete requirements closure so numerical
+# policy changes invalidate it, while ordinary source edits do not.
 COPY requirements.txt ./requirements.txt
+COPY python/reference/quantization/w4a4-requirements.txt ./python/reference/quantization/w4a4-requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --break-system-packages -r requirements.txt
 

@@ -3,6 +3,8 @@ GGUF File Format Parser
 
 Low-level parser for GGUF (GPT-Generated Unified Format) files.
 Extracts metadata, tensor information, and provides access to tensor data.
+Native quantized source extents are storage contracts, not floating estimates;
+W4A4/W4A4H payloads retain their online-activation metadata for native consumers.
 
 File Format Reference:
 https://github.com/ggerganov/llama.cpp/blob/master/docs/gguf.md
@@ -70,6 +72,9 @@ class GGUFTensorType(IntEnum):
     IQ4_XS = 23
     IQ1_M = 29
     BF16 = 30
+    # Pinned ruquant fork types, not aliases for an ordinary four-bit codebook.
+    W4A4 = 44
+    W4A4H = 45
 
 
 class GGUFTensorInfo:
@@ -507,6 +512,11 @@ class GGUFParser:
             return n_elements * 4
         elif tensor_type in (GGUFTensorType.F16, GGUFTensorType.BF16):
             return n_elements * 2
+        elif tensor_type in (GGUFTensorType.W4A4, GGUFTensorType.W4A4H):
+            if (len(tensor_info.shape) != 2 or any(dim <= 0 for dim in tensor_info.shape)
+                    or tensor_info.shape[-1] % 256):
+                raise ValueError('W4A4 native storage requires a rank-two matrix with K divisible by 256')
+            return n_elements // 256 * 144
         elif tensor_type == GGUFTensorType.Q4_0:
             # Q4_0: 32 elements per block, 18 bytes per block (2 scale + 16 data)
             block_size = 32

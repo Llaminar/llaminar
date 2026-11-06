@@ -3,6 +3,9 @@ Qwen 3.5 Gated Delta Net Reference Implementation
 
 PyTorch reference implementation for Qwen 3.5 models using HuggingFace transformers.
 Captures intermediate pipeline states for parity testing with Llaminar.
+The ruquant W4A4/H export installs native integer-operand projections into the
+pinned HF graph. Online A4 quantization is not replaced by floating matmuls,
+and its rotated main-model basis does not implicitly qualify the MTP sidecar.
 
 Architecture:
   - Hybrid 3:1 layout: 75% Gated DeltaNet (linear attention) + 25% full softmax GQA
@@ -137,7 +140,9 @@ class Qwen35ReferenceModel(HuggingFaceReferenceModel):
         """
 
         from .loaders import GGUFLoader
-        from .loaders.gguf_parser import GGUFParser
+        from .loaders.gguf_loader import GGUFWeightMode
+        from .loaders.gguf_parser import GGUFParser, GGUFTensorType
+        from .quantization.w4a4 import W4A4Weights, install_native_linear, require_pinned_hf_runtime
         from transformers.initialization import no_init_weights
         from transformers.models.qwen3_5.modeling_qwen3_5 import (
             Qwen3_5DecoderLayer,
@@ -152,6 +157,15 @@ class Qwen35ReferenceModel(HuggingFaceReferenceModel):
             config_dict = loader.load_config(
                 parser=parser, as_transformers_config=False
             )
+            has_native_w4a4 = any(tensor.type in (GGUFTensorType.W4A4, GGUFTensorType.W4A4H)
+                                  for tensor in parser.tensors)
+            self._w4a4_reference_policy = None
+            if has_native_w4a4:
+                if self.device.type != 'cpu' or torch_dtype not in (None, torch.float32):
+                    raise ValueError('Native W4A4 HF reference requires CPU FP32 execution')
+                self._w4a4_reference_policy = require_pinned_hf_runtime()
+                if kwargs.get('mtp_sidecar_reference_pack') is not None:
+                    raise RuntimeError('W4A4 MTP basis compatibility has not been established')
             sidecar_reference_pack = kwargs.get("mtp_sidecar_reference_pack")
             self._mtp_sidecar_reference_pack = (
                 Path(sidecar_reference_pack)
@@ -246,7 +260,14 @@ class Qwen35ReferenceModel(HuggingFaceReferenceModel):
                 show_progress=self.verbose,
                 max_in_flight=8,
                 include_mapped_name=include_sidecar_tensor,
+                weight_mode=GGUFWeightMode.NATIVE_OPERANDS,
             ):
+                if isinstance(tensor, W4A4Weights):
+                    # Native operands replace the declared linear itself, not
+                    # its weight parameter. No FP32 weight mirror survives.
+                    install_native_linear(self.hf_model, mapped_name, tensor,
+                                          main_parameters, main_loaded)
+                    continue
                 if raw_nextn_prefix and mapped_name.startswith(raw_nextn_prefix):
                     self._mtp_sidecar_state[mapped_name] = tensor.detach()
                     continue
@@ -582,6 +603,11 @@ class Qwen35ReferenceModel(HuggingFaceReferenceModel):
         separate from additive branch replay so neither operation can silently
         treat an arbitrary directory as a complete-model oracle.
         """
+        if getattr(self, '_w4a4_reference_policy', None) is not None:
+            raise RuntimeError(
+                'W4A4 MTP basis compatibility has not been established: the rotated '
+                'main graph and copied nextn weights require an authenticated basis contract'
+            )
         if not getattr(self, "_mtp_sidecar_state", None):
             raise RuntimeError(
                 "The dense GGUF has no retained Qwen3.6 nextn/MTP sidecar"
