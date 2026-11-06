@@ -11,11 +11,11 @@
 #include <type_traits>
 namespace llaminar2 {
 /** @brief Source service operation; exclusive promotion must detach new RAM reads. */
-enum class ImmutableRowReadIntent : std::uint64_t { Read = 0, ReadAndInvalidate = 1 };
+enum class ImmutableRowReadIntent : std::uint64_t { Read = 0, ReadAndInvalidate = 1, FutureLookupOnly = 2 };
 /** @brief One live compact-ID operation with an opaque GPU reservation generation. */
 struct ImmutableRowSubordinateIntent final {
     ImmutableRowReadIntent intent = ImmutableRowReadIntent::Read;
-    std::uint64_t destination_grant = 0; ///< Zero for Read, nonzero for exclusive promotion; CPU never decodes it.
+    std::uint64_t destination_grant = 0; ///< Zero for Read/FutureLookupOnly, nonzero for exclusive promotion; CPU never decodes it.
 };
 /** @brief Published only after native fill and generation-matched RAM invalidation. */
 struct ImmutableRowInvalidationAcknowledgement final {

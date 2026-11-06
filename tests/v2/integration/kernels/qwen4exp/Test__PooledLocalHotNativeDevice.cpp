@@ -5,6 +5,7 @@
  * response inputs are recorded: it proves no L2 delivery, Rank cohort or model
  * inference. No source seal or physical retirement authority is synthesized.
  */
+#include "fixtures/backends/NativeGraphTimingEvents.h"
 #include "fixtures/execution/RetainedHostServiceFixture.h"
 #include "fixtures/backends/PreparedNativeLookupFixture.h"
 #include "fixtures/backends/RetainedParticipantGraphExecutableFixtureAccess.h"
@@ -25,6 +26,8 @@
 #include "utils/EmbeddingVerifierFormats.h"
 #include "utils/PooledNgramReplayTrace.h"
 #include "LocalHotRecordedResponse.h"
+#include "execution/local_execution/graph/IGraphBuilder.h"
+#include "execution/local_execution/graph/RequestInputPositionAdmission.h"
 #include <gtest/gtest.h>
 #include <array>
 #include <atomic>
@@ -72,7 +75,7 @@ std::size_t nativeReplayStagingBytes(const ReplayCase& c)
  * @param maximumOriginal Full sixteen-head ID capacity, independent of compact misses.
  * @return Original geometry and arena declarations, with no live capacity decision.
  */
-auto geometry(const ReplayCase& c,DeviceId device,std::uint32_t slots,std::uint32_t maximumOriginal=64)
+auto geometry(const ReplayCase& c,DeviceId device,std::uint32_t slots,std::uint32_t maximumOriginal=64,bool nextWindow=false)
 {
     const auto source=c.file->descriptor();const PhysicalMemoryAllocatorIdentity gpu{0,device},host{0,DeviceId::cpu()};
     const std::array tiers{ImmutableRowStorage::VRAM,ImmutableRowStorage::RAM,ImmutableRowStorage::MemoryMapped};
@@ -90,14 +93,16 @@ auto geometry(const ReplayCase& c,DeviceId device,std::uint32_t slots,std::uint3
         CPUTensorStorageDeclaration(1,1,BufferTensorType::INT32,PhysicalMemoryOwner::ActivationArena,DeviceId::cpu()),
         CPUTensorStorageDeclaration(1,sampling_math::kDeviceGenerationControlCount,BufferTensorType::INT32,PhysicalMemoryOwner::ActivationArena,DeviceId::cpu()),
         CPUTensorStorageDeclaration(maximumOriginal/16,16*c.file->columns,BufferTensorType::FP32,PhysicalMemoryOwner::ActivationArena,DeviceId::cpu())};
+    if(nextWindow)declarations.emplace_back(1,2*(maximumOriginal/16+1)+4,BufferTensorType::INT32,
+        PhysicalMemoryOwner::ActivationArena,DeviceId::cpu());
     return std::tuple{std::move(layout),std::move(physical),std::move(policy),std::move(cpu),std::move(channel),std::move(local),std::move(declarations)};
 }
 /** @brief Existing inventory, low-key scan pressure, or full-width large-radix correctness. */
-enum class ReplayShape { SmallInventory, LargeRadixScan, LargeRadixWideKey };
+enum class ReplayShape { SmallInventory, LargeRadixScan, LargeRadixWideKey, NextWindowCount, LargeFutureAdoption, SmallProbeBoundary, SmallProbeTiming };
 /**
  * @brief Run the exact selected native backend; absence is an error, never a skip.
  * @param device Original requested native participant.
- * @param slots Admitted local slots; both large profiles retain four original slots.
+ * @param slots Admitted local slots; the small-boundary sweep includes zero capacity.
  * @param wide Select the original sparse high-key-only inventory.
  * @param shape Immutable original query capacity and finite replay workload.
  */
@@ -105,11 +110,15 @@ void replayLocal(DeviceId device,std::uint32_t slots,bool wide,
     ReplayShape shape=ReplayShape::SmallInventory)
 {
     if(!hasCPUBackend())initCPUBackend(-1);
+    const bool nextWindow=shape==ReplayShape::NextWindowCount;
     const bool scanPressure = shape == ReplayShape::LargeRadixScan;
     const bool largeWideKey = shape == ReplayShape::LargeRadixWideKey;
-    const bool large = scanPressure || largeWideKey;
-    const std::uint32_t maximumOriginal = large ? 1024 : 64;
-    requireProvider(!large || (slots == 4 && wide == largeWideKey),
+    const bool timingMode = shape == ReplayShape::SmallProbeTiming;
+    const bool smallBoundary = shape == ReplayShape::SmallProbeBoundary || timingMode;
+    const bool large = scanPressure || largeWideKey || shape == ReplayShape::LargeFutureAdoption || smallBoundary;
+    const std::uint32_t maximumOriginal = smallBoundary ? 512 : large ? 1024 : 64;
+    requireProvider(!large || ((slots == 4 || (smallBoundary && slots == 0)) &&
+        (wide == largeWideKey || (smallBoundary && wide))),
         "Large native trace requires its exact original four-slot format inventory");
     std::vector<ReplayCase> cases;
     if(wide)cases.push_back({"UInt64_IQ4_NL",std::make_unique<ProviderFile>(),{7,101,102,ProviderFile::High,900},{}});
@@ -122,6 +131,16 @@ void replayLocal(DeviceId device,std::uint32_t slots,bool wide,
         if (large) { keys.resize(64); std::iota(keys.begin(), keys.end(), 1); }
         cases.push_back({entry.label,std::make_unique<ProviderFile>(*native,*format,columns),std::move(keys),{}});
     }
+    if(timingMode) {
+        // Match the real-model observer's IQ4_NL160/90-byte row and table
+        // extent. Scattered authored rows exercise the production eight-pass
+        // radix range without allocating the table's sparse file holes.
+        // Responses are still recorded component inputs, not real I/O timing.
+        constexpr std::uint64_t qfnRows=320001536;
+        std::vector<std::uint64_t> keys(64);
+        for(std::size_t i=0;i<keys.size();++i)keys[i]=7+i*((qfnRows-16)/keys.size());
+        cases.push_back({"QFN_IQ4_NL160",std::make_unique<ProviderFile>(qfnRows,keys),std::move(keys),{}});
+    }
     requireProvider(!scanPressure || cases.size()==2,
         "Large native trace lost its original FP32/IQ4_NL representative formats");
     requireProvider(!largeWideKey || cases.size()==1,
@@ -133,13 +152,14 @@ void replayLocal(DeviceId device,std::uint32_t slots,bool wide,
     constexpr std::size_t AdmissionOffset=0,RequestOffset=64,LaneOffset=192,KeyBytesOffset=224,ControlBytes=256;
     PhysicalMemoryPlanBuilder bom;
     for(const auto& c:cases) {
-        const auto [layout,physical,policy,cpu,channel,local,declarations]=geometry(c,device,slots,maximumOriginal);
+        const auto [layout,physical,policy,cpu,channel,local,declarations]=geometry(c,device,slots,maximumOriginal,nextWindow);
         for(const auto& contribution:{cpu.bom(host),physical.cacheBOM(0,gpu),physical.mandatoryBOM(0,gpu),policy.policyBOM(gpu),policy.mandatoryBOM(gpu),
             q::PooledImmutableOwnerNativePlan::mandatoryBOM(physical,policy,0,gpu),q::PooledImmutableCoordinatorNativePlan::mandatoryBOM(physical,policy,gpu),
             q::PooledImmutableSourceGeometry::mandatoryBOM(physical,policy,c.file->descriptor(),gpu),local.mandatoryBOM(gpu,host),local.slotDependentBOM(gpu,host),io.bom(host),
             RetainedParticipantGraphExecutable::generalBOM(host,gpu,5)})for(const auto& row:contribution.resources())bom.add(row);
         bom.add(host,PhysicalMemoryOwner::ImmutableLookupStaging,q::ImmutableLookupService::hostBytes(channel));
-        const auto activation=maximumOriginal*8+4+sampling_math::kDeviceGenerationControlCount*4+maximumOriginal*c.file->columns*4;
+        const auto activation=maximumOriginal*8+4+sampling_math::kDeviceGenerationControlCount*4+maximumOriginal*c.file->columns*4+
+            (nextWindow?(2*(maximumOriginal/16+1)+4)*sizeof(std::int32_t):0);
         bom.add(gpu,PhysicalMemoryOwner::ActivationArena,activation);
         for(const auto& declaration:declarations)bom.add(host,PhysicalMemoryOwner::ActivationArena,declaration.physicalBytes());
         bom.add(gpu,PhysicalMemoryOwner::ActivationTransportStaging,nativeReplayStagingBytes(c));
@@ -150,7 +170,7 @@ void replayLocal(DeviceId device,std::uint32_t slots,bool wide,
     const auto stream=ExplicitGPUStream(worker->defaultStream()).get();
     std::size_t ordinal=0;
     for(const auto& c:cases) {
-        const auto source=c.file->descriptor();const auto [layout,physical,policy,cpu,channel,local,declarations]=geometry(c,device,slots,maximumOriginal);
+        const auto source=c.file->descriptor();const auto [layout,physical,policy,cpu,channel,local,declarations]=geometry(c,device,slots,maximumOriginal,nextWindow);
         const RetainedHostServiceInstance ioKey{0,device,RetainedHostServiceRole::ImmutableLookupIO,ordinal++};
         RetainedHostServiceDeclarations::Builder builder(0);builder.add(ioKey,io);auto declared=std::move(builder).freeze();
         auto binding=declared->bind(memory,std::span{&ioKey,std::size_t{1}});
@@ -166,8 +186,8 @@ void replayLocal(DeviceId device,std::uint32_t slots,bool wide,
         BufferArena arena;
         std::optional<DeviceGenerationControlBinding> controllerValue;
         std::shared_ptr<DeviceTransferBuffer> staging;
-        std::shared_ptr<TensorBase> hashes,count,controlRoot,output;
-        std::optional<q::PooledImmutableLocalHotOperands> queryValue,futureValue,readValue,resultValue,resetValue,frameValue;
+        std::shared_ptr<TensorBase> hashes,count,controlRoot,output,windowRoot;
+        std::optional<q::PooledImmutableLocalHotOperands> queryValue,futureValue,adoptionValue,readValue,resultValue,resetValue,frameValue;
         local_hot_recorded::Args args{};
         std::vector<std::shared_ptr<RetainedParticipantGraphExecutable>> graphs;
         for(unsigned profile=0;profile<5;++profile)graphs.push_back(RetainedParticipantGraphExecutableFixtureAccess::original(permit,stream));
@@ -226,12 +246,24 @@ void replayLocal(DeviceId device,std::uint32_t slots,bool wide,
             const std::array<std::shared_ptr<const q::PooledImmutableLocalHotPreparedStorage>,2> duplicateLocals{storage,storage};
             EXPECT_THROW((void)ImmutableLookupSetupObservation::captureAdaptive(layout,cpu,service,sourceOwners,duplicateLocals),std::invalid_argument);
 
-            const auto activation=maximumOriginal*8+4+sampling_math::kDeviceGenerationControlCount*4+maximumOriginal*c.file->columns*4;
+            const auto activation=maximumOriginal*8+4+sampling_math::kDeviceGenerationControlCount*4+maximumOriginal*c.file->columns*4+
+            (nextWindow?(2*(maximumOriginal/16+1)+4)*sizeof(std::int32_t):0);
             activationLease=memory->claimNewAllocation(device,PhysicalMemoryOwner::ActivationArena,activation);
             const std::array roles{BufferId::QFN_NGRAM_ROW_IDS,BufferId::PREFILL_CHUNK_GEOMETRY,BufferId::MTP_GENERATION_CONTROL,BufferId::QFN_PLE_EMBEDDING};
             for(unsigned i=0;i<4;++i){std::shared_ptr<TensorBase> root(declarations[i].materialize(memory));std::memset(root->raw_mutable_data(),0,root->size_bytes());
                 TransferEngine::prepareDeviceInput(root.get(),device,stream);TransferEngine::requireDeviceInput(root.get(),device,stream);
                 requireProvider(arena.registerExternalBuffer(roles[i],root),"Original L1 arena declaration failed");}
+            if(nextWindow){
+                windowRoot=std::shared_ptr<TensorBase>(declarations[4].materialize(memory));
+                auto* words=static_cast<std::int32_t*>(windowRoot->raw_mutable_data());
+                const int requestCapacity=maximumOriginal/16+1;
+                std::fill_n(words,windowRoot->size_bytes()/4,1);
+                std::iota(words+requestCapacity,words+2*requestCapacity,100);
+                words[2*requestCapacity]=requestCapacity;words[2*requestCapacity+1]=100;
+                words[2*requestCapacity+2]=1;words[2*requestCapacity+3]=1;
+                TransferEngine::prepareDeviceInput(windowRoot.get(),device,stream);
+                TransferEngine::requireDeviceInput(windowRoot.get(),device,stream);
+            }
             controllerValue.emplace(DeviceGenerationControlBinding::admit(arena,device,0));
             const auto& controller=*controllerValue;
             const auto controlBytes=nativeReplayStagingBytes(c);
@@ -252,22 +284,45 @@ void replayLocal(DeviceId device,std::uint32_t slots,bool wide,
                 {hashes,roles[0],0,hashes->size_bytes()},q::PooledNativeTensorSpan{count,roles[1],0,4},controller,q::PooledImmutableLocalHotAccessIntent::CurrentInvocation));
             futureValue.emplace(q::PooledImmutableLocalHotOperands::query(*storage,consumer,DeviceRowRange::deviceCounted(maximumOriginal/16,static_cast<const int*>(count->gpu_data_ptr())),
                 {hashes,roles[0],0,hashes->size_bytes()},q::PooledNativeTensorSpan{count,roles[1],0,4},controller,q::PooledImmutableLocalHotAccessIntent::FutureReadAhead));
+            if(nextWindow){
+                const int capacity=maximumOriginal/16+1;
+                const auto* words=static_cast<const std::int32_t*>(windowRoot->gpu_data_ptr());
+                DevicePrefillChunkGraphBinding original{.backend=backend,
+                    .request_token_ids_device=words,.request_position_ids_device=words+capacity,
+                    .request_total_rows_device=words+2*capacity,.cached_tokens_device=words+2*capacity+1,
+                    .chunk_token_ids_device=const_cast<std::int32_t*>(words),.chunk_position_ids_device=const_cast<std::int32_t*>(words+2*capacity+1),
+                    .chunk_real_rows_device=const_cast<std::int32_t*>(words+2*capacity+2),
+                    .chunk_row_stride_device=const_cast<std::int32_t*>(words+2*capacity+3),
+                    .request_row_capacity=capacity,.bucket_seq_len=1,.capture_identity=storage->captureIdentity()};
+                auto window=q::Qwen4ExpPrefillNextWindowBinding::fromOriginalChunk(original,device,maximumOriginal/16,
+                    RequestInputPositionLayoutRequirement::ContiguousSingleRequestPrefill);
+                futureValue.emplace(q::PooledImmutableLocalHotOperands::nextWindowQuery(*storage,consumer,window,
+                    q::PooledNativeTensorSpan{hashes,roles[0],0,hashes->size_bytes()},controller));
+                EXPECT_TRUE(futureValue->hasNextWindow());
+                EXPECT_NE(futureValue->declarationIdentity(),queryValue->declarationIdentity());
+            }
+            adoptionValue.emplace(q::PooledImmutableLocalHotOperands::adoption(*storage,consumer,
+                DeviceRowRange::deviceCounted(maximumOriginal/16,static_cast<const int*>(count->gpu_data_ptr())),
+                {hashes,roles[0],0,hashes->size_bytes()},q::PooledNativeTensorSpan{count,roles[1],0,4},
+                {staging,AdmissionOffset,sizeof(t::SourceAdmissionHeader)},controller));
             readValue.emplace(q::PooledImmutableLocalHotOperands::read(*storage,consumer,{output,roles[3],0,output->size_bytes()},controller));
             resultValue.emplace(q::PooledImmutableLocalHotOperands::result(*storage,consumer,{staging,RequestOffset,sizeof(t::RequestHeader)},controller));
             resetValue.emplace(q::PooledImmutableLocalHotOperands::requestReset(*storage,consumer,{staging,AdmissionOffset,sizeof(t::SourceAdmissionHeader)},controller));
             frameValue.emplace(q::PooledImmutableLocalHotOperands::frame(*storage,consumer,controller));
-            for(auto* operand:{&*queryValue,&*futureValue,&*readValue,&*resultValue,&*resetValue,&*frameValue})operand->seal();
+            for(auto* operand:{&*queryValue,&*futureValue,&*adoptionValue,&*readValue,&*resultValue,&*resetValue,&*frameValue})operand->seal();
+            EXPECT_THROW(frameValue->require(q::PooledImmutableLocalHotAction::Adopt,*storage),std::logic_error);
+            EXPECT_NE(adoptionValue->declarationIdentity(),frameValue->declarationIdentity());
             const auto& query=*queryValue;const auto& future=*futureValue;const auto& read=*readValue;const auto& result=*resultValue;const auto& frame=*frameValue;
             for(unsigned profile=0;profile<5;++profile){
                 auto& capture=RetainedParticipantGraphExecutableFixtureAccess::capture(graphs[profile]);
                 ScopedBackendGraphCapture scope(*worker,capture,"actual L1 immutable recorded response replay");requireProvider(scope.begin(),"L1 graph recording failed");
                 const auto phase=[&](q::PooledImmutableLocalHotAction action,const q::PooledImmutableLocalHotOperands& operands){code->enqueue(action,*storage,operands,stream);};
-                phase(q::PooledImmutableLocalHotAction::Probe,profile==1 || profile==2?future:query);
+                phase(q::PooledImmutableLocalHotAction::Probe,profile==1 || profile==2 || (profile==4 && nextWindow)?future:query);
                 if(profile==0 || profile==3){launch(local_hot_recorded::Action::RecordedResponse,args);phase(q::PooledImmutableLocalHotAction::AcceptResult,result);}
                 if(profile==4) {scope.finish();requireProvider(capture.prepareRuntimeContextStorage(memory)&&capture.instantiate(),"L1 negative guard graph instantiation failed");continue;}
                 if(profile==2)phase(q::PooledImmutableLocalHotAction::Discard,frame);
                 else {
-                    if(profile==1)phase(q::PooledImmutableLocalHotAction::Adopt,frame);
+                    if(profile==1)phase(q::PooledImmutableLocalHotAction::Adopt,*adoptionValue);
                     storage->enqueueReadyWait(stream);phase(q::PooledImmutableLocalHotAction::LocalRead,read);storage->enqueueLocalReadCompleteWait(stream);
                     phase(q::PooledImmutableLocalHotAction::ConsumeDemand,frame);phase(q::PooledImmutableLocalHotAction::CopyFills,frame);
                     phase(profile==3?q::PooledImmutableLocalHotAction::Cancel:q::PooledImmutableLocalHotAction::CompleteFills,frame);
@@ -279,6 +334,10 @@ void replayLocal(DeviceId device,std::uint32_t slots,bool wide,
             const auto& controller=*controllerValue;const auto& reset=*resetValue;
             const auto captureIdentity=storage->captureIdentity();std::array<std::uint64_t,5> graphOrdinals{};std::uint64_t sequence=0;
             const auto join=[&]{onWorker([&]{requireProvider(backend->synchronizeStream(stream,device.ordinal),"L1 diagnostic native join failed");});};join();
+            // The explicit diagnostic uses the existing complete retained programs.
+            // Neither input upload nor result comparison is inside these events.
+            std::unique_ptr<NativeGraphTimingEvents> timing;
+            if(timingMode)timing=std::make_unique<NativeGraphTimingEvents>(*worker,device);
             const auto observe=[&]<class T>(std::size_t offset){T value{};onWorker([&]{requireProvider(backend->deviceToHostOnStream(&value,args.frame+offset,sizeof(T),device.ordinal,stream),"L1 terminal metadata copy failed");});join();return value;};
             /**
              * @brief Replay actual production dispatch, then inspect only its completed native frame.
@@ -294,9 +353,24 @@ void replayLocal(DeviceId device,std::uint32_t slots,bool wide,
                 const int tokens=int(ids.size()/16);onWorker([&]{requireProvider(backend->hostToDeviceOnStream(hashes->gpu_data_ptr(),full.data(),maximumOriginal*sizeof(std::uint64_t),device.ordinal,stream),"L1 original recorded hashes upload failed");
                 requireProvider(backend->hostToDeviceOnStream(count->gpu_data_ptr(),&tokens,4,device.ordinal,stream),"L1 original token count upload failed");
                 requireProvider(backend->hostToDeviceOnStream(output->gpu_data_ptr(),pristine.data(),pristine.size()*4,device.ordinal,stream),"L1 output poison upload failed");});
-                requireProvider(RetainedParticipantGraphExecutableFixtureAccess::submit(graphs[profile],++graphOrdinals[profile]),"L1 original graph submit failed");
+                if(nextWindow){
+                    const int total=tokens+1,offset=2*(maximumOriginal/16+1);
+                    onWorker([&]{requireProvider(backend->hostToDeviceOnStream(
+                        static_cast<std::int32_t*>(windowRoot->gpu_data_ptr())+offset,&total,4,device.ordinal,stream),
+                        "Original next-window request count upload failed");});
+                }
+                const auto submit=[&]{requireProvider(RetainedParticipantGraphExecutableFixtureAccess::submit(graphs[profile],++graphOrdinals[profile]),"L1 original graph submit failed");};
+                if(timing)onWorker([&]{timing->begin(stream);submit();timing->end(stream);});
+                else submit();
                 const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(30);
                 while(!RetainedParticipantGraphExecutableFixtureAccess::observeTerminal(graphs[profile])){requireProvider(std::chrono::steady_clock::now()<deadline,"L1 exact original terminal deadline");std::this_thread::yield();}
+                if(nextWindow){
+                    std::int32_t currentRows=0;
+                    onWorker([&]{requireProvider(backend->deviceToHostOnStream(&currentRows,
+                        static_cast<const std::int32_t*>(windowRoot->gpu_data_ptr())+2*(maximumOriginal/16+1)+2,
+                        4,device.ordinal,stream),"Original current count preservation observation failed");});join();
+                    EXPECT_EQ(currentRows,1);
+                }
                 const auto identity=observe.template operator()<h::FrameIdentity>(local.frameOffsets().identity);
                 const auto native=observe.template operator()<q::adaptive_lookup::FrameControl>(local.frameOffsets().control);
                 EXPECT_EQ(identity.query.sequence,++sequence);EXPECT_EQ(identity.disposition,h::Disposition::Idle);EXPECT_EQ(identity.terminal_error,q::adaptive_lookup::Status::Success);
@@ -346,7 +420,7 @@ void replayLocal(DeviceId device,std::uint32_t slots,bool wide,
                     const auto after=observe.template operator()<h::Counters>(local.frameOffsets().counters);
                     EXPECT_EQ(after.read_original_ids-before->read_original_ids,profile==2?0u:ids.size());
                     EXPECT_EQ(after.local_hit_original_ids-before->local_hit_original_ids,profile==2?0u:hitOriginal);
-                    EXPECT_EQ(after.consumed_original_ids-before->consumed_original_ids,profile==0?ids.size():0u);
+                    EXPECT_EQ(after.consumed_original_ids-before->consumed_original_ids,profile==0 || profile==1?ids.size():0u);
                     EXPECT_EQ(after.promotions-before->promotions,native.promotions);
                     EXPECT_EQ(after.evictions-before->evictions,native.evictions);
                     EXPECT_EQ(after.future_on_time_native_rows,0u);EXPECT_EQ(after.future_late_native_rows,0u);
@@ -360,20 +434,42 @@ void replayLocal(DeviceId device,std::uint32_t slots,bool wide,
                     }
                 }
                 EXPECT_EQ(storage->captureIdentity(),captureIdentity);
+                if(timing)std::cout<<"LOCAL_HOT_NATIVE_TIMING {\"device\":\""<<device.toString()
+                    <<"\",\"format\":\""<<c.label<<"\",\"profile\":"<<profile
+                    <<",\"ordinal\":"<<sequence<<",\"original_ids\":"<<ids.size()
+                    <<",\"physical_original_capacity\":"<<maximumOriginal
+                    <<",\"source_rows\":"<<native.source_rows<<",\"native_us\":"<<timing->microseconds()
+                    <<",\"scope\":\"complete_captured_local_graph_recorded_response\"}\n";
                 return native;
             };
             h::TerminalObservation previousTerminal{};
-            const unsigned requestLimit=large?2:wide || c.label=="FP32"?20:2;
+            const unsigned requestLimit=timingMode?20:large?2:wide || c.label=="FP32"?20:2;
             for(unsigned request=1;request<=requestLimit;++request) {
                 std::vector<int> healthy(sampling_math::kDeviceGenerationControlCount);healthy[sampling_math::kDeviceGenerationControlOk]=request%2?0:1;
                 onWorker([&]{requireProvider(backend->hostToDeviceOnStream(controller.row(),healthy.data(),healthy.size()*4,device.ordinal,stream),"Original request controller initialization failed");});
                 const auto ticket=service->arm(request);onWorker([&]{boundary->pooledKernels().admit(*boundary->pooledStorage(),ticket.generation,ticket.invocation,stream);
                 launch(local_hot_recorded::Action::ForwardOriginalAdmission,args);code->enqueue(q::PooledImmutableLocalHotAction::ResetRequest,*storage,reset,stream);});join();
                 if (large) {
-                    for (const auto live : {512u,528u,1024u,16u,0u}) {
+                    // Exercise the exact single-CTA ceiling and dirty shorter replays
+                    // through the original retained production graph.
+                    const std::array extents = smallBoundary ? std::array{496u,512u,32u,16u,0u} :
+                        std::array{512u,528u,1024u,16u,0u};
+                    for (const auto live : extents) {
                         std::vector<std::uint64_t> input(live);
                         for (std::size_t i=0;i<input.size();++i) input[i]=c.keys[i%c.keys.size()];
                         run(0,input);
+                    }
+                    if(smallBoundary && !timingMode) {
+                        // Coalescing is format-independent, but its live shape
+                        // and key width are not. Sweep every supported token
+                        // count in the small-query range on the actual retained
+                        // kernels, including C0 and wide-key registrations.
+                        for(unsigned tokens=0;tokens<=maximumOriginal/16;++tokens) {
+                            std::vector<std::uint64_t> input(tokens*16);
+                            for(std::size_t i=0;i<input.size();++i)
+                                input[i]=c.keys[(i*3+tokens)%c.keys.size()];
+                            run(0,input);
+                        }
                     }
                 }
                 if (scanPressure) {
@@ -395,7 +491,31 @@ void replayLocal(DeviceId device,std::uint32_t slots,bool wide,
                 std::vector<std::uint64_t> warm(16,c.keys.front());run(0,warm);run(0,warm);
                 std::vector<std::uint64_t> mixed(64,c.keys.front());for(unsigned i=0;i<mixed.size();++i)mixed[i]=c.keys[i%4];run(0,mixed);run(0,std::span<const std::uint64_t>{});
                 const std::vector<std::uint64_t> futureIds=slots?warm:std::vector<std::uint64_t>{};
-                if (!large) { run(1,futureIds);run(2,futureIds); }
+                if (!large || !slots) {
+                    run(1,futureIds);run(2,futureIds);
+                    if(nextWindow){
+                        // All four original rows are warm. Derive two/four/zero
+                        // token counts from the SAME immutable request window,
+                        // without overwriting the current chunk count bank.
+                        run(1,std::span<const std::uint64_t>(mixed.data(),32));
+                        run(1,mixed);
+                        run(2,std::span<const std::uint64_t>{});
+                    }
+                }
+                else {
+                    // Demand exceeding one block's lane count still uses the
+                    // retained cooperative adoption kernel. Repeated IDs keep
+                    // every future lookup local, isolating adoption from the
+                    // separate original-source delivery fixture. Large-to-small
+                    // and empty replays must not inspect poisoned capacity tails.
+                    const std::array extents = smallBoundary ? std::array{496u,512u,16u,0u} :
+                        std::array{528u,1024u,16u,0u};
+                    for (const auto live : extents) {
+                        const std::vector<std::uint64_t> demand(live,c.keys.front());
+                        EXPECT_EQ(run(1,demand).source_rows,0u);
+                        EXPECT_EQ(run(2,demand).source_rows,0u);
+                    }
+                }
                 // Warm first row is guaranteed pinned; cancellation after actual
                 // reservation/native copy drains both retained and Reserved pins.
                 std::vector<std::uint64_t> partial(16,c.keys.front());partial.back()=c.keys.back();run(3,partial);
@@ -420,6 +540,27 @@ void replayLocal(DeviceId device,std::uint32_t slots,bool wide,
                 h::TerminalObservation delta;ASSERT_TRUE(h::terminalObservationDelta(actual,previousTerminal,delta));
                 EXPECT_GT(delta.values[0],0u);EXPECT_EQ(actual.status,h::TerminalObservationStatus::Complete);
                 previousTerminal=actual;
+            }
+            if(nextWindow){
+                // Actual malformed publication fails before opening another
+                // source/frame; observe only the original terminal controller.
+                std::vector<int> healthy(sampling_math::kDeviceGenerationControlCount);
+                healthy[sampling_math::kDeviceGenerationControlOk]=1;
+                const int invalidTotal=0,offset=2*(maximumOriginal/16+1);
+                onWorker([&]{
+                    requireProvider(backend->hostToDeviceOnStream(controller.row(),healthy.data(),healthy.size()*4,device.ordinal,stream),"Next-window guard controller publication failed");
+                    requireProvider(backend->hostToDeviceOnStream(static_cast<int*>(windowRoot->gpu_data_ptr())+offset,&invalidTotal,4,device.ordinal,stream),"Malformed next-window publication failed");
+                });
+                requireProvider(RetainedParticipantGraphExecutableFixtureAccess::submit(graphs[4],++graphOrdinals[4]),"Next-window malformed graph submission failed");
+                const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(30);
+                while(!RetainedParticipantGraphExecutableFixtureAccess::observeTerminal(graphs[4])){
+                    requireProvider(std::chrono::steady_clock::now()<deadline,"Malformed next-window terminal deadline");std::this_thread::yield();
+                }
+                std::vector<int> observed(healthy.size());
+                onWorker([&]{requireProvider(backend->deviceToHostOnStream(observed.data(),controller.row(),observed.size()*4,device.ordinal,stream),"Next-window error observation failed");});join();
+                EXPECT_EQ(observed[sampling_math::kDeviceGenerationControlOk],0);
+                EXPECT_EQ(observed[sampling_math::kDeviceGenerationControlErrorCode],int(sampling_math::DeviceGenerationError::ImmutableStorageFailure));
+                EXPECT_EQ(observe.template operator()<q::adaptive_lookup::FrameControl>(local.frameOffsets().control).held_pins,0u);
             }
             for (const auto bad : std::array<std::array<int,2>,3>{{{{2,0}},{{0,77}},{{1,77}}}}) {
                 std::vector<int> state(sampling_math::kDeviceGenerationControlCount);
@@ -448,7 +589,7 @@ void replayLocal(DeviceId device,std::uint32_t slots,bool wide,
             if(slots){EXPECT_GT(counters.local_hit_original_ids,0u);EXPECT_GT(counters.all_hit_wait_avoided_original_ids,0u);}else EXPECT_EQ(counters.local_hit_original_ids,0u);
             std::cout<<"LOCAL_HOT_NATIVE_KERNEL_REPLAY device="<<device.toString()<<" format="<<c.label<<" slots="<<slots<<" requests="<<requestLimit<<" ordinal="<<sequence
                 <<" original_key_bits="<<(c.file->rows>UINT32_MAX?64:32)<<" physical_original_capacity="<<maximumOriginal
-                <<" large_radix_scan="<<scanPressure<<" large_radix_wide_key="<<largeWideKey
+                <<" small_probe_boundary="<<smallBoundary<<" next_window_count="<<nextWindow<<" large_radix_scan="<<scanPressure<<" large_radix_wide_key="<<largeWideKey
                 <<" l2_transport_proven=0 model_executed=0\n";
     }
     session->requirePayloadRetired();worker.reset();session->retire();session->requireExactRetired();
@@ -459,7 +600,14 @@ TEST(PooledLocalHotNative,BACKEND##_AllFormatsPositive){replayLocal(DEVICE,4,fal
 TEST(PooledLocalHotNative,BACKEND##_WideKeyPositive){replayLocal(DEVICE,4,true);} \
 TEST(PooledLocalHotNative,BACKEND##_TerminalObservation){replayLocal(DEVICE,4,false);} \
 TEST(PooledLocalHotNative,BACKEND##_LargeRadixScan){replayLocal(DEVICE,4,false,ReplayShape::LargeRadixScan);} \
-TEST(PooledLocalHotNative,BACKEND##_LargeRadixWideKey){replayLocal(DEVICE,4,true,ReplayShape::LargeRadixWideKey);}
+TEST(PooledLocalHotNative,BACKEND##_LargeFutureAdoption){replayLocal(DEVICE,4,false,ReplayShape::LargeFutureAdoption);} \
+TEST(PooledLocalHotNative,BACKEND##_SmallProbeBoundary){replayLocal(DEVICE,4,false,ReplayShape::SmallProbeBoundary);} \
+TEST(PooledLocalHotNative,BACKEND##_SmallProbeBoundaryC0){replayLocal(DEVICE,0,false,ReplayShape::SmallProbeBoundary);} \
+TEST(PooledLocalHotNative,BACKEND##_SmallProbeBoundaryWideKey){replayLocal(DEVICE,4,true,ReplayShape::SmallProbeBoundary);} \
+TEST(PooledLocalHotNative,BACKEND##_SmallProbeBoundaryWideKeyC0){replayLocal(DEVICE,0,true,ReplayShape::SmallProbeBoundary);} \
+TEST(PooledLocalHotNative,BACKEND##_SmallProbeTiming){replayLocal(DEVICE,4,false,ReplayShape::SmallProbeTiming);} \
+TEST(PooledLocalHotNative,BACKEND##_LargeRadixWideKey){replayLocal(DEVICE,4,true,ReplayShape::LargeRadixWideKey);} \
+TEST(PooledLocalHotNative,BACKEND##_PrefillNextWindowCount){replayLocal(DEVICE,4,false,ReplayShape::NextWindowCount);}
 #ifdef HAVE_CUDA
 LOCAL_HOT_NATIVE_TESTS(CUDA,DeviceId::cuda(0))
 #endif

@@ -9,6 +9,7 @@
 #pragma once
 #include "execution/local_execution/graph/IRetainedGraphParticipants.h"
 #include <optional>
+#include "kernels/qwen4exp/PooledImmutableLocalHotAccess.h"
 #include "execution/mtp/DeviceGenerationControlBinding.h"
 namespace llaminar2 {
 class IRetainedGraphStorageBoundary;
@@ -24,12 +25,14 @@ struct PooledImmutableCompactReadRequest final {
     std::shared_ptr<const qwen4exp::PooledImmutableDirectedTransport> transport;
     std::vector<std::shared_ptr<qwen4exp::PooledImmutableLocalHotPreparedStorage>> consumers;
     std::shared_ptr<const qwen4exp::IPooledImmutableLocalHotKernels> source_code;
+    qwen4exp::PooledImmutableLocalHotAccessIntent intent=qwen4exp::PooledImmutableLocalHotAccessIntent::CurrentInvocation;
 };
 /** @brief Actual reader's compact native delivery acquisition and original fixed ACK frontier. */
 struct PooledImmutableCompactConsumerCompletion final {
     std::shared_ptr<const qwen4exp::PooledImmutableDirectedTransport> transport;
     std::shared_ptr<qwen4exp::PooledImmutableLocalHotPreparedStorage> local;
     std::string requested,header_received,payload_received,received,accepted,ack_sent;
+    qwen4exp::PooledImmutableLocalHotAccessIntent intent=qwen4exp::PooledImmutableLocalHotAccessIntent::CurrentInvocation;
 };
 /** @brief Authenticate actual original request/result/receipt/LocalAcceptResult/ACK stages. */
 void requirePooledCompactConsumerCompletion(const ComputeGraph&,const PooledImmutableCompactConsumerCompletion&);
@@ -88,4 +91,20 @@ struct PooledImmutableLocalHotGraphEndpoints final {
     PooledImmutableLocalHotDemandFrontier demand;
     RetainedGraphParticipantAuxiliaryRange auxiliary;
 };
+/** @brief Future reader has no model writer or local policy/retirement claim. */
+struct PooledImmutableLocalHotFutureProducerEndpoints final {
+    std::string probe,acquired,transport_retired;
+    RetainedGraphParticipantAuxiliaryRange auxiliary;
+};
+/** @brief Local-only selected consumer branch; runtime branch selection belongs to the original controller. */
+enum class PooledImmutableLocalHotConsumerBranch : std::uint8_t { Accepted,Discard };
+/** @brief Actual local-only main/frontier and its separately attached maintenance terminal. */
+struct PooledImmutableLocalHotConsumerEndpoints final {
+    std::string first,last,retired;
+    RetainedGraphParticipantAuxiliaryRange auxiliary;
+};
+/** @brief Require exact actual local stages without claiming a new pool/source completion. */
+void requirePooledLocalHotLocalConsumption(const ComputeGraph&,const RetainedGraphParticipantAuxiliaryRange&,
+    const std::shared_ptr<qwen4exp::PooledImmutableLocalHotPreparedStorage>&);
+
 } // namespace llaminar2

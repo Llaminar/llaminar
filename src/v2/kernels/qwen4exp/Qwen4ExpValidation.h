@@ -79,6 +79,28 @@ inline void validate(const NgramHashArgs &a)
     require(a.tokens && a.priorTokens && a.output && static_cast<const void *>(a.output) != a.tokens && static_cast<const void *>(a.output) != a.priorTokens,
             "Qwen4Exp hashing requires tokens, immutable prior tokens and distinct output");
 }
+/** @brief Validate only immutable next-window bindings; live values remain on their execution owner. */
+inline void validate(const NgramNextWindowHashArgs& a)
+{
+    validate(NgramHashArgs{a.extent,a.tokens,a.priorTokens,a.output,a.policy});
+    require((a.nextWindow.declared() &&
+        a.tokens==a.nextWindow.request_tokens && !a.extent.liveRows && a.extent.rows==a.nextWindow.next_bucket),
+        "Qwen4Exp next-window hash requires one complete original token/count alternative");
+    if(!a.nextWindow.absent()){
+        const auto out=reinterpret_cast<std::uintptr_t>(a.output);
+        const auto bytes=std::size_t(a.extent.rows)*kNgramHeads*sizeof(std::int64_t);
+        require(out<=std::numeric_limits<std::uintptr_t>::max()-bytes,"QFN next-window output extent overflows");
+        const auto disjoint=[&](const std::int32_t* p,std::size_t count){
+            const auto input=reinterpret_cast<std::uintptr_t>(p);
+            return input+count*sizeof(std::int32_t)<=out || out+bytes<=input;
+        };
+        require(disjoint(a.tokens,a.nextWindow.request_capacity)&&disjoint(a.priorTokens,2)&&
+            disjoint(a.nextWindow.request_positions,1)&&disjoint(a.nextWindow.request_total,1)&&
+            disjoint(a.nextWindow.current_positions,1)&&disjoint(a.nextWindow.current_rows,1),
+            "QFN next-window hash inputs must not alias its output");
+    }
+    require(a.nextWindow.declared(),"QFN next-window Hash cannot use an absent source");
+}
 /** @brief Reject incomplete normalized similarity bindings. */
 inline void validate(const PLEGateArgs &a)
 {

@@ -117,3 +117,25 @@ if(TARGET v2_test_qwen4exp_primitives)
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ImmutableLookupClosedWorkerGateLifecycle)
 endif()
+
+# The actual closed compact query uses invocation bounds with unchanged bank storage.
+if(TARGET v2_test_qwen4exp_primitives)
+    add_v2_test(V2_Integration_PooledCompactCapturedQueryBoundReplay
+        COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+            --gtest_filter=PooledImmutableCoordinator.CompactCapturedQueryBoundIsTightAndCaptureComplete:PooledImmutableCoordinator.LocalHotCompactMissesReuseOriginalUnionAndRejectForeignRosters
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Ngram;LiveExtent;Capture;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledCompactCapturedQueryBoundReplay)
+endif()
+
+# Exact small union dispatch and the existing genuine original-source replay.
+if(TARGET v2_test_qwen4exp_primitives)
+    add_v2_test(V2_Integration_PooledCompactCooperativeUnionLaunchReplay
+        COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+            --gtest_filter=PooledImmutableCoordinator.CooperativeUnionLaunchPolicyIsCaptureComplete
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Ngram;Capture;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledCompactCooperativeUnionLaunchReplay)
+endif()

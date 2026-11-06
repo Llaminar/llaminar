@@ -11,6 +11,14 @@
 #include "PooledImmutableLocalHotTransportProtocol.h"
 #include "PooledImmutableSourceOps.h"
 namespace llaminar2::qwen4exp::local_hot_transport {
+/** @brief Immutable one-CTA union envelope; larger queries retain the existing partitioned DAG. */
+inline constexpr unsigned CooperativeUnionRows=256;
+/** @return Whether this captured union fits one CTA, independent of live counts. */
+QFN_ADAPTIVE_HD constexpr bool usesCooperativeUnion(std::uint32_t capacity) noexcept
+{return capacity && capacity<=CooperativeUnionRows;}
+/** @return Complete immutable native union launch policy for graph capture identity. */
+QFN_ADAPTIVE_HD constexpr std::uint64_t unionLaunchIdentity(std::uint32_t capacity) noexcept
+{return (std::uint64_t{2}<<32)|(std::uint64_t{CooperativeUnionRows}<<1)|std::uint64_t{usesCooperativeUnion(capacity)};}
 /** @brief Exact source probe's retained sorted original rows, not peer-provided identity. */
 struct CanonicalQueryView {
     const adaptive_lookup::KeyIndex* sorted_original=nullptr;
@@ -32,6 +40,7 @@ struct UnionArgs {
     ConsumerGeometry consumers[8]{};
     RequestView requests[8]{};
     std::uint32_t consumer_count=0,capacity=0;
+    PooledImmutableLocalHotAccessIntent expected_intent=PooledImmutableLocalHotAccessIntent::CurrentInvocation;
     UnionControl* output=nullptr;
     std::uint64_t* merged_keys=nullptr;
 };
@@ -62,13 +71,13 @@ QFN_ADAPTIVE_HD inline bool prepareUnion(const UnionArgs& a)
         !a.canonical.original_count ||
         *a.canonical.original_count>a.canonical.capacity ||
         *a.canonical.original_count%16) return false;
-    UnionControl next{};next.query=*a.expected;std::uint32_t total=0;
+    UnionControl next{};next.query=*a.expected;next.intent=a.expected_intent;std::uint32_t total=0;
     for(std::uint32_t i=0;i<a.consumer_count;++i){
         const auto& r=a.requests[i];const auto g=a.consumers[i];
         if(!r.header || !r.received_header_bytes || !r.received_key_bytes ||
             g.coordinate!=i || g.consumers!=a.consumer_count ||
             !acceptRequest(*r.header,*a.expected,g,static_cast<std::uint32_t>(*a.canonical.original_count),
-                *a.source_admission,*r.received_header_bytes,*r.received_key_bytes) ||
+                *a.source_admission,*r.received_header_bytes,*r.received_key_bytes,a.expected_intent) ||
             (r.header->miss_rows && !r.keys) || total>a.capacity || r.header->miss_rows>a.capacity-total) return false;
         next.row_offset[i]=total;total+=static_cast<std::uint32_t>(r.header->miss_rows);
     }
@@ -114,6 +123,10 @@ template<class Slot> QFN_ADAPTIVE_HD inline const std::byte* resultRow(
     const auto view=pooled_native::coordinatorView(source.coordinator);
     if(!consumerCount || consumerCount>8 || consumer>=consumerCount || input.pool_original_ids<0 ||
         input.status!=Status::Success || !valid(input.query) ||
+        ((input.intent==PooledImmutableLocalHotAccessIntent::FutureReadAhead) !=
+         (view.frame->purpose==adaptive_lookup::pooled::LookupPurpose::FutureLookupOnly)) ||
+        (input.intent!=PooledImmutableLocalHotAccessIntent::CurrentInvocation &&
+         input.intent!=PooledImmutableLocalHotAccessIntent::FutureReadAhead) ||
         view.frame->interval.table!=input.query.table ||
         view.frame->source_storage_generation!=input.query.source_storage_generation || view.frame->original_ids!=static_cast<std::uint32_t>(input.pool_original_ids) ||
         input.row_offset[consumer]>input.row_offset[consumer+1] ||

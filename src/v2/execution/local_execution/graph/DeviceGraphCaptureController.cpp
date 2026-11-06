@@ -978,13 +978,15 @@ namespace llaminar2
         }
 
         /**
-         * @brief Expose the current probe as a native parent fork frontier.
+         * @brief Expose the lifecycle's actual main-stage frontier for its finite parent body.
          * @param graph Original participant graph and its declared finite body.
          * @param segments Validated compiler units, before capture or input binding.
          * @note This changes only graph-only compilation units. The complete
          * parent still executes once; no new CPU ticket or submission is added.
-         * The auxiliary body may wait for a later LocalRead, so it must start
-         * after the probe without joining the probe unit's own terminal.
+         * CurrentDemand forks after Probe and may wait for a later LocalRead.
+         * FutureProducer forks after its actual Probe without a model read.
+         * Local-only consumption forks after the selected actual Read/Discard.
+         * None of these finite bodies joins the producing fragment's exit.
          */
         void exposeParticipantAuxiliaryProbeFrontier(
             const ComputeGraph& graph,
@@ -992,13 +994,17 @@ namespace llaminar2
         {
             const auto& range=graph.retainedParticipantAuxiliaryRange();
             if(!range)return;
+            const bool needsRead=range->lifecycle==RetainedGraphParticipantAuxiliaryLifecycle::CurrentDemand;
+            const std::string frontier=needsRead ? "participant_auxiliary_probe" :
+                range->lifecycle==RetainedGraphParticipantAuxiliaryLifecycle::FutureProducer
+                    ? "participant_future_producer" : "participant_local_consumption";
             std::size_t producer=segments.size(),consumer=segments.size(),offset=0;
             bool sawRead=false;
             for(std::size_t index=0;index<segments.size();++index) {
                 const auto& segment=segments[index];
                 for(std::size_t row=0;row<segment.stage_names.size();++row) {
                     const auto& name=segment.stage_names[row];
-                    if(name==range->main_read) {
+                    if(needsRead && name==range->main_read) {
                         if(producer==segments.size() || sawRead)
                             throw std::logic_error("Participant LocalRead must follow its unique current probe");
                         sawRead=true;consumer=index;
@@ -1009,7 +1015,7 @@ namespace llaminar2
                     producer=index;offset=row;
                 }
             }
-            if(producer==segments.size() || !sawRead)
+            if(producer==segments.size() || (needsRead && !sawRead))
                 throw std::logic_error("Participant auxiliary lost its main probe/read frontier");
             auto& unit=segments[producer];
             const auto continuation_identity = [&]() -> std::string {
@@ -1018,8 +1024,8 @@ namespace llaminar2
             };
             if(offset+1==unit.stage_names.size()) {
                 if(unit.capture_wave_identity.empty())
-                    unit.capture_wave_identity="participant_auxiliary_probe";
-                if(segments[consumer].capture_wave_identity.empty())
+                    unit.capture_wave_identity=frontier;
+                if(needsRead && segments[consumer].capture_wave_identity.empty())
                     segments[consumer].capture_wave_identity=continuation_identity();
                 return;
             }
@@ -1028,8 +1034,8 @@ namespace llaminar2
             // Explicit semantic identity is shared across the participant
             // domain. Never include a device, local pointer or stage spelling.
             prefix.capture_wave_identity=unit.capture_wave_identity.empty()
-                ? "participant_auxiliary_probe"
-                : unit.capture_wave_identity+":participant_auxiliary_probe";
+                ? frontier
+                : unit.capture_wave_identity+":"+frontier;
             // The new continuation half is also a shared logical frontier.
             // Leaving it implicit would derive the TP rendezvous from local
             // source/reader stage names, even when the two programs agree.
@@ -1779,6 +1785,11 @@ namespace llaminar2
             has_variant=true;h^=body->identity;h*=kFnvPrime;
             h^=static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(body->original_execution.get()));h*=kFnvPrime;
             h^=static_cast<std::uint64_t>(body->role);h*=kFnvPrime;
+            if(body->lifecycle!=RetainedGraphParticipantAuxiliaryLifecycle::CurrentDemand){
+                h^=static_cast<std::uint64_t>(body->lifecycle);h*=kFnvPrime;
+                if(body->local_consumption){h^=body->local_consumption->captureIdentity();h*=kFnvPrime;
+                    h^=reinterpret_cast<std::uintptr_t>(body->local_arena);h*=kFnvPrime;}
+            }
             h^=graph.topologyGeneration();h*=kFnvPrime;
         }
         if(const auto participants=graph.retainedParticipantSourcePlan()){

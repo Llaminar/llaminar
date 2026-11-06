@@ -172,7 +172,7 @@ def declared_benchmark_profile(record):
     return profile
 
 
-def canonical_diagnostic_arguments(record, directory=None):
+def canonical_diagnostic_arguments(record, directory=None, *, paired_observer=None):
     """Keep a source-authored document alive through its actual public parser use.
 
     The temporary file is only a lossless spelling of original exported input,
@@ -192,6 +192,19 @@ def canonical_diagnostic_arguments(record, directory=None):
             stream.write(json.dumps(profile['configuration_document'],sort_keys=True,indent=2)+'\n')
         pins[str(path)]=identity(path)
         arguments=['--config',str(path)]
+    if paired_observer is not None:
+        # The source-authenticated numerical observer already declares this
+        # policy. Project only its explicit disabled-prefix arm; never inherit
+        # a public parser default or copy unrelated observer workload flags.
+        prefix = paired_observer.get('expected_config',{}).get('configuration',{}).get('prefix_cache')
+        argv = paired_observer.get('engine_argv')
+        require(type(prefix) is dict and prefix.get('enabled') is False and
+                type(argv) is list and argv.count('--no-prefix-cache') == 1 and '--prefix-cache' not in argv,
+                'Paired diagnostic observer must explicitly disable prefix cache')
+        require('--prefix-cache' not in arguments,
+                'Original diagnostic benchmark conflicts with disabled observer prefix policy')
+        if '--no-prefix-cache' not in arguments:
+            arguments.append('--no-prefix-cache')
     return [*arguments,'-m',record['model'],'--context-length',str(profile['context_length'])],owner,pins
 
 @dataclass(frozen=True)
@@ -306,7 +319,7 @@ class PairedCorpusSelection:
             corpus_v2._limits(documents['calibration'],corpus['manifest'],baseline,approval,groups)
         # One original public representation; unequal ceilings are never
         # downgraded to scalar argv or inferred from observer runtime state.
-        canonical_arguments,configuration_owner,configuration_pins=canonical_diagnostic_arguments(record,configuration_directory)
+        canonical_arguments,configuration_owner,configuration_pins=canonical_diagnostic_arguments(record,configuration_directory,paired_observer=topology)
         pins.update(configuration_pins)
         unchanged(pins)
         return cls(exact, json.loads(json.dumps(record)), corpus, topology, paths, pins, documents, canonical_arguments, configuration_owner)

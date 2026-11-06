@@ -24,3 +24,13 @@ if(TARGET v2_test_compute_graph_execution)
         NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_FiniteStorageParallelBodyFrontierReplay)
 endif()
+
+# Exact original main/finite-body terminal joins; native GPU runs remain separate.
+if(TARGET v2_test_compute_graph_execution)
+    add_v2_test(V2_Integration_FiniteChildOriginalTerminalJoinReplay
+        COMMAND $<TARGET_FILE:v2_test_compute_graph_execution>
+            --gtest_filter=NativeParallelGraphBranch.FiniteChildJoin* --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;GraphCapture;Ownership;TraceReplay;Regression"
+        NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_FiniteChildOriginalTerminalJoinReplay)
+endif()

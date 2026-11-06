@@ -96,39 +96,44 @@ static_assert(std::is_trivially_copyable_v<RequestHeader> && std::is_trivially_c
 static_assert(sizeof(RequestHeader)==88 && sizeof(ResultHeader)==96);
 /**
  * @brief Validate actual compact metadata against the original source query/reader.
- * FutureReadAhead is deliberately rejected: unchanged pooled Begin credits demand
- * and cannot authenticate speculative lookup-only/bypass-admission semantics.
+ * Future intent requires its explicit original expected-purpose declaration.
+ * Default callers retain CurrentInvocation and reject future metadata.
  */
 QFN_ADAPTIVE_HD inline bool acceptRequestHeader(const RequestHeader& h,QueryIdentity expected,
     ConsumerGeometry g,std::uint32_t expected_original_ids,const SourceAdmissionHeader& source,
-    std::uint64_t received_header_bytes)
+    std::uint64_t received_header_bytes,
+    PooledImmutableLocalHotAccessIntent expected_intent=PooledImmutableLocalHotAccessIntent::CurrentInvocation)
 {
-    return valid(g) && valid(expected) && valid(h.query) && h.query.table==expected.table &&
+    return (expected_intent==PooledImmutableLocalHotAccessIntent::CurrentInvocation ||
+        expected_intent==PooledImmutableLocalHotAccessIntent::FutureReadAhead) && valid(g) && valid(expected) && valid(h.query) && h.query.table==expected.table &&
         h.query.source_storage_generation==expected.source_storage_generation &&
         h.query.consumer_storage_identity==g.consumer_storage_identity &&
         validSourceAdmission(source,expected.table,expected.source_storage_generation) &&
         h.source_admission==source.source_admission && h.source_invocation==source.source_invocation &&
         received_header_bytes==sizeof(RequestHeader) && h.version==Version && h.status==Status::Success &&
         h.consumer==g.coordinate && h.native_format==g.native_format && h.native_row_bytes==g.native_row_bytes &&
-        h.intent==PooledImmutableLocalHotAccessIntent::CurrentInvocation &&
+        h.intent==expected_intent &&
         h.original_ids==expected_original_ids && h.original_ids<=g.maximum_original &&
         h.original_ids%16==0 && h.miss_rows<=h.original_ids && h.miss_rows<=g.maximum_misses;
 }
 /** @brief Validate the actual original counted-key receipt after its separate fixed header. */
 QFN_ADAPTIVE_HD inline bool acceptRequest(const RequestHeader& h,QueryIdentity expected,
     ConsumerGeometry g,std::uint32_t expected_original_ids,const SourceAdmissionHeader& source,
-    std::uint64_t received_header_bytes,std::uint64_t received_key_bytes)
+    std::uint64_t received_header_bytes,std::uint64_t received_key_bytes,
+    PooledImmutableLocalHotAccessIntent expected_intent=PooledImmutableLocalHotAccessIntent::CurrentInvocation)
 {
-    return acceptRequestHeader(h,expected,g,expected_original_ids,source,received_header_bytes) &&
+    return acceptRequestHeader(h,expected,g,expected_original_ids,source,received_header_bytes,expected_intent) &&
         received_key_bytes==h.miss_rows*sizeof(std::uint64_t);
 }
 /** @brief Validate only the received fixed native result header, never payload completion/readiness. */
 QFN_ADAPTIVE_HD inline bool acceptResultHeader(const ResultHeader& h,const RequestHeader& request,
-    ConsumerGeometry g,std::uint64_t received_header_bytes)
+    ConsumerGeometry g,std::uint64_t received_header_bytes,
+    PooledImmutableLocalHotAccessIntent expected_intent=PooledImmutableLocalHotAccessIntent::CurrentInvocation)
 {
-    return valid(g) && valid(request.query) && same(h.query,request.query) &&
+    return (expected_intent==PooledImmutableLocalHotAccessIntent::CurrentInvocation ||
+        expected_intent==PooledImmutableLocalHotAccessIntent::FutureReadAhead) && valid(g) && valid(request.query) && same(h.query,request.query) &&
         request.version==Version && request.status==Status::Success && request.consumer==g.coordinate &&
-        request.intent==PooledImmutableLocalHotAccessIntent::CurrentInvocation && h.intent==request.intent &&
+        request.intent==expected_intent && h.intent==request.intent &&
         request.native_format==g.native_format && request.native_row_bytes==g.native_row_bytes &&
         request.query.consumer_storage_identity==g.consumer_storage_identity &&
         request.original_ids<=g.maximum_original && request.original_ids%16==0 &&
@@ -141,8 +146,9 @@ QFN_ADAPTIVE_HD inline bool acceptResultHeader(const ResultHeader& h,const Reque
 }
 /** @brief Check the actual compact payload completion before any missing cache row becomes Ready. */
 QFN_ADAPTIVE_HD inline bool acceptResult(const ResultHeader& h,const RequestHeader& request,
-    ConsumerGeometry g,std::uint64_t received_header_bytes,std::uint64_t received_native_bytes)
-{return acceptResultHeader(h,request,g,received_header_bytes) && received_native_bytes==h.native_bytes;}
+    ConsumerGeometry g,std::uint64_t received_header_bytes,std::uint64_t received_native_bytes,
+    PooledImmutableLocalHotAccessIntent expected_intent=PooledImmutableLocalHotAccessIntent::CurrentInvocation)
+{return acceptResultHeader(h,request,g,received_header_bytes,expected_intent) && received_native_bytes==h.native_bytes;}
 /** @brief One endpoint's actual wire metadata; native receive extents are independent outputs. */
 struct alignas(64) Control {
     SourceAdmissionHeader original_admission{};
@@ -160,6 +166,7 @@ struct alignas(64) UnionControl {
     std::uint32_t row_offset[9]{};
     std::int32_t pool_original_ids=0;
     adaptive_lookup::Status status=adaptive_lookup::Status::Success;
+    PooledImmutableLocalHotAccessIntent intent=PooledImmutableLocalHotAccessIntent::CurrentInvocation;
 };
 
 /**
@@ -176,12 +183,13 @@ struct DeviceResultView {
 };
 /** @return Exact native row only after its own authenticated compact result; never an allocation/capability. */
 QFN_ADAPTIVE_HD inline const std::byte* receivedRow(DeviceResultView view,
-    const RequestHeader& ownRequest,ConsumerGeometry geometry,std::uint64_t compactRow)
+    const RequestHeader& ownRequest,ConsumerGeometry geometry,std::uint64_t compactRow,
+    PooledImmutableLocalHotAccessIntent expected_intent=PooledImmutableLocalHotAccessIntent::CurrentInvocation)
 {
     if(!view.header || !view.received_header_bytes || !view.received_payload_bytes ||
         !view.native_rows || !valid(geometry) || compactRow>=ownRequest.miss_rows ||
         ownRequest.miss_rows>view.native_capacity/geometry.native_row_bytes ||
-        !acceptResult(*view.header,ownRequest,geometry,*view.received_header_bytes,*view.received_payload_bytes)) return nullptr;
+        !acceptResult(*view.header,ownRequest,geometry,*view.received_header_bytes,*view.received_payload_bytes,expected_intent)) return nullptr;
     return view.native_rows+compactRow*geometry.native_row_bytes;
 }
 } // namespace llaminar2::qwen4exp::local_hot_transport

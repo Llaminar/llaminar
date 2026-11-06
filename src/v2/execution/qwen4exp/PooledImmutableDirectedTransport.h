@@ -121,7 +121,17 @@ public:
     /** @return Exact original native response destination for one actual consumer. */
     PooledImmutableLocalHotNativePack localHotNativePack(std::shared_ptr<PooledImmutableLocalHotPreparedStorage>)const;
     /** @return Closed actual compact query producers for the unchanged original pool Begin. */
-    PooledImmutableLocalHotPoolQuery localHotPoolQuery(std::shared_ptr<PooledImmutableLocalHotPreparedStorage>)const;
+    /**
+     * @brief Retain the same actual compact producer with immutable read purpose.
+     * @param local Original source participant's local cache/query storage.
+     * @param bound Exact captured canonical query/consumer subset limits; storage stays unchanged.
+     * @param purpose Expected union purpose, validated on device before coordinator policy work.
+     * @return Closed original union/count/keys borrower; no new source or storage.
+     * @throws std::exception For foreign source, coordinator, roots, bounds or purpose.
+     */
+    PooledImmutableLocalHotPoolQuery localHotPoolQuery(std::shared_ptr<PooledImmutableLocalHotPreparedStorage>,
+        PooledImmutableLocalHotQueryBound bound,
+        adaptive_lookup::pooled::LookupPurpose purpose=adaptive_lookup::pooled::LookupPurpose::CurrentDemand)const;
     /** @return Original optional compact geometry; old shared-only semantics remain distinct. */
     const auto& localHotGeometry()const noexcept{return local_hot_geometry_;}
     /** @return Exact participant-local actual request metadata, including source-self. */

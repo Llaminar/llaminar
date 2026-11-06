@@ -12,8 +12,12 @@
 #include "execution/local_execution/device/DeviceContext.h"
 #include "tensors/Tensors.h"
 #include "snapshots/SnapshotCapture.h"
+#include "execution/local_execution/graph/IGraphBuilder.h"
+#include "backends/BackendManager.h"
+#include "execution/local_execution/graph/RequestInputPositionAdmission.h"
 #include "utils/OpenMPUtils.h"
 #include <algorithm>
+#include <numeric>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -358,4 +362,49 @@ TEST(Qwen4ExpPrimitiveStage, MTPTerminalHiddenPublicationChecksDistinctPhysicalV
             EXPECT_FALSE(std::equal(original.begin() + 32, original.begin() + 60, parent->data() + 32));
         }
     }
+}
+
+/** @test Real stage input contracts and cache identity retain the exact original next-window declaration. */
+TEST(Qwen4ExpPrimitiveStage, PrefillNextWindowBindsOriginalInputsAndChangesCaptureIdentity)
+{
+    // CPUDeviceContext is only a lightweight arithmetic wrapper; the original
+    // prefill binding separately requires its real registered CPU backend.
+    if(!hasCPUBackend())initCPUBackend(-1);
+    llaminar::v2::ThreadCountGuard team(1);CPUDeviceContext context(DeviceId::cpu(),1);
+    constexpr int capacity=12,bucket=4;
+    INT32Tensor request({capacity}),history({2}),ids({bucket,32});
+    std::array<std::int32_t,capacity> positions{};std::iota(positions.begin(),positions.end(),71);
+    std::int32_t total=12,currentPosition=71,currentRows=4,stride=4;
+    auto* tokens=static_cast<std::int32_t*>(request.raw_mutable_data());std::iota(tokens,tokens+capacity,17);
+    auto* prior=static_cast<std::int32_t*>(history.raw_mutable_data());prior[0]=3;prior[1]=5;
+    DevicePrefillChunkGraphBinding original{.backend=getBackendFor(DeviceId::cpu()),
+        .request_token_ids_device=tokens,.request_position_ids_device=positions.data(),.request_total_rows_device=&total,
+        .cached_tokens_device=&currentPosition,.chunk_token_ids_device=tokens,.chunk_position_ids_device=&currentPosition,
+        .chunk_real_rows_device=&currentRows,.chunk_row_stride_device=&stride,
+        .request_row_capacity=capacity,.bucket_seq_len=bucket,.capture_identity=111};
+    constexpr auto layout=RequestInputPositionLayoutRequirement::ContiguousSingleRequestPrefill;
+    const auto window=qwen4exp::Qwen4ExpPrefillNextWindowBinding::fromOriginalChunk(original,DeviceId::cpu(),bucket,layout);
+    const auto make=[&](auto binding){return std::make_unique<Stage>(Stage::Params{.device_id=DeviceId::cpu(),.rows={bucket,{}},
+        .operation=Stage::NgramHash{Qwen4ExpNativeIntInput{DeviceId::cpu(),tokens,capacity},
+            Int(history,BufferId::QFN_PLE_PRIOR_TOKEN_HISTORY),Int(ids,BufferId::QFN_NGRAM_ROW_IDS),hashPolicy(),binding}});};
+    EXPECT_THROW((void)qwen4exp::Qwen4ExpPrefillNextWindowBinding::fromOriginalChunk(original,DeviceId::cpu(),bucket,
+        RequestInputPositionLayoutRequirement::Existing),std::invalid_argument);
+    auto stage=make(window);const auto identity=stage->graphCaptureVariantSignature();
+    EXPECT_FALSE(stage->matchesNgramHashOutput(&ids,BufferId::QFN_NGRAM_ROW_IDS,0,bucket*16*8));
+    EXPECT_TRUE(stage->matchesNgramHashOutput(&ids,BufferId::QFN_NGRAM_ROW_IDS,0,bucket*16*8,window.captureIdentity()));
+    EXPECT_FALSE(stage->matchesNgramHashOutput(&ids,BufferId::QFN_NGRAM_ROW_IDS,0,bucket*16*8,window.captureIdentity()+1));
+    EXPECT_TRUE(!stage->bufferContract().inputs.empty());
+    EXPECT_TRUE(stage->execute(&context));
+    std::vector<std::int64_t> expected(bucket*16);auto kernel=qwen4exp::createCPUQwen4ExpKernels();
+    kernel->ngramHash({{bucket},tokens+4,prior,expected.data(),hashPolicy()},nullptr);
+    EXPECT_EQ(std::memcmp(ids.raw_data(),expected.data(),expected.size()*8),0);
+    currentPosition=75;total=10;EXPECT_TRUE(stage->execute(&context));
+    EXPECT_EQ(stage->graphCaptureVariantSignature(),identity);
+    auto changed=original;changed.capture_identity=112;
+    EXPECT_NE(make(qwen4exp::Qwen4ExpPrefillNextWindowBinding::fromOriginalChunk(changed,DeviceId::cpu(),bucket,layout))->graphCaptureVariantSignature(),identity);
+    changed=original;changed.chunk_position_ids_device=positions.data();
+    EXPECT_NE(make(qwen4exp::Qwen4ExpPrefillNextWindowBinding::fromOriginalChunk(changed,DeviceId::cpu(),bucket,layout))->graphCaptureVariantSignature(),identity);
+    EXPECT_THROW((void)make(qwen4exp::Qwen4ExpPrefillNextWindowBinding::fromOriginalChunk(original,DeviceId::cpu(),2,layout)),std::invalid_argument);
+    changed=original;changed.capture_identity=0;
+    EXPECT_THROW((void)qwen4exp::Qwen4ExpPrefillNextWindowBinding::fromOriginalChunk(changed,DeviceId::cpu(),bucket,layout),std::invalid_argument);
 }

@@ -245,8 +245,15 @@ def declared_focused_accuracy_scope(panel: dict, selection, cell: dict) -> dict:
 def declared_config_identity(selection, observed: dict, parser: Path, environment: dict) -> dict:
     """Use the paired owner's public-parser projection, including observer-owned controls."""
     from types import SimpleNamespace
-    return selection.require_public_projection(SimpleNamespace(subprocess=subprocess),
+    canonical = selection.require_public_projection(SimpleNamespace(subprocess=subprocess),
         SimpleNamespace(binary=parser), environment, observed)
+    # The shared QFN projection intentionally excludes observer prefix controls.
+    # Benchmark startup still must retain this original source policy: otherwise
+    # a disabled-prefix cell can open the caller's persistent archive by default.
+    if (canonical['config']['configuration'].get('prefix_cache') !=
+            selection.topology['expected_config']['configuration'].get('prefix_cache')):
+        raise ValueError("Declared benchmark changed original source prefix-cache policy")
+    return canonical
 
 
 def declared_runtime_projection(parser: Path, configuration: dict, environment: dict, path: Path) -> dict:
@@ -432,6 +439,7 @@ def _validate_declared_passive_evidence(data: dict) -> dict:
     policy = config.get('ngram_table_policy') or {}
     adaptive = policy.get('storage') == 'AdaptiveVRAMRAMSSD'
     expert = []
+    initial_banks = []
     setup = []
     terminal = {}
     submissions = []
@@ -455,7 +463,7 @@ def _validate_declared_passive_evidence(data: dict) -> dict:
         if not isinstance(tags,dict):
             raise ValueError('passive evidence lacks original tags')
         if domain == 'moe_placement':
-            if name != 'routed_expert_weight_selection' or phase != 'load':
+            if name != 'routed_expert_weight_selection' or phase not in ('load','model_setup'):
                 raise ValueError('passive expert evidence is not original immutable setup')
             if tags.get('owner_order') != {'Ordinal':'ordinal','Random':'random'}.get(config.get('routed_expert_owner_order')) or tags.get('selection_layout') not in ('contiguous','noncontiguous'):
                 raise ValueError('passive expert selection policy differs from original config')
@@ -465,6 +473,18 @@ def _validate_declared_passive_evidence(data: dict) -> dict:
                 raise ValueError('passive expert selection mixed incompatible setup populations')
             expert.append(dict(device=device,layer=layer,participant=participant,owner_order=tags['owner_order'],
                 selection_layout=tags['selection_layout'],observations=count,selected_experts_per_observation=value//count))
+            if phase=='model_setup':
+                required={'layer','owner_order','participant','tier','tier_participant_count','selection_layout',
+                          'frozen_owner_map_match','publication','layer_role'}
+                if (set(tags)!=required or tags.get('publication')!='initial_epoch_bank' or
+                        tags.get('frozen_owner_map_match')!='true' or
+                        tags.get('layer_role') not in ('main_transformer','mtp_predictor') or count!=1):
+                    raise ValueError('passive initial expert bank publication is not frozen original setup')
+                initial_banks.append(dict(device=device,layer=layer,participant=participant,
+                    tier=_passive_uint(tags['tier'],'initial expert tier'),
+                    tier_participant_count=_passive_uint(tags['tier_participant_count'],'initial tier participants'),
+                    layer_role=tags['layer_role'],selected=value//count))
+
         elif domain == 'immutable_lookup_setup':
             if name != 'admitted_owner' or phase != 'setup' or count != 1 or value != 1:
                 raise ValueError('passive admitted setup is missing, repeated or not immutable')
@@ -510,24 +530,84 @@ def _validate_declared_passive_evidence(data: dict) -> dict:
         tiers=plan.get('routed_tiers')
         if not isinstance(tiers,list) or not tiers:
             raise ValueError('passive expert setup lacks original frozen tier projection')
-        expected_selection=set()
-        for tier in tiers:
-            counts=tier.get('resolved_live_experts_per_layer')
-            domains=[d for d in plan.get('domains',[]) if d.get('name')==tier.get('domain')]
-            if not isinstance(counts,list) or len(domains)!=1:
-                raise ValueError('passive expert setup lacks original admitted layer/domain membership')
-            participants=domains[0].get('participants',[])
-            for layer,count in enumerate(counts):
-                if not _passive_uint(count,'resolved expert population'):continue
-                for participant,p in enumerate(participants):
-                    expected_selection.add((_passive_device(f"{p['device_type']}:{p['device_ordinal']}"),
-                        _passive_uint(plan.get('first_model_layer'),'first model layer')+layer,participant))
-        if not expected_selection.issubset({(r['device'],r['layer'],r['participant']) for r in expert}):
-            raise ValueError('passive expert physical selection coverage is partial')
-        declared_members={(_passive_device(f"{p['device_type']}:{p['device_ordinal']}"),index)
-            for domain in plan.get('domains',[]) for index,p in enumerate(domain.get('participants',[]))}
-        if any((r['device'],r['participant']) not in declared_members for r in expert):
-            raise ValueError('passive expert selection has a foreign original participant')
+        if initial_banks:
+            if len(initial_banks)!=len(expert):
+                raise ValueError('passive expert setup mixes legacy sliced and initial-bank populations')
+            expected_selection=set();selected_totals={};selected_banks={};roles={};first_participant=0
+            for tier_index,tier in enumerate(tiers):
+                counts=tier.get('resolved_live_experts_per_layer')
+                domains=[d for d in plan.get('domains',[]) if d.get('name')==tier.get('domain')]
+                if not isinstance(counts,list) or len(domains)!=1:
+                    raise ValueError('passive initial bank lacks original admitted tier/domain')
+                for layer,count in enumerate(counts):
+                    _passive_uint(count,'resolved expert population')
+                    actual_layer=_passive_uint(plan.get('first_model_layer'),'first model layer')+layer
+                    for member_index,member in enumerate(domains[0].get('participants',[])):
+                        device=_passive_device(f"{member['device_type']}:{member['device_ordinal']}")
+                        expected_selection.add((device,actual_layer,tier_index,first_participant+member_index))
+                first_participant+=len(domains[0].get('participants',[]))
+            seen=set()
+            for bank in initial_banks:
+                tier_index=bank['tier']
+                if tier_index>=len(tiers):raise ValueError('foreign initial expert bank tier')
+                tier=tiers[tier_index]
+                domain=next(d for d in plan['domains'] if d['name']==tier['domain'])
+                key=(bank['device'],bank['layer'],tier_index,bank['participant'])
+                if key not in expected_selection or key in seen or bank['tier_participant_count']!=len(domain['participants']):
+                    raise ValueError('passive initial expert bank has foreign or duplicate membership')
+                seen.add(key)
+                # MoEExpertOwnerMap::buildTierParticipants assigns global IDs
+                # by original tier order/member order. Preserve that identity,
+                # including distinct CPU participants sharing a DeviceId string.
+                role=bank['layer_role'];layer=bank['layer']
+                if roles.setdefault(layer,role)!=role:raise ValueError('passive initial expert layer role changed')
+                total_key=(tier_index,layer)
+                selected_totals[total_key]=selected_totals.get(total_key,0)+bank['selected']
+                selected_banks.setdefault(total_key,[]).append(bank['selected'])
+            if seen!=expected_selection:raise ValueError('passive initial expert bank coverage is partial')
+            first=_passive_uint(plan['first_model_layer'],'first model layer')
+            for (tier_index,layer),total in selected_totals.items():
+                tier=tiers[tier_index]
+                domain=next(d for d in plan['domains'] if d['name']==tier['domain'])
+                compute=domain.get('routed_compute_policy');phase=domain.get('routed_phase_policy')
+                population=tier['resolved_live_experts_per_layer'][layer-first]
+                # Registry observes physical expert IDs, not phase route counts.
+                # Tensor shards and full replicas repeat those IDs per member;
+                # phase-aware replicated decode likewise requires full residents.
+                if phase=='PrefillApportionedDecodeReplicated' and compute in ('Apportioned','Replicated'):
+                    replicated=True
+                elif phase=='Uniform' and compute in ('Apportioned','Replicated','TensorSharded'):
+                    replicated=compute!='Apportioned'
+                else:
+                    raise ValueError('unsupported passive initial-bank compute/phase policy: '+str(compute)+'/'+str(phase))
+                if (replicated and any(value!=population for value in selected_banks[(tier_index,layer)])) or \
+                        (not replicated and total!=population):
+                    raise ValueError('passive initial expert bank population differs from frozen tier policy')
+            main=[layer for layer,role in roles.items() if role=='main_transformer']
+            predictor=[layer for layer,role in roles.items() if role=='mtp_predictor']
+            if predictor and not config.get('shared_predictor'):
+                raise ValueError('passive initial predictor bank has no original predictor source')
+            if not main or min(main)!=first or (predictor and min(predictor)<=max(main)):
+                raise ValueError('passive initial expert main/predictor role ordering changed')
+        else:
+            expected_selection=set()
+            for tier in tiers:
+                counts=tier.get('resolved_live_experts_per_layer')
+                domains=[d for d in plan.get('domains',[]) if d.get('name')==tier.get('domain')]
+                if not isinstance(counts,list) or len(domains)!=1:
+                    raise ValueError('passive expert setup lacks original admitted layer/domain membership')
+                participants=domains[0].get('participants',[])
+                for layer,count in enumerate(counts):
+                    if not _passive_uint(count,'resolved expert population'):continue
+                    for participant,p in enumerate(participants):
+                        expected_selection.add((_passive_device(f"{p['device_type']}:{p['device_ordinal']}"),
+                            _passive_uint(plan.get('first_model_layer'),'first model layer')+layer,participant))
+            if not expected_selection.issubset({(r['device'],r['layer'],r['participant']) for r in expert}):
+                raise ValueError('passive expert physical selection coverage is partial')
+            declared_members={(_passive_device(f"{p['device_type']}:{p['device_ordinal']}"),index)
+                for domain in plan.get('domains',[]) for index,p in enumerate(domain.get('participants',[]))}
+            if any((r['device'],r['participant']) not in declared_members for r in expert):
+                raise ValueError('passive expert selection has a foreign original participant')
 
 
     if not adaptive:
@@ -617,8 +697,10 @@ def _validate_declared_passive_evidence(data: dict) -> dict:
         tags=dict(tag_items)
         if tags.get('transport')!='pooled_subordinate':raise ValueError('passive adaptive terminal transport changed')
         if tags.get('authority')=='terminal_device_generation_control':
-            names=device_metrics;device_seen.add(device)
-            if tags.get('storage')!='vram' or device not in device_names:raise ValueError('foreign passive device terminal owner')
+            names=device_metrics
+            if tags.get('storage')!='vram' or device not in {d for _,d in continuation}:
+                raise ValueError('foreign passive device terminal owner')
+            if device in device_names:device_seen.add(device)
         else:
             names=host_metrics;host_seen.add(device)
             if tags.get('storage')!=mode or device not in device_names:raise ValueError('foreign passive host terminal source')
@@ -628,6 +710,10 @@ def _validate_declared_passive_evidence(data: dict) -> dict:
         if any(value for name,value in values.items() if name in ('failures','adaptive_failed_frames')):
             raise ValueError('passive measured lookup reports failed work')
         if names==device_metrics:
+            # Original participant controllers publish the fixed terminal tuple
+            # even when this participant owns no pooled-source execution.
+            if device not in device_names and any(values.values()):
+                raise ValueError('non-coordinator passive device reports source work')
             if values['adaptive_source_native_bytes']!=values['adaptive_source_rows']*row_bytes:
                 raise ValueError('passive device native bytes differ from original row width')
             if values['adaptive_source_rows']>values['adaptive_cache_miss_rows'] or values['adaptive_cache_hit_rows']+values['adaptive_cache_miss_rows']>values['adaptive_completed_live_ids']:
@@ -846,11 +932,10 @@ def run_declared_diagnostic(args) -> int:
     prompt = validate_workload(workload)
     # Retain the identical source document in this existing artifact directory;
     # command evidence never depends on a temporary parser input after return.
-    if 'configuration_document' in profile:
-        engine_arguments=selection.canonical_arguments
-    else:
-        engine_arguments,configuration_owner,configuration_pins=paired_owner.canonical_diagnostic_arguments(record,output)
-        pins.update(configuration_pins)
+    # from_export already retained the original representation and translated
+    # its authenticated numerical observer's disabled-prefix policy. Rebuilding
+    # raw profile argv here would lose that exact source-owned projection.
+    engine_arguments=selection.canonical_arguments
     engine = ['benchmark',*engine_arguments,
         '--prompt',prompt,'-n',str(workload['decode_tokens']),'--seed',str(workload['seed']),
         '--temperature',str(workload['temperature']),'--top-k',str(workload['top_k']),

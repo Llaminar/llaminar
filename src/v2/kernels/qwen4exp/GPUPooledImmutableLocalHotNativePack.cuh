@@ -36,7 +36,7 @@ __global__ void prepareCompactPack(pooled_source::DeviceArgs a,lhpack::NativePac
         input.query.table==a.plan.owner.table && input.query.source_storage_generation==a.plan.owner.source_storage_generation &&
         p.consumer<p.consumer_count && p.consumer_count<=8 && input.row_offset[p.consumer]<=input.row_offset[p.consumer+1] &&
         request.miss_rows==input.row_offset[p.consumer+1]-input.row_offset[p.consumer] &&
-        lhpack::prepareResult(request,geometry,admission,view.frame->interval,*p.result,bytes) && bytes<=p.capacity_bytes;
+        lhpack::prepareResultFromSource(request,geometry,admission,*view.frame,input,*p.result,bytes) && bytes<=p.capacity_bytes;
     if(!valid)failCompactPack(a,p);
 }
 /** @brief Each actual needed row has disjoint writers; inactive capacity blocks copy no bytes. */

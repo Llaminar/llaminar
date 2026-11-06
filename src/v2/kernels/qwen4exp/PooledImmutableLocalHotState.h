@@ -15,7 +15,7 @@ enum class Disposition : std::uint32_t { Idle,Probing,Probed,DataReady,Consuming
 /** @brief Exact current frame identity; only its owning native stages may mutate it. */
 struct alignas(64) FrameIdentity {
     local_hot_transport::QueryIdentity query{};
-    PooledImmutableLocalHotAccessIntent intent=PooledImmutableLocalHotAccessIntent::CurrentInvocation;
+    PooledImmutableLocalHotAccessIntent intent=PooledImmutableLocalHotAccessIntent::CurrentInvocation; ///< Effective consumption intent; immutable wire purpose remains FutureOrigin after adoption.
     Disposition disposition=Disposition::Idle;
     std::uint64_t retained_native_bytes=0;
     adaptive_lookup::Status terminal_error=adaptive_lookup::Status::Success;
@@ -23,7 +23,31 @@ struct alignas(64) FrameIdentity {
     std::uint64_t source_request_invocation=0; ///< Last actual once-per-request I/O invocation; survives query/reset.
 };
 static_assert(sizeof(FrameIdentity)==64);
-inline constexpr std::uint32_t ReadCompleted=1u,FutureOrigin=2u,LateAdoption=4u;
+inline constexpr std::uint32_t ReadCompleted=1u,FutureOrigin=2u,LateAdoption=4u,PredictionDiscard=8u;
+/** @brief Actual consumer identity; a matching row prediction cannot replace request authority. */
+struct DemandIdentity {
+    local_hot_transport::QueryIdentity query{};
+    std::uint64_t source_request_invocation=0;
+};
+/** @brief Explicit local adoption result; prediction mismatch is reusable discard, never success. */
+enum class AdoptionResult : std::uint32_t {
+    Accepted,
+    PredictionMiss,
+    InvalidIdentity,
+    InvalidState,
+};
+/** @brief Order-independent integer-OR comparison bits shared by host replay and native reduction. */
+enum class DemandComparison : std::uint32_t {
+    Equal=0,
+    DifferentRow=1,
+    InvalidRecord=2,
+};
+/** @brief Complete original demand prefix; no storage, pin or execution authority is minted. */
+template<class Row> struct ActualDemand {
+    DemandIdentity identity{};
+    const Row* ordered_ids=nullptr;
+    std::uint32_t original_ids=0;
+};
 /**
  * @brief Actual completed transition counters; original IDs and unique native rows stay distinct.
  * Receive-completed wire bytes are projected by the original receipt producer;

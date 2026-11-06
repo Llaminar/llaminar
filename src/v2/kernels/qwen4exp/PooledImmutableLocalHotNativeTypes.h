@@ -4,13 +4,14 @@
  */
 #pragma once
 #include "PooledImmutableLocalHotOffsets.h"
+#include "Qwen4ExpPrefillNextTokenWindow.h"
 #include "PooledImmutableLocalHotOps.h"
 #include "PooledImmutableLocalHotTerminal.h"
 #include "PooledImmutableNativeTypes.h"
 #include "kernels/common/NativeEmbeddingIQTables.h"
 namespace llaminar2::qwen4exp::local_hot {
 /** @brief Closed launch/schema version captured with every actual native input. */
-inline constexpr std::uint64_t NativeVersion=3;
+inline constexpr std::uint64_t NativeVersion=5;
 /** @brief Static projection of the original prepared geometry and physical lifetime. */
 struct Parameters {
     PooledImmutableLocalHotCacheOffsets cache;
@@ -52,6 +53,10 @@ struct NativeQuery : NativeFrame {
     pooled_native::OriginalIdWidth id_width;
     PooledImmutableLocalHotAccessIntent intent;
 };
+/** @brief Actual demand producer and original once-per-request publication for safe future adoption. */
+struct NativeAdoption : NativeQuery {const local_hot_transport::SourceAdmissionHeader* admission=nullptr;};
+/** @brief Separate borrowed-window launch keeps the original Probe kernel parameter layout unchanged. */
+struct NativeNextWindowQuery : NativeQuery {Qwen4ExpPrefillNextTokenWindow window;};
 /** @brief Sole model output writer, independent of optional cache fill. */
 struct NativeRead : NativeFrame {float* output=nullptr;std::uint32_t physical_original=0;};
 /** @brief Original once-per-request local admission producer, never a per-query grant. */

@@ -53,7 +53,8 @@ QFN_ADAPTIVE_HD inline bool prepareRequest(const RequestArgs& a)
     if(a.key_bytes)*a.key_bytes=0;
     if(!a.output || !a.lane || !a.key_bytes || !a.query || !valid(*a.query) || !valid(a.geometry) ||
         !a.original_ids || !a.miss_rows || !a.source_admission ||
-        !a.received_admission_bytes || a.intent!=PooledImmutableLocalHotAccessIntent::CurrentInvocation ||
+        !a.received_admission_bytes || (a.intent!=PooledImmutableLocalHotAccessIntent::CurrentInvocation &&
+        a.intent!=PooledImmutableLocalHotAccessIntent::FutureReadAhead) ||
         a.query->consumer_storage_identity!=a.geometry.consumer_storage_identity ||
         !acceptSourceAdmission(*a.source_admission,a.query->table,a.query->source_storage_generation,
             *a.received_admission_bytes) ||
@@ -70,10 +71,11 @@ QFN_ADAPTIVE_HD inline bool prepareRequest(const RequestArgs& a)
 /** @brief Source-side request-lane projection, only after the actual header receive proof. */
 QFN_ADAPTIVE_HD inline bool acceptRequestLane(const RequestHeader& request,QueryIdentity sourceQuery,
     ConsumerGeometry geometry,std::uint32_t originalIds,const SourceAdmissionHeader& admission,
-    std::uint64_t receivedHeaderBytes,RequestLaneIdentity& output)
+    std::uint64_t receivedHeaderBytes,RequestLaneIdentity& output,
+    PooledImmutableLocalHotAccessIntent expected_intent=PooledImmutableLocalHotAccessIntent::CurrentInvocation)
 {
     output={};
-    if(!acceptRequestHeader(request,sourceQuery,geometry,originalIds,admission,receivedHeaderBytes))return false;
+    if(!acceptRequestHeader(request,sourceQuery,geometry,originalIds,admission,receivedHeaderBytes,expected_intent))return false;
     output={request.query.table,request.source_admission,request.query.sequence};return true;
 }
 /**
@@ -83,15 +85,42 @@ QFN_ADAPTIVE_HD inline bool acceptRequestLane(const RequestHeader& request,Query
  */
 QFN_ADAPTIVE_HD inline bool prepareResult(const RequestHeader& request,ConsumerGeometry geometry,
     const SourceAdmissionHeader& admission,p::Interval actualPoolInterval,
-    ResultHeader& output,std::uint64_t& nativeBytes)
+    ResultHeader& output,std::uint64_t& nativeBytes,
+    PooledImmutableLocalHotAccessIntent expected_intent=PooledImmutableLocalHotAccessIntent::CurrentInvocation)
 {
     output={};output.status=Status::InvalidGeometry;nativeBytes=0;
-    if(!acceptRequestHeader(request,request.query,geometry,request.original_ids,admission,sizeof(RequestHeader)) ||
+    if(!acceptRequestHeader(request,request.query,geometry,request.original_ids,admission,sizeof(RequestHeader),expected_intent) ||
         actualPoolInterval.table!=request.query.table || actualPoolInterval.admission!=request.source_admission ||
         !actualPoolInterval.sequence)return false;
     ResultHeader next{};next.query=request.query;next.pool_interval=actualPoolInterval;
     next.miss_rows=request.miss_rows;next.native_bytes=request.miss_rows*geometry.native_row_bytes;
     next.consumer=geometry.coordinate;next.native_format=geometry.native_format;next.intent=request.intent;
     output=next;nativeBytes=next.native_bytes;return true;
+}
+/**
+ * @brief Bind compact result metadata to the original completed source frame and union purpose.
+ * @param request Original immutable consumer request, never a relabeled adopted frame.
+ * @param geometry Exact consumer native extent and storage identity.
+ * @param admission Original source request admission/invocation.
+ * @param frame Actual original coordinator frame, already Ready after physical source work.
+ * @param input Actual original compact union producer.
+ * @param output Native result metadata, invalidated before any rejected preparation.
+ * @param nativeBytes Exact successful payload bytes, or zero on rejection.
+ * @return True only for matching current/future purpose and original query/count/interval.
+ * @note This grants no pin, readable pointer, source retirement or transport completion.
+ */
+QFN_ADAPTIVE_HD inline bool prepareResultFromSource(const RequestHeader& request,ConsumerGeometry geometry,
+    const SourceAdmissionHeader& admission,const p::LookupFrame& frame,const UnionControl& input,
+    ResultHeader& output,std::uint64_t& nativeBytes)
+{
+    output={};output.status=Status::InvalidGeometry;nativeBytes=0;
+    if((frame.purpose!=p::LookupPurpose::CurrentDemand && frame.purpose!=p::LookupPurpose::FutureLookupOnly) ||
+        frame.phase!=p::LookupPhase::Ready || frame.status!=Status::Success || input.status!=Status::Success ||
+        !valid(input.query) || input.query.table!=frame.interval.table ||
+        input.query.source_storage_generation!=frame.source_storage_generation || input.pool_original_ids<0 ||
+        frame.original_ids!=static_cast<std::uint32_t>(input.pool_original_ids))return false;
+    const auto expected=frame.purpose==p::LookupPurpose::FutureLookupOnly
+        ?PooledImmutableLocalHotAccessIntent::FutureReadAhead:PooledImmutableLocalHotAccessIntent::CurrentInvocation;
+    return input.intent==expected && prepareResult(request,geometry,admission,frame.interval,output,nativeBytes,expected);
 }
 } // namespace llaminar2::qwen4exp::local_hot_transport

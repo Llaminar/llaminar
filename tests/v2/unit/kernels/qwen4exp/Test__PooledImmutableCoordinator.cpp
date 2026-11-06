@@ -10,6 +10,8 @@
 #include "kernels/qwen4exp/PooledImmutableCoordinatorGeometry.h"
 #include "kernels/qwen4exp/PooledImmutableLocalHotTransportOps.h"
 #include "execution/qwen4exp/PooledImmutableNativeTransfer.h"
+#include "execution/qwen4exp/PooledImmutableLocalHotQueryBound.h"
+#include "kernels/qwen4exp/PooledImmutableNativeTypes.h"
 #include "execution/qwen4exp/PooledImmutableLocalHotTransportGeometry.h"
 #include "execution/qwen4exp/PooledImmutableReplicatedReaderGeometry.h"
 #include "kernels/qwen4exp/PooledImmutableCoordinatorOps.h"
@@ -111,9 +113,10 @@ struct Pool
     /** @brief Convert a protocol rejection into a concise fixture exception. */
     static void require(bool ok){if(!ok)throw std::logic_error("Actual pooled protocol rejected");}
     /** @brief Coalesce and acquire every actual directed initial pin and complete owner frontier. */
-    void begin(std::span<const std::uint64_t> original,std::uint64_t admission=1)
+    void begin(std::span<const std::uint64_t> original,std::uint64_t admission=1,
+        p::LookupPurpose purpose=p::LookupPurpose::CurrentDemand)
     {
-        require(operations().begin(admission,original.data(),static_cast<std::uint32_t>(original.size())));
+        require(operations().begin(admission,original.data(),static_cast<std::uint32_t>(original.size()),purpose));
         for(auto &owner:owners)require(owner->operations().begin(frame.interval));
         for(std::uint32_t i=0;i<frame.unique_rows;++i){
             p::OwnerCommand command{};
@@ -839,6 +842,41 @@ TEST(PooledImmutableCoordinator, NativeReaderFreshReceiptAndCurrentACKReplay)
     }
 }
 
+/** @test The actual union enqueuer's immutable selector and capture policy cover zero/boundaries. */
+TEST(PooledImmutableCoordinator, CooperativeUnionLaunchPolicyIsCaptureComplete)
+{
+    namespace t=qwen4exp::local_hot_transport;
+    EXPECT_FALSE(t::usesCooperativeUnion(0));
+    for(std::uint32_t bound:{1u,16u,32u,128u,256u})EXPECT_TRUE(t::usesCooperativeUnion(bound));
+    for(std::uint32_t bound:{257u,512u,8192u})EXPECT_FALSE(t::usesCooperativeUnion(bound));
+    EXPECT_NE(t::unionLaunchIdentity(256),t::unionLaunchIdentity(257));
+    EXPECT_EQ(t::unionLaunchIdentity(32),t::unionLaunchIdentity(16));
+}
+
+/** @test Actual compact launch policy follows declared query rows, not retained frame capacity. */
+TEST(PooledImmutableCoordinator, CompactCapturedQueryBoundIsTightAndCaptureComplete)
+{
+    namespace t=qwen4exp::local_hot_transport;
+    using Bound=qwen4exp::PooledImmutableLocalHotQueryBound;
+    std::array<t::ConsumerGeometry,2> consumers{{{0,2,8192,8192,0x100000100ULL,18,0,41},
+                                               {1,2,8192,32,0x100000100ULL,18,0,42}}};
+    std::int32_t count=0,other=0;
+    const auto small=Bound::forCanonicalQuery(DeviceRowRange::deviceCounted(1,&count),consumers,16384);
+    EXPECT_EQ(small.canonicalOriginal(),16u);EXPECT_EQ(small.consumerMaximum(0),16u);
+    EXPECT_EQ(small.consumerMaximum(1),16u);EXPECT_EQ(small.maximumOriginal(),32u);
+    EXPECT_TRUE(qwen4exp::pooled_native::coordinatorUsesSmallOriginal(DeviceRowRange::deviceCounted(small.maximumOriginal(),&count)));
+    const auto large=Bound::forCanonicalQuery(DeviceRowRange::fullyActive(512),consumers,16384);
+    EXPECT_EQ(large.maximumOriginal(),8224u);EXPECT_EQ(large.consumerMaximum(1),32u);
+    EXPECT_FALSE(qwen4exp::pooled_native::coordinatorUsesSmallOriginal(DeviceRowRange::fullyActive(large.maximumOriginal())));
+    for(int live:{0,1,0,1}){count=live;EXPECT_EQ(small,Bound::forCanonicalQuery(DeviceRowRange::deviceCounted(1,&count),consumers,16384));}
+    EXPECT_FALSE(small==large);
+    EXPECT_FALSE(small==Bound::forCanonicalQuery(DeviceRowRange::deviceCounted(1,&other),consumers,16384));
+    EXPECT_THROW(Bound::forCanonicalQuery(DeviceRowRange::fullyActive(512),consumers,32),std::invalid_argument);
+    EXPECT_THROW(Bound::forCanonicalQuery(DeviceRowRange::fullyActive(1),std::span<const t::ConsumerGeometry>{},16384),std::invalid_argument);
+    auto foreign=consumers;foreign[1].coordinate=0;
+    EXPECT_THROW(Bound::forCanonicalQuery(DeviceRowRange::fullyActive(1),foreign,16384),std::invalid_argument);
+}
+
 /** @test Unequal compact native requests use the actual original pool's stable union/inverse. */
 TEST(PooledImmutableCoordinator, LocalHotCompactMissesReuseOriginalUnionAndRejectForeignRosters)
 {
@@ -863,6 +901,22 @@ TEST(PooledImmutableCoordinator, LocalHotCompactMissesReuseOriginalUnionAndRejec
         args.consumers[c]={c,3,16,16,0x100000100ULL,18,static_cast<std::uint32_t>(GGUFTensorType::IQ4_NL),40+c};
         args.requests[c]={&requests[c],c==0?keys0.data():keys1.data(),&headerBytes[c],&keyBytes[c]};
     }
+    // Same admitted buffers, unequal per-consumer compact ceilings and a tight
+    // checked sum. Actual zero prefixes remain ordinary progress, not fallback.
+    args.consumers[0].maximum_misses=2;args.consumers[1].maximum_misses=3;args.consumers[2].maximum_misses=1;
+    const auto tight=qwen4exp::PooledImmutableLocalHotQueryBound::forCanonicalQuery(
+        DeviceRowRange::fullyActive(1),std::span{args.consumers,std::size_t{3}},merged.size());
+    args.capacity=tight.maximumOriginal();args.canonical.capacity=tight.canonicalOriginal();
+    EXPECT_EQ(args.capacity,6u);
+    for(unsigned repeat=0;repeat<20;++repeat){
+        for(auto& request:requests)request.miss_rows=0;keyBytes={0,0,0};
+        ASSERT_TRUE(t::prepareUnion(args));EXPECT_EQ(control.pool_original_ids,0);
+        requests[0].miss_rows=2;requests[1].miss_rows=2;keyBytes={16,16,0};
+        ASSERT_TRUE(t::prepareUnion(args));EXPECT_EQ(control.pool_original_ids,4);
+    }
+    requests[0].miss_rows=3;keyBytes[0]=24;
+    EXPECT_FALSE(t::prepareUnion(args));EXPECT_EQ(control.pool_original_ids,-1);
+    requests[0].miss_rows=2;keyBytes[0]=16;
     ASSERT_TRUE(t::prepareUnion(args));ASSERT_EQ(control.pool_original_ids,4);
     for(std::uint32_t c=0;c<3;++c)for(std::uint32_t m=0;m<requests[c].miss_rows;++m)ASSERT_TRUE(t::copyMiss(args,c,m));
     const std::array<std::uint64_t,4> expected{5,9,9,2};EXPECT_TRUE(std::equal(expected.begin(),expected.end(),merged.begin()));
@@ -979,11 +1033,81 @@ TEST(PooledImmutableCoordinator, LocalHotRequestPublicationRejectsStaleAdmission
     }
     --headerBytes;EXPECT_FALSE(t::prepareRequest(args));EXPECT_EQ(bytes,0);EXPECT_EQ(lane.sequence,0);
     ++headerBytes;args.intent=qwen4exp::PooledImmutableLocalHotAccessIntent::FutureReadAhead;
-    EXPECT_FALSE(t::prepareRequest(args));EXPECT_EQ(bytes,0);
+    ASSERT_TRUE(t::prepareRequest(args));
+    EXPECT_FALSE(t::acceptRequest(request,query,geometry,32,source,sizeof(request),bytes));
+    EXPECT_TRUE(t::acceptRequest(request,query,geometry,32,source,sizeof(request),bytes,args.intent));
     args.intent=qwen4exp::PooledImmutableLocalHotAccessIntent::CurrentInvocation;
     source.status=a::Status::Cancelled;EXPECT_FALSE(t::prepareRequest(args));EXPECT_EQ(bytes,0);
     admission=0;EXPECT_FALSE(t::publishSourceAdmission({701,17,&admission,&invocation,&source}));
     EXPECT_NE(source.status,a::Status::Success);
+}
+
+/** @test Lookup-only uses actual empty owner receipts, retained pins and no demand policy credit. */
+TEST(PooledImmutableCoordinator, FutureLookupOnlyRetainsPinsAndNeverMutatesDemandPolicy)
+{
+    const std::array<std::uint32_t,3> capacities{2,1,0};
+    Pool pool(capacities), twin(capacities);
+    const std::array<std::uint64_t,3> seed{0,1,2};
+    for(auto* owner:{&pool,&twin}){
+        owner->begin(seed);owner->freeWave();owner->victimWave();owner->finish();
+    }
+    for(unsigned replay=0;replay<20;++replay){
+        const auto before=pool.policy;
+        const auto epochs=pool.epochs;const auto counts=pool.counts;
+        const auto entries=pool.entries;
+        const std::array<std::uint64_t,5> forecast{0,80,80,1,81};
+        pool.begin(forecast,1,p::LookupPurpose::FutureLookupOnly);
+        EXPECT_GT(pool.owners[0]->frame.initial_pin_count,0u);
+        pool.freeWave();pool.victimWave();
+        EXPECT_EQ(pool.frame.free_planned,0u);EXPECT_EQ(pool.frame.victim_planned,0u);
+        for(const auto& owner:pool.owners)EXPECT_EQ(owner->allocation_frame.count,0u);
+        if(replay%2)pool.cancel();else pool.finish();
+        EXPECT_EQ(std::memcmp(&pool.policy,&before,sizeof(before)),0);
+        EXPECT_EQ(pool.epochs,epochs);EXPECT_EQ(pool.counts,counts);
+        for(std::size_t at=0;at<entries.size();++at){
+            EXPECT_EQ(pool.entries[at].touched,entries[at].touched);
+            EXPECT_EQ(pool.entries[at].previous,entries[at].previous);
+            EXPECT_EQ(pool.entries[at].next,entries[at].next);
+            EXPECT_EQ(pool.entries[at].stream,entries[at].stream);
+            EXPECT_EQ(pool.entries[at].present,entries[at].present);
+        }
+        const std::array<std::uint64_t,3> demand{3+replay%7,3+replay%7,1};
+        for(auto* owner:{&pool,&twin}){
+            owner->begin(demand);owner->freeWave();owner->victimWave();owner->finish();
+        }
+        EXPECT_EQ(std::memcmp(&pool.policy,&twin.policy,sizeof(pool.policy)),0);
+        EXPECT_EQ(pool.epochs,twin.epochs);EXPECT_EQ(pool.counts,twin.counts);
+    }
+    Pool invalid(capacities);
+    EXPECT_FALSE(invalid.operations().begin(1,seed.data(),seed.size(),static_cast<p::LookupPurpose>(99)));
+}
+
+/** @test Future metadata requires its original purpose and actual live native extents. */
+TEST(PooledImmutableCoordinator, FutureCompactWireRequiresPurposeAndExactPartialExtents)
+{
+    namespace t=qwen4exp::local_hot_transport;
+    const auto future=qwen4exp::PooledImmutableLocalHotAccessIntent::FutureReadAhead;
+    std::uint64_t admission=23,invocation=37,original=32,misses=0,bytes=0;
+    t::SourceAdmissionHeader source{};
+    ASSERT_TRUE(t::publishSourceAdmission({701,17,&admission,&invocation,&source}));
+    std::uint64_t admissionBytes=sizeof(source);
+    t::QueryIdentity query{701,17,77,9};
+    const t::ConsumerGeometry geometry{1,2,32,32,1000,18,static_cast<std::uint32_t>(GGUFTensorType::IQ4_NL),77};
+    t::RequestHeader request{};t::RequestLaneIdentity lane{};
+    t::RequestArgs args{&query,&original,&misses,&source,&admissionBytes,geometry,future,&request,&lane,&bytes};
+    for(unsigned replay=0;replay<20;++replay)for(const auto live:{0u,1u,3u,32u}){
+        misses=live;++query.sequence;
+        ASSERT_TRUE(t::prepareRequest(args));EXPECT_EQ(bytes,live*8u);
+        EXPECT_FALSE(t::acceptRequest(request,query,geometry,32,source,sizeof(request),bytes));
+        EXPECT_TRUE(t::acceptRequest(request,query,geometry,32,source,sizeof(request),bytes,future));
+        EXPECT_FALSE(t::acceptRequest(request,query,geometry,32,source,sizeof(request),bytes+8,future));
+        t::ResultHeader result{};std::uint64_t nativeBytes=0;
+        ASSERT_TRUE(t::prepareResult(request,geometry,source,{701,23,101},result,nativeBytes,future));
+        EXPECT_EQ(nativeBytes,live*18u);
+        EXPECT_TRUE(t::acceptResult(result,request,geometry,sizeof(result),nativeBytes,future));
+        EXPECT_FALSE(t::acceptResult(result,request,geometry,sizeof(result),nativeBytes));
+        EXPECT_FALSE(t::acceptResult(result,request,geometry,sizeof(result),nativeBytes+18,future));
+    }
 }
 
 } // namespace llaminar2::test

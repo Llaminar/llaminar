@@ -16,7 +16,7 @@
 namespace llaminar2::qwen4exp {
 namespace {
 /** @brief Closed schemas prevent an unused input from becoming an implicit authority. */
-enum class Schema { Frame, Query, Read, Result, RequestReset };
+enum class Schema { Frame, Query, Adoption, Read, Result, RequestReset };
 /** @return Checked immutable extent; never a live communication count. */
 std::size_t multiply(std::size_t a, std::size_t b)
 {
@@ -54,6 +54,7 @@ struct PooledImmutableLocalHotOperands::Data {
     Schema schema;
     std::vector<PooledNativeTensorSpan> spans;
     std::optional<DeviceRowRange> rows;
+    std::optional<Qwen4ExpPrefillNextWindowBinding> next_window;
     PooledImmutableLocalHotAccessIntent intent = PooledImmutableLocalHotAccessIntent::CurrentInvocation;
     std::optional<PooledNativeTransferSpan> own_request;
     void* sealed_request = nullptr;
@@ -98,6 +99,36 @@ PooledImmutableLocalHotOperands PooledImmutableLocalHotOperands::query(
         data->spans.push_back(std::move(*count));
     }
     return PooledImmutableLocalHotOperands(std::move(data));
+}
+
+PooledImmutableLocalHotOperands PooledImmutableLocalHotOperands::nextWindowQuery(
+    const PooledImmutableLocalHotPreparedStorage& storage,local_hot_transport::ConsumerGeometry consumer,
+    Qwen4ExpPrefillNextWindowBinding window,PooledNativeTensorSpan ids,DeviceGenerationControlBinding controller)
+{
+    if(window.device()!=storage.geometry().allocator().device || !window.native().declared() ||
+        window.native().next_bucket>int(storage.geometry().maximumOriginalIds()/16))
+        throw std::invalid_argument("Local next-window query changed its original participant or bounded capacity");
+    auto result=query(storage,consumer,DeviceRowRange::fullyActive(window.native().next_bucket),std::move(ids),{},
+        controller,PooledImmutableLocalHotAccessIntent::FutureReadAhead);
+    result.data_->next_window=std::move(window);return result;
+}
+bool PooledImmutableLocalHotOperands::hasNextWindow()const noexcept{return data_->next_window.has_value();}
+std::uint64_t PooledImmutableLocalHotOperands::nextWindowIdentity()const noexcept
+{return data_->next_window?data_->next_window->captureIdentity():0;}
+
+PooledImmutableLocalHotOperands PooledImmutableLocalHotOperands::adoption(
+    const PooledImmutableLocalHotPreparedStorage& storage, local_hot_transport::ConsumerGeometry consumer,
+    DeviceRowRange rows, PooledNativeTensorSpan ids, std::optional<PooledNativeTensorSpan> count,
+    PooledNativeTransferSpan admission, DeviceGenerationControlBinding controller)
+{
+    auto result = query(storage, consumer, rows, std::move(ids), std::move(count), controller,
+                        PooledImmutableLocalHotAccessIntent::CurrentInvocation);
+    admission.require(storage.geometry().allocator().device, alignof(local_hot_transport::SourceAdmissionHeader));
+    if (admission.bytes() != sizeof(local_hot_transport::SourceAdmissionHeader))
+        throw std::invalid_argument("Local adoption requires its actual original request publication");
+    result.data_->schema = Schema::Adoption;
+    result.data_->own_request.emplace(std::move(admission));
+    return result;
 }
 
 PooledImmutableLocalHotOperands PooledImmutableLocalHotOperands::read(
@@ -155,6 +186,19 @@ void PooledImmutableLocalHotOperands::seal()
         data_->prepared.emplace(device, roots);
     }
     data_->prepared->seal();
+    if(data_->next_window){
+        const auto& w=data_->next_window->native();
+        const auto begin=reinterpret_cast<std::uintptr_t>(address(data_->spans.at(0)));
+        const auto end=begin+data_->spans.at(0).bytes;
+        const auto disjoint=[&](const std::int32_t* p,std::size_t count){
+            const auto input=reinterpret_cast<std::uintptr_t>(p);
+            return input<=std::numeric_limits<std::uintptr_t>::max()-count*4 &&
+                (input+count*4<=begin || input>=end);
+        };
+        if(!disjoint(w.request_tokens,w.request_capacity)||!disjoint(w.request_positions,1)||
+            !disjoint(w.request_total,1)||!disjoint(w.current_positions,1)||!disjoint(w.current_rows,1))
+            throw std::logic_error("Local next-window native input aliases its hash output");
+    }
     if (data_->own_request) {
         auto* current = data_->own_request->pointer(device, alignof(local_hot_transport::RequestHeader));
         if (data_->sealed_request && data_->sealed_request != current)
@@ -177,6 +221,7 @@ void PooledImmutableLocalHotOperands::require(PooledImmutableLocalHotAction acti
     const PooledImmutableLocalHotPreparedStorage& storage) const
 {
     const Schema wanted = action == PooledImmutableLocalHotAction::Probe ? Schema::Query :
+        action == PooledImmutableLocalHotAction::Adopt ? Schema::Adoption :
         action == PooledImmutableLocalHotAction::LocalRead ? Schema::Read :
         action == PooledImmutableLocalHotAction::AcceptResult ? Schema::Result :
         action == PooledImmutableLocalHotAction::ResetRequest ? Schema::RequestReset : Schema::Frame;
@@ -193,7 +238,7 @@ void PooledImmutableLocalHotOperands::require(PooledImmutableLocalHotAction acti
         TransferEngine::instance().requireCapturedDeviceStorage(*data_->captured.at(i), *span.root,
             storage.geometry().allocator().device, span.root->size_bytes());
         if (!span.root->gpu_data_ptr() || reinterpret_cast<std::uintptr_t>(address(span)) %
-            (data_->schema == Schema::Query && i == 0 ? 8 : 4))
+            ((data_->schema == Schema::Query || data_->schema == Schema::Adoption) && i == 0 ? 8 : 4))
             throw std::logic_error("Local hot native producer lost its exact aligned prepared address");
     }
     if (data_->rows && data_->rows->countOwner() &&
@@ -203,6 +248,12 @@ void PooledImmutableLocalHotOperands::require(PooledImmutableLocalHotAction acti
 
 const std::vector<PooledNativeTensorSpan>& PooledImmutableLocalHotOperands::spans() const noexcept
 {return data_->spans;}
+PooledImmutableLocalHotAccessIntent PooledImmutableLocalHotOperands::queryIntent() const
+{
+    if (!data_ || data_->schema != Schema::Query)
+        throw std::logic_error("Query intent requires original Probe operands");
+    return data_->intent;
+}
 std::uint64_t PooledImmutableLocalHotOperands::controllerIdentity() const noexcept
 {return data_->controller.captureIdentity();}
 TensorBase* PooledImmutableLocalHotOperands::controllerOwner() const noexcept
@@ -218,6 +269,8 @@ std::uint64_t PooledImmutableLocalHotOperands::declarationIdentity() const
     mix(value, data_->consumer.native_format); mix(value, data_->consumer.consumer_storage_identity);
     mix(value, std::uint32_t(data_->intent));
     if (data_->own_request) mix(value, data_->own_request->identity());
+    mix(value,data_->next_window.has_value());
+    if(data_->next_window)mix(value,data_->next_window->captureIdentity());
     for (const auto& span : data_->spans) {
         mix(value, reinterpret_cast<std::uintptr_t>(span.root.get())); mix(value, std::uint64_t(span.buffer));
         mix(value, span.offset); mix(value, span.bytes); mix(value, std::uint64_t(span.root->native_type()));
@@ -248,6 +301,17 @@ local_hot::NativeQuery PooledImmutableLocalHotOperands::nativeQuery(const Pooled
 {
     return {nativeFrame(storage), *data_->rows, address(data_->spans.at(0)),
             pooled_native::OriginalIdWidth::UInt64, data_->intent};
+}
+local_hot::NativeAdoption PooledImmutableLocalHotOperands::nativeAdoption(const PooledImmutableLocalHotPreparedStorage& storage) const
+{
+    return {nativeQuery(storage), static_cast<const local_hot_transport::SourceAdmissionHeader*>(data_->sealed_request)};
+}
+local_hot::NativeNextWindowQuery PooledImmutableLocalHotOperands::nativeNextWindowQuery(
+    const PooledImmutableLocalHotPreparedStorage& storage)const
+{
+    if(!data_->next_window || data_->schema!=Schema::Query)
+        throw std::logic_error("Next-window native query requires its original Probe declaration");
+    return {nativeQuery(storage),data_->next_window->native()};
 }
 local_hot::NativeRead PooledImmutableLocalHotOperands::nativeRead(const PooledImmutableLocalHotPreparedStorage& storage) const
 {

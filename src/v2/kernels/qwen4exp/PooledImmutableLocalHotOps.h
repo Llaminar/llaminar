@@ -130,12 +130,12 @@ public:
     {
         auto& f=*v_.metadata.frame;
         if(v_.identity->disposition!=Disposition::Probed || f.status!=a::Status::Success ||
-            !t::same(request.query,v_.identity->query) || request.intent!=v_.identity->intent ||
+            !t::same(request.query,v_.identity->query) || request.intent!=wireIntent() ||
             request.original_ids!=f.original_ids ||
             request.miss_rows!=f.source_rows || !result.header || !result.received_header_bytes ||
             !result.received_payload_bytes || result.native_rows!=v_.response ||
             f.source_rows>result.native_capacity/v_.row_bytes ||
-            !t::acceptResult(*result.header,request,geometry,*result.received_header_bytes,*result.received_payload_bytes))
+            !t::acceptResult(*result.header,request,geometry,*result.received_header_bytes,*result.received_payload_bytes,wireIntent()))
             return fail(a::Status::SourceFailure);
         if((v_.identity->flags&LateAdoption) && !addCounter(v_.counters->future_late_native_rows,f.source_rows))return false;
         v_.identity->retained_native_bytes=*result.received_payload_bytes;
@@ -145,7 +145,8 @@ public:
     QFN_ADAPTIVE_HD const std::byte* readableUnique(std::uint32_t index)const
     {
         const auto& f=*v_.metadata.frame;
-        if(f.status!=a::Status::Success || v_.identity->disposition!=Disposition::DataReady || index>=f.unique_rows)
+        if(f.status!=a::Status::Success || v_.identity->disposition!=Disposition::DataReady ||
+            v_.identity->intent!=PooledImmutableLocalHotAccessIntent::CurrentInvocation || index>=f.unique_rows)
             return nullptr;
         const auto& r=v_.unique[index];
         if(r.flags&a::InitialHit){
@@ -184,17 +185,125 @@ public:
             (!f.source_rows && !addCounter(v_.counters->all_hit_wait_avoided_original_ids,f.original_ids)))return false;
         v_.identity->flags|=ReadCompleted;return true;
     }
-    /** @brief Adopt the SAME retained future frame without another probe/source lookup or policy credit. */
-    QFN_ADAPTIVE_HD bool adopt(t::QueryIdentity query)
+    /** @return Immutable original transport intent, distinct from adopted demand consumption. */
+    QFN_ADAPTIVE_HD PooledImmutableLocalHotAccessIntent wireIntent() const
     {
-        if(!t::same(query,v_.identity->query) ||
-            v_.identity->intent!=PooledImmutableLocalHotAccessIntent::FutureReadAhead ||
-            (v_.identity->disposition!=Disposition::Probed && v_.identity->disposition!=Disposition::DataReady))
-            return fail(a::Status::InvalidPhase);
-        if(v_.identity->disposition==Disposition::DataReady){
-            if(!addCounter(v_.counters->future_on_time_native_rows,v_.metadata.frame->source_rows))return false;
-        }else v_.identity->flags|=LateAdoption;
-        v_.identity->intent=PooledImmutableLocalHotAccessIntent::CurrentInvocation;return true;
+        return v_.identity->flags & FutureOrigin
+            ? PooledImmutableLocalHotAccessIntent::FutureReadAhead
+            : PooledImmutableLocalHotAccessIntent::CurrentInvocation;
+    }
+    /**
+     * @brief Validate the actual consumer's complete original frame/request coordinates.
+     * @param demand Exact retained query and original source request invocation.
+     * @param original_ids Actual complete ordered demand extent, never allocation capacity.
+     * @return Accepted means eligible for row comparison, not committed consumption.
+     * @note A count prediction miss is nonfatal. Stale/foreign identity is absorbing.
+     */
+    QFN_ADAPTIVE_HD AdoptionResult checkAdoption(DemandIdentity demand, std::uint32_t original_ids)
+    {
+        const auto& f = *v_.metadata.frame;
+        if (v_.identity->terminal_error != a::Status::Success) return AdoptionResult::InvalidState;
+        if (f.status != a::Status::Success && f.status != a::Status::Cancelled)
+        {
+            fatal(f.status); // Preserve an earlier actual source/frame failure.
+            return AdoptionResult::InvalidState;
+        }
+        if (!t::valid(demand.query) || !t::same(demand.query, v_.identity->query) ||
+            demand.query.table != v_.table || demand.query.source_storage_generation != v_.source_generation ||
+            demand.query.consumer_storage_identity != v_.consumer_storage_identity ||
+            !demand.source_request_invocation ||
+            demand.source_request_invocation != v_.identity->source_request_invocation)
+        {
+            fatal(a::Status::Invariant);
+            return AdoptionResult::InvalidIdentity;
+        }
+        if (v_.identity->terminal_error != a::Status::Success || f.status != a::Status::Success ||
+            !(v_.identity->flags & FutureOrigin) || (v_.identity->flags & ReadCompleted) ||
+            v_.identity->intent != PooledImmutableLocalHotAccessIntent::FutureReadAhead ||
+            (v_.identity->disposition != Disposition::Probed && v_.identity->disposition != Disposition::DataReady))
+        {
+            fatal(a::Status::InvalidPhase);
+            return AdoptionResult::InvalidState;
+        }
+        if (original_ids > v_.maximum_original || original_ids % 16 ||
+            f.original_ids > v_.maximum_original || f.unique_rows > f.original_ids || ((f.unique_rows == 0) != (f.original_ids == 0)))
+        {
+            fatal(a::Status::InvalidGeometry);
+            return AdoptionResult::InvalidState;
+        }
+        return original_ids == f.original_ids ? AdoptionResult::Accepted : AdoptionResult::PredictionMiss;
+    }
+    /**
+     * @brief Compare one actual original coordinate through the retained stable inverse.
+     * @param original Actual ordered coordinate in the current full demand prefix.
+     * @param row Exact UInt32-zero-extended or full UInt64 original source row.
+     * @return Integer bits permit deterministic OR reduction without another sort or scratch bank.
+     */
+    QFN_ADAPTIVE_HD DemandComparison compareDemandOriginal(std::uint32_t original, std::uint64_t row) const
+    {
+        const auto& f = *v_.metadata.frame;
+        if (original >= f.original_ids || row >= v_.metadata.source_rows)
+            return DemandComparison::InvalidRecord;
+        const auto unique = v_.original_to_unique[original];
+        if (unique >= f.unique_rows || v_.unique[unique].row >= v_.metadata.source_rows)
+            return DemandComparison::InvalidRecord;
+        return v_.unique[unique].row == row ? DemandComparison::Equal : DemandComparison::DifferentRow;
+    }
+    /**
+     * @brief Commit the original comparison after all cooperative reader lanes have joined.
+     * @param demand Same actual request identity checked before the bounded comparison.
+     * @param original_ids Same live complete prefix used by every comparison lane.
+     * @param comparison OR of compareDemandOriginal results; no floating arithmetic is involved.
+     * @return Accepted changes only consumption intent. PredictionMiss disposes without policy credit.
+     * @note Physical source/transfer drain remains the original parent retirement authority.
+     */
+    QFN_ADAPTIVE_HD AdoptionResult finishAdoption(DemandIdentity demand, std::uint32_t original_ids,
+                                                  std::uint32_t comparison)
+    {
+        const auto check = checkAdoption(demand, original_ids);
+        if (check == AdoptionResult::InvalidIdentity || check == AdoptionResult::InvalidState) return check;
+        if (comparison & ~std::uint32_t(DemandComparison::DifferentRow))
+        {
+            fatal(a::Status::Invariant);
+            return AdoptionResult::InvalidState;
+        }
+        if (check == AdoptionResult::PredictionMiss || comparison)
+        {
+            if (!discard(demand.query)) return AdoptionResult::InvalidState;
+            v_.identity->flags |= PredictionDiscard;
+            return AdoptionResult::PredictionMiss;
+        }
+        if (v_.identity->disposition == Disposition::DataReady)
+        {
+            if (!addCounter(v_.counters->future_on_time_native_rows, v_.metadata.frame->source_rows))
+                return AdoptionResult::InvalidState;
+        }
+        else v_.identity->flags |= LateAdoption;
+        v_.identity->intent = PooledImmutableLocalHotAccessIntent::CurrentInvocation;
+        return AdoptionResult::Accepted;
+    }
+    /**
+     * @brief Replay the same exact-demand comparison serially over recorded CPU inputs.
+     * @tparam Row Original UInt32 or UInt64 row representation; no narrowing conversion is permitted.
+     * @param demand Actual complete original IDs and original request identity.
+     * @return Explicit accepted, prediction-miss disposal or absorbing invalid identity/state.
+     * @note Native execution uses the same coordinate predicate with cooperative deterministic OR.
+     */
+    template<class Row> QFN_ADAPTIVE_HD AdoptionResult adopt(ActualDemand<Row> demand)
+    {
+        static_assert(std::is_same_v<Row, std::uint32_t> || std::is_same_v<Row, std::uint64_t>);
+        const auto check = checkAdoption(demand.identity, demand.original_ids);
+        if (check == AdoptionResult::InvalidIdentity || check == AdoptionResult::InvalidState) return check;
+        if (demand.original_ids && !demand.ordered_ids)
+        {
+            fatal(a::Status::InvalidGeometry);
+            return AdoptionResult::InvalidState;
+        }
+        std::uint32_t comparison = 0;
+        if (check == AdoptionResult::Accepted)
+            for (std::uint32_t i = 0; i < demand.original_ids; ++i)
+                comparison |= std::uint32_t(compareDemandOriginal(i, std::uint64_t(demand.ordered_ids[i])));
+        return finishAdoption(demand.identity, demand.original_ids, comparison);
     }
     /**
      * @brief Credit actual demand once in true original order, then reserve optional slots.

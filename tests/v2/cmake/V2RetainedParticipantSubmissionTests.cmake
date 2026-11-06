@@ -299,3 +299,14 @@ if(TARGET v2_test_native_ordering_event_group)
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;GTEST_DEATH_TEST_STYLE=threadsafe")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PreparedFollowerTerminalRecreation)
 endif()
+
+# Metadata-only lifecycle boundaries; actual source/native parent execution is a separate gate.
+if(TARGET v2_test_forward_graph_types)
+    add_v2_test(V2_Integration_RetainedParticipantFutureLifecycleReplay
+        COMMAND $<TARGET_FILE:v2_test_forward_graph_types>
+            --gtest_filter=Test__GraphSegmentCache.RetainedParticipantFutureProducerHasIndependentMainFrontierReplay:Test__GraphSegmentCache.RetainedParticipantLocalConsumptionRetainsOnlyOriginalOwnerReplay:Test__GraphSegmentCache.RetainedParticipantFutureLifecycleRejectsMixedAndStaleDeclarationsReplay
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Graph;Ownership;Replay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RetainedParticipantFutureLifecycleReplay)
+endif()

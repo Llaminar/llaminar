@@ -94,7 +94,7 @@ template<class Slot> struct Replay {
     t::RequestHeader request()const {
         t::RequestHeader q;q.query=identity.query;q.miss_rows=frame.source_rows;q.original_ids=std::uint32_t(frame.original_ids);
         q.source_admission=23;q.source_invocation=37;
-        q.consumer=0;q.native_format=std::uint32_t(GGUFTensorType::F32);q.native_row_bytes=row_bytes;q.intent=identity.intent;return q;
+        q.consumer=0;q.native_format=std::uint32_t(GGUFTensorType::F32);q.native_row_bytes=row_bytes;q.intent=identity.flags&h::FutureOrigin ? PooledImmutableLocalHotAccessIntent::FutureReadAhead : identity.intent;return q;
     }
     /** @return Original declared reader envelope; current root lifetime is explicit. */
     t::ConsumerGeometry consumer()const {return {0,1,Maximum,Maximum,source_rows,row_bytes,std::uint32_t(GGUFTensorType::F32),19};}
@@ -169,7 +169,7 @@ TEST(PooledImmutableLocalHot, FutureIntentAdoptionAndDiscardNeverCreditsUnconsum
         EXPECT_EQ(retired.outcome,decltype(retired.outcome)::Discarded);EXPECT_EQ(std::memcmp(&owner,&r.owner,sizeof(owner)),0);
         EXPECT_EQ(r.counts,counts);EXPECT_EQ(r.epochs,epochs);EXPECT_EQ(r.frame.held_pins,0u);
         r.query(ids,PooledImmutableLocalHotAccessIntent::FutureReadAhead);const auto ordinal=r.identity.query.sequence;
-        op=r.operations();ASSERT_TRUE(op.adopt(r.identity.query));r.expectRows(ids);r.consumeRetire();
+        op=r.operations();ASSERT_TRUE(op.adopt(h::ActualDemand<std::uint64_t>{{r.identity.query,r.identity.source_request_invocation},ids.data(),unsigned(ids.size())})==h::AdoptionResult::Accepted);r.expectRows(ids);r.consumeRetire();
         EXPECT_EQ(r.identity.query.sequence,ordinal);
     }
 }
@@ -548,12 +548,12 @@ void replayLateAdoptedMiss(std::uint64_t base, std::uint64_t source_rows)
         const auto clock = r.owner.logical_clock;
         const auto counters = r.counters;
         auto op = r.operations();
-        ASSERT_TRUE(op.adopt(original_query));
+        ASSERT_TRUE(op.adopt(h::ActualDemand<std::uint64_t>{{original_query,r.identity.source_request_invocation},input.data(),unsigned(input.size())})==h::AdoptionResult::Accepted);
         EXPECT_TRUE(t::same(original_query, r.identity.query));
         EXPECT_EQ(r.identity.intent, PooledImmutableLocalHotAccessIntent::CurrentInvocation);
         EXPECT_EQ(r.owner.logical_clock, clock);
         EXPECT_EQ(r.counters, counters);
-        ASSERT_TRUE(r.receive()); // Actual current-demand receipt, never a future tier-prefetch claim.
+        ASSERT_TRUE(r.receive()); // The original Future wire intent survives adoption; this is still component metadata replay.
         EXPECT_EQ(r.counters.future_late_native_rows, counters.future_late_native_rows + 1);
         EXPECT_EQ(r.counters.future_useful_native_rows, counters.future_useful_native_rows);
         EXPECT_EQ(r.owner.logical_clock, clock);
@@ -622,5 +622,193 @@ TEST(PooledImmutableLocalHot, RecordedConsumedScanPreservesHotDecodeRow)
 {
     replayConsumedScanProtection<a::Slot32>(0, 1024);
     replayConsumedScanProtection<a::Slot64>(0x100000000ULL, 0x100000400ULL);
+}
+} // namespace llaminar2::qwen4exp
+
+namespace llaminar2::qwen4exp {
+namespace {
+/**
+ * @brief Replay complete ordered demand matching through the actual native-frame mechanics.
+ * @tparam Slot Original Slot32 or Slot64 metadata representation.
+ * @param base Exact original source-key width offset.
+ * @param source_rows Original source extent containing every recorded row.
+ */
+template<class Slot>
+void replayActualFutureDemand(std::uint64_t base, std::uint64_t source_rows)
+{
+    using Result = h::AdoptionResult;
+    using Intent = PooledImmutableLocalHotAccessIntent;
+    for (const auto capacity : {0u, 2u, 4u})
+    {
+        Replay<Slot> r(capacity, 16, source_rows);
+        auto ids = repeated(base + 5);
+        ids[1] = base + 9;
+        ids[3] = base + 9;
+        r.query(ids); ASSERT_TRUE(r.receive()); r.consumeRetire();
+        for (unsigned replay = 0; replay < 20; ++replay)
+        {
+            r.query(ids, Intent::FutureReadAhead);
+            if (r.frame.source_rows) ASSERT_TRUE(r.receive());
+            const auto before = r.counters;
+            const auto clock = r.owner.logical_clock;
+            const auto ordinal = r.identity.query.sequence;
+            EXPECT_EQ(r.operations().readableOriginal(0), nullptr);
+            auto demand = h::ActualDemand<std::uint64_t>{
+                {r.identity.query, r.identity.source_request_invocation}, ids.data(), unsigned(ids.size())};
+            ASSERT_EQ(r.operations().adopt(demand), Result::Accepted);
+            EXPECT_EQ(r.owner.logical_clock, clock);
+            EXPECT_EQ(r.counters.consumed_original_ids, before.consumed_original_ids);
+            EXPECT_EQ(r.identity.query.sequence, ordinal);
+            EXPECT_EQ(r.operations().wireIntent(), Intent::FutureReadAhead);
+            r.read(); r.consumeRetire();
+            EXPECT_EQ(r.counters.consumed_original_ids, before.consumed_original_ids + ids.size());
+
+            // Same multiset/unique count but a different original order is an
+            // explicit prediction miss. No demand row is read or credited.
+            r.query(ids, Intent::FutureReadAhead);
+            auto changed = ids;
+            std::swap(changed[0], changed[1]);
+            const auto policy = localHotObjectBytes(r.owner);
+            const auto counts = r.counts;
+            const auto epochs = r.epochs;
+            const auto counters = r.counters;
+            const auto pending = r.frame.source_rows;
+            demand = {{r.identity.query,r.identity.source_request_invocation},changed.data(),unsigned(changed.size())};
+            ASSERT_EQ(r.operations().adopt(demand), Result::PredictionMiss);
+            EXPECT_EQ(r.identity.disposition, h::Disposition::Discarded);
+            EXPECT_TRUE(r.identity.flags & h::PredictionDiscard);
+            EXPECT_EQ(r.identity.terminal_error, a::Status::Success);
+            EXPECT_EQ(r.operations().readableOriginal(0), nullptr);
+            EXPECT_EQ(localHotObjectBytes(r.owner), policy);
+            EXPECT_EQ(r.counts, counts); EXPECT_EQ(r.epochs, epochs);
+            EXPECT_EQ(r.counters.consumed_original_ids, counters.consumed_original_ids);
+            // This is a device-free lifecycle observation, not native drain:
+            // the original transport/parent must finish before this retire.
+            if (pending) EXPECT_EQ(r.frame.held_pins, 0u);
+            const auto retired = r.operations().retire(r.identity.query);
+            EXPECT_EQ(retired.outcome, decltype(retired.outcome)::Discarded);
+            EXPECT_EQ(r.frame.held_pins, 0u);
+        }
+        // A complete empty actual demand matches an empty future frame without
+        // response, source wait, policy credit or an additional query ordinal.
+        r.query({}, Intent::FutureReadAhead);
+        ASSERT_EQ(r.operations().adopt(h::ActualDemand<std::uint64_t>{
+            {r.identity.query,r.identity.source_request_invocation},nullptr,0}), Result::Accepted);
+        r.consumeRetire();
+    }
+}
+}
+/** @test Actual ordered demand, duplicate positions, empty work and both native key widths govern adoption. */
+TEST(PooledImmutableLocalHot, FutureActualDemandMatchesCompleteOrderedRows)
+{
+    replayActualFutureDemand<a::Slot32>(0, 1024);
+    replayActualFutureDemand<a::Slot64>(0x100000000ULL, 0x100000400ULL);
+}
+/** @test Stale identity is absorbing; ordinary prediction misses remain reusable and nonpromoting. */
+TEST(PooledImmutableLocalHot, FutureActualDemandRejectsStaleIdentityAndMalformedInverse)
+{
+    using Result = h::AdoptionResult;
+    const auto ids = repeated(7);
+    for (unsigned field = 0; field < 5; ++field)
+    {
+        Replay<a::Slot32> r(2);
+        r.query(ids, PooledImmutableLocalHotAccessIntent::FutureReadAhead);
+        auto demand = h::ActualDemand<std::uint64_t>{
+            {r.identity.query,r.identity.source_request_invocation},ids.data(),unsigned(ids.size())};
+        switch (field)
+        {
+        case 0: ++demand.identity.query.table; break;
+        case 1: ++demand.identity.query.source_storage_generation; break;
+        case 2: ++demand.identity.query.consumer_storage_identity; break;
+        case 3: ++demand.identity.query.sequence; break;
+        case 4: ++demand.identity.source_request_invocation; break;
+        }
+        EXPECT_EQ(r.operations().adopt(demand), Result::InvalidIdentity);
+        EXPECT_EQ(r.identity.terminal_error, a::Status::Invariant);
+        ASSERT_TRUE(r.operations().cancel(r.identity.query));
+        EXPECT_EQ(r.operations().retire(r.identity.query).outcome,
+                  h::Operations<a::Slot32>::Retirement::Outcome::Failed);
+    }
+    Replay<a::Slot32> failed(2);
+    failed.query(ids, PooledImmutableLocalHotAccessIntent::FutureReadAhead);
+    failed.operations().fail(a::Status::SourceFailure);
+    EXPECT_EQ(failed.operations().adopt(h::ActualDemand<std::uint64_t>{
+        {failed.identity.query,failed.identity.source_request_invocation},ids.data(),unsigned(ids.size())}),
+        Result::InvalidState);
+    EXPECT_EQ(failed.identity.terminal_error,a::Status::SourceFailure);
+    ASSERT_TRUE(failed.operations().cancel(failed.identity.query));
+    EXPECT_EQ(failed.operations().retire(failed.identity.query).status,a::Status::SourceFailure);
+
+    Replay<a::Slot32> bad(2);
+    bad.query(ids, PooledImmutableLocalHotAccessIntent::FutureReadAhead);
+    bad.inverse[ids.size()-1] = bad.frame.unique_rows;
+    EXPECT_EQ(bad.operations().adopt(h::ActualDemand<std::uint64_t>{
+        {bad.identity.query,bad.identity.source_request_invocation},ids.data(),unsigned(ids.size())}), Result::InvalidState);
+    EXPECT_EQ(bad.identity.terminal_error, a::Status::Invariant);
+}
+/** @test A miss disposes pending work; read/consume/rearm cannot skip physical source drain. */
+TEST(PooledImmutableLocalHot, FuturePredictionMissLeavesPendingLifetimeAndPolicyUncredited)
+{
+    using Intent = PooledImmutableLocalHotAccessIntent;
+    const auto ids = repeated(7);
+    for (unsigned operation = 0; operation < 3; ++operation)
+    {
+        Replay<a::Slot32> r(2);
+        r.query(ids); ASSERT_TRUE(r.receive()); r.consumeRetire();
+        auto prediction = ids; prediction.back() = 9;
+        r.query(prediction, Intent::FutureReadAhead);
+        ASSERT_EQ(r.frame.source_rows, 1u); ASSERT_EQ(r.frame.held_pins, 1u);
+        const auto before = r.counters;
+        ASSERT_EQ(r.operations().adopt(h::ActualDemand<std::uint64_t>{
+            {r.identity.query,r.identity.source_request_invocation},ids.data(),unsigned(ids.size())}),
+            h::AdoptionResult::PredictionMiss);
+        EXPECT_EQ(r.identity.disposition, h::Disposition::Discarded);
+        EXPECT_EQ(r.frame.held_pins, 1u);
+        if (operation == 0) EXPECT_EQ(r.operations().readableOriginal(0), nullptr);
+        if (operation == 1) EXPECT_FALSE(r.operations().consumeDemand(r.identity.query));
+        if (operation == 2) EXPECT_FALSE(r.operations().begin(Intent::CurrentInvocation, unsigned(ids.size())));
+        EXPECT_EQ(r.counters.consumed_original_ids, before.consumed_original_ids);
+        EXPECT_EQ(r.frame.held_pins, 1u);
+        // Tests do not mint physical proof. The production graph owns the
+        // outstanding source/ACK completion; only after that edge may retire run.
+        EXPECT_EQ(r.operations().retire(r.identity.query).physical,
+                  h::Operations<a::Slot32>::Retirement::Physical::Retired);
+        EXPECT_EQ(r.frame.held_pins, 0u);
+    }
+}
+} // namespace llaminar2::qwen4exp
+
+namespace llaminar2::qwen4exp {
+/** @test UInt32 demand zero-extension is exact, and a valid different live count disposes without a read. */
+TEST(PooledImmutableLocalHot, FutureActualDemandUInt32AndCountMismatchRemainExact)
+{
+    const auto ids = repeated(7);
+    std::array<std::uint32_t,16> narrow{};
+    narrow.fill(7);
+    Replay<a::Slot32> r(2);
+    r.query(ids); ASSERT_TRUE(r.receive()); r.consumeRetire();
+    r.query(ids, PooledImmutableLocalHotAccessIntent::FutureReadAhead);
+    ASSERT_EQ(r.operations().adopt(h::ActualDemand<std::uint32_t>{
+        {r.identity.query,r.identity.source_request_invocation},narrow.data(),unsigned(narrow.size())}),
+        h::AdoptionResult::Accepted);
+    r.consumeRetire();
+    r.query(ids, PooledImmutableLocalHotAccessIntent::FutureReadAhead);
+    const auto before = r.counters;
+    ASSERT_EQ(r.operations().adopt(h::ActualDemand<std::uint64_t>{
+        {r.identity.query,r.identity.source_request_invocation},nullptr,0}),h::AdoptionResult::PredictionMiss);
+    EXPECT_EQ(r.identity.terminal_error,a::Status::Success);
+    EXPECT_EQ(r.counters.consumed_original_ids,before.consumed_original_ids);
+    EXPECT_EQ(r.operations().retire(r.identity.query).outcome,
+              h::Operations<a::Slot32>::Retirement::Outcome::Discarded);
+    r.query({}); r.consumeRetire(); // Normal discard did not poison the next original query.
+
+    // A matching low word cannot adopt a genuinely different full-width prediction.
+    Replay<a::Slot64> wide(0,16,0x100000400ULL);
+    const auto high = repeated(0x100000007ULL);
+    wide.query(high,PooledImmutableLocalHotAccessIntent::FutureReadAhead);
+    EXPECT_EQ(wide.operations().adopt(h::ActualDemand<std::uint32_t>{
+        {wide.identity.query,wide.identity.source_request_invocation},narrow.data(),unsigned(narrow.size())}),
+        h::AdoptionResult::PredictionMiss);
+    EXPECT_EQ(wide.identity.terminal_error,a::Status::Success);
 }
 } // namespace llaminar2::qwen4exp

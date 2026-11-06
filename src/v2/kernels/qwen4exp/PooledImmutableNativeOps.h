@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <type_traits>
 #include "PooledImmutableNativeTypes.h"
+#include "PooledImmutableLocalHotTransportProtocol.h"
 #include "PooledImmutableExactIdentity.h"
 #include "PooledImmutableCoordinatorOps.h"
 namespace llaminar2::qwen4exp::pooled_native
@@ -696,8 +697,9 @@ namespace llaminar2::qwen4exp::adaptive_lookup::pooled
 struct CoordinatorCoalescingAccess
 {
     /** @brief Open only original identity and bounds before parallel data producers. */
-    template<class Row> QFN_ADAPTIVE_HD static bool open(CoordinatorOperations& op,std::uint64_t admission,const Row* rows,std::uint32_t count)
-    {return op.openOriginal(admission,rows,count);}
+    template<class Row> QFN_ADAPTIVE_HD static bool open(CoordinatorOperations& op,std::uint64_t admission,const Row* rows,std::uint32_t count,
+        LookupPurpose purpose=LookupPurpose::CurrentDemand)
+    {return op.openOriginal(admission,rows,count,purpose);}
     /** @brief Commit after every actual disjoint coalescing producer is ordered. */
     QFN_ADAPTIVE_HD static bool finish(CoordinatorOperations& op){return op.finishOriginal();}
     /** @brief Seal controls after actual independent setup producers complete. */
@@ -715,6 +717,26 @@ struct CoordinatorCoalescingAccess
 }
 namespace llaminar2::qwen4exp::pooled_native
 {
+/**
+ * @brief Authenticate the actual compact union before opening or crediting a coordinator interval.
+ * @param a Original native Begin declaration and retained producer pointers.
+ * @param count Actual counted original prefix, never allocated capacity.
+ * @return True for ordinary current input or matching complete compact purpose/query/count.
+ */
+QFN_ADAPTIVE_HD inline bool validBeginPurpose(const CoordinatorBeginArgs& a,std::uint64_t count)
+{
+    const auto purpose=a.query.original.purpose;
+    if(purpose!=p::LookupPurpose::CurrentDemand && purpose!=p::LookupPurpose::FutureLookupOnly)return false;
+    const auto* input=a.query.original_union;
+    if(!input)return purpose==p::LookupPurpose::CurrentDemand;
+    const auto expected=purpose==p::LookupPurpose::FutureLookupOnly
+        ?PooledImmutableLocalHotAccessIntent::FutureReadAhead:PooledImmutableLocalHotAccessIntent::CurrentInvocation;
+    return a.query.original_query && local_hot_transport::same(input->query,*a.query.original_query) &&
+        input->status==adaptive_lookup::Status::Success && input->intent==expected &&
+        local_hot_transport::valid(input->query) && input->query.table==a.plan.table &&
+        input->query.source_storage_generation==a.plan.source_storage_generation &&
+        input->pool_original_ids>=0 && static_cast<std::uint64_t>(input->pool_original_ids)==count;
+}
 /** @return The sole actual coordinator view derived from exact immutable native offsets. */
 template<class Args> QFN_ADAPTIVE_HD p::CoordinatorView coordinatorView(const Args& a)
 {

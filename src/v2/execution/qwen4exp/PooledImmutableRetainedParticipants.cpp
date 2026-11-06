@@ -900,6 +900,111 @@ void PooledImmutableRetainedParticipants::bindSourcePlan(ComputeGraph& graph,Buf
     requirePooledSourceRetirementCompletion(graph,completion);
     graph.setRetainedParticipantSourcePlan(std::make_shared<SourcePlan>(shared_from_this(),arena,std::move(completion)));
 }
+RetainedGraphParticipantDefinitionDomain PooledImmutableRetainedParticipants::definitionDomain() const noexcept
+{
+    return {state_->source.device(), state_->transport.get()};
+}
+
+std::uint64_t PooledImmutableRetainedParticipants::captureIdentity() const noexcept
+{
+    auto value = state_->rootIdentity;
+    const auto mix = [&](std::uint64_t word) { value = (value ^ word) * 1099511628211ULL; };
+    mix(reinterpret_cast<std::uintptr_t>(state_->transport.get()));
+    mix(reinterpret_cast<std::uintptr_t>(state_->executionPolicy.get()));
+    for (const auto& local : state_->locals) mix(local.rootIdentity);
+    return value ? value : 1;
+}
+
+void PooledImmutableRetainedParticipants::bindLocalConsumption(ComputeGraph& graph, BufferArena& arena,
+    const std::shared_ptr<PooledImmutableLocalHotPreparedStorage>& local, RetainedGraphParticipantAuxiliaryRange range)
+{
+    requireCurrent();
+    const auto found = std::find(state_->localHotParticipants.begin(), state_->localHotParticipants.end(), local);
+    if (!local || found == state_->localHotParticipants.end() || range.participant != local->geometry().allocator().device ||
+        !localConsumptionOnly(range.lifecycle) || graph.retainedParticipantSourcePlan() ||
+        !graph.retainedParticipantDefinitionDomain() || *graph.retainedParticipantDefinitionDomain() != definitionDomain())
+        throw std::invalid_argument("Local-only declaration lost its actual prepared local/source owner");
+    // Alias the same canonical owner: no declaration allocation, source program
+    // or independently counted captured-branch population is introduced.
+    range.local_consumption = std::static_pointer_cast<const IRetainedGraphParticipantLocalConsumptionPlan>(shared_from_this());
+    range.local_arena = &arena;
+    graph.setRetainedParticipantAuxiliaryRange(std::move(range));
+    requirePooledLocalHotLocalConsumption(graph, *graph.retainedParticipantAuxiliaryRange(), local);
+}
+
+void PooledImmutableRetainedParticipants::requireLocalDefinition(
+    const RetainedGraphParticipantPreparationStream& preparation, bool inspect) const
+{
+    requireCurrent();
+    const auto& d = preparation.definition();
+    const auto original = shared_from_this();
+    const auto local = std::find_if(state_->locals.begin(), state_->locals.end(),
+        [&](const auto& value) { return value.original.device() == d.participant; });
+    if (d.scope != RetainedGraphParticipantDefinitionScope::LocalConsumption || d.plan || d.original_source_definition ||
+        d.local_consumption.get() != this || d.local_consumption.owner_before(original) || original.owner_before(d.local_consumption) ||
+        !d.graph || !d.arena || !d.topology_generation || !d.variant || d.graph->topologyGeneration() != d.topology_generation ||
+        d.domain != definitionDomain() || local == state_->locals.end() || d.graph->retainedParticipantSourcePlan() ||
+        !d.graph->retainedParticipantDefinitionDomain() || *d.graph->retainedParticipantDefinitionDomain() != d.domain ||
+        !d.graph->retainedParticipantSourceVariants().empty())
+        throw std::invalid_argument("Local consumption cannot claim a source program or substitute its actual owner/cache");
+    preparation.requireLive(local->original);
+    const auto& range = d.graph->retainedParticipantAuxiliaryRange();
+    if (!range || range->local_arena != d.arena || !localConsumptionOnly(range->lifecycle) ||
+        range->participant != d.participant || range->identity != d.range_identity ||
+        range->local_consumption != d.local_consumption || range->local_consumption.owner_before(d.local_consumption) ||
+        d.local_consumption.owner_before(range->local_consumption) || range->original_execution != state_->executionPolicy ||
+        range->original_execution.owner_before(state_->executionPolicy) || state_->executionPolicy.owner_before(range->original_execution))
+        throw std::invalid_argument("Local consumption changed its exact immutable local range/execution identity");
+    if (inspect)
+    {
+        d.graph->requireRetainedParticipantAuxiliaryRange();
+        if (requiresSingleNativeExecutable(d.graph->nativeCaptureEnvelope()))
+            d.graph->requireRetainedParticipantNativeAuxiliaryParent();
+        const auto index = std::size_t(local - state_->locals.begin());
+        requirePooledLocalHotLocalConsumption(*d.graph, *range, state_->localHotParticipants[index]);
+    }
+}
+
+std::unique_ptr<IRetainedGraphParticipantStorageAttachment> PooledImmutableRetainedParticipants::prepareLocalAttachment(
+    const RetainedGraphParticipantAuxiliaryBodySeal& sealed, IGraphCaptureAuxiliaryBranch* progress) const
+{
+    const auto& prep = sealed.preparation();
+    const auto& id = sealed.identity();
+    if (!prep || !sealed.recordedBody())
+        throw std::invalid_argument("Local consumption lost its actual finite recording");
+    prep->requireDefinition();
+    const auto& d = prep->definition();
+    const auto local = std::find_if(state_->locals.begin(), state_->locals.end(),
+        [&](const auto& value) { return value.original.device() == id.participant; });
+    if (local == state_->locals.end() || id.graph != d.graph || id.arena != d.arena || id.participant != d.participant ||
+        id.topology_generation != d.topology_generation || id.capture_variant_signature != d.variant ||
+        !id.capture_generation || id.range_identity != d.range_identity || !id.enclosing_parent ||
+        id.enclosing_parent->hasExecutable() || !id.enclosing_parent->nodeCount() || !id.producer_fragment ||
+        !id.producer_fragment->nodeCount() || id.producer_fragment->hasExecutable() ||
+        id.producer_fragment->executionStream() != id.enclosing_recording_stream || id.producer_fragment == id.enclosing_parent ||
+        id.producer_fragment == sealed.recordedBody().get() || id.enclosing_parent->executionStream() != id.enclosing_recording_stream ||
+        prep->stream() != id.enclosing_recording_stream || !sealed.recordedBody()->nodeCount() || sealed.recordedBody()->hasExecutable() ||
+        sealed.recordedBody()->executionStream() != id.enclosing_recording_stream ||
+        (progress && (progress->device() != id.participant || progress->originalSourceDefinition())))
+        throw std::invalid_argument("Local consumption substituted native parent/body or introduced source progress");
+    sealed.originalParticipant().requireWorker(local->original.worker());
+    prep->requireLive(local->original);
+    if (!local->original.worker()->ownsCurrentThread())
+        throw std::logic_error("Local attachment requires original recording worker");
+    for (const auto& weak : local->parents)
+        if (const auto prior = weak.lock())
+            if (prior->native == id.enclosing_parent || prior->auxiliary == prep)
+                throw std::logic_error("Local body already belongs to this exact original parent");
+    // Retain original local/native identity only. No physical owner body or
+    // source submission, servicing or completion is imported by this branch.
+    auto lifetime = std::make_shared<State::AttachedParent>(State::AttachedParent{
+        .definition = prep, .auxiliary = prep, .recipient = id.graph, .native = id.enclosing_parent,
+        .captureStream = id.enclosing_recording_stream, .original = local->original, .enclosing = local->enclosingParent});
+    auto result = std::make_unique<StorageAttachment>(std::nullopt, lifetime, sealed);
+    local->parents.push_back(lifetime);
+    return result;
+}
+
 void PooledImmutableRetainedParticipants::requireCurrent()const{
     if (!state_->ownsBoundaryClaim) throw std::logic_error("Original pooled execution participants retired with their runner");
     if(state_->rootIdentity!=state_->boundary->pooledStorage()->captureIdentity())throw std::logic_error("Recurring owner original roots changed");

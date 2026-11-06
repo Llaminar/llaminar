@@ -15,7 +15,7 @@ if(HAVE_CUDA OR HAVE_ROCM)
                 set(_env "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
                 set(_lock rocm_gpu_0)
             endif()
-            foreach(_case OwnedAllHit ImportedAllHit OwnedMiss ImportedEmpty OldNoEdgeControl OriginalNativeComposerAllHit OriginalSourceAllHitAndMixed)
+            foreach(_case OwnedAllHit ImportedAllHit OwnedMiss ImportedEmpty OldNoEdgeControl OriginalNativeComposerAllHit OriginalSourceAllHitAndMixed OriginalSourceTightQueryBound FutureOriginalSourceAdoptDiscard FutureOriginalSourceAfterAdoption OwnedFiniteJoin ImportedFiniteJoin MissingFiniteJoinControl)
                 add_v2_test(V2_Integration_${_backend}_LocalHotParentFork_${_case}
                     COMMAND $<TARGET_FILE:v2_integration_local_hot_native_fork>
                         --gtest_filter=LocalHotNativeParentFork.${_backend}_${_case}
@@ -23,6 +23,27 @@ if(HAVE_CUDA OR HAVE_ROCM)
                     MPI_PROCS 1 NO_MPI NO_MODELS RESOURCE_LOCK ${_lock} TIMEOUT 30 ENVIRONMENT ${_env})
                 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_${_backend}_LocalHotParentFork_${_case})
             endforeach()
+        endif()
+    endforeach()
+endif()
+
+# The target is defined here before these focused native aliases are declared.
+if(TARGET v2_integration_local_hot_native_fork)
+    foreach(_backend CUDA ROCm)
+        if((_backend STREQUAL "CUDA" AND HAVE_CUDA) OR (_backend STREQUAL "ROCm" AND HAVE_ROCM))
+            if(_backend STREQUAL "CUDA")
+                set(_env "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=1")
+                set(_lock cuda_gpu_0)
+            else()
+                set(_env "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
+                set(_lock rocm_gpu_0)
+            endif()
+            add_v2_test(V2_Integration_${_backend}_PooledCompactCooperativeUnionNativeReplay
+                COMMAND $<TARGET_FILE:v2_integration_local_hot_native_fork>
+                    --gtest_filter=LocalHotNativeParentFork.${_backend}_OriginalSourceAllHitAndMixed
+                LABELS "V2;Integration;ProductionTestPreflight;GPU;${_backend};Ngram;Capture;TraceReplay;LiveExtent;Regression"
+                MPI_PROCS 1 NO_MPI NO_MODELS RESOURCE_LOCK ${_lock} TIMEOUT 30 ENVIRONMENT ${_env})
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_${_backend}_PooledCompactCooperativeUnionNativeReplay)
         endif()
     endforeach()
 endif()

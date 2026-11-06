@@ -17,12 +17,13 @@
 #include <optional>
 #include "execution/local_execution/graph/IRetainedGraphParticipants.h"
 namespace llaminar2 {struct GraphConfig; class RankOrchestrator; class MoEOverlayParticipantGraphRunner; class Qwen4ExpReplicatedPLECohort;}
-namespace llaminar2 { struct ClusterInventory; }
+namespace llaminar2 { struct ClusterInventory; struct PooledImmutableLocalHotFutureSourceBody; }
 namespace llaminar2::qwen4exp {
 class PooledImmutableLocalHotPreparedStorage;
 class IPooledImmutableLocalHotKernels;
 /** @brief Closed original source/owner native lifetime, shared by exclusive model graph variants. */
 class PooledImmutableRetainedParticipants final:public PooledImmutableRetirementAuthority,public IRetainedGraphParticipantEnqueueCompletion,
+    public IRetainedGraphParticipantLocalConsumptionPlan,
     public std::enable_shared_from_this<PooledImmutableRetainedParticipants> {
 public:
     /**
@@ -134,8 +135,95 @@ public:
         DeviceGenerationControlBinding control,DeviceRowRange tokens,PooledNativeTensorSpan ids,
         PooledNativeTensorSpan output,const std::string& identity,const std::string& outputIdentity,
         std::optional<PooledNativeTensorSpan> count);
+    /**
+     * @brief Build actual future source delivery, retaining the one local frame for later adoption.
+     * @param graph Original source graph. @param arena Same prepared arena.
+     * @param poolCode Original source implementation. @param local Actual coordinator local root.
+     * @param code Same local implementation. @param tokens Genuine original token extent.
+     * @param ids Already-authored ordered hashes. @param count Exact optional count producer.
+     * @param control Same request controller row. @param identity Unique declaration namespace.
+     * @return Actual source/ACK retirement; no model read, policy credit or local retirement.
+     * @note The caller independently orders original accepted history and previous local retirement.
+     */
+    PooledImmutableLocalHotFutureSourceBody appendLocalHotFuturePLE(ComputeGraph& graph,BufferArena& arena,
+        std::shared_ptr<const IPooledImmutableNativeKernels> poolCode,
+        std::shared_ptr<PooledImmutableLocalHotPreparedStorage> local,
+        std::shared_ptr<const IPooledImmutableLocalHotKernels> code,DeviceRowRange tokens,PooledNativeTensorSpan ids,
+        std::optional<PooledNativeTensorSpan> count,DeviceGenerationControlBinding control,const std::string& identity);
+    /**
+     * @brief Build actual future reader request/delivery/ACK without waiting for a later model read.
+     * @param graph Original participant graph. @param arena Same prepared arena.
+     * @param local Actual reader local root. @param code Same local implementation.
+     * @param control Original request controller. @param tokens Genuine original token extent.
+     * @param ids Already-authored ordered hashes. @param identity Unique declaration namespace.
+     * @param count Exact optional token-count producer.
+     * @return Actual response acquisition and ACK retirement, retaining the one local frame.
+     */
+    PooledImmutableLocalHotFutureProducerEndpoints appendLocalHotFutureReader(ComputeGraph& graph,BufferArena& arena,
+        std::shared_ptr<PooledImmutableLocalHotPreparedStorage> local,
+        std::shared_ptr<const IPooledImmutableLocalHotKernels> code,DeviceGenerationControlBinding control,
+        DeviceRowRange tokens,PooledNativeTensorSpan ids,const std::string& identity,
+        std::optional<PooledNativeTensorSpan> count);
+    /**
+     * @brief Append complete actual-demand comparison without selecting its native branch.
+     * @param graph Same participant graph. @param arena Same prepared arena.
+     * @param local Original local root. @param code Same local implementation.
+     * @param control Same request controller. @param tokens Actual complete demand extent.
+     * @param ids Genuine ordered demand IDs. @param count Exact optional count producer.
+     * @param identity Unique comparison node name.
+     * @return Actual Adopt endpoint; original controller explicitly selects read or cleanup afterward.
+     */
+    std::string appendLocalHotAdoptionCheck(ComputeGraph& graph,BufferArena& arena,
+        std::shared_ptr<PooledImmutableLocalHotPreparedStorage> local,
+        std::shared_ptr<const IPooledImmutableLocalHotKernels> code,DeviceGenerationControlBinding control,
+        DeviceRowRange tokens,PooledNativeTensorSpan ids,std::optional<PooledNativeTensorSpan> count,
+        const std::string& identity);
+    /**
+     * @brief Build an explicitly selected local-only accepted or unused-future branch.
+     * @param graph Same original participant graph. @param arena Same prepared arena.
+     * @param local Original retained local root. @param code Same native implementation.
+     * @param control Same request controller. @param branch Explicit controller-selected disposition.
+     * @param output Sole model output for Accepted; absent for Discard.
+     * @param identity Unique declaration namespace. @param outputIdentity Actual accepted LocalRead name.
+     * @return Actual main and separately attached maintenance endpoints; no new source completion.
+     * @note Source/transfer ACK retirement must already precede this submission. PredictionMiss uses
+     * appendLocalHotPredictionMissRetirement because Adopt has already discarded that frame.
+     */
+    PooledImmutableLocalHotConsumerEndpoints appendLocalHotConsumer(ComputeGraph& graph,BufferArena& arena,
+        std::shared_ptr<PooledImmutableLocalHotPreparedStorage> local,
+        std::shared_ptr<const IPooledImmutableLocalHotKernels> code,DeviceGenerationControlBinding control,
+        PooledImmutableLocalHotConsumerBranch branch,std::optional<PooledNativeTensorSpan> output,
+        const std::string& identity,const std::string& outputIdentity);
+    /**
+     * @brief Retire a selected prediction-miss branch after its actual adoption check.
+     * @param graph Same graph holding the actual r779 adoption stage.
+     * @param arena Same local frame arena. @param local Original prepared local root.
+     * @param code Same native local implementation. @param control Same request controller row.
+     * @param adoptionCheck Actual complete-demand comparison stage on this graph.
+     * @param identity Unique retirement node name.
+     * @return Actual local Retire endpoint, with no SourcePlan, auxiliary or source completion.
+     * @note The original controller must select this branch only for PredictionMiss.
+     * Adoption already discarded the frame; a second Discard is invalid. Actual
+     * source/transfer ACK retirement must precede that adoption submission.
+     */
+    std::string appendLocalHotPredictionMissRetirement(ComputeGraph& graph,BufferArena& arena,
+        std::shared_ptr<PooledImmutableLocalHotPreparedStorage> local,
+        std::shared_ptr<const IPooledImmutableLocalHotKernels> code,DeviceGenerationControlBinding control,
+        const std::string& adoptionCheck,const std::string& identity);
+    /** @return Same original prepared source/local roster; no new declaration owner is allocated. */
+    RetainedGraphParticipantDefinitionDomain definitionDomain()const noexcept override;
+    /** @return Immutable original retained source/local-owner identity, not live cache state. */
+    std::uint64_t captureIdentity()const noexcept override;
+    /** @brief Validate only original local ownership, never a new source execution/completion.
+     * @param preparation Exact executor-issued definition. @param inspect Inspect stage topology only while cold. */
+    void requireLocalDefinition(const RetainedGraphParticipantPreparationStream& preparation,bool inspect)const override;
+    /** @brief Attach an actual local-only finite body without importing physical owner/source work.
+     * @param body Exact sealed recording. @param progress Optional generic original progress, without source binding.
+     * @return Attachment retaining same original local owner and native parent through retirement. */
+    std::unique_ptr<IRetainedGraphParticipantStorageAttachment> prepareLocalAttachment(
+        const RetainedGraphParticipantAuxiliaryBodySeal& body,IGraphCaptureAuxiliaryBranch* progress)const override;
     /** @return The exact original prepared compute/storage participant, never a newly adopted worker. */
-    PreparedGPUContextUsePermit originalParticipant(DeviceId device)const;
+    PreparedGPUContextUsePermit originalParticipant(DeviceId device)const override;
     /** @return True only for an actual original physical owner embedded in a declared compute reader. */
     bool hasEmbeddedParticipant(DeviceId device)const noexcept;
     /** @brief Retain one original DGO enclosing stream, independently of each FEE variant's capture stream. */
@@ -175,6 +263,16 @@ private:
     void retireOriginalRuntimeBeforeArenaRelease();
     /** @brief Join only original remote host enqueue calls after source submission. */
     void completeOriginalEnqueue()const noexcept override;
+    /** @brief Share the original reader protocol between current and future lifetimes without copying stages. */
+    PooledImmutableLocalHotGraphEndpoints appendLocalHotReaderBody(ComputeGraph&,BufferArena&,
+        std::shared_ptr<PooledImmutableLocalHotPreparedStorage>,std::shared_ptr<const IPooledImmutableLocalHotKernels>,
+        DeviceGenerationControlBinding,DeviceRowRange,PooledNativeTensorSpan,PooledNativeTensorSpan,
+        const std::string&,const std::string&,std::optional<PooledNativeTensorSpan>,PooledImmutableLocalHotAccessIntent);
+    /** @brief Install a local-only declaration over existing prepared roots; never mint a source plan.
+     * @param graph Actual local graph. @param arena Same original arena.
+     * @param local Original local root. @param range Complete typed finite body declaration. */
+    void bindLocalConsumption(ComputeGraph& graph,BufferArena& arena,
+        const std::shared_ptr<PooledImmutableLocalHotPreparedStorage>& local,RetainedGraphParticipantAuxiliaryRange range);
     class SourcePlan;
     class StorageAttachment;
     class Invocation;

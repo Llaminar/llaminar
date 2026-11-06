@@ -198,6 +198,8 @@ QFN_ADAPTIVE_HD inline bool planRequest(const DeviceArgs& a)
            (i && row.first_position<=v.unique[i-1].first_position) || row.first_position>=v.frame->original_ids ||
            (row.phase!=p::UniquePhase::Read && row.phase!=p::UniquePhase::SourceOnly && !reserved(row.phase)))
             return reject(a,ImmutableLookupStatus::InvalidProtocol);
+        if(v.frame->purpose==p::LookupPurpose::FutureLookupOnly && reserved(row.phase))
+            return reject(a,ImmutableLookupStatus::InvalidProtocol);
         if(reserved(row.phase)) {
             const auto& grant=row.grant;
             if(grant.kind!=p::GrantKind::Reservation || grant.unique!=i || grant.row!=row.row ||
@@ -225,7 +227,8 @@ QFN_ADAPTIVE_HD inline bool planRequest(const DeviceArgs& a)
         const auto& row=v.unique[i];coordinates[i]=adaptive_lookup::None;
         if(row.phase==p::UniquePhase::Read)continue;
         coordinates[i]=source;a.channel.base.ids[source]=static_cast<std::int64_t>(row.row);
-        a.channel.intents[source]={reserved(row.phase)?ImmutableRowReadIntent::ReadAndInvalidate:ImmutableRowReadIntent::Read,
+        a.channel.intents[source]={v.frame->purpose==p::LookupPurpose::FutureLookupOnly?ImmutableRowReadIntent::FutureLookupOnly:
+            reserved(row.phase)?ImmutableRowReadIntent::ReadAndInvalidate:ImmutableRowReadIntent::Read,
             reserved(row.phase)?row.grant.destination_token:0};++source;
     }
     io.idCount=misses;io.nativeBytes=0;io.status=static_cast<std::uint64_t>(ImmutableLookupStatus::Success);

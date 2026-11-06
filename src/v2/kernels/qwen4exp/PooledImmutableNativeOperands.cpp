@@ -189,6 +189,8 @@ PooledNativeOperandSchema pooledNativeSchema(n::CoordinatorAction action,const n
     switch(action){
     case n::CoordinatorAction::Begin:{
         const auto descriptor=*original_rows;const auto rows=descriptor.rows;
+        if(descriptor.purpose!=p::LookupPurpose::CurrentDemand)
+            throw std::invalid_argument("Future native Begin requires the original closed compact union producer");
         if(descriptor.id_width!=n::OriginalIdWidth::UInt32 && descriptor.id_width!=n::OriginalIdWidth::UInt64)
             throw std::invalid_argument("Pooled original producer width is unsupported");
         const auto bytes=descriptor.id_width==n::OriginalIdWidth::UInt32?4u:8u;
@@ -322,6 +324,8 @@ PooledImmutableCoordinatorOperands::PooledImmutableCoordinatorOperands(n::Coordi
 }
 void PooledImmutableCoordinatorOperands::declarations()const{
     requireSpanDeclarations(spans_,schema_);
+    if(rows_ && rows_->purpose!=p::LookupPurpose::CurrentDemand && rows_->purpose!=p::LookupPurpose::FutureLookupOnly)
+        throw std::invalid_argument("Pooled original Begin has an invalid read purpose");
     if(local_owner_ && local_owner_->captureIdentity()!=local_owner_identity_)
         throw std::logic_error("Local metadata import owner capture identity changed");
 }
@@ -349,6 +353,7 @@ std::uint64_t PooledImmutableCoordinatorOperands::declarationIdentity()const
     if(local_owner_)value=combine(combine(combine(value,local_coordinate_),local_reply_capacity_),local_owner_identity_);
     if(rows_){
     value=combine(value,static_cast<unsigned>(rows_->id_width));
+    value=combine(value,static_cast<unsigned>(rows_->purpose));
     const auto id=rows_->rows.captureIdentity();
     for(const auto word:{std::uint64_t{reinterpret_cast<std::uintptr_t>(id.count)},std::uint64_t{static_cast<unsigned>(id.count_capacity)},
         std::uint64_t{static_cast<unsigned>(id.first_physical_row)},std::uint64_t{static_cast<unsigned>(id.physical_rows)},

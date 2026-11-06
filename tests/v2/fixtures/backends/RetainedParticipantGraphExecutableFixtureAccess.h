@@ -142,6 +142,81 @@ struct RetainedParticipantGraphExecutableFixtureAccess final {
             throw;
         }
     }
+    /** @brief Four graph-only definitions sharing one original General executable reservation. */
+    struct NativeJoinDefinitions {
+        static constexpr std::size_t Count=4;
+        std::unique_ptr<IGPUGraphCapture> probe,history,retired,future;
+    };
+    /**
+     * @brief Compose a real finite-child plus main exit join under the existing original owner.
+     * @tparam Record Callable recording all four actual graph-only definitions on the original worker.
+     * @param owner Pristine original General/PMA owner. @param owned Original owned main fragments or imported children.
+     * @param missingRetire Diagnostic-only no-edge negative control, never a serving strategy.
+     * @param record Exact native definition recorder.
+     * @return Strong original definitions retained through parent retirement; none has an executable.
+     */
+    template<class Record>
+    static NativeJoinDefinitions composeNativeJoinFixture(
+        const std::shared_ptr<RetainedParticipantGraphExecutable>& owner,bool owned,bool missingRetire,Record record)
+    {
+        if(!owner)throw std::invalid_argument("Native join requires original General owner");
+        owner->requireRecordingAuthority();
+        if(owner->phase_!=RetainedParticipantGraphExecutable::Phase::Fresh || !owner->capture_ ||
+           owner->capture_->nodeCount() || owner->capture_->hasExecutable())
+            throw std::logic_error("Native join requires untouched original definition");
+        NativeJoinDefinitions definitions;
+        owner->phase_=RetainedParticipantGraphExecutable::Phase::Recording;
+        try {
+            auto& parent=*owner->capture_;
+            definitions.probe=owned?parent.createOrderedTimelineFragment():owner->worker_->createGraphCapture(owner->stream_);
+            definitions.history=owned?parent.createOrderedTimelineFragment():owner->worker_->createGraphCapture(owner->stream_);
+            definitions.retired=owner->worker_->createGraphCapture(owner->stream_);
+            definitions.future=owner->worker_->createGraphCapture(owner->stream_);
+            if(!definitions.probe || !definitions.history || !definitions.retired || !definitions.future)
+                throw std::runtime_error("Native join omitted original graph-only definition");
+            record(*definitions.probe,*definitions.history,*definitions.retired,*definitions.future);
+            const std::array steps{
+                GPUOrderedTimelineStep{.name="diagnostic_probe",.kind=GPUOrderedTimelineStepKind::CapturedFragment,.capture=definitions.probe.get()},
+                GPUOrderedTimelineStep{.name="diagnostic_history",.kind=GPUOrderedTimelineStepKind::CapturedFragment,.capture=definitions.history.get()}};
+            if(!parent.buildOrderedTimelineTransaction(steps) ||
+               !parent.appendFiniteBodyAfterCapturedFragment(*definitions.probe,*definitions.retired))
+                throw std::runtime_error("Native join original prefix assembly failed");
+            const std::array<const IGPUGraphCapture*,2> joins{definitions.history.get(),definitions.retired.get()};
+            const auto count=parent.nodeCount();
+            const std::array<const IGPUGraphCapture*,2> duplicate{definitions.history.get(),definitions.history.get()};
+            const std::array<const IGPUGraphCapture*,1> absent{nullptr};
+            if(parent.appendFiniteBodyAfterCapturedFragment(duplicate,*definitions.future) ||
+               parent.appendFiniteBodyAfterCapturedFragment(absent,*definitions.future) || parent.nodeCount()!=count)
+                throw std::runtime_error("Native join accepted invalid predecessor before mutation");
+            const std::span<const IGPUGraphCapture* const> selected=missingRetire
+                ?std::span<const IGPUGraphCapture* const>{joins.data(),1}:std::span<const IGPUGraphCapture* const>{joins};
+            if(!parent.appendFiniteBodyAfterCapturedFragment(selected,*definitions.future) || parent.nodeCount()!=count+1 ||
+               parent.appendFiniteBodyAfterCapturedFragment(joins,*definitions.future))
+                throw std::runtime_error("Native join changed exact original child/duplicate topology");
+            std::string why;
+            if(!parent.validateExecutableMemoryClass(GPUGraphExecutableClass::General,&why))
+                throw std::runtime_error("Native join actual General shape invalid: "+why);
+            owner->phase_=RetainedParticipantGraphExecutable::Phase::Recorded;
+            return definitions;
+        } catch(...) {
+            owner->phase_=RetainedParticipantGraphExecutable::Phase::Failed;
+            throw;
+        }
+    }
+    /**
+     * @brief Verify the actual backend rejects further finite assembly after original instantiation.
+     * @param owner Same original General owner. @param definitions Its exact still-retained graph-only definitions.
+     * @return True only when the actual backend rejects without changing native node count.
+     */
+    static bool rejectInstantiatedNativeJoin(const std::shared_ptr<RetainedParticipantGraphExecutable>& owner,
+        const NativeJoinDefinitions& definitions)
+    {
+        if(!owner || !owner->capture_ || !owner->capture_->hasExecutable())return false;
+        const std::array<const IGPUGraphCapture*,2> joins{definitions.history.get(),definitions.retired.get()};
+        const auto before=owner->capture_->nodeCount();
+        return !owner->capture_->appendFiniteBodyAfterCapturedFragment(joins,*definitions.future) &&
+            owner->capture_->nodeCount()==before;
+    }
     /** @return Owner-controlled original enqueue; the recording facade cannot launch independently. */
     static bool submit(const std::shared_ptr<RetainedParticipantGraphExecutable>& owner,std::uint64_t ordinal){return owner->submit(ordinal);}
     /** @return Original native terminal observation, called only outside its owner worker. */

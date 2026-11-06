@@ -16,12 +16,18 @@
 #include <cstddef>
 namespace llaminar2::qwen4exp
 {
+namespace local_hot_transport { struct UnionControl; struct QueryIdentity; }
 namespace pooled_native
 {
 namespace p=adaptive_lookup::pooled;
 /** @brief Version of immutable launch/schema/arithmetic policy embedded in capture identity. */
-inline constexpr std::uint64_t Version=12;
+inline constexpr std::uint64_t Version=13;
 static_assert(Version<=std::uint64_t{0xffffffff},"Nominal native wire version must fit original Invocation.version32");
+/** @brief Existing single-CTA coalescer bound, shared by actual launch and replay policy. */
+inline constexpr unsigned SmallOriginalRows=512;
+/** @return Actual immutable query shape's existing small/radix launch selection. */
+QFN_ADAPTIVE_HD constexpr bool coordinatorUsesSmallOriginal(DeviceRowRange rows) noexcept
+{return rows.physicalRows()<=static_cast<int>(SmallOriginalRows);}
 /**
  * @brief Smallest even four-bit radix pass count for one checked immutable exclusive key bound.
  * @param exclusive_limit Positive declared source/position bound, never a mutable device count.
@@ -298,13 +304,19 @@ struct CoordinatorArgs
 /** @brief Actual original producer width, independent of physical source/slot row width. */
 enum class OriginalIdWidth:std::uint32_t {UInt32,UInt64};
 /** @brief Complete immutable query declaration; metadata-only phases have no dummy query or width. */
-struct OriginalRows {DeviceRowRange rows;OriginalIdWidth id_width;};
+struct OriginalRows {
+    DeviceRowRange rows;
+    OriginalIdWidth id_width;
+    p::LookupPurpose purpose=p::LookupPurpose::CurrentDemand; ///< Immutable captured operation; never read from host execution state.
+};
 /** @brief Original counted query belongs only to Begin; its typed producer width enters capture identity. */
 struct CoordinatorQuery
 {
     OriginalRows original;
     const void* ids;
     const std::uint64_t* admission;
+    const local_hot_transport::UnionControl* original_union=nullptr; ///< Actual closed compact producer; absent only for ordinary demand queries.
+    const local_hot_transport::QueryIdentity* original_query=nullptr; ///< SAME source-local current frame identity; rejects stale compact producer reuse.
 };
 /** @brief Complete original Begin operands; private native launch never fabricates a placeholder query. */
 struct CoordinatorBeginArgs:CoordinatorArgs

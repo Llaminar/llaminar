@@ -365,7 +365,7 @@ private:
     {
         const auto maximum=static_cast<std::uint64_t>(a.query.original.rows.physicalRows());
         openOriginal<Width><<<1,1,0,stream>>>(a);checked();
-        if(maximum<=SmallRows){coalesceSmall<Width><<<1,Threads,0,stream>>>(a);checked();}
+        if(n::coordinatorUsesSmallOriginal(a.query.original.rows)){coalesceSmall<Width><<<1,Threads,0,stream>>>(a);checked();}
         else{
             const auto grid=blocks(maximum);
             seedKeys<Width><<<grid,Threads,0,stream>>>(a);checked();

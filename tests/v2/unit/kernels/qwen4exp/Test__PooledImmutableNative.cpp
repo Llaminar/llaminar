@@ -8,6 +8,7 @@
  */
 #include "fixtures/qwen4exp/PooledImmutableNativeReplayBytes.h"
 #include "kernels/qwen4exp/PooledImmutableNativeOps.h"
+#include "kernels/qwen4exp/PooledImmutableLocalHotTransportOps.h"
 #include "kernels/qwen4exp/PooledImmutableOwnerRecordValidation.h"
 #include "kernels/qwen4exp/PooledImmutableNativePlan.h"
 #include "kernels/qwen4exp/PooledImmutableNativeOperands.h"
@@ -141,8 +142,9 @@ struct Pool {
     }
     template<class H> std::vector<H> headers(){std::vector<H> result;for(auto& owner:owners)result.push_back(owner->header<H>());return result;}
     /** @brief Common Begin is the CPU coalescing oracle; GPU Begin's cooperative producer is tested separately natively. */
-    void begin(std::span<const std::uint64_t> original,std::uint64_t admission=1,bool receivedIngress=false,bool replyIngress=false,std::function<void()> beforeReceivedSeal={}){
-        require(p::CoordinatorOperations(view()).begin(admission,original.data(),original.size()));n::invocation(args);
+    void begin(std::span<const std::uint64_t> original,std::uint64_t admission=1,bool receivedIngress=false,bool replyIngress=false,std::function<void()> beforeReceivedSeal={},
+        p::LookupPurpose purpose=p::LookupPurpose::CurrentDemand){
+        require(p::CoordinatorOperations(view()).begin(admission,original.data(),original.size(),purpose));n::invocation(args);
         for(auto& owner:owners){
             const auto* received=invocation();
             if(receivedIngress){
@@ -850,6 +852,63 @@ TEST(PooledImmutableNative, SourceOwnerCohortIdentityRejectsForeignAllocatorAndR
             }
         }
     }
+}
+
+/** @test Native Begin authenticates the same purpose/query/count producer before any policy write. */
+TEST(PooledImmutableNative, FutureBeginRequiresMatchingOriginalCompactUnion)
+{
+    namespace t=q::local_hot_transport;
+    Pool pool(std::array{4u});
+    const std::array<std::uint64_t,2> rows{700,701};std::uint64_t admission=1;
+    n::CoordinatorQuery query{{DeviceRowRange::fullyActive(2),n::OriginalIdWidth::UInt64,p::LookupPurpose::FutureLookupOnly},rows.data(),&admission};
+    n::CoordinatorBeginArgs args{pool.args,query};
+    EXPECT_FALSE(n::validBeginPurpose(args,2));
+    t::UnionControl input{};input.query={701,17,77,9};input.pool_original_ids=2;
+    input.intent=q::PooledImmutableLocalHotAccessIntent::FutureReadAhead;args.query.original_union=&input;
+    const auto actual_query=input.query;args.query.original_query=&actual_query;
+    EXPECT_TRUE(n::validBeginPurpose(args,2));
+    EXPECT_FALSE(n::validBeginPurpose(args,1));
+    args.query.original.purpose=p::LookupPurpose::CurrentDemand;
+    EXPECT_FALSE(n::validBeginPurpose(args,2));
+    args.query.original.purpose=p::LookupPurpose::FutureLookupOnly;
+    ++input.query.sequence;EXPECT_FALSE(n::validBeginPurpose(args,2));
+    --input.query.sequence;
+    ++input.query.source_storage_generation;EXPECT_FALSE(n::validBeginPurpose(args,2));
+    --input.query.source_storage_generation;input.status=a::Status::Cancelled;
+    EXPECT_FALSE(n::validBeginPurpose(args,2));
+    EXPECT_EQ(pool.view().frame->ordinal,0u);
+    EXPECT_THROW(q::pooledNativeSchema(n::CoordinatorAction::Begin,pool.args.plan,
+        std::optional<n::OriginalRows>{query.original}),std::invalid_argument);
+}
+
+/** @test Native source plans preserve authenticated future purpose without reservation/invalidation. */
+TEST(PooledImmutableNative, FutureLookupOnlySourceEmitsZeroTokenOriginalNativeReads)
+{
+    namespace source=q::pooled_source;
+    Pool pool(std::array{4u});
+    ASSERT_NO_THROW(pool.complete(std::array<std::uint64_t,2>{101,102}));
+    const std::array<std::uint64_t,4> original{101,700,700,701};
+    ASSERT_NO_THROW(pool.begin(original,1,false,false,{},p::LookupPurpose::FutureLookupOnly));
+    ASSERT_NO_THROW(pool.wave<false>());
+    ASSERT_NO_THROW(pool.wave<true>());
+    EXPECT_EQ(pool.view().frame->free_planned,0u);EXPECT_EQ(pool.view().frame->victim_planned,0u);
+    const ImmutableRowTableSource descriptor{.path="cpu_parser_original_source",.tensor_name="per_layer_token_embd.weight",
+        .file_offset=37,.rows=0x100000100ULL,.row_elements=160,.format=GGUFTensorType::IQ4_NL};
+    const auto geometry=q::PooledImmutableSourceGeometry::fromPlans(pool.owners.front()->plan,pool.plan,descriptor,1);
+    const auto parameters=geometry.parameters();Bytes frame(parameters.offsets.frame_bytes),native(parameters.offsets.native_bytes);
+    std::memset(native.data(),0,parameters.offsets.native_bytes);
+    std::array<std::int64_t,16> ids{};std::array<ImmutableRowSubordinateIntent,16> intents{};
+    std::array<ImmutableRowInvalidationAcknowledgement,16> acknowledgements{};int healthy=1,error=0;
+    source::DeviceArgs args{parameters,pool.owners.front()->args,pool.args,frame.data(),native.data(),
+        {{nullptr,nullptr,nullptr,ids.data(),nullptr,701,16,90},intents.data(),acknowledgements.data()},&healthy,&error};
+    source::protocol(args).admissionGeneration=17;source::invocation(args)=23;
+    ASSERT_TRUE(source::planRequest(args));ASSERT_EQ(source::protocol(args).idCount,2u);
+    EXPECT_EQ(ids[0],700);EXPECT_EQ(ids[1],701);
+    for(unsigned at=0;at<2;++at){
+        EXPECT_EQ(intents[at].intent,ImmutableRowReadIntent::FutureLookupOnly);
+        EXPECT_EQ(intents[at].destination_grant,0u);
+    }
+    EXPECT_EQ(pool.view().frame->purpose,p::LookupPurpose::FutureLookupOnly);
 }
 
 /** @brief Actual source parsers reject stale envelopes and partial/malformed ACKs before producing any accepted fill. */
@@ -2599,6 +2658,41 @@ TEST(PooledImmutableNative, OriginalNativeAbortPreservesPinnedDutiesAndEarlierOw
         // incomplete decoded capability cannot suppress an existing phase.
         original.deviceCommunicator = nullptr;
         EXPECT_FALSE(n::suppressAbortedNativeOwner<a::Slot64>(args, original, 1));
+    }
+}
+
+/** @test Actual pack metadata derives wire purpose from its original Ready source, not the request alone. */
+TEST(PooledImmutableNative, FutureSourcePackRequiresActualUnionAndFramePurpose)
+{
+    namespace t=q::local_hot_transport;
+    const t::ConsumerGeometry geometry{0,1,32,32,1000,90,static_cast<std::uint32_t>(GGUFTensorType::IQ4_NL),77};
+    t::SourceAdmissionHeader admission{701,17,23,37};
+    t::RequestHeader request{};request.query={701,17,77,9};request.source_admission=23;request.source_invocation=37;
+    request.original_ids=32;request.miss_rows=3;request.consumer=0;request.native_format=geometry.native_format;
+    request.native_row_bytes=90;request.intent=q::PooledImmutableLocalHotAccessIntent::FutureReadAhead;
+    p::LookupFrame frame{};frame.interval={701,23,101};frame.source_storage_generation=17;frame.original_ids=3;
+    frame.purpose=p::LookupPurpose::FutureLookupOnly;frame.phase=p::LookupPhase::Ready;
+    t::UnionControl input{};input.query={701,17,66,5};input.pool_original_ids=3;input.intent=request.intent;
+    t::ResultHeader result{};std::uint64_t bytes=999;
+    for(unsigned replay=0;replay<20;++replay)for(const auto live:{0u,1u,3u}){
+        request.miss_rows=live;frame.original_ids=live;input.pool_original_ids=live;
+        ASSERT_TRUE(t::prepareResultFromSource(request,geometry,admission,frame,input,result,bytes));
+        EXPECT_EQ(bytes,live*90u);EXPECT_EQ(result.intent,request.intent);
+        frame.purpose=p::LookupPurpose::CurrentDemand;
+        EXPECT_FALSE(t::prepareResultFromSource(request,geometry,admission,frame,input,result,bytes));EXPECT_EQ(bytes,0u);
+        frame.purpose=p::LookupPurpose::FutureLookupOnly;
+        ++input.query.source_storage_generation;
+        EXPECT_FALSE(t::prepareResultFromSource(request,geometry,admission,frame,input,result,bytes));
+        --input.query.source_storage_generation;
+        frame.phase=p::LookupPhase::Source;
+        EXPECT_FALSE(t::prepareResultFromSource(request,geometry,admission,frame,input,result,bytes));
+        frame.phase=p::LookupPhase::Ready;
+        frame.purpose=p::LookupPurpose::CurrentDemand;
+        input.intent=request.intent=q::PooledImmutableLocalHotAccessIntent::CurrentInvocation;
+        EXPECT_TRUE(t::prepareResultFromSource(request,geometry,admission,frame,input,result,bytes));
+        EXPECT_EQ(bytes,live*90u);
+        frame.purpose=p::LookupPurpose::FutureLookupOnly;
+        input.intent=request.intent=q::PooledImmutableLocalHotAccessIntent::FutureReadAhead;
     }
 }
 

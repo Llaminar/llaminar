@@ -8,6 +8,9 @@
  * accepted-prefix publication remain distinct semantic stages and storage banks.
  */
 #include "Qwen4ExpPrimitiveStage.h"
+#include "execution/local_execution/graph/IGraphBuilder.h"
+#include "backends/BackendManager.h"
+#include "execution/local_execution/graph/RequestInputPositionAdmission.h"
 #include <string_view>
 #include "../../../../kernels/KernelFactory.h"
 #include "../../../../kernels/qwen4exp/Qwen4ExpValidation.h"
@@ -32,6 +35,29 @@ void require(bool condition, const char *message)
     if (!condition) throw std::invalid_argument(message);
 }
 } // namespace
+
+qwen4exp::Qwen4ExpPrefillNextWindowBinding qwen4exp::Qwen4ExpPrefillNextWindowBinding::fromOriginalChunk(
+    const DevicePrefillChunkGraphBinding& original,DeviceId consumer,int nextBucket,
+    RequestInputPositionLayoutRequirement layout)
+{
+    if(layout!=RequestInputPositionLayoutRequirement::ContiguousSingleRequestPrefill)
+        throw std::invalid_argument("QFN next-window family requires contiguous positions at every original ingress");
+    if(!original.valid() || !consumer.is_valid() || original.backend!=getBackendFor(consumer) ||
+        nextBucket<=0 || nextBucket>original.request_row_capacity || nextBucket>INT32_MAX/16)
+        throw std::invalid_argument("QFN next-window binding requires its original participant/request and retained shape");
+    Qwen4ExpPrefillNextTokenWindow window{original.request_token_ids_device,original.request_position_ids_device,
+        original.request_total_rows_device,original.chunk_position_ids_device,original.chunk_real_rows_device,
+        original.request_row_capacity,original.bucket_seq_len,nextBucket,1};
+    if(!window.declared())throw std::invalid_argument("QFN next-window original addresses are incomplete or misaligned");
+    std::uint64_t identity=1469598103934665603ULL;
+    const auto mix=[&](std::uint64_t value){identity=(identity^value)*1099511628211ULL;};
+    mix(static_cast<std::uint64_t>(layout));
+    mix(original.capture_identity);mix(static_cast<std::uint64_t>(consumer.type));mix(consumer.ordinal);
+    for(const auto* p:{window.request_tokens,window.request_positions,window.request_total,window.current_positions,window.current_rows})
+        mix(reinterpret_cast<std::uintptr_t>(p));
+    mix(window.request_capacity);mix(window.current_bucket);mix(window.next_bucket);mix(window.version);
+    return {window,consumer,identity?identity:1};
+}
 
 template <TensorType Type>
 void Qwen4ExpPrimitiveStage::add(Qwen4ExpArenaBinding<Type> binding,
@@ -180,7 +206,15 @@ Qwen4ExpPrimitiveStage::Qwen4ExpPrimitiveStage(Params params)
         [&](const NgramHash &a) {
             a.policy.validate();
             require(a.outputWords.byteOffset % 8 == 0, "Qwen4Exp packed INT64 row IDs require eight-byte alignment");
-            addIntInput(a.tokens, rows, "tokens");
+            if(a.nextWindow){
+                const auto& window=a.nextWindow->native();
+                const auto* tokens=std::get_if<Qwen4ExpNativeIntInput>(&a.tokens.value);
+                require(a.nextWindow->device()==device() && !params_.rows.liveRows && window.next_bucket==params_.rows.capacity &&
+                    tokens && tokens->data==window.request_tokens,"QFN next-window Hash must borrow the original complete request input");
+                addIntInput(a.tokens,window.request_capacity,"request_tokens");
+                for(const auto* p:{window.request_positions,window.request_total,window.current_positions,window.current_rows})
+                    addIntInput(Qwen4ExpNativeIntInput{device(),p,1},1,"next_window_input");
+            }else addIntInput(a.tokens, rows, "tokens");
             add(a.priorTokens, 1, 2, Access::Input, "prior_tokens");
             add(a.outputWords, rows, 32, Access::Output, "row_id_words");
         },
@@ -332,7 +366,11 @@ bool Qwen4ExpPrimitiveStage::execute(IDeviceContext *context)
         [&](const ResidualDown &a) { kernels_->residualDown({rows,a.lowRank,f(a.input),out(a.output)},stream); },
         [&](const ResidualRead &a) { kernels_->residualRead({rows,a.hidden,f(a.normalized),f(a.gateLogits),out(a.output)},stream); },
         [&](const ResidualWrite &a) { kernels_->residualWrite({rows,a.hidden,f(a.residual),f(a.block),f(a.gateLogits),out(a.output)},stream); },
-        [&](const NgramHash &a) { kernels_->ngramHash({rows,intInput(a.tokens),i(a.priorTokens),pointer<std::int64_t>(a.outputWords,Access::Output),a.policy},stream); },
+        [&](const NgramHash &a) {
+            auto* output=pointer<std::int64_t>(a.outputWords,Access::Output);
+            if(a.nextWindow)kernels_->ngramHashNextWindow({rows,intInput(a.tokens),i(a.priorTokens),output,a.policy,a.nextWindow->native()},stream);
+            else kernels_->ngramHash({rows,intInput(a.tokens),i(a.priorTokens),output,a.policy},stream);
+        },
         [&](const PLEGate &a) { kernels_->pleGate({rows,a.hidden,f(a.normalizedKey),f(a.normalizedQuery),f(a.value),out(a.gated)},stream); },
         [&](const PLEConv &a) { kernels_->pleConv({rows,a.channels,f(a.normalized),f(a.priorHistory),weightPointer(a.weights),f(a.gated),f(a.residual),out(a.output)},stream); },
         [&](const CommitConvHistory &a) { kernels_->commitConvHistory({acceptedPrefix(a.acceptance),a.channels,f(a.priorHistory),f(a.candidates),out(a.outputHistory)},stream); },
@@ -362,6 +400,7 @@ uint64_t Qwen4ExpPrimitiveStage::graphCaptureVariantSignature() const
         mix(params_.rows.capacity);mix(params_.rows.liveRows.has_value());
         if(params_.rows.liveRows)input(*params_.rows.liveRows);
         input(hash->tokens);binding(hash->priorTokens);binding(hash->outputWords);
+        if(hash->nextWindow){mix(0x4e45585457494e01ULL);mix(hash->nextWindow->captureIdentity());}
         for(auto word:hash->policy.multipliers)mix(word);
         for(auto word:hash->policy.moduli)mix(word);
         for(auto word:hash->policy.offsets)mix(word);
@@ -380,9 +419,9 @@ bool Qwen4ExpPrimitiveStage::allowsZeroOutput() const
 }
 
 bool Qwen4ExpPrimitiveStage::matchesNgramHashOutput(const TensorBase* root,BufferId buffer,
-    std::size_t offset,std::size_t bytes)const noexcept{
+    std::size_t offset,std::size_t bytes,std::uint64_t nextWindowIdentity)const noexcept{
     const auto* hash=std::get_if<NgramHash>(&params_.operation);
-    return hash && hash->outputWords.tensor==root && hash->outputWords.buffer==buffer &&
+    return hash && (hash->nextWindow?hash->nextWindow->captureIdentity():0)==nextWindowIdentity && hash->outputWords.tensor==root && hash->outputWords.buffer==buffer &&
         hash->outputWords.byteOffset==offset && bytes==std::size_t(params_.rows.capacity)*16*sizeof(std::uint64_t);
 }
 ComputeStageType Qwen4ExpPrimitiveStage::type() const

@@ -566,7 +566,8 @@ PooledNativeTransferSpan PooledImmutableDirectedTransport::localHotSourceScratch
 }
 
 PooledImmutableLocalHotPoolQuery PooledImmutableDirectedTransport::localHotPoolQuery(
-    std::shared_ptr<PooledImmutableLocalHotPreparedStorage> sourceLocal)const
+    std::shared_ptr<PooledImmutableLocalHotPreparedStorage> sourceLocal,PooledImmutableLocalHotQueryBound bound,
+    adaptive_lookup::pooled::LookupPurpose purpose)const
 {
     requireCurrent();const auto source=boundary_->pooledStorage();
     if(!local_hot_geometry_ || !sourceLocal || sourceLocal->originalSource()!=source ||
@@ -574,24 +575,34 @@ PooledImmutableLocalHotPoolQuery PooledImmutableDirectedTransport::localHotPoolQ
         sourceLocal->geometry().maximumOriginalIds()!=local_hot_geometry_->maximumPoolUniqueRows())
         throw std::invalid_argument("Compact Begin requires the actual source participant's original local query");
     sourceLocal->requireAuthority(source->retainedOwnerObservation().authority());
+    if(bound.consumers()!=local_hot_geometry_->consumers().size() ||
+        bound.canonicalOriginal()>sourceLocal->geometry().maximumOriginalIds() ||
+        bound.maximumOriginal()>local_hot_geometry_->maximumPoolOriginalRows())
+        throw std::invalid_argument("Compact Begin launch bound exceeds original roots");
+    for(std::uint32_t i=0;i<bound.consumers();++i)
+        if(!bound.consumerMaximum(i) || bound.consumerMaximum(i)>std::min(bound.canonicalOriginal(),local_hot_geometry_->maximumPoolUniqueRows()))
+            throw std::invalid_argument("Compact Begin launch bound changed original consumer subset");
     const auto& f=sourceLocal->geometry().frameOffsets();
     auto ids=local_hot_geometry_->consumers().size()==1?
         PooledNativeTransferSpan(sourceLocal->roots().frame,f.miss_keys,local_hot_geometry_->keyCapacityBytes()):
         localHotSourceScratch(LocalHotSourceScratch::MergedKeys);
+    ids=ids.subspan(0,std::size_t{bound.maximumOriginal()}*sizeof(std::uint64_t));
     const auto& sourceParameters=source->geometry().parameters();
     PooledNativeTransferSpan admission(source->roots().native,
         sourceParameters.offsets.protocol+offsetof(ImmutableLookupDeviceState,admissionGeneration),sizeof(std::uint64_t));
     return {shared_from_this(),std::move(sourceLocal),std::move(ids),
         PooledNativeTransferSpan(local_hot_source_roots_[1],offsetof(local_hot_transport::UnionControl,pool_original_ids),sizeof(std::int32_t)),
-        std::move(admission),local_hot_geometry_->maximumPoolOriginalRows()};
+        std::move(admission),std::move(bound),purpose};
 }
 PooledImmutableLocalHotPoolQuery::PooledImmutableLocalHotPoolQuery(
     std::shared_ptr<const PooledImmutableDirectedTransport> transport,std::shared_ptr<PooledImmutableLocalHotPreparedStorage> local,
-    PooledNativeTransferSpan ids,PooledNativeTransferSpan count,PooledNativeTransferSpan admission,std::uint32_t capacity)
+    PooledNativeTransferSpan ids,PooledNativeTransferSpan count,PooledNativeTransferSpan admission,PooledImmutableLocalHotQueryBound bound,
+    adaptive_lookup::pooled::LookupPurpose purpose)
     :transport_(std::move(transport)),source_local_(std::move(local)),ids_(std::move(ids)),count_(std::move(count)),
-     admission_(std::move(admission)),capacity_(capacity)
+     admission_(std::move(admission)),bound_(std::move(bound)),capacity_(bound_.maximumOriginal()),purpose_(purpose)
 {
-    if(!transport_ || !source_local_ || !capacity_ || capacity_>static_cast<std::uint32_t>(INT32_MAX) ||
+    if((purpose_!=adaptive_lookup::pooled::LookupPurpose::CurrentDemand && purpose_!=adaptive_lookup::pooled::LookupPurpose::FutureLookupOnly) ||
+        !transport_ || !source_local_ || !capacity_ || capacity_>static_cast<std::uint32_t>(INT32_MAX) ||
         ids_.bytes()!=std::size_t{capacity_}*sizeof(std::uint64_t) || count_.bytes()!=sizeof(std::int32_t) || admission_.bytes()!=sizeof(std::uint64_t))
         throw std::invalid_argument("Compact Begin lost its exact original producer extents");
 }
@@ -610,7 +621,8 @@ void PooledImmutableLocalHotPoolQuery::requireDeclaration(const PooledImmutableC
     transport_->requireCurrent();const auto source=transport_->sourceBoundary()->pooledStorage();
     const auto device=source_local_->geometry().allocator().device;
     if(source_local_->originalSource()!=source || source->coordinator()->plan().parameters().identity!=plan.parameters().identity ||
-        plan.allocator().device!=device || capacity_!=plan.parameters().policy.maximumOriginal() ||
+        plan.allocator().device!=device || capacity_>plan.parameters().policy.maximumOriginal() ||
+        bound_.canonicalOriginal()>source_local_->geometry().maximumOriginalIds() ||
         ids_.bytes()!=std::size_t{capacity_}*sizeof(std::uint64_t) || count_.bytes()!=sizeof(std::int32_t) ||
         admission_.bytes()!=sizeof(std::uint64_t))
         throw std::logic_error("Compact Begin changed its original coordinator/source/query declaration");
@@ -627,7 +639,10 @@ std::uint64_t PooledImmutableLocalHotPoolQuery::declarationIdentity()const
 {
     transport_->requireCurrent();if(sealed_ids_)require(transport_->sourceBoundary()->pooledStorage()->coordinator()->plan());std::uint64_t h=1469598103934665603ULL;
     const auto mix=[&](std::uint64_t x){h=(h^x)*1099511628211ULL;};
-    mix(1);mix(source_local_->captureIdentity());mix(ids_.identity());mix(count_.identity());mix(admission_.identity());mix(capacity_);return h?h:1;
+    mix(2);const auto& rows=bound_.tokenIdentity();mix(reinterpret_cast<std::uintptr_t>(rows.count));
+    mix(rows.count_capacity);mix(rows.first_physical_row);mix(rows.physical_rows);mix(rows.repeats_per_row);mix(rows.schema_version);
+    mix(bound_.canonicalOriginal());mix(bound_.consumers());for(std::uint32_t i=0;i<bound_.consumers();++i)mix(bound_.consumerMaximum(i));
+    mix(static_cast<std::uint32_t>(purpose_));mix(source_local_->captureIdentity());mix(ids_.identity());mix(count_.identity());mix(admission_.identity());mix(capacity_);return h?h:1;
 }
 std::uint64_t PooledImmutableLocalHotPoolQuery::captureIdentity()const
 {
@@ -639,7 +654,11 @@ std::uint64_t PooledImmutableLocalHotPoolQuery::captureIdentity()const
 pooled_native::CoordinatorQuery PooledImmutableLocalHotPoolQuery::native()const
 {
     require(transport_->sourceBoundary()->pooledStorage()->coordinator()->plan());
-    return {{DeviceRowRange::deviceCounted(static_cast<int>(capacity_),sealed_count_),pooled_native::OriginalIdWidth::UInt64},sealed_ids_,sealed_admission_};
+    return {{DeviceRowRange::deviceCounted(static_cast<int>(capacity_),sealed_count_),pooled_native::OriginalIdWidth::UInt64,purpose_},sealed_ids_,sealed_admission_,
+        static_cast<const local_hot_transport::UnionControl*>(transport_->localHotUnion().pointer(source_local_->geometry().allocator().device,alignof(local_hot_transport::UnionControl))),
+        static_cast<const local_hot_transport::QueryIdentity*>(PooledNativeTransferSpan(source_local_->roots().frame,
+            source_local_->geometry().frameOffsets().identity,sizeof(local_hot_transport::QueryIdentity)).pointer(
+                source_local_->geometry().allocator().device,alignof(local_hot_transport::QueryIdentity)))};
 }
 
 PooledImmutableLocalHotNativePack PooledImmutableDirectedTransport::localHotNativePack(

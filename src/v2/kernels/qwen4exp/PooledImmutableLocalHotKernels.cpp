@@ -43,7 +43,11 @@ void IPooledImmutableLocalHotKernels::enqueue(PooledImmutableLocalHotAction acti
     operands.require(action, storage);
     switch (action) {
     case PooledImmutableLocalHotAction::Probe:
-        launchProbe(operands.nativeQuery(storage), stream);
+        if(operands.hasNextWindow())launchNextWindowProbe(operands.nativeNextWindowQuery(storage),stream);
+        else launchProbe(operands.nativeQuery(storage), stream);
+        break;
+    case PooledImmutableLocalHotAction::Adopt:
+        launchAdoption(operands.nativeAdoption(storage), stream);
         break;
     case PooledImmutableLocalHotAction::LocalRead:
         launchRead(operands.nativeRead(storage), stream);
@@ -57,7 +61,6 @@ void IPooledImmutableLocalHotKernels::enqueue(PooledImmutableLocalHotAction acti
     case PooledImmutableLocalHotAction::ConsumeDemand:
     case PooledImmutableLocalHotAction::CopyFills:
     case PooledImmutableLocalHotAction::CompleteFills:
-    case PooledImmutableLocalHotAction::Adopt:
     case PooledImmutableLocalHotAction::Discard:
     case PooledImmutableLocalHotAction::Cancel:
     case PooledImmutableLocalHotAction::Retire:

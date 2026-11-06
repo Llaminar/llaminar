@@ -76,6 +76,8 @@ enum class UniquePhase : std::uint32_t
     Missing, NeedsPin, PinPending, Read, FreePlanned, FreeGranted,
     VictimPlanned, VictimGranted, SourceOnly
 };
+/** @brief Immutable read purpose; lookup-only acquires bytes/pins without demand-policy credit. */
+enum class LookupPurpose : std::uint32_t { CurrentDemand, FutureLookupOnly };
 /** @brief One bounded invocation, retaining original lookup ordinal across request reset. */
 struct alignas(64) LookupFrame
 {
@@ -86,6 +88,7 @@ struct alignas(64) LookupFrame
     Status status = Status::Success;
     std::uint32_t original_ids = 0, unique_rows = 0, outstanding = 0;
     std::uint32_t free_planned = 0, victim_planned = 0, eligible_cursor[3]{};
+    LookupPurpose purpose = LookupPurpose::CurrentDemand;
     bool observed = false, queues_applied = false, free_exhausted = false, cancelled_completion = false;
 };
 /** @brief Append-only immutable command/grant observations; neither grants nor unique coordinates are reordered. */

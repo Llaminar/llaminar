@@ -772,6 +772,21 @@ namespace llaminar2
         {(void)producer;(void)body;return false;}
 
         /**
+         * @brief Join exact imported main and previously appended finite-body exits before another body.
+         * @param producers Unique original definitions already belonging to this uninstantiated parent.
+         * @param body Same-device graph-only finite definition, not already present in this parent.
+         * @return True after the body depends on every actual original exit. Its newly appended
+         * child exit can be named by a later call using the SAME original body definition.
+         * Empty, null, stale, foreign, ambiguous and duplicate definitions reject before native mutation.
+         * Instantiated/reset parents reject. No event or live word is introduced; completion
+         * of an appended child means all terminals of its original finite body completed.
+         * Backends without native graph assembly, including CPU, explicitly return false.
+         */
+        [[nodiscard]] virtual bool appendFiniteBodyAfterCapturedFragment(
+            std::span<const IGPUGraphCapture* const> producers, const IGPUGraphCapture& body)
+        {(void)producers;(void)body;return false;}
+
+        /**
          * @brief Consume completed per-step timings without waiting on the GPU.
          *
          * Backends return `Pending` while the terminal event is incomplete.

@@ -475,7 +475,10 @@ CpuImmutableRowGatherObservation CpuAdaptiveImmutableRowCache::gather(
 }
 CpuImmutableRowGatherObservation CpuAdaptiveImmutableRowCache::gatherImpl(
     std::span<const std::int64_t> ids,std::span<std::byte> destination,const ReadGrant *grant) {
-    return gatherImpl(ids,destination,grant,CpuImmutableRowCacheAccess::CurrentDemand);
+    const auto access=grant && !grant->intents_.empty() &&
+        grant->intents_.front().intent==ImmutableRowReadIntent::FutureLookupOnly
+        ?CpuImmutableRowCacheAccess::FutureLookupOnly:CpuImmutableRowCacheAccess::CurrentDemand;
+    return gatherImpl(ids,destination,grant,access);
 }
 CpuImmutableRowGatherObservation CpuAdaptiveImmutableRowCache::gather(std::span<const std::int64_t> ids,std::span<std::byte> destination,
     CpuImmutableRowCacheAccess access) {
@@ -486,8 +489,7 @@ CpuImmutableRowGatherObservation CpuAdaptiveImmutableRowCache::gatherImpl(
     CpuImmutableRowCacheAccess access) {
     auto &s=*impl_;std::lock_guard lock(s.mutex);s.requireOpen();const auto &g=s.geometry;
     if((access!=CpuImmutableRowCacheAccess::CurrentDemand &&
-        access!=CpuImmutableRowCacheAccess::FutureLookupOnly) ||
-       (grant && access!=CpuImmutableRowCacheAccess::CurrentDemand))
+        access!=CpuImmutableRowCacheAccess::FutureLookupOnly))
         throw std::invalid_argument("CPU lookup-only access requires an independent original source read");
     const bool demand=access==CpuImmutableRowCacheAccess::CurrentDemand;
     if(!g.requesters_.empty()!=static_cast<bool>(grant) ||
@@ -512,8 +514,9 @@ CpuImmutableRowGatherObservation CpuAdaptiveImmutableRowCache::gatherImpl(
             overlaps(grant->acknowledgements_.data(),grant->acknowledgements_.size_bytes(),grant->intents_.data(),grant->intents_.size_bytes()))
             throw std::invalid_argument("Subordinate CPU response metadata aliases live payload");
         for(const auto &intent:grant->intents_) {
-            if((intent.intent!=ImmutableRowReadIntent::Read && intent.intent!=ImmutableRowReadIntent::ReadAndInvalidate) ||
-                ((intent.intent==ImmutableRowReadIntent::Read)!=(intent.destination_grant==0)))
+            if((demand && intent.intent!=ImmutableRowReadIntent::Read && intent.intent!=ImmutableRowReadIntent::ReadAndInvalidate) ||
+                (!demand && intent.intent!=ImmutableRowReadIntent::FutureLookupOnly) ||
+                ((intent.intent==ImmutableRowReadIntent::ReadAndInvalidate)!=(intent.destination_grant!=0)))
                 throw std::invalid_argument("Subordinate CPU read intent or destination grant is invalid");
         }
     }
@@ -602,7 +605,7 @@ CpuImmutableRowGatherObservation CpuAdaptiveImmutableRowCache::gatherImpl(
             auto *rows=reinterpret_cast<GrantedRow*>(static_cast<std::byte*>(s.execution.data)+g.read_rows_offset_)+grant->channel_index_*g.maximum_live_rows_;
             for(std::size_t i=0;i<ids.size();++i) {
                 rows[i]={ids[i],grant->intents_[i].intent};
-                if(rows[i].intent==ImmutableRowReadIntent::Read){
+                if(rows[i].intent==ImmutableRowReadIntent::Read || rows[i].intent==ImmutableRowReadIntent::FutureLookupOnly){
                     const auto slot=s.find(static_cast<std::uint64_t>(ids[i]));
                     if(slot!=None){
                         auto &record=s.slots()[slot];
@@ -641,7 +644,7 @@ std::optional<CpuAdaptiveImmutableRowCache::Pin> CpuAdaptiveImmutableRowCache::p
     if(grant) {
         const auto *rows=reinterpret_cast<const GrantedRow*>(static_cast<const std::byte*>(s.execution.data)+s.geometry.read_rows_offset_)+grant->channel_index_*s.geometry.maximum_live_rows_;
         const auto &record=rows[static_cast<std::size_t>(row)];
-        if(record.intent!=ImmutableRowReadIntent::Read)
+        if(record.intent!=ImmutableRowReadIntent::Read && record.intent!=ImmutableRowReadIntent::FutureLookupOnly)
             throw std::invalid_argument("Invalidated promotion rows cannot publish new RAM read pins");
         try{s.source->authenticateSource();}catch(...){s.failed=true;throw;}
         if(record.slot==None)return std::nullopt;

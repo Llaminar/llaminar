@@ -368,6 +368,9 @@ namespace llaminar2
         /** @copydoc IGPUGraphCapture::appendFiniteBodyAfterCapturedFragment */
         [[nodiscard]] bool appendFiniteBodyAfterCapturedFragment(
             const IGPUGraphCapture& producer, const IGPUGraphCapture& body) override;
+        /** @brief Join exact original main and already appended finite-body frontiers; see base contract. */
+        [[nodiscard]] bool appendFiniteBodyAfterCapturedFragment(
+            std::span<const IGPUGraphCapture* const> producers, const IGPUGraphCapture& body) override;
         /** @copydoc IGPUGraphCapture::appendParallelBranch */
         [[nodiscard]] bool appendParallelBranch(
             const GPUCapturedParallelBranch &branch) override;

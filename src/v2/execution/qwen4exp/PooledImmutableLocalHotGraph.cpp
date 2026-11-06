@@ -178,11 +178,13 @@ public:
     /** @brief Retain actual source/consumer/private producer owners; never infer an admission from an L1 ordinal. */
     CompactMetadata(BufferArena& arena,std::shared_ptr<const Transport> transport,std::shared_ptr<Local> local,
         std::shared_ptr<Local> sourceLocal,DeviceGenerationControlBinding control,t::MetadataAction action,
-        const CompactTransfer* payload=nullptr)
+        const CompactTransfer* payload=nullptr,
+        q::PooledImmutableLocalHotAccessIntent intent=q::PooledImmutableLocalHotAccessIntent::CurrentInvocation)
         :IComputeStage(controllerDevice(control)),arena_(&arena),transport_(std::move(transport)),local_(std::move(local)),
-         source_local_(std::move(sourceLocal)),control_(control),action_(action),payload_(payload),coordinate_(localCoordinate(*transport_,local_))
+         source_local_(std::move(sourceLocal)),control_(control),action_(action),payload_(payload),intent_(intent),coordinate_(localCoordinate(*transport_,local_))
     {
         control_.requireFor(device());
+        if(!q::validLocalHotAccessIntent(intent_))throw std::invalid_argument("Compact metadata has unknown immutable purpose");
         const bool source=device()==transport_->localHotGeometry()->coordinator().device;
         const bool sourceAction=action_==t::MetadataAction::PublishSourceAdmission || action_==t::MetadataAction::AcceptRequestHeader ||
             action_==t::MetadataAction::ConfirmRequestKeys || action_==t::MetadataAction::ConfirmAck;
@@ -200,6 +202,7 @@ public:
     const DeviceGenerationControlBinding& control()const noexcept{return control_;}
     const auto& sourceLocal()const noexcept{return source_local_;}
     const CompactTransfer* payload()const noexcept{return payload_;}
+    auto intent()const noexcept{return intent_;}
     /** @brief Bind actual prepared private addresses and exact native authority after original producers are prepared. */
     bool prepareGraphLaunch(IDeviceContext* context,void* stream)override
     {
@@ -239,7 +242,7 @@ public:
     StageBufferRequirements getBufferRequirements()const override{return {};}
     StageBufferContract bufferContract()const override{return StageBufferContract::build().addPreallocatedInOut(BufferId::MTP_GENERATION_CONTROL,"INT32");}
     std::uint64_t graphCaptureVariantSignature()const override
-    {require();auto h=local_->captureIdentity();mix(h,reinterpret_cast<std::uintptr_t>(transport_.get()));mix(h,control_.captureIdentity());mix(h,static_cast<unsigned>(action_));if(source_local_)mix(h,source_local_->captureIdentity());if(payload_)mix(h,payload_->graphCaptureVariantSignature());return h?h:1;}
+    {require();auto h=local_->captureIdentity();mix(h,reinterpret_cast<std::uintptr_t>(transport_.get()));mix(h,control_.captureIdentity());mix(h,static_cast<unsigned>(action_));if(intent_!=q::PooledImmutableLocalHotAccessIntent::CurrentInvocation)mix(h,static_cast<unsigned>(intent_));if(source_local_)mix(h,source_local_->captureIdentity());if(payload_)mix(h,payload_->graphCaptureVariantSignature());return h?h:1;}
     StageDumpInfo buildDumpInfoImpl()const override{StageDumpInfo result;result.addScalarInt("compact_metadata",static_cast<unsigned>(action_));return result;}
 private:
     /** @brief Authenticate unchanged original source/PMA/controller and exact peer role. */
@@ -248,7 +251,7 @@ private:
     /** @return Exact source-local or own-consumer addresses; never dereference a foreign GPU alias. */
     t::MetadataArgs arguments()const
     {
-        t::MetadataArgs args{};args.device=device();args.first_error=control_.error();args.healthy=control_.healthy();
+        t::MetadataArgs args{};args.request.intent=intent_;args.device=device();args.first_error=control_.error();args.healthy=control_.healthy();
         const auto& g=*transport_->localHotGeometry();const bool source=device()==g.coordinator().device;
         const auto reporting=source && source_local_?source_local_:local_;
         args.reporting=address<q::local_hot::Counters>(localFrame(*reporting,reporting->geometry().frameOffsets().counters,
@@ -299,6 +302,7 @@ private:
     }
     BufferArena* arena_;std::shared_ptr<const Transport> transport_;std::shared_ptr<Local> local_,source_local_;
     DeviceGenerationControlBinding control_;t::MetadataAction action_;const CompactTransfer* payload_;
+    q::PooledImmutableLocalHotAccessIntent intent_;
     std::uint32_t coordinate_;std::optional<t::MetadataArgs> args_;std::uint64_t identity_;
 };
 /** @brief Exact native canonical-subset check/concatenation before original pool Begin. */
@@ -306,19 +310,31 @@ class CompactUnion final:public IComputeStage {
 public:
     /** @brief Retain the complete original root roster; no partial consumer list can seal. */
     CompactUnion(std::shared_ptr<const Transport> transport,std::vector<std::shared_ptr<Local>> locals,
-        DeviceGenerationControlBinding control)
-        :IComputeStage(transport->localHotGeometry()->coordinator().device),transport_(std::move(transport)),locals_(std::move(locals)),control_(control)
+        DeviceRowRange tokens,DeviceGenerationControlBinding control,
+        q::PooledImmutableLocalHotAccessIntent intent=q::PooledImmutableLocalHotAccessIntent::CurrentInvocation)
+        :IComputeStage(transport->localHotGeometry()->coordinator().device),transport_(std::move(transport)),locals_(std::move(locals)),control_(control),intent_(intent)
     {
         if(locals_.size()!=transport_->localHotGeometry()->consumers().size())throw std::invalid_argument("Compact union omitted actual consumers");
         for(std::uint32_t i=0;i<locals_.size();++i){if(localCoordinate(*transport_,locals_[i])!=i)throw std::invalid_argument("Compact union changed actual consumer order");if(locals_[i]->geometry().allocator()==transport_->localHotGeometry()->coordinator())source_=locals_[i];}
         if(!source_)throw std::invalid_argument("Compact union lost actual source canonical query");
-        query_.emplace(transport_->localHotPoolQuery(source_));identity_=graphCaptureVariantSignature();
+        if(!q::validLocalHotAccessIntent(intent_))throw std::invalid_argument("Compact union has unknown immutable purpose");
+        std::array<t::ConsumerGeometry,8> consumerBounds{};
+        for(std::uint32_t i=0;i<locals_.size();++i){
+            consumerBounds[i]=transport_->localHotGeometry()->consumer(i,locals_[i]->consumerStorageIdentity());
+            consumerBounds[i].maximum_misses=std::min(consumerBounds[i].maximum_misses,locals_[i]->geometry().maximumOriginalIds());
+        }
+        auto bound=q::PooledImmutableLocalHotQueryBound::forCanonicalQuery(tokens,
+            std::span{consumerBounds.data(),locals_.size()},transport_->localHotGeometry()->maximumPoolOriginalRows());
+        query_.emplace(transport_->localHotPoolQuery(source_,std::move(bound),intent_==q::PooledImmutableLocalHotAccessIntent::FutureReadAhead
+            ?q::adaptive_lookup::pooled::LookupPurpose::FutureLookupOnly:q::adaptive_lookup::pooled::LookupPurpose::CurrentDemand));
+        identity_=graphCaptureVariantSignature();
     }
     const q::PooledImmutableLocalHotPoolQuery& query()const{return *query_;}
     const auto& transport()const noexcept{return transport_;}
     const auto& source()const noexcept{return source_;}
     const auto& locals()const noexcept{return locals_;}
     const auto& control()const noexcept{return control_;}
+    auto intent()const noexcept{return intent_;}
     bool prepareGraphLaunch(IDeviceContext* context,void* stream)override
     {
         if(!context || context->deviceId()!=device() || !stream || reinterpret_cast<std::uintptr_t>(stream)<=2)throw std::invalid_argument("Compact union changed exact original participant/stream");
@@ -351,24 +367,25 @@ public:
     StageBufferRequirements getBufferRequirements()const override{return {};}
     StageBufferContract bufferContract()const override{return StageBufferContract::build().addPreallocatedInOut(BufferId::MTP_GENERATION_CONTROL,"INT32");}
     std::uint64_t graphCaptureVariantSignature()const override
-    {transport_->requireCurrent();control_.requireFor(device());auto h=query_->declarationIdentity();mix(h,control_.captureIdentity());for(const auto& local:locals_)mix(h,local->captureIdentity());return h?h:1;}
+    {transport_->requireCurrent();control_.requireFor(device());auto h=query_->declarationIdentity();mix(h,t::unionLaunchIdentity(query_->queryBound().maximumOriginal()));mix(h,control_.captureIdentity());for(const auto& local:locals_)mix(h,local->captureIdentity());return h?h:1;}
     StageDumpInfo buildDumpInfoImpl()const override{StageDumpInfo result;result.addScalarInt("compact_union_consumers",locals_.size());return result;}
 private:
     /** @return Only source-local aliases; remote native roots are used solely as immutable cold identities. */
     t::UnionArgs arguments()const
     {
-        t::UnionArgs args{};const auto& g=*transport_->localHotGeometry();const auto& f=source_->geometry().frameOffsets();
+        t::UnionArgs args{};args.expected_intent=intent_;const auto& g=*transport_->localHotGeometry();const auto& f=source_->geometry().frameOffsets();
         args.expected=address<const t::QueryIdentity>(localFrame(*source_,f.identity+offsetof(q::local_hot::FrameIdentity,query),sizeof(t::QueryIdentity)),device());
         args.source_admission=address<const t::SourceAdmissionHeader>(transport_->localHotAdmission(device()),device());
         args.canonical={address<const q::adaptive_lookup::KeyIndex>(q::PooledNativeTransferSpan(source_->roots().native,source_->geometry().scratchOffsets().keys_a,
             std::size_t{g.maximumPoolUniqueRows()}*sizeof(q::adaptive_lookup::KeyIndex)),device()),
-            address<const std::uint64_t>(localFrame(*source_,f.control+offsetof(q::adaptive_lookup::FrameControl,original_ids),8),device()),g.maximumPoolUniqueRows()};
-        args.consumer_count=static_cast<std::uint32_t>(locals_.size());args.capacity=g.maximumPoolOriginalRows();args.output=address<t::UnionControl>(transport_->localHotUnion(),device());
+            address<const std::uint64_t>(localFrame(*source_,f.control+offsetof(q::adaptive_lookup::FrameControl,original_ids),8),device()),query_->queryBound().canonicalOriginal()};
+        args.consumer_count=static_cast<std::uint32_t>(locals_.size());args.capacity=query_->queryBound().maximumOriginal();args.output=address<t::UnionControl>(transport_->localHotUnion(),device());
         args.merged_keys=locals_.size()==1?address<std::uint64_t>(localFrame(*source_,f.miss_keys,g.keyCapacityBytes()),device()):address<std::uint64_t>(transport_->localHotSourceScratch(Transport::LocalHotSourceScratch::MergedKeys),device());
         std::size_t remote=0;
         for(std::uint32_t i=0;i<locals_.size();++i){
             const bool self=locals_[i]==source_;const auto bank=transport_->localHotControl(device(),i);
             args.consumers[i]=g.consumer(i,locals_[i]->consumerStorageIdentity());
+            args.consumers[i].maximum_misses=query_->queryBound().consumerMaximum(i);
             args.requests[i].header=address<const t::RequestHeader>(bank.subspan(self?offsetof(t::Control,request_out):offsetof(t::Control,request_in),sizeof(t::RequestHeader)),device());
             args.requests[i].received_header_bytes=address<const std::uint64_t>(bank.subspan(offsetof(t::Control,header_receive_bytes),8),device());
             args.requests[i].received_key_bytes=address<const std::uint64_t>(bank.subspan(self?offsetof(t::Control,request_send_bytes):offsetof(t::Control,request_receive_bytes),8),device());
@@ -378,7 +395,7 @@ private:
         return args;
     }
     std::shared_ptr<const Transport> transport_;std::vector<std::shared_ptr<Local>> locals_;std::shared_ptr<Local> source_;
-    DeviceGenerationControlBinding control_;std::optional<q::PooledImmutableLocalHotPoolQuery> query_;std::optional<t::UnionArgs> args_;std::uint64_t identity_;
+    DeviceGenerationControlBinding control_;q::PooledImmutableLocalHotAccessIntent intent_;std::optional<q::PooledImmutableLocalHotPoolQuery> query_;std::optional<t::UnionArgs> args_;std::uint64_t identity_;
 };
 /** @return Exact actual source native roots read by the original native-row pack. */
 auto sourceRoots(const q::PooledImmutableSourcePreparedStorage& storage)
@@ -452,10 +469,11 @@ const CompactTransfer& wireNode(const ComputeGraph& graph,const std::string& nam
 }
 /** @return Actual checked native metadata projection. */
 const CompactMetadata& metadataNode(const ComputeGraph& graph,const std::string& name,const std::shared_ptr<const Transport>& transport,
-    const std::shared_ptr<Local>& local,t::MetadataAction action,DeviceId device)
+    const std::shared_ptr<Local>& local,t::MetadataAction action,DeviceId device,
+    q::PooledImmutableLocalHotAccessIntent intent=q::PooledImmutableLocalHotAccessIntent::CurrentInvocation)
 {
     const auto& node=actualNode(graph,name,device);const auto* stage=dynamic_cast<const CompactMetadata*>(node.stage.get());
-    if(!stage || !stage->matches(transport.get(),local.get(),action))throw std::invalid_argument("Compact completion substituted its actual metadata producer");return *stage;
+    if(!stage || !stage->matches(transport.get(),local.get(),action) || stage->intent()!=intent)throw std::invalid_argument("Compact completion substituted its actual metadata producer");return *stage;
 }
 /** @brief Add a stage and its exact predecessor, rejecting all collisions before replacement. */
 void add(ComputeGraph& graph,const std::string& name,std::unique_ptr<IComputeStage> stage,DeviceId device,const std::string& predecessor)
@@ -483,7 +501,7 @@ void requirePooledCompactQueryProducer(const ComputeGraph& graph,const q::Pooled
                 if(request)throw std::invalid_argument("Compact union has duplicate original request producers");request=stage;terminal=name;
             }
         }
-        if(!request || request->sourceLocal()!=prepared->source() || request->control().captureIdentity()!=prepared->control().captureIdentity() ||
+        if(!request || request->intent()!=prepared->intent() || request->sourceLocal()!=prepared->source() || request->control().captureIdentity()!=prepared->control().captureIdentity() ||
             !ancestor(graph,node->dependencies.front(),terminal))throw std::invalid_argument("Compact union omitted an actual current request/native receipt");
         if(!self){
             const auto& confirmed=actualNode(graph,terminal,device);
@@ -492,7 +510,7 @@ void requirePooledCompactQueryProducer(const ComputeGraph& graph,const q::Pooled
             if(request->payload()!=&payload)throw std::invalid_argument("Compact request confirmation substituted its native completion");
             const auto& received=actualNode(graph,confirmed.dependencies.front(),device);
             if(received.dependencies.size()!=1)throw std::invalid_argument("Compact request keys precede fixed-header validation");
-            const auto& header=metadataNode(graph,received.dependencies.front(),transport,local,t::MetadataAction::AcceptRequestHeader,device);
+            const auto& header=metadataNode(graph,received.dependencies.front(),transport,local,t::MetadataAction::AcceptRequestHeader,device,prepared->intent());
             if(header.sourceLocal()!=prepared->source() || header.control().captureIdentity()!=prepared->control().captureIdentity())
                 throw std::invalid_argument("Compact header changed canonical source/controller");
             const auto& accepted=actualNode(graph,received.dependencies.front(),device);
@@ -510,12 +528,12 @@ void requirePooledCompactConsumerCompletion(const ComputeGraph& graph,const Pool
     wireNode(graph,completion.requested,transport,local,CompactWire::MissKeys,CapturedTransferEndpoint::Producer);
     wireNode(graph,completion.header_received,transport,local,CompactWire::ResultHeader,CapturedTransferEndpoint::Consumer);
     const auto& payload=wireNode(graph,completion.payload_received,transport,local,CompactWire::NativeRows,CapturedTransferEndpoint::Consumer);
-    const auto& received=metadataNode(graph,completion.received,transport,local,t::MetadataAction::ConfirmResult,device);
+    const auto& received=metadataNode(graph,completion.received,transport,local,t::MetadataAction::ConfirmResult,device,completion.intent);
     if(received.payload()!=&payload)throw std::invalid_argument("Compact consumer lost its exact whole native payload receipt");
     direct(graph,completion.received,completion.payload_received,device);
     const auto& payloadNode=actualNode(graph,completion.payload_received,device);
     if(payloadNode.dependencies.size()!=1)throw std::invalid_argument("Compact payload lost fixed-header admission");
-    metadataNode(graph,payloadNode.dependencies.front(),transport,local,t::MetadataAction::AcceptResultHeader,device);
+    metadataNode(graph,payloadNode.dependencies.front(),transport,local,t::MetadataAction::AcceptResultHeader,device,completion.intent);
     direct(graph,payloadNode.dependencies.front(),completion.header_received,device);
     if(!ancestor(graph,completion.header_received,completion.requested))throw std::invalid_argument("Compact result precedes its original request");
     const auto& acceptedNode=actualNode(graph,completion.accepted,device);const auto* accepted=dynamic_cast<const PooledImmutableLocalHotPhaseStage*>(acceptedNode.stage.get());
@@ -542,7 +560,7 @@ PooledImmutableCompactConsumerCompletion findPooledCompactConsumerCompletion(con
             if(wire->matches(transport.get(),local.get(),CompactWire::Ack,CapturedTransferEndpoint::Producer))assign(result.ack_sent,name);
         }
         if(const auto* metadata=dynamic_cast<const CompactMetadata*>(node->stage.get()))
-            if(metadata->matches(transport.get(),local.get(),t::MetadataAction::ConfirmResult))assign(result.received,name);
+            if(metadata->matches(transport.get(),local.get(),t::MetadataAction::ConfirmResult)){assign(result.received,name);result.intent=metadata->intent();}
         if(const auto* phase=dynamic_cast<const PooledImmutableLocalHotPhaseStage*>(node->stage.get()))
             if(phase->storage()==local && phase->action()==Action::AcceptResult)assign(result.accepted,name);
     }
@@ -559,6 +577,7 @@ std::shared_ptr<const PooledImmutableCompactReadCompletion> appendPooledCompactN
     std::size_t self=request.consumers.size();
     for(std::uint32_t i=0;i<request.consumers.size();++i){if(localCoordinate(*transport,request.consumers[i])!=i)throw std::invalid_argument("Compact delivery reordered actual consumers");if(request.consumers[i]->geometry().allocator()==geometry->coordinator())self=i;}
     if(self==request.consumers.size() || request.source_code->backend()!=device.type)throw std::invalid_argument("Compact delivery lost original source consumer/code");
+    if(!q::validLocalHotAccessIntent(request.intent))throw std::invalid_argument("Compact delivery has unknown immutable purpose");
     auto result=std::make_shared<PooledImmutableCompactReadCompletion>();result->original=std::move(request);result->native_rows_ready=nativeRowsReady;
     const auto count=result->original.consumers.size();for(auto* names:{&result->packed,&result->header_sent,&result->payload_sent,&result->ack_received,&result->ack_validated})names->resize(count);
     std::vector<const CompactTransfer*> payloads(count);std::string previous=nativeRowsReady;
@@ -584,7 +603,7 @@ std::shared_ptr<const PooledImmutableCompactReadCompletion> appendPooledCompactN
     for(const auto i:order)if(i!=self){const auto& local=result->original.consumers[i];const auto prefix=identity+"/consumer"+std::to_string(i);
         result->ack_received[i]=prefix+"/ack_receive";result->ack_validated[i]=prefix+"/ack_validate";
         add(graph,result->ack_received[i],std::make_unique<CompactTransfer>(arena,transport,local,control,CompactWire::Ack,CapturedTransferEndpoint::Consumer),device,previous);
-        add(graph,result->ack_validated[i],std::make_unique<CompactMetadata>(arena,transport,local,result->original.consumers[self],control,t::MetadataAction::ConfirmAck,payloads[i]),device,result->ack_received[i]);
+        add(graph,result->ack_validated[i],std::make_unique<CompactMetadata>(arena,transport,local,result->original.consumers[self],control,t::MetadataAction::ConfirmAck,payloads[i],result->original.intent),device,result->ack_received[i]);
         previous=result->ack_validated[i];
     }
     result->terminal=previous;requirePooledCompactNativeDelivery(graph,*result);return result;
@@ -632,7 +651,7 @@ void requirePooledCompactNativeDelivery(const ComputeGraph& graph,const PooledIm
     }
     for(const auto i:order)if(i!=self){
         wireNode(graph,completion.ack_received[i],transport,request.consumers[i],CompactWire::Ack,CapturedTransferEndpoint::Consumer);
-        const auto& ack=metadataNode(graph,completion.ack_validated[i],transport,request.consumers[i],t::MetadataAction::ConfirmAck,device);
+        const auto& ack=metadataNode(graph,completion.ack_validated[i],transport,request.consumers[i],t::MetadataAction::ConfirmAck,device,request.intent);
         const auto& payload=wireNode(graph,completion.payload_sent[i],transport,request.consumers[i],CompactWire::NativeRows,CapturedTransferEndpoint::Producer);
         if(ack.payload()!=&payload)throw std::invalid_argument("Native ACK lost its actual source payload completion");
         direct(graph,completion.ack_received[i],previous,device);direct(graph,completion.ack_validated[i],completion.ack_received[i],device);previous=completion.ack_validated[i];
@@ -726,12 +745,24 @@ PooledImmutableLocalHotGraphEndpoints appendLocalMain(ComputeGraph& graph,Buffer
     e.demand={e.probe,e.ready_wait,e.read,device};return e;
 }
 } // namespace
-PooledImmutableLocalHotSourceBody appendPooledImmutableLocalHotSourceBody(ComputeGraph& graph,BufferArena& arena,
+/**
+ * @brief Lower the same real source protocol with an immutable current or lookup-only purpose.
+ * @param graph Original graph. @param arena Same prepared arena. @param actual Original transport.
+ * @param originalLocals Complete local-root roster. @param poolCode Original pool code.
+ * @param local Actual coordinator local root. @param localCode Same local code.
+ * @param tokens Original token extent. @param ids Actual ordered hashes. @param count Optional original count.
+ * @param control Same request controller. @param output Sole Current output; absent for Future.
+ * @param identity Unique stage namespace. @param outputIdentity Current output name; empty for Future.
+ * @param intent Immutable source/wire purpose, independent of later actual-demand adoption.
+ * @return Actual stages and source retirement descriptor, without a model SourcePlan or history authority.
+ */
+static PooledImmutableLocalHotSourceBody appendLocalHotSourceBody(ComputeGraph& graph,BufferArena& arena,
     std::shared_ptr<const Transport> actual,std::span<const std::shared_ptr<Local>> originalLocals,
     std::shared_ptr<const q::IPooledImmutableNativeKernels> poolCode,std::shared_ptr<Local> local,
     std::shared_ptr<const q::IPooledImmutableLocalHotKernels> localCode,DeviceRowRange tokens,q::PooledNativeTensorSpan ids,
     std::optional<q::PooledNativeTensorSpan> count,DeviceGenerationControlBinding control,q::PooledNativeTensorSpan output,
-    const std::string& identity,const std::string& outputIdentity)
+    const std::string& identity,const std::string& outputIdentity,
+    q::PooledImmutableLocalHotAccessIntent intent)
 {
     if(!actual)throw std::invalid_argument("Combined PLE source lost its original transport");
     actual->requireCurrent();const auto& geometry=actual->localHotGeometry();
@@ -744,31 +775,70 @@ PooledImmutableLocalHotSourceBody appendPooledImmutableLocalHotSourceBody(Comput
         throw std::invalid_argument("Combined PLE source requires its actual source local roots");
     std::set<std::string> before;for(const auto& name:graph.getExecutionOrder())before.insert(name);
     graph.setRetainedParticipantDefinitionDomain({geometry->coordinator().device,actual.get()});
-    const auto coordinate=localCoordinate(*actual,local);auto endpoints=appendLocalMain(graph,arena,local,localCode,
-        geometry->consumer(coordinate,local->consumerStorageIdentity()),control,tokens,std::move(ids),std::move(count),std::move(output),identity,outputIdentity);
+    const auto coordinate=localCoordinate(*actual,local);
+    PooledImmutableLocalHotGraphEndpoints endpoints;
+    if(intent==q::PooledImmutableLocalHotAccessIntent::CurrentInvocation)
+        endpoints=appendLocalMain(graph,arena,local,localCode,
+            geometry->consumer(coordinate,local->consumerStorageIdentity()),control,tokens,std::move(ids),std::move(count),std::move(output),identity,outputIdentity);
+    else if(intent==q::PooledImmutableLocalHotAccessIntent::FutureReadAhead){
+        endpoints.probe=identity+"/future_probe";endpoints.first=endpoints.probe;
+        add(graph,endpoints.probe,std::make_unique<PooledImmutableLocalHotPhaseStage>(arena,local,localCode,Action::Probe,
+            q::PooledImmutableLocalHotOperands::query(*local,geometry->consumer(coordinate,local->consumerStorageIdentity()),
+                tokens,std::move(ids),std::move(count),control,intent)),geometry->coordinator().device,{});
+    }else throw std::invalid_argument("Local source body has unknown immutable purpose");
     auto previous=identity+"/own_request";
-    add(graph,previous,std::make_unique<CompactMetadata>(arena,actual,local,local,control,t::MetadataAction::PrepareRequest),local->geometry().allocator().device,endpoints.probe);
+    add(graph,previous,std::make_unique<CompactMetadata>(arena,actual,local,local,control,t::MetadataAction::PrepareRequest,nullptr,intent),local->geometry().allocator().device,endpoints.probe);
     std::vector<std::shared_ptr<Local>> locals(originalLocals.begin(),originalLocals.end());
     for(std::uint32_t i=0;i<locals.size();++i)if(locals[i]!=local){
         const auto prefix=identity+"/request"+std::to_string(i),header=prefix+"/header",accepted=prefix+"/accepted",keys=prefix+"/keys",received=prefix+"/received";
         add(graph,header,std::make_unique<CompactTransfer>(arena,actual,locals[i],control,CompactWire::RequestHeader,CapturedTransferEndpoint::Consumer),geometry->coordinator().device,previous);
-        add(graph,accepted,std::make_unique<CompactMetadata>(arena,actual,locals[i],local,control,t::MetadataAction::AcceptRequestHeader),geometry->coordinator().device,header);
+        add(graph,accepted,std::make_unique<CompactMetadata>(arena,actual,locals[i],local,control,t::MetadataAction::AcceptRequestHeader,nullptr,intent),geometry->coordinator().device,header);
         auto payload=std::make_unique<CompactTransfer>(arena,actual,locals[i],control,CompactWire::MissKeys,CapturedTransferEndpoint::Consumer);const auto* receipt=payload.get();
         add(graph,keys,std::move(payload),geometry->coordinator().device,accepted);
-        add(graph,received,std::make_unique<CompactMetadata>(arena,actual,locals[i],local,control,t::MetadataAction::ConfirmRequestKeys,receipt),geometry->coordinator().device,keys);previous=received;
+        add(graph,received,std::make_unique<CompactMetadata>(arena,actual,locals[i],local,control,t::MetadataAction::ConfirmRequestKeys,receipt,intent),geometry->coordinator().device,keys);previous=received;
     }
     const auto unionReady=identity+"/compact_union";
-    auto unionStage=std::make_unique<CompactUnion>(actual,locals,control);auto query=unionStage->query();
+    auto unionStage=std::make_unique<CompactUnion>(actual,locals,tokens,control,intent);auto query=unionStage->query();
     add(graph,unionReady,std::move(unionStage),geometry->coordinator().device,previous);
     const auto pool=appendPooledImmutableCompactLookupGraph(graph,arena,actual->sourceBoundary(),actual,poolCode,std::move(query),
-        {actual,locals,localCode},control,unionReady,identity+"/pool");
+        {actual,locals,localCode,intent},control,unionReady,identity+"/pool");
     for(const auto& name:graph.getExecutionOrder()){const auto* node=graph.getNode(name);const auto* stage=node?dynamic_cast<const PooledImmutableLocalHotPhaseStage*>(node->stage.get()):nullptr;
         if(stage && stage->storage()==local && stage->action()==Action::AcceptResult){if(!endpoints.auxiliary.ready_publication.empty())throw std::logic_error("Combined source has duplicate local result acquisitions");endpoints.auxiliary.ready_publication=name;}}
-    const auto maintenance=appendLocalMaintenance(graph,arena,local,localCode,geometry->consumer(coordinate,local->consumerStorageIdentity()),control,pool.source.last,identity+"/local");
-    endpoints.consumed=maintenance.first;endpoints.retired=maintenance.second;
+    if(intent==q::PooledImmutableLocalHotAccessIntent::CurrentInvocation){
+        const auto maintenance=appendLocalMaintenance(graph,arena,local,localCode,geometry->consumer(coordinate,local->consumerStorageIdentity()),control,pool.source.last,identity+"/local");
+        endpoints.consumed=maintenance.first;endpoints.retired=maintenance.second;
+    }else endpoints.last=endpoints.retired=pool.source.last;
     endpoints.auxiliary=auxiliaryRange(graph,before,endpoints,RetainedGraphParticipantAuxiliaryRole::Source,geometry->coordinator().device);
+    if(intent==q::PooledImmutableLocalHotAccessIntent::FutureReadAhead){
+        endpoints.auxiliary.lifecycle=RetainedGraphParticipantAuxiliaryLifecycle::FutureProducer;
+        mix(endpoints.auxiliary.identity,static_cast<unsigned>(endpoints.auxiliary.lifecycle));
+    }
     return {std::move(endpoints),pool.retirement};
 }
+PooledImmutableLocalHotSourceBody appendPooledImmutableLocalHotSourceBody(ComputeGraph& graph,BufferArena& arena,
+    std::shared_ptr<const Transport> transport,std::span<const std::shared_ptr<Local>> locals,
+    std::shared_ptr<const q::IPooledImmutableNativeKernels> poolCode,std::shared_ptr<Local> local,
+    std::shared_ptr<const q::IPooledImmutableLocalHotKernels> localCode,DeviceRowRange tokens,q::PooledNativeTensorSpan ids,
+    std::optional<q::PooledNativeTensorSpan> count,DeviceGenerationControlBinding control,q::PooledNativeTensorSpan output,
+    const std::string& identity,const std::string& outputIdentity)
+{
+    return appendLocalHotSourceBody(graph,arena,std::move(transport),locals,std::move(poolCode),std::move(local),
+        std::move(localCode),tokens,std::move(ids),std::move(count),control,std::move(output),identity,outputIdentity,
+        q::PooledImmutableLocalHotAccessIntent::CurrentInvocation);
+}
+PooledImmutableLocalHotFutureSourceBody appendPooledImmutableLocalHotFutureSourceBody(ComputeGraph& graph,BufferArena& arena,
+    std::shared_ptr<const Transport> transport,std::span<const std::shared_ptr<Local>> locals,
+    std::shared_ptr<const q::IPooledImmutableNativeKernels> poolCode,std::shared_ptr<Local> local,
+    std::shared_ptr<const q::IPooledImmutableLocalHotKernels> localCode,DeviceRowRange tokens,q::PooledNativeTensorSpan ids,
+    std::optional<q::PooledNativeTensorSpan> count,DeviceGenerationControlBinding control,const std::string& identity)
+{
+    auto body=appendLocalHotSourceBody(graph,arena,std::move(transport),locals,std::move(poolCode),std::move(local),
+        std::move(localCode),tokens,std::move(ids),std::move(count),control,{},identity,{},
+        q::PooledImmutableLocalHotAccessIntent::FutureReadAhead);
+    return {body.local.probe,body.local.auxiliary.ready_publication,body.local.retired,
+        std::move(body.pool_retirement),std::move(body.local.auxiliary)};
+}
+
 namespace qwen4exp {
 PooledImmutableLocalHotGraphEndpoints PooledImmutableRetainedParticipants::appendLocalHotPLE(ComputeGraph& graph,BufferArena& arena,
     std::shared_ptr<const IPooledImmutableNativeKernels> poolCode,std::shared_ptr<Local> local,
@@ -784,19 +854,28 @@ PooledImmutableLocalHotGraphEndpoints PooledImmutableRetainedParticipants::appen
     graph.setRetainedParticipantAuxiliaryRange(body.local.auxiliary);
     return std::move(body.local);
 }
-PooledImmutableLocalHotGraphEndpoints PooledImmutableRetainedParticipants::appendLocalHotReader(ComputeGraph& graph,BufferArena& arena,
+PooledImmutableLocalHotGraphEndpoints PooledImmutableRetainedParticipants::appendLocalHotReaderBody(ComputeGraph& graph,BufferArena& arena,
     std::shared_ptr<Local> local,std::shared_ptr<const IPooledImmutableLocalHotKernels> localCode,
     DeviceGenerationControlBinding control,DeviceRowRange tokens,PooledNativeTensorSpan ids,PooledNativeTensorSpan output,
-    const std::string& identity,const std::string& outputIdentity,std::optional<PooledNativeTensorSpan> count)
+    const std::string& identity,const std::string& outputIdentity,std::optional<PooledNativeTensorSpan> count,
+    PooledImmutableLocalHotAccessIntent intent)
 {
     requireCurrent();const auto actual=transport();const auto& geometry=localHotGeometry();const auto coordinate=localCoordinate(*actual,local);
     if(!geometry || local->geometry().allocator()==geometry->coordinator())throw std::invalid_argument("Combined reader cannot impersonate original source");
     const auto device=local->geometry().allocator().device;std::set<std::string> before;for(const auto& name:graph.getExecutionOrder())before.insert(name);
     graph.setRetainedParticipantDefinitionDomain({geometry->coordinator().device,actual.get()});
-    auto endpoints=appendLocalMain(graph,arena,local,localCode,geometry->consumer(coordinate,local->consumerStorageIdentity()),control,tokens,
-        std::move(ids),std::move(count),std::move(output),identity,outputIdentity);
+    PooledImmutableLocalHotGraphEndpoints endpoints;
+    if(intent==PooledImmutableLocalHotAccessIntent::CurrentInvocation)
+        endpoints=appendLocalMain(graph,arena,local,localCode,geometry->consumer(coordinate,local->consumerStorageIdentity()),control,tokens,
+            std::move(ids),std::move(count),std::move(output),identity,outputIdentity);
+    else if(intent==PooledImmutableLocalHotAccessIntent::FutureReadAhead){
+        endpoints.probe=identity+"/future_probe";endpoints.first=endpoints.probe;
+        add(graph,endpoints.probe,std::make_unique<PooledImmutableLocalHotPhaseStage>(arena,local,localCode,Action::Probe,
+            PooledImmutableLocalHotOperands::query(*local,geometry->consumer(coordinate,local->consumerStorageIdentity()),
+                tokens,std::move(ids),std::move(count),control,intent)),device,{});
+    }else throw std::invalid_argument("Local reader has unknown immutable purpose");
     const auto request=identity+"/request",headerSent=identity+"/request_header_send",keysSent=identity+"/miss_keys_send";
-    add(graph,request,std::make_unique<CompactMetadata>(arena,actual,local,std::shared_ptr<Local>{},control,t::MetadataAction::PrepareRequest),device,endpoints.probe);
+    add(graph,request,std::make_unique<CompactMetadata>(arena,actual,local,std::shared_ptr<Local>{},control,t::MetadataAction::PrepareRequest,nullptr,intent),device,endpoints.probe);
     add(graph,headerSent,std::make_unique<CompactTransfer>(arena,actual,local,control,CompactWire::RequestHeader,CapturedTransferEndpoint::Producer),device,request);
     add(graph,keysSent,std::make_unique<CompactTransfer>(arena,actual,local,control,CompactWire::MissKeys,CapturedTransferEndpoint::Producer),device,headerSent);
     std::string previous=keysSent;const PooledImmutableRemoteTransport* physical=nullptr;
@@ -808,34 +887,268 @@ PooledImmutableLocalHotGraphEndpoints PooledImmutableRetainedParticipants::appen
         const auto owner=appendPooledImmutableInlineOwnerPrefix(graph,arena,*physical,ownerCode,identity+"/owner");
         graph.addDependency(owner.first,keysSent);previous=owner.last;
     }
-    PooledImmutableCompactConsumerCompletion consumer;consumer.transport=actual;consumer.local=local;consumer.requested=keysSent;
+    PooledImmutableCompactConsumerCompletion consumer;consumer.transport=actual;consumer.local=local;consumer.requested=keysSent;consumer.intent=intent;
     consumer.header_received=identity+"/result_header_receive";const auto headerAccepted=identity+"/result_header_accept";
     consumer.payload_received=identity+"/native_rows_receive";consumer.received=identity+"/native_rows_confirm";
     consumer.accepted=identity+"/local_accept";consumer.ack_sent=identity+"/ack_send";
     add(graph,consumer.header_received,std::make_unique<CompactTransfer>(arena,actual,local,control,CompactWire::ResultHeader,CapturedTransferEndpoint::Consumer),device,previous);
-    add(graph,headerAccepted,std::make_unique<CompactMetadata>(arena,actual,local,std::shared_ptr<Local>{},control,t::MetadataAction::AcceptResultHeader),device,consumer.header_received);
+    add(graph,headerAccepted,std::make_unique<CompactMetadata>(arena,actual,local,std::shared_ptr<Local>{},control,t::MetadataAction::AcceptResultHeader,nullptr,intent),device,consumer.header_received);
     auto payload=std::make_unique<CompactTransfer>(arena,actual,local,control,CompactWire::NativeRows,CapturedTransferEndpoint::Consumer);const auto* receipt=payload.get();
     add(graph,consumer.payload_received,std::move(payload),device,headerAccepted);
-    add(graph,consumer.received,std::make_unique<CompactMetadata>(arena,actual,local,std::shared_ptr<Local>{},control,t::MetadataAction::ConfirmResult,receipt),device,consumer.payload_received);
+    add(graph,consumer.received,std::make_unique<CompactMetadata>(arena,actual,local,std::shared_ptr<Local>{},control,t::MetadataAction::ConfirmResult,receipt,intent),device,consumer.payload_received);
     add(graph,consumer.accepted,std::make_unique<PooledImmutableLocalHotPhaseStage>(arena,local,localCode,Action::AcceptResult,
         PooledImmutableLocalHotOperands::result(*local,geometry->consumer(coordinate,local->consumerStorageIdentity()),actual->localHotOriginalRequest(device),control)),device,consumer.received);
     add(graph,consumer.ack_sent,std::make_unique<CompactTransfer>(arena,actual,local,control,CompactWire::Ack,CapturedTransferEndpoint::Producer),device,consumer.accepted);
     requirePooledCompactConsumerCompletion(graph,consumer);previous=consumer.ack_sent;
     if(physical)previous=appendPooledRetirementOwnerAfterCompactConsumer(graph,arena,physical->retirement,ownerCode,
         findPooledReadOwnerCompletion(graph,physical->read),identity+"/owner_retirement",consumer).last;
-    const auto maintenance=appendLocalMaintenance(graph,arena,local,localCode,geometry->consumer(coordinate,local->consumerStorageIdentity()),control,previous,identity+"/local");
-    endpoints.consumed=maintenance.first;endpoints.retired=maintenance.second;endpoints.auxiliary.ready_publication=consumer.accepted;
+    if(intent==PooledImmutableLocalHotAccessIntent::CurrentInvocation){
+        const auto maintenance=appendLocalMaintenance(graph,arena,local,localCode,geometry->consumer(coordinate,local->consumerStorageIdentity()),control,previous,identity+"/local");
+        endpoints.consumed=maintenance.first;endpoints.retired=maintenance.second;
+    }else endpoints.last=endpoints.retired=previous;
+    endpoints.auxiliary.ready_publication=consumer.accepted;
     endpoints.auxiliary=auxiliaryRange(graph,before,endpoints,RetainedGraphParticipantAuxiliaryRole::Reader,device);
+    if(intent==PooledImmutableLocalHotAccessIntent::FutureReadAhead){
+        endpoints.auxiliary.lifecycle=RetainedGraphParticipantAuxiliaryLifecycle::FutureProducer;
+        mix(endpoints.auxiliary.identity,static_cast<unsigned>(endpoints.auxiliary.lifecycle));
+    }
     endpoints.auxiliary.original_execution = originalExecutionPolicy();
     graph.setRetainedParticipantAuxiliaryRange(endpoints.auxiliary);return endpoints;
 }
+PooledImmutableLocalHotGraphEndpoints PooledImmutableRetainedParticipants::appendLocalHotReader(ComputeGraph& graph,BufferArena& arena,
+    std::shared_ptr<Local> local,std::shared_ptr<const IPooledImmutableLocalHotKernels> code,
+    DeviceGenerationControlBinding control,DeviceRowRange tokens,PooledNativeTensorSpan ids,PooledNativeTensorSpan output,
+    const std::string& identity,const std::string& outputIdentity,std::optional<PooledNativeTensorSpan> count)
+{
+    return appendLocalHotReaderBody(graph,arena,std::move(local),std::move(code),control,tokens,std::move(ids),std::move(output),
+        identity,outputIdentity,std::move(count),PooledImmutableLocalHotAccessIntent::CurrentInvocation);
+}
+PooledImmutableLocalHotFutureSourceBody PooledImmutableRetainedParticipants::appendLocalHotFuturePLE(
+    ComputeGraph& graph, BufferArena& arena, std::shared_ptr<const IPooledImmutableNativeKernels> poolCode,
+    std::shared_ptr<Local> local, std::shared_ptr<const IPooledImmutableLocalHotKernels> code,
+    DeviceRowRange tokens, PooledNativeTensorSpan ids, std::optional<PooledNativeTensorSpan> count,
+    DeviceGenerationControlBinding control, const std::string& identity)
+{
+    requireCurrent();
+    auto result = appendPooledImmutableLocalHotFutureSourceBody(graph, arena, transport(), localHotParticipants(),
+        std::move(poolCode), std::move(local), std::move(code), tokens, std::move(ids), std::move(count), control, identity);
+    bindSourcePlan(graph, arena, result.pool_retirement);
+    result.auxiliary.original_execution = originalExecutionPolicy();
+    graph.setRetainedParticipantAuxiliaryRange(result.auxiliary);
+    return result;
+}
+
+PooledImmutableLocalHotFutureProducerEndpoints PooledImmutableRetainedParticipants::appendLocalHotFutureReader(
+    ComputeGraph& graph, BufferArena& arena, std::shared_ptr<Local> local,
+    std::shared_ptr<const IPooledImmutableLocalHotKernels> code, DeviceGenerationControlBinding control,
+    DeviceRowRange tokens, PooledNativeTensorSpan ids, const std::string& identity,
+    std::optional<PooledNativeTensorSpan> count)
+{
+    auto result = appendLocalHotReaderBody(graph, arena, std::move(local), std::move(code), control, tokens,
+        std::move(ids), {}, identity, {}, std::move(count), PooledImmutableLocalHotAccessIntent::FutureReadAhead);
+    return {result.probe, result.auxiliary.ready_publication, result.retired, std::move(result.auxiliary)};
+}
+
+std::string PooledImmutableRetainedParticipants::appendLocalHotAdoptionCheck(
+    ComputeGraph& graph, BufferArena& arena, std::shared_ptr<Local> local,
+    std::shared_ptr<const IPooledImmutableLocalHotKernels> code, DeviceGenerationControlBinding control,
+    DeviceRowRange tokens, PooledNativeTensorSpan ids, std::optional<PooledNativeTensorSpan> count,
+    const std::string& identity)
+{
+    requireCurrent();
+    const auto actual = transport();
+    const auto coordinate = localCoordinate(*actual, local);
+    const auto device = local->geometry().allocator().device;
+    add(graph, identity, std::make_unique<PooledImmutableLocalHotPhaseStage>(arena, local, code, Action::Adopt,
+        PooledImmutableLocalHotOperands::adoption(*local,
+            actual->localHotGeometry()->consumer(coordinate, local->consumerStorageIdentity()), tokens,
+            std::move(ids), std::move(count), actual->localHotAdmission(device), control)), device, {});
+    return identity;
+}
+
+std::string PooledImmutableRetainedParticipants::appendLocalHotPredictionMissRetirement(
+    ComputeGraph& graph, BufferArena& arena, std::shared_ptr<Local> local,
+    std::shared_ptr<const IPooledImmutableLocalHotKernels> code, DeviceGenerationControlBinding control,
+    const std::string& adoptionCheck, const std::string& identity)
+{
+    requireCurrent();
+    const auto actual = transport();
+    const auto coordinate = localCoordinate(*actual, local);
+    const auto device = local->geometry().allocator().device;
+    const auto& node = actualNode(graph, adoptionCheck, device);
+    const auto* adoption = dynamic_cast<const PooledImmutableLocalHotPhaseStage*>(node.stage.get());
+    if (!adoption || adoption->storage() != local || adoption->action() != Action::Adopt ||
+        adoption->operands().controllerIdentity() != control.captureIdentity() || !code ||
+        adoption->codeIdentity() != code->codeIdentity() || graph.retainedParticipantSourcePlan() ||
+        graph.retainedParticipantAuxiliaryRange())
+        throw std::invalid_argument("Prediction-miss retirement requires its actual selected complete-demand adoption");
+    add(graph, identity, std::make_unique<PooledImmutableLocalHotPhaseStage>(arena, local, code, Action::Retire,
+        PooledImmutableLocalHotOperands::frame(*local,
+            actual->localHotGeometry()->consumer(coordinate, local->consumerStorageIdentity()), control)),
+        device, adoptionCheck);
+    return identity;
+}
+
+PooledImmutableLocalHotConsumerEndpoints PooledImmutableRetainedParticipants::appendLocalHotConsumer(
+    ComputeGraph& graph, BufferArena& arena, std::shared_ptr<Local> local,
+    std::shared_ptr<const IPooledImmutableLocalHotKernels> code, DeviceGenerationControlBinding control,
+    PooledImmutableLocalHotConsumerBranch branch, std::optional<PooledNativeTensorSpan> output,
+    const std::string& identity, const std::string& outputIdentity)
+{
+    requireCurrent();
+    const auto actual = transport();
+    const auto coordinate = localCoordinate(*actual, local);
+    const auto device = local->geometry().allocator().device;
+    const auto geometry = actual->localHotGeometry()->consumer(coordinate, local->consumerStorageIdentity());
+    graph.setRetainedParticipantDefinitionDomain({actual->localHotGeometry()->coordinator().device, actual.get()});
+    std::set<std::string> before;
+    for (const auto& name : graph.getExecutionOrder()) before.insert(name);
+    PooledImmutableLocalHotGraphEndpoints e;
+    if (branch == PooledImmutableLocalHotConsumerBranch::Accepted)
+    {
+        if (!output) throw std::invalid_argument("Accepted local consumer requires its actual sole output");
+        e.ready_wait = identity + "/ready";
+        e.read = outputIdentity;
+        e.first = e.ready_wait;
+        e.last = e.read;
+        add(graph, e.ready_wait, std::make_unique<PooledImmutableLocalHotReadyStage>(
+            local, PooledImmutableLocalHotReadyStage::Frontier::DataReady), device, {});
+        add(graph, e.read, std::make_unique<PooledImmutableLocalHotPhaseStage>(arena, local, code, Action::LocalRead,
+            PooledImmutableLocalHotOperands::read(*local, geometry, std::move(*output), control)), device, e.ready_wait);
+        // Maintenance forks after the actual read fragment, never a fabricated new Probe.
+        e.probe = e.read;
+        const auto maintenance = appendLocalMaintenance(graph, arena, local, code, geometry, control, e.read, identity);
+        e.consumed = maintenance.first;
+        e.retired = maintenance.second;
+    }
+    else if (branch == PooledImmutableLocalHotConsumerBranch::Discard)
+    {
+        if (output) throw std::invalid_argument("Discard cannot declare a model output");
+        e.first = e.last = e.probe = identity + "/discard";
+        e.retired = identity + "/retired";
+        add(graph, e.probe, std::make_unique<PooledImmutableLocalHotPhaseStage>(arena, local, code, Action::Discard,
+            PooledImmutableLocalHotOperands::frame(*local, geometry, control)), device, {});
+        add(graph, e.retired, std::make_unique<PooledImmutableLocalHotPhaseStage>(arena, local, code, Action::Retire,
+            PooledImmutableLocalHotOperands::frame(*local, geometry, control)), device, e.probe);
+    }
+    else throw std::invalid_argument("Local consumer branch is unknown");
+    auto range = auxiliaryRange(graph, before, e, device == actual->localHotGeometry()->coordinator().device
+        ? RetainedGraphParticipantAuxiliaryRole::Source : RetainedGraphParticipantAuxiliaryRole::Reader, device);
+    range.lifecycle = branch == PooledImmutableLocalHotConsumerBranch::Accepted
+        ? RetainedGraphParticipantAuxiliaryLifecycle::AdoptedConsumer
+        : RetainedGraphParticipantAuxiliaryLifecycle::DiscardedConsumer;
+    mix(range.identity, static_cast<unsigned>(range.lifecycle));
+    range.original_execution = originalExecutionPolicy();
+    bindLocalConsumption(graph, arena, local, range);
+    return {e.first, e.last, e.retired, *graph.retainedParticipantAuxiliaryRange()};
+}
+
 } // namespace qwen4exp
+namespace {
+/** @brief Authenticate the shared immutable Probe/acquisition/controller tuple for a real producer. */
+void requireFutureProducer(const ComputeGraph& graph,const RetainedGraphParticipantAuxiliaryRange& range,
+    const std::shared_ptr<const Transport>& transport,const std::shared_ptr<Local>& local)
+{
+    const auto device=local->geometry().allocator().device;
+    const auto& probeNode=actualNode(graph,range.probe_ready,device);
+    const auto* probe=dynamic_cast<const PooledImmutableLocalHotPhaseStage*>(probeNode.stage.get());
+    const auto& acquiredNode=actualNode(graph,range.ready_publication,device);
+    const auto* acquired=dynamic_cast<const PooledImmutableLocalHotPhaseStage*>(acquiredNode.stage.get());
+    if(!probe || probe->storage()!=local || probe->action()!=Action::Probe ||
+       probe->operands().queryIntent()!=q::PooledImmutableLocalHotAccessIntent::FutureReadAhead || !acquired || acquired->storage()!=local ||
+       acquired->action()!=Action::AcceptResult || probe->operands().controllerIdentity()!=acquired->operands().controllerIdentity() ||
+       !range.main_read.empty() || range.nodes.back()!=range.retirement)
+        throw std::invalid_argument("Future producer changed its actual Probe/acquisition or invented model consumption");
+    for(const auto& name:range.nodes){
+        const auto& node=actualNode(graph,name,device);
+        if(const auto* phase=dynamic_cast<const PooledImmutableLocalHotPhaseStage*>(node.stage.get()))
+            if(phase->storage()!=local || phase->action()!=Action::AcceptResult)
+                throw std::invalid_argument("Future producer cannot consume/read/fill/retire the retained local frame");
+        if(dynamic_cast<const PooledImmutableLocalHotReadyStage*>(node.stage.get()))
+            throw std::invalid_argument("Future producer cannot wait for a later local model consumer");
+        if(const auto* metadata=dynamic_cast<const CompactMetadata*>(node.stage.get()))
+            if(metadata->intent()!=q::PooledImmutableLocalHotAccessIntent::FutureReadAhead)
+                throw std::invalid_argument("Future producer metadata changed its immutable lookup-only purpose");
+        if(const auto* joined=dynamic_cast<const CompactUnion*>(node.stage.get()))
+            if(joined->intent()!=q::PooledImmutableLocalHotAccessIntent::FutureReadAhead)
+                throw std::invalid_argument("Future producer union changed its immutable lookup-only purpose");
+    }
+    if(range.role==RetainedGraphParticipantAuxiliaryRole::Source){
+        const auto* retired=dynamic_cast<const PooledImmutableSourcePhaseStage*>(actualNode(graph,range.retirement,device).stage.get());
+        if(!retired || !retired->matchesDemand(transport->sourceBoundary().get(),q::PooledSourceAction::ObserveRetired))
+            throw std::invalid_argument("Future source omitted its actual original pool/source retirement");
+    }else{
+        const auto consumer=findPooledCompactConsumerCompletion(graph,transport,local);
+        if(consumer.intent!=q::PooledImmutableLocalHotAccessIntent::FutureReadAhead || consumer.accepted!=range.ready_publication)
+            throw std::invalid_argument("Future reader substituted its original result/ACK purpose");
+        auto expected=consumer.ack_sent;
+        const auto& owners=transport->sourceBoundary()->pooledStorage()->originalOwners();
+        for(std::uint32_t i=0;i<owners.size();++i)if(owners[i]->plan().allocator()==local->geometry().allocator())
+            expected=findPooledRetirementOwnerAfterCompactConsumer(graph,transport->remote(i).retirement,consumer);
+        if(expected!=range.retirement)throw std::invalid_argument("Future reader omitted actual ACK/inline-owner retirement");
+    }
+}
+}
+void requirePooledLocalHotLocalConsumption(const ComputeGraph& graph,const RetainedGraphParticipantAuxiliaryRange& range,
+    const std::shared_ptr<qwen4exp::PooledImmutableLocalHotPreparedStorage>& local)
+{
+    using Lifecycle=RetainedGraphParticipantAuxiliaryLifecycle;
+    if(!local || !localConsumptionOnly(range.lifecycle) || graph.retainedParticipantSourcePlan() ||
+       !range.local_consumption || !range.ready_publication.empty() || range.nodes.empty())
+        throw std::invalid_argument("Local consumption cannot claim new source execution or response acquisition");
+    const auto device=local->geometry().allocator().device;
+    const auto& anchorNode=actualNode(graph,range.probe_ready,device);
+    const auto* anchor=dynamic_cast<const PooledImmutableLocalHotPhaseStage*>(anchorNode.stage.get());
+    const bool accepted=range.lifecycle==Lifecycle::AdoptedConsumer;
+    if(!anchor || anchor->storage()!=local || anchor->action()!=(accepted?Action::LocalRead:Action::Discard) ||
+       (accepted ? range.main_read!=range.probe_ready : !range.main_read.empty()))
+        throw std::invalid_argument("Local consumption substituted actual selected read/discard branch");
+    const auto controller=anchor->operands().controllerIdentity();
+    std::string previous=range.retirement;std::vector<std::string> reverse;
+    const auto phase=[&](Action action){
+        const auto& node=actualNode(graph,previous,device);
+        const auto* actual=dynamic_cast<const PooledImmutableLocalHotPhaseStage*>(node.stage.get());
+        if(!actual || actual->storage()!=local || actual->action()!=action ||
+           actual->codeIdentity()!=anchor->codeIdentity() || actual->operands().controllerIdentity()!=controller || node.dependencies.size()!=1)
+            throw std::invalid_argument("Local consumption changed its actual policy/fill/retirement chain");
+        reverse.push_back(previous);previous=node.dependencies.front();
+    };
+    phase(Action::Retire);
+    if(accepted){
+        phase(Action::CompleteFills);phase(Action::CopyFills);phase(Action::ConsumeDemand);
+        const auto& waitNode=actualNode(graph,previous,device);
+        const auto* wait=dynamic_cast<const PooledImmutableLocalHotReadyStage*>(waitNode.stage.get());
+        if(!wait || wait->storage()!=local || wait->frontier()!=PooledImmutableLocalHotReadyStage::Frontier::LocalReadComplete ||
+           waitNode.dependencies.size()!=1 || waitNode.dependencies.front()!=range.probe_ready)
+            throw std::invalid_argument("Local policy must follow the actual local read-complete frontier");
+        reverse.push_back(previous);
+        const auto& read=actualNode(graph,range.main_read,device);
+        if(read.dependencies.size()!=1)throw std::invalid_argument("Adopted read lost its actual data-ready wait");
+        const auto* ready=dynamic_cast<const PooledImmutableLocalHotReadyStage*>(actualNode(graph,read.dependencies.front(),device).stage.get());
+        if(!ready || ready->storage()!=local || ready->frontier()!=PooledImmutableLocalHotReadyStage::Frontier::DataReady)
+            throw std::invalid_argument("Adopted local read changed its actual retained data-ready frontier");
+    }else if(previous!=range.probe_ready)
+        throw std::invalid_argument("Discard retirement must follow its actual unconsumed-frame discard");
+    std::reverse(reverse.begin(),reverse.end());
+    if(reverse!=range.nodes)throw std::invalid_argument("Local-only body omitted, duplicated or added a source/transport stage");
+}
 void requirePooledLocalHotAuxiliary(const ComputeGraph& graph,const RetainedGraphParticipantAuxiliaryRange& range,
     const std::shared_ptr<const Transport>& transport,const std::shared_ptr<Local>& local)
 {
     if(!transport || !local)throw std::invalid_argument("Local-hot auxiliary lost original transport/local roots");
     const auto coordinate=localCoordinate(*transport,local);const auto& geometry=*transport->localHotGeometry();const auto device=local->geometry().allocator().device;
     const auto domain=graph.retainedParticipantDefinitionDomain();
+    if(range.lifecycle==RetainedGraphParticipantAuxiliaryLifecycle::FutureProducer){
+        if(!domain || *domain!=RetainedGraphParticipantDefinitionDomain{geometry.coordinator().device,transport.get()} ||
+           range.participant!=device || (range.role==RetainedGraphParticipantAuxiliaryRole::Source)!=(device==geometry.coordinator().device))
+            throw std::invalid_argument("Future producer changed actual source/domain/participant role");
+        requireFutureProducer(graph,range,transport,local);return;
+    }
+    if(localConsumptionOnly(range.lifecycle)){
+        requirePooledLocalHotLocalConsumption(graph,range,local);return;
+    }
+    if(range.lifecycle!=RetainedGraphParticipantAuxiliaryLifecycle::CurrentDemand)
+        throw std::invalid_argument("Local auxiliary has unknown lifecycle");
     if(!domain || *domain!=RetainedGraphParticipantDefinitionDomain{geometry.coordinator().device,transport.get()} || range.participant!=device ||
         (range.role==RetainedGraphParticipantAuxiliaryRole::Source)!=(local->geometry().allocator()==geometry.coordinator()) ||
         range.nodes.empty() || range.nodes.back()!=range.retirement || !range.identity)

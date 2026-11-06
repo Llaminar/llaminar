@@ -481,6 +481,8 @@ def paired_fixture(root):
     t['expected_config']['configuration']['model_path']=c['manifest']['source']['shards'][0]['path']
     t['expected_config']['configuration']['shared_predictor']=None
     t['expected_config']['configuration']['max_seq_len']=4096
+    t['expected_config']['configuration']['prefix_cache']=dict(enabled=False)
+    t['engine_argv'].append('--no-prefix-cache')
     t['runtime_config_digest']=metadata_digest(t['expected_config'])
     documents={'workload':c['manifest'], 'catalog':{'schema':2,'manifest_digest':metadata_digest(c['manifest'])},
                'pilot':absolute_pilot(c['manifest']), 'benchmark':{'scope':'synthetic-unexecuted-obligation'}}
@@ -714,7 +716,7 @@ class PairedCorpusExecutionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);c,t,exact,record=paired_fixture(root)
             selected=self.selection(root,c,exact,record)
-            expected=['--no-mtp','-m',record['model'],'--context-length','4096']
+            expected=['--no-mtp','--no-prefix-cache','-m',record['model'],'--context-length','4096']
             self.assertEqual(selected.canonical_arguments,expected)
             self.assertEqual(record['diagnostic_benchmark']['args'],['--no-mtp'])
             observed=dict(schema='llaminar.model-kld-described-config.v1',engine_argv=t['engine_argv'],

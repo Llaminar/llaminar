@@ -1443,36 +1443,54 @@ namespace llaminar2
     }
 
     bool HIPGraphCapture::appendFiniteBodyAfterCapturedFragment(
-        const IGPUGraphCapture& producer,const IGPUGraphCapture& body)
+        const IGPUGraphCapture& producer, const IGPUGraphCapture& body)
     {
-        if(!activateOwner("appendFiniteBodyAfterCapturedFragment") || !graph_ || exec_ ||
-           !node_count_ || native_capture_active_)return false;
-        const auto* original=dynamic_cast<const HIPGraphCapture*>(&producer);
-        const auto* auxiliary=dynamic_cast<const HIPGraphCapture*>(&body);
-        if(!original || !auxiliary || original==this || auxiliary==this || original==auxiliary ||
-           original->deviceOrdinal()!=device_ordinal_ || auxiliary->deviceOrdinal()!=device_ordinal_ ||
-           original->projection_owner_!=projection_owner_ || auxiliary->projection_owner_!=projection_owner_ ||
-           !original->graph() || !auxiliary->graph() || auxiliary->graph()==graph_ ||
-           !original->nodeCount() || !auxiliary->nodeCount() ||
-           original->hasExecutable() || auxiliary->hasExecutable() ||
-           original->native_capture_active_ || auxiliary->native_capture_active_)return false;
-        const auto frontier=fragment_frontiers_.require(original,original->definition_scope_,original->graph(),original->nodeCount());
-        if(frontier.empty() || fragment_frontiers_.alreadyAttached(auxiliary,auxiliary->definitionScope(),auxiliary->graph()))
-            return false;
-        // The auxiliary waits only for its producing main unit. It is another
-        // final-parent terminal: joining it to the producer exit would prevent
-        // a later main LocalRead unit from releasing its maintenance wait.
-        const auto result=detail::appendNativeFiniteBodyAfterFrontier<HIPParallelGraphAPI>(graph_,auxiliary->graph(),frontier);
-        if(result.error!=hipSuccess){
-            LOG_ERROR("[HIPGraphCapture] Finite producer attachment failed operation="<<result.operation
-                      <<" error="<<hipGetErrorString(result.error));
+        const std::array<const IGPUGraphCapture*, 1> producers{&producer};
+        return appendFiniteBodyAfterCapturedFragment(producers, body);
+    }
+
+    bool HIPGraphCapture::appendFiniteBodyAfterCapturedFragment(
+        std::span<const IGPUGraphCapture* const> producers, const IGPUGraphCapture& body)
+    {
+        if (!activateOwner("appendFiniteBodyAfterCapturedFragment") || !graph_ || exec_ ||
+            !node_count_ || native_capture_active_ || producers.empty()) return false;
+        const auto* auxiliary = dynamic_cast<const HIPGraphCapture*>(&body);
+        if (!auxiliary || auxiliary == this || auxiliary->deviceOrdinal() != device_ordinal_ ||
+            auxiliary->projection_owner_ != projection_owner_ || !auxiliary->graph() ||
+            auxiliary->graph() == graph_ || !auxiliary->nodeCount() || auxiliary->hasExecutable() ||
+            auxiliary->native_capture_active_ ||
+            fragment_frontiers_.alreadyAttached(auxiliary, auxiliary->definitionScope(), auxiliary->graph())) return false;
+
+        using Definition = typename decltype(fragment_frontiers_)::Definition;
+        std::vector<Definition> original_definitions;
+        for (const auto* producer : producers)
+        {
+            const auto* original = dynamic_cast<const HIPGraphCapture*>(producer);
+            if (!original || original == this || original == auxiliary ||
+                original->deviceOrdinal() != device_ordinal_ || original->projection_owner_ != projection_owner_ ||
+                !original->graph() || !original->nodeCount() || original->hasExecutable() ||
+                original->native_capture_active_) return false;
+            original_definitions.push_back({original, original->definition_scope_, original->graph(), original->nodeCount()});
+        }
+        const auto frontier = fragment_frontiers_.requireJoined(original_definitions);
+        if (frontier.empty()) return false;
+        // Only these exact original exits gate the new body. Existing later
+        // main units remain independent; normal parent completion joins every
+        // finite child. Retaining the actual child exit permits the next body
+        // to join prior local Retire with genuine accepted-history publication.
+        const auto result = detail::appendNativeFiniteBodyAfterFrontier<HIPParallelGraphAPI>(graph_, auxiliary->graph(), frontier);
+        if (result.error != hipSuccess)
+        {
+            LOG_ERROR("[HIPGraphCapture] Finite producer attachment failed operation=" << result.operation
+                      << " error=" << hipGetErrorString(result.error));
             return false;
         }
         definition_scope_.reset();
-        fragment_frontiers_.attached(auxiliary,auxiliary->definitionScope(),auxiliary->graph());
-        std::size_t count=0;
-        if(hipGraphGetNodes(graph_,nullptr,&count)!=hipSuccess)return false;
-        node_count_=count;
+        fragment_frontiers_.attached(auxiliary, auxiliary->definitionScope(), auxiliary->graph(),
+            auxiliary->nodeCount(), result.appended_exit);
+        std::size_t count = 0;
+        if (hipGraphGetNodes(graph_, nullptr, &count) != hipSuccess) return false;
+        node_count_ = count;
         return true;
     }
 

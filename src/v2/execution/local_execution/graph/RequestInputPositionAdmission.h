@@ -12,10 +12,20 @@
 #include "DeviceDecodePositionBinding.h"
 #include <cstdint>
 #include <optional>
+#include <limits>
 #include <stdexcept>
 
 namespace llaminar2
 {
+/**
+ * @brief Immutable original request-position requirement declared by a retained graph family.
+ * Every request ingress enforces this same requirement before publication. It
+ * carries no request content, cursor, captured proof or execution permission.
+ */
+enum class RequestInputPositionLayoutRequirement : std::uint8_t {
+    Existing, ///< Preserve original host-absolute/scalar-decode admission behavior.
+    ContiguousSingleRequestPrefill ///< Require authored contiguous rows; never a scalar decode snapshot.
+};
 /** @brief Exact position producer for one host-token admission transaction. */
 class RequestInputPositionAdmission final
 {
@@ -31,19 +41,24 @@ public:
      * @param totalRows Physical token count in this transaction.
      * @param requests Independent request count.
      * @param rowsPerRequest Physical request stride.
+     * @param layout Immutable retained-family requirement, enforced anew on every ingress.
      * @return Immutable upload/padding policy for the validated producer.
      * @throws std::invalid_argument For missing, competing, foreign or nonscalar snapshot authority.
      */
     static RequestInputPositionAdmission bind(const int *hostRows,
         std::optional<DeviceDecodePositionBinding> snapshot,IBackend *backend,
         const std::int32_t *canonicalCount,std::int32_t *requestPositions,
-        int totalRows,int requests,int rowsPerRequest)
+        int totalRows,int requests,int rowsPerRequest,
+        RequestInputPositionLayoutRequirement layout=RequestInputPositionLayoutRequirement::Existing)
     {
+        if(layout!=RequestInputPositionLayoutRequirement::Existing &&
+            layout!=RequestInputPositionLayoutRequirement::ContiguousSingleRequestPrefill)
+            throw std::invalid_argument("Request position admission has an unknown retained layout requirement");
         if(!backend || !requestPositions || totalRows<=0 || requests<=0 || rowsPerRequest<=0 ||
             std::int64_t(requests)*rowsPerRequest!=totalRows)
             throw std::invalid_argument("Request position admission requires exact native ownership and geometry");
         if(snapshot) {
-            if(hostRows || totalRows!=1 || requests!=1 || rowsPerRequest!=1 ||
+            if(layout!=RequestInputPositionLayoutRequirement::Existing || hostRows || totalRows!=1 || requests!=1 || rowsPerRequest!=1 ||
                 !snapshot->valid() || snapshot->backend!=backend || !canonicalCount ||
                 snapshot->cached_tokens!=canonicalCount || snapshot->position!=requestPositions)
                 throw std::invalid_argument("Request decode position admission requires one exact canonical captured snapshot and no host position rows");
@@ -51,6 +66,17 @@ public:
         }
         if(!hostRows)
             throw std::invalid_argument("Request position admission is missing its explicit host rows or captured snapshot");
+        if(layout==RequestInputPositionLayoutRequirement::ContiguousSingleRequestPrefill){
+            if(requests!=1 || hostRows[0]<0)
+                throw std::invalid_argument("Future prefill requires one original contiguous host-position ingress");
+            // Validate only the explicitly selected family. Legacy absolute
+            // rows remain unrestricted and incur no new scan or policy change.
+            for(int index=0;index<totalRows;++index){
+                const auto expected=std::int64_t(hostRows[0])+index;
+                if(expected>std::numeric_limits<std::int32_t>::max() || hostRows[index]!=expected)
+                    throw std::invalid_argument("Future prefill host positions are not a contiguous non-overflowing original request");
+            }
+        }
         return RequestInputPositionAdmission(Source::HostAbsoluteRows);
     }
     /** @return The sole authenticated producer, independent of live device contents. */

@@ -31070,6 +31070,13 @@ add_v2_test(V2_Integration_CpuAdaptiveImmutableRowCache
     COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives> --gtest_filter=CpuAdaptiveImmutableRowCache.*
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Loaders;Storage;Ownership;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30 ENVIRONMENT ${QFN_HOST_ADAPTIVE_CPU_ENV})
+# Actual source/coordinator purpose replay; future graph/model enablement is separate.
+add_v2_test(V2_Integration_ImmutableFutureLookupOnlySourceReplay
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+        --gtest_filter=PooledImmutableCoordinator.FutureLookupOnlyRetainsPinsAndNeverMutatesDemandPolicy:PooledImmutableCoordinator.FutureCompactWireRequiresPurposeAndExactPartialExtents:PooledImmutableNative.FutureLookupOnlySourceEmitsZeroTokenOriginalNativeReads:PooledImmutableNative.FutureBeginRequiresMatchingOriginalCompactUnion:PooledImmutableNative.FutureSourcePackRequiresActualUnionAndFramePurpose:ImmutableLookupSubordinate.FutureLookupOnly*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Loaders;Storage;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30 ENVIRONMENT ${QFN_HOST_ADAPTIVE_CPU_ENV})
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ImmutableFutureLookupOnlySourceReplay)
 # Explicit preparation-read regression; this does not qualify future transport.
 add_v2_test(V2_Integration_CpuImmutableLookupOnlyReplay
     COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
@@ -38379,3 +38386,11 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2NativeHostAbortTests.cmake")
 
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2NativeCollectiveOwnedErrorTests.cmake")
+
+# Actual borrowed-window Hash/count primitive; no future model mode is enabled.
+add_v2_test(V2_Integration_Qwen4ExpPrefillNextWindowReplay
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+        --gtest_filter=Qwen4ExpPrimitives.PrefillNextWindow*:Qwen4ExpPrimitiveStage.PrefillNextWindow* --gtest_repeat=20
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Qwen4Exp;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30 ENVIRONMENT ${QFN_HOST_ADAPTIVE_CPU_ENV})
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpPrefillNextWindowReplay)

@@ -11,6 +11,7 @@
  */
 #pragma once
 
+#include "Qwen4ExpPrefillNextTokenWindow.h"
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -118,6 +119,15 @@ struct NgramHashArgs
     NgramHashPolicy policy; ///< Authenticated checkpoint constants.
 };
 
+/** @brief Separate next-window primitive; contiguous Hash arguments and dispatch stay unchanged. */
+struct NgramNextWindowHashArgs {
+    RowExtent extent; ///< Admitted next-bucket output bound, with no competing live count.
+    const std::int32_t* tokens=nullptr; ///< Same complete original request bank as window.request_tokens.
+    const std::int32_t* priorTokens=nullptr; ///< Actual accepted two-token history.
+    std::int64_t* output=nullptr; ///< Existing packed sixteen-head output bank.
+    NgramHashPolicy policy; ///< Unchanged authenticated integer policy.
+    Qwen4ExpPrefillNextTokenWindow nextWindow; ///< Explicit original source/count view.
+};
 /** @brief PLE similarity and shared-value gating after existing branch norm bridges.
  * @details The 256 fixed arithmetic lanes and ascending binary reduction tree
  * are independent of row count, scheduling, CPU worker count and GPU warp size.
@@ -228,6 +238,12 @@ public:
      * @throws std::invalid_argument For missing operands or invalid static geometry.
      */
     virtual void ngramHash(const NgramHashArgs &args, void *stream) const = 0;
+    /** @brief Hash the original next chunk without changing contiguous dispatch or copying tokens/counts.
+     * @param args Exact borrowed next-window, accepted prior, output bound and hash policy.
+     * @param stream Exact non-default GPU stream; CPU reads only its host-owned inputs.
+     * @throws std::invalid_argument For malformed declarations or CPU live windows; GPU malformed live values fail fatally.
+     */
+    virtual void ngramHashNextWindow(const NgramNextWindowHashArgs& args,void* stream)const=0;
     /** @brief Compute signed-square-root similarity gates with a fixed reduction order.
      * @param args Complete immutable operand and admitted-geometry binding.
      * @param stream Exact non-default GPU stream; ignored by the CPU implementation.

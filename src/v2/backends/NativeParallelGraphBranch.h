@@ -38,6 +38,40 @@ namespace llaminar2::detail
     class NativeCapturedFragmentFrontiers final
     {
     public:
+        /** @brief Immutable original recording coordinates; this view grants no native ownership. */
+        struct Definition final {
+            const void* original;
+            std::shared_ptr<const void> lifetime;
+            Graph source;
+            std::size_t source_nodes;
+        };
+        /**
+         * @brief Authenticate all original dependencies and join their exact distinct native exits.
+         * @param definitions Nonempty original main/finite definitions owned by this parent's mapping.
+         * @return Their actual parent exits, or empty for null, repeated, stale, foreign or ambiguous input.
+         * This allocates cold graph metadata only, never a live execution ledger or an event.
+         */
+        std::vector<Node> requireJoined(std::span<const Definition> definitions) const
+        {
+            std::vector<Node> result;
+            if (definitions.empty()) return result;
+            for (std::size_t i = 0; i < definitions.size(); ++i)
+            {
+                const auto& definition = definitions[i];
+                if (!definition.original) return {};
+                for (std::size_t prior = 0; prior < i; ++prior)
+                    if (definitions[prior].original == definition.original) return {};
+                const auto exits = require(definition.original, definition.lifetime,
+                    definition.source, definition.source_nodes);
+                if (exits.empty()) return {};
+                for (const auto exit : exits)
+                {
+                    if (!exit || std::find(result.begin(), result.end(), exit) != result.end()) return {};
+                    result.push_back(exit);
+                }
+            }
+            return result;
+        }
         /** @brief Save one actual import after its original native lowering succeeds. */
         void remember(const void* original, const std::shared_ptr<const void>& lifetime,
                       Graph source, std::size_t source_nodes, std::span<const Node> exits)
@@ -48,26 +82,47 @@ namespace llaminar2::detail
         std::span<const Node> require(const void* original,
             const std::shared_ptr<const void>& lifetime, Graph source, std::size_t source_nodes) const
         {
-            const Entry* found=nullptr;
-            for(const auto& entry:entries_) {
-                if(entry.original!=original)continue;
-                if(found)return {};
-                found=&entry;
-            }
-            if(!found || !lifetime || !source || !source_nodes || found->source!=source || found->source_nodes!=source_nodes ||
-               !sameLifetime(found->lifetime,lifetime))return {};
-            return found->exits;
+            if (!original || !lifetime || !source || !source_nodes) return {};
+            bool found = false, ambiguous = false;
+            std::span<const Node> result;
+            // Both rosters use the same original-identity validation. A finite
+            // body has exactly one actual child exit; it needs no heap vector.
+            const auto inspect = [&](const auto& roster) {
+                for (const auto& entry : roster)
+                {
+                    if (entry.original != original) continue;
+                    if (found) { ambiguous = true; continue; }
+                    found = true;
+                    if (entry.source == source && entry.source_nodes == source_nodes &&
+                        sameLifetime(entry.lifetime, lifetime)) result = std::span<const Node>(entry.exits);
+                }
+            };
+            inspect(entries_);
+            inspect(attached_);
+            return ambiguous ? std::span<const Node>{} : result;
         }
         /** @return Whether this exact auxiliary definition already belongs to this parent. */
         bool alreadyAttached(const void* original,const std::shared_ptr<const void>& lifetime,Graph source) const
         {
-            for(const auto& entry:attached_)
-                if(entry.original==original || (entry.source==source && sameLifetime(entry.lifetime,lifetime)))return true;
-            return false;
+            const auto contains = [&](const auto& roster) {
+                for (const auto& entry : roster)
+                    if (entry.original == original ||
+                        (entry.source == source && sameLifetime(entry.lifetime, lifetime))) return true;
+                return false;
+            };
+            return contains(entries_) || contains(attached_);
         }
-        /** @brief Retain the exact auxiliary identity only after native attachment succeeds. */
-        void attached(const void* original,const std::shared_ptr<const void>& lifetime,Graph source)
-        {attached_.push_back({original,lifetime,source,0,{}});}
+        /**
+         * @brief Retain an actual successfully appended child as another original parent frontier.
+         * @param original Exact original finite definition. @param lifetime Same live recording scope.
+         * @param source Original graph handle. @param source_nodes Exact original body node count.
+         * @param exit Actual SDK child node in this parent, returned by the native append helper.
+         * Its completion joins every terminal inside the original finite body.
+         * It is not the body's last kernel or a guessed main-fragment exit.
+         */
+        void attached(const void* original, const std::shared_ptr<const void>& lifetime,
+                      Graph source, std::size_t source_nodes, Node exit)
+        {attached_.push_back({original,lifetime,source,source_nodes,{exit}});}
         /** @brief Invalidate all associations when the original parent resets. */
         void clear() noexcept {entries_.clear();attached_.clear();}
     private:
@@ -79,6 +134,20 @@ namespace llaminar2::detail
             std::size_t source_nodes;
             std::vector<Node> exits;
         };
+        /**
+         * @brief One actual finite child exit, inline in the existing attached-definition roster.
+         * Unlike a main import, an appended SDK child is exactly one parent node.
+         * Removing the old empty vector leaves no additional retained allocation.
+         */
+        struct FiniteEntry {
+            const void* original;
+            std::weak_ptr<const void> lifetime;
+            Graph source;
+            std::size_t source_nodes;
+            std::array<Node,1> exits;
+        };
+        static_assert(sizeof(FiniteEntry) <= sizeof(Entry),
+            "Retained finite frontier must fit its original cold mapping envelope");
         /** @return Same still-live original shared control block. */
         static bool sameLifetime(const std::weak_ptr<const void>& weak,
                                  const std::shared_ptr<const void>& expected)
@@ -87,24 +156,37 @@ namespace llaminar2::detail
             return actual && expected && actual.get()==expected.get() &&
                 !actual.owner_before(expected) && !expected.owner_before(actual);
         }
-        std::vector<Entry> entries_,attached_;
+        std::vector<Entry> entries_;
+        std::vector<FiniteEntry> attached_;
     };
 
     /**
-     * @brief Fork a finite body after an actual imported producer exit.
+     * @brief Native append outcome including the actual whole-body child completion node.
+     * @tparam Error Original backend error code. @tparam Node Original parent node handle.
+     */
+    template<class Error, class Node>
+    struct NativeFiniteBodyAppendResult final {
+        Error error;
+        const char* operation;
+        Node appended_exit{}; ///< Non-null only after the actual SDK child creation succeeds.
+    };
+
+    /**
+     * @brief Fork a finite body after authenticated original parent exits.
      * @param parent Original composed parent. @param child Same-device sealed finite definition.
-     * @param producer Exits returned only by this parent's original-fragment mapping.
-     * @return Original SDK status; later main nodes receive no dependency on this auxiliary.
+     * @param producer Exits from this parent's original main/finite-body mapping, already joined by the caller.
+     * @return Original SDK status and actual appended child exit; failure returns no usable exit.
+     * Later main nodes receive no dependency on this auxiliary.
      * The graph's normal terminal closure joins the new child. There is no edge
      * back to the producer fragment or to a subsequent LocalRead unit.
      */
     template<class API>
-    NativeParallelGraphResult<typename API::Error> appendNativeFiniteBodyAfterFrontier(
+    NativeFiniteBodyAppendResult<typename API::Error, typename API::Node> appendNativeFiniteBodyAfterFrontier(
         typename API::Graph parent, typename API::Graph child,
         std::span<const typename API::Node> producer)
     {
-        using Result=NativeParallelGraphResult<typename API::Error>;
         using Node=typename API::Node;
+        using Result=NativeFiniteBodyAppendResult<typename API::Error, Node>;
         if(!parent || !child || parent==child || producer.empty())
             return Result{API::invalid,"exact finite producer/auxiliary ownership"};
         std::size_t count=0;
@@ -123,7 +205,9 @@ namespace llaminar2::detail
         if(!count)return Result{API::invalid,"nonempty finite auxiliary"};
         Node appended{};
         error=API::child(&appended,parent,producer.data(),producer.size(),child);
-        return Result{error,"fork finite auxiliary after original producer"};
+        if (error != API::success) return Result{error,"fork finite auxiliary after original producers"};
+        if (!appended) return Result{API::invalid,"native finite append returned no child exit"};
+        return Result{API::success,"fork finite auxiliary after original producers",appended};
     }
 
     /**

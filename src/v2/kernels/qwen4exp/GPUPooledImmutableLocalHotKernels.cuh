@@ -28,6 +28,7 @@
 #include "kernels/common/SamplingMath.h"
 #include <algorithm>
 #include <string>
+#include <type_traits>
 namespace llaminar2::qwen4exp::QFN_LH_NAMESPACE {
 namespace h=local_hot;
 namespace a=adaptive_lookup;
@@ -134,7 +135,7 @@ template<class Slot> static __global__ void resetRequest(h::NativeRequestReset n
     release(n.ready,0);
 }
 /** @brief Start the exact next local ordinal before clearing the previous retired ready word. */
-template<class Slot> static __global__ void open(h::NativeQuery n)
+template<class Slot> __device__ __forceinline__ void openBody(h::NativeQuery n)
 {
     if(!healthy(n)){release(n.ready,UINT64_MAX);return;}
     auto v=h::view<Slot>(n);h::Operations<Slot> op(v);
@@ -146,6 +147,24 @@ template<class Slot> static __global__ void open(h::NativeQuery n)
         [&](std::uint64_t previous,std::uint64_t value){return compareReady(n.ready,previous,value);}))
         failure(n,a::Status::InvalidPhase);
 }
+/** @brief The large-query bundle retains its original single-writer opening launch. */
+template<class Slot> static __global__ void open(h::NativeQuery n) { openBody<Slot>(n); }
+/** @brief Open from the exact shared next-window resolver; malformed publication is absorbing failure. */
+template<class Slot> __device__ __forceinline__ void openNextWindowBody(h::NativeNextWindowQuery n)
+{
+    if(!healthy(n)){release(n.ready,UINT64_MAX);return;}
+    auto v=h::view<Slot>(n);h::Operations<Slot> op(v);
+    const auto count=n.window.originalIds();
+    if(count<0 || std::uint32_t(count)>n.plan.maximum_original){failure(n,a::Status::InvalidGeometry);return;}
+    if(!op.begin(n.intent,unsigned(count))){failure(n,v.metadata.frame->status);return;}
+    *h::at<std::uint64_t>(n.frame,n.plan.frame.received_header_bytes)=0;
+    *h::at<std::uint64_t>(n.frame,n.plan.frame.received_payload_bytes)=0;
+    if(!h::resetReadyForProbe([&]{return acquireReady(n.ready);},
+        [&](std::uint64_t previous,std::uint64_t value){return compareReady(n.ready,previous,value);}))
+        failure(n,a::Status::InvalidPhase);
+}
+/** @brief Large next-window queries retain the same checked opening boundary. */
+template<class Slot> static __global__ void openNextWindow(h::NativeNextWindowQuery n) { openNextWindowBody<Slot>(n); }
 /** @return Stable first source occurrence in the actual sorted original query. */
 __device__ __forceinline__ unsigned lowerBound(const a::KeyIndex* sorted,unsigned count,std::uint64_t row)
 {
@@ -154,7 +173,7 @@ __device__ __forceinline__ unsigned lowerBound(const a::KeyIndex* sorted,unsigne
     return begin;
 }
 /** @brief One small cooperative original row sort; stable first-coordinate scan avoids a second sort. */
-template<class Slot> static __global__ __launch_bounds__(Threads,2) void coalesceSmall(h::NativeQuery n)
+template<class Slot> __device__ __forceinline__ void coalesceSmallBody(h::NativeQuery n)
 {
     __shared__ a::KeyIndex one[Small],two[Small];
     __shared__ unsigned histogram[Bins],cursor[Bins],warps[8*Bins],prefix[Threads],carry;
@@ -275,7 +294,7 @@ template<class Slot> static __global__ __launch_bounds__(Threads,2) void probeUn
         if(!op.probeUnique(unsigned(i)))failure(n,a::Status::Invariant);
 }
 /** @brief Publish immediate all-hit data-ready; real misses are resolved only by AcceptResult. */
-template<class Slot> static __global__ void sealProbe(h::NativeFrame n)
+template<class Slot> __device__ __forceinline__ void sealProbeBody(h::NativeFrame n)
 {
     auto v=h::view<Slot>(n);h::Operations<Slot> op(v);
     if(!healthy(n) || v.metadata.frame->status!=a::Status::Success){
@@ -284,6 +303,36 @@ template<class Slot> static __global__ void sealProbe(h::NativeFrame n)
     }
     if(!op.pinAndCompact()){failure(n,v.metadata.frame->status);return;}
     if(!v.metadata.frame->source_rows)compareReady(n.ready,0,1);
+}
+/** @brief The large-query bundle preserves its original ordered final publication. */
+template<class Slot> static __global__ void sealProbe(h::NativeFrame n) { sealProbeBody<Slot>(n); }
+/**
+ * @brief One captured CTA opens, coalesces, probes and publishes a bounded small query.
+ * @tparam Slot Original native row-key representation.
+ * @tparam Query Current demand or borrowed next-prefill window, with the same frame.
+ * @param n Immutable original query declaration; the live count remains device-owned.
+ * @note The exact original radix/first-coordinate and ordered pin code is shared.
+ * CTA barriers replace only the three internal kernel boundaries. No transfer,
+ * external publication dependency or cache admission decision is removed.
+ */
+template<class Slot,class Query> static __global__ __launch_bounds__(Threads,2) void fusedSmallProbe(Query n)
+{
+    if(threadIdx.x==0) {
+        if constexpr(std::is_same_v<Query,h::NativeNextWindowQuery>) openNextWindowBody<Slot>(n);
+        else openBody<Slot>(n);
+    }
+    __syncthreads();
+    coalesceSmallBody<Slot>(n);
+    __syncthreads();
+    if(probing(n)) {
+        auto v=h::view<Slot>(n);h::Operations<Slot> op(v);
+        for(unsigned index=threadIdx.x;index<v.metadata.frame->unique_rows;index+=Threads)
+            if(!op.probeUnique(index))failure(n,a::Status::Invariant);
+    }
+    __syncthreads();
+    // Run even after an invalid opening/coalescing step: the existing seal
+    // cancels the frame and publishes Abort through its exact original owner.
+    if(threadIdx.x==0)sealProbeBody<Slot>(n);
 }
 /** @brief Accept only actual native compact bytes; an all-hit late ACK never rewinds ready2 to1. */
 template<class Slot> static __global__ void accept(h::NativeFrame n,const local_hot_transport::RequestHeader* own_request)
@@ -339,11 +388,60 @@ template<class Slot> static __global__ void frameAction(h::NativeFrame n,Action 
     switch(action){
     case Action::ConsumeDemand:ok=op.consumeDemand(query);break;
     case Action::CompleteFills:ok=op.completeFills();break;
-    case Action::Adopt:ok=op.adopt(query);break;
     case Action::Discard:ok=op.discard(query);break;
     default:failure(n,a::Status::InvalidPhase);return;
     }
     if(!ok)failure(n,v.metadata.frame->status);
+}
+/**
+ * @brief Compare the full actual ordered demand cooperatively without new persistent storage.
+ * One CTA performs bounded strided comparisons and an order-independent integer
+ * OR. Original identity failures poison; a normal prediction miss only disposes
+ * this frame. No output, source lookup, sort or policy operation occurs here.
+ */
+template<class Slot> static __global__ __launch_bounds__(Threads,2) void adopt(h::NativeAdoption n)
+{
+    __shared__ unsigned check, comparison;
+    auto v = h::view<Slot>(n);
+    h::Operations<Slot> op(v);
+    const auto count = n.original_ids.activeRows();
+    const h::DemandIdentity identity{v.identity->query, n.admission ? n.admission->source_invocation : 0};
+    if (threadIdx.x == 0)
+    {
+        comparison = 0;
+        if (!healthy(n)) check = unsigned(h::AdoptionResult::InvalidState);
+        else if (!n.admission ||
+            !h::t::validSourceAdmission(*n.admission, n.plan.table, n.plan.source_generation) || count < 0)
+        {
+            op.fatal(a::Status::Invariant);
+            check = unsigned(h::AdoptionResult::InvalidIdentity);
+        }
+        else check = unsigned(op.checkAdoption(identity, unsigned(count)));
+    }
+    __syncthreads();
+    if (check == unsigned(h::AdoptionResult::Accepted))
+    {
+        unsigned local = 0;
+        for (unsigned i = threadIdx.x; i < unsigned(count); i += blockDim.x)
+            local |= unsigned(op.compareDemandOriginal(i, original(n, i)));
+        atomicOr(&comparison, local); // Integer OR has the same result for every lane order.
+    }
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        if (!healthy(n))
+        {
+            if (v.identity->disposition != h::Disposition::Idle &&
+                v.identity->disposition != h::Disposition::Cancelled) op.cancel(v.identity->query);
+            release(n.ready, UINT64_MAX);
+            return;
+        }
+        const auto result = check == unsigned(h::AdoptionResult::InvalidIdentity) ||
+            check == unsigned(h::AdoptionResult::InvalidState)
+            ? h::AdoptionResult(check) : op.finishAdoption(identity, unsigned(count), comparison);
+        if (result == h::AdoptionResult::InvalidIdentity || result == h::AdoptionResult::InvalidState)
+            failure(n, v.metadata.frame->status);
+    }
 }
 /** @brief Exact complete-native bytes only; optional declined admissions perform no cache copy. */
 template<class Slot> static __global__ __launch_bounds__(Threads,2) void copyFills(h::NativeFrame n)
@@ -374,12 +472,11 @@ inline void check(const char* phase)
 #endif
 }
 /** @brief Submit the fixed captured native probe bundle for this original physical query shape. */
-template<class Slot> void submitProbe(const h::NativeQuery& n,QFN_LH_STREAM stream)
+template<class Slot> void submitLargeProbeBody(const h::NativeQuery& n,QFN_LH_STREAM stream)
 {
-    open<Slot><<<1,1,0,stream>>>(n);check("open");
     const auto capacity=unsigned(n.original_ids.physicalRows());
-    if(capacity<=Small){coalesceSmall<Slot><<<1,Threads,0,stream>>>(n);check("small coalesce");}
-    else{
+    if(capacity<=Small)throw std::logic_error("Large local probe requires a multi-block query bound");
+    {
         initializeKeys<<<blocks(capacity),Threads,0,stream>>>(n);check("initialize keys");
         const auto count_blocks=unsigned((capacity+Threads-1)/Threads);
         const auto passes=pooled_native::radixPasses(n.plan.source_rows);
@@ -434,9 +531,28 @@ __global__ void terminalPack(h::NativeTerminal n)
     }
 }
 /** @brief Stateless backend implementation; original storage owns every persistent byte and handle. */
+/** @brief Select the fused small-query program or the original large-query bundle from its immutable bound. */
+template<class Slot> void submitProbe(const h::NativeQuery& n,QFN_LH_STREAM stream)
+{
+    if(n.original_ids.physicalRows()<=Small) {
+        fusedSmallProbe<Slot><<<1,Threads,0,stream>>>(n);check("fused small probe");
+        return;
+    }
+    open<Slot><<<1,1,0,stream>>>(n);check("open");submitLargeProbeBody<Slot>(n,stream);
+}
+/** @brief Only the explicit next-window path resolves a derived count. */
+template<class Slot> void submitNextWindowProbe(const h::NativeNextWindowQuery& n,QFN_LH_STREAM stream)
+{
+    if(n.original_ids.physicalRows()<=Small) {
+        fusedSmallProbe<Slot><<<1,Threads,0,stream>>>(n);check("fused small next-window probe");
+        return;
+    }
+    openNextWindow<Slot><<<1,1,0,stream>>>(n);check("open next window");submitLargeProbeBody<Slot>(n,stream);
+}
 class Kernels final:public IPooledImmutableLocalHotKernels {
 public:
-    std::uint64_t codeIdentity()const noexcept override{return h::NativeVersion;}
+    /** @return Native data contract plus the explicit fused-probe execution-policy revision. */
+    std::uint64_t codeIdentity()const noexcept override{return (h::NativeVersion << 32) | std::uint64_t{1};}
     DeviceType backend()const noexcept override{
 #if defined(QFN_LOCAL_HOT_CUDA)
         return DeviceType::CUDA;
@@ -476,6 +592,20 @@ protected:
         const auto stream=static_cast<QFN_LH_STREAM>(exact);
         if(n.plan.key_width==a::RowKeyWidth::UInt32)submitProbe<a::Slot32>(n,stream);
         else submitProbe<a::Slot64>(n,stream);
+    }
+    void launchAdoption(const h::NativeAdoption& n,void* exact)const override
+    {
+        const auto stream = static_cast<QFN_LH_STREAM>(exact);
+        if (n.plan.key_width == a::RowKeyWidth::UInt32) adopt<a::Slot32><<<1,Threads,0,stream>>>(n);
+        else adopt<a::Slot64><<<1,Threads,0,stream>>>(n);
+        check("actual demand adoption");
+    }
+    /** @copydoc IPooledImmutableLocalHotKernels::launchNextWindowProbe */
+    void launchNextWindowProbe(const h::NativeNextWindowQuery& n,void* exact)const override
+    {
+        const auto stream=static_cast<QFN_LH_STREAM>(exact);
+        if(n.plan.key_width==a::RowKeyWidth::UInt32)submitNextWindowProbe<a::Slot32>(n,stream);
+        else submitNextWindowProbe<a::Slot64>(n,stream);
     }
     void launchRead(const h::NativeRead& n,void* exact)const override
     {

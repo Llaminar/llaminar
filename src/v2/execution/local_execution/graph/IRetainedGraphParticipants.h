@@ -70,8 +70,23 @@ private:
     PreparedGPUContextUsePermit original_; ///< Keeps original context alive until the existing stream owner releases.
     std::shared_ptr<void> stream_;
 };
+class IRetainedGraphParticipantLocalConsumptionPlan;
 /** @brief Per-device auxiliary ownership, never a declaration of source authority for a reader. */
 enum class RetainedGraphParticipantAuxiliaryRole : std::uint8_t {Source,Reader};
+/** @brief Distinct native lifetimes; none implies actual model history publication. */
+enum class RetainedGraphParticipantAuxiliaryLifecycle : std::uint8_t {
+    CurrentDemand,
+    FutureProducer,
+    AdoptedConsumer,
+    DiscardedConsumer,
+};
+/** @param lifecycle Original immutable body purpose.
+ * @return Whether this body consumes an already produced local frame without a new source operation. */
+inline bool localConsumptionOnly(RetainedGraphParticipantAuxiliaryLifecycle lifecycle) noexcept
+{
+    return lifecycle == RetainedGraphParticipantAuxiliaryLifecycle::AdoptedConsumer ||
+        lifecycle == RetainedGraphParticipantAuxiliaryLifecycle::DiscardedConsumer;
+}
 /**
  * @brief Actual participant-local side range in the original graph.
  *
@@ -87,11 +102,15 @@ struct RetainedGraphParticipantAuxiliaryRange final {
     std::uint64_t identity=0;
     /** Same original immutable owner descriptor; no graph/source back-reference or policy copy. */
     std::shared_ptr<const MoEExpertOverlayExecutionPlan> original_execution;
+    RetainedGraphParticipantAuxiliaryLifecycle lifecycle=RetainedGraphParticipantAuxiliaryLifecycle::CurrentDemand;
+    /** Actual prepared local owner/body only; absent for every new source/transport operation. */
+    std::shared_ptr<const IRetainedGraphParticipantLocalConsumptionPlan> local_consumption;
+    const void* local_arena=nullptr; ///< Actual cold local builder arena; never a source/completion authority.
     bool operator==(const RetainedGraphParticipantAuxiliaryRange&)const=default;
 };
 /** @brief Whole source and exact participant bodies have disjoint preparation meanings. */
 enum class RetainedGraphParticipantDefinitionScope : std::uint8_t {
-    WholeSource,AuxiliarySource,AuxiliaryReader
+    WholeSource,AuxiliarySource,AuxiliaryReader,LocalConsumption
 };
 /** @brief Cache-owned preparation stream borrow, revoked before the original cache destroys its stream.
  * This capability creates no resource. The exact original worker serializes
@@ -110,6 +129,7 @@ public:
         DeviceId participant=DeviceId::invalid();
         std::uint64_t range_identity=0;
         std::shared_ptr<const RetainedGraphParticipantPreparationStream> original_source_definition;
+        std::shared_ptr<const IRetainedGraphParticipantLocalConsumptionPlan> local_consumption;
     };
     /** @return Exact executor-minted cold definition, absent for legacy stream-only borrows. */
     const Definition& definition()const noexcept{return definition_;}
@@ -342,16 +362,51 @@ public:
     {throw std::logic_error("Source plan has no original storage input frontier");}
 
 };
+/**
+ * @brief Original retained local owner/body, with no source enqueue/service/completion rights.
+ * It borrows the SAME prepared cache/source and cannot bind a WholeSource invocation.
+ */
+class IRetainedGraphParticipantLocalConsumptionPlan {
+public:
+    virtual ~IRetainedGraphParticipantLocalConsumptionPlan()=default;
+    /** @param participant Exact original local participant.
+     * @return Existing permit; this never acquires or creates a worker. */
+    virtual PreparedGPUContextUsePermit originalParticipant(DeviceId participant)const=0;
+    /** @return Same immutable prepared-source/transport domain, without executing it. */
+    virtual RetainedGraphParticipantDefinitionDomain definitionDomain()const noexcept=0;
+    /** @return Complete cold local-root/controller/body identity. */
+    virtual std::uint64_t captureIdentity()const noexcept=0;
+    /** @brief Authenticate the actual local definition.
+     * @param preparation Exact executor-issued local definition.
+     * @param inspect Walk cold stage declarations only during preparation; live checks stay constant-time. */
+    virtual void requireLocalDefinition(const RetainedGraphParticipantPreparationStream& preparation,bool inspect)const=0;
+    /** @brief Retain/attach the actual finite local body, importing no source or physical-owner program.
+     * @param body Exact executor-sealed finite recording. @param progress Optional original generic progress.
+     * @return Original attachment retaining native and local lifetime through parent retirement. */
+    virtual std::unique_ptr<IRetainedGraphParticipantStorageAttachment> prepareLocalAttachment(
+        const RetainedGraphParticipantAuxiliaryBodySeal& body,IGraphCaptureAuxiliaryBranch* progress)const=0;
+};
 /** @brief Validate only after the original revocable cache token proves its graph/plan lifetime. */
 inline void RetainedGraphParticipantPreparationStream::requireDefinition()const {
     requireLive(original_);
     // Name only the absent declaration, never log pointers or live device words.
-    const char* missing = !definition_.plan ? "plan" : !definition_.graph ? "graph" :
+    const bool local = definition_.scope == RetainedGraphParticipantDefinitionScope::LocalConsumption;
+    const char* missing = (!local && !definition_.plan) || (local && !definition_.local_consumption) ? "plan" : !definition_.graph ? "graph" :
         !definition_.arena ? "arena" : !definition_.topology_generation ? "topology_generation" :
         !definition_.variant ? "variant" : !definition_.domain.source.is_gpu() ? "domain.source" :
         !definition_.domain.authority ? "domain.authority" : nullptr;
     if(missing)
         throw std::logic_error(std::string("Original source preparation has no complete declarative definition: missing ")+missing);
+    if(local){
+        if(definition_.plan || definition_.original_source_definition || !definition_.participant.is_gpu() ||
+           definition_.participant!=original_.device() || !definition_.range_identity ||
+           definition_.local_consumption->definitionDomain()!=definition_.domain)
+            throw std::logic_error("Local consumption cannot claim a whole-source definition or foreign local owner");
+        definition_.local_consumption->requireLocalDefinition(*this,true);
+        definition_authenticated_.store(true,std::memory_order_release);
+        return;
+    }
+    if(definition_.local_consumption)throw std::logic_error("Source definition cannot carry a local-only plan");
     if(definition_.scope==RetainedGraphParticipantDefinitionScope::WholeSource){
         if(definition_.participant.is_valid() || definition_.range_identity || definition_.original_source_definition)
             throw std::logic_error("Whole source preparation cannot carry participant auxiliary scope");
@@ -379,9 +434,16 @@ inline void RetainedGraphParticipantPreparationStream::requireDefinition()const 
 /** @brief Revocation is checked before dereferencing the original graph/plan. */
 inline void RetainedGraphParticipantPreparationStream::requireCurrentDefinition()const {
     requireLive(original_);
-    if(!definition_authenticated_.load(std::memory_order_acquire) || !definition_.plan)
+    if(!definition_authenticated_.load(std::memory_order_acquire))
         throw std::logic_error("Original source definition was never structurally authenticated");
-    definition_.plan->requireCurrentPreparedSourceDefinition(*this);
+    if(definition_.scope==RetainedGraphParticipantDefinitionScope::LocalConsumption){
+        if(!definition_.local_consumption || definition_.plan)
+            throw std::logic_error("Local consumption lost its original local-only plan");
+        definition_.local_consumption->requireLocalDefinition(*this,false);
+    }else{
+        if(!definition_.plan)throw std::logic_error("Original source definition lost its plan");
+        definition_.plan->requireCurrentPreparedSourceDefinition(*this);
+    }
 }
 
 }

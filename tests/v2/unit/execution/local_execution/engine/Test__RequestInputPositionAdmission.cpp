@@ -56,3 +56,46 @@ TEST(RequestInputPositionAdmission, RejectsNonscalarSnapshotAndMalformedPhysical
     EXPECT_THROW(RequestInputPositionAdmission::bind(&host,std::nullopt,binding.backend,&canonical,&position,
         1,std::numeric_limits<int>::max(),std::numeric_limits<int>::max()),std::invalid_argument);
 }
+
+/** @test An immutable retained requirement is revalidated on each original ingress, never retained as a content proof. */
+TEST(RequestInputPositionAdmission, ContiguousPrefillRequirementChecksEveryIngress)
+{
+    using Layout=RequestInputPositionLayoutRequirement;
+    for(unsigned replay=0;replay<20;++replay){
+        std::array<int,4> host{127,128,129,130},destination{};
+        const auto admit=[&]{return RequestInputPositionAdmission::bind(host.data(),{},backendIdentity(0x1000),nullptr,
+            destination.data(),4,1,4,Layout::ContiguousSingleRequestPrefill);};
+        EXPECT_NO_THROW((void)admit());
+        // Reuse the SAME original destination and retained requirement with a
+        // new request. A previous valid request cannot authorize these values.
+        host[2]=128;EXPECT_THROW((void)admit(),std::invalid_argument);
+        host={211,212,213,214};EXPECT_NO_THROW((void)admit());
+        EXPECT_EQ(destination.front(),0);
+    }
+}
+/** @test Duplicate/gap/negative/overflow rows remain valid legacy ingress but cannot meet the selected future-family requirement. */
+TEST(RequestInputPositionAdmission, ContiguousPrefillRequirementRejectsMalformedWithoutChangingLegacy)
+{
+    using Layout=RequestInputPositionLayoutRequirement;
+    for(unsigned replay=0;replay<20;++replay)for(const auto host:std::array{
+        std::array{7,7,9},std::array{7,9,10},std::array{-1,0,1},
+        std::array{std::numeric_limits<int>::max()-1,std::numeric_limits<int>::max(),std::numeric_limits<int>::min()}}){
+        std::array<int,3> destination{};
+        const auto original=RequestInputPositionAdmission::bind(host.data(),{},backendIdentity(0x1000),nullptr,destination.data(),3,1,3);
+        EXPECT_TRUE(original.uploadsPositions());EXPECT_TRUE(original.allowsBucketPadding());
+        EXPECT_THROW((void)RequestInputPositionAdmission::bind(host.data(),{},backendIdentity(0x1000),nullptr,
+            destination.data(),3,1,3,Layout::ContiguousSingleRequestPrefill),std::invalid_argument);
+    }
+}
+/** @test Empty/batched/unknown requirements and scalar canonical decode cannot authorize a prefill window. */
+TEST(RequestInputPositionAdmission, PrefillRequirementRejectsEmptyBatchedAndDecodeAuthority)
+{
+    using Layout=RequestInputPositionLayoutRequirement;
+    int canonical=17,position=0;const std::array<int,4> host{0,1,2,3};
+    EXPECT_THROW((void)RequestInputPositionAdmission::bind(host.data(),{},backendIdentity(0x1000),nullptr,&position,0,1,1,Layout::ContiguousSingleRequestPrefill),std::invalid_argument);
+    EXPECT_THROW((void)RequestInputPositionAdmission::bind(host.data(),{},backendIdentity(0x1000),nullptr,&position,4,2,2,Layout::ContiguousSingleRequestPrefill),std::invalid_argument);
+    EXPECT_THROW((void)RequestInputPositionAdmission::bind(host.data(),{},backendIdentity(0x1000),nullptr,&position,4,1,4,static_cast<Layout>(99)),std::invalid_argument);
+    const DeviceDecodePositionBinding snapshot{backendIdentity(0x1000),&canonical,&position};
+    EXPECT_NO_THROW((void)RequestInputPositionAdmission::bind(nullptr,snapshot,snapshot.backend,&canonical,&position,1,1,1));
+    EXPECT_THROW((void)RequestInputPositionAdmission::bind(nullptr,snapshot,snapshot.backend,&canonical,&position,1,1,1,Layout::ContiguousSingleRequestPrefill),std::invalid_argument);
+}

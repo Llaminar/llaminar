@@ -15,7 +15,7 @@ namespace llaminar2::qwen4exp::QFN_NATIVE_NAMESPACE
 namespace n=pooled_native;
 namespace p=adaptive_lookup::pooled;
 using Occurrence=p::CoordinatorOccurrence;
-constexpr unsigned Threads=256,SmallRows=512,Bins=16;
+constexpr unsigned Threads=256,SmallRows=n::SmallOriginalRows,Bins=16;
 /** @brief Publish an order-independent structural failure from independent disjoint producers. */
 __device__ __forceinline__ void failure(const n::CoordinatorArgs& a)
 {
@@ -48,7 +48,7 @@ template<n::OriginalIdWidth Width> __global__ void openOriginal(n::CoordinatorBe
 {
     auto v=n::coordinatorView(a);auto op=p::CoordinatorOperations(v);
     const auto count=a.query.original.rows.activeRows();
-    if(!a.query.admission || !p::CoordinatorCoalescingAccess::open(op,*a.query.admission,static_cast<const std::conditional_t<Width==n::OriginalIdWidth::UInt32,std::uint32_t,std::uint64_t>*>(a.query.ids),static_cast<unsigned>(count)))
+    if(!n::validBeginPurpose(a,count) || !a.query.admission || !p::CoordinatorCoalescingAccess::open(op,*a.query.admission,static_cast<const std::conditional_t<Width==n::OriginalIdWidth::UInt32,std::uint32_t,std::uint64_t>*>(a.query.ids),static_cast<unsigned>(count),a.query.original.purpose))
         failure(a);
 }
 /** @brief One cooperative small-shape Begin bundle, including actual commit and immutable header publication. */

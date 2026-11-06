@@ -21,7 +21,7 @@ struct MetadataArgs {
     DeviceId device;
     local_hot::Counters* reporting=nullptr; ///< SAME actual receiving participant root; source-self authors no wire count.
     SourceAdmissionArgs source{};
-    RequestArgs request{};
+    RequestArgs request{}; ///< intent is the immutable expected wire purpose for every metadata action, including replies/ACKs.
     const QueryIdentity* source_query=nullptr;
     ConsumerGeometry geometry{};
     const std::uint64_t* original_ids=nullptr;

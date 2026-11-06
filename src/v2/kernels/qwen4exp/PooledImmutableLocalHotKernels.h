@@ -52,6 +52,14 @@ protected:
     virtual void launchFrame(PooledImmutableLocalHotAction,const local_hot::NativeFrame&,void* exact_stream)const=0;
     /** @brief Actual original hash/count producer is carried only by Probe. */
     virtual void launchProbe(const local_hot::NativeQuery&,void* exact_stream)const=0;
+    /** @brief Explicit next-prefill count specialization; original contiguous Probe is unchanged. */
+    virtual void launchNextWindowProbe(const local_hot::NativeNextWindowQuery&,void* exact_stream)const=0;
+    /**
+     * @brief Cooperatively compare actual demand IDs against the original retained future frame.
+     * @param demand Checked complete hash/count/request producer and original local roots.
+     * @param exact_stream Same non-default stream selected by the enclosing capture.
+     */
+    virtual void launchAdoption(const local_hot::NativeAdoption& demand,void* exact_stream)const=0;
     /** @brief Native LocalRead receives its sole actual FP32 output. */
     virtual void launchRead(const local_hot::NativeRead&,void* exact_stream)const=0;
     /** @brief Once-per-request reset consumes its exact original local admission producer. */

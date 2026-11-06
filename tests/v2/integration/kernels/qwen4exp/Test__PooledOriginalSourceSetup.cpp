@@ -146,7 +146,13 @@ void originalSetup(DeviceId device,std::uint32_t slots,bool compactDeclaration=f
             // Actual cold transport setup runs off its original worker; no replay
             // cohort or fabricated source permit stands in for native authority.
             auto transport=q::PooledImmutableDirectedTransport::create(compactBoundary,{}, {}, {},compactGeometry);
-            auto query=transport->localHotPoolQuery(compactLocal);
+            const std::array consumer{compactGeometry.consumer(0,compactLocal->consumerStorageIdentity())};
+            const auto bound=q::PooledImmutableLocalHotQueryBound::forCanonicalQuery(DeviceRowRange::fullyActive(1),consumer,32);
+            auto query=transport->localHotPoolQuery(compactLocal,bound);
+            auto wider=transport->localHotPoolQuery(compactLocal,
+                q::PooledImmutableLocalHotQueryBound::forCanonicalQuery(DeviceRowRange::fullyActive(2),consumer,32));
+            EXPECT_EQ(query.queryBound().maximumOriginal(),16u);
+            EXPECT_NE(query.declarationIdentity(),wider.declarationIdentity());
             const auto& actual=compactBoundary->pooledStorage()->coordinator()->plan();
             const auto declaration=query.declarationIdentity();
             EXPECT_NO_THROW(query.requireDeclaration(actual));

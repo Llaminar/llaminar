@@ -282,38 +282,48 @@ namespace llaminar2
         if(!participant_auxiliary_range_)return;
         const auto& range=*participant_auxiliary_range_;
         const auto& domain=participant_definition_domain_;
+        using Lifecycle=RetainedGraphParticipantAuxiliaryLifecycle;
+        const bool current=range.lifecycle==Lifecycle::CurrentDemand;
+        const bool future=range.lifecycle==Lifecycle::FutureProducer;
+        const bool adopted=range.lifecycle==Lifecycle::AdoptedConsumer;
+        const bool discarded=range.lifecycle==Lifecycle::DiscardedConsumer;
+        const bool local=adopted || discarded;
         const bool source=range.role==RetainedGraphParticipantAuxiliaryRole::Source;
-        if((!source && range.role!=RetainedGraphParticipantAuxiliaryRole::Reader) ||
+        if((!current && !future && !local) || (!source && range.role!=RetainedGraphParticipantAuxiliaryRole::Reader) ||
            !domain || !range.participant.is_gpu() || !range.identity || range.nodes.empty() ||
-           range.probe_ready.empty() || range.ready_publication.empty() || range.main_read.empty() ||
-           range.retirement.empty() || range.nodes.back()!=range.retirement || read_ahead_branch_ ||
-           source!=(range.participant==domain->source) || source!=bool(participant_source_plan_))
-            throw std::invalid_argument("Participant auxiliary body has an incomplete or foreign source/reader declaration");
+           range.probe_ready.empty() || range.retirement.empty() || range.nodes.back()!=range.retirement ||
+           read_ahead_branch_ || source!=(range.participant==domain->source) ||
+           (local ? bool(participant_source_plan_) || !range.local_consumption || !range.local_arena :
+                    source!=bool(participant_source_plan_) || bool(range.local_consumption) || bool(range.local_arena)))
+            throw std::invalid_argument("Participant auxiliary body has an incomplete or foreign lifecycle/source declaration");
         const auto main_node=[&](const std::string& name) {
             const auto* node=getNode(name);
             return node && node->stage && node->device==range.participant && !isRetainedParticipantAuxiliaryNode(name);
         };
-        if(range.probe_ready==range.main_read || !main_node(range.probe_ready) || !main_node(range.main_read) ||
-           !isRetainedParticipantAuxiliaryNode(range.ready_publication))
-            throw std::invalid_argument("Participant auxiliary body lost its distinct model probe/read/publication frontiers");
+        if(!main_node(range.probe_ready) ||
+           (current && (range.main_read.empty() || range.probe_ready==range.main_read || !main_node(range.main_read))) ||
+           (adopted && (range.main_read!=range.probe_ready || !main_node(range.main_read))) ||
+           ((future || discarded) && !range.main_read.empty()) ||
+           ((current || future) ? range.ready_publication.empty() || !isRetainedParticipantAuxiliaryNode(range.ready_publication)
+                                : !range.ready_publication.empty()))
+            throw std::invalid_argument("Participant auxiliary body lost its exact lifecycle main/publication frontier");
+        if(local && (range.local_consumption->definitionDomain()!=*domain || !range.local_consumption->captureIdentity()))
+            throw std::invalid_argument("Local-only consumption changed its original prepared-source/local declaration");
         std::unordered_set<std::string> visited;
-        bool readinessPublished=false;
+        bool readinessPublished=local;
         for(const auto& name:range.nodes) {
             const auto* node=getNode(name);
             if(!node || !node->stage || node->device!=range.participant || !visited.insert(name).second ||
                node->stage->isManualGraphBoundary() || node->graph_capture_wave || node->heterogeneous_ticket_unit_contract ||
                (!node->stage->isGraphCapturable() && !node->stage->supportsGraphCaptureAfterLaunchPreparation()))
                 throw std::invalid_argument("Participant auxiliary body contains an absent, repeated or uncapturable stage: "+name);
-            // Device-side probe/read frontiers connect the two lanes. All other
-            // body dependencies must be earlier actual nodes of this same body.
             for(const auto& dependency:node->dependencies) {
-                if(dependency==name || (!visited.contains(dependency) &&
-                    dependency!=range.probe_ready && dependency!=range.main_read))
+                if(dependency==name || (!visited.contains(dependency) && dependency!=range.probe_ready &&
+                    (!current || dependency!=range.main_read)))
                     throw std::invalid_argument("Participant auxiliary body has an undeclared cross-lane dependency: "+name);
-                // This body records in one ordered lane. Waiting for LocalRead
-                // before publishing its readiness deadlocks even when the wait
-                // is an earlier body node rather than a direct graph ancestor.
-                if(dependency==range.main_read && !readinessPublished)
+                // Only Current has a later model read. Future producer has no
+                // read dependency; a local consumer starts after its real read/discard.
+                if(current && dependency==range.main_read && !readinessPublished)
                     throw std::invalid_argument("Participant auxiliary readiness cannot wait for the read it releases: "+name);
             }
             if(name==range.ready_publication)readinessPublished=true;

@@ -888,3 +888,150 @@ TEST(Test__GraphSegmentCache, NativeAuxiliaryParentRejectsForeignAuthorityReplay
         EXPECT_THROW(marked.requireRetainedParticipantNativeAuxiliaryParent(), std::invalid_argument);
     }
 }
+
+
+namespace {
+/**
+ * @brief Metadata-only local declaration spy; it cannot mint a native permit or attachment.
+ * Its deliberate failures keep these tests separate from original-source native proof.
+ */
+static_assert(!std::is_base_of_v<IRetainedGraphParticipantSourcePlan,
+    IRetainedGraphParticipantLocalConsumptionPlan>);
+class LocalConsumptionMetadataPlan final : public IRetainedGraphParticipantLocalConsumptionPlan {
+public:
+    /** @param domain Exact original metadata domain retained by this fixture. */
+    explicit LocalConsumptionMetadataPlan(RetainedGraphParticipantDefinitionDomain domain):domain_(domain){}
+    /** @param device Unused GPU label. @throws std::logic_error Always: no native worker is admitted. */
+    PreparedGPUContextUsePermit originalParticipant(DeviceId)const override
+    {throw std::logic_error("Metadata fixture cannot create a native participant");}
+    /** @return Original metadata domain, without source service authority. */
+    RetainedGraphParticipantDefinitionDomain definitionDomain()const noexcept override{return domain_;}
+    /** @return Immutable fixture identity, never native execution proof. */
+    std::uint64_t captureIdentity()const noexcept override{return 811;}
+    /** @param stream Unused native preparation. @param inspect Unused inspection mode.
+     * @throws std::logic_error Always: metadata acceptance is not a prepared definition.
+     */
+    void requireLocalDefinition(const RetainedGraphParticipantPreparationStream&,bool)const override
+    {throw std::logic_error("Metadata fixture cannot authenticate native preparation");}
+    /** @param body Unused native body. @param progress Unused progress branch.
+     * @throws std::logic_error Always: metadata cannot certify an attached parent.
+     */
+    std::unique_ptr<IRetainedGraphParticipantStorageAttachment> prepareLocalAttachment(
+        const RetainedGraphParticipantAuxiliaryBodySeal&,IGraphCaptureAuxiliaryBranch*)const override
+    {throw std::logic_error("Metadata fixture cannot attach a native body");}
+private:
+    RetainedGraphParticipantDefinitionDomain domain_;
+};
+/**
+ * @brief Declare lifecycle metadata through the real graph/controller boundary.
+ * @param device Original GPU label, without startup or native resources.
+ * @param lifecycle Explicit future producer or local consumer branch.
+ * @param plan Optional exact metadata-only local owner; Future must have none.
+ * @return Finite main and auxiliary declaration, without a SourcePlan or executable.
+ */
+ComputeGraph lifecycleMetadataGraph(DeviceId device,RetainedGraphParticipantAuxiliaryLifecycle lifecycle,
+    std::shared_ptr<const IRetainedGraphParticipantLocalConsumptionPlan> plan={})
+{
+    ComputeGraph graph;
+    graph.setRetainedParticipantDefinitionDomain({device.is_cuda()?DeviceId::cuda(0):DeviceId::rocm(0),
+        &auxiliary_range_transport_identity});
+    for(const auto* name:{"anchor","aux_begin","aux_result","aux_retire","output"})
+        graph.addNode(name,std::make_unique<FakeSegmentStage>(device,true),device);
+    graph.addDependency("aux_begin","anchor");
+    graph.addDependency("aux_result","aux_begin");
+    graph.addDependency("aux_retire","aux_result");
+    graph.addDependency("output","anchor");
+    graph.setTerminalNode("output");
+    const bool local=localConsumptionOnly(lifecycle);
+    const bool read=lifecycle==RetainedGraphParticipantAuxiliaryLifecycle::AdoptedConsumer;
+    graph.setRetainedParticipantAuxiliaryRange({
+        .role=RetainedGraphParticipantAuxiliaryRole::Reader,.participant=device,
+        .nodes={"aux_begin","aux_result","aux_retire"},.probe_ready="anchor",
+        .ready_publication=local?"":"aux_result",.main_read=read?"anchor":"",
+        .retirement="aux_retire",.identity=881,.lifecycle=lifecycle,
+        .local_consumption=std::move(plan),.local_arena=local?&auxiliary_range_transport_identity:nullptr});
+    return graph;
+}
+}
+
+/** @test Future producer ends source/ACK work without waiting for a later model read. */
+TEST(Test__GraphSegmentCache, RetainedParticipantFutureProducerHasIndependentMainFrontierReplay)
+{
+    for(const auto device:{DeviceId::cuda(1),DeviceId::rocm(1)})
+        for(int replay=0;replay<20;++replay){
+            auto graph=lifecycleMetadataGraph(device,RetainedGraphParticipantAuxiliaryLifecycle::FutureProducer);
+            auto cache=auxiliaryMainPlan(graph);
+            ASSERT_EQ(cache.segments.size(),2u);
+            EXPECT_EQ(cache.segments[0].stage_names,(std::vector<std::string>{"anchor"}));
+            EXPECT_EQ(cache.segments[1].stage_names,(std::vector<std::string>{"output"}));
+            EXPECT_EQ(cache.segments[0].capture_wave_identity,"participant_future_producer");
+            EXPECT_TRUE(graph.retainedParticipantAuxiliaryRange()->main_read.empty());
+            EXPECT_FALSE(graph.retainedParticipantSourcePlan()); // Reader is not a fabricated WholeSource.
+            const auto variant=DeviceGraphCaptureController::computeCaptureVariantSignature(graph);
+            auto moved=std::move(graph);
+            EXPECT_EQ(DeviceGraphCaptureController::computeCaptureVariantSignature(moved),variant);
+            moved.requireRetainedParticipantAuxiliaryRange();
+        }
+}
+
+/** @test Local read/discard declarations retain one original owner without creating source completion. */
+TEST(Test__GraphSegmentCache, RetainedParticipantLocalConsumptionRetainsOnlyOriginalOwnerReplay)
+{
+    for(const auto device:{DeviceId::cuda(1),DeviceId::rocm(1)})
+        for(const auto lifecycle:{RetainedGraphParticipantAuxiliaryLifecycle::AdoptedConsumer,
+                                 RetainedGraphParticipantAuxiliaryLifecycle::DiscardedConsumer})
+            for(int replay=0;replay<20;++replay){
+                const RetainedGraphParticipantDefinitionDomain domain{
+                    device.is_cuda()?DeviceId::cuda(0):DeviceId::rocm(0),&auxiliary_range_transport_identity};
+                auto owner=std::make_shared<LocalConsumptionMetadataPlan>(domain);
+                std::weak_ptr<LocalConsumptionMetadataPlan> weak=owner;
+                auto graph=lifecycleMetadataGraph(device,lifecycle,owner);
+                owner.reset();
+                EXPECT_FALSE(weak.expired());
+                EXPECT_FALSE(graph.retainedParticipantSourcePlan());
+                auto cache=auxiliaryMainPlan(graph);
+                ASSERT_EQ(cache.segments.size(),2u);
+                EXPECT_EQ(cache.segments.front().capture_wave_identity,"participant_local_consumption");
+                EXPECT_EQ(cache.segments.front().stage_names,(std::vector<std::string>{"anchor"}));
+                EXPECT_EQ(cache.segments.back().stage_names,(std::vector<std::string>{"output"}));
+                EXPECT_THROW((void)graph.retainedParticipantAuxiliaryRange()->local_consumption->originalParticipant(device),std::logic_error);
+                graph.clear();
+                EXPECT_TRUE(weak.expired());
+                EXPECT_FALSE(graph.retainedParticipantAuxiliaryRange());
+            }
+}
+
+/** @test Unknown/mixed lifecycle, owner/domain and missing current read fail rather than weaken Current. */
+TEST(Test__GraphSegmentCache, RetainedParticipantFutureLifecycleRejectsMixedAndStaleDeclarationsReplay)
+{
+    using Lifecycle=RetainedGraphParticipantAuxiliaryLifecycle;
+    const auto device=DeviceId::cuda(1);
+    const RetainedGraphParticipantDefinitionDomain domain{DeviceId::cuda(0),&auxiliary_range_transport_identity};
+    auto owner=std::make_shared<LocalConsumptionMetadataPlan>(domain);
+    EXPECT_THROW((void)lifecycleMetadataGraph(device,Lifecycle::AdoptedConsumer),std::invalid_argument);
+    EXPECT_THROW((void)lifecycleMetadataGraph(device,Lifecycle::FutureProducer,owner),std::invalid_argument);
+    EXPECT_THROW((void)lifecycleMetadataGraph(device,static_cast<Lifecycle>(99)),std::invalid_argument);
+    auto foreign=std::make_shared<LocalConsumptionMetadataPlan>(RetainedGraphParticipantDefinitionDomain{DeviceId::cuda(2),domain.authority});
+    EXPECT_THROW((void)lifecycleMetadataGraph(device,Lifecycle::DiscardedConsumer,foreign),std::invalid_argument);
+    for(int mutation=0;mutation<7;++mutation){
+        auto graph=lifecycleMetadataGraph(device,Lifecycle::FutureProducer);
+        auto range=*graph.retainedParticipantAuxiliaryRange();
+        ComputeGraph fresh;
+        fresh.setRetainedParticipantDefinitionDomain(*graph.retainedParticipantDefinitionDomain());
+        for(const auto& name:graph.getExecutionOrder()){
+            fresh.addNode(name,std::make_unique<FakeSegmentStage>(device,true),device);
+            for(const auto& dependency:graph.getNode(name)->dependencies)fresh.addDependency(name,dependency);
+        }
+        fresh.setTerminalNode("output");
+        switch(mutation){
+        case 0:range.lifecycle=Lifecycle::CurrentDemand;break;
+        case 1:range.main_read="output";break;
+        case 2:range.nodes.push_back("aux_retire");break;
+        case 3:std::swap(range.nodes[0],range.nodes[1]);break;
+        case 4:range.identity=0;break;
+        case 5:range.nodes[1]="output";break;
+        case 6:range.ready_publication.clear();break;
+        }
+        EXPECT_THROW(fresh.setRetainedParticipantAuxiliaryRange(range),std::invalid_argument)<<mutation;
+    }
+}

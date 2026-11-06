@@ -248,6 +248,14 @@ public:
             a.output[i] = static_cast<std::int64_t>(hash % a.policy.moduli[head] + a.policy.offsets[head]);
         });
     }
+    /** @copydoc IQwen4ExpKernels::ngramHashNextWindow */
+    void ngramHashNextWindow(const NgramNextWindowHashArgs& a,void*)const override
+    {
+        detail::validate(a);const auto window=a.nextWindow.resolve();
+        detail::require(window.valid,"QFN next-window hash has malformed original live inputs");
+        if(!window.rows)return;
+        ngramHash({{window.rows},a.tokens+window.first,a.priorTokens,a.output,a.policy},nullptr);
+    }
     /** @copydoc IQwen4ExpKernels::pleGate */
     void pleGate(const PLEGateArgs &a, void *) const override
     {

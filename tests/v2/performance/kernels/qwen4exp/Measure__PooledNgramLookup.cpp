@@ -9,6 +9,7 @@
  * two-device limit. Host wall covers submission through complete native cohort completion. The
  * original service remains armed across frames and terminally joins afterward. No observed device value selects a workload or repairs its state.
  */
+#include "fixtures/backends/NativeGraphTimingEvents.h"
 #ifdef LLAMINAR_POOLED_NATIVE_PROGRAM_DIAGNOSTIC
 #include "fixtures/execution/RetainedHostServiceFixture.h"
 #include "fixtures/execution/RetainedHostServiceCalibrationAccess.h"
@@ -303,26 +304,6 @@ struct CrossActor {
     void validate(std::span<const std::uint64_t> ids,std::optional<std::uint32_t> hits){fixture->validateTiming(ids,hits);requireAssertions();}
     PooledNgramReplayObservation observation()const{return fixture->lastObservation;}
 };
-/** @brief Fixture-owned outer events; created/destroyed outside captured or measured execution. */
-class TimingEvents final {
-    IWorkerGPUContext& worker_;IBackend* backend_;DeviceId device_;void* start_=nullptr;void* stop_=nullptr;void* stream_=nullptr;
-public:
-    /** @brief Admit both timing events on the actual source worker, retaining partial-failure cleanup. */
-    TimingEvents(IWorkerGPUContext& worker,DeviceId device):worker_(worker),backend_(getBackendFor(device)),device_(device){
-        worker_.submitAndWait([&]{try{start_=backend_->createTimingEvent(device_.ordinal);requireProvider(start_,"Native start event unavailable");stop_=backend_->createTimingEvent(device_.ordinal);requireProvider(stop_,"Native stop event unavailable");}
-            catch(...){if(start_)backend_->destroyEvent(start_,device_.ordinal);start_=nullptr;throw;}});}
-    /** @brief All measured work has terminally retired before event release. */
-    ~TimingEvents(){worker_.submitAndWait([&]{if(stream_ && !backend_->synchronizeStream(stream_,device_.ordinal))std::terminate();if(stop_)backend_->destroyEvent(stop_,device_.ordinal);if(start_)backend_->destroyEvent(start_,device_.ordinal);});}
-    /** @brief Record start after untimed input publication. @param stream Original source stream. */
-    void begin(void* stream){requireProvider(stream && (!stream_ || stream_==stream),"Timing events require one original exact stream");stream_=stream;
-        requireProvider(backend_->recordEvent(start_,device_.ordinal,stream),"Native timing start failed");}
-    /** @brief Record end behind complete source physical retirement. @param stream Original source stream. */
-    void end(void* stream){requireProvider(stream==stream_,"Native timing end replaced its original source stream");
-        requireProvider(backend_->recordEvent(stop_,device_.ordinal,stream),"Native timing stop failed");}
-    /** @return Positive actual same-device native elapsed microseconds after full terminal join. */
-    double microseconds(){float ms=0;worker_.submitAndWait([&]{requireProvider(backend_->eventElapsedTimeMs(start_,stop_,device_.ordinal,&ms),"Native timing interval unavailable");});
-        requireProvider(std::isfinite(ms)&&ms>=0,"Invalid native event duration");return static_cast<double>(ms)*1000;}
-};
 /**
  * @brief Complete one local request inside its original single worker submission.
  * @param actor Original local fixture. @param events Original outer event pair.
@@ -331,7 +312,7 @@ public:
  * Native events bracket only the complete graph on the owning worker. No caller
  * round trip separates event/launch/event/wait, and no oracle is evaluated here.
  */
-double timedRequest(LocalActor& actor,TimingEvents& events){
+double timedRequest(LocalActor& actor,NativeGraphTimingEvents& events){
     const auto start=std::chrono::steady_clock::now();
     actor.worker.submitAndWait([&]{events.begin(actor.stream());actor.fixture->launchTiming();events.end(actor.stream());actor.fixture->join();});
     return std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-start).count();
@@ -345,7 +326,7 @@ double timedRequest(LocalActor& actor,TimingEvents& events){
  * both backends and rejects capture. Original source+owner submissions and final
  * participant joins remain unchanged; no worker guard or source API is bypassed.
  */
-double timedRequest(CrossActor& actor,TimingEvents& events){
+double timedRequest(CrossActor& actor,NativeGraphTimingEvents& events){
     const auto start=std::chrono::steady_clock::now();events.begin(actor.stream());
     actor.launch();events.end(actor.stream());actor.finish();
     return std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-start).count();
@@ -354,7 +335,7 @@ double timedRequest(CrossActor& actor,TimingEvents& events){
  * @tparam Actor Local or actual cross-vendor placement. @param actor Exact fixture. @param file Original provider.
  * @param o Frozen cell. @param worker Original source worker. */
 template<class Actor>void measure(Actor& actor,ProviderFile& file,const Options& o,IWorkerGPUContext& worker){
-    using P=ngram_replay::Pattern;TimingEvents events(worker,o.continuation);actor.admit();
+    using P=ngram_replay::Pattern;NativeGraphTimingEvents events(worker,o.continuation);actor.admit();
     std::vector<double> eventSamples,wallSamples;eventSamples.reserve(o.samples);wallSamples.reserve(o.samples);
     for(std::uint32_t index=0;index<ngram_replay::PreludeFrames;++index){const auto declared=ngram_replay::scheduledFrame(scenario(o),true,index);
         const auto warm=ngram_replay::ids(o.shape,declared.pattern);actor.prepare(warm);actor.launch();actor.finish();actor.validate(warm,index==1 && (scenario(o)==ngram_replay::Scenario::WarmHits || scenario(o)==ngram_replay::Scenario::DuplicateControl)?frame(o,0).expected_hits:std::nullopt);}
@@ -648,7 +629,7 @@ public:
                 fixtures_.push_back(nullptr);
                 const auto index=fixtures_.size()-1;
                 worker(index).submitAndWait([&,index]{fixtures_[index]=std::make_unique<ProviderReplay>(programs_[index],*graphs_[index]);});
-                events_.push_back(std::make_unique<TimingEvents>(worker(index),program.device));
+                events_.push_back(std::make_unique<NativeGraphTimingEvents>(worker(index),program.device));
             }
         }catch(...){release();throw;}
     }
@@ -786,7 +767,7 @@ private:
     std::shared_ptr<q::ImmutableLookupService> service_;
     std::vector<std::unique_ptr<ProviderReplayGraphs>> graphs_;
     std::vector<std::unique_ptr<ProviderReplay>> fixtures_;
-    std::vector<std::unique_ptr<TimingEvents>> events_;
+    std::vector<std::unique_ptr<NativeGraphTimingEvents>> events_;
     std::unique_ptr<q::ImmutableLookupExecutionBoundary::SourceGroupAdmission> group_;
     std::uint64_t requestEpoch_=0; ///< Original host-owned request admission identity, never a device-loop mirror.
 };

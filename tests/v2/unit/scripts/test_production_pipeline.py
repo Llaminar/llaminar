@@ -1753,6 +1753,47 @@ class PrerequisiteEntrypointTests(unittest.TestCase):
 
 
 class BenchmarkPolicyTests(unittest.TestCase):
+    def test_paired_diagnostic_arguments_project_only_explicit_original_prefix_policy(self):
+        """Original metadata adapter only; no model or native authority is minted."""
+        import model_kld_corpus_execution as adapter
+        record = dict(model='/original/model', diagnostic_benchmark=dict(schema=1,
+            policy='diagnostic_declared',certification_eligible=False,context_length=4096,args=['--no-mtp']))
+        observer = dict(expected_config=dict(configuration=dict(prefix_cache=dict(enabled=False))),
+                        engine_argv=['--no-mtp','--no-prefix-cache','--prefill-max-bucket-size','512'])
+        original = copy.deepcopy(record)
+        untouched,_,_ = adapter.canonical_diagnostic_arguments(record)
+        self.assertNotIn('--no-prefix-cache',untouched)
+        actual,_,_ = adapter.canonical_diagnostic_arguments(record,paired_observer=observer)
+        self.assertEqual(actual.count('--no-prefix-cache'),1)
+        self.assertNotIn('--prefill-max-bucket-size',actual)
+        self.assertEqual(record,original)
+        for change in ('enabled','missing','duplicate','conflict'):
+            bad=copy.deepcopy(observer)
+            if change=='enabled':bad['expected_config']['configuration']['prefix_cache']['enabled']=True
+            if change=='missing':bad['engine_argv'].remove('--no-prefix-cache')
+            if change=='duplicate':bad['engine_argv'].append('--no-prefix-cache')
+            if change=='conflict':bad['engine_argv'].append('--prefix-cache')
+            with self.assertRaisesRegex(ValueError,'explicitly disable prefix'):
+                adapter.canonical_diagnostic_arguments(record,paired_observer=bad)
+        conflicting=copy.deepcopy(record);conflicting['diagnostic_benchmark']['args'].append('--prefix-cache')
+        with self.assertRaisesRegex(ValueError,'conflicts with disabled observer'):
+            adapter.canonical_diagnostic_arguments(conflicting,paired_observer=observer)
+
+    def test_declared_parser_rejects_prefix_drift_before_native_launch(self):
+        """Actual benchmark pre-launch guard, with a mocked public-parser owner."""
+        from types import SimpleNamespace
+        prefix = dict(enabled=False, storage_mode='Tiered', disk_dir='/original/archive')
+        canonical = dict(config=dict(configuration=dict(prefix_cache=copy.deepcopy(prefix))))
+        selection = SimpleNamespace(topology=dict(expected_config=copy.deepcopy(canonical['config'])),
+                                    require_public_projection=Mock(return_value=canonical))
+        self.assertIs(benchmark.declared_config_identity(selection, {}, Path('/parser'), {}), canonical)
+        for field,value in [('enabled',True),('disk_dir','/foreign/archive'),('storage_mode','RAM')]:
+            bad = copy.deepcopy(canonical)
+            bad['config']['configuration']['prefix_cache'][field] = value
+            selection.require_public_projection.return_value = bad
+            with self.assertRaisesRegex(ValueError, 'original source prefix-cache policy'):
+                benchmark.declared_config_identity(selection, {}, Path('/parser'), {})
+
     @staticmethod
     def _focused_panel_fixture():
         """Producer-shaped metadata only; no model/native result is claimed by this fixture."""
@@ -2009,6 +2050,93 @@ class BenchmarkPolicyTests(unittest.TestCase):
                             'wire_attribution':'receive_completed_only','window':window}))
         return data
 
+    @staticmethod
+    def _initial_bank_fixture():
+        """Exact initial-bank producer forms; no native authority or execution."""
+        data=BenchmarkPolicyTests._passive_lookup_fixture(shared=True)
+        config=data['runtime_configuration']['configuration']
+        config['shared_predictor']='/original/predictor.gguf'
+        plan=config['moe_routed_expert_plan']
+        plan['domains'][0].update(routed_compute_policy='Apportioned',routed_phase_policy='Uniform')
+        plan['domains'].append(dict(name='cpu',participants=[dict(device_type='CPU',device_ordinal=0)],
+                                    routed_compute_policy='Apportioned',routed_phase_policy='Uniform'))
+        plan['routed_tiers'][0]['resolved_live_experts_per_layer']=[128,128]
+        plan['routed_tiers'].append(dict(domain='cpu',resolved_live_experts_per_layer=[256,256]))
+        records=data['perf_stats']['records']
+        records[:]=[x for x in records if x['domain']!='moe_placement']
+        for layer,role in [(0,'main_transformer'),(1,'mtp_predictor')]:
+            for device,participant,tier,size,selected in [('CUDA:0',0,0,2,64),('CUDA:1',1,0,2,64),('CPU',2,1,1,256)]:
+                records.append(dict(domain='moe_placement',name='routed_expert_weight_selection',device=device,
+                    phase='model_setup',kind='counter',count=1,value=selected,total_ns=0,
+                    tags=dict(layer=str(layer),participant=str(participant),tier=str(tier),tier_participant_count=str(size),
+                        owner_order='ordinal',selection_layout='contiguous',publication='initial_epoch_bank',
+                        frozen_owner_map_match='true',layer_role=role)))
+        return data
+
+    def test_declared_passive_initial_bank_matches_exact_registry_publication(self):
+        """Producer-shaped initial banks retain global IDs, tier and role coverage."""
+        data=self._initial_bank_fixture()
+        self.assertTrue(benchmark.validate_declared_passive_evidence(data)['adaptive'])
+        for field,value in [('publication','desired_map'),('frozen_owner_map_match','false'),('layer_role','unknown'),
+                            ('tier','2'),('tier_participant_count','3'),('participant','2')]:
+            bad=copy.deepcopy(data);next(x for x in bad['perf_stats']['records'] if x['domain']=='moe_placement')['tags'][field]=value
+            with self.subTest(field=field),self.assertRaises(ValueError):benchmark.validate_declared_passive_evidence(bad)
+        for change in ('partial','population','no_predictor','role_order'):
+            bad=copy.deepcopy(data);banks=[x for x in bad['perf_stats']['records'] if x['domain']=='moe_placement']
+            if change=='partial':bad['perf_stats']['records'].remove(banks[-1])
+            if change=='population':banks[-1]['value']-=1
+            if change=='no_predictor':bad['runtime_configuration']['configuration'].pop('shared_predictor')
+            if change=='role_order':banks[-1]['tags']['layer_role']='main_transformer'
+            with self.subTest(change=change),self.assertRaises(ValueError):benchmark.validate_declared_passive_evidence(bad)
+
+    def test_declared_passive_initial_bank_uses_physical_domain_policy_and_zero_banks(self):
+        """Sharded/replicated physical IDs are repeated; empty admitted banks remain evidence."""
+        for compute,phase,replicated in [('Apportioned','Uniform',False),('TensorSharded','Uniform',True),
+                ('Replicated','Uniform',True),('Apportioned','PrefillApportionedDecodeReplicated',True)]:
+            for population in [0,128]:
+                data=self._initial_bank_fixture()
+                plan=data['runtime_configuration']['configuration']['moe_routed_expert_plan']
+                plan['domains'][0].update(routed_compute_policy=compute,routed_phase_policy=phase)
+                plan['routed_tiers'][0]['resolved_live_experts_per_layer']=[population,population]
+                banks=[x for x in data['perf_stats']['records'] if x['domain']=='moe_placement' and x['tags']['tier']=='0']
+                for bank in banks:bank['value']=population if replicated else population//2
+                with self.subTest(compute=compute,phase=phase,population=population):
+                    self.assertTrue(benchmark.validate_declared_passive_evidence(data)['adaptive'])
+                bad=copy.deepcopy(data)
+                next(x for x in bad['perf_stats']['records'] if x['domain']=='moe_placement')['value']+=1
+                with self.assertRaises(ValueError):benchmark.validate_declared_passive_evidence(bad)
+        # CPU F-shard members can share the rendered CPU DeviceId; their
+        # original global participant IDs still identify distinct physical banks.
+        data=self._initial_bank_fixture()
+        domain=data['runtime_configuration']['configuration']['moe_routed_expert_plan']['domains'][1]
+        domain['participants']*=2
+        domain.update(routed_compute_policy='TensorSharded',routed_phase_policy='Uniform')
+        cpu=[x for x in data['perf_stats']['records'] if x['domain']=='moe_placement' and x['tags']['tier']=='1']
+        for bank in cpu:
+            bank['tags']['tier_participant_count']='2'
+            other=copy.deepcopy(bank);other['tags']['participant']='3';data['perf_stats']['records'].append(other)
+        self.assertTrue(benchmark.validate_declared_passive_evidence(data)['adaptive'])
+        bad=self._initial_bank_fixture()
+        bad['runtime_configuration']['configuration']['moe_routed_expert_plan']['domains'][0]['routed_compute_policy']='Automatic'
+        with self.assertRaisesRegex(ValueError,'unsupported passive initial-bank compute/phase'):
+            benchmark.validate_declared_passive_evidence(bad)
+
+    def test_declared_passive_noncoordinator_terminal_is_exact_original_zero_tuple(self):
+        """An original non-source controller can publish no source work, never invented traffic."""
+        data=self._passive_lookup_fixture(shared=True)
+        rows=[copy.deepcopy(x) for x in data['perf_stats']['records'] if x['domain']=='immutable_lookup'
+              and x['tags'].get('authority')=='terminal_device_generation_control']
+        for x in rows:x['device']='CUDA:0'
+        data['perf_stats']['records'].extend(rows)
+        self.assertTrue(benchmark.validate_declared_passive_evidence(data)['adaptive'])
+        for change in ('positive','foreign','partial'):
+            bad=copy.deepcopy(data)
+            if change=='positive':bad['perf_stats']['records'][-1]['value']=1
+            if change=='foreign':
+                for x in bad['perf_stats']['records'][-len(rows):]:x['device']='CUDA:7'
+            if change=='partial':bad['perf_stats']['records'].pop()
+            with self.subTest(change=change),self.assertRaises(ValueError):benchmark.validate_declared_passive_evidence(bad)
+
     def test_declared_combined_passive_binds_actual_local_ready_pairs_and_storage_windows(self):
         for zero_positive in (False,True):
             data=self._combined_passive_fixture(zero_positive)
@@ -2233,7 +2361,9 @@ class BenchmarkPolicyTests(unittest.TestCase):
                 native_identity=native_identity, actual_owner=actual_owner,
                 proofs={name: True for name in owner.corpus_v2.PROOFS})))
             selection = SimpleNamespace(topology=topology, corpus={'manifest': manifest},
-                documents={'pilot': None}, paths={'benchmark': workload_path})
+                documents={'pilot': None}, paths={'benchmark': workload_path},
+                canonical_arguments=['--ngram-gpu-cache-placement','consumer-local','--no-prefix-cache',
+                                     '-m','original.gguf','--context-length','4096'])
             record = {'model': 'original.gguf', 'diagnostic_benchmark': dict(schema=1, policy='diagnostic_declared',
                 certification_eligible=False, context_length=4096, args=['--ngram-gpu-cache-placement', 'consumer-local'])}
             args = argparse.Namespace(diagnostic=True, diagnostic_binary=binary, image=None,
@@ -2247,6 +2377,9 @@ class BenchmarkPolicyTests(unittest.TestCase):
             for failure_stage in ('measurement', 'configuration', 'passive', 'success'):
                 args.report = root / (failure_stage + '.json')
                 def guardian(command, environment, output):
+                    engine=command.index('benchmark')+1
+                    self.assertEqual(command[engine:engine+len(selection.canonical_arguments)],
+                                     selection.canonical_arguments)
                     self.assertEqual(environment['LLAMINAR_PERF_STATS_FILTER'],','.join(benchmark.DECLARED_PASSIVE_FILTERS))
                     self.assertEqual(environment['LLAMINAR_PERF_STATS_GPU_STAGE_TIMING'],'0')
                     (output / 'benchmark.json').write_text(json.dumps(self._passive_lookup_fixture()) if failure_stage=='success' else '{}')
@@ -2287,7 +2420,7 @@ class BenchmarkPolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             model=Path(temporary)/'model.gguf';model.write_bytes(b'original source')
             other=Path(temporary)/'other.gguf';other.write_bytes(b'foreign source')
-            canonical_config={'configuration':{'model_path':str(model),'prefix_cache':{'enabled':True},
+            canonical_config={'configuration':{'model_path':str(model),'prefix_cache':{'enabled':False},
                 'prefill_max_bucket_size':None}}
             observed_config=copy.deepcopy(canonical_config)
             observed_config['configuration'].update(prefix_cache={'enabled':False},prefill_max_bucket_size=512)

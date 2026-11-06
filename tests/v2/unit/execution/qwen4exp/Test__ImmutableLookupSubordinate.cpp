@@ -1629,6 +1629,45 @@ TEST(ImmutableLookupSubordinate, ClosedOriginalGroupWorkerGatePreservesAdmission
         })(), ::testing::ExitedWithCode(0), "");
     }
 }
+/** @test Acquired future frames preserve native bytes and hit pins without demand credit. */
+TEST(ImmutableLookupSubordinate, FutureLookupOnlyUsesOriginalGrantAndConsumptionAck)
+{
+    Lane lane;
+    const std::array<std::int64_t,2> seed{3,4};const std::array<Intent,2> reads{};
+    lane.publish(1,1,seed,reads);ASSERT_EQ(lane.processor->poll(1),ImmutableLookupPoll::Completed);
+    lane.consume(1);lane.poison();const auto before=lane.cache->stats();
+    const std::array<std::int64_t,4> ids{3,7,7,4};
+    const std::array<Intent,4> future{{{Operation::FutureLookupOnly,0},{Operation::FutureLookupOnly,0},
+        {Operation::FutureLookupOnly,0},{Operation::FutureLookupOnly,0}}};
+    lane.publish(2,2,ids,future);ASSERT_EQ(lane.processor->poll(2),ImmutableLookupPoll::Completed);
+    lane.expectRows(ids);EXPECT_EQ(lane.completion().status,static_cast<std::uint64_t>(ImmutableLookupStatus::Success));
+    const auto after=lane.cache->stats();EXPECT_EQ(after.admissions,before.admissions);
+    EXPECT_EQ(after.evictions,before.evictions);EXPECT_EQ(after.invalidations,before.invalidations);
+    EXPECT_EQ(after.resident_rows,before.resident_rows);
+    auto hit=lane.processor->borrowSubordinateResponseRow(0);ASSERT_TRUE(hit);
+    EXPECT_FALSE(lane.processor->borrowSubordinateResponseRow(1));
+    for(std::size_t at=0;at<ids.size();++at)EXPECT_EQ(lane.invalidations()[at].destination_grant,0u);
+    lane.consume(2);lane.poison();
+    lane.publish(3,3,seed,reads);ASSERT_EQ(lane.processor->poll(3),ImmutableLookupPoll::Completed);
+    EXPECT_EQ(std::memcmp(hit->bytes().data(),lane.file.bytes.data()+lane.file.source.file_offset+3*lane.layout.rowBytes(),lane.layout.rowBytes()),0);
+}
+/** @test Future purpose cannot smuggle an invalidation token or mix ordinary operations. */
+TEST(ImmutableLookupSubordinate, FutureLookupOnlyRejectsMixedAndNonzeroDestinationBeforeCopy)
+{
+    for(unsigned variant=0;variant<3;++variant){
+        Lane lane;const auto before=lane.cache->stats();
+        const std::array<std::int64_t,2> ids{3,3};
+        std::array<Intent,2> intents{{{Operation::FutureLookupOnly,0},{Operation::FutureLookupOnly,0}}};
+        if(variant==0)intents[0].destination_grant=9;
+        if(variant==1)intents[1].intent=Operation::Read;
+        if(variant==2)intents[1]={Operation::ReadAndInvalidate,9};
+        lane.publish(1,1,ids,intents);ASSERT_EQ(lane.processor->poll(1),ImmutableLookupPoll::Completed);
+        EXPECT_EQ(lane.completion().status,static_cast<std::uint64_t>(ImmutableLookupStatus::InvalidProtocol));
+        EXPECT_EQ(lane.cache->stats().admissions,before.admissions);
+        for(auto byte:lane.payload())EXPECT_EQ(byte,std::byte{0xa5});
+    }
+}
+
 } // namespace llaminar2::qwen4exp
 
 namespace llaminar2::qwen4exp {

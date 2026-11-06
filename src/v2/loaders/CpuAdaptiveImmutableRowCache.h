@@ -201,7 +201,7 @@ public:
      * @return Actual copy/source/window work and serialized operation ordinal;
      * lookup-only completion counts do not grant demand policy credit.
      * @throws std::exception For invalid purpose, subordinate access, invalid frame,
-     * retirement or original source failure. No subordinate future protocol is enabled.
+     * retirement or original source failure. Independent calls still cannot bypass a subordinate owner.
      */
     CpuImmutableRowGatherObservation gather(std::span<const std::int64_t> ids,std::span<std::byte> destination,
         CpuImmutableRowCacheAccess access);
@@ -286,7 +286,7 @@ private:
      * @param ids Original validated row sequence; duplicate source reads coalesce.
      * @param destination Exact externally owned native response storage.
      * @param grant Original processor capability, absent for independent CPU reads.
-     * @param access Validated read purpose; subordinate grants currently require demand.
+     * @param access Validated read purpose; subordinate purpose is derived only from its complete acquired operation metadata.
      * @return Serialized completed native/source work, not speculative demand credit.
      * @throws std::exception For incompatible access/grant, invalid capacity/alias/row,
      * stale source, retired owner or failed original gather. Source failure is sticky.

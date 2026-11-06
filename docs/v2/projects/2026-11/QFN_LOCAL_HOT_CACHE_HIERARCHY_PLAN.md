@@ -18,10 +18,65 @@ authority over the source table.
 `ConsumerLocal` and shared-only `DeclaredRankLocal` remain comparison policies.
 The shared-only replicated-reader contract delivers expanded FP32 lookup output;
 the combined extension delivers compact native misses and retains local hits.
-Current-demand early overlap is implemented. Speculative future shared misses
-remain unsupported: their source and pool policy credit must first be separated
-from actual demand consumption. Existing owner/source/MTP passes alone do not
-qualify the combined hierarchy.
+Current-demand early overlap is implemented. The future-source components now
+separate speculative lookup from actual demand credit, but complete model
+future scheduling remains disabled until its retained source transactions and
+graph families are wired and qualified. Existing owner/source/MTP passes alone
+do not qualify model future read-ahead.
+
+The current-demand slice is checkpointed on `feat/qfn-ngram-continuation` at
+`6ebdb5019`. Its four fresh numerical panels pass the required groups. The first
+natural-history Release comparison stopped before inference because the declared
+diagnostic benchmark omitted the paired numerical profile's disabled prefix-cache
+policy and opened the default disk archive. That failed run is retained at
+`/tmp/qfn-declared-benchmark-command-prep-r785/shared-varied4-execute-r1`;
+it provides no timing result. The paired diagnostic adapter now carries through
+the authenticated observer's explicit disabled-prefix setting and checks the
+complete prefix policy before launch. The original exports and accuracy panels
+are unchanged. All three short natural-history campaigns now complete eight
+workloads each with identical generated tokens and clean native/driver retirement.
+The saved shared run required a separate postvalidation receipt after fixing
+stale passive telemetry assumptions; its original failed validator report is
+preserved. The owning Python suite passes all 250 tests. The repair validates
+physical expert-bank populations according to apportioned, tensor-sharded,
+replicated and phase-aware domain policies, including zero-capacity banks and
+registry-global participant IDs. Evidence and the matched rates are in
+`/tmp/qfn-declared-benchmark-command-prep-r785/comparison.json` and the sibling
+Markdown table. This short ROCm TP2 plus CPU-capacity workload favors
+ConsumerLocal; combined hierarchy overhead currently outweighs its smaller
+native-source traffic. It is not a cold-SSD or lookup-latency measurement, and
+no default policy is promoted. Longer prompt/scan coverage and phase attribution
+remain performance obligations.
+
+The [coordination and fusion investigation](QFN_LOCAL_HOT_CACHE_FUSION_20261106.md)
+records the matched rates, actual traffic, compact coordinator bound repair and
+separate local-probe/shared-union fusion candidates. Internal kernel boundaries
+may be replaced by block synchronization where the original policy and ordering
+remain exact; actual source, transfer and publication dependencies must remain.
+
+Future read-ahead remains a separate implementation slice. The source
+lookup-only, complete-demand adoption, producer/consumer lifecycle and borrowed
+next-prefill-window components are now integrated for a coherent focused build;
+actual model scheduling is still disabled. Speculation uses the existing frame
+and response banks and earns no replacement-policy credit before real demand.
+The 41 focused component cases pass, including real source delivery after
+adoption, pressure/discard/reset safety and large-to-small demand replay on CUDA
+and ROCm. The component receipt is
+`/tmp/qfn-future-component-integration-r789/component-qualification.json`.
+The next-window requirement is an immutable retained-family contract checked at
+every request ingress; a proof about one request cannot authorize a later request
+that reuses the same pointers. No new token/count cursor is introduced.
+
+Model enabling still requires ordered finite auxiliary bodies and one original
+source plan covering their genuine source occurrences. First-current plus next-
+future executes two source lookups; adopted-current plus next-future executes
+one. The original remote owner must perform that exact count inside one selected
+complete retained transaction, with canonical admission for any additional
+retained executable. Future Hash/Probe must join both prior local retirement and
+accepted PLE history, while transformer work can proceed independently. This is
+a bounded extension of the existing graph/source owners. Native component
+qualification, actual model overlap, numerical panels and Release benefit remain
+separate obligations; component passes do not advertise model read-ahead support.
 
 | Slice | Implementation | Functional qualification | Performance qualification |
 |---|---|---|---|
@@ -30,6 +85,8 @@ qualify the combined hierarchy.
 | Local-cache configuration and PMA roots | Implemented in the integration tree; independent ceilings, C0, overrides, exact ready-page ownership | Focused parser/document/admission/ownership and runtime-projection registrations pass | Not a runtime measurement |
 | Combined local hot cache and shared pool | Native compact delivery, current-probe parent dependency, model wiring, terminal counters and once-request admission integrated | CUDA/ROCm native coverage spans 23 formats; focused ordinary/fixed1/fixed3/dynamic checks pass. Real TP2 held-source cases prove local-hit completion independently of a missing peer's owner service on both backends. Six-GPU C0 and positive-cache configurations pass ordinary generation with expert movement and fixed1 exact replay. Six-GPU C0 source recreation and final retirement pass. Fresh CUDA combined and ROCm refined-combined/shared-only/ConsumerLocal numerical panels pass every required group | Pending; no default promotion |
 | Native compact responses and unequal consumer miss sets | Compact request/union and native completion bindings implemented; actual delivery graph under integration | Compact-consumer, request-publication and native-request-binding CTests pass; native transport qualification pending | Pending |
+| Small local probe fusion | Integrated; four launches become one for at most 512 original IDs | 32 distinct focused native cases pass, including every small token count, both key widths and C0; compiler spill guards pass for all six shipped GPU targets. Fresh CUDA/ROCm numerical panels retain all 178 baseline row metrics exactly | Matched QFN-sized warm graph latency improves about 3.7% on CUDA; ROCm changes are near run variation. Combined probe/bound/union Release run passes; +1.34% prefill/+0.85% decode is too small to establish a firm gain from one historical pair |
+| Shared query launch bound and small union fusion | Integrated as separate changes after the local-probe component pass; existing storage and transport contracts retained | Bound-only 11-case and union 10-case host/CUDA/MI50 selections pass; gfx1100 adds 14 passing native cases; no skips or new driver errors. Fresh numerical panels pass | Eight-request matching MI50 Release campaign passes with exact generated tokens; no standalone union speedup or default promotion claim |
 | Real token-trace measurement | Exact GGUF/PLE trace exporter and metric contract implemented; native IQ4_NL source extent corrected | Parser and existing trace regressions pass, with the old parser failing the same regression. Two saved histories now validate their actual 90-byte native rows; oversized 320-byte exports reject | Two short histories provide limited warm/history inputs. Long-scan and speculative captures, actual combined-runtime timing and matched controls remain required |
 
 The first new model projections are the existing ROCm TP2 RAM-backed,
@@ -544,6 +601,18 @@ time-to-use, staging/pin high-water marks, protected-row survival and full-model
 throughput. Earlier submission alone is not a performance win. Keep any adaptive
 lookahead decisions in the existing device controller and test recorded inputs;
 do not add a host policy that reads live counts or cache contents.
+
+Completion requires effective fetch/compute overlap across the six hardware rows
+below, not merely native component passes or a higher future-ready counter.
+The finite producer parent joins its future body before completing, so
+`future_on_time_native_rows` means ready at adoption even if that join stalled.
+Use the existing native graph/stage timing machinery to measure the independent
+main-tail and future-body completion intervals on the same device, plus the
+complete parent critical path. Report exposed fetch delay separately from
+useful native bytes. Never subtract timestamps from different GPU clocks or
+label host enqueue duration as device work. Keep instrumented attribution
+separate from interleaved, unprofiled Release comparisons. A benefit must survive
+the complete request timing, including required control traffic and retirement.
 
 ## Functional qualification
 

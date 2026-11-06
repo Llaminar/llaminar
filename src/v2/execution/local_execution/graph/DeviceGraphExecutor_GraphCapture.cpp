@@ -4173,7 +4173,9 @@ namespace llaminar2
 
         const auto recorded_source_boundary = [&](const std::string& name,void* stream){
             const auto& domain=graph.retainedParticipantDefinitionDomain();
-            if(!domain || name.find(":phase=capture_end:")==std::string::npos)
+            const auto& range=graph.retainedParticipantAuxiliaryRange();
+            if((range && localConsumptionOnly(range->lifecycle)) ||
+               !domain || name.find(":phase=capture_end:")==std::string::npos)
                 return capture_boundary?capture_boundary(name,stream):true;
             if(!auxiliary_branch_factory.source_definition_boundary)
                 throw std::logic_error("Graph-declared source definition has no original cold TP boundary");
@@ -4197,16 +4199,18 @@ namespace llaminar2
             const auto& range=*graph.retainedParticipantAuxiliaryRange();
             const auto& definition=segment_cache.recorded_source_definition;
             const auto& domain=graph.retainedParticipantDefinitionDomain();
-            if(!gpu_ctx || !gpu_ctx->ownsCurrentThread() || !domain || !definition ||
-               definition->definition().domain!=*domain || segment_cache.capture_device!=range.participant ||
+            const bool local=localConsumptionOnly(range.lifecycle);
+            if(!gpu_ctx || !gpu_ctx->ownsCurrentThread() || !domain ||
+               (local ? !range.local_consumption || bool(definition) :
+                        !definition || definition->definition().domain!=*domain) || segment_cache.capture_device!=range.participant ||
                ctx->deviceId()!=range.participant || parent.hasExecutable() || !parent.nodeCount() ||
                parent.executionStream()!=segment_cache.capture_stream ||
                segment_cache.original_storage_attachment || segment_cache.participant_auxiliary_preparation)
                 throw std::logic_error("Finite participant body requires its actual untouched parent/source/worker");
-            definition->requireCurrentDefinition();
-            const auto plan=definition->definition().plan;
-            const auto original=GPUDeviceContextPool::instance().retainExistingPreparedContext(
-                range.participant,definition->originalSource().memory());
+            if(!local)definition->requireCurrentDefinition();
+            const auto plan=local ? std::shared_ptr<const IRetainedGraphParticipantSourcePlan>{} : definition->definition().plan;
+            const auto original=GPUDeviceContextPool::instance().retainExistingPreparedContext(range.participant,
+                local ? range.local_consumption->originalParticipant(range.participant).memory() : definition->originalSource().memory());
             if(original.worker().get()!=gpu_ctx)
                 throw std::logic_error("Finite participant body substituted the original prepared worker");
             original.requireWorker(original.worker());
@@ -4226,9 +4230,11 @@ namespace llaminar2
                 original,segment_cache.capture_stream,RetainedGraphParticipantPreparationStream::Definition{
                     .graph=&graph,.arena=arena_,.topology_generation=graph.topologyGeneration(),
                     .variant=segment_cache.capture_variant_signature,.domain=*domain,.plan=plan,
-                    .scope=range.role==RetainedGraphParticipantAuxiliaryRole::Source
-                        ?RetainedGraphParticipantDefinitionScope::AuxiliarySource:RetainedGraphParticipantDefinitionScope::AuxiliaryReader,
-                    .participant=range.participant,.range_identity=range.identity,.original_source_definition=definition}));
+                    .scope=local ? RetainedGraphParticipantDefinitionScope::LocalConsumption :
+                        range.role==RetainedGraphParticipantAuxiliaryRole::Source
+                            ?RetainedGraphParticipantDefinitionScope::AuxiliarySource:RetainedGraphParticipantDefinitionScope::AuxiliaryReader,
+                    .participant=range.participant,.range_identity=range.identity,.original_source_definition=definition,
+                    .local_consumption=range.local_consumption}));
             segment_cache.participant_auxiliary_preparation->requireDefinition();
 
             auto& body=*participant_auxiliary_segment;
@@ -4271,7 +4277,9 @@ namespace llaminar2
                 .capture_variant_signature=segment_cache.capture_variant_signature,
                 .capture_generation=segment_cache.evidence_family,.range_identity=range.identity},
                 original,std::move(native),segment_cache.participant_auxiliary_preparation);
-            segment_cache.original_storage_attachment=plan->prepareOriginalAuxiliaryAttachment(seal,segment_cache.auxiliary_branch.get());
+            segment_cache.original_storage_attachment=local
+                ? range.local_consumption->prepareLocalAttachment(seal,segment_cache.auxiliary_branch.get())
+                : plan->prepareOriginalAuxiliaryAttachment(seal,segment_cache.auxiliary_branch.get());
             if(!segment_cache.original_storage_attachment)
                 throw std::logic_error("Finite participant body was not retained by its original parent attachment");
             const bool attached=segment_cache.original_storage_attachment->attachTo(parent,segment_cache.auxiliary_branch.get());

@@ -312,3 +312,50 @@ TEST(Qwen4ExpPrimitives, RejectsMalformedBindingsAndCounts)
     accepted = 0;
     EXPECT_THROW(kernel->commitConvHistory({{{1}, &accepted}, 4, history.data(), input.data(), history.data()}, nullptr), std::invalid_argument);
 }
+
+/** @test Actual CPU Hash and the exact shared Probe-count resolver select the same original next bucket. */
+TEST(Qwen4ExpPrimitives, PrefillNextWindowUsesOriginalChunkWithoutCursorOrCountBank)
+{
+    llaminar::v2::ThreadCountGuard team(1);
+    auto kernel=createCPUQwen4ExpKernels();const auto policy=hashPolicy();
+    constexpr int capacity=24,bucket=8;
+    std::array<std::int32_t,capacity> tokens{},positions{};
+    std::iota(positions.begin(),positions.end(),127);
+    for(int i=0;i<capacity;++i)tokens[i]=i%5==0?policy.eosToken:17+i;
+    std::int32_t total=capacity,currentPosition=127,currentRows=bucket;
+    const std::int32_t prior[]{37,static_cast<std::int32_t>(policy.eosToken)};
+    Qwen4ExpPrefillNextTokenWindow window{tokens.data(),positions.data(),&total,&currentPosition,&currentRows,
+        capacity,bucket,bucket,1};
+    for(int replay=0;replay<20;++replay)for(total=1;total<=capacity;++total)
+        for(int start=0;start<total;++start){
+            currentPosition=positions[start];currentRows=std::min(bucket,total-start);
+            const auto view=window.resolve();ASSERT_TRUE(view.valid);
+            const int expectedFirst=start+currentRows,expectedRows=std::min(bucket,total-expectedFirst);
+            EXPECT_EQ(view.first,expectedFirst);EXPECT_EQ(view.rows,expectedRows);
+            EXPECT_EQ(window.originalIds(),expectedRows*16);
+            std::vector<std::int64_t> actual(bucket*16,-777),expected(bucket*16,-777);
+            kernel->ngramHashNextWindow({{bucket},tokens.data(),prior,actual.data(),policy,window},nullptr);
+            if(expectedRows)kernel->ngramHash({{expectedRows},tokens.data()+expectedFirst,prior,expected.data(),policy},nullptr);
+            EXPECT_EQ(actual,expected);EXPECT_EQ(currentRows,std::min(bucket,total-start));
+            EXPECT_EQ(currentPosition,positions[start]);
+        }
+}
+/** @test Malformed borrowed declarations or live windows cannot become successful empty queries. */
+TEST(Qwen4ExpPrimitives, PrefillNextWindowRejectsMalformedAndCompetingInputs)
+{
+    auto kernel=createCPUQwen4ExpKernels();const auto policy=hashPolicy();
+    std::array<std::int32_t,12> tokens{},positions{};std::iota(positions.begin(),positions.end(),41);
+    std::int32_t total=12,current=41,rows=4;const std::int32_t prior[]{1,2};
+    std::array<std::int64_t,64> output{};
+    Qwen4ExpPrefillNextTokenWindow window{tokens.data(),positions.data(),&total,&current,&rows,12,4,4,1};
+    const auto run=[&]{kernel->ngramHashNextWindow({{4},tokens.data(),prior,output.data(),policy,window},nullptr);};
+    ASSERT_NO_THROW(run());
+    for(const auto bad:{-1,0,13,INT32_MAX}){total=bad;EXPECT_FALSE(window.resolve().valid);EXPECT_EQ(window.originalIds(),-1);EXPECT_THROW(run(),std::invalid_argument);}total=12;
+    for(const auto bad:{-1,0,5,INT32_MAX}){rows=bad;EXPECT_FALSE(window.resolve().valid);EXPECT_THROW(run(),std::invalid_argument);}rows=4;
+    for(const auto bad:{-1,40,53,INT32_MAX}){current=bad;EXPECT_FALSE(window.resolve().valid);EXPECT_THROW(run(),std::invalid_argument);}current=41;
+    window.version=99;EXPECT_THROW(run(),std::invalid_argument);window.version=1;
+    window.next_bucket=13;EXPECT_THROW(run(),std::invalid_argument);window.next_bucket=4;
+    int competing=1;EXPECT_THROW(kernel->ngramHashNextWindow({{4,&competing},tokens.data(),prior,output.data(),policy,window},nullptr),std::invalid_argument);
+    EXPECT_THROW(kernel->ngramHashNextWindow({{4},tokens.data()+1,prior,output.data(),policy,window},nullptr),std::invalid_argument);
+    window.request_total=nullptr;EXPECT_THROW(run(),std::invalid_argument);
+}

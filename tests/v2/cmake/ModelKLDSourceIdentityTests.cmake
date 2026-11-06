@@ -191,3 +191,27 @@ if(TARGET v2_test_model_parity_definition)
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QFNResetComparisonPolicy)
 endif()
+
+# Translate only the paired observer's authenticated disabled-prefix policy.
+if(Python3_Interpreter_FOUND)
+    add_v2_test(V2_Integration_DeclaredBenchmarkPrefixPolicy
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/../unit/scripts/test_production_pipeline.py
+            BenchmarkPolicyTests.test_paired_diagnostic_arguments_project_only_explicit_original_prefix_policy
+            BenchmarkPolicyTests.test_declared_parser_rejects_prefix_drift_before_native_launch
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Parity;Contract;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 15
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_DeclaredBenchmarkPrefixPolicy)
+endif()
+
+if(Python3_Interpreter_FOUND)
+    add_v2_test(V2_Integration_DeclaredBenchmarkInitialBankPublication
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/../unit/scripts/test_production_pipeline.py
+            BenchmarkPolicyTests.test_declared_passive_initial_bank_matches_exact_registry_publication
+            BenchmarkPolicyTests.test_declared_passive_initial_bank_uses_physical_domain_policy_and_zero_banks
+            BenchmarkPolicyTests.test_declared_passive_noncoordinator_terminal_is_exact_original_zero_tuple
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Parity;Contract;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 15
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_DeclaredBenchmarkInitialBankPublication)
+endif()

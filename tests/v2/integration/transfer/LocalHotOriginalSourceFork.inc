@@ -32,7 +32,15 @@ namespace llaminar2::test { namespace original_l1_fork {
 namespace q=qwen4exp;namespace h=q::local_hot;namespace t=q::local_hot_transport;namespace n=q::pooled_native;
 #include "../kernels/qwen4exp/PooledImmutableProviderFile.inc"
 
-/** @brief Require the selected real backend; no absence skip or alternate path is permitted. */
+/**
+ * @brief Replay the selected original source and captured local query on a real backend.
+ * @tparam Maximum Original admitted bank/frame extent in IDs, unchanged across replays.
+ * @tparam QueryTokens Exact immutable captured token-row ceiling, independent from bank capacity.
+ * @param device Actual physical participant; absence or native failure is fatal.
+ * @throws std::exception For invalid original source, admission, capture or retirement.
+ * @note Diagnostic terminal copies observe outputs only after actual parent retirement.
+ */
+template<std::uint32_t Maximum=32,std::uint32_t QueryTokens=Maximum/16>
 void actualSourceFork(DeviceId device)
 {
     if(!hasCPUBackend())initCPUBackend(-1);
@@ -40,7 +48,8 @@ void actualSourceFork(DeviceId device)
     const auto memory=session->memory();const auto gpu=session->resource(device),host=session->resource(DeviceId::cpu());
     const PhysicalMemoryAllocatorIdentity gpuId{0,device},hostId{0,DeviceId::cpu()};
     const std::array<std::uint64_t,4> authored{7,8,9,10};ProviderFile file(32,authored);const auto source=file.descriptor();
-    constexpr std::uint32_t Maximum=32,Slots=4;
+    static_assert(QueryTokens>0 && Maximum%16==0 && QueryTokens<=Maximum/16);
+    constexpr std::uint32_t Slots=4,QueryOriginal=QueryTokens*16;
     const std::array tiers{ImmutableRowStorage::VRAM,ImmutableRowStorage::RAM};
     const auto layout=ImmutableRowTableLayoutGeometry::checked(ImmutableRowTableExtent::fromNative(source.format,source.rows,source.rowBytes()),
         ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,
@@ -128,9 +137,21 @@ void actualSourceFork(DeviceId device)
         std::unique_ptr<IDeviceContext> context;
         worker->submitAndWait([&]{context=IDeviceContext::create(device,1);});
         const auto body=appendPooledImmutableLocalHotSourceBody(graph,arena,transport,std::array{local},poolCode,local,localCode,
-            DeviceRowRange::deviceCounted(Maximum/16,static_cast<const int*>(roots[1]->gpu_data_ptr())),
-            {roots[0],BufferId::QFN_NGRAM_ROW_IDS,0,Maximum*8},q::PooledNativeTensorSpan{roots[1],BufferId::PREFILL_CHUNK_GEOMETRY,0,4},*control,
-            {roots[3],BufferId::QFN_PLE_EMBEDDING,0,roots[3]->size_bytes()},"original_local","actual_local_read");
+            DeviceRowRange::deviceCounted(QueryTokens,static_cast<const int*>(roots[1]->gpu_data_ptr())),
+            {roots[0],BufferId::QFN_NGRAM_ROW_IDS,0,QueryOriginal*8},q::PooledNativeTensorSpan{roots[1],BufferId::PREFILL_CHUNK_GEOMETRY,0,4},*control,
+            {roots[3],BufferId::QFN_PLE_EMBEDDING,0,QueryOriginal*file.columns*4},"original_local","actual_local_read");
+        const PooledImmutableLocalHotBeginStage* begin=nullptr;
+        for(const auto& name:graph.getExecutionOrder()){
+            const auto* actual=dynamic_cast<const PooledImmutableLocalHotBeginStage*>(graph.getNode(name)->stage.get());
+            if(actual && actual->source()==boundary->pooledStorage()){
+                ASSERT_EQ(begin,nullptr);begin=actual;
+            }
+        }
+        ASSERT_NE(begin,nullptr);
+        EXPECT_EQ(begin->query().queryBound().canonicalOriginal(),QueryOriginal);
+        EXPECT_EQ(begin->query().queryBound().maximumOriginal(),QueryOriginal);
+        EXPECT_TRUE(n::coordinatorUsesSmallOriginal(DeviceRowRange::fullyActive(QueryOriginal)));
+        if constexpr(Maximum>QueryOriginal)EXPECT_FALSE(n::coordinatorUsesSmallOriginal(DeviceRowRange::fullyActive(Maximum)));
         EXPECT_FALSE(graph.retainedParticipantSourcePlan());EXPECT_FALSE(graph.retainedParticipantAuxiliaryRange());
         requirePooledSourceRetirementCompletion(graph,body.pool_retirement);
         requirePooledLocalHotAuxiliary(graph,body.local.auxiliary,transport,local);
@@ -190,7 +211,7 @@ void actualSourceFork(DeviceId device)
              */
             const auto replay=[&](std::span<const std::uint64_t> input,bool heldAllHit,
                 std::uint64_t expectedMisses,std::uint64_t expectedHits,std::uint64_t expectedPromotions){
-                requireProvider(input.size()%16==0 && input.size()<=Maximum,"Actual full query extent invalid");file.requireAuthored(input);
+                requireProvider(input.size()%16==0 && input.size()<=QueryOriginal,"Actual full query extent invalid");file.requireAuthored(input);
                 std::array<std::uint64_t,Maximum> ids{};std::copy(input.begin(),input.end(),ids.begin());const int tokens=static_cast<int>(input.size()/16);
                 std::vector<float> poison(Maximum*file.columns,-12345.f);
                 hostWord(probeDone).store(0,std::memory_order_release);hostWord(readDone).store(0,std::memory_order_release);hostWord(gate).store(heldAllHit || expectedMisses?0:1,std::memory_order_release);
@@ -213,7 +234,7 @@ void actualSourceFork(DeviceId device)
                 std::vector<float> expected(input.size()*file.columns),actual(poison.size());
                 q::decodeCPUImmutableLookupRows(file.type,static_cast<int>(file.columns),file.row_bytes,nativeRows.data(),input.size(),expected.data());
                 worker->submitAndWait([&]{requireProvider(backend->deviceToHostOnStream(actual.data(),roots[3]->gpu_data_ptr(),actual.size()*4,device.ordinal,stream),"Actual LocalRead terminal copy failed");});join();
-                EXPECT_EQ(std::memcmp(actual.data(),expected.data(),expected.size()*4),0);
+                if(!expected.empty())EXPECT_EQ(std::memcmp(actual.data(),expected.data(),expected.size()*4),0);
                 for(std::size_t i=expected.size();i<actual.size();++i)EXPECT_EQ(actual[i],-12345.f);
                 const auto& offsets=local->geometry().frameOffsets();
                 const auto frame=observe.template operator()<h::FrameIdentity>(local->roots().frame,offsets.identity);
@@ -248,6 +269,15 @@ void actualSourceFork(DeviceId device)
             std::vector<std::uint64_t> mixed(16,7);mixed.back()=8;
             replay(mixed,false,request==1?1:0,request==1?15:16,request==1?1:0);
             replay(mixed,true,0,16,0);
+            {
+                // Both source-storage shapes exercise the same fused small query: replay
+                // its full live tile, zero progress, then small work without
+                // changing graph, root pointers, source or allocation geometry.
+                std::vector<std::uint64_t> full(QueryOriginal,7);
+                replay(full,true,0,QueryOriginal,0);
+                replay(std::span<const std::uint64_t>{},true,0,0,0);
+                replay(warm,true,0,16,0);
+            }
             worker->submitAndWait([&]{boundary->recordTerminalClose(stream);});join();boundary->awaitTerminal();
             const auto stats=service->stats();EXPECT_GE(stats.requests,beforeService.requests);EXPECT_GE(stats.ids,beforeService.ids);EXPECT_GE(stats.nativeBytes,beforeService.nativeBytes);
             EXPECT_EQ(stats.requests-beforeService.requests,expectedRequests);EXPECT_EQ(stats.ids-beforeService.ids,expectedRows);
@@ -262,8 +292,10 @@ void actualSourceFork(DeviceId device)
 }
 #ifdef HAVE_CUDA
 TEST(LocalHotNativeParentFork,CUDA_OriginalSourceAllHitAndMixed){original_l1_fork::actualSourceFork(DeviceId::cuda(0));}
+TEST(LocalHotNativeParentFork,CUDA_OriginalSourceTightQueryBound){original_l1_fork::actualSourceFork<1024,2>(DeviceId::cuda(0));}
 #endif
 #ifdef HAVE_ROCM
 TEST(LocalHotNativeParentFork,ROCm_OriginalSourceAllHitAndMixed){original_l1_fork::actualSourceFork(DeviceId::rocm(0));}
+TEST(LocalHotNativeParentFork,ROCm_OriginalSourceTightQueryBound){original_l1_fork::actualSourceFork<1024,2>(DeviceId::rocm(0));}
 #endif
 } // namespace llaminar2::test

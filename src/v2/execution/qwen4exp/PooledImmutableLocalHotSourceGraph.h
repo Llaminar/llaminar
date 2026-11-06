@@ -42,4 +42,35 @@ PooledImmutableLocalHotSourceBody appendPooledImmutableLocalHotSourceBody(
     std::shared_ptr<const qwen4exp::IPooledImmutableLocalHotKernels>,
     DeviceRowRange,qwen4exp::PooledNativeTensorSpan,std::optional<qwen4exp::PooledNativeTensorSpan>,
     DeviceGenerationControlBinding,qwen4exp::PooledNativeTensorSpan,const std::string&,const std::string&);
+/** @brief Real future producer; local pins/response survive its completed source/ACK terminal. */
+struct PooledImmutableLocalHotFutureSourceBody final {
+    std::string probe,acquired,transport_retired;
+    PooledImmutableSourceRetirementCompletion pool_retirement;
+    RetainedGraphParticipantAuxiliaryRange auxiliary;
+};
+/**
+ * @brief Append genuine lookup-only source delivery without a later model-read wait.
+ * @param graph Actual participant-local graph. @param arena Same source arena.
+ * @param transport Original directed source and complete local-root roster.
+ * @param locals Original ordered consumer roots. @param poolCode Same source native code.
+ * @param local Same coordinator local root. @param localCode Same local native code.
+ * @param tokens Actual full token-count producer. @param ids Already-authored original ordered hashes.
+ * @param count Exact optional original count. @param control Same original controller row.
+ * @param identity Unique original stage namespace.
+ * @return Probe/acquisition and actual pool/source retirement; no local read/consume/retire.
+ * @note This low-level component does not mint model token/history publication.
+ * The model owner must independently order its genuine history commit and
+ * previous local Retire before the actual future Hash/Probe.
+ */
+PooledImmutableLocalHotFutureSourceBody appendPooledImmutableLocalHotFutureSourceBody(
+    ComputeGraph& graph,BufferArena& arena,
+    std::shared_ptr<const qwen4exp::PooledImmutableDirectedTransport> transport,
+    std::span<const std::shared_ptr<qwen4exp::PooledImmutableLocalHotPreparedStorage>> locals,
+    std::shared_ptr<const qwen4exp::IPooledImmutableNativeKernels> poolCode,
+    std::shared_ptr<qwen4exp::PooledImmutableLocalHotPreparedStorage> local,
+    std::shared_ptr<const qwen4exp::IPooledImmutableLocalHotKernels> localCode,
+    DeviceRowRange tokens,qwen4exp::PooledNativeTensorSpan ids,
+    std::optional<qwen4exp::PooledNativeTensorSpan> count,DeviceGenerationControlBinding control,
+    const std::string& identity);
+
 }

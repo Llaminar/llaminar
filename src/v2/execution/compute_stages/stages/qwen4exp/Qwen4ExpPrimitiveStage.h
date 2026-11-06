@@ -13,6 +13,7 @@
 #include "../../IComputeStage.h"
 #include "../RMSNormStage.h"
 #include "../../../qwen4exp/Qwen4ExpPreparedStorage.h"
+#include "../../../qwen4exp/Qwen4ExpPrefillNextWindowBinding.h"
 #include "../../StageParamsBase.h"
 #include "../../../../kernels/qwen4exp/Qwen4ExpKernels.h"
 #include "../../../../tensors/TensorType.h"
@@ -174,6 +175,7 @@ public:
         Qwen4ExpIntInput tokens; ///< [M] exact tokens from the execution authority.
         Qwen4ExpIntBinding priorTokens, outputWords; ///< [2], [M,32] raw words.
         qwen4exp::NgramHashPolicy policy; ///< Exact authenticated checkpoint constants.
+        std::optional<qwen4exp::Qwen4ExpPrefillNextWindowBinding> nextWindow; ///< Explicit original next-chunk source, absent for contiguous Hash.
     };
     /** @brief Signed-square-root branch similarity and shared-value gating. */
     struct PLEGate
@@ -242,9 +244,10 @@ public:
      * @brief Authenticate the original typed hash output without observing device values.
      * @param root Original packed-ID allocation. @param buffer Original arena role.
      * @param offset Exact byte subview. @param bytes Complete declared INT64 output extent.
+     * @param nextWindowIdentity Zero requires the unchanged contiguous source; otherwise the exact original next-window borrow.
      * @return True only for the existing NgramHash operation and its unchanged output binding.
      */
-    bool matchesNgramHashOutput(const TensorBase* root,BufferId buffer,std::size_t offset,std::size_t bytes)const noexcept;
+    bool matchesNgramHashOutput(const TensorBase* root,BufferId buffer,std::size_t offset,std::size_t bytes,std::uint64_t nextWindowIdentity=0)const noexcept;
     /** @brief Return the semantic operation tag without inspecting live device state. */
     ComputeStageType type() const override;
     /** @brief Distinguish an additional captured diagnostic input view from ordinary normalization. */

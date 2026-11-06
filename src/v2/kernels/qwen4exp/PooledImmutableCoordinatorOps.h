@@ -39,13 +39,15 @@ public:
      * @param admission Original admitted request generation acquired from its actual producer.
      * @param originalRows Exact original row prefix, including interleaved duplicates; no source-home partition.
      * @param count Actual original IDs, bounded by the independently admitted N geometry.
+     * @param purpose Immutable current-demand or nonpromoting source-read purpose.
      * @return True after retaining original-position-to-global-unique permutation and immutable unique rows.
      * @note Every successful U0/all-hit invocation advances the lookup ordinal; source sequences never supply it.
      */
-    template<class Row> QFN_ADAPTIVE_HD bool begin(std::uint64_t admission, const Row *originalRows, std::uint32_t count)
+    template<class Row> QFN_ADAPTIVE_HD bool begin(std::uint64_t admission, const Row *originalRows, std::uint32_t count,
+        LookupPurpose purpose = LookupPurpose::CurrentDemand)
     {
         static_assert(std::is_same_v<Row,std::uint32_t> || std::is_same_v<Row,std::uint64_t>);
-        if (!openOriginal(admission,originalRows,count)) return false;
+        if (!openOriginal(admission,originalRows,count,purpose)) return false;
         auto &f=*v_.frame;
         for (std::uint32_t i=0;i<count;++i)
             if (originalRows[i]>=v_.parameters.sourceRows()) return fail(Status::Invariant);
@@ -217,7 +219,7 @@ public:
         {
             auto &r = v_.unique[i];
             if (r.phase != UniquePhase::Missing && r.phase != UniquePhase::SourceOnly) continue;
-            const auto at = v_.frame->free_exhausted && !v_.frame->cancelled_completion ? victim() : None;
+            const auto at = v_.frame->purpose==LookupPurpose::FutureLookupOnly ? None : v_.frame->free_exhausted && !v_.frame->cancelled_completion ? victim() : None;
             if (v_.frame->status != Status::Success) return false;
             if (at == None || frequency(r.row,false) <= frequency(v_.entries[at].locator.row,false))
             { r.phase = UniquePhase::SourceOnly; continue; }
@@ -405,6 +407,11 @@ private:
             if (!same(leases[i].interval,interval()) || leases[i].owner != i || leases[i].free_slots > v_.owners[i].slots)
                 return fail(Status::Invariant);
         for (std::uint32_t i = 0; i < count; ++i) v_.owner_plans[i].lease = leases[i];
+        if(v_.frame->purpose==LookupPurpose::FutureLookupOnly){
+            buildPlans(false);
+            v_.frame->phase=LookupPhase::FreePlanned;
+            return true;
+        }
         if(runs){
             if(!observeRuns(*runs))return false;
         }else{
@@ -522,22 +529,24 @@ private:
         return true;
     }
     /** @brief Open original identity/bounds once; only canonical coalescers may publish its data and commit. */
-    template<class Row> QFN_ADAPTIVE_HD bool openOriginal(std::uint64_t admission,const Row* originalRows,std::uint32_t count)
+    template<class Row> QFN_ADAPTIVE_HD bool openOriginal(std::uint64_t admission,const Row* originalRows,std::uint32_t count,LookupPurpose purpose)
     {
         static_assert(std::is_same_v<Row,std::uint32_t> || std::is_same_v<Row,std::uint64_t>);
         if (!valid()) return fail(Status::InvalidGeometry);
         auto &f = *v_.frame;
-        if (!admission || f.phase != LookupPhase::Idle || f.status != Status::Success ||
+        if ((purpose!=LookupPurpose::CurrentDemand && purpose!=LookupPurpose::FutureLookupOnly) ||
+            !admission || f.phase != LookupPhase::Idle || f.status != Status::Success ||
             admission < f.interval.admission || f.ordinal == UINT64_MAX ||
             (f.interval.table && (f.interval.table != v_.table || f.source_storage_generation != v_.source_storage_generation)) ||
             count > v_.parameters.maximumOriginal() ||
             (count && (!originalRows || aliases(originalRows,std::size_t{count}*sizeof(Row)))) ||
             (capacity() && (v_.policy->flags != OwnerInitialized || !policyMatches() ||
-                UINT64_MAX-v_.policy->logical_clock < count ||
-                (v_.policy->logical_clock+count)/v_.parameters.agingAccesses() > UINT32_MAX)))
+                (purpose==LookupPurpose::CurrentDemand && (UINT64_MAX-v_.policy->logical_clock < count ||
+                (v_.policy->logical_clock+count)/v_.parameters.agingAccesses() > UINT32_MAX)))))
             return fail(Status::InvalidPhase);
         const auto ordinal = f.ordinal + 1;
         f = {};
+        f.purpose = purpose;
         f.ordinal = ordinal;
         f.interval = {v_.table,admission,ordinal};
         f.source_storage_generation = v_.source_storage_generation;
@@ -702,7 +711,7 @@ private:
     QFN_ADAPTIVE_HD bool applyQueues()
     {
         auto &f = *v_.frame;
-        if (f.queues_applied || !f.observed) return true;
+        if (f.purpose==LookupPurpose::FutureLookupOnly || f.queues_applied || !f.observed) return true;
         for (std::uint32_t pos=0;pos<f.original_ids;)
         {
             const auto unique=v_.original_to_unique[pos];
@@ -804,7 +813,7 @@ private:
         v_.policy->lane_width==v_.parameters.laneWidth() && v_.policy->protected_limit==v_.parameters.protectedLimit()); }
     /** @return Current exact phase and healthy coordinator. */
     QFN_ADAPTIVE_HD bool healthy(LookupPhase phase) const
-    { return valid() && v_.frame->source_storage_generation == v_.source_storage_generation &&
+    { return valid() && (v_.frame->purpose==LookupPurpose::CurrentDemand || v_.frame->purpose==LookupPurpose::FutureLookupOnly) && v_.frame->source_storage_generation == v_.source_storage_generation &&
              v_.frame->interval.table == v_.table && v_.frame->phase == phase && v_.frame->status == Status::Success &&
              (!capacity() || (v_.policy->flags == OwnerInitialized && policyMatches())); }
     /** @return Bounded already-defined unique record. */

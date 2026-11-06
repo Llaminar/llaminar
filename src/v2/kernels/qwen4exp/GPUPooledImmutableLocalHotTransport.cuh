@@ -50,7 +50,7 @@ __global__ void compactMetadata(lht::MetadataArgs args)
     else if constexpr(Action==lht::MetadataAction::AcceptRequestHeader){
         const auto bytes=compactFixedBytes(args,sizeof(lht::RequestHeader));
         accepted=*args.original_ids<=args.geometry.maximum_original && lht::acceptRequestLane(*args.received_request,*args.source_query,
-            args.geometry,static_cast<std::uint32_t>(*args.original_ids),*args.admission,bytes,*args.received_lane);
+            args.geometry,static_cast<std::uint32_t>(*args.original_ids),*args.admission,bytes,*args.received_lane,args.request.intent);
         *args.fixed_header_bytes=accepted?bytes:0;
         *args.payload_bytes=accepted?args.received_request->miss_rows*sizeof(std::uint64_t):0;
     }else if constexpr(Action==lht::MetadataAction::ConfirmRequestKeys){
@@ -61,23 +61,25 @@ __global__ void compactMetadata(lht::MetadataArgs args)
             bytes,args.native_payload_message,aborted,*args.first_error) &&
             *args.received_payload_bytes==bytes && *args.original_ids<=args.geometry.maximum_original &&
             lht::acceptRequest(request,*args.source_query,args.geometry,static_cast<std::uint32_t>(*args.original_ids),
-                *args.admission,sizeof(lht::RequestHeader),bytes);
+                *args.admission,sizeof(lht::RequestHeader),bytes,args.request.intent);
     }else if constexpr(Action==lht::MetadataAction::AcceptResultHeader){
         const auto bytes=compactFixedBytes(args,sizeof(lht::ResultHeader));
-        accepted=lht::acceptResultHeader(*args.received_result,*args.received_request,args.geometry,bytes);
+        accepted=lht::acceptResultHeader(*args.received_result,*args.received_request,args.geometry,bytes,args.request.intent);
         *args.fixed_header_bytes=accepted?bytes:0;
     }else if constexpr(Action==lht::MetadataAction::PrepareResult){
         accepted=args.pool_frame->phase==adaptive_lookup::pooled::LookupPhase::Ready &&
             args.pool_frame->status==adaptive_lookup::Status::Success &&
+            ((args.request.intent==PooledImmutableLocalHotAccessIntent::FutureReadAhead)==
+             (args.pool_frame->purpose==adaptive_lookup::pooled::LookupPurpose::FutureLookupOnly)) &&
             lht::prepareResult(*args.received_request,args.geometry,*args.admission,args.pool_frame->interval,
-                *args.result,*args.payload_bytes);
+                *args.result,*args.payload_bytes,args.request.intent);
     }else if constexpr(Action==lht::MetadataAction::ConfirmResult || Action==lht::MetadataAction::ConfirmAck){
         const auto& result=*args.received_result;
         const auto aborted=readerSystemAcquire(args.native_payload_completion.abortAddress());
         accepted=args.native_payload_completion.matches(result.pool_interval.table,result.pool_interval.admission,
             result.pool_interval.sequence,result.native_bytes,args.native_payload_message,aborted,*args.first_error) &&
             lht::acceptResult(result,*args.received_request,args.geometry,
-                compactFixedBytes(args,sizeof(lht::ResultHeader)),*args.received_payload_bytes);
+                compactFixedBytes(args,sizeof(lht::ResultHeader)),*args.received_payload_bytes,args.request.intent);
     }
     // Receive-only attribution gives every physical byte exactly one owner.
     // Fixed extents are counted only downstream of a successful actual native
@@ -95,6 +97,40 @@ __global__ void compactMetadata(lht::MetadataArgs args)
             accepted=compactReport(args.reporting->acknowledgement_bytes,compactFixedBytes(args,sizeof(lht::ResultHeader)));
     }
     if(!accepted)compactFailure(args);
+}
+/**
+ * @brief Fuse the exact small union prepare/copy/seal producers in one CTA.
+ *
+ * The original metadata and key transfers complete before this node. Thread0
+ * forms offsets, all lanes copy disjoint original-order positions, then thread0
+ * seals after both barriers. No transfer/publication/ACK edge is crossed; the
+ * original first error invalidates the count before any following pool Begin.
+ */
+__global__ __launch_bounds__(lht::CooperativeUnionRows) void cooperativeCompactUnion(
+    lht::UnionArgs args,int* healthy,int* error)
+{
+    if(threadIdx.x==0 && (atomicAdd(error,0) || !lht::prepareUnion(args))){
+        args.output->status=adaptive_lookup::Status::InvalidGeometry;args.output->pool_original_ids=-1;
+        atomicCAS(error,static_cast<int>(sampling_math::DeviceGenerationError::None),
+            static_cast<int>(sampling_math::DeviceGenerationError::ImmutableStorageFailure));
+        atomicExch(healthy,0);
+    }
+    __syncthreads();
+    if(args.output->status==adaptive_lookup::Status::Success && args.output->pool_original_ids>=0){
+        for(std::uint64_t index=threadIdx.x;index<static_cast<std::uint32_t>(args.output->pool_original_ids);index+=blockDim.x){
+            std::uint32_t consumer=0;
+            while(consumer<args.consumer_count && index>=args.output->row_offset[consumer+1])++consumer;
+            if(consumer==args.consumer_count || !lht::copyMiss(args,consumer,index-args.output->row_offset[consumer])){
+                atomicCAS(error,static_cast<int>(sampling_math::DeviceGenerationError::None),
+                    static_cast<int>(sampling_math::DeviceGenerationError::ImmutableStorageFailure));
+                atomicExch(healthy,0);
+            }
+        }
+    }
+    __syncthreads();
+    if(threadIdx.x==0 && (atomicAdd(error,0) || args.output->status!=adaptive_lookup::Status::Success)){
+        args.output->status=adaptive_lookup::Status::InvalidGeometry;args.output->pool_original_ids=-1;
+    }
 }
 /** @brief A single writer validates immutable request headers and forms exact offsets. */
 __global__ void prepareCompactUnion(lht::UnionArgs args,int* healthy,int* error)
@@ -176,6 +212,10 @@ void QFN_UNION_ENQUEUE(DeviceId device,UnionArgs args,int* healthy,int* error,vo
         !args.consumer_count || args.consumer_count>8 || !args.capacity)
         throw std::invalid_argument("Compact union requires every original source/consumer producer");
     const auto stream=static_cast<QFN_NATIVE_STREAM>(exact_stream);
+    if(usesCooperativeUnion(args.capacity)){
+        QFN_NATIVE_NAMESPACE::cooperativeCompactUnion<<<1,CooperativeUnionRows,0,stream>>>(args,healthy,error);
+        QFN_NATIVE_NAMESPACE::checked();return;
+    }
     QFN_NATIVE_NAMESPACE::prepareCompactUnion<<<1,1,0,stream>>>(args,healthy,error);QFN_NATIVE_NAMESPACE::checked();
     const auto blocks=static_cast<unsigned>(std::min<std::uint64_t>(65535,(std::uint64_t{args.capacity}+255)/256));
     QFN_NATIVE_NAMESPACE::copyCompactUnion<<<blocks,256,0,stream>>>(args,healthy,error);QFN_NATIVE_NAMESPACE::checked();

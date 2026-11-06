@@ -272,4 +272,7 @@ LOCAL_HOT_FORK_TESTS(ROCm,DeviceId::rocm(0))
 #undef LOCAL_HOT_FORK_TESTS
 } // namespace llaminar2::test
 
+#include "LocalHotFiniteChildJoin.inc"
 #include "LocalHotOriginalSourceFork.inc"
+
+#include "LocalHotFutureSourceReplay.inc"

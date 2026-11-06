@@ -208,6 +208,24 @@ __global__ __launch_bounds__(kThreads, 2) void hashKernel(
     if (head >= 8) hash ^= static_cast<std::uint64_t>(secondPrevious) * policy.multipliers[2];
     output[i] = static_cast<std::int64_t>(hash % policy.moduli[head] + policy.offsets[head]);
 }
+/** @brief Explicit next-window specialization; the original contiguous kernel ABI is unchanged. */
+__global__ __launch_bounds__(kThreads, 2) void nextWindowHashKernel(
+    Qwen4ExpPrefillNextTokenWindow source,const std::int32_t* prior,std::int64_t* output,DeviceHashPolicy policy)
+{
+    const auto window=source.resolve();
+    if(!window.valid){invalidDeviceState();return;}
+    const auto i=static_cast<std::size_t>(blockIdx.x)*kThreads+threadIdx.x;
+    if(i>=static_cast<std::size_t>(window.rows)*kNgramHeads)return;
+    const auto* tokens=source.request_tokens+window.first;
+    const auto row=i/kNgramHeads,head=i%kNgramHeads;
+    const auto previous=row>0?tokens[row-1]:prior[1];
+    auto secondPrevious=row>1?tokens[row-2]:prior[row];
+    if(previous==policy.eos)secondPrevious=policy.eos;
+    auto hash=(static_cast<std::uint64_t>(tokens[row])*policy.multipliers[0])^
+        (static_cast<std::uint64_t>(previous)*policy.multipliers[1]);
+    if(head>=8)hash^=static_cast<std::uint64_t>(secondPrevious)*policy.multipliers[2];
+    output[i]=static_cast<std::int64_t>(hash%policy.moduli[head]+policy.offsets[head]);
+}
 /** @brief Fixed-lane similarity reduction followed by coalesced gated-value stores. */
 __global__ __launch_bounds__(kThreads, 2) void gateKernel(PLEGateArgs a)
 {
@@ -359,6 +377,16 @@ public:
         hashKernel<<<blocks(static_cast<std::size_t>(a.extent.rows) * kNgramHeads), kThreads, 0,
                      explicitStream(stream)>>>(a.extent, a.tokens, a.priorTokens, a.output, policy);
         checkLaunch();
+    }
+    /** @copydoc IQwen4ExpKernels::ngramHashNextWindow */
+    void ngramHashNextWindow(const NgramNextWindowHashArgs& a,void* stream)const override
+    {
+        detail::validate(a);DeviceHashPolicy policy{};
+        for(int index=0;index<3;++index)policy.multipliers[index]=a.policy.multipliers[index];
+        for(int head=0;head<kNgramHeads;++head){policy.moduli[head]=a.policy.moduli[head];policy.offsets[head]=a.policy.offsets[head];}
+        policy.eos=a.policy.eosToken;
+        nextWindowHashKernel<<<blocks(static_cast<std::size_t>(a.extent.rows)*kNgramHeads),kThreads,0,
+            explicitStream(stream)>>>(a.nextWindow,a.priorTokens,a.output,policy);checkLaunch();
     }
     /** @copydoc IQwen4ExpKernels::pleGate */
     void pleGate(const PLEGateArgs &a, void *stream) const override

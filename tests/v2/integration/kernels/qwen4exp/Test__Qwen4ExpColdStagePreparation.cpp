@@ -17,6 +17,9 @@
 #include "backends/IWorkerGPUContext.h"
 #include "../../../utils/GraphArenaTestHarness.h"
 #include "transfer/TransferEngine.h"
+#include "execution/local_execution/graph/IGraphBuilder.h"
+#include "execution/local_execution/graph/RequestInputPositionAdmission.h"
+#include <numeric>
 #include "kernels/KernelFactory.h"
 #include <gtest/gtest.h>
 #include <algorithm>
@@ -155,6 +158,88 @@ void proveHash(DeviceId device)
         EXPECT_EQ(replay, liveRows.size());
     }).get();
 }
+/** @brief Same production Hash stage reuses a borrowed original request view through partial/empty/reset data. */
+void proveNextWindowHash(DeviceId device)
+{
+    auto* backend=getBackendFor(device);
+    require(backend && backend->deviceCount()>device.ordinal,"Requested next-window native backend unavailable");
+    auto context=IDeviceContext::create(device,1);auto& worker=GPUDeviceContextPool::instance().getContext(device);
+    worker.submitAsync([&]{
+        constexpr int capacity=12,bucket=4;
+        test::GraphArenaTestHarness arena;
+        const auto integer=[&](BufferId id,std::size_t count){return arena.createPersistentTensor<INT32Tensor>(id,std::vector<std::size_t>{count});};
+        auto* tokens=integer(BufferId::REQUEST_TOKEN_IDS,capacity);
+        auto* positions=integer(BufferId::REQUEST_POSITION_IDS,capacity);
+        auto* total=integer(BufferId::REQUEST_BATCH_GEOMETRY,1);
+        auto* current=integer(BufferId::PREFILL_CHUNK_POSITION_IDS,bucket);
+        auto* count=integer(BufferId::PREFILL_CHUNK_GEOMETRY,1);
+        auto* history=integer(BufferId::QFN_PLE_PRIOR_TOKEN_HISTORY,2);
+        auto* ids=integer(BufferId::QFN_NGRAM_ROW_IDS,bucket*32);
+        const auto stream=ExplicitGPUStream(worker.defaultStream()).get();
+        std::array<std::int32_t,capacity> hostTokens{},hostPositions{};
+        std::iota(hostPositions.begin(),hostPositions.end(),100);
+        for(int i=0;i<capacity;++i)hostTokens[i]=i%3==0?248044:31+i;
+        const std::array<std::int32_t,2> prior{11,248044};
+        std::copy(hostTokens.begin(),hostTokens.end(),static_cast<int*>(tokens->raw_mutable_data()));
+        std::copy(hostPositions.begin(),hostPositions.end(),static_cast<int*>(positions->raw_mutable_data()));
+        std::copy(prior.begin(),prior.end(),static_cast<int*>(history->raw_mutable_data()));
+        *static_cast<int*>(total->raw_mutable_data())=capacity;*static_cast<int*>(current->raw_mutable_data())=100;
+        *static_cast<int*>(count->raw_mutable_data())=bucket;
+        for(auto* input:{tokens,positions,total,current,count,history}){
+            TransferEngine::prepareDeviceInput(input,device,stream);TransferEngine::requireDeviceInput(input,device,stream);
+        }
+        DevicePrefillChunkGraphBinding original{.backend=backend,
+            .request_token_ids_device=static_cast<const int*>(tokens->gpu_data_ptr()),
+            .request_position_ids_device=static_cast<const int*>(positions->gpu_data_ptr()),
+            .request_total_rows_device=static_cast<const int*>(total->gpu_data_ptr()),
+            .cached_tokens_device=static_cast<const int*>(current->gpu_data_ptr()),
+            .chunk_token_ids_device=static_cast<int*>(tokens->gpu_data_ptr()),
+            .chunk_position_ids_device=static_cast<int*>(current->gpu_data_ptr()),
+            .chunk_real_rows_device=static_cast<int*>(count->gpu_data_ptr()),
+            .chunk_row_stride_device=static_cast<int*>(count->gpu_data_ptr()),
+            .request_row_capacity=capacity,.bucket_seq_len=bucket,.capture_identity=0x4e57494e};
+        const auto window=qwen4exp::Qwen4ExpPrefillNextWindowBinding::fromOriginalChunk(original,device,bucket,
+            RequestInputPositionLayoutRequirement::ContiguousSingleRequestPrefill);
+        using Stage=Qwen4ExpPrimitiveStage;using Int=Qwen4ExpIntBinding;
+        qwen4exp::NgramHashPolicy policy;policy.multipliers={3,5,7};
+        for(unsigned head=0;head<16;++head){policy.moduli[head]=17;policy.offsets[head]=(std::uint64_t{1}<<33)+head*64;}
+        auto stage=std::make_unique<Stage>(Stage::Params{.device_id=device,.rows={bucket,{}},
+            .operation=Stage::NgramHash{Qwen4ExpNativeIntInput{device,static_cast<const int*>(tokens->gpu_data_ptr()),capacity},
+                Int(*history,BufferId::QFN_PLE_PRIOR_TOKEN_HISTORY),Int(*ids,BufferId::QFN_NGRAM_ROW_IDS),policy,window}});
+        auto* raw=stage.get();const auto identity=raw->graphCaptureVariantSignature();
+        ComputeGraph graph;graph.addNode("actual_next_window_hash",std::move(stage),device);
+        GraphExecutorConfig config;config.enable_validation=false;DeviceGraphExecutor executor(config);arena.bindExecutor(executor);
+        DeviceGraphExecutor::GraphSegmentCache cache;Retirement retirement{*backend,device,stream,cache};
+        auto cpu=qwen4exp::createCPUQwen4ExpKernels();
+        for(unsigned replay=0;replay<20;++replay)for(const auto values:std::array{
+            std::array{0,12,4},std::array{4,10,4},std::array{8,10,2},std::array{0,4,1}}){
+            const int first=100+values[0],logical=values[1],live=values[2];
+            *static_cast<int*>(current->raw_mutable_data())=first;
+            *static_cast<int*>(total->raw_mutable_data())=logical;*static_cast<int*>(count->raw_mutable_data())=live;
+            // The retained graph executes on its own exact capture stream.
+            // Later fixture publications and output poisoning must precede
+            // that replay there, rather than race it on the setup stream.
+            const auto replayStream=cache.initialized?cache.capture_stream:stream;
+            for(auto* input:{current,total,count})TransferEngine::prepareDeviceInput(input,device,replayStream);
+            if(ids->gpu_data_ptr())require(backend->memset(ids->gpu_data_ptr(),0xa5,ids->size_bytes(),device.ordinal,replayStream),"Next-window poison failed");
+            graph.reset();require(executor.executeWithCachedGraphReplay(graph,context.get(),cache,stream,&worker,nullptr),"Next-window captured replay failed");
+            EXPECT_EQ(cache.variant_recapture_count,0u);EXPECT_EQ(raw->graphCaptureVariantSignature(),identity);
+            auto actual=observe<std::int64_t>(*backend,device,cache.capture_stream,*ids);
+            const int next=values[0]+live,nextRows=std::min(bucket,logical-next);
+            const auto poison=std::bit_cast<std::int64_t>(std::uint64_t{0xa5a5a5a5a5a5a5a5});
+            std::vector<std::int64_t> expected(bucket*16,poison);
+            // First capture has no prior poison publication; only active rows
+            // are compared there. Every later suffix is explicitly protected.
+            if(nextRows)cpu->ngramHash({{nextRows},hostTokens.data()+next,prior.data(),expected.data(),policy},nullptr);
+            EXPECT_EQ(std::memcmp(actual.data(),expected.data(),nextRows*16*8),0)
+                <<"replay="<<replay<<" current_first="<<first<<" current_rows="<<live
+                <<" next_first="<<next<<" next_rows="<<nextRows
+                <<" first_actual="<<actual.front()<<" first_expected="<<expected.front();
+            if(replay || values[0])for(std::size_t i=nextRows*16;i<actual.size();++i)EXPECT_EQ(actual[i],poison);
+            EXPECT_EQ(observe<std::int32_t>(*backend,device,cache.capture_stream,*count).front(),live);
+        }
+    }).get();
+}
 /** @brief Snapshot and retention separately materialize every cold output before their physical seals. */
 void provePLE(DeviceId device,Qwen4ExpPLERetainedStage::Operation operation){
  auto*backend=getBackendFor(device);if(!backend||backend->deviceCount()<=device.ordinal)GTEST_SKIP()<<"Requested backend unavailable";
@@ -206,4 +291,11 @@ TEST(Qwen4ExpColdStagePreparation, ROCmPrimitive){provePrimitive(DeviceId::rocm(
 TEST(Qwen4ExpColdStagePreparation, ROCmNgramHash){proveHash(DeviceId::rocm(0));}
 TEST(Qwen4ExpColdStagePreparation, ROCmPLESnapshot){provePLE(DeviceId::rocm(0),Qwen4ExpPLERetainedStage::Operation::SnapshotPrior);}
 TEST(Qwen4ExpColdStagePreparation, ROCmPLERetain){provePLE(DeviceId::rocm(0),Qwen4ExpPLERetainedStage::Operation::RetainCandidates);}
+#endif
+
+#ifdef HAVE_CUDA
+TEST(Qwen4ExpColdStagePreparation,CUDANgramHashNextWindow){proveNextWindowHash(DeviceId::cuda(0));}
+#endif
+#ifdef HAVE_ROCM
+TEST(Qwen4ExpColdStagePreparation,ROCmNgramHashNextWindow){proveNextWindowHash(DeviceId::rocm(0));}
 #endif
