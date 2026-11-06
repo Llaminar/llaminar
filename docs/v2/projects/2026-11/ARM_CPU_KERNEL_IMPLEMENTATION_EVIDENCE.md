@@ -105,9 +105,173 @@ The first local producer helper had a Python parse error before any admission
 or container creation; the separate corrected producer ran. A metadata verifier
 also initially expected the wrong armv8.2 envelope; actual source correctly
 uses armv8-a+simd+dotprod. Both helper failures remain preserved, not relabeled
-kernel failures. Current AVX2/AVX512 paths have real cross-target compiler syntax
-checks only; native x86 execution, CPU PMU/economy and full integration remain
-required. No older4e56 x86 receipt supplies that proof.
+kernel failures. These pre-review snapshots do not supply current native-x86,
+CPU PMU/economy or full-integration proof. No older4e56 x86 receipt supplies it.
+
+### Published344 native-x86 INT32 qualification
+
+Main independently authenticates successor archive SHA256
+`329f00ad9500bc33189c05de0f5ea7ea7d69a5783ad40882e79ee7dec1525ff6`
+(10057181B), all320 covered archive/extracted hashes and the unchanged original
+7079-entry source/archive reconstruction. AVX2 and AVX512 each pass36 actual
+registrations and11 individually counted INT32 cells×20=220 raw passes. Only
+after both pass, actual AVX512-built/runtime-AVX2 binaries execute37 workshare,
+4 real precision-caller,9 Q16 and1 separately compiled C/C++ configuration cases.
+Five explicit Scalar filters select13 cases per ISA, all failing specifically
+at native admission, with no skips. Each ISA's exact outside-source finite-check
+countercopy has one parent failure: the early native-vector `gamma[1]` NaN at
+original line252 fails to die; the four other death assertions remain correct.
+Genuine original test objects/libraries and exact compile/link inputs are bound
+to both controls; ordinary source, objects, libraries and executables remain
+unchanged. All57 subprocess phases return their expected codes (45 zero and12
+explicit diagnostic exit1). Source-owned C compiler defaults and GNU++20/23
+remain distinct; no uniform dialect flag is invented.
+
+The first attempt remains **INCOMPLETE_HELPER_RED**, archive
+`d3bdfb9ee42b5e1d8b05aa0bce30ab1b2c97dc7f09c400ab77234b24c7394a84`
+(7274650B/all192 hashes). It completed both native profiles but a validation
+helper's `inventory` callable was overwritten by a CTest JSON variable;37 mixed
+names were listed, not executed. A distinct fresh-window successor changed only
+the two variable references, retaining source/SDK/flags and the old failure.
+Its first collector then used the wrong ownership label key; a separately
+approved metadata-only collector copied retained artifacts and retired the
+already-stopped producer, without executing it again. The misleading earlier
+host-log filename is explicitly PRE-retirement. An optional summary verifier's
+incorrect demand for an explicit C dialect remains preserved and unrerun.
+Main's own first verifier also confused30 total descriptors with original link
+inputs: the actual22 original inputs plus8 diagnostic descriptors were verified
+without changing evidence or rerunning source.
+
+SDKf492/36 layers, all3989 prefix records, nine actual tools, real compiler
+commands,26 original objects and10 ELF62 binaries are authenticated. Default-FP
+probes retain XCR0=231/MXCSR8064/rounding0; these are not per-thread observations.
+All7079 source records before/after equal SHA256
+`f6aa4710bd909a4a32c5351bb7bf1db3a344845e9f3803d696e3e98b4650df7a`;
+immediate capture starts61.730ms after exit. Actual target/ancestor cgroups,
+new owned executable POSIX storage and separate host-evidence capacity were
+admitted. Peak3404128256B, zero OOM/throttling, exit0/PID0/OOMfalse. Actual owned
+retirement is07:06:03.741922UTC, not terminal exit; the fresh host receipt and
+window release are retained. Both old/new volumes remain owned and preserved.
+This completes the published INT32 **focused leaf-correctness manifest only**;
+it is not full engine, factory/PMA, serving, current sparse source or economy.
+
+## Current native sparse-attention implementation (not a full-engine certificate)
+
+`QwenSparseNativeBankContract.h` supplies one checked original byte-layout
+program to static validation and CPU readers. It rejects stride/address overflow,
+wrong roles/layouts/Q16 blocks and unaligned metadata before consumption;
+`CPUQwenSparseNativeCodec.h` decodes genuine native register fragments from all
+eight existing codecs without staging a selected head. TQ tables are the supplied
+original words, not substituted globals. QSA's own eight-/sixteen-chain score
+butterflies remain distinct from generic attention folds. The value program
+rounds decoding before probability FMA; its bounded eight-coordinate inverse
+rotation retains increasing original-coordinate FMAs without a256-word mirror.
+
+The actual production CPU TU now compiles and links with the complete existing
+QSA caller TU and genuine StateIO/replay/TP/address dependencies. Initial missing
+TP/address symbols and strict interface warnings are preserved; the real
+implementations and explicit overrides/unused unsupported-parameter consumption
+close them, without stubs or warning suppression. Baseline/strict actual native
+all-codec/Q16/ring, inactive-output/traffic and grouped/serial byte cases pass.
+The initial enabled legacy-plus-lifetime run executed20 cases without failures.
+After real terminal-counter and consumed-indexer-numeric regressions were added,
+the pre-review72 GNU14 snapshot executed27 enabled cases; its separate explicitly
+selected historical `DISABLED_RankingOnly...` case also ran successfully (GTest's
+disabled-name counter remains1 despite actual run/completed status; this is not
+relabeled ordinary Unit coverage). These snapshots precede the following replay
+admission repair and independent exact-basis oracle.
+
+New public-call regressions cover original-bank/gate/metadata writer exclusions,
+exact same-head query/output reuse, M1..16/31/33 with all positive caller workers,
+and immediate empty/nonempty retained completion. The first gate-exclusion fixture
+incorrectly treated an unbound array as consumed input; the preserved failure
+was repaired by binding the actual gate, not by rejecting legitimate unused
+storage. Original partial-tail early-return and one-edge attention-nowait copies
+produce the expected two immediate-completion failures each. Geometry fixtures
+also falsify removed Q16 guards and incorrect2/4-byte alignment policies using
+genuine otherwise-admissible storage; both legal TQ roles are exercised.
+
+Review71's two fixture gaps are closed: fresh TQ4/TQ8 FLTMAX/book2 and
+fitted-subnormal-word8/book16 controls distinguish radial multiplication order;
+high-lane7 NaN/Inf and positive-source/negative-fitted Value deaths cover the
+previously omitted finite/role guards. Counter overflow now aborts in its owner,
+not through OpenMP unwinding. Indexer dot corruption is rejected before ReLU can
+mask NaN as zero; exact outside-source copies that remove this guard or restore
+counter throws fail only the intended death assertions.
+
+A complete pre-review72 snapshot passed218 registrations on each of five local
+profiles and170 preflights×20 (3400 raw passes). Fresh genuine GNU14 executed17
+actual TUs/six ELF183 binaries,22 registrations,17 focused cells×20, bank8/codec3/
+FP323/27 enabled callers and the explicit ranking case. All15671 source records
+matched before/after and Main at audit; capture started29.295ms after exit.
+The named4GiB compiler/test BOM was admitted against5385936896B available;
+actual target/docker/root ancestry retains absent root limits, affinity0–9,
+private peak3016704000B, no OOM/throttling, exit0/PID0/OOMfalse and owned removal.
+`/tmp/llaminar-qsa-pre-replay-P2-independent-audit.json` records this **pre-fix**
+scope, not a complete replay-admission certificate.
+
+Review72 then found an actual P2: replay was copied before its interval check.
+One shared checked original-range guard now precedes the first replay load or
+member-address formation in all five public CPU entries. Actual public calls
+reject aligned wrapping and misaligned roots via the specific address diagnostic;
+an exact separate-header missing-Core-guard copy produces two failed subprocess
+exit assertions (wrapping SIG11, misaligned late-error exit18). No source was
+replaced by a diagnostic copy.
+
+Review72 also identified same-path/symmetric-basis oracle coverage, not a proven
+transpose implementation defect. `Test__CPUQwenSparseExactBasis.cpp` now independently
+unpacks original TQ4/TQ8 codes/tables and role radii, executes declared FP32 edges/
+eight-or-sixteen-chain scores/softmax/selected FMAs and increasing-coordinate
+transpose FMAs. Distinct nonsymmetric orthogonal bases, wrapped physical history,
+rows1/3/16 and both disjoint/exact-query-alias calls compare every output/guard word.
+Wrong reverse-within-eight and transpose-index references must differ; actual
+outside-source production-header copies that reverse the coordinate sequence or
+skip the value inverse each fail12 exact-word assertions in the one parent case.
+These controls were refreshed after adding complete input immutability/traces;
+first pass logs remain, while the control directories contain the final-fixture
+artifacts. Fresh focused Unit/preflight registrations cover both review findings.
+All eight independently filtered public numeric/lifetime cases reject Scalar at
+native admission, with one selected/failed case and no skips each.
+
+Baseline/strict closure cases pass. Complete current enabled callers also pass
+29/29 in both strict Debug and optimized DotProd ASan+UBSan; all ten actual TUs
+have GNU++23, last-O3/g/NDEBUG, both sanitizers and source-owned DotProd flags.
+The final source-only closure review73 closes both review72 findings without
+claiming execution. A fresh post-review matrix now passes220 registrations on
+each of five local profiles and all172 preflights×20=3440 independently counted
+raw passes. Fresh GNU14 passes24 registrations,19 focused cells×20=380 raw passes,
+8 bank/3 codec/3 FP32/29 enabled actual callers and the separately opted-in ranking
+case. Actual18 compiled TUs and six ELF183 binaries are authenticated:14 GNU++23,
+three GNU++20, one genuine default-C probe; all retain source-owned O3/g/NDEBUG.
+Optimized DotProd sanitizer commands cover all14 bank/codec/complete-caller TUs.
+All15672 source records remain unchanged before/after and matched Main at audit,
+map SHA256 `9e1d05834a0fc6695b59e06bd3eca2dc046f06613a5487f6f514ad03fb7ee6f0`;
+the after-map starts31.245ms after terminal exit. Actual private peak3557351424B
+fits the named4GiB compiler/test BOM, no OOM/throttling, exit0/PID0/OOMfalse and
+owned removal. Typed `--mount` read-only source and private target/docker/root
+ancestry are verified. The auditor's first `HostConfig.Binds` assumption and
+second Docker diagnostic-capitalization assumption both remain preserved RED;
+only metadata interpretation changed, never source/helper/test execution.
+`/tmp/llaminar-qsa-post-review72-independent-audit/audit.json` binds these records;
+the older218/170 and9o4gieek receipts remain pre-fix scope.
+
+Separate actual GNU14 object disassemblies isolate TQ4/TQ8 value specializations.
+Their selected loops contain93/94 instructions,24/10 SIMD register identities and
+two native FMA instructions, with no hot stack accesses or calls. All eight
+inverse-coordinate loops likewise have two FMA instructions and no hot stack/
+calls; ordinary16/48-byte GPR prologues are not hot spills. The first manual
+object-path probe used a host path instead of actual `/work/source` command
+coordinates; actual compile-command routing corrected the probe, not the kernel.
+These are static ISA observations only, not PMU/economy or all-codec resource
+certification. Native-x86/current full-engine and economical grouped execution
+still need their own fresh evidence; no generic training is required.
+Current complete-engine Unit/preflight/model/HTTP/PMA/economy and the final
+all-family `Perf__` round remain unfinished. The current canonical pre-commit
+was executed locally and remains RED at `CMakeLists.txt:173`: native macOS CPU
+memory/placement still requires an implemented native authority, not a libnuma
+stub. Its complete Unit/preflight dependencies never built and no such tests
+ran. A disclosed `--no-verify` draft checkpoint is not a gate waiver. The
+immutable4e56 engine build stays RED; no old ARM build token authorizes a producer.
 
 ## 2026-11-05 RMSNorm integration checkpoint (incomplete)
 
