@@ -143,9 +143,30 @@ v2_add_core_free_test(V2_Unit_Q16_1RMSNorm
 v2_add_core_free_test(V2_Integration_CPURMSNormQ16LegacyCoverage
     COMMAND $<TARGET_FILE:v2_test_q16_1_rmsnorm>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Q16_1 Regression)
+# Compile the actual legacy precision caller TU, not a hand-copied surrogate.
+# Its remaining precision/ISA cases retain their canonical full-core Unit gate;
+# this core-free selection certifies only the admitted original-INT32 publisher.
+add_executable(v2_test_cpu_rmsnorm_precision
+    "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/ops/Test__RMSNormPrecision.cpp"
+    "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/primitives/RMSNormPrimitives.cpp")
+target_compile_features(v2_test_cpu_rmsnorm_precision PRIVATE cxx_std_23)
+target_include_directories(v2_test_cpu_rmsnorm_precision PRIVATE
+    "${V2_CPU_ARCHITECTURE_ROOT}/src/v2" "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2")
+target_link_libraries(v2_test_cpu_rmsnorm_precision PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX)
+v2_add_core_free_test(V2_Unit_CPURMSNormInt32PrecisionCaller
+    COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_precision>
+        --gtest_filter=Test__RMSNormPrecision.ISAParity_Int32OriginalPublication
+    LABELS V2 Unit CPU DeviceFree RMSNorm INT32 Regression)
+v2_add_core_free_test(V2_Integration_CPURMSNormInt32PrecisionCaller
+    COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_precision>
+        --gtest_filter=Test__RMSNormPrecision.ISAParity_Int32OriginalPublication
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm INT32 Regression)
 add_executable(v2_test_cpu_rmsnorm_workshare
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPURMSNormWorkshare.cpp"
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPUQuantizedRMSNorm.cpp"
+    "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPUInt32RMSNorm.cpp"
+    "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPUInt32RMSNormPublication.cpp"
+    "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/ops/Test__RMSNormINT32.cpp"
     "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/primitives/RMSNormPrimitives.cpp")
 target_compile_features(v2_test_cpu_rmsnorm_workshare PRIVATE cxx_std_23)
 target_include_directories(v2_test_cpu_rmsnorm_workshare PRIVATE
@@ -155,6 +176,45 @@ v2_add_core_free_test(V2_Unit_CPURMSNormWorkshare
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare>
         --gtest_filter=-*AllPositiveWorkersThroughTen*
     LABELS V2 Unit CPU DeviceFree RMSNorm Ownership)
+v2_add_core_free_test(V2_Integration_CPURMSNormInt32Precision
+    COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare>
+        --gtest_filter=CPUInt32RMSNorm.FullWidthSummaryNeverRoundsOriginalIntegersThroughFP32:CPUInt32RMSNorm.ExplicitScalarUsesOriginalIncreasingColumnFP64Program
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm INT32 Native ByteExact Regression)
+v2_add_core_free_test(V2_Integration_CPURMSNormInt32Admission
+    COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare>
+        --gtest_filter=CPUInt32RMSNorm.OriginalBankIntersectionsAndUndeclaredPolicyRejectBeforeStores
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm INT32 Ownership Geometry Regression)
+v2_add_core_free_test(V2_Integration_CPURMSNormInt32Completion
+    COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare>
+        --gtest_filter=CPUInt32RMSNorm.EmptyRetainedSummaryCompletesBeforeRetirement:CPUInt32RMSNorm.SmallRetainedSummaryHasOnePublicationOwner
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm INT32 Ownership Workshare Regression)
+v2_add_core_free_test(V2_Integration_CPURMSNormInt32AllPositiveWorkers
+    COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare>
+        --gtest_filter=CPUInt32RMSNorm.AllPositiveWorkersThroughTenRetainOriginalSummaries
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm INT32 ByteExact Regression)
+v2_add_core_free_test(V2_Integration_CPURMSNormInt32LegacyCoverage
+    COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=Test__RMSNormINT32.*
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm INT32 Regression)
+v2_add_core_free_test(V2_Integration_CPURMSNormInt32PublicationProgram
+    COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare>
+        --gtest_filter=CPUInt32RMSNormPublication.OriginalNativeRNEFragmentsAndAwayTails:CPUInt32RMSNormPublication.OriginalScaleHasNoForeignFloorAndZeroInverseDoesNotReadGamma:CPUInt32RMSNormPublication.ExplicitScalarFusedUsesSerialSummaryAndOriginalAwayPublication
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm INT32 ByteExact Regression)
+v2_add_core_free_test(V2_Integration_CPURMSNormInt32PublicationAdmission
+    COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare>
+        --gtest_filter=CPUInt32RMSNormPublication.CompleteOriginalBanksAndPolicyRejectBeforePublication
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm INT32 Ownership Geometry Regression)
+v2_add_core_free_test(V2_Integration_CPURMSNormInt32PublicationCompletion
+    COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare>
+        --gtest_filter=CPUInt32RMSNormPublication.EmptyStagedAndFusedCallsCompleteRetainedTeam:CPUInt32RMSNormPublication.NonemptyStagedAndFusedCompleteBeforeImmediateReuse
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm INT32 Ownership Workshare Regression)
+v2_add_core_free_test(V2_Integration_CPURMSNormInt32PublicationNumeric
+    COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare>
+        --gtest_filter=CPUInt32RMSNormPublication.NonfiniteAndUnrepresentableRowsAreFatalNotZeroed
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm INT32 Numerical Regression)
+v2_add_core_free_test(V2_Integration_CPURMSNormInt32PublicationAllPositiveWorkers
+    COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare>
+        --gtest_filter=CPUInt32RMSNormPublication.AllPositiveWorkersThroughTenRetainNativeStagedFusedBytesAndGuards
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm INT32 ByteExact Regression)
 v2_add_core_free_test(V2_Integration_CPURMSNormRetainedSummary
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=*WideRetainedRowUsesCompleteOriginalSummary
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Ownership Regression)
