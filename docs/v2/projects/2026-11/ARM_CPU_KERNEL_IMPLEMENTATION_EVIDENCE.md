@@ -578,6 +578,144 @@ and this independent score regression uses four representative M values with
 one caller. Neither the configured matrix nor these timings certify serving,
 current native-x86, PMA, model/HTTP behavior, or the final Perf__ round.
 
+K12 introduced twelve real format/tail integration cells for that indexer
+coverage gap. Each independently derives prepared queries, new pools, scores,
+selection and counts from original raw/tail/gamma/table inputs, once per geometry
+rather than once per worker. It sweeps M1..16/31/33, all prefix remainders0..3,
+nonzero position origin, both query-demand policies, inactive capacity and every
+caller-admitted positive OpenMP team size. Persistent test banks are re-poisoned
+without rebinding. Standalone and retained calls authenticate every output and
+source guard; retained thread0 checks immediately after return before the outer
+join, with no test barrier that could repair a missing kernel completion edge.
+Each parameter has its own unchanged30-second timeout. A named CPU-team resource
+serializes only these whole-team cells against one another, never caps workers;
+the common directory registrar owns that resource with fatal sanitizer policy
+and perf-only omission. Its real LANGUAGES NONE metadata fixture checks both
+registration contexts. Production source and arithmetic are unchanged. No K12
+build, numeric, timing or totality success was observed. Its actual baseline
+configure and metadata-only policy checks passed:241 registrations,191 preflight,
+all timeouts30 and fatal UBSan environments, exactly twelve team-resource locks,
+and both policy filters executing three LANGUAGES NONE metadata cases. The tester
+then held before any native compilation or GNU admission. A slow shell-based
+source-manifest collection hit the tester's tool timeout; a separate Python
+collection authenticated unchanged source. This was not a native/test failure.
+
+Source85 found a test-authentication gap: vector<float> equality permits signed
+zero changes, so K12's source-byte claim was unproved. Unverified K13 replaces
+all seven source comparisons with exact word authentication. Supplied finite
+dyadic rotary planes now vary by position and pair rather than hiding address
+errors behind identity coefficients. Synthetic parameter/filter prefix
+OriginalInputs replaces OriginalReplay, and the fixture comment describes each
+unchanged timeout budget without claiming an unmeasured bound. The existing
+explicitly registered lifetime regression additionally calls the real indexer
+and selector with delayed participants at short/ranking prefixes, all three
+representations and live/empty frontiers. This is an arrival check before the
+outer join, not yet an executed missing-barrier countercontrol. Production code
+remained unchanged. Subsequently, the sealed old-base K13 Mac slice passed all
+three native profiles:46 enabled cases,45 scoped registrations and17 individually
+filtered positives plus17 real Scalar-admission negatives per profile. Its
+largest new-cell CTest duration was4.31 seconds in strict Debug; this is not an
+economy result. Source guards matched and the scoped production objects retained
+their prior byte/text identities. No K13 GNU or proposed countercontrols ran.
+
+An operator-requested local rebase replayed all nine ARM commits onto upstream
+f48c856105f6d1495a4c342ed2cc0c62b4d11273 without conflicts. Ordered added/removed
+patch payloads were identical, and all seven dirty K13 files were restored byte
+and mode exactly. The local committed head isfe4d37d19482c3161d7cdb0698a96027d9e0d68e;
+the remote PR was not force-pushed. Exact workspace treea97be2f7a4a77c1531c4735ea293ab5f7f854dc7
+was separately sealed as K14:15786 blob/link records plus one uninitialized corpus
+gitlink. Every raw input/tree/snapshot payload and mode relation matched. Source87
+found no narrow compatibility issue in the eight overlapping files and direct
+native-collective headers; this does not audit every upstream change. A fresh
+K14 baseline configure, metadata/policy checks, actual attention target compile,
+FP32Tail0 sweep and Completion case passed. The other profiles, GNU, controls and
+complete engine gates remain unqualified on that base. No old whole-tree result
+is relabelled as K14.
+
+A separate unverified scalar-RMS successor declares increasing-column FP64 FMA
+for original FP32 words. Finite FP32 squares are exact in FP64; the existing
+OpenMP SIMD reduction nevertheless allowed an unspecified lane fold. The new
+source removes that reduction directive in favor of an explicit arithmetic
+chain, consistent with the existing scalar per-row program; native ISA trees
+are unchanged. The existing detail seam receives an independent volatile
+product/add byte oracle, a2^27-plus-sixteen-ones discriminator, varied anchor
+positions, widths/tails and finite boundary words. The focused
+V2_Integration_CPURMSNormScalarFP32Summary entry joins ProductionTestPreflight.
+K15 subsequently passed its three Mac RMS profiles:34 actual registrations and
+whole binaries9/15/39/3 cases per profile, including the focused scalar case both
+native and explicitly Scalar-forced. The current object was reproduced byte
+exactly. Rebinding the old K14 object into current links failed291 assertions in
+Release, but correctly passed O0 and optimized sanitizer builds where the old
+reduction was serial. Those profile-dependent controls retain their actual
+outcomes. Optimized sanitizer compilation reduced the original twelve warnings
+to six: only the unchanged gamma/no-gamma apply loops remain across three RMS
+translation units. Source guards matched; GNU/x86/economy remain unqualified.
+Mixed finite-boundary fixtures contain a large anchor and do not independently
+certify tiny-only arithmetic. The shared scalar leaf also reached inherited
+uncompiled-ISA stubs; K15 alone did not certify admission/fallback closure.
+
+Unverified K16 replaces those remaining generic forced-vectorizer application
+loops with compiled scalar/AVX2/AVX512 row publishers, selected once before the
+worker region. Native ARM keeps its existing shared-row publisher. Compiled
+fragments and bounded tails preserve the separate input*inverse then gamma
+products, including identity gamma and exact input/output aliases, without
+scratch or a new admission authority. Unsupported generic row ISAs fail rather
+than substituting scalar; the two uncompiled FP32-summary alias stubs are retired.
+A new public-primitive regression uses exact mean9, inverse1/sqrt(12), subnormal
+and signed-zero gamma words to discriminate premature inverse*gamma rounding;
+it covers M1..16/31/33, widths1..65 and representative tails, inactive/outer guards,
+exact aliases and representative retained calls checked before the outer join.
+Its focused FP32Application preflight is explicit. K16's first baseline build
+and focused application case passed; all three optimized-sanitizer RMS translation
+units compiled with zero warnings (12→6→0 in that exact closure). Baseline ARM
+scalar publishers retained separate vector/scalar products without hot helper
+stack traffic; the caller has one indirect phase call and two ABI-boundary stack
+loads per row. Instrumented frames are not a performance certificate, and x86
+publishers have not run. Source89 found no production math/bounds issue but two
+new-test authentication gaps: native intent lacked a self-admitted native pair,
+and requested3-worker teams were not checked. Unverified test-only K17 adds both
+checks and scoped dynamic-policy restoration. Its Scalar-forced application
+filter must now reject rather than certify a native subcase; the separate scalar
+summary filter remains a legitimate Scalar positive. Collective numeric-exception
+handling, broader resources/economy, GNU/x86 and complete engine gates remain
+open. Later K17 qualification passed all three RMS profiles with zero warnings,
+35 registrations and9/15/40/3 whole-binary cases per profile. Its native admission,
+Scalar-positive summary, Scalar-negative application and exact-team controls all
+executed as intended. The one-line premature inverse*gamma mutant failed exactly
+2808 weighted explicit-Scalar cells in each profile while native ARM-tile and
+identity-gamma cells remained correct; current-link controls passed. Full K17
+five-profile core-free qualification subsequently passed:243 tests once and193
+preflight cells20 times per profile (19,300 raw passes),74 translation-unit
+compilations from63 distinct sources and114 build steps/profile, zero
+warnings/errors/sanitizer hits, clean ten JUnit
+files, and unchanged15,761 regular files plus25 links. Main independently checked
+all95 artifacts under seal `a216a2965b08f47cb27f6757f83b296abdd5fec4edf15cd4c19cebc5fb39a6d9`,
+actual per-name repetitions, registration environments and raw RMS disassembly.
+The eight-instruction scalar FP64 FMA chain and31/44-instruction pointwise
+publishers are call/stack free; the caller retains one indirect call and two
+per-row ABI stack loads (28 total Apple/29 LLVM stack accesses). These are static
+resources, not economy measurements. Strict Debug's representation case peaked
+at25.07 seconds without timeout; separate data inspection identified missing
+PROCESSORS accounting for whole-team tests, not an excuse to raise the budget.
+Standalone issues36/37
+were consolidated into the active implementation work at the operator's request,
+not closed as proof of resolution. The isolated arm-helper lane now owns the
+remaining systemic numeric/lifecycle/half-policy/identity-gamma repair; Main owns
+integration and actual engine qualification.
+
+The native Spark SDK now has an independently checked mount-primitive PASS in a
+separate SDK-only transaction. The first B4 attempt stopped before its admission
+token and ran no SDK CMake: its physical-root capacity assumption and collector
+finally-name shadow were preserved as separate defects. Functional mock regressions
+reproduced the old cleanup failure and proved the typed B5 successor retires its
+owned target even with logging errors. B5 then passed on the actual pinned SDK:
+physical root absent-controller fields use fresh MemAvailable, controlled ancestors
+retain their real limits, lock/removal/source-read-only guards pass, and the
+mounted output root legitimately persists after its payload is removed. Actual
+exit0/no-OOM, source guards, CID removal and absence are recorded. This is not
+project source compilation or an engine/serving certificate. The complete-engine
+BUILD-ONLY source/dependency guard and lifecycle protocol still require review.
+
 The first canonical-hook binding attempt stops before execution: this immutable
 snapshot is a plain file tree, so git root discovery fails128. It is not a hook
 PASS or the expected macOS/libnuma failure. A separately owned exact-tree Git

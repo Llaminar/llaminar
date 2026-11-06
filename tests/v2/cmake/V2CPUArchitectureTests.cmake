@@ -181,6 +181,14 @@ v2_add_core_free_test(V2_Unit_CPURMSNormWorkshare
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare>
         --gtest_filter=-*AllPositiveWorkersThroughTen*
     LABELS V2 Unit CPU DeviceFree RMSNorm Ownership)
+v2_add_core_free_test(V2_Integration_CPURMSNormFP32Application
+    COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare>
+        --gtest_filter=CPURMSNormWorkshare.FP32ApplicationRetainsOriginalRoundedEdges
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm ByteExact Ownership Regression)
+v2_add_core_free_test(V2_Integration_CPURMSNormScalarFP32Summary
+    COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare>
+        --gtest_filter=CPURMSNormWorkshare.ScalarFP32SummaryRetainsIncreasingColumnFMA
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm ByteExact Regression)
 v2_add_core_free_test(V2_Integration_CPURMSNormInt32Precision
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare>
         --gtest_filter=CPUInt32RMSNorm.FullWidthSummaryNeverRoundsOriginalIntegersThroughFP32:CPUInt32RMSNorm.ExplicitScalarUsesOriginalIncreasingColumnFP64Program
@@ -657,6 +665,18 @@ v2_add_core_free_test(V2_Integration_CPUQwenSparseAllPositiveWorkers
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
         --gtest_filter=CPUQwenSparseLifetime.AllPositiveWorkersRetainOriginalSerialRowsAndGuards
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact ThreadBudget)
+# Each real representation/tail owns its timeout and every caller-admitted team
+# size. One named resource prevents these whole-team sweeps competing with each
+# other; it does not reduce workers or cap ordinary build/CTest parallelism.
+foreach(_indexer_rep IN ITEMS FP32 FP16 BF16)
+    foreach(_indexer_tail RANGE 0 3)
+        v2_add_core_free_test(V2_Integration_CPUQwenSparseIndexer${_indexer_rep}Tail${_indexer_tail}AllPositiveWorkers
+            COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
+                "--gtest_filter=OriginalInputs/CPUQwenSparseIndexerTotality.NativeRowsAndWorkers/${_indexer_rep}_Tail${_indexer_tail}"
+            LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact ThreadBudget Regression
+            RESOURCE_LOCK CPUQwenSparseIndexer_AllTeams)
+    endforeach()
+endforeach()
 add_executable(v2_test_cpu_qwen_sparse_fp32
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/attention/Test__CPUQwenSparseFP32.cpp")
 target_compile_features(v2_test_cpu_qwen_sparse_fp32 PRIVATE cxx_std_20)
