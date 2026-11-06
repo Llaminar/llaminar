@@ -872,3 +872,32 @@ TEST(PooledImmutableOwnerPinChain, SoleLocalDirectedSourceKeepsOriginalPhasesAnd
     }
 }
 }
+
+namespace llaminar2::test
+{
+/** @test Original pooled source/count declarations reject missing or substituted grouped prior authority. */
+TEST(PooledImmutableCurrentDemand, GroupedPrefixRejectsMissingPriorAndSubstitutedProjectionBeforeMutation){
+    std::vector<PooledOriginalRecipe> recipes;
+    for(const auto type:{DeviceType::CUDA,DeviceType::ROCm})recipes.push_back({{3},false,0,true,type,64});
+    PooledImmutableOriginalPrograms programs(recipes);
+    for(const auto& recipe:recipes){auto c=programs.make(recipe);const auto device=c.boundary->device();
+        auto* live=static_cast<std::int32_t*>(c.queryLive->gpu_data_ptr());ASSERT_NE(live,nullptr);
+        const auto rows=DeviceRowRange::deviceCounted(4,live);const auto& declared=c.boundary->pooledStorage()->geometry().parameters();
+        Qwen4ExpPLEContext context{.device=device,.prefix="L1_ple_",.rows={4,Qwen4ExpNativeIntInput{device,live,1}},.hidden=1,.epsilon=1e-6f,
+            .nativeFormat=declared.format,.nativeRowElements=static_cast<int>(declared.row_elements),.nativeRowBytes=declared.owner.row_bytes,
+            .arithmetic=Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier,.projectionRows=rows};
+        const Qwen4ExpFloatBinding output(*c.readOutput,BufferId::QFN_PLE_EMBEDDING);
+        const Qwen4ExpPLEBuffers buffers{Qwen4ExpNativeIntInput{device,static_cast<const std::int32_t*>(c.queryTokens->gpu_data_ptr()),4},
+            Qwen4ExpIntBinding(*c.queryPrior,BufferId::QFN_PLE_TOKEN_HISTORY),Qwen4ExpIntBinding(*c.ids,BufferId::QFN_NGRAM_ROW_IDS),
+            output,output,output,output,output,output,output,output};
+        const Qwen4ExpPooledLookupStorage storage{&c.arena,c.boundary,c.coordCode,*c.control,rows,
+            Qwen4ExpIntBinding(*c.queryLive,BufferId::PREFILL_CHUNK_GEOMETRY),{}};
+        ComputeGraph graph;const auto before=graph.topologyGeneration();
+        EXPECT_THROW(Qwen4ExpPooledReadAheadFrame::publish(graph,context,buffers,storage),std::invalid_argument);
+        EXPECT_EQ(graph.size(),0u);EXPECT_EQ(graph.topologyGeneration(),before);
+        context.projectionRows=DeviceRowRange::deviceCounted(4,static_cast<const std::int32_t*>(c.queryTokens->gpu_data_ptr()));
+        EXPECT_THROW(Qwen4ExpPooledReadAheadFrame::publish(graph,context,buffers,storage),std::invalid_argument);
+        EXPECT_EQ(graph.size(),0u);EXPECT_EQ(graph.topologyGeneration(),before);
+    }
+}
+}

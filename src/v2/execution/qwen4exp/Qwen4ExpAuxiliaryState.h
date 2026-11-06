@@ -119,6 +119,23 @@ public:
         Qwen4ExpFloatBinding convolution()const{(void)capability_.snapshotProducer();return convolution_;}
         /** @brief Exact snapshot producer consumed by both verifier readers. */
         const std::string&snapshotProducer()const{return capability_.snapshotProducer();}
+        /**
+         * @brief Authenticate the same immutable prior, count and history banks before early hash construction.
+         * @param graph Original participant graph whose snapshot minted this capability.
+         * @param device Exact execution participant.
+         * @param rows Original capacity and native live-count binding.
+         * @param tokens Original snapshot token bank consumed by hash.
+         * @param convolution Original snapshot convolution bank consumed by late PLE.
+         * @throws std::invalid_argument Before mutation for a substituted graph, prior or count.
+         */
+        void requireFor(const ComputeGraph&graph,DeviceId device,const Qwen4ExpStageRows&rows,
+            Qwen4ExpIntBinding tokens,Qwen4ExpFloatBinding convolution)const;
+        /**
+         * @brief Order an actual same-graph hash after this original snapshot without consuming publication authority.
+         * @param graph Original capability owner graph.
+         * @param consumer Actual same-device hash node already appended to graph.
+         */
+        void orderBefore(ComputeGraph&graph,const std::string&consumer)const{capability_.orderBefore(graph,consumer);}
     private:
         friend class Qwen4ExpAuxiliaryState;
         /** @brief Construct only after the auxiliary owner appends the dedicated snapshot. */

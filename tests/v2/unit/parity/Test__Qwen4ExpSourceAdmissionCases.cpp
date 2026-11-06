@@ -11,6 +11,7 @@
  * explicitly smaller dynamic MTP ceiling, independent of retained capacity.
  */
 #include "integration/parity/qwen4exp/Qwen4ExpSourceAdmissionCases.h"
+#include "integration/parity/qwen4exp/Qwen4ExpPooledCurrentDemandCases.h"
 #include "integration/parity/qwen4exp/Qwen4ExpSharedContinuationMTPSourceCases.h"
 #include "fixtures/models/Qwen4ExpReplicatedPLECohortReplayAccess.h"
 #include "planning/ImmutableRowTablePlacementPlanner.h"
@@ -2368,4 +2369,83 @@ TEST(Qwen4ExpSourceAdmissionCases, AllGPUQ6SourceAdmissionAndPublicRuntimeKeepOr
         EXPECT_EQ(runtime.mtp.draft_tokens, public_request.mtp.draft_tokens);
     }
 }
+
+/** @test Functional Off generation projects two unchanged original retained3 shared-owner requests. */
+TEST(Qwen4ExpSourceAdmissionCases, OwnerSubsetOrdinaryGenerationKeepsOriginalOffRequests)
+{
+    const auto cells=qwen4ExpOwnerSubsetOrdinaryGenerationCases();ASSERT_EQ(cells.size(),2u);
+    const auto original=qwen4ExpOwnerSubsetExecutionCases(ModelParityExpertOverlayPolicy{});
+    std::set<std::string> names;
+    for(const auto& cell:cells) {
+        EXPECT_TRUE(names.insert(cell.testName()).second);
+        EXPECT_EQ(cell.mtp,ModelParityMTP::Off);EXPECT_EQ(cell.retained_mtp_draft_capacity,3);
+        EXPECT_EQ(cell.expert_overlay,std::optional{ModelParityExpertOverlayPolicy{}});
+        ASSERT_TRUE(cell.ngram_table_policy);const auto& storage=cell.ngram_table_policy->gpu_adaptive;
+        EXPECT_EQ(storage.source_backing,AdaptiveImmutableRowBacking::RAM);
+        ASSERT_EQ(storage.placement.owners.size(),1u);
+        EXPECT_EQ(storage.placement.owners.front().participant.device().ordinal,1);
+        EXPECT_TRUE(std::any_of(original.begin(),original.end(),[&](const auto& old){return old.testName()==cell.testName();}));
+    }
+}
+
 } // namespace llaminar2::test::parity::qwen4exp
+
+namespace llaminar2::test::parity::qwen4exp {
+/** @test Explicit current-demand candidates preserve exact original seeds and truthful role/backend coverage. */
+TEST(Qwen4ExpSourceAdmissionCases, PooledCurrentDemandCandidatesPreserveSupportedOriginalSeeds)
+{
+    const auto originalMatched=qwen4ExpHardwareMatchedCacheEconomyCases();
+    const auto originalPure=qwen4ExpSharedCoordinatorCUDATP2AdaptiveSourceAdmissionSeeds();
+    const auto& cases=qwen4ExpPooledCurrentDemandCases();ASSERT_EQ(cases.size(),4u);
+    unsigned pure=0,inlineOwners=0;std::set<DeviceType> inlineBackends;std::set<std::uint64_t> pureCaps;
+    for(const auto& candidate:cases){
+        EXPECT_EQ(candidate.mtp,ModelParityMTP::Off);EXPECT_EQ(candidate.retained_mtp_draft_capacity,0);
+        EXPECT_EQ(candidate.expert_overlay,std::optional{ModelParityExpertOverlayPolicy{}});
+        EXPECT_EQ(candidate.inventory_role,ModelParityInventoryRole::NumericalDiagnostic);
+        const auto role=qwen4ExpCurrentDemandRole(candidate);const auto& pool=candidate.ngram_table_policy->gpu_adaptive;
+        const auto& original=role==Qwen4ExpCurrentDemandRole::PureReader?originalPure:originalMatched;
+        const auto found=std::find_if(original.begin(),original.end(),[&](const auto& value){return value.topology.test_id+"_PooledEarlyCurrent"==candidate.topology.test_id && value.ngram_table_policy==candidate.ngram_table_policy;});
+        ASSERT_NE(found,original.end());auto normalized=candidate;
+        normalized.topology.test_id=found->topology.test_id;normalized.inventory_role=found->inventory_role;
+        EXPECT_EQ(::testing::PrintToString(normalized),::testing::PrintToString(*found));
+        if(role==Qwen4ExpCurrentDemandRole::PureReader){
+            ++pure;ASSERT_EQ(pool.placement.owners.size(),1u);
+            EXPECT_EQ(pool.placement.coordinator->device().type,DeviceType::CUDA);
+            EXPECT_EQ(pool.placement.owners.front().participant.device().type,DeviceType::ROCm);
+            pureCaps.insert(pool.placement.owners.front().maximum_cache_rows);
+        }else{
+            ++inlineOwners;ASSERT_EQ(pool.placement.owners.size(),2u);
+            inlineBackends.insert(pool.placement.coordinator->device().type);
+            for(const auto& owner:pool.placement.owners)EXPECT_EQ(owner.cache_physical_byte_limit,std::size_t{256}<<20);
+        }
+    }
+    EXPECT_EQ(pure,2u);EXPECT_EQ(inlineOwners,2u);
+    EXPECT_EQ(pureCaps,(std::set<std::uint64_t>{0,64}));
+    EXPECT_EQ(inlineBackends,(std::set<DeviceType>{DeviceType::CUDA,DeviceType::ROCm}));
+    for(std::size_t index=0;index<originalMatched.size();++index)
+        EXPECT_EQ(::testing::PrintToString(originalMatched[index]),::testing::PrintToString(qwen4ExpHardwareMatchedCacheEconomyCases()[index]));
+    for(std::size_t index=0;index<originalPure.size();++index)
+        EXPECT_EQ(::testing::PrintToString(originalPure[index]),::testing::PrintToString(qwen4ExpSharedCoordinatorCUDATP2AdaptiveSourceAdmissionSeeds()[index]));
+}
+}
+
+namespace llaminar2::test::parity::qwen4exp {
+/** @test Existing typed MTP expansion preserves all original current-demand seed/owner identities without duplicate Off launches. */
+TEST(Qwen4ExpSourceAdmissionCases,PooledCurrentDemandMTPPreservesOriginalSeeds)
+{
+ const auto& seeds=qwen4ExpPooledCurrentDemandCases();const auto& active=qwen4ExpPooledCurrentMTPDemandCases();
+ ASSERT_EQ(seeds.size(),4u);ASSERT_EQ(active.size(),12u);std::set<std::string> names;
+ std::map<ModelParityMTP,int> policies;
+ const auto expected=qwen4ExpExpandSourceAdmissionMTP(seeds,Qwen4ExpSourceMTPEnvelope::Retained3);
+ for(const auto& cell:active){ASSERT_NE(cell.mtp,ModelParityMTP::Off);EXPECT_EQ(cell.retained_mtp_draft_capacity,3);
+  ASSERT_TRUE(cell.model.shared_predictor);EXPECT_EQ(cell.inventory_role,ModelParityInventoryRole::NumericalDiagnostic);
+  EXPECT_TRUE(names.insert(cell.testName()).second);++policies[cell.mtp];
+  const auto original=std::find_if(expected.begin(),expected.end(),[&](const auto& row){return row.testName()==cell.testName();});
+  ASSERT_NE(original,expected.end());EXPECT_EQ(::testing::PrintToString(cell),::testing::PrintToString(*original));
+  EXPECT_NO_THROW(qwen4ExpCurrentDemandRole(cell));
+ }
+ EXPECT_EQ(policies[ModelParityMTP::Depth1],4);EXPECT_EQ(policies[ModelParityMTP::Depth3],4);EXPECT_EQ(policies[ModelParityMTP::DynamicDepth],4);
+ for(const auto& seed:seeds){EXPECT_EQ(seed.mtp,ModelParityMTP::Off);EXPECT_EQ(seed.retained_mtp_draft_capacity,0);}
+}
+
+}

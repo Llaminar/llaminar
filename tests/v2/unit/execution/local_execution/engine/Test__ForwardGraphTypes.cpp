@@ -8824,3 +8824,63 @@ TEST(HostedDeviceGenerationFragment, ExactVerifierIdentityAcrossFixedAndDynamicW
         EXPECT_FALSE(fragment.hasSameExecutionIdentity(changed_policy));
     }
 }
+
+/** @test The ordinary semantic arm requires its original sampler and complete retained key. */
+TEST(HostedDeviceGenerationFragment, OrdinaryForwardRequiresOriginalSamplerAndCompleteKey)
+{
+    std::array<int32_t,2> tokens{},positions{},counts{};
+    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)}) {
+    FakeReplayGraphCapture original(nullptr,true),foreign(nullptr,true);
+    ForwardGraphSignature key;key.device=device;key.seq_len=key.batch_size=1;
+    key.decode=true;key.execution_role=ForwardExecutionRole::MainInference;
+    key.device_token_ids=tokens.data();key.device_position_ids=positions.data();
+    HostedDeviceGenerationFragment fragment;
+    fragment.kind=HostedDeviceGenerationFragment::Kind::OrdinaryExpertOverlayReplay;
+    fragment.capture=&original;fragment.forward_signature=key;
+    EXPECT_TRUE(fragment.embedsOrdinaryForward(key,&original));
+    EXPECT_FALSE(fragment.embedsVerifierForward(key));
+    EXPECT_FALSE(fragment.embedsOrdinaryForward(key,nullptr));
+    EXPECT_FALSE(fragment.embedsOrdinaryForward(key,&foreign));
+    auto changed=fragment;changed.capture=&foreign;
+    EXPECT_FALSE(changed.embedsOrdinaryForward(key,&original));
+    ComputeGraph graph;changed=fragment;changed.semantic_graph=&graph;
+    EXPECT_FALSE(changed.embedsOrdinaryForward(key,&original));
+    for(int change=0;change<12;++change) {
+        auto other=key;
+        switch(change) {
+        case 0:other.device_token_ids=tokens.data()+1;break;
+        case 1:other.device_position_ids=positions.data()+1;break;
+        case 2:other.device_sequence_lengths=counts.data();break;
+        case 3:other.seq_len=2;break;
+        case 4:other.batch_size=2;break;
+        case 5:other.decode=false;break;
+        case 6:other.execution_role=ForwardExecutionRole::GroupedMTPVerifier;break;
+        case 7:other.snapshot_configuration_identity++;break;
+        case 8:other.sparse_query_execution_program=SparseQueryExecutionProgram::ProvenNoRanking;break;
+        case 9:other.moe_placement_epoch++;break;
+        case 10:other.device_request_query_capture_identity++;break;
+        case 11:other.live_mtp_request_batch_condition=true;break;
+        }
+        EXPECT_FALSE(fragment.embedsOrdinaryForward(other,&original))<<change;
+    }
+    for(int invalid=0;invalid<7;++invalid) {
+        auto other=key;
+        if(invalid==0)other.device_token_ids=nullptr;
+        if(invalid==1)other.device_position_ids=nullptr;
+        if(invalid==2)other.decode=false;
+        if(invalid==3)other.execution_role=ForwardExecutionRole::GroupedMTPVerifier;
+        if(invalid==4)other.device=DeviceId::cpu();
+        if(invalid==5)other.seq_len=2;
+        if(invalid==6)other.batch_size=2;
+        changed=fragment;changed.forward_signature=other;
+        EXPECT_FALSE(changed.embedsOrdinaryForward(other,&original));
+    }
+    for(const auto kind:{HostedDeviceGenerationFragment::Kind::CapturedLocal,
+        HostedDeviceGenerationFragment::Kind::MTPGroupedVerifierReplay,HostedDeviceGenerationFragment::Kind::MTPFullSidecarReplay,
+        HostedDeviceGenerationFragment::Kind::MTPChainedSidecarReplay,HostedDeviceGenerationFragment::Kind::MoEOverlayEpochAcquire,
+        HostedDeviceGenerationFragment::Kind::MoEOverlayEpochRelease}) {
+        changed=fragment;changed.kind=kind;
+        EXPECT_FALSE(changed.embedsOrdinaryForward(key,&original));
+    }
+    }
+}

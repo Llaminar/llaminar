@@ -87,6 +87,50 @@ protected:
 /** @test Original native condition/verifier inputs, snapshots and reset/reuse, without HF acceptance. */
 TEST_P(Qwen4ExpMTPExactReplayTest, MTPExactReplay) { runQwen4ExpMTPExactReplay(); }
 
+/** @brief Public ordinary generation on the original source, followed by real reset/reuse. */
+class Qwen4ExpOrdinaryGenerationTest
+    : public Qwen4ExpConfigDrivenParityTest<Qwen4ExpOrdinaryGenerationTest>, public ModelParityCaseParameter {
+    using Base=Qwen4ExpConfigDrivenParityTest<Qwen4ExpOrdinaryGenerationTest>;
+protected:
+    /** @return Existing-header-only setup; this fixture performs no HF scoring. */
+    MTPParityProofPurpose mtpParityProofPurpose() const noexcept override
+    { return MTPParityProofPurpose::NativeExactReplay; }
+    /** @brief Functional generation cannot manufacture numerical reference rows. */
+    bool regeneratePyTorchSnapshots() override
+    { ADD_FAILURE()<<"NativeGeneration cannot generate reference snapshots";return false; }
+    /** @brief Run two real public requests, with existing graph/source/reader retirement checks. */
+    void runOrdinaryGeneration()
+    {
+        ASSERT_EQ(modelParityCase().mtp,ModelParityMTP::Off);
+        ASSERT_NO_FATAL_FAILURE(Base::beginProductionParitySnapshotAdmission());
+        ASSERT_NO_FATAL_FAILURE(Base::setupProductionParityPipeline());
+        ASSERT_NE(Base::orch_runner_,nullptr);
+        ASSERT_FALSE(Base::orch_runner_->config().mtp.enabled);
+        const std::vector<int32_t> prompt(Base::config_.token_ids.begin(),Base::config_.token_ids.end());
+        // The prompt supplies the first sample. Two subsequent tokens prove
+        // both the retained decode program's initial launch and actual replay;
+        // a two-token response would exercise only transaction zero.
+        const auto generation=Base::orch_runner_->generate(prompt,3,Base::productionParitySamplingParams());
+        ASSERT_TRUE(generation.error.empty())<<generation.error;
+        // is_complete records a model stop token, not exhaustion of this
+        // caller's three-token budget. Error-free delivery of the full budget
+        // proves completion here; an earlier model stop still fails the size.
+        ASSERT_EQ(generation.tokens.size(),3u);
+        ASSERT_NO_FATAL_FAILURE(Base::finishProductionParityEvidence());
+        ASSERT_NO_FATAL_FAILURE(Base::assertLookupReuseAfterProductionProof());
+        std::ofstream record(Base::ensureResultsDir()/"ordinary_generation_scope.txt");
+        ASSERT_TRUE(record.is_open());
+        record<<"public_requests=2\nfirst_response_budget=3\nreuse_response_budget=2\nmtp=off\nhf_numerical_scoring=0\n";
+        record<<"first_request_model_stopped="<<generation.is_complete<<'\n';
+        record.flush();ASSERT_TRUE(record.good());
+    }
+};
+/** @test Actual complete captured ordinary generation and original-owner reuse; no numerical certificate. */
+TEST_P(Qwen4ExpOrdinaryGenerationTest, NativeGeneration) { runOrdinaryGeneration(); }
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpOwnerSubsetOrdinaryGenerationCandidate,Qwen4ExpOrdinaryGenerationTest,
+    ::testing::ValuesIn(qwen4ExpOwnerSubsetOrdinaryGenerationCases()),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
+
 // Rank-local all-GPU two-tier candidates use the original mapped device
 // GraphService. Source admission and native exact proof remain separate jobs.
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpAllGPUQ6DynamicOrdinalR3Exact, Qwen4ExpMTPExactReplayTest,

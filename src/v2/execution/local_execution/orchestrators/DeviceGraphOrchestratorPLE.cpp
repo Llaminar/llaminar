@@ -191,7 +191,30 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
     // old sidecar/preparation cache left over from another request shape.
     const auto embedded=[](const MTPDeviceGenerationLoopGraphCache &parent,
         const IGPUGraphCapture *capture,const ComputeGraph *graph,
-        const ForwardGraphSignature *signature=nullptr){
+        const ForwardGraphSignature *signature=nullptr,
+        const ForwardExecutionEngine::RetainedDecodeGraphView *retained=nullptr,
+        OrdinaryForwardRetentionKind retention=OrdinaryForwardRetentionKind::NativeComposable){
+        const auto *sampler=parent.ordinary_children[OrdinaryGenerationGraphPlan::decode_sampler].get();
+        // The semantic ordinary arm owns a sampler rather than the forward's
+        // capture. Authenticate its exact original retained export and current
+        // workspace BEFORE projecting the parent membership; a foreign merely
+        // executable capture is never a substitute for ordinary_children.
+        const bool ordinary_owner=signature && retained && parent.ordinary_forward_identity &&
+            *parent.ordinary_forward_identity==*signature && parent.ordinary_hosted_forward &&
+            *parent.ordinary_hosted_forward==*retained && retained->signature==*signature &&
+            retained->device==signature->device && retained->workspace_generation==parent.workspace_generation &&
+            parent.execution_kind==MTPDeviceGenerationLoopGraphCache::ExecutionKind::HostedDispatchTicketPublisher &&
+            parent.source_fragments.empty() && parent.ordinary_sampling_identity && sampler &&
+            sampler->hasExecutable() && parent.stream && sampler->executionStream()==parent.stream.get();
+        // Composition is not retention authority: a native complete parent can
+        // also contain ExpertOverlay compute. Only the original admitted
+        // retention contract selects the semantic ordinary export.
+        const bool ordinary_semantic=signature && signature->execution_role==ForwardExecutionRole::MainInference &&
+            retention==OrdinaryForwardRetentionKind::HostedExpertOverlay;
+        if(ordinary_semantic)
+            return ordinary_owner && std::ranges::any_of(parent.hosted_fragments,[&](const auto &fragment){
+                return fragment.embedsOrdinaryForward(*signature,sampler);
+            });
         return (capture && std::ranges::any_of(parent.source_fragments,[&](const auto &f){return f.capture==capture;})) ||
             std::ranges::any_of(parent.hosted_fragments,[&](const auto &f){
                 // Hosted verifier submission consumes the exact FEE signature,
@@ -270,7 +293,7 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
         const auto native=forward_engine_->deviceLoopGraphTemplate(signature);
         if(!retained || !retained->graph_owner || retained->device!=state_.device_id ||
             retained->workspace_generation!=loop.workspace_generation ||
-            !embedded(loop,native?native->capture:nullptr,retained->graph_owner,&signature))
+            !embedded(loop,native?native->capture:nullptr,retained->graph_owner,&signature,&*retained,ordinaryForwardRetentionKind()))
             fail("retained forward graph is not embedded in the current generation parent");
         inspect(*retained->graph_owner,*this,heads,
             signature.all_position_logits || signature.live_mtp_request_batch_condition
@@ -351,7 +374,7 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
         const auto native=canonical.forward_engine_->deviceLoopGraphTemplate(signature);
         if(!retained || !retained->graph_owner || retained->device!=canonical.state_.device_id ||
             retained->workspace_generation!=reference.workspace_generation ||
-            !embedded(reference,native?native->capture:nullptr,retained->graph_owner,&signature))
+            !embedded(reference,native?native->capture:nullptr,retained->graph_owner,&signature,&*retained,canonical.ordinaryForwardRetentionKind()))
             fail("canonical retained forward is not embedded in its generation parent");
         inspect(*retained->graph_owner,canonical,referenceHeads,
             signature.all_position_logits || signature.live_mtp_request_batch_condition

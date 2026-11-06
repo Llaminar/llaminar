@@ -459,6 +459,28 @@ Qwen4ExpPLERetainedStage::Params pleVerifierParams(DeviceId device,
   .copiedBytes=counter,.verifierOrigins=RequestRowOrigins::fixedStride(0,rows.capacity)};
 }
 }
+void Qwen4ExpAuxiliaryState::PLEVerifierPrior::requireFor(const ComputeGraph&graph,DeviceId device,
+ const Qwen4ExpStageRows&rows,Qwen4ExpIntBinding tokens,Qwen4ExpFloatBinding convolution)const
+{
+ capability_.requireFor(graph,device);
+ const auto* snapshot=graph.getNode(capability_.snapshotProducer());
+ require(snapshot&&snapshot->device==device&&snapshot->stage->device()==device,
+  "Early verifier prior requires its original declared participant");
+ const auto sameInput=[](const Qwen4ExpIntInput&a,const Qwen4ExpIntInput&b){
+  if(a.value.index()!=b.value.index())return false;
+  if(const auto*left=std::get_if<Qwen4ExpNativeIntInput>(&a.value)){
+   const auto&right=std::get<Qwen4ExpNativeIntInput>(b.value);
+   return left->owner==right.owner&&left->data==right.data&&left->capacity==right.capacity;
+  }
+  const auto&left=std::get<Qwen4ExpIntBinding>(a.value);const auto&right=std::get<Qwen4ExpIntBinding>(b.value);
+  return left.tensor==right.tensor&&left.buffer==right.buffer&&left.byteOffset==right.byteOffset;
+ };
+ require(rows.capacity==rows_.capacity&&rows.liveRows.has_value()==rows_.liveRows.has_value()&&
+  (!rows.liveRows||sameInput(*rows.liveRows,*rows_.liveRows))&&
+  tokens.tensor==tokens_.tensor&&tokens.buffer==tokens_.buffer&&tokens.byteOffset==tokens_.byteOffset&&
+  convolution.tensor==convolution_.tensor&&convolution.buffer==convolution_.buffer&&convolution.byteOffset==convolution_.byteOffset,
+  "Early verifier hash requires its exact original prior/history/count bindings");
+}
 Qwen4ExpAuxiliaryState::PLEVerifierPrior Qwen4ExpAuxiliaryState::appendVerifierPLEPrior(
  ComputeGraph&graph,const std::string&prefix,int sequence,Qwen4ExpStageRows rows,
  Qwen4ExpIntInput candidateTokens,Qwen4ExpFloatBinding candidateNormalized,

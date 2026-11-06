@@ -53,7 +53,7 @@ class SourceAdmissionDiscovery(unittest.TestCase):
     def discover(self, listing: str, *, sources: bool = True,
                  mtp_source_kind: str = "", predictor_files: tuple[str, ...] = (),
                  timeout: str | None = "30", source_timeout: str | None = None,
-                 perf_filter: str | None = None):
+                 perf_filter: str | None = None, environment: tuple[str, ...] = ()):
         """Run canonical discovery and parse the resulting real CTest properties."""
         with tempfile.TemporaryDirectory(prefix="llaminar source admission ") as directory:
             root = Path(directory)
@@ -67,6 +67,8 @@ class SourceAdmissionDiscovery(unittest.TestCase):
                        "-DLABELS=V2;Integration;Parity;CPU;CUDA;ROCm;PyTorch;GoldenReference;FullModel",
                        "-DMPI_PROCS=1", "-DNUM_SOCKETS=2", "-DCORES_PER_SOCKET=2",
                        f"-DWORKING_DIR={root}"]
+            if environment:
+                command.append("-DENVIRONMENT_SERIALIZED=" + "|".join(environment))
             if timeout is not None:
                 command.append(f"-DTIMEOUT={timeout}")
             if source_timeout is not None:
@@ -91,7 +93,7 @@ class SourceAdmissionDiscovery(unittest.TestCase):
                 "cmake_minimum_required(VERSION 3.25)\n"
                 "project(SourceAdmissionDiscovery LANGUAGES NONE)\n"
                 "enable_testing()\n"
-                f'include("{generated.as_posix()}")\n')
+                f'set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES "{generated.as_posix()}")\n')
             configured = subprocess.run(
                 [self.cmake, "-S", str(root), "-B", str(root / "build"),
                  "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={self.ninja}"],
@@ -114,6 +116,34 @@ class SourceAdmissionDiscovery(unittest.TestCase):
                 environment = dict(item.split("=", 1) for item in props["ENVIRONMENT"])
                 self.assertEqual(environment["LLAMINAR_TEST_MPI_SESSION_HELPER"], command[0])
             return result, tests
+
+    def test_explicit_environment_is_literal_for_focused_and_campaign_children(self):
+        """The same selected policy reaches CTest and every MPI child without a shell."""
+        value = 'a value=with "quotes" $HOME ${literal} `never-run` \\tail'
+        entries = ("LLAMINAR_QFN_NGRAM_LOOKUP_SCHEDULE=early_current_hosted_candidate",
+                   "PARITY_LITERAL=" + value)
+        result, tests = self.discover(
+            "SourceMatrix.\n  FullSourceAdmission/CUDA0_CUDA1_MTPOff\n"
+            "NumericMatrix.\n  ProductionParity/CUDA0_CUDA1_MTPOff\n", environment=entries)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(tests), 2)
+        for test in tests:
+            props = {p["name"]: p["value"] for p in test["properties"]}
+            actual = dict(item.split("=", 1) for item in props["ENVIRONMENT"])
+            self.assertEqual(actual["PARITY_LITERAL"], value)
+            self.assertEqual(actual["LLAMINAR_QFN_NGRAM_LOOKUP_SCHEDULE"], "early_current_hosted_candidate")
+            for entry in entries:
+                position = test["command"].index(entry)
+                self.assertEqual(test["command"][position-1], "-x")
+
+    def test_explicit_environment_rejects_invalid_duplicate_and_canonical_override(self):
+        """CMake delimiters cannot turn one binding into another policy or override graph ownership."""
+        for entries in (("not-an-assignment",), ("1INVALID=x",), ("VALUE=x;split",),
+                        ("VALUE=x", "VALUE=y"), ("LLAMINAR_GPU_GRAPHS=0",)):
+            with self.subTest(entries=entries):
+                result, tests = self.discover("SourceMatrix.\n  FullSourceAdmission/CUDA0_MTPOff\n", environment=entries)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIsNone(tests)
 
     def test_actual_participants_sources_and_world_are_preserved(self):
         """Every hardware signature owns exact sources and disabled foreign startup."""
@@ -299,20 +329,22 @@ class SourceAdmissionDiscovery(unittest.TestCase):
         declaration = source[begin:end]
         with tempfile.TemporaryDirectory(prefix="llaminar-source-deadline-identity-") as temporary:
             root = Path(temporary)
-            def configure(declared):
+            (root / "cmake").mkdir(exist_ok=True)
+            shutil.copy2(SOURCE / "tests/v2/cmake/V2ParityEnvironment.cmake", root / "cmake/V2ParityEnvironment.cmake")
+            def configure(declared, target="v2_integration_parity_qwen4exp_production_matrix"):
                 (root / "CMakeLists.txt").write_text(
                     "cmake_minimum_required(VERSION 3.25)\n"
                     "project(SourceDeadlineIdentity LANGUAGES NONE)\n"
                     "enable_testing()\n"
                     f'include("{SOURCE}/tests/v2/fixtures/cmake/NativeMPISessionOwner.cmake")\n'
-                    "add_custom_target(v2_integration_parity_qwen4exp_production_matrix)\n"
+                    f"add_custom_target({target})\n"
                     # Compilation and command scheduling are not the policy under
                     # test. Capture the actual POST_BUILD argv without a build.
                     "function(target_compile_definitions)\nendfunction()\n"
                     "function(add_custom_command)\n"
                     'file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/post-build.txt" "${ARGV}")\n'
                     "endfunction()\n" + helper + "\n" + declared + "\n"
-                    'get_target_property(deps v2_integration_parity_qwen4exp_production_matrix LINK_DEPENDS)\n'
+                    f'get_target_property(deps {target} LINK_DEPENDS)\n'
                     'file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/dependencies.txt" "${deps}")\n')
                 result = subprocess.run([self.cmake, "-S", str(root), "-B", str(root / "build"),
                                          "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={self.ninja}"],
@@ -338,6 +370,16 @@ class SourceAdmissionDiscovery(unittest.TestCase):
             self.assertNotEqual((build / name).read_text(), identity)
             self.assertIn("source_admission_timeout=901\n", (build / name).read_text())
             self.assertIn("SOURCE_ADMISSION_TIMEOUT=901", (build / "post-build.txt").read_text())
+            # Exact before-startup bindings own discovery identity and POST_BUILD argv too.
+            current = changed[:changed.rfind(")")] + ' ENVIRONMENT "PARITY_BINDING=current"\n)' + changed[changed.rfind(")")+1:]
+            configure(current)
+            selected = (build / name).read_text()
+            self.assertIn("environment=PARITY_BINDING=current\n", selected)
+            self.assertIn("ENVIRONMENT_SERIALIZED=PARITY_BINDING=current", (build / "post-build.txt").read_text())
+            configure(current.replace("PARITY_BINDING=current", "PARITY_BINDING=other"))
+            self.assertNotEqual((build / name).read_text(), selected)
+            self.assertIn("environment=PARITY_BINDING=other\n", (build / name).read_text())
+            self.assertIn("V2ParityEnvironment.cmake", (build / "dependencies.txt").read_text())
             # The helper remains the installed original binary, but its selected
             # location must participate in the actual generated link identity.
             prior_helper = os.environ["LLAMINAR_TEST_MPI_SESSION_HELPER"]
@@ -354,6 +396,20 @@ class SourceAdmissionDiscovery(unittest.TestCase):
             self.assertIn("mpi_session_helper=" + str(relocated) + "\n", after_relocation)
             self.assertNotIn("mpi_session_helper=" + prior_helper + "\n", after_relocation)
 
+            # Execute the new target's actual declaration through the same
+            # configure-owned parser rather than infer its before-startup binding.
+            target = "v2_integration_parity_qwen4exp_pooled_current_mtp_matrix"
+            self.assertRegex(target, r"^v2_integration_parity_[a-z0-9]+(_[a-z0-9]+)+_matrix$")
+            begin = source.index("    discover_v2_parity_tests(" + target)
+            end = source.index("\n\n", begin)
+            configure(source[begin:end], target)
+            identity = (build / (target + "_discovery_identity_.txt")).read_text()
+            self.assertIn("environment=LLAMINAR_QFN_NGRAM_LOOKUP_SCHEDULE=early_current_hosted_candidate\n", identity)
+            self.assertIn("source_admission_mtp_source_kind=Paired\n", identity)
+            post_build = (build / "post-build.txt").read_text()
+            self.assertIn("TEST_EXECUTABLE=$<TARGET_FILE:" + target + ">", post_build)
+            self.assertIn("ENVIRONMENT_SERIALIZED=LLAMINAR_QFN_NGRAM_LOOKUP_SCHEDULE=early_current_hosted_candidate", post_build)
+
     def test_actual_helper_identity_is_configuration_owned(self):
         """Different native helper outputs cannot collide at CMake generation."""
         source = (SOURCE / "tests/v2/CMakeLists.txt").read_text()
@@ -361,6 +417,8 @@ class SourceAdmissionDiscovery(unittest.TestCase):
         end = source.index("endfunction()", begin) + len("endfunction()")
         with tempfile.TemporaryDirectory(prefix="llaminar multi config identity ") as temporary:
             root = Path(temporary)
+            (root / "cmake").mkdir(exist_ok=True)
+            shutil.copy2(SOURCE / "tests/v2/cmake/V2ParityEnvironment.cmake", root / "cmake/V2ParityEnvironment.cmake")
             for config in ("Debug", "Release"):
                 destination = root / config / "llaminar_mpi_session"
                 destination.parent.mkdir()
@@ -491,6 +549,24 @@ class SourceAdmissionDiscovery(unittest.TestCase):
                 self.assertIn(long_cell, command[-1])
             else:
                 self.assertEqual(command[command.index("-np") + 1], "1" if "CUDA" in test["name"] else "2")
+
+    def test_ordinary_generation_uses_original_inputs_and_functional_labels(self):
+        """Public Off requests use explicit native originals without numerical/reference claims."""
+        listing="Ordinary.\n  NativeGeneration/ROCm0_ROCm1_RAM_OwnerSubset2_R3_MTPOff\n"
+        result,tests=self.discover(listing,perf_filter="forward_graph,immutable_lookup")
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertEqual(len(tests),1)
+        test=tests[0];props={item["name"]:item["value"] for item in test["properties"]}
+        self.assertTrue({"NativeGeneration","Functional","UnqualifiedCandidate","RealModel","ROCm"}<=set(props["LABELS"]))
+        self.assertFalse({"ByteExact","MTP","Parity","PyTorch","GoldenReference","NativeExactReplay","Admission"}&set(props["LABELS"]))
+        self.assertFalse(props.get("FIXTURES_REQUIRED",[]))
+        self.assertEqual(set(props["REQUIRED_FILES"]),{"/not-loaded/main 0.gguf","/not-loaded/main 1.gguf","/not-loaded/ROCm.gguf"})
+        env=dict(value.split("=",1) for value in props["ENVIRONMENT"])
+        for name in ("LLAMINAR_PRODUCTION_PARITY","LLAMINAR_GPU_GRAPHS","LLAMINAR_PREFILL_GRAPH_REQUIRED"):
+            self.assertEqual(env[name],"1");self.assertIn(name,test["command"])
+        self.assertEqual(env["LLAMINAR_SKIP_CUDA_STARTUP"],"1")
+        self.assertEqual(env["LLAMINAR_SKIP_ROCM_STARTUP"],"0")
+        self.assertEqual(props["RESOURCE_LOCK"],["Integration_Serial"])
 
     def test_native_exact_reuses_original_source_closure_without_fetch_or_reference_labels(self):
         """Exact functional cells retain real roles/inputs and all consumed counter producers."""

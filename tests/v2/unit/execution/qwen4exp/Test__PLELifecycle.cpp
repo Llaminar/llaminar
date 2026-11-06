@@ -13,6 +13,9 @@
 #include "utils/MPIContext.h"
 #include "utils/OpenMPUtils.h"
 #include "models/qwen4exp/Qwen4ExpBufferLayout.h"
+#include "models/qwen4exp/Qwen4ExpEarlyCurrentInput.h"
+#include "models/GraphTypes.h"
+#include "execution/local_execution/graph/IGraphBuilder.h"
 #include "execution/local_execution/graph/GraphResolver.h"
 #include <gtest/gtest.h>
 #include <array>
@@ -243,3 +246,121 @@ TEST(PLELifecycle, RetainedStageCaptureIdentityUsesNativeOwnersAndGeometry){
 int main(int argc,char**argv){MPI_Init(&argc,&argv);::testing::InitGoogleTest(&argc,argv);const int result=RUN_ALL_TESTS();MPI_Finalize();return result;}
 
 #endif
+
+/** @test The real prior/hash/retain implementation replays one original transaction without accepted-state writes. */
+TEST(PLELifecycle, EarlyCurrentPriorHashRetainReplay)
+{
+ llaminar::v2::ThreadCountGuard threads(1);
+ for(const int capacity:{1,2,3,4,16}) {
+  Fixture f;ComputeGraph graph;
+  const Qwen4ExpStageRows rows{capacity,f.rows().liveRows};
+  auto prior=f.owner->appendVerifierPLEPrior(graph,"early_",0,rows,f.tokenInput(),
+   {f.normalized,BufferId::QFN_PLE_NORMALIZED},{});
+  INT32Tensor ids({Fixture::M*16*2});
+  qwen4exp::NgramHashPolicy policy;policy.multipliers={9007199254740993ULL,9007199254740995ULL,9007199254740997ULL};policy.eosToken=42;
+  for(int head=0;head<16;++head){policy.moduli[head]=1009+head;policy.offsets[head]=2048*head;}
+  ASSERT_NO_THROW(prior.requireFor(graph,DeviceId::cpu(),rows,prior.tokens(),prior.convolution()));
+  graph.addNode("hash",std::make_unique<Qwen4ExpPrimitiveStage>(Qwen4ExpPrimitiveStage::Params{
+   .device_id=DeviceId::cpu(),.rows=rows,.operation=Qwen4ExpPrimitiveStage::NgramHash{
+    f.tokenInput(),prior.tokens(),{ids,BufferId::QFN_NGRAM_ROW_IDS},policy}}));
+  prior.orderBefore(graph,"hash");
+  graph.addNode("trunk",std::make_unique<ReadyStage>());graph.addDependency("trunk","hash");
+  f.owner->appendVerifierPLERetain(graph,"early_",std::move(prior),f.tokenInput(),
+   {f.normalized,BufferId::QFN_PLE_NORMALIZED},{"trunk"});
+  EXPECT_THROW(prior.orderBefore(graph,"hash"),std::invalid_argument);
+  const auto order=graph.getExecutionOrder();
+  const auto at=[&](const char*name){return std::find(order.begin(),order.end(),name)-order.begin();};
+  ASSERT_LT(at("early_transaction_prior"),at("hash"));ASSERT_LT(at("hash"),at("trunk"));
+  ASSERT_LT(at("trunk"),at("early_retain_candidates"));
+  for(int replay=0;replay<20;++replay)for(int live:{capacity,std::min(3,capacity),0,1}) {
+   SCOPED_TRACE(::testing::Message()<<"capacity="<<capacity<<" replay="<<replay<<" live="<<live);
+   f.live=live;graph.reset();ASSERT_EQ(graph.getExecutionOrder(),order);
+   const std::array<int,2> history{static_cast<const int*>(f.ordinaryTokens.raw_data())[0],static_cast<const int*>(f.ordinaryTokens.raw_data())[1]};
+   std::fill_n(static_cast<int*>(f.priorTokens.raw_mutable_data()),2,-987);
+   std::fill_n(reinterpret_cast<std::int64_t*>(ids.raw_mutable_data()),Fixture::M*16,-123);
+   f.execute(graph);
+   ASSERT_EQ(std::memcmp(f.ordinaryTokens.raw_data(),history.data(),8),0);
+   for(int row=0;row<capacity;++row)for(int head=0;head<16;++head){
+    std::int64_t expected=-123;
+    if(row<live){const auto previous=row?f.tokens[row-1]:history[1];auto second=row>1?f.tokens[row-2]:history[row];
+     if(previous==policy.eosToken)second=policy.eosToken;
+     auto hash=std::uint64_t(f.tokens[row])*policy.multipliers[0] ^ std::uint64_t(previous)*policy.multipliers[1];
+     if(head>=8)hash^=std::uint64_t(second)*policy.multipliers[2];
+     expected=hash%policy.moduli[head]+policy.offsets[head];}
+    ASSERT_EQ(reinterpret_cast<const std::int64_t*>(ids.raw_data())[row*16+head],expected);
+   }
+   ASSERT_TRUE(f.publish(graph,std::min(live,2)).ok);
+   f.owner->reset({0,2,0,1},nullptr);
+  }
+ }
+}
+/** @test Genuine prior capability rejects substituted count, bank, device and graph before mutation. */
+TEST(PLELifecycle, EarlyCurrentPriorRejectsSubstitutedAuthority)
+{
+ Fixture f;ComputeGraph graph,foreign;
+ auto prior=f.owner->appendVerifierPLEPrior(graph,"early_",0,f.rows(),f.tokenInput(),{f.normalized,BufferId::QFN_PLE_NORMALIZED},{});
+ const auto before=graph.getExecutionOrder();int sameValue=f.live;
+ auto wrongRows=f.rows();wrongRows.liveRows=Qwen4ExpNativeIntInput{DeviceId::cpu(),&sameValue,1};
+ EXPECT_THROW(prior.requireFor(graph,DeviceId::cpu(),wrongRows,prior.tokens(),prior.convolution()),std::invalid_argument);
+ wrongRows=f.rows();--wrongRows.capacity;
+ EXPECT_THROW(prior.requireFor(graph,DeviceId::cpu(),wrongRows,prior.tokens(),prior.convolution()),std::invalid_argument);
+ EXPECT_THROW(prior.requireFor(graph,DeviceId::cuda(0),f.rows(),prior.tokens(),prior.convolution()),std::invalid_argument);
+ EXPECT_THROW(prior.requireFor(foreign,DeviceId::cpu(),f.rows(),prior.tokens(),prior.convolution()),std::invalid_argument);
+ EXPECT_THROW(prior.requireFor(graph,DeviceId::cpu(),f.rows(),{f.ordinaryTokens,BufferId::QFN_PLE_TOKEN_HISTORY},prior.convolution()),std::invalid_argument);
+ EXPECT_THROW(prior.requireFor(graph,DeviceId::cpu(),f.rows(),prior.tokens(),{f.ordinaryConv,BufferId::QFN_PLE_CONV_HISTORY}),std::invalid_argument);
+ ASSERT_EQ(graph.getExecutionOrder(),before);
+ auto* snapshot=graph.getNode(prior.snapshotProducer());snapshot->device=DeviceId::cuda(0);
+ EXPECT_THROW(prior.requireFor(graph,DeviceId::cpu(),f.rows(),prior.tokens(),prior.convolution()),std::invalid_argument);
+ snapshot->device=DeviceId::cpu();
+ EXPECT_NO_THROW(prior.requireFor(graph,DeviceId::cpu(),f.rows(),prior.tokens(),prior.convolution()));
+}
+
+/** @test The actual production role resolver keeps all scalar condition purposes on accepted history. */
+TEST(PLELifecycle, EarlyCurrentConditionUsesOriginalScalarAcceptedHistory)
+{
+    for (int replay = 0; replay < 20; ++replay) {
+        GraphConfig config;
+        ForwardInput input;
+        input.batch_size = 1;
+        input.seq_len = 1;
+        input.execution_phase = ForwardExecutionPhase::Decode;
+        input.execution_role = ForwardExecutionRole::MTPCondition;
+        config.live_mtp_request_batch_condition = true;
+        // Original condition mailbox values are cached-token positions, not row
+        // counts. Eligibility must never dereference/reinterpret that address.
+        const std::int32_t cached_tokens = 128 + replay;
+        input.sequence_lengths_device = &cached_tokens;
+        for (const auto transaction : {ForwardStateTransaction::Ordinary,
+                 ForwardStateTransaction::CommittedMTPCondition,
+                 ForwardStateTransaction::RestoredPrefixMTPDecodeBridge}) {
+            input.state_transaction = transaction;
+            EXPECT_EQ(resolveQwen4ExpEarlyCurrentHistory(config, input),
+                Qwen4ExpEarlyCurrentHistory::AcceptedState);
+            EXPECT_EQ(cached_tokens, 128 + replay);
+        }
+        config.live_mtp_request_batch_condition = false;
+        EXPECT_THROW(resolveQwen4ExpEarlyCurrentHistory(config, input), std::invalid_argument);
+        config.live_mtp_request_batch_condition = true;
+        input.seq_len = 2;
+        EXPECT_THROW(resolveQwen4ExpEarlyCurrentHistory(config, input), std::invalid_argument);
+        input.seq_len = 1;
+        input.batch_size = 2;
+        EXPECT_THROW(resolveQwen4ExpEarlyCurrentHistory(config, input), std::invalid_argument);
+        input.batch_size = 1;
+        input.execution_phase = ForwardExecutionPhase::Prefill;
+        EXPECT_THROW(resolveQwen4ExpEarlyCurrentHistory(config, input), std::invalid_argument);
+        input.execution_phase = ForwardExecutionPhase::Decode;
+        config.grouped_mtp_verifier = true;
+        EXPECT_THROW(resolveQwen4ExpEarlyCurrentHistory(config, input), std::invalid_argument);
+        config.live_mtp_request_batch_condition = false;
+        input.execution_role = ForwardExecutionRole::GroupedMTPVerifier;
+        EXPECT_EQ(resolveQwen4ExpEarlyCurrentHistory(config, input),
+            Qwen4ExpEarlyCurrentHistory::VerifierPrior);
+        config.grouped_mtp_verifier = false;
+        input.execution_role = ForwardExecutionRole::MainInference;
+        EXPECT_EQ(resolveQwen4ExpEarlyCurrentHistory(config, input),
+            Qwen4ExpEarlyCurrentHistory::AcceptedState);
+        config.grouped_mtp_verifier = true;
+        EXPECT_THROW(resolveQwen4ExpEarlyCurrentHistory(config, input), std::invalid_argument);
+    }
+}

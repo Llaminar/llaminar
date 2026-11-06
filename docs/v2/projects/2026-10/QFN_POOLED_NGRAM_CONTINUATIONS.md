@@ -1,5 +1,11 @@
 # QFN pooled ngrams across continuation topologies
 
+The active scoped extension is the
+[participant-local hot-cache hierarchy plan](../2026-11/QFN_LOCAL_HOT_CACHE_HIERARCHY_PLAN.md).
+It separates implementation, functional qualification and performance evidence
+for local VRAM replicas ahead of shared GPU capacity. The dated observations
+below retain their original scope; they do not qualify the combined hierarchy.
+
 Implementation contract, updated 2026-11-01. The isolated integration tree implements ordinary rank-local cross-vendor storage behind a singleton GPU continuation and CPU expert domain. All four static-expert, MTP-Off retained15 source controls pass loading and final retirement in r65. The four corresponding frozen-history panels now pass their required groups, actual captured inference, exact reset and final retirement; see the [panel result and explicit numerical-policy decision](QFN_POOLED_NGRAM_PANEL_2026-11-01.md). Dynamic balancing, active MTP, performance and complete preflight remain unqualified for this new path. This note records the complete target; source admission alone does not qualify inference.
 
 The isolated integration tree includes the [source/fill component](QFN_POOLED_SOURCE_FILL_PLAN.md),

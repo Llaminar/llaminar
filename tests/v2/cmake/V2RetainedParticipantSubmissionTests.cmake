@@ -148,3 +148,14 @@ if(TARGET v2_test_forward_graph_types)
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HostedVerifierForwardIdentity)
 endif()
+
+# An ordinary hosted forward is selected by its key AND the original owned sampler.
+if(TARGET v2_test_forward_graph_types)
+    add_v2_test(V2_Integration_HostedOrdinaryForwardIdentity
+        COMMAND $<TARGET_FILE:v2_test_forward_graph_types>
+            --gtest_filter=HostedDeviceGenerationFragment.OrdinaryForwardRequiresOriginalSamplerAndCompleteKey
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Graph;Contract;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HostedOrdinaryForwardIdentity)
+endif()

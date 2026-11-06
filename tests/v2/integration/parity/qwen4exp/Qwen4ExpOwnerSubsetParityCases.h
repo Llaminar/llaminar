@@ -192,4 +192,27 @@ inline std::vector<ModelParityCase> qwen4ExpOwnerSubsetNativeExactCases(ModelPar
     std::erase_if(result, [](const auto& cell) { return cell.mtp == ModelParityMTP::Off; });
     return result;
 }
+/**
+ * @return Two original Static Off/R3 pure-reader-coordinator functional controls.
+ * Select the existing RAM TP2 mask2 requests (CUDA positive and ROCm zero cache)
+ * by their authored request identity, preserving the full execution cell. This
+ * is public generation/reset evidence, independent from HF numerical scoring.
+ */
+inline std::vector<ModelParityCase> qwen4ExpOwnerSubsetOrdinaryGenerationCases()
+{
+    const auto all=qwen4ExpOwnerSubsetExecutionCases(ModelParityExpertOverlayPolicy{});
+    const auto& seeds=qwen4ExpOwnerSubsetSourceAdmissionSeeds();
+    std::vector<ModelParityCase> result;
+    for(std::size_t i=0;i<kQwen4ExpOwnerSubsetModelRequests.size();++i) {
+        const auto& request=kQwen4ExpOwnerSubsetModelRequests[i];
+        if((request.target!=Qwen4ExpHardwareTarget::CUDA2 && request.target!=Qwen4ExpHardwareTarget::ROCm2) ||
+            request.continuation_mask!=2 || request.backing!=AdaptiveImmutableRowBacking::RAM ||
+            request.movement!=ModelParityExpertMovement::Static) continue;
+        const auto identity=seeds.at(i).topology.test_id+"_R3";
+        for(const auto& cell:all)
+            if(cell.topology.test_id==identity && cell.mtp==ModelParityMTP::Off) result.push_back(cell);
+    }
+    if(result.size()!=2) throw std::logic_error("Ordinary generation lost its two original Off/R3 requests");
+    return result;
+}
 } // namespace llaminar2::test::parity::qwen4exp

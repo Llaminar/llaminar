@@ -34,6 +34,29 @@ void require(bool condition,const char *message)
 {
     if(!condition) throw std::invalid_argument(message);
 }
+/** @brief Authenticate the same primitive/GEMM row identity before prefix or late block mutation. */
+void requireProjectionRows(const Qwen4ExpPLEContext& c)
+{
+    require(c.arithmetic==Qwen4ExpProjectionArithmetic::Ordinary ||
+        c.arithmetic==Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier,"PLE projection arithmetic is invalid");
+    if(c.projectionRows)
+        require(c.arithmetic==Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier,
+            "PLE counted projections require explicit grouped-verifier arithmetic");
+    if(c.arithmetic==Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier)
+    {
+        // Validate the effective descriptor, so omitting it cannot replace a
+        // primitive-owned count with fully-active GEMM rows. CPU declarations
+        // also borrow their original native scalar; no count value is read here.
+        const auto *native=c.rows.liveRows ? std::get_if<Qwen4ExpNativeIntInput>(&c.rows.liveRows->value) : nullptr;
+        require(!c.rows.liveRows || (native && native->owner==c.device && native->capacity==1 && native->data),
+            "PLE verifier projections require the exact native primitive query authority");
+        const auto original=native ? DeviceRowRange::deviceCounted(c.rows.capacity,native->data) :
+            DeviceRowRange::fullyActive(c.rows.capacity);
+        const auto effective=c.projectionRows.value_or(DeviceRowRange::fullyActive(c.rows.capacity));
+        require(effective.captureIdentity()==original.captureIdentity(),
+            "PLE verifier projections require the complete original primitive row identity");
+    }
+}
 /** @brief One completely constructed graph node and its explicit incoming edges. */
 struct Pending
 {
@@ -259,7 +282,8 @@ Qwen4ExpPooledReadAheadFrame::Qwen4ExpPooledReadAheadFrame(ComputeGraph& graph,Q
     Qwen4ExpPLEBuffers buffers,const Qwen4ExpPLEContext& context,std::uint64_t hash,PooledImmutableLookupGraphEndpoints endpoints)
     :graph_(&graph),storage_(std::move(storage)),buffers_(std::move(buffers)),device_(context.device),
      format_(context.nativeFormat),row_elements_(context.nativeRowElements),row_bytes_(context.nativeRowBytes),
-     hash_(hash),endpoints_(std::move(endpoints)),hash_producer_(context.prefix+"hash"),
+     hash_(hash),arithmetic_(context.arithmetic),projection_rows_(context.projectionRows),
+     endpoints_(std::move(endpoints)),hash_producer_(context.prefix+"hash"),
      handoff_(graph,requiredDemand(endpoints_),hash,hash){
     require(endpoints_.demand && graph.getNode(endpoints_.demand->consume) && graph.getNode(endpoints_.last),
         "Pooled current demand lost its actual protocol frontiers");
@@ -268,9 +292,16 @@ Qwen4ExpPooledReadAheadFrame::Qwen4ExpPooledReadAheadFrame(ComputeGraph& graph,Q
         "Pooled current demand lost its actual publication");
 }
 std::unique_ptr<Qwen4ExpPooledReadAheadFrame> Qwen4ExpPooledReadAheadFrame::publish(ComputeGraph& graph,
-    const Qwen4ExpPLEContext& c,const Qwen4ExpPLEBuffers& b,Qwen4ExpPooledLookupDeclaration storage){
-    require(graph.size()==0 && c.device.is_gpu() && c.arithmetic==Qwen4ExpProjectionArithmetic::Ordinary && !c.projectionRows,
-        "Pooled read-ahead requires its original ordinary empty graph prefix");
+    const Qwen4ExpPLEContext& c,const Qwen4ExpPLEBuffers& b,Qwen4ExpPooledLookupDeclaration storage,
+    const Qwen4ExpAuxiliaryState::PLEVerifierPrior* verifierPrior){
+    require(c.device.is_gpu(),"Pooled read-ahead requires its original GPU participant");
+    requireProjectionRows(c);
+    if(c.arithmetic==Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier){
+        require(verifierPrior && graph.size()==1 && c.projectionRows.has_value(),
+            "Pooled verifier read-ahead requires the original entry snapshot and counted projection identity");
+        verifierPrior->requireFor(graph,c.device,c.rows,b.priorTokens,b.priorConvolution);
+    }else require(!verifierPrior && graph.size()==0 && c.arithmetic==Qwen4ExpProjectionArithmetic::Ordinary && !c.projectionRows,
+        "Pooled ordinary read-ahead requires its original empty graph prefix");
     auto hash=std::make_unique<Qwen4ExpPrimitiveStage>(Qwen4ExpPrimitiveStage::Params{
         .device_id=c.device,.mpi_ctx=c.mpi,.rows=c.rows,
         .operation=Qwen4ExpPrimitiveStage::NgramHash{b.tokens,b.priorTokens,b.ids,c.hash}});
@@ -281,14 +312,17 @@ std::unique_ptr<Qwen4ExpPooledReadAheadFrame> Qwen4ExpPooledReadAheadFrame::publ
     const auto endpoints=appendOriginalPooledLookup(fragment,c,b,storage,c.prefix+"gather");
     fragment.addDependency(endpoints.first,hashName);
     graph.merge(std::move(fragment));
+    if(verifierPrior)verifierPrior->orderBefore(graph,hashName);
     return std::unique_ptr<Qwen4ExpPooledReadAheadFrame>(new Qwen4ExpPooledReadAheadFrame(graph,std::move(storage),b,c,hashIdentity,endpoints));
 }
 std::string Qwen4ExpPooledReadAheadFrame::consume(ComputeGraph& graph,const Qwen4ExpPLEContext& c,const Qwen4ExpPLEBuffers& b,
     const Qwen4ExpPooledLookupDeclaration& storage,std::uint64_t hash,const std::vector<std::string>& trunk){
+    requireProjectionRows(c);
     require(&graph==graph_ && hash==hash_ && samePooledLookup(storage_,storage) &&
         c.device==device_ && c.prefix+"hash"==hash_producer_ && graph.getNode(hash_producer_) &&
         graph.getNode(hash_producer_)->stage->graphCaptureVariantSignature()==hash_ && c.nativeFormat==format_ && c.nativeRowElements==row_elements_ && c.nativeRowBytes==row_bytes_ &&
-        c.arithmetic==Qwen4ExpProjectionArithmetic::Ordinary && !c.projectionRows &&
+        c.arithmetic==arithmetic_ && c.projectionRows.has_value()==projection_rows_.has_value() &&
+        (!c.projectionRows || c.projectionRows->captureIdentity()==projection_rows_->captureIdentity()) &&
         b.ids.tensor==buffers_.ids.tensor && b.ids.buffer==buffers_.ids.buffer && b.ids.byteOffset==buffers_.ids.byteOffset &&
         b.embedding.tensor==buffers_.embedding.tensor && b.embedding.buffer==buffers_.embedding.buffer &&
         b.embedding.byteOffset==buffers_.embedding.byteOffset && !trunk.empty(),
@@ -309,25 +343,7 @@ std::string Qwen4ExpPLEBuilder::append(ComputeGraph &graph,const Qwen4ExpPLECont
         c.nativeRowElements==c.hidden/qwen4exp::kNgramHeads && c.hidden%qwen4exp::kNgramHeads==0 &&
         std::isfinite(c.epsilon) && c.epsilon>0,
         "PLE graph requires exact participant geometry, sixteen native rows and branch epsilon");
-    require(c.arithmetic==Qwen4ExpProjectionArithmetic::Ordinary ||
-        c.arithmetic==Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier,"PLE projection arithmetic is invalid");
-    if(c.projectionRows)
-        require(c.arithmetic==Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier,
-            "PLE counted projections require explicit grouped-verifier arithmetic");
-    if(c.arithmetic==Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier)
-    {
-        // Validate the effective descriptor, so omitting it cannot replace a
-        // primitive-owned count with fully-active GEMM rows. CPU declarations
-        // also borrow their original native scalar; no count value is read here.
-        const auto *native=c.rows.liveRows ? std::get_if<Qwen4ExpNativeIntInput>(&c.rows.liveRows->value) : nullptr;
-        require(!c.rows.liveRows || (native && native->owner==c.device && native->capacity==1 && native->data),
-            "PLE verifier projections require the exact native primitive query authority");
-        const auto original=native ? DeviceRowRange::deviceCounted(c.rows.capacity,native->data) :
-            DeviceRowRange::fullyActive(c.rows.capacity);
-        const auto effective=c.projectionRows.value_or(DeviceRowRange::fullyActive(c.rows.capacity));
-        require(effective.captureIdentity()==original.captureIdentity(),
-            "PLE verifier projections require the complete original primitive row identity");
-    }
+    requireProjectionRows(c);
     const std::array views{b.embedding,b.key,b.value,b.query,b.gated,b.normalized,b.priorConvolution,b.trunk};
     for(std::size_t i=0;i<views.size();++i)
         for(std::size_t j=i+1;j<views.size();++j)

@@ -1,5 +1,10 @@
 # QFN ngram lookup performance and tier-churn qualification
 
+The [local-hot/shared-pool extension](../2026-11/QFN_LOCAL_HOT_CACHE_HIERARCHY_PLAN.md)
+adds matched ConsumerLocal, shared-only and combined measurements, including
+real token traces, independent local/pool budgets and actual native wire bytes.
+Its implementation, functional and performance statuses are tracked separately.
+
 This plan measures the production lookup operation consumed by a GPU continuation.
 It complements source admission and numerical model parity; a component timing
 is not a full-model, topology or serving certificate. This is a regular project

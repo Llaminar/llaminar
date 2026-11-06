@@ -8,6 +8,7 @@
  * so reset, rollback and prefix archive share one lifecycle and frontier.
  */
 #include "Qwen4ExpGraph.h"
+#include "Qwen4ExpEarlyCurrentInput.h"
 #include "execution/qwen4exp/PooledImmutableSourceRootBinding.h"
 #include "execution/qwen4exp/PooledImmutableRetainedParticipants.h"
 #include "collective/ILocalTPContext.h"
@@ -486,7 +487,15 @@ struct Qwen4ExpGraph::EarlyPrefix final : ModelInvocationPrefix {
 /** @brief Exact original pooled source/owner/reader frame owned by this one lexical graph build. */
 struct Qwen4ExpGraph::PooledPrefix final : ModelInvocationPrefix {
     std::unique_ptr<Qwen4ExpPooledReadAheadFrame> frame;
-    explicit PooledPrefix(std::unique_ptr<Qwen4ExpPooledReadAheadFrame> value):frame(std::move(value)){}
+    std::optional<Qwen4ExpAuxiliaryState::PLEVerifierPrior> prior;
+    /**
+     * @brief Keep the existing transaction capability with its original lexical frame until late retention.
+     * @param value Genuine source/inline/pure-reader demand frame for this graph only.
+     * @param snapshot Same original grouped prior, absent for ordinary execution.
+     */
+    explicit PooledPrefix(std::unique_ptr<Qwen4ExpPooledReadAheadFrame> value,
+        std::optional<Qwen4ExpAuxiliaryState::PLEVerifierPrior> snapshot={})
+        :frame(std::move(value)),prior(std::move(snapshot)){}
     std::string terminal()const override{return frame->producer();}
     void requireConsumed()const override{frame->requireConsumed();}
 };
@@ -497,6 +506,24 @@ struct Qwen4ExpGraph::ResidentPrefix final : ModelInvocationPrefix {
     std::string terminal()const override{return frame->frontier();}
     void requireConsumed()const override{frame->requireConsumed();}
 };
+Qwen4ExpEarlyCurrentHistory resolveQwen4ExpEarlyCurrentHistory(
+    const GraphConfig& config, const ForwardInput& input)
+{
+    if (config.grouped_mtp_verifier &&
+        input.execution_role == ForwardExecutionRole::GroupedMTPVerifier &&
+        input.execution_phase == ForwardExecutionPhase::Decode)
+        return Qwen4ExpEarlyCurrentHistory::VerifierPrior;
+    if (!config.grouped_mtp_verifier &&
+        input.execution_role == ForwardExecutionRole::MainInference)
+        return Qwen4ExpEarlyCurrentHistory::AcceptedState;
+    if (!config.grouped_mtp_verifier && config.live_mtp_request_batch_condition &&
+        input.execution_role == ForwardExecutionRole::MTPCondition &&
+        input.execution_phase == ForwardExecutionPhase::Decode &&
+        input.batch_size == 1 && input.seq_len == 1)
+        return Qwen4ExpEarlyCurrentHistory::AcceptedState;
+    throw std::invalid_argument("Early current lookup requires its original main, scalar condition or grouped verifier invocation policy");
+}
+
 std::unique_ptr<QwenGraphBase::ModelInvocationPrefix> Qwen4ExpGraph::addModelInvocationPrefix(
     ComputeGraph& graph,const ForwardInput& input,DeviceId device,ModelInvocationShape shape)
 {
@@ -520,13 +547,15 @@ std::unique_ptr<QwenGraphBase::ModelInvocationPrefix> Qwen4ExpGraph::addModelInv
     const bool residentCandidate=selected==ImmutableLookupInvocationSchedule::ResidentSideLane;
     if(!residentCandidate && config_.ngram_lookup_schedule!=GraphConfig::NgramLookupSchedule::EarlyCurrentHostedCandidate)
         throw std::invalid_argument("Unknown typed ngram lookup construction policy");
-    if(shape!=ModelInvocationShape::FullLocal || input.execution_role!=ForwardExecutionRole::MainInference ||
-       config_.grouped_mtp_verifier || config_.pipeline_config ||
-       !device.is_gpu() || input.batch_size!=1)
-        throw std::invalid_argument("Early current hosted lookup candidate requires ordinary complete local GPU forward; PP/grouped MTP and request batches are unqualified");
+    const bool verifier = resolveQwen4ExpEarlyCurrentHistory(config_, input) ==
+        Qwen4ExpEarlyCurrentHistory::VerifierPrior;
+    if(shape!=ModelInvocationShape::FullLocal || config_.pipeline_config || !device.is_gpu() || input.batch_size!=1)
+        throw std::invalid_argument("Early current lookup requires its complete single-request local GPU invocation; PP/request batches are unqualified");
     if(!config_.ngram_table_placement)
         throw std::invalid_argument("Early current lookup candidate requires its actual admitted source placement");
     const bool pooledCandidate=!residentCandidate && config_.ngram_table_placement->isGPUAdaptive();
+    if ((verifier || input.execution_role == ForwardExecutionRole::MTPCondition) && !pooledCandidate)
+        throw std::invalid_argument("MTP current read-ahead requires its original pooled retained transaction");
     if(!pooledCandidate && (config_.ngram_table_placement->isGPUAdaptive() || config_.ngram_replicated_ple_cohort))
         throw std::invalid_argument("Resident or whole-source read-ahead cannot adopt pooled/shared ownership");
     if(pooledCandidate && config_.ngram_replicated_ple_cohort){
@@ -562,10 +591,12 @@ std::unique_ptr<QwenGraphBase::ModelInvocationPrefix> Qwen4ExpGraph::addModelInv
         throw std::invalid_argument("Early current hosted lookup candidate does not implement resident/fixed-head GPU overlap");
     const auto prefix="layer"+std::to_string(config_.flash_next->ngrams().decoder_layer)+"_ple_";
     const auto context=pleContext(input,device,prefix);
-    if((input.execution_phase==ForwardExecutionPhase::Decode && (input.seq_len!=1 || context.rows.liveRows)) ||
+    if((input.execution_phase==ForwardExecutionPhase::Decode &&
+        (verifier ? (input.seq_len<=0 || !context.rows.liveRows || !context.projectionRows) :
+                    (input.seq_len!=1 || context.rows.liveRows))) ||
        (input.execution_phase==ForwardExecutionPhase::Prefill && !context.rows.liveRows) ||
        (input.execution_phase!=ForwardExecutionPhase::Decode && input.execution_phase!=ForwardExecutionPhase::Prefill))
-        throw std::invalid_argument("Early lookup requires one ordinary decode query or its original native counted prefill producer");
+        throw std::invalid_argument("Early lookup requires ordinary decode or the original native counted prefill/verifier producer");
     if(!input.device_state_publication_stream || reinterpret_cast<std::uintptr_t>(input.device_state_publication_stream)<=2)
         throw std::invalid_argument("Early lookup requires the original explicit invocation publication stream");
     auto* cache=input.getKVCacheForDevice(device);
@@ -591,11 +622,16 @@ std::unique_ptr<QwenGraphBase::ModelInvocationPrefix> Qwen4ExpGraph::addModelInv
             :std::holds_alternative<Qwen4ExpPooledReaderLookupStorage>(storage)
                 ?Qwen4ExpPooledLookupDeclaration{std::get<Qwen4ExpPooledReaderLookupStorage>(storage)}
                 :throw std::invalid_argument("Pooled read-ahead lost its actual source or shared-reader declaration");
-        return std::make_unique<PooledPrefix>(Qwen4ExpPooledReadAheadFrame::publish(graph,context,
-            {tokens,owner.ple(0).acceptedTokens,integer(BufferId::QFN_NGRAM_ROW_IDS),
+        std::optional<Qwen4ExpAuxiliaryState::PLEVerifierPrior> prior;
+        if(verifier)prior.emplace(owner.appendVerifierPLEPrior(graph,prefix,0,context.rows,tokens,
+            fp32(BufferId::QFN_PLE_NORMALIZED),{}));
+        auto frame=Qwen4ExpPooledReadAheadFrame::publish(graph,context,
+            {tokens,prior?prior->tokens():owner.ple(0).acceptedTokens,integer(BufferId::QFN_NGRAM_ROW_IDS),
              fp32(BufferId::QFN_PLE_EMBEDDING),fp32(BufferId::QFN_PLE_KEY),fp32(BufferId::QFN_PLE_VALUE),
              fp32(BufferId::QFN_PLE_QUERY),fp32(BufferId::QFN_PLE_GATED),fp32(BufferId::QFN_PLE_NORMALIZED),
-             owner.ple(0).acceptedConvolution,qwen4ExpTrunkBinding(buffers_.layer_buffers)},declaration));
+             prior?prior->convolution():owner.ple(0).acceptedConvolution,qwen4ExpTrunkBinding(buffers_.layer_buffers)},
+            declaration,prior?&*prior:nullptr);
+        return std::make_unique<PooledPrefix>(std::move(frame),std::move(prior));
     }
     const auto* hosted=whole?std::get_if<ImmutableLookupStage::GPUStorage>(whole):nullptr;
     if(!hosted)throw std::invalid_argument("Early lookup candidate lost its original hosted GPU source");
@@ -636,8 +672,16 @@ std::string Qwen4ExpGraph::addModelLayerInput(ComputeGraph &graph,const ForwardI
     std::vector<std::string> dependencies=dependency.empty()?std::vector<std::string>{}:std::vector<std::string>{dependency};
     std::optional<Qwen4ExpAuxiliaryState::PLEVerifierPrior> prior;
     if(config_.grouped_mtp_verifier) {
-        prior.emplace(owner.appendVerifierPLEPrior(graph,prefix,0,rows,tokenRows,normalized,dependencies));
-        dependencies={prior->snapshotProducer()};
+        if(pooledEarly){
+            if(!pooledEarly->prior)throw std::invalid_argument("Grouped pooled consumer lost its original entry snapshot");
+            prior.emplace(std::move(*pooledEarly->prior));pooledEarly->prior.reset();
+            prior->requireFor(graph,device,rows,prior->tokens(),prior->convolution());
+            // The original trunk already descends from snapshot -> Hash ->
+            // Publish. Keep its late response join; snapshot is not trunk work.
+        }else{
+            prior.emplace(owner.appendVerifierPLEPrior(graph,prefix,0,rows,tokenRows,normalized,dependencies));
+            dependencies={prior->snapshotProducer()};
+        }
     }
     const auto terminal=Qwen4ExpPLEBuilder::append(graph,
         context,

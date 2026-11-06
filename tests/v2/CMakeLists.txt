@@ -652,7 +652,7 @@ function(discover_v2_parity_tests TARGET)
         ARG
         ""
         "MPI_PROCS;TEST_PREFIX;TIMEOUT;PRODUCTION_PERF_STATS_FILTER;SOURCE_ADMISSION_MTP_SOURCE_KIND;SOURCE_ADMISSION_TIMEOUT"
-        "LABELS;MODEL_FILES;CPU_MODEL_FILES;CUDA_MODEL_FILES;ROCM_MODEL_FILES;PRODUCTION_ISOLATED_TESTS;SOURCE_ADMISSION_MTP_MODEL_FILES"
+        "LABELS;MODEL_FILES;CPU_MODEL_FILES;CUDA_MODEL_FILES;ROCM_MODEL_FILES;PRODUCTION_ISOLATED_TESTS;SOURCE_ADMISSION_MTP_MODEL_FILES;ENVIRONMENT"
         ${ARGN})
 
     if(NOT ARG_TEST_PREFIX)
@@ -665,6 +665,8 @@ function(discover_v2_parity_tests TARGET)
     # Serialize the test-owned model manifest through the POST_BUILD script.
     # A pipe is intentional: semicolons are CMake list separators and would
     # otherwise be expanded into separate command arguments before discovery.
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2ParityEnvironment.cmake)
+    v2_parity_environment_serialize(_serialized_environment ${ARG_ENVIRONMENT})
     set(_serialized_model_files "")
     if(ARG_MODEL_FILES)
         string(JOIN "|" _serialized_model_files ${ARG_MODEL_FILES})
@@ -702,7 +704,7 @@ function(discover_v2_parity_tests TARGET)
     # The generated CTest include is produced by a POST_BUILD command attached
     # to the test binary. Make the binary relink when the discovery helper
     # changes so stale "Discovery failed" files do not survive script fixes.
-    set_property(TARGET ${TARGET} APPEND PROPERTY LINK_DEPENDS "${_discovery_script}")
+    set_property(TARGET ${TARGET} APPEND PROPERTY LINK_DEPENDS "${_discovery_script}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2ParityEnvironment.cmake")
 
     # POST_BUILD command-line changes alone do not make an already-linked
     # executable stale in every CMake/Ninja version. Persist every registration
@@ -723,6 +725,7 @@ function(discover_v2_parity_tests TARGET)
         "cores_per_socket=${V2_TEST_CORES_PER_SOCKET}\n"
         "timeout=${ARG_TIMEOUT}\n"
         "production_perf_stats_filter=${ARG_PRODUCTION_PERF_STATS_FILTER}\n"
+        "environment=${_serialized_environment}\n"
         "production_isolated_tests=${_serialized_production_isolated_tests}\n"
         "source_admission_timeout=${ARG_SOURCE_ADMISSION_TIMEOUT}\n"
         "source_admission_mtp_source_kind=${ARG_SOURCE_ADMISSION_MTP_SOURCE_KIND}\n"
@@ -757,6 +760,7 @@ function(discover_v2_parity_tests TARGET)
             -D "WORKING_DIR=${_working_dir}"
             -D "TIMEOUT=${ARG_TIMEOUT}"
             -D "PRODUCTION_PERF_STATS_FILTER=${ARG_PRODUCTION_PERF_STATS_FILTER}"
+            -D "ENVIRONMENT_SERIALIZED=${_serialized_environment}"
             -D "PRODUCTION_ISOLATED_TESTS_SERIALIZED=${_serialized_production_isolated_tests}"
             -D "SOURCE_ADMISSION_TIMEOUT=${ARG_SOURCE_ADMISSION_TIMEOUT}"
             -D "SOURCE_ADMISSION_MTP_SOURCE_KIND=${ARG_SOURCE_ADMISSION_MTP_SOURCE_KIND}"
@@ -12848,6 +12852,25 @@ if(ZLIB_FOUND)
     if(NOT _qfn_mtp_numerical_source_count EQUAL 5)
         message(FATAL_ERROR "QFN numerical MTP requires exact original4main shards +explicit predictor")
     endif()
+    # Bounded source/functional candidates use original retained3 seeds and exact startup policy.
+    add_executable(v2_integration_parity_qwen4exp_pooled_current_mtp_matrix
+        integration/parity/qwen4exp/Test__Qwen4Exp_PooledCurrentDemand_Candidate.cpp
+        integration/mpi_gtest_main.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp)
+    target_link_libraries(v2_integration_parity_qwen4exp_pooled_current_mtp_matrix PRIVATE
+        llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB)
+    target_include_directories(v2_integration_parity_qwen4exp_pooled_current_mtp_matrix PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy ${CMAKE_CURRENT_SOURCE_DIR})
+    discover_v2_parity_tests(v2_integration_parity_qwen4exp_pooled_current_mtp_matrix
+        TEST_PREFIX V2_Integration_Qwen4Exp_PooledCurrentMTP
+        LABELS "V2;Integration;Qwen4Exp;CUDA;ROCm;MTP;NativeQualification;UnqualifiedCandidate"
+        MPI_PROCS 1 MODEL_FILES ${V2_PARITY_MODEL_QWEN_FLASH_NEXT}
+        SOURCE_ADMISSION_MTP_SOURCE_KIND Paired
+        SOURCE_ADMISSION_MTP_MODEL_FILES
+            "/opt/llaminar-models/Qwen3.8-Flash-Next-GGUF/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"
+        SOURCE_ADMISSION_TIMEOUT 900
+        ENVIRONMENT "LLAMINAR_QFN_NGRAM_LOOKUP_SCHEDULE=early_current_hosted_candidate")
+
     discover_v2_parity_tests(v2_integration_parity_qwen4exp_mtp_matrix
         TEST_PREFIX V2_Integration_Parity_Qwen4Exp_MTP
         # Match main-model arithmetic evidence without adding broad domains or

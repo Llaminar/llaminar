@@ -261,3 +261,35 @@ foreach(_addressed_backend IN ITEMS nccl rccl)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledAddressed_${_addressed_backend}_NativeAdmissionReplay)
     endif()
 endforeach()
+
+# Same genuine prior/count authority for grouped pooled current lookup; no device work.
+if(TARGET v2_test_qwen4exp_primitives)
+    add_v2_test(V2_Integration_Qwen4ExpPooledCurrentVerifierReplay
+        COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+            --gtest_filter=PLELifecycle.EarlyCurrentPriorHashRetainReplay:PLELifecycle.EarlyCurrentPriorRejectsSubstitutedAuthority
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Qwen4Exp;MTP;Replay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpPooledCurrentVerifierReplay)
+endif()
+if(TARGET v2_test_pooled_owner_pin_chain)
+    add_v2_test(V2_Integration_PooledCurrentVerifierAuthorityContract
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_cohort_original_cases.py
+            $<TARGET_FILE:v2_test_pooled_owner_pin_chain>
+            --gtest_filter=PooledImmutableCurrentDemand.GroupedPrefixRejectsMissingPriorAndSubstitutedProjectionBeforeMutation
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;MTP;Ownership;Contract;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledCurrentVerifierAuthorityContract)
+endif()
+
+# The real source family cold-builds all original scalar MTP condition purposes.
+if(TARGET v2_test_qwen4exp_primitives)
+    add_v2_test(V2_Integration_Qwen4ExpPooledCurrentConditionReplay
+        COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+            --gtest_filter=PLELifecycle.EarlyCurrentConditionUsesOriginalScalarAcceptedHistory
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Qwen4Exp;MTP;Replay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpPooledCurrentConditionReplay)
+endif()

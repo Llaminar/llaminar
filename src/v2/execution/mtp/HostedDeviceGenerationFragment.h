@@ -63,5 +63,21 @@ struct HostedDeviceGenerationFragment
             retained.usesDeviceTokenIds() && retained.usesDevicePositionIds() && retained.usesDeviceSequenceLengths() &&
             forward_signature == retained;
     }
+    /**
+     * @brief Match the original ordinary retained forward AND owned sampler.
+     * @param retained Exact key resolved through the current original engine.
+     * @param original_sampler Actual loop-owned decode sampler, authenticated by
+     * the caller against ordinary_children and its executable/stream lifetime.
+     * @return Immutable membership only; never readiness or native authority.
+     */
+    [[nodiscard]] bool embedsOrdinaryForward(const ForwardGraphSignature &retained,
+        const IGPUGraphCapture *original_sampler) const noexcept
+    {
+        return kind == Kind::OrdinaryExpertOverlayReplay && original_sampler &&
+            capture == original_sampler && !semantic_graph && retained.decode &&
+            retained.execution_role == ForwardExecutionRole::MainInference && retained.device.is_gpu() &&
+            retained.seq_len == 1 && retained.batch_size == 1 &&
+            retained.usesDeviceTokenIds() && retained.usesDevicePositionIds() && forward_signature == retained;
+    }
 };
 } // namespace llaminar2

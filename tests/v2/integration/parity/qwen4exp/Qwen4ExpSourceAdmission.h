@@ -14,6 +14,7 @@
  * claim generation-controller execution or numerical sidecar certification.
  */
 #pragma once
+#include <functional>
 #include "Qwen4ExpProductionParityCases.h"
 #include "integration/parity/ParityArtifactDirectory.h"
 #include "Qwen4ExpSourceAdmissionCases.h"
@@ -1127,6 +1128,12 @@ inline void expectQwen4ExpCPUJointSourceFragments(int rank,const ModelContextReu
     EXPECT_EQ(observed,expected_observations);
 }
 
+/** @brief Existing initialization/recreation observation points; neither proves inference. */
+enum class Qwen4ExpSourceInspectionPhase { Original, RetainedReplacement };
+/** @brief Optional immutable view; callback-local aliases must expire before original retirement. */
+using Qwen4ExpSourceInspection = std::function<void(const IOrchestrationRunner&,
+    Qwen4ExpSourceInspectionPhase, const std::filesystem::path&)>;
+
 /**
  * @brief Materialize one original-source serving configuration without gold or inference.
  * @param cell Complete existing typed source/topology/precision/storage declaration.
@@ -1137,9 +1144,11 @@ inline void expectQwen4ExpCPUJointSourceFragments(int rank,const ModelContextReu
 /** @brief Materialize the original full source and optionally require its existing cold recreation proof.
  * @param cell Original real-model source request; no test creates a model authority.
  * @param recreation Require original role eligibility and execute the same cold lifecycle assertions.
+ * @param inspect Optional read-only observation after the original mandatory phase checks; failures do not skip recreation/retirement.
  */
 inline void admitQwen4ExpSource(const ModelParityCase &cell,
-    Qwen4ExpSourceRecreationProof recreation = Qwen4ExpSourceRecreationProof::FromOriginalRoles)
+    Qwen4ExpSourceRecreationProof recreation = Qwen4ExpSourceRecreationProof::FromOriginalRoles,
+    const Qwen4ExpSourceInspection &inspect = {})
 {
     ASSERT_TRUE(recreation==Qwen4ExpSourceRecreationProof::FromOriginalRoles ||
         recreation==Qwen4ExpSourceRecreationProof::Required);
@@ -1248,6 +1257,9 @@ inline void admitQwen4ExpSource(const ModelParityCase &cell,
         << cell.testName() << ",48,1,0,0," << (joint_follower?0u:placement->extent().nativeBytes()) << '\n';
     csv.flush();
     ASSERT_TRUE(csv.good());
+    // Inspection is additional evidence. A failed callback cannot bypass the
+    // original recreation, source-owner verification or final retirement path.
+    if (inspect) EXPECT_NO_THROW(inspect(*runner, Qwen4ExpSourceInspectionPhase::Original, output));
     const bool original_recreation = qwen4ExpSourceReusesSharedContinuationOwners(placement.get()) || !old_expert_parents.empty();
     if (recreation == Qwen4ExpSourceRecreationProof::Required)
         ASSERT_TRUE(original_recreation) << "This source candidate requires original cold recreation/retirement";
@@ -1306,6 +1318,7 @@ inline void admitQwen4ExpSource(const ModelParityCase &cell,
             EXPECT_FALSE(actual.worker.owner_before(before->worker));
             EXPECT_FALSE(before->worker.owner_before(actual.worker));
         }
+        if (inspect) EXPECT_NO_THROW(inspect(*runner, Qwen4ExpSourceInspectionPhase::RetainedReplacement, output));
         if(!::testing::Test::HasFailure())
             ::testing::Test::RecordProperty("original_shared_source_cold_recreation","completed");
     }
