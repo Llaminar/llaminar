@@ -19,7 +19,9 @@ if(V2_PERF_TESTS_ONLY)
 endif()
 include("${CMAKE_CURRENT_LIST_DIR}/V2CoreFreeTestRegistration.cmake")
 add_executable(v2_integration_cpu_attention_key_q8
-    "${V2_CPU_AQ8_ROOT}/tests/v2/integration/kernels/cpu/Test__CPUAttentionKeyQ8.cpp")
+    "${V2_CPU_AQ8_ROOT}/tests/v2/integration/kernels/cpu/Test__CPUAttentionKeyQ8.cpp"
+    "${V2_CPU_AQ8_ROOT}/tests/v2/integration/kernels/cpu/Test__CPUAttentionKeyQ8Dot.cpp"
+    "${V2_CPU_AQ8_ROOT}/tests/v2/integration/kernels/cpu/Test__CPUQ8AttentionValue.cpp")
 target_compile_features(v2_integration_cpu_attention_key_q8 PRIVATE cxx_std_20)
 target_include_directories(v2_integration_cpu_attention_key_q8 PRIVATE "${V2_CPU_AQ8_ROOT}/src/v2" "${V2_CPU_AQ8_ROOT}/tests/v2")
 target_link_libraries(v2_integration_cpu_attention_key_q8 PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX)
@@ -30,6 +32,30 @@ v2_add_core_free_test(V2_Unit_CPUAttentionKeyQ8
 v2_add_core_free_test(V2_Integration_CPUAttentionKeyQ8
     COMMAND $<TARGET_FILE:v2_integration_cpu_attention_key_q8>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention KVCache Q8 AllHeadDims ByteExact Regression)
+v2_add_core_free_test(V2_Integration_CPUQ8AttentionValueProgram
+    COMMAND $<TARGET_FILE:v2_integration_cpu_attention_key_q8>
+        --gtest_filter=CPUQ8AttentionValue.NativeOriginalCodesMatchIndependentCombinedWeightFMA
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention KVCache Q8 ByteExact Regression)
+v2_add_core_free_test(V2_Integration_CPUQ8AttentionValueAdmission
+    COMMAND $<TARGET_FILE:v2_integration_cpu_attention_key_q8>
+        --gtest_filter=CPUQ8AttentionValue.CompleteNumeratorAndSourceAliasesRejectBeforeStores
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention KVCache Q8 Ownership Geometry Regression)
+v2_add_core_free_test(V2_Integration_CPUAttentionKeyQ8OriginalDots
+    COMMAND $<TARGET_FILE:v2_integration_cpu_attention_key_q8>
+        --gtest_filter=CPUAttentionKeyQ8Dot.OriginalQueriesMatchSerialAndPreviousPipeline
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention KVCache Q8 ByteExact Regression)
+v2_add_core_free_test(V2_Integration_CPUAttentionKeyQ8DotRounding
+    COMMAND $<TARGET_FILE:v2_integration_cpu_attention_key_q8>
+        --gtest_filter=CPUAttentionKeyQ8Dot.SeparateDecodeRoundingAndPublishedScales
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention KVCache Q8 ByteExact Regression)
+v2_add_core_free_test(V2_Integration_CPUAttentionKeyQ8DotAuthentication
+    COMMAND $<TARGET_FILE:v2_integration_cpu_attention_key_q8>
+        --gtest_filter=CPUAttentionKeyQ8Dot.PoisonedAuthenticationRejectsNoOpAndPartialWriters
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention KVCache Q8 Regression)
+v2_add_core_free_test(V2_Integration_CPUAttentionKeyQ8DotAdmission
+    COMMAND $<TARGET_FILE:v2_integration_cpu_attention_key_q8>
+        --gtest_filter=CPUAttentionKeyQ8Dot.OriginalHeadGeometryAndUnavailableProgramsReject
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention KVCache Q8 ISA Geometry Regression)
 v2_add_core_free_test(V2_Integration_CPUAttentionKeyQ8StorageAliases
     COMMAND $<TARGET_FILE:v2_integration_cpu_attention_key_q8>
         --gtest_filter=*SourceAnchorAndCompressedStorageAliasesRejectBeforeMutation
