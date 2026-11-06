@@ -32,10 +32,11 @@ namespace llaminar2
     {
     public:
         /**
-         * @brief Declare a source-native, unrotated projection without loading weights.
+         * @brief Declare original native projection scratch without loading weights.
          * @param format Canonical source format, including F32/F16/BF16.
          * @param geometry Participant and physical matrix geometry.
-         * @return Exact named Q8/partial envelope; floating projections require neither.
+         * @return Exact named online-A4 transform banks or Q8/partial envelope;
+         *         floating projections require neither.
          * @throws std::invalid_argument For unknown formats or incomplete geometry.
          */
         static WorkspaceRequirements sourceNative(std::string_view format,

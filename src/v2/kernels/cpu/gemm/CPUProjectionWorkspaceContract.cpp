@@ -11,6 +11,7 @@
 #include "CPUNativeVNNITileConfig.h"
 #include "CPUNativeVNNIWeightPacker.h"
 #include "kernels/cpu/CPUInvocationWorkspace.h"
+#include "CPUW4A4Workspace.h"
 #include <climits>
 #include <stdexcept>
 
@@ -32,6 +33,9 @@ namespace llaminar2
     {
         requireGeometry(geometry);
         if (format == "F32" || format == "F16" || format == "BF16") return {};
+        if (format == "W4A4" || format == "W4A4H")
+            return w4a4::cpuWorkspaceRequirements(format == "W4A4"
+                ? w4a4::Transform::Identity : w4a4::Transform::PaleySylvester, geometry.k, geometry.rows);
         const auto *native = native_vnni_formats::forQuantType(format);
         if (!native) throw std::invalid_argument("CPU projection workspace has an unsupported source format");
         return prepared(cpu::native_vnni::preparedFootprintForFormat(*native), native->codebook_id, geometry);

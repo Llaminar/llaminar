@@ -127,6 +127,7 @@ namespace llaminar2
     class Q16_1Tensor;
     class IQ1_MTensor;
     class MXFP4Tensor;
+    class W4A4Tensor;
     class IQ1_STensor;
     class IQ2_STensor;
     class IQ2_XSTensor;
@@ -602,6 +603,18 @@ namespace llaminar
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
                     const llaminar2::MXFP4Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
+
+                /**
+                 * @brief Create native online-A4 CPU arithmetic without converting source weights.
+                 * @param tensor Admitted W4A4/H tensor; the engine retains its immutable storage.
+                 * @param dev_type CPU; native GPU preparation uses the device load pipeline.
+                 * @param device_ordinal CPU sentinel -1, never a substituted GPU ordinal.
+                 * @return Native engine with invocation-owned scratch and independently retained weights.
+                 * @throws std::invalid_argument For absent source or a foreign device path.
+                 * @throws std::logic_error If this tensor's source lease has already retired.
+                 */
+                static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
+                    const llaminar2::W4A4Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create GEMM kernel for IQ1_S tensor
@@ -1288,6 +1301,9 @@ namespace llaminar
 
                     // ROCm INT8 packed representation for GPU execution.
                     ROCM_INT8_PACKED = 4,
+
+                    // Original immutable W4A4/H bytes; online A4 is invocation-owned.
+                    CPU_NATIVE_ONLINE_A4 = 5,
                 };
 
                 /**

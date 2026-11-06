@@ -11,6 +11,7 @@
 #include "FloatingPointGemmKernel.h"
 #include "tensors/TensorFactory.h"
 #include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/W4A4Tensor.h"
 #include "tensors/NativeWeightSourceRange.h"
 #include <cstring>
 #include "tensors/FP16Utils.h"
@@ -59,6 +60,7 @@ struct CPUPreparedWeightWriter::Impl {
  CPUWeightStoragePlacement placement;
  cpu::native_vnni::CPUNativeVNNIPackedWeights packed;
  std::shared_ptr<TensorBase> final;
+ AlignedVector<uint8_t> online_a4_bytes; ///< Unpublished final W4A4 root; admission follows complete writes.
  std::byte* final_bytes=nullptr;
  size_t native_group=0,native_group_bytes=0,row=0,column=0,matrix=0,logical_elements=0;
  size_t stripe_index=0,destination_extent=0,final_rows=0,final_columns=0;
@@ -82,9 +84,10 @@ struct CPUPreparedWeightWriter::Impl {
    throw std::invalid_argument("CPU GEMM source must be an actual matrix");
   const auto* original_format=native_vnni_formats::forQuantType(tensorTypeName(g.original_type));
   const bool original_floating=g.original_type==TensorType::FP32 || g.original_type==TensorType::FP16 || g.original_type==TensorType::BF16;
-  if(!original_format && !original_floating)throw std::invalid_argument("CPU source has no canonical native geometry");
-  const size_t expected_group=original_format?(original_format->is_superblock?256:32):1;
-  const size_t expected_bytes=original_format?cpu::native_vnni::native_block_bytes_for_format(original_format->codebook_id,original_format->is_superblock):
+  const bool online_a4=isW4A4Format(g.original_type);
+  if(!original_format && !original_floating && !online_a4)throw std::invalid_argument("CPU source has no canonical native geometry");
+  const size_t expected_group=online_a4?w4a4::kBlockElements:(original_format?(original_format->is_superblock?256:32):1);
+  const size_t expected_bytes=online_a4?w4a4::kSourceBlockBytes:original_format?cpu::native_vnni::native_block_bytes_for_format(original_format->codebook_id,original_format->is_superblock):
     (g.original_type==TensorType::FP32?sizeof(float):sizeof(uint16_t));
   if(g.native_group_elements!=expected_group || g.native_group_bytes!=expected_bytes || g.original_shape[0]%expected_group)
    throw std::invalid_argument("CPU source geometry differs from its original canonical native encoding");
@@ -110,6 +113,18 @@ struct CPUPreparedWeightWriter::Impl {
   final_rows=spec.assembly?spec.assembly->final_rows:r.rows;
   final_columns=spec.assembly?spec.assembly->final_columns:r.columns;
   native_group=g.native_group_elements;native_group_bytes=g.native_group_bytes;
+  if(online_a4) {
+   if(spec.numerical_policy!=CPUProjectionNumericalPolicy::BackendNative &&
+      spec.numerical_policy!=CPUProjectionNumericalPolicy::GPUAlignedExpert)
+    throw std::invalid_argument("W4A4/H preparation has an unknown projection numerical policy");
+   if(g.original_shape.size()<2 || spec.matrix_count!=1 || r.first_column || r.columns!=k ||
+      final_columns!=k || (spec.assembly && spec.assembly->axis!=NativeWeightSourceAssembly::Axis::Rows))
+    throw std::invalid_argument("W4A4/H final CPU preparation requires complete original-K matrices");
+   forEachNativeWeightSourceStripe(g,r,spec.assembly,[&](const auto& stripe,size_t,size_t){
+    if(stripe.first_column || stripe.columns!=k)
+     throw std::invalid_argument("W4A4/H source assembly cannot split the whole-token activation policy");
+   });
+  }
   quote=quoteCPUWeightPreparation(g.original_type,final_rows,final_columns,spec.destination_precision,spec.consumer,spec.operand_precision);
   if(quote && spec.assembly) {
    if(maximum_stripe_bytes%quote->native_bytes_per_unit)
@@ -120,6 +135,18 @@ struct CPUPreparedWeightWriter::Impl {
    // Stripes are serialized through the same input/scratch arena. Its largest
    // useful stripe, rather than their sum, owns the simultaneous setup peak.
    quote->maximum_units=maximum_units;
+  }
+  if(online_a4) {
+   const auto owner=placement.physicalOwner();
+   if(owner!=PhysicalMemoryOwner::PrimaryModelWeights && owner!=PhysicalMemoryOwner::AdditionalModelWeights &&
+      owner!=PhysicalMemoryOwner::RoutedExpertWeights)
+    throw std::invalid_argument("W4A4/H final CPU preparation requires an admitted persistent weight owner");
+   const auto bytes=w4a4::MatrixContract::sourceExtent(final_rows,final_columns);
+   if(!bytes)throw std::invalid_argument(bytes.error().message());
+   online_a4_bytes=placement.allocate<uint8_t>(*bytes);
+   final_bytes=reinterpret_cast<std::byte*>(online_a4_bytes.data());
+   final_type=g.original_type;
+   return;
   }
   const auto* fmt=native_vnni_formats::forQuantType(tensorTypeName(g.original_type));
   q8_conversion=!fmt && spec.destination_precision==WeightPrecision::CONVERT_TO_INT8;
@@ -336,7 +363,20 @@ CPUPreparedWeightResult CPUPreparedWeightWriter::finish() {
   throw std::logic_error("CPU final weights cannot publish incomplete, failed or already-finished coverage");
  }
  CPUPreparedWeightResult result;
- if(impl_->native_packed)result.kernel=std::make_shared<cpu::native_vnni::CPUNativeVNNIGemmKernel>(std::move(impl_->packed),impl_->spec.numerical_policy);
+ if(isW4A4Format(impl_->final_type)) {
+  try {
+   const auto transform=impl_->final_type==TensorType::W4A4?w4a4::Transform::Identity:w4a4::Transform::PaleySylvester;
+   auto storage=w4a4::WeightStorage::adopt(transform,impl_->final_rows,impl_->final_columns,
+       std::move(impl_->online_a4_bytes),impl_->placement.physicalOwner());
+   result.final_tensor=std::make_shared<W4A4Tensor>(std::move(storage));
+   if(impl_->spec.consumer==CPUWeightConsumer::PreparedGemm)
+    result.kernel=result.final_tensor->createGemm();
+   // This pointer was a producer-only borrow. Publication seals immutable
+   // bytes and withdraws that borrow, even while the committed owner is live.
+   impl_->final_bytes=nullptr;
+  } catch(...) {impl_->final_bytes=nullptr;impl_->failed=true;throw;}
+ }
+ else if(impl_->native_packed)result.kernel=std::make_shared<cpu::native_vnni::CPUNativeVNNIGemmKernel>(std::move(impl_->packed),impl_->spec.numerical_policy);
  else {
   result.final_tensor=impl_->final;
   if(impl_->spec.consumer==CPUWeightConsumer::PreparedGemm)

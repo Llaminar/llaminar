@@ -32,9 +32,10 @@ namespace llaminar2
          * @throws std::invalid_argument for unsupported formats or geometry.
          * @throws std::overflow_error for unrepresentable allocation geometry.
          *
-         * The source-native observation path does not enable activation rotation.
-         * Rotated preparation has a different scratch contract and must not be
-         * admitted with this value. No ISA, thread count or device capacity is
+         * Native online-A4 operands retain original bytes; their source-declared
+         * activation transform owns invocation workspace, not weight setup scratch.
+         * This quote does not enable optional VNNI activation rotation, whose
+         * preparation has a different scratch contract. No ISA, thread count or device capacity is
          * guessed here; these packing buffers are independent of worker count.
          */
         static CPUWeightPreparationMemory sourceNative(std::string_view format, size_t n, size_t k);

@@ -98,6 +98,17 @@ namespace llaminar2
             return authority_ ? allocator_ : DeviceId::cpu();
         }
 
+        /**
+         * @return Original PMA owner of this admitted final allocation policy.
+         * @throws std::logic_error If called at an explicitly unadmitted allocation boundary.
+         */
+        [[nodiscard]] PhysicalMemoryOwner physicalOwner() const
+        {
+            if (!authority_)
+                throw std::logic_error("Final native weights require their original admitted PMA owner");
+            return owner_;
+        }
+
         /** @return Original immutable allocation placement, independent of CPU ordinal. */
         [[nodiscard]] CPUStoragePlacement storagePlacement() const noexcept { return placement_; }
         /** @return Original admission owner, absent only at existing explicit low-level allocation boundaries. */

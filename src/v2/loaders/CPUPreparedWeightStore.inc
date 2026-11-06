@@ -85,7 +85,8 @@ WeightBinding PreparedWeightStore::finishCPUPreparation(std::unique_ptr<CPUPrepa
         if(!result.kernel)throw std::logic_error("CPU GEMM commit is missing its completed actual engine");
         using Factory=llaminar::v2::kernels::KernelFactory;
         handle=std::make_shared<Factory::PreparedGemmHandle>();handle->tensor=binding.tensor;handle->device_id=device;
-        handle->kind=result.kernel->canReleaseSourceWeightTensor()?Factory::GemmPreparationKind::CPU_PACKED:Factory::GemmPreparationKind::FLOATING_POINT;
+        handle->kind=isW4A4Format(binding.tensor->native_type()) ? Factory::GemmPreparationKind::CPU_NATIVE_ONLINE_A4 :
+            result.kernel->canReleaseSourceWeightTensor()?Factory::GemmPreparationKind::CPU_PACKED:Factory::GemmPreparationKind::FLOATING_POINT;
         handle->variant=static_cast<int>(binding.tensor->native_type());handle->prepared_weights=std::make_shared<Factory::PreparedGemmWeights>();
         handle->prepared_weights->kind=handle->kind;handle->prepared_weights->owned_kernel=std::move(result.kernel);
         handle->prepared_weights->kernel=handle->prepared_weights->owned_kernel.get();

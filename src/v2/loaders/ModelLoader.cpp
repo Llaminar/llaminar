@@ -11,6 +11,8 @@
  * factories preserve bytes rather than dequantizing them for transport.
  * Original expert projections compact exact K blocks/N rows in the same final
  * storage owner; they neither reinterpret a full-parent stride nor requantize.
+ * Each GGUF file owns its declared alignment, including additional split parts.
+ * A directory's aligned payload origin is resolved once before any source view.
  */
 
 #include "memory/CPUStorageRoot.h"
@@ -24,6 +26,7 @@
 #include "../models/qwen4exp/Qwen4ExpSidecarManifest.h"
 #include "../tensors/Tensors.h"
 #include "../tensors/TensorFactory.h"
+#include "../tensors/W4A4Tensor.h"
 #include "../utils/MPIContext.h"
 #include <cstring>
 #include <iostream>
@@ -36,6 +39,79 @@ namespace llaminar2
 {
     namespace
     {
+        /** @return Whether the original GGUF type declares native online-A4 arithmetic. */
+        bool isW4A4Source(GGUFTensorType type) noexcept
+        {
+            return type == GGUFTensorType::W4A4 || type == GGUFTensorType::W4A4H;
+        }
+
+        /** @return Exact checked native bytes for a normalized complete W4A4/H matrix descriptor. */
+        size_t w4a4SourceExtent(const GGUFTensorInfo &info)
+        {
+            if (info.dimensions.size() != 2)
+                throw std::invalid_argument("W4A4/H source requires a complete rank-two matrix: " + info.name);
+            const auto extent = w4a4::MatrixContract::sourceExtent(info.dimensions[0], info.dimensions[1]);
+            if (!extent) throw std::invalid_argument(std::string(extent.error().message()) + ": " + info.name);
+            return *extent;
+        }
+
+        /**
+         * @brief Read a bounded GGUF string from the actual file owning the field.
+         * @param stream Main or additional-part stream at its uint64 length prefix.
+         * @return Exact string bytes, including an empty string when declared.
+         * @throws std::runtime_error For an oversized or truncated field.
+         */
+        std::string readGGUFString(std::istream &stream)
+        {
+            uint64_t length = 0;
+            if (!stream.read(reinterpret_cast<char *>(&length), sizeof(length)))
+                throw std::runtime_error("[ModelLoader] Failed to read string length (truncated)");
+            if (length > 1000000)
+                throw std::runtime_error("[ModelLoader] String length too large: " +
+                    std::to_string(length) + " bytes (>1MB)");
+            std::string value(static_cast<size_t>(length), '\0');
+            if (!stream.read(value.data(), static_cast<std::streamsize>(length)))
+                throw std::runtime_error("[ModelLoader] Failed to read string data (" +
+                    std::to_string(length) + " bytes, truncated)");
+            return value;
+        }
+
+        /**
+         * @brief Admit the GGUF UINT32 alignment without substituting a default for bad data.
+         * @param type Serialized metadata type; alignment is not a coercible numeric field.
+         * @param alignment Original scalar value from that file.
+         * @return The positive power-of-two alignment required by the pinned GGUF reader.
+         * @throws std::invalid_argument For a wrong type, zero or non-power-of-two value.
+         */
+        uint32_t checkedGGUFAlignment(GGUFValueType type, uint32_t alignment)
+        {
+            if (type != GGUFValueType::UINT32 || alignment == 0 ||
+                (alignment & (alignment - 1)) != 0)
+                throw std::invalid_argument(
+                    "[ModelLoader] general.alignment requires a positive power-of-two UINT32");
+            return alignment;
+        }
+
+        /**
+         * @brief Resolve a file-local payload origin after its complete tensor directory.
+         * @param stream Exact file whose directory has just been read.
+         * @param alignment Previously admitted alignment from that same file.
+         * @return Checked absolute byte offset, not a tensor-relative offset.
+         * @throws std::runtime_error For an incomplete directory or unrepresentable seek.
+         */
+        uint64_t alignedGGUFDataOffset(std::istream &stream, uint32_t alignment)
+        {
+            const auto position = stream.tellg();
+            if (position == std::streampos(-1))
+                throw std::runtime_error("[ModelLoader] Cannot locate the end of the GGUF tensor directory");
+            const auto current = static_cast<uint64_t>(position);
+            const auto padding = uint64_t{checkedGGUFAlignment(GGUFValueType::UINT32, alignment)} - 1;
+            const auto maximum = static_cast<uint64_t>(std::numeric_limits<std::streamoff>::max());
+            if (current > maximum || padding > maximum - current)
+                throw std::runtime_error("[ModelLoader] Aligned GGUF data offset exceeds stream representation");
+            return (current + padding) & ~padding;
+        }
+
         /** Minimum selected payload that repays one OpenMP team launch. */
         constexpr size_t kParallelExpertSelectionCopyBytes =
             8u * 1024u * 1024u;
@@ -399,6 +475,10 @@ namespace llaminar2
             return TensorType::IQ1_M;
         case GGUFTensorType::MXFP4:
             return TensorType::MXFP4;
+        case GGUFTensorType::W4A4:
+            return TensorType::W4A4;
+        case GGUFTensorType::W4A4H:
+            return TensorType::W4A4H;
         default:
             throw std::invalid_argument(
                 "[ModelLoader] Unsupported GGUF tensor type " +
@@ -431,6 +511,8 @@ namespace llaminar2
         case GGUFTensorType::IQ4_XS:
         case GGUFTensorType::IQ1_M:
         case GGUFTensorType::MXFP4:
+        case GGUFTensorType::W4A4:
+        case GGUFTensorType::W4A4H:
             return true;
         default:
             return false;
@@ -489,6 +571,9 @@ namespace llaminar2
             return 56;
         case GGUFTensorType::MXFP4:
             return 17;
+        case GGUFTensorType::W4A4:
+        case GGUFTensorType::W4A4H:
+            return w4a4::kSourceBlockBytes;
         default:
             return 0;
         }
@@ -506,6 +591,9 @@ namespace llaminar2
         case GGUFTensorType::IQ4_NL:
         case GGUFTensorType::MXFP4:
             return 32;
+        case GGUFTensorType::W4A4:
+        case GGUFTensorType::W4A4H:
+            return w4a4::kBlockElements;
         case GGUFTensorType::IQ4_XS: // IQ4_XS uses 256-element super-blocks like K-quants
         case GGUFTensorType::Q2_K:
         case GGUFTensorType::Q3_K:
@@ -690,13 +778,11 @@ namespace llaminar2
             model_.split_no = static_cast<uint16_t>(split_no_it->second.asUInt32());
         }
 
-        // Calculate data offset (32-byte aligned after header/metadata)
-        std::streampos pos = file_stream_.tellg();
-        uint64_t cur = static_cast<uint64_t>(pos);
-        uint64_t align = model_.alignment ? model_.alignment : 32;
-        uint64_t aligned = (cur + align - 1) / align * align;
+        // Alignment belongs to this file's metadata, not to the tensor format
+        // or to an assumed 32-byte layout shared by every split.
+        const uint64_t aligned = alignedGGUFDataOffset(file_stream_, model_.alignment);
 
-        if (aligned != cur)
+        if (aligned != static_cast<uint64_t>(file_stream_.tellg()))
         {
             file_stream_.seekg(static_cast<std::streamoff>(aligned), std::ios::beg);
             if (!file_stream_)
@@ -892,6 +978,31 @@ namespace llaminar2
         return info->dimensions;
     }
 
+    std::shared_ptr<TensorBase> ModelLoader::loadW4A4Rows(
+        const GGUFTensorInfo &info, size_t first, size_t count, WeightPrecision precision)
+    {
+        if (!isW4A4Source(info.type) || precision != WeightPrecision::NATIVE)
+            throw std::invalid_argument("W4A4/H loading requires its native online-A4 arithmetic: " + info.name);
+        const auto complete_bytes = w4a4SourceExtent(info);
+        const size_t rows = info.dimensions[0], columns = info.dimensions[1];
+        if (info.size_bytes != complete_bytes || first > rows || !count || count > rows - first)
+            throw std::invalid_argument("W4A4/H source row interval disagrees with its complete descriptor: " + info.name);
+        auto region = getMmapRegion(&info);
+        if (!region)
+            throw std::logic_error("Unmapped W4A4/H uses PreparedWeightStore's admitted final native writer: " + info.name);
+        const auto base = getDataOffset(&info);
+        if (base > region->size() || info.offset > region->size() - base ||
+            complete_bytes > region->size() - base - info.offset)
+            throw std::invalid_argument("W4A4/H source matrix extends beyond its retained file: " + info.name);
+        const auto transform = info.type == GGUFTensorType::W4A4
+            ? w4a4::Transform::Identity : w4a4::Transform::PaleySylvester;
+        auto storage = w4a4::WeightStorage::map(
+            transform, rows, columns, std::move(region), static_cast<size_t>(base + info.offset));
+        // The full source owns the transform/clip policy. A selected row must
+        // not acquire a new policy by ignoring a conflicting unselected row.
+        return std::make_shared<W4A4Tensor>(storage.rowSlice(first, count));
+    }
+
     std::shared_ptr<TensorBase> ModelLoader::loadTensor(const std::string &tensor_name,
                                                         DeviceId device,
                                                         WeightPrecision weight_precision)
@@ -914,6 +1025,12 @@ namespace llaminar2
             // based on whether the schema declares this weight as required or optional.
             LOG_DEBUG("[ModelLoader] Tensor not found: " << tensor_name);
             return nullptr;
+        }
+
+        if (isW4A4Source(info->type))
+        {
+            (void)w4a4SourceExtent(*info);
+            return loadW4A4Rows(*info, 0, info->dimensions[0], weight_precision);
         }
 
         // Ensure NUMA binding before allocating the temporary read buffer.
@@ -1408,6 +1525,8 @@ namespace llaminar2
         }
 
         size_t slice_rows = row_end - row_start;
+        if (isW4A4Source(info->type))
+            return loadW4A4Rows(*info, row_start, slice_rows, weight_precision);
 
         // Calculate bytes per row based on tensor type
         size_t bytes_per_row = 0;
@@ -1981,14 +2100,60 @@ namespace llaminar2
             source_offset > std::numeric_limits<uint64_t>::max() - base - info->offset ||
             base + info->offset + source_offset > uint64_t(std::numeric_limits<std::streamoff>::max()))
             throw std::overflow_error("Native source file offset exceeds stream extent");
-        stream->clear();
-        stream->seekg(std::streamoff(base + info->offset + source_offset), std::ios::beg);
-        if (!*stream) throw std::runtime_error("Cannot seek original native weight source: " + name);
         const auto read = [&](std::byte *out, size_t bytes) {
             if (bytes > size_t(std::numeric_limits<std::streamsize>::max()) ||
                 !stream->read(reinterpret_cast<char *>(out), std::streamsize(bytes)))
                 throw std::runtime_error("Short/error buffered read of original native weight source: " + name);
         };
+        const auto seek = [&](uint64_t offset) {
+            stream->clear();
+            stream->seekg(std::streamoff(offset), std::ios::beg);
+            if (!*stream) throw std::runtime_error("Cannot seek original native weight source: " + name);
+        };
+        if (isW4A4Source(info->type) && !w4a4_source_contracts_.contains(info))
+        {
+            if (destination.empty())
+                throw std::invalid_argument("W4A4/H source admission requires a nonempty final destination: " + name);
+            const auto fail = [&](w4a4::AdmissionError error) {
+                const auto location = error.location.value_or(w4a4::SourceLocation{0, 0});
+                throw std::invalid_argument(name + ": " + error.message() +
+                    " at original row " + std::to_string(location.row) +
+                    " block " + std::to_string(location.block));
+            };
+            const auto transform = info->type == GGUFTensorType::W4A4
+                ? w4a4::Transform::Identity : w4a4::Transform::PaleySylvester;
+            auto admission = w4a4::MatrixAdmission::begin(transform, rows, columns);
+            if (!admission) fail(admission.error());
+            if (info->size_bytes > uint64_t(std::numeric_limits<std::streamoff>::max()) - base - info->offset)
+                throw std::overflow_error("W4A4/H original source exceeds representable file coordinates: " + name);
+            // Borrow only this still-unpublished final interval. One transport
+            // window can be smaller than a row; the scanner retains the original
+            // row unit across windows. No temporary source allocation is made.
+            seek(base + info->offset);
+            for (size_t consumed = 0; consumed < info->size_bytes;)
+            {
+                const size_t bytes = std::min(destination.size(), size_t(info->size_bytes) - consumed);
+                read(destination.data(), bytes);
+                const auto appended = admission->append(destination.first(bytes));
+                if (!appended) fail(appended.error());
+                consumed += bytes;
+            }
+            auto contract = std::move(*admission).finish();
+            if (!contract) fail(contract.error());
+            // Source selection has sealed the directory and original file owner.
+            // Only complete admission is retained; partial/failed reads publish nothing.
+            w4a4_source_contracts_.emplace(info, std::move(*contract));
+            // A complete matrix fits this exact final destination in one scan.
+            // Its bytes are already admitted; seeking back would read the same
+            // payload twice. Partial windows still need their selected bytes
+            // restored after the whole-source scan, and cached later requests
+            // must always fill their own new destinations.
+            if (outer == 1 && window.original_expert == 0 &&
+                window.first_row == 0 && window.rows == rows &&
+                window.first_column == 0 && window.columns == columns)
+                return;
+        }
+        seek(base + info->offset + source_offset);
         const size_t gap = row_bytes - window.native_row_bytes;
         if (!gap) read(destination.data(), destination.size());
         else {
@@ -2461,6 +2626,14 @@ namespace llaminar2
             LOG_ERROR("[ModelLoader] Invalid column range [" << col_start << ", " << col_end
                                                              << ") for tensor with " << total_cols << " columns: " << tensor_name);
             return nullptr;
+        }
+
+        if (isW4A4Source(info->type))
+        {
+            if (col_start != 0 || col_end != total_cols)
+                throw std::invalid_argument(
+                    "W4A4/H execution requires complete original K; a source window is not a reduction shard");
+            return loadW4A4Rows(*info, 0, total_rows, weight_precision);
         }
 
         size_t slice_cols = col_end - col_start;
@@ -2939,22 +3112,15 @@ namespace llaminar2
         return true;
     }
 
+    /**
+     * @brief Decode a main-file string using the same bounded reader as split metadata.
+     * @param str Destination for the complete original field.
+     * @return True after successful decoding; malformed input throws.
+     * @throws std::runtime_error For oversized or truncated strings.
+     */
     bool ModelLoader::readString(std::string &str)
     {
-        uint64_t len;
-        if (!readValue(len))
-            throw std::runtime_error("[ModelLoader] Failed to read string length (truncated)");
-
-        if (len > 1000000)
-        { // 1MB sanity check
-            throw std::runtime_error("[ModelLoader] String length too large: " + std::to_string(len) + " bytes (>1MB)");
-        }
-
-        std::vector<char> buffer(len);
-        if (!file_stream_.read(buffer.data(), len))
-            throw std::runtime_error("[ModelLoader] Failed to read string data (" + std::to_string(len) + " bytes, truncated)");
-
-        str.assign(buffer.data(), len);
+        str = readGGUFString(file_stream_);
         return true;
     }
 
@@ -3033,8 +3199,18 @@ namespace llaminar2
         return true;
     }
 
+    /**
+     * @brief Retain original main-file metadata and admit its physical alignment.
+     * @return True when every declared value has been completely decoded.
+     * @throws std::runtime_error For malformed or truncated values.
+     * @throws std::invalid_argument For ambiguous or invalid alignment metadata.
+     */
     bool ModelLoader::parseMetadata()
     {
+        // An absent field means the GGUF-specified default for this new file;
+        // it must not inherit a previously loaded directory's declared value.
+        model_.alignment = 32;
+        bool alignment_seen = false;
         for (uint64_t i = 0; i < model_.metadata_kv_count; ++i)
         {
             // Read key
@@ -3114,6 +3290,14 @@ namespace llaminar2
                 }
             }
 
+            if (key == "general.alignment")
+            {
+                if (alignment_seen)
+                    throw std::invalid_argument("[ModelLoader] Duplicate general.alignment metadata");
+                model_.alignment = checkedGGUFAlignment(value.type,
+                    value.type == GGUFValueType::UINT32 ? value.asUInt32() : 0);
+                alignment_seen = true;
+            }
             model_.metadata[key] = std::move(value);
         }
 
@@ -3174,6 +3358,12 @@ namespace llaminar2
             }
 
             // Calculate size in bytes
+            if (isW4A4Source(tensor.type))
+            {
+                tensor.size_bytes = w4a4SourceExtent(tensor);
+                tensor.split_idx = 0;
+                continue;
+            }
             size_t n_elems = 1;
             for (auto d : tensor.dimensions)
                 n_elems *= d;
@@ -3384,6 +3574,12 @@ namespace llaminar2
         return true;
     }
 
+    /**
+     * @brief Merge additional directories while retaining each file's own payload origin.
+     * @return True after every split directory and its local alignment are admitted.
+     * @throws std::runtime_error For missing, truncated or malformed split files.
+     * @throws std::invalid_argument For invalid native tensor geometry or alignment.
+     */
     bool ModelLoader::loadSplitFiles()
     {
         // Check if this is a split model
@@ -3442,17 +3638,30 @@ namespace llaminar2
             stream.read(reinterpret_cast<char *>(&tensor_count), sizeof(tensor_count));
             stream.read(reinterpret_cast<char *>(&kv_count), sizeof(kv_count));
 
-            // Skip metadata KV pairs
+            // Additional files may declare a different alignment or omit it.
+            // Other metadata remains unmaterialized; only this file's physical
+            // layout contributes to its source coordinate authority.
+            uint32_t split_alignment = 32;
+            bool alignment_seen = false;
             for (uint64_t i = 0; i < kv_count; ++i)
             {
-                // Skip key
-                uint64_t key_len;
-                stream.read(reinterpret_cast<char *>(&key_len), sizeof(key_len));
-                stream.seekg(key_len, std::ios::cur);
-
-                // Skip value type
-                uint32_t value_type;
-                stream.read(reinterpret_cast<char *>(&value_type), sizeof(value_type));
+                const auto key = readGGUFString(stream);
+                uint32_t value_type = 0;
+                if (!stream.read(reinterpret_cast<char *>(&value_type), sizeof(value_type)))
+                    throw std::runtime_error("[ModelLoader] Truncated split metadata value type");
+                if (key == "general.alignment")
+                {
+                    if (alignment_seen)
+                        throw std::invalid_argument("[ModelLoader] Duplicate general.alignment metadata");
+                    if (value_type != static_cast<uint32_t>(GGUFValueType::UINT32))
+                        throw std::invalid_argument("[ModelLoader] general.alignment requires a positive power-of-two UINT32");
+                    uint32_t declared = 0;
+                    if (!stream.read(reinterpret_cast<char *>(&declared), sizeof(declared)))
+                        throw std::runtime_error("[ModelLoader] Truncated general.alignment metadata");
+                    split_alignment = checkedGGUFAlignment(GGUFValueType::UINT32, declared);
+                    alignment_seen = true;
+                    continue;
+                }
 
                 // Skip value data based on type
                 // Must handle ALL GGUFValueType values with correct sizes
@@ -3576,21 +3785,21 @@ namespace llaminar2
                 // Read offset
                 stream.read(reinterpret_cast<char *>(&info.offset), sizeof(info.offset));
 
-                // Calculate size
-                info.size_bytes = 1;
-                for (auto dim : info.dimensions)
-                {
-                    info.size_bytes *= dim;
-                }
-                size_t type_size = info.getTypeSize();
-                size_t block_size = info.getBlockSize();
-                if (block_size > 0)
-                {
-                    info.size_bytes = (info.size_bytes / block_size) * type_size;
-                }
+                // Online-A4 admission requires complete rows and checked exact
+                // extents, not flattened rounded/padded source capacity.
+                if (isW4A4Source(info.type))
+                    info.size_bytes = w4a4SourceExtent(info);
                 else
                 {
-                    info.size_bytes *= type_size;
+                    info.size_bytes = 1;
+                    for (auto dim : info.dimensions)
+                        info.size_bytes *= dim;
+                    const size_t type_size = info.getTypeSize();
+                    const size_t block_size = info.getBlockSize();
+                    if (block_size > 0)
+                        info.size_bytes = (info.size_bytes / block_size) * type_size;
+                    else
+                        info.size_bytes *= type_size;
                 }
 
                 // Mark which split this tensor belongs to
@@ -3600,12 +3809,7 @@ namespace llaminar2
                 model_.tensors.push_back(info);
             }
 
-            // Calculate data offset (32-byte aligned)
-            std::streampos pos = stream.tellg();
-            uint64_t cur = static_cast<uint64_t>(pos);
-            uint64_t align = model_.alignment ? model_.alignment : 32;
-            uint64_t aligned = (cur + align - 1) / align * align;
-            model_.split_data_offsets[idx] = aligned;
+            model_.split_data_offsets[idx] = alignedGGUFDataOffset(stream, split_alignment);
 
             LOG_DEBUG("[ModelLoader] Split " << idx << " has " << tensor_count << " tensors");
         }
