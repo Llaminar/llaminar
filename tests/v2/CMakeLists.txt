@@ -26784,6 +26784,7 @@ add_v2_test(V2_Integration_RecurrentOnlyPipelinePrefixAdmission
 # Test: canonical topology-wide CPU/GPU admission and live allocation ledger
 add_executable(v2_test_physical_memory_authority
     unit/planning/Test__PhysicalMemoryAuthority.cpp
+    unit/planning/Test__PhysicalMemoryRankHostPool.cpp
     unit/planning/Test__NativeStoragePreparing.cpp
     unit/backends/Test__PreparedGPUWorkerThread.cpp
     unit/backends/Test__NativeContextPreparation.cpp
@@ -26801,6 +26802,14 @@ add_v2_test(V2_Unit_PhysicalMemoryAuthority
     MPI_PROCS 1
     NO_MODELS
 )
+# Shared CPU+integrated-GPU pool (GB10/APU) joint admission; device-free preflight.
+add_v2_test(V2_Integration_PhysicalMemoryRankHostPool
+    COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
+        --gtest_filter=PhysicalMemoryRankHostPool.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;PhysicalMemoryAuthority;CUDA;ROCm;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PhysicalMemoryRankHostPool)
 # Compile the actual resource-borrow API constraints in Unit and explicit device-free preflight.
 add_v2_test(V2_Integration_PhysicalMemoryPlanResourceViewLifetime
     COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
