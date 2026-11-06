@@ -28,15 +28,41 @@ row banks. The old normalization-only precision caller was a real retirement
 dependency; its actual link failure was reproduced before moving it to the
 admitted public publisher. Native-vector NaN rejection and immediate nonempty
 retained completion have focused regressions; isolated nowait countercopies
-fail at1/3 or2/3 arrivals. Current x86 INT32 runtime/economy remains unqualified.
+fail at1/3 or2/3 arrivals. Published `3440350` now has independently audited
+native AVX2/AVX512 INT32 correctness:36 registrations and11 focused cells×20
+per ISA, actual AVX512-built/runtime-AVX2 executions, five explicit Scalar
+admission negatives and one exact finite-check countercopy per ISA. The first
+helper failure and later collection/summary metadata errors remain preserved;
+no producer correction or metadata assumption is counted as source validation.
+INT32 factory/PMA, full-engine runtime and economy are still not certified.
 
-Next build frontier is genuine native sparse attention, not an include guard:
-its ISA admission, dot and value paths are explicitly x86-only, and its decoded
-head buffers must not become an ARM compatibility path. Preserve original
-codec/rounding/basis programs, same-head in-place indexer preparation, original
-query coordinates and canonical replay/cache owners. Validate actual TU/callers,
-all codecs and serial/grouped bytes before a fresh sealed build-only successor.
-No old source token/window, model admission or full-engine pass is inherited.
+The sparse frontier is now implemented in the working tree, not by an include
+guard: the actual complete CPU QSA TU and existing caller TU compile/link/run
+natively using checked original banks, fixed eight-/sixteen-chain scores and
+register-only cache fragments. Its decoded selected-head and full weighted-value
+mirrors are retired. The original TQ codebooks, source/fitted radii and ordered
+inverse-basis FMAs remain explicit. Actual existing all-codec/Q16/ring and
+serial/grouped cases pass; new public admission, exact query alias, immediate
+retained completion and all-positive-worker regressions pass locally. Diagnostic
+old-return/nowait copies falsify the completion tests. The pre-review72 snapshot
+passed218 tests on each of five local profiles and170 preflights×20; fresh genuine
+GNU14 executed27 enabled actual callers and17 focused cells×20. Review then found
+and repaired replay address admission before load/member access across all five
+CPU entries, and added an independent ordered-FMA nonsymmetric TQ4/TQ8 basis/
+query-alias oracle. Exact late-check, reversed-coordinate and zero-value-phase
+copies fail their focused regressions; they are not installed production modes.
+Final source-only closure review73 closes both findings. Fresh post-review
+five-profile runs pass220 registrations each and172 preflights×20; genuine GNU14
+passes24 registrations,19 focused cells×20, all29 enabled actual callers and the
+explicit historical ranking case. Actual18 TUs/six native ELF183 binaries and
+all15672 unchanged source records are independently authenticated. Actual TQ4/8
+value hot loops have native FMAs and no hot stack/calls; this is static ISA, not
+PMU/economy. These remain local kernel/caller proofs, not native-x86 sparse,
+complete-engine/factory/PMA/serving or economical grouped execution certificates.
+
+Finish optimized compiler/resource/economy and native-x86 validation; retain the
+same-head in-place indexer and representation programs. Then seal a fresh source and obtain a separate app/gate-target build-only
+window. No old source token/window, model admission or full-engine pass is inherited.
 
 ## 1. Mandate and completion criteria
 
