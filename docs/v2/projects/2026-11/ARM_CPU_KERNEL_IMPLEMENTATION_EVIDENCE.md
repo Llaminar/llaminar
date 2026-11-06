@@ -1,6 +1,6 @@
 # ARM CPU kernel implementation evidence
 
-Updated: 2026-11-05. Branch `codex/qfn-ngram-continuation-arm64`, based on
+Updated: 2026-11-06. Branch `codex/qfn-ngram-continuation-arm64`, based on
 `2cba3ca1d`. This is an in-progress draft publication; immutable handoffs retain
 their own base-plus-overlay identities. This record distinguishes verified
 kernel slices from the unfinished objective in
@@ -98,7 +98,8 @@ OpenMP collective is fatally diagnosed rather than repaired to zero.
 AVX2 now has a genuine vector Q16 body with the same explicit FP32-square
 program. A named unavailable AVX512 entry rejects instead of silently calling
 scalar; existing compiled AVX512 arithmetic remains distinct. Both actual x86
-compiler envelopes pass syntax, **not new native x86 execution or economy**.
+compiler envelopes first passed syntax; the separately authenticated native x86
+correctness result below now closes that bounded runtime scope, not economy.
 Current GNU14/native ARM passes15 production-TU,9 actual legacy-TU and3 reduction
 cases. Final Mac five-profile170/170 and130preflights×20=2600 raw passes were
 independently parsed from actual XML/raw records, without failures or skips.
@@ -129,17 +130,51 @@ with no hot SP access/calls; its32-byte frame is GPR/cold-exception storage, not
 hot SIMD spill traffic. These static resources are not achieved IPC/cache/
 throughput, PMU evidence or a final `Perf__` certificate.
 
-Native x86 current-source qualification is still pending. Fresh read-only SDK
-probes now directly prove both old CMake and CTest3.28.3, which cannot satisfy the
-real4.x metadata prerequisite. One authenticated SDK-preparation attempt failed
-before any RUN/install: BuildKit tried registry metadata resolution for the local
-base despite`--pull=false`/`--network=none`. Archive`445761da8119c28f4f7fc680f1d32b7df3cf953ba3979f57b3be74c6253b3ea8`
-retains the failure and unchanged35-layer base; no successor or source test ran.
-A separately authorized local-only producer uses the exact local config ID,
-`docker create --pull=never`, authenticated offline official wheels and an owned
-committed layer. Its actual tool/metadata/C++ proofs and immutable successor must
-exist before AVX2/AVX512 tests; this is not permission to weaken tool checks,
-change host packages/services, or claim inherited x86 coverage.
+Native x86 correctness is now independently verified for frozen public73da,
+not the later attention worktree. Old CMake/CTest3.28.3 could not satisfy the
+real4.x metadata prerequisite. The original BuildKit attempt failed before any
+RUN/install when registry metadata resolution ignored the intended local-only
+boundary. Archive`445761da8119c28f4f7fc680f1d32b7df3cf953ba3979f57b3be74c6253b3ea8`
+retains that RED and its unchanged35-layer base. The explicit exact-local-ID,
+`docker create --pull=never`, authenticated offline-wheel successor first exposed
+an ignored empty-entrypoint reset; imageac7a remains unqualified. An explicit
+metadata-only successor sets the actual`/usr/bin/env` entrypoint and retains
+exactly the same36 rootfs IDs, first35 identical to the base. Final SDKf492's
+248 raw hashes,3989 installed records, official wheel/tool bytes, genuine
+CMake/CTest4.0.3, LANGUAGES NONE SIGTERM/36, C++23/OpenMP/GTest/MPI-link witnesses
+were independently authenticated. MPI linkage is not MPI initialization.
+
+The first source73da/d18 native WSL Ryzen7800X3D/GNU14.2 producer then passed
+20 actual registered cells per AVX2/AVX512 profile, including ISA/cache
+preflights. Eight distinct Q16/legacy cells each ran20 times:160 raw passes per
+ISA. Only after both profiles passed, the actual AVX512 binaries with explicit
+runtime AVX2 passed14 RMS/workshare+9 legacy GTests, no failures/disabled/skips.
+The x86 RMS inventory is14, not ARM's15. Source-owned TIMEOUT30 stays unchanged;
+the SDK SIGTERM/36 witness is separate. Actual production-TU flags, six native
+AMD64 ELF binaries and mixed-lane environment/commands are bound in the return.
+XCR0=231, MXCSR=8064/`1f80` and rounding0 remain unchanged in the before/after
+probes; this is not claimed as in-process sampling from every test thread.
+
+Main independently verified archive`cb1c48f7a0cbaff24a9ce587d46ba5e98d1e4f53e6d44a1a1b94c737160a48e5`
+(4832866B), all178 raw member hashes, actual XML and each repeated raw cell
+count. The native private producer finished01:07:09.793293235UTC, exit0/PID0/
+OOMfalse; peak1615630336B. A host terminal guard began the complete7063-entry
+source-after map75.379ms after **terminal exit**, before container removal.
+Before/after maps are byte-identical with SHA256
+`42819719509e5a59870c8a3c03a047d0c0a6fdac6a336fa082dbfb0adae8c08f`.
+The separately approved read-only/nonroot/network-none host-cgroup-namespace
+observer captured actual target→docker→root ancestry; the source producer
+retained private namespaces. Parent historical OOM counts are not this run's
+OOM events. Owned containers were retired and the W4A4 capacity window released.
+
+The earlier d072 private-namespace cgroup helper stopped before compilation or
+source execution and stays an admission-helper RED. A later cancelled scheduled
+observer reported exit2 with cause **uninvestigated**, supplying no qualification
+evidence; actual terminal/raw tests/guard receipts determine the source result.
+The relay's initial Mac verifier also lacked`hashlib.file_digest`; its pre-check
+error is preserved and an explicit bounded SHA256-stream verifier succeeded
+without changing the archive. None of these focused results certifies the full
+engine/Unit/preflight, later AQ8 changes, model/GPU/cluster or performance.
 
 The actual canonical hook was attempted again for this slice. Default AppleClang
 OpenMP discovery failed; explicit genuine Homebrew libomp then reached the same
@@ -147,6 +182,95 @@ fatal`CMakeLists.txt:173` native-macOS memory/placement diagnostic. Neither full
 Unit nor production-preflight target build/test ran. A published draft checkpoint
 therefore uses the documented explicit hook bypass, disclosed as incomplete gate
 evidence rather than a readiness waiver. Hooks remain registered and unchanged.
+
+## 2026-11-06 original AQ8 attention operands (partial integration)
+
+`CPUAttentionKeyQ8Dot.h` binds complete original query heads, immutable anchors
+and an authenticated native ISA in a non-default-constructible immutable tile.
+D64/128/256 and query widths1..4 share register-only decoded fragments, preserving
+the original NEON two-chain, AVX2 eight-lane and AVX512 sixteen-lane dot programs.
+No key head, decoded cache bank or coefficient mirror is materialized. Existing
+NEON dot helpers are the component oracle; x86 references transcribe the class
+loops, rather than claiming execution of private class methods. No universal
+cross-ISA byte oracle is implied.
+
+Independent RN controls distinguish separate decode words`36000000` from
+reassociation`35800000` and an outer FMA`35c00000`; actual native quantizer
+publication also supplies non-power-of-two scales. Original33-row strided query
+banks,1..4-query tiles, all head widths, seeds/exponents, M1/component bytes,
+readonly roots, malformed geometry and foreign ISA rejection are covered.
+Each separately filtered numeric receipt rejects an empty native ISA inventory.
+
+The initial four-query resource candidate repeatedly loaded query-root pointers
+from its hot stack. Passing only validated roots by value and storing immutable
+bindings removes those loads, without copying query/key/coefficient data. Isolated
+D128/Rows4 loops use16 AppleClang or19 GNU14 SIMD register identities with no hot
+SP access/calls. The actual canonical Release `Perf__` D128/Rows4 worker was also
+disassembled separately: eight native FMA instructions in its K loop, no hot
+stack traffic. These are bounded resource observations, not PMU certificates.
+
+`CPUQ8AttentionValue.h` supplies explicit native NEON/AVX2/AVX512 original32-code
+value accumulation. The FP16 scale is decoded canonically, weight*scale rounds
+separately, and original signed codes enter intentional numerator FMAs. The
+source/block intersection and complete32-value output checks precede stores;
+only explicit scalar diagnostic intent selects its scalar program. All signed
+codes, seven half scales, four weights, canaries/readonly metadata and an
+independent memory-rounded combined-weight/FMA reference distinguish premature
+code scaling. This replaces the class's plain ARM/AVX2 V loop as well as the
+existing AVX512 leaf, so **symmetric Q8 attention also needs full-core validation**;
+AQ8 dot resources alone do not qualify the value kernel. Separate native32-code
+value candidates show eight intentional FMAs,5 AppleClang/11 GNU14 SIMD identities
+and no hot SP access/calls; cold dispatch/validation and ABI saves remain. This
+bounded ISA inspection is not measured value-kernel economy or full FA2 proof.
+
+Source review exposed a real integration boundary: both AQ8 entries and the
+adapter include were still x86-only. Only AQ8 was separated from those Q8/TQ
+sections; other guards were not opened indiscriminately. Genuine native GNU14
+preprocessing finds zero AQ8 definitions/calls in the frozen73da class and one
+actual definition/three occurrences after repair. Explicit FP32 production-class
+and new regression-TU syntax now compile the native adapter and its Q8/TQ
+value/rotation dependencies. **Syntax is not linked/executed FA2.** Query widths2–4
+remain leaf-only: the canonical adapter currently binds width1.
+
+`V2_Integration_CPUFlashAttentionAQ8NativeEntries` is an explicit full-core
+preflight. It uses the real ring factory, physical NUMA endpoint registration,
+setup-owned workspace manager, native tensor/verifier/two-request APIs,
+D64/128/256, Q8/TQ4/TQ8 values, M3 and worker budgets1/3/10. Every publication bank,
+including serial oracles, is NaN-poisoned before its independently asserted call;
+finite and strict full-byte checks cannot inherit a previous writer's result.
+This is origin0/capacity17/window7 with one canonical partition, not wrap,
+context-summary lifecycle or production PMA admission. The test has passed actual
+native GNU14 syntax only; **full-core linking/execution remains unqualified**.
+
+The final focused worktree checkpoint is176/176 in each of five Mac profiles,
+136 preflights×20=2720 independently counted raw passes, without fail/skip.
+Native GNU14 runs all15 codec/dot/value/authentication cases. Earlier172/132,
+173/133 and175/135 checkpoints retain their narrower source scopes. The complete
+native engine/gate inventory is not represented by those counts.
+
+The canonical `Perf__CPUAttentionKeyQ8.cpp` now cold-binds exactly one native dot
+D/query-width/ISA candidate per process. All authentication precedes warmup and
+seven timed samples; no head reconstruction, binding or allocation is timed.
+Complete NaN poisoning and shared nonempty/finite/bitwise authentication reject
+no-op, partial, identical-NaN and empty banks, including the admitted all-zero
+heads1 fixture. Raw dot samples are retained in CSV. See the stable focused-build
+and benchmark procedure in `tests/v2/portability/README.md`.
+
+One bounded unpinned M1 Max Release experiment, three fresh processes per shape,
+records median per-query widths1→4 of10.205→5.356ns (D64),21.462→9.961ns (D128)
+and39.127→19.046ns (D256):1.906x/2.155x/2.054x register-fragment reuse. Raw samples,
+binary digest and exact-symbol ISA evidence remain outside the repository.
+**This is neither placement/PMU/scaling nor FA2/MTP/server throughput evidence**;
+the width1 production callback cannot inherit the width4 helper's economics.
+Remaining attention-exp tails/rescaling, grouped-query scheduler wiring, actual
+workspace/cache/request lifetimes and final all-family `Perf__` still apply.
+
+The actual canonical hook was repeated for this attention checkpoint: default
+AppleClang OpenMP discovery fails; after explicit genuine Homebrew libomp setup,
+it again fails at`CMakeLists.txt:173` because native macOS memory/placement is not
+implemented. Full Unit/preflight never build or execute. The explicit documented
+draft-checkpoint bypass remains disclosed, not a gate/readiness waiver; neither
+the focused176/136 matrix nor the old73da x86 pass replaces this missing gate.
 
 ## Configure-host topology and evidence retirement
 

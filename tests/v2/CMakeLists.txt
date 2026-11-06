@@ -19065,6 +19065,20 @@ add_v2_test(V2_Integration_GroupedVerifierRows_CPU_Attention_NonQ16NativeFormats
     NO_MODELS
 )
 
+# Actual AQ8 tensor/request entries must execute on each compiled native CPU ISA;
+# a leaf-only ARM pass cannot certify an adapter hidden in an x86-only section.
+add_executable(v2_integration_cpu_flash_attention_aq8
+    integration/kernels/cpu/attention/Test__CPUFlashAttentionAQ8.cpp)
+target_link_libraries(v2_integration_cpu_flash_attention_aq8 PRIVATE
+    llaminar2_core GTest::gtest_main OpenMP::OpenMP_CXX)
+add_v2_test(V2_Integration_CPUFlashAttentionAQ8NativeEntries
+    COMMAND $<TARGET_FILE:v2_integration_cpu_flash_attention_aq8>
+        --gtest_filter=CPUFlashAttentionAQ8.NativeTensorAndRequestEntriesRetainSerialBytes
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;Attention;AQ8;Q8_1;TQ4;TQ8;GroupedVerifier;ByteExact;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+)
+
 # Wo transpose benchmark - compares row-major vs column-major GEMV
 add_executable(v2_perf_wo_transpose performance/Microbench__WoTranspose.cpp)
 target_link_libraries(v2_perf_wo_transpose
