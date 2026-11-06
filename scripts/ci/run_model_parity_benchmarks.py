@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+## @file run_model_parity_benchmarks.py
+## @brief Own canonical benchmark workload arguments and local/image lifetimes.
+## Native diagnostic consumers share the exact local launch, warmup and timeout
+## authority without inheriting image certification or production-default intent.
 """Benchmark canonical E2E candidates on an image or local Release diagnostic.
 
 The canonical matrix exports a separate production-default benchmark policy
@@ -79,16 +83,21 @@ def benchmark_profile(record: dict) -> dict:
     return profile
 
 
-def benchmark_arguments(record: dict, model: str, output: str, workload: dict) -> list[str]:
-    """Use the exported benchmark intent verbatim; add only the fixed workload."""
+def workload_arguments(output: str, workload: dict) -> list[str]:
+    """Bind exact prompt bytes, output budget and sampler on every native route."""
     prompt = validate_workload(workload)
-    profile = benchmark_profile(record)
-    return ["benchmark", *profile["args"], "-m", model,
-            "--context-length", str(profile["context_length"]),
-            "--prompt", prompt, "-n", str(workload["decode_tokens"]),
+    return ["--prompt", prompt, "-n", str(workload["decode_tokens"]),
             "--seed", str(workload["seed"]), "--temperature", str(workload["temperature"]),
             "--top-k", str(workload["top_k"]), "--top-p", str(workload["top_p"]),
             "--benchmark-json-output", output]
+
+
+def benchmark_arguments(record: dict, model: str, output: str, workload: dict) -> list[str]:
+    """Use the exported benchmark intent verbatim; add only the fixed workload."""
+    profile = benchmark_profile(record)
+    return ["benchmark", *profile["args"], "-m", model,
+            "--context-length", str(profile["context_length"]),
+            *workload_arguments(output, workload)]
 
 
 def validate_measurement(data: dict, workload: dict) -> dict:
@@ -119,6 +128,35 @@ def validate_measurement(data: dict, workload: dict) -> dict:
             "samples": samples, "prefill_tokens": int(token_counts.pop())}
 
 
+def run_local_benchmark(binary: Path, directory: Path, arguments: list[str], workload: dict,
+                        *, environment: dict[str, str] | None = None) -> dict:
+    """Own one native diagnostic process and retire its group on interruption.
+
+    Frozen collectors pass a complete explicit environment instead of inheriting
+    unrecorded profiling or runtime knobs. Canonical callers retain their current
+    inherited environment. Both routes use the same workload iteration settings
+    and exact-cell watchdog; neither manufactures a certification receipt.
+    """
+    validate_workload(workload)
+    command = [str(binary), *arguments]
+    write_json(directory / "invocation.json", {"argv": command})
+    child_environment = os.environ.copy() if environment is None else dict(environment)
+    child_environment["LLAMINAR_BENCHMARK_ITERATIONS"] = str(workload["measurement_iterations"])
+    child_environment["LLAMINAR_BENCHMARK_WARMUP_ITERATIONS"] = str(workload["warmup_iterations"])
+    with (directory / "benchmark.log").open("w") as log:
+        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
+                                   env=child_environment, start_new_session=True)
+        try:
+            return_code = process.wait(timeout=e2e.parity.EXACT_CELL_TIMEOUT_SECONDS)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            raise
+    if return_code != 0:
+        raise subprocess.CalledProcessError(return_code, command)
+    return json.loads((directory / "benchmark.json").read_text())
+
+
 def run_cell(image: str | None, backends: str, directory: Path, model: Path,
              record: dict, workload: dict, *, diagnostic_binary: Path | None = None) -> dict:
     """Run one exact workload, isolating a certified image or a local diagnostic.
@@ -129,8 +167,8 @@ def run_cell(image: str | None, backends: str, directory: Path, model: Path,
     name = "llaminar-benchmark-" + uuid.uuid4().hex
     output = directory / "benchmark.json"
     if diagnostic_binary is not None:
-        command = [str(diagnostic_binary), *benchmark_arguments(
-            record, str(model), str(output), workload)]
+        return run_local_benchmark(diagnostic_binary, directory, benchmark_arguments(
+            record, str(model), str(output), workload), workload)
     else:
         if image is None:
             raise ValueError("certifying benchmark cell requires an immutable image")
@@ -142,30 +180,14 @@ def run_cell(image: str | None, backends: str, directory: Path, model: Path,
                    "-e", f"LLAMINAR_BENCHMARK_WARMUP_ITERATIONS={workload['warmup_iterations']}",
                    image, *benchmark_arguments(record, str(model), "/benchmark-output/benchmark.json", workload)]
     write_json(directory / "invocation.json", {"argv": command})
-    if diagnostic_binary is not None:
-        environment = os.environ.copy()
-        environment["LLAMINAR_BENCHMARK_ITERATIONS"] = str(workload["measurement_iterations"])
-        environment["LLAMINAR_BENCHMARK_WARMUP_ITERATIONS"] = str(workload["warmup_iterations"])
+    try:
         with (directory / "benchmark.log").open("w") as log:
-            process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
-                                       env=environment, start_new_session=True)
-            try:
-                return_code = process.wait(timeout=e2e.parity.EXACT_CELL_TIMEOUT_SECONDS)
-            except (subprocess.TimeoutExpired, KeyboardInterrupt):
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
-                raise
-        if return_code != 0:
-            raise subprocess.CalledProcessError(return_code, command)
-    else:
-        try:
-            with (directory / "benchmark.log").open("w") as log:
-                subprocess.run(command, check=True, stdout=log, stderr=subprocess.STDOUT,
-                               timeout=e2e.parity.EXACT_CELL_TIMEOUT_SECONDS)
-        finally:
-            # A dead docker client does not necessarily retire server/MPI children.
-            subprocess.run(["docker", "rm", "-f", name], stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=30, check=False)
+            subprocess.run(command, check=True, stdout=log, stderr=subprocess.STDOUT,
+                           timeout=e2e.parity.EXACT_CELL_TIMEOUT_SECONDS)
+    finally:
+        # A dead docker client does not necessarily retire server/MPI children.
+        subprocess.run(["docker", "rm", "-f", name], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=30, check=False)
     return json.loads(output.read_text())
 
 

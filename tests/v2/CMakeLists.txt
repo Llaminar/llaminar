@@ -1,7 +1,9 @@
-# Llaminar V2 Test Suite
-# Canonical registration for Unit, integration, production parity, E2E and
-# performance. Build gates derive dependencies from these same registrations,
-# including executables passed as arguments to script-based test drivers.
+## @file CMakeLists.txt
+## @brief Canonical registration and build dependencies for the V2 test suite.
+## Unit, integration, production parity, E2E and performance gates derive their
+## inventories from these registrations, including executables passed as script
+## arguments. Device-free evidence contracts must remain independently runnable
+## in Unit and ProductionTestPreflight without models or accelerators.
 
 # Note: enable_testing() is called in parent CMakeLists.txt (src/v2/CMakeLists.txt)
 
@@ -4324,6 +4326,46 @@ add_test(NAME V2_Integration_MTPBenchmarkPolicyEvidence
 )
 set_tests_properties(V2_Integration_MTPBenchmarkPolicyEvidence PROPERTIES
     LABELS "V2;Integration;ProductionTestPreflight;MTP;Benchmark;Regression"
+    TIMEOUT 30
+)
+
+# The offline evaluator consumes native benchmark evidence but never launches
+# models. Its adversarial contracts cannot themselves certify performance or
+# replace numerical/state replay and production-path admission.
+add_test(NAME V2_Unit_NativeSpeculationEvaluation
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_speculation_evaluation.py
+)
+set_tests_properties(V2_Unit_NativeSpeculationEvaluation PROPERTIES
+    LABELS "V2;Unit;DeviceFree;MTP;Benchmark;Evidence;Regression"
+    TIMEOUT 30
+)
+add_test(NAME V2_Integration_NativeSpeculationEvidenceContract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_speculation_evaluation.py
+            EvidenceContractTests
+)
+set_tests_properties(V2_Integration_NativeSpeculationEvidenceContract PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MTP;Benchmark;Evidence;Regression"
+    TIMEOUT 30
+)
+
+# Synthetic process/admission fixtures exercise the real collection and shared
+# local launch adapter without executing models, GPU work or process signals.
+add_test(NAME V2_Unit_NativeSpeculationCollection
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_speculation_collection.py
+)
+set_tests_properties(V2_Unit_NativeSpeculationCollection PROPERTIES
+    LABELS "V2;Unit;DeviceFree;MTP;Benchmark;Evidence;Collection;Regression"
+    TIMEOUT 30
+)
+add_test(NAME V2_Integration_NativeSpeculationCollectionContract
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_speculation_collection.py
+)
+set_tests_properties(V2_Integration_NativeSpeculationCollectionContract PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MTP;Benchmark;Evidence;Collection;Regression"
     TIMEOUT 30
 )
 

@@ -1036,7 +1036,12 @@ token produced at the end of prefill. Use matching token counts and timing
 boundaries in both engines.
 
 See the [llama.cpp comparison workflow](.agents/llama-cpp-comparison/SKILL.md)
-for matching workloads and profiling across engines.
+for matching workloads and profiling across engines. For offline AR/current-MTP/
+candidate comparisons of native benchmark JSON, use the
+[native speculation evaluator](docs/native-speculation-evaluation.md). It checks
+frozen evidence and exact emitted tokens, but does not certify an implementation.
+The [frozen collection adapter](docs/native-speculation-collection.md) assembles
+that evidence through the canonical launcher for an already admitted local deployment.
 
 </details>
 

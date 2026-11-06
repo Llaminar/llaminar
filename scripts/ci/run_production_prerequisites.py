@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+## @file run_production_prerequisites.py
+## @brief Own complete model-free prerequisite execution and source freshness.
+## Independent diagnostic collectors may validate another explicitly identified
+## checkout through the same freshness contract; no receipt or test is invented.
 """Run the canonical Unit/preflight transaction without admitting any model.
 
 Run this command in the installed test runner before the outer CI driver starts
@@ -21,16 +25,17 @@ from run_production_parity_campaigns import (
 )
 
 
-def validate_source_freshness(build: Path, report: Path) -> None:
+def validate_source_freshness(build: Path, report: Path, *, source_root: Path | None = None) -> None:
     """Reject edits to interpreted tests and policies that Ninja cannot rebuild.
 
-    Local receipt reuse belongs to this checkout's configured build. Git owns
-    the source inventory; file and containing-directory metadata conservatively
-    detects edits, additions and removals after the actual gate. No payload is
+    Local receipt reuse belongs to this checkout's configured build unless an
+    explicit source_root selects another build checkout. Git owns the source
+    inventory; file and containing-directory metadata conservatively detects
+    edits, additions and removals after the actual gate. No payload is
     read or hashed, and ignored models, caches and build products are excluded.
     The canonical validator separately authenticates success and test inventory.
     """
-    root = Path(__file__).resolve().parents[2]
+    root = source_root.resolve(strict=True) if source_root is not None else Path(__file__).resolve().parents[2]
     cache = (build / "CMakeCache.txt").read_text(encoding="utf-8")
     homes = [line.split("=", 1)[1] for line in cache.splitlines()
              if line.startswith("CMAKE_HOME_DIRECTORY:INTERNAL=")]
