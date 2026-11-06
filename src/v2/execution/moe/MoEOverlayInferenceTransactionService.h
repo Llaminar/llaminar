@@ -759,7 +759,23 @@ namespace llaminar2
         MoEOverlayInferencePlacementScopeObservation withMoEOverlayInferencePlacementScope(
             const std::function<void()> &body);
 
-        /** @brief Open one monotonic command on every target publisher. */
+        /**
+         * @brief Admit an outer command only from the original sealed continuation rank.
+         * @param world_rank Actual original overlay communicator rank, including world-one publishers.
+         * @param command Original request generation, monotonic command identity and admitted epoch floor.
+         * @param error Optional stable rejection diagnostic.
+         * @return True after existing publisher admission; false before publication for foreign/stale identity.
+         * @note The epoch is a scheduling floor. Device packet kernels authenticate the live bank ticket.
+         */
+        bool beginRootCommand(int world_rank, const MoEOverlayInferenceCommandIdentity &command,
+            std::string *error = nullptr);
+
+        /**
+         * @brief Open one monotonic command on every target publisher.
+         * @param command Original request, command and admitted epoch-floor identity.
+         * @param error Optional stable publication diagnostic.
+         * @return Whether every original publisher admitted the command.
+         */
         bool beginCommand(
             const MoEOverlayInferenceCommandIdentity &command,
             std::string *error = nullptr);
@@ -1138,6 +1154,13 @@ namespace llaminar2
         /** Optional model-lifetime probe; policy/calibration remain host-owned. */
         std::shared_ptr<MoEOverlayInferenceInterferenceProbe>
             prefill_interference_probe_;
+        /**
+         * @brief Perform existing command publication while the original coordinator mutex is held.
+         * @param command Checked command identity; publishers retain their original validation.
+         * @param error Optional stable diagnostic.
+         * @return Whether every original publisher admitted the command.
+         */
+        bool beginCommandLocked(const MoEOverlayInferenceCommandIdentity &command, std::string *error);
         mutable std::mutex mutex_;
         /** Wakes an ahead prefill submitter after the last sibling seals a group. */
         std::condition_variable graph_group_completion_cv_;
@@ -1197,7 +1220,12 @@ namespace llaminar2
                 coordinator,
             MoEOverlayInferenceExecutionDescriptor descriptor,
             int participant_index);
-        /** @brief Fail an unfinished active graph without throwing. */
+        /**
+         * @brief Publish the original failed terminal for an unfinished active graph.
+         * @note Failure to publish that terminal is process-fatal before worker
+         *       collection or graph-owner release can wait on unproven work.
+         *       A successfully published failed terminal retains normal cancellation.
+         */
         ~MoEOverlayInferenceParticipantGraphScope() noexcept;
 
         MoEOverlayInferenceParticipantGraphScope(

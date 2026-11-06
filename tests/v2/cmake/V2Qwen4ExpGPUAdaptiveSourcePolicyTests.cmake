@@ -7,6 +7,16 @@ source/numerical/exact candidates or absent native hardware.
 ]]
 # Source-only typed discovery is distinct from numerical/expert movement qualification.
 if(TARGET v2_test_model_parity_definition)
+    add_v2_test(V2_Integration_Qwen4ExpAllGPUQ6MTPRegistrationContract
+        COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+            --gtest_filter=Qwen4ExpSourceAdmissionCases.AllGPUQ6* --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;MTP;Admission;Ownership;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpAllGPUQ6MTPRegistrationContract)
+endif()
+
+if(TARGET v2_test_model_parity_definition)
     add_v2_test(V2_Integration_Qwen4ExpGPUAdaptiveSourcePolicyDiscoveryReplay
         COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
             --gtest_filter=Qwen4ExpSourceAdmissionCases.ExpertLookupOwnerSelectionRequiresOriginalKnownRank:Qwen4ExpSourceAdmissionCases.ExpertFollowerOwnersRetainOriginalQ6AndAllMTPPolicies:Qwen4ExpSourceAdmissionCases.GPUAdaptiveSourceHasTotalExpertPolicyAndMTPProduct:Qwen4ExpSourceAdmissionCases.GPUAdaptiveSourcePreservesOriginalSixteenAndNumericalFour:Qwen4ExpSourceAdmissionCases.GPUAdaptiveDynamicDepthDoesNotCertifyPhysicalExpertMovement:Qwen4ExpSourceAdmissionCases.FullSourceMatrixHasTotalFourPolicyMTPDimension:Qwen4ExpSourceAdmissionCI.GPUAdaptiveDiscoveryRetainsAllTypedExpertAndMTPPolicies

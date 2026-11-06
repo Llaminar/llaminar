@@ -7,6 +7,7 @@
  * once instead of recompiling both monolithic backend test translation units.
  */
 #include "NativeVNNIExpertTransferParityTest.h"
+#include "../../../utils/DeviceEpochArenaTestMemory.h"
 
 namespace llaminar2::test
 {
@@ -290,13 +291,13 @@ namespace llaminar2::test
             // and every grouped execution. A bare runtime table cannot certify
             // this protocol even when the payload copy itself is correct.
             auto source_epoch = std::make_shared<DeviceMoEOverlayEpochArena>(
-                DeviceMoEOverlayEpochArena::Config{
+                llaminar2::test::admitEpochArenaForTest(DeviceMoEOverlayEpochArena::Config{
                     .device_id = device, .initial_epoch = 1u,
-                    .initial_bank = 1u, .request_slot_capacity = 1u});
+                    .initial_bank = 1u, .request_slot_capacity = 1u}));
             auto destination_epoch = std::make_shared<DeviceMoEOverlayEpochArena>(
-                DeviceMoEOverlayEpochArena::Config{
+                llaminar2::test::admitEpochArenaForTest(DeviceMoEOverlayEpochArena::Config{
                     .device_id = device, .initial_epoch = 1u,
-                    .initial_bank = 1u, .request_slot_capacity = 1u});
+                    .initial_bank = 1u, .request_slot_capacity = 1u}));
             auto source_placement = makeRuntimeTable(
                 device,
                 stream,

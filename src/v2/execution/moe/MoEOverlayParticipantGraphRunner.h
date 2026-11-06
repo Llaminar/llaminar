@@ -35,6 +35,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <utility>
 #include <string>
 #include <stdexcept>
@@ -82,6 +83,29 @@ namespace llaminar2
         ExpertOnlyRank, ///< Existing remote command/ticket follower lifecycle.
         RankLocalAuxiliary, ///< Subordinate endpoints of the real continuation Rank.
     };
+
+    /**
+     * @brief Validate the exact fabric and follower GPU projections of original owners.
+     *
+     * The local fabric includes continuation DGO endpoints as well as follower
+     * endpoints. A rank-local auxiliary runner owns only the non-continuation
+     * GPU endpoints; an expert-only rank must contain no continuation GPUs.
+     * This cold validation creates no runtime authority or membership ledger.
+     * @param plan Original plan naming the continuation domain.
+     * @param original_owners Original admitted participant catalog.
+     * @param world_rank Exact rank whose native runtimes are being constructed.
+     * @param ownership Existing original runner role.
+     * @param fabric_local_ids Actual local controller-fabric participant IDs.
+     * @param follower_gpu_ids Actual GPU IDs selected for this participant runner.
+     * @throws std::invalid_argument For missing, foreign, duplicate or wrong-role IDs.
+     */
+    void requireMoEOverlayParticipantGPUOwnership(
+        const MoERoutedExpertPlacementPlan &plan,
+        const MoEExpertOwnerMap &original_owners,
+        int world_rank,
+        MoEOverlayParticipantGraphOwnership ownership,
+        std::span<const int> fabric_local_ids,
+        std::span<const int> follower_gpu_ids);
 
     /**
      * @brief Construction contract for one rank-local expert graph.
@@ -357,6 +381,45 @@ namespace llaminar2
          */
         static void cancelOriginalPooledSource(const std::function<void()>& cancellation,
             std::mutex& failure_mutex,std::exception_ptr& failure) noexcept;
+        /**
+         * @brief Preserve source-cancellation failure after exact native terminal observation.
+         * @param native_terminals_joined Existing original submission's native retirement proof.
+         * @param failure_mutex Protects its existing sticky cancellation exception.
+         * @param failure Original source-cancellation failure, never cleared by native proof.
+         * @param drain Existing native drain, invoked only before terminal observation.
+         * @param error Optional stable original cancellation diagnostic.
+         * @return True only after original native drain and successful source cancellation.
+         * @throws Any original native-drain exception; the caller still attempts sibling drains.
+         */
+        template <class Drain>
+        static bool drainOriginalSubmissionCancellation(bool native_terminals_joined,
+            std::mutex &failure_mutex, const std::exception_ptr &failure, Drain drain, std::string *error)
+        {
+            if (!native_terminals_joined)
+                return drain(error);
+            std::exception_ptr original;
+            {
+                std::lock_guard lock(failure_mutex);
+                original = failure;
+            }
+            if (!original)
+                return true;
+            try
+            {
+                std::rethrow_exception(original);
+            }
+            catch (const std::exception &source_error)
+            {
+                if (error)
+                    *error = std::string("Original pooled source cancellation failed: ") + source_error.what();
+            }
+            catch (...)
+            {
+                if (error)
+                    *error = "Original pooled source cancellation failed with a non-standard exception";
+            }
+            return false;
+        }
         friend class RankOrchestrator;
         /** @brief Bind actual source cache owners after original continuation setup and before follower capture. */
         void bindOriginalPooledSourceFamily(
@@ -570,15 +633,18 @@ namespace llaminar2
         class RankLocalPublicationState
         {
         public:
-            /** @brief Allocate the original fixed protocol ring during cold setup. */
+            /**
+             * @brief Allocate publication handles for the original fixed protocol ring during cold setup.
+             * @param config Original topology, ring capacity and admitted geometry.
+             */
             explicit RankLocalPublicationState(MoEOverlayInferenceTransactionProtocol::Config config)
-                : protocol_(std::move(config))
+                : protocol_(std::move(config)), active_(protocol_.slotCount())
             {
             }
             /** @brief Open only after the prior original command retired successfully. */
             bool begin(const MoEOverlayInferenceCommandIdentity &command, std::string *error)
             {
-                if (active_ || failed_)
+                if (active() || failed_)
                     return reject(error, "Original local expert command is active or failed");
                 if (!protocol_.beginCommand(command, error))
                     return false;
@@ -596,7 +662,7 @@ namespace llaminar2
                 const MoEOverlayInferenceExecutionDescriptor &descriptor, Submit submit)
             {
                 MoEOverlayPublishedInferenceTransaction out;
-                if (active_ || failed_ || !command_.valid())
+                if (failed_ || !command_.valid())
                 {
                     out.error = "Local publisher has no reusable original command slot";
                     return out;
@@ -617,7 +683,7 @@ namespace llaminar2
                         return out;
                     }
                     out.slot_index = admission.slot_index;
-                    active_ = out;
+                    active_.at(out.slot_index) = out;
                     if (!protocol_.markSubmitted(out.slot_index, out.ticket, &out.error) ||
                         !submit(out.ticket, &out.error))
                     {
@@ -625,7 +691,7 @@ namespace llaminar2
                         return out;
                     }
                     out.ok = true;
-                    active_ = out;
+                    active_.at(out.slot_index) = out;
                 }
                 catch (const std::exception &exception)
                 {
@@ -653,8 +719,9 @@ namespace llaminar2
             template <class Join>
             bool retire(const MoEOverlayPublishedInferenceTransaction &handle, Join join, std::string *error)
             {
-                if (!active_ || !handle.ok || !active_->ok || handle.ticket != active_->ticket ||
-                    handle.slot_index != active_->slot_index)
+                const auto *original = activeHandle(handle.slot_index);
+                if (!original || !handle.ok || !original->ok || handle.ticket != original->ticket ||
+                    handle.slot_index != original->slot_index)
                     return reject(error, "Local retirement lost its exact original publication");
                 if (failed_)
                     return reject(error, "Original local expert command has failed");
@@ -677,13 +744,13 @@ namespace llaminar2
                     failed_ = true;
                     return false;
                 }
-                active_.reset();
+                active_[handle.slot_index].reset();
                 return true;
             }
             /** @brief Successful completion is impossible while any slot or failure remains. */
             bool complete(std::uint64_t epoch, std::uint64_t progress, std::string *error)
             {
-                if (active_ || failed_)
+                if (active() || failed_)
                     return reject(error, "Original local expert work is not successfully retired");
                 return terminal(MoEOverlayInferenceTransactionAction::Complete, epoch, progress, 0, error);
             }
@@ -697,7 +764,7 @@ namespace llaminar2
                 if (!command_.valid() || epoch < protocol_.currentPlacementEpoch() || code <= 0)
                     return reject(error, "Local abort lost its original command epoch or failure code");
                 failed_ = true;
-                if (active_)
+                if (active())
                 {
                     try
                     {
@@ -708,7 +775,8 @@ namespace llaminar2
                     {
                         return reject(error, exception.what());
                     }
-                    active_.reset();
+                    for (auto &handle : active_)
+                        handle.reset();
                 }
                 if (protocol_.state() == MoEOverlayInferenceProtocolState::Failed)
                     return true;
@@ -717,12 +785,43 @@ namespace llaminar2
             /** @return Whether original work still needs its exact native retirement. */
             bool active() const noexcept
             {
-                return active_.has_value();
+                return std::any_of(active_.begin(), active_.end(), [](const auto &handle)
+                {
+                    return handle.has_value();
+                });
             }
-            /** @return Original active ticket, never a mutable device-state observation. */
+            /** @return Latest original active ticket for absorbing abort, never mutable device state. */
             const MoEOverlayInferenceTransactionTicket *activeTicket() const noexcept
             {
-                return active_ ? &active_->ticket : nullptr;
+                const MoEOverlayInferenceTransactionTicket *latest = nullptr;
+                for (const auto &handle : active_)
+                    if (handle && (!latest || handle->ticket.transaction_ordinal > latest->transaction_ordinal))
+                        latest = &handle->ticket;
+                return latest;
+            }
+            /** @return Original admitted protocol capacity, never a new concurrency budget. */
+            std::size_t slotCount() const noexcept
+            {
+                return protocol_.slotCount();
+            }
+            /**
+             * @param slot Index in the original protocol ring.
+             * @return Exact retained publication, or null when that slot is reusable.
+             */
+            const MoEOverlayPublishedInferenceTransaction *activeHandle(std::size_t slot) const noexcept
+            {
+                return slot < active_.size() && active_[slot] ? &*active_[slot] : nullptr;
+            }
+            /**
+             * @param ticket Immutable original execution identity.
+             * @return Existing slot owning this ticket; no second ring mapping is derived.
+             */
+            std::optional<std::size_t> activeSlot(const MoEOverlayInferenceTransactionTicket &ticket) const noexcept
+            {
+                for (std::size_t index = 0; index < active_.size(); ++index)
+                    if (active_[index] && active_[index]->ticket == ticket)
+                        return index;
+                return std::nullopt;
             }
             /** @return The same original topology retained by the protocol ring. */
             const MoEOverlayInferenceTopologyIdentity &topology() const noexcept
@@ -760,7 +859,8 @@ namespace llaminar2
             }
             MoEOverlayInferenceTransactionProtocol protocol_;
             MoEOverlayInferenceCommandIdentity command_{};
-            std::optional<MoEOverlayPublishedInferenceTransaction> active_;
+            /** Native publication handles indexed by the sole original protocol ring. */
+            std::vector<std::optional<MoEOverlayPublishedInferenceTransaction>> active_;
             bool failed_ = false;
         };
         class RankLocalInferencePublisher;
@@ -806,7 +906,10 @@ namespace llaminar2
                 const auto &receipt = boundary.runtime->inference_boundary_receipt;
                 if (boundary.graph_submitted)
                 {
-                    if (!native_proven || receipt.completedGeneration() != boundary.generation)
+                    // This same original runtime publishes a completed prefix.
+                    // Later retired generations cannot revoke this record's
+                    // exact native proof or its already completed generation.
+                    if (!native_proven || receipt.completedGeneration() < boundary.generation)
                         throw std::logic_error("Cannot replace an unretired original expert submission");
                 }
                 else if (receipt.submittedGeneration() != boundary.generation - 1u ||

@@ -7793,8 +7793,8 @@ namespace llaminar2
         return migrations;
     }
 
-    std::vector<MoEOverlayTierMigrationCycle> buildMoEOverlayMigrationCycles(
-        std::vector<MoEOverlayTierMigration> &migrations)
+    std::vector<MoEOverlayTierMigrationCycle> decomposeMoEOverlayMigrationCycles(
+        const std::vector<MoEOverlayTierMigration> &migrations)
     {
         if (!analyzeMoEOverlayMigrationCapacity(migrations).capacityPreserved())
             throw std::logic_error("MoE migration requires complete capacity-preserving placement targets");
@@ -7849,6 +7849,17 @@ namespace llaminar2
             }
             if (!cycle.valid(migrations))
                 throw std::logic_error("MoE overlay produced an invalid placement migration cycle");
+            cycles.push_back(std::move(cycle));
+        }
+        return cycles;
+    }
+
+    std::vector<MoEOverlayTierMigrationCycle> buildMoEOverlayMigrationCycles(
+        std::vector<MoEOverlayTierMigration> &migrations)
+    {
+        auto cycles = decomposeMoEOverlayMigrationCycles(migrations);
+        for (const auto &cycle : cycles)
+        {
             bool advances_tier = false;
             bool advances_participant = false;
             for (const size_t index : cycle.migration_indices)
@@ -7862,7 +7873,6 @@ namespace llaminar2
                                  : MoEOptimizationMovementAxis::ParticipantPlacement);
             for (const size_t index : cycle.migration_indices)
                 migrations[index].axis = axis;
-            cycles.push_back(std::move(cycle));
         }
         return cycles;
     }

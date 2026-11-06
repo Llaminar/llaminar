@@ -8,6 +8,9 @@
  */
 #include "integration/parity/ParityRunnerEvidence.h"
 #include "utils/ProductionParityEvidence.h"
+#include "utils/ControllerMovementFixture.h"
+#include "execution/moe/MoEControllerMovementPerfStats.h"
+#include <algorithm>
 #include <gtest/gtest.h>
 #include <array>
 #include <cstdlib>
@@ -182,6 +185,94 @@ namespace llaminar2::test::parity
             }
             resetParityRunnerEvidence(ParityRunnerEvidenceLifetime::FreshRunner);
             EXPECT_EQ(certify(), ProductionParityGraphCertification::MissingHeterogeneousSegmentPlan);
+        }
+    }
+    /**
+     * @test Actual completed publisher requires its registered domain and fresh work.
+     * Recorded registration filters reproduce the omitted-domain failure; the
+     * corrected filters publish the original typed completed-wave evidence.
+     */
+    TEST_F(ParityRunnerEvidenceTest, MovementFactsRequireCompletedNativePublicationAndFreshDomains)
+    {
+        const std::array<const char *, 2> omitted_filters{
+            "forward_graph,mtp,prefix_cache,moe_rebalance,moe_overlay_residency,moe_placement,moe_overlay,immutable_lookup,qsa,kernel.gdn_projection_route,weight_loading.gdn_projection_arithmetic_prepared_weight,weight_loading.moe_router_arithmetic_prepared_weight,kernel.cpu_moe_fp16_operand_router_calls,kernel.cpu_moe_grouped_router_calls,cuda_moe.router_fp16_operands,cuda_moe.router_fp16_owned_operands,cuda_moe.router_fp16_grouped_operands,kernel.rocm_moe_batch_invariant_prefill_router_calls,kernel.rocm_moe_decode_equivalent_runtime_m_router_calls,memory,moe_overlay_capacity,gpu_graph_inventory,kernel.rocm_moe_router_fp16_operand_calls",
+            "forward_graph,mtp,prefix_cache,moe_rebalance,moe_overlay_residency,moe_placement,immutable_lookup,qsa,kernel.gdn_projection_route,weight_loading.gdn_projection_arithmetic_prepared_weight,weight_loading.moe_router_arithmetic_prepared_weight,kernel.cpu_moe_fp16_operand_router_calls,kernel.cpu_moe_grouped_router_calls,cuda_moe.router_fp16_operands,cuda_moe.router_fp16_owned_operands,cuda_moe.router_fp16_grouped_operands,kernel.rocm_moe_batch_invariant_prefill_router_calls,kernel.rocm_moe_decode_equivalent_runtime_m_router_calls,kernel.rocm_moe_router_fp16_operand_calls",
+        };
+        const std::array<const char *, 2> corrected_filters{
+            "forward_graph,mtp,prefix_cache,moe_rebalance,moe_overlay_controller,moe_overlay_residency,moe_placement,moe_overlay,immutable_lookup,qsa,kernel.gdn_projection_route,weight_loading.gdn_projection_arithmetic_prepared_weight,weight_loading.moe_router_arithmetic_prepared_weight,kernel.cpu_moe_fp16_operand_router_calls,kernel.cpu_moe_grouped_router_calls,cuda_moe.router_fp16_operands,cuda_moe.router_fp16_owned_operands,cuda_moe.router_fp16_grouped_operands,kernel.rocm_moe_batch_invariant_prefill_router_calls,kernel.rocm_moe_decode_equivalent_runtime_m_router_calls,memory,moe_overlay_capacity,gpu_graph_inventory,kernel.rocm_moe_router_fp16_operand_calls",
+            "forward_graph,mtp,prefix_cache,moe_rebalance,moe_overlay_controller,moe_overlay_residency,moe_placement,immutable_lookup,qsa,kernel.gdn_projection_route,weight_loading.gdn_projection_arithmetic_prepared_weight,weight_loading.moe_router_arithmetic_prepared_weight,kernel.cpu_moe_fp16_operand_router_calls,kernel.cpu_moe_grouped_router_calls,cuda_moe.router_fp16_operands,cuda_moe.router_fp16_owned_operands,cuda_moe.router_fp16_grouped_operands,kernel.rocm_moe_batch_invariant_prefill_router_calls,kernel.rocm_moe_decode_equivalent_runtime_m_router_calls,kernel.rocm_moe_router_fp16_operand_calls",
+        };
+        const auto completed = controllerMovementFixture(40u, 5u, 2u);
+        const auto publish = [&]
+        {
+            recordMoEControllerCompletedMovement(completed.device_publications.front(),
+                                                 completed.edges, "original-controller");
+        };
+        for (std::size_t family = 0u; family < omitted_filters.size(); ++family)
+        {
+            setenv("LLAMINAR_PERF_STATS_FILTER", omitted_filters[family], 1);
+            resetParityRunnerEvidence(ParityRunnerEvidenceLifetime::FreshRunner);
+            publish();
+            EXPECT_EQ(parityMoEMovementFacts(PerfStatsCollector::snapshot()),
+                      (std::array<float, 4>{}));
+
+            setenv("LLAMINAR_PERF_STATS_FILTER", corrected_filters[family], 1);
+            resetParityRunnerEvidence(ParityRunnerEvidenceLifetime::FreshRunner);
+            publish();
+            auto records = PerfStatsCollector::snapshot();
+            const auto facts = parityMoEMovementFacts(records);
+            EXPECT_EQ(facts, (std::array<float, 4>{1.0f, 3.0f,
+                static_cast<float>(completed.device_publications.front().physical_payload_bytes), 3.0f}));
+            // A proposal/arrival cannot supply a missing completed fact.
+            for (const char *missing : {"dynamic_movement_transactions", "dynamic_physical_bytes",
+                                       "dynamic_movement_commands", "dynamic_migration_edges"})
+            {
+                auto partial = records;
+                std::erase_if(partial, [missing](const auto &record) { return record.name == missing; });
+                const auto incomplete = parityMoEMovementFacts(partial);
+                EXPECT_FALSE(std::all_of(incomplete.begin(), incomplete.end(),
+                                         [](float value) { return value > 0.0f; }));
+            }
+            resetParityRunnerEvidence(ParityRunnerEvidenceLifetime::RetainedRunner);
+            EXPECT_EQ(parityMoEMovementFacts(PerfStatsCollector::snapshot()),
+                      (std::array<float, 4>{}));
+            auto invalid = completed.device_publications.front();
+            invalid.command_count += 1u;
+            EXPECT_THROW(recordMoEControllerCompletedMovement(invalid, completed.edges,
+                                                               "original-controller"), std::invalid_argument);
+            EXPECT_EQ(parityMoEMovementFacts(PerfStatsCollector::snapshot()),
+                      (std::array<float, 4>{}));
+        }
+    }
+
+    /** @test Existing CPU and mapped completion families retain four independent facts. */
+    TEST_F(ParityRunnerEvidenceTest, MovementFactsPreserveCPUAndMappedContracts)
+    {
+        for (const bool cpu : {true, false})
+        {
+            resetParityRunnerEvidence(ParityRunnerEvidenceLifetime::FreshRunner);
+            const auto counter = [](const char *name, double value)
+            {
+                PerfStatsCollector::addCounter("moe_overlay_residency", name, value,
+                                               "maintenance", "original-participant");
+            };
+            counter("committed_expert_migrations", 2.0);
+            if (cpu)
+                counter("cpu_native_copy_bytes", 4096.0);
+            else
+            {
+                counter("device_physical_destinations_staged", 2.0);
+                counter("placement_transfer_payload_bytes_completed", 4096.0);
+            }
+            counter(cpu ? "expert_migration_edges" : "device_physical_epoch_published", 2.0);
+            const auto facts = parityMoEMovementFacts(PerfStatsCollector::snapshot());
+            EXPECT_TRUE(std::all_of(facts.begin(), facts.end(), [](float value) { return value > 0.0f; }));
+            EXPECT_EQ(facts[2], 4096.0f);
+            resetParityRunnerEvidence(ParityRunnerEvidenceLifetime::RetainedRunner);
+            counter("proposed_expert_migrations", 1000.0);
+            counter("prepared_arrival_bytes", 8192.0);
+            EXPECT_EQ(parityMoEMovementFacts(PerfStatsCollector::snapshot()),
+                      (std::array<float, 4>{}));
         }
     }
 }

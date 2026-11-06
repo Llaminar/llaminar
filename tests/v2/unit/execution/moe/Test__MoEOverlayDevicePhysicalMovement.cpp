@@ -10,12 +10,15 @@
 
 #include "execution/moe/MoEOverlayDeviceControllerKernels.h"
 #include "execution/moe/MoEOverlayDevicePhysicalMovement.h"
+#include "execution/moe/MoEOverlayCycleSearch.h"
+#include "execution/moe/MoEOverlayPhysicalLaneDemand.h"
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <tuple>
 #include <vector>
 
 namespace llaminar2::test
@@ -173,7 +176,10 @@ namespace llaminar2::test
                 return group->tier_priority;
             };
             std::uint64_t bytes = 0u;
-            std::vector<std::uint8_t> changed_layers(3u, 0u);
+            std::uint32_t layer_count = 3u;
+            for (const auto &entry : entries)
+                layer_count = std::max(layer_count, entry.layer + 1u);
+            std::vector<std::uint8_t> changed_layers(layer_count, 0u);
             std::uint32_t promotions = 0u;
             std::uint32_t demotions = 0u;
             std::uint32_t same_priority_moves = 0u;
@@ -263,7 +269,7 @@ namespace llaminar2::test
             }
             result.entries = std::move(entries);
             result.participant_count = 4u;
-            result.num_layers = 3u;
+            result.num_layers = layer_count;
             result.num_experts = 16u;
             return result;
         }
@@ -285,7 +291,8 @@ namespace llaminar2::test
                 .expert = expert,
                 .source_participant = source,
                 .destination_participant = destination,
-                .flags = static_cast<std::uint32_t>(axis),
+                .flags = moeOverlayMovementFlags(axis,
+                    op == MoEOverlayDeviceMovementOp::DurableMove ? 1u : 0u),
                 .payload_bytes = bytes,
             };
         }
@@ -516,6 +523,168 @@ namespace llaminar2::test
         EXPECT_TRUE(physical.migrations[0].destination.device.is_cuda());
         EXPECT_EQ(physical.migrations[0].source.owner_world_rank, 0);
         EXPECT_EQ(physical.migrations[0].destination.owner_world_rank, 1);
+    }
+
+    /** @test Invalid objective/cycle inputs cannot alias an admitted wire identity. */
+    TEST(Test__MoEOverlayDevicePhysicalMovement, MovementFlagsRejectInvalidIdentity)
+    {
+        constexpr auto maximum_cycle = UINT32_MAX >> 2u;
+        for (const auto raw_axis : {0u, 4u, 5u, UINT32_MAX})
+            for (const auto cycle : {0u, 1u, maximum_cycle})
+            {
+                const auto flags = moeOverlayMovementFlags(
+                    static_cast<MoEOverlayDeviceMovementAxis>(raw_axis), cycle);
+                EXPECT_EQ(flags, 0u);
+                EXPECT_EQ(moeOverlayMovementCycle(flags), 0u);
+                EXPECT_EQ(static_cast<std::uint32_t>(moeOverlayMovementAxis(flags)), 0u);
+            }
+        for (const auto axis : {MoEOverlayDeviceMovementAxis::TierResidency,
+                                MoEOverlayDeviceMovementAxis::ParticipantPlacement,
+                                MoEOverlayDeviceMovementAxis::Combined})
+        {
+            for (const auto cycle : {0u, 1u, maximum_cycle})
+            {
+                const auto flags = moeOverlayMovementFlags(axis, cycle);
+                EXPECT_EQ(moeOverlayMovementAxis(flags), axis);
+                EXPECT_EQ(moeOverlayMovementCycle(flags), cycle);
+            }
+            for (const auto overflow : {maximum_cycle + 1u, UINT32_MAX})
+                EXPECT_EQ(moeOverlayMovementFlags(axis, overflow), 0u);
+        }
+    }
+
+    /**
+     * @test Original production cycle search survives canonical destination sort.
+     * Two opposite authored triangles must consume two lanes, not the three
+     * swaps found by regrouping; three later layers prove the default 5/6 case.
+     */
+    TEST(Test__MoEOverlayDevicePhysicalMovement,
+         AuthoredCycleIdentityRetainsOriginalLaneBound)
+    {
+        for (const std::uint32_t admitted : {2u, 5u})
+        {
+            std::array<std::int32_t, 6> current{0, 1, 0, 2, 1, 2};
+            const std::array<std::int32_t, 6> desired{1, 2, 2, 1, 0, 0};
+            std::array<std::uint8_t, 6> excluded{};
+            std::array<std::uint8_t, 4> visited{};
+            std::array<std::uint32_t, 5> sources{}, next{}, cycle{};
+            std::vector<MoEOverlayDeviceMovementCommand> entries;
+            std::uint32_t authored = 0u;
+            for (;;)
+            {
+                const auto found = findMoEOverlayPlacementCycle(
+                    current.data(), desired.data(), excluded.data(), 4u, 6u,
+                    visited.data(), sources.data(), next.data(), cycle.data());
+                if (found.length == 0u)
+                    break;
+                ++authored;
+                for (std::uint32_t index = 0u; index < found.length; ++index)
+                {
+                    const auto expert = cycle[index];
+                    auto entry = move(MoEOverlayDeviceMovementOp::DurableMove,
+                                      0u, expert, current[expert], desired[expert]);
+                    entry.flags = moeOverlayMovementFlags(
+                        MoEOverlayDeviceMovementAxis::TierResidency, authored);
+                    entries.push_back(entry);
+                    current[expert] = desired[expert];
+                }
+            }
+            ASSERT_EQ(authored, 2u);
+            for (std::uint32_t id = 3u; id <= admitted; ++id)
+                for (std::uint32_t source : {0u, 1u})
+                {
+                    auto entry = move(MoEOverlayDeviceMovementOp::DurableMove,
+                                      id - 2u, source, source, 1u - source);
+                    entry.flags = moeOverlayMovementFlags(
+                        MoEOverlayDeviceMovementAxis::TierResidency, id);
+                    entries.push_back(entry);
+                }
+            std::sort(entries.begin(), entries.end(), [](const auto &a, const auto &b)
+            {
+                return std::tie(a.destination_participant, a.layer, a.expert) <
+                       std::tie(b.destination_participant, b.layer, b.expert);
+            });
+            auto command = commandBatch(
+                MoEOverlayDeviceControllerTransactionKind::DynamicPlacement, 7u, entries);
+            command.header.accepted_cycles = admitted;
+            ASSERT_TRUE(command.valid());
+            const auto physical = makeMoEOverlayDevicePhysicalMovementBatch(command, topology());
+            ASSERT_EQ(physical.migration_cycles.size(), admitted);
+            EXPECT_NO_THROW(requireSimpleMoEOverlayPhysicalCycles(
+                physical.migrations, physical.migration_cycles));
+            // This calls the genuine alternate host planner; it demonstrates
+            // why re-planning authenticated device groups changes lane demand.
+            EXPECT_EQ(decomposeMoEOverlayMigrationCycles(physical.migrations).size(), admitted + 1u);
+            for (const auto malformed : {0u, admitted + 1u, 1u})
+            {
+                auto bad = command;
+                bad.entries.front().flags = moeOverlayMovementFlags(
+                    MoEOverlayDeviceMovementAxis::TierResidency, malformed);
+                bad.header.command_digest = commandDigest(bad.entries);
+                if (malformed == 1u &&
+                    moeOverlayMovementCycle(command.entries.front().flags) == 1u)
+                    bad.entries.back().flags = moeOverlayMovementFlags(
+                        MoEOverlayDeviceMovementAxis::TierResidency, 1u);
+                bad.header.command_digest = commandDigest(bad.entries);
+                EXPECT_THROW(makeMoEOverlayDevicePhysicalMovementBatch(bad, topology()),
+                             std::invalid_argument);
+            }
+        }
+    }
+
+    /** @test Immutable device commands preserve distinct simple cycles sharing a target. */
+    TEST(Test__MoEOverlayDevicePhysicalMovement,
+         DurableCommandsRetainSimpleCyclesAcrossSharedTargets)
+    {
+        for (const auto kind : {
+                 MoEOverlayDeviceControllerTransactionKind::DynamicPlacement,
+                 MoEOverlayDeviceControllerTransactionKind::PreparedContextRestore})
+        {
+            for (const int first_layer : {0, 31})
+            {
+                auto command = commandBatch(kind, 7u, {
+                    move(MoEOverlayDeviceMovementOp::DurableMove, 1, 0, 2, 0),
+                    move(MoEOverlayDeviceMovementOp::DurableMove, 1, 1, 3, 0),
+                    move(MoEOverlayDeviceMovementOp::DurableMove, 1, 2, 0, 2),
+                    move(MoEOverlayDeviceMovementOp::DurableMove, 1, 3, 0, 3),
+                });
+                command.first_model_layer = first_layer;
+                command.entries[1].flags = moeOverlayMovementFlags(
+                    moeOverlayMovementAxis(command.entries[1].flags), 2u);
+                command.entries[3].flags = moeOverlayMovementFlags(
+                    moeOverlayMovementAxis(command.entries[3].flags), 2u);
+                command.header.command_digest = commandDigest(command.entries);
+                command.header.accepted_cycles = 2u;
+                ASSERT_TRUE(command.valid());
+                const auto physical = makeMoEOverlayDevicePhysicalMovementBatch(command, topology());
+                ASSERT_TRUE(physical.valid());
+
+                // Both swaps use target 0, but each original admitted cycle
+                // visits it only once. Joining them into an Euler circuit
+                // invents a repeated-target cycle outside the lane-plan bound.
+                EXPECT_NO_THROW(requireSimpleMoEOverlayPhysicalCycles(
+                    physical.migrations, physical.migration_cycles));
+                ASSERT_EQ(physical.migration_cycles.size(), 2u);
+                EXPECT_EQ(physical.migration_cycles[0].migration_indices,
+                          (std::vector<std::size_t>{0u, 2u}));
+                EXPECT_EQ(physical.migration_cycles[1].migration_indices,
+                          (std::vector<std::size_t>{1u, 3u}));
+                for (const auto &cycle : physical.migration_cycles)
+                    EXPECT_EQ(cycle.layer_idx, first_layer + 1);
+
+                EXPECT_EQ(physical.command_digest, command.header.command_digest);
+                EXPECT_EQ(physical.packed_weight_bytes, 4u * 4096u);
+                ASSERT_EQ(physical.migrations.size(), command.entries.size());
+                for (std::size_t index = 0; index < physical.migrations.size(); ++index)
+                {
+                    const auto &edge = physical.migrations[index];
+                    EXPECT_EQ(edge.expert_id, command.entries[index].expert);
+                    EXPECT_EQ(edge.source.owner_participant, command.entries[index].source_participant);
+                    EXPECT_EQ(edge.destination.owner_participant, command.entries[index].destination_participant);
+                    EXPECT_EQ(edge.axis, MoEOptimizationMovementAxis::TierResidency);
+                }
+            }
+        }
     }
 
     TEST(Test__MoEOverlayDevicePhysicalMovement,

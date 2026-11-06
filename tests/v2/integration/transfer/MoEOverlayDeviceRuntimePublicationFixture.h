@@ -12,6 +12,7 @@
 #pragma once
 
 #include "backends/IBackend.h"
+#include "../../utils/DeviceEpochArenaTestMemory.h"
 #include "execution/moe/DeviceMoEOverlayEpochArena.h"
 #include "execution/moe/DeviceMoERebalancePolicyShared.h"
 #include "execution/moe/MoEOverlayDeviceControllerKernels.h"
@@ -118,7 +119,7 @@ namespace llaminar2::test
                 transfer_stream_ = backend_->createStream(ordinal);
                 transfer_event_ = backend_->createEvent(ordinal);
                 epoch_arena_ = std::make_shared<DeviceMoEOverlayEpochArena>(
-                    DeviceMoEOverlayEpochArena::Config{
+                    llaminar2::test::admitEpochArenaForTest(DeviceMoEOverlayEpochArena::Config{
                         .device_id = participant.device,
                         .initial_epoch = input.base_epoch,
                         .initial_bank = 0u,
@@ -129,7 +130,7 @@ namespace llaminar2::test
                         .external_admission_epoch = external_admission_epoch,
                         .external_admission_lifetime =
                             std::move(external_admission_lifetime),
-                    });
+                    }));
                 if (!dummy_payload_ || !dummy_scales_ || !runtime_layers_ ||
                     !prepared_arrivals_ || !apply_status_ ||
                     !arrival_staging_ || !transfer_stream_ ||

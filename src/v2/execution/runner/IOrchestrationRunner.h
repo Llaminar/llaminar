@@ -1295,6 +1295,14 @@ namespace llaminar2
          */
         virtual void setMPICoordinatedMode(bool /*enabled*/) {}
         /**
+         * @brief Run a finite comparison under the original rank-local device parent.
+         * @param body Actual public requests/resets, not a replacement execution path.
+         * No device-selected epoch is returned or mirrored to host memory.
+         */
+        virtual void withMoEOverlayDevicePlacementScope(const std::function<void()> &body)
+        { (void)body; throw std::logic_error("This original runner has no device-owned finite placement scope"); }
+
+        /**
          * @brief Run finite complete requests under the original host placement owner.
          * @param body Synchronous original requests, including public request resets.
          * @return Original retained parent and completed descendant sequence IDs.

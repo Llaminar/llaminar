@@ -17,6 +17,7 @@
  */
 
 #include "MoEOverlayDeviceControllerGraphService.h"
+#include "MoEOverlayRuntimeReaderDeadline.h"
 #include "MoEOverlayWorkerDrainProtocol.h"
 #include "MoEOverlayControllerPerfStats.h"
 #include "MoEControllerMovementPerfStats.h"
@@ -1001,6 +1002,13 @@ namespace llaminar2
         {
             if (dynamic_worker_)
             {
+                // Cold capture only: the ordinary serving family is sealed,
+                // and no background submitter or child may race native capture.
+                if(config_.mpi_ctx->world_size()==1)
+                    for(const auto &endpoint:endpoints_)
+                        if(!endpoint || !endpoint->runtime_binding.inference_boundary ||
+                           !endpoint->runtime_binding.inference_boundary->prepareMoEOverlayFinitePlacementGraphs())
+                            throw std::logic_error("Device finite placement lacks an original cold inference-owner graph");
                 dynamic_worker_->thread = std::jthread(
                     [worker = dynamic_worker_.get()](std::stop_token token)
                     {
@@ -1044,6 +1052,24 @@ namespace llaminar2
                 std::memory_order_release);
             throw;
         }
+    }
+
+    void MoEOverlayDeviceControllerGraphService::runFinitePlacementBoundary(
+        DeviceMoEOverlayEpochParentAction action)
+    {
+        if(config_.execution_mode!=ExecutionMode::Dynamic || !config_.mpi_ctx ||
+           config_.mpi_ctx->world_size()!=1 || endpoints_.empty() ||
+           state()!=MoEOverlayDeviceControllerActivationState::Running || !healthy())
+            throw std::logic_error("Device finite placement requires its running rank-local original authority");
+        if(action!=DeviceMoEOverlayEpochParentAction::Arm &&
+           action!=DeviceMoEOverlayEpochParentAction::Close)
+            throw std::invalid_argument("Device finite placement received an invalid boundary");
+        // No service/worker mutex is held here. In particular a background
+        // reader-retirement wait must not own the queue which submits End.
+        for(const auto &endpoint:endpoints_)
+            if(!endpoint || !endpoint->runtime_binding.inference_boundary ||
+               !endpoint->runtime_binding.inference_boundary->runMoEOverlayFinitePlacementBoundary(action))
+                throw std::logic_error("Device finite placement original owner did not complete its captured boundary");
     }
 
     MoEOverlayDeviceControllerActivationState
@@ -4606,17 +4632,37 @@ namespace llaminar2
                     : "device runtime-retirement readiness epoch did not terminate");
         }
 
-        if (!wait_protocol(
-                [&]
-                {
-                    return std::all_of(
-                        protocols.begin(), protocols.end(),
-                        [&](const auto &protocol)
-                        {
-                            return protocol->runtimeReadersReady(command);
-                        });
-                },
-                "device controller timed out awaiting the topology-wide reader receipt"))
+        // One original binding exposes the complete authenticated topology.
+        // Only terminal progress from that SAME peer may extend its deadline.
+        // This host wait holds no inference worker or callback mutex; bounded
+        // native readiness kernels have already returned, so child/End graphs
+        // remain independently runnable on their original owner streams.
+        std::vector<MoEOverlayRuntimeReaderObservation> reader_observations(
+            protocols.front()->runtimeReaderObservationCount());
+        MoEOverlayRuntimeReaderDeadline reader_deadlines(
+            reader_observations.size(),std::chrono::steady_clock::now());
+        const auto wait_readers=[&]() {
+            using Result=MoEOverlayRuntimeReaderDeadline::Result;
+            for(;;) {
+                if(!protocols.front()->observeRuntimeReaders(command,reader_observations)) {
+                    if(error)*error="device retirement received a foreign, missing or failed original participant";
+                    return false;
+                }
+                const auto observation=reader_deadlines.observe(
+                    reader_observations,std::chrono::steady_clock::now());
+                if(observation==Result::Ready)
+                    return std::all_of(protocols.begin(),protocols.end(),
+                        [&](const auto &protocol){return protocol->runtimeReadersReady(command);});
+                if(observation==Result::Invalid || observation==Result::Expired) {
+                    if(error)*error=observation==Result::Expired
+                        ? "device controller timed out awaiting original reader progress"
+                        : "device retirement finite-parent receipt regressed";
+                    return false;
+                }
+                pollPause();
+            }
+        };
+        if (!wait_readers())
         {
             return unwind(error && !error->empty()
                               ? *error

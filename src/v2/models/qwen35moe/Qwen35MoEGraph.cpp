@@ -25,6 +25,7 @@
 #include "execution/moe/MoEGraphOwnerProjection.h"
 #include "execution/moe/MoECPUExpertWorkspaceSource.h"
 #include "planning/ModelMemoryProfile.h"
+#include "planning/PhysicalMemoryAuthority.h"
 #include "execution/moe/MoEExpertOverlayPreparationPlan.h"
 #include "execution/moe/MoEExpertOverlayGraphScope.h"
 #include "execution/moe/MoEProjectionRuntimeBinding.h"
@@ -4520,6 +4521,24 @@ namespace llaminar2
 #endif
     }
 
+    DeviceMoEOverlayEpochArena::Config
+    Qwen35MoEGraph::moeOverlayEpochArenaConfig(DeviceId device) const
+    {
+        const auto manager = model_ctx_ ? model_ctx_->concreteWeightManager() : nullptr;
+        const auto memory = manager ? manager->physicalMemoryAuthority() : nullptr;
+        if (!memory || !memory->contains(device))
+            throw std::logic_error("Qwen MoE epoch storage requires its original admitted model authority for " + device.to_string());
+        if (prepared_weight_store_ && prepared_weight_store_->physicalMemoryAuthority() != memory)
+            throw std::logic_error("Qwen MoE epoch storage rejects a prepared store with a different original model authority");
+        DeviceMoEOverlayEpochArena::Config result;
+        result.device_id = device;
+        result.memory_authority = memory;
+        result.initial_epoch = 1u;
+        result.initial_bank = 1u;
+        result.request_slot_capacity = 1u;
+        return result;
+    }
+
     DeviceMoEOverlayEpochExecutionBinding
     Qwen35MoEGraph::deviceMoEOverlayEpochExecutionBinding(DeviceId device)
     {
@@ -4572,6 +4591,9 @@ namespace llaminar2
             }
         }
 
+        // Model/PMA admission precedes arena initialization. Prepared weight
+        // handles arrive later and cannot be the source of this cold ownership.
+        auto arena_config = moeOverlayEpochArenaConfig(device);
         const std::string key = device.to_string();
         auto existing = moe_overlay_epoch_arenas_.find(key);
         if (existing != moe_overlay_epoch_arenas_.end())
@@ -4598,11 +4620,6 @@ namespace llaminar2
          * initial bank makes a subsequently acquired ticket valid for every
          * main and MTP layer without a setup-only host shadow.
          */
-        DeviceMoEOverlayEpochArena::Config arena_config;
-        arena_config.device_id = device;
-        arena_config.initial_epoch = 1u;
-        arena_config.initial_bank = 1u;
-        arena_config.request_slot_capacity = 1u;
         if (config_.moe.device_controller_fabric)
         {
             const auto &participant =

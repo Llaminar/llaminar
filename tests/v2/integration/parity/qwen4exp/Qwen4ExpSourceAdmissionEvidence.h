@@ -448,6 +448,8 @@ inline void requireQwen4ExpHostLookupStaging(
  * @brief Reject the formerly unclaimed CPU storage categories after real setup.
  * @param rows Coherent rank-local attestation from the existing model authority.
  * @param placement Original frozen routed placement, when this rank uses an overlay.
+ * @param lookup_owners Original resolved immutable-table allocator inventory; it
+ *        authenticates source-only CPU ownership, never compute or weight ownership.
  * @throws std::logic_error If a CPU compute allocation category has no live claim.
  *
  * This is a materialization canary, not equality to a maximum admission budget.
@@ -461,7 +463,8 @@ inline void requireQwen4ExpHostLookupStaging(
  */
 inline void requireQwen4ExpCPUStorageMaterialization(
     std::span<const PhysicalMemoryOwnerAttestation> rows,
-    const std::shared_ptr<const MoERoutedExpertPlacementPlan>& placement = {})
+    const std::shared_ptr<const MoERoutedExpertPlacementPlan>& placement = {},
+    ImmutableRowAllocatorInventory lookup_owners = ImmutableRowAllocatorInventory{std::span<const PhysicalMemoryAllocatorIdentity>{}})
 {
     std::vector<DeviceId> unused_cpu_compute;
     if (placement && placement->usesExpertOverlayAuthority() && !rows.empty())
@@ -476,6 +479,15 @@ inline void requireQwen4ExpCPUStorageMaterialization(
         for (const auto device : execution.currentRankPlan().local_devices)
             if (device.is_cpu() && std::find(admitted.begin(), admitted.end(), device) == admitted.end())
                 unused_cpu_compute.push_back(device);
+        // A RAM/SSD ngram source may own conservative host setup capacity while
+        // every actual compute participant is a GPU. Authenticate its original
+        // allocator instead of treating any foreign CPU row as unused compute.
+        for (const auto& allocator : lookup_owners)
+            if (allocator.world_rank == rank && allocator.device.is_cpu() &&
+                std::find(execution.currentRankPlan().local_devices.begin(),
+                    execution.currentRankPlan().local_devices.end(), allocator.device) ==
+                    execution.currentRankPlan().local_devices.end())
+                unused_cpu_compute.push_back(allocator.device);
     }
     const auto planned = [](const auto &row) {
         return row.planned_new_bytes != 0 || row.planned_resident_bytes != 0;

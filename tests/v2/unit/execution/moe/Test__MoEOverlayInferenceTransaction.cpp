@@ -17,10 +17,13 @@
 #include "execution/moe/MoEOverlayParticipantResidency.h"
 #include "execution/mpi_orchestration/DeviceInventory.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
+#include "execution/local_execution/graph/DeviceGraphCaptureController.h"
 #include "execution/moe/MoEOverlayNodeLocalRankBatchTransport.h"
 #include "utils/PerfStatsCollector.h"
 
 #include <gtest/gtest.h>
+#include <sys/resource.h>
+#include <cstdio>
 
 #include <array>
 #include <atomic>
@@ -37,6 +40,20 @@ namespace llaminar2::test
     {
         /** @brief Observe the actual private callable publisher protocol, never construct a native-ready runner. */
         using PublicationState = MoEOverlayParticipantGraphRunner::RankLocalPublicationState;
+        /** @brief Exercise actual original source cancellation publication; no native/source owner is constructed. */
+        static void cancelSource(const std::function<void()> &cancel, std::mutex &mutex, std::exception_ptr &failure)
+        {
+            MoEOverlayParticipantGraphRunner::cancelOriginalPooledSource(cancel, mutex, failure);
+        }
+        /** @brief Observe the actual sticky source/native drain boundary with recorded native-terminal state. */
+        template <class Drain>
+        static bool drainCancellation(bool native_joined, std::mutex &mutex, const std::exception_ptr &failure,
+            Drain drain, std::string *error)
+        {
+            return MoEOverlayParticipantGraphRunner::drainOriginalSubmissionCancellation(
+                native_joined, mutex, failure, std::move(drain), error);
+        }
+
         template <class Enqueues, class Boundaries>
         static void requireRetired(const Enqueues &enqueues, const Boundaries &boundaries, bool native_proven)
         {
@@ -154,9 +171,10 @@ namespace llaminar2::test
             : public IMoEOverlayInferenceTransactionPublisher
         {
         public:
-            explicit RecordingPublisher(int target_rank)
+            explicit RecordingPublisher(int target_rank, int source_rank = 0)
                 : topology_(topology(target_rank))
             {
+                topology_.source_world_rank = source_rank;
             }
 
             bool beginCommand(
@@ -178,6 +196,12 @@ namespace llaminar2::test
                 override
             {
                 MoEOverlayPublishedInferenceTransaction result;
+                if (reject_next_publish_)
+                {
+                    reject_next_publish_ = false;
+                    result.error = "injected original publisher rejection";
+                    return result;
+                }
                 if (!active_)
                 {
                     result.error = "recording publisher is inactive";
@@ -257,6 +281,8 @@ namespace llaminar2::test
                 return topology_;
             }
 
+            /** @brief Reject the next original publisher call to exercise coordinator first-error ownership. */
+            void rejectNextPublish() noexcept { reject_next_publish_ = true; }
             std::size_t publishCount() const noexcept { return publish_count_; }
             std::size_t retireCount() const noexcept { return retire_count_; }
             std::size_t completeCount() const noexcept { return complete_count_; }
@@ -276,6 +302,7 @@ namespace llaminar2::test
             MoEOverlayInferenceTopologyIdentity topology_;
             MoEOverlayInferenceCommandIdentity command_{};
             bool active_ = false;
+            bool reject_next_publish_ = false;
             std::uint64_t next_ordinal_ = 1;
             std::size_t publish_count_ = 0;
             std::size_t retire_count_ = 0;
@@ -631,10 +658,17 @@ namespace llaminar2::test
         EXPECT_FALSE(admitted.hasHostBoundary())
             << "GPU-only heterogeneous publication does not invent a CPU service";
         EXPECT_TRUE(admitted.requiresRankLocalInferencePublisher());
-        EXPECT_EQ(admitted.captureEnvelope(true),
-                  GraphNativeCaptureEnvelope::HeterogeneousTicketAuthorityTransaction);
-        EXPECT_EQ(admitted.captureEnvelope(false),
-                  GraphNativeCaptureEnvelope::HeterogeneousTicketFollowerTransaction);
+        for (const bool authority : {false, true}) {
+            const auto envelope = admitted.captureEnvelope(authority);
+            EXPECT_EQ(envelope, GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction);
+            DeviceGraphExecutor::DecodeCapturePolicy policy;
+            policy.allow_cached_graph_replay = true;
+            policy.heterogeneous_segmented_enabled = true;
+            policy.graph_replay_plan_policy = DeviceGraphExecutor::GraphReplayPlanPolicy::AllowHeterogeneousBoundarySegmentation;
+            ASSERT_TRUE(DeviceGraphCaptureController::constrainReplayPolicyToNativeEnvelope(envelope, policy));
+            EXPECT_EQ(policy.graph_replay_plan_policy, DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph);
+            EXPECT_TRUE(policy.defer_final_sync);
+        }
 
         auto cpu_positive = placement;
         cpu_positive.placements[1].routed_expert_tier = {0, 0, 1, 2};
@@ -912,6 +946,54 @@ namespace llaminar2::test
             << "Two segment roles may never alias one MPI rank";
     }
 
+    /** @test Actual root admission supports local endpoints and nonzero distributed roots without MPI fiction. */
+    TEST(Test__MoEOverlayInferenceTransaction, RootCommandAdmissionUsesOriginalPlanAndGeneration)
+    {
+        for (const int root : {0, 3}) {
+            const int follower = root == 0 ? 0 : 4;
+            auto publisher = std::make_shared<RecordingPublisher>(follower, root);
+            auto plan = MoEOverlayInferenceCoordinatorGraphPlan::sealAfterSynchronizedMaterialization(71, {
+                {.role=MoEOverlayInferenceCoordinatorSegmentRole::Continuation,
+                 .materialization=MoEOverlayInferenceSegmentMaterializationKind::NativeDeviceExecutable,
+                 .world_rank=root,.local_participant_count=1},
+                {.role=MoEOverlayInferenceCoordinatorSegmentRole::ExpertFollower,
+                 .materialization=MoEOverlayInferenceSegmentMaterializationKind::NativeDeviceExecutable,
+                 .world_rank=follower,.local_participant_count=1}});
+            MoEOverlayInferenceTransactionCoordinator coordinator({
+                .publishers={publisher},.graph_plan=std::move(plan),
+                .continuation_participant_count=1,.ticket_authority_participant_index=0,
+                .participant_completion_boundaries={MoEOverlayInferenceCompletionBoundaryKind::HostSynchronous},
+                .max_transactions_per_command=2,.max_mtp_draft_depth=0});
+            std::string error;
+            EXPECT_FALSE(coordinator.beginRootCommand(root+1,command(),&error));
+            EXPECT_EQ(coordinator.state(),MoEOverlayInferenceProtocolState::Idle);
+            EXPECT_FALSE(coordinator.beginRootCommand(root,command(0,1,41),&error));
+            EXPECT_FALSE(coordinator.beginRootCommand(root,command(9,0,41),&error));
+            EXPECT_FALSE(coordinator.beginRootCommand(root,command(9,1,0),&error));
+            std::uint64_t id=1;
+            // Prefill, ordinary decode and teacher-forced decode all use the
+            // same original command boundary, followed by actual graph retirement.
+            for (const auto role : {MoEOverlayInferenceGraphRole::MainPrefill,
+                                    MoEOverlayInferenceGraphRole::MainDecode,
+                                    MoEOverlayInferenceGraphRole::MainDecode}) {
+                ASSERT_TRUE(coordinator.beginRootCommand(root,command(9,id,41),&error)) << error;
+                ASSERT_TRUE(coordinator.beginGraphSequence(0,&error)) << error;
+                const auto binding=coordinator.beginParticipantGraph({.graph_role=role,
+                    .placement_epoch=41,.request_count=1,.logical_rows_per_request=1,
+                    .physical_rows_per_request=1},0);
+                ASSERT_TRUE(binding.ok) << binding.error;
+                ASSERT_TRUE(coordinator.armParticipantGraph(binding,&error)) << error;
+                ASSERT_TRUE(coordinator.finishParticipantGraph(binding,true,&error)) << error;
+                ASSERT_TRUE(coordinator.completeCommand(41,&error)) << error;
+                EXPECT_FALSE(coordinator.beginRootCommand(root,command(9,id,41),&error));
+                EXPECT_FALSE(coordinator.beginRootCommand(root,command(8,id+1,41),&error));
+                ++id;
+            }
+            ASSERT_TRUE(coordinator.beginRootCommand(root,command(10,1,41),&error)) << error;
+            ASSERT_TRUE(coordinator.completeCommand(41,&error)) << error;
+        }
+    }
+
     TEST(Test__MoEOverlayInferenceTransaction,
          CoordinatorGraphPlanMirrorsSetupAndExactSparseReturnRetirement)
     {
@@ -1094,7 +1176,7 @@ namespace llaminar2::test
                     .max_transactions_per_command = 4,
                     .max_mtp_draft_depth = 3,
                 });
-        ASSERT_TRUE(coordinator->beginCommand(command()));
+        ASSERT_TRUE(coordinator->beginRootCommand(0, command()));
         ASSERT_TRUE(coordinator->beginGraphSequence(2));
 
         const MoEOverlayInferenceExecutionDescriptor sidecar{
@@ -3284,6 +3366,87 @@ namespace llaminar2::test
             EXPECT_FALSE(coordinator->beginHostedContinuationGraphSequence(transition, &error));
             EXPECT_FALSE(error.empty());
         }
+    }
+
+    /** @test Failed terminal publication is fatal before a worker can return without native closure. */
+    TEST(Test__MoEOverlayInferenceTransaction, MissingOriginalGraphFailureTerminalIsProcessFatal)
+    {
+        EXPECT_DEATH(([] {
+            // Only this re-executed death child changes core policy. Its parent
+            // and production native processes retain their original limits.
+            const rlimit no_core{0, 0};
+            if (setrlimit(RLIMIT_CORE, &no_core) != 0) {
+                std::fprintf(stderr, "Death-test child could not disable core dumps\n");
+                std::_Exit(94);
+            }
+            auto publisher = std::make_shared<RecordingPublisher>(1);
+            auto coordinator = std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
+                MoEOverlayInferenceTransactionCoordinator::Config{
+                    .publishers = {publisher},
+                    .graph_plan = coordinatorGraphPlan(1),
+                    .continuation_participant_count = 1,
+                    .ticket_authority_participant_index = 0,
+                    .participant_completion_boundaries = {
+                        MoEOverlayInferenceCompletionBoundaryKind::HostSynchronous},
+                    .max_transactions_per_command = 2,
+                    .max_mtp_draft_depth = 3});
+            if (!coordinator->beginCommand(command()) || !coordinator->beginGraphSequence(0))
+                std::_Exit(91);
+            const MoEOverlayInferenceExecutionDescriptor decode{
+                .graph_role = MoEOverlayInferenceGraphRole::MainDecode,
+                .placement_epoch = 41, .request_count = 1,
+                .logical_rows_per_request = 1, .physical_rows_per_request = 1};
+            {
+                MoEOverlayInferenceParticipantGraphScope scope(coordinator, decode, 0);
+                if (!scope.ready() || !scope.active()) std::_Exit(92);
+                publisher->rejectNextPublish();
+                std::string error;
+                if (scope.armForHostExecution(&error) ||
+                    error != "injected original publisher rejection") std::_Exit(93);
+                // The actual coordinator has preserved its first error and
+                // cannot authenticate this scope's terminal after that failure.
+                // Only the actual scope destructor supplies the fatal boundary.
+            }
+            // Old log-only scope destruction reaches success immediately. No
+            // later coordinator/fixture destructor can satisfy this death test.
+            std::_Exit(0);
+        }()), "participant graph scope could not publish its failed terminal: injected original publisher rejection");
+    }
+
+    /** @test Proven original failed terminals retain ordinary cancellation both before and after arm. */
+    TEST(Test__MoEOverlayInferenceTransaction, OriginalGraphFailureTerminalRemainsRecoverable)
+    {
+        for (int repeat = 0; repeat < 20; ++repeat)
+            for (const bool arm : {false, true}) {
+                auto publisher = std::make_shared<RecordingPublisher>(1);
+                auto coordinator = std::make_shared<MoEOverlayInferenceTransactionCoordinator>(
+                    MoEOverlayInferenceTransactionCoordinator::Config{
+                        .publishers = {publisher},
+                        .graph_plan = coordinatorGraphPlan(1),
+                        .continuation_participant_count = 1,
+                        .ticket_authority_participant_index = 0,
+                        .participant_completion_boundaries = {
+                            MoEOverlayInferenceCompletionBoundaryKind::HostSynchronous},
+                        .max_transactions_per_command = 1,
+                        .max_mtp_draft_depth = 3});
+                ASSERT_TRUE(coordinator->beginCommand(command()));
+                ASSERT_TRUE(coordinator->beginGraphSequence(0));
+                const MoEOverlayInferenceExecutionDescriptor decode{
+                    .graph_role = MoEOverlayInferenceGraphRole::MainDecode,
+                    .placement_epoch = 41, .request_count = 1,
+                    .logical_rows_per_request = 1, .physical_rows_per_request = 1};
+                {
+                    MoEOverlayInferenceParticipantGraphScope scope(coordinator, decode, 0);
+                    ASSERT_TRUE(scope.ready());
+                    ASSERT_TRUE(scope.active());
+                    if (arm) ASSERT_TRUE(scope.armForHostExecution());
+                    // Intentionally abandon the actual scope. Its original
+                    // failed terminal is accepted, so no process exit occurs.
+                }
+                EXPECT_EQ(publisher->publishCount(), arm ? 1u : 0u);
+                ASSERT_TRUE(coordinator->abortCommand(41, 17));
+                EXPECT_EQ(publisher->abortCount(), 1u);
+            }
     }
 
 } // namespace llaminar2::test

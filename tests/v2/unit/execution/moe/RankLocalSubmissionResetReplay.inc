@@ -61,6 +61,54 @@ namespace llaminar2::test
         ASSERT_TRUE(runtime.inference_boundary_receipt.completeSubmission(1u));
         EXPECT_NO_THROW(MoEOverlayParticipantNativeRetirementReplayAccess::requireRetired(
             enqueues, boundaries, true));
+        // Each successful native/event receipt advances the SAME runtime's
+        // monotonic prefix. Reusing an older original host slot is safe even
+        // after newer receipts complete, while its own native proof is mandatory.
+        for (std::uint64_t generation = 2; generation <= 8; ++generation)
+        {
+            ASSERT_EQ(runtime.inference_boundary_receipt.beginSubmission(), generation);
+            EXPECT_NO_THROW(MoEOverlayParticipantNativeRetirementReplayAccess::requireRetired(
+                enqueues, boundaries, true)) << "Newer pending work does not revoke an older exact receipt";
+            EXPECT_THROW(MoEOverlayParticipantNativeRetirementReplayAccess::requireRetired(
+                enqueues, boundaries, false), std::logic_error);
+            ASSERT_TRUE(runtime.inference_boundary_receipt.completeSubmission(generation));
+            EXPECT_NO_THROW(MoEOverlayParticipantNativeRetirementReplayAccess::requireRetired(
+                enqueues, boundaries, true)) << "Later successful completions preserve the original prefix";
+        }
+
+        // A failed/unlaunched receipt needs its exact rollback, not a guessed
+        // completion from another admission. This process-terminal branch is
+        // deliberately distinct from a successfully submitted original graph.
+        enqueues[0].launch_attempted.value = false;
+        boundaries[0].graph_submitted.value = false;
+        boundaries[0].generation = 9u;
+        ASSERT_EQ(runtime.inference_boundary_receipt.beginSubmission(), 9u);
+        EXPECT_THROW(MoEOverlayParticipantNativeRetirementReplayAccess::requireRetired(
+            enqueues, boundaries, false), std::logic_error);
+        ASSERT_TRUE(runtime.inference_boundary_receipt.cancelUnsubmitted(9u));
+        EXPECT_NO_THROW(MoEOverlayParticipantNativeRetirementReplayAccess::requireRetired(
+            enqueues, boundaries, false));
+        ASSERT_EQ(runtime.inference_boundary_receipt.beginSubmission(), 9u);
+        ASSERT_TRUE(runtime.inference_boundary_receipt.completeSubmission(9u));
+        EXPECT_THROW(MoEOverlayParticipantNativeRetirementReplayAccess::requireRetired(
+            enqueues, boundaries, false), std::logic_error) << "Later work is not the old unlaunched rollback identity";
+        enqueues[0].launch_attempted.value = true;
+        boundaries[0].graph_submitted.value = true;
+        boundaries[0].generation = 10u;
+        EXPECT_THROW(MoEOverlayParticipantNativeRetirementReplayAccess::requireRetired(
+            enqueues, boundaries, true), std::logic_error) << "Native proof cannot supply a missing receipt";
+        ASSERT_EQ(runtime.inference_boundary_receipt.beginSubmission(), 10u);
+        ASSERT_EQ(runtime.inference_boundary_receipt.beginSubmission(), 11u);
+        EXPECT_FALSE(runtime.inference_boundary_receipt.completeSubmission(11u))
+            << "A newer completion cannot skip the original failed/uncompleted generation";
+        EXPECT_EQ(runtime.inference_boundary_receipt.completedGeneration(), 9u);
+        EXPECT_THROW(MoEOverlayParticipantNativeRetirementReplayAccess::requireRetired(
+            enqueues, boundaries, true), std::logic_error);
+        boundaries[0].generation = 1u;
+        boundaries[0].runtime = nullptr;
+        EXPECT_THROW(MoEOverlayParticipantNativeRetirementReplayAccess::requireRetired(
+            enqueues, boundaries, true), std::logic_error);
+        boundaries[0].runtime = &runtime;
         boundaries[0].generation = 0u;
         EXPECT_THROW(MoEOverlayParticipantNativeRetirementReplayAccess::requireRetired(
             enqueues, boundaries, true), std::logic_error);

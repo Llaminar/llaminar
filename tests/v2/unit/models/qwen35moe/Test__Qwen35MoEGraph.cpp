@@ -59,6 +59,7 @@
 #include "utils/ScopedGPUStream.h"
 #include "utils/TestTensorFactory.h"
 #include "utils/CPUExpertStageTestAdmission.h"
+#include "utils/DeviceEpochArenaTestMemory.h"
 #include "memory/CPUSerialExpertStorageLayout.h"
 #include "execution/moe/RoutedExpertOwnerAssignment.h"
 
@@ -6799,3 +6800,87 @@ TEST(Test__Qwen35MoEGraph, PreparedParticipantDescriptorProjectionIsExact)
 }
 
 #include "CPUJointColocatedSerialArenaLifecycle.inc"
+
+namespace
+{
+/** @brief Expose only the real cold epoch declaration, never GPU readiness or private state. */
+class EarlyEpochMemoryGraph final : public Qwen35MoEGraph
+{
+public:
+    using Qwen35MoEGraph::Qwen35MoEGraph;
+    using Qwen35MoEGraph::moeOverlayEpochArenaConfig;
+};
+}
+
+/** @test Early arena initialization consumes original model admission before any prepared store exists. */
+TEST(Test__Qwen35MoEGraph, EarlyEpochMemoryAuthorityBeforePreparedWeightStoreLifecycle)
+{
+    for (int replay = 0; replay < 20; ++replay) {
+        SCOPED_TRACE(replay);
+        const auto declared = admitEpochArenaForTest({.device_id = DeviceId::cpu()});
+        const auto memory = declared.memory_authority;
+        const auto model = ModelContext::createForTesting("early_epoch_metadata_only.gguf", nullptr, 1, true);
+        const auto manager = model->concreteWeightManager();
+        ASSERT_NE(manager, nullptr);
+        manager->installPhysicalMemoryAuthority(memory);
+        ASSERT_FALSE(manager->preparedWeightStoreIfInitialized());
+        EarlyEpochMemoryGraph graph(makeMoEConfig());
+        graph.setModelContext(model);
+        const auto early = graph.moeOverlayEpochArenaConfig(DeviceId::cpu());
+        EXPECT_EQ(early.memory_authority, memory);
+        EXPECT_EQ(early.initial_epoch, 1u);
+        EXPECT_EQ(early.initial_bank, 1u);
+        EXPECT_EQ(early.request_slot_capacity, 1u);
+        EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ExecutionWorkspace,
+            PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+        {
+            // The exact declaration consumed by the GPU creation site is also
+            // valid for the real CPU arena. This tests actual PMA allocation and
+            // retirement without replacing a backend or inventing GPU ownership.
+            DeviceMoEOverlayEpochArena arena(early);
+            EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ExecutionWorkspace,
+                PhysicalMemoryMaterializationKind::NewAllocation), arena.allocationBytes());
+            EXPECT_EQ(arena.control()->finite_parent, arena.finiteParent());
+        }
+        EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ExecutionWorkspace,
+            PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+        EXPECT_FALSE(manager->preparedWeightStoreIfInitialized());
+        auto late_store = std::make_shared<PreparedWeightStore>();
+        manager->setPreparedWeightStore(late_store);
+        graph.setPreparedWeightStore(late_store.get());
+        EXPECT_EQ(late_store->physicalMemoryAuthority(), memory);
+        EXPECT_EQ(graph.moeOverlayEpochArenaConfig(DeviceId::cpu()).memory_authority, memory);
+    }
+}
+
+/** @test A materializing epoch cannot use missing admission, another device or a foreign late store. */
+TEST(Test__Qwen35MoEGraph, EarlyEpochMemoryAuthorityRejectsMissingAndForeignOwners)
+{
+    // Ordinary metadata construction still needs no PMA; consumption is the
+    // checked boundary. No base-class global binding requirement is introduced.
+    EarlyEpochMemoryGraph graph(makeMoEConfig());
+    EXPECT_THROW((void)graph.moeOverlayEpochArenaConfig(DeviceId::cpu()), std::logic_error);
+    graph.setModelContext(ModelContext::createForTesting("no_manager.gguf", nullptr, 1, false));
+    EXPECT_THROW((void)graph.moeOverlayEpochArenaConfig(DeviceId::cpu()), std::logic_error);
+    const auto model = ModelContext::createForTesting("no_admission.gguf", nullptr, 1, true);
+    graph.setModelContext(model);
+    EXPECT_THROW((void)graph.moeOverlayEpochArenaConfig(DeviceId::cpu()), std::logic_error);
+    const auto original = admitEpochArenaForTest({.device_id = DeviceId::cpu()}).memory_authority;
+    model->concreteWeightManager()->installPhysicalMemoryAuthority(original);
+    EXPECT_EQ(graph.moeOverlayEpochArenaConfig(DeviceId::cpu()).memory_authority, original);
+    EXPECT_THROW((void)graph.moeOverlayEpochArenaConfig(DeviceId::cuda(0)), std::logic_error);
+    PreparedWeightStore unbound;
+    graph.setPreparedWeightStore(&unbound);
+    EXPECT_THROW((void)graph.moeOverlayEpochArenaConfig(DeviceId::cpu()), std::logic_error);
+    PreparedWeightStore foreign;
+    const auto other = admitEpochArenaForTest({.device_id = DeviceId::cpu()}).memory_authority;
+    foreign.installPhysicalMemoryAuthority(other);
+    graph.setPreparedWeightStore(&foreign);
+    EXPECT_THROW((void)graph.moeOverlayEpochArenaConfig(DeviceId::cpu()), std::logic_error);
+    EXPECT_THROW(model->concreteWeightManager()->installPhysicalMemoryAuthority(other), std::logic_error);
+    graph.setPreparedWeightStore(nullptr); // Release the borrowed test pointer before either local store dies.
+    EXPECT_EQ(original->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ExecutionWorkspace,
+        PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+    EXPECT_EQ(other->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ExecutionWorkspace,
+        PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+}

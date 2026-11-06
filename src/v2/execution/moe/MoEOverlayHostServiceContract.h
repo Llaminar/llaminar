@@ -69,7 +69,9 @@ public:
      *
      * Only the frozen admitted projection may remove an empty external tier. The
      * pre-quota resolve result remains conservative and selects a ticket whenever
-     * a host-serviced endpoint is still declared.
+     * a host-serviced endpoint is still declared. The independent rank-local
+     * publisher submits endpoint graphs outside this timeline and never creates
+     * an in-graph CPU service or changes its native capture envelope.
      */
     [[nodiscard]] GraphNativeCaptureEnvelope captureEnvelope(bool dispatchAuthority) const noexcept;
     /** @return Same-tier-excluded local endpoints using actual host-serviced boundaries. */

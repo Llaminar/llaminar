@@ -10,6 +10,7 @@ namespace llaminar2 {
 class GPUContextProvenance;
 class NativeOrderingEventBudgetProjection;
 class ReadAheadNativeParentTerminal;
+class DeviceGraphExecutor;
 namespace qwen4exp {class ImmutableLookupSubmissionRetirement;namespace detail {class PooledNativeRootStorage;}}
 namespace test {struct NativeOrderingEventGroupReplayAccess;}
 /** @brief Group token lifetime brackets existing root/tensor/boundary event handles. */
@@ -29,6 +30,9 @@ private:
     friend class qwen4exp::detail::PooledNativeRootStorage;
     friend class qwen4exp::ImmutableLookupSubmissionRetirement;
     friend class ReadAheadNativeParentTerminal;
+    // The original cache owns its singleton native creator/destructor; this
+    // friendship only brackets that existing handle with its admitted group.
+    friend class DeviceGraphExecutor;
     friend struct test::NativeOrderingEventGroupReplayAccess;
     /** @brief Mark possible backing retention BEFORE the first original event create attempt. */
     void beginNativeAttempt();

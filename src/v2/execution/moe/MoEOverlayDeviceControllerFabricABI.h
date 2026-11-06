@@ -26,7 +26,7 @@ namespace llaminar2
 
     /** Version of every fixed-width fabric record in this header. */
     inline constexpr std::uint32_t kMoEOverlayDeviceControllerFabricVersion =
-        19u;
+        20u;
 
     /** Snapshot and durable history planes: decode, prefill, grouped verifier. */
     inline constexpr std::uint32_t
@@ -292,8 +292,8 @@ namespace llaminar2
      * devices completed the corresponding operation.
      *
      * Snapshot evidence and `prepared_transaction` occupy the first cache line;
-     * publication/retirement fields occupy the second. Inference never writes
-     * either line, so maintenance polling cannot contend with its hot data.
+     * publication/retirement fields occupy the second. Inference writes only terminal readiness/progress receipts, outside its
+     * arithmetic body; maintenance consumes the original mapped publication.
      */
     struct alignas(64) MoEOverlayDeviceControllerParticipantRecord
     {
@@ -326,7 +326,12 @@ namespace llaminar2
         std::uint64_t restored_transaction = 0u;
         /** Controller transaction observed at action entry; diagnostic-only. */
         std::uint64_t observed_action_transaction = 0u;
-        std::uint64_t reserved[3] = {};
+        /** Original finite parent generation retaining this transaction's old bank. */
+        std::uint64_t finite_parent_generation = 0u;
+        /** Actual captured Arm/child-terminal/End progress, never a host heartbeat. */
+        std::uint64_t finite_parent_progress = 0u;
+        /** Release publication binds these two words to the original command. */
+        std::uint64_t finite_deferred_transaction = 0u;
     };
 
     /** Host transport worker lifecycle for one device-controller group. */

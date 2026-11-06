@@ -15,6 +15,7 @@
  */
 
 #include "backends/BackendManager.h"
+#include "../../utils/DeviceEpochArenaTestMemory.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IGPUGraphCapture.h"
 #include "backends/IWorkerGPUContext.h"
@@ -1279,10 +1280,10 @@ namespace llaminar2::test
                 .source_participant = 0u,
                 .destination_participant = dynamic ? 2u : 0u,
                 .payload_slot = dynamic ? 0u : kMoEOverlayDeviceInvalidSlot,
-                .flags = static_cast<std::uint32_t>(
-                    dynamic
-                        ? MoEOverlayDeviceMovementAxis::TierResidency
-                        : MoEOverlayDeviceMovementAxis::ParticipantPlacement),
+                .flags = moeOverlayMovementFlags(
+                    dynamic ? MoEOverlayDeviceMovementAxis::TierResidency
+                            : MoEOverlayDeviceMovementAxis::ParticipantPlacement,
+                    dynamic ? 1u : 0u),
                 .payload_bytes = dynamic ? 4096u : 0u,
                 .source_epoch = base_epoch,
                 .candidate_epoch = dynamic ? base_epoch + 1u : base_epoch,
@@ -3489,7 +3490,7 @@ namespace llaminar2::test
                         "inference epoch endpoint requires one continuation GPU binding");
                 }
                 arena_ = std::make_shared<DeviceMoEOverlayEpochArena>(
-                    DeviceMoEOverlayEpochArena::Config{
+                    llaminar2::test::admitEpochArenaForTest(DeviceMoEOverlayEpochArena::Config{
                         .device_id = binding_.device,
                         .initial_epoch = initial_epoch,
                         .initial_bank = 0u,
@@ -3502,7 +3503,7 @@ namespace llaminar2::test
                             .participant_id = static_cast<std::uint32_t>(
                                 binding_.participant_id),
                         },
-                    });
+                    }));
                 kernel_ = llaminar::v2::kernels::KernelFactory::createMoEKernel(
                     binding_.device);
                 try
@@ -3805,8 +3806,8 @@ namespace llaminar2::test
                 .source_participant = 4u,
                 .destination_participant = 3u,
                 .payload_slot = 0u,
-                .flags = static_cast<std::uint32_t>(
-                    MoEOverlayDeviceMovementAxis::ParticipantPlacement),
+                .flags = moeOverlayMovementFlags(
+                    MoEOverlayDeviceMovementAxis::ParticipantPlacement, 1u),
                 .payload_bytes = 4096u,
                 .source_epoch = policy_input.base_epoch,
                 .candidate_epoch = policy_input.base_epoch + 1u,
@@ -3820,8 +3821,8 @@ namespace llaminar2::test
                 .source_participant = 3u,
                 .destination_participant = 4u,
                 .payload_slot = 1u,
-                .flags = static_cast<std::uint32_t>(
-                    MoEOverlayDeviceMovementAxis::ParticipantPlacement),
+                .flags = moeOverlayMovementFlags(
+                    MoEOverlayDeviceMovementAxis::ParticipantPlacement, 1u),
                 .payload_bytes = 4096u,
                 .source_epoch = policy_input.base_epoch,
                 .candidate_epoch = policy_input.base_epoch + 1u,
@@ -4435,6 +4436,16 @@ namespace llaminar2::test
                 expected.commands.data(),
                 static_cast<std::uint32_t>(expected.commands.size())));
 
+        std::vector<bool> observed_cycles(observed.policy.accepted_cycles, false);
+        for (const auto &entry : observed.commands)
+        {
+            const auto id = moeOverlayMovementCycle(entry.flags);
+            ASSERT_GE(id, 1u);
+            ASSERT_LE(id, observed.policy.accepted_cycles);
+            observed_cycles[id - 1u] = true;
+        }
+        EXPECT_TRUE(std::all_of(observed_cycles.begin(), observed_cycles.end(),
+                                [](bool present) { return present; }));
         bool advances_tier = false;
         bool advances_participant = false;
         for (std::size_t index = 0u;
@@ -4447,8 +4458,7 @@ namespace llaminar2::test
                     &expected.commands[index],
                     sizeof(MoEOverlayDeviceMovementCommand)),
                 0) << "device/CPU command ABI mismatch at ordinal " << index;
-            const auto axis = static_cast<MoEOverlayDeviceMovementAxis>(
-                observed.commands[index].flags);
+            const auto axis = moeOverlayMovementAxis(observed.commands[index].flags);
             advances_tier = advances_tier ||
                 axis == MoEOverlayDeviceMovementAxis::TierResidency ||
                 axis == MoEOverlayDeviceMovementAxis::Combined;
@@ -5266,6 +5276,16 @@ namespace llaminar2::test
                     transports, fixtures, &observed, &error,
                     {.complete_epoch = true, .expect_no_movement = terminal,
                      .objective = RuntimeCandidateApplyObjective::PreparedContextRestore})) << error;
+                std::vector<bool> authored_groups(observed.policy.accepted_cycles, false);
+                for (const auto &entry : observed.commands)
+                {
+                    const auto id = moeOverlayMovementCycle(entry.flags);
+                    ASSERT_GE(id, 1u);
+                    ASSERT_LE(id, authored_groups.size());
+                    authored_groups[id - 1u] = true;
+                }
+                EXPECT_TRUE(std::all_of(authored_groups.begin(), authored_groups.end(),
+                                        [](bool present) { return present; }));
                 EXPECT_EQ(observed.command.demand_phase,
                     static_cast<std::uint32_t>(MoEOverlayDeviceDemandPhase::Invalid));
                 EXPECT_EQ(observed.command.projected_net_benefit_ns, 0);
@@ -7071,3 +7091,7 @@ namespace llaminar2::test
         prove_backend(rocm, DeviceId::rocm(0));
     }
 } // namespace llaminar2::test
+
+#include "MoEFinitePlacementCaptureReplay.inc"
+
+#include "MoEFollowerPredecessorCaptureReplay.inc"

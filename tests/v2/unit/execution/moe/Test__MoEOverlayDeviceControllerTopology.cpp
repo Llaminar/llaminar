@@ -12,6 +12,7 @@
 
 #include "execution/moe/MoEOverlayDeviceControllerTopology.h"
 #include "execution/moe/MoEOverlayNodeLocalDeviceControllerFabric.h"
+#include "execution/moe/MoEOverlayParticipantGraphRunner.h"
 
 #include <gtest/gtest.h>
 
@@ -171,6 +172,102 @@ namespace llaminar2::test
                 {.world_rank_node_ids = node_ids});
         }
     } // namespace
+
+    TEST(Test__MoEOverlayDeviceControllerTopology,
+         ParticipantGPUOwnershipSingleRankKeepsBothOriginalOwners)
+    {
+        auto plan = cudaContinuationPlan();
+        plan.domains[1].owner_rank = 0;
+        const auto original = MoEExpertOwnerMap::build(plan);
+        const std::vector<int> fabric{5, 0, 3, 1, 4, 2};
+        const std::vector<int> followers{5, 3, 4, 2};
+        // The previous equality rejected these genuine roles: the DGO GPUs
+        // belong to the fabric but must not be adopted by the follower runner.
+        EXPECT_NE(fabric.size(), followers.size());
+        EXPECT_NO_THROW(requireMoEOverlayParticipantGPUOwnership(
+            plan, original, 0,
+            MoEOverlayParticipantGraphOwnership::RankLocalAuxiliary,
+            fabric, followers));
+    }
+
+    TEST(Test__MoEOverlayDeviceControllerTopology,
+         ParticipantGPUOwnershipReversedVendorAndDeclarationOrder)
+    {
+        auto plan = rocmContinuationPlan();
+        plan.domains[0].owner_rank = 0;
+        const auto original = MoEExpertOwnerMap::build(plan);
+        const std::vector<int> fabric{0, 1, 2, 3, 4, 5};
+        const std::vector<int> followers{3, 2, 1, 0};
+        EXPECT_NO_THROW(requireMoEOverlayParticipantGPUOwnership(
+            plan, original, 0,
+            MoEOverlayParticipantGraphOwnership::RankLocalAuxiliary,
+            fabric, followers));
+    }
+
+    TEST(Test__MoEOverlayDeviceControllerTopology,
+         ParticipantGPUOwnershipExpertOnlyRankUsesExactOriginalRank)
+    {
+        const auto plan = cudaContinuationPlan();
+        const auto original = MoEExpertOwnerMap::build(plan);
+        const std::vector<int> followers{2, 3, 4, 5};
+        EXPECT_NO_THROW(requireMoEOverlayParticipantGPUOwnership(
+            plan, original, 1,
+            MoEOverlayParticipantGraphOwnership::ExpertOnlyRank,
+            followers, followers));
+        const std::vector<int> foreign_rank{0, 1};
+        EXPECT_THROW(requireMoEOverlayParticipantGPUOwnership(
+            plan, original, 1,
+            MoEOverlayParticipantGraphOwnership::ExpertOnlyRank,
+            foreign_rank, followers), std::invalid_argument);
+        // Even matching full arrays cannot transfer original DGO ownership to
+        // an expert-only runner on the continuation rank.
+        EXPECT_THROW(requireMoEOverlayParticipantGPUOwnership(
+            plan, original, 0,
+            MoEOverlayParticipantGraphOwnership::ExpertOnlyRank,
+            foreign_rank, foreign_rank), std::invalid_argument);
+    }
+
+    TEST(Test__MoEOverlayDeviceControllerTopology,
+         ParticipantGPUOwnershipRejectsMissingForeignDuplicateAndWrongRole)
+    {
+        auto plan = cudaContinuationPlan();
+        plan.domains[1].owner_rank = 0;
+        const auto original = MoEExpertOwnerMap::build(plan);
+        const std::vector<int> fabric{0, 1, 2, 3, 4, 5};
+        const std::vector<int> followers{2, 3, 4, 5};
+        const std::vector<std::vector<int>> invalid_fabrics{
+            {}, {2, 3, 4, 5}, {0, 1}, {0, 1, 2, 3, 4},
+            {0, 1, 2, 3, 4, 99}, {0, 1, 2, 3, 4, 4},
+            {0, 1, 2, 3, 4, 5, 5}, {-1, 0, 1, 2, 3, 4, 5}};
+        for (const auto &actual : invalid_fabrics)
+        {
+            SCOPED_TRACE(::testing::PrintToString(actual));
+            EXPECT_THROW(requireMoEOverlayParticipantGPUOwnership(
+                plan, original, 0,
+                MoEOverlayParticipantGraphOwnership::RankLocalAuxiliary,
+                actual, followers), std::invalid_argument);
+        }
+        const std::vector<std::vector<int>> invalid_followers{
+            {}, {2, 3, 4}, {2, 3, 4, 99}, {2, 3, 4, 4},
+            {2, 3, 4, 5, 5}, {-1, 2, 3, 4, 5}, {0, 2, 3, 4, 5},
+            {0, 1, 2, 3, 4, 5}, {0, 1}};
+        for (const auto &actual : invalid_followers)
+        {
+            SCOPED_TRACE(::testing::PrintToString(actual));
+            EXPECT_THROW(requireMoEOverlayParticipantGPUOwnership(
+                plan, original, 0,
+                MoEOverlayParticipantGraphOwnership::RankLocalAuxiliary,
+                fabric, actual), std::invalid_argument);
+        }
+        EXPECT_THROW(requireMoEOverlayParticipantGPUOwnership(
+            plan, original, -1,
+            MoEOverlayParticipantGraphOwnership::RankLocalAuxiliary,
+            fabric, followers), std::invalid_argument);
+        EXPECT_THROW(requireMoEOverlayParticipantGPUOwnership(
+            plan, original, 0,
+            static_cast<MoEOverlayParticipantGraphOwnership>(255),
+            fabric, followers), std::invalid_argument);
+    }
 
     TEST(Test__MoEOverlayDeviceControllerTopology,
          TwoCudaContinuationAndFourRocmFollowersUseTwoNativeGroups)

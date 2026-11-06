@@ -124,8 +124,8 @@ namespace llaminar2
                     .source_participant = 0u,
                     .destination_participant = 1u,
                     .payload_slot = 0u,
-                    .flags = static_cast<std::uint32_t>(
-                        MoEOverlayDeviceMovementAxis::ParticipantPlacement),
+                    .flags = moeOverlayMovementFlags(
+                        MoEOverlayDeviceMovementAxis::ParticipantPlacement, 1u),
                     .payload_bytes = 4096u,
                     .source_epoch = 7u,
                     .candidate_epoch = 8u,
@@ -163,6 +163,8 @@ namespace llaminar2
                 const auto transaction = publishDynamic();
                 entries[0].op = static_cast<std::uint32_t>(MoEOverlayDeviceMovementOp::TransientArrival);
                 entries[0].candidate_epoch = 7u;
+                entries[0].flags = moeOverlayMovementFlags(
+                    MoEOverlayDeviceMovementAxis::ParticipantPlacement, 0u);
                 command = {};
                 command.kind = static_cast<std::uint32_t>(
                     MoEOverlayDeviceControllerTransactionKind::CurrentBatchLLEP);

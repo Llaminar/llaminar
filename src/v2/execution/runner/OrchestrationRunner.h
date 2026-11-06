@@ -296,6 +296,9 @@ namespace llaminar2
         bool maybeApplyMoERebalance(uint64_t committed_tokens) override;
         uint64_t moeRuntimeMovementEpoch() const override;
 
+        /** @copydoc IOrchestrationRunner::withMoEOverlayDevicePlacementScope */
+        void withMoEOverlayDevicePlacementScope(const std::function<void()> &body) override;
+
         /** @copydoc IOrchestrationRunner::withMoEOverlayInferencePlacementScope */
         MoEOverlayInferencePlacementScopeObservation withMoEOverlayInferencePlacementScope(
             const std::function<void()> &body) override;
@@ -1571,6 +1574,12 @@ namespace llaminar2
          */
         std::shared_ptr<MoEOverlayNodeLocalDeviceControllerFabric>
             moe_overlay_device_controller_fabric_;
+        /** Host submission intent only: the actual parent epoch/lease lives on device. */
+        enum class FiniteDevicePlacementSubmission { Inactive, PendingArm, Armed };
+        FiniteDevicePlacementSubmission finite_device_placement_submission_=
+            FiniteDevicePlacementSubmission::Inactive;
+        /** @brief Arm after public reset, before any new original source/follower launch. */
+        void ensureFiniteDevicePlacementArmed();
         /** Retained group-root graphs on dedicated controller streams. */
         std::unique_ptr<MoEOverlayDeviceControllerGraphService>
             moe_overlay_device_controller_graph_service_;

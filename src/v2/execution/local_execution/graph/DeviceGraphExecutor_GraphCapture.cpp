@@ -982,6 +982,9 @@ namespace llaminar2
         if (terminal_event)
             return true;
 
+        // Allocate immutable receipt identity only at this existing cold creator.
+        // Copies of an issued ticket keep it unique even after event destruction.
+        auto receipt_identity = std::make_shared<const std::uint8_t>(0);
         terminal_event = ctx->createEvent();
         if (!terminal_event)
         {
@@ -989,9 +992,46 @@ namespace llaminar2
                 "[GraphSegmentCache] Failed to create the exact terminal event");
             return false;
         }
+        terminal_receipt_identity = std::move(receipt_identity);
         if (!gpu_ctx_ref)
             gpu_ctx_ref = ctx;
         return true;
+    }
+
+    bool DeviceGraphExecutor::GraphSegmentCache::prepareCaptureStreamTerminal(
+        IWorkerGPUContext* ctx,const std::shared_ptr<PhysicalMemoryAuthority>& memory)
+    {
+        if(!ctx || !memory || !capture_stream || !capture_device.is_gpu() ||
+            initialized || !segments.empty() || isGraphCaptureActive())
+            throw std::logic_error("Source-bound capture terminal requires its original cold cache/stream/PMA");
+        const auto original=GPUDeviceContextPool::instance().retainExistingPreparedContext(capture_device,memory);
+        original.provenance().requireWorker(original.worker());
+        if(original.worker().get()!=ctx || !ctx->ownsCurrentThread())
+            throw std::logic_error("Source-bound capture terminal changed its original prepared worker");
+        const auto program=NativeOrderingEventProgram::captureSubmissionRetirement();
+        if(terminal_event) {
+            if(!terminal_event_obligation)
+                throw std::logic_error("Source-bound capture terminal cannot retrofit an unpriced native creator");
+            terminal_event_obligation->requireOriginal(memory,original.provenance(),program);
+            return prepareCaptureStreamTerminal(ctx);
+        }
+        terminal_event_obligation=NativeOrderingEventGroup::claim(memory,original.provenance(),program);
+        terminal_event_obligation->beginNativeAttempt();
+        try {
+            // The original exact creator remains single-source: same event,
+            // immutable receipt identity and checked original capture stream.
+            const bool prepared=prepareCaptureStreamTerminal(ctx);
+            if(!prepared) {
+                terminal_event_obligation->completeNativeHandles();
+                terminal_event_obligation.reset();
+            }
+            return prepared;
+        } catch(...) {
+            if(terminal_event)throw; // Retain actual accepted handle/obligation for original cache teardown.
+            terminal_event_obligation->completeNativeHandles();
+            terminal_event_obligation.reset();
+            throw;
+        }
     }
 
     DeviceGraphExecutor::GraphSegmentCache::CaptureStreamTerminalTicket
@@ -1024,7 +1064,22 @@ namespace llaminar2
         }
         ++terminal_fence_published_generation;
         return CaptureStreamTerminalTicket{
-            terminal_fence_published_generation};
+            terminal_fence_published_generation,terminal_receipt_identity,
+            ctx,terminal_event,capture_stream};
+    }
+
+    void DeviceGraphExecutor::GraphSegmentCache::enqueuePublishedCaptureStreamTerminalWait(
+        CaptureStreamTerminalTicket ticket,void* consumer_stream,IWorkerGPUContext* worker)
+    {
+        if(!worker || !consumer_stream || !ticket.valid() || !capture_stream || !terminal_event ||
+            worker!=requireLifecycleContext("exact terminal device handoff") || !worker->ownsCurrentThread() ||
+            ticket.worker_!=worker || ticket.event_!=terminal_event || ticket.stream_!=capture_stream ||
+            ticket.identity_.get()!=terminal_receipt_identity.get() ||
+            ticket.identity_.owner_before(terminal_receipt_identity) || terminal_receipt_identity.owner_before(ticket.identity_) ||
+            ticket.generation!=terminal_fence_published_generation)
+            throw std::logic_error("Exact terminal device handoff requires its original current receipt/worker/streams");
+        if(!worker->waitEventChecked(terminal_event,consumer_stream))
+            throw std::runtime_error("Exact terminal device handoff event wait was rejected");
     }
 
     void DeviceGraphExecutor::GraphSegmentCache::
@@ -1034,6 +1089,10 @@ namespace llaminar2
             std::function<std::string()> active_timeout_diagnostic)
     {
         if (!ticket.valid() || !terminal_event || !capture_stream ||
+            ticket.identity_.get()!=terminal_receipt_identity.get() ||
+            ticket.identity_.owner_before(terminal_receipt_identity) || terminal_receipt_identity.owner_before(ticket.identity_) ||
+            ticket.event_!=terminal_event || ticket.stream_!=capture_stream ||
+            ticket.worker_!=requireLifecycleContext("exact terminal receipt ownership") ||
             ticket.generation != terminal_fence_published_generation ||
             ticket.generation <= terminal_fence_observed_generation)
         {
@@ -1438,6 +1497,11 @@ namespace llaminar2
                 "exact terminal event destruction threw an unknown exception");
         }
         terminal_event = nullptr;
+        if(terminal_event_obligation) {
+            terminal_event_obligation->completeNativeHandles();
+            terminal_event_obligation.reset();
+        }
+        terminal_receipt_identity.reset();
     }
 
     void DeviceGraphExecutor::GraphSegmentCache::destroyReplayGpuTimingEvents()

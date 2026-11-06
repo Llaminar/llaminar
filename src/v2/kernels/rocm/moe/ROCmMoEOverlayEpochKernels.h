@@ -15,6 +15,13 @@
 
 extern "C"
 {
+    /** @brief Enqueue captured Arm/Close on the exact original arena finite parent. */
+    bool hipMoEOverlayEpochParentAction(
+        llaminar2::DeviceMoEOverlayEpochControl *control,
+        llaminar2::DeviceMoEOverlayEpochStatus *status,
+        llaminar2::DeviceMoEOverlayEpochParentAction action,
+        int device_ordinal,void *stream);
+
     /** @brief Enqueue request admission into the currently published bank. */
     bool hipMoEOverlayEpochAcquire(
         llaminar2::DeviceMoEOverlayEpochControl *control,

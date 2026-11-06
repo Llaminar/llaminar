@@ -112,7 +112,8 @@ namespace llaminar2
         bool resolveSynchronizedAdmission(
             const std::uint64_t *external_admission_epoch,
             DeviceMoEOverlayEpochAdmissionBarrierBinding barrier,
-            std::uint64_t *required_epoch) noexcept
+            std::uint64_t *required_epoch,
+            std::uint64_t finite_epoch = 0u) noexcept
         {
             if (!external_admission_epoch || !barrier.record ||
                 !required_epoch)
@@ -182,7 +183,7 @@ namespace llaminar2
                     }
                     return false;
                 }
-                const std::uint64_t frozen =
+                const std::uint64_t frozen = finite_epoch ? finite_epoch :
                     std::atomic_ref<std::uint64_t>(
                         *const_cast<std::uint64_t *>(
                             external_admission_epoch))
@@ -210,6 +211,23 @@ namespace llaminar2
         }
     } // namespace
 
+    bool CPUMoEKernel::runMoEOverlayEpochParentAction(
+        const MoEKernelLaunchContext &launch,DeviceMoEOverlayEpochControl *control,
+        DeviceMoEOverlayEpochStatus *status,DeviceMoEOverlayEpochParentAction action)
+    {
+        (void)launch;
+        if(!control || !status || !control->finite_parent)return false;
+        MoEOverlayDeviceEpochProtocol protocol(*control);
+        const bool success=action==DeviceMoEOverlayEpochParentAction::Arm
+            ?protocol.armFiniteParent(*control->finite_parent)
+            :action==DeviceMoEOverlayEpochParentAction::Close && protocol.closeFiniteParent(*control->finite_parent);
+        writeOverlayEpochStatus(status,
+            action==DeviceMoEOverlayEpochParentAction::Arm?DeviceMoEOverlayEpochOperation::ArmFiniteParent:
+                DeviceMoEOverlayEpochOperation::CloseFiniteParent,
+            success?DeviceMoEOverlayEpochStatusCode::Success:DeviceMoEOverlayEpochStatusCode::InvalidControl);
+        return success;
+    }
+
     bool CPUMoEKernel::acquireMoEOverlayEpoch(
         const MoEKernelLaunchContext &launch,
         DeviceMoEOverlayEpochControl *control,
@@ -219,92 +237,46 @@ namespace llaminar2
         DeviceMoEOverlayEpochAdmissionBarrierBinding admission_barrier,
         MoEOverlayPeerPlacementEpochBinding peer_placement_epoch)
     {
+
         (void)launch;
-        if (!status)
-            return false;
-        if (peer_placement_epoch.valid())
-        {
-            writeOverlayEpochStatus(
-                status,
-                DeviceMoEOverlayEpochOperation::Acquire,
-                DeviceMoEOverlayEpochStatusCode::InvalidControl);
+        if(!status)return false;
+        if(!control || peer_placement_epoch.valid()) {
+            writeOverlayEpochStatus(status,DeviceMoEOverlayEpochOperation::Acquire,DeviceMoEOverlayEpochStatusCode::InvalidControl);
             return true;
         }
-        if (!control)
-        {
-            writeOverlayEpochStatus(
-                status,
-                DeviceMoEOverlayEpochOperation::Acquire,
-                DeviceMoEOverlayEpochStatusCode::InvalidControl);
+        if(!ticket || ticket->epoch || ticket->selector || ticket->parent_generation) {
+            writeOverlayEpochStatus(status,DeviceMoEOverlayEpochOperation::Acquire,DeviceMoEOverlayEpochStatusCode::InvalidTicket);
             return true;
         }
-        if (!ticket || ticket->epoch != 0u || ticket->selector != 0u)
-        {
-            writeOverlayEpochStatus(
-                status,
-                DeviceMoEOverlayEpochOperation::Acquire,
-                DeviceMoEOverlayEpochStatusCode::InvalidTicket);
-            return true;
-        }
-
         MoEOverlayDeviceEpochProtocol protocol(*control);
-        std::uint64_t admitted_epoch = 0u;
-        bool admission_valid = true;
-        const bool synchronized = admission_barrier.record != nullptr;
-        if (synchronized)
-        {
-            /* Protect this participant's old bank before advertising arrival.
-             * tryAcquireAdmitted owns its usual narrower guard as well; the
-             * outer guard is dropped only after that reader is installed. */
-            std::atomic_ref<std::uint64_t>(
-                control->acquisitions_in_flight)
-                .fetch_add(1u, std::memory_order_seq_cst);
-            admission_valid = resolveSynchronizedAdmission(
-                external_admission_epoch,
-                admission_barrier,
-                &admitted_epoch);
-        }
-        else if (admission_barrier.participant_id != 0xffffffffu)
-        {
-            admission_valid = false;
-        }
-        else if (external_admission_epoch)
-        {
-            admitted_epoch = std::atomic_ref<std::uint64_t>(
-                                 *const_cast<std::uint64_t *>(
-                                     external_admission_epoch))
-                                 .load(std::memory_order_acquire);
-        }
-
-        const auto acquired = admission_valid
-                                  ? protocol.tryAcquireAdmitted(admitted_epoch)
-                                  : std::nullopt;
-        if (synchronized)
-        {
-            std::atomic_ref<std::uint64_t>(
-                control->acquisitions_in_flight)
-                .fetch_sub(1u, std::memory_order_seq_cst);
-        }
-        if (!acquired.has_value())
-        {
-            writeOverlayEpochStatus(
-                status,
-                DeviceMoEOverlayEpochOperation::Acquire,
-                DeviceMoEOverlayEpochStatusCode::InvalidControl,
-                0u,
-                currentOverlaySelector(protocol));
+        auto *const parent=control->finite_parent;
+        const bool synchronized=admission_barrier.record!=nullptr;
+        const bool guarded=synchronized || parent!=nullptr;
+        auto guard=std::atomic_ref<std::uint64_t>(control->acquisitions_in_flight);
+        if(guarded)guard.fetch_add(1u);
+        using ParentState=DeviceMoEOverlayEpochParentState;
+        const auto parent_state=parent?std::atomic_ref<std::uint32_t>(parent->state).load():static_cast<std::uint32_t>(ParentState::Idle);
+        const bool finite=parent_state!=static_cast<std::uint32_t>(ParentState::Idle);
+        bool valid=!parent || (parent->control==control && parent->version==kDeviceMoEOverlayEpochParentVersion &&
+            (!finite || parent_state==static_cast<std::uint32_t>(ParentState::Armed) || parent_state==static_cast<std::uint32_t>(ParentState::Active)));
+        const auto finite_epoch=parent_state==static_cast<std::uint32_t>(ParentState::Active)?parent->ticket.epoch:0u;
+        if(parent_state==static_cast<std::uint32_t>(ParentState::Active) &&
+            (!parent->ticket.valid() || parent->ticket.parent_generation))valid=false;
+        std::uint64_t admitted_epoch=finite_epoch;
+        if(synchronized)valid=valid && resolveSynchronizedAdmission(external_admission_epoch,admission_barrier,&admitted_epoch,finite_epoch);
+        else if(admission_barrier.participant_id!=0xffffffffu)valid=false;
+        else if(!finite_epoch && external_admission_epoch)
+            admitted_epoch=std::atomic_ref<std::uint64_t>(*const_cast<std::uint64_t*>(external_admission_epoch)).load(std::memory_order_acquire);
+        const auto acquired=valid ? (finite?protocol.tryAcquireFiniteChild(*parent,admitted_epoch):protocol.tryAcquireAdmitted(admitted_epoch)):std::nullopt;
+        if(guarded)guard.fetch_sub(1u);
+        if(!acquired) {
+            writeOverlayEpochStatus(status,DeviceMoEOverlayEpochOperation::Acquire,DeviceMoEOverlayEpochStatusCode::InvalidControl,
+                admitted_epoch,0u,kDeviceMoEOverlayInvalidBank,DeviceMoEOverlayEpochBankState::Empty);
             return true;
         }
-
-        *ticket = *acquired;
-        writeOverlayEpochStatus(
-            status,
-            DeviceMoEOverlayEpochOperation::Acquire,
-            DeviceMoEOverlayEpochStatusCode::Success,
-            ticket->epoch,
-            ticket->selector,
-            ticket->bank(),
-            protocol.bankState(ticket->bank()));
+        *ticket=*acquired;
+        writeOverlayEpochStatus(status,DeviceMoEOverlayEpochOperation::Acquire,DeviceMoEOverlayEpochStatusCode::Success,
+            ticket->epoch,ticket->selector,ticket->bank(),protocol.bankState(ticket->bank()));
         return true;
     }
 
@@ -336,7 +308,9 @@ namespace llaminar2
 
         MoEOverlayDeviceEpochProtocol protocol(*control);
         const DeviceMoEOverlayEpochTicket released = *ticket;
-        const bool released_reader = protocol.release(released);
+        const bool released_reader = released.parent_generation
+            ? control->finite_parent && protocol.releaseFiniteChild(*control->finite_parent,*ticket)
+            : protocol.release(released);
         if (released_reader)
             *ticket = {};
         writeOverlayEpochStatus(

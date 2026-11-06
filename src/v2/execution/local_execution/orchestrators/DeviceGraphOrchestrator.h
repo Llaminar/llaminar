@@ -30,6 +30,7 @@
 
 #pragma once
 #include "execution/mtp/OrdinaryForwardRetention.h"
+#include "../../../execution/moe/MoEOverlayFinitePlacementGraphs.h"
 #include "backends/ReadAheadNativeResourceFamily.h"
 #include "../graph/RetainedStorageTerminalCapture.h"
 #include "../graph/RetainedStoragePerfStats.h"
@@ -4133,6 +4134,11 @@ namespace llaminar2
         enqueueMoEOverlayDeviceInferenceBoundary(
             void *maintenance_stream,
             MoEOverlayInferenceBoundaryRequest request) override;
+
+        /** @copydoc IMoEOverlayDeviceInferenceBoundary::prepareMoEOverlayFinitePlacementGraphs */
+        bool prepareMoEOverlayFinitePlacementGraphs() override;
+        /** @copydoc IMoEOverlayDeviceInferenceBoundary::runMoEOverlayFinitePlacementBoundary */
+        bool runMoEOverlayFinitePlacementBoundary(DeviceMoEOverlayEpochParentAction action) override;
 
         /** @copydoc IMoEOverlayDeviceInferenceBoundary::installMoEOverlayTransferProgressEpoch */
         [[nodiscard]] bool installMoEOverlayTransferProgressEpoch(
@@ -9271,6 +9277,8 @@ namespace llaminar2
         bool prepareHostedMTPStochasticBranch(int rows, int source_rows, void *stream, std::string *error);
 
         /// First unconditional fragment of every durable overlay transaction.
+        /** Original bounded captures; destroyed before the executor and arena. */
+        MoEOverlayFinitePlacementGraphs moe_overlay_finite_placement_graphs_;
         MoEOverlayEpochBoundaryGraphCache
             moe_overlay_epoch_acquire_graph_;
 

@@ -12,6 +12,7 @@
  * identities and aggregate work without retaining an unbounded event history.
  */
 
+#include <exception>
 #include "MoEOverlayInferenceTransactionService.h"
 
 #include "collective/CollectiveTimeoutPolicy.h"
@@ -1568,6 +1569,28 @@ namespace llaminar2
         std::string *error)
     {
         std::lock_guard lock(mutex_);
+        return beginCommandLocked(command, error);
+    }
+
+    bool MoEOverlayInferenceTransactionCoordinator::beginRootCommand(
+        int world_rank, const MoEOverlayInferenceCommandIdentity &command, std::string *error)
+    {
+        std::lock_guard lock(mutex_);
+        if (world_rank != config_.graph_plan.continuationWorldRank() || !command.valid() ||
+            (active_command_.valid() &&
+             (command.request_generation < active_command_.request_generation ||
+              (command.request_generation == active_command_.request_generation &&
+               command.command_id <= active_command_.command_id))))
+        {
+            if (error) *error = "ExpertOverlay root command changed its original continuation rank or request/command generation";
+            return false;
+        }
+        return beginCommandLocked(command, error);
+    }
+
+    bool MoEOverlayInferenceTransactionCoordinator::beginCommandLocked(
+        const MoEOverlayInferenceCommandIdentity &command, std::string *error)
+    {
         if (error)
             error->clear();
         if (!command.valid())
@@ -3152,6 +3175,12 @@ namespace llaminar2
             LOG_ERROR(
                 "ExpertOverlay participant graph scope could not publish its failed terminal: "
                 << error);
+            // A sibling can already own an accepted native parent and be in
+            // diagnostic publication behind it. Without this original terminal
+            // there is no safe proof that joining workers or releasing graph
+            // owners can progress. Preserve the error and terminate at the
+            // original process boundary; never return a reusable worker result.
+            std::terminate();
         }
     }
 

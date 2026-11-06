@@ -972,9 +972,11 @@ inline void expectQwen4ExpSourceMTPMaterialization(const ModelParityCase &cell, 
         ASSERT_NO_THROW(setup_participants = requireQwen4ExpMTPSourceSetupFamilies(
                             setup_before, PerfStatsCollector::snapshot(), expected));
     }
+    const auto placement = model->resolvedImmutableRowTablePlacement();
+    ASSERT_NE(placement, nullptr) << "QFN CPU materialization lost its original immutable lookup placement";
     ASSERT_NO_THROW(
         requireQwen4ExpCPUStorageMaterialization(reuse->physical_memory_authority->rankAttestation(),
-            reuse->prepared_routed_weight_plan));
+            reuse->prepared_routed_weight_plan, placement->allocators()));
     std::ofstream mtp_setup(output / "mtp-setup.csv");
     ASSERT_TRUE(mtp_setup.is_open());
     mtp_setup
@@ -1227,16 +1229,17 @@ inline void admitQwen4ExpSource(const ModelParityCase &cell,
         grants.flush();ASSERT_TRUE(grants.good());
     }
 
+    const auto placement = model->resolvedImmutableRowTablePlacement();
+    ASSERT_NE(placement, nullptr) << "QFN CPU materialization lost its original immutable lookup placement";
     std::ofstream memory(output / "admission_memory.txt");
     ASSERT_TRUE(memory.is_open());
     memory << reuse->physical_memory_authority->rankAttestationSummary(true);
     ASSERT_NO_THROW(requireQwen4ExpCPUStorageMaterialization(
-        reuse->physical_memory_authority->rankAttestation(), reuse->prepared_routed_weight_plan));
+        reuse->physical_memory_authority->rankAttestation(), reuse->prepared_routed_weight_plan, placement->allocators()));
     memory.flush();
     ASSERT_TRUE(memory.good());
     std::ofstream csv(output / "admission.csv");
     ASSERT_TRUE(csv.is_open());
-    const auto placement = model->resolvedImmutableRowTablePlacement();
     const bool joint_follower=cell.topology.expert_overlay_plan &&
         MoEExpertOwnerMap::usesCPUJointFragments(*cell.topology.expert_overlay_plan) &&
         !qwen4ExpCPUJointSourceHasContinuation(cell,rank);

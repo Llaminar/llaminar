@@ -28,6 +28,7 @@
 
 #pragma once
 #include "IRetainedGraphParticipants.h"
+#include "backends/NativeOrderingEventGroup.h"
 
 #include "ComputeGraph.h"
 #include "../../../kernels/common/DiagnosticSnapshotCopy.h"
@@ -1778,6 +1779,8 @@ namespace llaminar2
             /** External producer -> capture-stream handoff event. */
             void *capture_input_event = nullptr;
             void *terminal_event = nullptr;           ///< Dedicated event for one exact deferred host terminal
+            std::unique_ptr<NativeOrderingEventGroup> terminal_event_obligation; ///< Optional original same-PMA singleton creator ownership.
+            std::shared_ptr<const std::uint8_t> terminal_receipt_identity; ///< Cold immutable exact event-lifetime identity, transferred on cache move.
             uint64_t terminal_fence_published_generation = 0; ///< Latest exact terminal recorded after submission
             uint64_t terminal_fence_observed_generation = 0; ///< Latest exact terminal acquired by its host owner
             IWorkerGPUContext *gpu_ctx_ref = nullptr; ///< GPU context for stream lifecycle (not owned)
@@ -1840,6 +1843,8 @@ namespace llaminar2
                   sync_event(other.sync_event),
                   capture_input_event(other.capture_input_event),
                   terminal_event(other.terminal_event),
+                  terminal_event_obligation(std::move(other.terminal_event_obligation)),
+                  terminal_receipt_identity(std::move(other.terminal_receipt_identity)),
                   terminal_fence_published_generation(
                       other.terminal_fence_published_generation),
                   terminal_fence_observed_generation(
@@ -1931,6 +1936,8 @@ namespace llaminar2
                     sync_event = other.sync_event;
                     capture_input_event = other.capture_input_event;
                     terminal_event = other.terminal_event;
+                    terminal_event_obligation = std::move(other.terminal_event_obligation);
+                    terminal_receipt_identity = std::move(other.terminal_receipt_identity);
                     terminal_fence_published_generation =
                         other.terminal_fence_published_generation;
                     terminal_fence_observed_generation =
@@ -2142,12 +2149,24 @@ namespace llaminar2
             struct CaptureStreamTerminalTicket
             {
                 uint64_t generation = 0;
+                CaptureStreamTerminalTicket() = default;
 
                 /** @return Whether this ticket names a real publication. */
                 [[nodiscard]] constexpr bool valid() const noexcept
                 {
-                    return generation != 0;
+                    return generation != 0 && generation == issued_generation_ && bool(identity_);
                 }
+            private:
+                friend struct GraphSegmentCache;
+                /** @brief Issue only at the actual exact event record boundary. */
+                CaptureStreamTerminalTicket(uint64_t serial,std::shared_ptr<const std::uint8_t> identity,
+                    IWorkerGPUContext* worker,void* event,void* stream)
+                    :generation(serial),identity_(std::move(identity)),worker_(worker),event_(event),stream_(stream),issued_generation_(serial){}
+                std::shared_ptr<const std::uint8_t> identity_;
+                IWorkerGPUContext* worker_ = nullptr;
+                void* event_ = nullptr;
+                void* stream_ = nullptr;
+                uint64_t issued_generation_ = 0; ///< Sealed issuance; public diagnostic generation cannot relabel a receipt.
             };
 
             /**
@@ -2164,7 +2183,8 @@ namespace llaminar2
                 {
                     waitForPublishedCaptureStreamTerminal(
                         CaptureStreamTerminalTicket{
-                            terminal_fence_published_generation});
+                            terminal_fence_published_generation,terminal_receipt_identity,
+                            gpu_ctx_ref,terminal_event,capture_stream});
                 }
                 else
                 {
@@ -2189,8 +2209,12 @@ namespace llaminar2
                 decode_step = 0;
                 capture_variant_signature = 0;
                 snapshot_selection_identity.clear();
-                terminal_fence_published_generation = 0;
-                terminal_fence_observed_generation = 0;
+                // Retaining this same event retains its monotonic ticket namespace.
+                // A stale receipt must not alias generation1 after a topology reset.
+                if(stream_policy == StreamResetPolicy::Destroy) {
+                    terminal_fence_published_generation = 0;
+                    terminal_fence_observed_generation = 0;
+                }
                 runtime_collective_capture_requirement=RuntimeCollectiveCaptureRequirement::Required;
                 graph_replay_plan_policy =
                     GraphReplayPlanPolicy::RequireFullGraph;
@@ -2257,6 +2281,16 @@ namespace llaminar2
              */
             [[nodiscard]] bool prepareCaptureStreamTerminal(
                 IWorkerGPUContext *ctx);
+            /**
+             * @brief Bind one explicitly admitted same-source event obligation before the existing creator.
+             * @param ctx Actual original worker owning this exact cache stream.
+             * @param memory SAME prepared source PMA, with the singleton capture-terminal BOM admitted.
+             * @return The same original event preparation result; never retrofits an existing unpriced event.
+             * @note This overload shares the exact original creator/destructor. It does not add
+             *       an event or alter execution/receipt semantics. Existing callers remain unchanged.
+             */
+            [[nodiscard]] bool prepareCaptureStreamTerminal(IWorkerGPUContext *ctx,
+                const std::shared_ptr<PhysicalMemoryAuthority>& memory);
 
             /**
              * @brief Record the exact terminal immediately after graph launch.
@@ -2271,6 +2305,20 @@ namespace llaminar2
              */
             [[nodiscard]] CaptureStreamTerminalTicket
             publishCaptureStreamTerminal();
+
+            /**
+             * @brief Enqueue a same-participant device dependency on the exact current terminal, including an already-complete one.
+             * @param ticket Original predecessor publication; foreign/stale receipts reject before native work.
+             * @param exact_consumer_stream Non-null original successor capture stream.
+             * @param same_original_worker Exact predecessor/consumer worker, currently owning this thread.
+             * @throws std::exception For changed owners, invalid tickets or failed native wait enqueue.
+             * @note This only inserts the original event edge. It neither records/rebinds
+             *       the event nor queries/synchronizes, marks host observation, or retires a slot.
+             *       Host observation may race this edge: waiting on the same completed
+             *       event is safe; only a replaced publication invalidates the ticket.
+             */
+            void enqueuePublishedCaptureStreamTerminalWait(CaptureStreamTerminalTicket ticket,
+                void* exact_consumer_stream,IWorkerGPUContext* same_original_worker);
 
             /**
              * @brief Observe a terminal that was already recorded at launch.

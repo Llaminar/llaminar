@@ -45,6 +45,8 @@ namespace llaminar2
         {
             Acquire = 0,
             Release = 1,
+            ArmFiniteParent = 2, ///< Cold finite scope admission, before any child.
+            CloseFiniteParent = 3, ///< All child terminals precede this original-bank release.
         };
 
         /**
@@ -88,7 +90,7 @@ namespace llaminar2
             /** Exact peer-selected epoch; legal only for follower Acquire. */
             std::optional<PeerEpochSource> peer_epoch_source;
             /**
-             * Exact device-controller receipt lane used only after Release.
+             * Exact device-controller receipt lane used after Release or CloseFiniteParent.
              * The binding's opaque lifetime keeps every mapped address valid
              * for the retained graph; omitting it is legal only for a topology
              * without a device-resident ExpertOverlay authority.

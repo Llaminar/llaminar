@@ -18,6 +18,7 @@
  */
 
 #include "MoEOverlayLocalCapacityPlanner.h"
+#include "DeviceMoEOverlayEpochArena.h"
 #include "loaders/NativeWeightLoadStaging.h"
 #include "backends/NativeContextPreparation.h"
 #include "utils/DebugEnv.h"
@@ -1240,6 +1241,18 @@ namespace llaminar2
                         throw std::overflow_error("ExpertOverlay ordinary native owner inventory overflows");
                     captured_inventory.auxiliary_executable_count += ordinary;
                 }
+                if(device.is_gpu() && endpoint_devices.contains(device) &&
+                   rank_plan.runtime.moe_rebalance.mode==MoERebalanceRuntimeMode::Dynamic &&
+                   input.overlay_plan->authority_execution==MoEOverlayAuthorityExecutionKind::DeviceResident &&
+                   !MoEOverlayNoPeerResidency::hasNoPeerTopology(*input.overlay_plan) &&
+                   input.cluster_inventory && input.cluster_inventory->world_size==1) {
+                    // One original epoch arena per physical participant, shared
+                    // by its serial main/MTP families. Arm/End are retained
+                    // helper recipes, not new per-request captures.
+                    if(captured_inventory.auxiliary_executable_count > std::numeric_limits<std::size_t>::max()-2u)
+                        throw std::overflow_error("Finite epoch parent graph inventory overflows");
+                    captured_inventory.auxiliary_executable_count += 2u;
+                }
                 const std::size_t captured_graph_bytes = device.is_gpu()
                     ? estimateCapturedGraphExecutableBytes(device, captured_inventory) : 0u;
                 if(device==DeviceId::cpu() && prepared.cpu_joint) {
@@ -1313,6 +1326,9 @@ namespace llaminar2
                 }
                 additions
                     .add(PhysicalMemoryOwner::ExecutionWorkspace, prepared_service_bytes)
+                    .add(PhysicalMemoryOwner::ExecutionWorkspace,
+                        device.is_gpu() && endpoint_devices.contains(device)
+                            ? DeviceMoEOverlayEpochArena::allocationBytesForSlots(1u) : 0u)
                     // One host histogram/mailbox family per rank, regardless of
                     // how many CPU or GPU expert endpoints share that process.
                     .add(PhysicalMemoryOwner::ExecutionWorkspace,

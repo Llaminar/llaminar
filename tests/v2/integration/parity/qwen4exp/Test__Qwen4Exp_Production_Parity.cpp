@@ -29,6 +29,7 @@
 #include "Qwen4ExpFixedHeadParityCases.h"
 #include "Qwen4ExpGPUAdaptiveParityCases.h"
 #include "Qwen4ExpFullROCmTP4ParityCases.h"
+#include "Qwen4ExpAllGPUQ6MTPParityCases.h"
 #include "Qwen4ExpLocalPairedCases.h"
 #include "collective/BackendRouter.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -85,6 +86,12 @@ protected:
 
 /** @test Original native condition/verifier inputs, snapshots and reset/reuse, without HF acceptance. */
 TEST_P(Qwen4ExpMTPExactReplayTest, MTPExactReplay) { runQwen4ExpMTPExactReplay(); }
+
+// Rank-local all-GPU two-tier candidates use the original mapped device
+// GraphService. Source admission and native exact proof remain separate jobs.
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpAllGPUQ6DynamicOrdinalR3Exact, Qwen4ExpMTPExactReplayTest,
+    ::testing::ValuesIn(qwen4ExpAllGPUQ6MTPNativeExactCases()),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info) { return info.param.testName(); });
 
 // Real physical world2; source admission and native exact arithmetic are disjoint proofs.
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpCPUJointWorld2MTPExact, Qwen4ExpMTPExactReplayTest,
@@ -241,7 +248,7 @@ TEST_P(Qwen4ExpMainParityTest, SnapshotAdmission)
     ASSERT_TRUE(memory.is_open());
     memory << prepared->physical_memory_authority->rankAttestationSummary(true);
     ASSERT_NO_THROW(requireQwen4ExpCPUStorageMaterialization(prepared->physical_memory_authority->rankAttestation(),
-        prepared->prepared_routed_weight_plan));
+        prepared->prepared_routed_weight_plan, placement->allocators()));
     memory.flush();
     ASSERT_TRUE(memory.good());
 
@@ -464,6 +471,10 @@ TEST_P(Qwen4ExpCandidateSourceAdmissionTest, CandidateSourceAdmission)
     ASSERT_NO_FATAL_FAILURE(admitQwen4ExpSource(modelParityCase()));
 }
 
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpAllGPUQ6DynamicOrdinalR3SourceAdmission, Qwen4ExpCandidateSourceAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpAllGPUQ6MTPNativeExactCases())),
+    [](const ::testing::TestParamInfo<Qwen4ExpSourceAdmissionCase>& info) { return info.param.testName(); });
+
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpComposedCandidateSourceAdmission, Qwen4ExpCandidateSourceAdmissionTest,
     ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpExpandSourceAdmissionMTP(qwen4ExpComposedCandidateSourceAdmissionCases()))),
     [](const ::testing::TestParamInfo<Qwen4ExpSourceAdmissionCase> &info) { return info.param.testName(); });
@@ -657,7 +668,7 @@ TEST_P(Qwen4ExpNgramAdmissionTest, FullSourceAdmission)
         ASSERT_TRUE(memory.is_open());
         memory << authority->rankAttestationSummary(true);
         ASSERT_NO_THROW(requireQwen4ExpCPUStorageMaterialization(authority->rankAttestation(),
-            prepared->prepared_routed_weight_plan));
+            prepared->prepared_routed_weight_plan, placement->allocators()));
         memory.flush();
         ASSERT_TRUE(memory.good());
         std::ofstream csv(output / "admission.csv");

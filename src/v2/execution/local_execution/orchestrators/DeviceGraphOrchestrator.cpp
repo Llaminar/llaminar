@@ -4971,6 +4971,7 @@ namespace llaminar2
             }
             for (auto &cache : mtp_stochastic_outcome_graphs_) cache.invalidate();
             for (auto &cache : mtp_stochastic_target_distribution_graphs_) cache.invalidate();
+            moe_overlay_finite_placement_graphs_.invalidate();
             moe_overlay_epoch_acquire_graph_.invalidate();
             moe_overlay_epoch_release_graph_.invalidate();
             device_moe_rebalance_maintenance_graph_.invalidate();
@@ -11605,6 +11606,7 @@ namespace llaminar2
         {
             if (!retire_pending_release_before_identity_change())
                 return false;
+            moe_overlay_finite_placement_graphs_.invalidate();
             moe_overlay_epoch_acquire_graph_.invalidate();
             moe_overlay_epoch_release_graph_.invalidate();
             moe_overlay_epoch_acquired_event_.reset();
@@ -11633,6 +11635,7 @@ namespace llaminar2
             if (!retire_pending_release_before_identity_change())
                 return false;
             invalidateSparseQueryParents();
+            moe_overlay_finite_placement_graphs_.invalidate();
             moe_overlay_epoch_acquire_graph_.invalidate();
             moe_overlay_epoch_release_graph_.invalidate();
             moe_overlay_epoch_acquired_event_.reset();
@@ -11688,6 +11691,36 @@ namespace llaminar2
          * family materialization. Resolve ownership and preallocate events now;
          * build the two graph definitions only once that generation exists.
          */
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::prepareMoEOverlayFinitePlacementGraphs()
+    {
+        if(!moe_overlay_epoch_execution_binding_ ||
+           !moe_overlay_epoch_execution_binding_.retirement_readiness_controller ||
+           workspaceGeneration(state_.device_id)==0u)return false;
+        auto *context=getDeviceContext(state_.device_id);
+        if(!context)return false;
+        auto &worker=GPUDeviceContextPool::instance().getContext(state_.device_id);
+        worker.submitAndWait([&] {
+            moe_overlay_finite_placement_graphs_.prepare(executor_,*context,worker,
+                moe_overlay_epoch_execution_binding_.arena,
+                *moe_overlay_epoch_execution_binding_.retirement_readiness_controller,
+                workspaceGeneration(state_.device_id),true);
+        });
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::runMoEOverlayFinitePlacementBoundary(
+        DeviceMoEOverlayEpochParentAction action)
+    {
+        // Actual parent completion is observed inside the original graph cache,
+        // independently of the background maintenance worker's reader wait.
+        moe_overlay_finite_placement_graphs_.run(action,[&](void *stream) {
+            return enqueueMoEOverlayDeviceInferenceBoundary(stream,
+                {.purpose=MoEOverlayInferenceBoundaryPurpose::PlacementDecisionSnapshot})==
+                MoEOverlayInferenceBoundaryStatus::Submitted;
+        });
         return true;
     }
 

@@ -1486,6 +1486,15 @@ add_v2_routed_expert_policy_unit(
     V2_Unit_MoEOverlayDeviceControllerTopology
     unit/execution/moe/Test__MoEOverlayDeviceControllerTopology.cpp
 )
+# Validate the production cold role partition without constructing device state.
+add_v2_test(V2_Integration_MoEOverlayParticipantGPUOwnership
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_device_controller_topology>
+        --gtest_filter=Test__MoEOverlayDeviceControllerTopology.ParticipantGPUOwnership*
+        --gtest_repeat=20
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;ExpertOverlay;Ownership;Regression"
+    MPI_PROCS 1 NO_MODELS NO_MPI TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1"
+)
 add_v2_test(V2_Integration_MoEOverlayDeviceAliasHostBoundary
     COMMAND $<TARGET_FILE:v2_unit_moe_overlay_device_controller_topology>
         --gtest_filter=Test__MoEOverlayDeviceControllerTopology.CaptureBindingNeverDereferencesDeviceAliases
@@ -5365,6 +5374,16 @@ add_v2_test(V2_Unit_ParityRunnerEvidence
     TIMEOUT 10
     NO_MPI NO_MODELS
 )
+
+# Completed native/mapped/CPU movement must remain fresh and observable.
+add_v2_test(V2_Integration_ParityMovementEvidenceReplay
+    COMMAND $<TARGET_FILE:v2_unit_parity_runner_evidence>
+        --gtest_filter=ParityRunnerEvidenceTest.MovementFactsRequireCompletedNativePublicationAndFreshDomains:ParityRunnerEvidenceTest.MovementFactsPreserveCPUAndMappedContracts
+        --gtest_repeat=20
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Parity;MoE;Replay;Regression"
+    TIMEOUT 30 MPI_PROCS 1 NO_MPI NO_MODELS
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ParityMovementEvidenceReplay)
 
 add_executable(v2_unit_native_verifier_row_evidence
     unit/parity/Test__NativeVerifierRowEvidence.cpp
@@ -12803,7 +12822,7 @@ if(ZLIB_FOUND)
         SOURCE_ADMISSION_MTP_SOURCE_KIND Paired
         SOURCE_ADMISSION_MTP_MODEL_FILES
             "/opt/llaminar-models/Qwen3.8-Flash-Next-GGUF/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"
-        PRODUCTION_PERF_STATS_FILTER "forward_graph,mtp,prefix_cache,moe_rebalance,moe_overlay_residency,moe_placement,moe_overlay,immutable_lookup,qsa,kernel.gdn_projection_route,weight_loading.gdn_projection_arithmetic_prepared_weight,weight_loading.moe_router_arithmetic_prepared_weight,kernel.cpu_moe_fp16_operand_router_calls,kernel.cpu_moe_grouped_router_calls,cuda_moe.router_fp16_operands,cuda_moe.router_fp16_owned_operands,cuda_moe.router_fp16_grouped_operands,kernel.rocm_moe_batch_invariant_prefill_router_calls,kernel.rocm_moe_decode_equivalent_runtime_m_router_calls,memory,moe_overlay_capacity,gpu_graph_inventory,kernel.rocm_moe_router_fp16_operand_calls"
+        PRODUCTION_PERF_STATS_FILTER "forward_graph,mtp,prefix_cache,moe_rebalance,moe_overlay_controller,moe_overlay_residency,moe_placement,moe_overlay,immutable_lookup,qsa,kernel.gdn_projection_route,weight_loading.gdn_projection_arithmetic_prepared_weight,weight_loading.moe_router_arithmetic_prepared_weight,kernel.cpu_moe_fp16_operand_router_calls,kernel.cpu_moe_grouped_router_calls,cuda_moe.router_fp16_operands,cuda_moe.router_fp16_owned_operands,cuda_moe.router_fp16_grouped_operands,kernel.rocm_moe_batch_invariant_prefill_router_calls,kernel.rocm_moe_decode_equivalent_runtime_m_router_calls,memory,moe_overlay_capacity,gpu_graph_inventory,kernel.rocm_moe_router_fp16_operand_calls"
         LABELS "V2;Integration;Parity;Qwen4Exp;MixtureOfExperts;CPU;CUDA;ROCm;ExpertOverlay;PyTorch;GoldenReference;FullModel"
         MPI_PROCS 1
         MODEL_FILES ${V2_PARITY_MODEL_QWEN_FLASH_NEXT} ${V2_QFN_LOCAL_PAIRED_PREDICTOR}
@@ -12833,7 +12852,7 @@ if(ZLIB_FOUND)
         TEST_PREFIX V2_Integration_Parity_Qwen4Exp_MTP
         # Match main-model arithmetic evidence without adding broad domains or
         # changing runtime selection, movement policy or measured benchmark data.
-        PRODUCTION_PERF_STATS_FILTER "forward_graph,mtp,prefix_cache,moe_rebalance,moe_overlay_residency,moe_placement,immutable_lookup,qsa,kernel.gdn_projection_route,weight_loading.gdn_projection_arithmetic_prepared_weight,weight_loading.moe_router_arithmetic_prepared_weight,kernel.cpu_moe_fp16_operand_router_calls,kernel.cpu_moe_grouped_router_calls,cuda_moe.router_fp16_operands,cuda_moe.router_fp16_owned_operands,cuda_moe.router_fp16_grouped_operands,kernel.rocm_moe_batch_invariant_prefill_router_calls,kernel.rocm_moe_decode_equivalent_runtime_m_router_calls,kernel.rocm_moe_router_fp16_operand_calls"
+        PRODUCTION_PERF_STATS_FILTER "forward_graph,mtp,prefix_cache,moe_rebalance,moe_overlay_controller,moe_overlay_residency,moe_placement,immutable_lookup,qsa,kernel.gdn_projection_route,weight_loading.gdn_projection_arithmetic_prepared_weight,weight_loading.moe_router_arithmetic_prepared_weight,kernel.cpu_moe_fp16_operand_router_calls,kernel.cpu_moe_grouped_router_calls,cuda_moe.router_fp16_operands,cuda_moe.router_fp16_owned_operands,cuda_moe.router_fp16_grouped_operands,kernel.rocm_moe_batch_invariant_prefill_router_calls,kernel.rocm_moe_decode_equivalent_runtime_m_router_calls,kernel.rocm_moe_router_fp16_operand_calls"
         LABELS "V2;Integration;Parity;Qwen4Exp;MTP;MixtureOfExperts;CPU;CUDA;ROCm;ExpertOverlay;PyTorch;GoldenReference;FullModel;UnqualifiedCandidate"
         MPI_PROCS 1 MODEL_FILES ${_qfn_mtp_numerical_sources})
 
@@ -24238,6 +24257,7 @@ add_executable(v2_test_snapshot_capture
     unit/snapshots/Test__ParityNumericalAggregation.cpp
     unit/snapshots/Test__ParitySnapshotSelection.cpp
     unit/snapshots/Test__MTPParitySnapshotContext.cpp
+    unit/snapshots/Test__MTPParityComparisonPlacement.cpp
     unit/snapshots/Test__MoERoutingBoundary.cpp
     unit/snapshots/Test__MoERouteConditionedProof.cpp
 )
@@ -24247,6 +24267,15 @@ add_v2_test(V2_Unit_SnapshotCapture
     LABELS "V2;Unit;Snapshot;SnapshotCapture;DGORefactor"
     MPI_PROCS 1
 )
+# Serial/verifier comparisons use the original frozen placement authority;
+# an unsupported native scope cannot quietly execute an unprotected retry.
+add_v2_test(V2_Integration_ParityMTPComparisonPlacement
+    COMMAND $<TARGET_FILE:v2_test_snapshot_capture>
+        --gtest_filter=MTPParityComparisonPlacement.* --gtest_repeat=20
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Parity;MTP;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ParityMTPComparisonPlacement)
 # Canonical residual checkpoints follow named outputs of the real fused producer,
 # including the next-layer producer outside a selected layer cohort.
 add_v2_test(V2_Integration_FusedNormSnapshotPublication
@@ -26069,6 +26098,14 @@ add_v2_test(V2_Unit_Qwen35MoEGraph
     LABELS "V2;Unit;Qwen35MoE;Graph;MixtureOfExperts;TensorParallel"
     MPI_PROCS 1
 )
+# Epoch storage is admitted before the prepared weight-store handoff.
+add_v2_test(V2_Integration_QwenMoEEarlyEpochMemoryAuthority
+    COMMAND $<TARGET_FILE:v2_test_qwen35moe_graph>
+        --gtest_filter=Test__Qwen35MoEGraph.EarlyEpochMemoryAuthority* --gtest_repeat=20
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;PMA;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenMoEEarlyEpochMemoryAuthority)
 add_v2_test(V2_Integration_MirroredEmbeddingGraphPhase
     COMMAND $<TARGET_FILE:v2_test_qwen35moe_graph>
         --gtest_filter=Test__Qwen35MoEGraph.DecodeMirroredEmbeddingSuppressesOnlyDecodeEmbeddingAllreduce

@@ -401,6 +401,38 @@ namespace llaminar2
         return value ^ (value >> 31u);
     }
 
+    /**
+     * @brief Preserve policy-authored cycle identity without changing command bytes.
+     * @param axis Original movement objective.
+     * @param cycle_id One-based durable cycle, or zero for transient actions.
+     * @return Fixed command flags, or invalid zero for an unknown axis or cycle overflow.
+     */
+    LLAMINAR_MOE_CONTROLLER_HD std::uint32_t moeOverlayMovementFlags(
+        MoEOverlayDeviceMovementAxis axis, std::uint32_t cycle_id) noexcept
+    {
+        // Out-of-range identities become invalid instead of aliasing an older
+        // admitted group. The physical count itself is never truncated.
+        const auto objective = static_cast<std::uint32_t>(axis);
+        return objective < 1u || objective > 3u ||
+                   cycle_id > (UINT32_MAX >> 2u)
+            ? 0u
+            : (cycle_id << 2u) | objective;
+    }
+
+    /** @return Exact authored objective, excluding the durable cycle identity. */
+    LLAMINAR_MOE_CONTROLLER_HD MoEOverlayDeviceMovementAxis moeOverlayMovementAxis(
+        std::uint32_t flags) noexcept
+    {
+        return static_cast<MoEOverlayDeviceMovementAxis>(flags & 3u);
+    }
+
+    /** @return One-based authored durable cycle; zero denotes transient work. */
+    LLAMINAR_MOE_CONTROLLER_HD std::uint32_t moeOverlayMovementCycle(
+        std::uint32_t flags) noexcept
+    {
+        return flags >> 2u;
+    }
+
     /** @return Whether one movement entry matches its immutable transaction. */
     LLAMINAR_MOE_CONTROLLER_HD bool moeOverlayMovementCommandValid(
         const MoEOverlayDeviceMovementCommand &entry,
@@ -413,7 +445,7 @@ namespace llaminar2
         std::uint64_t candidate_epoch) noexcept
     {
         const auto movement_axis =
-            static_cast<MoEOverlayDeviceMovementAxis>(entry.flags);
+            moeOverlayMovementAxis(entry.flags);
         const bool movement_axis_valid =
             movement_axis == MoEOverlayDeviceMovementAxis::TierResidency ||
             movement_axis ==
@@ -437,6 +469,8 @@ namespace llaminar2
                         DynamicPlacement ||
             kind == MoEOverlayDeviceControllerTransactionKind::
                         PreparedContextRestore;
+        if ((moeOverlayMovementCycle(entry.flags) != 0u) != durable_placement)
+            return false;
         const bool physical_movement =
             op == MoEOverlayDeviceMovementOp::DurableMove ||
             op == MoEOverlayDeviceMovementOp::TransientArrival;

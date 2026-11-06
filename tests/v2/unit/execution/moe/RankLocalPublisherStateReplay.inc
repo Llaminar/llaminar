@@ -44,7 +44,7 @@ TEST(Test__MoEOverlayInferenceTransaction, RankLocalCallablePublisherRetiresExac
    ASSERT_TRUE(handle.ok)<<handle.error;EXPECT_EQ(handle.ticket.transaction_ordinal,++ordinal);
    ASSERT_NE(state.activeTicket(),nullptr);EXPECT_EQ(*state.activeTicket(),handle.ticket);
    EXPECT_FALSE(state.complete(request.initial_placement_epoch,0,&error));
-   EXPECT_FALSE(state.publish(descriptor,[&](const auto&,std::string*){++submissions;return true;}).ok);
+   EXPECT_FALSE(state.begin(request,&error)) << "A live original command cannot be replaced";
    auto foreign=handle;++foreign.ticket.workspace_generation;
    EXPECT_FALSE(state.retire(foreign,[&](std::string*){++joins;return true;},&error));
    ASSERT_TRUE(state.retire(handle,[&](std::string*){++joins;return true;},&error))<<error;
@@ -250,3 +250,176 @@ TEST(Test__MoEOverlayInferenceTransaction, RankLocalOriginalEnqueuesCompleteBefo
     }
 }
 }
+
+namespace llaminar2::test
+{
+/** @test Original fixed protocol slots retain each draft/verifier handle until exact return retirement. */
+TEST(Test__MoEOverlayInferenceTransaction, RankLocalCallablePublisherRetainsOriginalMTPRing)
+{
+    LocalPublicationState state(localPublicationConfig());
+    std::string error;
+    ASSERT_EQ(state.slotCount(), 4u);
+    for (std::uint64_t request = 1; request <= 20; ++request)
+    {
+        ASSERT_TRUE(state.begin({request, 1, 41}, &error)) << error;
+        std::uint64_t ordinal = 0;
+        for (const int graphs : {2, 4, 3, 2, 4})
+        {
+            std::array<MoEOverlayPublishedInferenceTransaction, 4> handles;
+            for (int index = 0; index < graphs; ++index)
+            {
+                auto descriptor = localPublicationDescriptor(index + 1 == graphs ? graphs - 1 : 0, ordinal + index, 41);
+                if (index + 1 < graphs)
+                {
+                    descriptor.graph_role = MoEOverlayInferenceGraphRole::MTPDraft;
+                    descriptor.draft_depth = graphs - 1;
+                    descriptor.sidecar_depth = index;
+                }
+                handles[index] = state.publishOriginalFollowers(descriptor,
+                    [&](const auto &ticket, std::string *)
+                    {
+                        EXPECT_EQ(ticket.transaction_ordinal, ++ordinal);
+                        return true;
+                    }, [](std::string *) { return true; });
+                ASSERT_TRUE(handles[index].ok) << handles[index].error;
+                ASSERT_TRUE(state.activeSlot(handles[index].ticket));
+                EXPECT_EQ(*state.activeSlot(handles[index].ticket), handles[index].slot_index);
+            }
+            EXPECT_FALSE(state.complete(41, 0, &error));
+            for (int index = 0; index < graphs; ++index)
+            {
+                auto foreign = handles[index];
+                ++foreign.ticket.command_id;
+                EXPECT_FALSE(state.retire(foreign, [](std::string *) { ADD_FAILURE(); return true; }, &error));
+                ASSERT_TRUE(state.retire(handles[index], [](std::string *) { return true; }, &error)) << error;
+                EXPECT_FALSE(state.activeSlot(handles[index].ticket));
+            }
+            EXPECT_FALSE(state.active());
+        }
+        ASSERT_TRUE(state.complete(41, 0, &error)) << error;
+    }
+}
+
+/** @test A later partial enqueue retains every original slot until all native drains are proven. */
+TEST(Test__MoEOverlayInferenceTransaction, RankLocalCallablePublisherMTPRingRetainsPartialFailure)
+{
+    LocalPublicationState state(localPublicationConfig());
+    std::string error;
+    ASSERT_TRUE(state.begin({9, 1, 41}, &error));
+    std::array<MoEOverlayPublishedInferenceTransaction, 3> handles;
+    for (std::size_t index = 0; index < handles.size(); ++index)
+    {
+        handles[index] = state.publish(localPublicationDescriptor(0, index, 41),
+            [index](const auto &, std::string *failure)
+            {
+                if (index == 2)
+                {
+                    *failure = "original later enqueue failure";
+                    return false;
+                }
+                return true;
+            });
+        EXPECT_EQ(handles[index].ok, index != 2);
+    }
+    ASSERT_TRUE(state.active());
+    for (const auto &handle : handles)
+        ASSERT_TRUE(state.activeSlot(handle.ticket));
+    std::size_t drains = 0;
+    EXPECT_FALSE(state.abort(41, 7, [&](std::string *failure)
+    {
+        for (std::size_t index = 0; index < state.slotCount(); ++index)
+            if (state.activeHandle(index))
+                ++drains;
+        *failure = "original missing native proof";
+        return false;
+    }, &error));
+    EXPECT_EQ(error, "original missing native proof");
+    EXPECT_EQ(drains, 3u);
+    for (const auto &handle : handles)
+        ASSERT_TRUE(state.activeSlot(handle.ticket));
+    ASSERT_TRUE(state.abort(41, 7, [&](std::string *)
+    {
+        for (std::size_t index = 0; index < state.slotCount(); ++index)
+            if (state.activeHandle(index))
+                ++drains;
+        return true;
+    }, &error)) << error;
+    EXPECT_EQ(drains, 6u);
+    EXPECT_FALSE(state.active());
+    EXPECT_FALSE(state.begin({10, 1, 41}, &error));
+}
+
+/** @test Exhaustion cannot allocate or overwrite a fifth handle beyond the original ring. */
+TEST(Test__MoEOverlayInferenceTransaction, RankLocalCallablePublisherMTPRingRejectsCapacityOverrun)
+{
+    LocalPublicationState state(localPublicationConfig());
+    std::string error;
+    ASSERT_TRUE(state.begin({9, 1, 41}, &error));
+    std::size_t submissions = 0;
+    for (std::size_t index = 0; index < state.slotCount(); ++index)
+    {
+        const auto handle = state.publish(localPublicationDescriptor(0, index, 41),
+            [&](const auto &, std::string *) { ++submissions; return true; });
+        ASSERT_TRUE(handle.ok) << handle.error;
+    }
+    EXPECT_FALSE(state.publish(localPublicationDescriptor(0, 5, 41),
+        [&](const auto &, std::string *) { ++submissions; return true; }).ok);
+    EXPECT_EQ(submissions, state.slotCount());
+    ASSERT_TRUE(state.abort(41, 7, [](std::string *) { return true; }, &error)) << error;
+    EXPECT_FALSE(state.active());
+}
+
+} // namespace llaminar2::test
+
+namespace llaminar2::test
+{
+/**
+ * @test Exact native terminal observation never erases a failed original source cancellation.
+ * This exercises the actual cancellation publisher and original submission drain
+ * guard with recorded native-proof state; it creates no native owner or permit.
+ */
+TEST(Test__MoEOverlayInferenceTransaction, RankLocalCallablePublisherAbortRetainsSourceFailureAfterNativeProof)
+{
+    using Access = MoEOverlayParticipantNativeRetirementReplayAccess;
+    LocalPublicationState state(localPublicationConfig());
+    std::string error;
+    ASSERT_TRUE(state.begin({9, 1, 41}, &error));
+    const auto handle = state.publish(localPublicationDescriptor(0, 0, 41),
+        [](const auto &, std::string *) { return true; });
+    ASSERT_TRUE(handle.ok) << handle.error;
+    std::mutex mutex;
+    std::exception_ptr source_failure;
+    Access::cancelSource([] { throw std::runtime_error("original source retirement refusal"); }, mutex, source_failure);
+    ASSERT_TRUE(source_failure);
+    const auto original_failure = source_failure;
+    bool native_joined = false;
+    int native_drains = 0;
+    const std::string expected = "Original pooled source cancellation failed: original source retirement refusal";
+    const auto abort_drain = [&](std::string *diagnostic)
+    {
+        return Access::drainCancellation(native_joined, mutex, source_failure,
+            [&](std::string *failure)
+            {
+                ++native_drains;
+                native_joined = true;
+                *failure = expected;
+                return false;
+            }, diagnostic);
+    };
+    EXPECT_FALSE(state.abort(41, 7, abort_drain, &error));
+    ASSERT_TRUE(native_joined);
+    EXPECT_EQ(error, expected);
+    EXPECT_EQ(native_drains, 1);
+    for (int repeat = 0; repeat < 3; ++repeat)
+    {
+        EXPECT_FALSE(state.abort(41, 7, abort_drain, &error));
+        EXPECT_EQ(error, expected);
+        EXPECT_EQ(native_drains, 1) << "An already observed event cannot be waited again";
+        EXPECT_TRUE(state.activeSlot(handle.ticket));
+        EXPECT_EQ(source_failure, original_failure);
+    }
+    std::exception_ptr successful_source;
+    EXPECT_TRUE(Access::drainCancellation(true, mutex, successful_source,
+        [](std::string *) { ADD_FAILURE() << "Already observed native terminal was waited again"; return false; }, &error));
+}
+} // namespace llaminar2::test

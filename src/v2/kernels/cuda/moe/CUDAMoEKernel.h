@@ -190,6 +190,11 @@ namespace llaminar2
             override;
 
         /** @copydoc IMoEKernel::acquireMoEOverlayEpoch */
+        /** @brief Execute the original arena's captured finite parent Arm/Close action. */
+        bool runMoEOverlayEpochParentAction(const MoEKernelLaunchContext &launch,
+            DeviceMoEOverlayEpochControl *control, DeviceMoEOverlayEpochStatus *status,
+            DeviceMoEOverlayEpochParentAction action) override;
+
         bool acquireMoEOverlayEpoch(
             const MoEKernelLaunchContext &launch,
             DeviceMoEOverlayEpochControl *control,

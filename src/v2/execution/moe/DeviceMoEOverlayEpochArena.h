@@ -16,6 +16,8 @@
 namespace llaminar2
 {
     class IBackend;
+    class PhysicalMemoryAuthority;
+    class PhysicalMemoryAllocationLease;
 
     /**
      * @brief Own stable CPU or GPU addresses for placement-epoch RCU.
@@ -37,6 +39,8 @@ namespace llaminar2
         struct Config
         {
             DeviceId device_id = DeviceId::invalid(); ///< Exact owning participant.
+            /// SAME original source/PMA; required before any CPU/GPU epoch bytes are materialized.
+            std::shared_ptr<PhysicalMemoryAuthority> memory_authority;
             std::uint64_t initial_epoch = 1u;         ///< First executable residency epoch.
             std::uint32_t initial_bank = 0u;          ///< Bank already populated for that epoch.
             std::uint32_t request_slot_capacity = 1u; ///< Maximum concurrent request tickets.
@@ -215,12 +219,20 @@ namespace llaminar2
             return maintenance_status_;
         }
 
-        /**
-         * @return Requested payload bytes owned by this arena.
-         *
-         * Allocator metadata and alignment padding are deliberately excluded so
-         * the value can enter the model memory bill of materials.
+        /** @return Exact original arena parent address; contents remain exclusively device-owned. */
+        [[nodiscard]] DeviceMoEOverlayEpochParent *finiteParent() const noexcept { return parent_; }
+
+        /** @return Persistent semantic status for captured finite Arm/End, never a live epoch mirror. */
+        [[nodiscard]] DeviceMoEOverlayEpochStatus *finiteParentStatus() const noexcept { return parent_status_; }
+
+        /** @brief Quote the SAME aligned packed storage used by materialization.
+         * @param slots Positive immutable request capacity.
+         * @return Exact physical arena allocation extent including every record and alignment.
+         * @throws std::invalid_argument For zero slots; std::overflow_error for an unrepresentable extent.
          */
+        [[nodiscard]] static std::size_t allocationBytesForSlots(std::uint32_t slots);
+
+        /** @return Exact PMA-owned packed allocation, including internal alignment. */
         [[nodiscard]] std::size_t allocationBytes() const noexcept;
 
     private:
@@ -233,6 +245,12 @@ namespace llaminar2
         DeviceId device_id_ = DeviceId::invalid();
         std::uint32_t request_slot_capacity_ = 0u;
         IBackend *backend_ = nullptr;
+        std::shared_ptr<PhysicalMemoryAuthority> memory_authority_;
+        std::unique_ptr<PhysicalMemoryAllocationLease> allocation_lease_;
+        void *storage_ = nullptr;
+        std::size_t storage_bytes_ = 0u;
+        DeviceMoEOverlayEpochParent *parent_ = nullptr;
+        DeviceMoEOverlayEpochStatus *parent_status_ = nullptr;
         DeviceMoEOverlayEpochControl *control_ = nullptr;
         DeviceMoEOverlayEpochTicket *request_tickets_ = nullptr;
         DeviceMoEOverlayEpochStatus *request_statuses_ = nullptr;

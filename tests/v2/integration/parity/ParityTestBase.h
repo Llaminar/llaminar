@@ -57,6 +57,7 @@
 #include "snapshots/SnapshotSelectedIds.h"
 #include "snapshots/SnapshotEmptyObservation.h"
 #include "../../utils/TypedNpySnapshot.h"
+#include "../../utils/MTPParityComparisonPlacement.h"
 #include "../../utils/QwenSparseQueryParityEvidence.h"
 
 #include "ParityReferenceCache.h"
@@ -8127,75 +8128,12 @@ namespace llaminar2::test::parity
                 << "ExpertOverlay parity requires PerfStats movement evidence";
             ASSERT_TRUE(
                 PerfStatsCollector::isDomainEnabled("moe_rebalance") ||
-                PerfStatsCollector::isDomainEnabled("moe_overlay_residency"))
+                PerfStatsCollector::isDomainEnabled("moe_overlay_residency") ||
+                PerfStatsCollector::isDomainEnabled("moe_overlay_controller"))
                 << "ExpertOverlay parity must enable moe_rebalance or "
-                   "moe_overlay_residency PerfStats";
+                   "moe_overlay_residency or moe_overlay_controller PerfStats";
 
-            const auto counter = [&](const char *domain, const char *name)
-            {
-                return std::accumulate(
-                    records.begin(), records.end(), 0.0,
-                    [&](double total, const PerfStatRecord &record)
-                    {
-                        return total +
-                               (record.kind == PerfStatRecord::Kind::Counter &&
-                                        record.domain == domain &&
-                                        record.name == name
-                                    ? record.value
-                                    : 0.0);
-                    });
-            };
-
-            /*
-             * Host-authoritative multi-tier movement and device-authoritative
-             * homogeneous movement publish different counters, but both must
-             * prove the same four facts. Keep the mapping here at the common
-             * parity boundary rather than teaching each model fixture backend
-             * implementation details.
-             */
-            std::array<float, 4> local = {
-                static_cast<float>(
-                    counter("moe_overlay_residency", "committed_expert_migrations") +
-                    counter("moe_overlay_controller", "dynamic_movement_transactions") +
-                    counter("moe_rebalance", "device_rebalance_dynamic_ownership_swap_accepts") +
-                    counter("moe_rebalance", "device_rebalance_selected_replicas")),
-                static_cast<float>(
-                    counter("moe_overlay_residency", "cpu_native_copy_bytes") +
-                    counter("moe_overlay_residency", "remote_projection_payload_bytes_completed") +
-                    counter("moe_overlay_residency", "placement_transfer_operations_completed") +
-                    counter("moe_overlay_residency", "device_physical_destinations_staged") +
-                    counter("moe_rebalance", "cpu_llep_weight_transfers") +
-                    counter("moe_rebalance", "weight_transfer_outgoing_entries") +
-                    counter("moe_rebalance", "weight_transfer_incoming_entries") +
-                    counter("moe_rebalance", "mask_apply_received_entries") +
-                    counter("moe_rebalance", "device_rebalance_copy_copied_arrivals") +
-                    counter("moe_rebalance", "device_rebalance_transfer_current_copied_arrivals") +
-                    counter("moe_rebalance", "device_rebalance_wave_copied_arrivals_total") +
-                    counter("moe_rebalance", "device_rebalance_request_copied_payload_lower_bound")),
-                static_cast<float>(
-                    counter("moe_overlay_residency", "cpu_native_copy_bytes") +
-                    counter("moe_overlay_residency", "remote_projection_payload_bytes_completed") +
-                    counter("moe_overlay_residency", "placement_transfer_payload_bytes_completed") +
-                    counter("moe_overlay_controller", "dynamic_physical_bytes") +
-                    counter("moe_rebalance", "cpu_llep_weight_transfer_incoming_bytes") +
-                    counter("moe_rebalance", "cpu_llep_weight_transfer_outgoing_bytes") +
-                    counter("moe_rebalance", "weight_transfer_incoming_bytes") +
-                    counter("moe_rebalance", "weight_transfer_outgoing_bytes") +
-                    counter("moe_rebalance", "mask_apply_received_bytes") +
-                    counter("moe_rebalance", "device_rebalance_transfer_useful_payload_bytes") +
-                    counter("moe_rebalance", "device_rebalance_request_useful_payload_bytes_lower_bound")),
-                static_cast<float>(
-                    counter("moe_overlay_residency", "expert_migration_edges") +
-                    counter("moe_overlay_residency", "device_physical_epoch_published") +
-                    counter("moe_rebalance", "cpu_llep_weight_transfers") +
-                    counter("moe_rebalance", "ownership_change_entries") +
-                    counter("moe_rebalance", "replica_arrivals") +
-                    counter("moe_rebalance", "mask_apply_received_entries") +
-                    counter("moe_rebalance", "device_rebalance_apply_applied_arrivals") +
-                    counter("moe_rebalance", "device_rebalance_transfer_current_applied_arrivals") +
-                    counter("moe_rebalance", "device_rebalance_wave_applied_arrivals_total") +
-                    counter("moe_rebalance", "device_rebalance_request_applied_payload_lower_bound")),
-            };
+            const auto local = parityMoEMovementFacts(records);
             std::array<float, 4> global = local;
             if (mpi_ctx_ && mpiWorldSize() > 1)
                 parityCoordinationMPIContext()->allreduce_sum(
@@ -10063,26 +10001,14 @@ namespace llaminar2::test::parity
             runProductionParityMTPCheckpointComparisons(summary, purpose, native_attempt);
         }
 
-        /** @return Whether the original runtime owns a moving host CPU-cohort placement. */
-        bool productionParityMTPUsesMovingCPUJoint() const
-        {
-            const auto &runtime = orch_runner_->config();
-            return runtime.moe_routed_expert_plan &&
-                MoEExpertOwnerMap::usesCPUJointFragments(*runtime.moe_routed_expert_plan) &&
-                runtime.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic;
-        }
-
-        /** @brief Keep just one real serial/grouped comparison at its original placement.
-         * @param body Existing public request/reset calls and their unchanged exact comparison.
-         * @note Maintenance notifications remain active. Publication is released
-         * between comparisons; no parent spans the outer history or movement proof.
+        /** @brief Keep one unchanged comparison under the admitted placement authority.
+         * @param body Existing public request/reset calls and their exact comparison.
+         * @note Each callback owns an independent scope. Maintenance remains active
+         * between comparisons; no placement scope spans the outer history search.
          */
         void withProductionParityMTPComparisonPlacement(const std::function<void()> &body)
         {
-            if (productionParityMTPUsesMovingCPUJoint())
-                orch_runner_->withMoEOverlayInferencePlacementScope(body);
-            else
-                body();
+            withMTPParityComparisonPlacement(*orch_runner_, body);
         }
 
         /** @brief Run primary, adaptive and acceptance comparisons with independent placement ancestry.
@@ -10415,7 +10341,8 @@ namespace llaminar2::test::parity
                 {
                     const auto adaptive_comparison = [&] {
                     std::optional<std::vector<int32_t>> placement_serial_oracle;
-                    if (productionParityMTPUsesMovingCPUJoint())
+                    if (mtpParityComparisonPlacementOwner(orch_runner_->config()) !=
+                        MTPParityComparisonPlacementOwner::Unscoped)
                     {
                         std::string error;
                         placement_serial_oracle = captureProductionParityMTPSerialOracle(
@@ -11258,7 +11185,8 @@ namespace llaminar2::test::parity
                 {
                     original_layers=prepareProductionParityMoEOwnerOrderEvidence().expected_layers;
                     if(!PerfStatsCollector::isDomainEnabled("moe_rebalance") &&
-                       !PerfStatsCollector::isDomainEnabled("moe_overlay_residency"))
+                       !PerfStatsCollector::isDomainEnabled("moe_overlay_residency") &&
+                       !PerfStatsCollector::isDomainEnabled("moe_overlay_controller"))
                         throw std::logic_error("ExpertOverlay parity requires PerfStats movement evidence");
                 }
             }

@@ -22,6 +22,7 @@
 #include <unordered_map>
 
 #include "execution/compute_stages/IComputeStage.h"
+#include "execution/compute_stages/stages/qwen4exp/Qwen4ExpPredictorBuilder.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
 #include "execution/local_execution/graph/DeviceGraphCaptureController.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
@@ -778,7 +779,9 @@ namespace
         }
         void destroyEvent(void *) override { ++events_destroyed_; }
         void recordEvent(void *, void *) override { ++events_recorded_; }
-        void waitEvent(void *, void *) override { ++events_waited_; }
+        void waitEvent(void *event, void *stream) override {
+            ++events_waited_;last_waited_event_=event;last_waited_stream_=stream;
+        }
         bool queryEventChecked(void *event, bool &ready) override
         {
             ++event_query_calls_;
@@ -842,6 +845,8 @@ namespace
         int events_destroyed_ = 0;
         int events_recorded_ = 0;
         int events_waited_ = 0;
+        void* last_waited_event_ = nullptr;
+        void* last_waited_stream_ = nullptr;
         int event_query_calls_ = 0;
         int events_synchronized_ = 0;
         int event_elapsed_queries_ = 0;
@@ -8412,4 +8417,220 @@ TEST(Test__GraphSegmentCache, RetainedFullNativeEndpointRequiresExactExecutableA
     probe(true, native, false, true, true, false, false, false);
     probe(true, native, false, true, false, true, false, false);
     probe(true, native, false, true, false, false, true, false);
+}
+
+/**
+ * @test Original predictor wave joins different legal participant ranges while retaining local cache identity.
+ * The native replay backend is doubled; actual builder declaration and Controller
+ * boundary generation, capture, cache reuse and rejection execute unchanged.
+ */
+TEST(Test__GraphSegmentCache, QFNPredictorWaveAuthenticatesOriginalTransactionAcrossLocalTP)
+{
+    const auto source = [](int layer) {
+        const Qwen4ExpPredictorMetadata metadata{static_cast<std::uint32_t>(layer),
+            Qwen4ExpPredictorAttention::Dense,Qwen4ExpPredictorHiddenNorm::PerBranch,
+            Qwen4ExpPredictorSource::SharedGGUF};
+        return LayerGraphSourceIdentity::qwen4ExpSharedPredictor(layer,metadata,layer,0,0);
+    };
+    const auto context = [&](DeviceId device,int rows,int layer) {
+        return Qwen4ExpPredictorContext{FullAttentionLayerIdentity::qwen4ExpSharedPredictor(source(layer)),
+            Qwen4ExpPredictorRows::admit(1,rows,device,nullptr,nullptr),8,2,1e-6f,device,nullptr,"mtp0_"};
+    };
+    const auto replay = [&](int participant,int rows,int layer,Qwen4ExpPredictorInvocation invocation,
+                            const std::string &terminal,const std::vector<std::string> *expected,
+                            GraphNativeCaptureEnvelope envelope=GraphNativeCaptureEnvelope::Ordinary) {
+        const auto device=DeviceId::cuda(participant);
+        ComputeGraph graph;graph.setNativeCaptureEnvelope(envelope);
+        const std::string first=participant==0 ? "mtp0_embedding" : "mtp0_norm_hidden";
+        addFakeSegmentStage(graph,first,true,false,ComputeStageType::COPY,false,false,false,nullptr,device);
+        addFakeSegmentStage(graph,terminal,true,false,ComputeStageType::COPY,false,false,false,nullptr,device);
+        graph.addDependency(terminal,first);
+        graph.setTerminalNode(terminal);
+        if(envelope==GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction) {
+            graph.setGraphCaptureWaveContract(first,GraphCaptureWaveContract{.identity="internal_dispatch_packet"});
+            graph.setGraphCaptureWaveContract(terminal,GraphCaptureWaveContract{.identity="internal_return_packet"});
+        }
+        Qwen4ExpPredictorBuilder::declareNativeCaptureWave(graph,context(device,rows,layer),invocation,terminal);
+        DeviceGraphExecutor executor;
+        BufferArena arena;executor.setArena(&arena);
+        FakeReplayGPUContext worker(participant);
+        DeviceGraphExecutor::GraphSegmentCache cache;
+        cache.perf_context="mtp_decode_sidecar_device_target_token_live_position";
+        executor.setWorkerGPUContextResolver([&](DeviceId){return &worker;});
+        llaminar2::testing::MockDeviceContext ctx(device,ComputeBackendType::GPU_CUDA);
+        std::vector<std::string> boundaries;
+        const bool success=executor.executeWithCachedGraphReplay(graph,&ctx,cache,worker.defaultStream(),&worker,
+            nullptr,false,false,false,[&](const std::string &name,void*) {
+                const auto index=boundaries.size();boundaries.push_back(name);
+                return !expected || (index<expected->size() && (*expected)[index]==name);
+            },DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph);
+        EXPECT_EQ(success,expected==nullptr || *expected==boundaries);
+        if(success) {
+            EXPECT_EQ(cache.segments.size(),1u);
+            EXPECT_EQ(cache.segments.front().stage_names.front(),first);
+            const auto *capture=dynamic_cast<const FakeReplayGraphCapture*>(cache.segments.front().capture.get());
+            EXPECT_NE(capture,nullptr);
+            if(capture)EXPECT_EQ(capture->begin_capture_calls_,1);
+            EXPECT_TRUE(executor.executeWithCachedGraphReplay(graph,&ctx,cache,worker.defaultStream(),&worker,
+                nullptr,false,false,false,{},DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph));
+            if(capture)EXPECT_EQ(capture->begin_capture_calls_,1) << "Unchanged participant cache must replay without recapture";
+        }
+        return boundaries;
+    };
+    for(const auto envelope:{GraphNativeCaptureEnvelope::Ordinary,GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction}) {
+        const auto original=replay(0,1,48,Qwen4ExpPredictorInvocation::Draft,"mtp0_lm_head",nullptr,envelope);
+        ASSERT_EQ(original.size(),2u);
+        EXPECT_EQ(replay(1,1,48,Qwen4ExpPredictorInvocation::Draft,"mtp0_lm_head",&original,envelope),original);
+        EXPECT_NE(replay(1,2,48,Qwen4ExpPredictorInvocation::Draft,"mtp0_lm_head",&original,envelope),original);
+        EXPECT_NE(replay(1,1,49,Qwen4ExpPredictorInvocation::Draft,"mtp0_lm_head",&original,envelope),original);
+        EXPECT_NE(replay(1,1,48,Qwen4ExpPredictorInvocation::ShiftedPrefill,"mtp0_lm_head",&original,envelope),original);
+        EXPECT_NE(replay(1,1,48,Qwen4ExpPredictorInvocation::Draft,"mtp0_lm_head_allgather",&original,envelope),original);
+    }
+    const Qwen4ExpPredictorMetadata metadata{48,Qwen4ExpPredictorAttention::Dense,
+        Qwen4ExpPredictorHiddenNorm::PerBranch,Qwen4ExpPredictorSource::SharedGGUF};
+    EXPECT_THROW((void)LayerGraphSourceIdentity::qwen4ExpSharedPredictor(48,metadata,48,1,0),std::invalid_argument);
+    {
+        ComputeGraph graph;
+        const auto device=DeviceId::cuda(0);
+        auto original_context=context(device,1,48);
+        EXPECT_THROW(Qwen4ExpPredictorBuilder::declareNativeCaptureWave(graph,original_context,
+            Qwen4ExpPredictorInvocation::Draft,"missing"),std::invalid_argument);
+        addFakeSegmentStage(graph,"terminal",true,false,ComputeStageType::COPY,false,false,false,nullptr,device);
+        graph.setTerminalNode("terminal");
+        EXPECT_THROW(Qwen4ExpPredictorBuilder::declareNativeCaptureWave(graph,original_context,
+            static_cast<Qwen4ExpPredictorInvocation>(99),"terminal"),std::invalid_argument);
+        graph.setNativeTransactionCaptureContract({.identity="foreign_collective",.terminal_node="terminal"});
+        EXPECT_THROW(Qwen4ExpPredictorBuilder::declareNativeCaptureWave(graph,original_context,
+            Qwen4ExpPredictorInvocation::Draft,"terminal"),std::invalid_argument);
+        EXPECT_EQ(graph.nativeTransactionCaptureContract()->identity,"foreign_collective");
+    }
+    for(const auto envelope:{GraphNativeCaptureEnvelope::Ordinary,
+            GraphNativeCaptureEnvelope::HeterogeneousTicketAuthorityTransaction,
+            GraphNativeCaptureEnvelope::HeterogeneousTicketFollowerTransaction}) {
+        const auto device=envelope==GraphNativeCaptureEnvelope::Ordinary ? DeviceId::cpu() : DeviceId::cuda(0);
+        ComputeGraph graph;graph.setNativeCaptureEnvelope(envelope);
+        addFakeSegmentStage(graph,"terminal",true,false,ComputeStageType::COPY,false,false,false,nullptr,device);
+        Qwen4ExpPredictorBuilder::declareNativeCaptureWave(graph,context(device,1,48),Qwen4ExpPredictorInvocation::Draft,"terminal");
+        EXPECT_FALSE(graph.nativeTransactionCaptureContract().has_value());
+        EXPECT_EQ(graph.nativeCaptureEnvelope(),envelope);
+    }
+}
+
+/** @test Whole-parent identity is structural, scoped to its graph and rejects partial or conflicting plans. */
+TEST(Test__GraphSegmentCache, NativeTransactionCaptureContractRetainsScopeAndCacheIdentity)
+{
+    static_assert(!std::is_copy_constructible_v<ComputeGraph>);
+    ComputeGraph graph;
+    addFakeSegmentStage(graph,"terminal",true,false,ComputeStageType::COPY,false,false,false,nullptr,DeviceId::cuda(0));
+    graph.setTerminalNode("terminal");
+    const auto before=DeviceGraphCaptureController::computeCaptureVariantSignature(graph);
+    graph.setNativeTransactionCaptureContract({.identity="original_transaction",.terminal_node="terminal"});
+    EXPECT_NE(before,DeviceGraphCaptureController::computeCaptureVariantSignature(graph));
+    EXPECT_THROW(graph.setNativeTransactionCaptureContract({.identity="foreign",.terminal_node="terminal"}),std::invalid_argument);
+    EXPECT_THROW(graph.setNativeCaptureEnvelope(GraphNativeCaptureEnvelope::HeterogeneousTicketAuthorityTransaction),std::invalid_argument);
+    ComputeGraph moved(std::move(graph));
+    ASSERT_TRUE(moved.nativeTransactionCaptureContract());
+    EXPECT_EQ(moved.nativeTransactionCaptureContract()->identity,"original_transaction");
+    graph.clear();EXPECT_FALSE(graph.nativeTransactionCaptureContract());
+    ComputeGraph enclosing;
+    enclosing.merge(std::move(moved));
+    EXPECT_FALSE(enclosing.nativeTransactionCaptureContract());
+    EXPECT_FALSE(moved.nativeTransactionCaptureContract());
+    enclosing.setTerminalNode("terminal");
+    enclosing.setNativeTransactionCaptureContract({.identity="enclosing_transaction",.terminal_node="terminal"});
+    DeviceGraphExecutor::GraphSegmentCache complete;
+    DeviceGraphCaptureController::buildCapturePlan(enclosing,complete,nullptr,false,false,
+        DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph);
+    ASSERT_EQ(complete.segments.size(),1u);
+    EXPECT_EQ(complete.segments.front().capture_wave_identity,"enclosing_transaction");
+    addFakeSegmentStage(enclosing,"foreign_terminal",true,false,ComputeStageType::COPY,false,false,false,nullptr,DeviceId::cuda(0));
+    enclosing.addDependency("foreign_terminal","terminal");
+    enclosing.setTerminalNode("foreign_terminal");
+    DeviceGraphExecutor::GraphSegmentCache changed_terminal;
+    EXPECT_THROW(DeviceGraphCaptureController::buildCapturePlan(enclosing,changed_terminal,nullptr,false,false,
+        DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph),std::logic_error);
+    enclosing.setTerminalNode("terminal");
+    addFakeSegmentStage(enclosing,"manual",false,true,ComputeStageType::COPY,false,false,false,nullptr,DeviceId::cpu());
+    enclosing.addDependency("terminal","manual");
+    DeviceGraphExecutor::GraphSegmentCache partial;
+    EXPECT_THROW(DeviceGraphCaptureController::buildCapturePlan(enclosing,partial,nullptr,false,false,
+        DeviceGraphExecutor::GraphReplayPlanPolicy::AllowHeterogeneousBoundarySegmentation),std::logic_error);
+    enclosing.clear();EXPECT_FALSE(enclosing.nativeTransactionCaptureContract());
+}
+
+/** @test Exact predecessor device edge preserves its event and every deferred host terminal proof. */
+TEST(Test__GraphSegmentCache, PublishedTerminalDeviceHandoffDoesNotObserveOrRerecord) {
+    using Cache=DeviceGraphExecutor::GraphSegmentCache;
+    FakeReplayGPUContext worker;
+    int sourceStream=1,consumerStream=2;
+    Cache predecessor,successor;
+    ASSERT_TRUE(predecessor.bindBorrowedCaptureStream(&worker,&sourceStream,DeviceId::cuda(0)));
+    ASSERT_TRUE(successor.bindBorrowedCaptureStream(&worker,&consumerStream,DeviceId::cuda(0)));
+    ASSERT_TRUE(predecessor.prepareCaptureStreamTerminal(&worker));
+    ASSERT_TRUE(successor.prepareCaptureStreamTerminal(&worker));
+    for(int repeat=0;repeat<20;++repeat) {
+        const auto ticket=predecessor.publishCaptureStreamTerminal();
+        const auto records=worker.events_recorded_,queries=worker.event_query_calls_;
+        const auto syncs=worker.events_synchronized_,streamSyncs=worker.synchronize_stream_checked_calls_;
+        worker.submitAndWait([&] {
+            predecessor.enqueuePublishedCaptureStreamTerminalWait(ticket,&consumerStream,&worker);
+        });
+        EXPECT_EQ(worker.last_waited_event_,predecessor.terminal_event);
+        EXPECT_EQ(worker.last_waited_stream_,&consumerStream);
+        EXPECT_EQ(worker.events_recorded_,records);
+        EXPECT_EQ(worker.event_query_calls_,queries);
+        EXPECT_EQ(worker.events_synchronized_,syncs);
+        EXPECT_EQ(worker.synchronize_stream_checked_calls_,streamSyncs);
+        EXPECT_LT(predecessor.terminal_fence_observed_generation,ticket.generation);
+        const auto following=successor.publishCaptureStreamTerminal();
+        worker.submitAndWait([&] {
+            EXPECT_THROW(successor.enqueuePublishedCaptureStreamTerminalWait(ticket,&consumerStream,&worker),std::logic_error);
+        });
+        predecessor.waitForPublishedCaptureStreamTerminal(ticket,Cache::HostFenceWaitPolicy::ActiveProgress);
+        successor.waitForPublishedCaptureStreamTerminal(following,Cache::HostFenceWaitPolicy::ActiveProgress);
+        worker.submitAndWait([&] {
+            // Host retirement may win the race to the same immutable event.
+            // The exact completed dependency is still safe and does not change
+            // observation or native creator/record/query/synchronization counts.
+            const auto completedRecords=worker.events_recorded_;
+            const auto completedQueries=worker.event_query_calls_;
+            const auto completedSyncs=worker.events_synchronized_;
+            predecessor.enqueuePublishedCaptureStreamTerminalWait(ticket,&consumerStream,&worker);
+            EXPECT_EQ(predecessor.terminal_fence_observed_generation,ticket.generation);
+            EXPECT_EQ(worker.events_recorded_,completedRecords);
+            EXPECT_EQ(worker.event_query_calls_,completedQueries);
+            EXPECT_EQ(worker.events_synchronized_,completedSyncs);
+        });
+    }
+    EXPECT_EQ(worker.events_created_,2);
+}
+/** @test Cache move/reset and foreign/missing/relabelled owners reject before any native edge. */
+TEST(Test__GraphSegmentCache, PublishedTerminalDeviceHandoffRejectsChangedOriginalOwners) {
+    using Cache=DeviceGraphExecutor::GraphSegmentCache;
+    FakeReplayGPUContext worker,foreign;
+    int sourceStream=1,consumerStream=2;
+    Cache cache;
+    ASSERT_TRUE(cache.bindBorrowedCaptureStream(&worker,&sourceStream,DeviceId::rocm(0)));
+    ASSERT_TRUE(cache.prepareCaptureStreamTerminal(&worker));
+    auto ticket=cache.publishCaptureStreamTerminal();
+    EXPECT_THROW(cache.enqueuePublishedCaptureStreamTerminalWait(ticket,&consumerStream,&worker),std::logic_error);
+    worker.submitAndWait([&] {
+        EXPECT_THROW(cache.enqueuePublishedCaptureStreamTerminalWait(ticket,nullptr,&worker),std::logic_error);
+        EXPECT_THROW(cache.enqueuePublishedCaptureStreamTerminalWait(ticket,&consumerStream,&foreign),std::logic_error);
+        EXPECT_THROW(cache.enqueuePublishedCaptureStreamTerminalWait({},&consumerStream,&worker),std::logic_error);
+    });
+    EXPECT_EQ(worker.events_waited_,0);
+    Cache moved(std::move(cache));
+    worker.submitAndWait([&] {moved.enqueuePublishedCaptureStreamTerminalWait(ticket,&consumerStream,&worker);});
+    moved.waitForPublishedCaptureStreamTerminal(ticket,Cache::HostFenceWaitPolicy::ActiveProgress);
+    moved.reset(Cache::StreamResetPolicy::Preserve);
+    const auto later=moved.publishCaptureStreamTerminal();
+    EXPECT_GT(later.generation,ticket.generation);
+    ticket.generation=later.generation;
+    const auto waits=worker.events_waited_;
+    worker.submitAndWait([&] {
+        EXPECT_THROW(moved.enqueuePublishedCaptureStreamTerminalWait(ticket,&consumerStream,&worker),std::logic_error);
+    });
+    EXPECT_EQ(worker.events_waited_,waits);
+    moved.waitForPublishedCaptureStreamTerminal(later,Cache::HostFenceWaitPolicy::ActiveProgress);
 }

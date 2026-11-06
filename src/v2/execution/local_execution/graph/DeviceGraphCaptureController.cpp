@@ -1721,6 +1721,15 @@ namespace llaminar2
             for(const auto word:{static_cast<uint64_t>(domain->source.type),static_cast<uint64_t>(domain->source.ordinal),
                 static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(domain->authority))}){h^=word;h*=kFnvPrime;}
         }
+        if (const auto &transaction = graph.nativeTransactionCaptureContract()) {
+            has_variant = true;
+            for (const auto *word : {&transaction->identity, &transaction->terminal_node}) {
+                for (const unsigned char byte : *word) { h ^= byte; h *= kFnvPrime; }
+                h ^= 0xffu; h *= kFnvPrime;
+            }
+            h ^= static_cast<std::uint64_t>(graph.nativeCaptureEnvelope()); h *= kFnvPrime;
+            h ^= graph.topologyGeneration(); h *= kFnvPrime;
+        }
         const auto &order = graph.getExecutionOrder();
         for (const auto &name : order)
         {
@@ -2349,6 +2358,23 @@ namespace llaminar2
             segment_cache.segments = lowerHeterogeneousTicketCompilationPlan(
                 std::move(segment_cache.segments),
                 heterogeneous_ticket_authority);
+        }
+
+        if (const auto &transaction = graph.nativeTransactionCaptureContract())
+        {
+            if (requiresHeterogeneousTicketSegmentation(native_capture_envelope) ||
+                segment_cache.segments.size() != 1u || !segment_cache.segments.front().capturable ||
+                graph.terminalNode() != transaction->terminal_node ||
+                !graph.getNode(transaction->terminal_node) ||
+                std::find(segment_cache.segments.front().stage_names.begin(),
+                    segment_cache.segments.front().stage_names.end(),transaction->terminal_node) ==
+                    segment_cache.segments.front().stage_names.end() ||
+                (!segment_cache.segments.front().capture_wave_identity.empty() &&
+                 segment_cache.segments.front().capture_wave_identity != transaction->identity))
+                throw std::logic_error("Whole native transaction capture rejected a conflicting or partial plan");
+            // This labels the one complete executable. Internal packet wave
+            // annotations remain ignored under DeviceOwnedTimelineTransaction.
+            segment_cache.segments.front().capture_wave_identity = transaction->identity;
         }
 
         if (retained_parent_composition)

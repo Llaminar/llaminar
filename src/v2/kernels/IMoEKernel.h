@@ -3532,6 +3532,20 @@ namespace llaminar2
             return false;
         }
 
+        /** @brief Enqueue one captured lifecycle action on the original device finite parent.
+         * @param launch Exact original worker stream and device policy.
+         * @param control Original arena control carrying its immutable parent binding.
+         * @param status Persistent parent terminal status; never a host epoch mirror.
+         * @param action Arm before children or Close after every child terminal.
+         * @return True only for accepted backend submission; semantic failure is fatal in captured production.
+         */
+        virtual bool runMoEOverlayEpochParentAction(const MoEKernelLaunchContext &launch,
+            DeviceMoEOverlayEpochControl *control, DeviceMoEOverlayEpochStatus *status,
+            DeviceMoEOverlayEpochParentAction action)
+        {
+            (void)launch;(void)control;(void)status;(void)action;return false;
+        }
+
     };
 
     /**

@@ -70,6 +70,40 @@ namespace llaminar2
             DeviceMoEOverlayEpochControl &control) noexcept;
 
         /**
+         * @brief Arm a finite parent using the existing acquisition guard, without selecting an epoch.
+         * @param parent Original arena-owned idle parent; no host may operate on GPU storage.
+         * @return False for live, stale or exhausted parent state, before acquiring ownership.
+         */
+        bool armFiniteParent(DeviceMoEOverlayEpochParent &parent) noexcept;
+
+        /**
+         * @brief Borrow the first authenticated admission or the parent's retained epoch.
+         * @param parent SAME original armed/active arena parent.
+         * @param admission_epoch Actual original admission/peer epoch, or zero for local admission.
+         * @param admission Existing published or authenticated prepared-peer authority; no new permit.
+         * @return Descendant owning its own original bank reader and exact parent generation.
+         */
+        std::optional<DeviceMoEOverlayEpochTicket> tryAcquireFiniteChild(
+            DeviceMoEOverlayEpochParent &parent, std::uint64_t admission_epoch = 0u,
+            DeviceMoEOverlayEpochChildAdmission admission = DeviceMoEOverlayEpochChildAdmission::Published) noexcept;
+
+        /**
+         * @brief Release one exact original descendant before decrementing its parent child count.
+         * @param parent Original arena parent retaining the same generation.
+         * @param child Exact unreleased descendant; ordinary or foreign tickets are rejected.
+         * @return True only after both original reader and child ownership are released.
+         */
+        bool releaseFiniteChild(DeviceMoEOverlayEpochParent &parent,
+                                DeviceMoEOverlayEpochTicket &child) noexcept;
+
+        /**
+         * @brief End a finite parent only after every admitted child is terminal.
+         * @param parent Original arena parent; Armed releases its guard, Active its exact reader.
+         * @return False for missing/live-child/partial state without declaring the scope retired.
+         */
+        bool closeFiniteParent(DeviceMoEOverlayEpochParent &parent) noexcept;
+
+        /**
          * @brief Acquire the epoch selected at one atomic publication point.
          * @return A reader-holding ticket, or empty only for corrupt/uninitialized
          *         control state.

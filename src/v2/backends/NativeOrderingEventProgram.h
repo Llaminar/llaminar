@@ -12,7 +12,7 @@ namespace llaminar2 {
 /** @brief Fixed program identity; callers cannot author an event count. */
 class NativeOrderingEventProgram final {
 public:
-    enum class Kind {PooledOwnerInitialization,PooledCoordinatorInitialization,PooledSourceInitialization,LookupSubmissionRetirement,ReadAheadParentTerminal};
+    enum class Kind {PooledOwnerInitialization,PooledCoordinatorInitialization,PooledSourceInitialization,LookupSubmissionRetirement,ReadAheadParentTerminal,CaptureSubmissionRetirement};
     /** @return Original setup plus frame/native and optional cache tensor publications. */
     static constexpr NativeOrderingEventProgram pooledOwner(bool hasCache){return {Kind::PooledOwnerInitialization,std::uint8_t(hasCache?7:6)};}
     /** @return Original setup plus frame/native and optional policy tensor publications. */
@@ -23,6 +23,8 @@ public:
     static constexpr NativeOrderingEventProgram lookupSubmissionRetirement(){return {Kind::LookupSubmissionRetirement,0};}
     /** @return Independently named one-event read-ahead parent program. */
     static constexpr NativeOrderingEventProgram readAheadParentTerminal(){return {Kind::ReadAheadParentTerminal,0};}
+    /** @return One ordinary exact capture-stream terminal, with a unique original-PMA population. */
+    static constexpr NativeOrderingEventProgram captureSubmissionRetirement(){return {Kind::CaptureSubmissionRetirement,0};}
     Kind kind()const noexcept{return kind_;}
     std::uint8_t nonemptyRootMask()const noexcept{return mask_;}
     std::size_t orderingEvents()const noexcept{return 1u+std::popcount(mask_);}

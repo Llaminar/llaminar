@@ -2933,6 +2933,15 @@ namespace llaminar2
         grouped_gateup_desc_tables_.clear();
     }
 
+    bool ROCmMoEKernel::runMoEOverlayEpochParentAction(
+        const MoEKernelLaunchContext &launch,DeviceMoEOverlayEpochControl *control,
+        DeviceMoEOverlayEpochStatus *status,DeviceMoEOverlayEpochParentAction action)
+    {
+        void *stream=explicitMoELaunchStream(launch,"runMoEOverlayEpochParentAction");
+        if(!stream || !control || !status)return false;
+        return hipMoEOverlayEpochParentAction(control,status,action,device_ordinal_,stream);
+    }
+
     bool ROCmMoEKernel::acquireMoEOverlayEpoch(
         const MoEKernelLaunchContext &launch,
         DeviceMoEOverlayEpochControl *control,

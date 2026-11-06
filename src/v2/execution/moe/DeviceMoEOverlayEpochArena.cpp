@@ -6,6 +6,9 @@
 #include "DeviceMoEOverlayEpochArena.h"
 
 #include "MoEOverlayDeviceEpochProtocol.h"
+#include "planning/PhysicalMemoryAuthority.h"
+#include <cstring>
+#include <new>
 #include "../../backends/BackendManager.h"
 #include "../../backends/IBackend.h"
 #include "../../utils/Logger.h"
@@ -22,20 +25,36 @@ namespace llaminar2
 {
     namespace
     {
-        /** @return Checked byte count for an array owned by the arena. */
-        template <typename T>
-        std::size_t checkedArrayBytes(
-            std::uint32_t count,
-            const char *label)
-        {
-            if (count > std::numeric_limits<std::size_t>::max() / sizeof(T))
-            {
-                throw std::overflow_error(
-                    std::string("ExpertOverlay epoch arena ") + label +
-                    " byte count overflows size_t");
+        /** @brief Single checked physical layout shared by admission and materialization. */
+        struct EpochStorageLayout {
+            std::size_t control, parent, tickets, statuses, maintenance_epoch, maintenance_status, parent_status, bytes;
+            /** @brief Lay out every record once, including native alignment and finite-parent state. */
+            static EpochStorageLayout checked(std::uint32_t slots) {
+                if(!slots)throw std::invalid_argument("ExpertOverlay epoch storage requires positive request capacity");
+                std::size_t frontier=0u;
+                const auto append=[&](std::size_t bytes,std::size_t alignment) {
+                    const auto limit=std::numeric_limits<std::size_t>::max();
+                    if(frontier>limit-(alignment-1u))throw std::overflow_error("ExpertOverlay epoch storage alignment overflows");
+                    const auto offset=(frontier+alignment-1u)&~(alignment-1u);
+                    if(bytes>limit-offset)throw std::overflow_error("ExpertOverlay epoch storage extent overflows");
+                    frontier=offset+bytes;return offset;
+                };
+                const auto array=[&](std::size_t size) {
+                    if(slots>std::numeric_limits<std::size_t>::max()/size)
+                        throw std::overflow_error("ExpertOverlay epoch request storage overflows");
+                    return std::size_t(slots)*size;
+                };
+                EpochStorageLayout layout{};
+                layout.control=append(sizeof(DeviceMoEOverlayEpochControl),alignof(DeviceMoEOverlayEpochControl));
+                layout.parent=append(sizeof(DeviceMoEOverlayEpochParent),alignof(DeviceMoEOverlayEpochParent));
+                layout.tickets=append(array(sizeof(DeviceMoEOverlayEpochTicket)),alignof(DeviceMoEOverlayEpochTicket));
+                layout.statuses=append(array(sizeof(DeviceMoEOverlayEpochStatus)),alignof(DeviceMoEOverlayEpochStatus));
+                layout.maintenance_epoch=append(sizeof(std::uint64_t),alignof(std::uint64_t));
+                layout.maintenance_status=append(sizeof(DeviceMoEOverlayEpochStatus),alignof(DeviceMoEOverlayEpochStatus));
+                layout.parent_status=append(sizeof(DeviceMoEOverlayEpochStatus),alignof(DeviceMoEOverlayEpochStatus));
+                append(0u,alignof(DeviceMoEOverlayEpochControl));layout.bytes=frontier;return layout;
             }
-            return static_cast<std::size_t>(count) * sizeof(T);
-        }
+        };
 
         /**
          * @brief Model-setup stream that makes GPU initialization explicit.
@@ -103,6 +122,7 @@ namespace llaminar2
     DeviceMoEOverlayEpochArena::DeviceMoEOverlayEpochArena(Config config)
         : device_id_(config.device_id),
           request_slot_capacity_(config.request_slot_capacity),
+          memory_authority_(std::move(config.memory_authority)),
           external_admission_epoch_(config.external_admission_epoch),
           external_admission_lifetime_(
               std::move(config.external_admission_lifetime)),
@@ -148,103 +168,53 @@ namespace llaminar2
                 "ExpertOverlay continuation admission barrier requires a complete external admission binding");
         }
 
-        const std::size_t ticket_bytes =
-            checkedArrayBytes<DeviceMoEOverlayEpochTicket>(
-                request_slot_capacity_, "ticket");
-        const std::size_t status_bytes =
-            checkedArrayBytes<DeviceMoEOverlayEpochStatus>(
-                request_slot_capacity_, "status");
-
-        DeviceMoEOverlayEpochControl initial_control{};
-        MoEOverlayDeviceEpochProtocol::initialize(
-            initial_control, config.initial_epoch, config.initial_bank);
-        std::vector<DeviceMoEOverlayEpochTicket> initial_tickets(
-            request_slot_capacity_);
-        std::vector<DeviceMoEOverlayEpochStatus> initial_statuses(
-            request_slot_capacity_);
-        /* The captured maintenance graph owns this scalar. It reuses the same
-         * address on every replay and advances it only after a successful
-         * publication, so no host shadow or recapture is required. */
-        const std::uint64_t initial_maintenance_epoch =
-            config.initial_epoch + 1u;
-        DeviceMoEOverlayEpochStatus initial_maintenance_status{};
-
-        try
-        {
-            if (device_id_.is_cpu())
-            {
-                control_ = new DeviceMoEOverlayEpochControl(initial_control);
-                request_tickets_ = new DeviceMoEOverlayEpochTicket[
-                    request_slot_capacity_]{};
-                request_statuses_ = new DeviceMoEOverlayEpochStatus[
-                    request_slot_capacity_]{};
-                maintenance_epoch_ = new std::uint64_t(
-                    initial_maintenance_epoch);
-                maintenance_status_ = new DeviceMoEOverlayEpochStatus{};
+        const auto layout=EpochStorageLayout::checked(request_slot_capacity_);
+        storage_bytes_=layout.bytes;
+        if(!memory_authority_ || !memory_authority_->contains(device_id_))
+            throw std::invalid_argument("ExpertOverlay epoch storage requires its original admitted physical memory authority");
+        allocation_lease_=std::make_unique<PhysicalMemoryAllocationLease>(
+            memory_authority_->claimNewAllocation(device_id_,PhysicalMemoryOwner::ExecutionWorkspace,storage_bytes_));
+        try {
+            if(device_id_.is_cpu())storage_=::operator new(storage_bytes_,std::align_val_t{alignof(DeviceMoEOverlayEpochControl)});
+            else {
+                backend_=getBackendFor(device_id_);
+                if(!backend_)throw std::runtime_error("ExpertOverlay epoch storage has no original device backend");
+                storage_=backend_->allocate(storage_bytes_,device_id_.toKernelDeviceIndex());
             }
-            else
-            {
-                backend_ = getBackendFor(device_id_);
-                if (!backend_)
-                {
-                    throw std::runtime_error(
-                        "ExpertOverlay epoch arena has no backend for " +
-                        device_id_.to_string());
-                }
-                const int ordinal = device_id_.toKernelDeviceIndex();
-                control_ = static_cast<DeviceMoEOverlayEpochControl *>(
-                    backend_->allocate(sizeof(*control_), ordinal));
-                request_tickets_ =
-                    static_cast<DeviceMoEOverlayEpochTicket *>(
-                        backend_->allocate(ticket_bytes, ordinal));
-                request_statuses_ =
-                    static_cast<DeviceMoEOverlayEpochStatus *>(
-                        backend_->allocate(status_bytes, ordinal));
-                maintenance_epoch_ = static_cast<std::uint64_t *>(
-                    backend_->allocate(sizeof(*maintenance_epoch_), ordinal));
-                maintenance_status_ =
-                    static_cast<DeviceMoEOverlayEpochStatus *>(
-                        backend_->allocate(
-                            sizeof(*maintenance_status_), ordinal));
-                if (!control_ || !request_tickets_ || !request_statuses_ ||
-                    !maintenance_epoch_ || !maintenance_status_)
-                {
-                    throw std::runtime_error(
-                        "ExpertOverlay epoch arena backend allocation failed on " +
-                        device_id_.to_string());
-                }
-
-                SetupStream setup(*backend_, ordinal);
-                uploadSetupObject(
-                    *backend_, ordinal, setup.get(), control_,
-                    &initial_control, sizeof(initial_control), "control");
-                uploadSetupObject(
-                    *backend_, ordinal, setup.get(), request_tickets_,
-                    initial_tickets.data(), ticket_bytes, "request tickets");
-                uploadSetupObject(
-                    *backend_, ordinal, setup.get(), request_statuses_,
-                    initial_statuses.data(), status_bytes, "request statuses");
-                uploadSetupObject(
-                    *backend_, ordinal, setup.get(), maintenance_epoch_,
-                    &initial_maintenance_epoch,
-                    sizeof(initial_maintenance_epoch), "maintenance epoch");
-                uploadSetupObject(
-                    *backend_, ordinal, setup.get(), maintenance_status_,
-                    &initial_maintenance_status,
-                    sizeof(initial_maintenance_status), "maintenance status");
-                if (!backend_->synchronizeStream(setup.get(), ordinal))
-                {
-                    throw std::runtime_error(
-                        "ExpertOverlay epoch arena setup stream did not complete on " +
-                        device_id_.to_string());
-                }
+            if(!storage_)throw std::runtime_error("ExpertOverlay epoch packed allocation failed");
+            auto* base=static_cast<std::byte*>(storage_);
+            control_=reinterpret_cast<DeviceMoEOverlayEpochControl*>(base+layout.control);
+            parent_=reinterpret_cast<DeviceMoEOverlayEpochParent*>(base+layout.parent);
+            request_tickets_=reinterpret_cast<DeviceMoEOverlayEpochTicket*>(base+layout.tickets);
+            request_statuses_=reinterpret_cast<DeviceMoEOverlayEpochStatus*>(base+layout.statuses);
+            maintenance_epoch_=reinterpret_cast<std::uint64_t*>(base+layout.maintenance_epoch);
+            maintenance_status_=reinterpret_cast<DeviceMoEOverlayEpochStatus*>(base+layout.maintenance_status);
+            parent_status_=reinterpret_cast<DeviceMoEOverlayEpochStatus*>(base+layout.parent_status);
+            DeviceMoEOverlayEpochControl initial_control{};
+            MoEOverlayDeviceEpochProtocol::initialize(initial_control,config.initial_epoch,config.initial_bank);
+            initial_control.finite_parent=parent_;
+            const DeviceMoEOverlayEpochParent initial_parent{.control=control_};
+            const std::uint64_t initial_maintenance_epoch=config.initial_epoch+1u;
+            std::vector<std::byte> initial(storage_bytes_,std::byte{});
+            std::memcpy(initial.data()+layout.control,&initial_control,sizeof(initial_control));
+            std::memcpy(initial.data()+layout.parent,&initial_parent,sizeof(initial_parent));
+            // Zero bytes do not encode the status record's InvalidBank sentinel.
+            // Publish every typed default in the same original setup upload.
+            const DeviceMoEOverlayEpochStatus initial_status{};
+            for(std::uint32_t slot=0u;slot<request_slot_capacity_;++slot)
+                std::memcpy(initial.data()+layout.statuses+std::size_t(slot)*sizeof(initial_status),&initial_status,sizeof(initial_status));
+            std::memcpy(initial.data()+layout.maintenance_status,&initial_status,sizeof(initial_status));
+            std::memcpy(initial.data()+layout.parent_status,&initial_status,sizeof(initial_status));
+            std::memcpy(initial.data()+layout.maintenance_epoch,&initial_maintenance_epoch,sizeof(initial_maintenance_epoch));
+            if(device_id_.is_cpu())std::memcpy(storage_,initial.data(),storage_bytes_);
+            else {
+                const int ordinal=device_id_.toKernelDeviceIndex();
+                SetupStream setup(*backend_,ordinal);
+                uploadSetupObject(*backend_,ordinal,setup.get(),storage_,initial.data(),storage_bytes_,"packed epoch records");
+                if(!backend_->synchronizeStream(setup.get(),ordinal))
+                    throw std::runtime_error("ExpertOverlay epoch storage setup did not complete");
             }
-        }
-        catch (...)
-        {
-            release();
-            throw;
-        }
+        } catch(...) {release();throw;}
 
         PerfStatsCollector::addCounter(
             "memory",
@@ -296,62 +266,27 @@ namespace llaminar2
         return request_statuses_ + checkedSlot(slot);
     }
 
+    std::size_t DeviceMoEOverlayEpochArena::allocationBytesForSlots(std::uint32_t slots)
+    {
+        return EpochStorageLayout::checked(slots).bytes;
+    }
+
     std::size_t DeviceMoEOverlayEpochArena::allocationBytes() const noexcept
     {
-        return sizeof(DeviceMoEOverlayEpochControl) +
-               static_cast<std::size_t>(request_slot_capacity_) *
-                   sizeof(DeviceMoEOverlayEpochTicket) +
-               static_cast<std::size_t>(request_slot_capacity_) *
-                   sizeof(DeviceMoEOverlayEpochStatus) +
-               sizeof(std::uint64_t) +
-               sizeof(DeviceMoEOverlayEpochStatus);
+        return storage_bytes_;
     }
 
     void DeviceMoEOverlayEpochArena::release() noexcept
     {
-        if (device_id_.is_cpu())
-        {
-            delete maintenance_status_;
-            delete maintenance_epoch_;
-            delete[] request_statuses_;
-            delete[] request_tickets_;
-            delete control_;
+        if(storage_) {
+            if(device_id_.is_cpu())::operator delete(storage_,std::align_val_t{alignof(DeviceMoEOverlayEpochControl)});
+            else if(backend_) {
+                try {backend_->free(storage_,device_id_.toKernelDeviceIndex());}
+                catch(...) {std::terminate();} // Never withdraw a PMA claim for bytes not physically released.
+            }
         }
-        else if (backend_)
-        {
-            const int ordinal = device_id_.ordinal;
-            const auto release_one = [&](void *pointer, const char *label)
-            {
-                if (!pointer)
-                    return;
-                try
-                {
-                    backend_->free(pointer, ordinal);
-                }
-                catch (const std::exception &error)
-                {
-                    LOG_ERROR("[DeviceMoEOverlayEpochArena] Failed to free "
-                              << label << " on " << device_id_.to_string()
-                              << ": " << error.what());
-                }
-                catch (...)
-                {
-                    LOG_ERROR("[DeviceMoEOverlayEpochArena] Failed to free "
-                              << label << " on " << device_id_.to_string());
-                }
-            };
-            release_one(maintenance_status_, "maintenance status");
-            release_one(maintenance_epoch_, "maintenance epoch");
-            release_one(request_statuses_, "request statuses");
-            release_one(request_tickets_, "request tickets");
-            release_one(control_, "control");
-        }
-
-        maintenance_status_ = nullptr;
-        maintenance_epoch_ = nullptr;
-        request_statuses_ = nullptr;
-        request_tickets_ = nullptr;
-        control_ = nullptr;
-        backend_ = nullptr;
+        storage_=nullptr;control_=nullptr;parent_=nullptr;request_tickets_=nullptr;
+        request_statuses_=nullptr;maintenance_epoch_=nullptr;maintenance_status_=nullptr;parent_status_=nullptr;
+        backend_=nullptr;allocation_lease_.reset();memory_authority_.reset();storage_bytes_=0u;
     }
 } // namespace llaminar2

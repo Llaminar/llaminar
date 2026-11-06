@@ -22,6 +22,7 @@
  */
 
 #include "MoEOverlayParticipantGraphRunner.h"
+#include "MoEOverlayFinitePlacementGraphs.h"
 #include "MoEOverlayPreparedGraphBank.h"
 #include <mutex>
 #include "execution/qwen4exp/PooledImmutableRetainedParticipants.h"
@@ -89,6 +90,63 @@
 
 namespace llaminar2
 {
+    void requireMoEOverlayParticipantGPUOwnership(
+        const MoERoutedExpertPlacementPlan &plan,
+        const MoEExpertOwnerMap &original_owners,
+        int world_rank,
+        MoEOverlayParticipantGraphOwnership ownership,
+        std::span<const int> fabric_local_ids,
+        std::span<const int> follower_gpu_ids)
+    {
+        if (world_rank < 0 || plan.continuation_domain.empty() ||
+            (ownership != MoEOverlayParticipantGraphOwnership::ExpertOnlyRank &&
+             ownership != MoEOverlayParticipantGraphOwnership::RankLocalAuxiliary))
+        {
+            throw std::invalid_argument(
+                "Mapped follower GPU ownership has an invalid original rank or role");
+        }
+
+        // Both expectations come from the same original catalog. The fabric
+        // spans the rank; continuation GPU execution remains solely DGO-owned.
+        std::vector<int> expected_fabric;
+        std::vector<int> expected_followers;
+        for (const auto &participant : original_owners.participants())
+        {
+            if (!participant.device.is_gpu())
+                continue;
+            if (!participant.world_rank_known || participant.world_rank < 0)
+                throw std::invalid_argument(
+                    "Mapped follower GPU ownership requires original GPU rank identity");
+            if (participant.world_rank != world_rank)
+                continue;
+            expected_fabric.push_back(participant.participant_id);
+            if (participant.domain_name != plan.continuation_domain)
+                expected_followers.push_back(participant.participant_id);
+            else if (ownership == MoEOverlayParticipantGraphOwnership::ExpertOnlyRank)
+                throw std::invalid_argument(
+                    "Expert-only follower rank cannot own a continuation GPU endpoint");
+        }
+
+        // Equality after duplicate rejection permits arbitrary catalog order,
+        // but never treats an arbitrary subset as a valid ownership projection.
+        const auto sorted_unique = [](std::span<const int> ids)
+        {
+            std::vector<int> result(ids.begin(), ids.end());
+            std::sort(result.begin(), result.end());
+            if ((!result.empty() && result.front() < 0) ||
+                std::adjacent_find(result.begin(), result.end()) != result.end())
+                throw std::invalid_argument(
+                    "Mapped follower GPU ownership has a negative or duplicate participant ID");
+            return result;
+        };
+        if (sorted_unique(fabric_local_ids) != sorted_unique(expected_fabric))
+            throw std::invalid_argument(
+                "Mapped controller-fabric membership differs from original local GPU owners");
+        if (sorted_unique(follower_gpu_ids) != sorted_unique(expected_followers))
+            throw std::invalid_argument(
+                "Mapped follower GPU membership differs from original non-continuation GPU owners");
+    }
+
     namespace
     {
         /**
@@ -284,9 +342,9 @@ namespace llaminar2
             /**
              * @brief Device-family workspace shared by mutually exclusive shapes.
              *
-             * Every physical-row graph for one device is submitted on the
-             * same participant stream, so their scratch lifetimes never
-             * overlap. Keeping this owner shared makes the runtime allocation
+             * Each physical-row graph retains its own exact capture stream.
+             * The runtime joins the original previous terminal before launching
+             * another family/shape, so their scratch lifetimes never overlap. Keeping this owner shared makes the runtime allocation
              * match the serial-family BOM instead of reserving one complete
              * MoE workspace for every prefill bucket.
              */
@@ -335,7 +393,7 @@ namespace llaminar2
         struct MappedGPUFollowerShape
         {
             int physical_rows = 0;
-            std::vector<std::unique_ptr<MappedGPUFollowerEndpoint>> endpoints;
+            std::vector<std::shared_ptr<MappedGPUFollowerEndpoint>> endpoints;
         };
 
         std::unique_ptr<ComputeGraph> graph;
@@ -424,6 +482,107 @@ namespace llaminar2
         /** Shared finite relay graph launched ahead of follower inference. */
         std::shared_ptr<MappedTransferProgressEpoch>
             transfer_progress_epoch;
+
+        /** Original declared endpoint keeps its source executor/arena alive for finite helpers. */
+        std::shared_ptr<CachedParticipantGraph::MappedGPUFollowerEndpoint> finite_boundary_endpoint;
+        /** Original participant context; borrowed only while this runner is inference-ready. */
+        IDeviceContext *finite_boundary_context=nullptr;
+        /** Bounded helper captures retire before the retained endpoint/source. */
+        MoEOverlayFinitePlacementGraphs finite_placement_graphs;
+
+        /** @copydoc IMoEOverlayDeviceInferenceBoundary::prepareMoEOverlayFinitePlacementGraphs */
+        bool prepareMoEOverlayFinitePlacementGraphs() override
+        {
+            if(!worker || !epoch_arena || !controller_binding ||
+               !finite_boundary_endpoint || !finite_boundary_endpoint->executor ||
+               !finite_boundary_endpoint->workspace_allocator || !finite_boundary_context)return false;
+            worker->submitAndWait([&] {
+                finite_placement_graphs.prepare(*finite_boundary_endpoint->executor,
+                    *finite_boundary_context,*worker,epoch_arena,*controller_binding,
+                    finite_boundary_endpoint->workspace_allocator->deviceGeneration(device),false);
+            });
+            return true;
+        }
+
+        /** @copydoc IMoEOverlayDeviceInferenceBoundary::runMoEOverlayFinitePlacementBoundary */
+        bool runMoEOverlayFinitePlacementBoundary(DeviceMoEOverlayEpochParentAction action) override
+        {
+            finite_placement_graphs.run(action,[&](void *stream) {
+                return enqueueMoEOverlayDeviceInferenceBoundary(stream,
+                    {.purpose=MoEOverlayInferenceBoundaryPurpose::PlacementDecisionSnapshot})==
+                    MoEOverlayInferenceBoundaryStatus::Submitted;
+            });
+            return true;
+        }
+
+        /**
+         * @brief Exact previous native producer protecting this participant's shared epoch slot/workspace.
+         * Worker FIFO orders SDK enqueues; different cache streams require this
+         * original event edge before another family or shape can reuse storage.
+         */
+        struct InferencePredecessor
+        {
+            std::shared_ptr<CachedParticipantGraph::MappedGPUFollowerEndpoint> endpoint;
+            DeviceGraphExecutor::GraphSegmentCache::CaptureStreamTerminalTicket terminal;
+        };
+        /** Serializes only host receipt metadata; never held while observing native completion. */
+        std::mutex inference_predecessor_mutex;
+        std::optional<InferencePredecessor> inference_predecessor;
+
+        /**
+         * @brief Enqueue the previous exact producer on the next original capture stream.
+         * @param next Actual retained endpoint for this same participant/device.
+         * @param original_worker Same original worker which published the predecessor.
+         * This consumes no host completion and allocates/records no event.
+         */
+        void enqueueOriginalInferencePredecessor(
+            const CachedParticipantGraph::MappedGPUFollowerEndpoint &next,
+            IWorkerGPUContext *original_worker)
+        {
+            if (next.participant_id != participant_id || next.device != device ||
+                !next.cache.capture_stream || original_worker != worker)
+                throw std::logic_error("Follower predecessor consumer changed its original participant/device/worker");
+            std::lock_guard lock(inference_predecessor_mutex);
+            if (!inference_predecessor) return;
+            const auto &prior=*inference_predecessor;
+            if (!prior.endpoint || prior.endpoint->participant_id != participant_id ||
+                prior.endpoint->device != device || !prior.terminal.valid())
+                throw std::logic_error("Follower predecessor lost its original retained producer");
+            prior.endpoint->cache.enqueuePublishedCaptureStreamTerminalWait(
+                prior.terminal, next.cache.capture_stream, original_worker);
+        }
+
+        /**
+         * @brief Retain the actual successful terminal publication as the next exact producer.
+         * @param endpoint Same original endpoint owner; keeps its cache/event alive.
+         * @param terminal Receipt returned by that endpoint's actual native publication.
+         */
+        void publishOriginalInferencePredecessor(
+            std::shared_ptr<CachedParticipantGraph::MappedGPUFollowerEndpoint> endpoint,
+            DeviceGraphExecutor::GraphSegmentCache::CaptureStreamTerminalTicket terminal)
+        {
+            if (!endpoint || endpoint->participant_id != participant_id || endpoint->device != device ||
+                !terminal.valid())
+                throw std::logic_error("Follower predecessor publication has a foreign or missing original terminal");
+            std::lock_guard lock(inference_predecessor_mutex);
+            inference_predecessor=InferencePredecessor{std::move(endpoint),terminal};
+        }
+
+        /**
+         * @brief Withdraw only the latest link AFTER its actual original terminal was observed.
+         * @param endpoint Producer whose host receipt observation just completed.
+         * @param terminal Exact original observed publication, never an enqueue future.
+         * Older aggregate observations leave a newer outstanding producer intact.
+         */
+        void retireOriginalInferencePredecessor(
+            const CachedParticipantGraph::MappedGPUFollowerEndpoint *endpoint,
+            DeviceGraphExecutor::GraphSegmentCache::CaptureStreamTerminalTicket terminal)
+        {
+            std::lock_guard lock(inference_predecessor_mutex);
+            if (inference_predecessor && inference_predecessor->endpoint.get()==endpoint &&
+                inference_predecessor->terminal.generation==terminal.generation)
+                inference_predecessor.reset();
+        }
 
         /** Exact serial submission/completion receipt for this follower. */
         MoEOverlayInferenceBoundaryReceipt inference_boundary_receipt;
@@ -1967,9 +2126,6 @@ namespace llaminar2
             if (participant && participant->device.is_gpu())
                 expected_gpu_participants.push_back(participant->participant_id);
         }
-        std::sort(
-            expected_gpu_participants.begin(),
-            expected_gpu_participants.end());
         if (config_.device_controller_fabric)
         {
             const auto &layout = config_.device_controller_fabric->layout();
@@ -1984,15 +2140,15 @@ namespace llaminar2
                 throw std::invalid_argument(
                     "Mapped follower GPU runtime geometry disagrees with the topology-wide controller fabric");
             }
-            auto fabric_participants =
-                config_.device_controller_fabric->localParticipantIds();
-            std::sort(
-                fabric_participants.begin(), fabric_participants.end());
-            if (expected_gpu_participants != fabric_participants)
-            {
+            const auto snapshot = residency_authority_->snapshot();
+            if (!snapshot || !snapshot->valid())
                 throw std::invalid_argument(
-                    "Mapped follower GPU participants differ from the local controller-fabric membership");
-            }
+                    "Mapped follower GPU ownership has no original residency snapshot");
+            requireMoEOverlayParticipantGPUOwnership(
+                *snapshot->placement_plan, snapshot->originalOwnerMap(),
+                config_.mpi_context->rank(), config_.ownership,
+                config_.device_controller_fabric->localParticipantIds(),
+                expected_gpu_participants);
         }
 
         for (const auto *participant : local_participants_)
@@ -2137,6 +2293,7 @@ namespace llaminar2
                         epoch_config.external_admission_lifetime =
                             controller_binding->lifetime;
                     }
+                    epoch_config.memory_authority = config_.model_context->concreteWeightManager()->physicalMemoryAuthority();
                     runtime->epoch_arena = std::make_shared<
                         DeviceMoEOverlayEpochArena>(
                         std::move(epoch_config));
@@ -3028,7 +3185,7 @@ namespace llaminar2
                         continue;
                     const DeviceId target_device =
                         binding.participant->device;
-                    auto endpoint = std::make_unique<
+                    auto endpoint = std::make_shared<
                         CachedParticipantGraph::MappedGPUFollowerEndpoint>();
                     endpoint->participant_id =
                         binding.participant->participant_id;
@@ -3707,6 +3864,12 @@ namespace llaminar2
                                     "Mapped ExpertOverlay follower could not allocate its setup-owned terminal fence event");
                             }
                         });
+                    if(!gpu_runtime->finite_boundary_endpoint) {
+                        // This is the original declared family owner, not a
+                        // synthetic executor or a lookup of live placement.
+                        gpu_runtime->finite_boundary_endpoint=endpoint;
+                        gpu_runtime->finite_boundary_context=execution_contexts_.at(target_device);
+                    }
                     shape.endpoints.push_back(std::move(endpoint));
                 }
                 result->mapped_gpu_shapes.push_back(std::move(shape));
@@ -4610,7 +4773,7 @@ namespace llaminar2
         };
         struct PreparedGpuSubmission
         {
-            CachedParticipantGraph::MappedGPUFollowerEndpoint *endpoint = nullptr;
+            std::shared_ptr<CachedParticipantGraph::MappedGPUFollowerEndpoint> endpoint;
             IDeviceContext *context = nullptr;
             IWorkerGPUContext *worker = nullptr;
             bool had_native_transaction = false;
@@ -4967,7 +5130,7 @@ namespace llaminar2
             }
 
             prepared_gpu_submissions.push_back({
-                .endpoint = endpoint.get(),
+                .endpoint = endpoint,
                 .context = context_it->second,
                 .worker = worker,
                 .had_native_transaction =
@@ -5047,7 +5210,7 @@ namespace llaminar2
         for (std::size_t index = 0; index < prepared_gpu_submissions.size(); ++index)
         {
             const auto prepared = prepared_gpu_submissions[index];
-            auto *const endpoint = prepared.endpoint;
+            auto *const endpoint = prepared.endpoint.get();
             auto &pending = submission.pending_gpu_enqueues[index];
             pending.endpoint = endpoint;
             pending.had_native_transaction = prepared.had_native_transaction;
@@ -5062,6 +5225,8 @@ namespace llaminar2
                         auto &owned = submission.pending_gpu_enqueues[index];
                         owned.successful = runOriginalEndpointEnqueue([&]()
                         {
+                            auto &runtime=participantGpuRuntimeForParticipant(prepared.endpoint->participant_id);
+                            runtime.enqueueOriginalInferencePredecessor(*prepared.endpoint,prepared.worker);
                             owned.launch_attempted = true;
                             const bool launched = prepared.endpoint->executor->executeWithCachedGraphReplay(
                                 *prepared.endpoint->graph, prepared.context, prepared.endpoint->cache,
@@ -5075,6 +5240,7 @@ namespace llaminar2
                                 return false;
                             submission.submitted_boundaries[index].graph_submitted = true;
                             owned.terminal = prepared.endpoint->cache.publishCaptureStreamTerminal();
+                            runtime.publishOriginalInferencePredecessor(prepared.endpoint,owned.terminal);
                             if (!prepared.endpoint->cache.retained_full_graph_replay.valid())
                                 throw std::logic_error("Original expert enqueue lost its sealed native replay identity");
                             return owned.terminal.valid();
@@ -5725,6 +5891,8 @@ namespace llaminar2
                         throw std::logic_error("Cancelled expert submission lost its exact native terminal");
                     terminal.endpoint->cache.waitForPublishedCaptureStreamTerminal(terminal.ticket,
                         DeviceGraphExecutor::GraphSegmentCache::HostFenceWaitPolicy::ActiveProgress);
+                    participantGpuRuntimeForParticipant(terminal.endpoint->participant_id)
+                        .retireOriginalInferencePredecessor(terminal.endpoint,terminal.ticket);
                 }, cancel, error)) return false;
         if (enqueues.missing_terminal)
         {
@@ -6036,6 +6204,8 @@ namespace llaminar2
                         {
                             return topology_timeout_diagnostic(observed_endpoint);
                         });
+                    participantGpuRuntimeForParticipant(terminal.endpoint->participant_id)
+                        .retireOriginalInferencePredecessor(terminal.endpoint,terminal.ticket);
                 }, abort_armed, &native_error))
         {
             return reject("Mapped ExpertOverlay follower terminal event failed: " + native_error);
@@ -6564,13 +6734,13 @@ namespace llaminar2
      * The enclosing Rank owns this adapter and the original runner. Publication
      * submits every follower before the continuation can start; retirement is
      * called only after that continuation has consumed its sparse returns.
-     * One cold submission record retains partial launches across aborts.
+     * Each original protocol slot retains its cold submission record across partial failure.
      */
     class MoEOverlayParticipantGraphRunner::RankLocalInferencePublisher final
         : public IMoEOverlayInferenceTransactionPublisher
     {
     public:
-        /** @brief Retain the original runner and preallocate one reusable native submission record. */
+        /** @brief Retain the original runner and one reusable host submission record per admitted protocol slot. */
         explicit RankLocalInferencePublisher(std::shared_ptr<MoEOverlayParticipantGraphRunner> original)
             : original_(std::move(original)), state_(original_->inferenceTransactionProtocolConfig())
         {
@@ -6579,14 +6749,21 @@ namespace llaminar2
                 original_->serving_graph_family_lifecycle_ != ServingGraphFamilyLifecycle::Sealed ||
                 topologyIdentity().source_world_rank != topologyIdentity().target_world_rank)
                 throw std::invalid_argument("Local expert publisher requires its original prepared auxiliary endpoints");
-            submission_ = std::make_unique<MappedFollowerTransaction>(
-                *original_->main_graph_, MoEOverlayInferenceTransactionTicket{});
+            // Retain one host submission record per already admitted protocol
+            // slot. Every graph family, native event and GPU allocation is still
+            // owned once by its original endpoint cache; these are borrowed handles.
+            submissions_.resize(state_.slotCount());
             const auto count = original_->local_participants_.size();
-            submission_->armed.reserve(count);
-            submission_->submitted_boundaries.reserve(count);
-            submission_->prepared_gpu_submissions.reserve(count);
-            submission_->submitted_gpu_terminals.reserve(count);
-            submission_->pending_gpu_enqueues.reserve(count);
+            for (auto &slot : submissions_)
+            {
+                slot.submission = std::make_unique<MappedFollowerTransaction>(
+                    *original_->main_graph_, MoEOverlayInferenceTransactionTicket{});
+                slot.submission->armed.reserve(count);
+                slot.submission->submitted_boundaries.reserve(count);
+                slot.submission->prepared_gpu_submissions.reserve(count);
+                slot.submission->submitted_gpu_terminals.reserve(count);
+                slot.submission->pending_gpu_enqueues.reserve(count);
+            }
         }
         /** @brief Abandonment still owns every partial launch until exact native proof. */
         ~RankLocalInferencePublisher() override
@@ -6595,7 +6772,7 @@ namespace llaminar2
                 return;
             std::string ignored;
             (void)abort(state_.activeTicket()->placement_epoch, 1, &ignored);
-            if (!submission_->native_terminals_joined)
+            if (state_.active())
                 std::terminate();
         }
         /** @inheritdoc IMoEOverlayInferenceTransactionPublisher */
@@ -6609,28 +6786,35 @@ namespace llaminar2
         {
             auto result = state_.publishOriginalFollowers(descriptor, [&](const auto &ticket, std::string *error)
             {
-                submission_->reset(*original_->main_graph_, ticket);
-                submission_->original_source_cancellation = original_->original_pooled_source_cancellation_;
+                auto &slot = slotFor(ticket);
+                slot.submission->reset(*original_->main_graph_, ticket);
+                slot.submission->original_source_cancellation = original_->original_pooled_source_cancellation_;
                 const auto selection = original_->selectRetainedGraph(ticket, error);
                 if (!selection)
                     return false;
-                submission_->cached = selection->graph;
-                selection_ = *selection;
-                return original_->submitMappedFollowerTransaction(*submission_,error);
+                slot.submission->cached = selection->graph;
+                slot.selection = *selection;
+                return original_->submitMappedFollowerTransaction(*slot.submission,error);
             }, [&](std::string* error) {
                 // This consumes only native SDK enqueue futures. The captured
                 // expert/storage bodies remain asynchronous; actual GPU/event
                 // terminal proof belongs to retire(), never publication.
-                const auto enqueues=original_->joinMappedFollowerEnqueues(*submission_);
-                if (!enqueues.successful || enqueues.missing_terminal) {
-                    if (error) *error=enqueues.first_error.empty()
-                        ? "Original expert host enqueue lacks its exact terminal publication" : enqueues.first_error;
+                const auto *active = state_.activeTicket();
+                if (!active)
+                    throw std::logic_error("Original local enqueue lost its protocol slot");
+                auto &slot = slotFor(*active);
+                const auto enqueues = original_->joinMappedFollowerEnqueues(*slot.submission);
+                if (!enqueues.successful || enqueues.missing_terminal)
+                {
+                    if (error)
+                        *error = enqueues.first_error.empty()
+                            ? "Original expert host enqueue lacks its exact terminal publication"
+                            : enqueues.first_error;
                     return false;
                 }
                 return true;
             });
-            if (!result.ok && state_.active() &&
-                submission_->ticket == *state_.activeTicket())
+            if (!result.ok && state_.active())
                 cancelOriginalLanes();
             return result;
         }
@@ -6639,14 +6823,15 @@ namespace llaminar2
         {
             const bool retired = state_.retire(transaction, [&](std::string *diagnostic)
             {
-                return original_->retireMappedFollowerTransaction(*submission_, diagnostic);
+                return original_->retireMappedFollowerTransaction(*slotFor(transaction.ticket).submission, diagnostic);
             }, error);
             if (retired)
             {
-                if (!selection_)
+                auto &slot = submissions_.at(transaction.slot_index);
+                if (!slot.selection)
                     throw std::logic_error("Retired local expert transaction lost its original family selection");
-                original_->recordSuccessfulRetainedTransaction(transaction.ticket, *selection_);
-                selection_.reset();
+                original_->recordSuccessfulRetainedTransaction(transaction.ticket, *slot.selection);
+                slot.selection.reset();
             }
             return retired;
         }
@@ -6661,7 +6846,57 @@ namespace llaminar2
             return state_.abort(epoch, code, [&](std::string *diagnostic)
             {
                 cancelOriginalLanes();
-                return original_->drainCancelledMappedFollowerTransaction(*submission_, diagnostic);
+                // Existing receipts retire in original transaction order, even
+                // when the protocol ring wraps. Attempt every physical drain
+                // and preserve its first failure before releasing any handles.
+                bool complete = true;
+                std::string first_error;
+                std::uint64_t previous = 0u;
+                for (std::size_t visited = 0; visited < submissions_.size(); ++visited)
+                {
+                    const MoEOverlayPublishedInferenceTransaction *next = nullptr;
+                    for (std::size_t index = 0; index < submissions_.size(); ++index)
+                    {
+                        const auto *handle = state_.activeHandle(index);
+                        if (handle && handle->ticket.transaction_ordinal > previous &&
+                            (!next || handle->ticket.transaction_ordinal < next->ticket.transaction_ordinal))
+                            next = handle;
+                    }
+                    if (!next)
+                        break;
+                    previous = next->ticket.transaction_ordinal;
+                    auto &submission = *submissions_[next->slot_index].submission;
+                    std::string current;
+                    try
+                    {
+                        if (!drainOriginalSubmissionCancellation(submission.native_terminals_joined,
+                                submission.source_cancellation_failure_mutex, submission.source_cancellation_failure,
+                                [&](std::string *diagnostic)
+                                {
+                                    return original_->drainCancelledMappedFollowerTransaction(submission, diagnostic);
+                                }, &current))
+                        {
+                            complete = false;
+                            if (first_error.empty())
+                                first_error = current;
+                        }
+                    }
+                    catch (const std::exception &failure)
+                    {
+                        complete = false;
+                        if (first_error.empty())
+                            first_error = failure.what();
+                    }
+                    catch (...)
+                    {
+                        complete = false;
+                        if (first_error.empty())
+                            first_error = "Nonstandard original native slot drain failure";
+                    }
+                }
+                if (!complete && diagnostic)
+                    *diagnostic = first_error;
+                return complete;
             }, error);
         }
         /** @inheritdoc IMoEOverlayInferenceTransactionPublisher */
@@ -6673,12 +6908,30 @@ namespace llaminar2
         /** @brief Signal exact original lanes; existing endpoint errors remain absorbing. */
         void cancelOriginalLanes() noexcept
         {
-            original_->cancelMappedFollowerTransaction(*submission_);
+            for (std::size_t index = 0; index < submissions_.size(); ++index)
+                if (state_.activeHandle(index))
+                    original_->cancelMappedFollowerTransaction(*submissions_[index].submission);
         }
         std::shared_ptr<MoEOverlayParticipantGraphRunner> original_;
         RankLocalPublicationState state_;
-        std::unique_ptr<MappedFollowerTransaction> submission_;
-        std::optional<RetainedGraphSelection> selection_;
+        /** @brief One cold host record borrows native resources for one original protocol slot. */
+        struct SubmissionSlot {
+            std::unique_ptr<MappedFollowerTransaction> submission;
+            std::optional<RetainedGraphSelection> selection;
+        };
+        /**
+         * @param ticket Exact original active protocol identity.
+         * @return Its retained host record borrowing the original native resources.
+         * @throws std::logic_error When no original protocol slot owns the ticket.
+         */
+        SubmissionSlot &slotFor(const MoEOverlayInferenceTransactionTicket &ticket)
+        {
+            const auto index = state_.activeSlot(ticket);
+            if (!index)
+                throw std::logic_error("Local expert native submission lost its exact original protocol slot");
+            return submissions_.at(*index);
+        }
+        std::vector<SubmissionSlot> submissions_;
     };
 
     std::shared_ptr<IMoEOverlayInferenceTransactionPublisher>

@@ -1,4 +1,15 @@
+/**
+ * @file Perf__CUDAMoELLEPDeterminism.cpp
+ * @brief Native CUDA LLEP determinism and runtime workspace performance checks.
+ *
+ * The fixture retains one original workspace/epoch family across measured
+ * invocations. Its epoch records use the exact PMA-backed allocation quote;
+ * admitted capacity does not replace the live rows consumed by each kernel.
+ * Byte comparison and performance observation share the original backend path.
+ */
+
 #include <gtest/gtest.h>
+#include "../../../utils/DeviceEpochArenaTestMemory.h"
 
 #include "Perf__MoELLEPDeterminismCommon.h"
 
@@ -1886,12 +1897,12 @@ TEST(Perf__MoELLEPDeterminism, CUDA_PayloadMovementAndApplyDeterministic)
      * so this performance test cannot pass by bypassing epoch admission. */
     auto destination_epoch_arena =
         std::make_shared<DeviceMoEOverlayEpochArena>(
-            DeviceMoEOverlayEpochArena::Config{
+            llaminar2::test::admitEpochArenaForTest(DeviceMoEOverlayEpochArena::Config{
                 .device_id = DeviceId::cuda(0),
                 .initial_epoch = 1u,
                 .initial_bank = 0u,
                 .request_slot_capacity = 1u,
-            });
+            }));
     DeviceMoERuntimeTable::Config destination_parent_config;
     destination_parent_config.device_id = DeviceId::cuda(0);
     destination_parent_config.num_layers =

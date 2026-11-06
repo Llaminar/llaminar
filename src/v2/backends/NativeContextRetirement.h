@@ -18,7 +18,7 @@
 #include <string>
 #include <vector>
 namespace llaminar2 {
-namespace test {struct ReadAheadNativeResourceReplayAccess;}
+namespace test {struct ReadAheadNativeResourceReplayAccess; struct FollowerPredecessorDiagnosticGraphResources;}
 class PhysicalMemoryAuthority;
 class GPUDeviceContextPool;
 class GPUContextProvenance;
@@ -72,6 +72,7 @@ public:
 private:
     friend class NativeContextRetirementOwner;
     friend struct test::ReadAheadNativeResourceReplayAccess;
+    friend struct test::FollowerPredecessorDiagnosticGraphResources; ///< Actual original-PMA diagnostic General obligations only.
     friend class ReadAheadNativeResourceFamily;
     friend class ReadAheadNativeParentTerminal;
     friend class RetainedParticipantGraphExecutable;

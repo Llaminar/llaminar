@@ -19,6 +19,10 @@
 #include "integration/parity/qwen4exp/Qwen4ExpGPUAdaptiveParityCases.h"
 #include "integration/parity/qwen4exp/Qwen4ExpNgramAdmissionCases.h"
 #include "integration/parity/qwen4exp/Qwen4ExpROCm4OverlayPolicyParityCases.h"
+#include "integration/parity/qwen4exp/Qwen4ExpAllGPUQ6MTPParityCases.h"
+#include "integration/parity/qwen4exp/Qwen4ExpSourceAdmissionCI.h"
+#include "execution/moe/MoEOverlayDeviceControllerTopology.h"
+#include "execution/moe/MoEOverlayCapacityAdmission.h"
 #include "integration/parity/ModelParityRuntimeExport.h"
 #include "integration/parity/ParityHardwareRequirements.h"
 #include "config/ConfigValidator.h"
@@ -1143,6 +1147,29 @@ TEST(Qwen4ExpSourceAdmissionCases, CPUStorageMaterializationUsesFrozenComputeOwn
 {
     using Owner = PhysicalMemoryOwner;
     const PhysicalMemoryAllocatorIdentity cpu{0, DeviceId::cpu()};
+    // An original all-GPU compute plan can retain a genuine RAM ngram source
+    // on CPU0 without executing CPU layers or materializing CPU workspaces.
+    auto gpu_only = std::make_shared<MoERoutedExpertPlacementPlan>(
+        *qwen4ExpAllGPUQ6MTPDefinition().topology.expert_overlay_plan);
+    gpu_only->placements = {{.layer = 0, .routed_expert_tier = {0, 1}}};
+    gpu_only->routed_tiers[0].resolved_live_experts_per_layer = {1};
+    gpu_only->routed_tiers[1].resolved_live_experts_per_layer = {1};
+    const std::array lookup_owners{cpu};
+    std::vector<PhysicalMemoryOwnerAttestation> source_rows{
+        {.identity=cpu, .owner=Owner::ActivationArena, .planned_new_bytes=4096},
+        {.identity=cpu, .owner=Owner::ExecutionWorkspace, .planned_new_bytes=8192}};
+    EXPECT_THROW(requireQwen4ExpCPUStorageMaterialization(source_rows, gpu_only), std::logic_error);
+    EXPECT_NO_THROW(requireQwen4ExpCPUStorageMaterialization(source_rows, gpu_only, ImmutableRowAllocatorInventory{lookup_owners}));
+    for (const auto foreign : {PhysicalMemoryAllocatorIdentity{1, DeviceId::cpu()},
+                              PhysicalMemoryAllocatorIdentity{0, DeviceId{DeviceType::CPU,1}}}) {
+        const std::array foreign_owners{foreign};
+        EXPECT_THROW(requireQwen4ExpCPUStorageMaterialization(source_rows, gpu_only, ImmutableRowAllocatorInventory{foreign_owners}), std::logic_error);
+    }
+    for (const auto owner : {Owner::RoutedExpertWeights, Owner::PrimaryModelWeights, Owner::AdditionalModelWeights}) {
+        auto missing = source_rows;
+        missing.push_back({.identity=cpu, .owner=owner, .planned_new_bytes=64});
+        EXPECT_THROW(requireQwen4ExpCPUStorageMaterialization(missing, gpu_only, ImmutableRowAllocatorInventory{lookup_owners}), std::logic_error);
+    }
     for (const int first : {0, 17})
     {
         auto plan = std::make_shared<MoERoutedExpertPlacementPlan>(
@@ -1175,12 +1202,16 @@ TEST(Qwen4ExpSourceAdmissionCases, CPUStorageMaterializationUsesFrozenComputeOwn
         later->routed_tiers.back().resolved_live_experts_per_layer = {0, 1};
         later->placements.back().routed_expert_tier = {0, 1};
         EXPECT_THROW(requireQwen4ExpCPUStorageMaterialization(rows, later), std::logic_error);
+        EXPECT_THROW(requireQwen4ExpCPUStorageMaterialization(rows, later,
+            ImmutableRowAllocatorInventory{lookup_owners}), std::logic_error);
         auto contradicted = changed();
         contradicted->placements.back().routed_expert_tier = {0, 1};
         EXPECT_THROW(requireQwen4ExpCPUStorageMaterialization(rows, contradicted), std::logic_error);
         auto shared = changed();
         shared->shared_expert_domain = shared->routed_tiers.back().domain;
         EXPECT_THROW(requireQwen4ExpCPUStorageMaterialization(rows, shared), std::logic_error);
+        EXPECT_THROW(requireQwen4ExpCPUStorageMaterialization(rows, shared,
+            ImmutableRowAllocatorInventory{lookup_owners}), std::logic_error);
 
         // Absence from the admitted compute list is not permission to drop
         // actual weight claims, a different CPU's claims or another rank's rows.
@@ -2223,6 +2254,118 @@ TEST(Qwen4ExpSourceAdmissionCases, OwnerSubsetSourceReuseRequiresOriginalNonempt
             changed=declared;changed.owners.front().participant.world_rank=1;EXPECT_FALSE(qwen4ExpSharedContinuationOwnerSet(changed,consumers));
             changed=declared;changed.coordinator->world_rank=1;EXPECT_FALSE(qwen4ExpSharedContinuationOwnerSet(changed,consumers));
         }
+    }
+}
+} // namespace llaminar2::test::parity::qwen4exp
+
+namespace llaminar2::test::parity::qwen4exp
+{
+/** @test Exactly three original source/math policies retain GPU-only Q6 and ordinary RAM PLE. */
+TEST(Qwen4ExpSourceAdmissionCases, AllGPUQ6RetainsOriginalSourceRAMAndThreeMTPPolicies)
+{
+    const auto& cases = qwen4ExpAllGPUQ6MTPNativeExactCases();
+    ASSERT_EQ(cases.size(), 3u);
+    std::set<ModelParityMTP> policies;
+    std::set<std::string> names;
+    for (const auto& cell : cases) {
+        policies.insert(cell.mtp);
+        EXPECT_TRUE(names.insert(cell.testName()).second);
+        EXPECT_EQ(cell.inventory_role, ModelParityInventoryRole::NumericalDiagnostic);
+        EXPECT_EQ(cell.model.model_path, kMainModelPath);
+        ASSERT_TRUE(cell.model.shared_predictor);
+        EXPECT_EQ(cell.model.shared_predictor->path(), kPredictorModelPath);
+        EXPECT_EQ(cell.model.maximum_mtp_draft_depth, 3);
+        EXPECT_EQ(cell.retained_mtp_draft_capacity, 3);
+        EXPECT_EQ(cell.topology.mpi_ranks, 1);
+        ASSERT_EQ(cell.topology.participants.size(), 6u);
+        int cuda = 0, rocm = 0;
+        for (const auto& participant : cell.topology.participants) {
+            EXPECT_EQ(participant.world_rank, std::optional<int>{0});
+            EXPECT_TRUE(participant.address.isGPU());
+            cuda += participant.address.device_type == DeviceType::CUDA;
+            rocm += participant.address.device_type == DeviceType::ROCm;
+        }
+        EXPECT_EQ(cuda, 2); EXPECT_EQ(rocm, 4);
+        ASSERT_TRUE(cell.ngram_table_policy);
+        EXPECT_EQ(cell.ngram_table_policy->storage, ImmutableRowStoragePreference::RAM);
+        EXPECT_FALSE(cell.ngram_table_policy->isGPUAdaptive());
+        EXPECT_EQ(cell.expert_overlay, (std::optional{ModelParityExpertOverlayPolicy{
+            .owner_order = RoutedExpertOwnerOrder::Ordinal, .movement = ModelParityExpertMovement::Dynamic}}));
+        ASSERT_TRUE(cell.topology.expert_overlay_plan);
+        const auto& plan = *cell.topology.expert_overlay_plan;
+        EXPECT_EQ(resolveMoEOverlayAuthorityExecutionKind(plan), MoEOverlayAuthorityExecutionKind::DeviceResident);
+        EXPECT_FALSE(MoEExpertOwnerMap::usesCPUJointFragments(plan));
+        ASSERT_EQ(plan.routed_tiers.size(), 2u);
+        EXPECT_EQ(plan.routed_tiers.front().max_experts_per_layer, 8);
+        EXPECT_EQ(plan.routed_tiers.back().max_experts_per_layer, 0);
+        EXPECT_TRUE(plan.routed_tiers.back().fallback);
+        EXPECT_TRUE(validateMoERoutedExpertPlacementPlan(plan).ok());
+    }
+    EXPECT_EQ(policies, (std::set{ModelParityMTP::Depth1, ModelParityMTP::Depth3, ModelParityMTP::DynamicDepth}));
+}
+
+/** @test Actual metadata owner/controller builders select the existing world1 mapped GraphService branch. */
+TEST(Qwen4ExpSourceAdmissionCases, AllGPUQ6UsesTwoOriginalNativeGroupsAndMappedControl)
+{
+    auto plan = *qwen4ExpAllGPUQ6MTPNativeExactCases().front().topology.expert_overlay_plan;
+    plan.authority_execution = resolveMoEOverlayAuthorityExecutionKind(plan);
+    EXPECT_EQ(MoEOverlayCapacityAdmission::selectMigrationStorage(plan, MoERebalanceRuntimeMode::Dynamic),
+              MoEOverlayMigrationStorageKind::PhysicalResidencyFabric);
+    // This one representative 512-expert metadata row exercises the original
+    // owner-map constructor. It grants no physical slot, prepared source or PMA admission.
+    std::vector<int> tiers(512, 1);
+    std::fill_n(tiers.begin(), 8, 0);
+    plan.placements = {{.layer = 0, .routed_expert_tier = std::move(tiers)}};
+    const auto owners = MoEExpertOwnerMap::build(plan);
+    const std::array node_ids{0};
+    const auto topology = resolveMoEOverlayDeviceControllerTopology(plan, owners, {.world_rank_node_ids = node_ids});
+    ASSERT_TRUE(topology.valid());
+    EXPECT_EQ(topology.leader_world_rank, 0);
+    ASSERT_EQ(topology.groups.size(), 2u);
+    EXPECT_EQ(topology.groups[0].participant_ids, (std::vector<int>{0, 1}));
+    EXPECT_EQ(topology.groups[1].participant_ids, (std::vector<int>{2, 3, 4, 5}));
+    EXPECT_EQ(topology.groups[0].inter_group_transport, MoEOverlayDeviceControllerInterGroupTransport::LeaderLocal);
+    EXPECT_EQ(topology.groups[1].inter_group_transport, MoEOverlayDeviceControllerInterGroupTransport::NodeLocalMapped);
+    for (const auto& group : topology.groups) {
+        EXPECT_EQ(group.root_world_rank, 0);
+        EXPECT_EQ(group.intra_group_transport, MoEOverlayDeviceControllerIntraGroupTransport::NativeCollective);
+    }
+    EXPECT_TRUE(topology.usesNodeLocalMappedControl());
+    std::map<int, int> expert_counts;
+    for (const auto& owner : owners.owners()) ++expert_counts[owner.owner_participant];
+    EXPECT_EQ(expert_counts, (std::map<int, int>{{0, 4}, {1, 4}, {2, 126}, {3, 126}, {4, 126}, {5, 126}}));
+    // The old Q6 row is intentionally still host-owned; storage owners alone
+    // never turn its routed CPU capacity tier into a GPU finite-scope test.
+    const auto original = qwen4ExpHardwareTargetDefinition(Qwen4ExpHardwareTarget::CUDA2ROCm4);
+    EXPECT_EQ(resolveMoEOverlayAuthorityExecutionKind(*original.topology.expert_overlay_plan),
+              MoEOverlayAuthorityExecutionKind::HostResident);
+}
+
+/** @test Source admission and public runtime arguments preserve the same three retained3 policies. */
+TEST(Qwen4ExpSourceAdmissionCases, AllGPUQ6SourceAdmissionAndPublicRuntimeKeepOriginalPolicies)
+{
+    const auto& cells = qwen4ExpAllGPUQ6MTPNativeExactCases();
+    const auto admissions = qwen4ExpSourceAdmissionParameters(cells);
+    ASSERT_EQ(admissions.size(), 3u);
+    for (const auto& cell : cells) {
+        const auto runtime = cell.makeOrchestrationConfig(cell.model.model_path, 0);
+        const auto source = qwen4ExpSourceAdmissionConfig(cell, cell.model.model_path, 0);
+        const auto public_request = sourcePublicConfig(cell);
+        for (const auto* config : {&runtime, &source, &public_request}) {
+            ASSERT_TRUE(config->moe_routed_expert_plan);
+            EXPECT_EQ(resolveMoEOverlayAuthorityExecutionKind(*config->moe_routed_expert_plan),
+                      MoEOverlayAuthorityExecutionKind::DeviceResident);
+            EXPECT_EQ(config->moe_rebalance.mode, MoERebalanceRuntimeMode::Dynamic);
+            EXPECT_EQ(config->ngram_table_policy.storage, ImmutableRowStoragePreference::RAM);
+            EXPECT_TRUE(config->mtp.enabled);
+            EXPECT_EQ(resolveMTPMaximumDraftDepth(config->mtp), 3);
+            ASSERT_TRUE(config->shared_predictor);
+            EXPECT_EQ(config->shared_predictor->path(), kPredictorModelPath);
+        }
+        EXPECT_EQ(runtime.mtp.depth_policy.mode, source.mtp.depth_policy.mode);
+        EXPECT_EQ(runtime.mtp.depth_policy.mode, public_request.mtp.depth_policy.mode);
+        EXPECT_EQ(runtime.mtp.draft_tokens, source.mtp.draft_tokens);
+        EXPECT_EQ(runtime.mtp.draft_tokens, public_request.mtp.draft_tokens);
     }
 }
 } // namespace llaminar2::test::parity::qwen4exp

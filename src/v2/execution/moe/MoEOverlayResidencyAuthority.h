@@ -180,6 +180,18 @@ namespace llaminar2
     };
 
     /**
+     * @brief Cover immutable whole/cohort edges with simple placement-target cycles.
+     * @param migrations Complete capacity-preserving edges in their original order.
+     * @return Deterministic cycles covering each edge once and visiting each target
+     *         once per cycle; neither command order nor movement axes are changed.
+     * @throws std::logic_error For malformed targets or an open capacity flow.
+     * @note Device-authored commands and host residency planning share this
+     *       geometry so both obey the same physical lane-demand bound.
+     */
+    [[nodiscard]] std::vector<MoEOverlayTierMigrationCycle> decomposeMoEOverlayMigrationCycles(
+        const std::vector<MoEOverlayTierMigration> &migrations);
+
+    /**
      * @brief Decompose the canonical whole/cohort edges into closed placement cycles.
      * @param migrations Complete capacity-preserving edges; each cycle receives
      * its aggregate movement axis. Cohort members are never separate movements.

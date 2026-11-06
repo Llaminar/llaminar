@@ -33,6 +33,7 @@
 #pragma once
 
 #include "../../../utils/NativeVNNITestPartialStorage.h"
+#include "../../../utils/DeviceEpochArenaTestMemory.h"
 #include <gtest/gtest.h>
 
 #include "backends/BackendManager.h"
@@ -2242,13 +2243,13 @@ namespace llaminar2::test
                 << publication_error;
 
             auto epoch_arena = std::make_shared<DeviceMoEOverlayEpochArena>(
-                DeviceMoEOverlayEpochArena::Config{
+                llaminar2::test::admitEpochArenaForTest(DeviceMoEOverlayEpochArena::Config{
                     .device_id = device,
                     .initial_epoch = 1u,
                     // A freshly initialized runtime table prepares bank one.
                     .initial_bank = 1u,
                     .request_slot_capacity = 1u,
-                });
+                }));
             auto initial_runtime_descriptors = compact_experts;
             initial_runtime_descriptors[0].owner_participant = 0;
             initial_runtime_descriptors[1].owner_participant = 1;

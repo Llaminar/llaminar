@@ -397,6 +397,16 @@ namespace llaminar2
          */
         void start();
 
+        /**
+         * @brief Cross one finite boundary on every original rank-local GPU owner.
+         * @param action Arm before any child, or End after all child terminals.
+         * @throws std::logic_error For a foreign, distributed or nonrunning authority.
+         * Each original captured terminal is observed before returning. No
+         * maintenance mutex is held and no live epoch reaches the host.
+         */
+        void runFinitePlacementBoundary(DeviceMoEOverlayEpochParentAction action);
+
+
         /** @return Current typed activation state without advancing it. */
         [[nodiscard]] MoEOverlayDeviceControllerActivationState state() const
             noexcept;

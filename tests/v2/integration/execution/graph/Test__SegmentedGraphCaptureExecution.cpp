@@ -26,6 +26,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "../../../utils/DeviceEpochArenaTestMemory.h"
 #include "../../../utils/CPUSerialArenaTestAdmission.h"
 #include "../../../fixtures/execution/RetainedHostServiceFixture.h"
 #include "backends/HostMemoryCapacity.h"
@@ -1694,7 +1695,7 @@ TEST_F(CachedGraphReplayExecutionTest,
         contribution_elements * sizeof(float);
     const DeviceId device = device_ctx_->deviceId();
     auto epoch_arena = std::make_shared<DeviceMoEOverlayEpochArena>(
-        DeviceMoEOverlayEpochArena::Config{.device_id = device});
+        llaminar2::test::admitEpochArenaForTest(DeviceMoEOverlayEpochArena::Config{.device_id = device}));
     DeviceMoEOverlayEpochTicket epoch_fixture{
         .epoch = 301u, .selector = deviceMoEOverlayEpochSelector(1u, 0u)};
     auto *epoch_backend = getBackendFor(device);

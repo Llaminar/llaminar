@@ -10,6 +10,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "../../utils/DeviceEpochArenaTestMemory.h"
 
 #ifdef HAVE_ROCM
 
@@ -4377,7 +4378,7 @@ TEST(Test__LocalTPRCCLGraphCapture,
             hipSuccess);
         epoch_arenas[participant] =
             std::make_shared<DeviceMoEOverlayEpochArena>(
-                DeviceMoEOverlayEpochArena::Config{
+                llaminar2::test::admitEpochArenaForTest(DeviceMoEOverlayEpochArena::Config{
                     .device_id = DeviceId::rocm(participant),
                     .initial_epoch = 1u,
                     .initial_bank = 0u,
@@ -4397,7 +4398,7 @@ TEST(Test__LocalTPRCCLGraphCapture,
                         .participant_id = static_cast<std::uint32_t>(
                             participant),
                     },
-                });
+                }));
         epoch_kernels[participant] =
             std::make_unique<ROCmMoEKernel>(participant);
         children[participant].reserve(kFragments);

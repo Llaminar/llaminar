@@ -3226,6 +3226,15 @@ namespace llaminar2
         grouped_gateup_desc_tables_.clear();
     }
 
+    bool CUDAMoEKernel::runMoEOverlayEpochParentAction(
+        const MoEKernelLaunchContext &launch,DeviceMoEOverlayEpochControl *control,
+        DeviceMoEOverlayEpochStatus *status,DeviceMoEOverlayEpochParentAction action)
+    {
+        void *stream=explicitMoELaunchStream(launch,"runMoEOverlayEpochParentAction");
+        if(!stream || !control || !status)return false;
+        return cudaMoEOverlayEpochParentAction(control,status,action,device_ordinal_,stream);
+    }
+
     bool CUDAMoEKernel::acquireMoEOverlayEpoch(
         const MoEKernelLaunchContext &launch,
         DeviceMoEOverlayEpochControl *control,

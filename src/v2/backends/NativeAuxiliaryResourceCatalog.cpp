@@ -43,6 +43,17 @@ NativeAuxiliaryResourceAllowance NativeAuxiliaryResourceCatalog::selectAllowance
     NativeAuxiliaryResourceProgram program,std::span<const detail::NativeAuxiliaryQualifiedClass> rows){
     if(backend!=DeviceType::CUDA && backend!=DeviceType::ROCm)
         throw std::invalid_argument("Native auxiliary allowance requires a supported GPU backend");
+    // Exact capture terminals perform the SAME ordinary one-event operation:
+    // timing-disabled create, record, wait/query and destroy. Reuse the
+    // certified unit bound, not the read-ahead fixture's borrowed population.
+    // Actual instances claim distinct NativeOrderingEventGroups below. The
+    // existing NativeImmutableLookupOrderingEvent bucket already covers these
+    // ordinary pooled/boundary primitives; program identity remains distinct.
+    if(program.isOrdering() && program.orderingProgram().kind()==NativeOrderingEventProgram::Kind::CaptureSubmissionRetirement){
+        auto unit=selectAllowance(backend,NativeAuxiliaryResourceProgram::ordering(
+            NativeOrderingEventProgram::lookupSubmissionRetirement()),rows);
+        unit.program=program;return unit;
+    }
     for(const auto& row:rows){if(row.backend!=backend)continue;
         if(row.remoteFamily && (!row.remoteFamily->valid() || !row.program.isPooledRemoteOwner() ||
             !row.remoteFamily->accepts(row.program.remoteProgramClass().limits(),PooledRemoteGraphProgramClass::argumentLayout())))

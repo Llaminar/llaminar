@@ -115,7 +115,9 @@ MoEOverlayHostServiceContract MoEOverlayHostServiceContract::resolveImpl(const M
     return result;
 }
 GraphNativeCaptureEnvelope MoEOverlayHostServiceContract::captureEnvelope(bool dispatchAuthority) const noexcept {
-    if (!hasHostBoundary() && !requiresRankLocalInferencePublisher())
+    // The outer rank publisher submits original endpoint graphs; it is not a
+    // manual CPU unit inside this participant's captured device timeline.
+    if (!hasHostBoundary())
         return GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction;
     return dispatchAuthority
         ? GraphNativeCaptureEnvelope::HeterogeneousTicketAuthorityTransaction

@@ -3,6 +3,7 @@
  * @brief Deterministic CPU oracle for device-owned ExpertOverlay policy.
  */
 
+#include "MoEOverlayDeviceControllerKernels.h"
 #include "MoEOverlayDevicePlacementPolicy.h"
 
 #include "DeviceMoERebalancePolicyShared.h"
@@ -997,7 +998,8 @@ namespace llaminar2
                         .expert = expert,
                         .source_participant = source,
                         .destination_participant = destination,
-                        .flags = static_cast<std::uint32_t>(movement_axis),
+                        .flags = moeOverlayMovementFlags(
+                            movement_axis, plan.evidence.accepted_cycles + 1u),
                         .payload_bytes =
                             input.payload_bytes_per_layer[layer],
                         .source_epoch = input.base_epoch,

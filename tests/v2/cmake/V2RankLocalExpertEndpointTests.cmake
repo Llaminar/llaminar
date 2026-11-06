@@ -114,3 +114,26 @@ if(TARGET v2_unit_moe_overlay_inference_transaction)
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RankLocalOriginalEnqueueBeforeSourceReplay)
 endif()
+
+# Outer command admission authenticates original sealed rank identity even without MPI peers.
+if(TARGET v2_unit_moe_overlay_inference_transaction)
+    add_v2_test(V2_Integration_RankLocalRootCommandAdmissionReplay
+        COMMAND $<TARGET_FILE:v2_unit_moe_overlay_inference_transaction>
+            --gtest_filter=Test__MoEOverlayInferenceTransaction.RootCommandAdmissionUsesOriginalPlanAndGeneration:Test__MoEOverlayInferenceTransaction.RankLocalExpertsShareOriginalCoordinatorWithoutAliasingDenseSegments
+            --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;MoE;Ownership;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RankLocalRootCommandAdmissionReplay)
+endif()
+
+if(TARGET v2_unit_moe_overlay_inference_transaction)
+    add_v2_test(V2_Integration_RankLocalOriginalMTPPublicationRingReplay
+        COMMAND $<TARGET_FILE:v2_unit_moe_overlay_inference_transaction>
+            --gtest_filter=Test__MoEOverlayInferenceTransaction.RankLocalCallablePublisherRetainsOriginalMTPRing:Test__MoEOverlayInferenceTransaction.RankLocalCallablePublisherMTPRingRetainsPartialFailure:Test__MoEOverlayInferenceTransaction.RankLocalCallablePublisherMTPRingRejectsCapacityOverrun:Test__MoEOverlayInferenceTransaction.RankLocalCallablePublisherAbortRetainsSourceFailureAfterNativeProof
+            --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;MTP;Ownership;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RankLocalOriginalMTPPublicationRingReplay)
+endif()

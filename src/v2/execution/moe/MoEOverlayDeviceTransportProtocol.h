@@ -17,10 +17,21 @@
 
 #include <cstdint>
 #include <string>
+#include <span>
 #include <vector>
 
 namespace llaminar2
 {
+    /** Read-only scheduler receipt; no epoch selector or placement bytes are exposed. */
+    struct MoEOverlayRuntimeReaderObservation
+    {
+        /** Closed readiness states of one authenticated original participant. */
+        enum class State : std::uint8_t { Pending, FiniteDeferred, Ready };
+        State state = State::Pending;
+        std::uint64_t parent_generation = 0u;
+        std::uint64_t parent_progress = 0u;
+    };
+
     /** Immutable device-authored command bytes retained by one physical wave. */
     struct MoEOverlayDeviceTransportCommandBatch
     {
@@ -195,6 +206,21 @@ namespace llaminar2
          */
         [[nodiscard]] bool runtimeReadersReady(
             const MoEOverlayDeviceTransportCommandBatch &batch) const noexcept;
+
+        /** @return Exact original topology size for preallocating receipt observations. */
+        [[nodiscard]] std::size_t runtimeReaderObservationCount() const noexcept;
+
+        /**
+         * @brief Observe every original participant without copying placement state.
+         * @param batch Same acquired immutable physical command.
+         * @param observations Exact preallocated topology-sized destination.
+         * @return false for missing/foreign/error records or malformed receipts.
+         * A finite receipt authorizes only a bounded no-progress wait. It never
+         * authorizes reclamation; runtimeReadersReady remains the sole gate.
+         */
+        [[nodiscard]] bool observeRuntimeReaders(
+            const MoEOverlayDeviceTransportCommandBatch &batch,
+            std::span<MoEOverlayRuntimeReaderObservation> observations) const noexcept;
 
         /** @return Whether the authority GPU opened old-epoch retirement. */
         [[nodiscard]] bool retirementRequested(

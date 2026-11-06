@@ -1108,11 +1108,13 @@ namespace llaminar2
 
             /**
              * @brief Open the exact outer command on every remote follower lane.
-             * @param command Root-owned request, command, and placement identity.
+             * @param world_rank Actual original overlay communicator rank.
+             * @param command Root-owned request, command, and placement-floor identity.
              * @param error Optional stable failure diagnostic.
              * @return True for an inert local scope or a successfully opened lane.
              */
             bool begin(
+                int world_rank,
                 const MoEOverlayInferenceCommandIdentity &command,
                 std::string *error)
             {
@@ -1124,7 +1126,7 @@ namespace llaminar2
                         *error = "ExpertOverlay decode command began twice";
                     return false;
                 }
-                begun_ = coordinator_->beginCommand(command, error);
+                begun_ = coordinator_->beginRootCommand(world_rank, command, error);
                 return begun_;
             }
 
@@ -3219,6 +3221,8 @@ namespace llaminar2
 
     void OrchestrationRunner::shutdown()
     {
+        if(finite_device_placement_submission_!=FiniteDevicePlacementSubmission::Inactive)
+            throw std::logic_error("Runner shutdown cannot withdraw an active original device placement parent");
         std::string retired_storage_request_failure;
         const bool was_inference_ready = initialization_lifecycle_.readyForInference();
         const bool has_live_resources =
@@ -4019,6 +4023,7 @@ namespace llaminar2
             mpi_root_command,
             "PREFILL",
             &last_error_);
+        ensureFiniteDevicePlacementArmed();
         ScopedMoEOverlayRootCommand overlay_prefill_command(
             moe_overlay_inference_transaction_coordinator_);
 
@@ -4135,7 +4140,8 @@ namespace llaminar2
 
         if (overlay_prefill_command.active())
         {
-            if (!mpi_root_command ||
+            const auto command_context = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
+            if (!command_context ||
                 moe_overlay_collective_generation_id_ == 0 ||
                 !moe_expert_overlay_residency_authority_)
             {
@@ -4158,11 +4164,13 @@ namespace llaminar2
                     moe_overlay_collective_generation_id_,
                 .command_id =
                     ++moe_overlay_inference_command_sequence_,
+                // Initial admitted lower bound only: mapped device packet kernels
+                // authenticate their actual current placement ticket and bank.
                 .initial_placement_epoch = snapshot->epoch,
             };
             std::string command_error;
             if (!overlay_prefill_command.begin(
-                    command_identity, &command_error))
+                    command_context->rank(), command_identity, &command_error))
             {
                 return setError(
                     "ExpertOverlay remote prefill command admission failed: " +
@@ -15288,6 +15296,7 @@ namespace llaminar2
             mpi_root_command,
             "DECODE_STEP",
             &result.error);
+        ensureFiniteDevicePlacementArmed();
         ScopedMoEOverlayRootCommand overlay_decode_command(
             moe_overlay_inference_transaction_coordinator_);
 
@@ -15361,7 +15370,8 @@ namespace llaminar2
 
         if (overlay_decode_command.active())
         {
-            if (!mpi_root_command ||
+            const auto command_context = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
+            if (!command_context ||
                 moe_overlay_collective_generation_id_ == 0 ||
                 !moe_expert_overlay_residency_authority_)
             {
@@ -15384,11 +15394,13 @@ namespace llaminar2
                     moe_overlay_collective_generation_id_,
                 .command_id =
                     ++moe_overlay_inference_command_sequence_,
+                // Initial admitted lower bound only: mapped device packet kernels
+                // authenticate their actual current placement ticket and bank.
                 .initial_placement_epoch = snapshot->epoch,
             };
             std::string command_error;
             if (!overlay_decode_command.begin(
-                    command_identity, &command_error))
+                    command_context->rank(), command_identity, &command_error))
             {
                 result.error =
                     "ExpertOverlay remote decode command admission failed: " +
@@ -16016,6 +16028,7 @@ namespace llaminar2
             mpi_root_command,
             "FORCE_DECODE_TOKEN",
             &result.error);
+        ensureFiniteDevicePlacementArmed();
         ScopedMoEOverlayRootCommand overlay_force_command(
             moe_overlay_inference_transaction_coordinator_);
 
@@ -16094,7 +16107,8 @@ namespace llaminar2
 
         if (overlay_force_command.active())
         {
-            if (!mpi_root_command ||
+            const auto command_context = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
+            if (!command_context ||
                 moe_overlay_collective_generation_id_ == 0 ||
                 !moe_expert_overlay_residency_authority_)
             {
@@ -16117,11 +16131,13 @@ namespace llaminar2
                     moe_overlay_collective_generation_id_,
                 .command_id =
                     ++moe_overlay_inference_command_sequence_,
+                // Initial admitted lower bound only: mapped device packet kernels
+                // authenticate their actual current placement ticket and bank.
                 .initial_placement_epoch = snapshot->epoch,
             };
             std::string command_error;
             if (!overlay_force_command.begin(
-                    command_identity, &command_error))
+                    command_context->rank(), command_identity, &command_error))
             {
                 result.error =
                     "ExpertOverlay forced-token command admission failed: " +
@@ -17366,6 +17382,79 @@ namespace llaminar2
             return 0;
         }
         return runner_->get_position();
+    }
+
+    void OrchestrationRunner::ensureFiniteDevicePlacementArmed()
+    {
+        if(finite_device_placement_submission_!=FiniteDevicePlacementSubmission::PendingArm)return;
+        if(!moe_overlay_device_controller_graph_service_)
+            throw std::logic_error("Device finite placement lost its original controller owner");
+        // Public clearCache has already retired the previous source producer.
+        // Every original owner Arm terminal precedes any new source or follower.
+        try {
+            moe_overlay_device_controller_graph_service_->runFinitePlacementBoundary(
+                DeviceMoEOverlayEpochParentAction::Arm);
+        } catch(const std::exception &error) {
+            // Some original owners may already be Armed. Without the failed
+            // owner's native proof no host flag may certify rollback/reuse.
+            LOG_ERROR("Device finite placement Arm lost original native proof: " << error.what());
+            std::terminate();
+        } catch(...) {
+            LOG_ERROR("Device finite placement Arm lost original native proof through a nonstandard exception");
+            std::terminate();
+        }
+        finite_device_placement_submission_=FiniteDevicePlacementSubmission::Armed;
+    }
+
+    void OrchestrationRunner::withMoEOverlayDevicePlacementScope(const std::function<void()> &body)
+    {
+        if(!body || !initialization_lifecycle_.readyForInference() || !runner_ || !model_ctx_ ||
+           !physical_memory_authority_ || !moe_overlay_device_controller_graph_service_ ||
+           runner_->moeOverlayAuthorityExecution()!=MoEOverlayAuthorityExecutionKind::DeviceResident ||
+           !config_.moe_routed_expert_plan ||
+           MoEExpertOwnerMap::usesCPUJointFragments(*config_.moe_routed_expert_plan) ||
+           config_.moe_rebalance.mode!=MoERebalanceRuntimeMode::Dynamic ||
+           (mpi_ctx_ && mpi_ctx_->world_size()!=1) ||
+           finite_device_placement_submission_!=FiniteDevicePlacementSubmission::Inactive)
+            throw std::logic_error("Finite device placement requires its ready original rank-local device authority");
+        finite_device_placement_submission_=FiniteDevicePlacementSubmission::PendingArm;
+        std::exception_ptr failure;
+        try { body(); } catch(...) { failure=std::current_exception(); }
+        if(finite_device_placement_submission_==FiniteDevicePlacementSubmission::Armed) {
+            try {
+                // The device rejects End if any actual child still owns a bank.
+                // Missing native proof is fatal, never a successful scope close.
+                moe_overlay_device_controller_graph_service_->runFinitePlacementBoundary(
+                    DeviceMoEOverlayEpochParentAction::Close);
+            } catch(const std::exception &error) {
+                if(failure) {
+                    try {std::rethrow_exception(failure);}
+                    catch(const std::exception &original) {
+                        LOG_ERROR("Original finite device request failed: " << original.what());
+                    } catch(...) {
+                        LOG_ERROR("Original finite device request failed with a nonstandard exception");
+                    }
+                }
+                LOG_ERROR("Device finite placement cannot retire its original parent: " << error.what());
+                std::terminate();
+            } catch(...) {
+                if(failure) {
+                    try {std::rethrow_exception(failure);}
+                    catch(const std::exception &original) {
+                        LOG_ERROR("Original finite device request failed: " << original.what());
+                    } catch(...) {
+                        LOG_ERROR("Original finite device request failed with a nonstandard exception");
+                    }
+                }
+                LOG_ERROR("Device finite placement closure lost original native proof through a nonstandard exception");
+                std::terminate();
+            }
+        } else if(!failure) {
+            failure=std::make_exception_ptr(std::logic_error(
+                "Finite device placement callback executed no original request"));
+        }
+        finite_device_placement_submission_=FiniteDevicePlacementSubmission::Inactive;
+        if(failure)std::rethrow_exception(failure);
     }
 
     MoEOverlayInferencePlacementScopeObservation

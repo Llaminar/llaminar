@@ -69,6 +69,19 @@ namespace llaminar2
         return *this;
     }
 
+    ComputeGraph &ComputeGraph::setNativeTransactionCaptureContract(GraphNativeTransactionCaptureContract contract)
+    {
+        if (contract.identity.empty() || contract.terminal_node.empty() ||
+            contract.terminal_node != terminal_node_ || !getNode(contract.terminal_node) ||
+            requiresHeterogeneousTicketSegmentation(native_capture_envelope_) ||
+            (native_transaction_capture_contract_ && *native_transaction_capture_contract_ != contract))
+            throw std::invalid_argument("Native transaction capture requires its exact sealed terminal, identity and complete envelope");
+        if (native_transaction_capture_contract_) return *this;
+        native_transaction_capture_contract_ = std::move(contract);
+        noteTopologyMutation();
+        return *this;
+    }
+
     ComputeGraph &ComputeGraph::setGraphCaptureWaveContract(
         const std::string &node_name,
         GraphCaptureWaveContract contract)
@@ -215,6 +228,8 @@ namespace llaminar2
     {
         if (native_capture_envelope_ == envelope)
             return *this;
+        if (native_transaction_capture_contract_ && requiresHeterogeneousTicketSegmentation(envelope))
+            throw std::invalid_argument("Whole native transaction cannot acquire a heterogeneous ticket envelope");
         if (native_capture_envelope_ != GraphNativeCaptureEnvelope::Ordinary &&
             envelope != GraphNativeCaptureEnvelope::Ordinary)
         {
@@ -564,6 +579,7 @@ namespace llaminar2
         fast_schedule_.clear();
         order_dirty_ = true;
         execution_stages_dirty_ = true;
+        native_transaction_capture_contract_.reset();
         native_capture_envelope_ = GraphNativeCaptureEnvelope::Ordinary;
         executable_memory_class_ = GPUGraphExecutableClass::General;
         noteTopologyMutation();
@@ -642,6 +658,11 @@ namespace llaminar2
         {
             native_capture_envelope_ = other.native_capture_envelope_;
         }
+
+        // A standalone child identity cannot name the larger enclosing graph.
+        // The outer builder may declare its own complete transaction after merge.
+        native_transaction_capture_contract_.reset();
+        other.native_transaction_capture_contract_.reset();
 
         // Find root nodes in the source graph (nodes with no dependencies)
         std::vector<std::string> source_roots;

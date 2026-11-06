@@ -7,6 +7,7 @@
  */
 
 #include "execution/moe/MoERuntimeTable.h"
+#include "../../../utils/DeviceEpochArenaTestMemory.h"
 #include "utils/MPITags.h"
 #include "kernels/common/MoEGroupedDirectory.h"
 #include <algorithm>
@@ -798,12 +799,12 @@ namespace llaminar2::test
          OverlayEpochTicketIsStableTopologyAcrossEveryResetTemplate)
     {
         auto arena = std::make_shared<DeviceMoEOverlayEpochArena>(
-            DeviceMoEOverlayEpochArena::Config{
+            llaminar2::test::admitEpochArenaForTest(DeviceMoEOverlayEpochArena::Config{
                 .device_id = DeviceId::cpu(),
                 .initial_epoch = 41u,
                 .initial_bank = 1u,
                 .request_slot_capacity = 3u,
-            });
+            }));
         DeviceMoERuntimeTable::Config config{
             .device_id = DeviceId::cpu(),
             .num_layers = 2,
@@ -853,12 +854,12 @@ namespace llaminar2::test
 
         config.overlay_epoch_arena =
             std::make_shared<DeviceMoEOverlayEpochArena>(
-                DeviceMoEOverlayEpochArena::Config{
+                llaminar2::test::admitEpochArenaForTest(DeviceMoEOverlayEpochArena::Config{
                     .device_id = DeviceId::cpu(),
                     .initial_epoch = 1u,
                     .initial_bank = 0u,
                     .request_slot_capacity = 1u,
-                });
+                }));
         EXPECT_THROW({ MoERuntimeTable table(config); },
                      std::invalid_argument);
     }

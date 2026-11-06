@@ -327,6 +327,17 @@ namespace llaminar2
 
     protected:
         /**
+         * @brief Declare original epoch storage before prepared-weight publication.
+         * @param device Exact allocator owned by the admitted model context.
+         * @return Existing epoch/bank/slot declaration with the original WeightManager PMA.
+         * @throws std::logic_error For absent model admission, an unowned device,
+         *         or a bound prepared store carrying a different authority.
+         * @note This resolves the same immutable model owner injected by the
+         *       runner factory; it allocates nothing and creates no new authority.
+         */
+        DeviceMoEOverlayEpochArena::Config moeOverlayEpochArenaConfig(DeviceId device) const;
+
+        /**
          * @brief Retain every grouped-verifier embedding row on device.
          *
          * This opt-in diagnostic establishes the first data boundary after

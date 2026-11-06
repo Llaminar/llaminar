@@ -529,6 +529,85 @@ namespace llaminar2::test
         ASSERT_EQ(hipStreamSynchronize(inference_stream_), hipSuccess);
     }
 
+    /**
+     * @brief Replay absorbing abort before generation, normal successor, and ready abort through one capture.
+     *
+     * Input metadata is reset only between terminally observed replays. Neither
+     * an absent successor nor unready admission can hide the original abort.
+     */
+    TEST_F(ROCmMoEOverlayEpochTest, CapturedPeerAbortBeforeGenerationAndSuccessorReplay)
+    {
+        MoEOverlayActivationEpochControl* host_control=nullptr;
+        ASSERT_EQ(hipHostMalloc(reinterpret_cast<void**>(&host_control),sizeof(*host_control),hipHostMallocMapped),hipSuccess);
+        auto host_owner=std::unique_ptr<MoEOverlayActivationEpochControl,void(*)(MoEOverlayActivationEpochControl*)>(
+            host_control,[](auto* pointer){if(pointer)(void)hipHostFree(pointer);});
+        void* alias=nullptr;
+        ASSERT_EQ(hipHostGetDevicePointer(&alias,host_control,0u),hipSuccess);
+        auto* peer_control=static_cast<MoEOverlayActivationEpochControl*>(alias);
+        MoEOverlayActivationDeviceEpochGrant* grant=nullptr;
+        ASSERT_EQ(hipMalloc(reinterpret_cast<void**>(&grant),sizeof(*grant)),hipSuccess);
+        auto grant_owner=std::unique_ptr<MoEOverlayActivationDeviceEpochGrant,void(*)(MoEOverlayActivationDeviceEpochGrant*)>(
+            grant,[](auto* pointer){if(pointer)(void)hipFree(pointer);});
+        hipGraph_t graph=nullptr;hipGraphExec_t exec=nullptr;
+        // Installed before capture: early assertions still destroy executable
+        // and graph before their embedded grant/control pointers can disappear.
+        auto graph_owner=std::shared_ptr<void>(nullptr,[&](void*){
+            if(exec)EXPECT_EQ(hipGraphExecDestroy(exec),hipSuccess);
+            if(graph)EXPECT_EQ(hipGraphDestroy(graph),hipSuccess);
+        });
+        ASSERT_EQ(hipStreamBeginCapture(inference_stream_,hipStreamCaptureModeGlobal),hipSuccess);
+        const bool acquired=kernel_->acquireMoEOverlayEpoch(inferenceLaunch(),device_control_,
+            &device_tickets_[0],&device_statuses_[0],nullptr,{},
+            {.control=peer_control,.grant=grant,.stage_ordinal=0u});
+        const auto copied=hipMemcpyAsync(device_evidence_,&device_tickets_[0],sizeof(*device_evidence_),
+            hipMemcpyDeviceToDevice,inference_stream_);
+        const bool released=kernel_->releaseMoEOverlayEpoch(inferenceLaunch(),device_control_,
+            &device_tickets_[0],&device_statuses_[1]);
+        const auto ended=hipStreamEndCapture(inference_stream_,&graph);
+        ASSERT_TRUE(acquired && released);ASSERT_EQ(copied,hipSuccess);ASSERT_EQ(ended,hipSuccess);
+        ASSERT_EQ(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0),hipSuccess);
+        for(std::uint64_t repeat=0;repeat<20;++repeat){
+            for(int trace=0;trace<3;++trace){
+                const bool normal=trace==1;
+                *host_control={};host_control->channel.stage_count=1u;
+                const std::uint64_t previous=repeat*3u+7u;
+                host_control->identity.epoch_generation=trace==0?previous:previous+1u;
+                host_control->identity.digest={0x1234u+repeat,0x5678u};
+                host_control->admission.ready_signal=trace==0?0u:kMoEOverlayActivationAdmissionTimeline;
+                auto& descriptor=host_control->buffers[0].dispatch_descriptor;
+                descriptor.digest=host_control->identity.digest;
+                descriptor.timeline=moeOverlayActivationLeasedTimelineValue(1u);
+                descriptor.placement_epoch=1u;descriptor.stage_ordinal=0u;
+                std::atomic_ref<std::uint64_t>(host_control->buffers[0].dispatch_signal.value).store(
+                    normal?descriptor.timeline:kMoEOverlayActivationAbortTimeline,std::memory_order_release);
+                MoEOverlayActivationDeviceEpochGrant input_grant{};input_grant.generation=previous;
+                ASSERT_EQ(hipMemcpyAsync(grant,&input_grant,sizeof(input_grant),hipMemcpyHostToDevice,inference_stream_),hipSuccess);
+                ASSERT_EQ(hipMemsetAsync(device_tickets_,0,2u*sizeof(*device_tickets_),inference_stream_),hipSuccess);
+                ASSERT_EQ(hipMemsetAsync(device_statuses_,0,kStatusCount*sizeof(*device_statuses_),inference_stream_),hipSuccess);
+                ASSERT_EQ(hipGraphLaunch(exec,inference_stream_),hipSuccess);
+                DeviceMoEOverlayEpochTicket evidence{};std::array<DeviceMoEOverlayEpochStatus,2> status{};
+                DeviceMoEOverlayEpochControl control{};MoEOverlayActivationDeviceEpochGrant observed_grant{};
+                ASSERT_EQ(hipMemcpyAsync(&evidence,device_evidence_,sizeof(evidence),hipMemcpyDeviceToHost,inference_stream_),hipSuccess);
+                ASSERT_EQ(hipMemcpyAsync(status.data(),device_statuses_,sizeof(status),hipMemcpyDeviceToHost,inference_stream_),hipSuccess);
+                ASSERT_EQ(hipMemcpyAsync(&control,device_control_,sizeof(control),hipMemcpyDeviceToHost,inference_stream_),hipSuccess);
+                ASSERT_EQ(hipMemcpyAsync(&observed_grant,grant,sizeof(observed_grant),hipMemcpyDeviceToHost,inference_stream_),hipSuccess);
+                ASSERT_EQ(hipEventRecord(inference_event_,inference_stream_),hipSuccess);
+                ASSERT_EQ(hipEventSynchronize(inference_event_),hipSuccess); // Sole terminal observation of the captured replay.
+                EXPECT_EQ(evidence.valid(),normal);
+                if(normal)EXPECT_EQ(evidence.epoch,1u);
+                EXPECT_EQ(status[0].code,static_cast<std::uint32_t>(normal?
+                    DeviceMoEOverlayEpochStatusCode::Success:DeviceMoEOverlayEpochStatusCode::InvalidControl));
+                EXPECT_EQ(status[1].code,static_cast<std::uint32_t>(normal?
+                    DeviceMoEOverlayEpochStatusCode::Success:DeviceMoEOverlayEpochStatusCode::InvalidTicket));
+                EXPECT_EQ(control.acquisitions_in_flight,0u);
+                for(const auto readers:control.bank_readers)EXPECT_EQ(readers,0u);
+                EXPECT_EQ(observed_grant.generation,previous);
+                EXPECT_EQ(host_control->buffers[0].dispatch_signal.value,
+                    normal?descriptor.timeline:kMoEOverlayActivationAbortTimeline);
+            }
+        }
+    }
+
     TEST_F(ROCmMoEOverlayEpochTest,
            IndependentStreamsPublishWithoutReusingHeldInferenceBank)
     {

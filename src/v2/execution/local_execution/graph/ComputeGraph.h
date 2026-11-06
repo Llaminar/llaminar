@@ -221,6 +221,18 @@ namespace llaminar2
     };
 
     /**
+     * @brief Shared rendezvous identity of one indivisible native graph transaction.
+     * This names the logical transaction only; participant-local stage/pointer
+     * signatures remain separate. It never turns internal packet waves into cuts.
+     */
+    struct GraphNativeTransactionCaptureContract
+    {
+        std::string identity; ///< Original source/invocation/geometry identity shared by participants.
+        std::string terminal_node; ///< Original sealed logical terminal retained in this complete graph.
+        bool operator==(const GraphNativeTransactionCaptureContract &) const = default;
+    };
+
+    /**
      * @brief Compute graph for execution
      *
      * A directed acyclic graph (DAG) of ComputeNodes with dependency tracking.
@@ -381,6 +393,18 @@ namespace llaminar2
          */
         ComputeGraph &addDependency(const std::string &node_name,
                                     const std::string &depends_on);
+
+        /**
+         * @brief Name the whole native transaction without enabling internal segmentation.
+         * @param contract Original shared transaction identity and exact sealed terminal.
+         * @return This original graph for declarative composition.
+         * @throws std::invalid_argument For empty/foreign terminal or conflicting identity/envelope.
+         * @note Merging changes transaction scope and drops standalone contracts on both graphs.
+         */
+        ComputeGraph &setNativeTransactionCaptureContract(GraphNativeTransactionCaptureContract contract);
+        /** @return Original whole-transaction contract, separate from per-node packet waves. */
+        const std::optional<GraphNativeTransactionCaptureContract> &nativeTransactionCaptureContract() const noexcept
+        { return native_transaction_capture_contract_; }
 
         /**
          * @brief Attach an explicit LocalTP capture-wave contract to one node.
@@ -683,6 +707,7 @@ namespace llaminar2
         bool execution_stages_dirty_ = true;                    ///< Invalidated whenever graph topology/ownership changes.
         std::vector<FastScheduleEntry> fast_schedule_;   ///< Pre-computed decode schedule
         std::string terminal_node_;                      ///< Explicit terminal node (set by sub-graph builders)
+        std::optional<GraphNativeTransactionCaptureContract> native_transaction_capture_contract_; ///< Graph-scoped logical parent identity, never inherited from a merged child.
         GraphNativeCaptureEnvelope native_capture_envelope_ =
             GraphNativeCaptureEnvelope::Ordinary;        ///< Typed graph-wide capture lifecycle selected by lowering.
         uint64_t topology_generation_ = 1;               ///< Monotonic captured-topology identity; zero is never published.

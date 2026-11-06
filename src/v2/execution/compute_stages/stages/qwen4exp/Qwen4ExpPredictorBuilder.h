@@ -62,6 +62,18 @@ struct Qwen4ExpPredictorContext final {
 class Qwen4ExpPredictorBuilder final {
 public:
     /**
+     * @brief Declare the shared complete native predictor capture wave at its real terminal.
+     * @param graph Original participant-local predictor graph; cache identity stays participant-local.
+     * @param context Authenticated original predictor source/depth and physical row geometry.
+     * @param invocation Original draft or shifted-prefill policy.
+     * @param terminal Exact existing terminal stage, including any vocabulary collective.
+     * @throws std::invalid_argument For a foreign source, invocation or missing terminal.
+     * @note CPU and heterogeneous ticket graphs retain their existing unit contracts.
+     */
+    static void declareNativeCaptureWave(ComputeGraph &graph, const Qwen4ExpPredictorContext &context,
+        Qwen4ExpPredictorInvocation invocation, const std::string &terminal);
+
+    /**
      * @brief Append existing target embedding and optional explicit canonical reconstruction.
      * @param graph Participant-local graph receiving this native producer chain.
      * @param arena Existing activation owner of MTP_EMBEDDING.

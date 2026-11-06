@@ -93,3 +93,36 @@ if(TARGET v2_test_qwen4exp_primitives)
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;GTEST_DEATH_TEST_STYLE=threadsafe")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledExpertOriginalSourceFailureLifecycle)
 endif()
+
+if(TARGET v2_test_forward_graph_types)
+    add_v2_test(V2_Integration_QFNPredictorLocalTPCaptureWaveReplay
+        COMMAND $<TARGET_FILE:v2_test_forward_graph_types>
+            --gtest_filter=Test__GraphSegmentCache.QFNPredictorWaveAuthenticatesOriginalTransactionAcrossLocalTP:Test__GraphSegmentCache.NativeTransactionCaptureContractRetainsScopeAndCacheIdentity
+            --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MTP;GraphCapture;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QFNPredictorLocalTPCaptureWaveReplay)
+endif()
+
+# A successor stream consumes the exact predecessor event while aggregate host retirement stays deferred.
+if(TARGET v2_test_forward_graph_types)
+    add_v2_test(V2_Integration_CaptureTerminalDeviceHandoffLifecycle
+        COMMAND $<TARGET_FILE:v2_test_forward_graph_types>
+            --gtest_filter=Test__GraphSegmentCache.PublishedTerminalDeviceHandoffDoesNotObserveOrRerecord:Test__GraphSegmentCache.PublishedTerminalDeviceHandoffRejectsChangedOriginalOwners
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Graph;Lifecycle;Contract;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CaptureTerminalDeviceHandoffLifecycle)
+endif()
+
+# Exact singleton capture terminal creators use the original admitted source and PMA.
+if(TARGET v2_test_native_ordering_event_group)
+    add_v2_test(V2_Integration_CaptureTerminalOriginalSourceLifecycle
+        COMMAND $<TARGET_FILE:v2_test_native_ordering_event_group>
+            --gtest_filter=NativeOrderingOriginalSource.CaptureTerminalSingletonsUseOriginalPMAAndExactCreatorPopulation
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Graph;Memory;Lifecycle;Contract;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CaptureTerminalOriginalSourceLifecycle)
+endif()

@@ -17,6 +17,32 @@
 #include "../../../../execution/local_execution/graph/ComputeGraph.h"
 #include <cmath>
 namespace llaminar2 {
+void Qwen4ExpPredictorBuilder::declareNativeCaptureWave(ComputeGraph &graph,
+    const Qwen4ExpPredictorContext &context, Qwen4ExpPredictorInvocation invocation,
+    const std::string &terminal)
+{
+    if (!context.device.is_gpu() || requiresHeterogeneousTicketSegmentation(graph.nativeCaptureEnvelope()))
+        return;
+    const auto &source = context.layer.source();
+    if (source.sourcePolicy() != GraphLayerSourcePolicy::Qwen4ExpSharedPredictor ||
+        source.predictorDepth() != std::optional<int>{0} || source.cacheLayer() != 0 ||
+        (invocation != Qwen4ExpPredictorInvocation::Draft &&
+         invocation != Qwen4ExpPredictorInvocation::ShiftedPrefill) ||
+        !graph.getNode(terminal))
+        throw std::invalid_argument("QFN native predictor wave requires its original source/depth/invocation and terminal");
+    // Embedding and hidden normalization are independent roots. TP-local
+    // projection/reconstruction roles may legitimately change the first stage;
+    // collective rendezvous names this whole declared transaction instead.
+    // Per-participant graph signatures still retain every pointer/stage/policy.
+    const std::string identity = "qfn_predictor_source" + std::to_string(source.sourceLayer()) +
+        "_depth" + std::to_string(*source.predictorDepth()) + "_cache" + std::to_string(source.cacheLayer()) +
+        "_" + (invocation == Qwen4ExpPredictorInvocation::Draft ? "draft" : "shifted_prefill") +
+        "_rows" + std::to_string(context.rows.tokens().physicalRows()) +
+        "_counted" + (context.rows.tokens().countOwner() ? "1" : "0") +
+        "_terminal_" + terminal;
+    graph.setNativeTransactionCaptureContract({.identity=identity,.terminal_node=terminal});
+}
+
 namespace {
 /** @brief Borrow one exact admitted ordinary root without triggering native preparation. */
 Qwen4ExpFloatBinding buffer(BufferArena &arena, BufferId id, DeviceId device)

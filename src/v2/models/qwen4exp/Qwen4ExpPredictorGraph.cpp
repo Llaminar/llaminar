@@ -102,6 +102,7 @@ ComputeGraph Qwen4ExpGraph::buildMTPGraph(int depth, const MTPDepthWeightBinding
         const auto terminal = append.terminalNode();
         graph.merge(std::move(append), mixed);
         sealInferenceTransactionGraph(graph, terminal);
+        Qwen4ExpPredictorBuilder::declareNativeCaptureWave(graph, context, invocation, terminal);
         return graph;
     }
 
@@ -138,6 +139,7 @@ ComputeGraph Qwen4ExpGraph::buildMTPGraph(int depth, const MTPDepthWeightBinding
         .rows = rows.tokens(), .input_id = BufferId::MTP_LOGITS, .output_id = BufferId::MTP_LOGITS_GATHERED,
         .device = device, .stage_name = context.prefix + "lm_head_allgather"});
     sealInferenceTransactionGraph(graph, terminal);
+    Qwen4ExpPredictorBuilder::declareNativeCaptureWave(graph, context, invocation, terminal);
     return graph;
 }
 } // namespace llaminar2

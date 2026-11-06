@@ -38,12 +38,15 @@ namespace llaminar2
                params_.arena->deviceId() == params_.device_id &&
                params_.request_slot < params_.arena->requestSlotCapacity() &&
                (params_.operation == Operation::Acquire ||
-                params_.operation == Operation::Release) &&
+                params_.operation == Operation::Release ||
+                params_.operation == Operation::ArmFiniteParent ||
+                params_.operation == Operation::CloseFiniteParent) &&
                (!params_.peer_epoch_source.has_value() ||
                 (params_.operation == Operation::Acquire &&
                  params_.peer_epoch_source->valid())) &&
                (!params_.retirement_readiness_controller.has_value() ||
-                (params_.operation == Operation::Release &&
+                ((params_.operation == Operation::Release ||
+                  params_.operation == Operation::CloseFiniteParent) &&
                  params_.retirement_readiness_controller->valid() &&
                  params_.retirement_readiness_controller->device ==
                      params_.device_id));
@@ -100,11 +103,22 @@ namespace llaminar2
                 admission_barrier,
                 peer_placement_epoch);
         }
-        if (!moe_kernel_->releaseMoEOverlayEpoch(
-            launch,
-            params_.arena->control(),
-            ticket,
-            status))
+        if (params_.operation == Operation::ArmFiniteParent ||
+            params_.operation == Operation::CloseFiniteParent)
+        {
+            // Same original arena and stream as the request boundary. Arm is
+            // captured cold and submitted only at finite-scope admission; End
+            // follows every exact child terminal and reuses the readiness DAG.
+            if (!moe_kernel_->runMoEOverlayEpochParentAction(
+                    launch, params_.arena->control(),
+                    params_.arena->finiteParentStatus(),
+                    params_.operation == Operation::ArmFiniteParent
+                        ? DeviceMoEOverlayEpochParentAction::Arm
+                        : DeviceMoEOverlayEpochParentAction::Close))
+                return false;
+        }
+        else if (!moe_kernel_->releaseMoEOverlayEpoch(
+                     launch, params_.arena->control(), ticket, status))
         {
             return false;
         }
