@@ -283,9 +283,11 @@ TEST(MXFP4CPUScaleLoaders, PowerOfTwoBF16AndFP16WordsWidenExactlyOnEveryISA)
     ASSERT_EQ(fp16.scaleEncoding(), CPUNativeVNNIScaleEncoding::FP16);
     expectColumns(fp16, half_expected, [&](const uint16_t *p, const auto &x) { vector_check(p, x, fp16); });
     // Rotated MXFP4 keeps source codebook 25 but is expanded INT8 with FP16 scales.
+    // Every column goes through the scalar reader and each ISA's vector loader.
     const auto rotated = cpuUnitWithScales(half_words, kNativeVnniMXFP4Codebook, CPUNativeVNNIEncoding::ExpandedInt8);
-    EXPECT_EQ(rotated.scaleEncoding(), CPUNativeVNNIScaleEncoding::FP16);
-    EXPECT_EQ(bits(rotated.blockScale(0, 0, 3)), half_expected[3]);
+    ASSERT_EQ(rotated.scaleEncoding(), CPUNativeVNNIScaleEncoding::FP16);
+    ASSERT_EQ(rotated.primaryScaleLayout(), VnniPrimaryScaleLayout::FP16Words);
+    expectColumns(rotated, half_expected, [&](const uint16_t *p, const auto &x) { vector_check(p, x, rotated); });
 }
 
 TEST(MXFP4ScaleCarrier, StagedWordsDecodeExactlyAndFP16CallbacksAreUntouched)

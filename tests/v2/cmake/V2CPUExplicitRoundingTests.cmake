@@ -104,6 +104,6 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     # tile must select the exact placement widening from the prepared identity.
     v2_add_core_free_test(V2_Integration_MXFP4NEONScaleWords
         COMMAND $<TARGET_FILE:v2_test_cpu_native_neon_prepared_projection>
-            --gtest_filter=CPUNativeNEONPreparedProjection.EveryAdmittedPowerOfTwoBF16WordWidensExactly:CPUNativeNEONPreparedProjection.MXFP4ScaleWordsFollowThePreparedIdentity
+            --gtest_filter=CPUNativeNEONPreparedProjection.EveryAdmittedPowerOfTwoBF16WordWidensExactly:CPUNativeNEONPreparedProjection.MXFP4ScaleWordsFollowThePreparedIdentity:CPUNativeNEONPreparedProjection.RotatedMXFP4ExecutesExpandedInt8WithFP16Scales
         LABELS V2 Integration ProductionTestPreflight CPU NEON NativeVNNI MXFP4 Metadata Regression)
 endif()

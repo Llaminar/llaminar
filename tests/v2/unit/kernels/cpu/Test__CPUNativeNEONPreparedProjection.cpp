@@ -170,11 +170,17 @@ float appendPreparedReference(const CPUNativeVNNIWeightView &packed, const Q8_1B
  * @param blocks Logical K block count spanning partition boundaries.
  */
 template <std::size_t Rows, typename Ops, ms::Reduction Tree>
-void verifyPrepared(const NativeVnniFormatInfo &source, int n, int blocks)
+void verifyPrepared(const NativeVnniFormatInfo &source, int n, int blocks, bool rotated = false)
 {
     SCOPED_TRACE(::testing::Message() << "codebook=" << int(source.codebook_id)
-        << " rows=" << Rows << " n=" << n << " blocks=" << blocks << " tree=" << int(Tree));
-    NativeVNNIPreparedByteFixture fixture(source, n, blocks * 32);
+        << " rows=" << Rows << " n=" << n << " blocks=" << blocks << " tree=" << int(Tree)
+        << " rotated=" << rotated);
+    // Rotation publishes the symmetric ExpandedInt8 stream for any original
+    // source; the Q8_0 fixture owns that geometry, provenance stays original.
+    NativeVNNIPreparedByteFixture fixture(rotated ? native_vnni_formats::Q8_0 : source, n, blocks * 32);
+    if (rotated)
+        fixture.descriptor.source = {
+            .codebook_id = source.codebook_id, .is_superblock = source.is_superblock, .present = true};
     if constexpr (Tree == ms::Reduction::Contiguous)
         fixture.descriptor.numerical_policy = CPUProjectionNumericalPolicy::BackendNative;
     fixture.seedPayloadAndMetadata();
@@ -414,6 +420,20 @@ TEST_F(CPUNativeNEONPreparedProjection, EveryAdmittedPowerOfTwoBF16WordWidensExa
             EXPECT_EQ(widened[lane], e == 0 ? 0u : mxfp4::normalScaleFP32Bits(e)) << "word=" << word;
         }
     }
+}
+
+/** @test Rotated MXFP4 (source 25, ExpandedInt8) dispatches the expanded FP16 program, not the BF16 nibble one. */
+TEST_F(CPUNativeNEONPreparedProjection, RotatedMXFP4ExecutesExpandedInt8WithFP16Scales)
+{
+    using Ops = ms::NEONMultiScaleOps<ms::NEONByteDot::ASIMD>;
+    for (const int n : {3, 65})
+        for (const int blocks : {1, 17})
+        {
+            verifyPrepared<1, Ops, ms::Reduction::Contiguous>(native_vnni_formats::MXFP4, n, blocks, true);
+            verifyPrepared<4, Ops, ms::Reduction::Contiguous>(native_vnni_formats::MXFP4, n, blocks, true);
+            verifyPrepared<2, Ops, ms::Reduction::OrderedPartitions>(native_vnni_formats::MXFP4, n, blocks, true);
+            verifyPrepared<3, Ops, ms::Reduction::OrderedPartitions>(native_vnni_formats::MXFP4, n, blocks, true);
+        }
 }
 
 /** @test Native MXFP4 and its rotated form keep distinct scale-word interpretations. */
