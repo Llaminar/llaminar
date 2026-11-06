@@ -522,6 +522,124 @@ v2_add_core_free_test(V2_Integration_CPUTQRotationOriginalHeads
     COMMAND $<TARGET_FILE:v2_test_cpu_tq_rotation> --gtest_filter=*AllPositiveWorkersRetainOriginalSerialHeadBytes
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention TurboQuant Rotation ByteExact)
 
+add_executable(v2_test_qwen_sparse_native_bank
+    "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/attention/Test__QwenSparseNativeBank.cpp"
+    "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/qwen4exp/QwenSparseAttention.cpp"
+    "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/qwen4exp/Qwen4ExpStateIO.cpp")
+target_compile_features(v2_test_qwen_sparse_native_bank PRIVATE cxx_std_23)
+target_include_directories(v2_test_qwen_sparse_native_bank PRIVATE
+    "${V2_CPU_ARCHITECTURE_ROOT}/src/v2" "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2")
+target_link_libraries(v2_test_qwen_sparse_native_bank PRIVATE GTest::gtest_main)
+v2_add_core_free_test(V2_Unit_QwenSparseNativeBank
+    COMMAND $<TARGET_FILE:v2_test_qwen_sparse_native_bank>
+    LABELS V2 Unit CPU DeviceFree Attention QwenSparse Ownership)
+v2_add_core_free_test(V2_Integration_QwenSparseNativeBank
+    COMMAND $<TARGET_FILE:v2_test_qwen_sparse_native_bank>
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse Ownership Regression)
+v2_add_core_free_test(V2_Integration_QwenSparseNativeBankAddressAdmission
+    COMMAND $<TARGET_FILE:v2_test_qwen_sparse_native_bank>
+        --gtest_filter=*WrappingAndUnalignedOriginalAddressDomainsReject:*ActualCommonValidatorRejectsWrappingOriginalBank
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse Ownership Regression)
+v2_add_core_free_test(V2_Integration_QwenSparseNativeBankPolicyAdmission
+    COMMAND $<TARGET_FILE:v2_test_qwen_sparse_native_bank>
+        --gtest_filter=*UnknownOrIncompleteNativePoliciesReject:*ActualCommonValidatorRejectsUnrepresentableGQAAndRotaryPolicies:*ExactPhysicalElementAlignmentIsNotSIMDOrUniversalAlignment
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse Ownership Regression)
+v2_add_core_free_test(V2_Integration_QwenSparseNativeBankOriginalExclusions
+    COMMAND $<TARGET_FILE:v2_test_qwen_sparse_native_bank>
+        --gtest_filter=*EveryCodecRoleAndLayoutRetainsOriginalSlices:*CompleteOriginalCapacityAndMetadataExclusions:*PostAdmissionCoordinateCorruptionIsFatal
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse Ownership Regression)
+add_executable(v2_test_cpu_qwen_sparse_native_codec
+    "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/attention/Test__CPUQwenSparseNativeCodec.cpp")
+target_compile_features(v2_test_cpu_qwen_sparse_native_codec PRIVATE cxx_std_23)
+target_include_directories(v2_test_cpu_qwen_sparse_native_codec PRIVATE
+    "${V2_CPU_ARCHITECTURE_ROOT}/src/v2" "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2")
+target_link_libraries(v2_test_cpu_qwen_sparse_native_codec PRIVATE GTest::gtest_main)
+v2_add_core_free_test(V2_Unit_CPUQwenSparseNativeCodec
+    COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_native_codec>
+    LABELS V2 Unit CPU DeviceFree Attention QwenSparse ByteExact)
+v2_add_core_free_test(V2_Integration_CPUQwenSparseNativeCodec
+    COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_native_codec>
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact Regression)
+v2_add_core_free_test(V2_Integration_CPUQwenSparseNativeCodecRadialOrder
+    COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_native_codec>
+        --gtest_filter=*OriginalRadialScaleOrderCannotBeReassociated
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact Regression)
+v2_add_core_free_test(V2_Integration_CPUQwenSparseNativeCodecNumeric
+    COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_native_codec>
+        --gtest_filter=*InvalidOriginalNumericDataIsFatalBeforeFragmentPublication
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse Numeric Regression)
+add_executable(v2_test_cpu_qwen_sparse_attention
+    "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/Test__QwenSparseAttention.cpp"
+    "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/attention/Test__CPUQwenSparseLifetime.cpp"
+    "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/attention/Test__CPUQwenSparseExactBasis.cpp"
+    "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/Test__QwenSparseTerminalCounters.cpp"
+    "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/attention/CPUQwenSparseAttention.cpp"
+    "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/config/TensorParallelConfig.cpp"
+    "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/backends/GlobalDeviceAddress.cpp"
+    "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/qwen4exp/QwenSparseAttention.cpp"
+    "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/qwen4exp/QwenSparseReplay.cpp"
+    "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/qwen4exp/Qwen4ExpStateIO.cpp")
+target_compile_features(v2_test_cpu_qwen_sparse_attention PRIVATE cxx_std_23)
+target_include_directories(v2_test_cpu_qwen_sparse_attention PRIVATE
+    "${V2_CPU_ARCHITECTURE_ROOT}/src/v2" "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2")
+target_link_libraries(v2_test_cpu_qwen_sparse_attention PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX)
+v2_add_core_free_test(V2_Unit_CPUQwenSparseNativeEntries
+    COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
+        --gtest_filter=QwenSparseAttention.ExplicitRepresentationAndStaticBindingValidation:QwenSparseAttention.OrdinaryTailNoOpAndExactAcceptedPrefix:QwenSparseAttention.NativeSelectedAttentionIsGroupedSerialByteEquivalent:CPUQwenSparseLifetime.CompleteOriginalExclusionsRejectBeforePublication:CPUQwenSparseLifetime.OriginalReplayIntervalRejectsBeforeAnyWordLoad:CPUQwenSparseLifetime.FullSameHeadQueryAliasMatchesOriginalNativeProgram:CPUQwenSparseLifetime.EmptyAndNonemptyCallsCompleteBeforeOuterJoin:CPUQwenSparseLifetime.CanonicalCounterOverflowIsFatalAtPublicPublication:CPUQwenSparseLifetime.ConsumedIndexerNumericCorruptionIsFatalNotClamped:CPUQwenSparseExactBasis.OriginalNonsymmetricBasisAndQueryAliasMatchOrderedFMABytes
+    LABELS V2 Unit CPU DeviceFree Attention QwenSparse ByteExact)
+v2_add_core_free_test(V2_Integration_CPUQwenSparseOriginalCacheProgram
+    COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
+        --gtest_filter=QwenSparseAttention.NativeSelectedAttentionIsGroupedSerialByteEquivalent:QwenSparseAttention.InactiveRowsPreserveOutputAndTrafficAcrossDirtyReplays:QwenSparseAttention.EveryNativeCodecAndQ16BlockUsesCanonicalRingAndBasis
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact Regression)
+v2_add_core_free_test(V2_Integration_CPUQwenSparseAdmission
+    COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
+        --gtest_filter=CPUQwenSparseLifetime.CompleteOriginalExclusionsRejectBeforePublication
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse Ownership Regression)
+v2_add_core_free_test(V2_Integration_CPUQwenSparseExactOriginalBasis
+    COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
+        --gtest_filter=CPUQwenSparseExactBasis.OriginalNonsymmetricBasisAndQueryAliasMatchOrderedFMABytes
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact Regression)
+v2_add_core_free_test(V2_Integration_CPUQwenSparseReplayAdmission
+    COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
+        --gtest_filter=CPUQwenSparseLifetime.OriginalReplayIntervalRejectsBeforeAnyWordLoad
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse Ownership Regression)
+v2_add_core_free_test(V2_Integration_CPUQwenSparseQueryAlias
+    COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
+        --gtest_filter=CPUQwenSparseLifetime.FullSameHeadQueryAliasMatchesOriginalNativeProgram
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact Regression)
+v2_add_core_free_test(V2_Integration_CPUQwenSparseCompletion
+    COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
+        --gtest_filter=CPUQwenSparseLifetime.EmptyAndNonemptyCallsCompleteBeforeOuterJoin
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse Ordering Regression)
+v2_add_core_free_test(V2_Integration_CPUQwenSparseTerminalCounters
+    COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
+        --gtest_filter=QwenSparseTerminalCounters.*:CPUQwenSparseLifetime.CanonicalCounterOverflowIsFatalAtPublicPublication
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse StateMachine Regression)
+v2_add_core_free_test(V2_Integration_CPUQwenSparseIndexerNumeric
+    COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
+        --gtest_filter=CPUQwenSparseLifetime.ConsumedIndexerNumericCorruptionIsFatalNotClamped
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse Numeric Regression)
+v2_add_core_free_test(V2_Integration_CPUQwenSparseAllPositiveWorkers
+    COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
+        --gtest_filter=CPUQwenSparseLifetime.AllPositiveWorkersRetainOriginalSerialRowsAndGuards
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact ThreadBudget)
+add_executable(v2_test_cpu_qwen_sparse_fp32
+    "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/attention/Test__CPUQwenSparseFP32.cpp")
+target_compile_features(v2_test_cpu_qwen_sparse_fp32 PRIVATE cxx_std_20)
+target_include_directories(v2_test_cpu_qwen_sparse_fp32 PRIVATE
+    "${V2_CPU_ARCHITECTURE_ROOT}/src/v2" "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2")
+target_link_libraries(v2_test_cpu_qwen_sparse_fp32 PRIVATE GTest::gtest_main)
+v2_add_core_free_test(V2_Unit_CPUQwenSparseFP32
+    COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_fp32>
+    LABELS V2 Unit CPU DeviceFree Attention QwenSparse ByteExact)
+v2_add_core_free_test(V2_Integration_CPUQwenSparseFP32OriginalProgram
+    COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_fp32>
+        --gtest_filter=CPUQwenSparseFP32.OriginalRowsRetainDeclaredNativeFMAAndButterfly:CPUQwenSparseFP32.QsaButterflyIsNotGenericAttentionFold
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact Regression)
+v2_add_core_free_test(V2_Integration_CPUQwenSparseFP32Admission
+    COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_fp32>
+        --gtest_filter=CPUQwenSparseFP32.ScalarAndForeignProgramsAreNotAdvertised
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse Regression)
 add_executable(v2_test_cpu_tq_attention
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPUTQAttention.cpp")
 target_compile_features(v2_test_cpu_tq_attention PRIVATE cxx_std_20)
@@ -548,6 +666,9 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     v2_add_core_free_test(V2_Integration_NEONTQAttentionCentroidDecode
         COMMAND $<TARGET_FILE:v2_test_cpu_tq_attention> --gtest_filter=*NativeCentroidDecodeByteDomains
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree Attention TurboQuant ByteExact)
+    v2_add_core_free_test(V2_Integration_NEONTQAttentionOriginalCodebooks
+        COMMAND $<TARGET_FILE:v2_test_cpu_tq_attention> --gtest_filter=*NativeOriginalCodebookWordAuthorities
+        LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree Attention TurboQuant ByteExact Ownership Regression)
 endif()
 
 add_executable(v2_test_cpu_swiglu
