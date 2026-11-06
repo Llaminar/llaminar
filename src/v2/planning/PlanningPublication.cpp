@@ -6,6 +6,9 @@
  * MPI owns the rank namespace; immutable configuration bytes use the existing
  * strict codec. Root selection, receive allocation and decoding cannot strand
  * a peer in the next broadcast, and publication never selects a substitute plan.
+ * Root payloads are immutable borrows. Followers own unpublished final receivers
+ * until native completion, then admit/seal tensors inside the common consensus;
+ * malformed bytes cannot publish a partial sample or escape its original claim.
  */
 #include "planning/PlanningPublication.h"
 #include "planning/PlanningExpertSample.h"
@@ -156,6 +159,32 @@ namespace llaminar2
                 if (!completed && std::chrono::steady_clock::now() >= deadline)
                     fail("native payload broadcast exceeded collective deadline");
             }
+        }
+
+        /** @brief Require exact native identity before publication becomes externally visible.
+         * @param tensor Completed source or receive tensor.
+         * @param type Published original source format.
+         * @param geometry Published exact logical dimensions and payload extent.
+         * @throws std::runtime_error If the completed tensor disagrees with its source plan.
+         */
+        void validateNativeSample(const TensorBase &tensor, TensorType type,
+            const PlanningModelSampleGeometry &geometry)
+        {
+            if (tensor.native_type() != type || tensor.size_bytes() != geometry.source_bytes ||
+                tensor.shape() != std::vector<size_t>{geometry.n, geometry.k})
+                throw std::runtime_error("Planning publication changed native tensor identity");
+        }
+
+        /** @brief Adapt only an immutable root source to MPI's non-const broadcast ABI.
+         * @param tensor Completed root tensor, never a receive destination.
+         * @return Exact live source address; MPI_Ibcast never writes its root buffer.
+         * @throws std::runtime_error If the source has retired before posting.
+         */
+        void *nativeBroadcastSource(const TensorBase &tensor)
+        {
+            const auto *source = tensor.raw_data();
+            if (!source) throw std::runtime_error("Planning native source address is null");
+            return const_cast<void *>(source);
         }
 
         /** @return Exact MPI byte count; an empty envelope cannot attest completed work. */
@@ -339,6 +368,7 @@ namespace llaminar2
                 for (const auto &geometry : plan.description().matrices) payloadSize(geometry.source_bytes);
             });
         std::optional<PlanningLoadedExpertSample> loaded;
+        std::array<std::optional<PlanningModelSampleReceiver>, 3> receivers;
         std::array<void *, 3> receive_addresses{};
         std::array<int, 3> receive_counts{};
         exchange.phase(1, "planning-expert.allocate-payload", [&] {
@@ -349,24 +379,25 @@ namespace llaminar2
                 if (loaded->plan().serialize() != plan.serialize())
                     throw std::invalid_argument("Planning expert root payload disagrees with published plan");
             }
-            else
-            {
-                const auto allocate = [&](size_t i) {
-                    return PlanningLoadedModelSample::allocateReceive(plan.tensorType(i),
-                        plan.description().matrices[i], memory, host_device);
-                };
-                loaded = PlanningLoadedExpertSample(plan, {allocate(0), allocate(1), allocate(2)});
-            }
             for (size_t i = 0; i < receive_addresses.size(); ++i)
             {
                 const auto &geometry = plan.description().matrices[i];
-                if (loaded->tensor(i).native_type() != plan.tensorType(i) ||
-                    loaded->tensor(i).size_bytes() != geometry.source_bytes ||
-                    loaded->tensor(i).shape() != std::vector<size_t>{geometry.n, geometry.k})
-                    throw std::runtime_error("Planning expert publication changed native tensor identity");
-                // Resolve every potentially throwing tensor accessor before
-                // posting any request. No accessor may unwind live MPI buffers.
-                receive_addresses[i] = loaded->matrices_[i].receiveData();
+                // Resolve all fallible accesses before posting any request.
+                // The root never requests mutable access to sealed native data.
+                if (exchange.rank() == 0)
+                {
+                    validateNativeSample(loaded->tensor(i), plan.tensorType(i), geometry);
+                    receive_addresses[i] = nativeBroadcastSource(loaded->tensor(i));
+                }
+                else
+                {
+                    receivers[i].emplace(PlanningModelSampleReceiver::allocate(
+                        plan.tensorType(i), geometry, memory, host_device));
+                    const auto bytes = receivers[i]->receiveBytes();
+                    if (bytes.size() != geometry.source_bytes)
+                        throw std::runtime_error("Planning expert receive extent differs from its plan");
+                    receive_addresses[i] = bytes.data();
+                }
                 receive_counts[i] = payloadSize(geometry.source_bytes);
                 if (!receive_addresses[i]) throw std::runtime_error("Planning expert payload address is null");
             }
@@ -374,7 +405,13 @@ namespace llaminar2
         publishNativePayload(exchange, receive_addresses, receive_counts);
         // Local MPI completion alone does not certify that every peer has
         // completed. Publication becomes externally visible only after consensus.
-        exchange.phase(2, "planning-expert.seal-payload", [] {});
+        exchange.phase(2, "planning-expert.seal-payload", [&] {
+            if (exchange.rank() != 0)
+                loaded = PlanningLoadedExpertSample(plan,
+                    {receivers[0]->finish(), receivers[1]->finish(), receivers[2]->finish()});
+            for (size_t i = 0; i < receive_addresses.size(); ++i)
+                validateNativeSample(loaded->tensor(i), plan.tensorType(i), plan.description().matrices[i]);
+        });
         return std::move(*loaded);
     }
 
@@ -402,6 +439,7 @@ namespace llaminar2
                 payloadSize(plan.geometry().source_bytes);
             });
         std::optional<PlanningLoadedMatrixSample> loaded;
+        std::optional<PlanningModelSampleReceiver> receiver;
         std::array<void *, 1> addresses{};
         std::array<int, 1> counts{};
         exchange.phase(1, "planning-matrix.allocate-payload", [&] {
@@ -412,19 +450,29 @@ namespace llaminar2
                 if (loaded->plan().serialize() != plan.serialize())
                     throw std::invalid_argument("Planning matrix root payload disagrees with published plan");
             }
-            else loaded = PlanningLoadedMatrixSample(plan, PlanningLoadedModelSample::allocateReceive(
+            else receiver.emplace(PlanningModelSampleReceiver::allocate(
                 plan.tensorType(), plan.geometry(), memory, host_device));
             const auto &geometry = plan.geometry();
-            if (loaded->tensor().native_type() != plan.tensorType() ||
-                loaded->tensor().size_bytes() != geometry.source_bytes ||
-                loaded->tensor().shape() != std::vector<size_t>{geometry.n, geometry.k})
-                throw std::runtime_error("Planning matrix publication changed native tensor identity");
-            addresses[0] = loaded->sample_.receiveData();
+            if (exchange.rank() == 0)
+            {
+                validateNativeSample(loaded->tensor(), plan.tensorType(), geometry);
+                addresses[0] = nativeBroadcastSource(loaded->tensor());
+            }
+            else
+            {
+                const auto bytes = receiver->receiveBytes();
+                if (bytes.size() != geometry.source_bytes)
+                    throw std::runtime_error("Planning matrix receive extent differs from its plan");
+                addresses[0] = bytes.data();
+            }
             counts[0] = payloadSize(geometry.source_bytes);
             if (!addresses[0]) throw std::runtime_error("Planning matrix payload address is null");
         });
         publishNativePayload(exchange, addresses, counts);
-        exchange.phase(2, "planning-matrix.seal-payload", [] {});
+        exchange.phase(2, "planning-matrix.seal-payload", [&] {
+            if (exchange.rank() != 0) loaded = PlanningLoadedMatrixSample(plan, receiver->finish());
+            validateNativeSample(loaded->tensor(), plan.tensorType(), plan.geometry());
+        });
         return std::move(*loaded);
     }
 

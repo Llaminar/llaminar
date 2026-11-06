@@ -7,6 +7,8 @@
  * overlapping CPU visibility cannot manufacture contention. Samplers on separate
  * physical nodes may run concurrently. Setup storage is admitted once through
  * the canonical PMA envelope and completely retires before returning evidence.
+ * CPU floating and online-A4 projections retain their source allocation; their
+ * receipts must not claim a second prepared pack that the sampler never owned.
  */
 #include "PlanningKernelServiceCatalog.h"
 #include "PlanningObservedResource.h"
@@ -235,8 +237,9 @@ namespace llaminar2
                     value.cpu->isa <= ISALevel::AVX512 && value.cpu->compiled_isa >= ISALevel::AVX2 &&
                     value.cpu->compiled_isa <= ISALevel::AVX512 && value.cpu->isa <= value.cpu->compiled_isa,
                     "invalid projection CPU workshare/ISA");
-                const bool floating = type == TensorType::FP32 || type == TensorType::FP16 || type == TensorType::BF16;
-                require(floating ? value.prepared_bytes == 0 : value.prepared_bytes > 0,
+                const bool retains_source = type == TensorType::FP32 || type == TensorType::FP16 ||
+                    type == TensorType::BF16 || isW4A4Format(type);
+                require(retains_source ? value.prepared_bytes == 0 : value.prepared_bytes > 0,
                     "CPU projection prepared ownership differs from its execution format");
             }
             else require(value.prepared_bytes > 0, "GPU projection has no prepared payload");

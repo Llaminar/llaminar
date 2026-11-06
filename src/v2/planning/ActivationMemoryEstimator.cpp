@@ -5,8 +5,10 @@
  * BufferArena currently allocates each registered BufferId independently;
  * alias metadata validates lifetimes but does not merge physical storage.
  * CPU admission resolves the production GraphSchema into the same root inventory
- * consumed by graph setup. CPUTensorStorageDeclaration owns native extents and
- * allocator rounding. GPU estimates retain their existing geometry policy.
+ * consumed by graph setup. Source architecture owns that schema even when every
+ * layer is full attention: the Qwen3.5 graph still registers its complete union.
+ * CPUTensorStorageDeclaration owns native extents and allocator rounding.
+ * GPU estimates retain their existing geometry policy.
  */
 
 #include "planning/ActivationMemoryEstimator.h"
@@ -239,7 +241,11 @@ GraphArenaStorageLayout ActivationMemoryEstimator::declareCPUStorage(
     formulas["mtp_gather_rows"] = gather.rows();
     formulas["mtp_gather_vocab"] = gather.columns();
 
-    const bool hybrid = profile.flash_next || hasHybridRecurrentLayer(profile, 0, std::max(0, profile.n_layers - 1));
+    // A layer inventory selects execution, not the graph's physical root set.
+    // In particular, an all-attention Qwen3.5 model still owns the Qwen3.5
+    // schema's FA gates, recurrent placeholders and retained MTP placeholders.
+    const bool hybrid = profile.flash_next || profile.architecture == "qwen35" ||
+        profile.architecture == "qwen35moe";
     GraphSchema schema = hybrid ? (profile.expert_count > 0
         ? Qwen35MoESchemaFactory{}.createSchema() : Qwen35SchemaFactory{}.createSchema())
         : Qwen2SchemaFactory{}.createSchema();

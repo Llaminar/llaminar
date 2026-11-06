@@ -10,6 +10,10 @@
  * Native calibration samples use the same original-coordinate window reader as
  * model preparation. Reads populate the existing final sample owner directly;
  * there is no second matrix-sized reader allocation or retained source parent.
+ * Unpublished receivers become tensors only after complete I/O and native
+ * admission. The original loader owns whole-source online-A4 policy admission,
+ * borrowing this final allocation before returning selected bytes. Planning
+ * neither narrows that policy nor duplicates its scan or validation authority.
  */
 #include "planning/PlanningModelMetadata.h"
 #include "planning/PlanningPublication.h"
@@ -21,6 +25,8 @@
 #include "loaders/NativeWeightLoadStaging.h"
 #include "tensors/NativeWeightSourceRange.h"
 #include "tensors/TensorFactory.h"
+#include "tensors/NativeTensorExtent.h"
+#include "tensors/W4A4Tensor.h"
 #include "utils/MPIContext.h"
 #include <array>
 #include <limits>
@@ -206,6 +212,9 @@ namespace llaminar2
             else if constexpr (std::is_same_v<Selection, PlanningMatrixColumns>)
             {
                 requireRange(selection.first, selection.last, k);
+                if (isW4A4Format(ggufToTensorType(info->type)) &&
+                    (selection.first != 0 || selection.last != k))
+                    throw std::invalid_argument("W4A4/H planning samples require complete original K");
                 if (selection.first % block || selection.last % block)
                     throw std::invalid_argument("Planning sample column interval splits a source codebook block");
                 k = selection.last - selection.first;
@@ -237,37 +246,89 @@ namespace llaminar2
         return *storage_->matrix;
     }
 
-    PlanningLoadedModelSample PlanningLoadedModelSample::allocateReceive(TensorType type,
+    /** @brief Exclusive final roots retain their scalar ABI and original allocator through sealing. */
+    struct PlanningModelSampleReceiver::Storage final
+    {
+        using Bytes = std::variant<AlignedVector<float>, AlignedVector<uint16_t>, AlignedVector<uint8_t>>;
+        TensorType type; ///< Source format, not a requested conversion.
+        PlanningModelSampleGeometry geometry; ///< Already validated source selection.
+        DeviceId host_device; ///< Original admitted CPU allocator.
+        Bytes bytes; ///< One final payload; no tensor can borrow it before finish.
+    };
+
+    PlanningModelSampleReceiver::PlanningModelSampleReceiver(std::unique_ptr<Storage> storage)
+        : storage_(std::move(storage)) {}
+    PlanningModelSampleReceiver::~PlanningModelSampleReceiver() = default;
+    PlanningModelSampleReceiver::PlanningModelSampleReceiver(PlanningModelSampleReceiver &&) noexcept = default;
+    PlanningModelSampleReceiver &PlanningModelSampleReceiver::operator=(PlanningModelSampleReceiver &&) noexcept = default;
+
+    PlanningModelSampleReceiver PlanningModelSampleReceiver::allocate(TensorType type,
         PlanningModelSampleGeometry geometry, const std::shared_ptr<PhysicalMemoryAuthority> &memory,
         DeviceId host_device)
     {
         if (!memory || !host_device.is_cpu())
             throw std::invalid_argument("Planning sample reception requires an admitted CPU allocator");
-        auto payload = std::make_shared<Storage>();
+        if (!geometry.n || !geometry.k || !geometry.source_bytes ||
+            geometry.n > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+            geometry.k > static_cast<size_t>(std::numeric_limits<int>::max()))
+            throw std::invalid_argument("Planning sample reception requires complete matrix geometry");
         const auto allocate = [&]<typename T>(size_t count) {
             return CPUStorageRoot<T>(count, PhysicalMemoryOwner::ModelSourcePayload, host_device,
                 CPUStoragePlacement::local(), CPUStorageInitialization::Uninitialized).allocate(memory);
         };
-        const std::vector<size_t> shape{geometry.n, geometry.k};
-        // Allocation/first touch runs on the rank's affined setup thread. The
-        // initialized tensor is the final receive address, not a staging copy.
-        if (type == TensorType::FP32) payload->matrix = std::make_shared<FP32Tensor>(
-            shape, allocate.template operator()<float>(geometry.n * geometry.k), host_device);
-        else if (type == TensorType::FP16) payload->matrix = std::make_shared<FP16Tensor>(
-            shape, allocate.template operator()<uint16_t>(geometry.source_bytes / sizeof(uint16_t)), host_device);
-        else if (type == TensorType::BF16) payload->matrix = std::make_shared<BF16Tensor>(
-            shape, allocate.template operator()<uint16_t>(geometry.source_bytes / sizeof(uint16_t)), host_device);
-        else payload->matrix = TensorFactory::adoptQuantizedFinalStorage(
-            type, shape, allocate.template operator()<uint8_t>(geometry.source_bytes), host_device);
-        if (!payload->matrix || payload->matrix->size_bytes() != geometry.source_bytes)
-            throw std::runtime_error("Planning sample receive allocation disagrees with native extent");
-        return PlanningLoadedModelSample(std::move(payload));
+        const std::array shape{geometry.n, geometry.k};
+        Storage::Bytes bytes;
+        if (type == TensorType::FP32 || type == TensorType::FP16 || type == TensorType::BF16)
+        {
+            const size_t scalar_bytes = type == TensorType::FP32 ? sizeof(float) : sizeof(uint16_t);
+            if (geometry.source_bytes != nativeTensorExtent(shape, 1, scalar_bytes))
+                throw std::invalid_argument("Planning floating receive extent disagrees with geometry");
+            if (type == TensorType::FP32)
+                bytes = allocate.template operator()<float>(geometry.source_bytes / sizeof(float));
+            else bytes = allocate.template operator()<uint16_t>(geometry.source_bytes / sizeof(uint16_t));
+        }
+        else
+        {
+            if (isW4A4Format(type))
+            {
+                const auto extent = w4a4::MatrixContract::sourceExtent(geometry.n, geometry.k);
+                if (!extent || *extent != geometry.source_bytes)
+                    throw std::invalid_argument("Planning online-A4 receive extent disagrees with geometry");
+            }
+            bytes = allocate.template operator()<uint8_t>(geometry.source_bytes);
+        }
+        return PlanningModelSampleReceiver(std::make_unique<Storage>(
+            Storage{type, geometry, host_device, std::move(bytes)}));
     }
 
-    void *PlanningLoadedModelSample::receiveData()
+    std::span<std::byte> PlanningModelSampleReceiver::receiveBytes()
     {
-        if (!storage_) throw std::logic_error("Planning receive sample was moved from");
-        return storage_->matrix->raw_mutable_data();
+        if (!storage_) throw std::logic_error("Planning native receiver has retired");
+        return std::visit([](auto &bytes) { return std::as_writable_bytes(std::span(bytes.data(), bytes.size())); },
+            storage_->bytes);
+    }
+
+    PlanningLoadedModelSample PlanningModelSampleReceiver::finish()
+    {
+        if (!storage_) throw std::logic_error("Planning native receiver has retired");
+        auto source = std::move(storage_); // Failure consumes the writer and retires its original lease.
+        auto payload = std::make_shared<PlanningLoadedModelSample::Storage>();
+        const std::vector<size_t> shape{source->geometry.n, source->geometry.k};
+        if (source->type == TensorType::FP32) payload->matrix = std::make_shared<FP32Tensor>(
+            shape, std::move(std::get<AlignedVector<float>>(source->bytes)), source->host_device);
+        else if (source->type == TensorType::FP16) payload->matrix = std::make_shared<FP16Tensor>(
+            shape, std::move(std::get<AlignedVector<uint16_t>>(source->bytes)), source->host_device);
+        else if (source->type == TensorType::BF16) payload->matrix = std::make_shared<BF16Tensor>(
+            shape, std::move(std::get<AlignedVector<uint16_t>>(source->bytes)), source->host_device);
+        else if (isW4A4Format(source->type)) payload->matrix = std::make_shared<W4A4Tensor>(w4a4::WeightStorage::adopt(
+            source->type == TensorType::W4A4 ? w4a4::Transform::Identity : w4a4::Transform::PaleySylvester,
+            source->geometry.n, source->geometry.k, std::move(std::get<AlignedVector<uint8_t>>(source->bytes)),
+            PhysicalMemoryOwner::ModelSourcePayload));
+        else payload->matrix = TensorFactory::adoptQuantizedFinalStorage(source->type, shape,
+            std::move(std::get<AlignedVector<uint8_t>>(source->bytes)), source->host_device);
+        if (!payload->matrix || payload->matrix->size_bytes() != source->geometry.source_bytes)
+            throw std::runtime_error("Planning sample receive allocation disagrees with native extent");
+        return PlanningLoadedModelSample(std::move(payload));
     }
 
     PlanningLoadedModelSample PlanningModelSource::loadSample(const PlanningModelSampleRequest &request,
@@ -281,7 +342,7 @@ namespace llaminar2
         // allocation escapes it (the reader writes directly to final storage).
         const auto transaction = memory->acquireCPUWeightSourceTransaction(host_device);
         const auto original = storage_->loader.nativeWeightSourceGeometry(request.tensor_name);
-        auto result = PlanningLoadedModelSample::allocateReceive(
+        auto receiver = PlanningModelSampleReceiver::allocate(
             original.original_type, geometry, memory, host_device);
         NativeWeightSourceWindow range{
             .rows = geometry.n,
@@ -298,18 +359,23 @@ namespace llaminar2
         }, request.selection);
         const auto budget = configuredNativeWeightLoadStagingBudgetBytes();
         const size_t capacity = budget ? std::min(*budget, geometry.source_bytes) : geometry.source_bytes;
-        auto destination = std::span<std::byte>(static_cast<std::byte *>(result.receiveData()), geometry.source_bytes);
-        forEachNativeWeightSourceWindow(original, range, capacity, [&](const NativeWeightSourceWindow &window) {
-            // A complete-row window is contiguous in the final selected matrix.
-            // Oversized rows instead write one native-group strip at a time.
-            const size_t offset = (window.first_row - range.first_row) * range.native_row_bytes +
-                ((window.first_column - range.first_column) / original.native_group_elements) * original.native_group_bytes;
-            if (offset > destination.size() || window.nativeBytes() > destination.size() - offset)
-                throw std::logic_error("Planning source window exceeds its final native sample");
-            storage_->loader.readNativeWeightSourceWindow(request.tensor_name, window,
-                destination.subspan(offset, window.nativeBytes()));
-        });
-        return result;
+        auto destination = receiver.receiveBytes();
+        const auto read_range = [&](const NativeWeightSourceWindow &selected) {
+            forEachNativeWeightSourceWindow(original, selected, capacity, [&](const NativeWeightSourceWindow &window) {
+                // Transport may split K, but admission below sees complete rows.
+                const size_t offset = (window.first_row - selected.first_row) * selected.native_row_bytes +
+                    ((window.first_column - selected.first_column) / original.native_group_elements) * original.native_group_bytes;
+                if (offset > destination.size() || window.nativeBytes() > destination.size() - offset)
+                    throw std::logic_error("Planning source window exceeds its final native sample");
+                storage_->loader.readNativeWeightSourceWindow(request.tensor_name, window,
+                    destination.subspan(offset, window.nativeBytes()));
+            });
+        };
+        // The same source reader admits every original header before its first
+        // selected read, using this unpublished destination. Receiver sealing
+        // then validates the actual received matrix, including MPI corruption.
+        read_range(range);
+        return receiver.finish();
     }
 
     size_t maximumGGUFTensorPayloadBytes(const GGUFModel &model)

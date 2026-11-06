@@ -93,14 +93,16 @@ namespace llaminar2
             return plan.type == TensorType::FP32 || plan.type == TensorType::FP16 || plan.type == TensorType::BF16;
         }
 
-        /** @return Native CPU retained/temporary demand; ordinary floating kernels borrow source. */
+        /** @return Additional CPU demand; floating and online-A4 engines retain the existing source root. */
         CPUWeightPreparationMemory cpuPreparation(const ProjectionGeometry &plan)
         {
             auto result = CPUWeightPreparationMemory::sourceNative(plan.format, plan.n, plan.k);
-            if (floating(plan))
+            if (floating(plan) || isW4A4Format(plan.type))
             {
+                // Both retain the already admitted source allocation. Online-A4
+                // still reports its native payload, but owns no second pack.
                 result.persistent_bytes = 0;
-                result.persistent_payload_bytes = 0;
+                if (floating(plan)) result.persistent_payload_bytes = 0;
             }
             return result;
         }
@@ -289,8 +291,8 @@ namespace llaminar2
             else if (!GPUDeviceContextPool::instance().getContext(device).ownsCurrentThread())
                 throw std::invalid_argument("GPU projection sampling requires its exact owning worker");
 
-            // Floating CPU engines borrow the runtime source; quantized CPU
-            // engines own a separately admitted pack.
+            // Floating and online-A4 CPU engines retain the runtime source;
+            // weight-only quantized engines own a separately admitted pack.
             std::shared_ptr<KernelFactory::PreparedGemmHandle> cpu_handle;
             std::shared_ptr<LoadOrchestrator> gpu_pool;
             std::shared_ptr<ITensorGemm> gpu_engine;

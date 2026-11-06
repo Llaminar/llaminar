@@ -230,6 +230,10 @@ namespace llaminar2
                 return "IQ1_M";
             case GGUFTensorType::MXFP4:
                 return "MXFP4";
+            case GGUFTensorType::W4A4:
+                return "W4A4";
+            case GGUFTensorType::W4A4H:
+                return "W4A4H";
             case GGUFTensorType::BF16:
                 return "BF16";
             default:

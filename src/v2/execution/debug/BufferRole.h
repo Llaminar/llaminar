@@ -10,6 +10,10 @@
  * - Persistence after execution
  * - Eligibility for buffer reuse/aliasing
  *
+ * Weight descriptors preserve native format identity and complete block extents.
+ * They describe stage operands, not an allocation ledger or source-admission
+ * authority; source contracts still own original-K geometry and arithmetic.
+ *
  * @see DeviceGraphBufferManager for buffer allocation
  * @see IComputeStage::getBufferRequirements() for stage integration
  */
@@ -17,8 +21,12 @@
 #pragma once
 
 #include "../../tensors/TensorLayout.h"
+#include "../../tensors/TensorType.h"
+#include "../../tensors/W4A4Format.h"
 #include "../../backends/DeviceId.h"
 #include <cstddef>
+#include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -159,8 +167,8 @@ namespace llaminar2
     /**
      * @brief Tensor data type for buffer allocation
      *
-     * Matches TensorBase::native_type() values but as a simple enum
-     * for use in buffer descriptors before tensors exist.
+     * Describes operands before tensors exist. These ordinals are independent
+     * of TensorType; conversion must use named identities, not integer casts.
      */
     enum class BufferTensorType
     {
@@ -174,12 +182,16 @@ namespace llaminar2
         Q16_1,   ///< 16-bit quantized with scales (72 bytes per 32 elements)
         INT32,   ///< 32-bit integer (position IDs, etc.)
         UNKNOWN, ///< Unspecified (infer from context)
+        W4A4,    ///< Native online-A4 source:144 bytes per256 logical values
+        W4A4H,   ///< Same source ABI with an ordered online Hadamard transform
     };
 
     /**
      * @brief Get element size in bytes for a tensor type
      *
      * For block-quantized types, returns the block size.
+     * @param type Declared buffer representation.
+     * @return Bytes per scalar or serialized block, not bytes per logical value.
      */
     inline size_t bufferTensorTypeSize(BufferTensorType type)
     {
@@ -203,13 +215,18 @@ namespace llaminar2
             return 18; // Similar to Q4_0
         case BufferTensorType::Q16_1:
             return 72; // 64 bytes data + 4 bytes scale + 4 bytes sum (per 32 elements)
+        case BufferTensorType::W4A4:
+        case BufferTensorType::W4A4H:
+            return w4a4::kSourceBlockBytes;
         default:
             return 4; // Default to FP32 size
         }
     }
 
     /**
-     * @brief Convert BufferTensorType to string
+     * @brief Convert BufferTensorType to string.
+     * @param type Declared buffer representation.
+     * @return Stable format name, or UNKNOWN for an unresolved declaration.
      */
     inline const char *bufferTensorTypeName(BufferTensorType type)
     {
@@ -233,6 +250,10 @@ namespace llaminar2
             return "Q16_1";
         case BufferTensorType::INT32:
             return "INT32";
+        case BufferTensorType::W4A4:
+            return "W4A4";
+        case BufferTensorType::W4A4H:
+            return "W4A4H";
         default:
             return "UNKNOWN";
         }
@@ -321,44 +342,67 @@ namespace llaminar2
         // =====================================================================
 
         /**
-         * @brief Calculate total elements in buffer
+         * @brief Calculate the exact logical element count.
+         * @return Shape product; an empty shape or any zero dimension yields zero.
+         * @throws std::overflow_error If a nonempty extent cannot be represented.
          */
         size_t numel() const
         {
             if (shape.empty())
                 return 0;
+            for (size_t dim : shape)
+                if (dim == 0)
+                    return 0;
             size_t n = 1;
             for (size_t dim : shape)
+            {
+                if (dim > std::numeric_limits<size_t>::max() / n)
+                    throw std::overflow_error("Graph buffer element extent overflows size_t");
                 n *= dim;
+            }
             return n;
         }
 
         /**
-         * @brief Calculate total bytes needed
+         * @brief Calculate the exact scalar or block-encoded footprint.
          *
-         * For quantized types, accounts for block structure.
+         * Native online-A4 weights cannot round a fragment into another block.
+         * Algebraic [K,N] stage shapes and storage [N,K] have the same footprint;
+         * the source authority, not this descriptor, validates complete original K.
+         * @return Required bytes; empty extents yield zero.
+         * @throws std::invalid_argument If a native source ends inside a block.
+         * @throws std::overflow_error If the logical or byte extent overflows.
          */
         size_t sizeBytes() const
         {
-            size_t elements = numel();
+            const size_t elements = numel();
             if (elements == 0)
                 return 0;
 
+            size_t units = elements;
             switch (tensor_type)
             {
+            case BufferTensorType::W4A4:
+            case BufferTensorType::W4A4H:
+                if (elements % w4a4::kBlockElements != 0)
+                    throw std::invalid_argument("Native W4A4 graph buffers require complete source blocks");
+                units = elements / w4a4::kBlockElements;
+                break;
             case BufferTensorType::Q8_1:
             case BufferTensorType::Q8_0:
             case BufferTensorType::Q4_0:
             case BufferTensorType::IQ4_NL:
-            {
-                // Block-quantized: round up to block boundary
-                constexpr size_t BLOCK_SIZE = 32;
-                size_t blocks = (elements + BLOCK_SIZE - 1) / BLOCK_SIZE;
-                return blocks * bufferTensorTypeSize(tensor_type);
-            }
+            case BufferTensorType::Q16_1:
+                // Quotient/remainder rounding avoids overflowing elements+31.
+                units = elements / 32 + (elements % 32 != 0);
+                break;
             default:
-                return elements * bufferTensorTypeSize(tensor_type);
+                break;
             }
+            const size_t unit_bytes = bufferTensorTypeSize(tensor_type);
+            if (units > std::numeric_limits<size_t>::max() / unit_bytes)
+                throw std::overflow_error("Graph buffer byte extent overflows size_t");
+            return units * unit_bytes;
         }
 
         /**
@@ -750,9 +794,6 @@ namespace llaminar2
     // Tensor Type Conversion Helpers
     // =========================================================================
 
-    // Forward declaration (see Tensors.h for full definition)
-    enum class TensorType;
-
     /**
      * @brief Convert TensorBase::native_type() to BufferTensorType
      *
@@ -764,25 +805,30 @@ namespace llaminar2
      */
     inline BufferTensorType toBufferTensorType(TensorType type)
     {
-        // TensorType values from Tensors.h - cast to underlying int
-        switch (static_cast<int>(type))
+        switch (type)
         {
-        case 0: // FP32
+        case TensorType::FP32:
             return BufferTensorType::FP32;
-        case 1: // BF16
+        case TensorType::BF16:
             return BufferTensorType::BF16;
-        case 2: // FP16
+        case TensorType::FP16:
             return BufferTensorType::FP16;
-        case 4: // INT32
+        case TensorType::INT32:
             return BufferTensorType::INT32;
-        case 5: // IQ4_NL
+        case TensorType::IQ4_NL:
             return BufferTensorType::IQ4_NL;
-        case 7: // Q8_0
+        case TensorType::Q8_0:
             return BufferTensorType::Q8_0;
-        case 8: // Q8_1
+        case TensorType::Q8_1:
             return BufferTensorType::Q8_1;
-        case 9: // Q4_0
+        case TensorType::Q16_1:
+            return BufferTensorType::Q16_1;
+        case TensorType::Q4_0:
             return BufferTensorType::Q4_0;
+        case TensorType::W4A4:
+            return BufferTensorType::W4A4;
+        case TensorType::W4A4H:
+            return BufferTensorType::W4A4H;
         default:
             return BufferTensorType::UNKNOWN;
         }

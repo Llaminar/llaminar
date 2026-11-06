@@ -2,7 +2,9 @@
  * @file MTPWeightManifest.cpp
  * @brief Canonical learned-predictor discovery and fail-fast MTP admission.
  *
- * Discovery reads only metadata and tensor names. Auto planning and concrete
+ * Discovery reads only metadata, source formats and tensor names. Complete
+ * predictor weights do not authenticate the embedding/hidden/head basis of a
+ * rotated online-A4 main graph. Auto planning and concrete
  * graph construction use the same mandatory-weight contract before estimating
  * or allocating predictor state; no synthetic predictor or hidden downgrade is
  * permitted when a plain GGUF has no learned NextN/MTP weights.
@@ -26,6 +28,9 @@ namespace llaminar2
     namespace
     {
         constexpr int kSupportedMTPDepth = 1;
+        constexpr char kUnqualifiedW4A4Basis[] =
+            "W4A4/H MTP basis compatibility has not been established: rotated main weights "
+            "and copied predictor weights require independent embedding, hidden and head basis validation";
 
         /** @return Whether every required source role is present in this exact directory. */
         template<class HasTensor>
@@ -493,6 +498,15 @@ namespace llaminar2
         const IModelLoader &loader, const std::string &architecture,
         int base_layer_count, bool explicit_mtp)
     {
+        // Format identity, not model/display names or optional tensor names,
+        // identifies this unqualified basis. An h_unrotate name alone is not
+        // evidence that all three boundaries implement the same basis.
+        if (const auto *directory = loader.ggufDirectory();
+            directory && std::any_of(directory->tensors.begin(), directory->tensors.end(),
+                [](const auto &tensor) {
+                    return tensor.type == GGUFTensorType::W4A4 || tensor.type == GGUFTensorType::W4A4H;
+                }))
+            return unavailable(kUnqualifiedW4A4Basis);
         if (architecture == "qwen4exp")
         {
             if (const auto *manifest = loader.predictorManifest())
@@ -515,6 +529,10 @@ namespace llaminar2
     MTPWeightManifest discoverMTPWeightManifest(const ModelMemoryProfile &profile,
                                              bool explicit_mtp)
     {
+        if (std::any_of(profile.tensors.begin(), profile.tensors.end(), [](const auto &tensor) {
+                return tensor.quant_type == "W4A4" || tensor.quant_type == "W4A4H";
+            }))
+            return unavailable(kUnqualifiedW4A4Basis);
         if (profile.architecture == "qwen4exp")
         {
             if (!profile.flash_next_predictor || !profile.flash_next || profile.mtp_layer_count != 1)

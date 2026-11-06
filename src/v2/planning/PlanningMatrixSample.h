@@ -34,6 +34,8 @@ namespace llaminar2
         const PlanningModelSampleRequest &request() const noexcept { return request_; }
         /** @return Native source dimensions/extent, not packed-weight allocation demand. */
         const PlanningModelSampleGeometry &geometry() const noexcept { return geometry_; }
+        /** @return Complete original reduction width, independent of the selected source interval. */
+        size_t originalColumns() const noexcept { return original_k_; }
         /** @return Original source format; no dequantization or format substitution. */
         const std::string &format() const noexcept { return format_; }
         /** @return Validated native tensor type for source allocation/preparation. */
@@ -64,6 +66,7 @@ namespace llaminar2
         std::string model_path_, architecture_, format_;
         PlanningModelSampleRequest request_;
         PlanningModelSampleGeometry geometry_{};
+        size_t original_k_ = 0; ///< Source directory K; online-A4 operands cannot narrow it.
         uint32_t gguf_type_ = 0;
         GDNProjectionArithmetic arithmetic_ = GDNProjectionArithmetic::Native; ///< Sealed original-source scoped setup mode.
         MoERouterArithmetic router_arithmetic_ = MoERouterArithmetic::Native; ///< Router-only source preparation identity.

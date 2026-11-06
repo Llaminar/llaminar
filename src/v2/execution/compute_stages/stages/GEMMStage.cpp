@@ -8,6 +8,8 @@
  * exact stream ordering. Fused SwiGLU consumes two [M,K] operands before the
  * projection produces [M,N]. Diagnostic descriptors preserve those distinct
  * dimensions so a stage dump cannot truncate or overread the gate operand.
+ * Output declarations use the selected column interval while retained weight
+ * declarations continue to describe the original source operand.
  * Typed bias remains the same source tensor through ordinary and verifier
  * dispatch; unsupported typed fused bias declarations fail before submission.
  * HC two-term input publication retains the original activated FP32 value,
@@ -1289,6 +1291,11 @@ namespace llaminar2
         return info;
     }
 
+    /**
+     * @brief Describe bound operands without reading their values or allocating storage.
+     * @return Native source-weight metadata and selected-output extents, or an empty
+     * declaration when the required operands have not been bound.
+     */
     StageBufferRequirements GEMMStage::getBufferRequirements() const
     {
         StageBufferRequirements reqs;
@@ -1307,8 +1314,10 @@ namespace llaminar2
         // WEIGHT buffer (read-only, may be quantized)
         reqs.addWeight("B", {static_cast<size_t>(params_.k), static_cast<size_t>(params_.n)}, b_type);
 
-        // OUTPUT buffer
-        reqs.addOutput("C", {static_cast<size_t>(params_.m), static_cast<size_t>(params_.n)}, c_type);
+        // Match the executor's selected width, not the unsliced source width.
+        const size_t output_columns = params_.output_range.empty()
+            ? static_cast<size_t>(params_.n) : static_cast<size_t>(params_.output_range.size());
+        reqs.addOutput("C", {static_cast<size_t>(params_.m), output_columns}, c_type);
 
         if(params_.gated_norm) {
             reqs.addInput("gated_norm_gate",{static_cast<size_t>(params_.m),static_cast<size_t>(params_.k)},BufferTensorType::FP32);

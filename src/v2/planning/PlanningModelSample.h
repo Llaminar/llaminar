@@ -5,8 +5,10 @@
  * A selection names source rows, source columns, or one expert, never an
  * arbitrary proxy shape. PlanningModelSource validates it against its retained
  * directory and loads it through ModelLoader. The returned sample retains its
- * final sample allocation and PMA lease together. Expert selections populate a
- * 2-D final matrix directly, without loading their parent. This is native source materialization, not model-specific
+ * final sample allocation and PMA lease together. A move-only receiver owns
+ * unpublished final bytes; only completed I/O can seal a tensor. Expert
+ * selections populate a 2-D final matrix directly, without loading their parent.
+ * This is native source materialization, not model-specific
  * representation conversion, GPU preparation, or performance extrapolation.
  */
 #pragma once
@@ -14,6 +16,7 @@
 #include <cstddef>
 #include <array>
 #include <memory>
+#include <span>
 #include <string>
 #include <variant>
 #include "backends/DeviceId.h"
@@ -24,6 +27,7 @@ namespace llaminar2
 {
     class TensorBase;
     class PlanningModelSource;
+    class PlanningModelSampleReceiver;
     class PhysicalMemoryAuthority;
     /** @brief An entire ordinary 2-D source matrix. */
     struct PlanningWholeMatrix {};
@@ -111,17 +115,58 @@ namespace llaminar2
         /** @return Const matrix valid until this sample's last owning copy retires. */
         const TensorBase &tensor() const;
     private:
-        friend class PlanningModelSource;
-        friend class PlanningExpertSamplePublication;
-        friend class PlanningMatrixSamplePublication;
-        /** @brief Allocate an unpublished native receive tensor after its physical claim. */
-        static PlanningLoadedModelSample allocateReceive(TensorType type, PlanningModelSampleGeometry geometry,
-            const std::shared_ptr<PhysicalMemoryAuthority> &memory, DeviceId host_device);
-        /** @return Mutable bytes exclusively for the enclosing unpublished receive transaction. */
-        void *receiveData();
+        friend class PlanningModelSampleReceiver;
         struct Storage;
         /** @brief Seal a complete, destruction-ordered source-loading transaction. */
         explicit PlanningLoadedModelSample(std::shared_ptr<Storage> storage);
         std::shared_ptr<Storage> storage_;
+    };
+
+    /**
+     * @brief Exclusive unpublished final allocation, distinct from a loaded tensor.
+     *
+     * Only source I/O and collective publication can borrow writable bytes. They
+     * finish after their complete read/receive and inside failure consensus where
+     * applicable. Sealing consumes the receiver even when metadata admission
+     * fails; no partially received tensor or reusable failed writer escapes.
+     */
+    class PlanningModelSampleReceiver final
+    {
+    public:
+        /** @brief Retire an unfinished allocation through its original PMA owner. */
+        ~PlanningModelSampleReceiver();
+        /** @brief Transfer the sole writer; the moved-from value cannot publish. */
+        PlanningModelSampleReceiver(PlanningModelSampleReceiver &&) noexcept;
+        /** @brief Retire this unfinished writer before transferring the new one. */
+        PlanningModelSampleReceiver &operator=(PlanningModelSampleReceiver &&) noexcept;
+    private:
+        friend class PlanningModelSource;
+        friend class PlanningExpertSamplePublication;
+        friend class PlanningMatrixSamplePublication;
+        /**
+         * @brief Allocate the final root on the affined source/publication thread.
+         * @param type Original source format, never a conversion request.
+         * @param geometry Validated logical matrix and exact receive extent.
+         * @param memory Sole physical admission/allocation authority.
+         * @param host_device Exact CPU allocator retained through final retirement.
+         * @return One exclusive final allocation, with no published tensor yet.
+         * @throws std::invalid_argument For invalid geometry/allocator; allocation failures propagate.
+         */
+        static PlanningModelSampleReceiver allocate(TensorType type, PlanningModelSampleGeometry geometry,
+            const std::shared_ptr<PhysicalMemoryAuthority> &memory, DeviceId host_device);
+        /** @return Exact mutable extent, borrowed only until completion or retirement.
+         * @throws std::logic_error After move, sealing or failed admission.
+         */
+        std::span<std::byte> receiveBytes();
+        /** @return Immutable native tensor after successful admission; failure is absorbing.
+         * @throws std::logic_error After retirement; source admission errors propagate without publication.
+         */
+        PlanningLoadedModelSample finish();
+        struct Storage;
+        /** @brief Adopt the sole final allocation without publishing its uninitialized bytes.
+         * @param storage Exclusive source metadata and admitted final root.
+         */
+        explicit PlanningModelSampleReceiver(std::unique_ptr<Storage> storage);
+        std::unique_ptr<Storage> storage_;
     };
 }
