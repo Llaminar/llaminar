@@ -476,7 +476,7 @@ namespace llaminar2
          * [compute_units:4][cc_major:4][cc_minor:4][tflops_fp16:4][tflops_int8:4]
          * [memory_bandwidth_gbps:4][name_len:4][name:N][uuid_len:4][uuid:N]
          * [supports_p2p:1][pci_address_len:4][pci_address:N][numa_node:4]
-         * [PCIe metadata:variable][last_level_cache_bytes:8]
+         * [PCIe metadata:variable][last_level_cache_bytes:8][memory_backing:1]
          */
         static std::vector<uint8_t> serializeRankInventory(const RankInventory &inventory);
 

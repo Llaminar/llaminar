@@ -198,6 +198,24 @@ TEST_P(InventoryGPUProjection, RejectsInventedCapacityAndDuplicateOrdinals)
     gpu.total_memory_bytes = 8000;
     EXPECT_THROW(makeRankInventory(hardwareFixture(), std::span(&gpu, 1), {}), std::invalid_argument);
 }
+/** @test Integrated-GPU backing survives projection and the rank inventory wire. */
+TEST_P(InventoryGPUProjection, PhysicalBackingSurvivesProjectionAndWire)
+{
+    auto integrated = gpuFixture(GetParam(), 0);
+    integrated.memory_backing = PhysicalMemoryBacking::RankHostPool;
+    const std::array visible{integrated, gpuFixture(GetParam(), 1)};
+    const auto rank = makeRankInventory(hardwareFixture(), visible, {});
+    ASSERT_EQ(rank.gpus.size(), 2u);
+    EXPECT_EQ(rank.gpus[0].memory_backing, PhysicalMemoryBacking::RankHostPool);
+    EXPECT_EQ(rank.gpus[1].memory_backing, PhysicalMemoryBacking::Dedicated);
+    const auto wire = MPITopology::serializeRankInventory(rank);
+    const auto restored = MPITopology::deserializeRankInventory(wire.data(), wire.size());
+    ASSERT_EQ(restored.gpus.size(), 2u);
+    EXPECT_EQ(restored.gpus[0].memory_backing, PhysicalMemoryBacking::RankHostPool);
+    EXPECT_EQ(restored.gpus[1].memory_backing, PhysicalMemoryBacking::Dedicated);
+    EXPECT_EQ(restored.cpu.memory_backing, PhysicalMemoryBacking::Dedicated);
+}
+
 INSTANTIATE_TEST_SUITE_P(AllBackends, InventoryGPUProjection,
     ::testing::Values(ComputeBackendType::GPU_CUDA, ComputeBackendType::GPU_ROCM,
                       ComputeBackendType::GPU_VULKAN, ComputeBackendType::GPU_METAL));
