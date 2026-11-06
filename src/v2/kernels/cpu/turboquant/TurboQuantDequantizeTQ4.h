@@ -168,6 +168,46 @@ namespace llaminar2
     }
 #endif
 
+#if LLAMINAR_COMPILED_WITH_NEON
+    /// NEON dequantize: TQ4 → FP32 (four-lane gather + scale, scalar per-element program)
+    template <int D>
+    inline void turboquant_dequantize_tq4_neon(
+        const TQ4Block<D> &block,
+        const TurboQuantContext &ctx,
+        float *output,
+        float *scratch)
+    {
+        static_assert(D % 8 == 0, "D must be a multiple of 8 for NEON");
+        if (block.norm < 1e-30f)
+        {
+            for (int i = 0; i < D; ++i)
+                output[i] = 0.0f;
+            return;
+        }
+        const float reconstruction_scale =
+            block.reconstruction_norm / std::sqrt(static_cast<float>(D));
+        const float32x4_t vreconstruction_scale = vdupq_n_f32(reconstruction_scale);
+        for (int i = 0; i < D; i += 8)
+        {
+            const int group = i / 8;
+            uint8_t idx8[8];
+            uint8_t high_bits[8];
+            tq3_unpack_8(block.mse_indices + group * 3, idx8);
+            unpack_bitplane_8(block.high_bits + group, high_bits);
+
+            // Original-codebook gather then the single original scale multiply;
+            // per-element arithmetic is identical to the scalar program.
+            float words[8];
+            for (int j = 0; j < 8; ++j)
+                words[j] = TQ4_CENTROIDS[idx8[j] |
+                                         static_cast<uint8_t>(high_bits[j] << 3)];
+            vst1q_f32(scratch + i, vmulq_f32(vld1q_f32(words), vreconstruction_scale));
+            vst1q_f32(scratch + i + 4, vmulq_f32(vld1q_f32(words + 4), vreconstruction_scale));
+        }
+        apply_rotation_transpose(ctx.rotation(), scratch, output);
+    }
+#endif
+
 // Stubs for portability when ISA unavailable at compile time
 #if !defined(__AVX2__)
     template <int D>
