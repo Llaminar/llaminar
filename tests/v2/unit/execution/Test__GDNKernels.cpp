@@ -7734,4 +7734,89 @@ TEST(Test__GDNKernels, CPUCompactCounterBatchesPreserveCountsAcrossTeamsAndReque
         ASSERT_TRUE(filter_updated); ASSERT_TRUE(opposite_policy);
         for (const auto choice : choices) EXPECT_EQ(choice,initially_enabled ? 1 : 0);
     }
+
+#if LLAMINAR_COMPILED_WITH_NEON
+/**
+ * @test Native NEON short-convolution leaves reproduce the exact FMA program.
+ *
+ * The test reference mirrors the NEON prefill leaf lane-for-lane: k-major
+ * transposed weights and explicit std::fma in increasing k order, with the
+ * same causal state reads. apply_silu=false keeps the comparison byte-exact;
+ * the SiLU path is covered by the shared NEON polynomial helpers and the
+ * existing scalar-reference tolerance tests.
+ */
+TEST(CPUGDNKernels, ShortConvNeonPrefillAndDecodeExactReference)
+{
+    constexpr int seq_len = 9, channels = 13, kernel_size = 4;
+    constexpr int state_len = kernel_size - 1;
+    std::vector<float> input(seq_len * channels), weight(channels * kernel_size), bias(channels);
+    for (std::size_t i = 0; i < input.size(); ++i) input[i] = std::sin(float(i) * 0.71f) * 2.0f;
+    for (std::size_t i = 0; i < weight.size(); ++i) weight[i] = std::cos(float(i) * 0.37f) * 0.5f;
+    for (int c = 0; c < channels; ++c) bias[c] = 0.1f * c - 0.6f;
+
+    std::vector<float> output_test(seq_len * channels, 0.0f), reference(seq_len * channels, 0.0f);
+    std::vector<float> state_test(channels * state_len, 0.0f), state_ref(channels * state_len, 0.0f);
+    std::vector<float> wt(static_cast<std::size_t>(kernel_size) * channels);
+    for (int k = 0; k < kernel_size; ++k)
+        for (int c = 0; c < channels; ++c)
+            wt[static_cast<std::size_t>(k) * channels + c] = weight[static_cast<std::size_t>(c) * kernel_size + k];
+    for (int c = 0; c < channels; ++c)
+        for (int t = seq_len - 1; t >= 0; --t)
+        {
+            float sum = bias[c];
+            for (int k = 0; k < kernel_size; ++k)
+            {
+                const int input_t = t - state_len + k;
+                if (input_t >= 0)
+                    sum = std::fma(wt[static_cast<std::size_t>(k) * channels + c],
+                                   input[static_cast<std::size_t>(input_t) * channels + c], sum);
+                else
+                    sum = std::fma(wt[static_cast<std::size_t>(k) * channels + c],
+                                   state_ref[static_cast<std::size_t>(c) * state_len + state_len + input_t], sum);
+            }
+            reference[static_cast<std::size_t>(t) * channels + c] = sum;
+        }
+    for (int c = 0; c < channels; ++c)
+        for (int s = 0; s < state_len; ++s)
+        {
+            const int src_t = seq_len - state_len + s;
+            state_ref[static_cast<std::size_t>(c) * state_len + s] = (src_t >= 0)
+                ? input[static_cast<std::size_t>(src_t) * channels + c]
+                : state_ref[static_cast<std::size_t>(c) * state_len + state_len + src_t];
+        }
+
+    CPUShortConvolution conv;
+    ASSERT_TRUE(conv.forward(input.data(), weight.data(), bias.data(), output_test.data(),
+                             state_test.data(), seq_len, channels, kernel_size, false));
+    EXPECT_EQ(std::memcmp(output_test.data(), reference.data(), reference.size() * sizeof(float)), 0)
+        << "NEON prefill FMA bytes";
+    EXPECT_EQ(std::memcmp(state_test.data(), state_ref.data(), state_ref.size() * sizeof(float)), 0)
+        << "NEON prefill state bytes";
+
+    // Decode: one token from the produced state; exact scalar state-update program.
+    std::vector<float> one_input(channels), decode_out(channels), decode_ref(channels);
+    for (int c = 0; c < channels; ++c) one_input[c] = std::cos(float(c) * 0.53f);
+    std::vector<float> decode_state(state_test), decode_state_ref(state_test);
+    for (int c = 0; c < channels; ++c)
+    {
+        const float *w = weight.data() + static_cast<std::size_t>(c) * kernel_size;
+        float sum = bias[c];
+        for (int k = 0; k < state_len; ++k)
+            sum += w[k] * decode_state_ref[static_cast<std::size_t>(c) * state_len + k];
+        sum += w[state_len] * one_input[c];
+        decode_ref[c] = sum;
+        for (int k = 0; k < state_len - 1; ++k)
+            decode_state_ref[static_cast<std::size_t>(c) * state_len + k] =
+                decode_state_ref[static_cast<std::size_t>(c) * state_len + k + 1];
+        if (state_len > 0)
+            decode_state_ref[static_cast<std::size_t>(c) * state_len + state_len - 1] = one_input[c];
+    }
+    ASSERT_TRUE(conv.forward(one_input.data(), weight.data(), bias.data(), decode_out.data(),
+                             decode_state.data(), 1, channels, kernel_size, false));
+    EXPECT_EQ(std::memcmp(decode_out.data(), decode_ref.data(), channels * sizeof(float)), 0)
+        << "NEON decode bytes";
+    EXPECT_EQ(std::memcmp(decode_state.data(), decode_state_ref.data(), decode_state_ref.size() * sizeof(float)), 0)
+        << "NEON decode state bytes";
+}
+#endif
 }
