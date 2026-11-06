@@ -13,6 +13,8 @@
 
 #include "CPUNativeQuantisedMultiScaleKernels.h"
 #include "CPUNativeQuantisedWeightView.h"
+#include "tensors/MXFP4Format.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include "utils/ARMCPUFeatures.h"
 
 #include <algorithm>
@@ -42,8 +44,13 @@ namespace llaminar2::cpu::native_quantised
         static_assert(Rows >= 1 && Rows <= 4);
         using Encoding = CPUNativeQuantisedEncoding;
         using Dot = multi_scale::NEONByteDot;
-        /** @brief Exact source nibble interpretation, selected outside K traversal. */
-        enum class NibbleMap { Centered, Unsigned, NonLinear };
+        /** @brief Exact source nibble interpretation, selected outside K traversal.
+         *
+         * MXFP4 is a distinct map (doubled OCP E2M1 magnitudes with a sign bit),
+         * never IQ4_NL's grid, although both are sixteen-entry signed tables.
+         */
+        enum class NibbleMap { Centered, Unsigned, NonLinear, MXFP4 };
+        using ScaleWords = CPUNativeQuantisedScaleEncoding;
 
     public:
         /**
@@ -322,6 +329,14 @@ namespace llaminar2::cpu::native_quantised
                 case 0: return run<Ops, Policy, Encoding::NibbleLUT, NibbleMap::Centered, false, Strips>();
                 case 4: return run<Ops, Policy, Encoding::NibbleLUT, NibbleMap::NonLinear, false, Strips>();
                 case 5: return run<Ops, Policy, Encoding::NibbleLUT, NibbleMap::Unsigned, true, Strips>();
+                case kNativeQuantisedMXFP4Codebook:
+                    // The prepared identity, not the codebook alone, owns the scale
+                    // words: native nibble MXFP4 carries BF16 powers of two, while
+                    // rotated MXFP4 is ExpandedInt8 with FP16 scales (case above).
+                    if (weights_.scaleEncoding() != ScaleWords::PowerOfTwoBF16)
+                        break;
+                    return run<Ops, Policy, Encoding::NibbleLUT, NibbleMap::MXFP4, false, Strips,
+                               ScaleWords::PowerOfTwoBF16>();
                 }
                 break;
             case Encoding::CompactMultiScale:
@@ -340,6 +355,8 @@ namespace llaminar2::cpu::native_quantised
         {
             if constexpr (Map == NibbleMap::NonLinear)
                 return vqtbl1q_s8(vld1q_s8(kvalues_iq4nl_i8), index);
+            else if constexpr (Map == NibbleMap::MXFP4)
+                return vqtbl1q_s8(vld1q_s8(mxfp4::kValues), index);
             else if constexpr (Map == NibbleMap::Centered)
                 return vsubq_s8(vreinterpretq_s8_u8(index), vdupq_n_s8(8));
             else
@@ -517,9 +534,11 @@ namespace llaminar2::cpu::native_quantised
          * @tparam Physical One of the five non-compact execution encodings.
          * @tparam Map Nibble decoder, used only by nibble encodings.
          * @tparam WithMinimum Whether the source owns an additive minimum vector.
+         * @tparam Scale Primary scale-word interpretation of this prepared identity.
          */
         template <typename Ops, CPUProjectionNumericalPolicy Policy, Encoding Physical,
-                  NibbleMap Map = NibbleMap::Centered, bool WithMinimum = false, int Strips = 0>
+                  NibbleMap Map = NibbleMap::Centered, bool WithMinimum = false, int Strips = 0,
+                  ScaleWords Scale = ScaleWords::FP16>
         LLAMINAR_NEON_PROJECTION_EXACT void run() const noexcept
         {
             constexpr int S = Strips > 0 ? Strips : panelStrips<Ops, Physical, WithMinimum>();
@@ -530,7 +549,7 @@ namespace llaminar2::cpu::native_quantised
                 // Panels cover the whole chunk: a final panel may extend into the
                 // chunk's sealed padding columns, which it computes but never stores.
                 for (int column = 0; column < columns_; column += 4 * S)
-                    panel<Ops, Policy, Physical, Map, WithMinimum, S>(column);
+                    panel<Ops, Policy, Physical, Map, WithMinimum, S, Scale>(column);
             }
             else
             {
@@ -596,7 +615,11 @@ namespace llaminar2::cpu::native_quantised
                                     consume<Ops>(vld1q_s8(reinterpret_cast<const std::int8_t *>(unit + group * 256 + column * 4)),
                                         block, group, low);
                             }
-                            F scale0 = Ops::half(weights_.admittedScales(chunk_, block) + column);
+                            // BF16 power-of-two words widen by placement alone (exact),
+                            // matching the x86 loaders and the scalar view.
+                            F scale0 = Scale == ScaleWords::PowerOfTwoBF16
+                                ? Ops::bf16(weights_.admittedScales(chunk_, block) + column)
+                                : Ops::half(weights_.admittedScales(chunk_, block) + column);
                             F scale1{};
                             if constexpr (Physical == Encoding::Q6KNativeDualScale)
                             {
@@ -707,7 +730,7 @@ namespace llaminar2::cpu::native_quantised
          * chains are interleaved and each activation group/scale is read once.
          */
         template <typename Ops, CPUProjectionNumericalPolicy Policy, Encoding Physical,
-                  NibbleMap Map, bool WithMinimum, int S>
+                  NibbleMap Map, bool WithMinimum, int S, ScaleWords Scale>
         [[gnu::always_inline]] LLAMINAR_NEON_PROJECTION_EXACT inline void panel(int column0) const noexcept
         {
 #if defined(__clang__)
@@ -794,7 +817,9 @@ namespace llaminar2::cpu::native_quantised
                     for (int strip = 0; strip < S; ++strip)
                     {
                         const int column = column0 + 4 * strip;
-                        F scale0 = Ops::half(weights_.admittedScales(chunk_, block) + column);
+                        F scale0 = Scale == ScaleWords::PowerOfTwoBF16
+                            ? Ops::bf16(weights_.admittedScales(chunk_, block) + column)
+                            : Ops::half(weights_.admittedScales(chunk_, block) + column);
                         F scale1{};
                         if constexpr (Physical == Encoding::Q6KNativeDualScale)
                         {
