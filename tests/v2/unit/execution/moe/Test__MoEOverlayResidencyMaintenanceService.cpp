@@ -183,7 +183,7 @@ namespace llaminar2::test
                  .layer = 0,
                  .nanoseconds_per_activation = {100, 200, 300}},
             };
-            profile->participant_costs = {
+            profile->setParticipantCosts(std::vector<MoERoutedParticipantLayerPhaseServiceCost>{
                 {.participant_id = 0,
                  .layer = 0,
                  .nanoseconds_per_activation = {10, 20, 30}},
@@ -193,7 +193,7 @@ namespace llaminar2::test
                 {.participant_id = 2,
                  .layer = 0,
                  .nanoseconds_per_activation = {100, 200, 300}},
-            };
+            });
             return profile;
         }
 
@@ -210,10 +210,7 @@ namespace llaminar2::test
                 {
                     if (source == destination)
                         continue;
-                    profile->costs.push_back({
-                        .source_participant = source,
-                        .destination_participant = destination,
-                        .layer = 0,
+                    profile->costs.push_back({.coordinate = {.source_target = MoEOverlayRouteTarget::whole(source), .destination_target = MoEOverlayRouteTarget::whole(destination), .layer = 0},
                         .transfer_and_repack_ns = 1,
                         .inference_interference_ns = 0,
                     });

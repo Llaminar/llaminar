@@ -8,6 +8,11 @@
  * - SIMD intrinsics correctness (AVX2 vs AVX512 vs scalar)
  * - Cross-precision consistency (BF16 vs FP16 vs FP32)
  *
+ * Original INT32 normalization is tested through the admitted public row-INT8
+ * publisher, not a retired decoded-row helper. That case independently spells
+ * FP32 products and native RNE/explicit-scalar-away publication, poisoning both
+ * payload and scale. It does not turn distinct native reductions into one oracle.
+ *
  * @author David Sanftenberg
  * @date 2025-11-07
  */
@@ -16,6 +21,9 @@
 #include "kernels/cpu/primitives/RMSNormPrimitives.h"
 #include "kernels/cpu/primitives/RMSNormPrimitives_detail.h"
 #include "utils/Logger.h"
+#include "utils/CPUFeatures.h"
+#include <bit>
+#include <stdexcept>
 #include <vector>
 #include <random>
 #include <cmath>
@@ -31,9 +39,16 @@ namespace
     class Test__RMSNormPrecision : public ::testing::Test
     {
     protected:
+        /** @brief Admit a real native profile before each independently filtered precision receipt.
+         * @throws std::runtime_error For scalar, foreign or unavailable native execution.
+         */
         void SetUp() override
         {
-            // Seed RNG for reproducibility
+            const auto isa=llaminar2::activeISALevel();
+            if(isa==llaminar2::ISALevel::Scalar||
+                !llaminar2::isNativeCPUExecutionISAPair(llaminar2::compiledCPUISALevel(),isa))
+                throw std::runtime_error("RMS precision conformance requires an admitted native profile");
+            // Explicit scalar controls remain diagnostics within this profile.
             rng_.seed(42);
         }
 
@@ -210,7 +225,6 @@ namespace
         }
 
         std::mt19937 rng_;
-        static constexpr float EPSILON = 1e-6f;
     };
 
     // ========================================================================
@@ -1151,6 +1165,9 @@ namespace
         auto data = generateRandomFP32(1, cols, -2.0f, 2.0f);
 
         double ref = compute_sumsq_scalar(data.data(), cols);
+        double independent=0;
+        for(const auto word:data){const auto value=double(word);independent=std::fma(value,value,independent);}
+        EXPECT_NEAR(ref,independent,1e-4); // Also meaningful when no x86 comparison is compiled.
 
 #if defined(__AVX2__) && !defined(__AVX512F__)
         double avx2_val = compute_sumsq_avx2(data.data(), cols);
@@ -1172,6 +1189,9 @@ namespace
             v = dist(rng_);
 
         double ref = compute_rms_sq_int32_scalar(data.data(), cols);
+        double independent=0;
+        for(const auto word:data){const auto value=double(word);independent=std::fma(value,value,independent);}
+        EXPECT_DOUBLE_EQ(ref,independent);
 
 #if defined(__AVX2__)
         double avx2_val = compute_rms_sq_int32_avx2(data.data(), cols);
@@ -1187,30 +1207,53 @@ namespace
 #endif
     }
 
-    TEST_F(Test__RMSNormPrecision, ISAParity_Int32ToFP32Normalize)
+    TEST_F(Test__RMSNormPrecision, ISAParity_Int32OriginalPublication)
     {
-        const size_t cols = 256;
-        std::uniform_int_distribution<int32_t> src_dist(-10000, 10000);
-        std::vector<int32_t> src(cols);
-        for (auto &v : src)
-            v = src_dist(rng_);
-
-        auto gamma = generateGamma(cols);
-        float rms_inv = 0.01f;
-
-        std::vector<float> ref(cols), avx2_out(cols), avx512_out(cols);
-        int32_to_fp32_normalize_scalar(src.data(), ref.data(), rms_inv, gamma.data(), cols);
-
-#if defined(__AVX512F__)
-        // On AVX512 machines, the avx2 variant is guarded by !defined(__AVX512F__), so test avx512 only
-        int32_to_fp32_normalize_avx512(src.data(), avx512_out.data(), rms_inv, gamma.data(), cols);
-        float max_diff = computeMaxAbsError(ref, avx512_out);
-        EXPECT_LE(max_diff, 1e-6f) << "int32_to_fp32_normalize scalar vs AVX512";
-#elif defined(__AVX2__)
-        int32_to_fp32_normalize_avx2(src.data(), avx2_out.data(), rms_inv, gamma.data(), cols);
-        float max_diff = computeMaxAbsError(ref, avx2_out);
-        EXPECT_LE(max_diff, 1e-6f) << "int32_to_fp32_normalize scalar vs AVX2";
-#endif
+        const auto isa=llaminar2::activeISALevel();
+        if(isa==llaminar2::ISALevel::Scalar||
+            !llaminar2::isNativeCPUExecutionISAPair(llaminar2::compiledCPUISALevel(),isa))
+            throw std::runtime_error("INT32 precision caller requires an admitted native publisher");
+        for(const std::size_t cols:{256u,257u})
+        {
+            std::uniform_int_distribution<int32_t> dist(-10000,10000);
+            std::vector<int32_t>src(cols);for(auto &value:src)value=dist(rng_);
+            const auto gamma=generateGamma(cols);const auto before=src;
+            const float inverse=0.01f;
+            // These volatile edges are an independent test oracle, never a
+            // production decoded-row buffer or a call to the retired helper.
+            std::vector<float>normalized(cols);float maximum=0;
+            for(std::size_t c=0;c<cols;++c)
+            {
+                volatile float first=float(src[c])*inverse;
+                volatile float second=first*gamma[c];normalized[c]=second;
+                ASSERT_TRUE(std::isfinite(normalized[c]));maximum=std::max(maximum,std::fabs(normalized[c]));
+            }
+            const auto expectedScale=maximum>0?maximum/127.0f:1.0f;
+            ASSERT_TRUE(std::isfinite(expectedScale));ASSERT_GT(expectedScale,0);
+            const float reciprocal=1.0f/expectedScale;
+            for(const bool scalar:{false,true})
+            {
+                const auto width=isa==llaminar2::ISALevel::AVX512?16u:8u;
+                const auto complete=scalar?0:(cols/width)*width;
+                std::vector<std::int8_t>expected(cols),actual(cols);
+                for(std::size_t c=0;c<cols;++c)
+                {
+                    volatile float product=normalized[c]*reciprocal;
+                    const auto value=std::clamp(float(product),-127.0f,127.0f);
+                    const double magnitude=std::fabs(double(value));const auto base=int(std::floor(magnitude));
+                    const auto fraction=magnitude-double(base);
+                    const int even=base+int(fraction>0.5||(fraction==0.5&&(base%2)!=0));
+                    expected[c]=std::int8_t(c<complete?(value<0?-even:even):int(std::round(value)));
+                    actual[c]=std::bit_cast<std::int8_t>(std::uint8_t(std::bit_cast<std::uint8_t>(expected[c])^0x80u));
+                }
+                float scale=std::bit_cast<float>(~std::bit_cast<std::uint32_t>(expectedScale));
+                rmsnorm_apply_int32_to_int8_vectorized(src.data(),gamma.data(),&inverse,1,cols,actual.data(),&scale,
+                    {.allow_parallel=false,.force_scalar=scalar});
+                EXPECT_EQ(actual,expected);
+                EXPECT_EQ(std::bit_cast<std::uint32_t>(scale),std::bit_cast<std::uint32_t>(expectedScale));
+            }
+            EXPECT_EQ(src,before);
+        }
     }
 
     TEST_F(Test__RMSNormPrecision, ISAParity_BF16RmsnormRow)
@@ -1274,6 +1317,9 @@ namespace
             v = static_cast<int8_t>(qdist(rng_));
 
         int32_t ref = compute_int8_sumsq_scalar(qs);
+        std::int64_t independent=0;
+        for(const auto word:qs){const auto value=std::int64_t(word);independent+=value*value;}
+        EXPECT_EQ(ref,independent);
 
 #if defined(__AVX2__)
         int32_t avx2_val = compute_int8_sumsq_avx2(qs);

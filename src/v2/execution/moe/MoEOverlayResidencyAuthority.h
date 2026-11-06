@@ -18,6 +18,7 @@
 #include "DeviceMoERebalancePolicyShared.h"
 #include "MoEExpertOwnerMap.h"
 #include "MoEOverlayRouteTarget.h"
+#include "MoEOverlayMigrationTargetCoordinate.h"
 #include "MoELayeredExpertOwnership.h"
 #include "MoEOptimizationStatus.h"
 #include "MoEOverlayNoPeerResidency.h"
@@ -221,6 +222,14 @@ namespace llaminar2
         uint64_t inference_interference_ns = 0;
     };
 
+    /** @brief Complete-target movement price; source/cuts remain in original measurement context. */
+    struct MoEOverlayTargetLayerMigrationCost
+    {
+        MoEOverlayMigrationTargetCoordinate coordinate;
+        std::uint64_t transfer_and_repack_ns=0;
+        std::uint64_t inference_interference_ns=0;
+    };
+
     /**
      * @brief Complete setup-certified directed endpoint migration profile.
      *
@@ -231,7 +240,27 @@ namespace llaminar2
     struct MoEOverlayMigrationCostProfile
     {
         std::string identity;
-        std::vector<MoEOverlayParticipantLayerMigrationCost> costs;
+        std::vector<MoEOverlayTargetLayerMigrationCost> costs;
+        /** @brief Checked cold adapter for existing whole-only device consumers.
+         * @return Whole movement rows. @throws std::invalid_argument For any cohort. */
+        std::vector<MoEOverlayParticipantLayerMigrationCost> wholeCosts() const {
+            std::vector<MoEOverlayParticipantLayerMigrationCost> result;result.reserve(costs.size());
+            for(const auto& row:costs) {
+                if(!row.coordinate.source_target.isWhole() || !row.coordinate.destination_target.isWhole())
+                    throw std::invalid_argument("Whole movement projection rejects complete cohort prices");
+                result.push_back({row.coordinate.source_target.word(),row.coordinate.destination_target.word(),
+                    row.coordinate.layer,row.transfer_and_repack_ns,row.inference_interference_ns});
+            }
+            return result;
+        }
+        /** @brief Explicit legacy import into the same canonical cost vector.
+         * @param rows Original whole movement rows. */
+        void setWholeCosts(std::span<const MoEOverlayParticipantLayerMigrationCost> rows) {
+            std::vector<MoEOverlayTargetLayerMigrationCost> canonical;canonical.reserve(rows.size());
+            for(const auto& row:rows)canonical.push_back({{MoEOverlayRouteTarget::whole(row.source_participant),
+                MoEOverlayRouteTarget::whole(row.destination_participant),row.layer},row.transfer_and_repack_ns,row.inference_interference_ns});
+            costs=std::move(canonical);
+        }
     };
 
     /**

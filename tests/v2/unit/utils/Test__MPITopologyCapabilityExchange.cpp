@@ -36,6 +36,7 @@ protected:
         RankInventory inv;
         inv.cpu_execution = test::kSyntheticCPUExecutionGeometry;
         inv.cpu_execution.maximum_native_row_tile = rank % 2 ? 2 : 4;
+        inv.cpu_execution.active_isa = rank % 2 ? ISALevel::AVX2 : ISALevel::AVX512;
         inv.rank = rank;
         inv.node_id = rank / 2; // 2 ranks per node
         inv.local_rank = rank % 2;

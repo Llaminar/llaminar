@@ -2,8 +2,10 @@
  * @file CPUNativeVNNIDecode.h
  * @brief Inline decode functions for native quantized formats to INT8.
  *
- * Shared between the weight packer (pack-time VNNI transpose) and the
- * kernel (runtime scalar reference path).
+ * Shared between weight preparation and diagnostic source-order reconstruction.
+ * Simple source blocks use native NEON on AArch64 and the existing x86 tensor
+ * helpers on x86. Hot interleaved kernels consume their own native vector
+ * decode, without constructing a source-order or expanded matrix.
  */
 
 #pragma once
@@ -12,9 +14,15 @@
 #include "tensors/NativeVnniFormatInfo.h"
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 
 #include "tensors/BlockStructures.h"
+#include "CPUNativeVNNIEncoding.h"
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include "tensors/NEONBlockDecode.h"
+#else
 #include "tensors/SIMDHelpers.h"
+#endif
 
 namespace llaminar2::cpu::native_vnni
 {
@@ -23,37 +31,64 @@ namespace llaminar2::cpu::native_vnni
     // Q4_0 nibble decode: 16 bytes → 32 INT8 values (range [-8, +7])
     // =========================================================================
 
+    /**
+     * @brief Expand Q4_0 nibbles to centered signed source integers.
+     * @param payload Complete 16-byte prepared payload, excluding scales/minima.
+     * @param dst Exactly 32 writable signed source-order bytes.
+     */
     inline void decode_q4_0_block(const uint8_t *__restrict payload, int8_t *__restrict dst)
     {
         Q4_0Block block;
         block.d = 0;
         std::memcpy(block.qs, payload, 16);
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        neon_blocks::unpack(block, dst);
+#else
         simd::unpack_q4_0_to_int8(block, dst);
+#endif
     }
 
     // =========================================================================
     // IQ4_NL nibble decode: 16 bytes → 32 INT8 via non-linear LUT
     // =========================================================================
 
+    /**
+     * @brief Expand IQ4_NL nibbles through the immutable signed codebook.
+     * @param payload Complete 16-byte prepared payload, excluding scales/minima.
+     * @param dst Exactly 32 writable signed source-order bytes.
+     */
     inline void decode_iq4_nl_block(const uint8_t *__restrict payload, int8_t *__restrict dst)
     {
         IQ4_NLBlock block;
         block.d = 0;
         std::memcpy(block.qs, payload, 16);
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        neon_blocks::unpack(block, dst);
+#else
         simd::unpack_iq4_nl_to_int8(block, dst);
+#endif
     }
 
     // =========================================================================
     // Q4_1 nibble decode: 16 bytes → 32 INT8 values (range [0, 15])
     // =========================================================================
 
+    /**
+     * @brief Expand Q4_1 nibbles without applying its separate minimum.
+     * @param payload Complete 16-byte prepared payload, excluding scales/minima.
+     * @param dst Exactly 32 writable signed source-order bytes.
+     */
     inline void decode_q4_1_block(const uint8_t *__restrict payload, int8_t *__restrict dst)
     {
         Q4_1Block block;
         block.d = 0;
         block.m = 0;
         std::memcpy(block.qs, payload, 16);
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        neon_blocks::unpack(block, dst);
+#else
         simd::unpack_q4_1_to_int8(block, dst);
+#endif
     }
 
     // =========================================================================
@@ -61,32 +96,55 @@ namespace llaminar2::cpu::native_vnni
     // (IQ4_XS uses same kvalues_iq4nl codebook as IQ4_NL)
     // =========================================================================
 
+    /**
+     * @brief Expand an IQ4_XS prepared nibble block without modifying source scales.
+     * @param payload Complete 16-byte prepared payload, excluding scales/minima.
+     * @param dst Exactly 32 writable signed source-order bytes.
+     */
     inline void decode_iq4_xs_block(const uint8_t *__restrict payload, int8_t *__restrict dst)
     {
         // IQ4_XS sub-blocks use the same nibble→int8 mapping as IQ4_NL
         IQ4_NLBlock block;
         block.d = 0;
         std::memcpy(block.qs, payload, 16);
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        neon_blocks::unpack(block, dst);
+#else
         simd::unpack_iq4_nl_to_int8(block, dst);
+#endif
     }
 
     // =========================================================================
     // Q5_0 decode: 20 bytes (qs[16] + qh[4]) → 32 INT8 (range [-16, +15])
     // =========================================================================
 
+    /**
+     * @brief Expand Q5_0 payload/high bits to centered signed source integers.
+     * @param payload Complete 20-byte prepared payload, excluding scales/minima.
+     * @param dst Exactly 32 writable signed source-order bytes.
+     */
     inline void decode_q5_0_block(const uint8_t *__restrict payload, int8_t *__restrict dst)
     {
         Q5_0Block block;
         block.d = 0;
         std::memcpy(block.qs, payload, 16);
         std::memcpy(block.qh, payload + 16, 4);
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        neon_blocks::unpack(block, dst);
+#else
         simd::unpack_q5_0_to_int8(block, dst);
+#endif
     }
 
     // =========================================================================
     // Q5_1 decode: 20 bytes (qs[16] + qh[4]) → 32 INT8 (range [0, 31])
     // =========================================================================
 
+    /**
+     * @brief Expand Q5_1 payload/high bits without its separate minimum.
+     * @param payload Complete 20-byte prepared payload, excluding scales/minima.
+     * @param dst Exactly 32 writable signed source-order bytes.
+     */
     inline void decode_q5_1_block(const uint8_t *__restrict payload, int8_t *__restrict dst)
     {
         Q5_1Block block;
@@ -94,7 +152,11 @@ namespace llaminar2::cpu::native_vnni
         block.m = 0;
         std::memcpy(block.qs, payload, 16);
         std::memcpy(block.qh, payload + 16, 4);
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        neon_blocks::unpack(block, dst);
+#else
         simd::unpack_q5_1_to_int8(block, dst);
+#endif
     }
 
     // =========================================================================
@@ -124,28 +186,6 @@ namespace llaminar2::cpu::native_vnni
         case 15: // IQ2_XXS
         case 16: // IQ1_S (delta remains separate minimum metadata)
         case 17: // IQ1_M
-            return true;
-        default:
-            return false;
-        }
-    }
-
-    // =========================================================================
-    // Helper: does this codebook use 4-bit vpshufb LUT decode in the GEMV?
-    //
-    // Only 4-bit formats where each nibble maps to exactly one INT8 value
-    // via a 16-entry LUT can use the vpshufb fast path. All other formats
-    // use pre-decoded INT8 in the GEMV inner loop.
-    // =========================================================================
-
-    inline bool is_nibble_lut_format(uint8_t codebook_id)
-    {
-        switch (codebook_id)
-        {
-        case 0: // Q4_0:  nibble - 8 → [-8, +7]
-        case 4: // IQ4_NL / IQ4_XS: kvalues_iq4nl LUT
-        case kNativeVnniMXFP4Codebook: // MXFP4: doubled E2M1 LUT
-        case 5: // Q4_1:  nibble → [0, 15]
             return true;
         default:
             return false;

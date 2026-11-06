@@ -1,3 +1,5 @@
+# @file Dockerfile
+# @brief Development image sharing the production dependency/tool-selection authority.
 # Llaminar development container.
 #
 # Shares its system-deps install logic with the release Dockerfile via
@@ -11,8 +13,7 @@ ARG NINJA_VERSION=1.13.0
 ENV INSTALL_CUDA=${INSTALL_CUDA}
 ENV INSTALL_ROCM=${INSTALL_ROCM}
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    CMAKE_BUILD_PARALLEL_LEVEL=56
+ENV DEBIAN_FRONTEND=noninteractive
 
 # CRITICAL: install sed/grep/coreutils FIRST — VS Code's UID-remap process
 # and some later install steps need them available before anything else.
@@ -101,14 +102,6 @@ RUN if [ "$INSTALL_ROCM" = "true" ]; then \
     else \
         echo "Skipping ROCm installation"; \
     fi
-
-# Latest stable CMake from Kitware repo (newer than Ubuntu's default).
-RUN wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null \
-      | gpg --dearmor - | tee /etc/apt/trusted.gpg.d/kitware.gpg >/dev/null && \
-    echo 'deb https://apt.kitware.com/ubuntu/ noble main' \
-      | tee /etc/apt/sources.list.d/kitware.list >/dev/null && \
-    apt-get update && apt-get install -y --no-install-recommends cmake && \
-    rm -rf /var/lib/apt/lists/*
 
 # Done with install scripts.
 RUN rm -rf /tmp/install-scripts

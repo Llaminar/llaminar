@@ -124,6 +124,13 @@ namespace llaminar2
             std::vector<MoEOverlayParticipantLayerServiceTotals> *result,
             std::string *error = nullptr) override;
 
+        /** @brief Same lane/deadline, count then exact-live original root metadata. */
+        bool beginPreparedService(std::shared_ptr<const MoEOverlayPreparedTargetServicePlan> plan,
+            const std::vector<MoEOverlayPreparedTargetServiceTotals>& local,std::string* error=nullptr) override;
+        /** @brief Decode against retained original declarations without accepting sender geometry. */
+        MoEOverlayResidencyWaveProgress pollPreparedService(
+            std::vector<MoEOverlayPreparedTargetServiceTotals>* result,std::string* error=nullptr) override;
+
         [[nodiscard]] bool idle() const noexcept override;
         [[nodiscard]] int worldRank() const noexcept override;
         [[nodiscard]] int worldSize() const noexcept override;
