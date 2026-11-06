@@ -223,9 +223,68 @@ def map_predictor_source(record: dict, transform) -> dict:
             raise ValueError("canonical argv selected a foreign shared predictor")
         else:
             args[positions[0] + 1] = transform(source)
+    for field,argv_field in (("runtime","server_args"),("diagnostic_benchmark","args")):
+        owner=result.get(field)
+        if isinstance(owner,dict) and "configuration_document" in owner:
+            config=declared_document_configuration(owner,argv_field)
+            declared=model_source_fields(record)
+            if (not isinstance(config.get("model_path"),str)
+                    or Path(config["model_path"]).resolve()!=Path(declared["model"]).resolve()
+                    or config.get("shared_predictor")!=source):
+                raise ValueError("lossless runtime/benchmark document selected a foreign original GGUF source")
+            config["model_path"]=transform(declared["model"])
+            if source is not None:config["shared_predictor"]=transform(source)
     if source is not None:
         result["shared_predictor"] = transform(source)
     return result
+
+
+def declared_document_configuration(owner: dict, argv_field: str) -> dict:
+    """Validate one existing lossless public document, without interpreting its C++ policy."""
+    if (not isinstance(owner,dict)
+            or owner.get("configuration_policy")!="lossless_declared_document_v1"
+            or argv_field in owner):
+        raise ValueError("lossless configuration conflicts with argv or has an unknown policy")
+    document=owner.get("configuration_document")
+    if (not isinstance(document,dict) or document.get("kind")!="llaminar.orchestration-config"
+            or type(document.get("schema_version")) is not int or document["schema_version"]<=0
+            or not isinstance(document.get("configuration"),dict)):
+        raise ValueError("canonical input omitted its actual lossless configuration document")
+    return document["configuration"]
+
+
+def _runtime_document_configuration(record: dict) -> dict:
+    """Retain the original server-document owner and exact representation contract."""
+    return declared_document_configuration(record.get("runtime"),"server_args")
+
+
+def runtime_server_arguments(record: dict, directory: Path, model: str) -> list[str]:
+    """Materialize the declared document once for the existing public --config consumer.
+
+    Source remapping must already have authenticated the original GGUF fields.
+    The production parser remains the sole config-schema/policy validator; no
+    participant ceilings are translated to unsupported CLI options or dropped.
+    """
+    runtime = record.get("runtime")
+    if not isinstance(runtime, dict):
+        raise ValueError("canonical runtime is missing")
+    if "configuration_document" not in runtime:
+        if "configuration_policy" in runtime:
+            raise ValueError("runtime representation has no declared document")
+        arguments = runtime.get("server_args")
+        if not isinstance(arguments, list) or not all(isinstance(x, str) for x in arguments):
+            raise ValueError("canonical execution argv must be a string list")
+        return list(arguments)
+    config = _runtime_document_configuration(record)
+    if (not isinstance(config.get("model_path"), str)
+            or Path(config["model_path"]).resolve() != Path(model).resolve()
+            or config.get("shared_predictor") != record.get("shared_predictor")):
+        raise ValueError("staged runtime document selected a foreign GGUF source")
+    path = directory / "runtime-config.json"
+    with path.open("x", encoding="utf-8") as stream:
+        json.dump(runtime["configuration_document"], stream, sort_keys=True, indent=2)
+        stream.write("\n")
+    return ["--config", str(path.resolve())]
 
 
 def parse_parameters(output: str) -> dict[str, dict]:

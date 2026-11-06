@@ -56,6 +56,19 @@ TEST(NativeOrderingEventGroup, OriginalReservationPrefixCompletesOnlyAtValidated
         NativeOrderingEventGroupReplayAccess::requireOriginal(*group,memory,original,program);
         auto alias=std::shared_ptr<PhysicalMemoryAuthority>(memory.get(),[](auto*){});EXPECT_THROW(NativeOrderingEventGroupReplayAccess::requireOriginal(*group,alias,original,program),std::logic_error);
         NativeOrderingEventGroupReplayAccess::begin(*group);NativeOrderingEventGroupReplayAccess::complete(*group);group.reset();
+        EXPECT_EQ(memory->reservedBytes(gpu.device,PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent),6144u);
+        // The same original admitted population cannot be created again while
+        // its physical commitment survives. Preserve the actual PMA cause.
+        try {
+            auto duplicate=NativeOrderingEventGroupReplayAccess::claim(memory,original,program,projection);
+            FAIL()<<"Expected original ordering population exhaustion";
+        } catch(const std::logic_error& failure) {
+            const std::string message=failure.what();
+            EXPECT_NE(message.find("program_kind=0 root_mask=6 event_count=3"),std::string::npos);
+            EXPECT_NE(message.find("device=CUDA:0 context_generation="+std::to_string(original.generation())),std::string::npos);
+            EXPECT_NE(message.find("allocation_device=CPU"),std::string::npos);
+            EXPECT_NE(message.find("cause={Physical memory reservation exceeds admitted native_immutable_lookup_ordering_event bytes"),std::string::npos);
+        }
         EXPECT_EQ(memory->reservedBytes(gpu.device,PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent),6144u);}
     worker.reset();{auto scope=pool.beginExclusiveGenerationRetirement(devices[0]);NativeOrderingEventGroupReplayAccess::validatedReset(scope);}
     EXPECT_EQ(memory->reservedBytes(gpu.device,PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent),0u);EXPECT_EQ(memory->reservedBytes(cpu.device,PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent),0u);

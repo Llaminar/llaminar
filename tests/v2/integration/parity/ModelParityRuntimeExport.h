@@ -7,12 +7,13 @@
  * these records, never test-name fragments or a second model/topology table.
  * Declared diagnostics retain original placement and setup capacity; certified
  * automatic benchmark projections retain intent and production tuning defaults.
- * Arguments remain an argv vector
- * all the way to the existing HTTP harness; they are never shell-evaluated.
+ * Public runtime intent is either an argv vector or the existing lossless
+ * configuration document. Neither representation is shell-evaluated.
  */
 #pragma once
 
 #include <iomanip>
+#include "config/OrchestrationConfigDocument.h"
 #include "execution/moe/MoEExpertOwnerMap.h"
 #include <map>
 #include <ostream>
@@ -304,6 +305,20 @@ namespace llaminar2::test::parity
                 "--ngram-source-cache-aging-accesses",std::to_string(h.policy.aging_accesses),
                 "--ngram-source-cache-protected-numerator",std::to_string(h.policy.protected_numerator),
                 "--ngram-source-cache-protected-denominator",std::to_string(h.policy.protected_denominator)});
+            if(g.local_hot_cache) {
+                const auto& local=*g.local_hot_cache;
+                // Per-consumer ceilings are supported by the lossless config
+                // document. This argv-only exporter must never drop them and
+                // accidentally certify an equal-capacity workload instead.
+                if(!local.consumer_overrides.empty())
+                    throw std::invalid_argument("Per-consumer local cache ceilings require a configuration document; argv projection cannot preserve them");
+                arguments.insert(arguments.end(),{
+                    "--ngram-local-cache-max-rows",std::to_string(local.maximum_cache_rows),
+                    "--ngram-local-cache-bytes",std::to_string(local.cache_physical_byte_limit),
+                    "--ngram-local-cache-aging-accesses",std::to_string(local.policy.aging_accesses),
+                    "--ngram-local-cache-protected-numerator",std::to_string(local.policy.protected_numerator),
+                    "--ngram-local-cache-protected-denominator",std::to_string(local.policy.protected_denominator)});
+            }
         }
         return arguments;
     }
@@ -718,12 +733,13 @@ namespace llaminar2::test::parity
     }
 
     /**
-     * @brief Export complete diagnostic obligations using one existing argv owner.
+     * @brief Export complete diagnostic obligations using one source-owned public representation.
      * @param cell Original expanded case, whose profile was source-validated.
      * @param out Discovery stream; no files, model or approval state are read.
      * @note The typed accuracy policy exports obligations, never observed passes.
-     *       Both projections reference diagnostic_benchmark.args. There is no
-     *       second argv surface to drift or bypass inventory source remapping.
+     *       Both projections reference the same diagnostic_benchmark argv or
+     *       lossless document arm. No second policy surface can drift or bypass
+     *       original inventory source remapping.
      */
     inline void writeModelParityPairedWorkload(const ModelParityCase &cell, std::ostream &out)
     {
@@ -777,10 +793,36 @@ namespace llaminar2::test::parity
         out << '}';
     }
 
+    /** @brief Exact public runtime representation; documents preserve typed policy absent from CLI syntax. */
+    enum class ModelParityRuntimeRepresentation { Arguments, ConfigurationDocument };
+    /** @return Document only for declared per-consumer ceilings; argv-only helpers stay strict. */
+    inline ModelParityRuntimeRepresentation modelParityRuntimeRepresentation(const ModelParityCase& cell)
+    {
+        return cell.ngram_table_policy && cell.ngram_table_policy->isGPUAdaptive() &&
+            cell.ngram_table_policy->gpu_adaptive.local_hot_cache &&
+            !cell.ngram_table_policy->gpu_adaptive.local_hot_cache->consumer_overrides.empty()
+                ? ModelParityRuntimeRepresentation::ConfigurationDocument : ModelParityRuntimeRepresentation::Arguments;
+    }
     /**
-     * @brief GoogleTest's ADL parameter printer is the discovery export boundary.
+     * @brief Preserve the original typed request in the existing lossless public config format.
+     * The source/numerical cell remains unchanged. Only this public-runtime
+     * projection selects the same HTTP verifier policy as the argv projection;
+     * topology, storage, arithmetic and retained capacity stay case-owned.
+     */
+    inline OrchestrationConfig modelParityServerConfiguration(const ModelParityCase& cell)
+    {
+        auto config=cell.makeOrchestrationConfig(cell.model.model_path,0);
+        config.mpi_procs=cell.topology.mpi_ranks;
+        config.mtp.verify_mode=modelParityHttpMTPVerifyMode();
+        if(cell.prefill_graph.isSegmentedCaptured())
+            config.moe_routed_prefill.overlay_segment_rows=cell.prefill_graph.captured_rows;
+        return config;
+    }
+
+    /**
+     * @brief GoogleTest's ADL parameter printer emits the complete source-owned JSON record.
      * @param cell Typed parameter, also consumed by the numerical fixture.
-     * @param out GoogleTest discovery stream; emits one complete JSON line.
+     * @param out Discovery stream; no files or native state are created.
      */
     inline void PrintTo(const ModelParityCase &cell, std::ostream *out)
     {
@@ -830,8 +872,10 @@ namespace llaminar2::test::parity
             *out << (i ? "," : "") << "{\"id\":" << modelParityJsonString(std::string(probe.id))
                  << ",\"prefix\":" << modelParityJsonString(prefix)
                  << ",\"body\":{\"seed\":" << cell.model.generation_seed.value()
-                 << ",\"temperature\":0.7,\"top_k\":40,\"top_p\":0.9,"
-                    "\"enable_thinking\":false,\"return_token_ids\":true,\"return_runtime_summary\":true,\"max_tokens\":"
+                 << ",\"temperature\":" << kModelParityGenerationTemperature
+                 << ",\"top_k\":" << kModelParityGenerationTopK
+                 << ",\"top_p\":" << kModelParityGenerationTopP
+                 << ",\"enable_thinking\":false,\"return_token_ids\":true,\"return_runtime_summary\":true,\"max_tokens\":"
                  << cell.generation_workload.maximumTokens()
                  << ",\"messages\":[{\"role\":\"system\",\"content\":"
                  << modelParityJsonString(cell.model.generation_prompt.system())
@@ -861,6 +905,16 @@ namespace llaminar2::test::parity
         if(cell.requiresPhysicalExpertMovement() && cell.topology.expert_overlay_plan &&
            MoEExpertOwnerMap::usesCPUJointFragments(*cell.topology.expert_overlay_plan))
             *out << ",\"cohort_publication_inference\":true";
+        if(modelParityRuntimeRepresentation(cell)==ModelParityRuntimeRepresentation::ConfigurationDocument) {
+            if(cell.e2e_certification || !cell.remote_cpu_overlays.empty())
+                throw std::invalid_argument("Lossless declared runtime document requires its own tagged E2E projection");
+            *out << ",\"configuration_policy\":\"lossless_declared_document_v1\",\"configuration_document\":"
+                 << serializeOrchestrationConfig(modelParityServerConfiguration(cell))
+                 << "},\"diagnostic_benchmark\":{\"schema\":1,\"policy\":\"diagnostic_declared\",\"certification_eligible\":false,\"context_length\":"
+                 << cell.model.max_seq_len
+                 << ",\"configuration_policy\":\"lossless_declared_document_v1\",\"configuration_document\":"
+                 << serializeOrchestrationConfig(modelParityServerConfiguration(cell)) << "}";
+        } else {
         *out << ",\"server_args\":[";
         const auto args = modelParityServerArguments(cell);
         for (std::size_t i = 0; i < args.size(); ++i)
@@ -870,7 +924,9 @@ namespace llaminar2::test::parity
         const auto diagnostic_args = modelParityDiagnosticBenchmarkArguments(cell);
         for (std::size_t i = 0; i < diagnostic_args.size(); ++i)
             *out << (i ? "," : "") << modelParityJsonString(diagnostic_args[i]);
-        *out << "]},\"cross_host_e2e\":";
+        *out << "]}";
+        }
+        *out << ",\"cross_host_e2e\":";
         writeModelParityCrossHostE2E(cell, *out);
         *out << ",\"e2e\":";
         if (!cell.e2e_certification) { *out << "null,\"benchmark\":null}"; return; }

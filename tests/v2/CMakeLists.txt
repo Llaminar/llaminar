@@ -5382,7 +5382,7 @@ add_v2_test(V2_Unit_ParityRunnerEvidence
 # Completed native/mapped/CPU movement must remain fresh and observable.
 add_v2_test(V2_Integration_ParityMovementEvidenceReplay
     COMMAND $<TARGET_FILE:v2_unit_parity_runner_evidence>
-        --gtest_filter=ParityRunnerEvidenceTest.MovementFactsRequireCompletedNativePublicationAndFreshDomains:ParityRunnerEvidenceTest.MovementFactsPreserveCPUAndMappedContracts
+        --gtest_filter=ParityRunnerEvidenceTest.MovementFactsRequireCompletedNativePublicationAndFreshDomains:ParityRunnerEvidenceTest.MovementFactsPreserveCPUAndMappedContracts:ParityRunnerEvidenceTest.OrdinaryCohortMovementBoundaryKeepsFinalAndStaticStrict
         --gtest_repeat=20
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Parity;MoE;Replay;Regression"
     TIMEOUT 30 MPI_PROCS 1 NO_MPI NO_MODELS
@@ -12817,6 +12817,7 @@ if(ZLIB_FOUND)
             "Qwen4ExpSharedCoordinatorTP2DynamicRandomRetained15/Qwen4ExpMainParityTest.ProductionParity/"
             "Qwen4ExpExpertFollowerOwnerStaticOrdinalCandidate/Qwen4ExpMainParityTest.ProductionParity/"
             "Qwen4ExpExpertFollowerOwnerDynamicOrdinalCandidate/Qwen4ExpMainParityTest.ProductionParity/"
+            "Qwen4ExpLocalHotNumerical/Qwen4ExpLocalHotNumericalTest.ProductionParity/"
         # Use the existing paired-source setup budget. Full original-source
         # preparation is bounded independently of numerical focused tests;
         # missing execution/collective evidence never extends this deadline.
@@ -24890,6 +24891,12 @@ if(HAVE_CUDA OR HAVE_ROCM)
                     --gtest_brief=1
                 LABELS "V2;Integration;ProductionTestPreflight;${_live_rows_backend};MoE;MTP;AllFormats;GraphCapture;ByteExact;Lifecycle;Regression"
                 MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+            add_v2_test(V2_Integration_MoEColdSharedPreparation_${_live_rows_backend}
+                COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
+                    --gtest_filter=Backends/MoELiveRows.ColdSharedPreparationAllFormats/${_live_rows_backend}
+                    --gtest_brief=1
+                LABELS "V2;Integration;ProductionTestPreflight;${_live_rows_backend};MoE;MTP;AllFormats;GraphCapture;ByteExact;Lifecycle;Regression"
+                MPI_PROCS 1 NO_MODELS TIMEOUT 30)
             add_v2_test(V2_Integration_MoELiveRows_${_live_rows_backend}
                 COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
                     --gtest_filter=Backends/MoELiveRows.CapturedSharedAndRoutedAllFormats/${_live_rows_backend}:Backends/MoELiveRows.FloatingMultiPartitionGeometry/${_live_rows_backend}
@@ -28026,6 +28033,7 @@ if(HAVE_CUDA)
     V2_Integration_MoECompactProductionPackets_CUDA
     V2_Integration_MoEGroupingInitialization_CUDA
     V2_Integration_MoELiveRows_CUDA
+    V2_Integration_MoEColdSharedPreparation_CUDA
     V2_Integration_MoECanonicalQ5Partitions_CUDA
     V2_Integration_MoEOriginalSourceRows_CUDA
     V2_Integration_MoEProjectionPhases_CUDA
@@ -28122,6 +28130,7 @@ if(HAVE_ROCM)
     V2_Integration_MoECompactProductionPackets_ROCm
     V2_Integration_MoEGroupingInitialization_ROCm
     V2_Integration_MoELiveRows_ROCm
+    V2_Integration_MoEColdSharedPreparation_ROCm
     V2_Integration_MoECanonicalQ5Partitions_ROCm
     V2_Integration_MoEOriginalSourceRows_ROCm
     V2_Integration_MoEProjectionPhases_ROCm
@@ -31061,6 +31070,13 @@ add_v2_test(V2_Integration_CpuAdaptiveImmutableRowCache
     COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives> --gtest_filter=CpuAdaptiveImmutableRowCache.*
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Loaders;Storage;Ownership;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30 ENVIRONMENT ${QFN_HOST_ADAPTIVE_CPU_ENV})
+# Explicit preparation-read regression; this does not qualify future transport.
+add_v2_test(V2_Integration_CpuImmutableLookupOnlyReplay
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+        --gtest_filter=CpuAdaptiveImmutableRowCache.LookupOnlyReadsNeverCreditReplacementPolicy
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Loaders;Storage;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30 ENVIRONMENT ${QFN_HOST_ADAPTIVE_CPU_ENV})
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CpuImmutableLookupOnlyReplay)
 # The sole ConsumerLocal requester uses its original local coordinator authority.
 add_v2_test(V2_Integration_ConsumerLocalSubordinateGeometryContract
     COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
@@ -32055,7 +32071,15 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_AdaptiveOwnerTermi
 
 target_sources(v2_test_model_parity_definition PRIVATE
     unit/parity/Test__Qwen4ExpGPUAdaptiveParity.cpp
-    unit/parity/Test__Qwen4ExpGPUAdaptiveLookupEvidence.cpp)
+    unit/parity/Test__Qwen4ExpGPUAdaptiveLookupEvidence.cpp
+    unit/parity/Test__Qwen4ExpLocalHotTerminalEvidence.cpp)
+add_v2_test(V2_Integration_Qwen4ExpLocalHotTerminalEvidence
+    COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+        --gtest_filter=Qwen4ExpLocalHotTerminalEvidence.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Qwen4Exp;Adaptive;Parity;Evidence;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpLocalHotTerminalEvidence)
 add_v2_test(V2_Integration_Qwen4ExpGPUAdaptiveCanonicalCells
     COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
         --gtest_filter=Qwen4ExpGPUAdaptiveParity.*
@@ -32659,6 +32683,13 @@ add_v2_test(V2_Integration_CPUMappedPublicationPhysicalOwnership
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUMappedPublicationPhysicalOwnership)
+add_v2_test(V2_Integration_NgramLocalReadyPhysicalOwnership
+    COMMAND $<TARGET_FILE:v2_unit_mapped_host_transfer_region>
+        --gtest_filter=Test__MappedHostTransferRegion.LocalReadyClaimFollowsOriginalSourceAndAliasRetirement
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Transfer;Ngram;Admission;PhysicalMemory;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NgramLocalReadyPhysicalOwnership)
 add_v2_test(V2_Integration_CPURoutedStorageAccounting
     COMMAND $<TARGET_FILE:v2_unit_weight_manager_moe_expert_overlay_preparation>
         --gtest_filter=Test__WeightManagerMoEExpertOverlayPreparation.InitialCpuPhysicalClaims*:Test__WeightManagerMoEExpertOverlayPreparation.FullPersistentBudgetExportsReceivesAndRetiresStagingWithoutRechargingWeights:Test__WeightManagerMoEExpertOverlayPreparation.StandaloneCpuOwnerComesFromFrozenBindingsAndRejectsMissingOwner:Test__WeightManagerMoEExpertOverlayPreparation.PrimaryCpuFinalWeights*
@@ -37665,6 +37696,7 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2ImmutableLookupOrderingAdmissionTest
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2PooledOrderingProgramTests.cmake")
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2PooledOriginalSourceSetupTests.cmake")
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2PooledImmutableLocalHotTests.cmake")
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2NativeOrderingUnattemptedTests.cmake")
 
@@ -37690,6 +37722,7 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2PlanningHostServiceEvidenceTests.cm
 # Exact cold native inspection adapters and original remote-host ownership replay.
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2PooledRemoteGraphHostTests.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2PooledRemoteOwnerProgramTests.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2ColocatedStorageDefinitionTests.cmake)
 
 # Exact recurring source/remote host-enqueue ownership replays.
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2RetainedParticipantSubmissionTests.cmake)

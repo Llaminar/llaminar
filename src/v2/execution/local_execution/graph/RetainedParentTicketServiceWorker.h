@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
@@ -23,6 +24,7 @@
 
 namespace llaminar2
 {
+    namespace test { struct ImmutableLookupWorkerGateReplayAccess; }
     /**
      * @brief Runs one pre-armed CPU ticket service independently of GPU submission.
      *
@@ -100,6 +102,32 @@ namespace llaminar2
 
     private:
         friend class PreparedRetainedHostService;
+        friend struct test::ImmutableLookupWorkerGateReplayAccess;
+        /** @brief Closed fixture ownership only; never an inference/controller state. */
+        enum class BorrowedEntryOutcome : std::uint8_t
+        {
+            Uninstalled, Installed, Dispatched, Rejected, Withdrawn
+        };
+        /**
+         * @brief One fixture-owned wrapper for an exact original task/context.
+         * The fixture retains this descriptor through actual worker departure.
+         * The original dispatch still issues the sole invocation ticket.
+         */
+        struct BorrowedDispatchEntry
+        {
+            Task expected_task = nullptr;
+            void* expected_context = nullptr;
+            Task wrapper_task = nullptr;
+            void* wrapper_context = nullptr;
+            std::atomic<BorrowedEntryOutcome> outcome{BorrowedEntryOutcome::Uninstalled};
+        };
+        /**
+         * @brief Cold closed-fixture borrow, consumed once under mutex_.
+         * This pointer is part of sizeof(worker), priced/materialized by the
+         * original RetainedHostServiceProgram. Serving callers cannot install it.
+         */
+        BorrowedDispatchEntry* next_borrowed_entry_ = nullptr;
+
         /** @brief Construct complete idle data; only the admitted owner can start the entry. */
         explicit RetainedParentTicketServiceWorker(pthread_t) noexcept;
         /** @brief Enter the original run loop, terminating on any escaping exception. */

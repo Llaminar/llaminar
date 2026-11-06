@@ -10,6 +10,8 @@
  * be overwritten; invalid routes may never read unowned compact scratch.
  * This detects stale scratch, double publication by two
  * dispatch families, and shared experts accidentally evaluating padded rows.
+ * Cold shared-stage preparation additionally receives poisoned unpublished
+ * controller storage: only captured execution may consume its live count.
  */
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -75,6 +77,9 @@ namespace
     /** @brief Explicit original-Q8 producer exercised by the captured fixture. */
     enum class InputSource { PrivateQuantizer, RouterPublication };
 
+    /** @brief Select the complete inventory or its focused cold shared-stage gate. */
+    enum class ExpertCoverage { SharedAndRouted, SharedOnly };
+
     /**
      * @brief Exercise one endpoint on its worker's explicit non-default stream.
      * @param device Endpoint whose prepared weights and scratch own the graph.
@@ -85,12 +90,14 @@ namespace
      * @param rows Physical captured token capacity; independent of live routes.
      * @param input_source Whether routing publishes canonical Q8 before gate/up.
      * @param backing_rows Retained tensor/scratch capacity; zero selects exact rows.
+     * @param coverage Whether this invocation also proves routed expert execution.
      */
     void proveLiveRows(DeviceId device, IWorkerGPUContext &context,
                        const std::vector<WeightCase> &formats,
                        int hidden_size = 256, int width = 256, int rows = 16,
                        InputSource input_source = InputSource::PrivateQuantizer,
-                       int backing_rows = 0)
+                       int backing_rows = 0,
+                       ExpertCoverage coverage = ExpertCoverage::SharedAndRouted)
     {
         if (backing_rows == 0) backing_rows = rows;
         ASSERT_GE(backing_rows, rows);
@@ -181,6 +188,7 @@ namespace
 
                 for (const bool shared : {false, true})
                 {
+                    if (!shared && coverage == ExpertCoverage::SharedOnly) continue;
                     SCOPED_TRACE(shared ? "shared" : "routed");
                     const int experts = shared ? 1 : 16;
                     const int top_k = shared ? 1 : 4;
@@ -264,6 +272,70 @@ namespace
                     std::unique_ptr<IDeviceContext> stage_context;
                     std::unique_ptr<MoEExpertComputeStage> exact_stage, full_stage;
                     std::unique_ptr<IGPUGraphCapture> full_capture;
+                    GpuPreparedFFNFixture shared_prepared;
+                    std::unique_ptr<DeviceWorkspaceManager> shared_workspace;
+                    decltype(tensor(1, 1)) shared_gate_scratch, shared_up_scratch;
+                    std::unique_ptr<SharedExpertFFNStage> shared_stage;
+                    if (backing_rows > rows && shared)
+                    {
+                        // Use one actual production prepared store for the
+                        // three stage weights. Independent serial kernel rows
+                        // below retain the original same-weight oracle.
+                        const std::string prefix = std::string("test.cold_shared.") + format.label;
+                        if (floating)
+                        {
+                            shared_prepared.store = std::make_unique<PreparedWeightStore>(ModelContextId{9902});
+                            shared_prepared.gate_ref = registerGpuPreparedFloatingPointGemmInStore(
+                                source_weights[0].get(), device, prefix + ".gate",
+                                *shared_prepared.store, shared_prepared.orchestrators);
+                            shared_prepared.up_ref = registerGpuPreparedFloatingPointGemmInStore(
+                                source_weights[1].get(), device, prefix + ".up",
+                                *shared_prepared.store, shared_prepared.orchestrators);
+                            shared_prepared.down_ref = registerGpuPreparedFloatingPointGemmInStore(
+                                source_weights[2].get(), device, prefix + ".down",
+                                *shared_prepared.store, shared_prepared.orchestrators);
+                        }
+                        else
+                            shared_prepared = makeGpuPreparedFFNFixture(source_weights[0].get(),
+                                source_weights[1].get(), source_weights[2].get(), device, prefix);
+                        stage_output = tensor(backing_rows, hidden_size);
+                        shared_gate_scratch = tensor(backing_rows, width);
+                        shared_up_scratch = tensor(backing_rows, width);
+                        stage_context = IDeviceContext::create(device);
+                        SharedExpertFFNStage::Params params;
+                        params.device_id = device;
+                        params.input = hidden.get();
+                        params.output = stage_output.get();
+                        params.gate_w = source_weights[0].get();
+                        params.up_w = source_weights[1].get();
+                        params.down_w = source_weights[2].get();
+                        params.gate_scratch = shared_gate_scratch.get();
+                        params.up_scratch = shared_up_scratch.get();
+                        params.seq_len = rows;
+                        params.d_model = hidden_size;
+                        params.intermediate = width;
+                        params.active_row_count_device = count;
+                        params.force_grouped_verifier_prefill_for_decode = true;
+                        params.prepared_ref_gate = shared_prepared.gate_ref;
+                        params.prepared_ref_up = shared_prepared.up_ref;
+                        params.prepared_ref_down = shared_prepared.down_ref;
+                        params.prepared_store = shared_prepared.store.get();
+                        shared_stage = std::make_unique<SharedExpertFFNStage>(std::move(params));
+                        const auto shared_requirements = shared_stage->getWorkspaceRequirements(backing_rows,
+                            hidden_size, width);
+                        shared_workspace = std::make_unique<DeviceWorkspaceManager>(device,
+                            shared_requirements.total_bytes_with_alignment() + 4 * 1024 * 1024);
+                        ASSERT_TRUE(shared_workspace->allocate(shared_requirements));
+                        shared_stage->bindWorkspace(shared_workspace.get());
+                        ASSERT_TRUE(shared_stage->usesGroupedVerifierPrefillRouteForTesting());
+                        const int32_t unpublished = std::numeric_limits<int32_t>::min();
+                        ASSERT_TRUE(upload(live_count.get(), &unpublished, sizeof(unpublished)));
+                        ASSERT_TRUE(shared_stage->prepareGraphLaunch(stage_context.get(), stream));
+                        int32_t untouched = 0;
+                        ASSERT_TRUE(backend->deviceToHost(&untouched, count, sizeof(untouched), device.ordinal, stream));
+                        ASSERT_TRUE(backend->synchronizeStream(stream, device.ordinal));
+                        ASSERT_EQ(untouched, unpublished) << "cold preparation must not publish controller state";
+                    }
                     if (backing_rows > rows && !shared)
                     {
                         stage_output = tensor(backing_rows, hidden_size);
@@ -443,7 +515,8 @@ namespace
                                 contributions.get()) &&
                             kernel->reduceCanonicalRouteContributions(contributions.get(), reduced_output.get(),
                                 rows, top_k, hidden_size) &&
-                            (!exact_stage || exact_stage->execute(stage_context.get()));
+                            (!exact_stage || exact_stage->execute(stage_context.get())) &&
+                            (!shared_stage || shared_stage->execute(stage_context.get()));
                     };
                     // Materialize every persistent scratch view before recording.
                     ASSERT_TRUE(enqueue());
@@ -509,6 +582,20 @@ namespace
                         const int active = replay == 0 ? rows : (replay * 7) % (rows + 1);
                         visited_live_counts[active] = true;
                         SCOPED_TRACE(::testing::Message() << "replay=" << replay << " live=" << active);
+                        if (shared_stage && replay == replay_count / 2)
+                        {
+                            // Reused request storage may be dirty again. Reset
+                            // data and prepare the original stage without
+                            // rebuilding/rebinding its retained executable.
+                            shared_stage->resetSessionStatePreservingCapturedReplay();
+                            const int32_t unpublished = std::numeric_limits<int32_t>::max();
+                            ASSERT_TRUE(upload(live_count.get(), &unpublished, sizeof(unpublished)));
+                            ASSERT_TRUE(shared_stage->prepareGraphLaunch(stage_context.get(), stream));
+                            int32_t untouched = 0;
+                            ASSERT_TRUE(backend->deviceToHost(&untouched, count, sizeof(untouched), device.ordinal, stream));
+                            ASSERT_TRUE(backend->synchronizeStream(stream, device.ordinal));
+                            ASSERT_EQ(untouched, unpublished);
+                        }
                         if (full_capture)
                         {
                             ASSERT_TRUE(upload(indices.get(), route_ids.data(), route_ids.size() * sizeof(float)));
@@ -541,6 +628,8 @@ namespace
                         ASSERT_TRUE(upload(contributions.get(), route_poison.data(), route_poison.size() * sizeof(float)));
                         if (exact_stage)
                             ASSERT_TRUE(upload(stage_output.get(), poison.data(), size_t(rows) * hidden_size * sizeof(float)));
+                        if (shared_stage)
+                            ASSERT_TRUE(upload(stage_output.get(), poison.data(), poison.size() * sizeof(float)));
                         // Every mutable projection bank begins dirty. Complete
                         // producers define consumed values before reading them;
                         // absent routes must reject unowned intermediate slots
@@ -571,7 +660,7 @@ namespace
                         ASSERT_TRUE(capture->launch());
                         ASSERT_TRUE(observe(output.get(), actual));
                         ASSERT_TRUE(observe(reduced_output.get(), reduced));
-                        if (exact_stage) ASSERT_TRUE(observe(stage_output.get(), stage_actual));
+                        if (exact_stage || shared_stage) ASSERT_TRUE(observe(stage_output.get(), stage_actual));
                         if (!floating)
                         {
                             const size_t private_bytes = borrowed ? 0 : size_t(rows) * hidden_size;
@@ -596,7 +685,7 @@ namespace
                             ASSERT_EQ(std::bit_cast<uint32_t>(reduced[index]), std::bit_cast<uint32_t>(expected))
                                 << "canonical publication row=" << index / hidden_size
                                 << " col=" << index % hidden_size;
-                            if (exact_stage)
+                            if (exact_stage || shared_stage)
                                 ASSERT_EQ(std::bit_cast<uint32_t>(stage_actual[index]),
                                           std::bit_cast<uint32_t>(expected))
                                     << "actual production expert stage row=" << index / hidden_size;
@@ -610,6 +699,8 @@ namespace
                             ASSERT_EQ(std::bit_cast<uint32_t>(reduced[index]), std::bit_cast<uint32_t>(poison[index]));
                             if (exact_stage)
                                 ASSERT_EQ(std::bit_cast<uint32_t>(stage_actual[index]), std::bit_cast<uint32_t>(serial[index]));
+                            if (shared_stage)
+                                ASSERT_EQ(std::bit_cast<uint32_t>(stage_actual[index]), std::bit_cast<uint32_t>(poison[index]));
                         }
                         if (shared)
                         {
@@ -725,6 +816,18 @@ namespace
         auto &context = GPUDeviceContextPool::instance().getContext(device);
         proveLiveRows(device, context, liveRowsFormats(), 256, 256, 3,
                       InputSource::PrivateQuantizer, 4);
+    }
+
+    /** @test Cold preparation ignores unpublished live state, then captured replay owns every live prefix. */
+    TEST_P(MoELiveRows, ColdSharedPreparationAllFormats)
+    {
+        const auto device = GetParam() == "CUDA" ? DeviceId::cuda(0) : DeviceId::rocm(0);
+        auto *backend = getBackendFor(device);
+        ASSERT_NE(backend, nullptr);
+        ASSERT_GT(backend->deviceCount(), 0) << "Explicit native regression requires its backend";
+        auto &context = GPUDeviceContextPool::instance().getContext(device);
+        proveLiveRows(device, context, liveRowsFormats(), 256, 256, 3,
+                      InputSource::PrivateQuantizer, 4, ExpertCoverage::SharedOnly);
     }
 
     INSTANTIATE_TEST_SUITE_P(Backends, MoELiveRows, ::testing::Values("CUDA", "ROCm"),

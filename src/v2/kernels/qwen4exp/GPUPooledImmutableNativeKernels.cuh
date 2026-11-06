@@ -387,6 +387,7 @@ std::unique_ptr<IPooledImmutableNativeKernels> QFN_NATIVE_FACTORY()
 {return std::make_unique<QFN_NATIVE_NAMESPACE::Kernels>();}
 }
 #include "GPUPooledImmutableReplicatedReader.cuh"
+#include "GPUPooledImmutableLocalHotTransport.cuh"
 #undef QFN_NATIVE_NAMESPACE
 #undef QFN_NATIVE_STREAM
 #undef QFN_NATIVE_ERROR

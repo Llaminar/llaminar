@@ -19,6 +19,8 @@ namespace test {struct NativeContextBirthDiagnosticAccess;}
 class GPUDeviceContextPool;
 class IWorkerGPUContext;
 class TransferEngine;
+class RetainedParticipantGraphExecutable;
+class PreparedServiceCalibrationSlot;
 /** @brief Original physical obligations for one selected source worker, not an ownership mirror. */
 class PreparedGPUContextBirth final {
 public:
@@ -42,6 +44,8 @@ private:
     const NativeContextOpaqueContract contract_;
     std::shared_ptr<PhysicalMemoryOpaqueRuntimeCommitment> opaque_;
     std::shared_ptr<PreparedGPUWorkerStack> stack_;
+    std::shared_ptr<PreparedServiceCalibrationSlot> calibration_; ///< Pool mutex publishes this actual source-owned slot.
+    bool calibration_closed_=false; ///< Explicit final source retirement closes new cold borrowing.
 };
 /** @brief Exact original worker borrow retaining its certified original source authority. */
 class PreparedGPUContextUsePermit final {
@@ -58,6 +62,12 @@ public:
     DeviceId device()const noexcept{return birth_->device();}
     /** @return Original prebirth-assigned pool generation. */
     std::uint64_t generation()const noexcept{return provenance_.generation();}
+    /** @brief Exclusively borrow this original worker's persistent startup calibration.
+     * @param stream Exact non-null original worker stream; caller is off-worker.
+     * @return Same wrapper and two timing events across completed cold definitions/runners.
+     * @throws std::exception For foreign/live/failed/retiring ownership or native failure.
+     */
+    std::shared_ptr<RetainedParticipantGraphExecutable> borrowPreparedCalibration(void* stream)const;
 private:
     friend class GPUDeviceContextPool;
     PreparedGPUContextUsePermit(std::shared_ptr<PreparedGPUContextBirth> birth,GPUContextProvenance provenance)
@@ -101,12 +111,17 @@ public:
     std::shared_ptr<NativeStoragePmaBinding> admit(NativePreparationPlanningSnapshot&&,std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate>);
 private:
     friend struct test::NativeContextPreparationReplayAccess;
+    friend class PendingExclusiveModelRetirement; ///< Same original final-model boundary closes calibration before worker retirement.
     NativeContextPreparation(std::span<const PhysicalMemoryResource>,int);
     /** @brief Same original retirement body with an explicit infrastructure transfer authority for device-free replay.
      * @param transfers Existing transfer authority retaining the actual native backend contract.
      * @return Number of actual completed original-source native retirement receipts.
      * @throws std::exception For live owners or incomplete physical retirement evidence. */
     std::size_t retireReleasedContexts(const TransferEngine& transfers);
+    /** @brief Close source-owned calibration handles before the existing native retirement tickets.
+     * @throws std::exception If a calibration loan or native definition is still live.
+     */
+    void retirePreparedCalibrations();
     static std::shared_ptr<NativeContextPreparation> createQualified(std::span<const PhysicalMemoryResource>,int,std::span<const NativeContextBirthKey>);
     std::shared_ptr<NativeStoragePreparationPmaBinding> source_;
     std::vector<std::shared_ptr<PreparedGPUContextBirth>> births_;

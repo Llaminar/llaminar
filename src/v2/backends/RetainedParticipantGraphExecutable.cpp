@@ -140,7 +140,9 @@ PhysicalMemoryPlan RetainedParticipantGraphExecutable::generalBOM(PhysicalMemory
     return definitionBOM(host,gpu,slots,DefinitionPurpose::RetainedParticipant);
 }
 PhysicalMemoryPlan RetainedParticipantGraphExecutable::calibrationBOM(PhysicalMemoryResource host,PhysicalMemoryResource gpu){
-    return definitionBOM(host,gpu,1,DefinitionPurpose::PreparedServiceCalibration);
+    PhysicalMemoryPlanBuilder plan(definitionBOM(host,gpu,1,DefinitionPurpose::PreparedServiceCalibration));
+    plan.add(host,PhysicalMemoryOwner::NativePreparationGraphExecutable,PreparedServiceCalibrationSlot::physicalBytes());
+    return plan.build();
 }
 PhysicalMemoryPlan RetainedParticipantGraphExecutable::definitionBOM(PhysicalMemoryResource host,PhysicalMemoryResource gpu,
     std::size_t slots,DefinitionPurpose purpose){
@@ -444,18 +446,19 @@ RetainedParticipantGraphExecutable::RecordedStorageDefinition::RecordedStorageDe
     std::shared_ptr<const RetainedGraphParticipantPreparationStream> preparation)
     :owner_(std::move(owner)),originalParent_(std::move(parent)),
      sourcePlan_(preparation->definition().plan),sourcePreparation_(std::move(preparation)),
-     sourceIdentity_(sourcePlan_->captureIdentity()){
+     sourceIdentity_(sourcePlan_->captureIdentity()),definitionGeneration_(owner_->definitionGeneration_){
     owner_->embeddedBorrowers_.fetch_add(1,std::memory_order_acq_rel);
 }
 RetainedParticipantGraphExecutable::RecordedStorageDefinition::RecordedStorageDefinition(RecordedStorageDefinition&& other)noexcept
     :owner_(std::move(other.owner_)),originalParent_(std::move(other.originalParent_)),
      sourcePlan_(std::move(other.sourcePlan_)),sourcePreparation_(std::move(other.sourcePreparation_)),
-     sourceIdentity_(other.sourceIdentity_),attempted_(other.attempted_){}
+     sourceIdentity_(other.sourceIdentity_),definitionGeneration_(other.definitionGeneration_),attempted_(other.attempted_){}
 RetainedParticipantGraphExecutable::RecordedStorageDefinition::~RecordedStorageDefinition(){
     if(owner_)owner_->embeddedBorrowers_.fetch_sub(1,std::memory_order_acq_rel);
 }
 void RetainedParticipantGraphExecutable::RecordedStorageDefinition::requireCurrent()const{
     if(!owner_ || !sourcePlan_ || !sourcePreparation_ || owner_->phase_!=Phase::RecordedStorageBody ||
+       owner_->definitionGeneration_!=definitionGeneration_ ||
        sourcePlan_->captureIdentity()!=sourceIdentity_)
         throw std::logic_error("Recorded storage borrow lost its immutable source definition");
     owner_->requireLiveOriginal();originalParent_.requireWorker(owner_->worker_);
@@ -495,6 +498,118 @@ RetainedParticipantGraphExecutable::RecordedStorageDefinition RetainedParticipan
     RecordedStorageDefinition result(std::move(self),originalParent,std::move(preparation));
     result.requireCurrent();return result;
 }
+void RetainedParticipantGraphExecutable::releaseSourceDefinition(){
+    requireLiveOriginal();
+    if(worker_->ownsCurrentThread())throw std::logic_error("Original source definition release requires its terminal owner");
+    std::lock_guard definition(embeddedDefinitionMutex_);
+    if(!remoteProgram_ || purpose_!=DefinitionPurpose::RetainedParticipant || pending_ ||
+       embeddedBorrowers_.load(std::memory_order_acquire) || !capture_ ||
+       (phase_!=Phase::Ready && phase_!=Phase::RecordedStorageBody))
+        throw std::logic_error("Original source slot still has a live, failed or incomplete native definition");
+    try{
+        worker_->submitAndWait([&]{
+            if(worker_->queryStreamExecutionState(stream_,"original source serial definition retirement")!=GPUStreamExecutionState::Complete)
+                throw std::logic_error("Original source definition stream has not retired");
+            capture_->reset();
+            if(capture_->nodeCount() || capture_->hasExecutable())
+                throw std::logic_error("Original source definition retained native handles after reset");
+            recording_.reset();
+        });
+        recordingObjectLease_={};
+        recordedRuntimePrepared_=false;cohortBound_.store(false,std::memory_order_release);
+        phase_=Phase::DormantSourceSlot;
+    }catch(...){phase_=Phase::Failed;throw;}
+}
+void RetainedParticipantGraphExecutable::reacquireSourceDefinition(){
+    requireLiveOriginal();
+    if(worker_->ownsCurrentThread())throw std::logic_error("Original source recording requires its cold owner");
+    std::lock_guard definition(embeddedDefinitionMutex_);
+    if(!remoteProgram_ || phase_!=Phase::DormantSourceSlot || pending_ || !capture_ || recording_ ||
+       capture_->nodeCount() || capture_->hasExecutable() || embeddedBorrowers_.load(std::memory_order_acquire) ||
+       cohortBound_.load(std::memory_order_acquire) || definitionGeneration_==std::numeric_limits<std::uint64_t>::max())
+        throw std::logic_error("Original source slot cannot replace its active or exhausted definition");
+    try{
+        recordingObjectLease_=memory_->claimNewAllocation(DeviceId::cpu(),PhysicalMemoryOwner::NativeStorageGraphExecutable,sizeof(RecordingCapture));
+        ++definitionGeneration_;
+        // The SAME original backend capture wrapper/known-object claim remains
+        // source owned, exactly like serial prepared calibration. Only the cold
+        // definition facade changes; there is no new opaque native creator.
+        worker_->submitAndWait([&]{recording_=std::make_unique<RecordingCapture>(*this);});
+        phase_=Phase::Fresh;
+    }catch(...){
+        recording_.reset();recordingObjectLease_={};
+        phase_=Phase::Failed;throw;
+    }
+}
+std::size_t RetainedParticipantGraphSourceSlots::physicalBytes(std::size_t count){
+    if(!count || count>(std::numeric_limits<std::size_t>::max()-sizeof(RetainedParticipantGraphSourceSlots))/sizeof(Slot))
+        throw std::invalid_argument("Original remote source slot roster is empty or overflows");
+    static_assert(alignof(Slot)<=alignof(RetainedParticipantGraphSourceSlots));
+    return CPUStorageRoot<std::byte>(sizeof(RetainedParticipantGraphSourceSlots)+count*sizeof(Slot),
+        PhysicalMemoryOwner::NativeStorageGraphExecutable,DeviceId::cpu()).physicalBytes();
+}
+std::shared_ptr<RetainedParticipantGraphSourceSlots> RetainedParticipantGraphSourceSlots::create(
+    std::uint64_t source,std::size_t count,const std::shared_ptr<PhysicalMemoryAuthority>& memory){
+    if(!source || !memory)throw std::invalid_argument("Original source slots require their actual source/PMA");
+    auto storage=CPUStorageRoot<std::byte>(physicalBytes(count),PhysicalMemoryOwner::NativeStorageGraphExecutable,DeviceId::cpu(),
+        CPUStoragePlacement::local(),CPUStorageInitialization::Uninitialized).allocate(memory);
+    auto* owner=new(storage.data())RetainedParticipantGraphSourceSlots(source,count,memory);
+    for(std::size_t i=0;i<count;++i)std::construct_at(owner->slots()+i);
+    return {owner,[storage=std::move(storage)](RetainedParticipantGraphSourceSlots* value)mutable{
+        value->~RetainedParticipantGraphSourceSlots();storage={};}};
+}
+RetainedParticipantGraphSourceSlots::~RetainedParticipantGraphSourceSlots(){
+    for(std::size_t i=0;i<count_;++i)std::destroy_at(slots()+i);
+}
+std::shared_ptr<RetainedParticipantGraphExecutable> RetainedParticipantGraphSourceSlots::acquire(
+    std::uint64_t source,const PreparedGPUContextUsePermit& original,void* stream,const PooledRemoteGraphProgram& program){
+    std::lock_guard lock(mutex_);
+    const auto coordinate=program.geometry().coordinate;
+    if(source!=sourceIdentity_ || coordinate>=count_ || original.memory().get()!=memory_.get() ||
+       original.memory().owner_before(memory_) || memory_.owner_before(original.memory()) ||
+       program.geometry().owner!=PhysicalMemoryAllocatorIdentity{memory_->worldRank(),original.device()})
+        throw std::invalid_argument("Original remote slot changed its source/PMA/owner coordinate");
+    auto& slot=slots()[coordinate];if(slot.failure)std::rethrow_exception(slot.failure);
+    try{
+        if(!slot.owner)slot.owner=RetainedParticipantGraphExecutable::create(original,stream,program);
+        else{
+            auto& owner=*slot.owner;
+            if(slot.owner.use_count()!=1 || !owner.remoteProgram_ || *owner.remoteProgram_!=program ||
+               owner.memory_.get()!=memory_.get() || owner.device_!=original.device() || owner.generation_!=original.generation() ||
+               owner.stream_!=stream || owner.worker_!=original.worker() ||
+               owner.worker_.owner_before(original.worker()) || original.worker().owner_before(owner.worker_))
+                throw std::invalid_argument("Original remote source slot still has borrowers or changed program/worker/stream");
+            owner.requireLiveOriginal();
+            if(owner.phase_==RetainedParticipantGraphExecutable::Phase::DormantSourceSlot)owner.reacquireSourceDefinition();
+            else if(owner.phase_!=RetainedParticipantGraphExecutable::Phase::Fresh)
+                throw std::logic_error("Original remote source slot has not retired its previous definition");
+        }
+        return slot.owner;
+    }catch(...){
+        // Invalid overlapping/foreign borrows must not poison an otherwise
+        // healthy source; an actual failed native construction remains sticky.
+        if(!slot.owner || slot.owner->phase_==RetainedParticipantGraphExecutable::Phase::Failed)slot.failure=std::current_exception();
+        throw;
+    }
+}
+void RetainedParticipantGraphSourceSlots::release(std::uint64_t source,const PooledRemoteGraphProgram& program,
+    const std::shared_ptr<RetainedParticipantGraphExecutable>& owner){
+    std::lock_guard lock(mutex_);const auto coordinate=program.geometry().coordinate;
+    if(source!=sourceIdentity_ || coordinate>=count_ || !owner || slots()[coordinate].owner.get()!=owner.get() ||
+       slots()[coordinate].owner.owner_before(owner) || owner.owner_before(slots()[coordinate].owner) ||
+       !owner->remoteProgram_ || *owner->remoteProgram_!=program || slots()[coordinate].owner.use_count()!=2)
+        throw std::invalid_argument("Original source definition retirement changed its exact slot/program or retained borrowers");
+    owner->releaseSourceDefinition();
+}
+void RetainedParticipantGraphSourceSlots::abandon(std::uint64_t source,const PooledRemoteGraphProgram& program,
+    const std::shared_ptr<RetainedParticipantGraphExecutable>& owner,std::exception_ptr failure){
+    std::lock_guard lock(mutex_);const auto coordinate=program.geometry().coordinate;
+    if(source!=sourceIdentity_ || coordinate>=count_ || !owner || !failure ||
+       slots()[coordinate].owner!=owner || !owner->remoteProgram_ || *owner->remoteProgram_!=program)
+        throw std::logic_error("Failed source definition lost its exact original slot/diagnostic");
+    owner->retireDefinition();
+    slots()[coordinate].failure=std::move(failure);
+}
 void RetainedParticipantGraphExecutable::retireDefinition(){
     if(worker_->ownsCurrentThread())throw std::logic_error("Retained native definition requires its original off-worker terminal retirement");
     std::lock_guard definition(embeddedDefinitionMutex_);
@@ -513,4 +628,59 @@ void RetainedParticipantGraphExecutable::retireDefinition(){
 RetainedParticipantGraphExecutable::~RetainedParticipantGraphExecutable()noexcept{
     try{retireDefinition();}catch(...){std::terminate();}
 }
+std::size_t PreparedServiceCalibrationSlot::physicalBytes(){
+    return CPUStorageRoot<std::byte>(sizeof(PreparedServiceCalibrationSlot),
+        PhysicalMemoryOwner::NativePreparationGraphExecutable,DeviceId::cpu()).physicalBytes();
+}
+std::shared_ptr<PreparedServiceCalibrationSlot> PreparedServiceCalibrationSlot::create(
+    std::shared_ptr<PhysicalMemoryAuthority> memory,DeviceId device){
+    if(!memory || !device.is_gpu())throw std::invalid_argument("Prepared calibration slot requires its original GPU/source");
+    auto storage=CPUStorageRoot<std::byte>(physicalBytes(),PhysicalMemoryOwner::NativePreparationGraphExecutable,
+        DeviceId::cpu(),CPUStoragePlacement::local(),CPUStorageInitialization::Uninitialized).allocate(memory);
+    auto* slot=new(storage.data())PreparedServiceCalibrationSlot(memory,device);
+    return {slot,[storage=std::move(storage)](auto* value)mutable{value->~PreparedServiceCalibrationSlot();storage={};}};
+}
+std::shared_ptr<RetainedParticipantGraphExecutable> PreparedServiceCalibrationSlot::acquire(
+    const PreparedGPUContextUsePermit& original,void* stream){
+    if(original.device()!=device_ || original.memory().get()!=memory_.get() ||
+       original.memory().owner_before(memory_) || memory_.owner_before(original.memory()) ||
+       !original.worker() || original.worker()->ownsCurrentThread() || !stream || stream!=original.worker()->defaultStream())
+        throw std::invalid_argument("Prepared calibration slot changed its original source/worker/stream");
+    std::lock_guard lock(mutex_);
+    if(closed_.load(std::memory_order_acquire))throw std::logic_error("Original prepared calibration source slot is retiring");
+    if(failure_)std::rethrow_exception(failure_);
+    if(owner_){
+        if(owner_.use_count()!=1)throw std::logic_error("Original prepared calibration still has a live borrower");
+        auto& owner=*owner_;
+        original.requireWorker(owner.worker_);
+        if(owner.memory_.get()!=memory_.get() || owner.memory_.owner_before(memory_) || memory_.owner_before(owner.memory_) ||
+           owner.device_!=device_ || owner.generation_!=original.generation() || owner.stream_!=stream ||
+           owner.purpose_!=RetainedParticipantGraphExecutable::DefinitionPurpose::PreparedServiceCalibration ||
+           owner.remoteProgram_ || owner.pending_ || owner.embeddedBorrowers_.load(std::memory_order_acquire) ||
+           owner.cohortBound_.load(std::memory_order_acquire) || owner.phase_!=RetainedParticipantGraphExecutable::Phase::Fresh ||
+           owner.lastSubmission_!=owner.calibrationRetiredSubmission_ || !owner.capture_ ||
+           owner.capture_->nodeCount() || owner.capture_->hasExecutable())
+            throw std::logic_error("Original prepared calibration has no completed reset definition or changed identity");
+        owner.requireLiveOriginal();
+    }else{
+        try{owner_=RetainedParticipantGraphExecutable::createPreparedCalibration(original,stream);}
+        catch(...){failure_=std::current_exception();throw;}
+    }
+    return owner_;
+}
+void PreparedServiceCalibrationSlot::retire(){
+    std::lock_guard lock(mutex_);
+    // The pool first closes new holder lookups. This same slot lock also closes
+    // an already-issued off-pool borrow before it can enter a native creator.
+    closeAcquisition();
+    if(!owner_)return;
+    if(owner_.use_count()!=1)throw std::logic_error("Original prepared calibration retirement has a live borrower");
+    const auto phase=owner_->phase_.load(std::memory_order_acquire);
+    if(phase!=RetainedParticipantGraphExecutable::Phase::Fresh && phase!=RetainedParticipantGraphExecutable::Phase::Retired &&
+       phase!=RetainedParticipantGraphExecutable::Phase::Failed)
+        throw std::logic_error("Original prepared calibration must reset its completed definition before final retirement");
+    owner_->retireDefinition();
+    owner_.reset();
+}
+
 }

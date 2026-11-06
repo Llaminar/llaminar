@@ -15,6 +15,7 @@
 #include "integration/parity/qwen4exp/Qwen4ExpSharedContinuationMTPSourceCases.h"
 #include "fixtures/models/Qwen4ExpReplicatedPLECohortReplayAccess.h"
 #include "planning/ImmutableRowTablePlacementPlanner.h"
+#include "execution/qwen4exp/PooledImmutableParticipantExecutionPolicy.h"
 #include "integration/parity/qwen4exp/Qwen4ExpCPUJointParityCases.h"
 #include "integration/parity/qwen4exp/Qwen4ExpSourceAdmissionEvidence.h"
 #include "integration/parity/qwen4exp/Qwen4ExpGPUAdaptiveParityCases.h"
@@ -25,6 +26,7 @@
 #include "execution/moe/MoEOverlayDeviceControllerTopology.h"
 #include "execution/moe/MoEOverlayCapacityAdmission.h"
 #include "integration/parity/ModelParityRuntimeExport.h"
+#include "integration/parity/qwen4exp/Qwen4ExpOrdinaryGenerationWorkload.h"
 #include "integration/parity/ParityHardwareRequirements.h"
 #include "config/ConfigValidator.h"
 #include "app/RuntimeInitPhase.h"
@@ -42,9 +44,11 @@
 #include <map>
 #include <set>
 #include <tuple>
+#include <unistd.h>
 
 namespace llaminar2::test::parity::qwen4exp
 {
+
 namespace
 {
 /**
@@ -106,6 +110,62 @@ void expectSourcePipeline(const OrchestrationConfig &config, const ModelParityCa
     EXPECT_EQ(next_layer, 48);
 }
 } // namespace
+
+/** @test Combined local cache intent survives typed and public projection, including engaged C0. */
+TEST(Qwen4ExpSourceAdmissionCases, LocalHotCacheProjectionRetainsAllCapsAndPolicy)
+{
+    for(const auto* seeds:{&qwen4ExpSharedCoordinatorTP2AdaptiveSourceAdmissionSeeds(),
+                          &qwen4ExpSharedCoordinatorCUDATP2AdaptiveSourceAdmissionSeeds()})
+        for(const auto& original:*seeds)
+            for(const std::uint64_t slots:{0u,64u}) {
+                auto cell=original;
+                auto& local=cell.ngram_table_policy->gpu_adaptive.local_hot_cache;
+                local=AdaptiveGPULocalHotCacheRequest{
+                    .maximum_cache_rows=slots,.cache_physical_byte_limit=slots?std::size_t{1}<<20:0,
+                    .policy={.aging_accesses=17,.protected_numerator=2,.protected_denominator=3}};
+                const auto native=cell.makeOrchestrationConfig(cell.model.model_path,0);
+                const auto parsed=sourcePublicConfig(cell);
+                EXPECT_EQ(native.ngram_table_policy,*cell.ngram_table_policy);
+                EXPECT_EQ(parsed.ngram_table_policy,*cell.ngram_table_policy);
+                EXPECT_TRUE(ConfigValidator::createStandard().validateToStrings(parsed).empty());
+                EXPECT_NE(cell.testName(),original.testName());
+                const auto originalArgs=modelParityNgramStorageArguments(original);
+                EXPECT_EQ(std::find(originalArgs.begin(),originalArgs.end(),"--ngram-local-cache-max-rows"),originalArgs.end());
+            }
+}
+
+/** @test Every local policy scalar/override affects matrix identity; argv export cannot silently lose overrides. */
+TEST(Qwen4ExpSourceAdmissionCases, LocalHotCacheIdentityDistinguishesEveryPolicyAndOverride)
+{
+    auto base=qwen4ExpSharedCoordinatorTP2AdaptiveSourceAdmissionSeeds().front();
+    const auto unchanged=base.testName();
+    std::set<std::string> names{unchanged};
+    const AdaptiveGPULocalHotCacheRequest original{};
+    for(int field=0;field<10;++field) {
+        auto cell=base;
+        auto& local=cell.ngram_table_policy->gpu_adaptive.local_hot_cache;
+        local=original;
+        switch(field) {
+        case 0: break; // Engaged C0 is not absent/shared-only.
+        case 1: local->maximum_cache_rows=1;break;
+        case 2: local->cache_physical_byte_limit=1;break;
+        case 3: local->policy.aging_accesses=17;break;
+        case 4: local->policy.protected_numerator=0;break;
+        case 5: local->policy.protected_denominator=7;break;
+        case 6: local->consumer_overrides={{{0,DeviceType::ROCm,0},0,0}};break;
+        case 7: local->consumer_overrides={{{0,DeviceType::ROCm,1},0,0}};break;
+        case 8: local->consumer_overrides={{{0,DeviceType::ROCm,0},1,0}};break;
+        case 9: local->consumer_overrides={{{0,DeviceType::ROCm,0},0,1}};break;
+        }
+        cell.ngram_table_policy->validate();
+        EXPECT_TRUE(names.insert(cell.testName()).second)<<field;
+        if(!local->consumer_overrides.empty()) {
+            EXPECT_EQ(cell.makeOrchestrationConfig(cell.model.model_path,0).ngram_table_policy,*cell.ngram_table_policy);
+            EXPECT_THROW(modelParityNgramStorageArguments(cell),std::invalid_argument);
+        }
+    }
+    EXPECT_EQ(base.testName(),unchanged);
+}
 
 /** @test Declared dynamic depth survives fixture/runtime/CLI projection independently of graph capacity. */
 TEST(Qwen4ExpSourceAdmissionCases, DeclaredDynamicCeilingMatchesFixtureRuntimeAndPublicArguments)
@@ -1903,6 +1963,32 @@ TEST(Qwen4ExpSourceAdmissionCases, CPUJointExactStartupPreservesHostWideGPUAndEx
 } // namespace llaminar2::test::parity::qwen4exp
 
 namespace llaminar2::test::parity::qwen4exp {
+/** @test Independent consumer sources receive the same real cold recreation obligation on every GPU count. */
+TEST(Qwen4ExpSourceAdmissionCases, ConsumerLocalRecreationRetainsOriginalGPUOwners) {
+    EXPECT_FALSE(qwen4ExpSourceReusesContinuationOwners(nullptr));
+    const auto resource=[](DeviceId device){return PhysicalMemoryResource{0,device,1ull<<30,1ull<<29};};
+    for(const auto type:{DeviceType::CUDA,DeviceType::ROCm})
+    for(const auto count:{1,2,4,8})
+    for(const auto backing:{AdaptiveImmutableRowBacking::RAM,AdaptiveImmutableRowBacking::SSD}) {
+        std::vector<PhysicalMemoryResource> consumers;
+        for(int ordinal=0;ordinal<count;++ordinal)consumers.push_back(resource({type,ordinal}));
+        ImmutableRowTablePolicy policy{.storage=ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD};
+        policy.gpu_adaptive.source_backing=backing;
+        policy.gpu_adaptive.maximum_gpu_cache_rows=64;
+        policy.gpu_adaptive.gpu_cache_physical_byte_limit=1u<<20;
+        const auto input=ImmutableRowTablePlacementInput::forConsumers(
+            ImmutableRowTableExtent::fromNative(static_cast<GGUFTensorType>(0),128,64),resource(DeviceId::cpu()),consumers);
+        const std::vector<std::size_t> slots(count,32);
+        const auto placement=llaminar2::test::Qwen4ExpReplicatedPLECohortReplayAccess::declaration(
+            input.gpuAdaptiveLayout(policy,slots,0,16),policy.gpu_adaptive,16);
+        EXPECT_EQ(placement->consumers().size(),static_cast<std::size_t>(count));
+        EXPECT_TRUE(qwen4ExpSourceReusesContinuationOwners(placement.get()));
+        EXPECT_FALSE(qwen4ExpSourceReusesSharedContinuationOwners(placement.get()));
+        EXPECT_EQ(placement->gpuAdaptiveRequest().source_backing,backing);
+        EXPECT_EQ(placement->gpuAdaptiveRequest().placement.mode,AdaptiveGPUCachePlacementMode::ConsumerLocal);
+    }
+}
+
 /** @test Actual CPU follower absence and checked GPU ownership select only original reuse cases. */
 TEST(Qwen4ExpSourceAdmissionCases, SharedContinuationReuseEligibilityPreservesFollowerAndOwnerRoles) {
     using namespace llaminar2;
@@ -1929,6 +2015,7 @@ TEST(Qwen4ExpSourceAdmissionCases, SharedContinuationReuseEligibilityPreservesFo
         const auto placement=llaminar2::test::Qwen4ExpReplicatedPLECohortReplayAccess::declaration(
             input.gpuAdaptiveLayout(policy,slots,0,16),policy.gpu_adaptive,16);
         EXPECT_EQ(qwen4ExpSourceReusesSharedContinuationOwners(placement.get()),!remote);
+        EXPECT_EQ(qwen4ExpSourceReusesContinuationOwners(placement.get()),!remote);
     }
 }
 
@@ -2448,4 +2535,559 @@ TEST(Qwen4ExpSourceAdmissionCases,PooledCurrentDemandMTPPreservesOriginalSeeds)
  for(const auto& seed:seeds){EXPECT_EQ(seed.mtp,ModelParityMTP::Off);EXPECT_EQ(seed.retained_mtp_draft_capacity,0);}
 }
 
+}
+
+namespace llaminar2::test::parity::qwen4exp {
+/** @test Combined C0 is a lossless bounded projection of the original ROCm2 RAM owner-subset cell. */
+TEST(Qwen4ExpSourceAdmissionCases, CombinedLocalHotC0CandidatesRetainOriginalRequests)
+{
+    const auto candidates=qwen4ExpCombinedLocalHotC0Cases();ASSERT_EQ(candidates.size(),2u);
+    const auto original=qwen4ExpOwnerSubsetExecutionCases(ModelParityExpertOverlayPolicy{});
+    std::set<ModelParityMTP> modes;
+    for(const auto& cell:candidates) {
+        ASSERT_TRUE(cell.ngram_table_policy);const auto& request=cell.ngram_table_policy->gpu_adaptive;
+        ASSERT_TRUE(request.local_hot_cache);
+        EXPECT_EQ(request.local_hot_cache->maximum_cache_rows,0u);
+        EXPECT_EQ(request.local_hot_cache->cache_physical_byte_limit,0u);
+        EXPECT_TRUE(request.local_hot_cache->consumer_overrides.empty());
+        EXPECT_EQ(request.source_backing,AdaptiveImmutableRowBacking::RAM);
+        EXPECT_EQ(request.placement.mode,AdaptiveGPUCachePlacementMode::DeclaredRankLocal);
+        ASSERT_EQ(request.placement.owners.size(),1u);
+        EXPECT_EQ(request.placement.owners.front().participant.device(),DeviceId::rocm(1));
+        EXPECT_EQ(cell.retained_mtp_draft_capacity,3);
+        EXPECT_EQ(cell.expert_overlay,std::optional{ModelParityExpertOverlayPolicy{}});
+        EXPECT_TRUE(modes.insert(cell.mtp).second);
+        auto normalized=cell;
+        normalized.ngram_table_policy->gpu_adaptive.local_hot_cache.reset();
+        const std::string suffix="_CombinedLocalHotC0Candidate";
+        ASSERT_TRUE(normalized.topology.test_id.ends_with(suffix));
+        normalized.topology.test_id.resize(normalized.topology.test_id.size()-suffix.size());
+        const auto found=std::find_if(original.begin(),original.end(),[&](const auto& old){return old.testName()==normalized.testName();});
+        ASSERT_NE(found,original.end());
+        EXPECT_EQ(::testing::PrintToString(normalized),::testing::PrintToString(*found));
+        const auto native=cell.makeOrchestrationConfig(cell.model.model_path,0);
+        const auto parsed=sourcePublicConfig(cell);
+        EXPECT_EQ(native.ngram_table_policy,*cell.ngram_table_policy);
+        EXPECT_EQ(parsed.ngram_table_policy,*cell.ngram_table_policy);
+        EXPECT_TRUE(ConfigValidator::createStandard().validateToStrings(parsed).empty());
+    }
+    EXPECT_EQ(modes,(std::set<ModelParityMTP>{ModelParityMTP::Off,ModelParityMTP::Depth1}));
+    const auto ordinary=qwen4ExpCombinedLocalHotC0OrdinaryCases();ASSERT_EQ(ordinary.size(),1u);
+    const auto exact=qwen4ExpCombinedLocalHotC0ExactCases();ASSERT_EQ(exact.size(),1u);
+    EXPECT_EQ(ordinary.front().mtp,ModelParityMTP::Off);EXPECT_EQ(exact.front().mtp,ModelParityMTP::Depth1);
+}
+
+}
+
+namespace llaminar2::test::parity::qwen4exp {
+/** @test Five optional-cap comparisons retain exact original source/numerical/retained policies. */
+TEST(Qwen4ExpSourceAdmissionCases, LocalHotBudgetProfilesPreserveOriginalModelAndDistinctHierarchies)
+{
+    const auto originals=qwen4ExpCombinedLocalHotC0Cases();
+    const auto candidates=qwen4ExpLocalHotBudgetCases();ASSERT_EQ(candidates.size(),10u);
+    EXPECT_EQ(qwen4ExpLocalHotBudgetOrdinaryCases().size(),5u);EXPECT_EQ(qwen4ExpLocalHotBudgetExactCases().size(),5u);
+    std::set<std::string> names;std::size_t consumerLocal=0,sharedOnly=0,combined=0,zeroPositive=0,unequal=0;
+    for(const auto& cell:candidates) {
+        EXPECT_TRUE(names.insert(cell.testName()).second);
+        const auto found=std::find_if(originals.begin(),originals.end(),[&](const auto& original){return original.mtp==cell.mtp;});ASSERT_NE(found,originals.end());
+        auto restored=cell;restored.ngram_table_policy=found->ngram_table_policy;restored.topology.test_id=found->topology.test_id;
+        EXPECT_EQ(::testing::PrintToString(restored),::testing::PrintToString(*found));
+        const auto consumers=qwen4ExpLocalHotOriginalConsumers(cell);const auto& g=cell.ngram_table_policy->gpu_adaptive;
+        std::size_t total=0;
+        if(g.placement.mode==AdaptiveGPUCachePlacementMode::ConsumerLocal) {
+            ++consumerLocal;EXPECT_FALSE(g.local_hot_cache);EXPECT_TRUE(g.placement.owners.empty());
+            total=g.gpu_cache_physical_byte_limit*consumers.size();
+        } else {
+            EXPECT_EQ(g.placement.mode,AdaptiveGPUCachePlacementMode::DeclaredRankLocal);
+            EXPECT_EQ(g.placement.coordinator,found->ngram_table_policy->gpu_adaptive.placement.coordinator);
+            ASSERT_EQ(g.placement.owners.size(),found->ngram_table_policy->gpu_adaptive.placement.owners.size());
+            for(std::size_t i=0;i<g.placement.owners.size();++i) {
+                EXPECT_EQ(g.placement.owners[i].participant,found->ngram_table_policy->gpu_adaptive.placement.owners[i].participant);
+                total+=g.placement.owners[i].cache_physical_byte_limit;
+            }
+            if(!g.local_hot_cache)++sharedOnly;
+            else {
+                ++combined;g.local_hot_cache->requireConsumers(consumers);EXPECT_EQ(g.local_hot_cache->policy,g.gpu_policy);
+                std::set<std::size_t> limits;
+                for(const auto& consumer:consumers){const auto request=g.local_hot_cache->ceilingsFor(consumer);limits.insert(request.cache_physical_byte_limit);total+=request.cache_physical_byte_limit;}
+                if(limits.size()>1){++unequal;if(limits.contains(0))++zeroPositive;}
+            }
+        }
+        EXPECT_EQ(total,std::size_t{128}<<20); // Optional ceilings only; mandatory native footprints are deliberately separate.
+        EXPECT_EQ(cell.ngram_table_policy->gpu_adaptive.source_backing,AdaptiveImmutableRowBacking::RAM);
+        EXPECT_TRUE(ConfigValidator::createStandard().validateToStrings(cell.makeOrchestrationConfig(cell.model.model_path,0)).empty());
+    }
+    EXPECT_EQ(consumerLocal,2u);EXPECT_EQ(sharedOnly,2u);EXPECT_EQ(combined,6u);EXPECT_EQ(unequal,4u);EXPECT_EQ(zeroPositive,2u);
+}
+/** @test Unequal and zero/positive requests use the actual lossless public document and preserve every consumer. */
+TEST(Qwen4ExpSourceAdmissionCases, LocalHotBudgetLosslessRuntimeDocumentUsesPublicParser)
+{
+    std::size_t documents=0;
+    for(const auto& cell:qwen4ExpLocalHotBudgetCases()) {
+        const auto record=nlohmann::json::parse(::testing::PrintToString(cell));
+        if(modelParityRuntimeRepresentation(cell)==ModelParityRuntimeRepresentation::Arguments) {
+            EXPECT_TRUE(record["runtime"].contains("server_args"));EXPECT_FALSE(record["runtime"].contains("configuration_document"));
+            EXPECT_EQ(sourcePublicConfig(cell).ngram_table_policy,*cell.ngram_table_policy);continue;
+        }
+        ++documents;EXPECT_THROW(modelParityServerArguments(cell),std::invalid_argument);
+        EXPECT_THROW(modelParityNgramStorageArguments(cell),std::invalid_argument);
+        ASSERT_FALSE(record["runtime"].contains("server_args"));
+        const auto& benchmark=record["diagnostic_benchmark"];
+        ASSERT_FALSE(benchmark.is_null());EXPECT_FALSE(benchmark.contains("args"));
+        EXPECT_EQ(benchmark["configuration_policy"],"lossless_declared_document_v1");
+        EXPECT_EQ(benchmark["configuration_document"],record["runtime"]["configuration_document"]);
+        EXPECT_EQ(record["runtime"]["configuration_policy"],"lossless_declared_document_v1");
+        const auto document=record["runtime"]["configuration_document"].dump();
+        const auto restored=deserializeOrchestrationConfig(document);EXPECT_EQ(restored.ngram_table_policy,*cell.ngram_table_policy);
+        const auto path=std::filesystem::temp_directory_path()/("qfn-lossless-local-cache-"+std::to_string(::getpid())+"-"+std::to_string(documents)+".json");
+        struct Remove {std::filesystem::path path;~Remove(){std::error_code ignored;std::filesystem::remove(path,ignored);}} remove{path};
+        {std::ofstream out(path);ASSERT_TRUE(out);out<<document;ASSERT_TRUE(out.good());}
+        std::vector<std::string> args{"llaminar2","--config",path.string()};std::vector<char*> argv;for(auto& arg:args)argv.push_back(arg.data());
+        const auto parsed=OrchestrationConfigParser{}.parseArgs(int(argv.size()),argv.data());
+        EXPECT_EQ(parsed.ngram_table_policy,*cell.ngram_table_policy);EXPECT_EQ(parsed.model_path,cell.model.model_path);
+        ASSERT_TRUE(parsed.shared_predictor);EXPECT_EQ(parsed.shared_predictor->path(),cell.model.shared_predictor->path());
+        EXPECT_EQ(parsed.mtp.draft_tokens,cell.makeOrchestrationConfig(cell.model.model_path,0).mtp.draft_tokens);
+        EXPECT_EQ(parsed.mtp.graph_capacity_draft_tokens,3);EXPECT_EQ(parsed.mtp.verify_mode,modelParityHttpMTPVerifyMode());
+        EXPECT_TRUE(ConfigValidator::createStandard().validateToStrings(parsed).empty());
+    }
+    EXPECT_EQ(documents,4u);
+}
+/** @test Consumer identity and cap swaps cannot reuse another candidate or an equal scalar projection. */
+TEST(Qwen4ExpSourceAdmissionCases, LocalHotBudgetIdentityRetainsUnequalConsumersAndZeroArm)
+{
+    const auto original=qwen4ExpCombinedLocalHotC0Cases().front();
+    auto cell=qwen4ExpLocalHotBudgetCase(original,Qwen4ExpLocalHotBudgetProfile::CombinedUnequal);
+    const auto name=cell.testName();const auto runtime=modelParityServerConfiguration(cell);
+    ASSERT_TRUE(runtime.ngram_table_policy.gpu_adaptive.local_hot_cache);
+    auto& overrides=cell.ngram_table_policy->gpu_adaptive.local_hot_cache->consumer_overrides;
+    ASSERT_GE(overrides.size(),2u);std::swap(overrides.front().cache_physical_byte_limit,overrides.back().cache_physical_byte_limit);
+    EXPECT_NE(cell.testName(),name);EXPECT_NE(cell.ngram_table_policy,runtime.ngram_table_policy);
+    const auto zero=qwen4ExpLocalHotBudgetCase(original,Qwen4ExpLocalHotBudgetProfile::CombinedZeroPositive);
+    EXPECT_NE(zero.testName(),name);EXPECT_NE(zero.testName(),original.testName());
+    auto bad=*zero.ngram_table_policy->gpu_adaptive.local_hot_cache;
+    bad.consumer_overrides.push_back(bad.consumer_overrides.front());EXPECT_THROW(bad.validate(),std::invalid_argument);
+    bad=*zero.ngram_table_policy->gpu_adaptive.local_hot_cache;bad.consumer_overrides.front().participant.ordinal=std::numeric_limits<int>::max();
+    EXPECT_THROW(bad.requireConsumers(qwen4ExpLocalHotOriginalConsumers(zero)),std::invalid_argument);
+}
+}
+
+namespace llaminar2::test::parity::qwen4exp {
+/** @test The deliberate recurrent subset adds six requests without expanding initial or benchmark policy products. */
+TEST(Qwen4ExpSourceAdmissionCases, LocalHotRecurrentMembershipPreservesOriginalR3Policies)
+{
+    const auto cases=qwen4ExpLocalHotRecurrentCases();
+    ASSERT_EQ(cases.size(),6u);
+    EXPECT_EQ(qwen4ExpCombinedLocalHotC0Cases().size(),2u);
+    EXPECT_EQ(qwen4ExpLocalHotBudgetCases().size(),10u);
+    EXPECT_EQ(qwen4ExpLocalHotBudgetOrdinaryCases().size(),5u);
+    EXPECT_EQ(qwen4ExpLocalHotBudgetExactCases().size(),5u);
+    const auto original=qwen4ExpOwnerSubsetExecutionCases(ModelParityExpertOverlayPolicy{});
+    std::set<std::string> identities;
+    std::map<ModelParityMTP,std::size_t> modes;
+    for(const auto& cell:cases)
+    {
+        EXPECT_TRUE(identities.insert(cell.testName()).second);
+        EXPECT_TRUE(cell.mtp==ModelParityMTP::Depth3 || cell.mtp==ModelParityMTP::DynamicDepth);
+        ++modes[cell.mtp];
+        EXPECT_EQ(cell.retained_mtp_draft_capacity,3);
+        EXPECT_EQ(cell.model.maximum_mtp_draft_depth,3);
+        EXPECT_EQ(cell.model.shared_predictor,std::optional{SharedPredictorGGUFSource{std::string(kPredictorModelPath)}});
+        EXPECT_EQ(cell.expert_overlay,std::optional{ModelParityExpertOverlayPolicy{}});
+        const auto& gpu=cell.ngram_table_policy->gpu_adaptive;
+        EXPECT_EQ(gpu.source_backing,AdaptiveImmutableRowBacking::RAM);
+        EXPECT_EQ(gpu.placement.mode,AdaptiveGPUCachePlacementMode::DeclaredRankLocal);
+        ASSERT_TRUE(gpu.local_hot_cache);
+        const auto seed=std::find_if(original.begin(),original.end(),[&](const auto& value){
+            return value.mtp==cell.mtp && cell.topology.test_id.starts_with(value.topology.test_id+"_");});
+        ASSERT_NE(seed,original.end());
+        auto restored=cell;
+        restored.ngram_table_policy=seed->ngram_table_policy;
+        restored.topology.test_id=seed->topology.test_id;
+        EXPECT_EQ(::testing::PrintToString(restored),::testing::PrintToString(*seed));
+        EXPECT_EQ(cell.makeOrchestrationConfig(cell.model.model_path,0).ngram_table_policy,*cell.ngram_table_policy);
+    }
+    EXPECT_EQ(modes[ModelParityMTP::Depth3],3u);
+    EXPECT_EQ(modes[ModelParityMTP::DynamicDepth],3u);
+    EXPECT_THROW(qwen4ExpCombinedLocalHotC0CasesForMTP({}),std::invalid_argument);
+    EXPECT_THROW(qwen4ExpCombinedLocalHotC0CasesForMTP({ModelParityMTP::Depth3,ModelParityMTP::Depth3}),std::invalid_argument);
+    EXPECT_THROW(qwen4ExpCombinedLocalHotC0CasesForMTP({static_cast<ModelParityMTP>(255)}),std::invalid_argument);
+}
+/** @test Lossless configuration preserves recurrent MTP and exact unequal consumer ceilings through the public parser. */
+TEST(Qwen4ExpSourceAdmissionCases, LocalHotRecurrentLosslessRuntimePreservesOriginalMTP)
+{
+    std::size_t documents=0;
+    for(const auto& cell:qwen4ExpLocalHotRecurrentCases())
+    {
+        const auto expected=modelParityServerConfiguration(cell);
+        const auto record=nlohmann::json::parse(::testing::PrintToString(cell));
+        const auto parsed=[&]{
+            if(modelParityRuntimeRepresentation(cell)==ModelParityRuntimeRepresentation::Arguments)
+                return sourcePublicConfig(cell);
+            ++documents;
+            EXPECT_THROW(modelParityServerArguments(cell),std::invalid_argument);
+            EXPECT_FALSE(record["runtime"].contains("server_args"));
+            EXPECT_EQ(record["runtime"]["configuration_policy"],"lossless_declared_document_v1");
+            const auto serialized=record["runtime"]["configuration_document"].dump();
+            const auto path=std::filesystem::temp_directory_path()/("qfn-recurrent-local-cache-"+std::to_string(::getpid())+"-"+std::to_string(documents)+".json");
+            struct Remove {std::filesystem::path path;~Remove(){std::error_code ignored;std::filesystem::remove(path,ignored);}} remove{path};
+            {std::ofstream out(path);if(!out)throw std::runtime_error("Cannot write immutable recurrent config fixture");out<<serialized;}
+            std::vector<std::string> args{"llaminar2","--config",path.string()};
+            std::vector<char*> argv;for(auto& arg:args)argv.push_back(arg.data());
+            return OrchestrationConfigParser{}.parseArgs(int(argv.size()),argv.data());
+        }();
+        EXPECT_EQ(parsed.ngram_table_policy,expected.ngram_table_policy);
+        EXPECT_EQ(nlohmann::json::parse(serializeOrchestrationConfig(parsed)).at("configuration").at("mtp"),
+                  nlohmann::json::parse(serializeOrchestrationConfig(expected)).at("configuration").at("mtp"));
+        EXPECT_EQ(parsed.mtp.graph_capacity_draft_tokens,3);
+        EXPECT_EQ(parsed.mtp.verify_mode,modelParityHttpMTPVerifyMode());
+        EXPECT_EQ(parsed.model_path,expected.model_path);
+        EXPECT_EQ(parsed.shared_predictor,expected.shared_predictor);
+        EXPECT_TRUE(ConfigValidator::createStandard().validateToStrings(parsed).empty());
+        auto changed=cell;
+        changed.mtp=cell.mtp==ModelParityMTP::Depth3?ModelParityMTP::DynamicDepth:ModelParityMTP::Depth3;
+        EXPECT_NE(changed.testName(),cell.testName());
+    }
+    EXPECT_EQ(documents,2u);
+}
+}
+
+namespace llaminar2::test::parity::qwen4exp {
+/** @test Generic original-seed selection preserves CUDA source/roles and the unchanged ROCm families. */
+TEST(Qwen4ExpSourceAdmissionCases, CUDALocalHotCandidatesPreserveOriginalSourceAndConfiguration)
+{
+    const auto cases=qwen4ExpCUDALocalHotCases();
+    ASSERT_EQ(cases.size(),4u);
+    EXPECT_EQ(qwen4ExpCUDALocalHotOrdinaryCases().size(),2u);
+    EXPECT_EQ(qwen4ExpCUDALocalHotExactCases().size(),2u);
+    EXPECT_EQ(qwen4ExpCombinedLocalHotC0Cases().size(),2u);
+    EXPECT_EQ(qwen4ExpLocalHotBudgetCases().size(),10u);
+    EXPECT_EQ(qwen4ExpLocalHotRecurrentCases().size(),6u);
+    const auto originals=qwen4ExpOwnerSubsetExecutionCases(ModelParityExpertOverlayPolicy{});
+    std::set<std::string> names;
+    std::map<ModelParityMTP,std::size_t> modes;
+    std::size_t c0=0,equal=0;
+    for (const auto& cell:cases)
+    {
+        EXPECT_TRUE(names.insert(cell.testName()).second);
+        ++modes[cell.mtp];
+        const auto original=std::find_if(originals.begin(),originals.end(),[&](const auto& value){
+            return value.mtp==cell.mtp && cell.topology.test_id.starts_with(value.topology.test_id+"_");});
+        ASSERT_NE(original,originals.end());
+        auto restored=cell;
+        restored.topology.test_id=original->topology.test_id;
+        restored.ngram_table_policy=original->ngram_table_policy;
+        EXPECT_EQ(::testing::PrintToString(restored),::testing::PrintToString(*original));
+        const auto& g=cell.ngram_table_policy->gpu_adaptive;
+        EXPECT_EQ(g.source_backing,AdaptiveImmutableRowBacking::RAM);
+        ASSERT_EQ(g.placement.owners.size(),1u);
+        EXPECT_EQ(g.placement.owners.front().participant.device(),DeviceId::cuda(1));
+        ASSERT_TRUE(g.placement.coordinator);
+        EXPECT_EQ(g.placement.coordinator->device(),DeviceId::cuda(0));
+        ASSERT_TRUE(g.local_hot_cache);
+        std::size_t optional=0;
+        for(const auto& owner:g.placement.owners)optional+=owner.cache_physical_byte_limit;
+        for(const auto& consumer:qwen4ExpLocalHotOriginalConsumers(cell))
+            optional+=g.local_hot_cache->ceilingsFor(consumer).cache_physical_byte_limit;
+        if(cell.topology.test_id.ends_with("_CombinedLocalHotC0Candidate"))
+        {
+            ++c0;EXPECT_EQ(optional,0u);
+            EXPECT_EQ(g.placement.owners.front().maximum_cache_rows,0u);
+        }
+        else {++equal;EXPECT_EQ(optional,std::size_t{128}<<20);}
+        const auto parsed=sourcePublicConfig(cell);
+        EXPECT_EQ(parsed.ngram_table_policy,*cell.ngram_table_policy);
+        EXPECT_EQ(parsed.mtp.graph_capacity_draft_tokens,3);
+        EXPECT_EQ(parsed.mtp.draft_tokens,cell.makeOrchestrationConfig(cell.model.model_path,0).mtp.draft_tokens);
+        EXPECT_TRUE(ConfigValidator::createStandard().validateToStrings(parsed).empty());
+    }
+    EXPECT_EQ(c0,2u);EXPECT_EQ(equal,2u);
+    EXPECT_EQ(modes[ModelParityMTP::Off],2u);EXPECT_EQ(modes[ModelParityMTP::Depth1],2u);
+    EXPECT_THROW(qwen4ExpCombinedLocalHotC0CasesFromOriginalSeed(
+        {Qwen4ExpHardwareTarget::CUDA2,0,AdaptiveImmutableRowBacking::RAM,
+         Qwen4ExpOwnerSubsetCachePressure::Positive,ModelParityExpertMovement::Static},
+        {ModelParityMTP::Depth1}),std::logic_error);
+    EXPECT_THROW(qwen4ExpCombinedLocalHotC0CasesFromOriginalSeed(
+        {Qwen4ExpHardwareTarget::CUDA2,2,AdaptiveImmutableRowBacking::RAM,
+         Qwen4ExpOwnerSubsetCachePressure::Positive,ModelParityExpertMovement::Dynamic},
+        {ModelParityMTP::Depth1}),std::invalid_argument);
+}
+}
+
+namespace llaminar2::test::parity::qwen4exp {
+/** @test The actual source-factory policy accepts original Q6 ownership, preserving CPU controls and native-only errors. */
+TEST(Qwen4ExpSourceAdmissionCases, OriginalHostedSourceUsesActualMixedGPUContract)
+{
+    using Policy=llaminar2::qwen4exp::PooledImmutableParticipantExecutionPolicy;
+    const auto definition=qwen4ExpAllGPUQ6MTPDefinition();
+    const auto original=resolveMoEExpertOverlayExecutionPlan(definition.topology.expert_overlay_plan,
+        {.current_world_rank=0,.world_size=1});
+    ASSERT_EQ(original.world_size,1);
+    ASSERT_TRUE(original.current_rank.ownsTransactionAuthority());
+    ASSERT_EQ(original.generationExecutionDomain(),DeviceGenerationExecutionDomain::HostedBoundary);
+    for(const auto& domain:original.domains)for(const auto& participant:domain.participants)
+        ASSERT_TRUE(participant.local_device.is_gpu());
+    for(int repeat=0;repeat<20;++repeat)
+    {
+        EXPECT_NO_THROW(Policy::requireHostedSourceExecution(original));
+        auto foreign=original;foreign.world_size=2;
+        EXPECT_THROW(Policy::requireHostedSourceExecution(foreign),std::invalid_argument);
+        foreign=original;foreign.current_rank.execution_kind=OverlayRankExecutionKind::RelayOnly;
+        EXPECT_THROW(Policy::requireHostedSourceExecution(foreign),std::invalid_argument);
+        foreign=original;foreign.domains.pop_back();
+        EXPECT_THROW(Policy::requireHostedSourceExecution(foreign),std::invalid_argument);
+    }
+    const auto legacy=qwen4ExpCombinedLocalHotC0Cases().front().topology.expert_overlay_plan;
+    const auto control=resolveMoEExpertOverlayExecutionPlan(legacy,{.current_world_rank=0,.world_size=1});
+    EXPECT_NO_THROW(Policy::requireHostedSourceExecution(control));
+}
+}
+
+namespace llaminar2::test::parity::qwen4exp {
+/** @test The combined Q6 projection preserves the actual GPU-only parent, follower subset and original movement policy. */
+TEST(Qwen4ExpSourceAdmissionCases, AllGPUQ6LocalHotCandidatesPreserveOriginalOwnerAndRuntimeContracts)
+{
+    const auto cases=qwen4ExpAllGPUQ6LocalHotCases();ASSERT_EQ(cases.size(),4u);
+    EXPECT_EQ(qwen4ExpAllGPUQ6LocalHotOrdinaryCases().size(),2u);
+    EXPECT_EQ(qwen4ExpAllGPUQ6LocalHotExactCases().size(),2u);
+    const auto& originals=qwen4ExpAllGPUQ6MTPNativeExactCases();
+    const auto fixed=std::find_if(originals.begin(),originals.end(),[](const auto& cell){return cell.mtp==ModelParityMTP::Depth1;});
+    ASSERT_NE(fixed,originals.end());std::set<std::string> names;std::size_t zero=0,positive=0;
+    for(const auto& cell:cases)
+    {
+        EXPECT_TRUE(names.insert(cell.testName()).second);
+        auto restored=cell;restored.topology.test_id=fixed->topology.test_id;
+        restored.ngram_table_policy=fixed->ngram_table_policy;restored.mtp=fixed->mtp;
+        EXPECT_EQ(::testing::PrintToString(restored),::testing::PrintToString(*fixed));
+        EXPECT_EQ(cell.retained_mtp_draft_capacity,3);
+        ASSERT_TRUE(cell.expert_overlay);EXPECT_EQ(cell.expert_overlay->movement,ModelParityExpertMovement::Dynamic);
+        const auto& plan=*cell.topology.expert_overlay_plan;
+        EXPECT_EQ(resolveMoEOverlayAuthorityExecutionKind(plan),MoEOverlayAuthorityExecutionKind::DeviceResident);
+        for(const auto& participant:cell.topology.participants)EXPECT_FALSE(participant.address.isCPU());
+        const auto resolved=resolveMoEExpertOverlayExecutionPlan(cell.topology.expert_overlay_plan,{.current_world_rank=0,.world_size=1});
+        EXPECT_NO_THROW(llaminar2::qwen4exp::PooledImmutableParticipantExecutionPolicy::requireHostedSourceExecution(resolved));
+        const auto& g=cell.ngram_table_policy->gpu_adaptive;EXPECT_EQ(g.source_backing,AdaptiveImmutableRowBacking::RAM);
+        ASSERT_TRUE(g.local_hot_cache);ASSERT_EQ(g.placement.owners.size(),2u);
+        EXPECT_EQ(g.placement.owners[0].participant.device(),DeviceId::rocm(0));
+        EXPECT_EQ(g.placement.owners[1].participant.device(),DeviceId::rocm(2));
+        const auto consumers=qwen4ExpLocalHotOriginalConsumers(cell);
+        std::size_t bytes=0;for(const auto& owner:g.placement.owners)bytes+=owner.cache_physical_byte_limit;
+        for(const auto& consumer:consumers)bytes+=g.local_hot_cache->ceilingsFor(consumer).cache_physical_byte_limit;
+        if(cell.topology.test_id.ends_with("_CombinedLocalHotC0Candidate")){++zero;EXPECT_EQ(bytes,0u);}
+        else {++positive;EXPECT_EQ(bytes,std::size_t{128}<<20);}
+        const auto config=sourcePublicConfig(cell);
+        EXPECT_EQ(config.ngram_table_policy,*cell.ngram_table_policy);
+        EXPECT_EQ(config.mtp.graph_capacity_draft_tokens,3);
+        EXPECT_EQ(config.moe_routed_expert_plan->residency_policy,RoutedExpertResidencyPolicy::RoutedTierRebalanced);
+        EXPECT_TRUE(ConfigValidator::createStandard().validateToStrings(config).empty());
+    }
+    EXPECT_EQ(zero,2u);EXPECT_EQ(positive,2u);
+}
+}
+
+namespace llaminar2::test::parity::qwen4exp {
+/** @test SSD candidates preserve original bounded backing and lossless local-only caps. */
+TEST(Qwen4ExpSourceAdmissionCases, LocalHotSSDProjectionPreservesBoundedSourceAndConsumerOwnership)
+{
+    const auto cases = qwen4ExpLocalHotSSDCases();
+    ASSERT_EQ(cases.size(), 4u);
+    EXPECT_EQ(qwen4ExpLocalHotSSDOrdinaryCases().size(), 2u);
+    EXPECT_EQ(qwen4ExpLocalHotSSDExactCases().size(), 2u);
+    std::set<std::string> identities;
+    for (const auto& cell : cases)
+    {
+        EXPECT_TRUE(identities.insert(cell.testName()).second);
+        const auto& policy = *cell.ngram_table_policy;
+        const auto& gpu = policy.gpu_adaptive;
+        EXPECT_EQ(gpu.source_backing, AdaptiveImmutableRowBacking::SSD);
+        EXPECT_GT(policy.window_bytes, 0u);
+        EXPECT_GT(policy.window_count, 0u);
+        const auto consumers = qwen4ExpLocalHotOriginalConsumers(cell);
+        ASSERT_EQ(consumers.size(), 2u);
+        ASSERT_TRUE(gpu.local_hot_cache);
+        gpu.local_hot_cache->requireConsumers(consumers);
+        EXPECT_EQ(gpu.local_hot_cache->ceilingsFor(consumers.front()).cache_physical_byte_limit, 0u);
+        EXPECT_EQ(gpu.local_hot_cache->ceilingsFor(consumers.back()).cache_physical_byte_limit, std::size_t{64} << 20);
+        ASSERT_EQ(gpu.placement.owners.size(), 1u);
+        EXPECT_EQ(gpu.placement.owners.front().participant, consumers.front());
+        EXPECT_EQ(gpu.placement.owners.front().cache_physical_byte_limit, std::size_t{64} << 20);
+        const auto target = consumers.front().backend == DeviceType::ROCm
+            ? Qwen4ExpHardwareTarget::ROCm2 : Qwen4ExpHardwareTarget::CUDA2;
+        const auto pressure = target == Qwen4ExpHardwareTarget::ROCm2
+            ? Qwen4ExpOwnerSubsetCachePressure::Positive : Qwen4ExpOwnerSubsetCachePressure::Zero;
+        const auto originals = qwen4ExpCombinedLocalHotC0CasesFromOriginalSeed(
+            {target, 1, AdaptiveImmutableRowBacking::SSD, pressure, ModelParityExpertMovement::Static},
+            {ModelParityMTP::Off, ModelParityMTP::Depth1});
+        const auto original = std::find_if(originals.begin(), originals.end(),
+            [&](const auto& value) { return value.mtp == cell.mtp; });
+        ASSERT_NE(original, originals.end());
+        auto restored = cell;
+        restored.ngram_table_policy = original->ngram_table_policy;
+        restored.topology.test_id = original->topology.test_id;
+        EXPECT_EQ(::testing::PrintToString(restored), ::testing::PrintToString(*original));
+        EXPECT_EQ(policy.window_bytes, original->ngram_table_policy->window_bytes);
+        EXPECT_EQ(policy.window_count, original->ngram_table_policy->window_count);
+        EXPECT_EQ(gpu.host, original->ngram_table_policy->gpu_adaptive.host);
+        const auto exported = nlohmann::json::parse(::testing::PrintToString(cell));
+        ASSERT_TRUE(exported["runtime"].contains("configuration_document"));
+        const auto parsed = deserializeOrchestrationConfig(exported["runtime"]["configuration_document"].dump());
+        EXPECT_EQ(parsed.ngram_table_policy, policy);
+        EXPECT_TRUE(ConfigValidator::createStandard().validateToStrings(parsed).empty());
+    }
+}
+}
+
+#include "integration/parity/qwen4exp/Qwen4ExpLocalPairedCases.h"
+namespace llaminar2::test::parity::qwen4exp {
+/** @test Explicit caps change only authored optional ceilings and retain numerical admission. */
+TEST(Qwen4ExpSourceAdmissionCases, LocalHotExplicitBudgetCandidatesPreserveOriginalPolicies)
+{
+    const auto cells = qwen4ExpLocalHotMeasuredBudgetCandidates();
+    ASSERT_EQ(cells.size(), 2u);
+    const auto seed = qwen4ExpCombinedLocalHotC0CasesForMTP({ModelParityMTP::Off}).front();
+    const std::array profiles{Qwen4ExpLocalHotBudgetProfile::ConsumerLocal,
+        Qwen4ExpLocalHotBudgetProfile::CombinedEqual};
+    for (std::size_t index = 0; index < cells.size(); ++index)
+    {
+        const auto& cell = cells[index];
+        const auto original = qwen4ExpLocalHotBudgetCase(seed, profiles[index]);
+        auto restored = cell;
+        restored.topology.test_id = original.topology.test_id;
+        auto& restored_gpu = restored.ngram_table_policy->gpu_adaptive;
+        const auto& original_gpu = original.ngram_table_policy->gpu_adaptive;
+        if (index == 0)
+            restored_gpu.gpu_cache_physical_byte_limit = original_gpu.gpu_cache_physical_byte_limit;
+        else
+        {
+            ASSERT_EQ(restored_gpu.placement.owners.size(), 1u);
+            restored_gpu.placement.owners.front().cache_physical_byte_limit =
+                original_gpu.placement.owners.front().cache_physical_byte_limit;
+            restored_gpu.local_hot_cache->cache_physical_byte_limit =
+                original_gpu.local_hot_cache->cache_physical_byte_limit;
+        }
+        EXPECT_EQ(::testing::PrintToString(restored), ::testing::PrintToString(original));
+        EXPECT_EQ(cell.mtp, ModelParityMTP::Off);
+        EXPECT_EQ(cell.ngram_table_policy->gpu_adaptive.source_backing, AdaptiveImmutableRowBacking::RAM);
+        EXPECT_EQ(cell.testName().find("MatchedOptional"), std::string::npos);
+        EXPECT_NE(cell.testName().find("Candidate"), std::string::npos);
+        EXPECT_NE(cell.testName().find("AuthoredOptionalBudgets"), std::string::npos);
+        const auto record = nlohmann::json::parse(::testing::PrintToString(cell));
+        EXPECT_EQ(sourcePublicConfig(cell).ngram_table_policy, *cell.ngram_table_policy);
+        EXPECT_TRUE(ConfigValidator::createStandard().validateToStrings(
+            cell.makeOrchestrationConfig(cell.model.model_path, 0)).empty());
+        const auto id = qfnLocalPairedCellId("Qwen4ExpLocalHotMeasuredBudgetNumerical", cell);
+        EXPECT_EQ(id, "Qwen4ExpLocalHotMeasuredBudgetNumerical/Qwen4ExpLocalHotNumericalTest.ProductionParity/" + cell.testName());
+        EXPECT_THROW(qfnRequireLocalHotNumericalBinding(cell), std::invalid_argument);
+    }
+    const auto& consumer = cells[0].ngram_table_policy->gpu_adaptive;
+    EXPECT_EQ(consumer.gpu_cache_physical_byte_limit, 104697856u);
+    EXPECT_FALSE(consumer.local_hot_cache);
+    const auto& combined = cells[1].ngram_table_policy->gpu_adaptive;
+    EXPECT_EQ(combined.placement.owners.front().cache_physical_byte_limit, 71344128u);
+    EXPECT_EQ(combined.local_hot_cache->cache_physical_byte_limit, 35672064u);
+    EXPECT_EQ(qwen4ExpLocalHotBudgetCases().size(), 10u);
+    EXPECT_THROW(qwen4ExpLocalHotBudgetCase(seed, profiles[0],
+        (Qwen4ExpLocalHotExplicitOptionalBudgets{1, 2})), std::invalid_argument);
+    EXPECT_THROW(qwen4ExpLocalHotBudgetCase(seed, Qwen4ExpLocalHotBudgetProfile::SharedOnly,
+        (Qwen4ExpLocalHotExplicitOptionalBudgets{1, 2})), std::invalid_argument);
+    EXPECT_THROW(qwen4ExpLocalHotBudgetCase(seed, Qwen4ExpLocalHotBudgetProfile::CombinedUnequal,
+        (Qwen4ExpLocalHotExplicitOptionalBudgets{1, 2})), std::invalid_argument);
+}
+/** @brief Dynamic public generation consumes the original sustained declaration; static stays short. */
+TEST(Qwen4ExpSourceAdmissionCases, OrdinaryGenerationBindsDeclaredMovementHorizonAndInput)
+{
+    const std::vector<int32_t> checkpoint{7,11,13};
+    SamplingParams short_sampling;
+    short_sampling.temperature=0;short_sampling.top_k=1;short_sampling.top_p=1;short_sampling.seed=19;
+    auto dynamic=qwen4ExpAllGPUQ6LocalHotOrdinaryCases().front();
+    ASSERT_TRUE(dynamic.requiresPhysicalExpertMovement());
+    const auto original=::testing::PrintToString(dynamic);
+    unsigned encodes=0;
+    const auto encoder=[&](const auto& messages,bool add,const std::string& tools,bool thinking){
+        ++encodes;EXPECT_TRUE(add);EXPECT_TRUE(tools.empty());EXPECT_FALSE(thinking);
+        EXPECT_EQ(messages.size(),2u);
+        EXPECT_EQ(messages[0].role,"system");EXPECT_EQ(messages[0].content,dynamic.model.generation_prompt.system());
+        EXPECT_EQ(messages[1].role,"user");EXPECT_EQ(messages[1].content,dynamic.model.generation_prompt.user());
+        return std::vector<int>{21,22,23,24};
+    };
+    const auto workload=Qwen4ExpOrdinaryGenerationWorkload::fromOriginalCase(dynamic,checkpoint,short_sampling,encoder);
+    EXPECT_EQ(encodes,1u);EXPECT_TRUE(workload.sustained());EXPECT_EQ(workload.originalCase(),dynamic.testName());
+    const auto first=workload.request(Qwen4ExpOrdinaryRequestPhase::First);
+    const auto reuse=workload.request(Qwen4ExpOrdinaryRequestPhase::Reuse);
+    EXPECT_EQ(first.tokens,(std::vector<int32_t>{21,22,23,24}));EXPECT_EQ(first.tokens,reuse.tokens);
+    EXPECT_EQ(first.maximum_tokens,dynamic.generation_workload.maximumTokens());
+    EXPECT_EQ(first.minimum_tokens,dynamic.generation_workload.minimumTokens());
+    EXPECT_EQ(first.maximum_tokens,384);EXPECT_EQ(reuse.maximum_tokens,first.maximum_tokens);
+    EXPECT_EQ(reuse.minimum_tokens,first.minimum_tokens);EXPECT_EQ(first.sampling,reuse.sampling);
+    EXPECT_FLOAT_EQ(first.sampling.temperature,float(kModelParityGenerationTemperature));
+    EXPECT_EQ(first.sampling.top_k,kModelParityGenerationTopK);
+    EXPECT_FLOAT_EQ(first.sampling.top_p,float(kModelParityGenerationTopP));
+    EXPECT_EQ(first.sampling.seed,dynamic.model.generation_seed.value());
+    EXPECT_EQ(::testing::PrintToString(dynamic),original);
+    const auto exported=nlohmann::json::parse(original);
+    const auto& request=exported.at("runtime").at("generation").at("requests")[0].at("body");
+    EXPECT_EQ(request.at("max_tokens"),first.maximum_tokens);
+    EXPECT_EQ(request.at("messages")[0].at("content"),dynamic.model.generation_prompt.system());
+    EXPECT_EQ(request.at("messages")[1].at("content"),dynamic.model.generation_prompt.user());
+    EXPECT_EQ(request.at("seed"),first.sampling.seed);
+    EXPECT_DOUBLE_EQ(request.at("temperature").get<double>(),kModelParityGenerationTemperature);
+    EXPECT_EQ(request.at("top_k"),first.sampling.top_k);
+    EXPECT_DOUBLE_EQ(request.at("top_p").get<double>(),kModelParityGenerationTopP);
+
+    auto statics=qwen4ExpLocalHotBudgetCases();
+    const auto found=std::find_if(statics.begin(),statics.end(),[](const auto& cell){return cell.mtp==ModelParityMTP::Off;});
+    ASSERT_NE(found,statics.end());ASSERT_FALSE(found->requiresPhysicalExpertMovement());
+    const auto static_original=::testing::PrintToString(*found);
+    const auto short_workload=Qwen4ExpOrdinaryGenerationWorkload::fromOriginalCase(*found,checkpoint,short_sampling,encoder);
+    EXPECT_FALSE(short_workload.sustained());EXPECT_EQ(encodes,1u);
+    const auto short_first=short_workload.request(Qwen4ExpOrdinaryRequestPhase::First);
+    const auto short_reuse=short_workload.request(Qwen4ExpOrdinaryRequestPhase::Reuse);
+    EXPECT_EQ(short_first.tokens,checkpoint);EXPECT_EQ(short_first.sampling,short_sampling);
+    EXPECT_EQ(short_first.maximum_tokens,3);EXPECT_EQ(short_first.minimum_tokens,3);
+    EXPECT_EQ(short_reuse.maximum_tokens,2);EXPECT_EQ(short_reuse.minimum_tokens,2);
+    EXPECT_EQ(::testing::PrintToString(*found),static_original);
+
+    dynamic.generation_workload=ModelParityGenerationWorkload(512,384);
+    const auto longer=Qwen4ExpOrdinaryGenerationWorkload::fromOriginalCase(dynamic,checkpoint,short_sampling,encoder);
+    EXPECT_EQ(longer.request(Qwen4ExpOrdinaryRequestPhase::First).maximum_tokens,512);
+    EXPECT_EQ(longer.request(Qwen4ExpOrdinaryRequestPhase::Reuse).minimum_tokens,384);
+    EXPECT_THROW(workload.request(static_cast<Qwen4ExpOrdinaryRequestPhase>(9)),std::invalid_argument);
+    EXPECT_THROW(Qwen4ExpOrdinaryGenerationWorkload::fromOriginalCase(dynamic,checkpoint,short_sampling,
+        [](const auto&,bool,const auto&,bool){return std::vector<int>{};}),std::invalid_argument);
+    dynamic.mtp=ModelParityMTP::Depth1;
+    EXPECT_THROW(Qwen4ExpOrdinaryGenerationWorkload::fromOriginalCase(dynamic,checkpoint,short_sampling,encoder),std::invalid_argument);
+}
+
+}
+
+namespace llaminar2::test::parity::qwen4exp {
+/** @test Refinement changes only exact optional caps and preserves prior candidates/paired guards. */
+TEST(Qwen4ExpSourceAdmissionCases, LocalHotRefinedBudgetPreservesMeasuredPolicies)
+{
+    const auto refined = qwen4ExpLocalHotRefinedBudgetCandidates();
+    ASSERT_EQ(refined.size(), 1u);
+    const auto previous = qwen4ExpLocalHotMeasuredBudgetCandidates();
+    ASSERT_EQ(previous.size(), 2u);
+    EXPECT_EQ(previous[0].ngram_table_policy->gpu_adaptive.gpu_cache_physical_byte_limit, 104697856u);
+    auto restored = refined.front();
+    auto& gpu = restored.ngram_table_policy->gpu_adaptive;
+    EXPECT_EQ(gpu.placement.owners.front().cache_physical_byte_limit, 70432384u);
+    EXPECT_EQ(gpu.local_hot_cache->cache_physical_byte_limit, 35216192u);
+    EXPECT_EQ(gpu.placement.owners.front().cache_physical_byte_limit,
+        2 * gpu.local_hot_cache->cache_physical_byte_limit);
+    gpu.placement.owners.front().cache_physical_byte_limit =
+        previous[1].ngram_table_policy->gpu_adaptive.placement.owners.front().cache_physical_byte_limit;
+    gpu.local_hot_cache->cache_physical_byte_limit =
+        previous[1].ngram_table_policy->gpu_adaptive.local_hot_cache->cache_physical_byte_limit;
+    restored.topology.test_id = previous[1].topology.test_id;
+    EXPECT_EQ(::testing::PrintToString(restored), ::testing::PrintToString(previous[1]));
+    EXPECT_EQ(qwen4ExpLocalHotBudgetCases().size(), 10u);
+    EXPECT_EQ(qwen4ExpLocalHotNumericalCases().size(), 6u);
+    const auto key = qfnLocalPairedCellId("Qwen4ExpLocalHotRefinedBudgetNumerical", refined.front());
+    EXPECT_EQ(key, "Qwen4ExpLocalHotRefinedBudgetNumerical/Qwen4ExpLocalHotNumericalTest.ProductionParity/" + refined.front().testName());
+    auto deliberately_unbound = refined.front();
+    deliberately_unbound.paired_workload.reset();
+    EXPECT_THROW(qfnRequireLocalHotNumericalBinding(deliberately_unbound), std::invalid_argument);
+    EXPECT_TRUE(ConfigValidator::createStandard().validateToStrings(
+        refined.front().makeOrchestrationConfig(refined.front().model.model_path, 0)).empty());
+}
 }

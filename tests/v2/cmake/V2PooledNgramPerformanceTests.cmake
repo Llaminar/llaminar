@@ -3,6 +3,23 @@
 # The same actual pooled fixture serves correctness and explicit Release timing.
 # Include before canonical process-entry finalization; root owns the top-level include.
 if(NOT V2_PERF_TESTS_ONLY)
+    add_v2_test(V2_Integration_PooledNgramFinalPMACostEvidence
+        COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
+            --gtest_filter=PhysicalMemoryAuthority.FinalCostEvidence* --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Ngram;Memory;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledNgramFinalPMACostEvidence)
+    # The existing canonical model-case policies include the same snapshot
+    # declarations used by source admission; this adds no runtime model input.
+    target_include_directories(v2_test_memory_planner PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../external/cnpy")
+    add_v2_test(V2_Integration_PooledNgramMatchedPhysicalBudget
+        COMMAND $<TARGET_FILE:v2_test_memory_planner>
+            --gtest_filter=GPUAdaptiveImmutableLookupAdmission.CanonicalPooledReplayMatchesCompletePhysicalBudgets
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Ngram;Planning;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledNgramMatchedPhysicalBudget)
     add_executable(v2_test_pooled_ngram_replay_trace
         unit/kernels/qwen4exp/Test__PooledNgramReplayTrace.cpp)
     target_include_directories(v2_test_pooled_ngram_replay_trace PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -17,6 +34,40 @@ if(NOT V2_PERF_TESTS_ONLY)
         LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Ngram;TraceReplay;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledNgramReplayTrace)
+    # Actual saved QFN inputs stay external. These fast controls validate
+    # provenance/lifecycle/terminal arithmetic, never simulate cache residency.
+    add_v2_test(V2_Unit_PooledNgramRealTraceContract
+        COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_qfn_ngram_trace.py
+        LABELS "V2;Unit;CPU;DeviceFree;Ngram;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    add_v2_test(V2_Integration_PooledNgramRealTraceContract
+        COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_qfn_ngram_trace.py
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Ngram;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledNgramRealTraceContract)
+    # Production startup commonly leaves seed=-1. Campaign metadata must reject
+    # that unspecified law or bind an explicitly authored reproducible cohort.
+    add_v2_test(V2_Integration_PooledNgramCampaignSeedContract
+        COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_qfn_ngram_trace.py
+            QFNNgramTraceContract.test_campaign_seed_requires_a_reproducible_public_cohort
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Ngram;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledNgramCampaignSeedContract)
+    # Real trace geometry uses the same exact parser boundary as physical reference reads.
+    add_v2_test(V2_Integration_PooledNgramNativeSourceExtent
+        COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../python/reference/tests/test_gguf_parser.py
+            TestGGUFNativePayloadExtent.test_iq4_nl_160_rows_exclude_trailing_file_bytes
+            TestGGUFNativePayloadExtent.test_qwen_selected_rows_keep_original_native_bytes
+            TestGGUFNativePayloadExtent.test_supported_native_formats_keep_their_exact_extents
+            TestGGUFNativePayloadExtent.test_unknown_native_format_cannot_borrow_fp16_bytes
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Ngram;Reference;GGUF;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "OMP_NUM_THREADS=1;OMP_DYNAMIC=false;OPENBLAS_NUM_THREADS=1;MKL_NUM_THREADS=1;CUDA_VISIBLE_DEVICES=;HIP_VISIBLE_DEVICES=;ROCR_VISIBLE_DEVICES=")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledNgramNativeSourceExtent)
 endif()
 if(HAVE_CUDA OR HAVE_ROCM)
     add_executable(v2_perf_pooled_ngram_lookup
@@ -206,4 +257,14 @@ if(TARGET v2_perf_pooled_ngram_lookup)
             endforeach()
         endif()
     endforeach()
+endif()
+
+if(TARGET v2_test_physical_memory_authority)
+    add_v2_test(V2_Integration_PooledNgramSourceTerminalCostWitness
+        COMMAND $<TARGET_FILE:v2_test_physical_memory_authority>
+            --gtest_filter=PhysicalMemoryAuthority.SourceSubsetAndTerminalRequireCompleteFinalOwner --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Ngram;Ownership;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledNgramSourceTerminalCostWitness)
 endif()

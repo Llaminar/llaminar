@@ -757,6 +757,21 @@ namespace llaminar2
         {(void)siblings;return false;}
 
         /**
+         * @brief Fork a finite body after one exact imported main fragment.
+         * @param producer Original graph-only fragment imported exactly once by this parent's ordered timeline.
+         * @param body Original same-device finite auxiliary definition, not an executable or alias.
+         * @return True after the auxiliary entry depends on that imported exit frontier.
+         * Later main units remain independent of auxiliary completion. The
+         * auxiliary becomes another parent terminal, so final native retirement
+         * joins it. No event, live counter or replay-time host work is added.
+         * Wrong-parent, reset, foreign, ambiguous and duplicate definitions
+         * reject before mutation; native failure after mutation invalidates the parent.
+         */
+        [[nodiscard]] virtual bool appendFiniteBodyAfterCapturedFragment(
+            const IGPUGraphCapture& producer, const IGPUGraphCapture& body)
+        {(void)producer;(void)body;return false;}
+
+        /**
          * @brief Consume completed per-step timings without waiting on the GPU.
          *
          * Backends return `Pending` while the terminal event is incomplete.

@@ -25,7 +25,7 @@
 
 namespace llaminar2
 {
-namespace qwen4exp {class PooledImmutableRetainedParticipants;}
+namespace qwen4exp {class PooledImmutableRetainedParticipants;class PooledImmutableLocalHotPreparedStorage;}
 
     class HostImmutableRowProvider;
     class ImmutableLookupSetupObservation;
@@ -166,6 +166,14 @@ namespace qwen4exp {class PooledImmutableRetainedParticipants;}
 
         /** @return Original source-owned remote participant domain, absent only when this layout has no remote owners. */
         virtual std::shared_ptr<qwen4exp::PooledImmutableRetainedParticipants> adaptiveImmutableLookupParticipants(DeviceId) const { return {}; }
+
+        /**
+         * @brief Borrow this actual compute participant's separately admitted immutable hot rows.
+         * @param device Original consumer endpoint; ownership-only followers have no local hot cache.
+         * @return Same model-lifetime roots, including a mandatory C0 frame; absent for shared-only policy.
+         * @note Presence does not imply a hit or grant a source role. The captured transaction owns pins.
+         */
+        virtual std::shared_ptr<qwen4exp::PooledImmutableLocalHotPreparedStorage> adaptiveImmutableLookupLocalHot(DeviceId) const { return {}; }
 
         /** @return Historical admitted lookup capacities after complete original setup, never live occupancy. */
         virtual std::shared_ptr<const ImmutableLookupSetupObservation> immutableLookupSetupObservation()const {return {};}

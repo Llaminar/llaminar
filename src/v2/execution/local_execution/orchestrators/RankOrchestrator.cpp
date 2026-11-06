@@ -13013,24 +13013,64 @@ namespace llaminar2
             return false;
         }
 
-        /*
-         * Every participant that may publish mirrored KV, recurrent, or
-         * response state owns an independent resident ledger.  Admitting only
-         * the final sampler would leave earlier pipeline/TP participants with
-         * an unbounded publication authority and make cross-device equality an
-         * accident of host scheduling.
-         */
-        for (size_t participant = 0; participant < participants.size(); ++participant)
+        // Admission may enqueue original peer setup/header publications. Every
+        // participant must enter before any host joins its enqueue completion;
+        // a full prefix hit can reach this boundary without a preceding forward.
+        // The same original source attempt retains rollback until ALL callbacks
+        // have drained, exactly as for main-forward and parent preparation.
+        for (const auto& participant : participants)
+            if (!participant)
+                throw std::logic_error("Device-generation admission has an absent original participant");
+        if (participants.size() == 1)
         {
-            if (!participants[participant] ||
-                !participants[participant]
-                     ->beginDeviceResidentGeneration(
-                         request))
+            if (!participants.front()->beginDeviceResidentGeneration(request)) return false;
+        }
+        else
+        {
+            if (!tp_worker_pool_)
             {
-                LOG_ERROR("[RankOrchestrator] Device-resident generation admission failed on participant "
-                          << participant);
-                return false;
+                tp_worker_pool_ = makeParticipantWorkerPool(participants);
+                if (tp_ctx_)
+                    tp_worker_pool_->setFailureCallback([this]() {
+                        LOG_WARN("[TPWorkerPool] Device-generation admission failure detected - aborting collective backend");
+                        tp_ctx_->requestAbort();
+                    });
             }
+            if (tp_worker_pool_->numWorkers() != participants.size())
+                throw std::logic_error("Device-generation admission changed its original participant worker roster");
+            const auto kernel_phase = KernelProfiler::getCurrentPhase();
+            const auto rocm_phase = ROCmKernelProfiler::getCurrentPhase();
+            const auto cuda_phase = CUDAKernelProfiler::getCurrentPhase();
+            const auto kv_phase = KVCacheProfiler::getCurrentPhase();
+            const auto executor_phase = GraphExecutorStats::currentPhase();
+            tp_worker_pool_->dispatch([this, request, kernel_phase, rocm_phase,
+                cuda_phase, kv_phase, executor_phase](size_t i) -> bool {
+                KernelProfiler::setCurrentPhase(kernel_phase);
+                ROCmKernelProfiler::setCurrentPhase(rocm_phase);
+                CUDAKernelProfiler::setCurrentPhase(cuda_phase);
+                KVCacheProfiler::setCurrentPhase(kv_phase);
+                GraphExecutorStats::setCurrentPhase(executor_phase);
+                const auto device = device_runners_.at(i)->primaryDeviceId();
+                ROCmKernelProfiler::setCurrentDevice(device.ordinal);
+                CUDAKernelProfiler::setCurrentDevice(device.ordinal);
+                return device_runners_[i]->beginDeviceResidentGeneration(request);
+            });
+            const int timeout_ms = effectiveTPWorkerJoinTimeoutMs();
+            const auto results = tp_worker_pool_->collectAll(timeout_ms);
+            bool success = results.size() == participants.size();
+            bool incomplete = false;
+            std::exception_ptr first_exception;
+            for (const auto& result : results)
+            {
+                incomplete = incomplete || !result.completed;
+                success = success && result.completed && result.success;
+                if (result.exception && !first_exception) first_exception = result.exception;
+            }
+            if (incomplete && timeout_ms > 0)
+                abortAfterTPWorkerTimeout("beginDeviceResidentGeneration",timeout_ms,
+                    tp_worker_pool_->completedCount(),tp_worker_pool_->numWorkers());
+            if (first_exception) std::rethrow_exception(first_exception);
+            if (!success) return false;
         }
         source_attempt.keep=true;
         admitted_device_generation_max_new_tokens_ = request.max_new_tokens;

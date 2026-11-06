@@ -14,6 +14,7 @@
 #ifdef HAVE_ROCM
 
 #include "../IGPUGraphCapture.h"
+#include "../NativeParallelGraphBranch.h"
 #include "../GPUProjectionSubmission.h"
 #include <hip/hip_runtime.h>
 #include <optional>
@@ -69,6 +70,9 @@ namespace llaminar2
         consumeOrderedTimelineTiming() override;
         /** @copydoc IGPUGraphCapture::appendFiniteBodySiblings */
         bool appendFiniteBodySiblings(std::span<const IGPUGraphCapture* const> siblings)override;
+        /** @copydoc IGPUGraphCapture::appendFiniteBodyAfterCapturedFragment */
+        [[nodiscard]] bool appendFiniteBodyAfterCapturedFragment(
+            const IGPUGraphCapture& producer, const IGPUGraphCapture& body) override;
         /** @copydoc IGPUGraphCapture::appendParallelBranch */
         [[nodiscard]] bool appendParallelBranch(
             const GPUCapturedParallelBranch &branch) override;
@@ -103,6 +107,17 @@ namespace llaminar2
         int deviceOrdinal() const noexcept { return device_ordinal_; }
 
     private:
+
+        /** Unique cold recording lifetime, invalidated by reset/re-recording. */
+        mutable std::shared_ptr<const void> definition_scope_;
+        /** @return This exact cold native definition lifetime, created before its first import. */
+        const std::shared_ptr<const void>& definitionScope() const
+        {
+            if(!definition_scope_)definition_scope_=std::make_shared<const std::byte>();
+            return definition_scope_;
+        }
+        /** Exact original fragment exits in THIS composed parent, not live inference state. */
+        detail::NativeCapturedFragmentFrontiers<hipGraph_t,hipGraphNode_t> fragment_frontiers_;
         /** @brief Select the immutable HIP owner before a runtime operation. */
         bool activateOwner(const char *operation) const noexcept;
         /**

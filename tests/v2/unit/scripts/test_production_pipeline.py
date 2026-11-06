@@ -1753,10 +1753,146 @@ class PrerequisiteEntrypointTests(unittest.TestCase):
 
 
 class BenchmarkPolicyTests(unittest.TestCase):
+    @staticmethod
+    def _focused_panel_fixture():
+        """Producer-shaped metadata only; no model/native result is claimed by this fixture."""
+        record = {'diagnostic_benchmark': dict(schema=1,policy='diagnostic_declared',
+            certification_eligible=False,context_length=4096,args=['--no-mtp']),
+            'paired_workload': {'accuracy': {'policy':'initial_absolute_pilot'}}}
+        workload = dict(schema=1,prompt_unit=' test',prompt_repetitions=512,decode_tokens=256,
+            warmup_iterations=1,measurement_iterations=3)
+        cell = dict(complete=True,passed=True,observations_complete=True,native_retired=True,
+            returncode=0,driver_window_clean=True,reset_byte_equal=True)
+        panel = dict(schema=2,mode='local_paired_focused_diagnostic',complete=True,passed=None,
+            diagnostic_passed=True,observations_complete=True,status='DIAGNOSTIC_PANEL_COMPLETE',
+            accuracy_verdict='REQUIRED_GROUPS_GREEN',verdict='DIAGNOSTIC_REQUIRED_GROUPS_GREEN',
+            certification_eligible=False,full_preflight=False,calibrated=False,whole_corpus_accepted=False,
+            scope='selected_topology_required_groups_only',
+            prerequisites=dict(available=True,mode='focused_DeviceFree_diagnostic',full_preflight=False,
+                native_backend_regressions='not_covered_by_DeviceFree_selection'),
+            paired_workload=dict(exact_cell='Exact',source_export=record),cells=[cell])
+        return panel,record,workload
+
+    def _assert_declared_focused_panel_requires_explicit_scope_and_rejects_spoofed_green(self):
+        """Focused green is usable only by the explicit diagnostic bridge, never canonical admission."""
+        panel,record,workload = self._focused_panel_fixture();before=copy.deepcopy(panel)
+        self.assertEqual(benchmark.declared_panel_eligibility(panel,'Exact',record,workload,
+            allow_focused_diagnostic=True),record['diagnostic_benchmark'])
+        self.assertEqual(panel,before);self.assertIsNone(panel['passed'])
+        with self.assertRaises(ValueError):benchmark.declared_panel_eligibility(panel,'Exact',record,workload)
+        for field,value in [('complete',False),('observations_complete',False),('diagnostic_passed',False),
+                ('diagnostic_passed',None),('accuracy_verdict','UNCALIBRATED'),('accuracy_verdict','REQUIRED_GROUPS_RED'),
+                ('verdict','GREEN'),('status','DIAGNOSTIC_PANEL_RUNNING'),('passed',True),
+                ('full_preflight',True),('certification_eligible',True)]:
+            with self.subTest(field=field,value=value):
+                bad=copy.deepcopy(panel);bad[field]=value
+                with self.assertRaises(ValueError):benchmark.declared_panel_eligibility(bad,'Exact',record,workload,allow_focused_diagnostic=True)
+        for field,value in [('available',False),('mode','complete_production_preflight'),('full_preflight',True),
+                ('native_backend_regressions','covered')]:
+            bad=copy.deepcopy(panel);bad['prerequisites'][field]=value
+            with self.assertRaises(ValueError):benchmark.declared_panel_eligibility(bad,'Exact',record,workload,allow_focused_diagnostic=True)
+        for field,value in [('exact_cell','Other'),('source_export',{})]:
+            bad=copy.deepcopy(panel);bad['paired_workload'][field]=value
+            with self.assertRaises(ValueError):benchmark.declared_panel_eligibility(bad,'Exact',record,workload,allow_focused_diagnostic=True)
+        for field in ('complete','passed','observations_complete','native_retired','driver_window_clean','reset_byte_equal'):
+            bad=copy.deepcopy(panel);bad['cells'][0][field]=False
+            with self.assertRaises(ValueError):benchmark.declared_panel_eligibility(bad,'Exact',record,workload,allow_focused_diagnostic=True)
+        bad=copy.deepcopy(panel);bad.update(mode='local_paired_canonical_accuracy',passed=True)
+        with self.assertRaises(ValueError):benchmark.declared_panel_eligibility(bad,'Exact',record,workload)
+        import model_kld_canary
+        with self.assertRaises(ValueError):model_kld_canary.validate_report(panel,source_revision='fixture',image={},
+            cpu_isa='AVX512',corpus_manifest_digest='fixture')
+        spoofed=copy.deepcopy(panel);spoofed.update(schema=1,passed=True,source_revision='fixture',image={},
+            corpus_manifest_digest='fixture',cpu_isa='AVX512',diagnostic_only=False,full_preflight=True)
+        with self.assertRaises(ValueError):model_kld_canary.validate_report(spoofed,source_revision='fixture',image={},
+            cpu_isa='AVX512',corpus_manifest_digest='fixture')
+
+    def _assert_declared_focused_scope_reuses_complete_row_and_original_pilot_evaluator(self):
+        """Actual tiny scored rows exercise original evaluator negatives, not a replacement scorer."""
+        from types import SimpleNamespace
+        from test_model_kld_corpus_v2 import manifest,observation,absolute_pilot
+        import model_kld_corpus_v2 as corpus
+        panel,_,_=self._focused_panel_fixture();m=manifest();metrics=observation(m);pilot=absolute_pilot(m)
+        selection=SimpleNamespace(corpus={'manifest':m},documents={'pilot':pilot})
+        cell=dict(metrics=metrics,native_identity=metrics['native_identity'],
+            numerical_summary=corpus.summarize(m,metrics,absolute_pilot=pilot))
+        original=copy.deepcopy(cell);scope=benchmark.declared_focused_accuracy_scope(panel,selection,cell)
+        self.assertFalse(scope['full_preflight']);self.assertFalse(scope['certification_eligible'])
+        self.assertFalse(scope['calibrated']);self.assertEqual(scope['scope'],'selected_topology_required_groups_only')
+        self.assertEqual(cell,original)
+        for change in ('missing','duplicate','reordered','foreign_source','foreign_math','red','unscored_green','wrong_native'):
+            bad=copy.deepcopy(cell)
+            if change=='missing':bad['metrics']['rows'].pop()
+            elif change=='duplicate':bad['metrics']['rows'][-1]=copy.deepcopy(bad['metrics']['rows'][0])
+            elif change=='reordered':bad['metrics']['rows'].reverse()
+            elif change=='foreign_source':bad['metrics']['source_digest']='foreign'
+            elif change=='foreign_math':bad['metrics']['arithmetic']['hc_up']='two_term_q8'
+            elif change=='red':bad['metrics']=observation(m,replacements={m['histories'][0]['id']+':prefill':[-100.,0.,0.,0.,0.,0.]})
+            elif change=='unscored_green':bad['numerical_summary']['groups']=[]
+            else:bad['native_identity']={'fixture':'another'}
+            with self.subTest(change=change),self.assertRaises(ValueError):
+                benchmark.declared_focused_accuracy_scope(panel,selection,bad)
+        with self.assertRaises(ValueError):benchmark.declared_focused_accuracy_scope(panel,
+            SimpleNamespace(corpus={'manifest':m},documents={}),cell)
+
+    def _assert_declared_focused_generated_inventory_and_list_use_original_typed_document_policy(self):
+        """Real inventory export/discover and adapter paths stop before native execution."""
+        from types import SimpleNamespace
+        from test_model_kld_corpus_execution import paired_fixture
+        from test_model_kld_corpus_v2 import observation
+        import model_parity_inventory as inventory
+        import model_kld_corpus_execution as owner
+        import gpu_driver_diagnostics as driver
+        from model_kld_corpus import metadata_digest
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);c,t,exact,record=paired_fixture(root)
+            record.update(inventory_role='numerical_diagnostic',e2e=None,cross_host_e2e=[])
+            panel,_,workload=self._focused_panel_fixture()
+            benchmark_path=root/'benchmark.json';benchmark_path.write_text(json.dumps(workload))
+            record['paired_workload']['benchmark']['profile']['sha256']=hashlib.sha256(benchmark_path.read_bytes()).hexdigest()
+            external=root/'source-owned';external.mkdir();source_manifest=external/'manifest.json'
+            (root/'manifest.json').rename(source_manifest)
+            record['paired_workload']['accuracy']['workload']['path']=str(source_manifest)
+            metrics=observation(c['manifest']);metrics['native_identity']['executable_sha256']='fixture-only'
+            summary=owner.corpus_v2.summarize(c['manifest'],metrics,absolute_pilot=json.loads((root/'pilot.json').read_text()))
+            cell={**panel['cells'][0], 'topology_id':t['id'],'metrics':metrics,'numerical_summary':summary,
+                'native_identity':metrics['native_identity'],'actual_owner':{'fixture_only':True}}
+            panel.update(cells=[cell],paired_workload=dict(exact_cell=exact,source_export=record),
+                corpus_manifest_digest=metadata_digest(c['manifest']),absolute_pilot_digest=metadata_digest(json.loads((root/'pilot.json').read_text())),
+                binary={'sha256':'fixture-only'})
+            panel_path=root/'panel.json';panel_path.write_text(json.dumps(panel))
+            cell_path=root/t['id'];cell_path.mkdir()
+            (cell_path/'described-config.json').write_text(json.dumps(dict(schema='llaminar.model-kld-described-config.v1',
+                engine_argv=t['engine_argv'],config=t['expected_config'],runtime_config_digest=t['runtime_config_digest'])))
+            (cell_path/'controller.json').write_text(json.dumps({**cell,'returncode':0}))
+            native={**metrics,'actual_owner':cell['actual_owner']}
+            (cell_path/'native-observation.json').write_text(json.dumps(native))
+            campaign=parity.CampaignCell('fixture-source',parity.CampaignGroup('CPU','ALL'),model_files=(record['model'],))
+            document=inventory.export_manifest([(campaign,exact,record)],'fixture-revision',inventory.InventoryScope.LOCAL_DIAGNOSTIC)
+            path=root/'inventory.json';path.write_text(json.dumps(document))
+            binary=root/'llaminar2';binary.write_text('not-an-executable-fixture')
+            parser=root/'llaminar_model_kld_canary';parser.write_text('not-an-executable-fixture')
+            args=argparse.Namespace(manifest=path,source_revision='fixture-revision',declared_cell=exact,diagnostic=True,
+                diagnostic_binary=binary,image=None,e2e_report=None,panel_report=panel_path,corpus_root=root,parser_binary=parser,
+                report=root/'result.json',workload=benchmark_path,list=True)
+            with patch.object(benchmark.e2e,'release_binary_cpu_isa'), \
+                 patch.object(driver,'validate_evidence'), \
+                 patch.object(owner.corpus_v2,'load_corpus',return_value=c) as load, \
+                 patch.object(benchmark,'run_declared_guardian',side_effect=AssertionError('No native launch')):
+                self.assertEqual(benchmark.run_declared_diagnostic(args),0)
+            self.assertEqual(load.call_args.kwargs['manifest_path'],source_manifest.resolve())
+            self.assertIsNone(json.loads(panel_path.read_text())['passed'])
+            with self.assertRaises(ValueError):benchmark.declared_inventory(args,binary)
+            for bad_document in ({**document,'scope':'e2e'},{**document,'source_revision':'foreign'}):
+                path.write_text(json.dumps(bad_document))
+                with self.assertRaises(ValueError):benchmark.declared_inventory(args,binary,scope=inventory.InventoryScope.LOCAL_DIAGNOSTIC)
+            path.write_text(json.dumps(document));args.declared_cell='Other'
+            with self.assertRaises(ValueError):benchmark.declared_inventory(args,binary,scope=inventory.InventoryScope.LOCAL_DIAGNOSTIC)
+
     def test_declared_benchmark_requires_exact_green_panel_and_complete_retirement(self):
         """Declared placement is eligible only after genuine same-policy numerical/terminal proof."""
         record = {"diagnostic_benchmark": {"schema": 1, "policy": "diagnostic_declared",
-            "certification_eligible": False, "args": ["--ngram-gpu-cache-placement", "consumer-local"]}}
+            "certification_eligible": False, "context_length":512, "args": ["--ngram-gpu-cache-placement", "consumer-local"]}}
         workload = dict(schema=1,prompt_unit=" test",prompt_repetitions=512,decode_tokens=256,
             warmup_iterations=1,measurement_iterations=3)
         panel = dict(mode="local_fixed_history_diagnostic",complete=True,passed=True,observations_complete=True,
@@ -1777,6 +1913,10 @@ class BenchmarkPolicyTests(unittest.TestCase):
         with self.assertRaises(ValueError):benchmark.declared_panel_eligibility(panel,"Exact",bad,workload)
         bad=copy.deepcopy(workload);bad['measurement_iterations']=2
         with self.assertRaises(ValueError):benchmark.declared_panel_eligibility(panel,"Exact",record,bad)
+        # This exact selector already owns a dedicated ProductionTestPreflight
+        # registration. Keep both strict and explicit focused modes under it.
+        self._assert_declared_focused_panel_requires_explicit_scope_and_rejects_spoofed_green()
+        self._assert_declared_focused_scope_reuses_complete_row_and_original_pilot_evaluator()
 
     @staticmethod
     def _passive_lookup_fixture(backing='RAM', shared=False, positive=True):
@@ -1831,6 +1971,82 @@ class BenchmarkPolicyTests(unittest.TestCase):
             {'layer':'0','participant':str(i),'owner_order':'ordinal','selection_layout':'contiguous'},'load',3,384)
         return {'runtime_configuration':{'configuration':config},
             'perf_stats':{'schema':'llaminar.perf_stats.v1','enabled':True,'records':records}}
+
+    def _combined_passive_fixture(self, zero_positive=False):
+        """Authored metadata replay only; no native allocation or timing is fabricated."""
+        data=self._passive_lookup_fixture(shared=True)
+        config=data['runtime_configuration']['configuration']
+        request=config['ngram_table_policy']['gpu_adaptive']
+        request['local_hot_cache']={'maximum_cache_rows':100,'cache_physical_byte_limit':4096,
+            'consumer_overrides':[]}
+        if zero_positive:
+            request['local_hot_cache']['consumer_overrides']=[{'participant':{'world_rank':0,'backend':'CUDA','ordinal':0},
+                'maximum_cache_rows':0,'cache_physical_byte_limit':0}]
+        records=data['perf_stats']['records']
+        common=next(r['tags'] for r in records if r['domain']=='immutable_lookup_setup')
+        for ordinal in range(2):
+            slots=0 if zero_positive and ordinal==0 else 2
+            for role,device in (('local_gpu_cache',f'CUDA:{ordinal}'),('local_ready','CPU')):
+                tags={**common,'role':role,'admitted_slots':str(slots if role=='local_gpu_cache' else 0),
+                    'payload_bytes':str(slots*90 if role=='local_gpu_cache' else 0),
+                    'metadata_bytes':str(64 if slots and role=='local_gpu_cache' else 0),
+                    'table_storage_bytes':str(slots*90+64 if slots and role=='local_gpu_cache' else 0),
+                    'source_storage_bytes':'0','lookup_staging_bytes':'4096',
+                    'local_consumer':f'CUDA:{ordinal}','local_storage_identity':str(100+ordinal)}
+                records.append(dict(domain='immutable_lookup_setup',name='admitted_owner',device=device,tags=tags,
+                    phase='setup',count=1,value=1,kind='counter',total_ns=0,min_ns=0,max_ns=0))
+            values=[32,16 if slots else 0,0,32,0,0,0,0,1 if slots else 0,0,0,0,0,0,0]
+            if ordinal==1:values[10:]=[8,0,88,96,0]
+            else:values[10:]=[0,90,96,0,40]
+            for window,count in (('since_original_storage_initialization',1),('between_completed_terminals',2)):
+                for index,name in enumerate(benchmark.LOCAL_TERMINAL_NAMES):
+                    records.append(dict(domain='ngram_lookup',name=name,device=f'CUDA:{ordinal}',
+                        phase='generation_terminal',kind='counter',count=count,value=values[index]*count,
+                        total_ns=0,min_ns=0,max_ns=0,sequence_word_count=count,
+                        sequence_minimum_words=[values[index]],sequence_maximum_words=[values[index]],
+                        tags={'authority':'completed_local_hot_terminal','storage_identity':str(100+ordinal),
+                            'unit':'original_l1_ids' if index<4 else 'native_rows' if index<10 else 'bytes',
+                            'wire_attribution':'receive_completed_only','window':window}))
+        return data
+
+    def test_declared_combined_passive_binds_actual_local_ready_pairs_and_storage_windows(self):
+        for zero_positive in (False,True):
+            data=self._combined_passive_fixture(zero_positive)
+            result=benchmark.validate_declared_passive_evidence(data)
+            local=result['local_hot']
+            self.assertEqual(len(local['setup']),4)
+            self.assertEqual(len(local['terminal_observations']),4)
+            self.assertEqual(sorted(r['count'] for r in local['terminal_observations']),[1,1,2,2])
+            self.assertIn('physical_budget_pairing_requires_final_original_pma_costs',local['qualification_limits'])
+            self.assertEqual(len(result['setup']),5) # Unchanged original pool/source owners only.
+
+    def test_declared_combined_passive_rejects_foreign_incomplete_or_impossible_native_work(self):
+        original=self._combined_passive_fixture()
+        cases=[]
+        def changed(predicate,mutate):
+            data=copy.deepcopy(original);mutate(next(r for r in data['perf_stats']['records'] if predicate(r)));cases.append(data)
+        is_local=lambda r:r['domain']=='ngram_lookup' and r['name'].startswith('local_')
+        changed(is_local,lambda r:r['tags'].update(storage_identity='999'))
+        changed(is_local,lambda r:r.update(sequence_word_count=0))
+        changed(is_local,lambda r:r.update(sequence_word_count=True))
+        changed(is_local,lambda r:r.update(count=2)) # Initialization is storage-once, never request-once.
+        changed(is_local,lambda r:r.update(sequence_minimum_words=[999]))
+        changed(lambda r:r.get('tags',{}).get('role')=='local_ready',lambda r:r['tags'].update(local_consumer='CUDA:9'))
+        changed(lambda r:r.get('tags',{}).get('role')=='local_ready',lambda r:r['tags'].update(local_storage_identity='999'))
+        changed(lambda r:r.get('tags',{}).get('role')=='local_gpu_cache',lambda r:r['tags'].update(payload_bytes='181'))
+        data=copy.deepcopy(original);data['perf_stats']['records'].pop();cases.append(data)
+        data=copy.deepcopy(original);data['runtime_configuration']['configuration']['ngram_table_policy']['gpu_adaptive']['local_hot_cache']=None;cases.append(data)
+        data=copy.deepcopy(original);overrides=data['runtime_configuration']['configuration']['ngram_table_policy']['gpu_adaptive']['local_hot_cache']['consumer_overrides']
+        overrides.extend([{'participant':{'world_rank':0,'backend':'CUDA','ordinal':0},'maximum_cache_rows':100,'cache_physical_byte_limit':4096}]*2);cases.append(data)
+        # Exact wire byte categories cannot be relabeled as source-self or capacity.
+        for name in ('local_request_key_payload_bytes','local_native_result_payload_bytes','local_lookup_control_header_bytes','local_acknowledgement_bytes','local_request_admission_bytes'):
+            changed(lambda r:is_local(r) and r['name']==name,lambda r:r.update(value=r['value']+1,sequence_minimum_words=[r['value']+1],sequence_maximum_words=[r['value']+1]))
+        data=self._combined_passive_fixture(True)
+        for r in data['perf_stats']['records']:
+            if r['name']=='local_hit_original_ids' and r['device']=='CUDA:0':r.update(value=r['count'],sequence_minimum_words=[1],sequence_maximum_words=[1])
+        cases.append(data)
+        for data in cases:
+            with self.assertRaises(ValueError):benchmark.validate_declared_passive_evidence(data)
 
     def test_declared_passive_environment_overrides_caller_profiling_before_startup(self):
         supplied={'PATH':'/original','HOME':'/home/original','OMP_NUM_THREADS':'56','LD_PRELOAD':'/foreign',
@@ -1942,8 +2158,8 @@ class BenchmarkPolicyTests(unittest.TestCase):
                 proofs={name: True for name in owner.corpus_v2.PROOFS})))
             selection = SimpleNamespace(topology=topology, corpus={'manifest': manifest},
                 documents={'pilot': None}, paths={'benchmark': workload_path})
-            record = {'diagnostic_benchmark': dict(schema=1, policy='diagnostic_declared',
-                certification_eligible=False, args=['--ngram-gpu-cache-placement', 'consumer-local'])}
+            record = {'model':'original.gguf','diagnostic_benchmark': dict(schema=1, policy='diagnostic_declared',
+                certification_eligible=False, context_length=4096, args=['--ngram-gpu-cache-placement', 'consumer-local'])}
             args = argparse.Namespace(diagnostic=True, diagnostic_binary=binary, image=None,
                 e2e_report=None, panel_report=panel_path, corpus_root=root, parser_binary=parser,
                 workload=workload_path, list=False, report=root / 'report.json')
@@ -2220,6 +2436,8 @@ class BenchmarkPolicyTests(unittest.TestCase):
                 parser=root/'llaminar_model_kld_canary';parser.write_text('metadata-only parser pin')
                 args.diagnostic=True;args.diagnostic_binary=binary;args.image=None;args.e2e_report=None
                 args.panel_report=root/'panel.json';args.corpus_root=root;args.parser_binary=parser
+                args.report=root/'report.json';args.list=True
+                args.panel_report.write_text(json.dumps({'mode':'local_fixed_history_diagnostic'}))
                 with patch.object(benchmark.e2e,'release_binary_cpu_isa'), \
                      patch('model_kld_corpus_execution.PairedCorpusSelection.from_export',side_effect=RuntimeError('actual ALL manifest selected')) as admitted:
                     with self.assertRaisesRegex(RuntimeError,'actual ALL manifest selected'):
@@ -2237,6 +2455,10 @@ class BenchmarkPolicyTests(unittest.TestCase):
                     benchmark.declared_inventory(args,root/'llaminar2')
                 args.manifest=root/'missing.json'
                 with self.assertRaises(FileNotFoundError):benchmark.declared_inventory(args,root/'llaminar2')
+
+        # The existing dedicated inventory preflight also exercises generated
+        # LOCAL_DIAGNOSTIC export/list without weakening its default ALL arm.
+        self._assert_declared_focused_generated_inventory_and_list_use_original_typed_document_policy()
 
     def test_cross_revision_image_is_diagnostic_only(self):
         """Historical implementations can be retimed, never silently certified."""

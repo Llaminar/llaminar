@@ -12,11 +12,15 @@
 #include "PooledImmutableRetirementAuthority.h"
 #include "PooledImmutableDirectedLookupGraph.h"
 #include "PooledImmutableReplicatedReaderGeometry.h"
+#include "PooledImmutableLocalHotGraph.h"
+#include "PooledImmutableLocalHotTransportGeometry.h"
 #include <optional>
 #include "execution/local_execution/graph/IRetainedGraphParticipants.h"
 namespace llaminar2 {struct GraphConfig; class RankOrchestrator; class MoEOverlayParticipantGraphRunner; class Qwen4ExpReplicatedPLECohort;}
 namespace llaminar2 { struct ClusterInventory; }
 namespace llaminar2::qwen4exp {
+class PooledImmutableLocalHotPreparedStorage;
+class IPooledImmutableLocalHotKernels;
 /** @brief Closed original source/owner native lifetime, shared by exclusive model graph variants. */
 class PooledImmutableRetainedParticipants final:public PooledImmutableRetirementAuthority,public IRetainedGraphParticipantEnqueueCompletion,
     public std::enable_shared_from_this<PooledImmutableRetainedParticipants> {
@@ -32,7 +36,9 @@ public:
     static std::shared_ptr<PooledImmutableRetainedParticipants> create(
         std::shared_ptr<ImmutableLookupExecutionBoundary> boundary,const GraphConfig& policy,
         std::shared_ptr<const ClusterInventory> originalInventory = {},
-        std::optional<PooledImmutableReplicatedReaderGeometry> readers = {});
+        std::optional<PooledImmutableReplicatedReaderGeometry> readers = {},
+        std::optional<PooledImmutableLocalHotTransportGeometry> localHot = {},
+        std::span<const std::shared_ptr<PooledImmutableLocalHotPreparedStorage>> localHotParticipants = {});
     /** @brief Reject active or unobserved readers before actual participant definitions or roots destruct. */
     ~PooledImmutableRetainedParticipants()noexcept override;
     /** @return Original source boundary retained by the existing directed transport. */
@@ -55,6 +61,20 @@ public:
      * composition, never kernel execution, numerical output or native terminal completion.
      */
     std::vector<ExpertOwnerParentObservation> expertOwnerParentObservations() const;
+    /** @return Exact optional combined geometry; absence retains shared-only behavior. */
+    const std::optional<PooledImmutableLocalHotTransportGeometry>& localHotGeometry()const noexcept;
+    /** @return Complete immutable local root roster supplied atomically before any graph recording. */
+    std::span<const std::shared_ptr<PooledImmutableLocalHotPreparedStorage>> localHotParticipants()const noexcept;
+    /**
+     * @brief Borrow the original colocated physical owner's native code for combined graph construction.
+     * @param device Actual declared local-cache consumer, independent of pool ownership.
+     * @return The existing InlineReader owner's code; empty for a valid consumer with no inline owner.
+     * @throws std::invalid_argument For absent combined policy or a foreign consumer.
+     * No owner, worker, source role or executable is created by this projection.
+     */
+    std::shared_ptr<const IPooledImmutableNativeKernels> localHotInlineOwnerCode(DeviceId device) const;
+    /** @return The SAME original immutable owner descriptor; this borrow creates no policy copy or source authority. */
+    const std::shared_ptr<const MoEExpertOverlayExecutionPlan>& originalExecutionPolicy() const noexcept;
     /** @return Original immutable two-channel bundle; no local-self channel exists. */
     const std::shared_ptr<const PooledImmutableDirectedTransport>& transport()const noexcept;
     /**
@@ -78,6 +98,42 @@ public:
     PooledImmutableLookupGraphEndpoints appendReader(ComputeGraph&, BufferArena&,
         DeviceGenerationControlBinding, DeviceRowRange, PooledNativeTensorSpan,
         const std::string&, const std::string&, std::optional<PooledNativeTensorSpan>);
+    /**
+     * @brief Declare the actual original source's combined local/shared PLE stages.
+     * @param graph Same source model graph; no nested or replacement graph.
+     * @param arena Original participant activation/private protocol arena.
+     * @param poolCode Existing original pool code bundle.
+     * @param local Actual same-source/PMA local roots, including C0.
+     * @param localCode Original selected local native code bundle.
+     * @param tokens Original counted model-token rows. @param ids Original UInt64 sixteen-head hash span.
+     * @param count Exact original token count producer, absent only for fixed rows.
+     * @param control Original generation error/controller root. @param output Exact FP32 model embedding.
+     * @param identity Original declaration namespace. @param outputIdentity Original model output name.
+     * @return Probe→LocalRead model-ready edges plus separately retained auxiliary retirement.
+     */
+    PooledImmutableLocalHotGraphEndpoints appendLocalHotPLE(ComputeGraph& graph,BufferArena& arena,
+        std::shared_ptr<const IPooledImmutableNativeKernels> poolCode,
+        std::shared_ptr<PooledImmutableLocalHotPreparedStorage> local,
+        std::shared_ptr<const IPooledImmutableLocalHotKernels> localCode,
+        DeviceRowRange tokens,PooledNativeTensorSpan ids,std::optional<PooledNativeTensorSpan> count,
+        DeviceGenerationControlBinding control,PooledNativeTensorSpan output,
+        const std::string& identity,const std::string& outputIdentity);
+    /**
+     * @brief Declare an actual foreign compute reader's symmetric combined stages.
+     * @param graph Original reader model graph, receiving no SourcePlan/source launch authority.
+     * @param arena Original reader arena. @param local Actual same-source/PMA local roots, including C0.
+     * @param localCode Original reader native code. @param control Original generation controller.
+     * @param tokens Original counted token rows. @param ids Original sixteen-head hash span.
+     * @param output Exact FP32 model output. @param identity Actual declaration namespace.
+     * @param outputIdentity Original model output name. @param count Exact optional token-count producer.
+     * @return Main readiness and separately sealed Reader-role auxiliary range.
+     */
+    PooledImmutableLocalHotGraphEndpoints appendLocalHotReader(ComputeGraph& graph,BufferArena& arena,
+        std::shared_ptr<PooledImmutableLocalHotPreparedStorage> local,
+        std::shared_ptr<const IPooledImmutableLocalHotKernels> localCode,
+        DeviceGenerationControlBinding control,DeviceRowRange tokens,PooledNativeTensorSpan ids,
+        PooledNativeTensorSpan output,const std::string& identity,const std::string& outputIdentity,
+        std::optional<PooledNativeTensorSpan> count);
     /** @return The exact original prepared compute/storage participant, never a newly adopted worker. */
     PreparedGPUContextUsePermit originalParticipant(DeviceId device)const;
     /** @return True only for an actual original physical owner embedded in a declared compute reader. */

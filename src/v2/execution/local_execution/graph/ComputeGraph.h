@@ -29,6 +29,13 @@
 namespace llaminar2
 {
 
+    /** @brief Select the complete DAG or only nodes executed by its main native units. */
+    enum class GraphLeafScope : uint8_t
+    {
+        All,           ///< Include the separately retained finite auxiliary body.
+        MainExecution, ///< Exclude auxiliary nodes and their outgoing dependency edges.
+    };
+
     /**
      * @brief Domain-wide identity for one participant-local capture unit.
      *
@@ -320,6 +327,27 @@ namespace llaminar2
         /** @return Original cold source associations, never a newest-token lookup. */
         const auto& retainedParticipantSourceVariants() const noexcept { return participant_source_variants_; }
 
+        /**
+         * @brief Declare one finite participant-local body beside the model timeline.
+         * @param range Actual source/reader stages and exact model-ready/retirement frontiers.
+         * @throws std::invalid_argument For incomplete, cross-device, repeated or foreign declarations.
+         * The existing parent owns this graph-only body; it is never an independent executable.
+         */
+        void setRetainedParticipantAuxiliaryRange(RetainedGraphParticipantAuxiliaryRange range);
+        /** @return Immutable auxiliary stages, absent for the ordinary shared-only path. */
+        const auto& retainedParticipantAuxiliaryRange() const noexcept { return participant_auxiliary_range_; }
+        /** @brief Revalidate the full declared range only at cold construction/capture boundaries. */
+        void requireRetainedParticipantAuxiliaryRange() const;
+        /**
+         * @brief Authenticate the original rank-local mixed-GPU native-parent declaration.
+         * @throws std::invalid_argument If the envelope, original execution ownership,
+         * participant or stage topology cannot form one complete native executable.
+         * This cold eligibility check never grants source or native storage authority.
+         */
+        void requireRetainedParticipantNativeAuxiliaryParent() const;
+        /** @return Whether a named stage belongs exclusively to the declared finite body. */
+        bool isRetainedParticipantAuxiliaryNode(const std::string& name) const noexcept;
+
         /** @return Original graph-declared source relation; no-PLE graphs have none. */
         const auto& retainedParticipantDefinitionDomain()const noexcept{return participant_definition_domain_;}
 
@@ -589,10 +617,11 @@ namespace llaminar2
         std::vector<std::string> getRootNodes() const;
 
         /**
-         * @brief Get the names of all leaf nodes (nodes with no dependents)
-         * @return Vector of leaf node names
+         * @brief Get leaf names in the selected execution projection
+         * @param scope Complete DAG by default; main decorators exclude finite auxiliary work.
+         * @return Names with no dependents inside the selected projection.
          */
-        std::vector<std::string> getLeafNodes() const;
+        std::vector<std::string> getLeafNodes(GraphLeafScope scope = GraphLeafScope::All) const;
 
         /**
          * @brief Set the terminal node name for this graph
@@ -718,6 +747,7 @@ namespace llaminar2
         std::shared_ptr<IRetainedGraphStorageBoundary> storage_boundary_;
         ReadAheadRecordingBinding read_ahead_recording_binding_; ///< Exact recording/submission lifecycle, not GPU execution state.
         std::uint64_t read_ahead_phase_identity_=0; ///< Typed phase and selected implementation, independent of M.
+        std::optional<RetainedGraphParticipantAuxiliaryRange> participant_auxiliary_range_; ///< Immutable same-parent finite body, never live cache state.
         std::optional<GraphReadAheadBranch> read_ahead_branch_; ///< Immutable native stream/event topology. ///< Explicit retained native I/O lane.
         std::optional<RetainedGraphParticipantDefinitionDomain> participant_definition_domain_;
         std::vector<std::shared_ptr<const RetainedGraphParticipantPreparationStream>> participant_source_variants_;

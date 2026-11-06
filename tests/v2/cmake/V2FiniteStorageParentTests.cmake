@@ -1,11 +1,12 @@
 # @file V2FiniteStorageParentTests.cmake
 # @brief Exact original native finite-body ownership and SDMA/progress composition replay.
 if(TARGET v2_test_compute_graph_execution)
-    foreach(_case FiniteSiblingWithoutProgressPreservesOriginalMainAndAllTerminals FiniteSiblingRejectsEmptySelfDuplicateBeforeMutation)
+    foreach(_case CapturedProducerForkDoesNotGateLaterConsumerUnit CapturedProducerMappingRejectsStaleForeignAndAmbiguousDefinitions CapturedProducerForkRejectsUnknownOrDuplicateNodesBeforeMutation FiniteSiblingWithoutProgressPreservesOriginalMainAndAllTerminals FiniteSiblingRejectsEmptySelfDuplicateBeforeMutation)
         add_v2_test(V2_Integration_FiniteStorage_${_case}Replay
             COMMAND $<TARGET_FILE:v2_test_compute_graph_execution> --gtest_filter=NativeParallelGraphBranch.${_case} --gtest_repeat=20
             LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Graph;Ownership;TraceReplay;Regression"
-            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+            ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_FiniteStorage_${_case}Replay)
     endforeach()
 endif()

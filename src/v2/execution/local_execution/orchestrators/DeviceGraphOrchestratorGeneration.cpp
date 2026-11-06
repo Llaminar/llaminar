@@ -10,6 +10,9 @@
  */
 #include "execution/qwen4exp/ImmutableLookupExecutionBoundary.h"
 #include "execution/qwen4exp/PooledImmutableRetainedParticipants.h"
+#include "execution/qwen4exp/PooledImmutableLocalHotRequestPublication.h"
+#include "kernels/qwen4exp/PooledImmutableLocalHotKernels.h"
+#include "kernels/qwen4exp/PooledImmutableLocalHotPreparedStorage.h"
 #include "models/qwen4exp/Qwen4ExpReplicatedPLECohort.h"
 #include "interfaces/IModelContext.h"
 #include "execution/local_execution/graph/IRetainedGraphParticipants.h"
@@ -183,6 +186,7 @@ void DeviceGraphOrchestrator::awaitGroupedRetainedStorageTerminal()
             !device_generation_terminal_host_ready_event_ ||
             !backend->waitForEvent(device_generation_terminal_host_ready_event_.get(), state_.device_id.ordinal))
             throw std::runtime_error("Shared reader original native terminal completion is unproven");
+        retireLocalHotRequestAdmissionAfterTerminal();
         return;
     }
     if (!boundary->requiresSourceGroupAdmission())
@@ -253,6 +257,10 @@ void DeviceGraphOrchestrator::prepareRetainedStorageBinding()
 }
 void DeviceGraphOrchestrator::retireRetainedStorageGenerationBinding()noexcept
 {
+    // The original producer and every native parent have already retired. Drop
+    // the local admission's controller borrow before the arena can be reused,
+    // including query-only readers that own no CPU source boundary.
+    retained_local_hot_admission_.reset();
     if(!retained_storage_boundary_)return;
     try{
         if(!device_generation_storage_.control_device)
@@ -278,7 +286,139 @@ bool DeviceGraphOrchestrator::beginRetainedStorageAdmission(void *stream)
         submitRetainedStoragePublication(boundary,physical_memory_authority_,state_.device_id,
             [&]{boundary->beginAdmission(session_epoch_,stream);});
     }
+    beginLocalHotRequestAdmission(stream);
     return true;
+}
+
+/** @brief Exact original request dependencies; mutable cache and source state remain on device. */
+struct DeviceGraphOrchestrator::LocalHotRequestAdmission final {
+    std::shared_ptr<qwen4exp::PooledImmutableRetainedParticipants> participants;
+    std::shared_ptr<qwen4exp::PooledImmutableLocalHotPreparedStorage> local;
+    std::shared_ptr<const qwen4exp::IPooledImmutableLocalHotKernels> code;
+    DeviceGenerationControlBinding control;
+    PreparedGPUContextUsePermit original;
+    qwen4exp::PooledImmutableLocalHotRequestPublication publication;
+
+    /** @brief Retain the actual original model/worker/controller owners before request submission. */
+    LocalHotRequestAdmission(std::shared_ptr<qwen4exp::PooledImmutableRetainedParticipants> owner,
+        std::shared_ptr<qwen4exp::PooledImmutableLocalHotPreparedStorage> storage,
+        DeviceGenerationControlBinding controller)
+        : participants(std::move(owner)), local(std::move(storage)), control(controller),
+          original(participants->originalParticipant(local->geometry().allocator().device))
+    {
+        const auto device = original.device();
+#ifdef HAVE_CUDA
+        if (device.is_cuda()) code = qwen4exp::createCUDAPooledImmutableLocalHotKernels();
+#endif
+#ifdef HAVE_ROCM
+        if (device.is_rocm()) code = qwen4exp::createROCmPooledImmutableLocalHotKernels();
+#endif
+        if (!code) throw std::invalid_argument("Local-cache request admission requires its compiled native backend");
+    }
+};
+
+std::size_t DeviceGraphOrchestrator::localHotTerminalMetadataBytes(int requests)const
+{
+    const auto placement=graph_builder_?graph_builder_->config().ngram_table_placement:nullptr;
+    if(!placement || !placement->isGPUAdaptive() || !placement->gpuAdaptiveRequest().local_hot_cache)return 0;
+    return qwen4exp::local_hot::terminalObservationBytes(requests,sampling_math::kDeviceGenerationControlCount);
+}
+void DeviceGraphOrchestrator::packLocalHotTerminalObservation(int requests,void* destination,std::size_t bytes,void* stream)
+{
+    if(!retained_local_hot_admission_ || bytes!=localHotTerminalMetadataBytes(requests))
+        throw std::logic_error("Local terminal observation has no actual admitted request/local owner");
+    auto& original=*retained_local_hot_admission_;
+    original.local->requireAuthority(physical_memory_authority_);
+    const auto output=arena_->getSharedTensor(BufferId::MTP_LOCAL_HOT_TERMINAL_OBSERVATION);
+    if(!output || output->gpu_data_ptr()!=destination)
+        throw std::logic_error("Local terminal observation changed its actual separate arena owner");
+    const auto enqueue=[&]{original.code->packTerminal(*original.local,original.control,requests,
+        qwen4exp::PooledNativeTransferSpan(output,0,bytes),stream);};
+    if(original.original.worker()->ownsCurrentThread())enqueue();
+    else original.original.worker()->submitAndWait(enqueue);
+}
+void DeviceGraphOrchestrator::publishLocalHotTerminalObservation(const void* packed,std::size_t bytes,int requests)
+{
+    if(!packed || !retained_local_hot_admission_ || bytes!=localHotTerminalMetadataBytes(requests))
+        throw std::logic_error("Local terminal observation changed its complete immutable extent");
+    qwen4exp::local_hot::TerminalObservation current;
+    std::memcpy(&current,packed,sizeof(current));
+    auto& original=*retained_local_hot_admission_;
+    const auto publication=original.local->observeCompletedTerminal(current);
+    const auto& delta=publication.delta;
+    for(unsigned i=0;i<15;++i)
+        PerfStatsCollector::addCounterWithSequence("ngram_lookup",qwen4exp::local_hot::TerminalMetricNames[i],
+            static_cast<double>(delta.values[i]),{delta.values[i]},"generation_terminal",state_.device_id.toString(),
+            {{"authority","completed_local_hot_terminal"},{"storage_identity",std::to_string(original.local->consumerStorageIdentity())},
+             {"unit",i<4?"original_l1_ids":i<10?"native_rows":"bytes"},{"wire_attribution","receive_completed_only"},
+             {"window",publication.since_storage_initialization?"since_original_storage_initialization":"between_completed_terminals"}});
+}
+
+void DeviceGraphOrchestrator::beginLocalHotRequestAdmission(void* stream)
+{
+    const auto placement = graph_builder_ ? graph_builder_->config().ngram_table_placement : nullptr;
+    const bool selected = placement && placement->isGPUAdaptive() && placement->gpuAdaptiveRequest().local_hot_cache.has_value();
+    if (!selected) {
+        if (retained_local_hot_admission_)
+            throw std::logic_error("Local-cache request admission changed its original placement policy");
+        return;
+    }
+    if (!stream || reinterpret_cast<std::uintptr_t>(stream) <= 2 || isGraphCaptureActive() ||
+        !injected_model_ctx_ || !arena_)
+        throw std::logic_error("Local-cache request admission requires its original outside-capture model/arena/stream");
+    const auto local = injected_model_ctx_->adaptiveImmutableLookupLocalHot(state_.device_id);
+    const auto participants = injected_model_ctx_->adaptiveImmutableLookupParticipants(state_.device_id);
+    if (!local || !participants || !participants->localHotGeometry() ||
+        local->originalSource() != participants->boundary()->pooledStorage())
+        throw std::logic_error("Local-cache request admission lost its original local/shared owners");
+    local->requireAuthority(physical_memory_authority_);
+    participants->requireForPolicy(graph_builder_->config());
+    const auto control = DeviceGenerationControlBinding::admit(*arena_, state_.device_id, 0);
+    if (!retained_local_hot_admission_)
+        retained_local_hot_admission_ = std::make_shared<LocalHotRequestAdmission>(participants, local, control);
+    auto& admission = *retained_local_hot_admission_;
+    const auto same = [](const auto& a, const auto& b) {
+        return a.get() == b.get() && !a.owner_before(b) && !b.owner_before(a);
+    };
+    if (!same(admission.participants, participants) || !same(admission.local, local) ||
+        admission.control.captureIdentity() != control.captureIdentity() ||
+        !same(admission.original.memory(), physical_memory_authority_))
+        throw std::logic_error("Local-cache request admission changed original storage/controller/PMA identity");
+    const auto current = GPUDeviceContextPool::instance().retainExistingContextProvenance(state_.device_id);
+    admission.original.requireWorker(current.worker());
+    if (admission.original.generation() != current.generation())
+        throw std::logic_error("Local-cache request admission changed its original prepared worker generation");
+    const auto submit = [&] {
+        if (!admission.original.worker()->ownsCurrentThread())
+            throw std::logic_error("Local-cache request admission did not enter its original participant worker");
+        const auto frame = local->roots().frame;
+        admission.publication.enter(session_epoch_, [&] {
+            // Initial storage and reset publish this exact controller root on
+            // their producer stream. Admission precedes the ordinary forward
+            // state wait, so its input edge must exist before any health read.
+            // Binding an address alone supplies no publication dependency.
+            TransferEngine::requireDeviceInput(control.owner(), state_.device_id, stream);
+        }, [&] {
+            // The source DGO has enqueued its native source admission above.
+            // Every other DGO receives that fixed grant on its own worker. The
+            // enclosing Rank submits participants together; no GPU wait occurs
+            // here. The device reset keeps warmed rows and validates retirement.
+            participants->transport()->enqueueLocalHotAdmission(local, admission.code, control, stream);
+            TransferEngine::publishDeviceWrite(frame, state_.device_id, stream);
+        }, [&] {
+            // Reuse the admitted Tensor publication event. This also orders a
+            // later prefill/condition stream without another source round trip.
+            TransferEngine::requireDeviceInput(frame.get(), state_.device_id, stream);
+        });
+    };
+    if (admission.original.worker()->ownsCurrentThread()) submit();
+    else admission.original.worker()->submitAndWait(submit);
+}
+
+void DeviceGraphOrchestrator::retireLocalHotRequestAdmissionAfterTerminal()
+{
+    if (retained_local_hot_admission_)
+        retained_local_hot_admission_->publication.retireAfterTerminal(session_epoch_);
 }
 
 std::span<const DeviceControlledLoopEntryFragment> DeviceGraphOrchestrator::retainedStorageTerminalFragments()
@@ -360,7 +500,13 @@ void DeviceGraphOrchestrator::retireRetainedStorageForRequestReset(void *stream,
 }
 void DeviceGraphOrchestrator::awaitRetainedStorageTerminal()
 {
-    if(!retained_storage_boundary_)return;
+    if(!retained_storage_boundary_) {
+        // Query-only readers still completed their original native terminal
+        // bridge. They own no CPU source interval, but their next response may
+        // legitimately reuse this session with a fresh source admission.
+        retireLocalHotRequestAdmissionAfterTerminal();
+        return;
+    }
     std::exception_ptr failure;
     try{retained_storage_boundary_->awaitTerminal();}catch(...){failure=std::current_exception();}
     // Both successful and failed workers have joined before counters become
@@ -368,6 +514,7 @@ void DeviceGraphOrchestrator::awaitRetainedStorageTerminal()
     try{retained_storage_perf_stats_.publish(retained_storage_boundary_->terminalObservation(),state_.device_id.toString());}
     catch(...){if(!failure)throw;} // Preserve a more precise terminal-lifecycle failure when no joined observation exists.
     if(failure)std::rethrow_exception(failure);
+    retireLocalHotRequestAdmissionAfterTerminal();
 }
 
 bool DeviceGraphOrchestrator::observeOrdinaryGenerationForwardCompletion(int64_t completed_invocations)

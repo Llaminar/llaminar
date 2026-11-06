@@ -68,12 +68,16 @@ TEST(PooledImmutableRetirementGraph, CohortP8LocalFirst){retirementCohortRange(8
 TEST(PooledImmutableRetirementGraph, CohortP8LocalLast){retirementCohortRange(8,4,8);}
 TEST(PooledImmutableRetirementGraph, CohortP8Remote){retirementCohortRange(8,8,9);}
 TEST(PooledImmutableRetirementGraph, MissingOutputOrIssuedReadRejectsBeforeAnyTerminalNode){
-    const PooledOriginalRecipe recipe{{2,0,3,1},true,1};PooledImmutableOriginalPrograms programs(std::vector<PooledOriginalRecipe>(4,recipe));
-    for(unsigned defect=0;defect<4;++defect){auto c=programs.make(recipe);auto read=retirementRead(c);const auto members=retirementMembers(c,read);
+    const PooledOriginalRecipe recipe{{2,0,3,1},true,1};PooledImmutableOriginalPrograms programs(std::vector<PooledOriginalRecipe>(6,recipe));
+    for(unsigned defect=0;defect<6;++defect){auto c=programs.make(recipe);auto read=retirementRead(c);const auto members=retirementMembers(c,read);
         if(defect==0)c.graph.getNode(read.output)->dependencies.clear();
         if(defect==1)c.graph.getNode(read.sealed)->dependencies={read.imported[0]};
         if(defect==2)read.owners[0]=read.owners[3];
-        if(defect==3)read.outputSpan.bytes-=160*sizeof(float);
+        if(defect==3)std::get<q::PooledNativeTensorSpan>(read.target).bytes-=160*sizeof(float);
+        // A mode label cannot replace the actual completed native delivery.
+        // Both absent and invented metadata reject before any release exists.
+        if(defect==4)read.target=std::shared_ptr<const PooledImmutableCompactReadCompletion>{};
+        if(defect==5)read.target=std::make_shared<const PooledImmutableCompactReadCompletion>();
         const auto before=c.graph.getExecutionOrder();EXPECT_THROW(appendPooledRetirementCoordinator(c.graph,c.arena,read,members,c.coordCode,"terminal"),std::invalid_argument);EXPECT_EQ(c.graph.getExecutionOrder(),before);EXPECT_EQ(c.graph.getNode("terminal/readers_retired"),nullptr);
     }
 }

@@ -60,6 +60,7 @@
 
 namespace llaminar2
 {
+    class PreparedFollowerCaptureTerminalPopulation;
 
     // Forward declarations
     class TensorBase;
@@ -1780,6 +1781,7 @@ namespace llaminar2
             /** External producer -> capture-stream handoff event. */
             void *capture_input_event = nullptr;
             void *terminal_event = nullptr;           ///< Dedicated event for one exact deferred host terminal
+            bool terminal_event_is_prepared_borrow=false; ///< Physical population outlives this runner; receipts do not.
             std::unique_ptr<OriginalSlotCaptureTerminals> original_slot_terminals; ///< Same admitted protocol slots; no independent ring.
             std::unique_ptr<NativeOrderingEventGroup> terminal_event_obligation; ///< Optional original same-PMA singleton creator ownership.
             std::shared_ptr<const std::uint8_t> terminal_receipt_identity; ///< Cold immutable exact event-lifetime identity, transferred on cache move.
@@ -1807,6 +1809,7 @@ namespace llaminar2
             };
             std::shared_ptr<ParticipantSourceBinding> participant_source_binding;
             std::shared_ptr<RetainedGraphParticipantPreparationStream> participant_preparation_stream; ///< Revoked before this cache releases its actual stream.
+            std::shared_ptr<RetainedGraphParticipantPreparationStream> participant_auxiliary_preparation; ///< Exact finite-body scope, revoked after native retirement and before stream teardown.
             std::unique_ptr<IGPUGraphCapture> retained_parent_capture; ///< Sole executable for a topology-composed transaction.
             RetainedComposedParentReplayPlan retained_composed_parent_replay; ///< Frozen identity/publication plan for @ref retained_parent_capture.
             const void *auxiliary_branch_authority = nullptr; ///< Stable owner identity embedded in every captured branch node.
@@ -1845,6 +1848,7 @@ namespace llaminar2
                   sync_event(other.sync_event),
                   capture_input_event(other.capture_input_event),
                   terminal_event(other.terminal_event),
+                  terminal_event_is_prepared_borrow(std::exchange(other.terminal_event_is_prepared_borrow,false)),
                   original_slot_terminals(std::move(other.original_slot_terminals)),
                   terminal_event_obligation(std::move(other.terminal_event_obligation)),
                   terminal_receipt_identity(std::move(other.terminal_receipt_identity)),
@@ -1865,6 +1869,7 @@ namespace llaminar2
                       std::move(other.retained_full_graph_replay)),
                   participant_source_binding(std::move(other.participant_source_binding)),
                   participant_preparation_stream(std::move(other.participant_preparation_stream)),
+                  participant_auxiliary_preparation(std::move(other.participant_auxiliary_preparation)),
                   retained_parent_capture(
                       std::move(other.retained_parent_capture)),
                   retained_composed_parent_replay(
@@ -1939,6 +1944,7 @@ namespace llaminar2
                     sync_event = other.sync_event;
                     capture_input_event = other.capture_input_event;
                     terminal_event = other.terminal_event;
+                    terminal_event_is_prepared_borrow=std::exchange(other.terminal_event_is_prepared_borrow,false);
                     original_slot_terminals = std::move(other.original_slot_terminals);
                     terminal_event_obligation = std::move(other.terminal_event_obligation);
                     terminal_receipt_identity = std::move(other.terminal_receipt_identity);
@@ -1962,6 +1968,7 @@ namespace llaminar2
                     recorded_source_definition = std::move(other.recorded_source_definition);
                     original_storage_attachment = std::move(other.original_storage_attachment);
                     participant_preparation_stream = std::move(other.participant_preparation_stream);
+                    participant_auxiliary_preparation = std::move(other.participant_auxiliary_preparation);
                     retained_parent_capture =
                         std::move(other.retained_parent_capture);
                     retained_composed_parent_replay =
@@ -2067,7 +2074,7 @@ namespace llaminar2
                     segments.empty() && snapshot_manifest.empty() &&
                     decode_step == 0 && capture_variant_signature == 0 &&
                     replay_gpu_timing_slots.empty() &&
-                    !retained_parent_capture &&
+                    !retained_parent_capture && !participant_auxiliary_preparation && !original_storage_attachment &&
                     !auxiliary_branch &&
                     auxiliary_branch_authority == nullptr &&
                     !retained_full_graph_replay.valid() &&
@@ -2206,6 +2213,8 @@ namespace llaminar2
                 }
                 // The parent owns clones of every child graph. Destroy it first
                 // so no backend child-node lifetime can outlive its source cache.
+                if(participant_auxiliary_preparation)participant_auxiliary_preparation->retire();
+                participant_auxiliary_preparation.reset();
                 if(participant_preparation_stream)participant_preparation_stream->retire();
                 participant_preparation_stream.reset();
                 retained_parent_capture.reset();
@@ -2282,6 +2291,21 @@ namespace llaminar2
                 DeviceId device,
                 bool context_from_process_pool = false);
 
+            /**
+             * @brief Bind fresh runner receipts to original prepared-model terminal handles.
+             * @param domain Actual current runner's submitted-slot authority.
+             * @param population Exclusive physical loan from the same prepared model.
+             * @param memory Same admitted source PMA and ownership control block.
+             * @throws std::exception If the cache is materialized/already bound, or any
+             *         original worker, stream, source or slot geometry differs.
+             * @note Bind on the exact worker before capture. Cache reset observes all
+             *       receipts and destroys parent/child graphs before returning this loan;
+             *       the prepared model retains the physical events across runner replacement.
+             */
+            void bindPreparedFollowerCaptureTerminals(
+                std::shared_ptr<const MoEOverlayInferenceOriginalSlotDomain> domain,
+                std::shared_ptr<PreparedFollowerCaptureTerminalPopulation> population,
+                const std::shared_ptr<PhysicalMemoryAuthority>& memory);
             /**
              * @brief Allocate the dedicated exact-terminal event during setup.
              *

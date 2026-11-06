@@ -17,6 +17,8 @@
 #include "../GEMMStage.h"
 #include "../NativeAllGatherStage.h"
 #include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
+#include "kernels/qwen4exp/PooledImmutableLocalHotPreparedStorage.h"
+#include "kernels/qwen4exp/PooledImmutableLocalHotKernels.h"
 #include "../../../local_execution/graph/ComputeGraph.h"
 #include <array>
 #include <cmath>
@@ -169,15 +171,35 @@ void Qwen4ExpResidentReadAheadFrame::requireConsumed()const
 {handoff_.requireConsumed();require(sealed_,"Resident read-ahead has no native Consume join");}
 
 namespace {
+/** @return Actual backend's local native code; construction is cold and capture keeps its exact identity. */
+std::shared_ptr<const qwen4exp::IPooledImmutableLocalHotKernels> localHotCode(DeviceId device) {
+#ifdef HAVE_CUDA
+    if(device.is_cuda())return qwen4exp::createCUDAPooledImmutableLocalHotKernels();
+#endif
+#ifdef HAVE_ROCM
+    if(device.is_rocm())return qwen4exp::createROCmPooledImmutableLocalHotKernels();
+#endif
+    throw std::invalid_argument("PLE local cache requires its compiled native backend");
+}
+/** @return Unchanged shared-only model contract, rejecting a missing actual protocol split. */
+Qwen4ExpPooledLookupEndpoints modelLookupEndpoints(const PooledImmutableLookupGraphEndpoints& endpoints) {
+    if(!endpoints.demand)throw std::invalid_argument("Pooled current demand has no original typed split descriptor");
+    return {endpoints.first,endpoints.last,*endpoints.demand};
+}
+/** @return Combined model-ready contract; its auxiliary tail never becomes a model dependency. */
+Qwen4ExpPooledLookupEndpoints modelLookupEndpoints(const PooledImmutableLocalHotGraphEndpoints& endpoints) {
+    return {endpoints.first,endpoints.last,endpoints.demand};
+}
 /** @brief Reuse the original fully authenticated source/reader construction in both scheduling modes. */
-PooledImmutableLookupGraphEndpoints appendOriginalPooledLookup(ComputeGraph& graph,const Qwen4ExpPLEContext& c,
+Qwen4ExpPooledLookupEndpoints appendOriginalPooledLookup(ComputeGraph& graph,const Qwen4ExpPLEContext& c,
     const Qwen4ExpPLEBuffers& b,Qwen4ExpPooledLookupDeclaration storage,const std::string& gather){
     if(auto* pooled=std::get_if<Qwen4ExpPooledLookupStorage>(&storage))
     {
         require(pooled->arena && pooled->boundary && pooled->boundary->isPooled() && pooled->code &&
             pooled->boundary->device()==c.device,"PLE split lookup lost its original model-owned source domain");
         const auto sourceStorage=pooled->boundary->pooledStorage();
-        const bool needsParticipants=qwen4exp::PooledImmutableParticipantExecutionPolicy::requiresRetainedParticipants(sourceStorage->geometry());
+        const bool needsParticipants=bool(pooled->local_hot) ||
+            qwen4exp::PooledImmutableParticipantExecutionPolicy::requiresRetainedParticipants(sourceStorage->geometry());
         require(needsParticipants==bool(pooled->participants),
             "PLE shared readers and remote storage require their actual retained source participant domain");
         require(!pooled->participants || pooled->participants->boundary()==pooled->boundary,
@@ -202,11 +224,18 @@ PooledImmutableLookupGraphEndpoints appendOriginalPooledLookup(ComputeGraph& gra
             countSpan=qwen4exp::PooledNativeTensorSpan{count,pooled->count->buffer,pooled->count->byteOffset,sizeof(std::int32_t)};
         }
 
-        const auto appendSource=[&](auto&&... operands){
-            if(pooled->participants)return pooled->participants->appendPLE(graph,*pooled->arena,pooled->code,
-                std::forward<decltype(operands)>(operands)...);
-            return appendPooledImmutablePLELookupGraph(graph,*pooled->arena,pooled->boundary,pooled->code,
-                std::forward<decltype(operands)>(operands)...);
+        const auto appendSource=[&](auto&&... operands)->Qwen4ExpPooledLookupEndpoints {
+            if(pooled->local_hot) {
+                require(pooled->participants && pooled->local_hot->originalSource()==sourceStorage &&
+                    pooled->local_hot->geometry().allocator().device==c.device,
+                    "PLE local cache lost its same source and actual consumer roots");
+                return modelLookupEndpoints(pooled->participants->appendLocalHotPLE(graph,*pooled->arena,pooled->code,
+                    pooled->local_hot,localHotCode(c.device),std::forward<decltype(operands)>(operands)...));
+            }
+            if(pooled->participants)return modelLookupEndpoints(pooled->participants->appendPLE(graph,*pooled->arena,pooled->code,
+                std::forward<decltype(operands)>(operands)...));
+            return modelLookupEndpoints(appendPooledImmutablePLELookupGraph(graph,*pooled->arena,pooled->boundary,pooled->code,
+                std::forward<decltype(operands)>(operands)...));
         };
         const auto edge=appendSource(
             original,qwen4exp::PooledNativeTensorSpan{ids,b.ids.buffer,b.ids.byteOffset,static_cast<std::size_t>(expanded.physicalRows())*sizeof(std::uint64_t)},
@@ -246,12 +275,21 @@ PooledImmutableLookupGraphEndpoints appendOriginalPooledLookup(ComputeGraph& gra
                 reader->count->byteOffset,sizeof(std::int32_t)};
         }
 
-        const auto edge=reader->participants->appendReader(graph,*reader->arena,
-            reader->control,expanded,
-            qwen4exp::PooledNativeTensorSpan{output,b.embedding.buffer,b.embedding.byteOffset,
-                static_cast<std::size_t>(expanded.physicalRows())*c.nativeRowElements*sizeof(float)},
-            c.prefix+"pooled_reader",gather,std::move(count));
-        return edge;
+        const qwen4exp::PooledNativeTensorSpan outputSpan{output,b.embedding.buffer,b.embedding.byteOffset,
+            static_cast<std::size_t>(expanded.physicalRows())*c.nativeRowElements*sizeof(float)};
+        if(reader->local_hot) {
+            const auto ids=reader->arena->getSharedTensor(b.ids.buffer);
+            require(ids && ids.get()==b.ids.tensor && reader->local_hot->geometry().allocator().device==c.device &&
+                reader->local_hot->originalSource()==reader->participants->boundary()->pooledStorage(),
+                "PLE local reader lost its original hash root or shared source");
+            return modelLookupEndpoints(reader->participants->appendLocalHotReader(graph,*reader->arena,
+                reader->local_hot,localHotCode(c.device),reader->control,original,
+                qwen4exp::PooledNativeTensorSpan{ids,b.ids.buffer,b.ids.byteOffset,
+                    static_cast<std::size_t>(expanded.physicalRows())*sizeof(std::uint64_t)},
+                outputSpan,c.prefix+"pooled_reader",gather,std::move(count)));
+        }
+        return modelLookupEndpoints(reader->participants->appendReader(graph,*reader->arena,
+            reader->control,expanded,outputSpan,c.prefix+"pooled_reader",gather,std::move(count)));
     }
     throw std::invalid_argument("Pooled PLE lost its original declared role");
 }
@@ -261,7 +299,8 @@ bool samePooledLookup(const Qwen4ExpPooledLookupDeclaration& first,const Qwen4Ex
     return std::visit([&](const auto& a){
         using T=std::decay_t<decltype(a)>;const auto& b=std::get<T>(second);
         const auto same=[](const auto& a,const auto& b){return a.get()==b.get()&&!a.owner_before(b)&&!b.owner_before(a);};
-        if(a.arena!=b.arena || !same(a.participants,b.participants) || a.control.captureIdentity()!=b.control.captureIdentity() ||
+        if(a.arena!=b.arena || !same(a.participants,b.participants) || !same(a.local_hot,b.local_hot) ||
+           a.control.captureIdentity()!=b.control.captureIdentity() ||
            a.originalRows.captureIdentity()!=b.originalRows.captureIdentity() || bool(a.count)!=bool(b.count))return false;
         if(a.count && (a.count->tensor!=b.count->tensor || a.count->buffer!=b.count->buffer || a.count->byteOffset!=b.count->byteOffset))return false;
         if constexpr(std::is_same_v<T,Qwen4ExpPooledLookupStorage>)return same(a.boundary,b.boundary) && a.code && b.code &&
@@ -272,24 +311,25 @@ bool samePooledLookup(const Qwen4ExpPooledLookupDeclaration& first,const Qwen4Ex
 
 }
 namespace {
-/** @return Checked actual builder descriptor before any handoff initializer dereferences it. */
-const PooledImmutableDemandFrontier& requiredDemand(const PooledImmutableLookupGraphEndpoints& endpoints){
-    if(!endpoints.demand)throw std::invalid_argument("Pooled current demand has no original typed split descriptor");
-    return *endpoints.demand;
+/** @return Exactly the actual shared-only or combined cold handoff; neither borrows the other's source role. */
+Qwen4ExpPooledDemandHandoff makePooledHandoff(ComputeGraph& graph,const Qwen4ExpPooledLookupEndpoints& endpoints,
+    std::uint64_t query,std::uint64_t hash) {
+    return std::visit([&](const auto& frontier)->Qwen4ExpPooledDemandHandoff {
+        if constexpr(std::is_same_v<std::decay_t<decltype(frontier)>,PooledImmutableDemandFrontier>)
+            return Qwen4ExpPooledDemandHandoff(std::in_place_type<PooledImmutableDemandHandoff>,graph,frontier,query,hash);
+        else return Qwen4ExpPooledDemandHandoff(std::in_place_type<PooledImmutableLocalHotDemandHandoff>,graph,frontier,query,hash);
+    },endpoints.demand);
 }
 }
 Qwen4ExpPooledReadAheadFrame::Qwen4ExpPooledReadAheadFrame(ComputeGraph& graph,Qwen4ExpPooledLookupDeclaration storage,
-    Qwen4ExpPLEBuffers buffers,const Qwen4ExpPLEContext& context,std::uint64_t hash,PooledImmutableLookupGraphEndpoints endpoints)
+    Qwen4ExpPLEBuffers buffers,const Qwen4ExpPLEContext& context,std::uint64_t hash,Qwen4ExpPooledLookupEndpoints endpoints)
     :graph_(&graph),storage_(std::move(storage)),buffers_(std::move(buffers)),device_(context.device),
      format_(context.nativeFormat),row_elements_(context.nativeRowElements),row_bytes_(context.nativeRowBytes),
      hash_(hash),arithmetic_(context.arithmetic),projection_rows_(context.projectionRows),
      endpoints_(std::move(endpoints)),hash_producer_(context.prefix+"hash"),
-     handoff_(graph,requiredDemand(endpoints_),hash,hash){
-    require(endpoints_.demand && graph.getNode(endpoints_.demand->consume) && graph.getNode(endpoints_.last),
-        "Pooled current demand lost its actual protocol frontiers");
-    require(endpoints_.demand->role==PooledImmutableDemandRole::PureReader ||
-        (!endpoints_.demand->published.empty()&&graph.getNode(endpoints_.demand->published)),
-        "Pooled current demand lost its actual publication");
+     handoff_(makePooledHandoff(graph,endpoints_,hash,hash)) {
+    require(graph.getNode(endpoints_.first) && graph.getNode(endpoints_.last),
+        "Pooled current demand lost its actual model-ready endpoints");
 }
 std::unique_ptr<Qwen4ExpPooledReadAheadFrame> Qwen4ExpPooledReadAheadFrame::publish(ComputeGraph& graph,
     const Qwen4ExpPLEContext& c,const Qwen4ExpPLEBuffers& b,Qwen4ExpPooledLookupDeclaration storage,
@@ -327,10 +367,10 @@ std::string Qwen4ExpPooledReadAheadFrame::consume(ComputeGraph& graph,const Qwen
         b.embedding.tensor==buffers_.embedding.tensor && b.embedding.buffer==buffers_.embedding.buffer &&
         b.embedding.byteOffset==buffers_.embedding.byteOffset && !trunk.empty(),
         "Pooled read-ahead consume substituted its graph/query/source or was consumed twice");
-    handoff_.consume(graph,hash,hash,trunk);return endpoints_.last;
+    std::visit([&](auto& handoff){handoff.consume(graph,hash,hash,trunk);},handoff_);return endpoints_.last;
 }
 void Qwen4ExpPooledReadAheadFrame::requireConsumed()const{
-    handoff_.requireConsumed();
+    std::visit([](const auto& handoff){handoff.requireConsumed();},handoff_);
 }
 std::string Qwen4ExpPLEBuilder::append(ComputeGraph &graph,const Qwen4ExpPLEContext &c,
     const Qwen4ExpPLEWeights &w,const Qwen4ExpPLEBuffers &b,

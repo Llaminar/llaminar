@@ -9,6 +9,7 @@
  */
 #pragma once
 #include "PooledImmutableParticipantPublicationGraph.h"
+#include "PooledImmutableLocalHotGraph.h"
 namespace llaminar2::qwen4exp {
 /** @brief Exact read protocol roles on the existing forward/reverse channels. */
 enum class PooledReadWireRole {Outcome,Requests,Receipt,Rows};
@@ -44,6 +45,13 @@ private:
 using PooledImmutableReadParticipant=std::variant<std::shared_ptr<const PooledImmutableLocalOwnerBinding>,std::shared_ptr<const PooledImmutableCapturedReadWave>>;
 }
 namespace llaminar2 {
+/** @brief Actual decoded consumer target; native delivery has a separate typed arm. */
+struct PooledImmutableDecodedReadTarget final {
+    qwen4exp::PooledNativeTensorSpan output;
+    std::string name;
+};
+/** @brief Exactly one real output mode, never an unused decoded tensor beside native delivery. */
+using PooledImmutableReadTarget=std::variant<PooledImmutableDecodedReadTarget,PooledImmutableCompactReadRequest>;
 /**
  * @brief Actual issued-read inventory and last native-row consumer for retirement insertion.
  *
@@ -59,7 +67,7 @@ struct PooledImmutableReadCompletion {
     std::vector<qwen4exp::PooledImmutableReadParticipant> owners;
     std::vector<std::string> outcomeSent,requestSent,receiptReceived,rowsReceived,imported;
     std::string planned,sealed,output;
-    qwen4exp::PooledNativeTensorSpan outputSpan;
+    std::variant<qwen4exp::PooledNativeTensorSpan,std::shared_ptr<const PooledImmutableCompactReadCompletion>> target;
     PooledPinParticipantNodes coordinator;
 };
 /** @brief Append actual remote pinned-read/copy/receipt send after authenticating its original Ready producer. */
@@ -70,6 +78,10 @@ PooledPinParticipantNodes appendPooledReadOwner(ComputeGraph& graph,BufferArena&
 PooledImmutableReadCompletion appendPooledReadCoordinator(ComputeGraph& graph,BufferArena& arena,
     const PooledImmutablePublicationCompletion& publication,std::span<const qwen4exp::PooledImmutableReadParticipant> owners,
     qwen4exp::PooledNativeTensorSpan output,const std::string& prefix,const std::string& outputName);
+/** @brief Retain the same original read image and choose its actual decoded or native consumer. */
+PooledImmutableReadCompletion appendPooledReadCoordinator(ComputeGraph& graph,BufferArena& arena,
+    const PooledImmutablePublicationCompletion& publication,std::span<const qwen4exp::PooledImmutableReadParticipant> owners,
+    PooledImmutableReadTarget target,const std::string& prefix);
 /** @brief Authenticate actual original producers, operand roots and complete issued-read/output ordering before retirement. */
 void requirePooledReadCompletion(const ComputeGraph& graph,const PooledImmutableReadCompletion& original);
 /** @brief Authenticate exact original owner receipt/row send chain before any physical release successor. */

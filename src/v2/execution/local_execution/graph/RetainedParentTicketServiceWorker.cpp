@@ -46,19 +46,27 @@ namespace llaminar2
     RetainedParentTicketServiceWorker::Ticket
     RetainedParentTicketServiceWorker::dispatch(Task task, void *context)
     {
-        if (!task || !context)
-        {
-            throw std::invalid_argument(
-                "Retained-parent ticket service requires a complete task descriptor");
-        }
-
         Ticket ticket;
         {
             std::lock_guard lock(mutex_);
+            // Withdraw first, including every rejection. No failed dispatch
+            // leaves a fixture stack address installed in the original worker.
+            auto* borrowed = next_borrowed_entry_;
+            next_borrowed_entry_ = nullptr;
+            if (borrowed)
+                borrowed->outcome.store(BorrowedEntryOutcome::Rejected, std::memory_order_release);
+            if (!task || !context)
+                throw std::invalid_argument(
+                    "Retained-parent ticket service requires a complete task descriptor");
             if (state_ != State::Idle)
+                throw std::logic_error("Retained-parent ticket service cannot overlap invocations");
+            if (borrowed)
             {
-                throw std::logic_error(
-                    "Retained-parent ticket service cannot overlap invocations");
+                if (task != borrowed->expected_task || context != borrowed->expected_context ||
+                    !borrowed->wrapper_task || !borrowed->wrapper_context)
+                    throw std::logic_error("Closed worker wrapper changed its original dispatch task or owner");
+                task = borrowed->wrapper_task;
+                context = borrowed->wrapper_context;
             }
             ++generation_;
             if (generation_ == 0u)
@@ -68,6 +76,8 @@ namespace llaminar2
             task_result_ = false;
             state_ = State::Queued;
             ticket.generation = generation_;
+            if (borrowed)
+                borrowed->outcome.store(BorrowedEntryOutcome::Dispatched, std::memory_order_release);
         }
         work_ready_.notify_one();
         return ticket;

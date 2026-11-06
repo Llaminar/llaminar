@@ -8,12 +8,14 @@
  * Native VRAM, RAM or SSD mmap storage is resolved at admission.
  */
 #pragma once
+namespace llaminar2::qwen4exp { class PooledImmutableLocalHotPreparedStorage; }
 namespace llaminar2::qwen4exp {class PooledImmutableRetainedParticipants;}
 #include "ImmutableLookupStage.h"
 #include "GraphLocalLookupFrame.h"
 #include "Qwen4ExpFixedHeadLookupStage.h"
 #include "Qwen4ExpHyperconnectionBuilder.h"
 #include "execution/qwen4exp/PooledImmutableLocalLookupGraph.h"
+#include "execution/qwen4exp/PooledImmutableLocalHotGraph.h"
 #include "execution/qwen4exp/Qwen4ExpAuxiliaryState.h"
 #include <variant>
 
@@ -63,6 +65,7 @@ struct Qwen4ExpPooledLookupStorage {
     DeviceRowRange originalRows; ///< Original token rows; sixteen-head expansion borrows this exact count.
     std::optional<Qwen4ExpIntBinding> count;
     std::shared_ptr<qwen4exp::PooledImmutableRetainedParticipants> participants; ///< Original model-owned recurring remote programs, absent only for an actually local layout.
+    std::shared_ptr<qwen4exp::PooledImmutableLocalHotPreparedStorage> local_hot; ///< Actual optional consumer root, including the admitted C0 path.
 };
 /**
  * @brief Query-only compute participant in the original shared replicated PLE cohort.
@@ -77,9 +80,18 @@ struct Qwen4ExpPooledReaderLookupStorage {
     DeviceGenerationControlBinding control;
     DeviceRowRange originalRows;
     std::optional<Qwen4ExpIntBinding> count; ///< Same original arena-owned primitive count, retained through capture/reset.
+    std::shared_ptr<qwen4exp::PooledImmutableLocalHotPreparedStorage> local_hot; ///< Immutable local replica storage; no source/owner authority is conferred.
 };
 /** @brief Existing source versus query-only reader declaration, without selecting another transport. */
 using Qwen4ExpPooledLookupDeclaration=std::variant<Qwen4ExpPooledLookupStorage,Qwen4ExpPooledReaderLookupStorage>;
+/** @brief Model-facing endpoints retain their real shared-only or combined demand contract. */
+struct Qwen4ExpPooledLookupEndpoints final {
+    std::string first,last;
+    std::variant<PooledImmutableDemandFrontier,PooledImmutableLocalHotDemandFrontier> demand;
+};
+/** @brief Exactly one original cold handoff, with no role relabeling between cache policies. */
+using Qwen4ExpPooledDemandHandoff=std::variant<PooledImmutableDemandHandoff,PooledImmutableLocalHotDemandHandoff>;
+
 /**
  * @brief One graph-local pooled demand, split at original ordinary/verifier protocol frontiers.
  *
@@ -107,7 +119,10 @@ public:
     Qwen4ExpPooledReadAheadFrame(const Qwen4ExpPooledReadAheadFrame&)=delete;
     Qwen4ExpPooledReadAheadFrame& operator=(const Qwen4ExpPooledReadAheadFrame&)=delete;
     /** @return Source Publish, inline seal-send or original local Hash for a pure reader. */
-    const std::string& producer()const noexcept{return handoff_.producer().empty()?hash_producer_:handoff_.producer();}
+    const std::string& producer()const noexcept {
+        const auto& producer=std::visit([](const auto& handoff)->const std::string& {return handoff.producer();},handoff_);
+        return producer.empty()?hash_producer_:producer;
+    }
     /**
      * @brief Validate original ordinary/verifier inputs and seal exactly one late response join.
      * @param graph Original graph under cold construction; hot mutation remains forbidden.
@@ -116,7 +131,7 @@ public:
      * @param storage Same authenticated original source/reader declaration.
      * @param hash Exact actual Hash stage identity recomputed by the late PLE builder.
      * @param trunk Actual independent same-participant terminal predecessors.
-     * @return Original complete lookup terminal, including its unchanged retirement tail.
+     * @return Original model-ready terminal; combined auxiliary retirement remains with the same parent.
      * @throws std::invalid_argument Before mutation for substituted or repeated consumption.
      */
     std::string consume(ComputeGraph& graph,const Qwen4ExpPLEContext& context,const Qwen4ExpPLEBuffers& buffers,
@@ -126,7 +141,7 @@ public:
 private:
     /** @brief Retain only cold original graph/query/source declarations after the real builders authenticate them. */
     Qwen4ExpPooledReadAheadFrame(ComputeGraph& graph,Qwen4ExpPooledLookupDeclaration storage,
-        Qwen4ExpPLEBuffers buffers,const Qwen4ExpPLEContext& context,std::uint64_t hash,PooledImmutableLookupGraphEndpoints endpoints);
+        Qwen4ExpPLEBuffers buffers,const Qwen4ExpPLEContext& context,std::uint64_t hash,Qwen4ExpPooledLookupEndpoints endpoints);
     ComputeGraph* graph_;
     Qwen4ExpPooledLookupDeclaration storage_;
     Qwen4ExpPLEBuffers buffers_;
@@ -137,9 +152,9 @@ private:
     std::uint64_t hash_;
     Qwen4ExpProjectionArithmetic arithmetic_;
     std::optional<DeviceRowRange> projection_rows_;
-    PooledImmutableLookupGraphEndpoints endpoints_;
+    Qwen4ExpPooledLookupEndpoints endpoints_;
     std::string hash_producer_;
-    PooledImmutableDemandHandoff handoff_;
+    Qwen4ExpPooledDemandHandoff handoff_;
 };
 /**
  * @brief Graph-local exact-once current-demand publication, never request execution state.

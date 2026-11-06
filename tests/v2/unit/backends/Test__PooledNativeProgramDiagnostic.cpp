@@ -7,10 +7,23 @@
 #include "backends/RetainedParticipantGraphExecutable.h"
 #include "backends/GPUGraphMemoryContract.h"
 #include "planning/PlanningExecutionMeasurement.h"
+#include "execution/runner/ModelContextRetirement.h"
 #include "mocks/MockBackend.h"
 #include "mocks/MockWorkerGPUContext.h"
 #include <gtest/gtest.h>
+#include <sys/resource.h>
+#include <unistd.h>
+#include <cstdio>
+#include <type_traits>
 namespace llaminar2::test {
+std::shared_ptr<RetainedParticipantGraphExecutable> NativeContextPreparationReplayAccess::resumePreparedCalibrationLookup(
+    const std::shared_ptr<PreparedServiceCalibrationSlot>& slot,const PreparedGPUContextUsePermit& original,void* stream){
+    return slot->acquire(original,stream);
+}
+static_assert(!std::is_copy_constructible_v<PreparedServiceCalibrationSlot>);
+static_assert(!std::is_move_constructible_v<PreparedServiceCalibrationSlot>);
+static_assert(!std::is_copy_assignable_v<PreparedServiceCalibrationSlot>);
+static_assert(!std::is_move_assignable_v<PreparedServiceCalibrationSlot>);
 struct RetainedParticipantGraphExecutableReplayAccess {
     static auto create(const PreparedGPUContextUsePermit& original,void* stream){return RetainedParticipantGraphExecutable::createDeviceBound(original,stream);}
     /** @return Actual closed calibration-purpose factory, with no invented source permit. */
@@ -390,8 +403,9 @@ TEST(PooledNativeProgramDiagnostic,PreparedCalibrationBOMIsolatedFromServingRese
             const auto key=PhysicalMemoryAllocatorIdentity{resource.world_rank,resource.device};
             const auto servingBytes=serving.find(key)->bytes(PhysicalMemoryOwner::NativeGraphExecutable);
             const auto calibrationBytes=calibration.find(key)->bytes(PhysicalMemoryOwner::NativePreparationGraphExecutable);
-            EXPECT_EQ(servingBytes,calibrationBytes);
-            EXPECT_EQ(serving.find(key)->totalBytes(),calibration.find(key)->totalBytes());
+            const auto knownHolder=resource.device.is_cpu()?PreparedServiceCalibrationSlot::physicalBytes():0u;
+            EXPECT_EQ(servingBytes+knownHolder,calibrationBytes);
+            EXPECT_EQ(serving.find(key)->totalBytes()+knownHolder,calibration.find(key)->totalBytes());
             EXPECT_EQ(calibration.find(key)->bytes(PhysicalMemoryOwner::NativeGraphExecutable),0u);
             auto committed=memory->reserveNewAllocations(resource.device,PhysicalMemoryOwner::NativeGraphExecutable,servingBytes);
             // Original-owner control: the former calibration charge collides
@@ -534,5 +548,162 @@ TEST(PooledNativeProgramDiagnostic,PreparedCalibrationROCmTimingOwner){EXPECT_EX
 /** @test Normal graph definitions, stale provenance and failed native reset never gain a re-record capability. */
 TEST(PooledNativeProgramDiagnostic,PreparedCalibrationCUDARejectsUnproved){EXPECT_EXIT({rejectedPreparedCalibration(DeviceId::cuda(282));std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");}
 TEST(PooledNativeProgramDiagnostic,PreparedCalibrationROCmRejectsUnproved){EXPECT_EXIT({rejectedPreparedCalibration(DeviceId::rocm(282));std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");}
+
+namespace {
+/** @brief Preserve precise assertion diagnostics when a death child exits without normal listeners. */
+void reportCalibrationChildFailures(){
+    const auto* result=::testing::UnitTest::GetInstance()->current_test_info()->result();
+    for(int i=0;i<result->total_part_count();++i){const auto& part=result->GetTestPartResult(i);
+        if(part.failed())std::fprintf(stderr,"%s:%d: %s\n",part.file_name(),part.line_number(),part.message());}
+}
+/** @brief Replay twenty runner-local borrows against one actual original prepared source. */
+void sourceCalibrationRecreation(DeviceId device){
+    Source source(device,0,true,256u<<20,true,1);auto& worker=source.worker();
+    RetainedParticipantGraphExecutable* originalOwner=nullptr;
+    std::uint64_t ordinal=0,host=0,gpu=0;
+    for(int runner=0;runner<20;++runner){
+#ifdef LLAMINAR_OLD_PER_RUNNER_CALIBRATION
+        auto loan=RetainedParticipantGraphExecutableReplayAccess::calibration(*source.original,worker.defaultStream());
+#else
+        auto loan=source.original->borrowPreparedCalibration(worker.defaultStream());
+        EXPECT_THROW(source.original->borrowPreparedCalibration(worker.defaultStream()),std::logic_error);
+        EXPECT_THROW(source.original->borrowPreparedCalibration(reinterpret_cast<void*>(0x1234)),std::invalid_argument);
+        if(!runner)originalOwner=loan.get();else EXPECT_EQ(loan.get(),originalOwner);
+#endif
+        for(int phase=0;phase<3;++phase){
+            RetainedParticipantGraphExecutableReplayAccess::ready(*loan);
+            if(ordinal)EXPECT_THROW(RetainedParticipantGraphExecutableReplayAccess::submit(*loan,ordinal),std::logic_error);
+            ASSERT_TRUE(RetainedParticipantGraphExecutableReplayAccess::submit(*loan,++ordinal));
+            worker.streamState=GPUStreamExecutionState::Pending;
+            EXPECT_FALSE(RetainedParticipantGraphExecutableReplayAccess::observe(*loan));
+            EXPECT_THROW(RetainedParticipantGraphExecutableReplayAccess::resetCalibration(*loan),std::logic_error);
+            worker.streamState=GPUStreamExecutionState::Complete;
+            ASSERT_TRUE(RetainedParticipantGraphExecutableReplayAccess::observe(*loan));
+            RetainedParticipantGraphExecutableReplayAccess::resetCalibration(*loan);
+        }
+#ifndef LLAMINAR_OLD_PER_RUNNER_CALIBRATION
+        if(runner==19)EXPECT_THROW(NativeContextPreparationReplayAccess::closePreparedCalibrations(source.source),std::logic_error);
+#endif
+        loan.reset();
+        if(!runner){
+            host=source.memory->reservedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativePreparationGraphExecutable);
+            gpu=source.memory->reservedBytes(device,PhysicalMemoryOwner::NativePreparationGraphExecutable);
+        }
+        EXPECT_EQ(source.memory->reservedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativePreparationGraphExecutable),host);
+        EXPECT_EQ(source.memory->reservedBytes(device,PhysicalMemoryOwner::NativePreparationGraphExecutable),gpu);
+#ifndef LLAMINAR_OLD_PER_RUNNER_CALIBRATION
+        // This recorded counter includes one wrapper plus its two timing creators.
+        EXPECT_EQ(worker.calls,3);EXPECT_EQ(worker.capturesDestroyed,0);
+        EXPECT_EQ(worker.timingEventsCreated,2);EXPECT_EQ(worker.eventsDestroyed,0);
+#endif
+    }
+    NativeContextPreparationReplayAccess::closePreparedCalibrations(source.source);
+    EXPECT_EQ(worker.capturesDestroyed,1);EXPECT_EQ(worker.eventsDestroyed,2);
+    EXPECT_THROW(source.original->borrowPreparedCalibration(worker.defaultStream()),std::logic_error);
+    EXPECT_EQ(source.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativePreparationGraphExecutable,
+        PhysicalMemoryMaterializationKind::NewAllocation),0u);
+    EXPECT_EQ(source.memory->reservedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativePreparationGraphExecutable),host);
+    source.reset();
+}
+}
+/** @test Original source lifetime retains the same physical calibration across runner replacement. */
+TEST(PooledNativeProgramDiagnostic,PreparedCalibrationSourceCUDARecreation){
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    EXPECT_EXIT({const rlimit limit{};if(setrlimit(RLIMIT_CORE,&limit)!=0){std::fputs("cannot disable child core dumps\n",stderr);_exit(2);}
+        sourceCalibrationRecreation(DeviceId::cuda(284));reportCalibrationChildFailures();std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
+}
+TEST(PooledNativeProgramDiagnostic,PreparedCalibrationSourceROCmRecreation){
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    EXPECT_EXIT({const rlimit limit{};if(setrlimit(RLIMIT_CORE,&limit)!=0){std::fputs("cannot disable child core dumps\n",stderr);_exit(2);}
+        sourceCalibrationRecreation(DeviceId::rocm(284));reportCalibrationChildFailures();std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
+}
+
+namespace {
+/** @brief Deterministically pause the same production lookup before its off-lock acquire. */
+void sourceCalibrationLookupRetirement(DeviceId device){
+    Source source(device,0,true,256u<<20,true,1);auto& worker=source.worker();
+    auto pending=NativeContextPreparationReplayAccess::pausePreparedCalibrationLookup(*source.original,worker.defaultStream());
+    EXPECT_EQ(worker.calls,0);EXPECT_EQ(worker.timingEventsCreated,0);
+    const auto claimed=source.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativePreparationGraphExecutable,
+        PhysicalMemoryMaterializationKind::NewAllocation);
+    EXPECT_EQ(claimed,PreparedServiceCalibrationSlot::physicalBytes());
+    try{NativeContextPreparationReplayAccess::closePreparedCalibrations(source.source);FAIL()<<"Pending holder loan must reject final retirement";}
+    catch(const std::logic_error& failure){EXPECT_EQ(std::string(failure.what()),
+        "Original prepared calibration retirement has an in-flight holder borrower");}
+    EXPECT_EQ(source.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativePreparationGraphExecutable,
+        PhysicalMemoryMaterializationKind::NewAllocation),claimed);
+    try{auto denied=NativeContextPreparationReplayAccess::resumePreparedCalibrationLookup(pending,*source.original,worker.defaultStream());
+        FAIL()<<"An already-issued lookup cannot create after source close";}
+    catch(const std::logic_error& failure){EXPECT_EQ(std::string(failure.what()),"Original prepared calibration source slot is retiring");}
+    EXPECT_EQ(worker.calls,0);EXPECT_EQ(worker.timingEventsCreated,0);
+    EXPECT_EQ(source.memory->reservedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativePreparationGraphExecutable),0u);
+    pending.reset();NativeContextPreparationReplayAccess::closePreparedCalibrations(source.source);
+    EXPECT_EQ(source.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativePreparationGraphExecutable,
+        PhysicalMemoryMaterializationKind::NewAllocation),0u);
+    EXPECT_THROW(source.original->borrowPreparedCalibration(worker.defaultStream()),std::logic_error);
+    source.reset();
+}
+}
+/** @test Off-pool holder loans fail precisely before native teardown/zero-allocation retirement. */
+TEST(PooledNativeProgramDiagnostic,PreparedCalibrationSourceCUDAHolderRetirement){
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    EXPECT_EXIT({const rlimit limit{};if(setrlimit(RLIMIT_CORE,&limit)!=0){std::fputs("cannot disable child core dumps\n",stderr);_exit(2);}
+        sourceCalibrationLookupRetirement(DeviceId::cuda(285));std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
+}
+TEST(PooledNativeProgramDiagnostic,PreparedCalibrationSourceROCmHolderRetirement){
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    EXPECT_EXIT({const rlimit limit{};if(setrlimit(RLIMIT_CORE,&limit)!=0){std::fputs("cannot disable child core dumps\n",stderr);_exit(2);}
+        sourceCalibrationLookupRetirement(DeviceId::rocm(285));std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
+}
+
+namespace {
+/** @brief Exercise the same pending completion used by both actual final-model callers. */
+void sourceCalibrationModelTicketOrder(DeviceId device){
+    Source source(device,0,true,256u<<20,true,1);auto& worker=source.worker();
+    auto loan=source.original->borrowPreparedCalibration(worker.defaultStream());
+    RetainedParticipantGraphExecutableReplayAccess::ready(*loan);
+    ASSERT_TRUE(RetainedParticipantGraphExecutableReplayAccess::submit(*loan,1));
+    ASSERT_TRUE(RetainedParticipantGraphExecutableReplayAccess::observe(*loan));
+    RetainedParticipantGraphExecutableReplayAccess::resetCalibration(*loan);
+    // Storage-only native workers need no fabricated model-weight retention row.
+    // The overload closes source loans before the SAME completion dispatch for
+    // either HostOnly or DeviceBatch, including its one-shot consumption flag.
+    auto pending=PendingExclusiveModelRetirement::begin({});
+    const auto complete=[&]{
+#ifdef LLAMINAR_OLD_MODEL_TICKET_CALIBRATION_ORDER
+        auto result=pending.complete();
+        source.source->retireReleasedContexts(); // Literal former caller order.
+        return result;
+#else
+        return pending.complete(source.source);
+#endif
+    };
+    EXPECT_THROW((void)complete(),std::logic_error);
+    EXPECT_EQ(worker.capturesDestroyed,0);EXPECT_EQ(worker.eventsDestroyed,0);
+    loan.reset();
+    EXPECT_NO_THROW({const auto receipt=complete();EXPECT_EQ(receipt.retiredDeviceCount(),0u);});
+    // Identical pending state is consumed only by successful completion.
+    EXPECT_THROW((void)pending.complete(source.source),std::logic_error);
+    NativeContextPreparationReplayAccess::closePreparedCalibrations(source.source);
+    NativeContextPreparationReplayAccess::closePreparedCalibrations(source.source);
+    EXPECT_EQ(worker.capturesDestroyed,1);EXPECT_EQ(worker.eventsDestroyed,2);
+    EXPECT_EQ(source.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativePreparationGraphExecutable,
+        PhysicalMemoryMaterializationKind::NewAllocation),0u);
+    source.reset();
+}
+}
+/** @test Source loan preflight precedes actual pending model-ticket consumption. */
+TEST(PooledNativeProgramDiagnostic,PreparedCalibrationSourceCUDAModelTicketOrder){
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    EXPECT_EXIT({const rlimit limit{};if(setrlimit(RLIMIT_CORE,&limit)!=0){std::fputs("cannot disable child core dumps\n",stderr);_exit(2);}
+        sourceCalibrationModelTicketOrder(DeviceId::cuda(286));reportCalibrationChildFailures();
+        std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
+}
+TEST(PooledNativeProgramDiagnostic,PreparedCalibrationSourceROCmModelTicketOrder){
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    EXPECT_EXIT({const rlimit limit{};if(setrlimit(RLIMIT_CORE,&limit)!=0){std::fputs("cannot disable child core dumps\n",stderr);_exit(2);}
+        sourceCalibrationModelTicketOrder(DeviceId::rocm(286));reportCalibrationChildFailures();
+        std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
+}
 
 }

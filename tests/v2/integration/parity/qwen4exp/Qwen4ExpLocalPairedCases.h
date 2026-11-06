@@ -12,6 +12,7 @@
 #include "Qwen4ExpProductionParityCases.h"
 #include "Qwen4ExpFixedHeadParityCases.h"
 #include "Qwen4ExpGPUAdaptiveParityCases.h"
+#include "Qwen4ExpCombinedLocalHotCases.h"
 #include "Qwen4ExpOwnerSubsetParityCases.h"
 #include "Qwen4ExpMatchedCacheEconomyCases.h"
 #include "Qwen4ExpFullROCmTP4ParityCases.h"
@@ -29,10 +30,62 @@ namespace llaminar2::test::parity::qwen4exp
 /** @brief Existing suite families, not another topology or policy expander. */
 using QFNCaseFamilies = std::map<std::string, std::vector<ModelParityCase>>;
 
+/**
+ * @return Six original RAM/R3/StaticOrdinal Off policies for complete frozen-history panels.
+ * These reuse the functional optional ceilings; they do not assert matched total
+ * physical budgets. Source admission and native generation remain separate.
+ */
+inline std::vector<ModelParityCase> qwen4ExpLocalHotNumericalCases()
+{
+    std::vector<ModelParityCase> result;
+    for (const auto target : {Qwen4ExpHardwareTarget::ROCm2, Qwen4ExpHardwareTarget::CUDA2})
+    {
+        const auto pressure = target == Qwen4ExpHardwareTarget::ROCm2
+            ? Qwen4ExpOwnerSubsetCachePressure::Zero : Qwen4ExpOwnerSubsetCachePressure::Positive;
+        const auto seeds = qwen4ExpCombinedLocalHotC0CasesFromOriginalSeed(
+            {target, 2, AdaptiveImmutableRowBacking::RAM, pressure, ModelParityExpertMovement::Static},
+            {ModelParityMTP::Off});
+        for (const auto profile : {Qwen4ExpLocalHotBudgetProfile::SharedOnly,
+                 Qwen4ExpLocalHotBudgetProfile::ConsumerLocal, Qwen4ExpLocalHotBudgetProfile::CombinedEqual})
+            result.push_back(qwen4ExpLocalHotBudgetCase(seeds.front(), profile));
+    }
+    return result;
+}
+
+/**
+ * @brief Name the actual numerical fixture without changing historical registration identities.
+ * @param family Source-owned registration family.
+ * @param cell Exact case supplied by that family's original producer.
+ * @return Canonical GTest selector used by frozen bindings and actual discovery.
+ */
+inline std::string qfnLocalPairedCellId(const std::string& family, const ModelParityCase& cell)
+{
+    const auto fixture = (family == "Qwen4ExpLocalHotNumerical" || family == "Qwen4ExpLocalHotMeasuredBudgetNumerical" ||
+        family == "Qwen4ExpLocalHotRefinedBudgetNumerical")
+        ? "Qwen4ExpLocalHotNumericalTest" : "Qwen4ExpMainParityTest";
+    return family + "/" + fixture + ".ProductionParity/" + cell.testName();
+}
+
+/**
+ * @brief Reject unbound new numerical candidates before model or backend setup.
+ * @param cell Exact candidate with its build-frozen complete panel obligation.
+ * @throws std::invalid_argument If absent or inconsistent; no legacy numerical route is selected.
+ */
+inline void qfnRequireLocalHotNumericalBinding(const ModelParityCase& cell)
+{
+    if (!cell.paired_workload)
+        throw std::invalid_argument("Local-hot numerical candidates require a frozen complete-history paired binding");
+    cell.paired_workload->validate(cell.model.model_path, cell.model.shared_predictor
+        ? std::optional<std::string>(cell.model.shared_predictor->path()) : std::nullopt);
+}
+
 /** @return Original case producers in their unchanged registration families. */
 inline QFNCaseFamilies qfnOriginalCaseFamilies()
 {
-    return {{"Qwen4ExpOwnerSubsetStaticOrdinalCandidate", qwen4ExpOwnerSubsetExecutionCases(ModelParityExpertOverlayPolicy{})},
+    return {{"Qwen4ExpLocalHotNumerical", qwen4ExpLocalHotNumericalCases()},
+            {"Qwen4ExpLocalHotMeasuredBudgetNumerical", qwen4ExpLocalHotMeasuredBudgetCandidates()},
+            {"Qwen4ExpLocalHotRefinedBudgetNumerical", qwen4ExpLocalHotRefinedBudgetCandidates()},
+            {"Qwen4ExpOwnerSubsetStaticOrdinalCandidate", qwen4ExpOwnerSubsetExecutionCases(ModelParityExpertOverlayPolicy{})},
             {"Qwen4ExpOwnerSubsetDynamicOrdinalCandidate", qwen4ExpOwnerSubsetExecutionCases({.owner_order=RoutedExpertOwnerOrder::Ordinal,.movement=ModelParityExpertMovement::Dynamic})},
             {"Qwen4ExpExpertFollowerOwnerStaticOrdinalCandidate", qwen4ExpExpertFollowerOwnerExecutionCases(ModelParityExpertOverlayPolicy{})},
             {"Qwen4ExpExpertFollowerOwnerDynamicOrdinalCandidate", qwen4ExpExpertFollowerOwnerExecutionCases({.owner_order=RoutedExpertOwnerOrder::Ordinal,.movement=ModelParityExpertMovement::Dynamic})},
@@ -105,7 +158,7 @@ inline QFNCaseFamilies qfnAttachLocalPairedCases(QFNCaseFamilies original, const
     std::map<std::string, ModelParityCase *> available;
     for (auto &[family, cases] : original)
         for (auto &cell : cases)
-            qfnLocalRequire(available.emplace(family + "/Qwen4ExpMainParityTest.ProductionParity/" + cell.testName(), &cell).second,
+            qfnLocalRequire(available.emplace(qfnLocalPairedCellId(family, cell), &cell).second,
                             "Original QFN registration repeats an exact source ID");
     std::set<std::string> seen;
     for (const auto &binding : bindings)

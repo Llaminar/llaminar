@@ -686,3 +686,34 @@ TEST(OrchestrationConfigDocument, AdaptiveFullRAMBackingRejectsOldSchemaAndMissi
     auto foreign=valid;foreign["configuration"]["ngram_table_policy"]["gpu_adaptive"]["source_backing"]="Foreign";
     EXPECT_THROW(deserializeOrchestrationConfig(foreign.dump()),std::invalid_argument);
 }
+
+/** @test Optional absent/null differs from explicit C0 and overrides preserve exact readers. */
+TEST(OrchestrationConfigDocument, NgramLocalHotCacheAbsentNullC0AndOverrides)
+{
+    OrchestrationConfig c;
+    c.ngram_table_policy.storage = ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD;
+    c.ngram_table_policy.gpu_adaptive.placement = parseAdaptiveGPUCachePlacement("0:rocm:0/128/1048576@0:cuda:0");
+    auto shared = nlohmann::json::parse(serializeOrchestrationConfig(c));
+    EXPECT_TRUE(shared["configuration"]["ngram_table_policy"]["gpu_adaptive"]["local_hot_cache"].is_null());
+    auto old_shared = shared;
+    old_shared["configuration"]["ngram_table_policy"]["gpu_adaptive"].erase("local_hot_cache");
+    EXPECT_EQ(deserializeOrchestrationConfig(old_shared.dump()).ngram_table_policy, c.ngram_table_policy);
+    c.ngram_table_policy.gpu_adaptive.local_hot_cache.emplace();
+    c.ngram_table_policy.gpu_adaptive.local_hot_cache->consumer_overrides = {
+        {{0, DeviceType::CUDA, 1}, 17, 4096}};
+    const auto decoded = deserializeOrchestrationConfig(serializeOrchestrationConfig(c));
+    EXPECT_EQ(decoded.ngram_table_policy, c.ngram_table_policy);
+    ASSERT_TRUE(decoded.ngram_table_policy.gpu_adaptive.local_hot_cache);
+    EXPECT_EQ(decoded.ngram_table_policy.gpu_adaptive.local_hot_cache->maximum_cache_rows, 0u);
+    const std::array readers{AdaptiveGPUCacheParticipant{0,DeviceType::CUDA,0}, AdaptiveGPUCacheParticipant{0,DeviceType::CUDA,1}};
+    auto local = *decoded.ngram_table_policy.gpu_adaptive.local_hot_cache;
+    EXPECT_NO_THROW(local.requireConsumers(readers));
+    EXPECT_EQ(local.ceilingsFor(readers[1]).maximum_cache_rows, 17u);
+    EXPECT_EQ(local.ceilingsFor(readers[0]).maximum_cache_rows, 0u);
+    local.consumer_overrides.push_back(local.consumer_overrides.front());
+    EXPECT_THROW(local.validate(), std::invalid_argument);
+    local.consumer_overrides = {{{0,DeviceType::CUDA,2},17,4096}};
+    EXPECT_THROW(local.requireConsumers(readers), std::invalid_argument);
+    local.policy.protected_denominator = 0;
+    EXPECT_THROW(local.validate(), std::invalid_argument);
+}

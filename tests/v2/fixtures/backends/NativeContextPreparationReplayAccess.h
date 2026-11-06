@@ -17,6 +17,16 @@ namespace llaminar2::test {
 struct NativeContextPreparationReplayAccess {
     /** @brief Invoke the actual released-source retirement body with a device-free native backend authority. */
     static void retireReleased(const std::shared_ptr<NativeContextPreparation>& source,const TransferEngine& transfers){source->retireReleasedContexts(transfers);}
+    /** @brief Exercise the actual source calibration close before recorded native-only retirement. */
+    static void closePreparedCalibrations(const std::shared_ptr<NativeContextPreparation>& source){source->retirePreparedCalibrations();}
+    /** @return The actual production off-pool lookup loan, paused before slot acquisition. */
+    static std::shared_ptr<PreparedServiceCalibrationSlot> pausePreparedCalibrationLookup(
+        const PreparedGPUContextUsePermit& original,void* stream){
+        return GPUDeviceContextPool::instance().retainPreparedCalibrationSlot(original,stream);
+    }
+    /** @brief Resume the actual paused slot acquisition; never bypass source close or native guards. */
+    static std::shared_ptr<RetainedParticipantGraphExecutable> resumePreparedCalibrationLookup(
+        const std::shared_ptr<PreparedServiceCalibrationSlot>&,const PreparedGPUContextUsePermit&,void*);
 
     /** @return Actual source-owned explicit stack/object program, without creating a native worker. */
     static GPUWorkerStackProgram objectProgram(std::size_t bytes,std::size_t alignment){return GPUWorkerStackProgram::originalDefaults().withContextObject(bytes,alignment);}

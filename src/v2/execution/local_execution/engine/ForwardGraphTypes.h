@@ -408,6 +408,62 @@ namespace llaminar2
             return RetainedForwardSourceDefinition(std::move(signature),role,physical_rows,&graph,
                 graph.topologyGeneration(),variant,std::move(source));
         }
+        /**
+         * @brief Export only a cache's owned source, authenticating associated reader bodies separately.
+         * @param signature Exact owning forward-cache key.
+         * @param role Original serving role and physical_rows its live row specialization.
+         * @param physical_rows Actual row specialization, never retained capacity.
+         * @param graph Actual materialized cache graph.
+         * @param variant Exact immutable cache capture variant.
+         * @param source This graph's whole-source preparation, if it owns the source.
+         * @param recorded_source Exact coordinator definition received at the original capture boundary.
+         * @param auxiliary This graph's original participant-body preparation, if present.
+         * @param attachment Cache-owned sealed original parent/body borrow.
+         * @return Owned/source-free projection, or no entry for an authenticated associated reader.
+         *
+         * A reader is neither source-free nor another source owner. Its preparation
+         * proves the exact received source association before it is excluded from
+         * source-owner discovery. No launch, source seal or new authority is issued.
+         */
+        static std::optional<RetainedForwardSourceDefinition> projectOwned(
+            ForwardGraphSignature signature, MoEOverlayInferenceGraphRole role, int physical_rows,
+            const ComputeGraph& graph, uint64_t variant,
+            std::shared_ptr<const RetainedGraphParticipantPreparationStream> source,
+            const std::shared_ptr<const RetainedGraphParticipantPreparationStream>& recorded_source,
+            const std::shared_ptr<const RetainedGraphParticipantPreparationStream>& auxiliary,
+            const IRetainedGraphParticipantStorageAttachment* attachment)
+        {
+            if (source || !graph.retainedParticipantDefinitionDomain())
+                return checked(std::move(signature),role,physical_rows,graph,variant,std::move(source));
+            const auto& range=graph.retainedParticipantAuxiliaryRange();
+            if (graph.retainedParticipantSourcePlan() || !range || !recorded_source || !auxiliary || !attachment ||
+                range->role!=RetainedGraphParticipantAuxiliaryRole::Reader ||
+                range->participant!=signature.device || physical_rows<=0 || !variant ||
+                static_cast<int64_t>(signature.batch_size)*signature.seq_len!=physical_rows ||
+                role!=(signature.execution_role==ForwardExecutionRole::GroupedMTPVerifier
+                    ?MoEOverlayInferenceGraphRole::MTPGroupedVerifier
+                    :signature.decode?MoEOverlayInferenceGraphRole::MainDecode:MoEOverlayInferenceGraphRole::MainPrefill))
+                throw std::invalid_argument("Finite reader projection lost its exact associated source/body declaration");
+            graph.requireRetainedParticipantAuxiliaryRange();
+            recorded_source->requireCurrentDefinition();
+            auxiliary->requireCurrentDefinition();
+            const auto& original=recorded_source->definition();
+            const auto& body=auxiliary->definition();
+            const auto& received=body.original_source_definition;
+            if (original.scope!=RetainedGraphParticipantDefinitionScope::WholeSource ||
+                body.scope!=RetainedGraphParticipantDefinitionScope::AuxiliaryReader ||
+                body.graph!=&graph || body.topology_generation!=graph.topologyGeneration() ||
+                body.variant!=variant || body.participant!=range->participant || body.range_identity!=range->identity ||
+                body.domain!=*graph.retainedParticipantDefinitionDomain() || original.domain!=body.domain ||
+                body.plan!=original.plan || !received || received.get()!=recorded_source.get() ||
+                received.owner_before(recorded_source) || recorded_source.owner_before(received))
+                throw std::invalid_argument("Finite reader projection substituted its original source/cache association");
+            // Reauthenticate the actual sealed enclosing parent after both cache
+            // definitions. An unsealed or retired body cannot disappear as if it
+            // had never owned participant work.
+            attachment->requireCurrent();
+            return std::nullopt;
+        }
         /** @brief Reauthenticate a borrowed source before accessing its original graph; source-free values own no graph borrow. */
         void requireCurrent() const
         {

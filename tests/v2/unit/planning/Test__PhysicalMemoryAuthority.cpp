@@ -9,6 +9,8 @@
  */
 
 #include "planning/PhysicalMemoryAuthority.h"
+#include "utils/FinalPhysicalMemoryCostEvidence.h"
+#include <sstream>
 
 #include <gtest/gtest.h>
 
@@ -929,3 +931,83 @@ TEST(PhysicalMemoryAuthority,
 }
 
 #include "CPUWeightSourceTransactionContract.inc"
+
+/** @test Each original rank emits each allocator once; retained and live bytes never become extra admitted bytes. */
+TEST(PhysicalMemoryAuthority, FinalCostEvidenceSeparatesAllocatorOwnerAndRetainedBytes)
+{
+    PhysicalMemoryPlanBuilder builder;
+    builder.add(resource(0,DeviceId::cpu(),20000,18000),PhysicalMemoryOwner::ImmutableTableStorage,800,200)
+        .add(resource(0,DeviceId::cpu(),20000,18000),PhysicalMemoryOwner::ImmutableLookupStaging,64)
+        .add(resource(0,DeviceId::rocm(0),20000,18000),PhysicalMemoryOwner::ImmutableTableStorage,1000,100)
+        .add(resource(1,DeviceId::cpu(),30000,27000),PhysicalMemoryOwner::ImmutableTableStorage,9000);
+    auto certificate=std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(builder.build());
+    PhysicalMemoryAuthority rank0(certificate,0),rank1(certificate,1);
+    auto ready=rank0.claimNewAllocation(DeviceId::cpu(),PhysicalMemoryOwner::ImmutableLookupStaging,32);
+    auto retained=rank0.adoptResidentAllocation(DeviceId::cpu(),PhysicalMemoryOwner::ImmutableTableStorage,200);
+    const auto before=rank0.rankAttestationSummary(true);
+    std::ostringstream resources0,owners0,resources1,owners1;
+    test::writeFinalPhysicalMemoryCostCSV(resources0,owners0,rank0,{"cell","original-source","shared-profile"});
+    test::writeFinalPhysicalMemoryCostCSV(resources1,owners1,rank1,{"cell","original-source","shared-profile"});
+    EXPECT_EQ(rank0.rankAttestationSummary(true),before);
+    const auto lines=[](const std::string& value){return std::count(value.begin(),value.end(),'\n');};
+    EXPECT_EQ(lines(resources0.str()),3);
+    EXPECT_EQ(lines(resources1.str()),2);
+    EXPECT_EQ(lines(owners0.str()),1+2*PhysicalMemoryBOM::ownerCount());
+    EXPECT_EQ(lines(owners1.str()),1+PhysicalMemoryBOM::ownerCount());
+    EXPECT_NE(resources0.str().find("\"CPU\",20000,18000,864,664,200\n"),std::string::npos);
+    EXPECT_NE(resources0.str().find("\"ROCm:0\",20000,18000,1000,900,100\n"),std::string::npos);
+    EXPECT_EQ(resources0.str().find(",30000,"),std::string::npos);
+    EXPECT_NE(resources1.str().find("\"CPU\",30000,27000,9000,9000,0\n"),std::string::npos);
+    EXPECT_EQ(resources1.str().find("ROCm"),std::string::npos);
+    EXPECT_NE(owners0.str().find("immutable_table_storage,800,600,200,0,200,0,"),std::string::npos);
+    EXPECT_NE(owners0.str().find("immutable_lookup_staging,64,64,0,32,0,32,"),std::string::npos);
+    EXPECT_EQ(certificate->plan().totalBytes(),864u+1000u+9000u);
+}
+
+/** @test CSV source/profile labels preserve commas, quotes and newlines without a second source identity. */
+TEST(PhysicalMemoryAuthority, FinalCostEvidenceQuotesLabelsAndRejectsMissingIdentityOrOutput)
+{
+    PhysicalMemoryPlanBuilder builder;
+    builder.add(resource(0,DeviceId::cpu(),1000,1000),PhysicalMemoryOwner::ImmutableTableStorage,100);
+    PhysicalMemoryAuthority memory(std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(builder.build()),0);
+    std::ostringstream resources,owners;
+    test::writeFinalPhysicalMemoryCostCSV(resources,owners,memory,{"cell,quoted","source\"path\nnext","profile"});
+    const std::string labels="\"cell,quoted\",\"source\"\"path\nnext\",\"profile\",0,";
+    EXPECT_NE(resources.str().find(labels),std::string::npos);
+    EXPECT_NE(owners.str().find(labels),std::string::npos);
+    EXPECT_THROW(test::writeFinalPhysicalMemoryCostCSV(resources,owners,memory,{"","source","profile"}),std::invalid_argument);
+    std::ostringstream failed;failed.setstate(std::ios::badbit);
+    EXPECT_THROW(test::writeFinalPhysicalMemoryCostCSV(failed,owners,memory,{"cell","source","profile"}),std::runtime_error);
+}
+
+/** @test Disjoint source/ready and terminal leases fill one exact final owner; partial/reserved backing cannot certify it. */
+TEST(PhysicalMemoryAuthority, SourceSubsetAndTerminalRequireCompleteFinalOwner)
+{
+    const auto cpu=DeviceId::cpu();
+    const auto category=PhysicalMemoryOwner::ImmutableLookupStaging;
+    PhysicalMemoryPlanBuilder builder;
+    builder.add(resource(0,cpu,10000,10000),category,2000,400);
+    auto certificate=std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(builder.build());
+    PhysicalMemoryAuthority memory(certificate,0);
+    EXPECT_THROW(test::requireCompleteFinalPhysicalMemoryOwner(memory,{0,cpu},category),std::logic_error);
+    auto retained=memory.adoptResidentAllocation(cpu,category,400);
+    auto source=memory.claimNewAllocation(cpu,category,500);
+    auto ready=memory.claimNewAllocation(cpu,category,300);
+    auto terminal=memory.reserveNewAllocations(cpu,category,800);
+    EXPECT_THROW(test::requireCompleteFinalPhysicalMemoryOwner(memory,{0,cpu},category),std::logic_error);
+    auto first=terminal.claimAllocation(400);
+    EXPECT_THROW(test::requireCompleteFinalPhysicalMemoryOwner(memory,{0,cpu},category),std::logic_error);
+    auto second=terminal.claimAllocation(400);
+    EXPECT_NO_THROW(test::requireCompleteFinalPhysicalMemoryOwner(memory,{0,cpu},category));
+    // The original subset==category predicate is false even for complete,
+    // correctly owned source+ready+terminal backing.
+    const auto rows=memory.rankAttestation();
+    const auto line=std::find_if(rows.begin(),rows.end(),[&](const auto& row){return row.owner==category;});
+    ASSERT_NE(line,rows.end());
+    EXPECT_EQ(line->materialized_new_bytes+line->adopted_resident_bytes,2000u);
+    EXPECT_NE(line->materialized_new_bytes+line->adopted_resident_bytes,source.bytes()+ready.bytes()+retained.bytes());
+    EXPECT_THROW(test::requireCompleteFinalPhysicalMemoryOwner(memory,{1,cpu},category),std::logic_error);
+    EXPECT_THROW(test::requireCompleteFinalPhysicalMemoryOwner(memory,{0,DeviceId::rocm(0)},category),std::logic_error);
+    first={};
+    EXPECT_THROW(test::requireCompleteFinalPhysicalMemoryOwner(memory,{0,cpu},category),std::logic_error);
+}

@@ -5,7 +5,8 @@
  * Field visitors use structured bindings as compile-time exhaustiveness checks:
  * adding a member to a configuration aggregate requires updating its document
  * contract. Reads and writes use the same member list, including explicitness
- * and optional policy state. Routed plans retain their compact stage's global
+ * and optional policy state. A missing additive local-hot arm means the original
+ * shared-only intent; explicit C0 remains losslessly distinct. Routed plans retain their compact stage's global
  * layer origin, so saved configurations cannot rebase later PP stages to zero.
  * This is setup-only value serialization, not a live
  * device-state mirror or a competing physical-memory ledger.
@@ -153,7 +154,10 @@ namespace
 #define MEMBERS(X) X(owners) X(coordinator)
     RECORD(AdaptiveGPUCachePlacementRequest, mode, MEMBERS)
 #undef MEMBERS
-#define MEMBERS(X) X(gpu_cache_physical_byte_limit) X(gpu_policy) X(host) X(placement) X(source_backing)
+#define MEMBERS(X) X(cache_physical_byte_limit) X(policy) X(consumer_overrides)
+    RECORD(AdaptiveGPULocalHotCacheRequest, maximum_cache_rows, MEMBERS)
+#undef MEMBERS
+#define MEMBERS(X) X(gpu_cache_physical_byte_limit) X(gpu_policy) X(host) X(placement) X(source_backing) X(local_hot_cache)
     RECORD(AdaptiveVRAMRAMSSDRequest, maximum_gpu_cache_rows, MEMBERS)
 #undef MEMBERS
 #define MEMBERS(X) X(window_bytes) X(window_count) X(host_adaptive) X(distribution) X(gpu_adaptive)
@@ -254,6 +258,11 @@ namespace
         template<class T> void operator()(const char *name, T &value)
         {
             const auto field_path = path + "." + name;
+            // This additive optional arm has no intent in pre-feature shared-only
+            // documents. Every original field remains mandatory and lossless.
+            if constexpr (std::same_as<T, std::optional<AdaptiveGPULocalHotCacheRequest>>)
+                if (json.is_object() && !json.contains(name) && std::string_view(name) == "local_hot_cache")
+                { value.reset(); return; }
             if (!json.is_object() || !json.contains(name)) invalid(field_path, "missing field");
             value = decode<T>(json.at(name), field_path);
             consumed.emplace(name);

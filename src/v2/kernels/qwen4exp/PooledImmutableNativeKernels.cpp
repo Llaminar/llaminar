@@ -10,6 +10,7 @@
 #include "PooledImmutableNativeOperands.h"
 #include "PooledImmutableNativeAliasPolicy.h"
 #include "PooledImmutableNativeRootStorage.h"
+#include "execution/qwen4exp/PooledImmutableLocalHotPoolQuery.h"
 #include <stdexcept>
 namespace llaminar2::qwen4exp {
 namespace {
@@ -86,4 +87,14 @@ void IPooledImmutableNativeKernels::enqueue(n::CoordinatorAction action,PooledIm
     if(action==n::CoordinatorAction::Begin){const auto query=inputs.query();launch(action,args,&query,exact);}
     else launch(action,args,nullptr,exact);
 }
+void IPooledImmutableNativeKernels::enqueueCompactBegin(PooledImmutableCoordinatorPreparedStorage& storage,
+    const PooledImmutableLocalHotPoolQuery& query,void* exact)const
+{
+    stream(exact);storage.roots_->requireInitialized();query.require(storage.plan_);
+    if(backend()!=storage.plan_.parameters().device.type)
+        throw std::invalid_argument("Compact Begin selected a foreign original coordinator backend");
+    const n::CoordinatorArgs args{storage.plan_.parameters(),storage.roots_->address(0),storage.roots_->address(1),storage.roots_->address(2),{}};
+    const auto original=query.native();launch(n::CoordinatorAction::Begin,args,&original,exact);
+}
+
 }

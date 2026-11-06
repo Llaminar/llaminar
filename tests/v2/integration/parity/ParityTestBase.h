@@ -501,14 +501,6 @@ namespace llaminar2::test::parity
             rocm_count);
     }
 
-    /** Request-lifetime physical expert-movement contract for one parity cell. */
-    enum class ParityMoEMovementExpectation : std::uint8_t
-    {
-        NotApplicable,
-        NoMovement,
-        PhysicalMovement,
-    };
-
     /** Request-lifetime MTP policy contract for one generated parity cell. */
     enum class ParityMTPExpectation : std::uint8_t
     {
@@ -8114,9 +8106,12 @@ namespace llaminar2::test::parity
          * inference and any coordinated worker protocol have completed.
          *
          * @param records Process-local records retained for this campaign cell.
+         * @param boundary Only an explicit intermediate ordinary request postpones
+         * positive Dynamic proof; Final and all Static obligations remain strict.
          */
         void assertProductionParityMoEMovementEvidence(
-            const std::vector<PerfStatRecord> &records) const
+            const std::vector<PerfStatRecord> &records,
+            ParityMoEMovementEvidenceBoundary boundary = ParityMoEMovementEvidenceBoundary::Final) const
         {
             if (config_.moe_movement_expectation ==
                 ParityMoEMovementExpectation::NotApplicable)
@@ -8138,6 +8133,11 @@ namespace llaminar2::test::parity
             if (mpi_ctx_ && mpiWorldSize() > 1)
                 parityCoordinationMPIContext()->allreduce_sum(
                     local.data(), global.data(), global.size());
+
+            const auto status = parityMoEMovementEvidenceAtBoundary(
+                config_.moe_movement_expectation, global, boundary);
+            if (status == ParityMoEMovementEvidenceStatus::Intermediate)
+                return; // Incomplete observation; the ordinary cohort must still finish Final.
 
             const float movement_total =
                 global[0] + global[1] + global[2] + global[3];
@@ -11047,8 +11047,12 @@ namespace llaminar2::test::parity
 
         /**
          * @brief Export graph-path and economy evidence for a campaign.
+         * @param movement_boundary Final by default; an ordinary multi-request
+         * cohort may observe its first request while background calibration runs.
+         * Every graph/MTP/owner check and every Static check remains per request.
          */
-        void finishProductionParityEvidence()
+        void finishProductionParityEvidence(
+            ParityMoEMovementEvidenceBoundary movement_boundary = ParityMoEMovementEvidenceBoundary::Final)
         {
             if (!productionParityCampaignEnabled())
                 return;
@@ -11114,7 +11118,7 @@ namespace llaminar2::test::parity
                 ParityReferenceGenerationCoordination::SymmetricRanks)
             {
                 assertProductionParityMoEOwnerOrderEvidence(records);
-                assertProductionParityMoEMovementEvidence(records);
+                assertProductionParityMoEMovementEvidence(records, movement_boundary);
             }
             else
                 coordinated_passive_evidence_.requireServing();

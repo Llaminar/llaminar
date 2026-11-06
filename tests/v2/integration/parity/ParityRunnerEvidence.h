@@ -13,6 +13,8 @@
 
 #include "utils/PerfStatsCollector.h"
 #include <stdexcept>
+#include <algorithm>
+#include <cstdint>
 #include <array>
 #include <numeric>
 #include <span>
@@ -26,6 +28,66 @@ namespace llaminar2::test::parity
         RetainedRunner,
     };
 
+    /** Cell-lifetime physical movement contract; requests may share one original runner. */
+    enum class ParityMoEMovementExpectation : std::uint8_t
+    {
+        NotApplicable,
+        NoMovement,
+        PhysicalMovement,
+    };
+
+    /** Explicit evidence boundary; an intermediate request cannot certify a cohort. */
+    enum class ParityMoEMovementEvidenceBoundary : std::uint8_t
+    {
+        Intermediate,
+        Final,
+    };
+
+    /** Passive test evidence result, distinct from graph or runtime certification. */
+    enum class ParityMoEMovementEvidenceStatus : std::uint8_t
+    {
+        NotApplicable,
+        Intermediate,
+        Complete,
+        MissingPhysicalFacts,
+        UnexpectedMovement,
+    };
+
+    /**
+     * @brief Evaluate unchanged movement facts at an explicitly declared cell boundary.
+     * @param expectation Original typed cell obligation, never changed by calibration state.
+     * @param facts Latest cumulative snapshot of accepted/copied/bytes/applied facts.
+     * @param boundary Final by default; Intermediate postpones only positive Dynamic proof.
+     * @return Intermediate is expressly incomplete; Final still needs every physical fact.
+     * @throws std::invalid_argument For an unknown boundary or expectation.
+     * @note Static requires zero movement at every boundary. Snapshots are never added.
+     */
+    inline ParityMoEMovementEvidenceStatus parityMoEMovementEvidenceAtBoundary(
+        ParityMoEMovementExpectation expectation,
+        const std::array<float, 4> &facts,
+        ParityMoEMovementEvidenceBoundary boundary = ParityMoEMovementEvidenceBoundary::Final)
+    {
+        if (boundary != ParityMoEMovementEvidenceBoundary::Intermediate &&
+            boundary != ParityMoEMovementEvidenceBoundary::Final)
+            throw std::invalid_argument("Unknown parity movement evidence boundary");
+        switch (expectation)
+        {
+        case ParityMoEMovementExpectation::NotApplicable:
+            return ParityMoEMovementEvidenceStatus::NotApplicable;
+        case ParityMoEMovementExpectation::NoMovement:
+            return std::all_of(facts.begin(), facts.end(), [](float value) { return value == 0.0f; })
+                ? ParityMoEMovementEvidenceStatus::Complete
+                : ParityMoEMovementEvidenceStatus::UnexpectedMovement;
+        case ParityMoEMovementExpectation::PhysicalMovement:
+            if (boundary == ParityMoEMovementEvidenceBoundary::Intermediate)
+                return ParityMoEMovementEvidenceStatus::Intermediate;
+            return std::all_of(facts.begin(), facts.end(), [](float value) { return value > 0.0f; })
+                ? ParityMoEMovementEvidenceStatus::Complete
+                : ParityMoEMovementEvidenceStatus::MissingPhysicalFacts;
+        }
+        throw std::invalid_argument("Unknown parity movement expectation");
+    }
+
     /**
      * @brief Project the four required terminal movement facts for one parity cell.
      * @param records Current-cell collector snapshot, after original native work completed.
@@ -34,7 +96,7 @@ namespace llaminar2::test::parity
      * Native controller families originate only in the authenticated completed
      * physical-publication producer. Proposals and source arrivals do not
      * certify completion. CPU/mapped families retain their existing meanings.
-     * Runner reset erases these request counters; setup evidence cannot supply
+     * Cell evidence reset erases these counters; setup evidence cannot supply
      * movement credit to a later cell. These are observations, never capacity.
      */
     inline std::array<float, 4> parityMoEMovementFacts(

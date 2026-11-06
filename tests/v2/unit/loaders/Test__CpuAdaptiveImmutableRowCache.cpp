@@ -9,6 +9,8 @@
  * across ConsumerLocal populations; GPU populations here are metadata only.
  */
 #include "loaders/CpuAdaptiveImmutableRowCache.h"
+#include "loaders/ModelLoader.h"
+#include "../../utils/EmbeddingVerifierFormats.h"
 #include <gtest/gtest.h>
 #include <array>
 #include <algorithm>
@@ -172,6 +174,8 @@ TEST(CpuAdaptiveImmutableRowCache, ConsumerLocalSubordinateGeometryKeepsExactPMA
                     const std::array<std::int64_t,1> requested{1};
                     std::vector<std::byte> response(f.source.rowBytes());
                     EXPECT_THROW((void)cache->gather(requested,response),std::invalid_argument);
+                    EXPECT_THROW((void)cache->gather(requested,response,
+                        CpuImmutableRowCacheAccess::FutureLookupOnly),std::invalid_argument);
                     EXPECT_THROW((void)geometry.bom({1,DeviceId::cpu(),1ull<<34,1ull<<34}),std::invalid_argument);
                     if(count>1)EXPECT_THROW((void)Geometry::forSubordinateGPU(declared,Host,consumers.front()),std::invalid_argument);
                     EXPECT_THROW((void)Geometry::forSubordinateGPUs(declared,{1,DeviceId::cpu()}),std::invalid_argument);
@@ -652,4 +656,90 @@ TEST(CpuAdaptiveImmutableRowCache, RetiredPinAuthenticationFailureCannotRecoverW
     pin.reset();EXPECT_EQ(claimed(p,PhysicalMemoryOwner::ImmutableTableStorage),0u);
     EXPECT_EQ(claimed(p,PhysicalMemoryOwner::ImmutableLookupStaging),0u);
 }
+} // namespace llaminar2::test
+
+namespace llaminar2::test {
+/** @test Lookup-only native reads preserve subsequent demand choices and retained hit bytes. */
+TEST(CpuAdaptiveImmutableRowCache, LookupOnlyReadsNeverCreditReplacementPolicy) {
+    std::size_t covered = 0, unsupported = 0;
+    for (const auto &entry : embeddingVerifierFormats()) {
+        SCOPED_TRACE(entry.label);
+        const auto native = entry.create({2, 256}, 1701);
+        std::optional<GGUFTensorType> format;
+        // Resolve through the same production mapping as the native fixture.
+        // A future inventory entry without a native GGUF declaration must be
+        // explicitly accounted for rather than silently disappearing.
+        for (unsigned code = 0; code <= unsigned(GGUFTensorType::BF16); ++code) {
+            try {
+                if (ggufToTensorType(GGUFTensorType(code)) == native->native_type()) {
+                    format = GGUFTensorType(code);
+                    break;
+                }
+            } catch (const std::invalid_argument &) {}
+        }
+        if (!format) {
+            ASSERT_EQ(native->native_type(), TensorType::Q8_1)
+                << "Canonical format lacks its original GGUF declaration";
+            ++unsupported;
+            continue;
+        }
+        ++covered;
+        for (const auto slots : {0u, 1u, 4u}) {
+        SCOPED_TRACE(slots);
+        File f(*format,256);
+        const auto g=Geometry::fromLayout(layout(f,slots),Host,8,{.aging_accesses=2});
+        auto c=Cache::create(f.source,g,authority(g));
+        auto control=Cache::create(f.source,g,authority(g));
+        const auto bytes=f.source.rowBytes();std::vector<std::byte> out(8*bytes),expected(8*bytes);
+        const std::array<std::int64_t,2> seed{0,1};
+        c->gather(seed,std::span(out).first(2*bytes));
+        control->gather(seed,std::span(expected).first(2*bytes));
+        auto pin=c->tryPinResident(1);auto twin_pin=control->tryPinResident(1);
+        ASSERT_EQ(pin.has_value(),twin_pin.has_value());
+        for(int replay=0;replay<20;++replay) {
+            const auto before=c->stats();
+            const std::array<std::int64_t,5> forecast{1,90,90,0,91};
+            const auto observed=c->gather(forecast,std::span(out).first(5*bytes),
+                CpuImmutableRowCacheAccess::FutureLookupOnly);
+            expectRows(f,forecast,std::span(out).first(5*bytes));
+            EXPECT_EQ(observed.duplicate_rows,1u);EXPECT_EQ(observed.admissions,0u);
+            EXPECT_EQ(observed.evictions,0u);EXPECT_EQ(observed.invalidated_rows,0u);
+            EXPECT_EQ(observed.admission_rejections,0u);
+            EXPECT_EQ(c->stats().resident_rows,before.resident_rows);
+            EXPECT_EQ(c->stats().pinned_rows,before.pinned_rows);
+            const std::array<std::int64_t,1> demand{2+replay%7};
+            const auto actual=c->gather(demand,std::span(out).first(bytes));
+            const auto baseline=control->gather(demand,std::span(expected).first(bytes));
+            EXPECT_EQ(std::memcmp(out.data(),expected.data(),bytes),0);
+            EXPECT_EQ(actual.ram_rows,baseline.ram_rows);EXPECT_EQ(actual.source_rows,baseline.source_rows);
+            EXPECT_EQ(actual.admissions,baseline.admissions);EXPECT_EQ(actual.evictions,baseline.evictions);
+            EXPECT_EQ(actual.admission_rejections,baseline.admission_rejections);
+            for(std::int64_t row=0;row<10;++row) {
+                auto resident=c->tryPinResident(row);auto twin=control->tryPinResident(row);
+                EXPECT_EQ(resident.has_value(),twin.has_value());
+            }
+            if(pin)EXPECT_EQ(std::memcmp(pin->bytes().data(),f.original.data()+37+bytes,bytes),0);
+        }
+        const auto before=c->stats();const auto saved=out;
+        const std::array<std::int64_t,2> bad{0,128};
+        EXPECT_THROW(c->gather(bad,std::span(out).first(2*bytes),CpuImmutableRowCacheAccess::FutureLookupOnly),std::out_of_range);
+        EXPECT_EQ(out,saved);EXPECT_EQ(cacheWork(c->stats()),cacheWork(before));
+        EXPECT_THROW(c->gather(seed,std::span(out).first(bytes),CpuImmutableRowCacheAccess::FutureLookupOnly),std::invalid_argument);
+        EXPECT_THROW(c->gather({}, {},static_cast<CpuImmutableRowCacheAccess>(255)),std::invalid_argument);
+        const auto empty=c->gather({}, {},CpuImmutableRowCacheAccess::FutureLookupOnly);
+        EXPECT_EQ(empty.bytes,0u);EXPECT_EQ(empty.admissions,0u);
+        c->retire();
+        EXPECT_THROW(c->gather({}, {},CpuImmutableRowCacheAccess::FutureLookupOnly),std::runtime_error);
+        if(pin)EXPECT_EQ(std::memcmp(pin->bytes().data(),f.original.data()+37+bytes,bytes),0);
+        // A fresh owner resets operation scratch, not a parallel residency map.
+        auto fresh=Cache::create(f.source,g,authority(g));
+        EXPECT_EQ(fresh->gather(seed,std::span(out).first(2*bytes),CpuImmutableRowCacheAccess::FutureLookupOnly).source_rows,2u);
+        EXPECT_EQ(fresh->stats().resident_rows,0u);
+        }
+    }
+    EXPECT_GT(covered, 0u);
+    EXPECT_EQ(unsupported, 1u) << "Only the existing Q8_1 proprietary codebook lacks native GGUF mapping";
+    EXPECT_EQ(covered + unsupported, embeddingVerifierFormats().size());
+}
+
 } // namespace llaminar2::test

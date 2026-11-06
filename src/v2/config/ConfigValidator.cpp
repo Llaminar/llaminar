@@ -253,8 +253,8 @@ namespace llaminar2
 
         v.addRule({
             .id = "ngram-storage-policy",
-            .description = "Requested ngram storage/distribution has a checked explicit arm and bounded mapping policy",
-            .fix_hint = "Use replicated storage, explicit full-main gpu-adaptive-vram-ram-ssd with one GPU/R1 or homogeneous ConsumerLocal TP2/4/8 and local CPU source, or VRAM fixed-head-sharded on homogeneous rank-local TP2/4/8; Auto remains replicated VRAM/RAM/mmap",
+            .description = "Requested ngram storage/distribution and local/shared cache arms have checked independent bounded policies",
+            .fix_hint = "Use explicit adaptive DeclaredRankLocal owners for --ngram-local-cache-*; ConsumerLocal is independent and rejects that arm. Keep separate local/shared/source ceilings; Auto remains replicated VRAM/RAM/mmap",
             .applies = [](const OrchestrationConfig &) { return true; },
             .check = [](const OrchestrationConfig &c) -> std::optional<std::string>
             {

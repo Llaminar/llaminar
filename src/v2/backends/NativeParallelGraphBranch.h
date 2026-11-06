@@ -14,6 +14,7 @@
 #include <vector>
 #include <span>
 #include <algorithm>
+#include <memory>
 
 namespace llaminar2::detail
 {
@@ -24,6 +25,106 @@ namespace llaminar2::detail
         Error error;
         const char *operation;
     };
+
+    /**
+     * @brief Cold original-fragment to composed-parent exit mapping.
+     *
+     * A recording lifetime is replaced on reset/re-recording. Weak lifetime
+     * borrows therefore reject native-handle or C++ address reuse without a
+     * global nonce, source hash or mutable inference mirror. Repeated imports
+     * are retained separately and cannot name an ambiguous producer frontier.
+     */
+    template<class Graph, class Node>
+    class NativeCapturedFragmentFrontiers final
+    {
+    public:
+        /** @brief Save one actual import after its original native lowering succeeds. */
+        void remember(const void* original, const std::shared_ptr<const void>& lifetime,
+                      Graph source, std::size_t source_nodes, std::span<const Node> exits)
+        {
+            entries_.push_back({original,lifetime,source,source_nodes,{exits.begin(),exits.end()}});
+        }
+        /** @return The unique exact-current exit in this parent, or an empty span on invalid ownership. */
+        std::span<const Node> require(const void* original,
+            const std::shared_ptr<const void>& lifetime, Graph source, std::size_t source_nodes) const
+        {
+            const Entry* found=nullptr;
+            for(const auto& entry:entries_) {
+                if(entry.original!=original)continue;
+                if(found)return {};
+                found=&entry;
+            }
+            if(!found || !lifetime || !source || !source_nodes || found->source!=source || found->source_nodes!=source_nodes ||
+               !sameLifetime(found->lifetime,lifetime))return {};
+            return found->exits;
+        }
+        /** @return Whether this exact auxiliary definition already belongs to this parent. */
+        bool alreadyAttached(const void* original,const std::shared_ptr<const void>& lifetime,Graph source) const
+        {
+            for(const auto& entry:attached_)
+                if(entry.original==original || (entry.source==source && sameLifetime(entry.lifetime,lifetime)))return true;
+            return false;
+        }
+        /** @brief Retain the exact auxiliary identity only after native attachment succeeds. */
+        void attached(const void* original,const std::shared_ptr<const void>& lifetime,Graph source)
+        {attached_.push_back({original,lifetime,source,0,{}});}
+        /** @brief Invalidate all associations when the original parent resets. */
+        void clear() noexcept {entries_.clear();attached_.clear();}
+    private:
+        /** @brief One immutable original definition and its actual lowered parent nodes. */
+        struct Entry {
+            const void* original;
+            std::weak_ptr<const void> lifetime;
+            Graph source;
+            std::size_t source_nodes;
+            std::vector<Node> exits;
+        };
+        /** @return Same still-live original shared control block. */
+        static bool sameLifetime(const std::weak_ptr<const void>& weak,
+                                 const std::shared_ptr<const void>& expected)
+        {
+            const auto actual=weak.lock();
+            return actual && expected && actual.get()==expected.get() &&
+                !actual.owner_before(expected) && !expected.owner_before(actual);
+        }
+        std::vector<Entry> entries_,attached_;
+    };
+
+    /**
+     * @brief Fork a finite body after an actual imported producer exit.
+     * @param parent Original composed parent. @param child Same-device sealed finite definition.
+     * @param producer Exits returned only by this parent's original-fragment mapping.
+     * @return Original SDK status; later main nodes receive no dependency on this auxiliary.
+     * The graph's normal terminal closure joins the new child. There is no edge
+     * back to the producer fragment or to a subsequent LocalRead unit.
+     */
+    template<class API>
+    NativeParallelGraphResult<typename API::Error> appendNativeFiniteBodyAfterFrontier(
+        typename API::Graph parent, typename API::Graph child,
+        std::span<const typename API::Node> producer)
+    {
+        using Result=NativeParallelGraphResult<typename API::Error>;
+        using Node=typename API::Node;
+        if(!parent || !child || parent==child || producer.empty())
+            return Result{API::invalid,"exact finite producer/auxiliary ownership"};
+        std::size_t count=0;
+        auto error=API::nodes(parent,nullptr,&count);
+        if(error!=API::success)return Result{error,"query composed parent"};
+        std::vector<Node> nodes(count);
+        error=API::nodes(parent,nodes.data(),&count);
+        if(error!=API::success)return Result{error,"read composed parent"};
+        nodes.resize(count);
+        for(std::size_t i=0;i<producer.size();++i)
+            if(!producer[i] || std::find(nodes.begin(),nodes.end(),producer[i])==nodes.end() ||
+               std::find(producer.begin(),producer.begin()+i,producer[i])!=producer.begin()+i)
+                return Result{API::invalid,"original producer exit belongs to this parent"};
+        count=0;error=API::nodes(child,nullptr,&count);
+        if(error!=API::success)return Result{error,"query finite auxiliary"};
+        if(!count)return Result{API::invalid,"nonempty finite auxiliary"};
+        Node appended{};
+        error=API::child(&appended,parent,producer.data(),producer.size(),child);
+        return Result{error,"fork finite auxiliary after original producer"};
+    }
 
     /**
      * @brief Import finite siblings as independent roots/terminals of the SAME native parent.

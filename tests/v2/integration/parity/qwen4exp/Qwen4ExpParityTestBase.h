@@ -26,6 +26,8 @@
 #include "Qwen4ExpMTPExpertReference.h"
 #include "Qwen4ExpLookupRecordEvidence.h"
 #include "Qwen4ExpGPUAdaptiveLookupEvidence.h"
+#include "Qwen4ExpLocalHotTerminalEvidence.h"
+#include "Qwen4ExpOrdinaryGenerationWorkload.h"
 #include "Qwen4ExpGDNProjectionEvidence.h"
 #include "loaders/AdaptiveImmutableLookupGeometry.h"
 #include "execution/qwen4exp/ImmutableLookupExecutionBoundary.h"
@@ -70,6 +72,13 @@ class Qwen4ExpConfigDrivenParityTest : public qwen2::ConfigDrivenParityTest<Deri
 {
 protected:
     using Base = qwen2::ConfigDrivenParityTest<Derived>;
+    /** @return Existing short reuse input unless a source-owned ordinary fixture declares sustained work. */
+    virtual Qwen4ExpNativeGenerationRequest qwen4ExpLookupReuseRequest() const
+    {
+        return {std::vector<int32_t>(Base::config_.token_ids.begin(),Base::config_.token_ids.end()),
+            Base::productionParitySamplingParams(),2,2};
+    }
+
     /** @brief Retain the original published MPI inventory for the exact CPU socket domain. */
     void SetUp() override
     {
@@ -789,14 +798,38 @@ protected:
                 std::shared_ptr<::llaminar2::qwen4exp::PooledImmutableRetainedParticipants> participants;
                 std::shared_ptr<const ::llaminar2::qwen4exp::PooledImmutableReplicatedReaderTransport> reader;
             };
+            struct LocalHotWitness final {
+                std::shared_ptr<::llaminar2::qwen4exp::PooledImmutableLocalHotPreparedStorage> local;
+                ::llaminar2::qwen4exp::PooledImmutableLocalHotGeometry geometry;
+                ::llaminar2::qwen4exp::PooledImmutableNativeRoots roots;
+                std::shared_ptr<MappedHostTransferRegion> ready;
+                ImmutableLookupNativeOwnerObservation native_owner;
+                ImmutableLookupNativeOwnerObservation ready_owner;
+                std::uint64_t identity;
+                std::uint64_t storage_identity;
+            };
+            std::vector<LocalHotWitness> local_witnesses;
+            if(placement->gpuAdaptiveRequest().local_hot_cache) {
+                ASSERT_EQ(placement->gpuAdaptiveLocalHotCaches().size(),placement->gpuAdaptiveLayout().consumers().size());
+                for(const auto& geometry:placement->gpuAdaptiveLocalHotCaches()) {
+                    const auto local=context->adaptiveImmutableLookupLocalHot(geometry.allocator().device);
+                    ASSERT_TRUE(local);
+                    ASSERT_NO_THROW(local->requireFor(geometry,local->originalSource(),qfnObservationOwner().physical_memory_authority));
+                    local_witnesses.push_back({local,geometry,local->roots(),local->readyRegion(),
+                        local->retainedOwnerObservation(),local->retainedReadyObservation(),
+                        local->captureIdentity(),local->consumerStorageIdentity()});
+                }
+            }
             std::vector<ReaderWitness> reader_witnesses;
             std::vector<ConsumerWitness> witnesses;
             for (const auto consumer : placement->gpuAdaptiveLayout().consumers()) {
                 const auto boundary=context->adaptiveImmutableLookupBoundary(consumer.device);
                 const auto role=qwen4ExpAdaptiveExecutionRole(placement->gpuAdaptiveLayout(),placement->gpuAdaptiveRequest(),consumer);
                 if(role==Qwen4ExpAdaptiveExecutionRole::QueryReader){
-                    // The shared source identity proof above already authenticates
-                    // this reader's native result/ACK/control roots and SAME PMA.
+                    // The shared source identity proof authenticates this reader's
+                    // original holder and SAME PMA. Combined mode validates its
+                    // native compact request/result metadata and local roots;
+                    // shared-only keeps the original expanded FP32 contract.
                     // Keep that actual typed transport as the stability witness;
                     // a null boundary alone is never accepted as reader proof.
                     ASSERT_FALSE(boundary);
@@ -827,14 +860,21 @@ protected:
             // Forced numerical rows never certify the captured generation
             // controller. Use the existing public request path on
             // this same runner, original prompt and installed sampling law.
-            // Two outputs require one real model forward after the initial
-            // sample; an early EOS remains a failed witness, never suppressed.
-            const std::vector<int32_t> prompt(Base::config_.token_ids.begin(),Base::config_.token_ids.end());
+            // The default short witness requires one real model forward after
+            // the initial sample. Ordinary Dynamic cells instead retain their
+            // source-declared sustained request. An early stop below either
+            // original horizon remains a failure, never a suppressed EOS.
+            const auto request=qwen4ExpLookupReuseRequest();
+            ASSERT_FALSE(request.tokens.empty());
+            ASSERT_GT(request.minimum_tokens,0);
+            ASSERT_GE(request.maximum_tokens,request.minimum_tokens);
+            ASSERT_LE(request.tokens.size()+static_cast<std::size_t>(request.maximum_tokens),
+                static_cast<std::size_t>(Base::orch_runner_->config().max_seq_len));
             const auto generation=Base::orch_runner_->generate(
-                prompt,2,Base::productionParitySamplingParams());
+                request.tokens,request.maximum_tokens,request.sampling);
             std::ofstream generation_record(Base::ensureResultsDir()/"ngram_generation.txt");
             ASSERT_TRUE(generation_record.is_open());
-            generation_record<<"response_budget=2\nreturned_tokens="<<generation.tokens.size()
+            generation_record<<"response_budget="<<request.maximum_tokens<<"\nminimum_tokens="<<request.minimum_tokens<<"\nreturned_tokens="<<generation.tokens.size()
                 <<"\ncomplete="<<generation.is_complete<<"\nerror="<<generation.error<<"\ntoken_ids=";
             for(const auto token:generation.tokens)generation_record<<token<<' ';
             generation_record<<'\n';generation_record.flush();ASSERT_TRUE(generation_record.good());
@@ -842,8 +882,22 @@ protected:
             const auto native_submissions=PerfStatsCollector::snapshot({"ngram_lookup"});
             EXPECT_TRUE(PerfStatsCollector::writeCsv(
                 (Base::ensureResultsDir()/"ngram_expert_runtime.csv").string(),
-                {"ngram_lookup","moe_overlay","forward_graph"}))
+                {"ngram_lookup","immutable_lookup","moe_overlay","forward_graph"}))
                 << "Cannot retain original source/reader/expert terminal evidence";
+            if(!local_witnesses.empty()) {
+                // Original retained caches define this roster. Successful
+                // tokens cannot substitute for a missing consumer's report.
+                namespace h=::llaminar2::qwen4exp::local_hot;
+                std::vector<Qwen4ExpLocalHotTerminalOwner> local_owners;
+                for(const auto& witness:local_witnesses) {
+                    const auto allocator=witness.geometry.allocator();
+                    const auto source=witness.local->originalSource()->geometry().allocator();
+                    local_owners.push_back({allocator.device,witness.storage_identity,
+                        witness.geometry.slots(),witness.geometry.rowBytes(),
+                        allocator==source?h::TerminalReceiveRole::Coordinator:h::TerminalReceiveRole::Reader});
+                }
+                ASSERT_NO_THROW(requireQwen4ExpLocalHotTerminalEvidence(native_submissions,local_owners));
+            }
             for(const auto& record:native_submissions){
                 if(record.name!="retained_source_native_invocations" && record.name!="retained_remote_native_enqueues")continue;
                 ASSERT_TRUE(std::any_of(witnesses.begin(),witnesses.end(),[&](const auto& witness){
@@ -888,7 +942,9 @@ protected:
             std::ofstream csv(Base::ensureResultsDir()/"ngram_storage.csv");ASSERT_TRUE(csv.is_open());
             writeQwen4ExpLookupCounterCSV(csv,records);csv.flush();ASSERT_TRUE(csv.good());
             ASSERT_TRUE(generation.success())<<generation.error;
-            EXPECT_EQ(generation.tokens.size(),2u)<<"Adaptive terminal witness ended before one complete model forward";
+            EXPECT_GE(generation.tokens.size(),static_cast<std::size_t>(request.minimum_tokens))
+                <<"Adaptive terminal witness ended before its original declared generation horizon";
+            EXPECT_LE(generation.tokens.size(),static_cast<std::size_t>(request.maximum_tokens));
             for (const auto& witness : witnesses) {
                 const auto& boundary = witness.boundary;
                 ASSERT_FALSE(boundary->hasActiveInterval());
@@ -908,6 +964,27 @@ protected:
                 EXPECT_EQ(boundary->captureIdentity(),witness.identity);
                 EXPECT_EQ(context->adaptiveImmutableLookupBoundary(boundary->device()).get(),boundary.get());
             }
+            for(const auto& witness:local_witnesses) {
+                const auto current=context->adaptiveImmutableLookupLocalHot(witness.geometry.allocator().device);
+                ASSERT_EQ(current,witness.local);
+                EXPECT_FALSE(current.owner_before(witness.local));EXPECT_FALSE(witness.local.owner_before(current));
+                ASSERT_NO_THROW(current->requireFor(witness.geometry,current->originalSource(),
+                    qfnObservationOwner().physical_memory_authority));
+                EXPECT_EQ(current->captureIdentity(),witness.identity);
+                EXPECT_EQ(current->consumerStorageIdentity(),witness.storage_identity);
+                const auto roots=current->roots();
+                EXPECT_EQ(roots.cache,witness.roots.cache);EXPECT_EQ(roots.frame,witness.roots.frame);
+                EXPECT_EQ(roots.native,witness.roots.native);EXPECT_EQ(current->readyRegion(),witness.ready);
+                const auto native=current->retainedOwnerObservation();const auto ready=current->retainedReadyObservation();
+                EXPECT_EQ(native.authority(),witness.native_owner.authority());
+                EXPECT_EQ(native.allocator(),witness.native_owner.allocator());
+                EXPECT_EQ(native.tableStorageBytes(),witness.native_owner.tableStorageBytes());
+                EXPECT_EQ(native.lookupStagingBytes(),witness.native_owner.lookupStagingBytes());
+                EXPECT_EQ(ready.authority(),witness.ready_owner.authority());
+                EXPECT_EQ(ready.allocator(),witness.ready_owner.allocator());
+                EXPECT_EQ(ready.tableStorageBytes(),witness.ready_owner.tableStorageBytes());
+                EXPECT_EQ(ready.lookupStagingBytes(),witness.ready_owner.lookupStagingBytes());
+            }
             for(const auto& witness:reader_witnesses){
                 EXPECT_FALSE(context->adaptiveImmutableLookupBoundary(witness.consumer.device));
                 const auto current=context->adaptiveImmutableLookupParticipants(witness.consumer.device);
@@ -924,7 +1001,7 @@ protected:
             const auto &layout=placement->gpuAdaptiveLayout();
             const auto provider=context->hostImmutableRowProvider();ASSERT_TRUE(provider);
             ASSERT_NO_THROW((void)requireQwen4ExpGPUAdaptiveCohortEvidence(
-                records,layout,provider->source(),placement->gpuAdaptiveRequest()));
+                records,layout,provider->source(),placement->gpuAdaptiveRequest(),placement->gpuAdaptiveLocalHotCaches()));
             // Refresh from actual work while preserving every inherited raw
             // numerical/prefix result. No ModelContext reuse claim is inferred.
             Base::finishProductionParityEvidence();

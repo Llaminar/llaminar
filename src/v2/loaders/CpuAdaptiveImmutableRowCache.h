@@ -120,8 +120,13 @@ struct CpuImmutableRowGatherObservation final {
     std::uint64_t rows=0,bytes=0,ram_rows=0,source_rows=0,duplicate_rows=0,admissions=0,evictions=0;
     std::uint64_t admission_rejections=0,all_pinned_responses=0;
     ImmutableRowGatherObservation windows;
-    std::uint64_t policy_ordinal=0; ///< Owner-minted successful CPU policy order; never a GPU channel sequence.
+    std::uint64_t policy_ordinal=0; ///< Owner-minted successful gather order; neither demand-policy credit nor a GPU channel sequence.
     std::uint64_t invalidated_rows=0; ///< Exact per-call RAM detachments; never inferred GPU publications.
+};
+/** @brief Read purpose, not a replacement policy or future transport capability. */
+enum class CpuImmutableRowCacheAccess : std::uint8_t {
+    CurrentDemand, ///< Preserve the original frequency, recency and admission work.
+    FutureLookupOnly ///< Copy existing/native source bytes without replacement-policy credit.
 };
 /** @brief One exact native source and bounded CPU residency authority, with no public SSD-service escape. */
 class CpuAdaptiveImmutableRowCache final {
@@ -187,6 +192,19 @@ public:
      * @note Zero/all-pinned caches serve through the explicit SSD response path without allocation, wait or mode substitution.
      */
     CpuImmutableRowGatherObservation gather(std::span<const std::int64_t> ids,std::span<std::byte> destination);
+    /**
+     * @brief Copy through the same original source with an explicit read purpose.
+     * @param ids Complete valid original row IDs, including duplicates.
+     * @param destination Exact caller-owned native response bytes.
+     * @param access Current demand preserves existing policy; lookup-only never ages,
+     * touches, admits, evicts or invalidates hot rows.
+     * @return Actual copy/source/window work and serialized operation ordinal;
+     * lookup-only completion counts do not grant demand policy credit.
+     * @throws std::exception For invalid purpose, subordinate access, invalid frame,
+     * retirement or original source failure. No subordinate future protocol is enabled.
+     */
+    CpuImmutableRowGatherObservation gather(std::span<const std::int64_t> ids,std::span<std::byte> destination,
+        CpuImmutableRowCacheAccess access);
     /**
      * @brief Pin an existing native row without reading a missing source or altering logical replacement recency.
      * @param row Valid source row ID.
@@ -263,6 +281,19 @@ private:
     /** @brief Shared exact gather; null grant is legal only for independent CPU ownership. */
     CpuImmutableRowGatherObservation gatherImpl(std::span<const std::int64_t> ids,
         std::span<std::byte> destination,const ReadGrant *grant);
+    /**
+     * @brief Share byte/source work while lookup-only excludes replacement-policy mutations.
+     * @param ids Original validated row sequence; duplicate source reads coalesce.
+     * @param destination Exact externally owned native response storage.
+     * @param grant Original processor capability, absent for independent CPU reads.
+     * @param access Validated read purpose; subordinate grants currently require demand.
+     * @return Serialized completed native/source work, not speculative demand credit.
+     * @throws std::exception For incompatible access/grant, invalid capacity/alias/row,
+     * stale source, retired owner or failed original gather. Source failure is sticky.
+     */
+    CpuImmutableRowGatherObservation gatherImpl(std::span<const std::int64_t> ids,
+        std::span<std::byte> destination,const ReadGrant *grant,
+        CpuImmutableRowCacheAccess access);
     /** @brief Borrow only an actual current authorized response row; no public raw-row permit exists. */
     std::optional<Pin> pinSubordinate(const ReadGrant &grant,std::size_t response_row);
     /** @brief Preserve existing pin authentication while enforcing the access discipline. */

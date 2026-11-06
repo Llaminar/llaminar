@@ -816,4 +816,51 @@ class PairedCorpusExecutionTests(unittest.TestCase):
             self.assertIsNone(args.baseline_report)
             self.assertIn(str(root/'matrix'),args._paired_selection.pins)
 
+class DeclaredBenchmarkRepresentationTests(unittest.TestCase):
+    """Source document/argv spelling only, with no model or acceptance fabrication."""
+    @staticmethod
+    def document_record():
+        return {'model':'/actual/source.gguf','diagnostic_benchmark':{'schema':1,'policy':'diagnostic_declared',
+            'certification_eligible':False,'context_length':512,'configuration_policy':'lossless_declared_document_v1',
+            'configuration_document':{'kind':'llaminar.orchestration-config','schema_version':1,'configuration':{'ngram_table_policy':{
+                'storage':'AdaptiveVRAMRAMSSD','gpu_adaptive':{'local_hot_cache':{'consumer_overrides':[
+                    {'participant':{'world_rank':0,'backend':'ROCm','ordinal':0},'maximum_cache_rows':0,'cache_physical_byte_limit':0},
+                    {'participant':{'world_rank':0,'backend':'ROCm','ordinal':1},'maximum_cache_rows':512,'cache_physical_byte_limit':4096}]}}}}}}}
+
+    def test_lossless_original_document_retains_unequal_caps_and_pinned_artifact(self):
+        for replay in range(20):
+            record=self.document_record()
+            with tempfile.TemporaryDirectory() as directory:
+                arguments,owner,pins=adapter.canonical_diagnostic_arguments(record,Path(directory))
+                self.assertIsNone(owner)
+                self.assertEqual(arguments[0],'--config')
+                path=Path(arguments[1]);self.assertEqual(path.parent,Path(directory))
+                self.assertEqual(json.loads(path.read_text()),record['diagnostic_benchmark']['configuration_document'])
+                adapter.unchanged(pins)
+                self.assertEqual(arguments[2:],['-m',record['model'],'--context-length','512'])
+                with self.assertRaises(ValueError):adapter.canonical_diagnostic_arguments(record,Path(directory))
+                path.write_text('{}')
+                with self.assertRaises(ValueError):adapter.unchanged(pins)
+            arguments,owner,pins=adapter.canonical_diagnostic_arguments(record)
+            self.assertIsNotNone(owner);adapter.unchanged(pins)
+            owner.cleanup()
+
+    def test_document_and_argv_are_exclusive_and_incomplete_union_fails(self):
+        original=self.document_record()
+        invalid=[]
+        record=copy.deepcopy(original);record['diagnostic_benchmark']['args']=['--no-mtp'];invalid.append(record)
+        record=copy.deepcopy(original);del record['diagnostic_benchmark']['configuration_document'];invalid.append(record)
+        for value in (None,{},[],{'configuration':None}):
+            record=copy.deepcopy(original);record['diagnostic_benchmark']['configuration_document']=value;invalid.append(record)
+        record=copy.deepcopy(original);record['diagnostic_benchmark']['configuration_policy']='invented';invalid.append(record)
+        for record in invalid:
+            with self.assertRaises(ValueError):adapter.declared_benchmark_profile(record)
+        legacy={'model':'/actual/source.gguf','diagnostic_benchmark':{'schema':1,'policy':'diagnostic_declared',
+            'certification_eligible':False,'context_length':512,'args':['--no-mtp']}}
+        arguments,owner,pins=adapter.canonical_diagnostic_arguments(legacy)
+        self.assertEqual(arguments,['--no-mtp','-m',legacy['model'],'--context-length','512'])
+        self.assertIsNone(owner);self.assertEqual(pins,{})
+        legacy['diagnostic_benchmark']['configuration_policy']='lossless_declared_document_v1'
+        with self.assertRaises(ValueError):adapter.declared_benchmark_profile(legacy)
+
 if __name__=='__main__':unittest.main()

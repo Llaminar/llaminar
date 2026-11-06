@@ -970,13 +970,21 @@ namespace llaminar2
             const ComputeGraph &graph,
             std::span<const MoEOverlayRetainedCaptureUnit> units)
     {
-        if (!requiresHeterogeneousTicketSegmentation(
-                graph.nativeCaptureEnvelope()))
-        {
+        const bool native_auxiliary = graph.nativeCaptureEnvelope() ==
+            GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction;
+        if (native_auxiliary)
+            graph.requireRetainedParticipantNativeAuxiliaryParent();
+        else if (!requiresHeterogeneousTicketSegmentation(graph.nativeCaptureEnvelope()))
             throw std::invalid_argument(
-                "Stage-owned retained composition requires a typed heterogeneous ticket envelope");
-        }
+                "Stage-owned retained composition requires its original heterogeneous or native-auxiliary envelope");
 
+        // The main timeline and its finite participant service are recorded
+        // independently. Authenticate that original declaration before excluding
+        // it here; final parent attachment still owns the complete body/join.
+        graph.requireRetainedParticipantAuxiliaryRange();
+        // Native envelopes ignore packet-wave annotations, retaining immutable
+        // no-op reducers in main-unit stage identity. Heterogeneous envelopes
+        // instead represent those nodes as passive rendezvous after a unit.
         std::vector<std::string> expected_stages;
         expected_stages.reserve(graph.getExecutionOrder().size());
         for (const std::string &stage_name : graph.getExecutionOrder())
@@ -989,7 +997,8 @@ namespace llaminar2
                     stage_name);
             }
             if (node->stage->isManualGraphBoundary() ||
-                node->stage->isPassiveGraphCaptureNoOp())
+                (!native_auxiliary && node->stage->isPassiveGraphCaptureNoOp()) ||
+                graph.isRetainedParticipantAuxiliaryNode(stage_name))
             {
                 continue;
             }
@@ -1006,7 +1015,7 @@ namespace llaminar2
                 const ComputeNode *const node = graph.getNode(stage_name);
                 if (!node || !node->stage ||
                     node->stage->isManualGraphBoundary() ||
-                    node->stage->isPassiveGraphCaptureNoOp() ||
+                    (!native_auxiliary && node->stage->isPassiveGraphCaptureNoOp()) ||
                     !node->device.is_gpu() ||
                     node->stage->device() != node->device)
                 {

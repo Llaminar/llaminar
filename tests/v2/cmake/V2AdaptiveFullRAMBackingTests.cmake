@@ -53,6 +53,8 @@ endif()
 
 # Passive lookup comparisons use the same canonical diagnostic owner and fast Python schema replays.
 foreach(_passive_case
+        test_declared_combined_passive_binds_actual_local_ready_pairs_and_storage_windows
+        test_declared_combined_passive_rejects_foreign_incomplete_or_impossible_native_work
         test_declared_passive_environment_overrides_caller_profiling_before_startup
         test_declared_passive_adaptive_setup_and_zero_activity_are_complete
         test_declared_passive_rejects_partial_wrong_grants_and_foreign_setup
@@ -63,5 +65,29 @@ foreach(_passive_case
     set_tests_properties(V2_Integration_DeclaredPassiveLookup_${_passive_case} PROPERTIES
         LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Benchmark;Ownership;TraceReplay;Regression"
         TIMEOUT 30)
+    if(_passive_case MATCHES "^test_declared_combined_")
+        set_tests_properties(V2_Integration_DeclaredPassiveLookup_${_passive_case} PROPERTIES
+            LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Benchmark;Ownership;Configuration;Regression")
+    endif()
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_DeclaredPassiveLookup_${_passive_case})
 endforeach()
+
+# Cold lineage metadata is a projection only; it creates no model/native authority.
+if(TARGET v2_test_pooled_owner_pin_chain)
+    add_v2_test(V2_Integration_ImmutableLookupLocalSetupLineage
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_cohort_original_cases.py
+            $<TARGET_FILE:v2_test_pooled_owner_pin_chain>
+            --gtest_filter=PooledImmutableOwnerPinChain.LocalSetupLineageKeepsExactConsumerAndLegacyTags --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Memory;Ownership;Configuration;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ImmutableLookupLocalSetupLineage)
+endif()
+
+add_test(NAME V2_Integration_DeclaredBenchmarkLosslessDocument
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_model_kld_corpus_execution.py
+        DeclaredBenchmarkRepresentationTests)
+set_tests_properties(V2_Integration_DeclaredBenchmarkLosslessDocument PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Benchmark;Ownership;Configuration;Regression"
+    TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_DeclaredBenchmarkLosslessDocument)

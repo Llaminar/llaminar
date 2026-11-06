@@ -30,7 +30,7 @@ endif()
 if(TARGET v2_test_model_parity_definition)
     add_v2_test(V2_Integration_Qwen4ExpSourceReuseEligibilityContract
         COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
-            --gtest_filter=Qwen4ExpSourceAdmissionCases.SharedContinuationReuseEligibilityPreservesFollowerAndOwnerRoles:Qwen4ExpSourceAdmissionCases.SharedContinuationMTPProjectionPreservesCanonicalMatchedSeeds
+            --gtest_filter=Qwen4ExpSourceAdmissionCases.ConsumerLocalRecreationRetainsOriginalGPUOwners:Qwen4ExpSourceAdmissionCases.SharedContinuationReuseEligibilityPreservesFollowerAndOwnerRoles:Qwen4ExpSourceAdmissionCases.SharedContinuationMTPProjectionPreservesCanonicalMatchedSeeds
         LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Admission;Ownership;Contract;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
@@ -107,4 +107,131 @@ if(TARGET v2_test_model_parity_definition)
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpOrdinaryGenerationProjection)
+endif()
+
+# Exact local-cache intent must survive canonical runtime export before native
+# qualification; this registration makes no claim that a device path executed.
+if(TARGET v2_test_model_parity_definition)
+    add_v2_test(V2_Integration_QFNLocalHotRuntimeProjection
+        COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+            --gtest_filter=Qwen4ExpSourceAdmissionCases.LocalHotCache*
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Ngram;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QFNLocalHotRuntimeProjection)
+endif()
+
+# Focused declaration control; real source/ordinary/exact candidates remain hardware/model qualified separately.
+if(TARGET v2_test_model_parity_definition)
+    add_v2_test(V2_Integration_Qwen4ExpCombinedLocalHotC0ProjectionReplay
+        COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+            --gtest_filter=Qwen4ExpSourceAdmissionCases.CombinedLocalHotC0CandidatesRetainOriginalRequests --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Ngram;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpCombinedLocalHotC0ProjectionReplay)
+endif()
+
+# Positive/unequal cases retain separate actual source/runtime obligations; metadata proves no performance claim.
+if(TARGET v2_test_model_parity_definition)
+    add_v2_test(V2_Integration_Qwen4ExpLocalHotBudgetProjectionReplay
+        COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+            --gtest_filter=Qwen4ExpSourceAdmissionCases.LocalHotBudget* --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Ngram;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpLocalHotBudgetProjectionReplay)
+endif()
+add_v2_test(V2_Integration_ParityLosslessRuntimeDocumentReplay
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/../unit/scripts/test_model_parity_inventory.py LosslessRuntimeDocumentTests
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Parity;Configuration;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ParityLosslessRuntimeDocumentReplay)
+
+# Recurrent R3 candidates retain original source policies and lossless unequal-cache runtime exports.
+if(TARGET v2_test_model_parity_definition)
+    add_v2_test(V2_Integration_Qwen4ExpLocalHotRecurrentProjection
+        COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+            --gtest_filter=Qwen4ExpSourceAdmissionCases.LocalHotRecurrent* --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Parity;Inventory;Configuration;Ngram"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpLocalHotRecurrentProjection)
+endif()
+
+# CUDA combined-cache membership/configuration is a separate model-free inventory obligation.
+if(TARGET v2_test_model_parity_definition)
+    add_v2_test(V2_Integration_Qwen4ExpCUDALocalHotProjection
+        COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+            --gtest_filter=Qwen4ExpSourceAdmissionCases.CUDALocalHot* --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Parity;Inventory;Configuration;Ngram"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpCUDALocalHotProjection)
+endif()
+
+# GPU-only Q6 source/capture candidates retain exact original roles and configuration.
+if(TARGET v2_test_model_parity_definition)
+    add_v2_test(V2_Integration_Qwen4ExpAllGPUQ6LocalHotProjection
+        COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+            --gtest_filter=Qwen4ExpSourceAdmissionCases.AllGPUQ6LocalHot* --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Parity;Inventory;Configuration;Ngram"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpAllGPUQ6LocalHotProjection)
+endif()
+
+# Metadata/configuration validation only; actual complete-history panels remain separate.
+if(TARGET v2_test_model_parity_definition)
+    add_v2_test(V2_Integration_Qwen4ExpLocalHotNumericalProjection
+        COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+            --gtest_filter=Qwen4ExpLocalPairedCases.LocalHotNumericalPoliciesRequireExactPairedBindings --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Numerics;Inventory;Configuration"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpLocalHotNumericalProjection)
+endif()
+
+# Declaration/ownership proof only; actual SSD source and inference run separately.
+if(TARGET v2_test_model_parity_definition)
+    add_v2_test(V2_Integration_Qwen4ExpLocalHotSSDProjection
+        COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+            --gtest_filter=Qwen4ExpSourceAdmissionCases.LocalHotSSDProjectionPreservesBoundedSourceAndConsumerOwnership --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Ngram;Configuration;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpLocalHotSSDProjection)
+endif()
+
+if(TARGET v2_test_model_parity_definition)
+    add_v2_test(V2_Integration_Qwen4ExpLocalHotExplicitBudgetProjection
+        COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+            --gtest_filter=Qwen4ExpSourceAdmissionCases.LocalHotExplicitBudgetCandidatesPreserveOriginalPolicies:Qwen4ExpSourceAdmissionCases.LocalHotRefinedBudgetPreservesMeasuredPolicies --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Ngram;Configuration;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpLocalHotExplicitBudgetProjection)
+endif()
+
+# Actual request declaration only; real movement remains the native/model obligation.
+if(TARGET v2_test_model_parity_definition)
+    add_v2_test(V2_Integration_Qwen4ExpOrdinaryDeclaredMovementWorkload
+        COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+            --gtest_filter=Qwen4ExpSourceAdmissionCases.OrdinaryGenerationBindsDeclaredMovementHorizonAndInput --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Inventory;Configuration;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpOrdinaryDeclaredMovementWorkload)
+endif()
+
+if(TARGET v2_test_model_parity_definition)
+    target_sources(v2_test_model_parity_definition PRIVATE unit/parity/Test__Qwen4ExpLocalHotHeldSourceCases.cpp)
+    add_v2_test(V2_Integration_Qwen4ExpLocalHotHeldSourcePolicies
+        COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+            --gtest_filter=Qwen4ExpLocalHotHeldSourceCases.OriginalPoliciesRequirePoolC0AndOnePositiveOriginalConsumer --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Ngram;Configuration;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpLocalHotHeldSourcePolicies)
 endif()

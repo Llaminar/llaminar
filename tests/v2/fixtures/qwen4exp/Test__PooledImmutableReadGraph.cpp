@@ -56,7 +56,7 @@ TEST(PooledImmutableReadGraph, MissingIssuedReadImportOutputOrOriginalSpanReject
         if(defect==3)c.graph.getNode(reads.sealed)->dependencies={reads.imported[0]};
         if(defect==4)c.graph.getNode(reads.output)->dependencies={reads.planned};
         if(defect==5)reads.rowsReceived[0].clear();
-        if(defect==6)reads.outputSpan.bytes-=160*sizeof(float);
+        if(defect==6)std::get<q::PooledNativeTensorSpan>(reads.target).bytes-=160*sizeof(float);
         if(defect==7)reads.owners[0]=reads.owners[3];
         const auto before=c.graph.getExecutionOrder();EXPECT_THROW(requirePooledReadCompletion(c.graph,reads),std::invalid_argument);EXPECT_EQ(c.graph.getExecutionOrder(),before);
     }

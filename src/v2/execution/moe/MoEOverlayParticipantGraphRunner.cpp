@@ -20,6 +20,7 @@
  * CPU serial storage declarations survive admission and runtime projection.
  * Per-layer CPU packet roots retain their own exact backing allocation claims.
  */
+#include "execution/local_execution/graph/PreparedFollowerCaptureTerminals.h"
 
 #include "MoEOverlayParticipantGraphRunner.h"
 #include "MoEOverlayFinitePlacementGraphs.h"
@@ -1050,11 +1051,46 @@ namespace llaminar2
                     std::to_string(participant_id));
             }
         }
+        {
+            // Continuation construction may defer its graph declarations until
+            // this auxiliary owner is available. Prepared weights are already
+            // complete on every local participant, including retained dormant
+            // MTP layers. Publish those exact registry-owned banks before the
+            // whole-cohort readiness check; building a graph is not a required
+            // side effect of physical residency admission.
+            const auto manager = config_.model_context->concreteWeightManager();
+            std::string error;
+            if (!manager ||
+                !config_.participant_residency->bindOriginalPreparedContext(
+                    config_.model_context,
+                    config_.participant_residency->projectionPreparation(),
+                    &error) ||
+                !config_.participant_residency->finalizeInitialBanksFromPreparedRegistry(
+                    manager->expertGemmRegistry(), &error))
+            {
+                throw std::runtime_error(
+                    "Participant retained graph family initial prepared residency finalization failed: " +
+                    (error.empty() ? std::string("missing original prepared engine registry") : error));
+            }
+        }
         if (!config_.participant_residency->allInitialBanksReady())
         {
+            std::string deficits;
+            for (const auto &bank :
+                 config_.participant_residency->incompleteInitialBanks())
+            {
+                deficits += " participant=" + std::to_string(bank.participant_id) +
+                    " device=" + bank.device.toString() + " missing_layers=";
+                for (const int layer : bank.missing_layers)
+                    deficits += std::to_string(layer) + ",";
+                if (bank.publication_pending)
+                    deficits += "publication_pending";
+            }
             throw std::runtime_error(
-                "Participant retained graph families completed construction before every local initial prepared residency bank became ready");
+                "Participant retained graph families completed construction before every local initial prepared residency bank became ready:" +
+                deficits);
         }
+        if(config_.model_context)config_.model_context->sealPreparedFollowerCaptureTerminals();
         releasePreparedSourceBytes();
 
         PerfStatsCollector::addCounter(
@@ -3887,10 +3923,13 @@ namespace llaminar2
                                 const auto manager = config_.model_context
                                     ? config_.model_context->concreteWeightManager() : nullptr;
                                 const auto memory = manager ? manager->physicalMemoryAuthority() : nullptr;
-                                if (!memory || !endpoint->cache.prepareCaptureStreamTerminal(worker, memory))
+                                if (!memory || !config_.model_context)
                                     throw std::logic_error("Original follower terminal lost its admitted source/PMA");
                                 const auto domain = rank_local_publication_state_->originalSlotDomain();
-                                endpoint->cache.bindOriginalCaptureTerminalSlots(domain, memory, *original_native_slot_geometry_);
+                                auto population=config_.model_context->borrowPreparedFollowerCaptureTerminals(
+                                    {endpoint->participant_id,graph_family_ordinal,physical_rows,target_device},
+                                    endpoint->cache.capture_stream,*original_native_slot_geometry_,memory);
+                                endpoint->cache.bindPreparedFollowerCaptureTerminals(domain,std::move(population),memory);
                             }
                             if (!endpoint->cache.ensureCaptureOutputEvent(worker))
                             {

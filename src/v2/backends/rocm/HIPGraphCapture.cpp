@@ -878,6 +878,8 @@ namespace llaminar2
     {
         other.stream_ = nullptr;
         other.device_ordinal_ = -1;
+        definition_scope_=std::move(other.definition_scope_);
+        fragment_frontiers_=std::move(other.fragment_frontiers_);
         other.graph_ = nullptr;
         other.exec_ = nullptr;
         other.node_count_ = 0;
@@ -909,6 +911,8 @@ namespace llaminar2
                 other.ordered_timeline_timing_pending_;
             other.stream_ = nullptr;
             other.device_ordinal_ = -1;
+            definition_scope_=std::move(other.definition_scope_);
+            fragment_frontiers_=std::move(other.fragment_frontiers_);
             other.graph_ = nullptr;
             other.exec_ = nullptr;
             other.node_count_ = 0;
@@ -943,6 +947,8 @@ namespace llaminar2
 
     bool HIPGraphCapture::beginCapture()
     {
+        definition_scope_.reset();
+        fragment_frontiers_.clear();
         if (native_capture_active_)
             throw std::logic_error("HIP graph capture already owns a live native recording interval");
         if (!activateOwner("beginCapture"))
@@ -1343,6 +1349,8 @@ namespace llaminar2
                     reset();
                     return false;
                 }
+                fragment_frontiers_.remember(fragments[index],fragments[index]->definitionScope(),
+                    fragments[index]->graph(),fragments[index]->nodeCount(),imported.leaves);
                 frontier = std::move(imported.leaves);
                 expected_node_count += imported.node_count;
             }
@@ -1432,6 +1440,40 @@ namespace llaminar2
             /** @brief Join the bounded worker and the inference-owned Close. */
             static Error empty(Node *n, Graph g, const Node *d, std::size_t s) { return hipGraphAddEmptyNode(n, g, d, s); }
         };
+    }
+
+    bool HIPGraphCapture::appendFiniteBodyAfterCapturedFragment(
+        const IGPUGraphCapture& producer,const IGPUGraphCapture& body)
+    {
+        if(!activateOwner("appendFiniteBodyAfterCapturedFragment") || !graph_ || exec_ ||
+           !node_count_ || native_capture_active_)return false;
+        const auto* original=dynamic_cast<const HIPGraphCapture*>(&producer);
+        const auto* auxiliary=dynamic_cast<const HIPGraphCapture*>(&body);
+        if(!original || !auxiliary || original==this || auxiliary==this || original==auxiliary ||
+           original->deviceOrdinal()!=device_ordinal_ || auxiliary->deviceOrdinal()!=device_ordinal_ ||
+           original->projection_owner_!=projection_owner_ || auxiliary->projection_owner_!=projection_owner_ ||
+           !original->graph() || !auxiliary->graph() || auxiliary->graph()==graph_ ||
+           !original->nodeCount() || !auxiliary->nodeCount() ||
+           original->hasExecutable() || auxiliary->hasExecutable() ||
+           original->native_capture_active_ || auxiliary->native_capture_active_)return false;
+        const auto frontier=fragment_frontiers_.require(original,original->definition_scope_,original->graph(),original->nodeCount());
+        if(frontier.empty() || fragment_frontiers_.alreadyAttached(auxiliary,auxiliary->definitionScope(),auxiliary->graph()))
+            return false;
+        // The auxiliary waits only for its producing main unit. It is another
+        // final-parent terminal: joining it to the producer exit would prevent
+        // a later main LocalRead unit from releasing its maintenance wait.
+        const auto result=detail::appendNativeFiniteBodyAfterFrontier<HIPParallelGraphAPI>(graph_,auxiliary->graph(),frontier);
+        if(result.error!=hipSuccess){
+            LOG_ERROR("[HIPGraphCapture] Finite producer attachment failed operation="<<result.operation
+                      <<" error="<<hipGetErrorString(result.error));
+            return false;
+        }
+        definition_scope_.reset();
+        fragment_frontiers_.attached(auxiliary,auxiliary->definitionScope(),auxiliary->graph());
+        std::size_t count=0;
+        if(hipGraphGetNodes(graph_,nullptr,&count)!=hipSuccess)return false;
+        node_count_=count;
+        return true;
     }
 
     bool HIPGraphCapture::appendFiniteBodySiblings(std::span<const IGPUGraphCapture* const> originals)
@@ -1726,6 +1768,8 @@ namespace llaminar2
      */
     void HIPGraphCapture::reset()
     {
+        definition_scope_.reset();
+        fragment_frontiers_.clear();
         if (native_capture_active_)
         {
             if (!activateOwner("abortCapture")) std::terminate();

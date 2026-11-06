@@ -8,6 +8,7 @@
  * source-owned geometry, and every capacity decision uses complete PMA plans.
  */
 #include "planning/MemoryPlanner.h"
+#include "config/OrchestrationConfigDocument.h"
 #include "fixtures/backends/NativeContextPreparationReplayAccess.h"
 #include "mocks/MockWorkerGPUContext.h"
 #include "fixtures/planning/ImmutableRowTableAdmissionWireReplayAccess.h"
@@ -16,8 +17,12 @@
 #include "planning/PlanningModelMetadata.h"
 #include "planning/RankMemoryPlanInputs.h"
 #include "../../utils/CPUExecutionTestGeometry.h"
+#include "../../utils/PooledNgramReplayBudget.h"
+#include "integration/parity/qwen4exp/Qwen4ExpCombinedLocalHotCases.h"
 #include "planning/PhysicalMemoryCapacityExhausted.h"
 #include "loaders/AdaptiveImmutableLookupGeometry.h"
+#include "execution/qwen4exp/PooledImmutableRetainedParticipantBudget.h"
+#include "kernels/qwen4exp/PooledImmutableLocalHotTerminal.h"
 #include "execution/qwen4exp/PooledImmutableDirectedChannelGeometry.h"
 #include "kernels/qwen4exp/PooledImmutableNativeStorage.h"
 #include "transfer/TransferEngine.h"
@@ -881,7 +886,8 @@ void replayBalancedSharedCache(DeviceType backend,std::size_t count,bool constra
 /** @brief Actual grouped planner keeps original native continuation owners or opposite-vendor storage through selection/wire.
  * @param backend Original homogeneous compute backend.
  * @param cacheRows Declared zero/positive storage-owner cache envelope. */
-void replaySharedPlanning(DeviceType backend=DeviceType::ROCm,std::size_t cacheRows=64)
+void replaySharedPlanning(DeviceType backend=DeviceType::ROCm,std::size_t cacheRows=64,
+    std::optional<std::uint64_t> localRows=std::nullopt)
 {
     const auto devices=backend==DeviceType::CUDA ?
         std::vector{DeviceId::cuda(0),DeviceId::cuda(1),DeviceId::rocm(0)} :
@@ -899,6 +905,8 @@ void replaySharedPlanning(DeviceType backend=DeviceType::ROCm,std::size_t cacheR
         requested.gpu_adaptive.placement.owners.push_back({{0,devices[2].type,devices[2].ordinal},cacheRows,1048576});
     else for(const auto device:devices)
         requested.gpu_adaptive.placement.owners.push_back({{0,device.type,device.ordinal},cacheRows,1048576});
+    if (localRows) requested.gpu_adaptive.local_hot_cache = AdaptiveGPULocalHotCacheRequest{
+        .maximum_cache_rows=*localRows, .cache_physical_byte_limit=1048576};
     const auto projection=test::NativeOrderingEventGroupReplayAccess::projectionWithRemoteGraphs(originals.devices);
     const auto assignment=TensorParallelConfig::equalSplit(2,profile.n_heads,profile.n_kv_heads,
         profile.d_ff,profile.vocab_size,std::vector<DeviceId>{originals.devices[1],originals.devices[0]});
@@ -922,7 +930,50 @@ void replaySharedPlanning(DeviceType backend=DeviceType::ROCm,std::size_t cacheR
     const auto floor=MemoryPlanner::plan(profile,configs).physicalPlan();
     const auto selected=ImmutableRowTablePlacementPlanner::select(q,floor);
     ASSERT_TRUE(selected.placement->isGPUAdaptive());
-    const auto geometry=AdaptiveImmutableLookupGeometry::fromLayout(selected.placement->gpuAdaptiveLayout(),source(profile),requested.gpu_adaptive);
+    const auto geometry=AdaptiveImmutableLookupGeometry::fromLayoutWithLocalHot(selected.placement->gpuAdaptiveLayout(),
+        source(profile),requested.gpu_adaptive,selected.placement->gpuAdaptiveLocalHotCaches());
+    if (localRows)
+    {
+        ASSERT_EQ(selected.placement->gpuAdaptiveLocalHotCaches().size(),configs.size());
+        EXPECT_EQ(geometry.maximumIds(),q.execution_provision->maximumLiveIds());
+        EXPECT_EQ(geometry.coordinator().parameters().maximumUnique(),q.execution_provision->maximumLiveIds());
+        EXPECT_EQ(geometry.coordinator().parameters().maximumOriginal(),configs.size()*q.execution_provision->maximumLiveIds());
+        ASSERT_TRUE(geometry.localHotTransport());
+        for (std::size_t i=0;i<selected.placement->gpuAdaptiveLocalHotCaches().size();++i)
+        {
+            const auto& local=selected.placement->gpuAdaptiveLocalHotCaches()[i];
+            EXPECT_EQ(local.allocator(),selected.placement->gpuAdaptiveLayout().consumers()[i]);
+            EXPECT_EQ(local.slots(),*localRows);
+            EXPECT_EQ(local.extent(),selected.placement->extent());
+            EXPECT_EQ(local.maximumCompactMissRows(),q.execution_provision->maximumLiveIds());
+            EXPECT_LE(local.physicalBytes(),requested.gpu_adaptive.local_hot_cache->cache_physical_byte_limit);
+        }
+        EXPECT_THROW((void)AdaptiveImmutableLookupGeometry::fromLayout(selected.placement->gpuAdaptiveLayout(),
+            source(profile),requested.gpu_adaptive),std::invalid_argument);
+        const auto wire=serializeImmutableRowTableAdmissionRequests(std::array{q});
+        const auto parsed=test::ImmutableRowTableAdmissionWireReplayAccess::parse(wire,0,&profile,projection);
+        ASSERT_EQ(parsed.size(),1u);
+        const auto replay=ImmutableRowTablePlacementPlanner::select(parsed.front(),floor);
+        EXPECT_EQ(*replay.placement,*selected.placement);
+        EXPECT_EQ(replay.physical_plan.summary(),selected.physical_plan.summary());
+        auto resolved=configs;
+        for(auto& cfg:resolved)cfg.ngram_table_placement=selected.placement;
+        const auto projected=MemoryPlanner::plan(profile,resolved).physicalPlan();
+        const auto missing=projected.requiredFootprintMismatch(selected.physical_plan);
+        const auto extra=selected.physical_plan.requiredFootprintMismatch(projected);
+        EXPECT_FALSE(missing)<<missing.value_or("");
+        EXPECT_FALSE(extra)<<extra.value_or("");
+        for(const auto& bom:floor.resources())for(std::size_t i=0;i<PhysicalMemoryBOM::ownerCount();++i)
+        {
+            const auto owner=PhysicalMemoryBOM::ownerAt(i);
+            if(owner==PhysicalMemoryOwner::ImmutableTableStorage || owner==PhysicalMemoryOwner::ImmutableLookupStaging ||
+                owner==PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent || owner==PhysicalMemoryOwner::NativeStorageGraphExecutable ||
+                owner==PhysicalMemoryOwner::ActivationTransportStaging)continue;
+            EXPECT_EQ(bytes(selected.physical_plan,{bom.resource().world_rank,bom.resource().device},owner),bom.bytes(owner))
+                <<toString(owner)<<" on "<<bom.resource().device.toString();
+        }
+        return;
+    }
     ASSERT_TRUE(geometry.readerGeometry());
     EXPECT_EQ(geometry.physical().coordinator().device,devices[1]);
     ASSERT_EQ(geometry.physical().owners().size(),backend==DeviceType::CUDA?1u:2u);
@@ -1061,5 +1112,240 @@ TEST(GPUAdaptiveImmutableLookupAdmission, ConsumerLocalTP4AndTP8RankInputsKeepOr
         invalid.local_tp_devices[1]=GlobalDeviceAddress::fromLocalDeviceId(
             backend==DeviceType::CUDA?DeviceId::rocm(0):DeviceId::cuda(0),plan.hostname,0);
         EXPECT_THROW(immutableRowTableTPTopology(profile,invalid),std::invalid_argument);
+    }
+}
+
+/** @test The actual canonical shared-source planner retains separate local C0/positive geometry and wire identity. */
+TEST(GPUAdaptiveImmutableLookupAdmission, LocalHotCombinedCanonicalAdmissionAndReprojection)
+{
+    for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm})
+        for(const std::uint64_t local:{0u,64u})for(const std::size_t pool:{0u,64u})
+            EXPECT_EXIT({
+                const auto* result=::testing::UnitTest::GetInstance()->current_test_info()->result();
+                const int first=result->total_part_count();
+                replaySharedPlanning(backend,pool,local);
+                // GTest suppresses event forwarding in death-test children.
+                // Preserve actual predicate diagnostics before process-owned retirement.
+                bool failed=false;
+                for(int i=first;i<result->total_part_count();++i) {
+                    const auto& part=result->GetTestPartResult(i);
+                    if(part.failed()) {
+                        failed=true;
+                        std::cerr<<part.file_name()<<':'<<part.line_number()<<": "<<part.summary()<<'\n';
+                    }
+                }
+                std::cout.flush();std::cerr.flush();
+                std::_Exit(failed?1:0);},::testing::ExitedWithCode(0),"");
+}
+
+/** @test The real local geometry/BOM preserves bounded native rows and immutable source/consumer identity. */
+TEST(GPUAdaptiveImmutableLookupAdmission, LocalHotGeometryOwnsMandatoryFloorBeforeOptionalNativeSlots)
+{
+    const ImmutableRowTableSource original{.rows=1024,.row_elements=128,.format=GGUFTensorType::Q8_0};
+    for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm})for(const auto count:{1u,2u,4u,8u})
+    {
+        const PhysicalMemoryResource host{0,DeviceId::cpu(),1ull<<30,1ull<<30};
+        std::vector<DeviceId> devices;
+        for(unsigned ordinal=0;ordinal<count;++ordinal)devices.emplace_back(backend,ordinal);
+        const auto projection=test::NativeOrderingEventGroupReplayAccess::projection(devices);
+        for(const auto device:devices)
+        {
+            const PhysicalMemoryResource gpu{0,device,1ull<<30,1ull<<30};
+            const auto zero=qwen4exp::PooledImmutableLocalHotGeometry::declare(original,{0,device},32,0,{65536,3,4});
+            const auto hot=qwen4exp::PooledImmutableLocalHotGeometry::declare(original,{0,device},32,64,{65536,3,4});
+            const auto mandatory=zero.mandatoryBOM(gpu,host,projection);
+            EXPECT_EQ(mandatory.summary(),hot.mandatoryBOM(gpu,host,projection).summary());
+            EXPECT_EQ(zero.physicalBytes(),0u);
+            EXPECT_GT(hot.physicalBytes(),64u*original.rowBytes());
+            EXPECT_EQ(hot.maximumCompactMissRows(),32u);
+            EXPECT_EQ(hot.extent(),ImmutableRowTableExtent::fromNative(original.format,original.rows,original.rowBytes()));
+            PhysicalMemoryPlanBuilder complete(mandatory);
+            const auto optional=hot.slotDependentBOM(gpu,host,projection);
+            for(const auto& line:optional.resources()) complete.add(line);
+            EXPECT_TRUE(complete.build().fits());
+        }
+    }
+}
+
+/** @test Original five policy ratios match total canonical PMA bytes, not optional caps or per-device usage. */
+TEST(GPUAdaptiveImmutableLookupAdmission, CanonicalPooledReplayMatchesCompletePhysicalBudgets)
+{
+    EXPECT_EXIT(([]{
+        try {
+            SharedPlanningSource originals({DeviceId::rocm(0),DeviceId::rocm(1)});
+            test::Qwen4ExpPlanningGGUFFixture file;PlanningModelSource model(file.path());
+            const auto& profile=model.metadata().memoryProfile();
+            namespace q=test::parity::qwen4exp;
+            std::vector<ImmutableRowTablePolicy> policies;
+            for(const auto& cell:q::qwen4ExpLocalHotBudgetOrdinaryCases())policies.push_back(*cell.ngram_table_policy);
+            if(policies.size()!=5)throw std::logic_error("Matched benchmark lost its five original functional profiles");
+            const auto projection=test::NativeOrderingEventGroupReplayAccess::projectionWithRemoteGraphs(originals.devices);
+            const auto assignment=TensorParallelConfig::equalSplit(2,profile.n_heads,profile.n_kv_heads,
+                profile.d_ff,profile.vocab_size,originals.devices);
+            const auto resolve=[&](const ImmutableRowTablePolicy& requested) {
+                std::vector<DevicePlanConfig> configs{consumer(DeviceType::ROCm),consumer(DeviceType::ROCm)};
+                for(std::size_t i=0;i<configs.size();++i) {
+                    auto& cfg=configs[i];cfg.device=originals.devices[i];cfg.total_shards=2;cfg.shard_index=int(i);
+                    cfg.ngram_execution_policy=requested;cfg.ngram_tp_topology=ImmutableRowTableTPTopology::HomogeneousFullMainRankLocal;
+                    cfg.local_tp_backend=CollectiveBackendType::RCCL;cfg.tensor_parallel_assignment=assignment.forDevice(cfg.device);
+                    cfg.native_context_preparation=originals.source;cfg.native_ordering_events=projection;
+                    if(requested.gpu_adaptive.placement.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal) {
+                        cfg.ngram_gpu_peer_access=PeerAccessCoverage::None;
+                        cfg.ngram_reader_peer_access={{{0,DeviceId::rocm(0)},{0,DeviceId::rocm(1)},PeerAccessCoverage::None}};
+                    }
+                    test::declareRecordedNgramHostServices(cfg);
+                }
+                ClusterInventory cluster;cluster.world_size=1;RankInventory rank;rank.rank=0;cluster.ranks.push_back(rank);
+                (void)MemoryPlanner::declareRetainedHostServices(profile,configs,0,nullptr,cluster,test::planningHostServiceProjection());
+                const std::vector<std::vector<DevicePlanConfig>> groups{configs};
+                const auto request=MemoryPlanner::immutableRowTableAdmissionRequest(profile,requested,groups,{},configs.front().ngram_host_placement);
+                if(!request)throw std::logic_error("Matched benchmark lost original source provision");
+                const auto floor=MemoryPlanner::plan(profile,configs).physicalPlan();
+                return ImmutableRowTablePlacementPlanner::select(*request,floor);
+            };
+            const auto original=policies;
+            const auto matched=test::projectPooledNgramReplayBudgets(policies,16384,resolve);
+            ASSERT_EQ(matched.size(),5u);EXPECT_EQ(policies,original);
+            for(const auto& row:matched) {
+                EXPECT_TRUE(row.selected.physical_plan.fits());
+                EXPECT_EQ(row.within_alignment_tolerance,row.residual_bytes<=16384u);
+                EXPECT_EQ(row.selected.physical_plan.totalBytes()+row.residual_bytes,row.target_bytes);
+                EXPECT_EQ(row.target_bytes,matched.front().target_bytes);
+                if(row.next_larger)EXPECT_GT(row.next_larger->physical_plan.totalBytes(),row.target_bytes);
+                const auto fresh=resolve(row.requested);
+                EXPECT_EQ(fresh.physical_plan.summary(),row.selected.physical_plan.summary());
+                EXPECT_EQ(fresh.placement->gpuAdaptiveRowElements(),160u);
+                EXPECT_EQ(fresh.placement->gpuAdaptiveLayout().extent().rowBytes(),90u);
+                OrchestrationConfig declaration;
+                declaration.ngram_table_policy=row.requested;
+                const auto document=nlohmann::json::parse(serializeOrchestrationConfig(declaration));
+                std::cout<<"POOLED_BENCHMARK_POLICY "<<nlohmann::json{
+                    {"target_bytes",row.target_bytes},{"physical_bytes",row.selected.physical_plan.totalBytes()},
+                    {"residual_bytes",row.residual_bytes},{"within_alignment_tolerance",row.within_alignment_tolerance},
+                    {"ngram_table_policy",document.at("configuration").at("ngram_table_policy")},
+                    {"complete_plan",row.selected.physical_plan.summary()},
+                    {"next_larger_plan",row.next_larger?row.next_larger->physical_plan.summary():std::string{}}}.dump()<<std::endl;
+            }
+            const std::array same{policies.front(),policies.front()};
+            const auto exact=test::projectPooledNgramReplayBudgets(same,0,resolve);
+            EXPECT_TRUE(exact.front().within_alignment_tolerance);
+            EXPECT_EQ(exact.front().residual_bytes,0u);
+            auto zero=policies.front();
+            test::pooled_budget_detail::caps(zero,[](auto& cap){cap=0;});
+            const std::array erased{zero,zero};
+            EXPECT_THROW(test::projectPooledNgramReplayBudgets(erased,16384,resolve),std::invalid_argument);
+            const auto changedCeiling=[&](const ImmutableRowTablePolicy& requested) {
+                auto result=resolve(requested);
+                // A real alternate resource observation is built by the original BOM
+                // builder; no live allocator or admission receipt is forged.
+                PhysicalMemoryPlanBuilder changed;
+                for(const auto& line:result.physical_plan.resources()) {
+                    auto resource=line.resource();resource.total_bytes+=4096;
+                    PhysicalMemoryBOMBuilder copy(resource);
+                    for(std::size_t i=0;i<PhysicalMemoryBOM::ownerCount();++i) {
+                        const auto owner=PhysicalMemoryBOM::ownerAt(i);copy.add(owner,line.bytes(owner));
+                    }
+                    changed.add(copy.build());
+                }
+                if(requested!=policies.front())result.physical_plan=changed.build();
+                return result;
+            };
+            EXPECT_THROW(test::projectPooledNgramReplayBudgets(policies,16384,changedCeiling),std::invalid_argument);
+        }catch(const std::exception& error){std::cerr<<error.what()<<'\n';std::_Exit(1);}
+        const auto* current=::testing::UnitTest::GetInstance()->current_test_info();
+        const bool failed=current && current->result()->Failed();
+        if(failed)for(int i=0;i<current->result()->total_part_count();++i){const auto& part=current->result()->GetTestPartResult(i);if(part.failed())std::cerr<<part.summary()<<'\n';}
+        std::cerr.flush();std::_Exit(failed?1:0);
+    }()),::testing::ExitedWithCode(0),"");
+}
+
+/** @test Real source/coordinator and query-only reader each retain exactly one fresh terminal packet beside original source/ready credit. */
+TEST(GPUAdaptiveImmutableLookupAdmission, LocalTerminalHostBOMIsOncePerConsumerAcrossResolvedReuse)
+{
+    for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm}) {
+        EXPECT_EXIT(([&]{
+            try {
+                const std::vector devices{DeviceId{backend,0},DeviceId{backend,1}};
+                SharedPlanningSource originals(devices);
+                test::Qwen4ExpPlanningGGUFFixture file;PlanningModelSource model(file.path());
+                const auto& profile=model.metadata().memoryProfile();
+                const auto projection=test::NativeOrderingEventGroupReplayAccess::projectionWithRemoteGraphs(devices);
+                const auto assignment=TensorParallelConfig::equalSplit(2,profile.n_heads,profile.n_kv_heads,
+                    profile.d_ff,profile.vocab_size,devices);
+                for(unsigned coordinator:{0u,1u})for(bool combined:{false,true}) {
+                    auto requested=policy(64);auto& adaptive=requested.gpu_adaptive;
+                    adaptive.source_backing=AdaptiveImmutableRowBacking::RAM;adaptive.host={};
+                    adaptive.maximum_gpu_cache_rows=0;adaptive.gpu_cache_physical_byte_limit=0;
+                    adaptive.placement.mode=AdaptiveGPUCachePlacementMode::DeclaredRankLocal;
+                    adaptive.placement.coordinator=AdaptiveGPUCacheParticipant{0,backend,static_cast<int>(coordinator)};
+                    adaptive.placement.owners={{{0,backend,static_cast<int>(1-coordinator)},64,1048576}};
+                    if(combined)adaptive.local_hot_cache=AdaptiveGPULocalHotCacheRequest{};
+                    std::vector<DevicePlanConfig> configs{consumer(backend),consumer(backend)};
+                    for(unsigned i=0;i<2;++i) {
+                        auto& cfg=configs[i];cfg.device=devices[i];cfg.total_shards=2;cfg.shard_index=i;
+                        cfg.ngram_execution_policy=requested;cfg.ngram_tp_topology=ImmutableRowTableTPTopology::HomogeneousFullMainRankLocal;
+                        cfg.local_tp_backend=backend==DeviceType::CUDA?CollectiveBackendType::NCCL:CollectiveBackendType::RCCL;
+                        cfg.tensor_parallel_assignment=assignment.forDevice(cfg.device);
+                        cfg.native_context_preparation=originals.source;cfg.native_ordering_events=projection;
+                        cfg.ngram_gpu_peer_access=PeerAccessCoverage::None;
+                        cfg.ngram_reader_peer_access={{{0,devices[coordinator]},{0,devices[1-coordinator]},PeerAccessCoverage::None}};
+                        test::declareRecordedNgramHostServices(cfg);
+                    }
+                    ClusterInventory cluster;cluster.world_size=1;RankInventory rank;rank.rank=0;cluster.ranks.push_back(rank);
+                    (void)MemoryPlanner::declareRetainedHostServices(profile,configs,0,nullptr,cluster,test::planningHostServiceProjection());
+                    const std::vector<std::vector<DevicePlanConfig>> groups{configs};
+                    const auto request=MemoryPlanner::immutableRowTableAdmissionRequest(profile,requested,groups,{},configs.front().ngram_host_placement);
+                    if(!request)throw std::logic_error("Terminal cost lost its original actual source request");
+                    const auto unresolved=MemoryPlanner::plan(profile,configs).physicalPlan();
+                    const auto selected=ImmutableRowTablePlacementPlanner::select(*request,unresolved);
+                    const auto geometry=AdaptiveImmutableLookupGeometry::fromLayoutWithLocalHot(selected.placement->gpuAdaptiveLayout(),
+                        source(profile),adaptive,selected.placement->gpuAdaptiveLocalHotCaches());
+                    const auto& host=*configs.front().associated_host_memory;
+                    const std::array<PhysicalMemoryResource,2> gpu{{{0,devices[0],configs[0].device_total_bytes,configs[0].device_free_bytes},
+                        {0,devices[1],configs[1].device_total_bytes,configs[1].device_free_bytes}}};
+                    PhysicalMemoryPlanBuilder original(test::AdaptiveImmutableLookupGeometryReplayAccess::mandatory(geometry,gpu,host,projection));
+                    const auto cache=geometry.cacheBOM(gpu,host);
+                    for(const auto& line:cache.resources())original.add(line);
+                    const auto local_optional=geometry.localHotSlotDependentBOM(gpu,host,projection);
+                    for(const auto& line:local_optional.resources())original.add(line);
+                    const auto transport=qwen4exp::PooledImmutableRetainedParticipantBudget::completeBOM(geometry,host,gpu,projection);
+                    for(const auto& line:transport.resources())original.add(line);
+                    const auto original_bom=original.build();
+                    const auto source_staging=original_bom.find({0,DeviceId::cpu()})->bytes(PhysicalMemoryOwner::ImmutableLookupStaging);
+                    const auto packets=combined?2*qwen4exp::local_hot::terminalObservationBytes(1,sampling_math::kDeviceGenerationControlCount):0u;
+                    auto resolved=configs;
+                    for(auto& cfg:resolved)cfg.ngram_table_placement=selected.placement;
+                    const auto projected=MemoryPlanner::plan(profile,resolved).physicalPlan();
+                    EXPECT_EQ(projected.find({0,DeviceId::cpu()})->bytes(PhysicalMemoryOwner::ImmutableLookupStaging),source_staging+packets);
+                    EXPECT_FALSE(projected.requiredFootprintMismatch(selected.physical_plan));
+                    EXPECT_FALSE(selected.physical_plan.requiredFootprintMismatch(projected));
+                    // Retained fixture inputs describe only the original model
+                    // roots. The new runner's pinned terminal packet is not a
+                    // source or mapped-ready resident credit.
+                    const auto local_floor=geometry.localHotMandatoryBOM(gpu,host,projection);
+                    const auto* ready=local_floor.find({0,DeviceId::cpu()});
+                    const auto ready_bytes=ready?ready->bytes(PhysicalMemoryOwner::ImmutableLookupStaging):0u;
+                    for(auto& cfg:resolved) {
+                        const auto* original_gpu=original_bom.find({0,cfg.device});
+                        cfg.retained_immutable_table_bytes=original_gpu->bytes(PhysicalMemoryOwner::ImmutableTableStorage);
+                        cfg.retained_immutable_lookup_staging_bytes=original_gpu->bytes(PhysicalMemoryOwner::ImmutableLookupStaging);
+                        if(cfg.device==devices[coordinator]) {
+                            cfg.retained_immutable_source_table_bytes=original_bom.find({0,DeviceId::cpu()})->bytes(PhysicalMemoryOwner::ImmutableTableStorage);
+                            cfg.retained_immutable_source_lookup_staging_bytes=source_staging-ready_bytes;
+                            cfg.retained_immutable_local_ready_staging_bytes=ready_bytes;
+                        }
+                    }
+                    const auto reused=MemoryPlanner::plan(profile,resolved).physicalPlan();
+                    const auto* cpu=reused.find({0,DeviceId::cpu()});
+                    EXPECT_EQ(cpu->bytes(PhysicalMemoryOwner::ImmutableLookupStaging),source_staging+packets);
+                    EXPECT_EQ(cpu->alreadyResidentBytes(PhysicalMemoryOwner::ImmutableLookupStaging),source_staging);
+                    EXPECT_EQ(cpu->charge(PhysicalMemoryOwner::ImmutableLookupStaging).incrementalBytes(),packets);
+                }
+            }catch(const std::exception& error){std::cerr<<error.what()<<'\n';std::_Exit(1);}
+            const auto* current=::testing::UnitTest::GetInstance()->current_test_info();
+            const bool failed=current&&current->result()->Failed();
+            if(failed)for(int i=0;i<current->result()->total_part_count();++i){const auto& part=current->result()->GetTestPartResult(i);if(part.failed())std::cerr<<part.summary()<<'\n';}
+            std::cerr.flush();std::_Exit(failed?1:0);
+        }()),::testing::ExitedWithCode(0),"");
     }
 }

@@ -10,6 +10,7 @@
  */
 
 #include "planning/ActivationMemoryEstimator.h"
+#include "kernels/qwen4exp/PooledImmutableLocalHotTerminal.h"
 #include "tensors/AlignedVector.h"
 #include <initializer_list>
 #include "kernels/gdn/GDNPreparedQK.h"
@@ -382,6 +383,15 @@ size_t ActivationMemoryEstimator::estimate(
             geometry.batch_size, geometry.generation_request_capacity).bytes(),
             "resident generation request seeds");
 
+    // This request-terminal root is independent of recurrent-layer inventory.
+    // Price it beside the common request buffers, before the non-GDN return.
+    if (device.is_gpu() && geometry.local_hot_terminal_observation &&
+        geometry.ngram_lookup == ImmutableRowLookupExecution::AdaptiveGPUCache)
+        bytes = checkedAdd(bytes, qwen4exp::local_hot::terminalObservationBytes(
+            std::max(geometry.batch_size, geometry.generation_request_capacity),
+            sampling_math::kDeviceGenerationControlCount),
+            "separate local terminal observation arena");
+
     const size_t rows = static_cast<size_t>(geometry.resident_graph_rows);
     const size_t target_rows =
         static_cast<size_t>(geometry.mtp_target_query_rows);
@@ -615,7 +625,13 @@ std::size_t ActivationMemoryEstimator::immutableLookupArenaBytes(const ModelMemo
     if (!geometry.ngram_lookup)
         throw std::invalid_argument("Ngram execution contract is required for lookup arena candidate projection");
     const auto [resolver, dimensions] = qwenLookupGeometry(profile, geometry, device);
-    return qwen4ExpLookupArenaBytes(resolver, *profile.flash_next, dimensions);
+    auto bytes=qwen4ExpLookupArenaBytes(resolver, *profile.flash_next, dimensions);
+    if(device.is_gpu() && geometry.local_hot_terminal_observation &&
+        geometry.ngram_lookup==ImmutableRowLookupExecution::AdaptiveGPUCache)
+        bytes=checkedAdd(bytes,qwen4exp::local_hot::terminalObservationBytes(
+            std::max(geometry.batch_size,geometry.generation_request_capacity),sampling_math::kDeviceGenerationControlCount),
+            "separate local terminal observation arena");
+    return bytes;
 }
 
 } // namespace llaminar2

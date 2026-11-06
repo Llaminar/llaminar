@@ -32,6 +32,8 @@ private:
     friend class qwen4exp::ImmutableLookupSubmissionRetirement;
     friend class ReadAheadNativeParentTerminal;
     friend class OriginalSlotCaptureTerminals;
+    friend class PreparedFollowerCaptureTerminalOwner;
+    friend class PreparedFollowerCaptureTerminalPopulation;
     // The original cache owns its singleton native creator/destructor; this
     // friendship only brackets that existing handle with its admitted group.
     friend class DeviceGraphExecutor;

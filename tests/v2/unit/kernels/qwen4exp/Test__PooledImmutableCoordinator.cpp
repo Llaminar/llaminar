@@ -8,6 +8,9 @@
  * of the CPU consumer and independent cross-vendor coordinator declaration.
  */
 #include "kernels/qwen4exp/PooledImmutableCoordinatorGeometry.h"
+#include "kernels/qwen4exp/PooledImmutableLocalHotTransportOps.h"
+#include "execution/qwen4exp/PooledImmutableNativeTransfer.h"
+#include "execution/qwen4exp/PooledImmutableLocalHotTransportGeometry.h"
 #include "execution/qwen4exp/PooledImmutableReplicatedReaderGeometry.h"
 #include "kernels/qwen4exp/PooledImmutableCoordinatorOps.h"
 #include "loaders/ModelLoader.h"
@@ -834,6 +837,153 @@ TEST(PooledImmutableCoordinator, NativeReaderFreshReceiptAndCurrentACKReplay)
         ++receipt.sequence;
         EXPECT_FALSE(matches(receipt, bytes));
     }
+}
+
+/** @test Unequal compact native requests use the actual original pool's stable union/inverse. */
+TEST(PooledImmutableCoordinator, LocalHotCompactMissesReuseOriginalUnionAndRejectForeignRosters)
+{
+    namespace t=qwen4exp::local_hot_transport;
+    const t::QueryIdentity query{701,17,40,4};
+    std::array<a::KeyIndex,16> canonical{};
+    const std::array<std::uint64_t,16> original{5,9,5,2,5,9,5,2,5,9,5,2,5,9,5,2};
+    for(std::uint32_t i=0;i<16;++i)canonical[i]={original[i],i,0};
+    std::stable_sort(canonical.begin(),canonical.end(),[](auto x,auto y){return x.row<y.row;});
+    std::uint64_t originalCount=16;
+    std::array<std::uint64_t,2> keys0{5,9},keys1{9,2};
+    std::array<t::RequestHeader,3> requests{};std::array<std::uint64_t,3> headerBytes{},keyBytes{};
+    t::UnionControl control{};std::array<std::uint64_t,48> merged{};
+    const t::SourceAdmissionHeader admission{701,17,23,37};
+    t::UnionArgs args{};args.expected=&query;args.source_admission=&admission;args.canonical={canonical.data(),&originalCount,16};
+    args.consumer_count=3;args.capacity=merged.size();args.output=&control;args.merged_keys=merged.data();
+    for(std::uint32_t c=0;c<3;++c){
+        requests[c].source_admission=23;requests[c].source_invocation=37;
+        requests[c].query={701,17,40+c,4+c};requests[c].consumer=c;requests[c].original_ids=16;
+        requests[c].native_row_bytes=18;requests[c].native_format=static_cast<std::uint32_t>(GGUFTensorType::IQ4_NL);
+        requests[c].miss_rows=c==2?0:2;headerBytes[c]=sizeof(t::RequestHeader);keyBytes[c]=requests[c].miss_rows*8;
+        args.consumers[c]={c,3,16,16,0x100000100ULL,18,static_cast<std::uint32_t>(GGUFTensorType::IQ4_NL),40+c};
+        args.requests[c]={&requests[c],c==0?keys0.data():keys1.data(),&headerBytes[c],&keyBytes[c]};
+    }
+    ASSERT_TRUE(t::prepareUnion(args));ASSERT_EQ(control.pool_original_ids,4);
+    for(std::uint32_t c=0;c<3;++c)for(std::uint32_t m=0;m<requests[c].miss_rows;++m)ASSERT_TRUE(t::copyMiss(args,c,m));
+    const std::array<std::uint64_t,4> expected{5,9,9,2};EXPECT_TRUE(std::equal(expected.begin(),expected.end(),merged.begin()));
+    Pool pool(std::array{0u});pool.begin(std::span(merged.data(),control.pool_original_ids));
+    ASSERT_EQ(pool.frame.unique_rows,3u);
+    EXPECT_EQ(pool.unique[0].row,5);EXPECT_EQ(pool.unique[1].row,9);EXPECT_EQ(pool.unique[2].row,2);
+    const std::array<std::uint32_t,4> inverse{0,1,1,2};EXPECT_TRUE(std::equal(inverse.begin(),inverse.end(),pool.permutation.begin()));
+    keys1[0]=6;EXPECT_FALSE(t::copyMiss(args,1,0)); // in source range, absent from actual query
+    keys1={9,9};EXPECT_FALSE(t::copyMiss(args,1,1)); // duplicate is unnecessary native traffic
+    keys1={2,9};EXPECT_FALSE(t::copyMiss(args,1,1)); // wrong stable original ordering
+    keys1={9,2};--keyBytes[1];EXPECT_FALSE(t::prepareUnion(args));EXPECT_EQ(control.pool_original_ids,-1);
+    ++keyBytes[1];++requests[1].query.consumer_storage_identity;
+    EXPECT_FALSE(t::prepareUnion(args));EXPECT_EQ(control.pool_original_ids,-1);
+    --requests[1].query.consumer_storage_identity;++requests[1].query.source_storage_generation;
+    EXPECT_FALSE(t::prepareUnion(args));EXPECT_EQ(control.pool_original_ids,-1);
+    --requests[1].query.source_storage_generation;requests[1].intent=qwen4exp::PooledImmutableLocalHotAccessIntent::FutureReadAhead;
+    EXPECT_FALSE(t::prepareUnion(args));EXPECT_EQ(control.pool_original_ids,-1);
+}
+
+/** @test Native compact rows are accepted only by exact original query/source/reader/extent receipts. */
+TEST(PooledImmutableCoordinator, LocalHotNativeReceiptsKeepArbitraryMissCountsAndAbsorbingFailures)
+{
+    namespace t=qwen4exp::local_hot_transport;
+    const t::QueryIdentity query{701,17,77,9};
+    const t::ConsumerGeometry geometry{1,2,32,32,1000,18,static_cast<std::uint32_t>(GGUFTensorType::IQ4_NL),77};
+    for(unsigned replay=0;replay<20;++replay)for(const auto misses:{0u,1u,3u,17u,32u}){
+        t::RequestHeader request{};request.query=query;request.original_ids=32;request.consumer=1;
+        request.native_format=geometry.native_format;request.native_row_bytes=18;request.miss_rows=misses;
+        request.source_admission=2;request.source_invocation=37;
+        const t::SourceAdmissionHeader admission{701,17,2,37};
+        ASSERT_TRUE(t::acceptRequest(request,query,geometry,32,admission,sizeof(request),misses*8));
+        t::ResultHeader result{};result.query=query;result.pool_interval={701,2,11};result.consumer=1;
+        result.native_format=geometry.native_format;result.miss_rows=misses;result.native_bytes=misses*18;
+        ASSERT_TRUE(t::acceptResult(result,request,geometry,sizeof(result),misses*18));
+        for(unsigned mutation=0;mutation<10;++mutation){auto invalid=result;
+            if(mutation==0)++invalid.query.sequence;
+            if(mutation==1)++invalid.query.source_storage_generation;
+            if(mutation==2)++invalid.pool_interval.table;
+            if(mutation==3)++invalid.query.consumer_storage_identity;
+            if(mutation==4)invalid.pool_interval.sequence=0;
+            if(mutation==5)invalid.consumer=0;
+            if(mutation==6)++invalid.native_format;
+            if(mutation==7)++invalid.miss_rows;
+            if(mutation==8)invalid.status=a::Status::Cancelled;
+            if(mutation==9)invalid.intent=qwen4exp::PooledImmutableLocalHotAccessIntent::FutureReadAhead;
+            EXPECT_FALSE(t::acceptResult(invalid,request,geometry,sizeof(result),misses*18))<<mutation;
+        }
+        EXPECT_FALSE(t::acceptResult(result,request,geometry,0,misses*18));
+        EXPECT_FALSE(t::acceptResult(result,request,geometry,sizeof(result),misses*18+1));
+        if(misses)EXPECT_FALSE(t::acceptResult(result,request,geometry,sizeof(result),misses*4*16));
+        ++request.original_ids;EXPECT_FALSE(t::acceptRequest(request,query,geometry,32,admission,sizeof(request),misses*8));
+    }
+}
+
+/** @test Optional compact completion slots and mandatory source scratch are exact without changing shared-only bytes. */
+TEST(PooledImmutableCoordinator, LocalHotGeometryKeepsOriginalUniqueBoundAndOptionalNativeSlots)
+{
+    namespace q=qwen4exp;
+    for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm})for(const auto degree:{1u,2u,4u,8u}){
+        std::vector<PhysicalMemoryAllocatorIdentity> consumers;
+        for(unsigned i=0;i<degree;++i)consumers.push_back({0,{backend,static_cast<int>(i)}});
+        const auto extent=ImmutableRowTableExtent::fromNative(GGUFTensorType::IQ4_NL,1000,18);
+        const auto shape=degree==1?q::PooledImmutableLocalHotTransportGeometry::singleton(consumers[0],16,extent):
+            q::PooledImmutableLocalHotTransportGeometry::declare(q::PooledImmutableReplicatedReaderGeometry::native(consumers[0],consumers,16,32),extent);
+        EXPECT_EQ(shape.maximumPoolUniqueRows(),16u);EXPECT_EQ(shape.maximumPoolOriginalRows(),16u*degree);
+        EXPECT_EQ(shape.resultCapacityBytes(),16u*18u);EXPECT_EQ(shape.incomingKeyBytes(),(degree-1)*16u*8u);
+        EXPECT_EQ(shape.outgoingNativeBytes(),(degree-1)*16u*18u);
+        if(degree==1){EXPECT_EQ(shape.mergedKeyBytes(),0u);EXPECT_FALSE(shape.originalReaders());continue;}
+        std::vector<std::uint8_t> positive(degree);for(unsigned i=1;i<degree;++i)positive[i]=i%2;
+        const q::PooledNativeCompletionLayout shared(degree,0,positive),compact(degree,0,positive,q::PooledNativeReaderMessageProfile::CompactNative);
+        EXPECT_EQ(shared.readerProfile(),q::PooledNativeReaderMessageProfile::ReplicatedFP32);
+        for(unsigned i=1;i<degree;++i){
+            EXPECT_EQ(shared.receiptBytesPerParticipant(i),(positive[i]?12u:1u)*sizeof(ncclLlaminarByteCompletion));
+            EXPECT_EQ(compact.receiptBytesPerParticipant(i),(positive[i]?13u:2u)*sizeof(ncclLlaminarByteCompletion));
+            EXPECT_THROW(shared.operandOffset(q::PooledNativeCountedMessage::LocalHotMissKeys,0,i),std::invalid_argument);
+            EXPECT_NO_THROW(compact.operandOffset(q::PooledNativeCountedMessage::LocalHotMissKeys,0,i));
+        }
+    }
+}
+
+/** @test Actual request admission stays separate from unequal L1 ordinals and pool intervals. */
+TEST(PooledImmutableCoordinator, LocalHotRequestPublicationRejectsStaleAdmissionAndKeepsEmptyProgress)
+{
+    namespace t=qwen4exp::local_hot_transport;
+    std::uint64_t admission=23,invocation=37;
+    t::SourceAdmissionHeader source{};
+    ASSERT_TRUE(t::publishSourceAdmission({701,17,&admission,&invocation,&source}));
+    std::uint64_t headerBytes=sizeof(source),misses=3,bytes=999;
+    std::uint64_t original=32;
+    t::QueryIdentity query{701,17,77,9};
+    const t::ConsumerGeometry geometry{1,2,32,32,1000,18,static_cast<std::uint32_t>(GGUFTensorType::IQ4_NL),77};
+    t::RequestHeader request{};t::RequestLaneIdentity lane{};
+    t::RequestArgs args{&query,&original,&misses,&source,&headerBytes,geometry,
+        qwen4exp::PooledImmutableLocalHotAccessIntent::CurrentInvocation,&request,&lane,&bytes};
+    for(unsigned replay=0;replay<20;++replay){
+        for(const auto live:{32u,3u,0u,1u}){
+            misses=live;++query.sequence;
+            ASSERT_TRUE(t::prepareRequest(args));EXPECT_EQ(bytes,live*8u);
+            EXPECT_EQ(lane.table,701);EXPECT_EQ(lane.source_admission,23);EXPECT_EQ(lane.sequence,query.sequence);
+            t::RequestLaneIdentity received{};
+            const t::QueryIdentity sourceQuery{701,17,66,1}; // source ordinal is deliberately unrelated
+            ASSERT_TRUE(t::acceptRequestLane(request,sourceQuery,geometry,32,source,sizeof(request),received));
+            EXPECT_EQ(received.sequence,query.sequence);
+            t::ResultHeader result{};std::uint64_t nativeBytes=999;
+            ASSERT_TRUE(t::prepareResult(request,geometry,source,{701,23,101},result,nativeBytes));
+            EXPECT_EQ(nativeBytes,live*18u);
+            EXPECT_TRUE(t::acceptResult(result,request,geometry,sizeof(result),nativeBytes));
+            auto stale=source;++stale.source_invocation;
+            EXPECT_FALSE(t::acceptRequestLane(request,sourceQuery,geometry,32,stale,sizeof(request),received));
+            EXPECT_EQ(received.sequence,0);
+            EXPECT_FALSE(t::prepareResult(request,geometry,source,{701,24,101},result,nativeBytes));
+            EXPECT_EQ(nativeBytes,0);
+        }
+    }
+    --headerBytes;EXPECT_FALSE(t::prepareRequest(args));EXPECT_EQ(bytes,0);EXPECT_EQ(lane.sequence,0);
+    ++headerBytes;args.intent=qwen4exp::PooledImmutableLocalHotAccessIntent::FutureReadAhead;
+    EXPECT_FALSE(t::prepareRequest(args));EXPECT_EQ(bytes,0);
+    args.intent=qwen4exp::PooledImmutableLocalHotAccessIntent::CurrentInvocation;
+    source.status=a::Status::Cancelled;EXPECT_FALSE(t::prepareRequest(args));EXPECT_EQ(bytes,0);
+    admission=0;EXPECT_FALSE(t::publishSourceAdmission({701,17,&admission,&invocation,&source}));
+    EXPECT_NE(source.status,a::Status::Success);
 }
 
 } // namespace llaminar2::test

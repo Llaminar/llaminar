@@ -3375,3 +3375,38 @@ TEST(Test__OrchestrationConfigParser, NgramGPUAdaptiveVramRamSsdHelpNamesActualS
         "--ngram-source-cache-protected-numerator","--ngram-source-cache-protected-denominator"})
         EXPECT_NE(help.find(name),std::string::npos) << name;
 }
+
+/** @test Local L1 flags retain independent shared/source ceilings and explicit combined C0. */
+TEST(Test__OrchestrationConfigParser, NgramLocalHotCacheHasIndependentExplicitArm)
+{
+    // Help is generated from the SAME CliSpec entries used for parsing, so a
+    // second hand-maintained option list cannot hide or rename this arm.
+    const auto help = OrchestrationConfigParser::getHelpText();
+    for (const auto* flag : {"--ngram-local-cache-max-rows", "--ngram-local-cache-bytes",
+        "--ngram-local-cache-aging-accesses", "--ngram-local-cache-protected-numerator",
+        "--ngram-local-cache-protected-denominator"})
+        EXPECT_NE(help.find(flag), std::string::npos) << flag;
+    OrchestrationConfigParser parser;
+    for (const auto* rows : {"0", "64"})
+    {
+        ArgvHelper args{"llaminar2", "--ngram-storage", "gpu-adaptive-vram-ram-ssd",
+            "--ngram-gpu-cache-placement", "0:rocm:0/128/1048576@0:cuda:0",
+            "--ngram-local-cache-max-rows", rows, "--ngram-local-cache-bytes", "65536",
+            "--ngram-local-cache-aging-accesses", "97", "--ngram-local-cache-protected-numerator", "2",
+            "--ngram-local-cache-protected-denominator", "5"};
+        const auto c = parser.parseArgs(args.argc(), args.argv());
+        const auto& local = c.ngram_table_policy.gpu_adaptive.local_hot_cache;
+        ASSERT_TRUE(local);
+        EXPECT_EQ(local->maximum_cache_rows, std::stoull(rows));
+        EXPECT_EQ(local->cache_physical_byte_limit, 65536u);
+        EXPECT_EQ(local->policy, (CpuImmutableRowCachePolicy{97,2,5}));
+        EXPECT_EQ(c.ngram_table_policy.gpu_adaptive.placement.owners.front().maximum_cache_rows, 128u);
+        EXPECT_EQ(c.ngram_table_policy.gpu_adaptive.host, HostAdaptiveRAMSSDRequest{});
+        EXPECT_EQ(parser.parseYamlString(serializeOrchestrationConfig(c)).ngram_table_policy, c.ngram_table_policy);
+    }
+    ArgvHelper independent{"llaminar2", "--ngram-storage", "gpu-adaptive-vram-ram-ssd",
+        "--ngram-local-cache-max-rows", "0"};
+    EXPECT_THROW((void)parser.parseArgs(independent.argc(), independent.argv()), std::invalid_argument);
+    ArgvHelper absent{"llaminar2", "--ngram-storage", "gpu-adaptive-vram-ram-ssd"};
+    EXPECT_FALSE(parser.parseArgs(absent.argc(), absent.argv()).ngram_table_policy.gpu_adaptive.local_hot_cache);
+}

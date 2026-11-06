@@ -17,6 +17,8 @@
 #endif
 namespace llaminar2::qwen4exp
 {
+/** @brief Original token-expanded IDs and concatenated compact misses have distinct count units. */
+enum class QwenAdaptiveQuerySemantics { OriginalNgramRows, CompactNativeMisses };
 /** @brief Immutable reporting tuple, with original duplicate IDs separate from unique probe rows. */
 struct QwenAdaptiveCounterTotals
 {
@@ -96,15 +98,21 @@ LLAMINAR_ADAPTIVE_COUNTER_HD bool accumulateQwenAdaptiveCounters(std::int32_t *r
  * @brief Validate completed terminal observations against the exact original native source/frame envelope.
  * @param v Actual terminal tuple. @param rowBytes Original native stride, never decoded width.
  * @param maximumIds Admitted maximum original IDs per frame, not communication extent.
+ * @param semantics Actual source input contract; compact miss counts need not fill a sixteen-head token.
  * @return Whether all overflow-safe successful/failed-work relations hold.
  * @details Failed frames may have probes, evictions, validated source bytes or
  * Ready transitions even though no complete output is claimed. Successful-only
  * windows require every miss served and every eviction followed by a promotion.
  */
 inline bool validQwenAdaptiveCounters(const QwenAdaptiveCounterTotals &v, std::size_t rowBytes,
-                                      std::uint64_t maximumIds)
+                                      std::uint64_t maximumIds,
+                                      QwenAdaptiveQuerySemantics semantics=QwenAdaptiveQuerySemantics::OriginalNgramRows)
 {
-    if (!rowBytes || !maximumIds || maximumIds % 16 || v.completed_live_ids % 16 ||
+    if (semantics!=QwenAdaptiveQuerySemantics::OriginalNgramRows &&
+        semantics!=QwenAdaptiveQuerySemantics::CompactNativeMisses)
+        return false;
+    if (!rowBytes || !maximumIds || maximumIds % 16 ||
+        (semantics==QwenAdaptiveQuerySemantics::OriginalNgramRows && v.completed_live_ids % 16) ||
         v.failed_frames > v.calls || v.hit_rows > UINT64_MAX - v.miss_rows ||
         v.source_rows > UINT64_MAX / rowBytes || v.source_bytes != v.source_rows * rowBytes ||
         v.source_rows > v.miss_rows || v.promotions > v.source_rows || v.evictions > v.miss_rows)

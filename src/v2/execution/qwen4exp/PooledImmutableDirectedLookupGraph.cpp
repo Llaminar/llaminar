@@ -11,6 +11,7 @@
 #include "PooledImmutableReplicatedReaderGraph.h"
 #include "PooledImmutableParticipantLocalGraph.h"
 #include "execution/compute_stages/stages/qwen4exp/PooledImmutableNativePhaseStage.h"
+#include "execution/compute_stages/stages/qwen4exp/PooledImmutableLocalHotPhaseStage.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "backends/NativeContextPreparation.h"
 #include <stdexcept>
@@ -25,13 +26,19 @@ void publishFragment(ComputeGraph& graph,ComputeGraph fragment){
     graph.merge(std::move(fragment));
 }
 }
-PooledImmutableDirectedLookupEndpoints appendPooledImmutableDirectedLookupGraph(
+/** @brief One original pool phase program; the typed query selects only real Begin/read consumers. */
+class PooledImmutableDirectedLookupBuilder final {
+public:
+/** @brief Build cold participant-local phases without changing the original physical-owner protocol. */
+static PooledImmutableDirectedLookupEndpoints append(
     ComputeGraph& graph,BufferArena& arena,std::shared_ptr<q::ImmutableLookupExecutionBoundary> boundary,
     std::shared_ptr<const q::PooledImmutableDirectedTransport> transport,
-    std::shared_ptr<const q::IPooledImmutableNativeKernels> code,n::OriginalRows original,
-    q::PooledNativeOperandSpans begin,DeviceGenerationControlBinding control,q::PooledNativeTensorSpan output,
-    const std::string& identity,const std::string& output_identity){
-    if(isGraphCaptureActive() || !boundary || !boundary->isPooled() || !transport || !code || identity.empty() || output_identity.empty())
+    std::shared_ptr<const q::IPooledImmutableNativeKernels> code,PooledImmutableLookupInput request,
+    DeviceGenerationControlBinding control,const std::string& identity){
+    const auto* decoded=std::get_if<PooledImmutableOriginalLookupInput>(&request);
+    const auto* compact=std::get_if<PooledImmutableCompactLookupInput>(&request);
+    if(isGraphCaptureActive() || !boundary || !boundary->isPooled() || !transport || !code || identity.empty() ||
+       (decoded && decoded->output_identity.empty()))
         throw std::invalid_argument("Directed lookup requires original source, transport, code and output before capture");
     transport->requireCurrent();
     if(transport->sourceBoundary()!=boundary)
@@ -40,6 +47,9 @@ PooledImmutableDirectedLookupEndpoints appendPooledImmutableDirectedLookupGraph(
     if(!prepared || storage->originalOwners().empty() || code->backend()!=boundary->device().type)
         throw std::invalid_argument("Directed lookup requires its consumed original multiowner source and source-native code");
     const auto coordinator=storage->coordinator();const auto memory=prepared->source()->memory();
+    if(compact && (compact->delivery.transport!=transport || compact->query_ready.empty() || !graph.getNode(compact->query_ready)))
+        throw std::invalid_argument("Compact lookup changed its original transport or union producer");
+    if(compact)compact->query.requireDeclaration(coordinator->plan());
     const auto source_allocator=coordinator->plan().allocator();
     // P1 has no distributed ingress frontier. Its actual existing local graph
     // owns Read/release; only compute-result/ACK channels are added for readers.
@@ -50,18 +60,20 @@ PooledImmutableDirectedLookupEndpoints appendPooledImmutableDirectedLookupGraph(
         bindPooledNativeRoots(arena,*coordinator);
         bindPooledNativeRoots(arena,*storage->originalOwners().front());
         bindPooledSourceRoots(arena,*boundary);
-        ComputeGraph fragment;
+        ComputeGraph detached;
+        ComputeGraph& fragment=compact?graph:detached;
         std::shared_ptr<PooledImmutableLocalRetirementCompletion> terminal;
-        const auto count=begin[static_cast<unsigned>(q::PooledNativeOperand::OriginalCount)];
         const auto endpoints=appendPooledImmutableLocalLookupGraph(fragment,arena,boundary,code,
-            original,std::move(begin),control,std::move(output),identity,output_identity,&terminal);
-        if(storage->geometry().parameters().consumers>1)
+            request,control,identity,&terminal);
+        if(decoded && storage->geometry().parameters().consumers>1)
             terminal->readers=appendPooledReplicatedSourceReaders(fragment,arena,transport,control,
-                original.rows,terminal->output,terminal->read,terminal->readersRetired,identity+"/readers",count);
+                decoded->rows.rows,decoded->output,terminal->read,terminal->readersRetired,identity+"/readers",
+                decoded->begin[static_cast<unsigned>(q::PooledNativeOperand::OriginalCount)]);
         PooledImmutableSourceRetirementCompletion completion{
             std::shared_ptr<const PooledImmutableLocalRetirementCompletion>(std::move(terminal))};
         requirePooledSourceRetirementCompletion(fragment,completion);
-        publishFragment(graph,std::move(fragment));graph.setRetainedStorageBoundary(std::move(boundary));
+        if(!compact)publishFragment(graph,std::move(detached));
+        graph.setRetainedStorageBoundary(std::move(boundary));
         return {endpoints,std::move(completion)};
     }
     std::shared_ptr<const q::PooledImmutableLocalOwnerBinding> local;
@@ -88,15 +100,19 @@ PooledImmutableDirectedLookupEndpoints appendPooledImmutableDirectedLookupGraph(
     }
     if(transport->remotes().size()+(local?1u:0u)!=storage->originalOwners().size())
         throw std::invalid_argument("Directed lookup requires every original physical owner exactly once");
-    const auto originalCount = begin[static_cast<unsigned>(q::PooledNativeOperand::OriginalCount)];
     bindPooledNativeRoots(arena,*coordinator);
     if(local)bindPooledNativeRoots(arena,*local->ownerStorage());
     bindPooledSourceRoots(arena,*boundary);
-    ComputeGraph fragment;
+    ComputeGraph detached;
+    ComputeGraph& fragment=compact?graph:detached;
     const auto first=identity+"/begin",commands=identity+"/commands";
-    fragment.addNode(first,std::make_unique<PooledImmutableNativePhaseStage>(arena,code,
+    if(compact) {
+        fragment.addNode(first,std::make_unique<PooledImmutableLocalHotBeginStage>(arena,storage,code,compact->query),boundary->device());
+        fragment.addDependency(first,compact->query_ready);
+        requirePooledCompactQueryProducer(fragment,compact->query,first);
+    } else fragment.addNode(first,std::make_unique<PooledImmutableNativePhaseStage>(arena,code,
         PooledImmutableNativePhaseStage::Coordinator{n::CoordinatorAction::Begin,coordinator,
-            q::PooledImmutableCoordinatorOperands(n::CoordinatorAction::Begin,coordinator->plan(),original,std::move(begin))}),boundary->device());
+            q::PooledImmutableCoordinatorOperands(n::CoordinatorAction::Begin,coordinator->plan(),decoded->rows,decoded->begin)}),boundary->device());
     fragment.addNode(commands,std::make_unique<PooledImmutableNativePhaseStage>(arena,code,
         PooledImmutableNativePhaseStage::Coordinator{n::CoordinatorAction::PinCommands,coordinator,
             q::PooledImmutableCoordinatorOperands(n::CoordinatorAction::PinCommands,coordinator->plan(),{},{})}),boundary->device());
@@ -127,15 +143,38 @@ PooledImmutableDirectedLookupEndpoints appendPooledImmutableDirectedLookupGraph(
     const auto source=appendPooledSourceCoordinatorMembers(fragment,arena,sources,boundary,code,control,
         victimsComplete,identity+"/source",mixedVictim?&*mixedVictim:nullptr);
     const auto publication=appendPooledPublicationCoordinator(fragment,arena,source,publications,code,identity+"/publication");
-    const auto read=appendPooledReadCoordinator(fragment,arena,publication,readers,std::move(output),identity+"/read",output_identity);
+    const auto read=decoded
+        ?appendPooledReadCoordinator(fragment,arena,publication,readers,decoded->output,identity+"/read",decoded->output_identity)
+        :appendPooledReadCoordinator(fragment,arena,publication,readers,compact->delivery,identity+"/read");
     auto retired=appendPooledRetirementCoordinator(fragment,arena,read,retirement_members,code,identity+"/retirement");
-    if (storage->geometry().parameters().consumers > 1)
+    if (decoded && storage->geometry().parameters().consumers > 1)
         retired.readers = appendPooledReplicatedSourceReaders(fragment, arena, transport, control,
-            original.rows, retired.read.outputSpan, read.output, retired.readersRetired, identity + "/readers", originalCount);
+            decoded->rows.rows, decoded->output, read.output, retired.readersRetired, identity + "/readers",
+            decoded->begin[static_cast<unsigned>(q::PooledNativeOperand::OriginalCount)]);
     requirePooledRetirementCompletion(fragment,retired);
     const auto last=retired.coordinator.last;
-    publishFragment(graph,std::move(fragment));graph.setRetainedStorageBoundary(std::move(boundary));
+    if(!compact)publishFragment(graph,std::move(detached));
+    graph.setRetainedStorageBoundary(std::move(boundary));
     return {{first,last,PooledImmutableDemandFrontier{PooledImmutableDemandRole::Source,source.published,source.acquired}},std::move(retired)};
+}
+};
+PooledImmutableDirectedLookupEndpoints appendPooledImmutableDirectedLookupGraph(
+    ComputeGraph& graph,BufferArena& arena,std::shared_ptr<q::ImmutableLookupExecutionBoundary> boundary,
+    std::shared_ptr<const q::PooledImmutableDirectedTransport> transport,
+    std::shared_ptr<const q::IPooledImmutableNativeKernels> code,n::OriginalRows original,
+    q::PooledNativeOperandSpans begin,DeviceGenerationControlBinding control,q::PooledNativeTensorSpan output,
+    const std::string& identity,const std::string& outputIdentity){
+    return PooledImmutableDirectedLookupBuilder::append(graph,arena,std::move(boundary),std::move(transport),std::move(code),
+        PooledImmutableOriginalLookupInput{original,std::move(begin),std::move(output),outputIdentity},control,identity);
+}
+PooledImmutableDirectedLookupEndpoints appendPooledImmutableCompactLookupGraph(
+    ComputeGraph& graph,BufferArena& arena,std::shared_ptr<q::ImmutableLookupExecutionBoundary> boundary,
+    std::shared_ptr<const q::PooledImmutableDirectedTransport> transport,
+    std::shared_ptr<const q::IPooledImmutableNativeKernels> code,q::PooledImmutableLocalHotPoolQuery query,
+    PooledImmutableCompactReadRequest delivery,DeviceGenerationControlBinding control,
+    const std::string& compactQueryReady,const std::string& identity){
+    return PooledImmutableDirectedLookupBuilder::append(graph,arena,std::move(boundary),std::move(transport),std::move(code),
+        PooledImmutableCompactLookupInput{std::move(query),std::move(delivery),compactQueryReady},control,identity);
 }
 void requirePooledSourceRetirementCompletion(const ComputeGraph& graph,
     const PooledImmutableSourceRetirementCompletion& original){
@@ -144,7 +183,7 @@ void requirePooledSourceRetirementCompletion(const ComputeGraph& graph,
         if constexpr(std::is_same_v<T,PooledImmutableRetirementCompletion>)
             requirePooledRetirementCompletion(graph,completion);
         else{
-            if(!completion || !completion->sourceBoundary() || (completion->sourceBoundary()->pooledStorage()->geometry().parameters().consumers>1 && !completion->sharedReaders()))
+            if(!completion || !completion->sourceBoundary() || (completion->sourceBoundary()->pooledStorage()->geometry().parameters().consumers>1 && !completion->sharedReaders() && !completion->compactDelivery()))
                 throw std::invalid_argument("Local recurring source omitted original shared-reader completion");
             requirePooledLocalRetirementCompletion(graph,*completion);
         }

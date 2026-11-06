@@ -33,6 +33,7 @@
 // Forward declarations
 namespace llaminar2
 {
+    namespace qwen4exp { class PooledImmutableLocalHotReadyRoot; }
     class TransferEngine;
     class PhysicalMemoryAuthority;
     class PhysicalMemoryAllocationLease;
@@ -1557,6 +1558,16 @@ namespace llaminar2
             const std::shared_ptr<PhysicalMemoryAuthority> &authority) const;
 
         /**
+         * @brief Materialize the fixed LocalReady page under its own staging authority.
+         * @param root Original GPU consumer and private immutable ready-page owner.
+         * @param authority Same admitted physical-memory authority as the original source.
+         * @return Native mapped region retaining its CPU staging claim through final alias retirement.
+         */
+        [[nodiscard]] std::shared_ptr<MappedHostTransferRegion> allocateMappedHostRegion(
+            const qwen4exp::PooledImmutableLocalHotReadyRoot &root,
+            const std::shared_ptr<PhysicalMemoryAuthority> &authority) const;
+
+        /**
          * @brief Return the exact page-rounded backing extent used by mapped-host allocation.
          * @param bytes Positive requested payload capacity.
          * @return Physical host bytes contributed to PMA before materialization.
@@ -2836,6 +2847,21 @@ namespace llaminar2
         static TransferEngine &instance();
 
     private:
+        /**
+         * @brief Shared native allocation body for closed, typed CPU publication owners.
+         * @param payload_bytes Exact useful mapped payload extent.
+         * @param physical_bytes Canonical page-rounded admitted extent.
+         * @param host_allocator Original CPU allocator.
+         * @param consumer Exact GPU mapped alias endpoint.
+         * @param owner Typed owner selected only by a closed publication declaration.
+         * @param authority Sole allocation issuer, retained until native disposal.
+         * @return Actual region retaining its materialized claim.
+         */
+        [[nodiscard]] std::shared_ptr<MappedHostTransferRegion> allocateAdmittedMappedPublicationRoot(
+            size_t payload_bytes, size_t physical_bytes, DeviceId host_allocator,
+            DeviceId consumer, PhysicalMemoryOwner owner,
+            const std::shared_ptr<PhysicalMemoryAuthority> &authority) const;
+
         friend class TensorBase;
         friend class MappedHostTransferArena;
 

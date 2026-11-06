@@ -278,6 +278,10 @@ struct DevicePlanConfig
     std::size_t retained_immutable_table_bytes = 0u;
     std::size_t retained_immutable_source_table_bytes = 0u; ///< Actual mixed CPU source/cache lease; independent of GPU optional capacity.
     std::size_t retained_immutable_source_lookup_staging_bytes = 0u; ///< Actual subordinate source/grants+mapped channel leases.
+    /** Rank-wide actual CPU LocalReady page leases, distinct from the shared source.
+     * Only the authored shared coordinator imports this sum; other configs keep zero.
+     * GPU local frame/native leases belong to retained_immutable_lookup_staging_bytes. */
+    std::size_t retained_immutable_local_ready_staging_bytes = 0u;
     std::size_t retained_immutable_lookup_staging_bytes = 0u; ///< Actual provider request-scratch lease, excluding runner channels.
 
     /**

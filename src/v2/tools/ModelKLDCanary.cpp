@@ -45,6 +45,8 @@
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <cmath>
+#include <chrono>
+#include <optional>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -64,8 +66,18 @@ void publish(const std::filesystem::path &path, const json &value)
     if (!output) throw std::runtime_error("Cannot write accuracy report");
 }
 
-/** @brief Save one fresh finite full-vocabulary row at a joined result boundary. */
-json saveLogits(IOrchestrationRunner &runner, std::ofstream &output, size_t position)
+/**
+ * @brief Save one fresh finite full-vocabulary row at its existing joined result boundary.
+ * @param runner Original production runner owning the published logits.
+ * @param output Caller-owned original history file stream.
+ * @param position Exact consumed-token position of the original observation.
+ * @param phase_begin Optional diagnostic host phase start, never a device timing event.
+ * @return Existing row metadata and, when requested, elapsed host nanoseconds through
+ * the original logits join. Validation, JSON construction and file I/O are excluded.
+ * @throws std::runtime_error If the original result or output is incomplete.
+ */
+json saveLogits(IOrchestrationRunner &runner, std::ofstream &output, size_t position,
+               std::optional<std::chrono::steady_clock::time_point> phase_begin = std::nullopt)
 {
     /*
      * lastLogits() authenticates the current device publication, queues the
@@ -77,6 +89,7 @@ json saveLogits(IOrchestrationRunner &runner, std::ofstream &output, size_t posi
      * consuming API. The passive lifetime observer records health throughout.
      */
     const float *logits = runner.lastLogits();
+    const auto joined = std::chrono::steady_clock::now();
     const int vocabulary = runner.vocabSize();
     if (!logits || vocabulary <= 0)
         throw std::runtime_error("No complete host logits at the diagnostic result boundary");
@@ -84,8 +97,11 @@ json saveLogits(IOrchestrationRunner &runner, std::ofstream &output, size_t posi
         throw std::runtime_error("Nonfinite next-token logits");
     output.write(reinterpret_cast<const char *>(logits), vocabulary*sizeof(float));
     if (!output) throw std::runtime_error("Could not persist full-vocabulary row");
-    return {{"consumed_tokens",position}, {"argmax",std::max_element(logits,logits+vocabulary)-logits},
-            {"vocabulary",vocabulary}};
+    json row={{"consumed_tokens",position}, {"argmax",std::max_element(logits,logits+vocabulary)-logits},
+              {"vocabulary",vocabulary}};
+    if (phase_begin)
+        row["diagnostic_host_phase_ns"] = std::chrono::duration_cast<std::chrono::nanoseconds>(joined-*phase_begin).count();
+    return row;
 }
 
 /**
@@ -289,17 +305,22 @@ json observeQFNHistory(IOrchestrationRunner &runner, const json &history, const 
     const auto continuation = history.at("continuation_ids").get<std::vector<int32_t>>();
     const auto name = history.at("id").get<std::string>();
     runner.clearCache();
+    const auto path = std::filesystem::absolute(output/(name+".f32"));
+    std::ofstream logits(path,std::ios::binary);
+    json rows = json::array();
+    const auto prefill_begin = std::chrono::steady_clock::now();
     {
         accuracy::ScopedQFNObservationPhase phase(ExecutionPhase::PREFILL);
         if (!runner.prefill(prompt)) throw std::runtime_error("QFN prefill failed: "+runner.lastError());
     }
-    const auto path = std::filesystem::absolute(output/(name+".f32"));
-    std::ofstream logits(path,std::ios::binary);
-    json rows = json::array();
-    (void)saveLogits(runner,logits,prompt.size());
+    const auto prefill_observation=saveLogits(runner,logits,prompt.size(),prefill_begin);
     rows.push_back(qfnRow(history,-1,runner.vocabSize()));
+    json phase_timings=json::array({{{"row_id",rows.back().at("row_id")},{"phase","prefill"},
+        {"original_input_tokens",prompt.size()},
+        {"host_wall_ns",prefill_observation.at("diagnostic_host_phase_ns")}}});
     for (std::size_t i=0;i<continuation.size();++i)
     {
+        const auto decode_begin = std::chrono::steady_clock::now();
         const auto forced = [&] {
             accuracy::ScopedQFNObservationPhase phase(ExecutionPhase::DECODE);
             return runner.forceDecodeToken(continuation[i]);
@@ -309,15 +330,26 @@ json observeQFNHistory(IOrchestrationRunner &runner, const json &history, const 
             throw std::runtime_error("QFN original Pending teacher transaction failed: "+forced.error);
         if (i>0)
         {
-            (void)saveLogits(runner,logits,prompt.size()+i);
+            const auto observation=saveLogits(runner,logits,prompt.size()+i,decode_begin);
             rows.push_back(qfnRow(history,int(i-1),runner.vocabSize()));
+            phase_timings.push_back({{"row_id",rows.back().at("row_id")},{"phase","decode"},
+                {"original_input_tokens",1},{"host_wall_ns",observation.at("diagnostic_host_phase_ns")}});
         }
     }
     logits.close();
     if (!logits || rows.size()!=history.at("decode_rows").get<std::size_t>()+1 ||
         std::filesystem::file_size(path)!=rows.size()*std::size_t(runner.vocabSize())*sizeof(float))
         throw std::runtime_error("QFN observation inventory/output is incomplete");
-    return {{"history_id",name},{"logits_file",path.string()},{"rows",rows}};
+    // The first Pending teacher only stages a token; it is deliberately not
+    // labeled as a completed decode. Every timed row uses the existing host
+    // logits join, including its diagnostic D2H, without another native probe.
+    return {{"history_id",name},{"logits_file",path.string()},{"rows",rows},
+        {"diagnostic_phase_timings",{{"clock","steady_clock"},{"unit","nanoseconds"},
+            {"scope","original_runner_call_through_existing_host_logits_join"},
+            {"includes_diagnostic_full_vocabulary_d2h",true},
+            {"includes_reset_validation_or_file_io",false},
+            {"lookup_stall_timing",false},{"release_throughput_qualified",false},
+            {"phases",std::move(phase_timings)}}}};
 }
 
 /**

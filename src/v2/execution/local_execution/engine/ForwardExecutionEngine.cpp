@@ -2683,8 +2683,10 @@ namespace llaminar2
             const auto rows = static_cast<int64_t>(signature.batch_size) * signature.seq_len;
             if (rows <= 0 || rows > std::numeric_limits<int>::max())
                 throw std::logic_error("Finite source family has no original physical row geometry");
-            result.push_back(RetainedForwardSourceDefinition::checked(signature,role,static_cast<int>(rows),
-                *cache.graph,native.capture_variant_signature,preparation));
+            auto owned=RetainedForwardSourceDefinition::projectOwned(signature,role,static_cast<int>(rows),
+                *cache.graph,native.capture_variant_signature,preparation,native.recorded_source_definition,
+                native.participant_auxiliary_preparation,native.original_storage_attachment.get());
+            if(owned)result.push_back(std::move(*owned));
         }
         return result;
     }

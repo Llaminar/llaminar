@@ -30,8 +30,10 @@ public:
         // floor, optional growth, resolved plan and wire restore retains them.
         const auto channels=PooledImmutableDirectedTransport::completeBOM(
             physical,geometry.coordinator(),originalCPU0,originalGPUs,
-            geometry.readerGeometry() ? &*geometry.readerGeometry() : nullptr);
+            geometry.readerGeometry() ? &*geometry.readerGeometry() : nullptr,
+            geometry.localHotTransport()?PooledNativeReaderMessageProfile::CompactNative:PooledNativeReaderMessageProfile::ReplicatedFP32);
         for(const auto& line:channels.resources())result.add(line);
+        bool sourceHolder=false;
         for(std::uint32_t coordinate=0;coordinate<physical.owners().size();++coordinate){
             const auto& owner=physical.owners()[coordinate];
             if(owner.allocator==physical.coordinator())continue;
@@ -45,6 +47,11 @@ public:
             const auto gpu=std::find_if(originalGPUs.begin(),originalGPUs.end(),[&](const auto& resource){
                 return resource.device==owner.allocator.device && resource.world_rank==owner.allocator.world_rank;});
             if(gpu==originalGPUs.end())throw std::invalid_argument("Remote graph planning lost an original owner observation");
+            if(!sourceHolder){
+                result.add(originalCPU0,PhysicalMemoryOwner::NativeStorageGraphExecutable,
+                    RetainedParticipantGraphSourceSlots::physicalBytes(physical.owners().size()));
+                sourceHolder=true;
+            }
             const auto program=PooledImmutableDirectedOwnerProgram::declare(physical,geometry.coordinator(),coordinate);
             const auto host=source.remoteHostBOM(program,originalCPU0,*gpu);
             for(const auto& line:host.resources())result.add(line);

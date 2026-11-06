@@ -106,7 +106,7 @@ namespace llaminar2
             TensorBase *pipeline_hidden_input,
             void *publication_stream)
     {
-        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+        if (!graph_builder_ || !retainsMTPGraphCapacity(graph_builder_->config().mtp))
             return true;
         // Retain both condition purposes and both terminal outcome topologies
         // symmetrically: every participant must enter the same capture waves.
@@ -121,6 +121,32 @@ namespace llaminar2
             if (!executeMTPMainForward(MTPVerifierForwardPolicy(outcome, geometry.verifier_rows, retained), pipeline_hidden_input, publication_stream,
                     ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch))
                 return false;
+        // These are the same two learned scalar owners used at runtime, not
+        // depth clones. A main-model-only follower owns neither predictor nor
+        // its inputs. Capacity, rather than request one's Off/fixed/dynamic
+        // choice, declares the actual finite source-free draft family.
+        if (mtp_graph_owner_plan_.ownsControllerExecutables())
+        {
+            const auto hidden=state_.extension_buffers.find(BufferId::MTP_HIDDEN);
+            if (!state_.prefix_terminal_hidden || hidden==state_.extension_buffers.end() || !hidden->second ||
+                !mtp_sidecar_condition_token_dev_ || !mtp_sidecar_position_ids_dev_)
+                throw std::logic_error("Retained predictor setup lost its original full/chained input roots");
+            for (const auto role : {MTPSidecarCaptureRole::Full,MTPSidecarCaptureRole::Chained})
+            {
+                if(role==MTPSidecarCaptureRole::Chained && resolveMTPRetainedDraftCapacity(graph_builder_->config().mtp)<=1)
+                    continue;
+                const bool chained=role==MTPSidecarCaptureRole::Chained;
+                const int slot=mtp_sidecar_capture_layout_.conditionTokenSlot(role,1);
+                const auto* condition=static_cast<const int32_t*>(mtp_sidecar_condition_token_dev_)+
+                    slot*mtp_sidecar_condition_token_slot_width_;
+                if(!executeMTPDepth0Batched(nullptr,1,chained?hidden->second.get():state_.prefix_terminal_hidden.get(),
+                    0,chained?"mtp_decode_chained":"mtp_decode_sidecar",false,
+                    chained?BufferId::MTP_HIDDEN:BufferId::PREFIX_TERMINAL_HIDDEN,true,
+                    condition,-1,false,1,nullptr,mtp_sidecar_position_ids_dev_,nullptr,0,nullptr,0,-1,0,nullptr,
+                    1,1,1,0,0,DeviceGraphExecutor::GraphInitialSubmissionPolicy::MaterializeWithoutLaunch))
+                    return false;
+            }
+        }
         return true;
     }
 
@@ -136,7 +162,8 @@ namespace llaminar2
         if (error) error->clear();
         const bool setup = submission == ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
         if (!state_.device_id.is_gpu() || !publication_stream || !graph_builder_ ||
-            !graph_builder_->config().mtp.enabled ||
+            (!graph_builder_->config().mtp.enabled &&
+             !(setup && retainsMTPGraphCapacity(graph_builder_->config().mtp))) ||
             (submission != ForwardGraphSubmissionIntent::Execute && !setup))
             return fail("requires one MTP GPU participant, exact stream and explicit submission policy");
         if (!setup && (!pp_stage_config_ || pp_stage_config_->has_lm_head || !pipeline_forward_edges_))
@@ -804,7 +831,7 @@ namespace llaminar2
                      {"capacity_authority", "orchestration_memory_plan"}});
             }
 
-            if (graph_builder_ && graph_builder_->config().mtp.enabled)
+            if (graph_builder_ && retainsMTPGraphCapacity(graph_builder_->config().mtp))
             {
                 /*
                  * A one-token suffix following prefix restore shares decode math

@@ -18,6 +18,7 @@
 
 #include "GPUDeviceContextPool.h"
 #include "NativeContextPreparation.h"
+#include "RetainedParticipantGraphExecutable.h"
 #include "../utils/Logger.h"
 
 #include <algorithm>
@@ -192,6 +193,64 @@ namespace llaminar2
             // Original constructor rollback retires handles, never authorizes opaque pool release.
             contexts.erase(ordinal);throw;
         }
+    }
+    std::shared_ptr<RetainedParticipantGraphExecutable> GPUDeviceContextPool::borrowPreparedCalibration(
+        const PreparedGPUContextUsePermit& original,void* stream){
+        return retainPreparedCalibrationSlot(original,stream)->acquire(original,stream);
+    }
+    std::shared_ptr<PreparedServiceCalibrationSlot> GPUDeviceContextPool::retainPreparedCalibrationSlot(
+        const PreparedGPUContextUsePermit& original,void* stream){
+        if(!original.device().is_gpu() || !original.worker() || original.worker()->ownsCurrentThread() ||
+            !stream || stream!=original.worker()->defaultStream())
+            throw std::invalid_argument("Original calibration requires its off-worker source stream");
+        std::shared_ptr<PreparedServiceCalibrationSlot> slot;
+        {
+            std::lock_guard lock(mutex_);
+            const auto device=original.device();const auto ordinal=device.gpu_ordinal();
+            const auto& contexts=device.is_cuda()?nvidia_contexts_:amd_contexts_;
+            const auto& generations=device.is_cuda()?nvidia_generations_:amd_generations_;
+            const auto& retiring=device.is_cuda()?retiring_nvidia_contexts_:retiring_amd_contexts_;
+            const auto found=prepared_births_.find(device.toString());
+            const auto worker=contexts.find(ordinal);const auto generation=generations.find(ordinal);
+            if(found==prepared_births_.end() || found->second!=original.birth_ ||
+                found->second.owner_before(original.birth_) || original.birth_.owner_before(found->second) || worker==contexts.end() ||
+                generation==generations.end() || generation->second!=original.generation() || retiring.contains(ordinal) ||
+                found->second->calibration_closed_)
+                throw std::logic_error("Original calibration source is stale, foreign or retiring");
+            original.requireWorker(worker->second);
+            auto& holder=found->second->calibration_;
+            // Only exact CPU metadata is materialized under the pool mutex.
+            // The existing graph factory/worker callbacks run strictly off-lock.
+            if(!holder)holder=PreparedServiceCalibrationSlot::create(original.memory(),device);
+            slot=holder;
+        }
+        return slot;
+    }
+    void GPUDeviceContextPool::retirePreparedCalibration(const std::shared_ptr<PreparedGPUContextBirth>& birth){
+        if(!birth)throw std::invalid_argument("Calibration retirement requires its original selected birth");
+        std::shared_ptr<PreparedServiceCalibrationSlot> slot;
+        {
+            std::lock_guard lock(mutex_);
+            const auto found=prepared_births_.find(birth->device().toString());
+            if(found==prepared_births_.end())return;
+            if(found->second!=birth)throw std::logic_error("Calibration retirement substituted its original source");
+            birth->calibration_closed_=true;slot=birth->calibration_;
+            if(slot){
+                slot->closeAcquisition();
+                // Birth plus this retirement-local reference are the complete
+                // source-owned population. A pending off-lock lookup must return
+                // before native handles or its known CPU root can retire.
+                if(slot.use_count()!=2)
+                    throw std::logic_error("Original prepared calibration retirement has an in-flight holder borrower");
+            }
+        }
+        if(slot)slot->retire(); // Never hold the pool lock across original worker teardown.
+        {
+            std::lock_guard lock(mutex_);
+            if(birth->calibration_!=slot)throw std::logic_error("Original calibration owner changed during final retirement");
+            birth->calibration_.reset();
+        }
+        slot.reset(); // Known CPU holder retires before the existing zero-allocation tickets.
     }
     void GPUDeviceContextPool::confirmPreparedPhysicalRetirement(DeviceId device)
     {

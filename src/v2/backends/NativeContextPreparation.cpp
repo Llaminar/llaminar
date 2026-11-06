@@ -183,10 +183,18 @@ void NativeContextPreparation::retireUnadmitted(){
         throw std::logic_error("Admitted native source requires complete model retirement, not birth-only cleanup");
     retireReleasedContexts();
 }
+std::shared_ptr<RetainedParticipantGraphExecutable> PreparedGPUContextUsePermit::borrowPreparedCalibration(void* stream)const{
+    return GPUDeviceContextPool::instance().borrowPreparedCalibration(*this,stream);
+}
+void NativeContextPreparation::retirePreparedCalibrations(){
+    for(const auto& birth:births_)if(GPUDeviceContextPool::instance().ownsPreparedBirth(birth))
+        GPUDeviceContextPool::instance().retirePreparedCalibration(birth);
+}
 std::size_t NativeContextPreparation::retireReleasedContexts(){return retireReleasedContexts(TransferEngine::instance());}
 std::size_t NativeContextPreparation::retireReleasedContexts(const TransferEngine& transfers){
     if(memory()->phase()!=PhysicalMemoryAuthorityPhase::Preparing && memory()->phase()!=PhysicalMemoryAuthorityPhase::Admitted)
         throw std::logic_error("Original released source is not in a live physical authority phase");
+    retirePreparedCalibrations();
     std::vector<ExclusiveModelRetirementTicket> tickets;
     tickets.reserve(births_.size());
     for(const auto& birth:births_)if(GPUDeviceContextPool::instance().ownsPreparedBirth(birth))

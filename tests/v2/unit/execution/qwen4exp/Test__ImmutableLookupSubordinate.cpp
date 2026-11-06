@@ -1516,3 +1516,213 @@ TEST(ImmutableLookupSubordinate, ClosedWorkerGatePreservesOriginalSourceTaskAndR
     }
 }
 } // namespace llaminar2::qwen4exp
+
+namespace llaminar2::qwen4exp {
+/** @test The actual original group dispatch owns each one-shot gate and every rejection. */
+TEST(ImmutableLookupSubordinate, ClosedOriginalGroupWorkerGatePreservesAdmissionAndWithdraws)
+{
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    for (int mode = 0; mode < 6; ++mode)
+    {
+        ASSERT_EXIT(([&] {
+            {
+                using Access = llaminar2::test::ImmutableLookupWorkerGateReplayAccess;
+                ServiceLane lane(0, 2, ServiceLaneOrigin::Recorded, true);
+                const auto program = llaminar2::test::RetainedHostServiceReplayAccess::program(RetainedHostServiceRole::ImmutableLookupIO);
+                EXPECT_EQ(program.resourceDeclaration().objectBytes, sizeof(RetainedParentTicketServiceWorker));
+                {
+                    Access::Gate gate(lane.service);
+                    Access::installNextOriginalDispatch(gate);
+                    EXPECT_FALSE(Access::dispatched(gate));
+                    EXPECT_THROW(Access::installNextOriginalDispatch(gate), std::logic_error);
+                    if (mode == 0)
+                    {
+                        // The lexical owner withdraws an installed but unsent
+                        // descriptor. No ticket or task has been manufactured.
+                    }
+                    else if (mode <= 2)
+                    {
+                        if (mode == 1)
+                            EXPECT_THROW(Access::rejectIncompleteDispatch(gate), std::invalid_argument);
+                        else
+                            EXPECT_THROW(Access::rejectForeignDispatch(gate), std::logic_error);
+                        EXPECT_FALSE(Access::dispatched(gate));
+                        EXPECT_TRUE(Access::rejected(gate));
+                    }
+                    else
+                    {
+                        // This is the same public group arm used by the Rank
+                        // source boundary, not the old single-channel arm hook.
+                        auto group = lane.service->armGroup(1);
+                        const auto first = lane.service->adoptGroupChannel(group, DeviceId::cuda(0));
+                        const auto second = lane.service->adoptGroupChannel(group, DeviceId::cuda(1));
+                        EXPECT_EQ(first.invocation, second.invocation);
+                        EXPECT_TRUE(Access::dispatched(gate));
+                        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+                        while (!gate.entered())
+                        {
+                            if (std::chrono::steady_clock::now() >= deadline)
+                                throw std::runtime_error("Original group worker did not enter its gate");
+                            std::this_thread::yield();
+                        }
+                        EXPECT_TRUE(gate.held());
+                        Access::Gate duplicate(lane.service);
+                        EXPECT_THROW(Access::installNextOriginalDispatch(duplicate), std::logic_error);
+                        EXPECT_THROW(lane.service->armGroup(2), std::logic_error);
+                        if (mode == 4)
+                        {
+                            ASSERT_TRUE(lane.service->cancel(first));
+                            EXPECT_FALSE(lane.service->finishGroup(group));
+                        }
+                        else if (mode == 5)
+                        {
+                            // Original group destruction cancels/drains first;
+                            // the wrapper sees that cancellation and departs.
+                        }
+                        else
+                        {
+                            const std::array<std::int64_t, 3> ids{3, 45, 3};
+                            const std::array<Intent, 3> intents{};
+                            lane.publish(1, 1, {}, {}, 0);
+                            lane.publish(1, 1, ids, intents, 1);
+                            EXPECT_EQ(lane.completion(0).publication, 0u);
+                            EXPECT_EQ(lane.completion(1).publication, 0u);
+                            gate.release();
+                            ServiceLane::wait(lane.completion(0).publication, 1);
+                            ServiceLane::wait(lane.completion(1).publication, 1);
+                            const auto view = lane.secondBinding->deviceView();
+                            for (std::size_t row = 0; row < ids.size(); ++row)
+                                EXPECT_EQ(std::memcmp(view.base.nativeRows + row * lane.layout.rowBytes(),
+                                    lane.file.bytes.data() + lane.file.source.file_offset + ids[row] * lane.layout.rowBytes(),
+                                    lane.layout.rowBytes()), 0);
+                            lane.close(1, 1, 0);
+                            lane.close(1, 1, 1);
+                            EXPECT_TRUE(lane.service->await(first));
+                            EXPECT_TRUE(lane.service->await(second));
+                            EXPECT_TRUE(lane.service->finishGroup(group));
+                            EXPECT_EQ(lane.service->stats(DeviceId::cuda(0)).ids, 0u);
+                            EXPECT_EQ(lane.service->stats(DeviceId::cuda(1)).ids, ids.size());
+                        }
+                        EXPECT_FALSE(gate.timedOut());
+                    }
+                }
+                if (mode <= 2)
+                {
+                    // Both withdrawal and actual rejected dispatch leave the
+                    // original worker usable without any stale stack wrapper.
+                    auto group = lane.service->armGroup(1);
+                    const auto first = lane.service->adoptGroupChannel(group, DeviceId::cuda(0));
+                    const auto second = lane.service->adoptGroupChannel(group, DeviceId::cuda(1));
+                    lane.publish(1, 1, {}, {}, 0);
+                    lane.publish(1, 1, {}, {}, 1);
+                    ServiceLane::wait(lane.completion(0).publication, 1);
+                    ServiceLane::wait(lane.completion(1).publication, 1);
+                    lane.close(1, 1, 0);
+                    lane.close(1, 1, 1);
+                    EXPECT_TRUE(lane.service->await(first));
+                    EXPECT_TRUE(lane.service->await(second));
+                    EXPECT_TRUE(lane.service->finishGroup(group));
+                }
+            }
+            GPUDeviceProcessLifetime::retireActive();
+            std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+        })(), ::testing::ExitedWithCode(0), "");
+    }
+}
+} // namespace llaminar2::qwen4exp
+
+namespace llaminar2::qwen4exp {
+/** @test The actual invalid-descriptor guard consumes no ticket and retains no fixture pointer. */
+TEST(ImmutableLookupSubordinate, ClosedOriginalWorkerDispatchFailureWithdrawsBorrow)
+{
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ASSERT_EXIT(([&] {
+        {
+            ServiceLane lane(0, 2, ServiceLaneOrigin::Recorded, true);
+            using Access = llaminar2::test::ImmutableLookupWorkerGateReplayAccess;
+            Access::Gate gate(lane.service);
+            Access::installNextOriginalDispatch(gate);
+            EXPECT_THROW(Access::rejectIncompleteDispatch(gate), std::invalid_argument);
+            EXPECT_TRUE(Access::rejected(gate));
+            EXPECT_FALSE(Access::dispatched(gate));
+            EXPECT_FALSE(gate.entered());
+            Access::Gate successor(lane.service);
+            EXPECT_NO_THROW(Access::installNextOriginalDispatch(successor));
+        }
+        GPUDeviceProcessLifetime::retireActive();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+    })(), ::testing::ExitedWithCode(0), "");
+}
+}
+
+namespace llaminar2::qwen4exp {
+/** @test A new actual group request frontier rejects stale publication and new unsealed metadata. */
+TEST(ImmutableLookupSubordinate, ClosedOriginalGroupRequestFrontierRejectsStaleReadyEvidence)
+{
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    ASSERT_EXIT(([&] {
+        {
+            using Access = llaminar2::test::ImmutableLookupWorkerGateReplayAccess;
+            ServiceLane lane(0, 2, ServiceLaneOrigin::Recorded, true);
+            {
+                auto warm = lane.service->armGroup(1);
+                const auto first = lane.service->adoptGroupChannel(warm, DeviceId::cuda(0));
+                const auto second = lane.service->adoptGroupChannel(warm, DeviceId::cuda(1));
+                for (std::size_t channel = 0; channel < 2; ++channel)
+                {
+                    lane.publish(1, 1, {}, {}, channel);
+                    ServiceLane::wait(lane.completion(channel).publication, 1);
+                    lane.close(1, 1, channel);
+                }
+                EXPECT_TRUE(lane.service->await(first));
+                EXPECT_TRUE(lane.service->await(second));
+                EXPECT_TRUE(lane.service->finishGroup(warm));
+            }
+            Access::Gate gate(lane.service);
+            const auto previous = Access::retiredSequence(gate, DeviceId::cuda(0));
+            ASSERT_EQ(previous, 1u);
+            Access::installNextOriginalDispatch(gate);
+            auto current = lane.service->armGroup(2);
+            const auto first = lane.service->adoptGroupChannel(current, DeviceId::cuda(0));
+            const auto second = lane.service->adoptGroupChannel(current, DeviceId::cuda(1));
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (!gate.entered())
+            {
+                if (std::chrono::steady_clock::now() >= deadline)
+                    throw std::runtime_error("Original group observer worker did not enter its gate");
+                std::this_thread::yield();
+            }
+            EXPECT_FALSE(Access::currentRequest(gate, DeviceId::cuda(0), previous));
+            auto* original = lane.binding->deviceView().base.request;
+            // Recorded producer interleaving: new admission metadata exists,
+            // but the original release publication is still the retired one.
+            original->generation = first.generation;
+            original->generationComplement = ~first.generation;
+            EXPECT_FALSE(Access::currentRequest(gate, DeviceId::cuda(0), previous));
+            const std::array<std::int64_t, 3> ids{3, 45, 3};
+            const std::array<Intent, 3> intents{};
+            lane.publish(2, 2, ids, intents, 0);
+            lane.publish(2, 2, {}, {}, 1);
+            const auto observed = Access::currentRequest(gate, DeviceId::cuda(0), previous);
+            ASSERT_TRUE(observed);
+            EXPECT_EQ(observed->publication, previous + 1);
+            EXPECT_EQ(observed->generation, first.generation);
+            EXPECT_EQ(observed->idCount, ids.size());
+            EXPECT_EQ(observed->idBytes, ids.size() * sizeof(std::int64_t));
+            EXPECT_EQ(lane.completion(0).publication, 1u);
+            gate.release();
+            for (std::size_t channel = 0; channel < 2; ++channel)
+            {
+                ServiceLane::wait(lane.completion(channel).publication, 2);
+                lane.close(2, 2, channel);
+            }
+            EXPECT_TRUE(lane.service->await(first));
+            EXPECT_TRUE(lane.service->await(second));
+            EXPECT_TRUE(lane.service->finishGroup(current));
+            EXPECT_FALSE(Access::currentRequest(gate, DeviceId::cuda(0), previous));
+        }
+        GPUDeviceProcessLifetime::retireActive();
+        std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+    })(), ::testing::ExitedWithCode(0), "");
+}
+}

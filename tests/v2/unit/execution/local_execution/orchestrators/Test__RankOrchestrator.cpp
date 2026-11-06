@@ -3639,6 +3639,105 @@ struct HostedTicketObservationRendezvous
     std::condition_variable cv;
 };
 
+/** @brief Closed host rendezvous for actual Rank admission fan-out, without native permits. */
+struct RankAdmissionFanoutReplay final
+{
+    explicit RankAdmissionFanoutReplay(int participants) : expected(participants) {}
+    int expected;
+    int arrived=0;
+    std::atomic<int> completed{0};
+    std::mutex mutex;
+    std::condition_variable ready;
+    /** @return True only when every original callback has entered before any can finish. */
+    bool enter()
+    {
+        std::unique_lock lock(mutex);
+        ++arrived;
+        ready.notify_all();
+        return ready.wait_for(lock,std::chrono::seconds(2),[&]{return arrived==expected;});
+    }
+};
+
+/** @brief Existing runner spy exercising only the original Rank host admission boundary. */
+class RankAdmissionFanoutParticipant final : public MockDeviceGraphOrchestrator
+{
+public:
+    enum class Result {Success,Reject,Throw};
+    /** @brief Retain the same closed host callback rendezvous and one authored result. */
+    RankAdmissionFanoutParticipant(std::shared_ptr<RankAdmissionFanoutReplay> replay,Result result)
+        :replay_(std::move(replay)),result_(result){}
+    /** @brief Model a peer setup enqueue that cannot complete before all peers enter.
+     * @param request The unchanged production admission request.
+     * @return Authored success/rejection after every callback has entered.
+     * @throws std::runtime_error For the deliberate originating participant failure.
+     */
+    bool beginDeviceResidentGeneration(const DeviceGenerationAdmissionRequest& request)override
+    {
+        const bool all_entered=request.valid() && replay_->enter();
+        ++replay_->completed;
+        if(!all_entered)return false;
+        if(result_==Result::Throw)throw std::runtime_error("original admission enqueue failed");
+        return result_==Result::Success;
+    }
+private:
+    std::shared_ptr<RankAdmissionFanoutReplay> replay_;
+    Result result_;
+};
+
+/** @test Full-prefix-hit admission fans out ordinary and fixed1 without relying on earlier main-forward callbacks. */
+TEST(Test__RankOrchestratorDeviceGeneration, AdmissionEntersAllOriginalParticipantsBeforeJoiningReplay)
+{
+    for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm})
+        for(const int count:{1,2,4,8})
+            for(const bool speculative:{false,true})
+                for(int replay=0;replay<20;++replay) {
+                    SCOPED_TRACE(::testing::Message()<<"backend="<<int(backend)<<" count="<<count<<" speculative="<<speculative<<" replay="<<replay);
+                    auto shared=std::make_shared<RankAdmissionFanoutReplay>(count);
+                    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+                    for(int i=0;i<count;++i) {
+                        auto runner=std::make_unique<RankAdmissionFanoutParticipant>(shared,RankAdmissionFanoutParticipant::Result::Success);
+                        runner->set_primary_device_id(DeviceId{backend,i});
+                        runners.push_back(std::move(runner));
+                    }
+                    auto rank=RankOrchestrator::createForTest(llaminar2::test::MockModelContext::createMinimal(),
+                        std::move(runners),makeTPContextForRunnerCount(count),makeRankConfigForRunnerCount(count));
+                    ASSERT_TRUE(rank);
+                    DeviceGenerationAdmissionRequest request;
+                    request.request_count=1;request.max_new_tokens=3;
+                    request.depth_policy=speculative?sampling_math::DeviceGenerationPolicy::fixed(1):sampling_math::DeviceGenerationPolicy::ordinary();
+                    request.initial_leading_row_disposition=sampling_math::DeviceGenerationLeadingRowDisposition::AlreadyEmitted;
+                    ASSERT_TRUE(request.valid());
+                    ASSERT_TRUE(rank->beginDeviceResidentGeneration(request));
+                    EXPECT_EQ(shared->arrived,count);EXPECT_EQ(shared->completed.load(),count);
+                }
+}
+
+/** @test Every entered callback drains before rejection/primary exception can unwind original source admission. */
+TEST(Test__RankOrchestratorDeviceGeneration, AdmissionDrainsAllCallbacksBeforeFailureReplay)
+{
+    for(const auto result:{RankAdmissionFanoutParticipant::Result::Reject,RankAdmissionFanoutParticipant::Result::Throw})
+        for(int replay=0;replay<20;++replay) {
+            auto shared=std::make_shared<RankAdmissionFanoutReplay>(2);
+            std::vector<std::unique_ptr<IInferenceRunner>> runners;
+            for(int i=0;i<2;++i) {
+                auto runner=std::make_unique<RankAdmissionFanoutParticipant>(shared,
+                    i==0?result:RankAdmissionFanoutParticipant::Result::Success);
+                runner->set_primary_device_id(DeviceId::cuda(i));runners.push_back(std::move(runner));
+            }
+            auto rank=RankOrchestrator::createForTest(llaminar2::test::MockModelContext::createMinimal(),
+                std::move(runners),makeTPContextForRunnerCount(2),makeRankConfigForRunnerCount(2));
+            ASSERT_TRUE(rank);
+            DeviceGenerationAdmissionRequest request;request.request_count=1;request.max_new_tokens=3;
+            request.depth_policy=sampling_math::DeviceGenerationPolicy::ordinary();
+            if(result==RankAdmissionFanoutParticipant::Result::Reject)EXPECT_FALSE(rank->beginDeviceResidentGeneration(request));
+            else {
+                try {rank->beginDeviceResidentGeneration(request);FAIL()<<"Original participant error was lost";}
+                catch(const std::runtime_error& error){EXPECT_STREQ(error.what(),"original admission enqueue failed");}
+            }
+            EXPECT_EQ(shared->arrived,2);EXPECT_EQ(shared->completed.load(),2);
+        }
+}
+
 /**
  * @brief Device-free publisher supporting rank-level overlay admission tests.
  *

@@ -14,6 +14,49 @@
 #include <unistd.h>
 namespace llaminar2
 {
+void AdaptiveGPULocalHotCacheRequest::validate() const
+{
+    if (maximum_cache_rows > 0x7fffffffULL || !policy.aging_accesses ||
+        !policy.protected_denominator || policy.protected_numerator > policy.protected_denominator)
+        throw std::invalid_argument("Local hot cache requires bounded native slots and a valid frozen policy");
+    for (std::size_t i = 0; i < consumer_overrides.size(); ++i)
+    {
+        const auto& override = consumer_overrides[i];
+        if (override.participant.world_rank < 0 || !override.participant.device().is_gpu() ||
+            override.maximum_cache_rows > 0x7fffffffULL)
+            throw std::invalid_argument("Local hot cache override requires an exact bounded GPU reader");
+        for (std::size_t j = 0; j < i; ++j)
+            if (consumer_overrides[j].participant == override.participant)
+                throw std::invalid_argument("Local hot cache overrides duplicate a reader");
+    }
+}
+void AdaptiveGPULocalHotCacheRequest::requireConsumers(
+    std::span<const AdaptiveGPUCacheParticipant> consumers) const
+{
+    validate();
+    if (consumers.empty()) throw std::invalid_argument("Local hot cache requires original consumers");
+    for (std::size_t i = 0; i < consumers.size(); ++i)
+    {
+        if (consumers[i].world_rank < 0 || !consumers[i].device().is_gpu() ||
+            std::find(consumers.begin(), consumers.begin() + i, consumers[i]) != consumers.begin() + i)
+            throw std::invalid_argument("Local hot cache has an invalid or duplicate original consumer");
+    }
+    for (const auto& override : consumer_overrides)
+        if (std::find(consumers.begin(), consumers.end(), override.participant) == consumers.end())
+            throw std::invalid_argument("Local hot cache override is not an original compute consumer");
+}
+AdaptiveGPUCacheOwnerRequest AdaptiveGPULocalHotCacheRequest::ceilingsFor(
+    AdaptiveGPUCacheParticipant consumer) const
+{
+    validate();
+    if (consumer.world_rank < 0 || !consumer.device().is_gpu())
+        throw std::invalid_argument("Local hot cache ceiling requires an original GPU reader");
+    const auto found = std::find_if(consumer_overrides.begin(), consumer_overrides.end(),
+        [&](const auto& override) { return override.participant == consumer; });
+    return found == consumer_overrides.end()
+        ? AdaptiveGPUCacheOwnerRequest{consumer, maximum_cache_rows, cache_physical_byte_limit} : *found;
+}
+
 void AdaptiveGPUCachePlacementRequest::validate() const
 {
     if(mode==AdaptiveGPUCachePlacementMode::ConsumerLocal)
@@ -157,6 +200,15 @@ void ImmutableRowTablePolicy::validate() const
     if (isGPUAdaptive())
     {
         gpu_adaptive.placement.validate();
+        if (gpu_adaptive.local_hot_cache)
+        {
+            if (gpu_adaptive.placement.mode != AdaptiveGPUCachePlacementMode::DeclaredRankLocal)
+                throw std::invalid_argument("Local hot cache requires explicit DeclaredRankLocal shared placement");
+            gpu_adaptive.local_hot_cache->validate();
+            for (const auto& override : gpu_adaptive.local_hot_cache->consumer_overrides)
+                if (override.participant.world_rank != gpu_adaptive.placement.coordinator->world_rank)
+                    throw std::invalid_argument("Local hot cache override is foreign to the shared coordinator rank");
+        }
         if(gpu_adaptive.source_backing!=AdaptiveImmutableRowBacking::SSD && gpu_adaptive.source_backing!=AdaptiveImmutableRowBacking::RAM)
             throw std::invalid_argument("Unknown adaptive native host backing");
         if(gpu_adaptive.source_backing==AdaptiveImmutableRowBacking::RAM &&

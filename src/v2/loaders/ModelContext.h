@@ -44,6 +44,10 @@ namespace llaminar2::qwen4exp { class ImmutableLookupService; }
 namespace llaminar2
 {
 struct GraphConfig;
+struct PreparedFollowerCaptureTerminalKey;
+class PreparedFollowerCaptureTerminalOwner;
+class PreparedFollowerCaptureTerminalPopulation;
+class MoEOverlayInferenceOriginalSlotGeometry;
 namespace qwen4exp {class PooledImmutableRetainedParticipants;}
 
 
@@ -204,17 +208,25 @@ namespace qwen4exp {class PooledImmutableRetainedParticipants;}
         /**
          * @brief Observe current model-owned adaptive native roots on one exact allocator.
          * @param allocator Original rank/device, independent of execution-reader entries.
-         * @return Actual source aggregate or distinct storage-owner lease observation; no value for a query-only or unrelated device.
+         * @return Disjoint actual source/storage and local-cache observations; empty for an unrelated device.
          * @throws std::exception For foreign rank/PMA, missing claimed roots or non-disjoint original owners.
          * @note Historical setup rows never authorize reuse. This borrows surviving live root owners only.
          */
-        std::optional<ImmutableLookupNativeOwnerObservation> retainedAdaptiveImmutableLookupOwner(
+        std::vector<ImmutableLookupNativeOwnerObservation> retainedAdaptiveImmutableLookupOwners(
             PhysicalMemoryAllocatorIdentity allocator)const;
+        /**
+         * @brief Observe disjoint model-owned CPU readiness pages, separately from shared source storage.
+         * @return One actual original PMA lease observation per local consumer, including C0 frames.
+         * @throws std::exception For missing, replaced or incomplete local roots; no hypothetical credit is returned.
+         */
+        std::vector<ImmutableLookupNativeOwnerObservation> retainedAdaptiveImmutableLookupLocalReadyOwners() const;
         /** @brief Prepare original remote programs off all participant workers after immutable source materialization.
          * @param graph Actual full source policy; unsupported parent/MTP shapes reject before recording. */
         void prepareAdaptiveImmutableLookupParticipants(const GraphConfig& graph);
         /** @return Original model-owned remote programs; storage coordinates are never compute domains. */
         std::shared_ptr<qwen4exp::PooledImmutableRetainedParticipants> adaptiveImmutableLookupParticipants(DeviceId device) const override;
+        /** @copydoc IModelContext::adaptiveImmutableLookupLocalHot */
+        std::shared_ptr<qwen4exp::PooledImmutableLocalHotPreparedStorage> adaptiveImmutableLookupLocalHot(DeviceId device) const override;
         /** @brief Exact live immutable-bank bytes for the existing model-retention owner row. */
         std::size_t residentImmutableRowTableBytes(DeviceId device) const override;
 
@@ -247,6 +259,12 @@ namespace qwen4exp {class PooledImmutableRetainedParticipants;}
         void bindNativeContextPreparation(std::shared_ptr<NativeContextPreparation>);
         /** @return Same original source authority for factory-to-loader typed worker handoff. */
         std::shared_ptr<NativeContextPreparation> nativeContextPreparation() const;
+        /** @brief Exclusively borrow original follower events from this prepared model's fixed roster. */
+        std::shared_ptr<PreparedFollowerCaptureTerminalPopulation> borrowPreparedFollowerCaptureTerminals(
+            PreparedFollowerCaptureTerminalKey,void* exact_stream,const MoEOverlayInferenceOriginalSlotGeometry&,
+            const std::shared_ptr<PhysicalMemoryAuthority>&);
+        /** @brief Seal/verify every actual follower family after construction, without device observation. */
+        void sealPreparedFollowerCaptureTerminals();
 
         /**
          * @brief Materialize one actual PLE participant after its ordinary loader drains.
@@ -427,6 +445,7 @@ namespace qwen4exp {class PooledImmutableRetainedParticipants;}
         std::vector<RetainedHostServiceInstance> host_service_selected_;
         std::shared_ptr<NativeContextPreparation> native_context_preparation_; ///< Original same-PMA selected worker owner, never a second resource ledger.
         std::shared_ptr<RetainedHostServiceBinding> host_service_binding_; ///< Destroy/join retained workers before the original native source; PMA remains sole byte ledger.
+        std::shared_ptr<PreparedFollowerCaptureTerminalOwner> follower_capture_terminals_; ///< Physical events only; no runner/arena/protocol backreference.
         mutable std::mutex immutable_row_table_mutex_;
         std::condition_variable immutable_row_table_ready_;
         std::map<DeviceId, ImmutableRowPreparation> immutable_row_table_preparations_;
@@ -438,12 +457,14 @@ namespace qwen4exp {class PooledImmutableRetainedParticipants;}
         /**
          * @brief Original per-compute preparation entry, never a duplicate source authority.
          * ConsumerLocal and the shared coordinator retain a real boundary. A shared
-         * foreign reader retains only the SAME participant authority, with no CPU channel.
+         * foreign reader retains the SAME participant authority, with no CPU channel.
+         * Optional local native roots are disjoint immutable replicas and survive runner retirement.
          */
         struct AdaptiveLookupConsumer
         {
             std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> boundary;
             std::shared_ptr<qwen4exp::PooledImmutableRetainedParticipants> participants;
+            std::shared_ptr<qwen4exp::PooledImmutableLocalHotPreparedStorage> local_hot;
             std::optional<ImmutableRowPreparation> participant_preparation;
             std::exception_ptr participant_failure;
         };

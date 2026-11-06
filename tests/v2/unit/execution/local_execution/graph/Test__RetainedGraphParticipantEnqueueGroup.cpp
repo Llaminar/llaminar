@@ -6,6 +6,7 @@
  * backpressure, not GPU completion or model state. No vendor API is loaded.
  */
 #include "execution/moe/MoEOverlayFollowerRowGeometry.h"
+#include "execution/mtp/MTPServingForwardCaptureGeometry.h"
 
 #include <gtest/gtest.h>
 #include "execution/local_execution/engine/ForwardGraphTypes.h"

@@ -55,3 +55,14 @@ if(TARGET v2_test_pooled_ordering_root_lifetime)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledImmutableOrderingRootLifetimeReplay)
 endif()
 endif()
+
+# The actual parent graph fork needs no extra Probe event; original setup3/4 remains.
+if(TARGET v2_test_qwen4exp_primitives)
+    add_v2_test(V2_Integration_PooledLocalHotOriginalSetupEventBOMReplay
+        COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+            --gtest_filter=PooledImmutableOrderingProgram.LocalHotForkRetainsOnlyOriginalSetupEventBOMReplay
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Memory;Ngram;Ownership;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledLocalHotOriginalSetupEventBOMReplay)
+endif()

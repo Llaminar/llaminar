@@ -147,4 +147,55 @@ TEST(Qwen4ExpLocalPairedCases, UnsetBuildOptionReturnsTheOriginalFamilyDirectly)
     EXPECT_EQ(&qfnLocalPairedFamily("Qwen4ExpMain",ordinary),&ordinary);
 #endif
 }
+/** @test Configuration projection only: actual panel execution remains a separate numerical obligation. */
+TEST(Qwen4ExpLocalPairedCases, LocalHotNumericalPoliciesRequireExactPairedBindings)
+{
+    const auto families = qfnOriginalCaseFamilies();
+    const auto& cases = families.at("Qwen4ExpLocalHotNumerical");
+    ASSERT_EQ(cases.size(), 6u);
+    // Reuse the already-published functional profiles exactly, rather than
+    // manufacturing separate numerical capacity or source policies.
+    const auto functional = qwen4ExpLocalHotBudgetOrdinaryCases();
+    ASSERT_EQ(functional.size(), 5u);
+    for (std::size_t i = 0; i < 3; ++i)
+    {
+        EXPECT_EQ(cases[i].testName(), functional[i].testName());
+        EXPECT_EQ(cases[i].ngram_table_policy, functional[i].ngram_table_policy);
+    }
+    const auto cuda = qwen4ExpCUDALocalHotOrdinaryCases();
+    ASSERT_EQ(cuda.size(), 2u);
+    EXPECT_EQ(cases.back().testName(), cuda.back().testName());
+    EXPECT_EQ(cases.back().ngram_table_policy, cuda.back().ngram_table_policy);
+    auto input = document(families);
+    input["bindings"] = json::array();
+    for (const auto& cell : cases)
+    {
+        EXPECT_EQ(cell.mtp, ModelParityMTP::Off);
+        EXPECT_EQ(cell.retained_mtp_draft_capacity, 3);
+        EXPECT_EQ(cell.expert_overlay, std::optional{ModelParityExpertOverlayPolicy{}});
+        EXPECT_THROW(qfnRequireLocalHotNumericalBinding(cell), std::invalid_argument);
+        input["bindings"].push_back(binding(qfnLocalPairedCellId("Qwen4ExpLocalHotNumerical", cell)));
+    }
+    const auto selected = qfnAttachLocalPairedCases(families, input);
+    const auto& bound = selected.at("Qwen4ExpLocalHotNumerical");
+    std::set<std::string> identities;
+    for (std::size_t i = 0; i < cases.size(); ++i)
+    {
+        EXPECT_TRUE(identities.insert(qfnLocalPairedCellId("Qwen4ExpLocalHotNumerical", bound[i])).second);
+        EXPECT_NO_THROW(qfnRequireLocalHotNumericalBinding(bound[i]));
+        const auto before = cases[i].makeOrchestrationConfig(cases[i].model.model_path, 0);
+        const auto after = bound[i].makeOrchestrationConfig(bound[i].model.model_path, 0);
+        EXPECT_EQ(accuracy::qfnCanonicalConfigurationIntent(before), accuracy::qfnCanonicalConfigurationIntent(after));
+        EXPECT_EQ(bound[i].testName(), cases[i].testName());
+        EXPECT_EQ(bound[i].ngram_table_policy, cases[i].ngram_table_policy);
+        EXPECT_EQ(bound[i].graph_snapshot_policy.required_prefill_snapshot_keys,
+                  cases[i].graph_snapshot_policy.required_prefill_snapshot_keys);
+        EXPECT_EQ(bound[i].graph_snapshot_policy.required_decode_snapshot_keys,
+                  cases[i].graph_snapshot_policy.required_decode_snapshot_keys);
+    }
+    auto wrong = input;
+    wrong["bindings"][0]["exact_cell"] = "Qwen4ExpLocalHotNumerical/Qwen4ExpMainParityTest.ProductionParity/" + cases[0].testName();
+    EXPECT_THROW(qfnAttachLocalPairedCases(families, wrong), std::invalid_argument);
+}
+
 } // namespace llaminar2::test::parity::qwen4exp

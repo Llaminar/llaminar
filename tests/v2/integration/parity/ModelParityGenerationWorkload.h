@@ -21,6 +21,13 @@
 
 namespace llaminar2::test::parity
 {
+    /** Original sampled public generation law; shared by export and native requests. */
+    inline constexpr double kModelParityGenerationTemperature = 0.7;
+    /** Original top-k bound, distinct from numerical checkpoint sampling. */
+    inline constexpr int kModelParityGenerationTopK = 40;
+    /** Original nucleus threshold, retained across every generation topology. */
+    inline constexpr double kModelParityGenerationTopP = 0.9;
+
     /** Immutable request ordering; prefix restore is mandatory, not another axis. */
     enum class GenerationPrefixProbe { Fresh, FullRestore, PartialRestore };
 

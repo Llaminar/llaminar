@@ -469,12 +469,27 @@ CpuAdaptiveImmutableRowCache::ReadGrant CpuAdaptiveImmutableRowCache::authorizeS
         throw std::invalid_argument("Subordinate CPU source requires the original acquired processor frame");
     return ReadGrant(impl_,channel,generation,sequence,ids,intents,acknowledgements,s.channelIndex(channel));
 }
-CpuImmutableRowGatherObservation CpuAdaptiveImmutableRowCache::gather(std::span<const std::int64_t> ids,std::span<std::byte> destination) {
-    return gatherImpl(ids,destination,nullptr);
+CpuImmutableRowGatherObservation CpuAdaptiveImmutableRowCache::gather(
+    std::span<const std::int64_t> ids,std::span<std::byte> destination) {
+    return gatherImpl(ids,destination,nullptr,CpuImmutableRowCacheAccess::CurrentDemand);
 }
 CpuImmutableRowGatherObservation CpuAdaptiveImmutableRowCache::gatherImpl(
     std::span<const std::int64_t> ids,std::span<std::byte> destination,const ReadGrant *grant) {
+    return gatherImpl(ids,destination,grant,CpuImmutableRowCacheAccess::CurrentDemand);
+}
+CpuImmutableRowGatherObservation CpuAdaptiveImmutableRowCache::gather(std::span<const std::int64_t> ids,std::span<std::byte> destination,
+    CpuImmutableRowCacheAccess access) {
+    return gatherImpl(ids,destination,nullptr,access);
+}
+CpuImmutableRowGatherObservation CpuAdaptiveImmutableRowCache::gatherImpl(
+    std::span<const std::int64_t> ids,std::span<std::byte> destination,const ReadGrant *grant,
+    CpuImmutableRowCacheAccess access) {
     auto &s=*impl_;std::lock_guard lock(s.mutex);s.requireOpen();const auto &g=s.geometry;
+    if((access!=CpuImmutableRowCacheAccess::CurrentDemand &&
+        access!=CpuImmutableRowCacheAccess::FutureLookupOnly) ||
+       (grant && access!=CpuImmutableRowCacheAccess::CurrentDemand))
+        throw std::invalid_argument("CPU lookup-only access requires an independent original source read");
+    const bool demand=access==CpuImmutableRowCacheAccess::CurrentDemand;
     if(!g.requesters_.empty()!=static_cast<bool>(grant) ||
         (grant && (grant->owner_.get()!=impl_.get() || s.channels()[grant->channel_index_]!=grant->channel_ ||
          grant->ids_.data()!=ids.data() || grant->ids_.size()!=ids.size())))
@@ -482,8 +497,8 @@ CpuImmutableRowGatherObservation CpuAdaptiveImmutableRowCache::gatherImpl(
     if(s.next_policy_ordinal==std::numeric_limits<std::uint64_t>::max() ||
         ids.size()>g.maximum_live_rows_ || destination.size()!=times(ids.size(),g.extent_.rowBytes()) ||
         destination.size()>std::numeric_limits<std::uint64_t>::max()-s.counters.completed_bytes ||
-        ids.size()>std::numeric_limits<std::uint64_t>::max()-s.clock ||
-        (s.clock+ids.size())/g.policy_.aging_accesses>std::numeric_limits<std::uint32_t>::max())
+        (demand && (ids.size()>std::numeric_limits<std::uint64_t>::max()-s.clock ||
+        (s.clock+ids.size())/g.policy_.aging_accesses>std::numeric_limits<std::uint32_t>::max())))
         throw std::invalid_argument("CPU row cache live capacity, policy ordinal or epoch is invalid");
     for(auto id:ids)if(id<0 || static_cast<std::uint64_t>(id)>=g.extent_.rows())throw std::out_of_range("CPU row cache source ID is invalid");
     if(overlaps(ids.data(),ids.size_bytes(),destination.data(),destination.size()) ||
@@ -571,6 +586,9 @@ CpuImmutableRowGatherObservation CpuAdaptiveImmutableRowCache::gatherImpl(
                 std::memcpy(out,destination.data()+plans[i].first*g.extent_.rowBytes(),g.extent_.rowBytes());
                 ++s.counters.duplicate_rows;
             }
+            // Lookup-only uses the same bounded response/source transaction.
+            // It earns no policy age, sketch credit, hot admission or eviction.
+            if(!demand)continue;
             ++s.clock;
             if(grant && grant->intents_[i].intent==ImmutableRowReadIntent::ReadAndInvalidate) {
                 if(plans[i].first==i)s.invalidate(row);

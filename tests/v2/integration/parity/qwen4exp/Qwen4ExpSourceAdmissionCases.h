@@ -22,6 +22,7 @@
 #include "Qwen4ExpFixedHeadParityCases.h"
 #include "Qwen4ExpGPUAdaptiveParityCases.h"
 #include "Qwen4ExpOwnerSubsetParityCases.h"
+#include "Qwen4ExpCombinedLocalHotCases.h"
 #include "Qwen4ExpMTPAdmissionCases.h"
 #include "Qwen4ExpROCm4OverlayPolicyParityCases.h"
 #include "backends/HardwareInventory.h"

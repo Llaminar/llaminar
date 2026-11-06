@@ -82,9 +82,15 @@ namespace llaminar2
         MTPVerifierGraphFamily family = MTPVerifierGraphFamily::BoundedBuckets)
     {
         (void)mtpVerifierGraphFamilyWidthCount(maximum_verifier_rows, family);
-        if (!mtp.enabled)
+        if (!retainsMTPGraphCapacity(mtp))
             return {};
 
+        if (mtp.depth_policy.mode!=MTPDepthPolicyMode::Fixed && mtp.depth_policy.mode!=MTPDepthPolicyMode::Observe &&
+            mtp.depth_policy.mode!=MTPDepthPolicyMode::Dynamic)
+            throw std::invalid_argument("MTP serving capture has an unknown initial depth mode");
+        // Disabled request policy does not remove already-admitted graph
+        // identities. This is cold topology only; request admission still owns
+        // whether any MTP executable may run.
         const auto depth_policy =
             resolveMTPDeviceGenerationDepthPolicy(mtp);
         const bool dynamic_depth =
@@ -102,7 +108,7 @@ namespace llaminar2
                     ? MTPVerifierPhysicalWidthPolicy::DynamicDeviceEnvelope
                     : MTPVerifierPhysicalWidthPolicy::BoundedLogicalBucket;
         const int verifier_rows =
-            depth_policy.valid() && draft_depth > 0
+            (!mtp.enabled || depth_policy.valid()) && draft_depth > 0
                 ? mtpVerifierPhysicalPaddedSeqLen(
                       /*request_count=*/1,
                       logical_verifier_rows,
@@ -122,7 +128,7 @@ namespace llaminar2
      * @param mtp Immutable graph capacity and initial serving policy.
      * @param maximum_verifier_rows Exact arena-owned per-request row capacity.
      * @param family_kind Immutable graph identities selected before physical admission.
-     * @return Every admitted physical width; empty when execution is disabled.
+     * @return Every admitted physical width; empty only when no MTP capacity is retained.
      * @throws std::invalid_argument when arena and retained capacity disagree.
      *
      * The first graph fixes shared snapshot addresses at their largest extent.

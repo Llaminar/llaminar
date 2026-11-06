@@ -76,6 +76,23 @@ double completedForwardCount(OrdinaryForwardRetentionKind retention, DeviceId de
     }
     return count;
 }
+/**
+ * @brief Count exact completed-enqueue ordinary transaction publications.
+ * @param device Original participant; other publishers cannot satisfy this proof.
+ * @return Mailboxes published through the production exclusive-writer closure.
+ */
+double ordinaryTransactionPublications(DeviceId device)
+{
+    double count = 0;
+    for (const auto &record : PerfStatsCollector::snapshot())
+        if (record.domain == "mtp" &&
+            record.name == "device_resident_logical_state_mailboxes" &&
+            record.device == device.toString() &&
+            record.tags.contains("publication_kind") &&
+            record.tags.at("publication_kind") == "ordinary_generation_transaction")
+            count += record.value;
+    return count;
+}
 /** @brief One native GPU control or GPU continuation with an actual host expert tier. */
 class HostedOrdinaryForward : public ::testing::TestWithParam<std::string> {};
 TEST_P(HostedOrdinaryForward, MaterializesCompleteHostedBodyAndReusesAcrossResets)
@@ -121,7 +138,7 @@ TEST_P(HostedOrdinaryForward, MaterializesCompleteHostedBodyAndReusesAcrossReset
     config.prefill_max_bucket_size = 64;
     config.prefix_cache.enabled = false;
     publishOrchestrationStartupPolicy(config);
-    OrdinaryGraphEvidence evidence;
+    OrdinaryGraphEvidence evidence("generation,forward_graph,mtp");
     OrchestrationRunner runner(config, createExecutionPlanBuilder());
     ASSERT_TRUE(runner.initialize()) << runner.lastError();
     ASSERT_EQ(runner.primaryDeviceId(), device);
@@ -147,10 +164,17 @@ TEST_P(HostedOrdinaryForward, MaterializesCompleteHostedBodyAndReusesAcrossReset
         runner.clearCache();
         ASSERT_TRUE(runner.prefill({11, 12, 13})) << runner.lastError();
         const auto completed_before = completedForwardCount(retention, device);
+        const auto publications_before = ordinaryTransactionPublications(device);
         runner.setDecodeStepTokenBudget(3);
         const auto result = runner.decodeStep();
         ASSERT_TRUE(result.success()) << result.error;
         ASSERT_EQ(result.tokens.size(), 3u);
+        // Every hosted sample/forward closes its actual writer before the next
+        // coordinated transaction. CUDA's conditional native parent retains its
+        // separate complete-parent contract and must emit none of these.
+        EXPECT_EQ(ordinaryTransactionPublications(device) - publications_before,
+                  hosted || !cuda ? 3.0 : 0.0);
+
         // The first response samples existing prefill logits; the remaining
         // two responses each require one real complete retained forward.
         EXPECT_EQ(completedForwardCount(retention, device) - completed_before, 2.0);

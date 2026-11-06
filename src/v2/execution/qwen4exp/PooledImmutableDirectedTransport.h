@@ -12,11 +12,15 @@
  */
 #pragma once
 #include "PooledImmutableDirectedChannelGeometry.h"
+#include "PooledImmutableLocalHotTransportGeometry.h"
+#include "PooledImmutableLocalHotPoolQuery.h"
+#include "PooledImmutableLocalHotNativePack.h"
 #include "PooledImmutableTransferBinding.h"
 #include "PooledImmutableReplicatedReaderGeometry.h"
 #include "PooledImmutableParticipantRetirementGraph.h"
 #include "ImmutableLookupExecutionBoundary.h"
 namespace llaminar2::qwen4exp {
+class IPooledImmutableLocalHotKernels;
 /** @brief Complete immutable original chain for one addressed remote coordinate. */
 struct PooledImmutableRemoteTransport final {
     std::uint32_t coordinate;
@@ -60,33 +64,38 @@ private:
         std::shared_ptr<CapturedTransferChannel> result, std::shared_ptr<CapturedTransferChannel> acknowledgement,
         std::array<PhysicalMemoryAllocationLease,2> claims,
         std::array<std::shared_ptr<DeviceTransferBuffer>,2> controls,
-        PooledImmutableTransferChannel nativeResult = {}, PooledImmutableTransferChannel nativeAck = {})
+        PooledImmutableTransferChannel nativeResult = {}, PooledImmutableTransferChannel nativeAck = {},
+        PooledNativeReaderMessageProfile profile = PooledNativeReaderMessageProfile::ReplicatedFP32)
         : coordinate_(coordinate), source_(std::move(source)), reader_(std::move(reader)),
           result_(std::move(result)), acknowledgement_(std::move(acknowledgement)),
           control_claims_(std::move(claims)), controls_(std::move(controls)),
-          native_result_(std::move(nativeResult)), native_acknowledgement_(std::move(nativeAck)) {}
+          native_result_(std::move(nativeResult)), native_acknowledgement_(std::move(nativeAck)), profile_(profile) {}
     std::uint32_t coordinate_;
     PreparedGPUContextUsePermit source_, reader_;
     std::shared_ptr<CapturedTransferChannel> result_, acknowledgement_;
     std::array<PhysicalMemoryAllocationLease,2> control_claims_;
     std::array<std::shared_ptr<DeviceTransferBuffer>,2> controls_;
     PooledImmutableTransferChannel native_result_, native_acknowledgement_;
+    PooledNativeReaderMessageProfile profile_;
 };
 /** @brief Pure BOM projection and actual original TransferEngine materialization, never another admission ledger. */
-class PooledImmutableDirectedTransport final {
+class PooledImmutableDirectedTransport final:public std::enable_shared_from_this<PooledImmutableDirectedTransport> {
 public:
     /** @brief Exact two-channel protocol floor at zero optional owner payload capacity. */
     static PhysicalMemoryPlan mandatoryBOM(const PooledImmutablePhysicalOwnerGeometry&,const PooledImmutableCoordinatorGeometry&,
         PhysicalMemoryResource host,std::span<const PhysicalMemoryResource> originalGPUResources,
-        const PooledImmutableReplicatedReaderGeometry* readers = nullptr);
+        const PooledImmutableReplicatedReaderGeometry* readers = nullptr,
+        PooledNativeReaderMessageProfile profile = PooledNativeReaderMessageProfile::ReplicatedFP32);
     /** @brief Exact full two-channel contribution for this candidate's actual owner capacities. */
     static PhysicalMemoryPlan completeBOM(const PooledImmutablePhysicalOwnerGeometry&,const PooledImmutableCoordinatorGeometry&,
         PhysicalMemoryResource host,std::span<const PhysicalMemoryResource> originalGPUResources,
-        const PooledImmutableReplicatedReaderGeometry* readers = nullptr);
+        const PooledImmutableReplicatedReaderGeometry* readers = nullptr,
+        PooledNativeReaderMessageProfile profile = PooledNativeReaderMessageProfile::ReplicatedFP32);
     /** @brief Source-owned exact growth above the same ordered protocol floor; add before candidate fits. */
     static PhysicalMemoryPlan slotDependentBOM(const PooledImmutablePhysicalOwnerGeometry&,const PooledImmutableCoordinatorGeometry&,
         PhysicalMemoryResource host,std::span<const PhysicalMemoryResource> originalGPUResources,
-        const PooledImmutableReplicatedReaderGeometry* readers = nullptr);
+        const PooledImmutableReplicatedReaderGeometry* readers = nullptr,
+        PooledNativeReaderMessageProfile profile = PooledNativeReaderMessageProfile::ReplicatedFP32);
     /** @brief Bind original source permits/streams and existing directed waves once outside capture.
      * @param boundary Actual service/source owner retaining the original prepared participant cohort.
      * @param originalInventory Original rank discovery owner; required for every explicit same-vendor mapped or peer route.
@@ -95,7 +104,8 @@ public:
     static std::shared_ptr<const PooledImmutableDirectedTransport> create(std::shared_ptr<ImmutableLookupExecutionBoundary> boundary,
         std::shared_ptr<const ClusterInventory> originalInventory = {},
         std::optional<PooledImmutableReplicatedReaderGeometry> readers = {},
-        std::shared_ptr<const Qwen4ExpReplicatedPLECohort> nativeCohort = {});
+        std::shared_ptr<const Qwen4ExpReplicatedPLECohort> nativeCohort = {},
+        std::optional<PooledImmutableLocalHotTransportGeometry> localHot = {});
     /** @return Original source boundary; foreign readers never reinterpret its device as their own. */
     const std::shared_ptr<ImmutableLookupExecutionBoundary>& sourceBoundary() const noexcept { return boundary_; }
     /** @return Actual foreign compute-reader channels; they are never storage-owner programs. */
@@ -104,6 +114,27 @@ public:
     /** @return Exact declared compute-reader shape, absent on the original singleton path. */
     const std::optional<PooledImmutableReplicatedReaderGeometry>& readerGeometry() const noexcept
     { return reader_geometry_; }
+    /** @brief Once-request original source publication/receive and local reset, before any retained Probe. */
+    void enqueueLocalHotAdmission(const std::shared_ptr<PooledImmutableLocalHotPreparedStorage>&,
+        const std::shared_ptr<const IPooledImmutableLocalHotKernels>&,
+        const DeviceGenerationControlBinding&,void* exact_stream)const;
+    /** @return Exact original native response destination for one actual consumer. */
+    PooledImmutableLocalHotNativePack localHotNativePack(std::shared_ptr<PooledImmutableLocalHotPreparedStorage>)const;
+    /** @return Closed actual compact query producers for the unchanged original pool Begin. */
+    PooledImmutableLocalHotPoolQuery localHotPoolQuery(std::shared_ptr<PooledImmutableLocalHotPreparedStorage>)const;
+    /** @return Original optional compact geometry; old shared-only semantics remain distinct. */
+    const auto& localHotGeometry()const noexcept{return local_hot_geometry_;}
+    /** @return Exact participant-local actual request metadata, including source-self. */
+    PooledNativeTransferSpan localHotControl(DeviceId participant,std::uint32_t consumer)const;
+    /** @return Actual local consumer-authored Request88, never reconstructed from a response. */
+    PooledNativeTransferSpan localHotOriginalRequest(DeviceId participant)const;
+    /** @return Exact local once-per-request original source admission header. */
+    PooledNativeTransferSpan localHotAdmission(DeviceId participant)const;
+    /** @return Source-owned union metadata followed by distinct admitted native scratch roots. */
+    PooledNativeTransferSpan localHotUnion()const;
+    /** @return Source scratch by nominal role; absent singleton scratch is not fabricated. */
+    enum class LocalHotSourceScratch {MergedKeys,IncomingKeys,OutgoingRows};
+    PooledNativeTransferSpan localHotSourceScratch(LocalHotSourceScratch role)const;
     /** @return Actual remotes in original coordinate order; co-located owners are absent. */
     std::span<const PooledImmutableRemoteTransport> remotes()const noexcept{return remotes_;}
     /** @return Actual original addressed remote chain; a local/foreign coordinate rejects. */
@@ -136,6 +167,8 @@ private:
     explicit PooledImmutableDirectedTransport(std::shared_ptr<ImmutableLookupExecutionBoundary> boundary,
         std::shared_ptr<const ClusterInventory> originalInventory)
         :boundary_(std::move(boundary)),original_inventory_(std::move(originalInventory)){}
+    /** @return Exact private control owner for an original local endpoint/consumer pair. */
+    const std::shared_ptr<DeviceTransferBuffer>& localHotControlRoot(DeviceId,std::uint32_t)const;
     /** @brief Authenticate original source roots before any channel is materialized. */
     void requireOriginalSource() const;
     /** @return Existing physical channel owners only, with no new registry or progress state. */
@@ -144,6 +177,13 @@ private:
     /** Original immutable discovery owner, retained until all original channels retire. */
     std::shared_ptr<const ClusterInventory> original_inventory_;
     std::vector<PooledImmutableRemoteTransport> remotes_;
+    std::optional<PooledImmutableLocalHotTransportGeometry> local_hot_geometry_;
+    /** Immutable original fixed-header endpoints; created once, never per lookup. */
+    struct AdmissionEdge {std::uint32_t coordinate;PooledImmutableTransferBinding source,reader;};
+    std::vector<AdmissionEdge> local_hot_admission_;
+    /** Exact materialized roots, in self-control/union/merged/ingress/pack order. */
+    std::array<PhysicalMemoryAllocationLease,5> local_hot_source_claims_;
+    std::array<std::shared_ptr<DeviceTransferBuffer>,5> local_hot_source_roots_;
     std::shared_ptr<const PooledImmutableNativeCompletionStorage> native_completion_;
     std::optional<PooledImmutableReplicatedReaderGeometry> reader_geometry_;
     std::vector<std::shared_ptr<const PooledImmutableReplicatedReaderTransport>> readers_;

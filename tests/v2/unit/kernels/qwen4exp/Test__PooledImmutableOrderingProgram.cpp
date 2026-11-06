@@ -9,6 +9,9 @@
 #include "kernels/qwen4exp/PooledImmutableNativePlan.h"
 #include "kernels/qwen4exp/PooledImmutableSourceGeometry.h"
 #include "loaders/ImmutableRowTable.h"
+#include "kernels/qwen4exp/PooledImmutableLocalHotGeometry.h"
+#include "transfer/TransferEngine.h"
+#include "fixtures/backends/NativeOrderingEventGroupReplayAccess.h"
 #include <gtest/gtest.h>
 #include <array>
 #include <algorithm>
@@ -212,3 +215,49 @@ TEST(PooledImmutableOrderingProgram, RetainedRootProjectionDistinguishesPhysical
     }
 }
 }}
+
+namespace llaminar2::test {
+/** @test The actual LocalHot geometry prices only original setup/publication events after parent-level Probe fork. */
+TEST(PooledImmutableOrderingProgram, LocalHotForkRetainsOnlyOriginalSetupEventBOMReplay)
+{
+    const ImmutableRowTableSource source{.path="recorded-local-hot-event-bom", .tensor_name="rows",
+        .rows=0x100000100ULL, .row_elements=160, .format=GGUFTensorType::IQ4_NL};
+    const PhysicalMemoryResource cpu{0,DeviceId::cpu(),1ull<<34,1ull<<34};
+    for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm})
+        for(const std::size_t count:{1u,2u,4u,8u})
+        {
+            std::vector<DeviceId> devices;
+            for(std::size_t ordinal=0;ordinal<count;++ordinal) devices.emplace_back(backend,int(ordinal));
+            const auto projection=NativeOrderingEventGroupReplayAccess::projection(devices);
+            for(const auto slots:{0u,64u})
+                for(const auto device:devices)
+                {
+                    const PhysicalMemoryResource gpu{0,device,1ull<<34,1ull<<34};
+                    const auto geometry=q::PooledImmutableLocalHotGeometry::declare(source,{0,device},128,slots,{65536,1,2});
+                    const auto program=NativeOrderingEventProgram::pooledLocalHot(slots!=0);
+                    EXPECT_EQ(program.kind(),NativeOrderingEventProgram::Kind::PooledLocalHotInitialization);
+                    EXPECT_EQ(program.orderingEvents(),slots?4u:3u);
+                    EXPECT_NO_THROW(program.requireRootBytes({geometry.cacheOffsets().bytes,
+                        geometry.frameOffsets().bytes,geometry.scratchOffsets().bytes}));
+                    const auto floor=geometry.mandatoryBOM(gpu,cpu,projection);
+                    const auto optional=geometry.slotDependentBOM(gpu,cpu,projection);
+                    PhysicalMemoryPlanBuilder actual(floor);
+                    for(const auto& row:optional.resources())actual.add(row);
+                    PhysicalMemoryPlanBuilder expected(projection.bom(program,cpu,gpu));
+                    expected.add(gpu,PhysicalMemoryOwner::ImmutableTableStorage,geometry.physicalBytes());
+                    expected.add(gpu,PhysicalMemoryOwner::ImmutableLookupStaging,
+                        geometry.frameOffsets().bytes+geometry.scratchOffsets().bytes);
+                    expected.add(cpu,PhysicalMemoryOwner::ImmutableLookupStaging,
+                        TransferEngine::mappedHostRegionAllocationBytes(sizeof(std::uint64_t)));
+                    const auto complete=actual.build();const auto exact=expected.build();
+                    EXPECT_FALSE(complete.requiredFootprintMismatch(exact));
+                    EXPECT_FALSE(exact.requiredFootprintMismatch(complete));
+                    // Source-native cache caps and the mandatory mapped page
+                    // remain unchanged; only the unused Probe event disappears.
+                    EXPECT_EQ(geometry.physicalBytes(),geometry.cacheOffsets().bytes);
+                    EXPECT_EQ(complete.find({0,DeviceId::cpu()})->bytes(PhysicalMemoryOwner::ImmutableLookupStaging),
+                        TransferEngine::mappedHostRegionAllocationBytes(sizeof(std::uint64_t)));
+                }
+        }
+}
+} // namespace llaminar2::test

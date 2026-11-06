@@ -10,10 +10,27 @@
 #pragma once
 #include <optional>
 #include "PooledImmutableDemandFrontier.h"
+#include "PooledImmutableLocalHotGraph.h"
+#include "PooledImmutableLocalHotPoolQuery.h"
 #include "execution/compute_stages/stages/qwen4exp/PooledImmutableSourcePhaseStage.h"
 #include "execution/compute_stages/stages/qwen4exp/PooledImmutableNativePhaseStage.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
 namespace llaminar2 {
+/** @brief Original full-ID lookup and its real decoded model target. */
+struct PooledImmutableOriginalLookupInput final {
+    qwen4exp::pooled_native::OriginalRows rows;
+    qwen4exp::PooledNativeOperandSpans begin;
+    qwen4exp::PooledNativeTensorSpan output;
+    std::string output_identity;
+};
+/** @brief Compact query and native delivery; there is no decoded intermediate tensor. */
+struct PooledImmutableCompactLookupInput final {
+    qwen4exp::PooledImmutableLocalHotPoolQuery query;
+    PooledImmutableCompactReadRequest delivery;
+    std::string query_ready;
+};
+/** @brief A source graph has one complete original input/output contract. */
+using PooledImmutableLookupInput=std::variant<PooledImmutableOriginalLookupInput,PooledImmutableCompactLookupInput>;
 struct PooledImmutableReplicatedReaderCompletion;
 /**
  * @brief Original P1 phase inventory retained by the actual recurring source plan.
@@ -39,7 +56,14 @@ public:
     const std::string& readersRetiredNode()const noexcept{return readersRetired;}
     /** @return Actual original shared-reader completion, absent only for singleton composition. */
     const auto& sharedReaders()const noexcept{return readers;}
+    /** @return Real compact delivery/ACK inventory, present only for native delivery. */
+    const auto& compactDelivery()const noexcept{return compact_delivery;}
 private:
+    friend class PooledImmutableDirectedLookupBuilder;
+    friend PooledImmutableLookupGraphEndpoints appendPooledImmutableLocalLookupGraph(ComputeGraph&,BufferArena&,
+        std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary>,
+        std::shared_ptr<const qwen4exp::IPooledImmutableNativeKernels>,PooledImmutableLookupInput,
+        DeviceGenerationControlBinding,const std::string&,std::shared_ptr<PooledImmutableLocalRetirementCompletion>*);
     friend PooledImmutableLookupGraphEndpoints appendPooledImmutableLocalLookupGraph(ComputeGraph&,BufferArena&,
         std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary>,
         std::shared_ptr<const qwen4exp::IPooledImmutableNativeKernels>,qwen4exp::pooled_native::OriginalRows,
@@ -57,19 +81,18 @@ private:
      * @brief Capture original graph inputs; callers cannot fabricate a terminal inventory.
      * @param source Same materialized real-provider boundary.
      * @param binding Canonical controller borrowed by these exact phases.
-     * @param rows Original counted/fixed ID extent. @param ids Exact Begin ID subview.
-     * @param result Original FP32 Read output subview.
+     * @param input Complete typed decoded or compact source request.
      */
     PooledImmutableLocalRetirementCompletion(std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> source,
-        DeviceGenerationControlBinding binding,qwen4exp::pooled_native::OriginalRows rows,qwen4exp::PooledNativeTensorSpan ids,qwen4exp::PooledNativeTensorSpan result)
-        :boundary(std::move(source)),control(std::move(binding)),original(std::move(rows)),inputIds(std::move(ids)),output(std::move(result)){}
+        DeviceGenerationControlBinding binding,PooledImmutableLookupInput input)
+        :boundary(std::move(source)),control(std::move(binding)),input(std::move(input)){}
     std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> boundary;
     DeviceGenerationControlBinding control;
-    qwen4exp::pooled_native::OriginalRows original;
-    qwen4exp::PooledNativeTensorSpan inputIds,output;
+    PooledImmutableLookupInput input;
     std::string first,last,read,readersRetired;
     std::vector<Phase> phases;
     std::shared_ptr<const PooledImmutableReplicatedReaderCompletion> readers;
+    std::shared_ptr<const PooledImmutableCompactReadCompletion> compact_delivery;
 };
 /**
  * @brief Authenticate the original P1 phase chain and every actual shared-reader ACK.
@@ -105,6 +128,20 @@ PooledImmutableLookupGraphEndpoints appendPooledImmutableLocalLookupGraph(Comput
     std::shared_ptr<const qwen4exp::IPooledImmutableNativeKernels> code,qwen4exp::pooled_native::OriginalRows original,
     qwen4exp::PooledNativeOperandSpans begin,DeviceGenerationControlBinding control,
     qwen4exp::PooledNativeTensorSpan output,const std::string& identity,const std::string& outputIdentity={},
+    std::shared_ptr<PooledImmutableLocalRetirementCompletion>* retirement=nullptr);
+/**
+ * @brief Use the same sole-owner phase program for decoded or compact native delivery.
+ * @param graph Actual local graph. Compact input already names its original union producer.
+ * @param arena Original admitted root aliases. @param boundary Original source owner.
+ * @param code Original backend code. @param input Exactly one complete query/consumer contract.
+ * @param control Original request controller. @param identity Unique local phase namespace.
+ * @param retirement Optional actual phase/consumer inventory for parent retirement.
+ * @return Same physical first/last frontiers with the selected real consumer.
+ */
+PooledImmutableLookupGraphEndpoints appendPooledImmutableLocalLookupGraph(ComputeGraph& graph,BufferArena& arena,
+    std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> boundary,
+    std::shared_ptr<const qwen4exp::IPooledImmutableNativeKernels> code,PooledImmutableLookupInput input,
+    DeviceGenerationControlBinding control,const std::string& identity,
     std::shared_ptr<PooledImmutableLocalRetirementCompletion>* retirement=nullptr);
 /**
  * @brief Append the actual PLE hash-ID lookup using the original sixteen-head token count authority.

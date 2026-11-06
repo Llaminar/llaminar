@@ -41,8 +41,24 @@ public:
     PooledImmutableNativeTransfer counted(PooledImmutableNativeTransfer binding,
         PooledNativeCountedMessage message, PooledNativeTransferSpan extent,
         std::optional<PooledNativeCompletionFrame> frame = {}) const;
+    /**
+     * @brief Bind MissKeys to an explicit original request lane, never a default response frame.
+     * @param binding Original fixed endpoint on this same native cohort.
+     * @param extent Exact original UInt64 request byte publication.
+     * @param frame Actual original request identity/error authority.
+     * @return Counted endpoint retaining this same completion storage.
+     */
+    PooledImmutableNativeTransfer countedRequest(PooledImmutableNativeTransfer binding,
+        PooledNativeTransferSpan extent, PooledNativeRequestCompletionFrame frame) const;
 private:
     friend class PooledImmutableDirectedTransport;
+    /**
+     * @brief Match the counted endpoint to this same original metadata bank.
+     * @param binding Original native endpoint, not another equal-sized cohort.
+     * @return Exact coordinate after cohort/control-block, worker and PMA validation.
+     * @throws std::exception For retired/foreign ownership or stale generation.
+     */
+    int requireOriginalBinding(const PooledImmutableNativeTransfer& binding) const;
     /** @brief Revoke original caller bindings only after enclosing parent/cache retirement; storage releases with its final borrower. */
     void retireOriginalRuntime() const noexcept { retired_.store(true, std::memory_order_release); }
     /** @brief Materialize only exact admitted roots using original prepared workers before capture. */
@@ -110,6 +126,14 @@ public:
      */
     PooledImmutableTransferBinding withNativeCounted(PooledNativeTransferSpan extent,
         PooledNativeCountedMessage message, PooledNativeCompletionFrame frame) const;
+    /**
+     * @brief Bind native compact MissKeys using its original request-lane identity.
+     * @param extent Exact original UInt64 byte publication.
+     * @param frame Original request identity/error authority, not a response interval.
+     * @return Same original native binding and completion owner; mapped bindings reject.
+     */
+    PooledImmutableTransferBinding withNativeRequestCounted(PooledNativeTransferSpan extent,
+        PooledNativeRequestCompletionFrame frame) const;
     /** @brief Bind an original source descriptor and exact subspan, preserving its immutable offset origin. */
     PooledImmutableTransferBinding withDeviceSliced(std::shared_ptr<TensorBase> root,
         std::size_t offset, std::size_t sourceBytes, std::uint64_t sourceOrigin,
@@ -169,6 +193,8 @@ public:
     const std::shared_ptr<const PooledImmutableNativeCompletionStorage>& nativeStorage() const noexcept { return native_; }
     /** @return The original captured channel, absent for native movement. */
     const std::shared_ptr<CapturedTransferChannel>& captured() const noexcept { return captured_; }
+    /** @brief Preserve an exact original bounded span/role while binding this native or captured endpoint. */
+    PooledImmutableTransferBinding bind(CapturedTransferEndpoint,CapturedTransferMessage,PooledNativeTransferSpan)const;
     /** @return Original fixed endpoint, ready for an optional typed count/slice extension. */
     PooledImmutableTransferBinding bind(CapturedTransferEndpoint side, CapturedTransferMessage message,
         std::shared_ptr<TensorBase> root, std::size_t offset) const;

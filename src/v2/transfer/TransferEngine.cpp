@@ -12,6 +12,7 @@
 
 #include "transfer/TransferEngine.h"
 #include "planning/PhysicalMemoryAuthority.h"
+#include "kernels/qwen4exp/PooledImmutableLocalHotReadyRoot.h"
 
 #include <algorithm>
 #include <array>
@@ -1893,15 +1894,36 @@ namespace llaminar2
         const CPUMappedPublicationRoot &root,
         const std::shared_ptr<PhysicalMemoryAuthority> &authority) const
     {
+        return allocateAdmittedMappedPublicationRoot(root.payloadBytes(), root.physicalBytes(),
+            root.hostAllocator(), root.consumer(), root.owner(), authority);
+    }
+
+    std::shared_ptr<MappedHostTransferRegion> TransferEngine::allocateMappedHostRegion(
+        const qwen4exp::PooledImmutableLocalHotReadyRoot &root,
+        const std::shared_ptr<PhysicalMemoryAuthority> &authority) const
+    {
+        if (!authority || root.authority_.get() != authority.get() || root.region_ ||
+            root.consumer_.world_rank != authority->worldRank())
+            throw std::logic_error("Local ready mapping requires its unmaterialized original owner and authority");
+        return allocateAdmittedMappedPublicationRoot(sizeof(std::uint64_t),
+            mappedHostRegionAllocationBytes(sizeof(std::uint64_t)), DeviceId::cpu(),
+            root.consumer_.device, PhysicalMemoryOwner::ImmutableLookupStaging, authority);
+    }
+
+    std::shared_ptr<MappedHostTransferRegion> TransferEngine::allocateAdmittedMappedPublicationRoot(
+        size_t payload_bytes, size_t physical_bytes, DeviceId host_allocator,
+        DeviceId consumer, PhysicalMemoryOwner owner,
+        const std::shared_ptr<PhysicalMemoryAuthority> &authority) const
+    {
         if (!authority)
             throw std::logic_error("CPU mapped publication requires physical-memory admission");
-        // Admission precedes backend discovery/native allocation. On any setup
-        // failure native cleanup runs before this local claim retires.
-        auto claim = std::make_shared<PhysicalMemoryAllocationLease>(authority->claimNewAllocation(
-            root.hostAllocator(), root.owner(), root.physicalBytes()));
-        const std::array devices{root.consumer()};
-        auto region = allocateMappedHostRegion(root.payloadBytes(), devices);
-        if (region->sizeBytes() != root.physicalBytes())
+        // Admission precedes backend discovery/native allocation. On failure,
+        // native cleanup completes before this exact local claim retires.
+        auto claim = std::make_shared<PhysicalMemoryAllocationLease>(
+            authority->claimNewAllocation(host_allocator, owner, physical_bytes));
+        const std::array devices{consumer};
+        auto region = allocateMappedHostRegion(payload_bytes, devices);
+        if (region->sizeBytes() != physical_bytes)
             throw std::logic_error("CPU mapped publication allocation disagrees with its declaration");
         region->allocation_claim_ = std::move(claim);
         return region;

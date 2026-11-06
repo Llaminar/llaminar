@@ -8,6 +8,7 @@
  */
 #include "kernels/common/SamplingMath.h"
 #include "kernels/qwen4exp/QwenAdaptiveTerminalCounters.h"
+#include "execution/qwen4exp/PooledImmutableLocalHotTransportGeometry.h"
 #include "qwen4exp/AdaptiveImmutableRowCacheTestFixture.h"
 #include <array>
 #include <cstring>
@@ -80,6 +81,31 @@ TEST(QwenAdaptiveTerminalCounters, SourceBytesAndCancellationWorkHaveExactDistin
     EXPECT_TRUE(validQwenAdaptiveCounters({1, 0, 0, 0, 0, 0, 0, 0, 1}, 90, 16)); // cancelled before policy
     EXPECT_FALSE(validQwenAdaptiveCounters({0, 0, 1, 0, 0, 0, 0, 0, 0}, 90, 16));
     EXPECT_FALSE(validQwenAdaptiveCounters({1, 0, 0, 1, 1, 90, 1, 1, 0}, 90, 16));
+}
+/** @test Exact compact misses do not masquerade as full sixteen-head model queries. */
+TEST(QwenAdaptiveTerminalCounters, CompactMissCountsKeepOriginalUnitsAndUnpaddedBounds)
+{
+    constexpr auto compact=QwenAdaptiveQuerySemantics::CompactNativeMisses;
+    for(std::size_t consumers=1;consumers<=8;++consumers) {
+        const auto capacity=PooledImmutableLocalHotTransportGeometry::compactOriginalCapacity(32,consumers);
+        ASSERT_EQ(capacity,32u*consumers);
+        for(std::uint64_t ids=0;ids<=capacity;++ids) {
+            const QwenAdaptiveCounterTotals actual{1,ids,0,ids,ids,ids*90,0,0,0};
+            EXPECT_TRUE(validQwenAdaptiveCounters(actual,90,capacity,compact));
+            EXPECT_EQ(validQwenAdaptiveCounters(actual,90,capacity),ids%16==0);
+            auto corrupt=actual;++corrupt.source_bytes;
+            EXPECT_FALSE(validQwenAdaptiveCounters(corrupt,90,capacity,compact));
+        }
+        const QwenAdaptiveCounterTotals over{1,capacity+1u,0,capacity+1u,capacity+1u,(capacity+1u)*90u,0,0,0};
+        EXPECT_FALSE(validQwenAdaptiveCounters(over,90,capacity,compact));
+    }
+    EXPECT_TRUE(validQwenAdaptiveCounters({1,0,0,0,0,0,0,0,0},90,16,compact));
+    EXPECT_TRUE(validQwenAdaptiveCounters({1,0,0,3,2,180,1,1,1},90,16,compact));
+    EXPECT_FALSE(validQwenAdaptiveCounters({1,0,0,3,2,180,1,1,0},90,16,compact));
+    EXPECT_FALSE(validQwenAdaptiveCounters({},90,16,static_cast<QwenAdaptiveQuerySemantics>(99)));
+    EXPECT_THROW(PooledImmutableLocalHotTransportGeometry::compactOriginalCapacity(17,2),std::invalid_argument);
+    EXPECT_THROW(PooledImmutableLocalHotTransportGeometry::compactOriginalCapacity(16,0),std::invalid_argument);
+    EXPECT_THROW(PooledImmutableLocalHotTransportGeometry::compactOriginalCapacity(16,9),std::invalid_argument);
 }
 TEST(QwenAdaptiveTerminalCounters, OriginalOwnerCountsReadyAndEvictionRatherThanGenerationDifferences)
 {

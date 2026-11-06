@@ -901,3 +901,34 @@ TEST(PooledImmutableCurrentDemand, GroupedPrefixRejectsMissingPriorAndSubstitute
     }
 }
 }
+
+namespace llaminar2::test {
+/** @test Metadata-only local setup lineage separates equal CPU ready pages without granting native authority. */
+TEST(PooledImmutableOwnerPinChain, LocalSetupLineageKeepsExactConsumerAndLegacyTags)
+{
+    using Observation=ImmutableLookupSetupObservation;
+    for(unsigned replay=0;replay<20;++replay)for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm}) {
+        std::set<PerfStatsCollector::Tags> readyTags;
+        for(int ordinal=0;ordinal<4;++ordinal) {
+            const PhysicalMemoryAllocatorIdentity gpu{0,backend==DeviceType::CUDA?DeviceId::cuda(ordinal):DeviceId::rocm(ordinal)};
+            Observation::Owner row{.allocator=gpu,.role=Observation::Role::LocalGPUCache,
+                .local_storage_identity=std::uint64_t(100+ordinal),.local_consumer=gpu};
+            const auto tags=row.localIdentityTags();
+            EXPECT_EQ(tags.at("local_consumer"),gpu.device.toString());
+            EXPECT_EQ(tags.at("local_storage_identity"),std::to_string(100+ordinal));
+            row.role=Observation::Role::LocalReady;row.allocator={0,DeviceId::cpu()};
+            EXPECT_EQ(row.localIdentityTags(),tags);EXPECT_TRUE(readyTags.insert(tags).second);
+            row.local_consumer=PhysicalMemoryAllocatorIdentity{1,gpu.device};
+            EXPECT_THROW(row.localIdentityTags(),std::invalid_argument);
+            row.local_consumer=gpu;row.local_storage_identity=0;
+            EXPECT_THROW(row.localIdentityTags(),std::invalid_argument);
+        }
+        EXPECT_EQ(readyTags.size(),4u);
+        Observation::Owner legacy{.allocator={0,DeviceId::cpu()},.role=Observation::Role::SharedHostSource};
+        EXPECT_TRUE(legacy.localIdentityTags().empty());
+        legacy.local_storage_identity=1;
+        EXPECT_THROW(legacy.localIdentityTags(),std::invalid_argument);
+    }
+}
+
+} // namespace llaminar2::test

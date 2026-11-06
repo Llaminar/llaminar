@@ -10,7 +10,7 @@
 #include <memory>
 #include <utility>
 namespace llaminar2 {
-namespace qwen4exp {class PooledImmutableSourcePreparedStorage;namespace detail {class PooledNativeRootStorage;}}
+namespace qwen4exp {class PooledImmutableSourcePreparedStorage; class PooledImmutableLocalHotReadyRoot;namespace detail {class PooledNativeRootStorage;}}
 /** @brief Original participant's exact ordinary native metadata initialization stream. */
 struct AdaptiveImmutableLookupDevicePreparation final {DeviceId device;void* stream;};
 /** @brief Immutable lease observation, distinct from planner root declarations or live occupancy. */
@@ -27,6 +27,7 @@ public:
 private:
     friend class qwen4exp::detail::PooledNativeRootStorage;
     friend class qwen4exp::PooledImmutableSourcePreparedStorage;
+    friend class qwen4exp::PooledImmutableLocalHotReadyRoot;
     /** @brief Only actual physical owners can construct exact lease observations.
      * @param authority Original retained PMA. @param allocator Actual physical endpoint.
      * @param storage Retained cache/policy claims. @param staging Retained frame/native claims. */

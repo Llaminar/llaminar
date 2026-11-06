@@ -17,6 +17,7 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <string>
 namespace llaminar2 {
 NativeOrderingEventProgram NativeOrderingEventProgram::retainedCaptureTerminals(const MoEOverlayInferenceOriginalSlotDomain& domain){
     return retainedCaptureTerminals(domain.geometry());
@@ -51,8 +52,23 @@ std::unique_ptr<NativeOrderingEventGroup> NativeOrderingEventGroup::claimWithPro
     const auto selected=projection.select(program,original.device());
     if((selected.contextGeneration && selected.contextGeneration!=original.generation()) || !selected.hostBytes)throw std::invalid_argument("Ordering certificate changed original generation/bounds");
     const auto kind=program.kind()==NativeOrderingEventProgram::Kind::ReadAheadParentTerminal?PhysicalMemoryOwner::NativeReadAheadParentTerminal:PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent;
-    auto host=memory->reserveNewAllocations(DeviceId::cpu(),kind,selected.hostBytes);
-    std::optional<PhysicalMemoryOwnerReservation> gpu;if(selected.deviceBytes)gpu.emplace(memory->reserveNewAllocations(original.device(),kind,selected.deviceBytes));
+    // Preserve the original PMA failure while identifying the exact closed
+    // event population. No diagnostic reads live device state or retries a claim.
+    const auto reserve=[&](DeviceId allocationDevice,std::size_t bytes){
+        try { return memory->reserveNewAllocations(allocationDevice,kind,bytes); }
+        catch(const std::logic_error& failure){
+            throw std::logic_error("Native ordering reservation failed: program_kind="+
+                std::to_string(static_cast<unsigned>(program.kind()))+
+                " root_mask="+std::to_string(program.nonemptyRootMask())+
+                " event_count="+std::to_string(program.orderingEvents())+
+                " device="+original.device().toString()+
+                " context_generation="+std::to_string(original.generation())+
+                " allocation_device="+allocationDevice.toString()+
+                " cause={"+failure.what()+"}");
+        }
+    };
+    auto host=reserve(DeviceId::cpu(),selected.hostBytes);
+    std::optional<PhysicalMemoryOwnerReservation> gpu;if(selected.deviceBytes)gpu.emplace(reserve(original.device(),selected.deviceBytes));
     const auto countIdentity=program.kind()==NativeOrderingEventProgram::Kind::RetainedCaptureTerminals
         ? ":events="+std::to_string(program.orderingEvents()):std::string{};
     const auto identity=sha256BytesHex(countIdentity+selected.sourceIdentity+":"+selected.resourceSource+":"+selected.evidence+":"+std::to_string(static_cast<unsigned>(program.kind()))+":"+std::to_string(program.nonemptyRootMask()));

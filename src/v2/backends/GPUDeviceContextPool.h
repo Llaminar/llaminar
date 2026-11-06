@@ -45,6 +45,8 @@ namespace llaminar2
     class PreparedGPUContextBirth;
     struct NativeContextBirthKey;
     class PreparedGPUContextUsePermit;
+    class RetainedParticipantGraphExecutable;
+    class PreparedServiceCalibrationSlot;
     class PreparedGPUWorkerStack;
     class TransferEngine;
     namespace test {struct NativeContextPreparationReplayAccess;}
@@ -447,6 +449,25 @@ namespace llaminar2
 
     private:
         friend class NativeContextPreparation;
+        friend class PreparedGPUContextUsePermit;
+        /** @brief Publish one actual selected birth's calibration holder, then borrow off-lock.
+         * @param original Same original source/worker/PMA. @param stream Its exact stream.
+         * @return Exclusive original calibration owner; no new device roster is created.
+         * @throws std::exception For stale/foreign/retiring/live ownership or creation failure.
+         */
+        std::shared_ptr<RetainedParticipantGraphExecutable> borrowPreparedCalibration(
+            const PreparedGPUContextUsePermit& original,void* stream);
+        /** @brief Retain the exact original holder across the off-lock acquisition boundary.
+         * @param original Same selected source/worker/PMA. @param stream Exact original stream.
+         * @return Actual holder; final retirement rejects this outstanding lookup until it returns.
+         * @throws std::exception For foreign/retiring ownership or known holder allocation failure.
+         */
+        std::shared_ptr<PreparedServiceCalibrationSlot> retainPreparedCalibrationSlot(
+            const PreparedGPUContextUsePermit& original,void* stream);
+        /** @brief Close one original birth's calibration before native-only retirement.
+         * @param birth Actual selected source birth. @throws std::exception For live borrowers/work.
+         */
+        void retirePreparedCalibration(const std::shared_ptr<PreparedGPUContextBirth>& birth);
         /** @brief Identify only THIS installed original birth for native-only failed-creation cleanup. */
         bool ownsPreparedBirth(const std::shared_ptr<PreparedGPUContextBirth>&)const;
         friend void ensureNvidiaPreparedFactoryRegistered();

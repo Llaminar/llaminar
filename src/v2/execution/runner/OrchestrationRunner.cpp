@@ -53,6 +53,7 @@
 #include "execution/qwen4exp/ImmutableLookupExecutionBoundary.h"
 #include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
 #include "loaders/ImmutableRowTable.h"
+#include "loaders/AdaptiveImmutableLookupGeometry.h"
 #include "OrchestrationRunner.h"
 #include "collective/GlobalTPContext.h"
 #include "collective/NativeCPUCollectiveProgram.h"
@@ -3542,7 +3543,7 @@ namespace llaminar2
                         throw std::logic_error(
                             "exclusive final model retirement lost its typed pending plan");
                     }
-                    (void)pending_exclusive_model_retirement->complete();
+                    (void)pending_exclusive_model_retirement->complete(final_native_source);
                 }
                 catch (const std::exception &error)
                 {
@@ -21937,15 +21938,23 @@ namespace llaminar2
                 // Physical roots survive execution-reader teardown. A shared
                 // reader may own remote cache roots, or no immutable roots at
                 // all; neither case creates a source boundary on that device.
-                const auto actual=model_ctx_->retainedAdaptiveImmutableLookupOwner({plan_.rank,device});
-                if(actual)
+                const auto actual=model_ctx_->retainedAdaptiveImmutableLookupOwners({plan_.rank,device});
+                if(!actual.empty() && immutable_table_bytes)
+                    throw std::logic_error("Resident and adaptive immutable table ownership cannot overlap");
+                for(const auto& owner:actual)
                 {
-                    if(actual->authority().get()!=physical_memory_authority_.get() ||
-                       actual->authority().owner_before(physical_memory_authority_) || physical_memory_authority_.owner_before(actual->authority()) ||
-                       actual->allocator()!=PhysicalMemoryAllocatorIdentity{plan_.rank,device})
+                    if(owner.authority().get()!=physical_memory_authority_.get() ||
+                       owner.authority().owner_before(physical_memory_authority_) || physical_memory_authority_.owner_before(owner.authority()) ||
+                       owner.allocator()!=PhysicalMemoryAllocatorIdentity{plan_.rank,device})
                         throw std::invalid_argument("Adaptive retention must observe its exact original GPU/PMA root claims");
-                    immutable_table_bytes=actual->tableStorageBytes();
-                    immutable_lookup_staging_bytes=actual->lookupStagingBytes();
+                    // Only actual disjoint surviving owners author these bytes.
+                    // This projects their claims for retention; it never chooses
+                    // capacity, reserves memory or copies cache occupancy.
+                    if(owner.tableStorageBytes()>std::numeric_limits<std::size_t>::max()-immutable_table_bytes ||
+                       owner.lookupStagingBytes()>std::numeric_limits<std::size_t>::max()-immutable_lookup_staging_bytes)
+                        throw std::overflow_error("Adaptive immutable retention byte total overflowed");
+                    immutable_table_bytes+=owner.tableStorageBytes();
+                    immutable_lookup_staging_bytes+=owner.lookupStagingBytes();
                 }
                 ModelDeviceMemoryRetention row{
                     .device = device,
@@ -22459,22 +22468,50 @@ namespace llaminar2
                     const auto execution=retained_table->lookupForConsumer({cfg.world_rank,cfg.device});
                     if(execution==ImmutableRowLookupExecution::AdaptiveGPUCache)
                     {
-                        const auto boundary=model_ctx_->adaptiveImmutableLookupBoundary(cfg.device);
+                        const auto& layout=retained_table->gpuAdaptiveLayout();
+                        const auto& request=retained_table->gpuAdaptiveRequest();
+                        const bool independent=layout.adaptiveGPUDomain()==ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal;
+                        const auto sourceAllocator=independent?PhysicalMemoryAllocatorIdentity{cfg.world_rank,cfg.device}:
+                            AdaptiveImmutableLookupGeometry::sourceLayout(layout,request).consumers().front();
+                        const auto boundary=model_ctx_->adaptiveImmutableLookupBoundary(sourceAllocator.device);
                         if(!boundary)throw std::invalid_argument("Retained mixed ngrams lost their original source boundary");
-                        const auto gpu=boundary->pooledStorage()->retainedOwnerObservation();
                         const auto source=boundary->retainedSourceOwnerObservation();
-                        if(gpu.authority().get()!=physical_memory_authority_.get() || source.authority().get()!=physical_memory_authority_.get() ||
-                            gpu.allocator()!=PhysicalMemoryAllocatorIdentity{cfg.world_rank,cfg.device} ||
-                            source.allocator()!=retained_table->gpuAdaptiveLayout().sourceServices().front().allocator ||
-                            source.hostPlacement()!=retained_table->hostPlacement())
-                            throw std::invalid_argument("Retained mixed source/native roots changed exact allocator, locality or canonical authority");
-                        cfg.retained_immutable_table_bytes=gpu.tableStorageBytes();
-                        cfg.retained_immutable_lookup_staging_bytes=gpu.lookupStagingBytes();
-                        cfg.retained_immutable_source_table_bytes=source.tableStorageBytes();
-                        cfg.retained_immutable_source_lookup_staging_bytes=source.lookupStagingBytes();
-                        if(!cfg.retained_immutable_lookup_staging_bytes || !cfg.retained_immutable_source_lookup_staging_bytes ||
-                            !cfg.retained_immutable_source_table_bytes)
-                            throw std::invalid_argument("Retained mixed C0 still requires its complete original frame/source/channel leases");
+                        if(source.authority().get()!=physical_memory_authority_.get() ||
+                           source.authority().owner_before(physical_memory_authority_) || physical_memory_authority_.owner_before(source.authority()) ||
+                           source.allocator()!=layout.sourceServices().front().allocator ||
+                           source.hostPlacement()!=retained_table->hostPlacement())
+                            throw std::invalid_argument("Retained mixed source changed its exact allocator, locality or canonical authority");
+                        const auto checkedAdd=[](std::size_t& total,std::size_t bytes) {
+                            if(bytes>std::numeric_limits<std::size_t>::max()-total)
+                                throw std::overflow_error("Retained immutable lookup byte observation overflowed");
+                            total+=bytes;
+                        };
+                        for(const auto& gpu:model_ctx_->retainedAdaptiveImmutableLookupOwners({cfg.world_rank,cfg.device})) {
+                            if(gpu.authority().get()!=physical_memory_authority_.get() ||
+                               gpu.authority().owner_before(physical_memory_authority_) || physical_memory_authority_.owner_before(gpu.authority()) ||
+                               gpu.allocator()!=PhysicalMemoryAllocatorIdentity{cfg.world_rank,cfg.device})
+                                throw std::invalid_argument("Retained mixed native roots changed their exact GPU/PMA authority");
+                            checkedAdd(cfg.retained_immutable_table_bytes,gpu.tableStorageBytes());
+                            checkedAdd(cfg.retained_immutable_lookup_staging_bytes,gpu.lookupStagingBytes());
+                        }
+                        // The shared source and local ready pages are distinct
+                        // CPU owners. Only the authored coordinator imports
+                        // their rank-wide credit; a reader's local GPU roots
+                        // never manufacture an independent host source.
+                        if(cfg.device==sourceAllocator.device) {
+                            cfg.retained_immutable_source_table_bytes=source.tableStorageBytes();
+                            cfg.retained_immutable_source_lookup_staging_bytes=source.lookupStagingBytes();
+                            for(const auto& ready:model_ctx_->retainedAdaptiveImmutableLookupLocalReadyOwners()) {
+                                if(ready.authority().get()!=physical_memory_authority_.get() ||
+                                   ready.authority().owner_before(physical_memory_authority_) || physical_memory_authority_.owner_before(ready.authority()) ||
+                                   ready.allocator()!=PhysicalMemoryAllocatorIdentity{cfg.world_rank,DeviceId::cpu()} || ready.tableStorageBytes())
+                                    throw std::invalid_argument("Retained local ready page changed its original CPU/PMA owner");
+                                checkedAdd(cfg.retained_immutable_local_ready_staging_bytes,ready.lookupStagingBytes());
+                            }
+                            if(!cfg.retained_immutable_lookup_staging_bytes || !cfg.retained_immutable_source_lookup_staging_bytes ||
+                               !cfg.retained_immutable_source_table_bytes)
+                                throw std::invalid_argument("Retained mixed C0 still requires its complete original frame/source/channel leases");
+                        }
                     }
                     else if(immutableRowLookupUsesNativeDeviceStorage(execution))
                         cfg.retained_immutable_table_bytes=model_ctx_->residentImmutableRowTableBytes(cfg.device);
@@ -24280,6 +24317,12 @@ namespace llaminar2
                         {
                             *error =
                                 "Hosted ExpertOverlay decode progress could not wake the device controller";
+                            // Preserve the background authority's first fault.
+                            // A failed wake is only its terminal propagation
+                            // boundary, not the failed transfer/publication edge.
+                            const auto cause = moe_overlay_device_controller_graph_service_->failureMessage();
+                            if (!cause.empty())
+                                *error += ": " + cause;
                         }
                         return false;
                     }

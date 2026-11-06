@@ -66,12 +66,17 @@ inline std::vector<PerfStatRecord> beginQwen4ExpGPUAdaptiveGenerationEvidenceWin
 /**
  * @brief Authenticate one actual terminal record without altering its tags or byte values.
  * @param record Original PerfStats counter. @param consumer Sole resolved GPU PLE consumer.
+ * @param semantics Actual configured source input unit; a record cannot select its own interpretation.
  * @return Exact closed producer class.
  * @throws std::invalid_argument For unknown/foreign, malformed, wrong-phase or relabeled records.
  */
 inline GPUAdaptiveLookupCounterRole classifyQwen4ExpGPUAdaptiveLookupCounter(
-    const PerfStatRecord &record,DeviceId consumer)
+    const PerfStatRecord &record,DeviceId consumer,
+    ::llaminar2::qwen4exp::QwenAdaptiveQuerySemantics semantics=::llaminar2::qwen4exp::QwenAdaptiveQuerySemantics::OriginalNgramRows)
 {
+    using Query=::llaminar2::qwen4exp::QwenAdaptiveQuerySemantics;
+    if(semantics!=Query::OriginalNgramRows && semantics!=Query::CompactNativeMisses)
+        throw std::invalid_argument("GPU adaptive evidence has unknown original input semantics");
     if(record.name=="reset_terminal_closes" || record.name=="reset_terminal_waits")
     {
         const std::array owners{consumer};
@@ -90,7 +95,12 @@ inline GPUAdaptiveLookupCounterRole classifyQwen4ExpGPUAdaptiveLookupCounter(
     if(storage->second=="vram")
     {
         const auto authority=record.tags.find("authority"),request=record.tags.find("request");
-        if(record.tags.size()!=4 || authority==record.tags.end() || authority->second!="terminal_device_generation_control" ||
+        const auto query=record.tags.find("query");
+        const bool compact=semantics==Query::CompactNativeMisses;
+        if(record.tags.size()!=(compact?5u:4u) ||
+            (compact && (query==record.tags.end() || query->second!="compact_native_misses")) ||
+            (!compact && query!=record.tags.end()) ||
+            authority==record.tags.end() || authority->second!="terminal_device_generation_control" ||
             request==record.tags.end() || request->second.empty() ||
             (request->second.size()>1 && request->second.front()=='0') ||
             !std::all_of(request->second.begin(),request->second.end(),[](char c){return c>='0' && c<='9';}) ||
@@ -117,6 +127,7 @@ struct Qwen4ExpGPUAdaptiveLookupEvidence final
  * @param maximum_ids Original admitted per-frame ID bound, never a communication extent.
  * @param gpu_slots Actual admitted GPU slots. @param ram_slots Actual admitted CPU slots.
  * @param backing Exact original host backing; full RAM cannot claim bounded-cache/mmap work.
+ * @param semantics Configured original query or compact shared-miss input, never inferred from observed counts.
  * @return Checked independent device/source totals, without mutating records.
  * @throws std::invalid_argument For missing tuple fields, invalid identities, errors, byte equations or overflow.
  * @note Positive cache churn is not required. C0 must never report cache hits/promotions/evictions.
@@ -124,7 +135,8 @@ struct Qwen4ExpGPUAdaptiveLookupEvidence final
 inline Qwen4ExpGPUAdaptiveLookupEvidence requireQwen4ExpGPUAdaptiveLookupEvidence(
     std::span<const PerfStatRecord> records,DeviceId consumer,std::size_t row_bytes,
     std::uint64_t maximum_ids,std::uint64_t gpu_slots,std::uint64_t ram_slots,
-    AdaptiveImmutableRowBacking backing=AdaptiveImmutableRowBacking::SSD)
+    AdaptiveImmutableRowBacking backing=AdaptiveImmutableRowBacking::SSD,
+    ::llaminar2::qwen4exp::QwenAdaptiveQuerySemantics semantics=::llaminar2::qwen4exp::QwenAdaptiveQuerySemantics::OriginalNgramRows)
 {
     if(backing!=AdaptiveImmutableRowBacking::SSD && backing!=AdaptiveImmutableRowBacking::RAM)
         throw std::invalid_argument("GPU adaptive evidence has unknown original backing");
@@ -142,7 +154,7 @@ inline Qwen4ExpGPUAdaptiveLookupEvidence requireQwen4ExpGPUAdaptiveLookupEvidenc
     for(const auto &record:records)
     {
         if(record.domain!="immutable_lookup")continue;
-        const auto role=classifyQwen4ExpGPUAdaptiveLookupCounter(record,consumer);
+        const auto role=classifyQwen4ExpGPUAdaptiveLookupCounter(record,consumer,semantics);
         if(role==GPUAdaptiveLookupCounterRole::RequestResetLifecycle)continue;
         const auto value=static_cast<std::uint64_t>(record.value);
         if(role==GPUAdaptiveLookupCounterRole::DeviceTerminal)
@@ -166,7 +178,7 @@ inline Qwen4ExpGPUAdaptiveLookupEvidence requireQwen4ExpGPUAdaptiveLookupEvidenc
         const auto &v=window.values;
         const ::llaminar2::qwen4exp::QwenAdaptiveCounterTotals actual{
             v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8]};
-        if(!::llaminar2::qwen4exp::validQwenAdaptiveCounters(actual,row_bytes,maximum_ids) || actual.failed_frames)
+        if(!::llaminar2::qwen4exp::validQwenAdaptiveCounters(actual,row_bytes,maximum_ids,semantics) || actual.failed_frames)
             throw std::invalid_argument("GPU adaptive request has an invalid/error terminal tuple: "+request);
         for(std::size_t i=0;i<9;++i)
         {
@@ -176,8 +188,10 @@ inline Qwen4ExpGPUAdaptiveLookupEvidence requireQwen4ExpGPUAdaptiveLookupEvidenc
     }
     const ::llaminar2::qwen4exp::QwenAdaptiveCounterTotals device{
         total[0],total[1],total[2],total[3],total[4],total[5],total[6],total[7],total[8]};
-    if(!::llaminar2::qwen4exp::validQwenAdaptiveCounters(device,row_bytes,maximum_ids) ||
-        !device.calls || !device.completed_live_ids || device.failed_frames)
+    if(!::llaminar2::qwen4exp::validQwenAdaptiveCounters(device,row_bytes,maximum_ids,semantics) ||
+        !device.calls ||
+        (!device.completed_live_ids && semantics==::llaminar2::qwen4exp::QwenAdaptiveQuerySemantics::OriginalNgramRows) ||
+        device.failed_frames)
         throw std::invalid_argument("GPU adaptive device terminal lacks complete successful original-ID work");
     for(const auto count:source_counts)
         if(count!=source_counts.front())throw std::invalid_argument("GPU adaptive source tuple intervals disagree");
@@ -318,6 +332,7 @@ inline void requireQwen4ExpEmbeddedExpertWork(std::span<const PerfStatRecord> re
  * @param layout Original resolved plural or singleton placement.
  * @param source Original native table metadata, without payload reads.
  * @param request Original GPU/shared RAM policy.
+ * @param local_hot Exact admitted participant-local geometries, absent for shared-only/ConsumerLocal.
  * @return Independent channel totals in consumer order, or ONE shared coordinator/source tuple.
  * @throws std::invalid_argument For foreign/duplicate consumers, missing channels or invalid compact byte equations.
  *
@@ -330,8 +345,13 @@ inline void requireQwen4ExpEmbeddedExpertWork(std::span<const PerfStatRecord> re
  */
 inline std::vector<Qwen4ExpGPUAdaptiveLookupEvidence> requireQwen4ExpGPUAdaptiveCohortEvidence(
     std::span<const PerfStatRecord> records, const ImmutableRowTableLayoutGeometry& layout,
-    const ImmutableRowTableSource& source, const AdaptiveVRAMRAMSSDRequest& request)
+    const ImmutableRowTableSource& source, const AdaptiveVRAMRAMSSDRequest& request,
+    std::span<const ::llaminar2::qwen4exp::PooledImmutableLocalHotGeometry> local_hot={})
 {
+    using Query=::llaminar2::qwen4exp::QwenAdaptiveQuerySemantics;
+    const auto semantics=request.local_hot_cache?Query::CompactNativeMisses:Query::OriginalNgramRows;
+    if(bool(request.local_hot_cache)!=!local_hot.empty())
+        throw std::invalid_argument("GPU adaptive evidence lost its original local-cache placement");
     const auto& consumers = layout.consumers();
     if (consumers.empty()) throw std::invalid_argument("GPU adaptive evidence has no original consumers");
     const bool shared=request.placement.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal && consumers.size()>1;
@@ -360,7 +380,7 @@ inline std::vector<Qwen4ExpGPUAdaptiveLookupEvidence> requireQwen4ExpGPUAdaptive
             }
             const auto consumer=std::find_if(consumers.begin(),consumers.end(),[&](const auto& value){return value.device.toString()==record.device;});
             if(consumer==consumers.end())throw std::invalid_argument("Shared adaptive evidence has a foreign reader");
-            const auto role=classifyQwen4ExpGPUAdaptiveLookupCounter(record,consumer->device);
+            const auto role=classifyQwen4ExpGPUAdaptiveLookupCounter(record,consumer->device,semantics);
             if(role==GPUAdaptiveLookupCounterRole::RequestResetLifecycle)continue;
             if(role!=GPUAdaptiveLookupCounterRole::DeviceTerminal || record.value!=0)
                 throw std::invalid_argument("Query-only reader claimed duplicate shared source/cache work");
@@ -377,7 +397,9 @@ inline std::vector<Qwen4ExpGPUAdaptiveLookupEvidence> requireQwen4ExpGPUAdaptive
             for(const auto count:window.counts)
                 if(count!=coordinator_count->second)throw std::invalid_argument("Query reader/coordinator terminal windows disagree");
         }
-        const auto geometry=AdaptiveImmutableLookupGeometry::fromLayout(layout,source,request);
+        const auto geometry=request.local_hot_cache
+            ? AdaptiveImmutableLookupGeometry::fromLayoutWithLocalHot(layout,source,request,local_hot)
+            : AdaptiveImmutableLookupGeometry::fromLayout(layout,source,request);
         std::uint64_t slots=0;
         for(const auto& owner:geometry.physical().owners()){
             if(owner.slots>UINT64_MAX-slots)throw std::invalid_argument("Shared admitted slot observation overflows");slots+=owner.slots;
@@ -385,7 +407,8 @@ inline std::vector<Qwen4ExpGPUAdaptiveLookupEvidence> requireQwen4ExpGPUAdaptive
         // ONE source tuple. Original result/ACK roots and coordinator retirement
         // authenticate readers in the caller; no per-reader source is invented.
         return {requireQwen4ExpGPUAdaptiveLookupEvidence(source_records,coordinator.device,
-            layout.extent().rowBytes(),layout.maximumInflightRows(),slots,geometry.host().slots(),request.source_backing)};
+            layout.extent().rowBytes(),geometry.coordinator().parameters().maximumOriginal(),
+            slots,geometry.host().slots(),request.source_backing,semantics)};
     }
     std::vector<std::vector<PerfStatRecord>> channels(consumers.size());
     for (std::size_t i = 0; i < consumers.size(); ++i) {
@@ -405,10 +428,12 @@ inline std::vector<Qwen4ExpGPUAdaptiveLookupEvidence> requireQwen4ExpGPUAdaptive
     for (std::size_t i = 0; i < consumers.size(); ++i) {
         const auto geometry = layout.adaptiveGPUDomain() == ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal
             ? AdaptiveImmutableLookupGeometry::forRequester(layout, source, request, consumers[i])
-            : AdaptiveImmutableLookupGeometry::fromLayout(layout, source, request);
+            : request.local_hot_cache
+                ? AdaptiveImmutableLookupGeometry::fromLayoutWithLocalHot(layout,source,request,local_hot)
+                : AdaptiveImmutableLookupGeometry::fromLayout(layout, source, request);
         result.push_back(requireQwen4ExpGPUAdaptiveLookupEvidence(channels[i], consumers[i].device,
-            layout.extent().rowBytes(), layout.maximumInflightRows(),
-            geometry.physical().owners().front().slots, geometry.host().slots(),request.source_backing));
+            layout.extent().rowBytes(), geometry.coordinator().parameters().maximumOriginal(),
+            geometry.physical().owners().front().slots, geometry.host().slots(),request.source_backing,semantics));
     }
     return result;
 }

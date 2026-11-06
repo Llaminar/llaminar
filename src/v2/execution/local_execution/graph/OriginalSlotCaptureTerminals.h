@@ -13,6 +13,7 @@
 namespace llaminar2 {
 class IWorkerGPUContext;
 class DeviceGraphExecutor;
+class PreparedFollowerCaptureTerminalPopulation;
 /** @brief Cache-owned native event population with original admitted slot identity. */
 class OriginalSlotCaptureTerminals final {
 public:
@@ -22,6 +23,23 @@ public:
         PhysicalMemoryResource host,PhysicalMemoryResource gpu);
 private:
     friend class DeviceGraphExecutor;
+    /**
+     * @brief Build fresh runner receipts over an exclusively borrowed physical population.
+     * @param domain Actual new runner's original publication-slot authority.
+     * @param population Same prepared-model handles borrowed before capture.
+     * @param worker Exact worker owning those handles and the capture stream.
+     * @param memory Same original admitted PMA and ownership control block.
+     * @param device Actual participant device owning the captured family.
+     * @param stream Exact non-null original participant stream.
+     * @return Fresh receipt state retaining the physical loan through native drain.
+     * @throws std::exception If original source, geometry, worker or stream differs.
+     * @note Returning the loan requires all receipts observed and all parents destroyed.
+     */
+    static std::unique_ptr<OriginalSlotCaptureTerminals> createPrepared(
+        std::shared_ptr<const MoEOverlayInferenceOriginalSlotDomain> domain,
+        std::shared_ptr<PreparedFollowerCaptureTerminalPopulation> population,
+        std::shared_ptr<IWorkerGPUContext> worker,std::shared_ptr<PhysicalMemoryAuthority> memory,
+        DeviceId device,void* stream);
     /**
      * @brief Cold-create only additional events; slot0 borrows the existing singleton event.
      * @throws std::exception Before publication for a changed original source/worker/stream or failed creator.

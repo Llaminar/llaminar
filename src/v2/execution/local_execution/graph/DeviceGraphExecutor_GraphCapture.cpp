@@ -13,7 +13,9 @@
  * Successful submission records follow both native launch and CPU ticket-service
  * retirement; they do not imply a host wait for GPU completion. This lets an
  * HTTP observer prove a rank-local heterogeneous boundary without pretending
- * that the graph contains a cross-rank coordinator or TP collective.
+ * that the graph contains a cross-rank coordinator or TP collective. Export
+ * validates main-unit coverage separately from full declarative stage identity;
+ * auxiliary work must retain its original attached-body and parent authority.
  */
 
 #include "DeviceGraphExecutor.h"
@@ -26,6 +28,7 @@
 #include "RetainedParentTicketServiceWorker.h"
 #include "RetainedHostServiceProgram.h"
 #include "RetainedParentPerfEvidence.h"
+#include "RetainedParentTemplateStageCoverage.h"
 #include "../coherence/CoherencePolicy.h"
 #include "../../../tensors/TensorClasses.h"
 #include "../../../utils/Logger.h"
@@ -45,8 +48,134 @@
 #include <thread>
 #include <unordered_set>
 
+#include "PreparedFollowerCaptureTerminals.h"
+#include "memory/CPUStorageRoot.h"
 namespace llaminar2
 {
+    namespace {
+    /** @return The existing ordinary ordering-event creator on its exact owner. */
+    void* createCaptureTerminalEvent(IWorkerGPUContext& worker) {
+        return worker.createEvent(GPUEventPurpose::Ordering);
+    }
+    /** @brief Retire exactly one accepted ordinary event on its original worker. */
+    void destroyCaptureTerminalEvent(IWorkerGPUContext& worker,void*& event){
+        if(event){worker.destroyEvent(event);event=nullptr;}
+    }
+    }
+    struct PreparedFollowerCaptureTerminalPopulation::State final {
+        PreparedFollowerCaptureTerminalKey key;
+        PreparedGPUContextUsePermit original;
+        void* stream;
+        MoEOverlayInferenceOriginalSlotGeometry geometry;
+        std::unique_ptr<NativeOrderingEventGroup> singleton,extra;
+        std::shared_ptr<PreparedFollowerCaptureTerminalPopulation> next;
+        bool singleton_attempted=false,extra_attempted=false;
+        /** @brief Retain immutable source identity before any native creator. */
+        State(PreparedFollowerCaptureTerminalKey k,PreparedGPUContextUsePermit p,void* s,
+            MoEOverlayInferenceOriginalSlotGeometry g):key(k),original(std::move(p)),stream(s),geometry(g){}
+        /** @return Fixed trailing actual handle coordinates, not a slot allocator. */
+        void** events(){return reinterpret_cast<void**>(this+1);}
+    };
+    struct PreparedFollowerCaptureTerminalOwner::State final {
+        std::mutex mutex;
+        std::shared_ptr<PhysicalMemoryAuthority> memory;
+        MoEOverlayInferenceOriginalSlotGeometry geometry;
+        std::shared_ptr<PreparedFollowerCaptureTerminalPopulation> first;
+        bool sealed=false;
+        std::exception_ptr failure;
+        /** @brief Retain the same model admission and original slot geometry. */
+        State(std::shared_ptr<PhysicalMemoryAuthority> m,MoEOverlayInferenceOriginalSlotGeometry g)
+            :memory(std::move(m)),geometry(g){}
+    };
+    std::size_t PreparedFollowerCaptureTerminalPopulation::physicalBytes(const MoEOverlayInferenceOriginalSlotGeometry& g){
+        if(g.slotCount()>(std::numeric_limits<std::size_t>::max()-sizeof(PreparedFollowerCaptureTerminalPopulation)-sizeof(State))/sizeof(void*))
+            throw std::overflow_error("Prepared follower terminal metadata overflow");
+        return CPUStorageRoot<std::byte>(sizeof(PreparedFollowerCaptureTerminalPopulation)+sizeof(State)+g.slotCount()*sizeof(void*),
+            PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent,DeviceId::cpu()).physicalBytes();
+    }
+    std::size_t PreparedFollowerCaptureTerminalOwner::physicalBytes(){
+        return CPUStorageRoot<std::byte>(sizeof(PreparedFollowerCaptureTerminalOwner)+sizeof(State),
+            PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent,DeviceId::cpu()).physicalBytes();
+    }
+    std::shared_ptr<PreparedFollowerCaptureTerminalOwner> PreparedFollowerCaptureTerminalOwner::create(
+        std::shared_ptr<PhysicalMemoryAuthority> memory,const MoEOverlayInferenceOriginalSlotGeometry& geometry){
+        if(!memory)throw std::invalid_argument("Prepared follower terminals require original model admission");
+        auto storage=CPUStorageRoot<std::byte>(physicalBytes(),PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent,
+            DeviceId::cpu(),CPUStoragePlacement::local(),CPUStorageInitialization::Uninitialized).allocate(memory);
+        auto* state=new(storage.data()+sizeof(PreparedFollowerCaptureTerminalOwner))State(memory,geometry);
+        auto* owner=new(storage.data())PreparedFollowerCaptureTerminalOwner(state);
+        return {owner,[storage=std::move(storage)](auto* value)mutable{value->~PreparedFollowerCaptureTerminalOwner();storage={};}};
+    }
+    PreparedFollowerCaptureTerminalOwner::~PreparedFollowerCaptureTerminalOwner(){std::destroy_at(state_);}
+    void PreparedFollowerCaptureTerminalPopulation::requireOriginal(const PreparedGPUContextUsePermit& original,
+        void* stream,const MoEOverlayInferenceOriginalSlotGeometry& geometry)const {
+        const auto& held=state_->original;
+        if(!stream || stream!=state_->stream || geometry!=state_->geometry || original.device()!=held.device() ||
+            original.generation()!=held.generation() || original.memory().get()!=held.memory().get() ||
+            original.memory().owner_before(held.memory()) || held.memory().owner_before(original.memory()) ||
+            original.worker()!=held.worker() || original.worker().owner_before(held.worker()) || held.worker().owner_before(original.worker()))
+            throw std::invalid_argument("Prepared follower terminal changed original source/geometry/worker/stream");
+        held.provenance().requireWorker(original.worker());
+    }
+    void* PreparedFollowerCaptureTerminalPopulation::event(std::size_t index)const {
+        if(index>=state_->geometry.slotCount())throw std::out_of_range("Prepared follower terminal slot is outside original geometry");
+        return state_->events()[index];
+    }
+    PreparedFollowerCaptureTerminalPopulation::~PreparedFollowerCaptureTerminalPopulation()noexcept {
+        try {
+            auto destroy=[&]{for(std::size_t i=0;i<state_->geometry.slotCount();++i)
+                destroyCaptureTerminalEvent(*state_->original.worker(),state_->events()[i]);};
+            if(state_->original.worker()->ownsCurrentThread())destroy();else state_->original.worker()->submitAndWait(destroy);
+            if(state_->singleton_attempted)state_->singleton->completeNativeHandles();
+            if(state_->extra_attempted)state_->extra->completeNativeHandles();
+            std::destroy_at(state_);
+        }catch(...){std::terminate();}
+    }
+    std::shared_ptr<PreparedFollowerCaptureTerminalPopulation> PreparedFollowerCaptureTerminalOwner::acquire(
+        PreparedFollowerCaptureTerminalKey key,const PreparedGPUContextUsePermit& original,void* stream){
+        if(!stream || key.participant_id<0 || key.physical_rows<=0 || key.device!=original.device() || !key.device.is_gpu() ||
+            original.memory().get()!=state_->memory.get() || original.memory().owner_before(state_->memory) || state_->memory.owner_before(original.memory()))
+            throw std::invalid_argument("Prepared follower terminal changed original cache/model coordinate");
+        std::lock_guard lock(state_->mutex);
+        if(state_->failure)std::rethrow_exception(state_->failure);
+        for(auto* link=&state_->first;*link;link=&(*link)->state_->next){
+            if((*link)->state_->key!=key)continue;
+            if(link->use_count()!=1)throw std::logic_error("Prepared follower terminal population still has a live borrower");
+            (*link)->requireOriginal(original,stream,state_->geometry);
+            return *link;
+        }
+        if(state_->sealed)throw std::invalid_argument("Prepared follower terminal changed the sealed original cache roster");
+        try {
+            auto storage=CPUStorageRoot<std::byte>(PreparedFollowerCaptureTerminalPopulation::physicalBytes(state_->geometry),
+                PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent,DeviceId::cpu(),CPUStoragePlacement::local(),
+                CPUStorageInitialization::Uninitialized).allocate(state_->memory);
+            auto* metadata=new(storage.data()+sizeof(PreparedFollowerCaptureTerminalPopulation))PreparedFollowerCaptureTerminalPopulation::State(key,original,stream,state_->geometry);
+            std::fill_n(metadata->events(),state_->geometry.slotCount(),nullptr);
+            auto* value=new(storage.data())PreparedFollowerCaptureTerminalPopulation(metadata);
+            std::shared_ptr<PreparedFollowerCaptureTerminalPopulation> population(value,[storage=std::move(storage)](auto* p)mutable{
+                p->~PreparedFollowerCaptureTerminalPopulation();storage={};});
+            metadata->singleton=NativeOrderingEventGroup::claim(state_->memory,original.provenance(),NativeOrderingEventProgram::captureSubmissionRetirement());
+            metadata->extra=NativeOrderingEventGroup::claim(state_->memory,original.provenance(),NativeOrderingEventProgram::retainedCaptureTerminals(state_->geometry));
+            metadata->singleton->beginNativeAttempt();metadata->singleton_attempted=true;
+            metadata->extra->beginNativeAttempt();metadata->extra_attempted=true;
+            if(!original.worker()->ownsCurrentThread())throw std::logic_error("Prepared follower terminal creators require exact worker");
+            for(std::size_t slot=0;slot<state_->geometry.slotCount();++slot){
+                metadata->events()[slot]=createCaptureTerminalEvent(*original.worker());
+                if(!metadata->events()[slot])throw std::runtime_error("Original capture terminal event creation failed");
+            }
+            metadata->next=std::move(state_->first);state_->first=population;
+            return population;
+        }catch(...){state_->failure=std::current_exception();throw;}
+    }
+    void PreparedFollowerCaptureTerminalOwner::seal(){
+        std::lock_guard lock(state_->mutex);
+        if(state_->failure)std::rethrow_exception(state_->failure);
+        if(!state_->first)throw std::logic_error("Prepared follower terminal roster is empty");
+        for(auto* link=&state_->first;*link;link=&(*link)->state_->next)
+            if(link->use_count()!=2)throw std::logic_error("Prepared follower terminal roster omitted or duplicated an original borrower");
+        state_->sealed=true;
+    }
+
     struct OriginalSlotCaptureTerminals::State final {
         OriginalSlotCaptureTerminalState receipts;
         std::shared_ptr<IWorkerGPUContext> worker;
@@ -56,6 +185,7 @@ namespace llaminar2
         void* stream;
         std::vector<void*> events;
         std::unique_ptr<NativeOrderingEventGroup> extra_obligations;
+        std::shared_ptr<PreparedFollowerCaptureTerminalPopulation> prepared_population;
         /** @brief Retain the original roster/source before any additional native creator. */
         State(std::shared_ptr<const MoEOverlayInferenceOriginalSlotDomain> domain,
             std::shared_ptr<IWorkerGPUContext> w,GPUContextProvenance source,
@@ -91,7 +221,7 @@ namespace llaminar2
         state->extra_obligations->beginNativeAttempt();
         try {
             for(std::size_t slot=1;slot<state->events.size();++slot) {
-                state->events[slot]=worker->createEvent(GPUEventPurpose::Ordering);
+                state->events[slot]=createCaptureTerminalEvent(*worker);
                 if(!state->events[slot])throw std::runtime_error("Original capture terminal event creation failed");
             }
         } catch(...) {
@@ -105,14 +235,27 @@ namespace llaminar2
         }
         return std::unique_ptr<OriginalSlotCaptureTerminals>(new OriginalSlotCaptureTerminals(std::move(state)));
     }
+    std::unique_ptr<OriginalSlotCaptureTerminals> OriginalSlotCaptureTerminals::createPrepared(
+        std::shared_ptr<const MoEOverlayInferenceOriginalSlotDomain> domain,
+        std::shared_ptr<PreparedFollowerCaptureTerminalPopulation> population,
+        std::shared_ptr<IWorkerGPUContext> worker,std::shared_ptr<PhysicalMemoryAuthority> memory,DeviceId device,void* stream){
+        if(!domain || !population)throw std::invalid_argument("Prepared terminal borrow lacks actual original slot domain");
+        const auto original=GPUDeviceContextPool::instance().retainExistingPreparedContext(device,memory);
+        population->requireOriginal(original,stream,domain->geometry());
+        auto state=std::make_unique<State>(domain,worker,original.provenance(),memory,device,stream,population->event(0));
+        for(std::size_t slot=1;slot<state->events.size();++slot)state->events[slot]=population->event(slot);
+        state->prepared_population=std::move(population);
+        return std::unique_ptr<OriginalSlotCaptureTerminals>(new OriginalSlotCaptureTerminals(std::move(state)));
+    }
     OriginalSlotCaptureTerminals::~OriginalSlotCaptureTerminals()noexcept {
         try {
             if(!state_)return;
             if(state_->receipts.nextOutstanding())throw std::logic_error("Original capture terminal has unobserved native receipts");
+            if(state_->prepared_population)return;
             auto destroy=[&] {
                 if(isGraphCaptureActive())throw std::logic_error("Original capture terminal destruction entered graph capture");
                 for(std::size_t slot=1;slot<state_->events.size();++slot)
-                    if(state_->events[slot]) {state_->worker->destroyEvent(state_->events[slot]);state_->events[slot]=nullptr;}
+                    destroyCaptureTerminalEvent(*state_->worker,state_->events[slot]);
             };
             if(state_->worker->ownsCurrentThread())destroy();
             else state_->worker->submitAndWait(destroy);
@@ -497,24 +640,38 @@ namespace llaminar2
                 retained_parent_capture->nodeCount() == 0 || !capture_stream ||
                 retained_parent_capture->executionStream() != capture_stream)
                 return reject("composed parent has incomplete or stale native capture identity");
-            size_t covered_stages = 0;
-            for (const auto &segment : segments)
-            {
+            for (const auto& segment : segments)
                 if (!segment.capturable || !segment.capture || segment.capture->hasExecutable())
                     return reject("composed parent contains a manual or independently executable child");
-                for (const auto &name : segment.stage_names)
-                    if (covered_stages >= execution_order.size() || name != execution_order[covered_stages++])
-                        return reject("composed parent does not cover its complete source graph");
-            }
-            if (covered_stages != execution_order.size())
-                return reject("composed parent does not cover its complete source graph");
-            for (size_t index = 0; index < execution_order.size(); ++index)
+            if (!validateRetainedParentTemplateStageCoverage(graph, segments, plan, error))
+                return std::nullopt;
+            if (graph.retainedParticipantAuxiliaryRange())
             {
-                const auto *node = graph.getNode(execution_order[index]);
-                if (!node || !node->stage || node->stage.get() != plan.stages[index] ||
-                    node->stage->graphCaptureVariantSignature() != plan.stage_variant_signatures[index] ||
-                    node->stage->graphLaunchPreparationPolicy() == GraphLaunchPreparationPolicy::CaptureAndReplay)
-                    return reject("composed parent changed a captured stage or requires external replay preparation");
+                // Main coverage alone cannot prove the separately recorded
+                // body belongs to this executable. These original borrows are
+                // created only by the canonical executor/source-plan attachment.
+                if (!participant_auxiliary_preparation || !original_storage_attachment)
+                    return reject("composed parent has no original attached participant auxiliary body");
+                const auto& definition = participant_auxiliary_preparation->definition();
+                const auto& range = *graph.retainedParticipantAuxiliaryRange();
+                if (definition.graph != &graph ||
+                    definition.topology_generation != graph.topologyGeneration() ||
+                    definition.variant != capture_variant_signature ||
+                    definition.range_identity != range.identity ||
+                    definition.participant != range.participant ||
+                    participant_auxiliary_preparation->stream() != capture_stream)
+                    return reject("composed parent changed its original participant auxiliary identity");
+                try
+                {
+                    // Both APIs validate retained immutable identity/liveness;
+                    // neither requires worker-thread execution or native work.
+                    participant_auxiliary_preparation->requireCurrentDefinition();
+                    original_storage_attachment->requireCurrent();
+                }
+                catch (const std::exception& ex)
+                {
+                    return reject(std::string("composed parent lost its original participant auxiliary attachment: ") + ex.what());
+                }
             }
             return DeviceLoopGraphTemplateView{.capture = retained_parent_capture.get(),
                 .stream = capture_stream, .stage_count = execution_order.size(),
@@ -603,6 +760,28 @@ namespace llaminar2
         const bool concurrent_ticket_service =
             DeviceGraphExecutor::hasConcurrentTicketService(
                 cache.graph_replay_plan_policy);
+        const bool has_auxiliary_body = graph.retainedParticipantAuxiliaryRange().has_value();
+        if (has_auxiliary_body)
+        {
+            // Main compilation units omit the separately recorded finite body.
+            // Validate that original declaration again before projecting it out;
+            // malformed or foreign body stages must never disappear from proof.
+            try
+            {
+                graph.requireRetainedParticipantAuxiliaryRange();
+            }
+            catch (const std::exception &ex)
+            {
+                return reject(std::string("invalid retained participant auxiliary declaration: ") + ex.what());
+            }
+            if (inspection != UnitInspection::ParentComposition)
+                return reject("participant auxiliary children require their complete retained parent");
+        }
+        std::vector<std::string_view> main_execution_order;
+        main_execution_order.reserve(execution_order.size());
+        for (const auto &name : execution_order)
+            if (!graph.isRetainedParticipantAuxiliaryNode(name))
+                main_execution_order.emplace_back(name);
         switch (inspection)
         {
         case UnitInspection::ReplayReady:
@@ -772,6 +951,8 @@ namespace llaminar2
             expected_manual_stages.reserve(execution_order.size());
             for (const std::string &stage_name : execution_order)
             {
+                if (graph.isRetainedParticipantAuxiliaryNode(stage_name))
+                    continue;
                 const ComputeNode *const node = graph.getNode(stage_name);
                 if (!node || !node->stage)
                     return reject("source graph contains an unresolved stage");
@@ -786,17 +967,7 @@ namespace llaminar2
         }
         else
         {
-            exact_stage_coverage =
-                represented_stages.size() == execution_order.size() &&
-                std::equal(
-                    represented_stages.begin(),
-                    represented_stages.end(),
-                    execution_order.begin(),
-                    [](std::string_view represented,
-                       const std::string &expected)
-                    {
-                        return represented == expected;
-                    });
+            exact_stage_coverage = represented_stages == main_execution_order;
         }
         if (!exact_stage_coverage)
         {
@@ -1063,6 +1234,23 @@ namespace llaminar2
         return true;
     }
 
+    void DeviceGraphExecutor::GraphSegmentCache::bindPreparedFollowerCaptureTerminals(
+        std::shared_ptr<const MoEOverlayInferenceOriginalSlotDomain> domain,
+        std::shared_ptr<PreparedFollowerCaptureTerminalPopulation> population,
+        const std::shared_ptr<PhysicalMemoryAuthority>& memory){
+        if(!memory || !domain || !population || !capture_stream || !capture_device.is_gpu() ||
+            initialized || !segments.empty() || original_slot_terminals || terminal_event || terminal_event_obligation || isGraphCaptureActive())
+            throw std::logic_error("Prepared follower terminals bind once before native materialization");
+        auto* worker=requireLifecycleContext("prepared follower terminal binding");
+        const auto original=GPUDeviceContextPool::instance().retainExistingPreparedContext(capture_device,memory);
+        original.provenance().requireWorker(original.worker());
+        if(original.worker().get()!=worker || !worker->ownsCurrentThread())throw std::logic_error("Prepared follower terminal binding requires original worker");
+        auto receipts=OriginalSlotCaptureTerminals::createPrepared(domain,population,original.worker(),memory,capture_device,capture_stream);
+        auto identity=std::make_shared<const std::uint8_t>(0);
+        terminal_event=population->event(0);terminal_receipt_identity=std::move(identity);
+        terminal_event_is_prepared_borrow=true;original_slot_terminals=std::move(receipts);
+    }
+
     bool DeviceGraphExecutor::GraphSegmentCache::prepareCaptureStreamTerminal(
         IWorkerGPUContext *ctx)
     {
@@ -1084,7 +1272,7 @@ namespace llaminar2
         // Allocate immutable receipt identity only at this existing cold creator.
         // Copies of an issued ticket keep it unique even after event destruction.
         auto receipt_identity = std::make_shared<const std::uint8_t>(0);
-        terminal_event = ctx->createEvent();
+        terminal_event = createCaptureTerminalEvent(*ctx);
         if (!terminal_event)
         {
             LOG_ERROR(
@@ -1618,6 +1806,11 @@ namespace llaminar2
         // The original cache reset observed every receipt before any graph,
         // source, stream or exact event owner can be withdrawn.
         original_slot_terminals.reset();
+        if(terminal_event_is_prepared_borrow){
+            if(terminal_fence_published_generation!=terminal_fence_observed_generation)
+                terminateGraphSegmentCacheLifecycle("Prepared terminal return lacks original native observation");
+            terminal_event_is_prepared_borrow=false;terminal_event=nullptr;terminal_receipt_identity.reset();return;
+        }
         if (!terminal_event)
             return;
         if (terminal_fence_published_generation !=
@@ -1631,7 +1824,7 @@ namespace llaminar2
             requireLifecycleContext("exact terminal event destruction");
         try
         {
-            ctx->destroyEvent(terminal_event);
+            destroyCaptureTerminalEvent(*ctx,terminal_event);
         }
         catch (const std::exception &e)
         {
@@ -2899,7 +3092,7 @@ namespace llaminar2
 
         // Remote participants accompany the original full transaction; an eager
         // first enqueue would escape its typed source/participant ownership scope.
-        if(graph.retainedParticipantSourcePlan() &&
+        if((graph.retainedParticipantSourcePlan() || graph.retainedParticipantAuxiliaryRange()) &&
            (!retained_parent_requested ||
             (!segment_cache.initialized && initial_submission!=GraphInitialSubmissionPolicy::MaterializeWithoutLaunch)))
             throw std::invalid_argument("Recurring remote lookup requires its original materialized complete hosted transaction");
@@ -3891,6 +4084,33 @@ namespace llaminar2
                           RequireReadyBytes);
         };
 
+        // The finite body retains the same declared nodes, roots and setup
+        // policy as the model graph. Only native scheduling changes: ordinary
+        // model units omit these nodes, and the original parent attaches their
+        // one graph-only recording as a sibling before instantiation.
+        std::optional<GraphSegment> participant_auxiliary_segment;
+        if(const auto& range=graph.retainedParticipantAuxiliaryRange()) {
+            graph.requireRetainedParticipantAuxiliaryRange();
+            participant_auxiliary_segment.emplace();
+            auto& body=*participant_auxiliary_segment;
+            body.capturable=true;body.stage_names=range->nodes;
+            std::unordered_set<BufferId> main_writes,body_writes,parent_inputs;
+            for(const auto& name:graph.getExecutionOrder()) {
+                if(graph.isRetainedParticipantAuxiliaryNode(name))continue;
+                const auto* node=graph.getNode(name);
+                const auto contract=node->stage->bufferContract();
+                for(const auto& write:contract.allWrites())main_writes.insert(write.id);
+            }
+            for(const auto& name:body.stage_names) {
+                const auto contract=graph.getNode(name)->stage->bufferContract();
+                for(const auto& read:contract.allArenaReads())
+                    if(main_writes.contains(read.id) && !body_writes.contains(read.id))parent_inputs.insert(read.id);
+                for(const auto& write:contract.allWrites())body_writes.insert(write.id);
+            }
+            body.retained_parent_input_ids.assign(parent_inputs.begin(),parent_inputs.end());
+            std::sort(body.retained_parent_input_ids.begin(),body.retained_parent_input_ids.end());
+        }
+
         DeviceGraphCaptureController::prepareDeviceForGraphCapture(ctx);
 
         StageRunPolicy capture_phase_policy =
@@ -3972,7 +4192,94 @@ namespace llaminar2
         };
 
         const auto attach_original_parent = [&](IGPUGraphCapture& parent){
-            return attachRetainedParticipantStorageParent(graph,segment_cache,ctx->deviceId(),parent);
+            if(!participant_auxiliary_segment)
+                return attachRetainedParticipantStorageParent(graph,segment_cache,ctx->deviceId(),parent);
+            const auto& range=*graph.retainedParticipantAuxiliaryRange();
+            const auto& definition=segment_cache.recorded_source_definition;
+            const auto& domain=graph.retainedParticipantDefinitionDomain();
+            if(!gpu_ctx || !gpu_ctx->ownsCurrentThread() || !domain || !definition ||
+               definition->definition().domain!=*domain || segment_cache.capture_device!=range.participant ||
+               ctx->deviceId()!=range.participant || parent.hasExecutable() || !parent.nodeCount() ||
+               parent.executionStream()!=segment_cache.capture_stream ||
+               segment_cache.original_storage_attachment || segment_cache.participant_auxiliary_preparation)
+                throw std::logic_error("Finite participant body requires its actual untouched parent/source/worker");
+            definition->requireCurrentDefinition();
+            const auto plan=definition->definition().plan;
+            const auto original=GPUDeviceContextPool::instance().retainExistingPreparedContext(
+                range.participant,definition->originalSource().memory());
+            if(original.worker().get()!=gpu_ctx)
+                throw std::logic_error("Finite participant body substituted the original prepared worker");
+            original.requireWorker(original.worker());
+            const IGPUGraphCapture* producer=nullptr;
+            for(const auto& unit:segment_cache.segments) {
+                if(std::find(unit.stage_names.begin(),unit.stage_names.end(),range.probe_ready)==unit.stage_names.end())
+                    continue;
+                if(producer || !unit.capturable || !unit.capture ||
+                   unit.stage_names.back()!=range.probe_ready || !unit.capture->nodeCount() ||
+                   unit.capture->hasExecutable() || unit.capture->executionStream()!=segment_cache.capture_stream)
+                    throw std::logic_error("Finite participant body requires its exact graph-only probe frontier");
+                producer=unit.capture.get();
+            }
+            if(!producer)
+                throw std::logic_error("Finite participant body has no retained current-probe producer");
+            segment_cache.participant_auxiliary_preparation.reset(new RetainedGraphParticipantPreparationStream(
+                original,segment_cache.capture_stream,RetainedGraphParticipantPreparationStream::Definition{
+                    .graph=&graph,.arena=arena_,.topology_generation=graph.topologyGeneration(),
+                    .variant=segment_cache.capture_variant_signature,.domain=*domain,.plan=plan,
+                    .scope=range.role==RetainedGraphParticipantAuxiliaryRole::Source
+                        ?RetainedGraphParticipantDefinitionScope::AuxiliarySource:RetainedGraphParticipantDefinitionScope::AuxiliaryReader,
+                    .participant=range.participant,.range_identity=range.identity,.original_source_definition=definition}));
+            segment_cache.participant_auxiliary_preparation->requireDefinition();
+
+            auto& body=*participant_auxiliary_segment;
+            if(!cohere_segment_inputs(body))return false;
+            auto ledger=plan_capture_dependencies(body);
+            if(!ledger)return false;
+            // This is the existing cloneable graph-only child creator. There is
+            // no executable, new submission lane or separate General reservation.
+            std::shared_ptr<IGPUGraphCapture> native=gpu_ctx->createGraphCapture(segment_cache.capture_stream);
+            if(!native || native->hasExecutable() || native->nodeCount() ||
+               native->executionStream()!=segment_cache.capture_stream)
+                throw std::logic_error("Finite participant body lost its original record-only capture");
+            std::vector<IComputeStage*> stages;
+            for(const auto& name:body.stage_names)stages.push_back(graph.getNode(name)->stage.get());
+            ScopedGraphCaptureStageActivity activity(stages,ctx,segment_cache.capture_stream,"participant_auxiliary_body");
+            ScopedBackendGraphCapture recording(*gpu_ctx,*native,"participant_auxiliary_body",ledger.get());
+            if(!activity.begin())return false;
+            if(!recording.begin()) {
+                (void)activity.finish(GraphCaptureActivityTransition::Aborted);return false;
+            }
+            bool recorded=true;
+            for(const auto& name:body.stage_names) {
+                auto* node=graph.getNode(name);
+                if(!runStage(*node,ctx,snapshot_policy_for_node(*node,capture_phase_policy),
+                    is_collective_node(*node),&segment_cache.snapshot_manifest) ||
+                   !record_graph_snapshot_copies(*node,segment_cache.capture_stream)) {
+                    recorded=false;break;
+                }
+                graph.markCompleted(name);
+            }
+            recording.finish();
+            const bool complete=recorded && native->nodeCount() && !native->hasExecutable();
+            if(!activity.finish(complete?GraphCaptureActivityTransition::Completed:GraphCaptureActivityTransition::Aborted) || !complete)
+                return false;
+            RetainedGraphParticipantAuxiliaryBodySeal seal({
+                .graph=&graph,.arena=arena_,.participant=range.participant,
+                .enclosing_recording_stream=segment_cache.capture_stream,.enclosing_parent=&parent,
+                .producer_fragment=producer,
+                .topology_generation=graph.topologyGeneration(),
+                .capture_variant_signature=segment_cache.capture_variant_signature,
+                .capture_generation=segment_cache.evidence_family,.range_identity=range.identity},
+                original,std::move(native),segment_cache.participant_auxiliary_preparation);
+            segment_cache.original_storage_attachment=plan->prepareOriginalAuxiliaryAttachment(seal,segment_cache.auxiliary_branch.get());
+            if(!segment_cache.original_storage_attachment)
+                throw std::logic_error("Finite participant body was not retained by its original parent attachment");
+            const bool attached=segment_cache.original_storage_attachment->attachTo(parent,segment_cache.auxiliary_branch.get());
+            if(attached)PerfStatsCollector::addCounter("forward_graph","participant_auxiliary_body_nodes",
+                static_cast<double>(seal.recordedBody()->nodeCount()),"graph_setup",range.participant.toString(),
+                {{"range_identity",std::to_string(range.identity)},{"stages",std::to_string(range.nodes.size())},
+                 {"standalone_executables","0"}});
+            return attached;
         };
 
         // Capture and replay share the same post-launch lifecycle. All mutable
@@ -3989,7 +4296,20 @@ namespace llaminar2
                     is_collective_node(node),
                     &segment_cache.snapshot_manifest);
             },
-            .prepare_snapshot_manifest = prepare_graph_snapshot_manifest,
+            .prepare_snapshot_manifest = [&] {
+                if(participant_auxiliary_segment) {
+                    auto& body=*participant_auxiliary_segment;
+                    if(!prebind_segment_storage(body))return false;
+                    for(const auto& name:body.stage_names)
+                        graph.getNode(name)->stage->setGPUStream(segment_cache.capture_stream);
+                    if(!DeviceGraphCaptureController::prepareGraphLaunchMetadata(graph,body,ctx,
+                        segment_cache.capture_stream,GraphLaunchPreparationPhase::Capture))return false;
+                    for(const auto& name:body.stage_names)
+                        if(!graph.getNode(name)->stage->isGraphCapturable())
+                            throw std::logic_error("Finite participant body stage failed capture preparation: "+name);
+                }
+                return prepare_graph_snapshot_manifest();
+            },
             .record_snapshot_copies = record_graph_snapshot_copies,
             .post_launch = [&](GraphSegment &segment, void *stream)
             {

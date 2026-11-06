@@ -36,7 +36,7 @@ from model_kld_corpus import (CATALOG,identity,load_corpus,physical_workers,requ
                                score_observation,unchanged)
 from production_artifacts import image_identity,image_cpu_isa,write_json
 
-FILTER='kernel,forward_graph,gpu_graph_inventory,weight_loading,gemm,cuda_moe,rocm_moe,moe'
+FILTER='kernel,forward_graph,gpu_graph_inventory,weight_loading,gemm,cuda_moe,rocm_moe,moe,ngram_lookup,immutable_lookup'
 
 
 def observe_native_resources(manifest,local_owner):

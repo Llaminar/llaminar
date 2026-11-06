@@ -1768,6 +1768,132 @@ TEST(Test__MoEOverlayParticipantResidencyRegistry,
         << error;
 }
 
+/**
+ * @brief Prepared continuation banks need no graph-declaration side effects.
+ *
+ * A retained auxiliary constructor can finish before the continuation graphs
+ * are declared. Its same-process registry still includes both domains and a
+ * retained MTP layer. Finalization must authenticate every original source,
+ * reject an absent sidecar engine, and preserve already-published followers.
+ * GPU identifiers below are metadata only; no runtime or native memory is used.
+ */
+TEST(Test__MoEOverlayParticipantResidencyRegistry,
+     FinalizesDeferredContinuationAndRetainedSidecarBeforeAuxiliaryReadiness)
+{
+    for (const auto [continuations, followers] :
+         {std::pair{1, 1}, std::pair{2, 4}, std::pair{4, 4}})
+    for (const int first : {0, 32})
+    {
+        SCOPED_TRACE(continuations);
+        SCOPED_TRACE(followers);
+        SCOPED_TRACE(first);
+        constexpr int layers = 3; // Two main layers and the retained sidecar.
+        const int total = continuations + followers;
+        RoutedExpertDomain hot, cold;
+        hot.name = "continuation";
+        hot.scope = ExecutionDomainScope::RANK_LOCAL;
+        hot.backend = CollectiveBackendType::NCCL;
+        hot.owner_rank = 0;
+        cold.name = "followers";
+        cold.scope = ExecutionDomainScope::RANK_LOCAL;
+        cold.backend = CollectiveBackendType::RCCL;
+        cold.owner_rank = 0;
+        for (int i = 0; i < continuations; ++i)
+            hot.participants.push_back(GlobalDeviceAddress::cuda(i));
+        for (int i = 0; i < followers; ++i)
+            cold.participants.push_back(GlobalDeviceAddress::rocm(i));
+        MoERoutedExpertPlacementPlan plan;
+        plan.enabled = true;
+        plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
+        plan.continuation_domain = plan.shared_expert_domain = hot.name;
+        plan.domains = {hot, cold};
+        plan.routed_tiers = {
+            {.name = "hot", .domain = hot.name, .priority = 0,
+             .max_experts_per_layer = continuations},
+            {.name = "capacity", .domain = cold.name, .priority = 1, .fallback = true}};
+        plan.first_model_layer = first;
+        std::vector<int> tier_ids(total, 1);
+        std::fill_n(tier_ids.begin(), continuations, 0);
+        for (int row = 0; row < layers; ++row)
+            plan.placements.push_back({.layer = first + row, .routed_expert_tier = tier_ids});
+        const auto owners = MoEExpertOwnerMap::build(plan);
+        std::vector<int> ids;
+        for (int id = 0; id < total; ++id) ids.push_back(id);
+        MoEOverlayParticipantResidencyRegistry residency({
+            .owner_map = owners, .local_participant_ids = ids,
+            .num_layers = layers, .num_experts = total, .initial_epoch = 1,
+            .first_model_layer = first});
+        ExpertGemmRegistry prepared;
+        std::shared_ptr<ITensorGemm> missing_down;
+        const auto register_role = [&](int id, int layer, int expert,
+                                       ExpertGemmRegistry::WeightRole role,
+                                       const std::shared_ptr<ITensorGemm> &engine)
+        {
+            const auto *participant = owners.participantForId(id);
+            ASSERT_NE(participant, nullptr);
+            prepared.registerEngineForParticipant(participant->domain_name, participant->device,
+                participant->world_rank_known ? participant->world_rank : -1,
+                participant->domain_participant_index, layer, expert, role, engine.get(), engine);
+        };
+        int missing_expert = -1;
+        for (const int id : ids)
+        for (int row = 0; row < layers; ++row)
+        {
+            const int layer = first + row;
+            const auto mask = owners.expertMaskForParticipant(layer, id, total);
+            std::vector<MoEOverlayPreparedExpertPayload> table(total);
+            for (int expert = 0; expert < total; ++expert)
+            {
+                if (!mask[expert]) continue;
+                table[expert] = payload(10000 + id * 100 + row * 10);
+                register_role(id, layer, expert, ExpertGemmRegistry::WeightRole::GATE, table[expert].gate());
+                register_role(id, layer, expert, ExpertGemmRegistry::WeightRole::UP, table[expert].up());
+                if (id == continuations - 1 && row == layers - 1)
+                {
+                    missing_down = table[expert].down();
+                    missing_expert = expert;
+                }
+                else
+                    register_role(id, layer, expert, ExpertGemmRegistry::WeightRole::DOWN, table[expert].down());
+            }
+            // Follower graph construction has already registered its layers;
+            // the continuation builder has not been allowed to run yet.
+            if (id >= continuations)
+            {
+                std::string error;
+                ASSERT_TRUE(residency.registerInitialLayer(id, layer, mask, table, &error)) << error;
+            }
+        }
+        const auto deficits = residency.incompleteInitialBanks();
+        ASSERT_EQ(deficits.size(), static_cast<std::size_t>(continuations));
+        for (const auto &deficit : deficits)
+            EXPECT_EQ(deficit.missing_layers, (std::vector<int>{first, first + 1, first + 2}));
+        const auto original_follower = residency.endpoint(continuations)->acquire(1);
+        ASSERT_TRUE(original_follower);
+        EXPECT_FALSE(residency.allInitialBanksReady());
+        std::string error;
+        EXPECT_FALSE(residency.finalizeInitialBanksFromPreparedRegistry(prepared, &error));
+        EXPECT_NE(error.find("participant " + std::to_string(continuations - 1) +
+                             " layer " + std::to_string(first + layers - 1)), std::string::npos) << error;
+        ASSERT_TRUE(missing_down);
+        ASSERT_GE(missing_expert, 0);
+        register_role(continuations - 1, first + layers - 1, missing_expert,
+                      ExpertGemmRegistry::WeightRole::DOWN, missing_down);
+        ASSERT_TRUE(residency.finalizeInitialBanksFromPreparedRegistry(prepared, &error)) << error;
+        EXPECT_TRUE(residency.allInitialBanksReady());
+        EXPECT_TRUE(residency.incompleteInitialBanks().empty());
+        EXPECT_EQ(residency.verifyImmutablePreparedSources(prepared), static_cast<std::size_t>(total * layers));
+        const auto original_continuation = residency.endpoint(0)->acquire(1);
+        ASSERT_TRUE(original_continuation);
+        ASSERT_TRUE(residency.finalizeInitialBanksFromPreparedRegistry(prepared, &error)) << error;
+        EXPECT_EQ(residency.endpoint(0)->acquire(1).get(), original_continuation.get());
+        EXPECT_EQ(residency.endpoint(continuations)->acquire(1).get(), original_follower.get());
+        ExpertGemmRegistry foreign;
+        EXPECT_FALSE(residency.finalizeInitialBanksFromPreparedRegistry(foreign, &error));
+        EXPECT_EQ(residency.endpoint(0)->acquire(1).get(), original_continuation.get());
+    }
+}
+
 TEST(Test__MoEOverlayPreparedExpertArrival,
      PublishesOneExactCompletePayloadAndRejectsIdentityDrift)
 {

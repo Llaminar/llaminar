@@ -19,6 +19,7 @@
  */
 
 #include "execution/qwen4exp/PooledImmutableParticipantExecutionPolicy.h"
+#include "execution/qwen4exp/PooledImmutableLocalHotTransportGeometry.h"
 #include "execution/local_execution/graph/RetainedHostServiceDeclarations.h"
 #include "execution/diagnostics/QueryKVGeometryObservation.h"
 #include "DeviceGraphOrchestrator.h"
@@ -108,6 +109,7 @@
 #include "execution/prefix_cache/PrefixStateCache.h"
 #include "execution/prefix_cache/RamPrefixStorageBackend.h"
 #include "kernels/qwen4exp/QwenAdaptiveTerminalCounters.h"
+#include "kernels/qwen4exp/PooledImmutableLocalHotTerminal.h"
 #include "kernels/qwen4exp/QwenFixedHeadTerminalCounters.h"
 #include "kernels/qwen4exp/QwenSparseTerminalCounters.h"
 #include "models/qwen4exp/Qwen4ExpConfig.h"
@@ -3969,7 +3971,8 @@ namespace llaminar2
         size_t output_token_elements = 0;  ///< INT32 elements in output_tokens.
         size_t meta_elements = 0;          ///< INT32 elements in meta.
         int32_t *output_tokens = nullptr;  ///< Pinned INT32 [request, output-token stride].
-        int *meta = nullptr;               ///< Pinned INT32 [request, metadata stride].
+        int *meta = nullptr;               ///< Pinned INT32 [optional local report, request metadata].
+        PhysicalMemoryAllocationLease local_terminal_claim; ///< Exact whole combined pinned metadata destination; original token scratch is unchanged.
 
         PinnedHostScratch() = default;
         PinnedHostScratch(const PinnedHostScratch &) = delete;
@@ -3990,7 +3993,9 @@ namespace llaminar2
             int owner_device_id,
             int requests,
             int output_token_stride,
-            int metadata_stride)
+            int metadata_stride,
+            std::shared_ptr<PhysicalMemoryAuthority> reportAuthority={},
+            std::size_t terminalBytes=0)
         {
             release();
             if (!owner_backend || requests <= 0 || output_token_stride <= 0 ||
@@ -4007,6 +4012,12 @@ namespace llaminar2
                 static_cast<size_t>(requests) *
                 static_cast<size_t>(metadata_stride);
 
+            if(terminalBytes){
+                if(!reportAuthority || terminalBytes!=qwen4exp::local_hot::terminalObservationBytes(requests,metadata_stride))
+                    throw std::invalid_argument("Pinned local terminal observation changed its exact complete cold declaration");
+                local_terminal_claim=reportAuthority->claimNewAllocation(DeviceId::cpu(),PhysicalMemoryOwner::ImmutableLookupStaging,terminalBytes);
+                meta_elements=terminalBytes/sizeof(int);
+            }
             output_tokens = static_cast<int32_t *>(
                 backend->allocatePinned(
                     output_token_elements * sizeof(int32_t),
@@ -4047,6 +4058,7 @@ namespace llaminar2
                 if (meta)
                     backend->freePinned(meta, device_id);
             }
+            local_terminal_claim={};
             backend = nullptr;
             device_id = -1;
             request_capacity = 0;
@@ -6624,6 +6636,10 @@ namespace llaminar2
                 LOG_ERROR("[DeviceGraphOrchestrator] Failed to register persistent device request-state buffers");
                 return false;
             }
+            if(const auto terminalBytes=localHotTerminalMetadataBytes(request_length_capacity)){
+                if(!arena_->registerBuffer(BufferId::MTP_LOCAL_HOT_TERMINAL_OBSERVATION,1,terminalBytes/sizeof(int),"INT32",state_.device_id))
+                    throw std::logic_error("Local terminal observation could not declare its exact separate arena root");
+            }
             mtp_diagnostic_record_mode_ = sampling_math::resolveMTPDiagnosticRecordMode(
                 debugEnv().runtime_debug.mtp_device_phase_snapshots,
                 DebugEnv::isTruthyEnv("LLAMINAR_MTP_MIRROR_LAYER_DIAGNOSTICS"),
@@ -7330,6 +7346,8 @@ namespace llaminar2
                 return false;
             }
         }
+        if(state_.device_id.is_gpu() && arena_->isRegistered(BufferId::MTP_LOCAL_HOT_TERMINAL_OBSERVATION))
+            arena_->allocateDeviceStorage(BufferId::MTP_LOCAL_HOT_TERMINAL_OBSERVATION,state_.device_id);
         if (state_.device_id.is_gpu() &&
             arena_->isRegistered(BufferId::MTP_GENERATION_RESPONSE_TOKENS) &&
             arena_->isRegistered(BufferId::MTP_GENERATION_CONTROL) &&
@@ -7675,7 +7693,9 @@ namespace llaminar2
                     state_.device_id.gpu_ordinal(),
                     device_generation_storage_.request_capacity,
                     device_generation_storage_.response_token_stride,
-                    device_generation_storage_.control_stride))
+                    device_generation_storage_.control_stride,
+                    localHotTerminalMetadataBytes(device_generation_storage_.request_capacity)?physical_memory_authority_:nullptr,
+                    localHotTerminalMetadataBytes(device_generation_storage_.request_capacity)))
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Failed to allocate pinned terminal response scratch on "
                           << state_.device_id.toString());
@@ -13001,7 +13021,7 @@ namespace llaminar2
             output_node->is_final_output = true;
         }
 
-        const std::vector<std::string> prior_leaves = graph.getLeafNodes();
+        const std::vector<std::string> prior_leaves = graph.getLeafNodes(GraphLeafScope::MainExecution);
         if (prior_leaves.empty())
         {
             if (error)
@@ -13072,7 +13092,7 @@ namespace llaminar2
         }
 
         const std::vector<std::string> prior_roots = graph.getRootNodes();
-        const std::vector<std::string> prior_leaves = graph.getLeafNodes();
+        const std::vector<std::string> prior_leaves = graph.getLeafNodes(GraphLeafScope::MainExecution);
         if (prior_roots.empty() || prior_leaves.empty())
         {
             if (error)
@@ -24895,12 +24915,21 @@ namespace llaminar2
         if (submission != DeviceGraphExecutor::GraphInitialSubmissionPolicy::CaptureInstantiateAndLaunch &&
             !materialize_only)
             throw std::invalid_argument("MTP sidecar has an unknown initial submission policy");
-        if (materialize_only && (!state_.device_id.is_gpu() || kv_cache_only ||
-            terminal_hidden_buffer_id != BufferId::MTP_HIDDEN || token_count != 1 || request_batch != 1 ||
-            !draft_condition_tokens_device || !position_ids_device_override || position_ids_override ||
-            speculative_outcome_meta_device || speculative_outcome_output_tokens_device ||
-            speculative_outcome_ready_event || first_seq_idx != 0))
-            throw std::invalid_argument("Cold sidecar capture requires the authenticated scalar chained role");
+        if (materialize_only)
+        {
+            // Cold full/chained graphs borrow only their original retained
+            // hidden roots. No live tokens or model arithmetic are submitted.
+            const auto chained=state_.extension_buffers.find(BufferId::MTP_HIDDEN);
+            const bool hidden_binding=
+                (terminal_hidden_buffer_id==BufferId::PREFIX_TERMINAL_HIDDEN && terminal_hidden==state_.prefix_terminal_hidden.get()) ||
+                (terminal_hidden_buffer_id==BufferId::MTP_HIDDEN && chained!=state_.extension_buffers.end() &&
+                 terminal_hidden==chained->second.get());
+            if (!state_.device_id.is_gpu() || kv_cache_only || !terminal_hidden || !hidden_binding ||
+                token_count != 1 || request_batch != 1 || !draft_condition_tokens_device ||
+                !position_ids_device_override || position_ids_override || speculative_outcome_meta_device ||
+                speculative_outcome_output_tokens_device || speculative_outcome_ready_event || first_seq_idx != 0)
+                throw std::invalid_argument("Cold sidecar capture requires its exact original scalar full/chained role");
+        }
         const int seq_len = token_count;
         const int total_rows =
             (token_count > 0 && request_batch > 0)
@@ -25077,7 +25106,8 @@ namespace llaminar2
              {"kv_cache_only", boolTag(kv_cache_only)},
              {"seq_len", std::to_string(token_count)},
              {"batch", std::to_string(request_batch)}});
-        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+        if (!graph_builder_ || (!graph_builder_->config().mtp.enabled &&
+            !(materialize_only && retainsMTPGraphCapacity(graph_builder_->config().mtp))))
             return false;
         if (state_.mtp_kv_caches.empty() || !state_.mtp_kv_caches[0])
         {
@@ -32223,6 +32253,8 @@ namespace llaminar2
             return "main_batch_sample_initialization";
         case DeviceResidentLogicalStatePublicationKind::UnsampledLogitsInitialization:
             return "unsampled_logits_initialization";
+        case DeviceResidentLogicalStatePublicationKind::OrdinaryGenerationTransaction:
+            return "ordinary_generation_transaction";
         case DeviceResidentLogicalStatePublicationKind::OrdinaryGenerationTerminal:
             return "ordinary_generation_terminal";
         case DeviceResidentLogicalStatePublicationKind::ForwardOnlyTerminal:
@@ -33147,7 +33179,10 @@ namespace llaminar2
         {
             if (replacement_writer_pending)
                 *replacement_writer_pending = true;
-            LOG_DEBUG(
+            // This is an expected polling result while a retained generation
+            // writer is live, potentially many times per token. Formatting it
+            // at DEBUG makes passive telemetry compete with inference progress.
+            LOG_TRACE(
                 "[DeviceGraphOrchestrator] Resident logical-state observation "
                 "deferred behind an unfinished replacement writer"
                 << " consumer="
@@ -52970,6 +53005,17 @@ namespace llaminar2
                 }
             }
             loop.launched = true;
+            if (loop.ordinary_sampling_identity &&
+                !recordDeviceResidentLogicalSequenceStateMailbox(
+                    request_count, loop.stream.get(),
+                    DeviceResidentLogicalStatePublicationKind::OrdinaryGenerationTransaction))
+            {
+                // The initial captured sample/forward has been submitted.
+                // Publish its exact stream before maintenance can observe this
+                // transaction; a request-long writer would starve that reader.
+                LOG_ERROR("[DeviceGraphOrchestrator] Initial ordinary hosted transaction could not publish logical state");
+                std::terminate();
+            }
             if (!enqueueDeviceGenerationDispatchTicketObservation())
                 return false;
             if (loop.read_ahead_resources)
@@ -53175,6 +53221,17 @@ namespace llaminar2
                 branch_count);
         const size_t selected_fragment_count =
             selection.countSelected(ordered_branch);
+        if (loop.ordinary_sampling_identity &&
+            !waitForDeviceResidentLogicalSequenceStateRowReuse(
+                loop.stream.get(), "ordinary_hosted_transaction_writer"))
+        {
+            // The topology coordinator has accepted the completed ticket.
+            // Acquire the next writer only after that boundary, joining the
+            // previous publication and its actual readers through existing
+            // event edges. The terminal branch also owns its final publication.
+            LOG_ERROR("[DeviceGraphOrchestrator] Ordinary hosted transaction could not acquire its logical-state writer");
+            return false;
+        }
         if (!hosted_device_generation_cursor_.beginAdvance(
                 ticket.transaction_count) ||
             !loop.hosted_advance.begin(selected_fragment_count))
@@ -53376,6 +53433,17 @@ namespace llaminar2
             return true;
         }
 
+        if (loop.ordinary_sampling_identity &&
+            !recordDeviceResidentLogicalSequenceStateMailbox(
+                request_count, loop.stream.get(),
+                DeviceResidentLogicalStatePublicationKind::OrdinaryGenerationTransaction))
+        {
+            // All selected captured fragments precede this event on the exact
+            // controller stream. Closing each writer lets background snapshots
+            // consume a completed transaction while the request remains live.
+            LOG_ERROR("[DeviceGraphOrchestrator] Ordinary hosted transaction could not publish logical state");
+            std::terminate();
+        }
         if (!loop.hosted_advance.finish() ||
             !hosted_device_generation_cursor_.finishAdvance(
                 ticket.transaction_count,
@@ -53594,7 +53662,8 @@ namespace llaminar2
                 device_generation_storage_.response_token_stride,
                 device_generation_storage_.control_stride))
             return {};
-        return {device_generation_terminal_host_scratch_->meta,
+        const auto prefix=localHotTerminalMetadataBytes(request_count)?sizeof(qwen4exp::local_hot::TerminalObservation)/sizeof(int):0;
+        return {device_generation_terminal_host_scratch_->meta+prefix,
                 static_cast<size_t>(request_count) *
                     static_cast<size_t>(device_generation_storage_.control_stride)};
     }
@@ -53755,8 +53824,21 @@ namespace llaminar2
             static_cast<size_t>(device_generation_storage_.control_stride);
         int32_t *const host_response_tokens =
             device_generation_terminal_host_scratch_->output_tokens;
-        int *const host_controls =
-            device_generation_terminal_host_scratch_->meta;
+        const auto localTerminalBytes=localHotTerminalMetadataBytes(request_count);
+        const auto localPrefixWords=localTerminalBytes?sizeof(qwen4exp::local_hot::TerminalObservation)/sizeof(int):0;
+        int *const host_controls=device_generation_terminal_host_scratch_->meta+localPrefixWords;
+        const void* terminalControlSource=device_generation_storage_.control_device;
+        std::size_t terminalControlBytes=sizeof(int)*control_elements;
+        if(localTerminalBytes){
+            auto* output=arena_->getDevicePtr(BufferId::MTP_LOCAL_HOT_TERMINAL_OBSERVATION,state_.device_id);
+            if(!output || arena_->getCols(BufferId::MTP_LOCAL_HOT_TERMINAL_OBSERVATION)*sizeof(int)<localTerminalBytes)
+                throw std::logic_error("Local terminal observation lost its admitted arena output");
+            // Private terminal-only output has no graph consumer. The exact
+            // result stream and SAME ready event publish pack+copy together;
+            // no additional coherence event or live observation is created.
+            packLocalHotTerminalObservation(request_count,output,localTerminalBytes,result_stream);
+            terminalControlSource=output;terminalControlBytes=localTerminalBytes;
+        }
 
         {
             PerfStatsCollector::ScopedTimer enqueue_timer(
@@ -53772,9 +53854,9 @@ namespace llaminar2
                     state_.device_id.gpu_ordinal(),
                     result_stream) ||
                 !backend->deviceToHostOnStream(
-                    host_controls,
-                    device_generation_storage_.control_device,
-                    sizeof(int) * control_elements,
+                    localTerminalBytes?device_generation_terminal_host_scratch_->meta:host_controls,
+                    terminalControlSource,
+                    terminalControlBytes,
                     state_.device_id.gpu_ordinal(),
                     result_stream) ||
                 !backend->recordEvent(
@@ -54204,7 +54286,15 @@ namespace llaminar2
                       PhysicalMemoryAllocatorIdentity{placement->worldRank(), state_.device_id}) !=
                 placement->consumers().end();
         const auto adaptive_row_bytes = adaptive_lookup ? placement->extent().rowBytes() : 0;
-        const auto adaptive_maximum_ids = adaptive_lookup ? placement->gpuAdaptiveMaximumLiveRows() : 0;
+        const bool compact_lookup = adaptive_lookup && placement->gpuAdaptiveRequest().local_hot_cache.has_value();
+        const auto adaptive_query = compact_lookup ? qwen4exp::QwenAdaptiveQuerySemantics::CompactNativeMisses
+                                                  : qwen4exp::QwenAdaptiveQuerySemantics::OriginalNgramRows;
+        // The original coordinator consumes concatenated compact miss prefixes;
+        // its N envelope may exceed one query's U bound. Neither is wire volume.
+        const auto adaptive_maximum_ids = !adaptive_lookup ? 0 : compact_lookup
+            ? qwen4exp::PooledImmutableLocalHotTransportGeometry::compactOriginalCapacity(
+                static_cast<std::uint32_t>(placement->gpuAdaptiveMaximumLiveRows()),placement->consumers().size())
+            : placement->gpuAdaptiveMaximumLiveRows();
         const bool fixed_head_lookup=graph_builder_ && graph_builder_->config().ngram_table_placement &&
             graph_builder_->config().ngram_table_placement->isFixedHeadShards();
         const auto fixed_row_bytes=fixed_head_lookup && graph_builder_->config().flash_next
@@ -54373,7 +54463,7 @@ namespace llaminar2
             if (adaptive_lookup)
             {
                 if (!qwen4exp::validQwenAdaptiveCounters(adaptive_actual, adaptive_row_bytes,
-                                                         adaptive_maximum_ids) ||
+                                                         adaptive_maximum_ids, adaptive_query) ||
                     adaptive_actual.failed_frames)
                     return false;
             }
@@ -54562,6 +54652,8 @@ namespace llaminar2
         active_device_generation_admission_.reset();
         last_device_generation_dispatch_ticket_.reset();
         *out_result = std::move(parsed);
+        if(localTerminalBytes)
+            publishLocalHotTerminalObservation(device_generation_terminal_host_scratch_->meta,localTerminalBytes,request_count);
         // These words arrive in the existing immutable terminal controller copy.
         // Emit only after every request and complete-parent retirement succeeded.
         const char* qsa_metric_names[]{"verifier_prior_header_bytes","verifier_prior_payload_bytes",
@@ -54600,14 +54692,17 @@ namespace llaminar2
             for (std::size_t request = 0; request < adaptive_terminal_totals.size(); ++request)
             {
                 const auto values = qwen4exp::adaptiveCounterValues(adaptive_terminal_totals[request]);
+                std::map<std::string,std::string> tags{{"request",std::to_string(request)},
+                    {"storage","vram"},{"transport","pooled_subordinate"},
+                    {"authority","terminal_device_generation_control"}};
+                // A compact input count is shared-pool work, not original model
+                // rows. Preserve that unit in the immutable terminal evidence.
+                if(compact_lookup)tags.emplace("query","compact_native_misses");
                 for (unsigned metric = 0; metric < 9; ++metric)
                     PerfStatsCollector::addCounterWithSequence(
                         "immutable_lookup", names[metric], static_cast<double>(values[metric]),
                         {values[metric]}, "generation_terminal", state_.device_id.toString(),
-                        {{"request", std::to_string(request)},
-                         {"storage", "vram"},
-                         {"transport", "pooled_subordinate"},
-                         {"authority", "terminal_device_generation_control"}});
+                        tags);
             }
         }
         PerfStatsCollector::addCounter(

@@ -232,6 +232,7 @@ namespace llaminar2
         QFN_POOLED_SOURCE_FRAME, ///< Real provider private response/ACK/original-grant packet banks.
         QFN_POOLED_SOURCE_NATIVE, ///< Existing source protocol, exact invocation and source outcome.
         GDN_PREPARED_QK, ///< Scalar producer-normalized Q/K; transient activation, not recurrent state.
+        MTP_LOCAL_HOT_TERMINAL_OBSERVATION, ///< Separate terminal-only packed controller and local report; never execution state.
         _COUNT ///< Sentinel – must be last
     };
 
@@ -390,6 +391,8 @@ namespace llaminar2
             return "MTP_COMMITTED_VERIFIER_IDENTITY";
         case BufferId::MTP_GENERATION_RESPONSE_TOKENS:
             return "MTP_GENERATION_RESPONSE_TOKENS";
+        case BufferId::MTP_LOCAL_HOT_TERMINAL_OBSERVATION:
+            return "MTP_LOCAL_HOT_TERMINAL_OBSERVATION";
         case BufferId::MTP_GENERATION_CONTROL:
             return "MTP_GENERATION_CONTROL";
         case BufferId::MTP_GENERATION_DISPATCH_TICKETS:

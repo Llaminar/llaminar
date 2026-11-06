@@ -524,6 +524,7 @@ std::unique_ptr<IPooledImmutableSourceKernels> QFN_SOURCE_FACTORY(PooledImmutabl
     }
 }
 } // namespace llaminar2::qwen4exp
+#include "GPUPooledImmutableLocalHotNativePack.cuh"
 #undef QFN_SOURCE_STREAM
 #undef QFN_SOURCE_NAMESPACE
 #undef QFN_SOURCE_FACTORY

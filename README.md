@@ -291,6 +291,39 @@ Opposite-vendor declarations still require the original admitted directed
 transport and complete retained remote transaction implementation; declaration,
 source-owner initialization and checked geometry alone do not qualify inference.
 
+A declared shared pool can additionally request **participant-local hot caches**
+with `--ngram-local-cache-max-rows` and `--ngram-local-cache-bytes`. This is a
+separate optional arm: omission retains shared-only execution; explicitly setting
+zero keeps the combined C0 path and its mandatory miss/response storage. It is
+valid only with declared rank-local placement, and cannot be combined with the
+independent `consumer-local` placement. Local caches belong to actual PLE
+consumers, not to storage-only pool owners. Lookups follow local native VRAM,
+then the shared GPU pool, then the original RAM/SSD source. Full-RAM backing
+ends at RAM and retains no redundant bounded RAM cache.
+
+Local caps cover native payload plus local slot/directory/policy metadata,
+independently of pool and source-cache caps. All mandatory obligations, including
+the bounded local miss/response/ready roots, must fit first. Optional local slots
+are admitted before optional pool slots, followed by RAM cache slots; frozen
+model, expert and KV grants are never reopened. Opaque setup/event resources
+remain separately charged by the same physical-memory authority. A positive
+ceiling is not a guaranteed grant.
+
+`--ngram-local-cache-aging-accesses`,
+`--ngram-local-cache-protected-numerator` and
+`--ngram-local-cache-protected-denominator` retain the existing deterministic
+frequency/probation/protected policy (defaults 65,536/3/4). YAML uses
+`ngram.local_cache_max_rows`, `local_cache_bytes`, `local_cache_aging_accesses`,
+`local_cache_protected_numerator` and `local_cache_protected_denominator`.
+The lossless configuration's
+`ngram_table_policy.gpu_adaptive.local_hot_cache` record can additionally carry
+`consumer_overrides`, using the existing participant/row/byte-ceiling records;
+duplicate or non-consumer endpoints reject. An absent or null record preserves
+shared-only intent, while an explicit zero-valued record preserves combined C0.
+Speculative fetches must not receive consumed-demand policy credit. Declaration
+or metadata/BOM tests alone do not qualify native execution, MTP, read-ahead,
+numerics or performance for this combined path.
+
 Use `--ngram-gpu-cache-max-rows` / `--ngram-gpu-cache-bytes` for GPU payload plus
 metadata, and `--ngram-source-cache-max-rows` / `--ngram-source-cache-bytes` for
 the subordinate CPU cache. Both ceilings per cache default to zero, preserving

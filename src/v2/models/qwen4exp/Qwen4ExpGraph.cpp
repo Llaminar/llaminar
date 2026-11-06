@@ -441,7 +441,8 @@ Qwen4ExpPLEBuilder::LookupStorage Qwen4ExpGraph::pleLookupStorage(const ForwardI
                 config_.ngram_replicated_ple_cohort->requireQuery(*input.replicated_ple_query,input,original,owner);
                 if(!lookup_)
                     return Qwen4ExpPooledReaderLookupStorage{arena_,participants,
-                        DeviceGenerationControlBinding::admit(*arena_,device,0),original,adaptiveCountBinding(input,original)};
+                        DeviceGenerationControlBinding::admit(*arena_,device,0),original,adaptiveCountBinding(input,original),
+                        model_ctx_->adaptiveImmutableLookupLocalHot(device)};
             }
             if (!lookup_ || !arena_)
                 throw std::logic_error(
@@ -455,7 +456,8 @@ Qwen4ExpPLEBuilder::LookupStorage Qwen4ExpGraph::pleLookupStorage(const ForwardI
 #endif
             if(!code)throw std::invalid_argument("PLE split lookup requires its compiled original native backend");
             return Qwen4ExpPooledLookupStorage{arena_,lookup_,std::move(code),
-                DeviceGenerationControlBinding::admit(*arena_,device,0),original,adaptiveCountBinding(input,original),model_ctx_->adaptiveImmutableLookupParticipants(device)};
+                DeviceGenerationControlBinding::admit(*arena_,device,0),original,adaptiveCountBinding(input,original),participants,
+                model_ctx_->adaptiveImmutableLookupLocalHot(device)};
         }
         if (tier==ImmutableRowLookupExecution::ResidentGPU)
         {

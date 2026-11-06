@@ -173,3 +173,31 @@ TEST(ImmutableRowTableAdmissionWire, PlacementModeWireRejectsFullWidthAliases){
     }
 }
 }
+
+namespace llaminar2::test {
+/** @test New wire keeps explicit local C0 distinct, and rejects prior schema and foreign reader overrides. */
+TEST(ImmutableRowTableAdmissionWire, NgramLocalHotCacheIntentAndConsumerAuthority)
+{
+    auto original = request();
+    original.requested.storage = ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD;
+    original.requested.gpu_adaptive.placement = parseAdaptiveGPUCachePlacement("2:rocm:3/128/1048576@2:cuda:0");
+    const auto host = original.input.host();
+    const std::array consumers{PhysicalMemoryResource{2,DeviceId::cuda(0),1u<<30,1u<<29},
+        PhysicalMemoryResource{2,DeviceId::cuda(1),1u<<30,1u<<29}};
+    const std::array resources{consumers[0], consumers[1], PhysicalMemoryResource{2,DeviceId::rocm(3),1u<<30,1u<<29}};
+    original.requested.gpu_adaptive.local_hot_cache.emplace();
+    original.requested.gpu_adaptive.local_hot_cache->consumer_overrides = {{{2,DeviceType::CUDA,1},17,4096}};
+    original.input = ImmutableRowTablePlacementInput::forConsumers(original.input.extent(),host,consumers)
+        .withGPUCacheResources(original.requested,resources);
+    const auto encoded = serializeImmutableRowTableAdmissionRequests(std::array{original});
+    const auto decoded = parseImmutableRowTableAdmissionRequests(encoded,2);
+    ASSERT_EQ(decoded.size(),1u);
+    EXPECT_EQ(decoded.front().requested,original.requested);
+    ASSERT_TRUE(decoded.front().requested.gpu_adaptive.local_hot_cache);
+    EXPECT_EQ(decoded.front().requested.gpu_adaptive.local_hot_cache->maximum_cache_rows,0u);
+    auto old = encoded; old[4]=16;
+    EXPECT_THROW(parseImmutableRowTableAdmissionRequests(old,2),std::invalid_argument);
+    original.requested.gpu_adaptive.local_hot_cache->consumer_overrides.front().participant.ordinal=7;
+    EXPECT_THROW(original.input.withGPUCacheResources(original.requested,resources),std::invalid_argument);
+}
+}

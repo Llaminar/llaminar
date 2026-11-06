@@ -6,6 +6,7 @@
  * mints no host certificate and is unavailable in ordinary perf/test targets.
  */
 #pragma once
+#include <functional>
 #include "backends/RetainedParticipantGraphExecutable.h"
 #include <memory>
 #include "execution/local_execution/graph/IGraphCaptureAuxiliaryBranch.h"
@@ -78,6 +79,68 @@ struct RetainedParticipantGraphExecutableFixtureAccess final {
             definitions.push_back(body->capture_.get());
         }
         return progress?progress->attachWithFiniteBody(*parent->capture_,definitions):parent->capture_->appendFiniteBodySiblings(definitions);
+    }
+    /** @brief Retained original graph-only units for one diagnostic ordered parent; none is executable. */
+    struct NativeForkDefinitions {
+        std::unique_ptr<IGPUGraphCapture> producer,consumer,auxiliary;
+    };
+    /**
+     * @brief Exercise the actual native ordered-parent/fork builder under its original General owner.
+     * @param owner Pristine original same-source General reservation and native capture.
+     * @param owned Use original timeline-owned CUDA recording views, or independent import definitions.
+     * @param noEdge Diagnostic-only literal old independent-root control; never a serving strategy.
+     * @param record Records the three exact graph-only definitions on the original worker/stream.
+     * @param composeMain Optional actual production composer over these same graph-only definitions.
+     * @return Strong graph definitions retained through the original parent's native terminal.
+     * The owner enters Recorded only after the actual backend assembly succeeds;
+     * original instantiate/submit/observe remain unchanged and no raw launch escapes.
+     */
+    template<class Record>
+    static NativeForkDefinitions composeNativeForkFixture(
+        const std::shared_ptr<RetainedParticipantGraphExecutable>& owner,
+        bool owned,bool noEdge,Record record,
+        const std::function<bool(IGPUGraphCapture&, const IGPUGraphCapture&, const IGPUGraphCapture&)>& composeMain = {})
+    {
+        if(!owner)throw std::invalid_argument("Native fork requires its original General owner");
+        owner->requireRecordingAuthority();
+        if(owner->phase_!=RetainedParticipantGraphExecutable::Phase::Fresh || !owner->capture_ ||
+           owner->capture_->nodeCount() || owner->capture_->hasExecutable())
+            throw std::logic_error("Native fork fixture requires an untouched original definition");
+        NativeForkDefinitions definitions;
+        owner->phase_=RetainedParticipantGraphExecutable::Phase::Recording;
+        try {
+            auto& parent=*owner->capture_;
+            definitions.producer=owned?parent.createOrderedTimelineFragment():owner->worker_->createGraphCapture(owner->stream_);
+            definitions.consumer=owned?parent.createOrderedTimelineFragment():owner->worker_->createGraphCapture(owner->stream_);
+            definitions.auxiliary=owner->worker_->createGraphCapture(owner->stream_);
+            if(!definitions.producer || !definitions.consumer || !definitions.auxiliary)
+                throw std::runtime_error("Native fork omitted an original graph-only definition");
+            record(*definitions.producer,*definitions.consumer,*definitions.auxiliary);
+            const std::array steps{
+                GPUOrderedTimelineStep{.name="original_probe",.kind=GPUOrderedTimelineStepKind::CapturedFragment,.capture=definitions.producer.get()},
+                GPUOrderedTimelineStep{.name="later_local_read",.kind=GPUOrderedTimelineStepKind::CapturedFragment,.capture=definitions.consumer.get()}};
+            if(!(composeMain ? composeMain(parent,*definitions.producer,*definitions.consumer)
+                             : parent.buildOrderedTimelineTransaction(steps)))
+                throw std::runtime_error("Native fork original main timeline assembly failed");
+            const auto before=parent.nodeCount();
+            if(noEdge) {
+                const std::array<const IGPUGraphCapture*,1> siblings{definitions.auxiliary.get()};
+                if(!parent.appendFiniteBodySiblings(siblings))
+                    throw std::runtime_error("Diagnostic old independent-root control failed to assemble");
+            } else if(!parent.appendFiniteBodyAfterCapturedFragment(*definitions.producer,*definitions.auxiliary))
+                throw std::runtime_error("Native fork producer attachment failed");
+            if(parent.nodeCount()!=before+1 || definitions.auxiliary->hasExecutable() ||
+               (!noEdge && parent.appendFiniteBodyAfterCapturedFragment(*definitions.producer,*definitions.auxiliary)))
+                throw std::runtime_error("Native fork changed its exact parent/auxiliary topology");
+            std::string why;
+            if(!parent.validateExecutableMemoryClass(GPUGraphExecutableClass::General,&why))
+                throw std::runtime_error("Native fork actual General shape invalid: "+why);
+            owner->phase_=RetainedParticipantGraphExecutable::Phase::Recorded;
+            return definitions;
+        } catch(...) {
+            owner->phase_=RetainedParticipantGraphExecutable::Phase::Failed;
+            throw;
+        }
     }
     /** @return Owner-controlled original enqueue; the recording facade cannot launch independently. */
     static bool submit(const std::shared_ptr<RetainedParticipantGraphExecutable>& owner,std::uint64_t ordinal){return owner->submit(ordinal);}

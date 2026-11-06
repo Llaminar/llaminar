@@ -7,6 +7,7 @@
  * stay visible as nominal graph operations. The actual service retains backing.
  */
 #include "PooledImmutableSourceKernels.h"
+#include "execution/qwen4exp/PooledImmutableLocalHotNativePack.h"
 #include "execution/qwen4exp/PooledImmutableRetirementAuthority.h"
 #include "PooledImmutableSourcePreparedStorage.h"
 #include "PooledImmutableNativeRootStorage.h"
@@ -110,4 +111,24 @@ std::uint64_t IPooledImmutableSourceKernels::captureIdentity(const PooledImmutab
     for(auto word:{source().captureIdentity(),codeIdentity(),static_cast<std::uint64_t>(kImmutableLookupSubordinateProtocol)})h=(h^word)*1099511628211ULL;
     return h?h:1;
 }
+void IPooledImmutableSourceKernels::enqueueCompactNativePack(PooledImmutableSourcePreparedStorage& storage,
+    const DeviceGenerationControlBinding& control,const PooledImmutableLocalHotNativePack& pack,void* stream)const
+{
+    exact(stream);requireStorage(storage);storage.roots_->requireInitialized();control.requireFor(geometry().allocator().device);pack.require(storage);
+    const auto original=args(storage,&control);const auto delivery=pack.native();
+    if(geometry().allocator().device.is_cuda()){
+#if defined(HAVE_CUDA)
+        local_hot_transport::enqueueCUDAPooledLocalHotNativePack(original,delivery,stream);
+#else
+        throw std::logic_error("Compact native source delivery requires its compiled CUDA backend");
+#endif
+    }else if(geometry().allocator().device.is_rocm()){
+#if defined(HAVE_ROCM)
+        local_hot_transport::enqueueROCmPooledLocalHotNativePack(original,delivery,stream);
+#else
+        throw std::logic_error("Compact native source delivery requires its compiled HIP backend");
+#endif
+    }else throw std::logic_error("Compact native source delivery requires its exact GPU source backend");
+}
+
 }

@@ -10,6 +10,36 @@
 namespace llaminar2::test {
 /** @brief Access the same selector/BOM/creator/retirement implementation with recorded evidence. */
 struct PooledRemoteGraphHostReplayAccess final {
+    /** @return Actual PMA-backed fixed source roster; recorded metadata grants no native/model source permission. */
+    static auto sourceSlots(std::uint64_t identity,std::size_t count,const std::shared_ptr<PhysicalMemoryAuthority>& memory){
+        return RetainedParticipantGraphSourceSlots::create(identity,count,memory);
+    }
+    /** @brief Bind only recorded SDK results; reuse executes the exact production holder/owner transition. */
+    static auto acquireSlots(RetainedParticipantGraphSourceSlots& slots,std::uint64_t identity,
+        const PreparedGPUContextUsePermit& original,const PooledRemoteGraphProgram& program,
+        NativeAuxiliaryResourceSelection selected,std::size_t bytes,void* stream=nullptr){
+        if(!stream)stream=original.worker()->defaultStream();
+#ifdef LLAMINAR_ORIGINAL_SOURCE_SLOT_CONTROL
+        return RetainedParticipantGraphExecutable::createRecordedRemote(original,stream,program,std::move(selected),bytes);
+#else
+        if(!slots.slots()[program.geometry().coordinate].owner)
+            slots.slots()[program.geometry().coordinate].owner=RetainedParticipantGraphExecutable::createRecordedRemote(original,stream,program,std::move(selected),bytes);
+        return slots.acquire(identity,original,stream,program);
+#endif
+    }
+    /** @brief Original old-code control retains its original retirement path and ProcessRuntime obligations. */
+    static void releaseSlots(RetainedParticipantGraphSourceSlots& slots,std::uint64_t identity,
+        const PooledRemoteGraphProgram& program,const std::shared_ptr<RetainedParticipantGraphExecutable>& owner){
+#ifdef LLAMINAR_ORIGINAL_SOURCE_SLOT_CONTROL
+        owner->retireDefinition();
+#else
+        slots.release(identity,program,owner);
+#endif
+    }
+    /** @return Immutable cold definition epoch; not a controller/request count. */
+    static auto definitionGeneration(const RetainedParticipantGraphExecutable& owner){return owner.definitionGeneration_;}
+    /** @return Last original native submission ownership ordinal; no device state is downloaded. */
+    static auto submissionOrdinal(const RetainedParticipantGraphExecutable& owner){return owner.lastSubmission_;}
     /** @return Actual selector result for the recorded original source/program, with no catalog override. */
     static NativeAuxiliaryResourceSelection selection(const PreparedGPUContextUsePermit& original,const PooledRemoteGraphProgram& program,std::size_t hostUnitBytes=4096){
         const auto key=original.provenance().originalBirthKey();

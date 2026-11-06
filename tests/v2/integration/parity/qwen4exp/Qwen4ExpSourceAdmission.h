@@ -33,8 +33,11 @@
 #include "config/OrchestrationStartupPolicy.h"
 #include "execution/qwen4exp/ImmutableLookupExecutionBoundary.h"
 #include "execution/qwen4exp/PooledImmutableRetainedParticipants.h"
+#include "execution/qwen4exp/PooledImmutableParticipantExecutionPolicy.h"
 #include "loaders/AdaptiveImmutableLookupGeometry.h"
 #include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
+#include "kernels/qwen4exp/PooledImmutableLocalHotPreparedStorage.h"
+#include "kernels/qwen4exp/PooledImmutableLocalHotTransportProtocol.h"
 #include "loaders/ModelContext.h"
 #include "loaders/PreparedWeightStore.h"
 #include "loaders/ExpertGemmRegistry.h"
@@ -45,6 +48,7 @@
 #include "loaders/ImmutableLookupSetupObservation.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "utils/TestOrchestrationHelper.h"
+#include "utils/FinalPhysicalMemoryCostEvidence.h"
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <algorithm>
@@ -77,6 +81,106 @@ inline void expectQwen4ExpSourceLease(const PhysicalMemoryAuthority &memory,
     ASSERT_LE(line->materialized_new_bytes,
               std::numeric_limits<std::size_t>::max() - line->adopted_resident_bytes);
     EXPECT_EQ(line->materialized_new_bytes + line->adopted_resident_bytes, live);
+}
+
+/**
+ * @brief Sum only actual disjoint local native leases beside the original pool/source owner.
+ * @param context Same retained model whose resolved placement declares every local consumer.
+ * @param allocator Original GPU or CPU0 readiness allocator.
+ * @param category Exact physical category; no capacity or hypothetical credit is used.
+ * @return Actual local-only bytes, zero in unchanged shared-only modes.
+ */
+inline std::size_t qwen4ExpSourceLocalHotLeaseBytes(const ModelContext& context,
+    PhysicalMemoryAllocatorIdentity allocator, PhysicalMemoryOwner category)
+{
+    const auto placement=context.resolvedImmutableRowTablePlacement();
+    if(!placement || !placement->isGPUAdaptive() || !placement->gpuAdaptiveRequest().local_hot_cache)return 0;
+    std::size_t bytes=0;
+    for(const auto& geometry:placement->gpuAdaptiveLocalHotCaches()) {
+        const auto local=context.adaptiveImmutableLookupLocalHot(geometry.allocator().device);
+        if(!local)throw std::logic_error("Combined witness omitted an actual local native owner");
+        const auto observation=allocator.device.is_cpu()?local->retainedReadyObservation():local->retainedOwnerObservation();
+        if(observation.allocator()!=allocator)continue;
+        const auto add=category==PhysicalMemoryOwner::ImmutableTableStorage?observation.tableStorageBytes():
+            category==PhysicalMemoryOwner::ImmutableLookupStaging?observation.lookupStagingBytes():0;
+        if(add>std::numeric_limits<std::size_t>::max()-bytes)throw std::overflow_error("Local witness bytes overflow");
+        bytes+=add;
+    }
+    return bytes;
+}
+
+/**
+ * @brief Prove complete original local roots, compact source identity and separately retained CPU ready pages.
+ * @param original Actual retained model/PMA; this observer cannot materialize roots or grant native work.
+ */
+inline void expectQwen4ExpSourceLocalHotOwners(const ModelContextReuseContract& original)
+{
+    const auto& context=original.context;ASSERT_TRUE(context);
+    const auto placement=context->resolvedImmutableRowTablePlacement();ASSERT_TRUE(placement);
+    if(!placement->gpuAdaptiveRequest().local_hot_cache) {
+        EXPECT_TRUE(placement->gpuAdaptiveLocalHotCaches().empty());
+        return;
+    }
+    const auto& memory=original.physical_memory_authority;ASSERT_TRUE(memory);
+    const auto& request=placement->gpuAdaptiveRequest();
+    ASSERT_EQ(request.placement.mode,AdaptiveGPUCachePlacementMode::DeclaredRankLocal);
+    ASSERT_TRUE(request.placement.coordinator);
+    const auto coordinator=request.placement.coordinator->device();
+    const auto participants=context->adaptiveImmutableLookupParticipants(coordinator);ASSERT_TRUE(participants);
+    ASSERT_NO_THROW(participants->requireCurrent());
+    const auto transport=participants->transport();ASSERT_TRUE(transport);
+    ASSERT_TRUE(transport->localHotGeometry());ASSERT_NO_THROW(transport->requireCurrent());
+    const auto source=participants->boundary();ASSERT_TRUE(source);
+    ASSERT_EQ(participants->localHotParticipants().size(),placement->gpuAdaptiveLocalHotCaches().size());
+    ASSERT_EQ(placement->gpuAdaptiveLocalHotCaches().size(),placement->gpuAdaptiveLayout().consumers().size());
+    const auto setup=context->immutableLookupSetupObservation();ASSERT_TRUE(setup);
+    std::size_t local_rows=0,ready_rows=0;
+    for(const auto& row:setup->owners()) {
+        local_rows+=row.role==ImmutableLookupSetupObservation::Role::LocalGPUCache;
+        ready_rows+=row.role==ImmutableLookupSetupObservation::Role::LocalReady;
+    }
+    EXPECT_EQ(local_rows,placement->gpuAdaptiveLocalHotCaches().size());EXPECT_EQ(ready_rows,local_rows);
+    for(const auto& geometry:placement->gpuAdaptiveLocalHotCaches()) {
+        const auto gpu=geometry.allocator();
+        const auto local=context->adaptiveImmutableLookupLocalHot(gpu.device);ASSERT_TRUE(local);
+        ASSERT_NO_THROW(local->requireFor(geometry,source->pooledStorage(),memory));
+        ASSERT_EQ(local->originalSource(),source->pooledStorage());
+        EXPECT_FALSE(local->originalSource().owner_before(source->pooledStorage()));
+        EXPECT_FALSE(source->pooledStorage().owner_before(local->originalSource()));
+        const auto retained=std::find(participants->localHotParticipants().begin(),participants->localHotParticipants().end(),local);
+        ASSERT_NE(retained,participants->localHotParticipants().end());
+        EXPECT_FALSE(retained->owner_before(local));EXPECT_FALSE(local.owner_before(*retained));
+        EXPECT_NE(local->captureIdentity(),0u);EXPECT_NE(local->consumerStorageIdentity(),0u);
+        const auto roots=local->roots();
+        EXPECT_EQ(bool(roots.cache),geometry.slots()!=0);ASSERT_TRUE(roots.frame);ASSERT_TRUE(roots.native);
+        for(const auto& root:{roots.cache,roots.frame,roots.native})if(root) {
+            EXPECT_TRUE(root->is_raw_data_released());EXPECT_NE(root->gpu_data_ptr(),nullptr);
+        }
+        const auto native=local->retainedOwnerObservation();const auto ready=local->retainedReadyObservation();
+        EXPECT_EQ(native.authority(),memory);EXPECT_EQ(ready.authority(),memory);
+        EXPECT_EQ(native.allocator(),gpu);EXPECT_EQ(native.tableStorageBytes(),geometry.physicalBytes());
+        EXPECT_EQ(native.lookupStagingBytes(),geometry.frameOffsets().bytes+geometry.scratchOffsets().bytes);
+        EXPECT_EQ(ready.allocator(),(PhysicalMemoryAllocatorIdentity{gpu.world_rank,DeviceId::cpu()}));
+        EXPECT_EQ(ready.tableStorageBytes(),0u);
+        EXPECT_EQ(ready.lookupStagingBytes(),TransferEngine::mappedHostRegionAllocationBytes(sizeof(std::uint64_t)));
+        ASSERT_TRUE(local->readyRegion());
+        const auto recorded=std::find_if(setup->owners().begin(),setup->owners().end(),[&](const auto& row) {
+            return row.role==ImmutableLookupSetupObservation::Role::LocalGPUCache && row.allocator==gpu;
+        });
+        ASSERT_NE(recorded,setup->owners().end());
+        EXPECT_EQ(recorded->admitted_slots,geometry.slots());
+        EXPECT_EQ(recorded->payload_bytes,geometry.rowBytes()*geometry.slots());
+        EXPECT_EQ(recorded->metadata_bytes,geometry.physicalBytes()-recorded->payload_bytes);
+        EXPECT_EQ(recorded->table_storage_bytes,native.tableStorageBytes());
+        EXPECT_EQ(recorded->lookup_staging_bytes,native.lookupStagingBytes());
+        const auto request_span=transport->localHotOriginalRequest(gpu.device);
+        const auto admission=transport->localHotAdmission(gpu.device);
+        EXPECT_EQ(request_span.bytes(),sizeof(::llaminar2::qwen4exp::local_hot_transport::RequestHeader));
+        EXPECT_EQ(admission.bytes(),sizeof(::llaminar2::qwen4exp::local_hot_transport::SourceAdmissionHeader));
+        EXPECT_NO_THROW(request_span.require(gpu.device));
+        EXPECT_NO_THROW(admission.require(gpu.device));
+        EXPECT_NO_THROW(request_span.requireDisjoint(admission));
+    }
 }
 
 /**
@@ -233,6 +337,22 @@ inline void expectQwen4ExpSourceGPUAdaptiveConsumer(const ModelParityCase &cell,
 {
     ASSERT_TRUE(cell.ngram_table_policy);ASSERT_TRUE(cell.ngram_table_policy->isGPUAdaptive());
     const auto *retained=&original;
+    const auto expect_original_lease=[&](const PhysicalMemoryAuthority& memory,
+        PhysicalMemoryAllocatorIdentity allocator,PhysicalMemoryOwner owner,std::size_t bytes) {
+        const auto local=qwen4ExpSourceLocalHotLeaseBytes(*original.context,allocator,owner);
+        ASSERT_LE(local,std::numeric_limits<std::size_t>::max()-bytes);
+        const auto resolved=original.context->resolvedImmutableRowTablePlacement();
+        if(allocator.device.is_cpu() && owner==PhysicalMemoryOwner::ImmutableLookupStaging &&
+            resolved && resolved->isGPUAdaptive() && resolved->gpuAdaptiveRequest().local_hot_cache) {
+            // Source/LocalReady observations above authenticate their own exact
+            // retained roots. The runner's separate terminal lease shares this
+            // category, so require the complete original PMA category instead
+            // of mistaking the retained subset for all live physical bytes.
+            ASSERT_NO_THROW(test::requireCompleteFinalPhysicalMemoryOwner(memory,allocator,owner));
+        } else {
+            ASSERT_NO_FATAL_FAILURE(expectQwen4ExpSourceLease(memory,allocator,owner,bytes+local));
+        }
+    };
     const auto *context=retained->context.get();ASSERT_NE(context,nullptr);
     EXPECT_EQ(runner.modelContextForDiagnostics(),context);
     const auto placement=context->resolvedImmutableRowTablePlacement();ASSERT_TRUE(placement);
@@ -312,8 +432,17 @@ inline void expectQwen4ExpSourceGPUAdaptiveConsumer(const ModelParityCase &cell,
                 EXPECT_EQ(result.endpointDevice(CapturedTransferEndpoint::Consumer), gpu.device);
                 EXPECT_EQ(ack.endpointDevice(CapturedTransferEndpoint::Producer), gpu.device);
                 EXPECT_EQ(ack.endpointDevice(CapturedTransferEndpoint::Consumer), coordinator.device);
-                EXPECT_EQ(result.maximumBytes(), std::max(readers.resultMaximum(), sizeof(::llaminar2::qwen4exp::replicated_reader::Header)));
-                EXPECT_EQ(ack.maximumBytes(), sizeof(::llaminar2::qwen4exp::replicated_reader::Header));
+                if(request.local_hot_cache) {
+                    ASSERT_TRUE(transport->localHotGeometry());
+                    EXPECT_EQ(result.maximumBytes(),std::max(transport->localHotGeometry()->resultCapacityBytes(),
+                        sizeof(::llaminar2::qwen4exp::local_hot_transport::ResultHeader)));
+                    EXPECT_EQ(ack.maximumBytes(),std::max(transport->localHotGeometry()->keyCapacityBytes(),
+                        sizeof(::llaminar2::qwen4exp::local_hot_transport::RequestHeader)));
+                } else {
+                    EXPECT_FALSE(transport->localHotGeometry());
+                    EXPECT_EQ(result.maximumBytes(), std::max(readers.resultMaximum(), sizeof(::llaminar2::qwen4exp::replicated_reader::Header)));
+                    EXPECT_EQ(ack.maximumBytes(), sizeof(::llaminar2::qwen4exp::replicated_reader::Header));
+                }
                 EXPECT_TRUE(result.nativeStorage()->authority(gpu.device).valid());
                 EXPECT_EQ(result.nativeStorage()->cohort()->modelOwner(), context);
             } else {
@@ -321,24 +450,40 @@ inline void expectQwen4ExpSourceGPUAdaptiveConsumer(const ModelParityCase &cell,
                 EXPECT_EQ((*reader)->result()->endpointDevice(CapturedTransferEndpoint::Consumer),gpu.device);
                 EXPECT_EQ((*reader)->acknowledgement()->endpointDevice(CapturedTransferEndpoint::Producer),gpu.device);
                 EXPECT_EQ((*reader)->acknowledgement()->endpointDevice(CapturedTransferEndpoint::Consumer),coordinator.device);
+                if(request.local_hot_cache) {
+                    ASSERT_TRUE(transport->localHotGeometry());
+                    EXPECT_EQ((*reader)->result()->capacityBytes(),std::max(transport->localHotGeometry()->resultCapacityBytes(),
+                        sizeof(::llaminar2::qwen4exp::local_hot_transport::ResultHeader)));
+                    EXPECT_EQ((*reader)->acknowledgement()->capacityBytes(),std::max(transport->localHotGeometry()->keyCapacityBytes(),
+                        sizeof(::llaminar2::qwen4exp::local_hot_transport::RequestHeader)));
+                } else {
                 EXPECT_EQ((*reader)->result()->capacityBytes(),std::max(readers.resultMaximum(),sizeof(::llaminar2::qwen4exp::replicated_reader::Header)));
                 EXPECT_EQ((*reader)->result()->payloadStorage(), readers.payloadStorage(gpu));
                 EXPECT_EQ((*reader)->acknowledgement()->payloadStorage(), readers.payloadStorage(gpu));
                 EXPECT_EQ((*reader)->acknowledgement()->capacityBytes(),sizeof(::llaminar2::qwen4exp::replicated_reader::Header));
+                }
             }
+            if(request.local_hot_cache) {
+                ASSERT_TRUE(transport->localHotGeometry());
+                const auto control=transport->localHotControl(gpu.device,(*reader)->coordinate());
+                EXPECT_EQ(control.bytes(),sizeof(::llaminar2::qwen4exp::local_hot_transport::Control));
+                EXPECT_NO_THROW(control.require(gpu.device,alignof(::llaminar2::qwen4exp::local_hot_transport::Control)));
+                EXPECT_THROW((void)(*reader)->control(CapturedTransferEndpoint::Consumer),std::logic_error);
+            } else {
             const auto& control = (*reader)->control(CapturedTransferEndpoint::Consumer);
             ASSERT_TRUE(control);
             EXPECT_TRUE(control->isBound());
             EXPECT_EQ(control->device(),gpu.device);
             EXPECT_EQ(control->sizeBytes(),sizeof(::llaminar2::qwen4exp::replicated_reader::Control));
             EXPECT_EQ(reinterpret_cast<std::uintptr_t>(control->deviceData()) % alignof(::llaminar2::qwen4exp::replicated_reader::Control),0u);
+            }
             const auto provider = context->hostImmutableRowProvider();
             ASSERT_TRUE(provider);
             EXPECT_EQ(provider->subordinateRequester(),std::optional{coordinator});
             EXPECT_EQ(provider->subordinateRequesters().size(),1u);
             EXPECT_EQ(context->residentImmutableRowTable(gpu.device),nullptr);
             EXPECT_EQ(context->residentImmutableRowTableBytes(gpu.device),0u);
-            const auto geometry = AdaptiveImmutableLookupGeometry::fromLayout(layout,provider->source(),request);
+            const auto geometry = AdaptiveImmutableLookupGeometry::fromLayoutWithLocalHot(layout,provider->source(),request,placement->gpuAdaptiveLocalHotCaches());
             const auto physicalOwner = std::find_if(sourceBoundary->pooledStorage()->originalOwners().begin(),
                 sourceBoundary->pooledStorage()->originalOwners().end(), [&](const auto& owner) {
                     return owner->plan().allocator() == gpu;
@@ -349,7 +494,8 @@ inline void expectQwen4ExpSourceGPUAdaptiveConsumer(const ModelParityCase &cell,
                 for (const auto& row : memory->rankAttestation()) {
                     if (row.identity != gpu || (row.owner != PhysicalMemoryOwner::ImmutableTableStorage &&
                         row.owner != PhysicalMemoryOwner::ImmutableLookupStaging)) continue;
-                    EXPECT_EQ(row.materialized_new_bytes + row.adopted_resident_bytes, 0u);
+                    EXPECT_EQ(row.materialized_new_bytes + row.adopted_resident_bytes,
+                        qwen4ExpSourceLocalHotLeaseBytes(*context,gpu,row.owner));
                 }
             } else {
                 // A continuation reader may own real evictable row slots, but
@@ -362,9 +508,9 @@ inline void expectQwen4ExpSourceGPUAdaptiveConsumer(const ModelParityCase &cell,
                 EXPECT_EQ(actual.allocator(), gpu);
                 EXPECT_EQ(actual.tableStorageBytes(), geometry.gpuCacheBytes(gpu));
                 EXPECT_EQ(actual.lookupStagingBytes(), geometry.mandatoryDeviceBytes(gpu));
-                ASSERT_NO_FATAL_FAILURE(expectQwen4ExpSourceLease(*memory, gpu,
+                ASSERT_NO_FATAL_FAILURE(expect_original_lease(*memory, gpu,
                     PhysicalMemoryOwner::ImmutableTableStorage, actual.tableStorageBytes()));
-                ASSERT_NO_FATAL_FAILURE(expectQwen4ExpSourceLease(*memory, gpu,
+                ASSERT_NO_FATAL_FAILURE(expect_original_lease(*memory, gpu,
                     PhysicalMemoryOwner::ImmutableLookupStaging, actual.lookupStagingBytes()));
                 EXPECT_TRUE(participants->hasEmbeddedParticipant(gpu.device));
             }
@@ -399,7 +545,7 @@ inline void expectQwen4ExpSourceGPUAdaptiveConsumer(const ModelParityCase &cell,
     EXPECT_EQ(context->residentImmutableRowTable(gpu.device),nullptr);
     EXPECT_EQ(context->residentImmutableRowTableBytes(gpu.device),0u);
     const auto geometry=grouped ? AdaptiveImmutableLookupGeometry::forRequester(layout,provider->source(),request,gpu)
-        : AdaptiveImmutableLookupGeometry::fromLayout(layout,provider->source(),request);
+        : AdaptiveImmutableLookupGeometry::fromLayoutWithLocalHot(layout,provider->source(),request,placement->gpuAdaptiveLocalHotCaches());
     const auto ram_slots=geometry.host().slots();EXPECT_LE(ram_slots,request.host.maximum_cache_rows);
     const auto setup=context->immutableLookupSetupObservation();
     ASSERT_NE(setup,nullptr) << "Ready source requires original immutable admitted-capacity evidence";
@@ -545,19 +691,19 @@ inline void expectQwen4ExpSourceGPUAdaptiveConsumer(const ModelParityCase &cell,
         EXPECT_EQ(actual.authority(),original_memory);EXPECT_EQ(actual.allocator(),endpoint);
         EXPECT_EQ(actual.tableStorageBytes(),geometry.gpuCacheBytes(endpoint));
         EXPECT_EQ(actual.lookupStagingBytes(),geometry.mandatoryDeviceBytes(endpoint));
-        ASSERT_NO_FATAL_FAILURE(expectQwen4ExpSourceLease(*original_memory,endpoint,
+        ASSERT_NO_FATAL_FAILURE(expect_original_lease(*original_memory,endpoint,
             PhysicalMemoryOwner::ImmutableTableStorage,actual.tableStorageBytes()));
-        ASSERT_NO_FATAL_FAILURE(expectQwen4ExpSourceLease(*original_memory,endpoint,
+        ASSERT_NO_FATAL_FAILURE(expect_original_lease(*original_memory,endpoint,
             PhysicalMemoryOwner::ImmutableLookupStaging,actual.lookupStagingBytes()));
     }
     EXPECT_LE(geometry.host().storageBytes(),request.host.cache_physical_byte_limit);
-    ASSERT_NO_FATAL_FAILURE(expectQwen4ExpSourceLease(*memory, gpu,
+    ASSERT_NO_FATAL_FAILURE(expect_original_lease(*memory, gpu,
         PhysicalMemoryOwner::ImmutableTableStorage, gpu_owner.tableStorageBytes()));
-    ASSERT_NO_FATAL_FAILURE(expectQwen4ExpSourceLease(*memory, gpu,
+    ASSERT_NO_FATAL_FAILURE(expect_original_lease(*memory, gpu,
         PhysicalMemoryOwner::ImmutableLookupStaging, gpu_owner.lookupStagingBytes()));
-    ASSERT_NO_FATAL_FAILURE(expectQwen4ExpSourceLease(*memory, host,
+    ASSERT_NO_FATAL_FAILURE(expect_original_lease(*memory, host,
         PhysicalMemoryOwner::ImmutableTableStorage, source_owner.tableStorageBytes()));
-    ASSERT_NO_FATAL_FAILURE(expectQwen4ExpSourceLease(*memory, host,
+    ASSERT_NO_FATAL_FAILURE(expect_original_lease(*memory, host,
         PhysicalMemoryOwner::ImmutableLookupStaging, source_owner.lookupStagingBytes()));
 }
 
@@ -571,6 +717,7 @@ inline void expectQwen4ExpSourceGPUAdaptiveOwners(const ModelParityCase &cell, I
     ASSERT_TRUE(placement);
     for(const auto consumer:placement->gpuAdaptiveLayout().consumers())
         ASSERT_NO_FATAL_FAILURE(expectQwen4ExpSourceGPUAdaptiveConsumer(cell,runner,original,consumer));
+    ASSERT_NO_FATAL_FAILURE(expectQwen4ExpSourceLocalHotOwners(original));
 }
 
 /**
@@ -1247,6 +1394,21 @@ inline void admitQwen4ExpSource(const ModelParityCase &cell,
         reuse->physical_memory_authority->rankAttestation(), reuse->prepared_routed_weight_plan, placement->allocators()));
     memory.flush();
     ASSERT_TRUE(memory.good());
+    // The original rank owns each allocator exactly once. Keep resource totals
+    // separate from per-owner rows; included preparation/SDK detail is not an
+    // additional physical allocation or a remote materialization observation.
+    std::ofstream resource_cost(output / "admitted-resources.csv");
+    std::ofstream owner_cost(output / "admitted-owners.csv");
+    std::string source_identity;
+    for (const auto& path : model->artifactPaths()) {
+        if (!source_identity.empty()) source_identity += '\n';
+        source_identity += path;
+    }
+    ASSERT_NO_THROW(::llaminar2::test::writeFinalPhysicalMemoryCostCSV(
+        resource_cost, owner_cost, *reuse->physical_memory_authority,
+        {cell.topology.test_id, source_identity, cell.testName()}));
+    resource_cost.flush(); owner_cost.flush();
+    ASSERT_TRUE(resource_cost.good()); ASSERT_TRUE(owner_cost.good());
     std::ofstream csv(output / "admission.csv");
     ASSERT_TRUE(csv.is_open());
     const bool joint_follower=cell.topology.expert_overlay_plan &&
@@ -1260,7 +1422,7 @@ inline void admitQwen4ExpSource(const ModelParityCase &cell,
     // Inspection is additional evidence. A failed callback cannot bypass the
     // original recreation, source-owner verification or final retirement path.
     if (inspect) EXPECT_NO_THROW(inspect(*runner, Qwen4ExpSourceInspectionPhase::Original, output));
-    const bool original_recreation = qwen4ExpSourceReusesSharedContinuationOwners(placement.get()) || !old_expert_parents.empty();
+    const bool original_recreation = qwen4ExpSourceReusesContinuationOwners(placement.get()) || !old_expert_parents.empty();
     if (recreation == Qwen4ExpSourceRecreationProof::Required)
         ASSERT_TRUE(original_recreation) << "This source candidate requires original cold recreation/retirement";
     if (original_recreation) {
@@ -1268,10 +1430,26 @@ inline void admitQwen4ExpSource(const ModelParityCase &cell,
         // itself prevent the runner-bound participant authority from dying.
         using Participants = ::llaminar2::qwen4exp::PooledImmutableRetainedParticipants;
         std::vector<std::weak_ptr<Participants>> old;
+        std::vector<bool> participant_required;
         std::vector<std::shared_ptr<::llaminar2::qwen4exp::ImmutableLookupExecutionBoundary>> boundaries;
         for (const auto consumer : placement->consumers()) {
-            old.emplace_back(model->adaptiveImmutableLookupParticipants(consumer.device));
-            boundaries.push_back(model->adaptiveImmutableLookupBoundary(consumer.device));
+            const auto participants=model->adaptiveImmutableLookupParticipants(consumer.device);
+            const auto boundary=model->adaptiveImmutableLookupBoundary(consumer.device);
+            bool required=true; // A query-only reader borrows its original source's retained program.
+            if(boundary) {
+                ASSERT_TRUE(boundary->isPooled());
+                const auto storage=boundary->pooledStorage();ASSERT_TRUE(storage);
+                required=bool(model->adaptiveImmutableLookupLocalHot(consumer.device)) ||
+                    ::llaminar2::qwen4exp::PooledImmutableParticipantExecutionPolicy::requiresRetainedParticipants(storage->geometry());
+            }
+            // ConsumerLocal's original singleton source needs no remote/reader
+            // program. Preserve that absence rather than fabricate an owner;
+            // local-hot, remote-owner and query-only reader roles still require it.
+            ASSERT_EQ(bool(participants),required);
+            if(participants)ASSERT_NO_THROW(participants->requireCurrent());
+            old.emplace_back(participants);
+            participant_required.push_back(required);
+            boundaries.push_back(boundary);
         }
         const auto source = model->nativeContextPreparation();
         const auto setup = model->immutableLookupSetupObservation();
@@ -1293,8 +1471,11 @@ inline void admitQwen4ExpSource(const ModelParityCase &cell,
         std::size_t coordinate = 0;
         for (const auto consumer : placement->consumers()) {
             const auto current = model->adaptiveImmutableLookupParticipants(consumer.device);
-            ASSERT_NE(current, nullptr);ASSERT_NO_THROW(current->requireCurrent());
-            EXPECT_TRUE(old[coordinate].owner_before(current) || current.owner_before(old[coordinate]));
+            ASSERT_EQ(bool(current),participant_required[coordinate]);
+            if(current) {
+                ASSERT_NO_THROW(current->requireCurrent());
+                EXPECT_TRUE(old[coordinate].owner_before(current) || current.owner_before(old[coordinate]));
+            }
             EXPECT_EQ(model->adaptiveImmutableLookupBoundary(consumer.device), boundaries[coordinate]);
             ++coordinate;
         }

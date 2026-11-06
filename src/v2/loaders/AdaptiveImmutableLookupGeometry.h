@@ -19,6 +19,8 @@
 #include "execution/qwen4exp/ImmutableLookupService.h"
 #include "execution/qwen4exp/ImmutableLookupServiceGeometry.h"
 #include "execution/qwen4exp/PooledImmutableReplicatedReaderGeometry.h"
+#include "execution/qwen4exp/PooledImmutableLocalHotTransportGeometry.h"
+#include "kernels/qwen4exp/PooledImmutableLocalHotGeometry.h"
 #include <optional>
 #include <algorithm>
 #include <array>
@@ -49,6 +51,75 @@ public:
         const ImmutableRowTableLayoutGeometry& layout, const ImmutableRowTableSource& source,
         const AdaptiveVRAMRAMSSDRequest& request)
     {
+        return fromLayoutWithLocalHot(layout, source, request, {});
+    }
+
+    /**
+     * @brief Declare candidate local cache geometry over exact original consumers.
+     * @param layout Original shared placement, without changing its pool owners.
+     * @param source Original native format/row geometry.
+     * @param request Lossless local policy and overrides.
+     * @param slots Candidate/admitted local slots in original consumer order, not requested caps.
+     * @return Static byte declarations only, with no materialization permission.
+     * @throws std::exception For incomplete/foreign identity or unrepresentable geometry.
+     */
+    static std::vector<qwen4exp::PooledImmutableLocalHotGeometry> declareLocalHotCaches(
+        const ImmutableRowTableLayoutGeometry& layout, const ImmutableRowTableSource& source,
+        const AdaptiveVRAMRAMSSDRequest& request, std::span<const std::size_t> slots)
+    {
+        if (!request.local_hot_cache)
+        {
+            if (!slots.empty()) throw std::invalid_argument("Shared-only placement cannot declare local slots");
+            return {};
+        }
+        if (request.placement.mode != AdaptiveGPUCachePlacementMode::DeclaredRankLocal || slots.size() != layout.consumers().size())
+            throw std::invalid_argument("Local hot slots require every original shared compute reader");
+        std::vector<AdaptiveGPUCacheParticipant> consumers;
+        for (const auto id : layout.consumers()) consumers.push_back({id.world_rank,id.device.type,id.device.ordinal});
+        request.local_hot_cache->requireConsumers(consumers);
+        const auto& p = request.local_hot_cache->policy;
+        const qwen4exp::adaptive_lookup::Policy policy{p.aging_accesses,p.protected_numerator,p.protected_denominator};
+        std::vector<qwen4exp::PooledImmutableLocalHotGeometry> result;
+        result.reserve(slots.size());
+        for (std::size_t i = 0; i < slots.size(); ++i)
+        {
+            if (slots[i] > qwen4exp::adaptive_lookup::MaximumSlots || layout.maximumInflightRows() > qwen4exp::adaptive_lookup::MaximumSlots)
+                throw std::invalid_argument("Local hot geometry exceeds the original native index bound");
+            result.push_back(qwen4exp::PooledImmutableLocalHotGeometry::declare(source,layout.consumers()[i],
+                static_cast<std::uint32_t>(layout.maximumInflightRows()),static_cast<std::uint32_t>(slots[i]),policy));
+        }
+        return result;
+    }
+
+    /**
+     * @brief Price only an explicitly named cold mandatory local C0 floor.
+     * @param layout Original shared layout. @param source Original native source.
+     * @param request Original local/shared policy.
+     * @return Complete mandatory geometry; never an implicit runtime replacement for admitted local slots.
+     * @throws std::exception For invalid original declarations.
+     */
+    static AdaptiveImmutableLookupGeometry fromLayoutFloor(const ImmutableRowTableLayoutGeometry& layout,
+        const ImmutableRowTableSource& source, const AdaptiveVRAMRAMSSDRequest& request)
+    {
+        const std::vector<std::size_t> zero(request.local_hot_cache ? layout.consumers().size() : 0u,0u);
+        const auto local = declareLocalHotCaches(layout,source,request,zero);
+        return fromLayoutWithLocalHot(layout,source,request,local);
+    }
+
+    /**
+     * @brief Bind original admitted local cache declarations without selecting slots.
+     * @param layout Same original shared-pool/source placement.
+     * @param source Exact immutable native source geometry.
+     * @param request Same lossless shared/local intent.
+     * @param local_hot Exact actual-consumer order and already-admitted local geometries, including C0.
+     * @return One complete local/pool/source declaration, with no additional authority.
+     * @throws std::exception For absent/foreign local declarations or incompatible bounds.
+     */
+    static AdaptiveImmutableLookupGeometry fromLayoutWithLocalHot(
+        const ImmutableRowTableLayoutGeometry& layout, const ImmutableRowTableSource& source,
+        const AdaptiveVRAMRAMSSDRequest& request,
+        std::span<const qwen4exp::PooledImmutableLocalHotGeometry> local_hot)
+    {
         if (layout.consumers().empty())
             throw std::invalid_argument("Adaptive lookup requires original GPU consumers");
         if(request.placement.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal)
@@ -58,12 +129,12 @@ public:
             std::vector<PhysicalMemoryAllocatorIdentity> owners;
             for(const auto &owner:request.placement.owners)
                 owners.push_back({owner.participant.world_rank,owner.participant.device()});
-            return fromLayout(layout,source,request,owners);
+            return fromLayout(layout,source,request,owners,local_hot);
         }
         if(layout.consumers().size()!=1)
             throw std::invalid_argument("ConsumerLocal plural geometry requires exact per-requester projection");
         const std::array owners{layout.consumers().front()};
-        return fromLayout(layout, source, request, owners);
+        return fromLayout(layout, source, request, owners,local_hot);
     }
 
     /**
@@ -141,7 +212,8 @@ public:
     static AdaptiveImmutableLookupGeometry fromLayout(
         const ImmutableRowTableLayoutGeometry& layout, const ImmutableRowTableSource& source,
         const AdaptiveVRAMRAMSSDRequest& request,
-        std::span<const PhysicalMemoryAllocatorIdentity> ordered_owners)
+        std::span<const PhysicalMemoryAllocatorIdentity> ordered_owners,
+        std::span<const qwen4exp::PooledImmutableLocalHotGeometry> local_hot = {})
     {
         const auto source_layout=sourceLayout(layout,request);
         if (source_layout.consumers().size() != 1 || !source_layout.consumers().front().device.is_gpu() ||
@@ -155,8 +227,47 @@ public:
         const qwen4exp::adaptive_lookup::Policy policy{
             request.gpu_policy.aging_accesses, request.gpu_policy.protected_numerator,
             request.gpu_policy.protected_denominator};
+        std::optional<qwen4exp::PooledImmutableReplicatedReaderGeometry> readers;
+        if (layout.consumers().size() > 1)
+        {
+            if (source.row_elements > std::numeric_limits<std::uint32_t>::max())
+                throw std::overflow_error("Shared reader output width exceeds its original ABI");
+            readers = qwen4exp::PooledImmutableReplicatedReaderGeometry::native(requester, layout.consumers(),
+                static_cast<std::uint32_t>(layout.maximumInflightRows()), static_cast<std::uint32_t>(source.row_elements));
+        }
+        std::optional<qwen4exp::PooledImmutableLocalHotTransportGeometry> compact;
+        if (request.local_hot_cache)
+        {
+            if (request.placement.mode != AdaptiveGPUCachePlacementMode::DeclaredRankLocal ||
+                local_hot.size() != layout.consumers().size())
+                throw std::invalid_argument("Local hot geometry requires every original declared shared consumer, including C0");
+            std::vector<AdaptiveGPUCacheParticipant> consumers;
+            for (const auto consumer : layout.consumers())
+                consumers.push_back({consumer.world_rank, consumer.device.type, consumer.device.ordinal});
+            request.local_hot_cache->requireConsumers(consumers);
+            const auto& local_policy = request.local_hot_cache->policy;
+            const qwen4exp::adaptive_lookup::Policy policy{local_policy.aging_accesses,
+                local_policy.protected_numerator, local_policy.protected_denominator};
+            for (std::size_t i = 0; i < local_hot.size(); ++i)
+            {
+                const auto expected = qwen4exp::PooledImmutableLocalHotGeometry::declare(source,layout.consumers()[i],
+                    static_cast<std::uint32_t>(layout.maximumInflightRows()),local_hot[i].slots(),policy);
+                if (local_hot[i] != expected)
+                    throw std::invalid_argument("Local hot geometry changed its original consumer/source/query/policy identity");
+            }
+            compact = readers
+                ? qwen4exp::PooledImmutableLocalHotTransportGeometry::declare(*readers,layout.extent())
+                : qwen4exp::PooledImmutableLocalHotTransportGeometry::singleton(requester,
+                    static_cast<std::uint32_t>(layout.maximumInflightRows()),layout.extent());
+        }
+        else if (!local_hot.empty())
+            throw std::invalid_argument("Shared-only lookup cannot retain undeclared local hot geometry");
+        // N contains compact per-reader misses; U and CPU source work remain
+        // bounded by the one original replicated model query, never P*U.
+        const auto maximum_pool_original = compact ? compact->maximumPoolOriginalRows()
+            : static_cast<std::uint32_t>(layout.maximumInflightRows());
         const auto coordinator = qwen4exp::PooledImmutableCoordinatorGeometry::fromOwners(
-            physical, policy, static_cast<std::uint32_t>(layout.maximumInflightRows()));
+            physical, policy, maximum_pool_original);
         const auto host = CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPU(
             source_layout, layout.sourceServices().front().allocator, requester, request.host.policy);
 
@@ -172,7 +283,7 @@ public:
         const auto floor = qwen4exp::PooledImmutablePhysicalOwnerGeometry::fromLayout(
             zero, ordered_owners, requester);
         const auto floor_policy = qwen4exp::PooledImmutableCoordinatorGeometry::fromOwners(
-            floor, policy, static_cast<std::uint32_t>(layout.maximumInflightRows()));
+            floor, policy, maximum_pool_original);
         for (std::size_t owner = 0; owner < physical.owners().size(); ++owner)
             if (physical.owners()[owner].frame.bytes != floor.owners()[owner].frame.bytes)
                 throw std::logic_error("Adaptive fixed owner frame unexpectedly depends on optional slot capacity");
@@ -182,14 +293,8 @@ public:
         auto fixed_roots = NativeRoots::from(floor, floor_policy, source);
         if (actual_roots.source.native_bytes != fixed_roots.source.native_bytes)
             throw std::logic_error("Adaptive source metadata unexpectedly depends on optional slot capacity");
-        std::optional<qwen4exp::PooledImmutableReplicatedReaderGeometry> readers;
-        if(layout.consumers().size()>1){
-            if(source.row_elements>std::numeric_limits<std::uint32_t>::max())
-                throw std::overflow_error("Shared reader output width exceeds its original ABI");
-            readers=qwen4exp::PooledImmutableReplicatedReaderGeometry::native(requester,layout.consumers(),
-                static_cast<std::uint32_t>(layout.maximumInflightRows()),static_cast<std::uint32_t>(source.row_elements));
-        }
-        return {physical, coordinator, host, std::move(actual_roots), std::move(fixed_roots),std::move(readers)};
+        return {physical, coordinator, host, std::move(actual_roots), std::move(fixed_roots),
+            std::move(readers), {local_hot.begin(),local_hot.end()}, std::move(compact)};
     }
 
     /**
@@ -248,6 +353,10 @@ public:
 
     /** @return Optional exact result/ACK cohort; absence retains existing singleton semantics. */
     const std::optional<qwen4exp::PooledImmutableReplicatedReaderGeometry>& readerGeometry()const noexcept{return readers_;}
+    /** @return Exact admitted local roots, in original compute-reader order; empty in shared-only mode. */
+    std::span<const qwen4exp::PooledImmutableLocalHotGeometry> localHotCaches() const noexcept { return local_hot_; }
+    /** @return Compact native request/result transport replacing old FP32 reader channels when engaged. */
+    const std::optional<qwen4exp::PooledImmutableLocalHotTransportGeometry>& localHotTransport() const noexcept { return compact_; }
     /** @return Actual compute readers, independent of the single original CPU source channel. */
     std::uint32_t computeReaderCount()const noexcept{return readers_?static_cast<std::uint32_t>(readers_->consumers().size()):1u;}
 
@@ -258,7 +367,7 @@ public:
     /** @return Original bounded CPU RAM/SSD provider declaration, charged once. */
     const CpuAdaptiveImmutableRowCacheGeometry& host() const noexcept { return host_; }
     /** @return Complete ID envelope; runtime counts remain device-owned. */
-    std::uint32_t maximumIds() const noexcept { return coordinator_.parameters().maximumOriginal(); }
+    std::uint32_t maximumIds() const noexcept { return physical_.maximumUniqueRows(); }
     /** @return Exact subordinate source envelope, independent of storage-owner count. */
     qwen4exp::ImmutableLookupLayout channelLayout() const
     {
@@ -313,6 +422,42 @@ public:
                                    actual_.source.frame_bytes, actual_.source.native_bytes})
                 bytes = plus(bytes, size);
         return bytes;
+    }
+
+    /**
+     * @brief Project actual local mandatory categories independently of the shared source.
+     * @param devices Same complete original allocator observations.
+     * @param host Original CPU resource; its LookupStaging contribution names only LocalReady pages.
+     * @param projection Original installed or closed recorded event-resource origin.
+     * @return Separate local GPU frame/native and CPU ready-page BOM; opaque event category remains distinct.
+     * @throws std::exception For missing/foreign observations or unavailable native bounds.
+     */
+    PhysicalMemoryPlan localHotMandatoryBOM(std::span<const PhysicalMemoryResource> devices,
+        PhysicalMemoryResource host, const NativeOrderingEventBudgetProjection& projection) const
+    {
+        requireDevices(devices);
+        PhysicalMemoryPlanBuilder result;
+        for (const auto& local : local_hot_)
+            append(result,local.mandatoryBOM(resource(devices,local.allocator()),host,projection));
+        return result.build();
+    }
+
+    /**
+     * @brief Project only admitted local optional roots/event growth, independent of pool caps.
+     * @param devices Same complete original allocator observations.
+     * @param host Original CPU resource for setup events and bounded probe publication.
+     * @param projection Original installed or closed recorded native-resource origin.
+     * @return Exact per-consumer optional L1 BOM; absent local intent contributes nothing.
+     * @throws std::exception For missing/foreign resources or unavailable original bounds.
+     */
+    PhysicalMemoryPlan localHotSlotDependentBOM(std::span<const PhysicalMemoryResource> devices,
+        PhysicalMemoryResource host, const NativeOrderingEventBudgetProjection& projection) const
+    {
+        requireDevices(devices);
+        PhysicalMemoryPlanBuilder result;
+        for (const auto& local : local_hot_)
+            append(result,local.slotDependentBOM(resource(devices,local.allocator()),host,projection));
+        return result.build();
     }
 
     /** @return Existing one-GPU spelling of the exact mandatory root contributor. */
@@ -437,7 +582,9 @@ private:
             result.add(coordinator, PhysicalMemoryOwner::ImmutableLookupStaging, bytes);
         append(result, orderingBOM(devices,host,projection));
         append(result, host_.mandatoryBOM(host));
-        if(readers_)append(result,readers_->completeBOM(host,devices));
+        if (compact_) append(result, compact_->completeBOM(host,devices));
+        else if (readers_) append(result,readers_->completeBOM(host,devices));
+        append(result,localHotMandatoryBOM(devices,host,projection));
         result.add(host, PhysicalMemoryOwner::ImmutableLookupStaging,
                    qwen4exp::ImmutableLookupService::hostBytes(channelLayout()));
         return result.build();
@@ -451,6 +598,7 @@ private:
             result.add(device, PhysicalMemoryOwner::ImmutableLookupStaging,
                 nativeGrowth({device.world_rank, device.device}));
         append(result, orderingGrowthBOM(devices,host,projection));
+        append(result,localHotSlotDependentBOM(devices,host,projection));
         return result.build();
     }
     /**
@@ -520,9 +668,11 @@ private:
     AdaptiveImmutableLookupGeometry(qwen4exp::PooledImmutablePhysicalOwnerGeometry physical,
         qwen4exp::PooledImmutableCoordinatorGeometry coordinator, CpuAdaptiveImmutableRowCacheGeometry host,
         NativeRoots actual, NativeRoots floor,
-        std::optional<qwen4exp::PooledImmutableReplicatedReaderGeometry> readers={})
+        std::optional<qwen4exp::PooledImmutableReplicatedReaderGeometry> readers={},
+        std::vector<qwen4exp::PooledImmutableLocalHotGeometry> local_hot={},
+        std::optional<qwen4exp::PooledImmutableLocalHotTransportGeometry> compact={})
         : physical_(std::move(physical)), coordinator_(std::move(coordinator)), host_(std::move(host)),
-          actual_(std::move(actual)), floor_(std::move(floor)),readers_(std::move(readers)) {}
+          actual_(std::move(actual)), floor_(std::move(floor)),readers_(std::move(readers)),local_hot_(std::move(local_hot)),compact_(std::move(compact)) {}
     /** @return Checked extent sum, never available-memory arithmetic. */
     static std::size_t plus(std::size_t a, std::size_t b)
     {
@@ -605,5 +755,7 @@ private:
     CpuAdaptiveImmutableRowCacheGeometry host_;
     NativeRoots actual_, floor_;
     std::optional<qwen4exp::PooledImmutableReplicatedReaderGeometry> readers_;
+    std::vector<qwen4exp::PooledImmutableLocalHotGeometry> local_hot_;
+    std::optional<qwen4exp::PooledImmutableLocalHotTransportGeometry> compact_;
 };
 }

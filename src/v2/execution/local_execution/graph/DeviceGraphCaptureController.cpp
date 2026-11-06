@@ -978,6 +978,70 @@ namespace llaminar2
         }
 
         /**
+         * @brief Expose the current probe as a native parent fork frontier.
+         * @param graph Original participant graph and its declared finite body.
+         * @param segments Validated compiler units, before capture or input binding.
+         * @note This changes only graph-only compilation units. The complete
+         * parent still executes once; no new CPU ticket or submission is added.
+         * The auxiliary body may wait for a later LocalRead, so it must start
+         * after the probe without joining the probe unit's own terminal.
+         */
+        void exposeParticipantAuxiliaryProbeFrontier(
+            const ComputeGraph& graph,
+            std::vector<DeviceGraphExecutor::GraphSegment>& segments)
+        {
+            const auto& range=graph.retainedParticipantAuxiliaryRange();
+            if(!range)return;
+            std::size_t producer=segments.size(),consumer=segments.size(),offset=0;
+            bool sawRead=false;
+            for(std::size_t index=0;index<segments.size();++index) {
+                const auto& segment=segments[index];
+                for(std::size_t row=0;row<segment.stage_names.size();++row) {
+                    const auto& name=segment.stage_names[row];
+                    if(name==range->main_read) {
+                        if(producer==segments.size() || sawRead)
+                            throw std::logic_error("Participant LocalRead must follow its unique current probe");
+                        sawRead=true;consumer=index;
+                    }
+                    if(name!=range->probe_ready)continue;
+                    if(producer!=segments.size() || !segment.capturable)
+                        throw std::logic_error("Participant probe must belong to one captured main unit");
+                    producer=index;offset=row;
+                }
+            }
+            if(producer==segments.size() || !sawRead)
+                throw std::logic_error("Participant auxiliary lost its main probe/read frontier");
+            auto& unit=segments[producer];
+            const auto continuation_identity = [&]() -> std::string {
+                const auto& transaction=graph.nativeTransactionCaptureContract();
+                return transaction ? transaction->identity : "participant_auxiliary_continuation";
+            };
+            if(offset+1==unit.stage_names.size()) {
+                if(unit.capture_wave_identity.empty())
+                    unit.capture_wave_identity="participant_auxiliary_probe";
+                if(segments[consumer].capture_wave_identity.empty())
+                    segments[consumer].capture_wave_identity=continuation_identity();
+                return;
+            }
+            DeviceGraphExecutor::GraphSegment prefix;
+            prefix.capturable=true;
+            // Explicit semantic identity is shared across the participant
+            // domain. Never include a device, local pointer or stage spelling.
+            prefix.capture_wave_identity=unit.capture_wave_identity.empty()
+                ? "participant_auxiliary_probe"
+                : unit.capture_wave_identity+":participant_auxiliary_probe";
+            // The new continuation half is also a shared logical frontier.
+            // Leaving it implicit would derive the TP rendezvous from local
+            // source/reader stage names, even when the two programs agree.
+            // Existing ticket and whole-native transaction identities survive.
+            if(unit.capture_wave_identity.empty())
+                unit.capture_wave_identity=continuation_identity();
+            prefix.stage_names.assign(unit.stage_names.begin(),unit.stage_names.begin()+offset+1);
+            unit.stage_names.erase(unit.stage_names.begin(),unit.stage_names.begin()+offset+1);
+            segments.insert(segments.begin()+producer,std::move(prefix));
+        }
+
+        /**
          * @brief Materialize one frozen stage-order ledger before beginCapture().
          *
          * The production executor supplies arena-derived internal edges.  Pure
@@ -1711,6 +1775,12 @@ namespace llaminar2
         uint64_t h = kFnvOffset;
         bool has_variant = graph.readAheadCaptureIdentity()!=0;
         if(has_variant){h ^= graph.readAheadCaptureIdentity();h *= kFnvPrime;h ^= graph.topologyGeneration();h *= kFnvPrime;}
+        if(const auto& body=graph.retainedParticipantAuxiliaryRange()) {
+            has_variant=true;h^=body->identity;h*=kFnvPrime;
+            h^=static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(body->original_execution.get()));h*=kFnvPrime;
+            h^=static_cast<std::uint64_t>(body->role);h*=kFnvPrime;
+            h^=graph.topologyGeneration();h*=kFnvPrime;
+        }
         if(const auto participants=graph.retainedParticipantSourcePlan()){
             has_variant=true;
             h^=participants->captureIdentity();h*=kFnvPrime;
@@ -1937,7 +2007,12 @@ namespace llaminar2
         const bool retained_heterogeneous_follower =
             heterogeneous_ticket_follower && retained_parent_composition &&
             !concurrent_ticket_service;
-        if (device_owned_timeline_transaction &&
+        const bool native_auxiliary_parent = device_owned_timeline_transaction &&
+            graph.retainedParticipantAuxiliaryRange().has_value() &&
+            retained_parent_composition && !concurrent_ticket_service;
+        if (native_auxiliary_parent)
+            graph.requireRetainedParticipantNativeAuxiliaryParent();
+        if (device_owned_timeline_transaction && !native_auxiliary_parent &&
             plan_policy !=
                 DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph)
         {
@@ -1973,6 +2048,10 @@ namespace llaminar2
             return false;
         };
 
+        graph.requireRetainedParticipantAuxiliaryRange();
+        if(graph.retainedParticipantAuxiliaryRange() && !retained_parent_composition)
+            throw std::invalid_argument("Participant auxiliary body requires its complete retained native parent");
+
         bool current_capturable = false;
         bool first = true;
         bool force_new_segment = false;
@@ -1986,6 +2065,10 @@ namespace llaminar2
             {
                 continue;
             }
+
+            // A finite body is recorded separately and attached once to this
+            // same complete parent. Never replay it serially as a model unit.
+            if(graph.isRetainedParticipantAuxiliaryNode(name))continue;
 
             const auto *const wave_contract =
                 native_capture_envelope ==
@@ -2360,21 +2443,33 @@ namespace llaminar2
                 heterogeneous_ticket_authority);
         }
 
+        exposeParticipantAuxiliaryProbeFrontier(graph,segment_cache.segments);
+
         if (const auto &transaction = graph.nativeTransactionCaptureContract())
         {
-            if (requiresHeterogeneousTicketSegmentation(native_capture_envelope) ||
-                segment_cache.segments.size() != 1u || !segment_cache.segments.front().capturable ||
-                graph.terminalNode() != transaction->terminal_node ||
-                !graph.getNode(transaction->terminal_node) ||
-                std::find(segment_cache.segments.front().stage_names.begin(),
-                    segment_cache.segments.front().stage_names.end(),transaction->terminal_node) ==
-                    segment_cache.segments.front().stage_names.end() ||
-                (!segment_cache.segments.front().capture_wave_identity.empty() &&
-                 segment_cache.segments.front().capture_wave_identity != transaction->identity))
+            if (heterogeneous_ticket_transaction || segment_cache.segments.empty() ||
+                (!native_auxiliary_parent && segment_cache.segments.size() != 1u) ||
+                graph.terminalNode() != transaction->terminal_node || !graph.getNode(transaction->terminal_node) ||
+                std::find(segment_cache.segments.back().stage_names.begin(),
+                    segment_cache.segments.back().stage_names.end(), transaction->terminal_node) ==
+                    segment_cache.segments.back().stage_names.end())
                 throw std::logic_error("Whole native transaction capture rejected a conflicting or partial plan");
-            // This labels the one complete executable. Internal packet wave
-            // annotations remain ignored under DeviceOwnedTimelineTransaction.
-            segment_cache.segments.front().capture_wave_identity = transaction->identity;
+            for (auto& segment : segment_cache.segments)
+            {
+                if (!segment.capturable || (!native_auxiliary_parent && !segment.capture_wave_identity.empty() &&
+                    segment.capture_wave_identity != transaction->identity))
+                    throw std::logic_error("Whole native transaction capture rejected a manual or foreign child");
+                // These are graph-only compilation fragments, never independently
+                // replayable transactions. Final original-parent attachment and
+                // complete ordered coverage remain mandatory before instantiation.
+                if (!native_auxiliary_parent)
+                    segment.capture_wave_identity = transaction->identity;
+            }
+            // Probe-prefix identity is the existing participant rendezvous and
+            // must stay intact. The terminal fragment retains the original
+            // whole-transaction label; only their final parent is executable.
+            if (native_auxiliary_parent && segment_cache.segments.back().capture_wave_identity.empty())
+                segment_cache.segments.back().capture_wave_identity = transaction->identity;
         }
 
         if (retained_parent_composition)
@@ -2526,9 +2621,11 @@ namespace llaminar2
         }
 
         if (device_owned_timeline_transaction &&
-            (capturable_segments != 1u || manual_segments != 0u ||
-             segment_cache.segments.size() != 1u ||
-             !segment_cache.segments.front().passive_capture_waves_after.empty()))
+            (manual_segments != 0u || capturable_segments == 0u ||
+             capturable_segments != segment_cache.segments.size() ||
+             (!native_auxiliary_parent && segment_cache.segments.size() != 1u) ||
+             std::any_of(segment_cache.segments.begin(), segment_cache.segments.end(),
+                 [](const auto& segment) { return !segment.passive_capture_waves_after.empty(); })))
         {
             std::ostringstream diagnostic;
             diagnostic

@@ -10685,14 +10685,17 @@ namespace llaminar2
 
         if (shouldUseGroupedVerifierPrefillRoute())
         {
+            // Cold preparation owns fixed launch metadata only. The retained
+            // verifier's controller has not published a live row count yet
+            // (and its reused allocation may contain arbitrary prior bytes).
+            // Captured tryGroupedVerifierPrefill() republishes this metadata
+            // from the device-owned count before performing any model math.
             if (!ensureSharedGroupedGateUpDescriptorTable(
                     kernel, params_.d_model, params_.intermediate) ||
                 !ensureSharedGroupedDownDescriptorTable(
                     kernel, params_.d_model, params_.intermediate) ||
                 !kernel->prepareSharedExpertPrefillGroup(
-                    params_.active_row_count_device
-                        ? DeviceRowRange::deviceCounted(params_.seq_len, params_.active_row_count_device)
-                        : DeviceRowRange::fullyActive(params_.seq_len)))
+                    DeviceRowRange::fullyActive(params_.seq_len)))
             {
                 LOG_ERROR("[SharedExpertFFNStage] Failed to prepare the fixed "
                           "grouped verifier launch state before graph capture");

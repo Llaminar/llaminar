@@ -1902,6 +1902,8 @@ namespace llaminar2
         fragment_nodes_ = std::move(other.fragment_nodes_);
         other.stream_ = nullptr;
         other.device_ordinal_ = -1;
+        definition_scope_=std::move(other.definition_scope_);
+        fragment_frontiers_=std::move(other.fragment_frontiers_);
         other.graph_ = nullptr;
         other.exec_ = nullptr;
         other.node_count_ = 0;
@@ -1941,6 +1943,8 @@ namespace llaminar2
             fragment_nodes_ = std::move(other.fragment_nodes_);
             other.stream_ = nullptr;
             other.device_ordinal_ = -1;
+            definition_scope_=std::move(other.definition_scope_);
+            fragment_frontiers_=std::move(other.fragment_frontiers_);
             other.graph_ = nullptr;
             other.exec_ = nullptr;
             other.node_count_ = 0;
@@ -1976,6 +1980,8 @@ namespace llaminar2
 
     bool CUDAGraphCapture::beginCapture()
     {
+        definition_scope_.reset();
+        fragment_frontiers_.clear();
         if (!activateOwner("beginCapture"))
             return false;
         if (recording_role_ == RecordingRole::Fragment && !timeline_recording_)
@@ -2546,6 +2552,8 @@ namespace llaminar2
         if (timeline_recording_ &&
             recorded_fragments.size() != timeline_recording_->fragment_count)
             return false;
+        definition_scope_.reset();
+        fragment_frontiers_.clear();
         if (!timeline_recording_)
             reset();
         cudaError_t runtime_error = timeline_recording_ ? cudaSuccess :
@@ -2667,6 +2675,8 @@ namespace llaminar2
                 }
                 tail = node;
                 }
+                fragment_frontiers_.remember(fragments[index],fragments[index]->definitionScope(),
+                    fragments[index]->graph(),fragments[index]->nodeCount(),std::span<const cudaGraphNode_t>(&tail,1));
             }
             else
             {
@@ -2755,6 +2765,40 @@ namespace llaminar2
             /** @brief Join the bounded worker and the inference-owned Close. */
             static Error empty(Node *n, Graph g, const Node *d, std::size_t s) { return cudaGraphAddEmptyNode(n, g, d, s); }
         };
+    }
+
+    bool CUDAGraphCapture::appendFiniteBodyAfterCapturedFragment(
+        const IGPUGraphCapture& producer,const IGPUGraphCapture& body)
+    {
+        if(!activateOwner("appendFiniteBodyAfterCapturedFragment") || !graph_ || exec_ ||
+           !node_count_ || native_capture_active_ || recording_role_!=RecordingRole::Owner)return false;
+        const auto* original=dynamic_cast<const CUDAGraphCapture*>(&producer);
+        const auto* auxiliary=dynamic_cast<const CUDAGraphCapture*>(&body);
+        if(!original || !auxiliary || original==this || auxiliary==this || original==auxiliary ||
+           original->deviceOrdinal()!=device_ordinal_ || auxiliary->deviceOrdinal()!=device_ordinal_ ||
+           original->projection_owner_!=projection_owner_ || auxiliary->projection_owner_!=projection_owner_ ||
+           !original->graph() || !auxiliary->graph() || auxiliary->graph()==graph_ ||
+           !original->nodeCount() || !auxiliary->nodeCount() ||
+           original->hasExecutable() || auxiliary->hasExecutable() ||
+           original->native_capture_active_ || auxiliary->native_capture_active_ || auxiliary->recording_role_!=RecordingRole::Owner)return false;
+        const auto frontier=fragment_frontiers_.require(original,original->definition_scope_,original->graph(),original->nodeCount());
+        if(frontier.empty() || fragment_frontiers_.alreadyAttached(auxiliary,auxiliary->definitionScope(),auxiliary->graph()))
+            return false;
+        // The auxiliary waits only for its producing main unit. It is another
+        // final-parent terminal: joining it to the producer exit would prevent
+        // a later main LocalRead unit from releasing its maintenance wait.
+        const auto result=detail::appendNativeFiniteBodyAfterFrontier<CUDAParallelGraphAPI>(graph_,auxiliary->graph(),frontier);
+        if(result.error!=cudaSuccess){
+            LOG_ERROR("[CUDAGraphCapture] Finite producer attachment failed operation="<<result.operation
+                      <<" error="<<cudaGetErrorString(result.error));
+            return false;
+        }
+        definition_scope_.reset();
+        fragment_frontiers_.attached(auxiliary,auxiliary->definitionScope(),auxiliary->graph());
+        std::size_t count=0;
+        if(cudaGraphGetNodes(graph_,nullptr,&count)!=cudaSuccess)return false;
+        node_count_=count;
+        return true;
     }
 
     bool CUDAGraphCapture::appendFiniteBodySiblings(std::span<const IGPUGraphCapture* const> originals)
@@ -3776,6 +3820,8 @@ namespace llaminar2
      */
     void CUDAGraphCapture::reset()
     {
+        definition_scope_.reset();
+        fragment_frontiers_.clear();
         if (native_capture_active_)
         {
             // Invalidated capture still must leave native capture before its

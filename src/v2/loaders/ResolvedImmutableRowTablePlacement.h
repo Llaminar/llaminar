@@ -16,6 +16,7 @@
 #include "ImmutableRowTableSourceRange.h"
 #include "ImmutableRowAllocatorInventory.h"
 #include "CpuImmutableRowCachePolicy.h"
+#include "kernels/qwen4exp/PooledImmutableLocalHotGeometry.h"
 #include <span>
 #include <variant>
 namespace llaminar2 {
@@ -39,7 +40,9 @@ public:
     const ImmutableRowTableHostPlacement &hostPlacement() const;
     /** @return Exact original unchanged native extent. */
     const ImmutableRowTableExtent &extent() const noexcept;
-    /** @return Exact physical owners, including the one host source/cache owner. */
+    /** @return Original shared-source/pool storage role inventory, including the host source.
+     * Participant-local hot consumers are separately exposed by gpuAdaptiveLocalHotCaches();
+     * they must never be reclassified as shared pool owners through this projection. */
     ImmutableRowAllocatorInventory allocators() const noexcept;
     /** @return Actual PLE consumers; expert-only participants are excluded. */
     std::span<const PhysicalMemoryAllocatorIdentity> consumers() const noexcept;
@@ -49,7 +52,8 @@ public:
     ImmutableRowLookupExecution lookupForConsumer(PhysicalMemoryAllocatorIdentity identity) const;
     /** @return Exact owning rank. */
     int worldRank() const noexcept { return allocators().front().world_rank; }
-    /** @return Whether the identity names an actual admitted physical owner. */
+    /** @return Whether the identity belongs to the original source/shared-pool storage role.
+     * Local hot ownership is authenticated through gpuAdaptiveLocalHotCaches(), not this predicate. */
     bool containsAllocator(PhysicalMemoryAllocatorIdentity identity) const noexcept;
     /** @return One authoritative checked adaptive layout, including final slots; whole-tier rejects. */
     const ImmutableRowTableLayoutGeometry &hostAdaptiveLayout() const;
@@ -65,6 +69,8 @@ public:
     const ImmutableRowTableLayoutGeometry &gpuAdaptiveLayout() const;
     /** @return Exact original GPU/CPU slot and byte ceilings and replacement policies. */
     const AdaptiveVRAMRAMSSDRequest &gpuAdaptiveRequest() const;
+    /** @return Same admitted local consumer geometry, including explicit C0; non-GPU adaptive arms reject. */
+    std::span<const qwen4exp::PooledImmutableLocalHotGeometry> gpuAdaptiveLocalHotCaches() const;
     /** @brief Resolve the actual source worker label after authenticating consumer membership. */
     DeviceId lookupIOConsumer(DeviceId requester) const;
     /** @return Exact original native row element count, not inferred from byte capacity. */
@@ -108,6 +114,7 @@ private:
         ImmutableRowTableLayoutGeometry layout;
         AdaptiveVRAMRAMSSDRequest request;
         std::uint64_t row_elements; ///< Original source metadata absent from generic byte extent.
+        std::vector<qwen4exp::PooledImmutableLocalHotGeometry> local_hot; ///< Immutable admitted bytes/identities, never live residency.
         bool operator==(const GPUAdaptive &) const = default;
     };
     /** @brief Exactly one existing checked layout owns all fixed range/storage metadata. */
@@ -125,7 +132,8 @@ private:
     ResolvedImmutableRowTablePlacement(ImmutableRowTableLayoutGeometry layout, HostAdaptiveRAMSSDRequest requested);
     /** @brief Seal mixed geometry after canonical complete final admission. */
     ResolvedImmutableRowTablePlacement(ImmutableRowTableLayoutGeometry layout,AdaptiveVRAMRAMSSDRequest requested,
-        std::uint64_t row_elements);
+        std::uint64_t row_elements,
+        std::vector<qwen4exp::PooledImmutableLocalHotGeometry> local_hot = {});
     /** @brief Require exact membership before projecting either alternative. */
     void requireConsumer(PhysicalMemoryAllocatorIdentity identity) const;
     std::variant<WholeTier,HostAdaptive,FixedHeadShards,GPUAdaptive> value_;

@@ -66,8 +66,9 @@ ResolvedImmutableRowTablePlacement::ResolvedImmutableRowTablePlacement(
         throw std::invalid_argument("Resolved adaptive storage exceeds its original requested row/physical-byte ceiling");
 }
 ResolvedImmutableRowTablePlacement::ResolvedImmutableRowTablePlacement(ImmutableRowTableLayoutGeometry layout,
-    AdaptiveVRAMRAMSSDRequest requested,std::uint64_t row_elements)
-    :value_(GPUAdaptive{std::move(layout),requested,row_elements})
+    AdaptiveVRAMRAMSSDRequest requested,std::uint64_t row_elements,
+    std::vector<qwen4exp::PooledImmutableLocalHotGeometry> local_hot)
+    :value_(GPUAdaptive{std::move(layout),requested,row_elements,std::move(local_hot)})
 {
     const auto &g=gpuAdaptiveLayout();
     const bool independent = g.adaptiveGPUDomain() == ImmutableRowTableAdaptiveGPUDomain::ConsumerLocal;
@@ -99,8 +100,22 @@ ResolvedImmutableRowTablePlacement::ResolvedImmutableRowTablePlacement(Immutable
     if (independent) {
         for (const auto requester : g.consumers())
             validate(AdaptiveImmutableLookupGeometry::forRequester(g,source,requested,requester));
-    } else validate(AdaptiveImmutableLookupGeometry::fromLayout(g,source,requested));
+    } else validate(AdaptiveImmutableLookupGeometry::fromLayoutWithLocalHot(g,source,requested,gpuAdaptiveLocalHotCaches()));
+    for (const auto& local : gpuAdaptiveLocalHotCaches())
+    {
+        const auto id = local.allocator();
+        const auto limits = requested.local_hot_cache->ceilingsFor({id.world_rank,id.device.type,id.device.ordinal});
+        if (local.slots() > limits.maximum_cache_rows || local.physicalBytes() > limits.cache_physical_byte_limit)
+            throw std::invalid_argument("Resolved local hot cache exceeds its own original slot/physical-byte ceiling");
+    }
 }
+std::span<const qwen4exp::PooledImmutableLocalHotGeometry>
+ResolvedImmutableRowTablePlacement::gpuAdaptiveLocalHotCaches() const
+{
+    if (!isGPUAdaptive()) throw std::logic_error("Local hot geometry requires its original GPU adaptive placement");
+    return std::get<GPUAdaptive>(value_).local_hot;
+}
+
 ResolvedImmutableRowTablePlacement::ResolvedImmutableRowTablePlacement(ImmutableRowTableLayoutGeometry layout)
     :value_(FixedHeadShards{std::move(layout)})
 {
@@ -152,6 +167,8 @@ ImmutableRowAllocatorInventory ResolvedImmutableRowTablePlacement::allocators() 
     // This component admits owner==consumer. The layout's existing consumer
     // inventory is the immutable identity view, not another stored owner map.
     if(const auto *f=std::get_if<FixedHeadShards>(&value_))return {f->layout.consumers()};
+    // Preserve the existing pool role. A reader's local cache is a distinct
+    // admitted component, not another owner of the shared directory.
     if(const auto *a=std::get_if<GPUAdaptive>(&value_))
         return ImmutableRowAllocatorInventory(std::span<const ImmutableRowTableLayoutOwner>{a->layout.owners()});
     return {{&std::get<HostAdaptive>(value_).layout.sourceServices().front().allocator,1}};

@@ -57,6 +57,7 @@ struct ActivationGraphMemoryGeometry
     qwen4exp::QwenSparseAttentionPhaseSchedule attention_phase_schedule = qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform; ///< Same frozen scalar as actual graph dimensions.
     MTPShiftedKVHeadLayout mtp_shifted_kv_head_layout = MTPShiftedKVHeadLayout::PrimaryTensorParallelShard;
         ///< Existing predictor ownership also determines its retained Q/K/V and FFN arena widths.
+    bool local_hot_terminal_observation = false; ///< Original combined policy admits one separate terminal-only arena root.
 };
 
 /** @brief Sizes stable activation owners used by captured inference graphs. */

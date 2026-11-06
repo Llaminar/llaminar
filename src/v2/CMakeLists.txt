@@ -2640,6 +2640,22 @@ target_sources(llaminar2_core PRIVATE kernels/qwen4exp/PooledImmutablePhysicalOw
 
 # One source-owned shared policy/coalescing protocol; no serving selector or native transport.
 target_sources(llaminar2_core PRIVATE kernels/qwen4exp/PooledImmutableCoordinatorGeometry.cpp)
+target_sources(llaminar2_core PRIVATE kernels/qwen4exp/PooledImmutableLocalHotGeometry.cpp)
+
+# Original-source local hot roots and checked stateless native phase adapters.
+target_sources(llaminar2_core PRIVATE
+    kernels/qwen4exp/PooledImmutableLocalHotNativePlan.cpp
+    kernels/qwen4exp/PooledImmutableLocalHotPreparedStorage.cpp
+    kernels/qwen4exp/PooledImmutableLocalHotOperands.cpp
+    kernels/qwen4exp/PooledImmutableLocalHotKernels.cpp)
+if(TARGET cuda_backend)
+    target_sources(cuda_backend PRIVATE kernels/cuda/qwen4exp/CUDAPooledImmutableLocalHotKernels.cu)
+endif()
+if(TARGET rocm_backend)
+    set_source_files_properties(kernels/rocm/qwen4exp/ROCmPooledImmutableLocalHotKernels.hip PROPERTIES LANGUAGE HIP)
+    target_sources(rocm_backend PRIVATE kernels/rocm/qwen4exp/ROCmPooledImmutableLocalHotKernels.hip)
+endif()
+
 
 # Native pooled phases remain participant-local prerequisites; this adds no serving mode.
 target_sources(llaminar2_core PRIVATE
@@ -2648,6 +2664,8 @@ target_sources(llaminar2_core PRIVATE
     kernels/qwen4exp/PooledImmutableNativeOperands.cpp
     kernels/qwen4exp/PooledImmutableNativeKernels.cpp
     execution/compute_stages/stages/qwen4exp/PooledImmutableNativePhaseStage.cpp)
+target_sources(llaminar2_core PRIVATE
+    execution/compute_stages/stages/qwen4exp/PooledImmutableLocalHotPhaseStage.cpp)
 if(HAVE_CUDA)
     target_sources(cuda_backend PRIVATE kernels/cuda/qwen4exp/CUDAPooledImmutableNativeKernels.cu)
 endif()
@@ -2659,10 +2677,12 @@ endif()
 # Real pooled source storage stays in the existing retained service/boundary ownership.
 target_sources(llaminar2_core PRIVATE
     kernels/qwen4exp/PooledImmutableSourceGeometry.cpp
+    kernels/qwen4exp/PooledImmutableLocalHotReadyRoot.cpp
     kernels/qwen4exp/PooledImmutableSourcePreparedStorage.cpp
     kernels/qwen4exp/PooledImmutableSourceKernels.cpp
     execution/compute_stages/stages/qwen4exp/PooledImmutableSourcePhaseStage.cpp
     execution/qwen4exp/PooledImmutableLocalLookupGraph.cpp
+    execution/qwen4exp/PooledImmutableLocalHotGraph.cpp
     execution/qwen4exp/PooledImmutableParticipantPinGraph.cpp
     execution/qwen4exp/PooledImmutableDirectedTransport.cpp
     execution/qwen4exp/PooledImmutableNativeTransfer.cpp

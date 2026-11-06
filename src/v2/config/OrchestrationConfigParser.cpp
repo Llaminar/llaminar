@@ -649,6 +649,36 @@ namespace llaminar2
                 config.ngram_table_policy.host_adaptive.policy.protected_numerator = parseNonNegativeUint32Value(value, "ngram.protected_numerator");
             else if (key == "protected_denominator")
                 config.ngram_table_policy.host_adaptive.policy.protected_denominator = parseNonNegativeUint32Value(value, "ngram.protected_denominator");
+            else if (key == "local_cache_max_rows")
+            {
+                auto& local = config.ngram_table_policy.gpu_adaptive.local_hot_cache;
+                if (!local) local.emplace();
+                local->maximum_cache_rows = parseNonNegativeSizeTValue(value, "ngram.local_cache_max_rows");
+            }
+            else if (key == "local_cache_bytes")
+            {
+                auto& local = config.ngram_table_policy.gpu_adaptive.local_hot_cache;
+                if (!local) local.emplace();
+                local->cache_physical_byte_limit = parseNonNegativeSizeTValue(value, "ngram.local_cache_bytes");
+            }
+            else if (key == "local_cache_aging_accesses")
+            {
+                auto& local = config.ngram_table_policy.gpu_adaptive.local_hot_cache;
+                if (!local) local.emplace();
+                local->policy.aging_accesses = parseNonNegativeSizeTValue(value, "ngram.local_cache_aging_accesses");
+            }
+            else if (key == "local_cache_protected_numerator")
+            {
+                auto& local = config.ngram_table_policy.gpu_adaptive.local_hot_cache;
+                if (!local) local.emplace();
+                local->policy.protected_numerator = parseNonNegativeUint32Value(value, "ngram.local_cache_protected_numerator");
+            }
+            else if (key == "local_cache_protected_denominator")
+            {
+                auto& local = config.ngram_table_policy.gpu_adaptive.local_hot_cache;
+                if (!local) local.emplace();
+                local->policy.protected_denominator = parseNonNegativeUint32Value(value, "ngram.local_cache_protected_denominator");
+            }
             else if (key == "gpu_cache_placement")
                 config.ngram_table_policy.gpu_adaptive.placement = parseAdaptiveGPUCachePlacement(value);
             else if (key == "gpu_cache_max_rows")
@@ -2586,6 +2616,61 @@ namespace llaminar2
 
         // Disjoint fields are independent of option order. Existing host-only
         // --ngram-cache-* never writes the subordinate GPU source arm.
+        spec.add({
+            .long_name = "--ngram-local-cache-max-rows",
+            .category = "Ngram Storage", .value_label = "<count>",
+            .description = "Maximum per-consumer local native hot rows before the declared shared GPU pool; zero explicitly selects combined C0",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value) {
+                    auto& local = c.ngram_table_policy.gpu_adaptive.local_hot_cache;
+                    if (!local) local.emplace();
+                    local->maximum_cache_rows = parseNonNegativeSizeTValue(value, "--ngram-local-cache-max-rows");
+                }),
+        });
+        spec.add({
+            .long_name = "--ngram-local-cache-bytes",
+            .category = "Ngram Storage", .value_label = "<count>",
+            .description = "Per-consumer local hot payload plus metadata byte ceiling, below frozen model/expert/KV obligations",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value) {
+                    auto& local = c.ngram_table_policy.gpu_adaptive.local_hot_cache;
+                    if (!local) local.emplace();
+                    local->cache_physical_byte_limit = parseNonNegativeSizeTValue(value, "--ngram-local-cache-bytes");
+                }),
+        });
+        spec.add({
+            .long_name = "--ngram-local-cache-aging-accesses",
+            .category = "Ngram Storage", .value_label = "<count>",
+            .description = "Local hot cache logical-frequency aging interval",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value) {
+                    auto& local = c.ngram_table_policy.gpu_adaptive.local_hot_cache;
+                    if (!local) local.emplace();
+                    local->policy.aging_accesses = parseNonNegativeSizeTValue(value, "--ngram-local-cache-aging-accesses");
+                }),
+        });
+        spec.add({
+            .long_name = "--ngram-local-cache-protected-numerator",
+            .category = "Ngram Storage", .value_label = "<count>",
+            .description = "Local hot cache protected-recency fraction numerator",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value) {
+                    auto& local = c.ngram_table_policy.gpu_adaptive.local_hot_cache;
+                    if (!local) local.emplace();
+                    local->policy.protected_numerator = parseNonNegativeUint32Value(value, "--ngram-local-cache-protected-numerator");
+                }),
+        });
+        spec.add({
+            .long_name = "--ngram-local-cache-protected-denominator",
+            .category = "Ngram Storage", .value_label = "<count>",
+            .description = "Positive local hot cache protected-recency fraction denominator",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value) {
+                    auto& local = c.ngram_table_policy.gpu_adaptive.local_hot_cache;
+                    if (!local) local.emplace();
+                    local->policy.protected_denominator = parseNonNegativeUint32Value(value, "--ngram-local-cache-protected-denominator");
+                }),
+        });
         spec.add({
             .long_name = "--ngram-gpu-cache-placement",
             .category = "Ngram Storage", .value_label = "<owners@coordinator>",

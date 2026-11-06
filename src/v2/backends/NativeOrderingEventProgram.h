@@ -14,7 +14,7 @@ class MoEOverlayInferenceOriginalSlotGeometry;
 /** @brief Fixed program identity; callers cannot author an event count. */
 class NativeOrderingEventProgram final {
 public:
-    enum class Kind {PooledOwnerInitialization,PooledCoordinatorInitialization,PooledSourceInitialization,LookupSubmissionRetirement,ReadAheadParentTerminal,CaptureSubmissionRetirement,RetainedCaptureTerminals};
+    enum class Kind {PooledOwnerInitialization,PooledCoordinatorInitialization,PooledSourceInitialization,LookupSubmissionRetirement,ReadAheadParentTerminal,CaptureSubmissionRetirement,RetainedCaptureTerminals,PooledLocalHotInitialization};
     /** @return Original setup plus frame/native and optional cache tensor publications. */
     static constexpr NativeOrderingEventProgram pooledOwner(bool hasCache){return {Kind::PooledOwnerInitialization,std::uint8_t(hasCache?7:6)};}
     /** @return Original setup plus frame/native and optional policy tensor publications. */
@@ -31,6 +31,9 @@ public:
     static NativeOrderingEventProgram retainedCaptureTerminals(const MoEOverlayInferenceOriginalSlotGeometry&);
     /** @return One ordinary exact capture-stream terminal, with a unique original-PMA population. */
     static constexpr NativeOrderingEventProgram captureSubmissionRetirement(){return {Kind::CaptureSubmissionRetirement,0};}
+    /** @return Actual local-cache setup plus mandatory frame/scratch and optional cache publications. */
+    static constexpr NativeOrderingEventProgram pooledLocalHot(bool hasCache)
+    { return {Kind::PooledLocalHotInitialization,std::uint8_t(hasCache?7:6)}; }
     Kind kind()const noexcept{return kind_;}
     std::uint8_t nonemptyRootMask()const noexcept{return mask_;}
     std::size_t orderingEvents()const noexcept{return events_;}

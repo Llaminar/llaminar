@@ -156,3 +156,29 @@ if(TARGET v2_test_memory_planner)
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ConsumerLocalTP4AndTP8RankAdmissionReplay)
 endif()
+
+# Independent L1 intent/metadata; canonical runtime activation remains a separate gate.
+foreach(local_hot_case IN ITEMS
+    "v2_test_orchestration_config_parser|Test__OrchestrationConfigParser.NgramLocalHotCacheHasIndependentExplicitArm|Config"
+    "v2_test_orchestration_plan_config|OrchestrationConfigDocument.NgramLocalHotCacheAbsentNullC0AndOverrides|Document"
+    "v2_test_memory_planner|ImmutableRowTableAdmissionWire.NgramLocalHotCacheIntentAndConsumerAuthority:GPUAdaptiveImmutableLookupAdmission.LocalHot*|Admission")
+    string(REPLACE "|" ";" local_hot_fields "${local_hot_case}")
+    list(GET local_hot_fields 0 local_hot_target)
+    list(GET local_hot_fields 1 local_hot_filter)
+    list(GET local_hot_fields 2 local_hot_suffix)
+    if(TARGET ${local_hot_target})
+        set(local_hot_name V2_Integration_NgramLocalHot${local_hot_suffix}Contract)
+        add_v2_test(${local_hot_name}
+            COMMAND $<TARGET_FILE:${local_hot_target}> --gtest_filter=${local_hot_filter}
+            LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Ngram;MemoryBOM;Contract;Regression"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+            ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${local_hot_name})
+    endif()
+endforeach()
+unset(local_hot_case)
+unset(local_hot_fields)
+unset(local_hot_target)
+unset(local_hot_filter)
+unset(local_hot_suffix)
+unset(local_hot_name)

@@ -16,6 +16,7 @@
  * their explicit full-bank demand and never recover from a selected-mode error.
  * CPU serial storage declarations survive admission and runtime projection.
  */
+#include "execution/local_execution/graph/PreparedFollowerCaptureTerminals.h"
 
 #include "MoEOverlayLocalCapacityPlanner.h"
 #include "DeviceMoEOverlayEpochArena.h"
@@ -1189,6 +1190,7 @@ namespace llaminar2
                     .world_rank = rank_plan.rank, .device = DeviceId::cpu(),
                     .total_bytes = host_total,
                     .admission_available_bytes = usableMemory(host_available, DeviceId::cpu(), input)};
+                bool terminal_holder_priced=false;
                 for (const auto& channel : result.activation_channel_plan.channels)
                 {
                     if (channel.target_world_rank != rank_plan.rank) continue;
@@ -1203,6 +1205,13 @@ namespace llaminar2
                             .admission_available_bytes = usableMemory(available, endpoint.device, input)};
                         for (std::size_t cache = 0; cache < cache_count; ++cache)
                         {
+                            if(!terminal_holder_priced){
+                                physical_plan_builder.add(host,PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent,
+                                    PreparedFollowerCaptureTerminalOwner::physicalBytes());
+                                terminal_holder_priced=true;
+                            }
+                            physical_plan_builder.add(host,PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent,
+                                PreparedFollowerCaptureTerminalPopulation::physicalBytes(*input.original_native_slots));
                             // Preserve the original certificate origin for both programs.
                             // Slot zero is the existing cache event; only K-1 are additional.
                             for (const auto program : {

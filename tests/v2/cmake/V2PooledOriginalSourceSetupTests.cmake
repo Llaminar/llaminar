@@ -38,6 +38,11 @@ if(HAVE_CUDA OR HAVE_ROCM)
                 set(_pooled_source_env "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
                 set(_pooled_source_lock rocm_gpu_0)
             endif()
+            add_v2_test(V2_Integration_${_pooled_source_backend}_PooledCompactQueryDeclarationBeforeSeal
+                COMMAND $<TARGET_FILE:v2_perf_pooled_original_source_setup> --gtest_filter=PooledOriginalSourceSetup.${_pooled_source_backend}CompactDeclarationBeforeSeal
+                LABELS "V2;Integration;ProductionTestPreflight;${_pooled_source_backend};Memory;Ownership;Ngram;Pooled;NativeReplay;Regression"
+                MPI_PROCS 1 NO_MPI NO_MODELS RESOURCE_LOCK ${_pooled_source_lock} TIMEOUT 30 ENVIRONMENT ${_pooled_source_env})
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_${_pooled_source_backend}_PooledCompactQueryDeclarationBeforeSeal)
             foreach(_pooled_source_case IN ITEMS C0 Positive)
                 add_v2_test(V2_Integration_${_pooled_source_backend}_PooledOriginalSource${_pooled_source_case}Setup
                     COMMAND $<TARGET_FILE:v2_perf_pooled_original_source_setup> --gtest_filter=PooledOriginalSourceSetup.${_pooled_source_backend}${_pooled_source_case}

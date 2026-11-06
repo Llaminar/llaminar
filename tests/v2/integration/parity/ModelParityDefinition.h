@@ -84,7 +84,21 @@ namespace llaminar2::test::parity
                         "C"+std::to_string(owner.maximum_cache_rows)+"B"+std::to_string(owner.cache_physical_byte_limit)+"_";
                 placement+="CoordinatorR"+std::to_string(g.placement.coordinator->world_rank)+(g.placement.coordinator->backend==DeviceType::CUDA?std::string{"CUDA"}:std::string{"ROCm"})+std::to_string(g.placement.coordinator->ordinal)+"_";
             }
-            return prefix+(g.source_backing==AdaptiveImmutableRowBacking::RAM?"SourceRAM_":"")+placement+"G"+std::to_string(g.maximum_gpu_cache_rows)+"_B"+std::to_string(g.gpu_cache_physical_byte_limit)+
+            // An engaged C0 cache still selects the combined transaction.
+            // Preserve that distinction and every explicit consumer ceiling in
+            // matrix identity; no cache setting may overwrite another result.
+            std::string local;
+            if(g.local_hot_cache) {
+                const auto& request=*g.local_hot_cache;
+                local="LocalHot_C"+std::to_string(request.maximum_cache_rows)+"_B"+std::to_string(request.cache_physical_byte_limit)+
+                    "_A"+std::to_string(request.policy.aging_accesses)+"_P"+std::to_string(request.policy.protected_numerator)+
+                    "of"+std::to_string(request.policy.protected_denominator)+"_";
+                for(const auto& consumer:request.consumer_overrides)
+                    local+="ConsumerR"+std::to_string(consumer.participant.world_rank)+
+                        (consumer.participant.backend==DeviceType::CUDA?"CUDA":"ROCm")+std::to_string(consumer.participant.ordinal)+
+                        "C"+std::to_string(consumer.maximum_cache_rows)+"B"+std::to_string(consumer.cache_physical_byte_limit)+"_";
+            }
+            return prefix+(g.source_backing==AdaptiveImmutableRowBacking::RAM?"SourceRAM_":"")+placement+local+"G"+std::to_string(g.maximum_gpu_cache_rows)+"_B"+std::to_string(g.gpu_cache_physical_byte_limit)+
                 "_A"+std::to_string(g.gpu_policy.aging_accesses)+"_P"+std::to_string(g.gpu_policy.protected_numerator)+
                 "of"+std::to_string(g.gpu_policy.protected_denominator)+"_H"+std::to_string(h.maximum_cache_rows)+
                 "_B"+std::to_string(h.cache_physical_byte_limit)+"_A"+std::to_string(h.policy.aging_accesses)+

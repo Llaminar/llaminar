@@ -7,6 +7,8 @@
  * Every process-retained population is isolated in a true threadsafe child.
  */
 #include "fixtures/backends/PooledRemoteGraphHostReplayAccess.h"
+#include <sys/resource.h>
+#include <iostream>
 #include "fixtures/execution/RetainedGraphParticipantsReplayAccess.h"
 #include "fixtures/backends/NativeContextPreparationReplayAccess.h"
 #include "execution/qwen4exp/PooledImmutableDirectedOwnerProgram.h"
@@ -20,7 +22,8 @@ namespace llaminar2::test {
 namespace {
 using Access=PooledRemoteGraphHostReplayAccess;
 /** @brief Recorded structural SDK result with independent creator/inspection/instantiate observations. */
-struct Trace {GPUFlatGraphStructure structure;int creators=0,destroyed=0,inspections=0,instantiations=0,launches=0,preparations=0,finiteCopies=0;const PhysicalMemoryAuthority* preparedMemory=nullptr;void* preparedStream=nullptr;bool failCreate=false,failInspect=false,failPrepare=false,throwPrepare=false;};
+struct Trace {GPUFlatGraphStructure structure;int creators=0,destroyed=0,inspections=0,instantiations=0,launches=0,preparations=0,finiteCopies=0;const PhysicalMemoryAuthority* preparedMemory=nullptr;void* preparedStream=nullptr;bool failCreate=false,failInspect=false,failPrepare=false,throwPrepare=false;    unsigned resets=0;
+};
 /** @brief The fake native object occupies exactly sizeof(Capture); production state remains in the owner. */
 class Capture final:public IGPUGraphCapture {
 public:
@@ -46,7 +49,7 @@ public:
     bool hasExecutable()const override{return inner_.hasExecutable();}
     std::size_t residentMemoryBytes()const noexcept override{return 0;}
     std::size_t nodeCount()const override{return inner_.nodeCount();}
-    void reset()override{inner_.reset();}
+    void reset()override{++trace_.resets;inner_.reset();}
     const char* backendName()const override{return "recorded-remote-host";}
     bool inspectFlatGraphStructure(const GPUFlatGraphLimits&,std::span<std::byte> scratch,GPUFlatGraphStructure& out,std::string*)const override{
         ++trace_.inspections;if(scratch.empty() || trace_.failInspect)return false;out=trace_.structure;return true;
@@ -57,7 +60,11 @@ private:testing::MockGPUGraphCapture inner_;Trace& trace_;
 class Worker final:public testing::MockWorkerGPUContext {
 public:
     Worker(int ordinal,std::shared_ptr<PreparedGPUWorkerStack>):MockWorkerGPUContext(ordinal){}
-    Trace trace;
+    Trace trace;bool rejectQueue=false;
+    void submitAndWait(std::function<void()> work)override{
+        if(rejectQueue)throw std::runtime_error("recorded original source rearm queue rejection");
+        MockWorkerGPUContext::submitAndWait(std::move(work));
+    }
     std::unique_ptr<IGPUGraphCapture> createGraphCapture(void* stream)override{++trace.creators;if(trace.failCreate)return {};return std::make_unique<Capture>(stream,trace);}
     GPUStreamExecutionState queryStreamExecutionState(void*,std::string_view)override{return GPUStreamExecutionState::Complete;}
 };
@@ -79,11 +86,13 @@ PooledRemoteGraphProgram program(DeviceId remote,std::uint32_t capacity){
 struct Source {
     std::shared_ptr<NativeContextPreparation> source;std::optional<PreparedGPUContextUsePermit> original;
     std::shared_ptr<PhysicalMemoryAuthority> memory;PooledRemoteGraphProgram descriptor;NativeAuxiliaryResourceSelection selected;
-    Source(DeviceId device,std::uint32_t capacity,std::size_t instances=1,bool raw=false,std::size_t unitBytes=4096,std::size_t resourceBytes=128u<<20,bool modelBudget=false):descriptor(program(device,capacity)),selected(prepare(device,unitBytes,resourceBytes,modelBudget)){
+    Source(DeviceId device,std::uint32_t capacity,std::size_t instances=1,bool raw=false,std::size_t unitBytes=4096,std::size_t resourceBytes=128u<<20,bool modelBudget=false,bool sourceSlots=false):descriptor(program(device,capacity)),selected(prepare(device,unitBytes,resourceBytes,modelBudget)){
         source->freezeForPlanning();PhysicalMemoryPlanBuilder plan(source->mandatoryBOM());
         const auto& gpu=source->originalResource(device);const auto& cpu=source->originalResource(DeviceId::cpu());
         for(std::size_t i=0;i<instances;++i){const auto host=Access::bom(descriptor,cpu,gpu,raw?std::nullopt:std::optional(selected),raw?nativeGraphCaptureObjectBytes(device):sizeof(Capture));for(const auto& row:host.resources())plan.add(row);}
         plan.add(gpu,PhysicalMemoryOwner::NativeStorageGraphExecutable,instances*GPUGraphMemoryContract::reservationBytesPerExecutable(device,GPUGraphExecutableClass::General));
+        if(sourceSlots)plan.add(cpu,PhysicalMemoryOwner::NativeStorageGraphExecutable,
+            RetainedParticipantGraphSourceSlots::physicalBytes(descriptor.geometry().participants));
         if (modelBudget) {
             const auto model = RetainedParticipantGraphExecutable::generalBOM(cpu, gpu);
             for (const auto& row : model.resources()) plan.add(row);
@@ -480,4 +489,70 @@ TEST(PooledRemoteGraphHost, RecordedStorageBodyAuthenticatesSourceAndRetiresAfte
     }()),::testing::ExitedWithCode(0),"");
 }
 
+} // namespace llaminar2::test
+
+namespace llaminar2::test {
+/** @test Same original opaque slot survives20 runner-like native-definition retire/reacquire cycles without another reservation. */
+TEST(PooledRemoteGraphHost, OriginalSourceSerialDefinitionRecreationKeepsOneSlot)
+{
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})ASSERT_EXIT(([&]{
+        const rlimit noCore{0,0};if(setrlimit(RLIMIT_CORE,&noCore)!=0)std::_Exit(80);
+        try {
+            Source source(device,0,1,false,4096,128u<<20,false,true);source.exact();
+            // This is the actual recorded original source object's lifetime
+            // identity; the fixture grants no QFN/Rank/native cohort authority.
+            const auto identity=static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(source.source.get()));
+            auto slots=Access::sourceSlots(identity,source.descriptor.geometry().participants,source.memory);
+            RetainedParticipantGraphExecutable* original=nullptr;
+            std::size_t activeBytes=0,dormantBytes=0;
+            const auto reservedGPU=GPUGraphMemoryContract::reservationBytesPerExecutable(device,GPUGraphExecutableClass::General);
+            for(std::uint64_t epoch=1;epoch<=20;++epoch){
+                auto owner=Access::acquireSlots(*slots,identity,*source.original,source.descriptor,source.selected,sizeof(Capture));
+                if(epoch==1)original=owner.get();else EXPECT_EQ(owner.get(),original);
+                EXPECT_EQ(Access::definitionGeneration(*owner),epoch);
+                source.record(*owner);
+                const auto active=source.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativeStorageGraphExecutable,PhysicalMemoryMaterializationKind::NewAllocation);
+                if(epoch==1)activeBytes=active;else EXPECT_EQ(active,activeBytes);
+                EXPECT_EQ(source.memory->reservedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativeStorageGraphExecutable),source.selected.hostBytes);
+                EXPECT_EQ(source.memory->reservedBytes(device,PhysicalMemoryOwner::NativeStorageGraphExecutable),reservedGPU);
+#ifndef LLAMINAR_ORIGINAL_SOURCE_SLOT_CONTROL
+                EXPECT_THROW(Access::acquireSlots(*slots,identity,*source.original,source.descriptor,source.selected,sizeof(Capture)),std::invalid_argument);
+                auto alias=owner;
+                EXPECT_THROW(Access::releaseSlots(*slots,identity,source.descriptor,owner),std::invalid_argument);
+                alias.reset();
+#endif
+                EXPECT_EQ(Access::submissionOrdinal(*owner),epoch-1);
+                ASSERT_TRUE(Access::submit(*owner,epoch));
+                EXPECT_THROW(Access::releaseSlots(*slots,identity,source.descriptor,owner),std::logic_error);
+                ASSERT_TRUE(Access::observe(*owner));
+                Access::releaseSlots(*slots,identity,source.descriptor,owner);
+                EXPECT_THROW(Access::recording(*owner),std::logic_error);
+                owner.reset();
+                const auto dormant=source.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativeStorageGraphExecutable,PhysicalMemoryMaterializationKind::NewAllocation);
+                if(epoch==1)dormantBytes=dormant;else EXPECT_EQ(dormant,dormantBytes);
+                EXPECT_LT(dormant,activeBytes);
+            }
+#ifndef LLAMINAR_ORIGINAL_SOURCE_SLOT_CONTROL
+            EXPECT_THROW(Access::acquireSlots(*slots,identity+1,*source.original,source.descriptor,source.selected,sizeof(Capture)),std::invalid_argument);
+            const auto changed=program(device,3);
+            EXPECT_THROW(Access::acquireSlots(*slots,identity,*source.original,changed,source.selected,sizeof(Capture)),std::invalid_argument);
+            EXPECT_THROW(Access::acquireSlots(*slots,identity,*source.original,source.descriptor,source.selected,sizeof(Capture),reinterpret_cast<void*>(0x7788)),std::invalid_argument);
+            EXPECT_EQ(source.worker().trace.creators,1u);EXPECT_EQ(source.worker().trace.destroyed,0u);
+            EXPECT_EQ(source.worker().trace.resets,20u);
+            source.worker().rejectQueue=true;
+            EXPECT_THROW(Access::acquireSlots(*slots,identity,*source.original,source.descriptor,source.selected,sizeof(Capture)),std::runtime_error);
+            source.worker().rejectQueue=false;
+            EXPECT_THROW(Access::acquireSlots(*slots,identity,*source.original,source.descriptor,source.selected,sizeof(Capture)),std::runtime_error);
+            EXPECT_EQ(source.worker().trace.creators,1u); // Original failure is absorbing, no retry/extra slot.
+            EXPECT_EQ(source.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativeStorageGraphExecutable,PhysicalMemoryMaterializationKind::NewAllocation),dormantBytes);
+#endif
+            slots.reset();
+            EXPECT_EQ(source.worker().trace.destroyed,1u);
+            EXPECT_EQ(source.memory->reservedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativeStorageGraphExecutable),source.selected.hostBytes);
+            source.reset();
+            std::_Exit(::testing::Test::HasFailure()?2:0);
+        }catch(const std::exception& error){std::cerr<<"original_source_recreation_failure: "<<error.what()<<std::endl;std::_Exit(3);}
+    }()),::testing::ExitedWithCode(0),"");
+}
 } // namespace llaminar2::test

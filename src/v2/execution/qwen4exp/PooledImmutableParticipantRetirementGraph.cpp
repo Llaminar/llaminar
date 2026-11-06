@@ -7,6 +7,8 @@
  * Invalid metadata or a missing original consumer edge fails before graph mutation.
  */
 #include "PooledImmutableParticipantRetirementGraph.h"
+#include "PooledImmutableDirectedTransport.h"
+#include "kernels/qwen4exp/PooledImmutableLocalHotPreparedStorage.h"
 #include "PooledImmutableReplicatedReaderGraph.h"
 #include "PooledImmutableReplicatedReaderGraph.h"
 #include "PooledImmutableDirectedOperation.h"
@@ -148,27 +150,67 @@ private:
 void freeNames(const ComputeGraph& graph,const std::vector<std::string>& names){std::set<std::string> unique;for(const auto& name:names)if(name.empty() || graph.getNode(name) || !unique.insert(name).second)throw std::invalid_argument("Retirement changed original unique node names");}
 /** @return Actual local binding or original remote read holder at its original coordinate. */
 q::PooledImmutableReadParticipant readMember(const q::PooledImmutableRetirementParticipant& member){return std::visit([](const auto& value)->q::PooledImmutableReadParticipant{if(!value)throw std::invalid_argument("Retirement lost actual member");using T=std::decay_t<decltype(*value)>;if constexpr(std::is_same_v<T,q::PooledImmutableLocalOwnerBinding>)return value;else return value->read();},member);}
+/** @brief Optional actual same-device reader; monostate is a storage-only owner. */
+using RetiringConsumer=std::variant<std::monostate,
+    std::reference_wrapper<const PooledImmutableReplicatedConsumerCompletion>,
+    std::reference_wrapper<const PooledImmutableCompactConsumerCompletion>>;
+/**
+ * @return Actual validated reader ACK, or no ACK for an original storage-only owner.
+ * This cold check precedes graph mutation and shares the original physical
+ * owner/channel checks for decoded and native-byte consumers.
+ */
+std::optional<std::string> consumerAck(const ComputeGraph& graph,
+    const std::shared_ptr<const q::PooledImmutableCapturedRetirementWave>& original,
+    const RetiringConsumer& consumer) {
+    const auto owner=q::pooledSourceOwner(original->read()->publication()->sourceWave());
+    const auto device=owner->plan().allocator().device;
+    return std::visit([&](const auto& reference)->std::optional<std::string> {
+        using T=std::decay_t<decltype(reference)>;
+        if constexpr(std::is_same_v<T,std::monostate>)return {};
+        else {
+            const auto& value=reference.get();
+            DeviceId participant=DeviceId::invalid();std::string ack;
+            if constexpr(std::is_same_v<T,std::reference_wrapper<const PooledImmutableReplicatedConsumerCompletion>>) {
+                requirePooledReplicatedConsumerCompletion(graph,value);
+                participant=value.reader->originalReader().device();ack=value.sent;
+            } else {
+                requirePooledCompactConsumerCompletion(graph,value);
+                participant=value.local->geometry().allocator().device;ack=value.ack_sent;
+            }
+            if(participant!=device || value.transport->remote(owner->plan().parameters().owner.coordinate()).retirement!=original)
+                throw std::invalid_argument("Inline retirement changed its actual reader/physical owner/channel");
+            return ack;
+        }
+    },consumer);
 }
-PooledPinParticipantNodes appendPooledRetirementOwner(ComputeGraph& graph,BufferArena& arena,
+/** @brief Append the unchanged physical owner chain after authenticating its optional real reader. */
+PooledPinParticipantNodes appendRetirementOwner(ComputeGraph& graph,BufferArena& arena,
     std::shared_ptr<const q::PooledImmutableCapturedRetirementWave> original,std::shared_ptr<const q::IPooledImmutableNativeKernels> code,const std::string& lastReadSent,const std::string& prefix,
-    const PooledImmutableReplicatedConsumerCompletion* consumer){
+    const RetiringConsumer& consumer){
     if(isGraphCaptureActive() || !original || !code || prefix.empty())throw std::invalid_argument("Retirement owner needs original cold read/code");original->requireCurrent();
     requirePooledReadOwnerCompletion(graph,original->read(),lastReadSent);const auto owner=q::pooledSourceOwner(original->read()->publication()->sourceWave());const auto device=owner->plan().allocator().device;
     if(code->backend()!=device.type)throw std::invalid_argument("Retirement owner changed backend code");const bool positive=owner->plan().parameters().native.reply_capacity!=0;
+    const auto ack=consumerAck(graph,original,consumer);
     const std::array suffixes{"reader_gate_receive","acquire_reader_gate","drain","release","release_send","retire","retired_wire","retired_send"};std::vector<std::string> names;for(auto suffix:suffixes)names.push_back(prefix+"/"+suffix);freeNames(graph,names);
     std::vector<std::unique_ptr<IComputeStage>> stages;
     const auto wire=[&](q::PooledRetirementWireRole role,CapturedTransferEndpoint side){return std::make_unique<PooledRetirementTransferStage>(arena,original,role,side);};
     const auto phase=[&](n::OwnerAction action){return std::make_unique<PooledImmutableNativePhaseStage>(arena,code,PooledImmutableNativePhaseStage::Owner{action,owner,q::PooledImmutableOwnerOperands(action,owner->plan(),original->ownerInputs(action))});};
     stages.push_back(wire(q::PooledRetirementWireRole::ReadersRetired,CapturedTransferEndpoint::Consumer));stages.push_back(phase(n::OwnerAction::AcquireReaderRetirement));stages.push_back(phase(n::OwnerAction::DrainSourceFailure));stages.push_back(phase(n::OwnerAction::Release));stages.push_back(positive?wire(q::PooledRetirementWireRole::Releases,CapturedTransferEndpoint::Producer):nullptr);stages.push_back(phase(n::OwnerAction::Retire));stages.push_back(phase(n::OwnerAction::RetiredWire));stages.push_back(wire(q::PooledRetirementWireRole::Retired,CapturedTransferEndpoint::Producer));
     auto prior=lastReadSent;for(size_t i=0;i<stages.size();++i)if(stages[i]){graph.addNode(names[i],std::move(stages[i]),device);graph.addDependency(names[i],prior);prior=names[i];}
-    if (consumer) {
-        requirePooledReplicatedConsumerCompletion(graph, *consumer);
-        if (consumer->reader->originalReader().device() != device ||
-            consumer->transport->remote(owner->plan().parameters().owner.coordinate()).retirement != original)
-            throw std::invalid_argument("Inline retirement changed its original colocated reader/physical owner");
-        graph.addDependency(names.front(), consumer->sent);
-    }
+    if(ack)graph.addDependency(names.front(),*ack);
     return {names.front(),prior};
+}
+} // namespace
+PooledPinParticipantNodes appendPooledRetirementOwner(ComputeGraph& graph,BufferArena& arena,
+    std::shared_ptr<const q::PooledImmutableCapturedRetirementWave> original,std::shared_ptr<const q::IPooledImmutableNativeKernels> code,
+    const std::string& lastReadSent,const std::string& prefix,const PooledImmutableReplicatedConsumerCompletion* consumer){
+    return appendRetirementOwner(graph,arena,std::move(original),std::move(code),lastReadSent,prefix,
+        consumer?RetiringConsumer{std::cref(*consumer)}:RetiringConsumer{});
+}
+PooledPinParticipantNodes appendPooledRetirementOwnerAfterCompactConsumer(ComputeGraph& graph,BufferArena& arena,
+    std::shared_ptr<const q::PooledImmutableCapturedRetirementWave> original,std::shared_ptr<const q::IPooledImmutableNativeKernels> code,
+    const std::string& lastReadSent,const std::string& prefix,const PooledImmutableCompactConsumerCompletion& consumer){
+    return appendRetirementOwner(graph,arena,std::move(original),std::move(code),lastReadSent,prefix,std::cref(consumer));
 }
 PooledImmutableRetirementCompletion appendPooledRetirementCoordinator(ComputeGraph& graph,BufferArena& arena,
     const PooledImmutableReadCompletion& read,std::span<const q::PooledImmutableRetirementParticipant> owners,
@@ -220,25 +262,22 @@ PooledImmutableRetirementCompletion appendPooledRetirementCoordinator(ComputeGra
     }
     graph.addDependency(out.finished,prior);graph.addDependency(out.observed,out.finished);out.coordinator={out.readersRetired,out.observed};return out;
 }
-void requirePooledRetirementOwnerCompletion(const ComputeGraph& graph,
+namespace {
+/** @brief Validate the same complete physical phase chain for either genuine reader protocol. */
+void requireRetirementOwner(const ComputeGraph& graph,
     const std::shared_ptr<const q::PooledImmutableCapturedRetirementWave>& original,const std::string& retiredSent,
-    const PooledImmutableReplicatedConsumerCompletion* consumer){
+    const RetiringConsumer& consumer){
     if(isGraphCaptureActive() || !original || retiredSent.empty())throw std::invalid_argument("Retirement owner completion needs original cold holder");original->requireCurrent();
     const auto owner=q::pooledSourceOwner(original->read()->publication()->sourceWave());const auto device=owner->plan().allocator().device;
-    if (consumer) {
-        requirePooledReplicatedConsumerCompletion(graph, *consumer);
-        if (consumer->reader->originalReader().device() != device ||
-            consumer->transport->remote(owner->plan().parameters().owner.coordinate()).retirement != original)
-            throw std::invalid_argument("Inline retirement completion replaced its original colocated reader");
-    }
+    const auto expectedAck=consumerAck(graph,original,consumer);
     const auto prior = [&](const std::string& name) {
         const auto* node = graph.getNode(name);
         if (!node || node->device != device)
             throw std::invalid_argument("Retirement owner lost its exact original participant");
         const auto* stage = dynamic_cast<const PooledRetirementTransferStage*>(node->stage.get());
-        if (consumer && stage && stage->matches(original.get(), q::PooledRetirementWireRole::ReadersRetired,
+        if (expectedAck && stage && stage->matches(original.get(), q::PooledRetirementWireRole::ReadersRetired,
                 CapturedTransferEndpoint::Consumer)) {
-            const auto ack = std::find(node->dependencies.begin(), node->dependencies.end(), consumer->sent);
+            const auto ack = std::find(node->dependencies.begin(), node->dependencies.end(), *expectedAck);
             if (node->dependencies.size() != 2 || ack == node->dependencies.end())
                 throw std::invalid_argument("Inline retirement lost its exact original reader ACK dependency");
             return node->dependencies[ack == node->dependencies.begin() ? 1 : 0];
@@ -255,6 +294,17 @@ void requirePooledRetirementOwnerCompletion(const ComputeGraph& graph,
     phase(current,n::OwnerAction::Release);current=prior(current);phase(current,n::OwnerAction::DrainSourceFailure);current=prior(current);phase(current,n::OwnerAction::AcquireReaderRetirement);current=prior(current);
     endpoint(current,q::PooledRetirementWireRole::ReadersRetired,CapturedTransferEndpoint::Consumer);current=prior(current);requirePooledReadOwnerCompletion(graph,original->read(),current);
 }
+} // namespace
+void requirePooledRetirementOwnerCompletion(const ComputeGraph& graph,
+    const std::shared_ptr<const q::PooledImmutableCapturedRetirementWave>& original,const std::string& retiredSent,
+    const PooledImmutableReplicatedConsumerCompletion* consumer){
+    requireRetirementOwner(graph,original,retiredSent,consumer?RetiringConsumer{std::cref(*consumer)}:RetiringConsumer{});
+}
+void requirePooledRetirementOwnerAfterCompactConsumer(const ComputeGraph& graph,
+    const std::shared_ptr<const q::PooledImmutableCapturedRetirementWave>& original,const std::string& retiredSent,
+    const PooledImmutableCompactConsumerCompletion& consumer){
+    requireRetirementOwner(graph,original,retiredSent,std::cref(consumer));
+}
 void requirePooledRetirementCompletion(const ComputeGraph& graph,const PooledImmutableRetirementCompletion& original){
     if(isGraphCaptureActive())throw std::invalid_argument("Retirement completion authentication is cold-only");requirePooledReadCompletion(graph,original.read);
     if(!original.read.publication.source.control)throw std::invalid_argument("Retirement completion lost original canonical control");
@@ -268,11 +318,11 @@ void requirePooledRetirementCompletion(const ComputeGraph& graph,const PooledImm
     source(original.readersRetired,q::PooledSourceAction::ReadersRetired);source(original.planned,q::PooledSourceAction::PlanReleases);source(original.reconciled,q::PooledSourceAction::ReconcileReleases);source(original.snapshot,q::PooledSourceAction::SnapshotReleased);source(original.finished,q::PooledSourceAction::FinishRetired);source(original.observed,q::PooledSourceAction::ObserveRetired);
     std::vector<std::string> lastReaders{original.read.output};
     if (original.readers) {
-        if (p.consumers <= 1)
-            throw std::invalid_argument("Singleton source cannot invent foreign reader ACK authority");
+        if (p.consumers <= 1 || !std::holds_alternative<q::PooledNativeTensorSpan>(original.read.target))
+            throw std::invalid_argument("Only original decoded shared output can own replicated reader ACKs");
         requirePooledReplicatedReaderCompletion(graph, *original.readers, original.readersRetired);
         for (const auto& reader : original.readers->readers) lastReaders.push_back(reader.ackValidated);
-    } else if (p.consumers > 1) {
+    } else if (p.consumers > 1 && std::holds_alternative<q::PooledNativeTensorSpan>(original.read.target)) {
         throw std::invalid_argument("Shared source retirement is missing original compute reader ACKs");
     }
     requirePooledOriginalDependencies(graph,original.readersRetired,std::move(lastReaders));requirePooledOriginalDependencies(graph,original.planned,{original.readersRetired});
@@ -306,9 +356,10 @@ std::optional<qwen4exp::PooledImmutableDirectedTransferOperation> describePooled
     if(const auto* original=dynamic_cast<const PooledRetirementTransferStage*>(&stage))return original->directedTransferOperation();
     return std::nullopt;
 }
-std::string findPooledRetirementOwnerCompletion(const ComputeGraph& graph,
-    const std::shared_ptr<const q::PooledImmutableCapturedRetirementWave>& original,
-    const PooledImmutableReplicatedConsumerCompletion& consumer)
+namespace {
+/** @return Unique actual physical terminal under the exact supplied reader contract. */
+std::string findRetirementOwner(const ComputeGraph& graph,
+    const std::shared_ptr<const q::PooledImmutableCapturedRetirementWave>& original,const RetiringConsumer& consumer)
 {
     if (isGraphCaptureActive() || !original)
         throw std::invalid_argument("Original inline retirement inventory belongs to cold actual graph validation");
@@ -318,11 +369,21 @@ std::string findPooledRetirementOwnerCompletion(const ComputeGraph& graph,
         const auto* stage = node ? dynamic_cast<const PooledRetirementTransferStage*>(node->stage.get()) : nullptr;
         if (!stage || !stage->matches(original.get(), q::PooledRetirementWireRole::Retired, CapturedTransferEndpoint::Producer)) continue;
         if (!result.empty()) throw std::logic_error("Actual inline owner graph has duplicate original Retired producers");
-        requirePooledRetirementOwnerCompletion(graph, original, name, &consumer);
+        requireRetirementOwner(graph,original,name,consumer);
         result = name;
     }
     if (result.empty()) throw std::invalid_argument("Actual inline owner graph has no original Retired producer");
     return result;
 }
-
+} // namespace
+std::string findPooledRetirementOwnerCompletion(const ComputeGraph& graph,
+    const std::shared_ptr<const q::PooledImmutableCapturedRetirementWave>& original,
+    const PooledImmutableReplicatedConsumerCompletion& consumer){
+    return findRetirementOwner(graph,original,std::cref(consumer));
+}
+std::string findPooledRetirementOwnerAfterCompactConsumer(const ComputeGraph& graph,
+    const std::shared_ptr<const q::PooledImmutableCapturedRetirementWave>& original,
+    const PooledImmutableCompactConsumerCompletion& consumer){
+    return findRetirementOwner(graph,original,std::cref(consumer));
+}
 }

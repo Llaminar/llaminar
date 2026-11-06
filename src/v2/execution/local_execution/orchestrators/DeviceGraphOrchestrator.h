@@ -10661,6 +10661,7 @@ namespace llaminar2
             AcceptedSpecState,
             MainBatchSampleInitialization,
             UnsampledLogitsInitialization,
+            OrdinaryGenerationTransaction,
             OrdinaryGenerationTerminal,
             ForwardOnlyTerminal,
         };
@@ -11352,6 +11353,9 @@ namespace llaminar2
          */
         uint64_t session_epoch_ = 1;
         std::shared_ptr<IRetainedGraphStorageBoundary> retained_storage_boundary_; ///< Exclusive immutable I/O lane surrounding complete generation.
+        struct LocalHotRequestAdmission;
+        /** @brief Original local roots/controller and once-request enqueue duty, retired after their native parents. */
+        std::shared_ptr<LocalHotRequestAdmission> retained_local_hot_admission_;
         RetainedStorageTerminalCapture retained_storage_terminal_capture_; ///< Native terminal release retaining its exact stream lifetime.
         RetainedStoragePerfStats retained_storage_perf_stats_; ///< Fresh terminal I/O evidence without device reads.
         std::array<DeviceControlledLoopEntryFragment,1> retained_storage_terminal_fragment_{}; ///< Borrowed only by native parent construction.
@@ -11363,6 +11367,16 @@ namespace llaminar2
         Qwen4ExpReplicatedPLEQuery fixedHeadPLEQuery(const ForwardInput &input) const;
         /** @brief Arm the declared immutable I/O lane before admission's ready event. */
         bool beginRetainedStorageAdmission(void *stream);
+        /** @brief Publish this participant's original source grant/reset once and acquire its exact producer stream. */
+        void beginLocalHotRequestAdmission(void *stream);
+        /** @return Exact optional terminal arena/pinned metadata bytes; the controller remains unchanged. */
+        std::size_t localHotTerminalMetadataBytes(int requests)const;
+        /** @brief Pack actual counters only downstream of the original whole-parent terminal dependency. */
+        void packLocalHotTerminalObservation(int requests,void* destination,std::size_t bytes,void* stream);
+        /** @brief Publish validated deltas of immutable whole-request snapshots, never live GPU probes. */
+        void publishLocalHotTerminalObservation(const void* packed,std::size_t bytes,int requests);
+        /** @brief Retire only local enqueue ownership after the original whole-request native terminal. */
+        void retireLocalHotRequestAdmissionAfterTerminal();
         /** @brief Resolve setup-owned lane and bind canonical control addresses before graph construction. */
         void prepareRetainedStorageBinding();
         /** @brief Return the exact acquired graph borrow after original producer/topology closure.

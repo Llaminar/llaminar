@@ -12,6 +12,7 @@
 #include "execution/mtp/DeviceGenerationExecutionPolicy.h"
 #include "execution/mtp/MTPServingForwardCaptureGeometry.h"
 #include "execution/mtp/MTPMainForwardPolicy.h"
+#include "execution/mtp/MTPGraphOwnerPlan.h"
 #include "kernels/common/DeviceRowRange.h"
 #include "kernels/common/FixedHalfProjectionGroup.h"
 #include "kernels/common/FixedFloatingProjectionGroup.h"
@@ -249,8 +250,9 @@ TEST(Test__MTPVerifierPolicy, ExactHostedFamilyAdmissionIsIndependentOfActiveDep
     EXPECT_EQ(resolveMTPRetainedServingForwardModelGraphIdentityCount(mtp, MTPVerifierGraphFamily::ExactRows), 32u);
     EXPECT_EQ(resolveMTPRetainedServingForwardModelGraphIdentityCount(mtp, MTPVerifierGraphFamily::BoundedBuckets), 10u);
     EXPECT_EQ(resolveMTPRetainedServingForwardModelGraphIdentityCount({}, MTPVerifierGraphFamily::ExactRows), 0u);
-    // Disabled execution builds no live verifier; admission still reserves the complete family above.
-    EXPECT_TRUE(resolveMTPServingForwardCaptureFamily(mtp, 16, MTPVerifierGraphFamily::ExactRows).empty());
+    // Disabled request execution still materializes its admitted setup family;
+    // these cold graph definitions launch no model work or request policy.
+    EXPECT_EQ(resolveMTPServingForwardCaptureFamily(mtp, 16, MTPVerifierGraphFamily::ExactRows).size(),15u);
     mtp.enabled = true;
     const auto exact = resolveMTPServingForwardCaptureFamily(mtp, 16, MTPVerifierGraphFamily::ExactRows);
     const auto bounded = resolveMTPServingForwardCaptureFamily(mtp, 16, MTPVerifierGraphFamily::BoundedBuckets);
@@ -742,3 +744,42 @@ TEST(Test__MTPVerifierPolicy, FixedFloatingProjectionBindingsAreTypedBoundedValu
     EXPECT_THROW(partial.append(inputs,weights,nullptr),std::invalid_argument);
     EXPECT_EQ(partial.size(),1);
 }
+
+namespace llaminar2 {
+/** @test Initial request policy never removes a retained exact source row required by a follower. */
+TEST(Test__MTPVerifierPolicy, OffAndActiveInitialPoliciesRetainActualSourceRows)
+{
+    for(const int retained:{1,3,7,15})
+    for(const int initial:{0,1,3,-1}) {
+        if(initial>retained)continue;
+        MTPRuntimeConfig mtp;
+        mtp.enabled=initial!=0;
+        mtp.graph_capacity_draft_tokens=retained;
+        mtp.draft_tokens=initial>0?initial:initial==0?0:1;
+        if(initial==-1) {
+            mtp.depth_policy.mode=MTPDepthPolicyMode::Dynamic;
+            mtp.depth_policy.min_depth=1;mtp.depth_policy.initial_depth=1;mtp.depth_policy.max_depth=retained;
+        }
+        const auto before=mtp;
+        const auto family=resolveMTPServingForwardCaptureFamily(mtp,retained+1,MTPVerifierGraphFamily::ExactRows);
+        ASSERT_EQ(family.size(),static_cast<std::size_t>(retained));
+        for(int rows=2;rows<=retained+1;++rows) {
+            const auto found=std::find_if(family.begin(),family.end(),[&](const auto& shape){return shape.verifier_rows==rows;});
+            ASSERT_NE(found,family.end());EXPECT_TRUE(found->valid());EXPECT_EQ(found->draft_depth,rows-1);
+        }
+        const MTPGraphOwnerPlan terminal(mtp,MTPVerifierGraphFamily::ExactRows,MTPGenerationParentRole::Controller);
+        const MTPGraphOwnerPlan follower(mtp,MTPVerifierGraphFamily::ExactRows,MTPGenerationParentRole::PipelineFollower);
+        EXPECT_TRUE(terminal.ownsControllerExecutables());EXPECT_GT(terminal.sidecarGraphSlots(),0u);
+        EXPECT_FALSE(follower.ownsControllerExecutables());EXPECT_EQ(follower.sidecarGraphSlots(),0u);
+        EXPECT_EQ(mtp.enabled,before.enabled);EXPECT_EQ(mtp.draft_tokens,before.draft_tokens);
+        EXPECT_EQ(mtp.graph_capacity_draft_tokens,before.graph_capacity_draft_tokens);
+        if(initial!=0)EXPECT_TRUE(resolveMTPDeviceGenerationDepthPolicy(mtp).valid());
+        else EXPECT_FALSE(mtp.enabled); // Cold definitions do not enable live Off execution.
+    }
+    EXPECT_TRUE(resolveMTPServingForwardCaptureFamily({},0,MTPVerifierGraphFamily::ExactRows).empty());
+    MTPRuntimeConfig malformed;malformed.graph_capacity_draft_tokens=3;
+    malformed.depth_policy.mode=static_cast<MTPDepthPolicyMode>(99);
+    EXPECT_THROW((void)resolveMTPServingForwardCaptureFamily(malformed,4,MTPVerifierGraphFamily::ExactRows),std::invalid_argument);
+}
+
+} // namespace llaminar2

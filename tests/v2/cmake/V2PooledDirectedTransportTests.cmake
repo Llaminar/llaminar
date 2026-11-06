@@ -3,6 +3,24 @@
 @brief Focused source-owned directed geometry, native backing and cold transport lifecycle regressions.
 ]=]
 if(TARGET v2_test_qwen4exp_primitives)
+    add_v2_test(V2_Integration_PooledCompactTerminalCounterUnits
+        COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+            --gtest_filter=QwenAdaptiveTerminalCounters.CompactMissCountsKeepOriginalUnitsAndUnpaddedBounds
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Counters;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledCompactTerminalCounterUnits)
+endif()
+if(TARGET v2_test_model_parity_definition)
+    add_v2_test(V2_Integration_PooledCompactTerminalCounterEvidence
+        COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+            --gtest_filter=Qwen4ExpGPUAdaptiveLookupEvidence.CompactInputsPreserveExactCountsAndRejectRelabeledEvidence
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Counters;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledCompactTerminalCounterEvidence)
+endif()
+if(TARGET v2_test_qwen4exp_primitives)
     target_sources(v2_test_qwen4exp_primitives PRIVATE
         unit/kernels/qwen4exp/Test__PooledImmutableDirectedTransport.cpp)
     add_v2_test(V2_Integration_PooledImmutableDirectedTransportReplay
@@ -292,4 +310,39 @@ if(TARGET v2_test_qwen4exp_primitives)
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpPooledCurrentConditionReplay)
+endif()
+
+# Compact local-hot messages retain the original pool coalescer and receipt law.
+# This component proof is device-free; it advertises no native graph or model qualification.
+if(TARGET v2_test_qwen4exp_primitives)
+    add_v2_test(V2_Integration_PooledLocalHotCompactConsumerContract
+        COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+            --gtest_filter=PooledImmutableCoordinator.LocalHot* --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Transfer;LiveExtent;Contract;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledLocalHotCompactConsumerContract)
+endif()
+
+# Request88/Lane24 completion is a distinct typed purpose, never a pool interval.
+if(TARGET v2_test_qwen4exp_primitives)
+    add_v2_test(V2_Integration_PooledNativeRequestCompletionBindingReplay
+        COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+            --gtest_filter=PooledImmutableDirectedTransport.NativeRequestCompletionFramePurposeAndOwnershipReplay:PooledImmutableDirectedTransport.NativeRequestCompletionRejectsMalformedAndAliasedFieldsReplay:PooledImmutableDirectedTransport.NativeRequestCompletionSubspanKeepsOriginalRoleAndBoundsReplay
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Memory;Transfer;Ownership;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledNativeRequestCompletionBindingReplay)
+endif()
+
+# The original source admission and current request lane remain distinct from the pool interval.
+if(TARGET v2_test_qwen4exp_primitives)
+    add_v2_test(V2_Integration_PooledLocalHotRequestPublicationReplay
+        COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+            --gtest_filter=PooledImmutableCoordinator.LocalHotRequestPublicationRejectsStaleAdmissionAndKeepsEmptyProgress
+            --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Transfer;LiveExtent;Contract;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledLocalHotRequestPublicationReplay)
 endif()

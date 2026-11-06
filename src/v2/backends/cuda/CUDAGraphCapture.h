@@ -16,6 +16,7 @@
 #ifdef HAVE_CUDA
 
 #include "../IGPUGraphCapture.h"
+#include "../NativeParallelGraphBranch.h"
 #include "../IWorkerGPUContext.h"
 #include <optional>
 #include <cuda_runtime.h>
@@ -364,6 +365,9 @@ namespace llaminar2
         consumeOrderedTimelineTiming() override;
         /** @copydoc IGPUGraphCapture::appendFiniteBodySiblings */
         bool appendFiniteBodySiblings(std::span<const IGPUGraphCapture* const> siblings)override;
+        /** @copydoc IGPUGraphCapture::appendFiniteBodyAfterCapturedFragment */
+        [[nodiscard]] bool appendFiniteBodyAfterCapturedFragment(
+            const IGPUGraphCapture& producer, const IGPUGraphCapture& body) override;
         /** @copydoc IGPUGraphCapture::appendParallelBranch */
         [[nodiscard]] bool appendParallelBranch(
             const GPUCapturedParallelBranch &branch) override;
@@ -410,6 +414,17 @@ namespace llaminar2
         int deviceOrdinal() const noexcept { return device_ordinal_; }
 
     private:
+
+        /** Unique cold recording lifetime, invalidated by reset/re-recording. */
+        mutable std::shared_ptr<const void> definition_scope_;
+        /** @return This exact cold native definition lifetime, created before its first import. */
+        const std::shared_ptr<const void>& definitionScope() const
+        {
+            if(!definition_scope_)definition_scope_=std::make_shared<const std::byte>();
+            return definition_scope_;
+        }
+        /** Exact original fragment exits in THIS composed parent, not live inference state. */
+        detail::NativeCapturedFragmentFrontiers<cudaGraph_t,cudaGraphNode_t> fragment_frontiers_;
         /** Native capture, not software stage guards, owns shared side streams. */
         NvidiaDeviceContext *projection_owner_ = nullptr;
         std::shared_ptr<IWorkerGPUContext> projection_context_lifetime_;

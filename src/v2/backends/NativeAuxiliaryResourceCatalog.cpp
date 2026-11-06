@@ -49,7 +49,8 @@ NativeAuxiliaryResourceAllowance NativeAuxiliaryResourceCatalog::selectAllowance
     // The same ordinary ordering-event native operation is repeated over the
     // original admitted slot roster. Scale its installed UNIT allowance here,
     // once, rather than treating one fixture's borrowed population as many.
-    if(program.isOrdering() && program.orderingProgram().kind()==NativeOrderingEventProgram::Kind::RetainedCaptureTerminals){
+    if(program.isOrdering() && (program.orderingProgram().kind()==NativeOrderingEventProgram::Kind::RetainedCaptureTerminals ||
+        program.orderingProgram().kind()==NativeOrderingEventProgram::Kind::PooledLocalHotInitialization)){
         auto unit=selectAllowance(backend,NativeAuxiliaryResourceProgram::ordering(
             NativeOrderingEventProgram::lookupSubmissionRetirement()),rows);
         const auto count=program.orderingProgram().orderingEvents();

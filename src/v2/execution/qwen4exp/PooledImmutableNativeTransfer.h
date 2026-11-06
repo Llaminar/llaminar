@@ -23,8 +23,11 @@ namespace llaminar2::qwen4exp {
 /** @brief The counted messages in the existing source-owner protocol and final reader result. */
 enum class PooledNativeCountedMessage : std::uint8_t {
     PinCommands, PinGrants, FreeDecisions, FreeGrants, VictimDecisions, VictimGrants,
-    SourceFills, SourcePayload, ReadRequests, ReadRows, Releases, ReaderResult, Count
+    SourceFills, SourcePayload, ReadRequests, ReadRows, Releases, ReaderResult, LocalHotMissKeys, Count
 };
+
+/** @brief Optional reader semantics; shared-only message populations remain byte-identical. */
+enum class PooledNativeReaderMessageProfile : std::uint8_t {ReplicatedFP32,CompactNative};
 
 /** @brief Current source-owned graph admission bound; transport edges never presume a pair. */
 inline constexpr std::size_t kMaximumPooledNativeParticipants=8;
@@ -42,8 +45,11 @@ public:
     /** @brief Freeze original communicator order and actual positive remote-owner edges.
      * @param degree Exact complete native reader population. @param coordinator Original source coordinate.
      * @param positiveOwner One original-member flag per coordinate; source-self is not a remote edge. */
-    PooledNativeCompletionLayout(std::size_t degree,std::size_t coordinator,std::span<const std::uint8_t> positiveOwner)
-        :degree_(degree),coordinator_(coordinator) {
+    PooledNativeCompletionLayout(std::size_t degree,std::size_t coordinator,std::span<const std::uint8_t> positiveOwner,
+        PooledNativeReaderMessageProfile profile=PooledNativeReaderMessageProfile::ReplicatedFP32)
+        :degree_(degree),coordinator_(coordinator),profile_(profile) {
+        if(profile!=PooledNativeReaderMessageProfile::ReplicatedFP32 && profile!=PooledNativeReaderMessageProfile::CompactNative)
+            throw std::invalid_argument("Unknown native pooled reader message profile");
         if(degree<2 || degree>kMaximumPooledNativeParticipants || coordinator>=degree || positiveOwner.size()!=degree)
             throw std::invalid_argument("Native pooled layout requires exact admitted original star coordinates");
         for(std::size_t i=0;i<degree;++i){
@@ -55,6 +61,8 @@ public:
     }
     /** @return Exact original communicator population, independent of physical owners. */
     std::size_t degree()const noexcept{return degree_;}
+    /** @return Declared optional wire semantics, never a live capability. */
+    PooledNativeReaderMessageProfile readerProfile()const noexcept{return profile_;}
     /** @return Original source coordinate, independent of physical device ordinal. */
     std::size_t coordinator()const noexcept{return coordinator_;}
     /** @return Counted slots in the original pair declaration. */
@@ -116,7 +124,7 @@ private:
     /** @brief Reject implicit endpoint inference when the original cohort contains multiple edges. */
     void requirePair()const {if(degree_!=2)throw std::invalid_argument("Plural native completion requires explicit original edge identity");}
     /** @return Exact static slots for one original source/reader pair. */
-    std::size_t edgeSlots(std::size_t peer)const noexcept{return positive_[peer]?12:1;}
+    std::size_t edgeSlots(std::size_t peer)const noexcept{return (positive_[peer]?12:1)+(profile_==PooledNativeReaderMessageProfile::CompactNative?1:0);}
     /** @return Exact total incident slots for one original endpoint. */
     std::size_t participantSlots(std::size_t p)const noexcept {
         if(p!=coordinator_)return edgeSlots(p);
@@ -126,8 +134,10 @@ private:
     std::size_t messageSlot(PooledNativeCountedMessage message,std::size_t edge)const {
         const auto value=static_cast<std::size_t>(message);
         if(value>=static_cast<std::size_t>(PooledNativeCountedMessage::Count) ||
-            (!positive_[edge] && message!=PooledNativeCountedMessage::ReaderResult))
+            (message==PooledNativeCountedMessage::LocalHotMissKeys && profile_!=PooledNativeReaderMessageProfile::CompactNative) ||
+            (!positive_[edge] && message!=PooledNativeCountedMessage::ReaderResult && message!=PooledNativeCountedMessage::LocalHotMissKeys))
             throw std::invalid_argument("Native pooled completion has no original counted message on this edge");
+        if(message==PooledNativeCountedMessage::LocalHotMissKeys)return positive_[edge]?12:1;
         return positive_[edge]?value:0;
     }
     /** @return Exact incident-edge index without allocating a second topology or runtime ledger. */
@@ -142,6 +152,7 @@ private:
         return first+messageSlot(message,edge);
     }
     std::size_t degree_,coordinator_,operand_allocation_bytes_=0;
+    PooledNativeReaderMessageProfile profile_;
     std::array<std::uint8_t,kMaximumPooledNativeParticipants> positive_{};
 };
 
@@ -193,8 +204,24 @@ public:
     }
     /** @return Same original owner/offset with a checked cold source-bank declaration. */
     PooledNativeTransferSpan resized(std::size_t bytes) const;
+    /**
+     * @brief Derive a bounded field inside this same declared span, not the full root capacity.
+     * @param relativeOffset Byte offset from the beginning of this original span.
+     * @param bytes Positive exact field extent.
+     * @return Same owner/control block and graph role with a strictly bounded nested range.
+     * @throws std::exception For absent original ownership, overflow or an out-of-span field.
+     */
+    PooledNativeTransferSpan subspan(std::size_t relativeOffset, std::size_t bytes) const;
     /** @return Exact immutable physical-root control block identity. */
     bool sameOwner(const PooledNativeTransferSpan& other) const noexcept;
+    /**
+     * @brief Reject overlapping fields or aliased ownership control blocks.
+     * @param other Another exact positive declaration in this same binding.
+     * @throws std::invalid_argument For empty/overflowing ranges, overlapping bytes or foreign control blocks.
+     * Both declarations retain original roots; different root types receive
+     * their final native-address overlap check only when prepared storage seals.
+     */
+    void requireDisjoint(const PooledNativeTransferSpan& other) const;
     /** @return Complete immutable owner/type/role/subrange identity, excluding device values. */
     std::uint64_t identity() const noexcept;
     /** @return Bounded original source offset. */
@@ -202,6 +229,7 @@ public:
     /** @return Bounded original storage subrange, never a live transfer count. */
     std::size_t bytes() const noexcept { return bytes_; }
 private:
+    friend class PooledImmutableTransferChannel;
     std::variant<std::shared_ptr<TensorBase>, std::shared_ptr<DeviceTransferBuffer>> owner_;
     std::optional<BufferId> role_;
     std::size_t offset_, bytes_;
@@ -212,6 +240,37 @@ struct PooledNativeCompletionFrame final {
     PooledNativeTransferSpan interval;
     PooledNativeTransferSpan error;
     std::int32_t failureCode;
+    /**
+     * @brief Check the response/pool purpose and exact disjoint original declarations.
+     * @param nominal Existing response/owner message; MissKeys requires a request frame.
+     * @param device Exact original GPU endpoint.
+     * @param extent Original UInt64 live-byte field, never a host count.
+     * @param payload Original useful payload bank, independent of metadata.
+     */
+    void require(PooledNativeCountedMessage nominal, DeviceId device,
+        const PooledNativeTransferSpan& extent, const PooledNativeTransferSpan& payload) const;
+};
+
+/**
+ * @brief Original request-lane identity/error fields, never a pool completion interval.
+ *
+ * The native ABI still borrows the same three UInt64 pointers. Their semantic
+ * authority is the original immutable RequestLaneIdentity. A distinct type
+ * prevents a local miss-key request from borrowing an unrelated pool interval.
+ */
+struct PooledNativeRequestCompletionFrame final {
+    PooledNativeTransferSpan request_identity;
+    PooledNativeTransferSpan error;
+    std::int32_t failureCode;
+    /**
+     * @brief Check the compact request purpose and exact disjoint original fields.
+     * @param profile Original immutable compact reader profile.
+     * @param device Exact original GPU endpoint.
+     * @param extent Original UInt64 live-byte field.
+     * @param payload Original bounded compact miss-key bank.
+     */
+    void require(PooledNativeReaderMessageProfile profile, DeviceId device,
+        const PooledNativeTransferSpan& extent, const PooledNativeTransferSpan& payload) const;
 };
 
 /**
@@ -233,6 +292,8 @@ public:
 
     /**
      * @brief Bind an original counted prefix and its persistent operand/receipt storage.
+     * @param nominal Original pool/response message; request MissKeys is rejected.
+     * @param layout Original complete native completion-bank geometry.
      * @param operandBacking Same PMA-owned mapped metadata allocation, initialized before capture.
      * @param receipts Same original participant's admitted native receipt root.
      * @param extent Original UINT64 publication; never read on host.
@@ -242,6 +303,19 @@ public:
         PooledNativeCompletionLayout layout, std::shared_ptr<MappedHostTransferRegion> operandBacking,
         std::shared_ptr<DeviceTransferBuffer> receipts, PooledNativeTransferSpan extent,
         PooledNativeCompletionFrame frame) const;
+    /**
+     * @brief Bind compact MissKeys to its actual request-lane identity before capture.
+     * @param layout Original CompactNative completion bank declaration.
+     * @param operandBacking Same PMA-owned mapped immutable operand storage.
+     * @param receipts Original participant's admitted native receipt root.
+     * @param extent Exact original UInt64 request byte publication.
+     * @param frame Actual request identity/error authority, not a pool interval.
+     * @return Same original native endpoint with a purpose-tagged counted binding.
+     */
+    PooledImmutableNativeTransfer withRequestPrefix(PooledNativeCompletionLayout layout,
+        std::shared_ptr<MappedHostTransferRegion> operandBacking,
+        std::shared_ptr<DeviceTransferBuffer> receipts, PooledNativeTransferSpan extent,
+        PooledNativeRequestCompletionFrame frame) const;
     /**
      * @brief Bind a root-relative source slice; the receiver retains only its original acquired extent.
      * @param descriptor Original source descriptor; only the producer may supply it.
@@ -273,6 +347,7 @@ public:
     CapturedTransferEndpoint role() const noexcept { return side_; }
 private:
     friend class PooledImmutableTransferChannel;
+    friend class PooledImmutableNativeCompletionStorage;
     /** @brief Fixed useful protocol record on the original communicator; no counted header is sent. */
     static PooledImmutableNativeTransfer fixed(
         std::shared_ptr<const Qwen4ExpReplicatedPLECohort> cohort,
@@ -282,6 +357,27 @@ private:
     PooledImmutableNativeTransfer(std::shared_ptr<const Qwen4ExpReplicatedPLECohort> cohort,
         PreparedGPUContextUsePermit original, CapturedTransferEndpoint side,
         int producer, int consumer, int participant, CapturedTransferMessage message, PooledNativeTransferSpan payload);
+    using CountedFrame = std::variant<PooledNativeCompletionFrame, PooledNativeRequestCompletionFrame>;
+    /**
+     * @brief Extend the same cold storage/operand path with one explicit frame purpose.
+     * @param nominal Exact original counted message class.
+     * @param layout Same original complete native completion-bank geometry.
+     * @param operandBacking Same admitted mapped immutable operand bank.
+     * @param receipts Same participant's actual admitted receipt root.
+     * @param extent Original UInt64 live-byte publication.
+     * @param frame Distinct pool or request identity/error authority.
+     * @return Complete original endpoint retaining all original storage borrowers.
+     */
+    PooledImmutableNativeTransfer withCountedFrame(PooledNativeCountedMessage nominal,
+        PooledNativeCompletionLayout layout, std::shared_ptr<MappedHostTransferRegion> operandBacking,
+        std::shared_ptr<DeviceTransferBuffer> receipts, PooledNativeTransferSpan extent,
+        CountedFrame frame) const;
+    /** @return Original three-word pool or request identity span selected by its immutable purpose. */
+    const PooledNativeTransferSpan& frameIdentity() const;
+    /** @return Original sticky error field of the same purpose-tagged frame. */
+    const PooledNativeTransferSpan& frameError() const;
+    /** @return Original positive failure code embedded in the immutable native operand. */
+    std::int32_t frameFailureCode() const;
     /** @brief Seal the complete original root set after each cold binding extension. */
     void sealStorage();
     /** @brief Validate exact native membership, strong physical roots and prepared worker generation. */
@@ -296,7 +392,7 @@ private:
     NativeCompletionAuthority authority_;
     PooledNativeTransferSpan payload_;
     std::optional<PooledNativeTransferSpan> extent_, slice_;
-    std::optional<PooledNativeCompletionFrame> frame_;
+    std::optional<CountedFrame> frame_;
     std::optional<PooledNativeCountedMessage> nominal_;
     std::optional<PooledNativeCompletionLayout> layout_;
     std::shared_ptr<MappedHostTransferRegion> operands_;

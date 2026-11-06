@@ -111,7 +111,7 @@ endif()
 if(TARGET v2_test_qwen4exp_primitives)
     add_v2_test(V2_Integration_ImmutableLookupClosedWorkerGateLifecycle
         COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
-            --gtest_filter=ImmutableLookupSubordinate.ClosedWorkerGatePreservesOriginalSourceTaskAndRetirement
+            --gtest_filter=ImmutableLookupSubordinate.ClosedWorkerGatePreservesOriginalSourceTaskAndRetirement:ImmutableLookupSubordinate.ClosedOriginalGroupWorkerGatePreservesAdmissionAndWithdraws:ImmutableLookupSubordinate.ClosedOriginalWorkerDispatchFailureWithdrawsBorrow:ImmutableLookupSubordinate.ClosedOriginalGroupRequestFrontierRejectsStaleReadyEvidence
         LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Ngram;ReadAhead;Lifecycle;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")

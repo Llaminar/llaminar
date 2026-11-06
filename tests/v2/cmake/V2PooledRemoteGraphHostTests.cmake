@@ -46,6 +46,14 @@ if(NOT V2_PERF_TESTS_ONLY)
                 ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1" "GTEST_DEATH_TEST_STYLE=threadsafe")
             list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_allowance_gate})
         endforeach()
+        # Serial source definitions retain the same original opaque native slot.
+        add_v2_test(V2_Integration_PooledOriginalSourceSerialSlotRecreation
+            COMMAND $<TARGET_FILE:v2_test_pooled_remote_graph_host>
+                --gtest_filter=PooledRemoteGraphHost.OriginalSourceSerialDefinitionRecreationKeepsOneSlot
+            LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Memory;Ownership;Ngram;Lifecycle;Regression"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+            ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;GTEST_DEATH_TEST_STYLE=threadsafe")
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledOriginalSourceSerialSlotRecreation)
         set(_remote_host_cases StoragePurposeSurvivesFullyReservedModelAndFailedCreation FlatPreparationRejectsForeignAuthorityAndRetainsNativeFailures RecordedOriginalC0ClaimsSealReplayAndSurviveReset RecordedOriginalPositiveClaimsSealReplayAndSurviveReset
             WrongSourceAndFlatShapeRejectBeforeNativeInstantiation MissingPlannedBytesAndCreatorPrefixKeepPreciseOriginalOwnership
             ExplicitRawDescriptorUsesSameSealWithoutInventedHostLimit FamilySelectionKeepsExactCaptureAndAdmitsOnlyPlannedInstances)

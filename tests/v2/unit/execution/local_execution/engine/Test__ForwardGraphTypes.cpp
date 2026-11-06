@@ -8884,3 +8884,5 @@ TEST(HostedDeviceGenerationFragment, OrdinaryForwardRequiresOriginalSamplerAndCo
     }
     }
 }
+
+#include "RetainedParticipantAuxiliaryRangeReplay.inc"

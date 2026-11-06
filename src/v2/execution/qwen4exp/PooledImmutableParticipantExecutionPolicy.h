@@ -14,6 +14,7 @@
 namespace llaminar2 { struct GraphConfig; struct MoEExpertOverlayExecutionPlan; class PreparedGPUContextUsePermit; }
 namespace llaminar2::qwen4exp {
 class PooledImmutableSourceGeometry;
+class PooledImmutableLocalHotTransportGeometry;
 /** @brief Shared setup/admission validation for the hosted source and its original readers. */
 class PooledImmutableParticipantExecutionPolicy final {
 public:
@@ -25,8 +26,26 @@ public:
      * consumes results, and a zero-capacity remote owner still participates in the protocol.
      */
     static bool requiresRetainedParticipants(const PooledImmutableSourceGeometry& source) noexcept;
+    /**
+     * @brief Admit the combined local/shared participant program against its original pool geometry.
+     * @param source Original pool source and its admitted query envelope.
+     * @param localHot Optional complete local-cache transport declaration.
+     * @return True for a matching combined program, including a single consumer or zero cache capacity.
+     * @throws std::invalid_argument If the table, original pool envelope or consumer roster changed.
+     */
+    static bool requiresRetainedParticipants(const PooledImmutableSourceGeometry& source,
+        const PooledImmutableLocalHotTransportGeometry* localHot);
     /** @brief Policy projection only; actual reader membership is authenticated by its retained cohort. */
     enum class GraphRole { Source, ReplicatedReader };
+    /**
+     * @brief Require the original complete rank-local source execution boundary.
+     * @param original Same original resolved ExpertOverlay owner descriptor.
+     * @throws std::invalid_argument For absent continuation ownership, distributed/native-only
+     *         execution, or a no-CPU declaration outside the original mixed-GPU contract.
+     * @note Existing CPU hosted sources keep their original lifecycle. A mixed-GPU
+     *       source still requires its exact native auxiliary graph/seal later.
+     */
+    static void requireHostedSourceExecution(const MoEExpertOverlayExecutionPlan& original);
     /**
      * @brief Check the complete hosted graph descriptor without treating a derived value as identity.
      * @param original Source graph's retained immutable execution descriptor.

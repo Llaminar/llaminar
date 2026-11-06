@@ -11,6 +11,10 @@
 #include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include <algorithm>
+#include "loaders/ModelLoader.h"
+#include "kernels/qwen4exp/PooledImmutableLocalHotPreparedStorage.h"
+#include "kernels/qwen4exp/PooledImmutableLocalHotOperands.h"
+#include "kernels/qwen4exp/PooledImmutableLocalHotTransportKernels.h"
 #include <stdexcept>
 namespace llaminar2::qwen4exp {
 namespace {
@@ -30,7 +34,9 @@ void requireRemote(PhysicalMemoryAllocatorIdentity coordinator, PhysicalMemoryAl
 }
 /** @return One exact source-owned contribution, never subtracting a capacity balance. */
 PhysicalMemoryPlan contribution(const PooledImmutablePhysicalOwnerGeometry& physical,const PooledImmutableCoordinatorGeometry& policy,
-    PhysicalMemoryResource host,std::span<const PhysicalMemoryResource> resources,Contribution kind, const PooledImmutableReplicatedReaderGeometry* readers){
+    PhysicalMemoryResource host,std::span<const PhysicalMemoryResource> resources,Contribution kind, const PooledImmutableReplicatedReaderGeometry* readers,PooledNativeReaderMessageProfile profile){
+    if(profile!=PooledNativeReaderMessageProfile::ReplicatedFP32 && profile!=PooledNativeReaderMessageProfile::CompactNative)
+        throw std::invalid_argument("Unknown pooled native reader BOM profile");
     PooledImmutableCoordinatorNativePlan::requireOriginalCohort(physical,policy);
     if(!host.device.is_cpu() || host.world_rank!=physical.coordinator().world_rank)throw std::invalid_argument("Directed channel changed original host allocator");
     const auto coordinator=resource(resources,physical.coordinator());PhysicalMemoryPlanBuilder builder;
@@ -56,11 +62,11 @@ PhysicalMemoryPlan contribution(const PooledImmutablePhysicalOwnerGeometry& phys
         const auto flags=std::span(positive.data(),count);
         const auto endpointsView=std::span(endpoints.data(),count);
         const auto actual=PooledImmutableNativeCompletionStorage::memoryBOM(host,endpointsView,
-            PooledNativeCompletionLayout(count,source,flags));
+            PooledNativeCompletionLayout(count,source,flags,profile));
         if(kind==Contribution::Growth) {
             positive.fill(0);
             const auto floor=PooledImmutableNativeCompletionStorage::memoryBOM(host,endpointsView,
-                PooledNativeCompletionLayout(count,source,flags));
+                PooledNativeCompletionLayout(count,source,flags,profile));
             for(const auto& line:actual.resources()) {
                 const auto* baseline=floor.find({line.resource().world_rank,line.resource().device});
                 if(!baseline)throw std::logic_error("Native metadata growth changed original endpoints");
@@ -97,12 +103,13 @@ PhysicalMemoryPlan contribution(const PooledImmutablePhysicalOwnerGeometry& phys
     return builder.build();
 }
 }
-PhysicalMemoryPlan PooledImmutableDirectedTransport::mandatoryBOM(const PooledImmutablePhysicalOwnerGeometry& p,const PooledImmutableCoordinatorGeometry& c,PhysicalMemoryResource host,std::span<const PhysicalMemoryResource> resources,const PooledImmutableReplicatedReaderGeometry* readers){return contribution(p,c,host,resources,Contribution::Mandatory,readers);}
-PhysicalMemoryPlan PooledImmutableDirectedTransport::completeBOM(const PooledImmutablePhysicalOwnerGeometry& p,const PooledImmutableCoordinatorGeometry& c,PhysicalMemoryResource host,std::span<const PhysicalMemoryResource> resources,const PooledImmutableReplicatedReaderGeometry* readers){return contribution(p,c,host,resources,Contribution::Complete,readers);}
-PhysicalMemoryPlan PooledImmutableDirectedTransport::slotDependentBOM(const PooledImmutablePhysicalOwnerGeometry& p,const PooledImmutableCoordinatorGeometry& c,PhysicalMemoryResource host,std::span<const PhysicalMemoryResource> resources,const PooledImmutableReplicatedReaderGeometry* readers){return contribution(p,c,host,resources,Contribution::Growth,readers);}
+PhysicalMemoryPlan PooledImmutableDirectedTransport::mandatoryBOM(const PooledImmutablePhysicalOwnerGeometry& p,const PooledImmutableCoordinatorGeometry& c,PhysicalMemoryResource host,std::span<const PhysicalMemoryResource> resources,const PooledImmutableReplicatedReaderGeometry* readers,PooledNativeReaderMessageProfile profile){return contribution(p,c,host,resources,Contribution::Mandatory,readers,profile);}
+PhysicalMemoryPlan PooledImmutableDirectedTransport::completeBOM(const PooledImmutablePhysicalOwnerGeometry& p,const PooledImmutableCoordinatorGeometry& c,PhysicalMemoryResource host,std::span<const PhysicalMemoryResource> resources,const PooledImmutableReplicatedReaderGeometry* readers,PooledNativeReaderMessageProfile profile){return contribution(p,c,host,resources,Contribution::Complete,readers,profile);}
+PhysicalMemoryPlan PooledImmutableDirectedTransport::slotDependentBOM(const PooledImmutablePhysicalOwnerGeometry& p,const PooledImmutableCoordinatorGeometry& c,PhysicalMemoryResource host,std::span<const PhysicalMemoryResource> resources,const PooledImmutableReplicatedReaderGeometry* readers,PooledNativeReaderMessageProfile profile){return contribution(p,c,host,resources,Contribution::Growth,readers,profile);}
 std::shared_ptr<const PooledImmutableDirectedTransport> PooledImmutableDirectedTransport::create(std::shared_ptr<ImmutableLookupExecutionBoundary> boundary, std::shared_ptr<const ClusterInventory> originalInventory,
     std::optional<PooledImmutableReplicatedReaderGeometry> readers,
-    std::shared_ptr<const Qwen4ExpReplicatedPLECohort> nativeCohort){
+    std::shared_ptr<const Qwen4ExpReplicatedPLECohort> nativeCohort,
+    std::optional<PooledImmutableLocalHotTransportGeometry> localHot){
     if(isGraphCaptureActive() || !boundary || !boundary->isPooled())throw std::invalid_argument("Directed transport requires original cold pooled source");
     const auto storage=boundary->pooledStorage();const auto& retained=storage->retainedPreparedSourceWorkers();
     if(!retained || storage->originalOwners().empty() || retained->owners().size()!=storage->originalOwners().size())throw std::logic_error("Directed transport requires actual original prepared source participants");
@@ -145,7 +152,7 @@ std::shared_ptr<const PooledImmutableDirectedTransport> PooledImmutableDirectedT
     if (readers) {
         if (readers->coordinator() != storage->coordinator()->plan().allocator() ||
             readers->consumers().size() != storage->geometry().parameters().consumers ||
-            readers->maximumOriginal() != storage->geometry().parameters().coordinator.policy.maximumOriginal() ||
+            (localHot ? localHot->maximumPoolOriginalRows() : readers->maximumOriginal()) != storage->geometry().parameters().coordinator.policy.maximumOriginal() ||
             readers->rowElements() != storage->geometry().parameters().row_elements)
             throw std::invalid_argument("Shared reader transport changed original source geometry");
         if (!originalInventory)
@@ -170,6 +177,19 @@ std::shared_ptr<const PooledImmutableDirectedTransport> PooledImmutableDirectedT
     } else if (storage->geometry().parameters().consumers != 1) {
         throw std::invalid_argument("Plural shared source requires every original compute-reader channel");
     }
+    if(localHot){
+        if(localHot->coordinator()!=storage->coordinator()->plan().allocator() ||
+            localHot->consumers().size()!=storage->geometry().parameters().consumers ||
+            localHot->maximumPoolOriginalRows()!=storage->geometry().parameters().coordinator.policy.maximumOriginal() ||
+            localHot->sourceExtent().rows()!=storage->geometry().parameters().owner.owner.sourceRows() ||
+            localHot->sourceExtent().rowBytes()!=storage->geometry().parameters().owner.row_bytes ||
+            ggufToTensorType(localHot->sourceExtent().format())!=storage->geometry().parameters().format)
+            throw std::invalid_argument("Compact transport changed its actual source/union geometry");
+        if(bool(readers)!=bool(localHot->originalReaders()) ||
+            (readers && (readers->coordinator()!=localHot->coordinator() ||
+                !std::equal(readers->consumers().begin(),readers->consumers().end(),localHot->consumers().begin(),localHot->consumers().end()))))
+            throw std::invalid_argument("Compact transport lost its exact original reader roster");
+    }
     std::vector<void*> ownerStreams(retained->owners().size());
     // Authenticate the COMPLETE actual participant population before either
     // channel materializes. An unsupported later owner cannot create a partial
@@ -184,6 +204,8 @@ std::shared_ptr<const PooledImmutableDirectedTransport> PooledImmutableDirectedT
     }
     auto result=std::shared_ptr<PooledImmutableDirectedTransport>(new PooledImmutableDirectedTransport(std::move(boundary),std::move(originalInventory)));
     result->requireOriginalSource();result->remotes_.reserve(retained->owners().size());
+    result->local_hot_geometry_=std::move(localHot);
+    const auto profile=result->local_hot_geometry_?PooledNativeReaderMessageProfile::CompactNative:PooledNativeReaderMessageProfile::ReplicatedFP32;
     if(nativeCohort) {
         if(!readers || std::size_t(nativeCohort->degree())!=readers->consumers().size() ||
             nativeCohort->degree()<2 || std::size_t(nativeCohort->degree())>kMaximumPooledNativeParticipants)
@@ -213,7 +235,7 @@ std::shared_ptr<const PooledImmutableDirectedTransport> PooledImmutableDirectedT
             }
         }
         result->native_completion_=PooledImmutableNativeCompletionStorage::create(std::move(nativeCohort),
-            std::move(permits),std::move(frames),PooledNativeCompletionLayout(devices.size(),source,std::span(positive.data(),devices.size())));
+            std::move(permits),std::move(frames),PooledNativeCompletionLayout(devices.size(),source,std::span(positive.data(),devices.size()),profile));
     }
 
     void* coordinatorStream=nullptr;coordinator.worker()->submitAndWait([&]{coordinatorStream=coordinator.worker()->defaultStream();});
@@ -246,24 +268,52 @@ std::shared_ptr<const PooledImmutableDirectedTransport> PooledImmutableDirectedT
             auto& transfer = TransferEngine::instance();
             if (!result->native_completion_)
                 throw std::logic_error("Shared native reader lost its original communicator metadata owner");
-            const auto capacity = std::max(geometry.resultMaximum(), sizeof(replicated_reader::Header));
+            const auto capacity = result->local_hot_geometry_ ?
+                std::max(result->local_hot_geometry_->resultCapacityBytes(),sizeof(local_hot_transport::ResultHeader)) :
+                std::max(geometry.resultMaximum(), sizeof(replicated_reader::Header));
             auto output = PooledImmutableTransferChannel::native(result->native_completion_, coordinator.device(), permit.device(), capacity);
-            auto ack = PooledImmutableTransferChannel::native(result->native_completion_, permit.device(), coordinator.device(), sizeof(replicated_reader::Header));
+            auto ack = PooledImmutableTransferChannel::native(result->native_completion_, permit.device(), coordinator.device(), result->local_hot_geometry_?
+                std::max(result->local_hot_geometry_->keyCapacityBytes(),sizeof(local_hot_transport::RequestHeader)):sizeof(replicated_reader::Header));
             std::array<PhysicalMemoryAllocationLease,2> controlClaims;
             std::array<std::shared_ptr<DeviceTransferBuffer>,2> controls;
             const std::array endpoints{coordinator.device(), permit.device()};
             const std::array workers{coordinator.worker(), permit.worker()};
+            const auto controlBytes=result->local_hot_geometry_?sizeof(local_hot_transport::Control):sizeof(replicated_reader::Control);
             for (std::size_t endpoint = 0; endpoint < endpoints.size(); ++endpoint) {
                 controlClaims[endpoint] = memory->claimNewAllocation(endpoints[endpoint],
-                    PhysicalMemoryOwner::ActivationTransportStaging, sizeof(replicated_reader::Control));
+                    PhysicalMemoryOwner::ActivationTransportStaging, controlBytes);
                 workers[endpoint]->submitAndWait([&] {
                     controls[endpoint] = transfer.allocateDeviceTransferBuffer(
-                        sizeof(replicated_reader::Control), endpoints[endpoint]);
+                        controlBytes, endpoints[endpoint]);
                 });
             }
             result->readers_.push_back(std::shared_ptr<const PooledImmutableReplicatedReaderTransport>(
                 new PooledImmutableReplicatedReaderTransport(coordinate, coordinator, std::move(permit),
-                    {}, {}, std::move(controlClaims), std::move(controls), std::move(output), std::move(ack))));
+                    {}, {}, std::move(controlClaims), std::move(controls), std::move(output), std::move(ack), profile)));
+        }
+    }
+    if(result->local_hot_geometry_){
+        const auto& geometry=*result->local_hot_geometry_;
+        const std::array<std::size_t,5> bytes{sizeof(local_hot_transport::Control),sizeof(local_hot_transport::UnionControl),
+            geometry.mergedKeyBytes(),geometry.incomingKeyBytes(),geometry.outgoingNativeBytes()};
+        for(std::size_t i=0;i<bytes.size();++i){
+            if(!bytes[i])continue;
+            result->local_hot_source_claims_[i]=memory->claimNewAllocation(coordinator.device(),PhysicalMemoryOwner::ActivationTransportStaging,bytes[i]);
+            coordinator.worker()->submitAndWait([&]{result->local_hot_source_roots_[i]=
+                TransferEngine::instance().allocateDeviceTransferBuffer(bytes[i],coordinator.device());});
+        }
+    }
+    if(result->local_hot_geometry_){
+        result->local_hot_admission_.reserve(result->readers_.size());
+        const auto& parameters=storage->geometry().parameters();
+        for(const auto& reader:result->readers_){
+            auto key=0x51464e4c3141444dULL;key=(key^parameters.owner.table)*1099511628211ULL;
+            key=(key^parameters.owner.source_storage_generation)*1099511628211ULL;key=(key^reader->coordinate())*1099511628211ULL;key|=1;
+            auto send=reader->nativeResult().bind(CapturedTransferEndpoint::Producer,{key,sizeof(local_hot_transport::SourceAdmissionHeader)},result->localHotAdmission(coordinator.device()));
+            auto receive=reader->nativeResult().bind(CapturedTransferEndpoint::Consumer,{key,sizeof(local_hot_transport::SourceAdmissionHeader)},result->localHotAdmission(reader->originalReader().device()));
+            coordinator.worker()->submitAndWait([&]{send.prepare(coordinator.worker()->defaultStream());});
+            reader->originalReader().worker()->submitAndWait([&]{receive.prepare(reader->originalReader().worker()->defaultStream());});
+            result->local_hot_admission_.push_back({reader->coordinate(),std::move(send),std::move(receive)});
         }
     }
     result->requireCurrent();return result;
@@ -275,6 +325,8 @@ const PooledImmutableRemoteTransport& PooledImmutableDirectedTransport::remote(s
 const std::shared_ptr<DeviceTransferBuffer>& PooledImmutableReplicatedReaderTransport::control(
     CapturedTransferEndpoint side) const
 {
+    if(profile_!=PooledNativeReaderMessageProfile::ReplicatedFP32)
+        throw std::logic_error("Compact request metadata is not an expanded reader control");
     if (side == CapturedTransferEndpoint::Producer) return controls_[0];
     if (side == CapturedTransferEndpoint::Consumer) return controls_[1];
     throw std::invalid_argument("Unknown shared PLE result endpoint");
@@ -303,12 +355,13 @@ void PooledImmutableReplicatedReaderTransport::requireCurrent() const
         acknowledgement_->endpointDevice(CapturedTransferEndpoint::Consumer) != source_.device()) {
         throw std::logic_error("Shared PLE reader changed its original captured endpoints");
     }
+    const auto controlBytes=profile_==PooledNativeReaderMessageProfile::CompactNative?sizeof(local_hot_transport::Control):sizeof(replicated_reader::Control);
     for (std::size_t i = 0; i < controls_.size(); ++i) {
         const auto device = i ? reader_.device() : source_.device();
         if (!controls_[i] || !controls_[i]->isBound() || controls_[i]->device() != device ||
-            controls_[i]->sizeBytes() != sizeof(replicated_reader::Control) ||
+            controls_[i]->sizeBytes() != controlBytes ||
             reinterpret_cast<std::uintptr_t>(controls_[i]->deviceData()) % alignof(replicated_reader::Control) != 0 ||
-            control_claims_[i].bytes() != sizeof(replicated_reader::Control))
+            control_claims_[i].bytes() != controlBytes)
             throw std::logic_error("Shared PLE reader lost its exact original metadata storage");
     }
     for (const auto* original : {&source_, &reader_}) {
@@ -431,6 +484,19 @@ void PooledImmutableDirectedTransport::requireCurrent()const{
     } else if (!readers_.empty() || storage->geometry().parameters().consumers != 1) {
         throw std::logic_error("Shared transport lost its original compute-reader declaration");
     }
+    const auto resultCapacity=local_hot_geometry_?std::max(local_hot_geometry_->resultCapacityBytes(),sizeof(local_hot_transport::ResultHeader)):
+        (reader_geometry_?std::max(reader_geometry_->resultMaximum(),sizeof(replicated_reader::Header)):0);
+    const auto requestCapacity=local_hot_geometry_?std::max(local_hot_geometry_->keyCapacityBytes(),sizeof(local_hot_transport::RequestHeader)):sizeof(replicated_reader::Header);
+    if(local_hot_geometry_){
+        const auto& g=*local_hot_geometry_;
+        const std::array<std::size_t,5> bytes{sizeof(local_hot_transport::Control),sizeof(local_hot_transport::UnionControl),g.mergedKeyBytes(),g.incomingKeyBytes(),g.outgoingNativeBytes()};
+        for(std::size_t i=0;i<bytes.size();++i){
+            const auto& root=local_hot_source_roots_[i];
+            if(bool(root)!=bool(bytes[i]) || (root && (!root->isBound() || root->device()!=g.coordinator().device ||
+                root->sizeBytes()!=bytes[i] || local_hot_source_claims_[i].bytes()!=bytes[i])))
+                throw std::logic_error("Compact transport lost exact source protocol/scratch roots");
+        }
+    }
     for (const auto& reader : readers_) {
         if (!reader || !reader_geometry_)
             throw std::logic_error("Shared reader transport lost its original declaration");
@@ -439,15 +505,288 @@ void PooledImmutableDirectedTransport::requireCurrent()const{
             reader_geometry_->consumers()[reader->coordinate()].device != reader->originalReader().device() ||
             (reader->nativeCollective() &&
                 (reader->nativeResult().nativeStorage() != native_completion_ ||
-                 reader->nativeResult().maximumBytes() != std::max(reader_geometry_->resultMaximum(), sizeof(replicated_reader::Header)) ||
-                 reader->nativeAcknowledgement().maximumBytes() != sizeof(replicated_reader::Header))) ||
+                 reader->nativeResult().maximumBytes() != resultCapacity ||
+                 reader->nativeAcknowledgement().maximumBytes() != requestCapacity)) ||
             (!reader->nativeCollective() &&
-                (reader->result()->capacityBytes() != std::max(reader_geometry_->resultMaximum(), sizeof(replicated_reader::Header)) ||
-                 reader->acknowledgement()->capacityBytes() != sizeof(replicated_reader::Header) ||
+                (reader->result()->capacityBytes() != resultCapacity ||
+                 reader->acknowledgement()->capacityBytes() != requestCapacity ||
                  reader->result()->payloadStorage() != reader_geometry_->payloadStorage(reader_geometry_->consumers()[reader->coordinate()]) ||
                  reader->acknowledgement()->payloadStorage() != reader_geometry_->payloadStorage(reader_geometry_->consumers()[reader->coordinate()]))))
             throw std::logic_error("Shared reader channel geometry changed");
     }
     for(const auto& remote:remotes_){remote.pin->requireCurrent();remote.returned->requireCurrent();remote.free->requireCurrent();remote.victim->requireCurrent();remote.source->requireCurrent();remote.publication->requireCurrent();remote.read->requireCurrent();remote.retirement->requireCurrent();}
 }
+const std::shared_ptr<DeviceTransferBuffer>& PooledImmutableDirectedTransport::localHotControlRoot(DeviceId participant,std::uint32_t consumer)const
+{
+    requireCurrent();
+    if(!local_hot_geometry_ || consumer>=local_hot_geometry_->consumers().size())
+        throw std::invalid_argument("Compact control requires its actual declared consumer");
+    const auto source=local_hot_geometry_->coordinator().device;
+    if(local_hot_geometry_->consumers()[consumer].device==source){
+        if(participant!=source)throw std::invalid_argument("Source-self compact control cannot be read from a foreign GPU");
+        return local_hot_source_roots_[0];
+    }
+    for(const auto& reader:readers_)if(reader->coordinate()==consumer){
+        if(participant==source)return reader->controls_[0];
+        if(participant==reader->originalReader().device())return reader->controls_[1];
+        throw std::invalid_argument("Compact control is not local to this original endpoint");
+    }
+    throw std::logic_error("Compact consumer lost its original transport endpoint");
+}
+PooledNativeTransferSpan PooledImmutableDirectedTransport::localHotControl(DeviceId participant,std::uint32_t consumer)const
+{return {localHotControlRoot(participant,consumer),0,sizeof(local_hot_transport::Control)};}
+PooledNativeTransferSpan PooledImmutableDirectedTransport::localHotOriginalRequest(DeviceId participant)const
+{
+    requireCurrent();if(!local_hot_geometry_)throw std::logic_error("Shared-only transport has no local compact request");
+    for(std::uint32_t i=0;i<local_hot_geometry_->consumers().size();++i)
+        if(local_hot_geometry_->consumers()[i].device==participant)
+            return {localHotControlRoot(participant,i),offsetof(local_hot_transport::Control,request_out),sizeof(local_hot_transport::RequestHeader)};
+    throw std::invalid_argument("Compact request requires its actual consumer device");
+}
+PooledNativeTransferSpan PooledImmutableDirectedTransport::localHotAdmission(DeviceId participant)const
+{
+    requireCurrent();if(!local_hot_geometry_)throw std::logic_error("Shared-only transport has no local compact admission");
+    for(std::uint32_t i=0;i<local_hot_geometry_->consumers().size();++i)
+        if(local_hot_geometry_->consumers()[i].device==participant)
+            return {localHotControlRoot(participant,i),offsetof(local_hot_transport::Control,original_admission),sizeof(local_hot_transport::SourceAdmissionHeader)};
+    throw std::invalid_argument("Compact admission requires its actual consumer device");
+}
+PooledNativeTransferSpan PooledImmutableDirectedTransport::localHotUnion()const
+{
+    requireCurrent();if(!local_hot_geometry_)throw std::logic_error("Shared-only transport has no compact union");
+    return {local_hot_source_roots_[1],0,sizeof(local_hot_transport::UnionControl)};
+}
+PooledNativeTransferSpan PooledImmutableDirectedTransport::localHotSourceScratch(LocalHotSourceScratch role)const
+{
+    requireCurrent();if(!local_hot_geometry_)throw std::logic_error("Shared-only transport has no compact source scratch");
+    const auto index=role==LocalHotSourceScratch::MergedKeys?2u:role==LocalHotSourceScratch::IncomingKeys?3u:
+        role==LocalHotSourceScratch::OutgoingRows?4u:5u;
+    if(index==5 || !local_hot_source_roots_[index])throw std::invalid_argument("Compact source scratch role is absent or invalid");
+    const auto& root=local_hot_source_roots_[index];return {root,0,root->sizeBytes()};
+}
+
+PooledImmutableLocalHotPoolQuery PooledImmutableDirectedTransport::localHotPoolQuery(
+    std::shared_ptr<PooledImmutableLocalHotPreparedStorage> sourceLocal)const
+{
+    requireCurrent();const auto source=boundary_->pooledStorage();
+    if(!local_hot_geometry_ || !sourceLocal || sourceLocal->originalSource()!=source ||
+        sourceLocal->geometry().allocator()!=local_hot_geometry_->coordinator() ||
+        sourceLocal->geometry().maximumOriginalIds()!=local_hot_geometry_->maximumPoolUniqueRows())
+        throw std::invalid_argument("Compact Begin requires the actual source participant's original local query");
+    sourceLocal->requireAuthority(source->retainedOwnerObservation().authority());
+    const auto& f=sourceLocal->geometry().frameOffsets();
+    auto ids=local_hot_geometry_->consumers().size()==1?
+        PooledNativeTransferSpan(sourceLocal->roots().frame,f.miss_keys,local_hot_geometry_->keyCapacityBytes()):
+        localHotSourceScratch(LocalHotSourceScratch::MergedKeys);
+    const auto& sourceParameters=source->geometry().parameters();
+    PooledNativeTransferSpan admission(source->roots().native,
+        sourceParameters.offsets.protocol+offsetof(ImmutableLookupDeviceState,admissionGeneration),sizeof(std::uint64_t));
+    return {shared_from_this(),std::move(sourceLocal),std::move(ids),
+        PooledNativeTransferSpan(local_hot_source_roots_[1],offsetof(local_hot_transport::UnionControl,pool_original_ids),sizeof(std::int32_t)),
+        std::move(admission),local_hot_geometry_->maximumPoolOriginalRows()};
+}
+PooledImmutableLocalHotPoolQuery::PooledImmutableLocalHotPoolQuery(
+    std::shared_ptr<const PooledImmutableDirectedTransport> transport,std::shared_ptr<PooledImmutableLocalHotPreparedStorage> local,
+    PooledNativeTransferSpan ids,PooledNativeTransferSpan count,PooledNativeTransferSpan admission,std::uint32_t capacity)
+    :transport_(std::move(transport)),source_local_(std::move(local)),ids_(std::move(ids)),count_(std::move(count)),
+     admission_(std::move(admission)),capacity_(capacity)
+{
+    if(!transport_ || !source_local_ || !capacity_ || capacity_>static_cast<std::uint32_t>(INT32_MAX) ||
+        ids_.bytes()!=std::size_t{capacity_}*sizeof(std::uint64_t) || count_.bytes()!=sizeof(std::int32_t) || admission_.bytes()!=sizeof(std::uint64_t))
+        throw std::invalid_argument("Compact Begin lost its exact original producer extents");
+}
+void PooledImmutableLocalHotPoolQuery::seal()
+{
+    const auto device=source_local_->geometry().allocator().device;
+    transport_->requireCurrent();ids_.require(device,8);count_.require(device,4);admission_.require(device,8);
+    const auto* ids=ids_.pointer(device,8);const auto* count=static_cast<const std::int32_t*>(count_.pointer(device,4));
+    const auto* admission=static_cast<const std::uint64_t*>(admission_.pointer(device,8));
+    if(sealed_ids_ && (sealed_ids_!=ids || sealed_count_!=count || sealed_admission_!=admission))
+        throw std::logic_error("Compact Begin original producer addresses changed after seal");
+    sealed_ids_=ids;sealed_count_=count;sealed_admission_=admission;
+}
+void PooledImmutableLocalHotPoolQuery::requireDeclaration(const PooledImmutableCoordinatorNativePlan& plan)const
+{
+    transport_->requireCurrent();const auto source=transport_->sourceBoundary()->pooledStorage();
+    const auto device=source_local_->geometry().allocator().device;
+    if(source_local_->originalSource()!=source || source->coordinator()->plan().parameters().identity!=plan.parameters().identity ||
+        plan.allocator().device!=device || capacity_!=plan.parameters().policy.maximumOriginal() ||
+        ids_.bytes()!=std::size_t{capacity_}*sizeof(std::uint64_t) || count_.bytes()!=sizeof(std::int32_t) ||
+        admission_.bytes()!=sizeof(std::uint64_t))
+        throw std::logic_error("Compact Begin changed its original coordinator/source/query declaration");
+    source_local_->captureIdentity();
+}
+void PooledImmutableLocalHotPoolQuery::require(const PooledImmutableCoordinatorNativePlan& plan)const
+{
+    requireDeclaration(plan);const auto device=source_local_->geometry().allocator().device;
+    if(!sealed_ids_ || sealed_ids_!=ids_.pointer(device,8) || sealed_count_!=count_.pointer(device,4) ||
+        sealed_admission_!=admission_.pointer(device,8))
+        throw std::logic_error("Compact Begin lost its sealed original query producer addresses");
+}
+std::uint64_t PooledImmutableLocalHotPoolQuery::declarationIdentity()const
+{
+    transport_->requireCurrent();if(sealed_ids_)require(transport_->sourceBoundary()->pooledStorage()->coordinator()->plan());std::uint64_t h=1469598103934665603ULL;
+    const auto mix=[&](std::uint64_t x){h=(h^x)*1099511628211ULL;};
+    mix(1);mix(source_local_->captureIdentity());mix(ids_.identity());mix(count_.identity());mix(admission_.identity());mix(capacity_);return h?h:1;
+}
+std::uint64_t PooledImmutableLocalHotPoolQuery::captureIdentity()const
+{
+    require(transport_->sourceBoundary()->pooledStorage()->coordinator()->plan());
+    auto h=declarationIdentity();for(const auto pointer:{sealed_ids_,static_cast<const void*>(sealed_count_),static_cast<const void*>(sealed_admission_)})
+        h=(h^reinterpret_cast<std::uintptr_t>(pointer))*1099511628211ULL;
+    return h?h:1;
+}
+pooled_native::CoordinatorQuery PooledImmutableLocalHotPoolQuery::native()const
+{
+    require(transport_->sourceBoundary()->pooledStorage()->coordinator()->plan());
+    return {{DeviceRowRange::deviceCounted(static_cast<int>(capacity_),sealed_count_),pooled_native::OriginalIdWidth::UInt64},sealed_ids_,sealed_admission_};
+}
+
+PooledImmutableLocalHotNativePack PooledImmutableDirectedTransport::localHotNativePack(
+    std::shared_ptr<PooledImmutableLocalHotPreparedStorage> consumer)const
+{
+    requireCurrent();const auto source=boundary_->pooledStorage();
+    if(!local_hot_geometry_ || !consumer || consumer->originalSource()!=source ||
+        consumer->geometry().maximumOriginalIds()!=local_hot_geometry_->maximumPoolUniqueRows())
+        throw std::invalid_argument("Compact native pack requires its actual original local consumer");
+    consumer->requireAuthority(source->retainedOwnerObservation().authority());
+    const auto device=local_hot_geometry_->coordinator().device;
+    std::uint32_t coordinate=static_cast<std::uint32_t>(local_hot_geometry_->consumers().size()),remoteIndex=0;
+    for(std::uint32_t i=0;i<local_hot_geometry_->consumers().size();++i){
+        if(local_hot_geometry_->consumers()[i]==consumer->geometry().allocator()){coordinate=i;break;}
+        if(local_hot_geometry_->consumers()[i]!=local_hot_geometry_->coordinator())++remoteIndex;
+    }
+    if(coordinate==local_hot_geometry_->consumers().size())throw std::invalid_argument("Native pack consumer is outside the actual transport roster");
+    const auto control=localHotControlRoot(device,coordinate);
+    const auto capacity=local_hot_geometry_->resultCapacityBytes();
+    const bool self=consumer->geometry().allocator()==local_hot_geometry_->coordinator();
+    std::array<PooledNativeTransferSpan,5> spans{
+        PooledNativeTransferSpan(control,self?offsetof(local_hot_transport::Control,request_out):offsetof(local_hot_transport::Control,request_in),sizeof(local_hot_transport::RequestHeader)),
+        self?PooledNativeTransferSpan(consumer->roots().frame,consumer->geometry().frameOffsets().result_header,sizeof(local_hot_transport::ResultHeader)):
+            PooledNativeTransferSpan(control,offsetof(local_hot_transport::Control,result_out),sizeof(local_hot_transport::ResultHeader)),
+        self?PooledNativeTransferSpan(consumer->roots().frame,consumer->geometry().frameOffsets().response,capacity):
+            PooledNativeTransferSpan(local_hot_source_roots_[4],std::size_t{remoteIndex}*capacity,capacity),
+        self?PooledNativeTransferSpan(consumer->roots().frame,consumer->geometry().frameOffsets().received_payload_bytes,sizeof(std::uint64_t)):
+            PooledNativeTransferSpan(control,offsetof(local_hot_transport::Control,result_send_bytes),sizeof(std::uint64_t)),
+        localHotUnion()};
+    std::optional<PooledNativeTransferSpan> headerBytes;
+    if(self)headerBytes.emplace(consumer->roots().frame,consumer->geometry().frameOffsets().received_header_bytes,sizeof(std::uint64_t));
+    return {shared_from_this(),std::move(consumer),coordinate,std::move(spans),std::move(headerBytes)};
+}
+PooledImmutableLocalHotNativePack::PooledImmutableLocalHotNativePack(
+    std::shared_ptr<const PooledImmutableDirectedTransport> transport,std::shared_ptr<PooledImmutableLocalHotPreparedStorage> consumer,
+    std::uint32_t coordinate,std::array<PooledNativeTransferSpan,5> spans,std::optional<PooledNativeTransferSpan> header)
+    :transport_(std::move(transport)),consumer_(std::move(consumer)),coordinate_(coordinate),spans_(std::move(spans)),local_header_bytes_(std::move(header)){}
+void PooledImmutableLocalHotNativePack::seal()
+{
+    transport_->requireCurrent();const auto device=transport_->localHotGeometry()->coordinator().device;
+    const std::array<std::size_t,5> alignment{alignof(local_hot_transport::RequestHeader),alignof(local_hot_transport::ResultHeader),1,8,alignof(local_hot_transport::UnionControl)};
+    for(std::size_t i=0;i<spans_.size();++i){
+        spans_[i].require(device,alignment[i]);auto* pointer=spans_[i].pointer(device,alignment[i]);
+        if(sealed_[i] && sealed_[i]!=pointer)throw std::logic_error("Native pack original producer changed after seal");
+        sealed_[i]=pointer;
+    }
+    if(local_header_bytes_){
+        auto* pointer=local_header_bytes_->pointer(device,8);
+        if(sealed_header_bytes_ && sealed_header_bytes_!=pointer)throw std::logic_error("Native pack original header publication changed after seal");
+        sealed_header_bytes_=pointer;
+    }
+}
+void PooledImmutableLocalHotNativePack::require(const PooledImmutableSourcePreparedStorage& source)const
+{
+    transport_->requireCurrent();const auto device=transport_->localHotGeometry()->coordinator().device;
+    if(transport_->sourceBoundary()->pooledStorage().get()!=&source || consumer_->originalSource().get()!=&source ||
+        coordinate_>=transport_->localHotGeometry()->consumers().size() ||
+        transport_->localHotGeometry()->consumers()[coordinate_]!=consumer_->geometry().allocator())
+        throw std::logic_error("Native pack changed its actual original source/consumer");
+    consumer_->captureIdentity();
+    for(std::size_t i=0;i<spans_.size();++i)if(!sealed_[i] || sealed_[i]!=spans_[i].pointer(device))
+        throw std::logic_error("Native pack changed its sealed original physical root");
+    if(local_header_bytes_ && sealed_header_bytes_!=local_header_bytes_->pointer(device,8))
+        throw std::logic_error("Native pack changed its source-self terminal publication");
+}
+std::uint64_t PooledImmutableLocalHotNativePack::declarationIdentity()const
+{
+    transport_->requireCurrent();if(sealed_[0])require(*transport_->sourceBoundary()->pooledStorage());auto h=consumer_->captureIdentity();
+    for(const auto& span:spans_)h=(h^span.identity())*1099511628211ULL;
+    if(local_header_bytes_)h=(h^local_header_bytes_->identity())*1099511628211ULL;
+    h=(h^coordinate_)*1099511628211ULL;return h?h:1;
+}
+std::uint64_t PooledImmutableLocalHotNativePack::captureIdentity()const
+{
+    require(*transport_->sourceBoundary()->pooledStorage());auto h=declarationIdentity();
+    for(const auto* pointer:sealed_)h=(h^reinterpret_cast<std::uintptr_t>(pointer))*1099511628211ULL;
+    h=(h^reinterpret_cast<std::uintptr_t>(sealed_header_bytes_))*1099511628211ULL;return h?h:1;
+}
+local_hot_transport::NativePackDescriptor PooledImmutableLocalHotNativePack::native()const
+{
+    require(*transport_->sourceBoundary()->pooledStorage());const auto& geometry=*transport_->localHotGeometry();
+    return {static_cast<const local_hot_transport::UnionControl*>(sealed_[4]),static_cast<const local_hot_transport::RequestHeader*>(sealed_[0]),
+        static_cast<local_hot_transport::ResultHeader*>(sealed_[1]),static_cast<std::byte*>(sealed_[2]),
+        static_cast<std::uint64_t*>(sealed_[3]),static_cast<std::uint64_t*>(sealed_header_bytes_),coordinate_,
+        static_cast<std::uint32_t>(geometry.consumers().size()),geometry.maximumPoolUniqueRows(),
+        static_cast<std::uint32_t>(geometry.sourceExtent().format()),consumer_->consumerStorageIdentity(),geometry.resultCapacityBytes()};
+}
+
+void PooledImmutableDirectedTransport::enqueueLocalHotAdmission(
+    const std::shared_ptr<PooledImmutableLocalHotPreparedStorage>& local,
+    const std::shared_ptr<const IPooledImmutableLocalHotKernels>& code,
+    const DeviceGenerationControlBinding& control,void* stream)const
+{
+    requireCurrent();
+    if(isGraphCaptureActive() || !local_hot_geometry_ || !local || !code || !stream || reinterpret_cast<std::uintptr_t>(stream)<=2 ||
+        local->originalSource()!=boundary_->pooledStorage())
+        throw std::invalid_argument("Local-hot request admission requires its original outside-capture source boundary");
+    const auto allocator=local->geometry().allocator();const auto device=allocator.device;
+    const auto found=std::find(local_hot_geometry_->consumers().begin(),local_hot_geometry_->consumers().end(),allocator);
+    if(found==local_hot_geometry_->consumers().end() || code->backend()!=device.type || !code->codeIdentity())
+        throw std::invalid_argument("Local-hot admission changed its actual consumer/native code");
+    const auto coordinate=static_cast<std::uint32_t>(found-local_hot_geometry_->consumers().begin());
+    const auto memory=boundary_->pooledStorage()->retainedPreparedSourceWorkers()->source()->memory();local->requireAuthority(memory);
+    const auto original=GPUDeviceContextPool::instance().retainExistingPreparedContext(device,memory);
+    if(!original.worker()->ownsCurrentThread())throw std::invalid_argument("Local-hot admission must execute on its original prepared worker");
+    control.requireFor(device);local->acquireSetup(stream);
+    local_hot_transport::MetadataArgs args{};args.device=device;args.first_error=control.error();args.healthy=control.healthy();
+    args.reporting=static_cast<local_hot::Counters*>(PooledNativeTransferSpan(local->roots().frame,
+        local->geometry().frameOffsets().counters,sizeof(local_hot::Counters)).pointer(device,alignof(local_hot::Counters)));
+    const auto& p=boundary_->pooledStorage()->geometry().parameters();args.source.table=p.owner.table;args.source.source_storage_generation=p.owner.source_storage_generation;
+    const auto header=localHotAdmission(device);
+    const auto bank=localHotControlRoot(device,coordinate);
+    auto* count=static_cast<std::uint64_t*>(PooledNativeTransferSpan(bank,offsetof(local_hot_transport::Control,admission_receive_bytes),8).pointer(device,8));
+    const auto dispatch=[&](local_hot_transport::MetadataAction action){
+        if(device.is_cuda()){
+#if defined(HAVE_CUDA)
+            local_hot_transport::enqueueCUDAPooledLocalHotTransport(action,args,stream);
+#else
+            throw std::logic_error("Local-hot request admission requires compiled CUDA");
+#endif
+        }else{
+#if defined(HAVE_ROCM)
+            local_hot_transport::enqueueROCmPooledLocalHotTransport(action,args,stream);
+#else
+            throw std::logic_error("Local-hot request admission requires compiled HIP");
+#endif
+        }
+    };
+    if(allocator==local_hot_geometry_->coordinator()){
+        const auto source=boundary_->pooledStorage();source->acquireSetup(stream);
+        args.source.original_admission=static_cast<const std::uint64_t*>(PooledNativeTransferSpan(source->roots().native,
+            p.offsets.protocol+offsetof(ImmutableLookupDeviceState,admissionGeneration),8).pointer(device,8));
+        args.source.original_invocation=static_cast<const std::uint64_t*>(PooledNativeTransferSpan(source->roots().native,p.offsets.invocation,8).pointer(device,8));
+        args.source.output=static_cast<local_hot_transport::SourceAdmissionHeader*>(header.pointer(device,8));args.fixed_header_bytes=count;
+        dispatch(local_hot_transport::MetadataAction::PublishSourceAdmission);
+        for(const auto& edge:local_hot_admission_)edge.source.enqueue(stream);
+    }else{
+        const auto edge=std::find_if(local_hot_admission_.begin(),local_hot_admission_.end(),[&](const auto& value){return value.coordinate==coordinate;});
+        if(edge==local_hot_admission_.end())throw std::logic_error("Local-hot admission lost its original native header endpoint");
+        edge->reader.enqueue(stream);args.admission=static_cast<const local_hot_transport::SourceAdmissionHeader*>(header.pointer(device,8));args.payload_bytes=count;
+        const auto reader=std::find_if(readers_.begin(),readers_.end(),[&](const auto& value){return value->coordinate()==coordinate;});
+        if(reader==readers_.end())throw std::logic_error("Local-hot admission lost its actual reader");
+        args.native_fixed_header=(*reader)->nativeResult().nativeStorage()->authority(device).binding();
+        dispatch(local_hot_transport::MetadataAction::AcceptSourceAdmission);
+    }
+    auto operands=PooledImmutableLocalHotOperands::requestReset(*local,local_hot_geometry_->consumer(coordinate,local->consumerStorageIdentity()),header,control);
+    operands.seal();code->enqueue(PooledImmutableLocalHotAction::ResetRequest,*local,operands,stream);
+}
+
 }

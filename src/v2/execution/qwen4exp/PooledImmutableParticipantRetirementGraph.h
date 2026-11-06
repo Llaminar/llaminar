@@ -58,6 +58,11 @@ PooledPinParticipantNodes appendPooledRetirementOwner(ComputeGraph& graph,Buffer
     std::shared_ptr<const qwen4exp::PooledImmutableCapturedRetirementWave> original,
     std::shared_ptr<const qwen4exp::IPooledImmutableNativeKernels> code,const std::string& lastReadSent,const std::string& prefix,
     const PooledImmutableReplicatedConsumerCompletion* consumer = nullptr);
+/** @brief Retire a colocated physical owner after its actual compact-native consumer ACK. */
+PooledPinParticipantNodes appendPooledRetirementOwnerAfterCompactConsumer(ComputeGraph& graph,BufferArena& arena,
+    std::shared_ptr<const qwen4exp::PooledImmutableCapturedRetirementWave> original,
+    std::shared_ptr<const qwen4exp::IPooledImmutableNativeKernels> code,const std::string& lastReadSent,
+    const std::string& prefix,const PooledImmutableCompactConsumerCompletion& consumer);
 /** @brief Append full ordered local/remote terminal protocol behind the authenticated real output/drain node. */
 PooledImmutableRetirementCompletion appendPooledRetirementCoordinator(ComputeGraph& graph,BufferArena& arena,
     const PooledImmutableReadCompletion& read,std::span<const qwen4exp::PooledImmutableRetirementParticipant> owners,
@@ -66,11 +71,19 @@ PooledImmutableRetirementCompletion appendPooledRetirementCoordinator(ComputeGra
 void requirePooledRetirementOwnerCompletion(const ComputeGraph& graph,
     const std::shared_ptr<const qwen4exp::PooledImmutableCapturedRetirementWave>& original,const std::string& retiredSent,
     const PooledImmutableReplicatedConsumerCompletion* consumer = nullptr);
+/** @brief Authenticate the same physical release chain and its original compact ACK dependency. */
+void requirePooledRetirementOwnerAfterCompactConsumer(const ComputeGraph& graph,
+    const std::shared_ptr<const qwen4exp::PooledImmutableCapturedRetirementWave>& original,
+    const std::string& retiredSent,const PooledImmutableCompactConsumerCompletion& consumer);
 /** @brief Authenticate true last reader, exact original phases/roots/channels and all reuse/commit edges. */
 void requirePooledRetirementCompletion(const ComputeGraph& graph,const PooledImmutableRetirementCompletion& original);
 /** @return Exact original Retired producer following the same typed consumer ACK in this cold actual graph. */
 std::string findPooledRetirementOwnerCompletion(const ComputeGraph& graph,
     const std::shared_ptr<const qwen4exp::PooledImmutableCapturedRetirementWave>& original,
     const PooledImmutableReplicatedConsumerCompletion& consumer);
+/** @return Unique actual physical terminal following this consumer's validated compact ACK. */
+std::string findPooledRetirementOwnerAfterCompactConsumer(const ComputeGraph& graph,
+    const std::shared_ptr<const qwen4exp::PooledImmutableCapturedRetirementWave>& original,
+    const PooledImmutableCompactConsumerCompletion& consumer);
 
 }

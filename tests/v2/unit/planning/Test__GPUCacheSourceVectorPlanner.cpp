@@ -145,6 +145,18 @@ TEST(GPUCacheSourceVectorPlanner, OriginalTwoWorkerSourceFeedsFinalQFNPlanAtC0An
         const auto program=qwen4exp::PooledImmutableDirectedOwnerProgram::declare(geometry.physical(),geometry.coordinator(),1);
         EXPECT_THROW(eventOnly.remoteHostBOM(program,request->input.host(),source->originalResource(remote)),std::invalid_argument);
         const auto host=cfg.native_ordering_events.remoteHostBOM(program,request->input.host(),source->originalResource(remote));
+        const auto complete=qwen4exp::PooledImmutableRetainedParticipantBudget::completeBOM(
+            geometry,request->input.host(),request->input.gpuResources(),cfg.native_ordering_events);
+        const auto floorComplete=qwen4exp::PooledImmutableRetainedParticipantBudget::completeBOM(
+            zero,request->input.host(),request->input.gpuResources(),cfg.native_ordering_events);
+        const auto floorHost=cfg.native_ordering_events.remoteHostBOM(
+            qwen4exp::PooledImmutableDirectedOwnerProgram::declare(zero.physical(),zero.coordinator(),1),
+            request->input.host(),source->originalResource(remote));
+        const auto holder=RetainedParticipantGraphSourceSlots::physicalBytes(geometry.physical().owners().size());
+        EXPECT_EQ(bytes(complete,{0,DeviceId::cpu()},PhysicalMemoryOwner::NativeStorageGraphExecutable),
+            bytes(host,{0,DeviceId::cpu()},PhysicalMemoryOwner::NativeStorageGraphExecutable)+holder);
+        EXPECT_EQ(bytes(floorComplete,{0,DeviceId::cpu()},PhysicalMemoryOwner::NativeStorageGraphExecutable),
+            bytes(floorHost,{0,DeviceId::cpu()},PhysicalMemoryOwner::NativeStorageGraphExecutable)+holder);
         // Storage-definition metadata has its own admitted purpose. It must
         // neither consume model graph capacity nor claim device payload here.
         EXPECT_GT(bytes(host,{0,DeviceId::cpu()},PhysicalMemoryOwner::NativeStorageGraphExecutable),0u);

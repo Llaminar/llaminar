@@ -464,5 +464,69 @@ class ExactLiveSelectionTests(unittest.TestCase):
         self.assertEqual(self.launched, [])
 
 
+
+class LosslessRuntimeDocumentTests(unittest.TestCase):
+    """Explicit source-owned document projection; no runtime or native admission is fabricated."""
+    def record(self):
+        """Declare only metadata wire input; this creates no native source authority."""
+        overrides = [{"participant": {"world_rank": 0, "backend": "ROCm", "ordinal": 1},
+                      "maximum_cache_rows": 64, "cache_physical_byte_limit": 4096}]
+        return {"model": "/original/main.gguf", "shared_predictor": "/original/mtp.gguf",
+                "runtime": {"configuration_policy": "lossless_declared_document_v1",
+                    "configuration_document": {"kind": "llaminar.orchestration-config", "schema_version": 12,
+                        "configuration": {"model_path": "/original/main.gguf", "shared_predictor": "/original/mtp.gguf",
+                            "ngram_table_policy": {"gpu_adaptive": {"local_hot_cache": {
+                                "maximum_cache_rows": 0, "cache_physical_byte_limit": 0,
+                                "consumer_overrides": overrides}}}}}}}
+
+    def test_unequal_document_maps_both_original_sources_and_materializes_public_config(self):
+        original = self.record()
+        mapped = inventory.map_predictor_source(original, lambda p: "/staged/" + Path(p).name)
+        with tempfile.TemporaryDirectory() as directory:
+            argv = inventory.runtime_server_arguments(mapped, Path(directory), "/staged/main.gguf")
+            self.assertEqual(argv[0], "--config")
+            actual = json.loads(Path(argv[1]).read_text())["configuration"]
+            self.assertEqual(actual["model_path"], "/staged/main.gguf")
+            self.assertEqual(actual["shared_predictor"], "/staged/mtp.gguf")
+            self.assertEqual(actual["ngram_table_policy"], original["runtime"]["configuration_document"]["configuration"]["ngram_table_policy"])
+            with self.assertRaises(FileExistsError):
+                inventory.runtime_server_arguments(mapped, Path(directory), "/staged/main.gguf")
+        self.assertEqual(original["runtime"]["configuration_document"]["configuration"]["model_path"], "/original/main.gguf")
+
+    def test_malformed_foreign_and_conflicting_arms_reject_before_file_creation(self):
+        mutations = [lambda r: r["runtime"].update(server_args=[]),
+                     lambda r: r["runtime"].update(configuration_policy="unknown"),
+                     lambda r: r["runtime"]["configuration_document"].update(kind="foreign"),
+                     lambda r: r["runtime"]["configuration_document"]["configuration"].update(model_path="/foreign/main.gguf"),
+                     lambda r: r["runtime"]["configuration_document"]["configuration"].update(shared_predictor="/foreign/mtp.gguf")]
+        for mutate in mutations:
+            record = self.record(); mutate(record)
+            with self.assertRaises(ValueError):
+                inventory.map_predictor_source(record, str)
+        mapped = inventory.map_predictor_source(self.record(), str)
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ValueError):
+                inventory.runtime_server_arguments(mapped, Path(directory), "/foreign/main.gguf")
+            self.assertEqual(list(Path(directory).iterdir()), [])
+        self.assertEqual(inventory.runtime_server_arguments({"runtime": {"server_args": ["--no-mtp"]}}, Path("unused"), "unused"), ["--no-mtp"])
+
+    def test_lossless_benchmark_remaps_same_original_sources_and_rejects_ambiguous_arm(self):
+        original=self.record()
+        original['diagnostic_benchmark']={**copy.deepcopy(original['runtime']),
+            'schema':1,'policy':'diagnostic_declared','certification_eligible':False,'context_length':512}
+        mapped=inventory.map_predictor_source(original,lambda p:'/staged/'+Path(p).name)
+        runtime=mapped['runtime']['configuration_document']['configuration']
+        benchmark=mapped['diagnostic_benchmark']['configuration_document']['configuration']
+        self.assertEqual(runtime,benchmark)
+        self.assertEqual(benchmark['model_path'],'/staged/main.gguf')
+        self.assertEqual(benchmark['shared_predictor'],'/staged/mtp.gguf')
+        self.assertEqual(benchmark['ngram_table_policy'],original['runtime']['configuration_document']['configuration']['ngram_table_policy'])
+        for mutate in (lambda r:r['diagnostic_benchmark'].update(args=[]),
+                lambda r:r['diagnostic_benchmark']['configuration_document']['configuration'].update(shared_predictor='/foreign/mtp.gguf'),
+                lambda r:r['diagnostic_benchmark']['configuration_document'].update(kind='foreign')):
+            bad=copy.deepcopy(original);mutate(bad)
+            with self.assertRaises(ValueError):inventory.map_predictor_source(bad,str)
+
+
 if __name__ == "__main__":
     unittest.main()

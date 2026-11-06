@@ -9,7 +9,9 @@ the full pipeline owns those operations after all correctness gates pass.
 Full same-image E2E evidence is required unless --diagnostic explicitly selects
 a one-off experiment that cannot certify an image.
 ``--diagnostic-binary`` checks the exact canonical matrix before a new image is
-published; it cannot produce or consume an image E2E receipt.
+published; it cannot produce or consume an image E2E receipt. Explicit declared
+focused panels retain their diagnostic prerequisite scope and reuse the original
+complete-row accuracy evaluator; they never become image/canonical acceptance.
 """
 from __future__ import annotations
 
@@ -170,19 +172,42 @@ def run_cell(image: str | None, backends: str, directory: Path, model: Path,
     return json.loads(output.read_text())
 
 
-def declared_panel_eligibility(panel: dict, exact: str, record: dict, workload: dict) -> dict:
+def declared_panel_eligibility(panel: dict, exact: str, record: dict, workload: dict, *,
+        allow_focused_diagnostic: bool = False) -> dict:
     """Require genuine completed numerical acceptance of this identical exported policy/workload."""
     paired = panel.get("paired_workload")
-    if (panel.get("mode") not in ("local_paired_canonical_accuracy", "local_fixed_history_diagnostic")
-            or panel.get("complete") is not True or panel.get("passed") is not True
+    focused = panel.get("mode") == "local_paired_focused_diagnostic"
+    if focused:
+        # This explicit diagnostic receipt never becomes a canonical green.
+        # Its original row evaluator is replayed below after source admission.
+        prerequisites = panel.get("prerequisites", {})
+        declaration = record.get("paired_workload")
+        accuracy = declaration.get("accuracy", {}) if isinstance(declaration, dict) else {}
+        policy = accuracy.get("policy") if isinstance(accuracy, dict) else None
+        verdict = "REQUIRED_GROUPS_GREEN" if policy == "initial_absolute_pilot" else "GREEN"
+        if (not allow_focused_diagnostic or policy not in ("initial_absolute_pilot", "calibrated_revision")
+                or panel.get("schema") != 2 or panel.get("status") != "DIAGNOSTIC_PANEL_COMPLETE"
+                or panel.get("accuracy_verdict") != verdict or panel.get("verdict") != "DIAGNOSTIC_" + verdict
+                or panel.get("diagnostic_passed") is not True or "passed" not in panel or panel["passed"] is not None
+                or panel.get("certification_eligible") is not False or panel.get("full_preflight") is not False
+                or not isinstance(prerequisites, dict) or prerequisites.get("available") is not True
+                or prerequisites.get("mode") != "focused_DeviceFree_diagnostic"
+                or prerequisites.get("full_preflight") is not False
+                or prerequisites.get("native_backend_regressions") != "not_covered_by_DeviceFree_selection"
+                or not isinstance(paired, dict) or not isinstance(panel.get("cells"), list) or len(panel["cells"]) != 1):
+            raise ValueError("focused numerical panel is not an explicit noncertifying green diagnostic")
+        accepted = True
+    else:
+        accepted = (panel.get("mode") in ("local_paired_canonical_accuracy", "local_fixed_history_diagnostic")
+            and panel.get("passed") is True and "diagnostic_passed" not in panel
+            and not str(panel.get("status", "")).startswith("DIAGNOSTIC_")
+            and not str(panel.get("verdict", "")).startswith("DIAGNOSTIC_"))
+    if (not accepted or panel.get("complete") is not True
             or panel.get("observations_complete") is not True
             or (paired is not None and (paired.get("exact_cell") != exact or paired.get("source_export") != record))):
         raise ValueError("declared benchmark requires green numerical panel for the identical canonical cell")
-    profile = record.get("diagnostic_benchmark", {})
-    if (profile.get("schema") != 1 or profile.get("policy") != "diagnostic_declared"
-            or profile.get("certification_eligible") is not False or not profile.get("args")
-            or any(type(arg) is not str or not arg or "\0" in arg for arg in profile["args"])):
-        raise ValueError("unsupported declared benchmark policy")
+    from model_kld_corpus_execution import declared_benchmark_profile
+    profile = declared_benchmark_profile(record)
     cells = panel.get("cells", [])
     if not cells or any(cell.get("passed") is not True or cell.get("complete") is not True
             or cell.get("observations_complete") is not True or cell.get("native_retired") is not True
@@ -191,6 +216,30 @@ def declared_panel_eligibility(panel: dict, exact: str, record: dict, workload: 
         raise ValueError("numerical panel has incomplete native/driver/cleanup proof")
     validate_workload(workload)
     return profile
+
+
+def declared_focused_accuracy_scope(panel: dict, selection, cell: dict) -> dict:
+    """Replay the original row/threshold evaluator; preserve focused prerequisite limits.
+
+    This reads scored metadata only. It never reads logits, changes an input
+    verdict, invents calibration or runs prerequisites to repair their scope.
+    """
+    import model_kld_corpus_execution as owner
+    documents = selection.documents
+    summary = owner.corpus_v2.summarize(selection.corpus['manifest'], cell.get('metrics'),
+        documents.get('baseline'), documents.get('approval'),
+        calibration=documents.get('calibration'), absolute_pilot=documents.get('pilot'))
+    if (summary.get('passed') is not True or summary != cell.get('numerical_summary')
+            or summary.get('native_identity') != cell.get('native_identity')
+            or panel.get('calibrated') is not summary.get('calibrated')
+            or panel.get('scope') != summary.get('scope')
+            or (documents.get('pilot') is not None and panel.get('whole_corpus_accepted') is not False)):
+        raise ValueError("focused numerical panel differs from original complete row/policy evaluation")
+    return dict(mode=panel['mode'], status=panel['status'], verdict=panel['verdict'],
+        accuracy_verdict=panel['accuracy_verdict'], diagnostic_passed=True,
+        scope=summary['scope'], calibrated=summary['calibrated'],
+        full_preflight=False, certification_eligible=False,
+        prerequisites=panel['prerequisites'])
 
 
 def declared_config_identity(selection, observed: dict, parser: Path, environment: dict) -> dict:
@@ -289,8 +338,8 @@ def finish_declared_driver(driver, output: Path) -> None:
         raise ValueError("declared benchmark driver window failed")
 
 
-def declared_inventory(args, binary: Path):
-    """Read the source-bound ALL export from Integration; Release owns execution, never a second matrix."""
+def declared_inventory(args, binary: Path, *, scope=None):
+    """Read an explicit source inventory; canonical scope remains ALL by default."""
     from types import SimpleNamespace
     import model_parity_inventory as inventory
     from model_kld_corpus import identity, unchanged
@@ -300,7 +349,7 @@ def declared_inventory(args, binary: Path):
     pins = {str(path): identity(path)}
     selected = inventory.discover(SimpleNamespace(build_dir=binary.parent, manifest=path,
         source_revision=args.source_revision, backend='.*', campaign='.*', cell=re.escape(args.declared_cell)),
-        inventory.InventoryScope.ALL)
+        inventory.InventoryScope.ALL if scope is None else scope)
     unchanged(pins)
     if len(selected) != 1 or selected[0][1] != args.declared_cell:
         raise ValueError("declared benchmark needs one exact source-manifest cell")
@@ -387,6 +436,8 @@ def _validate_declared_passive_evidence(data: dict) -> dict:
     terminal = {}
     submissions = []
     resets = {}
+    local_setup = []
+    local_terminal = []
     for record in records:
         if not isinstance(record,dict) or record.get('kind') != 'counter':
             raise ValueError('passive evidence contains a non-counter observation')
@@ -417,8 +468,14 @@ def _validate_declared_passive_evidence(data: dict) -> dict:
         elif domain == 'immutable_lookup_setup':
             if name != 'admitted_owner' or phase != 'setup' or count != 1 or value != 1:
                 raise ValueError('passive admitted setup is missing, repeated or not immutable')
-            setup.append((device,tags))
+            if tags.get('role') in ('local_gpu_cache','local_ready'):
+                local_setup.append((device,tags))
+            else:
+                setup.append((device,tags))
         elif domain == 'ngram_lookup':
+            if str(name).startswith('local_'):
+                local_terminal.append(record)
+                continue
             if phase != 'hosted_transaction' or name not in ('retained_source_native_invocations','retained_remote_native_enqueues') or tags != {'policy':'retained_hosted'}:
                 raise ValueError('passive native submission evidence is not the original submission schema')
             # These are submission observations, never a native payload byte oracle.
@@ -474,6 +531,7 @@ def _validate_declared_passive_evidence(data: dict) -> dict:
 
 
     if not adaptive:
+        if local_setup or local_terminal:raise ValueError('ordinary lookup cannot claim local hot cache evidence')
         if setup:raise ValueError('ordinary lookup cannot claim adaptive admitted setup')
         return dict(collection_policy=DECLARED_PASSIVE_POLICY,adaptive=False,
             expert_selection=expert,qualification_limits=['ordinary lookup schema remains its original mode contract'])
@@ -511,6 +569,8 @@ def _validate_declared_passive_evidence(data: dict) -> dict:
         if any(v is None or v=='' for v in identity) or source_identity is not None and identity!=source_identity:
             raise ValueError('passive setup combines different original sources')
         source_identity=identity
+        if 'local_storage_identity' in tags or 'local_consumer' in tags:
+            raise ValueError('legacy passive setup cannot carry local root lineage')
         key=(values['world_rank'],device);role=tags.get('role')
         if role not in ('gpu_cache','gpu_policy','gpu_source_staging','shared_host_source') or (key,role) in seen:
             raise ValueError('passive setup duplicates or invents a physical role')
@@ -588,9 +648,112 @@ def _validate_declared_passive_evidence(data: dict) -> dict:
         measured_scope='original_benchmark_reset_before_measurement',setup=[dict(device=d,tags=t) for d,t in setup],
         expert_selection=sorted(expert,key=lambda x:(x['device'],x['layer'],x['participant'])),
         terminal_observations=observations,native_submission_observations=submissions,reset_terminal_observations=resets,
+        local_hot=validate_declared_local_hot_evidence(request,continuation,coordinators,local_setup,local_terminal,source_identity),
         qualification_limits=['aggregate_gpu_hits_do_not_identify_locality','native_submissions_are_not_wire_bytes',
             'mapping_window_misses_are_not_ssd_io','startup_full_ram_preload_is_outside_measured_window'])
 
+
+
+# Stable native terminal publication schema: original-L1 IDs, native rows, then
+# receipt-completed bytes. These are not a row-format/size or admission table.
+LOCAL_TERMINAL_NAMES = (
+    'local_read_original_ids','local_hit_original_ids','local_all_hit_wait_avoided_original_ids','local_consumed_original_ids',
+    'local_future_on_time_native_rows','local_future_late_native_rows','local_future_useful_native_rows','local_future_wasted_native_rows',
+    'local_promotions','local_evictions','local_request_key_payload_bytes','local_native_result_payload_bytes',
+    'local_lookup_control_header_bytes','local_acknowledgement_bytes','local_request_admission_bytes')
+
+
+def validate_declared_local_hot_evidence(request,continuation,coordinators,setup,records,source_identity):
+    """Bind completed native L1 windows to original cold roots; never infer locality or time.
+
+    This consumes the same fifteen-field publication contract as the native
+    terminal observer. Initial storage windows occur once per storage, not once
+    per request; subsequent windows retain their actual aggregated count.
+    """
+    local=request.get('local_hot_cache')
+    if local is None:
+        if setup or records:raise ValueError('shared-only lookup cannot claim local cache observations')
+        return None
+    if request.get('placement',{}).get('mode')!='DeclaredRankLocal':
+        raise ValueError('local hot cache requires original declared shared placement')
+    expected={key:(local['maximum_cache_rows'],local['cache_physical_byte_limit']) for key in continuation}
+    overridden=set()
+    for override in local.get('consumer_overrides',[]):
+        p=override['participant']
+        key=(_passive_uint(p['world_rank'],'local consumer rank'),_passive_device(f"{p['backend']}:{p['ordinal']}"))
+        if key not in expected or key in overridden:raise ValueError('foreign or duplicate local ceiling override')
+        overridden.add(key);expected[key]=(override['maximum_cache_rows'],override['cache_physical_byte_limit'])
+    cache={};ready={};storage_ids=set()
+    numeric=('world_rank','admitted_slots','payload_bytes','metadata_bytes','source_storage_bytes','table_storage_bytes','lookup_staging_bytes',
+        'source_generation','source_file_offset','source_rows','source_row_elements','source_row_bytes','local_storage_identity')
+    for device,tags in setup:
+        if any(not isinstance(tags.get(name),str) for name in numeric):raise ValueError('local setup lost original numeric tags')
+        values={name:_passive_uint(tags[name],'local setup '+name) for name in numeric}
+        identity=tuple(tags.get(k) for k in ('source_path','source_tensor','source_format','source_generation','source_file_offset','source_rows','source_row_elements','source_row_bytes'))
+        consumer=_passive_device(tags.get('local_consumer'))
+        key=(values['world_rank'],consumer);role=tags.get('role')
+        if key not in expected or identity!=source_identity or tags.get('storage')!=('gpu_subordinate_full_ram' if request['source_backing']=='RAM' else 'host_adaptive_ram_ssd') or not values['local_storage_identity'] or not values['lookup_staging_bytes']:
+            raise ValueError('local setup changed original source, consumer or live root')
+        if values['table_storage_bytes']!=values['payload_bytes']+values['metadata_bytes']+values['source_storage_bytes']:
+            raise ValueError('local setup physical byte partition is inconsistent')
+        if role=='local_gpu_cache':
+            maximum,ceiling=(_passive_uint(v,'local ceiling') for v in expected[key])
+            if device!=consumer or key in cache or values['local_storage_identity'] in storage_ids or values['source_storage_bytes'] or \
+                values['admitted_slots']>maximum or values['table_storage_bytes']>ceiling or \
+                bool(values['admitted_slots'])!=bool(values['table_storage_bytes']) or \
+                values['payload_bytes']!=values['admitted_slots']*values['source_row_bytes'] or \
+                (maximum and ceiling and not values['admitted_slots']):
+                raise ValueError('local native cache differs from original admitted ceiling/root')
+            cache[key]=values;storage_ids.add(values['local_storage_identity'])
+        elif role=='local_ready':
+            if device!='CPU:0' or key in ready or any(values[k] for k in ('admitted_slots','payload_bytes','metadata_bytes','source_storage_bytes','table_storage_bytes')):
+                raise ValueError('local ready page is foreign, duplicated or aliases native cache')
+            ready[key]=values
+        else:raise ValueError('unknown local setup role')
+    if set(cache)!=set(expected) or set(ready)!=set(expected) or any(cache[k]['local_storage_identity']!=ready[k]['local_storage_identity'] for k in expected):
+        raise ValueError('local setup requires one exact GPU/ready pair per original consumer')
+    windows={};reads={key:0 for key in expected}
+    for record in records:
+        name=record['name'];device=_passive_device(record['device']);tags=record['tags'];count=_passive_uint(record['count'],'local count')
+        matches=[key for key in expected if key[1]==device]
+        if len(matches)!=1 or name not in LOCAL_TERMINAL_NAMES or record['phase']!='generation_terminal':
+            raise ValueError('local terminal changed original participant or field')
+        key=matches[0];index=LOCAL_TERMINAL_NAMES.index(name);window=tags.get('window')
+        required={'authority':'completed_local_hot_terminal','storage_identity':str(cache[key]['local_storage_identity']),
+            'unit':'original_l1_ids' if index<4 else 'native_rows' if index<10 else 'bytes',
+            'wire_attribution':'receive_completed_only','window':window}
+        value=_passive_uint(record['value'],'local total')
+        minimum=record.get('sequence_minimum_words');maximum=record.get('sequence_maximum_words')
+        if tags!=required or window not in ('since_original_storage_initialization','between_completed_terminals') or \
+            (window=='since_original_storage_initialization' and count!=1) or not count or value>9007199254740991 or \
+            _passive_uint(record.get('sequence_word_count'),'local exact sequence word count')!=count or not isinstance(minimum,list) or not isinstance(maximum,list) or len(minimum)!=1 or len(maximum)!=1:
+            raise ValueError('local terminal changed root, window, units or completed publication')
+        low=_passive_uint(minimum[0],'local minimum');high=_passive_uint(maximum[0],'local maximum')
+        if low>high or not low*count<=value<=high*count:raise ValueError('local terminal aggregate is not its completed observations')
+        group=windows.setdefault((key,window),{})
+        if name in group:raise ValueError('duplicate local terminal field')
+        group[name]=(count,value)
+    observations=[]
+    for (key,window),group in windows.items():
+        if set(group)!=set(LOCAL_TERMINAL_NAMES) or len({count for count,_ in group.values()})!=1:
+            raise ValueError('local terminal window is incomplete')
+        v=[group[name][1] for name in LOCAL_TERMINAL_NAMES];width=cache[key]['source_row_bytes']
+        if any(v[4:8]):raise ValueError('current-only compact delivery cannot report future native work')
+        if v[1]>v[0] or v[2]>v[1] or v[3]>v[0] or (not cache[key]['admitted_slots'] and any(v[i] for i in (1,8,9))):
+            raise ValueError('local terminal original-L1 work or C0 churn is impossible')
+        if key in coordinators:
+            # Native protocol Request88 / Result96; self produces no wire.
+            if v[11] or v[14] or v[10]%8 or v[12]%88 or v[13]%96 or v[12]//88!=v[13]//96:
+                raise ValueError('local coordinator wire is not completed foreign receives')
+        elif v[10] or v[13] or v[11]%width or v[12]%96 or v[14]%40 or v[11]//width>v[0]-v[1]:
+            raise ValueError('local reader wire exceeds completed native misses')
+        reads[key]+=v[0]
+        observations.append(dict(world_rank=key[0],device=key[1],storage_identity=cache[key]['local_storage_identity'],
+            window=window,count=next(iter(group.values()))[0],counters={name:group[name][1] for name in LOCAL_TERMINAL_NAMES}))
+    if any(not value for value in reads.values()):raise ValueError('local terminal omitted useful work on an original consumer')
+    return dict(setup=[dict(device=device,tags=tags) for device,tags in setup],terminal_observations=observations,
+        qualification_limits=['original_l1_ids_are_not_compact_pool_rows','lifetime_windows_are_not_requests','legacy_source_and_local_windows_are_not_implicitly_paired',
+            'future_shared_misses_not_supported','physical_budget_pairing_requires_final_original_pma_costs'])
 
 def validate_declared_passive_evidence(data: dict) -> dict:
     """Reject incomplete external documents through the original passive schema owner."""
@@ -614,11 +777,23 @@ def run_declared_diagnostic(args) -> int:
     if parser.parent != binary.parent:
         raise ValueError("benchmark parser must belong to the same original Release build")
     e2e.release_binary_cpu_isa(parser)
-    (_campaign, exact, record), inventory_pins = declared_inventory(args,binary)
-    selection = paired_owner.PairedCorpusSelection.from_export(exact, record, args.corpus_root, ROOT)
-    panel = json.loads(args.panel_report.read_text())
+    panel_path = args.panel_report.resolve(strict=True)
+    panel_pin = identity(panel_path)
+    panel = json.loads(panel_path.read_text())
+    unchanged({str(panel_path):panel_pin})
+    focused = panel.get('mode') == 'local_paired_focused_diagnostic'
+    import model_parity_inventory as inventory
+    scope = inventory.InventoryScope.LOCAL_DIAGNOSTIC if focused else inventory.InventoryScope.ALL
+    (_campaign, exact, record), inventory_pins = declared_inventory(args,binary,scope=scope)
+    output = args.report.parent / (args.report.stem + '-artifacts')
+    if not args.list:
+        output.mkdir(parents=True, exist_ok=False)
+    selection = paired_owner.PairedCorpusSelection.from_export(exact, record, args.corpus_root, ROOT,
+        metadata_policy=paired_owner.PairedMetadataPolicy.SOURCE_BOUND_DIAGNOSTIC if focused
+            else paired_owner.PairedMetadataPolicy.CANONICAL_ROOT,
+        configuration_directory=None if args.list else output)
     workload = json.loads(args.workload.read_text())
-    profile = declared_panel_eligibility(panel, exact, record, workload)
+    profile = declared_panel_eligibility(panel, exact, record, workload,allow_focused_diagnostic=focused)
     cell_directory = args.panel_report.parent / selection.topology['id']
     observed = json.loads((cell_directory/'described-config.json').read_text())
     paired_owner.validate_described_config(selection.topology, observed)
@@ -646,20 +821,22 @@ def run_declared_diagnostic(args) -> int:
             or panel.get('binary',{}).get('sha256') != native.get('native_identity',{}).get('executable_sha256')):
         raise ValueError("numerical panel lacks original native source/config/publication proof")
 
+    accuracy_scope = declared_focused_accuracy_scope(panel,selection,cell) if focused else None
     if json.loads(selection.paths['benchmark'].read_text()) != workload:
         raise ValueError("benchmark workload differs from the original paired obligation")
     pins = {**declared_source_pins(selection), **inventory_pins}
     for path in (cell_directory/'described-config.json',cell_directory/'controller.json',cell_directory/'native-observation.json'):
         pins[str(path)] = identity(path)
 
-    for path in (binary, parser, args.panel_report.resolve(strict=True), args.workload.resolve(strict=True)):
+    pins[str(panel_path)] = panel_pin
+    for path in (binary, parser, args.workload.resolve(strict=True)):
         pins[str(path)] = identity(path)
     if args.list:
         unchanged(pins)
         print(f"[declared-diagnostic-benchmark] eligible {exact}")
+        if focused:
+            print("[declared-diagnostic-benchmark] focused_accuracy_only full_preflight=false certification_eligible=false")
         return 0
-    output = args.report.parent / (args.report.stem + '-artifacts')
-    output.mkdir(parents=True, exist_ok=False)
     environment = declared_environment(os.environ,workload,selection.topology['arithmetic'],output)
     canonical = declared_config_identity(selection, observed, parser, environment)
     write_json(output/'described-config.json', canonical)
@@ -667,7 +844,14 @@ def run_declared_diagnostic(args) -> int:
     if not helper.is_file() or not os.access(helper,os.X_OK):
         raise ValueError("missing original MPI session retirement helper")
     prompt = validate_workload(workload)
-    engine = ['benchmark',*profile['args'],'-m',record['model'],'--context-length',str(profile['context_length']),
+    # Retain the identical source document in this existing artifact directory;
+    # command evidence never depends on a temporary parser input after return.
+    if 'configuration_document' in profile:
+        engine_arguments=selection.canonical_arguments
+    else:
+        engine_arguments,configuration_owner,configuration_pins=paired_owner.canonical_diagnostic_arguments(record,output)
+        pins.update(configuration_pins)
+    engine = ['benchmark',*engine_arguments,
         '--prompt',prompt,'-n',str(workload['decode_tokens']),'--seed',str(workload['seed']),
         '--temperature',str(workload['temperature']),'--top-k',str(workload['top_k']),
         '--top-p',str(workload['top_p']),'--benchmark-json-output',str(output/'benchmark.json')]
@@ -677,6 +861,8 @@ def run_declared_diagnostic(args) -> int:
         exact_cell=exact, source_export=record, complete=False, passed=False,
         collection_policy=DECLARED_PASSIVE_POLICY,
         panel_report=str(args.panel_report), workload=workload)
+    if focused:
+        result.update(full_preflight=False,accuracy_prerequisite=accuracy_scope)
     armed = False
     try:
         unchanged(pins)

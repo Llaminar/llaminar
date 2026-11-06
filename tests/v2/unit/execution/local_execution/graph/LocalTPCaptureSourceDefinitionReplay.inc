@@ -24,7 +24,18 @@ public:
         ++coldValidations;requireRecordedIdentity(value);
     }
     void requireRecordedIdentity(const RetainedGraphParticipantPreparationStream& value)const{
-        value.requireLive(original_);const auto& d=value.definition();
+        const auto& d=value.definition();
+        if(d.scope==RetainedGraphParticipantDefinitionScope::AuxiliaryReader){
+            value.requireLive(value.originalSource());
+            if(d.graph!=readerGraph || d.arena!=readerArena || d.plan.get()!=this ||
+               !readerGraph || d.topology_generation!=readerGraph->topologyGeneration() ||
+               d.variant!=expectedVariant || d.domain!=definitionDomain() ||
+               d.original_source_definition!=readerSource.lock() || !readerGraph->retainedParticipantAuxiliaryRange() ||
+               d.range_identity!=readerGraph->retainedParticipantAuxiliaryRange()->identity)
+                throw std::logic_error("Recorded reader definition changed its exact original source/range");
+            return;
+        }
+        value.requireLive(original_);
         if(d.plan.get()!=this || d.graph!=graph || d.arena!=arena || d.domain!=definitionDomain() ||
            !graph || d.topology_generation!=graph->topologyGeneration() || d.variant!=expectedVariant ||
            graph->retainedParticipantSourcePlan().get()!=this)
@@ -47,6 +58,9 @@ public:
     uint64_t expectedVariant=511;
     const ComputeGraph* graph=nullptr;
     const void* arena=nullptr;
+    const ComputeGraph* readerGraph=nullptr;
+    const void* readerArena=nullptr;
+    std::weak_ptr<const RetainedGraphParticipantPreparationStream> readerSource;
 private:PreparedGPUContextUsePermit original_;
 };
 /** @brief Original cache token retires before its referenced graph or source context. */
@@ -538,4 +552,130 @@ TEST(RetainedGraphParticipantEnqueueGroup, ExpertSourceFamilyDraftRequestManifes
     EXPECT_THROW(MoEOverlayFollowerRowGeometry::declareDraft(33,backing),std::invalid_argument);
 }
 
+} // namespace llaminar2::test
+
+namespace llaminar2::test {
+namespace {
+/** @brief Metadata replay of the existing attachment liveness check; grants no native execution. */
+class ReaderProjectionAttachment final:public IRetainedGraphParticipantStorageAttachment {
+public:
+    bool attachTo(IGPUGraphCapture&,IGraphCaptureAuxiliaryBranch*)override{throw std::logic_error("Metadata replay has no native parent");}
+    void requireCurrent()const override{++checks;if(!live)throw std::logic_error("Recorded parent attachment retired");}
+    bool live=true;
+    mutable unsigned checks=0;
+};
+}
+/** @test An actual associated reader is authenticated without becoming source-free or a second source owner. */
+TEST(RetainedGraphParticipantEnqueueGroup, ExpertSourceFamilyAssociatedReaderProjection)
+{
+    using A=NativeContextPreparationReplayAccess;
+    for(const bool cuda:{true,false}){
+        const auto owner=cuda?DeviceId::cuda(104):DeviceId::rocm(104);
+        const auto reader=cuda?DeviceId::cuda(105):DeviceId::rocm(105);
+        const std::array devices{owner,reader};
+        for(const auto device:devices)A::seed(device,[device](auto stack){return A::construct<ColdPreparationWorker>(std::move(stack),device.ordinal);});
+        const std::array resources{PhysicalMemoryResource{0,DeviceId::cpu(),256u<<20,256u<<20},
+            PhysicalMemoryResource{0,owner,64u<<20,64u<<20},PhysicalMemoryResource{0,reader,64u<<20,64u<<20}};
+        auto population=A::source<ColdPreparationWorker>(devices,resources);
+        ColdPreparationRetirement retireOwner{owner},retireReader{reader};
+        ColdDefinitionReplay source(population->acquire(owner));source.token->requireDefinition();
+        ComputeGraph graph;graph.setRetainedParticipantDefinitionDomain(source.plan->definitionDomain());
+        for(const auto* name:{"probe","read","publish","retire"})
+            graph.addNode(name,std::make_unique<testing::MockComputeStage>(ComputeStageType::GEMM,name,reader),reader);
+        graph.setRetainedParticipantAuxiliaryRange({.role=RetainedGraphParticipantAuxiliaryRole::Reader,
+            .participant=reader,.nodes={"publish","retire"},.probe_ready="probe",.ready_publication="publish",
+            .main_read="read",.retirement="retire",.identity=725});
+        int arena=0;source.plan->readerGraph=&graph;source.plan->readerArena=&arena;source.plan->readerSource=source.token;
+        auto body=RetainedGraphParticipantsReplayAccess::definition(population->acquire(reader),reinterpret_cast<void*>(0x9191),
+            {&graph,&arena,graph.topologyGeneration(),511,source.plan->definitionDomain(),source.plan,
+             RetainedGraphParticipantDefinitionScope::AuxiliaryReader,reader,725,source.token});
+        body->requireDefinition();ReaderProjectionAttachment attachment;
+        ForwardGraphSignature signature;signature.batch_size=1;signature.seq_len=3;signature.device=reader;signature.decode=true;
+        const auto project=[&](std::shared_ptr<const RetainedGraphParticipantPreparationStream> received,std::shared_ptr<const RetainedGraphParticipantPreparationStream> auxiliary,const IRetainedGraphParticipantStorageAttachment* parent){
+            return RetainedForwardSourceDefinition::projectOwned(signature,MoEOverlayInferenceGraphRole::MainDecode,
+                3,graph,511,{},received,auxiliary,parent);
+        };
+        // Literal original failing boundary: a domain-bearing reader cannot be
+        // represented by checked() as either owned-source or source-free.
+        EXPECT_THROW(RetainedForwardSourceDefinition::checked(signature,MoEOverlayInferenceGraphRole::MainDecode,
+            3,graph,511,{}),std::invalid_argument);
+        for(int repeat=0;repeat<20;++repeat){
+            EXPECT_FALSE(project(source.token,body,&attachment));
+            auto ownerSignature=signature;ownerSignature.device=owner;
+            auto owned=RetainedForwardSourceDefinition::projectOwned(ownerSignature,MoEOverlayInferenceGraphRole::MainDecode,
+                3,source.graph,511,source.token,{}, {},nullptr);
+            ASSERT_TRUE(owned);EXPECT_EQ(owned->source,source.token);
+            const std::array originals{*owned};EXPECT_EQ(retainedExpertSourceVariants(originals,false,3).size(),1u);
+        }
+        EXPECT_EQ(attachment.checks,20u);
+        EXPECT_THROW(project({},body,&attachment),std::invalid_argument);
+        EXPECT_THROW(project(source.token,{},&attachment),std::invalid_argument);
+        EXPECT_THROW(project(source.token,body,nullptr),std::invalid_argument);
+        const auto relabelled=std::shared_ptr<const RetainedGraphParticipantPreparationStream>(source.token.get(),[](const auto*){});
+        EXPECT_THROW(project(relabelled,body,&attachment),std::invalid_argument);
+        ColdDefinitionReplay foreign(population->acquire(owner));foreign.token->requireDefinition();
+        EXPECT_THROW(project(foreign.token,body,&attachment),std::invalid_argument);
+        auto wrong=signature;wrong.device=owner;
+        EXPECT_THROW(RetainedForwardSourceDefinition::projectOwned(wrong,MoEOverlayInferenceGraphRole::MainDecode,
+            3,graph,511,{},source.token,body,&attachment),std::invalid_argument);
+        EXPECT_THROW(RetainedForwardSourceDefinition::projectOwned(signature,MoEOverlayInferenceGraphRole::MainDecode,
+            2,graph,511,{},source.token,body,&attachment),std::invalid_argument);
+        EXPECT_THROW(RetainedForwardSourceDefinition::projectOwned(signature,MoEOverlayInferenceGraphRole::MainPrefill,
+            3,graph,511,{},source.token,body,&attachment),std::invalid_argument);
+        EXPECT_THROW(RetainedForwardSourceDefinition::projectOwned(signature,MoEOverlayInferenceGraphRole::MainDecode,
+            3,graph,512,{},source.token,body,&attachment),std::invalid_argument);
+        attachment.live=false;EXPECT_THROW(project(source.token,body,&attachment),std::logic_error);attachment.live=true;
+        RetainedGraphParticipantsReplayAccess::retire(*body);
+        EXPECT_THROW(project(source.token,body,&attachment),std::logic_error);
+        auto replacement=RetainedGraphParticipantsReplayAccess::definition(population->acquire(reader),reinterpret_cast<void*>(0x9191),body->definition());
+        replacement->requireDefinition();
+        RetainedGraphParticipantsReplayAccess::retire(*source.token);
+        EXPECT_THROW(project(source.token,replacement,&attachment),std::logic_error);
+        RetainedGraphParticipantsReplayAccess::retire(*replacement);
+        source.plan->readerSource.reset();
+    }
+}
+
+} // namespace llaminar2::test
+
+namespace llaminar2::test {
+/** @test Original captured source tokens cover retained expert rows even when the first request is Off. */
+TEST(RetainedGraphParticipantEnqueueGroup, ExpertSourceFamilyRetainedRowsAcrossInitialPolicies)
+{
+    using A=NativeContextPreparationReplayAccess;
+    const auto device=DeviceId::cuda(106);
+    A::seed(device,[device](auto stack){return A::construct<ColdPreparationWorker>(std::move(stack),device.ordinal);});
+    auto source=A::source<ColdPreparationWorker>(device);ColdPreparationRetirement retirement{device};
+    ColdDefinitionReplay recorded(source->acquire(device));recorded.token->requireDefinition();
+    for(int repeat=0;repeat<20;++repeat)
+    for(const int retained:{1,3,7,15})
+    for(const int initial:{0,1,3,-1}) {
+        if(initial>retained)continue;
+        MTPRuntimeConfig mtp;mtp.enabled=initial!=0;mtp.graph_capacity_draft_tokens=retained;
+        mtp.draft_tokens=initial>0?initial:initial==0?0:1;
+        if(initial==-1) {
+            mtp.depth_policy.mode=MTPDepthPolicyMode::Dynamic;
+            mtp.depth_policy.min_depth=1;mtp.depth_policy.initial_depth=1;mtp.depth_policy.max_depth=retained;
+        }
+        std::vector<RetainedForwardSourceDefinition> definitions;
+        ForwardGraphSignature signature;signature.device=device;signature.decode=true;signature.batch_size=1;signature.seq_len=1;
+        definitions.push_back(RetainedForwardSourceDefinition::checked(signature,MoEOverlayInferenceGraphRole::MainDecode,
+            1,recorded.graph,511,recorded.token));
+        // Each projection consumes the SAME checked original token API as FEE.
+        // This metadata replay does not claim a native verifier executable.
+        for(const auto& member:resolveMTPServingForwardCaptureFamily(mtp,retained+1,MTPVerifierGraphFamily::ExactRows)) {
+            signature.seq_len=member.verifier_rows;signature.execution_role=ForwardExecutionRole::GroupedMTPVerifier;
+            definitions.push_back(RetainedForwardSourceDefinition::checked(signature,MoEOverlayInferenceGraphRole::MTPGroupedVerifier,
+                member.verifier_rows,recorded.graph,511,recorded.token));
+        }
+        const std::array<std::size_t,5> backing{1,2,4,8,16};
+        const auto actual=MoEOverlayFollowerRowGeometry::declare(retained+1,retained+1,{},backing);
+        for(const auto& shape:actual.shapes()) {
+            const auto matched=retainedExpertSourceVariants(definitions,false,shape.physical_rows);
+            ASSERT_EQ(matched.size(),1u);EXPECT_EQ(matched.front(),recorded.token);
+        }
+        EXPECT_THROW(retainedExpertSourceVariants(definitions,true,1),std::invalid_argument);
+        EXPECT_THROW(retainedExpertSourceVariants(definitions,false,retained+2),std::invalid_argument);
+    }
+}
 } // namespace llaminar2::test

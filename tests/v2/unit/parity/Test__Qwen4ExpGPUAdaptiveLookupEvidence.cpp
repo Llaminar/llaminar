@@ -90,6 +90,35 @@ Qwen4ExpGPUAdaptiveLookupEvidence validate(const std::vector<PerfStatRecord> &re
 }
 }
 
+/** @test Compact input units are explicit; empty shared work cannot fabricate a model lookup or a cache hit. */
+TEST(Qwen4ExpGPUAdaptiveLookupEvidence, CompactInputsPreserveExactCountsAndRejectRelabeledEvidence)
+{
+    using Query=::llaminar2::qwen4exp::QwenAdaptiveQuerySemantics;
+    for(const auto owner:{DeviceId::cuda(0),DeviceId::rocm(0)})for(const bool empty:{false,true}) {
+        auto records=example(owner,false,empty);
+        for(auto& record:records)if(record.tags.at("storage")=="vram") {
+            record.tags.emplace("query","compact_native_misses");
+            if(record.name=="adaptive_completed_live_ids")record.value=empty?0:6;
+            if(empty && record.name=="adaptive_cache_hit_rows")record.value=0;
+        }
+        const auto check=[&](const auto& actual){return requireQwen4ExpGPUAdaptiveLookupEvidence(
+            actual,owner,90,16384,64,64,AdaptiveImmutableRowBacking::SSD,Query::CompactNativeMisses);};
+        const auto result=check(records);
+        EXPECT_EQ(result.device.completed_live_ids,empty?0u:6u);
+        EXPECT_THROW(validate(records,owner),std::invalid_argument);
+        auto missing=records;missing.front().tags.erase("query");
+        EXPECT_THROW(check(missing),std::invalid_argument);
+        auto falseUnits=records;falseUnits.front().tags["query"]="original_ngram_rows";
+        EXPECT_THROW(check(falseUnits),std::invalid_argument);
+        auto extraBytes=records;
+        for(auto& record:extraBytes)if(record.name=="metadata_bytes")++record.value;
+        EXPECT_THROW(check(extraBytes),std::invalid_argument);
+        auto noWork=records;
+        for(auto& record:noWork)if(record.name=="adaptive_lookup_calls")record.value=0;
+        EXPECT_THROW(check(noWork),std::invalid_argument);
+    }
+}
+
 /** @test Plural source projection validates every native channel once, preserving shared host ownership. */
 TEST(Qwen4ExpGPUAdaptiveLookupEvidence, PluralConsumerProjectionPreservesEveryChannelAndExactTotals)
 {

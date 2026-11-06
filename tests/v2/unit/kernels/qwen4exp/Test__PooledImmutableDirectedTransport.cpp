@@ -18,6 +18,7 @@
 #include "../../../fixtures/collective/PooledNativeCollectiveReplayAccess.h"
 #include <gtest/gtest.h>
 #include <array>
+#include <limits>
 #include <map>
 #include <set>
 namespace llaminar2::test {
@@ -121,7 +122,7 @@ TEST(PooledImmutableDirectedTransport, NativeCompletionLayoutHasExactPositiveMes
     using Message = q::PooledNativeCountedMessage;
     const q::PooledNativeCompletionLayout layout(true);
     std::array<bool, 24> occupied{};
-    for (std::size_t message = 0; message < static_cast<std::size_t>(Message::Count); ++message) {
+    for (std::size_t message = 0; message <= static_cast<std::size_t>(Message::ReaderResult); ++message) {
         const auto nominal = static_cast<Message>(message);
         EXPECT_EQ(layout.receiptOffset(nominal), message * sizeof(ncclLlaminarByteCompletion));
         for (const int participant : {1, 0}) {
@@ -137,6 +138,8 @@ TEST(PooledImmutableDirectedTransport, NativeCompletionLayoutHasExactPositiveMes
     EXPECT_TRUE(std::all_of(occupied.begin(), occupied.end(), [](bool value) { return value; }));
     EXPECT_EQ(layout.operandBytes(), 1536u);
     EXPECT_EQ(layout.receiptBytesPerParticipant(), 768u);
+    // MissKeys is opt-in CompactNative; the default keeps its original twelve messages.
+    EXPECT_THROW(layout.slot(Message::LocalHotMissKeys), std::invalid_argument);
     EXPECT_THROW(layout.slot(Message::Count), std::invalid_argument);
     EXPECT_THROW(layout.operandOffset(Message::ReaderResult, -1), std::invalid_argument);
     EXPECT_THROW(layout.operandOffset(Message::ReaderResult, 2), std::invalid_argument);
@@ -432,8 +435,12 @@ TEST(PooledImmutableDirectedTransport, AddressedCompletionSlotsAreExactForEveryO
                     const auto edge=participant==source?peer:participant;
                     for(std::size_t message=0;message<std::size_t(Message::Count);++message){
                         const auto nominal=static_cast<Message>(message);
-                        if(!flags[edge] && nominal!=Message::ReaderResult){
-                            EXPECT_THROW(layout.operandOffset(nominal,int(participant),int(peer)),std::invalid_argument);continue;
+                        // Default readers retain the original twelve/one slots;
+                        // request MissKeys exists only in explicit CompactNative.
+                        if(nominal==Message::LocalHotMissKeys || (!flags[edge] && nominal!=Message::ReaderResult)){
+                            EXPECT_THROW(layout.operandOffset(nominal,int(participant),int(peer)),std::invalid_argument);
+                            EXPECT_THROW(layout.receiptOffset(nominal,int(participant),int(peer)),std::invalid_argument);
+                            continue;
                         }
                         const auto operand=layout.operandOffset(nominal,int(participant),int(peer));
                         const auto receipt=layout.receiptOffset(nominal,int(participant),int(peer));
@@ -508,3 +515,145 @@ TEST(PooledImmutableDirectedTransport, AddressedReaderKeysCoverEveryOriginalCons
 }
 
 }
+
+namespace llaminar2::test {
+namespace {
+/** @brief Actual typed pool-frame API availability, independent of native admission. */
+template<class Frame>
+concept PoolCountedFrame = requires(const q::PooledImmutableNativeTransfer& transfer,
+    q::PooledNativeCompletionLayout layout, std::shared_ptr<MappedHostTransferRegion> operands,
+    std::shared_ptr<DeviceTransferBuffer> receipts, q::PooledNativeTransferSpan extent, Frame frame)
+{
+    transfer.withPrefix(q::PooledNativeCountedMessage::ReaderResult, layout, operands, receipts, extent, frame);
+};
+/** @brief Actual typed request-frame API availability; pool intervals cannot convert implicitly. */
+template<class Frame>
+concept RequestCountedFrame = requires(const q::PooledImmutableNativeTransfer& transfer,
+    q::PooledNativeCompletionLayout layout, std::shared_ptr<MappedHostTransferRegion> operands,
+    std::shared_ptr<DeviceTransferBuffer> receipts, q::PooledNativeTransferSpan extent, Frame frame)
+{
+    transfer.withRequestPrefix(layout, operands, receipts, extent, frame);
+};
+static_assert(PoolCountedFrame<q::PooledNativeCompletionFrame>);
+static_assert(!PoolCountedFrame<q::PooledNativeRequestCompletionFrame>);
+static_assert(RequestCountedFrame<q::PooledNativeRequestCompletionFrame>);
+static_assert(!RequestCountedFrame<q::PooledNativeCompletionFrame>);
+}
+
+/** @test Actual request-frame declarations preserve explicit purpose and exact disjoint original fields without native authority. */
+TEST(PooledImmutableDirectedTransport, NativeRequestCompletionFramePurposeAndOwnershipReplay)
+{
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        for (const bool positive : {false, true})
+        {
+            const std::array<std::uint8_t, 2> owners{0, std::uint8_t(positive)};
+            const q::PooledNativeCompletionLayout compact(2, 0, owners,
+                q::PooledNativeReaderMessageProfile::CompactNative);
+            const auto fields = std::make_shared<INT8Tensor>(std::vector<std::size_t>{128});
+            const auto payload = std::make_shared<INT8Tensor>(std::vector<std::size_t>{512});
+            const q::PooledNativeTransferSpan bytes(fields, 32, 8), data(payload, 0, 512);
+            const q::PooledNativeRequestCompletionFrame request{
+                q::PooledNativeTransferSpan(fields, 0, 24), q::PooledNativeTransferSpan(fields, 24, 4), 7};
+            const q::PooledNativeCompletionFrame response{request.request_identity, request.error, request.failureCode};
+            for (int replay = 0; replay < 20; ++replay)
+            {
+                EXPECT_NO_THROW(request.require(compact.readerProfile(), device, bytes, data));
+                EXPECT_NO_THROW(response.require(q::PooledNativeCountedMessage::ReaderResult, device, bytes, data));
+                EXPECT_THROW(response.require(q::PooledNativeCountedMessage::LocalHotMissKeys, device, bytes, data),
+                    std::invalid_argument);
+                EXPECT_THROW(request.require(q::PooledNativeReaderMessageProfile::ReplicatedFP32, device, bytes, data),
+                    std::invalid_argument);
+                EXPECT_EQ(compact.slots(), positive ? 13u : 2u);
+                EXPECT_NE(compact.operandOffset(q::PooledNativeCountedMessage::LocalHotMissKeys, 0),
+                    compact.operandOffset(q::PooledNativeCountedMessage::ReaderResult, 0));
+                EXPECT_EQ(request.failureCode, 7);
+            }
+            // Passing the pure declaration law does not install GPU bytes or a
+            // prepared worker/communicator. Pointer use remains strictly closed.
+            EXPECT_THROW((void)request.request_identity.pointer(device, 8), std::logic_error);
+            // Independent canonical roots are legal; there is no invented
+            // requirement that request identity/count/error share one tensor.
+            const auto identity = std::make_shared<INT8Tensor>(std::vector<std::size_t>{24});
+            const auto error = std::make_shared<INT8Tensor>(std::vector<std::size_t>{4});
+            const auto count = std::make_shared<INT8Tensor>(std::vector<std::size_t>{8});
+            EXPECT_NO_THROW((q::PooledNativeRequestCompletionFrame{
+                q::PooledNativeTransferSpan(identity, 0, 24), q::PooledNativeTransferSpan(error, 0, 4), 7}.require(
+                    compact.readerProfile(), device, q::PooledNativeTransferSpan(count, 0, 8), data)));
+        }
+}
+
+/** @test Exact production validators reject malformed/overlapping metadata and aliased lifetime owners before native materialization. */
+TEST(PooledImmutableDirectedTransport, NativeRequestCompletionRejectsMalformedAndAliasedFieldsReplay)
+{
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+        for (int mutation = 0; mutation < 19; ++mutation)
+        {
+            const auto fields = std::make_shared<INT8Tensor>(std::vector<std::size_t>{128});
+            const auto payload = std::make_shared<INT8Tensor>(std::vector<std::size_t>{512});
+            q::PooledNativeTransferSpan bytes(fields, 32, 8), data(payload, 0, 512);
+            q::PooledNativeRequestCompletionFrame frame{
+                q::PooledNativeTransferSpan(fields, 0, 24), q::PooledNativeTransferSpan(fields, 24, 4), 7};
+            auto profile = q::PooledNativeReaderMessageProfile::CompactNative;
+            auto actual_device = device;
+            switch (mutation)
+            {
+            case 0: bytes = q::PooledNativeTransferSpan(fields, 32, 4); break;
+            case 1: frame.request_identity = q::PooledNativeTransferSpan(fields, 0, 16); break;
+            case 2: frame.error = q::PooledNativeTransferSpan(fields, 24, 8); break;
+            case 3: frame.failureCode = 0; break;
+            case 4: frame.failureCode = -1; break;
+            case 5: frame.request_identity = q::PooledNativeTransferSpan(fields, 4, 24); break;
+            case 6: frame.error = q::PooledNativeTransferSpan(fields, 26, 4); break;
+            case 7: bytes = q::PooledNativeTransferSpan(fields, 36, 8); break;
+            case 8: frame.request_identity = q::PooledNativeTransferSpan(std::shared_ptr<TensorBase>{}, 0, 24); break;
+            case 9: frame.request_identity = q::PooledNativeTransferSpan(fields, 112, 24); break;
+            case 10: frame.error = q::PooledNativeTransferSpan(fields, 16, 4); break;
+            case 11: bytes = q::PooledNativeTransferSpan(fields, 16, 8); break;
+            case 12: bytes = q::PooledNativeTransferSpan(fields, 24, 8); break;
+            case 13: frame.request_identity = q::PooledNativeTransferSpan(payload, 0, 24); break;
+            case 14: data = q::PooledNativeTransferSpan(fields, 8, 64); break;
+            case 15:
+                frame.request_identity = q::PooledNativeTransferSpan(
+                    std::shared_ptr<TensorBase>(fields.get(), [](TensorBase*) {}), 0, 24);
+                break;
+            case 16: actual_device = DeviceId::cpu(); break;
+            case 17: profile = q::PooledNativeReaderMessageProfile::ReplicatedFP32; break;
+            case 18: profile = static_cast<q::PooledNativeReaderMessageProfile>(99); break;
+            }
+            EXPECT_THROW(frame.require(profile, actual_device, bytes, data), std::invalid_argument) << mutation;
+            // Validation has no mutable execution or physical allocation state.
+            EXPECT_FALSE(fields->current_device());
+            EXPECT_FALSE(payload->current_device());
+        }
+}
+} // namespace llaminar2::test
+
+namespace llaminar2::test {
+/** @test Actual typed subspan keeps owner/role identity and cannot escape the original control declaration. */
+TEST(PooledImmutableDirectedTransport, NativeRequestCompletionSubspanKeepsOriginalRoleAndBoundsReplay)
+{
+    const auto root = std::make_shared<INT8Tensor>(std::vector<std::size_t>{256});
+    const q::PooledNativeTransferSpan original(q::PooledNativeTensorSpan{
+        root, BufferId::QFN_POOLED_COORDINATOR_FRAME, 32, 128});
+    for (int replay = 0; replay < 20; ++replay)
+    {
+        const auto field = original.subspan(16, 64).subspan(8, 24);
+        const q::PooledNativeTransferSpan expected(q::PooledNativeTensorSpan{
+            root, BufferId::QFN_POOLED_COORDINATOR_FRAME, 56, 24});
+        EXPECT_TRUE(field.sameOwner(original));
+        EXPECT_EQ(field.offset(), 56u);
+        EXPECT_EQ(field.bytes(), 24u);
+        EXPECT_EQ(field.identity(), expected.identity());
+        const q::PooledNativeTransferSpan untyped(root, 56, 24);
+        EXPECT_NE(field.identity(), untyped.identity());
+        EXPECT_THROW((void)original.subspan(128, 1), std::out_of_range);
+        EXPECT_THROW((void)original.subspan(127, 2), std::out_of_range);
+        EXPECT_THROW((void)original.subspan(0, 0), std::out_of_range);
+        EXPECT_THROW((void)original.subspan(std::numeric_limits<std::size_t>::max(), 1), std::out_of_range);
+        EXPECT_THROW((void)original.subspan(16, 64).subspan(64, 1), std::out_of_range);
+        const q::PooledNativeTransferSpan absent(std::shared_ptr<TensorBase>{}, 0, 64);
+        EXPECT_THROW((void)absent.subspan(0, 24), std::invalid_argument);
+        EXPECT_FALSE(root->current_device());
+    }
+}
+} // namespace llaminar2::test

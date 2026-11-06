@@ -83,6 +83,33 @@ struct AdaptiveGPUCacheOwnerRequest final
     bool operator==(const AdaptiveGPUCacheOwnerRequest &) const = default;
 };
 /**
+ * @brief Independent participant-local hot replicas ahead of a declared shared pool.
+ * Absent request retains shared-only execution; an engaged zero request keeps
+ * the combined path and its mandatory miss/scatter roots without optional slots.
+ * Ceilings include native payload and cache metadata, never a free-byte ledger.
+ */
+struct AdaptiveGPULocalHotCacheRequest final
+{
+    std::uint64_t maximum_cache_rows = 0;
+    std::size_t cache_physical_byte_limit = 0;
+    CpuImmutableRowCachePolicy policy;
+    std::vector<AdaptiveGPUCacheOwnerRequest> consumer_overrides;
+    /** @brief Validate bounded caps/policy and unique explicit GPU overrides.
+     * @throws std::invalid_argument For malformed identity, overflow or policy. */
+    void validate() const;
+    /** @brief Authenticate every override against the complete original reader roster.
+     * @param consumers Actual hardware-bound consumers; no storage owner inference.
+     * @throws std::invalid_argument For duplicate/foreign/missing reader identities. */
+    void requireConsumers(std::span<const AdaptiveGPUCacheParticipant> consumers) const;
+    /** @brief Select lossless common or explicitly overridden ceilings.
+     * @param consumer Original reader previously authenticated by requireConsumers.
+     * @return Request caps only; this value cannot materialize native storage.
+     * @throws std::invalid_argument For malformed request or invalid reader identity. */
+    AdaptiveGPUCacheOwnerRequest ceilingsFor(AdaptiveGPUCacheParticipant consumer) const;
+    bool operator==(const AdaptiveGPULocalHotCacheRequest &) const = default;
+};
+
+/**
  * @brief Lossless source-storage declaration, not permission to create a compute domain.
  * Declared owners retain their order at C0 as well as bounded capacity. All
  * endpoints are rank-local; the exact coordinator is an independently named
@@ -148,6 +175,8 @@ struct AdaptiveVRAMRAMSSDRequest final
         case AdaptiveImmutableRowBacking::SSD:return ImmutableRowStorage::MemoryMapped;}
         throw std::invalid_argument("Unknown adaptive native host backing");
     }
+    /** Explicit L1 before DeclaredRankLocal pool; ConsumerLocal rejects this arm. */
+    std::optional<AdaptiveGPULocalHotCacheRequest> local_hot_cache;
     bool operator==(const AdaptiveVRAMRAMSSDRequest &) const = default;
 };
 

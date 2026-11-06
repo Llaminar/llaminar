@@ -23,6 +23,7 @@
 
 namespace llaminar2
 {
+    class NativeContextPreparation;
     enum class MoEOverlayDeviceControllerDrainIntent : std::uint8_t;
     enum class MoEOverlayMigrationStorageKind : std::uint8_t;
 
@@ -137,6 +138,17 @@ namespace llaminar2
          * @throws std::runtime_error when exact backend retirement fails.
          */
         [[nodiscard]] ModelContextRetirementReceipt complete();
+        /**
+         * @brief Close original startup-calibration ownership before model ticket completion.
+         * @param original_source Same final model's original native source, or null for no native source.
+         * @return Existing host-only/per-device retirement evidence from complete().
+         * @throws std::exception If calibration loans/handles are still live, before this pending
+         *         boundary is consumed; completed or backend-failed boundaries remain strict.
+         * @note Actual model/workspace owners must already be dropped. This overload adds no
+         *       source ownership, runtime reset or alternate retirement authority.
+         */
+        [[nodiscard]] ModelContextRetirementReceipt complete(
+            const std::shared_ptr<NativeContextPreparation>& original_source);
 
     private:
         PendingExclusiveModelRetirement(

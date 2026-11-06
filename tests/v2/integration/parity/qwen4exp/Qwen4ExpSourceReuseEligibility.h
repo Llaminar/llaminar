@@ -47,6 +47,21 @@ inline bool qwen4ExpSourceReusesSharedContinuationOwners(const ResolvedImmutable
         qwen4ExpSharedContinuationOwnerSet(placement->gpuAdaptiveRequest().placement,placement->consumers());
 }
 /**
+ * @brief Select original continuation owners for actual runner retirement and recreation.
+ * @param placement Same resolved source placement, absent on an expert-only CPU follower.
+ * @return True for independent consumer-local owners or a declared shared continuation subset.
+ *
+ * ConsumerLocal has one retained source boundary per GPU and one shared host
+ * provider. It needs the same cold recreation proof as shared GPU owners;
+ * absence of a shared coordinator is not absence of a reusable source.
+ */
+inline bool qwen4ExpSourceReusesContinuationOwners(const ResolvedImmutableRowTablePlacement* placement)
+{
+    return placement && placement->isGPUAdaptive() && !placement->consumers().empty() &&
+        (placement->gpuAdaptiveRequest().placement.mode==AdaptiveGPUCachePlacementMode::ConsumerLocal ||
+         qwen4ExpSourceReusesSharedContinuationOwners(placement));
+}
+/**
  * @brief Select expert lookup owners using complete original rank/device/domain identity.
  * @param cell Original canonical model/topology and owner declaration.
  * @param placement SAME resolved model table placement, never a newly admitted owner.

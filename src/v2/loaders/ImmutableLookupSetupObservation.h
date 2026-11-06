@@ -12,6 +12,7 @@
 #include "CpuAdaptiveImmutableRowCache.h"
 #include "HostImmutableRowOwnerObservation.h"
 #include "kernels/qwen4exp/PooledImmutableSourcePreparedStorage.h"
+#include "kernels/qwen4exp/PooledImmutableLocalHotPreparedStorage.h"
 #include "utils/PerfStatsCollector.h"
 #include "execution/qwen4exp/ImmutableLookupService.h"
 #include <algorithm>
@@ -19,6 +20,7 @@
 #include <map>
 #include <set>
 #include <span>
+#include <optional>
 #include <string>
 #include <vector>
 namespace llaminar2 {
@@ -30,13 +32,35 @@ class ImmutableLookupSetupObservation final {
     }};
 public:
     /** @brief Disjoint physical allocation roles; these say nothing about executable ownership. */
-    enum class Role {GPUCache,GPUPolicy,GPUSourceStaging,SharedHostSource};
+    enum class Role {GPUCache,GPUPolicy,GPUSourceStaging,SharedHostSource,LocalGPUCache,LocalReady};
     /** @brief One original lease-backed capacity row, with no mutable cache state. */
     struct Owner {
         PhysicalMemoryAllocatorIdentity allocator;
         Role role;
         std::size_t admitted_slots=0,payload_bytes=0,metadata_bytes=0;
         std::size_t table_storage_bytes=0,lookup_staging_bytes=0,source_storage_bytes=0;
+        std::uint64_t local_storage_identity=0; ///< Actual local root identity, absent on legacy roles.
+        std::optional<PhysicalMemoryAllocatorIdentity> local_consumer; ///< Original GPU consumer of this GPU/ready pair.
+        /**
+         * @brief Project immutable local lineage only; this metadata grants no source/native authority.
+         * @return Distinct per-consumer tags, or no added tags for unchanged legacy roles.
+         * @throws std::invalid_argument For partial, foreign or relabeled local metadata.
+         */
+        PerfStatsCollector::Tags localIdentityTags() const {
+            const bool local=role==Role::LocalGPUCache || role==Role::LocalReady;
+            if(!local) {
+                if(local_storage_identity || local_consumer)
+                    throw std::invalid_argument("Legacy lookup setup cannot borrow local cache lineage");
+                return {};
+            }
+            if(!local_storage_identity || !local_consumer || !local_consumer->device.is_gpu() ||
+                local_consumer->world_rank!=allocator.world_rank ||
+                (role==Role::LocalGPUCache && *local_consumer!=allocator) ||
+                (role==Role::LocalReady && !allocator.device.is_cpu()))
+                throw std::invalid_argument("Local lookup setup lost its original consumer/root identity");
+            return {{"local_storage_identity",std::to_string(local_storage_identity)},
+                {"local_consumer",local_consumer->device.toString()}};
+        }
         bool operator==(const Owner&)const=default;
     };
     /**
@@ -45,12 +69,14 @@ public:
      * @param service Original shared provider/channel owner; its binding authenticates source coordinates and generation.
      * @param hostGeometry Original checked host geometry; its existing subranges only partition actual leases.
      * @param sources Exactly one original source per declared CPU channel; shared readers borrow it.
+     * @param locals Separately admitted actual per-consumer native roots; their ready pages are distinct CPU claims.
      * @return Immutable historical capacities; rows own no allocation or mutable authority.
      * @throws std::exception For partial, duplicate, foreign, stale or incompatible roots/leases.
      */
     static ImmutableLookupSetupObservation captureAdaptive(const ImmutableRowTableLayoutGeometry& layout,
         const CpuAdaptiveImmutableRowCacheGeometry& hostGeometry,const std::shared_ptr<qwen4exp::ImmutableLookupService>& service,
-        std::span<const std::shared_ptr<const qwen4exp::PooledImmutableSourcePreparedStorage>> sources)
+        std::span<const std::shared_ptr<const qwen4exp::PooledImmutableSourcePreparedStorage>> sources,
+        std::span<const std::shared_ptr<const qwen4exp::PooledImmutableLocalHotPreparedStorage>> locals={})
     {
         if(!service || sources.empty() || !sources.front())throw std::invalid_argument("Lookup setup has no complete original service/source");
         const auto binding=service->bindSubordinate(sources.front()->geometry().allocator().device);
@@ -122,6 +148,51 @@ public:
         // Host storage may contain a full RAM table or bounded cache+SSD service.
         // Preserve its actual aggregate lease; do not reinterpret it as GPU payload.
         result.rows_.push_back(hostOwner(hostGeometry,service));
+        std::set<PhysicalMemoryAllocatorIdentity,AllocatorLess> localAllocators;
+        for(const auto& replica:locals) {
+            if(!replica || local)throw std::invalid_argument("Local hot replica requires its admitted shared-pool source");
+            const auto& geometry=replica->geometry();
+            const auto allocator=geometry.allocator();
+            const auto& original=replica->originalSource();
+            if(std::find(layout.consumers().begin(),layout.consumers().end(),allocator)==layout.consumers().end() ||
+               !localAllocators.insert(allocator).second || geometry.extent()!=layout.extent() ||
+               std::none_of(sources.begin(),sources.end(),[&](const auto& expected){
+                   return expected.get()==original.get() && !expected.owner_before(original) && !original.owner_before(expected);
+               }))
+                throw std::invalid_argument("Local cache setup changed source, table or actual consumer membership");
+            replica->requireFor(geometry,original,host.authority());
+            const auto native=replica->retainedOwnerObservation();
+            const auto ready=replica->retainedReadyObservation();
+            requireAuthority(host,native);requireAuthority(host,ready);
+            const auto& cache=geometry.cacheOffsets();
+            if(geometry.slots() && geometry.rowBytes()>std::numeric_limits<std::size_t>::max()/geometry.slots())
+                throw std::overflow_error("Local cache native payload byte count overflows");
+            const auto payloadBytes=geometry.rowBytes()*geometry.slots();
+            if(native.allocator()!=allocator || native.tableStorageBytes()!=cache.bytes ||
+               native.lookupStagingBytes()!=add(geometry.frameOffsets().bytes,geometry.scratchOffsets().bytes) ||
+               cache.payload>cache.bytes || payloadBytes>cache.bytes-cache.payload ||
+               ready.allocator()!=PhysicalMemoryAllocatorIdentity{allocator.world_rank,DeviceId::cpu()} ||
+               ready.tableStorageBytes() || !ready.lookupStagingBytes())
+                throw std::logic_error("Local cache setup does not partition its actual GPU and CPU leases");
+            result.rows_.push_back(Owner{
+                .allocator=allocator,
+                .role=Role::LocalGPUCache,
+                .admitted_slots=geometry.slots(),
+                .payload_bytes=payloadBytes,
+                .metadata_bytes=cache.bytes-payloadBytes,
+                .table_storage_bytes=native.tableStorageBytes(),
+                .lookup_staging_bytes=native.lookupStagingBytes(),
+                .local_storage_identity=replica->consumerStorageIdentity(),
+                .local_consumer=allocator});
+            result.rows_.push_back(Owner{
+                .allocator=ready.allocator(),
+                .role=Role::LocalReady,
+                .lookup_staging_bytes=ready.lookupStagingBytes(),
+                .local_storage_identity=replica->consumerStorageIdentity(),
+                .local_consumer=allocator});
+        }
+        if(!locals.empty() && localAllocators.size()!=layout.consumers().size())
+            throw std::invalid_argument("Local cache setup omitted an admitted compute consumer");
         return result;
     }
     /**
@@ -159,12 +230,14 @@ public:
     void publish()const {
         if(!PerfStatsCollector::isDomainEnabled("immutable_lookup_setup"))return;
         for(const auto& row:rows_) {
-            const PerfStatsCollector::Tags tags{{"world_rank",std::to_string(row.allocator.world_rank)},
+            PerfStatsCollector::Tags tags{{"world_rank",std::to_string(row.allocator.world_rank)},
                 {"role",roleName(row.role)},{"admitted_slots",std::to_string(row.admitted_slots)},
                 {"payload_bytes",std::to_string(row.payload_bytes)},{"metadata_bytes",std::to_string(row.metadata_bytes)},
                 {"table_storage_bytes",std::to_string(row.table_storage_bytes)},{"source_storage_bytes",std::to_string(row.source_storage_bytes)},{"lookup_staging_bytes",std::to_string(row.lookup_staging_bytes)},
                 {"storage",std::string(hostImmutableRowModeName(mode_))},{"source_generation",std::to_string(source_generation_)},{"source_file_offset",std::to_string(source_.file_offset)},
                 {"source_path",source_.path},{"source_tensor",source_.tensor_name},{"source_format",std::to_string(static_cast<unsigned>(source_.format))},{"source_row_bytes",std::to_string(source_.rowBytes())},{"source_rows",std::to_string(source_.rows)},{"source_row_elements",std::to_string(source_.row_elements)}};
+            const auto lineage=row.localIdentityTags();
+            tags.insert(lineage.begin(),lineage.end());
             PerfStatsCollector::addCounter("immutable_lookup_setup","admitted_owner",1,"setup",row.allocator.device.toString(),tags);
         }
     }
@@ -180,7 +253,7 @@ private:
     /** @return Checked evidence aggregation only; this never decides admission or capacity. */
     static std::size_t add(std::size_t a,std::size_t b){if(b>std::numeric_limits<std::size_t>::max()-a)throw std::overflow_error("Lookup setup byte overflow");return a+b;}
     /** @return Closed stable role label. */
-    static const char* roleName(Role role){switch(role){case Role::GPUCache:return "gpu_cache";case Role::GPUPolicy:return "gpu_policy";case Role::GPUSourceStaging:return "gpu_source_staging";case Role::SharedHostSource:return "shared_host_source";}throw std::invalid_argument("Unknown lookup setup role");}
+    static const char* roleName(Role role){switch(role){case Role::GPUCache:return "gpu_cache";case Role::GPUPolicy:return "gpu_policy";case Role::GPUSourceStaging:return "gpu_source_staging";case Role::SharedHostSource:return "shared_host_source";case Role::LocalGPUCache:return "local_gpu_cache";case Role::LocalReady:return "local_ready";}throw std::invalid_argument("Unknown lookup setup role");}
     HostImmutableRowMode mode_;
     ImmutableRowTableSource source_;
     std::uint64_t source_generation_; ///< Existing service-issued generation, never a new evidence identity.

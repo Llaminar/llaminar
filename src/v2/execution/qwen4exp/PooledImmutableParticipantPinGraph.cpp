@@ -8,6 +8,8 @@
  * own exact stream and original canonical roots.
  */
 #include "PooledImmutableParticipantPinGraph.h"
+#include "PooledImmutableLocalHotGraph.h"
+#include "execution/compute_stages/stages/qwen4exp/PooledImmutableLocalHotPhaseStage.h"
 #include "execution/mpi_orchestration/DeviceInventory.h"
 #include "execution/qwen4exp/PooledImmutableDirectedChannelGeometry.h"
 #include "PooledImmutableDirectedOperation.h"
@@ -471,7 +473,17 @@ private:
 void requireProducer(const ComputeGraph& graph,const std::string& name,n::CoordinatorAction action,
     const q::PooledImmutableCoordinatorPreparedStorage* storage)
 {
-    const auto* node=graph.getNode(name);const auto* stage=node?dynamic_cast<const PooledImmutableNativePhaseStage*>(node->stage.get()):nullptr;
+    const auto* node=graph.getNode(name);
+    if(!node || !storage || node->device!=storage->plan().allocator().device)
+        throw std::invalid_argument("Pooled transfer producer changed original coordinator device");
+    if(action==n::CoordinatorAction::Begin){
+        if(const auto* compact=dynamic_cast<const PooledImmutableLocalHotBeginStage*>(node->stage.get())){
+            if(compact->source()->coordinator().get()!=storage)
+                throw std::invalid_argument("Compact transfer producer substituted original coordinator");
+            requirePooledCompactQueryProducer(graph,compact->query(),name);return;
+        }
+    }
+    const auto* stage=dynamic_cast<const PooledImmutableNativePhaseStage*>(node->stage.get());
     const auto* actual=stage?std::get_if<PooledImmutableNativePhaseStage::Coordinator>(&stage->phase()):nullptr;
     if(!actual || actual->action!=action || actual->storage.get()!=storage)
         throw std::invalid_argument("Pooled transfer producer is not its actual original coordinator phase");

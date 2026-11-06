@@ -228,13 +228,17 @@ namespace llaminar2
          * the parent adds exact child-to-child dependencies but must not
          * manufacture a second mapped wait or publication.
          *
-         * Every non-manual, non-passive graph node must occur exactly once in
-         * @p units and all such nodes must belong to one GPU. Packet stages are
+         * Every represented main graph node must occur exactly once in @p units
+         * and belong to one GPU. Native envelopes retain passive no-op nodes in
+         * unit identity; heterogeneous envelopes represent them separately as
+         * passive rendezvous. A declared
+         * participant auxiliary body is validated but recorded separately; the
+         * final parent must attach it before instantiation. Packet stages are
          * deliberately accepted here because their exact timeline nodes are
          * already part of their captured child.
          *
          * @param destination Empty native parent on the participant GPU.
-         * @param graph Exact declarative heterogeneous endpoint graph.
+         * @param graph Exact heterogeneous endpoint or authenticated native auxiliary-parent graph.
          * @param units Active native units in graph execution order.
          * @throws std::invalid_argument for missing, reordered, or mixed-device
          *         units.

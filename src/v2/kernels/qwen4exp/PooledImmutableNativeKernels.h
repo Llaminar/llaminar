@@ -13,6 +13,7 @@
 namespace llaminar2::qwen4exp
 {
 class PooledImmutableOwnerPreparedStorage;
+class PooledImmutableLocalHotPoolQuery;
 class PooledImmutableCoordinatorPreparedStorage;
 class PooledImmutableOwnerOperands;
 class PooledImmutableCoordinatorOperands;
@@ -32,6 +33,8 @@ public:
     /** @brief Enqueue one complete coordinator phase, including the inseparable parallel Begin producer bundle. */
     void enqueue(pooled_native::CoordinatorAction action,PooledImmutableCoordinatorPreparedStorage& storage,
         const PooledImmutableCoordinatorOperands& inputs,void* exact_stream)const;
+    /** @brief Consume actual private compact producers through the unchanged original Begin bundle. */
+    void enqueueCompactBegin(PooledImmutableCoordinatorPreparedStorage&,const PooledImmutableLocalHotPoolQuery&,void* exact_stream)const;
     /** @return Complete backend/launch version; stages also bind exact geometry, prepared roots and input producers. */
     virtual std::uint64_t codeIdentity()const noexcept=0;
     /** @return Actual selected native backend; factories do not query or activate hardware. */

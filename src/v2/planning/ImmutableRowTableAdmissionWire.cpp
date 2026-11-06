@@ -2,7 +2,7 @@
  * @file ImmutableRowTableAdmissionWire.cpp
  * @brief Authenticate bounded setup-only table candidate metadata with no payload reads.
  *
- * Version16 carries explicit adaptive host backing; older frames cannot silently
+ * Version17 carries explicit independent local-hot intent; older frames cannot silently
  * supply SSD defaults. Predictor head ownership remains beside resolved arithmetic and
  * the original attention schedule. Unknown values reject before narrowing; reloadable debug
  * state is never consulted when restoring an admitted remote provision.
@@ -19,7 +19,7 @@ namespace llaminar2
 {
 namespace
 {
-    constexpr std::uint32_t Magic = 0x4e475231u, Version = 16;
+    constexpr std::uint32_t Magic = 0x4e475231u, Version = 17;
     /** @brief Exact typed QFN layout words carried by this schema, without native padding. */
     constexpr std::array QfnLayoutWords{
         &Qwen4ExpMemoryGeometry::residual_width,
@@ -192,6 +192,23 @@ std::vector<std::uint8_t> serializeImmutableRowTableAdmissionRequests(
         }
         append(out,static_cast<std::uint32_t>(g.placement.coordinator.has_value()));
         if(g.placement.coordinator)participant(out,*g.placement.coordinator);
+        append(out, static_cast<std::uint32_t>(g.local_hot_cache.has_value()));
+        if (g.local_hot_cache)
+        {
+            const auto& local = *g.local_hot_cache;
+            append(out, local.maximum_cache_rows);
+            append(out, static_cast<std::uint64_t>(local.cache_physical_byte_limit));
+            append(out, local.policy.aging_accesses);
+            append(out, local.policy.protected_numerator);
+            append(out, local.policy.protected_denominator);
+            append(out, count(local.consumer_overrides.size()));
+            for (const auto& override : local.consumer_overrides)
+            {
+                participant(out, override.participant);
+                append(out, override.maximum_cache_rows);
+                append(out, static_cast<std::uint64_t>(override.cache_physical_byte_limit));
+            }
+        }
         const auto &e=request.input.extent();append(out,static_cast<std::uint32_t>(e.format()));
         append(out,e.rows());append(out,static_cast<std::uint64_t>(e.rowBytes()));
         resource(out,request.input.host());
@@ -354,6 +371,26 @@ std::vector<ImmutableRowTableAdmissionRequest> ImmutableRowTableAdmissionParser:
         const auto coordinator=in.read<std::uint32_t>();
         if(coordinator>1u)throw std::invalid_argument("GPU cache coordinator wire arm is invalid");
         if(coordinator)g.placement.coordinator=participant(in,expected_rank);
+        const auto has_local = in.read<std::uint32_t>();
+        if (has_local > 1u) throw std::invalid_argument("Local hot cache wire arm is invalid");
+        if (has_local)
+        {
+            auto& local = g.local_hot_cache.emplace();
+            local.maximum_cache_rows = in.read<std::uint64_t>();
+            local.cache_physical_byte_limit = size(in);
+            local.policy.aging_accesses = in.read<std::uint64_t>();
+            local.policy.protected_numerator = in.read<std::uint32_t>();
+            local.policy.protected_denominator = in.read<std::uint32_t>();
+            const auto overrides = in.read<std::uint32_t>();
+            if (overrides > in.remaining() / 28u)
+                throw std::invalid_argument("Local hot cache overrides exceed their wire frame");
+            for (std::uint32_t i = 0; i < overrides; ++i)
+            {
+                const auto endpoint = participant(in, expected_rank);
+                const auto rows = in.read<std::uint64_t>();
+                local.consumer_overrides.push_back({endpoint, rows, size(in)});
+            }
+        }
         policy.validate();
         const auto format=static_cast<GGUFTensorType>(in.read<std::uint32_t>());
         const auto rows=in.read<std::uint64_t>();const auto row_bytes=size(in);

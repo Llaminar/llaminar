@@ -9,6 +9,7 @@
  */
 #include "PooledImmutableParticipantReadGraph.h"
 #include "PooledImmutableDirectedOperation.h"
+#include "PooledImmutableDirectedTransport.h"
 #include "PooledImmutableDirectedMessageGeometry.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include <set>
@@ -134,9 +135,17 @@ PooledPinParticipantNodes appendPooledReadOwner(ComputeGraph& graph,BufferArena&
     std::vector<std::string> declared;for(const auto& node:nodes)declared.push_back(node.name);names(graph,declared);auto prior=readySent;for(auto& node:nodes){const auto name=node.name;graph.addNode(name,std::move(node.stage),device);graph.addDependency(name,prior);prior=name;}return {declared.front(),prior};
 }
 PooledImmutableReadCompletion appendPooledReadCoordinator(ComputeGraph& graph,BufferArena& arena,const PooledImmutablePublicationCompletion& publication,std::span<const q::PooledImmutableReadParticipant> owners,q::PooledNativeTensorSpan output,const std::string& prefix,const std::string& outputName){
-    if(isGraphCaptureActive() || prefix.empty() || outputName.empty() || owners.size()!=publication.owners.size())throw std::invalid_argument("Read needs cold original complete publication");requirePooledPublicationCompletion(graph,publication);
+    return appendPooledReadCoordinator(graph,arena,publication,owners,
+        PooledImmutableDecodedReadTarget{std::move(output),outputName},prefix);
+}
+PooledImmutableReadCompletion appendPooledReadCoordinator(ComputeGraph& graph,BufferArena& arena,
+    const PooledImmutablePublicationCompletion& publication,std::span<const q::PooledImmutableReadParticipant> owners,
+    PooledImmutableReadTarget target,const std::string& prefix){
+    const auto* decoded=std::get_if<PooledImmutableDecodedReadTarget>(&target);
+    if(isGraphCaptureActive() || prefix.empty() || (decoded && decoded->name.empty()) || owners.size()!=publication.owners.size())throw std::invalid_argument("Read needs cold original complete publication");requirePooledPublicationCompletion(graph,publication);
     for(size_t i=0;i<owners.size();++i)if(publicationMember(owners[i])!=publication.owners[i])throw std::invalid_argument("Read substituted original ordered publication member");
-    const auto boundary=publication.source.boundary;const auto device=boundary->device();PooledImmutableReadCompletion out;out.publication=publication;out.owners.assign(owners.begin(),owners.end());out.outputSpan=output;out.planned=prefix+"/planned";out.sealed=prefix+"/sealed";out.output=outputName;
+    const auto boundary=publication.source.boundary;const auto device=boundary->device();PooledImmutableReadCompletion out;out.publication=publication;out.owners.assign(owners.begin(),owners.end());out.planned=prefix+"/planned";out.sealed=prefix+"/sealed";
+    if(decoded){out.target=decoded->output;out.output=decoded->name;}
     for(auto* values:{&out.outcomeSent,&out.requestSent,&out.receiptReceived,&out.rowsReceived,&out.imported})values->resize(owners.size());
     struct Node{std::string name;std::unique_ptr<IComputeStage> stage;};std::vector<Node> nodes;
     const auto phase=[&](const std::string& name,q::PooledSourceAction action,uint32_t owner=q::adaptive_lookup::None){nodes.push_back({name,std::make_unique<PooledImmutableSourcePhaseStage>(arena,boundary,action,*publication.source.control,std::nullopt,owner)});};
@@ -146,13 +155,24 @@ PooledImmutableReadCompletion appendPooledReadCoordinator(ComputeGraph& graph,Bu
         if(const auto* remote=std::get_if<std::shared_ptr<const q::PooledImmutableCapturedReadWave>>(&owners[i])){(*remote)->requireCurrent();out.outcomeSent[i]=base+"outcome_send";endpoint(i,out.outcomeSent[i],q::PooledReadWireRole::Outcome,CapturedTransferEndpoint::Producer);out.receiptReceived[i]=base+"receipt_receive";endpoint(i,out.receiptReceived[i],q::PooledReadWireRole::Receipt,CapturedTransferEndpoint::Consumer);
             if(q::pooledSourceOwner((*remote)->publication()->sourceWave())->plan().parameters().native.reply_capacity){out.requestSent[i]=base+"requests_send";endpoint(i,out.requestSent[i],q::PooledReadWireRole::Requests,CapturedTransferEndpoint::Producer);out.rowsReceived[i]=base+"rows_receive";endpoint(i,out.rowsReceived[i],q::PooledReadWireRole::Rows,CapturedTransferEndpoint::Consumer);}}
     }
-    phase(out.sealed,q::PooledSourceAction::SealReads);nodes.push_back({out.output,std::make_unique<PooledImmutableSourcePhaseStage>(arena,boundary,q::PooledSourceAction::Read,*publication.source.control,output)});
+    phase(out.sealed,q::PooledSourceAction::SealReads);
+    if(decoded)nodes.push_back({out.output,std::make_unique<PooledImmutableSourcePhaseStage>(arena,boundary,
+        q::PooledSourceAction::Read,*publication.source.control,decoded->output)});
     std::vector<std::string> declared;for(const auto& node:nodes)declared.push_back(node.name);names(graph,declared);for(auto& node:nodes)graph.addNode(node.name,std::move(node.stage),device);
     graph.addDependency(out.planned,publication.ready);auto prior=out.planned;
     // Finish every original Grant-bank reader before the first serial response.
     for(size_t i=0;i<owners.size();++i){if(!out.outcomeSent[i].empty()){graph.addDependency(out.outcomeSent[i],prior);prior=out.outcomeSent[i];}if(!out.requestSent[i].empty()){graph.addDependency(out.requestSent[i],prior);prior=out.requestSent[i];}}
     for(size_t i=0;i<owners.size();++i){if(!out.receiptReceived[i].empty()){graph.addDependency(out.receiptReceived[i],prior);prior=out.receiptReceived[i];}if(!out.rowsReceived[i].empty()){graph.addDependency(out.rowsReceived[i],prior);prior=out.rowsReceived[i];}graph.addDependency(out.imported[i],prior);prior=out.imported[i];}
-    graph.addDependency(out.sealed,prior);graph.addDependency(out.output,out.sealed);out.coordinator={out.planned,out.output};return out;
+    graph.addDependency(out.sealed,prior);
+    if(decoded)graph.addDependency(out.output,out.sealed);
+    else {
+        const auto delivered=appendPooledCompactNativeDelivery(graph,arena,
+            std::get<PooledImmutableCompactReadRequest>(std::move(target)),*publication.source.control,
+            out.sealed,prefix+"/native_delivery");
+        if(!delivered)throw std::logic_error("Native read has no original delivery completion");
+        out.target=delivered;out.output=delivered->terminal;
+    }
+    out.coordinator={out.planned,out.output};return out;
 }
 void requirePooledReadCompletion(const ComputeGraph& graph,const PooledImmutableReadCompletion& original){
     if(isGraphCaptureActive())throw std::invalid_argument("Read successor must be declared before capture");requirePooledPublicationCompletion(graph,original.publication);const auto boundary=original.publication.source.boundary;const auto device=boundary->device();const auto count=original.publication.owners.size();if(original.owners.size()!=count)throw std::invalid_argument("Read lost original cohort");
@@ -167,7 +187,20 @@ void requirePooledReadCompletion(const ComputeGraph& graph,const PooledImmutable
         else if(!original.outcomeSent[i].empty() || !original.requestSent[i].empty() || !original.receiptReceived[i].empty() || !original.rowsReceived[i].empty())throw std::invalid_argument("Read invented local self transport");}
     for(size_t i=0;i<count;++i){if(std::holds_alternative<std::shared_ptr<const q::PooledImmutableCapturedReadWave>>(original.owners[i])){endpoint(i,original.receiptReceived[i],q::PooledReadWireRole::Receipt,CapturedTransferEndpoint::Consumer);depends(original.receiptReceived[i],prior);prior=original.receiptReceived[i];if(!original.rowsReceived[i].empty()){endpoint(i,original.rowsReceived[i],q::PooledReadWireRole::Rows,CapturedTransferEndpoint::Consumer);depends(original.rowsReceived[i],prior);prior=original.rowsReceived[i];}}
         phase(original.imported[i],q::PooledSourceAction::ImportReadRows,i);depends(original.imported[i],prior);prior=original.imported[i];}
-    phase(original.sealed,q::PooledSourceAction::SealReads);depends(original.sealed,prior);const auto* output=phase(original.output,q::PooledSourceAction::Read);if(!output->matchesReadOutput(original.outputSpan))throw std::invalid_argument("Read substituted original FP32 consumer span");depends(original.output,original.sealed);if(original.coordinator.first!=original.planned || original.coordinator.last!=original.output)throw std::invalid_argument("Read lost actual last native-row reader/drain frontier");
+    phase(original.sealed,q::PooledSourceAction::SealReads);depends(original.sealed,prior);
+    if(const auto* decoded=std::get_if<q::PooledNativeTensorSpan>(&original.target)) {
+        const auto* output=phase(original.output,q::PooledSourceAction::Read);
+        if(!output->matchesReadOutput(*decoded))throw std::invalid_argument("Read substituted original FP32 consumer span");
+        depends(original.output,original.sealed);
+    } else {
+        const auto& delivered=std::get<std::shared_ptr<const PooledImmutableCompactReadCompletion>>(original.target);
+        if(!delivered || !delivered->original.transport || delivered->original.transport->sourceBoundary()!=boundary ||
+           delivered->native_rows_ready!=original.sealed || delivered->terminal!=original.output)
+            throw std::invalid_argument("Read substituted original native delivery or sealed source image");
+        requirePooledCompactNativeDelivery(graph,*delivered);
+    }
+    if(original.coordinator.first!=original.planned || original.coordinator.last!=original.output)
+        throw std::invalid_argument("Read lost actual last native-row reader/drain frontier");
 }
 void requirePooledReadOwnerCompletion(const ComputeGraph& graph,const std::shared_ptr<const q::PooledImmutableCapturedReadWave>& original,const std::string& rowsSent){
     if(isGraphCaptureActive() || !original)throw std::invalid_argument("Read owner successor needs cold original completion");original->requireCurrent();const auto storage=q::pooledSourceOwner(original->publication()->sourceWave());const auto device=storage->plan().allocator().device;

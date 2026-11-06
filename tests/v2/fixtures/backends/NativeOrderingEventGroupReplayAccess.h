@@ -18,7 +18,8 @@ struct NativeOrderingEventGroupReplayAccess {
         std::vector<NativeOrderingEventBudgetProjection::RecordedBound> rows;
         const std::array programs{NativeOrderingEventProgram::pooledOwner(false),NativeOrderingEventProgram::pooledOwner(true),
             NativeOrderingEventProgram::pooledCoordinator(false),NativeOrderingEventProgram::pooledCoordinator(true),NativeOrderingEventProgram::pooledSource(),
-            NativeOrderingEventProgram::lookupSubmissionRetirement(),NativeOrderingEventProgram::readAheadParentTerminal()};
+            NativeOrderingEventProgram::lookupSubmissionRetirement(),NativeOrderingEventProgram::readAheadParentTerminal(),
+            NativeOrderingEventProgram::pooledLocalHot(false),NativeOrderingEventProgram::pooledLocalHot(true)};
         for(const auto device:devices)for(const auto program:programs){
             const auto n=program.orderingEvents();
             // Explicit recorded nonlinear bounds exercise growth, not an inferred native per-event price.

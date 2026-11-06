@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from enum import Enum
 import hashlib
 import json
+import tempfile
 
 import model_kld_corpus_v2 as corpus_v2
 from model_kld_corpus import identity, metadata_digest, require, unchanged, require_reference_file_identity
@@ -150,6 +151,49 @@ class PairedMetadataPolicy(str, Enum):
     SOURCE_BOUND_DIAGNOSTIC = "source_bound_external_diagnostic_manifest"
 
 
+
+def declared_benchmark_profile(record):
+    """Validate the source-owned exact argv/document union, never reconstruct policy."""
+    profile=record.get('diagnostic_benchmark')
+    require(type(profile) is dict and type(profile.get('schema')) is int and profile['schema']==1 and
+        profile.get('policy')=='diagnostic_declared' and profile.get('certification_eligible') is False and
+        type(profile.get('context_length')) is int and profile['context_length']>0,
+        'Paired case lacks its original typed diagnostic profile')
+    argv='args' in profile; document='configuration_document' in profile
+    require(argv!=document, 'Diagnostic profile requires exactly one original argv or configuration document')
+    if argv:
+        arguments=profile['args']
+        require('configuration_policy' not in profile and type(arguments) is list and arguments and
+            all(type(v) is str and v and '\0' not in v for v in arguments),
+            'Malformed original diagnostic argv')
+    else:
+        from model_parity_inventory import declared_document_configuration
+        declared_document_configuration(profile,'args')
+    return profile
+
+
+def canonical_diagnostic_arguments(record, directory=None):
+    """Keep a source-authored document alive through its actual public parser use.
+
+    The temporary file is only a lossless spelling of original exported input,
+    not a source/planning authority. Its original stat identity is pinned by the
+    selection alongside the corpus inputs. No model or subprocess is started.
+    """
+    profile=declared_benchmark_profile(record);owner=None;pins={}
+    if 'args' in profile:
+        arguments=list(profile['args'])
+    else:
+        if directory is None:
+            owner=tempfile.TemporaryDirectory(prefix='llaminar-paired-profile-',dir='/tmp')
+            directory=Path(owner.name)
+        path=Path(directory)/'original-configuration.json'
+        require(not path.exists(), 'Original diagnostic configuration output must be fresh')
+        with path.open('x') as stream:
+            stream.write(json.dumps(profile['configuration_document'],sort_keys=True,indent=2)+'\n')
+        pins[str(path)]=identity(path)
+        arguments=['--config',str(path)]
+    return [*arguments,'-m',record['model'],'--context-length',str(profile['context_length'])],owner,pins
+
 @dataclass(frozen=True)
 class PairedCorpusSelection:
     """One existing exact canonical case and its pinned local document obligations.
@@ -166,9 +210,10 @@ class PairedCorpusSelection:
     pins: dict
     documents: dict
     canonical_arguments: list
+    canonical_configuration_owner: object = None  # Retains the original source document until all parser/native users retire.
 
     @classmethod
-    def from_export(cls, exact, record, corpus_root, document_root, *, metadata_policy=PairedMetadataPolicy.CANONICAL_ROOT):
+    def from_export(cls, exact, record, corpus_root, document_root, *, metadata_policy=PairedMetadataPolicy.CANONICAL_ROOT, configuration_directory=None):
         """Authenticate all declared small documents before selecting or launching a model."""
         require(type(record) is dict and record.get('model_parity_schema') == 1 and
                 type(exact) is str and '.ProductionParity/' in exact,
@@ -259,23 +304,12 @@ class PairedCorpusSelection:
             groups={(topology['backend'],topology['id'],row['context_group'],row['phase'])
                     for row in corpus_v2.expected_rows(corpus['manifest'])}
             corpus_v2._limits(documents['calibration'],corpus['manifest'],baseline,approval,groups)
-        profile = record.get('diagnostic_benchmark',{})
-        require(type(profile) is dict, 'Paired case lacks its original typed diagnostic profile')
-        arguments = profile.get('args')
-        require(profile.get('schema') == 1 and type(profile.get('schema')) is int and
-                profile.get('policy') == 'diagnostic_declared' and
-                profile.get('certification_eligible') is False and
-                type(profile.get('context_length')) is int and profile['context_length'] > 0 and
-                type(arguments) is list and arguments and
-                all(type(v) is str and v and '\0' not in v for v in arguments),
-                'Paired case lacks its original typed diagnostic profile')
-        # The exporter separates policy arguments from the model and context,
-        # just as the benchmark launcher does. Bind those source-owned fields
-        # before asking the public parser to authenticate the full request.
-        canonical_arguments = [*arguments, '-m', record['model'],
-                               '--context-length', str(profile['context_length'])]
+        # One original public representation; unequal ceilings are never
+        # downgraded to scalar argv or inferred from observer runtime state.
+        canonical_arguments,configuration_owner,configuration_pins=canonical_diagnostic_arguments(record,configuration_directory)
+        pins.update(configuration_pins)
         unchanged(pins)
-        return cls(exact, json.loads(json.dumps(record)), corpus, topology, paths, pins, documents, canonical_arguments)
+        return cls(exact, json.loads(json.dumps(record)), corpus, topology, paths, pins, documents, canonical_arguments, configuration_owner)
 
     def require_public_projection(self, runner, args, environment, observed):
         """Compare actual parser-issued intent; never interpret topology/CLI in Python."""

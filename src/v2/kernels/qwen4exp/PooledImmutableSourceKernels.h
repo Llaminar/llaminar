@@ -35,6 +35,7 @@ struct PooledSourceQuery {
 };
 /** @brief Checked participant-local source code; arbitrary directed owner edges remain explicit transport contracts. */
 class PooledImmutableRetirementAuthority;
+class PooledImmutableLocalHotNativePack;
 class IPooledImmutableSourceKernels {
 public:
     /** @brief Release only after graph terminal and final source readers; retained source bindings own mapped backing. */
@@ -64,6 +65,9 @@ public:
      */
     void enqueue(PooledSourceAction action,PooledImmutableSourcePreparedStorage& storage,
         const DeviceGenerationControlBinding& control,PooledSourceQuery query,void* exact_stream)const;
+    /** @brief Copy exact compact native rows through original readable-row/pin authority; no FP32 output is created. */
+    void enqueueCompactNativePack(PooledImmutableSourcePreparedStorage&,const DeviceGenerationControlBinding&,
+        const PooledImmutableLocalHotNativePack&,void* exact_stream)const;
     /** @brief Close only at the complete parent's canonical terminal, after source reader retirement. */
     void closeWhenTerminal(PooledImmutableSourcePreparedStorage& storage,
         const DeviceGenerationControlBinding& control,void* exact_stream)const;

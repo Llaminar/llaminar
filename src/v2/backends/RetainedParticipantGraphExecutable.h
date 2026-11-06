@@ -11,8 +11,12 @@
  * their conservative General host allowance is separate from remote-program rows.
  * The closed startup-calibration purpose includes exactly one persistent timing
  * event pair in that same conservative unit and reuses it across cold definitions.
+ * Original source-owned remote slots likewise retain their exact opaque owner
+ * across proven runner retirement; only native handles are recreated at that
+ * cold frontier, with a fresh definition identity and no live cache borrower.
  */
 #pragma once
+#include <mutex>
 #include "NativeContextPreparation.h"
 #include "IGPUGraphCapture.h"
 #include "NativeContextRetirement.h"
@@ -25,9 +29,11 @@
 #include <memory>
 #include <atomic>
 namespace llaminar2 {
+class RetainedParticipantGraphSourceSlots;
+class PreparedServiceCalibrationSlot;
 class PlanningGPUExpertMeasurement;
 class PlanningExecutionMeasurement;
-namespace qwen4exp {class PooledImmutableRetainedParticipants;class PooledImmutableCompleteCohort;}
+namespace qwen4exp {class PooledImmutableRetainedParticipants;class PooledImmutableCompleteCohort;class PooledImmutableSourcePreparedStorage;}
 namespace test {struct RetainedParticipantGraphExecutableReplayAccess;struct RetainedParticipantGraphExecutableFixtureAccess;struct PooledRemoteGraphHostReplayAccess;}
 /** @brief Explicit graph-host authority; recorded/raw seams never claim installed qualification. */
 enum class GraphHostQualification:std::uint8_t {DeviceBoundOnly,GeneralProcessAllowance,InstalledCertified,RecordedReplay,UnqualifiedDiagnostic};
@@ -87,6 +93,8 @@ public:
     /** @return Distinct policy identity; it asserts conservative retention, not native host qualification. */
     static const char* policyIdentity()noexcept;
 private:
+    friend class RetainedParticipantGraphSourceSlots;
+    friend class PreparedServiceCalibrationSlot;
     friend class PlanningGPUExpertMeasurement; ///< Closed startup capture of original prepared experts.
     friend class PlanningExecutionMeasurement; ///< Original owner remains sole submission/terminal authority.
     /** @brief Closed cold-only purpose; serving participant definitions remain immutable. */
@@ -176,7 +184,7 @@ private:
     RetainedParticipantGraphExecutable(std::shared_ptr<IWorkerGPUContext>,std::shared_ptr<PhysicalMemoryAuthority>,std::uint64_t,DeviceId,void*,NativeContextRetirementSlot,
         std::unique_ptr<IContextNativeRetirementObligation>);
     class RecordingCapture;
-    enum class Phase:std::uint8_t {Fresh,Recording,Recorded,Ready,Failed,Retired,RecordedStorageBody};
+    enum class Phase:std::uint8_t {Fresh,Recording,Recorded,Ready,Failed,Retired,RecordedStorageBody,DormantSourceSlot};
     /** @brief Reject late recording changes without querying native state. */
     void requireConstruction()const;
     /** @brief Submit the next original invocation exactly once on its retained stream.
@@ -196,6 +204,15 @@ private:
      * This operation must run outside the original worker; actual teardown executes on that worker.
      */
     void retireDefinition();
+    /** @brief Reset only a source-owned serial definition after its exact terminal and all clone borrows retired.
+     * @throws std::exception For pending/borrowed/failed work or incomplete native handle retirement.
+     * @note The opaque slot and immutable program remain original-source owned. This is not a serving recapture API.
+     */
+    void releaseSourceDefinition();
+    /** @brief Recreate native recording handles in the SAME opaque slot, keeping ownership ordinals monotonic.
+     * @throws std::exception For non-dormant ownership, stale provenance, exhausted definition identity or native failure.
+     */
+    void reacquireSourceDefinition();
     /**
      * @brief Freeze a structurally proven original storage definition without creating an executable.
      * The original worker must have prepared native context backing. Only a
@@ -240,6 +257,7 @@ private:
         std::shared_ptr<const IRetainedGraphParticipantSourcePlan> sourcePlan_;
         std::shared_ptr<const RetainedGraphParticipantPreparationStream> sourcePreparation_;
         std::uint64_t sourceIdentity_;
+        std::uint64_t definitionGeneration_; ///< Exact native definition epoch, independent of request/GPU state.
         bool attempted_ = false;
     };
     /**
@@ -279,10 +297,122 @@ private:
     std::unique_ptr<RecordingCapture> recording_;
     std::weak_ptr<RetainedParticipantGraphExecutable> self_; ///< Original factory control block, rejecting counterfeit aliases.
     std::atomic<Phase> phase_{Phase::Fresh};
+    std::uint64_t definitionGeneration_=1; ///< Cold recording identity; never a device/request epoch.
     std::atomic<bool> cohortBound_{false}; ///< One-shot definition ownership, never GPU/model progress.
 
     std::uint64_t lastSubmission_=0; ///< Host ownership only; no model/controller state is mirrored.
     bool nativeAttempted_=false; ///< Sole native-handle lifecycle guard, never GPU model state.
     bool pending_=false; ///< Native-reader lifetime guard; never model/token/controller state.
 };
+/**
+ * @brief Original source-owned fixed roster of actual serial remote graph owners.
+ *
+ * This retains existing PMA slots, not a free list or a second allowance. A
+ * source cannot borrow another source/program, overlap runtime borrowers, or
+ * reissue a failed definition. Only actual native handles reset between runners;
+ * ProcessRuntime obligations stay with the SAME original graph owner.
+ */
+class RetainedParticipantGraphSourceSlots final {
+public:
+    /** @param originalOwners Actual original physical-owner roster, never a reload multiplier.
+     * @return Exact CPU root bytes for this source's fixed handle roster.
+     * @throws std::exception For an empty or overflowing declaration.
+     */
+    static std::size_t physicalBytes(std::size_t originalOwners);
+    /** @brief Destroy original owner handles while the source's original workers/PMA still live. */
+    ~RetainedParticipantGraphSourceSlots();
+private:
+    friend class qwen4exp::PooledImmutableSourcePreparedStorage;
+    friend struct test::PooledRemoteGraphHostReplayAccess;
+    struct Slot {std::shared_ptr<RetainedParticipantGraphExecutable> owner;std::exception_ptr failure;};
+    /** @brief Materialize only after the actual source identity and exact holder BOM were admitted.
+     * @param sourceIdentity Actual existing prepared source root identity.
+     * @param originalOwners Original declared physical-owner population.
+     * @param memory Same original source PMA/control block.
+     * @return One admitted handle root with no source/cohort back-reference.
+     */
+    static std::shared_ptr<RetainedParticipantGraphSourceSlots> create(std::uint64_t sourceIdentity,
+        std::size_t originalOwners,const std::shared_ptr<PhysicalMemoryAuthority>&);
+    /** @brief Borrow the exact original slot; old runtime aliases must be gone before another definition begins.
+     * @param sourceIdentity Actual prepared source identity. @param original Same prepared owner/worker/PMA.
+     * @param exactStream Original explicit source-program stream. @param program Complete original closed program.
+     * @return Existing opaque owner with a fresh cold recording definition.
+     * @throws std::exception For foreign/overlapping/failed ownership or failed native construction.
+     */
+    std::shared_ptr<RetainedParticipantGraphExecutable> acquire(std::uint64_t sourceIdentity,
+        const PreparedGPUContextUsePermit&,void* exactStream,const PooledRemoteGraphProgram&);
+    /** @brief Drop native handles before runner arenas/communicators die, retaining original opaque backing.
+     * @param sourceIdentity Same prepared source identity. @param program Exact existing original program.
+     * @param owner Sole runtime alias, after all actual native and clone readers retired.
+     * @throws std::exception For incomplete retirement or foreign slot/program ownership.
+     */
+    void release(std::uint64_t sourceIdentity,const PooledRemoteGraphProgram&,
+        const std::shared_ptr<RetainedParticipantGraphExecutable>&);
+    /** @brief Preserve a failed original construction and release handles before borrowed arenas disappear.
+     * @param sourceIdentity Same actual prepared source. @param program Its exact original program.
+     * @param owner Partial original definition. @param failure Original construction diagnostic, kept absorbing.
+     * @throws std::exception If physical cleanup or exact ownership cannot be proven.
+     */
+    void abandon(std::uint64_t sourceIdentity,const PooledRemoteGraphProgram&,
+        const std::shared_ptr<RetainedParticipantGraphExecutable>&,std::exception_ptr);
+    /** @return Placement-constructed handle roster within this same admitted CPU root. */
+    Slot* slots()noexcept{return reinterpret_cast<Slot*>(this+1);}
+    RetainedParticipantGraphSourceSlots(std::uint64_t source,std::size_t count,std::shared_ptr<PhysicalMemoryAuthority> memory)
+        :sourceIdentity_(source),count_(count),memory_(std::move(memory)){}
+    std::mutex mutex_;
+    const std::uint64_t sourceIdentity_;
+    const std::size_t count_;
+    std::shared_ptr<PhysicalMemoryAuthority> memory_;
+};
+
+/**
+ * @brief One original selected worker's serial startup-calibration owner.
+ *
+ * Borrow only from the same prepared birth. Every completed measurement resets
+ * its cold definition using the existing calibration reset; returning all loans
+ * leaves the wrapper and timing pair source-owned across runner replacement.
+ * Final source retirement closes this owner before native zero-allocation tickets.
+ */
+class PreparedServiceCalibrationSlot final {
+public:
+    PreparedServiceCalibrationSlot(const PreparedServiceCalibrationSlot&)=delete;
+    PreparedServiceCalibrationSlot& operator=(const PreparedServiceCalibrationSlot&)=delete;
+    PreparedServiceCalibrationSlot(PreparedServiceCalibrationSlot&&)=delete;
+    PreparedServiceCalibrationSlot& operator=(PreparedServiceCalibrationSlot&&)=delete;
+    /** @return Exact known CPU holder root bytes, not another opaque General allowance. */
+    static std::size_t physicalBytes();
+private:
+    friend class GPUDeviceContextPool;
+    friend struct test::NativeContextPreparationReplayAccess;
+    /** @brief Close already-issued off-pool lookups without waiting or native work. */
+    void closeAcquisition()noexcept{closed_.store(true,std::memory_order_release);}
+    /** @brief Materialize the one holder in its admitted original source.
+     * @param memory Same source PMA/control block. @param device Selected original GPU.
+     * @return Original physical holder; no device/worker registry is created.
+     * @throws std::exception For invalid source or original CPU root allocation failure.
+     */
+    static std::shared_ptr<PreparedServiceCalibrationSlot> create(
+        std::shared_ptr<PhysicalMemoryAuthority> memory,DeviceId device);
+    /** @brief Borrow the actual wrapper/timing pair exclusively, off-worker.
+     * @param original Same selected source/PMA/worker/native generation.
+     * @param stream Exact original non-null worker stream.
+     * @return Existing Fresh/reset owner or its single first materialization.
+     * @throws std::exception For changed/live/failed ownership; native failure stays absorbing.
+     */
+    std::shared_ptr<RetainedParticipantGraphExecutable> acquire(const PreparedGPUContextUsePermit& original,void* stream);
+    /** @brief Close actual handles after all loans and native work retire.
+     * @throws std::exception For live loans, pending work or unreset calibration definitions.
+     * @note The original ProcessRuntime obligations remain untouched.
+     */
+    void retire();
+    PreparedServiceCalibrationSlot(std::shared_ptr<PhysicalMemoryAuthority> memory,DeviceId device)
+        :memory_(std::move(memory)),device_(device){}
+    std::mutex mutex_;
+    std::shared_ptr<PhysicalMemoryAuthority> memory_;
+    const DeviceId device_;
+    std::shared_ptr<RetainedParticipantGraphExecutable> owner_;
+    std::exception_ptr failure_;
+    std::atomic<bool> closed_{false}; ///< Final source close also excludes already-issued off-pool lookups.
+};
+
 }

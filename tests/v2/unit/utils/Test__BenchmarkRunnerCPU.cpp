@@ -4372,3 +4372,113 @@ TEST(Test__BenchmarkRunnerCPU, RuntimeConfigurationUsesOriginalCanonicalSerializ
         nlohmann::json::parse(llaminar2::serializeOrchestrationConfig(config)));
     EXPECT_FALSE(nlohmann::json::parse(llaminar2::benchmarkResultToJsonString(result)).contains("runtime_configuration"));
 }
+
+/** @brief Original frozen natural text is tokenized once and reused by repeated requests. */
+TEST(Test__BenchmarkRunnerCPU, CampaignFrozenHistoryPreservesExactNaturalTokens)
+{
+    CampaignFiles files;
+    auto document = files.document();
+    document["prompts"][0]["frozen_history"] = {
+        {"schema", "llaminar.benchmark-frozen-history.v1"}, {"corpus_manifest_digest", std::string(64, 'a')},
+        {"source_digest", std::string(64, 'b')}, {"canonical_cell", "original.ProductionParity/Off"},
+        {"history_id", "original-nine"}, {"context_group", "short"}, {"prompt_ids", {1, 2, 3, 4, 5}}};
+    auto inference = std::make_shared<MockOrchestratedDecodeRunner>();
+    auto tokenizer = createMockTokenizer();
+    EXPECT_CALL(*tokenizer, encode("Natural input stays intact.\n", false, false))
+        .Times(1).WillOnce(Return(std::vector<int>{1, 2, 3, 4, 5}));
+    BenchmarkRunner benchmark(inference, tokenizer);
+    const auto campaign = prepareBenchmarkCampaign(files.write(document), benchmark);
+    EXPECT_EQ(campaign.prompts().size(), 1u);
+    EXPECT_EQ(campaign.cells().size(), 17u);
+    EXPECT_EQ(inference->forwardCount(), 0);
+}
+
+/** @brief Provenance/token errors reject the complete campaign before any request or output. */
+TEST(Test__BenchmarkRunnerCPU, CampaignFrozenHistoryRejectsMismatchesAndUnknownProvenance)
+{
+    for (const auto *fault : {"tokens", "schema", "unknown", "digest", "duplicate", "source", "partial"})
+    {
+        SCOPED_TRACE(fault);
+        CampaignFiles files;
+        auto document = files.document();
+        document["prompts"][0]["frozen_history"] = {
+            {"schema", "llaminar.benchmark-frozen-history.v1"}, {"corpus_manifest_digest", std::string(64, 'a')},
+            {"source_digest", std::string(64, 'b')}, {"canonical_cell", "original.ProductionParity/Off"},
+            {"history_id", "original-nine"}, {"context_group", "short"}, {"prompt_ids", {1, 2, 3, 4, 5}}};
+        auto &provenance = document["prompts"][0]["frozen_history"];
+        const std::string reason(fault);
+        if (reason == "tokens") provenance["prompt_ids"][0] = 99;
+        if (reason == "schema") provenance["schema"] = "future";
+        if (reason == "unknown") provenance["invented"] = true;
+        if (reason == "digest") provenance["source_digest"] = "bad";
+        if (reason == "duplicate" || reason == "source" || reason == "partial")
+        {
+            auto alias = document["prompts"][0];
+            alias["id"] = "alias";
+            if (reason == "source") alias["frozen_history"]["canonical_cell"] = "foreign.ProductionParity/Off";
+            if (reason == "partial") alias.erase("frozen_history");
+            document["prompts"].push_back(alias);
+        }
+        auto inference = std::make_shared<MockOrchestratedDecodeRunner>();
+        BenchmarkRunner benchmark(inference, createMockTokenizer());
+        EXPECT_THROW((void)prepareBenchmarkCampaign(files.write(document), benchmark), std::invalid_argument);
+        EXPECT_EQ(inference->forwardCount(), 0);
+        EXPECT_FALSE(std::filesystem::exists(files.directory / "results"));
+    }
+}
+
+/** @brief Actual terminal snapshots retain distinct native windows and never infer differences. */
+TEST(Test__BenchmarkRunnerCPU, CampaignLookupTerminalBracketsPreserveOriginalScopes)
+{
+    ScopedTerminalEvidenceCollection collection(true);
+    ScopedPrefillGraphRequiredSetting not_required(false);
+    auto runner = std::make_shared<MockImmutableLookupEvidenceRunner>();
+    BenchmarkRunner benchmark(runner, createMockTokenizer());
+    benchmark.setPostWarmupCallback([&] { runner->beginMeasuredObservations(); });
+    OrchestrationConfig config;
+    config.prompt = "Hello world";
+    config.n_predict = 3;
+    config.mtp.enabled = true;
+    auto result = benchmark.run(config);
+    ASSERT_TRUE(result.success) << result.failure_reason;
+    ASSERT_FALSE(result.iterations.empty());
+    const auto document = nlohmann::json::parse(benchmarkResultToJsonString(result, &config));
+    for (const auto &iteration : document.at("iterations"))
+    {
+        const auto &observation = iteration.at("lookup_terminal_observation");
+        EXPECT_EQ(observation.at("schema"), "llaminar.benchmark.lookup-terminal-bracket.v1");
+        EXPECT_FALSE(observation.at("counter_delta_inferred").get<bool>());
+        EXPECT_TRUE(observation.at("collection_enabled").get<bool>());
+        ASSERT_FALSE(observation.at("after_request").empty());
+        for (const auto &row : observation.at("after_request"))
+        {
+            EXPECT_EQ(row.at("phase"), "generation_terminal");
+            EXPECT_NE(row.at("name"), "retained_remote_native_enqueues");
+            EXPECT_TRUE(row.contains("tags"));
+            EXPECT_TRUE(row.contains("count"));
+            EXPECT_TRUE(row.contains("sequence_minimum_words"));
+        }
+    }
+    // A serializer control preserves exact local authority/window/sequence even
+    // when the next native observation has a smaller value. It grants no native
+    // execution proof and must not subtract service/controller/local windows.
+    PerfStatRecord local;
+    local.domain = "ngram_lookup"; local.name = "local_read_original_ids";
+    local.phase = "generation_terminal"; local.device = "ROCm:1";
+    local.tags = {{"authority", "completed_local_hot_terminal"}, {"storage_identity", "42"},
+        {"window", "lifetime_delta"}, {"unit", "original_ids"}};
+    local.count = 7; local.value = 100; local.sequence_word_count = 2;
+    local.sequence_digest_lo = 123; local.sequence_digest_hi = 456;
+    local.sequence_minimum_words = {3, 4}; local.sequence_maximum_words = {5, 6};
+    auto &bracket = result.iterations.front().lookup_terminal;
+    bracket.before_request = {local};
+    local.value = 2; local.count = 1;
+    bracket.after_request = {local};
+    const auto retained = nlohmann::json::parse(benchmarkResultToJsonString(result, &config))
+        .at("iterations")[0].at("lookup_terminal_observation");
+    EXPECT_EQ(retained.at("before_request")[0].at("value"), 100);
+    EXPECT_EQ(retained.at("after_request")[0].at("value"), 2);
+    EXPECT_EQ(retained.at("after_request")[0].at("tags"), nlohmann::json(local.tags));
+    EXPECT_EQ(retained.at("after_request")[0].at("sequence_digest_lo"), 123);
+    EXPECT_EQ(retained.at("after_request")[0].at("sequence_minimum_words"), nlohmann::json::array({3, 4}));
+}

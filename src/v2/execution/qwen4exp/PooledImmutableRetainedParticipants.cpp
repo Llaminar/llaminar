@@ -5,10 +5,15 @@
  * No source model graph is cloned or substituted. Each actual original source
  * parent invocation submits each addressed owner program once. Protocol packet
  * retirement and native executable completion remain distinct authorities.
+ * A mixed-GPU I/O auxiliary body borrows the same original execution descriptor;
+ * no CPU expert tier or alternative source policy is created to admit it.
  */
 #include "PooledImmutableRetainedParticipants.h"
 #include "PooledImmutableReplicatedReaderGraph.h"
 #include "PooledImmutableParticipantExecutionPolicy.h"
+#include "kernels/qwen4exp/PooledImmutableLocalHotPreparedStorage.h"
+#include "execution/compute_stages/stages/qwen4exp/PooledImmutableLocalHotPhaseStage.h"
+#include "loaders/ModelLoader.h"
 #include "backends/RetainedParticipantGraphExecutable.h"
 #include "backends/GPUGraphMemoryContract.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
@@ -28,6 +33,7 @@ struct PooledImmutableRetainedParticipants::State {
     /** @brief Original cache-local parent lifetime, not a GPU execution/progress ledger. */
     struct AttachedParent {
         std::shared_ptr<const RetainedGraphParticipantPreparationStream> definition;
+        std::shared_ptr<const RetainedGraphParticipantPreparationStream> auxiliary; ///< Actual local body, distinct from its whole-source lineage.
         std::vector<std::shared_ptr<const RetainedGraphParticipantPreparationStream>> variants; ///< Same original finite owner body, exact source signature variants.
         const ComputeGraph* recipient=nullptr; ///< Actual follower graph identity, never a source ownership substitute.
         const IGPUGraphCapture* native=nullptr;
@@ -63,6 +69,16 @@ struct PooledImmutableRetainedParticipants::State {
     const IModelContext* originalModel = nullptr; ///< Original model owner, never a copied consumer/source context.
     std::shared_ptr<const MoEExpertOverlayExecutionPlan> executionPolicy; ///< Original immutable topology; expert movement epochs remain device-owned and separate.
     std::vector<Owner> owners;
+    /** @brief Existing local-root lifetime metadata; no cache occupancy or second allocator ledger. */
+    struct LocalParticipant {
+        PreparedGPUContextUsePermit original;
+        std::uint64_t rootIdentity;
+        std::optional<RetainedGraphParticipantParentStream> enclosingParent;
+        std::vector<std::weak_ptr<AttachedParent>> parents;
+    };
+    std::optional<PooledImmutableLocalHotTransportGeometry> localHotGeometry;
+    std::vector<std::shared_ptr<PooledImmutableLocalHotPreparedStorage>> localHotParticipants; ///< Sole immutable local-root roster, in declared consumer order.
+    std::vector<LocalParticipant> locals; ///< Same-roster original worker and parent lifetimes only.
     std::unique_ptr<RetainedGraphParticipantEnqueueGroup> enqueueGroup;
     std::vector<PooledRemoteGraphProgram> programs; ///< Original physical order; never recomputed from live counts.
     std::uint64_t rootIdentity;
@@ -91,8 +107,10 @@ private:
 /** @brief One native parent owns this original recorded-body borrow until its existing cache fence retires. */
 class PooledImmutableRetainedParticipants::StorageAttachment final:public IRetainedGraphParticipantStorageAttachment {
 public:
-    StorageAttachment(std::optional<RetainedParticipantGraphExecutable::RecordedStorageDefinition> body,std::shared_ptr<State::AttachedParent> parent)
-        :body_(std::move(body)),parent_(std::move(parent)){}
+    StorageAttachment(std::optional<RetainedParticipantGraphExecutable::RecordedStorageDefinition> body,
+        std::shared_ptr<State::AttachedParent> parent,
+        std::optional<RetainedGraphParticipantAuxiliaryBodySeal> auxiliary={})
+        :body_(std::move(body)),parent_(std::move(parent)),auxiliary_(std::move(auxiliary)){}
     bool attachTo(IGPUGraphCapture& parent,IGraphCaptureAuxiliaryBranch* progress)override{
         if(parent_->attempted || parent_->native!=&parent || parent.executionStream()!=parent_->captureStream)
             throw std::logic_error("Embedded storage attachment changed its original cold native parent");
@@ -102,14 +120,32 @@ public:
             // Inline storage is already in the recorded main DAG. The original
             // CPU-service progress branch still belongs to this SAME parent;
             // skipping its ordinary attachment would strand hosted execution.
-            attached = body_ ? body_->attachTo(parent, progress) : (!progress || progress->attach(parent));
+            if(auxiliary_) {
+                auxiliary_->preparation()->requireCurrentDefinition();
+                // Start only after THIS replay's main Probe. The body remains
+                // a separate parent terminal; joining it to the producer unit
+                // would deadlock when it waits for LocalRead in a later unit.
+                if(!parent.appendFiniteBodyAfterCapturedFragment(
+                    *auxiliary_->identity().producer_fragment,*auxiliary_->recordedBody()))return;
+            }
+            // Existing progress Open/Close observes the complete parent after
+            // the finite body has been added, including its retirement leaf.
+            attached=body_ ? body_->attachTo(parent,progress) : (!progress || progress->attach(parent));
         };
         if(parent_->original.worker()->ownsCurrentThread())assemble();else parent_->original.worker()->submitAndWait(assemble);
         parent_->attached=attached;return attached;
     }
     void requireCurrent()const override{
         if (body_) body_->requireCurrent();
-        else parent_->definition->requireDefinition();
+        else parent_->definition->requireCurrentDefinition();
+        if(auxiliary_) {
+            auxiliary_->preparation()->requireCurrentDefinition();
+            if(auxiliary_->identity().enclosing_parent!=parent_->native ||
+               auxiliary_->identity().enclosing_recording_stream!=parent_->captureStream ||
+               !auxiliary_->identity().producer_fragment ||
+               !auxiliary_->recordedBody() || auxiliary_->recordedBody()->hasExecutable())
+                throw std::logic_error("Local auxiliary lost its exact graph-only body and enclosing native parent");
+        }
         for (const auto& variant : parent_->variants) variant->requireCurrentDefinition();
         if(!parent_->attached || !parent_->native || !parent_->native->hasExecutable() ||
            parent_->native->executionStream()!=parent_->captureStream)
@@ -133,6 +169,7 @@ public:
 private:
     std::optional<RetainedParticipantGraphExecutable::RecordedStorageDefinition> body_;
     std::shared_ptr<State::AttachedParent> parent_;
+    std::optional<RetainedGraphParticipantAuxiliaryBodySeal> auxiliary_; ///< Strong original body and preparation borrows until parent destruction.
 };
 class PooledImmutableRetainedParticipants::SourcePlan final:public IRetainedGraphParticipantSourcePlan {
     friend class PooledImmutableRetainedParticipants;
@@ -146,6 +183,7 @@ public:
         fold(owner_->state_->rootIdentity);fold(reinterpret_cast<std::uintptr_t>(arena_));
         fold(reinterpret_cast<std::uintptr_t>(owner_->state_->transport.get()));
         fold(reinterpret_cast<std::uintptr_t>(owner_->state_->executionPolicy.get()));
+        for(const auto& local:owner_->state_->locals)fold(local.rootIdentity);
         for(const auto& owner:owner_->state_->owners){fold(owner.program ? owner.program->captureIdentity() : owner.coordinate);fold(owner.topology);
             fold(reinterpret_cast<std::uintptr_t>(owner.executable.get()));}
         std::visit([&](const auto& completion){
@@ -167,6 +205,9 @@ public:
     }
     void requirePreparedSourceDefinition(const RetainedGraphParticipantPreparationStream& preparation)const override{
         owner_->requireCurrent();
+        if(preparation.definition().scope!=RetainedGraphParticipantDefinitionScope::WholeSource) {
+            requireAuxiliaryDeclaration(preparation,true);return;
+        }
         preparation.requireLive(originalSource());
         const auto& definition=preparation.definition();
         if(definition.plan.get()!=this || definition.domain!=definitionDomain())
@@ -176,6 +217,9 @@ public:
     }
     void requireCurrentPreparedSourceDefinition(const RetainedGraphParticipantPreparationStream& preparation)const override{
         owner_->requireCurrent();
+        if(preparation.definition().scope!=RetainedGraphParticipantDefinitionScope::WholeSource) {
+            requireAuxiliaryDeclaration(preparation,false);return;
+        }
         preparation.requireLive(originalSource());const auto& definition=preparation.definition();
         originalSource().requireWorker(GPUDeviceContextPool::instance().retainExistingContext(originalSource().device()));
         if(definition.plan.get()!=this || definition.domain!=definitionDomain() || !definition.graph || definition.arena!=arena_ ||
@@ -190,6 +234,21 @@ public:
             throw std::logic_error("Sealed storage definition changed its original owner/topology");
         found->original.requireWorker(GPUDeviceContextPool::instance().retainExistingContext(found->original.device()));
     }
+    /**
+     * @brief Authenticate the original source envelope independently of CPU expert presence.
+     * @param graph Same source graph later sealed with the actual native parent.
+     * @throws std::exception For an unsupported envelope or replaced original owner borrow.
+     */
+    void requireSourceEnvelope(const ComputeGraph& graph) const
+    {
+        if (ownsHeterogeneousTicketBoundary(graph.nativeCaptureEnvelope()))
+            return;
+        graph.requireRetainedParticipantNativeAuxiliaryParent();
+        const auto& original = graph.retainedParticipantAuxiliaryRange()->original_execution;
+        const auto& expected = owner_->state_->executionPolicy;
+        if (!original || original != expected || original.owner_before(expected) || expected.owner_before(original))
+            throw std::invalid_argument("Native I/O source substituted its original execution descriptor");
+    }
     void requireDeclaration(const ComputeGraph* graph,const void* arena,DeviceId device,void* stream,
         uint64_t topology,uint64_t variant)const{
         owner_->requireCurrent();
@@ -199,9 +258,9 @@ public:
         originalSource().requireWorker(GPUDeviceContextPool::instance().retainExistingContext(originalSource().device()));
         if(!graph || arena!=arena_ || device!=owner_->state_->source.device() ||
            !stream || reinterpret_cast<std::uintptr_t>(stream)<=2 || !topology || !variant ||
-           graph->topologyGeneration()!=topology || graph->retainedParticipantSourcePlan().get()!=this ||
-           !ownsHeterogeneousTicketBoundary(graph->nativeCaptureEnvelope()))
+           graph->topologyGeneration()!=topology || graph->retainedParticipantSourcePlan().get()!=this)
             throw std::invalid_argument("Source definition lost its original graph/arena/count transaction");
+        requireSourceEnvelope(*graph);
         requirePooledSourceRetirementCompletion(*graph,completion_);
     }
     void requirePreparedStorageDefinition(const RetainedParticipantGraphExecutable& definition)const override{
@@ -279,6 +338,64 @@ public:
         found->parents.push_back(lifetime);
         return result;
     }
+    /**
+     * @brief Retain the actual participant-local auxiliary beside any original physical owner body.
+     * @param sealed Executor-issued graph-only recording with its exact participant/parent identity.
+     * @param progress Existing original per-device Open/Close authority.
+     * @return One attachment owning the complete sibling set through native retirement.
+     * @throws std::exception Before native mutation for missing/foreign/stale or duplicated bodies.
+     */
+    std::unique_ptr<IRetainedGraphParticipantStorageAttachment> prepareOriginalAuxiliaryAttachment(
+        const RetainedGraphParticipantAuxiliaryBodySeal& sealed,IGraphCaptureAuxiliaryBranch* progress)const override {
+        const auto& id=sealed.identity();const auto& prep=sealed.preparation();
+        if(!prep || prep->definition().plan.get()!=this || !sealed.recordedBody())
+            throw std::invalid_argument("Local auxiliary lost its actual original preparation/body");
+        prep->requireDefinition();
+        const auto& declaration=prep->definition();
+        const auto& source=declaration.original_source_definition;
+        const auto local=std::find_if(owner_->state_->locals.begin(),owner_->state_->locals.end(),
+            [&](const auto& value){return value.original.device()==id.participant;});
+        if(local==owner_->state_->locals.end() || !id.graph || !id.arena ||
+           id.graph!=declaration.graph || id.arena!=declaration.arena || id.participant!=declaration.participant ||
+           id.topology_generation!=declaration.topology_generation || id.capture_variant_signature!=declaration.variant ||
+           !id.capture_generation || id.range_identity!=declaration.range_identity ||
+           !id.enclosing_parent || id.enclosing_parent->hasExecutable() || !id.enclosing_parent->nodeCount() ||
+           !id.producer_fragment || !id.producer_fragment->nodeCount() || id.producer_fragment->hasExecutable() ||
+           id.producer_fragment->executionStream()!=id.enclosing_recording_stream ||
+           id.producer_fragment==id.enclosing_parent || id.producer_fragment==sealed.recordedBody().get() ||
+           id.enclosing_parent->executionStream()!=id.enclosing_recording_stream || prep->stream()!=id.enclosing_recording_stream ||
+           !sealed.recordedBody()->nodeCount() || sealed.recordedBody()->hasExecutable() ||
+           sealed.recordedBody()->executionStream()!=id.enclosing_recording_stream ||
+           (progress && (progress->device()!=id.participant || progress->originalSourceDefinition()!=source)))
+            throw std::invalid_argument("Local auxiliary changed its actual native parent, recording or complete source lineage");
+        sealed.originalParticipant().requireWorker(local->original.worker());
+        prep->requireLive(local->original);
+        if(!local->original.worker()->ownsCurrentThread())
+            throw std::logic_error("Local auxiliary attachment requires its actual recording worker");
+        for(const auto& weak:local->parents)if(const auto prior=weak.lock())
+            if(prior->definition==source || prior->auxiliary==prep || prior->native==id.enclosing_parent)
+                throw std::logic_error("One local consumer already owns this exact source/parent auxiliary body");
+        auto physical=std::find_if(owner_->state_->owners.begin(),owner_->state_->owners.end(),
+            [&](const auto& value){return value.original.device()==id.participant;});
+        std::optional<RetainedParticipantGraphExecutable::RecordedStorageDefinition> body;
+        if(physical!=owner_->state_->owners.end()) {
+            if(physical->disposition==State::ExecutionDisposition::Standalone ||
+               physical->disposition==State::ExecutionDisposition::EmbeddedExpert)
+                throw std::invalid_argument("Local consumer cannot acquire an independent storage/expert parent role");
+            for(const auto& weak:physical->parents)if(const auto prior=weak.lock())
+                if(prior->definition==source || prior->native==id.enclosing_parent)
+                    throw std::logic_error("Original physical owner already attached to this source/parent");
+            if(physical->disposition==State::ExecutionDisposition::EmbeddedParent)
+                body.emplace(physical->executable->retainRecordedStorageDefinition(physical->original,source));
+        }
+        auto lifetime=std::make_shared<State::AttachedParent>(State::AttachedParent{
+            .definition=source,.auxiliary=prep,.recipient=id.graph,.native=id.enclosing_parent,
+            .captureStream=id.enclosing_recording_stream,.original=local->original,.enclosing=local->enclosingParent});
+        auto result=std::make_unique<StorageAttachment>(std::move(body),lifetime,sealed);
+        local->parents.push_back(lifetime);
+        if(physical!=owner_->state_->owners.end())physical->parents.push_back(lifetime);
+        return result;
+    }
     void authenticatePreparationStream(std::shared_ptr<const RetainedGraphParticipantPreparationStream> preparation)const override{
         if(!preparation)throw std::invalid_argument("Original source preparation lost its cache authority");
         preparation->requireDefinition();
@@ -310,7 +427,6 @@ public:
            source.original_parent->executionStream()!=source.recording_stream ||
            !source.recording_stream || reinterpret_cast<std::uintptr_t>(source.recording_stream)<=2 ||
            !source.capture_generation || !source.capture_variant_signature ||
-           !ownsHeterogeneousTicketBoundary(source.graph->nativeCaptureEnvelope()) ||
            source.graph->retainedParticipantSourcePlan().get()!=this)
             throw std::invalid_argument("Recurring participant binding requires the actual complete original hosted source parent");
         requirePooledSourceRetirementCompletion(*source.graph,completion_);
@@ -329,6 +445,48 @@ public:
         return std::make_shared<Invocation>(owner_,source,std::move(definition));
     }
 private:
+    /**
+     * @brief Validate the real local scope without treating a reader as a whole source.
+     * @param preparation Exact executor-issued local-body token.
+     * @param inspect Cold validation additionally authenticates concrete native stages and dependencies.
+     * @throws std::exception For a replaced source, participant, arena, root, role or capture topology.
+     */
+    void requireAuxiliaryDeclaration(const RetainedGraphParticipantPreparationStream& preparation,bool inspect)const {
+        const auto& d=preparation.definition();const auto& source=d.original_source_definition;
+        const auto local=std::find_if(owner_->state_->locals.begin(),owner_->state_->locals.end(),
+            [&](const auto& value){return value.original.device()==d.participant;});
+        const bool isSource=d.scope==RetainedGraphParticipantDefinitionScope::AuxiliarySource;
+        if(!source || d.plan.get()!=this || d.domain!=definitionDomain() || !d.graph || !d.arena ||
+           local==owner_->state_->locals.end() || d.graph->topologyGeneration()!=d.topology_generation ||
+           d.scope!= (isSource?RetainedGraphParticipantDefinitionScope::AuxiliarySource:RetainedGraphParticipantDefinitionScope::AuxiliaryReader) ||
+           isSource!=(d.participant==originalSource().device()) ||
+           !d.graph->retainedParticipantDefinitionDomain() || *d.graph->retainedParticipantDefinitionDomain()!=d.domain ||
+           (isSource ? d.graph->retainedParticipantSourcePlan().get()!=this || d.arena!=arena_ : bool(d.graph->retainedParticipantSourcePlan())) ||
+           !d.graph->retainedParticipantSourceVariants().empty())
+            throw std::invalid_argument("Auxiliary definition changed its actual local participant, source or graph role");
+        source->requireCurrentDefinition();preparation.requireLive(local->original);
+        const auto& range=d.graph->retainedParticipantAuxiliaryRange();
+        if(!range || range->participant!=d.participant || range->identity!=d.range_identity ||
+           (range->role==RetainedGraphParticipantAuxiliaryRole::Source)!=isSource)
+            throw std::invalid_argument("Auxiliary definition lost its exact declared native range");
+        if (requiresSingleNativeExecutable(d.graph->nativeCaptureEnvelope()))
+        {
+            // Cold authentication proves the full native I/O declaration once.
+            // Current borrows retain its immutable identity/topology without
+            // rescanning the model DAG on every invocation.
+            if (inspect)
+                d.graph->requireRetainedParticipantNativeAuxiliaryParent();
+            const auto& declared = range->original_execution;
+            const auto& expected = owner_->state_->executionPolicy;
+            if (!declared || declared != expected || declared.owner_before(expected) || expected.owner_before(declared))
+                throw std::invalid_argument("Native auxiliary source changed its original execution descriptor");
+        }
+        if(inspect) {
+            d.graph->requireRetainedParticipantAuxiliaryRange();
+            const auto index=static_cast<std::size_t>(local-owner_->state_->locals.begin());
+            requirePooledLocalHotAuxiliary(*d.graph,*range,owner_->state_->transport,owner_->state_->localHotParticipants[index]);
+        }
+    }
     std::shared_ptr<PooledImmutableRetainedParticipants> owner_;
     BufferArena* arena_;
     PooledImmutableSourceRetirementCompletion completion_;
@@ -337,7 +495,9 @@ private:
 PooledImmutableRetainedParticipants::PooledImmutableRetainedParticipants(std::unique_ptr<State> state):state_(std::move(state)){}
 std::shared_ptr<PooledImmutableRetainedParticipants> PooledImmutableRetainedParticipants::create(
     std::shared_ptr<ImmutableLookupExecutionBoundary> boundary,const GraphConfig& policy,std::shared_ptr<const ClusterInventory> originalInventory,
-    std::optional<PooledImmutableReplicatedReaderGeometry> readers){
+    std::optional<PooledImmutableReplicatedReaderGeometry> readers,
+    std::optional<PooledImmutableLocalHotTransportGeometry> localHot,
+    std::span<const std::shared_ptr<PooledImmutableLocalHotPreparedStorage>> localHotParticipants){
     PooledImmutableParticipantExecutionPolicy::requireConfiguration(policy.mtp);
     if(isGraphCaptureActive() || !boundary || !boundary->isPooled() || policy.default_device!=boundary->device() ||
        policy.n_layers<=0 || policy.pp_layer_offset!=0 ||
@@ -345,9 +505,13 @@ std::shared_ptr<PooledImmutableRetainedParticipants> PooledImmutableRetainedPart
        !policy.moe.expert_overlay_execution_plan)
         throw std::invalid_argument("Recurring declared owners require original hosted ExpertOverlay source policy");
     const auto& execution=*policy.moe.expert_overlay_execution_plan;
-    if(execution.world_size!=1 || !execution.ownsContinuationGraph() ||
-       execution.generationExecutionDomain()!=DeviceGenerationExecutionDomain::HostedBoundary)
-        throw std::invalid_argument("Recurring remote owners require one actual rank-local heterogeneous hosted ticket parent");
+    PooledImmutableParticipantExecutionPolicy::requireHostedSourceExecution(execution);
+    if (!localHot && std::none_of(execution.domains.begin(), execution.domains.end(), [](const auto& domain) {
+            return std::any_of(domain.participants.begin(), domain.participants.end(), [](const auto& participant) {
+                return participant.local_device.is_cpu();
+            });
+        }))
+        throw std::invalid_argument("Native mixed-GPU pooled source requires its actual combined auxiliary geometry");
     const auto dense=std::find_if(execution.domains.begin(),execution.domains.end(),[&](const auto& domain){return domain.name==execution.continuation_domain;});
     if (dense == execution.domains.end())
         throw std::invalid_argument("Recurring owner composition lost its actual continuation domain");
@@ -374,9 +538,24 @@ std::shared_ptr<PooledImmutableRetainedParticipants> PooledImmutableRetainedPart
     const auto storage=boundary->pooledStorage();const auto& witness=storage->retainedPreparedSourceWorkers();
     if(!witness || witness->rootIdentity()!=storage->captureIdentity() || witness->coordinator().device()!=boundary->device())
         throw std::invalid_argument("Recurring remote owners require actually consumed original prepared source workers");
-    bool cpu=false;
+    if(bool(localHot)!=!localHotParticipants.empty())
+        throw std::invalid_argument("Combined retained participants require their complete original local-root roster");
+    if(localHot) {
+        (void)PooledImmutableParticipantExecutionPolicy::requiresRetainedParticipants(storage->geometry(),&*localHot);
+        if(localHot->consumers().size()!=localHotParticipants.size() ||
+           localHot->consumers().size()!=dense->participants.size() || bool(readers)!=bool(localHot->originalReaders()))
+            throw std::invalid_argument("Combined retained participant population changed the actual continuation roster");
+        for(std::size_t index=0;index<localHotParticipants.size();++index) {
+            const auto& local=localHotParticipants[index];const auto endpoint=localHot->consumers()[index];
+            if(!local || local->geometry().allocator()!=endpoint ||
+               local->geometry().extent()!=localHot->sourceExtent() ||
+               local->geometry().maximumOriginalIds()!=localHot->maximumPoolUniqueRows() ||
+               (readers && readers->consumers()[index]!=endpoint))
+                throw std::invalid_argument("Combined retained local roots changed exact table, query or consumer order");
+            local->requireFor(local->geometry(),storage,witness->coordinator().memory());
+        }
+    }
     for(const auto& domain:execution.domains)for(const auto& participant:domain.participants){
-        cpu=cpu || participant.local_device.is_cpu();
         for(const auto& owner:witness->owners())
             if(owner.device()!=boundary->device() && participant.local_device==owner.device()){
                 const bool embedded=readers && std::any_of(readers->consumers().begin(),readers->consumers().end(),[&](const auto& consumer){
@@ -400,7 +579,6 @@ std::shared_ptr<PooledImmutableRetainedParticipants> PooledImmutableRetainedPart
         const bool expert = PooledImmutableParticipantExecutionPolicy::declaresExpertOwner(execution,owner);
         if (!expert) throw std::invalid_argument("Multiple mapped storage owners require their actual original expert follower parents");
     }
-    if(!cpu)throw std::invalid_argument("Recurring remote owner policy lost its explicitly declared CPU expert boundary");
     if(witness->coordinator().worker()->ownsCurrentThread())throw std::logic_error("Recurring owner preparation must run off its original source worker");
     std::unique_ptr<RetainedGraphParticipantEnqueueGroup> enqueueGroup;
     std::vector<PooledRemoteGraphProgram> programs;
@@ -438,13 +616,36 @@ std::shared_ptr<PooledImmutableRetainedParticipants> PooledImmutableRetainedPart
         result->state_->originalCohort = policy.ngram_replicated_ple_cohort;
     }
     result->state_->programs=std::move(programs);
+    result->state_->localHotGeometry=localHot;
+    result->state_->localHotParticipants.assign(localHotParticipants.begin(),localHotParticipants.end());
+    for(const auto& local:localHotParticipants) {
+        auto original=GPUDeviceContextPool::instance().retainExistingPreparedContext(
+            local->geometry().allocator().device,witness->coordinator().memory());
+        if(original.worker()->ownsCurrentThread())
+            throw std::logic_error("Combined local participant preparation must remain off its original worker");
+        result->state_->locals.push_back(State::LocalParticipant{.original=std::move(original),.rootIdentity=local->captureIdentity()});
+    }
     result->state_->transport=PooledImmutableDirectedTransport::create(boundary,std::move(originalInventory), std::move(readers),
-        policy.ngram_replicated_ple_cohort);
-    if(result->state_->transport->remotes().empty() && result->state_->transport->readers().empty())
+        policy.ngram_replicated_ple_cohort,localHot);
+    if(!localHot && result->state_->transport->remotes().empty() && result->state_->transport->readers().empty())
         throw std::invalid_argument("Retained participant binding has neither remote storage owners nor compute readers");
     result->prepareOriginalOwners();
     boundary->bindRetainedParticipants(result);
     return result;
+}
+void PooledImmutableParticipantExecutionPolicy::requireHostedSourceExecution(
+    const MoEExpertOverlayExecutionPlan& original)
+{
+    if (original.world_size != 1 || !original.ownsContinuationGraph() ||
+        original.generationExecutionDomain() != DeviceGenerationExecutionDomain::HostedBoundary)
+        throw std::invalid_argument("Recurring remote owners require one actual rank-local heterogeneous hosted ticket parent");
+    const bool hasCPU = std::any_of(original.domains.begin(), original.domains.end(), [](const auto& domain) {
+        return std::any_of(domain.participants.begin(), domain.participants.end(), [](const auto& participant) {
+            return participant.local_device.is_cpu();
+        });
+    });
+    if (!hasCPU)
+        requireRankLocalMixedGPUAuxiliaryExecution(original);
 }
 bool PooledImmutableParticipantExecutionPolicy::requiresRetainedParticipants(
     const PooledImmutableSourceGeometry& source) noexcept
@@ -454,6 +655,20 @@ bool PooledImmutableParticipantExecutionPolicy::requiresRetainedParticipants(
     return source.parameters().consumers > 1 ||
         std::any_of(source.originalOwners().begin(), source.originalOwners().end(),
             [&](const auto& owner) { return owner.allocator() != source.allocator(); });
+}
+
+bool PooledImmutableParticipantExecutionPolicy::requiresRetainedParticipants(
+    const PooledImmutableSourceGeometry& source,const PooledImmutableLocalHotTransportGeometry* localHot)
+{
+    if(!localHot)return requiresRetainedParticipants(source);
+    const auto& p=source.parameters();
+    if(localHot->coordinator()!=source.allocator() || localHot->consumers().size()!=p.consumers ||
+       localHot->sourceExtent().rows()!=p.coordinator.policy.sourceRows() ||
+       ggufToTensorType(localHot->sourceExtent().format())!=p.format || localHot->sourceExtent().rowBytes()!=p.owner.row_bytes ||
+       localHot->maximumPoolOriginalRows()!=p.coordinator.policy.maximumOriginal() ||
+       localHot->maximumPoolUniqueRows()!=p.coordinator.policy.maximumUnique())
+        throw std::invalid_argument("Combined source declaration changed the original pool/table/query envelope");
+    return true;
 }
 
 bool PooledImmutableParticipantExecutionPolicy::declaresExpertOwner(
@@ -602,7 +817,9 @@ void PooledImmutableRetainedParticipants::prepareOriginalOwners(){
             owner.disposition = State::ExecutionDisposition::EmbeddedExpert;
         void* originalStream=nullptr;
         permit.worker()->submitAndWait([&]{originalStream=permit.worker()->defaultStream();});
-        owner.executable=RetainedParticipantGraphExecutable::create(permit,originalStream,*owner.program);
+        owner.executable=state_->boundary->pooledStorage()->acquireOriginalRemoteDefinition(*owner.program,originalStream);
+        owner.submissionOrdinal=owner.executable->lastSubmission_;
+        try {
         owner.executable->bindCohortDefinition();
         permit.worker()->submitAndWait([&]{
             auto context=IDeviceContext::create(permit.device(),1);
@@ -634,6 +851,10 @@ void PooledImmutableRetainedParticipants::prepareOriginalOwners(){
                 owner.leaves.push_back({name,node->stage.get(),node->dependencies,node->stage->graphCaptureVariantSignature()});
             }
         });
+        } catch(...) {
+            state_->boundary->pooledStorage()->abandonOriginalRemoteDefinition(*owner.program,owner.executable,std::current_exception());
+            throw;
+        }
         state_->owners.push_back(std::move(owner));
     }
     std::vector<RetainedGraphParticipantEnqueueGroup::Job> jobs;
@@ -648,6 +869,27 @@ void PooledImmutableRetainedParticipants::prepareOriginalOwners(){
 }
 const std::shared_ptr<ImmutableLookupExecutionBoundary>& PooledImmutableRetainedParticipants::boundary()const noexcept{return state_->boundary;}
 const std::shared_ptr<const PooledImmutableDirectedTransport>& PooledImmutableRetainedParticipants::transport()const noexcept{return state_->transport;}
+const std::shared_ptr<const MoEExpertOverlayExecutionPlan>&
+PooledImmutableRetainedParticipants::originalExecutionPolicy() const noexcept
+{
+    return state_->executionPolicy;
+}
+const std::optional<PooledImmutableLocalHotTransportGeometry>& PooledImmutableRetainedParticipants::localHotGeometry()const noexcept{return state_->localHotGeometry;}
+std::span<const std::shared_ptr<PooledImmutableLocalHotPreparedStorage>> PooledImmutableRetainedParticipants::localHotParticipants()const noexcept{return state_->localHotParticipants;}
+
+std::shared_ptr<const IPooledImmutableNativeKernels>
+PooledImmutableRetainedParticipants::localHotInlineOwnerCode(DeviceId device) const
+{
+    requireCurrent();
+    if (!state_->localHotGeometry || std::none_of(state_->locals.begin(), state_->locals.end(),
+        [&](const auto& local) { return local.original.device() == device; }))
+        throw std::invalid_argument("Combined inline-owner code requires an original local-cache consumer");
+    const auto owner = std::find_if(state_->owners.begin(), state_->owners.end(), [&](const auto& candidate) {
+        return candidate.original.device() == device && candidate.disposition == State::ExecutionDisposition::InlineReader;
+    });
+    return owner == state_->owners.end() ? nullptr : owner->code;
+}
+
 void PooledImmutableRetainedParticipants::bindSourcePlan(ComputeGraph& graph,BufferArena& arena,PooledImmutableSourceRetirementCompletion completion){
     const auto boundary=std::visit([](const auto& value){
         using T=std::decay_t<decltype(value)>;
@@ -663,6 +905,14 @@ void PooledImmutableRetainedParticipants::requireCurrent()const{
     if(state_->rootIdentity!=state_->boundary->pooledStorage()->captureIdentity())throw std::logic_error("Recurring owner original roots changed");
     state_->transport->requireCurrent();
     state_->source.requireWorker(GPUDeviceContextPool::instance().retainExistingContext(state_->source.device()));
+    if(state_->locals.size()!=state_->localHotParticipants.size())
+        throw std::logic_error("Combined participant lost its immutable original local roster");
+    for(std::size_t index=0;index<state_->locals.size();++index) {
+        const auto& local=state_->localHotParticipants[index];const auto& lifetime=state_->locals[index];
+        if(!local || local->captureIdentity()!=lifetime.rootIdentity || local->geometry().allocator().device!=lifetime.original.device())
+            throw std::logic_error("Combined participant changed an original local physical root");
+        lifetime.original.requireWorker(GPUDeviceContextPool::instance().retainExistingContext(lifetime.original.device()));
+    }
     for(const auto& owner:state_->owners){
         owner.original.requireWorker(GPUDeviceContextPool::instance().retainExistingContext(owner.original.device()));
         if (owner.disposition == State::ExecutionDisposition::InlineReader) {
@@ -681,17 +931,34 @@ void PooledImmutableRetainedParticipants::requireCurrent()const{
     }
 }
 bool PooledImmutableRetainedParticipants::hasEmbeddedParticipant(DeviceId device)const noexcept{
-    return std::any_of(state_->owners.begin(),state_->owners.end(),[&](const auto& owner){return owner.original.device()==device && owner.disposition!=State::ExecutionDisposition::Standalone;});
+    return std::any_of(state_->locals.begin(),state_->locals.end(),[&](const auto& local){return local.original.device()==device;}) ||
+        std::any_of(state_->owners.begin(),state_->owners.end(),[&](const auto& owner){return owner.original.device()==device && owner.disposition!=State::ExecutionDisposition::Standalone;});
 }
 PreparedGPUContextUsePermit PooledImmutableRetainedParticipants::originalParticipant(DeviceId device)const{
     if(device==state_->source.device())return state_->source;
+    const auto local=std::find_if(state_->locals.begin(),state_->locals.end(),[&](const auto& value){return value.original.device()==device;});
+    if(local!=state_->locals.end())return local->original;
     const auto found=std::find_if(state_->owners.begin(),state_->owners.end(),[&](const auto& owner){return owner.original.device()==device && owner.disposition!=State::ExecutionDisposition::Standalone;});
     if(found==state_->owners.end())throw std::invalid_argument("Parent stream requires an original embedded storage participant");
     return found->original;
 }
 void PooledImmutableRetainedParticipants::bindEmbeddedParentSubmissionStream(const RetainedGraphParticipantParentStream& parent){
     auto& owners=state_->owners;const auto found=std::find_if(owners.begin(),owners.end(),[&](const auto& owner){return owner.original.device()==parent.original().device() && owner.disposition!=State::ExecutionDisposition::Standalone;});
-    if(found==owners.end())throw std::invalid_argument("Enclosing parent is not an original embedded participant");
+    const auto local=std::find_if(state_->locals.begin(),state_->locals.end(),[&](const auto& value){return value.original.device()==parent.original().device();});
+    if(found==owners.end() && local==state_->locals.end())throw std::invalid_argument("Enclosing parent is not an original embedded participant");
+    if(local!=state_->locals.end()) {
+        parent.original().requireWorker(local->original.worker());
+        const auto same=[](const auto& a,const auto& b){return a.get()==b.get() && !a.owner_before(b) && !b.owner_before(a);};
+        if(!same(parent.original().memory(),local->original.memory()) || (local->enclosingParent &&
+           (parent.stream()!=local->enclosingParent->stream() || !same(parent.owner(),local->enclosingParent->owner()))))
+            throw std::invalid_argument("Local parent changed its original PMA or native stream owner");
+        local->enclosingParent=parent;
+        for(const auto& weak:local->parents)if(const auto actual=weak.lock())actual->enclosing=parent;
+        const auto index=static_cast<std::size_t>(local-state_->locals.begin());
+        const auto acquire=[&]{state_->localHotParticipants[index]->acquireSetup(parent.stream());};
+        if(local->original.worker()->ownsCurrentThread())acquire();else local->original.worker()->submitAndWait(acquire);
+        if(found==owners.end())return;
+    }
     parent.original().requireWorker(found->original.worker());
     const auto same=[](const auto& a,const auto& b){return a.get()==b.get() && !a.owner_before(b) && !b.owner_before(a);};
     if(!same(parent.original().memory(),found->original.memory()) || (found->enclosingParent &&
@@ -744,6 +1011,14 @@ void PooledImmutableRetainedParticipants::requireOriginalExpertSourceVariants(De
         std::size_t occurrences = 0;
         for (const auto& name : definition->definition().graph->getExecutionOrder()) {
             const auto* node = definition->definition().graph->getNode(name);
+            const auto* compact=node?dynamic_cast<const PooledImmutableLocalHotBeginStage*>(node->stage.get()):nullptr;
+            if(compact) {
+                if(compact->source()!=state_->boundary->pooledStorage())
+                    throw std::invalid_argument("Expert source association contains a foreign compact coordinator occurrence");
+                requirePooledCompactQueryProducer(*definition->definition().graph,compact->query(),name);
+                ++occurrences;
+                continue;
+            }
             const auto* phase = node ? dynamic_cast<const PooledImmutableNativePhaseStage*>(node->stage.get()) : nullptr;
             if (!phase) continue;
             const auto* coordinator = std::get_if<PooledImmutableNativePhaseStage::Coordinator>(&phase->phase());
@@ -881,6 +1156,11 @@ void PooledImmutableRetainedParticipants::bindSourceSubmissionStream(const Retai
        state_->submissionStream->owner().owner_before(owner.owner()) || owner.owner().owner_before(state_->submissionStream->owner())))
         throw std::invalid_argument("Recurring source cannot reinterpret its original parent stream ownership");
     state_->submissionStream=owner;
+    const auto local=std::find_if(state_->locals.begin(),state_->locals.end(),[&](const auto& value){return value.original.device()==owner.original().device();});
+    if(local!=state_->locals.end()) {
+        local->enclosingParent=owner;
+        for(const auto& weak:local->parents)if(const auto actual=weak.lock())actual->enclosing=owner;
+    }
 }
 void PooledImmutableRetainedParticipants::awaitNativeTerminal(std::chrono::steady_clock::time_point deadline)const{
     requireCurrent();
@@ -892,6 +1172,11 @@ void PooledImmutableRetainedParticipants::awaitNativeTerminal(std::chrono::stead
                 complete=observed(parent->captureStream) && complete;
                 if(parent->enclosing)complete=observed(parent->enclosing->stream()) && complete;
             }
+        }
+        for(const auto& local:state_->locals)for(const auto& weak:local.parents)if(const auto parent=weak.lock()) {
+            const auto observed=[&](void* stream){return local.original.worker()->queryStreamExecutionState(stream,"original local auxiliary request terminal")==GPUStreamExecutionState::Complete;};
+            complete=observed(parent->captureStream) && complete;
+            if(parent->enclosing)complete=observed(parent->enclosing->stream()) && complete;
         }
         if(complete)return;
         if(std::chrono::steady_clock::now()>=deadline)throw std::runtime_error("Recurring owner native completion exceeded the original request terminal deadline");
@@ -919,6 +1204,8 @@ void PooledImmutableRetainedParticipants::retireOriginalRuntimeBeforeArenaReleas
     for (const auto& owner : state_->owners)
         for (const auto& weak : owner.parents)
             if (!weak.expired()) throw std::logic_error("Original pooled parent/cache borrower is still live");
+    for(const auto& local:state_->locals)for(const auto& weak:local.parents)
+        if(!weak.expired())throw std::logic_error("Original local auxiliary parent/cache borrower is still live");
     if (state_->transport) {
         awaitNativeTerminal(std::chrono::steady_clock::now() + std::chrono::seconds(30));
         if (state_->submissionStream) {
@@ -933,6 +1220,8 @@ void PooledImmutableRetainedParticipants::retireOriginalRuntimeBeforeArenaReleas
         // Independently recorded owners may borrow coordinator arena roots.
         // Their captures/stages MUST die here, while every child arena lives.
         state_->enqueueGroup.reset();
+        for(const auto& owner:state_->owners)if(owner.executable && owner.program)
+            state_->boundary->pooledStorage()->releaseOriginalRemoteDefinition(*owner.program,owner.executable);
         state_->owners.clear();
         for (const auto& remote : state_->transport->remotes()) remote.pin->retireOriginalInvocation();
         state_->transport->retireOriginalRuntime();
@@ -947,6 +1236,8 @@ void PooledImmutableRetainedParticipants::retireOriginalRuntimeBeforeArenaReleas
     state_->submissionStream.reset();
     state_->preparationStreams.clear();
     state_->transport.reset();
+    state_->locals.clear();
+    state_->localHotParticipants.clear();
     state_->programs.clear();
     state_->ownsBoundaryClaim = false;
     state_->boundary->cohortOwnerClaim_.clear(std::memory_order_release);
@@ -955,9 +1246,17 @@ PooledImmutableRetainedParticipants::~PooledImmutableRetainedParticipants()noexc
     if(!state_->ownsBoundaryClaim)return;
     if(state_->boundary->hasActiveInterval() || state_->source.worker()->ownsCurrentThread())std::terminate();
     for(const auto& owner:state_->owners)if(owner.original.worker()->ownsCurrentThread())std::terminate();
+    for(const auto& local:state_->locals) {
+        if(local.original.worker()->ownsCurrentThread())std::terminate();
+        for(const auto& weak:local.parents)if(!weak.expired())std::terminate();
+    }
     // Each closed executable rejects unobserved live readers before destroying
     // handles; its original device tokens remain process-retained afterwards.
     state_->enqueueGroup.reset();
+    try {
+        for(const auto& owner:state_->owners)if(owner.executable && owner.program)
+            state_->boundary->pooledStorage()->releaseOriginalRemoteDefinition(*owner.program,owner.executable);
+    }catch(...){std::terminate();}
     state_->owners.clear();
     state_->transport.reset();
     state_->boundary->cohortOwnerClaim_.clear(std::memory_order_release);

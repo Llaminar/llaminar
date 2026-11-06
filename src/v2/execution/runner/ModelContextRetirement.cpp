@@ -150,6 +150,17 @@ namespace llaminar2
         return result;
     }
 
+    ModelContextRetirementReceipt PendingExclusiveModelRetirement::complete(
+        const std::shared_ptr<NativeContextPreparation>& original_source)
+    {
+        if(completed_)throw std::logic_error("Pending model-context retirement cannot complete twice");
+        // begin() only captured allocation facts. Worker destruction starts in
+        // complete(), so source-held calibration loans must close before it.
+        // A rejected close leaves this same pending boundary unconsumed.
+        if(original_source)original_source->retirePreparedCalibrations();
+        return complete();
+    }
+
     ModelContextRetirementReceipt
     retireExclusiveModelContextReuseContract(
         ModelContextReuseContract &contract)
@@ -234,7 +245,7 @@ namespace llaminar2
 
         // This receipt continues to describe the sealed model-allocation BOM;
         // residual birth reset is an additional original-source lifetime proof.
-        auto receipt = pending.complete();
+        auto receipt = pending.complete(final_native_source);
         if (final_native_source)
             final_native_source->retireReleasedContexts();
         return receipt;

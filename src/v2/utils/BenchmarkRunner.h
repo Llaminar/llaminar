@@ -142,6 +142,19 @@ namespace llaminar2
     };
 
     /**
+     * @brief Completed terminal records observed at one measured request's host boundaries.
+     * These are immutable collector snapshots, not device reads or a new ledger.
+     * Native storage/controller/service windows and reset semantics remain in
+     * their original tags/sequence fields; no cross-window delta is inferred.
+     */
+    struct BenchmarkLookupTerminalBracket
+    {
+        bool collection_enabled = false;
+        std::vector<PerfStatRecord> before_request;
+        std::vector<PerfStatRecord> after_request;
+    };
+
+    /**
      * @brief One measured request in a repeated production benchmark.
      *
      * Aggregate throughput is useful for a stable headline number, but it
@@ -211,6 +224,7 @@ namespace llaminar2
 
         /** Decode trajectory partitioned by the configured maintenance window. */
         std::vector<BenchmarkDecodeWindowResult> decode_windows;
+        BenchmarkLookupTerminalBracket lookup_terminal; ///< Raw completed observations; never synthesized per-tier totals.
     };
 
     /**

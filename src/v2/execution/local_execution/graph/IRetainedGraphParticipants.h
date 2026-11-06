@@ -25,6 +25,14 @@
 namespace llaminar2 {
 namespace qwen4exp {class PooledImmutableRetainedParticipants;}
 class ComputeGraph;
+struct MoEExpertOverlayExecutionPlan;
+/**
+ * @brief Validate immutable rank-local mixed-GPU ownership for a native I/O auxiliary parent.
+ * @param original Same original resolved execution descriptor retained by the participant owner.
+ * @throws std::invalid_argument For CPU/homogeneous, distributed, foreign or incomplete ownership.
+ * @note This metadata check grants no worker, source, graph or attachment authority.
+ */
+void requireRankLocalMixedGPUAuxiliaryExecution(const MoEExpertOverlayExecutionPlan& original);
 class IRetainedGraphParticipantSourcePlan;
 class IGPUGraphCapture;
 class RetainedParticipantGraphExecutable;
@@ -62,6 +70,29 @@ private:
     PreparedGPUContextUsePermit original_; ///< Keeps original context alive until the existing stream owner releases.
     std::shared_ptr<void> stream_;
 };
+/** @brief Per-device auxiliary ownership, never a declaration of source authority for a reader. */
+enum class RetainedGraphParticipantAuxiliaryRole : std::uint8_t {Source,Reader};
+/**
+ * @brief Actual participant-local side range in the original graph.
+ *
+ * The canonical builder records these real stage names and identity. The
+ * executor validates topology before recording; only its private body seal
+ * can authorize attachment. Main LocalRead is explicitly outside this range.
+ */
+struct RetainedGraphParticipantAuxiliaryRange final {
+    RetainedGraphParticipantAuxiliaryRole role=RetainedGraphParticipantAuxiliaryRole::Source;
+    DeviceId participant=DeviceId::invalid();
+    std::vector<std::string> nodes;
+    std::string probe_ready,ready_publication,main_read,retirement;
+    std::uint64_t identity=0;
+    /** Same original immutable owner descriptor; no graph/source back-reference or policy copy. */
+    std::shared_ptr<const MoEExpertOverlayExecutionPlan> original_execution;
+    bool operator==(const RetainedGraphParticipantAuxiliaryRange&)const=default;
+};
+/** @brief Whole source and exact participant bodies have disjoint preparation meanings. */
+enum class RetainedGraphParticipantDefinitionScope : std::uint8_t {
+    WholeSource,AuxiliarySource,AuxiliaryReader
+};
 /** @brief Cache-owned preparation stream borrow, revoked before the original cache destroys its stream.
  * This capability creates no resource. The exact original worker serializes
  * native preparation with cache teardown; a retired borrow cannot authorize a
@@ -75,10 +106,14 @@ public:
         uint64_t topology_generation=0, variant=0;
         RetainedGraphParticipantDefinitionDomain domain;
         std::shared_ptr<const IRetainedGraphParticipantSourcePlan> plan;
+        RetainedGraphParticipantDefinitionScope scope=RetainedGraphParticipantDefinitionScope::WholeSource;
+        DeviceId participant=DeviceId::invalid();
+        std::uint64_t range_identity=0;
+        std::shared_ptr<const RetainedGraphParticipantPreparationStream> original_source_definition;
     };
     /** @return Exact executor-minted cold definition, absent for legacy stream-only borrows. */
     const Definition& definition()const noexcept{return definition_;}
-    /** @return Original admitted source permit; observing it creates no context. */
+    /** @return Original admitted actor: source for whole definitions, actual participant for auxiliary bodies. */
     const PreparedGPUContextUsePermit& originalSource()const noexcept{return original_;}
     /** @brief Revalidate original live cache, graph/count/retirement definition without an executable seal. */
     void requireDefinition()const;
@@ -138,6 +173,8 @@ retainedSourceVariantExtension(
         for (const auto& value : values) {
             if (!value) throw std::invalid_argument("Source alias refresh contains an absent original definition");
             value->requireCurrentDefinition();
+            if(value->definition().scope!=RetainedGraphParticipantDefinitionScope::WholeSource)
+                throw std::invalid_argument("Source alias refresh cannot adopt an auxiliary preparation body");
             value->requireLive(original);
             if (value->definition().domain != domain)
                 throw std::invalid_argument("Source alias refresh contains a foreign original domain");
@@ -171,6 +208,44 @@ private:
     friend struct test::RetainedGraphParticipantsReplayAccess;
     explicit RetainedGraphParticipantSourceSeal(RetainedGraphParticipantSourceIdentity identity):identity_(identity){}
     RetainedGraphParticipantSourceIdentity identity_;
+};
+/** @brief Exact enclosing parent observation for one real auxiliary body, never a reader SourceSeal. */
+struct RetainedGraphParticipantAuxiliaryBodyIdentity final {
+    const ComputeGraph* graph=nullptr;
+    const void* arena=nullptr;
+    DeviceId participant=DeviceId::invalid();
+    void* enclosing_recording_stream=nullptr;
+    const IGPUGraphCapture* enclosing_parent=nullptr;
+    const IGPUGraphCapture* producer_fragment=nullptr; ///< Exact retained main unit ending at this replay's probe.
+    std::uint64_t topology_generation=0,capture_variant_signature=0,capture_generation=0,range_identity=0;
+    bool operator==(const RetainedGraphParticipantAuxiliaryBodyIdentity&)const=default;
+};
+/**
+ * @brief Only the canonical executor seals an actual graph-only recorded body under its exact enclosing parent.
+ * Strong original participant/body/preparation owners survive until attachment
+ * and original parent retirement. A reader never receives source launch rights.
+ */
+class RetainedGraphParticipantAuxiliaryBodySeal final {
+public:
+    /** @return Exact enclosing native parent/range identity, never readiness. */
+    const auto& identity()const noexcept{return identity_;}
+    /** @return Actual admitted participant permit retained by its original executor. */
+    const auto& originalParticipant()const noexcept{return participant_;}
+    /** @return Actual record-only native owner; it must never be instantiated/enqueued independently. */
+    const auto& recordedBody()const noexcept{return body_;}
+    /** @return Revocable exact body preparation with its whole-source lineage. */
+    const auto& preparation()const noexcept{return preparation_;}
+private:
+    friend class DeviceGraphExecutor;
+    /** @brief Mint only after actual source-range recording and enclosing-parent identity are authenticated. */
+    RetainedGraphParticipantAuxiliaryBodySeal(RetainedGraphParticipantAuxiliaryBodyIdentity identity,
+        PreparedGPUContextUsePermit participant,std::shared_ptr<const IGPUGraphCapture> body,
+        std::shared_ptr<const RetainedGraphParticipantPreparationStream> preparation)
+        :identity_(identity),participant_(std::move(participant)),body_(std::move(body)),preparation_(std::move(preparation)){}
+    RetainedGraphParticipantAuxiliaryBodyIdentity identity_;
+    PreparedGPUContextUsePermit participant_;
+    std::shared_ptr<const IGPUGraphCapture> body_;
+    std::shared_ptr<const RetainedGraphParticipantPreparationStream> preparation_;
 };
 /** @brief Keep participant and original-source enqueues in one FIFO ownership scope.
  * This lock orders CPU enqueue ownership only; it never waits for native execution.
@@ -249,6 +324,16 @@ public:
     virtual std::unique_ptr<IRetainedGraphParticipantStorageAttachment> prepareOriginalStorageAttachment(
         DeviceId,IGPUGraphCapture&,IGraphCaptureAuxiliaryBranch*,
         std::shared_ptr<const RetainedGraphParticipantPreparationStream>,const ComputeGraph&)const{return {};}
+    /**
+     * @brief Attach the actual compact Source/Reader auxiliary range to its original enclosing parent.
+     * @param body Private canonical executor seal of the real record-only body and preparation scope.
+     * @param progress Existing original auxiliary contribution, never a replacement controller.
+     * @return Cache-owned existing finite-body attachment RAII; no standalone enqueue is permitted.
+     * @throws std::exception For ordinary mode, foreign role/root/range/token/stream or partial sealing.
+     */
+    virtual std::unique_ptr<IRetainedGraphParticipantStorageAttachment> prepareOriginalAuxiliaryAttachment(
+        const RetainedGraphParticipantAuxiliaryBodySeal&,IGraphCaptureAuxiliaryBranch*)const
+    {throw std::logic_error("Source plan has no original participant auxiliary body contract");}
     /** @brief Authenticate one exact original storage definition independently of kernel/library recipe. */
     virtual void requirePreparedStorageDefinition(const RetainedParticipantGraphExecutable&)const
     {throw std::logic_error("Source plan has no original storage definition binding");}
@@ -267,6 +352,27 @@ inline void RetainedGraphParticipantPreparationStream::requireDefinition()const 
         !definition_.domain.authority ? "domain.authority" : nullptr;
     if(missing)
         throw std::logic_error(std::string("Original source preparation has no complete declarative definition: missing ")+missing);
+    if(definition_.scope==RetainedGraphParticipantDefinitionScope::WholeSource){
+        if(definition_.participant.is_valid() || definition_.range_identity || definition_.original_source_definition)
+            throw std::logic_error("Whole source preparation cannot carry participant auxiliary scope");
+    }else if(definition_.scope==RetainedGraphParticipantDefinitionScope::AuxiliarySource ||
+             definition_.scope==RetainedGraphParticipantDefinitionScope::AuxiliaryReader){
+        const auto& source=definition_.original_source_definition;
+        if(!definition_.participant.is_gpu() || !definition_.range_identity || !source || source.get()==this ||
+           source->definition().scope!=RetainedGraphParticipantDefinitionScope::WholeSource ||
+           source->definition().plan!=definition_.plan || source->definition().domain!=definition_.domain)
+            throw std::logic_error("Auxiliary preparation lost its actual whole-source lineage/range");
+        source->requireCurrentDefinition();source->requireLive(source->originalSource());
+        const auto& sourceActor=source->originalSource();
+        const auto& sourceMemory=sourceActor.memory();const auto& participantMemory=original_.memory();
+        if(definition_.participant!=original_.device() || sourceActor.device()!=definition_.domain.source ||
+           !sourceMemory || !participantMemory || sourceMemory.get()!=participantMemory.get() ||
+           sourceMemory.owner_before(participantMemory) || participantMemory.owner_before(sourceMemory) ||
+           sourceMemory->worldRank()<0 || sourceMemory->worldRank()!=participantMemory->worldRank() ||
+           (definition_.scope==RetainedGraphParticipantDefinitionScope::AuxiliarySource && original_.device()!=definition_.domain.source) ||
+           (definition_.scope==RetainedGraphParticipantDefinitionScope::AuxiliaryReader && original_.device()==definition_.domain.source))
+            throw std::logic_error("Auxiliary preparation changed original participant/source role or PMA/rank");
+    }else throw std::logic_error("Source preparation has unknown participant scope");
     definition_.plan->requirePreparedSourceDefinition(*this);
     definition_authenticated_.store(true,std::memory_order_release);
 }

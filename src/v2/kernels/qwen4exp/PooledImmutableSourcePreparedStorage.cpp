@@ -7,9 +7,41 @@
  */
 #include "PooledImmutableSourcePreparedStorage.h"
 #include "PooledImmutableNativeRootStorage.h"
+#include "backends/RetainedParticipantGraphExecutable.h"
 #include <stdexcept>
 #include <limits>
 namespace llaminar2::qwen4exp {
+std::shared_ptr<RetainedParticipantGraphExecutable> PooledImmutableSourcePreparedStorage::acquireOriginalRemoteDefinition(
+    const PooledRemoteGraphProgram& program,void* stream)
+{
+    const auto& g=program.geometry();const auto coordinate=g.coordinate;
+    if(!prepared_workers_ || prepared_workers_->rootIdentity()!=captureIdentity() ||
+       coordinate>=geometry_.originalOwners().size() || coordinate>=prepared_workers_->owners().size() ||
+       g.coordinator!=geometry_.allocator() || g.owner!=geometry_.originalOwners()[coordinate].allocator() ||
+       g.owner==geometry_.allocator() || g.rowBytes!=geometry_.parameters().owner.row_bytes ||
+       g.sourceRows!=geometry_.parameters().coordinator.policy.sourceRows())
+        throw std::invalid_argument("Remote definition slot changed its original source/coordinator/owner roots");
+    const auto& original=prepared_workers_->owners()[coordinate];
+    const auto memory=prepared_workers_->source()->memory();
+    if(!remote_definition_slots_)
+        remote_definition_slots_=RetainedParticipantGraphSourceSlots::create(captureIdentity(),geometry_.originalOwners().size(),memory);
+    // The existing boundary cohort claim serializes this cold source factory.
+    // The holder separately rejects surviving runner aliases before rearming.
+    return remote_definition_slots_->acquire(captureIdentity(),original,stream,program);
+}
+void PooledImmutableSourcePreparedStorage::releaseOriginalRemoteDefinition(const PooledRemoteGraphProgram& program,
+    const std::shared_ptr<RetainedParticipantGraphExecutable>& owner)
+{
+    if(!prepared_workers_ || prepared_workers_->rootIdentity()!=captureIdentity() || !remote_definition_slots_)
+        throw std::logic_error("Remote definition retirement lost its original source slot holder");
+    remote_definition_slots_->release(captureIdentity(),program,owner);
+}
+void PooledImmutableSourcePreparedStorage::abandonOriginalRemoteDefinition(const PooledRemoteGraphProgram& program,
+    const std::shared_ptr<RetainedParticipantGraphExecutable>& owner,std::exception_ptr failure)
+{
+    if(!remote_definition_slots_)throw std::logic_error("Failed source definition has no original slot holder");
+    remote_definition_slots_->abandon(captureIdentity(),program,owner,std::move(failure));
+}
 void PooledImmutableSourcePreparedStorage::bindPreparedSourceWorkers(std::shared_ptr<NativeContextPreparation> source,
     PreparedGPUContextUsePermit coordinator,std::vector<PreparedGPUContextUsePermit> owners){
     if(prepared_workers_ || !source || owners.size()!=owners_.size())

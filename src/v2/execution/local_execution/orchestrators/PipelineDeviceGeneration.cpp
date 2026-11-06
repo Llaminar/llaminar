@@ -958,7 +958,8 @@ bool PipelineDeviceGeneration::forwardMTPVerifier(int logical_rows,
         tail.mtp_max_verifier_rows_, tail.mtpVerifierGraphFamily());
     const int physical_rows = width_policy ? mtpVerifierPhysicalPaddedSeqLen(
         1, logical_rows, tail.mtp_max_verifier_rows_, *width_policy) : 0;
-    if (!geometry.enabled || !geometry.valid() || logical_rows < 2 || physical_rows < logical_rows ||
+    if (!tail.graph_builder_->config().mtp.enabled || !geometry.enabled || !geometry.valid() ||
+        logical_rows < 2 || physical_rows < logical_rows ||
         physical_rows > geometry.verifier_rows ||
         !mtpVerifierGraphFamilyContains(physical_rows, geometry.verifier_rows, geometry.family))
     {

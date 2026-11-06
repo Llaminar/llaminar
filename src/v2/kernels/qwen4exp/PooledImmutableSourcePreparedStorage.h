@@ -14,6 +14,7 @@
 #include <optional>
 namespace llaminar2 {class ModelContext;}
 namespace llaminar2::test {struct PooledImmutableFactoryReplayAccess;}
+namespace llaminar2 {class RetainedParticipantGraphExecutable;class RetainedParticipantGraphSourceSlots;class PooledRemoteGraphProgram;}
 namespace llaminar2::qwen4exp {
 class ImmutableLookupService;
 /** @brief Immutable original-worker ownership consumed by actual source-root materialization. */
@@ -71,6 +72,15 @@ public:
     /** @brief Join only original native setup producers on the exact future consumer stream. */
     void acquireSetup(void* exact_stream)const;
 private:
+    friend class PooledImmutableRetainedParticipants;
+    /** @brief Borrow the source's already-admitted serial remote definition, never another model's slot. */
+    std::shared_ptr<RetainedParticipantGraphExecutable> acquireOriginalRemoteDefinition(const PooledRemoteGraphProgram&,void*);
+    /** @brief Retire actual graph handles before the original runner arenas and native cohort disappear. */
+    void releaseOriginalRemoteDefinition(const PooledRemoteGraphProgram&,
+        const std::shared_ptr<RetainedParticipantGraphExecutable>&);
+    /** @brief Withdraw failed native handles before local construction releases its original operands. */
+    void abandonOriginalRemoteDefinition(const PooledRemoteGraphProgram&,
+        const std::shared_ptr<RetainedParticipantGraphExecutable>&,std::exception_ptr);
     friend class ImmutableLookupService;
     friend class ::llaminar2::ModelContext;
     friend struct ::llaminar2::test::PooledImmutableFactoryReplayAccess;
@@ -103,5 +113,6 @@ private:
     std::vector<std::shared_ptr<PooledImmutableOwnerPreparedStorage>> owners_;
     std::shared_ptr<PooledImmutableCoordinatorPreparedStorage> coordinator_;
     std::shared_ptr<detail::PooledNativeRootStorage> roots_;
+    std::shared_ptr<RetainedParticipantGraphSourceSlots> remote_definition_slots_; ///< Original fixed owner roster; no source/cohort back-reference.
 };
 }

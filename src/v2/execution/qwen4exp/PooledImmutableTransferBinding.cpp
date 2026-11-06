@@ -132,17 +132,47 @@ void PooledImmutableNativeCompletionStorage::requireCurrent() const
             throw std::logic_error("Native pooled metadata changed its original generation/PMA/native resources");
     }
 }
+int PooledImmutableNativeCompletionStorage::requireOriginalBinding(
+    const PooledImmutableNativeTransfer& binding) const
+{
+    requireCurrent();
+    if (!binding.cohort_ || binding.cohort_.get() != cohort_.get() ||
+        binding.cohort_.owner_before(cohort_) || cohort_.owner_before(binding.cohort_))
+        throw std::invalid_argument("Native pooled counted binding belongs to another original cohort");
+    const auto participant = coordinate(binding.device());
+    const auto& original = *participants_[participant];
+    const auto memory = original.memory();
+    if (binding.original_.memory().get() != memory.get() ||
+        binding.original_.memory().owner_before(memory) || memory.owner_before(binding.original_.memory()))
+        throw std::invalid_argument("Native pooled counted binding changed its original physical authority");
+    original.requireWorker(binding.original_.worker());
+    if (binding.original_.generation() != original.generation())
+        throw std::logic_error("Native pooled counted binding changed its original worker generation");
+    return participant;
+}
+
 PooledImmutableNativeTransfer PooledImmutableNativeCompletionStorage::counted(PooledImmutableNativeTransfer binding,
     PooledNativeCountedMessage message, PooledNativeTransferSpan extent,
     std::optional<PooledNativeCompletionFrame> frame) const
 {
-    const auto participant = coordinate(binding.device());
+    const auto participant = requireOriginalBinding(binding);
     if (!frame) frame = frames_[participant];
     if (!frame) throw std::invalid_argument("Native pooled completion requires its actual original local frame/error authority");
     auto result = binding.withPrefix(message, layout_, operands_, receipts_[participant], std::move(extent), std::move(*frame));
     if (binding.role() == CapturedTransferEndpoint::Consumer && sourceSliceMessage(message))
         result = result.withReceivedSourceSlice();
     return result;
+}
+
+PooledImmutableNativeTransfer PooledImmutableNativeCompletionStorage::countedRequest(
+    PooledImmutableNativeTransfer binding, PooledNativeTransferSpan extent,
+    PooledNativeRequestCompletionFrame frame) const
+{
+    const auto participant = requireOriginalBinding(binding);
+    // Request completion is always explicit. The optional source/reader pool
+    // frames remain response-only and cannot supply this request identity.
+    return binding.withRequestPrefix(layout_, operands_, receipts_[participant],
+        std::move(extent), std::move(frame));
 }
 
 std::uint64_t PooledImmutableTransferBinding::captureIdentity() const
@@ -222,6 +252,15 @@ PooledImmutableTransferBinding PooledImmutableTransferBinding::withNativeCounted
         throw std::logic_error("Native pooled count cannot replace an original cross-vendor binding");
     return {completion_->counted(*original, message, std::move(extent), std::move(frame)), completion_};
 }
+PooledImmutableTransferBinding PooledImmutableTransferBinding::withNativeRequestCounted(
+    PooledNativeTransferSpan extent, PooledNativeRequestCompletionFrame frame) const
+{
+    const auto* original = std::get_if<PooledImmutableNativeTransfer>(&binding_);
+    if (!original || !completion_)
+        throw std::logic_error("Native pooled request count cannot replace an original cross-vendor binding");
+    return {completion_->countedRequest(*original, std::move(extent), std::move(frame)), completion_};
+}
+
 const CapturedTransferBinding& PooledImmutableTransferBinding::captured() const
 {
     const auto* original = std::get_if<CapturedTransferBinding>(&binding_);
@@ -288,4 +327,19 @@ PooledImmutableTransferBinding PooledImmutableTransferChannel::bind(CapturedTran
         producer_, consumer_, message, PooledNativeTransferSpan(std::move(root), offset, message.bytes));
     return {std::move(binding), native_};
 }
+PooledImmutableTransferBinding PooledImmutableTransferChannel::bind(CapturedTransferEndpoint side,
+    CapturedTransferMessage message,PooledNativeTransferSpan span)const
+{
+    if(!message.fits(span.bytes()))
+        throw std::invalid_argument("Pooled endpoint exceeds its exact original declared span");
+    if(captured_){
+        return std::visit([&](const auto& root){return bind(side,message,root,span.offset());},span.owner_);
+    }
+    if(!native_ || !message.fits(maximum_))throw std::invalid_argument("Pooled span endpoint has no original bounded transport");
+    const auto device=endpointDevice(side);
+    auto binding=PooledImmutableNativeTransfer::fixed(native_->cohort(),native_->original(device),side,
+        producer_,consumer_,message,span.subspan(0,message.bytes));
+    return {std::move(binding),native_};
+}
+
 } // namespace llaminar2::qwen4exp

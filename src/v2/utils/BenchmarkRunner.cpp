@@ -551,7 +551,12 @@ namespace llaminar2
             {"total_ms", total_ms},
             {"avg_us", avg_us},
             {"min_us", min_us},
-            {"max_us", max_us}};
+            {"max_us", max_us},
+            {"sequence_word_count", record.sequence_word_count},
+            {"sequence_digest_lo", record.sequence_digest_lo},
+            {"sequence_digest_hi", record.sequence_digest_hi},
+            {"sequence_minimum_words", record.sequence_minimum_words},
+            {"sequence_maximum_words", record.sequence_maximum_words}};
     }
 
     /**
@@ -621,6 +626,41 @@ namespace llaminar2
             {"collection_enabled", observation.collection_enabled},
             {"records", std::move(records)},
         };
+    }
+
+    /**
+     * @return Only existing completed lookup producer records; names, units,
+     * identities and ordered evidence remain unchanged. Submission metadata and
+     * timers cannot masquerade as completed cache/traffic observations.
+     */
+    static std::vector<PerfStatRecord> benchmarkLookupTerminalRecords()
+    {
+        auto records = PerfStatsCollector::snapshot({"immutable_lookup", "ngram_lookup"});
+        std::erase_if(records, [](const auto &record) {
+            if (!PerfStatsCollector::isDomainEnabled(record.domain) ||
+                record.kind != PerfStatRecord::Kind::Counter || record.phase != "generation_terminal") return true;
+            if (record.domain == "immutable_lookup") return false;
+            const auto authority = record.tags.find("authority");
+            return record.domain != "ngram_lookup" || authority == record.tags.end() ||
+                authority->second != "completed_local_hot_terminal";
+        });
+        return records;
+    }
+
+    /** @return Source-window-preserving raw host observations, with no counter subtraction. */
+    static nlohmann::json benchmarkLookupTerminalToJson(const BenchmarkLookupTerminalBracket &bracket)
+    {
+        const auto records = [](const auto &input) {
+            auto output = nlohmann::json::array();
+            for (const auto &record : input) output.push_back(perfStatRecordToJson(record));
+            return output;
+        };
+        return {{"schema", "llaminar.benchmark.lookup-terminal-bracket.v1"},
+            {"collection_enabled", bracket.collection_enabled},
+            {"scope", "host_request_boundaries_native_windows_unchanged"},
+            {"counter_delta_inferred", false},
+            {"before_request", records(bracket.before_request)},
+            {"after_request", records(bracket.after_request)}};
     }
 
     static nlohmann::json benchmarkPerfStatsToJson()
@@ -745,6 +785,7 @@ namespace llaminar2
                mtpTokenAcceptanceRate(
                    iteration.mtp_accepted_tokens,
                    iteration.mtp_draft_steps)}}}};
+        result["lookup_terminal_observation"] = benchmarkLookupTerminalToJson(iteration.lookup_terminal);
         result["decode_windows"] = nlohmann::json::array();
         for (const auto &window : iteration.decode_windows)
         {
@@ -2440,6 +2481,14 @@ namespace llaminar2
 
         for (int iter = 0; iter < benchmark_iterations; ++iter)
         {
+            // Observe completed host records before reset; the reset may itself
+            // publish a previous source-service close. Preserve that native
+            // window rather than relabeling it as this request's cache work.
+            BenchmarkLookupTerminalBracket lookup_terminal;
+            lookup_terminal.collection_enabled = PerfStatsCollector::isDomainEnabled("immutable_lookup") ||
+                PerfStatsCollector::isDomainEnabled("ngram_lookup");
+            if (lookup_terminal.collection_enabled)
+                lookup_terminal.before_request = benchmarkLookupTerminalRecords();
             // Reset live request state and force an actual full-prefill sample.
             if (!resetForFullPrefill("measured iteration"))
                 return capture_and_return();
@@ -2448,6 +2497,7 @@ namespace llaminar2
             LOG_DEBUG("  Iteration " << (iter + 1) << "/" << benchmark_iterations << "...");
             BenchmarkIterationResult iteration_result;
             iteration_result.iteration = iter + 1;
+            iteration_result.lookup_terminal = std::move(lookup_terminal);
             iteration_result.prefill_tokens = result.prefill_tokens;
             iteration_result.moe_runtime_movement_epoch_start =
                 runner_ ? runner_->moeRuntimeMovementEpoch() : 0u;
@@ -2598,6 +2648,8 @@ namespace llaminar2
             }
             captureCompletedDynamicMovement(
                 &iteration_result, dynamic_movement_start, runner_.get());
+            if (iteration_result.lookup_terminal.collection_enabled)
+                iteration_result.lookup_terminal.after_request = benchmarkLookupTerminalRecords();
             result.iterations.push_back(std::move(iteration_result));
             LOG_DEBUG("    Prefill: " << std::fixed << std::setprecision(2) << prefill_time << " ms"
                                       << (n_decode > 0 ? ", Decode: " + std::to_string(static_cast<int>(decode_times.back())) + " ms" : ""));

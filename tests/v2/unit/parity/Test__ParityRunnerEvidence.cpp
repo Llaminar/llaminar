@@ -275,4 +275,58 @@ namespace llaminar2::test::parity
                       (std::array<float, 4>{}));
         }
     }
+    /** @test Only the final original cohort can certify delayed physical movement. */
+    TEST_F(ParityRunnerEvidenceTest, OrdinaryCohortMovementBoundaryKeepsFinalAndStaticStrict)
+    {
+        using Boundary = ParityMoEMovementEvidenceBoundary;
+        using Expectation = ParityMoEMovementExpectation;
+        using Status = ParityMoEMovementEvidenceStatus;
+        const auto current = [&] {
+            return parityMoEMovementFacts(PerfStatsCollector::snapshot());
+        };
+        resetParityRunnerEvidence(ParityRunnerEvidenceLifetime::FreshRunner);
+        EXPECT_EQ(parityMoEMovementEvidenceAtBoundary(
+                      Expectation::PhysicalMovement, current(), Boundary::Intermediate),
+                  Status::Intermediate);
+        EXPECT_EQ(parityMoEMovementEvidenceAtBoundary(Expectation::PhysicalMovement, current()),
+                  Status::MissingPhysicalFacts);
+        for (const auto boundary : {Boundary::Intermediate, Boundary::Final})
+            EXPECT_EQ(parityMoEMovementEvidenceAtBoundary(Expectation::NoMovement, current(), boundary),
+                      Status::Complete);
+
+        // Original proposals/arrivals during calibration cannot replace a
+        // completed physical publication, even at the final request boundary.
+        PerfStatsCollector::addCounter("moe_overlay_residency", "proposed_expert_migrations", 99,
+                                       "maintenance", "original-participant");
+        PerfStatsCollector::addCounter("moe_overlay_residency", "prepared_arrival_bytes", 8192,
+                                       "maintenance", "original-participant");
+        EXPECT_EQ(parityMoEMovementEvidenceAtBoundary(Expectation::PhysicalMovement, current()),
+                  Status::MissingPhysicalFacts);
+        const auto completed = controllerMovementFixture(40u, 5u, 2u);
+        recordMoEControllerCompletedMovement(completed.device_publications.front(), completed.edges,
+                                             "original-controller");
+        const auto final_records = PerfStatsCollector::snapshot();
+        EXPECT_EQ(parityMoEMovementEvidenceAtBoundary(Expectation::PhysicalMovement, current()),
+                  Status::Complete);
+        for (const auto boundary : {Boundary::Intermediate, Boundary::Final})
+            EXPECT_EQ(parityMoEMovementEvidenceAtBoundary(Expectation::NoMovement, current(), boundary),
+                      Status::UnexpectedMovement);
+        for (const char *missing : {"dynamic_movement_transactions", "dynamic_movement_commands",
+                                    "dynamic_physical_bytes", "dynamic_migration_edges"})
+        {
+            auto partial = final_records;
+            std::erase_if(partial, [missing](const auto &record) { return record.name == missing; });
+            EXPECT_EQ(parityMoEMovementEvidenceAtBoundary(
+                          Expectation::PhysicalMovement, parityMoEMovementFacts(partial)),
+                      Status::MissingPhysicalFacts);
+        }
+        // Later cells cannot inherit an earlier cohort's actual completion.
+        resetParityRunnerEvidence(ParityRunnerEvidenceLifetime::RetainedRunner);
+        EXPECT_EQ(parityMoEMovementEvidenceAtBoundary(Expectation::PhysicalMovement, current()),
+                  Status::MissingPhysicalFacts);
+        EXPECT_THROW(parityMoEMovementEvidenceAtBoundary(
+                         Expectation::PhysicalMovement, current(), static_cast<Boundary>(255)),
+                     std::invalid_argument);
+    }
+
 }

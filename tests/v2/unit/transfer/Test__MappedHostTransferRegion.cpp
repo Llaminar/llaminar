@@ -19,6 +19,10 @@
 #include "../../mocks/MockBackend.h"
 
 #include <gtest/gtest.h>
+#include "kernels/qwen4exp/PooledImmutableLocalHotReadyRoot.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "../../fixtures/backends/NativeContextPreparationReplayAccess.h"
+#include "../../mocks/MockWorkerGPUContext.h"
 
 #include <array>
 #include <cstddef>
@@ -1074,4 +1078,65 @@ TEST_F(Test__MappedHostTransferRegion, PublicationRootClaimFollowsAliasAndNative
     EXPECT_EQ(live(), 0u);
     EXPECT_EQ(cuda_->mapped_allocate_count, 4u);
     EXPECT_EQ(cuda_->mapped_free_count, 4u);
+}
+
+/** @test The actual LocalReady owner retains one disjoint CPU staging lease through mapped aliases and failed setup. */
+TEST_F(Test__MappedHostTransferRegion, LocalReadyClaimFollowsOriginalSourceAndAliasRetirement)
+{
+    class ReadyWorker final : public llaminar2::testing::MockWorkerGPUContext
+    {
+    public:
+        ReadyWorker(int ordinal, std::shared_ptr<PreparedGPUWorkerStack>) : MockWorkerGPUContext(ordinal) {}
+    };
+    using Access = NativeContextPreparationReplayAccess;
+    const auto device = DeviceId::cuda(0);
+    Access::seed(device, [](auto stack) { return Access::construct<ReadyWorker>(std::move(stack), 0); });
+    auto source = Access::source<ReadyWorker>(device);
+    {
+        const auto original = source->acquire(device);
+        const auto physical = TransferEngine::mappedHostRegionAllocationBytes(sizeof(std::uint64_t));
+        PhysicalMemoryPlanBuilder extra;
+        extra.add({0, DeviceId::cpu(), 128u<<20, 128u<<20}, PhysicalMemoryOwner::ImmutableLookupStaging, physical);
+        const auto binding = Access::admit(source, extra.build());
+        const auto live = [&]() {
+            std::size_t bytes = 0;
+            for (const auto& line : source->memory()->rankAttestation())
+                if (line.owner == PhysicalMemoryOwner::ImmutableLookupStaging) bytes += line.materialized_new_bytes;
+            return bytes;
+        };
+        cuda_->before_mapped_free = [&]() { EXPECT_EQ(live(), physical); };
+        for (int replay = 0; replay < 20; ++replay)
+        {
+            auto root = qwen4exp::PooledImmutableLocalHotReadyRoot::create({0, device}, source->memory(), engine_);
+            const auto observation = root->retainedOwnerObservation();
+            EXPECT_EQ(observation.authority().get(), source->memory().get());
+            EXPECT_EQ(observation.allocator(), (PhysicalMemoryAllocatorIdentity{0, DeviceId::cpu()}));
+            EXPECT_EQ(observation.tableStorageBytes(), 0u);
+            EXPECT_EQ(observation.lookupStagingBytes(), physical);
+            auto alias = root->mappedRegion();
+            EXPECT_EQ(live(), physical);
+            EXPECT_THROW(engine_.allocateMappedHostRegion(*root, source->memory()), std::logic_error);
+            root.reset();
+            EXPECT_EQ(live(), physical);
+            alias.reset();
+            EXPECT_EQ(live(), 0u);
+        }
+        {
+            GraphCaptureGuard recording;
+            EXPECT_THROW(qwen4exp::PooledImmutableLocalHotReadyRoot::create({0, device}, source->memory(), engine_), std::logic_error);
+            EXPECT_EQ(cuda_->mapped_allocate_count, 20u);
+        }
+        EXPECT_THROW(qwen4exp::PooledImmutableLocalHotReadyRoot::create({1, device}, source->memory(), engine_), std::invalid_argument);
+        EXPECT_THROW(qwen4exp::PooledImmutableLocalHotReadyRoot::create({0, DeviceId::cpu()}, source->memory(), engine_), std::invalid_argument);
+        cuda_->force_null_mapped_alias = true;
+        EXPECT_THROW(qwen4exp::PooledImmutableLocalHotReadyRoot::create({0, device}, source->memory(), engine_), std::runtime_error);
+        EXPECT_EQ(live(), 0u);
+        EXPECT_EQ(cuda_->mapped_allocate_count, 21u);
+        EXPECT_EQ(cuda_->mapped_free_count, 21u);
+        cuda_->before_mapped_free = {};
+    }
+    // The original source owns actual recorded context retirement; mapped roots
+    // cannot extend or replace its worker generation or authority.
+    auto retirement = GPUDeviceContextPool::instance().beginExclusiveGenerationRetirement(device);
+    Access::physicalReset(retirement);
 }

@@ -22,6 +22,7 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <tuple>
 
 namespace llaminar2
 {
@@ -145,9 +146,14 @@ PreparedBenchmarkCampaign prepareBenchmarkCampaign(const OrchestrationConfig &co
     if (!prompts.is_array() || prompts.empty()) invalid("$.prompts", "expected nonempty prompt table");
     std::map<std::string, std::size_t> prompt_indices;
     std::map<std::string, std::string> partitions_by_tokens;
+    std::set<std::pair<std::string, std::string>> frozen_histories;
+    std::optional<std::tuple<std::string, std::string, std::string>> frozen_source;
+    std::size_t frozen_prompts = 0;
     for (const auto &entry : prompts)
     {
-        fields(entry, {"id", "partition", "text"}, "$.prompts[]");
+        const bool frozen = entry.is_object() && entry.contains("frozen_history");
+        if (frozen) fields(entry, {"id", "partition", "text", "frozen_history"}, "$.prompts[]");
+        else fields(entry, {"id", "partition", "text"}, "$.prompts[]");
         auto prompt_id = id(entry.at("id"), "$.prompts[].id");
         if (!prompt_indices.emplace(prompt_id, result.prompts_.size()).second) invalid("$.prompts", "duplicate prompt ID");
         auto partition = text(entry.at("partition"), "$.prompts[].partition");
@@ -160,11 +166,50 @@ PreparedBenchmarkCampaign prepareBenchmarkCampaign(const OrchestrationConfig &co
         auto input = benchmark.prepareInput(prompt_config);
         if (static_cast<std::uint64_t>(input.tokenIds().size()) + static_cast<std::uint64_t>(config.n_predict) >
             static_cast<std::uint64_t>(config.max_seq_len)) invalid("$.prompts." + prompt_id, "natural token IDs plus decode budget exceed admitted context; truncation is forbidden");
+        if (frozen)
+        {
+            // The external corpus remains the metadata producer's authority.
+            // This owner seals its declaration and verifies natural tokenizer
+            // output before any reset, policy publication or inference call.
+            const auto &original = entry.at("frozen_history");
+            fields(original, {"schema", "corpus_manifest_digest", "source_digest", "canonical_cell",
+                "history_id", "context_group", "prompt_ids"}, "$.prompts[].frozen_history");
+            if (text(original.at("schema"), "$.frozen_history.schema") != "llaminar.benchmark-frozen-history.v1")
+                invalid("$.frozen_history.schema", "unknown provenance schema");
+            const auto digest_field = [&](const char *key) {
+                const auto value = text(original.at(key), std::string("$.frozen_history.") + key);
+                if (value.size() != 64 || !std::all_of(value.begin(), value.end(), [](unsigned char c) {
+                    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }))
+                    invalid("$.frozen_history", "source/corpus digest must be exact lowercase SHA256");
+                return value;
+            };
+            const auto corpus = digest_field("corpus_manifest_digest");
+            const auto source = std::make_tuple(corpus, digest_field("source_digest"),
+                text(original.at("canonical_cell"), "$.frozen_history.canonical_cell"));
+            if (frozen_source && *frozen_source != source)
+                invalid("$.frozen_history", "one admitted campaign cannot mix original source cases");
+            frozen_source = source;
+            const auto history = id(original.at("history_id"), "$.frozen_history.history_id");
+            (void)id(original.at("context_group"), "$.frozen_history.context_group");
+            if (!frozen_histories.emplace(corpus, history).second)
+                invalid("$.frozen_history", "duplicate history declaration; repeated cells must reuse its prompt ID");
+            const auto &ids = original.at("prompt_ids");
+            if (!ids.is_array() || ids.empty()) invalid("$.frozen_history.prompt_ids", "expected original nonempty tokens");
+            std::vector<int> expected;
+            expected.reserve(ids.size());
+            for (const auto &token : ids)
+                expected.push_back(integer(token, 0, std::numeric_limits<int>::max(), "$.frozen_history.prompt_ids[]"));
+            if (input.tokenIds() != expected)
+                invalid("$.frozen_history.prompt_ids", "natural tokenizer output differs from original frozen prompt IDs");
+            ++frozen_prompts;
+        }
         const auto token_identity = Json(input.tokenIds()).dump();
         const auto [found, inserted] = partitions_by_tokens.emplace(token_identity, partition);
         if (!inserted && found->second != partition) invalid("$.prompts", "identical token history crosses train/holdout partitions");
         result.prompts_.push_back({std::move(prompt_id), std::move(partition), std::move(input)});
     }
+    if (frozen_prompts && frozen_prompts != result.prompts_.size())
+        invalid("$.prompts", "frozen provenance must cover every original prompt");
     const auto &cells = document.at("cells");
     if (!cells.is_array() || cells.empty()) invalid("$.cells", "expected nonempty explicit request list");
     std::set<std::string> cell_ids;

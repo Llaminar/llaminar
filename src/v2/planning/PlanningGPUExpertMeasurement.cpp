@@ -322,7 +322,7 @@ namespace llaminar2
             throw std::invalid_argument("Prepared calibration must retain its off-worker owner");
         void* stream=nullptr;
         original.worker()->submitAndWait([&]{stream=ExplicitGPUStream(original.worker()->defaultStream()).get();});
-        return RetainedParticipantGraphExecutable::createPreparedCalibration(original,stream);
+        return original.borrowPreparedCalibration(stream);
     }
 
     uint64_t PlanningGPUExpertMeasurement::measurePrepared(const MoEOverlayPreparedExpertPayload &payload,

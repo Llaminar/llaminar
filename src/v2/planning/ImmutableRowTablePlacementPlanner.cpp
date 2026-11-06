@@ -99,6 +99,14 @@ ImmutableRowTablePlacementInput ImmutableRowTablePlacementInput::withGPUCacheRes
 {
     requested.validate();auto result=*this;result.gpu_resources_.clear();result.gpu_placement_.reset();result.gpu_peer_access_.reset();result.reader_peer_access_.clear();
     if(!requested.isGPUAdaptive())throw std::invalid_argument("GPU storage observations require explicit GPU adaptive policy");
+    if (requested.gpu_adaptive.local_hot_cache)
+    {
+        std::vector<AdaptiveGPUCacheParticipant> original_consumers;
+        original_consumers.reserve(consumers_.size());
+        for (const auto& consumer : consumers_)
+            original_consumers.push_back({consumer.world_rank, consumer.device.type, consumer.device.ordinal});
+        requested.gpu_adaptive.local_hot_cache->requireConsumers(original_consumers);
+    }
     const auto &placement=requested.gpu_adaptive.placement;
     if(placement.mode==AdaptiveGPUCachePlacementMode::ConsumerLocal)
     {
@@ -401,15 +409,24 @@ ImmutableRowTablePlacementSelection ImmutableRowTablePlacementPlanner::select(
             .format=static_cast<GGUFTensorType>(metadata.ple_table_gguf_type)};
         const auto maximum=request.execution_provision->maximumLiveIds();
         const bool grouped = requested.gpu_adaptive.placement.mode == AdaptiveGPUCachePlacementMode::ConsumerLocal && input.consumers().size() > 1;
+        const auto local_count = requested.gpu_adaptive.local_hot_cache ? input.consumers().size() : 0u;
+        std::vector<std::size_t> local_slots(local_count,0u);
         std::optional<AdaptiveImmutableLookupGeometry> remote_floor;
-        if (!grouped) remote_floor.emplace(AdaptiveImmutableLookupGeometry::fromLayout(
+        if (!grouped) remote_floor.emplace(AdaptiveImmutableLookupGeometry::fromLayoutFloor(
             input.gpuAdaptiveLayout(requested,0,0,maximum),source,requested.gpu_adaptive));
         const auto* originalNativeHost=request.execution_provision->requiredBase().find({input.host().world_rank,DeviceId::cpu()});
         const auto nativeHost=originalNativeHost?originalNativeHost->resource():input.host();
-        const auto candidate=[&](std::span<const std::size_t> gpu_slots,std::size_t host_slots) {
+        const auto candidate=[&](std::span<const std::size_t> local_slots,
+            std::span<const std::size_t> gpu_slots,std::size_t host_slots) {
             const auto layout=input.gpuAdaptiveLayout(requested,gpu_slots,host_slots,maximum);
             std::optional<AdaptiveImmutableLookupGeometry> geometry;
-            if (!grouped) geometry.emplace(AdaptiveImmutableLookupGeometry::fromLayout(layout,source,requested.gpu_adaptive));
+            if (!grouped)
+            {
+                const auto local = AdaptiveImmutableLookupGeometry::declareLocalHotCaches(
+                    layout,source,requested.gpu_adaptive,local_slots);
+                geometry.emplace(AdaptiveImmutableLookupGeometry::fromLayoutWithLocalHot(
+                    layout,source,requested.gpu_adaptive,local));
+            }
             PhysicalMemoryPlanBuilder plan(higher_priority);
             plan.add(input.host(),PhysicalMemoryOwner::ImmutableTableStorage,0u);
             for(const auto &consumer:input.consumers())plan.add(consumer,PhysicalMemoryOwner::ImmutableTableStorage,0u);
@@ -442,11 +459,20 @@ ImmutableRowTablePlacementSelection ImmutableRowTablePlacementPlanner::select(
                     identity(device)).gpuSlotDependentBytes(identity(device)) : geometry->gpuSlotDependentBytes(identity(device));
                 ceilings=ceilings && bytes<=limit;
             }
+            if (requested.gpu_adaptive.local_hot_cache)
+                for (const auto& local : geometry->localHotCaches())
+                {
+                    const auto id = local.allocator();
+                    const auto limits = requested.gpu_adaptive.local_hot_cache->ceilingsFor(
+                        {id.world_rank,id.device.type,id.device.ordinal});
+                    ceilings = ceilings && local.slots() <= limits.maximum_cache_rows &&
+                        local.physicalBytes() <= limits.cache_physical_byte_limit;
+                }
             return std::pair{ceilings,plan.build()};
         };
         const auto &declaration=requested.gpu_adaptive.placement;
         std::vector<std::size_t> gpu(declaration.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal?declaration.owners.size():input.consumers().size(),0);
-        const auto zero=candidate(gpu,0);
+        const auto zero=candidate(local_slots,gpu,0);
         if(!zero.first || !zero.second.fits())
             throw PhysicalMemoryCapacityExhausted("GPU adaptive mandatory original frame/source/channel does not fit frozen PMA");
         // GPU then RAM priorities are explicit policy; each monotone candidate
@@ -461,39 +487,50 @@ ImmutableRowTablePlacementSelection ImmutableRowTablePlacementPlanner::select(
             }
             return low;
         };
-        // Establish each owner's individual bound using the same complete
-        // candidate, then raise every feasible owner together. A pooled
-        // directory lives on the coordinator: filling its own cache first can
-        // otherwise consume all directory headroom and starve later owners on
-        // different GPUs. No capacity is subtracted or priced outside the BOM.
-        std::vector<std::size_t> individual(gpu.size(),0);
-        for(std::size_t owner=0;owner<gpu.size();++owner)
+        // Use the SAME balanced, monotone grant equation for each optional
+        // tier. Local grants are frozen before pool grants, then RAM; no model,
+        // expert or KV grant is reopened and no capacity arithmetic is copied.
+        const auto admit_balanced = [&](std::vector<std::size_t>& grants,
+            const std::vector<std::uint64_t>& ceilings, const auto& fits)
         {
-            const auto ceiling=declaration.mode==AdaptiveGPUCachePlacementMode::DeclaredRankLocal?
-                declaration.owners[owner].maximum_cache_rows:requested.gpu_adaptive.maximum_gpu_cache_rows;
-            individual[owner]=solve(ceiling,[&](std::size_t rows) {
-                auto proposed=gpu;proposed[owner]=rows;const auto next=candidate(proposed,0);
-                return next.first && next.second.fits(); });
+            if (grants.size() != ceilings.size()) throw std::logic_error("Cache grant roster differs from its original ceilings");
+            if (grants.empty()) return;
+            std::vector<std::size_t> individual(grants.size(),0);
+            for (std::size_t owner = 0; owner < grants.size(); ++owner)
+                individual[owner] = solve(ceilings[owner],[&](std::size_t rows) {
+                    auto proposed = grants; proposed[owner] = rows; return fits(proposed); });
+            const auto level = solve(*std::max_element(individual.begin(),individual.end()),[&](std::size_t rows) {
+                auto proposed = individual;
+                for (auto& slots : proposed) slots = std::min(slots,rows);
+                return fits(proposed);
+            });
+            for (std::size_t owner = 0; owner < grants.size(); ++owner) grants[owner] = std::min(individual[owner],level);
+            for (std::size_t owner = 0; owner < grants.size(); ++owner)
+                grants[owner] = solve(individual[owner],[&](std::size_t rows) {
+                    auto proposed = grants; proposed[owner] = rows; return fits(proposed); });
+        };
+        if (requested.gpu_adaptive.local_hot_cache)
+        {
+            std::vector<std::uint64_t> ceilings;
+            for (const auto& consumer : input.consumers())
+                ceilings.push_back(requested.gpu_adaptive.local_hot_cache->ceilingsFor(
+                    {consumer.world_rank,consumer.device.type,consumer.device.ordinal}).maximum_cache_rows);
+            admit_balanced(local_slots,ceilings,[&](const auto& proposed) {
+                const auto next = candidate(proposed,gpu,0); return next.first && next.second.fits(); });
         }
-        const auto level=solve(*std::max_element(individual.begin(),individual.end()),[&](std::size_t rows) {
-            auto proposed=individual;
-            for(auto& slots:proposed)slots=std::min(slots,rows);
-            const auto next=candidate(proposed,0);return next.first && next.second.fits();
-        });
-        for(std::size_t owner=0;owner<gpu.size();++owner)gpu[owner]=std::min(individual[owner],level);
-        // Spend remaining discrete/alignment headroom without taking back any
-        // balanced grant. Owners with a smaller or zero individual bound do not
-        // cap the other devices. The final pass is monotone and leaves no owner
-        // that can grow independently within its original request and PMA.
-        for(std::size_t owner=0;owner<gpu.size();++owner)
-            gpu[owner]=solve(individual[owner],[&](std::size_t rows) {
-                auto proposed=gpu;proposed[owner]=rows;const auto next=candidate(proposed,0);
-                return next.first && next.second.fits(); });
+        std::vector<std::uint64_t> pool_ceilings;
+        for (std::size_t owner = 0; owner < gpu.size(); ++owner)
+            pool_ceilings.push_back(declaration.mode == AdaptiveGPUCachePlacementMode::DeclaredRankLocal
+                ? declaration.owners[owner].maximum_cache_rows : requested.gpu_adaptive.maximum_gpu_cache_rows);
+        admit_balanced(gpu,pool_ceilings,[&](const auto& proposed) {
+            const auto next = candidate(local_slots,proposed,0); return next.first && next.second.fits(); });
         const auto ram=solve(requested.gpu_adaptive.host.maximum_cache_rows,[&](std::size_t rows) {
-            const auto next=candidate(gpu,rows);return next.first && next.second.fits(); });
-        auto complete=candidate(gpu,ram).second;
+            const auto next=candidate(local_slots,gpu,rows);return next.first && next.second.fits(); });
+        auto complete=candidate(local_slots,gpu,ram).second;
+        auto layout = input.gpuAdaptiveLayout(requested,gpu,ram,maximum);
+        auto local = AdaptiveImmutableLookupGeometry::declareLocalHotCaches(layout,source,requested.gpu_adaptive,local_slots);
         auto placement=std::shared_ptr<const ResolvedImmutableRowTablePlacement>(new ResolvedImmutableRowTablePlacement(
-            input.gpuAdaptiveLayout(requested,gpu,ram,maximum),requested.gpu_adaptive,metadata.ple_row_elements));
+            std::move(layout),requested.gpu_adaptive,metadata.ple_row_elements,std::move(local)));
         return {std::move(placement),std::move(complete)};
     }
     if(request.requested.isHostAdaptive())

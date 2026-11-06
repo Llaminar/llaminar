@@ -56,6 +56,41 @@ class Qwen4ExpMainParityTest
 /** @test Every published numerical boundary and actual selected native row path. */
 TEST_P(Qwen4ExpMainParityTest, ProductionParity) { runQwen4ExpProductionParityCampaign(); }
 
+/** @brief Complete-history numerical candidates reuse the original campaign with mandatory paired admission. */
+class Qwen4ExpLocalHotNumericalTest
+    : public Qwen4ExpConfigDrivenParityTest<Qwen4ExpLocalHotNumericalTest>, public ModelParityCaseParameter
+{
+protected:
+    /** @brief Fail before original setup if this new cell has no frozen panel obligation. */
+    void SetUp() override
+    {
+        ASSERT_NO_THROW(qfnRequireLocalHotNumericalBinding(modelParityCase()));
+        Qwen4ExpConfigDrivenParityTest<Qwen4ExpLocalHotNumericalTest>::SetUp();
+    }
+
+    /**
+     * @brief Preserve the driver's exact full-stage history before model admission.
+     * Numerical acceptance runs through the complete paired canary panel; this
+     * fixture provides its frozen-history stage diagnosis without a legacy prompt.
+     */
+    void applyModelOverrides() override
+    {
+        Qwen4ExpConfigDrivenParityTest<Qwen4ExpLocalHotNumericalTest>::applyModelOverrides();
+        accuracy::requireQFN(bool(frozen_history_replay_),
+            "Local-hot full-stage diagnosis requires the original authenticated frozen history");
+    }
+};
+
+/** @test The unchanged canonical complete-history production campaign. */
+TEST_P(Qwen4ExpLocalHotNumericalTest, ProductionParity)
+{
+    runQwen4ExpProductionParityCampaign();
+}
+
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpLocalHotNumerical, Qwen4ExpLocalHotNumericalTest,
+    ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpLocalHotNumerical", qwen4ExpLocalHotNumericalCases())),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info) { return info.param.testName(); });
+
 /** @brief Functional byte replay uses the existing active cases, without another matrix producer. */
 class Qwen4ExpMTPExactReplayTest
     : public Qwen4ExpConfigDrivenParityTest<Qwen4ExpMTPExactReplayTest>, public ModelParityCaseParameter {
@@ -91,7 +126,14 @@ TEST_P(Qwen4ExpMTPExactReplayTest, MTPExactReplay) { runQwen4ExpMTPExactReplay()
 class Qwen4ExpOrdinaryGenerationTest
     : public Qwen4ExpConfigDrivenParityTest<Qwen4ExpOrdinaryGenerationTest>, public ModelParityCaseParameter {
     using Base=Qwen4ExpConfigDrivenParityTest<Qwen4ExpOrdinaryGenerationTest>;
+    std::optional<Qwen4ExpOrdinaryGenerationWorkload> ordinary_workload_;
 protected:
+    /** @return The same original source-selected input/sampler after real reset. */
+    Qwen4ExpNativeGenerationRequest qwen4ExpLookupReuseRequest() const override
+    {
+        if(!ordinary_workload_)throw std::logic_error("Ordinary reuse lost its original workload");
+        return ordinary_workload_->request(Qwen4ExpOrdinaryRequestPhase::Reuse);
+    }
     /** @return Existing-header-only setup; this fixture performs no HF scoring. */
     MTPParityProofPurpose mtpParityProofPurpose() const noexcept override
     { return MTPParityProofPurpose::NativeExactReplay; }
@@ -106,22 +148,42 @@ protected:
         ASSERT_NO_FATAL_FAILURE(Base::setupProductionParityPipeline());
         ASSERT_NE(Base::orch_runner_,nullptr);
         ASSERT_FALSE(Base::orch_runner_->config().mtp.enabled);
-        const std::vector<int32_t> prompt(Base::config_.token_ids.begin(),Base::config_.token_ids.end());
-        // The prompt supplies the first sample. Two subsequent tokens prove
-        // both the retained decode program's initial launch and actual replay;
-        // a two-token response would exercise only transaction zero.
-        const auto generation=Base::orch_runner_->generate(prompt,3,Base::productionParitySamplingParams());
+        const auto tokenizer=Base::orch_runner_->tokenizer();
+        ASSERT_TRUE(tokenizer);
+        const std::vector<int32_t> checkpoint(Base::config_.token_ids.begin(),Base::config_.token_ids.end());
+        ordinary_workload_.emplace(Qwen4ExpOrdinaryGenerationWorkload::fromOriginalCase(modelParityCase(),
+            checkpoint,Base::productionParitySamplingParams(),[&](const auto& messages,bool add,const auto& tools,bool thinking){
+                return tokenizer->encodeChat(messages,add,tools,thinking);
+            }));
+        const auto request=ordinary_workload_->request(Qwen4ExpOrdinaryRequestPhase::First);
+        ASSERT_LE(request.tokens.size()+static_cast<std::size_t>(request.maximum_tokens),
+            static_cast<std::size_t>(Base::orch_runner_->config().max_seq_len));
+        if(ordinary_workload_->sustained())Base::orch_runner_->setStopTokens(tokenizer->stop_tokens());
+        const auto generation=Base::orch_runner_->generate(request.tokens,request.maximum_tokens,request.sampling);
         ASSERT_TRUE(generation.error.empty())<<generation.error;
-        // is_complete records a model stop token, not exhaustion of this
-        // caller's three-token budget. Error-free delivery of the full budget
-        // proves completion here; an earlier model stop still fails the size.
-        ASSERT_EQ(generation.tokens.size(),3u);
-        ASSERT_NO_FATAL_FAILURE(Base::finishProductionParityEvidence());
+        // Completion must satisfy the original declared request horizon. A
+        // model stop below it fails; no stop suppression, retry or drain forces
+        // an asynchronous candidate to become successful movement evidence.
+        ASSERT_GE(generation.tokens.size(),static_cast<std::size_t>(request.minimum_tokens));
+        ASSERT_LE(generation.tokens.size(),static_cast<std::size_t>(request.maximum_tokens));
+        // This first request may finish while the original background economy
+        // profile is still learning. It remains a complete generation/graph
+        // observation, but cannot certify the two-request movement obligation.
+        ASSERT_NO_FATAL_FAILURE(Base::finishProductionParityEvidence(
+            ParityMoEMovementEvidenceBoundary::Intermediate));
         ASSERT_NO_FATAL_FAILURE(Base::assertLookupReuseAfterProductionProof());
+        // Mandatory explicit final boundary: use the latest cumulative original
+        // snapshot after real reuse, never add request snapshots or wait for work.
+        ASSERT_NO_FATAL_FAILURE(Base::finishProductionParityEvidence(
+            ParityMoEMovementEvidenceBoundary::Final));
         std::ofstream record(Base::ensureResultsDir()/"ordinary_generation_scope.txt");
         ASSERT_TRUE(record.is_open());
-        record<<"public_requests=2\nfirst_response_budget=3\nreuse_response_budget=2\nmtp=off\nhf_numerical_scoring=0\n";
+        record<<"public_requests=2\nfirst_response_budget="<<request.maximum_tokens
+            <<"\nreuse_response_budget="<<ordinary_workload_->request(Qwen4ExpOrdinaryRequestPhase::Reuse).maximum_tokens
+            <<"\nsource_declared_sustained="<<ordinary_workload_->sustained()
+            <<"\nmtp=off\nhf_numerical_scoring=0\n";
         record<<"first_request_model_stopped="<<generation.is_complete<<'\n';
+        record<<"movement_evidence_scope=final_two_request_cohort\n";
         record.flush();ASSERT_TRUE(record.good());
     }
 };
@@ -130,6 +192,40 @@ TEST_P(Qwen4ExpOrdinaryGenerationTest, NativeGeneration) { runOrdinaryGeneration
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpOwnerSubsetOrdinaryGenerationCandidate,Qwen4ExpOrdinaryGenerationTest,
     ::testing::ValuesIn(qwen4ExpOwnerSubsetOrdinaryGenerationCases()),
     [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
+
+// Focused combined C0 requests reuse original ROCm TP2 RAM topology and unchanged production fixtures.
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpCombinedLocalHotC0OrdinaryCandidate,Qwen4ExpOrdinaryGenerationTest,
+    ::testing::ValuesIn(qwen4ExpCombinedLocalHotC0OrdinaryCases()),
+    [](const auto& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpCombinedLocalHotC0ExactCandidate,Qwen4ExpMTPExactReplayTest,
+    ::testing::ValuesIn(qwen4ExpCombinedLocalHotC0ExactCases()),
+    [](const auto& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpLocalHotBudgetOrdinaryCandidate,Qwen4ExpOrdinaryGenerationTest,
+    ::testing::ValuesIn(qwen4ExpLocalHotBudgetOrdinaryCases()),
+    [](const auto& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpLocalHotBudgetExactCandidate,Qwen4ExpMTPExactReplayTest,
+    ::testing::ValuesIn(qwen4ExpLocalHotBudgetExactCases()),
+    [](const auto& info){return info.param.testName();});
+// Six explicit R3 requests extend only C0/equal/unequal to recurrent draft reuse.
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpLocalHotRecurrentExactCandidate,Qwen4ExpMTPExactReplayTest,
+    ::testing::ValuesIn(qwen4ExpLocalHotRecurrentCases()),
+    [](const auto& info){return info.param.testName();});
+
+// Bounded CUDA siblings retain the original source, parent and canonical fixtures.
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpCUDALocalHotOrdinaryCandidate,Qwen4ExpOrdinaryGenerationTest,
+    ::testing::ValuesIn(qwen4ExpCUDALocalHotOrdinaryCases()),
+    [](const auto& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpCUDALocalHotExactCandidate,Qwen4ExpMTPExactReplayTest,
+    ::testing::ValuesIn(qwen4ExpCUDALocalHotExactCases()),
+    [](const auto& info){return info.param.testName();});
+
+// Same original GPU-only Q6 parent; source admission and actual generation are separate gates.
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpAllGPUQ6LocalHotOrdinaryCandidate,Qwen4ExpOrdinaryGenerationTest,
+    ::testing::ValuesIn(qwen4ExpAllGPUQ6LocalHotOrdinaryCases()),
+    [](const auto& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpAllGPUQ6LocalHotExactCandidate,Qwen4ExpMTPExactReplayTest,
+    ::testing::ValuesIn(qwen4ExpAllGPUQ6LocalHotExactCases()),
+    [](const auto& info){return info.param.testName();});
 
 // Rank-local all-GPU two-tier candidates use the original mapped device
 // GraphService. Source admission and native exact proof remain separate jobs.
@@ -852,6 +948,21 @@ INSTANTIATE_TEST_SUITE_P(Qwen4ExpOwnerSubsetSourceAdmissionCandidate, Qwen4ExpOw
     ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpExpandSourceAdmissionMTP(
         qwen4ExpOwnerSubsetSourceAdmissionSeeds(),Qwen4ExpSourceMTPEnvelope::Retained3))),
     [](const auto& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpCombinedLocalHotC0SourceCandidate,Qwen4ExpOwnerSubsetSourceAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpCombinedLocalHotC0Cases())),
+    [](const auto& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpLocalHotBudgetSourceCandidate,Qwen4ExpOwnerSubsetSourceAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpLocalHotBudgetCases())),
+    [](const auto& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpAllGPUQ6LocalHotSourceCandidate,Qwen4ExpOwnerSubsetSourceAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpAllGPUQ6LocalHotCases())),
+    [](const auto& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpCUDALocalHotSourceCandidate,Qwen4ExpOwnerSubsetSourceAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpCUDALocalHotCases())),
+    [](const auto& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpLocalHotRecurrentSourceCandidate,Qwen4ExpOwnerSubsetSourceAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpLocalHotRecurrentCases())),
+    [](const auto& info){return info.param.testName();});
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpOwnerSubsetStaticOrdinalCandidate, Qwen4ExpMainParityTest,
     ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpOwnerSubsetStaticOrdinalCandidate",
         qwen4ExpOwnerSubsetExecutionCases(ModelParityExpertOverlayPolicy{}))),
@@ -866,3 +977,44 @@ INSTANTIATE_TEST_SUITE_P(Qwen4ExpOwnerSubsetStaticOrdinalCandidateExact, Qwen4Ex
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpOwnerSubsetDynamicOrdinalCandidateExact, Qwen4ExpMTPExactReplayTest,
     ::testing::ValuesIn(qwen4ExpOwnerSubsetNativeExactCases({.owner_order=RoutedExpertOwnerOrder::Ordinal,.movement=ModelParityExpertMovement::Dynamic})),
     [](const auto& info){return info.param.testName();});
+
+namespace llaminar2::test::parity::qwen4exp {
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpLocalHotSSDOrdinaryCandidate, Qwen4ExpOrdinaryGenerationTest,
+    ::testing::ValuesIn(qwen4ExpLocalHotSSDOrdinaryCases()),
+    [](const auto& info) { return info.param.testName(); });
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpLocalHotSSDExactCandidate, Qwen4ExpMTPExactReplayTest,
+    ::testing::ValuesIn(qwen4ExpLocalHotSSDExactCases()),
+    [](const auto& info) { return info.param.testName(); });
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpLocalHotSSDSourceCandidate, Qwen4ExpOwnerSubsetSourceAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpLocalHotSSDCases())),
+    [](const auto& info) { return info.param.testName(); });
+}
+
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpLocalHotMeasuredBudgetSourceCandidate, Qwen4ExpOwnerSubsetSourceAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpLocalHotMeasuredBudgetCandidates())),
+    [](const auto& info) { return info.param.testName(); });
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpLocalHotMeasuredBudgetNumerical, Qwen4ExpLocalHotNumericalTest,
+    ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpLocalHotMeasuredBudgetNumerical",
+        qwen4ExpLocalHotMeasuredBudgetCandidates())),
+    [](const auto& info) { return info.param.testName(); });
+
+#include "Qwen4ExpLocalHotHeldSourceTest.h"
+/** @test Genuine unequal-cohort current LocalRead progress and original source retirement. */
+TEST_P(Qwen4ExpLocalHotHeldSourceTest, CapturedLocalReadProgress)
+{
+    runHeldSourceProof();
+}
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpLocalHotHeldSourceCandidate, Qwen4ExpLocalHotHeldSourceTest,
+    ::testing::ValuesIn(qwen4ExpLocalHotHeldSourceCases()),
+    [](const auto& info) { return info.param.testName(); });
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpLocalHotHeldSourceAdmissionCandidate, Qwen4ExpOwnerSubsetSourceAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpLocalHotHeldSourceCases())),
+    [](const auto& info) { return info.param.testName(); });
+
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpLocalHotRefinedBudgetSourceCandidate, Qwen4ExpOwnerSubsetSourceAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpLocalHotRefinedBudgetCandidates())),
+    [](const auto& info) { return info.param.testName(); });
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpLocalHotRefinedBudgetNumerical, Qwen4ExpLocalHotNumericalTest,
+    ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpLocalHotRefinedBudgetNumerical",
+        qwen4ExpLocalHotRefinedBudgetCandidates())),
+    [](const auto& info) { return info.param.testName(); });

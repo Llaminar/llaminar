@@ -50,6 +50,22 @@ PooledImmutableDirectedLookupEndpoints appendPooledImmutableDirectedLookupGraph(
     DeviceGenerationControlBinding control,qwen4exp::PooledNativeTensorSpan output,
     const std::string& identity,const std::string& output_identity);
 /**
+ * @brief Reuse the complete original pool protocol for exact compact native deliveries.
+ * @param graph Actual participant graph already containing its union producer.
+ * @param arena Original root aliases. @param boundary Same admitted source.
+ * @param transport Same original addressed/native channels. @param code Same backend bundle.
+ * @param query Closed device-owned union/count producer. @param delivery Exact actual consumer roster.
+ * @param control Original canonical controller. @param compactQueryReady Actual union publication stage.
+ * @param identity Unique local source namespace.
+ * @return Same physical source/owner retirement after native delivery and its real ACKs.
+ */
+PooledImmutableDirectedLookupEndpoints appendPooledImmutableCompactLookupGraph(
+    ComputeGraph& graph,BufferArena& arena,std::shared_ptr<qwen4exp::ImmutableLookupExecutionBoundary> boundary,
+    std::shared_ptr<const qwen4exp::PooledImmutableDirectedTransport> transport,
+    std::shared_ptr<const qwen4exp::IPooledImmutableNativeKernels> code,
+    qwen4exp::PooledImmutableLocalHotPoolQuery query,PooledImmutableCompactReadRequest delivery,
+    DeviceGenerationControlBinding control,const std::string& compactQueryReady,const std::string& identity);
+/**
  * @brief Append the addressed original owner program, independent of source model variants.
  * @param graph Exclusive participant-local remote graph.
  * @param arena Original remote arena; every operand retains its actual prepared root.
