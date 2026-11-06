@@ -1243,6 +1243,10 @@ namespace llaminar2
         int seq_len, int channels, int kernel_size,
         bool apply_silu)
     {
+        // The SIMD prefill leaves retain at most eight per-tap weight
+        // vectors; a larger causal window would read unwritten registers.
+        if (kernel_size < 1 || kernel_size > kMaxSIMDPrefillKernelSize)
+            return false;
         ISA_DISPATCH_VOID(shortconv_prefill, input, weight, bias, output, conv_state, seq_len, channels, kernel_size, apply_silu);
         return true;
     }
