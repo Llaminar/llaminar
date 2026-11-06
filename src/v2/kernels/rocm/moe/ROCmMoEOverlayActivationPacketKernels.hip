@@ -13,6 +13,7 @@
 #include <hip/hip_runtime.h>
 
 #include "../../common/MoEOverlayActivationPacketDevice.inl"
+#include "../../common/MoEOverlayNativeInvocationDevice.inl"
 #include "../../common/MoEOverlayNodeLocalRouteExchangeDevice.inl"
 
 #include <algorithm>
@@ -495,5 +496,82 @@ extern "C" bool hipMoEOverlayFinishNodeLocalDensePublicationConsume(
     hipLaunchKernelGGL(
         llaminar2::moe_node_local_route_device::finishDensePublicationConsumeKernel,
         dim3(1u), dim3(1u), 0u, hip_stream, *launch);
+    return launchAccepted();
+}
+
+
+/** @brief Submit the original-slot begin without a host state observation. */
+extern "C" bool hipMoEOverlayOriginalNativeBegin(
+    const llaminar2::MoEOverlayOriginalNativeBeginLaunch *launch,
+    int device_ordinal,
+    void *stream)
+{
+    if (!launch || !launch->valid() ||
+        reinterpret_cast<std::uintptr_t>(stream) <= 2u ||
+        !selectLaunchContext(device_ordinal, stream))
+    {
+        return false;
+    }
+    hipLaunchKernelGGL(
+        (llaminar2::moe_activation_packet_device::beginOriginalNativeInvocationKernel),
+        dim3(1u), dim3(64u), 0u,
+        reinterpret_cast<hipStream_t>(stream), *launch);
+    return launchAccepted();
+}
+
+/** @brief Submit the original-slot retire without a host state observation. */
+extern "C" bool hipMoEOverlayOriginalNativeRetire(
+    const llaminar2::MoEOverlayOriginalNativeRetireLaunch *launch,
+    int device_ordinal,
+    void *stream)
+{
+    if (!launch || !launch->valid() ||
+        reinterpret_cast<std::uintptr_t>(stream) <= 2u ||
+        !selectLaunchContext(device_ordinal, stream))
+    {
+        return false;
+    }
+    hipLaunchKernelGGL(
+        (llaminar2::moe_activation_packet_device::retireOriginalNativeInvocationKernel),
+        dim3(1u), dim3(1u), 0u,
+        reinterpret_cast<hipStream_t>(stream), *launch);
+    return launchAccepted();
+}
+
+/** @brief Submit the original-slot retiresinglerowbatch without a host state observation. */
+extern "C" bool hipMoEOverlayOriginalNativeRetireSingleRowBatch(
+    const llaminar2::MoEOverlayActivationSingleRowReturnBatchLaunch *launch,
+    int device_ordinal,
+    void *stream)
+{
+    if (!launch || !launch->valid() ||
+        reinterpret_cast<std::uintptr_t>(stream) <= 2u ||
+        !selectLaunchContext(device_ordinal, stream))
+    {
+        return false;
+    }
+    hipLaunchKernelGGL(
+        (llaminar2::moe_activation_packet_device::retireOriginalNativeInvocationBatchKernel<llaminar2::MoEOverlayActivationSingleRowReturnBatchLaunch>),
+        dim3(launch->lane_count), dim3(1u), 0u,
+        reinterpret_cast<hipStream_t>(stream), *launch);
+    return launchAccepted();
+}
+
+/** @brief Submit the original-slot retiremultirowbatch without a host state observation. */
+extern "C" bool hipMoEOverlayOriginalNativeRetireMultiRowBatch(
+    const llaminar2::MoEOverlayActivationMultiRowReturnBatchLaunch *launch,
+    int device_ordinal,
+    void *stream)
+{
+    if (!launch || !launch->valid() ||
+        reinterpret_cast<std::uintptr_t>(stream) <= 2u ||
+        !selectLaunchContext(device_ordinal, stream))
+    {
+        return false;
+    }
+    hipLaunchKernelGGL(
+        (llaminar2::moe_activation_packet_device::retireOriginalNativeInvocationBatchKernel<llaminar2::MoEOverlayActivationMultiRowReturnBatchLaunch>),
+        dim3(launch->lane_count), dim3(1u), 0u,
+        reinterpret_cast<hipStream_t>(stream), *launch);
     return launchAccepted();
 }

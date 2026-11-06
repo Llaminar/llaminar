@@ -11,6 +11,7 @@
 #include <gtest/gtest.h>
 #include "fixtures/execution/RetainedHostServiceFixture.h"
 #include "backends/GPUDeviceProcessLifetime.h"
+#include "backends/NativeAuxiliaryResourceCatalog.h"
 #include <atomic>
 #include <array>
 #include <chrono>
@@ -779,9 +780,7 @@ namespace
         }
         void destroyEvent(void *) override { ++events_destroyed_; }
         void recordEvent(void *, void *) override { ++events_recorded_; }
-        void waitEvent(void *event, void *stream) override {
-            ++events_waited_;last_waited_event_=event;last_waited_stream_=stream;
-        }
+        void waitEvent(void *event, void *stream) override { ++events_waited_;last_waited_event_=event;last_waited_stream_=stream; }
         bool queryEventChecked(void *event, bool &ready) override
         {
             ++event_query_calls_;
@@ -8556,6 +8555,111 @@ TEST(Test__GraphSegmentCache, NativeTransactionCaptureContractRetainsScopeAndCac
     EXPECT_THROW(DeviceGraphCaptureController::buildCapturePlan(enclosing,partial,nullptr,false,false,
         DeviceGraphExecutor::GraphReplayPlanPolicy::AllowHeterogeneousBoundarySegmentation),std::logic_error);
     enclosing.clear();EXPECT_FALSE(enclosing.nativeTransactionCaptureContract());
+}
+
+namespace {
+/** @brief Original scheduler metadata for receipt-state replay; grants no native readiness. */
+MoEOverlayInferenceTopologyIdentity recurrentTerminalTopology() {
+    return {.workspace_generation=71,.topology_fingerprint_low=0x1234,
+        .topology_fingerprint_high=0x5678,.source_world_rank=0,.target_world_rank=1};
+}
+/** @brief Construct the actual original protocol; terminal state cannot select capacity. */
+MoEOverlayInferenceTransactionProtocol recurrentTerminalProtocol(int depth) {
+    return MoEOverlayInferenceTransactionProtocol({.topology=recurrentTerminalTopology(),
+        .slot_count=moeOverlayInferenceTransactionSlotCount(depth),.max_request_count=4,
+        .max_rows_per_request=16,.max_mtp_draft_depth=depth});
+}
+}
+/** @test Several original same-family publications retain distinct exact receipts before any observation. */
+TEST(Test__GraphSegmentCache, OriginalSlotTerminalsRetainEveryDeferredInvocationLifecycle) {
+    for(const int depth:{1,3,15}) {
+        auto protocol=recurrentTerminalProtocol(depth);
+        OriginalSlotCaptureTerminalState terminals(protocol.originalSlotDomain());
+        for(std::uint64_t request=1;request<=20;++request) {
+            const MoEOverlayInferenceCommandIdentity command{request,request,41};
+            ASSERT_TRUE(protocol.beginCommand(command));
+            std::vector<MoEOverlayInferenceOriginalSlot> submitted;
+            std::vector<OriginalSlotCaptureTerminalReceipt> receipts;
+            // The same learned family is invoked recurrently; depth belongs to
+            // the immutable ticket, never a newly declared learned executable.
+            for(std::uint64_t ordinal=1;ordinal<=3;++ordinal) {
+                const auto ticket=makeMoEOverlayInferenceExecutionTicket(recurrentTerminalTopology(),command,
+                    ordinal,ordinal,41,MoEOverlayInferenceGraphRole::MTPDraft,1,1,1,
+                    std::min(depth,3),int(ordinal-1)%std::min(depth,3));
+                const auto admission=protocol.accept(ticket);ASSERT_TRUE(admission.accepted());
+                ASSERT_TRUE(protocol.markSubmitted(admission.slot_index,ticket));
+                const auto slot=protocol.originalSubmittedSlot(ticket);
+                ASSERT_NO_THROW(terminals.requirePublication(slot));
+                receipts.push_back(terminals.publish(slot));submitted.push_back(slot);
+                EXPECT_THROW(terminals.publish(slot),std::logic_error);
+            }
+            EXPECT_THROW(terminals.requireObservation(receipts.back()),std::logic_error);
+            for(const auto& receipt:receipts) {
+                ASSERT_TRUE(terminals.nextOutstanding());
+                EXPECT_EQ(terminals.nextOutstanding()->generation(),receipt.generation());
+                ASSERT_NO_THROW(terminals.requireObservation(receipt));
+                terminals.observed(receipt);
+                EXPECT_THROW(terminals.observed(receipt),std::logic_error);
+            }
+            EXPECT_FALSE(terminals.nextOutstanding());
+            for(const auto& slot:submitted) {
+                ASSERT_TRUE(protocol.markReturnReady(slot.index(),slot.ticket()));
+                ASSERT_TRUE(protocol.retire(slot.index(),slot.ticket()));
+                EXPECT_THROW(terminals.requirePublication(slot),std::logic_error);
+            }
+            const auto complete=makeMoEOverlayInferenceTerminalTicket(recurrentTerminalTopology(),command,
+                4,41,MoEOverlayInferenceTransactionAction::Complete);
+            EXPECT_TRUE(protocol.accept(complete).completed());
+        }
+    }
+}
+/** @test Foreign caches, withdrawn original authorities and stale slots cannot authenticate terminal proof. */
+TEST(Test__GraphSegmentCache, OriginalSlotTerminalsRejectForeignAndWithdrawnOwners) {
+    auto protocol=recurrentTerminalProtocol(3),foreign=recurrentTerminalProtocol(3);
+    const MoEOverlayInferenceCommandIdentity command{1,1,41};
+    ASSERT_TRUE(protocol.beginCommand(command));
+    const auto ticket=makeMoEOverlayInferenceExecutionTicket(recurrentTerminalTopology(),command,
+        1,1,41,MoEOverlayInferenceGraphRole::MTPDraft,1,1,1,3,0);
+    const auto admission=protocol.accept(ticket);ASSERT_TRUE(admission.accepted());
+    ASSERT_TRUE(protocol.markSubmitted(admission.slot_index,ticket));
+    const auto slot=protocol.originalSubmittedSlot(ticket);
+    OriginalSlotCaptureTerminalState first(protocol.originalSlotDomain()),second(protocol.originalSlotDomain()),
+        foreignState(foreign.originalSlotDomain());
+    EXPECT_THROW(foreignState.requirePublication(slot),std::logic_error);
+    const auto receipt=first.publish(slot);
+    EXPECT_THROW(second.requireObservation(receipt),std::logic_error);
+    first.observed(receipt);
+    ASSERT_TRUE(protocol.markReturnReady(slot.index(),ticket));
+    ASSERT_TRUE(protocol.retire(slot.index(),ticket));
+    EXPECT_THROW(first.requirePublication(slot),std::logic_error);
+    std::optional<MoEOverlayInferenceOriginalSlot> orphan;
+    std::unique_ptr<OriginalSlotCaptureTerminalState> retained;
+    {
+        auto original=recurrentTerminalProtocol(3);
+        ASSERT_TRUE(original.beginCommand(command));
+        const auto accepted=original.accept(ticket);ASSERT_TRUE(accepted.accepted());
+        ASSERT_TRUE(original.markSubmitted(accepted.slot_index,ticket));
+        orphan=original.originalSubmittedSlot(ticket);
+        retained=std::make_unique<OriginalSlotCaptureTerminalState>(original.originalSlotDomain());
+    }
+    EXPECT_THROW(retained->requirePublication(*orphan),std::logic_error);
+}
+/** @test Additional event commitments scale only with the actual original slot roster on both backends. */
+TEST(Test__GraphSegmentCache, OriginalSlotTerminalBOMUsesCertifiedUnitCount) {
+    for(const int depth:{1,3,15}) {
+        auto protocol=recurrentTerminalProtocol(depth);
+        const auto program=NativeOrderingEventProgram::retainedCaptureTerminals(*protocol.originalSlotDomain());
+        EXPECT_EQ(program.orderingEvents(),protocol.slotCount()-1);
+        for(const auto backend:{DeviceType::CUDA,DeviceType::ROCm}) {
+            const auto unit=NativeAuxiliaryResourceCatalog::allowance(backend,
+                NativeAuxiliaryResourceProgram::ordering(NativeOrderingEventProgram::lookupSubmissionRetirement()));
+            const auto full=NativeAuxiliaryResourceCatalog::allowance(backend,NativeAuxiliaryResourceProgram::ordering(program));
+            EXPECT_EQ(full.hostBytes,unit.hostBytes*(protocol.slotCount()-1));
+            EXPECT_EQ(full.deviceBytes,unit.deviceBytes*(protocol.slotCount()-1));
+            EXPECT_EQ(full.lifetime,unit.lifetime);
+            EXPECT_EQ(full.evidence,unit.evidence);
+        }
+    }
 }
 
 /** @test Exact predecessor device edge preserves its event and every deferred host terminal proof. */

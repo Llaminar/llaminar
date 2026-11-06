@@ -6,6 +6,8 @@
  * its stream from IComputeStage::requireGPUStream(). Backend packet facades own
  * no host wait or synchronization; they enqueue fixed-shape kernels whose
  * mapped system-memory visibility is ordered by the parent timeline graph.
+ * Recurrent native admissions and post-payload receipts are captured on those
+ * same streams. Immutable original-slot bindings never mirror device progress.
  */
 
 #include "MoEOverlayActivationPacketStages.h"
@@ -21,6 +23,7 @@
 #include "../../../utils/Logger.h"
 #include "../../../utils/PerfStatsCollector.h"
 
+#include <algorithm>
 #include <cstring>
 #include <limits>
 #include <sstream>
@@ -125,6 +128,8 @@ namespace llaminar2
             return lane.valid() && lane.device == device && device.is_gpu() &&
                    physical_rows > 0 && model_layer_index >= 0 &&
                    lane.control_host->channel.stage_count > stage_ordinal &&
+                   (!lane.original_invocations.deviceOwned() ||
+                    lane.retained_stage_count == lane.control_host->channel.stage_count) &&
                    lane.control_host->channel.target_participant_id ==
                        lane.target_participant_id;
         }
@@ -426,6 +431,134 @@ namespace llaminar2
                 kMoEOverlayActivationAdmissionTimeline,
                 stream,
                 role);
+        }
+
+        /**
+         * @brief Rearm an original native lane before its first admission wait.
+         * @param kernel Backend implementation already selected for this stage.
+         * @param lane Immutable original channel and admitted slot roster.
+         * @param physical_rows Exact retained graph row specialization.
+         * @param stage_ordinal Position in the immutable family manifest.
+         * @param stream Exact source stream, before any auxiliary-lane fork.
+         * @param grant_initialized Whether cold preparation joined grant creation.
+         * @return Whether the required device operation was accepted.
+         * The device selects the next original admission and proves the prior
+         * payload retirement. Host code reads neither live progress nor counts.
+         */
+        bool beginOriginalInvocationIfFirstStage(
+            IMoEKernel &kernel,
+            const MoEOverlayMappedActivationDeviceLane &lane,
+            std::int32_t physical_rows,
+            std::uint32_t stage_ordinal,
+            void *stream,
+            bool grant_initialized)
+        {
+            if (stage_ordinal != 0u || !lane.original_invocations.deviceOwned())
+                return true;
+            if (!grant_initialized &&
+                !joinGrantInitialization(lane, stream, "original native source admission"))
+                return false;
+            return kernel.beginOriginalMoEOverlayInvocation(
+                packetLaunchContext(stream),
+                MoEOverlayOriginalNativeBeginLaunch{
+                    .original_invocations = lane.original_invocations,
+                    .control = lane.control_device,
+                    .grant = lane.grant_device,
+                    .physical_rows = physical_rows,
+                    .retained_stage_count = lane.retained_stage_count,
+                });
+        }
+
+        /** @return Whether this immutable stage is the native lane's last payload producer. */
+        bool isOriginalNativeFinalStage(
+            const MoEOverlayMappedActivationDeviceLane &lane,
+            std::uint32_t stage_ordinal) noexcept
+        {
+            return lane.original_invocations.deviceOwned() &&
+                   lane.retained_stage_count != 0u &&
+                   stage_ordinal == lane.retained_stage_count - 1u;
+        }
+
+        /**
+         * @brief Publish one endpoint receipt after its actual final payload work.
+         * @param kernel Backend implementation already selected for this stage.
+         * @param lane Immutable original channel and admitted slot roster.
+         * @param endpoint Actual producer of this post-payload receipt.
+         * @param physical_rows Exact retained graph row specialization.
+         * @param stage_ordinal Position in the immutable family manifest.
+         * @param stream Exact payload/publication stream; no host fence is added.
+         * @return Whether the final receipt enqueue, when required, succeeded.
+         * Semantic packet Complete can precede payload materialization, so it
+         * cannot replace this trailing captured node.
+         */
+        bool retireOriginalInvocationIfFinalStage(
+            IMoEKernel &kernel,
+            const MoEOverlayMappedActivationDeviceLane &lane,
+            MoEOverlayActivationEndpoint endpoint,
+            std::int32_t physical_rows,
+            std::uint32_t stage_ordinal,
+            void *stream)
+        {
+            if (!isOriginalNativeFinalStage(lane, stage_ordinal))
+                return true;
+            return kernel.retireOriginalMoEOverlayInvocation(
+                packetLaunchContext(stream),
+                MoEOverlayOriginalNativeRetireLaunch{
+                    .original_invocations = lane.original_invocations,
+                    .control = lane.control_device,
+                    .grant = lane.grant_device,
+                    .endpoint = endpoint,
+                    .physical_rows = physical_rows,
+                    .stage_ordinal = stage_ordinal,
+                    .retained_stage_count = lane.retained_stage_count,
+                });
+        }
+
+        /** @brief Extend the existing capture-variant key with one immutable word. */
+        void mixPacketCaptureWord(std::uint64_t &signature, std::uint64_t word) noexcept
+        {
+            signature ^= word;
+            signature *= 1099511628211ULL;
+        }
+
+        /**
+         * @brief Include the immutable native owner and channel in capture identity.
+         * @param signature Existing stage-local variant key.
+         * @param lane Cold-resolved lane, whose original slot storage is capture-stable.
+         * Only addresses and immutable geometry are included; live slot contents,
+         * publication generations and endpoint progress never change graph identity.
+         */
+        void mixPacketLaneCaptureIdentity(
+            std::uint64_t &signature,
+            const MoEOverlayMappedActivationDeviceLane &lane) noexcept
+        {
+            const auto mix = [&](std::uint64_t word) { mixPacketCaptureWord(signature, word); };
+            mix(static_cast<std::uint64_t>(lane.device.type));
+            mix(static_cast<std::uint64_t>(lane.device.ordinal));
+            mix(static_cast<std::uint64_t>(lane.target_participant_id));
+            mix(reinterpret_cast<std::uintptr_t>(lane.mapped_region.get()));
+            mix(reinterpret_cast<std::uintptr_t>(lane.control_device));
+            mix(reinterpret_cast<std::uintptr_t>(lane.grant_device));
+            mix(static_cast<std::uint64_t>(lane.original_invocations.policy));
+            mix(reinterpret_cast<std::uintptr_t>(lane.original_invocations.original_slots));
+            mix(lane.original_invocations.original_slot_count);
+            mix(lane.retained_stage_count);
+            mix(lane.admission_signal_offset);
+            for (const auto offset : lane.dispatch_signal_offsets)
+                mix(offset);
+            for (const auto offset : lane.return_signal_offsets)
+                mix(offset);
+            if (lane.control_host)
+            {
+                // This header is frozen by channel admission and is never part
+                // of the device-owned request state reset between invocations.
+                const auto &channel = lane.control_host->channel;
+                mix(channel.channel_nonce);
+                mix(channel.workspace_generation);
+                mix(channel.stage_manifest_digest);
+                mix(channel.graph_role_mask);
+                mix(channel.return_role);
+            }
         }
 
         /**
@@ -962,6 +1095,11 @@ namespace llaminar2
             return false;
         }
 
+        if (!beginOriginalInvocationIfFirstStage(
+                *moe_kernel_, params_.lane, params_.physical_rows,
+                params_.stage_ordinal, stream, grant_initialization_joined_))
+            return false;
+
         /* Transaction zero may not enter packet arithmetic until the scheduler
          * has armed this exact lane generation. This node becomes part of the
          * same full endpoint graph as every following dispatch/return edge. */
@@ -988,6 +1126,8 @@ namespace llaminar2
             .control = params_.lane.control_device,
             .grant = params_.lane.grant_device,
             .target_participant_id = params_.lane.target_participant_id,
+            .original_invocations = params_.lane.original_invocations,
+            .retained_stage_count = params_.lane.retained_stage_count,
             .physical_rows = params_.physical_rows,
             .stage_ordinal = params_.stage_ordinal,
             .model_layer_index = params_.model_layer_index,
@@ -1035,6 +1175,18 @@ namespace llaminar2
             timeline,
             stream,
             "dispatch");
+    }
+
+    std::uint64_t MoEOverlayActivationDispatchPackStage::graphCaptureVariantSignature() const
+    {
+        std::uint64_t signature = 1469598103934665603ULL;
+        mixPacketCaptureWord(signature, static_cast<std::uint64_t>(type()));
+        mixPacketCaptureWord(signature, 1u); // Scalar lane launch.
+        mixPacketCaptureWord(signature, static_cast<std::uint64_t>(params_.physical_rows));
+        mixPacketCaptureWord(signature, params_.stage_ordinal);
+        mixPacketCaptureWord(signature, static_cast<std::uint64_t>(params_.model_layer_index));
+        mixPacketLaneCaptureIdentity(signature, params_.lane);
+        return signature ? signature : 1u;
     }
 
     ComputeStageType MoEOverlayActivationDispatchPackStage::type() const
@@ -1364,6 +1516,18 @@ namespace llaminar2
         }
     }
 
+    std::uint64_t MoEOverlayActivationDispatchConsumeStage::graphCaptureVariantSignature() const
+    {
+        std::uint64_t signature = 1469598103934665603ULL;
+        mixPacketCaptureWord(signature, static_cast<std::uint64_t>(type()));
+        mixPacketCaptureWord(signature, 1u); // Scalar lane launch.
+        mixPacketCaptureWord(signature, static_cast<std::uint64_t>(params_.physical_rows));
+        mixPacketCaptureWord(signature, params_.stage_ordinal);
+        mixPacketCaptureWord(signature, static_cast<std::uint64_t>(params_.model_layer_index));
+        mixPacketLaneCaptureIdentity(signature, params_.lane);
+        return signature ? signature : 1u;
+    }
+
     ComputeStageType MoEOverlayActivationDispatchConsumeStage::type() const
     {
         return ComputeStageType::MOE_OVERLAY_ACTIVATION_DISPATCH_CONSUME;
@@ -1588,6 +1752,8 @@ namespace llaminar2
             .returned = params_.lane.returned,
             .control = params_.lane.control_device,
             .grant = params_.lane.grant_device,
+            .original_invocations = params_.lane.original_invocations,
+            .retained_stage_count = params_.lane.retained_stage_count,
             .physical_rows = params_.physical_rows,
             .stage_ordinal = params_.stage_ordinal,
             .model_layer_index = params_.model_layer_index,
@@ -1609,12 +1775,16 @@ namespace llaminar2
             {
                 return false;
             }
-            return moe_kernel_->packSingleRowMoEOverlayActivationReturn(
-                packetLaunchContext(stream),
-                MoEOverlayActivationSingleRowReturnPackLaunch{
-                    .packet = launch,
-                    .publication = publication,
-                });
+            if (!moe_kernel_->packSingleRowMoEOverlayActivationReturn(
+                    packetLaunchContext(stream),
+                    MoEOverlayActivationSingleRowReturnPackLaunch{
+                        .packet = launch,
+                        .publication = publication,
+                    }))
+                return false;
+            return retireOriginalInvocationIfFinalStage(
+                *moe_kernel_, params_.lane, MoEOverlayActivationEndpoint::Follower,
+                params_.physical_rows, params_.stage_ordinal, stream);
         }
 
         if (!moe_kernel_->packMoEOverlayActivationReturn(
@@ -1623,12 +1793,28 @@ namespace llaminar2
             return false;
         }
 
-        return publishMappedTimeline(
-            params_.lane,
-            params_.lane.return_signal_offsets[bank],
-            timeline,
-            stream,
-            "return");
+        if (!publishMappedTimeline(
+                params_.lane,
+                params_.lane.return_signal_offsets[bank],
+                timeline,
+                stream,
+                "return"))
+            return false;
+        return retireOriginalInvocationIfFinalStage(
+            *moe_kernel_, params_.lane, MoEOverlayActivationEndpoint::Follower,
+            params_.physical_rows, params_.stage_ordinal, stream);
+    }
+
+    std::uint64_t MoEOverlayActivationReturnPackStage::graphCaptureVariantSignature() const
+    {
+        std::uint64_t signature = 1469598103934665603ULL;
+        mixPacketCaptureWord(signature, static_cast<std::uint64_t>(type()));
+        mixPacketCaptureWord(signature, 1u); // Scalar lane launch.
+        mixPacketCaptureWord(signature, static_cast<std::uint64_t>(params_.physical_rows));
+        mixPacketCaptureWord(signature, params_.stage_ordinal);
+        mixPacketCaptureWord(signature, static_cast<std::uint64_t>(params_.model_layer_index));
+        mixPacketLaneCaptureIdentity(signature, params_.lane);
+        return signature ? signature : 1u;
     }
 
     ComputeStageType MoEOverlayActivationReturnPackStage::type() const
@@ -1824,6 +2010,8 @@ namespace llaminar2
             .grant = params_.lane.grant_device,
             .canonical_route_contributions_fp32 = static_cast<float *>(
                 params_.canonical_route_contributions->gpu_data_ptr()),
+            .original_invocations = params_.lane.original_invocations,
+            .retained_stage_count = params_.lane.retained_stage_count,
             .physical_rows = params_.physical_rows,
             .stage_ordinal = params_.stage_ordinal,
             .model_layer_index = params_.model_layer_index,
@@ -1872,7 +2060,9 @@ namespace llaminar2
         try
         {
             gpuExecution().publish(params_.canonical_route_contributions);
-            return true;
+            return retireOriginalInvocationIfFinalStage(
+                *moe_kernel_, params_.lane, MoEOverlayActivationEndpoint::Continuation,
+                params_.physical_rows, params_.stage_ordinal, stream);
         }
         catch (const std::exception &error)
         {
@@ -1881,6 +2071,18 @@ namespace llaminar2
                 << error.what());
             return false;
         }
+    }
+
+    std::uint64_t MoEOverlayActivationReturnConsumeStage::graphCaptureVariantSignature() const
+    {
+        std::uint64_t signature = 1469598103934665603ULL;
+        mixPacketCaptureWord(signature, static_cast<std::uint64_t>(type()));
+        mixPacketCaptureWord(signature, 1u); // Scalar lane launch.
+        mixPacketCaptureWord(signature, static_cast<std::uint64_t>(params_.physical_rows));
+        mixPacketCaptureWord(signature, params_.stage_ordinal);
+        mixPacketCaptureWord(signature, static_cast<std::uint64_t>(params_.model_layer_index));
+        mixPacketLaneCaptureIdentity(signature, params_.lane);
+        return signature ? signature : 1u;
     }
 
     ComputeStageType MoEOverlayActivationReturnConsumeStage::type() const
@@ -2177,6 +2379,8 @@ namespace llaminar2
                 .control = lane.control_device,
                 .grant = lane.grant_device,
                 .target_participant_id = lane.target_participant_id,
+                .original_invocations = lane.original_invocations,
+                .retained_stage_count = lane.retained_stage_count,
                 .physical_rows = 1,
                 .stage_ordinal = params_.transaction->stageOrdinal(),
                 .model_layer_index = params_.transaction->modelLayerIndex(),
@@ -2210,6 +2414,15 @@ namespace llaminar2
         void *const stream = requireGPUStream();
         auto &transaction = *params_.transaction;
         const auto &lanes = transaction.lanes();
+
+        // Rearm every original lane on the base stream before the input fork.
+        // Shared-row cohort validation must never see a mixture of old and new
+        // admissions from independently scheduled auxiliary streams.
+        for (const auto &lane : lanes)
+            if (!beginOriginalInvocationIfFirstStage(
+                    *moe_kernel_, lane, transaction.physicalRows(),
+                    transaction.stageOrdinal(), stream, grant_initialization_joined_))
+                return false;
 
         if (transaction.usesAsynchronousLanes())
         {
@@ -2286,6 +2499,8 @@ namespace llaminar2
                         .control = lane.control_device,
                         .grant = lane.grant_device,
                         .target_participant_id = lane.target_participant_id,
+                        .original_invocations = lane.original_invocations,
+                        .retained_stage_count = lane.retained_stage_count,
                         .physical_rows = transaction.physicalRows(),
                         .stage_ordinal = transaction.stageOrdinal(),
                         .model_layer_index = transaction.modelLayerIndex(),
@@ -2435,6 +2650,25 @@ namespace llaminar2
                       transaction.modelLayerIndex())}});
         }
         return launched;
+    }
+
+    std::uint64_t MoEOverlayActivationDispatchPackBatchStage::graphCaptureVariantSignature() const
+    {
+        std::uint64_t signature = 1469598103934665603ULL;
+        mixPacketCaptureWord(signature, static_cast<std::uint64_t>(type()));
+        mixPacketCaptureWord(signature, 2u); // Canonically ordered lane batch.
+        if (params_.transaction)
+        {
+            const auto &transaction = *params_.transaction;
+            mixPacketCaptureWord(signature, static_cast<std::uint64_t>(transaction.physicalRows()));
+            mixPacketCaptureWord(signature, transaction.stageOrdinal());
+            mixPacketCaptureWord(signature, static_cast<std::uint64_t>(transaction.modelLayerIndex()));
+            mixPacketCaptureWord(signature, transaction.usesAsynchronousLanes());
+            mixPacketCaptureWord(signature, transaction.lanes().size());
+            for (const auto &lane : transaction.lanes())
+                mixPacketLaneCaptureIdentity(signature, lane);
+        }
+        return signature ? signature : 1u;
     }
 
     ComputeStageType MoEOverlayActivationDispatchPackBatchStage::type() const
@@ -2742,6 +2976,8 @@ namespace llaminar2
                         static_cast<float *>(
                             params_.canonical_route_contributions->
                                 gpu_data_ptr()),
+                    .original_invocations = lane.original_invocations,
+                    .retained_stage_count = lane.retained_stage_count,
                     .physical_rows = params_.transaction->physicalRows(),
                     .stage_ordinal = params_.transaction->stageOrdinal(),
                     .model_layer_index =
@@ -2823,6 +3059,8 @@ namespace llaminar2
                 .grant = lane.grant_device,
                 .canonical_route_contributions_fp32 = static_cast<float *>(
                     params_.canonical_route_contributions->gpu_data_ptr()),
+                .original_invocations = lane.original_invocations,
+                .retained_stage_count = lane.retained_stage_count,
                 .physical_rows = 1,
                 .stage_ordinal = params_.transaction->stageOrdinal(),
                 .model_layer_index =
@@ -2942,6 +3180,12 @@ namespace llaminar2
                 }
                 gpuExecution().publish(
                     params_.canonical_route_contributions);
+                if (std::any_of(lanes.begin(), lanes.end(), [&](const auto &lane) {
+                        return isOriginalNativeFinalStage(lane, transaction.stageOrdinal());
+                    }) &&
+                    !moe_kernel_->retireOriginalMoEOverlayInvocationBatch(
+                        packetLaunchContext(stream), launch))
+                    return false;
                 PerfStatsCollector::addCounter(
                     "forward_graph",
                     "moe_overlay_async_lane_joins",
@@ -2995,6 +3239,12 @@ namespace llaminar2
         try
         {
             gpuExecution().publish(params_.canonical_route_contributions);
+            if (std::any_of(lanes.begin(), lanes.end(), [&](const auto &lane) {
+                    return isOriginalNativeFinalStage(lane, transaction.stageOrdinal());
+                }) &&
+                !moe_kernel_->retireOriginalMoEOverlayInvocationBatch(
+                    packetLaunchContext(stream), launch))
+                return false;
             PerfStatsCollector::addCounter(
                 "forward_graph",
                 "moe_overlay_one_row_return_batch_stages",
@@ -3012,6 +3262,25 @@ namespace llaminar2
                       << error.what());
             return false;
         }
+    }
+
+    std::uint64_t MoEOverlayActivationReturnConsumeBatchStage::graphCaptureVariantSignature() const
+    {
+        std::uint64_t signature = 1469598103934665603ULL;
+        mixPacketCaptureWord(signature, static_cast<std::uint64_t>(type()));
+        mixPacketCaptureWord(signature, 2u); // Canonically ordered lane batch.
+        if (params_.transaction)
+        {
+            const auto &transaction = *params_.transaction;
+            mixPacketCaptureWord(signature, static_cast<std::uint64_t>(transaction.physicalRows()));
+            mixPacketCaptureWord(signature, transaction.stageOrdinal());
+            mixPacketCaptureWord(signature, static_cast<std::uint64_t>(transaction.modelLayerIndex()));
+            mixPacketCaptureWord(signature, transaction.usesAsynchronousLanes());
+            mixPacketCaptureWord(signature, transaction.lanes().size());
+            for (const auto &lane : transaction.lanes())
+                mixPacketLaneCaptureIdentity(signature, lane);
+        }
+        return signature ? signature : 1u;
     }
 
     ComputeStageType MoEOverlayActivationReturnConsumeBatchStage::type() const

@@ -129,6 +129,10 @@ namespace llaminar2
         int activation_channel_row_capacity = 0;
         /** Main plus routed MTP graph families sharing each channel. */
         std::size_t activation_graph_family_count = 0;
+        /** Original schedule-owned prefill identities used by actual follower cache construction. */
+        std::vector<int> activation_prefill_graph_rows;
+        /** Same cold roster passed unchanged to channel layout and follower terminal creators. */
+        std::optional<MoEOverlayInferenceOriginalSlotGeometry> original_native_slots;
         /** Exact CPU evidence owners when the frozen Dynamic authority is host-resident. */
         std::optional<MoEOverlayHostDemandMemoryPlan> host_demand_memory;
         /** Complete frozen execution boundary, including parent PP and remote experts. */

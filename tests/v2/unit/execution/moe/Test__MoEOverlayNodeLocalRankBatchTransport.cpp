@@ -882,3 +882,47 @@ TEST(Test__MoEOverlayNodeLocalRankBatchTransport,
     EXPECT_EQ(source_context->total_collective_calls(), 0u);
     EXPECT_EQ(target_context->total_collective_calls(), 0u);
 }
+
+/** Original cold geometry prices one K-slot roster per actual participant, shared by families. */
+TEST(Test__MoEOverlayNodeLocalRankBatchTransport, OriginalNativeSlotLayoutUsesCanonicalRosterReplay)
+{
+    for(const int depth:{0,1,3,15})for(const std::size_t participants:{1u,2u,4u,8u})
+    {
+        const auto original=MoEOverlayInferenceOriginalSlotGeometry::forRetainedDraftCapacity(depth);
+        for(const std::size_t families:{1u,2u,4u})
+        {
+            SCOPED_TRACE(::testing::Message()<<"depth="<<depth<<" participants="<<participants<<" families="<<families);
+            MoEOverlayNodeLocalActivationLayoutGeometry geometry{
+                .participant_count=participants,.max_rows_per_participant=3u,
+                .max_entries_per_participant=6u,.d_model=4,.activation_graph_family_count=families};
+            const auto host=planMoEOverlayNodeLocalActivationLayout(geometry);
+            geometry.original_native_slots=original;
+            const auto native=planMoEOverlayNodeLocalActivationLayout(geometry);
+            ASSERT_TRUE(host.valid());ASSERT_TRUE(native.valid());
+            EXPECT_EQ(host.original_native_slots.bytes,0u);
+            EXPECT_EQ(native.original_native_slots.bytes,
+                participants*moeOverlayInferenceTransactionSlotCount(depth)*sizeof(MoEOverlayNativeInvocationSlot));
+            EXPECT_EQ(native.original_native_slots.offset%alignof(MoEOverlayNativeInvocationSlot),0u);
+            EXPECT_EQ(native.targetOwnedBytes(),host.targetOwnedBytes());
+            EXPECT_EQ(native.mapping_bytes-host.mapping_bytes,native.sourceOwnedBytes()-host.sourceOwnedBytes());
+            EXPECT_EQ(native,planMoEOverlayNodeLocalActivationLayout(geometry));
+        }
+    }
+    EXPECT_THROW((void)MoEOverlayInferenceOriginalSlotGeometry::forRetainedDraftCapacity(-1),std::invalid_argument);
+}
+
+/** Reject mismatched/aliased/incomplete native metadata without changing payload capacity. */
+TEST(Test__MoEOverlayNodeLocalRankBatchTransport, OriginalNativeSlotLayoutRejectsInvalidPhysicalViews)
+{
+    const auto layout=planMoEOverlayNodeLocalActivationLayout({
+        .participant_count=2u,.max_rows_per_participant=3u,.max_entries_per_participant=6u,
+        .d_model=4,.activation_graph_family_count=2u,
+        .original_native_slots=MoEOverlayInferenceOriginalSlotGeometry::forRetainedDraftCapacity(3)});
+    ASSERT_TRUE(layout.valid());
+    auto changed=layout;changed.original_native_slots.bytes=0u;EXPECT_FALSE(changed.valid());
+    changed=layout;changed.original_native_slots.offset=changed.activation_controls;EXPECT_FALSE(changed.valid());
+    changed=layout;changed.geometry.original_native_slots.reset();EXPECT_FALSE(changed.valid());
+    changed=layout;changed.geometry.original_native_slots=MoEOverlayInferenceOriginalSlotGeometry::forRetainedDraftCapacity(2);
+    EXPECT_FALSE(changed.valid());
+    changed=layout;changed.original_native_slots.offset=changed.metadata_pages.end();EXPECT_FALSE(changed.valid());
+}

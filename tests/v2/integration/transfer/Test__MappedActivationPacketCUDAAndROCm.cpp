@@ -5400,3 +5400,5 @@ TEST(Test__MappedActivationPacketCUDAAndROCm, ROCmChangedPublicationReplay)
     runChangedPublicationReplay<3, 4>(DeviceId::rocm(0));
     runChangedPublicationReplay<4>(DeviceId::rocm(0));
 }
+
+#include "MoERecurrentOriginalSlotPacketReplay.inc"

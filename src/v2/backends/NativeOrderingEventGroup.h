@@ -10,6 +10,7 @@ namespace llaminar2 {
 class GPUContextProvenance;
 class NativeOrderingEventBudgetProjection;
 class ReadAheadNativeParentTerminal;
+class OriginalSlotCaptureTerminals;
 class DeviceGraphExecutor;
 namespace qwen4exp {class ImmutableLookupSubmissionRetirement;namespace detail {class PooledNativeRootStorage;}}
 namespace test {struct NativeOrderingEventGroupReplayAccess;}
@@ -30,6 +31,7 @@ private:
     friend class qwen4exp::detail::PooledNativeRootStorage;
     friend class qwen4exp::ImmutableLookupSubmissionRetirement;
     friend class ReadAheadNativeParentTerminal;
+    friend class OriginalSlotCaptureTerminals;
     // The original cache owns its singleton native creator/destructor; this
     // friendship only brackets that existing handle with its admitted group.
     friend class DeviceGraphExecutor;

@@ -1,5 +1,9 @@
 # Six-GPU moving QFN MTP: focused checkpoint
 
+This records the historical fixed1 checkpoint. Recurrent fixed3/dynamic and
+additional cancellation qualification are recorded in the
+[November 6 focused result](QFN_RECURRENT_SIX_GPU_MTP_FOCUSED_QUALIFICATION_20261106.md).
+
 The fixed-depth-1 case passes on two RTX 3090 continuation GPUs and four MI50
 expert followers, with RAM ngrams and dynamic ordinal expert movement. This
 checkpoint includes the original stall repairs and the peer-cancellation fix.

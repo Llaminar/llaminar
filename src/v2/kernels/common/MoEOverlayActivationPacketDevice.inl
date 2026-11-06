@@ -14,6 +14,7 @@
 #pragma once
 
 #include "execution/moe/MoEOverlayActivationPacketABI.h"
+#include "execution/moe/MoEOverlayActivationAdmissionPublication.h"
 
 #include <cmath>
 #include <cstddef>
@@ -81,6 +82,21 @@ namespace llaminar2::moe_activation_packet_device
             address,
             __ATOMIC_ACQUIRE,
             __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+        return *address;
+#endif
+    }
+
+    /** @return Fresh original absorbing admission state after an unsuccessful grant attempt. */
+    __device__ __forceinline__ std::uint32_t loadSystemAcquire32(
+        const std::uint32_t *address) noexcept
+    {
+#if defined(__CUDA_ARCH__)
+        cuda::atomic_ref<std::uint32_t, cuda::thread_scope_system> reference(
+            *const_cast<std::uint32_t *>(address));
+        return reference.load(cuda::memory_order_acquire);
+#elif defined(__HIP_DEVICE_COMPILE__)
+        return __hip_atomic_load(address, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
 #else
         return *address;
 #endif
@@ -550,11 +566,23 @@ namespace llaminar2::moe_activation_packet_device
         const auto channel = snapshotPeerPublished(&control->channel);
         const auto identity = snapshotPeerPublished(&control->identity);
         const auto admission = snapshotPeerPublished(&control->admission);
+        const auto status = snapshotPeerPublished(
+            endpoint == MoEOverlayActivationEndpoint::Continuation
+                ? &control->continuation_status
+                : &control->follower_status);
+        // Revalidate generation BEFORE the final ready acquire. A cached prior
+        // ready word must never lend publication authority to a native rearm.
+        const bool current_publication = moeOverlayActivationAdmissionPublicationCurrent(
+            identity.epoch_generation,
+            [&]() { return loadSystemAcquire64(&control->identity.epoch_generation); },
+            [&]() { return loadSystemAcquire64(&control->admission.ready_signal); });
         if (channel.magic != kMoEOverlayActivationMagic ||
             channel.abi_version != kMoEOverlayActivationABIVersion || channel.channel_nonce == 0u ||
             channel.buffer_count != kMoEOverlayActivationBufferCount || channel.stage_count == 0u ||
             stage_ordinal >= channel.stage_count ||
             admission_timeline != kMoEOverlayActivationAdmissionTimeline ||
+            admission.ready_signal != kMoEOverlayActivationAdmissionTimeline ||
+            !current_publication ||
             admission.state != raw(MoEOverlayActivationAdmissionState::Armed) ||
             identity.epoch_generation == 0u || identity.stage_count != channel.stage_count ||
             identity.lane_ordinal != channel.lane_ordinal ||
@@ -583,10 +611,6 @@ namespace llaminar2::moe_activation_packet_device
             return false;
         }
 
-        const auto status = snapshotPeerPublished(
-            endpoint == MoEOverlayActivationEndpoint::Continuation
-                ? &control->continuation_status
-                : &control->follower_status);
         const auto state = static_cast<MoEOverlayActivationEndpointState>(
             status.state);
         return sameDigest(status.digest, identity.digest) &&
@@ -655,9 +679,12 @@ namespace llaminar2::moe_activation_packet_device
                 // Drain its retained graph so teardown does not leave a block
                 // polling an identity that the scheduler will never publish.
                 // Successful first-iteration admission performs no extra load.
-                if (loadSystemAcquire64(&control->admission.ready_signal) ==
-                    kMoEOverlayActivationAbortTimeline)
+                if (moeOverlayActivationAdmissionWaitAborted(
+                        loadSystemAcquire64(&control->admission.ready_signal),
+                        [&]() { return loadSystemAcquire32(&control->admission.state); }))
+                {
                     return false;
+                }
 #if defined(__CUDA_ARCH__)
                 __nanosleep(64u);
 #elif defined(__HIP_DEVICE_COMPILE__)
@@ -716,6 +743,7 @@ namespace llaminar2::moe_activation_packet_device
                 .code = raw(MoEOverlayActivationStatusCode::Success),
                 .graph_role = static_cast<MoEOverlayInferenceGraphRole>(
                     identity.graph_role),
+                .original_slot_index = identity.original_slot_index,
             };
         }
         return grant->digest.valid() && grant->generation != 0u &&

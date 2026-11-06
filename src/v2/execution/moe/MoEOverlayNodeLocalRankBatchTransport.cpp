@@ -190,6 +190,13 @@ namespace llaminar2
                 for (const std::int32_t layer : family.model_layer_indices)
                     mix(layer);
             }
+            if(config.activation_layout.geometry.original_native_slots)
+            {
+                // Capture/mapping identity includes the SAME immutable original
+                // roster geometry; host-ordered channels keep their old identity.
+                mix(config.activation_layout.geometry.original_native_slots->slotCount());
+                mix(config.activation_layout.geometry.original_native_slots->retainedDraftCapacity());
+            }
             hash = fnv1a(
                 hash,
                 config.channel_identity.data(),
@@ -316,6 +323,26 @@ namespace llaminar2
             return false;
         }
 
+        if (geometry.original_native_slots)
+        {
+            const auto count=geometry.original_native_slots->slotCount();
+            constexpr auto maximum=std::numeric_limits<std::size_t>::max();
+            if (geometry.participant_count>maximum/geometry.activation_graph_family_count ||
+                geometry.participant_count*geometry.activation_graph_family_count>maximum/sizeof(MoEOverlayActivationEpochControl) ||
+                activation_controls>maximum-geometry.participant_count*geometry.activation_graph_family_count*sizeof(MoEOverlayActivationEpochControl) ||
+                geometry.participant_count>maximum/count ||
+                geometry.participant_count*count>maximum/sizeof(MoEOverlayNativeInvocationSlot) ||
+                original_native_slots.bytes!=geometry.participant_count*count*sizeof(MoEOverlayNativeInvocationSlot) ||
+                !original_native_slots.validFor(mapping_bytes) ||
+                original_native_slots.offset<activation_controls+
+                    geometry.participant_count*geometry.activation_graph_family_count*sizeof(MoEOverlayActivationEpochControl) ||
+                original_native_slots.offset%alignof(MoEOverlayNativeInvocationSlot)!=0u ||
+                original_native_slots.end()>metadata_pages.end())
+                return false;
+        }
+        else if (original_native_slots.offset!=0u || original_native_slots.bytes!=0u)
+            return false;
+
         std::size_t cursor = shared_dispatch_pages.end();
         for (const auto &participant : participants)
         {
@@ -399,6 +426,17 @@ namespace llaminar2
                     "activation lane count"),
                 sizeof(MoEOverlayActivationEpochControl),
                 "activation epoch controls"));
+
+        if (geometry.original_native_slots)
+        {
+            // Original K is declared once per actual participant, not once per
+            // learned graph family. Payload banks retain their original owner.
+            const auto bytes=checkedMultiply(
+                checkedMultiply(geometry.participant_count,geometry.original_native_slots->slotCount(),
+                    "original native invocation slots"),
+                sizeof(MoEOverlayNativeInvocationSlot),"original native invocation metadata");
+            result.original_native_slots={appendRegion(bytes,alignof(MoEOverlayNativeInvocationSlot)),bytes};
+        }
 
         const size_t row_id_bytes = checkedMultiply(
             geometry.max_rows_per_participant,
@@ -851,6 +889,15 @@ namespace llaminar2
             if(family>=activation_family_count_)throw std::out_of_range("Original shared family controls are absent");
             return activation_controls_+family*participants_.size();
         }
+        /** @return Actual mapped original roster for this target, shared across learned families. */
+        std::span<MoEOverlayNativeInvocationSlot> originalNativeSlots(int participant_id) const
+        {
+            if(!layout_.geometry.original_native_slots)
+                throw std::logic_error("Original native metadata requested from a host-ordered channel");
+            const auto count=layout_.geometry.original_native_slots->slotCount();
+            auto* first=at<MoEOverlayNativeInvocationSlot>(layout_.original_native_slots.offset);
+            return {first+participantIndex(participant_id)*count,count};
+        }
         explicit Mapping(const MoEOverlayRankBatchTransportConfig &config)
             : participants_(config.workspace->participantIds()),
               max_rows_(config.max_rows_per_participant),
@@ -880,6 +927,7 @@ namespace llaminar2
                     .activation_graph_family_count =
                         activation_family_count_,
                     .return_layout = config.activation_layout.geometry.return_layout,
+                    .original_native_slots = config.activation_layout.geometry.original_native_slots,
                 });
             if (!config.activation_layout.valid() ||
                 config.activation_layout != expected_layout)
@@ -1825,6 +1873,128 @@ namespace llaminar2
         return mapped_region_->deviceAlias(device, offset);
     }
 
+    const std::optional<MoEOverlayInferenceOriginalSlotGeometry>&
+    MoEOverlayNodeLocalRankBatchTransport::originalNativeSlotGeometry() const noexcept
+    { return config_.activation_layout.geometry.original_native_slots; }
+
+    void MoEOverlayNodeLocalRankBatchTransport::bindOriginalNativeSlots(
+        std::shared_ptr<const MoEOverlayInferenceOriginalSlotDomain> domain)
+    {
+        const auto& geometry=originalNativeSlotGeometry();
+        if(!geometry || !domain || domain->geometry()!=*geometry ||
+            domain->topologyIdentity()!=config_.transaction_topology ||
+            config_.endpoint_scope!=MoEOverlayActivationEndpointScope::RankLocalGPU ||
+            !config_.mpi_ctx || config_.mpi_ctx->world_size()!=1 ||
+            std::any_of(config_.local_lanes.begin(),config_.local_lanes.end(),
+                [](const auto& lane){return !lane.device.is_gpu();}))
+            throw std::logic_error("Original native channel binding differs from its planned rank-local GPU roster/authority");
+        if(original_slot_domain_ && (original_slot_domain_.get()!=domain.get() ||
+            original_slot_domain_.owner_before(domain) || domain.owner_before(original_slot_domain_)))
+            throw std::logic_error("Original native channel cannot replace its retained original protocol domain");
+        original_slot_domain_=std::move(domain);
+    }
+
+    MoEOverlayNativeInvocationSlot& MoEOverlayNodeLocalRankBatchTransport::originalNativeRecord(
+        const MoEOverlayInferenceOriginalSlot& original,int target_participant_id) const
+    {
+        if(!original_slot_domain_ || original.domain().get()!=original_slot_domain_.get() ||
+            original.domain().owner_before(original_slot_domain_) || original_slot_domain_.owner_before(original.domain()))
+            throw std::logic_error("Original native invocation has a foreign or absent bound protocol authority");
+        original_slot_domain_->requireCurrent(original);
+        auto slots=mapping_->originalNativeSlots(target_participant_id);
+        if(original.index()>=slots.size())throw std::logic_error("Original native invocation index exceeds its admitted physical roster");
+        return slots[original.index()];
+    }
+
+    void MoEOverlayNodeLocalRankBatchTransport::requireOriginalNativeIdentity(
+        const MoEOverlayInferenceOriginalSlot& original,const MoEOverlayNativeInvocationSlot& record,
+        int target_participant_id,const MoEOverlayActivationEpochIdentity& identity) const
+    {
+        const auto published=std::atomic_ref(const_cast<std::uint64_t&>(record.published_generation)).load(std::memory_order_acquire);
+        if(record.abi_version!=kMoEOverlayNativeInvocationABIVersion ||
+            record.original_slot_index!=original.index() || identity.original_slot_index!=original.index() ||
+            published!=identity.epoch_generation || record.identity!=identity ||
+            identity.target_participant_id!=target_participant_id ||
+            identity.request_generation!=original.ticket().request_generation || identity.command_id!=original.ticket().command_id ||
+            identity.transaction_ordinal!=original.ticket().transaction_ordinal)
+            throw std::logic_error("Original native invocation immutable identity is stale, partial or relabelled");
+    }
+
+    MoEOverlayActivationEpochIdentity MoEOverlayNodeLocalRankBatchTransport::publishOriginalNativeInvocation(
+        const MoEOverlayInferenceOriginalSlot& original,int target_participant_id,std::size_t graph_family_ordinal,
+        std::uint64_t epoch_generation,std::uint64_t timeout_not_before_ns)
+    {
+        if(!timeout_not_before_ns)throw std::logic_error("Original native admission requires its original watchdog lower bound");
+        auto& record=originalNativeRecord(original,target_participant_id);
+        MoEOverlayActivationEpochProtocol immutable(activationEpochControl(target_participant_id,graph_family_ordinal),
+            activationEpochConfig(target_participant_id,graph_family_ordinal));
+        const auto identity=immutable.describeOriginalNativeSubmission(original,epoch_generation);
+        // Original Abort/retire cannot race the release publication. Only CPU
+        // immutable metadata writes occur under this original protocol lock.
+        original_slot_domain_->withActiveAdmission(original,[&] {
+            if(std::atomic_ref(record.published_generation).load(std::memory_order_acquire)!=0u)
+                throw std::logic_error("Original native invocation reused metadata before aggregate physical retirement");
+            record={};record.identity=identity;record.original_slot_index=original.index();
+            record.timeout_not_before_ns=timeout_not_before_ns;
+            std::atomic_ref(record.published_generation).store(epoch_generation,std::memory_order_release);
+        });
+        return identity;
+    }
+
+    void MoEOverlayNodeLocalRankBatchTransport::cancelOriginalNativeInvocation(
+        const MoEOverlayInferenceOriginalSlot& original,int target_participant_id,
+        const MoEOverlayActivationEpochIdentity& identity)
+    {
+        auto& record=originalNativeRecord(original,target_participant_id);
+        requireOriginalNativeIdentity(original,record,target_participant_id,identity);
+        std::atomic_ref(record.cancelled_generation).store(identity.epoch_generation,std::memory_order_release);
+        const auto family=identity.lane_ordinal/participantIds().size();
+        auto& control=activationEpochControl(target_participant_id,family);
+        if(control.channel.channel_nonce!=identity.channel_nonce)
+            throw std::logic_error("Original native cancellation changed its actual frozen channel");
+        // Failure is absorbing for every already issued invocation in this lane.
+        // It never clears state or manufactures successful packet completion.
+        std::atomic_ref(control.admission.code).store(static_cast<std::uint32_t>(MoEOverlayActivationStatusCode::ExplicitAbort),std::memory_order_relaxed);
+        std::atomic_ref(control.admission.state).store(static_cast<std::uint32_t>(MoEOverlayActivationAdmissionState::Failed),std::memory_order_release);
+        for(auto& bank:control.buffers) {
+            std::atomic_ref(bank.dispatch_signal.value).store(kMoEOverlayActivationAbortTimeline,std::memory_order_release);
+            std::atomic_ref(bank.return_signal.value).store(kMoEOverlayActivationAbortTimeline,std::memory_order_release);
+        }
+        std::atomic_ref(control.admission.ready_signal).store(kMoEOverlayActivationAbortTimeline,std::memory_order_release);
+    }
+
+    MoEOverlayActivationEpochTraffic MoEOverlayNodeLocalRankBatchTransport::completedOriginalNativeInvocation(
+        const MoEOverlayInferenceOriginalSlot& original,int target_participant_id,
+        const MoEOverlayActivationEpochIdentity& identity) const
+    {
+        const auto& record=originalNativeRecord(original,target_participant_id);
+        requireOriginalNativeIdentity(original,record,target_participant_id,identity);
+        if(std::atomic_ref(const_cast<std::uint64_t&>(record.cancelled_generation)).load(std::memory_order_acquire)!=0u ||
+            std::atomic_ref(const_cast<std::uint64_t&>(record.continuation.retired_generation)).load(std::memory_order_acquire)!=identity.epoch_generation ||
+            std::atomic_ref(const_cast<std::uint64_t&>(record.follower.retired_generation)).load(std::memory_order_acquire)!=identity.epoch_generation ||
+            !moeOverlayNativeInvocationEndpointRetired(record.continuation,identity) ||
+            !moeOverlayNativeInvocationEndpointRetired(record.follower,identity))
+            throw std::logic_error("Original native traffic requires two successful exact post-payload receipts");
+        std::string error;
+        const auto traffic=MoEOverlayActivationEpochProtocol::completedSnapshotTraffic(identity,identity.return_role,
+            record.continuation.status,record.follower.status,&error);
+        if(!traffic)throw std::logic_error("Original native traffic rejected immutable terminal snapshots: "+error);
+        return *traffic;
+    }
+
+    void MoEOverlayNodeLocalRankBatchTransport::clearOriginalNativeInvocation(
+        const MoEOverlayOriginalNativeInvocationRetirement& retired,int target_participant_id,
+        const MoEOverlayActivationEpochIdentity& identity)
+    {
+        const auto& original=retired.originalSlot();
+        auto& record=originalNativeRecord(original,target_participant_id);
+        requireOriginalNativeIdentity(original,record,target_participant_id,identity);
+        (void)completedOriginalNativeInvocation(original,target_participant_id,identity);
+        // The unforgeable runner permit follows ALL actual native observations.
+        // Current lane post-payload markers are separate and intentionally persist.
+        record={};
+    }
+
     MoEOverlayMappedActivationDeviceLane
     MoEOverlayNodeLocalRankBatchTransport::activationDeviceLane(
         int target_participant_id,
@@ -1886,6 +2056,16 @@ namespace llaminar2
                 "MoE activation lane has no endpoint-private device grant");
         }
 
+        MoEOverlayNativeInvocationDeviceBinding native;
+        if(originalNativeSlotGeometry()) {
+            const auto slots=mapping_->originalNativeSlots(target_participant_id);
+            if(slots.size()>std::numeric_limits<std::uint32_t>::max())
+                throw std::logic_error("Original native mapped roster exceeds its fixed-width capture ABI");
+            native={.policy=MoEOverlayActivationAdmissionPolicy::OriginalNativeSlots,
+                .original_slots=static_cast<MoEOverlayNativeInvocationSlot*>(alias(slots.data(),slots.size_bytes())),
+                .original_slot_count=static_cast<std::uint32_t>(slots.size())};
+        }
+
         MoEOverlayMappedActivationDeviceLane lane{
             .device = device,
             .target_participant_id = target_participant_id,
@@ -1901,6 +2081,8 @@ namespace llaminar2
             .control_device = static_cast<MoEOverlayActivationEpochControl *>(
                 alias(&control, sizeof(control))),
             .grant_device = (*grant_owner)->grant(),
+            .original_invocations = native,
+            .retained_stage_count = control.channel.stage_count,
             .grant_initialization_event =
                 (*grant_owner)->initializationEvent(),
             .dispatch = {

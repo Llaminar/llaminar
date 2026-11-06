@@ -2037,6 +2037,43 @@ extern "C"
 
 namespace llaminar2
 {
+
+    bool CUDAMoEKernel::beginOriginalMoEOverlayInvocation(
+        const MoEKernelLaunchContext &context,
+        const MoEOverlayOriginalNativeBeginLaunch &packet)
+    {
+        void *stream = explicitMoELaunchStream(context, "beginOriginalMoEOverlayInvocation");
+        return stream && packet.valid() &&
+            cudaMoEOverlayOriginalNativeBegin(&packet, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::retireOriginalMoEOverlayInvocation(
+        const MoEKernelLaunchContext &context,
+        const MoEOverlayOriginalNativeRetireLaunch &packet)
+    {
+        void *stream = explicitMoELaunchStream(context, "retireOriginalMoEOverlayInvocation");
+        return stream && packet.valid() &&
+            cudaMoEOverlayOriginalNativeRetire(&packet, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::retireOriginalMoEOverlayInvocationBatch(
+        const MoEKernelLaunchContext &context,
+        const MoEOverlayActivationSingleRowReturnBatchLaunch &packet)
+    {
+        void *stream = explicitMoELaunchStream(context, "retireOriginalMoEOverlayInvocationBatch");
+        return stream && packet.valid() &&
+            cudaMoEOverlayOriginalNativeRetireSingleRowBatch(&packet, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::retireOriginalMoEOverlayInvocationBatch(
+        const MoEKernelLaunchContext &context,
+        const MoEOverlayActivationMultiRowReturnBatchLaunch &packet)
+    {
+        void *stream = explicitMoELaunchStream(context, "retireOriginalMoEOverlayInvocationBatch");
+        return stream && packet.valid() &&
+            cudaMoEOverlayOriginalNativeRetireMultiRowBatch(&packet, device_ordinal_, stream);
+    }
+
     bool CUDAMoEKernel::packMoEOverlayActivationDispatch(
         const MoEKernelLaunchContext &launch,
         const MoEOverlayActivationDispatchPackLaunch &packet)

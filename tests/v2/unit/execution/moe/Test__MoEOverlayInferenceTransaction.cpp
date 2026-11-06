@@ -9,6 +9,7 @@
  */
 
 #include "execution/moe/MoEOverlayInferenceTransaction.h"
+#include "execution/moe/MoEOverlayInferenceOriginalSlot.h"
 #include "execution/moe/MoEOverlayInferenceTransactionService.h"
 #include "execution/moe/MoEOverlayDeviceControllerGraphService.h"
 #include "execution/moe/MoEExpertOwnerMap.h"
@@ -3454,3 +3455,145 @@ namespace llaminar2::test
 #include "RankLocalPublisherStateReplay.inc"
 
 #include "RankLocalSubmissionResetReplay.inc"
+
+namespace llaminar2::test
+{
+/** @test Native resource tokens consume actual original accepted/submitted slot ownership. */
+TEST(Test__MoEOverlayInferenceTransaction, OriginalNativeSlotsRequireExactSubmittedPublication)
+{
+    static_assert(!std::is_default_constructible_v<MoEOverlayInferenceOriginalSlot>);
+    static_assert(!std::is_copy_constructible_v<MoEOverlayInferenceTransactionProtocol>);
+    static_assert(!std::is_move_constructible_v<MoEOverlayInferenceTransactionProtocol>);
+    auto owner=protocol(moeOverlayInferenceTransactionSlotCount(3));
+    const auto domain=owner.originalSlotDomain();
+    EXPECT_EQ(domain->slotCount(),owner.slotCount());
+    ASSERT_TRUE(owner.beginCommand(command()));
+    const auto ticket=makeMoEOverlayInferenceExecutionTicket(topology(),command(),1,73,41,
+        MoEOverlayInferenceGraphRole::MainDecode,1,1,1);
+    EXPECT_THROW((void)owner.originalSubmittedSlot(ticket),std::invalid_argument);
+    const auto accepted=owner.accept(ticket);
+    ASSERT_TRUE(accepted.accepted());
+    EXPECT_THROW((void)owner.originalSubmittedSlot(ticket),std::invalid_argument);
+    ASSERT_TRUE(owner.markSubmitted(accepted.slot_index,ticket));
+    const auto token=owner.originalSubmittedSlot(ticket);
+    EXPECT_EQ(token.index(),accepted.slot_index);
+    EXPECT_EQ(token.ticket(),ticket);
+    EXPECT_EQ(token.domain(),domain);
+    EXPECT_NO_THROW(domain->requireCurrent(token));
+    EXPECT_NO_THROW(domain->requireActiveAdmission(token));
+    auto foreign=protocol(domain->slotCount());
+    EXPECT_THROW(foreign.originalSlotDomain()->requireCurrent(token),std::logic_error);
+    ASSERT_TRUE(owner.markReturnReady(accepted.slot_index,ticket));
+    EXPECT_NO_THROW(domain->requireCurrent(token));
+    EXPECT_THROW(domain->requireActiveAdmission(token),std::logic_error);
+    ASSERT_TRUE(owner.retire(accepted.slot_index,ticket));
+    EXPECT_THROW(domain->requireCurrent(token),std::logic_error);
+}
+
+/** @test Slot reuse/reset never authenticates a retained prior native publication. */
+TEST(Test__MoEOverlayInferenceTransaction, OriginalNativeSlotsRejectPriorWrappedAndResetTicketsReplay)
+{
+    for(const int depth:{1,3})
+    {
+        const auto count=moeOverlayInferenceTransactionSlotCount(depth);
+        MoEOverlayInferenceTransactionProtocol owner({.topology=topology(),.slot_count=count,
+            .max_request_count=4,.max_rows_per_request=16,.max_mtp_draft_depth=depth});
+        const auto domain=owner.originalSlotDomain();
+        for(std::uint64_t request=1;request<=3;++request)
+        {
+            const auto active=command(request,request,41);
+            ASSERT_TRUE(owner.beginCommand(active));
+            std::optional<MoEOverlayInferenceOriginalSlot> first;
+            for(std::uint64_t ordinal=1;ordinal<=count*2u+1u;++ordinal)
+            {
+                const auto ticket=makeMoEOverlayInferenceExecutionTicket(topology(),active,ordinal,ordinal,41,
+                    MoEOverlayInferenceGraphRole::MainDecode,1,1,1);
+                const auto accepted=owner.accept(ticket);ASSERT_TRUE(accepted.accepted());
+                ASSERT_TRUE(owner.markSubmitted(accepted.slot_index,ticket));
+                const auto token=owner.originalSubmittedSlot(ticket);
+                EXPECT_NO_THROW(domain->requireCurrent(token));
+                if(first) { EXPECT_THROW(domain->requireCurrent(*first),std::logic_error); }
+                else { first=token; }
+                ASSERT_TRUE(owner.markReturnReady(accepted.slot_index,ticket));
+                ASSERT_TRUE(owner.retire(accepted.slot_index,ticket));
+                EXPECT_THROW(domain->requireCurrent(token),std::logic_error);
+            }
+            const auto done=makeMoEOverlayInferenceTerminalTicket(topology(),active,count*2u+2u,41,
+                MoEOverlayInferenceTransactionAction::Complete);
+            EXPECT_TRUE(owner.accept(done).completed());
+            EXPECT_THROW(domain->requireCurrent(*first),std::logic_error);
+        }
+    }
+}
+
+/** @test Aborted work retains native teardown ownership; owner withdrawal invalidates every borrow. */
+TEST(Test__MoEOverlayInferenceTransaction, OriginalNativeSlotsRetainAbortDrainAndWithdrawOwner)
+{
+    std::optional<MoEOverlayInferenceOriginalSlot> retained;
+    std::shared_ptr<const MoEOverlayInferenceOriginalSlotDomain> domain;
+    {
+        auto owner=protocol(moeOverlayInferenceTransactionSlotCount(3));
+        domain=owner.originalSlotDomain();
+        const auto active=command();ASSERT_TRUE(owner.beginCommand(active));
+        const auto ticket=makeMoEOverlayInferenceExecutionTicket(topology(),active,1,73,41,
+            MoEOverlayInferenceGraphRole::MainDecode,1,1,1);
+        const auto accepted=owner.accept(ticket);ASSERT_TRUE(accepted.accepted());
+        ASSERT_TRUE(owner.markSubmitted(accepted.slot_index,ticket));
+        retained=owner.originalSubmittedSlot(ticket);
+        const auto abort=makeMoEOverlayInferenceTerminalTicket(topology(),active,2,41,
+            MoEOverlayInferenceTransactionAction::Abort,17);
+        EXPECT_EQ(owner.accept(abort).status,MoEOverlayInferenceAdmissionStatus::Aborted);
+        EXPECT_NO_THROW(domain->requireCurrent(*retained));
+        EXPECT_THROW(domain->requireActiveAdmission(*retained),std::logic_error);
+        EXPECT_THROW((void)owner.originalSubmittedSlot(ticket),std::invalid_argument);
+    }
+    EXPECT_THROW(domain->requireCurrent(*retained),std::logic_error);
+}
+}
+
+namespace llaminar2::test
+{
+/** @test Immutable publication and absorbing Abort share the original metadata lock. */
+TEST(Test__MoEOverlayInferenceTransaction, OriginalNativeSlotsSerializePublicationWithAbortReplay)
+{
+    for (int replay = 0; replay < 20; ++replay)
+    {
+        auto owner = protocol(moeOverlayInferenceTransactionSlotCount(3));
+        const auto active = command();
+        ASSERT_TRUE(owner.beginCommand(active));
+        const auto ticket = makeMoEOverlayInferenceExecutionTicket(
+            topology(), active, 1, 73, 41, MoEOverlayInferenceGraphRole::MainDecode, 1, 1, 1);
+        const auto accepted = owner.accept(ticket);
+        ASSERT_TRUE(accepted.accepted());
+        ASSERT_TRUE(owner.markSubmitted(accepted.slot_index, ticket));
+        const auto token = owner.originalSubmittedSlot(ticket);
+        std::atomic<bool> publication_started{false};
+        std::atomic<bool> abort_attempted{false};
+        std::atomic<bool> published{false};
+        bool abort_observed_publication = false;
+        const auto abort = makeMoEOverlayInferenceTerminalTicket(
+            topology(), active, 2, 41, MoEOverlayInferenceTransactionAction::Abort, 17);
+        std::thread cancellation([&] {
+            while (!publication_started.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            abort_attempted.store(true, std::memory_order_release);
+            (void)owner.accept(abort);
+            abort_observed_publication = published.load(std::memory_order_acquire);
+        });
+        token.domain()->withActiveAdmission(token, [&] {
+            publication_started.store(true, std::memory_order_release);
+            while (!abort_attempted.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            published.store(true, std::memory_order_release);
+        });
+        cancellation.join();
+        EXPECT_TRUE(abort_observed_publication);
+        bool late_publication = false;
+        EXPECT_THROW(token.domain()->withActiveAdmission(token, [&] {
+            late_publication = true;
+        }), std::logic_error);
+        EXPECT_FALSE(late_publication);
+        EXPECT_NO_THROW(token.domain()->requireCurrent(token));
+    }
+}
+}

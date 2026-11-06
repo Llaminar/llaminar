@@ -423,3 +423,124 @@ TEST(Test__MoEOverlayInferenceTransaction, RankLocalCallablePublisherAbortRetain
         [](std::string *) { ADD_FAILURE() << "Already observed native terminal was waited again"; return false; }, &error));
 }
 } // namespace llaminar2::test
+
+namespace llaminar2::test {
+/**
+ * @test The sole cold protocol retains submitted native ownership after Abort,
+ * while a queued closure cannot turn that ownership into new execution.
+ * Callback receipts here prove host protocol ordering only, not GPU completion.
+ */
+TEST(Test__MoEOverlayInferenceTransaction, RankLocalColdOriginalSlotsRejectQueuedAdmissionBeforeDrain)
+{
+    LocalPublicationState state(localPublicationConfig());
+    const auto domain = state.originalSlotDomain();
+    ASSERT_NE(domain, nullptr);
+    EXPECT_EQ(domain->slotCount(), state.slotCount());
+    std::string error;
+    const MoEOverlayInferenceCommandIdentity command{1u, 1u, 41u};
+    ASSERT_TRUE(state.begin(command, &error)) << error;
+    std::optional<MoEOverlayInferenceOriginalSlot> submitted;
+    const auto handle = state.publish(localPublicationDescriptor(0, 1u, 41u),
+        [&](const auto &ticket, std::string *)
+        {
+            submitted = state.originalSubmittedSlot(ticket);
+            EXPECT_EQ(submitted->domain().get(), domain.get());
+            domain->requireActiveAdmission(*submitted);
+            return true;
+        });
+    ASSERT_TRUE(handle.ok) << handle.error;
+    ASSERT_TRUE(submitted);
+    std::promise<void> release_queued;
+    auto ready = release_queued.get_future();
+    auto queued = std::async(std::launch::async, [&]
+    {
+        ready.get();
+        domain->requireActiveAdmission(*submitted);
+    });
+    unsigned drains = 0u;
+    EXPECT_FALSE(state.abort(41u, 17, [&](std::string *diagnostic)
+    {
+        ++drains;
+        // Original channel abort must be published by the real adapter before
+        // this native join. New execution is already closed by SAME protocol.
+        release_queued.set_value();
+        EXPECT_THROW(queued.get(), std::logic_error);
+        EXPECT_NO_THROW(domain->requireCurrent(*submitted));
+        *diagnostic = "original source cancellation remains failed";
+        return false;
+    }, &error));
+    EXPECT_TRUE(state.active());
+    EXPECT_EQ(error, "original source cancellation remains failed");
+    EXPECT_FALSE(state.abort(41u, 17, [&](std::string *diagnostic)
+    {
+        ++drains;
+        EXPECT_NO_THROW(domain->requireCurrent(*submitted));
+        EXPECT_THROW(domain->requireActiveAdmission(*submitted), std::logic_error);
+        *diagnostic = "original source cancellation remains failed";
+        return false;
+    }, &error));
+    EXPECT_EQ(drains, 2u);
+    EXPECT_TRUE(state.active());
+    EXPECT_FALSE(state.complete(41u, 0u, &error));
+    EXPECT_FALSE(state.begin({2u, 2u, 41u}, &error));
+}
+} // namespace llaminar2::test
+
+namespace llaminar2::test {
+/** @test The actual aggregate visitor retains every original slot through all proof phases. */
+TEST(Test__MoEOverlayInferenceTransaction, RankLocalOriginalAggregateObservesEverySlotBeforeRetiringAny)
+{
+    LocalPublicationState state(localPublicationConfig());
+    const auto domain = state.originalSlotDomain();
+    std::string error;
+    ASSERT_TRUE(state.begin({1u, 1u, 41u}, &error));
+    std::vector<MoEOverlayPublishedInferenceTransaction> handles;
+    std::vector<MoEOverlayInferenceOriginalSlot> tokens;
+    for (std::uint64_t step = 0u; step < 3u; ++step)
+    {
+        auto handle = state.publish(localPublicationDescriptor(0, step, 41u),
+            [&](const auto &ticket, std::string *)
+            {
+                tokens.push_back(state.originalSubmittedSlot(ticket));
+                return true;
+            });
+        ASSERT_TRUE(handle.ok) << handle.error;
+        handles.push_back(handle);
+    }
+    std::vector<std::uint64_t> attempted;
+    EXPECT_FALSE(state.observeOriginalActive([&](const auto &handle, std::string *diagnostic)
+    {
+        attempted.push_back(handle.ticket.transaction_ordinal);
+        for (const auto &token : tokens) domain->requireCurrent(token);
+        if (handle.ticket.transaction_ordinal == 2u)
+        {
+            *diagnostic = "first original native observation failed";
+            return false;
+        }
+        return true;
+    }, &error));
+    EXPECT_EQ(error, "first original native observation failed");
+    EXPECT_EQ(attempted, (std::vector<std::uint64_t>{1u, 2u, 3u}));
+    for (const auto &token : tokens) EXPECT_NO_THROW(domain->requireCurrent(token));
+    std::vector<std::pair<unsigned, std::uint64_t>> phases;
+    for (const unsigned phase : {0u, 1u, 2u})
+        ASSERT_TRUE(state.observeOriginalActive([&](const auto &handle, std::string *)
+        {
+            // The real adapter invokes this same visitor independently for ALL
+            // cache proofs, ALL immutable packet proofs, then metadata clears.
+            for (const auto &token : tokens) domain->requireCurrent(token);
+            phases.emplace_back(phase, handle.ticket.transaction_ordinal);
+            return true;
+        }, &error));
+    EXPECT_EQ(phases, (std::vector<std::pair<unsigned, std::uint64_t>>{
+        {0u,1u},{0u,2u},{0u,3u},{1u,1u},{1u,2u},{1u,3u},{2u,1u},{2u,2u},{2u,3u}}));
+    for (std::size_t index = 0u; index < handles.size(); ++index)
+    {
+        ASSERT_TRUE(state.retire(handles[index], [](std::string *) { return true; }, &error));
+        EXPECT_THROW(domain->requireCurrent(tokens[index]), std::logic_error);
+        for (std::size_t later = index + 1u; later < tokens.size(); ++later)
+            EXPECT_NO_THROW(domain->requireCurrent(tokens[later]));
+    }
+    EXPECT_TRUE(state.complete(41u, 0u, &error));
+}
+} // namespace llaminar2::test

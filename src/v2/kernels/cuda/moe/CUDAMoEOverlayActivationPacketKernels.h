@@ -129,4 +129,29 @@ extern "C"
         const llaminar2::MoENodeLocalDensePublicationLaunch *launch,
         int device_ordinal,
         void *stream);
+
+    /** @brief Enqueue exact original-slot begin on its original stream. */
+    bool cudaMoEOverlayOriginalNativeBegin(
+        const llaminar2::MoEOverlayOriginalNativeBeginLaunch *launch,
+        int device_ordinal,
+        void *stream);
+
+    /** @brief Enqueue exact original-slot retire on its original stream. */
+    bool cudaMoEOverlayOriginalNativeRetire(
+        const llaminar2::MoEOverlayOriginalNativeRetireLaunch *launch,
+        int device_ordinal,
+        void *stream);
+
+    /** @brief Enqueue exact original-slot retiresinglerowbatch on its original stream. */
+    bool cudaMoEOverlayOriginalNativeRetireSingleRowBatch(
+        const llaminar2::MoEOverlayActivationSingleRowReturnBatchLaunch *launch,
+        int device_ordinal,
+        void *stream);
+
+    /** @brief Enqueue exact original-slot retiremultirowbatch on its original stream. */
+    bool cudaMoEOverlayOriginalNativeRetireMultiRowBatch(
+        const llaminar2::MoEOverlayActivationMultiRowReturnBatchLaunch *launch,
+        int device_ordinal,
+        void *stream);
+
 }

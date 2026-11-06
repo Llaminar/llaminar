@@ -2,6 +2,7 @@
  * @brief Select supported-backend resource-family allowances and retain original live ownership metadata.
  */
 #include "NativeAuxiliaryResourceCatalog.h"
+#include <limits>
 #include "NativeAuxiliaryQualifiedLimits.h"
 #include "GPUDeviceContextPool.h"
 #include "PooledRemoteGraphHostAllowance.h"
@@ -25,7 +26,9 @@ std::string NativeAuxiliaryRemoteFamilyScope::identity()const{
 std::string NativeAuxiliaryResourceProgram::identity()const{
     if(isReadAheadSide())return "side-stream1-ordering2-v1";
     if(isPooledRemoteOwner())return remoteProgramClass().identity();
-    return "ordering-v1:"+std::to_string(static_cast<unsigned>(orderingProgram().kind()))+":"+std::to_string(orderingProgram().nonemptyRootMask());
+    return "ordering-v1:"+std::to_string(static_cast<unsigned>(orderingProgram().kind()))+":"+std::to_string(orderingProgram().nonemptyRootMask())+
+        (orderingProgram().kind()==NativeOrderingEventProgram::Kind::RetainedCaptureTerminals
+            ? ":events="+std::to_string(orderingProgram().orderingEvents()):std::string{});
 }
 const std::string& NativeAuxiliaryResourceCatalog::resourceSourceIdentity(){static const std::string value="native-auxiliary-operations";return value;}
 std::string NativeAuxiliaryResourceCatalog::portableSourceIdentity(const NativeContextBirthKey& k){
@@ -43,6 +46,18 @@ NativeAuxiliaryResourceAllowance NativeAuxiliaryResourceCatalog::selectAllowance
     NativeAuxiliaryResourceProgram program,std::span<const detail::NativeAuxiliaryQualifiedClass> rows){
     if(backend!=DeviceType::CUDA && backend!=DeviceType::ROCm)
         throw std::invalid_argument("Native auxiliary allowance requires a supported GPU backend");
+    // The same ordinary ordering-event native operation is repeated over the
+    // original admitted slot roster. Scale its installed UNIT allowance here,
+    // once, rather than treating one fixture's borrowed population as many.
+    if(program.isOrdering() && program.orderingProgram().kind()==NativeOrderingEventProgram::Kind::RetainedCaptureTerminals){
+        auto unit=selectAllowance(backend,NativeAuxiliaryResourceProgram::ordering(
+            NativeOrderingEventProgram::lookupSubmissionRetirement()),rows);
+        const auto count=program.orderingProgram().orderingEvents();
+        if(!count || count>std::numeric_limits<std::size_t>::max()/unit.hostBytes ||
+            (unit.deviceBytes && count>std::numeric_limits<std::size_t>::max()/unit.deviceBytes))
+            throw std::overflow_error("Original capture terminal event population allowance overflow");
+        unit.hostBytes*=count;unit.deviceBytes*=count;unit.program=program;return unit;
+    }
     // Exact capture terminals perform the SAME ordinary one-event operation:
     // timing-disabled create, record, wait/query and destroy. Reuse the
     // certified unit bound, not the read-ahead fixture's borrowed population.

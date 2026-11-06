@@ -23,6 +23,7 @@
 #include "MoEOverlayActivationEpochABI.h"
 #include "MoEOverlayActivationPayloadLayout.h"
 #include "DeviceMoEOverlayEpochABI.h"
+#include "MoEOverlayNativeInvocationABI.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -80,6 +81,8 @@ namespace llaminar2
          */
         MoEOverlayInferenceGraphRole graph_role =
             MoEOverlayInferenceGraphRole::None;
+        /** Same original native slot copied with the generation-authenticated grant. */
+        std::uint32_t original_slot_index = kMoEOverlayActivationOriginalNoSlot;
         /** Actual bytes written by the group's sole shared-row publisher. */
         std::uint64_t published_shared_hidden_bytes = 0u;
     };
@@ -389,6 +392,8 @@ namespace llaminar2
         MoEOverlayActivationEpochControl *control = nullptr; ///< Exact mapped lane control.
         MoEOverlayActivationDeviceEpochGrant *grant = nullptr; ///< Continuation-local epoch state.
         std::int32_t target_participant_id = -1; ///< Logical destination selected by planning.
+        MoEOverlayNativeInvocationDeviceBinding original_invocations{}; ///< Same original native roster.
+        std::uint32_t retained_stage_count=0u; ///< Frozen actual family manifest length.
         std::int32_t physical_rows = 0; ///< Captured row capacity of the source graph.
         std::uint32_t stage_ordinal = 0u; ///< Ordered stage in the retained transaction.
         std::int32_t model_layer_index = -1; ///< Layer embedded at this stage ordinal.
@@ -402,7 +407,9 @@ namespace llaminar2
         [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool valid()
             const noexcept
         {
-            return hidden_rows_fp32 && route_expert_ids_fp32 && route_weights &&
+            return original_invocations.valid() &&
+                   (!original_invocations.deviceOwned() || (retained_stage_count!=0u && stage_ordinal<retained_stage_count)) &&
+                   hidden_rows_fp32 && route_expert_ids_fp32 && route_weights &&
                    placement.valid() &&
                    ((shared_row_controls == nullptr) == (shared_row_target_count == 0u)) &&
                    (!shared_row_writer ||
@@ -472,6 +479,8 @@ namespace llaminar2
         MoEOverlayMappedReturnDeviceView returned{}; ///< Shared canonical destination.
         MoEOverlayActivationEpochControl *control = nullptr; ///< Exact mapped lane control.
         MoEOverlayActivationDeviceEpochGrant *grant = nullptr; ///< Follower-local epoch state.
+        MoEOverlayNativeInvocationDeviceBinding original_invocations{}; ///< Same original native roster.
+        std::uint32_t retained_stage_count=0u; ///< Frozen actual family manifest length.
         std::int32_t physical_rows = 0; ///< Captured follower row capacity.
         std::uint32_t stage_ordinal = 0u; ///< Ordered stage in the transaction.
         std::int32_t model_layer_index = -1; ///< Expected layer identity.
@@ -480,7 +489,9 @@ namespace llaminar2
         [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool valid()
             const noexcept
         {
-            return local_canonical_route_contributions_fp32 &&
+            return original_invocations.valid() &&
+                   (!original_invocations.deviceOwned() || (retained_stage_count!=0u && stage_ordinal<retained_stage_count)) &&
+                   local_canonical_route_contributions_fp32 &&
                    dispatch.valid() &&
                    returned.valid() && control && grant && physical_rows > 0 &&
                    dispatch.d_model == returned.d_model &&
@@ -508,6 +519,8 @@ namespace llaminar2
         MoEOverlayActivationDeviceEpochGrant *grant = nullptr; ///< Continuation-local epoch state.
         /** Continuation `[physical_rows * top_k, d_model]` route bank. */
         float *canonical_route_contributions_fp32 = nullptr;
+        MoEOverlayNativeInvocationDeviceBinding original_invocations{}; ///< Same original native roster.
+        std::uint32_t retained_stage_count=0u; ///< Frozen actual family manifest length.
         std::int32_t physical_rows = 0; ///< Captured destination row capacity.
         std::uint32_t stage_ordinal = 0u; ///< Ordered stage in the transaction.
         std::int32_t model_layer_index = -1; ///< Expected layer identity.
@@ -516,7 +529,9 @@ namespace llaminar2
         [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool valid()
             const noexcept
         {
-            return dispatch.valid() && returned.valid() &&
+            return original_invocations.valid() &&
+                   (!original_invocations.deviceOwned() || (retained_stage_count!=0u && stage_ordinal<retained_stage_count)) &&
+                   dispatch.valid() && returned.valid() &&
                    dispatch.d_model == returned.d_model && control && grant &&
                    canonical_route_contributions_fp32 && physical_rows > 0 &&
                    static_cast<std::size_t>(physical_rows) *
@@ -792,6 +807,39 @@ namespace llaminar2
                   MoEOverlayMappedDispatchDeviceView>);
     static_assert(std::is_trivially_copyable_v<
                   MoEOverlayActivationDeviceEpochGrant>);
+    /** @brief Source-only native rearm at stage zero, before the original admission wait. */
+    struct MoEOverlayOriginalNativeBeginLaunch
+    {
+        MoEOverlayNativeInvocationDeviceBinding original_invocations;
+        MoEOverlayActivationEpochControl* control=nullptr;
+        MoEOverlayActivationDeviceEpochGrant* grant=nullptr;
+        std::int32_t physical_rows=0;
+        std::uint32_t retained_stage_count=0u;
+        /** @return Complete original native source metadata, independent of live payload counts. */
+        [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool valid()const noexcept {
+            return original_invocations.valid() && original_invocations.deviceOwned() &&
+                control && grant && physical_rows>0 && retained_stage_count!=0u;
+        }
+    };
+
+    /** @brief Actual post-payload endpoint publication, called only at the final stage. */
+    struct MoEOverlayOriginalNativeRetireLaunch
+    {
+        MoEOverlayNativeInvocationDeviceBinding original_invocations;
+        MoEOverlayActivationEpochControl* control=nullptr;
+        MoEOverlayActivationDeviceEpochGrant* grant=nullptr;
+        MoEOverlayActivationEndpoint endpoint=MoEOverlayActivationEndpoint::Continuation;
+        std::int32_t physical_rows=0;
+        std::uint32_t stage_ordinal=0u;
+        std::uint32_t retained_stage_count=0u;
+        /** @return Complete exact terminal stage; semantic Complete alone is not a receipt. */
+        [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool valid()const noexcept {
+            return original_invocations.valid() && original_invocations.deviceOwned() && control && grant &&
+                physical_rows>0 && retained_stage_count!=0u && stage_ordinal+1u==retained_stage_count &&
+                (endpoint==MoEOverlayActivationEndpoint::Continuation || endpoint==MoEOverlayActivationEndpoint::Follower);
+        }
+    };
+
     static_assert(sizeof(MoEOverlayActivationDeviceEpochGrant) == 128u);
     static_assert(std::is_trivially_copyable_v<
                   MoEOverlayMappedReturnDeviceView>);

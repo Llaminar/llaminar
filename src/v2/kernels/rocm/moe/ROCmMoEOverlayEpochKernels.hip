@@ -410,6 +410,14 @@ namespace
         {
             const std::uint64_t ready =
                 systemAcquire64(&control->admission.ready_signal);
+            // Admission Abort is terminal for every issued invocation. An
+            // older packet may still publish its ordinary bank timeline while
+            // draining, so a reusable bank signal cannot be the sole abort
+            // authority for a queued successor whose source will never run.
+            if (ready == llaminar2::kMoEOverlayActivationAbortTimeline)
+            {
+                return false;
+            }
             const std::uint64_t generation =
                 systemAcquire64(&control->identity.epoch_generation);
             if (ready < llaminar2::kMoEOverlayActivationAdmissionTimeline ||

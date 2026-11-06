@@ -11,6 +11,8 @@
 #include "MoEOverlayActivationChannelPlan.h"
 
 #include "MoEOverlayActivationPacketABI.h"
+#include "MoEOverlayFollowerRowGeometry.h"
+#include <array>
 
 #include <algorithm>
 #include <limits>
@@ -193,6 +195,48 @@ namespace llaminar2
             });
     }
 
+    std::size_t MoEOverlayActivationChannelPlanner::followerCaptureCacheCount(
+        int maximum_rows, const MoEOverlayInferenceGraphFamilyIdentity& family,
+        std::span<const int> prefill_rows)
+    {
+        if (!family.valid() || maximum_rows <= 0)
+            throw std::invalid_argument("Follower terminal roster requires the original graph family");
+        // This count-only projection uses no backing authority. Row identity
+        // depends solely on exact execution bounds; PGR separately validates
+        // the same manifest against its actual retained serial arena capacities.
+        const std::array<std::size_t, 1> count_backing{static_cast<std::size_t>(maximum_rows)};
+        auto count = MoEOverlayFollowerRowGeometry::declare(maximum_rows,
+            family.max_decode_rows, prefill_rows, count_backing).shapes().size();
+        const auto draft_count = MoEOverlayFollowerRowGeometry::declareDraft(
+            family.max_request_count, count_backing).shapes().size();
+        for (const auto source_layer : family.mtp_source_layers)
+        {
+            (void)source_layer; // One cache manifest per actual learned source family.
+            count = checkedAdd(count, draft_count, "follower terminal cache roster");
+        }
+        return count;
+    }
+
+    std::optional<MoEOverlayInferenceOriginalSlotGeometry>
+    MoEOverlayActivationChannelPlanner::originalNativeSlotGeometry(
+        const MoERoutedExpertPlacementPlan& placement,
+        const ClusterInventory& inventory,
+        const MoEOverlayInferenceGraphFamilyIdentity& family)
+    {
+        if (!family.valid())
+            throw std::invalid_argument("Native activation slots require the original retained graph family");
+        (void)rankIndex(inventory);
+        const auto participants = MoEOverlayCapacityAdmission::boundParticipants(placement);
+        if (inventory.world_size != 1 ||
+            placement.authority_execution != MoEOverlayAuthorityExecutionKind::DeviceResident ||
+            !std::all_of(participants.begin(), participants.end(), [](const auto& participant) {
+                return participant.world_rank == 0 && participant.device.is_gpu();
+            }) || !requiresActivationChannels(placement))
+            return std::nullopt;
+        return MoEOverlayInferenceOriginalSlotGeometry::forRetainedDraftCapacity(
+            family.max_mtp_draft_depth);
+    }
+
     MoEOverlayActivationChannelPlan
     MoEOverlayActivationChannelPlanner::plan(
         const MoEOverlayActivationChannelPlannerInput &input)
@@ -208,8 +252,15 @@ namespace llaminar2
 
         const auto &placement = *input.placement_plan;
         const auto rank_by_id = rankIndex(*input.cluster_inventory);
+        if (input.original_native_slots &&
+            (input.cluster_inventory->world_size != 1 ||
+             placement.authority_execution != MoEOverlayAuthorityExecutionKind::DeviceResident))
+            throw std::invalid_argument("Native activation slots require their original world-one device authority");
         const auto participants =
             MoEOverlayCapacityAdmission::boundParticipants(placement);
+        if (input.original_native_slots && !std::all_of(participants.begin(), participants.end(),
+                [](const auto& participant) { return participant.world_rank == 0 && participant.device.is_gpu(); }))
+            throw std::invalid_argument("Native activation slots cannot bind CPU, mixed or remote participants");
         const int source_participant_id =
             placement.continuation_domain_spec.logical_root_participant;
         const auto source = std::find_if(
@@ -406,6 +457,7 @@ namespace llaminar2
                     .return_layout = source->device.is_cpu()
                         ? MoEOverlayReturnLayout::CanonicalExpertRoutes
                         : MoEOverlayReturnLayout::ParticipantTokenPartials,
+                    .original_native_slots = input.original_native_slots,
                 });
             auto &source_host_bytes = charge_by_resource[PhysicalKey{
                 source->world_rank, DeviceId::cpu()}];

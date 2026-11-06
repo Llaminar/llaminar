@@ -536,10 +536,13 @@ namespace llaminar2::test
     }
 
     /**
-     * @brief Replay absorbing abort before generation, normal successor, and ready abort through one capture.
+     * @brief Replay authoritative admission abort despite overwritten bank signals through one capture.
      *
      * Input metadata is reset only between terminally observed replays. Neither
      * an absent successor nor unready admission can hide the original abort.
+     * Generation-zero, completed-prior/no-successor, and issued-successor inputs
+     * retain ordinary cleared/published bank words after authoritative Abort;
+     * all must reject without acquiring a reader or manufacturing a valid ticket.
      */
     TEST_F(CUDAMoEOverlayEpochTest, CapturedPeerAbortBeforeGenerationAndSuccessorReplay)
     {
@@ -572,21 +575,62 @@ namespace llaminar2::test
         const auto ended=cudaStreamEndCapture(inference_stream_,&graph);
         ASSERT_TRUE(acquired && released);ASSERT_EQ(copied,cudaSuccess);ASSERT_EQ(ended,cudaSuccess);
         ASSERT_EQ(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0),cudaSuccess);
+        // These are protocol input frontiers, not alternate execution paths.
+        // An already-issued graph's ordinary drain can overwrite a BANK signal
+        // after cancellation. The original ADMISSION Abort must remain absorbing
+        // without requiring any successor source generation or a second Abort.
+        struct Trace {
+            const char *name;
+            std::uint64_t previous,generation,ready,dispatch;
+            bool normal,completed_prior;
+        };
         for(std::uint64_t repeat=0;repeat<20;++repeat){
-            for(int trace=0;trace<3;++trace){
-                const bool normal=trace==1;
+            const std::uint64_t previous=repeat*3u+7u;
+            const auto published=moeOverlayActivationLeasedTimelineValue(moeOverlayActivationBufferVisit(0u));
+            const std::array traces{
+                Trace{"bank_abort_before_successor",previous,previous,0u,kMoEOverlayActivationAbortTimeline,false,false},
+                Trace{"normal_successor",previous,previous+1u,kMoEOverlayActivationAdmissionTimeline,published,true,false},
+                Trace{"bank_abort_after_ready",previous,previous+1u,kMoEOverlayActivationAdmissionTimeline,kMoEOverlayActivationAbortTimeline,false,false},
+                Trace{"admission_abort_generation0_bank_cleared",0u,0u,kMoEOverlayActivationAbortTimeline,0u,false,false},
+                Trace{"admission_abort_generation0_bank_published",0u,0u,kMoEOverlayActivationAbortTimeline,published,false,false},
+                Trace{"admission_abort_completed_prior_bank_cleared",previous,previous,kMoEOverlayActivationAbortTimeline,0u,false,true},
+                Trace{"admission_abort_completed_prior_bank_published",previous,previous,kMoEOverlayActivationAbortTimeline,published,false,true},
+                Trace{"admission_abort_issued_successor_bank_cleared",previous,previous+1u,kMoEOverlayActivationAbortTimeline,0u,false,true},
+                Trace{"admission_abort_issued_successor_bank_published",previous,previous+1u,kMoEOverlayActivationAbortTimeline,published,false,true},
+            };
+            for(const auto &trace:traces){
+                SCOPED_TRACE(::testing::Message()<<"repeat="<<repeat<<" trace="<<trace.name);
+                const bool normal=trace.normal;
                 *host_control={};host_control->channel.stage_count=1u;
-                const std::uint64_t previous=repeat*3u+7u;
-                host_control->identity.epoch_generation=trace==0?previous:previous+1u;
-                host_control->identity.digest={0x1234u+repeat,0x5678u};
-                host_control->admission.ready_signal=trace==0?0u:kMoEOverlayActivationAdmissionTimeline;
+                host_control->identity.epoch_generation=trace.generation;
+                if(trace.generation)host_control->identity.digest={0x1234u+repeat,0x5678u};
+                host_control->admission.last_generation=trace.generation;
+                if(trace.ready==kMoEOverlayActivationAbortTimeline) {
+                    host_control->admission.state=static_cast<std::uint32_t>(MoEOverlayActivationAdmissionState::Failed);
+                    host_control->admission.code=static_cast<std::uint32_t>(MoEOverlayActivationStatusCode::ExplicitAbort);
+                }
                 auto& descriptor=host_control->buffers[0].dispatch_descriptor;
-                descriptor.digest=host_control->identity.digest;
-                descriptor.timeline=moeOverlayActivationLeasedTimelineValue(1u);
-                descriptor.placement_epoch=1u;descriptor.stage_ordinal=0u;
-                std::atomic_ref<std::uint64_t>(host_control->buffers[0].dispatch_signal.value).store(
-                    normal?descriptor.timeline:kMoEOverlayActivationAbortTimeline,std::memory_order_release);
-                MoEOverlayActivationDeviceEpochGrant input_grant{};input_grant.generation=previous;
+                if(trace.generation) {
+                    descriptor.digest=host_control->identity.digest;
+                    descriptor.timeline=published;
+                    descriptor.placement_epoch=1u;descriptor.stage_ordinal=0u;
+                }
+                if(trace.completed_prior) {
+                    // The follower has consumed no successor payload. Its
+                    // completed prior status may remain even if the source
+                    // issued new metadata before the absorbing cancellation.
+                    // A queued ordinary bank publication can still drain.
+                    for(auto *status:{&host_control->continuation_status,&host_control->follower_status}) {
+                        status->generation=trace.previous;
+                        status->state=static_cast<std::uint32_t>(MoEOverlayActivationEndpointState::Complete);
+                        status->code=static_cast<std::uint32_t>(MoEOverlayActivationStatusCode::Success);
+                        status->last_published_stage=0;status->last_consumed_stage=0;
+                        status->payload_retired_generation=trace.previous;
+                    }
+                }
+                std::atomic_ref<std::uint64_t>(host_control->admission.ready_signal).store(trace.ready,std::memory_order_release);
+                std::atomic_ref<std::uint64_t>(host_control->buffers[0].dispatch_signal.value).store(trace.dispatch,std::memory_order_release);
+                MoEOverlayActivationDeviceEpochGrant input_grant{};input_grant.generation=trace.previous;
                 ASSERT_EQ(cudaMemcpyAsync(grant,&input_grant,sizeof(input_grant),cudaMemcpyHostToDevice,inference_stream_),cudaSuccess);
                 ASSERT_EQ(cudaMemsetAsync(device_tickets_,0,2u*sizeof(*device_tickets_),inference_stream_),cudaSuccess);
                 ASSERT_EQ(cudaMemsetAsync(device_statuses_,0,kStatusCount*sizeof(*device_statuses_),inference_stream_),cudaSuccess);
@@ -607,9 +651,13 @@ namespace llaminar2::test
                     DeviceMoEOverlayEpochStatusCode::Success:DeviceMoEOverlayEpochStatusCode::InvalidTicket));
                 EXPECT_EQ(control.acquisitions_in_flight,0u);
                 for(const auto readers:control.bank_readers)EXPECT_EQ(readers,0u);
-                EXPECT_EQ(observed_grant.generation,previous);
-                EXPECT_EQ(host_control->buffers[0].dispatch_signal.value,
-                    normal?descriptor.timeline:kMoEOverlayActivationAbortTimeline);
+                EXPECT_EQ(observed_grant.generation,trace.previous);
+                EXPECT_EQ(host_control->admission.ready_signal,trace.ready);
+                EXPECT_EQ(host_control->buffers[0].dispatch_signal.value,trace.dispatch);
+                if(trace.ready==kMoEOverlayActivationAbortTimeline) {
+                    EXPECT_EQ(host_control->admission.state,static_cast<std::uint32_t>(MoEOverlayActivationAdmissionState::Failed));
+                    EXPECT_FALSE(evidence.valid()); // Never certify an aborted valid descriptor.
+                }
             }
         }
     }

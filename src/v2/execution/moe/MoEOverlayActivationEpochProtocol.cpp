@@ -4,6 +4,7 @@
  */
 
 #include "MoEOverlayActivationEpochProtocol.h"
+#include "MoEOverlayInferenceOriginalSlot.h"
 #include "CPUExpertShardRouteCompletion.h"
 
 #include <algorithm>
@@ -283,44 +284,16 @@ namespace llaminar2
         }
     }
 
-    std::optional<MoEOverlayActivationEpochIdentity>
-    MoEOverlayActivationEpochProtocol::arm(
-        const MoEOverlayInferenceTransactionTicket &ticket,
-        std::uint64_t epoch_generation,
-        std::uint64_t timeout_not_before_ns,
-        std::string *error)
+    bool MoEOverlayActivationEpochProtocol::ticketAuthenticatesChannel(
+        const MoEOverlayInferenceTransactionTicket &ticket) const noexcept
     {
-        if (error)
-            error->clear();
-        if (admissionState() != MoEOverlayActivationAdmissionState::Idle ||
-            acquireValue(control_->admission.ready_signal) != 0u ||
-            endpointState(MoEOverlayActivationEndpoint::Continuation) !=
-                MoEOverlayActivationEndpointState::Idle ||
-            endpointState(MoEOverlayActivationEndpoint::Follower) !=
-                MoEOverlayActivationEndpointState::Idle)
-        {
-            fail("ExpertOverlay activation epoch slot is not quiescent", error);
-            return std::nullopt;
-        }
-        for (std::uint32_t bank = 0u;
-             bank < kMoEOverlayActivationBufferCount;
-             ++bank)
-        {
-            if (dispatchTimeline(bank) != 0u || returnTimeline(bank) != 0u)
-            {
-                fail(
-                    "ExpertOverlay activation epoch slot retained a signal outside its completed lease",
-                    error);
-                return std::nullopt;
-            }
-        }
         const auto graph_role_value = static_cast<std::uint32_t>(
             ticket.graph_role);
         const bool graph_role_admitted =
             graph_role_value < 32u &&
             (control_->channel.graph_role_mask &
              (std::uint32_t{1} << graph_role_value)) != 0u;
-        if (!ticket.valid() ||
+        return !(!ticket.valid() ||
             ticket.action != MoEOverlayInferenceTransactionAction::Execute ||
             !graph_role_admitted ||
             ticket.workspace_generation !=
@@ -330,29 +303,12 @@ namespace llaminar2
             ticket.topology_fingerprint_high !=
                 control_->channel.topology_fingerprint_high ||
             ticket.source_world_rank != control_->channel.source_world_rank ||
-            ticket.target_world_rank != control_->channel.target_world_rank)
-        {
-            fail("ExpertOverlay activation ticket does not authenticate this retained rank-pair graph", error);
-            return std::nullopt;
-        }
-        const std::uint64_t last_generation = acquireValue(
-            control_->admission.last_generation);
-        if (epoch_generation == 0u || epoch_generation <= last_generation)
-        {
-            fail("ExpertOverlay activation generation is stale or non-monotonic", error);
-            return std::nullopt;
-        }
-        if (epoch_generation > kMoEOverlayActivationMaxGeneration)
-        {
-            fail("ExpertOverlay activation generation exceeds the 64-bit timeline ABI", error);
-            return std::nullopt;
-        }
-        if (timeout_not_before_ns == 0u)
-        {
-            fail("ExpertOverlay activation epoch requires a positive watchdog timeout lower bound", error);
-            return std::nullopt;
-        }
+            ticket.target_world_rank != control_->channel.target_world_rank);
+    }
 
+    MoEOverlayActivationEpochIdentity MoEOverlayActivationEpochProtocol::immutableTicketIdentity(
+        const MoEOverlayInferenceTransactionTicket &ticket,std::uint64_t epoch_generation) const noexcept
+    {
         MoEOverlayActivationEpochIdentity identity{
             .request_generation = ticket.request_generation,
             .command_id = ticket.command_id,
@@ -388,6 +344,80 @@ namespace llaminar2
             .reserved = {},
         };
         identity.digest = moeOverlayActivationIdentityDigest(identity);
+        return identity;
+    }
+
+    MoEOverlayActivationEpochIdentity MoEOverlayActivationEpochProtocol::describeOriginalNativeSubmission(
+        const MoEOverlayInferenceOriginalSlot &original,std::uint64_t epoch_generation) const
+    {
+        original.domain()->requireActiveAdmission(original);
+        if(!ticketAuthenticatesChannel(original.ticket()) || epoch_generation==0u ||
+            epoch_generation>kMoEOverlayActivationMaxGeneration)
+            throw std::logic_error("Original native admission does not authenticate its channel/timeline identity");
+        auto identity=immutableTicketIdentity(original.ticket(),epoch_generation);
+        if(original.index()>std::numeric_limits<std::uint32_t>::max())
+            throw std::logic_error("Original native slot index exceeds its exact ABI");
+        identity.original_slot_index=static_cast<std::uint32_t>(original.index());
+        identity.digest=moeOverlayActivationIdentityDigest(identity);
+        if(!identity.digest.valid())throw std::logic_error("Original native admission has an invalid immutable digest");
+        return identity;
+    }
+
+    std::optional<MoEOverlayActivationEpochIdentity>
+    MoEOverlayActivationEpochProtocol::arm(
+        const MoEOverlayInferenceTransactionTicket &ticket,
+        std::uint64_t epoch_generation,
+        std::uint64_t timeout_not_before_ns,
+        std::string *error)
+    {
+        if (error)
+            error->clear();
+        if (admissionState() != MoEOverlayActivationAdmissionState::Idle ||
+            acquireValue(control_->admission.ready_signal) != 0u ||
+            endpointState(MoEOverlayActivationEndpoint::Continuation) !=
+                MoEOverlayActivationEndpointState::Idle ||
+            endpointState(MoEOverlayActivationEndpoint::Follower) !=
+                MoEOverlayActivationEndpointState::Idle)
+        {
+            fail("ExpertOverlay activation epoch slot is not quiescent", error);
+            return std::nullopt;
+        }
+        for (std::uint32_t bank = 0u;
+             bank < kMoEOverlayActivationBufferCount;
+             ++bank)
+        {
+            if (dispatchTimeline(bank) != 0u || returnTimeline(bank) != 0u)
+            {
+                fail(
+                    "ExpertOverlay activation epoch slot retained a signal outside its completed lease",
+                    error);
+                return std::nullopt;
+            }
+        }
+        if (!ticketAuthenticatesChannel(ticket))
+        {
+            fail("ExpertOverlay activation ticket does not authenticate this retained rank-pair graph", error);
+            return std::nullopt;
+        }
+        const std::uint64_t last_generation = acquireValue(
+            control_->admission.last_generation);
+        if (epoch_generation == 0u || epoch_generation <= last_generation)
+        {
+            fail("ExpertOverlay activation generation is stale or non-monotonic", error);
+            return std::nullopt;
+        }
+        if (epoch_generation > kMoEOverlayActivationMaxGeneration)
+        {
+            fail("ExpertOverlay activation generation exceeds the 64-bit timeline ABI", error);
+            return std::nullopt;
+        }
+        if (timeout_not_before_ns == 0u)
+        {
+            fail("ExpertOverlay activation epoch requires a positive watchdog timeout lower bound", error);
+            return std::nullopt;
+        }
+
+        auto identity=immutableTicketIdentity(ticket,epoch_generation);
         if (!identity.digest.valid())
         {
             fail("ExpertOverlay activation identity digest is invalid", error);
@@ -1298,6 +1328,15 @@ namespace llaminar2
             MoEOverlayActivationEndpoint::Continuation);
         const auto follower = endpointStatus(
             MoEOverlayActivationEndpoint::Follower);
+        return completedSnapshotTraffic(identity,control_->channel.return_role,continuation,follower,error);
+    }
+
+    std::optional<MoEOverlayActivationEpochTraffic>
+    MoEOverlayActivationEpochProtocol::completedSnapshotTraffic(
+        const MoEOverlayActivationEpochIdentity& identity,std::uint32_t return_role,
+        const MoEOverlayActivationEndpointStatus& continuation,
+        const MoEOverlayActivationEndpointStatus& follower,std::string* error)
+    {
         const auto complete_for_identity = [&identity](
                                                const auto &status)
         {
@@ -1341,7 +1380,7 @@ namespace llaminar2
             return std::nullopt;
         }
 
-        const bool row_symmetric = moeOverlayActivationReturnCountsMatch(control_->channel.return_role,
+        const bool row_symmetric = moeOverlayActivationReturnCountsMatch(return_role,
             follower.published_live_rows,follower.published_live_entries,
             continuation.published_live_rows,continuation.published_live_entries);
         const bool dispatch_entry_geometry_valid =
@@ -1349,7 +1388,7 @@ namespace llaminar2
                 ? continuation.published_live_entries == 0u
                 : continuation.published_live_entries >=
                       continuation.published_live_rows;
-        const bool return_entry_geometry_valid = moeOverlayActivationReturnCountsMatch(control_->channel.return_role,
+        const bool return_entry_geometry_valid = moeOverlayActivationReturnCountsMatch(return_role,
             follower.published_live_rows,follower.published_live_entries,
             continuation.published_live_rows,continuation.published_live_entries);
         const bool entry_geometry_valid =

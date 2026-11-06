@@ -13,7 +13,9 @@
  * lifecycle cannot be confused: continuation dispatch pack, follower dispatch
  * consume, follower return pack, and continuation return consume. Their mapped
  * pointers are model-lifetime graph identity and must outlive every retained
- * parent transaction that imports these stages.
+ * parent transaction that imports these stages. Original native slots add a
+ * captured stage-zero handoff and post-payload retirement, with their fixed
+ * roster and family geometry included in each stage's capture identity.
  */
 
 #pragma once
@@ -76,6 +78,9 @@ namespace llaminar2
 
         /** @return Immutable lane, layer, and graph-family capture identity. */
         [[nodiscard]] const Params &getParams() const noexcept { return params_; }
+
+        /** @return Immutable original-slot, lane, role and retained-row capture identity. */
+        std::uint64_t graphCaptureVariantSignature() const override;
 
         /** @brief Enqueue deterministic row-major route compaction. */
         bool execute(IDeviceContext *ctx) override;
@@ -337,6 +342,9 @@ namespace llaminar2
         /** @return Immutable topology and tensor bindings used by this batch. */
         [[nodiscard]] const Params &getParams() const noexcept { return params_; }
 
+        /** @return Immutable original-slot, lane, role and retained-row capture identity. */
+        std::uint64_t graphCaptureVariantSignature() const override;
+
         /** @brief Enqueue fused decode or a non-blocking side-stream fork. */
         bool execute(IDeviceContext *ctx) override;
         /** @return MOE_OVERLAY_ACTIVATION_DISPATCH_PACK. */
@@ -435,6 +443,9 @@ namespace llaminar2
         /** @return Immutable lane, layer, and graph-family capture identity. */
         [[nodiscard]] const Params &getParams() const noexcept { return params_; }
 
+        /** @return Immutable original-slot, lane, role and retained-row capture identity. */
+        std::uint64_t graphCaptureVariantSignature() const override;
+
         /** @brief Enqueue descriptor validation and fixed-capacity expansion. */
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override;
@@ -498,6 +509,9 @@ namespace llaminar2
         /** @return Immutable lane, layer, and graph-family capture identity. */
         [[nodiscard]] const Params &getParams() const noexcept { return params_; }
 
+        /** @return Immutable original-slot, lane, role and retained-row capture identity. */
+        std::uint64_t graphCaptureVariantSignature() const override;
+
         /** @brief Enqueue compact return publication in dispatch row order. */
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override;
@@ -557,6 +571,9 @@ namespace llaminar2
 
         /** @return Immutable lane, layer, and graph-family capture identity. */
         [[nodiscard]] const Params &getParams() const noexcept { return params_; }
+
+        /** @return Immutable original-slot, lane, role and retained-row capture identity. */
+        std::uint64_t graphCaptureVariantSignature() const override;
 
         /** @brief Enqueue descriptor validation and deterministic FP32 fold. */
         bool execute(IDeviceContext *ctx) override;
@@ -627,6 +644,9 @@ namespace llaminar2
 
         /** @return Immutable canonical lane order and accumulator binding. */
         [[nodiscard]] const Params &getParams() const noexcept { return params_; }
+
+        /** @return Immutable original-slot, lane, role and retained-row capture identity. */
+        std::uint64_t graphCaptureVariantSignature() const override;
 
         /** @brief Enqueue parallel gather and deterministic fold. */
         bool execute(IDeviceContext *ctx) override;

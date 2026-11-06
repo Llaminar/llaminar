@@ -4,7 +4,11 @@
  */
 
 #include "execution/moe/MoEOverlayActivationEpochProtocol.h"
+#include "execution/moe/MoEOverlayActivationAdmissionPublication.h"
 #include "execution/moe/MoEOverlayRouteTarget.h"
+#include "execution/moe/MoEOverlayInferenceOriginalSlot.h"
+#include "execution/moe/MoEOverlayNativeInvocationABI.h"
+#include <array>
 
 #include <gtest/gtest.h>
 
@@ -146,7 +150,7 @@ namespace llaminar2::test
     TEST(Test__MoEOverlayActivationEpochProtocol,
          FixedABIAndTwoBanksPreservePipelinedRoundTripsAcrossReset)
     {
-        EXPECT_EQ(kMoEOverlayActivationABIVersion, 8u);
+        EXPECT_EQ(kMoEOverlayActivationABIVersion, 9u);
         EXPECT_EQ(sizeof(MoEOverlayActivationEndpointStatus), 128u);
         EXPECT_EQ(sizeof(MoEOverlayActivationEpochControl), 1152u);
         EXPECT_EQ(alignof(MoEOverlayActivationEpochControl), 64u);
@@ -916,4 +920,236 @@ namespace llaminar2::test
             *identity, MoEOverlayActivationStatusCode::ExplicitAbort, &error));
     }
 
+} // namespace llaminar2::test
+
+namespace llaminar2::test {
+/** Actual original submission identity is constructed without reading/resetting live epoch state. */
+TEST(Test__MoEOverlayActivationEpochProtocol, OriginalNativeAdmissionDescribesWithoutTouchingLiveControl)
+{
+    const auto config=makeConfig({3,5});
+    MoEOverlayActivationEpochControl control{};MoEOverlayActivationEpochProtocol::initialize(control,config);
+    MoEOverlayActivationEpochProtocol lane(control,config);
+    const auto first=makeTicket(config);
+    const MoEOverlayInferenceTopologyIdentity topology{.workspace_generation=config.workspace_generation,
+        .topology_fingerprint_low=config.topology_fingerprint_low,.topology_fingerprint_high=config.topology_fingerprint_high,
+        .source_world_rank=config.source.world_rank,.target_world_rank=config.target.world_rank};
+    MoEOverlayInferenceTransactionProtocol original({.topology=topology,
+        .slot_count=moeOverlayInferenceTransactionSlotCount(3),.max_request_count=1,.max_rows_per_request=1,.max_mtp_draft_depth=3});
+    ASSERT_TRUE(original.beginCommand({.request_generation=1,.command_id=1,.initial_placement_epoch=41}));
+    const auto a=original.accept(first);ASSERT_TRUE(a.accepted());ASSERT_TRUE(original.markSubmitted(a.slot_index,first));
+    const auto issued=original.originalSubmittedSlot(first);
+    const auto armed=lane.arm(first,1u,10'000u);ASSERT_TRUE(armed.has_value());activateBoth(lane,*armed);
+    std::array<std::byte,sizeof(control)> before{};std::memcpy(before.data(),&control,sizeof(control));
+    auto expected_first=*armed;expected_first.original_slot_index=static_cast<std::uint32_t>(issued.index());
+    expected_first.digest=moeOverlayActivationIdentityDigest(expected_first);
+    EXPECT_EQ(lane.describeOriginalNativeSubmission(issued,1u),expected_first);
+    auto second=makeTicket(config,2u);second.command_id=1u;
+    const auto b=original.accept(second);ASSERT_TRUE(b.accepted());ASSERT_TRUE(original.markSubmitted(b.slot_index,second));
+    const auto next=original.originalSubmittedSlot(second);
+    const auto described=lane.describeOriginalNativeSubmission(next,2u);
+    MoEOverlayActivationEpochControl reference{};MoEOverlayActivationEpochProtocol::initialize(reference,config);
+    MoEOverlayActivationEpochProtocol reference_lane(reference,config);
+    const auto expected=reference_lane.arm(second,2u,20'000u);ASSERT_TRUE(expected.has_value());
+    auto expected_native=*expected;expected_native.original_slot_index=static_cast<std::uint32_t>(next.index());
+    expected_native.digest=moeOverlayActivationIdentityDigest(expected_native);
+    EXPECT_EQ(described,expected_native);
+    EXPECT_EQ(std::memcmp(before.data(),&control,sizeof(control)),0);
+    EXPECT_THROW((void)lane.describeOriginalNativeSubmission(next,0u),std::logic_error);
+    const auto abort=makeMoEOverlayInferenceTerminalTicket(topology,{.request_generation=1,.command_id=1,.initial_placement_epoch=41},
+        3u,41u,MoEOverlayInferenceTransactionAction::Abort,17);
+    EXPECT_EQ(original.accept(abort).status,MoEOverlayInferenceAdmissionStatus::Aborted);
+    EXPECT_THROW((void)lane.describeOriginalNativeSubmission(next,2u),std::logic_error);
+    EXPECT_EQ(std::memcmp(before.data(),&control,sizeof(control)),0);
+}
+
+/** A semantic Complete status alone is insufficient for exact post-payload retirement. */
+TEST(Test__MoEOverlayActivationEpochProtocol, OriginalNativeAdmissionRejectsStaleAndPrematurePacketRetirement)
+{
+    const auto config=makeConfig({3,5});MoEOverlayActivationEpochControl control{};
+    MoEOverlayActivationEpochProtocol::initialize(control,config);MoEOverlayActivationEpochProtocol lane(control,config);
+    const auto identity=lane.arm(makeTicket(config),1u,10'000u);ASSERT_TRUE(identity.has_value());
+    MoEOverlayNativeInvocationSlot record{.identity=*identity,.original_slot_index=1u,.published_generation=1u,.timeout_not_before_ns=10'000u};
+    record.identity.original_slot_index=1u;record.identity.digest=moeOverlayActivationIdentityDigest(record.identity);
+    EXPECT_TRUE(moeOverlayNativeInvocationSlotMatches(record,1u,5u,control.channel,1));
+    auto changed=record;changed.published_generation=2u;EXPECT_FALSE(moeOverlayNativeInvocationSlotMatches(changed,1u,5u,control.channel,1));
+    changed=record;changed.abi_version=0u;EXPECT_FALSE(moeOverlayNativeInvocationSlotMatches(changed,1u,5u,control.channel,1));
+    changed=record;changed.cancelled_generation=1u;EXPECT_FALSE(moeOverlayNativeInvocationSlotMatches(changed,1u,5u,control.channel,1));
+    changed=record;changed.timeout_not_before_ns=0u;EXPECT_FALSE(moeOverlayNativeInvocationSlotMatches(changed,1u,5u,control.channel,1));
+    EXPECT_FALSE(moeOverlayNativeInvocationSlotMatches(record,0u,5u,control.channel,1));
+    EXPECT_FALSE(moeOverlayNativeInvocationSlotMatches(record,1u,5u,control.channel,3));
+    auto &receipt=record.continuation;
+    receipt.status.digest=record.identity.digest;receipt.status.generation=1u;
+    receipt.status.state=static_cast<std::uint32_t>(MoEOverlayActivationEndpointState::Complete);
+    receipt.status.code=static_cast<std::uint32_t>(MoEOverlayActivationStatusCode::Success);
+    receipt.status.last_consumed_stage=1;receipt.status.last_published_stage=1;
+    EXPECT_FALSE(moeOverlayNativeInvocationEndpointRetired(receipt,record.identity));
+    receipt.retired_generation=1u;EXPECT_FALSE(moeOverlayNativeInvocationEndpointRetired(receipt,record.identity));
+    receipt.status.payload_retired_generation=1u;EXPECT_TRUE(moeOverlayNativeInvocationEndpointRetired(receipt,record.identity));
+    receipt.retired_generation=2u;EXPECT_FALSE(moeOverlayNativeInvocationEndpointRetired(receipt,record.identity));
+}
+} // namespace llaminar2::test
+
+namespace llaminar2::test
+{
+/** @test A prior ready acquire cannot authorize a newly installed native identity. */
+TEST(Test__MoEOverlayActivationEpochProtocol, OriginalNativeAdmissionRequiresCurrentPublicationReplay)
+{
+    for (int replay = 0; replay < 20; ++replay)
+    {
+        const auto ready = kMoEOverlayActivationAdmissionTimeline;
+        std::uint64_t generation = 41;
+        std::uint64_t publication = ready;
+        EXPECT_TRUE(moeOverlayActivationAdmissionPublicationCurrent(41,
+            [&]() { return generation; }, [&]() { return publication; }));
+        // Closing admission can precede the generation rewrite. The original
+        // ready release cannot authorize this interval. A ready-first helper
+        // returns true here, even though no current publication exists.
+        int acquire_count = 0;
+        const auto acquire = [&](const std::uint64_t* address) {
+            const auto value = *address;
+            if (++acquire_count == 1) publication = 0;
+            return value;
+        };
+        EXPECT_FALSE(moeOverlayActivationAdmissionPublicationCurrent(41,
+            [&]() { return acquire(&generation); },
+            [&]() { return acquire(&publication); }));
+        EXPECT_EQ(acquire_count, 2);
+        // A newer identity remains unadmitted until its final ready release.
+        generation = 42;
+        EXPECT_FALSE(moeOverlayActivationAdmissionPublicationCurrent(42,
+            [&]() { return generation; }, [&]() { return publication; }));
+        publication = ready;
+        EXPECT_FALSE(moeOverlayActivationAdmissionPublicationCurrent(41,
+            [&]() { return generation; }, [&]() { return publication; }));
+        EXPECT_TRUE(moeOverlayActivationAdmissionPublicationCurrent(42,
+            [&]() { return generation; }, [&]() { return publication; }));
+        EXPECT_TRUE(moeOverlayActivationAdmissionPublicationMatches(41, 41, ready));
+        // The first ready acquire saw 41; source closed ready and installed 42.
+        EXPECT_FALSE(moeOverlayActivationAdmissionPublicationMatches(42, 42, 0));
+        // Generation must be read before the final ready acquire, like the peer
+        // epoch helper: a replacement publication cannot authenticate old bytes.
+        EXPECT_FALSE(moeOverlayActivationAdmissionPublicationMatches(41, 42, ready));
+        EXPECT_FALSE(moeOverlayActivationAdmissionPublicationMatches(0, 0, ready));
+        EXPECT_FALSE(moeOverlayActivationAdmissionPublicationMatches(
+            42, 42, kMoEOverlayActivationAbortTimeline));
+        EXPECT_TRUE(moeOverlayActivationAdmissionPublicationMatches(42, 42, ready));
+    }
+}
+}
+
+namespace llaminar2::test
+{
+/** @test The original native rearm does not normalize unknown lifecycle bytes. */
+TEST(Test__MoEOverlayActivationEpochProtocol, OriginalNativeAdmissionRejectsUnknownRearmStatesReplay)
+{
+    for (int replay = 0; replay < 20; ++replay)
+    {
+        for (std::uint32_t state = 0; state < 32; ++state)
+        {
+            const bool expected =
+                state == static_cast<std::uint32_t>(MoEOverlayActivationAdmissionState::Idle) ||
+                state == static_cast<std::uint32_t>(MoEOverlayActivationAdmissionState::Armed);
+            EXPECT_EQ(moeOverlayNativeInvocationRearmStateAllowed(state), expected) << state;
+        }
+        EXPECT_FALSE(moeOverlayNativeInvocationRearmStateAllowed(~std::uint32_t{0}));
+    }
+}
+}
+
+namespace llaminar2::test
+{
+/** @test Cancellation between the original state decision and ready CAS cannot be overwritten. */
+TEST(Test__MoEOverlayActivationEpochProtocol, OriginalNativeAdmissionReadyCASPreservesCancellationReplay)
+{
+    for (int replay = 0; replay < 20; ++replay)
+    {
+        for (const bool closing : {false, true})
+        {
+            std::atomic<std::uint64_t> ready{closing ? kMoEOverlayActivationAdmissionTimeline : 0u};
+            std::atomic<std::uint32_t> state{
+                static_cast<std::uint32_t>(MoEOverlayActivationAdmissionState::Armed)};
+            const auto first_error = static_cast<std::uint32_t>(MoEOverlayActivationStatusCode::OutOfOrder);
+            std::atomic<std::uint32_t> error{first_error};
+            unsigned acquires = 0, compares = 0;
+            const auto acquire = [&]() {
+                ++acquires;
+                return ready.load(std::memory_order_acquire);
+            };
+            const auto compare = [&](std::uint64_t expected, std::uint64_t desired) {
+                ++compares;
+                // The native state CAS already won. Original cancellation now
+                // wins just before the ready CAS, preserving its earlier error.
+                state.store(static_cast<std::uint32_t>(MoEOverlayActivationAdmissionState::Failed),
+                            std::memory_order_release);
+                ready.store(kMoEOverlayActivationAbortTimeline, std::memory_order_release);
+                return ready.compare_exchange_strong(expected, desired,
+                    std::memory_order_acq_rel, std::memory_order_acquire);
+            };
+            const bool published = closing
+                ? closeMoEOverlayActivationAdmissionPublication(acquire, compare)
+                : publishMoEOverlayActivationAdmissionPublication(compare);
+            EXPECT_FALSE(published);
+            EXPECT_EQ(acquires, closing ? 1u : 0u);
+            EXPECT_EQ(compares, 1u);
+            EXPECT_EQ(ready.load(std::memory_order_acquire), kMoEOverlayActivationAbortTimeline);
+            EXPECT_EQ(state.load(std::memory_order_acquire),
+                      static_cast<std::uint32_t>(MoEOverlayActivationAdmissionState::Failed));
+            EXPECT_EQ(error.load(std::memory_order_acquire), first_error);
+        }
+    }
+}
+
+/** @test Successful original close/open uses one CAS each and never polls for progress. */
+TEST(Test__MoEOverlayActivationEpochProtocol, OriginalNativeAdmissionReadyCASHasExactOperationsReplay)
+{
+    for (int replay = 0; replay < 20; ++replay)
+    {
+        for (const std::uint64_t initial : {std::uint64_t{0}, kMoEOverlayActivationAdmissionTimeline})
+        {
+            std::atomic<std::uint64_t> ready{initial};
+            unsigned acquires = 0, compares = 0;
+            const auto acquire = [&]() { ++acquires; return ready.load(std::memory_order_acquire); };
+            const auto compare = [&](std::uint64_t expected, std::uint64_t desired) {
+                ++compares;
+                return ready.compare_exchange_strong(expected, desired,
+                    std::memory_order_acq_rel, std::memory_order_acquire);
+            };
+            EXPECT_TRUE(closeMoEOverlayActivationAdmissionPublication(acquire, compare));
+            EXPECT_EQ(ready.load(std::memory_order_acquire), 0u);
+            EXPECT_EQ(acquires, 1u);
+            EXPECT_EQ(compares, 1u);
+            EXPECT_TRUE(publishMoEOverlayActivationAdmissionPublication(compare));
+            EXPECT_EQ(ready.load(std::memory_order_acquire), kMoEOverlayActivationAdmissionTimeline);
+            EXPECT_EQ(acquires, 1u);
+            EXPECT_EQ(compares, 2u);
+        }
+        for (const auto initial : {std::uint64_t{2}, kMoEOverlayActivationAbortTimeline})
+        {
+            std::atomic<std::uint64_t> ready{initial};
+            unsigned compares = 0;
+            EXPECT_FALSE(closeMoEOverlayActivationAdmissionPublication(
+                [&]() { return ready.load(std::memory_order_acquire); },
+                [&](std::uint64_t, std::uint64_t) { ++compares; return true; }));
+            EXPECT_EQ(compares, 0u);
+            EXPECT_EQ(ready.load(std::memory_order_acquire), initial);
+        }
+    }
+}
+
+/** @test The unsuccessful grant poll recognizes Failed while preserving ready-Abort short circuit. */
+TEST(Test__MoEOverlayActivationEpochProtocol, OriginalNativeAdmissionFailedWaitUsesOnlyRequiredLoadsReplay)
+{
+    for (int replay = 0; replay < 20; ++replay)
+    {
+        unsigned loads = 0;
+        const auto failed = [&]() { ++loads; return static_cast<std::uint32_t>(MoEOverlayActivationAdmissionState::Failed); };
+        EXPECT_TRUE(moeOverlayActivationAdmissionWaitAborted(kMoEOverlayActivationAbortTimeline, failed));
+        EXPECT_EQ(loads, 0u);
+        EXPECT_TRUE(moeOverlayActivationAdmissionWaitAborted(kMoEOverlayActivationAdmissionTimeline, failed));
+        EXPECT_EQ(loads, 1u);
+        EXPECT_FALSE(moeOverlayActivationAdmissionWaitAborted(kMoEOverlayActivationAdmissionTimeline,
+            [&]() { ++loads; return static_cast<std::uint32_t>(MoEOverlayActivationAdmissionState::Armed); }));
+        EXPECT_EQ(loads, 2u);
+    }
+}
 } // namespace llaminar2::test

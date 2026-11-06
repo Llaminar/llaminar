@@ -3546,6 +3546,19 @@ namespace llaminar2
             (void)launch;(void)control;(void)status;(void)action;return false;
         }
 
+        /** @brief Device-owned source rearm; CPU host-ordered channels never enter this GPU policy. */
+        virtual bool beginOriginalMoEOverlayInvocation(const MoEKernelLaunchContext&,
+            const MoEOverlayOriginalNativeBeginLaunch&) { return false; }
+        /** @brief Exact endpoint post-payload publication on the original stream. */
+        virtual bool retireOriginalMoEOverlayInvocation(const MoEKernelLaunchContext&,
+            const MoEOverlayOriginalNativeRetireLaunch&) { return false; }
+        /** @brief Final source batch epilogue after all single-row materializers/publications. */
+        virtual bool retireOriginalMoEOverlayInvocationBatch(const MoEKernelLaunchContext&,
+            const MoEOverlayActivationSingleRowReturnBatchLaunch&) { return false; }
+        /** @brief Final source batch epilogue after all multi-row materializers/publications. */
+        virtual bool retireOriginalMoEOverlayInvocationBatch(const MoEKernelLaunchContext&,
+            const MoEOverlayActivationMultiRowReturnBatchLaunch&) { return false; }
+
     };
 
     /**
@@ -3576,6 +3589,7 @@ namespace llaminar2
          */
         std::shared_ptr<MoERouterQ8HiddenPublication> router_q8_publication =
             std::make_shared<MoERouterQ8HiddenPublication>();
+
     };
 
 } // namespace llaminar2

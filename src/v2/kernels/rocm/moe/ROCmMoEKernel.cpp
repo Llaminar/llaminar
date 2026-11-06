@@ -1735,6 +1735,43 @@ namespace
 namespace llaminar2
 {
 
+    bool ROCmMoEKernel::beginOriginalMoEOverlayInvocation(
+        const MoEKernelLaunchContext &context,
+        const MoEOverlayOriginalNativeBeginLaunch &packet)
+    {
+        void *stream = explicitMoELaunchStream(context, "beginOriginalMoEOverlayInvocation");
+        return stream && packet.valid() &&
+            hipMoEOverlayOriginalNativeBegin(&packet, device_ordinal_, stream);
+    }
+
+    bool ROCmMoEKernel::retireOriginalMoEOverlayInvocation(
+        const MoEKernelLaunchContext &context,
+        const MoEOverlayOriginalNativeRetireLaunch &packet)
+    {
+        void *stream = explicitMoELaunchStream(context, "retireOriginalMoEOverlayInvocation");
+        return stream && packet.valid() &&
+            hipMoEOverlayOriginalNativeRetire(&packet, device_ordinal_, stream);
+    }
+
+    bool ROCmMoEKernel::retireOriginalMoEOverlayInvocationBatch(
+        const MoEKernelLaunchContext &context,
+        const MoEOverlayActivationSingleRowReturnBatchLaunch &packet)
+    {
+        void *stream = explicitMoELaunchStream(context, "retireOriginalMoEOverlayInvocationBatch");
+        return stream && packet.valid() &&
+            hipMoEOverlayOriginalNativeRetireSingleRowBatch(&packet, device_ordinal_, stream);
+    }
+
+    bool ROCmMoEKernel::retireOriginalMoEOverlayInvocationBatch(
+        const MoEKernelLaunchContext &context,
+        const MoEOverlayActivationMultiRowReturnBatchLaunch &packet)
+    {
+        void *stream = explicitMoELaunchStream(context, "retireOriginalMoEOverlayInvocationBatch");
+        return stream && packet.valid() &&
+            hipMoEOverlayOriginalNativeRetireMultiRowBatch(&packet, device_ordinal_, stream);
+    }
+
+
     bool ROCmMoEKernel::packMoEOverlayActivationDispatch(
         const MoEKernelLaunchContext &launch,
         const MoEOverlayActivationDispatchPackLaunch &packet)

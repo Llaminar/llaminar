@@ -19,6 +19,7 @@
  */
 
 #pragma once
+#include "MoEOverlayInferenceOriginalSlot.h"
 #include <mutex>
 #include "execution/local_execution/engine/ForwardGraphTypes.h"
 
@@ -755,8 +756,12 @@ namespace llaminar2
                 return terminal(MoEOverlayInferenceTransactionAction::Complete, epoch, progress, 0, error);
             }
             /**
-             * @brief Drain every partial original submission before accepting absorbing abort.
-             * @param drain Original cancellation plus all-native-proof operation, not semantic success.
+             * @brief Publish absorbing original Abort before draining partial submissions.
+             * @param epoch Current original command placement floor, never a fabricated live epoch.
+             * @param code Positive absorbing failure code.
+             * @param error First original cancellation/native proof failure.
+             * @param drain Original channel cancellation plus all-native-proof operation, not semantic success.
+             * @return True only after actual drain; failed source proof retains every active handle.
              */
             template <class Drain>
             bool abort(std::uint64_t epoch, int code, Drain drain, std::string *error)
@@ -764,6 +769,12 @@ namespace llaminar2
                 if (!command_.valid() || epoch < protocol_.currentPlacementEpoch() || code <= 0)
                     return reject(error, "Local abort lost its original command epoch or failure code");
                 failed_ = true;
+                // Withdraw NEW execution admission before joining any queued
+                // closure. Submitted slots remain original-owned for native
+                // terminal publication/drain; failure never releases handles.
+                if (protocol_.state() != MoEOverlayInferenceProtocolState::Failed &&
+                    !terminal(MoEOverlayInferenceTransactionAction::Abort, epoch, 0u, code, error))
+                    return false;
                 if (active())
                 {
                     try
@@ -778,9 +789,53 @@ namespace llaminar2
                     for (auto &handle : active_)
                         handle.reset();
                 }
-                if (protocol_.state() == MoEOverlayInferenceProtocolState::Failed)
-                    return true;
-                return terminal(MoEOverlayInferenceTransactionAction::Abort, epoch, 0u, code, error);
+                return true;
+            }
+            /**
+             * @brief Visit every original active publication in authored ordinal order.
+             * @param observe Actual aggregate proof/clear operation; never a slot allocator.
+             * @param error Receives the first failure after all original slots were attempted.
+             * @return Whether every original callback completed, without retiring ANY slot.
+             * Callback failure leaves all protocol/host handles retained for absorbing abort.
+             */
+            template<class Observe>
+            bool observeOriginalActive(Observe observe, std::string *error) const
+            {
+                bool complete = true;
+                std::string first_error;
+                std::uint64_t previous = 0u;
+                for (std::size_t visited = 0u; visited < active_.size(); ++visited)
+                {
+                    const MoEOverlayPublishedInferenceTransaction *next = nullptr;
+                    for (const auto &handle : active_)
+                        if (handle && handle->ticket.transaction_ordinal > previous &&
+                            (!next || handle->ticket.transaction_ordinal < next->ticket.transaction_ordinal))
+                            next = &*handle;
+                    if (!next)
+                        break;
+                    previous = next->ticket.transaction_ordinal;
+                    std::string current;
+                    try
+                    {
+                        if (!observe(*next, &current))
+                        {
+                            complete = false;
+                            if (first_error.empty()) first_error = current;
+                        }
+                    }
+                    catch (const std::exception &failure)
+                    {
+                        complete = false;
+                        if (first_error.empty()) first_error = failure.what();
+                    }
+                    catch (...)
+                    {
+                        complete = false;
+                        if (first_error.empty()) first_error = "Nonstandard original aggregate observation failure";
+                    }
+                }
+                if (!complete && error) *error = first_error;
+                return complete;
             }
             /** @return Whether original work still needs its exact native retirement. */
             bool active() const noexcept
@@ -798,6 +853,22 @@ namespace llaminar2
                     if (handle && (!latest || handle->ticket.transaction_ordinal > latest->transaction_ordinal))
                         latest = &handle->ticket;
                 return latest;
+            }
+            /** @return SAME cold original protocol domain; it grants no submission permission. */
+            std::shared_ptr<const MoEOverlayInferenceOriginalSlotDomain> originalSlotDomain() const
+            {
+                return protocol_.originalSlotDomain();
+            }
+            /**
+             * @brief Borrow native identity only after this original protocol submitted the exact ticket.
+             * @param ticket Entire immutable accepted publication, never an inferred slot ordinal.
+             * @return Original domain/slot/ticket capability retained through aggregate retirement.
+             * @throws std::logic_error For a foreign, absent or not-yet-submitted publication.
+             */
+            MoEOverlayInferenceOriginalSlot originalSubmittedSlot(
+                const MoEOverlayInferenceTransactionTicket &ticket) const
+            {
+                return protocol_.originalSubmittedSlot(ticket);
             }
             /** @return Original admitted protocol capacity, never a new concurrency budget. */
             std::size_t slotCount() const noexcept
@@ -863,6 +934,11 @@ namespace llaminar2
             std::vector<std::optional<MoEOverlayPublishedInferenceTransaction>> active_;
             bool failed_ = false;
         };
+        /**
+         * @return Sole cold protocol state owned by this original rank-local runner.
+         * @throws std::logic_error If no original rank-local domain was constructed.
+         */
+        RankLocalPublicationState &rankLocalPublicationState() const;
         class RankLocalInferencePublisher;
         struct RetainedGraphSelection;
         /**
@@ -948,8 +1024,31 @@ namespace llaminar2
         bool submitMappedFollowerTransaction(MappedFollowerTransaction &submission, std::string *error);
         /** @brief Service only the explicit CPU endpoints after native all-submit. */
         bool serviceMappedCPUFollowers(MappedFollowerTransaction &submission, std::string *error);
-        /** @brief Join every original terminal and retire the exact activation lease. */
-        bool retireMappedFollowerTransaction(MappedFollowerTransaction &submission, std::string *error);
+        /** Aggregate-only native proof never clears per-slot packet/protocol metadata. */
+        enum class MappedFollowerRetirementPhase { NativeProofOnly, Complete };
+        /**
+         * @brief Observe actual native terminals, then optionally consume completed packet evidence.
+         * @param submission Same original submitted family/slot and retained physical receipts.
+         * @param error First missing/failed proof diagnostic.
+         * @param phase NativeProofOnly preserves every packet/protocol slot for the aggregate barrier.
+         * @return True only for the requested original proof frontier; never inferred completion.
+         */
+        bool retireMappedFollowerTransaction(MappedFollowerTransaction &submission, std::string *error,
+            MappedFollowerRetirementPhase phase = MappedFollowerRetirementPhase::Complete);
+        /**
+         * @brief Acquire immutable post-payload traffic after original native observation.
+         * @param submission Same retained original native slot, without releasing its domain.
+         * @param error First missing, failed or premature post-payload receipt.
+         * @return Whether all exact lane snapshots were acquired; no metadata is cleared.
+         */
+        bool observeOriginalNativePacketReceipts(MappedFollowerTransaction &submission, std::string *error);
+        /**
+         * @brief Clear metadata only after ALL aggregate native and packet observations succeeded.
+         * @param submission Original slot whose immutable traffic has already been retained.
+         * @param error First rejected clear; ownership remains failed for absorbing abort.
+         * @return Whether each exact original metadata record was cleared, without protocol retirement.
+         */
+        bool clearOriginalNativePacketReceipts(MappedFollowerTransaction &submission, std::string *error);
         /**
          * @brief Join a cancelled partial submission without publishing successful service evidence.
          * @param submission Original retained native tickets and admission receipts.
@@ -1052,6 +1151,11 @@ namespace llaminar2
          */
         std::unordered_map<int, std::shared_ptr<TensorBase>>
             participant_canonical_route_buffers_;
+        // This sole protocol/domain precedes ALL native caches, so reverse
+        // destruction drains their original tokens before authority withdrawal.
+        std::unique_ptr<RankLocalPublicationState> rank_local_publication_state_;
+        /** Actual immutable registry declaration; absence retains the original host-ordered contract. */
+        std::optional<MoEOverlayInferenceOriginalSlotGeometry> original_native_slot_geometry_;
         /**
          * @brief One durable device-owned execution runtime per GPU participant.
          *

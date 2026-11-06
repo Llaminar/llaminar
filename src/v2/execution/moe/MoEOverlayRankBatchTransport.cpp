@@ -16,6 +16,7 @@
  */
 
 #include "MoEOverlayRankBatchTransport.h"
+#include "MoEOverlayNodeLocalRankBatchTransport.h"
 #include "MoEOverlayRankBatchTelemetry.h"
 
 #include "collective/CollectiveTimeoutPolicy.h"
@@ -161,6 +162,68 @@ namespace llaminar2
                 channel_identity);
         }
         return transport;
+    }
+
+    /** @brief Cold projection of the SAME existing channel owners; no second allocator or live state. */
+    struct MoEOverlayRankBatchTransportRegistry::OriginalNativeProjection
+    {
+        std::optional<MoEOverlayInferenceOriginalSlotGeometry> geometry;
+        std::vector<std::shared_ptr<IMoEOverlayMappedActivationTransport>> channels;
+    };
+
+    MoEOverlayRankBatchTransportRegistry::OriginalNativeProjection
+    MoEOverlayRankBatchTransportRegistry::originalNativeProjectionLocked(
+        int source_world_rank,int target_world_rank,std::span<const int> complete_endpoint_ids) const
+    {
+        if(source_world_rank<0 || target_world_rank<0)
+            throw std::logic_error("Original native registry projection requires valid original ranks");
+        std::vector<int> expected(complete_endpoint_ids.begin(),complete_endpoint_ids.end());
+        std::sort(expected.begin(),expected.end());
+        if(std::any_of(expected.begin(),expected.end(),[](int id){return id<0;}) ||
+            std::adjacent_find(expected.begin(),expected.end())!=expected.end())
+            throw std::logic_error("Original native registry projection has duplicate/invalid admitted endpoint IDs");
+        OriginalNativeProjection result;
+        bool native=false,legacy=false;
+        std::vector<int> actual;
+        for(const auto& [key,transport]:transports_)
+        {
+            (void)key;
+            if(transport->sourceWorldRank()!=source_world_rank || transport->targetWorldRank()!=target_world_rank)continue;
+            const auto mapped=std::dynamic_pointer_cast<IMoEOverlayMappedActivationTransport>(transport);
+            if(!mapped || !mapped->originalNativeSlotGeometry()) {legacy=true;continue;}
+            const auto geometry=*mapped->originalNativeSlotGeometry();
+            if(result.geometry && *result.geometry!=geometry)
+                throw std::logic_error("Original native registry channels disagree on their single retained roster");
+            result.geometry=geometry;native=true;result.channels.push_back(mapped);
+            const auto& ids=transport->participantIds();actual.insert(actual.end(),ids.begin(),ids.end());
+        }
+        if(!native)return {}; // Explicit legacy host-ordered channels keep their original semantics.
+        if(legacy)throw std::logic_error("Original native registry projection mixes execution owners");
+        std::sort(actual.begin(),actual.end());
+        if(std::adjacent_find(actual.begin(),actual.end())!=actual.end() || actual!=expected)
+            throw std::logic_error("Original native registry projection differs from the complete admitted endpoint set");
+        return result;
+    }
+
+    std::optional<MoEOverlayInferenceOriginalSlotGeometry>
+    MoEOverlayRankBatchTransportRegistry::originalNativeSlotGeometryFor(
+        int source_world_rank,int target_world_rank,std::span<const int> complete_endpoint_ids) const
+    {
+        std::lock_guard lock(mutex_);
+        return originalNativeProjectionLocked(source_world_rank,target_world_rank,complete_endpoint_ids).geometry;
+    }
+
+    void MoEOverlayRankBatchTransportRegistry::bindOriginalNativeSlotsFor(
+        std::shared_ptr<const MoEOverlayInferenceOriginalSlotDomain> domain,
+        int source_world_rank,int target_world_rank,std::span<const int> complete_endpoint_ids) const
+    {
+        std::lock_guard lock(mutex_);
+        const auto original=originalNativeProjectionLocked(source_world_rank,target_world_rank,complete_endpoint_ids);
+        if(!domain || !original.geometry || domain->geometry()!=*original.geometry ||
+            domain->topologyIdentity().source_world_rank!=source_world_rank ||
+            domain->topologyIdentity().target_world_rank!=target_world_rank)
+            throw std::logic_error("Original native registry binding lost its actual protocol geometry/rank authority");
+        for(const auto& channel:original.channels)channel->bindOriginalNativeSlots(domain);
     }
 
     std::size_t MoEOverlayRankBatchTransportRegistry::size() const

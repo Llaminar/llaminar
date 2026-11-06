@@ -129,3 +129,44 @@ unset(peer_abort_backend)
 unset(peer_abort_target)
 unset(peer_abort_suite)
 unset(peer_abort_test)
+
+# Exact original follower cache/slot BOM; no native materialization is performed.
+add_v2_test(V2_Integration_MoEOriginalNativeSlotBOMContract
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_capacity_resolver>
+        --gtest_filter=MoEOverlayCapacityResolver.OriginalNativeSlotBOM*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;MemoryBOM;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOriginalNativeSlotBOMContract)
+
+# Isolate each original two-GPU PMA population from the legacy unprepared packet
+# cases. Disabled GTests are explicitly executed here; no eligible case skips.
+if(TARGET v2_integration_mapped_activation_packet_cuda_rocm)
+    foreach(recurrent_backend IN ITEMS CUDA ROCm)
+        set(recurrent_name V2_Integration_${recurrent_backend}_MoERecurrentOriginalSlotPackets)
+        add_v2_test(${recurrent_name}
+            COMMAND $<TARGET_FILE:v2_integration_mapped_activation_packet_cuda_rocm>
+                --gtest_also_run_disabled_tests
+                --gtest_filter=MoERecurrentOriginalSlotPacketReplay.DISABLED_${recurrent_backend}TwoPhysicalEndpointsAggregate
+            LABELS "V2;Integration;ProductionTestPreflight;${recurrent_backend};MoE;CapturedReplay;Ownership;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${recurrent_name})
+    endforeach()
+endif()
+
+# Each adversarial trace keeps its own original source/PMA population. These
+# are packet replay/retirement contracts, not learned-model or PGR reset proof.
+if(TARGET v2_integration_mapped_activation_packet_cuda_rocm)
+    foreach(recurrent_backend IN ITEMS CUDA ROCm)
+        foreach(recurrent_profile IN ITEMS PartialVerifier Empty CancelBeforeSuccessorSource)
+            set(recurrent_name V2_Integration_${recurrent_backend}_MoERecurrentOriginalSlotPackets_${recurrent_profile})
+            add_v2_test(${recurrent_name}
+                COMMAND $<TARGET_FILE:v2_integration_mapped_activation_packet_cuda_rocm>
+                    --gtest_also_run_disabled_tests
+                    --gtest_filter=MoERecurrentOriginalSlotPacketReplay.DISABLED_${recurrent_backend}TwoPhysicalEndpoints${recurrent_profile}
+                LABELS "V2;Integration;ProductionTestPreflight;${recurrent_backend};MoE;CapturedReplay;Ownership;Regression"
+                MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${recurrent_name})
+        endforeach()
+    endforeach()
+endif()

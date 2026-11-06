@@ -236,6 +236,9 @@ MoEOverlayMemoryPlanInputs buildMoEOverlayMemoryPlanInputs(
             .resident_graph_rows = resolveRetainedGraphRowCapacity(resident_prefill_rows, mtp),
             .activation_channel_row_capacity = std::max(decode_rows, segment_rows),
             .activation_graph_family_count = family_count,
+            .activation_prefill_graph_rows = retained_buckets,
+            .original_native_slots = MoEOverlayActivationChannelPlanner::originalNativeSlotGeometry(
+                *overlay, request.inventory, family),
             .host_demand_memory = std::move(host_demand),
             .generation_domain = generation.domain(),
             .generation_parent_role = parent_role,

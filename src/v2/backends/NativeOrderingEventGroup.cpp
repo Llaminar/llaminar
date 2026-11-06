@@ -7,6 +7,7 @@
  * the certified context/process retirement owner. No bytes are claimed twice.
  */
 #include "NativeOrderingEventGroup.h"
+#include "execution/moe/MoEOverlayInferenceOriginalSlot.h"
 #include "NativeOrderingEventBudgetProjection.h"
 #include "GPUDeviceContextPool.h"
 #include "ReadAheadNativeResourceObligation.h"
@@ -17,6 +18,15 @@
 #include <optional>
 #include <stdexcept>
 namespace llaminar2 {
+NativeOrderingEventProgram NativeOrderingEventProgram::retainedCaptureTerminals(const MoEOverlayInferenceOriginalSlotDomain& domain){
+    return retainedCaptureTerminals(domain.geometry());
+}
+NativeOrderingEventProgram NativeOrderingEventProgram::retainedCaptureTerminals(const MoEOverlayInferenceOriginalSlotGeometry& geometry){
+    if(geometry.slotCount()<2 || geometry.slotCount()-1>std::numeric_limits<std::uint32_t>::max())
+        throw std::invalid_argument("Retained capture terminals require original bounded protocol slots");
+    return {Kind::RetainedCaptureTerminals,static_cast<std::uint32_t>(geometry.slotCount()-1),nullptr};
+}
+
 struct NativeOrderingEventGroup::State final {
     std::shared_ptr<PhysicalMemoryAuthority> memory;
     GPUContextProvenance original;
@@ -43,7 +53,9 @@ std::unique_ptr<NativeOrderingEventGroup> NativeOrderingEventGroup::claimWithPro
     const auto kind=program.kind()==NativeOrderingEventProgram::Kind::ReadAheadParentTerminal?PhysicalMemoryOwner::NativeReadAheadParentTerminal:PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent;
     auto host=memory->reserveNewAllocations(DeviceId::cpu(),kind,selected.hostBytes);
     std::optional<PhysicalMemoryOwnerReservation> gpu;if(selected.deviceBytes)gpu.emplace(memory->reserveNewAllocations(original.device(),kind,selected.deviceBytes));
-    const auto identity=sha256BytesHex(selected.sourceIdentity+":"+selected.resourceSource+":"+selected.evidence+":"+std::to_string(static_cast<unsigned>(program.kind()))+":"+std::to_string(program.nonemptyRootMask()));
+    const auto countIdentity=program.kind()==NativeOrderingEventProgram::Kind::RetainedCaptureTerminals
+        ? ":events="+std::to_string(program.orderingEvents()):std::string{};
+    const auto identity=sha256BytesHex(countIdentity+selected.sourceIdentity+":"+selected.resourceSource+":"+selected.evidence+":"+std::to_string(static_cast<unsigned>(program.kind()))+":"+std::to_string(program.nonemptyRootMask()));
     if(!identity)throw std::runtime_error("Ordering original certificate identity hashing failed");
     auto slot=original.reserveNativeRetirementSlot(memory,*identity);
     if(selected.lifetime==NativePhysicalLifetime::ProcessRuntime){

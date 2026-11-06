@@ -78,6 +78,15 @@ namespace llaminar2
         void resetDynamicState() override;
 
         /** @copydoc IMoEKernel::packMoEOverlayActivationDispatch */
+        /** @copydoc IMoEKernel::beginOriginalMoEOverlayInvocation */
+        bool beginOriginalMoEOverlayInvocation(const MoEKernelLaunchContext&,const MoEOverlayOriginalNativeBeginLaunch&) override;
+        /** @copydoc IMoEKernel::retireOriginalMoEOverlayInvocation */
+        bool retireOriginalMoEOverlayInvocation(const MoEKernelLaunchContext&,const MoEOverlayOriginalNativeRetireLaunch&) override;
+        /** @copydoc IMoEKernel::retireOriginalMoEOverlayInvocationBatch */
+        bool retireOriginalMoEOverlayInvocationBatch(const MoEKernelLaunchContext&,const MoEOverlayActivationSingleRowReturnBatchLaunch&) override;
+        /** @copydoc IMoEKernel::retireOriginalMoEOverlayInvocationBatch */
+        bool retireOriginalMoEOverlayInvocationBatch(const MoEKernelLaunchContext&,const MoEOverlayActivationMultiRowReturnBatchLaunch&) override;
+
         bool packMoEOverlayActivationDispatch(
             const MoEKernelLaunchContext &launch,
             const MoEOverlayActivationDispatchPackLaunch &packet) override;

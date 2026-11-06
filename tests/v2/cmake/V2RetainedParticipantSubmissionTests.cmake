@@ -126,3 +126,14 @@ if(TARGET v2_test_native_ordering_event_group)
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CaptureTerminalOriginalSourceLifecycle)
 endif()
+
+# Exact terminal receipts use only the original admitted publication-slot roster.
+if(TARGET v2_test_forward_graph_types)
+    add_v2_test(V2_Integration_OriginalSlotCaptureTerminalLifecycle
+        COMMAND $<TARGET_FILE:v2_test_forward_graph_types>
+            --gtest_filter=Test__GraphSegmentCache.OriginalSlotTerminalsRetainEveryDeferredInvocationLifecycle:Test__GraphSegmentCache.OriginalSlotTerminalsRejectForeignAndWithdrawnOwners:Test__GraphSegmentCache.OriginalSlotTerminalBOMUsesCertifiedUnitCount
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Graph;Lifecycle;Contract;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OriginalSlotCaptureTerminalLifecycle)
+endif()

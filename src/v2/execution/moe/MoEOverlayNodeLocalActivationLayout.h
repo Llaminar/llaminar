@@ -11,6 +11,9 @@
 
 #pragma once
 #include "MoEOverlayReturnLayout.h"
+#include "MoEOverlayInferenceOriginalSlot.h"
+#include "MoEOverlayNativeInvocationABI.h"
+#include <optional>
 
 #include <cstddef>
 #include <vector>
@@ -70,6 +73,9 @@ namespace llaminar2
         std::size_t activation_graph_family_count = 0;
         MoEOverlayReturnLayout return_layout = MoEOverlayReturnLayout::ParticipantTokenPartials;
 
+        /** Same cold original protocol roster; absent for explicit host-ordered channels. */
+        std::optional<MoEOverlayInferenceOriginalSlotGeometry> original_native_slots;
+
         /** @return Exact return-row capacity consumed by admission and transport. */
         [[nodiscard]] std::size_t returnRowCapacity() const noexcept
         {
@@ -111,6 +117,8 @@ namespace llaminar2
         std::size_t return_publication = 0;
         std::size_t participant_controls = 0;
         std::size_t activation_controls = 0;
+        /** Exact per-participant original K-slot metadata, shared across graph families. */
+        MoEOverlayNodeLocalActivationByteRange original_native_slots;
         MoEOverlayNodeLocalActivationByteRange shared_dispatch_pages;
         std::size_t shared_dispatch_hidden_rows = 0;
         MoEOverlayNodeLocalActivationByteRange shared_return_pages;

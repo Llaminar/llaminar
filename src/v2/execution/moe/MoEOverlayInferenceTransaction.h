@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -34,6 +35,9 @@
 
 namespace llaminar2
 {
+    class MoEOverlayInferenceOriginalSlotDomain;
+    class MoEOverlayInferenceOriginalSlot;
+
     /**
      * @brief Passive completed identity of one finite original host-placement scope.
      *
@@ -461,6 +465,14 @@ namespace llaminar2
          * @throws std::invalid_argument for an invalid topology or capacity.
          */
         explicit MoEOverlayInferenceTransactionProtocol(Config config);
+        /** @brief Withdraw native resource borrowing before original slot storage dies. */
+        ~MoEOverlayInferenceTransactionProtocol();
+        // This instance is the sole original slot owner retained by native
+        // resource domains. Copying or relocating it would fork that authority.
+        MoEOverlayInferenceTransactionProtocol(const MoEOverlayInferenceTransactionProtocol &) = delete;
+        MoEOverlayInferenceTransactionProtocol &operator=(const MoEOverlayInferenceTransactionProtocol &) = delete;
+        MoEOverlayInferenceTransactionProtocol(MoEOverlayInferenceTransactionProtocol &&) = delete;
+        MoEOverlayInferenceTransactionProtocol &operator=(MoEOverlayInferenceTransactionProtocol &&) = delete;
 
         /**
          * @brief Open one root-published command at its initial placement epoch.
@@ -532,6 +544,23 @@ namespace llaminar2
             return slots_.size();
         }
 
+        /**
+         * @brief Bind native resources to this original immutable slot roster.
+         * @return Cold shared domain whose count is the actual protocol slot count.
+         * @throws std::logic_error If a copied/moved protocol aliases another owner.
+         */
+        [[nodiscard]] std::shared_ptr<const MoEOverlayInferenceOriginalSlotDomain>
+        originalSlotDomain() const;
+
+        /**
+         * @brief Name only an exact accepted and submitted original native slot.
+         * @param ticket Original publication retained by this protocol.
+         * @return Checked immutable slot token, without a hot allocation or new admission.
+         * @throws std::invalid_argument If the ticket is absent, unsubmitted or stale.
+         */
+        [[nodiscard]] MoEOverlayInferenceOriginalSlot originalSubmittedSlot(
+            const MoEOverlayInferenceTransactionTicket &ticket) const;
+
         /** @return Immutable model/topology identity authenticated by this protocol. */
         [[nodiscard]] const MoEOverlayInferenceTopologyIdentity &
         topologyIdentity() const noexcept
@@ -540,6 +569,7 @@ namespace llaminar2
         }
 
     private:
+        friend class MoEOverlayInferenceOriginalSlotDomain;
         /** @brief Fixed metadata owned by one registered transport slot. */
         struct Slot
         {
@@ -562,6 +592,7 @@ namespace llaminar2
 
         Config config_;
         std::vector<Slot> slots_;
+        std::shared_ptr<const MoEOverlayInferenceOriginalSlotDomain> original_slot_domain_; ///< Cold immutable resource identity of THIS protocol roster.
         MoEOverlayInferenceProtocolState state_ =
             MoEOverlayInferenceProtocolState::Idle;
         MoEOverlayInferenceCommandIdentity active_command_{};

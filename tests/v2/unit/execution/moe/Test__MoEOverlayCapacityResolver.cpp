@@ -4095,6 +4095,78 @@ namespace llaminar2
         EXPECT_EQ(result[0].physical_memory_admission->plan().find({0,DeviceId::cpu()})->
             bytes(PhysicalMemoryOwner::ImmutableTableStorage),source.nativeBytes());
     }
+    /** @brief Actual follower row factories, not depth/family approximations, own event multiplicity. */
+    TEST(MoEOverlayCapacityResolver, OriginalNativeSlotBOMUsesActualFollowerCacheRoster)
+    {
+        auto family = testGraphFamily(smallModelProfile());
+        family.max_graph_rows = 600;
+        family.max_decode_rows = 4;
+        family.max_mtp_draft_depth = 3;
+        family.mtp_source_layers = {family.main_layer_count};
+        const std::vector<int> prefill{16, 600};
+        ASSERT_TRUE(family.valid());
+        // Main M1..4 + source-owned M16/M600, plus ONE actual learned R1.
+        EXPECT_EQ(MoEOverlayActivationChannelPlanner::followerCaptureCacheCount(600, family, prefill), 7u);
+        family.max_mtp_draft_depth = 8;
+        EXPECT_EQ(MoEOverlayActivationChannelPlanner::followerCaptureCacheCount(600, family, prefill), 7u);
+        family.max_request_count = 2;
+        EXPECT_EQ(MoEOverlayActivationChannelPlanner::followerCaptureCacheCount(600, family, prefill), 8u);
+        EXPECT_THROW((void)MoEOverlayActivationChannelPlanner::followerCaptureCacheCount(
+            600, family, std::vector<int>{600,16}), std::invalid_argument);
+    }
+
+    /** @brief Native geometry is original world-one GPU authority; host and remote channels remain explicit. */
+    TEST(MoEOverlayCapacityResolver, OriginalNativeSlotBOMRejectsHostAndRemoteAuthority)
+    {
+        MoERoutedExpertPlacementPlan placement;
+        placement.enabled = true;
+        placement.topology = RoutedExpertPlacementTopology::TieredOverlay;
+        placement.authority_execution = MoEOverlayAuthorityExecutionKind::DeviceResident;
+        placement.continuation_domain = "original-source";
+        placement.base_model_domain = placement.continuation_domain;
+        placement.shared_expert_domain = placement.continuation_domain;
+        placement.continuation_domain_spec.domain = placement.continuation_domain;
+        placement.continuation_domain_spec.logical_root_participant = 0;
+        RoutedExpertDomain source;
+        source.name = placement.continuation_domain;
+        source.scope = ExecutionDomainScope::SINGLE;
+        source.participants = {GlobalDeviceAddress::cuda(0)};
+        source.world_ranks = {0}; source.owner_rank = 0;
+        RoutedExpertDomain follower = source;
+        follower.name = "original-follower";
+        follower.participants = {GlobalDeviceAddress::rocm(0)};
+        placement.domains = {source, follower};
+        placement.routed_tiers = {
+            RoutedExpertTier{.name="source", .domain=source.name, .priority=0},
+            RoutedExpertTier{.name="follower", .domain=follower.name, .priority=1}};
+        ClusterInventory inventory;
+        inventory.world_size = 1; inventory.ranks.resize(1);
+        inventory.ranks[0].rank = 0; inventory.ranks[0].node_id = 0;
+        auto family = testGraphFamily(smallModelProfile());
+        for (const int depth : {0,1,3,8})
+        {
+            family.max_mtp_draft_depth = depth;
+            const auto geometry = MoEOverlayActivationChannelPlanner::originalNativeSlotGeometry(
+                placement, inventory, family);
+            ASSERT_TRUE(geometry);
+            EXPECT_EQ(geometry->retainedDraftCapacity(), depth);
+            const auto channels = MoEOverlayActivationChannelPlanner::plan({
+                .placement_plan=&placement, .cluster_inventory=&inventory,
+                .row_capacity=8, .d_model=16, .top_k=2, .graph_family_count=1,
+                .original_native_slots=geometry});
+            ASSERT_EQ(channels.channels.size(), 1u);
+            EXPECT_EQ(channels.channels.front().mapping_layout.geometry.original_native_slots, geometry);
+        }
+        placement.authority_execution = MoEOverlayAuthorityExecutionKind::HostResident;
+        EXPECT_FALSE(MoEOverlayActivationChannelPlanner::originalNativeSlotGeometry(placement,inventory,family));
+        placement.authority_execution = MoEOverlayAuthorityExecutionKind::DeviceResident;
+        placement.domains[1].participants = {GlobalDeviceAddress::cpu(0)};
+        EXPECT_FALSE(MoEOverlayActivationChannelPlanner::originalNativeSlotGeometry(placement,inventory,family));
+        inventory.world_size = 2; inventory.ranks.resize(2);
+        inventory.ranks[1].rank = 1; inventory.ranks[1].node_id = 0;
+        placement.domains[1].world_ranks = {1}; placement.domains[1].owner_rank = 1;
+        EXPECT_FALSE(MoEOverlayActivationChannelPlanner::originalNativeSlotGeometry(placement,inventory,family));
+    }
 } // namespace llaminar2
 
 #include "CPUExpertShardAccountingReplay.inc"

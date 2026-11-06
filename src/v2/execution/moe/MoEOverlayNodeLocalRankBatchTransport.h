@@ -18,6 +18,7 @@
 #include "MoEOverlayActivationChannelPlan.h"
 #include "MoEOverlayActivationEpochProtocol.h"
 #include "MoEOverlayActivationPacketABI.h"
+#include "MoEOverlayOriginalNativeInvocationRetirement.h"
 #include "MoEOverlayRankBatchTransport.h"
 #include "transfer/TransferEngine.h"
 
@@ -95,6 +96,9 @@ namespace llaminar2
         MoEOverlayActivationEpochControl *control_host = nullptr; ///< Scheduler/watchdog view.
         MoEOverlayActivationEpochControl *control_device = nullptr; ///< Exact endpoint alias.
         MoEOverlayActivationDeviceEpochGrant *grant_device = nullptr; ///< Endpoint-private hot-path state.
+        /** Same original K-slot metadata across all retained graph families. */
+        MoEOverlayNativeInvocationDeviceBinding original_invocations;
+        std::uint32_t retained_stage_count=0u; ///< Same frozen actual family manifest length.
         /** Setup publication event consumed once at each stage-zero graph edge. */
         void *grant_initialization_event = nullptr;
         MoEOverlayMappedDispatchDeviceView dispatch; ///< Shared continuation-to-follower packet.
@@ -132,7 +136,8 @@ namespace llaminar2
             };
             return device.is_valid() && target_participant_id >= 0 &&
                    mapped_region && mapped_region->isBound() && control_host &&
-                   control_device && grant_device &&
+                   control_device && grant_device && original_invocations.valid() &&
+                   (!original_invocations.deviceOwned() || retained_stage_count!=0u) &&
                    (!device.is_gpu() || grant_initialization_event) &&
                    shared_dispatch_hidden_rows_fp32 && dispatch.valid() &&
                    returned.valid() &&
@@ -417,6 +422,41 @@ namespace llaminar2
         /** @brief Polymorphic destruction through the capability boundary. */
         virtual ~IMoEOverlayMappedActivationTransport() = default;
 
+        /** @return Original cold planned roster, absent only for explicit host-ordered channels. */
+        [[nodiscard]] virtual const std::optional<MoEOverlayInferenceOriginalSlotGeometry>&
+        originalNativeSlotGeometry() const noexcept = 0;
+        /** @brief Cold-bind the SAME original protocol domain before native capture/publication.
+         * @param domain Actual original publisher protocol domain; geometry/topology must match this mapping.
+         * @throws std::logic_error For absent planned native geometry or foreign/replaced authority.
+         */
+        virtual void bindOriginalNativeSlots(std::shared_ptr<const MoEOverlayInferenceOriginalSlotDomain> domain) = 0;
+        /** @brief Publish one immutable checked admission without mutating live device controls.
+         * @param original Actual original Active/Submitted slot token.
+         * @param target_participant_id Original mapped follower/target.
+         * @param graph_family_ordinal Original retained family; repeated R1 uses the SAME family.
+         * @param epoch_generation Original monotonic per-lane immutable publication generation.
+         * @param timeout_not_before_ns Original admitted watchdog lower bound.
+         * @return Complete authenticated identity retained by the original submission.
+         */
+        [[nodiscard]] virtual MoEOverlayActivationEpochIdentity publishOriginalNativeInvocation(
+            const MoEOverlayInferenceOriginalSlot& original,int target_participant_id,
+            std::size_t graph_family_ordinal,std::uint64_t epoch_generation,
+            std::uint64_t timeout_not_before_ns) = 0;
+        /** @brief Publish existing absorbing cancellation for this exact retained original admission. */
+        virtual void cancelOriginalNativeInvocation(const MoEOverlayInferenceOriginalSlot& original,
+            int target_participant_id,const MoEOverlayActivationEpochIdentity& identity) = 0;
+        /** @return Actual post-payload terminal traffic, read only after aggregate native observation.
+         * @throws std::logic_error For stale, partial, failed or early-Complete records.
+         */
+        [[nodiscard]] virtual MoEOverlayActivationEpochTraffic completedOriginalNativeInvocation(
+            const MoEOverlayInferenceOriginalSlot& original,int target_participant_id,
+            const MoEOverlayActivationEpochIdentity& identity) const = 0;
+        /** @brief Clear only this original slot AFTER the runner observed ALL original native receipts.
+         * Current lane post-payload markers persist; next-request handoff does not read a cleared old ring record.
+         */
+        virtual void clearOriginalNativeInvocation(const MoEOverlayOriginalNativeInvocationRetirement& retired,
+            int target_participant_id,const MoEOverlayActivationEpochIdentity& identity) = 0;
+
         /** @return Number of independently authenticated retained graph families. */
         [[nodiscard]] virtual size_t activationGraphFamilyCount() const noexcept = 0;
 
@@ -536,6 +576,18 @@ namespace llaminar2
         /** @return POSIX mapping bytes, including metadata and both payload directions. */
         size_t mappedBytes() const noexcept;
 
+        const std::optional<MoEOverlayInferenceOriginalSlotGeometry>& originalNativeSlotGeometry() const noexcept override;
+        void bindOriginalNativeSlots(std::shared_ptr<const MoEOverlayInferenceOriginalSlotDomain> domain) override;
+        MoEOverlayActivationEpochIdentity publishOriginalNativeInvocation(
+            const MoEOverlayInferenceOriginalSlot& original,int target_participant_id,std::size_t graph_family_ordinal,
+            std::uint64_t epoch_generation,std::uint64_t timeout_not_before_ns) override;
+        void cancelOriginalNativeInvocation(const MoEOverlayInferenceOriginalSlot& original,
+            int target_participant_id,const MoEOverlayActivationEpochIdentity& identity) override;
+        MoEOverlayActivationEpochTraffic completedOriginalNativeInvocation(const MoEOverlayInferenceOriginalSlot& original,
+            int target_participant_id,const MoEOverlayActivationEpochIdentity& identity) const override;
+        void clearOriginalNativeInvocation(const MoEOverlayOriginalNativeInvocationRetirement& retired,
+            int target_participant_id,const MoEOverlayActivationEpochIdentity& identity) override;
+
         /** @return Number of independently authenticated retained graph families. */
         [[nodiscard]] size_t activationGraphFamilyCount() const noexcept override;
 
@@ -602,12 +654,21 @@ namespace llaminar2
         class Mapping;
         class DeviceGrantStorage;
 
+        /** @return Exact original record after same-domain/current-slot validation. */
+        MoEOverlayNativeInvocationSlot& originalNativeRecord(
+            const MoEOverlayInferenceOriginalSlot& original,int target_participant_id) const;
+        /** @brief Reject a stale/relabelled immutable record before cancel/read/clear. */
+        void requireOriginalNativeIdentity(const MoEOverlayInferenceOriginalSlot& original,
+            const MoEOverlayNativeInvocationSlot& record,int target_participant_id,
+            const MoEOverlayActivationEpochIdentity& identity) const;
         /** @brief Claim a fixed replay-ledger slot or reject stale reuse. */
         bool claimTransaction(
             const MoEOverlayRankBatchKey &key,
             std::vector<std::optional<MoEOverlayRankBatchKey>> &ledger,
             std::string *error);
 
+        /** Same actual original publisher domain; no second slot allocator or live ledger. */
+        std::shared_ptr<const MoEOverlayInferenceOriginalSlotDomain> original_slot_domain_;
         MoEOverlayRankBatchTransportConfig config_;
         TransferEngine transfer_engine_;
         std::shared_ptr<Mapping> mapping_;

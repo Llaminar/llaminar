@@ -9,6 +9,7 @@
  */
 
 #include "MoEOverlayInferenceTransaction.h"
+#include "MoEOverlayInferenceOriginalSlot.h"
 #include "MoEExpertOwnerMap.h"
 #include "execution/mtp/MTPWeightManifest.h"
 #include "loaders/IModelLoader.h"
@@ -720,12 +721,90 @@ namespace llaminar2
             throw std::invalid_argument(
                 "ExpertOverlay inference transaction protocol requires valid topology, positive row/request capacities, and non-negative MTP depth");
         }
+        original_slot_domain_ = std::shared_ptr<const MoEOverlayInferenceOriginalSlotDomain>(
+            new MoEOverlayInferenceOriginalSlotDomain(this, slots_.size(), config_.max_mtp_draft_depth, config_.topology));
+    }
+
+    MoEOverlayInferenceTransactionProtocol::~MoEOverlayInferenceTransactionProtocol()
+    {
+        if (original_slot_domain_)
+        {
+            std::lock_guard lock(original_slot_domain_->ownership_mutex_);
+            if (original_slot_domain_->owner_ == this)
+                original_slot_domain_->owner_ = nullptr;
+        }
+    }
+
+    const MoEOverlayInferenceTransactionProtocol &
+    MoEOverlayInferenceOriginalSlotDomain::requireRetainedOwner(
+        const MoEOverlayInferenceOriginalSlot &slot) const
+    {
+        if (!owner_ || slot.domain().get() != this ||
+            slot.domain().owner_before(owner_->original_slot_domain_) ||
+            owner_->original_slot_domain_.owner_before(slot.domain()) ||
+            slot.index() >= owner_->slots_.size())
+            throw std::logic_error("Native resource names a foreign or withdrawn original slot owner");
+        const auto &original = owner_->slots_[slot.index()];
+        if (original.state == MoEOverlayInferenceTransactionSlotState::Available ||
+            original.ticket != slot.ticket())
+            throw std::logic_error("Native resource names a retired or replaced original publication slot");
+        return *owner_;
+    }
+
+    void MoEOverlayInferenceOriginalSlotDomain::requireCurrent(
+        const MoEOverlayInferenceOriginalSlot &slot) const
+    {
+        std::lock_guard lock(ownership_mutex_);
+        (void)requireRetainedOwner(slot);
+    }
+
+    void MoEOverlayInferenceOriginalSlotDomain::requireActiveOwnerLocked(
+        const MoEOverlayInferenceOriginalSlot &slot) const
+    {
+        const auto &owner = requireRetainedOwner(slot);
+        if (owner.state_ != MoEOverlayInferenceProtocolState::Active ||
+            owner.slots_[slot.index()].state != MoEOverlayInferenceTransactionSlotState::Submitted)
+            throw std::logic_error("Native execution admission lost its original active submitted protocol slot");
+    }
+
+    void MoEOverlayInferenceOriginalSlotDomain::requireActiveAdmission(
+        const MoEOverlayInferenceOriginalSlot &slot) const
+    {
+        std::lock_guard lock(ownership_mutex_);
+        requireActiveOwnerLocked(slot);
+    }
+
+    std::shared_ptr<const MoEOverlayInferenceOriginalSlotDomain>
+    MoEOverlayInferenceTransactionProtocol::originalSlotDomain() const
+    {
+        std::lock_guard lock(original_slot_domain_->ownership_mutex_);
+        if (original_slot_domain_->owner_ != this)
+            throw std::logic_error("Native invocation slots require their original protocol owner");
+        return original_slot_domain_;
+    }
+
+    MoEOverlayInferenceOriginalSlot
+    MoEOverlayInferenceTransactionProtocol::originalSubmittedSlot(
+        const MoEOverlayInferenceTransactionTicket &ticket) const
+    {
+        const auto domain = originalSlotDomain();
+        std::lock_guard lock(domain->ownership_mutex_);
+        for (std::size_t index = 0; index < slots_.size(); ++index)
+        {
+            const auto &slot = slots_[index];
+            if (state_ == MoEOverlayInferenceProtocolState::Active &&
+                slot.state == MoEOverlayInferenceTransactionSlotState::Submitted &&
+                slot.ticket == ticket)
+                return MoEOverlayInferenceOriginalSlot(domain, index, ticket);
+        }
+        throw std::invalid_argument("Native invocation has no exact original submitted protocol slot");
     }
 
     bool MoEOverlayInferenceTransactionProtocol::beginCommand(
         const MoEOverlayInferenceCommandIdentity &command,
         std::string *error)
     {
+        std::lock_guard native_slot_lock(original_slot_domain_->ownership_mutex_);
         if (error)
             error->clear();
         if (!command.valid())
@@ -804,6 +883,7 @@ namespace llaminar2
     MoEOverlayInferenceTransactionProtocol::accept(
         const MoEOverlayInferenceTransactionTicket &ticket)
     {
+        std::lock_guard native_slot_lock(original_slot_domain_->ownership_mutex_);
         MoEOverlayInferenceAdmission admission;
         admission.error = validateExecutionTicket(ticket);
         if (!admission.error.empty())
@@ -872,6 +952,7 @@ namespace llaminar2
         MoEOverlayInferenceTransactionSlotState next,
         std::string *error)
     {
+        std::lock_guard native_slot_lock(original_slot_domain_->ownership_mutex_);
         if (error)
             error->clear();
         if (slot_index >= slots_.size())

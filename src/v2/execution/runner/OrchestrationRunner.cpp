@@ -23017,6 +23017,8 @@ namespace llaminar2
                     .top_k = top_k,
                     .graph_family_count =
                         activation_graph_families.size(),
+                    .original_native_slots = MoEOverlayActivationChannelPlanner::originalNativeSlotGeometry(
+                        placement, cluster_inventory_, graph_family),
                 });
 
             for (const auto &channel : activation_channel_plan.channels)

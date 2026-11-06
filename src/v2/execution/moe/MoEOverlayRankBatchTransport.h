@@ -22,6 +22,7 @@
 #pragma once
 
 #include "MoEOverlaySparseCollective.h"
+#include "MoEOverlayInferenceOriginalSlot.h"
 
 #include <mpi.h>
 
@@ -400,10 +401,35 @@ namespace llaminar2
             int target_world_rank,
             std::span<const int> participant_ids) const;
 
+        /**
+         * @brief Inspect the original rank-pair channels before any graph/cache creator.
+         * @param source_world_rank Original continuation authority rank.
+         * @param target_world_rank Original auxiliary owner rank.
+         * @param complete_endpoint_ids Complete admitted original auxiliary endpoint set.
+         * @return Uniform native geometry, or absent for the explicit legacy host-ordered policy.
+         * @throws std::logic_error For mixed native declarations, duplicate/foreign/missing native endpoints.
+         */
+        [[nodiscard]] std::optional<MoEOverlayInferenceOriginalSlotGeometry> originalNativeSlotGeometryFor(
+            int source_world_rank,int target_world_rank,std::span<const int> complete_endpoint_ids) const;
+        /**
+         * @brief Bind the SAME original publisher domain to that complete cold rank-pair projection.
+         * @param domain Actual same original protocol roster; geometry/topology must match every channel.
+         * @param source_world_rank Original continuation authority rank.
+         * @param target_world_rank Original auxiliary owner rank.
+         * @param complete_endpoint_ids Same complete admitted endpoint set inspected above.
+         * @throws std::logic_error For absent/mismatched native declaration or original authority.
+         */
+        void bindOriginalNativeSlotsFor(std::shared_ptr<const MoEOverlayInferenceOriginalSlotDomain> domain,
+            int source_world_rank,int target_world_rank,std::span<const int> complete_endpoint_ids) const;
+
         /** @return Number of immutable channels installed during preflight. */
         [[nodiscard]] std::size_t size() const;
 
     private:
+        struct OriginalNativeProjection;
+        /** @brief Validate only original registry/config metadata while mutex_ is held. */
+        OriginalNativeProjection originalNativeProjectionLocked(int source_world_rank,int target_world_rank,
+            std::span<const int> complete_endpoint_ids) const;
         /** Protects setup publication from concurrent graph construction. */
         mutable std::mutex mutex_;
         /** Exact canonical identity to process-local transport lifetime. */

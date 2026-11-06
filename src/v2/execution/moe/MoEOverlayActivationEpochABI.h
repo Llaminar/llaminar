@@ -78,7 +78,9 @@ namespace llaminar2
     inline constexpr std::uint32_t kMoEOverlayActivationMagic = 0x41454f4du;
 
     /** Current binary layout and semantic-contract version. */
-    inline constexpr std::uint32_t kMoEOverlayActivationABIVersion = 8u;
+    inline constexpr std::uint32_t kMoEOverlayActivationABIVersion = 9u;
+    /** Original host-ordered identities have no native roster index. */
+    inline constexpr std::uint32_t kMoEOverlayActivationOriginalNoSlot = 0xffffffffu;
 
     /** Device endpoint participating in one sparse activation round trip. */
     enum class MoEOverlayActivationEndpoint : std::uint32_t
@@ -299,7 +301,9 @@ namespace llaminar2
         std::uint32_t lane_ordinal = 0u;
         std::uint32_t return_role = 0u; ///< Authenticated original channel return policy.
         std::int32_t cohort_target = -1; ///< Same immutable channel cohort tag.
-        std::uint32_t reserved[3] = {};
+        /** Actual original protocol index; device-selected, never capture-depth-derived. */
+        std::uint32_t original_slot_index = kMoEOverlayActivationOriginalNoSlot;
+        std::uint32_t reserved[2] = {};
 
         bool operator==(
             const MoEOverlayActivationEpochIdentity &) const = default;
@@ -384,6 +388,7 @@ namespace llaminar2
         LLAMINAR_MOE_ACTIVATION_MIX(lane_ordinal);
         LLAMINAR_MOE_ACTIVATION_MIX(return_role);
         LLAMINAR_MOE_ACTIVATION_MIX(cohort_target);
+        LLAMINAR_MOE_ACTIVATION_MIX(original_slot_index);
 #undef LLAMINAR_MOE_ACTIVATION_MIX
         if (digest.low == 0u)
             digest.low = 0x9e3779b97f4a7c15ull;
@@ -490,6 +495,9 @@ namespace llaminar2
          */
         std::uint64_t published_shared_hidden_bytes = 0u;
 
+        /** Exact post-payload release marker; semantic Complete alone cannot rearm a native lane. */
+        std::uint64_t payload_retired_generation = 0u;
+
         /*
          * These totals are deliberately part of the endpoint-owned ABI rather
          * than host-side mirrors.  The continuation accumulates dispatch
@@ -582,6 +590,26 @@ namespace llaminar2
         return leased == 0u
                    ? 0u
                    : (generation << kMoEOverlayActivationVisitBits) | leased;
+    }
+
+    /**
+     * @brief Authenticate the current identity before its final publication acquire.
+     * @param identity_generation Generation copied with the immutable record.
+     * @param current_generation Fresh generation read before the final ready acquire.
+     * @param ready_signal Final system-acquired publication, never a cached prior ready.
+     * @return Whether the same nonzero record is currently published.
+     * A queued reader can acquire a prior ready word before the native source
+     * closes it. That earlier acquire cannot authorize newly installed fields.
+     */
+    [[nodiscard]] LLAMINAR_MOE_ACTIVATION_HD constexpr bool
+    moeOverlayActivationAdmissionPublicationMatches(
+        std::uint64_t identity_generation,
+        std::uint64_t current_generation,
+        std::uint64_t ready_signal) noexcept
+    {
+        return identity_generation != 0u &&
+               current_generation == identity_generation &&
+               ready_signal == kMoEOverlayActivationAdmissionTimeline;
     }
 
     static_assert(kMoEOverlayActivationBufferCount == 2u);

@@ -7,6 +7,7 @@
 #include "fixtures/backends/NativeContextPreparationReplayAccess.h"
 #include "mocks/MockWorkerGPUContext.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
+#include "execution/moe/MoEOverlayInferenceTransaction.h"
 #include <gtest/gtest.h>
 namespace llaminar2::test { namespace {
 /** @brief Recorded original worker placement and exact stack without SDK resource creation. */
@@ -14,6 +15,15 @@ class SourceBoundWorker final:public testing::MockWorkerGPUContext {
 public:
     SourceBoundWorker(int ordinal,std::shared_ptr<PreparedGPUWorkerStack> root):MockWorkerGPUContext(ordinal){thread_.start(std::move(root),[](void*){},nullptr);}
     ~SourceBoundWorker()override{thread_.join();}
+    /** @brief Replay a precise native creator failure after earlier handles were accepted. */
+    void* createEvent(GPUEventPurpose purpose=GPUEventPurpose::Ordering)override{
+        ++eventAttempts;
+        if(failEventAttempt && eventAttempts==failEventAttempt)return nullptr;
+        return MockWorkerGPUContext::createEvent(purpose);
+    }
+    /** @brief Preserve original destroy behavior while observing partial accepted-handle cleanup. */
+    void destroyEvent(void* event)override{++eventDestructions;MockWorkerGPUContext::destroyEvent(event);}
+    int eventAttempts=0,eventDestructions=0,failEventAttempt=0;
 private:PreparedGPUWorkerThread thread_;
 };
 }
@@ -90,10 +100,17 @@ TEST(NativeOrderingOriginalSource, CaptureTerminalSingletonsUseOriginalPMAAndExa
     {
         std::vector<PreparedGPUContextUsePermit> permits;
         for(const auto device:devices)permits.push_back(source->acquire(device));
+        const auto geometry=MoEOverlayInferenceOriginalSlotGeometry::forRetainedDraftCapacity(3);
         PhysicalMemoryPlanBuilder extra;
         for(std::size_t i=0;i<devices.size();++i){
             const auto one=NativeOrderingEventGroup::bom(program,host,observed[i+1]);
             for(int count=0;count<2;++count)for(const auto& row:one.resources())extra.add(row);
+            const auto recurrent=OriginalSlotCaptureTerminals::extraEventBOM(geometry,host,observed[i+1]);
+            for(const auto& row:recurrent.resources())extra.add(row);
+            // A separate cold partial-creator failure retains its own full
+            // opaque allowance; never borrow the successful cache population.
+            for(const auto& row:one.resources())extra.add(row);
+            for(const auto& row:recurrent.resources())extra.add(row);
         }
         source->freezeForPlanning();
         PhysicalMemoryPlanBuilder plan(source->mandatoryBOM());const auto extraPlan=extra.build();
@@ -102,10 +119,17 @@ TEST(NativeOrderingOriginalSource, CaptureTerminalSingletonsUseOriginalPMAAndExa
         for(std::size_t i=0;i<devices.size();++i){
             const auto device=devices[i];auto worker=permits[i].worker();
             const auto baseline=memory->reservedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent);
-            Cache first,second,unpriced;int firstStream=1,secondStream=2;
+            const MoEOverlayInferenceTopologyIdentity topology{.workspace_generation=71,
+                .topology_fingerprint_low=0x1234,.topology_fingerprint_high=0x5678,
+                .source_world_rank=0,.target_world_rank=1};
+            MoEOverlayInferenceTransactionProtocol protocol({.topology=topology,
+                .slot_count=geometry.slotCount(),.max_request_count=1,.max_rows_per_request=1,.max_mtp_draft_depth=3});
+            // Actual protocol outlives every cache drain; no receipt survives its original owner.
+            Cache first,second,unpriced,partial;int firstStream=1,secondStream=2;
             ASSERT_TRUE(first.bindBorrowedCaptureStream(worker.get(),&firstStream,device));
             ASSERT_TRUE(second.bindBorrowedCaptureStream(worker.get(),&secondStream,device));
             ASSERT_TRUE(unpriced.bindBorrowedCaptureStream(worker.get(),&firstStream,device));
+            ASSERT_TRUE(partial.bindBorrowedCaptureStream(worker.get(),&secondStream,device));
             worker->submitAndWait([&]{
                 auto alias=std::shared_ptr<PhysicalMemoryAuthority>(memory.get(),[](auto*){});
                 EXPECT_THROW(first.prepareCaptureStreamTerminal(worker.get(),alias),std::logic_error);
@@ -118,12 +142,80 @@ TEST(NativeOrderingOriginalSource, CaptureTerminalSingletonsUseOriginalPMAAndExa
                 ASSERT_TRUE(second.prepareCaptureStreamTerminal(worker.get(),memory));
                 EXPECT_NE(first.terminal_event,second.terminal_event);
                 EXPECT_EQ(memory->reservedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent),baseline+2*one);
+                EXPECT_THROW(first.bindOriginalCaptureTerminalSlots(protocol.originalSlotDomain(),memory,
+                    MoEOverlayInferenceOriginalSlotGeometry::forRetainedDraftCapacity(1)),std::logic_error);
+                first.bindOriginalCaptureTerminalSlots(protocol.originalSlotDomain(),memory,geometry);
+                EXPECT_EQ(memory->reservedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent),
+                    baseline+(geometry.slotCount()+1)*one);
+                ASSERT_TRUE(partial.prepareCaptureStreamTerminal(worker.get(),memory));
+                auto& observedWorker=dynamic_cast<SourceBoundWorker&>(*worker);
+                const auto destroyed=observedWorker.eventDestructions;
+                observedWorker.failEventAttempt=observedWorker.eventAttempts+2;
+                EXPECT_THROW(partial.bindOriginalCaptureTerminalSlots(protocol.originalSlotDomain(),memory,geometry),std::runtime_error);
+                observedWorker.failEventAttempt=0;
+                EXPECT_EQ(observedWorker.eventDestructions,destroyed+1);
+                EXPECT_FALSE(partial.original_slot_terminals);
+                EXPECT_EQ(memory->reservedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent),
+                    baseline+(2*geometry.slotCount()+1)*one);
                 EXPECT_THROW(unpriced.prepareCaptureStreamTerminal(worker.get(),memory),std::logic_error);
                 EXPECT_EQ(unpriced.terminal_event,nullptr);
                 // Device budgets are separate, while the one original source/PMA
                 // owns the combined host commitment for both backend populations.
             });
-            first.reset(Cache::StreamResetPolicy::Destroy);second.reset(Cache::StreamResetPolicy::Destroy);
+            for(std::uint64_t request=1;request<=20;++request){
+                const MoEOverlayInferenceCommandIdentity command{request,request,41};
+                ASSERT_TRUE(protocol.beginCommand(command));
+                std::vector<Cache::CaptureStreamTerminalTicket> receipts;
+                std::vector<MoEOverlayInferenceOriginalSlot> slots;
+                for(std::uint64_t ordinal=1;ordinal<=3;++ordinal){
+                    const auto ticket=makeMoEOverlayInferenceExecutionTicket(topology,command,ordinal,ordinal,41,
+                        MoEOverlayInferenceGraphRole::MTPDraft,1,1,1,3,int(ordinal-1));
+                    const auto admitted=protocol.accept(ticket);ASSERT_TRUE(admitted.accepted());
+                    ASSERT_TRUE(protocol.markSubmitted(admitted.slot_index,ticket));
+                    slots.push_back(protocol.originalSubmittedSlot(ticket));
+                    worker->submitAndWait([&]{receipts.push_back(first.publishCaptureStreamTerminal(slots.back()));});
+                }
+                // Moving the actual cache cannot replace event/token identity
+                // or drop any outstanding invocation's physical ownership.
+                if(request==10){Cache moved(std::move(first));first=std::move(moved);}
+                // All three exact records exist before the first host observation.
+                worker->submitAndWait([&]{first.enqueuePublishedCaptureStreamTerminalWait(receipts.back(),&secondStream,worker.get());});
+                for(const auto& receipt:receipts)
+                    first.waitForPublishedCaptureStreamTerminal(receipt,Cache::HostFenceWaitPolicy::ActiveProgress);
+                worker->submitAndWait([&]{first.enqueuePublishedCaptureStreamTerminalWait(receipts.back(),&secondStream,worker.get());});
+                for(const auto& slot:slots){
+                    ASSERT_TRUE(protocol.markReturnReady(slot.index(),slot.ticket()));
+                    ASSERT_TRUE(protocol.retire(slot.index(),slot.ticket()));
+                }
+                const auto complete=makeMoEOverlayInferenceTerminalTicket(topology,command,4,41,
+                    MoEOverlayInferenceTransactionAction::Complete);
+                ASSERT_TRUE(protocol.accept(complete).completed());
+                first.reset(Cache::StreamResetPolicy::Preserve);
+            }
+            const MoEOverlayInferenceCommandIdentity failedCommand{21,21,41};
+            ASSERT_TRUE(protocol.beginCommand(failedCommand));
+            std::vector<MoEOverlayInferenceOriginalSlot> failedSlots;
+            for(std::uint64_t ordinal=1;ordinal<=2;++ordinal){
+                const auto ticket=makeMoEOverlayInferenceExecutionTicket(topology,failedCommand,ordinal,ordinal,41,
+                    MoEOverlayInferenceGraphRole::MTPDraft,1,1,1,3,int(ordinal-1));
+                const auto admitted=protocol.accept(ticket);ASSERT_TRUE(admitted.accepted());
+                ASSERT_TRUE(protocol.markSubmitted(admitted.slot_index,ticket));
+                failedSlots.push_back(protocol.originalSubmittedSlot(ticket));
+                worker->submitAndWait([&]{(void)first.publishCaptureStreamTerminal(failedSlots.back());});
+            }
+            const auto aborted=makeMoEOverlayInferenceTerminalTicket(topology,failedCommand,3,41,
+                MoEOverlayInferenceTransactionAction::Abort,91);
+            ASSERT_EQ(protocol.accept(aborted).status,MoEOverlayInferenceAdmissionStatus::Aborted);
+            EXPECT_THROW(protocol.originalSlotDomain()->requireActiveAdmission(failedSlots.front()),std::logic_error);
+            // The actual cache destructor/reset drains both retained native
+            // records even after logical abort, before original slots retire.
+            first.reset(Cache::StreamResetPolicy::Destroy);
+            for(const auto& slot:failedSlots){
+                ASSERT_TRUE(protocol.markReturnReady(slot.index(),slot.ticket()));
+                ASSERT_TRUE(protocol.retire(slot.index(),slot.ticket()));
+            }
+            second.reset(Cache::StreamResetPolicy::Destroy);
+            partial.reset(Cache::StreamResetPolicy::Destroy);
         }
     }
     for(const auto device:devices){auto scope=GPUDeviceContextPool::instance().beginExclusiveGenerationRetirement(device);Access::physicalReset(scope);}

@@ -156,6 +156,18 @@ namespace llaminar2
             std::string *error = nullptr);
 
         /**
+         * @brief Describe a checked original submission without touching live device controls.
+         * @param original Exact already-Submitted token from the original active protocol.
+         * @param epoch_generation Original immutable per-lane publication generation.
+         * @return Same identity construction used by arm; native handoff owns live mutation.
+         * @throws std::logic_error For absent/stale/aborted/foreign channel or invalid generation.
+         * This method reads only the frozen channel header. It neither infers
+         * completion nor resets/arms a GPU-owned control block from the host.
+         */
+        [[nodiscard]] MoEOverlayActivationEpochIdentity describeOriginalNativeSubmission(
+            const MoEOverlayInferenceOriginalSlot &original,std::uint64_t epoch_generation) const;
+
+        /**
          * @brief Validate the armed identity and make one endpoint device-active.
          * @return False and terminally aborts that endpoint on any mismatch.
          */
@@ -344,6 +356,18 @@ namespace llaminar2
 
     private:
         friend class MoECPUExpertShardRouteStage;
+        friend class MoEOverlayNodeLocalRankBatchTransport;
+        /** @brief Canonical terminal traffic validation; no live-control mirror or retirement permission. */
+        static std::optional<MoEOverlayActivationEpochTraffic> completedSnapshotTraffic(
+            const MoEOverlayActivationEpochIdentity& identity,std::uint32_t return_role,
+            const MoEOverlayActivationEndpointStatus& continuation,
+            const MoEOverlayActivationEndpointStatus& follower,std::string* error);
+
+        /** @return Whether the immutable ticket authenticates this exact frozen channel. */
+        [[nodiscard]] bool ticketAuthenticatesChannel(const MoEOverlayInferenceTransactionTicket &ticket) const noexcept;
+        /** @return Original identity construction, shared by host arm and native immutable admission. */
+        [[nodiscard]] MoEOverlayActivationEpochIdentity immutableTicketIdentity(
+            const MoEOverlayInferenceTransactionTicket &ticket,std::uint64_t epoch_generation) const noexcept;
         /** @brief One original publication body; joint scope requires its actual completed witness. */
         bool publishReturnImpl(const MoEOverlayActivationEpochIdentity &identity,
             std::uint32_t stage,std::uint64_t bytes,const CPUExpertShardRouteCompletion *completed,std::string *error);

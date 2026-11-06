@@ -598,6 +598,7 @@ namespace llaminar2
                         .top_k = profile.expert_used_count,
                         .graph_family_count =
                             input.activation_graph_family_count,
+                        .original_native_slots = input.original_native_slots,
                     });
             }
             std::set<DeviceId> endpoint_devices;
@@ -1173,6 +1174,48 @@ namespace llaminar2
                     << device_plan.retained_workspace_bytes()
                     << " total=" << device_plan.total_bytes());
                 physical_plan_builder.add(device_plan.bom());
+            }
+
+            if (input.original_native_slots)
+            {
+                const auto expected = MoEOverlayActivationChannelPlanner::originalNativeSlotGeometry(
+                    *input.overlay_plan, *input.cluster_inventory, family);
+                if (expected != input.original_native_slots)
+                    throw std::invalid_argument("Follower terminal BOM changed its original retained slot geometry");
+                const auto cache_count = MoEOverlayActivationChannelPlanner::followerCaptureCacheCount(
+                    input.activation_channel_row_capacity, family, input.activation_prefill_graph_rows);
+                const auto [host_total, host_available] = inventoryMemory(inventory, DeviceId::cpu());
+                const PhysicalMemoryResource host{
+                    .world_rank = rank_plan.rank, .device = DeviceId::cpu(),
+                    .total_bytes = host_total,
+                    .admission_available_bytes = usableMemory(host_available, DeviceId::cpu(), input)};
+                for (const auto& channel : result.activation_channel_plan.channels)
+                {
+                    if (channel.target_world_rank != rank_plan.rank) continue;
+                    for (const auto& endpoint : channel.target_lanes)
+                    {
+                        if (!endpoint.device.is_gpu())
+                            throw std::invalid_argument("Native follower terminals require original GPU endpoints");
+                        const auto [total, available] = inventoryMemory(inventory, endpoint.device);
+                        const PhysicalMemoryResource gpu{
+                            .world_rank = rank_plan.rank, .device = endpoint.device,
+                            .total_bytes = total,
+                            .admission_available_bytes = usableMemory(available, endpoint.device, input)};
+                        for (std::size_t cache = 0; cache < cache_count; ++cache)
+                        {
+                            // Preserve the original certificate origin for both programs.
+                            // Slot zero is the existing cache event; only K-1 are additional.
+                            for (const auto program : {
+                                NativeOrderingEventProgram::captureSubmissionRetirement(),
+                                NativeOrderingEventProgram::retainedCaptureTerminals(*input.original_native_slots)})
+                            {
+                                const auto events = input.native_ordering_events.bom(program, host, gpu);
+                                for (const auto& contribution : events.resources())
+                                    physical_plan_builder.add(contribution);
+                            }
+                        }
+                    }
+                }
             }
 
             // Setup probes execute serially through one original reusable

@@ -13,6 +13,7 @@
 #pragma once
 
 #include "MoEOverlayCapacityAdmission.h"
+#include "MoEOverlayInferenceOriginalSlot.h"
 #include "MoEOverlayNodeLocalActivationLayout.h"
 #include "MoERoutedExpertPlacementPlan.h"
 #include "execution/mpi_orchestration/DeviceInventory.h"
@@ -103,6 +104,8 @@ namespace llaminar2
         int d_model = 0;
         int top_k = 0;
         std::size_t graph_family_count = 0;
+        /** Same cold original protocol roster; absent for host-ordered transports. */
+        std::optional<MoEOverlayInferenceOriginalSlotGeometry> original_native_slots;
     };
 
     /**
@@ -118,6 +121,32 @@ namespace llaminar2
     class MoEOverlayActivationChannelPlanner final
     {
     public:
+        /**
+         * @brief Resolve native slot eligibility from the original bound placement.
+         * @param placement Original device/host authority and participant declarations.
+         * @param inventory Complete original world topology.
+         * @param family Original retained graph family, including its draft ceiling.
+         * @return Native geometry only for a world-one device-owned mapped follower group.
+         * @throws std::invalid_argument For an incomplete family or bound topology.
+         * This is a cold BOM declaration; it grants no execution or source authority.
+         */
+        [[nodiscard]] static std::optional<MoEOverlayInferenceOriginalSlotGeometry>
+        originalNativeSlotGeometry(const MoERoutedExpertPlacementPlan& placement,
+            const ClusterInventory& inventory,
+            const MoEOverlayInferenceGraphFamilyIdentity& family);
+
+        /**
+         * @brief Count the actual main and learned follower cache row manifests.
+         * @param maximum_rows Original admitted main activation-row ceiling.
+         * @param family Original decode/request bounds and actual learned source-layer list.
+         * @param prefill_rows Exact schedule-owned ordered retained prefill identities.
+         * @return Cache count per original mapped follower endpoint, independent of K.
+         * @throws std::invalid_argument For incomplete row/family declarations.
+         * @throws std::overflow_error If the immutable cache roster overflows.
+         */
+        [[nodiscard]] static std::size_t followerCaptureCacheCount(int maximum_rows,
+            const MoEOverlayInferenceGraphFamilyIdentity& family, std::span<const int> prefill_rows);
+
         /**
          * @brief Report whether any participant requires a distinct retained endpoint channel.
          * @param placement Frozen, hardware-bound routed placement.

@@ -17,6 +17,7 @@
  */
 
 #include "DeviceGraphExecutor.h"
+#include "backends/NativeOrderingEventGroup.h"
 #include "../../../backends/ReadAheadNativeResourceFamily.h"
 #include "../../../backends/NativeContextPreparation.h"
 #include "DeviceGraphCaptureController.h"
@@ -46,6 +47,104 @@
 
 namespace llaminar2
 {
+    struct OriginalSlotCaptureTerminals::State final {
+        OriginalSlotCaptureTerminalState receipts;
+        std::shared_ptr<IWorkerGPUContext> worker;
+        GPUContextProvenance original;
+        std::shared_ptr<PhysicalMemoryAuthority> memory;
+        DeviceId device;
+        void* stream;
+        std::vector<void*> events;
+        std::unique_ptr<NativeOrderingEventGroup> extra_obligations;
+        /** @brief Retain the original roster/source before any additional native creator. */
+        State(std::shared_ptr<const MoEOverlayInferenceOriginalSlotDomain> domain,
+            std::shared_ptr<IWorkerGPUContext> w,GPUContextProvenance source,
+            std::shared_ptr<PhysicalMemoryAuthority> m,DeviceId d,void* st,void* singleton)
+            :receipts(std::move(domain)),worker(std::move(w)),original(std::move(source)),
+             memory(std::move(m)),device(d),stream(st),events(receipts.slotCount(),nullptr) {
+            events[0]=singleton;
+        }
+    };
+    PhysicalMemoryPlan OriginalSlotCaptureTerminals::extraEventBOM(
+        const MoEOverlayInferenceOriginalSlotGeometry& geometry,PhysicalMemoryResource host,PhysicalMemoryResource gpu)
+    {
+        return NativeOrderingEventGroup::bom(
+            NativeOrderingEventProgram::retainedCaptureTerminals(geometry),host,gpu);
+    }
+    OriginalSlotCaptureTerminals::OriginalSlotCaptureTerminals(std::unique_ptr<State> state):state_(std::move(state)){}
+    std::unique_ptr<OriginalSlotCaptureTerminals> OriginalSlotCaptureTerminals::create(
+        std::shared_ptr<const MoEOverlayInferenceOriginalSlotDomain> domain,
+        std::shared_ptr<IWorkerGPUContext> worker,std::shared_ptr<PhysicalMemoryAuthority> memory,
+        DeviceId device,void* stream,void* singleton)
+    {
+        if(!domain || !memory || !worker || !device.is_gpu() || !stream || !singleton || isGraphCaptureActive())
+            throw std::invalid_argument("Original capture terminals require cold original source/stream/slot owners");
+        const auto prepared=GPUDeviceContextPool::instance().retainExistingPreparedContext(device,memory);
+        prepared.provenance().requireWorker(worker);
+        if(!worker->ownsCurrentThread())throw std::logic_error("Original capture terminals require their exact source worker");
+        // Claim the SAME opaque-event population before constructing its
+        // proportional receipt/event metadata, not only before SDK creators.
+        auto obligations=NativeOrderingEventGroup::claim(memory,prepared.provenance(),
+            NativeOrderingEventProgram::retainedCaptureTerminals(*domain));
+        auto state=std::make_unique<State>(std::move(domain),worker,prepared.provenance(),std::move(memory),device,stream,singleton);
+        state->extra_obligations=std::move(obligations);
+        state->extra_obligations->beginNativeAttempt();
+        try {
+            for(std::size_t slot=1;slot<state->events.size();++slot) {
+                state->events[slot]=worker->createEvent(GPUEventPurpose::Ordering);
+                if(!state->events[slot])throw std::runtime_error("Original capture terminal event creation failed");
+            }
+        } catch(...) {
+            // No graph can use these cold handles yet. Retire every accepted
+            // creator before completing original physical-lifetime ownership.
+            try {for(std::size_t slot=1;slot<state->events.size();++slot)
+                if(state->events[slot])worker->destroyEvent(state->events[slot]);}
+            catch(...) {std::terminate();}
+            state->extra_obligations->completeNativeHandles();
+            throw;
+        }
+        return std::unique_ptr<OriginalSlotCaptureTerminals>(new OriginalSlotCaptureTerminals(std::move(state)));
+    }
+    OriginalSlotCaptureTerminals::~OriginalSlotCaptureTerminals()noexcept {
+        try {
+            if(!state_)return;
+            if(state_->receipts.nextOutstanding())throw std::logic_error("Original capture terminal has unobserved native receipts");
+            auto destroy=[&] {
+                if(isGraphCaptureActive())throw std::logic_error("Original capture terminal destruction entered graph capture");
+                for(std::size_t slot=1;slot<state_->events.size();++slot)
+                    if(state_->events[slot]) {state_->worker->destroyEvent(state_->events[slot]);state_->events[slot]=nullptr;}
+            };
+            if(state_->worker->ownsCurrentThread())destroy();
+            else state_->worker->submitAndWait(destroy);
+            state_->extra_obligations->completeNativeHandles();
+        }
+        catch(...) {LOG_ERROR("Original capture terminal destruction lacks exact native closure");std::terminate();}
+    }
+    void OriginalSlotCaptureTerminals::requireOwner(IWorkerGPUContext* worker,void* stream)const {
+        if(!state_ || worker!=state_->worker.get() || stream!=state_->stream || !stream)
+            throw std::logic_error("Original capture terminal changed exact worker/stream");
+        state_->original.requireWorker(state_->worker);
+    }
+    void* OriginalSlotCaptureTerminals::eventForPublication(const MoEOverlayInferenceOriginalSlot& slot,
+        IWorkerGPUContext* worker,void* stream)const {
+        requireOwner(worker,stream);
+        if(!worker->ownsCurrentThread())throw std::logic_error("Original terminal publication requires its exact worker thread");
+        state_->receipts.requirePublication(slot);return state_->events.at(slot.index());
+    }
+    OriginalSlotCaptureTerminals::Receipt OriginalSlotCaptureTerminals::published(const MoEOverlayInferenceOriginalSlot& slot) {
+        return state_->receipts.publish(slot);
+    }
+    void* OriginalSlotCaptureTerminals::eventForObservation(const Receipt& receipt,IWorkerGPUContext* worker,void* stream)const {
+        requireOwner(worker,stream);state_->receipts.requireObservation(receipt);return state_->events.at(receipt.originalSlot().index());
+    }
+    void* OriginalSlotCaptureTerminals::eventForDeviceDependency(const Receipt& receipt,IWorkerGPUContext* worker,void* stream)const {
+        requireOwner(worker,stream);state_->receipts.requireDeviceDependency(receipt);
+        return state_->events.at(receipt.originalSlot().index());
+    }
+    void OriginalSlotCaptureTerminals::observed(const Receipt& receipt){state_->receipts.observed(receipt);}
+    std::optional<OriginalSlotCaptureTerminals::Receipt> OriginalSlotCaptureTerminals::nextOutstanding()const{return state_->receipts.nextOutstanding();}
+    const std::shared_ptr<const MoEOverlayInferenceOriginalSlotDomain>&OriginalSlotCaptureTerminals::domain()const noexcept{return state_->receipts.domain();}
+
     namespace
     {
         /** @return Stable diagnostic label for one ordered-timeline step kind. */
@@ -998,6 +1097,35 @@ namespace llaminar2
         return true;
     }
 
+    void DeviceGraphExecutor::GraphSegmentCache::bindOriginalCaptureTerminalSlots(
+        std::shared_ptr<const MoEOverlayInferenceOriginalSlotDomain> domain,
+        std::shared_ptr<PhysicalMemoryAuthority> memory,
+        const MoEOverlayInferenceOriginalSlotGeometry& original_geometry)
+    {
+        if(!domain || domain->geometry()!=original_geometry || !terminal_event_obligation)
+            throw std::logic_error("Original capture terminal roster differs from its admitted retained geometry");
+        if(initialized || !segments.empty() || original_slot_terminals ||
+            terminal_fence_published_generation || terminal_fence_observed_generation || !terminal_event)
+            throw std::logic_error("Original capture terminal slots bind exactly once before materialization");
+        auto* context=requireLifecycleContext("original capture terminal slot binding");
+        const auto original=GPUDeviceContextPool::instance().retainExistingPreparedContext(capture_device,memory);
+        original.provenance().requireWorker(original.worker());
+        if(original.worker().get()!=context)throw std::logic_error("Original capture terminal source differs from cache worker");
+        original_slot_terminals=OriginalSlotCaptureTerminals::create(std::move(domain),original.worker(),
+            std::move(memory),capture_device,capture_stream,terminal_event);
+    }
+    DeviceGraphExecutor::GraphSegmentCache::CaptureStreamTerminalTicket
+    DeviceGraphExecutor::GraphSegmentCache::publishCaptureStreamTerminal(const MoEOverlayInferenceOriginalSlot& slot)
+    {
+        if(!original_slot_terminals)throw std::logic_error("Original capture terminal slots were not cold-bound");
+        auto* context=requireLifecycleContext("original-slot terminal event publication");
+        void* event=original_slot_terminals->eventForPublication(slot,context,capture_stream);
+        if(!context->recordEventChecked(event,capture_stream))
+            terminateGraphSegmentCacheLifecycle("Original-slot terminal event publication was rejected");
+        auto receipt=original_slot_terminals->published(slot);
+        return CaptureStreamTerminalTicket{receipt.generation(),terminal_receipt_identity,context,event,capture_stream,std::move(receipt)};
+    }
+
     bool DeviceGraphExecutor::GraphSegmentCache::prepareCaptureStreamTerminal(
         IWorkerGPUContext* ctx,const std::shared_ptr<PhysicalMemoryAuthority>& memory)
     {
@@ -1037,6 +1165,8 @@ namespace llaminar2
     DeviceGraphExecutor::GraphSegmentCache::CaptureStreamTerminalTicket
     DeviceGraphExecutor::GraphSegmentCache::publishCaptureStreamTerminal()
     {
+        if (original_slot_terminals)
+            terminateGraphSegmentCacheLifecycle("Original-slot terminal publication requires its checked original ticket");
         if (!capture_stream || !terminal_event)
         {
             terminateGraphSegmentCacheLifecycle(
@@ -1071,14 +1201,20 @@ namespace llaminar2
     void DeviceGraphExecutor::GraphSegmentCache::enqueuePublishedCaptureStreamTerminalWait(
         CaptureStreamTerminalTicket ticket,void* consumer_stream,IWorkerGPUContext* worker)
     {
-        if(!worker || !consumer_stream || !ticket.valid() || !capture_stream || !terminal_event ||
+        void* dependency_event=terminal_event;
+        if(ticket.original_slot) {
+            if(!original_slot_terminals || ticket.generation!=ticket.original_slot->generation())
+                throw std::logic_error("Original-slot dependency lost its exact cache receipt");
+            dependency_event=original_slot_terminals->eventForDeviceDependency(*ticket.original_slot,worker,capture_stream);
+        }
+        if(!worker || !consumer_stream || !ticket.valid() || !capture_stream || !dependency_event ||
             worker!=requireLifecycleContext("exact terminal device handoff") || !worker->ownsCurrentThread() ||
-            ticket.worker_!=worker || ticket.event_!=terminal_event || ticket.stream_!=capture_stream ||
+            ticket.worker_!=worker || ticket.event_!=dependency_event || ticket.stream_!=capture_stream ||
             ticket.identity_.get()!=terminal_receipt_identity.get() ||
             ticket.identity_.owner_before(terminal_receipt_identity) || terminal_receipt_identity.owner_before(ticket.identity_) ||
-            ticket.generation!=terminal_fence_published_generation)
+            (!ticket.original_slot && (original_slot_terminals || ticket.generation!=terminal_fence_published_generation)))
             throw std::logic_error("Exact terminal device handoff requires its original current receipt/worker/streams");
-        if(!worker->waitEventChecked(terminal_event,consumer_stream))
+        if(!worker->waitEventChecked(dependency_event,consumer_stream))
             throw std::runtime_error("Exact terminal device handoff event wait was rejected");
     }
 
@@ -1088,13 +1224,21 @@ namespace llaminar2
             HostFenceWaitPolicy wait_policy,
             std::function<std::string()> active_timeout_diagnostic)
     {
-        if (!ticket.valid() || !terminal_event || !capture_stream ||
+        void* observed_event=terminal_event;
+        if(ticket.original_slot) {
+            if(!original_slot_terminals || ticket.generation!=ticket.original_slot->generation())
+                terminateGraphSegmentCacheLifecycle("Original-slot terminal receipt lost its original cache owner");
+            observed_event=original_slot_terminals->eventForObservation(*ticket.original_slot,
+                requireLifecycleContext("original-slot terminal observation"),capture_stream);
+        }
+        if (!ticket.valid() || !observed_event || !capture_stream ||
             ticket.identity_.get()!=terminal_receipt_identity.get() ||
             ticket.identity_.owner_before(terminal_receipt_identity) || terminal_receipt_identity.owner_before(ticket.identity_) ||
-            ticket.event_!=terminal_event || ticket.stream_!=capture_stream ||
+            ticket.event_!=observed_event || ticket.stream_!=capture_stream ||
             ticket.worker_!=requireLifecycleContext("exact terminal receipt ownership") ||
-            ticket.generation != terminal_fence_published_generation ||
-            ticket.generation <= terminal_fence_observed_generation)
+            (!ticket.original_slot && (original_slot_terminals ||
+             ticket.generation != terminal_fence_published_generation ||
+             ticket.generation <= terminal_fence_observed_generation)))
         {
             terminateGraphSegmentCacheLifecycle(
                 "exact terminal observation received a missing, stale, or out-of-order ticket");
@@ -1114,7 +1258,7 @@ namespace llaminar2
                 for (;;)
                 {
                     bool ready = false;
-                    if (!ctx->queryEventChecked(terminal_event, ready))
+                    if (!ctx->queryEventChecked(observed_event, ready))
                     {
                         terminateGraphSegmentCacheLifecycle(
                             "exact terminal active query was rejected by the backend");
@@ -1139,7 +1283,7 @@ namespace llaminar2
                         std::this_thread::yield();
                 }
             }
-            else if (!ctx->synchronizeEventChecked(terminal_event))
+            else if (!ctx->synchronizeEventChecked(observed_event))
             {
                 terminateGraphSegmentCacheLifecycle(
                     "exact terminal event wait was rejected by the backend");
@@ -1167,7 +1311,8 @@ namespace llaminar2
                 "exact terminal event observation threw an unknown exception");
         }
 
-        terminal_fence_observed_generation = ticket.generation;
+        if(ticket.original_slot)original_slot_terminals->observed(*ticket.original_slot);
+        else terminal_fence_observed_generation = ticket.generation;
     }
 
     void DeviceGraphExecutor::GraphSegmentCache::waitForCaptureStreamFence(
@@ -1470,6 +1615,9 @@ namespace llaminar2
 
     void DeviceGraphExecutor::GraphSegmentCache::destroyTerminalEvent()
     {
+        // The original cache reset observed every receipt before any graph,
+        // source, stream or exact event owner can be withdrawn.
+        original_slot_terminals.reset();
         if (!terminal_event)
             return;
         if (terminal_fence_published_generation !=

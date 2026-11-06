@@ -137,3 +137,49 @@ if(TARGET v2_unit_moe_overlay_inference_transaction)
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RankLocalOriginalMTPPublicationRingReplay)
 endif()
+
+# Native resource ownership follows the original accepted transaction slots.
+add_v2_test(V2_Integration_MoEOriginalNativeSlotOwnershipReplay
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_inference_transaction>
+        --gtest_filter=Test__MoEOverlayInferenceTransaction.OriginalNativeSlots*
+        --gtest_repeat=20
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;Ownership;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOriginalNativeSlotOwnershipReplay)
+
+# One original K-slot native metadata roster per participant, never per family.
+if(TARGET v2_unit_moe_overlay_node_local_rank_batch_transport)
+    add_v2_test(V2_Integration_MoEOriginalNativeSlotLayoutReplay
+        COMMAND $<TARGET_FILE:v2_unit_moe_overlay_node_local_rank_batch_transport>
+            --gtest_filter=Test__MoEOverlayNodeLocalRankBatchTransport.OriginalNativeSlotLayout*
+            --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;Ownership;Replay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOriginalNativeSlotLayoutReplay)
+endif()
+
+# Describe only immutable original admission; native packet retirement remains a separate gate.
+if(TARGET v2_unit_moe_overlay_activation_epoch_protocol)
+    add_v2_test(V2_Integration_MoEOriginalNativeAdmissionIdentityReplay
+        COMMAND $<TARGET_FILE:v2_unit_moe_overlay_activation_epoch_protocol>
+            --gtest_filter=Test__MoEOverlayActivationEpochProtocol.OriginalNativeAdmission*
+            --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;Ownership;Replay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOriginalNativeAdmissionIdentityReplay)
+endif()
+
+# Actual cold owner and three-phase aggregate retirement, including absorbing Abort.
+if(TARGET v2_unit_moe_overlay_inference_transaction)
+    add_v2_test(V2_Integration_RankLocalOriginalAggregateRetirementReplay
+        COMMAND $<TARGET_FILE:v2_unit_moe_overlay_inference_transaction>
+            --gtest_filter=Test__MoEOverlayInferenceTransaction.RankLocalColdOriginalSlotsRejectQueuedAdmissionBeforeDrain:Test__MoEOverlayInferenceTransaction.RankLocalOriginalAggregateObservesEverySlotBeforeRetiringAny:Test__MoEOverlayInferenceTransaction.OriginalNativeSlotsSerializePublicationWithAbortReplay
+            --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;Ownership;Replay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RankLocalOriginalAggregateRetirementReplay)
+endif()
