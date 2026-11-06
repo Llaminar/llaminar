@@ -2419,6 +2419,10 @@ add_v2_test(V2_Unit_IWorkspaceConsumerStage
 )
 
 # Test: ROCmQuantisedGemmKernel_Workspace - IWorkspaceConsumer interface integration
+# The kernel constructor/workspace declarations are host-only, but the class
+# lives in ROCm-only sources (ROCmQuantisedGemmKernel.hip/.cpp), so this target
+# cannot link when the ROCm backend is disabled.
+if(HAVE_ROCM)
 add_executable(v2_unit_rocm_gemm_workspace unit/kernels/rocm/Test__ROCmQuantisedGemmKernel_Workspace.cpp)
 target_link_libraries(v2_unit_rocm_gemm_workspace 
     llaminar2_core 
@@ -2430,6 +2434,7 @@ add_v2_test(V2_Unit_GemmWorkspaceConsumer
     LABELS "V2;Unit;Kernels;Workspace;IWorkspaceConsumer"
     MPI_PROCS 1
 )
+endif()
 
 # Test: KVCacheLogicalBlockCodec - canonical host serialization for logical KV blocks
 # Tests: FP16/BF16-style signed-zero normalization, FP32 signed-zero normalization,
@@ -8661,6 +8666,7 @@ add_v2_test(V2_Integration_GemmKernelContextIntegration
 # Test: hipBLAS GEMM (ROCm - dense GEMM via hipBLAS for FP32/FP16)
 # Tests ROCmFloatingPointGemmKernel correctness against CPU reference, various matrix sizes
 # MI50: 13.4 TFLOPS FP32, 26.5 TFLOPS FP16 (no native BF16)
+if(HAVE_ROCM)
 add_executable(v2_test_hipblas_gemm unit/kernels/rocm/Test__ROCmFloatingPointGemmKernel.cpp)
 target_link_libraries(v2_test_hipblas_gemm llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Integration_HipBLASGemm
@@ -8668,6 +8674,7 @@ add_v2_test(V2_Integration_HipBLASGemm
     LABELS "V2;Integration;ROCm;hipBLAS;GEMM;FP32;FP16;DenseGEMM;KernelCorrectness;MI50"
     MPI_PROCS 1  # Tests GPU GEMM locally, no MPI needed
 )
+endif()
 if(HAVE_ROCM)
     add_v2_test(V2_Integration_ROCmFloatingExpertRetirement
         COMMAND $<TARGET_FILE:v2_test_hipblas_gemm>
@@ -24532,7 +24539,6 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_Q8KSourceScale
     V2_Integration_CPUResidualAddTailExtents
     V2_Integration_CUDAResidualAddTailExtents
-    V2_Integration_ROCmResidualAddTailExtents
     V2_Integration_FP16PrefillWorkspaceGeometryAdmission
     V2_Integration_FP16PrefillSchemaCodecAdmission
     V2_Integration_MTPBoundedPrefixLifecycleEvidence
@@ -24555,39 +24561,8 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_PrefixArchiveIdempotentPublication
     V2_Integration_NativeVocabularyPrefixAdmission
     V2_Integration_ROCmDensePrefillOverlayAdmission
-    V2_Integration_CanonicalRouteFold_CUDA
-    V2_Integration_CanonicalRouteFold_ROCm
     V2_Integration_MTPDefaultSamplingPolicy
-    V2_Integration_LearnedMTPDepthPolicy_CUDA
-    V2_Integration_LearnedMTPDepthPolicy_ROCm
-    V2_Integration_MoELiveRows_CUDA
-    V2_Integration_MoELiveRows_ROCm
-    V2_Integration_MoEOriginalSourceRows_CUDA
-    V2_Integration_MoEOriginalSourceRows_ROCm
-    V2_Integration_MoEProjectionPhases_CUDA
-    V2_Integration_MoEProjectionPhases_ROCm
-    V2_Integration_MoECompactProductionPackets_CUDA
-    V2_Integration_MoECompactProductionPackets_ROCm
-    V2_Integration_MoERouterHiddenQ8_CUDA
     ${V2_FP32_SUBNORMAL_PREFLIGHT_TESTS}
-    V2_Integration_FP32SubnormalContract_CUDA
-    V2_Integration_FP32SubnormalContract_ROCm
-    V2_Integration_Q8ExpertFiniteScaleContract_CUDA
-    V2_Integration_Q8ExpertFiniteScaleContract_ROCm
-    V2_Integration_Q8RouterFiniteScaleContract_CUDA
-    V2_Integration_MoERouterHiddenQ8_ROCm
-    V2_Integration_Q8RouterFiniteScaleContract_ROCm
-    V2_Integration_MoERouterLogits_ROCm
-    V2_Integration_MoERouterOwnedRows_CUDA
-    V2_Integration_MoERouterOwnedRows_ROCm
-    V2_Integration_MoERouterOwnedExchange_CUDA2
-    V2_Integration_MoERouterOwnedExchange_ROCm2
-    V2_Integration_MoERouterOwnedExchange_ROCm4
-    V2_Integration_MoERuntimeGrouping_CUDA
-    V2_Integration_MoERuntimeGrouping_ROCm
-    V2_Integration_MoEGroupingInitialization_CUDA
-    V2_Integration_MoEGroupingInitialization_ROCm
-    V2_Integration_ROCmMoERuntimeGroupResources
     V2_Integration_MTPDefaultSamplingLifecycle
     V2_Integration_CPUGreedySelector
     V2_Integration_CPUGreedySelector_ForcedAVX2
@@ -24749,6 +24724,56 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_MoEOverlayTicketRoutingWork
     V2_Integration_PrefixRestoreGDNMovementEpochContract
 )
+
+# Backend-suffixed preflight entries are registered only when their backend
+# is enabled (per-backend if() guards above). Adding them here unconditionally
+# made every CUDA-only and CPU-only configuration of this base fail: the
+# strict validation loop below cannot see a test that was never registered.
+# Keep the same guarded-append pattern as the other backend-specific entries.
+if(HAVE_CUDA)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_CanonicalRouteFold_CUDA
+        V2_Integration_LearnedMTPDepthPolicy_CUDA
+        V2_Integration_MoELiveRows_CUDA
+        V2_Integration_MoEOriginalSourceRows_CUDA
+        V2_Integration_MoEProjectionPhases_CUDA
+        V2_Integration_MoECompactProductionPackets_CUDA
+        V2_Integration_MoERouterHiddenQ8_CUDA
+        V2_Integration_FP32SubnormalContract_CUDA
+        V2_Integration_Q8ExpertFiniteScaleContract_CUDA
+        V2_Integration_Q8RouterFiniteScaleContract_CUDA
+        V2_Integration_MoERouterOwnedRows_CUDA
+        V2_Integration_MoERouterOwnedExchange_CUDA2
+        V2_Integration_MoERuntimeGrouping_CUDA
+        V2_Integration_MoEGroupingInitialization_CUDA
+    )
+endif()
+if(HAVE_ROCM)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_ROCmResidualAddTailExtents
+        V2_Integration_CanonicalRouteFold_ROCm
+        V2_Integration_LearnedMTPDepthPolicy_ROCm
+        V2_Integration_MoELiveRows_ROCm
+        V2_Integration_MoEOriginalSourceRows_ROCm
+        V2_Integration_MoEProjectionPhases_ROCm
+        V2_Integration_MoECompactProductionPackets_ROCm
+        V2_Integration_MoERouterHiddenQ8_ROCm
+        V2_Integration_FP32SubnormalContract_ROCm
+        V2_Integration_Q8ExpertFiniteScaleContract_ROCm
+        V2_Integration_Q8RouterFiniteScaleContract_ROCm
+        V2_Integration_MoERouterLogits_ROCm
+        V2_Integration_MoERouterOwnedRows_ROCm
+        V2_Integration_MoERouterOwnedExchange_ROCm2
+        V2_Integration_MoERouterOwnedExchange_ROCm4
+        V2_Integration_MoERuntimeGrouping_ROCm
+        V2_Integration_MoEGroupingInitialization_ROCm
+        V2_Integration_ROCmMoERuntimeGroupResources
+    )
+endif()
+# The ROCm residual-add tail proof is registered only when the ROCm backend is
+# enabled. Appending it here unconditionally broke every CUDA-only/CPU-only
+# configuration of this base (ROCm tests were never added); keep the same
+# guarded-append pattern as the other backend-specific preflight entries.
 if(HAVE_CUDA OR HAVE_ROCM)
     # The mapped transfer epoch fixture is intentionally device-backed and is
     # not registered by a CPU-only configuration.
@@ -24953,7 +24978,10 @@ if(TARGET v2_integration_cuda_gemm_parity)
         MPI_PROCS 1 NO_MODELS)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAQ6SourceScalePreservation)
 endif()
-if(TARGET v2_integration_rocm_vnni_repack_kernels)
+# Both referenced targets are ROCm-only; the repack target alone is built
+# unconditionally while the GEMV target requires HAVE_ROCM. Guard by backend,
+# not by a single target, so CUDA-only/CPU-only configurations generate cleanly.
+if(HAVE_ROCM)
     add_v2_test(V2_Integration_ROCmQ6SourceScaleRepack
         COMMAND $<TARGET_FILE:v2_integration_rocm_vnni_repack_kernels>
             --gtest_filter=Test__VnniRepackKernels.Q6_K_SourceScaleFactorsPreserveOriginalWords
