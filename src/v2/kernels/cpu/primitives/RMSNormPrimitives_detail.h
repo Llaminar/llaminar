@@ -16,8 +16,10 @@ namespace llaminar2::primitives::detail
 
     // ===== FP32 sum-of-squares (NS1) =====
 
-    /** @brief Observe the scalar FP32 summary program.
-     * @param row Complete original row; @param cols Logical width; @return Declared squared summary.
+    /** @brief Observe increasing-column FP64 FMA over original FP32 words.
+     * @param row Complete original row; @param cols Logical width; @return Explicit scalar squared summary.
+     * @details Finite FP32 squares are exact in FP64; the scalar summation
+     * order is fixed, distinct from each native ISA's fixed reduction tree.
      */
     double compute_sumsq_scalar(const float *row, std::size_t cols);
 
