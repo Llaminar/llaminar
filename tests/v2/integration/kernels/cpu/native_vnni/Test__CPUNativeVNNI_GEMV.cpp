@@ -1595,6 +1595,7 @@ namespace
     TEST_F(CPUNativeVNNIGemvTest, IQ2_XXS_SmallMatrix) { smokeTestFormat("IQ2_XXS", 0.880f); }
     TEST_F(CPUNativeVNNIGemvTest, IQ1_S_SmallMatrix) { smokeTestFormat("IQ1_S", 0.800f); }
     TEST_F(CPUNativeVNNIGemvTest, IQ1_M_SmallMatrix) { smokeTestFormat("IQ1_M", 0.800f); }
+    TEST_F(CPUNativeVNNIGemvTest, MXFP4_SmallMatrix) { smokeTestFormat("MXFP4", 0.985f); }
     TEST_F(CPUNativeVNNIGemvTest, Q8_0_SmallMatrix) { smokeTestFormat("Q8_0", 0.999f); }
     TEST_F(CPUNativeVNNIGemvTest, Q8_1_SmallMatrix) { smokeTestFormat("Q8_1", 0.999f); }
 

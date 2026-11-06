@@ -486,7 +486,7 @@ namespace llaminar2
         {
             // This is the totality guard: adding a supported quantized source
             // without a direction-complete migration layout fails this unit.
-            ASSERT_EQ(native_vnni_formats::kAllSourceFormats.size(), 21u);
+            ASSERT_EQ(native_vnni_formats::kAllSourceFormats.size(), 22u);
             for (const NativeVnniSourceFormat &entry :
                  native_vnni_formats::kAllSourceFormats)
             {
@@ -729,7 +729,7 @@ namespace llaminar2
 
         TEST(CpuExpertSlotPool, EveryCatalogedFormatBuildsStableTripletMetadata)
         {
-            ASSERT_EQ(native_vnni_formats::kAllSourceFormats.size(), 21u);
+            ASSERT_EQ(native_vnni_formats::kAllSourceFormats.size(), 22u);
             int participant_id = 0;
             for (const NativeVnniSourceFormat &entry :
                  native_vnni_formats::kAllSourceFormats)

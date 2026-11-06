@@ -197,6 +197,11 @@ class NativeVNNIHFGGUFMoeInventoryTest(unittest.TestCase):
         ])
 
     def test_unknown_execution_format_is_explicitly_not_sweepable(self) -> None:
+        """A format outside the tuning registry (MXFP4 here) is never a sweep case.
+
+        MXFP4 executes at runtime under IQ4_NL's installed policy, but has no
+        tuning corpus, so the inventory keeps it visible and non-sweepable.
+        """
         tensors = tuple(
             (name, dimensions, 39 if "gate_exps" in name else type_id)
             for name, dimensions, type_id in _layer_tensors(0, routed_down=21)

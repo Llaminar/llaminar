@@ -162,7 +162,7 @@ namespace llaminar2::test::native_vnni_dispatch
                 "Q4_0", "IQ4_NL", "IQ4_XS", "Q4_1", "Q4_K",
                 "Q5_0", "Q5_1", "Q5_K", "Q6_K", "Q3_K", "Q2_K",
                 "IQ3_S", "IQ3_XXS", "IQ2_S", "IQ2_XS", "IQ2_XXS",
-                "IQ1_S", "IQ1_M", "Q8_0", "Q8_1", "Q8_K",
+                "IQ1_S", "IQ1_M", "Q8_0", "Q8_1", "Q8_K", "MXFP4",
             };
             return formats;
         }

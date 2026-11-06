@@ -191,6 +191,9 @@ namespace
              { return TestTensorFactory::createIQ4_NLRandom(shape, seed); }},
             {"IQ4_XS", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>
              { return TestTensorFactory::createIQ4_XSRandom(shape, seed); }},
+            // MXFP4: own physical decoder (25) under IQ4_NL's installed policy.
+            {"MXFP4", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>
+             { return TestTensorFactory::createMXFP4Random(shape, seed); }},
             {"IQ3_S", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>
              { return TestTensorFactory::createIQ3_SRandom(shape, seed); }},
             {"IQ3_XXS", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>

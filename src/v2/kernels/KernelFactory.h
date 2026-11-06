@@ -126,6 +126,7 @@ namespace llaminar2
     class Q8_KTensor;
     class Q16_1Tensor;
     class IQ1_MTensor;
+    class MXFP4Tensor;
     class IQ1_STensor;
     class IQ2_STensor;
     class IQ2_XSTensor;
@@ -595,6 +596,12 @@ namespace llaminar
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
                     const llaminar2::IQ1_MTensor *tensor, DeviceType dev_type, int device_ordinal = -1);
+
+                /**
+                 * @brief Create GEMM kernel for an MXFP4 tensor (CPU NativeVNNI; GPUs use the load pipeline).
+                 */
+                static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
+                    const llaminar2::MXFP4Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
                 /**
                  * @brief Create GEMM kernel for IQ1_S tensor

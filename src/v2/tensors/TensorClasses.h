@@ -8970,4 +8970,182 @@ namespace llaminar2
         bool raw_data_released_ = false; // Track if raw data was released after GEMM pack
     };
 
+    // Implementation: MXFP4Tensor.cpp
+    /**
+     * @brief OCP MXFP4 weight tensor (GGUF type 39, 4.25 bits per weight).
+     *
+     * Each 17-byte block holds one E8M0 exponent and 32 FP4 E2M1 codes; values
+     * are mxfp4::kValues[code] * 2^(e - 128) (see MXFP4Format.h). Routed experts
+     * of DeepSeek-V4 and gpt-oss ship in this format, bit-identical to their
+     * original checkpoints.
+     *
+     * NativeVNNI preparation keeps the code bytes and converts the exponent to
+     * its exact FP16 power of two (codebook kNativeVnniMXFP4Codebook). Blocks
+     * whose exponent has no exact FP16 scale are rejected while packing, never
+     * rounded. Rank-two matrices and GGUF rank-three expert tensors
+     * ([K, N, E], flattened to [N*E, K]) are supported; views slice whole rows.
+     */
+    class MXFP4Tensor : public TypedTensorBase<MXFP4Tensor, MXFP4Block>, public TensorBase, public ITensorGemmTileDataProvider, public IQ8_0Decodable, public IINT8Unpackable
+    {
+    public:
+        /// Native storage type for CRTP-style type-safe access
+        using value_type = MXFP4Block;
+
+        /// Static type ID for ITensor::is<T>() and typed_as<T>()
+        static constexpr int static_type_id() { return TensorTypeId::MXFP4; }
+
+        const MXFP4Block *data_impl() const { return reinterpret_cast<const MXFP4Block *>(raw_host_data_ptr()); }
+        MXFP4Block *mutable_data_impl() { throw std::runtime_error("MXFP4Tensor: weight tensors are read-only"); }
+        const MXFP4Block *blocks() const { return typed_data(); }
+
+        MXFP4Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt MXFP4 blocks without copying.
+         * @param shape Logical tensor dimensions (rank two, or GGUF rank-three experts).
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @param device Original CPU allocator identity; unrelated to NUMA first-touch placement.
+         * @throws std::invalid_argument If the device is not a valid CPU or byte count and shape disagree.
+         */
+        MXFP4Tensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data,
+                    DeviceId device = DeviceId::cpu());
+        /// Zero-copy constructor for mmap-backed data (no memcpy)
+        MXFP4Tensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
+                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
+        ~MXFP4Tensor() override;
+
+        const std::vector<size_t> &shape() const override { return shape_; }
+        TensorType native_type() const override { return TensorType::MXFP4; }
+        DeviceId home_device() const override { return device_; }
+
+        const float *data() const override;
+        float *mutable_data() override;
+
+        // Diamond inheritance resolution (ITensor implemented by both TypedTensorBase and TensorBase)
+        int native_type_id() const final { return TensorBase::native_type_id(); }
+        size_t size_bytes() const final { return TensorBase::size_bytes(); }
+        const void *raw_data() const final { return TensorBase::raw_data(); }
+        void *raw_mutable_data() final { return TensorBase::raw_mutable_data(); }
+
+        bool copyFrom(const TensorBase *src) override;
+        std::unique_ptr<ITensorGemm> createGemm() override;
+
+        /// Retire this tensor's host bytes; a view retires only itself, a root also revokes its views.
+        void release_raw_data() override
+        {
+            if (!is_view_ && !raw_data_released_)
+            {
+                raw_data_.clear();
+                raw_data_.shrink_to_fit();
+            }
+            raw_data_released_ = true;
+        }
+        /** @return True after this tensor or any ancestor retired its host bytes. */
+        bool is_raw_data_released() const override { return raw_data_released_ || (parent_ && parent_->is_raw_data_released()); }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
+
+        void release_host_weight_data() override
+        {
+            unpinHostMemory(); // Must unpin BEFORE freeing — CUDA/HIP tracks pinned regions
+            release_raw_data();
+            {
+                decltype(dequant_cache_) tmp;
+                std::swap(dequant_cache_, tmp);
+            }
+            mmap_owner_.reset();
+        }
+
+        // Format conversion (TensorBase interface)
+        void to_fp32(float *dst) const override { to_fp32_via_blocks(dst); }
+        void to_bf16(uint16_t *dst) const override;
+        void to_fp16(uint16_t *dst) const override;
+        void to_int8_blocked(int8_t *dst_int8, float *dst_scales, size_t block_size = 32) const override;
+        bool to_int8_perchannel(int8_t *dst_int8, float *dst_col_scales, float *dst_row_scales = nullptr) const override
+        {
+            return to_int8_perchannel_via_blocks(dst_int8, dst_col_scales, dst_row_scales);
+        }
+        void to_fp32_row(size_t row_idx, float *buffer) const override;
+        void to_fp32_span(size_t offset, size_t count, float *buffer) const override;
+        /// Exact Q8_0 re-encoding: codes become int8 kValues, d becomes the FP16 block scale.
+        void decode_to_q8_0(size_t row_idx, size_t k_block_offset, Q8_0Block *output) const override;
+
+        bool is_view() const override { return is_view_; }
+        std::shared_ptr<TensorBase> create_view(
+            const std::vector<size_t> &new_shape,
+            size_t offset = 0) override;
+
+        // ITensorGemmTileDataProvider interface
+        void decode_block_at(size_t row_idx, size_t k_block_offset, float *output) const override
+        {
+            decodeBlock(blockAt(row_idx, k_block_offset), output);
+        }
+        const void *get_raw_block_at(size_t row_idx, size_t k_block_offset) const override
+        {
+            return &blockAt(row_idx, k_block_offset);
+        }
+
+        // IINT8Unpackable interface
+        void unpack_block_to_int8(size_t row_idx, size_t k_block_offset, int8_t *output) const override;
+        float get_block_scale(size_t row_idx, size_t k_block_offset) const override;
+        const NativeVnniFormatInfo *vnniFormatInfo() const override { return &native_vnni_formats::MXFP4; }
+        void packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const override;
+
+        size_t decoder_rows() const override { return rows2d(); }
+        size_t decoder_cols() const override { return cols2d(); }
+        size_t block_size() const override { return MXFP4Block::BLOCK_SIZE; }
+
+        /// Decode one block to 32 FP32 values (exact).
+        static void decodeBlock(const MXFP4Block &block, float *output);
+
+    protected:
+        /** @return Host native bytes, or null once this tensor or an ancestor retired them. */
+        void *raw_host_data_ptr() override
+        {
+            if (is_raw_data_released()) return nullptr;
+            return is_view_ ? const_cast<uint8_t *>(raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        /** @return Host native bytes, or null once this tensor or an ancestor retired them. */
+        const void *raw_host_data_ptr() const override
+        {
+            if (is_raw_data_released()) return nullptr;
+            return is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
+        }
+        /** @return Whole-row native bytes for rank-two borrowed views; preserve other storage extents. */
+        size_t byte_size() const override
+        {
+            return data_byte_size_ > 0 ? data_byte_size_ :
+                (is_view_ ? (shape_.size() == 2
+                    ? nativeMatrixExtent<MXFP4Block>(shape_[0], shape_[1])
+                    : nativeTensorExtent<MXFP4Block>(shape_)) : raw_data_.size());
+        }
+
+    private:
+        MXFP4Tensor(const std::vector<size_t> &shape, const uint8_t *raw_data_ptr,
+                    size_t view_byte_offset, std::shared_ptr<TensorBase> parent);
+
+        /// Flattened row count: N for [N, K], N*E for GGUF [K, N, E].
+        size_t rows2d() const { return shape_.size() == 3 ? shape_[1] * shape_[2] : shape_[0]; }
+        /// Reduction width K.
+        size_t cols2d() const { return shape_.size() == 3 ? shape_[0] : shape_[1]; }
+        size_t blocksPerRow() const { return (cols2d() + MXFP4Block::BLOCK_SIZE - 1) / MXFP4Block::BLOCK_SIZE; }
+        /// Every block read goes through the retirement-aware accessor and fails fast after release.
+        const MXFP4Block &blockAt(size_t row_idx, size_t k_block_offset) const
+        {
+            const auto *data_ptr = static_cast<const uint8_t *>(raw_host_data_ptr());
+            if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
+            return reinterpret_cast<const MXFP4Block *>(data_ptr)[row_idx * blocksPerRow() + k_block_offset];
+        }
+
+        std::vector<size_t> shape_;
+        bool is_view_;
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        const uint8_t *raw_data_ptr_;          // Borrowed data (if is_view_)
+        size_t view_byte_offset_;              // Byte offset in parent's raw_data_
+        std::shared_ptr<TensorBase> parent_;   // Keep parent alive (if is_view_)
+        std::shared_ptr<void> mmap_owner_;     // Keeps mmap region alive for zero-copy tensors
+        size_t data_byte_size_ = 0;            // Byte size for mmap-backed tensors
+        DeviceId device_;
+        mutable std::vector<float> dequant_cache_;
+        bool raw_data_released_ = false;
+    };
+
 } // namespace llaminar2

@@ -262,7 +262,10 @@ void verifyWide(int codebook, int payload_bytes, int tile, int cpt, int n, int k
                 a.data, p.data, s.data, secondary_s.data, em.data, destination,
                 sa.data, m, n, k, 1.0f, 0.0f, nullptr, nullptr,
                 static_cast<uint8_t>(codebook),
-                codebook == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook ? uint8_t{4} : static_cast<uint8_t>(codebook), 0, stream,
+                // IQ4_XS-source and MXFP4 execute IQ4_NL's certified policy.
+                codebook == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook ||
+                        codebook == llaminar2::kNativeVnniMXFP4Codebook
+                    ? uint8_t{4} : static_cast<uint8_t>(codebook), 0, stream,
                 execution.context.get(), nullptr));
         }
         else

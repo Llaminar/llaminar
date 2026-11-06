@@ -206,6 +206,7 @@ namespace
             {GGUFTensorType::IQ3_S, "IQ3_S"},
             {GGUFTensorType::IQ1_S, "IQ1_S"},
             {GGUFTensorType::IQ1_M, "IQ1_M"},
+            {GGUFTensorType::MXFP4, "MXFP4"},
         };
         return types;
     }

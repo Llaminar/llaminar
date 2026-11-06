@@ -820,6 +820,8 @@ namespace
              { return TestTensorFactory::createIQ1_SRandom({32, 256}); }},
             {"IQ1_M", true, []
              { return TestTensorFactory::createIQ1_MRandom({32, 256}); }},
+            {"MXFP4", true, []
+             { return TestTensorFactory::createMXFP4Random({32, 256}); }},
 
             // INT8-VNNI formats (8-bit) → only INT8 packing
             {"Q8_0", false, []
