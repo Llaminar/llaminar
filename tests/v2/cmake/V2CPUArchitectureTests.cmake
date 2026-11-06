@@ -504,7 +504,7 @@ v2_add_core_free_test(V2_Unit_CPUSoftmax WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_test_cpu_softmax> --gtest_filter=-*AllPositiveWorkers*
     LABELS V2 Unit CPU DeviceFree Softmax ByteExact)
 v2_add_core_free_test(V2_Integration_CPUSoftmax WHOLE_TEAM
-    COMMAND $<TARGET_FILE:v2_test_cpu_softmax>
+    COMMAND $<TARGET_FILE:v2_test_cpu_softmax> --gtest_filter=-*AllPositiveWorkers*
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Softmax ByteExact)
 v2_add_core_free_test(V2_Integration_CPUSoftmaxPolynomialLinearTerm
     COMMAND $<TARGET_FILE:v2_test_cpu_softmax> --gtest_filter=*ExponentialPolynomialLinearTermAndAccuracy
@@ -527,9 +527,14 @@ v2_add_core_free_test(V2_Integration_CPUSoftmaxFP16FragmentAlignment
 v2_add_core_free_test(V2_Integration_CPUSoftmaxGeometry
     COMMAND $<TARGET_FILE:v2_test_cpu_softmax> --gtest_filter=*OriginalGeometryRejectsBeforeMutation
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Softmax Regression)
-v2_add_core_free_test(V2_Integration_CPUSoftmaxRetainedOriginalRows WHOLE_TEAM
-    COMMAND $<TARGET_FILE:v2_test_cpu_softmax> --gtest_filter=*AllPositiveWorkersRetainOriginalSerialRows
-    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Softmax ByteExact Regression)
+# One storage per cell keeps each whole-team sweep inside the 30 s budget on
+# hosts with many logical CPUs; together they cover the original program.
+foreach(_softmax_storage IN ITEMS FP32 BF16 FP16 Q8_1)
+    v2_add_core_free_test(V2_Integration_CPUSoftmaxRetainedOriginalRows${_softmax_storage} WHOLE_TEAM
+        COMMAND $<TARGET_FILE:v2_test_cpu_softmax>
+            --gtest_filter=CPUSoftmax.AllPositiveWorkersRetainOriginalSerialRows${_softmax_storage}
+        LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Softmax ByteExact Regression)
+endforeach()
 v2_add_core_free_test(V2_Integration_CPUSoftmaxEmptyCompletion
     COMMAND $<TARGET_FILE:v2_test_cpu_softmax> --gtest_filter=*EmptyRetainedWorkshareCompletesBeforeRelease
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Softmax Regression)
