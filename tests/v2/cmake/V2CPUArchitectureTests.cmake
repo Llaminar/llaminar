@@ -288,6 +288,31 @@ v2_add_core_free_test(V2_Integration_CPUWorkshareTimingRetainedRelease
 v2_add_core_free_test(V2_Integration_CPUWorkshareTimingLifecycle
     COMMAND $<TARGET_FILE:v2_test_cpu_workshare_timing> --gtest_filter=*PublicationStateRejectsRepeatedOperations
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Profiling Ownership Regression)
+add_executable(v2_test_cpu_rmsnorm_numeric_fatal
+    "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPURMSNormNumericFatal.cpp"
+    "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/primitives/RMSNormPrimitives.cpp")
+target_compile_features(v2_test_cpu_rmsnorm_numeric_fatal PRIVATE cxx_std_23)
+target_include_directories(v2_test_cpu_rmsnorm_numeric_fatal PRIVATE
+    "${V2_CPU_ARCHITECTURE_ROOT}/src/v2" "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2")
+target_link_libraries(v2_test_cpu_rmsnorm_numeric_fatal PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX)
+v2_add_core_free_test(V2_Unit_CPURMSNormNumericFatal
+    COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_numeric_fatal>
+    LABELS V2 Unit CPU DeviceFree RMSNorm Numerical Regression)
+v2_add_core_free_test(V2_Integration_CPURMSNormNumericFatal
+    COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_numeric_fatal>
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Numerical Regression)
+v2_add_core_free_test(V2_Integration_CPURMSNormHalfPolicyIdentity
+    COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_numeric_fatal>
+        --gtest_filter=CPURMSNormNumericFatal.HalfT5RejectedColdAndFatalInRetainedTeam:CPURMSNormNumericFatal.HalfNullGammaIdentityMatchesExplicitOnes:CPURMSNormNumericFatal.RowNullGammaIdentityMatchesExplicitOnes
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm FP16 Policy Identity Regression)
+v2_add_core_free_test(V2_Integration_CPURMSNormExplicitFatalSink
+    COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_numeric_fatal>
+        --gtest_filter=CPURMSNormNumericFatal.FP32MatrixNonfiniteSummaryIsExplicitFatal:CPURMSNormNumericFatal.FP32MatrixNonfiniteRetainedTeamIsExplicitFatal:CPURMSNormNumericFatal.FP32MatrixNonfiniteNestedRetainedIsExplicitFatal:CPURMSNormNumericFatal.FP32DirectRowZeroDenominatorIsExplicitFatal:CPURMSNormNumericFatal.HalfMatrixNonfiniteSummaryIsExplicitFatal:CPURMSNormNumericFatal.HalfMatrixNonfiniteRetainedTeamIsExplicitFatal:CPURMSNormNumericFatal.HalfZeroDenominatorIsFatalAndPositiveEpsilonLegal:CPURMSNormNumericFatal.T5FiniteOverflowSummaryIsFatal:CPURMSNormNumericFatal.TinyOnlyRowRoundedFP32InverseOverflowIsFatal:CPURMSNormNumericFatal.DirectSIMDLeavesGateRangesAndTails:CPURMSNormNumericFatal.MultiOwnerMatrixEmitsIntactTypedFatal:CPURMSNormNumericFatal.Q16NonfiniteScaleIsExplicitFatal
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Numerical Fatal Regression)
+v2_add_core_free_test(V2_Integration_CPURMSNormLegalNumericPositives
+    COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_numeric_fatal>
+        --gtest_filter=CPURMSNormNumericFatal.GuardedZeroAndLargeFinitePositivesRemainLegal:CPURMSNormNumericFatal.T5ZeroRowPublishesLegalGuardedZeros:CPURMSNormNumericFatal.GuardedZeroRowOutputRemainsZeroWithNonfiniteGamma:CPURMSNormNumericFatal.ZeroRowWithPositiveEpsilonAndValidGammaStaysLegal:CPURMSNormNumericFatal.ColdEpsilonPolicyRemainsStandaloneRecoverable
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Numerical Positive Regression)
 add_executable(v2_unit_cpu_aligned_storage_header
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPUAlignedStorageHeader.cpp")
 target_compile_features(v2_unit_cpu_aligned_storage_header PRIVATE cxx_std_23)
