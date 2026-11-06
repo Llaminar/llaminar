@@ -11,7 +11,15 @@ endif()
 get_filename_component(V2_CPU_ARCHITECTURE_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
 
 include("${CMAKE_CURRENT_LIST_DIR}/V2CoreFreeTestRegistration.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/V2CPUImmutableLookupTests.cmake")
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_executable(v2_test_cpu_compiler_configuration
+    "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/Test__CPUCompilerConfiguration.cpp"
+    "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/CPUCompilerConfigurationProbe.c")
+target_compile_features(v2_test_cpu_compiler_configuration PRIVATE c_std_11 cxx_std_20)
+target_compile_definitions(v2_test_cpu_compiler_configuration PRIVATE
+    LLAMINAR_TEST_EXPECT_OPTIMIZED_CONFIGURATION=$<NOT:$<CONFIG:Debug>>)
+target_link_libraries(v2_test_cpu_compiler_configuration PRIVATE GTest::gtest_main)
 foreach(_ctest_metadata_suite IN ITEMS Unit Integration)
     if(_ctest_metadata_suite STREQUAL "Unit")
         set(_ctest_metadata_labels V2 Unit CPU DeviceFree Build Ownership)
@@ -22,6 +30,14 @@ foreach(_ctest_metadata_suite IN ITEMS Unit Integration)
         COMMAND "${Python3_EXECUTABLE}" -B
             "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_ctest_timeout_metadata.py"
             --cmake "${CMAKE_COMMAND}" --ctest "${CMAKE_CTEST_COMMAND}" --ninja "${CMAKE_MAKE_PROGRAM}"
+        LABELS ${_ctest_metadata_labels})
+    v2_add_core_free_test(V2_${_ctest_metadata_suite}_CPUPortabilityIntegrationFlags
+        COMMAND "${Python3_EXECUTABLE}" -B
+            "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_portability_build_types.py"
+            --cmake "${CMAKE_COMMAND}" --ninja "${CMAKE_MAKE_PROGRAM}"
+        LABELS ${_ctest_metadata_labels})
+    v2_add_core_free_test(V2_${_ctest_metadata_suite}_CPUCompilerConfiguration
+        COMMAND $<TARGET_FILE:v2_test_cpu_compiler_configuration>
         LABELS ${_ctest_metadata_labels})
 endforeach()
 v2_add_core_free_test(V2_Integration_CTestBuildToolImageContracts
