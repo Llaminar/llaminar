@@ -272,6 +272,127 @@ implemented. Full Unit/preflight never build or execute. The explicit documented
 draft-checkpoint bypass remains disclosed, not a gate/readiness waiver; neither
 the focused176/136 matrix nor the old73da x86 pass replaces this missing gate.
 
+## 2026-11-06 immutable-lookup engine frontier and native row repair
+
+The fresh, separately admitted73da/5adf ARM engine attempt consumed its one
+BUILD-ONLY authorization. Exact SDK4e8a/indexd211/configa78, GNU14, baseline
+ASIMD, normal Integration and unrestricted Ninja configure successfully in
+93.262s; the app+two complete gate-target build fails after222.436s at
+`CPUImmutableLookupKernels.cpp:17`:`immintrin.h` unavailable. This is a **new
+immutable compiler RED**, not the old c76 KV append header and not the newer
+attention source. Actual2138-command parent metadata and3430 CTest SHOW-ONLY
+entries/3129 genuine SIGTERM/36 pairs exist; zero tests execute and no application
+executable exists. The prior KV append repair now has a successful Ninja object
+record; a later read-only collector reports its7970392B/hash, not an app pass.
+
+Main independently verifies return archive
+`984a29d6cec4b0f8311922008cd9bc5fdd78f9259b517d6d1285826a2722c863`
+(2677349B), all196 raw member hashes, actual failed command/log, configuration,
+terminal and source maps. Complete7063-entry before/after maps are byte-identical
+SHA`42819719509e5a59870c8a3c03a047d0c0a6fdac6a336fa082dbfb0adae8c08f`;
+the host guard starts201.801ms after terminal exit. Peak37560524800B, OOM0 and
+throttle0 expose no resource-shortfall explanation. Fresh owner/cgroup/tool
+admission, physical package36/20-core topology and dependency ownership remain
+recorded. Owned producer/collector retire and the lab window releases; **no
+patch/retry, CTest, model or GPU work follows**. The b9d metadata-helper RED and
+corrected43-entry SDK-chain witness remain separate observations.
+
+The exact original CPU TU hashes
+`43443a51b43dd5118cfa3fdbeabc7eea8245a8b24f7e4a633dc93d6dfc438385`.
+Actual native focused compilation reproduces its architecture-header failure.
+A diagnostic copy minus exactly that include still fails at unconditional SSE/
+SSSE3 IQ4 setup: header removal alone cannot implement the native operation.
+No x86 emulation/header stub or whole-operation scalar replacement is installed.
+
+The actual production TU now widens FP16 with canonical `NEONFP16`, shifts
+original BF16 words exactly, and uses register table lookups/integer widening/
+one FP32 product per IQ4 coordinate. Source half bits and the canonical signed
+IQ4 grid remain authoritative. No intermediate decoded row is constructed;
+the requested live FP32 publication is the operation's output, not a cache or
+weight mirror. Original generic per-coordinate arithmetic for the other20
+quantized formats is unchanged, not newly certified SIMD/economy.
+
+`NativeEmbeddingLayout` admits incomplete logical rows with complete physical
+last blocks. Old `count*width/32` flattening could publish nothing or interpret
+padding as another row. The replacement owns every original ceil-block slot,
+clips its live output and preserves original row coordinates, including width1.
+AVX2/AVX512 also receive bounded masked fringe stores without changing their
+full-block products; mixed512-codegen/AVX2-runtime stays admitted. Complete extent,
+overlap and geometry checks precede `beginWorkshare`; valid zero work completes
+a retained team without a standalone team, and no source scan follows release.
+These synchronous checks neither prove capacity nor extend service/PMA leases.
+
+The actual-TU Unit and four explicit preflights cover all24 source representations,
+original partial widths, poisoned independent/actual-M1 outputs, readonly source,
+canaries, aliases/wrapping geometry, workers1..10 and retained empty/nonempty
+publication/reuse. Independent integer controls exhaust all65536 half/BF16 words;
+separate format-specific tiny tapes put actual NaNs/subnormals/signed zero into
+bounded fringes and assert that coverage. Every guard word is checked, with
+adjacent/interior corruption negatives. Independently filtered numeric receipts
+require an admitted active non-Scalar ISA; an actual Scalar NativePayloads
+negative rejects all three selected cases, without skips. Source-only reviews
+64–66 closed the native-admission/guard/fringe fixture holes; no reviewer ran the
+implementation or qualified runtime from inspection.
+
+The final source passes185 registrations in each of five native Mac profiles
+and142 preflights×20=2840 independently counted raw passes. Genuine GNU14 with
+actual O3/g/NDEBUG commands runs8 kernel cases,5 registered lookup cells,4
+preflights×20 and the separate2 compiler-policy cells. The older6-case GNU14
+unoptimized witness and intermediate185 matrices keep their narrower scopes.
+
+Diagnostic countercontrols retain native arithmetic and restore **only** the old
+coordinate or empty-completion policy in copies of the repaired TU. Width1 with
+three original rows changes from0 wrong words to3 untouched poison words;
+empty retained calls change from0 to2 early completions. These are labelled
+isolated-policy controls, not execution of the unmodified frozen TU, whose
+native compilation remains RED. Separate actual optimized IQ4 worker inspection
+finds two native table lookups/eight vector products, six SIMD identities and
+no vector spill in those math regions. AppleClang still reloads the OpenMP
+iteration bound from one GPR stack slot between blocks; this is not described
+as zero hot-stack traffic. Static resources are not PMU, timing or scaling.
+
+A fresh immutable successor must prove full app/gate compilation/linking and
+actual AQ8/symmetric-Q8/core/runtime tests; isolated lookup repair does not
+qualify service I/O, PMA admission, graph/request lifetime or inference economy.
+
+## Focused Integration compiler-policy correction
+
+Inspection of actual GNU14 commands, rather than the configuration label,
+exposed another defect: the focused project set custom Integration CACHE flags
+**after** `project()` had initialized them empty. The first6-case GNU14 lookup
+witness and old sanitized Integration profile were unoptimized diagnostics.
+Historical numerical/sanitizer passes remain recorded, but are not reclassified
+as optimized evidence. Main engine declarations already occur before `project()`;
+the actual73da engine command retains O3/g/NDEBUG/custom assertions unchanged.
+
+`V2PortabilityBuildTypes.cmake` now seeds C/CXX Integration initializers before
+language enablement, only when undefined. Both normal/pre-include and CLI-cache
+`_INIT` values, and authored final flags, retain their exact identity. Two focused
+real-CMake negatives reproduce the initial initializer-clobber mistake before
+repair; a literal-newline fixture parse error is preserved separately. Existing
+empty final caches fail closed instead of being forced into another policy.
+The old sanitizer tree correctly fails that admission in matrixxNle22cE. The
+explicit new `build_arm_portability_dotprod_sanitized_optimized` tree has actual
+O3/g/NDEBUG plus ASan/UBSan for both languages; the old tree remains untouched.
+
+Five device-free tests call genuine CMake per-config initialization with
+LANGUAGES NONE; they prove cache lifecycle, not compiler execution. A separate
+ordinary target compiles real C and C++ witnesses and executes their
+optimization-present/NDEBUG bits in Unit/preflight, including installed runners.
+That binary does not prove exact O3/g, custom assertions or every TU; actual
+compile-command evidence supplies that narrower proof. No runtime compiler SDK
+or executable temporary mount is required. An earlier compiler-in-/tmp fixture
+failed on the real noexec mount and remains preserved; it was retired rather
+than relaxing mount security or silently skipping execution. The local helper's
+invalid explicit private-PID spelling likewise failed before container creation;
+its command/helper remains separate from the corrected default-private run.
+
+The actual canonical hook was repeated after both repairs, with genuine cached
+libomp: it still fails at`CMakeLists.txt:173`, the explicit missing native-macOS
+memory/placement backend. No complete Unit/preflight target build/test follows.
+The disclosed draft-checkpoint bypass neither changes the hook nor waives its
+failure. Fresh source-bound native x86 and ARM engine validation are still needed.
+
 ## Configure-host topology and evidence retirement
 
 The returned native Spark archive was independently SHA-checked together with
