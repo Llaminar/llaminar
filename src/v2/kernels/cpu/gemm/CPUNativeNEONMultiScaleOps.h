@@ -114,6 +114,13 @@ namespace llaminar2::cpu::native_vnni::multi_scale
         static F half(const std::uint16_t *source) noexcept
         { return expandHalfBits(vld1_u16(source)); }
 
+        /** @brief Widen four BF16 words exactly by placement (word << 16).
+         * @param source Four readable BF16 words, e.g. native MXFP4 E8M0 powers of two.
+         * @return Four exact binary32 values; no rounding or FP16 interpretation.
+         */
+        static F bf16(const std::uint16_t *source) noexcept
+        { return std::bit_cast<F>(vshll_n_u16(vld1_u16(source), 16)); }
+
         /** @brief Widen opaque metadata without interpreting its half exponent.
          * @param source Four readable raw metadata words.
          * @return Four zero-extended INT32 metadata words.
