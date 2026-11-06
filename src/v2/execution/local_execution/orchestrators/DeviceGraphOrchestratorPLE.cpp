@@ -141,9 +141,13 @@ Qwen4ExpReplicatedPLEQuery DeviceGraphOrchestrator::fixedHeadPLEQuery(const Forw
 void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
     const DeviceGraphOrchestrator &canonical) const
 {
-    const auto fail=[](){throw std::invalid_argument("Fixed-head PLE requires the actual common Rank admission and complete deterministic mirrored terminal producers");};
+    const auto fail=[this](const std::string &reason){
+        throw std::invalid_argument("Fixed-head PLE generation producer on " +
+            state_.device_id.toString() + ": " + reason);
+    };
     if(!graph_builder_ || !canonical.graph_builder_ || !forward_engine_ || !arena_ ||
-        !active_device_generation_admission_ || !canonical.active_device_generation_admission_)fail();
+        !active_device_generation_admission_ || !canonical.active_device_generation_admission_)
+        fail("missing original Rank admission, forward engine, or arena");
     const auto &cfg=graph_builder_->config();const auto &other=canonical.graph_builder_->config();
     const auto &cohort=cfg.ngram_replicated_ple_cohort;
     const auto &loop=deviceGenerationLoopGraph();
@@ -176,7 +180,7 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
         mtp_request_penalty_policy_ != canonical.mtp_request_penalty_policy_ ||
         mtp_request_stop_token_count_ != canonical.mtp_request_stop_token_count_ ||
         mtp_request_stop_tokens_ != canonical.mtp_request_stop_tokens_)
-        fail();
+        fail("retained generation parents disagree in cohort, lifetime, geometry, arithmetic, or sampling policy");
     if(cohort->placement().isFixedHeadShards())(void)cohort->requireParticipant(state_.device_id,cfg.tp_device_idx);
     else cohort->requireConsumer(state_.device_id,cfg.tp_device_idx);
     const auto &a=*active_device_generation_admission_;const auto &b=*canonical.active_device_generation_admission_;
@@ -185,9 +189,18 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
     // Source fragments are existing compiler-issued executable identities.
     // Lookup validates that a candidate is actually embedded, not merely an
     // old sidecar/preparation cache left over from another request shape.
-    const auto embedded=[&](const IGPUGraphCapture *capture,const ComputeGraph *graph){
-        return (capture && std::ranges::any_of(loop.source_fragments,[&](const auto &f){return f.capture==capture;})) ||
-            std::ranges::any_of(loop.hosted_fragments,[&](const auto &f){return (capture && f.capture==capture) || (graph && f.semantic_graph==graph);});
+    const auto embedded=[](const MTPDeviceGenerationLoopGraphCache &parent,
+        const IGPUGraphCapture *capture,const ComputeGraph *graph,
+        const ForwardGraphSignature *signature=nullptr){
+        return (capture && std::ranges::any_of(parent.source_fragments,[&](const auto &f){return f.capture==capture;})) ||
+            std::ranges::any_of(parent.hosted_fragments,[&](const auto &f){
+                // Hosted verifier submission consumes the exact FEE signature,
+                // not a borrowed monolithic capture or semantic graph pointer.
+                // The caller first authenticates that signature with the actual
+                // retained cache; this only proves the parent selected it.
+                return (capture && f.capture==capture) || (graph && f.semantic_graph==graph) ||
+                    (signature && f.embedsVerifierForward(*signature));
+            });
     };
     using Head=std::tuple<std::string,std::uint64_t,std::size_t,std::size_t,int,int,int,bool,bool,int>;
     std::vector<Head> heads;
@@ -199,14 +212,14 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
                 auto name=std::move(pending.back());pending.pop_back();
                 if(name==producer)return true;
                 if(!visited.insert(name).second)continue;
-                const auto *node=graph.getNode(name);if(!node)fail();
+                const auto *node=graph.getNode(name);if(!node)fail("terminal dependency has no graph node: " + name);
                 pending.insert(pending.end(),node->dependencies.begin(),node->dependencies.end());
             }
             return false;
         };
         for(const auto &name:graph.getExecutionOrder())
         {
-            const auto *node=graph.getNode(name);if(!node || !node->stage)fail();
+            const auto *node=graph.getNode(name);if(!node || !node->stage)fail("terminal execution order has no stage: " + name);
             if(const auto *terminal=dynamic_cast<const MTPVerifierOutcomeStage *>(node->stage.get())) {
                 const auto &t=terminal->getParams();
                 if(t.device_id!=owner.state_.device_id || t.mode!=MTPVerifierOutcomeGraphMode::Greedy ||
@@ -215,16 +228,18 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
                     t.vocab_size!=owner.state_.vocab_size ||
                     t.binding.verifier_input_tokens_device!=owner.mtp_verifier_input_tokens_dev_ ||
                     t.binding.active_verifier_row_count_device!=owner.mtp_verifier_request_lengths_dev_ ||
-                    t.binding.generated_token_counts_device!=owner.mtp_generated_token_counts_dev_)fail();
+                    t.binding.generated_token_counts_device!=owner.mtp_generated_token_counts_dev_)
+                    fail("verifier outcome lost its participant-local logits or canonical publication banks");
             }
             const auto *head=dynamic_cast<const LMHeadStage *>(node->stage.get());
             if(!head)continue;
             const auto &p=head->getParams();
             if(p.device_id!=owner.state_.device_id || !p.prepared_ref || !p.prepared_store || !p.logits ||
-                p.prepared_ref->device!=owner.state_.device_id || p.d_model!=owner.state_.d_model)fail();
+                p.prepared_ref->device!=owner.state_.device_id || p.d_model!=owner.state_.d_model)
+                fail("LM head lost its original device, prepared weight, logits, or model geometry");
             const auto binding=p.prepared_store->binding(*p.prepared_ref);
             if(!binding || !binding->immutable || binding->identity.role!=WeightRole::LMHead ||
-                binding->identity.canonical_name.empty())fail();
+                binding->identity.canonical_name.empty())fail("LM head has no immutable canonical source binding");
             bool full=p.vocab_size==owner.state_.vocab_size && selectedLogits && p.logits==selectedLogits;
             if(!full)
                 for(const auto &gname:graph.getExecutionOrder())
@@ -238,7 +253,7 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
                         selectedLogits && gp.full_logits==selectedLogits && precedes(name,gname))
                         full=true;
                 }
-            if(!full)fail();
+            if(!full)fail("LM head has no ordered full-vocabulary terminal producer");
             // Every participant refers to the same original source. Local
             // vocabulary slices may differ; their existing typed gather above
             // authenticates ownership. Device addresses are checked locally,
@@ -250,33 +265,35 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
         }
     };
     const auto forward=[&](const ForwardGraphSignature &signature){
-        if(signature.sparse_query_execution_program!=sparseQueryGraphProgram())fail();
+        if(signature.sparse_query_execution_program!=sparseQueryGraphProgram())fail("forward signature names another sparse query program");
         const auto retained=forward_engine_->retainedDecodeGraph(signature);
         const auto native=forward_engine_->deviceLoopGraphTemplate(signature);
         if(!retained || !retained->graph_owner || retained->device!=state_.device_id ||
             retained->workspace_generation!=loop.workspace_generation ||
-            !embedded(native?native->capture:nullptr,retained->graph_owner))fail();
+            !embedded(loop,native?native->capture:nullptr,retained->graph_owner,&signature))
+            fail("retained forward graph is not embedded in the current generation parent");
         inspect(*retained->graph_owner,*this,heads,
             signature.all_position_logits || signature.live_mtp_request_batch_condition
                 ? state_.all_position_logits.get():state_.logits.get());
     };
     if(a.depth_policy.isOrdinary())
     {
-        if(!loop.ordinary_sampling_identity || !loop.ordinary_forward_identity)fail();
+        if(!loop.ordinary_sampling_identity || !loop.ordinary_forward_identity)fail("ordinary parent has no forward or sampler identity");
         const auto &p=*loop.ordinary_sampling_identity;const auto &pub=p.publication;
         const auto &logical=device_resident_logical_sequence_state_storage_;
         if(p.device_id!=state_.device_id || !p.logits || !state_.logits || p.logits!=state_.logits->gpu_data_ptr() ||
             p.vocab_size!=state_.vocab_size || p.logits_row_stride!=state_.vocab_size || !pub.valid() ||
             pub.control!=device_generation_storage_.control_device || pub.response_tokens!=device_generation_storage_.response_tokens_device ||
-            pub.frontier.next_condition_tokens!=logical.next_condition_tokens_device)fail();
+            pub.frontier.next_condition_tokens!=logical.next_condition_tokens_device)
+            fail("ordinary sampler lost its full logits or canonical terminal banks");
         if(const auto *random=std::get_if<OrdinaryGenerationSamplingStage::Stochastic>(&p.policy))
         {
             const auto seeds=arena_->getSharedTensor(BufferId::SAMPLING_REQUEST_SEEDS);
             if(!a.ordinary_sampling || !a.sampling_seeds || !seeds || random->seeds!=seeds->gpu_data_ptr() ||
                 random->top_k!=a.ordinary_sampling->top_k || random->top_p!=a.ordinary_sampling->top_p ||
-                random->temperature!=a.ordinary_sampling->temperature)fail();
+                random->temperature!=a.ordinary_sampling->temperature)fail("ordinary stochastic sampler disagrees with the common admission");
         }
-        else if(!a.ordinary_sampling || !a.ordinary_sampling->is_greedy())fail();
+        else if(!a.ordinary_sampling || !a.ordinary_sampling->is_greedy())fail("ordinary greedy sampler disagrees with the common admission");
         forward(*loop.ordinary_forward_identity);
     }
     else
@@ -286,22 +303,26 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
         {
             if(!publication.valid || !publication.verifier_signature ||
                 publication.verifier_signature->sparse_query_execution_program!=sparseQueryGraphProgram())continue;
-        if(!publication.valid || !publication.stage || publication.workspace_generation!=loop.workspace_generation)fail();
+        if(!publication.valid || !publication.stage || publication.workspace_generation!=loop.workspace_generation)
+            fail("speculative publication has no current stage/workspace owner");
         const auto &p=publication.stage->getParams();const auto &logical=device_resident_logical_sequence_state_storage_;
         if(p.authority!=MTPSpeculativeStatePublicationStage::Authority::BoundedGeneration || p.request_count!=1 ||
             p.generation_control_device!=device_generation_storage_.control_device ||
             p.verifier_input_tokens_device!=mtp_verifier_input_tokens_dev_ ||
             p.next_condition_tokens_device!=logical.next_condition_tokens_device ||
             p.target_cached_tokens_device!=logical.target_cached_tokens_device ||
-            p.main_kv_bindings.size()!=1 || p.main_kv_bindings.front().cache!=state_.kv_cache.get())fail();
+            p.main_kv_bindings.size()!=1 || p.main_kv_bindings.front().cache!=state_.kv_cache.get())
+            fail("speculative publication lost its canonical controller, frontier, or KV bindings");
         const auto pc=publication.segment_cache.deviceLoopGraphTemplate(*publication.graph);
-        if(!pc || !embedded(pc->capture,publication.graph.get()))continue;
+        if(!pc || !embedded(loop,pc->capture,publication.graph.get()))continue;
         ++publication_count;
         }
         const auto expected_publications = loop.execution_kind ==
             MTPDeviceGenerationLoopGraphCache::ExecutionKind::HostedDispatchTicketPublisher
             ? static_cast<std::size_t>(loop.maximum_draft_depth-loop.minimum_draft_depth+1) : 1u;
-        if(publication_count!=expected_publications)fail();
+        if(publication_count!=expected_publications)
+            fail("embedded speculative publication count " + std::to_string(publication_count) +
+                " differs from the admitted branch count " + std::to_string(expected_publications));
         bool verifier=false;
         for(const auto &preparation:mtp_verifier_preparation_graphs_)
         {
@@ -312,33 +333,33 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
             if(!paired)continue;
             const auto native=forward_engine_->deviceLoopGraphTemplate(*paired);
             const auto retained=forward_engine_->retainedDecodeGraph(*paired);
-            if(!retained || !embedded(native?native->capture:nullptr,retained->graph_owner))continue;
+            if(!retained || !embedded(loop,native?native->capture:nullptr,retained->graph_owner,&*paired))continue;
             const auto &signature=*paired;
             if(signature.execution_role!=ForwardExecutionRole::GroupedMTPVerifier ||
                 signature.device_token_ids!=mtp_verifier_input_tokens_dev_ ||
-                signature.device_sequence_lengths!=mtp_verifier_request_lengths_dev_)fail();
+                signature.device_sequence_lengths!=mtp_verifier_request_lengths_dev_)
+                fail("embedded verifier signature lost its canonical role, tokens, or row count");
             forward(signature);verifier=true;
         }
-        if(!verifier)fail();
+        if(!verifier)fail("generation parent contains no authenticated retained verifier forward");
     }
-    if(heads.empty())fail();
+    if(heads.empty())fail("generation parent contains no terminal LM heads");
     std::vector<Head> referenceHeads;
-    const auto canonicalEmbedded=[&](const IGPUGraphCapture *capture,const ComputeGraph *graph){
-        return (capture && std::ranges::any_of(reference.source_fragments,[&](const auto &f){return f.capture==capture;})) ||
-            std::ranges::any_of(reference.hosted_fragments,[&](const auto &f){return (capture && f.capture==capture) || (graph && f.semantic_graph==graph);});
-    };
     const auto referenceForward=[&](const ForwardGraphSignature &signature){
-        if(signature.sparse_query_execution_program!=canonical.sparseQueryGraphProgram())fail();
+        if(signature.sparse_query_execution_program!=canonical.sparseQueryGraphProgram())fail("canonical forward names another sparse query program");
         const auto retained=canonical.forward_engine_->retainedDecodeGraph(signature);
         const auto native=canonical.forward_engine_->deviceLoopGraphTemplate(signature);
-        if(!retained || !retained->graph_owner || !canonicalEmbedded(native?native->capture:nullptr,retained->graph_owner))fail();
+        if(!retained || !retained->graph_owner || retained->device!=canonical.state_.device_id ||
+            retained->workspace_generation!=reference.workspace_generation ||
+            !embedded(reference,native?native->capture:nullptr,retained->graph_owner,&signature))
+            fail("canonical retained forward is not embedded in its generation parent");
         inspect(*retained->graph_owner,canonical,referenceHeads,
             signature.all_position_logits || signature.live_mtp_request_batch_condition
                 ? canonical.state_.all_position_logits.get():canonical.state_.logits.get());
     };
     if(a.depth_policy.isOrdinary())
     {
-        if(!reference.ordinary_forward_identity)fail();
+        if(!reference.ordinary_forward_identity)fail("canonical ordinary parent has no forward identity");
         referenceForward(*reference.ordinary_forward_identity);
     }
     else
@@ -349,7 +370,7 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
             if(!paired)continue;
             const auto native=canonical.forward_engine_->deviceLoopGraphTemplate(*paired);
             const auto retained=canonical.forward_engine_->retainedDecodeGraph(*paired);
-            if(retained && canonicalEmbedded(native?native->capture:nullptr,retained->graph_owner))
+            if(retained && embedded(reference,native?native->capture:nullptr,retained->graph_owner,&*paired))
                 referenceForward(*paired);
         }
     const auto sidecars=[&](const DeviceGraphOrchestrator &owner,std::vector<Head> &out){
@@ -357,8 +378,7 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
         const auto visit=[&](const auto &cache){
             if(!cache.valid || !cache.graph || cache.workspace_generation!=parent.workspace_generation)return;
             const auto native=cache.segment_cache.deviceLoopGraphTemplate(*cache.graph);
-            const bool selected=(native && std::ranges::any_of(parent.source_fragments,[&](const auto &f){return f.capture==native->capture;})) ||
-                std::ranges::any_of(parent.hosted_fragments,[&](const auto &f){return f.semantic_graph==cache.graph.get();});
+            const bool selected=embedded(parent,native?native->capture:nullptr,cache.graph.get());
             if(selected) {
                 const auto found=owner.state_.extension_buffers.find(owner.mtpSamplingLogitsBufferId());
                 inspect(*cache.graph,owner,out,found==owner.state_.extension_buffers.end()?nullptr:found->second.get());
@@ -375,7 +395,8 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
         if(loop.sampling_mode==DeviceGenerationSamplingMode::Stochastic)
         {
             std::size_t selected_helpers=0;
-            if(mtp_graph_owner_plan_.samplerHelperWidthCount()!=canonical.mtp_graph_owner_plan_.samplerHelperWidthCount())fail();
+            if(mtp_graph_owner_plan_.samplerHelperWidthCount()!=canonical.mtp_graph_owner_plan_.samplerHelperWidthCount())
+                fail("participants disagree on retained sampler helper widths");
             for(std::size_t width=0;width<mtp_graph_owner_plan_.samplerHelperWidthCount();++width)
             {
             const auto &target=mtp_stochastic_target_distribution_graphs_.at(width);
@@ -384,18 +405,20 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
             const auto &peerOutcome=canonical.mtp_stochastic_outcome_graphs_.at(width);
             if(!target.valid || !target.stage || !target.graph || !outcome.valid || !outcome.stage || !outcome.graph ||
                 !peerTarget.valid || !peerTarget.stage || !peerOutcome.valid || !peerOutcome.stage ||
-                target.workspace_generation!=loop.workspace_generation || outcome.workspace_generation!=loop.workspace_generation)fail();
+                target.workspace_generation!=loop.workspace_generation || outcome.workspace_generation!=loop.workspace_generation)
+                fail("stochastic sampler helpers have incomplete or stale owners");
             const auto tc=target.segment_cache.deviceLoopGraphTemplate(*target.graph);
             const auto oc=outcome.segment_cache.deviceLoopGraphTemplate(*outcome.graph);
-            if(!tc || !oc)fail();
-            const bool target_selected=embedded(tc->capture,target.graph.get());
-            const bool outcome_selected=embedded(oc->capture,outcome.graph.get());
-            if(target_selected!=outcome_selected)fail();
+            if(!tc || !oc)fail("stochastic sampler helpers have no retained native templates");
+            const bool target_selected=embedded(loop,tc->capture,target.graph.get());
+            const bool outcome_selected=embedded(loop,oc->capture,outcome.graph.get());
+            if(target_selected!=outcome_selected)fail("only one half of a stochastic sampler pair is embedded");
             if(!target_selected)continue;
             const auto ptc=peerTarget.segment_cache.deviceLoopGraphTemplate(*peerTarget.graph);
             const auto poc=peerOutcome.segment_cache.deviceLoopGraphTemplate(*peerOutcome.graph);
-            if(!ptc || !poc || !canonicalEmbedded(ptc->capture,peerTarget.graph.get()) ||
-                !canonicalEmbedded(poc->capture,peerOutcome.graph.get()))fail();
+            if(!ptc || !poc || !embedded(reference,ptc->capture,peerTarget.graph.get()) ||
+                !embedded(reference,poc->capture,peerOutcome.graph.get()))
+                fail("canonical parent does not embed the matching stochastic sampler pair");
             ++selected_helpers;
             const auto &t=target.stage->getParams();const auto &pt=peerTarget.stage->getParams();
             const auto &o=outcome.stage->getParams();const auto &po=peerOutcome.stage->getParams();
@@ -412,15 +435,18 @@ void DeviceGraphOrchestrator::requireReplicatedPLEGenerationProducer(
                 std::tuple(o.verification,o.top_k,o.request_count,o.comparison_rows_per_request,o.verifier_row_capacity,
                     o.threshold_position_offset,o.target_distribution_row_stride)!=
                     std::tuple(po.verification,po.top_k,po.request_count,po.comparison_rows_per_request,po.verifier_row_capacity,
-                        po.threshold_position_offset,po.target_distribution_row_stride))fail();
+                        po.threshold_position_offset,po.target_distribution_row_stride))
+                fail("stochastic sampler pair disagrees in geometry, policy, or canonical publication banks");
             }
             const auto expected_helpers=mtpVerifierGraphFamily()==MTPVerifierGraphFamily::ExactRows
                 ? static_cast<std::size_t>(loop.maximum_draft_depth-loop.minimum_draft_depth+1) : 1u;
-            if(selected_helpers!=expected_helpers)fail();
+            if(selected_helpers!=expected_helpers)
+                fail("embedded stochastic sampler count differs from the admitted branch count");
         }
     }
     std::ranges::sort(heads);std::ranges::sort(referenceHeads);
-    if(heads!=referenceHeads || state_.vocab_size!=canonical.state_.vocab_size || state_.d_model!=canonical.state_.d_model)fail();
+    if(heads!=referenceHeads || state_.vocab_size!=canonical.state_.vocab_size || state_.d_model!=canonical.state_.d_model)
+        fail("participant and canonical terminal head declarations disagree");
 
 }
 } // namespace llaminar2

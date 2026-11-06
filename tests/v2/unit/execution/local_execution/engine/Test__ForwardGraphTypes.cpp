@@ -9,6 +9,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "execution/mtp/HostedDeviceGenerationFragment.h"
 #include "fixtures/execution/RetainedHostServiceFixture.h"
 #include "backends/GPUDeviceProcessLifetime.h"
 #include "backends/NativeAuxiliaryResourceCatalog.h"
@@ -8737,4 +8738,89 @@ TEST(Test__GraphSegmentCache, PublishedTerminalDeviceHandoffRejectsChangedOrigin
     });
     EXPECT_EQ(worker.events_waited_,waits);
     moved.waitForPublishedCaptureStreamTerminal(later,Cache::HostFenceWaitPolicy::ActiveProgress);
+}
+
+/** @test Both fixed and adaptive branch widths retain the actual complete key. */
+TEST(HostedDeviceGenerationFragment, ExactVerifierIdentityAcrossFixedAndDynamicWidths)
+{
+    std::array<int32_t,16> tokens{},positions{},counts{};
+    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})for(int width=1;width<=16;++width) {
+        SCOPED_TRACE(width);
+        ForwardGraphSignature signature;
+        signature.device=device;signature.seq_len=width;signature.batch_size=1;signature.decode=true;
+        signature.execution_role=ForwardExecutionRole::GroupedMTPVerifier;
+        signature.all_position_logits=true;signature.all_position_logit_rows=width;
+        signature.device_token_ids=tokens.data();signature.device_position_ids=positions.data();signature.device_sequence_lengths=counts.data();
+        HostedDeviceGenerationFragment fragment;
+        fragment.kind=HostedDeviceGenerationFragment::Kind::MTPGroupedVerifierReplay;fragment.forward_signature=signature;
+        EXPECT_TRUE(fragment.embedsVerifierForward(signature));
+        auto same=fragment;EXPECT_TRUE(fragment.hasSameExecutionIdentity(same));
+        for(int change=0;change<20;++change) {
+            auto different=signature;
+            switch(change) {
+            case 0:different.seq_len++;break;
+            case 1:different.batch_size++;break;
+            case 2:different.device=DeviceId::cpu();break;
+            case 3:different.execution_role=ForwardExecutionRole::MainInference;break;
+            case 4:different.decode=false;break;
+            case 5:different.device_token_ids=tokens.data()+1;break;
+            case 6:different.device_position_ids=positions.data()+1;break;
+            case 7:different.device_sequence_lengths=counts.data()+1;break;
+            case 8:different.all_position_logits=false;break;
+            case 9:different.all_position_logit_rows++;break;
+            case 10:different.snapshot_configuration_identity++;break;
+            case 11:different.moe_placement_epoch++;break;
+            case 12:different.live_mtp_request_batch_condition=true;break;
+            case 13:different.decode_has_history=true;break;
+            case 14:different.device_request_query_capture_identity++;break;
+            case 15:different.mtp_verifier_outcome_graph_mode=MTPVerifierOutcomeGraphMode::Greedy;break;
+            case 16:different.sparse_query_execution_program=SparseQueryExecutionProgram::ProvenNoRanking;break;
+            case 17:different.state_transaction=ForwardStateTransaction::CommittedMTPCondition;break;
+            case 18:different.position_policy=static_cast<ForwardPositionPolicy>(255);break;
+            case 19:different.pipeline_forward_edges=positions.data();break;
+            }
+            EXPECT_FALSE(fragment.embedsVerifierForward(different))<<change;
+            same.forward_signature=different;EXPECT_FALSE(fragment.hasSameExecutionIdentity(same))<<change;
+        }
+        for(int missing=0;missing<3;++missing) {
+            auto partial=signature;
+            if(missing==0)partial.device_token_ids=nullptr;
+            if(missing==1)partial.device_position_ids=nullptr;
+            if(missing==2)partial.device_sequence_lengths=nullptr;
+            fragment.forward_signature=partial;
+            EXPECT_FALSE(fragment.embedsVerifierForward(partial));
+        }
+        for(int invalid=0;invalid<5;++invalid) {
+            auto incomplete=signature;
+            if(invalid==0)incomplete.execution_role=ForwardExecutionRole::MainInference;
+            if(invalid==1)incomplete.decode=false;
+            if(invalid==2)incomplete.device=DeviceId::cpu();
+            if(invalid==3)incomplete.seq_len=0;
+            if(invalid==4)incomplete.batch_size=0;
+            fragment.forward_signature=incomplete;
+            EXPECT_FALSE(fragment.embedsVerifierForward(incomplete));
+        }
+        fragment.forward_signature=signature;
+        for(const auto kind:{HostedDeviceGenerationFragment::Kind::CapturedLocal,HostedDeviceGenerationFragment::Kind::OrdinaryExpertOverlayReplay,
+            HostedDeviceGenerationFragment::Kind::MTPFullSidecarReplay,HostedDeviceGenerationFragment::Kind::MTPChainedSidecarReplay,
+            HostedDeviceGenerationFragment::Kind::MoEOverlayEpochAcquire,HostedDeviceGenerationFragment::Kind::MoEOverlayEpochRelease}) {
+            fragment.kind=kind;EXPECT_FALSE(fragment.embedsVerifierForward(signature));
+        }
+        fragment.kind=HostedDeviceGenerationFragment::Kind::MTPGroupedVerifierReplay;
+        ComputeGraph foreign_graph;fragment.semantic_graph=&foreign_graph;
+        EXPECT_FALSE(fragment.embedsVerifierForward(signature));
+        fragment.semantic_graph=nullptr;
+        FakeReplayGraphCapture capture(nullptr,false);
+        fragment.capture=&capture;
+        EXPECT_FALSE(fragment.embedsVerifierForward(signature));
+        fragment.capture=nullptr;
+        EXPECT_TRUE(fragment.embedsVerifierForward(signature));
+        auto changed_policy=fragment;
+        changed_policy.execution=DeviceControlledLoopFragmentExecution::IfDeviceWordNonZero;
+        EXPECT_FALSE(fragment.hasSameExecutionIdentity(changed_policy));
+        changed_policy=fragment;changed_policy.condition_word_device=reinterpret_cast<const std::uint32_t*>(counts.data());
+        EXPECT_FALSE(fragment.hasSameExecutionIdentity(changed_policy));
+        changed_policy=fragment;changed_policy.minimum_selector=1;
+        EXPECT_FALSE(fragment.hasSameExecutionIdentity(changed_policy));
+    }
 }

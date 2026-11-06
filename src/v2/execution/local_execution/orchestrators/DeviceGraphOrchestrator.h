@@ -30,6 +30,7 @@
 
 #pragma once
 #include "execution/mtp/OrdinaryForwardRetention.h"
+#include "execution/mtp/HostedDeviceGenerationFragment.h"
 #include "../../../execution/moe/MoEOverlayFinitePlacementGraphs.h"
 #include "backends/ReadAheadNativeResourceFamily.h"
 #include "../graph/RetainedStorageTerminalCapture.h"
@@ -8406,44 +8407,7 @@ namespace llaminar2
          * cannot be cloned into one native CUDA child. The kind makes that
          * distinction structural; no null capture is interpreted as a fallback.
          */
-        struct HostedDeviceGenerationFragment
-        {
-            enum class Kind : uint8_t
-            {
-                CapturedLocal = 0,
-                /** Retained MainDecode plus sampler under one overlay scope. */
-                OrdinaryExpertOverlayReplay,
-                MTPFullSidecarReplay,
-                MTPChainedSidecarReplay,
-                MTPGroupedVerifierReplay,
-                /** Entry boundary owned by the hosted scheduler stream. */
-                MoEOverlayEpochAcquire,
-                /** Terminal boundary that closes the hosted parent's reader. */
-                MoEOverlayEpochRelease,
-            };
-
-            const char *name = nullptr;
-            Kind kind = Kind::CapturedLocal;
-            const IGPUGraphCapture *capture = nullptr;
-            const ComputeGraph *semantic_graph = nullptr;
-            ForwardGraphSignature forward_signature{};
-            DeviceControlledLoopFragmentExecution execution =
-                DeviceControlledLoopFragmentExecution::Always;
-            const uint32_t *condition_word_device = nullptr;
-            int minimum_selector = -1;
-
-            /** @return Whether two plans embed the same immutable executable identity. */
-            [[nodiscard]] bool hasSameExecutionIdentity(
-                const HostedDeviceGenerationFragment &other) const noexcept
-            {
-                return kind == other.kind && capture == other.capture &&
-                       semantic_graph == other.semantic_graph &&
-                       forward_signature == other.forward_signature &&
-                       execution == other.execution &&
-                       condition_word_device == other.condition_word_device &&
-                       minimum_selector == other.minimum_selector;
-            }
-        };
+        using HostedDeviceGenerationFragment = ::llaminar2::HostedDeviceGenerationFragment;
 
         /**
          * @brief Declares the sole owner of an ordinary generation parent.
