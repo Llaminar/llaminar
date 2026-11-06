@@ -15,6 +15,14 @@
  * - INT32→INT8 original-row summary/inverse and native two-pass publication,
  *   without scratch allocation or decoded-row/TLS mirrors
  * - Q8_1 integer-space RMSNorm (avoids FP32 dequant overhead)
+ *
+ * Nonfinite summaries and unrepresentable inverses are arithmetically
+ * unrecoverable: the FP32/BF16/FP16/Q16/INT32 CPU RMS column programs
+ * terminate through one release-safe fatal sink (`RMSNumericFatal.h`) with a
+ * precise diagnostic instead of publishing NaN/Inf/repair bytes or throwing
+ * across an OpenMP collective. Q8_1 integer-space and legacy FP32→INT8
+ * quantization keep their own programs and are outside this header's claim.
+ * Standalone cold policy admission keeps a recoverable std::invalid_argument.
  */
 #pragma once
 
@@ -44,6 +52,9 @@ namespace llaminar2::primitives
      * @param cols Number of columns (for mean calculation)
      * @param epsilon Epsilon for numerical stability
      * @param inv_out Output inverse RMS values (length = rows)
+     * @details A nonfinite input summary terminates through the release-safe
+     * fatal sink before the affected row's inverse is published; rows from an
+     * earlier pass are not rolled back.
      */
     void rmsnorm_compute_inv(
         const double *row_sumsq,
@@ -97,10 +108,14 @@ namespace llaminar2::primitives
      * Computes RMSNorm for a single row using scalar arithmetic.
      *
      * @param src Input row [cols]
-     * @param gamma Gamma weights [cols]
+     * @param gamma Gamma weights [cols], or null for the admitted identity
      * @param dst Output row [cols]
      * @param cols Number of columns
      * @param epsilon Epsilon for numerical stability
+     * @throws std::invalid_argument For a nonfinite or negative epsilon
+     * @details Nonfinite summary/inverse is fatal through the release-safe
+     * sink; the FP32-mean zero denominator is an undefined inverse, so it is
+     * fatal rather than a zero/repair publication.
      */
 
 
@@ -397,12 +412,16 @@ namespace llaminar2::primitives
      * 4. Convert result back to BF16
      *
      * @param src Input BF16 tensor [rows, cols] (stored as uint16_t)
-     * @param gamma Gamma weights [cols] (FP32)
+     * @param gamma Gamma weights [cols] (FP32), or null for the admitted identity
      * @param dst Output BF16 tensor [rows, cols] (stored as uint16_t)
      * @param rows Number of rows
      * @param cols Number of columns
      * @param epsilon Epsilon for numerical stability
      * @param opts Execution options
+     * @throws std::invalid_argument For invalid geometry/policy, including T5
+     * intent (recoverable standalone; fatal when inside a retained team).
+     * @details Nonfinite summary/inverse is fatal through the release-safe
+     * sink on every actual BF16 column program (scalar, AVX512, native ARM).
      */
     void rmsnorm_fused_bf16_vectorized(
         const uint16_t *src,
@@ -427,12 +446,17 @@ namespace llaminar2::primitives
      * 4. Convert result back to FP16
      *
      * @param src Input FP16 tensor [rows, cols] (stored as uint16_t)
-     * @param gamma Gamma weights [cols] (FP32)
+     * @param gamma Gamma weights [cols] (FP32), or null for the admitted identity
      * @param dst Output FP16 tensor [rows, cols] (stored as uint16_t)
      * @param rows Number of rows
      * @param cols Number of columns
      * @param epsilon Epsilon for numerical stability
      * @param opts Execution options
+     * @throws std::invalid_argument For invalid geometry/policy, including T5
+     * intent (recoverable standalone; fatal when inside a retained team).
+     * @details Nonfinite summary/inverse is fatal through the release-safe
+     * sink on every actual FP16 column program (scalar, AVX2/F16C, AVX512,
+     * native ARM).
      */
     void rmsnorm_fused_fp16_vectorized(
         const uint16_t *src,
@@ -564,7 +588,8 @@ namespace llaminar2::primitives
      * @param cols Number of columns (hidden_dim)
      * @param epsilon Epsilon for numerical stability
      * @throws std::invalid_argument For malformed complete-row geometry, policy or aliases.
-     * @throws std::domain_error For nonfinite arithmetic or an undefined inverse.
+     * @details Nonfinite arithmetic or an undefined inverse is fatal through
+     * the release-safe sink, never an exception across OpenMP.
      */
     void rmsnorm_q16_1_fp32_row_scalar(
         const Q16_1Block *input,
@@ -586,7 +611,8 @@ namespace llaminar2::primitives
      * @param cols Number of columns (hidden_dim)
      * @param epsilon Epsilon for numerical stability
      * @throws std::invalid_argument For malformed complete-row geometry, policy or aliases.
-     * @throws std::domain_error For nonfinite arithmetic or an undefined inverse.
+     * @details Nonfinite arithmetic or an undefined inverse is fatal through
+     * the release-safe sink, never an exception across OpenMP.
      * @throws std::runtime_error If the compiler envelope does not contain AVX512.
      */
     void rmsnorm_q16_1_fp32_row_avx512(
@@ -616,8 +642,11 @@ namespace llaminar2::primitives
      * @param opts Original immutable execution options; retained by the caller through completion.
      * @throws std::invalid_argument For malformed geometry, policy or original-bank/metadata aliases.
      * @throws std::runtime_error For an active ISA without a matching compiled implementation.
-     * @note Arithmetic corruption inside the collective is fatal: exceptions
-     * cannot cross an OpenMP parallel boundary. No zero-output repair is used.
+     * @note Arithmetic corruption inside the collective is fatal through the
+     * release-safe sink with a precise diagnostic; no exception crosses an
+     * OpenMP boundary and no zero-output repair is used. T5 intent is rejected
+     * cold: recoverable std::invalid_argument standalone, explicit abort when
+     * the call is inside an external retained team.
      */
     void rmsnorm_q16_1_fp32_fused(
         const Q16_1Block *input,
