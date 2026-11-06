@@ -10,6 +10,9 @@
  * absent hardware or a malformed rank placement is a failure, never a skip.
  * Source-free services also run separately across all discovered endpoints so
  * driver diagnostics can distinguish bandwidth setup from arithmetic setup.
+ * Request-cost coverage follows canonical physical endpoint proposals, not MPI
+ * process count: aliases cannot invent a CPU TP lane. Every tiny-fixture proposal
+ * must still be admitted and priced; absent multi-device hardware stays unqualified.
  */
 #include "planning/PlanningKernelServiceCatalog.h"
 #include "planning/PlanningWeightServiceModel.h"
@@ -17,6 +20,7 @@
 #include "planning/PlanningCommunicationService.h"
 #include "planning/PlanningCommunicationCost.h"
 #include "planning/AutomaticPlanningStartup.h"
+#include "planning/AutomaticOrchestrationCandidates.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "utils/MPIContext.h"
 #include "../../utils/PlanningGGUFFixture.h"
@@ -179,6 +183,13 @@ namespace
         });
         config.max_seq_len = 128;
         config.prefill_max_bucket_size = 64;
+        // Keep real prefix tiers enabled, but bind their storage to this tiny
+        // fixture instead of requiring multi-GiB serving defaults from volatile
+        // host RAM. PMA still admits every canonical candidate against the actual
+        // inventory; neither capacity observations nor rejection counts change.
+        static constexpr size_t kFixturePrefixBytes = 8u * 1024u * 1024u;
+        config.prefix_cache.ram_budget_bytes = kFixturePrefixBytes;
+        config.prefix_cache.device_budget_bytes = kFixturePrefixBytes;
         // Static is explicit fixture policy, not an automatic runtime change.
         // This metadata fixture certifies initial request costing, not movement.
         config.moe_rebalance.mode = MoERebalanceRuntimeMode::Off;
@@ -190,6 +201,7 @@ namespace
                 OrchestrationStrategy::ExpertOverlay};
         size_t prices = 0;
         size_t multi_device_prices = 0, overlay_prices = 0;
+        size_t proposals = 0, multi_device_proposals = 0, overlay_proposals = 0;
         const auto result = AutomaticPlanningStartup::run(config, *inventory, mpi,
             [&](const AutomaticPlanningPreparation &context) -> std::optional<AutomaticOrchestrationPlanner::Evaluate> {
                 auto service = AutomaticPlanningStartup::preparation()(context);
@@ -199,9 +211,21 @@ namespace
                     return std::nullopt;
                 }
                 if (!service) throw std::logic_error("Root has no completed service model");
+                // Enumerate the same immutable physical input, without another
+                // admission ledger or rank-as-device guess. Tiny sources must
+                // exercise every proposed lane, not silently lose one to capacity.
+                visitAutomaticOrchestrationCandidates(context.request(), context.metadata(), context.inventory(),
+                    [&](const auto &proposal) {
+                        ++proposals;
+                        if (proposal.strategy != OrchestrationStrategy::SingleDevice) ++multi_device_proposals;
+                        if (proposal.strategy == OrchestrationStrategy::ExpertOverlay) ++overlay_proposals;
+                    });
                 return [service = std::move(*service), &prices, &multi_device_prices, &overlay_prices]
                     (const auto &candidate, const auto &workload) {
                     ++prices;
+                    EXPECT_TRUE(candidate.config().prefix_cache.enabled);
+                    EXPECT_EQ(candidate.config().prefix_cache.ram_budget_bytes, kFixturePrefixBytes);
+                    EXPECT_EQ(candidate.config().prefix_cache.device_budget_bytes, kFixturePrefixBytes);
                     const auto cost = service(candidate, workload);
                     EXPECT_GT(cost.requestSeconds(), 0);
                     EXPECT_NE(cost.evidence().find("bounded measured ranking"), std::string::npos);
@@ -246,8 +270,19 @@ namespace
         if (mpi->is_root())
         {
             EXPECT_GT(prices, 0u);
-            EXPECT_GT(multi_device_prices, 0u);
-            if (backend != DeviceType::CPU) EXPECT_GT(overlay_prices, 0u);
+            EXPECT_EQ(prices, proposals);
+            EXPECT_EQ(result.root_selection->counts().proposed, proposals);
+            EXPECT_EQ(result.root_selection->counts().evaluated, prices);
+            EXPECT_EQ(result.root_selection->counts().capacity_rejected, 0u);
+            EXPECT_EQ(multi_device_prices, multi_device_proposals);
+            EXPECT_EQ(overlay_prices, overlay_proposals);
+            if (backend != DeviceType::CPU)
+            {
+                EXPECT_GT(multi_device_prices, 0u);
+                EXPECT_GT(overlay_prices, 0u);
+            }
+            ::testing::Test::RecordProperty("request_cost_topology_scope", multi_device_proposals ?
+                "single-and-multi-device" : "single-physical-endpoint; multi-device-unqualified");
         }
         else EXPECT_EQ(prices, 0u);
         EXPECT_TRUE(result.applied.execution_rank_selection);

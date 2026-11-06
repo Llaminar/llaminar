@@ -853,6 +853,245 @@ add_executable(v2_test_qwen4exp_metadata
     unit/loaders/Test__GGUFIntegerArrays.cpp
 )
 target_link_libraries(v2_test_qwen4exp_metadata PRIVATE llaminar2_core GTest::gtest_main)
+# W4A4/H source metadata is a native operand contract, not a weight-only codebook.
+add_executable(v2_test_w4a4_format unit/tensors/Test__W4A4Format.cpp)
+# Cold transform metadata is device-free; this does not register a GPU replay.
+add_executable(v2_test_w4a4_gpu_transform_policy unit/tensors/Test__W4A4GPUTransformPolicy.cpp)
+target_link_libraries(v2_test_w4a4_gpu_transform_policy PRIVATE llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_W4A4GPUTransformPolicyContract
+    COMMAND $<TARGET_FILE:v2_test_w4a4_gpu_transform_policy>
+    LABELS "V2;Unit;DeviceFree;W4A4;Contract;Geometry"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=1;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+add_v2_test(V2_Integration_W4A4GPUTransformPolicyContract
+    COMMAND $<TARGET_FILE:v2_test_w4a4_gpu_transform_policy>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;W4A4;Contract;Geometry"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=1;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+add_executable(v2_test_w4a4_gemm unit/tensors/Test__W4A4Gemm.cpp)
+target_link_libraries(v2_test_w4a4_gemm PRIVATE llaminar2_core GTest::gtest_main)
+target_compile_options(v2_test_w4a4_gemm PRIVATE -ffp-contract=off)
+add_v2_test(V2_Unit_W4A4GemmContracts
+    COMMAND $<TARGET_FILE:v2_test_w4a4_gemm>
+    LABELS "V2;Unit;DeviceFree;CPU;W4A4;Contract"
+    MPI_PROCS 1 NO_MPI NO_MODELS)
+add_v2_test(V2_Integration_W4A4GemmContracts
+    COMMAND $<TARGET_FILE:v2_test_w4a4_gemm>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;W4A4;Contract"
+    MPI_PROCS 1 NO_MPI NO_MODELS)
+set_tests_properties(V2_Unit_W4A4GemmContracts V2_Integration_W4A4GemmContracts
+    PROPERTIES PROCESSORS 8 TIMEOUT 30)
+add_v2_test(V2_Unit_W4A4NativeProjectionOrientation
+    COMMAND $<TARGET_FILE:v2_test_w4a4_gemm>
+        --gtest_filter=W4A4GemmContract.TensorEntryRetainsNativeStorageAndOrderedOffsetEpilogue
+    LABELS "V2;Unit;DeviceFree;CPU;W4A4;Contract"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_W4A4NativeProjectionOrientation
+    COMMAND $<TARGET_FILE:v2_test_w4a4_gemm>
+        --gtest_filter=W4A4GemmContract.TensorEntryRetainsNativeStorageAndOrderedOffsetEpilogue
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;W4A4;Contract"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+set_tests_properties(V2_Unit_W4A4NativeProjectionOrientation V2_Integration_W4A4NativeProjectionOrientation
+    PROPERTIES PROCESSORS 8)
+add_v2_test(V2_Unit_W4A4NativeStageContracts
+    COMMAND $<TARGET_FILE:v2_test_w4a4_gemm>
+        --gtest_filter=W4A4GemmContract.PreparedStoreAndStagesRetainNativeRowsAndArithmetic
+    LABELS "V2;Unit;DeviceFree;CPU;W4A4;Contract"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_W4A4NativeStageContracts
+    COMMAND $<TARGET_FILE:v2_test_w4a4_gemm>
+        --gtest_filter=W4A4GemmContract.PreparedStoreAndStagesRetainNativeRowsAndArithmetic
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;W4A4;Contract"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+set_tests_properties(V2_Unit_W4A4NativeStageContracts V2_Integration_W4A4NativeStageContracts
+    PROPERTIES PROCESSORS 8 ENVIRONMENT "OMP_NUM_THREADS=1;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+add_v2_test(V2_Integration_W4A4FusedGateUpStageContract
+    COMMAND $<TARGET_FILE:v2_test_w4a4_gemm>
+        --gtest_filter=W4A4GemmContract.FusedGateUpStagesRetainNativePoliciesThroughReset
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;W4A4;FFN;Contract;Lifecycle"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+set_tests_properties(V2_Integration_W4A4FusedGateUpStageContract
+    PROPERTIES PROCESSORS 8 ENVIRONMENT "OMP_NUM_THREADS=1;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+add_v2_test(V2_Unit_W4A4MixedGDNStageContract
+    COMMAND $<TARGET_FILE:v2_test_w4a4_gemm>
+        --gtest_filter=W4A4GemmContract.MixedGDNRetainsNativeAndFloatingSubgroupsThroughReset
+    LABELS "V2;Unit;DeviceFree;CPU;W4A4;GDN;Contract"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_W4A4MixedGDNStageContract
+    COMMAND $<TARGET_FILE:v2_test_w4a4_gemm>
+        --gtest_filter=W4A4GemmContract.MixedGDNRetainsNativeAndFloatingSubgroupsThroughReset
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;W4A4;GDN;Contract"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+set_tests_properties(V2_Unit_W4A4MixedGDNStageContract V2_Integration_W4A4MixedGDNStageContract
+    PROPERTIES PROCESSORS 8 ENVIRONMENT "OMP_NUM_THREADS=1;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+add_v2_test(V2_Integration_W4A4StreamedSourcePolicy
+    COMMAND $<TARGET_FILE:v2_test_w4a4_model_source>
+        --gtest_filter=W4A4ModelSourceContract.StreamedRowsCannotHideInvalidUnselectedSourcePolicy
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;W4A4;Loaders;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=1;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+add_v2_test(V2_Integration_W4A4CompleteSourceReadContract
+    COMMAND $<TARGET_FILE:v2_test_w4a4_model_source>
+        --gtest_filter=W4A4ModelSourceContract.CompleteRequestsRetainFinalBytesAcrossAdmissionOrder
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;W4A4;Loaders;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=1;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+add_v2_test(V2_Integration_W4A4SourceReadEconomy
+    COMMAND $<TARGET_FILE:v2_test_w4a4_model_source>
+        --gtest_filter=W4A4SourceReadEconomy.CompleteAdmissionDoesNotRereadTheFinalDestination
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;W4A4;Loaders;Economy;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=1;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+add_v2_test(V2_Integration_W4A4SourceAdmissionLifecycle
+    COMMAND $<TARGET_FILE:v2_test_w4a4_format>
+        --gtest_filter=W4A4FormatContract.IncrementalAdmissionRetainsWholeSourcePolicyAndSinglePublication:W4A4FormatContract.IncrementalFailureRetainsOriginalCoordinatesAndCannotRecover
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;W4A4;Loaders;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_W4A4WeightManagerLifecycle
+    COMMAND $<TARGET_FILE:v2_test_w4a4_model_source>
+        --gtest_filter=W4A4ModelSourceLifecycle.WeightManagerRetainsOnlyAdmittedCompleteKRows
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;W4A4;Loaders;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=1;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+add_executable(v2_test_w4a4_workspace unit/tensors/Test__W4A4Workspace.cpp)
+target_link_libraries(v2_test_w4a4_workspace PRIVATE llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_W4A4WorkspaceContract
+    COMMAND $<TARGET_FILE:v2_test_w4a4_workspace>
+    LABELS "V2;Unit;DeviceFree;CPU;W4A4;Contract"
+    MPI_PROCS 1 NO_MPI NO_MODELS)
+add_v2_test(V2_Integration_W4A4WorkspaceContract
+    COMMAND $<TARGET_FILE:v2_test_w4a4_workspace>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;W4A4;Contract"
+    MPI_PROCS 1 NO_MPI NO_MODELS)
+set_property(TEST V2_Unit_W4A4WorkspaceContract V2_Integration_W4A4WorkspaceContract
+    APPEND PROPERTY ENVIRONMENT "OMP_NUM_THREADS=1;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+add_executable(v2_test_w4a4_model_source
+    unit/loaders/Test__W4A4ModelSource.cpp
+    unit/loaders/Test__W4A4SplitModelSource.cpp
+    unit/planning/Test__W4A4PlanningSamples.cpp)
+target_link_libraries(v2_test_w4a4_model_source PRIVATE llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_W4A4ModelSourceContracts
+    COMMAND $<TARGET_FILE:v2_test_w4a4_model_source> --gtest_filter=W4A4ModelSource*.*
+    LABELS "V2;Unit;DeviceFree;Loaders;W4A4;Contract"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_W4A4ModelSourceContracts
+    COMMAND $<TARGET_FILE:v2_test_w4a4_model_source> --gtest_filter=W4A4ModelSource*.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Loaders;W4A4;Contract"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_W4A4SplitSourceContracts
+    COMMAND $<TARGET_FILE:v2_test_w4a4_model_source> --gtest_filter=W4A4ModelSourceSplit*.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;W4A4;Loaders;Contract;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_W4A4ServingFixtureContract
+    COMMAND $<TARGET_FILE:v2_test_w4a4_model_source>
+        --gtest_filter=W4A4ModelSourceFixtureContract.NormalizedDirectoryPreservesOriginalNativeRows
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;W4A4;Loaders;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Unit_GGUFAlignmentContracts
+    COMMAND $<TARGET_FILE:v2_test_w4a4_model_source> --gtest_filter=GGUFAlignmentContract.*
+    LABELS "V2;Unit;DeviceFree;Loaders;GGUF;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_GGUFAlignmentContracts
+    COMMAND $<TARGET_FILE:v2_test_w4a4_model_source> --gtest_filter=GGUFAlignmentContract.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Loaders;GGUF;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Unit_W4A4MTPBasisAdmission
+    COMMAND $<TARGET_FILE:v2_test_w4a4_model_source> --gtest_filter=W4A4ModelPlanningContract.*
+    LABELS "V2;Unit;DeviceFree;Planning;MTP;W4A4;Contract"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_W4A4MTPBasisAdmission
+    COMMAND $<TARGET_FILE:v2_test_w4a4_model_source> --gtest_filter=W4A4ModelPlanningContract.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;MTP;W4A4;Contract"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Unit_W4A4PlanningSampleContracts
+    COMMAND $<TARGET_FILE:v2_test_w4a4_model_source> --gtest_filter=W4A4PlanningSamples.*
+    LABELS "V2;Unit;DeviceFree;Planning;W4A4;Contract;Lifecycle"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_W4A4PlanningSampleContracts
+    COMMAND $<TARGET_FILE:v2_test_w4a4_model_source> --gtest_filter=W4A4PlanningSamples.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;W4A4;Contract;Lifecycle"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_W4A4PlanningPreparedOwnership
+    COMMAND $<TARGET_FILE:v2_test_w4a4_model_source>
+        --gtest_filter=W4A4PlanningSamples.ProductionProjectionMeasurementBorrowsTheOnlyNativePayload
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;W4A4;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+set_property(TEST V2_Unit_W4A4ModelSourceContracts V2_Integration_W4A4ModelSourceContracts
+    V2_Integration_W4A4SplitSourceContracts V2_Integration_W4A4ServingFixtureContract
+    V2_Unit_GGUFAlignmentContracts V2_Integration_GGUFAlignmentContracts
+    V2_Unit_W4A4MTPBasisAdmission V2_Integration_W4A4MTPBasisAdmission
+    V2_Unit_W4A4PlanningSampleContracts V2_Integration_W4A4PlanningSampleContracts
+    V2_Integration_W4A4PlanningPreparedOwnership
+    APPEND PROPERTY ENVIRONMENT "OMP_NUM_THREADS=1;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+# A generated all-attention model executes the complete production CPU graph;
+# this is not a Unit kernel fixture or an independent numerical reference.
+add_executable(v2_integration_w4a4_cpu_model_graph
+    integration/execution/runner/Test__W4A4CPUModelGraph.cpp
+    integration/mpi_gtest_main.cpp)
+target_link_libraries(v2_integration_w4a4_cpu_model_graph PRIVATE
+    llaminar2_core GTest::gtest MPI::MPI_CXX)
+add_v2_test(V2_Integration_W4A4CPUModelGraphLifecycle
+    COMMAND $<TARGET_FILE:v2_integration_w4a4_cpu_model_graph>
+        --gtest_filter=Formats/W4A4CPUModelGraphLifecycle.RetainsNativeFFNsThroughPrefixReuseAndRequestReset/*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;W4A4;Graph;Lifecycle;RequestReset;PrefixCache;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=1;OMP_DYNAMIC=false;OPENBLAS_NUM_THREADS=1;MKL_NUM_THREADS=1;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+
+add_executable(v2_test_w4a4_prepared_weights unit/tensors/Test__W4A4PreparedWeights.cpp)
+target_link_libraries(v2_test_w4a4_prepared_weights PRIVATE llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_W4A4PreparedWeightLifecycle
+    COMMAND $<TARGET_FILE:v2_test_w4a4_prepared_weights>
+    LABELS "V2;Unit;DeviceFree;CPU;W4A4;Lifecycle"
+    MPI_PROCS 1 NO_MPI NO_MODELS)
+add_v2_test(V2_Integration_W4A4PreparedWeightLifecycle
+    COMMAND $<TARGET_FILE:v2_test_w4a4_prepared_weights>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;W4A4;Lifecycle"
+    MPI_PROCS 1 NO_MPI NO_MODELS)
+add_executable(v2_test_w4a4_tensor unit/tensors/Test__W4A4Tensor.cpp)
+target_link_libraries(v2_test_w4a4_tensor PRIVATE llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_W4A4TensorLifecycle
+    COMMAND $<TARGET_FILE:v2_test_w4a4_tensor>
+    LABELS "V2;Unit;DeviceFree;Tensors;W4A4;Lifecycle"
+    MPI_PROCS 1 NO_MPI NO_MODELS)
+add_v2_test(V2_Integration_W4A4TensorLifecycle
+    COMMAND $<TARGET_FILE:v2_test_w4a4_tensor>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Tensors;W4A4;Lifecycle"
+    MPI_PROCS 1 NO_MPI NO_MODELS)
+add_executable(v2_test_w4a4_storage unit/tensors/Test__W4A4WeightStorage.cpp)
+target_link_libraries(v2_test_w4a4_storage PRIVATE llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_W4A4WeightStorageLifecycle
+    COMMAND $<TARGET_FILE:v2_test_w4a4_storage>
+    LABELS "V2;Unit;DeviceFree;Tensors;W4A4;Lifecycle"
+    MPI_PROCS 1 NO_MPI NO_MODELS)
+add_v2_test(V2_Integration_W4A4WeightStorageLifecycle
+    COMMAND $<TARGET_FILE:v2_test_w4a4_storage>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Tensors;W4A4;Lifecycle"
+    MPI_PROCS 1 NO_MPI NO_MODELS)
+add_executable(v2_w4a4_cpu_gemm_replay_driver unit/tensors/W4A4CPUGemmReplayDriver.cpp)
+target_link_libraries(v2_w4a4_cpu_gemm_replay_driver PRIVATE llaminar2_core OpenMP::OpenMP_CXX)
+add_executable(v2_w4a4_cpu_replay_driver unit/tensors/W4A4CPUReplayDriver.cpp)
+target_link_libraries(v2_w4a4_cpu_replay_driver PRIVATE llaminar2_core OpenMP::OpenMP_CXX)
+add_executable(v2_test_w4a4_arithmetic unit/tensors/Test__W4A4CPUArithmetic.cpp)
+target_link_libraries(v2_test_w4a4_arithmetic PRIVATE llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_W4A4CPUArithmeticContracts
+    COMMAND $<TARGET_FILE:v2_test_w4a4_arithmetic>
+    LABELS "V2;Unit;DeviceFree;CPU;W4A4;Contract"
+    MPI_PROCS 1 NO_MPI NO_MODELS)
+add_v2_test(V2_Integration_W4A4CPUArithmeticContracts
+    COMMAND $<TARGET_FILE:v2_test_w4a4_arithmetic>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;W4A4;Contract"
+    MPI_PROCS 1 NO_MPI NO_MODELS)
+set_tests_properties(V2_Unit_W4A4CPUArithmeticContracts V2_Integration_W4A4CPUArithmeticContracts
+    PROPERTIES PROCESSORS 8)
+target_link_libraries(v2_test_w4a4_format PRIVATE llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_W4A4FormatContract
+    COMMAND $<TARGET_FILE:v2_test_w4a4_format>
+    LABELS "V2;Unit;DeviceFree;Tensors;W4A4;Contract"
+    MPI_PROCS 1 NO_MPI NO_MODELS)
+add_v2_test(V2_Integration_W4A4FormatContract
+    COMMAND $<TARGET_FILE:v2_test_w4a4_format>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Tensors;W4A4;Contract"
+    MPI_PROCS 1 NO_MPI NO_MODELS)
 # OCP MXFP4 (GGUF type 39): exact decode, NativeVNNI packing and CPU projection.
 add_executable(v2_test_mxfp4_tensor unit/tensors/Test__MXFP4Tensor.cpp)
 target_link_libraries(v2_test_mxfp4_tensor PRIVATE llaminar2_core GTest::gtest_main)
@@ -5136,6 +5375,17 @@ add_v2_test(V2_Integration_ProductionPreflightBuildBootstrap
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CampaignFramework;Inventory;Build;Regression"
     ENVIRONMENT "LLAMINAR_TEST_MPI_SESSION_HELPER=$<TARGET_FILE:llaminar_mpi_session>"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+# Model-free commands forbid fixture injection while discovery still rejects dependencies.
+add_v2_test(V2_Integration_ProductionPrerequisiteFixtureExclusion
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_production_parity_campaigns.py
+            ProductionParityCampaignTest.test_preflight_executes_the_ctest_label_before_campaign_admission
+            ProductionParityCampaignTest.test_preflight_runs_disjoint_socket_lanes_together_then_mixed_work
+            ProductionParityCampaignTest.test_unit_inventory_rejects_model_fixture_dependency
+            ProductionParityCampaignTest.test_preflight_inventory_rejects_model_fixture_dependency
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CampaignFramework;Inventory;Contract;Regression"
+    ENVIRONMENT "LLAMINAR_TEST_MPI_SESSION_HELPER=$<TARGET_FILE:llaminar_mpi_session>"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 # Native backend selection cannot certify skipped or empty GTest execution.
 add_v2_test(V2_Integration_NativeGTestRequiredExecution
     COMMAND ${Python3_EXECUTABLE}
@@ -5222,6 +5472,14 @@ add_v2_test(V2_Unit_OptionalGPUPreflightRegistration
 add_v2_test(V2_Integration_OptionalGPUPreflightRegistration
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_optional_gpu_preflight_registration.py
     LABELS "V2;Integration;ProductionTestPreflight;BuildSystem;Regression;DeviceFree"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Unit_CUDAGDNPreflightRegistration
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_optional_gpu_preflight_registration.py CUDAGDNPreflightRegistration
+    LABELS "V2;Unit;BuildSystem;CUDA;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_CUDAGDNPreflightRegistration
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_optional_gpu_preflight_registration.py CUDAGDNPreflightRegistration
+    LABELS "V2;Integration;ProductionTestPreflight;BuildSystem;CUDA;DeviceFree;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 # Exercise real atomic file publication under constrained filesystem capacity.
 # This guards the same staging authority used by HTTP and image certification.
@@ -13355,6 +13613,18 @@ add_v2_test(V2_Unit_BufferRole
     MPI_PROCS 1
 )
 
+add_v2_test(V2_Integration_BufferTensorTypeIdentity
+    COMMAND $<TARGET_FILE:v2_test_buffer_role>
+        --gtest_filter=Test__BufferRole.NativeTensorIdentityDoesNotDependOnOrdinals:Test__BufferDescriptor.Q16BlockFootprintIsExact:Test__BufferDescriptor.EmptyAndMaximumExtentsDoNotWrap
+    LABELS "V2;Integration;DeviceFree;Execution;BufferRole;Contract;Regression"
+    NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30)
+add_v2_test(V2_Integration_W4A4GraphBufferContract
+    COMMAND $<TARGET_FILE:v2_test_buffer_role> --gtest_filter=W4A4GraphBufferContract.*
+    LABELS "V2;Integration;DeviceFree;CPU;W4A4;Execution;BufferRole;Contract;Regression"
+    NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30)
+set_tests_properties(V2_Integration_BufferTensorTypeIdentity V2_Integration_W4A4GraphBufferContract
+    PROPERTIES ENVIRONMENT "OMP_NUM_THREADS=1;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+
 # Test: DomainAwareBufferManager (Phase 5.2: Domain-aware buffer allocation)
 # Tests domain-aware buffer allocation based on layer placement configuration.
 # GPU layers get GPU buffers, CPU layers get NUMA-local CPU buffers.
@@ -15334,6 +15604,12 @@ add_v2_test(V2_Integration_AutomaticDeviceCountCandidates
     TIMEOUT 30
     NO_MODELS
 )
+add_v2_test(V2_Integration_PlanningCPUVisibilityContract
+    COMMAND $<TARGET_FILE:v2_test_execution_plan_builder>
+        --gtest_filter=AutomaticOrchestrationCandidates.CPUVisibilityAliasesDoNotInventParallelCandidates
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;CPU;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;OMP_NUM_THREADS=1")
 add_v2_test(V2_Integration_AutomaticMixedVendorOverlayRankBoundary
     COMMAND $<TARGET_FILE:v2_test_execution_plan_builder>
         --gtest_filter=AutomaticOrchestrationCandidates.ExactDeviceCountsMixedVendorOverlayRequiresRealRankBoundary
@@ -22997,6 +23273,7 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ImmutableTableSend
 add_executable(v2_integration_planning_mpi_transfers
     integration/planning/Test__PlanningMPITransferMeasurement.cpp
     integration/planning/Test__PlanningExpertSampleMPI.cpp
+    integration/planning/Test__W4A4PlanningSamplesMPI.cpp
     integration/planning/Test__PlanningKernelServiceCatalogMPI.cpp
     integration/planning/Test__PlanningMemoryBandwidthMeasurement.cpp
     integration/mpi_gtest_main.cpp)
@@ -23005,11 +23282,23 @@ target_link_libraries(v2_integration_planning_mpi_transfers llaminar2_core GTest
 foreach(planning_mpi_ranks IN ITEMS 2 3)
     add_v2_test(V2_Integration_PlanningMPITransfers_${planning_mpi_ranks}Ranks
         COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
-            --gtest_filter=PlanningMPITransferMeasurementIntegration.*:PlanningMatrixSampleMPI.*:PlanningExpertSampleMPI.CPU_*:PlanningExpertSampleMPI.Asymmetric*:PlanningKernelServiceCatalogMPI.CPU_*
+            --gtest_filter=PlanningMPITransferMeasurementIntegration.*:PlanningMatrixSampleMPI.*:W4A4PlanningPublicationMPI.*:PlanningExpertSampleMPI.CPU_*:PlanningExpertSampleMPI.Asymmetric*:PlanningKernelServiceCatalogMPI.CPU_*
         LABELS "V2;Integration;Orchestration;Planning;Lifecycle;MPI;Regression"
         MPI_PROCS ${planning_mpi_ranks}
         TIMEOUT 30
         NO_MODELS
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+    add_v2_test(V2_Integration_W4A4PlanningPublication_${planning_mpi_ranks}Ranks
+        COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
+            --gtest_filter=W4A4PlanningPublicationMPI.*
+        LABELS "V2;Integration;ProductionTestPreflight;Planning;W4A4;Lifecycle;MPI;Regression"
+        MPI_PROCS ${planning_mpi_ranks} TIMEOUT 30 NO_MODELS
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+    add_v2_test(V2_Integration_PlanningCPUTopologyCost_${planning_mpi_ranks}Ranks
+        COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
+            --gtest_filter=PlanningKernelServiceCatalogMPI.CPU_BoundedRequestCostPreparation
+        LABELS "V2;Integration;ProductionTestPreflight;Planning;CPU;MPI;Contract;Regression"
+        MPI_PROCS ${planning_mpi_ranks} TIMEOUT 30 NO_MODELS
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
     add_v2_test(V2_Integration_PlanningProjectionPolicyAgreement_${planning_mpi_ranks}Ranks
         COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
@@ -27710,6 +27999,7 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_MoEPipelinePrefixEpochs
     V2_Integration_PreparedContextSealBoundary
     V2_Integration_OptionalGPUPreflightRegistration
+    V2_Integration_CUDAGDNPreflightRegistration
     V2_Integration_PipelineStageConfigDocument
     V2_Integration_ImmutablePreparedSourceSeal
     V2_Integration_TerminalResetFailure
@@ -27829,13 +28119,16 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
 )
 
 # Exact stage-level regression for external event prejoins and scoped capture retirement.
-add_v2_test(V2_Integration_CUDA_GDNTensorCaptureOwnership
-    COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
-        --gtest_filter=Test__CUDAGemmParity.GDNProjectionStageFusesCUDAQuantizedQKVAndZSmallM:Test__CUDAGemmParity.GDNProjectionStageCapturedMixedBF16AndFP32UsesPhysicalFormatSubgroups
-        --gtest_brief=1
-    LABELS "V2;Integration;ProductionTestPreflight;CUDA;GEMM;GDN;GraphCapture;TransferEngine;Regression"
-    MPI_PROCS 1 NO_MODELS TIMEOUT 120)
-list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_GDNTensorCaptureOwnership)
+# The native test and its gate build obligation exist only in a configured CUDA lane.
+if(HAVE_CUDA)
+    add_v2_test(V2_Integration_CUDA_GDNTensorCaptureOwnership
+        COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
+            --gtest_filter=Test__CUDAGemmParity.GDNProjectionStageFusesCUDAQuantizedQKVAndZSmallM:Test__CUDAGemmParity.GDNProjectionStageCapturedMixedBF16AndFP32UsesPhysicalFormatSubgroups
+            --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;GEMM;GDN;GraphCapture;TransferEngine;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDA_GDNTensorCaptureOwnership)
+endif()
 if(TEST V2_Integration_ROCmNativeVNNITrainerOpenMPRuntimeBinding)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
         V2_Integration_ROCmNativeVNNITrainerOpenMPRuntimeBinding)
@@ -29388,8 +29681,81 @@ if(NOT V2_PERF_TESTS_ONLY)
         WORKING_DIRECTORY "${PYTHON_REFERENCE_ROOT}"
         ENVIRONMENT "OMP_NUM_THREADS=1;OMP_DYNAMIC=false;OPENBLAS_NUM_THREADS=1;MKL_NUM_THREADS=1;MKL_DYNAMIC=false;NUMEXPR_NUM_THREADS=1;BLIS_NUM_THREADS=1;VECLIB_MAXIMUM_THREADS=1;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ParityGGUFNativePayloadExtent)
+    add_v2_test(V2_Integration_W4A4ReferenceReplay
+        COMMAND ${Python3_EXECUTABLE} -m pytest -q --tb=short
+            python/reference/tests/test_w4a4.py::W4A4RecordedNativeReplay
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Parity;Reference;W4A4;Replay"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    add_v2_test(V2_Integration_W4A4HFReferenceContracts
+        COMMAND ${Python3_EXECUTABLE} -m pytest -q --tb=short
+            python/reference/tests/test_w4a4_hf.py
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Parity;Reference;W4A4;Contract"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    set_tests_properties(V2_Integration_W4A4ReferenceReplay V2_Integration_W4A4HFReferenceContracts PROPERTIES
+        WORKING_DIRECTORY "${PYTHON_REFERENCE_ROOT}"
+        ENVIRONMENT "OMP_NUM_THREADS=1;OMP_DYNAMIC=false;OPENBLAS_NUM_THREADS=1;MKL_NUM_THREADS=1;MKL_DYNAMIC=false;NUMEXPR_NUM_THREADS=1;BLIS_NUM_THREADS=1;VECLIB_MAXIMUM_THREADS=1;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+    add_v2_test(V2_Unit_W4A4CPUReplay
+        COMMAND ${Python3_EXECUTABLE} -m python.reference.tests.w4a4_cpu_replay
+            --executable $<TARGET_FILE:v2_w4a4_cpu_replay_driver>
+        LABELS "V2;Unit;DeviceFree;CPU;W4A4;Replay"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    add_v2_test(V2_Integration_W4A4CPUReplay
+        COMMAND ${Python3_EXECUTABLE} -m python.reference.tests.w4a4_cpu_replay
+            --executable $<TARGET_FILE:v2_w4a4_cpu_replay_driver>
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;W4A4;Replay"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    add_v2_test(V2_Unit_W4A4CPUGemmReplay
+        COMMAND ${Python3_EXECUTABLE} -m python.reference.tests.w4a4_cpu_replay
+            --executable $<TARGET_FILE:v2_w4a4_cpu_gemm_replay_driver> --interface gemm
+        LABELS "V2;Unit;DeviceFree;CPU;W4A4;Replay"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    add_v2_test(V2_Integration_W4A4CPUGemmReplay
+        COMMAND ${Python3_EXECUTABLE} -m python.reference.tests.w4a4_cpu_replay
+            --executable $<TARGET_FILE:v2_w4a4_cpu_gemm_replay_driver> --interface gemm
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;W4A4;Replay"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    set_tests_properties(V2_Unit_W4A4CPUReplay V2_Integration_W4A4CPUReplay
+        V2_Unit_W4A4CPUGemmReplay V2_Integration_W4A4CPUGemmReplay PROPERTIES
+        WORKING_DIRECTORY "${PYTHON_REFERENCE_ROOT}"
+        PROCESSORS 8
+        ENVIRONMENT "OMP_NUM_THREADS=1;OMP_DYNAMIC=false;OPENBLAS_NUM_THREADS=1;MKL_NUM_THREADS=1;MKL_DYNAMIC=false;NUMEXPR_NUM_THREADS=1;BLIS_NUM_THREADS=1;VECLIB_MAXIMUM_THREADS=1;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_W4A4ReferenceReplay V2_Integration_W4A4HFReferenceContracts
+        V2_Integration_W4A4CPUReplay V2_Integration_W4A4CPUGemmReplay)
 endif()
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_W4A4FormatContract
+    V2_Integration_W4A4GPUTransformPolicyContract
+    V2_Integration_W4A4CPUArithmeticContracts
+    V2_Integration_W4A4WeightStorageLifecycle
+    V2_Integration_W4A4TensorLifecycle
+    V2_Integration_W4A4PreparedWeightLifecycle
+    V2_Integration_W4A4ModelSourceContracts
+    V2_Integration_W4A4SplitSourceContracts
+    V2_Integration_W4A4ServingFixtureContract
+    V2_Integration_GGUFAlignmentContracts
+    V2_Integration_W4A4CPUModelGraphLifecycle
+    V2_Integration_W4A4StreamedSourcePolicy
+    V2_Integration_W4A4SourceAdmissionLifecycle
+    V2_Integration_W4A4WeightManagerLifecycle
+    V2_Integration_W4A4CompleteSourceReadContract
+    V2_Integration_W4A4SourceReadEconomy
+    V2_Integration_W4A4MTPBasisAdmission
+    V2_Integration_W4A4PlanningSampleContracts
+    V2_Integration_W4A4PlanningPreparedOwnership
+    V2_Integration_PlanningCPUVisibilityContract
+    V2_Integration_PlanningCPUTopologyCost_2Ranks
+    V2_Integration_PlanningCPUTopologyCost_3Ranks
+    V2_Integration_W4A4PlanningPublication_2Ranks
+    V2_Integration_W4A4PlanningPublication_3Ranks
+    V2_Integration_W4A4WorkspaceContract
+    V2_Integration_W4A4GemmContracts
+    V2_Integration_W4A4NativeProjectionOrientation
+    V2_Integration_W4A4NativeStageContracts
+    V2_Integration_W4A4FusedGateUpStageContract
+    V2_Integration_W4A4MixedGDNStageContract
+    V2_Integration_W4A4GraphBufferContract
+    V2_Integration_BufferTensorTypeIdentity
     V2_Integration_CPUHalfOperands_AVX2
     V2_Integration_Qwen4ExpMetadataContracts)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpCPUContracts)
@@ -29861,6 +30227,7 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_ProductionParityStageCSVSchema
     V2_Integration_ProductionPreflightBuildBootstrap
+    V2_Integration_ProductionPrerequisiteFixtureExclusion
     V2_Integration_ProductionPreflightIndexSelection)
 # The incoming epoch/state defects retain explicit canonical closure membership,
 # in addition to their behavioral aliases and preflight labels above.
@@ -32517,6 +32884,13 @@ add_v2_test(V2_Integration_CPUGraphArenaDeclarations
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUGraphArenaDeclarations)
+add_v2_test(V2_Integration_CPUModelArchitectureArenaContract
+    COMMAND $<TARGET_FILE:v2_test_activation_memory_estimator>
+        --gtest_filter=CPUGraphArenaDeclarations.AllAttentionSourceArchitectureOwnsTheArena
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Arena;Schema;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUModelArchitectureArenaContract)
 add_v2_test(V2_Integration_CPUDisabledMTPArenaAdmission
     COMMAND $<TARGET_FILE:v2_test_activation_memory_estimator>
         --gtest_filter=CPUGraphArenaDeclarations.NativeSizedDisabledMTPUsesAdmittedStorageRowsAcrossDepthPolicies

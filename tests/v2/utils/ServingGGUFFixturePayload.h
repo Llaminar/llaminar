@@ -9,6 +9,7 @@
  */
 #pragma once
 #include "PlanningGGUFFixture.h"
+#include "W4A4SourceFixture.h"
 #include "tensors/BlockStructures.h"
 #include "tensors/FP16Utils.h"
 #include <algorithm>
@@ -19,14 +20,16 @@ namespace llaminar2::test
 {
     /**
      * @brief Populate every authored tensor before any real model loader retains it.
-     * @param fixture Tiny fixture whose native payloads are FP32 or Q4_0.
+     * @param fixture Tiny fixture with FP32/Q4_0 tensors or complete rank-two W4A4/H matrices.
      * @throws std::invalid_argument For a source format outside this explicit fixture contract.
      * @throws std::runtime_error When the source directory cannot be read.
      *
      * All norm scales are one. Other FP32 sources and Q4_0 expert blocks have
-     * small positive nonuniform values, keeping residuals nonzero and finite
-     * through every declared layer. The directory and all extents are unchanged.
-     * Validate the whole format inventory before writing any payload.
+     * small positive nonuniform values. Native online-A4 matrices retain signed
+     * nibble codes, group64 multipliers and small FP32 row units; no floating
+     * weight conversion manufactures their payload. These sources keep residuals
+     * nonzero and finite without changing the directory or its extents. Validate
+     * the whole format inventory before writing any payload.
      */
     inline void populateServingGGUFFixture(const PlanningGGUFFixture &fixture)
     {
@@ -36,10 +39,21 @@ namespace llaminar2::test
             throw std::runtime_error("Cannot read serving fixture source directory");
         const auto &model = directory.getModel();
         for (const auto &tensor : model.tensors)
-            if ((tensor.type != GGUFTensorType::F32 && tensor.type != GGUFTensorType::Q4_0) ||
-                (tensor.type == GGUFTensorType::F32 && tensor.size_bytes % sizeof(float)) ||
-                (tensor.type == GGUFTensorType::Q4_0 && tensor.size_bytes % sizeof(Q4_0Block)))
-                throw std::invalid_argument("Serving fixture payload requires exact FP32/Q4_0 native tensors");
+        {
+            bool valid = (tensor.type == GGUFTensorType::F32 && tensor.size_bytes % sizeof(float) == 0) ||
+                (tensor.type == GGUFTensorType::Q4_0 && tensor.size_bytes % sizeof(Q4_0Block) == 0);
+            if ((tensor.type == GGUFTensorType::W4A4 || tensor.type == GGUFTensorType::W4A4H) &&
+                tensor.dimensions.size() == 2)
+            {
+                // The public directory already normalized GGUF [K,N] to [N,K].
+                // Reversing it again preserves byte count but corrupts native
+                // row units and the complete-original-K rotation policy.
+                const auto extent = w4a4::MatrixContract::sourceExtent(tensor.dimensions[0], tensor.dimensions[1]);
+                valid = extent && *extent == tensor.size_bytes;
+            }
+            if (!valid)
+                throw std::invalid_argument("Serving fixture requires exact FP32/Q4_0 tensors or complete native W4A4/H matrices");
+        }
         std::fstream stream(fixture.path(), std::ios::binary | std::ios::in | std::ios::out);
         stream.exceptions(std::ios::badbit | std::ios::failbit);
         for (const auto &tensor : model.tensors)
@@ -55,7 +69,7 @@ namespace llaminar2::test
                         (embedding ? 0.01F : 0.001F) * static_cast<float>(1 + index % 29) / 29.0F;
                 stream.write(reinterpret_cast<const char *>(values.data()), tensor.size_bytes);
             }
-            else
+            else if (tensor.type == GGUFTensorType::Q4_0)
             {
                 std::vector<Q4_0Block> blocks(tensor.size_bytes / sizeof(Q4_0Block));
                 for (std::size_t index = 0; index < blocks.size(); ++index)
@@ -65,6 +79,16 @@ namespace llaminar2::test
                     // exact constant-scale source is valid on every backend.
                     std::fill_n(blocks[index].qs, 16, index % 2 ? 0x9a : 0xa9);
                 }
+                stream.write(reinterpret_cast<const char *>(blocks.data()), tensor.size_bytes);
+            }
+            else
+            {
+                const auto type = tensor.type == GGUFTensorType::W4A4 ? TensorType::W4A4 : TensorType::W4A4H;
+                auto blocks = w4a4SourceBlocks(type, tensor.dimensions[0], tensor.dimensions[1]);
+                // Keep the original signed codes and exact descriptor policy.
+                // Scaling these synthetic row units is fixture construction,
+                // not a conversion or repack of production weights.
+                for (auto &block : blocks) block.unit *= 1.0F / 512.0F;
                 stream.write(reinterpret_cast<const char *>(blocks.data()), tensor.size_bytes);
             }
         }
