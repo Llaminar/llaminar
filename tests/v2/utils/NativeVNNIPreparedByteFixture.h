@@ -12,6 +12,7 @@
 
 #include "kernels/cpu/gemm/CPUNativeVNNIWeightView.h"
 #include "tensors/IQQuantTables.h"
+#include "tensors/MXFP4Format.h"
 #include <cstdint>
 #include <cstring>
 #include <span>
@@ -88,6 +89,8 @@ public:
                             sum += value < 128 ? value : int(value) - 256;
                         else if (layout.codebook_id == 4)
                             sum += kvalues_iq4nl_i8[value & 15] + kvalues_iq4nl_i8[value >> 4];
+                        else if (layout.codebook_id == kNativeVnniMXFP4Codebook)
+                            sum += mxfp4::kValues[value & 15] + mxfp4::kValues[value >> 4];
                         else
                             sum += (value & 15) + (value >> 4) - (layout.codebook_id == 0 ? 16 : 0);
                     }
@@ -96,7 +99,14 @@ public:
                         &compensation, sizeof(compensation));
                 }
                 const auto primary = unit + layout.data_stride + (layout.usesInlineCompensation() ? 128 : 0) + local * 2;
-                writeWord(primary, static_cast<std::uint16_t>(0x2401u + (seed & 0x1fffu)));
+                // Native MXFP4 primary words are BF16 powers of two of an admitted
+                // E8M0 exponent, or zero; every other unit holds FP16. The seeded
+                // exponents span [2, 200] so whole-row sums stay finite; the
+                // remaining admitted words are covered by the loader tests.
+                writeWord(primary, layout.scaleEncoding() == cpu::native_vnni::CPUNativeVNNIScaleEncoding::PowerOfTwoBF16
+                    ? (seed % 29u == 7u ? std::uint16_t{0}
+                        : mxfp4::powerOfTwoBF16Word(static_cast<std::uint8_t>(2u + (seed >> 8) % 199u)))
+                    : static_cast<std::uint16_t>(0x2401u + (seed & 0x1fffu)));
                 if (layout.is_asymmetric || layout.usesNibbleLUTSourceScale() || layout.usesIQ3SExpandedSourceScale() ||
                     layout.usesQ6KNativeDualScale() || layout.usesCompactMultiScale())
                 {

@@ -100,6 +100,12 @@ int sourceInteger(const CPUNativeVNNIWeightView &packed, int column, int block, 
         const int bit = (local % 16) * 4 + k % 4;
         return nibble + int((first >> bit) & 1) * 16 + int((second >> bit) & 1) * 32 - 32;
     }
+    // MXFP4 maps through its own E2M1 table, never IQ4_NL's grid.
+    if (packed.codebook_id == kNativeVnniMXFP4Codebook)
+    {
+        static constexpr int kE2M1Doubled[8] = {0, 1, 2, 3, 4, 6, 8, 12};
+        return (nibble & 8) ? -kE2M1Doubled[nibble & 7] : kE2M1Doubled[nibble & 7];
+    }
     return packed.codebook_id == 4 ? kvalues_iq4nl_i8[nibble]
         : packed.codebook_id == 0 ? nibble - 8 : nibble;
 }
@@ -387,6 +393,49 @@ TEST_F(CPUNativeNEONPreparedProjection, EveryHalfAndOpaqueWordHasExactBits)
                 std::bit_cast<std::uint32_t>(fp16_to_fp32(static_cast<std::uint16_t>(words[lane] ^ 0xa5b6u))));
         }
     }
+}
+
+/** @test Native MXFP4 BF16 power-of-two words widen exactly; FP16 interpretation is never used. */
+TEST_F(CPUNativeNEONPreparedProjection, EveryAdmittedPowerOfTwoBF16WordWidensExactly)
+{
+    using Ops = ms::NEONMultiScaleOps<ms::NEONByteDot::ASIMD>;
+    std::vector<std::uint16_t> words{0};
+    for (int e = 2; e <= 252; ++e)
+        words.push_back(mxfp4::powerOfTwoBF16Word(static_cast<std::uint8_t>(e)));
+    while (words.size() % 4 != 0) words.push_back(0);
+    for (std::size_t first = 0; first < words.size(); first += 4)
+    {
+        const auto widened = std::bit_cast<std::array<std::uint32_t, 4>>(Ops::bf16(words.data() + first));
+        for (int lane = 0; lane < 4; ++lane)
+        {
+            const auto word = words[first + lane];
+            std::uint8_t e = 0;
+            ASSERT_TRUE(mxfp4::e8m0FromPowerOfTwoBF16Word(word, e));
+            EXPECT_EQ(widened[lane], e == 0 ? 0u : mxfp4::normalScaleFP32Bits(e)) << "word=" << word;
+        }
+    }
+}
+
+/** @test Native MXFP4 and its rotated form keep distinct scale-word interpretations. */
+TEST_F(CPUNativeNEONPreparedProjection, MXFP4ScaleWordsFollowThePreparedIdentity)
+{
+    NativeVNNIPreparedByteFixture native(native_vnni_formats::MXFP4, 65, 64);
+    ASSERT_EQ(native.descriptor.encoding, CPUNativeVNNIEncoding::NibbleLUT);
+    EXPECT_EQ(native.view().scaleEncoding(), CPUNativeVNNIScaleEncoding::PowerOfTwoBF16);
+    native.seedPayloadAndMetadata();
+    const auto view = native.view();
+    for (int column = 0; column < 65; ++column)
+        for (int block = 0; block < 2; ++block)
+        {
+            const auto word = view.chunkScales(column / 64, block)[column % 64];
+            std::uint8_t e = 0;
+            ASSERT_TRUE(mxfp4::e8m0FromPowerOfTwoBF16Word(word, e)) << "seeded an inadmissible word";
+            EXPECT_EQ(std::bit_cast<std::uint32_t>(view.blockScale(column / 64, block, column % 64)),
+                e == 0 ? 0u : mxfp4::normalScaleFP32Bits(e));
+        }
+    EXPECT_EQ(preparedScaleEncoding(kNativeVnniMXFP4Codebook, CPUNativeVNNIEncoding::ExpandedInt8),
+        CPUNativeVNNIScaleEncoding::FP16);
+    EXPECT_EQ(preparedScaleEncoding(4, CPUNativeVNNIEncoding::NibbleLUT), CPUNativeVNNIScaleEncoding::FP16);
 }
 
 /** @test Widening reductions retain every signed-byte extremum and exact quarter order. */

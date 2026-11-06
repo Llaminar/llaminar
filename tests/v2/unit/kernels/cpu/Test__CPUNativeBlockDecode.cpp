@@ -27,14 +27,18 @@ TEST(CPUNativeBlockDecode, EveryNibblePairMatchesIndependentIntegerOracle)
     {
         std::array<std::uint8_t, 16> payload;
         payload.fill(static_cast<std::uint8_t>(raw));
-        for (const auto codebook : {0, 4, 5})
+        for (const int codebook : {0, 4, 5, int(kNativeVnniMXFP4Codebook)})
         {
             std::array<std::int8_t, 32> actual;
             decode_native_block(static_cast<std::uint8_t>(codebook), payload.data(), actual.data());
             for (int lane = 0; lane < 32; ++lane)
             {
                 const int index = lane < 16 ? raw & 15 : raw >> 4;
-                const int expected = codebook == 4 ? static_cast<int>(kvalues_iq4nl[index])
+                // MXFP4: sign bit 3, doubled OCP E2M1 magnitude in bits 0..2.
+                static constexpr int kE2M1Doubled[8] = {0, 1, 2, 3, 4, 6, 8, 12};
+                const int expected = codebook == kNativeVnniMXFP4Codebook
+                    ? ((index & 8) ? -kE2M1Doubled[index & 7] : kE2M1Doubled[index & 7])
+                    : codebook == 4 ? static_cast<int>(kvalues_iq4nl[index])
                     : codebook == 0 ? index - 8 : index;
                 ASSERT_EQ(int(actual[lane]), expected)
                     << "codebook=" << codebook << " raw=" << raw << " lane=" << lane;
