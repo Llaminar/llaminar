@@ -21,6 +21,10 @@
 #include <algorithm>
 #include <cmath>
 
+#if LLAMINAR_COMPILED_WITH_NEON
+#include "NEONInt8BlockRequantize.h"
+#endif
+
 #if defined(__AVX512F__)
 #include <immintrin.h>
 #endif
@@ -1280,6 +1284,20 @@ namespace llaminar2
                         _mm512_cvtsepi32_epi8(r));
                 }
             }
+        }
+#endif
+
+#if LLAMINAR_COMPILED_WITH_NEON
+        /** @brief Native NEON row maximum, byte-identical to the scalar leaf. */
+        float q8_1_find_max_abs_neon(const Q8_1Block *row_blocks, size_t blocks_per_row)
+        {
+            return neon_int8_block::findMaxAbs(row_blocks, blocks_per_row);
+        }
+        /** @brief Native NEON requantization, byte-identical to the scalar leaf. */
+        void q8_1_requantize_neon(const Q8_1Block *row_blocks, size_t blocks_per_row,
+                                  float inv_row_scale, int8_t *output)
+        {
+            neon_int8_block::requantize(row_blocks, blocks_per_row, inv_row_scale, output);
         }
 #endif
 
