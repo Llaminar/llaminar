@@ -613,6 +613,28 @@ namespace llaminar2
         }
 
     public:
+        /**
+         * @brief Authenticate the live allocation's original PMA issuer and owner.
+         * @param owner Exact physical BOM owner expected by the adopting subsystem.
+         * @return Original CPU allocator identity, independent of first-touch NUMA placement.
+         * @throws std::logic_error For unadmitted, retired or differently owned storage.
+         *
+         * This borrows the existing allocation lease; it does not reserve,
+         * subtract or re-account bytes. Moves preserve the authenticated binding.
+         */
+        [[nodiscard]] DeviceId requireAdmittedAllocator(PhysicalMemoryOwner owner) const
+        {
+            const bool lease_matches = allocation_bytes_ == 0
+                ? !allocation_lifetime_
+                : allocation_lifetime_ && allocation_lifetime_->valid() &&
+                  allocation_lifetime_->bytes() == allocation_bytes_ &&
+                  allocation_lifetime_->owner() == owner;
+            if (!allocation_authority_ || allocation_owner_ != owner || !lease_matches ||
+                !allocation_device_.is_valid() || !allocation_device_.is_cpu())
+                throw std::logic_error("AlignedVector adoption requires its original admitted allocation owner");
+            return allocation_device_;
+        }
+
         // ========== Alignment Query ==========
 
         /// Check if data pointer is properly aligned

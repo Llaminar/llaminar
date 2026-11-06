@@ -48,7 +48,9 @@ namespace llaminar2
         TQ4,     // TurboQuant 4-bit (KV cache values)
         TQ8,     // TurboQuant 8-bit (KV cache values)
         AQ8,     // Cubic-companded int8 attention-key cache blocks
-        MXFP4    // OCP MXFP4: E8M0 block exponent + 32 FP4 E2M1 codes (GGUF type 39)
+        MXFP4,   // OCP MXFP4: E8M0 block exponent + 32 FP4 E2M1 codes (GGUF type 39)
+        W4A4,    // Native ruquant group64 online-A4 operand (GGUF type 44)
+        W4A4H    // Same native arithmetic with ordered online Hadamard (GGUF type 45)
     };
 
     /**
@@ -122,9 +124,23 @@ namespace llaminar2
             return "AQ8";
         case TensorType::MXFP4:
             return "MXFP4";
+        case TensorType::W4A4:
+            return "W4A4";
+        case TensorType::W4A4H:
+            return "W4A4H";
         default:
             return "UNKNOWN";
         }
+    }
+
+    /**
+     * @brief Identify native online-A4 operands, distinct from weight-only codebooks.
+     * @param type Exact public tensor identity.
+     * @return True only for the W4A4/W4A4H arithmetic family.
+     */
+    inline constexpr bool isW4A4Format(TensorType type) noexcept
+    {
+        return type == TensorType::W4A4 || type == TensorType::W4A4H;
     }
 
     /**
@@ -196,7 +212,7 @@ namespace llaminar2
     {
         if(name=="F32")return TensorType::FP32;
         if(name=="F16")return TensorType::FP16;
-        for(int value=0;value<=static_cast<int>(TensorType::MXFP4);++value)
+        for(int value=0;value<=static_cast<int>(TensorType::W4A4H);++value)
             if(name==tensorTypeName(static_cast<TensorType>(value)))return static_cast<TensorType>(value);
         return std::nullopt;
     }
