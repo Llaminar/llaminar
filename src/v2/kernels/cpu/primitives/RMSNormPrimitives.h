@@ -12,14 +12,14 @@
  * accumulation remains a distinct program. Original tensors/gamma retain their
  * caller-owned storage authority. Other typed publication APIs keep their own
  * numerical programs:
- * - INT32→INT8 pipeline support for full INT8 inference
+ * - INT32→INT8 original-row summary/inverse and native two-pass publication,
+ *   without scratch allocation or decoded-row/TLS mirrors
  * - Q8_1 integer-space RMSNorm (avoids FP32 dequant overhead)
  */
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
-#include <vector>
 #include "../../../tensors/BlockStructures.h"
 
 namespace llaminar2::primitives
@@ -35,31 +35,6 @@ namespace llaminar2::primitives
         bool t5_compat_mode = false;                 // Use float32 accumulation for T5 parity
         bool force_scalar = false;                   // Force scalar path (for testing)
     };
-
-    /**
-     * @brief Reusable scratch buffers to avoid per-call allocations
-     */
-    struct RMSNormScratch
-    {
-        std::vector<double> row_sumsq; // Per-row sum of squares
-        std::vector<float> inv;        // Per-row inverse RMS
-
-        void ensure(std::size_t rows)
-        {
-            if (row_sumsq.size() < rows)
-                row_sumsq.resize(rows);
-            if (inv.size() < rows)
-                inv.resize(rows);
-        }
-
-        void clear()
-        {
-            row_sumsq.clear();
-            inv.clear();
-        }
-    };
-
-
 
     /**
      * @brief Convert row sum of squares to inverse RMS scaling factors
@@ -326,8 +301,14 @@ namespace llaminar2::primitives
      * @param src Input INT32 tensor [rows, cols]
      * @param rows Number of rows
      * @param cols Number of columns
-     * @param row_sumsq Output per-row sum of squares (length = rows)
-     * @param opts Execution options
+     * @param row_sumsq Disjoint caller-owned per-row FP64 summaries (length = rows).
+     * @param opts Native execution or explicit increasing-column FP64-FMA scalar intent.
+     * @throws std::invalid_argument For malformed/wrapping geometry, original bank/options
+     * intersections, foreign/uncompiled ISA or undeclared T5 accumulation intent.
+     * @details Original integers widen directly to FP64 before squares. Native
+     * per-ISA trees need not equal each other, but M/worker ownership cannot
+     * change one row's program. All retained members call this collective;
+     * valid empty calls complete their team without allocating a standalone one.
      */
     void rmsnorm_compute_row_sumsq_int32_vectorized(
         const int32_t *src,
@@ -349,7 +330,14 @@ namespace llaminar2::primitives
      * @param cols Number of columns
      * @param dst_int8 Output INT8 tensor [rows, cols]
      * @param dst_row_scales Output per-row INT8 scales [rows]
-     * @param opts Execution options
+     * @param opts Native ISA or explicit scalar diagnostic; retained calls are collective.
+     * @throws std::invalid_argument For malformed/wrapping geometry, aliases with
+     * original source/gamma/inverses/policy, or undeclared T5/native ISA intent.
+     * @details Two original-storage passes retain (float(x)*inv)*gamma FP32
+     * edges. Scale is A>0?A/127:1, without a foreign quantizer floor. Native
+     * complete8/16-coordinate fragments use RNE; scalar tails use ties-away.
+     * Inverse0 publishes zero codes/scale1 without reading gamma values.
+     * Nonfinite/unrepresentable arithmetic is fatal before that row's stores.
      */
     void rmsnorm_apply_int32_to_int8_vectorized(
         const int32_t *src,
@@ -377,7 +365,13 @@ namespace llaminar2::primitives
      * @param rows Number of rows
      * @param cols Number of columns
      * @param epsilon Epsilon for numerical stability
-     * @param opts Execution options
+     * @param opts Native program or explicit scalar diagnostic; retained calls are collective.
+     * @throws std::invalid_argument For malformed geometry, nonfinite/negative
+     * epsilon, original source/gamma/policy intersections or undeclared T5/ISA.
+     * @details One tile owner retains summary, staged FP64-mean inverse, native
+     * maximum and code/scale publication. ARM shares1..4 original summaries;
+     * no decoded row, scratch resizing, TLS inverse bank or complete M1 replay
+     * is used. Empty retained calls still complete their team.
      */
     void rmsnorm_fused_int32_to_int8_vectorized(
         const int32_t *src,
@@ -387,20 +381,6 @@ namespace llaminar2::primitives
         std::size_t rows,
         std::size_t cols,
         float epsilon,
-        const RMSNormExecOptions &opts = {});
-
-    /**
-     * @brief Fused INT32 RMSNorm with provided scratch buffer
-     */
-    void rmsnorm_fused_int32_to_int8_vectorized(
-        const int32_t *src,
-        const float *gamma,
-        int8_t *dst_int8,
-        float *dst_row_scales,
-        std::size_t rows,
-        std::size_t cols,
-        float epsilon,
-        RMSNormScratch &scratch,
         const RMSNormExecOptions &opts = {});
 
     // ========================================================================

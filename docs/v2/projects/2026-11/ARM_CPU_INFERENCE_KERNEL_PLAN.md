@@ -8,6 +8,36 @@ Working branch: `codex/qfn-ngram-continuation-arm64`.
 The full objective remains native CPU inference with the robustness of the
 existing Intel path, not merely a successful configure or primitive benchmark.
 
+### Verified frontier — 2026-11-06
+
+The immutable `4e56c543` successor now has independently audited native x86
+AQ8/value/lookup correctness:24 registrations and12 focused cells×20 per ISA,
+then actual AVX512-built/runtime-AVX2 binaries and three default-ISA byte-auth
+CLI calls. The isolated CLI timings are not economy. The separate ARM normal
+Integration app/gate-target build configures successfully but fails first at
+`CPUQwenSparseAttention.cpp:22` (`immintrin.h`). Its actual immutable-lookup
+object now builds; no engine executable or test execution exists. The complete
+7076-entry source maps are unchanged on both hosts. Both windows are retired.
+See [the evidence record](ARM_CPU_KERNEL_IMPLEMENTATION_EVIDENCE.md) for exact
+archive hashes, raw counts and scope.
+
+INT32 RMS work now closes the original-summary and native publication pipeline
+together: direct full-width FP64 reductions, explicit scalar intent, original
+integer/gamma streaming, private inverse, one row/tile owner and no decoded/TLS
+row banks. The old normalization-only precision caller was a real retirement
+dependency; its actual link failure was reproduced before moving it to the
+admitted public publisher. Native-vector NaN rejection and immediate nonempty
+retained completion have focused regressions; isolated nowait countercopies
+fail at1/3 or2/3 arrivals. Current x86 INT32 runtime/economy remains unqualified.
+
+Next build frontier is genuine native sparse attention, not an include guard:
+its ISA admission, dot and value paths are explicitly x86-only, and its decoded
+head buffers must not become an ARM compatibility path. Preserve original
+codec/rounding/basis programs, same-head in-place indexer preparation, original
+query coordinates and canonical replay/cache owners. Validate actual TU/callers,
+all codecs and serial/grouped bytes before a fresh sealed build-only successor.
+No old source token/window, model admission or full-engine pass is inherited.
+
 ## 1. Mandate and completion criteria
 
 The code owner's scope is authoritative for this work:
