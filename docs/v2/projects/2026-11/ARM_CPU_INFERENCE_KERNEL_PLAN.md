@@ -1,45 +1,51 @@
 # Native ARM CPU inference: implementation, numerical proof and tuning plan
 
-Created: 2026-11-04; progress updated 2026-11-06.
+Created: 2026-11-04; progress updated 2026-11-06 (late).
 Rebased upstream base: `feat/qfn-ngram-continuation` at `f48c856105f6d1495a4c342ed2cc0c62b4d11273`.
-Local committed head: `fe4d37d19482c3161d7cdb0698a96027d9e0d68e`; working branch: `codex/qfn-ngram-continuation-arm64`.
-The rebased history has not been force-pushed; the immutable K17 source below also includes uncommitted implementation work.
+Working branch: `codex/qfn-ngram-continuation-arm64`. The rebased history is
+committed locally and pushed only to `arm-validation/*` branches on the fork for
+cross-host testing; draft PR #32 still shows the pre-rebase head.
 
-**Status: implementation plan, not a completed port or performance certificate.**
+**Status: implementation in progress, not a completed port or performance certificate.**
 The full objective remains native CPU inference with the robustness of the
 existing Intel path, not merely a successful configure or primitive benchmark.
 
-### Verified frontier — 2026-11-06
+### Verified frontier — 2026-11-06 (late)
 
-Historical K11 passed all229 configured core-free tests on five profiles and
-all179 preflight cells20 times per profile. Current rebased K14 independently
-passed the expanded indexer native Mac slice, including original-input all-M,
-prefix-tail and admitted-team sweeps. K17 (`467cadff20f2e36065728a42970c3c93016b1c62`)
-passed three native RMS profiles:35 registrations, explicit native/Scalar/team
-authentication controls and a rounded-product mutant; all three RMS translation
-units compile without warnings. The complete five-profile K17 core-free matrix
-now passes243 tests per profile plus193 preflight cells20 times per profile
-(19,300 raw preflight passes), with zero warnings/sanitizer hits and unchanged
-source. Main independently authenticated all95 sealed artifacts and actual
-per-test repeat counts. This remains a Mac core-free slice, not an engine gate.
-GNU/native-x86, Spark20-core coverage, economy,
-canonical engine gates and serving remain unfinished. The old Git-bound Mac hook
-failure is historical evidence, not a rerun on the new base. Exact-SDK Spark mount
-primitives now pass; the guarded app plus both complete gate-target BUILD-ONLY
-protocol is under review, with no current complete-engine build result.
+Committed on the branch since the rebase:
 
-Standalone issues36/37 were consolidated at the operator's request; this does not
-resolve or waive their remaining work. Fixes and regressions are tracked directly
-in this plan/local tasks. The operator-provided arm-helper owns isolated RMS
-numeric/lifecycle/half-policy/identity-gamma implementation against exact K17;
-Main retains engine/integration and publication, arm-tester immutable runs and
-arm-reviewer source-only review. Helper RMS candidates remain uncompiled source
-until reviewed and independently qualified; neither their seals nor the K17
-results certify the new fatal-policy changes. A clean25.07-second Debug timing
-observation exposed missing CTest PROCESSORS accounting for whole-team tests;
-that local follow-on uses the actual admitted budget, not caps, locks or a longer
-timeout. Source-only reviews and old packets never replace
-current compiler/runtime gates. Detailed retained scopes follow below.
+- Scalar FP32 RMS order, explicit FP32 row publishers and whole-indexer
+  totality sweeps (K17): five Mac core-free profiles, 243 tests and 193
+  preflight cells x20 each.
+- RMS numeric corruption as one typed release-safe fatal (helper v7): five
+  profiles, 248 tests and 197 preflight x20, plus generic-gate, throw,
+  terminate, Scalar-override and thread-limit controls.
+- Shared OpenMP helpers reuse lexical retained teams (helper task47): ASIMD and
+  DotProd full matrices green; old-predicate and barrier mutants fail.
+- Every `ISA_DISPATCH_*` kernel now has a NEON leaf (Q8_0/Q8_1 requantize, GDN
+  normalization, sampler top-k, short-conv, TurboQuant dequant), and the
+  shared-memory spin backend builds on ARM. Short-conv prefill rejects windows
+  wider than its SIMD register program.
+- GB10/APU memory: discovery records integrated-GPU backing and
+  PhysicalMemoryAuthority admits each rank's CPU plus pooled GPUs jointly
+  against the shared pool (13 device-free regressions).
+- Core-free whole-team tests declare CTest PROCESSORS; slow sweeps are sharded
+  per format so the unchanged 30 s budget holds under an unrestricted gate.
+
+Real-hardware results so far:
+
+- **Spark GB10, first complete-engine build** (K14 source, GCC 14 SDK, build
+  only): configure passed; the build stopped at missing NEON Q8 leaves, now
+  fixed. Peak build memory 33.6 GiB. The generalized commit-based build tooling
+  is rerunning on the current head.
+- **x86 (7800X3D, GCC 14 SDK) portability suite** on the RMS head: AVX2 builds
+  clean and all tests pass when not oversubscribed; whole-team timeouts and one
+  GCC 14 AVX512 warning led to the accounting/sharding fixes above. The current
+  head is being rerun for AVX2 and AVX512, followed by a full CPU-only build.
+
+Not yet done: a complete ARM engine build and its Unit/preflight run, model and
+HTTP serving with MTP/prefix on ARM, exact NativeVNNI overlays, and the final
+`Perf__` scaling round on Spark (1..20 physical cores) and the Mac.
 
 The immutable `4e56c543` successor now has independently audited native x86
 AQ8/value/lookup correctness:24 registrations and12 focused cells×20 per ISA,
