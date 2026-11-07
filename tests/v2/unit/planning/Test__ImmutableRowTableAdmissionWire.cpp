@@ -111,9 +111,12 @@ TEST(ImmutableRowTableAdmissionWire, LocalityWireRejectsInvalidOrDiscardedPolicy
     {
         auto bytes=valid;
         if(mutation==0)bytes[4]=1; // Previous schema has no locality authority.
-        if(mutation==1)bytes[200]=2; // Unknown locality arm.
-        if(mutation==2)bytes[200]=0; // Task arm cannot retain a bound-node payload.
-        if(mutation==3)for(int i=0;i<4;++i)bytes[204+i]=255; // Unrepresentable node.
+        // The locality arm follows the host resource, whose Version17 record
+        // carries physical backing and pool headroom (40 bytes).
+        constexpr std::size_t arm=212;
+        if(mutation==1)bytes[arm]=2; // Unknown locality arm.
+        if(mutation==2)bytes[arm]=0; // Task arm cannot retain a bound-node payload.
+        if(mutation==3)for(int i=0;i<4;++i)bytes[arm+4+i]=255; // Unrepresentable node.
         EXPECT_THROW(parseImmutableRowTableAdmissionRequests(bytes,2),std::invalid_argument)<<mutation;
     }
 }

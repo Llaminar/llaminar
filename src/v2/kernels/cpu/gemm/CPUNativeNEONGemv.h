@@ -17,6 +17,7 @@
 #include "CPUProjectionQ8Publication.h"
 #include "execution/moe/DeviceMoERuntimeABI.h"
 #include <algorithm>
+#include <cmath>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -380,18 +381,23 @@ namespace llaminar2::cpu::native_vnni
                 if (!grid.active(row)) continue;
                 const auto offset = std::size_t(row) * columns;
                 int column = 0;
+                // Canonical CPU BLAS epilogue on every ISA: alpha*product
+                // alone, or fma(alpha, product, round(beta*prior)).
                 for (; column + 4 <= columns; column += 4)
                 {
-                    const auto a = persistRoundedNEON(vmulq_n_f32(vld1q_f32(destination + offset + column), alpha));
-                    const auto result = beta == 0.0f ? a : vaddq_f32(a,
-                        persistRoundedNEON(vmulq_n_f32(vld1q_f32(output + offset + column), beta)));
+                    const auto product_values = vld1q_f32(destination + offset + column);
+                    const auto result = beta == 0.0f
+                        ? vmulq_n_f32(product_values, alpha)
+                        : vfmaq_n_f32(persistRoundedNEON(vmulq_n_f32(vld1q_f32(output + offset + column), beta)),
+                              product_values, alpha);
                     vst1q_f32(output + offset + column, result);
                 }
                 for (; column < columns; ++column)
                 {
-                    const auto a = device_fp32_contract::multiply(destination[offset + column], alpha);
-                    output[offset + column] = beta == 0.0f ? a : device_fp32_contract::add(a,
-                        device_fp32_contract::multiply(output[offset + column], beta));
+                    output[offset + column] = beta == 0.0f
+                        ? device_fp32_contract::multiply(destination[offset + column], alpha)
+                        : std::fma(alpha, destination[offset + column],
+                              device_fp32_contract::multiply(output[offset + column], beta));
                 }
             }
         };
