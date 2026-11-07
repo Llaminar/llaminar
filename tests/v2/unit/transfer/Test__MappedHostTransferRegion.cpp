@@ -12,6 +12,10 @@
 
 #include "backends/IBackend.h"
 #include "execution/moe/MoEOverlaySparseCollective.h"
+#include "execution/local_execution/graph/IGraphBuilder.h"
+#include "execution/local_execution/graph/DeviceGraphExecutor.h"
+#include "execution/compute_stages/stages/MoEOverlayTicketPublishStage.h"
+#include "tensors/Tensors.h"
 #include "transfer/TransferEngine.h"
 #include "transfer/BackgroundTransferProgressBinding.h"
 #include "transfer/TransferProducerDependency.h"
@@ -1322,3 +1326,128 @@ TEST_F(Test__MappedHostTransferRegion, CUDAMappedDispatchTicketDoesNotRetouchFre
 /** @test ROCm-shaped actual binder has identical fresh-zero and publication ownership. */
 TEST_F(Test__MappedHostTransferRegion, ROCmMappedDispatchTicketDoesNotRetouchFreshPayloadPages)
 {proveFreshTicketDoesNotRetouchPayload(DeviceId::rocm(0));}
+
+/** @test Real declaration-only tickets leave no orphan arena slots before physical capture setup. */
+TEST_F(Test__MappedHostTransferRegion, WorkspaceTicketDeclarationDoesNotRetainNativeBacking)
+{
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        SCOPED_TRACE(device.toString());
+        auto arena = engine_.createMappedHostArena(std::array{device});
+        const auto before = arena->snapshot();
+        FP32Tensor hidden({17,64}), ids({17,2}), weights({17,2});
+        const auto paramsFor = [&](std::shared_ptr<MoEOverlayDispatchTicketStorage> storage)
+        {
+            MoEOverlayTicketPublishStage::Params params;
+            params.device_id=device; params.layer_idx=3; params.bucket_rows=17;
+            params.top_k=2; params.d_model=64; params.hidden=&hidden;
+            params.routing_indices=&ids; params.routing_weights=&weights;
+            params.ticket_storage=std::move(storage);
+            return params;
+        };
+        StageBufferRequirements expected;
+        std::size_t declared_bytes=0;
+        {
+            auto declaration = std::make_shared<MoEOverlayDispatchTicketStorage>();
+            declaration->bindForGraphConstruction(ForwardGraphSubmissionIntent::WorkspaceDeclaration,
+                3,17,2,64,device,7,arena);
+            EXPECT_EQ(arena->snapshot().slice_count,before.slice_count)
+                << "Workspace declaration must not orphan actual mapped ticket slices";
+            EXPECT_EQ(arena->snapshot().backing_region_count,before.backing_region_count)
+                << "Workspace declaration must not allocate native mapped backing";
+            ASSERT_TRUE(declaration->isWorkspaceDeclaration());
+            ASSERT_TRUE(declaration->hasValidConstructionIdentity());
+            EXPECT_FALSE(declaration->isBound());
+            EXPECT_FALSE(declaration->hasValidBoundIdentity());
+            EXPECT_FALSE(declaration->hasCapturedPublicationContract());
+            EXPECT_FALSE(declaration->armCapturedPublication());
+            EXPECT_THROW((void)declaration->ticket(),std::logic_error);
+            declared_bytes=declaration->allocationBytes();
+            auto stage=std::make_unique<MoEOverlayTicketPublishStage>(paramsFor(declaration));
+            expected=stage->getBufferRequirements();
+            EXPECT_FALSE(stage->isGraphCapturable());
+            ComputeGraph graph;graph.addNode("original.ticket.publish",std::move(stage),device);
+            graph.markWorkspaceDeclaration();
+            DeviceGraphExecutor executor;
+            EXPECT_THROW(executor.execute(graph,nullptr),std::invalid_argument);
+            EXPECT_THROW(executor.captureRetainedGraphFragment(graph,nullptr,nullptr),std::invalid_argument);
+            EXPECT_THROW(declaration->bindFixedCapacity(3,17,2,64,device,7,arena),std::logic_error);
+        }
+        // The declaration graph has gone away. Its persistent arena must still
+        // have exactly its ORIGINAL empty state, not abandoned bump positions.
+        const auto after=arena->snapshot();
+        EXPECT_EQ(after.committed_bytes,before.committed_bytes);
+        EXPECT_EQ(after.allocated_bytes,before.allocated_bytes);
+        EXPECT_EQ(after.alignment_padding_bytes,before.alignment_padding_bytes);
+        EXPECT_EQ(after.backing_region_count,before.backing_region_count);
+        EXPECT_EQ(after.slice_count,before.slice_count);
+        auto actual=std::make_shared<MoEOverlayDispatchTicketStorage>();
+        actual->bindForGraphConstruction(ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch,
+            3,17,2,64,device,7,arena);
+        ASSERT_TRUE(actual->hasValidBoundIdentity());
+        EXPECT_EQ(actual->allocationBytes(),declared_bytes);
+        MoEOverlayTicketPublishStage materialized(paramsFor(actual));
+        const auto requirements=materialized.getBufferRequirements();
+        ASSERT_EQ(expected.buffers.size(),requirements.buffers.size());
+        for(std::size_t i=0;i<expected.buffers.size();++i)
+        {
+            EXPECT_EQ(expected.buffers[i].name,requirements.buffers[i].name);
+            EXPECT_EQ(expected.buffers[i].shape,requirements.buffers[i].shape);
+            EXPECT_EQ(expected.buffers[i].tensor_type,requirements.buffers[i].tensor_type);
+            EXPECT_EQ(expected.buffers[i].sizeBytes(),requirements.buffers[i].sizeBytes());
+        }
+        EXPECT_EQ(arena->snapshot().slice_count,2u);
+        actual->ticket().hidden_rows_fp32[0]=19.f;
+        for(unsigned reset=0;reset<20;++reset)
+        {
+            ASSERT_TRUE(actual->armCapturedPublication());
+            EXPECT_EQ(actual->ticket().hidden_rows_fp32[0],19.f);
+            EXPECT_EQ(arena->snapshot().slice_count,2u);
+        }
+    }
+}
+
+/** @test Canonical metadata declarations borrow the same contribution bank without native metadata slots. */
+TEST_F(Test__MappedHostTransferRegion, WorkspaceCanonicalTicketDeclarationRetainsOnlyOriginalGeometry)
+{
+    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})
+    {
+        auto arena=engine_.createMappedHostArena(std::array{device});
+        auto contribution=engine_.allocateMappedHostRegion(34u*64u*sizeof(float),std::array{device});
+        const auto before=arena->snapshot();
+        MoEOverlayCanonicalRouteReturnTicketStorage declaration;
+        declaration.bindForGraphConstruction(ForwardGraphSubmissionIntent::WorkspaceDeclaration,
+            3,34,64,device,7,contribution,arena);
+        ASSERT_TRUE(declaration.isWorkspaceDeclaration());
+        ASSERT_TRUE(declaration.hasValidConstructionIdentity());
+        EXPECT_FALSE(declaration.hasValidBoundIdentity());
+        EXPECT_EQ(declaration.routeCapacity(),34u);
+        EXPECT_EQ(declaration.layerIndex(),3);
+        EXPECT_EQ(declaration.contributionRowsHost(),contribution->mutableHostData());
+        EXPECT_FALSE(static_cast<bool>(declaration.arm(1)));
+        EXPECT_FALSE(declaration.publishAbort());
+        EXPECT_EQ(declaration.controlDeviceAlias(),nullptr);
+        EXPECT_THROW(declaration.bindFixedCapacity(3,34,64,device,7,contribution,arena),std::logic_error);
+        EXPECT_EQ(arena->snapshot().committed_bytes,before.committed_bytes);
+        EXPECT_EQ(arena->snapshot().slice_count,before.slice_count);
+        MoEOverlayCanonicalRouteReturnTicketStorage actual;
+        actual.bindForGraphConstruction(ForwardGraphSubmissionIntent::Execute,
+            3,34,64,device,7,contribution,arena);
+        ASSERT_TRUE(actual.hasValidBoundIdentity());
+        EXPECT_EQ(actual.routeCapacity(),declaration.routeCapacity());
+        EXPECT_EQ(actual.contributionRowsHost(),declaration.contributionRowsHost());
+        EXPECT_EQ(arena->snapshot().slice_count,1u);
+    }
+    MoEOverlayDispatchTicketStorage arbitrary;
+    EXPECT_FALSE(arbitrary.hasValidConstructionIdentity());
+    EXPECT_THROW(arbitrary.bindForGraphConstruction(static_cast<ForwardGraphSubmissionIntent>(255),
+        0,1,1,1,DeviceId::cpu(),1),std::invalid_argument);
+    MoEOverlayDispatchTicketStorage cpu;
+    cpu.bindForGraphConstruction(ForwardGraphSubmissionIntent::WorkspaceDeclaration,
+        0,1,1,1,DeviceId::cpu(),1);
+    EXPECT_FALSE(cpu.armCapturedPublication());
+    EXPECT_FALSE(cpu.enqueueCapturedPayload({},reinterpret_cast<void*>(0x12340)));
+    EXPECT_FALSE(cpu.enqueueCapturedPublication(reinterpret_cast<void*>(0x12340)));
+    EXPECT_FALSE(cpu.awaitCapturedPublication());
+    EXPECT_THROW((void)cpu.ticket(),std::logic_error);
+}

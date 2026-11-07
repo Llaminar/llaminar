@@ -8,6 +8,7 @@
  */
 #include "execution/compute_stages/stages/MoECPUExpertShardRouteStage.h"
 #include "execution/local_execution/engine/PrefillGraphCache.h"
+#include "execution/local_execution/graph/IGraphBuilder.h"
 #include "execution/moe/MoEExpertOverlayPreparationPlan.h"
 #include "execution/moe/MoEOverlayCapacityResolver.h"
 #include "loaders/WeightManager.h"
@@ -132,6 +133,31 @@ void rootedPaddedPrefillContract(DeviceId device) {
   .original_sparse_routes=&input,.original_prepared_layer=layer,.original_tp_owner=context,
   .original_canonical_ticket=ticket,.original_continuation_device=device};
  auto stage=std::make_unique<MoECPUExpertShardRouteStage>(params);const auto* actual=stage.get();
+ // The exact same original CPU-shard/source geometry must also support a
+ // non-executable workspace declaration without another mapped metadata slot.
+ const auto before_declaration=metadata->snapshot();
+ auto declared_ticket=std::make_shared<MoEOverlayCanonicalRouteReturnTicketStorage>();
+ declared_ticket->bindForGraphConstruction(ForwardGraphSubmissionIntent::WorkspaceDeclaration,
+  0,slots,hidden,device,1,publication,metadata);
+ auto declared_params=params;declared_params.original_canonical_ticket=declared_ticket;
+ MoECPUExpertShardRouteStage declaration(std::move(declared_params));
+ const auto required=actual->getBufferRequirements();const auto declared_required=declaration.getBufferRequirements();
+ ASSERT_EQ(required.buffers.size(),declared_required.buffers.size());
+ for(size_t i=0;i<required.buffers.size();++i) {
+  EXPECT_EQ(required.buffers[i].name,declared_required.buffers[i].name);
+  EXPECT_EQ(required.buffers[i].shape,declared_required.buffers[i].shape);
+  EXPECT_EQ(required.buffers[i].tensor_type,declared_required.buffers[i].tensor_type);
+  EXPECT_EQ(required.buffers[i].sizeBytes(),declared_required.buffers[i].sizeBytes());
+ }
+ EXPECT_EQ(metadata->snapshot().slice_count,before_declaration.slice_count);
+ EXPECT_EQ(metadata->snapshot().committed_bytes,before_declaration.committed_bytes);
+ EXPECT_FALSE(declared_ticket->hasValidBoundIdentity());
+ EXPECT_FALSE(declaration.acceptsSchedulingContext(device));
+ EXPECT_FALSE(static_cast<bool>(declared_ticket->arm(1)));
+ auto arbitrary_params=params;arbitrary_params.original_canonical_ticket=
+  std::make_shared<MoEOverlayCanonicalRouteReturnTicketStorage>();
+ EXPECT_THROW(MoECPUExpertShardRouteStage(std::move(arbitrary_params)),std::invalid_argument);
+
  const auto foreign_ordinal=device.is_cuda()?DeviceId::cuda(device.ordinal+1):DeviceId::rocm(device.ordinal+1);
  const auto foreign_vendor=device.is_cuda()?DeviceId::rocm(device.ordinal):DeviceId::cuda(device.ordinal);
  EXPECT_TRUE(actual->acceptsSchedulingContext(DeviceId::cpu()));

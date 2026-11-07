@@ -14,6 +14,7 @@
  */
 
 #include "Qwen35Graph.h"
+#include "execution/mtp/MTPForwardConstruction.h"
 #include "execution/compute_stages/stages/GDNSpeculativeWorkspaceContract.h"
 #include "kernels/gdn/GDNPreparedQK.h"
 #include "../../config/GDNHeadAssignment.h"
@@ -419,10 +420,16 @@ namespace llaminar2
         const MTPForwardInput &input,
         MTPForwardOutput &output)
     {
+        const DeviceId device = input.device.is_valid() ? input.device : config_.default_device;
+        auto construction_input = mtpForwardConstructionInput(input);
+        // Preserve this builder's original declared-device resolution in the
+        // borrowed scope; no consumer may see an invalid device after selection.
+        construction_input.device = device;
+        ForwardInputConstructionScope construction_scope(*this, construction_input);
         ScopedMTPGraphContext mtp_graph_context(*this, depth_idx);
         ComputeGraph graph;
+        applyForwardGraphConstructionIntent(graph, construction_input);
         const std::string prefix = "mtp" + std::to_string(depth_idx) + "_";
-        const DeviceId device = input.device.is_valid() ? input.device : config_.default_device;
 
         auto missing = [&](const char *name, const void *ptr)
         {

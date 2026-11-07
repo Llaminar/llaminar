@@ -1113,7 +1113,7 @@ namespace llaminar2
                     throw std::invalid_argument("CPU joint producer requires its original static fragment publication and one packed graph root");
                 if(binding.deferred_canonical_ticket) {
                     const auto& ticket=*binding.deferred_canonical_ticket;
-                    if(!ticket.hasValidBoundIdentity() || ticket.layerIndex()!=params_.layer_idx ||
+                    if(!ticket.hasValidConstructionIdentity() || ticket.layerIndex()!=params_.layer_idx ||
                        ticket.dModel()!=params_.d_model || ticket.routeCapacity()<entry_capacity)
                         throw std::invalid_argument("CPU joint producer changed its deferred canonical ticket identity");
                     // This is only the immutable scheduling/region borrow. The
@@ -1159,7 +1159,7 @@ namespace llaminar2
                     *params_.cpu_canonical_route_ticket_return;
                 std::shared_ptr<MappedHostTransferRegion>
                     mapped_publication;
-                if (binding.valid() &&
+                if (binding.storage && binding.storage->hasValidConstructionIdentity() &&
                     params_.serial_compact_buffer_arena)
                 {
                     mapped_publication =
@@ -1167,7 +1167,8 @@ namespace llaminar2
                             ->mappedCPUCanonicalRoutes(
                                 binding.storage->continuationDevice());
                 }
-                if (!params_.device_id.is_cpu() || !binding.valid() ||
+                if (!params_.device_id.is_cpu() || !binding.storage ||
+                    !binding.storage->hasValidConstructionIdentity() ||
                     binding.storage->routeCapacity() < entry_capacity ||
                     binding.storage->dModel() != params_.d_model ||
                     binding.storage->layerIndex() != params_.layer_idx ||

@@ -32700,6 +32700,45 @@ add_v2_test(V2_Integration_CPUMappedPublicationPhysicalOwnership
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUMappedPublicationPhysicalOwnership)
+# Declaration-only graph setup must not retain native mapped ticket payloads.
+add_v2_test(V2_Integration_MoEWorkspaceTicketDeclaration
+    COMMAND $<TARGET_FILE:v2_unit_mapped_host_transfer_region>
+        --gtest_filter=Test__MappedHostTransferRegion.WorkspaceTicketDeclarationDoesNotRetainNativeBacking:Test__MappedHostTransferRegion.WorkspaceCanonicalTicketDeclarationRetainsOnlyOriginalGeometry
+        --gtest_repeat=20
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;Memory;GraphDeclaration;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEWorkspaceTicketDeclaration)
+add_v2_test(V2_Integration_Qwen35MoEWorkspaceTicketFactory
+    COMMAND $<TARGET_FILE:v2_test_qwen35moe_graph>
+        --gtest_filter=Test__Qwen35MoEGraph.WorkspaceDeclarationUsesOriginalTicketFactoryWithoutMappedArena
+        --gtest_repeat=20
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;Memory;GraphDeclaration;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen35MoEWorkspaceTicketFactory)
+foreach(_ticket_declaration_backend CUDA ROCm)
+    string(TOUPPER "${_ticket_declaration_backend}" _ticket_declaration_backend_upper)
+    if(HAVE_${_ticket_declaration_backend_upper})
+        add_v2_test(V2_Integration_${_ticket_declaration_backend}_CPUJointWorkspaceTicketDeclaration
+            COMMAND $<TARGET_FILE:v2_integration_cross_tier_expert_arithmetic>
+                --gtest_filter=CPUJointPaddedPrefillContract.OriginalMappedTicket${_ticket_declaration_backend}
+            LABELS "V2;Integration;ProductionTestPreflight;${_ticket_declaration_backend};CPU;MoE;Memory;GraphDeclaration;Lifecycle;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_${_ticket_declaration_backend}_CPUJointWorkspaceTicketDeclaration)
+    endif()
+endforeach()
+
+# Same declaration-only ticket invariant for the original MTP manifest path.
+add_v2_test(V2_Integration_MTPWorkspaceTicketDeclaration
+    COMMAND $<TARGET_FILE:v2_test_qwen35moe_graph>
+        --gtest_filter=Test__Qwen35MoEGraph.MTPWorkspaceDeclarationUsesOriginalTicketFactoryWithoutMappedArena
+        --gtest_repeat=20
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;MTP;Memory;GraphDeclaration;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MTPWorkspaceTicketDeclaration)
+
 add_v2_test(V2_Integration_MappedDispatchTicketFreshZeroAllocation
     COMMAND $<TARGET_FILE:v2_unit_mapped_host_transfer_region>
         --gtest_filter=Test__MappedHostTransferRegion.ArenaFreshSlicesStayZeroAfterDirtyNeighborsAndGrowth:Test__MappedHostTransferRegion.MappedDispatchTicketFreshPayloadAndPublicationLifecycle:Test__MappedHostTransferRegion.*MappedDispatchTicketDoesNotRetouchFreshPayloadPages

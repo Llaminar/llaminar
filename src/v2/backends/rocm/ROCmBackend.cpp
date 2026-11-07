@@ -645,11 +645,13 @@ namespace llaminar2
         HipDeviceSaveRestore device_guard;
         if (hipSetDevice(registration_device_id) != hipSuccess)
             return false;
-        /* Portable registration mutates every ROCm page table and is
-         * materially more expensive on multi-GPU IOMMU hosts. In particular,
-         * thousands of one-device retained-graph tickets used to create an
-         * iova_depot backlog and IH-ring overflow storm. Only a genuinely
-         * shared same-family region is allowed to pay that cost. */
+        /* Registration scope declares which original device aliases this
+         * region must support. Only an explicitly shared same-family region
+         * requests portable registration; singleton storage keeps its narrower
+         * alias contract. This does not constrain IOMMU maintenance to those
+         * aliases: devices sharing a translation domain can still receive
+         * device-TLB invalidations. IH2 overflow causality is not established
+         * by the registration flag or ownership choice alone. */
         const unsigned int flags = hipHostRegisterMapped |
                                    hipExtHostRegisterUncached |
                                    (scope == MappedHostRegistrationScope::BackendPortable
@@ -4757,8 +4759,10 @@ namespace llaminar2
         if (hipSetDevice(device_id) != hipSuccess)
             return nullptr;
 
-        /* Native KFD/GTT ownership avoids retrofitting already-touched pages
-         * with hipHostRegisterPortable, which can flood Vega20's IH2 ring. */
+        /* Native KFD/GTT ownership retains the allocation and portable aliases
+         * together, without registering a separately owned anonymous range.
+         * It still permits IOMMU/device-TLB maintenance; native backing alone
+         * is not an IH2 overflow-prevention guarantee. */
         void *host_ptr = nullptr;
         const hipError_t allocation_error = hipHostMalloc(
             &host_ptr,

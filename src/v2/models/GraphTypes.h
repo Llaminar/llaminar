@@ -23,6 +23,7 @@
 
 #pragma once
 #include "../execution/mtp/MTPShiftedCacheOrigin.h"
+#include "../execution/local_execution/graph/ForwardGraphSubmissionIntent.h"
 
 #include "../execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "../execution/config/ExecutionPolicy.h"
@@ -1260,6 +1261,9 @@ namespace llaminar2
         DeviceId device = DeviceId::cpu();
         BufferId terminal_hidden_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN;
         bool kv_cache_only = false;
+        /** Original construction purpose; declarations never acquire execution authority. */
+        ForwardGraphSubmissionIntent graph_submission_intent =
+            ForwardGraphSubmissionIntent::Execute;
     };
 
     struct MTPForwardOutput

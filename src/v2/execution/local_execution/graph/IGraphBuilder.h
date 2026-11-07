@@ -17,6 +17,7 @@
 #pragma once
 
 #include "DeviceGraphExecutor.h"
+#include "ForwardGraphSubmissionIntent.h"
 #include "DeviceDecodePositionBinding.h"
 #include "kernels/common/SparseQueryExecutionProgram.h"
 #include "DeviceRequestQueryBinding.h"
@@ -545,22 +546,7 @@ namespace llaminar2
         CommittedMTPCondition, ///< Scalar condition plus one new decode commit.
     };
 
-    /**
-     * @brief Submission lifecycle requested for one forward graph.
-     *
-     * Production inference normally builds and launches the graph atomically.
-     * A setup authority may instead capture and instantiate the exact executable
-     * while leaving all model arithmetic, manual boundaries, output publication,
-     * and transaction numbering untouched. The first ordinary invocation then
-     * owns transaction zero. This policy is deliberately carried beside the
-     * input rather than inferred from missing request data.
-     */
-    enum class ForwardGraphSubmissionIntent : uint8_t
-    {
-        Execute = 0, ///< Submit one production forward transaction.
-        MaterializeExecutableWithoutLaunch, ///< Setup-only capture/instantiation.
-        WorkspaceDeclaration, ///< Geometry/lifetime manifest only; never executable or capturable.
-    };
+
 
     /**
      * @brief Sole owner of pipeline activation edges for this captured forward.

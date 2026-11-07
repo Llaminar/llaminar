@@ -14,6 +14,7 @@
 #include "../../loaders/IModelLoader.h"
 #include "../../memory/BufferArena.h"
 #include <limits>
+#include "execution/mtp/MTPForwardConstruction.h"
 
 namespace llaminar2
 {
@@ -26,6 +27,8 @@ ComputeGraph Qwen4ExpGraph::buildMTPGraph(int, const MTPDepthWeights &,
 ComputeGraph Qwen4ExpGraph::buildMTPGraph(int depth, const MTPDepthWeightBindings &weights,
     const MTPForwardInput &input, MTPForwardOutput &output)
 {
+    const auto construction_input = mtpForwardConstructionInput(input);
+    ForwardInputConstructionScope construction_scope(*this, construction_input);
     if (!config_.flash_next || !model_ctx_ || !model_ctx_->loader() || !arena_ ||
         !prepared_weight_store_ || !retainsMTPGraphCapacity(config_.mtp))
         throw std::invalid_argument("QFN shared predictor requires exact metadata, retained policy, canonical model/prepared authority and admitted arena");
@@ -87,6 +90,7 @@ ComputeGraph Qwen4ExpGraph::buildMTPGraph(int depth, const MTPDepthWeightBinding
             throw std::invalid_argument("QFN predictor declared sharded target embedding requires its canonical reconstruction stage");
     }
     ComputeGraph graph;
+    applyForwardGraphConstructionIntent(graph, construction_input);
     const auto embedding_ready = Qwen4ExpPredictorBuilder::appendEmbedding(graph, *arena_, context,
         globals, input, *prepared_weight_store_, std::move(reconstruction));
     const auto mixed = Qwen4ExpPredictorBuilder::appendInputMix(graph, *arena_, context, frozen,

@@ -2104,6 +2104,7 @@ namespace llaminar2
             .device = device,
             .terminal_hidden_buffer_id = packed_hidden_id,
             .kv_cache_only = true,
+            .graph_submission_intent = input.graph_submission_intent,
         };
         MTPForwardOutput mtp_output = binding.output;
         ComputeGraph mtp_kv_graph = buildMTPGraph(

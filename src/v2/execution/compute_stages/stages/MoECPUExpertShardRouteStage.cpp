@@ -85,7 +85,11 @@ MoECPUExpertShardRouteStage::MoECPUExpertShardRouteStage(Params params)
     if(p.original_tp_owner && p.original_tp_owner.get()!=p.tp)
         throw std::invalid_argument("CPU shard gather has a foreign retained context owner");
     if(p.original_canonical_ticket && (!sparse || !p.original_prepared_layer || !p.original_tp_owner ||
-       p.original_preweighted_routes || !hasOriginalCanonicalTicket() || p.original_canonical_ticket->routeCapacity()<slots))
+       p.original_preweighted_routes || !p.original_canonical_ticket->hasValidConstructionIdentity() ||
+       p.original_canonical_ticket->layerIndex()!=p.original_source->layer() ||
+       p.original_canonical_ticket->dModel()!=p.columns || !p.original_continuation_device.is_gpu() ||
+       p.original_canonical_ticket->continuationDevice()!=p.original_continuation_device ||
+       p.original_canonical_ticket->routeCapacity()<slots))
         throw std::invalid_argument("CPU joint canonical ticket requires its exact source/frame/context/layer/GPU binding");
     const std::array<std::pair<const void*,size_t>,11> regions{{
         {p.packed_records->data(),p.packed_records->numel()*sizeof(float)},

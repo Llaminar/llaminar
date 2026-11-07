@@ -1974,13 +1974,13 @@ namespace llaminar2
         {
             /*
              * A node-local TP/ExpertOverlay route bank is read and written by
-             * every GPU in one backend family. Anonymous mmap followed by
-             * hipHostRegisterPortable/cudaHostRegisterPortable forces the
-             * driver to retrofit every already-touched page into each GPU
-             * page table; on Vega20 that can overflow the fixed IH2 ring while
-             * the retained graph is already live. Native portable ownership
-             * establishes the aliases as one setup transaction and leaves the
-             * captured host address immutable.
+             * every GPU in one backend family. Native portable ownership binds
+             * the allocation and its complete alias set without retrofitting
+             * a separately owned anonymous range through host registration.
+             * The captured host address and native release authority remain
+             * immutable. This ownership contract does not eliminate IOMMU or
+             * device-TLB maintenance, which may reach other devices sharing
+             * the same translation domain; driver behavior needs its own proof.
              */
             void *allocation_alias = nullptr;
             void *const allocation = allocation_backend->allocatePortableMapped(
@@ -2088,15 +2088,13 @@ namespace llaminar2
             }
 
             /*
-             * A native mapped allocation is not merely a convenience wrapper.
-             * On Vega20, registering an already-faulted anonymous range emits
-             * an ATS invalidation interrupt for roughly every host page. Four
-             * participants materializing retained graph tickets concurrently
-             * can therefore overrun the fixed 4 KiB IH2 retry ring. KFD-owned
-             * hipHostMallocMapped pages establish the same zero-copy alias
-             * without that interrupt storm; cudaHostAllocMapped gives CUDA the
-             * symmetric ownership contract. The backend call is setup-only and
-             * serialized by its runtime-lifecycle authority.
+             * Native mapped storage keeps allocation, zero-copy alias and
+             * release under one backend authority instead of registering a
+             * separately owned anonymous range. ROCm startup selects KFD/GTT
+             * backing; CUDA supplies the symmetric native ownership contract.
+             * Native ownership does not prevent IOMMU/device-TLB invalidations
+             * or establish IH2 overflow safety. The backend call is setup-only
+             * and serialized by its runtime-lifecycle authority.
              */
             void *device_alias = nullptr;
             void *const allocation = backend->allocateMapped(

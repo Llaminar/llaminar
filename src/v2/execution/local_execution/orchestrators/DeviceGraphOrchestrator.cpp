@@ -62973,6 +62973,7 @@ namespace llaminar2
                 .terminal_hidden_buffer_id =
                     terminal_hidden_buffer_id,
                 .kv_cache_only = kv_cache_only,
+                .graph_submission_intent = ForwardGraphSubmissionIntent::WorkspaceDeclaration,
             };
 
             ComputeGraph sidecar = graph_builder_->buildMTPGraph(
@@ -62980,6 +62981,8 @@ namespace llaminar2
                 bindings.mtp.depths[0],
                 input,
                 output);
+            if (!sidecar.isWorkspaceDeclaration())
+                throw std::logic_error("MTP workspace manifest received an executable sidecar graph");
             if (sidecar.size() == 0)
             {
                 LOG_ERROR("[DGO] Model graph builder returned an empty MTP workspace-family participant: role="

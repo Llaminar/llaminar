@@ -33,6 +33,7 @@ namespace llaminar2
     class ILocalTPContext;
     class IMoERuntimeTable;
     class MappedHostTransferArena;
+    class MoEOverlayDispatchTicketStorage;
     class MoELocalExpertSerialBufferArena;
     class MoEExpertOwnerMap;
     class MoEOverlayCollectiveWorkspace;
@@ -639,6 +640,23 @@ namespace llaminar2
     private:
         /** Device-free archive tests install real tables without admitting GPU work. */
         friend struct Qwen35MoEPrefixRuntimeTestPeer;
+
+        /**
+         * @brief Create this exact forward invocation's original dispatch ticket.
+         *
+         * WorkspaceDeclaration retains only checked geometry; no persistent
+         * mapped arena is requested. Executable construction retains the same
+         * per-device arena, native binding and original epoch pointer.
+         * @param layer_idx Original source layer.
+         * @param rows Exact physical forward row capacity.
+         * @param device Original GPU publisher.
+         * @param epoch Original request epoch pointer borrowed by executable graphs.
+         * @return Ticket with the immutable original forward construction purpose.
+         * @throws std::invalid_argument For invalid original purpose or geometry.
+         */
+        std::shared_ptr<MoEOverlayDispatchTicketStorage> dispatchTicketForForward(
+            int layer_idx, int rows, DeviceId device,
+            const DeviceMoEOverlayEpochTicket *epoch);
 
         /**
          * @brief Return model-lifetime mapped ticket storage for one GPU.

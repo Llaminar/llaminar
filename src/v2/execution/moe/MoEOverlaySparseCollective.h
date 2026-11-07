@@ -29,6 +29,7 @@
 
 namespace llaminar2
 {
+    enum class ForwardGraphSubmissionIntent : uint8_t;
     class IBackend;
     class IDeviceContext;
     class IMPIContext;
@@ -148,6 +149,36 @@ namespace llaminar2
             MoEOverlayDispatchTicketStorage &&) = delete;
 
         /**
+         * @brief Preserve the original forward construction purpose for this ticket.
+         *
+         * WorkspaceDeclaration stores immutable geometry only: no native arena
+         * slice, payload or publication word is created. Such a declaration is
+         * never an executable binding and cannot later be rebound in place.
+         * Execute and MaterializeExecutableWithoutLaunch use the original binder.
+         * @param intent Original scoped ForwardInput construction intent.
+         * @param layer_idx Exact source layer.
+         * @param bucket_rows Positive physical row capacity.
+         * @param top_k Routes per row.
+         * @param d_model FP32 hidden/return width.
+         * @param source_device Original CPU/GPU publisher.
+         * @param workspace_generation Positive captured workspace identity.
+         * @param mapped_arena Exact GPU arena; unused for declaration-only geometry.
+         * @param captured_request_epoch Original immutable epoch pointer, if present.
+         * @throws std::invalid_argument For unknown purpose or invalid geometry.
+         * @throws std::logic_error For a second declaration or binding.
+         */
+        void bindForGraphConstruction(ForwardGraphSubmissionIntent intent,
+            int layer_idx, int bucket_rows, int top_k, int d_model,
+            DeviceId source_device, uint64_t workspace_generation,
+            std::shared_ptr<MappedHostTransferArena> mapped_arena = nullptr,
+            const DeviceMoEOverlayEpochTicket *captured_request_epoch = nullptr);
+
+        /** @return A bound identity or an explicitly typed non-executable declaration. */
+        [[nodiscard]] bool hasValidConstructionIdentity() const noexcept;
+        /** @return Whether the original purpose permanently forbids execution. */
+        [[nodiscard]] bool isWorkspaceDeclaration() const noexcept;
+
+        /**
          * @brief Bind the ticket's complete fixed-capacity capture identity.
          * @param layer_idx Model layer owning this publication.
          * @param bucket_rows Captured physical row capacity.
@@ -185,8 +216,10 @@ namespace llaminar2
         bool isBound() const noexcept { return allocation_ != nullptr; }
         const DeviceId &sourceDevice() const noexcept { return source_device_; }
         size_t allocationBytes() const noexcept { return allocation_bytes_; }
-        MoEOverlayDispatchTicket &ticket() noexcept { return ticket_; }
-        const MoEOverlayDispatchTicket &ticket() const noexcept { return ticket_; }
+        /** @return The physical ticket; declaration-only access is a fatal contract error. */
+        MoEOverlayDispatchTicket &ticket();
+        /** @return The physical ticket; declaration-only access is a fatal contract error. */
+        const MoEOverlayDispatchTicket &ticket() const;
         /** @brief Validate mutable host memory against the separately retained binding identity. */
         bool hasValidBoundIdentity() const noexcept;
 
@@ -271,6 +304,8 @@ namespace llaminar2
         uint64_t workspace_generation_ = 0;
         std::vector<std::max_align_t> cpu_storage_;
         MoEOverlayDispatchTicket ticket_;
+        /** Original immutable setup purpose; absence means never declared/bound. */
+        std::optional<ForwardGraphSubmissionIntent> construction_intent_;
     };
 
     /**
@@ -360,6 +395,29 @@ namespace llaminar2
             MoEOverlayCanonicalRouteReturnTicketStorage &&) = delete;
         MoEOverlayCanonicalRouteReturnTicketStorage &operator=(
             MoEOverlayCanonicalRouteReturnTicketStorage &&) = delete;
+
+        /**
+         * @brief Declare or physically bind the original canonical return ticket.
+         * @param intent Original scoped forward construction intent.
+         * @param layer_idx Exact source layer.
+         * @param route_capacity Immutable original/compact slot capacity.
+         * @param d_model FP32 row width.
+         * @param continuation_device Original local GPU consumer.
+         * @param workspace_generation Positive captured workspace identity.
+         * @param contribution_region Existing admitted serial contribution bank.
+         * @param metadata_arena Exact GPU metadata arena, unused for WorkspaceDeclaration.
+         * @throws std::invalid_argument For unknown purpose or invalid original geometry.
+         * @throws std::logic_error For a second declaration/binding.
+         */
+        void bindForGraphConstruction(ForwardGraphSubmissionIntent intent,
+            int layer_idx, size_t route_capacity, int d_model,
+            DeviceId continuation_device, uint64_t workspace_generation,
+            std::shared_ptr<MappedHostTransferRegion> contribution_region,
+            std::shared_ptr<MappedHostTransferArena> metadata_arena);
+        /** @return A bound identity or an explicitly typed non-executable declaration. */
+        [[nodiscard]] bool hasValidConstructionIdentity() const noexcept;
+        /** @return Whether this original construction purpose forbids execution. */
+        [[nodiscard]] bool isWorkspaceDeclaration() const noexcept;
 
         /**
          * @brief Bind immutable layer geometry and the serial CPU contribution arena.
@@ -501,6 +559,8 @@ namespace llaminar2
         uint64_t workspace_generation_ = 0u;
         uint64_t armed_sequence_ = 0u;
         ProducerLifecycle producer_lifecycle_ = ProducerLifecycle::Unbound;
+        /** Original immutable setup purpose; never an executable capability. */
+        std::optional<ForwardGraphSubmissionIntent> construction_intent_;
     };
 
     struct MoEOverlaySparseRows;

@@ -46,6 +46,7 @@
 #include "loaders/ExpertGemmRegistry.h"
 #include "loaders/ModelContext.h"
 #include "models/qwen35moe/Qwen35MoEGraph.h"
+#include "execution/mtp/MTPForwardConstruction.h"
 #include "models/qwen35moe/Qwen35MoESchema.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
@@ -83,6 +84,41 @@ namespace llaminar2
     struct Qwen35MoEPrefixRuntimeTestPeer
     {
         using Role = Qwen35MoEGraph::MoERuntimeTableRole;
+        /**
+         * @brief Exercise original MTP projection and the actual FFN ticket factory.
+         * @param graph Original model owner; no replacement allocator is installed.
+         * @param input Original sidecar input, retained only during construction.
+         * @return Geometry-only ticket produced by the production factory.
+         */
+        static std::shared_ptr<MoEOverlayDispatchTicketStorage> mtpDeclaration(
+            Qwen35MoEGraph &graph, const MTPForwardInput &input)
+        {
+            const auto forward = mtpForwardConstructionInput(input);
+            QwenGraphBase::ForwardInputConstructionScope scope(graph, forward);
+            return graph.dispatchTicketForForward(0,input.seq_len,input.device,nullptr);
+        }
+
+        /**
+         * @brief Call the actual FFN ticket factory under its original scoped build input.
+         * @param graph Original model graph owning the persistent arena registry.
+         * @param input Original immutable forward construction declaration.
+         * @return The production factory result with no replacement allocator.
+         */
+        static std::shared_ptr<MoEOverlayDispatchTicketStorage> dispatchDeclaration(
+            Qwen35MoEGraph &graph, const ForwardInput &input)
+        {
+            QwenGraphBase::ForwardInputConstructionScope scope(graph,input);
+            return graph.dispatchTicketForForward(0,input.seq_len,input.device,nullptr);
+        }
+        /**
+         * @param graph Original graph whose native-arena inventory is inspected.
+         * @return Native arena count from that same actual graph builder owner.
+         */
+        static std::size_t mappedTicketArenas(const Qwen35MoEGraph &graph)
+        {
+            return graph.moe_mapped_ticket_arenas_.size();
+        }
+
         /** @brief Exercise the original admitted CPU arena factory without a graph/collective launch. */
         static std::shared_ptr<MoELocalExpertSerialBufferArena> serialArena(
             Qwen35MoEGraph& graph,int participant,size_t rows) {
@@ -6883,4 +6919,94 @@ TEST(Test__Qwen35MoEGraph, EarlyEpochMemoryAuthorityRejectsMissingAndForeignOwne
         PhysicalMemoryMaterializationKind::NewAllocation), 0u);
     EXPECT_EQ(other->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ExecutionWorkspace,
         PhysicalMemoryMaterializationKind::NewAllocation), 0u);
+}
+
+/** @test The production FFN creation site must not materialize tickets for discarded workspace graphs. */
+TEST(Test__Qwen35MoEGraph, WorkspaceDeclarationUsesOriginalTicketFactoryWithoutMappedArena)
+{
+    using Peer=Qwen35MoEPrefixRuntimeTestPeer;
+    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})
+    {
+        auto config=makeMoEConfig();config.default_device=device;
+        Qwen35MoEGraph graph(config);
+        ForwardInput input;input.device=device;input.batch_size=1;
+        input.graph_submission_intent=ForwardGraphSubmissionIntent::WorkspaceDeclaration;
+        for(const int rows:{1,3,17,512})
+        {
+            input.seq_len=rows;
+            input.execution_phase=rows==1?ForwardExecutionPhase::Decode:ForwardExecutionPhase::Prefill;
+            auto ticket=Peer::dispatchDeclaration(graph,input);
+            ASSERT_TRUE(ticket->isWorkspaceDeclaration());
+            EXPECT_TRUE(ticket->hasValidConstructionIdentity());
+            EXPECT_FALSE(ticket->hasValidBoundIdentity());
+            EXPECT_FALSE(ticket->isBound());
+            EXPECT_FALSE(ticket->armCapturedPublication());
+            EXPECT_EQ(Peer::mappedTicketArenas(graph),0u);
+            EXPECT_THROW((void)ticket->ticket(),std::logic_error);
+        }
+        input.graph_submission_intent=static_cast<ForwardGraphSubmissionIntent>(255);
+        EXPECT_THROW((void)Peer::dispatchDeclaration(graph,input),std::invalid_argument);
+        EXPECT_EQ(Peer::mappedTicketArenas(graph),0u);
+    }
+}
+
+/** @test Sidecar manifests retain the same purpose/geometry without orphan mapped tickets. */
+TEST(Test__Qwen35MoEGraph, MTPWorkspaceDeclarationUsesOriginalTicketFactoryWithoutMappedArena)
+{
+    using Peer=Qwen35MoEPrefixRuntimeTestPeer;
+    MTPForwardInput defaults;
+    EXPECT_EQ(defaults.graph_submission_intent,ForwardGraphSubmissionIntent::Execute);
+    EXPECT_EQ(mtpForwardConstructionInput(defaults).graph_submission_intent,
+        ForwardGraphSubmissionIntent::Execute);
+    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})
+    {
+        auto config=makeMoEConfig();config.default_device=device;
+        Qwen35MoEGraph graph(config);
+        const int host_token=19,host_position=7;
+        const std::vector<int> lengths{1};
+        MTPForwardInput input;
+        input.device=device;input.graph_submission_intent=ForwardGraphSubmissionIntent::WorkspaceDeclaration;
+        input.draft_token_ids=&host_token;input.position_ids=&host_position;
+        input.draft_token_ids_device=reinterpret_cast<const void*>(0x12340);
+        input.position_ids_device=reinterpret_cast<const void*>(0x23450);
+        input.device_state_publication_stream=reinterpret_cast<void*>(0x34560);
+        input.sequence_lengths=&lengths;
+        input.sequence_lengths_device=reinterpret_cast<const int32_t*>(0x45670);
+        for(const bool kv_only:{false,true})for(const int rows:{1,3,17,512})
+        {
+            input.kv_cache_only=kv_only;input.seq_len=rows;
+            const auto forward=mtpForwardConstructionInput(input);
+            EXPECT_EQ(forward.graph_submission_intent,input.graph_submission_intent);
+            EXPECT_EQ(forward.token_ids,nullptr);EXPECT_EQ(forward.position_ids,nullptr);
+            EXPECT_EQ(forward.token_ids_device,input.draft_token_ids_device);
+            EXPECT_EQ(forward.position_ids_device,input.position_ids_device);
+            EXPECT_EQ(forward.sequence_lengths,input.sequence_lengths);
+            EXPECT_EQ(forward.sequence_lengths_device,input.sequence_lengths_device);
+            EXPECT_EQ(forward.device_state_publication_stream,input.device_state_publication_stream);
+            EXPECT_EQ(forward.seq_len,rows);EXPECT_EQ(forward.device,device);
+            EXPECT_EQ(forward.execution_phase,kv_only?ForwardExecutionPhase::Prefill:ForwardExecutionPhase::Decode);
+            auto ticket=Peer::mtpDeclaration(graph,input);
+            const auto original=Peer::dispatchDeclaration(graph,forward);
+            EXPECT_EQ(ticket->allocationBytes(),original->allocationBytes());
+            ASSERT_TRUE(ticket->hasValidConstructionIdentity());
+            EXPECT_TRUE(ticket->isWorkspaceDeclaration());EXPECT_FALSE(ticket->isBound());
+            EXPECT_EQ(Peer::mappedTicketArenas(graph),0u);
+            EXPECT_FALSE(ticket->armCapturedPublication());
+            EXPECT_THROW((void)ticket->ticket(),std::logic_error);
+            ComputeGraph declaration;applyForwardGraphConstructionIntent(declaration,forward);
+            EXPECT_TRUE(declaration.isWorkspaceDeclaration());
+            EXPECT_THROW(declaration.requireExecutable(),std::invalid_argument);
+            ComputeGraph moved=std::move(declaration);
+            EXPECT_THROW(moved.requireExecutable(),std::invalid_argument);
+        }
+        input.graph_submission_intent=ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+        EXPECT_EQ(mtpForwardConstructionInput(input).graph_submission_intent,input.graph_submission_intent);
+        input.graph_submission_intent=static_cast<ForwardGraphSubmissionIntent>(255);
+        EXPECT_THROW((void)Peer::mtpDeclaration(graph,input),std::invalid_argument);
+        EXPECT_EQ(Peer::mappedTicketArenas(graph),0u);
+    }
+    MTPForwardInput cpu;const int token=3,position=2;
+    cpu.draft_token_ids=&token;cpu.position_ids=&position;
+    const auto cpu_forward=mtpForwardConstructionInput(cpu);
+    EXPECT_EQ(cpu_forward.token_ids,&token);EXPECT_EQ(cpu_forward.position_ids,&position);
 }

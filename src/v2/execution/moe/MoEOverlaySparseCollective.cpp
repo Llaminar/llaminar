@@ -10,6 +10,7 @@
 
 #include "execution/moe/MoEOverlaySparseCollective.h"
 #include "execution/moe/MoEOverlayActivationPacketABI.h"
+#include "execution/local_execution/graph/IGraphBuilder.h"
 #include "execution/moe/DeviceMoEOverlayEpochABI.h"
 
 #include "backends/BackendManager.h"
@@ -139,6 +140,7 @@ namespace llaminar2
         d_model_ = 0;
         workspace_generation_ = 0;
         ticket_ = {};
+        construction_intent_.reset();
     }
 
     void MoEOverlayDispatchTicketStorage::bindFixedCapacity(
@@ -151,6 +153,27 @@ namespace llaminar2
         std::shared_ptr<MappedHostTransferArena> mapped_arena,
         const DeviceMoEOverlayEpochTicket *captured_request_epoch)
     {
+        bindForGraphConstruction(ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch,
+            layer_idx, bucket_rows, top_k, d_model, source_device,
+            workspace_generation, std::move(mapped_arena), captured_request_epoch);
+    }
+
+    void MoEOverlayDispatchTicketStorage::bindForGraphConstruction(
+        ForwardGraphSubmissionIntent intent, int layer_idx,
+        int bucket_rows,
+        int top_k,
+        int d_model,
+        DeviceId source_device,
+        uint64_t workspace_generation,
+        std::shared_ptr<MappedHostTransferArena> mapped_arena,
+        const DeviceMoEOverlayEpochTicket *captured_request_epoch)
+    {
+        if (intent != ForwardGraphSubmissionIntent::Execute &&
+            intent != ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch &&
+            intent != ForwardGraphSubmissionIntent::WorkspaceDeclaration)
+            throw std::invalid_argument("MoE dispatch ticket has an unknown forward construction intent");
+        if (construction_intent_)
+            throw std::logic_error("MoE dispatch ticket construction purpose is immutable");
         if (layer_idx < 0 || bucket_rows <= 0 || top_k <= 0 ||
             d_model <= 0 || !source_device.is_valid() ||
             workspace_generation == 0)
@@ -205,6 +228,19 @@ namespace llaminar2
             checkedTicketProduct(hidden_count, sizeof(float), "return rows"),
             "return rows");
         allocation_bytes_ = offset;
+        construction_intent_ = intent;
+        source_device_ = source_device;
+        layer_idx_ = layer_idx;
+        bucket_rows_ = bucket_rows;
+        top_k_ = top_k;
+        d_model_ = d_model;
+        workspace_generation_ = workspace_generation;
+        captured_request_epoch_ = captured_request_epoch;
+        // Workspace graphs declare the same immutable capacity but never own
+        // an executable payload. Retained graph materialization creates a fresh
+        // physical ticket, so no published pointer is rebound or recycled.
+        if (intent == ForwardGraphSubmissionIntent::WorkspaceDeclaration)
+            return;
 
         if (source_device.is_gpu())
         {
@@ -288,6 +324,35 @@ namespace llaminar2
         captured_request_epoch_ = captured_request_epoch;
     }
 
+    bool MoEOverlayDispatchTicketStorage::isWorkspaceDeclaration() const noexcept
+    {
+        return construction_intent_ == ForwardGraphSubmissionIntent::WorkspaceDeclaration;
+    }
+
+    bool MoEOverlayDispatchTicketStorage::hasValidConstructionIdentity() const noexcept
+    {
+        return isWorkspaceDeclaration()
+            ? !allocation_ && !payload_region_ && !publication_region_ &&
+                !ticket_.header && allocation_bytes_ > 0u && layer_idx_ >= 0 &&
+                bucket_rows_ > 0 && top_k_ > 0 && d_model_ > 0 &&
+                workspace_generation_ > 0u && source_device_.is_valid()
+            : hasValidBoundIdentity();
+    }
+
+    MoEOverlayDispatchTicket &MoEOverlayDispatchTicketStorage::ticket()
+    {
+        if (isWorkspaceDeclaration())
+            throw std::logic_error("Workspace-only MoE dispatch ticket has no executable payload");
+        return ticket_;
+    }
+
+    const MoEOverlayDispatchTicket &MoEOverlayDispatchTicketStorage::ticket() const
+    {
+        if (isWorkspaceDeclaration())
+            throw std::logic_error("Workspace-only MoE dispatch ticket has no executable payload");
+        return ticket_;
+    }
+
     bool MoEOverlayDispatchTicketStorage::hasValidBoundIdentity() const noexcept
     {
         if (!allocation_ || !ticket_.isValid() || !ticket_.header)
@@ -327,6 +392,11 @@ namespace llaminar2
     {
         if (error)
             error->clear();
+        if (isWorkspaceDeclaration())
+        {
+            if (error) *error = "Workspace declaration cannot publish a dispatch payload";
+            return false;
+        }
         if (!source_device_.is_gpu())
             return true;
         if (!stream || !hasCapturedPublicationContract() ||
@@ -430,6 +500,11 @@ namespace llaminar2
     {
         if (error)
             error->clear();
+        if (isWorkspaceDeclaration())
+        {
+            if (error) *error = "Workspace declaration cannot arm a dispatch publication";
+            return false;
+        }
         if (!source_device_.is_gpu())
             return true;
         if (!hasCapturedPublicationContract())
@@ -458,6 +533,11 @@ namespace llaminar2
     {
         if (error)
             error->clear();
+        if (isWorkspaceDeclaration())
+        {
+            if (error) *error = "Workspace declaration cannot publish a dispatch completion";
+            return false;
+        }
         if (!source_device_.is_gpu())
             return true;
         if (!stream || !hasCapturedPublicationContract())
@@ -503,6 +583,11 @@ namespace llaminar2
     {
         if (error)
             error->clear();
+        if (isWorkspaceDeclaration())
+        {
+            if (error) *error = "Workspace declaration cannot await a dispatch completion";
+            return false;
+        }
         if (!source_device_.is_gpu())
             return true;
         if (!hasCapturedPublicationContract())
@@ -569,6 +654,26 @@ namespace llaminar2
         std::shared_ptr<MappedHostTransferRegion> contribution_region,
         std::shared_ptr<MappedHostTransferArena> metadata_arena)
     {
+        bindForGraphConstruction(ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch,
+            layer_idx, route_capacity, d_model, continuation_device,
+            workspace_generation, std::move(contribution_region), std::move(metadata_arena));
+    }
+
+    void MoEOverlayCanonicalRouteReturnTicketStorage::bindForGraphConstruction(
+        ForwardGraphSubmissionIntent intent, int layer_idx,
+        size_t route_capacity,
+        int d_model,
+        DeviceId continuation_device,
+        uint64_t workspace_generation,
+        std::shared_ptr<MappedHostTransferRegion> contribution_region,
+        std::shared_ptr<MappedHostTransferArena> metadata_arena)
+    {
+        if (intent != ForwardGraphSubmissionIntent::Execute &&
+            intent != ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch &&
+            intent != ForwardGraphSubmissionIntent::WorkspaceDeclaration)
+            throw std::invalid_argument("Canonical MoE ticket has an unknown forward construction intent");
+        if (construction_intent_)
+            throw std::logic_error("Canonical MoE ticket construction purpose is immutable");
         if (metadata_region_ || contribution_region_)
         {
             throw std::logic_error(
@@ -580,8 +685,9 @@ namespace llaminar2
                 static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
             !contribution_region || !contribution_region->isBound() ||
             !contribution_region->hasDevice(continuation_device) ||
-            !metadata_arena || metadata_arena->devices().size() != 1u ||
-            metadata_arena->devices().front() != continuation_device)
+            (intent != ForwardGraphSubmissionIntent::WorkspaceDeclaration &&
+             (!metadata_arena || metadata_arena->devices().size() != 1u ||
+              metadata_arena->devices().front() != continuation_device)))
         {
             throw std::invalid_argument(
                 "canonical route return ticket requires complete layer, route, mapped contribution, exact GPU, and model-owned metadata arena identity");
@@ -616,6 +722,16 @@ namespace llaminar2
             checkedTicketProduct(
                 route_capacity, sizeof(int32_t), "compact route slots"),
             "compact route slots");
+
+        construction_intent_ = intent;
+        contribution_region_ = contribution_region;
+        continuation_device_ = continuation_device;
+        layer_idx_ = layer_idx;
+        route_capacity_ = route_capacity;
+        d_model_ = d_model;
+        workspace_generation_ = workspace_generation;
+        if (intent == ForwardGraphSubmissionIntent::WorkspaceDeclaration)
+            return;
 
         constexpr size_t kControlCacheLineBytes = 64u;
         metadata_region_ = metadata_arena->allocate(
@@ -999,6 +1115,21 @@ namespace llaminar2
                        MoEOverlayCanonicalRouteTicketStatus::Success) &&
                control_host_->residency_epoch == residency_epoch &&
                control_host_->live_entry_count <= route_capacity_;
+    }
+
+    bool MoEOverlayCanonicalRouteReturnTicketStorage::isWorkspaceDeclaration() const noexcept
+    {
+        return construction_intent_ == ForwardGraphSubmissionIntent::WorkspaceDeclaration;
+    }
+
+    bool MoEOverlayCanonicalRouteReturnTicketStorage::hasValidConstructionIdentity() const noexcept
+    {
+        return isWorkspaceDeclaration()
+            ? !metadata_region_ && !control_host_ && contribution_region_ &&
+                contribution_region_->isBound() && contribution_region_->hasDevice(continuation_device_) &&
+                continuation_device_.is_gpu() && layer_idx_ >= 0 && route_capacity_ > 0u &&
+                d_model_ > 0 && workspace_generation_ > 0u
+            : hasValidBoundIdentity();
     }
 
     bool MoEOverlayCanonicalRouteReturnTicketStorage::hasValidBoundIdentity()

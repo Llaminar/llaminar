@@ -3851,6 +3851,26 @@ namespace llaminar2
         return arena;
     }
 
+    std::shared_ptr<MoEOverlayDispatchTicketStorage>
+    Qwen35MoEGraph::dispatchTicketForForward(int layer_idx, int rows,
+        DeviceId device, const DeviceMoEOverlayEpochTicket *epoch)
+    {
+        const auto intent = forward_input_construction_
+            ? modelForwardInput().graph_submission_intent
+            : ForwardGraphSubmissionIntent::Execute;
+        if (intent != ForwardGraphSubmissionIntent::Execute &&
+            intent != ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch &&
+            intent != ForwardGraphSubmissionIntent::WorkspaceDeclaration)
+            throw std::invalid_argument("Qwen35 dispatch ticket has an unknown original construction intent");
+        auto storage = std::make_shared<MoEOverlayDispatchTicketStorage>();
+        storage->bindForGraphConstruction(intent, layer_idx, rows,
+            config_.moe.top_k, config_.d_model, device,
+            /*workspace_generation=*/1,
+            intent == ForwardGraphSubmissionIntent::WorkspaceDeclaration
+                ? nullptr : mappedOverlayTicketArenaForDevice(device), epoch);
+        return storage;
+    }
+
     std::shared_ptr<MappedHostTransferArena>
     Qwen35MoEGraph::mappedOverlayTicketArenaForDevice(DeviceId device)
     {
@@ -9645,17 +9665,8 @@ namespace llaminar2
                     if (sparse_graph_contract.ownsDispatchAuthority() &&
                         device.is_gpu())
                     {
-                        dispatch_ticket_storage =
-                            std::make_shared<
-                                MoEOverlayDispatchTicketStorage>();
-                        dispatch_ticket_storage->bindFixedCapacity(
-                            layer_idx,
-                            total_tokens,
-                            config_.moe.top_k,
-                            config_.d_model,
-                            device,
-                            /*workspace_generation=*/1,
-                            mappedOverlayTicketArenaForDevice(device),
+                        dispatch_ticket_storage = dispatchTicketForForward(
+                            layer_idx, total_tokens, device,
                             moe_runtime_table
                                 ? moe_runtime_table->hostLayerState(layer_idx).overlay_epoch_ticket
                                 : nullptr);
@@ -11477,9 +11488,12 @@ namespace llaminar2
                                 canonical_route_ticket_storage =
                                     std::make_shared<
                                         MoEOverlayCanonicalRouteReturnTicketStorage>();
+                                const auto ticket_intent = forward_input_construction_
+                                    ? modelForwardInput().graph_submission_intent
+                                    : ForwardGraphSubmissionIntent::Execute;
                                 canonical_route_ticket_storage
-                                    ->bindFixedCapacity(
-                                        layer_idx,
+                                    ->bindForGraphConstruction(
+                                        ticket_intent, layer_idx,
                                         static_cast<size_t>(total_tokens) *
                                             static_cast<size_t>(
                                                 config_.moe.top_k),
@@ -11487,8 +11501,8 @@ namespace llaminar2
                                         device,
                                         /*workspace_generation=*/1u,
                                         std::move(contribution_region),
-                                        mappedOverlayTicketArenaForDevice(
-                                            device));
+                                        ticket_intent == ForwardGraphSubmissionIntent::WorkspaceDeclaration
+                                            ? nullptr : mappedOverlayTicketArenaForDevice(device));
                                 if (!joint_local_target) local_params
                                     .cpu_canonical_route_ticket_return =
                                     MoELocalExpertStage::
