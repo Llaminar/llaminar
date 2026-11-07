@@ -15214,9 +15214,11 @@ namespace llaminar2
         // queried independently below because it is not monotonic in M.
         hints.max_seq_len = workspace_seq_len > 0 ? workspace_seq_len : default_workspace_seq_len;
         hints.graph_family_policy = graph_family_policy;
-        if (graph_family_policy ==
-            WorkspaceGraphFamilyPolicy::
-                SerialDeviceFamilyLargestParticipant)
+        // Both serial-family participant policies publish the family's
+        // largest prefill rows: an exact decode participant may create
+        // generation one (prefix-hit warmup) and must not omit them.
+        if (graph_family_policy !=
+            WorkspaceGraphFamilyPolicy::ExclusiveLifetime)
         {
             const int largest_bucket_rows =
                 state_.activation_seq_len > 0
