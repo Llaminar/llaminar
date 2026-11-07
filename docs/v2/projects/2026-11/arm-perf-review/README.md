@@ -43,6 +43,7 @@ references are as of the head above and may drift.
 | 14 | Dense-model MTP verifier economics (27B) | `14-dense-mtp-verifier-economics.md` | Open (MTP dynamic 4.23 vs off 4.61 tok/s) |
 | 15 | NUMA-less and cache-unpublished Linux ARM hosts | `15-numa-less-hosts.md` | Partial (memory attribution `a572c3c9c`) |
 | 16 | MoE routed experts, GDN projection and LM head in CPU decode | `16-moe-expert-and-lm-head-decode.md` | Open (bundle part addressed by `408ff90e5`) |
+| 17 | GB10 CPU decode bandwidth gap (post-merge follow-up) | `17-gb10-decode-bandwidth-gap.md` | Open (operator-requested re-analysis after merge) |
 
 Measured numbers for all ideas: `00-measured-baseline.md` (GB10 serving,
 stage attribution, spin sweep, thread scaling, overlay statistics).

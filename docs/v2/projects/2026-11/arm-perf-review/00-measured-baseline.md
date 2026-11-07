@@ -92,3 +92,14 @@ this file was written.
 - On selected keys the median ratio is about 0.74-0.81 of the total policy.
 - The end-to-end serving A/B (baseline, plus overlays, plus pooled bundle) was
   pending when this file was written.
+
+## Updated serving results (post-`268cd81de`)
+
+Supersedes the 35B rows in the table above for the commits named here:
+- at
+`268cd81de`: 35B MTP dynamic **27.5** tok/s, MTP off **20.6**; 27B MTP dynamic
+**4.27–4.29**;
+- per-commit A/B/C (`878a33fea` baseline → `144ece037` overlays → `268cd81de`
+  pooled bundle, with repeats) still running on `.80`; at A: 35B 17.9/17.8,
+  27B 4.16 (MTP) / 4.21 (off) tok/s decode.
+- See `17-gb10-decode-bandwidth-gap.md` for the bandwidth-gap analysis.
