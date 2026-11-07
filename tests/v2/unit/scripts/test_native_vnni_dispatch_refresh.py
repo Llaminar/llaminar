@@ -69,30 +69,19 @@ CPU_DECODE_CHECKPOINT = (
 def _affinity_visible_physical_core_count() -> int:
     """Return the physical cores available to this CTest process.
 
-    The refresh regressions launch shell transactions of their own. Counting
-    package/core identities instead of logical CPUs prevents the test runner
-    from scheduling both SMT siblings as independent subprocess owners.
+    The refresh regressions launch shell transactions of their own, so the
+    runner schedules one worker per physical core, never per SMT sibling. Uses
+    the shared thread-sibling counter: a ``(package, core_id)`` key collapses
+    hosts that repeat core labels across clusters (GB10 reported 20 cores as
+    5 and the suite exceeded its CTest timeout).
     """
 
-    visible_cpus = tuple(
-        sorted(os.sched_getaffinity(0))
-        if hasattr(os, "sched_getaffinity")
-        else range(os.cpu_count() or 1)
-    )
-    physical_cores: set[tuple[str, str]] = set()
-    for cpu in visible_cpus:
-        topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
-        try:
-            package_id = (topology / "physical_package_id").read_text(
-                encoding="utf-8"
-            ).strip()
-            core_id = (topology / "core_id").read_text(
-                encoding="utf-8"
-            ).strip()
-        except OSError:
-            continue
-        physical_cores.add((package_id, core_id))
-    return max(1, len(physical_cores) or len(visible_cpus))
+    root = Path(__file__).resolve().parents[2] / "performance" / "kernels"
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    from native_vnni_dispatch.host_cores import physical_core_count
+
+    return physical_core_count()
 
 
 def _run_refresh_test_method(method_name: str) -> tuple[str, bool, str]:

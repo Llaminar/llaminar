@@ -1272,21 +1272,9 @@ def _read_one_paired_shard(path: Path) -> tuple[PairedCellEvidence, ...]:
 def _physical_core_count() -> int:
     """Return physical cores visible through the current affinity mask."""
 
-    logical_cpus = (
-        sorted(os.sched_getaffinity(0))
-        if hasattr(os, "sched_getaffinity")
-        else list(range(os.cpu_count() or 1))
-    )
-    physical_cores = set()
-    for cpu in logical_cpus:
-        topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
-        try:
-            package_id = (topology / "physical_package_id").read_text().strip()
-            core_id = (topology / "core_id").read_text().strip()
-        except OSError:
-            return max(1, len(logical_cpus))
-        physical_cores.add((package_id, core_id))
-    return max(1, len(physical_cores))
+    from .host_cores import physical_core_count
+
+    return physical_core_count()
 
 
 def _development_corpus(
