@@ -125,6 +125,12 @@ not an additional routine CI regression gate.
 Choose the workflow below before loading model-specific instructions. Treat
 `tests/v2/CMakeLists.txt` plus generated CTest registration as the test inventory
 source of truth; never copy an axis table into this skill or a runner script.
+A registration whose subject exists only with a compiled GPU family declares
+`REQUIRES_BACKEND GPU|CUDA|ROCM` (or the executable's
+`V2_TEST_REQUIRED_BACKEND` property); a build without that family omits and
+counts it in the configure summary. Guard the matching GTest bodies with
+`#if defined(HAVE_CUDA) || defined(HAVE_ROCM)` rather than letting a CPU-only
+build fail on "not compiled". Never use this to hide a CPU-path defect.
 For model/generation/HTTP runs, read `tests/v2/integration/parity/README.md` and
 the applicable model definition or fixture. For image certification and remote
 infrastructure, also read `docs/production-ci.md`.
