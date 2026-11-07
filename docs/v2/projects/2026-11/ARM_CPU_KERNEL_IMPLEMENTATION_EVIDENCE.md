@@ -2153,6 +2153,36 @@ fall from4/4/4 and6/2/6 to zero; AVX2 retains its existing temporary bank/frame,
 and the inspected AVX512 wrappers have no stack accesses. Static96-element
 witnesses do not establish PMU throughput or a whole-engine spill certificate.
 
+### x86 CPU-only gate at `be6658c38` / `05930d91a`
+
+arm-wsl ran an Integration build on a Ryzen 7800X3D (8 cores / 16 threads,
+one NUMA node) inside a WSL2 container.
+
+- **Configuration:** CPU-only, shared core, AVX512 envelope, non-root.
+  Configure omitted exactly 291 GPU-only registrations.
+- **Results:** Unit 942/950, preflight 2234/2244.
+- **Byte identity:** an `LLAMINAR_ISA_LEVEL=avx2` rerun of the NativeVNNI,
+  FusedVerifier, ExplicitRounding, RMSNorm, attention, softmax, RoPE and
+  SwiGLU families failed only the profiler-surrogate tests that also fail
+  under AVX512. Every byte-exact kernel suite passes on both ISAs.
+
+One branch defect was found and fixed in `05930d91a`. Compact multi-scale
+`rows` had rejected empty trailing fixed-count K tiles (for example
+`[26, 24)`), which aborted the GPU-aligned expert and expert-prefill
+all-format suites on both ISAs. The new regression
+`CompactEmptyTrailingKTilePublishesWithoutReading` is in preflight, and 4/4
+pass on both ISAs after the fix.
+
+The remaining failures are classified as follows.
+
+| Failure | Count | Class | Evidence |
+|---|---|---|---|
+| Profiler surrogate fitting | 7 | Needs a CUDA device | x86 retraining tooling |
+| `ModelLoaderRowSlice` | 1 | No models on the host | — |
+| Release/pooled target selection | 3 | Known base-branch failure | `v2_test_memory_planner` is referenced before it exists in `V2PooledNgramPerformanceTests.cmake` |
+| `CPUJointBufferedSource` | 2 | WSL2 limitation | `/proc/self/io` is absent |
+| `CPUStartupAffinity`, `MoEOwnedSharedBackingNativeStartup` | 2 | WSL2 limitation | Open MPI `--cpu-set` fails silently there for any list, even `mpirun -np 1 --cpu-set 0-15 echo hi` exits 1 with no output; the unpinned selector passes, and the multi-rank probe fails fast with its exact-affinity diagnostic |
+
 ## Preliminary ISA tuning, not timing certification
 
 One isolated AppleClang Release Q6_K / Rows4 / ASIMD / expert specialization
