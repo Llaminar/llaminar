@@ -13,6 +13,7 @@
 #include "utils/CPUExplicitRoundingOracle.h"
 #include <gtest/gtest.h>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <bit>
 #include <vector>
@@ -290,7 +291,9 @@ TEST_F(CPUNativeNEONExecution, AllSourcesFP32EpilogueAndTwoTermRetainOriginalRow
         std::vector<float> product(rows * n + 4, 123456.0f), actual(product.size(), 123456.0f), expected = actual;
         serial(packed, reference, expected, rows, n, live);
         for (int i = 0; i < live * n; ++i)
-            expected[i] = memoryRoundedAdd(memoryRoundedMultiply(expected[i], 0.75f), memoryRoundedMultiply(123456.0f, -0.125f));
+            // Canonical BLAS epilogue: round(beta*prior), then one fused
+            // alpha*product + scaled_prior (the same program on every ISA/GPU).
+            expected[i] = std::fma(0.75f, expected[i], memoryRoundedMultiply(123456.0f, -0.125f));
         omp_set_num_threads(3);
         multiply_native_vnni_with_epilogue(packed, source.data(), actual.data(), rows, n, 0.75f, -0.125f,
             primary, product, {}, &work);

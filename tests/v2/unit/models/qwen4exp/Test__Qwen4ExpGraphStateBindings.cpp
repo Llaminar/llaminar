@@ -280,7 +280,10 @@ TEST(Qwen4ExpGraphStateBindings, EarlyCurrentCandidateRejectsUnsupportedRolesBef
         input.seq_len=1;input.batch_size=1;input.execution_role=role;input.execution_phase=ForwardExecutionPhase::Decode;
         ComputeGraph graph;
         try{(void)Qwen4ExpPLEProjectionTestPeer::prefix(owner,input,shape,graph);FAIL()<<"Unsupported early role accepted";}
-        catch(const std::invalid_argument& error){EXPECT_NE(std::string(error.what()).find("ordinary complete"),std::string::npos);}
+        catch(const std::invalid_argument& error){
+            // Either the invocation-policy or the complete-local-GPU-invocation
+            // rejection; both precede source acquisition and graph mutation.
+            EXPECT_NE(std::string(error.what()).find("Early current lookup requires its"),std::string::npos)<<error.what();}
         EXPECT_EQ(graph.size(),0u);EXPECT_FALSE(graph.retainedStorageBoundary());
     }
 }
