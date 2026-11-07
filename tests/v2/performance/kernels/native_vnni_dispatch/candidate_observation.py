@@ -13,6 +13,7 @@ import shutil
 import tempfile
 from typing import Iterable
 
+from .host_cores import physical_core_count
 from .corpus import ObservationCorpus
 from .schema import NativeVNNIObservation, OBSERVATION_COLUMNS
 
@@ -33,22 +34,9 @@ _PARALLEL_WRITE_OBSERVATIONS: tuple[NativeVNNIObservation, ...] = ()
 
 
 def _physical_core_count() -> int:
-    """Return affinity-visible physical cores for offline CSV processing."""
+    """Return affinity-visible physical cores (one worker per core; see ``host_cores``)."""
 
-    try:
-        visible_cpus = tuple(sorted(os.sched_getaffinity(0)))
-    except AttributeError:
-        visible_cpus = tuple(range(os.cpu_count() or 1))
-    physical = set()
-    for cpu in visible_cpus:
-        topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
-        try:
-            package = (topology / "physical_package_id").read_text().strip()
-            core = (topology / "core_id").read_text().strip()
-        except OSError:
-            return max(1, len(visible_cpus))
-        physical.add((package, core))
-    return max(1, len(physical))
+    return physical_core_count()
 
 
 def _observation_csv_row(

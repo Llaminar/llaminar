@@ -9,7 +9,9 @@ lscpu presentation identities never enter physical-core counting. Real CMake
 fixtures exercise the production decoder/finalizer without a compiler or model.
 """
 from __future__ import annotations
+import contextlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import shutil
@@ -59,6 +61,42 @@ class CPUHostTopologyTests(unittest.TestCase):
         self.assertEqual(document['core_thread_widths'], [1] * 20)
         self.assertEqual(document['packages'], [{'package_id': 36, 'physical_cores': 20, 'logical_cpus': 20}])
         self.assertEqual(TOPOLOGY.TestHostTopology.from_document(document).document(), document)
+
+    def test_tooling_queries_use_sibling_groups_on_recorded_gb10(self):
+        """Shell tooling receives twenty GB10 physical cores in CPU order, never lscpu's ten."""
+        _, document = recorded_spark_document()
+        topology = TOPOLOGY.TestHostTopology.from_document(document)
+        self.assertEqual(TOPOLOGY.query(topology, 'packages', []), '1')
+        self.assertEqual(TOPOLOGY.query(topology, 'max-cores-per-package', []), '20')
+        self.assertEqual(TOPOLOGY.query(topology, 'profiler-cpus', ['20', '1']),
+                         ','.join(str(cpu) for cpu in range(20)))
+        self.assertEqual(TOPOLOGY.query(topology, 'profiler-cpus', ['4', '1']), '0,1,2,3')
+        with self.assertRaises(TOPOLOGY.TopologyError):
+            TOPOLOGY.query(topology, 'profiler-cpus', ['21', '1'])
+        with self.assertRaises(TOPOLOGY.TopologyError):
+            TOPOLOGY.query(topology, 'profiler-cpus', ['1', '2'])
+        with self.assertRaises(TOPOLOGY.TopologyError):
+            TOPOLOGY.query(topology, 'cores', [])
+
+    def test_tooling_queries_keep_one_cpu_per_smt_core_and_package_lanes(self):
+        """SMT siblings collapse to their first CPU; lanes follow package order."""
+        fixture = ROOT / 'tests/v2/fixtures/cpu/dual_socket_28core_smt2_topology.json'
+        document = json.loads(fixture.read_text(encoding='utf-8'))
+        topology = TOPOLOGY.TestHostTopology.from_document(document)
+        self.assertEqual(TOPOLOGY.query(topology, 'packages', []), '2')
+        self.assertEqual(TOPOLOGY.query(topology, 'max-cores-per-package', []), '28')
+        self.assertEqual(TOPOLOGY.query(topology, 'profiler-cpus', ['2', '2']), '0,1;28,29')
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'topology.json'
+            path.write_text(json.dumps(document), encoding='utf-8')
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(TOPOLOGY.main(['--document', str(path), 'query', 'packages']), 0)
+            self.assertEqual(output.getvalue(), '2\n')
+            document['packages'][0]['physical_cores'] = 27
+            path.write_text(json.dumps(document), encoding='utf-8')
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(TOPOLOGY.main(['--document', str(path), 'query', 'packages']), 1)
 
     def test_core_labels_are_not_authority_when_sibling_groups_are_distinct(self):
         """A repeated core label cannot merge disjoint genuine physical sibling sets."""

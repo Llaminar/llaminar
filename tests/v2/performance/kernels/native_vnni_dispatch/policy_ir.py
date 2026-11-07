@@ -13,6 +13,7 @@ from functools import cached_property
 from pathlib import Path
 from typing import Any, Mapping
 
+from .host_cores import physical_core_count
 from .corpus import GenericDomain, RuntimeKey
 from .exact_oracle import ExactWinner
 from .schema import FEATURE_SCHEMA_VERSION, LEARNER_VERSION, POLICY_ABI
@@ -35,28 +36,9 @@ _PARALLEL_POLICY_VALUES: tuple[Any, ...] = ()
 
 
 def _physical_core_count() -> int:
-    """Return the affinity-visible physical-core count for offline encoding.
+    """Return affinity-visible physical cores (one worker per core; see ``host_cores``)."""
 
-    Policy publication is an offline operation, but using every SMT sibling for
-    Python object traversal only increases process state and scheduler pressure.
-    Package/core identities keep worker defaults aligned with the corpus fitter
-    and the rest of the NativeVNNI publication pipeline.
-    """
-
-    try:
-        visible_cpus = tuple(sorted(os.sched_getaffinity(0)))
-    except AttributeError:
-        visible_cpus = tuple(range(os.cpu_count() or 1))
-    physical_cores = set()
-    for cpu in visible_cpus:
-        topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
-        try:
-            package = (topology / "physical_package_id").read_text().strip()
-            core = (topology / "core_id").read_text().strip()
-        except OSError:
-            return max(1, len(visible_cpus))
-        physical_cores.add((package, core))
-    return max(1, len(physical_cores))
+    return physical_core_count()
 
 
 def _normalize_policy_value(value: Any) -> Any:
