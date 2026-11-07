@@ -507,6 +507,8 @@ namespace llaminar2
         setenv("OMP_NESTED", "false", 1);
         setenv("OMP_DYNAMIC", "false", 1);
 
+        configureOpenMPWaitPolicy();
+
         // Intel KMP settings
         setenv("KMP_AFFINITY", "granularity=fine,compact,1,0", 1);
         setenv("KMP_BLOCKTIME", "0", 1);
@@ -524,6 +526,16 @@ namespace llaminar2
         // Log configuration
         LOG_DEBUG("[MPIBootstrap] OpenMP configured: " << omp_threads << " threads, "
                                                        << "places=" << config.omp_places << ", bind=" << config.omp_proc_bind);
+    }
+
+    void MPIBootstrap::configureOpenMPWaitPolicy()
+    {
+        // Preserve an explicit measurement value; otherwise install the
+        // measured bounded budget (see kOpenMPIdleSpinCount).
+        if (DebugEnv::envValue("GOMP_SPINCOUNT") == nullptr &&
+            setenv("GOMP_SPINCOUNT", kOpenMPIdleSpinCount, 0) != 0)
+            throw std::runtime_error(std::string("Cannot install the OpenMP idle-spin policy: ") + strerror(errno));
+        LOG_DEBUG("[MPIBootstrap] GOMP_SPINCOUNT=" << DebugEnv::envValue("GOMP_SPINCOUNT"));
     }
 
     // ========================================================================
@@ -667,6 +679,14 @@ namespace llaminar2
         cmd.push_back("none");
 
         appendDiagnosticEnvironment(cmd);
+        // Runtime scheduling policy, not diagnostics: remote ranks load libgomp
+        // before main(), so the launcher-installed idle-spin budget must reach
+        // them by name. Local ranks inherit it; exporting it is identical.
+        if (DebugEnv::envValue("GOMP_SPINCOUNT") != nullptr)
+        {
+            cmd.emplace_back("-x");
+            cmd.emplace_back("GOMP_SPINCOUNT");
+        }
 
         // MPI owns this explicit option/application delimiter. The shared
         // session owner validates only that prefix, never opaque app flags.
@@ -716,6 +736,8 @@ namespace llaminar2
         // Configure OpenMP environment before exec (inherited by child processes)
         if (config.hostfile.empty())
             configureOpenMPEnvironment(topology, config);
+        else
+            configureOpenMPWaitPolicy(); // Remote ranks receive it through -x.
         configureLauncherEnvironment();
 
         // Build command
