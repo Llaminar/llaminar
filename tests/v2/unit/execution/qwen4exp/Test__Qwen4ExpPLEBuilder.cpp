@@ -385,6 +385,9 @@ TEST(Qwen4ExpPLEBuilder, OrdinaryProjectionsKeepTheirOriginalPolicy)
     EXPECT_EQ(rejected.size(),0u);
 }
 
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 /** @test A foreign reader cannot manufacture a source boundary or proceed without the original retained cohort. */
 TEST(Qwen4ExpPLEBuilder, SharedReaderRequiresOriginalCohortBeforeGraphMutation)
 {
@@ -431,3 +434,4 @@ TEST(Qwen4ExpPLEBuilder, SharedReaderRequiresOriginalCohortBeforeGraphMutation)
         EXPECT_FALSE(graph.retainedStorageBoundary());
     }
 }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)

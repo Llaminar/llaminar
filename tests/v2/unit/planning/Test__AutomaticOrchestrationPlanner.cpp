@@ -553,6 +553,9 @@ TEST(AutomaticOrchestrationPlanner, CompilerAndDiagnosticFailuresRemainFatal)
     EXPECT_THROW(AutomaticOrchestrationPlanner::select(config, source, observed, memory(), {64, 128}, cost), std::invalid_argument);
 }
 
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 TEST(AutomaticOrchestrationPlanner, RemoteOverlaySelectionPreservesDynamicMTPAndPrecisionPolicies)
 {
     for (const auto format : {GGUFTensorType::F32, GGUFTensorType::F16, GGUFTensorType::BF16})
@@ -617,7 +620,11 @@ TEST(AutomaticOrchestrationPlanner, RemoteOverlaySelectionPreservesDynamicMTPAnd
         EXPECT_TRUE(applied.moe_routed_expert_plan->usesExpertOverlayAuthority());
     }
 }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 /**
  * @brief Full auto selection admits three physical tiers before ranking them.
  *
@@ -684,3 +691,4 @@ TEST(AutomaticOrchestrationPlanner, MultiTierOverlayAdmissionAndSelection)
     const auto saved = serializeOrchestrationConfig(selected.candidate().config());
     EXPECT_EQ(serializeOrchestrationConfig(deserializeOrchestrationConfig(saved)), saved);
 }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
