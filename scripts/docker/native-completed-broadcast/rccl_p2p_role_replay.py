@@ -11,6 +11,12 @@ root=Path(os.environ['LLAMINAR_NATIVE_REPLAY_ROOT']);r=root/'replay/rccl-role';r
 cpp='''#include "llaminar_p2p_entry.h"
 #include <cassert>
 #include <csignal>
+// __builtin_trap() raises the host ISA's trap: ud2/SIGILL on x86-64, brk/SIGTRAP on AArch64.
+#if defined(__aarch64__)
+constexpr int kNativeTrapSignal=SIGTRAP;
+#else
+constexpr int kNativeTrapSignal=SIGILL;
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <sys/wait.h>
@@ -27,7 +33,7 @@ int main(){rlimit limit{0,0};setrlimit(RLIMIT_CORE,&limit);int checked=0;
     else check<ncclP2pEntryPolicy::Native>(recv,send,threads);_exit(0);}
    int status=0;assert(waitpid(pid,&status,0)==pid);
    if(valid)assert(WIFEXITED(status)&&WEXITSTATUS(status)==0);
-   else assert(WIFSIGNALED(status)&&WTERMSIG(status)==(local?SIGILL:SIGABRT));++checked;
+   else assert(WIFSIGNALED(status)&&WTERMSIG(status)==(local?kNativeTrapSignal:SIGABRT));++checked;
   }
  }printf("PASS actual role predicate: %d Native/Sealed valid/fatal cases\\n",checked);
 }
