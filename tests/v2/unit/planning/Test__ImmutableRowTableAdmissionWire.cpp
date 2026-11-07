@@ -6,6 +6,7 @@
  * fail before a final placement/certificate can exist.
  */
 #include "planning/ImmutableRowTableAdmissionWire.h"
+#include <algorithm>
 #include <gtest/gtest.h>
 #include <array>
 namespace llaminar2::test
