@@ -45,6 +45,14 @@ Candidate changes:
 - No current A/B bandwidth evidence establishes the winner; this needs the
   harness (idea 1) before and after.
 
+## Decode M=1 thread-scaling observation (2026-11-07)
+
+M1 Max VM: decode M=1 saturates around **8 threads**, and Q8_K **regresses to
+2.96x at 10 threads** (already in `00-measured-baseline.md`). This may share a
+cause with this idea and idea 12 (activation reuse / bandwidth): worth
+checking on GB10 at 1..20 threads from P1, and a Q8_K regression signal would
+argue for the wider-panel / activation-reuse work before touching scheduling.
+
 ## Validation
 
 - Panel tournaments per Rows × encoding (Q4_K/Q5_K/Q6_K/Q8_0/IQ2_S/IQ3_S/

@@ -59,3 +59,11 @@ integer dot products; it amortizes weight bandwidth but not arithmetic.
   perf-debug helper** when this idea is implemented — verifier-depth,
   acceptance rate and depth-controller behaviour under the measured spin
   policy — rather than as a now-obligation or a CI check.
+
+## Verified numbers (corrected)
+
+Verified-mode per-commit run, A2 `878a33fea`: 27B MTP dyn **4.20** vs off
+**4.51 tok/s** (−6.9%). The earlier “≈ equal” figures came from **mislabeled
+cells (both runs had MTP on)** — the verified comparison is the A2 pair above.
+At `268cd81de`: MTP dyn 4.27–4.29. Mainline evidence for the dense-MTP
+decision stays the verified pair; idea 19 covers the prefill side.

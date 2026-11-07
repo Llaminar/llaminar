@@ -28,6 +28,21 @@ topology/unknowns are retained (`CPUCacheObservation.h`). Class-specific tuning
 3. Any new table must stay exact-overlay based (no generic fitting/retraining;
    the plan explicitly allows only exact overlays).
 
+## End-to-end overlay transfer (finding, 2026-11-07)
+
+Verified-mode per-commit runs on GB10 (35B Release, decode tok/s):
+
+- A2 `878a33fea` (baseline): MTP dyn **18.46**, MTP off **14.14**.
+- B2 `144ece037` (+2,519-key overlay table): MTP dyn **17.30**, MTP off
+  **13.27** (−6% in both).
+- B1 earlier: 17.68 vs A1 17.89.
+
+Kernel-level wins on selected keys were ~20–25%, but end to end the overlays
+are **neutral to slightly negative** so far. Repeats are pending (C3 then
+more); if it persists, the 20-worker microbenchmark keys may not transfer to
+real in-model concurrency/cache state, and an A/B with overlays disabled at
+the head is worthwhile before drawing conclusions.
+
 ## Exactness / risk
 
 - Low: tables select implementations with identical arithmetic; but a wrong

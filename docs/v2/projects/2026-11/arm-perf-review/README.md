@@ -44,6 +44,8 @@ references are as of the head above and may drift.
 | 15 | NUMA-less and cache-unpublished Linux ARM hosts | `15-numa-less-hosts.md` | Partial (memory attribution `a572c3c9c`) |
 | 16 | MoE routed experts, GDN projection and LM head in CPU decode | `16-moe-expert-and-lm-head-decode.md` | Open (bundle part addressed by `408ff90e5`) |
 | 17 | GB10 CPU decode bandwidth gap (post-merge follow-up) | `17-gb10-decode-bandwidth-gap.md` | Open (operator-requested re-analysis after merge) |
+| 18 | GDN grouped verifier + publication economics | `18-gdn-grouped-verifier-economics.md` | Open (clean-host rerun needed; GB10 numbers from final Perf__ round) |
+| 19 | Prefill vs decode gap on GB10 (short-prompt effect) | `19-prefill-vs-decode-gap.md` | Open (prompt-length sweep planned) |
 
 Measured numbers for all ideas: `00-measured-baseline.md` (GB10 serving,
 stage attribution, spin sweep, thread scaling, overlay statistics).

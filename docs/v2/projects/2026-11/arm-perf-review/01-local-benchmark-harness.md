@@ -36,6 +36,12 @@ and byte-identical output. The repo already has the model for this:
 3. A committed baseline-JSON convention (SHA-tagged host/build + counters) so
    any follow-up run can diff against the last recorded baseline without a
    manual table.
+4. Low priority (tooling feedback loop, maxim 28): the MTP benchmark-matrix
+   script suites take ~190 s on the Mac VM (18 subprocess lanes at ~6 s each)
+   against a 30 s CTest budget; they pass inside 30 s on GB10 and x86. The
+   VM classifies as slow, not a code defect. Optional follow-up: run the lanes
+   with more parallelism/physical cores or reduce lane count so the loop
+   itself doesn't waste the feedback time.
 
 ## Exactness / risk
 
