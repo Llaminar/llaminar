@@ -178,12 +178,65 @@ def observe_linux(sysfs_root: Path = Path('/sys/devices/system/cpu'),
     return TestHostTopology(tuple(rows))
 
 
-def main() -> int:
-    """Publish only an authenticated native snapshot; errors are fatal and never a one-core default."""
+def physical_core_representatives(topology: TestHostTopology) -> dict[int, list[int]]:
+    """Return each package's physical cores as their lowest CPU id, in CPU-id order.
+
+    Physical cores are kernel thread-sibling sets, never repeated presentation
+    core labels (GB10 repeats lscpu/sysfs core ids across its clusters).
+    """
+    packages: dict[int, set[int]] = {}
+    for row in topology.cpus:
+        packages.setdefault(row.package_id, set()).add(row.siblings.intervals[0][0])
+    return {package: sorted(cores) for package, cores in sorted(packages.items())}
+
+
+def query(topology: TestHostTopology, field: str, arguments: list[str]) -> str:
+    """Answer one derived topology question for shell tooling.
+
+    `packages` prints the package count, `max-cores-per-package` the widest
+    package's physical core count, and `profiler-cpus THREADS LANES` one
+    comma-separated list of THREADS physical-core CPUs for each of the first
+    LANES packages, lanes separated by `;`.
+    """
+    cores = physical_core_representatives(topology)
+    if field == 'packages' and not arguments:
+        return str(len(cores))
+    if field == 'max-cores-per-package' and not arguments:
+        return str(max(len(values) for values in cores.values()))
+    if field == 'profiler-cpus' and len(arguments) == 2 and all(re.fullmatch(r'[1-9][0-9]*', a) for a in arguments):
+        threads, lanes = int(arguments[0]), int(arguments[1])
+        selected = list(cores.values())[:lanes]
+        if len(selected) < lanes or any(len(values) < threads for values in selected):
+            raise TopologyError(f'{lanes} package lane(s) of {threads} physical cores are not available')
+        return ';'.join(','.join(str(cpu) for cpu in values[:threads]) for values in selected)
+    raise TopologyError(f'unknown topology query: {" ".join([field, *arguments])}')
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Publish only an authenticated native snapshot; errors are fatal and never a one-core default.
+
+    Without arguments the live snapshot is printed as JSON. `query FIELD ...`
+    answers a derived question; `--document PATH` before `query` substitutes a
+    recorded canonical document (a device-free fixture seam) for the live host.
+    """
+    arguments = list(sys.argv[1:] if argv is None else argv)
     try:
-        print(json.dumps(observe_linux().document(), sort_keys=True))
+        document_path = None
+        if arguments[:1] == ['--document']:
+            if len(arguments) < 2:
+                raise TopologyError('--document requires a path')
+            document_path = Path(arguments[1])
+            arguments = arguments[2:]
+        topology = (TestHostTopology.from_document(json.loads(document_path.read_text(encoding='utf-8')))
+                    if document_path else observe_linux())
+        if not arguments:
+            print(json.dumps(topology.document(), sort_keys=True))
+        elif arguments[0] == 'query' and len(arguments) >= 2:
+            print(query(topology, arguments[1], arguments[2:]))
+        else:
+            raise TopologyError(f'unknown arguments: {" ".join(arguments)}')
         return 0
-    except TopologyError as error:
+    except (TopologyError, OSError, ValueError) as error:
         print(f'CPU test-host topology admission failed: {error}', file=sys.stderr)
         return 1
 

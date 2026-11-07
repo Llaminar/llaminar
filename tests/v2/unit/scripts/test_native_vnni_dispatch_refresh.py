@@ -25,6 +25,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 SCRIPT = REPO_ROOT / "scripts" / "refresh_native_vnni_dispatch_tables.sh"
+# Every wrapper subprocess inherits one recorded dual-socket host; the live
+# test host's CPU presentation (GB10, a laptop VM) never decides admission.
+os.environ["LLAMINAR_NATIVE_VNNI_REFRESH_HOST_TOPOLOGY"] = str(
+    REPO_ROOT / "tests/v2/fixtures/cpu/dual_socket_28core_smt2_topology.json")
 VALIDATOR = (
     REPO_ROOT
     / "tests"
@@ -1518,13 +1522,17 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         cmake = (REPO_ROOT / "src" / "v2" / "CMakeLists.txt").read_text(
             encoding="utf-8"
         )
+        owner = (REPO_ROOT / "cmake" / "OneDNNBuild.cmake").read_text(
+            encoding="utf-8"
+        )
         dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
 
-        self.assertIn(
-            'set(ONEDNN_BUILD_DIR "${ONEDNN_EXTERNAL_DIR}/build-${ONEDNN_ISA_SUFFIX}")',
-            cmake,
-        )
-        self.assertIn("unset(ONEDNN_LIB CACHE)", cmake)
+        # One owner selects the per-ISA tree and returns its exact manifested
+        # library; no cached name search can carry another ISA's library over.
+        self.assertIn('string(TOLOWER "${LLAMINAR_CPU_ISA_UPPER}" suffix)', owner)
+        self.assertIn('set(build "${source}/build-${suffix}")', owner)
+        self.assertIn("llaminar_prepare_onednn(", cmake)
+        self.assertNotIn("find_library(ONEDNN_LIB", cmake)
         self.assertIn("build-${ONEDNN_ISA_SUFFIX}", dockerfile)
         self.assertIn(
             "build-$(printf '%s' \"${LLAMINAR_CPU_ISA}\"",
