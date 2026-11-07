@@ -195,8 +195,9 @@ static int serialEquivalentPolicyN(int actual_n)
 template <uint8_t ExecutionCodebook>
 inline constexpr uint8_t trainedPolicyCodebook()
 {
-    if constexpr (ExecutionCodebook == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook)
-        return 4; // Exact source4 schedule; physical template/cache remains 24.
+    if constexpr (ExecutionCodebook == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook ||
+                  ExecutionCodebook == llaminar2::kNativeVnniMXFP4Codebook)
+        return 4; // Exact source4 schedule; physical template/cache remains 24/25.
     return ExecutionCodebook ==
                    llaminar2::kNativeVnniExpandedInt8MinCodebook
                ? static_cast<uint8_t>(19)
@@ -4189,7 +4190,7 @@ extern "C"
             d_C_existing,
             d_bias,
             codebook_id,
-            codebook_id == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook ? uint8_t{4} : codebook_id,
+            llaminar2::nativeVnniPolicyCodebook(codebook_id),
             cuda_device_id,
             stream,
             gemv_ctx,
@@ -4294,7 +4295,7 @@ extern "C"
             d_C_existing,
             d_bias,
             codebook_id,
-            codebook_id == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook ? uint8_t{4} : codebook_id,
+            llaminar2::nativeVnniPolicyCodebook(codebook_id),
             cuda_device_id,
             stream,
             gemv_ctx,

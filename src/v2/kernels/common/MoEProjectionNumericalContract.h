@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include "tensors/NativeVnniFormatInfo.h"
 #include <cstdint>
 
 namespace llaminar2
@@ -85,7 +86,8 @@ namespace llaminar2
                    (arithmetic_policy_codebook >= 4u &&
                     arithmetic_policy_codebook <= 17u) ||
                    (arithmetic_policy_codebook >= 19u &&
-                    arithmetic_policy_codebook <= 21u);
+                    arithmetic_policy_codebook <= 21u) ||
+                   arithmetic_policy_codebook == kNativeVnniMXFP4Codebook;
         }
 
         /**

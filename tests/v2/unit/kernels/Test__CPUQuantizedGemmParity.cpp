@@ -62,6 +62,7 @@ namespace
         {"Q8_1", 0.01f, 0.999f},
         {"Q4_0", 0.01f, 0.999f},
         {"IQ4_NL", 0.01f, 0.999f},
+        {"MXFP4", 0.01f, 0.999f},
         {"Q4_1", 0.01f, 0.999f},
         {"Q5_0", 0.01f, 0.999f},
         {"Q5_1", 0.01f, 0.999f},
@@ -169,6 +170,8 @@ namespace
             return TestTensorFactory::createIQ1_SRandom({N, K});
         if (fmt == "IQ1_M")
             return TestTensorFactory::createIQ1_MRandom({N, K});
+        if (fmt == "MXFP4")
+            return TestTensorFactory::createMXFP4Random({N, K});
         return nullptr;
     }
 
@@ -924,7 +927,7 @@ namespace
     }
 
     // =========================================================================
-    // Instantiate for all 20 quantized formats
+    // Instantiate for all 21 quantized formats
     // =========================================================================
 
     INSTANTIATE_TEST_SUITE_P(
@@ -934,7 +937,7 @@ namespace
             "Q8_0", "Q8_1", "Q4_0", "IQ4_NL", "Q4_1", "Q5_0", "Q5_1",
             "Q6_K", "Q5_K", "Q4_K", "Q3_K", "Q2_K",
             "IQ4_XS", "IQ3_S", "IQ3_XXS", "IQ2_S", "IQ2_XS", "IQ2_XXS",
-            "IQ1_S", "IQ1_M"),
+            "IQ1_S", "IQ1_M", "MXFP4"),
         [](const ::testing::TestParamInfo<std::string> &info)
         { return info.param; });
 

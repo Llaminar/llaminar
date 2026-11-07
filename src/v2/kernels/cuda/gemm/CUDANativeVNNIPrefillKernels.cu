@@ -816,6 +816,7 @@ namespace
         case 0:
         case 4:
         case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook:
+        case llaminar2::kNativeVnniMXFP4Codebook:
         case 5:
         case 6:
         case 7:
@@ -895,8 +896,7 @@ namespace
         // IQ4_XS owns physical24 kernels and resources, but retains exactly
         // the source4 tile/staging/reduction schedule rather than losing its
         // admitted cells when the physical metadata identity changes.
-        const uint8_t policy_codebook = codebook == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook
-            ? uint8_t{4} : codebook;
+        const uint8_t policy_codebook = llaminar2::nativeVnniPolicyCodebook(codebook);
         if (!llaminar2::cuda::generated::selectCUDADensePrefillOverlay(
                 policy_codebook, M, N, K, config))
         {
@@ -1264,7 +1264,8 @@ namespace
             return tile == 2 ? ordinary_hint : 1;
         }
         if constexpr (CanonicalKpart &&
-                      (CB == 0 || CB == 4 || CB == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook || CB == 6 || CB == 11 ||
+                      (CB == 0 || CB == 4 || CB == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook ||
+                       CB == llaminar2::kNativeVnniMXFP4Codebook || CB == 6 || CB == 11 ||
                        CB == 12 || CB == 15 || CB == 19))
         {
             return tile <= 3 ? ordinary_hint : 1;
@@ -2243,6 +2244,7 @@ extern "C"
             QUERY_LAST_DENSE_PREFILL_CODEBOOK(0);
             QUERY_LAST_DENSE_PREFILL_CODEBOOK(4);
             QUERY_LAST_DENSE_PREFILL_CODEBOOK(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
+            QUERY_LAST_DENSE_PREFILL_CODEBOOK(llaminar2::kNativeVnniMXFP4Codebook);
             QUERY_LAST_DENSE_PREFILL_CODEBOOK(5);
             QUERY_LAST_DENSE_PREFILL_CODEBOOK(6);
             QUERY_LAST_DENSE_PREFILL_CODEBOOK(7);
@@ -2317,6 +2319,7 @@ extern "C"
             QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(0);
             QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(4);
             QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
+            QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(llaminar2::kNativeVnniMXFP4Codebook);
             QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(5);
             QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(6);
             QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(7);
@@ -2477,7 +2480,7 @@ extern "C"
     {
         return cudaNativeVNNIPrefill_getWorkspacePlanWithPolicy(
             codebook_id,
-            codebook_id == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook ? uint8_t{4} : codebook_id,
+            llaminar2::nativeVnniPolicyCodebook(codebook_id),
             M,
             N,
             K,
@@ -2536,7 +2539,7 @@ extern "C"
                 for (const auto &entry :
                      llaminar2::cuda::generated::kCUDADensePrefillOverlayEntries)
                 {
-                    if (entry.codebook != (codebook_id == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook ? uint8_t{4} : codebook_id) ||
+                    if (entry.codebook != llaminar2::nativeVnniPolicyCodebook(codebook_id) ||
                         entry.n != N || entry.k != K ||
                         entry.m <= 1 || entry.m > max_M)
                     {
@@ -2593,7 +2596,7 @@ extern "C"
     {
         return cudaNativeVNNIPrefill_getWorkspaceEnvelopeWithPolicy(
             codebook_id,
-            codebook_id == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook ? uint8_t{4} : codebook_id,
+            llaminar2::nativeVnniPolicyCodebook(codebook_id),
             max_M,
             N,
             K,
@@ -2688,6 +2691,13 @@ extern "C" bool cudaNativeVNNIPrefill_fp32_withPolicy(
         break;
     case 4:
         ok = launchGenericPrefillBK64<4>(
+            d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
+            serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
+            cuda_stream, prefill_ctx);
+        break;
+    case llaminar2::kNativeVnniMXFP4Codebook:
+        ok = launchGenericPrefillBK64<llaminar2::kNativeVnniMXFP4Codebook>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
             nullptr, M, N, K, alpha, beta, d_C_existing, d_bias,
             serial_m1_k_partitions, serial_m1_uses_ordered_reducer,
@@ -2919,7 +2929,7 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
         d_C_existing,
         d_bias,
         codebook_id,
-        codebook_id == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook ? uint8_t{4} : codebook_id,
+        llaminar2::nativeVnniPolicyCodebook(codebook_id),
         cuda_device_id,
         stream,
         prefill_ctx);

@@ -136,3 +136,9 @@ TEST_F(Test__QuantizedTensorTailDecodeRegression, IQ1_M_K17Tail)
     auto tensor = TestTensorFactory::createIQ1_MRandom({kRows, kPartialCols}, 1010);
     verifyTailSafeDequantization("IQ1_M", std::move(tensor));
 }
+
+TEST_F(Test__QuantizedTensorTailDecodeRegression, MXFP4_K17Tail)
+{
+    auto tensor = TestTensorFactory::createMXFP4Random({kRows, kPartialCols}, 1011);
+    verifyTailSafeDequantization("MXFP4", std::move(tensor));
+}

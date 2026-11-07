@@ -103,6 +103,9 @@ namespace llaminar2::test
              { return TestTensorFactory::createQ8_1Random(shape, -1.0f, 1.0f, seed); }},
             {"Q8_K", TensorType::Q8_K, 21, true, 19, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
              { return TestTensorFactory::createQ8_KRandom(shape, seed); }},
+            {"MXFP4", TensorType::MXFP4, kNativeVnniMXFP4Codebook, false, kNativeVnniMXFP4Codebook,
+             [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createMXFP4Random(shape, seed); }},
         };
         return formats;
     }

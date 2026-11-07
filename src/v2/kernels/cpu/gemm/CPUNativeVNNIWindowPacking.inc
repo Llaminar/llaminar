@@ -196,6 +196,11 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeV
                     uint16_t scale=0,minimum=0;
                     if(out.usesNibbleLUTSourceScale() || out.usesIQ3SExpandedSourceScale()) {
                         scale=primary[b];minimum=secondary[b];
+                    } else if(nibble && format.codebook_id==kNativeVnniMXFP4Codebook) {
+                        // packVnniBlock already validated the block and published its exact
+                        // prepared FP16 scale (+0 for ggml all-zero blocks). Re-rounding the
+                        // FP32 source scale would turn e > 143 zero blocks into +inf.
+                        scale=primary[b];
                     } else if(nibble) {
                         scale=fp32_to_fp16(source.get_block_scale(actual_row,input_first+b));
                         minimum=fp32_to_fp16(source.get_block_min(actual_row,input_first+b));

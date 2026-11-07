@@ -7599,6 +7599,7 @@ namespace
         {
         case 0:
         case 4:
+        case llaminar2::kNativeVnniMXFP4Codebook:
             payload_bytes = 16u;
             return true;
         case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook:

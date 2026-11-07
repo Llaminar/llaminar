@@ -296,6 +296,7 @@ namespace
         case 0:  // Q4_0
         case 4:  // IQ4_NL
         case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook: // IQ4_XS original tuple
+        case llaminar2::kNativeVnniMXFP4Codebook: // MXFP4 (doubled-E2M1 lookup)
         case 5:  // Q4_1 / Q4_K
         case 6:  // Q5_0
         case 7:  // Q5_1 / Q5_K

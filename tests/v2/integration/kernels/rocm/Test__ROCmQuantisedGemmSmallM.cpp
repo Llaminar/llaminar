@@ -772,6 +772,8 @@ namespace
              { return TestTensorFactory::createIQ1_SRandom(shape, seed); }},
             {"IQ1_M", 17, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
              { return TestTensorFactory::createIQ1_MRandom(shape, seed); }},
+            {"MXFP4", llaminar2::kNativeVnniMXFP4Codebook, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createMXFP4Random(shape, seed); }},
             {"Q8_0", 19, [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
              { return TestTensorFactory::createQ8_0Random(shape, seed); }},
         };

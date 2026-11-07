@@ -27,6 +27,7 @@
 
 #include "backends/DeviceId.h"
 #include "tensors/Tensors.h"
+#include "tensors/MXFP4Format.h"
 #include "kernels/KernelFactory.h"
 #include <memory>
 #include <vector>
@@ -388,6 +389,68 @@ namespace llaminar2::test
             }
 
             return std::make_unique<Q4_0Tensor>(shape, raw_data);
+        }
+
+        /**
+         * @brief Create a deterministic MXFP4 tensor (GGUF type 39).
+         *
+         * Each block quantizes N(0, 0.1) values to the doubled-E2M1 lookup with
+         * a power-of-two E8M0 exponent chosen so the block maximum maps to 12.
+         * Exponents stay inside the exact-FP16 scale window, matching real
+         * checkpoints, so every NativeVNNI preparation path accepts the tensor.
+         * Every 13th block is an all-zero block with e = 0, exactly as ggml's
+         * quantizer writes it, so all-format sweeps also cover the scale-+0
+         * preparation of blocks whose exponent has no FP16 form.
+         *
+         * @param shape Tensor dimensions [rows, cols]; a partial final block per row is
+         *        stored row-padded, like every other block format.
+         * @param seed Random seed.
+         */
+        static std::unique_ptr<MXFP4Tensor> createMXFP4Random(
+            const std::vector<size_t> &shape,
+            uint32_t seed = 42)
+        {
+            const size_t rows = shape[0];
+            const size_t cols = shape[1];
+            const size_t total_blocks =
+                rows * ((cols + MXFP4Block::BLOCK_SIZE - 1) / MXFP4Block::BLOCK_SIZE);
+            std::mt19937 rng(seed);
+            std::normal_distribution<float> dist(0.0f, 0.1f);
+            std::vector<uint8_t> raw_data(total_blocks * sizeof(MXFP4Block));
+            auto *blocks = reinterpret_cast<MXFP4Block *>(raw_data.data());
+            for (size_t i = 0; i < total_blocks; ++i)
+            {
+                if (i % 13 == 5)
+                {
+                    blocks[i].e = 0;
+                    std::memset(blocks[i].qs, 0, sizeof(blocks[i].qs));
+                    continue;
+                }
+                float values[MXFP4Block::BLOCK_SIZE];
+                float max_abs = 0.0f;
+                for (auto &v : values)
+                {
+                    v = dist(rng);
+                    max_abs = std::max(max_abs, std::abs(v));
+                }
+                // Smallest exponent with max_abs / 2^(e-128) <= 12.
+                int e = 128 + static_cast<int>(std::ceil(std::log2(std::max(max_abs, 1e-6f) / 12.0f)));
+                e = std::clamp(e, static_cast<int>(mxfp4::kMinExactFP16Exponent),
+                               static_cast<int>(mxfp4::kMaxExactFP16Exponent));
+                blocks[i].e = static_cast<uint8_t>(e);
+                const float inv = 1.0f / mxfp4::scaleFP32(blocks[i].e);
+                auto nearest = [&](float x)
+                {
+                    int best = 0;
+                    for (int c = 1; c < 16; ++c)
+                        if (std::abs(x * inv - mxfp4::kValues[c]) < std::abs(x * inv - mxfp4::kValues[best]))
+                            best = c;
+                    return static_cast<uint8_t>(best);
+                };
+                for (size_t j = 0; j < 16; ++j)
+                    blocks[i].qs[j] = static_cast<uint8_t>(nearest(values[j]) | (nearest(values[j + 16]) << 4));
+            }
+            return std::make_unique<MXFP4Tensor>(shape, raw_data);
         }
 
         /**

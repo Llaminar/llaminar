@@ -15,6 +15,11 @@
         static constexpr bool is_iq4_source_scale =
             CODEBOOK_ID == kNativeVnniIQ4XSSourceScaleCodebook;
         static constexpr bool is_iq4_lut = CODEBOOK_ID == 4 || is_iq4_source_scale;
+        /// MXFP4: IQ4_NL payload geometry and FP16 scale, doubled-E2M1 lookup.
+        /// Deliberately outside the IQ4 peer family (no 4/24 pairing semantics).
+        static constexpr bool is_mxfp4_lut = CODEBOOK_ID == kNativeVnniMXFP4Codebook;
+        /// Any 16-entry signed nibble lookup decoded by nibble_lut_decode_word().
+        static constexpr bool is_nibble_lut = is_iq4_lut || is_mxfp4_lut;
         static constexpr bool is_iq3_grid = (CODEBOOK_ID == 11 || CODEBOOK_ID == 12);
         static constexpr bool is_iq2_grid = (CODEBOOK_ID == 13 || CODEBOOK_ID == 14 || CODEBOOK_ID == 15);
         static constexpr bool is_iq1_grid = (CODEBOOK_ID == 16 || CODEBOOK_ID == 17);
@@ -393,6 +398,40 @@
         out_hi = __byte_perm(first, last, 0x7531);
     }
 
+    /**
+     * @brief Expand eight 4-bit codes through the codebook's signed lookup.
+     * @tparam CODEBOOK_ID IQ4 family (kvalues_iq4nl) or MXFP4 (doubled E2M1).
+     *
+     * Identical byte-permutation program to iq4nl_decode_word(); only the four
+     * packed lookup words differ. Output layout matches every dp4a caller.
+     */
+    template <uint8_t CODEBOOK_ID>
+    __device__ __forceinline__ void nibble_lut_decode_word(
+        uint32_t w, uint32_t &out_lo, uint32_t &out_hi)
+    {
+        if constexpr (CodebookTraits<CODEBOOK_ID>::is_mxfp4_lut)
+        {
+            constexpr uint32_t kLut0 = 0x03020100u; // {0, 1, 2, 3}
+            constexpr uint32_t kLut1 = 0x0c080604u; // {4, 6, 8, 12}
+            constexpr uint32_t kLut2 = 0xfdfeff00u; // {0, -1, -2, -3}
+            constexpr uint32_t kLut3 = 0xf4f8fafcu; // {-4, -6, -8, -12}
+            const uint32_t halves = 0x32103210u | ((w >> 1) & 0x44444444u);
+            const uint32_t first = __byte_perm(
+                __byte_perm(kLut0, kLut1, w),
+                __byte_perm(kLut2, kLut3, w), halves);
+            const uint32_t last = __byte_perm(
+                __byte_perm(kLut0, kLut1, w >> 16),
+                __byte_perm(kLut2, kLut3, w >> 16), halves >> 16);
+            out_lo = __byte_perm(first, last, 0x6420);
+            out_hi = __byte_perm(first, last, 0x7531);
+        }
+        else
+        {
+            static_assert(CodebookTraits<CODEBOOK_ID>::is_iq4_lut);
+            iq4nl_decode_word(w, out_lo, out_hi);
+        }
+    }
+
     __device__ __forceinline__ uint32_t centered_sub_16(uint32_t value)
     {
         value ^= 0x80808080u;
@@ -530,14 +569,14 @@
                 packed_groups[g + 4] = static_cast<int32_t>(__vsub4(hi, 0x08080808u));
             }
         }
-        else if constexpr (CodebookTraits<CODEBOOK_ID>::is_iq4_lut)
+        else if constexpr (CodebookTraits<CODEBOOK_ID>::is_nibble_lut)
         {
             for (int g = 0; g < 4; ++g)
             {
                 const uint32_t raw = *reinterpret_cast<const uint32_t *>(payload + g * 4);
                 uint32_t lo = 0;
                 uint32_t hi = 0;
-                iq4nl_decode_word(raw, lo, hi);
+                nibble_lut_decode_word<CODEBOOK_ID>(raw, lo, hi);
                 packed_groups[g] = static_cast<int32_t>(lo);
                 packed_groups[g + 4] = static_cast<int32_t>(hi);
             }
@@ -731,7 +770,7 @@
                     packed_groups[g + 4] = static_cast<int32_t>(__vsub4(hi, 0x08080808u));
                 }
             }
-            else if constexpr (CodebookTraits<CODEBOOK_ID>::is_iq4_lut)
+            else if constexpr (CodebookTraits<CODEBOOK_ID>::is_nibble_lut)
             {
 #pragma unroll
                 for (int g = 0; g < 4; ++g)
@@ -739,7 +778,7 @@
                     const uint32_t raw = raws[g];
                     uint32_t lo = 0;
                     uint32_t hi = 0;
-                    iq4nl_decode_word(raw, lo, hi);
+                    nibble_lut_decode_word<CODEBOOK_ID>(raw, lo, hi);
                     packed_groups[g] = static_cast<int32_t>(lo);
                     packed_groups[g + 4] = static_cast<int32_t>(hi);
                 }

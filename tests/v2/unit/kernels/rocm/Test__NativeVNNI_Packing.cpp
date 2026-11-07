@@ -68,6 +68,9 @@ namespace
         {"IQ4_NL", 4, 16, false, false,
          [](size_t N, size_t K)
          { return TestTensorFactory::createIQ4_NLRandom({N, K}); }},
+        {"MXFP4", llaminar2::kNativeVnniMXFP4Codebook, 16, false, false,
+         [](size_t N, size_t K)
+         { return TestTensorFactory::createMXFP4Random({N, K}); }},
         {"Q4_1", 5, 16, true, false,
          [](size_t N, size_t K)
          { return TestTensorFactory::createQ4_1Random({N, K}); }},

@@ -11,7 +11,9 @@ The loader is intentionally strict. Every layer in every checked-in variant
 must belong to exactly one pattern, every LFS object must have immutable SHA256
 provenance, and NativeVNNI eligibility is recomputed from the canonical format
 registry. F16, BF16, MXFP4, or future formats remain visible all-format cases;
-they are never mislabeled as NativeVNNI or silently discarded.
+they are never mislabeled as tuning-sweepable or silently discarded. (MXFP4
+executes through NativeVNNI at runtime under IQ4_NL's installed policy, but it
+has no tuning-registry entry or corpus of its own, so it is not a sweep case.)
 """
 
 from __future__ import annotations
@@ -453,7 +455,7 @@ def qwen_moe_routed_prefill_cases() -> tuple[QwenMoERoutedPrefillCase, ...]:
     """Collapse full GGUF mixtures onto routed grouped-launch source keys.
 
     A full mixture whose shared expert uses BF16/F16/MXFP4 still has a valid
-    NativeVNNI routed path. Shared-expert execution is a dense GEMM surface, so
+    tuning-sweepable routed path. Shared-expert execution is a dense GEMM surface, so
     it must not suppress or duplicate grouped routed evidence.
     """
 
