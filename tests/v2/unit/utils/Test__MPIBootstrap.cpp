@@ -21,6 +21,9 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <unistd.h>
 #include <optional>
 #include <string>
 #include <vector>
@@ -406,4 +409,40 @@ TEST(Test__MPIBootstrap, ExistingMPIKeepsExplicitRankConfigurationWithoutRelaunc
     const auto result = MPIBootstrapPhase{}.execute(config, 1, argv);
     EXPECT_EQ(result.action, BootstrapResult::Action::CONTINUE);
     EXPECT_EQ(config.mpi_procs, 4);
+}
+
+/** @test GB10 workers start on X925 cores; homogeneous hosts keep CPU order. */
+TEST(Test__MPIBootstrap, ClusterWorkersOrderFastCoresFirst)
+{
+    namespace fs = std::filesystem;
+    const auto root = fs::temp_directory_path() /
+        ("llaminar-capacity-" + std::to_string(::getpid()));
+    // Recorded GB10 capacities: two clusters of five A725 (718/731) then five
+    // X925 (997..1024) cores.
+    const std::vector<long> gb10 = {718, 718, 718, 718, 718, 997, 997, 997, 997, 997,
+                                    731, 731, 731, 731, 731, 1017, 1017, 1017, 1017, 1024};
+    for (int cpu = 0; cpu < static_cast<int>(gb10.size()); ++cpu)
+    {
+        fs::create_directories(root / ("cpu" + std::to_string(cpu)));
+        std::ofstream(root / ("cpu" + std::to_string(cpu)) / "cpu_capacity") << gb10[cpu] << '\n';
+    }
+    std::vector<int> cpus(gb10.size());
+    for (int cpu = 0; cpu < static_cast<int>(cpus.size()); ++cpu)
+        cpus[static_cast<size_t>(cpu)] = cpu;
+    EXPECT_EQ(llaminar2::MPIBootstrapPhase::capacityOrderedCpus(cpus, root.string()),
+              (std::vector<int>{19, 15, 16, 17, 18, 5, 6, 7, 8, 9,
+                                10, 11, 12, 13, 14, 0, 1, 2, 3, 4}));
+    // Frequency is the fallback capacity; unknown topology keeps CPU order.
+    fs::remove_all(root);
+    for (int cpu = 0; cpu < 4; ++cpu)
+    {
+        fs::create_directories(root / ("cpu" + std::to_string(cpu)) / "cpufreq");
+        std::ofstream(root / ("cpu" + std::to_string(cpu)) / "cpufreq" / "cpuinfo_max_freq")
+            << (cpu % 2 ? 3900000 : 2808000) << '\n';
+    }
+    EXPECT_EQ(llaminar2::MPIBootstrapPhase::capacityOrderedCpus({0, 1, 2, 3}, root.string()),
+              (std::vector<int>{1, 3, 0, 2}));
+    EXPECT_EQ(llaminar2::MPIBootstrapPhase::capacityOrderedCpus({3, 2, 1, 0}, (root / "absent").string()),
+              (std::vector<int>{0, 1, 2, 3}));
+    fs::remove_all(root);
 }
