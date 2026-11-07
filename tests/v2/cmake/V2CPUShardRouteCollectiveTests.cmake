@@ -4,6 +4,10 @@
 The two-rank case proves the real original MPI/shared-memory lifecycle. Neither
 it nor device-free recorded partials certify full NUMA model serving or economy.
 ]]
+# Functional replay targets only; Release builds performance targets alone.
+if(V2_PERF_TESTS_ONLY)
+    return()
+endif()
 add_executable(v2_test_cpu_shard_route_collective unit/kernels/cpu/moe/Test__CPUShardRouteCollective.cpp)
 target_compile_features(v2_test_cpu_shard_route_collective PRIVATE cxx_std_20)
 target_include_directories(v2_test_cpu_shard_route_collective PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

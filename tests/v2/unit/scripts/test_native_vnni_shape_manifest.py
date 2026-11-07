@@ -853,6 +853,7 @@ class NativeVNNIShapeManifestTest(unittest.TestCase):
         }
         expected_shared_targets = {
             "v2_perf_cpu_native_vnni_gemv",
+            "v2_perf_cpu_native_neon_exact_overlay",
             "v2_test_native_vnni_shape_manifest_projection",
             "v2_perf_cuda_native_vnni_decode_trainer",
             "v2_perf_cuda_native_vnni_gemm",
