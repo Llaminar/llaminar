@@ -255,7 +255,12 @@ namespace llaminar2::test
         ClusterInventory inventory;
         inventory.world_size = 2;
         inventory.ranks.resize(2);
-        for (int index = 0; index < 2; ++index) inventory.ranks[index].rank = index;
+        for (int index = 0; index < 2; ++index)
+        {
+            inventory.ranks[index].rank = index;
+            inventory.ranks[index].node_id = 0; // Gathered inventories always name the node.
+            inventory.ranks[index].local_rank = index;
+        }
         const auto execution = resolveMoEExpertOverlayExecutionPlan(overlay,
             {.current_world_rank = rank, .world_size = 2});
         const auto policy = resolveMoEOverlayCapacityAdmissionPolicy(*overlay, config, 2, 2, 8);
