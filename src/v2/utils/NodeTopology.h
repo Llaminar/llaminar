@@ -27,7 +27,8 @@ namespace llaminar2
         int node_id;              ///< NUMA node ID (0-indexed)
         std::vector<int> cpu_ids; ///< CPUs in this NUMA node
         size_t memory_bytes;      ///< Total memory on this node
-        int socket_id;            ///< Physical socket this node belongs to
+        int socket_id;            ///< Dense socket index in [0, numSockets())
+        int physical_package_id = -1; ///< Raw sysfs physical_package_id (firmware numbering)
     };
 
     /**
@@ -62,6 +63,14 @@ namespace llaminar2
          * @return NodeTopology with detected configuration, or default single-socket if detection fails
          */
         static NodeTopology detect();
+
+        /**
+         * @brief Replace raw firmware package ids with dense socket indices.
+         * @param nodes Detected NUMA nodes whose socket_id holds the raw sysfs
+         *        physical_package_id; on return socket_id is the rank of that id
+         *        among the distinct packages and physical_package_id keeps it.
+         */
+        static void densifySocketIds(std::vector<NUMANode> &nodes);
 
         /**
          * Create topology from explicit configuration (for testing)
