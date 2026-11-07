@@ -9,6 +9,8 @@
  * Lazy frequency aging follows published logical accesses, never a wall clock.
  * Any source-authentication failure bars future owner/pin reads permanently.
  * Ordinary facade retirement alone keeps existing pinned bytes readable.
+ * Lookup-only responses may occupy detached free slots, with zero demand age
+ * or frequency credit. Such rows yield before every demand-owned resident.
  * Exclusive subordinate invalidation detaches the resident lookup before ACK;
  * old pins retain their exact bytes until the last reader releases the slot.
  * The existing processor owns channel sequence/admission authentication. Its
@@ -329,7 +331,10 @@ struct CpuAdaptiveImmutableRowCache::Impl {
     }
     /** @brief Observe actual logical reuse and maintain bounded probation/protected policy. */
     void touch(std::uint32_t slot) {
-        auto &s=slots()[slot];s.touched=clock;
+        auto &s=slots()[slot];const bool firstDemand=s.touched==0;s.touched=clock;
+        // A free-only speculative resident has not earned a prior demand access.
+        // Its first demand must match a cold admission: probation, not protection.
+        if(firstDemand){if(!s.pins)fix(s.heap_position);return;}
         if(s.protected_region)unlink(slot);else{s.protected_region=true;++protected_count;}
         s.previous=None;s.next=protected_head;if(protected_head!=None)slots()[protected_head].previous=slot;
         else protected_tail=slot;
@@ -382,17 +387,30 @@ struct CpuAdaptiveImmutableRowCache::Impl {
             else eligible(slot);
         }
     }
-    /** @brief Optionally retain an already complete response; failure never publishes half-filled bytes. */
-    void admit(std::uint64_t row,const std::byte *response) {
+    /** @brief Physical admission authority, independent of the caller's source-read purpose. */
+    enum class Admission { DemandReplacement, FreeOnlyUncredited };
+    /**
+     * @brief Retain complete native bytes under one typed, mutex-owned admission policy.
+     * @param row Authenticated original row. @param response Complete same-request native bytes.
+     * @param purpose Demand may replace eligible victims; lookup-only may use only genuinely free slots.
+     * @throws std::overflow_error Before publishing an exhausted physical slot generation.
+     *
+     * Logical demand clock is strictly positive before ordinary admission/touch.
+     * Ready touched0 therefore identifies uncredited speculative bytes without a
+     * new slot field. They remain probationary and must yield to real demand even
+     * when the bounded frequency sketch collides. Native pins retain precedence.
+     */
+    void admit(std::uint64_t row,const std::byte *response,Admission purpose=Admission::DemandReplacement) {
         if(!geometry.slots_)return;
         std::uint32_t slot;
         bool new_resident=true;
         if(free_head!=None){slot=free_head;free_head=slots()[slot].next;}
         else if(filled<geometry.slots_)slot=filled++;
         else {
+            if(purpose==Admission::FreeOnlyUncredited)return;
             if(!heap_size){++counters.all_pinned_responses;return;}
             slot=heap()[0];
-            if(frequency(row,false)<=frequency(slots()[slot].row,false)){++counters.admission_rejections;return;}
+            if(slots()[slot].touched!=0 && frequency(row,false)<=frequency(slots()[slot].row,false)){++counters.admission_rejections;return;}
             ineligible(slot);erase(slot);
             if(slots()[slot].protected_region){unlink(slot);--protected_count;}
             ++counters.evictions;new_resident=false;
@@ -400,7 +418,8 @@ struct CpuAdaptiveImmutableRowCache::Impl {
         auto &s=slots()[slot];
         if(s.generation==std::numeric_limits<std::uint64_t>::max())throw std::overflow_error("CPU row slot generation exhausted");
         std::memcpy(data(slot),response,geometry.extent_.rowBytes());
-        const auto generation=s.generation+1;s=Slot{};s.row=row;s.generation=generation;s.touched=clock;s.ready=true;
+        const auto generation=s.generation+1;s=Slot{};s.row=row;s.generation=generation;
+        s.touched=purpose==Admission::DemandReplacement?clock:0;s.ready=true;
         insert(slot);eligible(slot);++counters.admissions;if(new_resident)++counters.resident_rows;
     }
 };
@@ -589,9 +608,15 @@ CpuImmutableRowGatherObservation CpuAdaptiveImmutableRowCache::gatherImpl(
                 std::memcpy(out,destination.data()+plans[i].first*g.extent_.rowBytes(),g.extent_.rowBytes());
                 ++s.counters.duplicate_rows;
             }
-            // Lookup-only uses the same bounded response/source transaction.
-            // It earns no policy age, sketch credit, hot admission or eviction.
-            if(!demand)continue;
+            // Source bytes are now complete. Lookup-only can retain each unique
+            // initial miss only in genuinely free backing; it earns no demand
+            // clock, frequency, recency, protection, eviction or invalidation.
+            // The ordinary grant loop below pins any newly ready generation.
+            if(!demand){
+                if(plans[i].first==i && plans[i].initial_slot==None)
+                    s.admit(row,out,Impl::Admission::FreeOnlyUncredited);
+                continue;
+            }
             ++s.clock;
             if(grant && grant->intents_[i].intent==ImmutableRowReadIntent::ReadAndInvalidate) {
                 if(plans[i].first==i)s.invalidate(row);

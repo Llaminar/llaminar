@@ -353,8 +353,11 @@ void replayFutureSource(DeviceId device,bool sourceAfterAdoption=false)
             EXPECT_EQ(serviceAfter.nativeBytes-serviceBefore.nativeBytes,expectedSourceRows*file.row_bytes);
             EXPECT_EQ(cpuAfter.completed_rows-cpuBefore.completed_rows,expectedSourceRows);
             EXPECT_EQ(cpuAfter.completed_bytes-cpuBefore.completed_bytes,expectedSourceRows*file.row_bytes);
-            EXPECT_EQ(cpuAfter.admissions,cpuBefore.admissions);EXPECT_EQ(cpuAfter.evictions,cpuBefore.evictions);
-            EXPECT_EQ(cpuAfter.invalidations,cpuBefore.invalidations);EXPECT_EQ(cpuAfter.resident_rows,0u);
+            // Only the initial7/8 responses occupy genuinely free RAM slots.
+            // Full-cache unused9/10 forecasts cannot evict them or gain demand credit.
+            EXPECT_EQ(cpuAfter.admissions-cpuBefore.admissions,request==1?2u:0u);
+            EXPECT_EQ(cpuAfter.evictions,cpuBefore.evictions);
+            EXPECT_EQ(cpuAfter.invalidations,cpuBefore.invalidations);EXPECT_EQ(cpuAfter.resident_rows,2u);
         }
         parents={};producerGraph.clear();context.reset();transport.reset();local.reset();boundary.reset();
         service.reset();cpuCache=nullptr;provider.reset();roots={};join();closed=true;

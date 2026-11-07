@@ -9,6 +9,8 @@
  * Existing whole-tier serving retains its original owner and semantics.
  * Every variable-sized array is bounded and included once in the source-owned
  * PMA BOM. Returned pins retain storage/source/authority through final release.
+ * Lookup-only may retain complete bytes only in genuinely free RAM backing;
+ * those uncredited rows yield to demand and never replace demand residents.
  */
 #pragma once
 #include "loaders/ImmutableRowTable.h"
@@ -126,7 +128,7 @@ struct CpuImmutableRowGatherObservation final {
 /** @brief Read purpose, not a replacement policy or future transport capability. */
 enum class CpuImmutableRowCacheAccess : std::uint8_t {
     CurrentDemand, ///< Preserve the original frequency, recency and admission work.
-    FutureLookupOnly ///< Copy existing/native source bytes without replacement-policy credit.
+    FutureLookupOnly ///< Copy bytes and retain only in genuinely free RAM slots, without demand-policy credit.
 };
 /** @brief One exact native source and bounded CPU residency authority, with no public SSD-service escape. */
 class CpuAdaptiveImmutableRowCache final {
@@ -196,8 +198,9 @@ public:
      * @brief Copy through the same original source with an explicit read purpose.
      * @param ids Complete valid original row IDs, including duplicates.
      * @param destination Exact caller-owned native response bytes.
-     * @param access Current demand preserves existing policy; lookup-only never ages,
-     * touches, admits, evicts or invalidates hot rows.
+     * @param access Current demand preserves existing policy; lookup-only may retain
+     * complete native bytes only in free backing. It never ages/touches demand
+     * residents, credits frequency/protection, evicts, or invalidates a row.
      * @return Actual copy/source/window work and serialized operation ordinal;
      * lookup-only completion counts do not grant demand policy credit.
      * @throws std::exception For invalid purpose, subordinate access, invalid frame,
@@ -282,7 +285,7 @@ private:
     CpuImmutableRowGatherObservation gatherImpl(std::span<const std::int64_t> ids,
         std::span<std::byte> destination,const ReadGrant *grant);
     /**
-     * @brief Share byte/source work while lookup-only excludes replacement-policy mutations.
+     * @brief Share source work; lookup-only can retain free bytes but never replace demand residency.
      * @param ids Original validated row sequence; duplicate source reads coalesce.
      * @param destination Exact externally owned native response storage.
      * @param grant Original processor capability, absent for independent CPU reads.

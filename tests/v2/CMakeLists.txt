@@ -38394,3 +38394,14 @@ add_v2_test(V2_Integration_Qwen4ExpPrefillNextWindowReplay
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Qwen4Exp;Replay;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30 ENVIRONMENT ${QFN_HOST_ADAPTIVE_CPU_ENV})
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpPrefillNextWindowReplay)
+
+# Free-space speculative retention is not consumed-demand policy credit.
+if(TARGET v2_test_qwen4exp_primitives)
+    add_v2_test(V2_Integration_CpuImmutableLookupOnlyFreeRetentionReplay
+        COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+            --gtest_filter=CpuAdaptiveImmutableRowCache.LookupOnlyFreeRetentionNativeFormatReplay:CpuAdaptiveImmutableRowCache.LookupOnlyFreeResidentsYieldOnFirstDemandReplay:CpuAdaptiveImmutableRowCache.LookupOnlyFirstDemandMatchesColdProbationReplay:ImmutableLookupSubordinate.FutureLookupOnlyFreeRetentionUsesOriginalPinAndAckReplay
+            --gtest_repeat=20
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Loaders;Storage;Replay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30 ENVIRONMENT ${QFN_HOST_ADAPTIVE_CPU_ENV})
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CpuImmutableLookupOnlyFreeRetentionReplay)
+endif()

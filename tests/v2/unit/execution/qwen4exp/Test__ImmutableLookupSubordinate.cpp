@@ -1765,3 +1765,29 @@ TEST(ImmutableLookupSubordinate, ClosedOriginalGroupRequestFrontierRejectsStaleR
     })(), ::testing::ExitedWithCode(0), "");
 }
 }
+
+
+namespace llaminar2::qwen4exp {
+/** @test Free-only retained future rows use the existing acquired grant and exact ACK pin lifetime. */
+TEST(ImmutableLookupSubordinate, FutureLookupOnlyFreeRetentionUsesOriginalPinAndAckReplay) {
+    for(int replay=0;replay<20;++replay) {
+        Lane lane(DeviceId::cuda(0),3,0);
+        const std::array<std::int64_t,3> ids{3,7,7};
+        const std::array<Intent,3> future{{{Operation::FutureLookupOnly,0},{Operation::FutureLookupOnly,0},{Operation::FutureLookupOnly,0}}};
+        lane.publish(1,1,ids,future);ASSERT_EQ(lane.processor->poll(1),ImmutableLookupPoll::Completed);
+        lane.expectRows(ids);EXPECT_EQ(lane.cache->stats().admissions,2u);EXPECT_EQ(lane.cache->stats().resident_rows,2u);
+        auto pin=lane.processor->borrowSubordinateResponseRow(1);ASSERT_TRUE(pin);const auto generation=pin->generation();
+        lane.consume(1);std::atomic_ref(lane.ack().closedGeneration).store(1,std::memory_order_release);
+        EXPECT_TRUE(lane.processor->closed(1));
+        // The original packet pin is gone; this genuine read loan remains valid.
+        EXPECT_EQ(pin->generation(),generation);
+        EXPECT_EQ(std::memcmp(pin->bytes().data(),lane.file.bytes.data()+lane.file.source.file_offset+7*lane.layout.rowBytes(),lane.layout.rowBytes()),0);
+        lane.poison();const std::array<Intent,3> demand{};
+        lane.publish(2,2,ids,demand);ASSERT_EQ(lane.processor->poll(2),ImmutableLookupPoll::Completed);
+        lane.expectRows(ids);EXPECT_EQ(lane.cache->stats().evictions,0u);EXPECT_EQ(lane.cache->stats().admissions,2u);
+        lane.consume(2);std::atomic_ref(lane.ack().closedGeneration).store(2,std::memory_order_release);
+        EXPECT_TRUE(lane.processor->closed(2));pin.reset();
+        lane.cache->authenticateSource(); // Same owner remains reusable after exact original acknowledgements.
+    }
+}
+} // namespace llaminar2::qwen4exp

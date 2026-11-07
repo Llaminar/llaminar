@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <fcntl.h>
 #include <random>
+#include <numeric>
 #include <thread>
 #include <tuple>
 #include <unistd.h>
@@ -691,9 +692,12 @@ TEST(CpuAdaptiveImmutableRowCache, LookupOnlyReadsNeverCreditReplacementPolicy) 
         auto c=Cache::create(f.source,g,authority(g));
         auto control=Cache::create(f.source,g,authority(g));
         const auto bytes=f.source.rowBytes();std::vector<std::byte> out(8*bytes),expected(8*bytes);
-        const std::array<std::int64_t,2> seed{0,1};
-        c->gather(seed,std::span(out).first(2*bytes));
-        control->gather(seed,std::span(expected).first(2*bytes));
+        // Fill the actual cache: this control proves lookup-only never changes
+        // demand replacement policy, independently of free-space warming.
+        std::vector<std::int64_t> seed(std::max<std::size_t>(2,slots));
+        std::iota(seed.begin(),seed.end(),0);
+        c->gather(seed,std::span(out).first(seed.size()*bytes));
+        control->gather(seed,std::span(expected).first(seed.size()*bytes));
         auto pin=c->tryPinResident(1);auto twin_pin=control->tryPinResident(1);
         ASSERT_EQ(pin.has_value(),twin_pin.has_value());
         for(int replay=0;replay<20;++replay) {
@@ -733,8 +737,8 @@ TEST(CpuAdaptiveImmutableRowCache, LookupOnlyReadsNeverCreditReplacementPolicy) 
         if(pin)EXPECT_EQ(std::memcmp(pin->bytes().data(),f.original.data()+37+bytes,bytes),0);
         // A fresh owner resets operation scratch, not a parallel residency map.
         auto fresh=Cache::create(f.source,g,authority(g));
-        EXPECT_EQ(fresh->gather(seed,std::span(out).first(2*bytes),CpuImmutableRowCacheAccess::FutureLookupOnly).source_rows,2u);
-        EXPECT_EQ(fresh->stats().resident_rows,0u);
+        EXPECT_EQ(fresh->gather(seed,std::span(out).first(seed.size()*bytes),CpuImmutableRowCacheAccess::FutureLookupOnly).source_rows,seed.size());
+        EXPECT_EQ(fresh->stats().resident_rows,std::min<std::size_t>(slots,seed.size()));
         }
     }
     EXPECT_GT(covered, 0u);
@@ -742,4 +746,107 @@ TEST(CpuAdaptiveImmutableRowCache, LookupOnlyReadsNeverCreditReplacementPolicy) 
     EXPECT_EQ(covered + unsupported, embeddingVerifierFormats().size());
 }
 
+} // namespace llaminar2::test
+
+
+namespace llaminar2::test {
+/** @test Only genuinely free native backing may retain speculative bytes, for every original format. */
+TEST(CpuAdaptiveImmutableRowCache, LookupOnlyFreeRetentionNativeFormatReplay) {
+    std::size_t covered=0,unsupported=0;
+    for(const auto& entry:embeddingVerifierFormats()) {
+        SCOPED_TRACE(entry.label);const auto native=entry.create({2,256},1701);
+        std::optional<GGUFTensorType> format;
+        for(unsigned code=0;code<=unsigned(GGUFTensorType::BF16);++code)try{
+            if(ggufToTensorType(GGUFTensorType(code))==native->native_type()){format=GGUFTensorType(code);break;}
+        }catch(const std::invalid_argument&){}
+        if(!format){ASSERT_EQ(native->native_type(),TensorType::Q8_1);++unsupported;continue;}
+        ++covered;
+        for(const auto slots:{0u,1u,4u}) {
+            SCOPED_TRACE(slots);File f(*format,256);const auto g=Geometry::fromLayout(layout(f,slots),Host,8);
+            auto memory=authority(g);auto cache=Cache::create(f.source,g,memory);
+            const auto bytes=f.source.rowBytes();std::vector<std::byte> output(8*bytes);
+            const std::array<std::int64_t,1> demand{0};cache->gather(demand,std::span(output).first(bytes));
+            auto original=cache->tryPinResident(0);ASSERT_EQ(bool(original),slots!=0);
+            const auto generation=original?original->generation():0;
+            const std::array<std::int64_t,4> forecast{3,7,7,9};
+            const auto initial=cache->stats();
+            const auto first=cache->gather(forecast,std::span(output).first(4*bytes),CpuImmutableRowCacheAccess::FutureLookupOnly);
+            expectRows(f,forecast,std::span(output).first(4*bytes));
+            EXPECT_EQ(first.source_rows,3u);EXPECT_EQ(first.duplicate_rows,1u);
+            const auto retained=slots==4?3u:0u;
+            EXPECT_EQ(first.admissions,retained);EXPECT_EQ(first.evictions,0u);
+            EXPECT_EQ(cache->stats().resident_rows,initial.resident_rows+retained);
+            for(int replay=0;replay<20;++replay) {
+                const auto observed=cache->gather(forecast,std::span(output).first(4*bytes),CpuImmutableRowCacheAccess::FutureLookupOnly);
+                expectRows(f,forecast,std::span(output).first(4*bytes));
+                EXPECT_EQ(observed.admissions,0u);EXPECT_EQ(observed.evictions,0u);EXPECT_EQ(observed.invalidated_rows,0u);
+                EXPECT_EQ(observed.ram_rows,retained);EXPECT_EQ(observed.source_rows,3u-retained);
+                EXPECT_EQ(observed.duplicate_rows,1u);
+                EXPECT_EQ(claimed(memory,PhysicalMemoryOwner::ImmutableTableStorage),g.sourceBytes()+g.storageBytes());
+                EXPECT_EQ(claimed(memory,PhysicalMemoryOwner::ImmutableLookupStaging),g.executionBytes());
+            }
+            if(original){EXPECT_EQ(original->generation(),generation);expectRows(f,demand,original->bytes());}
+            auto warm=cache->tryPinResident(3);EXPECT_EQ(bool(warm),retained!=0);
+            cache->retire();cache.reset();
+            if(warm){const std::array<std::int64_t,1> id{3};expectRows(f,id,warm->bytes());}
+            warm.reset();original.reset();EXPECT_EQ(claimed(memory,PhysicalMemoryOwner::ImmutableTableStorage),0u);
+            EXPECT_EQ(claimed(memory,PhysicalMemoryOwner::ImmutableLookupStaging),0u);
+            auto reset=Cache::create(f.source,g,authority(g));
+            EXPECT_EQ(reset->gather(forecast,std::span(output).first(4*bytes),CpuImmutableRowCacheAccess::FutureLookupOnly).admissions,std::min(3u,slots));
+        }
+    }
+    EXPECT_EQ(unsupported,1u);EXPECT_EQ(covered+unsupported,embeddingVerifierFormats().size());
+}
+/** @test Recorded all-lane frequency collision cannot let uncredited bytes exclude actual demand. */
+TEST(CpuAdaptiveImmutableRowCache, LookupOnlyFreeResidentsYieldOnFirstDemandReplay) {
+    for(int replay=0;replay<20;++replay) {
+        File f;const auto g=Geometry::fromLayout(layout(f,1),Host,1);auto memory=authority(g);
+        auto cache=Cache::create(f.source,g,memory);std::vector<std::byte> output(f.source.rowBytes());
+        // Original counterexample79/99 collides in every canonical minimum-width lane.
+        // The old frequency gate rejects99 even though79 has never earned demand credit.
+        const std::array<std::int64_t,1> warm{79},demand{99},other{3};
+        EXPECT_EQ(cache->gather(warm,output,CpuImmutableRowCacheAccess::FutureLookupOnly).admissions,1u);
+        EXPECT_TRUE(cache->tryPinResident(79));
+        const auto consumed=cache->gather(demand,output);expectRows(f,demand,output);
+        EXPECT_EQ(consumed.admissions,1u);EXPECT_EQ(consumed.evictions,1u);EXPECT_EQ(consumed.admission_rejections,0u);
+        EXPECT_FALSE(cache->tryPinResident(79));auto pin=cache->tryPinResident(99);ASSERT_TRUE(pin);
+        const auto generation=pin->generation();const auto before=cache->stats();
+        const auto full=cache->gather(other,output,CpuImmutableRowCacheAccess::FutureLookupOnly);
+        expectRows(f,other,output);EXPECT_EQ(full.admissions,0u);EXPECT_EQ(full.evictions,0u);
+        EXPECT_EQ(cache->stats().all_pinned_responses,before.all_pinned_responses);
+        EXPECT_EQ(pin->generation(),generation);expectRows(f,demand,pin->bytes());
+        cache->retire();cache.reset();expectRows(f,demand,pin->bytes());pin.reset();EXPECT_EQ(claimed(memory,PhysicalMemoryOwner::ImmutableTableStorage),0u);
+            EXPECT_EQ(claimed(memory,PhysicalMemoryOwner::ImmutableLookupStaging),0u);
+    }
+}
+} // namespace llaminar2::test
+
+namespace llaminar2::test {
+/** @test Free warming cannot earn protection before the same cold demand history. */
+TEST(CpuAdaptiveImmutableRowCache, LookupOnlyFirstDemandMatchesColdProbationReplay) {
+    for(int replay=0;replay<20;++replay) {
+        File f;const auto g=Geometry::fromLayout(layout(f,2),Host,1);
+        auto cold=Cache::create(f.source,g,authority(g));
+        auto warm=Cache::create(f.source,g,authority(g));
+        std::vector<std::byte> output(f.source.rowBytes());
+        const std::array<std::int64_t,1> a{7},b{11},c{23};
+        EXPECT_EQ(warm->gather(a,output,CpuImmutableRowCacheAccess::FutureLookupOnly).admissions,1u);
+        for(auto* cache:{cold.get(),warm.get()}) {
+            cache->gather(a,output);expectRows(f,a,output);
+            cache->gather(b,output);expectRows(f,b,output);
+            auto pinA=cache->tryPinResident(a[0]),pinB=cache->tryPinResident(b[0]);
+            ASSERT_TRUE(pinA);ASSERT_TRUE(pinB);const auto ga=pinA->generation(),gb=pinB->generation();
+            // Demand frequency changes while original physical pins exclude both victims.
+            for(int i=0;i<2;++i){const auto work=cache->gather(c,output);EXPECT_EQ(work.admissions,0u);expectRows(f,c,output);}
+            EXPECT_EQ(pinA->generation(),ga);EXPECT_EQ(pinB->generation(),gb);
+            expectRows(f,a,pinA->bytes());expectRows(f,b,pinB->bytes());pinA.reset();pinB.reset();
+            const auto replaced=cache->gather(c,output);EXPECT_EQ(replaced.admissions,1u);EXPECT_EQ(replaced.evictions,1u);
+            // Both histories must evict oldest probation A, retaining newer probation B.
+            EXPECT_FALSE(cache->tryPinResident(a[0]));EXPECT_TRUE(cache->tryPinResident(b[0]));EXPECT_TRUE(cache->tryPinResident(c[0]));
+            for(int i=0;i<20;++i){const auto hit=cache->gather(b,output);EXPECT_EQ(hit.source_rows,0u);expectRows(f,b,output);}
+            for(std::int64_t row=40;row<56;++row){const std::array ids{row};cache->gather(ids,output);expectRows(f,ids,output);}
+            EXPECT_TRUE(cache->tryPinResident(b[0]));
+        }
+    }
+}
 } // namespace llaminar2::test
