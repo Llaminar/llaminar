@@ -26604,6 +26604,13 @@ if(NOT V2_PERF_TESTS_ONLY)
             --gtest_filter=Test__ModelMemoryProfile.FlashNext*:Test__ModelMemoryProfile.BF16InventoryKeepsExactNativeFormat:Test__ModelMemoryProfile.SelectedNativeByteTotalsPreserveEveryInventoryLane:Test__ModelMemoryProfile.NativeByteQueriesRejectSelectedOverflow
         LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Qwen4Exp;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS)
+    # Planning and graph construction share one dense FFN-width authority; the
+    # MoE router axis once under-admitted the Qwen3.6-35B-A3B CPU arena.
+    add_v2_test(V2_Integration_MoEDenseFFNWidthAuthority
+        COMMAND $<TARGET_FILE:v2_test_model_memory_profile>
+            --gtest_filter=Test__ModelMemoryProfile.FromGGUF_MoEDFFUsesSharedExpertNotRouterAxis:Test__ModelMemoryProfile.FromGGUF_InfersDFFFromTensorShapes
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;MoE;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS)
 endif()
 
 # Test: WeightMemoryEstimator — weight sizing with TP sharding and PP slicing
