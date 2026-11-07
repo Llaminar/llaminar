@@ -107,6 +107,33 @@ namespace llaminar2::test
         }
 
         /**
+         * @brief Return the complete source of parity movement certification.
+         *
+         * assertProductionParityMoEMovementEvidence delegates its counter
+         * mapping to the shared parityMoEMovementFacts helper. The scan reads
+         * both bodies, and returns empty unless the assertion really consumes
+         * that helper, so a counter cannot be satisfied by unused text.
+         */
+        std::string parityMovementEvidenceSource(const fs::path &root)
+        {
+            const std::string parity_base = readFile(root / "tests/v2/integration/parity/ParityTestBase.h");
+            const std::string evidence = readFile(root / "tests/v2/integration/parity/ParityRunnerEvidence.h");
+            const size_t start = parity_base.find("void assertProductionParityMoEMovementEvidence(");
+            const size_t end = start == std::string::npos ? start :
+                parity_base.find("void assertProductionParityMoEOwnerOrderEvidence(", start);
+            const size_t facts = evidence.find("inline std::array<float, 4> parityMoEMovementFacts(");
+            if (start == std::string::npos || end == std::string::npos || facts == std::string::npos)
+                return {};
+            const size_t facts_end = evidence.find("\n    }\n", facts);
+            if (facts_end == std::string::npos)
+                return {};
+            const std::string assertion = parity_base.substr(start, end - start);
+            if (assertion.find("parityMoEMovementFacts(records)") == std::string::npos)
+                return {};
+            return assertion + evidence.substr(facts, facts_end - facts);
+        }
+
+        /**
          * @brief Read a registration and its dedicated shared fixture sources.
          * @param registration Thin model registration beside node_overlay/.
          * @return Deterministically ordered source for architecture assertions.
@@ -4519,15 +4546,9 @@ namespace llaminar2::test
         const std::string framework = readFile(framework_path);
         const std::string parity_base = readFile(parity_base_path);
 
-        const size_t movement_start = parity_base.find(
-            "void assertProductionParityMoEMovementEvidence(");
-        const size_t movement_end = parity_base.find(
-            "void assertProductionParityMoEOwnerOrderEvidence(",
-            movement_start);
-        ASSERT_NE(movement_start, std::string::npos);
-        ASSERT_NE(movement_end, std::string::npos);
-        const std::string movement =
-            parity_base.substr(movement_start, movement_end - movement_start);
+        const std::string movement = parityMovementEvidenceSource(root);
+        ASSERT_FALSE(movement.empty())
+            << "Movement certification must consume parityMoEMovementFacts";
         for (const char *counter : {
                  "committed_expert_migrations",
                  "cpu_native_copy_bytes",
@@ -5102,19 +5123,10 @@ namespace llaminar2::test
             model_parity_definition.find(
                 ".request_every_decode_steps = 1"),
             std::string::npos);
-        const size_t movement_evidence_start =
-            generic_parity.find(
-                "void assertProductionParityMoEMovementEvidence(");
-        ASSERT_NE(movement_evidence_start, std::string::npos);
-        const size_t movement_evidence_end =
-            generic_parity.find(
-                "void assertProductionParityMoEOwnerOrderEvidence(",
-                movement_evidence_start);
-        ASSERT_NE(movement_evidence_end, std::string::npos);
         const std::string movement_evidence_body =
-            generic_parity.substr(
-                movement_evidence_start,
-                movement_evidence_end - movement_evidence_start);
+            parityMovementEvidenceSource(findRepoRoot());
+        ASSERT_FALSE(movement_evidence_body.empty())
+            << "Movement certification must consume parityMoEMovementFacts";
         for (const char *cumulative_counter : {
                  "committed_expert_migrations",
                  "device_rebalance_wave_copied_arrivals_total",
@@ -11465,10 +11477,18 @@ namespace llaminar2::test
             fabric_header.find("MoEExpertOwnerMap canonical_owner_map;"),
             std::string::npos)
             << "The terminal seal must carry the owner map represented by its banks";
+        // The registry owner now validates the seal's owner map itself; the
+        // runner must hand it the seal rather than any host snapshot.
         EXPECT_NE(
-            rebind.find("seal.canonical_owner_map"),
+            rebind.find(".replaceParticipantResidencyFromSeal(seal, *residency, &registry_error)"),
             std::string::npos)
             << "Registry rebinding must consume only the self-contained physical seal";
+        const std::string registry = readFile(root / "src/v2/loaders/ExpertGemmRegistry.cpp");
+        const std::string replacement = braceBalancedDeclarationRegion(
+            registry, "bool ExpertGemmRegistry::replaceParticipantResidencyFromSeal(");
+        ASSERT_FALSE(replacement.empty());
+        EXPECT_NE(replacement.find("seal.canonical_owner_map"), std::string::npos)
+            << "The registry replacement must take its owner map from the physical seal";
         EXPECT_EQ(
             rebind.find("moe_expert_overlay_residency_authority_"),
             std::string::npos)
