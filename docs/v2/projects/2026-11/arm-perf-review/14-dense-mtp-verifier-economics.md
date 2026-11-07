@@ -53,3 +53,7 @@ integer dot products; it amortizes weight bandwidth but not arithmetic.
 - `Perf__CPUNativeVNNI_ThreadScaling`, `Perf__CPUFusedVerifier`, SDOT against
   SMMLA, all formats, M = 2..16, per core class.
 - End-to-end 27B and 35B MTP off against dynamic, -n 256, unprofiled.
+- The MTP/admission test lanes are available for exhaustive debugging runs
+  (project owner, 2026-11-07: mostly for exhaustive debugging; freely runnable,
+  not intended as mandatory CI/CD gates) — use them for verifier-depth and
+  acceptance measurement without making them CI obligations.
