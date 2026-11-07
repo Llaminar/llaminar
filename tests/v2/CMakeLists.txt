@@ -18167,6 +18167,8 @@ add_v2_test(V2_Integration_CPU_NativeVNNI_PrefillHeuristic
 )
 foreach(V2_PREFILL_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
     v2_cpu_native_isa_runtime("${V2_PREFILL_ISA}" V2_PREFILL_RUNTIME_ISA)
+    # x86 four-row prefill grid with a separate Pairwise policy; ARM folds both into one native tile.
+    if(V2_CPU_TARGET_X86)
     add_v2_test(V2_Integration_CPU_NativeVNNI_PrefillFourRows_${V2_PREFILL_ISA}
         COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
                 --gtest_filter=CPUNativeVNNIGemvTest.NativeVNNIPrefillFourRowsAllFormatsMatchSerialRows
@@ -18175,6 +18177,7 @@ foreach(V2_PREFILL_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
         MPI_PROCS 1
         NO_MODELS
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_PREFILL_RUNTIME_ISA}")
+    endif()
     add_v2_test(V2_Integration_CPU_NativeVNNI_PrefillWaveBalancing_${V2_PREFILL_ISA}
         COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
                 --gtest_filter=CPUNativeVNNIGemvTest.NativeVNNIPrefillWaveBalancingAllFormatsMatchesSerialRows
@@ -18228,6 +18231,9 @@ add_v2_test(V2_Integration_CPU_NativeVNNI_PrefillCacheKTile_AVX2
 )
 endif()
 foreach(V2_FUSED_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
+    if(NOT V2_CPU_TARGET_X86)
+        continue() # Forces x86 full-K schedules; ARM rejects x86-only candidates.
+    endif()
     v2_cpu_native_isa_runtime("${V2_FUSED_ISA}" V2_FUSED_RUNTIME_ISA)
     add_v2_test(V2_Integration_CPU_FusedVerifierSchedules_${V2_FUSED_ISA}
         COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
