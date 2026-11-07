@@ -34,10 +34,17 @@ Committed on the branch since the rebase:
 
 Real-hardware results so far:
 
-- **Spark GB10, first complete-engine build** (K14 source, GCC 14 SDK, build
-  only): configure passed; the build stopped at missing NEON Q8 leaves, now
-  fixed. Peak build memory 33.6 GiB. The generalized commit-based build tooling
-  is rerunning on the current head.
+- **Spark GB10 complete-engine builds** (GCC 14 SDK, Integration, build
+  only). The first stopped at missing NEON Q8 leaves (now fixed). The second
+  (`1472f1341`, keep-going) linked `libllaminar2_core` and the `llaminar2`
+  application on aarch64; 22 test translation units failed on x86-only test
+  code, and the remaining links ran out of disk. Measured needs for the full
+  app-plus-both-gates Integration build: about 322 GiB of build tree and
+  106 GiB peak memory at 20 jobs, so gate builds now run in two phases.
+  All 22 test units were ported (NEON checks replace x86 chunk leaves, x86-only
+  fixtures are x86-gated, the scalar NativeVNNI oracle is shared) and compile
+  in a local aarch64 GCC 14 container; ISA-forced test cells now register
+  `neon`/`neon-dotprod` on ARM instead of a fatal `avx2`.
 - **x86 (7800X3D, GCC 14 SDK) portability suite** on the RMS head: AVX2 builds
   clean and all tests pass when not oversubscribed; whole-team timeouts and one
   GCC 14 AVX512 warning led to the accounting/sharding fixes above. The current
