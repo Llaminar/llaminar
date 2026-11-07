@@ -1121,6 +1121,39 @@ namespace llaminar2::cpu::native_vnni
                         /*n=*/0,
                         k,
                         static_cast<int>(projections.size()));
+#if defined(__aarch64__) && defined(__ARM_NEON)
+                    // The NEON programs are core-free and publish nothing; the
+                    // kernel records the native schedule each member executed,
+                    // with the same counter the x86 layer-global launcher uses.
+                    if (PerfStatsCollector::isDomainEnabled("kernel"))
+                    {
+                        const auto executed = planNativeVNNIFusedRows(
+                            std::span<const FusedVerifierRowsDesc>(fused_descs.data(), projections.size()),
+                            live_rows, nativeVNNIInvocationWorkerCount(), ISAPath::AUTO);
+                        for (int member = 0; member < executed.count; ++member)
+                        {
+                            const int tile_rows = executed.tiles[member] == NEONProjectionRowTile::Pair ? 2 : 4;
+                            const int chunks = (fused_descs[member].packed->N_padded / 64);
+                            const int n_block = executed.chunks[member];
+                            const auto producer_tasks =
+                                std::int64_t((executed.rows[member] + tile_rows - 1) / tile_rows) *
+                                ((chunks + n_block - 1) / n_block);
+                            PerfStatsCollector::addCounter(
+                                "kernel", "cpu_native_vnni_fused_verifier_rows_projection_launch", 1.0, "gemm", "cpu",
+                                PerfStatsCollector::Tags{
+                                    {"m", std::to_string(executed.rows[member])},
+                                    {"n", std::to_string(fused_descs[member].N)},
+                                    {"k", std::to_string(k)},
+                                    {"route", "native_neon_shared_rows"},
+                                    {"task_grid", "row_tile_n_block"},
+                                    {"physical_row_tile", std::to_string(tile_rows)},
+                                    {"n_block_chunks", std::to_string(n_block)},
+                                    {"bundle_scheduler", "layer_global_full_k"},
+                                    {"producer_tasks", std::to_string(producer_tasks)},
+                                    {"reduction_tasks", "0"}});
+                        }
+                    }
+#endif
                     if (PerfStatsCollector::isDomainEnabled("kernel"))
                     {
                         PerfStatsCollector::addCounter(

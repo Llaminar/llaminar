@@ -8518,14 +8518,14 @@ namespace llaminar2::cpu::native_vnni
         auto accumulate = [&]() {
 #pragma omp for simd schedule(static)
             for (size_t i = 0; i < elements; ++i)
-                C[i] = alpha * product_storage[i] + beta * C[i];
+                C[i] = std::fma(alpha, product_storage[i], beta * C[i]);
         };
         if (omp_in_parallel()) accumulate();
         else
         {
 #pragma omp simd
             for (size_t i = 0; i < elements; ++i)
-                C[i] = alpha * product_storage[i] + beta * C[i];
+                C[i] = std::fma(alpha, product_storage[i], beta * C[i]);
         }
     }
 
