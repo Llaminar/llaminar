@@ -11,6 +11,7 @@
  */
 
 #include "backends/IBackend.h"
+#include "execution/moe/MoEOverlaySparseCollective.h"
 #include "transfer/TransferEngine.h"
 #include "transfer/BackgroundTransferProgressBinding.h"
 #include "transfer/TransferProducerDependency.h"
@@ -25,6 +26,13 @@
 #include "../../mocks/MockWorkerGPUContext.h"
 
 #include <array>
+#include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -106,8 +114,24 @@ namespace
             ++mapped_allocate_count;
             mapped_allocation_bytes = bytes;
             mapped_allocation_ordinal = device_id;
-            void *const allocation =
-                MockBackend::allocateMapped(bytes, device_id, device_ptr);
+            // Only the page-write economy fixture selects this branch. Each
+            // native-API-double allocation then owns complete aligned pages;
+            // protection never reaches malloc metadata or another allocation.
+            void *allocation = nullptr;
+            if (page_aligned_mapped_storage)
+            {
+                const auto page = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+                if (!page || bytes % page != 0u)
+                    throw std::invalid_argument("Fixture mapped storage requires whole pages");
+                allocation = std::aligned_alloc(page, bytes);
+                if (allocation)
+                {
+                    page_allocations_.emplace(allocation, bytes);
+                    std::memset(allocation, 0xa7, bytes); // Native memory is not assumed initially zero.
+                }
+                if (device_ptr) *device_ptr = allocation;
+            }
+            else allocation = MockBackend::allocateMapped(bytes, device_id, device_ptr);
             if (force_null_mapped_alias && device_ptr)
                 *device_ptr = nullptr;
             mapped_allocation_host = allocation;
@@ -149,7 +173,25 @@ namespace
             ++mapped_free_count;
             mapped_free_host = host_ptr;
             mapped_free_ordinal = device_id;
-            MockBackend::freeMapped(host_ptr, device_id);
+            if (page_allocations_.erase(host_ptr)) std::free(host_ptr);
+            else MockBackend::freeMapped(host_ptr, device_id);
+        }
+
+        /**
+         * @brief Authenticate that a protection range lies wholly in fixture-owned pages.
+         * @param address First byte of the proposed page range.
+         * @param bytes Complete protected byte count.
+         * @return True only for one exact live page-aligned API-double allocation.
+         */
+        bool ownsPages(const void* address, size_t bytes) const
+        {
+            const auto start = reinterpret_cast<std::uintptr_t>(address);
+            for (const auto& [base, capacity] : page_allocations_)
+            {
+                const auto first = reinterpret_cast<std::uintptr_t>(base);
+                if (start >= first && start-first <= capacity && bytes <= capacity-(start-first)) return true;
+            }
+            return false;
         }
 
         /** @brief Return the deterministic alias belonging to one exact ordinal. */
@@ -294,6 +336,7 @@ namespace
         MappedTransferWakeState service_wake_value =
             MappedTransferWakeState::InferenceComplete;
         MappedTransferServiceRun service_run = MappedTransferServiceRun::FinitePass;
+        bool page_aligned_mapped_storage = false; ///< Fixture-only dedicated pages, poisoned before TransferEngine initialization.
         bool force_null_mapped_alias = false;
         std::function<void()> before_mapped_free;
         bool registration_succeeds = true;
@@ -326,6 +369,7 @@ namespace
         std::vector<MappedProgressCall> progress_calls;
 
     private:
+        std::map<void*, size_t> page_allocations_; ///< Exact fixture native-allocation records; no production admission role.
         std::uintptr_t alias_bias_ = 0u;
         const bool *lifetime_released_ = nullptr;
     };
@@ -378,6 +422,12 @@ namespace
             g_cuda_backend = nullptr;
             g_rocm_backend = nullptr;
         }
+
+        /**
+         * @brief Bind the real GPU-shaped ticket while fresh payload-only pages are read-only.
+         * @param device Exact recorded CUDA/ROCm endpoint; no native GPU work is executed.
+         */
+        void proveFreshTicketDoesNotRetouchPayload(DeviceId device);
 
         alignas(64) std::array<std::byte, 1024> pages_{};
         bool lifetime_released_ = false;
@@ -1140,3 +1190,135 @@ TEST_F(Test__MappedHostTransferRegion, LocalReadyClaimFollowsOriginalSourceAndAl
     auto retirement = GPUDeviceContextPool::instance().beginExclusiveGenerationRetirement(device);
     Access::physicalReset(retirement);
 }
+
+
+/** @test Monotonic slices remain byte-zero after earlier slices are dirty and backing growth occurs. */
+TEST_F(Test__MappedHostTransferRegion, ArenaFreshSlicesStayZeroAfterDirtyNeighborsAndGrowth)
+{
+    cuda_->page_aligned_mapped_storage = rocm_->page_aligned_mapped_storage = true;
+    cuda_->portable_mapped_supported = rocm_->portable_mapped_supported = true;
+    for (const std::vector<DeviceId> devices : {
+             std::vector{DeviceId::cuda(0)}, std::vector{DeviceId::rocm(0)},
+             std::vector{DeviceId::cuda(0),DeviceId::cuda(1)},
+             std::vector{DeviceId::rocm(0),DeviceId::rocm(1)},
+             std::vector{DeviceId::cuda(0),DeviceId::rocm(0)}})
+    {
+        auto arena = engine_.createMappedHostArena(devices);
+        std::vector<std::shared_ptr<MappedHostTransferRegion>> slices;
+        for (const size_t bytes : {size_t{17},size_t{8192},size_t{65},size_t{32768},size_t{513}})
+        {
+            auto fresh = arena->allocate(bytes,64);
+            const auto* begin = static_cast<const std::byte*>(fresh->mutableHostData());
+            EXPECT_TRUE(std::all_of(begin,begin+bytes,[](std::byte b){return b==std::byte{};}));
+            for (const auto& prior : slices)
+            {
+                const auto* p=static_cast<const std::byte*>(prior->mutableHostData());
+                EXPECT_TRUE(std::all_of(p,p+prior->sizeBytes(),[](std::byte b){return b==std::byte{0x5c};}));
+            }
+            std::memset(fresh->mutableHostData(),0x5c,bytes);
+            slices.push_back(std::move(fresh));
+        }
+        EXPECT_GT(arena->snapshot().backing_region_count,1u);
+        auto retained=slices.front();slices.clear();arena.reset();
+        const auto* p=static_cast<const std::byte*>(retained->mutableHostData());
+        EXPECT_TRUE(std::all_of(p,p+retained->sizeBytes(),[](std::byte b){return b==std::byte{0x5c};}));
+    }
+}
+
+/** @test Actual CPU/GPU-shaped ticket construction and publication reset retain fresh payload bytes. */
+TEST_F(Test__MappedHostTransferRegion, MappedDispatchTicketFreshPayloadAndPublicationLifecycle)
+{
+    cuda_->page_aligned_mapped_storage = rocm_->page_aligned_mapped_storage = true;
+    for (const auto device : {DeviceId::cpu(),DeviceId::cuda(0),DeviceId::rocm(0)})
+    {
+        std::shared_ptr<MappedHostTransferArena> arena;
+        if(device.is_gpu())arena=engine_.createMappedHostArena(std::array{device});
+        MoEOverlayDispatchTicketStorage storage;
+        storage.bindFixedCapacity(3,17,2,64,device,7,arena);
+        ASSERT_TRUE(storage.hasValidBoundIdentity());
+        const auto& ticket=storage.ticket();
+        for(const auto* data:{ticket.routing_indices_fp32,ticket.routing_weights_fp32})
+            EXPECT_TRUE(std::all_of(data,data+34,[](float x){return x==0.f;}));
+        for(const auto* data:{ticket.hidden_rows_fp32,ticket.return_rows_fp32})
+            EXPECT_TRUE(std::all_of(data,data+17*64,[](float x){return x==0.f;}));
+        EXPECT_EQ(ticket.header->residency_epoch,0u);
+        EXPECT_EQ(ticket.header->return_logical_row_count,0);
+        EXPECT_THROW(storage.bindFixedCapacity(3,17,2,64,device,7,arena),std::logic_error);
+        ticket.hidden_rows_fp32[0]=19.f;ticket.return_rows_fp32[17*64-1]=23.f;
+        if(device.is_gpu())
+        {
+            auto* spy=device.is_cuda()?cuda_.get():rocm_.get();
+            // The fixture's resolver owns these API-double pages; the real
+            // singleton TransferEngine must not silently adopt that backend.
+            // Positive native publication belongs to the existing GPU fixture.
+            std::string error;
+            EXPECT_FALSE(storage.enqueueCapturedPublication(reinterpret_cast<void*>(0x12340),&error));
+            EXPECT_NE(error.find("mapped 64-bit timeline publication"),std::string::npos);
+            EXPECT_TRUE(spy->timeline_calls.empty());
+            for(unsigned repeat=0;repeat<20;++repeat)
+            {
+                ASSERT_TRUE(storage.armCapturedPublication());
+                EXPECT_TRUE(storage.hasValidBoundIdentity());
+                EXPECT_EQ(ticket.hidden_rows_fp32[0],19.f);
+                EXPECT_EQ(ticket.return_rows_fp32[17*64-1],23.f);
+            }
+            EXPECT_EQ(spy->getSyncCount(),0u);EXPECT_EQ(spy->getStreamSyncCount(),0u);
+        }
+        else EXPECT_TRUE(storage.armCapturedPublication());
+    }
+}
+
+namespace {
+/** @brief Restore fixture-owned page access before its original mapped owner can be released. */
+class ReadOnlyFixturePages final
+{
+public:
+    /**
+     * @brief Protect only an authenticated complete interior page range.
+     * @param address Page-aligned address in a live dedicated backend-spy allocation.
+     * @param bytes Positive page-multiple length wholly contained in that allocation.
+     */
+    ReadOnlyFixturePages(void* address,size_t bytes):address_(address),bytes_(bytes)
+    {if(::mprotect(address_,bytes_,PROT_READ)!=0)throw std::runtime_error("Fixture payload read-only protection failed");}
+    /** @brief Always restore write permission before arena/backend destruction, including test failure. */
+    ~ReadOnlyFixturePages()
+    {if(::mprotect(address_,bytes_,PROT_READ|PROT_WRITE)!=0)std::terminate();}
+    ReadOnlyFixturePages(const ReadOnlyFixturePages&)=delete;
+    ReadOnlyFixturePages& operator=(const ReadOnlyFixturePages&)=delete;
+private:
+    void* address_;size_t bytes_;
+};
+}
+void Test__MappedHostTransferRegion::proveFreshTicketDoesNotRetouchPayload(DeviceId device)
+{
+    auto* spy=device.is_cuda()?cuda_.get():rocm_.get();spy->page_aligned_mapped_storage=true;
+    const auto page=static_cast<size_t>(::sysconf(_SC_PAGESIZE));ASSERT_GT(page,0u);
+    auto arena=engine_.createMappedHostArena(std::array{device});
+    auto first=arena->allocate(8*page,1);auto second=arena->allocate(8*page,1);
+    std::memset(first->mutableHostData(),0x4b,first->sizeBytes());
+    std::memset(second->mutableHostData(),0x4b,second->sizeBytes());
+    auto anchor=arena->allocate(page,1);ASSERT_EQ(arena->snapshot().backing_region_count,3u);
+    auto* expected=static_cast<std::byte*>(anchor->mutableHostData())+page;
+    ASSERT_EQ(reinterpret_cast<std::uintptr_t>(expected)%64u,0u);
+    auto* protectedBegin=expected+2*page;const auto protectedBytes=2*page;
+    ASSERT_EQ(reinterpret_cast<std::uintptr_t>(protectedBegin)%page,0u);
+    ASSERT_TRUE(spy->ownsPages(protectedBegin,protectedBytes));
+    ReadOnlyFixturePages protection(protectedBegin,protectedBytes);
+    MoEOverlayDispatchTicketStorage storage;
+    // The literal old second full memset faults on these already-zero interior
+    // pages. Header and publication stores are outside the protected payload.
+    storage.bindFixedCapacity(2,64,2,64,device,9,arena);
+    ASSERT_EQ(static_cast<void*>(storage.ticket().header),expected);
+    ASSERT_GT(storage.allocationBytes(),4*page);
+    EXPECT_TRUE(storage.hasValidBoundIdentity());
+    EXPECT_TRUE(std::all_of(protectedBegin,protectedBegin+protectedBytes,[](std::byte b){return b==std::byte{};}));
+    EXPECT_EQ(*static_cast<const std::byte*>(first->mutableHostData()),std::byte{0x4b});
+    EXPECT_EQ(*static_cast<const std::byte*>(second->mutableHostData()),std::byte{0x4b});
+    EXPECT_EQ(arena->snapshot().backing_region_count,3u);
+}
+/** @test CUDA-shaped actual binder does not rewrite the fresh GPU mapped payload. */
+TEST_F(Test__MappedHostTransferRegion, CUDAMappedDispatchTicketDoesNotRetouchFreshPayloadPages)
+{proveFreshTicketDoesNotRetouchPayload(DeviceId::cuda(0));}
+/** @test ROCm-shaped actual binder has identical fresh-zero and publication ownership. */
+TEST_F(Test__MappedHostTransferRegion, ROCmMappedDispatchTicketDoesNotRetouchFreshPayloadPages)
+{proveFreshTicketDoesNotRetouchPayload(DeviceId::rocm(0));}

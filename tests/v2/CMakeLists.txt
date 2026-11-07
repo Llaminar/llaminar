@@ -9551,6 +9551,16 @@ add_v2_test(V2_Unit_PreparedWeightStore
     MPI_PROCS 1
 )
 
+# Actual model-owned prepared store candidate lookup, replacement and teardown contract.
+add_v2_test(V2_Integration_PreparedWeightAdoptionIndexedLifecycle
+    COMMAND $<TARGET_FILE:v2_unit_prepared_weight_store>
+        --gtest_filter=Test__PreparedWeightStore.IndexedAdoptionReplacementResetAndAliasLifetime:Test__PreparedWeightStore.IndexedCandidatesKeepKindDeviceAndOriginalIdentity
+        --gtest_repeat=20
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Loaders;Weights;Ownership;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PreparedWeightAdoptionIndexedLifecycle)
+
 add_executable(v2_unit_prepared_weight_store_expert_slab unit/loaders/Test__PreparedWeightStore_ExpertSlab.cpp)
 target_link_libraries(v2_unit_prepared_weight_store_expert_slab llaminar2_core GTest::gtest_main)
 add_v2_test(V2_Unit_PreparedWeightStoreExpertSlab
@@ -32690,6 +32700,14 @@ add_v2_test(V2_Integration_CPUMappedPublicationPhysicalOwnership
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUMappedPublicationPhysicalOwnership)
+add_v2_test(V2_Integration_MappedDispatchTicketFreshZeroAllocation
+    COMMAND $<TARGET_FILE:v2_unit_mapped_host_transfer_region>
+        --gtest_filter=Test__MappedHostTransferRegion.ArenaFreshSlicesStayZeroAfterDirtyNeighborsAndGrowth:Test__MappedHostTransferRegion.MappedDispatchTicketFreshPayloadAndPublicationLifecycle:Test__MappedHostTransferRegion.*MappedDispatchTicketDoesNotRetouchFreshPayloadPages
+        --gtest_repeat=20
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;Transfer;Ownership;Economy;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MappedDispatchTicketFreshZeroAllocation)
 add_v2_test(V2_Integration_NgramLocalReadyPhysicalOwnership
     COMMAND $<TARGET_FILE:v2_unit_mapped_host_transfer_region>
         --gtest_filter=Test__MappedHostTransferRegion.LocalReadyClaimFollowsOriginalSourceAndAliasRetirement
@@ -38405,3 +38423,13 @@ if(TARGET v2_test_qwen4exp_primitives)
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30 ENVIRONMENT ${QFN_HOST_ADAPTIVE_CPU_ENV})
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CpuImmutableLookupOnlyFreeRetentionReplay)
 endif()
+
+# Actual private registry hash/lookup economy on representative original key geometry.
+add_v2_test(V2_Integration_ExpertGemmRegistryHashDistribution
+    COMMAND $<TARGET_FILE:v2_unit_expert_gemm_registry>
+        --gtest_filter=ExpertGemmRegistryHash.* --gtest_brief=1
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Loaders;MoE;Regression;Configuration"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1"
+)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ExpertGemmRegistryHashDistribution)

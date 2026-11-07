@@ -942,8 +942,14 @@ namespace llaminar2
          * @brief Allocate one graph-stable mapped slice.
          *
          * The returned region has the arena's exact endpoint set and retains
-         * its backing mapping independently of the arena object. The call may
-         * allocate a new mapped slab and is therefore setup-only; callers
+         * its backing mapping independently of the arena object. Every byte of
+         * a newly returned slice is zero: backing creation initializes and
+         * first-touches the complete mapping, and monotonic allocation never
+         * returns a previously issued slice or overlaps live/past slices.
+         * Callers still initialize their typed headers and atomic publication
+         * words explicitly; this contract does not clear an existing slice on
+         * request reset or change the caller's original NUMA placement.
+         * The call may allocate a new mapped slab and is therefore setup-only; callers
          * must never invoke it from capture or live inference.
          *
          * @param bytes Positive logical capacity of the slice.

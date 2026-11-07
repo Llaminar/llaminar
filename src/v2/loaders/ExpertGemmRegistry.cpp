@@ -11,6 +11,7 @@
 
 #include "ExpertGemmRegistry.h"
 #include "PreparedWeightStore.h"
+#include "utils/FNV1a.h"
 #include "execution/moe/MoEOverlayPhysicalResidencyFabric.h"
 #include "tensors/NativeWeightSourceRange.h"
 #include "execution/moe/CPUExpertShardSourceSelection.h"
@@ -375,16 +376,27 @@ namespace llaminar2
                participant_index == other.participant_index;
     }
 
+    /**
+     * @brief Mix the ordered registry identity without device-name formatting.
+     * @param k Complete original domain/device/layer/expert/role/participant key.
+     * @return Metadata hash; equality remains the sole identity decision.
+     */
     size_t ExpertGemmRegistry::KeyHash::operator()(const Key &k) const
     {
-        size_t hash = std::hash<std::string>{}(k.domain_name);
-        hash ^= std::hash<std::string>{}(k.device.to_string()) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
-        hash ^= std::hash<int>{}(k.layer) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
-        hash ^= std::hash<int>{}(k.expert) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
-        hash ^= std::hash<uint8_t>{}(static_cast<uint8_t>(k.role)) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
-        hash ^= std::hash<int>{}(k.participant_world_rank) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
-        hash ^= std::hash<int>{}(k.participant_index) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
-        return hash;
+        // Hash only ordered identity metadata. Small adjacent expert/layer/role
+        // integers collide under shift/add combination; ordered word mixing preserves
+        // their boundaries and avoids allocating a formatted device string.
+        const std::uint64_t words[]{
+            static_cast<std::uint64_t>(k.device.type),
+            static_cast<std::uint64_t>(k.device.ordinal),
+            static_cast<std::uint64_t>(k.layer),
+            static_cast<std::uint64_t>(k.expert),
+            static_cast<std::uint64_t>(k.role),
+            static_cast<std::uint64_t>(k.participant_world_rank),
+            static_cast<std::uint64_t>(k.participant_index)};
+        std::uint64_t hash=std::hash<std::string>{}(k.domain_name);
+        for(const auto word:words)hash=(hash^word)*kFNV1a64Prime;
+        return static_cast<size_t>(hash);
     }
 
     void ExpertGemmRegistry::registerEngine(DeviceId device, int layer, int expert, WeightRole role,

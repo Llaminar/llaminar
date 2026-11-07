@@ -8,6 +8,8 @@
 #include "../tensors/TensorClasses.h"
 #include "../tensors/TensorKernels.h"
 
+#include <algorithm>
+#include <type_traits>
 #include <stdexcept>
 #include <limits>
 #include <unordered_set>
@@ -284,7 +286,7 @@ namespace llaminar2
         stored.prepared = ref;
 
         std::lock_guard<std::mutex> lock(mutex_);
-        entries_[keyFor(ref)] = Entry{std::move(stored), ref, std::move(owned), memory_owner};
+        publishGemmEntry(keyFor(ref), Entry{std::move(stored), ref, std::move(owned), memory_owner});
         WeightLifecycleTrace::record(
             WeightLifecycleEventType::RegisterPrepared,
             binding.identity.canonical_name,
@@ -306,7 +308,7 @@ namespace llaminar2
         stored.prepared = ref;
 
         std::lock_guard<std::mutex> lock(mutex_);
-        entries_[keyFor(ref)] = Entry{std::move(stored), ref, nullptr};
+        publishGemmEntry(keyFor(ref), Entry{std::move(stored), ref, nullptr});
         WeightLifecycleTrace::record(
             WeightLifecycleEventType::RegisterPrepared,
             binding.identity.canonical_name,
@@ -344,7 +346,7 @@ namespace llaminar2
             stored.tensor->publishPreparedDeviceState();
 
         std::lock_guard<std::mutex> lock(mutex_);
-        entries_[keyFor(ref)] = Entry{std::move(stored), ref, std::move(handle), memory_owner};
+        publishGemmEntry(keyFor(ref), Entry{std::move(stored), ref, std::move(handle), memory_owner});
         WeightLifecycleTrace::record(
             WeightLifecycleEventType::RegisterPrepared,
             binding.identity.canonical_name,
@@ -353,6 +355,56 @@ namespace llaminar2
             device,
             toString(kind));
         return ref;
+    }
+
+    void PreparedWeightStore::removeGemmMembership(const AdoptionNameKey& name,
+        AdoptionTensorKey tensor, PreparedBindingKey key) noexcept
+    {
+        const auto remove = [&](auto& index, const auto& lookup) {
+            const auto found = index.find(lookup);
+            if (found == index.end()) return;
+            auto& keys = found->second;
+            const auto member = std::find(keys.begin(), keys.end(), key);
+            if (member != keys.end()) keys.erase(member);
+            if (keys.empty()) index.erase(found);
+        };
+        if (!name.name.empty()) remove(adoption_names_, name);
+        if (tensor.tensor) remove(adoption_tensors_, tensor);
+    }
+
+    void PreparedWeightStore::publishGemmEntry(PreparedBindingKey key, Entry entry)
+    {
+        static_assert(std::is_nothrow_move_assignable_v<Entry>);
+        const AdoptionNameKey name{entry.binding.identity.canonical_name, key.device};
+        const AdoptionTensorKey tensor{entry.binding.tensor, key.device};
+        const auto old = entries_.find(key);
+        // Copy all potentially allocating old metadata before touching the store.
+        const AdoptionNameKey old_name{old == entries_.end() ? std::string{} : old->second.binding.identity.canonical_name, key.device};
+        const AdoptionTensorKey old_tensor{old == entries_.end() ? nullptr : old->second.binding.tensor, key.device};
+        const AdoptionNameKey absent_name{{}, key.device};
+        bool name_added = false, tensor_added = false;
+        try {
+            if (!name.name.empty()) {
+                auto [bucket, inserted] = adoption_names_.try_emplace(name);
+                try { bucket->second.push_back(key); }
+                catch (...) { if (inserted) adoption_names_.erase(bucket); throw; }
+                name_added = true;
+            }
+            if (tensor.tensor) {
+                auto [bucket, inserted] = adoption_tensors_.try_emplace(tensor);
+                try { bucket->second.push_back(key); }
+                catch (...) { if (inserted) adoption_tensors_.erase(bucket); throw; }
+                tensor_added = true;
+            }
+            // Allocation failure leaves an existing owner untouched; replacing
+            // its Entry is noexcept, so both memberships commit together.
+            entries_.insert_or_assign(key, std::move(entry));
+        } catch (...) {
+            removeGemmMembership(name_added ? name : absent_name,
+                tensor_added ? tensor : AdoptionTensorKey{nullptr, key.device}, key);
+            throw;
+        }
+        removeGemmMembership(old_name, old_tensor, key);
     }
 
     bool PreparedWeightStore::adoptPreparedGemmForBinding(
@@ -401,31 +453,40 @@ namespace llaminar2
             return true;
         }
 
-        for (const auto &[id, entry] : entries_)
-        {
-            (void)id;
-            if (entry.ref.device != device)
-                continue;
-
-            const bool same_tensor = entry.binding.tensor == binding.tensor;
-            const bool same_canonical_name = !entry.binding.identity.canonical_name.empty() &&
-                                             entry.binding.identity.canonical_name == binding.identity.canonical_name;
-            if (!same_tensor && !same_canonical_name)
-                continue;
-            if (!compatiblePreparedAdoptionBinding(entry.binding, binding))
-                continue;
-
-            auto handle = entry.owned_handle;
-            if (!handle || !handle->prepared_weights)
-                continue;
-
-            validateBindingForStore(binding, model_id_, entry.ref.kind);
+        const Entry* selected = nullptr;
+        const auto consider = [&](const AdoptionKeys& candidates) {
+            for (const auto& key : candidates) {
+                const auto found = entries_.find(key);
+                if (found == entries_.end())
+                    throw std::logic_error("Prepared GEMM candidate lost its original entry");
+                const auto& entry = found->second;
+                if (entry.ref.device != device ||
+                    (binding.prepared->kind != PreparedWeightKind::None && binding.prepared->kind != entry.ref.kind) ||
+                    !compatiblePreparedAdoptionBinding(entry.binding, binding) ||
+                    !entry.owned_handle || !entry.owned_handle->prepared_weights)
+                    continue;
+                selected = &entry;
+                return;
+            }
+        };
+        // Tensor and name are two original ways to identify a candidate, never
+        // permission to reuse it: full source/slice/arithmetic checks run above.
+        const auto tensor_candidates = adoption_tensors_.find({binding.tensor, device});
+        if (tensor_candidates != adoption_tensors_.end()) consider(tensor_candidates->second);
+        if (!selected && !binding.identity.canonical_name.empty()) {
+            const auto named = adoption_names_.find({binding.identity.canonical_name, device});
+            if (named != adoption_names_.end()) consider(named->second);
+        }
+        if (selected) {
+            validateBindingForStore(binding, model_id_, selected->ref.kind);
             WeightBinding stored = binding;
-            auto ref = makeRef(binding.binding_id, entry.ref.kind, device);
+            auto ref = makeRef(binding.binding_id, selected->ref.kind, device);
             stored.prepared = ref;
-            if (stored.tensor)
-                stored.tensor->publishPreparedDeviceState();
-            entries_[keyFor(ref)] = Entry{std::move(stored), ref, std::move(handle), entry.memory_owner};
+            if (stored.tensor) stored.tensor->publishPreparedDeviceState();
+            // Copy the actual handle/owner before publish can rehash entries_.
+            auto handle = selected->owned_handle;
+            const auto owner = selected->memory_owner;
+            publishGemmEntry(keyFor(ref), Entry{std::move(stored), ref, std::move(handle), owner});
             return true;
         }
 
@@ -1068,6 +1129,8 @@ namespace llaminar2
     void PreparedWeightStore::clear()
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        adoption_names_.clear();
+        adoption_tensors_.clear();
         entries_.clear();
         fused_cache_.clear();
         embedding_entries_.clear();
@@ -1095,6 +1158,8 @@ namespace llaminar2
         // releases owned kernels through PreparedGemmWeights::owned_kernel. Expert
         // slabs own MoE expert GEMM engines through ExpertEntry::engine_lifetime.
 
+        adoption_names_.clear();
+        adoption_tensors_.clear();
         entries_.clear();
         fused_cache_.clear();
         embedding_entries_.clear();

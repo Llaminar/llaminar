@@ -241,9 +241,17 @@ namespace llaminar2
                 sizeof(std::max_align_t);
             cpu_storage_.resize(words);
             allocation_ = cpu_storage_.data();
+            // Value initialization of max_align_t does not promise every byte
+            // of its object representation is zero. Preserve CPU's explicit
+            // complete-payload initialization before publishing its header.
+            std::memset(allocation_, 0, allocation_bytes_);
         }
 
-        std::memset(allocation_, 0, allocation_bytes_);
+        // GPU arena slices are fresh, disjoint and already byte-zeroed by the
+        // original backing allocation/first-touch. Retouching the payload here
+        // repeats that complete pass for every layer/bucket without adding an
+        // initialization or NUMA guarantee. Header and atomic publication-word
+        // initialization remain explicit; no live/reset payload is cleared.
         auto *const base = static_cast<std::byte *>(allocation_);
         ticket_.header =
             reinterpret_cast<MoEOverlayDispatchTicketHeader *>(base);

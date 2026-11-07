@@ -94,7 +94,7 @@ WeightBinding PreparedWeightStore::finishCPUPreparation(std::unique_ptr<CPUPrepa
     std::lock_guard<std::mutex> lock(mutex_);
     const auto key=keyFor(ref);
     if(entries_.contains(key) || embedding_entries_.contains(key))throw std::logic_error("CPU final commit would replace an existing completed owner");
-    entries_.emplace(key,Entry{binding,ref,std::move(handle),state.owner});
+    publishGemmEntry(key,Entry{binding,ref,std::move(handle),state.owner});
     // Publication follows the actual Store-owned engine/root, including a
     // floating engine that aliases its final raw tensor. Resident-only roots
     // are not prepared kernels and must retain their unprepared state.

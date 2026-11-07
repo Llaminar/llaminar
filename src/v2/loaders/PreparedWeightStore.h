@@ -498,6 +498,46 @@ namespace llaminar2
             }
         };
 
+        /** @brief Non-owning original source-name lookup, scoped to the physical device. */
+        struct AdoptionNameKey {
+            std::string name;
+            DeviceId device;
+            bool operator==(const AdoptionNameKey&) const = default;
+        };
+        /** @brief Hash existing source names only; equality authenticates the full original name. */
+        struct AdoptionNameHash {
+            size_t operator()(const AdoptionNameKey& key) const noexcept {
+                return std::hash<std::string>{}(key.name) ^ (std::hash<DeviceId>{}(key.device) << 1u);
+            }
+        };
+        /** @brief Non-owning tensor identity lookup; no tensor or prepared handle is retained here. */
+        struct AdoptionTensorKey {
+            const TensorBase* tensor;
+            DeviceId device;
+            bool operator==(const AdoptionTensorKey&) const = default;
+        };
+        /** @brief Hash actual tensor address and exact physical device. */
+        struct AdoptionTensorHash {
+            size_t operator()(const AdoptionTensorKey& key) const noexcept {
+                return std::hash<const TensorBase*>{}(key.tensor) ^ (std::hash<DeviceId>{}(key.device) << 1u);
+            }
+        };
+        using AdoptionKeys = std::vector<PreparedBindingKey>;
+        /** @brief Publish/replace the sole GEMM owner and both non-owning lookup memberships atomically.
+         * @param key Exact original stable binding/device key.
+         * @param entry Complete new owner; existing mutex must already be held.
+         * @throws Allocation failure before replacing the previous owner or its memberships.
+         */
+        void publishGemmEntry(PreparedBindingKey key, Entry entry);
+        /** @brief Remove one original membership without allocating, including an empty lookup bucket.
+         * @param name Existing original name/device key, empty names have no name membership.
+         * @param tensor Existing original tensor/device key, null tensors have no tensor membership.
+         * @param key Original stable binding key to remove once.
+         * @note Existing mutex must already be held; replacement may temporarily contain two identical keys.
+         */
+        void removeGemmMembership(const AdoptionNameKey& name, AdoptionTensorKey tensor,
+            PreparedBindingKey key) noexcept;
+
         /// Fused gate/up kernel cache (Phase 8: owned by this store, not KernelFactory)
         struct FusedCacheKey
         {
@@ -537,6 +577,10 @@ namespace llaminar2
         /** Sole admitted authority carried to graph-owned allocation sites. */
         std::shared_ptr<PhysicalMemoryAuthority> physical_memory_authority_;
         std::unordered_map<PreparedBindingKey, Entry, PreparedBindingKeyHash> entries_;
+        // Candidate indices contain keys only. Every compatibility/lifetime check
+        // still reads the sole original Entry under mutex_; success is never cached.
+        std::unordered_map<AdoptionNameKey, AdoptionKeys, AdoptionNameHash> adoption_names_;
+        std::unordered_map<AdoptionTensorKey, AdoptionKeys, AdoptionTensorHash> adoption_tensors_;
         mutable std::unordered_map<FusedCacheKey, std::unique_ptr<ITensorFusedGateUpGemm>, FusedCacheHash> fused_cache_;
 
         // =========================================================================

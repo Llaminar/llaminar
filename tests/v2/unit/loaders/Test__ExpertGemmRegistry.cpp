@@ -1194,3 +1194,48 @@ TEST(StaticProjectionPreparedSource, NativeDescriptorOwnsGeometryAndOriginalCode
 #include "CPUJointInitialBankPrepassContract.inc"
 
 #include "CPUJointReusableRegistryContract.inc"
+
+/** Prove representative metadata does not collapse into expert/layer collision chains. */
+TEST(ExpertGemmRegistryHash, RepresentativeLayerExpertRolesScaleAcrossParticipantCounts)
+{
+    for(const std::size_t devices:{1,3,9,16})
+    {
+        SCOPED_TRACE(devices);
+        const auto stats=test::ExpertGemmRegistryResidencyTestAccess::hashDistribution(devices,48,256);
+        EXPECT_EQ(stats.keys,devices*48*256*3);
+        // These are distribution/economy bounds, not an expected digest table:
+        // normal hash-table bucket collisions are permitted, full-hash collapse is not.
+        EXPECT_GE(stats.distinct_hashes,stats.keys*999/1000);
+        EXPECT_LE(stats.maximum_equal_hashes,2);
+        EXPECT_LE(stats.successful_lookup_comparisons,stats.keys*3);
+        EXPECT_EQ(stats.measured_lookup_hits,2*stats.keys);
+        EXPECT_EQ(stats.measured_lookup_misses,2*stats.keys);
+        RecordProperty("keys_"+std::to_string(devices),std::to_string(stats.keys));
+        RecordProperty("distinct_hashes_"+std::to_string(devices),std::to_string(stats.distinct_hashes));
+        RecordProperty("lookup_comparisons_"+std::to_string(devices),std::to_string(stats.successful_lookup_comparisons));
+        RecordProperty("maximum_equal_hashes_"+std::to_string(devices),std::to_string(stats.maximum_equal_hashes));
+        RecordProperty("lookup_nanoseconds_"+std::to_string(devices),std::to_string(stats.lookup_nanoseconds));
+        RecordProperty("negative_lookup_nanoseconds_"+std::to_string(devices),std::to_string(stats.negative_lookup_nanoseconds));
+    }
+}
+
+/** Match the profiled R4 GPU kernel population and original two registry scopes. */
+TEST(ExpertGemmRegistryHash, ConfiguredR4SparseOverlayPositiveAndNegativeLookups)
+{
+    // Preserved r857 log declares512 experts, four GPU participants and294
+    // physical GPU kernels per participant:49layers ×2resident experts ×3roles.
+    // WeightManager publishes each under both domain and participant keys.
+    // Ordinal representative IDs exercise this declared geometry; this is not
+    // a replay of an exported live registry inventory or engine payloads.
+    const auto stats=test::ExpertGemmRegistryResidencyTestAccess::hashDistribution(4,49,512,2);
+    EXPECT_EQ(stats.keys,4*49*2*3*2);
+    EXPECT_GE(stats.distinct_hashes,stats.keys*99/100);
+    EXPECT_LE(stats.maximum_equal_hashes,2);
+    EXPECT_LE(stats.successful_lookup_comparisons,stats.keys*3);
+    EXPECT_EQ(stats.measured_lookup_hits,2*stats.keys);
+    EXPECT_EQ(stats.measured_lookup_misses,2*stats.keys);
+    RecordProperty("configured_keys",std::to_string(stats.keys));
+    RecordProperty("configured_distinct_hashes",std::to_string(stats.distinct_hashes));
+    RecordProperty("configured_positive_ns",std::to_string(stats.lookup_nanoseconds));
+    RecordProperty("configured_negative_ns",std::to_string(stats.negative_lookup_nanoseconds));
+}
