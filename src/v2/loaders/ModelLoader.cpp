@@ -22,6 +22,7 @@
 #include "ModelLoader.h"
 #include "WeightIdentity.h"
 #include "../models/qwen4exp/Qwen4ExpSidecarManifest.h"
+#include "../models/clover/CloverMoEConfig.h"
 #include "../tensors/Tensors.h"
 #include "../tensors/TensorFactory.h"
 #include "../utils/MPIContext.h"
@@ -4051,7 +4052,13 @@ namespace llaminar2
     {
         std::vector<std::string> names;
         names.reserve(tensorCount());
-        for (const auto &tensor : model_.tensors) names.push_back(tensor.name);
+        for (const auto &tensor : model_.tensors)
+        {
+            // Original Preview exports retain noncausal operands. The source
+            // directory stays exact, but the AR graph owns no such allocation.
+            if (model_.architecture == "clover_moe" && CloverMoEConfig::isDiffusionOnlyTensor(tensor.name)) continue;
+            names.push_back(tensor.name);
+        }
         if (predictor_manifest_ && predictor_materialization_ == SharedPredictorMaterialization::Active)
             for (const auto &source : predictor_manifest_->sources())
                 if (source.source == Qwen4ExpTensorSource::Predictor && source.consumed)

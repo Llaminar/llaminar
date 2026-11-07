@@ -1981,6 +1981,9 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     # Qwen3.5 MoE (hybrid GDN + Full Attention + Mixture of Experts)
     models/qwen35moe/Qwen35MoEGraph.cpp
     models/qwen35moe/Qwen35MoEGraphConfigBuilder.cpp
+    # Clover causal AR: independent source admission, shared hybrid MoE operators.
+    models/clover/CloverMoEConfig.cpp
+    models/clover/CloverMoEGraphConfigBuilder.cpp
     # Qwen3.8 Flash Next: authenticated geometry and native residual/PLE primitives.
     models/qwen4exp/Qwen4ExpConfig.cpp
     models/qwen4exp/Qwen4ExpSidecarManifest.cpp

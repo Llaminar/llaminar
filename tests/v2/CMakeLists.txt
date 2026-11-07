@@ -26119,6 +26119,19 @@ add_v2_test(V2_Integration_PhaseSplitFAGateLiveGeometry
     NO_MODELS
 )
 
+# Clover AR admission and graph contracts stay model-free and device-free.
+add_executable(v2_test_clover_moe unit/models/clover/Test__CloverMoE.cpp)
+target_link_libraries(v2_test_clover_moe PRIVATE llaminar2_core GTest::gtest GTest::gmock GTest::gtest_main)
+target_include_directories(v2_test_clover_moe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_v2_test(V2_Unit_CloverMoEContract
+    COMMAND $<TARGET_FILE:v2_test_clover_moe>
+    LABELS "V2;Unit;Clover;MoE;Graph;Contract;DeviceFree"
+    MPI_PROCS 1 NO_MODELS)
+add_v2_test(V2_Integration_CloverMoEAdmissionContract
+    COMMAND $<TARGET_FILE:v2_test_clover_moe>
+    LABELS "V2;Integration;ProductionTestPreflight;Clover;MoE;Graph;Contract;DeviceFree"
+    MPI_PROCS 1 NO_MODELS)
+
 # Test: Qwen35MoEGraph — MoE graph construction regressions
 add_executable(v2_test_qwen35moe_graph unit/models/qwen35moe/Test__Qwen35MoEGraph.cpp)
 target_link_libraries(v2_test_qwen35moe_graph
@@ -27791,6 +27804,7 @@ add_v2_test(V2_Integration_GDNStateLayoutCliqueIdentity
 )
 
 set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_CloverMoEAdmissionContract
     ${V2_PREPARED_GRAPH_TEMPLATE_PREFLIGHT_TESTS}
     ${V2_PIPELINE_MIXED_GDN_LAYOUT_PREFLIGHT_TESTS}
     ${V2_GDN_LIVE_STATE_LAYOUT_NATIVE_PREFLIGHT_TESTS}

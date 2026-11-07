@@ -120,7 +120,8 @@ namespace llaminar2
         [[nodiscard]] static constexpr bool isGDNProjectionSource(
             WeightRole role, std::string_view name, std::string_view architecture) noexcept
         {
-            if (architecture != "qwen35" && architecture != "qwen35moe" && architecture != "qwen4exp") return false;
+            if (architecture != "qwen35" && architecture != "qwen35moe" &&
+                architecture != "qwen4exp" && architecture != "clover_moe") return false;
             if (!name.starts_with("blk.")) return false;
             const auto end = name.find('.', 4);
             if (end == std::string_view::npos || end == 4) return false;
@@ -152,7 +153,8 @@ namespace llaminar2
             if (!isGDNProjectionSource(role, name, architecture))
                 return GDNProjectionArithmetic::Native;
             if (requested == GDNProjectionArithmetic::FP16MoEAlphaBeta)
-                return (architecture == "qwen35moe" || architecture == "qwen4exp") && role == WeightRole::GDNAlphaBetaProjection ?
+                return (architecture == "qwen35moe" || architecture == "qwen4exp" || architecture == "clover_moe") &&
+                    role == WeightRole::GDNAlphaBetaProjection ?
                     GDNProjectionArithmetic::FP16 : GDNProjectionArithmetic::Native;
             if (requested == GDNProjectionArithmetic::FP16AlphaBeta)
                 return role == WeightRole::GDNAlphaBetaProjection ?

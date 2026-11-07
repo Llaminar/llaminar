@@ -127,7 +127,7 @@ namespace llaminar2
         }
 
         const bool cpu_expert_family = graph_config.default_device.is_cpu() &&
-            (architecture == "qwen35moe" || architecture == "qwen4exp") && graph_config.moe.num_experts > 0;
+            graph_config.moe.num_experts > 0;
         if (!cpu_expert_family && !graph_config.requiresEagerWorkspaceFamilyManifest())
             return true;
 
@@ -1718,7 +1718,7 @@ namespace llaminar2
         }
         WeightManagerConfig wm_config;
         wm_config.sharding = SchemaFactoryRegistry::getWeightShardingConfig(architecture);
-        if (architecture == "qwen35moe" || architecture == "qwen4exp")
+        if (graph_config.moe.num_experts > 0)
         {
             for (auto &pattern : wm_config.sharding.patterns)
             {

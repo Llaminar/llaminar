@@ -42,6 +42,10 @@ Use a GGUF file from one of these supported model families:
 * Qwen 3 (dense)
 * Qwen 3.5/3.6 (dense and MoE), including Qwen 3.8 dense GGUFs
 
+Experimental `clover_moe` source support implements **causal autoregressive**
+inference, not block diffusion or diffusion self-speculation. It is not yet
+real-weight/backend qualified; see the [Clover contract and validation boundary](src/v2/models/clover/README.md).
+
 The tested examples below include Qwen 3.8 27B, Qwen 3.6 MoE 35B,
 Ornith 1.5 MoE 35B, and Qwen 3.5 MoE 122B.
 

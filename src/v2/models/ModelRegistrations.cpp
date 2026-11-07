@@ -2,12 +2,10 @@
  * @file ModelRegistrations.cpp
  * @brief Registers all built-in model architectures
  *
- * This is the SINGLE place to add a new model architecture.
- * Adding support for a new model requires:
- *   1. Creating files under models/<arch>/
- *   2. Adding registration calls here
- *
- * No edits to execution/, config/, loaders/, or kernels/ needed.
+ * This is the single registration authority for built-in graph/schema pairs.
+ * Architecture-owned source admission and configuration live in models/<arch>;
+ * shared loading/planning contracts remain responsible for consumed operands.
+ * Registration preserves source identity even when models share native stages.
  */
 
 #include "ModelRegistrations.h"
@@ -20,6 +18,8 @@
 #include "qwen35moe/Qwen35MoESchema.h"
 #include "qwen4exp/Qwen4ExpGraph.h"
 #include "qwen4exp/Qwen4ExpSchema.h"
+#include "clover/CloverMoEGraph.h"
+#include "clover/CloverMoESchema.h"
 #include "../execution/local_execution/graph/GraphBuilderRegistry.h"
 #include "../execution/local_execution/graph/SchemaFactoryRegistry.h"
 
@@ -28,6 +28,7 @@
 namespace llaminar2
 {
 
+    /** @brief Install the matching schema and graph owners for each built-in architecture. */
     static void doRegisterBuiltinModels()
     {
         // =================================================================
@@ -78,6 +79,12 @@ namespace llaminar2
         SchemaFactoryRegistry::registerFactory("qwen35moe",
                                                []()
                                                { return std::make_unique<Qwen35MoESchemaFactory>(); });
+
+        GraphBuilderRegistry::registerFactory("clover_moe",
+            [](const GraphConfig &config, std::shared_ptr<IMPIContext> mpi)
+            { return std::make_shared<CloverMoEGraph>(config, std::move(mpi)); });
+        SchemaFactoryRegistry::registerFactory("clover_moe",
+            []() { return std::make_unique<CloverMoESchemaFactory>(); });
 
         GraphBuilderRegistry::registerFactory("qwen4exp",
             [](const GraphConfig &config,std::shared_ptr<IMPIContext> mpi)
