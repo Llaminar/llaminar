@@ -1,0 +1,11 @@
+--- a/amd/dkms/dkms-config.sh
++++ b/amd/dkms/dkms-config.sh
+@@ -128,6 +128,8 @@
+ export_macro_mk CONFIG_DRM_AMDGPU_SI
+ export_macro_mk CONFIG_DRM_AMDGPU_USERPTR
+ export_macro_mk CONFIG_DRM_AMD_DC
++# Keep legacy DCE support enabled, matching its Kconfig default.
++export_macro_mk CONFIG_DRM_AMD_DC_DCE
+ 
+ echo "Enabled configurations:"
+ cat ${local_config_tmp}

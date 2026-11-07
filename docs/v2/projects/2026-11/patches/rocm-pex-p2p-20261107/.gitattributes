@@ -1,0 +1,2 @@
+# Preserve unified-diff context prefixes and the original source whitespace.
+*.patch -whitespace

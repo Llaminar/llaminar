@@ -1,0 +1,51 @@
+From fe89277c9ceb0d6af0aa665bcf24a41d8b1b79cd Mon Sep 17 00:00:00 2001
+From: Guanghui Feng <guanghuifeng@linux.alibaba.com>
+Date: Mon, 16 Mar 2026 15:16:39 +0800
+Subject: [PATCH] iommu/vt-d: Fix intel iommu iotlb sync hardlockup and retry
+
+During the qi_check_fault process after an IOMMU ITE event, requests at
+odd-numbered positions in the queue are set to QI_ABORT, only satisfying
+single-request submissions. However, qi_submit_sync now supports multiple
+simultaneous submissions, and can't guarantee that the wait_desc will be
+at an odd-numbered position. Therefore, if an item times out, IOMMU can't
+re-initiate the request, resulting in an infinite polling wait.
+
+This modifies the process by setting the status of all requests already
+fetched by IOMMU and recorded as QI_IN_USE status (including wait_desc
+requests) to QI_ABORT, thus enabling multiple requests to be resubmitted.
+
+Fixes: 8a1d82462540 ("iommu/vt-d: Multiple descriptors per qi_submit_sync()")
+Cc: stable@vger.kernel.org
+Signed-off-by: Guanghui Feng <guanghuifeng@linux.alibaba.com>
+Tested-by: Shuai Xue <xueshuai@linux.alibaba.com>
+Reviewed-by: Shuai Xue <xueshuai@linux.alibaba.com>
+Reviewed-by: Samiullah Khawaja <skhawaja@google.com>
+Link: https://lore.kernel.org/r/20260306101516.3885775-1-guanghuifeng@linux.alibaba.com
+Signed-off-by: Lu Baolu <baolu.lu@linux.intel.com>
+Fixes: 8a1d82462540 ("iommu/vt-d: Multiple descriptors per  qi_submit_sync()")
+Signed-off-by: Joerg Roedel <joerg.roedel@amd.com>
+---
+ drivers/iommu/intel/dmar.c | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/drivers/iommu/intel/dmar.c b/drivers/iommu/intel/dmar.c
+index d68c06025cac2f..69222dbd2af0ea 100644
+--- a/drivers/iommu/intel/dmar.c
++++ b/drivers/iommu/intel/dmar.c
+@@ -1314,7 +1314,6 @@ static int qi_check_fault(struct intel_iommu *iommu, int index, int wait_index)
+ 	if (fault & DMA_FSTS_ITE) {
+ 		head = readl(iommu->reg + DMAR_IQH_REG);
+ 		head = ((head >> shift) - 1 + QI_LENGTH) % QI_LENGTH;
+-		head |= 1;
+ 		tail = readl(iommu->reg + DMAR_IQT_REG);
+ 		tail = ((tail >> shift) - 1 + QI_LENGTH) % QI_LENGTH;
+ 
+@@ -1331,7 +1330,7 @@ static int qi_check_fault(struct intel_iommu *iommu, int index, int wait_index)
+ 		do {
+ 			if (qi->desc_status[head] == QI_IN_USE)
+ 				qi->desc_status[head] = QI_ABORT;
+-			head = (head - 2 + QI_LENGTH) % QI_LENGTH;
++			head = (head - 1 + QI_LENGTH) % QI_LENGTH;
+ 		} while (head != tail);
+ 
+ 		/*
