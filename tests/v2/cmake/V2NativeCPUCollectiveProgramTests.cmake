@@ -5,6 +5,10 @@
 # Count ABI reuse. Only MPI/cache backend boundaries are doubled; the admission,
 # borrow, lock, finalization order and retirement checks are production bodies.
 # Actual GlobalTPContext/ShmemSpin/MPI native qualification remains separate.
+# Functional replay targets only; Release builds performance targets alone.
+if(V2_PERF_TESTS_ONLY)
+    return()
+endif()
 set(_cpu_program_root "${CMAKE_CURRENT_SOURCE_DIR}/../../src/v2")
 add_executable(v2_test_native_cpu_collective_program
     unit/collective/Test__NativeCPUCollectiveProgram.cpp

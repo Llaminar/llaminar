@@ -8,6 +8,10 @@ responses; no core/backend object or native readiness is fabricated. Original
 shared-error bodies remain explicit deferred-readback negative controls.
 ]=]
 include_guard(DIRECTORY)
+# Functional replay targets only; Release builds performance targets alone.
+if(V2_PERF_TESTS_ONLY)
+    return()
+endif()
 set(V2_NATIVE_ERROR_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/native_owned_error_replay")
 set(V2_NATIVE_ERROR_GENERATED "${V2_NATIVE_ERROR_GENERATED_DIR}/NativeCollectiveDiagnosticBodies.inc")
 set(V2_NATIVE_ERROR_GENERATOR "${CMAKE_CURRENT_SOURCE_DIR}/scripts/extract_native_collective_error_bodies.py")
