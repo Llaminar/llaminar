@@ -2125,6 +2125,29 @@ add_v2_test(V2_Unit_CacheInfo
     MPI_PROCS 1
 )
 
+# Test: processes launched by the session owner/bootstrap receive the
+# OpenMP-admitted CPU set, not the one place libgomp bound the launcher to.
+add_executable(v2_test_openmp_launch_affinity unit/utils/Test__OpenMPLaunchAffinity.cpp)
+target_link_libraries(v2_test_openmp_launch_affinity
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+foreach(_launch_affinity_kind IN ITEMS Unit Integration)
+    set(_launch_affinity_labels "V2;${_launch_affinity_kind};CPU;OpenMP;Affinity;MPI;Ownership;Regression")
+    if(_launch_affinity_kind STREQUAL "Integration")
+        string(APPEND _launch_affinity_labels ";ProductionTestPreflight")
+    endif()
+    add_v2_test(V2_${_launch_affinity_kind}_OpenMPLaunchAffinity
+        COMMAND $<TARGET_FILE:v2_test_openmp_launch_affinity>
+        LABELS "${_launch_affinity_labels}"
+        MPI_PROCS 1
+        NO_MODELS
+        TIMEOUT 30
+        ENVIRONMENT "OMP_PLACES=cores" "OMP_PROC_BIND=close")
+endforeach()
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OpenMPLaunchAffinity)
+
 # Test: shared NativeVNNI row-regime and geometry-aware GPU tile policy.
 # This is host-only even in GPU-enabled builds; unit tests must never allocate
 # a device or launch a kernel.
