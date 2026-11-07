@@ -13,6 +13,7 @@
 #include "CPUNativeVNNIExecutionContract.h"
 #include "CPUNativeVNNIPackedWeights.h"
 #include "CPUNativeNEONProjectionBatch.h"
+#include "CPUNativeNEONExactOverlay.h"
 #include "CPUNativeVNNIScalarReference.h"
 #include "CPUProjectionQ8Publication.h"
 #include "execution/moe/DeviceMoERuntimeABI.h"
@@ -94,6 +95,21 @@ namespace llaminar2::cpu::native_vnni
             return decodeScheduleNBlockChunks(requested);
         }
 
+        /** @brief Resolve the automatic native schedule for one actual invocation.
+         * @param packed Actual prepared source identity and geometry.
+         * @param rows Positive physical M.
+         * @param policy_n Authenticated serial-equivalent N, or zero for the caller scope's.
+         * @param workers Planned worker budget, or zero for this invocation's team.
+         * @return Exact measured overlay for this key, otherwise the total policy.
+         */
+        inline NativeNEONSchedule automatic(const CPUNativeVNNIPackedWeights &packed, int rows,
+            int policy_n = 0, int workers = 0)
+        {
+            return resolveNativeNEONSchedule(packed.codebook_id, packed.is_superblock,
+                policy_n ? policy_n : cpuNativeVNNISerialEquivalentPolicyN(packed.N), packed.K, rows,
+                workers ? workers : nativeVNNIInvocationWorkerCount());
+        }
+
         /** @brief Build checked whole-bank spans from one actual retained prepared owner.
          * @param packed Actual immutable prepared owner; no deferred workspace binding.
          * @param input Persistent original-order Q8 rows.
@@ -159,7 +175,9 @@ namespace llaminar2::cpu::native_vnni
             storage_proof::requireDisjoint(writes, {&packed, sizeof(packed)});
             storage_proof::requireOriginalWorkReadOnly(writes, work);
             const auto dot = instruction(ISAPath::AUTO);
-            const auto batch = bind(packed, activation.data(), output, rows, stride, NEONProjectionRowTile::Four, 1, work);
+            const auto schedule = automatic(packed, rows);
+            const auto batch = bind(packed, activation.data(), output, rows, stride,
+                schedule.tile, schedule.n_block_chunks, work);
             auto run = [&] {
                 quantize_activations_to_q8_1(input, activation.data(), rows, packed.K, packed.blocks_per_row,
                     packed.numerical_policy, work);
@@ -210,8 +228,13 @@ namespace llaminar2::cpu::native_vnni
         (void)partial_storage;
         const auto dot = neon_execution::instruction(isa_path);
         (void)cpuNativeVNNISerialEquivalentPolicyN(packed.N);
+        // Auto consults the exact overlay; the M1 oracle and explicit Nbc
+        // candidates keep their forced physical ownership.
+        const int chunks = schedule_override == DecodeSchedulePolicy::Auto
+            ? neon_execution::automatic(packed, 1).n_block_chunks
+            : neon_execution::nChunks(schedule_override);
         const auto batch = neon_execution::bind(packed, input, output, 1, packed.N,
-            NEONProjectionRowTile::Four, neon_execution::nChunks(schedule_override));
+            NEONProjectionRowTile::Four, chunks);
         neon_execution::execute(batch, dot);
     }
 
@@ -240,8 +263,13 @@ namespace llaminar2::cpu::native_vnni
         (void)cpuNativeVNNISerialEquivalentPolicyN(packed.N);
         const CPUProjectionRowGrid grid(rows, work);
         if (!grid.beginWorkshare()) return;
-        const auto batch = neon_execution::bind(packed, input, output, rows, stride,
-            neon_execution::rowTile(policy), chunks ? chunks : 1, work);
+        // Auto takes the exact overlay (or total policy) for this physical M;
+        // explicit row candidates and explicit N ownership stay forced.
+        const auto schedule = neon_execution::automatic(packed, rows);
+        const auto tile = policy == VerifierRowsPolicy::Auto ? schedule.tile : neon_execution::rowTile(policy);
+        const int n_chunks = chunks ? chunks
+            : (policy == VerifierRowsPolicy::Auto ? schedule.n_block_chunks : 1);
+        const auto batch = neon_execution::bind(packed, input, output, rows, stride, tile, n_chunks, work);
         neon_execution::execute(batch, neon_execution::instruction(isa_path));
     }
 
@@ -444,8 +472,11 @@ namespace llaminar2::cpu::native_vnni
                 throw std::invalid_argument("Native ARM fused members require the same physical K width");
             blocks = d.packed->blocks_per_row;
             if (d.policy_n == 0) (void)cpuNativeVNNISerialEquivalentPolicyN(d.N);
-            plan.tiles[p] = neon_execution::rowTile(d.verifier_schedule);
-            plan.chunks[p] = neon_execution::nChunks(d.decode_schedule);
+            const auto schedule = neon_execution::automatic(*d.packed, plan.rows[p], d.policy_n, workers);
+            plan.tiles[p] = d.verifier_schedule == VerifierRowsPolicy::Auto
+                ? schedule.tile : neon_execution::rowTile(d.verifier_schedule);
+            plan.chunks[p] = d.decode_schedule == DecodeSchedulePolicy::Auto
+                ? schedule.n_block_chunks : neon_execution::nChunks(d.decode_schedule);
         }
         return plan;
     }
