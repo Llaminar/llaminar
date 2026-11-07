@@ -42,7 +42,10 @@ namespace llaminar2::Q8R_NAMESPACE
         /** @brief Load exact original scale/raw-factor planes and IQ1_M delta signs. */
         __device__ NativeBlock(const DeviceNativeVNNIMatrixDesc &w, std::uint64_t block,
                                const std::uint8_t *payload)
-            : scale(static_cast<const std::uint16_t *>(w.scales)[block]), secondary(0), qh(0), emin(0)
+            // `scale` is the normalized staged word decoded by the shared contract.
+            : scale(::llaminar2::native_vnni_scale::loadStagedPrimary<C>(
+                  static_cast<const std::uint16_t *>(w.scales), static_cast<std::size_t>(block))),
+              secondary(0), qh(0), emin(0)
         {
             if constexpr (Traits::requires_secondary_metadata)
                 secondary = static_cast<const std::uint16_t *>(w.mins)[block];

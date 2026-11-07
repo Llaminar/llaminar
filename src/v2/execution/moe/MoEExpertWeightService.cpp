@@ -329,6 +329,8 @@ namespace llaminar2
             {
             case TensorType::IQ4_NL:
                 return bytes_for(IQ4_NLBlock::BLOCK_SIZE, sizeof(IQ4_NLBlock));
+            case TensorType::MXFP4:
+                return bytes_for(MXFP4Block::BLOCK_SIZE, sizeof(MXFP4Block));
             case TensorType::IQ4_XS:
                 return bytes_for(IQ4_XSBlock::BLOCK_SIZE, sizeof(IQ4_XSBlock));
             case TensorType::Q8_0:
@@ -2037,6 +2039,7 @@ namespace llaminar2
                     format.payload_bytes,
                     canonicalDeviceVnniFormat(format).is_asymmetric,
                     format.has_emins,
+                    nativeVnniScalePlaneWidth(canonicalDeviceVnniCodebookId(format)),
                     source_bytes);
                 transfer_sources.push_back(std::move(*source));
                 max_raw_bytes = std::max(max_raw_bytes, source_bytes);
@@ -2393,7 +2396,9 @@ namespace llaminar2
 
                 orchestrator->planWeight(gpu_ordinal, slot_name, N, K,
                                          vnni->payload_bytes, canonicalDeviceVnniFormat(*vnni).is_asymmetric,
-                                         vnni->has_emins, raw_bytes);
+                                         vnni->has_emins,
+                                         nativeVnniScalePlaneWidth(canonicalDeviceVnniCodebookId(*vnni)),
+                                         raw_bytes);
                 max_raw_bytes = std::max(max_raw_bytes, raw_bytes);
                 ++total_planned;
             }
@@ -3592,6 +3597,7 @@ namespace llaminar2
                 spec.is_asymmetric = is_asymmetric != 0;
                 spec.has_emins = has_emins != 0;
                 spec.codebook_id = src_desc.codebook_id;
+                spec.scale_plane = nativeVnniScalePlaneWidth(src_desc.codebook_id);
                 specs.push_back(std::move(spec));
             }
             return specs;
@@ -4444,6 +4450,7 @@ namespace llaminar2
                 spec.is_asymmetric = canonicalDeviceVnniFormat(*vnni).is_asymmetric;
                 spec.has_emins = vnni->has_emins;
                 spec.codebook_id = vnni->codebook_id;
+                spec.scale_plane = nativeVnniScalePlaneWidth(canonicalDeviceVnniCodebookId(*vnni));
                 specs.push_back(std::move(spec));
             }
             return specs;
@@ -4763,6 +4770,7 @@ namespace llaminar2
                         vnni->payload_bytes,
                         canonicalDeviceVnniFormat(*vnni).is_asymmetric,
                         vnni->has_emins,
+                        nativeVnniScalePlaneWidth(canonicalDeviceVnniCodebookId(*vnni)),
                         /*raw_gguf_bytes=*/0);
                 }
 

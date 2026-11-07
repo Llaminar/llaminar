@@ -161,6 +161,8 @@ namespace llaminar2::cpu::native_vnni::test
                 return Factory::createIQ1_SRandom(shape);
             if (quant_type == "IQ1_M")
                 return Factory::createIQ1_MRandom(shape);
+            if (quant_type == "MXFP4")
+                return Factory::createMXFP4Random(shape);
             throw std::invalid_argument(
                 "No TestTensorFactory fixture for canonical format " +
                 std::string(quant_type));
@@ -246,6 +248,7 @@ namespace llaminar2::cpu::native_vnni::test
                 .scales_array = scales.data(),
                 .mins_array = minima.data(),
                 .emins_array = nullptr,
+                .primary_layout = packed.primaryScaleLayout(),
             };
             source.packVnniBlock(context, source_row, 0, kb);
             const uint8_t *const block = payload.data() + kb * packed.payload_bytes;
@@ -419,7 +422,7 @@ namespace llaminar2::cpu::native_vnni::test
         static_assert(kK % 32 == 0);
         static_assert(kK % 256 != 0);
 
-        ASSERT_EQ(native_vnni_formats::kAllSourceFormats.size(), 21u);
+        ASSERT_EQ(native_vnni_formats::kAllSourceFormats.size(), 22u);
         size_t expanded_formats = 0;
         size_t compact_formats = 0;
 

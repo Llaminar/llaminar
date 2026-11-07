@@ -38,6 +38,22 @@ namespace llaminar2
     };
     static_assert(sizeof(IQ4_NLBlock) == 18, "IQ4_NLBlock must be 18 bytes");
 
+    /**
+     * @brief MXFP4 block (exactly 17 bytes, GGML block_mxfp4) for 32 elements.
+     *
+     * @p e is the shared E8M0 exponent; @p qs holds FP4 E2M1 codes with the
+     * IQ4_NL nibble order. Values are mxfp4::kValues[code] * 2^(e - 128).
+     * The struct is byte-aligned, so blocks are packed with no padding.
+     */
+    struct MXFP4Block
+    {
+        uint8_t e;      ///< E8M0 shared exponent
+        uint8_t qs[16]; ///< Packed FP4 E2M1 codes (2 per byte)
+
+        static constexpr size_t BLOCK_SIZE = 32; ///< Elements per block
+    };
+    static_assert(sizeof(MXFP4Block) == 17, "MXFP4Block must be 17 bytes");
+
     /** @brief Q8_0 block: 8-bit quantization (32 elements per block, 34 bytes) */
     struct Q8_0Block
     {

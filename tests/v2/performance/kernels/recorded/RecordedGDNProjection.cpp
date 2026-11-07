@@ -62,7 +62,7 @@ void planGDNWeights(LoadOrchestrator &pool,const Request &r,DeviceId device)
     for(std::size_t i=0;i<4;++i)
     {
         if(i<2)pool.planWeightForOwner(device.ordinal,r.sources[i].name,widths[i],r.k,format.payload_bytes,
-            canonicalDeviceVnniFormat(format).is_asymmetric,format.has_emins,std::size_t(widths[i])*(r.k/32)*34,
+            canonicalDeviceVnniFormat(format).is_asymmetric,format.has_emins, NativeVnniScalePlaneWidth::FP16Word,std::size_t(widths[i])*(r.k/32)*34,
             PhysicalMemoryOwner::PrimaryModelWeights);
         else pool.planRawWeightForOwner(device.ordinal,r.sources[i].name,widths[i],r.k,std::size_t(widths[i])*r.k*2,
             PhysicalMemoryOwner::PrimaryModelWeights);

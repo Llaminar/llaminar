@@ -12,6 +12,7 @@
 #pragma once
 
 #include "ExpertTierWeightDeviceLayout.h"
+#include "kernels/common/NativeVnniScaleLoad.h"
 #include "GPUExpertTransfer.h"
 #include "../../kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
 
@@ -52,7 +53,10 @@ namespace llaminar2
     {
         // Wire discriminator: receivers reject unknown layouts before parsing.
         static constexpr uint32_t kMagic = 0x45545753u; // "ETWS"
-        static constexpr uint16_t kVersion = 3;
+        // Version 4: codebook-25 (MXFP4) units carry a BF16 power-of-two scale
+        // word and the GPU plane a native E8M0 byte (#26). Older records used
+        // FP16 for the same codebook/strides and are rejected, not reinterpreted.
+        static constexpr uint16_t kVersion = 4;
 
         // Direction is explicit so CPU bytes cannot be replayed as GPU bytes.
         uint32_t magic = kMagic;
@@ -281,10 +285,35 @@ namespace llaminar2
         bool is_superblock = false;
         bool has_emins = false;
         // Separate arrays mirror the production device descriptor byte-for-byte.
+        // `scales` holds nativeVnniScalePlaneStorageWords(codebook_id, blocks)
+        // storage words: the exact primary plane (one byte per block for a
+        // native E8M0 plane). Use scaleWord/setScaleWord for per-block access.
         std::vector<uint8_t> payload;
         std::vector<uint16_t> scales;
         std::vector<uint16_t> mins;
         std::vector<uint32_t> emins;
+
+        /** @return Staged/CPU-unit scale word of block @p linear (FP16, or BF16 power of two). */
+        [[nodiscard]] uint16_t scaleWord(size_t linear) const noexcept
+        {
+            return native_vnni_scale::loadStagedPrimary(codebook_id, scales.data(), linear);
+        }
+
+        /** @return Exact live primary-plane bytes (device-view and transfer length). */
+        [[nodiscard]] size_t scaleLiveBytes() const noexcept
+        {
+            return nativeVnniScalePlaneLiveBytes(
+                codebook_id, static_cast<size_t>(N) * blocks_per_row);
+        }
+
+        /**
+         * @brief Store a CPU-unit scale word into the exact plane.
+         * @return False for a word that the native E8M0 plane cannot represent.
+         */
+        [[nodiscard]] bool setScaleWord(size_t linear, uint16_t word) noexcept
+        {
+            return native_vnni_scale::storePrimaryFromCpuWord(codebook_id, scales.data(), linear, word);
+        }
 
         /**
          * @brief Validate separated host storage against declared geometry.

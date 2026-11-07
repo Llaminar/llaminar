@@ -35,6 +35,7 @@
 #pragma once
 
 #include "memory/CPUWeightStoragePlacement.h"
+#include "kernels/common/NativeVnniScaleLoad.h"
 #include "loaders/NativeWeightLoadStaging.h"
 
 #include <cstdint>
@@ -60,6 +61,7 @@
 #include "tensors/NativeVnniQ6Scale.h"
 #include "tensors/NativeVnniIQ2SScale.h"
 #include "tensors/NativeVnniIQ4XSScale.h"
+#include "tensors/MXFP4Format.h"
 #include "tensors/NativeVnniIQ3SScale.h"
 #include "kernels/common/DeviceFP32NumericalContract.h"
 #include "utils/Logger.h"
@@ -194,6 +196,7 @@ namespace llaminar2::cpu::native_vnni
         case 19: return 34;  // Q8_0Block
         case 20: return 36;  // Q8_1Block
         case 21: return sizeof(Q8_KBlock); // Original FP32-scale Q8_K source block
+        case kNativeVnniMXFP4Codebook: return sizeof(MXFP4Block); // E8M0 + 16 code bytes
         default: return 0;
         }
     }
@@ -246,6 +249,20 @@ namespace llaminar2::cpu::native_vnni
 
         /// Physical prepared encoding consumed by serial and grouped kernels.
         CPUNativeVNNIEncoding encoding = CPUNativeVNNIEncoding::ExpandedInt8;
+
+        /// Interpretation of the primary scale words, derived from codebook and encoding.
+        [[nodiscard]] CPUNativeVNNIScaleEncoding scaleEncoding() const noexcept
+        {
+            return preparedScaleEncoding(codebook_id, encoding);
+        }
+
+        /// Pack-context layout that writes this unit's primary scale words.
+        [[nodiscard]] VnniPrimaryScaleLayout primaryScaleLayout() const noexcept
+        {
+            return scaleEncoding() == CPUNativeVNNIScaleEncoding::PowerOfTwoBF16
+                       ? VnniPrimaryScaleLayout::PowerOfTwoBF16Words
+                       : VnniPrimaryScaleLayout::FP16Words;
+        }
 
         /**
          * Arithmetic identity selected by the owner of this prepared matrix.
@@ -371,8 +388,11 @@ namespace llaminar2::cpu::native_vnni
          */
         [[nodiscard]] inline __m512 loadScales512(const uint16_t *primary) const
         {
-            const __m512 base = _mm512_cvtph_ps(_mm256_load_si256(
-                reinterpret_cast<const __m256i *>(primary)));
+            const __m256i words = _mm256_load_si256(reinterpret_cast<const __m256i *>(primary));
+            // BF16 power-of-two words widen by placement alone (word << 16); never F16C.
+            const __m512 base = scaleEncoding() == CPUNativeVNNIScaleEncoding::PowerOfTwoBF16
+                ? _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(words), 16))
+                : _mm512_cvtph_ps(words);
             if (!usesNibbleLUTSourceScale() && !usesIQ3SExpandedSourceScale()) return base;
             const __m512i raw = _mm512_cvtepu16_epi32(_mm256_load_si256(
                 reinterpret_cast<const __m256i *>(primary + 64)));
@@ -394,8 +414,10 @@ namespace llaminar2::cpu::native_vnni
          */
         [[nodiscard]] inline __m256 loadScales256(const uint16_t *primary) const
         {
-            const __m256 base = _mm256_cvtph_ps(_mm_load_si128(
-                reinterpret_cast<const __m128i *>(primary)));
+            const __m128i words = _mm_load_si128(reinterpret_cast<const __m128i *>(primary));
+            const __m256 base = scaleEncoding() == CPUNativeVNNIScaleEncoding::PowerOfTwoBF16
+                ? _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(words), 16))
+                : _mm256_cvtph_ps(words);
             if (!usesNibbleLUTSourceScale() && !usesIQ3SExpandedSourceScale()) return base;
             const __m256i raw = _mm256_cvtepu16_epi32(_mm_load_si128(
                 reinterpret_cast<const __m128i *>(primary + 64)));
@@ -420,7 +442,10 @@ namespace llaminar2::cpu::native_vnni
          */
         inline float blockScale(int c, int kb, int n_local) const
         {
-            const float base = fp16_to_fp32(chunkScales(c, kb)[n_local]);
+            const uint16_t primary_word = chunkScales(c, kb)[n_local];
+            const float base = scaleEncoding() == CPUNativeVNNIScaleEncoding::PowerOfTwoBF16
+                ? native_vnni_scale::floatFromBits(uint32_t{primary_word} << 16)
+                : fp16_to_fp32(primary_word);
             if (usesIQ3SExpandedSourceScale())
             {
                 const auto word = chunkMins(c, kb)[n_local];
@@ -658,7 +683,9 @@ namespace llaminar2::cpu::native_vnni
             // ---------------------------------------------------------------
             const int pb = meta.payload_bytes;
             // Payload offset within native block (after scale, optionally after min)
-            const int payload_offset = (codebook_id == 5) ? 4 : 2; // Q4_1=4, others=2
+            // MXFP4 stores one E8M0 byte before its codes; Q4_1 a half scale and min.
+            const bool mxfp4_source = codebook_id == kNativeVnniMXFP4Codebook;
+            const int payload_offset = mxfp4_source ? 1 : ((codebook_id == 5) ? 4 : 2); // Q4_1=4, others=2
 
 #pragma omp parallel for schedule(static) collapse(2)
             for (int chunk = 0; chunk < N_chunks; ++chunk)
@@ -689,7 +716,19 @@ namespace llaminar2::cpu::native_vnni
                         int row = chunk * 64 + col;
                         const uint8_t *blk = native_blocks + row * native_row_stride + kb * block_size;
 
-                        std::memcpy(&scales_buf[col], blk, 2);
+                        if (mxfp4_source)
+                        {
+                            // Native nibble MXFP4 units always carry the exact BF16
+                            // power-of-two word of their E8M0 scale.
+                            if (meta.scaleEncoding() != CPUNativeVNNIScaleEncoding::PowerOfTwoBF16)
+                                throw std::logic_error("MXFP4 nibble units require the BF16 power-of-two scale encoding");
+                            if (!mxfp4::blockFitsNativeE8M0(blk[0], blk + 1))
+                                throw std::invalid_argument(
+                                    "MXFP4 block exponent is outside the native E8M0 range [2, 252]");
+                            scales_buf[col] = mxfp4::powerOfTwoBF16Word(mxfp4::preparedNativeE8M0Byte(blk[0]));
+                        }
+                        else
+                            std::memcpy(&scales_buf[col], blk, 2);
                         if (codebook_id == 5)
                             std::memcpy(&mins_buf[col], blk + 2, 2);
                         std::memcpy(payload_buf + col * pb, blk + payload_offset, pb);
@@ -999,6 +1038,7 @@ namespace llaminar2::cpu::native_vnni
                                 .emins_array = nullptr,
                                 .destination_block_origin = first_kb,
                                 .destination_block_count = block_count,
+                                .primary_layout = out.primaryScaleLayout(),
                             };
                             for (int local_kb = 0; local_kb < block_count; ++local_kb)
                             {

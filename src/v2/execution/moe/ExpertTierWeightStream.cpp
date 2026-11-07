@@ -93,7 +93,8 @@ namespace llaminar2
          */
         bool isNibbleCodebook(uint8_t codebook) noexcept
         {
-            return codebook == 0 || codebook == 4 || codebook == 5;
+            return codebook == 0 || codebook == 4 || codebook == 5 ||
+                   codebook == kNativeVnniMXFP4Codebook;
         }
 
         /**
@@ -156,7 +157,7 @@ namespace llaminar2
                 {
                     return reject(
                         error,
-                        "Nibble CPU stream requires codebook 0, 4, or 5 and a 16-byte payload");
+                        "Nibble CPU stream requires codebook 0, 4, 5 or 25 (MXFP4) and a 16-byte payload");
                 }
                 codebook = cpu.codebook_id;
                 payload_bytes = 16;
@@ -1006,7 +1007,7 @@ namespace llaminar2
         const size_t blocks =
             static_cast<size_t>(N) * static_cast<size_t>(blocks_per_row);
         if (payload.size() != blocks * payload_bytes_per_block ||
-            scales.size() != blocks ||
+            scales.size() != nativeVnniScalePlaneStorageWords(codebook_id, blocks) ||
             mins.size() != (is_asymmetric ? blocks : 0) ||
             emins.size() != (has_emins ? blocks : 0))
         {
@@ -1300,7 +1301,7 @@ namespace llaminar2
         const size_t block_count =
             static_cast<size_t>(output.N) * output.blocks_per_row;
         output.payload.resize(block_count * payload_bytes);
-        output.scales.resize(block_count);
+        output.scales.assign(nativeVnniScalePlaneStorageWords(output.codebook_id, block_count), uint16_t{0});
         if (gpu_asym)
             output.mins.resize(block_count);
         if (gpu_emins)
@@ -1341,12 +1342,17 @@ namespace llaminar2
                                 interleavedValueOffset(cpu, n, kb, value)];
                     }
                     // Compensation is CPU-only derived metadata and is not returned.
+                    // The CPU unit word becomes the exact GPU plane element (one
+                    // E8M0 byte for MXFP4, the FP16 word otherwise).
+                    uint16_t cpu_scale_word = 0;
                     std::memcpy(
-                        &output.scales[linear],
+                        &cpu_scale_word,
                         cpu.native_interleaved.data() +
                             unit + cpu.data_stride + 128u +
                             static_cast<size_t>(n % 64) * sizeof(uint16_t),
                         sizeof(uint16_t));
+                    if (!output.setScaleWord(linear, cpu_scale_word))
+                        return reject(error, "CPU unit scale word is not an admitted native E8M0 power of two");
                     if (cpu.is_asymmetric || cpu.usesNibbleLUTSourceScale())
                     {
                         std::memcpy(
@@ -1394,6 +1400,7 @@ namespace llaminar2
                             cpu.native_interleaved[
                                 interleavedValueOffset(cpu, n, kb, value)];
                     }
+                    // Expanded INT8 units carry ordinary FP16 scales (2-byte plane).
                     std::memcpy(
                         &output.scales[linear],
                         cpu.native_interleaved.data() +
@@ -1556,11 +1563,12 @@ namespace llaminar2
                             static_cast<size_t>(local_column) * sizeof(int16_t),
                         &compensation,
                         sizeof(compensation));
+                    const uint16_t cpu_scale_word = gpu.scaleWord(linear);
                     std::memcpy(
                         output.native_interleaved.data() +
                             unit + output.data_stride + 128u +
                             static_cast<size_t>(local_column) * sizeof(uint16_t),
-                        &gpu.scales[linear],
+                        &cpu_scale_word,
                         sizeof(uint16_t));
                     if (output.is_asymmetric || output.usesNibbleLUTSourceScale())
                     {

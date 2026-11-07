@@ -195,8 +195,9 @@ static int serialEquivalentPolicyN(int actual_n)
 template <uint8_t ExecutionCodebook>
 inline constexpr uint8_t trainedPolicyCodebook()
 {
-    if constexpr (ExecutionCodebook == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook)
-        return 4; // Exact source4 schedule; physical template/cache remains 24.
+    if constexpr (ExecutionCodebook == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook ||
+                  ExecutionCodebook == llaminar2::kNativeVnniMXFP4Codebook)
+        return 4; // Exact source4 schedule; physical template/cache remains 24/25.
     return ExecutionCodebook ==
                    llaminar2::kNativeVnniExpandedInt8MinCodebook
                ? static_cast<uint8_t>(19)
@@ -663,7 +664,7 @@ namespace
                 dot_lo,
                 dot_hi,
                 scale_a,
-                d_scales[linear],
+                ::llaminar2::native_vnni_scale::loadStagedPrimary<CB>(d_scales, linear),
                 secondary_bits,
                 emin_bits,
                 sum_a,
@@ -1635,7 +1636,7 @@ namespace
                 }
 
                 const auto scales = llaminar2::cuda_native_vnni::native_vnni_dual_scales_rn<CB>(
-                    d_scales_rm[linear], d_mins_rm ? d_mins_rm[linear] : uint16_t{0});
+                    ::llaminar2::native_vnni_scale::loadStagedPrimary<CB>(d_scales_rm, linear), d_mins_rm ? d_mins_rm[linear] : uint16_t{0});
                 const float scale_lo = scales.low;
                 const float scale_hi = scales.high;
                 acc += scale_a * (scale_lo * static_cast<float>(dot_lo) + scale_hi * static_cast<float>(dot_hi));
@@ -1677,7 +1678,7 @@ namespace
                 }
 
                 const float scale_b = llaminar2::cuda_native_vnni::native_vnni_single_scale_rn<CB>(
-                    d_scales_rm[linear], d_mins_rm ? d_mins_rm[linear] : uint16_t{0});
+                    ::llaminar2::native_vnni_scale::loadStagedPrimary<CB>(d_scales_rm, linear), d_mins_rm ? d_mins_rm[linear] : uint16_t{0});
                 acc += scale_a * scale_b * static_cast<float>(dot);
 
                 if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_asymmetric)
@@ -1809,7 +1810,7 @@ namespace
             if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CB>::is_dual_scale)
             {
                 const auto scales = llaminar2::cuda_native_vnni::native_vnni_dual_scales_rn<CB>(
-                    d_scales_rm[linear], d_mins_rm ? d_mins_rm[linear] : uint16_t{0});
+                    ::llaminar2::native_vnni_scale::loadStagedPrimary<CB>(d_scales_rm, linear), d_mins_rm ? d_mins_rm[linear] : uint16_t{0});
                 const float scale_lo = scales.low;
                 const float scale_hi = scales.high;
                 const uint32_t emin = d_emins_rm ? d_emins_rm[linear] : 0u;
@@ -1870,7 +1871,7 @@ namespace
             else
             {
                 const float scale_b = llaminar2::cuda_native_vnni::native_vnni_single_scale_rn<CB>(
-                    d_scales_rm[linear], d_mins_rm ? d_mins_rm[linear] : uint16_t{0});
+                    ::llaminar2::native_vnni_scale::loadStagedPrimary<CB>(d_scales_rm, linear), d_mins_rm ? d_mins_rm[linear] : uint16_t{0});
                 const float min_b = d_mins_rm ? llaminar2::cuda_native_vnni::fp16_bits_to_float(d_mins_rm[linear]) : 0.0f;
 
 #pragma unroll
@@ -4189,7 +4190,7 @@ extern "C"
             d_C_existing,
             d_bias,
             codebook_id,
-            codebook_id == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook ? uint8_t{4} : codebook_id,
+            llaminar2::nativeVnniPolicyCodebook(codebook_id),
             cuda_device_id,
             stream,
             gemv_ctx,
@@ -4294,7 +4295,7 @@ extern "C"
             d_C_existing,
             d_bias,
             codebook_id,
-            codebook_id == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook ? uint8_t{4} : codebook_id,
+            llaminar2::nativeVnniPolicyCodebook(codebook_id),
             cuda_device_id,
             stream,
             gemv_ctx,

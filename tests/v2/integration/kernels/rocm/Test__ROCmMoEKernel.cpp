@@ -19654,6 +19654,20 @@ TEST(Test__ROCmMoEKernel, GroupedExpertGateUpDecode_IQ4_NLMatchesSerialDecodeByt
                                             { return TestTensorFactory::createIQ4_NLRandom({rows, cols}); });
 }
 
+/**
+ * @test MXFP4 grouped gate/up decode matches serial decode bytes.
+ *
+ * MXFP4 executes physical decoder 25 under IQ4_NL's arithmetic policy (4).
+ * The device descriptor-policy reader must resolve 25 to the populated
+ * policy-4 K-partition entry; an unmapped 25 reads an empty table entry.
+ */
+TEST(Test__ROCmMoEKernel, GroupedExpertGateUpDecode_MXFP4MatchesSerialDecodeBytes)
+{
+    SKIP_IF_NO_ROCM();
+    runGroupedExpertGateUpDecodeFormatMatch("MXFP4", [](size_t rows, size_t cols)
+                                            { return TestTensorFactory::createMXFP4Random({rows, cols}); });
+}
+
 TEST(Test__ROCmMoEKernel, GroupedExpertGateUpDecode_Q4_1MatchesSerialDecodeBytes)
 {
     SKIP_IF_NO_ROCM();

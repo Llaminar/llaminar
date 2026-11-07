@@ -311,6 +311,7 @@ extern "C" cudaError_t launch_embedding_lookup_native(
         LLAMINAR_EMBED_SOURCE(IQ3_S);
         LLAMINAR_EMBED_SOURCE(IQ4_NL);
         LLAMINAR_EMBED_SOURCE(IQ4_XS);
+        LLAMINAR_EMBED_SOURCE(MXFP4);
     default: return cudaErrorInvalidValue;
     }
 #undef LLAMINAR_EMBED_SOURCE

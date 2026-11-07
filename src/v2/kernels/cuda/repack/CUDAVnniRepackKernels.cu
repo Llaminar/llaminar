@@ -15,6 +15,8 @@
  * schedule are unchanged; the coefficient is storage metadata, never a minimum.
  */
 
+#include "tensors/MXFP4Format.h"
+#include "tensors/NativeVnniScalePlane.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdio>
@@ -215,6 +217,41 @@ __global__ void cuda_repack_q4_0_to_vnni(
     copy16(d_payload + packedVnniPayloadOffset(linear, 16, destination), blk.qs);
 
     d_scales[linear] = blk.d;
+}
+
+// ============================================================================
+// Kernel 1b: MXFP4 repack (17-byte E8M0 + FP4 E2M1 blocks)
+// ============================================================================
+
+/**
+ * @brief Keep MXFP4 code bytes verbatim and publish the native E8M0 scale byte.
+ *
+ * Source blocks are 17 bytes, so they are read bytewise (no 4-byte alignment).
+ * The primary plane is one byte per block (nativeVnniScalePlaneBytes(25) == 1),
+ * addressed through the byte view of @p d_scales. The host reader has already
+ * rejected any nonzero block outside the native range [2, 252]
+ * (mxfp4::blockFitsNativeE8M0); an all-zero block with an unadmitted exponent
+ * publishes the zero marker 0.
+ */
+__global__ void cuda_repack_mxfp4_to_vnni(
+    const uint8_t* __restrict__ d_raw,
+    uint8_t*       __restrict__ d_payload,
+    uint16_t*      __restrict__ d_scales,
+    int N, int blocks_per_row,
+    PackedVnniDestination destination)
+{
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    const int b = blockIdx.y;
+    if (n >= N || b >= blocks_per_row) return;
+
+    const uint8_t* blk = d_raw + (static_cast<size_t>(n) * blocks_per_row + b) * llaminar2::mxfp4::kSourceBlockBytes;
+    const size_t linear = packedVnniLinearIndex(n, b, destination);
+    uint8_t* out = d_payload + packedVnniPayloadOffset(linear, 16, destination);
+#pragma unroll
+    for (int i = 0; i < 16; ++i)
+        out[i] = blk[1 + i];
+    static_assert(llaminar2::nativeVnniScalePlaneBytes(llaminar2::kNativeVnniMXFP4Codebook) == 1);
+    reinterpret_cast<uint8_t*>(d_scales)[linear] = llaminar2::mxfp4::preparedNativeE8M0Byte(blk[0]);
 }
 
 // ============================================================================
@@ -1137,6 +1174,14 @@ bool launchVnniRepackCUDA(
         dim3 grid((N + 255) / 256, blocks_per_row);
         cuda_repack_q4_0_to_vnni<<<grid, block, 0, cuda_stream>>>(
             static_cast<const Q4_0Block*>(d_raw_blocks),
+            d_payload, d_scales, N, blocks_per_row, destination);
+        break;
+    }
+    case RepackFormat::MXFP4: {
+        dim3 block(256, 1);
+        dim3 grid((N + 255) / 256, blocks_per_row);
+        cuda_repack_mxfp4_to_vnni<<<grid, block, 0, cuda_stream>>>(
+            static_cast<const uint8_t*>(d_raw_blocks),
             d_payload, d_scales, N, blocks_per_row, destination);
         break;
     }

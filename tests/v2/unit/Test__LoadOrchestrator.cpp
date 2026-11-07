@@ -228,7 +228,7 @@ namespace llaminar2
         orch.addDevice(0);
 
         orch.planWeight(0, "attn_q", 1024, 1024, kQ4PayloadBytes,
-                        false, false, 524288);
+                        false, false, NativeVnniScalePlaneWidth::FP16Word, 524288);
 
         auto *pool = orch.getPool(0);
         ASSERT_NE(pool, nullptr);
@@ -265,9 +265,9 @@ namespace llaminar2
         orch.addDevice(1);
 
         orch.planWeight(0, "w_dev0", 512, 1024, kQ4PayloadBytes,
-                        false, false, 262144);
+                        false, false, NativeVnniScalePlaneWidth::FP16Word, 262144);
         orch.planWeight(1, "w_dev1", 256, 512, kQ4PayloadBytes,
-                        true, false, 131072);
+                        true, false, NativeVnniScalePlaneWidth::FP16Word, 131072);
 
         auto *pool0 = orch.getPool(0);
         auto *pool1 = orch.getPool(1);
@@ -285,7 +285,7 @@ namespace llaminar2
     {
         LoadOrchestrator orch;
         orch.addDevice(0);
-        orch.planWeight(0, "w1", 64, 64, kQ4PayloadBytes, false, false, 1024);
+        orch.planWeight(0, "w1", 64, 64, kQ4PayloadBytes, false, false, NativeVnniScalePlaneWidth::FP16Word, 1024);
 
         ASSERT_NO_THROW(orch.allocate(1024, 3));
 
@@ -612,7 +612,7 @@ namespace llaminar2
 
     TEST(Test__LoadOrchestrator, CoalescingIsTotalAcrossEveryGpuRepackFormat)
     {
-        constexpr std::array<RepackFormat, 22> formats = {
+        constexpr std::array<RepackFormat, 23> formats = {
             RepackFormat::Q4_0, RepackFormat::IQ4_NL, RepackFormat::Q4_1,
             RepackFormat::Q5_0, RepackFormat::Q5_1, RepackFormat::Q4_K,
             RepackFormat::Q5_K, RepackFormat::Q6_K, RepackFormat::Q3_K,
@@ -620,7 +620,7 @@ namespace llaminar2
             RepackFormat::IQ3_XXS, RepackFormat::IQ2_S, RepackFormat::IQ2_XS,
             RepackFormat::IQ2_XXS, RepackFormat::IQ1_S, RepackFormat::IQ1_M,
             RepackFormat::Q8_0, RepackFormat::Q8_1, RepackFormat::Q8_K,
-            RepackFormat::RAW_FP,
+            RepackFormat::MXFP4, RepackFormat::RAW_FP,
         };
         std::array<uint8_t, 256> source{};
         int owner = 0;
@@ -653,7 +653,7 @@ namespace llaminar2
 
     TEST(Test__LoadOrchestrator, NativeVnniExpertSubregionsAreGapFreeForEveryCodebook)
     {
-        constexpr std::array<const NativeVnniFormatInfo *, 21> formats = {
+        constexpr std::array<const NativeVnniFormatInfo *, 22> formats = {
             &native_vnni_formats::IQ4_NL, &native_vnni_formats::Q8_0,
             &native_vnni_formats::Q8_1, &native_vnni_formats::Q4_0,
             &native_vnni_formats::Q4_1, &native_vnni_formats::Q5_0,
@@ -664,7 +664,7 @@ namespace llaminar2
             &native_vnni_formats::IQ2_XXS, &native_vnni_formats::IQ2_XS,
             &native_vnni_formats::IQ3_XXS, &native_vnni_formats::IQ2_S,
             &native_vnni_formats::IQ3_S, &native_vnni_formats::IQ1_S,
-            &native_vnni_formats::IQ1_M,
+            &native_vnni_formats::IQ1_M, &native_vnni_formats::MXFP4,
         };
         constexpr size_t expert_count = 15;
         constexpr size_t rows_per_expert = 7;
@@ -1144,7 +1144,7 @@ namespace llaminar2
         orch.addDevice(0);
 
         EXPECT_THROW(
-            orch.planWeight(99, "w", 64, 64, kQ4PayloadBytes, false, false, 1024),
+            orch.planWeight(99, "w", 64, 64, kQ4PayloadBytes, false, false, NativeVnniScalePlaneWidth::FP16Word, 1024),
             std::runtime_error);
     }
 

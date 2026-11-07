@@ -570,6 +570,9 @@ def extract_moe_variant_record(
         for roles in layer_roles.values()
         for tensor in roles.values()
     })
+    # "Unsupported" means absent from the tuning format registry, not
+    # unexecutable: MXFP4 runs through NativeVNNI under IQ4_NL's installed
+    # policy but has no tuning corpus, so its variants are not sweep cases.
     unsupported_formats = sorted(set(observed_formats) - set(FORMAT_BY_LABEL))
     return {
         "release_id": release_id,

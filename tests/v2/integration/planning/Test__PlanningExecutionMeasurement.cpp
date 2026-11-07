@@ -389,7 +389,7 @@ namespace
                         job.is_asymmetric = canonicalDeviceVnniFormat(source).is_asymmetric;
                         job.packed_payload_capacity_bytes_per_block = allocation.payload_bytes_per_block;
                         owner->planWeight(device.ordinal, job.name, job.N, job.K,
-                            allocation.payload_bytes_per_block, allocation.has_mins, allocation.has_emins, job.raw_bytes);
+                            allocation.payload_bytes_per_block, allocation.has_mins, allocation.has_emins, NativeVnniScalePlaneWidth::FP16Word, job.raw_bytes);
                     }
                     // Chunk boundaries deliberately cross expert boundaries;
                     // the loader must preserve each group's standalone layout.

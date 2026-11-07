@@ -10,6 +10,7 @@
 #include "kernels/common/DeviceNativeVNNIContributionContract.h"
 #include "kernels/common/GPUQ8ResidualNative.h"
 #include "kernels/common/NativeVNNIPackedBits.h"
+#include "kernels/common/NativeVnniScaleLoad.h"
 #include "tensors/NativeVnniIQ2SScale.h"
 #include "tensors/NativeVnniIQ3SScale.h"
 #include "tensors/NativeVnniIQ4XSScale.h"

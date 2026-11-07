@@ -220,11 +220,11 @@ namespace llaminar2
                 return floatingBytes(spec, deviceFormat(spec.format));
             const size_t block_count =
                 static_cast<size_t>(spec.N) * static_cast<size_t>(spec.K / 32);
-            const size_t scales_bytes = block_count * sizeof(uint16_t);
+            // Capacity follows the spec's plane width (a union keeps the widest).
+            const auto planes = NativeVnniMetadataPlaneBytes::of(
+                block_count, spec.scale_plane, spec.is_asymmetric, spec.has_emins);
             return block_count * static_cast<size_t>(spec.payload_bytes_per_block) +
-                   scales_bytes +
-                   (spec.is_asymmetric ? scales_bytes : 0u) +
-                   (spec.has_emins ? block_count * sizeof(uint32_t) : 0u);
+                   planes.scales + planes.secondary + planes.emins;
         }
 
         /** @return Complete wire size, or union capacity when a raw alias is supplied. */
@@ -294,6 +294,7 @@ namespace llaminar2
                         spec.payload_bytes_per_block,
                         spec.is_asymmetric,
                         spec.has_emins,
+                        spec.scale_plane,
                         /*raw_gguf_bytes=*/0,
                         {.bytes = floatingBytes(spec, floating_capacity)});
                 }
@@ -379,6 +380,8 @@ namespace llaminar2
                     allocation.is_asymmetric || source_it->is_asymmetric;
                 allocation.has_emins =
                     allocation.has_emins || source_it->has_emins;
+                allocation.scale_plane =
+                    widestScalePlane(allocation.scale_plane, source_it->scale_plane);
             }
         }
         return profile;
@@ -464,6 +467,8 @@ namespace llaminar2
                     .has_emins = reusable.has_emins,
                     .codebook_id =
                         canonicalDeviceVnniCodebookId(*source),
+                    .scale_plane = nativeVnniScalePlaneWidth(
+                        canonicalDeviceVnniCodebookId(*source)),
                     .format = projection.format,
                 });
             }
@@ -740,6 +745,7 @@ namespace llaminar2
                     spec.payload_bytes_per_block,
                     spec.is_asymmetric,
                     spec.has_emins,
+                    spec.scale_plane,
                     /*raw_gguf_bytes=*/0,
                     {.bytes = floatingBytes(spec, format_profile.floating_allocation_format)});
             }

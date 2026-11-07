@@ -22,6 +22,7 @@
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "kernels/common/GPUQ8ResidualNative.h"
+#include "kernels/common/NativeVnniScaleLoad.h"
 #include "kernels/common/Q8ResidualGroupedGeometry.h"
 #include "kernels/common/Q8ResidualShortKGeometry.h"
 #include "transfer/TransferEngine.h"
@@ -32,6 +33,7 @@
 #include "kernels/rocm/gemm/ROCmQuantisedActivationProducers.h"
 #endif
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <future>
 #include <gtest/gtest.h>
@@ -167,6 +169,20 @@ struct Planes {
   std::vector<uint32_t> emins;
   bool operator==(const Planes &) const = default;
 };
+/** @brief Download exactly the live primary plane (one E8M0 byte per block for
+ * native MXFP4) and return one staged word per block. */
+std::vector<uint16_t> stagedPrimaryWords(Storage &s, const DeviceNativeVNNIMatrixDesc &d,
+                                         std::size_t blocks) {
+  const auto bytes = s.download(static_cast<const uint8_t *>(d.scales),
+                                nativeVnniScalePlaneLiveBytes(d.codebook_id, blocks));
+  // Re-home the bytes in word storage so loadStagedPrimary reads the same plane layout.
+  std::vector<uint16_t> plane((bytes.size() + 1) / 2, 0);
+  std::memcpy(plane.data(), bytes.data(), bytes.size());
+  std::vector<uint16_t> words(blocks);
+  for (std::size_t i = 0; i < blocks; ++i)
+    words[i] = native_vnni_scale::loadStagedPrimary(d.codebook_id, plane.data(), i);
+  return words;
+}
 /** @brief Terminal snapshot of actual source allocations, never a hot-path
  * source mirror. */
 Planes readPlanes(Storage &s, const DeviceNativeVNNIMatrixDesc &d) {
@@ -176,7 +192,7 @@ Planes readPlanes(Storage &s, const DeviceNativeVNNIMatrixDesc &d) {
       s.download(d.payload, blocks * (d.allocation_payload_bytes_per_block
                                           ? d.allocation_payload_bytes_per_block
                                           : physical.payload_bytes_per_block)),
-      s.download(static_cast<const uint16_t *>(d.scales), blocks),
+      stagedPrimaryWords(s, d, blocks),
       d.mins ? s.download(static_cast<const uint16_t *>(d.mins), blocks)
              : std::vector<uint16_t>{},
       d.emins ? s.download(static_cast<const uint32_t *>(d.emins), blocks)

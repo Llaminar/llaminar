@@ -63,6 +63,8 @@
 #include "tensors/TensorSlice.h"     // TensorSlice - for unwrapping sliced biases
 #include "tensors/BlockStructures.h" // Q8_1Block
 #include "tensors/KernelSnapshotInfo.h"
+#include "tensors/NativeVnniScalePlane.h"
+#include "kernels/common/NativeVnniPrimaryPlaneUpload.h"
 #include "transfer/TransferEngine.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/device/AlignedWorkspaceSlices.h"
@@ -116,6 +118,9 @@ namespace llaminar2
 
             // Upload raw bytes from host to device (nvcc-compiled for CUDA runtime consistency)
             bool cudaQuantGemm_uploadRawBytes(const void *h_src, void **d_dst, size_t bytes, int cuda_device_id);
+            // Primary-plane setup upload with exact live extents (0 = uploaded).
+            int cudaQuantGemm_uploadPrimaryPlane(uint8_t physical_codebook, size_t blocks_per_chunk, size_t chunks,
+                                                 const void *h_src, size_t host_bytes, void **d_dst, int cuda_device_id);
 
             // Memory movement helpers for prepared tensor projections.
             bool cudaQuantGemm_copyHostToDevice(float *d_dst, const float *h_src, size_t count, int cuda_device_id);
@@ -815,8 +820,18 @@ namespace llaminar2
                 CUDAPackedWeights::DeviceUpload &upload,
                 int cuda_device_id)
             {
-                if (!uploadHostArrayToDevice(packed.native_vnni, &upload.d_native_vnni, cuda_device_id) ||
-                    !uploadHostArrayToDevice(packed.native_scales, &upload.d_native_scales, cuda_device_id) ||
+                // The shared primary-plane uploader derives the exact live
+                // extent: an odd one-byte E8M0 plane keeps its rounded storage
+                // capacity but never sends the unused byte.
+                void *d_scales = nullptr;
+                const bool scales_uploaded = cudaQuantGemm_uploadPrimaryPlane(
+                    packed.native_codebook_id,
+                    static_cast<size_t>(packed.N) * packed.native_blocks_per_row, 1,
+                    packed.native_scales.data(), packed.native_scales.size() * sizeof(uint16_t),
+                    &d_scales, cuda_device_id) == 0;
+                upload.d_native_scales = static_cast<uint16_t *>(d_scales);
+                if (!scales_uploaded ||
+                    !uploadHostArrayToDevice(packed.native_vnni, &upload.d_native_vnni, cuda_device_id) ||
                     !uploadHostArrayToDevice(packed.native_mins, &upload.d_native_mins, cuda_device_id) ||
                     !uploadHostArrayToDevice(packed.native_emins, &upload.d_native_emins, cuda_device_id))
                 {
@@ -857,6 +872,7 @@ namespace llaminar2
                 case 0:
                 case 4:
                 case kNativeVnniIQ4XSSourceScaleCodebook:
+                case kNativeVnniMXFP4Codebook:
                 case 5:
                 case 6:
                 case 7:
@@ -1144,7 +1160,8 @@ namespace llaminar2
                                  wt == TensorType::IQ2_S ||
                                  wt == TensorType::IQ3_S ||
                                  wt == TensorType::IQ1_S ||
-                                 wt == TensorType::IQ1_M);
+                                 wt == TensorType::IQ1_M ||
+                                 wt == TensorType::MXFP4);
 
             if (!is_quantized)
             {

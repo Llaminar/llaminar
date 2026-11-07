@@ -19,6 +19,8 @@
 #include "kernels/common/DeviceHalfMetadataContract.h"
 #include "kernels/rocm/repack/VnniRepackKernels.h"
 #include "tensors/BlockStructures.h"
+#include "tensors/MXFP4Format.h"
+#include "tensors/NativeVnniScalePlane.h"
 #include "tensors/NativeVnniQ6Scale.h"
 #include "tensors/NativeVnniIQ2SScale.h"
 #include "tensors/NativeVnniIQ4XSScale.h"
@@ -211,6 +213,43 @@ __global__ void repack_q4_0_to_vnni(
 
     // Copy FP16 scale (already stored as FP16 in GGUF block)
     d_scales[linear] = blk.d;
+}
+
+// ============================================================================
+// Kernel 1b: MXFP4 repack (17-byte E8M0 + FP4 E2M1 blocks)
+// ============================================================================
+
+/**
+ * @brief Keep MXFP4 code bytes verbatim and publish the native E8M0 scale byte.
+ *
+ * Source blocks are 17 bytes, so they are read bytewise (no 4-byte alignment).
+ * The primary plane is one byte per block (nativeVnniScalePlaneBytes(25) == 1),
+ * addressed through the byte view of @p d_scales. The host reader has already
+ * rejected any nonzero block outside the native range [2, 252]
+ * (mxfp4::blockFitsNativeE8M0); an all-zero block with an unadmitted exponent
+ * publishes the zero marker 0.
+ * The payload keeps the IQ4_NL nibble order; codebook 25 selects the lookup.
+ */
+__global__ void repack_mxfp4_to_vnni(
+    const uint8_t* __restrict__ d_raw,
+    uint8_t*       __restrict__ d_payload,
+    uint16_t*      __restrict__ d_scales,
+    int N, int blocks_per_row,
+    PackedVnniDestination destination)
+{
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    const int b = blockIdx.y;
+    if (n >= N || b >= blocks_per_row) return;
+
+    const uint8_t* blk = d_raw +
+        (static_cast<size_t>(n) * blocks_per_row + b) * llaminar2::mxfp4::kSourceBlockBytes;
+    const size_t linear = packedVnniLinearIndex(n, b, destination);
+    uint8_t* out = d_payload + packedVnniPayloadOffset(linear, 16, destination);
+#pragma unroll
+    for (int i = 0; i < 16; ++i)
+        out[i] = blk[1 + i];
+    static_assert(llaminar2::nativeVnniScalePlaneBytes(llaminar2::kNativeVnniMXFP4Codebook) == 1);
+    reinterpret_cast<uint8_t*>(d_scales)[linear] = llaminar2::mxfp4::preparedNativeE8M0Byte(blk[0]);
 }
 
 // ============================================================================
@@ -1272,6 +1311,14 @@ bool launchVnniRepack(
         dim3 grid((N + 255) / 256, blocks_per_row);
         repack_q4_0_to_vnni<<<grid, block, 0, hip_stream>>>(
             static_cast<const Q4_0Block*>(d_raw_blocks),
+            d_payload, d_scales, N, blocks_per_row, destination);
+        break;
+    }
+    case RepackFormat::MXFP4: {
+        dim3 block(256, 1);
+        dim3 grid((N + 255) / 256, blocks_per_row);
+        repack_mxfp4_to_vnni<<<grid, block, 0, hip_stream>>>(
+            static_cast<const uint8_t*>(d_raw_blocks),
             d_payload, d_scales, N, blocks_per_row, destination);
         break;
     }

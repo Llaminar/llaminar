@@ -53,8 +53,11 @@ static constexpr uint32_t PACKED_WEIGHTS_MAGIC = 0x5457504C; // "LPWT" in little
 /// Version6 preserves IQ4_XS original half bases and encoded signed coefficients.
 /// Version5 and earlier archives are rejected before any section is adopted.
 /// Version7 retains IQ3_S original half bases and raw nibbles in CPU encoding5.
+/// Version8 stores native MXFP4 (codebook 25, NibbleLUT) unit scales as BF16
+/// power-of-two words instead of FP16; the codebook/encoding fields are
+/// unchanged, so a version-7 MXFP4 archive would otherwise be misread.
 /// Earlier archives are rejected before any payload is adopted.
-static constexpr uint32_t PACKED_WEIGHTS_VERSION = 7;
+static constexpr uint32_t PACKED_WEIGHTS_VERSION = 8;
 
 #pragma pack(push, 1)
 

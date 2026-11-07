@@ -137,7 +137,9 @@ void verify(int codebook, int payload_bytes, int m, int n, int k,
     const size_t weight_blocks = static_cast<size_t>(blocks) * n;
     int partitions = 0, waves = 0;
     const auto policy = static_cast<uint8_t>(
-        codebook == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook ? 4 :
+        // IQ4_XS-source and MXFP4 physical tuples share IQ4_NL's certified policy.
+        codebook == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook ||
+                codebook == llaminar2::kNativeVnniMXFP4Codebook ? 4 :
         codebook == llaminar2::kNativeVnniExpandedInt8MinCodebook ? 19 : codebook);
     ASSERT_TRUE(rocmGemv_native_vnni_query_serial_m1_config_with_policy(
         policy, n, k, &partitions, &waves));
@@ -174,6 +176,14 @@ void verify(int codebook, int payload_bytes, int m, int n, int k,
             secondary[i] = static_cast<uint16_t>(mixed(i + 77) & 63u);
         }
         minima[i] = scales[i] | (static_cast<uint32_t>(secondary[i]) << 16);
+    }
+    if (llaminar2::nativeVnniScalePlaneBytes(static_cast<uint8_t>(codebook)) == 1)
+    {
+        // Native MXFP4 plane: one admitted E8M0 byte per block (2^-8 .. 2^7),
+        // with zero-marker blocks, in the same word storage.
+        auto *bytes = reinterpret_cast<uint8_t *>(scales.data());
+        for (size_t i = 0; i < weight_blocks; ++i)
+            bytes[i] = mixed(i) % 29 == 3 ? uint8_t{0} : static_cast<uint8_t>(120 + mixed(i) % 16);
     }
     for (size_t i = 0; i < activation.size(); ++i)
         activation[i] = static_cast<int>(mixed(i + 389) % 255) - 127;

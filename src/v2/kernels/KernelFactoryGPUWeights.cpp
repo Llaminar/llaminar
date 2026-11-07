@@ -133,8 +133,12 @@ namespace llaminar::v2::kernels
             auto *payload = static_cast<uint8_t *>(region(slot->d_native_vnni_payload, slot->payload_bytes,
                 product(offset_blocks, allocation.payload_bytes_per_block), product(length_blocks, allocation.payload_bytes_per_block),
                 slot_name, "quantized payload"));
+            // The primary plane width follows the physical decoder (1 byte for
+            // MXFP4's native E8M0 plane); canonical and migration-stable
+            // decoders share it for every format.
+            const size_t scale_plane_bytes = nativeVnniScalePlaneBytes(canonicalDeviceVnniCodebookId(*source));
             auto *scales = static_cast<uint16_t *>(region(slot->d_native_vnni_scales, slot->scales_bytes,
-                product(offset_blocks, sizeof(uint16_t)), product(length_blocks, sizeof(uint16_t)), slot_name, "scales"));
+                product(offset_blocks, scale_plane_bytes), product(length_blocks, scale_plane_bytes), slot_name, "scales"));
             auto *mins = static_cast<uint16_t *>(region(slot->d_native_vnni_mins, slot->mins_bytes,
                 allocation.has_mins ? product(offset_blocks, sizeof(uint16_t)) : 0,
                 allocation.has_mins ? product(length_blocks, sizeof(uint16_t)) : 0, slot_name, "minima"));

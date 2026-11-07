@@ -454,7 +454,7 @@ namespace llaminar2
             const std::size_t blocks =
                 static_cast<std::size_t>(N) * projection.blocks_per_row;
             projection.payload.resize(blocks * format.payload_bytes);
-            projection.scales.resize(blocks);
+            projection.scales.assign(nativeVnniScalePlaneStorageWords(projection.codebook_id, blocks), 0);
             if (projection.is_asymmetric)
                 projection.mins.resize(blocks);
             if (format.has_emins)
@@ -467,6 +467,7 @@ namespace llaminar2
             context.payload_bytes = format.payload_bytes;
             context.payload_array = projection.payload.data();
             context.scales_array = projection.scales.data();
+            context.primary_layout = gpuPrimaryScaleLayout(projection.codebook_id);
             context.mins_array =
                 projection.is_asymmetric ? projection.mins.data() : nullptr;
             context.emins_array =
@@ -1176,7 +1177,7 @@ namespace llaminar2
             constexpr int N = 70;
             constexpr int K = 256;
             constexpr std::uint32_t kUnitsPerChunk = 4;
-            ASSERT_EQ(test::quantizedVerifierFormats().size(), 21u);
+            ASSERT_EQ(test::quantizedVerifierFormats().size(), 22u);
 
             TestHIPStream stream;
             bool rejection_contract_checked = false;
@@ -1241,7 +1242,7 @@ namespace llaminar2
                     .mins = source_mins.data(),
                     .emins = source_emins.data(),
                     .payload_bytes = source_payload.bytes(),
-                    .scales_bytes = source_scales.bytes(),
+                    .scales_bytes = source.scaleLiveBytes(),
                     .mins_bytes = source_mins.bytes(),
                     .emins_bytes = source_emins.bytes(),
                 };
@@ -1341,7 +1342,7 @@ namespace llaminar2
                     .mins = destination_mins.data(),
                     .emins = destination_emins.data(),
                     .payload_bytes = destination_payload.bytes(),
-                    .scales_bytes = destination_scales.bytes(),
+                    .scales_bytes = expected_gpu.scaleLiveBytes(),
                     .mins_bytes = destination_mins.bytes(),
                     .emins_bytes = destination_emins.bytes(),
                 };
@@ -1464,7 +1465,7 @@ namespace llaminar2
                 .mins = source_mins.data(),
                 .emins = source_emins.data(),
                 .payload_bytes = source_payload.bytes(),
-                .scales_bytes = source_scales.bytes(),
+                .scales_bytes = source.scaleLiveBytes(),
                 .mins_bytes = source_mins.bytes(),
                 .emins_bytes = source_emins.bytes(),
             };
@@ -1542,7 +1543,7 @@ namespace llaminar2
                 .mins = destination_mins.data(),
                 .emins = destination_emins.data(),
                 .payload_bytes = destination_payload.bytes(),
-                .scales_bytes = destination_scales.bytes(),
+                .scales_bytes = expected_gpu.scaleLiveBytes(),
                 .mins_bytes = destination_mins.bytes(),
                 .emins_bytes = destination_emins.bytes(),
             };
@@ -1804,7 +1805,7 @@ namespace llaminar2
                 .mins = source_mins.data(),
                 .emins = source_emins.data(),
                 .payload_bytes = source_payload.bytes(),
-                .scales_bytes = source_scales.bytes(),
+                .scales_bytes = source.scaleLiveBytes(),
                 .mins_bytes = source_mins.bytes(),
                 .emins_bytes = source_emins.bytes(),
             };
@@ -2161,7 +2162,7 @@ namespace llaminar2
                 .is_asymmetric = expected_gpu.is_asymmetric,
                 .has_emins = expected_gpu.has_emins,
                 .vnni_bytes = destination_payload.bytes(),
-                .scales_bytes = destination_scales.bytes(),
+                .scales_bytes = expected_gpu.scaleLiveBytes(),
                 .mins_bytes = destination_mins.bytes(),
                 .emins_bytes = destination_emins.bytes(),
             };
@@ -2855,7 +2856,7 @@ namespace llaminar2
                 .mins = mins.data(),
                 .emins = emins.data(),
                 .payload_bytes = payload.bytes(),
-                .scales_bytes = scales.bytes(),
+                .scales_bytes = source.scaleLiveBytes(),
                 .mins_bytes = mins.bytes(),
                 .emins_bytes = emins.bytes(),
             };
@@ -3065,7 +3066,7 @@ namespace llaminar2
                 .mins = mins.data(),
                 .emins = emins.data(),
                 .payload_bytes = payload.bytes(),
-                .scales_bytes = scales.bytes(),
+                .scales_bytes = source.scaleLiveBytes(),
                 .mins_bytes = mins.bytes(),
                 .emins_bytes = emins.bytes(),
             };
@@ -3292,9 +3293,9 @@ namespace llaminar2
             ASSERT_EQ(input_payload.upload(source.payload),hipSuccess);
             ASSERT_EQ(input_scales.upload(source.scales),hipSuccess);ASSERT_EQ(input_coeff.upload(source.mins),hipSuccess);
             ExpertTierGpuConstProjectionView in{.payload=input_payload.data(),.scales=input_scales.data(),.mins=input_coeff.data(),
-                .payload_bytes=input_payload.bytes(),.scales_bytes=input_scales.bytes(),.mins_bytes=input_coeff.bytes()};
+                .payload_bytes=input_payload.bytes(),.scales_bytes = source.scaleLiveBytes(),.mins_bytes=input_coeff.bytes()};
             ExpertTierGpuMutableProjectionView out{.payload=destination_payload.data(),.scales=destination_scales.data(),.mins=destination_coeff.data(),
-                .payload_bytes=destination_payload.bytes(),.scales_bytes=destination_scales.bytes(),.mins_bytes=destination_coeff.bytes()};
+                .payload_bytes=destination_payload.bytes(),.scales_bytes = source.scaleLiveBytes(),.mins_bytes=destination_coeff.bytes()};
             ASSERT_TRUE(in.validFor(demotion));ASSERT_TRUE(out.validFor(promotion));
             std::vector<std::uint8_t> observed_cpu(chunk.bytes()),observed_payload(source.payload.size());
             std::vector<std::uint16_t> observed_scales(source.scales.size()),observed_coeff(source.mins.size());

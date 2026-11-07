@@ -313,7 +313,11 @@
                         for(unsigned byte=0;byte<promoted.payload_bytes_per_block;++byte)
                             EXPECT_EQ(actual_payload[index*promoted.payload_bytes_per_block+byte],
                                 active?promoted.payload[index*promoted.payload_bytes_per_block+byte]:uint8_t(0xa5));
-                        EXPECT_EQ(actual_scales[index],active?promoted.scales[index]:uint16_t(0xa5a5));
+                        // Exact plane bytes (one byte per block for native MXFP4).
+                        const std::size_t scale_width=nativeVnniScalePlaneBytes(promoted.codebook_id);
+                        for(std::size_t byte=0;byte<scale_width;++byte)
+                            EXPECT_EQ(reinterpret_cast<const uint8_t*>(actual_scales.data())[index*scale_width+byte],
+                                active?reinterpret_cast<const uint8_t*>(promoted.scales.data())[index*scale_width+byte]:uint8_t(0xa5));
                         if(!actual_mins.empty())EXPECT_EQ(actual_mins[index],active?promoted.mins[index]:uint16_t(0xa5a5));
                         if(!actual_emins.empty())EXPECT_EQ(actual_emins[index],active?promoted.emins[index]:uint32_t(0xa5a5a5a5));
                     }

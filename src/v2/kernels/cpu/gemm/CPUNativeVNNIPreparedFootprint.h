@@ -26,6 +26,19 @@ namespace llaminar2::cpu::native_vnni
      * Cache policy belongs to this execution encoding because it determines
      * the bytes and decode work seen by the hot kernel.
      */
+    /**
+     * @brief Interpretation of the 16-bit primary scale word in CPU units.
+     *
+     * Chosen from the prepared physical representation, never from the source
+     * codebook alone: rotated (expanded INT8) MXFP4 keeps source codebook 25 but
+     * carries ordinary FP16 scales.
+     */
+    enum class CPUNativeVNNIScaleEncoding : std::uint8_t
+    {
+        FP16 = 0,           ///< IEEE binary16 scale (every format today).
+        PowerOfTwoBF16 = 1, ///< Native MXFP4 E8M0 as mxfp4::powerOfTwoBF16Word.
+    };
+
     enum class CPUNativeVNNIEncoding : std::uint8_t
     {
         NibbleLUT = 0,          ///< Four-bit payload decoded in the hot loop.
@@ -35,6 +48,24 @@ namespace llaminar2::cpu::native_vnni
         NibbleLUTSourceScale = 4, ///< IQ4_XS nibble payload, original half base, raw coefficient.
         IQ3SExpandedSourceScale = 5, ///< Original IQ3_S signed grid, base and raw nibble.
     };
+
+    /**
+     * @brief Scale-word encoding of a prepared CPU unit, derived from its physical identity.
+     * @param codebook_id Source codebook retained by the prepared matrix.
+     * @param encoding Physical prepared encoding.
+     * @return PowerOfTwoBF16 only for MXFP4 in its native nibble encoding;
+     *         rotated (expanded INT8) MXFP4 and every other format carry FP16.
+     *
+     * Derived rather than stored, so no construction or import path can leave
+     * it stale; archives and wire records seal it through their version.
+     */
+    [[nodiscard]] constexpr CPUNativeVNNIScaleEncoding preparedScaleEncoding(
+        std::uint8_t codebook_id, CPUNativeVNNIEncoding encoding) noexcept
+    {
+        return codebook_id == 25 && encoding == CPUNativeVNNIEncoding::NibbleLUT
+                   ? CPUNativeVNNIScaleEncoding::PowerOfTwoBF16
+                   : CPUNativeVNNIScaleEncoding::FP16;
+    }
 
     /**
      * @brief Return whether an encoding value names a supported execution path.

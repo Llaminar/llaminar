@@ -1481,10 +1481,11 @@ namespace llaminar2::test
                 backend,
                 device.ordinal,
                 blocks * layout.gpu_payload_bytes_per_block);
+            // Exact live primary plane (one byte per block for native MXFP4).
             result.scales = std::make_unique<DeviceAllocation>(
                 backend,
                 device.ordinal,
-                blocks * sizeof(uint16_t));
+                nativeVnniScalePlaneLiveBytes(layout.gpu_codebook_id, blocks));
             if (layout.gpu_is_asymmetric != 0u)
             {
                 result.mins = std::make_unique<DeviceAllocation>(
