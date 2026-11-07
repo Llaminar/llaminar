@@ -569,11 +569,18 @@ TEST(CPUProjectionWorkspace, MirroredHeadDeclaresSerialTreeForPhysicalOutput)
     ASSERT_EQ(cpuNativeVNNISerialOutputPartitionN(), 0);
     const auto partials = std::find_if(requirements.buffers.begin(), requirements.buffers.end(),
         [](const auto &buffer) { return buffer.name == kCPUProjectionPartials; });
-    ASSERT_NE(partials, requirements.buffers.end());
     const auto scope = kernel->beginOutputPartitionEquivalenceScope(n, serial_n);
     const auto expected = nativeVNNIProjectionPartialFloats(kernel->packedWeights(), rows);
+#if defined(__aarch64__)
+    // ARM native rows own full-K register trees: the serial policy width needs
+    // no ordered-partial bank, so none may be declared or charged.
+    EXPECT_EQ(partials, requirements.buffers.end());
+    EXPECT_EQ(expected, 0u);
+#else
+    ASSERT_NE(partials, requirements.buffers.end());
     ASSERT_GT(expected, 0u);
     EXPECT_EQ(partials->size_bytes, expected * sizeof(float));
+#endif
     CPUProjectionTestWorkspace workspace(rows, k, requirements);
     ASSERT_TRUE(kernel->multiply_tensor(input.get(), output.get(), rows, n, k,
         true, 1.f, 0.f, nullptr, nullptr, -1, workspace.get()));

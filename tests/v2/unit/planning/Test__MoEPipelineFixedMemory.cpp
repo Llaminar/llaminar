@@ -94,6 +94,8 @@ namespace
             inventory.ranks.resize(1);
             auto &observed = inventory.ranks.front();
             observed.rank = 0;
+            observed.node_id = 0; // A gathered inventory always names the rank's node.
+            observed.local_rank = 0;
             observed.cpu_cores = observed.cpu_worker_threads = 8;
             observed.cpu_execution = test::kSyntheticCPUExecutionGeometry;
             observed.cpu.memory_bytes = observed.cpu.free_memory_bytes = observed.cpu_memory_bytes = 256ULL << 30;
