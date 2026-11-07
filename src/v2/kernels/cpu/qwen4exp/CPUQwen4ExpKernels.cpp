@@ -163,6 +163,22 @@ public:
         const int vectorWidth = cpu_detail::vectorWidth();
         channelBlocks(liveRows(a.extent), a.hidden, [&](std::size_t row, int begin, int end) {
             int channel = begin;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+            // Four-lane copy of the AVX2 program: polynomial sigmoid, one FMA
+            // per branch in branch order, then the separately rounded quarter.
+            if (vectorWidth == 4)
+                for (; channel + 4 <= end; channel += 4)
+                {
+                    auto sum = vdupq_n_f32(0.0f);
+                    for (int branch = 0; branch < 4; ++branch)
+                    {
+                        const auto offset = (row * 4 + branch) * hidden + channel;
+                        sum = vfmaq_f32(sum, neon::fast_sigmoid(vld1q_f32(a.gateLogits + offset)),
+                                        vld1q_f32(a.normalized + offset));
+                    }
+                    vst1q_f32(a.output + row * hidden + channel, vmulq_n_f32(sum, 0.25f));
+                }
+#endif
 #if defined(__AVX512F__)
             if (vectorWidth == 16)
                 for (; channel + 16 <= end; channel += 16)
