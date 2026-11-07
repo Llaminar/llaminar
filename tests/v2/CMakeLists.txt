@@ -18545,8 +18545,6 @@ add_v2_test(V2_Perf_CPUNativeVNNI_DispatchSweep
     MPI_PROCS 1
 )
 
-# Performance Test: CPU NativeVNNI GEMV Decode Sweep (native Q8_0 vs packed VNNI, all models)
-add_executable(v2_perf_cpu_native_vnni_gemv performance/kernels/cpu/native_vnni/Perf__CPUNativeVNNI_GEMV.cpp)
 add_executable(v2_perf_cpu_fused_verifier
     performance/kernels/cpu/native_vnni/Perf__CPUFusedVerifier.cpp)
 target_link_libraries(v2_perf_cpu_fused_verifier PRIVATE
@@ -18579,6 +18577,13 @@ add_v2_test(V2_Perf_CPUFusedVerifier
     MPI_PROCS 1
     NO_MODELS
 )
+# Performance Test: CPU NativeVNNI GEMV Decode Sweep (native Q8_0 vs packed VNNI,
+# all models) and the x86 generated-dispatch trainer/evidence collectors. Its
+# candidates are the AVX2/AVX512 schedule registry; ARM's native programs are
+# measured by the portable thread-scaling and fused-verifier owners and its
+# exact overlays, never by relabelled x86 schedule candidates.
+if(V2_CPU_TARGET_X86)
+add_executable(v2_perf_cpu_native_vnni_gemv performance/kernels/cpu/native_vnni/Perf__CPUNativeVNNI_GEMV.cpp)
 target_link_libraries(v2_perf_cpu_native_vnni_gemv
     llaminar2_core
     GTest::gtest
@@ -18610,6 +18615,8 @@ add_v2_test(V2_Integration_CPUNativeVNNIDispatchEvidencePreparedLayout
     TIMEOUT 30
 )
 
+endif()
+
 # Performance Test: CPU NativeVNNI thread scaling across production regimes.
 add_executable(v2_perf_cpu_native_vnni_thread_scaling
     performance/kernels/cpu/native_vnni/Perf__CPUNativeVNNI_ThreadScaling.cpp)
@@ -18628,6 +18635,7 @@ add_v2_test(V2_Perf_CPUNativeVNNI_ThreadScaling
     TIMEOUT 120
 )
 
+if(V2_CPU_TARGET_X86)
 add_v2_test(V2_Perf_CPUNativeVNNI_VerifierRows
     COMMAND $<TARGET_FILE:v2_perf_cpu_native_vnni_gemv>
             --gtest_filter=*MTP_VerifierRows_GroupedVsSerial_Synthetic
@@ -18653,6 +18661,7 @@ set_property(TEST V2_Perf_CPUNativeVNNI_MoEGateUpFusion
     "LLAMINAR_CPU_NVNNI_MOE_GATEUP_WARMUP=2"
     "LLAMINAR_CPU_NVNNI_MOE_GATEUP_ITERS=5"
 )
+endif()
 
 # Performance Test: CPU Flash Attention Sweep (all models, TP degrees, decode + prefill)
 add_executable(v2_perf_cpu_flash_attention_sweep performance/kernels/cpu/attention/Perf__CpuFlashAttentionSweep.cpp)
