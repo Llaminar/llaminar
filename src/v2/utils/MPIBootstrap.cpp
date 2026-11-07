@@ -19,6 +19,7 @@
 
 #include "MPIBootstrap.h"
 #include "MPISessionOwner.h"
+#include "OpenMPLaunchAffinity.h"
 #include "Logger.h"
 #include "DebugEnv.h"
 #include <fstream>
@@ -748,6 +749,9 @@ namespace llaminar2
         // The helper stays alive until mpirun, local peers and daemon children
         // have actually retired, then removes only its original private roots.
         MPISessionOwner::retireStartupLoansForMPILaunch();
+        // mpirun and its ranks inherit this thread's affinity: hand them the
+        // admitted CPU set, not the place an OpenMP runtime bound it to.
+        const OpenMPLaunchAffinityScope launch_affinity;
         execvp("mpirun", c_argv.data());
 
         // If we get here, exec failed

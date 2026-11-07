@@ -206,12 +206,18 @@ TEST(OriginalOutputSlice, AllSourcesFusedQUnchangedOrdinaryAndGrouped)
                     {.packed=ks.engine->exportCPUNativeVNNIPackedWeights(), .N=256, .ldc=256, .policy_n=kfact.policyColumns()},
                     {.packed=vs.engine->exportCPUNativeVNNIPackedWeights(), .N=256, .ldc=256, .policy_n=vfact.policyColumns()}}};
                 const auto plan=planNativeVNNIFusedRows(descriptors,rows,2);
+#if defined(__aarch64__)
+                // ARM plans keep each member's full-K tree: no shared partial bank.
+                EXPECT_EQ(plan.count,3);
+                EXPECT_EQ(plan.sharedPartialFloats(),0u);
+#else
                 EXPECT_EQ(plan.projections[0].policy_n,128);
                 EXPECT_EQ(plan.projections[1].policy_n,512);
                 EXPECT_EQ(plan.projections[2].policy_n,512);
                 EXPECT_EQ(plan.projections[1].n_chunks,4);
                 EXPECT_EQ(plan.projections[1].k_tiles,
                     serialTileConfigForPackedMatrix(*k.engine->exportCPUNativeVNNIPackedWeights(),512,512,2).k_tiles);
+#endif
             }
             const auto invoke=[&](const auto &projections){return grouped
                 ? q.engine->multiply_fused_verifier_rows_decode_equivalent(input.get(),projections,rows,512,nullptr,workspace.get())

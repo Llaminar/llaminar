@@ -1541,56 +1541,24 @@ configure_policy_accelerators() {
 
 configure_policy_accelerators
 
-detect_cpu_threads_per_socket() {
-  local detected
-  detected="$(lscpu -p=CORE,SOCKET 2>/dev/null | awk -F, '
-    $0 !~ /^#/ { seen[$2 ":" $1] = 1 }
-    END {
-      for (key in seen) {
-        split(key, parts, ":")
-        count[parts[1]]++
-      }
-      best = 0
-      for (socket in count)
-        if (count[socket] > best) best = count[socket]
-      if (best > 0) print best
-    }')"
-  if [[ -n "${detected}" ]]; then
-    printf '%s\n' "${detected}"
-  else
-    nproc
+# Physical CPU topology comes from kernel thread-sibling sets (one authority
+# shared with the CTest host snapshot), not lscpu presentation core labels,
+# which repeat across clusters on hybrid ARM hosts such as GB10. A recorded
+# canonical document may replace the live host for device-free dry runs.
+host_cpu_topology() {
+  local -a document=()
+  if [[ -n "${LLAMINAR_NATIVE_VNNI_REFRESH_HOST_TOPOLOGY:-}" ]]; then
+    document=(--document "${LLAMINAR_NATIVE_VNNI_REFRESH_HOST_TOPOLOGY}")
   fi
+  python3 -B "${repo_root}/tests/v2/cmake/CPUHostTopology.py" "${document[@]}" query "$@"
+}
+
+detect_cpu_threads_per_socket() {
+  host_cpu_topology max-cores-per-package
 }
 
 detect_profiler_cpu_lists() {
-  local requested_threads="$1"
-  local requested_lanes="$2"
-  lscpu -p=CPU,CORE,SOCKET 2>/dev/null | awk -F, \
-    -v wanted="${requested_threads}" -v wanted_lanes="${requested_lanes}" '
-    $0 !~ /^#/ {
-      if (!seen_socket[$3]++) socket_order[socket_count++] = $3
-      key = $3 ":" $2
-      if (seen[key]) next
-      seen[key] = 1
-      if (count[$3] < wanted) cpus[$3, count[$3]++] = $1
-    }
-    END {
-      if (socket_count < wanted_lanes) exit
-      for (lane = 0; lane < wanted_lanes; ++lane) {
-        socket = socket_order[lane]
-        if (count[socket] < wanted) exit
-      }
-      for (lane = 0; lane < wanted_lanes; ++lane) {
-        socket = socket_order[lane]
-        if (lane) printf ";"
-        for (i = 0; i < wanted; ++i) {
-          if (i) printf ","
-          printf "%s", cpus[socket, i]
-        }
-      }
-      printf "\n"
-    }
-  '
+  host_cpu_topology profiler-cpus "$1" "$2"
 }
 
 cpu_lscpu_field() {
@@ -1612,8 +1580,8 @@ cpu_architecture_class() {
   stepping="$(cpu_lscpu_field "Stepping")"
   sockets="$(cpu_lscpu_field "Socket(s)")"
   cores="$(cpu_lscpu_field "Core(s) per socket")"
-  printf 'x86_64-%s-family%s-model%s-step%s-%ssockets-%scores\n' \
-    "${vendor}" "${family}" "${model}" "${stepping}" "${sockets}" "${cores}"
+  printf '%s-%s-family%s-model%s-step%s-%ssockets-%scores\n' \
+    "$(uname -m)" "${vendor}" "${family}" "${model}" "${stepping}" "${sockets}" "${cores}"
 }
 
 sha256_file_set() {
@@ -2001,7 +1969,7 @@ if [[ ! "${paired_max_iterations}" =~ ^[1-9][0-9]*$ ]]; then
   echo "error: --paired-max-iterations must be a positive integer" >&2
   exit 2
 fi
-available_cpu_sockets="$(cpu_lscpu_field "Socket(s)")"
+available_cpu_sockets="$(host_cpu_topology packages)"
 if [[ ! "${available_cpu_sockets}" =~ ^[1-9][0-9]*$ ]]; then
   echo "error: unable to determine physical CPU socket count" >&2
   exit 2

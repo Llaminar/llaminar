@@ -232,6 +232,7 @@ namespace llaminar2
                 if(memory_status!=hipSuccess)
                     throw std::runtime_error("ROCm capacity observation failed at ordinal "+std::to_string(i)+": "+hipGetErrorString(memory_status));
                 dev.free_memory_bytes=free_bytes;
+                dev.memory_backing=prop.integrated?PhysicalMemoryBacking::RankHostPool:PhysicalMemoryBacking::Dedicated;
 
                 // Feature detection based on architecture
                 // gfx900+ supports FP16, gfx908+ supports BF16 and matrix cores

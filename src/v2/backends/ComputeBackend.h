@@ -21,6 +21,7 @@
 #include "DeviceId.h"
 #include "GlobalDeviceAddress.h"
 #include "PeerAccessCoverage.h"
+#include "PhysicalMemoryBacking.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -230,6 +231,8 @@ namespace llaminar2
         std::string pci_bus_address;
         /// Observed device-wide last-level cache; zero means unavailable, not zero-sized hardware.
         size_t last_level_cache_bytes = 0;
+        /// Integrated accelerators draw on the host pool; free_memory_bytes then samples that pool.
+        PhysicalMemoryBacking memory_backing = PhysicalMemoryBacking::Dedicated;
     };
 
     /**

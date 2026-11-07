@@ -821,3 +821,27 @@ TEST(Test__TurboQuantRoundtrip, Rotation_ISA_Parity_RoundTrip)
             << "Cross-ISA round-trip failed for dim=" << dim << " MSE=" << mse;
     }
 }
+
+#if LLAMINAR_COMPILED_WITH_NEON
+/** @test NEON TQ4 dequantize reproduces the exact scalar per-element bytes. */
+TEST(TurboQuantRoundtrip, DequantNeon_ExactScalar)
+{
+    constexpr int D = 64;
+    const TurboQuantContext ctx(D);
+    TQ4Block<D> block;
+    block.norm = 3.0f;
+    block.reconstruction_norm = 1.7f;
+    for (int group = 0; group < D / 8; ++group)
+    {
+        for (int j = 0; j < 8; ++j)
+            block.mse_indices[group * 3 + j] = static_cast<uint8_t>((group * 5 + j) % 8);
+        block.high_bits[group] = static_cast<uint8_t>((group * 3) % 16);
+    }
+    alignas(64) float scratch[D];
+    std::vector<float> scalar_out(D, -9.0f), neon_out(D, -9.0f);
+    turboquant_dequantize_tq4_scalar<D>(block, ctx, scalar_out.data(), scratch);
+    turboquant_dequantize_tq4_neon<D>(block, ctx, neon_out.data(), scratch);
+    EXPECT_EQ(std::memcmp(neon_out.data(), scalar_out.data(), D * sizeof(float)), 0)
+        << "TQ4 NEON dequant bytes";
+}
+#endif

@@ -10,10 +10,13 @@
 #include "kernels/qwen4exp/Qwen4ExpKernels.h"
 #include "kernels/qwen4exp/Qwen4ExpValidation.h"
 #include "kernels/common/MoEProjectionNumericalContract.h"
+#include "kernels/common/DeviceFP32NumericalContract.h"
 #include "tensors/BlockStructures.h"
 #include "utils/CPUFeatures.h"
 #include "utils/OpenMPUtils.h"
+#if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
+#endif
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -117,6 +120,7 @@ inline float nativeVNNIFP16ScaleToFP32(uint16_t value)
 #endif
         return fp16_to_fp32(value);
     }
+#if defined(__AVX2__)
 inline __m256 persistRoundedAVX2(__m256 value) noexcept
     {
 #if defined(__GNUC__) || defined(__clang__)
@@ -175,6 +179,37 @@ static inline __m256 fast_silu(__m256 vx)
             return _mm256_mul_ps(vx, fast_sigmoid(vx));
         }
 }
+#endif
+#if defined(__aarch64__)
+/** @brief Independent per-lane replica of the CPU polynomial exponential program.
+ * Each step is separately rounded except the explicit FMAs, as in the AVX2 and
+ * NEON vector programs; the oracle shares no code with either. */
+namespace lane {
+inline float fastExp(float x)
+{
+    volatile float bounded = std::min(std::max(x, -88.0f), 88.0f);
+    volatile float scaled = bounded * 1.4426950408889634f;
+    const float integer = std::nearbyint(scaled);
+    volatile float fraction = scaled - integer;
+    float polynomial = std::fma(0.001333355814642f, fraction, 0.009618129107629f);
+    polynomial = std::fma(polynomial, fraction, 0.055504108664822f);
+    polynomial = std::fma(polynomial, fraction, 0.240226506959101f);
+    polynomial = std::fma(polynomial, fraction, 0.693147180559945f);
+    polynomial = std::fma(polynomial, fraction, 1.0f);
+    const auto bits = static_cast<std::uint32_t>(static_cast<std::int32_t>(integer) + 127) << 23;
+    float power;
+    std::memcpy(&power, &bits, sizeof(power));
+    return polynomial * power;
+}
+inline float fastSigmoid(float x)
+{
+    volatile float negated = 0.0f - x;
+    volatile float denominator = 1.0f + fastExp(negated);
+    return 1.0f / denominator;
+}
+inline float fastSilu(float x) { return x * fastSigmoid(x); }
+}
+#endif
 namespace cpu_detail {
 #if defined(__AVX512F__)
 inline __m512 sigmoid(__m512 value)
@@ -199,6 +234,10 @@ inline __m512 sigmoid(__m512 value)
 #endif
 inline int vectorWidth()
 {
+#if defined(__aarch64__)
+    // Native ARM ISAs evaluate the four-lane program; scalar stays scalar.
+    return activeISALevel() == ISALevel::Scalar ? 1 : 4;
+#endif
 #if defined(__AVX512F__)
     if (activeISALevel() == ISALevel::AVX512) return 16;
 #endif
@@ -254,6 +293,15 @@ inline void residualDown(const ResidualDownArgs &a, void *)
                     _mm256_storeu_ps(a.output + base + channel, avx2::fast_silu(value));
                 }
 #endif
+#if defined(__aarch64__)
+            if (vectorWidth == 4)
+                for (; channel + 4 <= end; channel += 4)
+                    for (int lane = 0; lane < 4; ++lane)
+                    {
+                        volatile float value = a.input[base + channel + lane] * 0.25f;
+                        a.output[base + channel + lane] = lane::fastSilu(value);
+                    }
+#endif
             for (; channel < end; ++channel)
             {
                 const float scaled = a.input[base + channel] * 0.25f;
@@ -296,6 +344,20 @@ inline void residualRead(const ResidualReadArgs &a, void *)
                     }
                     _mm256_storeu_ps(a.output + row * hidden + channel, _mm256_mul_ps(sum, _mm256_set1_ps(0.25f)));
                 }
+#endif
+#if defined(__aarch64__)
+            if (vectorWidth == 4)
+                for (; channel + 4 <= end; channel += 4)
+                    for (int lane = 0; lane < 4; ++lane)
+                    {
+                        float sum = 0.0f;
+                        for (int branch = 0; branch < 4; ++branch)
+                        {
+                            const auto offset = (row * 4 + branch) * hidden + channel + lane;
+                            sum = std::fma(lane::fastSigmoid(a.gateLogits[offset]), a.normalized[offset], sum);
+                        }
+                        a.output[row * hidden + channel + lane] = sum * 0.25f;
+                    }
 #endif
             for (; channel < end; ++channel)
             {
@@ -513,6 +575,36 @@ inline void quantize_single_block_avx512(const float *src, Q8_1Block &dst)
             dst.sum_qs = static_cast<int16_t>(sum_i32);
         }
 #endif
+#if defined(__aarch64__)
+/** @brief Scalar replica of the frozen AVX2 hardware quantizer: same scale, RNE
+ * conversion (cvtps_epi32) and int8 saturation, independent of production NEON. */
+inline void quantize_single_block_hardware_rne(const float *src, Q8_1Block &dst)
+        {
+            float max_abs = 0.0f;
+            for (int j = 0; j < 32; ++j) max_abs = std::max(max_abs, std::fabs(src[j]));
+            constexpr float MIN_SCALE_THRESHOLD = 1e-10f;
+            if (max_abs < MIN_SCALE_THRESHOLD)
+            {
+                dst.d = 0;
+                dst.sum_qs = 0;
+                std::memset(dst.qs, 0, 32);
+                return;
+            }
+            volatile float d = max_abs / 127.0f;
+            const float id = 1.0f / d;
+            dst.d = fp32_to_fp16(d);
+            int32_t sum = 0;
+            for (int j = 0; j < 32; ++j)
+            {
+                volatile float scaled = src[j] * id;
+                const long rounded = std::lrint(scaled); // RNE under the default mode.
+                const int8_t q = static_cast<int8_t>(std::clamp<long>(rounded, -128, 127));
+                dst.qs[j] = q;
+                sum += q;
+            }
+            dst.sum_qs = static_cast<int16_t>(sum);
+        }
+#endif
 inline void quantize_single_block(const float *src, Q8_1Block &dst, int valid_elements = 32)
         {
             // Partial blocks always use scalar (rare, at row boundaries only)
@@ -540,16 +632,34 @@ inline void quantize_single_block(const float *src, Q8_1Block &dst, int valid_el
                 return;
             }
 #endif
+#if defined(__aarch64__)
+            // Native ARM publication reproduces the x86 hardware quantizer.
+            if (activeISALevel() != ISALevel::Scalar)
+            {
+                quantize_single_block_hardware_rne(src, dst);
+                return;
+            }
+#endif
             quantize_single_block_scalar(src, dst, 32);
         }
 inline void quantizeResidualBlock(const float*input,const Q8_1Block&primary,Q8_1Block&residual,
  llaminar2::CPUProjectionNumericalPolicy policy) {
- alignas(64)float values[32];const auto scale=_mm256_set1_ps(nativeVNNIFP16ScaleToFP32(primary.d));
+ alignas(64)float values[32];
+#if defined(__AVX2__)
+ const auto scale=_mm256_set1_ps(nativeVNNIFP16ScaleToFP32(primary.d));
  for(int i=0;i<32;i+=8) {
   const auto bytes=_mm_loadl_epi64(reinterpret_cast<const __m128i*>(primary.qs+i));
   const auto decoded=persistRoundedAVX2(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(bytes)),scale));
   _mm256_store_ps(values+i,_mm256_sub_ps(_mm256_loadu_ps(input+i),decoded));
  }
+#else
+ // Same program per lane: separately rounded decode product, then one subtraction.
+ const float scale=nativeVNNIFP16ScaleToFP32(primary.d);
+ for(int i=0;i<32;++i) {
+  const float decoded=llaminar2::device_fp32_contract::multiply(float(primary.qs[i]),scale);
+  values[i]=llaminar2::device_fp32_contract::add(input[i],-decoded);
+ }
+#endif
  (void)policy; quantize_single_block(values,residual,32);
 }
 /** @brief Publish complete live blocks using original hardware quantizer/half residual policy. */

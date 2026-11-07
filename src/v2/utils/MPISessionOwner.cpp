@@ -14,6 +14,7 @@
 #endif
 #include "utils/MPISessionOwner.h"
 #include "utils/MPISessionEnvironment.h"
+#include "utils/OpenMPLaunchAffinity.h"
 #include <dlfcn.h>
 #include <array>
 #include <algorithm>
@@ -632,6 +633,9 @@ namespace
                 if(original>=0)require(::posix_spawn_file_actions_adddup2(&actions,original,target));
                 else require(::posix_spawn_file_actions_addclose(&actions,target));
             }
+            // Children inherit this thread's affinity; never the one CPU an
+            // OpenMP runtime bound it to before main().
+            const OpenMPLaunchAffinityScope launch_affinity;
             if(executable.empty())result=::posix_spawnp(&pid,argv[0],&actions,&attributes,argv.data(),environ);
             else result=::posix_spawn(&pid,executable.c_str(),&actions,&attributes,argv.data(),environ);
         } catch (...) {

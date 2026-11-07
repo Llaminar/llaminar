@@ -4,6 +4,10 @@
 # These device-free component tests exercise the actual prepared-bank interfaces
 # and complete-piece publication. They do not claim native shard migration or
 # global placement commit, which require the corresponding physical path gates.
+# Functional replay targets only; Release builds performance targets alone.
+if(V2_PERF_TESTS_ONLY)
+    return()
+endif()
 set(V2_CPU_FRAGMENT_TEST_ENV
     "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false;OPENBLAS_NUM_THREADS=1;MKL_NUM_THREADS=1")
 

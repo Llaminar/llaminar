@@ -7,12 +7,18 @@
  * INT32 lanes makes these small corrections surprisingly expensive. These
  * shared reductions keep the work in narrow integer vectors, without changing
  * any floating-point expression, prepared format, or per-row accumulation order.
+ * AArch64 uses native widening signed reductions; x86 retains bias/SAD. Both
+ * support the complete signed-byte domain without saturated intermediates.
  */
 #pragma once
 
 #include <array>
 #include <cstdint>
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#else
 #include <immintrin.h>
+#endif
 
 namespace llaminar2::cpu::native_vnni
 {
@@ -23,6 +29,10 @@ namespace llaminar2::cpu::native_vnni
      */
     inline int activationHalfSum(const std::int8_t *values) noexcept
     {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        // Sixteen signed bytes fit INT16; widening precedes the reduction.
+        return vaddlvq_s8(vld1q_s8(values));
+#else
         const __m128i bytes = _mm_loadu_si128(
             reinterpret_cast<const __m128i *>(values));
         // Reuse the unsigned-bias constant already needed by compact dots.
@@ -32,6 +42,7 @@ namespace llaminar2::cpu::native_vnni
         const __m128i biased = _mm_xor_si128(bytes, _mm_set1_epi8(-128));
         const __m128i sums = _mm_sad_epu8(biased, _mm_setzero_si128());
         return _mm_cvtsi128_si32(sums) + _mm_extract_epi32(sums, 2) - 2048;
+#endif
     }
 
     /**
@@ -39,13 +50,20 @@ namespace llaminar2::cpu::native_vnni
      * @param values First of exactly 32 readable signed activation bytes.
      * @return Four exact signed sums in increasing activation-column order.
      *
-     * XOR maps signed bytes to [0,255] by adding 128. VPSADBW then sums each
-     * eight-byte group; subtracting 8*128 restores the signed result. No
-     * activation minimum is negated, and no saturating intermediate is used.
+     * AArch64 widens/reduces eight signed bytes directly. On x86, XOR maps
+     * bytes to [0,255] and VPSADBW sums each eight-byte group before removing
+     * its 8*128 bias. Neither implementation negates the activation minimum
+     * or uses a saturating intermediate.
      */
     inline std::array<int, 4> activationQuarterSums(
         const std::int8_t *values) noexcept
     {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        const auto first = vld1q_s8(values);
+        const auto second = vld1q_s8(values + 16);
+        return {vaddlv_s8(vget_low_s8(first)), vaddlv_s8(vget_high_s8(first)),
+                vaddlv_s8(vget_low_s8(second)), vaddlv_s8(vget_high_s8(second))};
+#else
         const __m256i bytes = _mm256_loadu_si256(
             reinterpret_cast<const __m256i *>(values));
         const __m256i biased = _mm256_xor_si256(bytes, _mm256_set1_epi8(-128));
@@ -56,5 +74,6 @@ namespace llaminar2::cpu::native_vnni
                 _mm_extract_epi32(low, 2) - 1024,
                 _mm_cvtsi128_si32(high) - 1024,
                 _mm_extract_epi32(high, 2) - 1024};
+#endif
     }
 }

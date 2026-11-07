@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Device-free regressions for the NativeVNNI dispatch refresh wrapper.
+"""@file test_native_vnni_dispatch_refresh.py
+@brief Device-free regressions for the NativeVNNI dispatch refresh wrapper.
 
 Subprocess fixtures own their binaries, output and Git provenance. These tests
 also run from installed source archives: an enclosing developer checkout must
@@ -24,6 +25,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 SCRIPT = REPO_ROOT / "scripts" / "refresh_native_vnni_dispatch_tables.sh"
+# Every wrapper subprocess inherits one recorded dual-socket host; the live
+# test host's CPU presentation (GB10, a laptop VM) never decides admission.
+os.environ["LLAMINAR_NATIVE_VNNI_REFRESH_HOST_TOPOLOGY"] = str(
+    REPO_ROOT / "tests/v2/fixtures/cpu/dual_socket_28core_smt2_topology.json")
 VALIDATOR = (
     REPO_ROOT
     / "tests"
@@ -1517,13 +1522,17 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         cmake = (REPO_ROOT / "src" / "v2" / "CMakeLists.txt").read_text(
             encoding="utf-8"
         )
+        owner = (REPO_ROOT / "cmake" / "OneDNNBuild.cmake").read_text(
+            encoding="utf-8"
+        )
         dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
 
-        self.assertIn(
-            'set(ONEDNN_BUILD_DIR "${ONEDNN_EXTERNAL_DIR}/build-${ONEDNN_ISA_SUFFIX}")',
-            cmake,
-        )
-        self.assertIn("unset(ONEDNN_LIB CACHE)", cmake)
+        # One owner selects the per-ISA tree and returns its exact manifested
+        # library; no cached name search can carry another ISA's library over.
+        self.assertIn('string(TOLOWER "${LLAMINAR_CPU_ISA_UPPER}" suffix)', owner)
+        self.assertIn('set(build "${source}/build-${suffix}")', owner)
+        self.assertIn("llaminar_prepare_onednn(", cmake)
+        self.assertNotIn("find_library(ONEDNN_LIB", cmake)
         self.assertIn("build-${ONEDNN_ISA_SUFFIX}", dockerfile)
         self.assertIn(
             "build-$(printf '%s' \"${LLAMINAR_CPU_ISA}\"",
@@ -3808,6 +3817,7 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertIn("--require-inventory-m-values 2,3,4", stdout)
 
     def test_cpu_generated_verifier_policy_is_checked_in_and_consumed(self) -> None:
+        """@brief Authenticate policy use and request-grid geometry at their current source owners."""
         source_path = (
             REPO_ROOT
             / "src"
@@ -3821,6 +3831,8 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
 
         self.assertTrue(generated_path.is_file(), "CPU verifier generated policy include is missing")
         source = source_path.read_text(encoding="utf-8")
+        self.assertIn('#include "CPUNativeVNNIExecutionContract.h"', source)
+        source += "\n" + (source_path.parent / "CPUNativeVNNIExecutionContract.h").read_text(encoding="utf-8")
         generated_source = generated_path.read_text(encoding="utf-8")
         self.assertIn("CPUNativeVNNIVerifierRowsPolicyGenerated.inc", source)
         self.assertIn("selectCPUNativeVNNIVerifierRowsGeneratedPolicy", source)
@@ -3865,9 +3877,10 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         # ceil(M/4), now expressed without M+3 overflow by the shared row grid.
         # Explicit request work adds only request-aligned holes/suffixes; it must
         # retain four-row reuse in one workshare rather than serialize requests.
-        grid_begin = source.index("class CPUProjectionRowGrid final")
-        grid_end = source.index("int physical_;", grid_begin)
-        grid = re.sub(r"\s+", "", source[grid_begin:grid_end])
+        grid_source = (REPO_ROOT / "src/v2/kernels/cpu/gemm/CPUProjectionRowGrid.h").read_text(encoding="utf-8")
+        grid_begin = grid_source.index("class CPUProjectionRowGrid final")
+        grid_end = grid_source.index("int physical_;", grid_begin)
+        grid = re.sub(r"\s+", "", grid_source[grid_begin:grid_end])
         self.assertIn(
             "returnwork_?work_->requests()*((work_->rowsPerRequest()-1)/width+1):"
             "(physical_-1)/width+1;",

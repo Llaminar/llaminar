@@ -5,14 +5,20 @@
  * Each vector starts at a row-local channel boundary. A grouped call therefore
  * never turns a serial scalar tail into a vector lane. AVX2 uses the engine's
  * established exponential polynomial; AVX512 evaluates the same FP32 polynomial
- * with the same FMA order. ISA selection changes width, never reduction order.
+ * with the same FMA order. AArch64 evaluates four lanes with the identical
+ * range-reduction/FMA polynomial, native RNE and hardware division. ISA
+ * selection changes width, never reduction order.
  * HC two-term input publication retains the original activated FP32 value,
  * backend nonlinear arithmetic and prepared projection/workspace authority.
  */
 #pragma once
 #include "../simd/AVX2Helpers.h"
 #include "../../../utils/CPUFeatures.h"
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include "../simd/NEONHelpers.h"
+#endif
 #include <cmath>
+#include <stdexcept>
 
 namespace llaminar2::qwen4exp::cpu_detail
 {
@@ -41,6 +47,12 @@ inline __m512 sigmoid(__m512 value)
 /** @brief Select compiled native vector width once per call; scalar is explicit. */
 inline int vectorWidth()
 {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    const auto isa = activeISALevel();
+    if (isa == ISALevel::NEON || isa == ISALevel::NEONDotProd) return 4;
+    if (isa == ISALevel::Scalar) return 1; // Explicit scalar diagnostic program, as on x86.
+    throw std::invalid_argument("Native ARM HC channels require an admitted NEON or scalar ISA");
+#else
 #if defined(__AVX512F__)
     if (activeISALevel() == ISALevel::AVX512) return 16;
 #endif
@@ -48,6 +60,7 @@ inline int vectorWidth()
     if (activeISALevel() >= ISALevel::AVX2) return 8;
 #endif
     return 1;
+#endif
 }
 /** @brief Apply the original ISA-specific /4 SiLU program to a channel interval.
  * @param input Original row base; exact output alias is permitted.
@@ -59,6 +72,16 @@ inline int vectorWidth()
 inline void residualDownChannels(const float* input,float* output,int begin,int end,int vectorWidth)
 {
             int channel = begin;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+            if (vectorWidth != 4 && vectorWidth != 1)
+                throw std::invalid_argument("Native ARM HC channels require their four-lane or scalar program");
+            if (vectorWidth == 4)
+            for (; channel + 4 <= end; channel += 4)
+            {
+                const auto value = vmulq_n_f32(vld1q_f32(input + channel), 0.25f);
+                vst1q_f32(output + channel, neon::fast_silu(value));
+            }
+#endif
 #if defined(__AVX512F__)
             if (vectorWidth == 16)
                 for (; channel + 16 <= end; channel += 16)

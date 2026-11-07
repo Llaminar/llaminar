@@ -13,7 +13,10 @@
 #include <omp.h>
 #include "tensors/TensorClasses.h"
 #include "kernels/cpu/gemm/CPUNativeVNNIGemv.h"
+#include "kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
+#if !defined(__aarch64__)
 #include "kernels/cpu/gemm/CPUNativeAVX2Gemv.h"
+#endif
 #include "../../utils/IQ3SOriginalEquationSource.h"
 namespace llaminar2::test {
 /** @brief Original d times odd source coefficient survives unchanged Q8 arithmetic. */
@@ -48,6 +51,16 @@ TEST(IQ3SOriginalEquation, ScalarAndCompiledSIMDOriginalEquation)
         input[active].qs[0]=int8_t(sign);input[active].qs[31]=int8_t(sign*127);input[active].sum_qs=128*sign;
         const auto original=input;std::vector<float> scalar(source.n);
         gemv_native_vnni_scalar(packed,input.data(),scalar.data(),source.n,eq::k/32);
+#if defined(__aarch64__)
+        // ARM consumes the same prepared bank through its production NEON program.
+        std::vector<float> neon(source.n,-1.0f);
+        gemv_native_vnni_preq(packed,input.data(),neon.data(),{});
+        for(int column=0;column<source.n;++column) {
+            const auto expected=std::bit_cast<uint32_t>(eq::expected(source,column,active,sign));
+            EXPECT_EQ(std::bit_cast<uint32_t>(scalar[column]),expected)<<column;
+            EXPECT_EQ(std::bit_cast<uint32_t>(neon[column]),expected)<<column;
+        }
+#else
         for(int chunk=0;chunk<packed.N_padded/64;++chunk) {
             alignas(64) std::array<float,64> avx2{},avx512{};
             gemv_avx2_chunk_non_nibble(packed,input.data(),avx2.data(),chunk,0,eq::k/32);
@@ -63,6 +76,7 @@ TEST(IQ3SOriginalEquation, ScalarAndCompiledSIMDOriginalEquation)
 #endif
             }
         }
+#endif
         EXPECT_EQ(std::memcmp(input.data(),original.data(),sizeof(input)),0);
     }
 }

@@ -6,6 +6,7 @@
  * fail before a final placement/certificate can exist.
  */
 #include "planning/ImmutableRowTableAdmissionWire.h"
+#include <algorithm>
 #include <gtest/gtest.h>
 #include <array>
 namespace llaminar2::test
@@ -106,14 +107,26 @@ TEST(ImmutableRowTableAdmissionWire, LocalityWireRejectsInvalidOrDiscardedPolicy
 {
     const std::array values{request()};
     const auto valid=serializeImmutableRowTableAdmissionRequests(values);
-    ASSERT_GT(valid.size(),124u);
+    // Locate the locality arm from the wire itself: a whole-host task request
+    // differs from the bound-node request first at that arm byte, wherever
+    // later schema versions place it.
+    auto task=request();
+    task.input=ImmutableRowTablePlacementInput::forConsumers(task.input.extent(),task.input.host(),
+        task.input.consumers(),ImmutableRowTableHostPlacement::fromObservedNUMANode(-1));
+    const std::array task_values{task};
+    const auto task_bytes=serializeImmutableRowTableAdmissionRequests(task_values);
+    ASSERT_EQ(task_bytes.size(),valid.size());
+    const auto first=std::mismatch(valid.begin(),valid.end(),task_bytes.begin());
+    ASSERT_NE(first.first,valid.end());
+    const auto arm=static_cast<std::size_t>(first.first-valid.begin());
+    ASSERT_GT(valid.size(),arm+8);
     for (const auto mutation : {0,1,2,3})
     {
         auto bytes=valid;
         if(mutation==0)bytes[4]=1; // Previous schema has no locality authority.
-        if(mutation==1)bytes[200]=2; // Unknown locality arm.
-        if(mutation==2)bytes[200]=0; // Task arm cannot retain a bound-node payload.
-        if(mutation==3)for(int i=0;i<4;++i)bytes[204+i]=255; // Unrepresentable node.
+        if(mutation==1)bytes[arm]=2; // Unknown locality arm.
+        if(mutation==2)bytes[arm]=0; // Task arm cannot retain a bound-node payload.
+        if(mutation==3)for(int i=0;i<4;++i)bytes[arm+4+i]=255; // Unrepresentable node.
         EXPECT_THROW(parseImmutableRowTableAdmissionRequests(bytes,2),std::invalid_argument)<<mutation;
     }
 }

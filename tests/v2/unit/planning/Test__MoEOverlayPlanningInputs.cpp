@@ -81,7 +81,14 @@ namespace llaminar2
                     topology(backend, world_size > 1));
                 inventory.world_size = world_size;
                 inventory.ranks.resize(world_size);
-                for (int index = 0; index < world_size; ++index) inventory.ranks[index].rank = index;
+                // A gathered inventory always names each rank's node; these
+                // fixture ranks share one host.
+                for (int index = 0; index < world_size; ++index)
+                {
+                    inventory.ranks[index].rank = index;
+                    inventory.ranks[index].node_id = 0;
+                    inventory.ranks[index].local_rank = index;
+                }
                 execution = resolveMoEExpertOverlayExecutionPlan(config.moe_routed_expert_plan,
                     {.current_world_rank = 0, .world_size = world_size});
                 policy = resolveMoEOverlayCapacityAdmissionPolicy(

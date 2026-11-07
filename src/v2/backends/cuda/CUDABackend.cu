@@ -1367,7 +1367,10 @@ namespace llaminar2
                 // backing. Preserve the canonical physical-total identity and
                 // use only the actually observed free bytes for admission.
                 .total_bytes = physical->resource().total_bytes,
-                .admission_available_bytes = before_free}, measured_bytes));
+                .admission_available_bytes = before_free,
+                // An integrated device's fresh free figure is the shared host pool.
+                .backing = physical->resource().backing,
+                .pool_available_bytes = physical->resource().sharesRankHostPool() ? before_free : 0u}, measured_bytes));
         // Allocate host bookkeeping before changing persistent native storage:
         // successful growth must not become unowned on a vector allocation failure.
         auto &retained = nativeContextStorageLeases()[device_id];

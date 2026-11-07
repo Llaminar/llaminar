@@ -21,6 +21,7 @@
 #include "tensors/IQQuantTables.h"
 #include "tensors/VnniPackContext.h"
 #include "kernels/cpu/gemm/CPUNativeVNNIGemv.h"
+#include "kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
 #include "kernels/cpu/gemm/CPUNativeVNNIMultiScaleKernels.h"
 #include "kernels/common/DeviceFP32NumericalContract.h"
 #include "kernels/common/DeviceQ8ActivationNumericalContract.h"
@@ -116,12 +117,13 @@ private:
  * @brief Test one actual SIMD grouped kernel against independent source arithmetic.
  * @tparam Lanes Actual AVX2 eight-column or AVX512 sixteen-column implementation.
  * @tparam Rows Shared-weight row count one through four.
+ * @tparam Ops Exact instruction family; ARM selects ASIMD or DotProd explicitly.
  * @param packed Native prepared matrix including N-tail padding.
  * @param source Immutable original source blocks in row-major superblocks.
  * @param activations Unchanged Q8 rows.
  * @param chunk Destination 64-column chunk.
  */
-template<int Lanes, size_t Rows>
+template<int Lanes, size_t Rows, typename Ops = multi_scale::SIMD<Lanes>>
 void checkSIMD(const CPUNativeVNNIPackedWeights &packed,
     const std::vector<IQ2_SBlock> &source,
     const std::array<std::array<Q8_1Block, kBlocks>, 4> &activations, int chunk)
@@ -133,8 +135,8 @@ void checkSIMD(const CPUNativeVNNIPackedWeights &packed,
     for (bool ordered : {false, true})
     {
         for (auto &row : actual) row.fill(123.0f);
-        if (ordered) multi_scale::dispatchOrdered<Lanes, Rows>(packed, a, output, chunk, kBlocks, 3, 3);
-        else multi_scale::dispatch<Lanes, Rows>(packed, a, output, chunk, 0, kBlocks, false);
+        if (ordered) multi_scale::dispatchOrdered<Lanes, Rows, Ops>(packed, a, output, chunk, kBlocks, 3, 3);
+        else multi_scale::dispatch<Lanes, Rows, Ops>(packed, a, output, chunk, 0, kBlocks, false);
         for (int n = 0; n < 64 && chunk * 64 + n < kN; ++n)
         for (size_t row = 0; row < Rows; ++row)
         {
@@ -319,10 +321,25 @@ TEST_F(IQ2SOriginalEquation, ScalarAndAllSIMDRowsUseOriginalFactors)
     }
     for (int chunk = 0; chunk < 2; ++chunk)
     {
+#if defined(__aarch64__)
+        using ASIMD = multi_scale::NEONMultiScaleOps<multi_scale::NEONByteDot::ASIMD>;
+        checkSIMD<4, 1, ASIMD>(packed, source, activations, chunk);
+        checkSIMD<4, 2, ASIMD>(packed, source, activations, chunk);
+        checkSIMD<4, 3, ASIMD>(packed, source, activations, chunk);
+        checkSIMD<4, 4, ASIMD>(packed, source, activations, chunk);
+#if defined(__ARM_FEATURE_DOTPROD)
+        using DotProd = multi_scale::NEONMultiScaleOps<multi_scale::NEONByteDot::DotProd>;
+        checkSIMD<4, 1, DotProd>(packed, source, activations, chunk);
+        checkSIMD<4, 2, DotProd>(packed, source, activations, chunk);
+        checkSIMD<4, 3, DotProd>(packed, source, activations, chunk);
+        checkSIMD<4, 4, DotProd>(packed, source, activations, chunk);
+#endif
+#else
         checkSIMD<8, 1>(packed, source, activations, chunk);
         checkSIMD<8, 2>(packed, source, activations, chunk);
         checkSIMD<8, 3>(packed, source, activations, chunk);
         checkSIMD<8, 4>(packed, source, activations, chunk);
+#endif
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
         checkSIMD<16, 1>(packed, source, activations, chunk);
         checkSIMD<16, 2>(packed, source, activations, chunk);
