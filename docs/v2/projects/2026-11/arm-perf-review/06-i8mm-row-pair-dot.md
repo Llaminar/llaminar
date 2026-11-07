@@ -1,0 +1,59 @@
+# Idea 6 — I8MM (SMMLA) row-pair dot-product
+
+Status: **Open**. Not implemented; only feature observation exists
+(`ARMCPUFeatures.h`: `IntegerMatMul`, HWCAP2_I8MM). M1's absence is not a
+global deferral for GB10, where both core types are Armv9.2 with I8MM.
+
+## Measured motivation (2026-11-07)
+
+On a dense model the grouped verifier is compute-bound in SDOT. On the Mac VM,
+Q4_K at the 27B gate/up shape (17408x5120, 10 threads):
+
+- M=1 takes 1.10 ms;
+- M=4 takes 2.56 ms (2.3x);
+- four serial rows take 6.23 ms.
+
+On GB10, Qwen3.6-27B MTP dynamic (4.23 tok/s) loses to MTP off (4.61 tok/s)
+at 52-65% acceptance (idea 14). SMMLA's two rows per instruction targets this
+directly. Start with Q4_K and Q8_0 for M >= 2, byte-authenticated against the
+SDOT path on GB10.
+
+## Context
+
+- `CPUNativeNEONMultiScaleOps.h:24` names only `ASIMD`/`DotProd` today; the
+  prepared stream is 64 output columns × 32-K blocks, four interleaved payload
+  bytes per column.
+- SMMLA computes a 2-row × 2-column × 8-K byte block per instruction — two
+  useful result rows per instruction vs one for SDOT, with the same exact INT32
+  sums (no compensation, no saturation).
+- The B operand can be formed by a `vzip1q/vzip2q_s32` of two adjacent 4-byte
+  group words, so no packing ABI change is required.
+
+## Required before admission (all with real evidence)
+
+1. Runtime capability + compiler envelope admission (HWCAP2_I8MM and
+   `__ARM_FEATURE_I8MM`), separate TU/object identity with explicit target.
+2. Integer sum bounds: worst-case magnitudes per format (including the
+   correction/subtraction terms used by each decoder) must fit INT32 — same
+   caution as `NEONAttentionMath::integerDot` (idea 11).
+3. Scale subgroup handling for Q6_K dual-scale and the correction/minimum
+   metadata paths.
+4. Total K-bound coverage where K < 32, odd M (tail rows), odd N.
+5. M=1 economy: row-pair SMMLA should not regress single-row decode (SDOT or
+   a pair-proof fallback); must be proven, not assumed 2x from MAC counts.
+6. All-format byte auth, MTP batch invariance, worker counts 1..20.
+7. M1 must remain exact and unchanged (SMMLA never silently dispatched there).
+
+## Exactness / risk
+
+- Medium: the integer sums are identical, but the decode/metadata arithmetic
+  around them (per-block scales, minima, Q6 planes) must be proven unchanged for
+  every encoding. BFDOT/BFMMLA are explicitly out — their rounding differs from
+  the FP32 contract and cannot silently replace the FP32 program.
+- SVE2 is lower priority: 128-bit vector length on GB10 gives no width gain
+  over NEON; needs evidence before priority.
+
+## Validation
+
+- Perf harness A/B (idea 1): SDOT vs SMMLA for M≥2 grouped/verifier/prefill,
+  per encoding, per core class; byte-auth every timed run.
