@@ -32,6 +32,27 @@
 namespace llaminar2
 {
 
+    void assignNonNUMAHostMemory(std::vector<CPUSocketInfo> &sockets,
+                                 const HostMemoryCapacityObservation &system)
+    {
+        const auto with_memory = std::count_if(sockets.begin(), sockets.end(),
+            [](const CPUSocketInfo &socket) { return socket.memory_bytes > 0; });
+        if (sockets.empty() || with_memory == static_cast<std::ptrdiff_t>(sockets.size()))
+            return;
+        if (with_memory > 0)
+            throw std::runtime_error("Host memory topology is partial: NUMA memory observed for " +
+                std::to_string(with_memory) + " of " + std::to_string(sockets.size()) + " CPU packages");
+        if (sockets.size() > 1)
+            throw std::runtime_error("Host exposes " + std::to_string(sockets.size()) +
+                " CPU packages but no NUMA memory topology; per-package memory cannot be attributed");
+        if (!system.valid())
+            throw std::runtime_error("Host memory capacity is unobservable: no NUMA node memory and no /proc/meminfo total");
+        sockets.front().memory_bytes = system.total_bytes;
+        sockets.front().available_memory_bytes = system.admission_available_bytes;
+        LOG_INFO("[HardwareInventory] No NUMA memory topology; attributing system memory ("
+                 << system.total_bytes / (1024 * 1024) << " MB) to the single CPU package");
+    }
+
     // =========================================================================
     // CPU detection helpers
     // =========================================================================
@@ -195,6 +216,7 @@ namespace llaminar2
                 sockets.push_back(si);
             }
 
+            assignNonNUMAHostMemory(sockets, observeSystemMemoryCapacity());
             return sockets;
         }
     } // anonymous namespace

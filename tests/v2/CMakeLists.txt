@@ -2752,6 +2752,13 @@ add_v2_test(V2_Unit_HostMemoryCapacity
     LABELS "V2;Unit;Backend;CPU;NUMA;Memory;Capacity;Preflight"
     MPI_PROCS 1
 )
+# A NUMA-less Linux host (VM or small ARM server) must admit its system memory.
+add_v2_test(V2_Integration_NonNUMAHostMemoryAttribution
+    COMMAND $<TARGET_FILE:v2_unit_host_memory_capacity>
+        --gtest_filter=HostMemoryCapacity.NonNUMAHostAttributesSystemMemoryToItsSinglePackage
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Memory;Capacity;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NonNUMAHostMemoryAttribution)
 
 # Test: DeviceWorkspaceManager - Per-device GPU workspace buffer management
 add_executable(v2_unit_device_workspace_manager unit/execution/local_execution/device/Test__DeviceWorkspaceManager.cpp)

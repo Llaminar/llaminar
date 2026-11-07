@@ -17,6 +17,7 @@
 #pragma once
 
 #include "CPUSocketInfo.h"
+#include "HostMemoryCapacity.h"
 #include "CPUExecutionGeometry.h"
 #include "ComputeBackend.h"
 #include <string>
@@ -25,6 +26,27 @@
 
 namespace llaminar2
 {
+
+    /**
+     * @brief Attribute machine-wide memory to a host without NUMA memory topology.
+     *
+     * Kernels and VMs without NUMA support (no `/sys/devices/system/node`, libnuma
+     * unavailable, e.g. Docker Desktop's linuxkit or small ARM servers) expose
+     * no per-node capacity, which left every socket with zero memory and made
+     * physical-memory admission reject the host ("requires a valid resource")
+     * before any model was read. Such a host is one memory domain: a single
+     * socket receives the system observation (`/proc/meminfo`), as
+     * `CPUBackend::deviceMemoryTotal` already does at runtime. Sockets that
+     * carry a NUMA observation are never changed.
+     *
+     * @param sockets Detected sockets; modified only when none has NUMA memory.
+     * @param system Machine-wide observation.
+     * @throws std::runtime_error When several packages expose no NUMA memory
+     *         (capacity cannot be attributed), when NUMA memory is observed for
+     *         only some sockets, or when the system observation is invalid.
+     */
+    void assignNonNUMAHostMemory(std::vector<CPUSocketInfo> &sockets,
+                                 const HostMemoryCapacityObservation &system);
 
     /**
      * @brief Policy-scoped hardware inventory for one process on one machine
