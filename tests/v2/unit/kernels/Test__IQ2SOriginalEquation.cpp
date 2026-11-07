@@ -21,6 +21,7 @@
 #include "tensors/IQQuantTables.h"
 #include "tensors/VnniPackContext.h"
 #include "kernels/cpu/gemm/CPUNativeVNNIGemv.h"
+#include "kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
 #include "kernels/cpu/gemm/CPUNativeVNNIMultiScaleKernels.h"
 #include "kernels/common/DeviceFP32NumericalContract.h"
 #include "kernels/common/DeviceQ8ActivationNumericalContract.h"

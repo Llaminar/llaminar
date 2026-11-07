@@ -13,6 +13,7 @@
 #include <omp.h>
 #include "tensors/TensorClasses.h"
 #include "kernels/cpu/gemm/CPUNativeVNNIGemv.h"
+#include "kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
 #if !defined(__aarch64__)
 #include "kernels/cpu/gemm/CPUNativeAVX2Gemv.h"
 #endif

@@ -22,6 +22,7 @@
 #include "kernels/cpu/gemm/CPUNativeVNNIQ6Kernels.h"
 #endif
 #include "kernels/cpu/gemm/CPUNativeVNNIGemv.h"
+#include "kernels/cpu/gemm/CPUNativeVNNIWeightPacker.h"
 #include "kernels/common/DeviceFP32NumericalContract.h"
 
 namespace llaminar2::test
