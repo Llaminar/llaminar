@@ -11,9 +11,13 @@ AMD read links**: BIOS MMIO High Base 4T (1024G unchanged), identity DMA
 verifies 16,384 words per direction with clean driver windows and retirement.
 This is not a BIOS-alone causal experiment. The first Llaminar captured peer
 test subsequently found a byte mismatch with a clean driver window; production
-transport, model and performance qualification remain open. The normal default
-remains ABI 999/P2P-off; the successful identity-DMA entry was one-shot and is
-consumed.
+transport, model and performance qualification remain open. The initial
+identity-DMA trial was a consumed one-shot. The user subsequently authorized
+`GRUB_DEFAULT=llaminar-p2p-trial-identity`: ordinary reboot now selects the same
+kernel 1000/P2P-on/identity-DMA entry. The entry itself was unchanged, no reboot
+was performed, the 10-second menu remains and safe ABI 999/P2P-off plus drivers-
+disabled recovery entries remain selectable. This is boot policy, not native
+inference qualification.
 
 This investigation is separate from QFN arithmetic, ngram caching, RCCL/MPI
 and the large mapped-RAM scatterlist correction. Earlier failure and recovery
@@ -522,7 +526,9 @@ hypothesis but do not establish the original faulty TLP, root-complex behavior
 or final PTE attributes. ATS-off failure shows enabled ATS was not necessary.
 No raw-BAR bypass, DMA-mask widening or blanket IOMMU-disable fix is justified.
 IRQ remapping remains enabled. The firmware change persists across GRUB rollback;
-the consumed one-shot did not promote this configuration to the normal default.
+the trial itself did not promote this configuration. The later user-authorized
+default change is recorded separately in `/tmp/qfn-p2p-default-r915/applied.json`;
+ordinary reboot now returns to identity DMA, with manual safe recovery choices.
 
 Next qualification is the captured-transfer mismatch below, then genuine
 collective and model execution, followed separately by performance. Repeating
@@ -568,7 +574,9 @@ The tested source is the r709 projection at
 `f48c856105f6d1495a4c342ed2cc0c62b4d11273` plus its existing scoped admission-test
 changes; build r710. No Llaminar production code was changed in this host
 experiment. Keep the regression red until its cause is fixed and replayed;
-do not declare P2P production-ready or promote the one-shot boot from this note.
+do not declare P2P production-ready from this note. The subsequent default
+promotion was explicitly user-authorized and does not resolve this captured
+coherence failure or qualify native inference.
 
 After that focused repair, qualification should cover the retained native RCCL
 parent/reentry and four-device captured epoch/gather tests, then the original

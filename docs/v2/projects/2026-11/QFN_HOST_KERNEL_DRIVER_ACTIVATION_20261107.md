@@ -140,8 +140,13 @@ on the new P2P configuration remain unqualified. See the
 versions, committed patch files and both failure and success witnesses. The
 first captured peer-channel test subsequently reports a one-byte mismatch with
 a clean driver window and owned-process retirement; production P2P remains
-unqualified. The identity-DMA entry was a consumed one-shot; the normal default
-remains ABI 999/P2P-off, with no permanent promotion.
+unqualified. The initial identity-DMA trial was a consumed one-shot. The user
+then authorized promotion of the unchanged `llaminar-p2p-trial-identity` entry to
+`GRUB_DEFAULT`: ordinary reboot now selects kernel 1000/P2P-on/`iommu=pt`.
+Verification is `/tmp/qfn-p2p-default-r915/applied.json`; no reboot was performed
+by that change. Menu visibility remains 10 seconds; ABI 999/P2P-off and drivers-
+disabled entries remain available for manual recovery. Default promotion does
+not certify captured transport or native model inference.
 
 Meanwhile, the scoped ROCm4 RAM/Off Current and KnownNext numerical declarations
 build successfully, and seven focused device-free registrations pass with no

@@ -23,12 +23,17 @@ The earlier translated
 DMA configuration still has retained failures with ATS on and off; see the
 [research note](ROCM_PEX_P2P_MMIO_IOMMU_RESEARCH_20261107.md).
 
-The successful identity-DMA entry was a consumed **one-shot**. The normal default
-remains ABI 999/P2P-off; no permanent promotion has occurred.
+The successful identity-DMA trial was initially a consumed **one-shot**. The user
+subsequently authorized making that exact entry the normal default. Verified
+`GRUB_DEFAULT=llaminar-p2p-trial-identity` now selects kernel 1000/P2P-on/identity
+DMA on an ordinary reboot. No reboot accompanied this policy change; the current
+boot identity is unchanged. This promotion is user boot policy, not inference
+qualification.
 
 Recovery configuration is installed and GRUB syntax validation passed:
 
-- Normal default: **Llaminar recovery: Linux 6.17.0-999, AMD P2P OFF**.
+- Normal default: **llaminar-p2p-trial-identity**, Linux 6.17.0-1000/P2P ON/`iommu=pt`.
+- Manual recovery entry: **Llaminar recovery: Linux 6.17.0-999, AMD P2P OFF**.
 - Additional entry: **Llaminar recovery: Linux 6.17.0-999, GPU drivers DISABLED**.
 - GRUB displays the menu for 10 seconds; a failed ordinary boot gets 15 seconds.
 - Persistent journaling synchronizes every second, with a 4 GiB limit and an
@@ -38,7 +43,8 @@ Recovery configuration is installed and GRUB syntax validation passed:
 - Four diagnostic entries exist: ABI 1000 P2P-off, P2P-on, P2P-on with
   `pci=noats`, and P2P-on with identity DMA (`llaminar-p2p-trial-identity`).
   They use the delayed-load service. Each executed one-shot has
-  been consumed; no diagnostic entry became the normal default.
+  been consumed. The identity-DMA entry was later promoted explicitly by the user;
+  its exact boot-entry contents were unchanged.
 
 These are known-bootable recovery choices, not certification that ABI 999 can
 complete every model admission. Its separate large-DMA mapping failure is
@@ -47,13 +53,16 @@ documented in [the activation record](QFN_HOST_KERNEL_DRIVER_ACTIVATION_20261107
 ## Recovery from a trial
 
 The trial uses GRUB's `next_entry`, which is cleared before starting Linux.
-Rehearsal and subsequent actual boots confirmed consumption and preservation
-of the P2P-off normal default. `grub-editenv /boot/grub/grubenv list` may show
+Earlier rehearsal and trial boots confirmed consumption while P2P-off was the
+normal default. After the authorized promotion, consuming or cancelling a
+one-shot returns to the identity-DMA default, **not** automatically to P2P-off.
+`grub-editenv /boot/grub/grubenv list` may show
 `next_entry=` with an empty value; it need not produce entirely empty output.
 The environment resides on ordinary NVMe ext4 without a GRUB abstraction layer.
 
-If automatic recovery does not occur, reset the host through its normal power
-or BMC controls. In the visible GRUB menu choose the P2P-off entry. If GPU-driver
+If the promoted boot fails, use the normal power or BMC recovery controls and
+**manually select the P2P-off recovery entry** in the visible GRUB menu. An ordinary
+reset alone now selects the P2P-on identity-DMA default again. If GPU-driver
 initialization itself still prevents boot, select **GPU drivers DISABLED**.
 That entry deliberately has no `/dev/kfd`; GPU-dependent containers may fail to
 start, while the host console and networking remain the recovery boundary.
@@ -94,14 +103,16 @@ converted into panics. Narrow topology and KFD memory-map debug sites supplement
 ordinary driver logs; no device-wide tracing or broad driver debug flood is
 required for the first attempt. Docker requires successful driver initialization
 and a matching durable ready record on a diagnostic boot; it cannot start merely
-because a failed driver job stopped waiting. On ordinary boots the service's
-condition is false and its Docker gate performs no work.
+because a failed driver job stopped waiting. On original non-probe boot entries,
+the service's condition is false and its Docker gate performs no work. The
+current normal default is the identity-DMA probe entry, so it retains the delayed
+AMD-load service and Docker-ready gate on ordinary reboots.
 
 The native systemd rehearsal used a harmless sleep, a one-second job deadline
 and `JobTimeoutAction=none`. It returned the expected timeout after 1.127 seconds
 while the service was still starting. The real service's actual loaded 90-second
-deadline and recovery actions were checked. Its ordinary-boot condition skipped
-successfully. No panic or reboot was induced by this rehearsal.
+deadline and recovery actions were checked. Its condition skipped successfully
+on the earlier non-probe boot. No panic or reboot was induced by this rehearsal.
 
 ERST stores panic snapshots, not a continuous console: this kernel does not
 enable `CONFIG_PSTORE_CONSOLE`. A total hardware lockup or power loss may leave
@@ -120,7 +131,8 @@ the successful experiment later selected identity DMA explicitly.
 The later `pci=noats` control retains translated DMA-FQ domains. Actual PCI
 snapshots proved ATS disabled and the inspected ACS controls and post-PEX
 resources unchanged. It did not repair the peer read. Do not repeat either
-failed configuration unchanged or turn the diagnostic entry into a default.
+failed translated-DMA configurations unchanged. Their entries were not promoted;
+only the successful identity-DMA entry is now the authorized default.
 The user's subsequent BIOS 4T change is persistent and is **not** reversed by the
 GRUB one-shot recovery mechanism. The 1024G setting was unchanged; preserve the
 firmware preimage independently of boot selection.
@@ -136,9 +148,14 @@ not establish that result. Per-call durable breadcrumbs and full output oracles
 are retained. RCCL and production graph tests still follow this native-access
 checkpoint; they have not been qualified by these reads. The initial captured
 peer-channel test is currently red on byte accuracy, as recorded in the research
-note. No permanent boot promotion has been made.
+note. The user-authorized default promotion is recorded above; it does not
+resolve the captured coherence failure or certify inference.
 
 ## Evidence
+
+- `/tmp/qfn-p2p-default-r915/applied.json`: user-authorized default promotion,
+  unchanged entry, retained recovery choices, GRUB validation and no reboot.
+- `/var/tmp/llaminar-p2p-r906/default-p2p-promotion-r915/`: host configuration preimages.
 
 - `/tmp/qfn-p2p-identity-r911/{mi50-directed-pairs,xtx-directed-pairs}/results.json`:
   all 20 directed native reads, clean windows and process retirement.
