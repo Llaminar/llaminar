@@ -55,5 +55,7 @@ integer dot products; it amortizes weight bandwidth but not arithmetic.
 - End-to-end 27B and 35B MTP off against dynamic, -n 256, unprofiled.
 - The MTP/admission test lanes are available for exhaustive debugging runs
   (project owner, 2026-11-07: mostly for exhaustive debugging; freely runnable,
-  not intended as mandatory CI/CD gates) — use them for verifier-depth and
-  acceptance measurement without making them CI obligations.
+  not intended as mandatory CI/CD gates). Use them **later, on demand, as a
+  perf-debug helper** when this idea is implemented — verifier-depth,
+  acceptance rate and depth-controller behaviour under the measured spin
+  policy — rather than as a now-obligation or a CI check.

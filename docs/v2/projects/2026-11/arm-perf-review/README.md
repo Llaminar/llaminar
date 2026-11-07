@@ -56,9 +56,12 @@ stage attribution, spin sweep, thread scaling, overlay statistics).
   `NibbleMap` decode must be coordinated with the PR #35 lane so there is one
   change certifying all `NibbleMap`/scale representations.
 - **MTP/admission test lanes:** per the project owner (2026-11-07), the MTP/
-  admission test lanes are mostly for exhaustive debugging — they may be run
-  freely for this work (e.g. verifier-depth and acceptance measurement, idea
-  14), but they are **not** intended to become mandatory CI/CD gates.
+  admission test lanes are mostly for exhaustive debugging. Use them **later,
+  on demand, as a perf-debug helper** — e.g. for verifier-depth and acceptance
+  measurement when idea 14 (dense MTP verifier economics) or idea 6 (I8MM) is
+  implemented. They are **not** part of the current work, and **not** intended
+  to become mandatory CI/CD gates. Unit + model-free `ProductionTestPreflight`
+  remain the pass gate.
 - **Mac vs Spark:** Mac (M1 Max, 8P+2E, no libnuma, no production engine
   configure) is the fast correctness loop; DGX Spark (GB10, 10x X925 + 10x
   A725, one NUMA node, CPU/GPU UMA) is where scheduling, memory and bandwidth
