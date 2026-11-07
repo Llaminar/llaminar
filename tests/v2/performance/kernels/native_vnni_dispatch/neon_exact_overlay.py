@@ -10,14 +10,18 @@ entry only where a measured candidate beats it.
 Input rows come from ``Perf__CPUNativeNEONExactOverlay`` (schema
 ``neon-exact-overlay-v1``). For each runtime key (execution codebook, source
 superblock layout, N, K, physical M, workers) every measured source alias must
-provide the complete candidate set with byte-exact output. Aliases sharing one
-runtime key are pooled by the geometric mean of their median latency
-normalised to the total policy. An entry is emitted only when:
+provide the complete candidate set with byte-exact output. Every ``--csv`` is
+one independent replica (a separate collector process); each replica must
+measure every key it shares with the others, and at least ``--min-replicas``
+replicas are required (default 2) so a single run's winner's-curse noise cannot
+install an overlay. Every (alias, replica) measurement of a runtime key is
+pooled by the geometric mean of its median latency normalised to the total
+policy. An entry is emitted only when:
 
 - the winner differs from the total policy,
 - its geometric-mean normalised latency improves by at least
   ``--min-improvement``, and
-- it is not slower than the total policy for any alias.
+- it is not slower than the total policy for any alias in any replica.
 
 Missing candidates, non-exact bytes, duplicate measurements or mixed ISA
 identities fail closed. Unmeasured keys stay on the total policy; nothing is
@@ -81,29 +85,32 @@ def expected_candidates(m: int) -> tuple[tuple[str, int], ...]:
     return tuple((tile, chunks) for chunks in CHUNKS for tile in TILES)
 
 
-def read_rows(paths: Sequence[Path]) -> tuple[list[dict[str, str]], dict[str, str]]:
-    """Read every CSV row and the SHA-256 of each input file."""
+def read_rows(paths: Sequence[Path]) -> tuple[list[tuple[int, dict[str, str]]], dict[str, str]]:
+    """Read every CSV row tagged with its replica index, plus each input SHA-256."""
 
-    rows: list[dict[str, str]] = []
+    rows: list[tuple[int, dict[str, str]]] = []
     digests: dict[str, str] = {}
-    for path in paths:
+    for replica, path in enumerate(paths):
         data = path.read_bytes()
-        digests[str(path)] = hashlib.sha256(data).hexdigest()
+        digest = hashlib.sha256(data).hexdigest()
+        if digest in digests.values():
+            raise OverlayError(f"{path}: identical replica bytes supplied twice")
+        digests[str(path)] = digest
         reader = csv.DictReader(data.decode("utf-8").splitlines())
         if tuple(reader.fieldnames or ()) != FIELDS:
             raise OverlayError(f"{path}: unexpected header {reader.fieldnames}")
-        rows.extend(reader)
+        rows.extend((replica, row) for row in reader)
     if not rows:
         raise OverlayError("no overlay rows")
     return rows, digests
 
 
-def collect(rows: Iterable[Mapping[str, str]]):
-    """Group authenticated rows by runtime key, source alias and candidate."""
+def collect(rows: Iterable[tuple[int, Mapping[str, str]]], replicas: int):
+    """Group authenticated rows by runtime key, (alias, replica) and candidate."""
 
     isas = set()
-    grouped: dict[OverlayKey, dict[str, dict[tuple[str, int], float]]] = {}
-    for row in rows:
+    grouped: dict[OverlayKey, dict[tuple[str, int], dict[tuple[str, int], float]]] = {}
+    for replica, row in rows:
         if row["schema"] != SCHEMA:
             raise OverlayError(f"unsupported schema {row['schema']!r}")
         if row["byte_exact"] != "1":
@@ -120,12 +127,17 @@ def collect(rows: Iterable[Mapping[str, str]]):
         if not math.isfinite(median) or median <= 0.0 or int(row["samples"]) <= 0:
             raise OverlayError(f"invalid timing: {row}")
         sources = grouped.setdefault(key, {})
-        candidates = sources.setdefault(row["source_format"], {})
+        candidates = sources.setdefault((row["source_format"], replica), {})
         if candidate in candidates:
             raise OverlayError(f"duplicate measurement for {key} {row['source_format']} {candidate}")
         candidates[candidate] = median
     if len(isas) != 1:
         raise OverlayError(f"overlay inputs mix ISA identities {sorted(isas)}")
+    for key, sources in grouped.items():
+        for alias in {source for source, _ in sources}:
+            present = sorted(replica for source, replica in sources if source == alias)
+            if present != list(range(replicas)):
+                raise OverlayError(f"{key} {alias} measured by replicas {present}, not all {replicas}")
     return grouped, isas.pop()
 
 
@@ -155,10 +167,11 @@ def decide(grouped, min_improvement: float) -> tuple[list[Entry], list[dict]]:
                 and no_alias_regression)
         decisions.append({
             "key": key.__dict__, "winner": list(winner), "ratio": ratios[winner],
-            "sources": sorted(sources), "emitted": emit,
+            "sources": sorted({source for source, _ in sources}), "emitted": emit,
         })
         if emit:
-            entries.append(Entry(key, winner[0], winner[1], ratios[winner], tuple(sorted(sources))))
+            entries.append(Entry(key, winner[0], winner[1], ratios[winner],
+                                 tuple(sorted({source for source, _ in sources}))))
     return entries, decisions
 
 
@@ -191,11 +204,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--receipt", type=Path, required=True)
     parser.add_argument("--min-improvement", type=float, default=0.03)
+    parser.add_argument("--min-replicas", type=int, default=2)
     args = parser.parse_args(argv)
     if not 0.0 <= args.min_improvement < 1.0:
         raise OverlayError("--min-improvement must be in [0, 1)")
+    if args.min_replicas < 1 or len(args.csv) < args.min_replicas:
+        raise OverlayError(f"{len(args.csv)} replica(s) supplied; at least {args.min_replicas} required")
     rows, digests = read_rows(args.csv)
-    grouped, isa = collect(rows)
+    grouped, isa = collect(rows, len(args.csv))
     entries, decisions = decide(grouped, args.min_improvement)
     rendered = render(entries, isa)
     args.output.write_text(rendered, encoding="utf-8")
@@ -204,6 +220,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "isa": isa,
         "inputs": digests,
         "min_improvement": args.min_improvement,
+        "replicas": len(args.csv),
         "keys": len(decisions),
         "emitted": len(entries),
         "output_sha256": hashlib.sha256(rendered.encode()).hexdigest(),
