@@ -134,6 +134,36 @@ else()
     set(V2_CPU_TARGET_X86 ON)
 endif()
 
+# Native runtime ISA cells registered for ISA-forced CPU tests: every family
+# the compiled envelope can execute, lowest first. Names label tests; the
+# runtime value is the LLAMINAR_ISA_LEVEL spelling accepted by CPUFeatures.h.
+if(V2_CPU_TARGET_X86)
+    set(V2_CPU_NATIVE_ISA_CELLS AVX2)
+    if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+        list(APPEND V2_CPU_NATIVE_ISA_CELLS AVX512)
+    endif()
+else()
+    set(V2_CPU_NATIVE_ISA_CELLS NEON)
+    if(LLAMINAR_CPU_ISA_UPPER STREQUAL "NEON_DOTPROD")
+        list(APPEND V2_CPU_NATIVE_ISA_CELLS NEON_DOTPROD)
+    endif()
+endif()
+list(GET V2_CPU_NATIVE_ISA_CELLS 0 V2_CPU_BASELINE_ISA_CELL)
+
+#[[.rst:
+v2_cpu_native_isa_runtime(<cell> <output>)
+  Map a native ISA cell name to its LLAMINAR_ISA_LEVEL value.
+#]]
+function(v2_cpu_native_isa_runtime cell output)
+    if(cell STREQUAL "NEON_DOTPROD")
+        set(value "neon-dotprod")
+    else()
+        string(TOLOWER "${cell}" value)
+    endif()
+    set(${output} "${value}" PARENT_SCOPE)
+endfunction()
+v2_cpu_native_isa_runtime("${V2_CPU_BASELINE_ISA_CELL}" V2_CPU_BASELINE_RUNTIME_ISA)
+
 # =============================================================================
 # Release-mode guard: only build performance test targets
 # =============================================================================
@@ -1823,11 +1853,8 @@ add_v2_test(V2_Unit_CPURouterQ8Publication
     LABELS "V2;Unit;CPU;MoE;Quantization;ByteExact;Regression"
     MPI_PROCS 1 NO_MODELS NO_MPI
     ENVIRONMENT "LLAMINAR_PERF_STATS_JSON=1;LLAMINAR_PERF_STATS_FILTER=kernel.cpu_moe_router_q8_worker_rows")
-foreach(V2_ROUTER_Q8_ISA AVX2 AVX512)
-    if(V2_ROUTER_Q8_ISA STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
-        continue()
-    endif()
-    string(TOLOWER "${V2_ROUTER_Q8_ISA}" V2_ROUTER_Q8_RUNTIME_ISA)
+foreach(V2_ROUTER_Q8_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
+    v2_cpu_native_isa_runtime("${V2_ROUTER_Q8_ISA}" V2_ROUTER_Q8_RUNTIME_ISA)
     add_v2_test(V2_Integration_CPURouterQ8Publication_${V2_ROUTER_Q8_ISA}
         COMMAND $<TARGET_FILE:v2_test_cpu_router_q8_publication> --gtest_brief=1
         LABELS "V2;Integration;ProductionTestPreflight;CPU;MoE;MTP;AllFormats;${V2_ROUTER_Q8_ISA};ByteExact;Regression"
@@ -7846,16 +7873,17 @@ add_v2_test(V2_Integration_CPUGreedySelector
     MPI_PROCS 1
     NO_MODELS
 )
-add_v2_test(V2_Integration_CPUGreedySelector_ForcedAVX2
+# Forced lowest native family: AVX2 on x86, ASIMD NEON on ARM.
+add_v2_test(V2_Integration_CPUGreedySelector_Forced${V2_CPU_BASELINE_ISA_CELL}
     COMMAND $<TARGET_FILE:v2_test_sampler>
         --gtest_filter=SamplerTest.CPUGreedySelectorRetainsFirstWinnerAndEverySIMDTail
-    LABELS "V2;Integration;CPU;Sampling;MTP;AVX2;Regression"
+    LABELS "V2;Integration;CPU;Sampling;MTP;${V2_CPU_BASELINE_ISA_CELL};Regression"
     MPI_PROCS 1
     NO_MODELS
 )
-if(TEST V2_Integration_CPUGreedySelector_ForcedAVX2)
-    set_tests_properties(V2_Integration_CPUGreedySelector_ForcedAVX2 PROPERTIES
-        ENVIRONMENT "LLAMINAR_ISA_LEVEL=avx2"
+if(TEST V2_Integration_CPUGreedySelector_Forced${V2_CPU_BASELINE_ISA_CELL})
+    set_tests_properties(V2_Integration_CPUGreedySelector_Forced${V2_CPU_BASELINE_ISA_CELL} PROPERTIES
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_CPU_BASELINE_RUNTIME_ISA}"
     )
 endif()
 
@@ -17984,12 +18012,8 @@ target_link_libraries(v2_integration_cpu_projection_workspace PRIVATE
     llaminar2_core GTest::gtest GTest::gtest_main)
 target_include_directories(v2_integration_cpu_projection_workspace PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 set(V2_CPU_PROJECTION_WORKSPACE_PREFLIGHT_TESTS)
-set(V2_CPU_PROJECTION_WORKSPACE_ISAS avx2)
-if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
-    list(APPEND V2_CPU_PROJECTION_WORKSPACE_ISAS avx512)
-endif()
-foreach(V2_CPU_WORKSPACE_ISA IN LISTS V2_CPU_PROJECTION_WORKSPACE_ISAS)
-    string(TOUPPER "${V2_CPU_WORKSPACE_ISA}" V2_CPU_WORKSPACE_ISA_LABEL)
+foreach(V2_CPU_WORKSPACE_ISA_LABEL IN LISTS V2_CPU_NATIVE_ISA_CELLS)
+    v2_cpu_native_isa_runtime("${V2_CPU_WORKSPACE_ISA_LABEL}" V2_CPU_WORKSPACE_ISA)
     set(V2_CPU_WORKSPACE_TEST "V2_Integration_CPU_ProjectionWorkspace_${V2_CPU_WORKSPACE_ISA_LABEL}")
     add_v2_test(${V2_CPU_WORKSPACE_TEST}
         COMMAND $<TARGET_FILE:v2_integration_cpu_projection_workspace> --gtest_brief=1
@@ -18009,11 +18033,8 @@ target_link_libraries(v2_integration_cpu_native_vnni_verifier_workers PRIVATE
     llaminar2_core GTest::gtest GTest::gtest_main)
 target_include_directories(v2_integration_cpu_native_vnni_verifier_workers PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR})
-foreach(V2_VERIFIER_WORKER_ISA AVX2 AVX512)
-    if(V2_VERIFIER_WORKER_ISA STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
-        continue()
-    endif()
-    string(TOLOWER "${V2_VERIFIER_WORKER_ISA}" V2_VERIFIER_WORKER_RUNTIME_ISA)
+foreach(V2_VERIFIER_WORKER_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
+    v2_cpu_native_isa_runtime("${V2_VERIFIER_WORKER_ISA}" V2_VERIFIER_WORKER_RUNTIME_ISA)
     add_v2_test(V2_Integration_CPU_QueryRowWork_${V2_VERIFIER_WORKER_ISA}
         COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_verifier_workers>
             --gtest_filter=AllFormats/CPUQueryRowWork.*:CPUQueryRowWorkRotation.*:CPUQueryRowWorkAdmission.*
@@ -18056,11 +18077,8 @@ foreach(V2_VERIFIER_WORKER_ISA AVX2 AVX512)
 endforeach()
 
 # Same defining equation through real runtime-selected AVX expert workers.
-foreach(V2_IQ2S_FUSED_ISA AVX2 AVX512)
-    if(V2_IQ2S_FUSED_ISA STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
-        continue()
-    endif()
-    string(TOLOWER "${V2_IQ2S_FUSED_ISA}" V2_IQ2S_FUSED_RUNTIME_ISA)
+foreach(V2_IQ2S_FUSED_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
+    v2_cpu_native_isa_runtime("${V2_IQ2S_FUSED_ISA}" V2_IQ2S_FUSED_RUNTIME_ISA)
     add_v2_test(V2_Integration_CPUIQ2SFusedMoEOriginalEquation_${V2_IQ2S_FUSED_ISA}
         COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_verifier_workers>
                 --gtest_filter=CPUNativeVNNIVerifierWorkers.IQ2SOriginalSourceEquationInFusedExpertTransaction
@@ -18076,11 +18094,8 @@ target_link_libraries(v2_integration_cpu_native_vnni_fused_completion PRIVATE
     llaminar2_core GTest::gtest GTest::gtest_main)
 target_include_directories(v2_integration_cpu_native_vnni_fused_completion PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR})
-foreach(V2_FUSED_COMPLETION_ISA AVX2 AVX512)
-    if(V2_FUSED_COMPLETION_ISA STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
-        continue()
-    endif()
-    string(TOLOWER "${V2_FUSED_COMPLETION_ISA}" V2_FUSED_COMPLETION_RUNTIME_ISA)
+foreach(V2_FUSED_COMPLETION_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
+    v2_cpu_native_isa_runtime("${V2_FUSED_COMPLETION_ISA}" V2_FUSED_COMPLETION_RUNTIME_ISA)
     add_v2_test(V2_Integration_CPU_NativeVNNIFusedCompletion_${V2_FUSED_COMPLETION_ISA}
         COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_fused_completion> --gtest_brief=1
         LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeVNNI;MTP;AllFormats;${V2_FUSED_COMPLETION_ISA};ByteExact;Regression"
@@ -18104,9 +18119,12 @@ add_v2_test(V2_Integration_CPUNativeVNNI_GEMV
     MPI_PROCS 1
 )
 set(V2_CPU_MOVABLE_FLOATING_EXPERT_PREFLIGHT_TESTS)
-foreach(V2_FLOATING_EXPERT_ISA IN ITEMS scalar avx2)
-    string(TOUPPER "${V2_FLOATING_EXPERT_ISA}"
-        V2_FLOATING_EXPERT_ISA_LABEL)
+foreach(V2_FLOATING_EXPERT_ISA IN ITEMS scalar ${V2_CPU_BASELINE_RUNTIME_ISA})
+    if(V2_FLOATING_EXPERT_ISA STREQUAL "scalar")
+        set(V2_FLOATING_EXPERT_ISA_LABEL SCALAR)
+    else()
+        set(V2_FLOATING_EXPERT_ISA_LABEL ${V2_CPU_BASELINE_ISA_CELL})
+    endif()
     set(V2_FLOATING_EXPERT_TEST
         "V2_Integration_CPU_MovableFloatingExpertAllFormats_${V2_FLOATING_EXPERT_ISA_LABEL}")
     add_v2_test(${V2_FLOATING_EXPERT_TEST}
@@ -18141,11 +18159,8 @@ add_v2_test(V2_Integration_CPU_NativeVNNI_PrefillHeuristic
     LABELS "V2;Integration;CPU;GEMM;Prefill;Heuristic;AllFormats;NativeVNNI;DecodeEquivalent;Regression"
     MPI_PROCS 1
 )
-foreach(V2_PREFILL_ISA AVX2 AVX512)
-    if(V2_PREFILL_ISA STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
-        continue()
-    endif()
-    string(TOLOWER "${V2_PREFILL_ISA}" V2_PREFILL_RUNTIME_ISA)
+foreach(V2_PREFILL_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
+    v2_cpu_native_isa_runtime("${V2_PREFILL_ISA}" V2_PREFILL_RUNTIME_ISA)
     add_v2_test(V2_Integration_CPU_NativeVNNI_PrefillFourRows_${V2_PREFILL_ISA}
         COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
                 --gtest_filter=CPUNativeVNNIGemvTest.NativeVNNIPrefillFourRowsAllFormatsMatchSerialRows
@@ -18163,8 +18178,11 @@ foreach(V2_PREFILL_ISA AVX2 AVX512)
         NO_MODELS
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_PREFILL_RUNTIME_ISA}")
 endforeach()
-set(V2_CPU_FUSED_VERIFIER_PREFLIGHT_TESTS
-    V2_Integration_CPU_NativeVNNI_PrefillCacheKTile_AVX2)
+set(V2_CPU_FUSED_VERIFIER_PREFLIGHT_TESTS)
+if(V2_CPU_TARGET_X86)
+    list(APPEND V2_CPU_FUSED_VERIFIER_PREFLIGHT_TESTS
+        V2_Integration_CPU_NativeVNNI_PrefillCacheKTile_AVX2)
+endif()
 if(USE_ONEDNN AND ONEDNN_FOUND)
     add_executable(v2_integration_cpu_floating_skinny
         integration/kernels/cpu/native_vnni/Test__CPUFloatingSkinny.cpp)
@@ -18191,6 +18209,8 @@ if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
     list(APPEND V2_CPU_FUSED_VERIFIER_PREFLIGHT_TESTS
         V2_Integration_CPU_NativeVNNI_PrefillCacheKTile_AVX512)
 endif()
+# x86 cache-tiled prefill and unsigned word packing; ARM has neither.
+if(V2_CPU_TARGET_X86)
 add_v2_test(V2_Integration_CPU_NativeVNNI_PrefillCacheKTile_AVX2
     COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
             --gtest_filter=CPUActivationWordPacking.*:CPUNativeVNNIGemvTest.NativeVNNIPrefillCacheKTilesAllFormatsRemainSerialRowByteExact
@@ -18200,11 +18220,9 @@ add_v2_test(V2_Integration_CPU_NativeVNNI_PrefillCacheKTile_AVX2
     NO_MODELS
     ENVIRONMENT "LLAMINAR_ISA_LEVEL=avx2"
 )
-foreach(V2_FUSED_ISA AVX2 AVX512)
-    if(V2_FUSED_ISA STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
-        continue()
-    endif()
-    string(TOLOWER "${V2_FUSED_ISA}" V2_FUSED_RUNTIME_ISA)
+endif()
+foreach(V2_FUSED_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
+    v2_cpu_native_isa_runtime("${V2_FUSED_ISA}" V2_FUSED_RUNTIME_ISA)
     add_v2_test(V2_Integration_CPU_FusedVerifierSchedules_${V2_FUSED_ISA}
         COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
                 --gtest_filter=CPUNativeVNNIGemvTest.MTP_FusedFullKForcedPoliciesAllFormatsRuntimeMMatchSerialDecodeRows
@@ -18240,8 +18258,8 @@ add_v2_test(V2_Integration_GroupedVerifierRows_CPU_AllFormats
 # standalone v2_perf_cpu_moe_expert_verifier_rows benchmark below.
 set(V2_CPU_GPU_ALIGNED_EXPERT_PREFLIGHT_TESTS
     V2_Integration_CPU_CompactMultiScaleIntegerDot
-    V2_Integration_CPU_GPUAlignedExpertOneBlockTree_AllFormats_AVX2
-    V2_Integration_CPU_ContributionRounding_AVX2)
+    V2_Integration_CPU_GPUAlignedExpertOneBlockTree_AllFormats_${V2_CPU_BASELINE_ISA_CELL}
+    V2_Integration_CPU_ContributionRounding_${V2_CPU_BASELINE_ISA_CELL})
 
 # Independent scalar rounding oracle: grouped/serial agreement alone cannot
 # catch a shared compiler contraction defect in their inlined block primitive.
@@ -18263,10 +18281,8 @@ add_executable(v2_integration_cpu_vector_dot_rows
     integration/kernels/cpu/Test__CPUVectorDotRows.cpp)
 target_link_libraries(v2_integration_cpu_vector_dot_rows PRIVATE
     llaminar2_core GTest::gtest GTest::gtest_main)
-foreach(router_isa IN ITEMS avx2 avx512)
-    if(router_isa STREQUAL "avx512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
-        continue()
-    endif()
+foreach(router_isa_CELL IN LISTS V2_CPU_NATIVE_ISA_CELLS)
+    v2_cpu_native_isa_runtime("${router_isa_CELL}" router_isa)
     add_v2_test(V2_Integration_CPU_RouterFourRows_${router_isa}
         COMMAND $<TARGET_FILE:v2_integration_cpu_vector_dot_rows>
         LABELS "V2;Integration;ProductionTestPreflight;CPU;MoE;Router;MTP;Prefill;ByteExact;Regression"
@@ -18283,14 +18299,25 @@ target_link_libraries(v2_integration_cpu_contribution_rounding PRIVATE
 target_compile_features(v2_integration_cpu_contribution_rounding PRIVATE cxx_std_23)
 target_include_directories(v2_integration_cpu_contribution_rounding PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src/v2)
-add_v2_test(V2_Integration_CPU_ContributionRounding_AVX2
-    COMMAND $<TARGET_FILE:v2_integration_cpu_contribution_rounding>
-            --gtest_filter=CPUContributionRounding.AVX2
-    LABELS "V2;Integration;CPU;AVX2;NativeVNNI;MTP;ExpertOverlay;ByteExact;Regression"
-    MPI_PROCS 1
-    NO_MODELS
-    ENVIRONMENT "LLAMINAR_ISA_LEVEL=avx2"
-)
+foreach(V2_CONTRIBUTION_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
+    if(V2_CONTRIBUTION_ISA STREQUAL "AVX512")
+        continue() # Registered below with its own compiled-envelope gate.
+    endif()
+    v2_cpu_native_isa_runtime("${V2_CONTRIBUTION_ISA}" V2_CONTRIBUTION_RUNTIME_ISA)
+    if(V2_CPU_TARGET_X86)
+        set(V2_CONTRIBUTION_FILTER CPUContributionRounding.AVX2)
+    else()
+        set(V2_CONTRIBUTION_FILTER CPUContributionRounding.NEON)
+    endif()
+    add_v2_test(V2_Integration_CPU_ContributionRounding_${V2_CONTRIBUTION_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_contribution_rounding>
+                --gtest_filter=${V2_CONTRIBUTION_FILTER}
+        LABELS "V2;Integration;CPU;${V2_CONTRIBUTION_ISA};NativeVNNI;MTP;ExpertOverlay;ByteExact;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_CONTRIBUTION_RUNTIME_ISA}"
+    )
+endforeach()
 if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
     add_v2_test(V2_Integration_CPU_ContributionRounding_AVX512
         COMMAND $<TARGET_FILE:v2_integration_cpu_contribution_rounding>
@@ -18310,11 +18337,9 @@ add_v2_test(V2_Integration_CPU_CompactMultiScaleIntegerDot
     MPI_PROCS 1
     NO_MODELS
 )
-foreach(V2_ORDERED_EXPERT_ISA IN ITEMS avx2 avx512)
-    if(V2_ORDERED_EXPERT_ISA STREQUAL "avx512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
-        continue()
-    endif()
-    string(TOUPPER "${V2_ORDERED_EXPERT_ISA}" V2_ORDERED_EXPERT_ISA_LABEL)
+foreach(V2_ORDERED_EXPERT_ISA_CELL IN LISTS V2_CPU_NATIVE_ISA_CELLS)
+    v2_cpu_native_isa_runtime("${V2_ORDERED_EXPERT_ISA_CELL}" V2_ORDERED_EXPERT_ISA)
+    set(V2_ORDERED_EXPERT_ISA_LABEL "${V2_ORDERED_EXPERT_ISA_CELL}")
     set(V2_ORDERED_EXPERT_TEST "V2_Integration_CPU_GPUAlignedExpertMultiBlockTree_AllFormats_${V2_ORDERED_EXPERT_ISA_LABEL}")
     add_v2_test(${V2_ORDERED_EXPERT_TEST}
         COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
@@ -18338,14 +18363,14 @@ foreach(V2_ORDERED_EXPERT_ISA IN ITEMS avx2 avx512)
     )
     list(APPEND V2_CPU_GPU_ALIGNED_EXPERT_PREFLIGHT_TESTS ${V2_EXPERT_PREFILL_TEST})
 endforeach()
-add_v2_test(V2_Integration_CPU_GPUAlignedExpertOneBlockTree_AllFormats_AVX2
+add_v2_test(V2_Integration_CPU_GPUAlignedExpertOneBlockTree_AllFormats_${V2_CPU_BASELINE_ISA_CELL}
     COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
             --gtest_filter=CPUNativeVNNIGemvTest.GPUAlignedExpertOneBlockPartitionsAllFormatsRuntimeMMatchSerialDecode
             --gtest_brief=1
-    LABELS "V2;Integration;CPU;MoE;MTP;ExpertOverlay;GPUAlignedExpert;AVX2;AllFormats;AllCodebooks;BatchInvariant;ByteExact;Regression"
+    LABELS "V2;Integration;CPU;MoE;MTP;ExpertOverlay;GPUAlignedExpert;${V2_CPU_BASELINE_ISA_CELL};AllFormats;AllCodebooks;BatchInvariant;ByteExact;Regression"
     MPI_PROCS 1
     NO_MODELS
-    ENVIRONMENT "LLAMINAR_ISA_LEVEL=avx2"
+    ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_CPU_BASELINE_RUNTIME_ISA}"
 )
 if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
     add_v2_test(V2_Integration_CPU_GPUAlignedExpertOneBlockTree_AllFormats_AVX512
@@ -18433,7 +18458,8 @@ add_v2_test(V2_Perf_CPUNativeVNNI_Sweep
     MPI_PROCS 1
 )
 
-# Performance Test: AVX2 vs AVX512 VNNI throughput comparison
+# Performance Test: AVX2 vs AVX512 VNNI throughput comparison (x86 only)
+if(V2_CPU_TARGET_X86)
 add_executable(v2_perf_avx2_vs_avx512 performance/kernels/cpu/native_vnni/Perf__AVX2vsAVX512.cpp)
 target_link_libraries(v2_perf_avx2_vs_avx512
     llaminar2_core
@@ -18448,6 +18474,7 @@ add_v2_test(V2_Perf_AVX2vsAVX512
     LABELS "V2;Performance;GEMM;GEMV;NativeVNNI;CPU;AVX2;AVX512;Parity"
     MPI_PROCS 1
 )
+endif()
 
 # Performance Test: CPU NativeVNNI Dispatch Parameter Sweep (tile heuristic tuning)
 add_executable(v2_perf_cpu_native_vnni_dispatch_sweep performance/kernels/cpu/native_vnni/Perf__CPUNativeVNNI_DispatchSweep.cpp)
@@ -25863,11 +25890,8 @@ add_v2_test(V2_Integration_CPUFixedEpochGDNZeroLayerAccounting
         --gtest_filter=Test__HybridGDNStateGeometry.ZeroLayersOwnNoCPUCheckpointHistory
     LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;GDN;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
-foreach(V2_GDN_READOUT_ISA AVX2 AVX512)
-    if(V2_GDN_READOUT_ISA STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
-        continue()
-    endif()
-    string(TOLOWER "${V2_GDN_READOUT_ISA}" V2_GDN_READOUT_RUNTIME_ISA)
+foreach(V2_GDN_READOUT_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
+    v2_cpu_native_isa_runtime("${V2_GDN_READOUT_ISA}" V2_GDN_READOUT_RUNTIME_ISA)
     add_v2_test(V2_Unit_CPUFixedEpochGDN_${V2_GDN_READOUT_ISA}
         COMMAND $<TARGET_FILE:v2_test_cpu_fixed_epoch_gdn>
         LABELS "V2;Unit;CPU;DeviceFree;GDN;ByteExact;Regression"
@@ -25974,12 +25998,9 @@ add_v2_test(V2_Unit_GDNMathematicalCorrectness
     MPI_PROCS 1
 )
 set(V2_GDN_ADDITIVE_EPSILON_CPU_PREFLIGHT_TESTS)
-set(V2_GDN_ADDITIVE_EPSILON_ISAS SCALAR AVX2)
-if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
-    list(APPEND V2_GDN_ADDITIVE_EPSILON_ISAS AVX512)
-endif()
+set(V2_GDN_ADDITIVE_EPSILON_ISAS SCALAR ${V2_CPU_NATIVE_ISA_CELLS})
 foreach(V2_GDN_EPSILON_ISA IN LISTS V2_GDN_ADDITIVE_EPSILON_ISAS)
-    string(TOLOWER "${V2_GDN_EPSILON_ISA}" V2_GDN_EPSILON_RUNTIME_ISA)
+    v2_cpu_native_isa_runtime("${V2_GDN_EPSILON_ISA}" V2_GDN_EPSILON_RUNTIME_ISA)
     add_v2_test(V2_Integration_GDNAdditiveEpsilon_CPU_${V2_GDN_EPSILON_ISA}
         COMMAND $<TARGET_FILE:v2_test_gdn_mathematical_correctness>
                 --gtest_filter=Test__GDNMathematicalCorrectness.Recurrence_AdditiveEpsilonNearZero
@@ -27768,7 +27789,7 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     ${V2_FP32_SUBNORMAL_PREFLIGHT_TESTS}
     V2_Integration_MTPDefaultSamplingLifecycle
     V2_Integration_CPUGreedySelector
-    V2_Integration_CPUGreedySelector_ForcedAVX2
+    V2_Integration_CPUGreedySelector_Forced${V2_CPU_BASELINE_ISA_CELL}
     V2_Integration_CPUMainSamplingPublication
     V2_Integration_CPUExpertWorkspaceReplay
     V2_Integration_ExpertOverlayNonblockingDemandAdmission
@@ -28295,11 +28316,8 @@ add_v2_test(V2_Integration_IQ4XSOriginalEquation
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeVNNI;IQ4_XS;OriginalEquation;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_IQ4XSOriginalEquation)
-foreach(V2_IQ4XS_ISA AVX2 AVX512)
-    if(V2_IQ4XS_ISA STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
-        continue()
-    endif()
-    string(TOLOWER "${V2_IQ4XS_ISA}" V2_IQ4XS_RUNTIME_ISA)
+foreach(V2_IQ4XS_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
+    v2_cpu_native_isa_runtime("${V2_IQ4XS_ISA}" V2_IQ4XS_RUNTIME_ISA)
     add_v2_test(V2_Integration_CPUIQ4XSFusedMoEOriginalEquation_${V2_IQ4XS_ISA}
         COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_verifier_workers>
             --gtest_filter=CPUNativeVNNIVerifierWorkers.IQ4XSOriginalSourceEquationInFusedExpertTransaction
@@ -28401,12 +28419,10 @@ if(HAVE_ROCM AND TARGET v2_integration_rocm_vnni_repack_kernels)
 endif()
 
 # Explicit focused inventory membership, in addition to registration labels.
-list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
-    V2_Integration_CPUIQ2SFusedMoEOriginalEquation_AVX2)
-if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+foreach(V2_IQ2S_PREFLIGHT_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
-        V2_Integration_CPUIQ2SFusedMoEOriginalEquation_AVX512)
-endif()
+        V2_Integration_CPUIQ2SFusedMoEOriginalEquation_${V2_IQ2S_PREFLIGHT_ISA})
+endforeach()
 if(HAVE_CUDA AND TARGET v2_integration_cuda_moe_kernel)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
         V2_Integration_CUDAIQ2SFusedMoEOriginalEquation)
@@ -28566,11 +28582,8 @@ add_v2_test(V2_Integration_CPUIQ3SOriginalEquation COMMAND $<TARGET_FILE:v2_unit
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeVNNI;IQ3_S;OriginalEquation;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUIQ3SOriginalEquation)
-foreach(V2_IQ3S_ISA AVX2 AVX512)
-    if(V2_IQ3S_ISA STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
-        continue()
-    endif()
-    string(TOLOWER "${V2_IQ3S_ISA}" V2_IQ3S_RUNTIME_ISA)
+foreach(V2_IQ3S_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
+    v2_cpu_native_isa_runtime("${V2_IQ3S_ISA}" V2_IQ3S_RUNTIME_ISA)
     add_v2_test(V2_Integration_CPUIQ3SFusedMoEOriginalEquation_${V2_IQ3S_ISA}
         COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_verifier_workers>
             --gtest_filter=CPUNativeVNNIVerifierWorkers.IQ3SOriginalSourceEquationInFusedExpertTransaction
@@ -28796,11 +28809,8 @@ add_v2_test(V2_Unit_CPUHalfOperands
     COMMAND $<TARGET_FILE:v2_test_cpu_half_operands> --gtest_filter=-CPUHalfOperands.EveryPositiveWorkerBudget
     LABELS "V2;Unit;CPU;GDN;MoE;FloatingPoint;ByteExact;Regression"
     MPI_PROCS 1 NO_MODELS NO_MPI)
-foreach(V2_HALF_ISA AVX2 AVX512)
-    if(V2_HALF_ISA STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
-        continue()
-    endif()
-    string(TOLOWER "${V2_HALF_ISA}" V2_HALF_RUNTIME_ISA)
+foreach(V2_HALF_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
+    v2_cpu_native_isa_runtime("${V2_HALF_ISA}" V2_HALF_RUNTIME_ISA)
     add_v2_test(V2_Integration_CPUHalfOperands_${V2_HALF_ISA}
         COMMAND $<TARGET_FILE:v2_test_cpu_half_operands> --gtest_brief=1
         LABELS "V2;Integration;ProductionTestPreflight;CPU;GDN;MoE;MTP;${V2_HALF_ISA};ByteExact;Regression"
@@ -29508,7 +29518,7 @@ if(NOT V2_PERF_TESTS_ONLY)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ParityGGUFNativePayloadExtent)
 endif()
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
-    V2_Integration_CPUHalfOperands_AVX2
+    V2_Integration_CPUHalfOperands_${V2_CPU_BASELINE_ISA_CELL}
     V2_Integration_Qwen4ExpMetadataContracts)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpCPUContracts)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoE512ExpertContracts)
@@ -29998,7 +30008,7 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_CPUSharedGDNWorkspaceAdmission
     V2_Integration_GDNCompiledCaptureSupport
     V2_Integration_CPUFixedEpochGDNCacheGeneration)
-foreach(V2_EPOCH_PREFLIGHT_ISA AVX2 AVX512)
+foreach(V2_EPOCH_PREFLIGHT_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
     foreach(V2_EPOCH_PREFLIGHT_FAMILY CPUFixedEpochGDN CPUBF16Router)
         set(V2_EPOCH_PREFLIGHT_ALIAS V2_Integration_${V2_EPOCH_PREFLIGHT_FAMILY}_${V2_EPOCH_PREFLIGHT_ISA})
         if(TEST ${V2_EPOCH_PREFLIGHT_ALIAS})
@@ -32289,11 +32299,8 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_Qwen4ExpCPUVerifierM1PreparedProjection)
 
 # Reuse the actual all-format CPU native target and canonical ISA projection.
-foreach(verifier_m1_isa AVX2 AVX512)
-    if(verifier_m1_isa STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
-        continue()
-    endif()
-    string(TOLOWER "${verifier_m1_isa}" verifier_m1_runtime_isa)
+foreach(verifier_m1_isa IN LISTS V2_CPU_NATIVE_ISA_CELLS)
+    v2_cpu_native_isa_runtime("${verifier_m1_isa}" verifier_m1_runtime_isa)
     add_v2_test(V2_Integration_CPU_VerifierM1AllFormats_${verifier_m1_isa}
         COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
             --gtest_filter=CPUNativeVNNIGemvTest.MTP_M1ProjectionAndSwiGLUAllFormatsAreSerialByteExact:CPUNativeVNNIGemvTest.MTP_VerifierProjectionRejectsMalformedExtentsBeforeWrites
@@ -33826,10 +33833,10 @@ if(NOT V2_PERF_TESTS_ONLY)
     if(TEST V2_Integration_TwoTermSavedOriginalSourceFactory)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_TwoTermSavedOriginalSourceFactory)
     endif()
-    foreach(V2_TT_ISA IN ITEMS Default AVX2)
+    foreach(V2_TT_ISA IN ITEMS Default ${V2_CPU_BASELINE_ISA_CELL})
         set(V2_TT_CPU_ENV "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_DYNAMIC=false")
-        if(V2_TT_ISA STREQUAL "AVX2")
-            list(APPEND V2_TT_CPU_ENV "LLAMINAR_ISA_LEVEL=avx2")
+        if(NOT V2_TT_ISA STREQUAL "Default")
+            list(APPEND V2_TT_CPU_ENV "LLAMINAR_ISA_LEVEL=${V2_CPU_BASELINE_RUNTIME_ISA}")
         endif()
         foreach(V2_TT_CPU_CASE IN ITEMS NativeRowsThreadsAndLargeSmallReuse NativeLargeTiledRows HC103OriginalPreparedControlChain HC103OriginalPrimitiveTailsAndPublicationAdmission HC103FusedStageAndTypedOverload HC103TypedAdmissionAndStageIdentity HC103TypedBuilderAllFormats CountedNativeVerifierExtent CountedNativeVerifierRowGeometry CountedNativeVerifierFusedBankAdmission)
             set(V2_TT_ALIAS V2_Integration_CPU_TwoTermAllFormats_${V2_TT_ISA}_${V2_TT_CPU_CASE})
@@ -35166,7 +35173,7 @@ endif()
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ProjectionRowWorkContract)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ProjectionRowWorkBinding)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HostEntryPreparation)
-foreach(V2_QUERY_WORK_ISA AVX2 AVX512)
+foreach(V2_QUERY_WORK_ISA IN LISTS V2_CPU_NATIVE_ISA_CELLS)
     if(TEST V2_Integration_CPU_QueryRowWork_${V2_QUERY_WORK_ISA})
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPU_QueryRowWork_${V2_QUERY_WORK_ISA})
     endif()
@@ -36685,10 +36692,10 @@ foreach(V2_HC103_PERF_BACKEND CUDA ROCm)
 endforeach()
 
 # Explicit CPU component measurements; correctness aliases remain unchanged.
-foreach(V2_HC103_CPU_ISA Default AVX2)
+foreach(V2_HC103_CPU_ISA Default ${V2_CPU_BASELINE_ISA_CELL})
     set(V2_HC103_CPU_ENV "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_DYNAMIC=false;OMP_PLACES=cores;OMP_PROC_BIND=close")
-    if(V2_HC103_CPU_ISA STREQUAL "AVX2")
-        list(APPEND V2_HC103_CPU_ENV "LLAMINAR_ISA_LEVEL=avx2")
+    if(NOT V2_HC103_CPU_ISA STREQUAL "Default")
+        list(APPEND V2_HC103_CPU_ENV "LLAMINAR_ISA_LEVEL=${V2_CPU_BASELINE_RUNTIME_ISA}")
     endif()
     foreach(V2_HC103_CPU_ROWS 1 512)
         foreach(V2_HC103_CPU_WORKERS One Socket)
