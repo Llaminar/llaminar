@@ -742,6 +742,8 @@ namespace
             << " cosine=" << cosineSimilarity(actual, expected, count);
     }
 
+#ifdef HAVE_CUDA
+    // CUDA launch/stream helpers; every caller is itself CUDA-only.
     /**
      * @brief Scope direct CUDA native-VNNI calls into production verifier mode.
      *
@@ -773,6 +775,7 @@ namespace
     private:
         int previous_ = 0;
     };
+#endif // HAVE_CUDA
 
     /**
      * @brief Compare two logit rows as probability distributions.
@@ -822,6 +825,8 @@ namespace
         }
         return 0.5 * (actual_to_expected + expected_to_actual);
     }
+
+#ifdef HAVE_CUDA
 
     // =========================================================================
     // Helpers: multiply via tensor interface (multiply() removed from ITensorGemm)
@@ -1418,6 +1423,7 @@ namespace
 
         ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
     }
+#endif // HAVE_CUDA
 
     /**
      * @brief Return the Qwen3.6 MoE GGUF used by real-weight kernel regressions.
@@ -1618,6 +1624,7 @@ namespace
         return ok;
     }
 
+#ifdef HAVE_CUDA
     bool cudaFusedSwiGLUDownViaTensor(ITensorGemm *kernel,
                                       const float *gate_host,
                                       const float *up_host,
@@ -1657,6 +1664,7 @@ namespace
             std::memcpy(C_host, C_tensor->data(), (size_t)M * N * sizeof(float));
         return ok;
     }
+#endif // HAVE_CUDA
 
 } // namespace
 
