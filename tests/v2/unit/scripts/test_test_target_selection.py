@@ -778,10 +778,19 @@ if(NOT V2_PERF_TESTS_ONLY)
     if(NOT _cohort_original_unit_cases)
         message(FATAL_ERROR "Cohort module declares no original Unit cases")
     endif()
+    # Pooled sources are CUDA/ROCm-native: without a compiled GPU family the
+    # cohort executable declares REQUIRES_BACKEND and every case is omitted
+    # and counted, never registered to fail on "not compiled".
+    get_property(omitted GLOBAL PROPERTY V2_BACKEND_OMITTED_TESTS)
     foreach(case IN LISTS _cohort_original_unit_cases)
         string(REPLACE "." "_" case_id "${{case}}")
-        if(NOT "V2_Unit_PooledOriginal_${{case_id}}" IN_LIST tests)
-            message(FATAL_ERROR "Missing original cohort Unit registration: ${{case}}")
+        if(HAVE_CUDA OR HAVE_ROCM)
+            if(NOT "V2_Unit_PooledOriginal_${{case_id}}" IN_LIST tests)
+                message(FATAL_ERROR "Missing original cohort Unit registration: ${{case}}")
+            endif()
+        elseif("V2_Unit_PooledOriginal_${{case_id}}" IN_LIST tests OR
+               NOT "V2_Unit_PooledOriginal_${{case_id}}" IN_LIST omitted)
+            message(FATAL_ERROR "CPU-only build must omit and count cohort case: ${{case}}")
         endif()
     endforeach()
 endif()
@@ -822,7 +831,10 @@ endif()
 
                         self.assertNotIn("V2_Integration_PooledImmutableMixedLocalGraphReplay",
                                          [entry["name"] for entry in tests])
-                        expected = set() if performance_only else {prefix + case + "Replay" for case in mixed_cases}
+                        # The owner-pin executable requires a compiled GPU
+                        # family; CPU-only builds omit (and count) its cases.
+                        expected = (set() if performance_only or not (cuda or rocm)
+                                    else {prefix + case + "Replay" for case in mixed_cases})
                         self.assertEqual({entry["name"] for entry in actual}, expected)
                         self.assertEqual(len(actual), len(expected), "Mixed-local registration duplicate")
                         for entry in actual:

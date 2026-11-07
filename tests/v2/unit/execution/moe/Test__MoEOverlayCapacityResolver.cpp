@@ -1860,6 +1860,9 @@ namespace llaminar2
 
     }
 
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
     TEST(MoEOverlayLocalCapacityPlanner,
          NodeLocalActivationBOMPricesExactRootTargetAndMTPFamilyLanes)
     {
@@ -2106,6 +2109,7 @@ namespace llaminar2
             budgetFor(DeviceId::cuda(1)).fixedBytes(),
             captured_graph_bytes);
     }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
     TEST(MoEOverlayLocalCapacityPlanner,
          HostAuthoritySeparatesCompilationUnitsFromResidentExecutables)
@@ -2441,6 +2445,9 @@ namespace llaminar2
                 .empty());
     }
 
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
     /**
      * @brief Reproduce the replicated-dense preflight/runtime byte mismatch.
      *
@@ -2645,6 +2652,7 @@ namespace llaminar2
             }
         }
     }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
     /**
      * @test Setup probes must not interpret source matrices owned by another stage.
@@ -2775,6 +2783,9 @@ namespace llaminar2
 
     }
 
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
     TEST(MoEOverlayLocalCapacityPlanner,
          GroupsContinuationAndEndpointFixedBytesByBoundPhysicalResource)
     {
@@ -3037,6 +3048,7 @@ namespace llaminar2
 
 
     }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
     TEST(MoEOverlayLocalCapacityPlanner,
          ColocatedCpuWorkspaceCountsEveryConcurrentGpuGraphOwner)
@@ -3308,6 +3320,9 @@ namespace llaminar2
         EXPECT_FALSE(one_byte_short.fits());
     }
 
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
     TEST(MoEOverlayLocalCapacityPlanner,
          SmallerCapturedGraphCandidateCanRestoreCompleteExpertCoverage)
     {
@@ -3482,6 +3497,7 @@ namespace llaminar2
             (std::vector<int>{3, 3}));
 
     }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
     TEST(MoEOverlayCapacityResolver, SharedPhysicalResourceAggregatesEveryTierCopy)
     {

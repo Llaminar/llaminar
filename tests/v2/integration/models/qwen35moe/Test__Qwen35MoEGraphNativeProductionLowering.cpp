@@ -3953,6 +3953,9 @@ namespace llaminar2::test
             });
     }
 
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
     TEST(Test__Qwen35MoEGraphNativeProductionLowering,
          DistributedLocalTPContinuationKeepsNativeCollectiveWithP2P)
     {
@@ -3964,6 +3967,7 @@ namespace llaminar2::test
                     MoEOverlayNodeLocalRouteTransport::NativeCollective,
             });
     }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
     TEST(Test__Qwen35MoEGraphNativeProductionLowering,
          LocalTPApportionedRoutedComputeGpuPrefillUsesCapturableFastPathByDefault)
