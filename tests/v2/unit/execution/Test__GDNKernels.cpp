@@ -7794,7 +7794,8 @@ TEST(CPUGDNKernels, ShortConvNeonPrefillAndDecodeExactReference)
     EXPECT_EQ(std::memcmp(state_test.data(), state_ref.data(), state_ref.size() * sizeof(float)), 0)
         << "NEON prefill state bytes";
 
-    // Decode: one token from the produced state; exact scalar state-update program.
+    // Decode: one token from the produced state; the explicit FMA chain in
+    // increasing tap order shared by every ISA's decode and the SIMD prefill.
     std::vector<float> one_input(channels), decode_out(channels), decode_ref(channels);
     for (int c = 0; c < channels; ++c) one_input[c] = std::cos(float(c) * 0.53f);
     std::vector<float> decode_state(state_test), decode_state_ref(state_test);
@@ -7803,8 +7804,8 @@ TEST(CPUGDNKernels, ShortConvNeonPrefillAndDecodeExactReference)
         const float *w = weight.data() + static_cast<std::size_t>(c) * kernel_size;
         float sum = bias[c];
         for (int k = 0; k < state_len; ++k)
-            sum += w[k] * decode_state_ref[static_cast<std::size_t>(c) * state_len + k];
-        sum += w[state_len] * one_input[c];
+            sum = std::fma(w[k], decode_state_ref[static_cast<std::size_t>(c) * state_len + k], sum);
+        sum = std::fma(w[state_len], one_input[c], sum);
         decode_ref[c] = sum;
         for (int k = 0; k < state_len - 1; ++k)
             decode_state_ref[static_cast<std::size_t>(c) * state_len + k] =
