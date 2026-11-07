@@ -290,7 +290,7 @@ class TestGPUBlockingSyncPolicy(unittest.TestCase):
         """Only the two private Rank terminal/reset edges may await one original event."""
         for caller, category in (
             ("awaitGroupedRetainedStorageTerminal", "host_result"),
-            ("prepareGroupedRetainedStorageReset", "lifecycle"),
+            ("prepareGroupedRetainedStorageProducerProof", "lifecycle"),
         ):
             with self.subTest(owner=caller):
                 allowance, = (entry for entry in ALLOWANCES

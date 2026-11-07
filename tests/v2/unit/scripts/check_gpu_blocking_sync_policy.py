@@ -410,7 +410,7 @@ ALLOWANCES: tuple[Allowance, ...] = (
         # Rank's two-phase request reset first joins original native producers,
         # then records/observes THIS reader's terminal frontier before any
         # shared channel retirement or data clearing. No hot replay may call it.
-        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorGeneration.cpp", "DeviceGraphOrchestrator::prepareGroupedRetainedStorageReset", "backend_event", 1),
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestratorGeneration.cpp", "DeviceGraphOrchestrator::prepareGroupedRetainedStorageProducerProof", "backend_event", 1),
         # Metadata initialization/admission can enqueue before runner publication
         # fails. Only failed submission or last setup-owner teardown waits its
         # exact pre-created event. Successful admission/capture/terminal paths
