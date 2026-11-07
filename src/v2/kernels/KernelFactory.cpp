@@ -1071,6 +1071,26 @@ namespace llaminar
             }
 
             // ==========================================================================
+            // MXFP4 Tensor GEMM
+            // ==========================================================================
+
+            std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemm(
+                const llaminar2::MXFP4Tensor *tensor, DeviceType dev_type, int device_ordinal)
+            {
+                (void)device_ordinal;
+                if (dev_type == DeviceType::CPU)
+                    return std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(tensor);
+#ifdef HAVE_CUDA
+                if (dev_type == DeviceType::CUDA)
+                    throw std::runtime_error(
+                        "[KernelFactory] Legacy createGemm() GPU path removed. "
+                        "Use GPU pipeline for CUDA weight preparation.");
+#endif
+                throwUnsupportedBackend(dev_type, "MXFP4");
+                throw std::runtime_error("Unreachable");
+            }
+
+            // ==========================================================================
             // IQ1_S Tensor GEMM
             // ==========================================================================
 
@@ -4844,6 +4864,7 @@ namespace llaminar
                 case llaminar2::TensorType::Q4_K:
                 case llaminar2::TensorType::IQ4_NL:
                 case llaminar2::TensorType::IQ4_XS:
+                case llaminar2::TensorType::MXFP4:
                 // 5-bit formats
                 case llaminar2::TensorType::Q5_0:
                 case llaminar2::TensorType::Q5_1:

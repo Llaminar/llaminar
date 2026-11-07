@@ -104,6 +104,7 @@ namespace
         (uint32_t{1} << 0) |
         (uint32_t{1} << 4) |
         (uint32_t{1} << llaminar2::kNativeVnniIQ4XSSourceScaleCodebook) |
+        (uint32_t{1} << llaminar2::kNativeVnniMXFP4Codebook) |
         (uint32_t{1} << 5) |
         (uint32_t{1} << 6) |
         (uint32_t{1} << 7) |
@@ -286,8 +287,8 @@ namespace
         if constexpr (Traits::is_iq4_lut)
         {
             const float scale = physical_codebook == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook
-                ? llaminar2::cuda_native_vnni::native_vnni_single_scale_rn<llaminar2::kNativeVnniIQ4XSSourceScaleCodebook>(scales[linear], mins[linear])
-                : llaminar2::cuda_native_vnni::fp16_bits_to_float(scales[linear]);
+                ? llaminar2::cuda_native_vnni::native_vnni_single_scale_rn<llaminar2::kNativeVnniIQ4XSSourceScaleCodebook>(::llaminar2::native_vnni_scale::loadStagedPrimary<CodebookId>(scales, linear), mins[linear])
+                : llaminar2::cuda_native_vnni::fp16_bits_to_float(::llaminar2::native_vnni_scale::loadStagedPrimary<CodebookId>(scales, linear));
             return llaminar2::device_native_vnni_contract::singleScaleBlock(
                 dot_lo, scale, activation_scale);
         }
@@ -321,7 +322,7 @@ namespace
                 dot_lo,
                 dot_hi,
                 activation_scale,
-                scales[linear],
+                ::llaminar2::native_vnni_scale::loadStagedPrimary<CodebookId>(scales, linear),
                 secondary_bits,
                 emin_bits,
                 activation_sum_lo + activation_sum_hi,
@@ -594,7 +595,7 @@ namespace
                 shared_warp_weights + local_column * kQuantBlock +
                 lookup * sizeof(uint64_t)) = signed_grid;
         }
-        else if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_iq4_lut)
+        else if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_nibble_lut)
         {
             const int local_column = lane >> 2;
             const int group = lane & 3;
@@ -609,7 +610,7 @@ namespace
                     descriptor.payload + linear * kPayloadBytes;
                 const uint32_t raw = *reinterpret_cast<const uint32_t *>(
                     payload + group * sizeof(uint32_t));
-                llaminar2::cuda_native_vnni::iq4nl_decode_word(
+                llaminar2::cuda_native_vnni::nibble_lut_decode_word<CodebookId>(
                     raw,
                     low,
                     high);
@@ -884,7 +885,9 @@ namespace
                         {
                             const size_t linear =
                                 static_cast<size_t>(block) * N + column;
-                            scale_bits = weight_scales[linear];
+                            // The slot carries the normalized staged word (low 16 bits).
+                            scale_bits = ::llaminar2::native_vnni_scale::loadStagedPrimary<CodebookId>(
+                                weight_scales, linear);
                             if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_iq4_source_scale)
                                 if (descriptor.codebook_id == llaminar2::kNativeVnniIQ4XSSourceScaleCodebook)
                                     scale_bits |= uint32_t{weight_mins[linear]} << 16;
@@ -2011,6 +2014,7 @@ namespace
         LAUNCH_CODEBOOK(0);
         LAUNCH_CODEBOOK(4);
         LAUNCH_CODEBOOK(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
+        LAUNCH_CODEBOOK(llaminar2::kNativeVnniMXFP4Codebook);
         LAUNCH_CODEBOOK(5);
         LAUNCH_CODEBOOK(6);
         LAUNCH_CODEBOOK(7);
@@ -2074,6 +2078,7 @@ namespace
         LAUNCH_GATE_UP_CODEBOOK(0);
         LAUNCH_GATE_UP_CODEBOOK(4);
         LAUNCH_GATE_UP_CODEBOOK(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
+        LAUNCH_GATE_UP_CODEBOOK(llaminar2::kNativeVnniMXFP4Codebook);
         LAUNCH_GATE_UP_CODEBOOK(5);
         LAUNCH_GATE_UP_CODEBOOK(6);
         LAUNCH_GATE_UP_CODEBOOK(7);
@@ -2138,6 +2143,7 @@ namespace
         LAUNCH_PAIRED_GATE_UP_CODEBOOK(0);
         LAUNCH_PAIRED_GATE_UP_CODEBOOK(4);
         LAUNCH_PAIRED_GATE_UP_CODEBOOK(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
+        LAUNCH_PAIRED_GATE_UP_CODEBOOK(llaminar2::kNativeVnniMXFP4Codebook);
         LAUNCH_PAIRED_GATE_UP_CODEBOOK(5);
         LAUNCH_PAIRED_GATE_UP_CODEBOOK(6);
         LAUNCH_PAIRED_GATE_UP_CODEBOOK(7);
@@ -2503,6 +2509,7 @@ namespace
             QUERY_CODEBOOK(0);
             QUERY_CODEBOOK(4);
             QUERY_CODEBOOK(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
+            QUERY_CODEBOOK(llaminar2::kNativeVnniMXFP4Codebook);
             QUERY_CODEBOOK(5);
             QUERY_CODEBOOK(6);
             QUERY_CODEBOOK(7);
@@ -2554,6 +2561,7 @@ namespace
             QUERY_GATE_UP_CODEBOOK(0);
             QUERY_GATE_UP_CODEBOOK(4);
             QUERY_GATE_UP_CODEBOOK(llaminar2::kNativeVnniIQ4XSSourceScaleCodebook);
+            QUERY_GATE_UP_CODEBOOK(llaminar2::kNativeVnniMXFP4Codebook);
             QUERY_GATE_UP_CODEBOOK(5);
             QUERY_GATE_UP_CODEBOOK(6);
             QUERY_GATE_UP_CODEBOOK(7);

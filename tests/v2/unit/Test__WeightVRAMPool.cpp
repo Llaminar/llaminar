@@ -25,7 +25,7 @@ namespace llaminar2
     {
         WeightVRAMPool pool;
         pool.planWeight("attn_q", /*N=*/1024, /*K=*/1024,
-                        kQ4PayloadBytes, /*is_asymmetric=*/false, /*has_emins=*/false,
+                        kQ4PayloadBytes, /*is_asymmetric=*/false, /*has_emins=*/false, NativeVnniScalePlaneWidth::FP16Word,
                         /*raw_gguf_bytes=*/524288);
 
         EXPECT_GT(pool.totalPlannedBytes(), 0u);
@@ -35,9 +35,9 @@ namespace llaminar2
     TEST(Test__WeightVRAMPool, PlanMultipleWeights)
     {
         WeightVRAMPool pool;
-        pool.planWeight("w1", 512, 1024, kQ4PayloadBytes, false, false, 262144);
-        pool.planWeight("w2", 1024, 2048, kQ4PayloadBytes, false, false, 524288);
-        pool.planWeight("w3", 256, 512, kQ4PayloadBytes, false, false, 131072);
+        pool.planWeight("w1", 512, 1024, kQ4PayloadBytes, false, false, NativeVnniScalePlaneWidth::FP16Word, 262144);
+        pool.planWeight("w2", 1024, 2048, kQ4PayloadBytes, false, false, NativeVnniScalePlaneWidth::FP16Word, 524288);
+        pool.planWeight("w3", 256, 512, kQ4PayloadBytes, false, false, NativeVnniScalePlaneWidth::FP16Word, 131072);
 
         EXPECT_EQ(pool.numPlannedWeights(), 3u);
         EXPECT_GT(pool.totalPlannedBytes(), 0u);
@@ -55,7 +55,7 @@ namespace llaminar2
     {
         constexpr size_t raw_bytes = 32u * 64u * sizeof(float);
         WeightVRAMPool pool;
-        pool.planWeight("mixed", 32, 64, 16, true, true, 0,
+        pool.planWeight("mixed", 32, 64, 16, true, true, NativeVnniScalePlaneWidth::FP16Word, 0,
                         {.bytes = raw_bytes});
         EXPECT_EQ(pool.totalPlannedBytes(), raw_bytes);
         pool.planRawWeight("following", 32, 64, raw_bytes);
@@ -65,15 +65,15 @@ namespace llaminar2
         // next allocation backward. Quantized-only plans remain byte identical.
         WeightVRAMPool baseline;
         WeightVRAMPool smaller;
-        baseline.planWeight("native", 32, 64, 32, true, true, 0);
-        smaller.planWeight("native", 32, 64, 32, true, true, 0, {.bytes = 16});
+        baseline.planWeight("native", 32, 64, 32, true, true, NativeVnniScalePlaneWidth::FP16Word, 0);
+        smaller.planWeight("native", 32, 64, 32, true, true, NativeVnniScalePlaneWidth::FP16Word, 0, {.bytes = 16});
         EXPECT_EQ(smaller.totalPlannedBytes(), baseline.totalPlannedBytes());
     }
 
     TEST(Test__WeightVRAMPool, GetSlotBeforeAllocate)
     {
         WeightVRAMPool pool;
-        pool.planWeight("w1", 512, 1024, kQ4PayloadBytes, false, false, 262144);
+        pool.planWeight("w1", 512, 1024, kQ4PayloadBytes, false, false, NativeVnniScalePlaneWidth::FP16Word, 262144);
 
         auto slot = pool.getSlot("w1");
         EXPECT_FALSE(slot.has_value());
@@ -85,11 +85,11 @@ namespace llaminar2
 
         // First plan a symmetric weight for comparison
         WeightVRAMPool pool_sym;
-        pool_sym.planWeight("w_sym", 512, 1024, kQ4PayloadBytes, false, false, 262144);
+        pool_sym.planWeight("w_sym", 512, 1024, kQ4PayloadBytes, false, false, NativeVnniScalePlaneWidth::FP16Word, 262144);
         size_t sym_bytes = pool_sym.totalPlannedBytes();
 
         // Now plan an asymmetric weight (same dimensions)
-        pool.planWeight("w_asym", 512, 1024, kQ4PayloadBytes, true, false, 262144);
+        pool.planWeight("w_asym", 512, 1024, kQ4PayloadBytes, true, false, NativeVnniScalePlaneWidth::FP16Word, 262144);
         size_t asym_bytes = pool.totalPlannedBytes();
 
         // Asymmetric should have more bytes due to mins region
@@ -101,10 +101,10 @@ namespace llaminar2
         WeightVRAMPool pool;
 
         WeightVRAMPool pool_no_emins;
-        pool_no_emins.planWeight("w1", 512, 1024, kQ2KPayloadBytes, true, false, 262144);
+        pool_no_emins.planWeight("w1", 512, 1024, kQ2KPayloadBytes, true, false, NativeVnniScalePlaneWidth::FP16Word, 262144);
         size_t no_emins_bytes = pool_no_emins.totalPlannedBytes();
 
-        pool.planWeight("w1", 512, 1024, kQ2KPayloadBytes, true, true, 262144);
+        pool.planWeight("w1", 512, 1024, kQ2KPayloadBytes, true, true, NativeVnniScalePlaneWidth::FP16Word, 262144);
         size_t with_emins_bytes = pool.totalPlannedBytes();
 
         EXPECT_GT(with_emins_bytes, no_emins_bytes);
@@ -114,8 +114,8 @@ namespace llaminar2
     {
         WeightVRAMPool pool;
         // Plan multiple weights to force multiple region offsets
-        pool.planWeight("w1", 100, 96, kQ4PayloadBytes, true, true, 50000);
-        pool.planWeight("w2", 200, 128, kQ4PayloadBytes, false, false, 80000);
+        pool.planWeight("w1", 100, 96, kQ4PayloadBytes, true, true, NativeVnniScalePlaneWidth::FP16Word, 50000);
+        pool.planWeight("w2", 200, 128, kQ4PayloadBytes, false, false, NativeVnniScalePlaneWidth::FP16Word, 80000);
 
         // Allocate without GPU backend — d_base_ will be nullptr but allocation succeeds
         ASSERT_TRUE(pool.allocate(nullptr, 0, 0));
@@ -134,10 +134,10 @@ namespace llaminar2
     TEST(Test__WeightVRAMPool, DuplicateNameThrows)
     {
         WeightVRAMPool pool;
-        pool.planWeight("w1", 512, 1024, kQ4PayloadBytes, false, false, 262144);
+        pool.planWeight("w1", 512, 1024, kQ4PayloadBytes, false, false, NativeVnniScalePlaneWidth::FP16Word, 262144);
 
         EXPECT_THROW(
-            pool.planWeight("w1", 256, 512, kQ4PayloadBytes, false, false, 131072),
+            pool.planWeight("w1", 256, 512, kQ4PayloadBytes, false, false, NativeVnniScalePlaneWidth::FP16Word, 131072),
             std::runtime_error);
     }
 
@@ -146,20 +146,20 @@ namespace llaminar2
         WeightVRAMPool pool;
         EXPECT_EQ(pool.numPlannedWeights(), 0u);
 
-        pool.planWeight("a", 64, 64, kQ4PayloadBytes, false, false, 1024);
+        pool.planWeight("a", 64, 64, kQ4PayloadBytes, false, false, NativeVnniScalePlaneWidth::FP16Word, 1024);
         EXPECT_EQ(pool.numPlannedWeights(), 1u);
 
-        pool.planWeight("b", 64, 64, kQ4PayloadBytes, false, false, 1024);
+        pool.planWeight("b", 64, 64, kQ4PayloadBytes, false, false, NativeVnniScalePlaneWidth::FP16Word, 1024);
         EXPECT_EQ(pool.numPlannedWeights(), 2u);
 
-        pool.planWeight("c", 64, 64, kQ4PayloadBytes, false, false, 1024);
+        pool.planWeight("c", 64, 64, kQ4PayloadBytes, false, false, NativeVnniScalePlaneWidth::FP16Word, 1024);
         EXPECT_EQ(pool.numPlannedWeights(), 3u);
     }
 
     TEST(Test__WeightVRAMPool, AllocateAndGetSlot)
     {
         WeightVRAMPool pool;
-        pool.planWeight("w1", 512, 1024, kQ4PayloadBytes, false, false, 262144);
+        pool.planWeight("w1", 512, 1024, kQ4PayloadBytes, false, false, NativeVnniScalePlaneWidth::FP16Word, 262144);
 
         ASSERT_TRUE(pool.allocate(nullptr, 0, 0));
         EXPECT_TRUE(pool.isAllocated());
@@ -179,7 +179,7 @@ namespace llaminar2
     TEST(Test__WeightVRAMPool, GetSlotUnknownName)
     {
         WeightVRAMPool pool;
-        pool.planWeight("w1", 512, 1024, kQ4PayloadBytes, false, false, 262144);
+        pool.planWeight("w1", 512, 1024, kQ4PayloadBytes, false, false, NativeVnniScalePlaneWidth::FP16Word, 262144);
         ASSERT_TRUE(pool.allocate(nullptr, 0, 0));
 
         auto slot = pool.getSlot("nonexistent");
@@ -189,8 +189,8 @@ namespace llaminar2
     TEST(Test__WeightVRAMPool, StagingRegionIncluded)
     {
         WeightVRAMPool pool;
-        pool.planWeight("w1", 512, 1024, kQ4PayloadBytes, false, false, 100000);
-        pool.planWeight("w2", 256, 512, kQ4PayloadBytes, false, false, 200000);
+        pool.planWeight("w1", 512, 1024, kQ4PayloadBytes, false, false, NativeVnniScalePlaneWidth::FP16Word, 100000);
+        pool.planWeight("w2", 256, 512, kQ4PayloadBytes, false, false, NativeVnniScalePlaneWidth::FP16Word, 200000);
 
         size_t bytes_no_staging = pool.totalPlannedBytes();
 
@@ -204,7 +204,7 @@ namespace llaminar2
     TEST(Test__WeightVRAMPool, ExplicitStagingSlotSizeCapsTemporaryAllocation)
     {
         WeightVRAMPool pool;
-        pool.planWeight("large", 1024, 1024, kQ4PayloadBytes, false, false, 800000);
+        pool.planWeight("large", 1024, 1024, kQ4PayloadBytes, false, false, NativeVnniScalePlaneWidth::FP16Word, 800000);
         const size_t persistent_bytes = pool.totalPlannedBytes();
 
         ASSERT_TRUE(pool.allocate(nullptr, 0, /*staging_slot_count=*/3,
@@ -220,8 +220,8 @@ namespace llaminar2
         test::MockBackend backend(DeviceType::ROCm);
         WeightVRAMPool pool;
 
-        pool.planWeight("w1", 512, 1024, kQ4PayloadBytes, false, false, 100000);
-        pool.planWeight("w2", 256, 512, kQ4PayloadBytes, false, false, 200000);
+        pool.planWeight("w1", 512, 1024, kQ4PayloadBytes, false, false, NativeVnniScalePlaneWidth::FP16Word, 100000);
+        pool.planWeight("w2", 256, 512, kQ4PayloadBytes, false, false, NativeVnniScalePlaneWidth::FP16Word, 200000);
         const size_t weight_bytes = pool.totalPlannedBytes();
 
         ASSERT_TRUE(pool.allocate(&backend, 0, 3));

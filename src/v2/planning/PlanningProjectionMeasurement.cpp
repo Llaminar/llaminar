@@ -41,11 +41,7 @@ namespace llaminar2
     {
         constexpr auto kWeightOwner = PhysicalMemoryOwner::PrimaryModelWeights;
         using llaminar::v2::kernels::KernelFactory;
-#if LLAMINAR_COMPILED_WITH_AVX512
-        constexpr ISALevel kCompiledISA = ISALevel::AVX512;
-#else
-        constexpr ISALevel kCompiledISA = ISALevel::AVX2;
-#endif
+        constexpr ISALevel kCompiledISA = compiledCPUISALevel();
 
         /** @brief Reject failures without assigning a fabricated service rate. */
         void require(bool condition, const char *detail)
@@ -147,7 +143,8 @@ namespace llaminar2
             pool.addDevice(device.gpu_ordinal());
             if (const auto *format = native_vnni_formats::forQuantType(plan.format))
                 pool.planWeightForOwner(device.gpu_ordinal(), plan.name, plan.n, plan.k,
-                    format->payload_bytes, canonicalDeviceVnniFormat(*format).is_asymmetric, format->has_emins, plan.payload_bytes, kWeightOwner);
+                    format->payload_bytes, canonicalDeviceVnniFormat(*format).is_asymmetric, format->has_emins,
+                    nativeVnniScalePlaneWidth(canonicalDeviceVnniCodebookId(*format)), plan.payload_bytes, kWeightOwner);
             else if (floating(plan))
                 pool.planRawWeightForOwner(device.gpu_ordinal(), plan.name,
                     plan.n, plan.k, plan.payload_bytes, kWeightOwner);

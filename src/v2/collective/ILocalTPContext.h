@@ -5,6 +5,8 @@
  * LOCAL TP = multiple devices within a single MPI rank, decoupled from MPI world_size.
  * This enables tensor parallelism across GPUs owned by one rank, using high-bandwidth
  * backends like NCCL, RCCL, or HOST instead of cross-node MPI.
+ * Shared ITPContext operations are explicit overrides: local-only geometry must
+ * not accidentally create a second virtual dispatch contract during native builds.
  *
  * Key concepts:
  * - LOCAL TP degree can be different from MPI world_size
@@ -146,7 +148,7 @@ namespace llaminar2
          *
          * @return CollectiveBackendType
          */
-        virtual CollectiveBackendType backend() const = 0;
+        virtual CollectiveBackendType backend() const override = 0;
 
         /**
          * @brief Get total TP degree (number of devices)
@@ -194,7 +196,7 @@ namespace llaminar2
          *              set to actual_seq_len * hidden_dim, not the full buffer size.
          * @return true on success, false on error
          */
-        virtual bool allreduce(TensorBase *tensor, const std::string &stage_name, size_t count = 0) = 0;
+        virtual bool allreduce(TensorBase *tensor, const std::string &stage_name, size_t count = 0) override = 0;
 
         /**
          * @brief All-reduce across LOCAL devices (out-of-place)
@@ -794,12 +796,12 @@ namespace llaminar2
          * collectives. The request is idempotent and may be published by any
          * participant that observes the fatal failure first.
          */
-        virtual void requestAbort() = 0;
+        virtual void requestAbort() override = 0;
 
         /**
          * @brief Check if abort has been requested by any device thread.
          */
-        virtual bool isAbortRequested() const = 0;
+        virtual bool isAbortRequested() const override = 0;
 
         // =====================================================================
         // Device Management
@@ -957,7 +959,10 @@ namespace llaminar2
          * @throws std::logic_error If this implementation cannot own the typed exchange.
          */
         virtual bool graphCaptureBoundaryRendezvous(const std::string& name,int participant,int timeout_ms,LocalTPCaptureSourceDefinition& definition)
-        {throw std::logic_error("LocalTP has no typed source-definition rendezvous");}
+        {
+            (void)name;(void)participant;(void)timeout_ms;(void)definition;
+            throw std::logic_error("LocalTP has no typed source-definition rendezvous");
+        }
         /**
          * @brief Carry the definition through the original existing stream fence/rendezvous.
          * @param name Original matched capture-end phase.
@@ -969,7 +974,10 @@ namespace llaminar2
          * @throws std::logic_error If this implementation cannot own the typed exchange.
          */
         virtual bool graphCaptureBoundaryOnStream(const std::string& name,int participant,void* stream,int timeout_ms,LocalTPCaptureSourceDefinition& definition)
-        {throw std::logic_error("LocalTP has no typed source-definition stream boundary");}
+        {
+            (void)name;(void)participant;(void)stream;(void)timeout_ms;(void)definition;
+            throw std::logic_error("LocalTP has no typed source-definition stream boundary");
+        }
 
         /** @brief Record only the named original producer/consumer byte edge.
          * @param payload Original local endpoint bank. @param bytes Borrowed count/slice authority.

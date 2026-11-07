@@ -176,7 +176,7 @@ TEST(ResidentImmutableRowTable, OriginalNativeBytesUseOnlyDrainedBoundedSlot)
         GGUFTensorType::Q8_0, GGUFTensorType::Q2_K, GGUFTensorType::Q3_K, GGUFTensorType::Q4_K,
         GGUFTensorType::Q5_K, GGUFTensorType::Q6_K, GGUFTensorType::Q8_K, GGUFTensorType::IQ1_S,
         GGUFTensorType::IQ1_M, GGUFTensorType::IQ2_XXS, GGUFTensorType::IQ2_XS, GGUFTensorType::IQ2_S,
-        GGUFTensorType::IQ3_XXS, GGUFTensorType::IQ3_S, GGUFTensorType::IQ4_NL, GGUFTensorType::IQ4_XS})
+        GGUFTensorType::IQ3_XXS, GGUFTensorType::IQ3_S, GGUFTensorType::IQ4_NL, GGUFTensorType::IQ4_XS, GGUFTensorType::MXFP4})
     {
         SCOPED_TRACE(static_cast<int>(format)); OwnerFixture f(format);
         const auto table=f.prepare(); const auto view=table->view();
@@ -496,7 +496,7 @@ TEST(ResidentImmutableRowTable, FixedRangesPreserveEverySupportedOriginalNativeF
         GGUFTensorType::Q8_0,GGUFTensorType::Q2_K,GGUFTensorType::Q3_K,GGUFTensorType::Q4_K,
         GGUFTensorType::Q5_K,GGUFTensorType::Q6_K,GGUFTensorType::Q8_K,GGUFTensorType::IQ1_S,
         GGUFTensorType::IQ1_M,GGUFTensorType::IQ2_XXS,GGUFTensorType::IQ2_XS,GGUFTensorType::IQ2_S,
-        GGUFTensorType::IQ3_XXS,GGUFTensorType::IQ3_S,GGUFTensorType::IQ4_NL,GGUFTensorType::IQ4_XS}) {
+        GGUFTensorType::IQ3_XXS,GGUFTensorType::IQ3_S,GGUFTensorType::IQ4_NL,GGUFTensorType::IQ4_XS,GGUFTensorType::MXFP4}) {
         SCOPED_TRACE(static_cast<int>(format));RangeOwnerFixture f(2,format);
         for(int n=0;n<2;++n) {
             const auto table=f.prepare(n);const auto r=table->sourceRange();const auto v=table->rangeView();

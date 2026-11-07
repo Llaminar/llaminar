@@ -198,7 +198,8 @@ namespace llaminar2
             int K,
             int payload_bytes_per_block,
             bool is_asymmetric,
-            bool has_emins)
+            bool has_emins,
+            NativeVnniScalePlaneWidth scale_plane)
         {
             if (N <= 0 || K <= 0 || K % 32 != 0 ||
                 payload_bytes_per_block <= 0)
@@ -225,7 +226,7 @@ namespace llaminar2
                     "GPU expert payload"),
                 "GPU expert payload");
             append(
-                checkedMultiply(blocks, sizeof(std::uint16_t), "GPU expert scales"),
+                checkedMultiply(blocks, scalePlaneBytes(scale_plane), "GPU expert scales"),
                 "GPU expert scales");
             if (is_asymmetric)
             {
@@ -302,13 +303,16 @@ namespace llaminar2
             K,
             live.payload_bytes_per_block,
             live.has_mins,
-            live.has_emins);
+            live.has_emins,
+            nativeVnniScalePlaneWidth(canonicalDeviceVnniCodebookId(*source)));
+        // Shadow slots can hold any catalogued format: widest plane.
         result.gpu_shadow_bytes = gpuSeparatedProjectionBytes(
             N,
             K,
             /*payload_bytes_per_block=*/32,
             /*is_asymmetric=*/true,
-            /*has_emins=*/true);
+            /*has_emins=*/true,
+            NativeVnniScalePlaneWidth::FP16Word);
         return result;
     }
 } // namespace llaminar2

@@ -416,7 +416,7 @@ TEST(Test__TensorHostRelease, AllNativeRawViewsRetireIndependentlyAndFollowRoot)
     std::vector<TensorType> types{TensorType::FP32,TensorType::FP16,TensorType::BF16,TensorType::Q16_1};
     for(int id=0;id<=64;++id)
         if(NativeEmbeddingLayout::supports(static_cast<TensorType>(id)))types.push_back(static_cast<TensorType>(id));
-    ASSERT_EQ(types.size(),25u);
+    ASSERT_EQ(types.size(),26u); // Includes MXFP4 (GGUF type 39).
     for(const auto type:types)
     {
         SCOPED_TRACE(static_cast<int>(type));
@@ -466,6 +466,12 @@ TEST(Test__TensorHostRelease, AllNativeRawViewsRetireIndependentlyAndFollowRoot)
             }
             if(type==TensorType::IQ4_NL)
                 EXPECT_EQ(static_cast<IQ4_NLTensor*>(sibling.get())->raw_blocks(),nullptr);
+            if(type==TensorType::MXFP4) {
+                // Every MXFP4 block read follows the root's retirement (no freed-storage decode).
+                std::vector<float> row(256);
+                EXPECT_EQ(static_cast<MXFP4Tensor*>(nested.get())->blocks(),nullptr);
+                EXPECT_THROW(nested->to_fp32_row(0,row.data()),std::runtime_error);
+            }
             sibling->release_raw_data();root->release_raw_data();
             EXPECT_EQ(sibling->raw_data(),nullptr);
         }

@@ -3,6 +3,8 @@
 # Canonical registration for Unit, integration, production parity, E2E and
 # performance. Build gates derive dependencies from these same registrations,
 # including executables passed as arguments to script-based test drivers.
+# Native topology eligibility and CPU budgets consume one checked affinity/sysfs
+# snapshot; hybrid presentation fields and missing observations never invent capacity.
 
 # Note: enable_testing() is called in parent CMakeLists.txt (src/v2/CMakeLists.txt)
 
@@ -103,45 +105,23 @@ endfunction()
 # =============================================================================
 # CPU Topology Detection for Test Configuration
 # =============================================================================
-# Detect system topology to configure optimal MPI/OpenMP settings for tests
-execute_process(
-    COMMAND bash -c "lscpu | grep 'Socket(s):' | awk '{print $2}'"
-    OUTPUT_VARIABLE V2_TEST_SOCKETS
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-)
-execute_process(
-    COMMAND bash -c "lscpu | grep 'Core(s) per socket:' | awk '{print $4}'"
-    OUTPUT_VARIABLE V2_TEST_CORES_PER_SOCKET
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-)
-execute_process(
-    COMMAND bash -c "lscpu | grep 'Thread(s) per core:' | awk '{print $4}'"
-    OUTPUT_VARIABLE V2_TEST_THREADS_PER_CORE
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-)
+# Observe inherited affinity and kernel sibling groups once. Presentation lscpu
+# sections/ordinals are not physical identity on hybrid CPUs. The checked
+# uniform projection is the sole authority for the existing shared test budget.
+include(cmake/V2TestHostTopology.cmake)
+v2_observe_test_host_topology()
 
-if(NOT V2_TEST_SOCKETS OR V2_TEST_SOCKETS EQUAL "")
-    set(V2_TEST_SOCKETS 1)
-endif()
-if(NOT V2_TEST_CORES_PER_SOCKET OR V2_TEST_CORES_PER_SOCKET EQUAL "")
-    set(V2_TEST_CORES_PER_SOCKET 1)
-endif()
-if(NOT V2_TEST_THREADS_PER_CORE OR V2_TEST_THREADS_PER_CORE EQUAL "")
-    set(V2_TEST_THREADS_PER_CORE 1)
-endif()
-
-# Always use at least 2 MPI ranks for testing (even on single-socket systems)
+# Two protocol ranks on one accessible package are explicit oversubscription,
+# never evidence that two distinct physical sockets exist.
 if(V2_TEST_SOCKETS LESS 2)
     set(V2_TEST_MIN_RANKS 2)
     set(V2_TEST_NEEDS_OVERSUBSCRIBE TRUE)
-    message(STATUS "V2 Test Configuration: ${V2_TEST_SOCKETS} socket(s), ${V2_TEST_CORES_PER_SOCKET} cores/socket, ${V2_TEST_THREADS_PER_CORE} threads/core")
-    message(STATUS "V2 Tests will use: mpirun -np 2 --oversubscribe with OMP_NUM_THREADS=${V2_TEST_CORES_PER_SOCKET}")
 else()
     set(V2_TEST_MIN_RANKS ${V2_TEST_SOCKETS})
     set(V2_TEST_NEEDS_OVERSUBSCRIBE FALSE)
-    message(STATUS "V2 Test Configuration: ${V2_TEST_SOCKETS} sockets, ${V2_TEST_CORES_PER_SOCKET} cores/socket, ${V2_TEST_THREADS_PER_CORE} threads/core")
-    message(STATUS "V2 Tests will use: mpirun -np ${V2_TEST_SOCKETS} with OMP_NUM_THREADS=${V2_TEST_CORES_PER_SOCKET}")
 endif()
+message(STATUS "V2 Test Configuration: ${V2_TEST_SOCKETS} accessible package(s), ${V2_TEST_CORES_PER_SOCKET} eligible cores/package, ${V2_TEST_THREADS_PER_CORE} available threads/core")
+message(STATUS "V2 Tests: protocol ranks=${V2_TEST_MIN_RANKS}, oversubscribe=${V2_TEST_NEEDS_OVERSUBSCRIBE}, OMP_NUM_THREADS=${V2_TEST_CORES_PER_SOCKET}")
 
 # =============================================================================
 # Release-mode guard: only build performance test targets
@@ -857,6 +837,27 @@ add_executable(v2_test_qwen4exp_metadata
     unit/loaders/Test__GGUFIntegerArrays.cpp
 )
 target_link_libraries(v2_test_qwen4exp_metadata PRIVATE llaminar2_core GTest::gtest_main)
+# OCP MXFP4 (GGUF type 39): exact decode, NativeVNNI packing and CPU projection.
+add_executable(v2_test_mxfp4_tensor unit/tensors/Test__MXFP4Tensor.cpp)
+target_link_libraries(v2_test_mxfp4_tensor PRIVATE llaminar2_core GTest::gtest_main)
+target_include_directories(v2_test_mxfp4_tensor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_v2_test(V2_Unit_MXFP4Tensor
+    COMMAND $<TARGET_FILE:v2_test_mxfp4_tensor>
+    LABELS "V2;Unit;Tensors;MXFP4;CPU;Kernels"
+    MPI_PROCS 1
+    NO_MODELS
+    NO_MPI
+)
+# Exact MXFP4 preparation: inexact exponents rejected, ggml all-zero blocks
+# (e = 0 / e > 143) prepared with scale +0 through the production CPU packers.
+add_v2_test(V2_Integration_MXFP4ExactPreparation_CPU
+    COMMAND $<TARGET_FILE:v2_test_mxfp4_tensor>
+        --gtest_filter=MXFP4Tensor.NativeVnniPackingIsVerbatimAndRejectsInexactScales:MXFP4Tensor.GgmlAllZeroBlocksPrepareExactlyWithZeroScale:MXFP4CPUNativeVNNI.GgmlAllZeroBlocksMatchExactReference:MXFP4Format.NativeE8M0ScaleBitsAreExactNormalFP32:MXFP4Format.PowerOfTwoBF16WordIsExactAndValidated:MXFP4CPUScaleLoaders.*:MXFP4ScaleCarrier.*:MXFP4Tensor.NativeE8M0LayoutsCoverBoundariesAndRejectUnadmittedExponents:MXFP4ScalePlaneUpload.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Tensors;MXFP4;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+    NO_MPI
+)
 add_v2_test(V2_Unit_Qwen4ExpMetadata
     COMMAND $<TARGET_FILE:v2_test_qwen4exp_metadata>
     LABELS "V2;Unit;Models;Qwen4Exp;Loaders"
@@ -2810,6 +2811,18 @@ add_v2_test(V2_Unit_PackedWeightsSerialization
     LABELS "V2;Unit;Kernels;Serialization;PackedWeights;MoE"
     MPI_PROCS 1
 )
+# Native MXFP4 tier reference: exact byte plane <-> BF16 unit words, odd counts, malformed words.
+add_v2_test(V2_Integration_MXFP4TierReferenceRoundTrip
+    COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
+        --gtest_filter=ExpertTierWeightStream.MXFP4NativeE8M0PlaneRoundTripsOddCountsAndRejectsMalformedWords:*EveryCpuPreparedEncoding*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;MXFP4;Transfer;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+# CPU packed-weight archive ABI 8: native MXFP4 unit scale words are BF16 powers of two.
+add_v2_test(V2_Integration_MXFP4PackedWeightsArchiveABI
+    COMMAND $<TARGET_FILE:v2_unit_packed_weights_serialization>
+        --gtest_filter=Test__PackedWeightsSerialization.MXFP4NativeUnitScaleWordsRoundTripAndRejectVersion7
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MXFP4;Serialization;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 
 # Test: GPUPackedWeightsStubs - Phase 4 GPU packed weight stub IPackedWeights implementations
 # Tests: CUDA/ROCm construction, format, clone, convertTo, serialize, compatibility, empty data
@@ -4553,6 +4566,14 @@ foreach(V2_MPI_INVALID_KIND IN ITEMS layout version)
         target_compile_definitions(${V2_MPI_INVALID_TARGET} PRIVATE LLAMINAR_MPI_INVALID_VERSION)
     endif()
 endforeach()
+add_v2_test(V2_Integration_MPISessionNativeCABI
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/integration/scripts/test_mpi_native_module_abi.py
+        --module $<TARGET_FILE:llaminar_mpi_schizo> --mpi-library "${MPI_mpi_LIBRARY}"
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;MPI;ABI;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MPISessionNativeCABI)
+
 foreach(V2_MPI_DAEMON_CASE IN ITEMS success wait missing incompatible incompatible-version
         unselected-inclusion unselected-exclusion)
     add_v2_test(V2_Integration_MPISessionNativeDaemon_${V2_MPI_DAEMON_CASE}
@@ -6676,18 +6697,8 @@ add_v2_test(V2_Unit_Q8_1PureIntegerRMSNorm
     MPI_PROCS 1
 )
 
-# Test: Q16_1 RMSNorm (Q16_1 input → FP32 output)
-add_executable(v2_test_q16_1_rmsnorm unit/kernels/cpu/ops/Test__Q16_1RMSNorm.cpp)
-target_link_libraries(v2_test_q16_1_rmsnorm 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_Q16_1RMSNorm 
-    COMMAND $<TARGET_FILE:v2_test_q16_1_rmsnorm>
-    LABELS "V2;Unit;Kernels;RMSNorm;Q16_1;TypedResiduals;CPU"
-    MPI_PROCS 1
-)
+# Q16 RMSNorm's actual primitive-TU accuracy/ISA tests are core-free and
+# registered once in V2CPUArchitectureTests.cmake for both full and focused gates.
 
 # Test: Q4_1 SIMD Unpack
 add_executable(v2_test_q4_1_simd_unpack unit/tensors/Test__Q4_1_SIMD_Unpack.cpp)
@@ -7540,21 +7551,8 @@ add_v2_test(V2_Unit_CPUFlashAttentionKernelT
     MPI_PROCS 1
 )
 
-# Test: typed CPU FlashAttention2 cache and physical-axis launch policy.
-add_executable(v2_test_cpu_flash_attention_launch_policy
-    unit/kernels/cpu/attention/Test__CPUFlashAttentionLaunchPolicy.cpp
-    unit/kernels/cpu/attention/Test__CPUQ16AttentionMath.cpp
-)
-target_link_libraries(v2_test_cpu_flash_attention_launch_policy
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_CPUFlashAttentionLaunchPolicy
-    COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_launch_policy>
-    LABELS "V2;Unit;Kernels;Attention;FlashAttention;CPU;Dispatch;CachePolicy;Totality"
-    MPI_PROCS 1
-)
+# Device-free CPU attention launch/range policy registration is shared with
+# the native portability project in cmake/V2CPUArchitectureTests.cmake.
 add_v2_test(V2_Integration_GroupedVerifierRows_CPU_Attention_FP32
     COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_kernel_t>
             --gtest_filter=Test__CPUFlashAttentionKernelT.GroupedVerifierRowsMatchSerialDecode_Qwen36FP32_RuntimeM
@@ -8451,27 +8449,9 @@ add_v2_test(V2_Integration_CPUAttentionCacheSource
     NO_MODELS
 )
 
-# Production SIMD codec conformance does not need model or engine linkage.
-add_executable(v2_integration_cpu_attention_key_q8
-    integration/kernels/cpu/Test__CPUAttentionKeyQ8.cpp)
-target_include_directories(v2_integration_cpu_attention_key_q8 PRIVATE ${CMAKE_SOURCE_DIR})
-target_compile_features(v2_integration_cpu_attention_key_q8 PRIVATE cxx_std_23)
-target_link_libraries(v2_integration_cpu_attention_key_q8
-    GTest::gtest GTest::gtest_main OpenMP::OpenMP_CXX)
-add_v2_test(V2_Integration_CPUAttentionKeyQ8
-    COMMAND $<TARGET_FILE:v2_integration_cpu_attention_key_q8>
-    LABELS "V2;Integration;CPU;Attention;KVCache;Q8;AllHeadDims;AVX2;AVX512;ByteExact;Regression"
-    MPI_PROCS 1
-    TIMEOUT 120
-    NO_MODELS
-)
-
-# Economy/profiling stays outside ProductionTestPreflight.
-add_executable(v2_perf_cpu_attention_key_q8
-    performance/kernels/cpu/attention/Perf__CPUAttentionKeyQ8.cpp)
-target_include_directories(v2_perf_cpu_attention_key_q8 PRIVATE ${CMAKE_SOURCE_DIR})
-target_compile_features(v2_perf_cpu_attention_key_q8 PRIVATE cxx_std_23)
-target_link_libraries(v2_perf_cpu_attention_key_q8 PRIVATE OpenMP::OpenMP_CXX)
+# Production codec/performance targets share one source-owned registration with
+# the focused native CPU build. Economy stays outside ProductionTestPreflight.
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/V2CPUAttentionKeyQ8Tests.cmake")
 add_v2_test(V2_Perf_CPUAttentionKeyQ8
     COMMAND $<TARGET_FILE:v2_perf_cpu_attention_key_q8>
             --head-dim 64 --heads 128 --iterations 1000 --isa auto --operation encode
@@ -18669,72 +18649,7 @@ add_v2_test(V2_Perf_CPUGatedDeltaNetVerifierRows
     TIMEOUT 120
 )
 
-# The scalar FP32 publication ABI is device-free and header-only. Keep this
-# focused proof independent of the backend libraries for inexpensive feedback.
-add_executable(v2_test_cpu_explicit_rounding_contract
-    unit/kernels/cpu/Test__CPUExplicitRoundingContract.cpp)
-target_include_directories(v2_test_cpu_explicit_rounding_contract PRIVATE
-    ${CMAKE_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
-target_compile_features(v2_test_cpu_explicit_rounding_contract PRIVATE cxx_std_20)
-target_link_libraries(v2_test_cpu_explicit_rounding_contract PRIVATE
-    GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_CPUExplicitRoundingContract
-    COMMAND $<TARGET_FILE:v2_test_cpu_explicit_rounding_contract>
-    LABELS "V2;Unit;CPU;Numerics;ByteExact"
-    NO_MODELS NO_MPI MPI_PROCS 1)
-set(V2_Q8_FINITE_SCALE_CPU_PREFLIGHT_TESTS)
-set(V2_Q8_FINITE_SCALE_CPU_ISAS SCALAR AVX2)
-if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
-    list(APPEND V2_Q8_FINITE_SCALE_CPU_ISAS AVX512)
-endif()
-foreach(V2_Q8_SCALE_ISA IN LISTS V2_Q8_FINITE_SCALE_CPU_ISAS)
-    string(TOLOWER "${V2_Q8_SCALE_ISA}" V2_Q8_SCALE_TARGET_ISA)
-    set(V2_Q8_SCALE_TARGET v2_test_q8_finite_scale_contract_${V2_Q8_SCALE_TARGET_ISA})
-    # The production header selects SIMD with compiled feature guards and real
-    # CPUID, not LLAMINAR_ISA_LEVEL. Compile true ceilings; never stub detection.
-    add_executable(${V2_Q8_SCALE_TARGET}
-        unit/kernels/cpu/Test__CPUExplicitRoundingContract.cpp)
-    target_include_directories(${V2_Q8_SCALE_TARGET} PRIVATE
-        ${CMAKE_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
-    target_compile_features(${V2_Q8_SCALE_TARGET} PRIVATE cxx_std_20)
-    target_link_libraries(${V2_Q8_SCALE_TARGET} PRIVATE GTest::gtest GTest::gtest_main)
-    target_compile_definitions(${V2_Q8_SCALE_TARGET} PRIVATE
-        LLAMINAR_Q8_SCALE_TEST_${V2_Q8_SCALE_ISA}=1)
-    if(V2_Q8_SCALE_ISA STREQUAL "SCALAR")
-        target_compile_options(${V2_Q8_SCALE_TARGET} PRIVATE
-            -mno-avx -mno-avx2 -mno-avx512f -mno-fma)
-    elseif(V2_Q8_SCALE_ISA STREQUAL "AVX2")
-        target_compile_options(${V2_Q8_SCALE_TARGET} PRIVATE
-            -mavx2 -mfma -mno-avx512f)
-    else()
-        target_compile_options(${V2_Q8_SCALE_TARGET} PRIVATE
-            -mavx512f -mavx512bw -mavx512vl -mavx512dq -mfma)
-    endif()
-    add_v2_test(V2_Integration_Q8FiniteScaleContract_CPU_${V2_Q8_SCALE_ISA}
-        COMMAND $<TARGET_FILE:${V2_Q8_SCALE_TARGET}>
-            --gtest_filter=CPUExplicitRoundingContract.Q8FiniteScale*
-        LABELS "V2;Integration;CPU;${V2_Q8_SCALE_ISA};Quantization;Numerics;ScaleRange;Regression"
-        NO_MODELS NO_MPI MPI_PROCS 1)
-    list(APPEND V2_Q8_FINITE_SCALE_CPU_PREFLIGHT_TESTS
-        V2_Integration_Q8FiniteScaleContract_CPU_${V2_Q8_SCALE_ISA})
-endforeach()
-foreach(_fp32_subnormal_isa IN ITEMS SCALAR AVX2 AVX512)
-    string(TOLOWER "${_fp32_subnormal_isa}" _fp32_subnormal_isa_lower)
-    if(TARGET v2_test_q8_finite_scale_contract_${_fp32_subnormal_isa_lower})
-        add_v2_test(V2_Integration_FP32SubnormalContract_CPU_${_fp32_subnormal_isa}
-            COMMAND $<TARGET_FILE:v2_test_q8_finite_scale_contract_${_fp32_subnormal_isa_lower}>
-                --gtest_filter=CPUExplicitRoundingContract.Q8FiniteScaleCompiledISAPath:CPUExplicitRoundingContract.DeviceFP32SubnormalFixedWords
-            LABELS "V2;Integration;CPU;${_fp32_subnormal_isa};NumericalContract;ByteExact;Regression"
-            MPI_PROCS 1 NO_MODELS NO_MPI TIMEOUT 30)
-        list(APPEND V2_FP32_SUBNORMAL_PREFLIGHT_TESTS
-            V2_Integration_FP32SubnormalContract_CPU_${_fp32_subnormal_isa})
-    endif()
-endforeach()
-
-add_v2_test(V2_Integration_CPUExplicitRoundingContract
-    COMMAND $<TARGET_FILE:v2_test_cpu_explicit_rounding_contract>
-    LABELS "V2;Integration;ProductionTestPreflight;CPU;Numerics;MoE;AllFormats;ByteExact;Regression"
-    NO_MODELS NO_MPI MPI_PROCS 1)
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/V2CPUExplicitRoundingTests.cmake")
 
 # Performance evidence remains separate from the functional preflight proof.
 add_executable(v2_perf_cpu_expert_q8_publication
@@ -19179,6 +19094,20 @@ add_v2_test(V2_Integration_GroupedVerifierRows_CPU_Attention_NonQ16NativeFormats
     COMMAND $<TARGET_FILE:v2_integration_cpu_flash_attention_kernel>
             --gtest_filter=Test__CPUFlashAttentionKernel.PhysicalModesAndGroupedVerifierAreByteExactForEveryNonQ16NativeKVFormat:Test__CPUFlashAttentionKernel.WrappedNativeKVRingMatchesCompactForEveryNonQ16FormatAndM:Test__CPUFlashAttentionKernel.NativeRequestBatchWithUnequalWrappedHistoriesIsByteExactForEveryNonQ16Format
     LABELS "V2;Integration;ProductionTestPreflight;CPU;Attention;GroupedVerifier;ByteExact;AllFormats;MTotality;PhysicalModes;WrappedRing;FP32;FP16;BF16;Q8_1;TurboQuant;TQ4;TQ8"
+    MPI_PROCS 1
+    NO_MODELS
+)
+
+# Actual AQ8 tensor/request entries must execute on each compiled native CPU ISA;
+# a leaf-only ARM pass cannot certify an adapter hidden in an x86-only section.
+add_executable(v2_integration_cpu_flash_attention_aq8
+    integration/kernels/cpu/attention/Test__CPUFlashAttentionAQ8.cpp)
+target_link_libraries(v2_integration_cpu_flash_attention_aq8 PRIVATE
+    llaminar2_core GTest::gtest_main OpenMP::OpenMP_CXX)
+add_v2_test(V2_Integration_CPUFlashAttentionAQ8NativeEntries
+    COMMAND $<TARGET_FILE:v2_integration_cpu_flash_attention_aq8>
+        --gtest_filter=CPUFlashAttentionAQ8.NativeTensorAndRequestEntriesRetainSerialBytes
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;Attention;AQ8;Q8_1;TQ4;TQ8;GroupedVerifier;ByteExact;Regression"
     MPI_PROCS 1
     NO_MODELS
 )
@@ -21568,6 +21497,13 @@ add_v2_test(V2_Integration_ROCmIQ2SFusedMoEOriginalEquation
         LABELS "V2;Integration;ROCm;MoE;Routing;Gather;Scatter;gfx906"
         MPI_PROCS 1
     )
+    # MXFP4: physical decoder 25 under the IQ4_NL (4) arithmetic policy.
+    add_v2_test(V2_Integration_ROCm_MoEMXFP4GroupedDecodePolicy
+        COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
+                --gtest_filter=Test__ROCmMoEKernel.GroupedExpertGateUpDecode_MXFP4MatchesSerialDecodeBytes
+                --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;MXFP4;DecodeEquivalent;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 60)
     add_v2_test(V2_Integration_ROCm_MoEColdGroupedVerifierPublisherReplay
         COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
                 --gtest_filter=Test__ROCmMoEKernel.ColdGroupedVerifierPublisherCapturesWithoutComputeStream
@@ -26480,6 +26416,13 @@ add_v2_test(V2_Unit_CPUEmbeddingGroupedVerifier
     MPI_PROCS 1
 )
 # Original source values are independent of the optimized lookup implementation.
+# Arena-capacity outputs: native FP16/BF16 CPU lookups use the arena row pitch.
+add_v2_test(V2_Integration_EmbeddingArenaCapacityRowPitch_CPU
+    COMMAND $<TARGET_FILE:v2_test_cpu_embedding_grouped_verifier>
+        --gtest_filter=Test__CPUEmbeddingGroupedVerifier.ArenaCapacityOutputMatchesExactRowsForAllFormats
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Embedding;AllFormats;Regression"
+    MPI_PROCS 1 NO_MODELS
+)
 add_v2_test(V2_Integration_EmbeddingSourceRepresentation
     COMMAND $<TARGET_FILE:v2_test_cpu_embedding_grouped_verifier>
         --gtest_filter=Test__CPUEmbeddingGroupedVerifier.NativeLayoutRetainsEverySourceFormatAndRejectsInvalidGeometry
@@ -27678,6 +27621,17 @@ add_v2_test(V2_Integration_DeviceLoadPipeline
     LABELS "V2;Integration;WeightLoading;GpuPipeline;CUDA;ROCm;HIP"
     MPI_PROCS 1
 )
+# MXFP4 through the production row-chunked GPU pipeline on each backend:
+# exact payload/scales, ggml zero blocks, and reader-thread inexact-scale failure.
+foreach(_mxfp4_backend CUDA ROCm)
+    if((_mxfp4_backend STREQUAL "CUDA" AND HAVE_CUDA) OR (_mxfp4_backend STREQUAL "ROCm" AND HAVE_ROCM))
+        add_v2_test(V2_Integration_MXFP4DeviceLoadPipeline_${_mxfp4_backend}
+            COMMAND $<TARGET_FILE:v2_integration_device_load_pipeline>
+                --gtest_filter=Test__DeviceLoadPipelineMXFP4.${_mxfp4_backend}RowChunkedSourceIsExactAndInexactScalesFail
+            LABELS "V2;Integration;ProductionTestPreflight;WeightLoading;GpuPipeline;${_mxfp4_backend};MXFP4;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    endif()
+endforeach()
 
 # Backing-aware, exactly-once asynchronous mmap reclaim lifecycle. This is a
 # model-free integration invariant shared by CPU and accelerator model loading.
@@ -28465,6 +28419,16 @@ if(HAVE_ROCM AND TARGET v2_integration_rocm_vnni_repack_kernels)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmIQ4XSSourceTupleRepack)
 endif()
 
+# MXFP4 17-byte source blocks: exact FP16 scales, ggml zero blocks, offsets and replay.
+if(HAVE_ROCM AND TARGET v2_integration_rocm_vnni_repack_kernels)
+    add_v2_test(V2_Integration_ROCmMXFP4Repack
+        COMMAND $<TARGET_FILE:v2_integration_rocm_vnni_repack_kernels>
+            --gtest_filter=Test__VnniRepackKernels.MXFP4_ExactScalesCodesZeroBlocksOffsetsAndReplay
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;NativeVNNI;MXFP4;Repack;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmMXFP4Repack)
+endif()
+
 # Explicit focused inventory membership, in addition to registration labels.
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_CPUIQ2SFusedMoEOriginalEquation_AVX2)
@@ -28510,6 +28474,24 @@ add_v2_test(V2_Integration_NativeQuantizedRowViewExtent
     LABELS "V2;Integration;DeviceFree;CPU;TensorOperations;ByteSize;AllFormats;Regression"
     MPI_PROCS 1 NO_MODELS)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeQuantizedRowViewExtent)
+
+# IQ2_S source coefficients are raw words, not a maskable approximation.
+if(NOT LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
+    add_v2_test(V2_Integration_CPUNativeSourceCoefficientMetadata_X86
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
+            --gtest_filter=CPUNativeSourceMetadata.ReservedBitsRejectAtEveryVectorLane
+        LABELS "V2;Integration;DeviceFree;CPU;NativeVNNI;Metadata;Regression"
+        TIMEOUT 60 NO_MODELS MPI_PROCS 1)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeSourceCoefficientMetadata_X86)
+endif()
+
+# Native read views must accept the real catalog-wide CPU slot/demotion owners.
+add_v2_test(V2_Integration_CPUPreparedNativeReadPublication
+    COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
+        --gtest_filter=ExpertTierWeightStream.PreparedReadViewAcceptsAllMigratedSourceFormats:CpuExpertSlotPool.EveryCatalogedFormatBuildsStableTripletMetadata
+    LABELS "V2;Integration;DeviceFree;CPU;NativeVNNI;AllFormats;Movement;Regression"
+    TIMEOUT 60 NO_MODELS MPI_PROCS 1)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUPreparedNativeReadPublication)
 
 # IQ4_XS source-tuple mapping, movement, serialization and arithmetic-generation fences.
 add_v2_test(V2_Integration_IQ4XSTupleFormatContract
@@ -36632,6 +36614,8 @@ if(TEST V2_Integration_MPIBootstrapNativeApplicationBoundary)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
         V2_Integration_MPIBootstrapNativeApplicationBoundary V2_Integration_MPIExternalParentOwnership)
 endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/V2CPUArchitectureTests.cmake")
 
 # Inventory finalization must observe later registrations too. The module
 # schedules one end-of-directory pass rather than relying on textual position.

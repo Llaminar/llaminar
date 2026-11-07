@@ -916,7 +916,7 @@ TEST_P(VnniUnpackTest, BoundedBufferedMmapPipelineMatchesAcrossLaneReuse) {
             N, K,
             /*payload_bytes_per_block=*/16,
             /*is_asymmetric=*/false,
-            /*has_emins=*/false,
+            /*has_emins=*/false, NativeVnniScalePlaneWidth::FP16Word,
             kRawBytes);
     }
     orchestrator.allocate(kPinnedSlotBytes, kLaneCount);
@@ -1026,7 +1026,7 @@ TEST_P(
     orchestrator.addDevice(device_id_);
     orchestrator.planWeight(
         device_id_, "odd_stride_q6_k", N, K,
-        info->payload_bytes, info->is_asymmetric, info->has_emins,
+        info->payload_bytes, info->is_asymmetric, info->has_emins, NativeVnniScalePlaneWidth::FP16Word,
         tensor->size_bytes());
     orchestrator.allocate(kOddSlotCapacity, kLaneCount);
 

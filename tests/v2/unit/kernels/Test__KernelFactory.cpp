@@ -98,7 +98,7 @@ TEST(GPUPreparedWeightBinding, AllFormatsRejectTruncatedPoolRegions)
                         : NativeVnniReusableDeviceAllocationFormat{static_cast<uint8_t>(source.payload_bytes),
                             canonicalDeviceVnniFormat(source).is_asymmetric, source.has_emins};
                     owner->planWeight(0, "short", 16, 256, allocation.payload_bytes_per_block,
-                        allocation.has_mins, allocation.has_emins, tensor->size_bytes());
+                        allocation.has_mins, allocation.has_emins, NativeVnniScalePlaneWidth::FP16Word, tensor->size_bytes());
                 }
                 else owner->planRawWeight(0, "short", 16, 256, tensor->size_bytes() / 2);
                 ASSERT_TRUE(owner->getPool(0)->allocate(&backend, 0, 0));
@@ -128,7 +128,7 @@ TEST(GPUPreparedWeightBinding, RejectsMissingSourceCoefficientPlane)
                 auto owner = std::make_shared<LoadOrchestrator>(&backend, kTestOnlyUnadmittedGPUAllocation);
                 owner->addDevice(0);
                 owner->planWeight(0, "missing.coefficients", 32, 256,
-                    payload_bytes, false, false, tensor->size_bytes());
+                    payload_bytes, false, false, NativeVnniScalePlaneWidth::FP16Word, tensor->size_bytes());
                 // MockBackend supplies host backing only. Correct payload and
                 // scale bounds leave the absent secondary as the sole defect.
                 auto *pool = owner->getPool(0);

@@ -23,6 +23,7 @@
  * accesses; physical matrix strides and each row's reduction order stay fixed.
  */
 
+#include "kernels/common/NativeVnniPrimaryPlaneUpload.h"
 #include "kernels/common/ProjectionWorkLaunch.h"
 #include <cuda_runtime.h>
 #include "kernels/cuda/gemm/CUDAQuantisedActivationProducers.h"
@@ -426,6 +427,39 @@ extern "C"
             throw std::runtime_error(
                 "[CUDAQuantGemm] CUDA backend unavailable while releasing packed weights");
         backend->free(d_ptr, cuda_device_id);
+    }
+
+    /**
+     * @brief Allocate and upload a host-packed primary scale plane (setup only).
+     *
+     * Runs the shared uploadNativeVnniPrimaryPlane body: rounded word-aligned
+     * capacity, exact live-byte transfers. This is the single CUDA setup copy
+     * site for primary planes (dense and batched packed weights).
+     * @return 0 uploaded, 1 allocation failed, 2 copy failed (memory published).
+     */
+    int cudaQuantGemm_uploadPrimaryPlane(
+        uint8_t physical_codebook,
+        size_t blocks_per_chunk,
+        size_t chunks,
+        const void *h_src,
+        size_t host_bytes,
+        void **d_dst,
+        int cuda_device_id)
+    {
+        auto *backend = llaminar2::getCUDABackend();
+        void *const setup_stream =
+            llaminar2::GPUDeviceContextPool::instance()
+                .getNvidiaContext(cuda_device_id)
+                .defaultStream();
+        if (!backend || !setup_stream)
+            throw std::runtime_error(
+                "[CUDAQuantGemm] Primary-plane upload has no CUDA backend or explicit setup stream");
+        const auto status = llaminar2::uploadNativeVnniPrimaryPlane(
+            physical_codebook, blocks_per_chunk, chunks, h_src, host_bytes, d_dst,
+            [&](size_t bytes) { return backend->allocate(bytes, cuda_device_id); },
+            [&](void *dst, const void *src, size_t bytes)
+            { return backend->hostToDevice(dst, src, bytes, cuda_device_id, setup_stream); });
+        return static_cast<int>(status);
     }
 
     /**

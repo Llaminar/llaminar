@@ -40,6 +40,8 @@
 #include "kernels/rocm/gdn/ROCmGatedNormSingleQ8.h"
 #include "ROCmQuantisedEpilogues.h"
 #include "ROCmQuantisedGemmKernel.h"
+#include "tensors/NativeVnniScalePlane.h"
+#include "kernels/common/NativeVnniPrimaryPlaneUpload.h"
 #include "kernels/common/GPUQ8ResidualNative.h"
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -5967,39 +5969,51 @@ namespace llaminar2
                             // Allocate FP16 scales buffer
                             if (upload.d_native_vnni_payload)
                             {
-                                const size_t scales_bytes = packed_->native_vnni_scales.size() * sizeof(uint16_t);
+                                // Shared primary-plane uploader: rounded storage
+                                // capacity, exact live transfer (an odd one-byte
+                                // E8M0 plane never sends its unused storage byte).
                                 void *d_scales_tmp = nullptr;
-                                if (!rocmQuantGemm_allocInt8(
-                                        reinterpret_cast<int8_t **>(&d_scales_tmp),
-                                        scales_bytes,
-                                        rocm_device_id_))
+                                const auto scales_status = uploadNativeVnniPrimaryPlane(
+                                    packed_->native_vnni_codebook_id,
+                                    static_cast<size_t>(packed_->N) * packed_->native_vnni_blocks_per_row, 1,
+                                    packed_->native_vnni_scales.data(),
+                                    packed_->native_vnni_scales.size() * sizeof(uint16_t), &d_scales_tmp,
+                                    [&](size_t bytes) -> void *
+                                    {
+                                        void *slab = nullptr;
+                                        return rocmQuantGemm_allocInt8(
+                                                   reinterpret_cast<int8_t **>(&slab), bytes, rocm_device_id_)
+                                                   ? slab : nullptr;
+                                    },
+                                    [&](void *dst, const void *src, size_t bytes)
+                                    {
+                                        err = startupMemcpyAsyncOrSync(
+                                            dst,
+                                            src,
+                                            bytes,
+                                            async_upload_enabled,
+                                            upload.startup_h2d_stream,
+                                            &upload.startup_h2d_pinned_native_scales,
+                                            "ROCmQuantisedGemmKernel::ensureWeightsConverted",
+                                            "native_vnni_scales");
+                                        return err == hipSuccess;
+                                    });
+                                upload.d_native_vnni_scales = d_scales_tmp;
+                                if (scales_status == NativeVnniPrimaryPlaneUploadStatus::AllocationFailed)
                                 {
                                     LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate native-VNNI scales");
                                     cleanup_startup_device_upload();
                                     cleanup_startup_async_resources();
                                     return;
                                 }
-                                upload.d_native_vnni_scales = d_scales_tmp;
-                                if (d_scales_tmp)
+                                if (scales_status == NativeVnniPrimaryPlaneUploadStatus::CopyFailed)
                                 {
-                                    err = startupMemcpyAsyncOrSync(
-                                        d_scales_tmp,
-                                        packed_->native_vnni_scales.data(),
-                                        scales_bytes,
-                                        async_upload_enabled,
-                                        upload.startup_h2d_stream,
-                                        &upload.startup_h2d_pinned_native_scales,
-                                        "ROCmQuantisedGemmKernel::ensureWeightsConverted",
-                                        "native_vnni_scales");
-                                    if (err != hipSuccess)
-                                    {
-                                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI scales: "
-                                                  << hipGetErrorString(err)
-                                                  << "; refusing alternate GEMM path");
-                                        cleanup_startup_device_upload();
-                                        cleanup_startup_async_resources();
-                                        return;
-                                    }
+                                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI scales: "
+                                              << hipGetErrorString(err)
+                                              << "; refusing alternate GEMM path");
+                                    cleanup_startup_device_upload();
+                                    cleanup_startup_async_resources();
+                                    return;
                                 }
                             }
 
@@ -6287,21 +6301,31 @@ namespace llaminar2
                     return;
                 }
 
-                const size_t native_scales_bytes = host_packed.native_vnni_scales.size() * sizeof(uint16_t);
-                if (!rocmQuantGemm_allocInt8(
-                        reinterpret_cast<int8_t **>(&impl_->d_weights_native_scales),
-                        native_scales_bytes,
-                        rocm_device_id_))
+                // Shared primary-plane uploader (see the startup upload above).
+                void *d_native_scales = nullptr;
+                const auto native_scales_status = uploadNativeVnniPrimaryPlane(
+                    host_packed.native_vnni_codebook_id,
+                    static_cast<size_t>(host_packed.N) * host_packed.native_vnni_blocks_per_row, 1,
+                    host_packed.native_vnni_scales.data(),
+                    host_packed.native_vnni_scales.size() * sizeof(uint16_t), &d_native_scales,
+                    [&](size_t bytes) -> void *
+                    {
+                        void *slab = nullptr;
+                        return rocmQuantGemm_allocInt8(reinterpret_cast<int8_t **>(&slab), bytes, rocm_device_id_)
+                                   ? slab : nullptr;
+                    },
+                    [&](void *dst, const void *src, size_t bytes)
+                    {
+                        err = hipMemcpy(dst, src, bytes, hipMemcpyHostToDevice);
+                        return err == hipSuccess;
+                    });
+                impl_->d_weights_native_scales = d_native_scales;
+                if (native_scales_status == NativeVnniPrimaryPlaneUploadStatus::AllocationFailed)
                 {
                     LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to allocate native-VNNI scales");
                     return;
                 }
-
-                err = hipMemcpy(impl_->d_weights_native_scales,
-                                host_packed.native_vnni_scales.data(),
-                                native_scales_bytes,
-                                hipMemcpyHostToDevice);
-                if (err != hipSuccess)
+                if (native_scales_status == NativeVnniPrimaryPlaneUploadStatus::CopyFailed)
                 {
                     LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI scales: "
                               << hipGetErrorString(err));

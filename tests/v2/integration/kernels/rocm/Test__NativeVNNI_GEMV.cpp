@@ -420,6 +420,10 @@ namespace
         {"IQ4_NL", false, 0.990f,
          [](size_t N, size_t K)
          { return TestTensorFactory::createIQ4_NLRandom({N, K}); }},
+        // IQ4_NL geometry with the doubled-E2M1 lookup (physical codebook 25).
+        {"MXFP4", false, 0.990f,
+         [](size_t N, size_t K)
+         { return TestTensorFactory::createMXFP4Random({N, K}); }},
         {"Q4_1", false, 0.990f,
          [](size_t N, size_t K)
          { return TestTensorFactory::createQ4_1Random({N, K}); }},

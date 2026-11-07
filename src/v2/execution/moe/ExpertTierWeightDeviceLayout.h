@@ -325,7 +325,7 @@ namespace llaminar2
                         ? Encoding::NibbleLUTSourceScale
                         : gpu_codebook_id == 11 ? Encoding::IQ3SExpandedSourceScale
                         : gpu_codebook_id == 0 || gpu_codebook_id == 4 ||
-                            gpu_codebook_id == 5
+                            gpu_codebook_id == 5 || gpu_codebook_id == kNativeVnniMXFP4Codebook
                         ? Encoding::NibbleLUT
                         : (gpu_codebook_id == 8
                                ? Encoding::Q6KNativeDualScale
@@ -354,7 +354,8 @@ namespace llaminar2
             case Encoding::NibbleLUT:
                 return gpu_payload_bytes_per_block == 16 &&
                        gpu_is_asymmetric == cpu_is_asymmetric &&
-                       (((gpu_codebook_id == 0 || gpu_codebook_id == 4) &&
+                       (((gpu_codebook_id == 0 || gpu_codebook_id == 4 ||
+                          gpu_codebook_id == kNativeVnniMXFP4Codebook) &&
                          cpu_is_asymmetric == 0) ||
                         (gpu_codebook_id == 5 && cpu_is_asymmetric != 0));
             case Encoding::ExpandedInt8:
@@ -490,10 +491,10 @@ namespace llaminar2
                 static_cast<std::size_t>(layout.gpu_K/32);
             return payload_bytes ==
                        blocks * layout.gpu_payload_bytes_per_block &&
-                   scales_bytes == blocks * sizeof(std::uint16_t) &&
+                   scales_bytes == blocks * nativeVnniScalePlaneBytes(layout.gpu_codebook_id) &&
                    mins_bytes ==
                        (layout.gpu_is_asymmetric != 0
-                            ? blocks * sizeof(std::uint16_t)
+                            ? blocks * kNativeVnniSecondaryPlaneBytes
                             : 0u) &&
                    emins_bytes ==
                        (layout.gpu_has_emins != 0

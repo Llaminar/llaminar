@@ -124,6 +124,11 @@ class NativeVNNIQwenMoEPrefillPatternsTest(unittest.TestCase):
         ))
 
     def test_non_native_formats_remain_visible_but_never_claim_coverage(self) -> None:
+        """Formats outside the tuning registry stay visible without claiming sweep coverage.
+
+        This includes MXFP4, which executes at runtime under IQ4_NL's installed
+        policy but has no tuning corpus.
+        """
         all_mixtures = qwen_moe_prefill_mixtures()
         native_mixtures = qwen_moe_prefill_mixtures(native_vnni_only=True)
 

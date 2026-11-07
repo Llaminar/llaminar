@@ -97,6 +97,8 @@ namespace
          [] { return TestTensorFactory::createQ8_1Random({2, 256}); }},
         {"Q8_K", 21, 32, false, true, false,
          [] { return TestTensorFactory::createQ8_KRandom({2, 256}); }},
+        {"MXFP4", kNativeVnniMXFP4Codebook, 16, false, false, false,
+         [] { return TestTensorFactory::createMXFP4Random({2, 256}); }},
     };
 }
 
@@ -251,7 +253,7 @@ TEST(Test__NativeVnniFormatInfo, CompactMultiScaleRetainsNativePayloadAndEveryMe
 
 TEST(Test__NativeVnniFormatInfo, SourceIdentitiesAreExhaustiveUniqueAndCanonical)
 {
-    ASSERT_EQ(native_vnni_formats::kAllSourceFormats.size(), 21u);
+    ASSERT_EQ(native_vnni_formats::kAllSourceFormats.size(), 22u);
     ASSERT_EQ(native_vnni_formats::kAllSourceFormats.size(), kExpectations.size());
 
     for (size_t i = 0; i < native_vnni_formats::kAllSourceFormats.size(); ++i)
@@ -270,10 +272,13 @@ TEST(Test__NativeVnniFormatInfo, SourceIdentitiesAreExhaustiveUniqueAndCanonical
             entry.metadata)
             << entry.quant_type;
 
+        // Q8_1/Q8_K share the Q8_0 arithmetic policy; MXFP4 shares IQ4_NL's.
         const uint8_t expected_device_codebook =
             entry.metadata->codebook_id == 20 ||
                     entry.metadata->codebook_id == 21
                 ? static_cast<uint8_t>(19)
+            : entry.metadata->codebook_id == kNativeVnniMXFP4Codebook
+                ? static_cast<uint8_t>(4)
                 : entry.metadata->codebook_id;
         EXPECT_EQ(
             canonicalDeviceVnniCodebookId(entry.metadata->codebook_id),
@@ -340,7 +345,9 @@ TEST(Test__NativeVnniFormatInfo, PackedRegionSizingMatchesCanonicalMetadata)
         EXPECT_EQ(
             regions.payload_bytes,
             blocks * static_cast<size_t>(expected.payload_bytes));
-        EXPECT_EQ(regions.scales_bytes, blocks * sizeof(uint16_t));
+        // Primary plane width follows the physical codebook (1 B for native MXFP4).
+        EXPECT_EQ(regions.scales_bytes,
+                  blocks * nativeVnniScalePlaneBytes(canonicalDeviceVnniCodebookId(*format)));
         EXPECT_EQ(
             regions.mins_bytes,
             (expected.is_asymmetric || expected.name == "IQ4_XS" || expected.name == "IQ3_S")
@@ -369,7 +376,8 @@ TEST(Test__NativeVnniFormatInfo, MigrationStableAndReusableFormatsCoverEveryCode
                 ? source->payload_bytes
                 : (source->codebook_id == 0 ||
                            source->codebook_id == 4 ||
-                           source->codebook_id == 5
+                           source->codebook_id == 5 ||
+                           source->codebook_id == kNativeVnniMXFP4Codebook
                        ? 16
                        : 32);
         const uint8_t expected_migrated_codebook =

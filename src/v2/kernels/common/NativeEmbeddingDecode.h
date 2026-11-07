@@ -47,6 +47,7 @@ namespace llaminar2::native_embedding
     LLAMINAR_EMBED_BLOCK(IQ3_S)
     LLAMINAR_EMBED_BLOCK(IQ4_NL)
     LLAMINAR_EMBED_BLOCK(IQ4_XS)
+    LLAMINAR_EMBED_BLOCK(MXFP4)
 #undef LLAMINAR_EMBED_BLOCK
 
     /**
@@ -231,6 +232,20 @@ namespace llaminar2::native_embedding
         }
         else if constexpr (Format == TensorType::IQ4_NL)
             return multiply(half(b.d), iq4((b.qs[i & 15] >> (4 * (i / 16))) & 15));
+        else if constexpr (Format == TensorType::MXFP4)
+        {
+            // Doubled E2M1 code times 2^(e-128): one exact binary32 product.
+            const unsigned code = (b.qs[i & 15] >> (4 * (i / 16))) & 15;
+            constexpr std::uint64_t kValues = 0xf4f8fafcfdfeff00ULL; // codes 8..15 as int8
+            constexpr std::uint64_t kPositive = 0x0c08060403020100ULL; // codes 0..7
+            const int value = static_cast<std::int8_t>(
+                ((code < 8 ? kPositive : kValues) >> (8 * (code & 7))) & 255);
+            const int exponent = int(b.e) - 128;
+            const float scale = exponent >= -126
+                ? device_fp32_contract::floatFromBits(std::uint32_t(exponent + 127) << 23)
+                : device_fp32_contract::floatFromBits(1u << (exponent + 149));
+            return multiply(scale, float(value));
+        }
         else if constexpr (Format == TensorType::IQ4_XS)
         {
             const unsigned group = i / 32;

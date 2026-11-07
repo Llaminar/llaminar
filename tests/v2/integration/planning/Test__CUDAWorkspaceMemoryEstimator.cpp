@@ -149,7 +149,7 @@ TEST(Test__CUDAWorkspaceMemoryEstimator, ContinuationIncludesCompactQuantizedPro
         {"blk.0.ffn_up_exps.weight", 0, "", size_t(512 * 2048) * 256, 2048, 0},
         {"blk.0.ffn_down_exps.weight", 0, "", size_t(2048 * 512) * 256, 512, 0},
     };
-    for (int raw = 0; raw <= static_cast<int>(TensorType::AQ8); ++raw)
+    for (int raw = 0; raw <= static_cast<int>(TensorType::MXFP4); ++raw)
     {
         const auto type = static_cast<TensorType>(raw);
         if (!isNativeVnniFormat(type) && !isInt8VnniFormat(type))
@@ -159,8 +159,10 @@ TEST(Test__CUDAWorkspaceMemoryEstimator, ContinuationIncludesCompactQuantizedPro
             tensor.quant_type = format;
         const auto *native = native_vnni_formats::forQuantType(format);
         ASSERT_NE(native, nullptr);
-        const auto codebook = canonicalDeviceVnniCodebookId(native->codebook_id);
-        const cuda::quantized_gemm_workspace::NativeCodebooks codebooks{codebook, codebook};
+        // Physical decoder from the descriptor overload; arithmetic policy from
+        // the source-codebook overload (MXFP4 25/4, IQ4_XS 24/4).
+        const cuda::quantized_gemm_workspace::NativeCodebooks codebooks{
+            canonicalDeviceVnniCodebookId(*native), canonicalDeviceVnniCodebookId(native->codebook_id)};
         for (const int rows : {1, 16, 128, 768, 4096})
         {
             auto invocation = geometry();

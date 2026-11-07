@@ -3,19 +3,23 @@
  * @brief Vectorized RMSNorm primitives for V2 (ported from V1)
  * @author David Sanftenberg
  *
- * High-performance RMSNorm implementation with:
- * - AVX512/AVX2 vectorization (4-8× speedup)
- * - Double precision accumulation for accuracy
- * - Thread-local scratch buffers
- * - T5 compatibility mode
- * - INT32→INT8 pipeline support for full INT8 inference
+ * FP32 matrix normalization retains complete original rows within one worker
+ * transaction: summary, inverse and publication have the same lexical owner.
+ * Native ARM floating and original-Q16 tiles share gamma across1..4 rows
+ * without decoded row scratch. Q16 retains FP32 squares before FP64 accumulation,
+ * unlike floating RMSNorm's widen-before-square program. Their fixed arithmetic
+ * is independent of M or worker count. Explicit T5
+ * accumulation remains a distinct program. Original tensors/gamma retain their
+ * caller-owned storage authority. Other typed publication APIs keep their own
+ * numerical programs:
+ * - INT32→INT8 original-row summary/inverse and native two-pass publication,
+ *   without scratch allocation or decoded-row/TLS mirrors
  * - Q8_1 integer-space RMSNorm (avoids FP32 dequant overhead)
  */
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
-#include <vector>
 #include "../../../tensors/BlockStructures.h"
 
 namespace llaminar2::primitives
@@ -33,45 +37,6 @@ namespace llaminar2::primitives
     };
 
     /**
-     * @brief Reusable scratch buffers to avoid per-call allocations
-     */
-    struct RMSNormScratch
-    {
-        std::vector<double> row_sumsq; // Per-row sum of squares
-        std::vector<float> inv;        // Per-row inverse RMS
-
-        void ensure(std::size_t rows)
-        {
-            if (row_sumsq.size() < rows)
-                row_sumsq.resize(rows);
-            if (inv.size() < rows)
-                inv.resize(rows);
-        }
-
-        void clear()
-        {
-            row_sumsq.clear();
-            inv.clear();
-        }
-    };
-
-    /**
-     * @brief Compute per-row sum of squares (vectorized)
-     *
-     * @param src Input tensor [rows, cols]
-     * @param rows Number of rows
-     * @param cols Number of columns
-     * @param row_sumsq Output per-row sum of squares (length = rows)
-     * @param opts Execution options
-     */
-    void rmsnorm_compute_row_sumsq_vectorized(
-        const float *src,
-        std::size_t rows,
-        std::size_t cols,
-        double *row_sumsq,
-        const RMSNormExecOptions &opts = {});
-
-    /**
      * @brief Convert row sum of squares to inverse RMS scaling factors
      *
      * @param row_sumsq Per-row sum of squares
@@ -87,25 +52,7 @@ namespace llaminar2::primitives
         float epsilon,
         float *inv_out);
 
-    /**
-     * @brief Apply RMSNorm scaling and gamma weights (vectorized)
-     *
-     * @param src Input tensor [rows, cols]
-     * @param gamma Gamma weights [cols]
-     * @param inv Per-row inverse RMS values
-     * @param rows Number of rows
-     * @param cols Number of columns
-     * @param dst Output tensor [rows, cols]
-     * @param opts Execution options
-     */
-    void rmsnorm_apply_vectorized(
-        const float *src,
-        const float *gamma,
-        const float *inv,
-        std::size_t rows,
-        std::size_t cols,
-        float *dst,
-        const RMSNormExecOptions &opts = {});
+
 
     /**
      * @brief Fused RMSNorm computation (all stages)
@@ -127,22 +74,22 @@ namespace llaminar2::primitives
         float epsilon,
         const RMSNormExecOptions &opts = {});
 
-    /**
-     * @brief Fused RMSNorm with provided scratch buffer
-     */
-    void rmsnorm_fused_vectorized(
-        const float *src,
-        const float *gamma,
-        float *dst,
-        std::size_t rows,
-        std::size_t cols,
-        float epsilon,
-        RMSNormScratch &scratch,
-        const RMSNormExecOptions &opts = {});
+
 
     // ========================================================================
     // Per-Row Primitives (Testable SIMD variants)
     // ========================================================================
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    /**
+     * @brief Native noncollective FP32 row leaf with the per-row FP32-mean inverse.
+     * @param src Original input row; @param gamma Original immutable weights or identity.
+     * @param dst Original output row; @param cols Logical elements; @param epsilon Original policy.
+     * @details The caller owns row worksharing. This leaf creates no team or decoded row bank.
+     */
+    void rmsnorm_fused_row_neon(const float *src,const float *gamma,float *dst,
+                               std::size_t cols,float epsilon);
+#endif
 
     /**
      * @brief RMSNorm per-row FP32 scalar implementation
@@ -155,6 +102,8 @@ namespace llaminar2::primitives
      * @param cols Number of columns
      * @param epsilon Epsilon for numerical stability
      */
+
+
     void rmsnorm_fused_row_scalar(
         const float *src,
         const float *gamma,
@@ -352,8 +301,14 @@ namespace llaminar2::primitives
      * @param src Input INT32 tensor [rows, cols]
      * @param rows Number of rows
      * @param cols Number of columns
-     * @param row_sumsq Output per-row sum of squares (length = rows)
-     * @param opts Execution options
+     * @param row_sumsq Disjoint caller-owned per-row FP64 summaries (length = rows).
+     * @param opts Native execution or explicit increasing-column FP64-FMA scalar intent.
+     * @throws std::invalid_argument For malformed/wrapping geometry, original bank/options
+     * intersections, foreign/uncompiled ISA or undeclared T5 accumulation intent.
+     * @details Original integers widen directly to FP64 before squares. Native
+     * per-ISA trees need not equal each other, but M/worker ownership cannot
+     * change one row's program. All retained members call this collective;
+     * valid empty calls complete their team without allocating a standalone one.
      */
     void rmsnorm_compute_row_sumsq_int32_vectorized(
         const int32_t *src,
@@ -375,7 +330,14 @@ namespace llaminar2::primitives
      * @param cols Number of columns
      * @param dst_int8 Output INT8 tensor [rows, cols]
      * @param dst_row_scales Output per-row INT8 scales [rows]
-     * @param opts Execution options
+     * @param opts Native ISA or explicit scalar diagnostic; retained calls are collective.
+     * @throws std::invalid_argument For malformed/wrapping geometry, aliases with
+     * original source/gamma/inverses/policy, or undeclared T5/native ISA intent.
+     * @details Two original-storage passes retain (float(x)*inv)*gamma FP32
+     * edges. Scale is A>0?A/127:1, without a foreign quantizer floor. Native
+     * complete8/16-coordinate fragments use RNE; scalar tails use ties-away.
+     * Inverse0 publishes zero codes/scale1 without reading gamma values.
+     * Nonfinite/unrepresentable arithmetic is fatal before that row's stores.
      */
     void rmsnorm_apply_int32_to_int8_vectorized(
         const int32_t *src,
@@ -403,7 +365,13 @@ namespace llaminar2::primitives
      * @param rows Number of rows
      * @param cols Number of columns
      * @param epsilon Epsilon for numerical stability
-     * @param opts Execution options
+     * @param opts Native program or explicit scalar diagnostic; retained calls are collective.
+     * @throws std::invalid_argument For malformed geometry, nonfinite/negative
+     * epsilon, original source/gamma/policy intersections or undeclared T5/ISA.
+     * @details One tile owner retains summary, staged FP64-mean inverse, native
+     * maximum and code/scale publication. ARM shares1..4 original summaries;
+     * no decoded row, scratch resizing, TLS inverse bank or complete M1 replay
+     * is used. Empty retained calls still complete their team.
      */
     void rmsnorm_fused_int32_to_int8_vectorized(
         const int32_t *src,
@@ -413,20 +381,6 @@ namespace llaminar2::primitives
         std::size_t rows,
         std::size_t cols,
         float epsilon,
-        const RMSNormExecOptions &opts = {});
-
-    /**
-     * @brief Fused INT32 RMSNorm with provided scratch buffer
-     */
-    void rmsnorm_fused_int32_to_int8_vectorized(
-        const int32_t *src,
-        const float *gamma,
-        int8_t *dst_int8,
-        float *dst_row_scales,
-        std::size_t rows,
-        std::size_t cols,
-        float epsilon,
-        RMSNormScratch &scratch,
         const RMSNormExecOptions &opts = {});
 
     // ========================================================================
@@ -600,13 +554,17 @@ namespace llaminar2::primitives
      * 3. Apply normalization and gamma scaling
      * 4. Write FP32 output
      *
-     * Memory access: 1 read (Q16_1) + 1 write (FP32) - single pass
+     * Two original-block traversals: FP32 squares widen to a linear FP64
+     * diagnostic summary; publication retains the FP32 mean/sqrt/inverse program.
+     * Complete32-value geometry and disjoint expansion/gamma banks are required.
      *
      * @param input Input Q16_1 blocks [blocks_per_row blocks]
      * @param gamma Gamma weights [cols] (FP32)
      * @param output Output FP32 row [cols]
      * @param cols Number of columns (hidden_dim)
      * @param epsilon Epsilon for numerical stability
+     * @throws std::invalid_argument For malformed complete-row geometry, policy or aliases.
+     * @throws std::domain_error For nonfinite arithmetic or an undefined inverse.
      */
     void rmsnorm_q16_1_fp32_row_scalar(
         const Q16_1Block *input,
@@ -618,14 +576,18 @@ namespace llaminar2::primitives
     /**
      * @brief RMSNorm with Q16_1 input, FP32 output (AVX512 per-row)
      *
-     * Vectorized version using AVX512 intrinsics for high performance.
-     * Dequantizes and normalizes in SIMD registers for memory efficiency.
+     * Uses the actual AVX512 program and original-block register decoding.
+     * A non-AVX512 compiler envelope rejects this named entry; it never
+     * substitutes a scalar or another ISA implementation.
      *
      * @param input Input Q16_1 blocks [blocks_per_row blocks]
      * @param gamma Gamma weights [cols] (FP32)
      * @param output Output FP32 row [cols]
      * @param cols Number of columns (hidden_dim)
      * @param epsilon Epsilon for numerical stability
+     * @throws std::invalid_argument For malformed complete-row geometry, policy or aliases.
+     * @throws std::domain_error For nonfinite arithmetic or an undefined inverse.
+     * @throws std::runtime_error If the compiler envelope does not contain AVX512.
      */
     void rmsnorm_q16_1_fp32_row_avx512(
         const Q16_1Block *input,
@@ -637,8 +599,13 @@ namespace llaminar2::primitives
     /**
      * @brief Fused Q16_1 RMSNorm for multiple rows (parallelized)
      *
-     * Dispatches to AVX512 or scalar implementation based on availability.
-     * Uses OpenMP for row-level parallelization on large inputs.
+     * Native ARM processes1..4 original compressed rows per shared-gamma tile;
+     * AVX2/AVX512 select their genuine arithmetic programs. Scalar execution is
+     * explicitly requested diagnostic/backend intent, never an ISA substitute.
+     * Complete source/output/gamma/options spans are checked before worksharing.
+     * Retained teams complete even for small or empty invocations. No decoded
+     * row, invocation workspace or persistent scale/gamma bank is constructed.
+     * T5 FP32 accumulation is a distinct program and is not admitted here.
      *
      * @param input Input Q16_1 blocks [rows * blocks_per_row]
      * @param gamma Gamma weights [cols] (FP32)
@@ -646,7 +613,11 @@ namespace llaminar2::primitives
      * @param rows Number of rows
      * @param cols Number of columns (hidden_dim, must be multiple of 32)
      * @param epsilon Epsilon for numerical stability
-     * @param opts Execution options
+     * @param opts Original immutable execution options; retained by the caller through completion.
+     * @throws std::invalid_argument For malformed geometry, policy or original-bank/metadata aliases.
+     * @throws std::runtime_error For an active ISA without a matching compiled implementation.
+     * @note Arithmetic corruption inside the collective is fatal: exceptions
+     * cannot cross an OpenMP parallel boundary. No zero-output repair is used.
      */
     void rmsnorm_q16_1_fp32_fused(
         const Q16_1Block *input,

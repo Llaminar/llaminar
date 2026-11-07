@@ -127,7 +127,8 @@ namespace llaminar2
 
     void WeightVRAMPool::planWeight(const std::string &name, int N, int K,
                                     int payload_bytes_per_block, bool is_asymmetric,
-                                    bool has_emins, size_t raw_gguf_bytes,
+                                    bool has_emins, NativeVnniScalePlaneWidth scale_plane,
+                                    size_t raw_gguf_bytes,
                                     ContiguousAlias alias)
     {
         if (allocated_)
@@ -146,19 +147,16 @@ namespace llaminar2
         plan.K = K;
         plan.staging_bytes = raw_gguf_bytes;
 
-        const NativeVnniFormatInfo format{
-            .codebook_id = 0,
-            .payload_bytes = payload_bytes_per_block,
-            .is_asymmetric = is_asymmetric,
-            .is_superblock = false,
-            .has_emins = has_emins,
-            .max_abs_factor = 0.0f,
+        // Region extents come from the single metadata-plane authority with
+        // the caller's explicit primary-plane capacity.
+        const size_t blocks = static_cast<size_t>(N) * static_cast<size_t>(K / 32);
+        const auto planes = NativeVnniMetadataPlaneBytes::of(blocks, scale_plane, is_asymmetric, has_emins);
+        const NativeVnniPackedRegionSizes regions{
+            .payload_bytes = blocks * static_cast<size_t>(payload_bytes_per_block),
+            .scales_bytes = planes.scales,
+            .mins_bytes = planes.secondary,
+            .emins_bytes = planes.emins,
         };
-        const NativeVnniPackedRegionSizes regions =
-            nativeVnniPackedRegionSizes(
-                static_cast<size_t>(N),
-                static_cast<size_t>(K),
-                format);
 
         // Every persistent region uses the canonical native-VNNI layout.
         plan.payload_bytes = regions.payload_bytes;

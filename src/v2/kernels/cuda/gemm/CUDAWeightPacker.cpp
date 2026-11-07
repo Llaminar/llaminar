@@ -77,11 +77,15 @@ namespace llaminar2::cuda
                                                     << tensorTypeName(tensor->native_type()));
                 return false;
             }
+            // Self-describing geometry: the uploaders derive exact live extents from it.
+            out.N = N;
+            out.K = K;
 
             const auto physical = canonicalDeviceVnniFormat(*info);
             const int blocks_per_row = K / 32;
             out.native_vnni.assign(static_cast<size_t>(blocks_per_row) * N * info->payload_bytes, uint8_t{0});
-            out.native_scales.assign(static_cast<size_t>(blocks_per_row) * N, uint16_t{0});
+            out.native_scales.assign(nativeVnniScalePlaneStorageWords(
+                physical.codebook_id, static_cast<size_t>(blocks_per_row) * N), uint16_t{0});
             out.native_mins.clear();
             out.native_emins.clear();
             if (physical.is_asymmetric)
@@ -110,6 +114,7 @@ namespace llaminar2::cuda
             ctx.scales_array = out.native_scales.data();
             ctx.mins_array = physical.is_asymmetric ? out.native_mins.data() : nullptr;
             ctx.emins_array = info->has_emins ? out.native_emins.data() : nullptr;
+            ctx.primary_layout = gpuPrimaryScaleLayout(physical.codebook_id);
 
 #pragma omp parallel for schedule(static)
             for (int n = 0; n < N; ++n)
@@ -220,6 +225,8 @@ namespace llaminar2::cuda
     extern "C"
     {
         bool cudaQuantGemm_uploadRawBytes(const void *h_src, void **d_dst, size_t bytes, int cuda_device_id);
+        int cudaQuantGemm_uploadPrimaryPlane(uint8_t physical_codebook, size_t blocks_per_chunk, size_t chunks,
+                                             const void *h_src, size_t host_bytes, void **d_dst, int cuda_device_id);
         void cudaQuantGemm_freeDevice(void *d_ptr, int cuda_device_id);
     }
 
@@ -262,8 +269,20 @@ namespace llaminar2::cuda
             return true;
         };
 
+        // Primary plane: the shared uploader sends each expert's exact live extent.
+        auto uploadScales = [&]() -> bool
+        {
+            void *d_mem = nullptr;
+            const int status = cudaQuantGemm_uploadPrimaryPlane(
+                codebook_id, static_cast<size_t>(rows_per_expert) * blocks_per_row,
+                static_cast<size_t>(num_experts), all_scales.data(),
+                all_scales.size() * sizeof(uint16_t), &d_mem, cuda_device_id);
+            upload.d_scales = static_cast<uint16_t *>(d_mem);
+            return status == 0;
+        };
+
         if (!uploadArray(all_vnni, &upload.d_vnni) ||
-            !uploadArray(all_scales, &upload.d_scales) ||
+            !uploadScales() ||
             !uploadArray(all_mins, &upload.d_mins) ||
             !uploadArray(all_emins, &upload.d_emins))
         {
@@ -358,9 +377,12 @@ namespace llaminar2::cuda
 
         // Per-expert sizes
         batch->vnni_bytes_per_expert = static_cast<size_t>(blocks_per_row) * rows_per_expert * info->payload_bytes;
-        batch->scales_per_expert = static_cast<size_t>(blocks_per_row) * rows_per_expert;
-        batch->mins_per_expert = physical.is_asymmetric ? batch->scales_per_expert : 0;
-        batch->emins_per_expert = info->has_emins ? batch->scales_per_expert : 0;
+        // Strides are in elements of each plane's storage type; the primary
+        // plane may be narrower than the per-block secondary/emin planes.
+        const size_t blocks_per_expert = static_cast<size_t>(blocks_per_row) * rows_per_expert;
+        batch->scales_per_expert = nativeVnniScalePlaneStorageWords(physical.codebook_id, blocks_per_expert);
+        batch->mins_per_expert = physical.is_asymmetric ? blocks_per_expert : 0;
+        batch->emins_per_expert = info->has_emins ? blocks_per_expert : 0;
 
         // Allocate contiguous slabs
         batch->all_vnni.assign(static_cast<size_t>(num_experts) * batch->vnni_bytes_per_expert, uint8_t{0});
@@ -394,6 +416,7 @@ namespace llaminar2::cuda
             ctx.emins_array = info->has_emins
                                   ? batch->all_emins.data() + e * batch->emins_per_expert
                                   : nullptr;
+            ctx.primary_layout = gpuPrimaryScaleLayout(physical.codebook_id);
 
 #pragma omp parallel for schedule(static)
             for (int n = 0; n < rows_per_expert; ++n)

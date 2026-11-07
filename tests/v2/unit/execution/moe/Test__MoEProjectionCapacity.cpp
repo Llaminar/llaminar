@@ -44,7 +44,9 @@ namespace llaminar2
                 format.native_vnni.codebook_id, format.native_vnni.is_superblock);
             const auto packing = reusableDeviceVnniAllocationFormat(*source);
             const auto blocks = std::size_t(n) * (k / 32);
-            return aligned(blocks * packing.payload_bytes_per_block) + aligned(blocks * 2u) +
+            // Live slots carry the physical codebook's own primary plane (1 B for native MXFP4).
+            const auto primary = blocks * nativeVnniScalePlaneBytes(canonicalDeviceVnniCodebookId(*source));
+            return aligned(blocks * packing.payload_bytes_per_block) + aligned(primary) +
                 (packing.has_mins ? aligned(blocks * 2u) : 0u) +
                 (packing.has_emins ? aligned(blocks * 4u) : 0u);
         }

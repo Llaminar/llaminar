@@ -112,7 +112,8 @@ namespace llaminar2
         IQ3_S = 21,
         IQ2_S = 22,
         IQ4_XS = 23,
-        IQ1_M = 29
+        IQ1_M = 29,
+        MXFP4 = 39 ///< OCP MXFP4: E8M0 exponent + 32 FP4 E2M1 codes (17 bytes / 32 values).
     };
 
     /**
