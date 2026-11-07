@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -185,6 +186,93 @@ namespace
                           << verifierRowsPolicyName(policy) << ','
                           << sample << ',' << (sample % 2 ? "separate" : "bundle") << ','
                           << times[0] << ',' << times[1] << '\n';
+        }
+    }
+
+    /**
+     * @test Many narrow members (routed-expert gate/up) pooled into one bundle.
+     *
+     * Qwen3.6-35B-A3B decode fuses 16 routed gate/up projections of N=512,
+     * K=2048 reusing one Q8 row. The bundle must equal serial rows byte for
+     * byte and is timed against the same members executed one by one.
+     */
+    TEST_P(CPUFusedVerifier, ManyNarrowMembersBundleVersusStandalone)
+    {
+        const auto &format = GetParam();
+        const int members = dimension("LLAMINAR_CPU_FUSED_MEMBERS", 16);
+        const int m = dimension("LLAMINAR_CPU_FUSED_MEMBERS_M", 1);
+        const int n = dimension("LLAMINAR_CPU_FUSED_MEMBERS_N", 512);
+        const int k = dimension("LLAMINAR_CPU_FUSED_MEMBERS_K", 2048);
+        ASSERT_GE(members, 1);
+        ASSERT_LE(members, int(NativeVNNIFusedRowsPlan::capacity));
+        ASSERT_EQ(k % 256, 0);
+        std::vector<std::unique_ptr<TensorBase>> sources;
+        std::vector<std::unique_ptr<CPUNativeVNNIGemmKernel>> kernels;
+        std::vector<NativeVNNITestPartialStorage> partial;
+        for (int member = 0; member < members; ++member)
+        {
+            sources.push_back(format.create({size_t(n), size_t(k)}, 9000 + member));
+            kernels.push_back(std::make_unique<CPUNativeVNNIGemmKernel>(sources.back().get()));
+            ASSERT_TRUE(kernels.back()->isValid());
+            partial.emplace_back(kernels.back()->packedWeights(), m);
+        }
+        std::mt19937 random(77);
+        std::uniform_real_distribution<float> distribution(-1.0f, 1.0f);
+        std::vector<float> input(size_t(m) * k);
+        for (auto &value : input) value = distribution(random);
+        std::vector<Q8_1Block> quantized(size_t(m) * k / 32);
+        quantize_activations_to_q8_1(input.data(), quantized.data(), m, k, k / 32);
+        std::vector<std::vector<float>> fused(members), separate(members), serial(members);
+        std::vector<FusedVerifierRowsDesc> descriptors(members);
+        for (int member = 0; member < members; ++member)
+        {
+            const auto &weights = kernels[member]->packedWeights();
+            fused[member].resize(size_t(m) * n);
+            separate[member].resize(size_t(m) * n);
+            serial[member].resize(size_t(m) * n);
+            descriptors[member] = {.packed = &weights, .output = fused[member].data(), .bias = nullptr,
+                .N = n, .ldc = n};
+            for (int row = 0; row < m; ++row)
+                gemv_native_vnni_preq(weights, quantized.data() + row * (k / 32),
+                    serial[member].data() + row * n, partial[member].span());
+        }
+        NativeVNNITestPartialStorage fused_storage(descriptors.data(), members, m);
+        const auto run = [&](bool bundle)
+        {
+            if (bundle)
+            {
+                if (!gemm_native_vnni_fused_verifier_rows_preq(quantized.data(), descriptors.data(),
+                        fused_storage.span(), members, m, k / 32))
+                    throw std::runtime_error("production fused bundle rejected its descriptors");
+            }
+            else
+                for (int member = 0; member < members; ++member)
+                    gemm_native_vnni_preq_decode_equivalent_rows(kernels[member]->packedWeights(),
+                        quantized.data(), separate[member].data(), partial[member].span(), m, n);
+        };
+        run(false);
+        run(true);
+        for (int member = 0; member < members; ++member)
+        {
+            ASSERT_EQ(std::memcmp(serial[member].data(), fused[member].data(), serial[member].size() * sizeof(float)), 0);
+            ASSERT_EQ(std::memcmp(serial[member].data(), separate[member].data(), serial[member].size() * sizeof(float)), 0);
+        }
+        std::cout << "format,members,m,n,k,threads,sample,bundle_us,separate_us\n";
+        constexpr int repetitions = 32;
+        for (int sample = -2; sample < 12; ++sample)
+        {
+            std::array<double, 2> times{};
+            for (int order = 0; order < 2; ++order)
+            {
+                const bool bundle = ((sample + 2 + order) % 2) == 0;
+                const auto start = std::chrono::steady_clock::now();
+                for (int repeat = 0; repeat < repetitions; ++repeat) run(bundle);
+                times[bundle ? 0 : 1] = std::chrono::duration<double, std::micro>(
+                    std::chrono::steady_clock::now() - start).count() / repetitions;
+            }
+            if (sample >= 0)
+                std::cout << format.label << ',' << members << ',' << m << ',' << n << ',' << k << ','
+                          << omp_get_max_threads() << ',' << sample << ',' << times[0] << ',' << times[1] << '\n';
         }
     }
 
