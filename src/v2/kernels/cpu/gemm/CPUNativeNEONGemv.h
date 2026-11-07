@@ -13,6 +13,8 @@
 #include "CPUNativeVNNIExecutionContract.h"
 #include "CPUNativeVNNIPackedWeights.h"
 #include "CPUNativeNEONProjectionBatch.h"
+#include "CPUNativeVNNIScalarReference.h"
+#include "CPUNativeVNNIWeightPacker.h"
 #include "CPUProjectionQ8Publication.h"
 #include "execution/moe/DeviceMoERuntimeABI.h"
 #include <algorithm>

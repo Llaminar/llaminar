@@ -16,7 +16,6 @@
 #include "tensors/IQQuantTables.h"
 #include "tensors/NativeVnniIQ3SScale.h"
 #include "kernels/cpu/gemm/CPUNativeVNNIGemv.h"
-#include "kernels/cpu/gemm/CPUNativeAVX2Gemv.h"
 #include "../../utils/IQ3SOriginalEquationSource.h"
 #include "kernels/PackedWeightsSerialization.h"
 #include "loaders/gpu_pipeline/GpuPackedWeightsFormat.h"

@@ -32,6 +32,10 @@ namespace llaminar2::test
 namespace
 {
 using namespace cpu::native_vnni;
+#if defined(__aarch64__)
+/** @brief ARM native programs own full-K register trees: only one storage route exists. */
+enum class NativeVNNIFusedPartialRoute { FullK };
+#endif
 
 /** @brief Restore the caller's worker and arithmetic-partition test controls. */
 class FusedCompletionScope final
@@ -90,8 +94,12 @@ void proveFusedCompletion(NativeVNNIFusedPartialRoute route)
     constexpr int k = 512;
     constexpr int workers = 7;
     constexpr float guard = -12345.0f;
+#if defined(__aarch64__)
+    const int n0 = 257, n1 = 321;
+#else
     const int n0 = route == NativeVNNIFusedPartialRoute::SharedBank ? 31 : 257;
     const int n1 = route == NativeVNNIFusedPartialRoute::SharedBank ? 61 : 321;
+#endif
     FusedCompletionScope runtime(workers,
         route == NativeVNNIFusedPartialRoute::FullK ? 1 : 16);
     const auto &formats = quantizedVerifierFormats();
@@ -111,8 +119,10 @@ void proveFusedCompletion(NativeVNNIFusedPartialRoute route)
 
         for (int rows : {1, 2, 3, 15, 31})
         {
+#if !defined(__aarch64__)
             if (route == NativeVNNIFusedPartialRoute::SharedBank && rows > 3)
                 continue; // More row tiles legitimately select local ownership.
+#endif
             SCOPED_TRACE("rows=" + std::to_string(rows));
             std::vector<float> source(size_t(rows) * k);
             for (size_t value = 0; value < source.size(); ++value)
@@ -159,7 +169,11 @@ void proveFusedCompletion(NativeVNNIFusedPartialRoute route)
                         .rows = rows,
                         .verifier_schedule = rows == 1 ? VerifierRowsPolicy::Auto : VerifierRowsPolicy::Pairwise};
                 const auto plan = planNativeVNNIFusedRows(descriptors, rows, workers, ISAPath::AUTO);
+#if defined(__aarch64__)
+                ASSERT_EQ(plan.sharedPartialFloats(), 0u);
+#else
                 ASSERT_EQ(plan.partial_route, route);
+#endif
                 NativeVNNITestPartialStorage partials(plan.sharedPartialFloats());
                 auto invoke = [&]() {
                     return gemm_native_vnni_fused_verifier_rows_preq(input.data(),
@@ -207,6 +221,7 @@ TEST(CPUNativeVNNIFusedCompletion, FullK)
     proveFusedCompletion(NativeVNNIFusedPartialRoute::FullK);
 }
 
+#if !defined(__aarch64__)
 /** @test Per-output ordered trees need only the real optional bias dependency. */
 TEST(CPUNativeVNNIFusedCompletion, OutputTileLocal)
 {
@@ -218,6 +233,7 @@ TEST(CPUNativeVNNIFusedCompletion, SharedBank)
 {
     proveFusedCompletion(NativeVNNIFusedPartialRoute::SharedBank);
 }
+#endif
 } // namespace llaminar2::test
 
 #include "CPUNativeVNNIFusedPerfIdentity.inc"

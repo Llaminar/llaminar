@@ -10,10 +10,13 @@
 #include "kernels/qwen4exp/Qwen4ExpKernels.h"
 #include "kernels/qwen4exp/Qwen4ExpValidation.h"
 #include "kernels/common/MoEProjectionNumericalContract.h"
+#include "kernels/common/DeviceFP32NumericalContract.h"
 #include "tensors/BlockStructures.h"
 #include "utils/CPUFeatures.h"
 #include "utils/OpenMPUtils.h"
+#if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
+#endif
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -117,6 +120,7 @@ inline float nativeVNNIFP16ScaleToFP32(uint16_t value)
 #endif
         return fp16_to_fp32(value);
     }
+#if defined(__AVX2__)
 inline __m256 persistRoundedAVX2(__m256 value) noexcept
     {
 #if defined(__GNUC__) || defined(__clang__)
@@ -175,6 +179,7 @@ static inline __m256 fast_silu(__m256 vx)
             return _mm256_mul_ps(vx, fast_sigmoid(vx));
         }
 }
+#endif
 namespace cpu_detail {
 #if defined(__AVX512F__)
 inline __m512 sigmoid(__m512 value)
@@ -544,12 +549,22 @@ inline void quantize_single_block(const float *src, Q8_1Block &dst, int valid_el
         }
 inline void quantizeResidualBlock(const float*input,const Q8_1Block&primary,Q8_1Block&residual,
  llaminar2::CPUProjectionNumericalPolicy policy) {
- alignas(64)float values[32];const auto scale=_mm256_set1_ps(nativeVNNIFP16ScaleToFP32(primary.d));
+ alignas(64)float values[32];
+#if defined(__AVX2__)
+ const auto scale=_mm256_set1_ps(nativeVNNIFP16ScaleToFP32(primary.d));
  for(int i=0;i<32;i+=8) {
   const auto bytes=_mm_loadl_epi64(reinterpret_cast<const __m128i*>(primary.qs+i));
   const auto decoded=persistRoundedAVX2(_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(bytes)),scale));
   _mm256_store_ps(values+i,_mm256_sub_ps(_mm256_loadu_ps(input+i),decoded));
  }
+#else
+ // Same program per lane: separately rounded decode product, then one subtraction.
+ const float scale=nativeVNNIFP16ScaleToFP32(primary.d);
+ for(int i=0;i<32;++i) {
+  const float decoded=llaminar2::device_fp32_contract::multiply(float(primary.qs[i]),scale);
+  values[i]=llaminar2::device_fp32_contract::add(input[i],-decoded);
+ }
+#endif
  (void)policy; quantize_single_block(values,residual,32);
 }
 /** @brief Publish complete live blocks using original hardware quantizer/half residual policy. */

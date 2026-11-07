@@ -124,6 +124,17 @@ message(STATUS "V2 Test Configuration: ${V2_TEST_SOCKETS} accessible package(s),
 message(STATUS "V2 Tests: protocol ranks=${V2_TEST_MIN_RANKS}, oversubscribe=${V2_TEST_NEEDS_OVERSUBSCRIBE}, OMP_NUM_THREADS=${V2_TEST_CORES_PER_SOCKET}")
 
 # =============================================================================
+# CPU instruction family of the compiled target
+# =============================================================================
+# x86-only fixtures call AVX2/AVX512 leaves directly; ARM builds register the
+# NEON counterparts instead. This is the compiled target, not the build host.
+if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
+    set(V2_CPU_TARGET_X86 OFF)
+else()
+    set(V2_CPU_TARGET_X86 ON)
+endif()
+
+# =============================================================================
 # Release-mode guard: only build performance test targets
 # =============================================================================
 # When V2_PERF_TESTS_ONLY is ON (set by parent for Release builds), we override
@@ -7118,6 +7129,8 @@ if(NOT V2_PERF_TESTS_ONLY)
 endif()
 
 # Test: AVX2 vs AVX512-VNNI parity (emulated dpbusd, chunk GEMV, full GEMV/GEMM)
+# x86 leaves only; ARM NativeVNNI programs have their own NEON byte gates.
+if(V2_CPU_TARGET_X86)
 add_executable(v2_test_avx2_vnni_parity unit/kernels/Test__AVX2VNNIParity.cpp)
 target_link_libraries(v2_test_avx2_vnni_parity
     llaminar2_core
@@ -7152,6 +7165,7 @@ add_v2_test(V2_Unit_AVX2FallbackParity
     LABELS "V2;Unit;Kernels;AVX2;Parity;GDN;TurboQuant;FWHT;Attention"
     MPI_PROCS 1
 )
+endif()
 
 # Test: SIMDHelpers ISA Parity (scalar vs AVX2 vs AVX512 for residual add, quantize, etc.)
 add_executable(v2_test_simd_helpers_isa_parity unit/Test__SIMDHelpersISAParity.cpp)

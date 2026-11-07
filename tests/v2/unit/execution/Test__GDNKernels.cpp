@@ -7734,6 +7734,7 @@ TEST(Test__GDNKernels, CPUCompactCounterBatchesPreserveCountsAcrossTeamsAndReque
         ASSERT_TRUE(filter_updated); ASSERT_TRUE(opposite_policy);
         for (const auto choice : choices) EXPECT_EQ(choice,initially_enabled ? 1 : 0);
     }
+}
 
 #if LLAMINAR_COMPILED_WITH_NEON
 /**
@@ -7819,7 +7820,6 @@ TEST(CPUGDNKernels, ShortConvNeonPrefillAndDecodeExactReference)
         << "NEON decode state bytes";
 }
 #endif
-}
 
 /** @test A causal window wider than the SIMD prefill programs hold is rejected before any write. */
 TEST(Test__GDNKernels, ShortConvPrefillRejectsWindowWiderThanSIMDRegisters)
