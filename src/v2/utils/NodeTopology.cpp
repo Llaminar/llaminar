@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <cstring>
+#include <iterator>
 #include <set>
 #include <thread>
 
@@ -137,6 +138,12 @@ namespace llaminar2
             LOG_INFO("[NodeTopology] Fallback: 1 socket, " << num_cpus << " CPUs");
             return topology;
         }
+
+        // Firmware package numbering need not be dense or zero-based (GB10
+        // reports package 36). Every consumer indexes sockets in
+        // [0, numSockets()), so map the sorted distinct raw packages to dense
+        // indices once and retain the raw id for diagnostics.
+        densifySocketIds(topology.numa_nodes_);
 
         // Determine number of sockets from detected nodes
         topology.num_sockets_ = detectNumSockets(topology.numa_nodes_);
@@ -447,6 +454,19 @@ namespace llaminar2
                                             << (is_amd ? "AMD Infinity Fabric" : "Intel UPI") << " heuristic)");
 
         return links;
+    }
+
+    void NodeTopology::densifySocketIds(std::vector<NUMANode> &nodes)
+    {
+        std::set<int> packages;
+        for (const auto &node : nodes)
+            packages.insert(node.socket_id);
+        for (auto &node : nodes)
+        {
+            node.physical_package_id = node.socket_id;
+            node.socket_id = static_cast<int>(
+                std::distance(packages.begin(), packages.find(node.socket_id)));
+        }
     }
 
     int NodeTopology::detectNumSockets(const std::vector<NUMANode> &nodes)
