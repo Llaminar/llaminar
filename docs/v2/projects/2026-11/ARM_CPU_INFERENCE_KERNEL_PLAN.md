@@ -33,40 +33,62 @@ Installed and verified:
   schedule dimensions (row tile, chunks per task) with a compile-time validated
   exact table; collector `Perf__CPUNativeNEONExactOverlay`; generator
   `native_vnni_dispatch/neon_exact_overlay.py` (exact-only, alias-pooled,
-  no-regression, fail-closed). The installed table is empty until GB10
-  evidence is generated.
+  replicated, no-regression, fail-closed). Installed (`144ece037`): 2,519 of
+  10,920 GB10 keys (20 workers) for Q4_K/Q5_K/Q6_K/Q8_0/IQ2_S/IQ3_S/IQ4_XS from
+  14 independent replicas (168,000 byte-authenticated candidates); every other
+  key keeps the total policy. Seal `K14-OVERLAY-INSTALL-20261107`.
+- **CPU serving robustness (GB10, Release).** Real plan/benchmark/serve works
+  for Qwen3-0.6B, Qwen2.5-0.5B (q4_0, q4_k_m), Qwen3.6-27B dense and
+  Qwen3.6-35B-A3B MoE, including the MTP (nextn) GGUFs, MTP off and dynamic,
+  HTTP chat with RAM-tier prefix reuse, and byte-identical greedy text between
+  MTP off and on. Defects found and fixed on the way:
+  - planner `d_ff` read the MoE router's expert axis (`21e411c7d`);
+  - CPU nextn MoE experts are registry-owned, not raw parents (`0d12e65dd`,
+    `ba8b32090`);
+  - a decode-first (prefix-hit warmup) serial workspace family omitted the
+    prefill rows (`878a33fea` lineage, `V2_Integration_DecodeFirstSerialWorkspaceFamily`);
+  - libgomp's default 300k idle spin made every short region pay a team
+    wake-up; the launcher now installs a bounded `GOMP_SPINCOUNT=3000000`
+    (`V2_Integration_OpenMPIdleSpinPolicy`). 35B-MTP dynamic 13.23 -> 18.73
+    tok/s, MTP off 13.68 -> 14.34, 27B-MTP 3.56 -> 4.23; an idle server parks
+    all workers.
+- **CPU-only gate hygiene.** Registrations whose subject only exists with a
+  compiled CUDA/ROCm family declare `REQUIRES_BACKEND` (or the executable's
+  `V2_TEST_REQUIRED_BACKEND`); CPU-only builds omit and count them (291).
 - **Tests.** ISA-forced cells register `neon`/`neon-dotprod` on ARM; x86-only
   scheduler tests are x86-gated with ISA-neutral byte sweeps kept; portable
   all-format thread-scaling `Perf__` with byte authentication and measured
-  grouped/serial amortization.
+  grouped/serial amortization. Native macOS portability suites pass 258/258
+  (plain and dotprod) on the M1 Max.
 
-GB10 (DGX Spark, GCC 14 Integration, canonical test container), head
-`5f7298e3d`: all three gate builds green; Unit 65/1029 and preflight 185/2459
-fail, all in classes outside the ARM work: 235 need a compiled CUDA/ROCm
-backend (Pooled*, native graph geometry, MoE 4/8-device overlay planning), 6
-profiler-surrogate tests need a CUDA device, plus upstream drift fixed in
-`b528bb121` and one upstream-owned Release target-selection test.
+GB10 serving reference (Release, 20 cores, -c 8192, greedy, before overlays):
 
-GB10 scaling evidence (diagnostic Integration builds; Q4_K N=2048 K=4096):
-static 20-core split 78 us decode / 3536 us M=64 prefill; 10 X925 only
-52.7 / 2152 us; 20 cores with dynamic tiles 46.0 / 1450 us. GB10 is two
-clusters of 5 X925 (CPU 5-9, 15-19) + 5 A725 (CPU 0-4, 10-14); an X925 is
-about 2.8x an A725 per thread on these kernels.
+| Model | Mode | Prefill tok/s | Decode tok/s |
+|---|---|---|---|
+| Qwen3-0.6B Q8_0 | — | 330 | 93.5 |
+| Qwen2.5-0.5B q4_0 / q4_k_m | — | 510 / 384 | 144 / 103 |
+| Qwen3.6-27B Q4_K_S | MTP off / dynamic | 10.3 / 10.6 | 4.63 / 4.23 |
+| Qwen3.6-35B-A3B IQ3_S | MTP off / dynamic (n=256) | 25.4 / 24.8 | 14.34 / 18.73 |
+
+(27B and 35B rows use the bounded spin policy; the small models predate it.)
+
+GB10 topology: two clusters of 5 X925 (CPU 5-9, 15-19) + 5 A725 (CPU 0-4,
+10-14); an X925 is about 2.8x an A725 per thread on these kernels. Dynamic
+tiles over all 20 cores with `OMP_PLACES=cores` is the measured best policy
+(Q4_K 2048x4096 decode 44.7 us, 27x over one thread).
 
 Open, in order:
 
-1. Diagnose the later 20-thread M=1 regression on mixed cores (309 us with
-   fast-first explicit places) and the GDN grouped verifier being slower than
-   serial on mixed cores; settle the GB10 default worker policy from data.
-2. Clean CPU-only gate: register GPU-backend-dependent tests only when a GPU
-   backend is compiled (or validate GB10 as a CUDA+CPU build).
-3. Collect and install GB10 exact overlays for the canonical model formats
-   (Qwen3.6-27B: Q4_K/Q5_K/Q6_K; Qwen3.6-35B-A3B: Q6_K/IQ2_S/IQ3_S/IQ4_XS).
-4. Real CPU serving on GB10: plan/benchmark/serve for Qwen3-0.6B, Qwen2.5-0.5B,
-   Qwen3.6-27B dense and 35B-A3B MoE, MTP off and dynamic, HTTP prefix reuse.
-5. Live GB10 joint-pool validation.
-6. Final Release `Perf__` round: all families and formats, 1..20 cores on GB10
-   (fast-only, slow-only, mixed), plus the M1 Mac.
+1. Fresh CPU-only Unit/preflight gate on the current head, GB10 and M1 Mac.
+2. Measure the installed overlays end to end (A/B, byte-identical text).
+3. Router-plus-shared-expert fused projection on CPU (651 us per 35B layer
+   call, ~1.3K x 2048), GDN grouped verifier economics on mixed cores, and
+   27B dense MTP economics (dynamic 4.23 vs off 4.63 tok/s at ~52-65%
+   acceptance).
+4. Live GB10 joint-pool validation.
+5. Final Release `Perf__` round: all families and formats, 1..20 cores on GB10
+   (fast-only, slow-only, mixed), plus the M1 Mac; update this frontier and
+   the evidence record.
 
 ## 1. Mandate and completion criteria
 
