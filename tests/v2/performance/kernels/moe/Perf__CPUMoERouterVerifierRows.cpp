@@ -19,6 +19,7 @@
 #include <gtest/gtest.h>
 
 #include "kernels/cpu/moe/CPUMoEKernel.h"
+#include "utils/CPURouterKernelTestAdmission.h"
 #include "utils/VerifierRowTestInventory.h"
 
 #include <algorithm>
@@ -290,6 +291,10 @@ namespace
     {
         CPUMoEKernel grouped_kernel;
         CPUMoEKernel serial_kernel;
+        // Each kernel owns one admitted router publication root, exactly as
+        // the production stage binds it before replay.
+        llaminar2::test::admitCPURouterKernelForTest(grouped_kernel, rows, kDModel);
+        llaminar2::test::admitCPURouterKernelForTest(serial_kernel, 1, kDModel);
 
         const RouteSnapshot grouped =
             captureGrouped(grouped_kernel, hidden, gate, rows);
@@ -375,6 +380,7 @@ TEST(Perf__CPUMoERouterVerifierRows,
         ASSERT_EQ(rows.size(), 1u)
             << "One profiler invocation must select exactly one runtime M";
         CPUMoEKernel kernel;
+        llaminar2::test::admitCPURouterKernelForTest(kernel, rows.front(), kDModel);
         MoERoutingResult result;
         // Capacity preparation is deliberately outside the long repeated
         // interval. The ordinary mode above owns serial-byte certification.
