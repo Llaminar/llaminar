@@ -51,20 +51,30 @@ def image_pair():
             "repository": "Llaminar/llaminar", "branch": "develop", "workflow_revision": "c" * 40}
 
 
-def inventory_image(source):
+def inventory_image(source, isa="AVX2"):
     """Describe an exact full-matrix test companion already in local Docker."""
     role = suite.pipeline.ImageRole.TEST_RUNNER
-    tag = suite.pipeline.source_image_tag(source, "AVX2", role)
-    identity = "sha256:" + "3" * 64
+    tag = suite.pipeline.source_image_tag(source, isa, role)
+    identity = "sha256:" + ("3" if isa == "AVX2" else "4") * 64
     return {"tag": tag, "id": identity, "layers": ["test-layer"], "labels": {
         "org.opencontainers.image.revision": source["revision"],
         "org.llaminar.source_tree": source["tree"],
-        "org.llaminar.build_type": "Release", "org.llaminar.cpu_isa": "AVX2",
+        "org.llaminar.build_type": "Release", "org.llaminar.cpu_isa": isa,
         "org.llaminar.cuda": "ON", "org.llaminar.rocm": "ON",
         "org.llaminar.image_role": role.value,
         "org.llaminar.integration_skipped": "0",
         "org.llaminar.test_runner_inventory": suite.pipeline.TestRunnerInventory.FULL_MATRIX.value,
     }}
+
+
+def prerequisite_evidence(pair):
+    """Bind complete model-free reports to both source/ISA test companions."""
+    return {isa: {"test_runner_image": inventory_image(pair["source"], isa),
+                  "runtime_image": pair["images"][isa]["id"],
+                  "report": {"preflight_return_code": 0,
+                             "preflight_tests": ["V2_Unit_Contract", "V2_Integration_Preflight"],
+                             "preflight_test_count": 2}}
+            for isa in suite.ISAS}
 
 
 def full_inventory():
@@ -89,7 +99,8 @@ def write_e2e_bundle(root, pair=None):
     write_json(root / "all-cells.json", inventory)
     write_json(root / "manifest.json", manifest)
     receipt = {"schema": 1, "complete": True, "images_digest": digest(pair),
-               "manifest_digest": digest(manifest), "reports": {}}
+               "manifest_digest": digest(manifest), "reports": {},
+               "prerequisites": prerequisite_evidence(pair)}
     for isa in suite.ISAS:
         report = {"schema": 1, "image": pair["images"][isa]["id"],
             "source_revision": pair["source"]["revision"], "manifest_digest": digest(manifest),
@@ -294,6 +305,69 @@ class PublicDocumentationTests(unittest.TestCase):
 
 
 class PublishedImageSuiteTests(unittest.TestCase):
+    def test_release_prerequisites_execute_both_exact_companions_before_http(self):
+        """Published runtimes must no longer inherit tests from develop builds."""
+        pair = image_pair()
+        events = []
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = SimpleNamespace(models=root, model_ramdisk_root=root)
+
+            def companion(build_args, source, work):
+                self.assertEqual(source, pair["source"])
+                events.append(("build", build_args.cpu_isa))
+                return {"test-runner": inventory_image(source, build_args.cpu_isa)}
+
+            def run(images, command, build_args, work, log):
+                isa = build_args.cpu_isa
+                self.assertEqual(images["test-runner"], inventory_image(pair["source"], isa))
+                self.assertEqual(command, ["python3", "scripts/ci/run_production_prerequisites.py",
+                    "--build-dir", "build_v2_integration", "--installed-build-receipt",
+                    "/src/installed-tests.json", "--output", "/ci-results/prerequisites"])
+                events.append(("tests", isa))
+                write_json(work / "prerequisites/prerequisites.json", prerequisite_evidence(pair)[isa]["report"])
+
+            with patch.object(suite, "inventory_companion", side_effect=companion), \
+                 patch.object(suite.pipeline, "run_test_runner", side_effect=run):
+                proof = suite.run_e2e_prerequisites(args, pair, root)
+            self.assertEqual(events, [(phase, isa) for isa in suite.ISAS for phase in ("build", "tests")])
+            suite.validate_e2e_prerequisites(proof, pair)
+
+    def test_failed_release_prerequisites_prevent_http_driver_start(self):
+        """A missing production gate cannot be compensated by green HTTP cells."""
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(suite, "run_e2e_prerequisites", side_effect=RuntimeError("preflight red")), \
+                 patch.object(suite, "build_driver") as driver:
+                with self.assertRaisesRegex(RuntimeError, "preflight red"):
+                    suite.run_e2e(SimpleNamespace(), image_pair(), {}, Path(temporary))
+            driver.assert_not_called()
+
+    def test_benchmark_admission_rejects_missing_failed_or_misbound_prerequisites(self):
+        """Replay preserved E2E evidence with each production prerequisite broken."""
+        for defect in ("absent", "partial", "failed", "runtime", "isa", "unit-only"):
+            with self.subTest(defect=defect), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                pair = image_pair()
+                write_e2e_bundle(root, pair)
+                path = root / "e2e-receipt.json"
+                receipt = json.loads(path.read_text())
+                proof = receipt["prerequisites"]
+                if defect == "absent":
+                    del receipt["prerequisites"]
+                elif defect == "partial":
+                    del proof["AVX2"]
+                elif defect == "failed":
+                    proof["AVX2"]["report"]["preflight_return_code"] = 1
+                elif defect == "runtime":
+                    proof["AVX2"]["runtime_image"] = pair["images"]["AVX512"]["id"]
+                elif defect == "isa":
+                    proof["AVX2"]["test_runner_image"] = proof["AVX512"]["test_runner_image"]
+                else:
+                    proof["AVX2"]["test_runner_image"]["labels"]["org.llaminar.test_runner_inventory"] = "unit-only"
+                write_json(path, receipt)
+                with self.assertRaises(ValueError):
+                    suite.admit_e2e(root, pair)
+
     """Wrong provenance or incomplete evidence cannot publish a convincing chart."""
 
     def test_e2e_runner_collects_failed_timeout_and_passing_cells(self):
@@ -392,7 +466,8 @@ class PublishedImageSuiteTests(unittest.TestCase):
                 if failed:
                     raise subprocess.CalledProcessError(1, "HTTP E2E")
 
-            with patch.object(suite, "build_driver", return_value="tools") as build, \
+            with patch.object(suite, "run_e2e_prerequisites", return_value=prerequisite_evidence(pair)), \
+                 patch.object(suite, "build_driver", return_value="tools") as build, \
                  patch.object(suite, "run_in_driver", side_effect=drive) as run:
                 with self.assertRaisesRegex(ValueError, "cell failures remain"):
                     suite.run_e2e(SimpleNamespace(model_ramdisk_root=root), pair,
@@ -420,7 +495,8 @@ class PublishedImageSuiteTests(unittest.TestCase):
                                                "correctness_passed": False, "cells": []})
                 raise subprocess.CalledProcessError(1, "driver")
 
-            with patch.object(suite, "build_driver", return_value="tools"), \
+            with patch.object(suite, "run_e2e_prerequisites", return_value=prerequisite_evidence(pair)), \
+                 patch.object(suite, "build_driver", return_value="tools"), \
                  patch.object(suite, "run_in_driver", side_effect=interrupted) as run:
                 with self.assertRaisesRegex(ValueError, "complete selected inventory"):
                     suite.run_e2e(SimpleNamespace(model_ramdisk_root=root), pair,

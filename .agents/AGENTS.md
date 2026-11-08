@@ -254,7 +254,8 @@ for the current develop HEAD. If documentation/CI maintenance skipped that
 head's push CI, run `gh workflow run ci.yml --ref develop --repo Llaminar/llaminar`
 and wait for the published pair before opening the PR.
 The master workflow admits the exact develop source and published
-image pair, runs the full canonical E2E suite on both ISAs, then the published
+image pair, runs complete Unit and production preflight in source-bound test
+companions for both ISAs, then the full canonical E2E suite and the published
 benchmark gates and then complete OpenCode app sessions on every blessed E2E
 cell and both ISAs. Merge only after all required checks pass. The merge cuts a
 release through the canonical release workflow, promoting the same tested

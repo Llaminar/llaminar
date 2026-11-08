@@ -58,8 +58,9 @@ production preflight remain mandatory in the explicit production pipeline,
 through `run_production_prerequisites.py`. See `docs/production-ci.md` for
 runner, cache, receipt and publication boundaries.
 The `develop` → `master` PR gate is separate: its required pull-request E2E
-check waits for the exact develop-head image pair, proves both ISAs on the full
-HTTP matrix, then its dependent benchmark check consumes that same image-bound
+check waits for the exact develop-head image pair, runs complete Unit and
+production preflight in source/ISA-bound full-matrix test companions on both
+ISAs, then proves both runtimes on the full HTTP matrix, then its dependent benchmark check consumes that same image-bound
 E2E receipt. The benchmark check runs both ISAs even when the first has a
 complete red ratchet report, comments the per-cell red/amber/green numbers on
 the PR, and fails if any measured phase exceeds the high-water tolerance.

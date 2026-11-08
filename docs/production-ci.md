@@ -325,7 +325,9 @@ A same-repository PR from `develop` to `master` triggers
 `.github/workflows/master-pr-certification.yml`. Its first job waits for the
 successful develop push or manual image gate at the PR's **exact head SHA**.
 It never substitutes the mutable `develop` tag. The required E2E check pulls that
-source-pinned AVX512/AVX2 pair, verifies image labels and source tree, and runs
+source-pinned AVX512/AVX2 pair and verifies image labels and source tree. It
+first runs complete Unit and `ProductionTestPreflight` in authenticated
+full-matrix test companions for both ISAs; only then does it run
 the full canonical HTTP suite and the frozen dense/MoE KL canaries on one CUDA
 and one ROCm device per ISA. The native observer ships in the runtime image and
 links that image's serving core. MoE uses the FP16 alpha/beta default; dense
@@ -352,6 +354,11 @@ not run after an E2E failure. A complete red benchmark report still lets the
 other ISA finish, so the PR receives a per-cell red/amber/green table of both
 prefill and decode numbers. A red phase fails the required benchmark check;
 amber is below the prior high-water mark but inside the configured tolerance.
+The E2E receipt embeds both canonical prerequisite reports and their
+source/ISA/test-image/runtime bindings. Benchmark and release admission reject
+missing or failed prerequisite evidence; they cannot assume that the develop
+build ran tests. CTest logs and JUnit evidence remain in the workflow artifact.
+
 The branch-policy check admits only `develop`.
 
 After both benchmark lanes pass, `run_opencode_matrix.py prepare` authenticates
