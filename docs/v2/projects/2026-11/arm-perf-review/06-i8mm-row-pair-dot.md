@@ -232,3 +232,15 @@ Handoffs (rebased onto afe62c5ef, fork codex/i8mm-typed-placement):
   NUMA/mempolicy/MPI-bind/fused family. Sealed in SUMMARY.md (host-evidence
   section). Verdict: env-known in container gate; no code change/skip;
   real-host-clean PROVEN. Container-green = infra change if wanted.
+
+## .80 self-gate GREEN on merge candidate (2026-11-08)
+
+c24ce9b4e, Integration NEON_I8MM, gcc-14, e0d6d34e7, logs
+.80:build/ctest-{unit,pre,gemv}-tip.log: Unit 958/960 (only known base:
+TestTargetSelection, MoEForbiddenDependencyScan); Preflight 2301/2304 (only
+target-selection family: Release/PooledRelease/Qwen4ExpRelease). All new /
+I8MM-related entries passed: CPUCodegenEnvelope, CPUISAProfile (incl.
+missing-I8MM admission negatives), CPUNativeNEONI8MM{OperandGrouping,
+TailsMatchSDOT}, NativeNEONExactOverlayInstructionIdentity,
+OpenMPCapacityOrderedCorePlaces; GEMV + fused cells 6/6. Getenv + PrefixArchive
+failures GONE at this base. RE-GATE GO to arm-sparks.

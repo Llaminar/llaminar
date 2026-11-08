@@ -135,3 +135,15 @@ another schedule heuristic.
   claiming and only meet the barrier). Covers retained-team calls too; saves
   only straggler avoidance, not wake-up cost.
 - Held (NOT for merge): origin/codex/arm-decode-team-placement @ 56158b57a.
+
+## Rework v2 (2026-11-08) — held branch codex/arm-decode-team-placement @ c3060d607
+
+- Teams are NEVER narrowed. claimPlacedTasks() keeps dynamic(1) at full claim
+  width; fastest-class decode uses static(1) slot = worker id → only the
+  leading X925 workers own tasks, the rest only meet the barrier. Works in
+  standalone AND retained teams (covers ~100% of decode projections vs 66%).
+- The auto task cap is DROPPED; auto = all workers until evidence picks
+  otherwise. Byte equality tested across placements (standalone + retained).
+- Honest expectation: economy likely small — removes A725 straggling but NOT
+  their wake-up. Window request (~30 min, 35B/27B all-workers vs fastest-class,
+  ABBA + PerfStats claim counter as proof) booked after the c24ce9b4e re-gate.
