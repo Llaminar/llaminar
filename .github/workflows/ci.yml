@@ -13,7 +13,7 @@ permissions:
   packages: write
 
 concurrency:
-  group: llaminar-cloud-develop-images
+  group: llaminar-cloud-develop-ci
   cancel-in-progress: false
   queue: max
 
@@ -23,8 +23,8 @@ jobs:
     if: github.ref == 'refs/heads/develop'
     name: Build → Publish develop images
     runs-on:
-      group: Cloud image builds
-      labels: llaminar-cloud-64
+      group: Develop CI
+      labels: llaminar-cloud-16
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v6

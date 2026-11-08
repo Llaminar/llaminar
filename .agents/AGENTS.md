@@ -241,11 +241,11 @@ Conventional Commits: `<type>(<optional-scope>): <description>`, for example
 Push the feature branch and open a PR into `develop`. Same-repository,
 non-draft feature PRs enable native squash auto-merge, which must wait for every
 required gate, owner approval and an up-to-date merge candidate. The canonical
-PR workflow
-builds the AVX512 Unit-only test image and runs the complete device-free
-`Unit` suite, without integration or production-preflight tests. A successful
+PR workflow builds the AVX2 Unit-only test image on the 16-core cloud runner
+and runs the complete device-free `Unit` suite, without integration or
+production-preflight tests. A successful
 develop merge builds and publishes both AVX512 and AVX2 runtime images on the
-64-core GitHub-hosted cloud runner, without compiling or running test images.
+16-core GitHub-hosted cloud runner, without compiling or running test images.
 These images are development artifacts; this gate does not certify a release.
 
 Only upon explicit user direction, open a release PR from `develop` into
@@ -1010,13 +1010,16 @@ add a second benchmark topology/model list or reintroduce this pipeline into
 pre-commit.
 
 Feature PRs targeting `develop` run `.github/workflows/develop-pr.yml`: build
-one AVX512 full-backend test image with only the Unit executable inventory
+one AVX2 full-backend test image with only the Unit executable inventory
+on the 16-core GitHub-hosted runner through `develop-unit.yml@develop`
 and run the complete device-free `Unit` suite. Integration and production
 preflight remain separate production gates. This is not image certification.
-It reuses the existing image driver without publication; no AVX2, models, E2E or benchmarks run on this PR.
+It reuses the existing image driver without publication; no models, E2E or
+benchmarks run on this PR. The PR imports public registry layers without credentials or cache export and shares the cloud publication
+queue; production hardware has its own independent queue.
 
 The enabled `develop` push workflow is deliberately smaller than certification: it invokes
-`scripts/ci/run_develop_image_gate.py --build-only --publish` on the 64-core
+`scripts/ci/run_develop_image_gate.py --build-only --publish` on the 16-core
 GitHub-hosted runner to build AVX512 and AVX2 full-backend Release runtimes
 and publish both `develop` and source-SHA tags. It compiles no Integration
 inventory and runs no tests. PRs separately require device-free Unit tests

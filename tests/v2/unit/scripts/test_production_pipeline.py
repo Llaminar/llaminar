@@ -3657,6 +3657,27 @@ class ImageIdentityTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "tagged registry image"):
                     pipeline.persistent_build_cache_arguments("AVX512", role, role)
 
+    def test_cloud_pr_cache_import_cannot_export(self):
+        """Every PR image role can reuse layers without writing publication caches."""
+        registry = "ghcr.io/llaminar/llaminar:build-cache-develop"
+        environment = {pipeline.DOCKER_BUILD_CACHE_IMAGE_ENV: registry,
+                       pipeline.DOCKER_BUILD_CACHE_ACCESS_ENV: "import-only"}
+        with patch.dict(pipeline.os.environ, environment, clear=True):
+            for isa in pipeline.SHIPPING_ISAS:
+                for role in pipeline.ImageRole:
+                    for owner in pipeline.ImageRole:
+                        self.assertEqual(pipeline.persistent_build_cache_arguments(isa, role, owner),
+                                         ["--cache-from", f"type=registry,ref={registry}-{isa.lower()}"])
+        for invalid in ("", "readonly", "IMPORT_ONLY"):
+            with patch.dict(pipeline.os.environ, {**environment,
+                    pipeline.DOCKER_BUILD_CACHE_ACCESS_ENV: invalid}, clear=True):
+                with self.assertRaises(ValueError):
+                    pipeline.persistent_build_cache_arguments("AVX2", role, owner)
+        with patch.dict(pipeline.os.environ,
+                        {pipeline.DOCKER_BUILD_CACHE_ACCESS_ENV: "import-only"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "requires a registry cache"):
+                pipeline.persistent_build_cache_arguments("AVX2", role, owner)
+
     def test_persistent_build_cache_is_partitioned_and_cold_start_safe(self):
         """An ARC hostPath adds Buildx cache state without a bogus cold import."""
         with tempfile.TemporaryDirectory() as directory:
@@ -4807,15 +4828,14 @@ class InfrastructureTests(unittest.TestCase):
         # bounded compiler cache instead of allocating anonymous mounts.
         self.assertEqual(dockerfile.count(mount), 4)
 
-    def test_pr_workflow_uses_one_persistent_buildkit_worker_for_host_cache(self):
+    def test_production_workflow_uses_one_persistent_buildkit_worker_for_host_cache(self):
         """The ARC cache needs a retained BuildKit worker, never the unsupported Docker driver."""
-        workflow = (ROOT / ".github/workflows/develop-pr.yml").read_text(encoding="utf-8")
+        workflow = (ROOT / ".github/workflows/production-e2e.yml").read_text(encoding="utf-8")
         self.assertIn("driver: docker-container", workflow)
         self.assertIn("name: llaminar-ci", workflow)
         self.assertIn("cleanup: false", workflow)
         self.assertIn("keep-state: true", workflow)
         self.assertIn("cache-binary: false", workflow)
-        self.assertIn("Bound node-local BuildKit cache", workflow)
         self.assertNotIn("type=gha", workflow)
         self.assertNotIn("actions/cache", workflow)
 

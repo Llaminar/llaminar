@@ -1192,10 +1192,10 @@ without driving maintenance.
 
 ### CI and branch approvals
 
-PRs into `develop` require the complete device-free Unit suite and owner
-approval. They do not run integration or production-preflight tests. After
-merge, a 64-core GitHub-hosted runner builds and publishes the AVX512 and AVX2
-Release development images without running tests. Production validation and
+PRs into `develop` run the complete device-free Unit suite on a 16-core
+GitHub-hosted runner and require owner approval. They do not run integration or
+production-preflight tests. After merge, the same runner size builds and
+publishes the AVX512 and AVX2 Release development images without running tests. Production validation and
 release certification remain separate; see [the CI workflow](docs/production-ci.md).
 
 ### Build from source

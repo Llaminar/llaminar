@@ -59,6 +59,7 @@ DOCKER_BUILD_CACHE_ROOT_ENV = "LLAMINAR_DOCKER_BUILD_CACHE_ROOT"
 # Ephemeral cloud builders retain immutable layers in a separate registry tag;
 # they never pretend to own the ARC host's persistent directories.
 DOCKER_BUILD_CACHE_IMAGE_ENV = "LLAMINAR_DOCKER_BUILD_CACHE_IMAGE"
+DOCKER_BUILD_CACHE_ACCESS_ENV = "LLAMINAR_DOCKER_BUILD_CACHE_ACCESS"
 # Docker build input must not include diagnostic parity CSVs.  Docker itself
 # already excludes this generated directory through .dockerignore; excluding it
 # during the preceding Git archive avoids materializing almost 0.9 GB per ISA
@@ -88,6 +89,12 @@ class ImageRole(str, Enum):
     """Installed test runner and shipped runtime have distinct admission roles."""
     TEST_RUNNER = "test-runner"
     RUNTIME = "runtime"
+
+
+class RegistryBuildCacheAccess(str, Enum):
+    """PRs import trusted layers; only publication jobs export registry caches."""
+    IMPORT_ONLY = "import-only"
+    READ_WRITE = "read-write"
 
 
 class TestRunnerInventory(str, Enum):
@@ -302,7 +309,8 @@ def persistent_build_cache_arguments(cpu_isa: str, role: ImageRole,
     The Dockerfile names that ccache mount separately and the persistent
     BuildKit worker hosted by the one host Docker daemon retains it. This
     external cache complements it by retaining layer hits across runner-pod
-    lifecycle transitions.
+    lifecycle transitions. Cloud PRs select import-only registry access to
+    reuse published SDK layers without credentials or cache mutation.
     """
     if cpu_isa not in SHIPPING_ISAS:
         raise ValueError("persistent Buildx cache requires an explicit shipping CPU ISA")
@@ -310,6 +318,11 @@ def persistent_build_cache_arguments(cpu_isa: str, role: ImageRole,
         raise TypeError("persistent Buildx cache requires typed image roles")
     raw_root = os.environ.get(DOCKER_BUILD_CACHE_ROOT_ENV)
     registry = os.environ.get(DOCKER_BUILD_CACHE_IMAGE_ENV)
+    raw_access = os.environ.get(DOCKER_BUILD_CACHE_ACCESS_ENV)
+    if raw_access is not None and registry is None:
+        raise ValueError(f"{DOCKER_BUILD_CACHE_ACCESS_ENV} requires a registry cache")
+    access = RegistryBuildCacheAccess(
+        raw_access if raw_access is not None else RegistryBuildCacheAccess.READ_WRITE.value)
     if registry is not None:
         if raw_root is not None:
             raise ValueError("select exactly one local or registry Buildx cache authority")
@@ -317,7 +330,7 @@ def persistent_build_cache_arguments(cpu_isa: str, role: ImageRole,
             raise ValueError(f"{DOCKER_BUILD_CACHE_IMAGE_ENV} requires a tagged registry image")
         reference = f"{registry}-{cpu_isa.lower()}"
         arguments = ["--cache-from", f"type=registry,ref={reference}"]
-        if role is external_cache_owner:
+        if access is RegistryBuildCacheAccess.READ_WRITE and role is external_cache_owner:
             arguments.extend(["--cache-to", f"type=registry,ref={reference},mode=max,image-manifest=true,oci-mediatypes=true"])
         return arguments
     if raw_root is None:

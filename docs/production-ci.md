@@ -24,14 +24,14 @@ and its required gates. Restore any temporary maintenance exception in the
 develop ruleset immediately after the push.
 
 `.github/workflows/develop-pr.yml` tests same-repository feature PRs targeting
-`develop`. It builds an AVX512 full-backend test image with the `unit-only` executable
+`develop`. It builds an AVX2 full-backend test image with the `unit-only` executable
 inventory and executes only the complete device-free `Unit` suite. It does not
 compile the production-preflight target or run integration tests. The test
 container receives no GPU devices or model mounts. This is PR validation, not
 release certification. The checkout is the PR merge ref, so the tests
 include the proposed integration with `develop`.
 
-The active `develop` ruleset requires `Unit (AVX512)`, an
+The active `develop` ruleset requires `Develop PR / Unit (AVX2)`, an
 up-to-date PR, and squash merge; direct human pushes, force pushes and deletion
 are rejected. `.github/workflows/develop-auto-merge.yml` arms GitHub's native
 auto-merge for same-repository, non-draft PRs. GitHub loads this
@@ -39,9 +39,8 @@ auto-merge for same-repository, non-draft PRs. GitHub loads this
 when the PR targets `develop`. That installed copy uses the dedicated
 `DEVELOP_AUTOMERGE_TOKEN` repository secret; changing only the develop copy
 cannot repair the live policy. It does not check out PR code and cannot merge
-before the required image-bound check and review requirements succeed. Fork PRs cannot run on the
-privileged host runner; import a reviewed branch into this repository before
-requesting this gate.
+before the required image-bound check and review requirements succeed. The gate retains the same-repository PR policy; import a reviewed fork branch
+into this repository before requesting it.
 
 The automation secret is a fine-grained personal access token limited to
 `Llaminar/llaminar`, with Contents and Pull requests write permissions. It has
@@ -58,28 +57,26 @@ Create the token in GitHub's fine-grained token settings with resource owner
 prompts for the value; credential values do not belong in source or evidence
 files. Replace the secret before its configured expiration.
 
-The workflow calls the existing `run_develop_image_gate.py --cpu-isa AVX512`
-without `--publish`. It runs no AVX2 lane, model discovery/staging, generation,
-HF parity, HTTP/remote E2E, benchmarks, image publication or release creation.
-Every job on the production host that builds an image, runs tests, or prepares
-the self-hosted test toolchain shares `llaminar-develop-image-gate` with
-`queue: max` and `cancel-in-progress: false`. The ARC scale set also has
-`maxRunners: 1`. Thus separate PRs and certification runs wait their turn;
-GitHub must neither overlap their hardware work nor replace an older pending
-run with a newer one. Read-only policy, source-admission, and documentation
-publication jobs do not occupy that hardware queue.
-No registry-write permission or login is granted. Untrusted fork PRs do not
-acquire the privileged host runner; review/import them onto a repository branch
-before running this gate. Branch protection is configured independently.
+The PR workflow calls `.github/workflows/develop-unit.yml@develop`, a reusable
+workflow pinned to the protected branch. The runner group admits that stable
+workflow reference while the default checkout still tests the caller's PR
+merge ref. Both workflows grant only Contents read access and pass no secrets.
+The called job admits only same-repository pull requests targeting `develop`.
 
-The PR uses the same host Docker daemon, retained `llaminar-ci` BuildKit worker,
-bounded local compiler cache and accelerator concurrency group as the
-production workflows. Cloud publication has its own independent queue. Only build logs, image/test receipts and CTest/JUnit evidence are
-uploaded to GitHub, never cache contents. Run the equivalent locally with:
+The Unit job uses the same 16-core GitHub-hosted runner as develop publication.
+AVX2 is the explicit execution lane because the cloud x64 pool does not carry
+the production host's AVX512 contract. It calls the existing
+`run_develop_image_gate.py --cpu-isa AVX2` without `--publish`, using an ephemeral
+BuildKit worker. It imports public registry layers with
+`LLAMINAR_DOCKER_BUILD_CACHE_ACCESS=import-only`; it never exports caches or logs
+into the registry. No registry-write permission is granted. Model staging,
+integration, preflight, generation, HF parity, E2E and benchmarks remain outside
+this PR gate. Only build logs, image/test receipts and CTest/JUnit evidence are
+uploaded to GitHub. Run the equivalent locally with:
 
 ```bash
 python3 scripts/ci/run_develop_image_gate.py \
-  --cpu-isa AVX512 --output parity-results/develop-pr-gate
+  --cpu-isa AVX2 --output parity-results/develop-pr-gate
 ```
 
 After merge, the ordinary develop push workflow below builds and publishes
@@ -89,12 +86,14 @@ separate, broader gate.
 ## Develop branch image publication
 
 `.github/workflows/ci.yml` runs on pushes to `develop` and explicit manual
-dispatches on `develop`. It uses the GitHub-hosted `llaminar-cloud-64` runner
-in the `Cloud image builds` group: Ubuntu 24.04, 64 vCPUs, 256 GB RAM and
-2,040 GB storage, with maximum concurrency one. The group admits only this
-repository's `ci.yml` on `refs/heads/develop`. Its independent
-`llaminar-cloud-develop-images` queue preserves every pending build without
-occupying the production host or its accelerators.
+dispatches on `develop`. It uses the GitHub-hosted `llaminar-cloud-16` runner
+in the `Develop CI` group: Ubuntu 24.04, 16 vCPUs, 64 GB RAM and 600 GB storage,
+with maximum concurrency one. The group admits only this repository and
+`ci.yml` plus the reusable `develop-unit.yml`, both pinned to
+`refs/heads/develop`. PR validation and image publication share the
+`llaminar-cloud-develop-ci` queue with `queue: max` and
+`cancel-in-progress: false`, preserving every pending run without occupying
+the production host or its accelerators.
 
 The job runs `scripts/ci/run_develop_image_gate.py --build-only --publish`.
 It builds only the full CPU/CUDA/ROCm Release runtime targets for AVX512 and
@@ -113,7 +112,9 @@ release artifacts.
 The ephemeral cloud worker uses registry-backed BuildKit caches selected by
 `LLAMINAR_DOCKER_BUILD_CACHE_IMAGE`, with separate `-avx512` and `-avx2` tags.
 The workflow stores these under `ghcr.io/llaminar/llaminar:build-cache-develop`.
-Local host-path and registry cache authorities are mutually exclusive. Ccache
+Registry access defaults to `read-write` for publication; PRs explicitly select
+`import-only`, with no cache export. Local host-path and registry cache
+authorities are mutually exclusive. Ccache
 mounts are shared within a build job; only immutable layers survive in the
 registry. Artifacts retain build/publication logs, timelines and identity
 receipts, never source snapshots or compiler caches.
@@ -147,6 +148,12 @@ separate CI rulesets. Keep approver-team membership restricted to the owner.
 The check installer leaves this independent approval ruleset intact.
 
 ### ARC runner on the production host
+
+Production-host image builds, tests and toolchain preparation share
+`llaminar-develop-image-gate` with `queue: max` and
+`cancel-in-progress: false`. The ARC scale set has `maxRunners: 1`, so those jobs
+cannot overlap GPU work or replace an older pending run. This queue is separate
+from develop PRs and image publication in the cloud.
 
 The `llaminar-xeon` ARC scale set runs inside the host's Kubernetes cluster,
 but it deliberately uses the host's Docker Unix socket rather than a DIND
@@ -390,7 +397,7 @@ feature PRs, develop pushes and manual benchmark workflows retain their scope.
 
 `scripts/ci/apply_master_ruleset.py` installs the five required GitHub Actions
 checks on the existing master ruleset with strict up-to-date PR semantics and
-squash-only merge. It also installs the `develop` PR and AVX512 Unit
+squash-only merge. It also installs the `develop` PR and AVX2 Unit
 check requirements, while retaining deletion and force-push protection.
 `develop` deliberately does not require linear history: after a certified
 master squash merge, the release publisher records that exact master commit as

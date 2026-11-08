@@ -33,14 +33,17 @@ Keep the fresh/full/partial prefix probes, exact repeatability, actual dynamic
 MTP activity, movement obligations and captured production-path evidence.
 
 Feature PRs into `develop` use `.github/workflows/develop-pr.yml` to build an
-AVX512 full-backend test companion with the `unit-only` executable inventory
+AVX2 full-backend test companion with the `unit-only` executable inventory
 and run only the complete device-free `Unit` suite. No integration or
 production-preflight tests run, and the container receives no GPU devices or
-model mounts. It calls `run_develop_image_gate.py --cpu-isa AVX512` without
-`--build-only` or `--publish`, using the production host's persistent cache
-and serialized queue. CTest owns selection and the JUnit receipt must prove
+model mounts. It calls `run_develop_image_gate.py --cpu-isa AVX2` without
+`--build-only` or `--publish`, on the 16-core GitHub-hosted runner through the protected
+`develop-unit.yml@develop` reusable workflow. PRs import public registry cache
+layers without credentials or cache export, and share a serialized cloud queue
+with develop image publication. AVX2 execution does not depend on AVX512 support
+in the cloud pool. CTest owns selection and the JUnit receipt must prove
 that every discovered Unit test ran without skipping.
-The `develop` ruleset requires `Unit (AVX512)` on an up-to-date PR. The separate
+The `develop` ruleset requires `Develop PR / Unit (AVX2)` on an up-to-date PR. The separate
 `Owner approval` ruleset requires approval from the owner-only
 `@Llaminar/repository-approvers` team for both protected branches. Native
 squash auto-merge waits for required reviews and checks. The owner has a
@@ -48,7 +51,7 @@ PR-only approval override; existing CI rules remain enforced. The dedicated
 release-evidence deploy key retains its existing publication exception.
 Never grant the general GitHub Actions app a ruleset bypass.
 
-The `develop` push workflow uses the 64-core GitHub-hosted cloud runner and
+The `develop` push workflow uses the 16-core GitHub-hosted cloud runner and
 `run_develop_image_gate.py --build-only --publish`. It compiles only the two
 full-backend Release runtimes, omits Integration compilation, and publishes
 both branch and source-SHA tags after both builds succeed. It runs no tests

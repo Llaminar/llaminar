@@ -1,0 +1,58 @@
+name: Develop device-free Unit gate
+
+# Runner-group access is pinned to this workflow on develop. The caller keeps
+# the pull_request event, so checkout still tests its proposed merge commit.
+# AVX2 execution does not require the production host's AVX512 instruction set.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    # Only same-repository PRs into develop may call this paid Unit gate.
+    if: >-
+      github.event_name == 'pull_request' && github.base_ref == 'develop' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    name: Unit (AVX2)
+    runs-on:
+      group: Develop CI
+      labels: llaminar-cloud-16
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: false
+          lfs: false
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4
+        with:
+          driver: docker-container
+          driver-opts: network=host
+          cache-binary: false
+      - name: Build AVX2 Unit inventory and run device-free tests
+        shell: bash
+        env:
+          LLAMINAR_DOCKER_BUILD_CACHE_ACCESS: import-only
+        run: |
+          set -euo pipefail
+          export LLAMINAR_DOCKER_BUILD_CACHE_IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}:build-cache-develop"
+          exec python3 scripts/ci/run_develop_image_gate.py \
+            --cpu-isa AVX2 \
+            --output "$RUNNER_TEMP/llaminar-develop-pr-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+      - name: Retain image-bound Unit evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: develop-pr-${{ github.event.pull_request.number }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # Logs/receipts only: no source snapshots, images or compiler cache.
+          path: |
+            ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/develop-image-gate.json
+            ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/avx2/build-*.log
+            ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/avx2/build-timeline.jsonl
+            ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/avx2/unit.log
+            ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/avx2/unit.process.log
+            ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/avx2/unit/**
+          if-no-files-found: warn
+          retention-days: 30

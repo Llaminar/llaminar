@@ -235,8 +235,8 @@ class DevelopImageGateTests(unittest.TestCase):
         self.assertIn("exec python3 scripts/ci/run_develop_image_gate.py", workflow)
         policy = yaml.load(workflow, Loader=yaml.BaseLoader)
         self.assertEqual(policy["jobs"]["develop-images"]["runs-on"],
-                         {"group": "Cloud image builds", "labels": "llaminar-cloud-64"})
-        self.assertEqual(policy["concurrency"]["group"], "llaminar-cloud-develop-images")
+                         {"group": "Develop CI", "labels": "llaminar-cloud-16"})
+        self.assertEqual(policy["concurrency"]["group"], "llaminar-cloud-develop-ci")
         self.assertIn("--build-only", workflow)
         self.assertNotIn("prerequisites/", workflow)
         self.assertNotIn("prune_docker_build_cache", workflow)
@@ -251,14 +251,26 @@ class DevelopImageGateTests(unittest.TestCase):
                          {"opened", "synchronize", "reopened", "ready_for_review"})
         self.assertEqual(workflow["permissions"], {"contents": "read"})
         self.assertEqual(workflow["concurrency"], {
-            "group": "llaminar-develop-image-gate", "cancel-in-progress": "false",
+            "group": "llaminar-cloud-develop-ci", "cancel-in-progress": "false",
             "queue": "max"})
         self.assertEqual(set(workflow["jobs"]), {"unit"})
         job = workflow["jobs"]["unit"]
-        self.assertEqual(job["runs-on"], ["llaminar-xeon-host"])
-        # Fork code must not acquire this privileged, persistent host runner.
+        self.assertEqual(job["uses"],
+                         "Llaminar/llaminar/.github/workflows/develop-unit.yml@develop")
+        # Preserve the established same-repository PR admission policy.
         self.assertEqual(job["if"],
                          "github.event.pull_request.head.repo.full_name == github.repository")
+        reusable = yaml.load((ROOT / ".github/workflows/develop-unit.yml").read_text(),
+                             Loader=yaml.BaseLoader)
+        self.assertEqual(set(reusable["on"]), {"workflow_call"})
+        self.assertEqual(reusable["permissions"], {"contents": "read"})
+        caller = job
+        job = reusable["jobs"]["unit"]
+        self.assertEqual(job["runs-on"], {"group": "Develop CI", "labels": "llaminar-cloud-16"})
+        self.assertEqual(f"{caller['name']} / {job['name']}", "Develop PR / Unit (AVX2)")
+        self.assertIn("github.event_name == 'pull_request'", job["if"])
+        self.assertIn("github.base_ref == 'develop'", job["if"])
+        self.assertIn("github.event.pull_request.head.repo.full_name == github.repository", job["if"])
         steps = job["steps"]
         actions = {step["uses"] for step in steps if "uses" in step}
         self.assertEqual(actions, {"actions/checkout@v6", "docker/setup-buildx-action@v4",
@@ -267,18 +279,20 @@ class DevelopImageGateTests(unittest.TestCase):
         self.assertEqual(checkout["with"], {
             "submodules": "false", "lfs": "false", "persist-credentials": "false"})
         buildx = next(step for step in steps if step.get("uses") == "docker/setup-buildx-action@v4")
-        for key, value in {"name": "llaminar-ci", "driver": "docker-container",
-                           "keep-state": "true", "cleanup": "false",
-                           "cache-binary": "false"}.items():
+        for key, value in {"driver": "docker-container", "cache-binary": "false"}.items():
             self.assertEqual(buildx["with"][key], value)
         commands = [step["run"] for step in steps if "run" in step]
-        self.assertEqual(len(commands), 2)
-        self.assertEqual(commands[1], "bash scripts/ci/prune_docker_build_cache.sh")
+        self.assertEqual(len(commands), 1)
+        self.assertNotIn("keep-state", buildx["with"])
+        self.assertNotIn("cleanup", buildx["with"])
+        build_step = next(step for step in steps if "run" in step)
+        self.assertEqual(build_step["env"], {"LLAMINAR_DOCKER_BUILD_CACHE_ACCESS": "import-only"})
+        self.assertIn("LLAMINAR_DOCKER_BUILD_CACHE_IMAGE", commands[0])
         command = shlex.split(commands[0].split("exec ", 1)[1].replace("\\\n", ""))
         self.assertEqual(command[:2], ["python3", "scripts/ci/run_develop_image_gate.py"])
         arguments = command[2:]
         policy = gate.parse_arguments(arguments)
-        self.assertEqual(policy.cpu_isas, ["AVX512"])
+        self.assertEqual(policy.cpu_isas, ["AVX2"])
         self.assertFalse(policy.publish)
         self.assertIsNone(policy.image)
 
@@ -306,12 +320,12 @@ class DevelopImageGateTests(unittest.TestCase):
                  patch.object(gate, "publish_runtime") as publish:
                 self.assertEqual(gate.main(arguments), 0)
             publish.assert_not_called()
-            self.assertEqual(events, [("build", "AVX512"),
-                                     ("unit", "test-runner-avx512")])
+            self.assertEqual(events, [("build", "AVX2"),
+                                     ("unit", "test-runner-avx2")])
             receipt = json.loads((output / "develop-image-gate.json").read_text())
             self.assertTrue(receipt["complete"])
             self.assertFalse(receipt["published"])
-            self.assertEqual(set(receipt["variants"]), {"AVX512"})
+            self.assertEqual(set(receipt["variants"]), {"AVX2"})
 
     def test_develop_auto_merge_waits_for_protected_pr_gate(self):
         """Only trusted, non-draft PRs arm native auto-merge; no PR code runs."""
@@ -338,7 +352,7 @@ class DevelopImageGateTests(unittest.TestCase):
         self.assertNotIn("checkout", str(job))
 
     def test_all_host_ci_jobs_share_a_serial_non_discarding_queue(self):
-        """Separate PRs and certification jobs cannot contend for this host's GPUs."""
+        """Production certification jobs cannot contend for this host's GPUs."""
         values = yaml.load((ROOT / "scripts/ci/arc/llaminar-xeon-host-docker-values.yaml")
                            .read_text(), Loader=yaml.BaseLoader)
         self.assertEqual(values["maxRunners"], "1")
@@ -353,7 +367,7 @@ class DevelopImageGateTests(unittest.TestCase):
                 admitted.append(f"{path.name}:{name}")
                 self.assertEqual(job.get("concurrency", workflow.get("concurrency")),
                                  expected, admitted[-1])
-        self.assertGreaterEqual(len(admitted), 6)
+        self.assertGreaterEqual(len(admitted), 5)
 
     def test_unit_executes_in_exact_test_image_without_devices_or_models(self):
         """A PR must test its built image, not a host checkout or older runtime."""
