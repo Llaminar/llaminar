@@ -117,3 +117,21 @@ another schedule heuristic.
 - OPEN QUESTION: `auto` default changes behaviour (task cap) before any engine
   measurement — window 2 (all-workers vs auto vs fastest-class, 35B/27B MTP
   off/dyn) decides whether auto keeps the cap / adopts fastest-class.
+
+## MECHANISM REJECTED (2026-11-08, window 2) — severe regression
+
+- Engine A/B (35B no-MTP): all-workers **23.41** tok/s; auto (task cap only)
+  **0.76** (~30× slower; prefill 48.3 → 4.96); fastest-class equally slow
+  (A/B killed, no clean number; no 27B/MTP cells).
+- Root cause (libgomp): a NON-nested `omp parallel num_threads(w)` with
+  w smaller than the pool's previous team RELEASES the surplus pool threads
+  (they exit); the next full-width region pthread_creates them again →
+  thread churn on ~1000 regions/token; recreated threads also get libgomp's
+  CPU-id place binding (not capacity order). Unit tests pass because bytes
+  stay identical — they don't measure team churn.
+- Conclusion: varying num_threads per region is UNUSABLE.
+- REWORK direction (idea 05, prototype + measure before proposing): keep every
+  region at FULL width; gate task claiming by worker id (workers ≥ w skip
+  claiming and only meet the barrier). Covers retained-team calls too; saves
+  only straggler avoidance, not wake-up cost.
+- Held (NOT for merge): origin/codex/arm-decode-team-placement @ 56158b57a.

@@ -174,3 +174,22 @@ Handoffs (rebased onto afe62c5ef, fork codex/i8mm-typed-placement):
   focused tests (incl. the 5 filters that were link-broken before, GEMV
   route/isa proof assertions, fused NEON cells, codegen envelope, ISA profile,
   MPIBootstrap/OpenMP binding, CPUStartupAffinity).
+
+## Merge candidate + window-2 results (2026-11-08)
+
+- MERGE CANDIDATE: origin/codex/i8mm-typed-placement @ **5f4c9d4d4**
+  (rebased onto 79c1f62ab: envelope d8546d184 + I8MM leaf 5f4c9d4d4; content-
+  identical to the gated de4535855 pair; getenv copy dropped — in base as
+  12d3f23cd). Placement commit held separately (idea 05). Review requested
+  from arm-reviewer on the I8MM content.
+- Q6_K mixed-20 prefill (n512 k2048 M=64, 3×ABBA, 61 iters): NOT bimodal —
+  stable **−15%** (SDOT 174.8 vs SMMLA 205.5 µs, 6/6). Same shape X925-only
+  1.00, A725-only 1.06, big-shape mixed 1.07; Q6_K M=2..4 mixed 1.02–1.07 →
+  regression is PREFILL-ONLY and small-N+mixed. Harness uses libgomp CPU-id
+  place order (A725 first) vs production capacity binding — rerun under
+  production binding before any per-encoding gate.
+- Small-M X925-10 (Q4_K/Q8_0/IQ4_XS, 3×ABBA, spreads <2%): M=2 1.00–1.04,
+  M=3 1.02–1.06, M=4 1.07–1.09, M=5..8 1.05–1.13, prefill 1.13–1.17,
+  M=1 0.98–1.00. M=2/3 low gain is STRUCTURAL (one pair saves 2 dot
+  instructions per group pair vs decode work SMMLA doesn't reduce; M=3 adds
+  an SDOT tail row) — no defect.
