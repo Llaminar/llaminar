@@ -19,6 +19,15 @@ Source: `Perf__CPUGatedDeltaNetVerifierRows`.
 - **Caveat:** samples swing ~10x because the VM was loaded by a concurrent
   gate. GB10 Release 20T/1T numbers come from the final `Perf__` round.
 
+## GB10 confirmation (final Perf round, K14-PERF-FINAL-264970E14 @ `264970e14`)
+
+`CPUGatedDeltaNetVerifierRows` on the sealed final round: **grouped-vs-serial
+speedup < 1 for every M at both 20T and 1T** (e.g. M=4 **0.447**, M=6
+**0.416** @ 20T). The grouped GDN verifier path is **uneconomical on NEON** —
+confirming, not just suggesting, the analysis above. Any fix must first
+separate kernel vs capture/publication cost (the production-path numbers above
+were the worse half).
+
 ## Open questions (before any kernel change)
 
 1. Is per-row **state capture / accepted-state publication** the dominant cost

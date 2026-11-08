@@ -60,6 +60,17 @@ Two follow-ups have landed since:
 - Other certified leaf trees (FA2 fixed arithmetic spans etc.) must remain
   fixed.
 
+## Measured placement economics (P1 final Perf round, K14-PERF-FINAL-264970E14)
+
+- **Fast-only (X925, 10T) ≈ mixed 20T** for GEMV — the X925-only placement
+  matches all-core throughput with half the workers.
+- **Slow-only (A725) is 2.4–3.7x worse** than mixed.
+
+So the current `dynamic(1)` all-core policy is not leaving much on the table
+for GEMV; the economical win would be a typed policy that avoids putting
+work on slow cores when fast cores can absorb it (or a P-core-only mode where
+power/thermal matter). No such typed policy exists yet.
+
 ## Validation
 
 - Thread-scaling Perf on GB10, M 1..8/12/15/16/31/64, all formats; per-class

@@ -42,6 +42,12 @@ and byte-identical output. The repo already has the model for this:
    VM classifies as slow, not a code defect. Optional follow-up: run the lanes
    with more parallelism/physical cores or reduce lane count so the loop
    itself doesn't waste the feedback time.
+5. **Bug (final Perf round, K14-PERF-FINAL-264970E14, GB10/NEON @ `264970e14`):**
+   `NativeVNNI_Sweep` and `DispatchSweep` fail with `CPU invocation requires
+   admitted workspace buffer: cpu_projection_q8` — the perf sweep bypasses
+   workspace admission. The sweep must either go through the same workspace
+   admission/contract as production invocation or explicitly declare its
+   workspace BOM; do not paper over it with the `PerfStats` labels.
 
 ## Exactness / risk
 

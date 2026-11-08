@@ -31,7 +31,7 @@ references are as of the head above and may drift.
 | 2 | Shared CPU/GPU (UMA) memory admission | `02-uma-shared-memory-admission.md` | Partial (joint pool implemented `80985c08e`; live GB10 CUDA+CPU validation open) |
 | 3 | Move projection metadata validation out of the K loop | `03-projection-metadata-validation-hoist.md` | Open |
 | 4 | Wider decode column panel + activation reuse | `04-decode-column-panel-activation-reuse.md` | Open |
-| 5 | Heterogeneous (X925/A725) core scheduling | `05-heterogeneous-core-scheduling.md` | Partial (dynamic tile claiming landed; no typed weighted policy) |
+| 5 | Heterogeneous (X925/A725) core scheduling | `05-heterogeneous-core-scheduling.md` | Partial (dynamic tile claiming landed; X925-only 10T ≈ mixed 20T measured; no typed policy) |
 | 6 | I8MM (SMMLA) row-pair dot-product | `06-i8mm-row-pair-dot.md` | Open (highest-value next kernel item; see idea 14) |
 | 7 | Hot-path allocation / cache cleanup (RoPE, RMSNorm, gamma TLS) | `07-hot-path-allocation-cleanup.md` | Open |
 | 8 | ARM prepared-weight layout (drop dead compensation bytes, compact expansions) | `08-arm-prepared-weight-layout.md` | Open (ABI change; last) |
@@ -44,10 +44,11 @@ references are as of the head above and may drift.
 | 15 | NUMA-less and cache-unpublished Linux ARM hosts | `15-numa-less-hosts.md` | Partial (memory attribution `a572c3c9c`) |
 | 16 | MoE routed experts, GDN projection and LM head in CPU decode | `16-moe-expert-and-lm-head-decode.md` | Open (bundle part closed/verified; GDN and LM head open) |
 | 17 | GB10 CPU decode bandwidth gap (post-merge follow-up) | `17-gb10-decode-bandwidth-gap.md` | Open (operator-requested re-analysis after merge) |
-| 18 | GDN grouped verifier + publication economics | `18-gdn-grouped-verifier-economics.md` | Open (clean-host rerun needed; GB10 numbers from final Perf__ round) |
+| 18 | GDN grouped verifier + publication economics | `18-gdn-grouped-verifier-economics.md` | Confirmed (GB10 grouped-vs-serial < 1.0 for all M; M=4 0.447 @20T) |
 | 19 | Prefill vs decode gap on GB10 (short-prompt effect) | `19-prefill-vs-decode-gap.md` | Open (prompt-length sweep planned) |
 | 20 | Overlay collection methodology (microbench wins that lose in-model) | `20-overlay-collection-methodology.md` | Open (new rule: in-model collection or per-format E2E validation) |
 | 21 | CUDA GB10 (sm_120/sm_121) kernel register spills under the zero-spill guard | `21-sm121-cuda-kernel-spills.md` | Open (sm_120 worse: 45 instantiations; blocks GB10 GPU + UMA validation) |
+| 22 | FA2 tile-tournament policy tail on GB10 | `22-fa2-tile-tournament-policy-tail.md` | Open (p95 regret 8.926% > 5%; tq4_tq4 17.6%) |
 
 Measured numbers for all ideas: `00-measured-baseline.md` (GB10 serving,
 stage attribution, spin sweep, thread scaling, overlay statistics).
