@@ -1,7 +1,10 @@
 # Idea 27 — Fused NativeVNNI evidence cells fail on ARM (Pairwise/WideRows gap)
 
-Status: **Open**. Base-class failures on `b2cf793bf`, discovered during the
-arm-i8mm commit-1 preflight (2026-11-08); not I8MM-specific.
+Status: **Open — fix in flight**. 2026-11-08: prepared on the PR #43 branch by
+Main (evidence cell uses the native WideRows schedule on aarch64; x86
+unchanged; Pairwise stays as the second distinct policy); not pushed yet
+(container rebuilding oneDNN). Close on Main's SHA once both NEON
+fused-completion cells pass locally.
 
 ## Finding (commit-1 preflight acadffd64, .80 → 2284/2291)
 
