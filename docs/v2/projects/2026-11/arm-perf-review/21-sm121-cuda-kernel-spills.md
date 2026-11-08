@@ -60,3 +60,13 @@ tensor-prefill instances being the largest single family).
   ARM-branch SHA, announced by Main when landed.
 - **Tensor-split spec rev 2 (`83c61732d`)**: open design candidate, pending
   sign-off from arm-perf + arm-reviewer (01a1a8d9).
+
+- Tensor-split spec rev 2 (83c61732d): **signed off by arm-perf (2026-11-08)**
+  with conditions — §5 exactness proven by the mandated byte-compare +
+  boundary sweep (not argument alone); fragment/lane mapping verified against
+  mmaFragmentRow/Column before implementation; measured per-target values
+  replace every estimate; consumer peak > 170 → stop+report (no silent 4-way
+  fallback); add unprofiled before/after Release timing (one barrier per tile
+  — report any slowdown with attribution); graph-capture identity includes
+  the variant/generation. Implementation + measurements owned by Main/ARM
+  after the branch move; arm-reviewer checks the implementation diff.
