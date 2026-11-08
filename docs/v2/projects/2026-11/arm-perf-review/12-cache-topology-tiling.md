@@ -28,20 +28,25 @@ topology/unknowns are retained (`CPUCacheObservation.h`). Class-specific tuning
 3. Any new table must stay exact-overlay based (no generic fitting/retraining;
    the plan explicitly allows only exact overlays).
 
-## End-to-end overlay transfer (finding, 2026-11-07)
+## End-to-end overlay transfer (final A/B/C, verified 2026-11-08)
 
-Verified-mode per-commit runs on GB10 (35B Release, decode tok/s):
+Verified per-commit runs on GB10 (35B Release, decode tok/s, n=256 greedy):
 
-- A2 `878a33fea` (baseline): MTP dyn **18.46**, MTP off **14.14**.
-- B2 `144ece037` (+2,519-key overlay table): MTP dyn **17.30**, MTP off
-  **13.27** (−6% in both).
-- B1 earlier: 17.68 vs A1 17.89.
+- A `878a33fea` (baseline): MTP dyn **18.18±0.40**, no-MTP **14.14**, prefill
+  24.0–24.7.
+- B `144ece037` (+2,519-key overlay table): MTP dyn **17.45±0.21** (−4%),
+  no-MTP **13.27** (−6%), prefill 22.6–22.8 (−7%).
+- C `268cd81de` (pooled bundle **plus** the same overlays): MTP dyn 27.19±0.18,
+  no-MTP 20.48, prefill 37.1–37.8 — so the head is still carrying the overlay
+  cost on top of the bundle gains.
 
-Kernel-level wins on selected keys were ~20–25%, but end to end the overlays
-are **neutral to slightly negative** so far. Repeats are pending (C3 then
-more); if it persists, the 20-worker microbenchmark keys may not transfer to
-real in-model concurrency/cache state, and an A/B with overlays disabled at
-the head is worthwhile before drawing conclusions.
+Kernel-level wins on selected keys were ~20–25%, but the 20-worker
+microbenchmark keys do **not** transfer to in-model execution: end to end the
+overlays are confirmed to **regress ~4–7%** (warm caches, concurrent stages).
+
+**Follow-up:** A/B at the head with the overlay table disabled; if confirmed,
+either retire the table or re-collect overlays from **in-model context** (warm
+caches, concurrent stages, per-layer shapes as they actually run).
 
 ## Exactness / risk
 

@@ -3,8 +3,14 @@
 Status: **Partial**. `27585692d` installs a bounded libgomp idle spin
 (`GOMP_SPINCOUNT=3000000`, `MPIBootstrap::configureOpenMPWaitPolicy`,
 regression `V2_Integration_OpenMPIdleSpinPolicy`). `408ff90e5` removes 15 of
-16 barriers from the CPU MoE fused gate/up bundle. Reducing the region and
-barrier count further is still open.
+16 barriers from the CPU MoE fused gate/up bundle, now **verified end to end**
+(2026-11-08, GB10, 35B): MTP dyn 17.45→27.19±0.18 (+56%), no-MTP 13.27→20.48
+(+54%), prefill 37.1–37.8 (+65%); C true no-MTP stage timings `MOE_EXPERT_FFN`
+274 µs/call and router bundle 176 µs/call (16 projections, K=2048); MTP gain
+over no-MTP at C +32.8%. The bundle part of this idea and of idea 16 is
+closed. Reducing the region and barrier count **further is still open** — the
+remaining structure (other workshares/regions per step, experts/shared/GDN
+pooling candidates, retained-team-per-layer) is unmeasured.
 
 ## Finding
 

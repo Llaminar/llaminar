@@ -65,5 +65,18 @@ integer dot products; it amortizes weight bandwidth but not arithmetic.
 Verified-mode per-commit run, A2 `878a33fea`: 27B MTP dyn **4.20** vs off
 **4.51 tok/s** (−6.9%). The earlier “≈ equal” figures came from **mislabeled
 cells (both runs had MTP on)** — the verified comparison is the A2 pair above.
-At `268cd81de`: MTP dyn 4.27–4.29. Mainline evidence for the dense-MTP
-decision stays the verified pair; idea 19 covers the prefill side.
+At `268cd81de` (C): MTP dyn 4.24–4.25 vs no-MTP 4.49–4.62 (−7…−8%). Mainline
+evidence for the dense-MTP decision stays the verified pair; idea 19 covers
+the prefill side.
+
+## Depth-controller finding (2026-11-08)
+
+At C the 27B depth controller reports **43.4% acceptance at depth=10** with
+last decision `window_not_ready`, i.e. it runs depth 10 at 43% acceptance.
+For any positive verifier cost that is economically wrong: most of each
+grouped verify is wasted. Two open questions:
+
+1. Why does the decision window never become ready (`window_not_ready`)?
+2. Are the CPU continuation profile defaults in `execution/config/
+   MTPDepthDefaults.h` sensible for CPU (they may be tuned for device
+   continua)?

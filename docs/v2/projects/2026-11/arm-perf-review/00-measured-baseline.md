@@ -93,13 +93,23 @@ this file was written.
 - The end-to-end serving A/B (baseline, plus overlays, plus pooled bundle) was
   pending when this file was written.
 
-## Updated serving results (post-`268cd81de`)
+## Updated serving results (final A/B/C, verified, n=256 greedy, 20 cores)
 
-Supersedes the 35B rows in the table above for the commits named here:
-- at
-`268cd81de`: 35B MTP dynamic **27.5** tok/s, MTP off **20.6**; 27B MTP dynamic
-**4.27–4.29**;
-- per-commit A/B/C (`878a33fea` baseline → `144ece037` overlays → `268cd81de`
-  pooled bundle, with repeats) still running on `.80`; at A: 35B 17.9/17.8,
-  27B 4.16 (MTP) / 4.21 (off) tok/s decode.
+Supersedes the 35B rows in the table above and the earlier per-commit notes for
+the commits named here. Decode tok/s, mean±sd; prefill shown as range (short
+bench prompt):
+
+| Run | Commit | 35B MTP dyn | 35B no-MTP | 35B prefill |
+|---|---|---|---|---|
+| A | `878a33fea` baseline | 18.18±0.40 | 14.14 | 24.0–24.7 |
+| B | `144ece037` +2,519-key overlay table | 17.45±0.21 | 13.27 | 22.6–22.8 |
+| C | `268cd81de` + pooled bundle (still carries B's overlays) | 27.19±0.18 | 20.48 | 37.1–37.8 |
+
+- 27B dense: at C MTP dyn 4.24–4.25 vs no-MTP 4.49–4.62 (−7…−8%) — see idea 14
+  for the depth-controller finding. At A: MTP 4.20 vs no-MTP 4.51.
+- C true no-MTP stage timings: `MOE_EXPERT_FFN` **274 µs/call**, fused router
+  bundle **176 µs/call** (16 projections, K=2048).
+- B vs A: overlays regress end to end (~−4% MTP, −6% no-MTP, −7% prefill) —
+  see idea 12. C vs B: pooled bundle gains +56% MTP, +54% no-MTP, +65%
+  prefill. MTP gain over no-MTP at C: **+32.8%**.
 - See `17-gb10-decode-bandwidth-gap.md` for the bandwidth-gap analysis.

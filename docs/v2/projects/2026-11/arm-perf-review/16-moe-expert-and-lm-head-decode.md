@@ -1,7 +1,12 @@
 # Idea 16 — MoE routed experts, GDN projection and LM head in CPU decode
 
 Status: **Open**. The measured attribution is in `00-measured-baseline.md`;
-the bundle part is addressed by `408ff90e5`.
+**the bundle part is closed** — `408ff90e5` is verified end to end
+(2026-11-08): router bundle 668→176 µs/call (16 projections, K=2048),
+`MOE_EXPERT_FFN` 803→274 µs/call, 35B MTP dyn 17.45→27.19 (+56%), no-MTP
+13.27→20.48 (+54%). Remaining in this idea: GDN (394 µs × ~30 layers ≈ 12 ms,
+now the largest stage), LM head 5.7 ms/token, shared expert, and the grouped
+verifier economics (idea 18).
 
 ## Finding (35B-A3B, GB10, MTP off, per decode step of about 75 ms)
 
