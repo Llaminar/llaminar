@@ -99,3 +99,21 @@ another schedule heuristic.
   in-team path (measured separately, idea 13 caveat).
 - Next: typed placement mechanism implementation (fastest-class width +
   task-count cap, CLI flag, PerfStats counter) — pending window measurement.
+
+## Typed placement implemented (2026-11-08, 56158b57a)
+
+- CPUWorkerPlacement = core-free authority; binding publishes the
+  fastest-class width by MIDR (capacity fallback; GB10 → 10).
+- `--cpu-decode-placement auto|all-workers|fastest-class`: auto never wakes
+  more workers than independent tasks; fastest-class additionally limits
+  single-row decode to the fastest class and fails at startup without the
+  bound layout. Applies to STANDALONE regions only (C7) via
+  OMP_WORKSHARE_REGION_WIDTH. PerfStats `cpu_native_neon_team_placement`.
+- Config document omits auto → existing plans/expected_config stay
+  byte-identical; explicit values round-trip.
+- Tests (all green on .80, preflight): V2_Integration_CPUWorkerPlacement,
+  V2_Integration_CPUNativeNEONTypedPlacement (byte equality across
+  placements), MIDR class counting on recorded GB10 layout, parser round trip.
+- OPEN QUESTION: `auto` default changes behaviour (task cap) before any engine
+  measurement — window 2 (all-workers vs auto vs fastest-class, 35B/27B MTP
+  off/dyn) decides whether auto keeps the cap / adopts fastest-class.

@@ -62,3 +62,12 @@ Main reviewed and cherry-picked a7f719dfb; PR #43 is now a7f719dfb (same
 commit object, fast-forward). Local pass: OpenMPCapacityOrderedCorePlaces,
 MPIBootstrap*, OpenMPIdleSpinPolicy. The i8mm lane rebases onto a7f719dfb and
 drops its binding commit; remaining tip goes to the gate.
+
+## Defect in the taken binding + fix (2026-11-08)
+
+a7f719dfb reads LLAMINAR_SELF_BOOTSTRAPPED/OMP_PLACES/OMP_PROC_BIND via
+std::getenv in MPIBootstrapPhase.cpp → fails the getenv-hygiene sanitizer
+(V2_Unit_Static_NoDirectGetenvOutsideDebugEnv, V2_Integration_
+HostServiceDebugEnvAuthority). Fix offered: ef19d19f1 (DebugEnv::envValue,
+3 lines, behaviour unchanged; clean cherry-pick onto 0868a5573). Expected
+gate set includes these two as base-class until Main takes the fix.
