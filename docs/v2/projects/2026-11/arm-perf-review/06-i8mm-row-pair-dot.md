@@ -207,7 +207,4 @@ Handoffs (rebased onto afe62c5ef, fork codex/i8mm-typed-placement):
   base binding commit).
 - Reviewer ACK does NOT transfer the de4535855 gate to the successor bytes —
   re-gate c24ce9b4e pending the lane's own Unit/preflight/I8MM run on .80.
-- Prefix-archive base failure resolved as ENVIRONMENTAL (no before-repro on
-  .80 under idle/spin/IO pressure; original failure coincided with a full
-  Release compile; 79c1f62ab does not regress — fix-by-inspection stands
-  pending Main's choice of reproducer).
+- Prefix-archive base item **CLOSED** (Main decision): 79c1f62ab accepted as a non-regressing fix proven by inspection only. The race is real (scheduleCompactionLocked silently absorbed a request during Copying/Publishing; the rewrite's finite tail copied superseded history; host pressure only stretches that window). No reproducer seam will be added (holding the archive advisory lock would deadlock writeBlock behind mutex_). Earlier 5/5 = host pressure + race. (Superseded: the .80 battery found no before-case repro — idle/spin/IO all pass both SHAs; that was part of the evidence.)
