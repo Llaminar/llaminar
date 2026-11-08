@@ -228,6 +228,12 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # Temporary draft-only probe; never report this as a completed test gate.
+    probe = parse_arguments(None)
+    for isa in probe.cpu_isas:
+        require_host_cpu_isa(isa)
+    print(f"Runner {os.environ.get('RUNNER_NAME')} admitted {','.join(probe.cpu_isas)}", flush=True)
+    raise SystemExit("Temporary matrix admission probe; full image/test execution intentionally not run.")
     try:
         raise SystemExit(main())
     except (ValueError, OSError, subprocess.SubprocessError) as error:
