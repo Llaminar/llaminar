@@ -206,6 +206,9 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # Temporary draft-only hardware probe: deliberately do not report a test pass.
+    subprocess.run(["lscpu"], check=True)
+    raise SystemExit("Hardware probe complete; Unit/host tests were intentionally not executed.")
     try:
         raise SystemExit(main())
     except (ValueError, OSError, subprocess.SubprocessError) as error:
