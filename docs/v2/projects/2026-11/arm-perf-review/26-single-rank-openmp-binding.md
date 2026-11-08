@@ -71,3 +71,12 @@ std::getenv in MPIBootstrapPhase.cpp → fails the getenv-hygiene sanitizer
 HostServiceDebugEnvAuthority). Fix offered: ef19d19f1 (DebugEnv::envValue,
 3 lines, behaviour unchanged; clean cherry-pick onto 0868a5573). Expected
 gate set includes these two as base-class until Main takes the fix.
+
+- Fix TAKEN by Main unchanged (as 12d3f23cd in PR #43 = 79c1f62ab): locally
+  passing NoDirectGetenvOutsideDebugEnv, HostServiceDebugEnvAuthority,
+  OpenMPCapacityOrderedCorePlaces, MPIBootstrap. The lane drops its copy on
+  rebase onto 79c1f62ab.
+- Main also fixed the PrefixArchiveBackgroundPublication base race at
+  79c1f62ab (worker records a compaction request arriving during
+  Copying/Publishing and schedules exactly one more rewrite after its own
+  publication; 18/18 + 20/20 pass in-container; .80 repeat-proof requested).
