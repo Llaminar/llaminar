@@ -36,6 +36,11 @@ captured bucket-pipeline overhead**, not kernel efficiency:
 - The host is currently with arm-sparks; do **not** schedule unilaterally.
   When a window opens, ping the Spark session to run it, then file the results
   here.
+- **In progress (2026-11-08 14:42, operator-approved, `.79` uncontested):**
+  `spark-cuda-spil` is running the trace now — nsys CUDA/NVTX + gpu_trace
+  stats on `arm-validation/0cdcecc3c-spills` (Release sm_121) with
+  Qwen3.8-Flash-Next-UD-Q4_K_XL, 2160-token prefill; ETA ~45–60 min. Results
+  will be filed into this idea (and idea 24) on arrival.
 
 ## Validation
 
