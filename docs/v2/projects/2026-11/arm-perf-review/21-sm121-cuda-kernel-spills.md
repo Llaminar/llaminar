@@ -1,7 +1,11 @@
 # Idea 21 — CUDA GB10 (sm_120/sm_121) kernel register spills under the zero-spill guard
 
-Status: **Open** (tracked follow-up for GB10 GPU support; CUDA side, not
-ARM-CPU — filed because the operator routes all perf findings here).
+Status: **Addressed** (2026-11-08 — the spill session fixed the CUDA
+register-pressure issue; fix is the stacked upstream PR `Llaminar/llaminar`
+**#44** (draft, base `feat/arm64-native-kernels`), linear tip **`09e14d3ae`**,
+whose content equals the local merged tree `a5412af30`; spill kernel files
+verified unchanged vs `be998fdec`). Remaining: upstream merge + live SM120/
+SM121 and joint-pool validation once the guard is clean.
 
 ## Finding (2026-11-08; evidence: K14-UMA-SM121-SPILLS-20261108)
 
