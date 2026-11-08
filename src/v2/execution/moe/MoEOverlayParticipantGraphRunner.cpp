@@ -4831,6 +4831,9 @@ namespace llaminar2
             std::uint64_t dispatch_wait_ns = 0u;
             std::uint64_t packet_prepare_ns = 0u;
             std::uint64_t expert_compute_ns = 0u;
+            std::uint64_t local_execute_ns = 0u;
+            std::uint64_t endpoint_post_service_ns = 0u; ///< Nested in local_execute_ns.
+            std::uint64_t joint_publication_ns = 0u;
             std::uint64_t return_publication_ns = 0u;
         };
         struct ArmedLane
@@ -5785,10 +5788,24 @@ namespace llaminar2
                                                       ? Clock::now()
                                                       : Clock::time_point{};
                 bool expert_compute_ok = layer.local_expert->execute(context_it->second);
+                const auto local_completed_at = collect_timeline ? Clock::now() : Clock::time_point{};
+                if (collect_timeline)
+                {
+                    layer_timing.local_execute_ns = static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            local_completed_at - expert_compute_begin).count());
+                    layer_timing.endpoint_post_service_ns =
+                        layer.local_expert->completedPostServiceNanoseconds();
+                }
                 std::optional<CPUExpertShardRouteCompletion> joint_completed;
                 if(expert_compute_ok && layer.joint_route_collective) {
+                    const auto joint_begin = collect_timeline ? Clock::now() : Clock::time_point{};
                     joint_completed=layer.joint_route_collective->executeOriginalJointPublication(
                         context_it->second,protocol,lane->identity,layer.stage_ordinal);
+                    if (collect_timeline)
+                        layer_timing.joint_publication_ns = static_cast<std::uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                Clock::now() - joint_begin).count());
                     expert_compute_ok=joint_completed.has_value();
                 }
                 const bool joint_contributor =
@@ -6922,6 +6939,24 @@ namespace llaminar2
                 record_layer_timeline(
                     "mapped_cpu_layer_return_publication",
                     sample.return_publication_ns);
+                // Child intervals overlap the existing expert-compute parent;
+                // post-service is additionally nested in local-execute. Publish
+                // only here, after terminal completion, never inside a layer.
+                auto child_tags = layer_tags;
+                child_tags["timing_semantics"] = "deferred_child_of_expert_compute";
+                for (const auto &[name, ns] : std::array{
+                         std::pair{"mapped_cpu_layer_local_execute", sample.local_execute_ns},
+                         std::pair{"mapped_cpu_layer_joint_publication", sample.joint_publication_ns}})
+                    if (ns > 0u)
+                        PerfStatsCollector::recordTimingNs("moe_overlay_participant_graph", name,
+                            ns, transaction_phase, "CPU", child_tags);
+                child_tags["timing_semantics"] = "deferred_postservice_nested_in_local_execute";
+                // Zero means this optional child observation was absent (for
+                // example an empty endpoint's early return), never a 1ns sample.
+                if (sample.endpoint_post_service_ns > 0u)
+                    PerfStatsCollector::recordTimingNs("moe_overlay_participant_graph",
+                        "mapped_cpu_layer_endpoint_post_service", sample.endpoint_post_service_ns,
+                        transaction_phase, "CPU", child_tags);
             }
         }
         return true;

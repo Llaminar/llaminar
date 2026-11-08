@@ -692,6 +692,38 @@ namespace llaminar2
             out << contents;
             return true;
         }
+        /** @brief Mutate the sole counter map for bound, ordinary and batched producers.
+         * @param key Original complete semantic key; no caller retains an accumulator.
+         * @param batch Actual observation count and summed value.
+         * @throws std::invalid_argument If an empty batch claims a nonzero value.
+         * @throws std::logic_error If an existing family requires sequence evidence.
+         * @throws std::overflow_error Before changing an existing overflowing count.
+         */
+        void addCounterObservationBatch(const PerfStatKey &key,
+            PerfStatsCollector::CounterObservationBatch batch)
+        {
+            if (batch.observations == 0)
+            {
+                if (batch.value != 0.0)
+                    throw std::invalid_argument("An empty counter observation batch has a nonzero value");
+                return;
+            }
+            if (!PerfStatsCollector::isDomainEnabled(key.domain))
+                return;
+            auto &s = state();
+            std::lock_guard<std::mutex> lock(s.mutex);
+            auto entry = s.records.try_emplace(key).first;
+            auto &record = entry->second;
+            if (record.sequence_word_count != 0u)
+                throw std::logic_error("PerfStats counter family omitted its lifecycle evidence");
+            if (batch.observations > std::numeric_limits<uint64_t>::max() - record.count)
+                throw std::overflow_error("PerfStats counter observation count overflow");
+            record.kind = PerfStatRecord::Kind::Counter;
+            record.count += batch.observations;
+            record.value += batch.value;
+            ++s.version;
+        }
+
     } // namespace
 
     /** @brief Stable metadata only; the collector owns all mutable accumulators. */
@@ -721,27 +753,7 @@ namespace llaminar2
     {
         if (!identity.impl_)
             throw std::invalid_argument("Counter identity has been moved from");
-        if (batch.observations == 0)
-        {
-            if (batch.value != 0.0)
-                throw std::invalid_argument("An empty counter observation batch has a nonzero value");
-            return;
-        }
-        const auto &key = identity.impl_->key;
-        if (!isDomainEnabled(key.domain))
-            return;
-        auto &s = state();
-        std::lock_guard<std::mutex> lock(s.mutex);
-        auto entry = s.records.try_emplace(key).first;
-        auto &record = entry->second;
-        if (record.sequence_word_count != 0u)
-            throw std::logic_error("PerfStats counter family omitted its lifecycle evidence");
-        if (batch.observations > std::numeric_limits<uint64_t>::max() - record.count)
-            throw std::overflow_error("PerfStats counter observation count overflow");
-        record.kind = PerfStatRecord::Kind::Counter;
-        record.count += batch.observations;
-        record.value += batch.value;
-        ++s.version;
+        addCounterObservationBatch(identity.impl_->key, batch);
     }
 
     bool PerfStatsCollector::isEnabled()
@@ -836,26 +848,17 @@ namespace llaminar2
         std::string device,
         Tags tags)
     {
-        if (!isDomainEnabled(domain))
-            return;
+        addCounter(std::move(domain), std::move(name),
+            CounterObservationBatch{.observations = 1u, .value = value},
+            std::move(phase), std::move(device), std::move(tags));
+    }
 
-        PerfStatKey key;
-        key.kind = PerfStatRecord::Kind::Counter;
-        key.domain = std::move(domain);
-        key.name = std::move(name);
-        key.phase = std::move(phase);
-        key.device = std::move(device);
-        key.tags = std::move(tags);
-
-        auto &s = state();
-        std::lock_guard<std::mutex> lock(s.mutex);
-        auto &record = s.records[key];
-        if (record.sequence_word_count != 0u)
-            throw std::logic_error("PerfStats counter family omitted its lifecycle evidence");
-        record.kind = PerfStatRecord::Kind::Counter;
-        record.count += 1;
-        record.value += value;
-        ++s.version;
+    void PerfStatsCollector::addCounter(std::string domain, std::string name,
+        CounterObservationBatch batch, std::string phase, std::string device, Tags tags)
+    {
+        const PerfStatKey key{PerfStatRecord::Kind::Counter, std::move(domain),
+            std::move(name), std::move(phase), std::move(device), std::move(tags)};
+        addCounterObservationBatch(key, batch);
     }
 
     /** @brief Shared collector mutation for both cold-bound and ordinary sequence counters.

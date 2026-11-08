@@ -12,7 +12,7 @@
  * block arithmetic; worksharing changes row ownership, never numerical order.
  * Publication provenance is revoked before mutation and becomes visible only
  * after the complete row workshare has joined. Optional worker diagnostics
- * observe completed work without controlling execution or allocating when off.
+ * observe completed quantization rows without controlling execution or allocating when off.
  * Serial workspace publication borrows no competing cache: setup moves its
  * declared physical backing into the kernel, which keeps that address across
  * partial and repeated publication until the final owner retires.
@@ -805,40 +805,224 @@ namespace llaminar2
         return publishRouterQ8Hidden(source, rows, d_model);
     }
 
+    std::optional<CPUMoEKernel::RouterQ8ExpertMajorSchedule>
+    CPUMoEKernel::RouterQ8ExpertMajorSchedule::fromOriginalRoutes(
+        std::span<const int> source_rows,
+        std::span<int> retired_expert_to_local,
+        std::span<const int> original_to_local,
+        std::span<const int> local_to_expert,
+        int top_k,
+        std::optional<std::span<const int>> compact_source_rows,
+        int source_capacity)
+    {
+        const size_t rows = source_rows.size();
+        if (top_k <= 0 || source_capacity < 0 ||
+            rows > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+            rows != retired_expert_to_local.size() || rows != local_to_expert.size() ||
+            original_to_local.size() % static_cast<size_t>(top_k) != 0u)
+            return std::nullopt;
+        // Scratch is retired in-place. Reject every read/scratch overlap before
+        // even the first marker write; comparing integer address intervals also
+        // handles partial aliases between unrelated span views without C++
+        // relational comparisons between distinct allocations.
+        const auto scratch_overlaps = [&](std::span<const int> input)
+        {
+            if (retired_expert_to_local.empty() || input.empty())
+                return false;
+            constexpr auto limit = std::numeric_limits<std::uintptr_t>::max();
+            if (input.size() > limit / sizeof(int))
+                return true;
+            const auto scratch_begin = reinterpret_cast<std::uintptr_t>(retired_expert_to_local.data());
+            const auto input_begin = reinterpret_cast<std::uintptr_t>(input.data());
+            const auto scratch_bytes = retired_expert_to_local.size() * sizeof(int);
+            const auto input_bytes = input.size() * sizeof(int);
+            if (scratch_begin > limit - scratch_bytes || input_begin > limit - input_bytes)
+                return true;
+            return scratch_begin <= input_begin
+                ? input_begin - scratch_begin < scratch_bytes
+                : scratch_begin - input_begin < input_bytes;
+        };
+        if (scratch_overlaps(source_rows) || scratch_overlaps(original_to_local) ||
+            scratch_overlaps(local_to_expert) ||
+            (compact_source_rows && scratch_overlaps(*compact_source_rows)))
+            return std::nullopt;
+        const size_t compact_rows = original_to_local.size() / static_cast<size_t>(top_k);
+        if (compact_source_rows && compact_source_rows->size() != compact_rows)
+            return std::nullopt;
+        if (!compact_source_rows && compact_rows > static_cast<size_t>(source_capacity))
+            return std::nullopt;
+        const auto source_for_compact = [&](size_t row)
+        {
+            return compact_source_rows ? (*compact_source_rows)[row] : static_cast<int>(row);
+        };
+        for (size_t row = 0; row < compact_rows; ++row)
+        {
+            const int source = source_for_compact(row);
+            if (source < 0 || source >= source_capacity ||
+                (row > 0u && source_for_compact(row - 1u) >= source))
+                return std::nullopt;
+        }
+        // This inverse check proves the original scratch is a permutation,
+        // before it is retired. No new ownership/index buffer is introduced.
+        for (size_t destination = 0; destination < rows; ++destination)
+        {
+            const int local = retired_expert_to_local[destination];
+            if (local < 0 || static_cast<size_t>(local) >= rows ||
+                local_to_expert[static_cast<size_t>(local)] != static_cast<int>(destination))
+                return std::nullopt;
+        }
+        std::fill(retired_expert_to_local.begin(), retired_expert_to_local.end(), -1);
+        size_t assigned = 0u;
+        for (size_t row = 0; row < compact_rows; ++row)
+        {
+            const size_t begin = row * static_cast<size_t>(top_k);
+            int representative = -1;
+            for (int route = 0; route < top_k; ++route)
+            {
+                const int local = original_to_local[begin + static_cast<size_t>(route)];
+                if (local == -1)
+                    continue;
+                if (local < 0 || static_cast<size_t>(local) >= rows)
+                    return std::nullopt;
+                const int destination = local_to_expert[static_cast<size_t>(local)];
+                if (destination < 0 || static_cast<size_t>(destination) >= rows ||
+                    retired_expert_to_local[static_cast<size_t>(destination)] != -1 ||
+                    source_rows[static_cast<size_t>(destination)] != source_for_compact(row))
+                    return std::nullopt;
+                if (representative < 0)
+                    representative = destination;
+                retired_expert_to_local[static_cast<size_t>(destination)] = representative;
+                ++assigned;
+            }
+        }
+        if (assigned != rows)
+            return std::nullopt;
+        return RouterQ8ExpertMajorSchedule(source_rows, retired_expert_to_local);
+    }
+
     bool CPUMoEKernel::publishTransportedRouterQ8HiddenExpertMajor(
         const float *source,
         int source_rows,
         int d_model,
-        std::span<const int> expert_major_source_rows,
+        RouterQ8ExpertMajorSchedule schedule,
         std::span<Q8_1Block> destination)
     {
-        invalidateRouterQ8HiddenPublication();
-        if (expert_major_source_rows.empty() ||
-            expert_major_source_rows.size() >
-                static_cast<size_t>(std::numeric_limits<int>::max()))
+        const auto revoke_publication = [&]() { invalidateRouterQ8HiddenPublication(); };
+        OMP_SINGLE(revoke_publication);
+        const size_t rows = schedule.source_rows_.size();
+        if (d_model <= 0 || source_rows < 0 ||
+            rows != schedule.representatives_.size() ||
+            rows > static_cast<size_t>(std::numeric_limits<int>::max()))
             return false;
-        const bool published = quantizeRouterQ8Rows(
-            source,
-            source_rows,
-            d_model,
-            expert_major_source_rows.data(),
-            static_cast<int>(expert_major_source_rows.size()),
-            destination.data(),
-            destination.size());
-        if (published && PerfStatsCollector::isDomainEnabled("kernel"))
+        if (rows == 0u)
+            return true;
+        const size_t blocks = (static_cast<size_t>(d_model) + 31u) / 32u;
+        if (!source || source_rows == 0 || !destination.data() ||
+            rows > destination.size() / blocks)
+            return false;
+
+        size_t unique_rows = 0u;
+        for (size_t row = 0; row < rows; ++row)
         {
-            PerfStatsCollector::addCounter(
-                "kernel",
-                "cpu_moe_transport_router_q8_expert_major_publication_calls",
-                1.0,
-                "moe",
-                "cpu",
-                {{"source_rows", std::to_string(source_rows)},
-                 {"route_rows",
-                  std::to_string(expert_major_source_rows.size())},
-                 {"d_model", std::to_string(d_model)}});
+            const int source_row = schedule.source_rows_[row];
+            const int representative = schedule.representatives_[row];
+            if (source_row < 0 || source_row >= source_rows ||
+                representative < 0 || static_cast<size_t>(representative) >= rows ||
+                schedule.representatives_[static_cast<size_t>(representative)] != representative ||
+                schedule.source_rows_[static_cast<size_t>(representative)] != source_row)
+                return false;
+            if (static_cast<size_t>(representative) == row)
+                ++unique_rows;
         }
-        return published;
+
+        const size_t copy_rows = rows - unique_rows;
+        // Quantization and copying have distinct live work. Repeated expert
+        // indices must not make a four-source verifier open a large team merely
+        // because it has many destinations. Copy threshold is active Q8 bytes.
+        constexpr size_t kMinimumQuantizedValuesForTeam = 16384u;
+        constexpr size_t kMinimumCopiedBytesForTeam = 256u * 1024u;
+        // A collective caller already inside a team must retain worksharing
+        // even for tiny unique work. This opens no nested team and prevents
+        // every existing worker from repeating the serial stores.
+        const bool use_parallel = omp_in_parallel() || (omp_get_max_threads() > 1 &&
+            (unique_rows * static_cast<size_t>(d_model) >= kMinimumQuantizedValuesForTeam ||
+             copy_rows * blocks * sizeof(Q8_1Block) >= kMinimumCopiedBytesForTeam));
+        const bool observe_workers = PerfStatsCollector::isDomainEnabled("kernel");
+        const auto publish_worker_rows = [&](int completed_rows)
+        {
+            if (observe_workers && completed_rows > 0)
+                PerfStatsCollector::addCounter(
+                    "kernel", "cpu_moe_router_q8_worker_rows", completed_rows,
+                    "moe", "cpu", {{"rows", std::to_string(rows)},
+                    {"d_model", std::to_string(d_model)},
+                    {"worker", std::to_string(omp_get_thread_num())},
+                    {"workers", std::to_string(omp_get_num_threads())},
+                    {"layout", "indexed"}});
+        };
+        const auto quantize_row = [&](size_t row)
+        {
+            const float *input = source + static_cast<size_t>(schedule.source_rows_[row]) *
+                static_cast<size_t>(d_model);
+            Q8_1Block *output = destination.data() + row * blocks;
+            size_t block = 0;
+#if defined(__AVX512F__)
+            if (d_model % Q8_1Block::BLOCK_SIZE == 0)
+                for (; block + 1u < blocks; block += 2u)
+                    cpu::gpu_aligned_expert_q8::quantizeTwoBlocks(
+                        input + block * 32u, output[block], output[block + 1u]);
+#endif
+            for (; block < blocks; ++block)
+                cpu::gpu_aligned_expert_q8::quantizeBlock(
+                    input + block * 32u, output[block],
+                    std::min(32, d_model - static_cast<int>(block * 32u)));
+        };
+        const auto copy_row = [&](size_t row)
+        {
+            const size_t owner = static_cast<size_t>(schedule.representatives_[row]);
+            if (owner != row)
+                std::copy_n(destination.data() + owner * blocks, blocks,
+                            destination.data() + row * blocks);
+        };
+        if (use_parallel)
+        {
+            const auto work = [&]()
+            {
+                int completed_rows = 0;
+#pragma omp for schedule(static)
+                for (size_t row = 0; row < rows; ++row)
+                    if (schedule.representatives_[row] == static_cast<int>(row))
+                    {
+                        quantize_row(row);
+                        ++completed_rows;
+                    }
+                // The first workshare's implicit barrier publishes every root
+                // before any worker consumes one. Destinations remain disjoint.
+#pragma omp for schedule(static)
+                for (size_t row = 0; row < rows; ++row)
+                    copy_row(row);
+                publish_worker_rows(completed_rows);
+            };
+            OMP_WORKSHARE_REGION(work);
+        }
+        else
+        {
+            for (size_t row = 0; row < rows; ++row)
+                if (schedule.representatives_[row] == static_cast<int>(row))
+                    quantize_row(row);
+            for (size_t row = 0; row < rows; ++row)
+                copy_row(row);
+            publish_worker_rows(static_cast<int>(unique_rows));
+        }
+        const auto publish_call = [&]()
+        {
+            if (observe_workers)
+                PerfStatsCollector::addCounter(
+                    "kernel", "cpu_moe_transport_router_q8_expert_major_publication_calls",
+                    1.0, "moe", "cpu", {{"source_rows", std::to_string(source_rows)},
+                    {"route_rows", std::to_string(rows)}, {"d_model", std::to_string(d_model)}});
+        };
+        OMP_SINGLE(publish_call);
+        return true;
     }
 
     bool CPUMoEKernel::reserveRouterQ8HiddenCapacity(

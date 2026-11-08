@@ -201,6 +201,20 @@ namespace llaminar2
          */
         static void addCounter(const CounterIdentity &identity, CounterObservationBatch batch);
 
+        /** @brief Publish homogeneous live observations without allocating a bound identity.
+         * @param domain Existing collection domain.
+         * @param name Existing counter family.
+         * @param batch Original observation multiplicity and summed numeric increments.
+         * @param phase Existing execution phase.
+         * @param device Existing participant identity.
+         * @param tags Complete immutable semantic dimensions for this observation group.
+         * @details Uses the same collector map, filtering, reset, sequence-schema and
+         * count-overflow authority as setup-bound counters. No mutable record is retained.
+         */
+        static void addCounter(std::string domain, std::string name,
+            CounterObservationBatch batch, std::string phase = {},
+            std::string device = {}, Tags tags = {});
+
         static void addCounter(
             std::string domain,
             std::string name,

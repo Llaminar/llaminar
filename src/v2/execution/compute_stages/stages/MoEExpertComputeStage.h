@@ -799,6 +799,23 @@ namespace llaminar2
         bool bindSparseOverlayInvocation(
             const SparseOverlayInvocation &invocation);
 
+        /**
+         * @brief Borrow the completed CPU invocation's sorted unique expert IDs.
+         * @return Empty before completion, after reset/failure/empty work, and on GPU.
+         * The existing CPU route schedule owns the storage. The view is valid only
+         * until the next bind, execute or reset; it never owns residency or kernels.
+         */
+        std::span<const int> completedCPUActiveExpertIds() const noexcept
+        {
+            return cpu_active_expert_view_published_
+                ? std::span<const int>(cpu_grouped_active_experts_) : std::span<const int>{};
+        }
+        /** @brief Revoke only the last completed observation before packet reuse. */
+        void clearCompletedCPUActiveExpertView() noexcept
+        {
+            cpu_active_expert_view_published_ = false;
+            cpu_grouped_active_experts_.clear();
+        }
         bool execute(IDeviceContext *ctx) override;
         bool validatePreparedWeights(std::string *error) const override;
         ComputeStageType type() const override { return ComputeStageType::MOE_EXPERT_FFN; }
@@ -1207,6 +1224,7 @@ namespace llaminar2
          */
         void resetSessionState() override
         {
+            clearCompletedCPUActiveExpertView();
             IComputeStage::resetSessionState();
             runtime_grouped_decode_launch_state_prepared_ = false;
         }
@@ -1224,6 +1242,7 @@ namespace llaminar2
          */
         void invalidateKernelDynamicState() override
         {
+            clearCompletedCPUActiveExpertView();
             IMoEKernel *kernel =
                 params_.routed_pipeline_kernel_owner &&
                         params_.routed_pipeline_kernel_owner->kernel
@@ -1274,6 +1293,7 @@ namespace llaminar2
          */
         void resetSessionStatePreservingCapturedReplay() override
         {
+            clearCompletedCPUActiveExpertView();
             IComputeStage::resetSessionState();
         }
         StageBufferRequirements getBufferRequirements() const override;
@@ -1623,6 +1643,8 @@ namespace llaminar2
 
         /** @brief Ascending IDs of experts with at least one local route row. */
         mutable std::vector<int> cpu_grouped_active_experts_;
+        /** Completed-call observation validity; never a topology/execution decision. */
+        bool cpu_active_expert_view_published_ = false;
 
         /** @brief Gather indices reused for each complete expert batch. */
         mutable std::vector<int> cpu_grouped_token_indices_;

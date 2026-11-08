@@ -27,6 +27,7 @@
 #include <map>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <system_error>
 #include <tuple>
 #include <utility>
@@ -117,8 +118,30 @@ namespace llaminar2
                 target += "+" + value;
         }
 
-        /** @brief Add counters and timings from one observation into its aggregate row. */
-        void mergeRow(MoEExpertOverlayProfileRow &target, const MoEExpertOverlayProfileRow &row)
+        /**
+         * @brief Merge sorted evidence into its existing owned union storage.
+         * @param target Persistent sorted union, owned by the aggregate row.
+         * @param observed Borrowed sorted unique current observation.
+         * Only genuinely new IDs can grow capacity. Repeated/subset observations
+         * neither allocate an intermediate vector nor re-sort known evidence.
+         */
+        void mergeObservedExperts(std::vector<int> &target, std::span<const int> observed)
+        {
+            size_t frontier = 0u;
+            for (const int expert : observed)
+            {
+                const auto position = std::lower_bound(target.begin() + frontier,
+                    target.end(), expert);
+                const size_t offset = static_cast<size_t>(position - target.begin());
+                if (position == target.end() || *position != expert)
+                    target.insert(position, expert);
+                frontier = offset + 1u;
+            }
+        }
+
+        /** @brief Add an observation while retaining exact sorted expert-union semantics. */
+        void mergeRow(MoEExpertOverlayProfileRow &target, const MoEExpertOverlayProfileRow &row,
+                      std::span<const int> observed_experts)
         {
             mergeTextField(target.domain_kind, row.domain_kind);
             mergeTextField(target.backend, row.backend);
@@ -134,17 +157,7 @@ namespace llaminar2
             target.domain_reduce_ms += row.domain_reduce_ms;
             target.cross_domain_reduce_ms += row.cross_domain_reduce_ms;
             target.participant_count = std::max(target.participant_count, row.participant_count);
-            std::vector<int> expert_union;
-            expert_union.reserve(
-                target.observed_expert_ids.size() +
-                row.observed_expert_ids.size());
-            std::set_union(
-                target.observed_expert_ids.begin(),
-                target.observed_expert_ids.end(),
-                row.observed_expert_ids.begin(),
-                row.observed_expert_ids.end(),
-                std::back_inserter(expert_union));
-            target.observed_expert_ids = std::move(expert_union);
+            mergeObservedExperts(target.observed_expert_ids, observed_experts);
             mergeTextField(target.transport_mode, row.transport_mode);
             mergeTextField(target.final_reduce_mode, row.final_reduce_mode);
             mergeTextField(target.accumulation_path, row.accumulation_path);
@@ -368,7 +381,7 @@ namespace llaminar2
         ProfileKey key = profileKey(row);
         const auto existing = s.row_index.find(key);
         if (existing != s.row_index.end())
-            mergeRow(s.rows[existing->second], row);
+            mergeRow(s.rows[existing->second], row, row.observed_expert_ids);
         else
         {
             s.row_index.emplace(std::move(key), s.rows.size());
@@ -754,6 +767,48 @@ namespace llaminar2
         row.observed_expert_ids = std::move(unique_expert_ids);
         row.accumulation_path = is_cpu ? "CPU" : "GPU";
         recordRow(std::move(row));
+    }
+
+    void MoEExpertOverlayProfiler::recordGraphNativeCPUExpertSorted(
+        int layer, int tier_index, int participant_id, const std::string &device_key,
+        size_t inbound_rows, size_t active_routes, size_t output_rows,
+        std::span<const int> unique_expert_ids, double compute_ms)
+    {
+        if (!isEnabled()) return;
+        int previous = -1;
+        for (const int expert : unique_expert_ids)
+        {
+            if (expert <= previous)
+                throw std::invalid_argument("Completed CPU expert view must be sorted, unique and nonnegative");
+            previous = expert;
+        }
+        MoEExpertOverlayProfileRow row;
+        row.phase = "gn_local_expert";
+        row.layer = layer; row.tier_index = tier_index; row.participant_id = participant_id;
+        row.domain = device_key.empty() ? "unknown" : device_key;
+        row.domain_kind = "CPU";
+        row.selected_rows = output_rows; row.inbound_rows = inbound_rows;
+        row.routed_entries = active_routes; row.active_routes = active_routes;
+        row.assigned_experts = static_cast<int>(unique_expert_ids.size());
+        row.resident_experts = row.assigned_experts; row.compute_ms = compute_ms;
+        row.transport_mode = "local"; row.cpu_fallback_rows = output_rows;
+        row.accumulation_path = "CPU";
+        recordUnified(row);
+        auto &s = state();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        ProfileKey key = profileKey(row);
+        const auto existing = s.row_index.find(key);
+        if (existing != s.row_index.end())
+            mergeRow(s.rows[existing->second], row, unique_expert_ids);
+        else
+        {
+            // The aggregate must own a new key's evidence. Borrowing ends here;
+            // reset/new-key allocation semantics are intentionally unchanged.
+            row.observed_expert_ids.assign(unique_expert_ids.begin(), unique_expert_ids.end());
+            s.row_index.emplace(std::move(key), s.rows.size());
+            s.rows.push_back(std::move(row));
+        }
+        ++s.version;
     }
 
     void MoEExpertOverlayProfiler::recordGraphNativeReturnReduce(

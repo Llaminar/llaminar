@@ -1842,6 +1842,12 @@ foreach(V2_ROUTER_Q8_ISA AVX2 AVX512)
         LABELS "V2;Integration;ProductionTestPreflight;CPU;MoE;MTP;AllFormats;${V2_ROUTER_Q8_ISA};ByteExact;Regression"
         MPI_PROCS 1 NO_MODELS NO_MPI
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_ROUTER_Q8_RUNTIME_ISA};LLAMINAR_PERF_STATS_JSON=1;LLAMINAR_PERF_STATS_FILTER=kernel.cpu_moe_router_q8_worker_rows")
+    add_v2_test(V2_Integration_CPURouterQ8UniqueLiveSourceReplay_${V2_ROUTER_Q8_ISA}
+        COMMAND $<TARGET_FILE:v2_test_cpu_router_q8_publication> --gtest_brief=1
+            --gtest_filter=CPURouterQ8Publication.UniqueLiveSourceReplay:CPURouterQ8Publication.InvalidOriginalRoutesRejectBeforeWrites:CPURouterQ8Publication.UniqueLiveSourceQuantizesOnce:CPURouterQ8Publication.MetadataAliasesRejectBeforeScratchMutation:CPURouterQ8Publication.TinyNestedTeamReplayIsByteExactAndQuantizesOnce
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;MoE;MTP;AllFormats;${V2_ROUTER_Q8_ISA};ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS NO_MPI
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_ROUTER_Q8_RUNTIME_ISA};LLAMINAR_PERF_STATS_JSON=1;LLAMINAR_PERF_STATS_FILTER=kernel.cpu_moe_router_q8_worker_rows")
 endforeach()
 
 # Test: fixed-slot serial/MTP ExpertOverlay transaction scheduling protocol
@@ -4184,6 +4190,19 @@ add_v2_test(V2_Integration_ReleaseTestTargetSelection
         --cmake ${CMAKE_COMMAND} --ninja ${CMAKE_MAKE_PROGRAM}
     LABELS "V2;Integration;ProductionTestPreflight;BuildSystem;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+# Actual included modules must obey the same Release/Integration target policy.
+foreach(_native_module_selection_kind Unit Integration)
+    set(_native_module_selection_labels "V2;${_native_module_selection_kind};BuildSystem;Regression;DeviceFree")
+    if(_native_module_selection_kind STREQUAL "Integration")
+        list(APPEND _native_module_selection_labels ProductionTestPreflight)
+    endif()
+    add_v2_test(V2_${_native_module_selection_kind}_NativeModuleReleaseSelection
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_test_module_selection.py
+            --cmake ${CMAKE_COMMAND} --ninja ${CMAKE_MAKE_PROGRAM}
+        LABELS ${_native_module_selection_labels}
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+endforeach()
 add_v2_test(V2_Integration_PooledReleaseTargetSelection
     COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_test_target_selection.py
@@ -18120,6 +18139,18 @@ foreach(V2_FUSED_COMPLETION_ISA AVX2 AVX512)
         continue()
     endif()
     string(TOLOWER "${V2_FUSED_COMPLETION_ISA}" V2_FUSED_COMPLETION_RUNTIME_ISA)
+    add_v2_test(V2_Integration_CPU_NativeVNNIFusedProjectionEvidenceIdentity_${V2_FUSED_COMPLETION_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_fused_completion>
+            --gtest_filter=CPUNativeVNNIFusedCompletion.ProjectionEvidenceUsesGeometryAndPolicyInsteadOfBundleOrdinal
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeVNNI;PerfStats;Economy;Lifecycle;${V2_FUSED_COMPLETION_ISA};ByteExact;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=2")
+    add_v2_test(V2_Integration_CPU_NativeVNNIOrderedNibbleReplay_${V2_FUSED_COMPLETION_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_fused_completion>
+            --gtest_filter=CPUNativeVNNIFusedCompletion.GPUAlignedOrderedNibbleAllFormatReplay
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeVNNI;AllFormats;MoE;Prefill;Decode;${V2_FUSED_COMPLETION_ISA};ByteExact;Replay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=4" "OMP_DYNAMIC=false")
     add_v2_test(V2_Integration_CPU_NativeVNNIFusedCompletion_${V2_FUSED_COMPLETION_ISA}
         COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_fused_completion> --gtest_brief=1
         LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeVNNI;MTP;AllFormats;${V2_FUSED_COMPLETION_ISA};ByteExact;Regression"
@@ -18511,6 +18542,27 @@ add_executable(v2_perf_cpu_fused_verifier
 target_link_libraries(v2_perf_cpu_fused_verifier PRIVATE
     llaminar2_core GTest::gtest GTest::gtest_main)
 target_include_directories(v2_perf_cpu_fused_verifier PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+# The existing fixture proves real aligned output geometry while retaining its
+# independent padded guard replays. Keep this model-free correctness slice
+# distinct from Performance labels and from any measured-throughput claim.
+if(NOT V2_PERF_TESTS_ONLY)
+    foreach(_layout_isa AVX2 AVX512)
+        if(_layout_isa STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+            continue()
+        endif()
+        string(TOLOWER "${_layout_isa}" _layout_runtime_isa)
+        foreach(_layout_slice gate down)
+            set(_layout_test V2_Integration_CPU_NativeVNNIFusedProjectionLayout_${_layout_slice}_${_layout_isa})
+            add_v2_test(${_layout_test}
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/integration/scripts/test_cpu_fused_fixture_layout.py
+                    --binary $<TARGET_FILE:v2_perf_cpu_fused_verifier>
+                    --slice ${_layout_slice} --isa ${_layout_runtime_isa}
+                LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;NativeVNNI;MoE;Prefill;Layout;ByteExact;Regression;${_layout_isa}"
+                MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+        endforeach()
+    endforeach()
+endif()
+
 add_v2_test(V2_Perf_CPUFusedVerifier
     COMMAND $<TARGET_FILE:v2_perf_cpu_fused_verifier>
     LABELS "V2;Performance;CPU;NativeVNNI;MTP;AllFormats"
@@ -27045,6 +27097,21 @@ add_v2_test(V2_Integration_GroupedVerifierRows_CPU_MoEExpertPaths
     MPI_PROCS 1
 )
 
+# This reuses the actual all-format stage replay; transported rows additionally
+# prove the native slot permutation can be retired/rebuilt between invocations.
+foreach(V2_ROUTER_Q8_STAGE_ISA AVX2 AVX512)
+    if(V2_ROUTER_Q8_STAGE_ISA STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+        continue()
+    endif()
+    string(TOLOWER "${V2_ROUTER_Q8_STAGE_ISA}" V2_ROUTER_Q8_STAGE_RUNTIME_ISA)
+    add_v2_test(V2_Integration_CPURouterQ8UniqueSourceStageReplay_${V2_ROUTER_Q8_STAGE_ISA}
+        COMMAND $<TARGET_FILE:v2_test_moe_expert_compute_stage> --gtest_brief=1
+            --gtest_filter=MoEExpertComputeStageTest.MoEFFN_RuntimeMVerifierMatchesSerialDecode_AllNativeFormatsRouterQ8Reuse
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;MoE;MTP;AllFormats;${V2_ROUTER_Q8_STAGE_ISA};ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS NO_MPI
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_ROUTER_Q8_STAGE_RUNTIME_ISA}")
+endforeach()
+
 # Performance: production-shaped CPU MoE verifier expert transaction.
 add_executable(v2_perf_cpu_moe_expert_verifier_rows
     performance/kernels/moe/Perf__CPUMoEExpertVerifierRows.cpp)
@@ -33963,7 +34030,7 @@ if(NOT V2_PERF_TESTS_ONLY)
 # Definitions belong before inventory's selection-only span.
 add_v2_test(V2_Integration_PerfStatsBoundCounterIdentity
     COMMAND $<TARGET_FILE:v2_test_perf_stats_collector>
-        --gtest_filter=PerfStatsCollector.BoundCounterIdentityUsesCurrentEpochAndCollectionPolicy
+        --gtest_filter=PerfStatsCollector.BoundCounterIdentityUsesCurrentEpochAndCollectionPolicy:PerfStatsCollector.OrdinaryCounterBatchesPreserveMultiplicityAndEpoch
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;PerfStats;Regression"
     MPI_PROCS 1 NO_MODELS NO_MPI TIMEOUT 30)
 # Append only after the main V2_PRODUCTION_TEST_PREFLIGHT_TESTS set.
@@ -36262,6 +36329,46 @@ foreach(_exact_rows_backend IN ITEMS CUDA ROCm)
         endif()
     endforeach()
 endforeach()
+
+
+# These CPU aliases are declared above the main preflight inventory. Append
+# them here after its set() so that the explicit suite retains every regression.
+if(NOT V2_PERF_TESTS_ONLY)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_NativeModuleReleaseSelection)
+    foreach(_cpu_checkpoint_isa AVX2 AVX512)
+        if(_cpu_checkpoint_isa STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+            continue()
+        endif()
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+            V2_Integration_CPURouterQ8UniqueLiveSourceReplay_${_cpu_checkpoint_isa}
+            V2_Integration_CPURouterQ8UniqueSourceStageReplay_${_cpu_checkpoint_isa}
+            V2_Integration_CPU_NativeVNNIFusedProjectionEvidenceIdentity_${_cpu_checkpoint_isa}
+            V2_Integration_CPU_NativeVNNIOrderedNibbleReplay_${_cpu_checkpoint_isa}
+            V2_Integration_CPU_NativeVNNIFusedProjectionLayout_gate_${_cpu_checkpoint_isa}
+            V2_Integration_CPU_NativeVNNIFusedProjectionLayout_down_${_cpu_checkpoint_isa})
+    endforeach()
+endif()
+
+# Completed CPU expert observation and exact profiler/reset equivalence.
+if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_unit_moe_graph_native_profiling_metrics)
+    add_v2_test(V2_Integration_CPUExpertProfilerSortedSpanLifecycle
+        COMMAND $<TARGET_FILE:v2_unit_moe_graph_native_profiling_metrics>
+            --gtest_filter=Test__MoEGraphNativeProfilingMetrics.SortedCPUExpertSpan*
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;Profiler;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUExpertProfilerSortedSpanLifecycle)
+endif()
+if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_test_moe_expert_compute_stage)
+    add_v2_test(V2_Integration_CPUCompletedExpertViewLifecycle
+        COMMAND $<TARGET_FILE:v2_test_moe_expert_compute_stage>
+            --gtest_filter=MoEExpertComputeStageTest.CompletedCPUExpertViewLifecycle
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;Profiler;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCompletedExpertViewLifecycle)
+endif()
 
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)
     if(NOT TEST ${V2_PREFLIGHT_TEST})

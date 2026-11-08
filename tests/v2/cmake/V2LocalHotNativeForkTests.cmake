@@ -1,5 +1,12 @@
 # @file V2LocalHotNativeForkTests.cmake
 # @brief Exact native imported/owned parent forks with no auxiliary executable or model authority.
+# Release deliberately owns only performance targets. Keep functional target
+# creation, source/property mutations and registration under the same policy.
+# Integration still executes every declaration and rejects missing owners.
+if(V2_PERF_TESTS_ONLY)
+    return()
+endif()
+
 if(HAVE_CUDA OR HAVE_ROCM)
     add_executable(v2_integration_local_hot_native_fork EXCLUDE_FROM_ALL
         integration/transfer/Test__LocalHotNativeParentFork.cpp)

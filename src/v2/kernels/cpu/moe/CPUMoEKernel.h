@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include <optional>
 #include "../../IMoEKernel.h"
 #include "../CPUKernelBase.h"
 #include "../../../tensors/BlockStructures.h"
@@ -223,33 +224,72 @@ namespace llaminar2
             int d_model);
 
         /**
-         * @brief Publish transported rows directly in expert-major route order.
+         * @brief Invocation borrow authenticated by original compact routing maps.
          *
-         * A heterogeneous CPU endpoint already knows its stable expert-major
-         * route schedule before it prepares NativeVNNI input. Materializing a
-         * row-major Q8_1 tensor and then gathering those same bytes performs an
-         * avoidable second activation pass. This transport-specific operation
-         * applies the canonical Q8_1 transform directly into caller-owned
-         * expert-major storage. Repeated source indices deliberately produce
-         * repeated byte-identical rows; no quantized value is shared or
-         * arithmetically combined.
+         * Construction consumes the retired expert-to-local permutation as
+         * scratch. The original route map and its inverse prove one destination
+         * for each owned route. Distinct ordered compact source IDs then imply
+         * one representative per source without quadratic duplicate searches.
+         * Borrowed maps must remain immutable until synchronous publication
+         * returns; the stage's serial invocation lease owns that lifetime.
+         */
+        class RouterQ8ExpertMajorSchedule
+        {
+        public:
+            /**
+             * @brief Derive unique representatives from the original route authority.
+             * @param source_rows Authoritative source index for each live destination.
+             * @param retired_expert_to_local Original permutation, overwritten by representatives;
+             *        must not overlap any of the read-only metadata spans.
+             * @param original_to_local Original compact row/top-k slot to local slot, or -1.
+             * @param local_to_expert Inverse local-slot to expert-major destination map.
+             * @param top_k Original positive route width.
+             * @param compact_source_rows Ordered distinct source IDs, or nullopt for identity rows.
+             * @param source_capacity Admitted source extent, never the quantization work count.
+             * @return A validated invocation borrow, or nullopt before any payload write.
+             * @details Work is linear in the live original slots and destinations.
+             */
+            static std::optional<RouterQ8ExpertMajorSchedule> fromOriginalRoutes(
+                std::span<const int> source_rows,
+                std::span<int> retired_expert_to_local,
+                std::span<const int> original_to_local,
+                std::span<const int> local_to_expert,
+                int top_k,
+                std::optional<std::span<const int>> compact_source_rows,
+                int source_capacity);
+        private:
+            friend class CPUMoEKernel;
+            /** @brief Retain only validated const invocation borrows. */
+            RouterQ8ExpertMajorSchedule(std::span<const int> sources,
+                                       std::span<const int> representatives)
+                : source_rows_(sources), representatives_(representatives) {}
+            std::span<const int> source_rows_;
+            std::span<const int> representatives_;
+        };
+
+        /**
+         * @brief Quantize each live source once into its final expert-major owner.
          *
-         * This method revokes any ordinary row-major publication owned by this
-         * kernel. It is not a fallback for a missing CPU router publication;
-         * only a stage with the typed transported-row policy may call it.
+         * Revokes ordinary row-major publication. The first workshare produces
+         * representative rows; its barrier precedes disjoint duplicate copies.
+         * No inactive source-capacity row or unused destination block is read
+         * or written, and no temporary payload/allocation is needed. Inside
+         * an active OpenMP team every member calls this boundary collectively;
+         * tiny publications reuse that team rather than replaying serial stores.
          *
-         * @param source Authoritative contiguous transported FP32 rows.
-         * @param source_rows Number of valid rows in @p source.
-         * @param d_model Logical FP32 values per source row.
-         * @param expert_major_source_rows Source row index for each output row.
-         * @param destination Caller-owned expert-major Q8_1 block storage.
-         * @return True after every selected row is published exactly once.
+         * @param source Authoritative transported FP32 row base.
+         * @param source_rows Admitted source-row capacity, used only for bounds.
+         * @param d_model Logical values per source row.
+         * @param schedule Exact live source and representative destination maps.
+         * @param destination Caller-owned expert-major Q8 block storage.
+         * @return True for a complete publication or empty live schedule; false
+         *         for malformed input before any destination byte is written.
          */
         bool publishTransportedRouterQ8HiddenExpertMajor(
             const float *source,
             int source_rows,
             int d_model,
-            std::span<const int> expert_major_source_rows,
+            RouterQ8ExpertMajorSchedule schedule,
             std::span<Q8_1Block> destination);
 
         /**

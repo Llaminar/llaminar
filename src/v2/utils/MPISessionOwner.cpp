@@ -6,6 +6,8 @@
  * parent/subreaper relationship. It releases only its fresh private directories
  * after waitpid proves all children retired, including singleton MPI daemons.
  * Actual frontend entrypoints enter this ancestor before runtime initialization.
+ * Child creation inherits the existing admitted OpenMP partition, never the
+ * initial thread's single place or an independently widened host CPU domain.
  * Missing roots retire only through original-FD zero-link proof after consumer exit.
  * No PID-name matching, shared /tmp sweep, model state or accelerator API is used.
  */
@@ -14,6 +16,7 @@
 #endif
 #include "utils/MPISessionOwner.h"
 #include "utils/MPISessionEnvironment.h"
+#include "utils/ScopedOpenMPPartitionAffinity.h"
 #include <dlfcn.h>
 #include <array>
 #include <algorithm>
@@ -632,6 +635,11 @@ namespace
                 if(original>=0)require(::posix_spawn_file_actions_adddup2(&actions,original,target));
                 else require(::posix_spawn_file_actions_addclose(&actions,target));
             }
+            // OpenMP may have bound this launcher thread before main(). A new
+            // executable must inherit the admitted partition, so its runtime
+            // can place workers within that domain. Restore only this caller
+            // after spawn; the existing partition is the sole placement owner.
+            const ScopedOpenMPPartitionAffinity child_partition;
             if(executable.empty())result=::posix_spawnp(&pid,argv[0],&actions,&attributes,argv.data(),environ);
             else result=::posix_spawn(&pid,executable.c_str(),&actions,&attributes,argv.data(),environ);
         } catch (...) {

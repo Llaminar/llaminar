@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -264,6 +265,28 @@ namespace llaminar2
             size_t output_rows,
             std::vector<int> unique_expert_ids,
             double compute_ms);
+
+        /**
+         * @brief Consume a completed CPU stage's borrowed sorted unique IDs.
+         * @param layer Original model layer.
+         * @param tier_index Original routed tier.
+         * @param participant_id Original participant identity.
+         * @param device_key Original backend/device label.
+         * @param inbound_rows Exact sparse input rows.
+         * @param active_routes Completed mask-eligible routes.
+         * @param output_rows Exact logical return rows.
+         * @param unique_expert_ids Strictly increasing, nonnegative completed IDs;
+         *        borrowed only for this synchronous call and never retained.
+         * @param compute_ms Existing completed compute measurement.
+         * Existing aggregate ownership/reset semantics remain unchanged. A new
+         * key or genuine union capacity growth may allocate; repeated subsets
+         * need neither a temporary expert vector nor sorting.
+         */
+        static void recordGraphNativeCPUExpertSorted(
+            int layer, int tier_index, int participant_id,
+            const std::string &device_key, size_t inbound_rows,
+            size_t active_routes, size_t output_rows,
+            std::span<const int> unique_expert_ids, double compute_ms);
 
         /**
          * @brief Record compact result return and root-side deterministic scatter/reduction.

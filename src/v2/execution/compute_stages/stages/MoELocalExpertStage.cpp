@@ -1771,6 +1771,9 @@ namespace llaminar2
 
     void MoELocalExpertStage::resetDeferredInvocation() noexcept
     {
+        last_post_service_ns_ = 0u;
+        if (retained_cpu_compute_stage_)
+            retained_cpu_compute_stage_->clearCompletedCPUActiveExpertView();
         deferred_residency_bank_.reset();
         pending_deferred_replay_ = nullptr;
         deferred_lifecycle_ = DeferredLifecycle::Idle;
@@ -2720,6 +2723,9 @@ namespace llaminar2
     bool MoELocalExpertStage::executePacketOnCurrentThread(
         IDeviceContext *ctx)
     {
+        last_post_service_ns_ = 0u;
+        if (retained_cpu_compute_stage_)
+            retained_cpu_compute_stage_->clearCompletedCPUActiveExpertView();
         if (!validateDeviceContext(ctx, params_.device_id, "MoELocalExpertStage"))
             return false;
         if (deferred_lifecycle_ != DeferredLifecycle::Idle)
@@ -4344,8 +4350,10 @@ namespace llaminar2
         output.live_row_count = params_.cpu_joint_route_producer?0u:
             (canonical_packet?active_routes_.size():output_input_rows_.size());
 
+        const bool post_service_timing_enabled =
+            PerfStatsCollector::isDomainEnabled("moe_overlay_participant_graph");
         const auto service_completed_at =
-            economy_timing_enabled || endpoint_detail_enabled
+            economy_timing_enabled || endpoint_detail_enabled || post_service_timing_enabled
                 ? std::chrono::steady_clock::now()
                 : std::chrono::steady_clock::time_point{};
         if (economy_timing_enabled)
@@ -4425,7 +4433,17 @@ namespace llaminar2
                 });
         }
 
-        if (profiling_enabled)
+        if (profiling_enabled && params_.device_id.is_cpu())
+        {
+            if (!retained_cpu_compute_stage_)
+                throw std::logic_error("Completed CPU endpoint lost its retained compute owner");
+            MoEExpertOverlayProfiler::recordGraphNativeCPUExpertSorted(
+                params_.layer_idx, input.key.tier_idx, params_.runtime_participant_index,
+                params_.device_id.to_string(), input.live_row_count, active_routes_.size(),
+                output.live_row_count, retained_cpu_compute_stage_->completedCPUActiveExpertIds(),
+                compute_ms);
+        }
+        else if (profiling_enabled)
         {
             std::set<int> active_expert_ids;
             for (const auto &route : active_routes_)
@@ -4566,6 +4584,12 @@ namespace llaminar2
                  {"transport", "local"}});
         }
         resetDeferredInvocation();
+        if (post_service_timing_enabled)
+        {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - service_completed_at).count();
+            last_post_service_ns_ = elapsed > 0 ? static_cast<std::uint64_t>(elapsed) : 0u;
+        }
         return true;
     }
 

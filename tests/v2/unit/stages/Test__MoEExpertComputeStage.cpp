@@ -1716,14 +1716,20 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_All
                            int run_seq,
                            bool verifier_rows,
                            const std::vector<bool> *run_expert_mask,
-                           TensorBase *run_canonical_routes = nullptr)
+                           TensorBase *run_canonical_routes = nullptr,
+                           CPURouterQ8InputPublicationPolicy input_policy =
+                               CPURouterQ8InputPublicationPolicy::RequireRouterStage,
+                           int replays = 1)
         {
             MoEExpertComputeStage::Params params;
             params.device_id = DeviceId::cpu();
             params.input = run_input;
             params.routing_indices = run_indices;
             params.routing_weights = run_weights;
-            params.routed_pipeline_kernel_owner = kernel_owner;
+            params.routed_pipeline_kernel_owner = input_policy ==
+                CPURouterQ8InputPublicationPolicy::RequireRouterStage
+                    ? kernel_owner : nullptr;
+            params.cpu_router_q8_input_publication = input_policy;
             params.expert_gate_views = gate_views;
             params.expert_up_views = up_views;
             params.expert_down_views = down_views;
@@ -1764,7 +1770,10 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_All
             ExpertGemmRegistry params_registry;publishCPUExpertStageRegistryForTest(params,params_registry);
             MoEExpertComputeStage stage(params);
             auto workspace = bindExpertWorkspace(stage, params);
-            return stage.execute(cpu_ctx_.get());
+            for (int replay = 0; replay < replays; ++replay)
+                if (!stage.execute(cpu_ctx_.get()))
+                    return false;
+            return true;
         };
 
         constexpr int owner_participants = 2;
@@ -2035,6 +2044,22 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_All
                 /*verifier_rows=*/false,
                 /*run_expert_mask=*/nullptr));
 
+            if (seq == 3)
+            {
+                // Exercise the actual stage's retained slot-map lifetime in
+                // every source family. Repeating the SAME stage proves the
+                // next invocation rebuilds a permutation after its previous
+                // native call reused those integers as source representatives.
+                auto transported = TestTensorFactory::createFP32(
+                    {static_cast<size_t>(seq), static_cast<size_t>(d)});
+                ASSERT_TRUE(run_moe(input.get(), grouped_routing.indices.get(),
+                    grouped_routing.weights.get(), grouped_routing.kernel_owner,
+                    transported.get(), seq, true, nullptr, nullptr,
+                    CPURouterQ8InputPublicationPolicy::PublishTransportedRows, 3));
+                expectRowsByteEqual(transported->data(), grouped_output->data(),
+                    seq, d, std::string("transported unique-source replay ") + format.label);
+            }
+
             for (int row = 0; row < seq; ++row)
             {
                 FP32Tensor row_input({1u, static_cast<size_t>(d)});
@@ -2127,6 +2152,18 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_All
                     seq,
                     /*verifier_rows=*/false,
                     &owner_mask));
+
+                if (seq == 3)
+                {
+                    auto transported = TestTensorFactory::createFP32(
+                        {static_cast<size_t>(seq), static_cast<size_t>(d)});
+                    ASSERT_TRUE(run_moe(input.get(), grouped_routing.indices.get(),
+                        grouped_routing.weights.get(), grouped_routing.kernel_owner,
+                        transported.get(), seq, true, &owner_mask, nullptr,
+                        CPURouterQ8InputPublicationPolicy::PublishTransportedRows, 3));
+                    expectRowsByteEqual(transported->data(), masked_grouped_output->data(),
+                        seq, d, std::string("masked transported unique-source replay ") + format.label);
+                }
 
                 for (int row = 0; row < seq; ++row)
                 {
@@ -3757,4 +3794,73 @@ TEST_F(MoEExpertComputeStageTest, DeclaredCPUWorkspaceRejectsMissingBundle)
     EXPECT_FALSE(router.hasWorkspace());
     CPUProjectionTestWorkspace empty(cpuSwiGLUWorkspaceRequirements(1,32));
     EXPECT_THROW(router.bindWorkspace(empty.get()),std::logic_error);
+}
+
+
+/**
+ * @brief Actual prepared CPU host packets publish only completed current expert
+ * IDs through grouped->M1->empty->reset->failure->grouped replay. The real
+ * production binding and kernel entry execute; no observation setter exists.
+ */
+TEST_F(MoEExpertComputeStageTest, CompletedCPUExpertViewLifecycle)
+{
+    ScopedOpenMPThreadCount threads(1);
+    constexpr int rows=3,d=256,f=256,experts=4,topk=2;
+    auto input=TestTensorFactory::createFP32Random({rows,d},-.25f,.25f,1917);
+    auto indices=TestTensorFactory::createFP32({rows,topk});
+    auto weights=TestTensorFactory::createFP32({rows,topk});
+    auto output=TestTensorFactory::createFP32({rows,d});
+    const std::array<float,rows*topk> routing{3,1,1,2,3,2};
+    std::copy(routing.begin(),routing.end(),indices->mutable_data());
+    std::fill_n(weights->mutable_data(),rows*topk,.5f);
+    auto gate=createExpertQ4K(experts,f,d,1918),up=createExpertQ4K(experts,f,d,1919);
+    auto down=createExpertQ4K(experts,d,f,1920);
+    MoEExpertComputeStage::Params ep;
+    ep.device_id=DeviceId::cpu();ep.input=input.get();ep.output=output.get();
+    ep.routing_indices=indices.get();ep.routing_weights=weights.get();
+    ep.gate_exps=gate.get();ep.up_exps=up.get();ep.down_exps=down.get();
+    ep.seq_len=rows;ep.d_model=d;ep.expert_intermediate=f;ep.num_experts=experts;ep.top_k=topk;
+    ep.expert_mask.assign(experts,true);
+    ep.cpu_router_q8_input_publication=CPURouterQ8InputPublicationPolicy::PublishTransportedRows;
+    ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(ep));
+    auto admission=admitCPUExpertStageForTest(ep,PhysicalMemoryOwner::PrimaryModelWeights);
+    ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(ep));
+    ExpertGemmRegistry registry;publishCPUExpertStageRegistryForTest(ep,registry);
+    MoEExpertComputeStage stage(ep);
+    CPUProjectionTestWorkspace workspace(stage.getWorkspaceRequirements(rows));
+    stage.bindWorkspace(workspace.get());
+    std::array<int,rows> mapping{0,1,2};
+    const auto bind=[&](int live) {
+        return stage.bindSparseOverlayInvocation(MoEExpertComputeStage::SparseOverlayInvocation{
+            .input=input.get(),.routing_indices=indices.get(),.routing_weights=weights.get(),
+            .output=output.get(),.live_rows=live,.route_width=topk,
+            .binding_kind=MoEExpertComputeStage::SparseOverlayBindingKind::HostPacketPublication,
+            .service_phase=MoEOverlayServicePhaseHint::Prefill,.engine_binding_generation=1,
+            .expert_mask=&ep.expert_mask,.gate_engines=ep.prepared_gate_gemm,
+            .up_engines=ep.prepared_up_gemm,.down_engines=ep.prepared_down_gemm,
+            .cpu_transported_hidden={.source=input->data(),.source_row_capacity=rows,
+                .compact_to_source_row=std::span<const int>(mapping).first(live)}});
+    };
+    const auto actual=[&]() {
+        const auto view=stage.completedCPUActiveExpertIds();
+        return std::vector<int>(view.begin(),view.end());
+    };
+    EXPECT_TRUE(actual().empty());
+    std::vector<float> expected;
+    for(int repeat=0;repeat<3;++repeat) {
+        std::fill_n(weights->mutable_data(),rows*topk,.5f);
+        ASSERT_TRUE(bind(rows)); EXPECT_TRUE(actual().empty());
+        ASSERT_TRUE(stage.execute(cpu_ctx_.get())); EXPECT_EQ(actual(),(std::vector<int>{1,2,3}));
+        if(repeat==0) expected.assign(output->data(),output->data()+rows*d);
+        else EXPECT_EQ(std::memcmp(expected.data(),output->data(),rows*d*sizeof(float)),0);
+        ASSERT_TRUE(bind(1)); EXPECT_TRUE(actual().empty());
+        ASSERT_TRUE(stage.execute(cpu_ctx_.get())); EXPECT_EQ(actual(),(std::vector<int>{1,3}));
+        std::fill_n(weights->mutable_data(),rows*topk,0.0f);
+        ASSERT_TRUE(bind(1)); ASSERT_TRUE(stage.execute(cpu_ctx_.get())); EXPECT_TRUE(actual().empty());
+        stage.resetSessionStatePreservingCapturedReplay(); EXPECT_TRUE(actual().empty());
+        EXPECT_FALSE(stage.execute(nullptr)); EXPECT_TRUE(actual().empty());
+        EXPECT_FALSE(bind(0)); EXPECT_TRUE(actual().empty());
+        stage.resetSessionState(); EXPECT_TRUE(actual().empty());
+    }
+    stage.unbindWorkspace();
 }

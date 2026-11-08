@@ -751,6 +751,14 @@ namespace llaminar2
          * @return True after the return rows and completion evidence are ready.
          */
         bool completeDeferredOutput(IDeviceContext *ctx);
+        /**
+         * @brief Read the last completed endpoint's post-service host duration.
+         * @return Nanoseconds of telemetry/cleanup after the service timestamp;
+         * zero when disabled, failed or empty. Nested in local execute time.
+         * The existing participant timeline alone publishes this observation.
+         */
+        std::uint64_t completedPostServiceNanoseconds() const noexcept
+        { return last_post_service_ns_; }
         /** @return Whether this stage requires an explicit completion node. */
         bool usesDeferredCompletion() const noexcept
         {
@@ -1136,6 +1144,8 @@ namespace llaminar2
         DeferredGPUReplayFamily *pending_deferred_replay_ = nullptr;
         DeferredLifecycle deferred_lifecycle_ = DeferredLifecycle::Idle;
         MoEOverlayParticipantBankLease deferred_residency_bank_;
+        /** Host-only completed timing observation; never an execution decision. */
+        std::uint64_t last_post_service_ns_ = 0u;
         bool pending_economy_timing_enabled_ = false;
         bool pending_endpoint_detail_enabled_ = false;
         bool pending_profiling_enabled_ = false;

@@ -1,10 +1,21 @@
 # QFN tuning dashboard
 
-Updated 2026-11-06. **Keep this file at or below 15,000 UTF-8 bytes.** Replace
+Updated 2026-11-08. **Keep this file at or below 15,000 UTF-8 bytes.** Replace
 status entries in place; put experiment histories, commands, samples and failure
 analysis in the linked tuning notes, not in this dashboard.
 
 ## Current status
+
+**Active hybrid target: 500 prefill /40 decode tok/s on 2×MI50 +2×CPU TP.**
+Matched local Release 512/256 measurements give **161.706 P /29.484 D**, up
+from 150.782/27.298 (+7.25%/+8.01%) after unique-source Q8 publication and CPU
+profiler cleanup. All three generated streams and MTP work counts match.
+Context remains 262144, with dynamic MTP/balancing, RAM ngrams, local GPU row
+caches and 16/32 GiB RAM/disk prefix budgets. **36 focused checkpoint tests
+pass, zero skips**; full preflight, exact checkpoint model and OpenCode remain open.
+The CPU checkpoint also retains the qualified ordered-pair, counter, affinity
+and aligned-fixture fixes. Four-row tuning is a separate unmeasured candidate.
+[Assembly, measurements, configuration and qualification limits](../2026-11/QFN_CPU_NATIVEVNNI_SPILL_AUDIT_20261108.md).
 
 **Earlier checkpoint `2cf99995d`:** finite-trajectory MTP comparison and full OpenCode
 session complete on accepted ROCm TP4. [Contract and live MTP table](QFN_MTP_TP4_TUNING.md).

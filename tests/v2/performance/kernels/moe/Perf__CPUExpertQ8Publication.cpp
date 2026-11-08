@@ -105,25 +105,42 @@ TEST(Perf_CPUExpertQ8Publication, TransportedExpertMajor)
     const int rows = publicationSetting("LLAMINAR_CPU_EXPERT_Q8_ROWS", 20);
     const int source_rows = publicationSetting("LLAMINAR_CPU_EXPERT_Q8_SOURCE_ROWS", 5);
     const int width = publicationSetting("LLAMINAR_CPU_EXPERT_Q8_WIDTH", 2048);
+    const int live_source_rows = publicationSetting(
+        "LLAMINAR_CPU_EXPERT_Q8_LIVE_SOURCE_ROWS", std::min(rows, source_rows));
+    if (live_source_rows > rows || live_source_rows > source_rows)
+        throw std::invalid_argument("Live Q8 sources exceed the route count or source capacity");
     const int blocks = (width + 31) / 32;
     const bool profile_only = std::getenv("LLAMINAR_CPU_EXPERT_Q8_PROFILE_ITERATIONS") != nullptr;
     std::vector<float> source(size_t(source_rows) * width);
     std::vector<int> indices(rows);
+    std::vector<int> retired_permutation(rows);
+    std::vector<int> inverse(rows);
+    const int top_k = (rows + live_source_rows - 1) / live_source_rows;
+    std::vector<int> original_routes(size_t(live_source_rows) * top_k, -1);
+    std::vector<int> compact_sources(live_source_rows);
+    for (int row = 0; row < live_source_rows; ++row)
+        compact_sources[row] = row * source_rows / live_source_rows;
     std::vector<Q8_1Block> output(size_t(rows) * blocks);
     std::vector<Q8_1Block> expected(output.size());
     for (size_t i = 0; i < source.size(); ++i)
         source[i] = float(int((i * 71 + i / 13) % 257) - 128) * 0.003125f;
     for (int row = 0; row < rows; ++row)
     {
-        indices[row] = row % source_rows;
+        indices[row] = (row % live_source_rows) * source_rows / live_source_rows;
+        retired_permutation[row] = inverse[row] = row;
+        original_routes[size_t(row % live_source_rows) * top_k + row / live_source_rows] = row;
         if (!profile_only)
             publishExpertQ8(source.data() + size_t(indices[row]) * width,
                            expected.data() + size_t(row) * blocks, 1, width);
     }
+    const auto schedule = CPUMoEKernel::RouterQ8ExpertMajorSchedule::fromOriginalRoutes(
+        indices, retired_permutation, original_routes, inverse, top_k,
+        std::span<const int>(compact_sources), source_rows);
+    ASSERT_TRUE(schedule);
     CPUMoEKernel kernel;
     auto run = [&] {
         return kernel.publishTransportedRouterQ8HiddenExpertMajor(
-            source.data(), source_rows, width, indices, output);
+            source.data(), source_rows, width, *schedule, output);
     };
     ASSERT_TRUE(run());
     if (!profile_only)
@@ -136,7 +153,7 @@ TEST(Perf_CPUExpertQ8Publication, TransportedExpertMajor)
         for (int iteration = 0; iteration < iterations; ++iteration)
             ASSERT_TRUE(run());
         std::cout << "profile_only,rows=" << rows << ",source_rows=" << source_rows
-                  << ",width=" << width << ",iterations=" << iterations << '\n';
+                  << ",live_source_rows=" << live_source_rows << ",width=" << width << ",iterations=" << iterations << '\n';
         return;
     }
     const int iterations = publicationSetting("LLAMINAR_CPU_EXPERT_Q8_ITERS", 512);
@@ -151,8 +168,8 @@ TEST(Perf_CPUExpertQ8Publication, TransportedExpertMajor)
     }
     ASSERT_EQ(std::memcmp(output.data(), expected.data(), output.size() * sizeof(Q8_1Block)), 0);
     std::sort(samples.begin(), samples.end());
-    std::cout << "rows,source_rows,width,median_us,min_us,max_us\n"
-              << rows << ',' << source_rows << ',' << width << ',' << samples[4]
+    std::cout << "rows,source_rows,live_source_rows,width,median_us,min_us,max_us\n"
+              << rows << ',' << source_rows << ',' << live_source_rows << ',' << width << ',' << samples[4]
               << ',' << samples.front() << ',' << samples.back() << '\n';
 }
 } // namespace llaminar2::test

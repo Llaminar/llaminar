@@ -33,6 +33,11 @@
  *   4 comp loads + 4 mullo + 4 sub (bias correction)
  *   4 scale loads + 4 mul + 4 fmadd (FP32 accumulation)
  *
+ * GPU-aligned fused row pairs use the bounded ordered nibble kernel for all
+ * eligible prepared nibble encodings. Decoder, original scale factors and
+ * asymmetry remain tensor-owned; fixed K partitions and their FP32 fold do not
+ * depend on the physical row or column tile.
+ *
  * ## Cache-Aware Tiling
  *
  * Uses NativeVNNITileConfig (from CPUNativeVNNITileConfig.h) to select
@@ -49,7 +54,9 @@
 #pragma once
 
 #include <immintrin.h>
+#include <algorithm>
 #include <array>
+#include <compare>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -6553,6 +6560,101 @@ namespace llaminar2::cpu::native_vnni
     };
 
 
+    /**
+     * @brief Exact numeric projection evidence dimensions, with no descriptor ordinal.
+     *
+     * This value exists only while the original enabled instrumentation runs.
+     * It owns no payload, collector record, epoch or retained cache. Sorting
+     * descriptor indices by these dimensions permits one original tag map and
+     * one collector update for each semantically identical group.
+     */
+    struct FusedProjectionEvidenceDimensions
+    {
+        int rows, n, policy_n, k, codebook;
+        ProjectionRowsPurpose purpose;
+        ISAPath isa;
+        int k_tiles, k_tile_blocks, ambient_n_block_chunks, n_block_chunks;
+        DecodeSchedulePolicy requested_decode, effective_decode;
+        VerifierRowsPolicy requested_verifier, effective_verifier;
+        int physical_row_tile;
+        VerifierRowsExecutionRoute route;
+        VerifierRowsTaskGrid task_grid;
+        int64_t producer_tasks, reduction_tasks;
+        bool layer_global_full_k;
+
+        /** @brief Compare every emitted semantic dimension using its native type.
+         * @param other Another projection's complete immutable dimensions.
+         * @return Lexicographic order; equality requires every field to match.
+         */
+        auto operator<=>(const FusedProjectionEvidenceDimensions &other) const = default;
+
+        /** @brief Project the original recorder's dimensions from an admitted plan.
+         * @param descriptor Actual live prepared projection; payload pointers are not read.
+         * @param plan Original resolved serial arithmetic and task geometry.
+         * @param isa Resolved native ISA shared by this invocation.
+         * @param full_k Original bundle-wide scheduler identity.
+         * @return All 21 dimensions that determine the existing retained record key.
+         */
+        static FusedProjectionEvidenceDimensions from(
+            const FusedVerifierRowsDesc &descriptor, const FusedVerifierRowsPlan &plan,
+            ISAPath isa, bool full_k)
+        {
+            const bool grouped_k_parallel = nativeVNNIUsesKPartitions(plan.k_tiles);
+            return {
+                .rows = plan.rows, .n = descriptor.N, .policy_n = plan.policy_n,
+                .k = descriptor.packed->K, .codebook = descriptor.packed->codebook_id,
+                .purpose = descriptor.purpose, .isa = isa,
+                .k_tiles = plan.k_tiles, .k_tile_blocks = plan.k_blocks_per_tile,
+                .ambient_n_block_chunks = plan.rows == 1 ? plan.n_block_chunks
+                    : plan.verifier_resolution.ambient_n_block_chunks,
+                .n_block_chunks = plan.n_block_chunks,
+                .requested_decode = plan.requested_decode_schedule,
+                .effective_decode = plan.effective_decode_schedule,
+                .requested_verifier = plan.requested_verifier_schedule,
+                .effective_verifier = plan.effective_verifier_schedule,
+                .physical_row_tile = plan.rows == 1 ? 1 : plan.verifier_resolution.physical_row_tile,
+                .route = plan.rows == 1
+                    ? (grouped_k_parallel ? VerifierRowsExecutionRoute::DecodeKParallelRow
+                                          : VerifierRowsExecutionRoute::DecodeFullKRow)
+                    : plan.verifier_resolution.route,
+                .task_grid = plan.rows == 1 ? VerifierRowsTaskGrid::NBlockKTile
+                                           : plan.verifier_resolution.task_grid,
+                .producer_tasks = plan.rows == 1
+                    ? static_cast<int64_t>(plan.total_blocks) * std::max(1, plan.k_tiles)
+                    : plan.verifier_resolution.producer_tasks,
+                .reduction_tasks = plan.rows == 1
+                    ? (grouped_k_parallel ? plan.n_chunks : 0)
+                    : plan.verifier_resolution.reduction_tasks,
+                .layer_global_full_k = full_k};
+        }
+
+        /** @brief Construct the unchanged public schema once per distinct numeric group.
+         * @return Complete original 21-tag map; no observation is dropped or filtered.
+         */
+        PerfStatsCollector::Tags tags() const
+        {
+            return {
+                {"m", std::to_string(rows)}, {"n", std::to_string(n)},
+                {"policy_n", std::to_string(policy_n)}, {"k", std::to_string(k)},
+                {"codebook", std::to_string(codebook)},
+                {"purpose", purpose == ProjectionRowsPurpose::Prefill ? "prefill" : "decode"},
+                {"isa", isa == ISAPath::AVX512 ? "AVX512" : (isa == ISAPath::AVX2 ? "AVX2" : "Scalar")},
+                {"k_tiles", std::to_string(k_tiles)}, {"k_tile_blocks", std::to_string(k_tile_blocks)},
+                {"ambient_n_block_chunks", std::to_string(ambient_n_block_chunks)},
+                {"n_block_chunks", std::to_string(n_block_chunks)},
+                {"requested_decode_policy", decodeSchedulePolicyName(requested_decode)},
+                {"effective_decode_policy", decodeSchedulePolicyName(effective_decode)},
+                {"requested_verifier_policy", verifierRowsPolicyName(requested_verifier)},
+                {"effective_verifier_policy", verifierRowsPolicyName(effective_verifier)},
+                {"physical_row_tile", std::to_string(physical_row_tile)},
+                {"route", verifierRowsExecutionRouteName(route)},
+                {"task_grid", verifierRowsTaskGridName(task_grid)},
+                {"producer_tasks", std::to_string(producer_tasks)},
+                {"reduction_tasks", std::to_string(reduction_tasks)},
+                {"bundle_scheduler", layer_global_full_k ? "layer_global_full_k" : "projection_ordered"}};
+        }
+    };
+
     /** @brief Physical ownership of ordered partials for one fused invocation. */
     enum class NativeVNNIFusedPartialRoute
     {
@@ -6935,80 +7037,35 @@ namespace llaminar2::cpu::native_vnni
         if ((!omp_in_parallel() || omp_get_thread_num() == 0) &&
             PerfStatsCollector::isDomainEnabled("kernel"))
         {
-            const char *effective_isa =
-                use_avx512 ? "AVX512" : (use_avx2 ? "AVX2" : "Scalar");
+            const ISAPath effective_isa = use_avx512 ? ISAPath::AVX512
+                : (use_avx2 ? ISAPath::AVX2 : ISAPath::SCALAR);
+            // Sort only bounded indices into the already admitted plans. No
+            // per-descriptor tag maps or retained metadata cache are built.
+            std::array<int, kMaxFusedVerifierProjections> order;
             for (int p = 0; p < num_descs; ++p)
+                order[static_cast<size_t>(p)] = p;
+            const auto dimensions = [&](int p) {
+                return FusedProjectionEvidenceDimensions::from(descs[p],
+                    plans[static_cast<size_t>(p)], effective_isa, all_full_k);
+            };
+            std::sort(order.begin(), order.begin() + num_descs,
+                [&](int a, int b) { return dimensions(a) < dimensions(b); });
+            for (int first = 0; first < num_descs;)
             {
-                const auto &plan = plans[static_cast<size_t>(p)];
-                const bool grouped_k_parallel =
-                    nativeVNNIUsesKPartitions(plan.k_tiles);
-                const VerifierRowsExecutionRoute route = plan.rows == 1
-                    ? (grouped_k_parallel
-                           ? VerifierRowsExecutionRoute::DecodeKParallelRow
-                           : VerifierRowsExecutionRoute::DecodeFullKRow)
-                    : plan.verifier_resolution.route;
-                const VerifierRowsTaskGrid task_grid = plan.rows == 1
-                    ? VerifierRowsTaskGrid::NBlockKTile
-                    : plan.verifier_resolution.task_grid;
-                const int physical_row_tile = plan.rows == 1
-                    ? 1
-                    : plan.verifier_resolution.physical_row_tile;
-                const int64_t producer_tasks = plan.rows == 1
-                    ? static_cast<int64_t>(plan.total_blocks) *
-                          std::max(1, plan.k_tiles)
-                    : plan.verifier_resolution.producer_tasks;
-                const int64_t reduction_tasks = plan.rows == 1 &&
-                                                        grouped_k_parallel
-                    ? plan.n_chunks
-                    : (plan.rows == 1
-                           ? 0
-                           : plan.verifier_resolution.reduction_tasks);
-                PerfStatsCollector::addCounter(
-                    "kernel",
+                const auto key = dimensions(order[static_cast<size_t>(first)]);
+                int end = first + 1;
+                while (end < num_descs && dimensions(order[static_cast<size_t>(end)]) == key)
+                    ++end;
+                const auto observations = static_cast<uint64_t>(end - first);
+                // Multiplicity remains actual descriptor observations, rather
+                // than one synthetic event with a larger numeric value. The
+                // existing collector owns filtering, reset and accumulation.
+                PerfStatsCollector::addCounter("kernel",
                     "cpu_native_vnni_fused_verifier_rows_projection_launch",
-                    1.0,
-                    "gemm",
-                    "cpu",
-                    PerfStatsCollector::Tags{
-                        {"m", std::to_string(plan.rows)},
-                        {"n", std::to_string(descs[p].N)},
-                        {"policy_n", std::to_string(plan.policy_n)},
-                        {"k", std::to_string(descs[p].packed->K)},
-                        {"codebook", std::to_string(descs[p].packed->codebook_id)},
-                        {"projection", std::to_string(p)},
-                        {"purpose", descs[p].purpose == ProjectionRowsPurpose::Prefill
-                                        ? "prefill" : "decode"},
-                        {"isa", effective_isa},
-                        {"k_tiles", std::to_string(plan.k_tiles)},
-                        {"k_tile_blocks", std::to_string(plan.k_blocks_per_tile)},
-                        {"ambient_n_block_chunks",
-                         std::to_string(
-                             plan.rows == 1
-                                 ? plan.n_block_chunks
-                                 : plan.verifier_resolution
-                                       .ambient_n_block_chunks)},
-                        {"n_block_chunks",
-                         std::to_string(plan.n_block_chunks)},
-                        {"requested_decode_policy",
-                         decodeSchedulePolicyName(
-                             plan.requested_decode_schedule)},
-                        {"effective_decode_policy",
-                         decodeSchedulePolicyName(
-                             plan.effective_decode_schedule)},
-                        {"requested_verifier_policy",
-                         verifierRowsPolicyName(
-                             plan.requested_verifier_schedule)},
-                        {"effective_verifier_policy",
-                         verifierRowsPolicyName(
-                             plan.effective_verifier_schedule)},
-                        {"physical_row_tile", std::to_string(physical_row_tile)},
-                        {"route", verifierRowsExecutionRouteName(route)},
-                        {"task_grid", verifierRowsTaskGridName(task_grid)},
-                        {"producer_tasks", std::to_string(producer_tasks)},
-                        {"reduction_tasks", std::to_string(reduction_tasks)},
-                        {"bundle_scheduler",
-                         all_full_k ? "layer_global_full_k"
-                                    : "projection_ordered"}});
+                    PerfStatsCollector::CounterObservationBatch{
+                        .observations = observations, .value = static_cast<double>(observations)},
+                    "gemm", "cpu", key.tags());
+                first = end;
             }
         }
 
@@ -7964,10 +8021,18 @@ namespace llaminar2::cpu::native_vnni
                                             static_cast<size_t>(projection)]
                                                 .value);
                                 }
-                                else if (packed.usesNibbleLUT() &&
-                                    nibbleDecodeKind(packed.codebook_id) ==
-                                        NibbleDecodeKind::Q4_0_LINEAR)
+                                else if (packed.usesNibbleLUT())
                                 {
+                                    // Decoder and asymmetry are immutable prepared
+                                    // policy. The existing bounded two-row kernel
+                                    // owns their exact per-block publication and
+                                    // ordered K fold for every nibble encoding,
+                                    // including Q4_K/Q4_1 and non-linear IQ4.
+                                    // The generic 64-column kernel keeps enough
+                                    // simultaneous FP/INT vectors to spill live
+                                    // accumulators in optimized builds. The
+                                    // existing two-segment tile bounds that live
+                                    // state without changing any arithmetic.
                                     dispatch_2row_native_avx512_ordered_partitions(
                                         packed,
                                         row0,

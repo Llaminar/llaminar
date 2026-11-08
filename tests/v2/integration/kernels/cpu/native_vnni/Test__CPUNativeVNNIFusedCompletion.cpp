@@ -8,6 +8,9 @@
  * exercises all three layer-wide schedules with the canonical format registry,
  * mixed biased/unbiased members, padded tails and repeated nested-team calls.
  * It asserts native bytes and ownership, never a noisy timing threshold.
+ * GPU-aligned nibble dispatch replay additionally uses actual prepared source
+ * formats and the fixed expert reduction contract, including shard and tail
+ * geometries, partial bundles and repeated large-to-small request reuse.
  */
 #include "kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 #include "utils/NativeVNNITestPartialStorage.h"
@@ -37,16 +40,19 @@ public:
     /**
      * @brief Bind one stable team and an explicit serial arithmetic partition.
      * @param workers Positive width shared by the oracle and grouped invocation.
-     * @param partitions Number of K partials in the serial arithmetic contract.
+     * @param partitions K partial count, or absent to use production arithmetic policy.
      */
-    FusedCompletionScope(int workers, int partitions)
+    FusedCompletionScope(int workers, std::optional<int> partitions)
         : workers_(omp_get_max_threads()), dynamic_(omp_get_dynamic())
     {
         if (const char *value = std::getenv("LLAMINAR_CPU_VNNI_K_TILES"))
             prior_partitions_ = value;
         omp_set_dynamic(0);
         omp_set_num_threads(workers);
-        setenv("LLAMINAR_CPU_VNNI_K_TILES", std::to_string(partitions).c_str(), 1);
+        if (partitions)
+            setenv("LLAMINAR_CPU_VNNI_K_TILES", std::to_string(*partitions).c_str(), 1);
+        else
+            unsetenv("LLAMINAR_CPU_VNNI_K_TILES");
         mutableDebugEnv().cpu_vnni.reload();
     }
 
@@ -213,3 +219,7 @@ TEST(CPUNativeVNNIFusedCompletion, SharedBank)
     proveFusedCompletion(NativeVNNIFusedPartialRoute::SharedBank);
 }
 } // namespace llaminar2::test
+
+#include "CPUNativeVNNIFusedPerfIdentity.inc"
+
+#include "CPUNativeVNNIOrderedNibbleReplay.inc"

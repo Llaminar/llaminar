@@ -2519,7 +2519,10 @@ add_library(llaminar_mpi_session_owner STATIC utils/MPISessionOwner.cpp)
 target_compile_features(llaminar_mpi_session_owner PRIVATE cxx_std_20)
 set_target_properties(llaminar_mpi_session_owner PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(llaminar_mpi_session_owner PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(llaminar_mpi_session_owner PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+# Process children inherit the configured OpenMP partition even when libgomp
+# binds the frontend before main(). Keep the same runtime ABI as the core.
+target_link_libraries(llaminar_mpi_session_owner PUBLIC
+    Threads::Threads OpenMP::OpenMP_CXX ${CMAKE_DL_LIBS})
 target_link_libraries(llaminar2_core PRIVATE llaminar_mpi_session_owner)
 add_executable(llaminar_mpi_session tools/MPISessionLauncher.cpp)
 target_link_libraries(llaminar_mpi_session PRIVATE llaminar_mpi_session_owner)

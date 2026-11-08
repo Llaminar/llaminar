@@ -1444,6 +1444,10 @@ namespace llaminar2
         params_.prepared_gate_gemm.resize(expert_count, nullptr);
         params_.prepared_up_gemm.resize(expert_count, nullptr);
         params_.prepared_down_gemm.resize(expert_count, nullptr);
+        // This existing CPU schedule also lends completed expert IDs to metrics.
+        // Reserve its same bounded capacity during construction, not per packet.
+        if (params_.device_id.is_cpu())
+            cpu_grouped_active_experts_.reserve(expert_count);
         const bool invocation_published_registry_bank =
             params_.prepared_engine_binding_lifecycle ==
             MoEPreparedEngineBindingLifecycle::
@@ -2093,6 +2097,7 @@ namespace llaminar2
 
     void MoEExpertComputeStage::applyExpertMask(const std::vector<bool> &new_mask)
     {
+        clearCompletedCPUActiveExpertView();
         params_.expert_mask = new_mask;
         if (params_.replica_set.num_replicated > 0 && !params_.expert_mask.empty())
             params_.replica_set.buildPrefillMask(params_.my_socket_id, params_.expert_mask, params_.layer_idx);
@@ -2733,6 +2738,7 @@ namespace llaminar2
 
     bool MoEExpertComputeStage::execute(IDeviceContext *ctx)
     {
+        clearCompletedCPUActiveExpertView();
         if(params_.cpu_joint_layer && !cpu_joint_invocation_bank_) {
             LOG_ERROR("CPU fragment execution requires its exact bound packet-epoch RCU lease");return false;
         }
@@ -2741,7 +2747,14 @@ namespace llaminar2
             ~InvocationBankScope(){stage.releaseCPUJointInvocation();}
         } release_after_gemm{*this};
         if (!overlay_service_telemetry_layer_)
-            return executeWithoutServiceTelemetry(ctx);
+        {
+            // Construction admits device service telemetry only for a complete
+            // GPU binding. Every CPU invocation necessarily completes here.
+            const bool completed = executeWithoutServiceTelemetry(ctx);
+            cpu_active_expert_view_published_ = completed && params_.device_id.is_cpu();
+            if (!completed) cpu_grouped_active_experts_.clear();
+            return completed;
+        }
         if (!ctx || !overlay_service_sample_ ||
             !overlay_service_runtime_layer_)
         {
@@ -4266,6 +4279,20 @@ namespace llaminar2
 
         } // end CPU Phase 2 else block
 
+        if (!is_gpu)
+        {
+            // M=1 has its own real ActiveExpert entries, not the grouped CSR
+            // schedule. Publish those completed selections into the same
+            // retained view, deduplicating at most top_k<=16 without a node set.
+            for (int active = 0; active < num_active; ++active)
+            {
+                const int expert = active_experts[active].expert_id;
+                auto position = std::lower_bound(cpu_grouped_active_experts_.begin(),
+                    cpu_grouped_active_experts_.end(), expert);
+                if (position == cpu_grouped_active_experts_.end() || *position != expert)
+                    cpu_grouped_active_experts_.insert(position, expert);
+            }
+        }
         LOG_TRACE("[MoEExpertComputeStage] Single-token decode (batched gate+up): " << num_active << " experts");
         if (is_gpu && !params_.output_registered_in_arena)
             gpuExecution().publish(params_.output);
@@ -5052,6 +5079,30 @@ namespace llaminar2
                 const size_t required_router_q8_blocks =
                     static_cast<size_t>(local_route_rows) *
                     static_cast<size_t>(router_q8_blocks_per_row);
+                /*
+                 * Native descriptors consume expert offsets and the separate
+                 * local-to-expert map, never expert_local_slots_. Its last
+                 * native consumer was source-index materialization above.
+                 * The checked builder retires that permutation into unique
+                 * representatives using the original row/top-k route authority.
+                 * Floating bundles retain their permutation unchanged.
+                 */
+                const auto publication_schedule =
+                    CPUMoEKernel::RouterQ8ExpertMajorSchedule::fromOriginalRoutes(
+                        {cpu_grouped_token_indices_.data(), static_cast<size_t>(local_route_rows)},
+                        {cpu_grouped_expert_local_slots_.data(), static_cast<size_t>(local_route_rows)},
+                        {cpu_grouped_original_to_local_.data(), route_slot_capacity},
+                        {cpu_grouped_local_to_expert_position_.data(), static_cast<size_t>(local_route_rows)},
+                        top_k,
+                        borrowed_transport_hidden
+                            ? std::optional{std::span<const int>{
+                                  sparse_overlay_cpu_compact_to_source_row_.data(),
+                                  static_cast<size_t>(seq_len)}}
+                            : std::nullopt,
+                        borrowed_transport_hidden
+                            ? sparse_overlay_cpu_hidden_source_row_capacity_ : seq_len);
+                if (!publication_schedule)
+                    throw std::logic_error("CPU transported Q8 publication lost its original route/source authority");
                 if (!cpu_moe_kernel->
                         publishTransportedRouterQ8HiddenExpertMajor(
                             input_rows,
@@ -5059,9 +5110,7 @@ namespace llaminar2
                                 ? sparse_overlay_cpu_hidden_source_row_capacity_
                                 : seq_len,
                             d_model,
-                            std::span<const int>(
-                                cpu_grouped_token_indices_.data(),
-                                static_cast<size_t>(local_route_rows)),
+                            *publication_schedule,
                             std::span<Q8_1Block>(
                                 grouped_router_q8.data(),
                                 required_router_q8_blocks)))
@@ -9383,6 +9432,7 @@ namespace llaminar2
 
     void MoEExpertComputeStage::bindWorkspace(DeviceWorkspaceManager *workspace)
     {
+        clearCompletedCPUActiveExpertView();
         // Allocator rebuilds revoke borrows through the public null binding.
         // The graph-local kernel and its backing retain their own lifetimes.
         if (!workspace)
@@ -9485,6 +9535,7 @@ namespace llaminar2
 
     void MoEExpertComputeStage::unbindWorkspace()
     {
+        clearCompletedCPUActiveExpertView();
         auto unbindAll = [](const std::vector<ITensorGemm *> &engines)
         {
             for (auto *gemm : engines)
@@ -9537,7 +9588,8 @@ namespace llaminar2
     bool MoEExpertComputeStage::bindSparseOverlayInvocation(
         const SparseOverlayInvocation &invocation)
     {
-        // A rejected new packet cannot leave a previous lease executable.
+        // A rejected packet cannot lend a prior observation or execution lease.
+        clearCompletedCPUActiveExpertView();
         releaseCPUJointInvocation();
         MoEOverlayParticipantBankLease joint_bank;
         if(params_.cpu_joint_layer) {

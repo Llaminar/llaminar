@@ -1772,3 +1772,40 @@ TEST(Test__ProductionParityEvidence, HostedContinuationAdmissionRejectsDroppedOr
         EXPECT_FALSE(collectProductionDeviceGenerationEvidence(records).hosted_ticket_boundary_certified)<<reorder;
     }
 }
+
+/** @test Ordinary batches and single observations share reset, filtering and overflow authority. */
+TEST(PerfStatsCollector, OrdinaryCounterBatchesPreserveMultiplicityAndEpoch)
+{
+    ScopedEnv enabled("LLAMINAR_PERF_STATS_JSON", "-");
+    ScopedEnv filter("LLAMINAR_PERF_STATS_FILTER", "kernel");
+    PerfStatsCollector::reset();
+    using Batch = PerfStatsCollector::CounterObservationBatch;
+    const auto emit = [](Batch batch) {
+        PerfStatsCollector::addCounter("kernel", "ordinary_batch", batch, "gemm", "cpu", {{"geometry", "stable"}});
+    };
+    emit({.observations = 3u, .value = 0.0});
+    PerfStatsCollector::addCounter("kernel", "ordinary_batch", 2.0, "gemm", "cpu", {{"geometry", "stable"}});
+    auto records = PerfStatsCollector::snapshot();
+    ASSERT_EQ(records.size(), 1u);
+    EXPECT_EQ(records[0].count, 4u);
+    EXPECT_DOUBLE_EQ(records[0].value, 2.0);
+    emit({.observations = 0u, .value = 0.0});
+    EXPECT_THROW(emit((Batch{.observations = 0u, .value = 1.0})), std::invalid_argument);
+    EXPECT_THROW(emit((Batch{.observations = std::numeric_limits<uint64_t>::max(), .value = 1.0})), std::overflow_error);
+    records = PerfStatsCollector::snapshot();
+    ASSERT_EQ(records.size(), 1u);
+    EXPECT_EQ(records[0].count, 4u);
+    EXPECT_DOUBLE_EQ(records[0].value, 2.0);
+    PerfStatsCollector::reset();
+    EXPECT_TRUE(PerfStatsCollector::snapshot().empty());
+    emit({.observations = 5u, .value = 5.0});
+    {
+        ScopedEnv disabled("LLAMINAR_PERF_STATS_FILTER", "forward_graph");
+        emit({.observations = 7u, .value = 7.0});
+    }
+    records = PerfStatsCollector::snapshot();
+    ASSERT_EQ(records.size(), 1u);
+    EXPECT_EQ(records[0].count, 5u);
+    EXPECT_DOUBLE_EQ(records[0].value, 5.0);
+    PerfStatsCollector::reset();
+}

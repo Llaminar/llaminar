@@ -19,6 +19,7 @@
 
 #include "MPIBootstrap.h"
 #include "MPISessionOwner.h"
+#include "ScopedOpenMPPartitionAffinity.h"
 #include "Logger.h"
 #include "DebugEnv.h"
 #include <fstream>
@@ -747,6 +748,10 @@ namespace llaminar2
 
         // The helper stays alive until mpirun, local peers and daemon children
         // have actually retired, then removes only its original private roots.
+        // A replacement process inherits this thread's native mask. Retain
+        // the current admitted OpenMP partition across exec, before retiring
+        // startup loans; on exec failure the caller's original place restores.
+        const ScopedOpenMPPartitionAffinity launcher_partition;
         MPISessionOwner::retireStartupLoansForMPILaunch();
         execvp("mpirun", c_argv.data());
 

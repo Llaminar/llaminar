@@ -1,12 +1,12 @@
 /**
  * @file ScopedOpenMPPartitionAffinity.h
- * @brief Scoped placement for independently scheduled control-worker construction.
+ * @brief Scoped placement for independently scheduled control workers and process children.
  *
  * OpenMP binds its initial thread to one place before main(). Ordinary C++
  * children inherit that one-core mask even when MPI admitted a whole socket.
- * Independent GPU-control and HTTP service children need the admitted
- * partition to make progress independently of the inference owner's first
- * place. This scope changes only the thread-construction caller. New children
+ * Independent GPU-control, HTTP service, and reexecuted process children need
+ * the admitted partition rather than the inference owner's first place. This
+ * scope changes only the child-construction or exec caller. New children
  * inherit its temporary mask; existing inference, OpenMP, MPI and GPU workers
  * keep their placement. Scope exit restores the caller exactly, without
  * modifying the newly created children or the OpenMP placement policy.

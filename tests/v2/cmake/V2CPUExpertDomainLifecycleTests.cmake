@@ -5,6 +5,13 @@ The canonical lscpu-derived V2_TEST_SOCKETS owns launch eligibility. Missing
 populations remain unqualified; no oversubscribed process control substitutes
 for physical sockets. Device-free membership and 1–8 production math remain.
 ]]
+# Release deliberately owns only performance targets. Keep functional target
+# creation, source/property mutations and registration under the same policy.
+# Integration still executes every declaration and rejects missing owners.
+if(V2_PERF_TESTS_ONLY)
+    return()
+endif()
+
 add_executable(v2_integration_cpu_expert_domain_lifecycle
     integration/collective/Test__CPUExpertDomainLifecycle.cpp mpi_session_gtest_main.cpp)
 target_compile_features(v2_integration_cpu_expert_domain_lifecycle PRIVATE cxx_std_20)

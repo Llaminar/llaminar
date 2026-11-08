@@ -112,12 +112,29 @@ set_property(TEST V2_Integration_MPIRetirementDiagnostics APPEND PROPERTY LABELS
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_MPIRetirementCursorReplay V2_Integration_MPIRetirementDiagnostics)
 
+# Real owner reexec must preserve the admitted CPU domain before the new
+# executable initializes its OpenMP runtime. Both aliases remain model-free.
+add_executable(v2_mpi_process_affinity_probe integration/utils/MPIProcessAffinityProbe.cpp)
+target_link_libraries(v2_mpi_process_affinity_probe PRIVATE llaminar_mpi_session_owner OpenMP::OpenMP_CXX)
+add_dependencies(v2_mpi_process_affinity_probe llaminar_mpi_session)
+foreach(_affinity_suite Unit Integration)
+    add_v2_test(V2_${_affinity_suite}_MPIProcessAffinity
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/integration/scripts/test_mpi_process_affinity.py
+            --helper $<TARGET_FILE:llaminar_mpi_session>
+            --probe $<TARGET_FILE:v2_mpi_process_affinity_probe>
+        LABELS "V2;${_affinity_suite};CPU;DeviceFree;MPI;Threading;Topology;Replay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+endforeach()
+set_property(TEST V2_Integration_MPIProcessAffinity APPEND PROPERTY LABELS ProductionTestPreflight)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MPIProcessAffinity)
+
 # Actual original-FD root retirement beyond unpublished/ECHILD frontiers.
 # The body TU includes production source; it neither links the engine nor initializes MPI.
 add_executable(v2_test_mpi_root_retirement_body unit/utils/Test__MPIRootRetirementBody.cpp)
 target_include_directories(v2_test_mpi_root_retirement_body PRIVATE ${REPO_ROOT}/src/v2)
 target_compile_features(v2_test_mpi_root_retirement_body PRIVATE cxx_std_20)
-target_link_libraries(v2_test_mpi_root_retirement_body PRIVATE GTest::gtest_main ${CMAKE_DL_LIBS})
+target_link_libraries(v2_test_mpi_root_retirement_body PRIVATE
+    GTest::gtest_main OpenMP::OpenMP_CXX ${CMAKE_DL_LIBS})
 foreach(_root_suite Unit Integration)
     add_v2_test(V2_${_root_suite}_MPIRootRetirementBody
         COMMAND $<TARGET_FILE:v2_test_mpi_root_retirement_body> --gtest_repeat=20
