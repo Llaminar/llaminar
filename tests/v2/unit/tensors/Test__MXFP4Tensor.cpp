@@ -24,10 +24,15 @@
 #include "tensors/VnniPackContext.h"
 #include "loaders/gpu_pipeline/RepackFormat.h"
 #include "utils/CPUProjectionTestWorkspace.h"
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include "kernels/cpu/gemm/CPUNativeNEONMultiScaleOps.h"
+#elif defined(__AVX2__) || defined(__AVX512F__)
+#include <immintrin.h>
+#endif
 
 #include <array>
+#include <bit>
 #include <cmath>
-#include <immintrin.h>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -236,6 +241,19 @@ TEST(MXFP4CPUScaleLoaders, PowerOfTwoBF16AndFP16WordsWidenExactlyOnEveryISA)
                 EXPECT_EQ(bits(out[lane]), expected[group * 8 + lane]) << "256 col " << group * 8 + lane;
         }
 #endif
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        // The NEON projection tile selects bf16() or half() from the same
+        // prepared scale encoding; check that pairing on every column.
+        using Ops = multi_scale::NEONMultiScaleOps<multi_scale::NEONByteDot::ASIMD>;
+        for (int group = 0; group < 16; ++group)
+        {
+            const uint16_t *words = primary + group * 4;
+            const auto out = std::bit_cast<std::array<uint32_t, 4>>(
+                packed.scaleEncoding() == CPUNativeVNNIScaleEncoding::PowerOfTwoBF16 ? Ops::bf16(words) : Ops::half(words));
+            for (int lane = 0; lane < 4; ++lane)
+                EXPECT_EQ(out[lane], expected[group * 4 + lane]) << "neon col " << group * 4 + lane;
+        }
+#endif
         (void)primary; (void)expected; (void)packed;
     };
     for (size_t first = 0; first < exponents.size(); first += 64)
@@ -265,9 +283,11 @@ TEST(MXFP4CPUScaleLoaders, PowerOfTwoBF16AndFP16WordsWidenExactlyOnEveryISA)
     ASSERT_EQ(fp16.scaleEncoding(), CPUNativeVNNIScaleEncoding::FP16);
     expectColumns(fp16, half_expected, [&](const uint16_t *p, const auto &x) { vector_check(p, x, fp16); });
     // Rotated MXFP4 keeps source codebook 25 but is expanded INT8 with FP16 scales.
+    // Every column goes through the scalar reader and each ISA's vector loader.
     const auto rotated = cpuUnitWithScales(half_words, kNativeVnniMXFP4Codebook, CPUNativeVNNIEncoding::ExpandedInt8);
-    EXPECT_EQ(rotated.scaleEncoding(), CPUNativeVNNIScaleEncoding::FP16);
-    EXPECT_EQ(bits(rotated.blockScale(0, 0, 3)), half_expected[3]);
+    ASSERT_EQ(rotated.scaleEncoding(), CPUNativeVNNIScaleEncoding::FP16);
+    ASSERT_EQ(rotated.primaryScaleLayout(), VnniPrimaryScaleLayout::FP16Words);
+    expectColumns(rotated, half_expected, [&](const uint16_t *p, const auto &x) { vector_check(p, x, rotated); });
 }
 
 TEST(MXFP4ScaleCarrier, StagedWordsDecodeExactlyAndFP16CallbacksAreUntouched)

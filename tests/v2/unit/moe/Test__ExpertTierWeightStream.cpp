@@ -5,6 +5,8 @@
  * Exercise source provenance, bounded receive/publication state and exact
  * layout transformations independently of backend launchers. Native grid
  * scales/minima must survive conversion, not merely a lossy round trip.
+ * Native read views also admit the real slot/demotion owners, separating source
+ * codec widths from physical expanded payloads without changing publications.
  */
 
 #include "execution/moe/ExpertTierWeightStream.h"
@@ -122,6 +124,39 @@ namespace llaminar2
                 }
             }
             return projection;
+        }
+
+        /** @test Real demotion publications retain native view geometry for every source. */
+        TEST(ExpertTierWeightStream, PreparedReadViewAcceptsAllMigratedSourceFormats)
+        {
+            for (const auto &source : native_vnni_formats::kAllSourceFormats)
+            {
+                SCOPED_TRACE(source.quant_type);
+                const auto physical = migrationStableDeviceVnniFormat(*source.metadata);
+                auto gpu = makeProjection(physical.codebook_id, physical.payload_bytes_per_block,
+                    physical.is_asymmetric, source.metadata->is_superblock);
+                gpu.source_codebook_id = source.metadata->codebook_id;
+                gpu.has_emins = physical.has_emins;
+                if (physical.codebook_id == 11 || physical.codebook_id == 13)
+                    for (std::size_t block = 0; block < gpu.mins.size(); ++block)
+                        gpu.mins[block] = static_cast<std::uint16_t>(
+                            block & (physical.codebook_id == 11 ? 15u : 255u));
+                if (physical.has_emins)
+                    gpu.emins.assign(gpu.scales.size(), 0xac002c00u);
+
+                cpu::native_vnni::CPUNativeVNNIPackedWeights cpu;
+                std::string error;
+                ASSERT_TRUE(gpuToCpuExpertPackedReference(gpu, cpu, &error)) << error;
+                const auto view = cpu.readView();
+                EXPECT_EQ(view.interleavedBase(), cpu.native_interleaved.data());
+                EXPECT_EQ(view.bytes().size(), cpu.native_interleaved.size());
+                EXPECT_EQ(view.N, cpu.N);
+                EXPECT_EQ(view.K, cpu.K);
+                EXPECT_EQ(view.source_payload_bytes, source.metadata->payload_bytes);
+                EXPECT_EQ(view.payload_bytes, view.usesExpandedInt8() ? 32 : source.metadata->payload_bytes);
+                EXPECT_EQ(view.encoding, cpu.encoding);
+                EXPECT_EQ(view.numerical_policy, cpu.numerical_policy);
+            }
         }
 
         TEST(ExpertTierWeightStream, SingleScaleNativeGridsExpandWithoutRequantization)
@@ -819,6 +854,13 @@ namespace llaminar2
                             actual));
                     EXPECT_EQ(actual, source_identity);
                     EXPECT_FALSE(projection.destination_bytes.empty());
+                    const auto *packed = projection.engine->exportCPUNativeVNNIPackedWeights();
+                    ASSERT_NE(packed, nullptr);
+                    const auto view = packed->readView();
+                    EXPECT_EQ(view.interleavedBase(), projection.destination_bytes.data());
+                    EXPECT_EQ(view.bytes().size(), projection.destination_bytes.size());
+                    EXPECT_EQ(view.source_payload_bytes, entry.metadata->payload_bytes);
+                    EXPECT_EQ(view.payload_bytes, view.usesExpandedInt8() ? 32 : entry.metadata->payload_bytes);
                 }
                 lease.reset();
                 EXPECT_EQ(pool->usedSlots(), 0u);

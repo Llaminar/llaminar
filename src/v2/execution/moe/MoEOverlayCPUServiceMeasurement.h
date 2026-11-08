@@ -13,10 +13,15 @@
 #include "planning/PhysicalMemoryAuthority.h"
 #include "memory/CPUStorageRoot.h"
 #include "planning/ModelMemoryProfile.h"
+#include "MoEOverlayRouteTarget.h"
+#include "MoEOverlayPreparedTargetService.h"
+#include <optional>
+#include <span>
 
 namespace llaminar2
 {
     struct RankInventory;
+    class IGlobalTPContext;
     /**
      * @brief Setup producer on the same rank-affined OpenMP execution as CPU serving.
      *
@@ -102,6 +107,87 @@ namespace llaminar2
             const MoEOverlayPreparedExpertPayload &source, DeviceId device, int layer,
             ExpertHistogramSource phase, Geometry geometry,
             const std::shared_ptr<PhysicalMemoryAuthority> &memory);
+
+        /**
+         * @brief Explicit setup-only boundary, not serving dispatch-to-publication.
+         *
+         * Inputs and route metadata are ready before the rendezvous. The root
+         * clock includes the original-domain start release, prepared fragment
+         * FFNs, rooted gather/combine and canonical ordered-FMA output fold.
+         * Serving dispatch, activation ingress and terminal device ingress are
+         * excluded. Whole measurePrepared() has no collective release and must
+         * not be silently mixed into a dispatch-inclusive price.
+         */
+        enum class PreparedComputeBoundary { InputReadyStartReleaseToCanonicalOutput };
+
+        /** @brief Passive root-clock evidence; it grants no service/placement readiness. */
+        struct PreparedComputeObservation
+        {
+            MoEOverlayRouteTarget target;
+            int layer = -1, expert = -1;
+            ExpertHistogramSource phase = ExpertHistogramSource::DecodeToken;
+            PreparedComputeBoundary boundary = PreparedComputeBoundary::InputReadyStartReleaseToCanonicalOutput;
+            uint64_t logical_rows_per_invocation = 0; ///< Logical rows once, never multiplied by members.
+            uint64_t measured_invocations = 0;
+            uint64_t total_root_wall_nanoseconds = 0; ///< Sum of root intervals, never peer-clock maxima.
+        };
+
+        /**
+         * @brief Quote the same serial setup roots used by the original-cohort probe.
+         * @param cohort Original checked full source/cuts/member metadata.
+         * @param member Original domain member, not a CPU device ordinal.
+         * @param phase Exact existing representative row family.
+         * @param invocation_workspace_bytes Existing merged stage/kernel requirement.
+         * @return Physical ExecutionWorkspace bytes, including root-only gather/fold storage.
+         * @throws std::exception For invalid source/phase/member or overflow.
+         */
+        [[nodiscard]] static size_t cpuJointAllocationBytes(
+            const std::shared_ptr<const MoEExpertShardCohort>& cohort, size_t member,
+            ExpertHistogramSource phase, size_t invocation_workspace_bytes);
+
+        /**
+         * @brief Measure one actual prepared CPU cohort at the explicitly named boundary.
+         * @param registry Original model/source-bound participant banks.
+         * @param epoch Installed original initial epoch; no candidate or fabricated readiness.
+         * @param participant Exact original local global participant ID.
+         * @param layer Original global model layer.
+         * @param expert Same original logical expert selected on every member.
+         * @param phase Same production phase on every member.
+         * @param original_domain SAME live admitted native CPU expert domain shared owner.
+         * @param memory Sole authority admitting exact setup roots and invocation workspace.
+         * @param diagnostic_output Optional exact root rows*H CPU span, empty on contributors; filled only after all timed work succeeds. It owns no storage and is excluded from timing/traffic.
+         * @return Root-only completed evidence; contributors return nullopt after their final gather.
+         * @throws std::exception For missing source/bank/domain/admission or failed computation.
+         * @note All original members enter this explicit job in the same order. No
+         * new communicator, executor, histogram or active service price is installed.
+         * Original source and bank readers span every stage and collective.
+         * After the native owner is authenticated, any rank-local rejection
+         * requests that same domain's existing fatal abort; callers cannot
+         * continue a partially prepared collective job. A foreign native-owner
+         * alias is rejected without entering or aborting that foreign domain.
+         */
+        [[nodiscard]] static std::optional<PreparedComputeObservation> measurePreparedCPUJoint(
+            const MoEOverlayParticipantResidencyRegistry& registry, uint64_t epoch,
+            int participant, int layer, int expert, ExpertHistogramSource phase,
+            const std::shared_ptr<IGlobalTPContext>& original_domain,
+            const std::shared_ptr<PhysicalMemoryAuthority>& memory,
+            std::span<float> diagnostic_output = {});
+
+        /**
+         * @brief Execute deterministic original prepared-only target/class/phase jobs.
+         * @param registry Original model-bound banks. @param plan Checked original declarations.
+         * @param geometry Full original H/F. @param original_domain Existing CPU expert owner, null only on nonmembers.
+         * @param memory Original PMA. @param model_profile Original workspace source for GPU targets.
+         * @param rank_inventory Same rank's actual backend geometry for GPU targets.
+         * @return Only actual locally rooted samples; cohort contributors emit no rows.
+         * @note This does not import live packet timing or install a service price.
+         */
+        static std::vector<MoEOverlayPreparedTargetServiceTotals> measurePreparedTargets(
+            const MoEOverlayParticipantResidencyRegistry& registry,
+            const MoEOverlayPreparedTargetServicePlan& plan,Geometry geometry,
+            const std::shared_ptr<IGlobalTPContext>& original_domain,
+            const std::shared_ptr<PhysicalMemoryAuthority>& memory,
+            const ModelMemoryProfile* model_profile=nullptr,const RankInventory* rank_inventory=nullptr);
 
         /**
          * @brief Measure missing priced CPU/GPU class/phase coordinates from the initial bank.

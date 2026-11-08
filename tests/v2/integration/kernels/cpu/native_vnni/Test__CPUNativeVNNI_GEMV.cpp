@@ -6,7 +6,10 @@
  * accumulation). General projections retain their per-format numerical gates;
  * grouped MTP and ExpertOverlay additionally require serial-row byte identity.
  * Compact-format ordered reductions have an independent scalar decoder oracle
- * for one-block, multi-block and trailing-empty partitions on both CPU ISAs.
+ * for one-block, multi-block and trailing-empty partitions on both x86 CPU ISAs.
+ * Opaque source words must reject reserved bits instead of masking them into
+ * valid coefficients. Rejection is fatal, not rollback of earlier vector stores;
+ * the outer stage may publish only a successfully completed operation.
  *
  * @note Run with Integration build: ctest -R V2_Integration_CPUNativeVNNI_GEMV
  */
@@ -47,6 +50,7 @@
 #include "utils/NativeVNNIEquivalenceInventory.h"
 #include "utils/VerifierRowTestInventory.h"
 #include "utils/CPUProjectionTestWorkspace.h"
+#include "utils/NativeVNNIPreparedByteFixture.h"
 
 using namespace llaminar2;
 using namespace llaminar2::cpu::native_vnni;
@@ -54,6 +58,74 @@ using namespace llaminar2::test;
 
 namespace
 {
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+    /** @test Every x86 vector/lane rejects corrupt source words without hiding partial writes. */
+    TEST(CPUNativeSourceMetadata, ReservedBitsRejectAtEveryVectorLane)
+    {
+        NativeVNNIPreparedByteFixture fixture(native_vnni_formats::IQ2_S, 64, 32);
+        fixture.seedPayloadAndMetadata();
+        const auto packed = fixture.view();
+        Q8_1Block activation{};
+        activation.d = 0x3c00;
+        activation.sum_qs = 32;
+        std::fill(std::begin(activation.qs), std::end(activation.qs), std::int8_t{1});
+        const std::array<const Q8_1Block *, 1> input{&activation};
+        const auto verify = [&]<int Lanes>() {
+            std::array<float, 64> result;
+            const std::array<float *, 1> output{result.data()};
+            multi_scale::dispatch<Lanes, 1>(packed, input, output, 0, 0, 1, false);
+            const auto reference = result;
+            for (int bad_column = 0; bad_column < 64; ++bad_column)
+            {
+                SCOPED_TRACE(::testing::Message() << "lanes=" << Lanes << " bad_column=" << bad_column);
+                auto *word = fixture.bytes.data() + packed.data_stride + 128 + bad_column * 2;
+                std::uint16_t original = 0;
+                std::memcpy(&original, word, sizeof(original));
+                const std::uint16_t invalid = 0xffff;
+                std::memcpy(word, &invalid, sizeof(invalid));
+                result.fill(123.0f);
+                EXPECT_THROW((multi_scale::dispatch<Lanes, 1>(packed, input, output, 0, 0, 1, false)), std::invalid_argument);
+                const int failed_vector = bad_column / Lanes * Lanes;
+                for (int column = 0; column < 64; ++column)
+                    if (column < failed_vector)
+                        EXPECT_EQ(std::bit_cast<std::uint32_t>(result[column]), std::bit_cast<std::uint32_t>(reference[column]));
+                    else
+                        EXPECT_EQ(result[column], 123.0f);
+                std::memcpy(word, &original, sizeof(original));
+            }
+        };
+        verify.template operator()<8>();
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+        verify.template operator()<16>();
+#endif
+        // IQ4_XS source-scale owners must reject all ten reserved bits as well;
+        // the historic SIMD accessors masked them into a plausible coefficient.
+        CPUNativeVNNIPackedWeights source_scale;
+        source_scale.codebook_id = native_vnni_formats::IQ4_XS.codebook_id;
+        source_scale.is_superblock = true;
+        source_scale.encoding = CPUNativeVNNIEncoding::NibbleLUTSourceScale;
+        alignas(64) std::array<std::uint16_t, 128> words;
+        words.fill(0x3c00);
+        std::fill(words.begin() + 64, words.end(), 32);
+        for (int bit = 6; bit < 16; ++bit)
+            for (int lane = 0; lane < 8; ++lane)
+            {
+                words[64 + lane] = std::uint16_t(32 | (1u << bit));
+                EXPECT_THROW((void)source_scale.loadScales256(words.data()), std::invalid_argument);
+                words[64 + lane] = 32;
+            }
+#if defined(__AVX512F__)
+        for (int bit = 6; bit < 16; ++bit)
+            for (int lane = 0; lane < 16; ++lane)
+            {
+                words[64 + lane] = std::uint16_t(32 | (1u << bit));
+                EXPECT_THROW((void)source_scale.loadScales512(words.data()), std::invalid_argument);
+                words[64 + lane] = 32;
+            }
+#endif
+    }
+#endif
+
     /** Prove integer activation packing independently of serial/grouped kernel agreement. */
     TEST(CPUActivationWordPacking, AllSignedBytesAndOffsetsMatchScalar)
     {

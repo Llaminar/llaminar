@@ -1,5 +1,7 @@
 # syntax=docker/dockerfile:1.6
 #
+# @file Dockerfile
+# @brief Build source-bound serving and test images with one genuine dependency/tool closure.
 # Llaminar — CUDA + ROCm runtime image
 #
 # Two-stage build:
@@ -718,7 +720,6 @@ ARG LLAMINAR_SOURCE_TREE
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       build-essential \
-      cmake \
       git \
       jq \
  && rm -rf /var/lib/apt/lists/*
@@ -736,6 +737,10 @@ RUN if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then \
 # /usr/local path. Copy that tiny exact executable rather than substituting the
 # distribution version and silently testing a different generator contract.
 COPY --from=toolchain /usr/local/bin/ninja /usr/local/bin/ninja
+# Keep the builder's exact Kitware entrypoints, not Ubuntu's older CTest JSON
+# interface. Their package/native binaries/data come from the same builder's
+# dist-packages copy below, so the installed inventory retains timeout ownership.
+COPY --from=toolchain /usr/local/bin/cmake /usr/local/bin/ctest /usr/local/bin/cpack /usr/local/bin/
 
 # Preserve the exact source/build paths encoded in CTest and binary RUNPATHs.
 # Copying the sealed workspace wholesale avoids a second hand-maintained list

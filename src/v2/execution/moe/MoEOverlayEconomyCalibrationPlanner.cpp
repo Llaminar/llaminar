@@ -428,112 +428,151 @@ namespace llaminar2
 
     MoEOverlaySealedMigrationMeasurements
     MoEOverlayEconomyCalibrationLayerCatalog::expand(
-        const MoEOverlaySealedMigrationMeasurements &
-            representative_measurements) const
+        const MoEOverlaySealedMigrationMeasurements &measurements) const
     {
-        if (!representative_measurements.valid() || groups_.empty() ||
-            identity_.empty())
+        return expandOriginalMeasurements(measurements, {});
+    }
+
+    MoEOverlaySealedMigrationMeasurements
+    MoEOverlayEconomyCalibrationLayerCatalog::expand(
+        const MoEOverlaySealedMigrationMeasurements &measurements,
+        std::shared_ptr<const MoEOverlayResidencySnapshot> snapshot) const
+    {
+        if (!snapshot || !snapshot->valid() ||
+            snapshot->firstModelLayer() != firstModelLayer() ||
+            snapshot->layerCount() != static_cast<int>(layerCount()))
+            throw std::invalid_argument("Target expansion requires the original sealed cohort source and exact layer interval");
+        if (snapshot->ownershipKind() != MoEOverlayResidencyOwnershipKind::CPUJointFragments)
+            return expandOriginalMeasurements(measurements, {});
+        if (!snapshot->originalProjectionPreparation())
+            throw std::invalid_argument("Target expansion lost its original cohort source preparation");
+        return expandOriginalMeasurements(measurements, std::move(snapshot));
+    }
+
+    MoEOverlaySealedMigrationMeasurements
+    MoEOverlayEconomyCalibrationLayerCatalog::expandOriginalMeasurements(
+        const MoEOverlaySealedMigrationMeasurements &measurements,
+        std::shared_ptr<const MoEOverlayResidencySnapshot> snapshot) const
+    {
+        if (!measurements.valid() || groups_.empty() || identity_.empty())
+            throw std::invalid_argument("Calibration expansion requires valid original measurements and catalog");
+
+        using Coordinate = MoEOverlayMigrationTargetCoordinate;
+        std::map<Coordinate, std::shared_ptr<const MoEOverlayMigrationMeasurementGeometry>> original_geometry;
+        std::vector<Coordinate> required;
+        if (snapshot)
         {
-            throw std::invalid_argument(
-                "ExpertOverlay calibration expansion requires valid representative evidence and catalog");
+            // The existing planner and fabric geometry builder remain the ONLY
+            // target/intersection authorities. buildShardPlacement uses one
+            // fixed plan-level member order per tier and balancedIntervals for
+            // each source. That rule depends only on F, source block and width;
+            // exact catalog projection classes therefore have identical cuts.
+            // Validate geometry anyway: arbitrary passive cuts are NOT another
+            // admitted scheduler or a reason to invent additional samples.
+            // Every layer's original cohort
+            // retains its complete source manifest, including whole endpoint roles.
+            std::vector<MoEOverlayLayerWeightManifest> manifests;
+            for (int layer = firstModelLayer(); layer < firstModelLayer() + static_cast<int>(layerCount()); ++layer)
+            {
+                const auto &owners = snapshot->placementOwnerMap().owners();
+                const auto source = std::find_if(owners.begin(), owners.end(), [&](const auto &owner) {
+                    return owner.layer_idx == layer && owner.shard_cohort;
+                });
+                if (source == owners.end())
+                    throw std::invalid_argument("Target expansion has no original cohort source manifest for a layer");
+                manifests.push_back(source->shard_cohort->source());
+            }
+            const MoEOverlayEconomyCalibrationLayerCatalog original_catalog(manifests);
+            if (original_catalog.identity() != identity_)
+                throw std::invalid_argument("Target expansion catalog differs from original source formats or geometry");
+            MoEOverlayEconomyCalibrationPlanner planner({.live_snapshot = snapshot,
+                .complete_expert_bytes_per_layer = complete_expert_bytes_per_layer_});
+            required = planner.requiredTargetCoordinates();
+            for (const auto &coordinate : required)
+            {
+                const auto wave = planner.buildPairSwap(coordinate.source_target,
+                    coordinate.destination_target, coordinate.layer, 1);
+                original_geometry.emplace(coordinate, makePhysicalMoEOverlayMeasurementGeometry(
+                    wave.migrations.front(), manifests.at(storageIndexForModelLayer(coordinate.layer)),
+                    snapshot->expertCount(), snapshot->placementOwnerMap()));
+            }
         }
 
-        for(const auto &row:representative_measurements.rows)
-            if(!row.coordinate.source_target.isWhole() || !row.coordinate.destination_target.isWhole())
-                throw std::invalid_argument("Cohort calibration expansion requires authenticated original per-layer target geometry");
-        using DirectedPair = std::pair<int, int>;
-        std::set<DirectedPair> directed_pairs;
-        std::set<std::tuple<int, int, int>> observed;
-        for (const auto &row : representative_measurements.rows)
+        std::map<Coordinate, const MoEOverlayTargetLayerMigrationMeasurement *> observed;
+        std::set<std::pair<int, int>> directed_pairs;
+        for (const auto &row : measurements.rows)
         {
-            const auto representative = std::lower_bound(
-                representative_layers_.begin(),
-                representative_layers_.end(),
-                row.coordinate.layer);
-            if (representative == representative_layers_.end() ||
-                *representative != row.coordinate.layer ||
-                !observed.emplace(
-                     row.coordinate.source_target.word(),
-                     row.coordinate.destination_target.word(),
-                     row.coordinate.layer)
-                     .second)
+            if (row.measured_coordinate ||
+                !observed.emplace(row.coordinate, &row).second)
+                throw std::invalid_argument("Calibration expansion rejects projected or duplicate input measurements");
+            (void)storageIndexForModelLayer(row.coordinate.layer);
+            if (!std::binary_search(representative_layers_.begin(), representative_layers_.end(), row.coordinate.layer))
+                throw std::invalid_argument("Calibration expansion requires physically measured catalog representatives");
+            if (snapshot)
             {
-                throw std::invalid_argument(
-                    "ExpertOverlay calibration expansion received a non-representative or duplicate row");
+                const auto expected = original_geometry.find(row.coordinate);
+                if (expected == original_geometry.end() || !row.geometry ||
+                    !expected->second->sameIdentity(*row.geometry))
+                    throw std::invalid_argument("Measured target geometry differs from original members, cuts or source formats");
             }
-            directed_pairs.emplace(
-                row.coordinate.source_target.word(), row.coordinate.destination_target.word());
-        }
-        const std::size_t expected_representative_rows = checkedProduct(
-            directed_pairs.size(), groups_.size(), "representative matrix");
-        if (representative_measurements.rows.size() !=
-            expected_representative_rows)
-        {
-            throw std::invalid_argument(
-                "ExpertOverlay calibration expansion is missing a directed-pair/layer-class row");
-        }
-        for (const auto &[source, destination] : directed_pairs)
-        {
-            for (const int representative : representative_layers_)
+            else if (!row.coordinate.source_target.isWhole() || !row.coordinate.destination_target.isWhole())
             {
-                if (!observed.contains(
-                        {source, destination, representative}))
-                {
-                    throw std::invalid_argument(
-                        "ExpertOverlay calibration expansion has an incomplete representative matrix");
-                }
+                throw std::invalid_argument("Whole expansion adapter requires unprojected whole representative rows");
             }
+            directed_pairs.emplace(row.coordinate.source_target.word(), row.coordinate.destination_target.word());
         }
+        if (!snapshot)
+            for (const auto &[source, destination] : directed_pairs)
+                for (int layer = firstModelLayer(); layer < firstModelLayer() + static_cast<int>(layerCount()); ++layer)
+                    required.push_back({MoEOverlayRouteTarget::fromWord(source),
+                        MoEOverlayRouteTarget::fromWord(destination), layer});
+        std::sort(required.begin(), required.end());
 
         MoEOverlaySealedMigrationMeasurements expanded;
-        expanded.rows.reserve(checkedProduct(
-            directed_pairs.size(),
-            complete_expert_bytes_per_layer_.size(),
-            "expanded matrix"));
-        for (const auto &row : representative_measurements.rows)
+        expanded.rows.reserve(required.size());
+        for (const auto &coordinate : required)
         {
-            const auto group = std::lower_bound(
-                groups_.begin(),
-                groups_.end(),
-                row.coordinate.layer,
-                [](const auto &candidate, int representative)
-                {
-                    return candidate.representative_layer < representative;
-                });
-            if (group == groups_.end() ||
-                group->representative_layer != row.coordinate.layer)
-            {
-                throw std::logic_error(
-                    "ExpertOverlay calibration representative disappeared during expansion");
-            }
-            for (const int member : group->member_layers)
-            {
-                auto copy = row;
-                copy.coordinate.layer = member;
-                expanded.rows.push_back(std::move(copy));
-            }
-        }
-        std::sort(
-            expanded.rows.begin(),
-            expanded.rows.end(),
-            [](const auto &left, const auto &right)
-            {
-                return left.coordinate < right.coordinate;
+            const auto group = std::find_if(groups_.begin(), groups_.end(), [&](const auto &candidate) {
+                return std::binary_search(candidate.member_layers.begin(), candidate.member_layers.end(), coordinate.layer);
             });
+            if (group == groups_.end())
+                throw std::logic_error("Original catalog lost an owned layer during expansion");
+            const auto sample = observed.find({coordinate.source_target,
+                coordinate.destination_target, group->representative_layer});
+            if (sample == observed.end())
+                throw std::invalid_argument("Calibration expansion is missing an original directed-pair/layer-class measurement");
+            if (snapshot && !sample->second->geometry->sameIdentity(*original_geometry.at(coordinate)))
+                throw std::invalid_argument("Changed original target cuts are not admitted by representative calibration");
 
-        std::uint64_t hash = kFNV1a64OffsetBasis;
-        hashString(hash, representative_measurements.identity);
-        hashString(hash, identity_);
-        expanded.identity =
-            "expert-overlay-expanded-migration-v1/" +
-            catalogIdentity(hash).substr(
-                std::string("expert-overlay-calibration-layer-catalog-v1/")
-                    .size());
-        if (!expanded.valid())
-        {
-            throw std::logic_error(
-                "ExpertOverlay calibration expansion produced an invalid full-layer corpus");
+            auto copy = *sample->second;
+            if (copy.coordinate.layer != coordinate.layer)
+            {
+                // Preserve the genuine observation owner and its measured layer.
+                // Equivalent-layer pricing does not create another physical sample.
+                copy.measured_coordinate = copy.coordinate;
+                copy.coordinate = coordinate;
+            }
+            expanded.rows.push_back(std::move(copy));
         }
+        std::uint64_t hash = kFNV1a64OffsetBasis;
+        hashString(hash, measurements.identity);
+        hashString(hash, identity_);
+        if (snapshot)
+        {
+            for (const auto &row : expanded.rows)
+            {
+                hashUnsigned(hash, static_cast<uint64_t>(row.coordinate.source_target.word()));
+                hashUnsigned(hash, static_cast<uint64_t>(row.coordinate.destination_target.word()));
+                hashUnsigned(hash, static_cast<uint64_t>(row.coordinate.layer));
+                hashUnsigned(hash, static_cast<uint64_t>(row.measured_coordinate
+                    ? row.measured_coordinate->layer : row.coordinate.layer));
+            }
+        }
+        expanded.identity = std::string(snapshot ? "expert-overlay-expanded-migration-v2/"
+                                                 : "expert-overlay-expanded-migration-v1/") +
+            catalogIdentity(hash).substr(std::string("expert-overlay-calibration-layer-catalog-v1/").size());
+        if (!expanded.valid())
+            throw std::logic_error("Calibration expansion produced an invalid full-layer corpus");
         return expanded;
     }
 

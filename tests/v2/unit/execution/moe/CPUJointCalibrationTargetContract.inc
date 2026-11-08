@@ -186,3 +186,121 @@ TEST(CPUJointCalibrationTargetContract, UnequalOriginalCohortsAreCompleteTargets
     missing.shadow_requirements = buildMoEOverlayShadowRequirements(missing.migrations);
     EXPECT_FALSE(missing.valid());
 }
+
+/** @test Recorded geometry observations price only exact original source-equivalent layers. */
+TEST(CPUJointCalibrationTargetContract, SourceBoundExpansionPreservesMeasuredLayerAndRejectsForeignGeometry)
+{
+    using namespace llaminar2;
+    using namespace llaminar2::test;
+    for (const int first : {0, 40})
+    {
+        SCOPED_TRACE(first);
+        JointPlacementOriginal original(2, 1, 4, 2, first);
+        MoEOverlayResidencyAuthority authority(original.config());
+        const auto snapshot = authority.snapshot();
+        std::vector<MoEOverlayLayerWeightManifest> manifests;
+        for (int layer = first; layer < first + 2; ++layer)
+            manifests.push_back(snapshot->placementOwnerMap().placementFor(layer, 1)->shard_cohort->source());
+        const MoEOverlayEconomyCalibrationLayerCatalog catalog(manifests);
+        // Prove the actual source builder's rule, not a test-authored split:
+        // one plan-level member order and balanced source-block intervals must
+        // produce equal Gate/Up F rows and Down K columns in each class layer.
+        for (int layer = first; layer < first + 2; ++layer)
+        {
+            const auto cohort = snapshot->placementOwnerMap().placementFor(layer, 1)->shard_cohort;
+            const auto intervals = MoEExpertShardCohort::balancedIntervals(cohort->source(), 2);
+            for (std::size_t member = 0; member < intervals.size(); ++member)
+            {
+                EXPECT_EQ(cohort->participants()[member].participant_id,
+                          snapshot->placementOwnerMap().placementFor(first, 1)->shard_cohort->participants()[member].participant_id);
+                for (const auto role : {WeightRole::MoEExpertGate, WeightRole::MoEExpertUp})
+                {
+                    const auto cut = cohort->ownership(member).projection(role);
+                    EXPECT_EQ(cut.first_row, intervals[member].first_column);
+                    EXPECT_EQ(cut.rows, intervals[member].columns);
+                }
+                const auto down = cohort->ownership(member).projection(WeightRole::MoEExpertDown);
+                EXPECT_EQ(down.first_column, intervals[member].first_column);
+                EXPECT_EQ(down.columns, intervals[member].columns);
+            }
+        }
+        MoEOverlayEconomyCalibrationPlanner planner({.live_snapshot = snapshot,
+            .complete_expert_bytes_per_layer = catalog.completeExpertBytesPerLayer()});
+        // These are explicitly recorded protocol inputs, not a native timing
+        // claim. The separate two-socket controller test supplies actual times.
+        const auto recorded = [&](const MoEOverlayEconomyCalibrationPlanner &source_planner,
+                                  const MoEOverlayResidencySnapshot &source_snapshot) {
+            MoEOverlaySealedMigrationMeasurements result{.identity = "recorded-original-target-expansion"};
+            for (const auto &coordinate : source_planner.requiredTargetCoordinates())
+            {
+                if (coordinate.layer != first) continue;
+                const auto wave = source_planner.buildPairSwap(coordinate.source_target,
+                    coordinate.destination_target, coordinate.layer, 1);
+                auto geometry = makePhysicalMoEOverlayMeasurementGeometry(wave.migrations.front(),
+                    manifests.front(), source_snapshot.expertCount(), source_snapshot.placementOwnerMap());
+                MoEOverlayTargetLayerMigrationMeasurement row{.coordinate = coordinate, .geometry = geometry,
+                    .wave_wall_nanoseconds = 100, .wave_sample_count = 3};
+                for (std::size_t piece = 0; piece < geometry->pieces().size(); ++piece)
+                    row.pieces.push_back({128 + piece, {.sequence = 1, .bytes = 128 + piece,
+                        .wall_nanoseconds = 100, .host_nanoseconds = 100}});
+                result.rows.push_back(std::move(row));
+            }
+            return result;
+        };
+        const auto measured = recorded(planner, *snapshot);
+        ASSERT_TRUE(measured.valid());
+        const auto expanded = catalog.expand(measured, snapshot);
+        ASSERT_TRUE(expanded.valid());
+        ASSERT_EQ(expanded.rows.size(), 4u);
+        for (const auto &row : expanded.rows)
+        {
+            const auto input = std::find_if(measured.rows.begin(), measured.rows.end(), [&](const auto &candidate) {
+                return candidate.coordinate.source_target.word() == row.coordinate.source_target.word();
+            });
+            ASSERT_NE(input, measured.rows.end());
+            EXPECT_EQ(row.geometry, input->geometry); // SAME physically measured geometry owner.
+            EXPECT_EQ(row.wave_wall_nanoseconds, input->wave_wall_nanoseconds);
+            EXPECT_EQ(row.wave_sample_count, input->wave_sample_count);
+            EXPECT_EQ(bool(row.measured_coordinate), row.coordinate.layer != first);
+            if (row.measured_coordinate) EXPECT_EQ(*row.measured_coordinate, input->coordinate);
+        }
+        EXPECT_EQ(MoEOverlayEconomyProfileComposer::normalizeMigrationMeasurements(expanded.rows).size(), 4u);
+        EXPECT_THROW((void)catalog.expand(expanded, snapshot), std::invalid_argument); // No projection chaining.
+        EXPECT_THROW((void)catalog.expand(measured), std::invalid_argument); // Whole adapter remains strict.
+        auto missing = measured; missing.rows.pop_back();
+        EXPECT_THROW((void)catalog.expand(missing, snapshot), std::invalid_argument);
+        auto duplicate = measured; duplicate.rows.push_back(duplicate.rows.front());
+        EXPECT_THROW((void)catalog.expand(duplicate, snapshot), std::invalid_argument);
+        auto wrong_format = measured;
+        const auto &geometry = *wrong_format.rows.front().geometry;
+        auto formats = geometry.formats(); formats[0] = ExpertWeightFormat::floating(TensorType::FP16);
+        wrong_format.rows.front().geometry = MoEOverlayMigrationMeasurementGeometry::checked(geometry.targets(), formats);
+        ASSERT_TRUE(wrong_format.valid());
+        EXPECT_THROW((void)catalog.expand(wrong_format, snapshot), std::invalid_argument);
+        auto different_cuts = measured;
+        auto targets = measured.rows.front().geometry->targets();
+        auto &cohort = targets.first.members.size() == 2 ? targets.first : targets.second;
+        const auto down_index = static_cast<std::size_t>(ExpertTierWeightProjection::Down);
+        const int full_f = cohort.members.front().projections[down_index].source_columns;
+        for (std::size_t member = 0; member < cohort.members.size(); ++member)
+        {
+            const int begin = member == 0 ? 0 : full_f / 4;
+            const int width = member == 0 ? full_f / 4 : full_f - full_f / 4;
+            for (const auto role : {ExpertTierWeightProjection::Gate, ExpertTierWeightProjection::Up})
+            {
+                auto &cut = cohort.members[member].projections[static_cast<std::size_t>(role)];
+                cut.first_row = begin; cut.rows = width;
+            }
+            auto &down = cohort.members[member].projections[down_index];
+            down.first_column = begin; down.columns = width;
+        }
+        // This unequal passive partition is well-formed geometry, but it was
+        // never the original source builder's admitted balanced partition.
+        different_cuts.rows.front().geometry = MoEOverlayMigrationMeasurementGeometry::checked(
+            std::move(targets), measured.rows.front().geometry->formats());
+        ASSERT_TRUE(different_cuts.valid());
+        EXPECT_THROW((void)catalog.expand(different_cuts, snapshot), std::invalid_argument);
+        EXPECT_EQ(authority.snapshot(), snapshot);
+        EXPECT_FALSE(authority.migrationEnabled());
+    }
+}

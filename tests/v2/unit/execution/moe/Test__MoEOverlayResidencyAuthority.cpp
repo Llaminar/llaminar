@@ -782,7 +782,7 @@ namespace llaminar2::test
                  .layer = 0,
                  .nanoseconds_per_activation = {100, 200, 300}},
             };
-            profile->participant_costs = {
+            profile->setParticipantCosts(std::vector<MoERoutedParticipantLayerPhaseServiceCost>{
                 {.participant_id = 0,
                  .layer = 0,
                  .nanoseconds_per_activation = {10, 20, 30}},
@@ -792,7 +792,7 @@ namespace llaminar2::test
                 {.participant_id = 2,
                  .layer = 0,
                  .nanoseconds_per_activation = {100, 200, 300}},
-            };
+            });
             return profile;
         }
 
@@ -843,8 +843,8 @@ namespace llaminar2::test
                                   uint64_t,
                                   kExpertHistogramProductionSourceCount>{
                                   100, 200, 300};
-                    profile->participant_costs.push_back({
-                        .participant_id = participant,
+                    profile->target_costs.push_back({
+                        .target = MoEOverlayRouteTarget::whole(participant),
                         .layer = layer,
                         .nanoseconds_per_activation = cost,
                     });
@@ -868,14 +868,14 @@ namespace llaminar2::test
                  .layer = 0,
                  .nanoseconds_per_activation = {10, 20, 30}},
             };
-            profile->participant_costs = {
+            profile->setParticipantCosts(std::vector<MoERoutedParticipantLayerPhaseServiceCost>{
                 {.participant_id = 0,
                  .layer = 0,
                  .nanoseconds_per_activation = {10, 20, 30}},
                 {.participant_id = 1,
                  .layer = 0,
                  .nanoseconds_per_activation = {10, 20, 30}},
-            };
+            });
             return profile;
         }
 
@@ -894,14 +894,14 @@ namespace llaminar2::test
                  .layer = 0,
                  .nanoseconds_per_activation = {100, 100, 100}},
             };
-            profile->participant_costs = {
+            profile->setParticipantCosts(std::vector<MoERoutedParticipantLayerPhaseServiceCost>{
                 {.participant_id = 0,
                  .layer = 0,
                  .nanoseconds_per_activation = {1, 1, 1}},
                 {.participant_id = 1,
                  .layer = 0,
                  .nanoseconds_per_activation = {100, 100, 100}},
-            };
+            });
             return profile;
         }
 
@@ -931,10 +931,7 @@ namespace llaminar2::test
                     {
                         if (source == destination)
                             continue;
-                        profile->costs.push_back({
-                            .source_participant = source,
-                            .destination_participant = destination,
-                            .layer = layer,
+                        profile->costs.push_back({.coordinate = {.source_target = MoEOverlayRouteTarget::whole(source), .destination_target = MoEOverlayRouteTarget::whole(destination), .layer = layer},
                             .transfer_and_repack_ns = transfer_and_repack_ns,
                             .inference_interference_ns =
                                 inference_interference_ns,
@@ -969,10 +966,7 @@ namespace llaminar2::test
                     {
                         if (source == destination)
                             continue;
-                        profile->costs.push_back({
-                            .source_participant = source,
-                            .destination_participant = destination,
-                            .layer = layer,
+                        profile->costs.push_back({.coordinate = {.source_target = MoEOverlayRouteTarget::whole(source), .destination_target = MoEOverlayRouteTarget::whole(destination), .layer = layer},
                             .transfer_and_repack_ns =
                                 transfer_and_repack_ns,
                             .inference_interference_ns =
@@ -991,7 +985,7 @@ namespace llaminar2::test
             auto profile =
                 std::make_shared<MoEOverlayMigrationCostProfile>();
             profile->identity = "two-participant-same-domain-v1";
-            profile->costs = {
+            profile->setWholeCosts(std::vector<MoEOverlayParticipantLayerMigrationCost>{
                 {.source_participant = 0,
                  .destination_participant = 1,
                  .layer = 0,
@@ -1002,7 +996,7 @@ namespace llaminar2::test
                  .layer = 0,
                  .transfer_and_repack_ns = 1,
                  .inference_interference_ns = 1},
-            };
+            });
             return profile;
         }
 
@@ -1814,6 +1808,57 @@ namespace llaminar2::test
         EXPECT_EQ(
             authority.stats().current_batch_llep_lease_rejections,
             1u);
+    }
+
+    /** @test Positive interference is admitted and charged by canonical typed-target payoff. */
+    TEST(Test__MoEOverlayResidencyAuthority, TypedMigrationInterferencePreservesAcceptanceAndPayoff)
+    {
+        std::array<MoEOverlayResidencyTransaction, 3> proposals;
+        const std::array<uint64_t, 3> interference{0, 1, 1'000'000};
+        for (std::size_t trial = 0; trial < interference.size(); ++trial)
+        {
+            SCOPED_TRACE(interference[trial]);
+            auto histogram = oneTierHistogram(2);
+            auto movement = std::make_shared<MoEOverlayMigrationCostProfile>(
+                *twoParticipantMigrationProfile());
+            for (auto &row : movement->costs)
+                row.inference_interference_ns = interference[trial];
+            MoEOverlayResidencyAuthority authority({
+                .initial_plan = oneTierTwoParticipantPlan(RoutedExpertResidencyPolicy::RoutedTierRebalanced),
+                .model_metadata = modelMetadata(), .maintenance_mode = MoERebalanceRuntimeMode::Dynamic,
+                .histogram = histogram.get(), .phase_service_profile = oneTierServiceProfile(),
+                .migration_cost_profile = movement,
+                .migration_economy_policy = MoEOverlayMigrationEconomyPolicy{
+                    .historical_window_weight = 0, .current_window_weight = 1,
+                    .payoff_horizon_tokens = 2, .minimum_net_benefit_ns = 0,
+                    .minimum_residency_generations = 0},
+                .participant_rebalance_policy = {.enabled = true,
+                    .imbalance_threshold_per_mille = 1300, .minimum_improvement_per_mille = 50,
+                    .maximum_swaps_per_layer = 1, .maximum_plan_entries_per_wave = 2,
+                    .minimum_window_activations = 1},
+                .shadow_slots_per_endpoint_layer = 1, .max_concurrent_cycles = 1,
+            });
+            proposals[trial] = authority.proposeFromFrozenHistogramWindow(observedBatches({0, 1, 3, 4}));
+            ASSERT_TRUE(proposals[trial].valid());
+            if (trial < 2)
+            {
+                ASSERT_FALSE(proposals[trial].empty());
+                // Reciprocal rows price the SAME calibrated pair wave;
+                // preserve its max cost rather than double charging both edges.
+                EXPECT_EQ(proposals[trial].economy.projected_transfer_and_repack_ns, 1u);
+                EXPECT_EQ(proposals[trial].economy.projected_inference_interference_ns,
+                          interference[trial]);
+            }
+            else
+            {
+                EXPECT_TRUE(proposals[trial].empty());
+                EXPECT_GT(authority.stats().payoff_rejected_cycles, 0u);
+            }
+        }
+        EXPECT_EQ(proposals[0].economy.projected_service_gain_ns,
+                  proposals[1].economy.projected_service_gain_ns);
+        EXPECT_EQ(proposals[0].economy.projected_net_benefit_ns,
+                  proposals[1].economy.projected_net_benefit_ns + 1);
     }
 
     TEST(Test__MoEOverlayResidencyAuthority, BalancedMarginalsCanHideActionableDecodeBatchSkew)
@@ -4322,10 +4367,7 @@ namespace llaminar2::test
                     const bool expensive_layer_zero_tier_edge =
                         layer == 0 &&
                         (source == 0 || destination == 0);
-                    migration_profile->costs.push_back({
-                        .source_participant = source,
-                        .destination_participant = destination,
-                        .layer = layer,
+                    migration_profile->costs.push_back({.coordinate = {.source_target = MoEOverlayRouteTarget::whole(source), .destination_target = MoEOverlayRouteTarget::whole(destination), .layer = layer},
                         .transfer_and_repack_ns =
                             expensive_layer_zero_tier_edge ? 100'000u : 1u,
                         .inference_interference_ns =
@@ -4469,8 +4511,8 @@ namespace llaminar2::test
                 std::uint64_t cost = participant == 0 ? 10u : 100u;
                 if (layer == 0 && participant == 3)
                     cost = 1'000u;
-                service_profile->participant_costs.push_back({
-                    .participant_id = participant,
+                service_profile->target_costs.push_back({
+                    .target = MoEOverlayRouteTarget::whole(participant),
                     .layer = layer,
                     .nanoseconds_per_activation = {cost, cost, cost},
                 });
@@ -4489,10 +4531,7 @@ namespace llaminar2::test
                 {
                     if (source == destination)
                         continue;
-                    migration_profile->costs.push_back({
-                        .source_participant = source,
-                        .destination_participant = destination,
-                        .layer = layer,
+                    migration_profile->costs.push_back({.coordinate = {.source_target = MoEOverlayRouteTarget::whole(source), .destination_target = MoEOverlayRouteTarget::whole(destination), .layer = layer},
                         .transfer_and_repack_ns = 1,
                         .inference_interference_ns = 1,
                     });
@@ -5481,11 +5520,10 @@ namespace llaminar2::test
                         .nanoseconds_per_activation = {price, 2 * price, 3 * price}});
                     for (int participant = 0; participant < 2; ++participant)
                     {
-                        service->participant_costs.push_back({.participant_id = participant,
+                        service->target_costs.push_back({.target = MoEOverlayRouteTarget::whole(participant),
                             .layer = layer,
                             .nanoseconds_per_activation = {price, 2 * price, 3 * price}});
-                        movement->costs.push_back({.source_participant = participant,
-                            .destination_participant = 1 - participant, .layer = layer,
+                        movement->costs.push_back({.coordinate = {.source_target = MoEOverlayRouteTarget::whole(participant), .destination_target = MoEOverlayRouteTarget::whole(1 - participant), .layer = layer},
                             .transfer_and_repack_ns = 1, .inference_interference_ns = 1});
                     }
                 }
@@ -5680,10 +5718,10 @@ namespace llaminar2::test
             case 0: fixture.service->production_topology = ExpertHistogramProductionTopology::uniform(
                         2, kAllExpertHistogramProductionSources, 0); break;
             case 1: fixture.service->costs[0].layer = 0; break;
-            case 2: fixture.service->participant_costs[0].layer = 0; break;
-            case 3: fixture.movement->costs[0].layer = 0; break;
+            case 2: fixture.service->target_costs[0].layer = 0; break;
+            case 3: fixture.movement->costs[0].coordinate.layer = 0; break;
             case 4: fixture.service->costs.pop_back(); break;
-            case 5: fixture.service->participant_costs.pop_back(); break;
+            case 5: fixture.service->target_costs.pop_back(); break;
             case 6: fixture.movement->costs.pop_back(); break;
             case 7: fixture.movement->costs.back() = fixture.movement->costs.front(); break;
             }

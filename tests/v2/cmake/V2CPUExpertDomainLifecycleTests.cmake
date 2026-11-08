@@ -34,6 +34,19 @@ foreach(_cpu_socket_population IN ITEMS 2 4 8)
     endforeach()
 endforeach()
 
+# This setup producer uses original source banks and one physical rank per
+# socket. Its interval ends at the canonical output and excludes dispatch.
+if(V2_TEST_SOCKETS AND V2_TEST_SOCKETS GREATER_EQUAL 2)
+    add_v2_test(V2_Integration_CPUJointPreparedComputeService
+        COMMAND $<TARGET_FILE:v2_integration_cpu_expert_domain_lifecycle>
+            --gtest_filter=CPUExpertDomainNative.PreparedCPUJointComputeRootWallAndRetirement
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;MoE;MPI;Collective;Service;Measurement;Lifecycle;Replay"
+        MPI_PROCS 2 NO_MODELS TIMEOUT 120
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1"
+            "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUJointPreparedComputeService)
+endif()
+
 add_executable(v2_unit_cpu_expert_socket_membership unit/collective/Test__CPUExpertSocketMembership.cpp)
 target_compile_features(v2_unit_cpu_expert_socket_membership PRIVATE cxx_std_20)
 target_link_libraries(v2_unit_cpu_expert_socket_membership PRIVATE GTest::gtest_main)

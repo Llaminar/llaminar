@@ -13,7 +13,9 @@
  * 7. Multi-row batch correctness
  *
  * The Q8_1 softmax operates on quantized integer data, computing softmax
- * with minimal floating-point conversions and requantizing the output.
+ * with minimal floating-point conversions and requantizing the output. All
+ * fixtures obey the authoritative FP16 Q8_1Block metadata ABI; a private BF16
+ * scale would conceal real producer/consumer corruption.
  * We test accuracy against a FP32 reference (dequant → softmax → requant).
  */
 
@@ -28,6 +30,7 @@
 
 #include "v2/kernels/cpu/primitives/SoftmaxPrimitives_New.h"
 #include "v2/tensors/BlockStructures.h"
+#include "v2/tensors/FP16Utils.h"
 
 using namespace llaminar2::primitives;
 using namespace llaminar2;
@@ -57,10 +60,7 @@ namespace
         for (int b = 0; b < n_blocks; ++b)
         {
             const Q8_1Block &block = row[b];
-            // Convert FP16 scale to FP32 (stored as BF16 in our implementation)
-            uint32_t fp32_bits = static_cast<uint32_t>(block.d) << 16;
-            float d;
-            std::memcpy(&d, &fp32_bits, sizeof(float));
+            const float d = fp16_to_fp32(block.d);
 
             for (int i = 0; i < 32; ++i)
             {
@@ -93,11 +93,7 @@ namespace
             float d = (max_abs > 0.0f) ? max_abs / 127.0f : 1.0f / 127.0f;
             float inv_d = 1.0f / d;
 
-            // Convert scale to BF16 format
-            uint32_t d_bits;
-            std::memcpy(&d_bits, &d, sizeof(float));
-            uint16_t d_bf16 = static_cast<uint16_t>(d_bits >> 16);
-            block.d = d_bf16;
+            block.d = fp32_to_fp16(d);
 
             // Quantize values
             int16_t sum_qs = 0;
@@ -207,10 +203,7 @@ namespace
         for (int b = 0; b < n_blocks; ++b)
         {
             float d = scale_dist(rng);
-            // Convert to BF16
-            uint32_t d_bits;
-            std::memcpy(&d_bits, &d, sizeof(float));
-            row[b].d = static_cast<uint16_t>(d_bits >> 16);
+            row[b].d = fp32_to_fp16(d);
 
             int16_t sum_qs = 0;
             for (int i = 0; i < 32; ++i)
@@ -279,9 +272,7 @@ TEST_F(Q8_1SoftmaxPrimitivesTest, ScalarBasicFunctionality)
     for (int b = 0; b < n_blocks; ++b)
     {
         float d = 0.1f; // Larger scale
-        uint32_t d_bits;
-        std::memcpy(&d_bits, &d, sizeof(float));
-        input[b].d = static_cast<uint16_t>(d_bits >> 16);
+        input[b].d = fp32_to_fp16(d);
 
         int16_t sum_qs = 0;
         for (int i = 0; i < 32; ++i)
@@ -415,9 +406,7 @@ TEST_F(Q8_1SoftmaxPrimitivesTest, VsFP32Reference_UniformInput)
     for (int b = 0; b < n_blocks; ++b)
     {
         float d = 0.01f;
-        uint32_t d_bits;
-        std::memcpy(&d_bits, &d, sizeof(float));
-        input_q8[b].d = static_cast<uint16_t>(d_bits >> 16);
+        input_q8[b].d = fp32_to_fp16(d);
 
         int16_t sum_qs = 0;
         for (int i = 0; i < 32; ++i)
@@ -454,9 +443,7 @@ TEST_F(Q8_1SoftmaxPrimitivesTest, VsFP32Reference_PeakyInput)
     for (int b = 0; b < n_blocks; ++b)
     {
         float d = 0.1f;
-        uint32_t d_bits;
-        std::memcpy(&d_bits, &d, sizeof(float));
-        input_q8[b].d = static_cast<uint16_t>(d_bits >> 16);
+        input_q8[b].d = fp32_to_fp16(d);
 
         int16_t sum_qs = 0;
         for (int i = 0; i < 32; ++i)
@@ -598,9 +585,7 @@ TEST_F(Q8_1SoftmaxPrimitivesTest, Requantization_ScaleComputation)
     for (int b = 0; b < n_blocks; ++b)
     {
         float d = 0.1f;
-        uint32_t d_bits;
-        std::memcpy(&d_bits, &d, sizeof(float));
-        input_q8[b].d = static_cast<uint16_t>(d_bits >> 16);
+        input_q8[b].d = fp32_to_fp16(d);
 
         for (int i = 0; i < 32; ++i)
         {
@@ -613,12 +598,10 @@ TEST_F(Q8_1SoftmaxPrimitivesTest, Requantization_ScaleComputation)
 
     // After softmax, max probability is close to 1.0
     // Scale should be approximately 1/127 = 0.00787...
-    // But stored as BF16, so check it's in reasonable range
+    // Decode the actual FP16 metadata, not an alternate test-only scale ABI.
     for (int b = 0; b < n_blocks; ++b)
     {
-        uint32_t d_bits = static_cast<uint32_t>(input_q8[b].d) << 16;
-        float d;
-        std::memcpy(&d, &d_bits, sizeof(float));
+        const float d = fp16_to_fp32(input_q8[b].d);
 
         EXPECT_GT(d, 0.0f) << "Scale should be positive for block " << b;
         EXPECT_LT(d, 1.0f) << "Scale should be < 1 for probability block " << b;

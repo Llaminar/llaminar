@@ -239,6 +239,7 @@ namespace llaminar2
             CalibrationReadiness,
             ServiceReadiness,
             Service,
+            PreparedService,
         };
 
         Config config;
@@ -248,6 +249,7 @@ namespace llaminar2
         EvidenceCountHeader local_attempt;
         std::vector<EvidenceCountHeader> gathered_attempts;
         std::shared_ptr<const MoEOverlayMigrationEvidenceContext> evidence_context;
+        std::shared_ptr<const MoEOverlayPreparedTargetServicePlan> prepared_service_plan;
         std::vector<std::byte> local_payload, gathered_payload;
         std::vector<int> payload_counts, payload_offsets;
         bool payload_active = false;
@@ -380,7 +382,7 @@ namespace llaminar2
                     const char *operation =
                         expected == Active::ServiceReadiness
                             ? "MPI_Iallreduce"
-                            : payload_active && (expected==Active::Attempt || expected==Active::MigrationProfile)
+                            : payload_active && (expected==Active::Attempt || expected==Active::MigrationProfile || expected==Active::PreparedService)
                                 ? "MPI_Iallgatherv" : "MPI_Iallgather";
                     diagnostic
                         << operation
@@ -1301,4 +1303,95 @@ namespace llaminar2
     {
         return impl_->stats;
     }
+    bool MoEOverlayMPIEconomyEvidenceExchange::beginPreparedService(
+        std::shared_ptr<const MoEOverlayPreparedTargetServicePlan> plan,
+        const std::vector<MoEOverlayPreparedTargetServiceTotals>& local,std::string* error)
+    {
+        if(impl_->active!=Impl::Active::Idle || impl_->request!=MPI_REQUEST_NULL) {
+            ++impl_->stats.concurrent_start_rejections;assignError(error,"Prepared service evidence lane is already owned");return false;
+        }
+        try {
+            if(!plan || !plan->authenticates(plan) || plan->snapshot()->placementOwnerMap().participants()!=impl_->config.owner_map.participants() ||
+                plan->topology()!=impl_->config.production_topology)
+                throw std::invalid_argument("Prepared service exchange requires original target/inventory/phase declarations");
+            for(const auto& entry:plan->entries())if(entry.root_world_rank<0 || entry.root_world_rank>=worldSize())
+                throw std::invalid_argument("Prepared service original root is outside this MPI authority");
+            impl_->local_payload=MoEOverlayEconomyEvidenceCodec::encodePreparedService(*plan,local,worldRank());
+            if(impl_->local_payload.size()>size_t(INT_MAX))throw std::invalid_argument("Prepared service live payload exceeds MPI ABI");
+            EvidenceCountHeader wire{};wire.evidence_kind=3;wire.world_rank=worldRank();wire.world_size=worldSize();
+            wire.expected_epoch=plan->snapshot()->epoch;wire.candidate_epoch=wire.expected_epoch;
+            wire.schedule_fingerprint=fnv1a64(plan->identity().data(),plan->identity().size());
+            wire.payload_bytes=impl_->local_payload.size();wire.payload_hash=fnv1a64(impl_->local_payload.data(),impl_->local_payload.size());
+            wire.packet_hash=evidenceHeaderHash(wire);impl_->local_attempt=wire;
+            impl_->prepared_service_plan=std::move(plan);impl_->evidence_context.reset();impl_->payload_active=false;
+            std::fill(impl_->gathered_attempts.begin(),impl_->gathered_attempts.end(),EvidenceCountHeader{});
+            if(!impl_->beginRaw(&impl_->local_attempt,impl_->gathered_attempts.data(),sizeof(wire),Impl::Active::PreparedService,error))return false;
+            impl_->stats.evidence_count_bytes_sent+=sizeof(wire);++impl_->stats.service_exchanges_started;
+            impl_->record("mpi_economy_prepared_service_count_bytes_sent",sizeof(wire));return true;
+        }catch(const std::exception& exception) {
+            ++impl_->stats.rejected_packets;assignError(error,exception.what());
+            // Local rejection may race a peer's posted count request. Keep the
+            // existing MPI fatal authority, never leave that peer awaiting data.
+            abortMoEOverlayMPI(impl_->communicator,worldRank(),"prepared_service_evidence",exception.what());
+        }
+    }
+
+    MoEOverlayResidencyWaveProgress MoEOverlayMPIEconomyEvidenceExchange::pollPreparedService(
+        std::vector<MoEOverlayPreparedTargetServiceTotals>* result,std::string* error)
+    {
+        if(!result){assignError(error,"Prepared service exchange requires its output owner");return MoEOverlayResidencyWaveProgress::Failed;}
+        const auto progress=impl_->pollRaw(Impl::Active::PreparedService,error);
+        if(progress!=MoEOverlayResidencyWaveProgress::Ready)return progress;
+        try {
+            const auto& plan=*impl_->prepared_service_plan;
+            if(!impl_->payload_active) {
+                size_t total=0;
+                for(size_t rank=0;rank<impl_->gathered_attempts.size();++rank) {
+                    const auto& wire=impl_->gathered_attempts[rank];const auto& own=impl_->local_attempt;
+                    if(wire.magic!=kAttemptMagic || wire.version!=5 || wire.reserved || wire.reserved_result || wire.evidence_kind!=3 ||
+                        wire.world_rank!=int(rank) || wire.world_size!=worldSize() ||
+                        wire.expected_epoch!=own.expected_epoch || wire.candidate_epoch!=own.candidate_epoch ||
+                        wire.schedule_fingerprint!=own.schedule_fingerprint || wire.calibration_sequence ||
+                        wire.first_target_word!=-1 || wire.second_target_word!=-1 || wire.layer!=-1 || wire.source ||
+                        wire.real_rows || wire.execution_rows || wire.transaction_count || wire.speculative_depth ||
+                        wire.baseline_nanoseconds || wire.concurrent_nanoseconds || wire.exact_overlap || wire.wave_wall_nanoseconds ||
+                        wire.migration_count || wire.transaction_purpose || wire.experts!=std::array<int32_t,2>{-1,-1} ||
+                        wire.packet_hash!=evidenceHeaderHash(wire) ||
+                        wire.payload_bytes!=MoEOverlayEconomyEvidenceCodec::preparedServiceBytes(plan,int(rank)) ||
+                        wire.payload_bytes>size_t(INT_MAX)-total)
+                        throw std::invalid_argument("Prepared service count header differs from original live declarations");
+                    impl_->payload_counts[rank]=int(wire.payload_bytes);impl_->payload_offsets[rank]=int(total);total+=wire.payload_bytes;
+                }
+                impl_->gathered_payload.resize(total);
+                const int status=MPI_Iallgatherv(impl_->local_payload.data(),int(impl_->local_payload.size()),MPI_BYTE,
+                    impl_->gathered_payload.data(),impl_->payload_counts.data(),impl_->payload_offsets.data(),MPI_BYTE,
+                    impl_->communicator,&impl_->request);
+                if(status!=MPI_SUCCESS || impl_->request==MPI_REQUEST_NULL)
+                    abortMoEOverlayMPI(impl_->communicator,worldRank(),"prepared_service_evidence",mpiError("MPI_Iallgatherv",status));
+                impl_->payload_active=true;impl_->active=Impl::Active::PreparedService;
+                impl_->stats.evidence_payload_bytes_sent+=impl_->local_payload.size();
+                impl_->stats.evidence_payload_bytes_received+=total;++impl_->stats.evidence_payload_collectives_started;
+                impl_->record("mpi_economy_prepared_service_payload_bytes_sent",impl_->local_payload.size());
+                impl_->record("mpi_economy_prepared_service_payload_bytes_received",total);
+                // The original count-start deadline covers both requests.
+                return MoEOverlayResidencyWaveProgress::Pending;
+            }
+            std::vector<MoEOverlayPreparedTargetServiceTotals> complete;
+            for(size_t rank=0;rank<impl_->gathered_attempts.size();++rank) {
+                const auto bytes=std::span<const std::byte>(impl_->gathered_payload).subspan(impl_->payload_offsets[rank],impl_->payload_counts[rank]);
+                if(fnv1a64(bytes.data(),bytes.size())!=impl_->gathered_attempts[rank].payload_hash)
+                    throw std::invalid_argument("Prepared service live payload failed protocol integrity");
+                auto local=MoEOverlayEconomyEvidenceCodec::decodePreparedService(plan,bytes,int(rank));
+                complete.insert(complete.end(),std::make_move_iterator(local.begin()),std::make_move_iterator(local.end()));
+            }
+            std::sort(complete.begin(),complete.end(),[](const auto& a,const auto& b){return a.coordinate<b.coordinate;});
+            *result=std::move(complete);impl_->prepared_service_plan.reset();impl_->payload_active=false;
+            ++impl_->stats.service_exchanges_completed;
+            if(error)error->clear();return MoEOverlayResidencyWaveProgress::Ready;
+        }catch(const std::exception& exception) {
+            ++impl_->stats.rejected_packets;assignError(error,exception.what());
+            abortMoEOverlayMPI(impl_->communicator,worldRank(),"prepared_service_evidence",exception.what());
+        }
+    }
+
 } // namespace llaminar2

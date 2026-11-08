@@ -8,7 +8,9 @@
  * Domain-only cases construct no model. The CUDA/ROCm replay cases additionally
  * prepares a tiny genuine source and joins its actual GPU dispatch, CPU shards
  * and rooted return. It supplies no fabricated completion/readiness and makes
- * no full-model accuracy or deployment qualification claim.
+ * no full-model accuracy or deployment qualification claim. The prepared CPU
+ * service case uses a genuine tiny source at the explicitly dispatch-exclusive
+ * input-ready/start-release to canonical-output boundary.
  */
 #include "app/MPIProcessSession.h"
 #include "collective/GlobalTPContext.h"
@@ -185,3 +187,5 @@ TEST_F(CPUExpertDomainNative, ROCmPreparedRootedVerifierReplay)
 #endif
 
 }
+
+#include "CPUJointPreparedComputeServiceContract.inc"

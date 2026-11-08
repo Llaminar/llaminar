@@ -587,9 +587,88 @@ for eighty actual controller calibration waves; existing shadow-copy and MPI
 evidence controls also repeat twenty times. All 80 observed temporary model
 paths are retired. This test-only successor changes no production implementation.
 
+The shadow-wave witness now also progresses each rank independently instead of
+voting with a test-side MPI allreduce on every poll. A single terminal join keeps
+the original owners alive after both operations complete. Build230 and
+`focused231` pass both shadow and controller registrations, twenty repetitions
+each, in 4.66 seconds with no skips and a clean driver window. This removes test
+lockstep that could otherwise conceal production progress races; it changes no
+transport or calibration implementation.
+
 Complete cohort service/rooted-return pricing and changed-epoch
 publication/inference remain open. No model arithmetic, KL limit, serving-time
 Dynamic cohort guard or Release performance claim changes in these slices.
+
+## Prepared complete-target CPU service measurement
+
+The existing prepared-service producer now measures a real CPU tensor-sharded
+target using its original source, fragment banks, PMA and native domain. The
+root interval includes start release, fragment FFNs, rooted gather/combine and
+the canonical output fold. Input-ready rendezvous, serving dispatch and device
+ingress/return are excluded. Contributors emit no duplicate price or logical
+row count. Existing whole-expert prepared computation remains the control.
+This is passive setup evidence, not an installed economy price or permission
+to enable dynamic cohort movement.
+
+Build241 compiles the production producer and owning fixtures. The first
+`focused242` invocation passed the native computation and retirement once,
+then exposed two fixture errors: a missing owner map in the host rejection
+case, and GTest repetition attempting to reinitialize finalized MPI. Build243
+repairs the fixtures and repeats twenty complete source/domain lifetimes inside
+one original MPI session, one rank per physical socket. In `focused244`,
+`CPUJointPreparedComputeOriginalDomainContract` passes in 0.33 seconds and
+`CPUJointPreparedComputeService` in 11.76 seconds, with no skips and a clean
+driver window. Prefill, decode and grouped-verifier outputs match the independent
+tiny-source FP32 oracle; dirty tails, source expiry and per-probe/final PMA
+retirement pass. Both regressions are explicitly registered in production
+preflight. The same batch's unrelated CUDA reader-ACK fixture remained red;
+this is a scoped CPU result, not a claim that the complete batch was green.
+
+Receipts remain under `/tmp/qfn-cpu-joint-qualified-r224/`, including
+`prepared-service244-evidence.json`. Full preflight, new model KL and Release
+performance were not run.
+
+The subsequent consumer slice uses one typed target-cost vector and one typed
+migration-cost vector. Checked whole-participant adapters project those same
+rows; there is no duplicate runtime price table or separate cohort controller.
+The existing objective, hotness, hysteresis, payoff horizon, residency rules and
+phase nonregression checks price a complete cohort once. Prepared-only service
+evidence stays distinct from dispatch-inclusive live measurements. Original
+source, sample layer, expert, root rank and measured phase must agree before
+encoding or composition. Equivalent sample layers without a resident expert
+are skipped during sample selection; absence across the entire class is fatal.
+
+Build262 compiled the consumer slice. `focused263` found an unintended validator
+restriction: positive inference-interference costs were rejected, breaking the
+owning authority and native MPI consensus suites. Build266 restores the original
+cost contract. The explicit `MoETypedMigrationInterferenceReplay` regression
+proves that small positive interference is accepted and subtracted from payoff,
+and a large interference cost rejects uneconomical movement. It preserves the
+existing reciprocal-wave maximum instead of charging both edges twice.
+
+`focused267` passes all 14 selected registrations in 26.44 seconds, without
+skips and with clean driver evidence. This includes all 82 authority cases,
+21 consensus cases per actual MPI rank, typed-target source/codec/objective
+contracts, the economy composer and maintenance suites, and the native CPU
+producer. The latter retains twenty real source/domain lifetimes; the last two
+use a cohort-only routed tier with the original CPU0 continuation. Four complete
+outer producer/exchange/composer replays measure prefill, decode and grouped
+verification. The root sends exactly 120 evidence bytes, the contributor zero,
+and both receive 120. Actual durations, sample counts and expert provenance
+survive the exchange unchanged; PMA claims and original owners retire normally.
+`prepared267-evidence.json` records the scoped suite counts.
+
+The remaining affected callers pass in `focused270`: six owning planning,
+rebalancing, calibration/measurement and native transaction/controller-fabric
+registrations, 9.93 seconds, no skips, clean driver evidence. The fabric control
+uses the actual two CUDA and four MI50 devices. These checks retain the existing
+whole-expert behavior after the typed target-cost API change.
+
+The source-bound Off configuration consumes this evidence without permitting
+movement. Complete cohort calibration expansion and changed-epoch publication
+through dynamic inference still require qualification; the runtime guards remain.
+These focused results do not certify full preflight, fresh model KL or Release
+performance.
 
 ## Shared histogram candidate construction
 
@@ -1018,3 +1097,29 @@ Local evidence root: `/tmp/qfn-cpu-joint-qualified-r224/`.
 The original red reports remain intact. Focused repairs do not convert the
 previous complete-preflight receipt into a green one. No complete preflight
 was run for this slice, and no model/corpus reference or arithmetic was changed.
+
+
+## Original-source cohort calibration expansion (r401)
+
+The existing calibration catalog now expands physically measured complete-target
+rows only across layers with matching original source geometry. It validates
+original formats, all cohort members and source cuts through the existing
+calibration planner and physical geometry builder. Projected rows retain their
+actual measured coordinate; they cannot be submitted as fresh physical samples
+or expanded again. Whole-target expansion keeps its existing arithmetic. This
+does not enable Dynamic cohort serving by itself.
+
+`build273-result.json` records the scoped Integration build, with the existing
+CUDA SM80/86/89/90 and ROCm gfx906/gfx1100 spill guards unchanged. In
+`focused274/`, all seven relevant registrations passed: owning residency,
+composer, calibration-controller and measurement-ledger suites; the complete
+CPU target contract; the repeated actual two-socket physical calibration test;
+and the separate unsupported-native-cohort admission contract. No tests skipped
+and the driver window was clean. The complete invocation remained red because
+four ngram planning registrations exposed unrelated stale reader assertions
+and a new fixture missing one compute consumer's resource observation. Those
+failures remain preserved, not reclassified as passes.
+
+This is focused calibration evidence only. The broader Unit/preflight gate,
+Dynamic full-model movement, and Release performance remain unqualified here.
+Local evidence is retained under `/tmp/qfn-cpu-joint-qualified-r224/`.

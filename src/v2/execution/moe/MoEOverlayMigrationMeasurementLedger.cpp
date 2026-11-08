@@ -350,6 +350,8 @@ namespace llaminar2
                 row=&candidate;
             }
             if(!row)return reject("Presealed movement evidence has a foreign or missing original target coordinate");
+            if (row->measured_coordinate)
+                return reject("Equivalent-layer projection is not a directly measured calibration corpus");
             const auto &state=coordinate_state_[i];
             if(state.geometry) {
                 if(!row->geometry || !state.geometry->sameIdentity(*row->geometry))

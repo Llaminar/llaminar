@@ -1,6 +1,6 @@
 /**
  * @file CPUFlashAttentionLaunchPolicy.h
- * @brief Typed, cache-derived physical launch policy for CPU FlashAttention2.
+ * @brief Typed architecture-native physical launch policy for CPU FlashAttention2.
  *
  * CPU attention has two independent physical choices:
  *
@@ -16,12 +16,12 @@
  * QK phase streams one K row while retaining scores; the P@V phase streams one
  * V row while retaining those scores and the output accumulator. K and V are
  * not simultaneously resident, so the former `K + V + scores` L1-percentage
- * estimate systematically selected tiles that were too narrow. A one-socket
- * tournament on a Cascade Lake Xeon with 1 MiB private L2 established a useful
- * phase-resident band of roughly one sixth of private L2. The rule below
- * normalizes that measured band by the detected private-L2 size and exact
- * storage row width, so it remains total on CPUs and tensor formats that were
- * not present in the tournament.
+ * estimate systematically selected tiles that were too narrow. The x86 policy
+ * uses measured Cascade Lake bands normalized by actual private-L2 capacity.
+ * AArch64 instead uses a complete canonical arithmetic span as its first-class
+ * physical policy: it neither imports x86 measurements nor invents private
+ * cache capacity on shared/asymmetric ARM cache topologies. Exact compiled
+ * tournament overrides preserve the same arithmetic on both architectures.
  *
  * Physical K/V tiling is independent of arithmetic partitioning. Every
  * invocation forms the same canonical 256-row online-softmax summaries and
@@ -40,6 +40,7 @@
 #pragma once
 
 #include "../../attention/AttentionExecutionPolicy.h"
+#include "../../../utils/CPUFeatures.h"
 
 #include <algorithm>
 #include <array>
@@ -75,8 +76,8 @@ namespace llaminar2::cpu::fa2_policy
     /**
      * Largest tile currently admitted by automatic production dispatch.
      *
-     * This separate name makes installation intent explicit even though the
-     * currently certified maximum is also the arithmetic maximum.
+     * This separate name makes the installed x86 candidate envelope explicit;
+     * ARM's canonical-span policy is selected independently from these bands.
      */
     inline constexpr int kInstalledMaximumKVTile = 256;
 
@@ -129,6 +130,8 @@ namespace llaminar2::cpu::fa2_policy
         Scalar,
         AVX2,
         AVX512,
+        NEON,
+        NEONDotProd,
     };
 
     /** Highest vector ISA enabled while compiling the attention translation unit. */
@@ -138,7 +141,33 @@ namespace llaminar2::cpu::fa2_policy
         Scalar,
         AVX2,
         AVX512,
+        NEON,
+        NEONDotProd,
     };
+
+    /** @brief Map the canonical runtime ISA without guessing another architecture.
+     * @param isa Immutable runtime ISA selected by the public CPU dispatcher.
+     * @return Corresponding attention identity, or Invalid for an unknown value.
+     */
+    [[nodiscard]] inline constexpr CPUFA2VectorISA cpuFA2VectorISAFor(ISALevel isa) noexcept
+    {
+        switch (isa)
+        {
+        case ISALevel::Scalar: return CPUFA2VectorISA::Scalar;
+        case ISALevel::AVX2: return CPUFA2VectorISA::AVX2;
+        case ISALevel::AVX512: return CPUFA2VectorISA::AVX512;
+        case ISALevel::NEON: return CPUFA2VectorISA::NEON;
+        case ISALevel::NEONDotProd: return CPUFA2VectorISA::NEONDotProd;
+        }
+        return CPUFA2VectorISA::Invalid;
+    }
+
+    /** @brief Identify the native ARM span policy before reading any cache observations.
+     * @param isa Authenticated compiler envelope, not a host-name or performance hint.
+     * @return Whether physical tiling is independent of private-cache measurements.
+     */
+    [[nodiscard]] inline constexpr bool cpuFA2UsesCanonicalSpanPolicy(CPUFA2CodegenISA isa) noexcept
+    { return isa == CPUFA2CodegenISA::NEON || isa == CPUFA2CodegenISA::NEONDotProd; }
 
     /** @return True only for a concrete production K/V codec pair. */
     [[nodiscard]] inline constexpr bool isCPUFA2KVStoragePair(
@@ -153,7 +182,7 @@ namespace llaminar2::cpu::fa2_policy
         CPUFA2VectorISA isa) noexcept
     {
         return isa >= CPUFA2VectorISA::Scalar &&
-               isa <= CPUFA2VectorISA::AVX512;
+               isa <= CPUFA2VectorISA::NEONDotProd;
     }
 
     /** @return True only for a concrete CPU attention code-generation profile. */
@@ -161,7 +190,7 @@ namespace llaminar2::cpu::fa2_policy
         CPUFA2CodegenISA isa) noexcept
     {
         return isa >= CPUFA2CodegenISA::Scalar &&
-               isa <= CPUFA2CodegenISA::AVX512;
+               isa <= CPUFA2CodegenISA::NEONDotProd;
     }
 
     /** @return True when one compiled profile can execute the selected runtime path. */
@@ -182,7 +211,14 @@ namespace llaminar2::cpu::fa2_policy
             return runtime_isa == CPUFA2VectorISA::Scalar ||
                    runtime_isa == CPUFA2VectorISA::AVX2;
         case CPUFA2CodegenISA::AVX512:
-            return true;
+            return runtime_isa == CPUFA2VectorISA::Scalar ||
+                   runtime_isa == CPUFA2VectorISA::AVX2 ||
+                   runtime_isa == CPUFA2VectorISA::AVX512;
+        case CPUFA2CodegenISA::NEON:
+            return runtime_isa == CPUFA2VectorISA::NEON;
+        case CPUFA2CodegenISA::NEONDotProd:
+            return runtime_isa == CPUFA2VectorISA::NEON ||
+                   runtime_isa == CPUFA2VectorISA::NEONDotProd;
         case CPUFA2CodegenISA::Invalid:
             return false;
         }
@@ -201,13 +237,15 @@ namespace llaminar2::cpu::fa2_policy
     [[nodiscard]] inline constexpr CPUFA2CodegenISA
     compiledCPUFA2CodegenISA() noexcept
     {
-#if defined(LLAMINAR_COMPILED_WITH_AVX512) && LLAMINAR_COMPILED_WITH_AVX512
-        return CPUFA2CodegenISA::AVX512;
-#elif defined(LLAMINAR_COMPILED_WITH_AVX2) && LLAMINAR_COMPILED_WITH_AVX2
-        return CPUFA2CodegenISA::AVX2;
-#else
-        return CPUFA2CodegenISA::Scalar;
-#endif
+        switch (compiledCPUISALevel())
+        {
+        case ISALevel::Scalar: return CPUFA2CodegenISA::Scalar;
+        case ISALevel::AVX2: return CPUFA2CodegenISA::AVX2;
+        case ISALevel::AVX512: return CPUFA2CodegenISA::AVX512;
+        case ISALevel::NEON: return CPUFA2CodegenISA::NEON;
+        case ISALevel::NEONDotProd: return CPUFA2CodegenISA::NEONDotProd;
+        }
+        return CPUFA2CodegenISA::Invalid;
     }
 
     /** @return Stable diagnostic name for one native K/V codec pair. */
@@ -255,6 +293,10 @@ namespace llaminar2::cpu::fa2_policy
             return "avx2";
         case CPUFA2VectorISA::AVX512:
             return "avx512";
+        case CPUFA2VectorISA::NEON:
+            return "neon";
+        case CPUFA2VectorISA::NEONDotProd:
+            return "neon-dotprod";
         case CPUFA2VectorISA::Invalid:
             break;
         }
@@ -273,6 +315,10 @@ namespace llaminar2::cpu::fa2_policy
             return "avx2";
         case CPUFA2CodegenISA::AVX512:
             return "avx512";
+        case CPUFA2CodegenISA::NEON:
+            return "neon";
+        case CPUFA2CodegenISA::NEONDotProd:
+            return "neon-dotprod";
         case CPUFA2CodegenISA::Invalid:
             break;
         }
@@ -287,19 +333,19 @@ namespace llaminar2::cpu::fa2_policy
     };
 
     /**
-     * @brief Cache capacities relevant to one CPU worker.
+     * @brief Explicit cache observations for the x86 cache-derived policy.
      *
-     * L1 and L2 must describe one physical core, not the sum printed by tools
-     * such as `lscpu`. Shared L3 is retained for diagnostics and future
-     * prefetch policy work; physical tile capacity is intentionally bounded by
-     * private cache so a neighboring worker cannot invalidate the assumption.
+     * L1 and L2 describe one physical core, not a sum reported by `lscpu`.
+     * Zero denotes unknown, including the cache line. ARM's canonical-span
+     * policy needs no private-cache observation; callers must not manufacture
+     * one from a shared/asymmetric cache merely to satisfy this structure.
      */
     struct CPUFA2CacheGeometry
     {
         std::size_t private_l1d_bytes = 0;
         std::size_t private_l2_bytes = 0;
         std::size_t shared_l3_bytes = 0;
-        std::size_t cache_line_bytes = 64;
+        std::size_t cache_line_bytes = 0;
 
         /** @return True when every cache field needed by dispatch is usable. */
         [[nodiscard]] constexpr bool valid() const noexcept
@@ -310,7 +356,23 @@ namespace llaminar2::cpu::fa2_policy
         }
     };
 
-    /** Exact storage and cache geometry used to choose one K/V tile. */
+    /**
+     * @brief Observe only cache data consumed by the compiled physical policy.
+     * @return Genuine checked x86 cache/topology observations, or unknown zeros for
+     * ARM's cache-independent canonical span. Shared/asymmetric ARM cache
+     * capacities are never relabelled as private worker capacity.
+     */
+    [[nodiscard]] inline CPUFA2CacheGeometry observedCPUFA2PolicyCache()
+    {
+        if (cpuFA2UsesCanonicalSpanPolicy(compiledCPUFA2CodegenISA())) return {};
+        const auto &cache = cpu_cache_observation();
+        return {.private_l1d_bytes = static_cast<std::size_t>(cache.private_l1d_bytes),
+            .private_l2_bytes = static_cast<std::size_t>(cache.private_l2_bytes),
+            .shared_l3_bytes = static_cast<std::size_t>(cache.shared_l3_bytes),
+            .cache_line_bytes = cache.cache_line_bytes};
+    }
+
+    /** Original storage/ISA geometry plus optional architecture-required cache observations. */
     struct CPUFA2KVTileGeometry
     {
         CPUFA2KVStoragePair storage_pair = CPUFA2KVStoragePair::Invalid;
@@ -322,14 +384,14 @@ namespace llaminar2::cpu::fa2_policy
         std::size_t value_head_row_bytes = 0;
         CPUFA2CacheGeometry cache{};
 
-        /** @return True when the tile footprint can be calculated exactly. */
+        /** @return True when identities/extents and the selected policy's observations are present. */
         [[nodiscard]] constexpr bool valid() const noexcept
         {
             return isCPUFA2KVStoragePair(storage_pair) &&
                    cpuFA2CodegenSupportsRuntimeISA(codegen_isa, vector_isa) &&
                    head_dim > 0 && kv_rows > 0 &&
                    key_head_row_bytes > 0 && value_head_row_bytes > 0 &&
-                   cache.valid();
+                   (cpuFA2UsesCanonicalSpanPolicy(codegen_isa) || cache.valid());
         }
     };
 
@@ -465,6 +527,8 @@ namespace llaminar2::cpu::fa2_policy
                 return 0;
             }
             break;
+        case CPUFA2VectorISA::NEON:
+        case CPUFA2VectorISA::NEONDotProd:
         case CPUFA2VectorISA::Scalar:
         case CPUFA2VectorISA::Invalid:
             return 0;
@@ -492,10 +556,11 @@ namespace llaminar2::cpu::fa2_policy
             {
                 return false;
             }
-            const std::int64_t rows =
-                static_cast<std::int64_t>(batch_size) * query_rows *
-                local_query_heads;
-            return rows > 0 && rows <= std::numeric_limits<int>::max();
+            // Each positive intermediate is bounded before multiplication;
+            // even three INT_MAX inputs cannot overflow this admission check.
+            constexpr int limit = std::numeric_limits<int>::max();
+            if (batch_size > limit / query_rows) return false;
+            return batch_size * query_rows <= limit / local_query_heads;
         }
     };
 
@@ -553,25 +618,31 @@ namespace llaminar2::cpu::fa2_policy
             static_cast<std::size_t>(geometry.head_dim) * sizeof(float) * 2;
         const std::size_t score_bytes =
             static_cast<std::size_t>(tile_rows) * sizeof(float);
-        const std::size_t stream_bytes =
-            static_cast<std::size_t>(tile_rows) * streamed_row_bytes;
-        return persistent_vector_bytes + score_bytes + stream_bytes +
-               2 * geometry.cache.cache_line_bytes;
+        constexpr auto limit = std::numeric_limits<std::size_t>::max();
+        if (persistent_vector_bytes > limit - score_bytes) return 0;
+        const auto vectors_and_scores = persistent_vector_bytes + score_bytes;
+        if (geometry.cache.cache_line_bytes > (limit - vectors_and_scores) / 2) return 0;
+        const auto resident = vectors_and_scores + 2 * geometry.cache.cache_line_bytes;
+        if (streamed_row_bytes > (limit - resident) / static_cast<std::size_t>(tile_rows)) return 0;
+        return resident + static_cast<std::size_t>(tile_rows) * streamed_row_bytes;
     }
 
     /**
-     * @brief Select the largest measured-safe tile for detected private L2.
+     * @brief Resolve the first-class native physical policy or an exact override.
      *
-     * `explicit_tile` is an authenticated tournament control. It accepts only
-     * a compiled power-of-two candidate and never silently rounds an invalid
-     * request. Production selection chooses from the same candidate set using
-     * the exact phase footprint and the detected private-L2 capacity.
+     * @param geometry Original storage, compiler/runtime and cache observations.
+     * @param explicit_tile Zero for native policy, otherwise an exact compiled candidate.
+     * @return Selected tile, or zero for invalid/unrepresentable geometry or override.
+     * @details ARM uses one canonical span without consulting x86 measurements
+     * or private-cache assumptions. X86 retains its measured/cache-derived
+     * program. Physical chunking never changes canonical arithmetic summaries.
      */
     [[nodiscard]] inline constexpr int selectCPUFA2KVTile(
         const CPUFA2KVTileGeometry &geometry,
         int explicit_tile = 0) noexcept
     {
-        if (!geometry.valid() || explicit_tile < 0)
+        if (!geometry.valid() || explicit_tile < 0 ||
+            cpuFA2TileWorkingSetBytes(geometry, kMinimumKVTile) == 0)
             return 0;
 
         const auto compiled = [](int tile) constexpr
@@ -581,7 +652,12 @@ namespace llaminar2::cpu::fa2_policy
                              tile) != kCompiledKVTiles.end();
         };
         if (explicit_tile > 0)
-            return compiled(explicit_tile) ? explicit_tile : 0;
+            return compiled(explicit_tile) && cpuFA2TileWorkingSetBytes(geometry, explicit_tile) != 0
+                ? explicit_tile : 0;
+
+        if (cpuFA2UsesCanonicalSpanPolicy(geometry.codegen_isa))
+            return cpuFA2TileWorkingSetBytes(geometry, kCanonicalContextPartitionRows) != 0
+                ? kCanonicalContextPartitionRows : 0;
 
         /*
          * The measured capacity band is expressed as a cache ratio only so
@@ -645,12 +721,12 @@ namespace llaminar2::cpu::fa2_policy
 
         plan.output_rows = geometry.batch_size * geometry.query_rows *
                            geometry.local_query_heads;
-        const int available_context_spans =
-            (geometry.kv_rows + kCanonicalContextPartitionRows - 1) /
-            kCanonicalContextPartitionRows;
-        const int saturation_partitions =
-            (geometry.physical_workers + geometry.local_query_heads - 1) /
-            geometry.local_query_heads;
+        const int available_context_spans = static_cast<int>(
+            (static_cast<std::int64_t>(geometry.kv_rows) + kCanonicalContextPartitionRows - 1) /
+            kCanonicalContextPartitionRows);
+        const int saturation_partitions = static_cast<int>(
+            (static_cast<std::int64_t>(geometry.physical_workers) + geometry.local_query_heads - 1) /
+            geometry.local_query_heads);
         plan.context_partitions = std::max(
             1,
             std::min(available_context_spans, saturation_partitions));

@@ -1,5 +1,6 @@
 # =============================================================================
-# V2ParityTestDiscovery.cmake
+# @file V2ParityTestDiscovery.cmake
+# @brief Canonical model-parity discovery and original native process-world registration.
 #
 # POST_BUILD helper script: runs a GTest binary with --gtest_list_tests
 # (no mpirun), parses the output, and generates a CTest include file with
@@ -128,8 +129,8 @@ if(NOT MPI_PROCS)
 endif()
 
 # --- Build environment variables list ----------------------------------------
-if(NOT CORES_PER_SOCKET OR CORES_PER_SOCKET EQUAL "" OR CORES_PER_SOCKET EQUAL 0)
-    set(CORES_PER_SOCKET 1)
+if(NOT CORES_PER_SOCKET MATCHES "^[1-9][0-9]*$")
+    message(FATAL_ERROR "V2ParityTestDiscovery requires checked affinity-visible cores/socket; no default geometry is admitted")
 endif()
 
 if(NOT PRODUCTION_PERF_STATS_FILTER)

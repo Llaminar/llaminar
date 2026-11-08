@@ -2,9 +2,11 @@
  * @file CPUFlashAttentionAQ8.inl
  * @brief Native anchored-key operand adapter for the canonical CPU FA2 scheduler.
  *
- * Included in CPUFlashAttentionKernelT. Only one key head is reconstructed into
- * bounded worker scratch; no context-length FP32 cache exists. Value accumulation
- * reuses the existing native Q8/TQ primitives and fixed-order summary reduction.
+ * Included in CPUFlashAttentionKernelT. Checked original query/anchor programs
+ * consume published AQ8 blocks directly through register-only decode/dot
+ * fragments, never a reconstructed key head. Value accumulation reuses the
+ * native Q8/TQ primitives and fixed-order summary reduction. Enclosing cache
+ * owners retain all physical capacity, publication and request-lifetime authority.
  */
 
 /**
@@ -98,14 +100,15 @@ bool compute_aq8kv(
         const auto score = [&](int, const NativeRow &scratch, int begin,
                                CPUFA2VisibleTile span, float *scores, float &maximum)
         {
-            // Bounded codec scratch, not an accumulator spill or a key shadow.
-            alignas(64) float key[D];
+            // Bind original query/basis geometry and exact ISA once before the
+            // K loop. Each published block is consumed without a decoded head.
+            const auto program = cpu::attention_key_q8::QueryDotTile<D, 1>::bind(
+                {std::span<const float>(scratch.query, D)},
+                std::span<const float>(scratch.anchor, D), isa);
             for (int row = span.begin; row < span.end; ++row)
             {
                 const size_t index = K->block_index(view.physicalRow(row), scratch.head);
-                cpu::attention_key_q8::dequantize<D>(blocks[index],
-                    std::span<const float, D>(scratch.anchor, D), std::span<float, D>(key, D), isa);
-                const float value = dot_fp32(scratch.query, key, D) * scale;
+                const float value = program.dot(blocks[index])[0] * scale;
                 scores[row - begin] = value;
                 maximum = std::max(maximum, value);
             }
