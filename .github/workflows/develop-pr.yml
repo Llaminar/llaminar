@@ -9,6 +9,7 @@ on:
 permissions:
   contents: read
 
+# Cloud routing verification: Unit and host require no GPU device mounts.
 # Different PRs run concurrently; new commits replace only their own PR run.
 concurrency:
   group: llaminar-cloud-develop-pr-${{ github.event.pull_request.number }}
