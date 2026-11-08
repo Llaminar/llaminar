@@ -8,6 +8,7 @@
  * follows the same distributed publication contract used by live maintenance.
  * Frozen execution and parent boundaries authenticate one shared GPU family.
  */
+#include "planning/PlanningObservedResource.h"
 #include "planning/MoEOverlayMemoryPlanInputs.h"
 #include "execution/local_execution/engine/PrefillBucketUtils.h"
 #include "execution/moe/MoEOverlayNodeLocalRankBatchTransport.h"
@@ -66,7 +67,8 @@ std::vector<PhysicalMemoryResource> originalMoEOverlayNativePreparationResources
             if(gpu==observed.gpus.end())throw std::invalid_argument("Native overlay registry device is absent from original rank inventory");
             total=gpu->memory_bytes;available=gpu->free_memory_bytes;
         }
-        PhysicalMemoryResource resource{rank,device,total,PhysicalMemoryAuthority::admissionCapacity(available,config.memoryLimitBytes(device.type))};
+        const PhysicalMemoryResource resource=withObservedBacking(
+            {rank,device,total,PhysicalMemoryAuthority::admissionCapacity(available,config.memoryLimitBytes(device.type))},observed);
         if(!resource.valid())throw std::invalid_argument("Native overlay registry has incomplete original capacity");
         result.push_back(resource);
     }

@@ -26753,6 +26753,12 @@ add_v2_test(V2_Integration_MoEProjectionArenaAccounting
     MPI_PROCS 1
     NO_MODELS
 )
+add_v2_test(V2_Integration_IntegratedGPUPoolObservationMerge
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=Test__MemoryPlanner.IntegratedGPULogicalLinesShareOnePoolObservation
+    LABELS "V2;Integration;ProductionTestPreflight;Memory;PhysicalMemoryAuthority;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MODELS)
+
 add_v2_test(V2_Integration_MoEProjectionTransportAccounting
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
         --gtest_filter=Test__MemoryPlanner.CountedProjectionTransportHasOneCanonicalPhysicalBOM
