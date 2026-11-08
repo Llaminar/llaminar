@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "scripts/ci"))
 
 import run_develop_image_gate as gate
-import run_unit_tests as unit_runner
+import run_develop_pr_tests as pr_runner
 
 
 def images(isa: str) -> dict:
@@ -34,46 +34,76 @@ def images(isa: str) -> dict:
             "runtime": {"id": f"runtime-{isa.lower()}"}}
 
 
-def unit_report() -> dict:
-    """Build a complete device-free Unit receipt without preflight evidence."""
-    return {"schema": 1, "scope": "unit", "complete": True, "return_code": 0,
-            "tests": ["V2_Unit_Contract"], "test_count": 1}
+def pr_report() -> dict:
+    """Build a scoped PR receipt; full accelerator preflight remains unproven."""
+    return {"schema": 1, "scope": "unit-and-host", "complete": True, "return_code": 0,
+            "lanes": {lane: {"complete": True, "return_code": 0,
+                              "tests": [name], "test_count": 1}
+                      for lane, name in (("unit", "V2_Unit_Contract"),
+                                         ("host", "V2_Integration_HostContract"))}}
 
 
 class DevelopImageGateTests(unittest.TestCase):
     """Keep develop publishing smaller than, and incapable of replacing, certification."""
 
-    def test_unit_driver_runs_exact_unit_suite_and_rejects_skips(self):
-        """Replay real CTest selection; an integration command must never run."""
-        for outcome in (0, 7, 77):
-            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as temporary:
+    def test_pr_driver_runs_exact_unit_and_host_inventories_and_rejects_skips(self):
+        """Replay real CTest selection while poison accelerator cases stay unrun."""
+        for unit_outcome, host_outcome in ((0, 0), (7, 0), (77, 0), (0, 7), (0, 77)):
+            with self.subTest(unit=unit_outcome, host=host_outcome), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 build = root / "build"
                 build.mkdir()
-                forbidden = root / "integration-ran"
-                (build / "CTestTestfile.cmake").write_text(
-                    f'add_test(V2_Unit_Contract "{sys.executable}" "-c" "raise SystemExit({outcome})")\n'
-                    'set_tests_properties(V2_Unit_Contract PROPERTIES LABELS "Unit" TIMEOUT 30 SKIP_RETURN_CODE 77)\n'
-                    f'add_test(V2_Integration_Forbidden "{sys.executable}" "-c" '
-                    f'"from pathlib import Path; Path(\'{forbidden}\').touch()")\n'
-                    'set_tests_properties(V2_Integration_Forbidden PROPERTIES LABELS "Integration;ProductionTestPreflight")\n'
-                )
+                forbidden = root / "accelerator-ran"
+                registrations = []
+                for name, labels, outcome in (
+                        ("V2_Unit_Contract", "Unit", unit_outcome),
+                        ("V2_Integration_HostContract", "Integration;ProductionTestPreflight", host_outcome)):
+                    registrations += [
+                        f'add_test({name} "{sys.executable}" "-c" "raise SystemExit({outcome})")',
+                        f'set_tests_properties({name} PROPERTIES LABELS "{labels}" TIMEOUT 30 SKIP_RETURN_CODE 77)']
+                for name, labels in (("CUDA", "CUDA"), ("ROCm", "ROCm"),
+                                     ("Mixed", "CUDA;ROCm"), ("Inventory", "FullDeviceInventory")):
+                    registrations += [
+                        f'add_test(V2_Integration_{name} "{sys.executable}" "-c" '
+                        f'"from pathlib import Path; Path(\'{forbidden}\').touch(); raise SystemExit(99)")',
+                        f'set_tests_properties(V2_Integration_{name} PROPERTIES '
+                        f'LABELS "Integration;ProductionTestPreflight;{labels}" TIMEOUT 30)']
+                (build / "CTestTestfile.cmake").write_text("\n".join(registrations) + "\n")
                 output = root / "results"
                 arguments = ["--build-dir", str(build), "--installed-build-receipt",
                              str(root / "receipt"), "--output", str(output)]
-                with patch.object(unit_runner, "validate") as validate:
-                    if outcome == 77:
+                with patch.object(pr_runner, "validate") as validate:
+                    if 77 in (unit_outcome, host_outcome):
                         with self.assertRaisesRegex(ValueError, "without skipping"):
-                            unit_runner.main(arguments)
+                            pr_runner.main(arguments)
                     else:
-                        code = unit_runner.main(arguments)
-                        self.assertEqual(code == 0, outcome == 0)
+                        code = pr_runner.main(arguments)
+                        self.assertEqual(code == 0, unit_outcome == host_outcome == 0)
                 validate.assert_called_once_with(root / "receipt", build,
-                                                  unit_runner.InstalledTestScope.UNIT)
+                                                 pr_runner.InstalledTestScope.PRODUCTION)
                 self.assertFalse(forbidden.exists())
-                report = json.loads((output / "unit.json").read_text())
-                self.assertEqual(report["complete"], outcome == 0)
-                self.assertEqual(report["tests"], ["V2_Unit_Contract"])
+                report = json.loads((output / "pr-tests.json").read_text())
+                self.assertEqual(report["scope"], "unit-and-host")
+                self.assertEqual(report["complete"], unit_outcome == host_outcome == 0)
+                self.assertEqual(report["lanes"]["unit"]["tests"], ["V2_Unit_Contract"])
+                if unit_outcome == 0:
+                    self.assertEqual(report["lanes"]["host"]["tests"], ["V2_Integration_HostContract"])
+
+    def test_pr_driver_rejects_an_empty_host_lane(self):
+        """A GPU-only preflight inventory must not become a green host gate."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            build = root / "build"
+            build.mkdir()
+            (build / "CTestTestfile.cmake").write_text(
+                f'add_test(V2_Unit_Contract "{sys.executable}" "-c" "pass")\n'
+                'set_tests_properties(V2_Unit_Contract PROPERTIES LABELS "Unit" TIMEOUT 30)\n'
+                f'add_test(V2_Integration_GPU "{sys.executable}" "-c" "raise SystemExit(99)")\n'
+                'set_tests_properties(V2_Integration_GPU PROPERTIES '
+                'LABELS "Integration;ProductionTestPreflight;CUDA" TIMEOUT 30)\n')
+            with patch.object(pr_runner, "validate"), self.assertRaisesRegex(ValueError, "nonempty"):
+                pr_runner.main(["--build-dir", str(build), "--installed-build-receipt",
+                                str(root / "receipt"), "--output", str(root / "out")])
 
     def test_unit_results_reject_missing_duplicate_and_foreign_observations(self):
         """A zero CTest exit status alone cannot prove the complete inventory."""
@@ -83,7 +113,7 @@ class DevelopImageGateTests(unittest.TestCase):
                 report.write_text('<testsuite>' + ''.join(
                     f'<testcase name="{name}" status="run"/>' for name in names) + '</testsuite>')
                 with self.assertRaisesRegex(ValueError, "exact CTest inventory"):
-                    unit_runner.validate_results(report, ("V2_Unit_A",))
+                    pr_runner.validate_results(report, ("V2_Unit_A",))
 
     def test_publish_requires_both_shipping_isas(self):
         """A partial local diagnosis can never overwrite a public develop tag."""
@@ -118,7 +148,7 @@ class DevelopImageGateTests(unittest.TestCase):
             with patch.object(gate, "source_identity", return_value=source), \
                  patch.object(gate, "build", side_effect=build), \
                  patch.object(gate, "require_image"), \
-                 patch.object(gate, "run_unit_tests") as tests, \
+                 patch.object(gate, "run_pr_tests") as tests, \
                  patch.object(gate, "publish_runtime", side_effect=publish):
                 self.assertEqual(gate.main(["--output", str(output), "--build-only", "--publish",
                                             "--image", "ghcr.io/llaminar/llaminar:develop"]), 0)
@@ -242,7 +272,7 @@ class DevelopImageGateTests(unittest.TestCase):
         self.assertNotIn("prerequisites/", workflow)
         self.assertNotIn("prune_docker_build_cache", workflow)
 
-    def test_develop_pr_builds_one_isa_and_runs_only_installed_unit_tests(self):
+    def test_develop_pr_builds_one_isa_and_runs_installed_unit_and_host_tests(self):
         """Exercise the real PR command, not a separately invented argument set."""
         workflow = yaml.load((ROOT / ".github/workflows/develop-pr.yml").read_text(),
                              Loader=yaml.BaseLoader)
@@ -257,18 +287,18 @@ class DevelopImageGateTests(unittest.TestCase):
         self.assertEqual(set(workflow["jobs"]), {"unit"})
         job = workflow["jobs"]["unit"]
         self.assertEqual(job["uses"],
-                         "Llaminar/llaminar/.github/workflows/develop-unit.yml@develop")
+                         "Llaminar/llaminar/.github/workflows/develop-pr-tests.yml@develop")
         # Preserve the established same-repository PR admission policy.
         self.assertEqual(job["if"],
                          "github.event.pull_request.head.repo.full_name == github.repository")
-        reusable = yaml.load((ROOT / ".github/workflows/develop-unit.yml").read_text(),
+        reusable = yaml.load((ROOT / ".github/workflows/develop-pr-tests.yml").read_text(),
                              Loader=yaml.BaseLoader)
         self.assertEqual(set(reusable["on"]), {"workflow_call"})
         self.assertEqual(reusable["permissions"], {"contents": "read"})
         caller = job
         job = reusable["jobs"]["unit"]
         self.assertEqual(job["runs-on"], {"group": "Develop CI", "labels": "llaminar-cloud-16"})
-        self.assertEqual(f"{caller['name']} / {job['name']}", "Develop PR / Unit (AVX2)")
+        self.assertEqual(f"{caller['name']} / {job['name']}", "Develop PR / Unit + host (AVX2)")
         self.assertIn("github.event_name == 'pull_request'", job["if"])
         self.assertIn("github.base_ref == 'develop'", job["if"])
         self.assertIn("github.event.pull_request.head.repo.full_name == github.repository", job["if"])
@@ -305,19 +335,19 @@ class DevelopImageGateTests(unittest.TestCase):
 
             def build(args, admitted, directory, *, roles, test_inventory):
                 self.assertEqual(admitted, source)
-                self.assertEqual(test_inventory, gate.TestRunnerInventory.UNIT_ONLY)
+                self.assertEqual(test_inventory, gate.TestRunnerInventory.MODEL_FREE)
                 self.assertEqual(roles, (gate.ImageRole.TEST_RUNNER,))
                 events.append(("build", args.cpu_isa))
                 return images(args.cpu_isa)
 
             def unit_tests(built, directory):
                 events.append(("unit", built["test-runner"]["id"]))
-                return unit_report()
+                return pr_report()
 
             with patch.object(gate, "source_identity", return_value=source), \
                  patch.object(gate, "build", side_effect=build), \
                  patch.object(gate, "require_image"), \
-                 patch.object(gate, "run_unit_tests", side_effect=unit_tests), \
+                 patch.object(gate, "run_pr_tests", side_effect=unit_tests), \
                  patch.object(gate, "publish_runtime") as publish:
                 self.assertEqual(gate.main(arguments), 0)
             publish.assert_not_called()
@@ -327,6 +357,9 @@ class DevelopImageGateTests(unittest.TestCase):
             self.assertTrue(receipt["complete"])
             self.assertFalse(receipt["published"])
             self.assertEqual(set(receipt["variants"]), {"AVX2"})
+            self.assertEqual(receipt["validation"], "unit-and-host")
+            self.assertEqual(receipt["variants"]["AVX2"]["unit_test_count"], 1)
+            self.assertEqual(receipt["variants"]["AVX2"]["host_test_count"], 1)
 
     def test_develop_auto_merge_waits_for_protected_pr_gate(self):
         """Only trusted, non-draft PRs arm native auto-merge; no PR code runs."""
@@ -370,7 +403,7 @@ class DevelopImageGateTests(unittest.TestCase):
                                  expected, admitted[-1])
         self.assertGreaterEqual(len(admitted), 5)
 
-    def test_unit_executes_in_exact_test_image_without_devices_or_models(self):
+    def test_pr_executes_in_exact_test_image_without_devices_or_models(self):
         """A PR must test its built image, not a host checkout or older runtime."""
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -384,25 +417,45 @@ class DevelopImageGateTests(unittest.TestCase):
                 # The log wrapper receives the real canonical prerequisite
                 # command as positional arguments, retaining its exit status.
                 self.assertEqual(invocation[-8:], [
-                    "python3", "scripts/ci/run_unit_tests.py",
+                    "python3", "scripts/ci/run_develop_pr_tests.py",
                     "--build-dir", "build_v2_integration",
                     "--installed-build-receipt", "/src/installed-tests.json",
-                    "--output", "/ci-results/unit"])
-                gate.write_json(directory / "unit/unit.json",
-                                unit_report())
+                    "--output", "/ci-results/pr-tests"])
+                gate.write_json(directory / "pr-tests/pr-tests.json",
+                                pr_report())
 
             with patch.object(gate.docker_paths, "device_args", return_value=[]) as devices, \
                  patch.object(gate.docker_paths, "mounts", return_value=[]) as mounts, \
                  patch.object(gate, "run", side_effect=run), \
                  patch.object(gate.subprocess, "run") as retire:
-                self.assertEqual(gate.run_unit_tests(images("AVX512"), directory),
-                                 unit_report())
+                self.assertEqual(gate.run_pr_tests(images("AVX512"), directory),
+                                 pr_report())
             devices.assert_not_called()
             mounts.assert_called_once_with([(directory, "/ci-results", False)])
             retirement = retire.call_args.args[0]
             self.assertEqual(retirement[:3], ["docker", "rm", "-f"])
             self.assertEqual(len(retirement), 4)
-            self.assertTrue(retirement[3].startswith("llaminar-develop-unit-"))
+            self.assertTrue(retirement[3].startswith("llaminar-develop-pr-tests-"))
+
+    def test_pr_receipt_cannot_omit_or_skip_the_host_lane(self):
+        """The outer image transaction rejects incomplete and broader receipts."""
+        mutations = (
+            lambda report: report["lanes"].pop("host"),
+            lambda report: report["lanes"]["host"].update(complete=False),
+            lambda report: report["lanes"]["host"].update(return_code=1),
+            lambda report: report["lanes"]["host"].update(tests=[], test_count=0),
+            lambda report: report.update(scope="production"),
+        )
+        for mutate in mutations:
+            with self.subTest(mutation=mutate), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                report = pr_report()
+                mutate(report)
+                gate.write_json(directory / "pr-tests/pr-tests.json", report)
+                with patch.object(gate.docker_paths, "mounts", return_value=[]), \
+                     patch.object(gate, "run"), patch.object(gate.subprocess, "run"), \
+                     self.assertRaisesRegex(ValueError, "incomplete"):
+                    gate.run_pr_tests(images("AVX2"), directory)
 
 
 if __name__ == "__main__":

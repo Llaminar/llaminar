@@ -33,18 +33,20 @@ Keep the fresh/full/partial prefix probes, exact repeatability, actual dynamic
 MTP activity, movement obligations and captured production-path evidence.
 
 Feature PRs into `develop` use `.github/workflows/develop-pr.yml` to build an
-AVX2 full-backend test companion with the `unit-only` executable inventory
-and run only the complete device-free `Unit` suite. No integration or
-production-preflight tests run, and the container receives no GPU devices or
-model mounts. It calls `run_develop_image_gate.py --cpu-isa AVX2` without
+AVX2 full-backend test companion with the `model-free` executable inventory.
+They run the complete device-free `Unit` suite and the production-preflight
+`host` lane selected by the canonical scheduler. CUDA, ROCm and exclusive
+preflight lanes do not run; the container receives no GPU devices or model mounts. It calls `run_develop_image_gate.py --cpu-isa AVX2` without
 `--build-only` or `--publish`, on the 16-core GitHub-hosted runner through the protected
-`develop-unit.yml@develop` reusable workflow. PRs import public registry cache
+`develop-pr-tests.yml@develop` reusable workflow. PRs import public registry cache
 layers without credentials or cache export. Separate PRs run concurrently;
 new commits cancel older checks on the same PR. The cloud pool admits up to
 four 16-core runners. AVX2 execution does not depend on AVX512 support
 in the cloud pool. CTest owns selection and the JUnit receipt must prove
-that every discovered Unit test ran without skipping.
-The `develop` ruleset requires `Develop PR / Unit (AVX2)` on an up-to-date PR. The separate
+that every discovered Unit and host test ran without skipping. Unit runs with
+unrestricted parallelism; host retains its canonical serial scheduling. The
+`unit-and-host` PR receipt is separate from complete production preflight.
+The `develop` ruleset requires `Develop PR / Unit + host (AVX2)` on an up-to-date PR. The separate
 `Owner approval` ruleset requires approval from the owner-only
 `@Llaminar/repository-approvers` team for both protected branches. Native
 squash auto-merge waits for required reviews and checks. The owner has a

@@ -30,7 +30,7 @@ REQUIRED_CHECKS = (
     "Published benchmarks (AVX512 and AVX2)",
     "Published OpenCode (AVX512 and AVX2)",
 )
-DEVELOP_REQUIRED_CHECK = "Develop PR / Unit (AVX2)"
+DEVELOP_REQUIRED_CHECK = "Develop PR / Unit + host (AVX2)"
 RELEASE_DEPLOY_KEY_TITLE = "llaminar-release-evidence"
 RELEASE_DEPLOY_KEY_BYPASS = [{"actor_id": None, "actor_type": "DeployKey",
                               "bypass_mode": "always"}]

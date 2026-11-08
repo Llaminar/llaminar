@@ -1,4 +1,4 @@
-name: Develop device-free Unit gate
+name: Develop Unit and host gate
 
 # Runner-group access is pinned to this workflow on develop. The caller keeps
 # the pull_request event, so checkout still tests its proposed merge commit.
@@ -11,11 +11,11 @@ permissions:
 
 jobs:
   unit:
-    # Only same-repository PRs into develop may call this paid Unit gate.
+    # Only same-repository PRs into develop may call this paid PR gate.
     if: >-
       github.event_name == 'pull_request' && github.base_ref == 'develop' &&
       github.event.pull_request.head.repo.full_name == github.repository
-    name: Unit (AVX2)
+    name: Unit + host (AVX2)
     runs-on:
       group: Develop CI
       labels: llaminar-cloud-16
@@ -31,7 +31,7 @@ jobs:
           driver: docker-container
           driver-opts: network=host
           cache-binary: false
-      - name: Build AVX2 Unit inventory and run device-free tests
+      - name: Build AVX2 test inventory and run Unit plus host tests
         shell: bash
         env:
           LLAMINAR_DOCKER_BUILD_CACHE_ACCESS: import-only
@@ -41,7 +41,7 @@ jobs:
           exec python3 scripts/ci/run_develop_image_gate.py \
             --cpu-isa AVX2 \
             --output "$RUNNER_TEMP/llaminar-develop-pr-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-      - name: Retain image-bound Unit evidence
+      - name: Retain image-bound Unit and host evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -51,8 +51,8 @@ jobs:
             ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/develop-image-gate.json
             ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/avx2/build-*.log
             ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/avx2/build-timeline.jsonl
-            ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/avx2/unit.log
-            ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/avx2/unit.process.log
-            ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/avx2/unit/**
+            ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/avx2/pr-tests.log
+            ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/avx2/pr-tests.process.log
+            ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/avx2/pr-tests/**
           if-no-files-found: warn
           retention-days: 30

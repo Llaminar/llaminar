@@ -1,4 +1,4 @@
-name: Develop PR — device-free Unit tests
+name: Develop PR — Unit and host tests
 run-name: "develop PR #${{ github.event.pull_request.number }} — ${{ github.event.pull_request.head.sha }}"
 
 on:
@@ -20,4 +20,4 @@ jobs:
     if: github.event.pull_request.head.repo.full_name == github.repository
     name: Develop PR
     # A pinned reusable workflow lets PR merge refs use the restricted group.
-    uses: Llaminar/llaminar/.github/workflows/develop-unit.yml@develop
+    uses: Llaminar/llaminar/.github/workflows/develop-pr-tests.yml@develop

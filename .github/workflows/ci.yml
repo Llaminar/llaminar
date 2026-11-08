@@ -1,8 +1,8 @@
 name: CI
 
 # Develop publishes Release runtime images on a GitHub-hosted larger runner.
-# Device-free Unit tests belong to the separate PR gate. This push job only
-# builds and publishes; preflight and certification remain production work.
+# Unit and host-preflight tests belong to the separate PR gate. This push job
+# only builds and publishes; complete certification remains production work.
 on:
   push:
     branches: [develop]

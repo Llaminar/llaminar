@@ -13,7 +13,7 @@ routes local development checks, model diagnostics, and this full image gate.
 
 Ordinary work starts from current `develop` on a branch named
 `feat/short-feature-description`. Commit messages and PR titles use
-Conventional Commits. After its required Unit check and owner approval pass, the feature PR
+Conventional Commits. After its required Unit/host check and owner approval pass, the feature PR
 squash-merges into `develop`. Only explicit user direction starts the separate
 `develop`-to-`master` release PR and its full certification/release workflow.
 
@@ -24,14 +24,15 @@ and its required gates. Restore any temporary maintenance exception in the
 develop ruleset immediately after the push.
 
 `.github/workflows/develop-pr.yml` tests same-repository feature PRs targeting
-`develop`. It builds an AVX2 full-backend test image with the `unit-only` executable
-inventory and executes only the complete device-free `Unit` suite. It does not
-compile the production-preflight target or run integration tests. The test
+`develop`. It builds an AVX2 full-backend test image with the `model-free`
+executable inventory and executes the complete device-free `Unit` suite plus
+the production-preflight `host` lane. The canonical production scheduler owns
+host selection; CUDA, ROCm and exclusive preflight lanes are not executed. The test
 container receives no GPU devices or model mounts. This is PR validation, not
 release certification. The checkout is the PR merge ref, so the tests
 include the proposed integration with `develop`.
 
-The active `develop` ruleset requires `Develop PR / Unit (AVX2)`, an
+The active `develop` ruleset requires `Develop PR / Unit + host (AVX2)`, an
 up-to-date PR, and squash merge; direct human pushes, force pushes and deletion
 are rejected. `.github/workflows/develop-auto-merge.yml` arms GitHub's native
 auto-merge for same-repository, non-draft PRs. GitHub loads this
@@ -57,13 +58,13 @@ Create the token in GitHub's fine-grained token settings with resource owner
 prompts for the value; credential values do not belong in source or evidence
 files. Replace the secret before its configured expiration.
 
-The PR workflow calls `.github/workflows/develop-unit.yml@develop`, a reusable
+The PR workflow calls `.github/workflows/develop-pr-tests.yml@develop`, a reusable
 workflow pinned to the protected branch. The runner group admits that stable
 workflow reference while the default checkout still tests the caller's PR
 merge ref. Both workflows grant only Contents read access and pass no secrets.
 The called job admits only same-repository pull requests targeting `develop`.
 
-The Unit job uses the same 16-core GitHub-hosted runner pool as develop publication.
+The PR test job uses the same 16-core GitHub-hosted runner pool as develop publication.
 Each PR has its own `llaminar-cloud-develop-pr-<number>` concurrency group with
 `cancel-in-progress: true`: separate PRs can run concurrently, while new commits
 cancel obsolete checks on that same PR.
@@ -72,9 +73,14 @@ the production host's AVX512 contract. It calls the existing
 `run_develop_image_gate.py --cpu-isa AVX2` without `--publish`, using an ephemeral
 BuildKit worker. It imports public registry layers with
 `LLAMINAR_DOCKER_BUILD_CACHE_ACCESS=import-only`; it never exports caches or logs
-into the registry. No registry-write permission is granted. Model staging,
-integration, preflight, generation, HF parity, E2E and benchmarks remain outside
-this PR gate. Only build logs, image/test receipts and CTest/JUnit evidence are
+into the registry. No registry-write permission is granted. The model-free image compiles Unit
+and preflight executables, but `run_develop_pr_tests.py` executes only Unit
+and host. Unit retains unrestricted parallelism; host uses the production
+lane's serial scheduling. Both exact inventories must pass with no skips.
+Their logs and JUnit evidence are retained separately, and `pr-tests.json`
+records the `unit-and-host` scope. That receipt cannot certify full preflight.
+Accelerator preflight, model staging, generation, HF parity, E2E and benchmarks
+remain outside this PR gate. Only build logs, image/test receipts and CTest/JUnit evidence are
 uploaded to GitHub. Run the equivalent locally with:
 
 ```bash
@@ -93,7 +99,7 @@ dispatches on `develop`. It uses the GitHub-hosted `llaminar-cloud-16` runner
 in the `Develop CI` group: Ubuntu 24.04, 16 vCPUs, 64 GB RAM and 600 GB storage,
 with a maximum of four cloud runners across PR checks and publication. The
 group admits only this repository and
-`ci.yml` plus the reusable `develop-unit.yml`, both pinned to
+`ci.yml` plus the reusable `develop-pr-tests.yml`, both pinned to
 `refs/heads/develop`. Image publication has its own
 `llaminar-cloud-develop-images` concurrency group with
 `cancel-in-progress: true`: at most one develop image build runs, and a new
@@ -135,8 +141,8 @@ python3 scripts/ci/run_develop_image_gate.py \
 ```
 
 `--publish` requires `--build-only`, an image tag and both ISA lanes. Without
-`--build-only`, the driver runs the complete device-free Unit suite in a
-`unit-only` test companion and cannot publish. `--cpu-isa` can narrow a local
+`--build-only`, the driver runs the complete device-free Unit suite and the
+host preflight lane in a `model-free` test companion and cannot publish. `--cpu-isa` can narrow a local
 build or PR diagnostic, never a published pair. Full production prerequisites
 remain owned by `run_production_prerequisites.py` and the production pipeline.
 
@@ -402,7 +408,7 @@ feature PRs, develop pushes and manual benchmark workflows retain their scope.
 
 `scripts/ci/apply_master_ruleset.py` installs the five required GitHub Actions
 checks on the existing master ruleset with strict up-to-date PR semantics and
-squash-only merge. It also installs the `develop` PR and AVX2 Unit
+squash-only merge. It also installs the `develop` PR and AVX2 Unit/host
 check requirements, while retaining deletion and force-push protection.
 `develop` deliberately does not require linear history: after a certified
 master squash merge, the release publisher records that exact master commit as

@@ -4,8 +4,8 @@
 This intentionally small gate is distinct from the full production
 certification pipeline. The develop push selects build-only publication of
 AVX512 and AVX2 full-backend runtimes without compiling or running test images.
-The separate PR gate runs only the complete CMake-owned, device-free Unit
-inventory inside its installed test runner.
+The separate PR gate runs the complete CMake-owned Unit inventory and the
+canonical host preflight lane inside its installed test runner, without GPUs.
 Neither policy discovers models, stages a
 corpus, launches a server, runs mathematical parity, E2E, remote MPI, or a
 benchmark, and it never calls an image a certified release artifact.
@@ -67,37 +67,43 @@ def remote_image_id(tag: str) -> str | None:
     return identity
 
 
-def run_unit_tests(images: dict, directory: Path) -> dict:
-    """Run the complete device-free Unit suite without exposing accelerators.
+def run_pr_tests(images: dict, directory: Path) -> dict:
+    """Run complete Unit and host-preflight inventories without exposing accelerators.
 
-    The test runner already contains its immutable Unit executable inventory
+    The test runner already contains its immutable model-free executable inventory
     and installed receipt.  Bind only the evidence directory; attaching models
     or a corpus would make this deliberately model-free develop gate depend on
     a second, undocumented input surface.
     """
     image = images[ImageRole.TEST_RUNNER.value]["id"]
-    name = "llaminar-develop-unit-" + uuid.uuid4().hex
-    command = ["python3", "scripts/ci/run_unit_tests.py",
+    name = "llaminar-develop-pr-tests-" + uuid.uuid4().hex
+    command = ["python3", "scripts/ci/run_develop_pr_tests.py",
                "--build-dir", "build_v2_integration",
                "--installed-build-receipt", "/src/installed-tests.json",
-               "--output", "/ci-results/unit"]
+               "--output", "/ci-results/pr-tests"]
     launch = ["docker", "run", "--rm", "--name", name,
               "--user", f"{os.getuid()}:{os.getgid()}",
               *(part for group in os.getgroups() for part in ("--group-add", str(group))),
               *docker_paths.mounts([(directory, "/ci-results", False)]),
               "-w", "/src", image,
-              *logged_container_command(command, "/ci-results/unit.process.log")]
+              *logged_container_command(command, "/ci-results/pr-tests.process.log")]
     try:
-        run(launch, directory / "unit.log")
+        run(launch, directory / "pr-tests.log")
     finally:
         subprocess.run(["docker", "rm", "-f", name], check=False, timeout=30,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    report_path = directory / "unit" / "unit.json"
+    report_path = directory / "pr-tests" / "pr-tests.json"
     report = json.loads(report_path.read_text())
-    if (report.get("scope") != "unit" or report.get("complete") is not True
-            or report.get("return_code") != 0 or not report.get("tests")
-            or report.get("test_count") != len(report["tests"])):
-        raise ValueError("Unit receipt is incomplete or unsuccessful")
+    if (report.get("scope") != "unit-and-host" or report.get("complete") is not True
+            or report.get("return_code") != 0
+            or set(report.get("lanes", {})) != {"unit", "host"}):
+        raise ValueError("PR Unit/host receipt is incomplete or unsuccessful")
+    for lane in report["lanes"].values():
+        tests = lane.get("tests", [])
+        if (lane.get("complete") is not True or lane.get("return_code") != 0
+                or not tests or lane.get("test_count") != len(tests)
+                or len(set(tests)) != len(tests)):
+            raise ValueError("PR Unit/host lane is incomplete or unsuccessful")
     return report
 
 
@@ -123,7 +129,7 @@ def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
     """Parse only the small explicit surface supported by the develop gate."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True,
-                        help="new ignored directory for build or Unit evidence")
+                        help="new ignored directory for build or Unit/host evidence")
     parser.add_argument("--image", help="AVX512 develop runtime tag; AVX2 appends -avx2")
     parser.add_argument("--build-only", action="store_true",
                         help="build runtime images without compiling or executing Unit/preflight tests")
@@ -139,7 +145,7 @@ def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
     if args.publish and (not args.image or set(args.cpu_isas) != set(SHIPPING_ISAS)):
         parser.error("--publish requires --image and both AVX512 and AVX2 gates")
     if args.publish and not args.build_only:
-        parser.error("--publish requires --build-only; PR Unit validation never publishes")
+        parser.error("--publish requires --build-only; PR Unit/host validation never publishes")
     args.output = args.output.resolve()
     return args
 
@@ -153,7 +159,7 @@ def main(argv: list[str] | None = None) -> int:
     source = source_identity()
     receipt = {"schema": 1, "source": source, "complete": False, "published": False,
                "variants": {}, "image": args.image,
-               "validation": "build-only" if args.build_only else "unit"}
+               "validation": "build-only" if args.build_only else "unit-and-host"}
     write_json(args.output / "develop-image-gate.json", receipt)
     for isa in args.cpu_isas:
         if source_identity() != source:
@@ -170,15 +176,16 @@ def main(argv: list[str] | None = None) -> int:
         else:
             images = build(build_args, source, directory,
                            roles=(ImageRole.TEST_RUNNER,),
-                           test_inventory=TestRunnerInventory.UNIT_ONLY)
+                           test_inventory=TestRunnerInventory.MODEL_FREE)
             require_image(images[ImageRole.TEST_RUNNER.value], source, isa, ImageRole.TEST_RUNNER,
-                          test_inventory=TestRunnerInventory.UNIT_ONLY)
-            unit = run_unit_tests(images, directory)
+                          test_inventory=TestRunnerInventory.MODEL_FREE)
+            pr_tests = run_pr_tests(images, directory)
             variant = {
                 "test_runner_image": images[ImageRole.TEST_RUNNER.value]["id"],
-                "test_runner_inventory": TestRunnerInventory.UNIT_ONLY.value,
-                "unit_digest": digest(unit),
-                "unit_test_count": unit["test_count"],
+                "test_runner_inventory": TestRunnerInventory.MODEL_FREE.value,
+                "pr_tests_digest": digest(pr_tests),
+                "unit_test_count": pr_tests["lanes"]["unit"]["test_count"],
+                "host_test_count": pr_tests["lanes"]["host"]["test_count"],
             }
         receipt["variants"][isa] = variant
         write_json(args.output / "develop-image-gate.json", receipt)
