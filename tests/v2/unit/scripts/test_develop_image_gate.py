@@ -236,7 +236,8 @@ class DevelopImageGateTests(unittest.TestCase):
         policy = yaml.load(workflow, Loader=yaml.BaseLoader)
         self.assertEqual(policy["jobs"]["develop-images"]["runs-on"],
                          {"group": "Develop CI", "labels": "llaminar-cloud-16"})
-        self.assertEqual(policy["concurrency"]["group"], "llaminar-cloud-develop-ci")
+        self.assertEqual(policy["concurrency"], {
+            "group": "llaminar-cloud-develop-images", "cancel-in-progress": "true"})
         self.assertIn("--build-only", workflow)
         self.assertNotIn("prerequisites/", workflow)
         self.assertNotIn("prune_docker_build_cache", workflow)
@@ -251,8 +252,8 @@ class DevelopImageGateTests(unittest.TestCase):
                          {"opened", "synchronize", "reopened", "ready_for_review"})
         self.assertEqual(workflow["permissions"], {"contents": "read"})
         self.assertEqual(workflow["concurrency"], {
-            "group": "llaminar-cloud-develop-ci", "cancel-in-progress": "false",
-            "queue": "max"})
+            "group": "llaminar-cloud-develop-pr-${{ github.event.pull_request.number }}",
+            "cancel-in-progress": "true"})
         self.assertEqual(set(workflow["jobs"]), {"unit"})
         job = workflow["jobs"]["unit"]
         self.assertEqual(job["uses"],

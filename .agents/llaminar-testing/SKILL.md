@@ -39,8 +39,9 @@ production-preflight tests run, and the container receives no GPU devices or
 model mounts. It calls `run_develop_image_gate.py --cpu-isa AVX2` without
 `--build-only` or `--publish`, on the 16-core GitHub-hosted runner through the protected
 `develop-unit.yml@develop` reusable workflow. PRs import public registry cache
-layers without credentials or cache export, and share a serialized cloud queue
-with develop image publication. AVX2 execution does not depend on AVX512 support
+layers without credentials or cache export. Separate PRs run concurrently;
+new commits cancel older checks on the same PR. The cloud pool admits up to
+four 16-core runners. AVX2 execution does not depend on AVX512 support
 in the cloud pool. CTest owns selection and the JUnit receipt must prove
 that every discovered Unit test ran without skipping.
 The `develop` ruleset requires `Develop PR / Unit (AVX2)` on an up-to-date PR. The separate
@@ -56,7 +57,8 @@ The `develop` push workflow uses the 16-core GitHub-hosted cloud runner and
 full-backend Release runtimes, omits Integration compilation, and publishes
 both branch and source-SHA tags after both builds succeed. It runs no tests
 and grants no certificate. Registry layer caches retain cloud build inputs;
-this job has a separate queue from the production host. Complete Unit and
+publication has a single concurrency group that cancels a superseded build
+when a new merge arrives. PR checks and production hardware use separate groups. Complete Unit and
 production preflight remain mandatory in the explicit production pipeline,
 through `run_production_prerequisites.py`. See `docs/production-ci.md` for
 runner, cache, receipt and publication boundaries.

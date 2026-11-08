@@ -1015,14 +1015,17 @@ on the 16-core GitHub-hosted runner through `develop-unit.yml@develop`
 and run the complete device-free `Unit` suite. Integration and production
 preflight remain separate production gates. This is not image certification.
 It reuses the existing image driver without publication; no models, E2E or
-benchmarks run on this PR. The PR imports public registry layers without credentials or cache export and shares the cloud publication
-queue; production hardware has its own independent queue.
+benchmarks run on this PR. The PR imports public registry layers without
+credentials or cache export. Separate PRs run concurrently in a pool of up to
+four 16-core cloud runners; a new commit cancels older checks on the same PR.
+Production hardware has its own independent queue.
 
 The enabled `develop` push workflow is deliberately smaller than certification: it invokes
 `scripts/ci/run_develop_image_gate.py --build-only --publish` on the 16-core
 GitHub-hosted runner to build AVX512 and AVX2 full-backend Release runtimes
 and publish both `develop` and source-SHA tags. It compiles no Integration
-inventory and runs no tests. PRs separately require device-free Unit tests
+inventory and runs no tests. Its single concurrency group cancels an older
+build when a newer develop merge arrives. PRs separately require device-free Unit tests
 and approval from the owner-only repository approvers team. It does not
 run model/generation/parity/E2E/benchmark certification and must not be
 expanded into a second production-pipeline implementation. See

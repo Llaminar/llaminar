@@ -12,10 +12,10 @@ permissions:
   contents: read
   packages: write
 
+# Only the newest develop head needs publication. Cancel superseded builds.
 concurrency:
-  group: llaminar-cloud-develop-ci
-  cancel-in-progress: false
-  queue: max
+  group: llaminar-cloud-develop-images
+  cancel-in-progress: true
 
 jobs:
   develop-images:

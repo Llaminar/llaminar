@@ -63,7 +63,10 @@ workflow reference while the default checkout still tests the caller's PR
 merge ref. Both workflows grant only Contents read access and pass no secrets.
 The called job admits only same-repository pull requests targeting `develop`.
 
-The Unit job uses the same 16-core GitHub-hosted runner as develop publication.
+The Unit job uses the same 16-core GitHub-hosted runner pool as develop publication.
+Each PR has its own `llaminar-cloud-develop-pr-<number>` concurrency group with
+`cancel-in-progress: true`: separate PRs can run concurrently, while new commits
+cancel obsolete checks on that same PR.
 AVX2 is the explicit execution lane because the cloud x64 pool does not carry
 the production host's AVX512 contract. It calls the existing
 `run_develop_image_gate.py --cpu-isa AVX2` without `--publish`, using an ephemeral
@@ -88,12 +91,14 @@ separate, broader gate.
 `.github/workflows/ci.yml` runs on pushes to `develop` and explicit manual
 dispatches on `develop`. It uses the GitHub-hosted `llaminar-cloud-16` runner
 in the `Develop CI` group: Ubuntu 24.04, 16 vCPUs, 64 GB RAM and 600 GB storage,
-with maximum concurrency one. The group admits only this repository and
+with a maximum of four cloud runners across PR checks and publication. The
+group admits only this repository and
 `ci.yml` plus the reusable `develop-unit.yml`, both pinned to
-`refs/heads/develop`. PR validation and image publication share the
-`llaminar-cloud-develop-ci` queue with `queue: max` and
-`cancel-in-progress: false`, preserving every pending run without occupying
-the production host or its accelerators.
+`refs/heads/develop`. Image publication has its own
+`llaminar-cloud-develop-images` concurrency group with
+`cancel-in-progress: true`: at most one develop image build runs, and a new
+merge cancels the superseded build. PRs use separate per-PR groups, so they
+can run alongside publication without occupying production accelerators.
 
 The job runs `scripts/ci/run_develop_image_gate.py --build-only --publish`.
 It builds only the full CPU/CUDA/ROCm Release runtime targets for AVX512 and

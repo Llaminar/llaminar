@@ -9,11 +9,10 @@ on:
 permissions:
   contents: read
 
-# PRs and publication share one 16-core cloud slot, separate from production.
+# Different PRs run concurrently; new commits replace only their own PR run.
 concurrency:
-  group: llaminar-cloud-develop-ci
-  cancel-in-progress: false
-  queue: max
+  group: llaminar-cloud-develop-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   unit:
