@@ -715,7 +715,9 @@ class QFNSourceAdmissionCI(unittest.TestCase):
             return {'isa': isa}
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            with patch.object(suite, 'inventory_companion', return_value={}), \
+            with patch.object(suite, 'run_e2e_prerequisites', return_value={}), \
+                 patch.object(suite, 'validate_e2e_prerequisites'), \
+                 patch.object(suite, 'inventory_companion', return_value={}), \
                  patch.object(suite, 'run_admission', side_effect=source), \
                  patch.object(suite, 'build_driver') as http:
                 with self.assertRaisesRegex(ValueError, 'source-admission cell failures'):
@@ -733,7 +735,9 @@ class QFNSourceAdmissionCI(unittest.TestCase):
         pair = {'source': {}, 'images': {isa: {'id': isa} for isa in suite.ISAS}}
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            with patch.object(suite, 'inventory_companion', return_value={}), \
+            with patch.object(suite, 'run_e2e_prerequisites', return_value={}), \
+                 patch.object(suite, 'validate_e2e_prerequisites'), \
+                 patch.object(suite, 'inventory_companion', return_value={}), \
                  patch.object(suite, 'run_admission', side_effect=ValueError('incomplete driver window')) as source, \
                  patch.object(suite, 'build_driver') as http:
                 with self.assertRaisesRegex(ValueError, 'incomplete driver window'):
@@ -891,21 +895,14 @@ class QFNSourceAdmissionCI(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_report(report)
 
-    def test_feature_source_failure_prevents_successful_parent_receipt(self):
+    def test_feature_gate_does_not_admit_real_model_source_work(self):
+        """PR validation owns Unit/host only; real source admission is release work."""
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / 'output'
-            source = {'revision': 'a' * 40, 'tree': 'tree'}
-            images = {'test-runner': {'id': 'companion'}, 'runtime': {'id': 'runtime'}}
-            with patch.object(gate, 'source_identity', return_value=source), \
-                 patch.object(gate, 'device_lease', return_value=nullcontext()), \
-                 patch.object(gate, 'build', return_value=images) as build, \
-                 patch.object(gate, 'require_image_pair'), \
-                 patch.object(gate, 'run_prerequisites', return_value={'preflight_test_count': 1}), \
-                 patch.object(gate, 'run_admission', side_effect=ValueError('native candidate unsupported')):
-                with self.assertRaisesRegex(ValueError, 'native candidate unsupported'):
-                    gate.main(['--cpu-isa', 'AVX512', '--source-admission', '--output', str(output)])
-            self.assertEqual(build.call_args.kwargs['test_inventory'], gate.TestRunnerInventory.FULL_MATRIX)
-            self.assertFalse(json.loads((output / 'develop-image-gate.json').read_text())['complete'])
+            with patch.object(gate, 'build') as build, self.assertRaises(SystemExit):
+                gate.parse_arguments(['--cpu-isa', 'AVX512', '--source-admission', '--output', str(output)])
+            build.assert_not_called()
+            self.assertFalse(output.exists())
 
     def test_source_registration_rejects_reference_xfail_and_missing_sources(self):
         props = {'LABELS': ['Admission', 'RealModel', 'FullModel', 'UnqualifiedCandidate'],

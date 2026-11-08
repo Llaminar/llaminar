@@ -33,39 +33,48 @@ separate explicit workflow. Never silently regenerate answers on drift.
 Keep the fresh/full/partial prefix probes, exact repeatability, actual dynamic
 MTP activity, movement obligations and captured production-path evidence.
 
-Feature PRs into `develop` use `.github/workflows/develop-pr.yml` to build one
-AVX512 full-backend image pair and run complete Unit and
-ProductionTestPreflight, followed by the separate QFN source-admission gate.
-This is pre-merge validation, not release certification: no AVX2, numerical
-reference run, HTTP E2E, benchmarks or publication. It calls the existing image
-driver with `--cpu-isa AVX512 --source-admission` and no `--publish`, using the
-same host-only cache and shared accelerator concurrency group. Source admission
-uses the FULL_MATRIX test companion, code-owned CTest/GTest membership, exact
-native hardware eligibility and canonical read-only GGUF inputs. All selected
-cells, including Candidates, must execute and pass without skips; unavailable
-hardware is explicitly unqualified. The default develop push remains model-free. See
-`docs/production-ci.md` for its same-repository trust boundary and local command.
-The `develop` ruleset requires that exact check on an up-to-date PR and rejects
-direct human pushes. The trusted base-branch auto-merge workflow arms native
-squash auto-merge only for non-draft same-repository PRs; it never runs PR code.
-The sole direct-push exception is the dedicated release-evidence deploy key for
-the certified post-squash high-water/ancestry commit. Never grant the general
-GitHub Actions app bypass, since it also owns PR auto-merge.
+Feature PRs into `develop` use `.github/workflows/develop-pr.yml` to run an
+AVX512/AVX2 matrix on two separate 16-core cloud runners in parallel. Each builds
+a full-backend test companion with the `model-free` executable inventory.
+They run the complete device-free `Unit` suite and the production-preflight
+`host` lane selected by the canonical scheduler. CUDA, ROCm and exclusive
+preflight lanes do not run; the container receives no GPU devices or model
+mounts. Each job calls `run_develop_image_gate.py --cpu-isa <matrix ISA>` without
+`--build-only` or `--publish`, on the 16-core GitHub-hosted runner through the protected
+`develop-pr-tests.yml@develop` reusable workflow. PRs import public registry cache
+layers without credentials or cache export. Separate PRs run concurrently;
+new commits cancel older checks on the same PR. The cloud pool admits up to
+four 16-core runners. The matrix disables fail-fast so both ISA results remain
+visible. The driver admits the requested ISA against every visible CPU before
+compiling; missing required flags fail explicitly without changing the ISA. CTest owns selection and the JUnit receipt must prove
+that every discovered Unit and host test ran without skipping. Unit runs with
+unrestricted parallelism; host retains its canonical serial scheduling. The
+`unit-and-host` PR receipt is separate from complete production preflight.
+The `develop` ruleset requires both `Develop PR / Unit + host (AVX512)` and
+`Develop PR / Unit + host (AVX2)` on an up-to-date PR. The separate
+`Owner approval` ruleset requires approval from the owner-only
+`@Llaminar/repository-approvers` team for both protected branches. Native
+squash auto-merge waits for required reviews and checks. The owner has a
+PR-only approval override; existing CI rules remain enforced. The dedicated
+release-evidence deploy key retains its existing publication exception.
+Never grant the general GitHub Actions app a ruleset bypass.
 
-The enabled `develop` push workflow is intentionally narrower than that
-routine certification path. It uses `scripts/ci/run_develop_image_gate.py` to
-build both full-backend AVX512/AVX2 builder/runtime pairs, run the complete
-Unit and ProductionTestPreflight transaction inside each builder, and publish
-the two tested `develop` runtime tags **and exact source-SHA tags**. It does not run model discovery,
-generation, mathematical parity, HTTP E2E, remote MPI, benchmarks, or attach a
-certificate. Use it for fast shippable developer images; use the full pipeline
-when requesting a certified artifact.
+The `develop` push workflow uses the 16-core GitHub-hosted cloud runner and
+`run_develop_image_gate.py --build-only --publish`. It compiles only the two
+full-backend Release runtimes, omits Integration compilation, and publishes
+both branch and source-SHA tags after both builds succeed. It runs no tests
+and grants no certificate. Registry layer caches retain cloud build inputs;
+publication has a single concurrency group that cancels a superseded build
+when a new merge arrives. PR checks and production hardware use separate groups. Complete Unit and
+production preflight remain mandatory in the explicit production pipeline,
+through `run_production_prerequisites.py`. See `docs/production-ci.md` for
+runner, cache, receipt and publication boundaries.
 The `develop` → `master` PR gate is separate: its required pull-request E2E
-check waits for the exact develop-head image pair, runs QFN source admission in
-source/ISA-authenticated full-matrix test companions for both ISAs, then proves
-both runtime ISAs on the full HTTP matrix. Its dependent benchmark check consumes
-that same image-bound E2E receipt, including source-admission bindings. The
-benchmark check runs both ISAs even when the first has a
+check waits for the exact develop-head image pair, runs complete Unit and
+production preflight in source/ISA-bound full-matrix test companions on both
+ISAs, runs separate QFN source admission on both exact-source test companions,
+then proves both runtimes on the full HTTP matrix, then its dependent benchmark check consumes that same image-bound
+E2E receipt. The benchmark check runs both ISAs even when the first has a
 complete red ratchet report, comments the per-cell red/amber/green numbers on
 the PR, and fails if any measured phase exceeds the high-water tolerance.
 Only after both benchmark lanes pass, the required OpenCode check runs one

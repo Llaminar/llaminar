@@ -4,6 +4,8 @@
 This is a consumer of the production pipeline, not another test matrix or an
 image builder/publisher. A same-source installed test companion exports the
 canonical inventory; inference always uses immutable images pulled from GHCR.
+Complete Unit/preflight runs in both source-bound companions before HTTP work,
+because develop image publication itself performs no test execution.
 Both full HTTP suites must pass before either ISA may be benchmarked. Compact
 benchmark evidence and a deterministic SVG may be published to the branch;
 these phase-specific results are not full production-image certificates.
@@ -27,7 +29,7 @@ import docker_paths
 from qfn_source_admission_image import SourceAdmissionRed, run_admission, validate_binding as validate_source_binding
 from production_artifacts import (digest, image_identity, positive, ratchet, validate_image_e2e,
                                   validate_image_e2e_coverage,
-                                  validate_manifest, write_json)
+                                  validate_manifest, validate_prerequisites, write_json)
 import run_production_pipeline as pipeline
 from run_develop_image_gate import runtime_tag
 
@@ -458,6 +460,51 @@ def run_source_pair(args, pair: dict, directory: Path, receipt: dict) -> None:
         raise ValueError('QFN source-admission cell failures remain on the ISA pair')
 
 
+def run_e2e_prerequisites(args, pair: dict, directory: Path) -> dict:
+    """Gate both published runtimes with complete source/ISA-bound prerequisites.
+
+    Test companions compile the full production inventory. Runtime identities
+    remain the pulled immutable pair; no locally built runtime may replace them.
+    Canonical reports are embedded in the E2E receipt so benchmark and release
+    admission can authenticate this gate without assuming develop ran tests.
+    """
+    evidence = {}
+    for isa in ISAS:
+        work = directory / "prerequisites" / isa.lower()
+        work.mkdir(parents=True)
+        build_args = SimpleNamespace(cpu_isa=isa, models=args.models,
+                                    model_ramdisk_root=args.model_ramdisk_root,
+                                    reference_cache_root=work / "reference-cache")
+        build_args.reference_cache_root.mkdir()
+        images = inventory_companion(build_args, pair["source"], work)
+        image = images[pipeline.ImageRole.TEST_RUNNER.value]
+        pipeline.require_image(image, pair["source"], isa, pipeline.ImageRole.TEST_RUNNER)
+        pipeline.run_test_runner(images, [
+            "python3", "scripts/ci/run_production_prerequisites.py",
+            "--build-dir", "build_v2_integration",
+            "--installed-build-receipt", "/src/installed-tests.json",
+            "--output", "/ci-results/prerequisites",
+        ], build_args, work, "prerequisites.log")
+        report = json.loads((work / "prerequisites/prerequisites.json").read_text())
+        validate_prerequisites(report)
+        evidence[isa] = {"test_runner_image": image, "report": report,
+                         "runtime_image": pair["images"][isa]["id"]}
+    return evidence
+
+
+def validate_e2e_prerequisites(evidence: dict, pair: dict) -> None:
+    """Reject absent, failed, cross-source or cross-ISA prerequisite evidence."""
+    if not isinstance(evidence, dict) or set(evidence) != set(ISAS):
+        raise ValueError("E2E prerequisites require both shipping ISAs")
+    for isa in ISAS:
+        lane = evidence[isa]
+        if lane.get("runtime_image") != pair["images"][isa]["id"]:
+            raise ValueError("E2E prerequisite runtime identity changed")
+        pipeline.require_image(lane.get("test_runner_image"), pair["source"], isa,
+                               pipeline.ImageRole.TEST_RUNNER)
+        validate_prerequisites(lane.get("report", {}))
+
+
 def run_e2e(args, pair: dict, manifest: dict, directory: Path) -> None:
     """Collect every independent HTTP cell on both ISAs before judging the pair.
 
@@ -472,6 +519,9 @@ def run_e2e(args, pair: dict, manifest: dict, directory: Path) -> None:
     receipt['model_kld_required'] = getattr(args, 'model_kld_canaries', False)
     receipt['model_kld_reports'] = {}
     receipt['failed_model_kld_cells'] = {}
+    write_json(directory / "e2e-receipt.json", receipt)
+    receipt["prerequisites"] = run_e2e_prerequisites(args, pair, directory)
+    validate_e2e_prerequisites(receipt["prerequisites"], pair)
     write_json(directory / "e2e-receipt.json", receipt)
     if getattr(args, 'qfn_source_admission', False):
         run_source_pair(args, pair, directory, receipt)
@@ -610,6 +660,7 @@ def admit_e2e(bundle: Path, pair: dict, *, require_model_kld: bool = False,
             or receipt.get("manifest_digest") != digest(manifest)
             or set(receipt.get("reports", {})) != set(ISAS)):
         raise ValueError("E2E pair receipt is incomplete or stale")
+    validate_e2e_prerequisites(receipt.get("prerequisites"), pair)
     reports = {}
     for isa in ISAS:
         report = json.loads((bundle / isa.lower() / "e2e.json").read_text())

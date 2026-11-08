@@ -70,7 +70,6 @@ ARG LLAMINAR_BUILD_TYPE
 ARG LLAMINAR_CUDA_ARCHS
 ARG LLAMINAR_ENABLE_CUDA
 ARG LLAMINAR_ENABLE_ROCM
-ARG LLAMINAR_SKIP_INTEGRATION
 ARG LLAMINAR_BUILD_RCCL_FROM_SOURCE
 ARG RCCL_GIT_REF
 ARG RCCL_GPU_TARGETS
@@ -404,6 +403,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 FROM toolchain AS builder
 
+# Runtime-only cloud builds omit Integration without invalidating the shared
+# compiler/SDK dependency layers. Test companions always compile Integration.
+ARG LLAMINAR_SKIP_INTEGRATION
+
 # The full production pipeline needs matrix executables for typed E2E discovery.
 # The develop image gate is intentionally model-free, so it selects the smaller
 # inventory below. Declare this only at the builder boundary: toolchain layers
@@ -411,7 +414,7 @@ FROM toolchain AS builder
 ARG LLAMINAR_BUILD_MODEL_PARITY_MATRICES
 ARG LLAMINAR_TEST_RUNNER_INVENTORY
 RUN case "${LLAMINAR_BUILD_MODEL_PARITY_MATRICES}:${LLAMINAR_TEST_RUNNER_INVENTORY}" in \
-        ON:full-matrix|OFF:model-free) ;; \
+        ON:full-matrix|OFF:model-free|OFF:unit-only) ;; \
         *) echo "Invalid test-runner inventory: matrices=${LLAMINAR_BUILD_MODEL_PARITY_MATRICES}, inventory=${LLAMINAR_TEST_RUNNER_INVENTORY}" >&2; exit 1 ;; \
     esac
 
@@ -479,10 +482,11 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
             -DLLAMINAR_SHARED_CORE=ON \
             -DCMAKE_CUDA_ARCHITECTURES="${LLAMINAR_CUDA_ARCHS}" \
             ${RCCL_CMAKE_ARGS} \
-     && case "${LLAMINAR_BUILD_MODEL_PARITY_MATRICES}" in \
-            ON) integration_targets="v2_unit_gate v2_production_test_preflight_gate v2_model_parity_matrices" ;; \
-            OFF) integration_targets="v2_unit_gate v2_production_test_preflight_gate" ;; \
-            *) echo "Unsupported LLAMINAR_BUILD_MODEL_PARITY_MATRICES='${LLAMINAR_BUILD_MODEL_PARITY_MATRICES}'. Use ON or OFF." >&2; exit 1 ;; \
+     && case "${LLAMINAR_TEST_RUNNER_INVENTORY}" in \
+            full-matrix) integration_targets="v2_unit_gate v2_production_test_preflight_gate v2_model_parity_matrices" ;; \
+            model-free) integration_targets="v2_unit_gate v2_production_test_preflight_gate" ;; \
+            unit-only) integration_targets="v2_unit_gate" ;; \
+            *) echo "Unsupported test-runner inventory: ${LLAMINAR_TEST_RUNNER_INVENTORY}" >&2; exit 1 ;; \
         esac \
      && echo "==> [integration] cmake build (parallel; matrices=${LLAMINAR_BUILD_MODEL_PARITY_MATRICES})" \
      && cmake --build build_v2_integration --parallel \
@@ -508,10 +512,12 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
     fi
 
 # This receipt permits the campaign driver to use installed binaries without
-# reconstructing stripped objects. Both complete model-free gates still run.
+# reconstructing stripped objects. Its scope cannot substitute for broader gates.
 RUN if [ "${LLAMINAR_SKIP_INTEGRATION}" != "1" ]; then \
+      receipt_scope=production; \
+      if [ "${LLAMINAR_TEST_RUNNER_INVENTORY}" = "unit-only" ]; then receipt_scope=unit; fi; \
       python3 scripts/ci/prebuilt_test_image.py --build-dir build_v2_integration \
-        --receipt /src/installed-tests.json --seal; \
+        --receipt /src/installed-tests.json --scope "$receipt_scope" --seal; \
     fi
 
 # Release build — what the runtime image ships. Optimized, no assertions,

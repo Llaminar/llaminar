@@ -50,7 +50,7 @@ jobs:
           cleanup: false
           keep-state: true
           cache-binary: false
-      - name: Test both published runtime images with the full canonical HTTP suite
+      - name: Run prerequisites and the full HTTP suite for both published ISAs
         run: |
           exec python3 scripts/ci/run_published_image_suite.py e2e \
             --output "$RUNNER_TEMP/llaminar-published-e2e-$GITHUB_RUN_ID" \
@@ -66,6 +66,9 @@ jobs:
             ${{ runner.temp }}/llaminar-published-e2e-${{ github.run_id }}/manifest.json
             ${{ runner.temp }}/llaminar-published-e2e-${{ github.run_id }}/inventory-image.json
             ${{ runner.temp }}/llaminar-published-e2e-${{ github.run_id }}/e2e-receipt.json
+            ${{ runner.temp }}/llaminar-published-e2e-${{ github.run_id }}/prerequisites/*/*.log
+            ${{ runner.temp }}/llaminar-published-e2e-${{ github.run_id }}/prerequisites/*/build-timeline.jsonl
+            ${{ runner.temp }}/llaminar-published-e2e-${{ github.run_id }}/prerequisites/*/prerequisites/**
             ${{ runner.temp }}/llaminar-published-e2e-${{ github.run_id }}/pull.log
             ${{ runner.temp }}/llaminar-published-e2e-${{ github.run_id }}/build-driver.log
             ${{ runner.temp }}/llaminar-published-e2e-${{ github.run_id }}/driver-image.json

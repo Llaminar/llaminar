@@ -2,7 +2,7 @@
 """Install release-branch protection after PR checks have run once.
 
 The master rule requires five GitHub Actions checks. The develop rule requires
-the image-bound PR prerequisite check and blocks direct human pushes. Its only
+the image-bound device-free Unit check and blocks direct human pushes. Its only
 bypass is the repository's dedicated release-evidence deploy key, used to
 publish the certified post-squash two-parent ancestry join. Never grant the
 general GitHub Actions app bypass: it also arms ordinary PR auto-merge.
@@ -30,7 +30,10 @@ REQUIRED_CHECKS = (
     "Published benchmarks (AVX512 and AVX2)",
     "Published OpenCode (AVX512 and AVX2)",
 )
-DEVELOP_REQUIRED_CHECK = "Unit + ProductionTestPreflight (AVX512)"
+DEVELOP_REQUIRED_CHECKS = (
+    "Develop PR / Unit + host (AVX512)",
+    "Develop PR / Unit + host (AVX2)",
+)
 RELEASE_DEPLOY_KEY_TITLE = "llaminar-release-evidence"
 RELEASE_DEPLOY_KEY_BYPASS = [{"actor_id": None, "actor_type": "DeployKey",
                               "bypass_mode": "always"}]
@@ -64,7 +67,7 @@ def proposed_ruleset(current: dict) -> dict:
 
 
 def proposed_develop_ruleset(current: dict) -> dict:
-    """Require the image-bound PR gate, except for the dedicated release key."""
+    """Require the image-bound Unit gate, except for the dedicated release key."""
     if (current.get("target") != "branch" or current.get("name") != "develop"
             or current.get("conditions", {}).get("ref_name", {}).get("include")
             != ["refs/heads/develop"]):
@@ -96,8 +99,9 @@ def proposed_develop_ruleset(current: dict) -> dict:
         {"type": "required_status_checks", "parameters": {
             "strict_required_status_checks_policy": True,
             "do_not_enforce_on_create": False,
-            "required_status_checks": [{"context": DEVELOP_REQUIRED_CHECK,
-                                        "integration_id": GITHUB_ACTIONS_APP_ID}],
+            "required_status_checks": [{"context": context,
+                                        "integration_id": GITHUB_ACTIONS_APP_ID}
+                                       for context in DEVELOP_REQUIRED_CHECKS],
         }},
     ])
     return {"name": current["name"], "target": current["target"],
