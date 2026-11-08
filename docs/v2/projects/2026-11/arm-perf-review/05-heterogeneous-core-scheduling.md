@@ -88,3 +88,14 @@ another schedule heuristic.
 - SMALL N=512 bundle: mixed-20 is much worse for grouped M=4 (IQ2_S 52.5 vs 19.3 µs; Q4_K 32.5 vs 11.2 µs) — only ~8 tasks, 20 workers to wake.
 - Conclusion: the placement choice must depend on the projection's TASK COUNT (columns × chunk structure), not only M=1 vs grouped — the C8 default table is revised accordingly (fastest-class only when the task count is small AND M=1; all-workers for big shapes).
 - Nuance vs the earlier P1 numbers: 'fast-only ≈ mixed for GEMV' was a different shape (2048x4096); at 17408x5120 mixed wins decode. The typed policy needs per-shape-class evidence, not a single switch.
+
+## Decode projection composition (2026-11-08 diagnostic probe, 35B)
+
+- no-MTP: **66%** start a standalone OpenMP region, **34%** enter an
+  already-running team; **99%** are M=1; **17%** have FEWER tasks than workers.
+- MTP: **65%** standalone.
+- Implication for C7: a standalone-region placement policy (fastest-class
+  width + task-count cap) covers ~2/3 of decode projections; the rest need the
+  in-team path (measured separately, idea 13 caveat).
+- Next: typed placement mechanism implementation (fastest-class width +
+  task-count cap, CLI flag, PerfStats counter) — pending window measurement.

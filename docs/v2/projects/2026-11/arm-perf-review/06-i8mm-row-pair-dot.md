@@ -164,3 +164,13 @@ Handoffs (rebased onto afe62c5ef, fork codex/i8mm-typed-placement):
   ancestor — PR #43 fast-forwarded onto the binding commit, so the lane's
   rebase is a no-op and cd55f6b27 is current-base + envelope + leaf; the
   authoritative gate runs on cd55f6b27 unchanged.
+
+- Final tip (2026-11-08): rebased onto 0868a5573 → **de4535855** (cc6ec7fd4
+  envelope + de4535855 leaf; fork codex/i8mm-typed-placement). CONFLICT
+  RESOLUTION: launcher keeps upstream's observer call ONLY; the I8MM
+  isa/route tags (NEON_I8MM, grouped_neon_i8mm_*; lone rows NEON_DOTPROD;
+  still 21 tags) live in the moved publisher recordNativeNEONFusedLaunches
+  (CPUNativeVNNIGemmKernel.h). Self-check .80 Integration NEON_I8MM: 52/52
+  focused tests (incl. the 5 filters that were link-broken before, GEMV
+  route/isa proof assertions, fused NEON cells, codegen envelope, ISA profile,
+  MPIBootstrap/OpenMP binding, CPUStartupAffinity).
