@@ -107,6 +107,12 @@ def _run_parallel_refresh_suite() -> int:
         os.environ.get("LLAMINAR_NATIVE_VNNI_REFRESH_TEST_WORKERS", "16")
     )
     workers = min(max(1, requested_workers), physical_cores, len(methods))
+    # CTest's PROCESSOR_AFFINITY grants at most its parallel level of CPUs, so
+    # `ctest -R <this>` without --parallel pins the suite to one core and it
+    # cannot meet its budget. State the granted width before any work starts.
+    print(f"Refresh suite: {workers} workers over {physical_cores} affinity-visible "
+          f"physical cores (requested {requested_workers}; run CTest with "
+          f"--parallel {requested_workers} or more)", flush=True)
 
     outcomes: dict[str, tuple[bool, str]] = {}
     durations: dict[str, float] = {}
