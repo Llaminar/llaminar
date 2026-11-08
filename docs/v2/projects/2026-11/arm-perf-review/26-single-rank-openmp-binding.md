@@ -37,3 +37,23 @@ deciding — the lane will run that check.
   .80 for OMP_PLACES=cores / bind=close single-rank serve; then A/B of
   binding change: single-rank 35B/27B decode+prefill, worker classes measured
   (X925-only / A725-only / mixed).
+
+## Decision (Main, 2026-11-08): option (a), two conditions
+
+1. **One implementation.** Factor the binding in `configureClusterRankThreads`
+   into one helper used by EVERY bootstrap path that sets OMP_PLACES=cores /
+   OMP_PROC_BIND=close (single-rank CPU, explicit `cpu:N`, GPU-NUMA cpu-set,
+   shorthand). Keep the existing OpenMP-partition authority: bind within the
+   rank's admitted mask (`sched_getaffinity` /
+   `ScopedOpenMPPartitionAffinity`), never widen it. On hosts without
+   `cpu_capacity`/`cpufreq` the order stays plain CPU-id order — x86 unchanged.
+2. **Proof.** Device-free ordering test with a fake sysfs root
+   (`capacityOrderedCpus` already takes one) + the .80 sched_getcpu-per-member
+   check in single-rank serve and with explicit `cpu:0`; registered in
+   `ProductionTestPreflight`. Rerun `V2_Integration_CPUStartupAffinity` and
+   `OpenMPIdleSpinPolicy` on .80; measure 35B MTP-off decode before/after (must
+   not regress — dynamic tiles already balance load; the gain is in serial and
+   static work).
+
+Implemented by arm-i8mm in commit 3 on top of `b2cf793bf`; Main reviews the
+diff by SHA.
