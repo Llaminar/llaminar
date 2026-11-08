@@ -95,7 +95,11 @@ TEST(CPUNativeVNNIFusedCompletion, ProjectionEvidenceUsesGeometryAndPolicyInstea
                 .verifier_schedule=VerifierRowsPolicy::FullKTwoRowPairGridNbc1});
         }
         const auto plan=planNativeVNNIFusedRows(descriptors,rows,workers,ISAPath::AUTO);
+#if !defined(__aarch64__)
+        // The x86 shared-K plan routes partials; the ARM register-K plan has
+        // whole-K tiles and no partial route. Output bytes are checked below.
         ASSERT_EQ(plan.partial_route,NativeVNNIFusedPartialRoute::FullK);
+#endif
         NativeVNNITestPartialStorage partials(plan.sharedPartialFloats());
         ASSERT_TRUE(gemm_native_vnni_fused_verifier_rows_preq(input.data(),descriptors.data(),partials.span(),
             count,rows,packed[0]->blocks_per_row));
@@ -205,7 +209,11 @@ TEST(CPUNativeVNNIFusedCompletion, ProjectionEvidenceUsesGeometryAndPolicyInstea
                 .verifier_schedule=item.verifier,.purpose=item.purpose,.policy_n=item.policy_n});
         }
         const auto plan=planNativeVNNIFusedRows(descriptors,rows,workers,ISAPath::AUTO);
+#if !defined(__aarch64__)
+        // The x86 shared-K plan routes partials; the ARM register-K plan has
+        // whole-K tiles and no partial route. Output bytes are checked below.
         ASSERT_EQ(plan.partial_route,NativeVNNIFusedPartialRoute::FullK);
+#endif
         NativeVNNITestPartialStorage partials(plan.sharedPartialFloats());
         ASSERT_TRUE(gemm_native_vnni_fused_verifier_rows_preq(input.data(),descriptors.data(),partials.span(),
             static_cast<int>(live.size()),rows,packed[0]->blocks_per_row));

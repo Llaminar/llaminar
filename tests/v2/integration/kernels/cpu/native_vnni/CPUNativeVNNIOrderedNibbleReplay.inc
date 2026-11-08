@@ -94,6 +94,9 @@ TEST(CPUNativeVNNIFusedCompletion, GPUAlignedOrderedNibbleAllFormatReplay)
                     // output owners even for four workers. This proves
                     // the changed local ordered branch is exercised,
                     // rather than certifying only the shared-bank path.
+#if !defined(__aarch64__)
+                    // x86 shared-K plan identity. The ARM register-K plan has
+                    // whole-K tiles; its ordered tree is proven by the bytes below.
                     if (rows >= 8 && requested == VerifierRowsPolicy::Pairwise)
                         ASSERT_EQ(plan.partial_route, NativeVNNIFusedPartialRoute::OutputTileLocal);
                     for (int member = 0; member < live; ++member)
@@ -104,6 +107,7 @@ TEST(CPUNativeVNNIFusedCompletion, GPUAlignedOrderedNibbleAllFormatReplay)
                             EXPECT_EQ(plan.projections[member].effective_verifier_schedule,
                                 VerifierRowsPolicy::Pairwise);
                     }
+#endif
                     NativeVNNITestPartialStorage partials(plan.sharedPartialFloats());
                     std::fill(partials.span().begin(), partials.span().end(), guard);
                     ASSERT_TRUE(gemm_native_vnni_fused_verifier_rows_preq(input.data(),
