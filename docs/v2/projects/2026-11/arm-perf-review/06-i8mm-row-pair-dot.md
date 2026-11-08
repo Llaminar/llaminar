@@ -223,3 +223,12 @@ Handoffs (rebased onto afe62c5ef, fork codex/i8mm-typed-placement):
   NO production code change and NO silent skip; NUMA/mempolicy classes get
   host-level evidence on a real GB10 host; container lists sealed in
   K14-I8MM-GATE-DE4535855-20261108. Quiet re-gate: c24ce9b4e when lane green.
+
+- HOST-LEVEL EVIDENCE DONE (arm-sparks): EPERM family = sandbox capability,
+  not product — cap-drop-ALL + seccomp-unconfined collector fails
+  (CPUBackend.cpp:190 mbind EPERM); docker default caps+seccomp fail
+  identically; CAPABLE RUN on real GB10 (.79, --cap-add SYS_NICE + SYS_ADMIN,
+  --seccomp unconfined) = **68/68 pass, 0 fail** for the entire
+  NUMA/mempolicy/MPI-bind/fused family. Sealed in SUMMARY.md (host-evidence
+  section). Verdict: env-known in container gate; no code change/skip;
+  real-host-clean PROVEN. Container-green = infra change if wanted.
