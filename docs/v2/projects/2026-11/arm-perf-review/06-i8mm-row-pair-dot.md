@@ -79,9 +79,23 @@ pin branches). Lane: `arm-i8mm` (01a1bbe6, codex/i8mm-typed-placement).
 
 ## Envelope resolved (2026-11-08, g++-14 probe on .80 — recheck verdict)
 
-- Spelling: **`-march=armv8.2-a+simd+dotprod+i8mm`** — canonical (verified on
-  g++-14 / llaminar-arm-engine-sdk-py:e0d6d34e7: `vmmlaq_s32`+`vusmmlaq_s32`
-  compile, rc=0, emits smmla/usmmla @ -O2; AppleClang accepts too).
+- Spelling: **`-mcpu=generic -march=armv8-a+simd+dotprod+i8mm`** — canonical
+  (FINAL, 2026-11-08, lane evidence; = NEON_DOTPROD's spelling + i8mm, so the
+  envelope delta is exactly one feature). Verified on g++-14 /
+  llaminar-arm-engine-sdk-py:e0d6d34e7 and AppleClang: `vmmlaq_s32` +
+  `vusmmlaq_s32` compile, emit smmla/usmmla @ -O2, and predefine exactly
+  `__ARM_FEATURE_DOTPROD` + `__ARM_FEATURE_MATMUL_INT8`.
+- `armv8.2-a` REJECTED as base: gcc-14 adds `+lse+dotprod+rdma+crc+i8mm` and
+  predefines `__ARM_FEATURE_ATOMICS` / QRDMX / CRC32 — the codegen probe
+  deliberately #errors on `__ARM_FEATURE_ATOMICS` and none of those are
+  admitted at startup. `armv8.6-a` pulled in BF16 (also rejected).
+- `-mcpu=generic` RETAINED (existing canonical policy for all ARM envelopes;
+  without it AppleClang keeps its implicit apple-m1 target and can
+  auto-vectorize outside the envelope — that is what the envelope proof
+  exists to catch). The gcc '-mcpu conflicts with -march' warning is benign
+  and identical for today's NEON_DOTPROD build; dropping it for I8MM only
+  would make the three envelopes inconsistent. Any reproducibility change
+  applies to all three envelopes separately.
   `-mcpu=generic` is benign but non-canonical — `CPUInstructionSet.cmake`
   should use ONE authoritative combination (`-march` only).
 - NO v8.6 requirement (GCC accepts i8mm as an additive extension with `+simd`
