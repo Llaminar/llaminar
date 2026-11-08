@@ -19277,7 +19277,9 @@ add_v2_test(V2_Integration_CPUFlashAttentionAQ8NativeEntries
     NO_MODELS
 )
 
-# Wo transpose benchmark - compares row-major vs column-major GEMV
+# Wo transpose benchmark - compares row-major vs column-major GEMV.
+# The microbenchmark is written in AVX-512 intrinsics, so only x86 targets build it.
+if(V2_CPU_TARGET_X86)
 add_executable(v2_perf_wo_transpose performance/Microbench__WoTranspose.cpp)
 target_link_libraries(v2_perf_wo_transpose
     llaminar2_core
@@ -19291,6 +19293,7 @@ add_v2_test(V2_Perf_WoTranspose
     LABELS "V2;Performance;Wo;Transpose;GEMV"
     MPI_PROCS 1
 )
+endif()
 
 # =============================================================================
 # Multi-Rank MPI Integration Tests for Distributed Architecture (Phase 1, 2, G0)

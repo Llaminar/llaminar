@@ -359,6 +359,10 @@ v2_add_core_free_test(V2_Unit_MPIContextOwnershipHeader
 v2_add_core_free_test(V2_Integration_MPIContextOwnershipHeader
     COMMAND $<TARGET_FILE:v2_unit_mpi_context_header>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Interface Ownership MPI Regression)
+v2_add_core_free_test(V2_Integration_CPUCodegenTargetManifestMultiLanguage
+    COMMAND "${Python3_EXECUTABLE}" -B
+        "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_codegen_target_manifest.py"
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree ISA Build Regression)
 v2_add_core_free_test(V2_Unit_CPUCodegenEvidenceLifecycle
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_codegen_envelope.py"
@@ -461,8 +465,9 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     # Generation observes final target properties, including options added by
     # callers after this module. The build borrows the actual ordered command
     # from CMake's compilation database rather than reconstructing its ISA flags.
-    file(GENERATE OUTPUT "${V2_CPU_CODEGEN_TARGET_MANIFEST}" CONTENT
-        "compiler=${CMAKE_CXX_COMPILER}\narg1=${CMAKE_CXX_COMPILER_ARG1}\nflags=${V2_CPU_CODEGEN_FLAGS}\ntarget=${CMAKE_CXX_COMPILER_TARGET}\nsysroot=${CMAKE_SYSROOT}\nosx_sysroot=${CMAKE_OSX_SYSROOT}\noptions=$<TARGET_GENEX_EVAL:v2_unit_cpu_isa_profile,$<TARGET_PROPERTY:v2_unit_cpu_isa_profile,COMPILE_OPTIONS>>\ndefinitions=$<TARGET_GENEX_EVAL:v2_unit_cpu_isa_profile,$<TARGET_PROPERTY:v2_unit_cpu_isa_profile,COMPILE_DEFINITIONS>>\n")
+    include("${CMAKE_CURRENT_LIST_DIR}/V2CPUCodegenTargetManifest.cmake")
+    v2_write_cpu_codegen_target_manifest(v2_unit_cpu_isa_profile
+        "${V2_CPU_CODEGEN_TARGET_MANIFEST}" "${V2_CPU_CODEGEN_FLAGS}")
     # Compile the isolated optimized ISA motif during the build, independently
     # of sanitizer/debug instrumentation. Verification never needs a compiler
     # in an installed runner; retain the small JSON and assembly together.
