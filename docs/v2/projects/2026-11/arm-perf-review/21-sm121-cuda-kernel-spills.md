@@ -50,3 +50,13 @@ tensor-prefill instances being the largest single family).
   SM121 CUDA gates and capture/KV/MTP/state/economy runs after.
 - Record the target set with the evidence (spill results are
   architecture-specific).
+
+## Ownership/handover (2026-11-08 — spark-cuda-spil standing down)
+
+- The CUDA spill-fix work is now owned by **Main/ARM** (per operator): he
+  folds the sound parts into `feat/arm64-native-kernels` and closes PR #44.
+- Canonical trace build SHA: `09e14d3ae` remains **provenance only** for the
+  measured numbers; the canonical SHA for future traces = the migrated
+  ARM-branch SHA, announced by Main when landed.
+- **Tensor-split spec rev 2 (`83c61732d`)**: open design candidate, pending
+  sign-off from arm-perf + arm-reviewer (01a1a8d9).
