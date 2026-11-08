@@ -153,7 +153,10 @@ __global__ __launch_bounds__(256, 2) void sharedTinyProjectionKernel(
                 : 0.0f;
         __syncthreads();
 
-        #pragma unroll
+        // Keep the part loop rolled: the eight-lane schedule already overlaps
+        // the shared reads, and full unrolling raises peak register pressure
+        // past the 128-register budget of the two-block occupancy contract.
+        #pragma unroll 1
         for (int part = 0; part < parts_per_lane; ++part)
         {
             const int tile_k = lane + part * warp_width;
