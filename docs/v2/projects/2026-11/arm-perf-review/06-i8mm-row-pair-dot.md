@@ -244,3 +244,12 @@ missing-I8MM admission negatives), CPUNativeNEONI8MM{OperandGrouping,
 TailsMatchSDOT}, NativeNEONExactOverlayInstructionIdentity,
 OpenMPCapacityOrderedCorePlaces; GEMV + fused cells 6/6. Getenv + PrefixArchive
 failures GONE at this base. RE-GATE GO to arm-sparks.
+
+## Lane close-out (2026-11-08, operator)
+
+- i8mm lane RETIRED; merge candidate c24ce9b4e handed to Main for merge into
+  feat/arm64-native-kernels; .80 released back to arm-sparks.
+- Held NOT-for-merge: codex/arm-decode-team-placement @ c3060d607 (idea 05).
+- Parked follow-ups: Q6_K prefill rerun under production binding; idea-05
+  window (~30 min, 35B/27B all-workers vs fastest-class ABBA + PerfStats
+  claim counter); M=2/3 structural notes (no defect).
