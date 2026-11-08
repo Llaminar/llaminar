@@ -1,10 +1,14 @@
 # Idea 27 — Fused NativeVNNI evidence cells fail on ARM (Pairwise/WideRows gap)
 
-Status: **Open — fix in flight**. 2026-11-08: prepared on the PR #43 branch by
-Main (evidence cell uses the native WideRows schedule on aarch64; x86
-unchanged; Pairwise stays as the second distinct policy); not pushed yet
-(container rebuilding oneDNN). Close on Main's SHA once both NEON
-fused-completion cells pass locally.
+Status: **Addressed** (2026-11-08 — closed per implementer). Fixed on PR #43 in
+two commits: `37bd75ffa` lineage (evidence cell uses the native WideRows
+schedule on ARM) and `afe62c5ef` (real cause: ARM's fused launcher recorded
+nothing — three call sites published a 12-tag record including the bundle
+ordinal (an upstream-removed cardinality defect), and M=1 fused paths
+published no launch evidence; the NEON launcher now publishes the shared
+21-tag semantic schema with batched multiplicity and the call-site recorder
+is gone). Local aarch64 NEON: FusedProjectionEvidenceIdentity, FusedCompletion
+and OrderedNibbleReplay pass; v2_integration_cpu_native_vnni_gemv 67/67.
 
 ## Finding (commit-1 preflight acadffd64, .80 → 2284/2291)
 
