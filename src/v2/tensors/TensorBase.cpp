@@ -609,6 +609,8 @@ namespace llaminar2
             return "IQ1_S";
         case TensorType::IQ1_M:
             return "IQ1_M";
+        case TensorType::MXFP4:
+            return "MXFP4";
         default:
             return "Unknown";
         }

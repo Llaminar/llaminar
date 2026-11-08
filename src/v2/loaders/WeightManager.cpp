@@ -1387,6 +1387,8 @@ namespace llaminar2
                 return std::make_unique<IQ1_STensor>(shape, raw_data);
             case TensorType::IQ1_M:
                 return std::make_unique<IQ1_MTensor>(shape, raw_data);
+            case TensorType::MXFP4:
+                return std::make_unique<MXFP4Tensor>(shape, raw_data);
             case TensorType::BF16:
             {
                 std::vector<uint16_t> bf16_data(raw_data.size() / 2);
@@ -5279,6 +5281,8 @@ namespace llaminar2
         {
         case TensorType::IQ4_NL:
             return bytes_for(IQ4_NLBlock::BLOCK_SIZE, sizeof(IQ4_NLBlock));
+        case TensorType::MXFP4:
+            return bytes_for(MXFP4Block::BLOCK_SIZE, sizeof(MXFP4Block));
         case TensorType::IQ4_XS:
             return bytes_for(IQ4_XSBlock::BLOCK_SIZE, sizeof(IQ4_XSBlock));
         case TensorType::Q8_0:
@@ -6699,7 +6703,9 @@ namespace llaminar2
 
             orchestrator->planWeight(target_device.ordinal, name, N, K,
                                      vnni->payload_bytes, canonicalDeviceVnniFormat(*vnni).is_asymmetric,
-                                     vnni->has_emins, raw_bytes);
+                                     vnni->has_emins,
+                                     nativeVnniScalePlaneWidth(canonicalDeviceVnniCodebookId(*vnni)),
+                                     raw_bytes);
             max_raw_bytes = std::max(max_raw_bytes, raw_bytes);
             ++planned_storage_count;
             weight_formats.emplace_back(name, vnni);
@@ -6896,6 +6902,7 @@ namespace llaminar2
                         allocation.payload_bytes_per_block,
                         allocation.has_mins,
                         allocation.has_emins,
+                        nativeVnniScalePlaneWidth(canonicalDeviceVnniCodebookId(*vnni)),
                         run.job.raw_bytes);
                 }
                 else

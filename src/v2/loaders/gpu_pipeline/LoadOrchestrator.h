@@ -113,6 +113,7 @@ namespace llaminar2
         void planWeight(int device_id, const std::string &name,
                         int N, int K, int payload_bytes_per_block,
                         bool is_asymmetric, bool has_emins,
+                        NativeVnniScalePlaneWidth scale_plane,
                         size_t raw_gguf_bytes,
                         WeightVRAMPool::ContiguousAlias alias = {0});
 
@@ -132,6 +133,7 @@ namespace llaminar2
             int payload_bytes_per_block,
             bool is_asymmetric,
             bool has_emins,
+            NativeVnniScalePlaneWidth scale_plane,
             size_t raw_gguf_bytes,
             PhysicalMemoryOwner owner,
             WeightVRAMPool::ContiguousAlias alias = {0});

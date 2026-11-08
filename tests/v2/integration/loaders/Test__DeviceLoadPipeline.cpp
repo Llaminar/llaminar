@@ -8,6 +8,7 @@
  * CPU reference packing.
  */
 
+#include <array>
 #include <gtest/gtest.h>
 #include <cstring>
 #include <cstdint>
@@ -24,6 +25,7 @@
 #include "loaders/gpu_pipeline/RepackFormat.h"
 #include "backends/BackendManager.h"
 #include "tensors/BlockStructures.h"
+#include "tensors/MXFP4Format.h"
 #include "../../utils/ScopedGPUStream.h"
 
 #ifdef HAVE_ROCM
@@ -533,7 +535,7 @@ TEST_F(Test__DeviceLoadPipeline, Q4_0_SingleWeight)
 
     // Setup pool
     WeightVRAMPool pool;
-    pool.planWeight("test_q4_0", N, K, 16, false, false, raw_bytes);
+    pool.planWeight("test_q4_0", N, K, 16, false, false, NativeVnniScalePlaneWidth::FP16Word, raw_bytes);
     ASSERT_TRUE(pool.allocate(backend_, 0, num_streams));
 
     // Setup pinned ring
@@ -582,7 +584,7 @@ TEST_F(Test__DeviceLoadPipeline, Q4_0_RowChunkedWeightMatchesUnchunkedLayout)
 
     LoadOrchestrator orch(backend_, kTestOnlyUnadmittedGPUAllocation);
     orch.addDevice(0);
-    orch.planWeight(0, "chunked_q4_0", N, K, 16, false, false, raw_bytes);
+    orch.planWeight(0, "chunked_q4_0", N, K, 16, false, false, NativeVnniScalePlaneWidth::FP16Word, raw_bytes);
     orch.allocate(/*pinned_slot_size=*/16 * raw_bytes_per_row,
                   /*num_h2d_streams=*/2);
 
@@ -623,7 +625,7 @@ TEST_F(Test__DeviceLoadPipeline, Q4_K_RowChunkedWeightMatchesUnchunkedLayout)
 
     LoadOrchestrator orch(backend_, kTestOnlyUnadmittedGPUAllocation);
     orch.addDevice(0);
-    orch.planWeight(0, "chunked_q4_k", N, K, 16, true, false, raw_bytes);
+    orch.planWeight(0, "chunked_q4_k", N, K, 16, true, false, NativeVnniScalePlaneWidth::FP16Word, raw_bytes);
     orch.allocate(/*pinned_slot_size=*/raw_bytes_per_superblock_column,
                   /*num_h2d_streams=*/2);
 
@@ -670,7 +672,7 @@ TEST(Test__DeviceLoadPipelineCUDA, Q4_0_RowChunkedWeightMatchesUnchunkedLayout)
 
     LoadOrchestrator orch(backend, kTestOnlyUnadmittedGPUAllocation);
     orch.addDevice(0);
-    orch.planWeight(0, "cuda_chunked_q4_0", N, K, 16, false, false, raw_bytes);
+    orch.planWeight(0, "cuda_chunked_q4_0", N, K, 16, false, false, NativeVnniScalePlaneWidth::FP16Word, raw_bytes);
     orch.allocate(raw_bytes_per_block_column, 2);
 
     WeightJob job;
@@ -703,6 +705,170 @@ TEST(Test__DeviceLoadPipelineCUDA, Q4_0_RowChunkedWeightMatchesUnchunkedLayout)
 #endif
 }
 
+namespace
+{
+    /**
+     * @brief Deterministic MXFP4 source rows covering every exact exponent,
+     *        every code and ggml all-zero blocks (e = 0 and e = 255).
+     */
+    std::vector<uint8_t> mxfp4PipelineSource(int N, int blocks_per_row)
+    {
+        constexpr size_t kBlock = mxfp4::kSourceBlockBytes;
+        std::vector<uint8_t> raw(static_cast<size_t>(N) * blocks_per_row * kBlock);
+        size_t nonzero_ordinal = 0;
+        for (size_t index = 0; index < raw.size() / kBlock; ++index)
+        {
+            uint8_t *block = raw.data() + index * kBlock;
+            // Nonzero blocks walk every native exponent [2, 252] by ordinal
+            // (including the range the former FP16 plane could not represent),
+            // so the zero controls below never displace an exponent.
+            const bool zero_control = index % 13 == 6 || index % 13 == 11;
+            block[0] = zero_control ? uint8_t{0}
+                : static_cast<uint8_t>(mxfp4::kMinNormalFP32Exponent +
+                      nonzero_ordinal++ % (mxfp4::kMaxNativeE8M0Exponent - mxfp4::kMinNormalFP32Exponent + 1));
+            for (int byte = 0; byte < 16; ++byte)
+                block[1 + byte] = static_cast<uint8_t>((index * 16 + byte) * 29u + 3u);
+            if (zero_control)
+            {
+                block[0] = index % 13 == 6 ? 0 : 255;
+                std::memset(block + 1, index % 2 ? 0x88 : 0x00, 16);
+            }
+        }
+        return raw;
+    }
+
+    /**
+     * @brief Load MXFP4 rows through the production row-chunked pipeline and compare
+     *        block-major payload/scales with the exact prepared representation.
+     * @param backend CUDA or ROCm backend selected by the caller.
+     * @param device Device owning the verification stream.
+     * @note LoadOrchestrator selects the backend's own repack launcher.
+     */
+    void expectMXFP4RowChunkedPipelineIsExact(IBackend *backend, DeviceId device)
+    {
+        backend->setDevice(0);
+        test::ScopedGPUStream verification_stream(device);
+        constexpr int N = 67, K = 160, blocks_per_row = K / 32;
+        constexpr size_t kBlock = mxfp4::kSourceBlockBytes;
+        const auto host = mxfp4PipelineSource(N, blocks_per_row);
+        const size_t row_bytes = static_cast<size_t>(blocks_per_row) * kBlock;
+
+        LoadOrchestrator orch(backend, kTestOnlyUnadmittedGPUAllocation);
+        orch.addDevice(0);
+        orch.planWeight(0, "mxfp4_rows", N, K, 16, false, false, NativeVnniScalePlaneWidth::E8M0Byte, host.size());
+        // 16-row staging slots: five chunks, the last one a 3-row tail.
+        orch.allocate(16 * row_bytes, 2);
+
+        WeightJob job;
+        job.name = "mxfp4_rows";
+        job.host_raw_data = host.data();
+        job.raw_bytes = host.size();
+        job.format = RepackFormat::MXFP4;
+        job.N = N;
+        job.K = K;
+        job.is_asymmetric = false;
+        orch.addWeightJob(0, job);
+        ASSERT_NO_THROW(orch.load());
+
+        auto slot = orch.getPool(0)->getSlot(job.name);
+        ASSERT_TRUE(slot.has_value());
+        const size_t count = static_cast<size_t>(N) * blocks_per_row;
+        // The pool holds exactly one E8M0 byte per block (17 B/32 with payload).
+        ASSERT_EQ(slot->scales_bytes, count);
+        std::vector<uint8_t> payload(count * 16);
+        std::vector<uint8_t> scales(count);
+        ASSERT_TRUE(backend->deviceToHost(payload.data(), slot->d_native_vnni_payload,
+                                          payload.size(), 0, verification_stream.get()));
+        ASSERT_TRUE(backend->deviceToHost(scales.data(), slot->d_native_vnni_scales,
+                                          scales.size(), 0, verification_stream.get()));
+        size_t zero_blocks = 0, extended = 0;
+        std::array<bool, 256> seen_exponent{};
+        for (int n = 0; n < N; ++n)
+            for (int b = 0; b < blocks_per_row; ++b)
+            {
+                const uint8_t *source = host.data() + (static_cast<size_t>(n) * blocks_per_row + b) * kBlock;
+                const size_t linear = static_cast<size_t>(b) * N + n;
+                zero_blocks += mxfp4::exponentFitsNativeE8M0(source[0]) ? 0u : 1u;
+                extended += mxfp4::exponentFitsNativeE8M0(source[0]) && !mxfp4::exponentFitsFP16(source[0]) ? 1u : 0u;
+                if (mxfp4::exponentFitsNativeE8M0(source[0]))
+                    seen_exponent[source[0]] = true;
+                EXPECT_EQ(scales[linear], mxfp4::preparedNativeE8M0Byte(source[0])) << n << ',' << b;
+                EXPECT_EQ(std::memcmp(payload.data() + linear * 16, source + 1, 16), 0) << n << ',' << b;
+            }
+        EXPECT_GT(zero_blocks, 0u);
+        EXPECT_GT(extended, 0u) << "fixture must cover exponents outside the former FP16 window";
+        // Totality: the fixture (N=67, K=160) loads every admitted exponent.
+        for (int e = mxfp4::kMinNormalFP32Exponent; e <= mxfp4::kMaxNativeE8M0Exponent; ++e)
+            EXPECT_TRUE(seen_exponent[static_cast<size_t>(e)]) << "exponent " << e << " never loaded";
+        orch.release();
+    }
+
+    /**
+     * @brief A nonzero block outside the native E8M0 range fails the load on the reader thread.
+     * @param exponent Rejected exponent: 0/1 (FP32 subnormal), 253/254 (weights overflow), 255 (NaN).
+     */
+    void expectMXFP4UnadmittedNonzeroBlockFailsLoad(IBackend *backend, const RepackKernels &kernels, uint8_t exponent)
+    {
+        backend->setDevice(0);
+        SCOPED_TRACE(static_cast<int>(exponent));
+        constexpr int N = 64, K = 64, blocks_per_row = K / 32;
+        auto host = mxfp4PipelineSource(N, blocks_per_row);
+        host[5 * mxfp4::kSourceBlockBytes] = exponent; // block 5 keeps nonzero codes
+        ASSERT_FALSE(mxfp4::blockFitsNativeE8M0(host[5 * mxfp4::kSourceBlockBytes],
+                                                host.data() + 5 * mxfp4::kSourceBlockBytes + 1));
+        WeightVRAMPool pool;
+        pool.planWeight("mxfp4_inexact", N, K, 16, false, false, NativeVnniScalePlaneWidth::E8M0Byte, host.size());
+        ASSERT_TRUE(pool.allocate(backend, 0, 1));
+        PinnedRingBuffer pinned(host.size(), 1);
+        ASSERT_TRUE(pinned.allocate(backend, 0));
+        DeviceLoadPipeline pipeline(*backend, 0, pool, pinned, kernels, 1);
+        ASSERT_TRUE(pipeline.initialize());
+        WeightJob job;
+        job.name = "mxfp4_inexact";
+        job.host_raw_data = host.data();
+        job.raw_bytes = host.size();
+        job.format = RepackFormat::MXFP4;
+        job.N = N;
+        job.K = K;
+        job.is_asymmetric = false;
+        EXPECT_FALSE(pipeline.processJobs({job}));
+        pinned.release();
+        pool.release();
+    }
+} // namespace
+
+TEST(Test__DeviceLoadPipelineMXFP4, ROCmRowChunkedSourceIsExactAndInexactScalesFail)
+{
+#ifdef HAVE_ROCM
+    auto *backend = getROCmBackend();
+    if (!backend)
+        GTEST_SKIP() << "ROCm backend unavailable";
+    expectMXFP4RowChunkedPipelineIsExact(backend, DeviceId::rocm(0));
+    RepackKernels kernels{};
+    kernels.vnniRepack = launchVnniRepack;
+    for (const uint8_t exponent : {0, 1, 253, 254, 255})
+        expectMXFP4UnadmittedNonzeroBlockFailsLoad(backend, kernels, exponent);
+#else
+    GTEST_SKIP() << "HAVE_ROCM not defined";
+#endif
+}
+
+TEST(Test__DeviceLoadPipelineMXFP4, CUDARowChunkedSourceIsExactAndInexactScalesFail)
+{
+#ifdef HAVE_CUDA
+    auto *backend = getCUDABackend();
+    if (!backend)
+        GTEST_SKIP() << "CUDA backend unavailable";
+    expectMXFP4RowChunkedPipelineIsExact(backend, DeviceId::cuda(0));
+    RepackKernels kernels{};
+    kernels.vnniRepack = launchVnniRepackCUDA;
+    for (const uint8_t exponent : {0, 1, 253, 254, 255})
+        expectMXFP4UnadmittedNonzeroBlockFailsLoad(backend, kernels, exponent);
+#else
+    GTEST_SKIP() << "HAVE_CUDA not defined";
+#endif
+}
+
 // ============================================================================
 // Test 2: Q4_K single weight through pipeline
 // ============================================================================
@@ -721,7 +887,7 @@ TEST_F(Test__DeviceLoadPipeline, Q4_K_SingleWeight)
     fill_q4k_blocks(host_blocks.data(), total_superblocks);
 
     WeightVRAMPool pool;
-    pool.planWeight("test_q4k", N, K, 16, true, false, raw_bytes);
+    pool.planWeight("test_q4k", N, K, 16, true, false, NativeVnniScalePlaneWidth::FP16Word, raw_bytes);
     ASSERT_TRUE(pool.allocate(backend_, 0, num_streams));
 
     PinnedRingBuffer pinned(raw_bytes, num_streams);
@@ -807,7 +973,7 @@ TEST_F(Test__DeviceLoadPipeline, MultipleWeights)
         }
 
         max_raw = std::max(max_raw, raw_bytes);
-        pool.planWeight(s.name, s.N, s.K, 16, s.is_asymmetric, false, raw_bytes);
+        pool.planWeight(s.name, s.N, s.K, 16, s.is_asymmetric, false, NativeVnniScalePlaneWidth::FP16Word, raw_bytes);
     }
 
     ASSERT_TRUE(pool.allocate(backend_, 0, num_streams));
@@ -903,7 +1069,7 @@ TEST_F(Test__DeviceLoadPipeline, MultipleWeightsExercisesAllStreams)
         }
 
         std::string name = "w_" + std::to_string(w);
-        pool.planWeight(name, N, K, 16, false, false, raw_bytes);
+        pool.planWeight(name, N, K, 16, false, false, NativeVnniScalePlaneWidth::FP16Word, raw_bytes);
     }
 
     ASSERT_TRUE(pool.allocate(backend_, 0, num_streams));
@@ -977,8 +1143,8 @@ TEST_F(Test__DeviceLoadPipeline, LoadOrchestratorEndToEnd)
     LoadOrchestrator orch(backend_, kTestOnlyUnadmittedGPUAllocation);
     orch.addDevice(0);
 
-    orch.planWeight(0, "w_q4_0", N, K, 16, false, false, raw_bytes);
-    orch.planWeight(0, "w_q4k", N2, K2, 16, true, false, raw_bytes2);
+    orch.planWeight(0, "w_q4_0", N, K, 16, false, false, NativeVnniScalePlaneWidth::FP16Word, raw_bytes);
+    orch.planWeight(0, "w_q4k", N2, K2, 16, true, false, NativeVnniScalePlaneWidth::FP16Word, raw_bytes2);
 
     ASSERT_NO_THROW(orch.allocate(max_raw, 3));
 
@@ -1031,7 +1197,7 @@ TEST_F(Test__DeviceLoadPipeline, EmptyJobsSucceeds)
 {
 #ifdef HAVE_ROCM
     WeightVRAMPool pool;
-    pool.planWeight("dummy", 64, 128, 16, false, false, 1024);
+    pool.planWeight("dummy", 64, 128, 16, false, false, NativeVnniScalePlaneWidth::FP16Word, 1024);
     ASSERT_TRUE(pool.allocate(backend_, 0, 3));
 
     PinnedRingBuffer pinned(1024, 3);

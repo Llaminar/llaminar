@@ -15,6 +15,7 @@
  */
 
 #include "kernels/cuda/repack/CUDAExpertTierWeightKernels.h"
+#include "kernels/common/NativeVnniScaleLoad.h"
 #include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
 #include "backends/cuda/MappedTransferServiceCUDA.h"
 #include "backends/cuda/MappedTransferServiceDevice.cuh"
@@ -126,6 +127,14 @@ namespace llaminar2
         {
             if constexpr (Codebook == 0)
                 return static_cast<int>(value) - 8;
+            if constexpr (Codebook == kNativeVnniMXFP4Codebook)
+            {
+                // Warp-uniform register lookup of the doubled E2M1 values.
+                constexpr unsigned kWords[4] = {0x03020100u, 0x0c080604u, 0xfdfeff00u, 0xf4f8fafcu};
+                const unsigned packed = value < 4u ? kWords[0] : value < 8u ? kWords[1]
+                    : value < 12u ? kWords[2] : kWords[3];
+                return static_cast<std::int8_t>(packed >> ((value & 3u) * 8u));
+            }
             if constexpr (Codebook == 4 || Codebook == kNativeVnniIQ4XSSourceScaleCodebook)
             {
                 // Divergent constant-memory indices serialize each warp by
@@ -266,8 +275,9 @@ namespace llaminar2
             }
             reinterpret_cast<std::int16_t *>(unit + (1024u/64)*columns)[local_column] =
                 static_cast<std::int16_t>(compensation);
+            // CPU unit word: FP16 for 2-byte planes, BF16 power of two for E8M0 planes.
             reinterpret_cast<std::uint16_t *>(unit + (1152u/64)*columns)[local_column] =
-                scales[linear];
+                ::llaminar2::native_vnni_scale::loadStagedPrimary<Codebook>(scales, linear);
             if constexpr (Asymmetric || Codebook == kNativeVnniIQ4XSSourceScaleCodebook)
             {
                 reinterpret_cast<std::uint16_t *>(unit + (1280u/64)*columns)[local_column] =
@@ -498,8 +508,14 @@ namespace llaminar2
                 static_cast<size_t>(kb+layout.gpu_first_column/32)*layout.gpu_N+n+layout.gpu_first_row;
             std::uint8_t *destination = payload + linear * 16u;
             gatherCpuPayloadVectors<16>(unit, local_column, destination, columns);
-            scales[linear] =
-                reinterpret_cast<const std::uint16_t *>(unit + (1152u/64)*columns)[local_column];
+            // Exact inverse of the GPU->CPU scale word; a malformed unit is fatal.
+            if (!::llaminar2::native_vnni_scale::storePrimaryFromCpuWord(
+                    layout.gpu_codebook_id, scales, linear,
+                    reinterpret_cast<const std::uint16_t *>(unit + (1152u/64)*columns)[local_column]))
+            {
+                __trap();
+                return;
+            }
             if constexpr (Asymmetric)
             {
                 mins[linear] = reinterpret_cast<const std::uint16_t *>(
@@ -723,7 +739,7 @@ namespace llaminar2
                 {
                 case Encoding::NibbleLUT:
                     return layout.gpu_codebook_id == 0 || layout.gpu_codebook_id == 4 ||
-                        layout.gpu_codebook_id == 5;
+                        layout.gpu_codebook_id == 5 || layout.gpu_codebook_id == kNativeVnniMXFP4Codebook;
                 case Encoding::IQ3SExpandedSourceScale:
                     return layout.gpu_codebook_id == 11;
                 case Encoding::NibbleLUTSourceScale:
@@ -822,6 +838,8 @@ namespace llaminar2
                             LLAMINAR_TRANSFER_DEMOTE_UNIT(gpuToCpuNibbleUnitsCUDAUnit, 0, false);
                         else if (layout.gpu_codebook_id == 4)
                             LLAMINAR_TRANSFER_DEMOTE_UNIT(gpuToCpuNibbleUnitsCUDAUnit, 4, false);
+                        else if (layout.gpu_codebook_id == kNativeVnniMXFP4Codebook)
+                            LLAMINAR_TRANSFER_DEMOTE_UNIT(gpuToCpuNibbleUnitsCUDAUnit, kNativeVnniMXFP4Codebook, false);
                         else
                             LLAMINAR_TRANSFER_DEMOTE_UNIT(gpuToCpuNibbleUnitsCUDAUnit, 5, true);
                     }
@@ -1036,11 +1054,22 @@ namespace llaminar2
                     source.payload, source.scales, source.mins, layout, first_unit,
                     device_cpu_chunk);
             }
-            else
+            else if (layout.gpu_codebook_id == kNativeVnniMXFP4Codebook)
+            {
+                gpuToCpuNibbleUnitsCUDA<kNativeVnniMXFP4Codebook, false><<<grid, block, 0, cuda_stream>>>(
+                    source.payload, source.scales, source.mins, layout, first_unit,
+                    device_cpu_chunk);
+            }
+            else if (layout.gpu_codebook_id == 5)
             {
                 gpuToCpuNibbleUnitsCUDA<5, true><<<grid, block, 0, cuda_stream>>>(
                     source.payload, source.scales, source.mins, layout, first_unit,
                     device_cpu_chunk);
+            }
+            else
+            {
+                // Never reinterpret an unknown nibble codebook as Q4_1.
+                return false;
             }
         }
         else if (layout.cpu_encoding ==

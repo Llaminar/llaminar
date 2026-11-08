@@ -627,7 +627,7 @@ namespace llaminar2
             const std::size_t blocks =
                 static_cast<std::size_t>(N) * projection.blocks_per_row;
             projection.payload.resize(blocks * execution.payload_bytes_per_block);
-            projection.scales.resize(blocks);
+            projection.scales.assign(nativeVnniScalePlaneStorageWords(projection.codebook_id, blocks), 0);
             if (execution.is_asymmetric)
                 projection.mins.resize(blocks);
             if (execution.has_emins)
@@ -640,6 +640,7 @@ namespace llaminar2
             context.payload_bytes = execution.payload_bytes_per_block;
             context.payload_array = projection.payload.data();
             context.scales_array = projection.scales.data();
+            context.primary_layout = gpuPrimaryScaleLayout(projection.codebook_id);
             context.mins_array =
                 execution.is_asymmetric ? projection.mins.data() : nullptr;
             context.emins_array =

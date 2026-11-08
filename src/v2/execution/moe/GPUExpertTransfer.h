@@ -163,9 +163,13 @@ inline GpuExpertPackedDescriptor makeGpuExpertPackedDescriptor(
     out.allocation_has_mins = desc.allocation_has_mins != 0;
     out.allocation_has_emins = desc.allocation_has_emins != 0;
     out.vnni_bytes = block_count * payload_bytes_per_block;
-    out.scales_bytes = block_count * sizeof(uint16_t);
-    out.mins_bytes = is_asymmetric ? out.scales_bytes : 0;
-    out.emins_bytes = has_emins ? block_count * sizeof(uint32_t) : 0;
+    // Plane widths come from the single metadata-plane authority; the
+    // secondary plane is never assumed to be as wide as the primary scales.
+    const auto planes = NativeVnniMetadataPlaneBytes::of(
+        block_count, desc.codebook_id, is_asymmetric, has_emins);
+    out.scales_bytes = planes.scales;
+    out.mins_bytes = planes.secondary;
+    out.emins_bytes = planes.emins;
     return out;
 }
 

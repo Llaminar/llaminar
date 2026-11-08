@@ -198,6 +198,7 @@ namespace
             {"IQ3_S", 110.0f / 256.0f},
             {"IQ1_S", 50.0f / 256.0f},
             {"IQ1_M", 56.0f / 256.0f},
+            {"MXFP4", 17.0f / 32.0f},
         };
         return formats;
     }
@@ -229,6 +230,8 @@ namespace
             {"IQ3_S", 17.0f / 32.0f},
             {"IQ1_S", 10.0f / 32.0f},
             {"IQ1_M", 10.0f / 32.0f},
+            // 16 code bytes plus the prepared FP16 block scale.
+            {"MXFP4", 18.0f / 32.0f},
         };
         return formats;
     }

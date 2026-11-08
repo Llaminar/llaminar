@@ -77,7 +77,11 @@ TEST_F(CUDAExpertTierWeightKernelsTest, RectangularNativeMovementAllFormatsAndDi
                 const size_t index=size_t(kb)*N+row;const bool active=row>=23 && kb>=3 && kb<11;
                 for(unsigned byte=0;byte<expected.payload_bytes_per_block;++byte)
                     EXPECT_EQ(observed[index*expected.payload_bytes_per_block+byte],active?expected.payload[index*expected.payload_bytes_per_block+byte]:uint8_t(0xa5));
-                EXPECT_EQ(observedScales[index],active?expected.scales[index]:uint16_t(0xa5a5));
+                // Compare the exact plane bytes (one byte per block for native MXFP4).
+                const size_t scaleWidth=nativeVnniScalePlaneBytes(expected.codebook_id);
+                for(size_t byte=0;byte<scaleWidth;++byte)
+                    EXPECT_EQ(reinterpret_cast<const uint8_t*>(observedScales.data())[index*scaleWidth+byte],
+                        active?reinterpret_cast<const uint8_t*>(expected.scales.data())[index*scaleWidth+byte]:uint8_t(0xa5));
                 if(!observedMins.empty())EXPECT_EQ(observedMins[index],active?expected.mins[index]:uint16_t(0xa5a5));
                 if(!observedEmins.empty())EXPECT_EQ(observedEmins[index],active?expected.emins[index]:uint32_t(0xa5a5a5a5));
             }

@@ -226,7 +226,7 @@ namespace llaminar2::test::native_vnni_transfer_parity_detail
                 .mins = static_cast<const uint16_t *>(descriptor.mins),
                 .emins = static_cast<const uint32_t *>(descriptor.emins),
                 .payload_bytes = blocks * layout.gpu_payload_bytes_per_block,
-                .scales_bytes = blocks * sizeof(uint16_t),
+                .scales_bytes = nativeVnniScalePlaneLiveBytes(layout.gpu_codebook_id, blocks),
                 .mins_bytes = layout.gpu_is_asymmetric ? blocks * sizeof(uint16_t) : 0u,
                 .emins_bytes = layout.gpu_has_emins ? blocks * sizeof(uint32_t) : 0u,
             };

@@ -29,6 +29,7 @@
  */
 
 #include "loaders/gpu_pipeline/RepackFormat.h"
+#include "tensors/NativeVnniScalePlane.h"
 
 #include <cstdint>
 #include <cstddef>
@@ -39,10 +40,11 @@ namespace llaminar2 {
 /// Magic bytes identifying a GPU packed weights blob: "GPWT"
 static constexpr uint32_t GPU_PACKED_WEIGHTS_MAGIC = 0x54575047; // "GPWT" little-endian
 
+/// Version5 stores MXFP4 (codebook 25) scales as one native E8M0 byte per block.
 /// Version4 adds mandatory IQ3_S original-base/raw-nibble tuples; older wires reject.
 /// Version2 retains IQ2_S original d/coefficient metadata. Version1's same-sized
 /// derived-half words must be rejected before any packed payload is adopted.
-static constexpr uint32_t GPU_PACKED_WEIGHTS_VERSION = 4;
+static constexpr uint32_t GPU_PACKED_WEIGHTS_VERSION = 5;
 
 #pragma pack(push, 1)
 
@@ -122,7 +124,7 @@ inline GpuPackedWeightsHeader buildGpuPackedHeader(
     hdr.K              = K;
     hdr.blocks_per_row = blocks_per_row;
     hdr.payload_size   = total_blocks * payload_bytes_per_block;
-    hdr.scales_size    = total_blocks * sizeof(uint16_t);
+    hdr.scales_size    = total_blocks * nativeVnniScalePlaneBytes(codebook_id);
     hdr.mins_size      = is_asymmetric ? total_blocks * sizeof(uint16_t) : 0;
     hdr.emins_size     = has_emins ? total_blocks * sizeof(uint32_t) : 0;
     std::memset(hdr.reserved, 0, sizeof(hdr.reserved));
@@ -162,6 +164,9 @@ inline bool validateGpuPackedHeader(const GpuPackedWeightsHeader& hdr, size_t bu
             hdr.payload_size != blocks * 16u || hdr.scales_size != blocks * 2u ||
             hdr.mins_size != blocks * 2u || hdr.emins_size != 0u) return false;
     }
+    // The primary plane width follows the physical decoder (1 byte for MXFP4).
+    if (hdr.scales_size != uint64_t(hdr.N) * uint64_t(hdr.blocks_per_row) *
+                               nativeVnniScalePlaneBytes(hdr.codebook_id)) return false;
     if (buffer_size < gpuPackedTotalSize(hdr)) return false;
     return true;
 }

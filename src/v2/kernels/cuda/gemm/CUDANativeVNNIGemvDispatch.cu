@@ -33,6 +33,7 @@ constexpr int shardIndexForCodebook(uint8_t codebook_id)
     case 0:
     case 4:
     case llaminar2::kNativeVnniIQ4XSSourceScaleCodebook:
+    case llaminar2::kNativeVnniMXFP4Codebook:
         return 0;
     case 5:
     case 6:

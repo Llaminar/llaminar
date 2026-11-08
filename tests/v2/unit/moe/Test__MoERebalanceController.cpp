@@ -2607,7 +2607,12 @@ TEST(DeviceMoETransferFormats, IQ4XSSourceTupleRetainsSecondaryCapacityAndIdenti
     source.codebook_id = 4; source.source_is_superblock = 0; source.mins = nullptr;
     ASSERT_TRUE(deviceMoEProjectionFormat(source, width, auxiliary, emins));
     EXPECT_EQ(width, 16); EXPECT_EQ(auxiliary, 0); EXPECT_EQ(emins, 0);
-    source.codebook_id = 25;
+    // MXFP4 (25) moves exactly like IQ4_NL: 16 code bytes, one FP16 scale.
+    source.codebook_id = kNativeVnniMXFP4Codebook;
+    source.source_codebook_id = kNativeVnniMXFP4Codebook;
+    ASSERT_TRUE(deviceMoEProjectionFormat(source, width, auxiliary, emins));
+    EXPECT_EQ(width, 16); EXPECT_EQ(auxiliary, 0); EXPECT_EQ(emins, 0);
+    source.codebook_id = 26; // Outside the ABI.
     EXPECT_FALSE(deviceMoEProjectionFormat(source, width, auxiliary, emins));
 }
 

@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include "tensors/MXFP4Format.h"
+#include "tensors/NativeVnniFormatInfo.h"
 #include <cstdint>
 #include <cstring>
 
@@ -109,6 +111,7 @@ namespace llaminar2::cpu::native_vnni
         {
         case 0: // Q4_0
         case 4: // IQ4_NL / IQ4_XS (both use kvalues_iq4nl LUT)
+        case kNativeVnniMXFP4Codebook: // MXFP4: doubled E2M1 LUT
         case 5: // Q4_1
         case 6: // Q5_0
         case 7: // Q5_1
@@ -141,6 +144,7 @@ namespace llaminar2::cpu::native_vnni
         {
         case 0: // Q4_0:  nibble - 8 → [-8, +7]
         case 4: // IQ4_NL / IQ4_XS: kvalues_iq4nl LUT
+        case kNativeVnniMXFP4Codebook: // MXFP4: doubled E2M1 LUT
         case 5: // Q4_1:  nibble → [0, 15]
             return true;
         default:
@@ -175,6 +179,13 @@ namespace llaminar2::cpu::native_vnni
             break;
         case 4: // IQ4_NL
             decode_iq4_nl_block(payload, dst);
+            break;
+        case kNativeVnniMXFP4Codebook: // MXFP4: same nibble order, E2M1 values
+            for (int j = 0; j < 16; ++j)
+            {
+                dst[j] = mxfp4::kValues[payload[j] & 0x0F];
+                dst[j + 16] = mxfp4::kValues[payload[j] >> 4];
+            }
             break;
         case 5: // Q4_1
             decode_q4_1_block(payload, dst);

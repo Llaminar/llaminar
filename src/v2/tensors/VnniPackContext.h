@@ -20,6 +20,8 @@
 #include <cstddef>
 #include <stdexcept>
 
+#include "NativeVnniScalePlane.h"
+
 namespace llaminar2
 {
 
@@ -30,6 +32,28 @@ namespace llaminar2
      * per-format packVnniBlock() implementations.  Constructed once
      * by packNativeVNNI() and passed to every block packing call.
      */
+    /**
+     * @brief Encoding of the primary scale written into VnniPackContext::scales_array.
+     *
+     * Chosen by the owner of the destination from the physical codebook and
+     * consumer: a GPU plane follows nativeVnniScalePlaneBytes(), and a CPU
+     * unit follows CPUNativeVNNIScaleEncoding. Only formats with a native E8M0
+     * scale (MXFP4) accept a layout other than FP16Words.
+     */
+    enum class VnniPrimaryScaleLayout : uint8_t
+    {
+        FP16Words = 0,          ///< One IEEE binary16 word per block.
+        NativeE8M0Bytes = 1,    ///< One E8M0 byte per block (scales_array addressed as bytes).
+        PowerOfTwoBF16Words = 2 ///< One mxfp4::powerOfTwoBF16Word per block (CPU units).
+    };
+
+    /** @brief Pack-context layout of a separated GPU primary plane for @p physical_codebook. */
+    [[nodiscard]] constexpr VnniPrimaryScaleLayout gpuPrimaryScaleLayout(uint8_t physical_codebook) noexcept
+    {
+        return nativeVnniScalePlaneBytes(physical_codebook) == 1 ? VnniPrimaryScaleLayout::NativeE8M0Bytes
+                                                                 : VnniPrimaryScaleLayout::FP16Words;
+    }
+
     struct VnniPackContext
     {
         const uint8_t *raw_bytes; ///< Tensor raw data (from tensor->raw_data())
@@ -52,6 +76,8 @@ namespace llaminar2
         /// Number of blocks in the destination window; zero means the complete
         /// remaining source range. Positive counts bound streaming scratch.
         int destination_block_count = 0;
+        /// Encoding of scales_array; the destination owner selects it.
+        VnniPrimaryScaleLayout primary_layout = VnniPrimaryScaleLayout::FP16Words;
     };
 
     // =================================================================

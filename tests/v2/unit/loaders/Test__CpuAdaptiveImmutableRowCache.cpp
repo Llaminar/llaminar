@@ -376,7 +376,7 @@ TEST(CpuAdaptiveImmutableRowCache, EveryOriginalNativeFormatAndCrossWindowRowPre
         GGUFTensorType::Q2_K,GGUFTensorType::Q3_K,GGUFTensorType::Q4_K,GGUFTensorType::Q5_K,GGUFTensorType::Q6_K,
         GGUFTensorType::Q8_K,GGUFTensorType::IQ1_S,GGUFTensorType::IQ1_M,GGUFTensorType::IQ2_XXS,
         GGUFTensorType::IQ2_XS,GGUFTensorType::IQ2_S,GGUFTensorType::IQ3_XXS,GGUFTensorType::IQ3_S,
-        GGUFTensorType::IQ4_NL,GGUFTensorType::IQ4_XS};
+        GGUFTensorType::IQ4_NL,GGUFTensorType::IQ4_XS,GGUFTensorType::MXFP4};
     for(auto type:formats) {
         SCOPED_TRACE(static_cast<int>(type));File f(type,4096,16);const auto g=Geometry::fromLayout(layout(f,3),Host,8);
         auto c=Cache::create(f.source,g,authority(g));const std::array<std::int64_t,8> ids{15,0,4,15,4,7,15,0};
@@ -670,7 +670,7 @@ TEST(CpuAdaptiveImmutableRowCache, LookupOnlyReadsNeverCreditReplacementPolicy) 
         // Resolve through the same production mapping as the native fixture.
         // A future inventory entry without a native GGUF declaration must be
         // explicitly accounted for rather than silently disappearing.
-        for (unsigned code = 0; code <= unsigned(GGUFTensorType::BF16); ++code) {
+        for (unsigned code = 0; code <= unsigned(GGUFTensorType::MXFP4); ++code) {
             try {
                 if (ggufToTensorType(GGUFTensorType(code)) == native->native_type()) {
                     format = GGUFTensorType(code);
@@ -756,7 +756,7 @@ TEST(CpuAdaptiveImmutableRowCache, LookupOnlyFreeRetentionNativeFormatReplay) {
     for(const auto& entry:embeddingVerifierFormats()) {
         SCOPED_TRACE(entry.label);const auto native=entry.create({2,256},1701);
         std::optional<GGUFTensorType> format;
-        for(unsigned code=0;code<=unsigned(GGUFTensorType::BF16);++code)try{
+        for(unsigned code=0;code<=unsigned(GGUFTensorType::MXFP4);++code)try{
             if(ggufToTensorType(GGUFTensorType(code))==native->native_type()){format=GGUFTensorType(code);break;}
         }catch(const std::invalid_argument&){}
         if(!format){ASSERT_EQ(native->native_type(),TensorType::Q8_1);++unsupported;continue;}

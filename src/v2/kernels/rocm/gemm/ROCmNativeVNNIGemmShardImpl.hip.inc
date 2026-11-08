@@ -55,6 +55,7 @@
 #include "../../../tensors/NativeVnniFormatInfo.h"
 #include "../../../utils/DebugEnv.h"
 #include "ROCmNativeVNNIDecodeEquivalentMath.h"
+#include "ROCmNativeVNNINibbleLUT.h"
 #include "ROCmNativeVNNIGemmShard.h"
 #include "ROCmDenseProductionPrefillOverlay.h"
 
@@ -89,6 +90,7 @@ enum NativeVNNIGemmFormat : uint8_t {
     NVNNI_GEMM_Q4_0    = 0,   // 4-bit symmetric, linear decode (q - 8)
     NVNNI_GEMM_IQ4_XS_SOURCE = llaminar2::kNativeVnniIQ4XSSourceScaleCodebook,
     NVNNI_GEMM_IQ4_NL  = 4,   // 4-bit symmetric, LUT decode via v_perm_b32
+    NVNNI_GEMM_MXFP4   = llaminar2::kNativeVnniMXFP4Codebook, // IQ4_NL geometry, doubled-E2M1 LUT
     NVNNI_GEMM_Q4_1    = 5,   // 4-bit asymmetric (q as-is, has min)
     NVNNI_GEMM_Q5_0    = 6,   // 5-bit symmetric, linear decode (q - 16)
     NVNNI_GEMM_Q5_1    = 7,   // 5-bit asymmetric (q as-is, has min)
@@ -140,7 +142,8 @@ struct NVNNIGemmTraits {
     static constexpr bool is_2bit   = (FMT == NVNNI_GEMM_Q2_K);
     static constexpr bool is_8bit =
         FMT == NVNNI_GEMM_Q8_0 || FMT == NVNNI_GEMM_EXPANDED_INT8_MIN;
-    static constexpr bool uses_lut  = (FMT == NVNNI_GEMM_IQ4_NL || FMT == NVNNI_GEMM_IQ4_XS_SOURCE);
+    static constexpr bool uses_lut  = (FMT == NVNNI_GEMM_IQ4_NL || FMT == NVNNI_GEMM_IQ4_XS_SOURCE ||
+                                       FMT == NVNNI_GEMM_MXFP4);
     static constexpr int  payload_bytes =
         is_8bit ? 32 :                              // Q8_0: 32 raw INT8 values
         is_iq1_grid ? 6 :                          // IQ1_S/IQ1_M: qs[4]+qh[2], native size
@@ -303,11 +306,13 @@ __device__ __forceinline__ void decode_block(
             packed_groups[g + 4] = static_cast<int32_t>((((raw[g] >> 4) & NIBBLE_MASK) + SWAR_ADD) ^ SWAR_XOR);
         }
     }
-    else if constexpr (FMT == NVNNI_GEMM_IQ4_NL || FMT == NVNNI_GEMM_IQ4_XS_SOURCE)
+    else if constexpr (FMT == NVNNI_GEMM_IQ4_NL || FMT == NVNNI_GEMM_IQ4_XS_SOURCE ||
+                       FMT == NVNNI_GEMM_MXFP4)
     {
-        // IQ4_NL: v_perm_b32 codebook LUT
-        constexpr uint32_t CB_LO_A = 0xBFAD9881u, CB_LO_B = 0xF6EADDCFu;
-        constexpr uint32_t CB_HI_A = 0x26190D01u, CB_HI_B = 0x71594535u;
+        // IQ4_NL / IQ4_XS / MXFP4: v_perm_b32 codebook LUT (only the table differs).
+        constexpr auto lut = llaminar2::rocm::nibble_lut::words<static_cast<int>(FMT)>();
+        constexpr uint32_t CB_LO_A = lut.lo_a, CB_LO_B = lut.lo_b;
+        constexpr uint32_t CB_HI_A = lut.hi_a, CB_HI_B = lut.hi_b;
         constexpr uint32_t MUX_ID = 0x03020100u, MUX_B3 = 0x04040404u;
         #pragma unroll
         for (int g = 0; g < 4; ++g)
@@ -1316,7 +1321,7 @@ void native_vnni_gemm_kernel(
             {
                 const size_t linear = static_cast<size_t>(block_global) * N + b_load_n_global;
                 load_payload<PB>(d_payload + linear * PB, b_payload_dw);
-                b_scale_staging = d_block_scales[linear];
+                b_scale_staging = ::llaminar2::native_vnni_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(d_block_scales, linear);
                 if constexpr (Traits::needs_aux_compute)
                     b_aux_staging = d_block_mins[linear];
                 if constexpr (Traits::is_dual_scale_asym) {
@@ -1419,7 +1424,7 @@ void native_vnni_gemm_kernel(
             const int block_global = tile_block_base + b_load_block;
             const size_t linear = static_cast<size_t>(block_global) * N + b_load_n_global;
             load_payload<PB>(d_payload + linear * PB, b_payload_dw);
-            b_scale_staging = d_block_scales[linear];
+            b_scale_staging = ::llaminar2::native_vnni_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(d_block_scales, linear);
             if constexpr (Traits::needs_aux_compute)
                 b_aux_staging = d_block_mins[linear];
             if constexpr (Traits::is_dual_scale_asym) {
@@ -1640,7 +1645,7 @@ void native_vnni_gemm_kernel(
             {
                 const size_t linear = static_cast<size_t>(block_global) * N + b_load_n_global;
                 load_payload<PB>(d_payload + linear * PB, b_payload_dw);
-                b_scale_staging = d_block_scales[linear];
+                b_scale_staging = ::llaminar2::native_vnni_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(d_block_scales, linear);
                 if constexpr (Traits::needs_aux_compute)
                     b_aux_staging = d_block_mins[linear];
                 if constexpr (Traits::is_dual_scale_asym) {
@@ -2170,7 +2175,7 @@ void streaming_lm_head_kernel(
         uint32_t b_payload_dw[Traits::payload_dwords];
         load_payload<PB>(d_payload + linear * PB, b_payload_dw);
 
-        uint16_t scale_bits = d_block_scales[linear];
+        uint16_t scale_bits = ::llaminar2::native_vnni_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(d_block_scales, linear);
 
         uint16_t aux_bits = 0;
         if constexpr (Traits::needs_aux_compute)
@@ -3062,7 +3067,7 @@ static bool launch_native_vnni_gemm(
     // continues through the same total generic dispatch below; an admitted
     // measured producer that cannot launch is an error, never a second choice.
     if (const auto exact = llaminar2::rocm::selectDensePrefillExactConfig(
-            FMT == NVNNI_GEMM_IQ4_XS_SOURCE ? uint8_t{4} : static_cast<uint8_t>(FMT), M, N, K,
+            llaminar2::nativeVnniPolicyCodebook(static_cast<uint8_t>(FMT)), M, N, K,
             llaminar2::rocm::DensePrefillWeightFamily::NativeVNNI))
     {
         switch (exact->producer)
@@ -3419,6 +3424,7 @@ bool LLAMINAR_ROCM_NVNNI_SHARD_SYMBOL(
     case NVNNI_GEMM_Q4_0:     LAUNCH_GEMM(NVNNI_GEMM_Q4_0);
     case NVNNI_GEMM_IQ4_NL:   LAUNCH_GEMM(NVNNI_GEMM_IQ4_NL);
     case NVNNI_GEMM_IQ4_XS_SOURCE: LAUNCH_GEMM(NVNNI_GEMM_IQ4_XS_SOURCE);
+    case NVNNI_GEMM_MXFP4:    LAUNCH_GEMM(NVNNI_GEMM_MXFP4);
 #elif LLAMINAR_ROCM_NATIVE_VNNI_SHARD == 1
     case NVNNI_GEMM_Q4_1:     LAUNCH_GEMM(NVNNI_GEMM_Q4_1);
     case NVNNI_GEMM_Q5_0:     LAUNCH_GEMM(NVNNI_GEMM_Q5_0);

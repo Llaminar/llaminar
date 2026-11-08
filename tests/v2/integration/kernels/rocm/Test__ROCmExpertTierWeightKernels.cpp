@@ -10,6 +10,8 @@
  * separated destination array with the device-free reference. IQ4_XS uses
  * physical24 with original half bases and raw encoded6 secondary words; its
  * source identity remains4 and symmetric arithmetic is unchanged.
+ * Fixture uploads complete on an explicit stream before publishing storage to
+ * independent non-blocking transfer lanes; pageable H2D staging is not completion.
  */
 
 #include "execution/moe/MoEOverlayMPIRemoteProjectionTransport.h"
@@ -376,19 +378,25 @@ namespace llaminar2
             }
 
             /**
-             * @brief Upload a complete host vector before kernel execution.
+             * @brief Complete a fixture upload before independent streams use it.
              * @param source Host elements whose size must match the allocation.
              * @return HIP copy status, or invalid-value for a size mismatch.
+             * @throws std::runtime_error If the explicit copy stream cannot be created.
              */
             [[nodiscard]] hipError_t upload(
-                const std::vector<T> &source) noexcept
+                const std::vector<T> &source)
             {
                 if (source.size() != elements_)
                     return hipErrorInvalidValue;
                 if (elements_ == 0)
                     return hipSuccess;
-                return hipMemcpy(
-                    pointer_, source.data(), bytes(), hipMemcpyHostToDevice);
+                TestHIPStream copy_stream;
+                const auto status = hipMemcpyAsync(
+                    pointer_, source.data(), bytes(), hipMemcpyHostToDevice,
+                    copy_stream.native());
+                // Publish completed fixture bytes to non-blocking consumers;
+                // returning from pageable H2D staging is not a readiness edge.
+                return status == hipSuccess ? copy_stream.synchronize() : status;
             }
 
             /**
@@ -454,7 +462,7 @@ namespace llaminar2
             const std::size_t blocks =
                 static_cast<std::size_t>(N) * projection.blocks_per_row;
             projection.payload.resize(blocks * format.payload_bytes);
-            projection.scales.resize(blocks);
+            projection.scales.assign(nativeVnniScalePlaneStorageWords(projection.codebook_id, blocks), 0);
             if (projection.is_asymmetric)
                 projection.mins.resize(blocks);
             if (format.has_emins)
@@ -467,6 +475,7 @@ namespace llaminar2
             context.payload_bytes = format.payload_bytes;
             context.payload_array = projection.payload.data();
             context.scales_array = projection.scales.data();
+            context.primary_layout = gpuPrimaryScaleLayout(projection.codebook_id);
             context.mins_array =
                 projection.is_asymmetric ? projection.mins.data() : nullptr;
             context.emins_array =
@@ -1176,7 +1185,7 @@ namespace llaminar2
             constexpr int N = 70;
             constexpr int K = 256;
             constexpr std::uint32_t kUnitsPerChunk = 4;
-            ASSERT_EQ(test::quantizedVerifierFormats().size(), 21u);
+            ASSERT_EQ(test::quantizedVerifierFormats().size(), 22u);
 
             TestHIPStream stream;
             bool rejection_contract_checked = false;
@@ -1241,7 +1250,7 @@ namespace llaminar2
                     .mins = source_mins.data(),
                     .emins = source_emins.data(),
                     .payload_bytes = source_payload.bytes(),
-                    .scales_bytes = source_scales.bytes(),
+                    .scales_bytes = source.scaleLiveBytes(),
                     .mins_bytes = source_mins.bytes(),
                     .emins_bytes = source_emins.bytes(),
                 };
@@ -1341,7 +1350,7 @@ namespace llaminar2
                     .mins = destination_mins.data(),
                     .emins = destination_emins.data(),
                     .payload_bytes = destination_payload.bytes(),
-                    .scales_bytes = destination_scales.bytes(),
+                    .scales_bytes = expected_gpu.scaleLiveBytes(),
                     .mins_bytes = destination_mins.bytes(),
                     .emins_bytes = destination_emins.bytes(),
                 };
@@ -1464,7 +1473,7 @@ namespace llaminar2
                 .mins = source_mins.data(),
                 .emins = source_emins.data(),
                 .payload_bytes = source_payload.bytes(),
-                .scales_bytes = source_scales.bytes(),
+                .scales_bytes = source.scaleLiveBytes(),
                 .mins_bytes = source_mins.bytes(),
                 .emins_bytes = source_emins.bytes(),
             };
@@ -1542,7 +1551,7 @@ namespace llaminar2
                 .mins = destination_mins.data(),
                 .emins = destination_emins.data(),
                 .payload_bytes = destination_payload.bytes(),
-                .scales_bytes = destination_scales.bytes(),
+                .scales_bytes = expected_gpu.scaleLiveBytes(),
                 .mins_bytes = destination_mins.bytes(),
                 .emins_bytes = destination_emins.bytes(),
             };
@@ -1804,7 +1813,7 @@ namespace llaminar2
                 .mins = source_mins.data(),
                 .emins = source_emins.data(),
                 .payload_bytes = source_payload.bytes(),
-                .scales_bytes = source_scales.bytes(),
+                .scales_bytes = source.scaleLiveBytes(),
                 .mins_bytes = source_mins.bytes(),
                 .emins_bytes = source_emins.bytes(),
             };
@@ -2162,7 +2171,7 @@ namespace llaminar2
                 .is_asymmetric = expected_gpu.is_asymmetric,
                 .has_emins = expected_gpu.has_emins,
                 .vnni_bytes = destination_payload.bytes(),
-                .scales_bytes = destination_scales.bytes(),
+                .scales_bytes = expected_gpu.scaleLiveBytes(),
                 .mins_bytes = destination_mins.bytes(),
                 .emins_bytes = destination_emins.bytes(),
             };
@@ -2857,7 +2866,7 @@ namespace llaminar2
                 .mins = mins.data(),
                 .emins = emins.data(),
                 .payload_bytes = payload.bytes(),
-                .scales_bytes = scales.bytes(),
+                .scales_bytes = source.scaleLiveBytes(),
                 .mins_bytes = mins.bytes(),
                 .emins_bytes = emins.bytes(),
             };
@@ -3067,7 +3076,7 @@ namespace llaminar2
                 .mins = mins.data(),
                 .emins = emins.data(),
                 .payload_bytes = payload.bytes(),
-                .scales_bytes = scales.bytes(),
+                .scales_bytes = source.scaleLiveBytes(),
                 .mins_bytes = mins.bytes(),
                 .emins_bytes = emins.bytes(),
             };
@@ -3294,9 +3303,9 @@ namespace llaminar2
             ASSERT_EQ(input_payload.upload(source.payload),hipSuccess);
             ASSERT_EQ(input_scales.upload(source.scales),hipSuccess);ASSERT_EQ(input_coeff.upload(source.mins),hipSuccess);
             ExpertTierGpuConstProjectionView in{.payload=input_payload.data(),.scales=input_scales.data(),.mins=input_coeff.data(),
-                .payload_bytes=input_payload.bytes(),.scales_bytes=input_scales.bytes(),.mins_bytes=input_coeff.bytes()};
+                .payload_bytes=input_payload.bytes(),.scales_bytes = source.scaleLiveBytes(),.mins_bytes=input_coeff.bytes()};
             ExpertTierGpuMutableProjectionView out{.payload=destination_payload.data(),.scales=destination_scales.data(),.mins=destination_coeff.data(),
-                .payload_bytes=destination_payload.bytes(),.scales_bytes=destination_scales.bytes(),.mins_bytes=destination_coeff.bytes()};
+                .payload_bytes=destination_payload.bytes(),.scales_bytes = source.scaleLiveBytes(),.mins_bytes=destination_coeff.bytes()};
             ASSERT_TRUE(in.validFor(demotion));ASSERT_TRUE(out.validFor(promotion));
             std::vector<std::uint8_t> observed_cpu(chunk.bytes()),observed_payload(source.payload.size());
             std::vector<std::uint16_t> observed_scales(source.scales.size()),observed_coeff(source.mins.size());

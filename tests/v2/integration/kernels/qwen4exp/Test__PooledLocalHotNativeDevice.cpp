@@ -49,7 +49,7 @@ namespace q=qwen4exp;namespace n=q::pooled_native;namespace p=n::p;namespace h=q
 /** @brief Actual supported loader format, never a separate backend inventory. */
 std::optional<GGUFTensorType> originalFormat(TensorType type)
 {
-    for(unsigned code=0;code<=unsigned(GGUFTensorType::BF16);++code)try {
+    for(unsigned code=0;code<=unsigned(GGUFTensorType::MXFP4);++code)try {
         if(ggufToTensorType(GGUFTensorType(code))==type)return GGUFTensorType(code);
     }catch(const std::invalid_argument&){}
     return std::nullopt;

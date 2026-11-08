@@ -11,8 +11,10 @@
  */
 
 #include "kernels/rocm/repack/ROCmExpertTierWeightKernels.h"
+#include "kernels/common/NativeVnniScaleLoad.h"
 #include "backends/rocm/HipDeviceGuard.h"
 #include "tensors/NativeVnniIQ3SScale.h"
+#include "kernels/rocm/gemm/ROCmNativeVNNINibbleLUT.h"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -487,7 +489,7 @@ namespace llaminar2
 
         /**
          * @brief Decode one compact value for the CPU compensation vector.
-         * @tparam Codebook Nibble execution codebook 0, 4, or 5.
+         * @tparam Codebook Nibble execution codebook 0, 4, 5 or 25 (MXFP4).
          * @param value Four-bit quantized value.
          * @return Signed/unsigned decoded integer consumed by CPU VNNI.
          */
@@ -499,6 +501,14 @@ namespace llaminar2
                 return static_cast<int>(value) - 8;
             if constexpr (Codebook == 4)
                 return static_cast<int>(kTierIQ4ValuesROCm[value]);
+            if constexpr (Codebook == kNativeVnniMXFP4Codebook)
+            {
+                // Register lookup of the doubled E2M1 values (no constant-memory table).
+                constexpr auto lut = rocm::nibble_lut::words<kNativeVnniMXFP4Codebook>();
+                const std::uint32_t packed = value < 4u ? lut.lo_a : value < 8u ? lut.lo_b
+                    : value < 12u ? lut.hi_a : lut.hi_b;
+                return static_cast<int>(static_cast<std::int8_t>(packed >> ((value & 3u) * 8u)));
+            }
             return static_cast<int>(value);
         }
 
@@ -551,8 +561,9 @@ namespace llaminar2
             }
             reinterpret_cast<std::int16_t *>(unit + (1024u/64)*columns)[local_column] =
                 static_cast<std::int16_t>(compensation);
+            // CPU unit word: FP16 for 2-byte planes, BF16 power of two for E8M0 planes.
             reinterpret_cast<std::uint16_t *>(unit + (1152u/64)*columns)[local_column] =
-                scales[linear];
+                ::llaminar2::native_vnni_scale::loadStagedPrimary<Codebook>(scales, linear);
             if constexpr (HasSecondaryMetadata)
             {
                 reinterpret_cast<std::uint16_t *>(unit + (1280u/64)*columns)[local_column] =
@@ -771,8 +782,14 @@ namespace llaminar2
                 destination[value] =
                     unit[interleavedValueOffsetROCm(local_column, value, columns)];
             }
-            scales[linear] =
-                reinterpret_cast<const std::uint16_t *>(unit + (1152u/64)*columns)[local_column];
+            // Exact inverse of the GPU->CPU scale word; a malformed unit is fatal.
+            if (!::llaminar2::native_vnni_scale::storePrimaryFromCpuWord(
+                    layout.gpu_codebook_id, scales, linear,
+                    reinterpret_cast<const std::uint16_t *>(unit + (1152u/64)*columns)[local_column]))
+            {
+                __builtin_trap();
+                return;
+            }
             if constexpr (HasSecondaryMetadata)
             {
                 mins[linear] = reinterpret_cast<const std::uint16_t *>(
@@ -1060,12 +1077,26 @@ namespace llaminar2
                     hip_stream, source.payload, source.scales, source.mins,
                     layout, first_unit, device_cpu_chunk);
             }
-            else
+            else if (layout.gpu_codebook_id == kNativeVnniMXFP4Codebook)
+            {
+                // Symmetric FP16 scale, no secondary plane; only the lookup differs from 4.
+                hipLaunchKernelGGL(
+                    (gpuToCpuNibbleUnitsROCm<kNativeVnniMXFP4Codebook, false>), grid, block, 0,
+                    hip_stream, source.payload, source.scales, source.mins,
+                    layout, first_unit, device_cpu_chunk);
+            }
+            else if (layout.gpu_codebook_id == 5)
             {
                 hipLaunchKernelGGL(
                     (gpuToCpuNibbleUnitsROCm<5, true>), grid, block, 0,
                     hip_stream, source.payload, source.scales, source.mins,
                     layout, first_unit, device_cpu_chunk);
+            }
+            else
+            {
+                // A nibble layout names exactly one of the decoders above; never
+                // reinterpret an unknown codebook as Q4_1 with a nonexistent min plane.
+                return false;
             }
         }
         else if (layout.cpu_encoding ==

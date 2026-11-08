@@ -309,6 +309,14 @@ void run(int m,int n,int k,int kb,Epilogue epilogue,int tile_id=CB==7?2:5) {
         scales[i]=uint16_t(0x2400u+(mixed(i+25)&0x7ffu));
         mins[i]=uint16_t(0xa000u+(mixed(i+51)&0x7ffu));
     }
+    if constexpr (llaminar2::nativeVnniScalePlaneBytes(CB) == 1) {
+        // Native MXFP4: one admitted E8M0 byte per block (2^-10..2^5) plus zero
+        // markers. An odd block count leaves a ragged final word, as in production.
+        auto *bytes = reinterpret_cast<uint8_t *>(scales.data());
+        std::fill(bytes, bytes + scales.size() * sizeof(uint16_t), uint8_t{0});
+        for(std::size_t i=0;i<blocks;++i)
+            bytes[i] = mixed(i+25)%23==7 ? uint8_t{0} : uint8_t(118u+mixed(i+25)%16u);
+    }
     for(std::size_t i=0;i<elements;++i) activation[i]=int(mixed(i+133)%255)-127;
     for(int row=0;row<m;++row) for(int block=0;block<k/32;++block) {
         activation_scales[std::size_t(row)*(k/32)+block]=float(1+mixed(row+block*7)%31)/256;
@@ -589,6 +597,7 @@ TEST(CUDANativeVNNIPrefillStaging, CapturedCandidatesMatchRegisterDecode)
     verifyCodebook<5>();
     verifyCodebook<6>();
     verifyCodebook<7>();
+    verifyCodebook<llaminar2::kNativeVnniMXFP4Codebook>();
 }
 
 /** @brief Every staged tile preserves full output/partials over retained replay. */
@@ -613,6 +622,7 @@ TEST(CUDANativeVNNIPrefillStaging, AllStagedTilesMatchRegisterDecode)
     verify.template operator()<5>();
     verify.template operator()<6>();
     verify.template operator()<7>();
+    verify.template operator()<llaminar2::kNativeVnniMXFP4Codebook>();
 }
 
 /** @brief Every diagnostic identity must inspect the kernel it would launch. */
@@ -625,9 +635,11 @@ TEST(CUDANativeVNNIPrefillStaging, ResourceQueriesNameExactStagingSymbols)
     verifyCodebookResources<5>(symbols);
     verifyCodebookResources<6>(symbols);
     verifyCodebookResources<7>(symbols);
+    verifyCodebookResources<llaminar2::kNativeVnniMXFP4Codebook>(symbols);
     // The Q5_1 direct tile-2 family excludes AsyncWeight/AsyncAll. Every other
-    // codebook, arithmetic family and staging schedule has its own symbol.
-    EXPECT_EQ(symbols.size(), 40u - 2u);
+    // codebook (six, including MXFP4), arithmetic family and staging schedule
+    // has its own symbol.
+    EXPECT_EQ(symbols.size(), 48u - 2u);
     using llaminar2::cuda::prefill::PrefillStagingSchedule;
     CUDADensePrefillKernelResources primary{}, auxiliary{};
     // BK256 has no staged-nibble specialization, and tile 1 lacks a copy

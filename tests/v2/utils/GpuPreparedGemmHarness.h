@@ -250,7 +250,7 @@ namespace llaminar2::test
         orchestrator->addDevice(device.ordinal);
         orchestrator->planWeight(
             device.ordinal, canonical_name, N, K,
-            vnni->payload_bytes, canonicalDeviceVnniFormat(*vnni).is_asymmetric, vnni->has_emins, raw_bytes);
+            vnni->payload_bytes, canonicalDeviceVnniFormat(*vnni).is_asymmetric, vnni->has_emins, NativeVnniScalePlaneWidth::FP16Word, raw_bytes);
 
         constexpr int kNumStreams = 3;
         orchestrator->allocate(raw_bytes, kNumStreams);
@@ -467,7 +467,7 @@ namespace llaminar2::test
         out.orchestrator->addDevice(device.ordinal);
         out.orchestrator->planWeight(
             device.ordinal, canonical_name, N, K,
-            vnni->payload_bytes, canonicalDeviceVnniFormat(*vnni).is_asymmetric, vnni->has_emins, raw_bytes);
+            vnni->payload_bytes, canonicalDeviceVnniFormat(*vnni).is_asymmetric, vnni->has_emins, NativeVnniScalePlaneWidth::FP16Word, raw_bytes);
 
         // Allocate pool + staging. Pinned slot size must cover the largest raw weight.
         constexpr int kNumStreams = 3;
@@ -593,7 +593,7 @@ namespace llaminar2::test
             job.format = *repack; job.N = static_cast<int>(source->rows()); job.K = static_cast<int>(source->cols());
             job.is_asymmetric = canonicalDeviceVnniFormat(*format).is_asymmetric;
             owner->planWeight(device.ordinal, job.name, job.N, job.K, format->payload_bytes,
-                job.is_asymmetric, format->has_emins, raw_bytes);
+                job.is_asymmetric, format->has_emins, nativeVnniScalePlaneWidth(canonicalDeviceVnniCodebookId(*format)), raw_bytes);
             maximum_raw_bytes = std::max(maximum_raw_bytes, raw_bytes);
             jobs.push_back(std::move(job));
         }
