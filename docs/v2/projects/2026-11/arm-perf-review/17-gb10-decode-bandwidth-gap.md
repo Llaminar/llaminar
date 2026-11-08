@@ -47,4 +47,23 @@ At `268cd81de`: 35B MTP dynamic **27.5** tok/s, MTP off **20.6**; 27B MTP
 dynamic **4.27–4.29**. The per-commit A/B/C runs
 (`878a33fea` baseline → `144ece037` overlays → `268cd81de` pooled bundle,
 with repeats) were still running on `.80`; at A: 35B 17.9/17.8, 27B 4.16 (MTP)
-/ 4.21 (off) tok/s decode.
+/ 4.21 (off) tok/s decode. The final verified A/B/C supersedes this paragraph —
+see `00-measured-baseline.md`.
+
+## llama.cpp CPU baseline on GB10 (2026-11-08)
+
+Same qwen4exp UD-Q4_K_XL GGUF on `.79`; llama.cpp `cf34d31`, CPU 20 threads,
+`llama-bench`, 3 repeats:
+
+- pp2160 = **40.88 ± 0.09** tok/s
+- tg256 = **3.06 ± 0.11** tok/s
+
+Compared with Llaminar GPU (GB10, all-CUDA:0): prefill 318.6 tok/s, decode
+22.82 tok/s → **GPU is 7.8× prefill, 7.5× decode**.
+
+Inference: the Llaminar GPU numbers are **not anomalously low for this model
+class**; the CPU reference is ~7.5–8× behind. (llama.cpp reports the arch as
+“qwen4exp A3B Q4_K Medium”, i.e. it supports the qwen4exp family.)
+
+Optional next data point: llama.cpp with **CUDA on GB10** (build ~30 min) —
+would separate llama.cpp CPU-arch limits from GB10-class ceilings.
