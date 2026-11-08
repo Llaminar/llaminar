@@ -19,6 +19,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -84,14 +85,15 @@ def _affinity_visible_physical_core_count() -> int:
     return physical_core_count()
 
 
-def _run_refresh_test_method(method_name: str) -> tuple[str, bool, str]:
+def _run_refresh_test_method(method_name: str) -> tuple[str, bool, str, float]:
     """Run one isolated unittest method inside a persistent worker process."""
 
     stream = io.StringIO()
+    started = time.monotonic()
     result = unittest.TextTestRunner(stream=stream, verbosity=2).run(
         NativeVNNIDispatchRefreshTest(method_name)
     )
-    return method_name, result.wasSuccessful(), stream.getvalue()
+    return method_name, result.wasSuccessful(), stream.getvalue(), time.monotonic() - started
 
 
 def _run_parallel_refresh_suite() -> int:
@@ -107,6 +109,8 @@ def _run_parallel_refresh_suite() -> int:
     workers = min(max(1, requested_workers), physical_cores, len(methods))
 
     outcomes: dict[str, tuple[bool, str]] = {}
+    durations: dict[str, float] = {}
+    started = time.monotonic()
     with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
         futures = {
             pool.submit(_run_refresh_test_method, method): method
@@ -115,16 +119,22 @@ def _run_parallel_refresh_suite() -> int:
         for future in concurrent.futures.as_completed(futures):
             method = futures[future]
             try:
-                _, successful, output = future.result()
+                _, successful, output, durations[method] = future.result()
             except BaseException as error:  # Preserve worker failures as test failures.
                 successful = False
                 output = f"worker failed before reporting unittest state: {error!r}\n"
             outcomes[method] = (successful, output)
+            # Unbuffered progress shows where a supervised run spends its time
+            # even when the harness kills the suite before the summary.
+            print(f"[{len(outcomes)}/{len(methods)} {time.monotonic() - started:.1f}s] "
+                  f"{method} {durations.get(method, float('nan')):.2f}s", flush=True)
 
     failed = [method for method in methods if not outcomes[method][0]]
     if failed:
         for method in failed:
             print(f"\n[{method}]\n{outcomes[method][1]}", file=sys.stderr)
+    slowest = sorted(durations.items(), key=lambda item: item[1], reverse=True)[:5]
+    print("Slowest: " + ", ".join(f"{name} {seconds:.2f}s" for name, seconds in slowest))
     print(
         f"Ran {len(methods)} NativeVNNI refresh tests with {workers} "
         f"physical-core-capped workers: {len(failed)} failed"
