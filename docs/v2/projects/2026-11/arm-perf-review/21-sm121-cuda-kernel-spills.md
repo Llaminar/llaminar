@@ -3,18 +3,30 @@
 Status: **Open** (tracked follow-up for GB10 GPU support; CUDA side, not
 ARM-CPU — filed because the operator routes all perf findings here).
 
-## Finding (2026-11-08, evidence: K14-UMA-SM121-SPILLS-20261108)
+## Finding (2026-11-08; evidence: K14-UMA-SM121-SPILLS-20261108)
 
-Tables: `~/llaminar-spark-results/K14-UMA-SM121-SPILLS-20261108/
-{sm121,sm120}-spill-table*.json`.
+Tables (mangled + demangled, store/load bytes):
+`~/llaminar-spark-results/K14-UMA-SM121-SPILLS-20261108/{sm121,sm120}-spill-table.json`
+(18 + 45 rows).
 
-- **sm_121 (GB10):** 18 kernel instantiations spill under the zero-spill guard
-  (24–276 B). Families: `tensor_prefill_kernel` family,
-  `sharedTinyProjectionKernel<bf16>`, MoE grouped prefill / overlay activation
-  packet, NativeVNNI prefill, pooled immutable native.
-- **sm_120 is worse:** 45 spilling instantiations, adding
-  `groupImmaPairedGateUpSwiGluKernel<13,128>` / `<13,64>` (44/24 B) and
-  `MoEOverlayActivationPacket` (128/156 B) to the sm_121 set.
+- **sm_121 (GB10):** 18 spilling instantiations (24–276 B).
+- **sm_120 is worse:** 45 spilling instantiations (SASS-compatible target).
+
+Canonical kernel classes (from the builder evidence):
+
+| Class | Instance | Spill bytes |
+|---|---|---|
+| `CUDATinyFP32ProjectionKernels` | `sharedTinyProjectionKernel<bf16,8,float>` | 4 |
+| `CUDATensorPrefillKernels` | `tensor_prefill_kernel<>` | 60–88 |
+| `CUDAMoEGroupedPrefillKernels` | `groupImmaPairedGateUpSwiGluKernel<13,128>` / `<13,64>` | 44 / 24 |
+| `CUDAMoEOverlayActivationPacketKernels` | | 128 / 156 |
+| `CUDANativeVNNIPrefillKernels` | | |
+| `CUDAPooledImmutableNativeKernels` | | |
+
+Build environment: nvcc 13.0.88, aarch64, CUTLASS v4.2.1, NCCL capture-reentry
+2.28.9 — all builder probes pass; the build lane is **closed as blocked by
+register pressure**. Fix = CUDA kernel register tuning for sm_121 (60–88 B
+tensor-prefill instances being the largest single family).
 
 ## Implications
 
