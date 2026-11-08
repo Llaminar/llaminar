@@ -24,6 +24,7 @@
 #include "kernels/cpu/gemm/CPUProjectionWorkspaceContract.h"
 #include "../../../utils/CPUExecutionTestGeometry.h"
 #include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/NativeVnniScalePlane.h"
 
 #include <gtest/gtest.h>
 
@@ -218,12 +219,18 @@ namespace llaminar2
                 logical >= kCpuPage ? kCpuPage : kCpuCacheLine);
         }
 
-        /** @return Independently expected separated GPU projection allocation. */
+        /**
+         * @return Independently expected separated GPU projection allocation.
+         * @param primary_scale_bytes Bytes per block of the primary scale plane:
+         *        1 for native MXFP4 (E8M0), 2 (FP16) for every other format and
+         *        for the format-union shadow slot.
+         */
         [[nodiscard]] std::size_t expectedGpuProjectionBytes(
             const MoEOverlayProjectionWeightManifest &spec,
             int payload_bytes_per_block,
             bool asymmetric,
-            bool has_emins)
+            bool has_emins,
+            std::size_t primary_scale_bytes = sizeof(std::uint16_t))
         {
             const std::size_t blocks =
                 static_cast<std::size_t>(spec.N) *
@@ -235,7 +242,7 @@ namespace llaminar2
                 cursor += bytes;
             };
             append(blocks * static_cast<std::size_t>(payload_bytes_per_block));
-            append(blocks * sizeof(std::uint16_t));
+            append(blocks * primary_scale_bytes);
             if (asymmetric)
                 append(blocks * sizeof(std::uint16_t));
             if (has_emins)
@@ -286,7 +293,8 @@ namespace llaminar2
                         format.payload_bytes,
                         expectedMigrationPayload(format)),
                     format.is_asymmetric || format.codebook_id == 11 || (format.codebook_id == 4 && format.is_superblock),
-                    format.has_emins);
+                    format.has_emins,
+                    nativeVnniScalePlaneBytes(format.codebook_id));
                 expected.gpu_shadow_bytes += expectedGpuProjectionBytes(
                     spec,
                     /*payload_bytes_per_block=*/32,
@@ -659,7 +667,8 @@ namespace llaminar2
                     projection,
                     reusable.payload_bytes_per_block,
                     reusable.has_mins,
-                    reusable.has_emins);
+                    reusable.has_emins,
+                    nativeVnniScalePlaneBytes(allocation.codebook_id));
             }
 
             const auto capacity =
