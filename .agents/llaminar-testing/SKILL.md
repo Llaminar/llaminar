@@ -32,21 +32,25 @@ separate explicit workflow. Never silently regenerate answers on drift.
 Keep the fresh/full/partial prefix probes, exact repeatability, actual dynamic
 MTP activity, movement obligations and captured production-path evidence.
 
-Feature PRs into `develop` use `.github/workflows/develop-pr.yml` to build an
-AVX2 full-backend test companion with the `model-free` executable inventory.
+Feature PRs into `develop` use `.github/workflows/develop-pr.yml` to run an
+AVX512/AVX2 matrix on two separate 16-core cloud runners in parallel. Each builds
+a full-backend test companion with the `model-free` executable inventory.
 They run the complete device-free `Unit` suite and the production-preflight
 `host` lane selected by the canonical scheduler. CUDA, ROCm and exclusive
-preflight lanes do not run; the container receives no GPU devices or model mounts. It calls `run_develop_image_gate.py --cpu-isa AVX2` without
+preflight lanes do not run; the container receives no GPU devices or model
+mounts. Each job calls `run_develop_image_gate.py --cpu-isa <matrix ISA>` without
 `--build-only` or `--publish`, on the 16-core GitHub-hosted runner through the protected
 `develop-pr-tests.yml@develop` reusable workflow. PRs import public registry cache
 layers without credentials or cache export. Separate PRs run concurrently;
 new commits cancel older checks on the same PR. The cloud pool admits up to
-four 16-core runners. AVX2 execution does not depend on AVX512 support
-in the cloud pool. CTest owns selection and the JUnit receipt must prove
+four 16-core runners. The matrix disables fail-fast so both ISA results remain
+visible. The driver admits the requested ISA against every visible CPU before
+compiling; missing required flags fail explicitly without changing the ISA. CTest owns selection and the JUnit receipt must prove
 that every discovered Unit and host test ran without skipping. Unit runs with
 unrestricted parallelism; host retains its canonical serial scheduling. The
 `unit-and-host` PR receipt is separate from complete production preflight.
-The `develop` ruleset requires `Develop PR / Unit + host (AVX2)` on an up-to-date PR. The separate
+The `develop` ruleset requires both `Develop PR / Unit + host (AVX512)` and
+`Develop PR / Unit + host (AVX2)` on an up-to-date PR. The separate
 `Owner approval` ruleset requires approval from the owner-only
 `@Llaminar/repository-approvers` team for both protected branches. Native
 squash auto-merge waits for required reviews and checks. The owner has a

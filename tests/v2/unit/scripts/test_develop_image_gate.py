@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Device-free contracts for model-free develop PR and image-publication gates.
 
-The PR workflow consumes the same image driver with one ISA and no publication.
-Its actual command is parsed and exercised here so adding a second ISA, model
-phase or registry write cannot silently expand the inexpensive pre-merge gate.
+The PR workflow consumes the same image driver in independent AVX512 and AVX2
+jobs without publication. Its actual matrix command is parsed and exercised
+here so ISA coverage, model exclusion and read-only cache access stay explicit.
 """
 from __future__ import annotations
 
@@ -115,6 +115,38 @@ class DevelopImageGateTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "exact CTest inventory"):
                     pr_runner.validate_results(report, ("V2_Unit_A",))
 
+    def test_pr_cpu_admission_requires_each_selected_isa_on_every_cpu(self):
+        """Reject missing VNNI and heterogeneous flags without changing the ISA."""
+        avx2 = gate.CPU_ISA_FEATURES[gate.CPUISA.AVX2]
+        avx512 = gate.CPU_ISA_FEATURES[gate.CPUISA.AVX512]
+        for isa, flags in (("AVX2", avx2), ("AVX512", avx512)):
+            with patch.object(gate.Path, "read_text", return_value="flags: " + " ".join(flags)):
+                gate.require_host_cpu_isa(isa)
+        for flags in (avx2, avx512 - {"avx512_vnni"}):
+            with patch.object(gate.Path, "read_text", return_value="flags: " + " ".join(flags)), \
+                 self.assertRaisesRegex(ValueError, "AVX512.*missing CPU flags.*avx512_vnni"):
+                gate.require_host_cpu_isa("AVX512")
+        rows = "flags: " + " ".join(avx512) + "\nflags: " + " ".join(avx2)
+        with patch.object(gate.Path, "read_text", return_value=rows), \
+             self.assertRaisesRegex(ValueError, "missing CPU flags"):
+            gate.require_host_cpu_isa("AVX512")
+        with patch.object(gate.Path, "read_text", return_value="flags:\n" + rows), \
+             self.assertRaisesRegex(ValueError, "missing CPU flags"):
+            gate.require_host_cpu_isa("AVX2")
+        with patch.object(gate.Path, "read_text", return_value=""), \
+             self.assertRaisesRegex(ValueError, "explicit x86 CPU flags"):
+            gate.require_host_cpu_isa("AVX2")
+
+    def test_unsupported_pr_isa_fails_before_docker_build(self):
+        """A size label cannot authorize expensive compilation for an unusable VM."""
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "out"
+            with patch.object(gate, "require_host_cpu_isa", side_effect=ValueError("missing CPU flags")), \
+                 patch.object(gate, "build") as build, self.assertRaisesRegex(ValueError, "missing CPU flags"):
+                gate.main(["--output", str(output), "--cpu-isa", "AVX512"])
+            build.assert_not_called()
+            self.assertFalse(output.exists())
+
     def test_publish_requires_both_shipping_isas(self):
         """A partial local diagnosis can never overwrite a public develop tag."""
         with tempfile.TemporaryDirectory() as temporary:
@@ -148,11 +180,13 @@ class DevelopImageGateTests(unittest.TestCase):
             with patch.object(gate, "source_identity", return_value=source), \
                  patch.object(gate, "build", side_effect=build), \
                  patch.object(gate, "require_image"), \
+                 patch.object(gate, "require_host_cpu_isa") as cpu_admission, \
                  patch.object(gate, "run_pr_tests") as tests, \
                  patch.object(gate, "publish_runtime", side_effect=publish):
                 self.assertEqual(gate.main(["--output", str(output), "--build-only", "--publish",
                                             "--image", "ghcr.io/llaminar/llaminar:develop"]), 0)
             tests.assert_not_called()
+            cpu_admission.assert_not_called()
             self.assertEqual(events, [("build", "AVX512"), ("build", "AVX2"),
                                       ("publish", "AVX512"), ("publish", "AVX2")])
             receipt = json.loads((output / "develop-image-gate.json").read_text())
@@ -272,7 +306,7 @@ class DevelopImageGateTests(unittest.TestCase):
         self.assertNotIn("prerequisites/", workflow)
         self.assertNotIn("prune_docker_build_cache", workflow)
 
-    def test_develop_pr_builds_one_isa_and_runs_installed_unit_and_host_tests(self):
+    def test_develop_pr_matrix_runs_both_isas_on_separate_unit_and_host_jobs(self):
         """Exercise the real PR command, not a separately invented argument set."""
         workflow = yaml.load((ROOT / ".github/workflows/develop-pr.yml").read_text(),
                              Loader=yaml.BaseLoader)
@@ -298,7 +332,10 @@ class DevelopImageGateTests(unittest.TestCase):
         caller = job
         job = reusable["jobs"]["unit"]
         self.assertEqual(job["runs-on"], {"group": "Develop CI", "labels": "llaminar-cloud-16"})
-        self.assertEqual(f"{caller['name']} / {job['name']}", "Develop PR / Unit + host (AVX2)")
+        self.assertEqual(job["strategy"], {"fail-fast": "false", "max-parallel": "2",
+                                           "matrix": {"cpu_isa": ["AVX512", "AVX2"]}})
+        self.assertEqual(f"{caller['name']} / {job['name']}",
+                         "Develop PR / Unit + host (${{ matrix.cpu_isa }})")
         self.assertIn("github.event_name == 'pull_request'", job["if"])
         self.assertIn("github.base_ref == 'develop'", job["if"])
         self.assertIn("github.event.pull_request.head.repo.full_name == github.repository", job["if"])
@@ -317,49 +354,57 @@ class DevelopImageGateTests(unittest.TestCase):
         self.assertNotIn("keep-state", buildx["with"])
         self.assertNotIn("cleanup", buildx["with"])
         build_step = next(step for step in steps if "run" in step)
-        self.assertEqual(build_step["env"], {"LLAMINAR_DOCKER_BUILD_CACHE_ACCESS": "import-only"})
+        self.assertEqual(build_step["env"], {"CPU_ISA": "${{ matrix.cpu_isa }}",
+                                            "LLAMINAR_DOCKER_BUILD_CACHE_ACCESS": "import-only"})
         self.assertIn("LLAMINAR_DOCKER_BUILD_CACHE_IMAGE", commands[0])
-        command = shlex.split(commands[0].split("exec ", 1)[1].replace("\\\n", ""))
-        self.assertEqual(command[:2], ["python3", "scripts/ci/run_develop_image_gate.py"])
-        arguments = command[2:]
-        policy = gate.parse_arguments(arguments)
-        self.assertEqual(policy.cpu_isas, ["AVX2"])
-        self.assertFalse(policy.publish)
-        self.assertIsNone(policy.image)
+        artifact = next(step for step in steps if step.get("uses") == "actions/upload-artifact@v4")
+        self.assertIn("${{ matrix.cpu_isa }}", artifact["with"]["name"])
+        self.assertIn("/*/pr-tests/**", artifact["with"]["path"])
+        for isa in job["strategy"]["matrix"]["cpu_isa"]:
+            command = shlex.split(commands[0].split("exec ", 1)[1].replace("\\\n", ""))
+            self.assertEqual(command[:2], ["python3", "scripts/ci/run_develop_image_gate.py"])
+            arguments = command[2:]
+            arguments[arguments.index("--cpu-isa") + 1] = isa
+            policy = gate.parse_arguments(arguments)
+            self.assertEqual(policy.cpu_isas, [isa])
+            self.assertFalse(policy.publish)
+            self.assertIsNone(policy.image)
 
-        source = {"revision": "a" * 40, "tree": "merge-tree", "dirty": False}
-        events = []
-        with tempfile.TemporaryDirectory() as temporary:
-            output = Path(temporary) / "output"
-            arguments[arguments.index("--output") + 1] = str(output)
+            source = {"revision": "a" * 40, "tree": "merge-tree", "dirty": False}
+            events = []
+            with tempfile.TemporaryDirectory() as temporary:
+                output = Path(temporary) / "output"
+                arguments[arguments.index("--output") + 1] = str(output)
 
-            def build(args, admitted, directory, *, roles, test_inventory):
-                self.assertEqual(admitted, source)
-                self.assertEqual(test_inventory, gate.TestRunnerInventory.MODEL_FREE)
-                self.assertEqual(roles, (gate.ImageRole.TEST_RUNNER,))
-                events.append(("build", args.cpu_isa))
-                return images(args.cpu_isa)
+                def build(args, admitted, directory, *, roles, test_inventory):
+                    self.assertEqual(admitted, source)
+                    self.assertEqual(test_inventory, gate.TestRunnerInventory.MODEL_FREE)
+                    self.assertEqual(roles, (gate.ImageRole.TEST_RUNNER,))
+                    events.append(("build", args.cpu_isa))
+                    return images(args.cpu_isa)
 
-            def unit_tests(built, directory):
-                events.append(("unit", built["test-runner"]["id"]))
-                return pr_report()
+                def unit_tests(built, directory):
+                    events.append(("unit", built["test-runner"]["id"]))
+                    return pr_report()
 
-            with patch.object(gate, "source_identity", return_value=source), \
-                 patch.object(gate, "build", side_effect=build), \
-                 patch.object(gate, "require_image"), \
-                 patch.object(gate, "run_pr_tests", side_effect=unit_tests), \
-                 patch.object(gate, "publish_runtime") as publish:
-                self.assertEqual(gate.main(arguments), 0)
-            publish.assert_not_called()
-            self.assertEqual(events, [("build", "AVX2"),
-                                     ("unit", "test-runner-avx2")])
-            receipt = json.loads((output / "develop-image-gate.json").read_text())
-            self.assertTrue(receipt["complete"])
-            self.assertFalse(receipt["published"])
-            self.assertEqual(set(receipt["variants"]), {"AVX2"})
-            self.assertEqual(receipt["validation"], "unit-and-host")
-            self.assertEqual(receipt["variants"]["AVX2"]["unit_test_count"], 1)
-            self.assertEqual(receipt["variants"]["AVX2"]["host_test_count"], 1)
+                with patch.object(gate, "require_host_cpu_isa") as cpu_admission, \
+                     patch.object(gate, "source_identity", return_value=source), \
+                     patch.object(gate, "build", side_effect=build), \
+                     patch.object(gate, "require_image"), \
+                     patch.object(gate, "run_pr_tests", side_effect=unit_tests), \
+                     patch.object(gate, "publish_runtime") as publish:
+                    self.assertEqual(gate.main(arguments), 0)
+                publish.assert_not_called()
+                cpu_admission.assert_called_once_with(isa)
+                self.assertEqual(events, [("build", isa),
+                                         ("unit", f"test-runner-{isa.lower()}")])
+                receipt = json.loads((output / "develop-image-gate.json").read_text())
+                self.assertTrue(receipt["complete"])
+                self.assertFalse(receipt["published"])
+                self.assertEqual(set(receipt["variants"]), {isa})
+                self.assertEqual(receipt["validation"], "unit-and-host")
+                self.assertEqual(receipt["variants"][isa]["unit_test_count"], 1)
+                self.assertEqual(receipt["variants"][isa]["host_test_count"], 1)
 
     def test_develop_auto_merge_waits_for_protected_pr_gate(self):
         """Only trusted, non-draft PRs arm native auto-merge; no PR code runs."""

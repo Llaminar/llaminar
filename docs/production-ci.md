@@ -13,7 +13,7 @@ routes local development checks, model diagnostics, and this full image gate.
 
 Ordinary work starts from current `develop` on a branch named
 `feat/short-feature-description`. Commit messages and PR titles use
-Conventional Commits. After its required Unit/host check and owner approval pass, the feature PR
+Conventional Commits. After both required Unit/host checks and owner approval pass, the feature PR
 squash-merges into `develop`. Only explicit user direction starts the separate
 `develop`-to-`master` release PR and its full certification/release workflow.
 
@@ -24,16 +24,17 @@ and its required gates. Restore any temporary maintenance exception in the
 develop ruleset immediately after the push.
 
 `.github/workflows/develop-pr.yml` tests same-repository feature PRs targeting
-`develop`. It builds an AVX2 full-backend test image with the `model-free`
-executable inventory and executes the complete device-free `Unit` suite plus
-the production-preflight `host` lane. The canonical production scheduler owns
+`develop`. One workflow matrix runs AVX512 and AVX2 builds concurrently on
+separate 16-core runners, each with a full-backend `model-free` test image.
+Each image executes the complete device-free `Unit` suite plus the
+production-preflight `host` lane. The canonical production scheduler owns
 host selection; CUDA, ROCm and exclusive preflight lanes are not executed. The test
 container receives no GPU devices or model mounts. This is PR validation, not
 release certification. The checkout is the PR merge ref, so the tests
 include the proposed integration with `develop`.
 
-The active `develop` ruleset requires `Develop PR / Unit + host (AVX2)`, an
-up-to-date PR, and squash merge; direct human pushes, force pushes and deletion
+The active `develop` ruleset requires both `Develop PR / Unit + host (AVX512)`
+and `Develop PR / Unit + host (AVX2)`, an up-to-date PR, and squash merge; direct human pushes, force pushes and deletion
 are rejected. `.github/workflows/develop-auto-merge.yml` arms GitHub's native
 auto-merge for same-repository, non-draft PRs. GitHub loads this
 `pull_request_target` policy from the trusted default branch, `master`, even
@@ -68,10 +69,13 @@ The PR test job uses the same 16-core GitHub-hosted runner pool as develop publi
 Each PR has its own `llaminar-cloud-develop-pr-<number>` concurrency group with
 `cancel-in-progress: true`: separate PRs can run concurrently, while new commits
 cancel obsolete checks on that same PR.
-AVX2 is the explicit execution lane because the cloud x64 pool does not carry
-the production host's AVX512 contract. It calls the existing
-`run_develop_image_gate.py --cpu-isa AVX2` without `--publish`, using an ephemeral
-BuildKit worker. It imports public registry layers with
+The matrix allows two simultaneous jobs and disables fail-fast, so a failing
+ISA cannot cancel its sibling's evidence. Each calls the existing
+`run_develop_image_gate.py --cpu-isa <matrix ISA>` without `--publish`, using its
+own ephemeral BuildKit worker. Before compiling, the driver checks every
+visible CPU against the existing shipped ISA feature contract, including
+AVX512-VNNI. Unsupported hardware fails with the missing flags; the requested
+ISA is never changed. Build-only publication does not require native ISA support. It imports public registry layers with
 `LLAMINAR_DOCKER_BUILD_CACHE_ACCESS=import-only`; it never exports caches or logs
 into the registry. No registry-write permission is granted. The model-free image compiles Unit
 and preflight executables, but `run_develop_pr_tests.py` executes only Unit
@@ -81,11 +85,11 @@ Their logs and JUnit evidence are retained separately, and `pr-tests.json`
 records the `unit-and-host` scope. That receipt cannot certify full preflight.
 Accelerator preflight, model staging, generation, HF parity, E2E and benchmarks
 remain outside this PR gate. Only build logs, image/test receipts and CTest/JUnit evidence are
-uploaded to GitHub. Run the equivalent locally with:
+uploaded to GitHub under artifact names containing the ISA. Run both ISA transactions locally (sequentially on that host) with:
 
 ```bash
 python3 scripts/ci/run_develop_image_gate.py \
-  --cpu-isa AVX2 --output parity-results/develop-pr-gate
+  --output parity-results/develop-pr-gate
 ```
 
 After merge, the ordinary develop push workflow below builds and publishes
@@ -408,7 +412,7 @@ feature PRs, develop pushes and manual benchmark workflows retain their scope.
 
 `scripts/ci/apply_master_ruleset.py` installs the five required GitHub Actions
 checks on the existing master ruleset with strict up-to-date PR semantics and
-squash-only merge. It also installs the `develop` PR and AVX2 Unit/host
+squash-only merge. It also installs the `develop` PR and both ISA Unit/host
 check requirements, while retaining deletion and force-push protection.
 `develop` deliberately does not require linear history: after a certified
 master squash merge, the release publisher records that exact master commit as

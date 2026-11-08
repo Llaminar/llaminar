@@ -1192,9 +1192,10 @@ without driving maintenance.
 
 ### CI and branch approvals
 
-PRs into `develop` run the complete device-free Unit suite and the host lane
-of production preflight on 16-core GitHub-hosted runners, and require owner
-approval. CUDA, ROCm and exclusive preflight lanes remain production checks.
+PRs into `develop` build AVX512 and AVX2 test images in parallel on separate
+16-core GitHub-hosted runners. Each runs the complete device-free Unit suite
+and the host lane of production preflight; both checks and owner approval
+are required. CUDA, ROCm and exclusive preflight lanes remain production checks.
 After merge, the same runner size builds and publishes the AVX512 and AVX2
 Release development images without running tests. Production validation and
 release certification remain separate. Different PRs can run concurrently; a

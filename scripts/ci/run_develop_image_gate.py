@@ -22,13 +22,32 @@ import sys
 import uuid
 
 import docker_paths
-from production_artifacts import digest, image_identity, write_json
+from production_artifacts import CPUISA, digest, image_identity, write_json
+from run_production_cross_host_e2e import CPU_ISA_FEATURES
 from run_production_pipeline import (
     TestRunnerInventory, ImageRole, SHIPPING_ISAS, build, logged_container_command,
     require_image, run, source_identity,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def require_host_cpu_isa(isa: str) -> None:
+    """Reject incompatible PR test execution before spending time compiling.
+
+    Reuse the shipped CPU feature contract instead of inferring support from
+    the runner size or CPU model. Every visible CPU must support the requested
+    image; a partial feature set cannot authorize unrestricted test workers.
+    Build-only publication deliberately does not require native ISA support.
+    """
+    required = CPU_ISA_FEATURES[CPUISA(isa)]
+    rows = re.findall(r"^flags[ \t]*:[ \t]*(.*)$", Path("/proc/cpuinfo").read_text(), re.M)
+    if not rows:
+        raise ValueError(f"{isa} PR tests require explicit x86 CPU flags from the runner")
+    common = set.intersection(*(set(row.split()) for row in rows))
+    missing = sorted(required - common)
+    if missing:
+        raise ValueError(f"{isa} PR tests cannot run on this runner; missing CPU flags: {', '.join(missing)}")
 
 
 def runtime_tag(base: str, isa: str) -> str:
@@ -153,6 +172,9 @@ def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     """Finish both admitted ISA transactions before publishing either runtime."""
     args = parse_arguments(argv)
+    if not args.build_only:
+        for isa in args.cpu_isas:
+            require_host_cpu_isa(isa)
     if args.output.exists():
         raise ValueError("develop image gate output already exists; preserve prior evidence and choose a new directory")
     args.output.mkdir(parents=True)
