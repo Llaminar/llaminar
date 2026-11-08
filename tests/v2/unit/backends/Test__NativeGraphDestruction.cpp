@@ -9,6 +9,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "../../../../src/v2/backends/NativeParallelGraphBranch.h"
 #define LOG_ERROR(...) ((void)0)
 #define CUDA_WARN_IF_FAIL(call) ((void)(call))
 #define HIP_WARN_IF_FAIL(call) ((void)(call))
@@ -26,6 +27,10 @@ bool vramBomEnabled(){return false;}
 void logVramBomLine(const char*,const std::string&){}
 struct OrderedTimelineRecording{enum class State{Failed};State state=State::Failed;};
 struct Common {
+ // Match the production definition authority and imported-frontier types so
+ // replaying a real reset revokes the same metadata before native teardown.
+ std::shared_ptr<const void> definition_scope_=std::make_shared<const std::byte>();
+ detail::NativeCapturedFragmentFrontiers<void*,void*> fragment_frontiers_;
  bool native_capture_active_=false;int device_ordinal_=0;
  void*exec_=reinterpret_cast<void*>(0x100);void*graph_=reinterpret_cast<void*>(0x200);
  std::size_t resident_memory_bytes_=1024,node_count_=5;int cleanup=0;
@@ -52,7 +57,7 @@ template<class Capture> void failure(int phase){
  std::set_terminate([]{
   const bool handles=SDK::fail==3?!original->exec_&&original->graph_:original->exec_&&original->graph_;
   const bool calls=SDK::activate==1&&SDK::exec==(SDK::fail==1?0:1)&&SDK::graph==(SDK::fail==3?1:0);
-  std::_Exit(handles&&calls&&original->cleanup==0?77:79);
+  std::_Exit(handles&&calls&&!original->definition_scope_&&original->cleanup==0?77:79);
  });
  capture.reset();std::_Exit(0);
 }
@@ -70,6 +75,27 @@ template<class Capture>void success(){
   capture.reset();EXPECT_EQ(SDK::exec,executable?1:0);EXPECT_EQ(SDK::graph,graph?1:0);
  }
 }
+/** @brief Retained original definitions must not preserve an invalidated parent frontier. */
+template<class Capture>void metadataReset(){
+ SDK::reset(0);Capture capture;
+ const auto definition=capture.definition_scope_;
+ const auto original_graph=capture.graph_;
+ const auto original_nodes=capture.node_count_;
+ void* exit=reinterpret_cast<void*>(0x300);
+ capture.fragment_frontiers_.remember(&capture,definition,original_graph,original_nodes,
+                                     std::span<void* const>(&exit,1));
+ ASSERT_EQ(capture.fragment_frontiers_.require(&capture,definition,original_graph,original_nodes).size(),1u);
+ capture.reset();
+ EXPECT_EQ(capture.definition_scope_,nullptr);
+ // Keep the original definition alive independently: expiration alone must
+ // not conceal a reset that forgot to clear imported native frontier state.
+ EXPECT_TRUE(capture.fragment_frontiers_.require(&capture,definition,original_graph,original_nodes).empty());
+ capture.reset();
+ EXPECT_TRUE(capture.fragment_frontiers_.require(&capture,definition,original_graph,original_nodes).empty());
+ EXPECT_EQ(SDK::exec,1);EXPECT_EQ(SDK::graph,1);
+}
+TEST(NativeGraphDestruction, CUDAActualDefinitionAndFrontierRevocation){metadataReset<CUDAGraphCapture>();}
+TEST(NativeGraphDestruction, ROCmActualDefinitionAndFrontierRevocation){metadataReset<HIPGraphCapture>();}
 TEST(NativeGraphDestruction, CUDAActualPartialAndRepeatedCleanup){success<CUDAGraphCapture>();}
 TEST(NativeGraphDestruction, ROCmActualPartialAndRepeatedCleanup){success<HIPGraphCapture>();}
 }
