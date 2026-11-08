@@ -33,10 +33,13 @@ Installed and verified:
   schedule dimensions (row tile, chunks per task) with a compile-time validated
   exact table; collector `Perf__CPUNativeNEONExactOverlay`; generator
   `native_vnni_dispatch/neon_exact_overlay.py` (exact-only, alias-pooled,
-  replicated, no-regression, fail-closed). Installed (`144ece037`): 2,519 of
-  10,920 GB10 keys (20 workers) for Q4_K/Q5_K/Q6_K/Q8_0/IQ2_S/IQ3_S/IQ4_XS from
-  14 independent replicas (168,000 byte-authenticated candidates); every other
-  key keeps the total policy. Seal `K14-OVERLAY-INSTALL-20261107`.
+  replicated, no-regression, fail-closed). The 2,519-key GB10 table installed
+  in `144ece037` was byte-neutral but an end-to-end regression (head A/B, seal
+  `K14-OVERLAY-AB-HEAD-20261108`: removing it raised 35B decode 4.2% with MTP
+  and 2.0% without, prefill 9-11%, 27B unchanged, text byte-identical), so it
+  is retired. Microbenchmark-selected keys did not transfer to in-model
+  execution. The installed table is empty; every key resolves to the total
+  policy. Re-collecting overlays from in-model context is a follow-up.
 - **CPU serving robustness (GB10, Release).** Real plan/benchmark/serve works
   for Qwen3-0.6B, Qwen2.5-0.5B (q4_0, q4_k_m), Qwen3.6-27B dense and
   Qwen3.6-35B-A3B MoE, including the MTP (nextn) GGUFs, MTP off and dynamic,
@@ -79,14 +82,13 @@ tiles over all 20 cores with `OMP_PLACES=cores` is the measured best policy
 
 Open, in order:
 
-1. Fresh CPU-only Unit/preflight gate on the current head, GB10 and M1 Mac.
-2. Measure the installed overlays end to end (A/B, byte-identical text).
-3. Router-plus-shared-expert fused projection on CPU (651 us per 35B layer
-   call, ~1.3K x 2048), GDN grouped verifier economics on mixed cores, and
-   27B dense MTP economics (dynamic 4.23 vs off 4.63 tok/s at ~52-65%
-   acceptance).
-4. Live GB10 joint-pool validation.
-5. Final Release `Perf__` round: all families and formats, 1..20 cores on GB10
+1. Live GB10 joint-pool validation: the CUDA build at sm_121 is blocked by
+   18 kernel spills under the zero-spill guard (seal
+   `K14-UMA-SM121-SPILLS-20261108`); the status run uses compute 12.0 SASS.
+2. GDN grouped verifier economics on mixed cores (from the final round).
+   27B dense MTP economics (MTP dynamic 4.24 vs off 4.62 tok/s, 43% acceptance
+   at depth 10) moves to the I8MM and depth-controller follow-ups.
+3. Final Release `Perf__` round: all families and formats, 1..20 cores on GB10
    (fast-only, slow-only, mixed), plus the M1 Mac; update this frontier and
    the evidence record.
 
