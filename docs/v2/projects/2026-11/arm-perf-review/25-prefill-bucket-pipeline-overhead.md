@@ -28,6 +28,15 @@ captured bucket-pipeline overhead**, not kernel efficiency:
 3. measure the ~280 ms fixed intercept separately (admission/load/planning
    amortisation) so it is not charged to the pipeline.
 
+## Coordination (2026-11-08)
+
+- Trace owner: `spark-cuda-spil` session; it will run the nsys/PerfStats
+  per-bucket trace plus the fixed-intercept separation on `.79` when a window
+  exists — needs a GPU-phase run (~30 min), same merged head + model.
+- The host is currently with arm-sparks; do **not** schedule unilaterally.
+  When a window opens, ping the Spark session to run it, then file the results
+  here.
+
 ## Validation
 
 - Same model/prompt/length as idea 24; byte-identical output vs existing
