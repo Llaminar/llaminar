@@ -6193,6 +6193,15 @@ add_v2_test(V2_Integration_NativeVNNIHistoricalProductionOwnership
     LABELS "V2;Integration;ProductionTestPreflight;NativeVNNI;CPU;Geometry;DeviceFree;Regression"
     MPI_PROCS 1 TIMEOUT 30 NO_MODELS)
 
+# Profiler surrogate fits in Unit tests use an explicit device-free inventory;
+# CUDA discovery is fatal there, so the suite is identical on every host.
+add_v2_test(V2_Integration_NativeVNNIProfilerSurrogateDeviceFree
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_profiler_evidence.py
+        NativeVNNIProfilerEvidenceTest.test_explicit_surrogate_inventory_never_discovers_cuda_devices
+    LABELS "V2;Integration;ProductionTestPreflight;NativeVNNI;Trainer;DeviceFree;Regression"
+    MPI_PROCS 1 TIMEOUT 30 NO_MODELS)
+
 add_test(NAME V2_Unit_NativeVNNICommonDispatchPolicy
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_vnni_common_dispatch_policy.py
