@@ -64,3 +64,11 @@ argue for the wider-panel / activation-reuse work before touching scheduling.
 Must be one shared change with the PR #35 MXFP4 lane (`NibbleMap::MXFP4` uses
 the same tile); certify all `NibbleMap`/scale representations on the combined
 source.
+
+## Coordination update (2026-11-08, operator)
+
+MXFP4 is UNTOUCHED and stays OPEN; the ARM branch merges FIRST. Idea 04 is
+implemented within the ARM stack only (no MXFP4 coordination/wait). Keep the
+Ops seam (pairDot / activation-pair API) encoding-agnostic so the MXFP4 lane
+(PR #40) can adapt and adopt it later without a rewrite; note the compatibility
+in the plan. Any NibbleMap touch points must remain seam-based.
