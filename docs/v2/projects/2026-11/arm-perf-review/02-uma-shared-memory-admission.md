@@ -67,6 +67,27 @@ A typed shared-physical-pool constraint inside the sole PMA:
 - Device-free planning unit tests with synthetic coupled/discrete resources;
   then a real GB10 admission run.
 
+## Live GB10 observation (2026-11-08, .79 Qwen3.8 run)
+
+Qwen3.8-Flash-Next-UD-Q4_K_XL (~111 GB, 177B MoE) on the 121 GB LPDDR5x
+joint pool:
+
+- After the model read, ~40 GB of the unified pool sits in **page cache**;
+  the driver's reported free (used for `cudaMemGetInfo`-style capacity)
+  **collapses to ~24 GB**, and PMA rejects with `Higher-priority PMA plan must
+  fit`;
+- Workaround today: `echo 3 > drop_caches` before admission.
+
+Open sub-items for the GB10 workflow:
+
+- Account (or at least allow) **reclaimable page cache** in the joint-pool
+  available figure so a one-time model read does not block admission
+  (downside: page-cache reclaim pressure on first-token latency — needs a
+  deliberate policy, not a silent subtraction);
+- Alternatively document a GB10-specific admission knob, and make the failure
+  diagnostic say what to do (drop caches / free page cache) instead of a bare
+  `Higher-priority PMA plan must fit`.
+
 ## Coordination
 
 ARM session owns Task 39; Spark qualification task is blocked on it. This is
