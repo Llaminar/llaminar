@@ -1,17 +1,17 @@
 # Native ARM CPU inference: implementation, numerical proof and tuning plan
 
-Created: 2026-11-04; frontier updated 2026-11-07.
+Created: 2026-11-04; frontier updated 2026-11-08.
 Base: `feat/qfn-ngram-continuation` at `b65ee52fd`. Working branch
 `codex/qfn-ngram-continuation-arm64` (draft PR #32), force-pushed after every
 commit; `arm-validation/<sha9>` branches pin each commit for the Spark hosts.
 
-**Status: implementation in progress, not a completed port or performance certificate.**
+**Status: implementation complete for the ARM CPU scope; post-merge performance work is tracked in `arm-perf-review/`.**
 The objective remains native CPU inference with the robustness of the Intel
 path, finished by a Release `Perf__` scaling round. Detailed historical
 evidence (K-series snapshots, seals, falsification controls) lives in
 [the evidence record](ARM_CPU_KERNEL_IMPLEMENTATION_EVIDENCE.md).
 
-### Current frontier — 2026-11-07
+### Current frontier — 2026-11-08
 
 Installed and verified:
 
@@ -61,42 +61,75 @@ Installed and verified:
 - **Tests.** ISA-forced cells register `neon`/`neon-dotprod` on ARM; x86-only
   scheduler tests are x86-gated with ISA-neutral byte sweeps kept; portable
   all-format thread-scaling `Perf__` with byte authentication and measured
-  grouped/serial amortization. Native macOS portability suites pass 258/258
+  grouped/serial amortization. Native macOS portability suites pass 259/259
   (plain and dotprod) on the M1 Max.
+- **Pooled CPU MoE bundle (`408ff90e5`).** The router/gate-up bundle runs all
+  members' tasks in one dynamic workshare (byte-identical). On GB10 35B it cut
+  the bundle from 668 to 176 us per call (routed experts 803 to 274 us, which
+  also includes the bounded spin policy).
+- **GB10 integrated GPU (validation build: head + `codex/cuda-sm121-spills`).**
+  CUDA+CPU builds at sm_121 with zero spills once the separate CUDA spill branch
+  is merged. Logical plan lines now keep the integrated GPU's pool observation
+  (`98e427c7c`, `V2_Integration_IntegratedGPUPoolObservationMerge`); before,
+  every GB10 CUDA start failed `validateMemoryPlan`. 35B CUDA+CPU runs at 132
+  tok/s prefill and 97 tok/s decode, and an over-subscribed authored tier is
+  rejected at planning ("Rank host pool over-subscribed ... incremental
+  40.4 GB, pool 39.5 GB"). Three fresh CUDA+CPU server processes return
+  byte-identical greedy text (seal `K14-UMA-MERGED-BEF53EDB6-FINAL-20261108`);
+  CUDA+CPU and CPU-only text legitimately differ (different accumulation
+  programs).
 
-GB10 serving reference (Release, 20 cores, -c 8192, greedy, before overlays):
+GB10 serving reference (Release, 20 cores, -c 8192, greedy, n=256, per-run MTP
+mode asserted; seals `K14-ABC-*`, `K14-OVERLAY-AB-HEAD-20261108`):
 
-| Model | Mode | Prefill tok/s | Decode tok/s |
-|---|---|---|---|
-| Qwen3-0.6B Q8_0 | — | 330 | 93.5 |
-| Qwen2.5-0.5B q4_0 / q4_k_m | — | 510 / 384 | 144 / 103 |
-| Qwen3.6-27B Q4_K_S | MTP off / dynamic | 10.3 / 10.6 | 4.63 / 4.23 |
-| Qwen3.6-35B-A3B IQ3_S | MTP off / dynamic (n=256) | 25.4 / 24.8 | 14.34 / 18.73 |
+| Model | Commit | MTP dynamic decode | MTP off decode | Prefill |
+|---|---|---|---|---|
+| Qwen3.6-35B-A3B IQ3_S | `878a33fea` baseline | 18.18 +/- 0.40 | 14.14 | 24-25 |
+| Qwen3.6-35B-A3B IQ3_S | `268cd81de` + bundle (+ overlays) | 27.19 +/- 0.18 | 20.48 | 37 |
+| Qwen3.6-35B-A3B IQ3_S | head (bundle, overlays retired) | 28.51 +/- 0.29 | 20.95 | 40-41 |
+| Qwen3.6-27B Q4_K_S | head | 4.24 | 4.64 | 10.5 |
+| Qwen3-0.6B Q8_0 | pre-spin policy | — | 93.5 | 330 |
 
-(27B and 35B rows use the bounded spin policy; the small models predate it.)
+Greedy text is byte-identical across all A/B/C commits, with and without
+overlays, and between MTP off and on. Qwen3-0.6B greedy text is byte-identical
+between GB10 (NEON dotprod) and x86 (AVX512 and AVX2), seal
+`K14-CROSSARCH-PROBE-GB10-20261107`.
 
 GB10 topology: two clusters of 5 X925 (CPU 5-9, 15-19) + 5 A725 (CPU 0-4,
 10-14); an X925 is about 2.8x an A725 per thread on these kernels. Dynamic
-tiles over all 20 cores with `OMP_PLACES=cores` is the measured best policy
-(Q4_K 2048x4096 decode 44.7 us, 27x over one thread).
+tiles over all 20 cores with `OMP_PLACES=cores` is the measured best policy.
+The final round (`K14-PERF-FINAL-264970E14-20261108`) shows the 10 X925 cores
+alone match 20 mixed cores for M=1 decode (217.7 vs 226.4 us), mixed wins
+11-12% for grouped M=15, and A725-only is 2.4-3.7x behind X925-only.
 
-Open, in order:
+Final Release `Perf__` round at `264970e14` (GB10):
 
-1. Live GB10 joint-pool validation is blocked by CUDA register pressure. The
-   zero-spill guard rejects 18 kernel instantiations at sm_121 and 45 at
-   sm_120, including the tensor prefill family, BF16 tiny projection, MoE
-   grouped/IMMA gate-up and overlay activation packets (seal
-   `K14-UMA-SM121-SPILLS-20261108`, both tables). The rest of the GB10 CUDA
-   path is proven up to compilation: both configures, canonical NCCL with all
-   four builder probes, CUTLASS, and the two-language manifest regression.
-   Joint-pool admission is covered device-free (`PhysicalMemoryRankHostPool`,
-   10 cases). The spill fixes are CUDA tuning outside this CPU scope.
-2. GDN grouped verifier economics on mixed cores (from the final round).
-   27B dense MTP economics (MTP dynamic 4.24 vs off 4.62 tok/s, 43% acceptance
-   at depth 10) moves to the I8MM and depth-controller follow-ups.
-3. Final Release `Perf__` round: all families and formats, 1..20 cores on GB10
-   (fast-only, slow-only, mixed), plus the M1 Mac; update this frontier and
-   the evidence record.
+- Thread scaling, all formats, mixed 1..20 / X925-only 1..10 / A725-only 1..10:
+  pass, every timed row byte-authenticated against the serial oracle.
+- Fused verifier, all formats, 20 threads: 45/45.
+- Other CPU kernel owners at 20 and 1 threads: pass except two economy
+  findings handed to the performance follow-up (FA2 tile tournament p95
+  regret 8.9% over a 5% bound; GDN grouped verifier below serial for nearly
+  every M). The NativeVNNI sweep harness lacked an admitted workspace (fixed,
+  `5f3493f38`); the dispatch sweep is x86-only (`eeb392561`).
+
+Cross-ISA and host gates (failures classified, no unexplained failure):
+
+- x86 CPU-only Integration (Ryzen 7800X3D, WSL2): byte-exact suites pass on
+  AVX512 and AVX2; one branch defect found and fixed (`05930d91a`).
+- M1 Max Docker VM: Unit 938/958, preflight 2192/2250; every failure is the
+  NUMA-less host class, a known upstream registration, a CUDA-device
+  surrogate, or VM slowness of subprocess-heavy suites.
+- GB10 CPU-only Integration gate at `a8d380cd0` (seal
+  `K14-GATES-A8D380CD0-20261108`): Unit 951/958, preflight 2250/2252; every
+  failure is a known upstream target-selection registration (3) or a
+  CUDA-device profiler surrogate (6).
+
+Performance follow-ups after merge are tracked in
+[`arm-perf-review/`](arm-perf-review/README.md): I8MM for grouped rows,
+27B dense MTP and its depth controller, region/barrier count per step, LM head,
+GDN verifier economics, FA2 policy regret, placement by core class, in-model
+overlay collection, GB10 CUDA register pressure, NUMA-less hosts.
 
 ## 1. Mandate and completion criteria
 
