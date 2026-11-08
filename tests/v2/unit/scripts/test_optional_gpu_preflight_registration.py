@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 ## @file test_optional_gpu_preflight_registration.py
-#  @brief Execute device-free native topology registration with the real process-owner target.
+#  @brief Prove native test admission and build obligations with the real CMake authorities.
 """Execute optional-GPU CMake registration in Integration and Release modes.
 
 The real helper and native topology loops run in a language-free CMake project
 with imported executable placeholders. CTest's generated metadata proves both
 wide-hardware skip ownership and safe omission in Release. The actual ROCm
 owner-partition cache/owning-TU blocks additionally prove Automatic/explicit mode
-configuration and conditional native-test registration. No compiler, model,
-GPU discovery, executable launch or replacement registration helper is involved.
+configuration and conditional native-test registration. CUDA GDN admission
+executes the real registration and gate finalizer for every configured backend
+pair, including a literal original-code control. No compiler, model, GPU
+discovery, native test launch or replacement registration helper is involved.
 """
 from pathlib import Path
 import json
@@ -104,6 +106,104 @@ set(Python3_EXECUTABLE "{sys.executable}")
         """A performance-only build cannot attach metadata to nonexistent tests."""
         self.assertEqual(self.configure('Release'), [])
 
+
+
+class CUDAGDNPreflightRegistration(unittest.TestCase):
+    """Prove configured CUDA owns both native test and prerequisite build admission."""
+
+    TEST_NAME = 'V2_Integration_CUDA_GDNTensorCaptureOwnership'
+    TARGET = 'v2_integration_cuda_gemm_parity'
+
+    def configure(self, *, cuda, rocm, original=False):
+        """Execute real registration/finalization and return inventory plus built markers."""
+        source = (SOURCE / 'tests/v2/CMakeLists.txt').read_text()
+        start = source.index('function(add_v2_test TEST_NAME)')
+        end = source.index('endfunction()', start) + len('endfunction()')
+        helper = source[start:end]
+        start = source.index('# Exact stage-level regression for external event prejoins')
+        end = source.index('if(TEST V2_Integration_ROCmNativeVNNITrainerOpenMPRuntimeBinding)', start)
+        registration = source[start:end]
+        if original:
+            registration = (SOURCE / 'tests/v2/fixtures/cmake/OriginalCUDAGDNPreflightRegistration.cmake').read_text()
+        with tempfile.TemporaryDirectory(prefix='llaminar-cuda-gdn-admission-') as directory:
+            root = Path(directory)
+            prefix = f'''cmake_minimum_required(VERSION 3.25)
+project(CUDAGDNPreflightAdmission NONE)
+enable_testing()
+set(CMAKE_BUILD_TYPE Integration)
+set(V2_PERF_TESTS_ONLY OFF)
+set(HAVE_CUDA {'ON' if cuda else 'OFF'})
+set(HAVE_ROCM {'ON' if rocm else 'OFF'})
+set(V2_TEST_SOCKETS 2)
+set(V2_TEST_CORES_PER_SOCKET 2)
+set(V2_TEST_THREADS_PER_CORE 1)
+set(DEFAULT_LOG_LEVEL ERROR)
+include("{SOURCE}/tests/v2/fixtures/cmake/NativeMPISessionOwner.cmake")
+add_custom_target(baseline_marker COMMAND ${{CMAKE_COMMAND}} -E touch "${{CMAKE_BINARY_DIR}}/baseline.built")
+set_property(GLOBAL PROPERTY V2_UNIT_GATE_TARGETS baseline_marker)
+add_test(NAME Baseline COMMAND ${{CMAKE_COMMAND}} -E true)
+set_tests_properties(Baseline PROPERTIES LABELS "Integration;ProductionTestPreflight;DeviceFree")
+set_property(GLOBAL PROPERTY V2_TEST_BUILD_TARGETS_Baseline baseline_marker)
+add_custom_target(cuda_marker COMMAND ${{CMAKE_COMMAND}} -E touch "${{CMAKE_BINARY_DIR}}/cuda.built")
+add_executable({self.TARGET} IMPORTED GLOBAL)
+set_target_properties({self.TARGET} PROPERTIES IMPORTED_LOCATION "${{CMAKE_COMMAND}}" V2_TEST_DEVICE_SCOPE FullInventory)
+add_dependencies({self.TARGET} cuda_marker)
+'''
+            suffix = f'''
+file(WRITE "${{CMAKE_BINARY_DIR}}/named-inventory.txt" "${{V2_PRODUCTION_TEST_PREFLIGHT_TESTS}}")
+include("{SOURCE}/tests/v2/cmake/V2TestGateFinalization.cmake")
+'''
+            (root / 'CMakeLists.txt').write_text(prefix + helper + '\n' + registration + suffix)
+            ninja = shutil.which('ninja')
+            self.assertIsNotNone(ninja)
+            configured = subprocess.run(['cmake', '-S', str(root), '-B', str(root / 'build'),
+                                         '-G', 'Ninja', '-DCMAKE_MAKE_PROGRAM=' + ninja],
+                                        text=True, capture_output=True, timeout=10)
+            self.assertEqual(configured.returncode, 0, configured.stdout + configured.stderr)
+            built = subprocess.run(['cmake', '--build', str(root / 'build'), '--parallel',
+                                    '--target', 'v2_production_test_preflight_gate'],
+                                   text=True, capture_output=True, timeout=10)
+            self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+            listed = subprocess.run(['ctest', '--test-dir', str(root / 'build'), '--show-only=json-v1'],
+                                    text=True, capture_output=True, check=True, timeout=10)
+            tests = [test for test in json.loads(listed.stdout)['tests'] if test['name'] != 'Baseline']
+            named = (root / 'build/named-inventory.txt').read_text().split(';')
+            markers = {path.stem for path in (root / 'build').glob('*.built')}
+            return tests, [name for name in named if name], markers
+
+    def test_disabled_cuda_omits_native_test_inventory_and_build(self):
+        """CPU-only and ROCm-only gates cannot acquire a CUDA compilation obligation."""
+        for rocm in (False, True):
+            with self.subTest(rocm=rocm):
+                tests, named, markers = self.configure(cuda=False, rocm=rocm)
+                self.assertEqual(tests, [])
+                self.assertEqual(named, [])
+                self.assertEqual(markers, {'baseline'})
+
+    def test_enabled_cuda_preserves_native_test_inventory_and_build(self):
+        """CUDA-only and combined builds retain the exact filter, labels and native target."""
+        for rocm in (False, True):
+            with self.subTest(rocm=rocm):
+                tests, named, markers = self.configure(cuda=True, rocm=rocm)
+                self.assertEqual([test['name'] for test in tests], [self.TEST_NAME])
+                self.assertEqual(named, [self.TEST_NAME])
+                self.assertEqual(markers, {'baseline', 'cuda'})
+                properties = {item['name']: item['value'] for item in tests[0]['properties']}
+                self.assertTrue({'CUDA', 'ProductionTestPreflight', 'FullDeviceInventory'} <= set(properties['LABELS']))
+                self.assertNotIn('DISABLED', properties)
+                self.assertNotIn('SKIP_REGULAR_EXPRESSION', properties)
+                self.assertIn('--gtest_filter=Test__CUDAGemmParity.GDNProjectionStageFusesCUDAQuantizedQKVAndZSmallM:'
+                              'Test__CUDAGemmParity.GDNProjectionStageCapturedMixedBF16AndFP32UsesPhysicalFormatSubgroups',
+                              tests[0]['command'])
+
+    def test_original_registration_exposes_disabled_cuda_build_obligation(self):
+        """The literal former body wrongly registers and builds CUDA in both disabled configurations."""
+        for rocm in (False, True):
+            with self.subTest(rocm=rocm):
+                tests, named, markers = self.configure(cuda=False, rocm=rocm, original=True)
+                self.assertEqual([test['name'] for test in tests], [self.TEST_NAME])
+                self.assertEqual(named, [self.TEST_NAME])
+                self.assertEqual(markers, {'baseline', 'cuda'})
 
 
 class ROCmOwnerPartitionConfiguration(unittest.TestCase):

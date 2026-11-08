@@ -10,6 +10,7 @@
 #include "CPUWeightPreparationMemory.h"
 #include "CPUNativeVNNIWeightPacker.h"
 #include "memory/CPUStorageRoot.h"
+#include "tensors/W4A4MatrixContract.h"
 #include <climits>
 #include <limits>
 #include <stdexcept>
@@ -24,6 +25,14 @@ namespace llaminar2
                 throw std::overflow_error("CPU preparation byte extent overflow");
             return a * b;
         };
+        if (format == "W4A4" || format == "W4A4H")
+        {
+            const auto extent = w4a4::MatrixContract::sourceExtent(n, k);
+            if (!extent) throw std::invalid_argument(extent.error().message());
+            // The streamed writer publishes this exact allocation; no VNNI
+            // padding, decoded source shadow or setup scratch exists.
+            return {CPUStoragePlacement::local().physicalBytes<uint8_t>(*extent), 0, *extent};
+        }
         // The packer uses signed-int padded geometry. Reject before its N+63
         // or K+31 arithmetic can wrap, even on a host with 64-bit size_t.
         if (!n || !k || n > size_t(INT_MAX - 63) || k > size_t(INT_MAX - 31))

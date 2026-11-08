@@ -30,6 +30,7 @@
 #include "PackedWeightsSerialization.h"
 #include "cpu/gemm/FloatingPointGemmKernel.h"
 #include "../tensors/TensorSlice.h"
+#include "../tensors/W4A4Tensor.h"
 #include "cpu/ops/CPURoPEKernelT.h"
 #include "cpu/ops/CPUSwiGLUKernelT.h"
 #include "cpu/ops/CPUSoftmaxKernelT.h"
@@ -117,6 +118,24 @@ namespace llaminar
             static bool isVnniPackableTensor(const llaminar2::TensorBase *tensor)
             {
                 return vnniFormatInfoIfPackable(tensor) != nullptr;
+            }
+
+            /**
+             * @brief Resolve only a sealed native operand or its already materialized row view.
+             * @param tensor Native W4A4/H source selected by its public format identity.
+             * @return The lifetime-owning native tensor, never a generic weight-only codec.
+             * @throws std::invalid_argument If metadata advertises native bytes without their authority.
+             */
+            static const llaminar2::W4A4Tensor &nativeOnlineA4Source(const llaminar2::TensorBase &tensor)
+            {
+                const auto *source = &tensor;
+                if (const auto *slice = dynamic_cast<const llaminar2::TensorSlice *>(source);
+                    slice && slice->metadata().inner_is_presliced)
+                    source = slice->inner();
+                const auto *native = dynamic_cast<const llaminar2::W4A4Tensor *>(source);
+                if (!native)
+                    throw std::invalid_argument("W4A4/H preparation requires its sealed native tensor authority");
+                return *native;
             }
 
             // ==========================================================================
@@ -490,9 +509,12 @@ namespace llaminar
             std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemm(
                 const llaminar2::TensorBase *tensor, DeviceType dev_type, int device_ordinal)
             {
-                // Two-way dispatch based on interface:
-                // 1. IINT8Unpackable → CPUNativeVNNIGemmKernel (quantized weights)
-                // 2. Otherwise → FloatingPointGemmKernel (FP32/FP16/BF16)
+                // Online-A4 is a distinct native representation, not an
+                // IINT8Unpackable weight codec or floating GEMM operand.
+                if (tensor && llaminar2::isW4A4Format(tensor->native_type()))
+                    return createGemm(&nativeOnlineA4Source(*tensor), dev_type, device_ordinal);
+                // Weight-only codecs retain their existing VNNI preparation;
+                // genuine floating sources retain the floating implementation.
 
                 const bool quantized = isVnniPackableTensor(tensor);
 
@@ -3070,6 +3092,13 @@ namespace llaminar
                     llaminar2::FloatingActivationOperandPrecision operand_precision,
                     llaminar2::CPUWeightStoragePlacement placement)
                 {
+                    if (llaminar2::isW4A4Format(tensor->native_type()))
+                    {
+                        if (operand_precision != llaminar2::FloatingActivationOperandPrecision::Native)
+                            throw std::invalid_argument("W4A4/H preparation cannot replace its online-A4 operands");
+                        return KernelFactory::createGemm(&nativeOnlineA4Source(*tensor),
+                            KernelFactory::getDeviceType(target_device), target_device.toKernelDeviceIndex());
+                    }
                     if (target_device.is_cpu() && isVnniPackableTensor(tensor) &&
                         operand_precision == llaminar2::FloatingActivationOperandPrecision::Native)
                     {
@@ -3217,6 +3246,16 @@ namespace llaminar
                     llaminar2::DeviceId target_device,
                     KernelFactory::GemmPreparationKind prep_kind)
                 {
+                    if (llaminar2::isW4A4Format(tensor->native_type()))
+                    {
+                        if (!target_device.is_cpu() ||
+                            (prep_kind != KernelFactory::GemmPreparationKind::AUTO &&
+                             prep_kind != KernelFactory::GemmPreparationKind::CPU_NATIVE_ONLINE_A4))
+                            throw std::invalid_argument("W4A4/H local preparation requires native CPU online-A4");
+                        return KernelFactory::GemmPreparationKind::CPU_NATIVE_ONLINE_A4;
+                    }
+                    if (prep_kind == KernelFactory::GemmPreparationKind::CPU_NATIVE_ONLINE_A4)
+                        throw std::invalid_argument("Native online-A4 preparation requires a W4A4/H source");
                     const bool quantized = isVnniPackableTensor(tensor);
                     if (prep_kind != KernelFactory::GemmPreparationKind::AUTO)
                         return prep_kind;
@@ -3304,6 +3343,13 @@ namespace llaminar
                     dev_type = current_dev->is_cuda() ? DeviceType::CUDA : DeviceType::ROCm;
                 if (dev_type != DeviceType::CPU)
                     throw std::runtime_error("KernelFactory: sliced GEMM only supported on CPU");
+
+                if (llaminar2::isW4A4Format(tensor->native_type()))
+                {
+                    llaminar2::W4A4Tensor slice(nativeOnlineA4Source(*tensor).retainWeightStorage()
+                        .rowSlice(row_start, row_end - row_start));
+                    return createGemm(&slice, DeviceType::CPU, -1);
+                }
 
                 return std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(
                     tensor, static_cast<int>(row_start), static_cast<int>(row_end),

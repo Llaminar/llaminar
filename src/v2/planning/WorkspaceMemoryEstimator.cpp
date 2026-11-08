@@ -29,6 +29,7 @@
 #include "kernels/common/EmbeddingWorkspaceContract.h"
 #include "kernels/cpu/CPUInvocationWorkspace.h"
 #include "kernels/cpu/gemm/CPUProjectionWorkspaceContract.h"
+#include "kernels/cpu/gemm/CPUW4A4Workspace.h"
 #include "kernels/attention/AttentionWorkspaceContract.h"
 #include "kernels/cuda/attention/CUDAFlashAttentionWorkspaceEnvelope.h"
 #include "kernels/cuda/gemm/CUDAFloatingPointGemmWorkspaceContract.h"
@@ -844,6 +845,127 @@ std::pair<int, int> compactRoutedExpertWorkspaceRows(
         checkedWorkspaceDimension(routes, "compact expert route rows")};
 }
 
+/** @brief Find one exact layer-local matrix suffix in the metadata inventory. */
+const TensorSizeInfo* findLayerWorkspaceTensor(
+    const ModelMemoryProfile& profile,
+    int layer,
+    std::string_view suffix)
+{
+    const auto found = std::find_if(
+        profile.tensors.begin(),
+        profile.tensors.end(),
+        [&](const TensorSizeInfo& candidate)
+        {
+            return candidate.layer_index == layer &&
+                   candidate.name.ends_with(suffix);
+        });
+    return found == profile.tensors.end() ? nullptr : &*found;
+}
+
+/**
+ * @brief Derive one actual fused projection bundle from original source geometry.
+ * @param anchor Directory operand selecting the graph's QKV, GDN or gate/up bundle.
+ * @param profile Complete source inventory, including mixed floating/native GDN members.
+ * @param geometry Exact participant ownership and execution geometry.
+ * @param sharding Same schema-owned slicing law used by the individual projections.
+ * @return Physical output widths, or empty when this source does not declare a complete bundle.
+ *
+ * CPU metadata and CUDA/ROCm fused banks use one group inventory. Matching
+ * original K is mandatory even when local output widths differ.
+ */
+std::vector<int> fusedProjectionWorkspaceColumns(const TensorSizeInfo &anchor,
+    const ModelMemoryProfile &profile, const WorkspaceMemoryGeometry &geometry,
+    const WeightShardingConfig &sharding)
+{
+    std::vector<int> fused_columns;
+    if (anchor.name.ends_with(".attn_qkv.weight"))
+    {
+        constexpr std::array<std::string_view, 4> suffixes = {
+            ".attn_qkv.weight",
+            ".attn_gate.weight",
+            ".ssm_alpha.weight",
+            ".ssm_beta.weight"};
+        for (const std::string_view suffix : suffixes)
+        {
+            const TensorSizeInfo* member = findLayerWorkspaceTensor(
+                profile, anchor.layer_index, suffix);
+            if (!member)
+            {
+                fused_columns.clear();
+                break;
+            }
+            const WorkspaceMatrixShape shape = localWorkspaceMatrixShape(
+                *member, profile, geometry, sharding, false);
+            if (!shape.valid() || member->K != anchor.K)
+            {
+                fused_columns.clear();
+                break;
+            }
+            fused_columns.push_back(shape.output_columns);
+        }
+    }
+    else if (anchor.name.ends_with(".attn_q.weight"))
+    {
+        constexpr std::array<std::string_view, 3> suffixes = {
+            ".attn_q.weight",
+            ".attn_k.weight",
+            ".attn_v.weight"};
+        for (const std::string_view suffix : suffixes)
+        {
+            const TensorSizeInfo* member = findLayerWorkspaceTensor(
+                profile, anchor.layer_index, suffix);
+            if (!member)
+            {
+                fused_columns.clear();
+                break;
+            }
+            const WorkspaceMatrixShape shape = localWorkspaceMatrixShape(
+                *member, profile, geometry, sharding, false);
+            if (!shape.valid() || member->K != anchor.K)
+            {
+                fused_columns.clear();
+                break;
+            }
+            fused_columns.push_back(shape.output_columns);
+        }
+    }
+    else if (anchor.name.ends_with(".ffn_gate_exps.weight"))
+    {
+        const WorkspaceMatrixShape shape = localWorkspaceMatrixShape(
+            anchor, profile, geometry, sharding, false);
+        fused_columns.assign(
+            static_cast<std::size_t>(
+                std::max(1, profile.expert_used_count)) * 2u,
+            shape.output_columns);
+    }
+    else if (anchor.name.find(".ffn_gate") != std::string::npos &&
+             anchor.name.ends_with(".weight"))
+    {
+        std::string up_name = anchor.name;
+        const std::size_t gate = up_name.find(".ffn_gate");
+        up_name.replace(
+            gate, std::string_view(".ffn_gate").size(), ".ffn_up");
+        const auto up = std::find_if(
+            profile.tensors.begin(),
+            profile.tensors.end(),
+            [&](const TensorSizeInfo& candidate)
+            { return candidate.name == up_name; });
+        if (up != profile.tensors.end() && up->K == anchor.K)
+        {
+            const WorkspaceMatrixShape gate_shape =
+                localWorkspaceMatrixShape(
+                    anchor, profile, geometry, sharding, false);
+            const WorkspaceMatrixShape up_shape =
+                localWorkspaceMatrixShape(
+                    *up, profile, geometry, sharding, false);
+            fused_columns = {
+                gate_shape.output_columns,
+                up_shape.output_columns};
+        }
+    }
+    return fused_columns;
+}
+
 /**
  * @brief Admit the same participant-local CPU activation storage declared by stages.
  *
@@ -885,7 +1007,10 @@ size_t exactCPUProjectionWorkspaceBytes(
             const auto shape = localWorkspaceMatrixShape(tensor, profile, geometry, *sharding,
                 geometry.mtp_terminal_logits_layout == MTPTerminalLogitsLayout::FullVocabularyPerParticipant);
             if (!shape.valid())
-                throw std::runtime_error("CPU Q8 admission requires complete projection geometry");
+                throw std::runtime_error("CPU projection admission requires complete matrix geometry");
+            if ((tensor.quant_type == "W4A4" || tensor.quant_type == "W4A4H") &&
+                static_cast<std::size_t>(shape.input_columns) != tensor.K)
+                throw std::invalid_argument("W4A4/H workspace cannot admit an independently quantized K shard");
             const int ordinary_rows = isTerminalProjectionWeight(tensor.name) ||
                 isRetainedMTPSidecarLayer(tensor, profile, geometry)
                 ? std::max({1, geometry.batch_size, geometry.mtp_target_query_rows}) : rows;
@@ -939,25 +1064,20 @@ size_t exactCPUProjectionWorkspaceBytes(
              .n = shape.output_columns, .k = shape.input_columns, .serial_n = serial_shape.output_columns,
              .workers = geometry.device_compute_units, .execution = geometry.cpu_execution}));
     }
+    for (const auto &anchor : profile.tensors)
+    {
+        if ((anchor.quant_type != "W4A4" && anchor.quant_type != "W4A4H") ||
+            !WorkspaceMemoryEstimator::ownsProjectionSource(anchor, profile, geometry))
+            continue;
+        if (!sharding)
+            sharding = SchemaFactoryRegistry::getWeightShardingConfig(profile.architecture);
+        const auto columns = fusedProjectionWorkspaceColumns(anchor, profile, geometry, *sharding);
+        if (!columns.empty())
+            requirements.merge(w4a4::cpuFusedProjectionWorkspaceRequirements(columns.size()));
+    }
     return requirements.total_bytes_with_alignment();
 }
 
-/** @brief Find one exact layer-local matrix suffix in the metadata inventory. */
-const TensorSizeInfo* findLayerWorkspaceTensor(
-    const ModelMemoryProfile& profile,
-    int layer,
-    std::string_view suffix)
-{
-    const auto found = std::find_if(
-        profile.tensors.begin(),
-        profile.tensors.end(),
-        [&](const TensorSizeInfo& candidate)
-        {
-            return candidate.layer_index == layer &&
-                   candidate.name.ends_with(suffix);
-        });
-    return found == profile.tensors.end() ? nullptr : &*found;
-}
 
 /**
  * @brief Price ROCm's exact codebook-independent quantized GEMM name set.
@@ -1066,92 +1186,7 @@ size_t exactROCmQuantizedGemmWorkspaceBytes(
             continue;
         }
 
-        std::vector<int> fused_columns;
-        if (anchor.name.ends_with(".attn_qkv.weight"))
-        {
-            constexpr std::array<std::string_view, 4> suffixes = {
-                ".attn_qkv.weight",
-                ".attn_gate.weight",
-                ".ssm_alpha.weight",
-                ".ssm_beta.weight"};
-            for (const std::string_view suffix : suffixes)
-            {
-                const TensorSizeInfo* member = findLayerWorkspaceTensor(
-                    profile, anchor.layer_index, suffix);
-                if (!member)
-                {
-                    fused_columns.clear();
-                    break;
-                }
-                const WorkspaceMatrixShape shape = localWorkspaceMatrixShape(
-                    *member, profile, geometry, sharding, false);
-                if (!shape.valid())
-                {
-                    fused_columns.clear();
-                    break;
-                }
-                fused_columns.push_back(shape.output_columns);
-            }
-        }
-        else if (anchor.name.ends_with(".attn_q.weight"))
-        {
-            constexpr std::array<std::string_view, 3> suffixes = {
-                ".attn_q.weight",
-                ".attn_k.weight",
-                ".attn_v.weight"};
-            for (const std::string_view suffix : suffixes)
-            {
-                const TensorSizeInfo* member = findLayerWorkspaceTensor(
-                    profile, anchor.layer_index, suffix);
-                if (!member)
-                {
-                    fused_columns.clear();
-                    break;
-                }
-                const WorkspaceMatrixShape shape = localWorkspaceMatrixShape(
-                    *member, profile, geometry, sharding, false);
-                if (!shape.valid())
-                {
-                    fused_columns.clear();
-                    break;
-                }
-                fused_columns.push_back(shape.output_columns);
-            }
-        }
-        else if (anchor.name.ends_with(".ffn_gate_exps.weight"))
-        {
-            const WorkspaceMatrixShape shape = localWorkspaceMatrixShape(
-                anchor, profile, geometry, sharding, false);
-            fused_columns.assign(
-                static_cast<std::size_t>(
-                    std::max(1, profile.expert_used_count)) * 2u,
-                shape.output_columns);
-        }
-        else if (anchor.name.find(".ffn_gate") != std::string::npos &&
-                 anchor.name.ends_with(".weight"))
-        {
-            std::string up_name = anchor.name;
-            const std::size_t gate = up_name.find(".ffn_gate");
-            up_name.replace(gate, std::string_view(".ffn_gate").size(),
-                            ".ffn_up");
-            const auto up = std::find_if(
-                profile.tensors.begin(),
-                profile.tensors.end(),
-                [&](const TensorSizeInfo& candidate)
-                { return candidate.name == up_name; });
-            if (up != profile.tensors.end())
-            {
-                const WorkspaceMatrixShape gate_shape =
-                    localWorkspaceMatrixShape(
-                        anchor, profile, geometry, sharding, false);
-                const WorkspaceMatrixShape up_shape =
-                    localWorkspaceMatrixShape(
-                        *up, profile, geometry, sharding, false);
-                fused_columns = {
-                    gate_shape.output_columns,
-                    up_shape.output_columns};
-            }
-        }
+        const auto fused_columns = fusedProjectionWorkspaceColumns(anchor, profile, geometry, sharding);
 
         if (!fused_columns.empty())
         {
@@ -1319,92 +1354,7 @@ size_t exactCUDAQuantizedGemmWorkspaceBytes(
             continue;
         }
 
-        std::vector<int> fused_columns;
-        if (anchor.name.ends_with(".attn_qkv.weight"))
-        {
-            constexpr std::array<std::string_view, 4> suffixes = {
-                ".attn_qkv.weight",
-                ".attn_gate.weight",
-                ".ssm_alpha.weight",
-                ".ssm_beta.weight"};
-            for (const std::string_view suffix : suffixes)
-            {
-                const TensorSizeInfo* member = findLayerWorkspaceTensor(
-                    profile, anchor.layer_index, suffix);
-                if (!member)
-                {
-                    fused_columns.clear();
-                    break;
-                }
-                const WorkspaceMatrixShape shape = localWorkspaceMatrixShape(
-                    *member, profile, geometry, sharding, false);
-                if (!shape.valid() || member->K != anchor.K)
-                {
-                    fused_columns.clear();
-                    break;
-                }
-                fused_columns.push_back(shape.output_columns);
-            }
-        }
-        else if (anchor.name.ends_with(".attn_q.weight"))
-        {
-            constexpr std::array<std::string_view, 3> suffixes = {
-                ".attn_q.weight",
-                ".attn_k.weight",
-                ".attn_v.weight"};
-            for (const std::string_view suffix : suffixes)
-            {
-                const TensorSizeInfo* member = findLayerWorkspaceTensor(
-                    profile, anchor.layer_index, suffix);
-                if (!member)
-                {
-                    fused_columns.clear();
-                    break;
-                }
-                const WorkspaceMatrixShape shape = localWorkspaceMatrixShape(
-                    *member, profile, geometry, sharding, false);
-                if (!shape.valid() || member->K != anchor.K)
-                {
-                    fused_columns.clear();
-                    break;
-                }
-                fused_columns.push_back(shape.output_columns);
-            }
-        }
-        else if (anchor.name.ends_with(".ffn_gate_exps.weight"))
-        {
-            const WorkspaceMatrixShape shape = localWorkspaceMatrixShape(
-                anchor, profile, geometry, sharding, false);
-            fused_columns.assign(
-                static_cast<std::size_t>(
-                    std::max(1, profile.expert_used_count)) * 2u,
-                shape.output_columns);
-        }
-        else if (anchor.name.find(".ffn_gate") != std::string::npos &&
-                 anchor.name.ends_with(".weight"))
-        {
-            std::string up_name = anchor.name;
-            const std::size_t gate = up_name.find(".ffn_gate");
-            up_name.replace(
-                gate, std::string_view(".ffn_gate").size(), ".ffn_up");
-            const auto up = std::find_if(
-                profile.tensors.begin(),
-                profile.tensors.end(),
-                [&](const TensorSizeInfo& candidate)
-                { return candidate.name == up_name; });
-            if (up != profile.tensors.end() && up->K == anchor.K)
-            {
-                const WorkspaceMatrixShape gate_shape =
-                    localWorkspaceMatrixShape(
-                        anchor, profile, geometry, sharding, false);
-                const WorkspaceMatrixShape up_shape =
-                    localWorkspaceMatrixShape(
-                        *up, profile, geometry, sharding, false);
-                fused_columns = {
-                    gate_shape.output_columns,
-                    up_shape.output_columns};
-            }
-        }
+        const auto fused_columns = fusedProjectionWorkspaceColumns(anchor, profile, geometry, sharding);
 
         if (!fused_columns.empty())
         {

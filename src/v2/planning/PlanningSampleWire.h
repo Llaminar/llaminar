@@ -9,6 +9,7 @@
 #pragma once
 #include "PlanningModelSample.h"
 #include "loaders/ModelLoader.h"
+#include "tensors/W4A4MatrixContract.h"
 #include <nlohmann/json.hpp>
 #include <limits>
 
@@ -69,6 +70,12 @@ namespace llaminar2::planning_sample_wire
         const size_t blocks = geometry.n * (geometry.k / block);
         if (blocks > std::numeric_limits<size_t>::max() / block_bytes || geometry.source_bytes != blocks * block_bytes)
             throw std::invalid_argument("Planning sample native byte extent disagrees with geometry");
+        if (isW4A4Format(type))
+        {
+            const auto extent = w4a4::MatrixContract::sourceExtent(geometry.n, geometry.k);
+            if (!extent || *extent != geometry.source_bytes)
+                throw std::invalid_argument("Planning sample exceeds native online-A4 arithmetic geometry");
+        }
         return result;
     }
 }

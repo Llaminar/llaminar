@@ -75,6 +75,15 @@ namespace llaminar2
             case ModelPreparedWeightRepresentation::SourceNative:break;
             default:throw std::invalid_argument("Unknown original CPU execution representation");
             }
+            if (isW4A4Format(original))
+            {
+                if (requested != WeightPrecision::NATIVE ||
+                    execution != ModelPreparedWeightRepresentation::SourceNative ||
+                    operand != FloatingActivationOperandPrecision::Native ||
+                    isImmutableFP32WeightRole(role) || role == WeightRole::SharedExpertInputGate)
+                    throw std::invalid_argument("W4A4/H cannot replace native online-A4 arithmetic with scalar weight conversion");
+                return WeightPrecision::NATIVE;
+            }
             // A native FP32 source still carries a storage obligation even
             // though resolve() requires no conversion. This does not select
             // FP32 activation arithmetic for a shared-expert gate GEMM.

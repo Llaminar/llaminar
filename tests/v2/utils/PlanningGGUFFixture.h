@@ -4,6 +4,8 @@
  *
  * The real parser reads metadata and tensor extents. Payload holes may be used
  * by explicit source-loading tests, never as real-model numerical evidence.
+ * Dense FFNs can declare a distinct down format, preserving the target's mixed
+ * W4A4 gate/up and W4A4H down identity instead of relabeling payload bytes.
  * Each fixture owns one unique file,
  * allowing Unit groups to run concurrently without a shared temporary folder.
  */
@@ -26,7 +28,11 @@ namespace llaminar2::test
     public:
         /** @brief Directory-only geometry or complete all-attention graph metadata. */
         enum class Geometry { Directory, FullAttentionGraph };
-        /** @return Exact GGUF encoding for a source tensor; runtime-only formats are rejected. */
+        /** @brief Resolve a stored tensor's GGUF encoding.
+         * @param type Source tensor identity, never a runtime-only packed representation.
+         * @return Exact GGUF encoding without a format conversion.
+         * @throws std::invalid_argument For unsupported or runtime-only formats.
+         */
         static GGUFTensorType sourceType(TensorType type)
         {
             switch (type)
@@ -56,6 +62,8 @@ namespace llaminar2::test
             LLAMINAR_PLANNING_GGUF_FORMAT(IQ4_NL)
             LLAMINAR_PLANNING_GGUF_FORMAT(IQ4_XS)
             LLAMINAR_PLANNING_GGUF_FORMAT(MXFP4)
+            LLAMINAR_PLANNING_GGUF_FORMAT(W4A4)
+            LLAMINAR_PLANNING_GGUF_FORMAT(W4A4H)
 #undef LLAMINAR_PLANNING_GGUF_FORMAT
             default: throw std::invalid_argument("Tensor format has no supported GGUF source encoding");
             }
@@ -95,20 +103,25 @@ namespace llaminar2::test
          *        and nonzero recurrent arena metadata, even for all-FA layers.
          * @param main_layers Positive source main-layer count; defaults preserve existing fixtures.
          * @param expert_count Positive original MoE expert population; defaults preserve existing fixtures.
+         * @param dense_down_type Optional distinct dense FFN down format; expert tensors retain their original format.
          */
         explicit PlanningGGUFFixture(bool moe = false, bool mtp = false,
             GGUFTensorType expert_type = GGUFTensorType::F32, uint32_t expert_width = 256,
             std::optional<GGUFTensorType> gdn_projection = std::nullopt, uint32_t attention_heads = 8,
-            Geometry geometry = Geometry::Directory, uint32_t main_layers = 2,uint32_t expert_count=8)
+            Geometry geometry = Geometry::Directory, uint32_t main_layers = 2,uint32_t expert_count=8,
+            std::optional<GGUFTensorType> dense_down_type = std::nullopt)
         {
             if (GGUFTensorInfo{.type = expert_type}.getTypeSize() == 0)
                 throw std::invalid_argument("Planning fixture requires a supported GGUF format");
+            if (dense_down_type && (moe || GGUFTensorInfo{.type = *dense_down_type}.getTypeSize() == 0))
+                throw std::invalid_argument("Planning fixture requires a supported dense-only down override");
             char pattern[] = "/tmp/llaminar-planning-XXXXXX.gguf";
             const int descriptor = ::mkstemps(pattern, 5);
             if (descriptor < 0) throw std::runtime_error("Cannot create planning GGUF fixture");
             ::close(descriptor);
             path_ = pattern;
-            try { write(moe, mtp, expert_type, expert_width, gdn_projection, attention_heads, geometry, main_layers,expert_count); }
+            try { write(moe, mtp, expert_type, expert_width, gdn_projection, attention_heads, geometry, main_layers,
+                expert_count, dense_down_type.value_or(expert_type)); }
             catch (...) { remove(); throw; }
         }
         /** @brief Remove only this fixture's file, including during exception unwinding. */
@@ -126,21 +139,42 @@ namespace llaminar2::test
             std::vector<uint64_t> dimensions;
             GGUFTensorType type = GGUFTensorType::F32;
         };
-        /** @brief Encode an unsigned GGUF scalar explicitly in little-endian order. */
+        /** @brief Encode an unsigned GGUF scalar explicitly in little-endian order.
+         * @tparam T Unsigned serialized scalar type.
+         * @param stream Private fixture file being constructed.
+         * @param value Exact scalar to serialize.
+         */
         template<class T> static void scalar(std::ostream &stream, T value)
         {
             for (size_t byte = 0; byte < sizeof(T); ++byte)
                 stream.put(static_cast<char>(value >> (8 * byte)));
         }
-        /** @brief Encode a GGUF length-prefixed string. */
+        /** @brief Encode a GGUF length-prefixed string.
+         * @param stream Private fixture file being constructed.
+         * @param value UTF-8 payload; the byte count, not a terminator, is serialized.
+         */
         static void string(std::ostream &stream, const std::string &value)
         {
             scalar<uint64_t>(stream, value.size());
             stream.write(value.data(), static_cast<std::streamsize>(value.size()));
         }
-        /** @brief Publish the directory followed by sparse, unread payload extents. */
+        /** @brief Publish the directory followed by sparse, unread payload extents.
+         * @param moe Select routed/shared expert geometry instead of dense FFNs.
+         * @param mtp Append one predictor directory after the main layers.
+         * @param expert_type Dense gate/up or routed expert source format.
+         * @param expert_width Original MoE intermediate width.
+         * @param gdn_projection Optional source type for alpha/beta directory entries.
+         * @param attention_heads Q-head count dividing the fixed hidden width.
+         * @param geometry Select directory-only or complete all-attention graph metadata.
+         * @param main_layers Positive bounded main-layer count.
+         * @param expert_count Positive original expert population when MoE is selected.
+         * @param dense_down_type Exact dense down format; never applied to routed tensors.
+         * @throws std::invalid_argument For unsupported geometry or partial source blocks.
+         * @throws std::ios_base::failure If the private file cannot be written.
+         */
         void write(bool moe, bool mtp, GGUFTensorType expert_type, uint32_t expert_width,
-            std::optional<GGUFTensorType> gdn_projection, uint32_t attention_heads, Geometry geometry, uint32_t main_layers,uint32_t expert_count)
+            std::optional<GGUFTensorType> gdn_projection, uint32_t attention_heads, Geometry geometry,
+            uint32_t main_layers, uint32_t expert_count, GGUFTensorType dense_down_type)
         {
             if(expert_count==0)throw std::invalid_argument("Planning fixture requires positive original expert count");
             if (attention_heads < 2 || 256 % attention_heads != 0)
@@ -184,7 +218,7 @@ namespace llaminar2::test
                 {
                     for (const auto name : {"ffn_gate.weight", "ffn_up.weight"})
                         tensors.push_back({prefix + name, {256, 512}, expert_type});
-                    tensors.push_back({prefix + "ffn_down.weight", {512, 256}, expert_type});
+                    tensors.push_back({prefix + "ffn_down.weight", {512, 256}, dense_down_type});
                 }
                 if (mtp && layer == static_cast<int>(main_layers))
                 {

@@ -1,24 +1,21 @@
 # Llaminar Python Dependencies
 # PyTorch reference implementation for parity testing
 
-# Core ML framework
---extra-index-url https://download.pytorch.org/whl/cpu
-torch>=2.6.0
+# The native W4A4 HF oracle pins the shared numerical toolchain; consume its
+# one recipe so images and standalone reference environments cannot drift.
+-r python/reference/quantization/w4a4-requirements.txt
 torchvision  # Will auto-match torch version
 torchaudio   # Will auto-match torch version
 
 # HuggingFace ecosystem
-# Use our fork with Qwen 3.5 GGUF loading fixes + GQA repeat pattern fix
-# https://github.com/dbsanfte/transformers/tree/qwen35-gguf-fixes
-transformers @ git+https://github.com/dbsanfte/transformers.git@qwen35-gguf-fixes
+# The recipe above pins our Qwen 3.5 GGUF/GQA fixes by immutable commit.
 safetensors>=0.4.0
 accelerate>=0.34.0
 
 # Quantization support
 bitsandbytes>=0.43.0
 
-# Numerical computing (already in Dockerfile but specifying version)
-numpy>=1.24.0
+# Numerical computing (NumPy is pinned by the shared reference recipe above)
 pandas>=2.2.0
 scikit-learn>=1.4.0
 # GPU-resident profiler-informed NativeVNNI dispatch surrogate. Keep this pin

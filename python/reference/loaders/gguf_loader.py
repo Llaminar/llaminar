@@ -2,6 +2,9 @@
 GGUF Loader
 
 Main orchestrator for loading GGUF files into PyTorch state dicts.
+An explicit native-operand iterator policy preserves W4A4/H metadata and integer
+codes for architecture-owned modules; those weights cannot be dequantized into
+an ordinary floating state dictionary without changing the model's arithmetic.
 
 Orchestrates the complete pipeline:
 1. Parse GGUF file (header, metadata, tensor info)
@@ -30,6 +33,7 @@ import os
 import re
 import sys
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from enum import Enum
 
 import numpy as np
 
@@ -59,9 +63,16 @@ except ImportError:
     LlamaConfig = None
     HAS_QWEN3_CONFIG = False
 
-from .gguf_parser import GGUFParser, GGUFTensorInfo
+from .gguf_parser import GGUFParser, GGUFTensorInfo, GGUFTensorType
 from . import dequantize
 from .tensor_name_mapper import TensorNameMapper, create_mapper_from_metadata
+
+
+class GGUFWeightMode(Enum):
+    """Choose floating state publication or architecture-owned native operands."""
+
+    FP32_STATE_DICT = 'fp32-state-dict'
+    NATIVE_OPERANDS = 'native-operands'
 
 
 class GGUFLoader:
@@ -325,8 +336,9 @@ class GGUFLoader:
         show_progress: Optional[bool] = None,
         max_in_flight: int = 4,
         include_mapped_name: Optional[Callable[[str], bool]] = None,
+        weight_mode: GGUFWeightMode = GGUFWeightMode.FP32_STATE_DICT,
     ) -> Iterator[Tuple[str, Any]]:
-        """Yield mapped, dequantized tensors with bounded temporary memory.
+        """Yield mapped weights under an explicit representation policy.
 
         Large MoE checkpoints cannot materialize both a complete FP32 state
         dictionary and a complete Hugging Face model. This iterator keeps at
@@ -343,10 +355,18 @@ class GGUFLoader:
                 but before reading or dequantizing tensor bytes. This is used
                 by graph-external reference components which deliberately own
                 only a small, typed subset of a very large checkpoint.
+            weight_mode: Native mode additionally yields checked ``W4A4Weights``
+                for the dense Qwen35 ruquant export. Only its architecture
+                loader may install those operands into native HF modules;
+                ordinary state-dictionary mode rejects them, never dequantizes.
 
         Yields:
-            ``(mapped_name, tensor)`` pairs.
+            ``(mapped_name, tensor_or_native_operands)`` pairs.
         """
+        if not isinstance(weight_mode, GGUFWeightMode):
+            raise ValueError('Weight representation must be a GGUFWeightMode')
+        if weight_mode is GGUFWeightMode.NATIVE_OPERANDS and (not as_torch or not HAS_TORCH):
+            raise ValueError('Native operand loading requires PyTorch publication')
         if max_in_flight < 1:
             raise ValueError("max_in_flight must be positive")
         if show_progress is None:
@@ -362,14 +382,23 @@ class GGUFLoader:
         n_workers = min(os.cpu_count() or 4, 16, max_in_flight)
 
         def process_tensor(tensor_info, mapped_name):
+            """Decode one owned representation and release its borrowed source view."""
+            native = tensor_info.type in (GGUFTensorType.W4A4, GGUFTensorType.W4A4H)
+            if native and weight_mode is not GGUFWeightMode.NATIVE_OPERANDS:
+                raise ValueError('W4A4/H requires native operands, not a dequantized state dictionary')
+            if native and (model_type != 'qwen35' or not parser.metadata.get('ruquant.w4a4')):
+                raise ValueError('Native W4A4/H reference admission requires the dense Qwen35 ruquant contract')
             raw = parser.read_tensor_data(tensor_info)
-            fp32 = dequantize.dequantize(
-                raw, tensor_info.type, tensor_info.shape
-            )
-            if not fp32.flags.writeable:
-                fp32 = fp32.copy()
-            if isinstance(raw, memoryview):
-                raw.release()
+            try:
+                if native:
+                    from ..quantization.w4a4 import W4A4Weights
+                    return mapped_name, W4A4Weights.from_bytes(raw, tensor_info.shape, int(tensor_info.type))
+                fp32 = dequantize.dequantize(raw, tensor_info.type, tensor_info.shape)
+                if not fp32.flags.writeable:
+                    fp32 = fp32.copy()
+            finally:
+                if isinstance(raw, memoryview):
+                    raw.release()
 
             if as_torch:
                 if not HAS_TORCH:

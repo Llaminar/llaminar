@@ -1,0 +1,6 @@
+# Exact CPU HF/PyTorch oracle environment for ruquant-w4a4-g64-shift4-v1.
+# Install in a dedicated environment; do not rewrite a shared tuning environment.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.15.0+cpu
+numpy==2.5.4
+transformers @ git+https://github.com/dbsanfte/transformers.git@89e65121e562303cd909bde6e7b395da5d0db30b

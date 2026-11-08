@@ -1470,6 +1470,10 @@ set(LLAMINAR2_CORE_LIBRARY_TYPE STATIC)
 if(LLAMINAR_SHARED_CORE)
     set(LLAMINAR2_CORE_LIBRARY_TYPE SHARED)
 endif()
+# Native W4A4 normalization, quantization and epilogues retain explicit FP32 rounding.
+set_source_files_properties(kernels/cpu/gemm/CPUW4A4Arithmetic.cpp
+    kernels/cpu/gemm/CPUW4A4GemmKernel.cpp
+    PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     # Interfaces
     interfaces/IMPIContext.cpp
@@ -1984,6 +1988,11 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     tensors/GPUTensorVerification.cpp
     tensors/IQ4_NLTensor.cpp
     tensors/MXFP4Tensor.cpp
+    tensors/W4A4MatrixContract.cpp
+    tensors/W4A4WeightStorage.cpp
+    tensors/W4A4Tensor.cpp
+    kernels/cpu/gemm/CPUW4A4Arithmetic.cpp
+    kernels/cpu/gemm/CPUW4A4GemmKernel.cpp
     # Simple quantization formats (Q8_0, Q8_1, Q16_1, Q4_0, Q4_1, Q5_0, Q5_1)
     tensors/Q8_0Tensor.cpp
     tensors/Q8_1Tensor.cpp
@@ -2041,6 +2050,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     kernels/cpu/moe/CPUMoEKernel.cpp
     # Kernel dispatch factory (centralized device-aware kernel creation)
     kernels/KernelFactory.cpp
+    kernels/KernelFactoryW4A4.cpp
     kernels/KernelFactoryGPUWeights.cpp
     kernels/HybridKVCacheConfig.cpp
     kernels/common/PreparedEmbeddingWeights.cpp

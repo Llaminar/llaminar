@@ -1,6 +1,10 @@
 /**
  * @file Test__BufferRole.cpp
- * @brief Unit tests for BufferRole enum and buffer descriptor types
+ * @brief Device-free role, native identity and exact graph-buffer extent contracts.
+ *
+ * Declarations retain the actual tensor format without relying on enum ordinals.
+ * Native online-A4 descriptors account complete256-value blocks, not FP32 values;
+ * these metadata checks do not replace source-policy or physical admission.
  * @author David Sanftenberg
  * @date December 2025
  */
@@ -8,6 +12,12 @@
 #include <gtest/gtest.h>
 #include "execution/debug/BufferRole.h"
 #include "backends/DeviceId.h"
+#include "tensors/TensorType.h"
+#include "tensors/W4A4Format.h"
+#include <array>
+#include <limits>
+#include <stdexcept>
+#include <utility>
 
 using namespace llaminar2;
 
@@ -52,6 +62,87 @@ TEST(Test__BufferRole, TensorTypeSizes)
     EXPECT_EQ(bufferTensorTypeSize(BufferTensorType::Q8_0), 34);
     EXPECT_EQ(bufferTensorTypeSize(BufferTensorType::Q4_0), 18);
     EXPECT_EQ(bufferTensorTypeSize(BufferTensorType::IQ4_NL), 18);
+}
+
+TEST(Test__BufferRole, NativeTensorIdentityDoesNotDependOnOrdinals)
+{
+    const std::array mappings{
+        std::pair{TensorType::FP32, BufferTensorType::FP32},
+        std::pair{TensorType::BF16, BufferTensorType::BF16},
+        std::pair{TensorType::FP16, BufferTensorType::FP16},
+        std::pair{TensorType::INT32, BufferTensorType::INT32},
+        std::pair{TensorType::IQ4_NL, BufferTensorType::IQ4_NL},
+        std::pair{TensorType::Q8_0, BufferTensorType::Q8_0},
+        std::pair{TensorType::Q8_1, BufferTensorType::Q8_1},
+        std::pair{TensorType::Q16_1, BufferTensorType::Q16_1},
+        std::pair{TensorType::Q4_0, BufferTensorType::Q4_0}};
+    for (const auto &[native, descriptor] : mappings)
+    {
+        SCOPED_TRACE(tensorTypeName(native));
+        EXPECT_EQ(toBufferTensorType(native), descriptor);
+        EXPECT_STREQ(bufferTensorTypeName(toBufferTensorType(native)), tensorTypeName(native));
+    }
+}
+
+TEST(W4A4GraphBufferContract, NativeWeightsRetainIdentityAndExactBytes)
+{
+    for (const auto type : {TensorType::W4A4, TensorType::W4A4H})
+    {
+        SCOPED_TRACE(tensorTypeName(type));
+        const auto descriptor_type = toBufferTensorType(type);
+        EXPECT_STREQ(bufferTensorTypeName(descriptor_type), tensorTypeName(type));
+        EXPECT_EQ(bufferTensorTypeSize(descriptor_type), w4a4::kSourceBlockBytes);
+        // Stages describe algebraic [K,N]; storage remains admitted [N,K].
+        for (const auto &shape : {std::vector<size_t>{512, 7}, std::vector<size_t>{7, 512}})
+        {
+            const auto descriptor = BufferDescriptor::weight("native", shape, descriptor_type);
+            EXPECT_EQ(descriptor.numel(), 7u * 512u);
+            EXPECT_EQ(descriptor.sizeBytes(), 14u * w4a4::kSourceBlockBytes);
+            EXPECT_TRUE(descriptor.isReadOnly());
+            EXPECT_FALSE(descriptor.isAliasable());
+        }
+        EXPECT_EQ(BufferDescriptor::weight("empty", {0, 512}, descriptor_type).sizeBytes(), 0u);
+    }
+}
+
+TEST(W4A4GraphBufferContract, NativeExtentsCannotRoundOrOverflow)
+{
+    for (const auto type : {TensorType::W4A4, TensorType::W4A4H})
+    {
+        SCOPED_TRACE(tensorTypeName(type));
+        const auto descriptor_type = toBufferTensorType(type);
+        for (const size_t elements : {1u, 255u, 257u})
+            EXPECT_THROW(BufferDescriptor::weight("partial", {elements}, descriptor_type).sizeBytes(),
+                std::invalid_argument);
+        const auto overflow = BufferDescriptor::weight("overflow",
+            {std::numeric_limits<size_t>::max(), 2u}, descriptor_type);
+        EXPECT_THROW(overflow.numel(), std::overflow_error);
+        EXPECT_THROW(overflow.sizeBytes(), std::overflow_error);
+    }
+}
+
+TEST(Test__BufferDescriptor, Q16BlockFootprintIsExact)
+{
+    EXPECT_EQ(BufferDescriptor::weight("q16", {32}, BufferTensorType::Q16_1).sizeBytes(), 72u);
+    EXPECT_EQ(BufferDescriptor::weight("q16", {64}, BufferTensorType::Q16_1).sizeBytes(), 144u);
+    EXPECT_EQ(BufferDescriptor::weight("q16", {33}, BufferTensorType::Q16_1).sizeBytes(), 144u);
+}
+
+TEST(Test__BufferDescriptor, EmptyAndMaximumExtentsDoNotWrap)
+{
+    constexpr auto maximum = std::numeric_limits<size_t>::max();
+    for (const auto type : {BufferTensorType::FP32, BufferTensorType::Q16_1,
+             toBufferTensorType(TensorType::W4A4), toBufferTensorType(TensorType::W4A4H)})
+    {
+        EXPECT_EQ(BufferDescriptor::weight("empty", {maximum, maximum, 0}, type).sizeBytes(), 0u);
+        EXPECT_THROW(BufferDescriptor::weight("overflow", {maximum, 2}, type).numel(), std::overflow_error);
+    }
+    EXPECT_THROW(BufferDescriptor::weight("scalar", {maximum}, BufferTensorType::FP32).sizeBytes(),
+        std::overflow_error);
+    EXPECT_THROW(BufferDescriptor::weight("blocks", {maximum}, BufferTensorType::Q16_1).sizeBytes(),
+        std::overflow_error);
+    EXPECT_EQ(BufferDescriptor::weight("blocks", {maximum}, BufferTensorType::Q4_0).sizeBytes(),
+        (maximum / 32 + 1) * 18);
 }
 
 // =============================================================================

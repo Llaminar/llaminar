@@ -9,6 +9,8 @@
  *  - Simple tensor loading API for pipeline integration
  *  - Device-aware tensor creation (CPU, CUDA, ROCm)
  *  - Exact native 3D expert K-block/N-row projection into retained compact storage
+ *  - Whole-source W4A4/H policy admission before any streamed row selection,
+ *    using only the caller's unpublished final destination as bounded read storage
  *  - INT8 dequantization mode (for AVX512-VNNI / CUDA INT8 GEMM)
  *
  * Simplified from V1 ModelLoader (3870 lines) to focus on:
@@ -32,6 +34,7 @@
 #include "../backends/DeviceId.h"
 #include "../execution/config/RuntimeConfig.h" // for WeightPrecision
 #include "../tensors/TensorFactory.h"          // for owned_factory_
+#include "../tensors/W4A4MatrixContract.h"
 #include <cstdint>
 #include <fstream>
 #include <map>
@@ -113,7 +116,9 @@ namespace llaminar2
         IQ2_S = 22,
         IQ4_XS = 23,
         IQ1_M = 29,
-        MXFP4 = 39 ///< OCP MXFP4: E8M0 exponent + 32 FP4 E2M1 codes (17 bytes / 32 values).
+        MXFP4 = 39, ///< OCP MXFP4: E8M0 exponent + 32 FP4 E2M1 codes (17 bytes / 32 values).
+        W4A4 = 44,  ///< Native group64 online-A4 operand; 144 bytes / 256 values.
+        W4A4H = 45  ///< Same native operand with source-declared ordered online Hadamard.
     };
 
     /**
@@ -645,6 +650,19 @@ namespace llaminar2
             std::vector<float> &fp32_buffer,
             const std::vector<size_t> &shape);
 
+        /**
+         * @brief Retain exact mapped W4A4/H rows under the source file's original lifetime.
+         * @param info Actual normalized source descriptor, never a detached raw pointer.
+         * @param first First output row in the original matrix.
+         * @param count Positive complete-row count with unchanged original K.
+         * @param precision Must preserve the native online-A4 contract.
+         * @return Immutable typed tensor whose storage retains the exact source mapping.
+         * @throws std::invalid_argument For conversion, malformed geometry or invalid file coordinates.
+         * @throws std::logic_error Without a mapping; owned reads use the Store's admitted final writer.
+         */
+        std::shared_ptr<TensorBase> loadW4A4Rows(const GGUFTensorInfo &info,
+            size_t first, size_t count, WeightPrecision precision);
+
         // Low-level readers
         template <typename T>
         bool readValue(T &value);
@@ -673,6 +691,9 @@ namespace llaminar2
         std::vector<std::ifstream> split_streams_; // Additional file streams for multi-part GGUF
         GGUFModel model_;
         mutable std::mutex file_mutex_; // Protects file_stream_ and split_streams_ for thread-safety
+        // Sealed original directory identity and the same file lock own these
+        // successful policies. This is metadata, never a source tensor mirror.
+        std::map<const GGUFTensorInfo *, w4a4::MatrixContract> w4a4_source_contracts_;
 
         // mmap state (when use_mmap_ is true)
         bool use_mmap_ = true;

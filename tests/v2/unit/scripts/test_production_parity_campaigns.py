@@ -1597,6 +1597,13 @@ class ProductionParityCampaignTest(unittest.TestCase):
         self.assertEqual(self.selected_names[commands[campaigns.PreflightExecutionLane.CUDA_SOCKET][-1]], ("V2_Integration_CUDA",))
         self.assertEqual(self.selected_names[commands[campaigns.PreflightExecutionLane.ROCM_SOCKET][-1]], ("V2_Integration_ROCm",))
         self.assertTrue(all(not Path(command[-1]).exists() for command in commands.values()))
+        # Model-free ownership forbids implicit fixture injection on every lane,
+        # including the two commands wrapped by their native socket affinity.
+        for command in [*(call.args[0] for call in run_process.call_args_list[1:]),
+                        *commands.values()]:
+            with self.subTest(command=command):
+                self.assertEqual(command.count("-FA"), 1)
+                self.assertEqual(command[command.index("-FA") + 1], ".*")
 
     @mock.patch.object(campaigns, "_run_process", return_value=0)
     @mock.patch.object(
@@ -1640,6 +1647,10 @@ class ProductionParityCampaignTest(unittest.TestCase):
         self.assertIn("--parallel", unit_command)
         self.assertIn("--no-tests=error", unit_command)
         self.assertIn(f"^{campaigns.PRODUCTION_PARITY_UNIT_PREFIX}", unit_command)
+        for phase_command in (unit_command, command):
+            with self.subTest(command=phase_command):
+                self.assertEqual(phase_command.count("-FA"), 1)
+                self.assertEqual(phase_command[phase_command.index("-FA") + 1], ".*")
         self.assertIn("-I", command)
         self.assertEqual(self.selected_names[command[command.index("-I") + 1]], ("V2_Integration_ParityCellLifecycle_MPI1",))
         self.assertFalse(Path(command[command.index("-I") + 1]).exists())

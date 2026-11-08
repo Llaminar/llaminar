@@ -8,6 +8,7 @@
 #include "CPUWeightPreparationGeometry.h"
 #include "CPUNativeVNNIWeightPacker.h"
 #include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/W4A4MatrixContract.h"
 #include <limits>
 namespace llaminar2 {
 std::optional<NativeWeightLoadStagingRequest> quoteCPUWeightPreparation(
@@ -23,6 +24,15 @@ std::optional<NativeWeightLoadStagingRequest> quoteCPUWeightPreparation(
       default:throw std::invalid_argument("CPU weight quote has invalid resolved precision");
     }
     if(!n || !k)throw std::invalid_argument("CPU weight quote requires positive matrix geometry");
+    if(isW4A4Format(type)) {
+        if(precision!=WeightPrecision::NATIVE || operand!=FloatingActivationOperandPrecision::Native)
+            throw std::invalid_argument("W4A4/H preparation must retain native weights and its FP32 online-A4 boundary");
+        const auto extent=w4a4::MatrixContract::sourceExtent(n,k);
+        if(!extent)throw std::invalid_argument(extent.error().message());
+        // The reader writes original bytes directly into the one final owner.
+        // Validation happens only after complete coverage, before publication.
+        return std::nullopt;
+    }
     const bool floating=type==TensorType::FP32 || type==TensorType::FP16 || type==TensorType::BF16;
     if(floating) {
         const auto source_bytes=type==TensorType::FP32?size_t(4):size_t(2);

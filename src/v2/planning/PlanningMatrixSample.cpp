@@ -5,7 +5,9 @@
  * Matrix slices retain their original source coordinates; equivalent output
  * extents cannot disguise a different shard. The shared sample codec validates
  * native bytes for every format, and load revalidates the sealed plan against
- * the same retained directory before allocating or reading anything.
+ * the same retained directory before allocating or reading anything. Version4
+ * retains original K independently of sampled K so online-A4 cannot authorize
+ * a locally normalized reduction shard, even when its rotation length fits.
  */
 #include "utils/DebugEnv.h"
 #include "PlanningMatrixSample.h"
@@ -28,6 +30,7 @@ namespace llaminar2
         plan.geometry_ = source.sampleGeometry(request);
         const auto *tensor = source.loader().tensorInfo(request.tensor_name);
         plan.gguf_type_ = static_cast<uint32_t>(tensor->type);
+        plan.original_k_ = tensor->dimensions[std::holds_alternative<PlanningExpertMatrix>(request.selection) ? 0 : 1];
         plan.format_ = planning_sample_wire::sourceFormat(plan.tensorType());
         if (PreparedWeightRepresentationContract::isGDNProjectionSource(
                 inferWeightRole(request.tensor_name), request.tensor_name, plan.architecture_))
@@ -48,6 +51,10 @@ namespace llaminar2
         const auto representation = PreparedWeightRepresentationContract::resolve(
             inferWeightRole(request_.tensor_name), tensorType(), request_.tensor_name, architecture_,
             arithmetic_, router_arithmetic_);
+        if (isW4A4Format(tensorType()) &&
+            (representation != ModelPreparedWeightRepresentation::SourceNative ||
+             operandPrecision() != FloatingActivationOperandPrecision::Native))
+            throw std::invalid_argument("W4A4/H planning cannot replace native online-A4 arithmetic");
         return representation == ModelPreparedWeightRepresentation::FP32 ? TensorType::FP32 :
             representation == ModelPreparedWeightRepresentation::FP16 ? TensorType::FP16 : tensorType();
     }
@@ -79,8 +86,8 @@ namespace llaminar2
             else return {{"kind", std::is_same_v<Selection, PlanningMatrixRows> ? "rows" : "columns"},
                 {"first", value.first}, {"last", value.last}};
         }, request_.selection);
-        const auto text = Json{{"schema", "llaminar.planning-matrix-sample.v3"}, {"model", model_path_},
-            {"architecture", architecture_}, {"selection", selection},
+        const auto text = Json{{"schema", "llaminar.planning-matrix-sample.v4"}, {"model", model_path_},
+            {"architecture", architecture_}, {"selection", selection}, {"original_k", original_k_},
             {"gdn_arithmetic", gdnProjectionArithmeticName(arithmetic_)},
             {"router_arithmetic", moeRouterArithmeticName(router_arithmetic_)},
             {"matrix", planning_sample_wire::encode({request_.tensor_name, gguf_type_, geometry_, format_})}}.dump();
@@ -91,7 +98,7 @@ namespace llaminar2
     {
         using planning_sample_wire::unsignedField;
         const auto wire = nlohmann::json::parse(bytes.begin(), bytes.end());
-        if (!wire.is_object() || wire.size() != 7 || wire.at("schema") != "llaminar.planning-matrix-sample.v3")
+        if (!wire.is_object() || wire.size() != 8 || wire.at("schema") != "llaminar.planning-matrix-sample.v4")
             throw std::invalid_argument("Invalid planning matrix sample envelope");
         PlanningMatrixSamplePlan plan;
         plan.model_path_ = wire.at("model").get<std::string>();
@@ -102,6 +109,9 @@ namespace llaminar2
         plan.request_.tensor_name = matrix.name;
         plan.gguf_type_ = matrix.gguf_type;
         plan.geometry_ = matrix.geometry;
+        plan.original_k_ = unsignedField(wire.at("original_k"), std::numeric_limits<int>::max());
+        if (!plan.original_k_ || plan.geometry_.k > plan.original_k_)
+            throw std::invalid_argument("Planning matrix omits or contradicts original K");
         plan.format_ = matrix.format;
         plan.arithmetic_ = parseGDNProjectionArithmetic(wire.at("gdn_arithmetic").get<std::string>());
         plan.router_arithmetic_ = parseMoERouterArithmetic(wire.at("router_arithmetic").get<std::string>());
@@ -130,12 +140,17 @@ namespace llaminar2
                 GGUFTensorInfo info{};
                 info.type = static_cast<GGUFTensorType>(plan.gguf_type_);
                 const size_t block = std::max(size_t{1}, info.getBlockSize());
-                if (first % block || last % block)
+                if (last > plan.original_k_ || first % block || last % block)
                     throw std::invalid_argument("Planning matrix source columns cross native blocks");
                 plan.request_.selection = PlanningMatrixColumns{first, last};
             }
         }
         else throw std::invalid_argument("Unknown or malformed planning matrix source selection");
+        if ((!std::holds_alternative<PlanningMatrixColumns>(plan.request_.selection) ||
+             isW4A4Format(plan.tensorType())) && plan.geometry_.k != plan.original_k_)
+            throw std::invalid_argument("Planning matrix requires its complete original K");
+        if (isW4A4Format(plan.tensorType()) && std::holds_alternative<PlanningExpertMatrix>(plan.request_.selection))
+            throw std::invalid_argument("W4A4/H planning requires an original rank-two matrix");
         (void)plan.executionType(); // Reject forbidden source conversion before any payload admission.
         return plan;
     }

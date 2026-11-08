@@ -1,12 +1,14 @@
 /**
  * @file Test__CPUGraphArenaDeclarations.cpp
- * @brief Device-free production-schema replay of CPU graph arena admission.
+ * @brief Device-free production-schema contracts for CPU graph arena admission.
  *
  * Actual model graph schemas/resolvers are compared root by root with metadata
  * admission. Local TP degree comes from a real configured mock participant
  * domain; retained MTP policy remains independent of whether execution is on.
  * Small native arenas prove complete declaration/materialization equality.
- * No-capacity MTP replay uses production planner semantics, including fixed depth.
+ * No-capacity MTP checks use production planner semantics, including fixed depth.
+ * All-attention source architectures retain their complete registered root set;
+ * exact-budget materialization rejects inventory-based schema substitution.
  */
 #include "planning/ActivationMemoryEstimator.h"
 #include "config/TensorParallelConfig.h"
@@ -15,6 +17,7 @@
 #include "memory/CPUTensorStorageDeclaration.h"
 #include "memory/BufferArena.h"
 #include "models/qwen35moe/Qwen35MoEGraph.h"
+#include "models/qwen35/Qwen35Graph.h"
 #include "models/qwen4exp/Qwen4ExpGraph.h"
 #include "models/qwen4exp/Qwen4ExpGraphConfigBuilder.h"
 #include "execution/local_execution/graph/GraphResolver.h"
@@ -184,6 +187,63 @@ TEST(CPUGraphArenaDeclarations,Qwen35ActualSchemaMatchesMetadataAtEveryLocalDegr
         compare(actualLayout(graph,config),metadata);
     }
 }
+/**
+ * @test Source architecture retains its exact physical schema even without a recurrent layer.
+ *
+ * Both dense and MoE all-attention graphs still register the Qwen3.5 union.
+ * Compare every native root and materialize it under the metadata-only budget;
+ * no private reserve or invented source tensor may conceal an omitted owner.
+ */
+TEST(CPUGraphArenaDeclarations,AllAttentionSourceArchitectureOwnsTheArena)
+{
+    const DeviceId cpu0=DeviceId::cpu();
+    size_t declarations=0;
+    for(bool moe:{false,true})for(int degree:{1,2,4,8})for(int mode:{0,1,2})
+    {
+        SCOPED_TRACE(::testing::Message()<<"moe="<<moe<<" degree="<<degree<<" mode="<<mode);
+        test::MockLocalTPContext tp;auto config=tinyQwen35();
+        if(!moe)config.moe={};
+        config.gdn.full_attention_interval=1;
+        config.layer_types.assign(config.total_n_layers,"full_attention");
+        configureTP(config,tp,degree,0);configureMTP(config,mode);
+        auto profile=sourceProfile(config);
+        profile.architecture=moe?"qwen35moe":"qwen35";
+        profile.tensors.clear();
+        profile.tensors.push_back({.name="blk.0.attn_q.weight",
+            .elements=size_t(2*config.n_heads*config.head_dim*config.d_model),
+            .K=size_t(config.d_model),.layer_index=0});
+        const auto metadata=ActivationMemoryEstimator::declareCPUStorage(
+            profile,runtimeGeometry(config,degree),cpu0);
+        const auto check=[&](const auto &graph)
+        {
+            const auto actual=actualLayout(graph,config);
+            compare(actual,metadata);
+            const auto bytes=metadata.cpuPhysicalBytes();
+            ASSERT_GT(bytes,0u);ASSERT_LT(bytes,size_t{4}*1024*1024);
+            PhysicalMemoryPlanBuilder budget;
+            budget.add({.world_rank=0,.device=cpu0,.total_bytes=bytes,
+                .admission_available_bytes=bytes},PhysicalMemoryOwner::ActivationArena,bytes);
+            auto memory=std::make_shared<PhysicalMemoryAuthority>(
+                std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(budget.build()),0);
+            {
+                BufferArena arena({.physical_memory_authority=memory});
+                for(const auto &entry:actual.entries())
+                    ASSERT_TRUE(arena.registerBuffer(entry.id,entry.descriptor));
+                ASSERT_TRUE(arena.allocate());
+                EXPECT_EQ(memory->claimedBytes(cpu0,PhysicalMemoryOwner::ActivationArena,
+                    PhysicalMemoryMaterializationKind::NewAllocation),bytes);
+            }
+            EXPECT_EQ(memory->claimedBytes(cpu0,PhysicalMemoryOwner::ActivationArena,
+                PhysicalMemoryMaterializationKind::NewAllocation),0u);
+            ++declarations;
+        };
+        if(moe){Qwen35MoEGraph graph(config);check(graph);}
+        else{Qwen35Graph graph(config);check(graph);}
+    }
+    EXPECT_EQ(declarations,24u);
+    RecordProperty("all_attention_arena_declarations",int(declarations));
+}
+
 TEST(CPUGraphArenaDeclarations,QwenFlashNextActualSchemasMatchMetadataAcrossTPMTPAndPPPlacements)
 {
     const auto directory=test::qwen4MetadataFixture(true);

@@ -109,6 +109,9 @@ namespace llaminar2
          *
          * This operation allocates no payload and never faults a source mmap. Consumers
          * retain source identity and own conversion/packing and the destination lifetime.
+         * Native online-A4 sources must admit every original header before returning
+         * selected rows. The first read may reuse this unpublished destination for
+         * bounded whole-source validation; no intermediate bytes are published.
          */
         virtual void readNativeWeightSourceWindow(
             const std::string &name, const NativeWeightSourceWindow &window,

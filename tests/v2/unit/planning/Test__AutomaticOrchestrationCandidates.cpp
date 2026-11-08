@@ -690,6 +690,47 @@ TEST(AutomaticOrchestrationCandidates,
     compile(*found, true);
 }
 
+/** @test Repeated CPU process visibility cannot invent TP; a distinct NUMA endpoint restores it. */
+TEST(AutomaticOrchestrationCandidates, CPUVisibilityAliasesDoNotInventParallelCandidates)
+{
+    const auto config = request({DeviceType::CPU},
+        {OrchestrationStrategy::SingleDevice, OrchestrationStrategy::TensorParallel});
+    for (int ranks : {2, 3})
+    {
+        auto inventory = hosts(ranks);
+        for (auto &rank : inventory.ranks)
+        {
+            rank.node_id = 10;
+            rank.hostname = "one-physical-host";
+            rank.cpu.numa_node = 9;
+        }
+        inventory.buildNodeAggregations();
+        const auto aliased = candidates(config, inventory, true);
+        ASSERT_EQ(aliased.size(), static_cast<size_t>(ranks));
+        for (const auto &proposal : aliased)
+        {
+            EXPECT_EQ(proposal.strategy, OrchestrationStrategy::SingleDevice);
+            EXPECT_EQ(proposal.membership.discoveryRanks().size(), 1u);
+        }
+        // Change only physical NUMA identity. MPI membership and the model are
+        // unchanged, so a real second endpoint must now produce a TP proposal.
+        inventory.ranks.back().cpu.numa_node = 7;
+        inventory.buildNodeAggregations();
+        const auto independent = candidates(config, inventory, true);
+        size_t parallel = 0;
+        for (const auto &proposal : independent)
+            if (proposal.strategy == OrchestrationStrategy::TensorParallel)
+            {
+                ++parallel;
+                ASSERT_TRUE(proposal.config.moe_routed_expert_plan);
+                const auto &domains = proposal.config.moe_routed_expert_plan->domains;
+                ASSERT_EQ(domains.size(), 1u);
+                EXPECT_EQ(domains.front().participants.size(), 2u);
+            }
+        EXPECT_GT(parallel, 0u);
+    }
+}
+
 TEST(AutomaticOrchestrationCandidates, ExactDeviceCountsUsePhysicalNotRankCardinality)
 {
     auto inventory = hosts(2);

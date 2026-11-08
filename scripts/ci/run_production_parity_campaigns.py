@@ -3833,6 +3833,10 @@ def run_production_test_preflight(
         "--parallel",
         test_parallelism,
         "--no-tests=error",
+        # Inventory validation rejects fixture dependencies; the execution
+        # command also forbids CTest from injecting any undeclared setup work.
+        "-FA",
+        ".*",
         "-R",
         f"^{PRODUCTION_PARITY_UNIT_PREFIX}",
         *evidence_arguments("unit"),
@@ -3892,6 +3896,8 @@ def run_production_test_preflight(
                 "--parallel",
                 "1",
                 "--no-tests=error",
+                "-FA",
+                ".*",
                 "-I",
                 str(selector_owners.enter_context(_preflight_index_selection(
                     build_dir, integration_registrations, names))),

@@ -21,6 +21,7 @@
 #include "utils/DebugEnv.h"
 #include "tensors/BlockStructures.h"
 #include "tensors/NativeVnniFormatInfo.h"
+#include "tensors/W4A4Format.h"
 
 #include <algorithm>
 #include <limits>
@@ -79,6 +80,8 @@ namespace llaminar2
             {"IQ1_S", sizeof(IQ1_SBlock), IQ1_SBlock::BLOCK_SIZE},
             {"IQ1_M", sizeof(IQ1_MBlock), IQ1_MBlock::BLOCK_SIZE},
             {"MXFP4", sizeof(MXFP4Block), MXFP4Block::BLOCK_SIZE},
+            {"W4A4", w4a4::kSourceBlockBytes, w4a4::kBlockElements},
+            {"W4A4H", w4a4::kSourceBlockBytes, w4a4::kBlockElements},
         };
 
         const NativeBlockLayout *findNativeBlockLayout(const std::string &quant_type)
@@ -337,6 +340,8 @@ namespace llaminar2
 
     float WeightMemoryEstimator::getGPUPackedBytesPerWeight(const std::string &quant_type, size_t K)
     {
+        if (quant_type == "W4A4" || quant_type == "W4A4H")
+            throw std::invalid_argument("W4A4/H GPU admission requires its native device preparation contract");
         if (quant_type == "F16" || quant_type == "FP16" || quant_type == "BF16")
             return 2.0f;
         if (quant_type == "F32")
@@ -360,6 +365,8 @@ namespace llaminar2
 
     float WeightMemoryEstimator::getCPUPackedBytesPerWeight(const std::string &quant_type)
     {
+        if (quant_type == "W4A4" || quant_type == "W4A4H")
+            return blockBytesPerWeight(w4a4::kSourceBlockBytes, w4a4::kBlockElements);
         // CPU VNNI packing expands quantized weights for efficient VNNI/AVX512 processing.
         // Q8_0 → int8 with block scales, ~1.125 bytes/weight
         // Q4_0 → dequant to int8 for VNNI, ~1.125 bytes/weight (after expansion)
@@ -520,6 +527,15 @@ namespace llaminar2
                 PreparedWeightRepresentationContract::resolve(
                     role, std::string_view(t.quant_type), t.name, profile.architecture,
                     debugEnv().gemm.gdn_projection_arithmetic, debugEnv().gemm.moe_router_arithmetic);
+            if (t.quant_type == "W4A4" || t.quant_type == "W4A4H")
+            {
+                const auto &matrix = geometry.matrix();
+                if (prepared_representation != ModelPreparedWeightRepresentation::SourceNative ||
+                    !matrix || matrix->instances != 1 || matrix->columns != t.K)
+                    throw std::invalid_argument("W4A4/H admission requires native complete-original-K matrices");
+                if (!device.is_cpu())
+                    throw std::invalid_argument("W4A4/H GPU admission requires its native device preparation contract");
+            }
             if (device.is_cpu())
             {
                 const auto type = tensorTypeFromName(t.quant_type);
