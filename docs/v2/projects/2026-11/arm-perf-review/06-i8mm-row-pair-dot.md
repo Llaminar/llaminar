@@ -278,3 +278,18 @@ failures GONE at this base. RE-GATE GO to arm-sparks.
   byte-identical. FIX REQUIRED (helper only in I8MM pair block / restore
   inline in non-SMMLA walk / unsigned-(group&3) math) → re-diff on the fix
   SHA (arm-qualification, ~5 min) before Main merges. Evidence: /tmp/armqual.
+
+## Mac re-diff PASS on amended candidate ea5402a54 (2026-11-08)
+
+- Q6K class GONE. All Tile<1..4>::run<> leaves byte-identical to base:
+  NEON_DOTPROD 384/384 (Enc0 144, Enc1 96, Enc2 48, Enc4 48, Enc5 48), NEON
+  192/192 (Enc2 24/24) — zero run<> diff lines in either ISA.
+- Functions identical: DOTPROD 13149/13244 (was 13101), NEON 11831/11900
+  (was 11807). Only remaining production diff class = the intended admission
+  change (execute/bind + ProjectionBatch tile/bind + ResidualChunk<DotProd>
+  + ARMCPUCapabilities::requireEnvelope). Test-TU diffs expected.
+- Release portability 259/259 both ISAs incl. all Q6K exactness cells, 0
+  gtest skips; 0 forbidden instructions. (Preflight ×20 / Integration /
+  NEON_I8MM runtime check NOT re-run on Mac — covered by the arm-sparks
+  re-gate on ea5402a54; Mac can't run I8MM anyway.)
+- Evidence: /tmp/armqual/{neon,neon_dotprod}.c.objfn.txt + c_*_rel.*.log.
