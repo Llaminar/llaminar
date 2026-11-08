@@ -89,3 +89,14 @@ The tracker and all lane branches are now mirrored on **Llaminar/llaminar**
 frozen `codex/qfn-ngram-continuation-arm64`. The personal fork that hosted
 them is being deleted by the operator — use upstream only; SHAs remain the
 source of truth.
+
+## Startable now (2026-11-08; independent of the i8mm merge)
+
+Measurement/qualification on GB10 (current engine + hosts):
+- 17 bandwidth sweep (1..20, per core class) · 19 prompt-length sweep (128/512/2048) · 2 live UMA joint-pool + page-cache admission validation (Qwen3.8; spill fixes landed) · 18 GDN kernel-vs-capture cost split · 8 memory sizing (prepared vs GGUF, dead bytes, peak RSS).
+Device-free code (no conflicts):
+- 23 qwen4exp HC auto-planning classification · 7 allocation cleanup (RoPE/RMSNorm/gamma TLS incl. stale-risk fix) · 11 attention validation hoist + integer-dot range proof · 14 depth-controller analysis (window_not_ready, MTPDepthDefaults).
+CUDA / GB10 GPU (part of the ARM story):
+- 21 remainder (BK256 non-ordered; tensor_prefill split — spec signed off) · 25 (PerfStats bucket counters + nsys-in-uma3 first; single-bucket/async path after) · 22 FA2 per-codec tournament prep.
+After i8mm merge (same tile / post-merge):
+- 4 wider panel + activation reuse (MXFP4-coordinated) · 5 rework prototype (id-gated claiming; lane-held) · 3 metadata hoist (lands on the tile) · 6 Q6_K prefill rerun under production binding.
