@@ -77,14 +77,23 @@ SDOT path on GB10.
 Base: `b2cf793bf` (upstream PR #43); rebase if the base moves (SHA-only, no
 pin branches). Lane: `arm-i8mm` (01a1bbe6, codex/i8mm-typed-placement).
 
-## Envelope resolved (2026-11-08, g++-14 probe on .80)
+## Envelope resolved (2026-11-08, g++-14 probe on .80 — recheck verdict)
 
-- Spelling: **`-march=armv8.6-a+dotprod+i8mm`** (minimal honest target;
-  compiles `vusmmlaq_s32`/`vmmlaq_s32` cleanly).
-- Negative control: `armv8.2-a+dotprod+i8mm` declares the intrinsic but fails
-  with `target specific option mismatch` — use it in envelope/checker tests.
-- Feature macro: **`__ARM_FEATURE_MATMUL_INT8`** (GCC does not define
-  `__ARM_FEATURE_I8MM` on this toolchain) plus `__ARM_FEATURE_DOTPROD`.
+- Spelling: **`-march=armv8.2-a+simd+dotprod+i8mm`** — canonical (verified on
+  g++-14 / llaminar-arm-engine-sdk-py:e0d6d34e7: `vmmlaq_s32`+`vusmmlaq_s32`
+  compile, rc=0, emits smmla/usmmla @ -O2; AppleClang accepts too).
+  `-mcpu=generic` is benign but non-canonical — `CPUInstructionSet.cmake`
+  should use ONE authoritative combination (`-march` only).
+- NO v8.6 requirement (GCC accepts i8mm as an additive extension with `+simd`
+  present). `armv8.6-a` would pull in __ARM_FEATURE_BF16 (+ BF16 arithmetic)
+  and __ARM_FEATURE_ATOMICS (LSE) — BF16 is explicitly out of scope, so
+  avoid.
+- Negative control: same spelling WITHOUT `+i8mm` — `target specific option
+  mismatch` for the intrinsic (use in envelope/checker tests).
+- Feature macros: `__ARM_FEATURE_MATMUL_INT8` (GCC does not define
+  `__ARM_FEATURE_I8MM`) + `__ARM_FEATURE_DOTPROD`; checker sanity also asserts
+  `!__ARM_FEATURE_BF16_VECTOR_ARITHMETIC`.
+- Startup admission: HWCAP_ASIMDDP + HWCAP2_I8MM.
 - Ownership: CPUCodegenEnvelope.py NEON_I8MM + CPUInstructionSet.cmake =
   the i8mm lane; arm-sparks validates at the gate (envelope + BuildSystem
   gates + Unit/byte tests) when handed a SHA.
