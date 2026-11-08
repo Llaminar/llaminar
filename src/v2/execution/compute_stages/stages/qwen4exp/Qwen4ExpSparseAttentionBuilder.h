@@ -13,6 +13,7 @@
 #include "../AttentionConsumerBinding.h"
 #include "../../../../kernels/common/SparseQueryExecutionProgram.h"
 #include <cstdint>
+#include "execution/local_execution/graph/ForwardGraphSubmissionIntent.h"
 
 namespace llaminar2
 {
@@ -39,7 +40,9 @@ struct Qwen4ExpSparseAttentionPolicy
     qwen4exp::QwenSparseAttentionArithmetic attentionArithmetic = qwen4exp::kDefaultQwenSparseAttentionArithmetic; ///< Resolved selected-core arithmetic; no native phase decision.
     std::optional<ForwardExecutionPhase> executionPhase; ///< Exact construction phase for diagnostic/capture identity; absent preserves legacy direct builders.
     int retainedMtpCandidateRows = 0; ///< Original canonical retained R, copied from immutable setup geometry.
-    SparseQueryExecutionProgram queryExecutionProgram = SparseQueryExecutionProgram::RankingPossible; ///< Retained admission-selected topology, never a live frontier hint.
+    SparseQueryExecutionProgram queryExecutionProgram = SparseQueryExecutionProgram::RankingPossible; ///< Retained admission-selected topology.
+    std::optional<SparseQueryPrefillProof> prefillQueryProof; ///< Original admitted prefill extent; not embedded numeric capture identity.
+    ForwardGraphSubmissionIntent submissionIntent = ForwardGraphSubmissionIntent::Execute; ///< Reject cold proof on execution before graph mutation.
 };
 /** @brief Replicated production GGUF projection identities and immutable indexer gains/planes. */
 struct Qwen4ExpSparseAttentionWeights
@@ -79,18 +82,22 @@ class Qwen4ExpSparseAttentionBuilder final
 {
 public:
     /**
-     * @brief Lower the retained admission program to explicit indexer authorship.
-     * @param phase Original forward phase; legacy direct builders may leave it absent.
-     * @param program Immutable topology chosen by authenticated generation admission.
-     * @return AllLive for Prefill, RankingOnly for ordinary complete Decode, or
-     * ProvenNoRanking for a certified short Decode response window.
-     * @throws std::invalid_argument For unknown enum values or omission without
-     * explicit Decode, before any graph nodes or prepared operands are created.
-     * @details The response owner stamps RankingPossible on Prefill. A graph
-     * claiming both Prefill and ProvenNoRanking is invalid, never normalized.
+     * @brief Lower the original admission-selected program to indexer authorship.
+     * @param phase Original forward phase; legacy direct builders may omit it.
+     * @param program Closed retained query topology selected by its actual owner.
+     * @param prefillProof Original accepted prefill extent or cold declaration.
+     * @param intent Existing execution/materialization authority; cold proofs cannot execute.
+     * @return AllLive for complete Prefill, RankingOnly for complete Decode,
+     * or ProvenNoRanking for explicit Decode or proved Prefill.
+     * @throws std::invalid_argument Before graph mutation for unknown phases,
+     * missing/mismatched prefill proof, or cold declarations used for execution.
+     * @details Numeric admitted extents are consumed only while choosing this
+     * topology. Native kernels validate the original replay before any write.
      */
     static qwen4exp::QwenSparseQueryDemand queryDemandForInvocation(
-        std::optional<ForwardExecutionPhase> phase, SparseQueryExecutionProgram program);
+        std::optional<ForwardExecutionPhase> phase, SparseQueryExecutionProgram program,
+        std::optional<SparseQueryPrefillProof> prefillProof = std::nullopt,
+        ForwardGraphSubmissionIntent intent = ForwardGraphSubmissionIntent::Execute);
     /**
      * @brief Declare the native pool selector for one typed production invocation.
      * @param phase Original forward phase; a one-row prefill remains Prefill.

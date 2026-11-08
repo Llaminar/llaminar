@@ -19,6 +19,7 @@
  */
 
 #include "ForwardExecutionEngine.h"
+#include "kernels/qwen4exp/QwenSparseAttention.h"
 #include "execution/local_execution/graph/GraphCaptureStageActivity.h"
 #include "execution/local_execution/orchestrators/PipelineForwardGraphEdges.h"
 #include "PrefillBucketUtils.h"
@@ -492,6 +493,12 @@ namespace llaminar2
             chunk_input.token_offset = plan.chunk.token_offset;
             chunk_input.position_offset = plan.chunk.token_offset;
             chunk_input.prefill_chunk_index = plan.chunk_index;
+            if (base_input.sparse_query_prefill_proof) {
+                chunk_input.sparse_query_prefill_proof = base_input.sparse_query_prefill_proof->chunk(
+                    plan.chunk.token_offset, plan.chunk.real_count);
+                chunk_input.sparse_query_execution_program = chunk_input.sparse_query_prefill_proof->program(
+                    qwen4exp::QwenSparseFirstRankingLogicalRow);
+            }
             /*
              * Sparse MoE packets carry only live rows, but the matching root
              * and participant graphs must still name this padded bucket by its
@@ -1120,6 +1127,8 @@ namespace llaminar2
     ForwardExecutionEngine::ForwardExecutionEngine(Config config, DeviceGraphExecutor &executor)
         : config_(std::move(config)), executor_(executor)
     {
+        if (config_.sparse_query_program_count == 0u || config_.sparse_query_program_count > kSparseQueryExecutionProgramCount)
+            throw std::invalid_argument("Forward engine requires the original model's closed sparse-query owner roster");
     }
 
     // =========================================================================
@@ -1471,10 +1480,37 @@ namespace llaminar2
         // each captured materializer still reads the very same device KV count.
         for (size_t index = 0; index < schedule.chunks.size(); ++index)
         {
+            const auto &declaration = chunk_inputs.empty() ? base_input : chunk_inputs[index];
+            // Validate every request-derived choice before the first chunk can
+            // append KV/state. A later foreign declaration must not partially
+            // execute the original accepted request.
+            if (declaration.sparse_query_prefill_proof != base_input.sparse_query_prefill_proof ||
+                declaration.sparse_query_execution_program != base_input.sparse_query_execution_program)
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Prefill family changed its original admitted query proof/program");
+                return false;
+            }
+            if (base_input.sparse_query_prefill_proof) {
+                const auto &proof = *base_input.sparse_query_prefill_proof;
+                if (proof.isMaterialization() || base_input.execution_phase != ForwardExecutionPhase::Prefill ||
+                    proof.program(qwen4exp::QwenSparseFirstRankingLogicalRow) != base_input.sparse_query_execution_program)
+                    return false;
+                try {
+                    const auto chunk_proof = proof.chunk(schedule.chunks[index].chunk.token_offset,
+                        schedule.chunks[index].chunk.real_count);
+                    if (sparseQueryExecutionProgramIndex(chunk_proof.program(qwen4exp::QwenSparseFirstRankingLogicalRow)) >=
+                        config_.sparse_query_program_count) return false;
+                } catch (const std::invalid_argument &error) {
+                    LOG_ERROR("[ForwardExecutionEngine] Invalid admitted prefill chunk: " << error.what());
+                    return false;
+                }
+            } else if (base_input.sparse_query_execution_program != SparseQueryExecutionProgram::RankingPossible) {
+                LOG_ERROR("[ForwardExecutionEngine] Prefill family omitted the required original query proof");
+                return false;
+            }
             if (!base_input.device_prefill_chunk)
                 continue;
             const auto &owner = *base_input.device_prefill_chunk;
-            const auto &declaration = chunk_inputs.empty() ? base_input : chunk_inputs[index];
             if (!declaration.device_prefill_chunk ||
                 declaration.device != base_input.device ||
                 declaration.batch_size != base_input.batch_size ||
@@ -1768,7 +1804,9 @@ namespace llaminar2
         if (configured_cap <= 0)
             return;
 
-        const size_t cap = static_cast<size_t>(configured_cap);
+        // The option bounds admitted physical bucket owners; the closed QSA
+        // programs retain distinct complete executables for each such bucket.
+        const size_t cap = static_cast<size_t>(configured_cap) * config_.sparse_query_program_count;
         while (prefillForwardCacheSize() > cap)
         {
             auto victim = cache_.end();
@@ -1832,10 +1870,26 @@ namespace llaminar2
             return false;
         }
         (void)sparseQueryExecutionProgramIndex(input.sparse_query_execution_program);
-        if (input.sparse_query_execution_program == SparseQueryExecutionProgram::ProvenNoRanking &&
-            input.execution_phase != ForwardExecutionPhase::Decode)
+        if (input.sparse_query_prefill_proof)
         {
-            LOG_ERROR("[ForwardExecutionEngine] No-ranking topology requires explicit Decode admission");
+            const auto &proof = *input.sparse_query_prefill_proof;
+            const bool materializing = input.graph_submission_intent ==
+                ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+            const int rows = input.real_seq_len > 0 ? input.real_seq_len : input.seq_len;
+            if (input.execution_phase != ForwardExecutionPhase::Prefill || input.batch_size != 1 ||
+                sparseQueryExecutionProgramIndex(input.sparse_query_execution_program) >= config_.sparse_query_program_count ||
+                (proof.isMaterialization() ? !materializing : !proof.namesRange(effectiveTokenOffset(input), rows)) ||
+                proof.program(qwen4exp::QwenSparseFirstRankingLogicalRow) != input.sparse_query_execution_program)
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Prefill query topology lacks its exact original admitted range or cold materialization");
+                return false;
+            }
+        }
+        if (input.sparse_query_execution_program == SparseQueryExecutionProgram::ProvenNoRanking &&
+            input.execution_phase != ForwardExecutionPhase::Decode &&
+            !(input.execution_phase == ForwardExecutionPhase::Prefill && input.sparse_query_prefill_proof))
+        {
+            LOG_ERROR("[ForwardExecutionEngine] No-ranking topology requires explicit Decode or proved Prefill admission");
             return false;
         }
         if(input.device_request_query)requireDeviceRequestQueryOwnsInput(input);

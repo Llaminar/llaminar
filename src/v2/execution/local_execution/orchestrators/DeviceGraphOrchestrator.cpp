@@ -8559,6 +8559,13 @@ namespace llaminar2
         std::vector<int> position_ids_storage;
         ForwardInput effective_input = input;
         effective_input.sparse_query_execution_program = sparseQueryForwardProgram(input.execution_phase);
+        if (input.execution_phase == ForwardExecutionPhase::Prefill && sparseQueryProgramCount() > 1u) {
+            if (compiling_sparse_query_program_)
+                effective_input.sparse_query_prefill_proof = SparseQueryPrefillProof::materialization(*compiling_sparse_query_program_);
+            else if (input.sparse_query_prefill_proof)
+                effective_input.sparse_query_execution_program = input.sparse_query_prefill_proof->program(
+                    qwen4exp::QwenSparseFirstRankingLogicalRow);
+        }
 
         if (!input.position_ids && !input.position_ids_device)
         {
@@ -14280,6 +14287,7 @@ namespace llaminar2
 
         ForwardExecutionEngine::Config engine_config;
         engine_config.cache_config = cache_config_;
+        engine_config.sparse_query_program_count = sparseQueryProgramCount();
         engine_config.pp_stage_config = pp_stage_config_;
         engine_config.pipeline_forward_edges = pipeline_forward_edges_;
 
@@ -17935,6 +17943,11 @@ namespace llaminar2
             materialize_serial_decode_position_from_device_kv = true;
         }
 
+        std::optional<SparseQueryPrefillProof> cpu_prefill_proof;
+        if (new_phase == InferencePhase::PREFILL && state_.device_id.is_cpu() &&
+            batch_size == 1 && sparseQueryProgramCount() > 1u)
+            cpu_prefill_proof = SparseQueryPrefillProof::admittedRange(state_.positions[0], seq_len);
+
         // Build host position rows only for a host-owned forward transaction.
         // Device-resident MTP condition rows already carry their authoritative
         // positions in the logical-state mailbox; constructing a host shadow
@@ -18168,6 +18181,13 @@ namespace llaminar2
             new_phase == InferencePhase::DECODE
                 ? ForwardExecutionPhase::Decode
                 : ForwardExecutionPhase::Prefill;
+        // CPU request positions are host-owned. GPU prefill uses the original
+        // accepted ingress proof in forwardPrefillChunkSchedule instead.
+        if (cpu_prefill_proof) {
+            input.sparse_query_prefill_proof = cpu_prefill_proof;
+            input.sparse_query_execution_program = input.sparse_query_prefill_proof->program(
+                qwen4exp::QwenSparseFirstRankingLogicalRow);
+        }
         input.state_transaction =
             restored_prefix_mtp_decode_bridge
                 ? ForwardStateTransaction::RestoredPrefixMTPDecodeBridge
@@ -19322,6 +19342,14 @@ namespace llaminar2
             physical_rows += static_cast<std::uint64_t>(binding->bucket_seq_len);
         }
 
+        // Validate the original ingress extent before signed position-row fill.
+        // The caller's schedule must name this same accepted logical range;
+        // no live GPU KV count is observed to select a retained program.
+        const auto request_range = SparseQueryPrefillProof::admittedRange(state_.positions[0], seq_len);
+        if (policy.real_token_start != state_.positions[0] || policy.real_token_count != seq_len) {
+            LOG_ERROR("[DeviceGraphOrchestrator] GPU prefill schedule disagrees with its original request ingress");
+            return false;
+        }
         std::vector<int> request_position_ids(static_cast<size_t>(seq_len));
         for (int row = 0; row < seq_len; ++row)
             request_position_ids[static_cast<size_t>(row)] =
@@ -19354,6 +19382,11 @@ namespace llaminar2
         input.position_policy = ForwardPositionPolicy::ExplicitRows;
         input.execution_role = ForwardExecutionRole::MainInference;
         input.execution_phase = ForwardExecutionPhase::Prefill;
+        if (sparseQueryProgramCount() > 1u) {
+            input.sparse_query_prefill_proof = request_range;
+            input.sparse_query_execution_program = input.sparse_query_prefill_proof->program(
+                qwen4exp::QwenSparseFirstRankingLogicalRow);
+        }
         input.batch_size = 1;
         input.seq_len = seq_len;
         input.real_seq_len = seq_len;

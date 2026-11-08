@@ -39,7 +39,7 @@ inline constexpr int QwenSparsePartitionTokens = 257; ///< Covers 2051 indices i
 enum class QwenSparseQueryDemand : std::uint8_t {
     AllLive,
     RankingOnly,
-    ProvenNoRanking ///< Admission proves every submitted decode row has visible tokens <=2051.
+    ProvenNoRanking ///< Original Decode/Prefill admission proves every submitted row has visible tokens <=2051.
 };
 /**
  * @brief Reject unknown immutable query programs before staging or capture.
@@ -138,7 +138,7 @@ struct QwenSparseIndexer
     const QwenSparseTransactionPrior* transaction_prior=nullptr; ///< Optional typed immutable original replay/tail codec.
     QwenSparsePoolSelection pool_selection = QwenSparsePoolSelection::Installed; ///< Explicit selector candidate; scores/arithmetic are unchanged.
     QwenSparseSelectionObservation *selection_observations = nullptr; ///< Optional original [row_capacity] diagnostics; no host mirror.
-    QwenSparseQueryDemand query_demand = QwenSparseQueryDemand::AllLive; ///< Explicit decode query work; ordinary prefill retains complete query authorship.
+    QwenSparseQueryDemand query_demand = QwenSparseQueryDemand::AllLive; ///< Explicit admitted query work; unproved prefill retains complete query authorship.
 };
 
 /**

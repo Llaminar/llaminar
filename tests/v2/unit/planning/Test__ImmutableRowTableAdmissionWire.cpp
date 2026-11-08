@@ -106,14 +106,28 @@ TEST(ImmutableRowTableAdmissionWire, LocalityWireRejectsInvalidOrDiscardedPolicy
 {
     const std::array values{request()};
     const auto valid=serializeImmutableRowTableAdmissionRequests(values);
-    ASSERT_GT(valid.size(),124u);
+    // Discover the locality words from two actual serializer outputs, rather
+    // than pin an offset that changes when preceding optional arms evolve.
+    auto task = values.front();
+    task.input = ImmutableRowTablePlacementInput::forConsumers(task.input.extent(),
+        task.input.host(), task.input.consumers(), ImmutableRowTableHostPlacement::taskPolicy());
+    const auto task_bytes = serializeImmutableRowTableAdmissionRequests(std::array{task});
+    ASSERT_EQ(valid.size(), task_bytes.size());
+    std::vector<std::size_t> changed;
+    for (std::size_t i = 0; i < valid.size(); ++i)
+        if (valid[i] != task_bytes[i]) changed.push_back(i);
+    ASSERT_EQ(changed.size(), 2u);
+    const auto arm = changed[0], node = changed[1];
+    ASSERT_GE(valid.size(), node + sizeof(std::uint32_t));
+    EXPECT_EQ(parseImmutableRowTableAdmissionRequests(task_bytes, 2).front().input.hostPlacement(),
+              ImmutableRowTableHostPlacement::taskPolicy());
     for (const auto mutation : {0,1,2,3})
     {
         auto bytes=valid;
         if(mutation==0)bytes[4]=1; // Previous schema has no locality authority.
-        if(mutation==1)bytes[200]=2; // Unknown locality arm.
-        if(mutation==2)bytes[200]=0; // Task arm cannot retain a bound-node payload.
-        if(mutation==3)for(int i=0;i<4;++i)bytes[204+i]=255; // Unrepresentable node.
+        if(mutation==1)bytes[arm]=2; // Unknown locality arm.
+        if(mutation==2)bytes[arm]=0; // Task arm cannot retain a bound-node payload.
+        if(mutation==3)for(int i=0;i<4;++i)bytes[node+i]=255; // Unrepresentable node.
         EXPECT_THROW(parseImmutableRowTableAdmissionRequests(bytes,2),std::invalid_argument)<<mutation;
     }
 }

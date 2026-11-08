@@ -594,10 +594,14 @@ namespace llaminar2
             prefill_buffers.logits_local = state_.logits_local.get();
             setBuffers(prefill_buffers);
 
+            for (std::size_t program = 0; program < sparseQueryProgramCount(); ++program)
             for (auto bucket_it = normalized_buckets.rbegin();
                  bucket_it != normalized_buckets.rend();
                  ++bucket_it)
             {
+                ServingProgramBufferScope buffer_scope(*this, prefill_buffers);
+                SparseQueryProgramCompilationScope program_scope(*this,
+                    program == 0 ? SparseQueryExecutionProgram::RankingPossible : SparseQueryExecutionProgram::ProvenNoRanking);
                 const int bucket_rows = *bucket_it;
                 if (!prepareServingGraphSetupInputs(
                         bucket_rows,

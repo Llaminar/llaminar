@@ -12,6 +12,7 @@
 #include "../../fixtures/planning/RecordedHostServicePlanning.h"
 #include "planning/MoEOverlayPlanningInputs.h"
 #include "planning/MoEOverlayMemoryPlanInputs.h"
+#include "execution/moe/MoEOverlayActivationChannelPlan.h"
 #include "config/OrchestrationConfig.h"
 #include "../models/qwen4exp/Qwen4ExpSidecarFixture.h"
 #include "../../utils/CPUExecutionTestGeometry.h"
@@ -81,7 +82,13 @@ namespace llaminar2
                     topology(backend, world_size > 1));
                 inventory.world_size = world_size;
                 inventory.ranks.resize(world_size);
-                for (int index = 0; index < world_size; ++index) inventory.ranks[index].rank = index;
+                // Authored gathered node identity is distinct from world rank.
+                // This fixture declares one physical host per rank.
+                for (int index = 0; index < world_size; ++index) {
+                    inventory.ranks[index].rank = index;
+                    inventory.ranks[index].node_id = index;
+                    inventory.ranks[index].local_rank = 0;
+                }
                 execution = resolveMoEExpertOverlayExecutionPlan(config.moe_routed_expert_plan,
                     {.current_world_rank = 0, .world_size = world_size});
                 policy = resolveMoEOverlayCapacityAdmissionPolicy(
@@ -129,6 +136,33 @@ namespace llaminar2
                     .has_embedding = rank.has_embedding, .has_lm_head = rank.has_lm_head};
             }
         };
+    }
+
+    /**
+     * @test Authored topology is accepted before native geometry, and missing/duplicate owners reject.
+     * @details This calls the original shared admission boundary without SDK
+     * objects, workers or fabricated compiled-backend capability. The fixture
+     * declares its topology; production still requires actual gathered facts.
+     */
+    TEST(MoEOverlayMemoryPlanInputs, ObservedNodeIdentityPrecedesNativeGeometryAdmission)
+    {
+        for (const auto backend : {DeviceType::CPU,DeviceType::CUDA,DeviceType::ROCm})
+        for (const int ranks : {1,2}) {
+            SCOPED_TRACE(::testing::Message()<<deviceTypeToString(backend)<<'/'<<ranks);
+            MemoryInputsFixture fixture(backend,ranks);
+            const auto project=[&] {
+                return MoEOverlayActivationChannelPlanner::originalNativeSlotGeometry(
+                    *fixture.config.moe_routed_expert_plan,fixture.inventory,fixture.family);
+            };
+            EXPECT_NO_THROW((void)project());
+            fixture.inventory.ranks.back().node_id=-1;
+            EXPECT_THROW((void)project(),std::invalid_argument);
+            fixture.inventory.ranks.back().node_id=ranks-1;
+            if(ranks>1) {
+                fixture.inventory.ranks.back().rank=0;
+                EXPECT_THROW((void)project(),std::invalid_argument);
+            }
+        }
     }
 
     TEST(MoEOverlayPlanningInputs, StaticDoesNotPriceAnyMigrationStorageOnAnyBackend)
@@ -788,8 +822,8 @@ namespace llaminar2
         }
     }
 
-    /** @test Whole-main programs multiply fixed owners, never prefill reserves or shared MTP helpers. */
-    TEST(MoEOverlayMemoryPlanInputs, QueryProgramsPriceFixedOwnersAndKeepPrefillAndSnapshotsIndependent)
+    /** @test Whole-main programs multiply real prefill/runtime/fixed owners while preserving shared helpers. */
+    TEST(MoEOverlayMemoryPlanInputs, QueryProgramsPricePrefillAndRuntimeOwnersAndPreserveSnapshots)
     {
         MemoryInputsFixture fixture(DeviceType::ROCm);
         auto scope = fixture.stage(0, 32, true);
@@ -821,9 +855,9 @@ namespace llaminar2
             DeviceGenerationExecutionDomain::HostedBoundary,
             2u);
         EXPECT_EQ(two.model_graph_identity_count - one.model_graph_identity_count,
-                  two_serving.fixed_executable_count - one_serving.fixed_executable_count);
+                  two_serving.fixed_executable_count - one_serving.fixed_executable_count + 3u);
         EXPECT_EQ(one.model_graph_identity_count - one_serving.fixed_executable_count, 3u); // Bucket + two reserves.
-        EXPECT_EQ(two.model_graph_identity_count - two_serving.fixed_executable_count, 3u);
+        EXPECT_EQ(two.model_graph_identity_count - two_serving.fixed_executable_count, 6u); // Both programs retain the bucket and two original runtime identities.
         EXPECT_EQ(two_serving.mtp_graph_owners.sidecarGraphSlots(), one_serving.mtp_graph_owners.sidecarGraphSlots());
         EXPECT_EQ(two_serving.mtp_graph_owners.boundedHelperExecutableSlotCount(),
                   one_serving.mtp_graph_owners.boundedHelperExecutableSlotCount());

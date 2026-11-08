@@ -189,10 +189,18 @@ MoEOverlayMemoryPlanInputs buildMoEOverlayMemoryPlanInputs(
         ? MTPGenerationParentRole::PipelineFollower : MTPGenerationParentRole::Controller;
     const auto query_programs = request.model.sparseQueryProgramCount();
     const auto serving = resolveCapturedServingGraphMemoryInventory({}, mtp, verifier_family, parent_role, generation.domain(), query_programs);
-    // Prefill and its request/rehydration reserve have RankingPossible only.
-    // The canonical fixed inventory already prices each decode/condition/
-    // verifier identity per actual query program, including the prefix bridge.
-    const auto graph_identities = retained_buckets.size() + kExpertOverlayPrefillGraphIdentityReserve +
+    // Each admitted bucket and original named runtime identity retains both
+    // actual main-query programs. Fixed decode/condition/verifier owners are
+    // already multiplied by this same closed model inventory.
+    // Rehydration keeps its existing initial-materialization lifecycle; pricing
+    // its owner does not advertise it as a cold serving bucket.
+    const auto prefill_identities = retained_buckets.size();
+    if (query_programs == 0u || query_programs > kSparseQueryExecutionProgramCount ||
+        prefill_identities > std::numeric_limits<std::size_t>::max() - kExpertOverlayPrefillGraphIdentityReserve ||
+        prefill_identities + kExpertOverlayPrefillGraphIdentityReserve >
+            (std::numeric_limits<std::size_t>::max() - serving.fixed_executable_count) / query_programs)
+        throw std::overflow_error("Overlay retained prefill program quantity overflows");
+    const auto graph_identities = (prefill_identities + kExpertOverlayPrefillGraphIdentityReserve) * query_programs +
         serving.fixed_executable_count;
     const auto &graph_owners = serving.mtp_graph_owners;
     const auto captured = resolveMoEOverlayCapturedGraphPlan(

@@ -190,6 +190,18 @@ Qwen4ExpPooledLookupEndpoints modelLookupEndpoints(const PooledImmutableLookupGr
 Qwen4ExpPooledLookupEndpoints modelLookupEndpoints(const PooledImmutableLocalHotGraphEndpoints& endpoints) {
     return {endpoints.first,endpoints.last,endpoints.demand};
 }
+/**
+ * @brief Require original reader authority before resolving any native stage code.
+ * @param reader Shared-only lookup declaration borrowed by this model block.
+ * @throws std::invalid_argument For absent original source participants or arena.
+ * @details Source authority is backend-independent metadata. A malformed reader
+ * must not reach hash-stage/backend construction, even in a CPU-only build.
+ * The original lookup wiring still validates transport, rows and arena roots.
+ */
+void requireOriginalReaderAuthority(const Qwen4ExpPooledReaderLookupStorage& reader) {
+    require(reader.arena && reader.participants,
+        "PLE reader requires its original shared source participants and local arena");
+}
 /** @brief Reuse the original fully authenticated source/reader construction in both scheduling modes. */
 Qwen4ExpPooledLookupEndpoints appendOriginalPooledLookup(ComputeGraph& graph,const Qwen4ExpPLEContext& c,
     const Qwen4ExpPLEBuffers& b,Qwen4ExpPooledLookupDeclaration storage,const std::string& gather){
@@ -246,8 +258,7 @@ Qwen4ExpPooledLookupEndpoints appendOriginalPooledLookup(ComputeGraph& graph,con
     }
     else if(auto* reader=std::get_if<Qwen4ExpPooledReaderLookupStorage>(&storage))
     {
-        require(reader->arena && reader->participants,
-            "PLE reader requires its original shared source participants and local arena");
+        requireOriginalReaderAuthority(*reader);
         const auto transport=reader->participants->transport();
         require(transport && transport->readerGeometry() &&
             transport->readerGeometry()->coordinator().device!=c.device,
@@ -342,6 +353,8 @@ std::unique_ptr<Qwen4ExpPooledReadAheadFrame> Qwen4ExpPooledReadAheadFrame::publ
         verifierPrior->requireFor(graph,c.device,c.rows,b.priorTokens,b.priorConvolution);
     }else require(!verifierPrior && graph.size()==0 && c.arithmetic==Qwen4ExpProjectionArithmetic::Ordinary && !c.projectionRows,
         "Pooled ordinary read-ahead requires its original empty graph prefix");
+    if(const auto* reader=std::get_if<Qwen4ExpPooledReaderLookupStorage>(&storage))
+        requireOriginalReaderAuthority(*reader);
     auto hash=std::make_unique<Qwen4ExpPrimitiveStage>(Qwen4ExpPrimitiveStage::Params{
         .device_id=c.device,.mpi_ctx=c.mpi,.rows=c.rows,
         .operation=Qwen4ExpPrimitiveStage::NgramHash{b.tokens,b.priorTokens,b.ids,c.hash}});
@@ -390,6 +403,8 @@ std::string Qwen4ExpPLEBuilder::append(ComputeGraph &graph,const Qwen4ExpPLECont
             require(views[i].tensor!=views[j].tensor && views[i].buffer!=views[j].buffer,
                 "PLE projections, retained histories and residual trunk must have independent storage");
     c.hash.validate();
+    if(const auto* reader=std::get_if<Qwen4ExpPooledReaderLookupStorage>(&storage))
+        requireOriginalReaderAuthority(*reader);
     using Stage=Qwen4ExpPrimitiveStage;
     const auto hash=c.prefix+"hash",gather=c.prefix+"gather",key=c.prefix+"key",value=c.prefix+"value",
         keyNorm=c.prefix+"key_norm",queryNorm=c.prefix+"query_norm",gate=c.prefix+"gate",

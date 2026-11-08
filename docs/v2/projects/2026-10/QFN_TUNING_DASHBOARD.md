@@ -7,26 +7,27 @@ analysis in the linked tuning notes, not in this dashboard.
 ## Current status
 
 **Active hybrid target: 500 prefill /40 decode tok/s on 2×MI50 +2×CPU TP.**
-Matched local Release 512/256 measurements give **184.840 P /30.809 D**,
-versus 161.929/29.380 with the original admission (+14.15%/+4.86%, aggregate
-tokens/time on both sides). QFN main QSA was charged for nonexistent dense FA2
-scratch: correcting that adds **61.67% GPU expert slots**, from 50–51 to
-82–83 experts/card/layer. All 768 generated tokens and MTP work counts match.
-Context remains 262144, with dynamic MTP/balancing, RAM ngrams, local GPU row
-caches and 16/32 GiB RAM/disk prefix budgets. The workspace Unit suite and new
-CPU/CUDA/ROCm TP1/2/4/8 admission regression pass; the old binary fails the new
-regression. Driver free VRAM stays near 1.6 GiB/card through measured inference.
-**Full preflight, exact checkpoint model and OpenCode remain open.**
-The earlier CPU checkpoint retains its 36 focused passes and qualified pair,
-counter, affinity and aligned-fixture fixes. The experimental wide-row kernel
-was rejected after measurement; no blanket WideRows policy is promoted.
-Latest observation run is **184.310 P /30.839 D**, with identical token/MTP work.
-Phase labeling is fixed; 12 focused development tests and four checkpoint tests
-pass. Root combine/weighting is small; **GPU-ticket waits and rooted gather**
-are the next profiling targets.
-[Measured scopes and current candidate decisions](../2026-11/QFN_HYBRID_ROOT_TIMING_20261108.md).
-[Admission correction, matched control and qualification limits](../2026-11/QFN_SELECTED_ATTENTION_WORKSPACE_ADMISSION_20261108.md).
-[Assembly, measurements, configuration and qualification limits](../2026-11/QFN_CPU_NATIVEVNNI_SPILL_AUDIT_20261108.md).
+Current local Release 512/256 result: **196.279 P /30.230 D**. Omitting short-
+prefill indexer-query projection/preparation/scoring improves P **7.09%** over
+an identical-owner control (**183.283/30.179**); decode is unchanged. Each GPU
+executes **36 fewer kernels/chunk**. All 768 output IDs and MTP work match.
+Paired retained graphs cost eight GPU expert slots: **8066 total, 4033/card**.
+Context stays 262144 with dynamic MTP/balancing, RAM ngrams, local GPU caches
+and 16/32 GiB RAM/disk prefix budgets. The original dense-scratch accounting
+fix had raised GPU capacity from 50–51 to 82–83 experts/card/layer.
+
+Broad Integration: **1254 affected Unit cases and eight native CUDA/ROCm
+registrations pass**; focused host aliases pass. Exact-feature new checks pass;
+its CPU-only companion cannot qualify 27 compiled-GPU geometry cases. **Full
+preflight, exact checkpoint GPU/model and OpenCode remain open**. The original
+owner0 remains selected: moving it to the other NUMA cohort did not help.
+Ready-data MPI gather beats retained SharedSpin by 1.42–1.48× at 1–16 MiB;
+CMA improves large gathers another 1.3–1.4× in both test orders; model effect
+is unmeasured and defaults stay unchanged.
+[Launch omission, matched controls and timeline](../2026-11/QFN_HYBRID_TIMELINE_AND_NUMA_20261108.md).
+[Root phase timing](../2026-11/QFN_HYBRID_ROOT_TIMING_20261108.md).
+[Admission correction](../2026-11/QFN_SELECTED_ATTENTION_WORKSPACE_ADMISSION_20261108.md).
+[CPU assembly and measurements](../2026-11/QFN_CPU_NATIVEVNNI_SPILL_AUDIT_20261108.md).
 
 **Earlier checkpoint `2cf99995d`:** finite-trajectory MTP comparison and full OpenCode
 session complete on accepted ROCm TP4. [Contract and live MTP table](QFN_MTP_TP4_TUNING.md).

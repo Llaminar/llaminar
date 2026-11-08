@@ -9073,8 +9073,8 @@ namespace llaminar2
         /** @return Explicit per-forward topology; outside response admission the complete program applies. */
         SparseQueryExecutionProgram sparseQueryForwardProgram(ForwardExecutionPhase phase) const noexcept
         {
-            if (phase != ForwardExecutionPhase::Decode) return SparseQueryExecutionProgram::RankingPossible;
             if (compiling_sparse_query_program_) return *compiling_sparse_query_program_;
+            if (phase != ForwardExecutionPhase::Decode) return SparseQueryExecutionProgram::RankingPossible;
             if (admitted_sparse_query_program_ &&
                 (admitted_sparse_query_program_->boundary == SparseQueryAdmissionBoundary::HostControlledResponse ||
                  device_generation_storage_.active_request_count != 0))

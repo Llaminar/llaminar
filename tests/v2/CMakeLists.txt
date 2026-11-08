@@ -27436,6 +27436,7 @@ add_v2_test(V2_Perf_CPURootedPublicationTransport
     COMMAND $<TARGET_FILE:v2_perf_cpu_rooted_publication_transport>
     LABELS "V2;Perf;CPU;Collective;ShmemSpin;MoE"
     MPI_PROCS 2
+    NO_MODELS
     TIMEOUT 120
     RESOURCE_LOCK "ShmemSpin"
 )
@@ -36306,7 +36307,7 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MTPDeclaredGenerat
 # Existing targets already compile these focused device-free regressions.
 add_v2_test(V2_Integration_SparseQueryProgramBOM
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
-        --gtest_filter=Test__MemoryPlanner.SparseQueryProfileProjectionExcludesPredictorOnlyLayers:Test__MemoryPlanner.SparseQueryProgramBOMKeepsPrefillSingleAndPricesHostedCudaTail:Test__MemoryPlanner.CapturedServingFamilyMustMatchDeclaredGpuDomain:MoEOverlayMemoryPlanInputs.QueryProgramsPriceFixedOwnersAndKeepPrefillAndSnapshotsIndependent:MoEOverlayMemoryPlanInputs.CompleteQwenSourcePrefixEnabledFixedBOMWholeAndPipeline:MoEPipelineFixedMemory.OrdinaryAuxiliaryBOMFollowsActualContinuationRoleAndPolicy
+        --gtest_filter=Test__MemoryPlanner.SparseQueryProfileProjectionExcludesPredictorOnlyLayers:Test__MemoryPlanner.SparseQueryProgramBOMPricesBothPrefillProgramsAndHostedCudaTail:Test__MemoryPlanner.CapturedServingFamilyMustMatchDeclaredGpuDomain:MoEOverlayMemoryPlanInputs.QueryProgramsPricePrefillAndRuntimeOwnersAndPreserveSnapshots:MoEOverlayMemoryPlanInputs.CompleteQwenSourcePrefixEnabledFixedBOMWholeAndPipeline:MoEPipelineFixedMemory.OrdinaryAuxiliaryBOMFollowsActualContinuationRoleAndPolicy
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;MTP;GraphCapture;Ownership;CUDA;ROCm;PP;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
@@ -36390,6 +36391,64 @@ if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_test_moe_expert_compute_stage)
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCompletedExpertViewLifecycle)
+endif()
+
+# Proven prefill omission reuses the original owners and complete native replay.
+if(NOT V2_PERF_TESTS_ONLY)
+    add_v2_test(V2_Integration_QwenSparseProvenNoRankingPrefillAdmission
+        COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+            --gtest_filter=Qwen4ExpSparseAttentionBuilder.ProvenNoRankingPrefill*
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Admission;Capture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+    add_v2_test(V2_Integration_QwenSparseProvenNoRankingPrefillRetention
+        COMMAND $<TARGET_FILE:v2_test_forward_execution_engine>
+            --gtest_filter=Test__ForwardExecutionEngine.Execute_ProvenNoRankingPrefill*
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Admission;Capture;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+    add_v2_test(V2_Integration_QwenSparseProvenNoRankingPrefillBOM
+        COMMAND $<TARGET_FILE:v2_test_memory_planner>
+            --gtest_filter=Test__MemoryPlanner.SparseQueryProgramBOMPricesBothPrefillProgramsAndHostedCudaTail:MoEOverlayMemoryPlanInputs.QueryProgramsPricePrefillAndRuntimeOwnersAndPreserveSnapshots
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Planning;PhysicalMemoryAuthority;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_QwenSparseProvenNoRankingPrefillAdmission
+        V2_Integration_QwenSparseProvenNoRankingPrefillRetention
+        V2_Integration_QwenSparseProvenNoRankingPrefillBOM)
+    foreach(QSA_PREFILL_BACKEND IN ITEMS CUDA ROCm)
+        if(QSA_PREFILL_BACKEND STREQUAL "CUDA")
+            set(QSA_PREFILL_DIR cuda)
+            set(QSA_PREFILL_ENV "LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=1")
+            set(QSA_PREFILL_LOCK cuda_gpu_0)
+        else()
+            set(QSA_PREFILL_DIR rocm)
+            set(QSA_PREFILL_ENV "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
+            set(QSA_PREFILL_LOCK rocm_gpu_0)
+        endif()
+        if(TARGET v2_test_${QSA_PREFILL_DIR}_qwen_sparse_attention)
+            add_v2_test(V2_Integration_${QSA_PREFILL_BACKEND}_QwenSparseProvenNoRankingPrefill
+                COMMAND $<TARGET_FILE:v2_test_${QSA_PREFILL_DIR}_qwen_sparse_attention>
+                    --gtest_filter=${QSA_PREFILL_BACKEND}QwenSparseAttention.CapturedProvenNoRankingPrefillOmitsQueryWorkAndPreservesRequiredBytes
+                LABELS "V2;Integration;ProductionTestPreflight;${QSA_PREFILL_BACKEND};Qwen4Exp;Capture;ByteExact;Regression"
+                MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK ${QSA_PREFILL_LOCK}
+                ENVIRONMENT ${QSA_PREFILL_ENV})
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+                V2_Integration_${QSA_PREFILL_BACKEND}_QwenSparseProvenNoRankingPrefill)
+        endif()
+    endforeach()
+endif()
+
+# Fixture ownership and wire corruption controls are fast and SDK/device-free.
+if(NOT V2_PERF_TESTS_ONLY)
+    add_v2_test(V2_Integration_PlanningFixtureTopologyAndLocality
+        COMMAND $<TARGET_FILE:v2_test_memory_planner>
+            --gtest_filter=MoEOverlayMemoryPlanInputs.ObservedNodeIdentityPrecedesNativeGeometryAdmission:ImmutableRowTableAdmissionWire.LocalityWireRejectsInvalidOrDiscardedPolicy
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Admission;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PlanningFixtureTopologyAndLocality)
 endif()
 
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)

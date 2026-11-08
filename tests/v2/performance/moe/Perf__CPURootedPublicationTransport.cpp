@@ -12,16 +12,33 @@
  * Profiler or benchmark output from this executable is evidence for a typed
  * transport policy. It is not a correctness substitute: production graph and
  * all-format byte-equivalence tests remain the authority for arithmetic.
+ * The OriginalNUMAVariableRecordGatherReplay case additionally uses admitted
+ * original physical socket domains, production matched-envelope MPI gather,
+ * node-certified ordinary packed roots, root aliasing and live/empty replays.
  */
 
 #include <gtest/gtest.h>
 #include <mpi.h>
 
 #include "collective/DeviceGroup.h"
+#include "collective/GlobalTPContext.h"
+#include "collective/CollectiveTimeoutPolicy.h"
+#include "memory/CPUStorageRoot.h"
+#include "backends/HostMemoryCapacity.h"
+#include "utils/MPIContext.h"
+#include "utils/NUMATopology.h"
+#include "utils/NodeTopology.h"
+#include "utils/DebugEnv.h"
+#include "../../fixtures/collective/CPUExpertDomainSocketMembership.h"
 #include "collective/backends/ShmemSpinBackend.h"
 #include "collective/backends/UPIBackend.h"
 
 #include <algorithm>
+#include <array>
+#include <bit>
+#include <optional>
+#include <span>
+#include <variant>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -30,11 +47,50 @@
 #include <iostream>
 #include <memory>
 #include <numeric>
+#include <string>
 #include <string_view>
 #include <vector>
 
 namespace llaminar2::test
 {
+    /** @brief Bounded test operation borrowing one actual admitted shared backend.
+     * This fixture-only seam returns no backend pointer and retains no borrower.
+     * Public production transport selection and original context retirement are
+     * unchanged. Failed native execution marks the same original context aborted.
+     */
+    struct CPURootedPublicationTransportReplayAccess
+    {
+        /** @brief Invoke only the existing shared gather of a live admitted UPI context.
+         * @param context Original retained domain; foreign, null and retired owners reject.
+         * @param local Original NUMA-packed local prefix, aliased to receive storage on root.
+         * @param count Actual local records, never declaration capacity.
+         * @param root Original root NUMA-packed receive allocation, null on contributor.
+         * @param capacity Common declared record capacity used by both transport arms.
+         * @param width Native packed record width.
+         * @param root_index Original communicator member selected as gather root.
+         * @param gathered Successful root live count; reset before any rejected borrow.
+         * @param ranges Original root-only per-source boundaries, reset on rejected borrow.
+         * @return Existing native result, or false before entry for an invalid owner.
+         */
+        static bool gatherSharedOriginal(const std::shared_ptr<GlobalTPContext>& context,
+            const float* local,size_t count,float* root,size_t capacity,size_t width,
+            int root_index,size_t& gathered,std::span<RootedFloatRecordRange> ranges)
+        {
+            gathered=0;
+            for(auto& range:ranges)range={};
+            if(!context || !context->authenticatesOriginalCPUExpertBorrow(context) ||
+               context->isAbortRequested() || context->backend()!=CollectiveBackendType::UPI)
+                return false;
+            auto* backend=dynamic_cast<ShmemSpinBackend*>(context->backend_.get());
+            if(!backend)return false;
+            if(!backend->gatherVariableFloatRecordsToRoot(local,count,root,capacity,width,
+                                                        root_index,gathered,ranges)) {
+                context->requestAbort();return false;
+            }
+            return true;
+        }
+    };
+
     namespace
     {
         using Clock = std::chrono::steady_clock;
@@ -137,6 +193,215 @@ namespace llaminar2::test
                       << p50_gbps << '\n';
         }
     } // namespace
+
+    /**
+     * @test OriginalNUMAVariableRecordGatherReplay
+     * Compare the retained SharedSpin protocol with production MPI matched
+     * gather on the SAME certified ordinary NUMA roots and live record counts.
+     * Only the named test seam bypasses the production crossover for the shared
+     * arm. Original contexts own their split, arena, PMA and explicit retirement.
+     * Setup/poisoning/validation and readiness barriers are outside each timed
+     * call; this measures ready-data transport service, not model arrival skew.
+     */
+    TEST(Perf__CPURootedPublicationTransport, OriginalNUMAVariableRecordGatherReplay)
+    {
+        constexpr int root=1;
+        constexpr size_t width=2561;
+        constexpr size_t record_bytes=width*sizeof(float);
+        constexpr size_t one_mib=(1u<<20)/record_bytes;
+        constexpr size_t four_mib=(4u<<20)/record_bytes;
+        constexpr size_t sixteen_mib=(16u<<20)/record_bytes;
+        constexpr size_t capacity=2*sixteen_mib;
+        constexpr int warmups=3,repetitions=12;
+        const int rank=worldRank();
+        ASSERT_EQ(worldSize(),2)<<"Requires two actual physical socket workers";
+        ASSERT_EQ(collective_timeout_policy::effectiveCollectTimeoutMs(
+            debugEnv().tp_collect_timeout_ms),30000)<<"Requires the original collective deadline";
+        const auto inventory=MPIContextFactory::global()->clusterInventory();
+        ASSERT_EQ(inventory->ranks.size(),2u);
+        const auto affinity=NUMATopology::detectLocalNUMANode();
+        ASSERT_TRUE(affinity.detection_succeeded);
+        const auto topology=NodeTopology::detect();
+        const auto node=std::find_if(topology.numaNodes().begin(),topology.numaNodes().end(),
+            [&](const auto& item){return item.node_id==affinity.local_numa_node;});
+        ASSERT_NE(node,topology.numaNodes().end());
+        std::array<int,2> sockets{},nodes{};
+        ASSERT_EQ(MPI_Allgather(&node->socket_id,1,MPI_INT,sockets.data(),1,MPI_INT,MPI_COMM_WORLD),MPI_SUCCESS);
+        ASSERT_EQ(MPI_Allgather(&affinity.local_numa_node,1,MPI_INT,nodes.data(),1,MPI_INT,MPI_COMM_WORLD),MPI_SUCCESS);
+        std::vector<NativeCPUCollectiveProgram::Participant> members;
+        std::vector<CPUExpertSocketEndpoint> endpoints;
+        for(const auto& observed:inventory->ranks) {
+            ASSERT_GE(observed.rank,0);ASSERT_LT(observed.rank,2);
+            ASSERT_EQ(observed.hostname,inventory->ranks.front().hostname);
+            ASSERT_EQ(observed.cpu.numa_node,nodes[observed.rank]);
+            members.push_back({observed.rank,GlobalDeviceAddress::cpu(nodes[observed.rank],observed.hostname)});
+            endpoints.push_back({observed.rank,nodes[observed.rank],sockets[observed.rank]});
+        }
+        ASSERT_TRUE(validCPUExpertSocketMembership(endpoints,2));
+        // Original inventory order must match MPI member order; never fabricate
+        // a socket from a rank number or silently repair an unexpected ordering.
+        ASSERT_EQ(members[0].world_rank,0);ASSERT_EQ(members[1].world_rank,1);
+        RecordProperty("actual_distinct_physical_sockets",2);
+        RecordProperty("actual_rank_numa_node",nodes[rank]);
+        RecordProperty("actual_root_world_rank",root);
+        RecordProperty("native_record_width_elements",width);
+        const auto shared_program=NativeCPUCollectiveProgram::expertShardRoutePartials(
+            73002,CollectiveBackendType::UPI,members);
+        const auto mpi_program=NativeCPUCollectiveProgram::expertShardRoutePartials(
+            73003,CollectiveBackendType::MPI,members);
+        const auto observed_capacity=observeSystemMemoryCapacity();
+        ASSERT_TRUE(observed_capacity.valid());
+        ASSERT_GT(observed_capacity.admission_available_bytes,0u);
+        const PhysicalMemoryResource cpu{rank,DeviceId::cpu(),observed_capacity.total_bytes,
+                                         observed_capacity.admission_available_bytes};
+        const size_t local_capacity=rank==root?capacity:sixteen_mib;
+        const auto placement=CPUStoragePlacement::onNode(nodes[rank]);
+        const CPUStorageRoot<float> packed_root(local_capacity*width+1,
+            PhysicalMemoryOwner::ActivationArena,DeviceId::cpu(),placement);
+        const CPUStorageRoot<RootedFloatRecordRange> ranges_root(rank==root?2:0,
+            PhysicalMemoryOwner::ActivationArena,DeviceId::cpu(),placement);
+        PhysicalMemoryPlanBuilder bill;
+        shared_program.contributeDomainBOM(bill,cpu,rank);
+        mpi_program.contributeDomainBOM(bill,cpu,rank);
+        NativeCPUCollectiveProgram::contributeProcessPoolBOM(bill,cpu);
+        bill.add(cpu,PhysicalMemoryOwner::ActivationArena,packed_root.physicalBytes()+ranges_root.physicalBytes());
+        if(rank==0)bill.add(cpu,PhysicalMemoryOwner::ActivationTransportStaging,
+                            ShmemSpinArena::allocationGeometry(2).mapped_bytes);
+        auto memory=std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(bill.build()),rank);
+        auto records=packed_root.allocate(memory);
+        auto ranges=ranges_root.allocate(memory);
+        using Use=std::variant<NativeCPUCollectiveProgram::DomainUse,NativeCPUCollectiveProgram::ProcessUse>;
+        auto shared=GlobalTPContext::createAdmittedCPUExpertDomain(MPI_COMM_WORLD,shared_program,
+            Use(std::in_place_type<NativeCPUCollectiveProgram::DomainUse>,shared_program.admit(memory,rank)));
+        auto mpi=GlobalTPContext::createAdmittedCPUExpertDomain(MPI_COMM_WORLD,mpi_program,
+            Use(std::in_place_type<NativeCPUCollectiveProgram::DomainUse>,mpi_program.admit(memory,rank)));
+        ASSERT_TRUE(shared);ASSERT_TRUE(mpi);
+        ASSERT_EQ(shared->scope(),TPScope::NODE_LOCAL);ASSERT_EQ(mpi->scope(),TPScope::NODE_LOCAL);
+        ASSERT_EQ(mpi->backend(),CollectiveBackendType::MPI);
+        ASSERT_EQ(CPURootedPublicationTransportPolicy::select(
+            CPURootedPublicationOperation::PackedRecordGather,capacity*record_bytes),
+            CPURootedPublicationTransport::MPIBandwidth);
+        const auto range_span=std::span(ranges.data(),ranges.size());
+        size_t rejected=99;
+        EXPECT_FALSE(CPURootedPublicationTransportReplayAccess::gatherSharedOriginal(
+            {},records.data(),0,rank==root?records.data():nullptr,capacity,width,root,rejected,range_span));
+        EXPECT_EQ(rejected,0u);
+        // An admitted MPI owner cannot masquerade as a retained SharedSpin owner.
+        rejected=99;
+        EXPECT_FALSE(CPURootedPublicationTransportReplayAccess::gatherSharedOriginal(
+            mpi,records.data(),0,rank==root?records.data():nullptr,capacity,width,root,rejected,range_span));
+        EXPECT_EQ(rejected,0u);EXPECT_FALSE(mpi->isAbortRequested());
+
+        struct Shape {const char* name;size_t root_records,remote_records;};
+        const std::array<Shape,10> shapes={{{"equal_1MiB",one_mib,one_mib},
+            {"equal_4MiB",four_mib,four_mib},{"equal_16MiB",sixteen_mib,sixteen_mib},
+            {"small_after_large",1,7},{"all_empty",0,0},{"mixed_root_small",3,four_mib},
+            {"remote_empty",four_mib,0},{"root_empty",0,four_mib},
+            {"equal_16MiB_replay",sixteen_mib,sixteen_mib},{"small_replay",1,7}}};
+        const std::string stage_name="perf_original_numa_variable_records";
+        /** Source-tagged exact FP32 bytes, with the native flat-slot coordinate last. */
+        const auto valueAt=[](int source,size_t record,size_t column) {
+            return column==width-1?float(record):float(size_t(source)*8000000+record*width+column);
+        };
+        if(rank==root)std::cout<<"original_numa_gather,shape,transport,root,root_numa,remote_numa,width,common_capacity,root_local_bytes,remote_bytes,total_live_root_bytes,root_p50_us,root_p95_us,slowest_p50_us,slowest_p95_us,remote_effective_gbps\n";
+        for(const bool shared_arm:{true,false}) {
+            // Small timing vectors only; payload and range roots remain the same
+            // PMA-owned node-certified allocations throughout both native arms.
+            std::array<std::vector<double>,10> samples;
+            for(auto& sample:samples)sample.resize(repetitions);
+            for(int iteration=-warmups;iteration<repetitions;++iteration) {
+                for(size_t index=0;index<shapes.size();++index) {
+                    const auto& shape=shapes[index];
+                    const size_t count=rank==root?shape.root_records:shape.remote_records;
+                    const size_t total=shape.root_records+shape.remote_records;
+                    const float poison=-991.0f-float(rank);
+                    std::fill_n(records.data(),records.size(),poison);
+                    for(size_t record=0;record<count;++record)
+                        for(size_t column=0;column<width;++column)
+                            records[record*width+column]=valueAt(rank,record,column);
+                    size_t gathered=99;
+                    // Outside the measured call: both original producers are ready.
+                    // No count exchange, payload, allocation or barrier is added to
+                    // either native gather. This is not model arrival-skew evidence.
+                    ASSERT_EQ(MPI_Barrier(MPI_COMM_WORLD),MPI_SUCCESS);
+                    const auto start=Clock::now();
+                    const bool success=shared_arm?
+                        CPURootedPublicationTransportReplayAccess::gatherSharedOriginal(shared,
+                            records.data(),count,rank==root?records.data():nullptr,capacity,width,root,gathered,range_span):
+                        mpi->gatherVariableFloatRecordsToRoot(records.data(),count,
+                            rank==root?records.data():nullptr,capacity,width,root,gathered,stage_name,range_span);
+                    const auto stop=Clock::now();
+                    ASSERT_TRUE(success);
+                    if(iteration>=0)samples[index][iteration]=
+                        std::chrono::duration<double,std::micro>(stop-start).count();
+                    /** Validate source counts/bytes and every unused element, including native count-word tail. */
+                    const auto outputValid=[&] {
+                        const size_t used=rank==root?total:count;
+                        if(gathered!=(rank==root?total:0))return false;
+                        if(rank==root) {
+                            if(!validRootedFloatRecordRanges(range_span,total) ||
+                               ranges[root].first_record!=0 || ranges[root].record_count!=shape.root_records ||
+                               ranges[1-root].first_record!=shape.root_records || ranges[1-root].record_count!=shape.remote_records)
+                                return false;
+                            for(const auto& range:range_span)
+                                for(size_t record=0;record<range.record_count;++record)
+                                    for(size_t column=0;column<width;++column)
+                                        if(std::bit_cast<uint32_t>(records[(range.first_record+record)*width+column])!=
+                                           std::bit_cast<uint32_t>(valueAt(range.participant,record,column)))return false;
+                        } else for(size_t record=0;record<count;++record)
+                            for(size_t column=0;column<width;++column)
+                                if(std::bit_cast<uint32_t>(records[record*width+column])!=
+                                   std::bit_cast<uint32_t>(valueAt(rank,record,column)))return false;
+                        return std::all_of(records.data()+used*width,records.data()+records.size(),
+                            [&](float value){return std::bit_cast<uint32_t>(value)==std::bit_cast<uint32_t>(poison);});
+                    };
+                    EXPECT_TRUE(outputValid())<<shape.name<<" shared="<<shared_arm;
+                    if(iteration==0 && index==0) {
+                        const size_t tail=(rank==root?total:count)*width;
+                        records[tail]=42;EXPECT_FALSE(outputValid());records[tail]=poison;
+                        const float saved=records[0];records[0]=-1;
+                        EXPECT_FALSE(outputValid());records[0]=saved;
+                        EXPECT_TRUE(outputValid());
+                    }
+                }
+            }
+            for(size_t index=0;index<shapes.size();++index) {
+                const auto slowest=summarizeSlowestRank(samples[index]);
+                if(rank!=root)continue;
+                auto& sample=samples[index];std::sort(sample.begin(),sample.end());
+                const auto& shape=shapes[index];
+                const auto root_p50=percentile(sample,50),root_p95=percentile(sample,95);
+                const size_t remote_bytes=shape.remote_records*record_bytes;
+                std::cout<<"original_numa_gather,"<<shape.name<<','<<(shared_arm?"shared_spin":"production_mpi_bandwidth")
+                    <<','<<root<<','<<nodes[root]<<','<<nodes[1-root]<<','<<width<<','<<capacity
+                    <<','<<shape.root_records*record_bytes<<','<<remote_bytes<<','<<(shape.root_records+shape.remote_records)*record_bytes
+                    <<','<<std::fixed<<std::setprecision(3)<<root_p50<<','<<root_p95<<','<<slowest.p50_us<<','<<slowest.p95_us
+                    <<','<<(remote_bytes?double(remote_bytes)/slowest.p50_us/1000.0:0.0)<<'\n';
+            }
+        }
+        // Retained original borrowers must prevent retirement BEFORE any
+        // native unmap/acknowledgement; the same owner remains usable afterwards.
+        {
+            auto borrower=std::shared_ptr<IGlobalTPContext>(shared);
+            EXPECT_THROW(shared->retireOriginalCPUExpertDomain(),std::logic_error);
+            EXPECT_TRUE(shared->authenticatesOriginalCPUExpertBorrow(borrower));
+        }
+        ASSERT_TRUE(shared->retireOriginalCPUExpertDomain());
+        EXPECT_TRUE(shared->retireOriginalCPUExpertDomain());
+        ASSERT_TRUE(mpi->retireOriginalCPUExpertDomain());
+        EXPECT_EQ(memory->reservedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativeCPUCollectiveDomain),0u);
+        EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ActivationTransportStaging,
+                                      PhysicalMemoryMaterializationKind::NewAllocation),0u);
+        rejected=99;
+        EXPECT_FALSE(CPURootedPublicationTransportReplayAccess::gatherSharedOriginal(shared,
+            records.data(),0,rank==root?records.data():nullptr,capacity,width,root,rejected,range_span));
+        EXPECT_EQ(rejected,0u);
+        EXPECT_TRUE(std::all_of(range_span.begin(),range_span.end(),[](const auto& range){return range.participant==-1 && range.first_record==0 && range.record_count==0;}));
+        // No backend pointer escapes. Original session owns the process pool
+        // until mpi_gtest_main performs its unchanged production finalization.
+        shared.reset();mpi.reset();
+    }
 
     /**
      * @test SweepNativeSharedMemoryAndMPIByPayloadSize

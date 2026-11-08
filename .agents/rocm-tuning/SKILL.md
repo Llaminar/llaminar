@@ -197,6 +197,17 @@ actual output/schema. Database/report generation after device shutdown is
 profiler overhead, not model loading or inference. Persistent waits and summed
 parallel-agent durations are not a critical-path measurement.
 
+For launch-under-profiler diagnostics, set
+`HSA_TOOLS_ROCPROFILER_V1_TOOLS=0` before the profiled application starts. The
+selected rocprofiler SDK installs this same legacy-tool exclusion lazily when
+HSA registers its API table. Preconfiguring it keeps the original runtime
+environment immutable across metadata discovery; modern rocprofv3 tracing
+remains enabled. Do not weaken the runtime environment guard or refresh its
+original identity to accommodate a late profiler mutation. An existing
+`v2_perf_native_context_source_probe --device rocm:N --key-only` invocation
+under the same profiler checks this boundary without creating a context worker
+or loading model weights.
+
 Captured auxiliary-stream kernels can be attributed to the parent replay's
 stream ID in the dispatch trace. A shared `stream_id` therefore does not prove
 serialization. Establish overlap from same-agent start/end intervals and the

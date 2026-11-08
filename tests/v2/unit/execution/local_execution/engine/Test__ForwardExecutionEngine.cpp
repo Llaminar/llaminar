@@ -8,6 +8,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <type_traits>
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -4447,4 +4448,134 @@ TEST_F(Test__ForwardExecutionEngine, FailedCapturePublicationRetiresNativeBorrow
         EXPECT_EQ(retired,1);EXPECT_GT(nativeLive,0);
         engine.invalidateAll();EXPECT_EQ(nativeLive,0);EXPECT_EQ(retired,2);
     }
+}
+
+/**
+ * @test Both admitted prefill programs survive alternating request reset at one bucket.
+ * @details Original code genuinely rejects proved Prefill omission. The closed
+ * roster expands the existing bucket retention quantity without growing another
+ * cache or recapturing either owner during reuse.
+ */
+TEST_F(Test__ForwardExecutionEngine, Execute_ProvenNoRankingPrefillRetainsBothProgramOwners)
+{
+    ScopedDebugEnv env({{"LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS", "1"}});
+    ForwardExecutionEngine::Config config;
+    config.cache_config.enabled=true;
+    const auto bindRoster=[]<class Config>(Config &value) {
+        if constexpr(requires { value.sparse_query_program_count; }) value.sparse_query_program_count=2u;
+    };
+    bindRoster(config);
+    ForwardExecutionEngine engine(std::move(config),executor_);
+    MockForwardExecutionHost host(&mock_ctx_);host.graph_stage_count=1;
+    std::array<int,3> tokens{31,32,33},positions{0,1,2};
+    auto full=makeTestInput(3,1,DeviceId::cpu(),tokens.data(),positions.data());
+    full.execution_phase=ForwardExecutionPhase::Prefill;
+    auto omitted=full;omitted.sparse_query_execution_program=SparseQueryExecutionProgram::ProvenNoRanking;
+    const auto admit=[]<class Input>(Input &input) {
+        if constexpr(requires { input.sparse_query_prefill_proof; }) {
+            using Proof=typename std::remove_cvref_t<decltype(input.sparse_query_prefill_proof)>::value_type;
+            input.sparse_query_prefill_proof=Proof::admittedRange(0,3);
+        }
+    };
+    admit(omitted);
+    ForwardOutput output{};
+    for(int request=0;request<6;++request) {
+        ASSERT_TRUE(engine.execute(request%2?omitted:full,output,host));
+        engine.resetCapturedReplayState();
+    }
+    EXPECT_EQ(host.build_forward_graph_calls,2);
+    const auto snapshots=engine.prefillGraphCacheSnapshots();
+    ASSERT_EQ(snapshots.size(),2u);
+    for(const auto &snapshot:snapshots) EXPECT_EQ(snapshot.eviction_count,0u);
+}
+
+/** @test Arbitrary enum, foreign range and cold-only proofs reject before graph construction. */
+TEST_F(Test__ForwardExecutionEngine, Execute_ProvenNoRankingPrefillRejectsMissingForeignAndColdProof)
+{
+    ForwardExecutionEngine::Config config;config.cache_config.enabled=true;
+    const auto bind=[]<class Config>(Config &value) {
+        if constexpr(requires { value.sparse_query_program_count; })value.sparse_query_program_count=2u;
+    };bind(config);
+    ForwardExecutionEngine engine(std::move(config),executor_);MockForwardExecutionHost host(&mock_ctx_);
+    std::array<int,3> tokens{31,32,33},positions{0,1,2};
+    auto input=makeTestInput(3,1,DeviceId::cpu(),tokens.data(),positions.data());
+    input.execution_phase=ForwardExecutionPhase::Prefill;
+    input.sparse_query_execution_program=SparseQueryExecutionProgram::ProvenNoRanking;
+    ForwardOutput output{};
+    EXPECT_FALSE(engine.execute(input,output,host));
+    const auto verify=[&]<class Input>(Input candidate) {
+        if constexpr(requires { candidate.sparse_query_prefill_proof; }) {
+            using Proof=typename std::remove_cvref_t<decltype(candidate.sparse_query_prefill_proof)>::value_type;
+            candidate.sparse_query_prefill_proof=Proof::admittedRange(1,3);
+            EXPECT_FALSE(engine.execute(candidate,output,host));
+            candidate.sparse_query_prefill_proof=Proof::materialization(SparseQueryExecutionProgram::ProvenNoRanking);
+            EXPECT_FALSE(engine.execute(candidate,output,host));
+        }
+    };
+    verify(input);EXPECT_EQ(host.build_forward_graph_calls,0);
+}
+
+/**
+ * @test Initial restored-prefix materialization retains both distinct programs thereafter.
+ * @details Two original identity classes (ordinary and rehydration), each with
+ * two admitted programs, retain four owners. This proves reuse after first
+ * materialization; it does not claim restored variants are cold-materialized.
+ */
+TEST_F(Test__ForwardExecutionEngine, Execute_ProvenNoRankingPrefillRestoredProgramsReuseAfterInitialMaterialization)
+{
+    ScopedDebugEnv env({{"LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS", "2"}});
+    ForwardExecutionEngine::Config config;config.cache_config.enabled=true;
+    const auto bind=[]<class Config>(Config &value) {
+        if constexpr(requires { value.sparse_query_program_count; })value.sparse_query_program_count=2u;
+    };bind(config);
+    ForwardExecutionEngine engine(std::move(config),executor_);
+    MockForwardExecutionHost host(&mock_ctx_);host.graph_stage_count=1;
+    std::array<int,3> tokens{31,32,33},positions{0,1,2};
+    auto full=makeTestInput(3,1,DeviceId::cpu(),tokens.data(),positions.data());
+    full.execution_phase=ForwardExecutionPhase::Prefill;
+    auto omitted=full;omitted.sparse_query_execution_program=SparseQueryExecutionProgram::ProvenNoRanking;
+    const auto admit=[]<class Input>(Input &input) {
+        if constexpr(requires { input.sparse_query_prefill_proof; }) {
+            using Proof=typename std::remove_cvref_t<decltype(input.sparse_query_prefill_proof)>::value_type;
+            input.sparse_query_prefill_proof=Proof::admittedRange(0,3);
+        }
+    };admit(omitted);
+    auto restoredFull=full;restoredFull.rehydrate_prefix_runtime_on_device=true;
+    auto restoredOmitted=omitted;restoredOmitted.rehydrate_prefix_runtime_on_device=true;
+    const std::array inputs{full,omitted,restoredFull,restoredOmitted};
+    ForwardOutput output{};
+    for(const auto &input:inputs)ASSERT_TRUE(engine.execute(input,output,host));
+    ASSERT_EQ(host.build_forward_graph_calls,4);
+    for(int request=0;request<3;++request) {
+        engine.resetCapturedReplayState();
+        for(const auto &input:inputs)ASSERT_TRUE(engine.execute(input,output,host));
+    }
+    EXPECT_EQ(host.build_forward_graph_calls,4);
+    const auto snapshots=engine.prefillGraphCacheSnapshots();ASSERT_EQ(snapshots.size(),4u);
+    for(const auto &snapshot:snapshots)EXPECT_EQ(snapshot.eviction_count,0u);
+}
+
+/** @test A later chunk outside original admitted I/O rejects before any stage mutates state. */
+TEST_F(Test__ForwardExecutionEngine, Execute_ProvenNoRankingPrefillFamilyRejectsLaterForeignChunkBeforeSubmission)
+{
+    auto engine=makeEngine(false);MockForwardExecutionHost host(&mock_ctx_);host.graph_stage_count=1;
+    const std::array<int,8> tokens{10,11,12,13,14,15,16,17};
+    auto input=makeTestInput(8,1,DeviceId::cpu(),tokens.data(),nullptr);
+    input.execution_phase=ForwardExecutionPhase::Prefill;
+    input.position_offset=input.token_offset=2048;
+    const auto admit=[]<class Input>(Input &value) {
+        if constexpr(requires { value.sparse_query_prefill_proof; }) {
+            using Proof=typename std::remove_cvref_t<decltype(value.sparse_query_prefill_proof)>::value_type;
+            value.sparse_query_prefill_proof=Proof::admittedRange(2048,8);
+        }
+    };admit(input);
+    PrefillChunkSchedulerPolicy policy;policy.bucket_sizes={4};policy.fixed_chunk_real_tokens=4;
+    policy.real_token_start=2048;policy.real_token_count=8;
+    auto schedule=ForwardExecutionEngine::preparePrefillChunkRuntimeSchedule(input,policy,0,false);
+    ASSERT_TRUE(schedule)<<schedule.error;ASSERT_EQ(schedule.chunks.size(),2u);
+    schedule.chunks[1].chunk.token_offset=9000;
+    ForwardOutput output{};
+    EXPECT_FALSE(engine.runPrefillChunkSchedule(input,schedule,output,host));
+    EXPECT_EQ(host.build_forward_graph_calls,0);
+    EXPECT_EQ(host.prefill_chunk_submission_begin_calls,0);
 }

@@ -47,7 +47,7 @@ public:
     };
     /**
      * @brief Pool/norm/rotate indexer keys and publish exact causal token indices.
-     * @details ProvenNoRanking is a decode-admission program: query/queryNorm,
+     * @details ProvenNoRanking requires original Decode or Prefill proof: query/queryNorm,
      * preparedQuery and scores are not registered, waited on, published or
      * exposed as mathematical snapshots. Their containing arena may remain
      * admitted for mutually exclusive full-program graphs; no bytes are mirrored.

@@ -4480,8 +4480,8 @@ TEST(Test__MemoryPlanner, SparseQueryProfileProjectionExcludesPredictorOnlyLayer
     EXPECT_THROW(profile.sparseQueryProgramCount(), std::invalid_argument);
 }
 
-/** @test Two decode programs never create a second RankingPossible-only prefill family. */
-TEST(Test__MemoryPlanner, SparseQueryProgramBOMKeepsPrefillSingleAndPricesHostedCudaTail)
+/** @test Two main-query programs price both retained prefill families and the actual hosted tail. */
+TEST(Test__MemoryPlanner, SparseQueryProgramBOMPricesBothPrefillProgramsAndHostedCudaTail)
 {
     const auto profile = createTestProfile();
     DevicePlanConfig config;
@@ -4506,13 +4506,13 @@ TEST(Test__MemoryPlanner, SparseQueryProgramBOMKeepsPrefillSingleAndPricesHosted
         const auto &serving = config.captured_serving_graphs;
         const auto ordinary = OrdinaryGenerationGraphPlan::additionalExecutableCount(config.device, true, DeviceGenerationExecutionPolicy::HostScheduledCapturedTransactions, role, 2u);
         const CapturedGraphExecutableInventory expected{
-            .model_graph_identity_count = 2u + serving.fixed_executable_count,
+            .model_graph_identity_count = 4u + serving.fixed_executable_count,
             .model_graph_topology_variant_count = 1u,
             .auxiliary_executable_count = serving.mtp_graph_owners.generalAuxiliaryExecutableSlotCount() + ordinary,
             .bounded_helper_executable_count = serving.mtp_graph_owners.boundedHelperExecutableSlotCount()};
         EXPECT_EQ(plan.devices.front().captured_graph_bytes(), estimateCapturedGraphExecutableBytes(config.device, expected));
         auto wrong_prefill = expected;
-        wrong_prefill.model_graph_identity_count += 2u; // Blanket program multiplication invents two prefills.
+        wrong_prefill.model_graph_identity_count -= 2u; // Original count omitted the second retained prefill program.
         EXPECT_NE(plan.devices.front().captured_graph_bytes(), estimateCapturedGraphExecutableBytes(config.device, wrong_prefill));
     }
 }

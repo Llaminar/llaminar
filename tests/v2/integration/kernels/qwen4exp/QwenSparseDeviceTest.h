@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <array>
 #include <memory>
+#include <numeric>
 #include <cmath>
 #include <cstdlib>
 #include <exception>
@@ -108,20 +109,30 @@ struct Fixture
     QwenSparseIndexer indexer;
     QwenSparseAttention attention;
     FixtureCopyRetirement copyRetirement{&stream};
-    /** @brief Bind one production-shaped FP32/FP16/BF16 candidate before capture. */
-    Fixture(int row_count, int prefix, int token_capacity, QwenSparseScalar representation)
+    /**
+     * @brief Bind one production-shaped candidate before capture.
+     * @param row_count Captured row capacity, independent of live replay rows.
+     * @param prefix Initial accepted logical frontier.
+     * @param token_capacity Retained native bank capacity, not proof of visibility.
+     * @param representation Existing FP32/FP16/BF16 indexer and native KV format.
+     * @param core_heads Core query heads physically allocated by this fixture;
+     *        the four-head indexer geometry remains unchanged. Existing tests
+     *        retain24heads; large prefill omission probes use one real head.
+     */
+    Fixture(int row_count, int prefix, int token_capacity, QwenSparseScalar representation,
+            int core_heads = 24)
         : rows(row_count), capacity(token_capacity), positions(capacity + 17), blocks((capacity + 3) / 4),
           replay{prefix, rows, 17}, host_query(values(std::size_t(rows) * 512, 3)),
           host_raw(values(std::size_t(rows) * 128, 5)), host_partial(values(512, 7)),
           host_pools(values(std::size_t(blocks) * 128, 11)), norm(128, 1.0f),
           cosine(std::size_t(positions) * 32), sine(cosine.size()),
-          host_core_query(values(std::size_t(rows) * 6144, 13)), host_gate(values(host_core_query.size(), 17)),
+          host_core_query(values(std::size_t(rows) * core_heads * 256, 13)), host_gate(values(host_core_query.size(), 17)),
           host_key(values(std::size_t(capacity) * 512, 19)), host_value(values(host_key.size(), 23)),
           key16(host_key.size()), value16(host_value.size()), state(1), query(host_query.size()), raw(host_raw.size()),
           partial(512), pools(host_pools.size()), query_norm(128), key_norm(128), cos(cosine.size()), sin(sine.size()),
           prepared(query.size), scores(std::size_t(rows) * blocks), core_query(host_core_query.size()), gate(host_gate.size()),
           output(host_core_query.size()), selected(std::size_t(rows) * QwenSparseSelected), count(rows), accepted(1),
-          observations(std::size_t(rows) * 24), partials(std::size_t(rows) * 24 * QwenSparsePartitions),
+          observations(std::size_t(rows) * core_heads), partials(std::size_t(rows) * core_heads * QwenSparsePartitions),
           keys(host_key.size() * (representation == QwenSparseScalar::FP32 ? 4 : 2)), vals(keys.size)
     {
         check(QSA_RT(StreamCreateWithFlags)(&stream, QSA_RT(StreamNonBlocking)));
@@ -156,7 +167,8 @@ struct Fixture
                    .values = {.data = vals.data, .token_stride_bytes = scalar * 512, .head_stride_bytes = scalar * 256,
                            .codec = representation == QwenSparseScalar::FP32 ? TensorType::FP32 : representation == QwenSparseScalar::FP16 ? TensorType::FP16 : TensorType::BF16}},
             .selected = selected.data, .selected_count = count.data, .gate = gate.data, .output = output.data,
-            .gpu_partials = partials.data, .observations = observations.data, .row_capacity = rows, .token_capacity = capacity};
+            .gpu_partials = partials.data, .observations = observations.data, .row_capacity = rows, .token_capacity = capacity,
+            .query_heads = core_heads};
         check(QSA_RT(StreamSynchronize)(stream));
     }
     /** @brief Retire graph objects after all terminal collection has completed. */
@@ -1366,7 +1378,10 @@ void inspectNoRankingIndexer(Fixture &f)
         QSA_RT(KernelNodeParams) native{};check(QSA_RT(GraphKernelNodeGetParams)(current,&native));
         ASSERT_NE(native.func,nullptr);ASSERT_NE(native.kernelParams,nullptr);
         ASSERT_EQ(native.extra,nullptr);ASSERT_EQ(native.sharedMemBytes,0u);
-        EXPECT_EQ(native.gridDim.x,role==0 ? unsigned((f.rows+6)/4) : unsigned(f.rows));
+        const bool installedPrefill = f.indexer.pool_selection == QwenSparsePoolSelection::Installed &&
+            f.rows > llaminar2::attention::kMaxGroupedVerifierAttentionRows;
+        EXPECT_EQ(native.gridDim.x,role==0 ? unsigned((f.rows+6)/4) :
+            installedPrefill ? unsigned((f.rows+7)/8) : unsigned(f.rows));
         EXPECT_EQ(native.gridDim.y,1u);EXPECT_EQ(native.gridDim.z,1u);
         EXPECT_EQ(native.blockDim.x,role==0 ? 128u : 256u);
         EXPECT_EQ(native.blockDim.y,1u);EXPECT_EQ(native.blockDim.z,1u);
@@ -1400,7 +1415,9 @@ void inspectNoRankingIndexer(Fixture &f)
         ASSERT_EQ(status,0);
         const auto policy=f.indexer.pool_selection;
         const std::string expected=role==0 ? space+"preparePools(llaminar2::qwen4exp::QwenSparseIndexer)" :
-            policy==QwenSparsePoolSelection::Installed ? space+"selectPoolsWide(llaminar2::qwen4exp::QwenSparseIndexer)" :
+            policy==QwenSparsePoolSelection::Installed ? space+
+                (installedPrefill ? "selectPools(llaminar2::qwen4exp::QwenSparseIndexer)" :
+                                    "selectPoolsWide(llaminar2::qwen4exp::QwenSparseIndexer)") :
             "void "+space+"selectPoolsBounded<"+
                 std::string(policy==QwenSparsePoolSelection::Bounded256_512 ? "256, 512" :
                             policy==QwenSparsePoolSelection::Bounded512_512 ? "512, 512" : "1024, 1024")+
@@ -1483,6 +1500,130 @@ TEST(QSA_SUITE, CapturedProvenNoRankingOmitsQueryWorkAndPreservesRequiredBytes)
                 EXPECT_EQ(full.executable,fullExec);EXPECT_EQ(omitted.executable,omittedExec);
                 ASSERT_FALSE(::testing::Test::HasFailure());
             }
+        }
+    }
+}
+/**
+ * @test Captured prefill omission retains native required bytes for full,
+ * partial, empty and repeated requests up to the exact no-ranking boundary.
+ * @details This exercises the already supported native entrypoint, not request
+ * admission: typed Prefill admission/builder tests own the original-red control.
+ * Capacity4096 is deliberately larger than every eligible visible prefix.
+ */
+TEST(QSA_SUITE, CapturedProvenNoRankingPrefillOmitsQueryWorkAndPreservesRequiredBytes)
+{
+    constexpr int tokens=4096;
+    constexpr float querySentinel=-333.5f, normSentinel=-444.75f,
+        preparedSentinel=-777.25f, scoreSentinel=-999.5f, outputSentinel=-3125.5f;
+    constexpr std::int32_t selectionSentinel=-91;
+    for (const int rows : {64,448,512,1024,2048})
+    for (const auto representation : {QwenSparseScalar::FP32,QwenSparseScalar::FP16,QwenSparseScalar::BF16})
+    {
+        SCOPED_TRACE(::testing::Message()<<"prefill M="<<rows<<" repr="<<int(representation));
+        // One real attention head avoids allocating/copying23 unused head
+        // planes. The indexer remains its original four128-coordinate heads.
+        Fixture full(rows,3,tokens,representation,1),omitted(rows,3,tokens,representation,1);
+        ASSERT_EQ(qwenSparsePreparationGrid(rows).program,QwenSparsePreparationProgram::SeparatePrefill);
+        omitted.indexer.query_demand=QwenSparseQueryDemand::ProvenNoRanking;
+        omitted.indexer.query=nullptr;omitted.indexer.query_norm=nullptr;
+        omitted.indexer.prepared_query=nullptr;omitted.indexer.scores=nullptr;
+        const std::vector<float> queryPoison(omitted.query.size,querySentinel),
+            normPoison(omitted.query_norm.size,normSentinel),
+            preparedPoison(omitted.prepared.size,preparedSentinel),
+            scorePoison(omitted.scores.size,scoreSentinel),outputPoison(omitted.output.size,outputSentinel);
+        const std::vector<std::int32_t> selectedPoison(omitted.selected.size,selectionSentinel),countPoison(rows,selectionSentinel);
+        BoundedPipelineRetirement fullRetirement{full.stream},omittedRetirement{omitted.stream};
+        full.capture();omitted.capture();inspectNoRankingIndexer(omitted);
+        const auto fullExec=full.executable,omittedExec=omitted.executable;
+        /** Restore only request data; all graph owners and bindings are retained. */
+        const auto reset = [&](Fixture &f,const QwenSparseReplay replay)
+        {
+            f.replay=replay;f.state.upload(&f.replay,f.stream);
+            f.pools.upload(f.host_pools.data(),f.stream);f.partial.upload(f.host_partial.data(),f.stream);
+            f.selected.upload(selectedPoison.data(),f.stream);f.count.upload(countPoison.data(),f.stream);
+            f.output.upload(outputPoison.data(),f.stream);
+        };
+        /** Compare exact native bytes without formatting multi-megabyte tensors on failure. */
+        const auto equalBytes = [](const auto &actual,const auto &expected)
+        {
+            EXPECT_EQ(actual.size(),expected.size());
+            if(actual.size()==expected.size())
+                EXPECT_EQ(std::memcmp(actual.data(),expected.data(),actual.size()*sizeof(actual[0])),0);
+        };
+        int replayIndex=0;
+        for (const auto replay : {QwenSparseReplay{3,rows,17},QwenSparseReplay{2051-rows,rows,17},
+                QwenSparseReplay{2051,0,17},QwenSparseReplay{2049,2,17},QwenSparseReplay{3,rows,17}})
+        {
+            if(replayIndex++==4) {
+                // Run the long complete program before the final short replay.
+                // Its now-dirty scores must not influence short selection.
+            //2052 really needs ranking. Execute only the valid complete program;
+            // submitting the omitted graph would correctly device-trap and poison
+            // this shared fixture context instead of testing a successful control.
+            reset(full,QwenSparseReplay{2052-rows,rows,17});
+            full.prepared.upload(preparedPoison.data(),full.stream);
+            full.scores.upload(scorePoison.data(),full.stream);
+            full.launch();
+            const auto rankedCount=full.count.download(full.stream);
+            const auto rankedPrepared=full.prepared.download(full.stream),rankedScores=full.scores.download(full.stream);
+            EXPECT_EQ(rankedCount.back(),2048);
+            EXPECT_NE(std::memcmp(rankedPrepared.data()+std::size_t(rows-1)*512,
+                preparedPoison.data()+std::size_t(rows-1)*512,512*sizeof(float)),0);
+            EXPECT_NE(std::memcmp(rankedScores.data()+std::size_t(rows-1)*full.blocks,
+                scorePoison.data()+std::size_t(rows-1)*full.blocks,513*sizeof(float)),0);
+            EXPECT_EQ(full.executable,fullExec);EXPECT_EQ(omitted.executable,omittedExec);
+            }
+            SCOPED_TRACE(::testing::Message()<<"prefix="<<replay.prefix_tokens<<" live="<<replay.live_rows);
+            ASSERT_LE(replay.prefix_tokens+replay.live_rows,QwenSparseFirstRankingLogicalRow);
+            reset(full,replay);reset(omitted,replay);
+            omitted.query.upload(queryPoison.data(),omitted.stream);
+            omitted.query_norm.upload(normPoison.data(),omitted.stream);
+            omitted.prepared.upload(preparedPoison.data(),omitted.stream);
+            omitted.scores.upload(scorePoison.data(),omitted.stream);
+            full.launch();omitted.launch();
+            const auto fullSelected=full.selected.download(full.stream),omittedSelected=omitted.selected.download(omitted.stream);
+            const auto fullCount=full.count.download(full.stream),omittedCount=omitted.count.download(omitted.stream);
+            equalBytes(fullSelected,omittedSelected);equalBytes(fullCount,omittedCount);
+            auto expectedSelected=selectedPoison;
+            std::vector<std::int32_t> expectedCount(rows,0);
+            for(int row=0;row<replay.live_rows;++row) {
+                const int visible=replay.prefix_tokens+row+1;
+                expectedCount[row]=visible;
+                auto begin=expectedSelected.begin()+std::size_t(row)*QwenSparseSelected;
+                std::iota(begin,begin+visible,0);
+            }
+            equalBytes(omittedSelected,expectedSelected);equalBytes(omittedCount,expectedCount);
+            const auto fullPools=full.pools.download(full.stream),omittedPools=omitted.pools.download(omitted.stream);
+            equalBytes(fullPools,omittedPools);
+            // Only newly completed pools may overwrite the accepted history.
+            const int first=replay.prefix_tokens/4,last=(replay.prefix_tokens+replay.live_rows)/4;
+            for(int block=0;block<omitted.blocks;++block)
+                if(block<first || block>=last)
+                    EXPECT_EQ(std::memcmp(omittedPools.data()+std::size_t(block)*128,
+                        omitted.host_pools.data()+std::size_t(block)*128,128*sizeof(float)),0);
+            const auto fullOutput=full.output.download(full.stream),omittedOutput=omitted.output.download(omitted.stream);
+            equalBytes(fullOutput,omittedOutput);
+            EXPECT_TRUE(std::all_of(omittedOutput.begin()+std::size_t(replay.live_rows)*256,omittedOutput.end(),
+                [=](float value){return value==outputSentinel;}));
+            equalBytes(omitted.query.download(omitted.stream),queryPoison);
+            equalBytes(omitted.query_norm.download(omitted.stream),normPoison);
+            equalBytes(omitted.prepared.download(omitted.stream),preparedPoison);
+            equalBytes(omitted.scores.download(omitted.stream),scorePoison);
+            equalBytes(omitted.raw.download(omitted.stream),omitted.host_raw);
+            equalBytes(omitted.partial.download(omitted.stream),omitted.host_partial);
+            // Native KV and original replay metadata remain read-only even
+            // when only two of2048 admitted query rows are currently live.
+            const auto keyBytes=omitted.keys.download(omitted.stream),valueBytes=omitted.vals.download(omitted.stream);
+            const void *expectedKeys=representation==QwenSparseScalar::FP32 ?
+                static_cast<const void *>(omitted.host_key.data()) : omitted.key16.data();
+            const void *expectedValues=representation==QwenSparseScalar::FP32 ?
+                static_cast<const void *>(omitted.host_value.data()) : omitted.value16.data();
+            EXPECT_EQ(std::memcmp(keyBytes.data(),expectedKeys,keyBytes.size()),0);
+            EXPECT_EQ(std::memcmp(valueBytes.data(),expectedValues,valueBytes.size()),0);
+            const auto original=omitted.state.download(omitted.stream);
+            ASSERT_EQ(original.size(),1u);EXPECT_EQ(std::memcmp(original.data(),&replay,sizeof(replay)),0);
+            EXPECT_EQ(full.executable,fullExec);EXPECT_EQ(omitted.executable,omittedExec);
+            ASSERT_FALSE(::testing::Test::HasFailure());
         }
     }
 }

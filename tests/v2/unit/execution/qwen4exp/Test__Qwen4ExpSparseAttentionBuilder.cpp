@@ -9,6 +9,8 @@
  */
 #include "../../../utils/CPUPreparedStoreTestAdmission.h"
 #include <gtest/gtest.h>
+#include <type_traits>
+#include <limits>
 #include "execution/compute_stages/stages/qwen4exp/Qwen4ExpSparseAttentionBuilder.h"
 #include "execution/compute_stages/stages/GEMMStage.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
@@ -609,8 +611,8 @@ TEST(Qwen4ExpSparseAttentionBuilder, QueryDemandRejectsUnknownPhaseBeforeGraphMu
     EXPECT_EQ(graph.size(),1u);
 }
 
-/** @test An admission-selected short program omits the node and all of its edges. */
-TEST(Qwen4ExpSparseAttentionBuilder, ProvenNoRankingOmitsProjectionOnlyForExplicitDecode)
+/** @test Without a prefill proof, only explicit Decode may omit the query node. */
+TEST(Qwen4ExpSparseAttentionBuilder, ProvenNoRankingWithoutPrefillProofRequiresExplicitDecode)
 {
     using Phase=ForwardExecutionPhase;
     using Program=SparseQueryExecutionProgram;
@@ -738,4 +740,95 @@ TEST(Qwen4ExpSparseAttentionBuilder, KVAuthorityDiagnosticNamesActualAndDeclared
             EXPECT_NE(message.find(field),std::string::npos) << message;
     }
     EXPECT_EQ(graph.size(),1u);
+}
+
+/**
+ * @test Original admitted prefill chunks omit the physical query projection only on proof.
+ * @details The dependent fixture projection keeps this regression compilable
+ * against the original policy interface: that source receives the same explicit
+ * Prefill/program and genuinely rejects it in the production builder.
+ */
+TEST(Qwen4ExpSparseAttentionBuilder, ProvenNoRankingPrefillAdmissionOmitsQueryProjection)
+{
+    llaminar::v2::ThreadCountGuard threads(1);
+    Fixture f;
+    for (const bool requestsEntry : {false,true}) {
+        ComputeGraph graph; f.seed(graph);
+        auto policy=f.policy();
+        policy.executionPhase=ForwardExecutionPhase::Prefill;
+        policy.queryExecutionProgram=SparseQueryExecutionProgram::ProvenNoRanking;
+        const auto bind=[]<class Policy>(Policy &p) {
+            if constexpr (requires { p.prefillQueryProof; }) {
+                using Proof=typename std::remove_cvref_t<decltype(p.prefillQueryProof)>::value_type;
+                p.prefillQueryProof=Proof::admittedRange(0,Fixture::rows);
+            }
+        };
+        bind(policy);
+        if(requestsEntry) {
+            ASSERT_NO_THROW((void)Builder::appendRequests(graph,f.consumer(),policy,f.weights(),
+                DeviceRequestRowRanges::fullyActive(Fixture::rows),{{0,f.buffers()}}));
+        } else ASSERT_NO_THROW((void)Builder::append(graph,f.consumer(),policy,f.weights(),f.buffers()));
+        EXPECT_EQ(graph.getNode("qsa.qsa_query_proj"),nullptr);
+        ASSERT_NE(graph.getNode("qsa.qsa_key_proj"),nullptr);
+        const auto *node=graph.getNode("qsa.qsa_indexer"); ASSERT_NE(node,nullptr);
+        const auto *stage=dynamic_cast<const QwenSparseAttentionStage *>(node->stage.get()); ASSERT_NE(stage,nullptr);
+        const auto &indexer=std::get<QwenSparseAttentionStage::Indexer>(stage->getParams().operation);
+        EXPECT_EQ(indexer.queryDemand,qwen4exp::QwenSparseQueryDemand::ProvenNoRanking);
+        EXPECT_EQ(std::find(node->dependencies.begin(),node->dependencies.end(),"qsa.qsa_query_proj"),node->dependencies.end());
+        EXPECT_NE(std::find(node->dependencies.begin(),node->dependencies.end(),"qsa.qsa_key_proj"),node->dependencies.end());
+        EXPECT_NE(graph.getNode("qsa.attention"),nullptr);
+        EXPECT_NE(graph.getNode("qsa.qsa_commit_partial"),nullptr);
+    }
+}
+
+/** @test Original request ranges project early/late chunks and reject foreign/overflowing proof. */
+TEST(Qwen4ExpSparseAttentionBuilder, ProvenNoRankingPrefillProofProjectsOnlyAdmittedChunks)
+{
+    const auto verify=[]<class Policy>(Policy &policy) {
+        if constexpr (requires { policy.prefillQueryProof; }) {
+            using Proof=typename std::remove_cvref_t<decltype(policy.prefillQueryProof)>::value_type;
+            constexpr int bound=qwen4exp::QwenSparseFirstRankingLogicalRow;
+            const auto request=Proof::admittedRange(0,4096);
+            EXPECT_EQ(request.chunk(0,448).program(bound),SparseQueryExecutionProgram::ProvenNoRanking);
+            EXPECT_EQ(request.chunk(448,64).program(bound),SparseQueryExecutionProgram::ProvenNoRanking);
+            EXPECT_EQ(request.chunk(1792,259).program(bound),SparseQueryExecutionProgram::ProvenNoRanking);
+            EXPECT_EQ(request.chunk(1792,260).program(bound),SparseQueryExecutionProgram::RankingPossible);
+            EXPECT_EQ(request.chunk(2048,512).program(bound),SparseQueryExecutionProgram::RankingPossible);
+            EXPECT_TRUE(request.chunk(448,64).namesRange(448,64));
+            EXPECT_FALSE(request.chunk(448,64).namesRange(0,64));
+            EXPECT_EQ(Proof::admittedRange(2047,4).program(bound),SparseQueryExecutionProgram::ProvenNoRanking);
+            EXPECT_EQ(Proof::admittedRange(2048,4).program(bound),SparseQueryExecutionProgram::RankingPossible);
+            EXPECT_THROW((void)request.chunk(-1,4),std::invalid_argument);
+            EXPECT_THROW((void)request.chunk(4095,2),std::invalid_argument);
+            EXPECT_THROW((void)Proof::admittedRange(0,0),std::invalid_argument);
+            EXPECT_THROW((void)Proof::admittedRange(std::numeric_limits<int>::max(),1),std::invalid_argument);
+        } else FAIL()<<"Original policy lacks typed prefill admission proof";
+    };
+    Fixture f; auto policy=f.policy(); verify(policy);
+}
+
+/** @test Cold program declarations cannot authorize execution or forge a mismatched selected program. */
+TEST(Qwen4ExpSparseAttentionBuilder, ProvenNoRankingPrefillRejectsColdOrMismatchedExecutionProof)
+{
+    llaminar::v2::ThreadCountGuard threads(1);
+    const auto verify=[]<class Policy>(Fixture &f, Policy policy) {
+        if constexpr (requires { policy.prefillQueryProof; policy.submissionIntent; }) {
+            using Proof=typename std::remove_cvref_t<decltype(policy.prefillQueryProof)>::value_type;
+            policy.executionPhase=ForwardExecutionPhase::Prefill;
+            policy.queryExecutionProgram=SparseQueryExecutionProgram::ProvenNoRanking;
+            for (bool cold : {false,true}) {
+                ComputeGraph graph;f.seed(graph);
+                policy.prefillQueryProof=cold ? Proof::materialization(SparseQueryExecutionProgram::ProvenNoRanking)
+                    : Proof::admittedRange(2051,Fixture::rows);
+                EXPECT_THROW((void)Builder::append(graph,f.consumer(),policy,f.weights(),f.buffers()),std::invalid_argument);
+                EXPECT_EQ(graph.size(),1u);
+            }
+            ComputeGraph graph;f.seed(graph);
+            policy.prefillQueryProof=Proof::materialization(SparseQueryExecutionProgram::ProvenNoRanking);
+            policy.submissionIntent=ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+            EXPECT_NO_THROW((void)Builder::append(graph,f.consumer(),policy,f.weights(),f.buffers()));
+            EXPECT_EQ(graph.getNode("qsa.qsa_query_proj"),nullptr);
+        } else FAIL()<<"Original policy cannot distinguish cold and executable prefill proof";
+    };
+    Fixture f;verify(f,f.policy());
 }

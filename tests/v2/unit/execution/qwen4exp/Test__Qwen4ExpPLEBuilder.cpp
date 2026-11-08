@@ -384,7 +384,12 @@ TEST(Qwen4ExpPLEBuilder, OrdinaryProjectionsKeepTheirOriginalPolicy)
     EXPECT_EQ(rejected.size(),0u);
 }
 
-/** @test A foreign reader cannot manufacture a source boundary or proceed without the original retained cohort. */
+/**
+ * @test Both model entrypoints reject missing source authority before native code resolution.
+ * @details CUDA/ROCm IDs describe metadata only: a CPU-only build must exercise
+ * the original cohort diagnostic and leave the graph untouched without native
+ * kernels, a fabricated source cohort or a compiled-backend testing shortcut.
+ */
 TEST(Qwen4ExpPLEBuilder, SharedReaderRequiresOriginalCohortBeforeGraphMutation)
 {
     llaminar::v2::ThreadCountGuard threads(1);
@@ -413,20 +418,28 @@ TEST(Qwen4ExpPLEBuilder, SharedReaderRequiresOriginalCohortBeforeGraphMutation)
         BufferArena arena(ArenaConfig{.physical_memory_authority=memory});
         ASSERT_TRUE(arena.registerExternalBuffer(BufferId::MTP_GENERATION_CONTROL,controller));
         const auto control=DeviceGenerationControlBinding::admit(arena,device,0);
-        ComputeGraph graph;
         const auto storage=Qwen4ExpPooledReaderLookupStorage{
             &arena,{},control,DeviceRowRange::fullyActive(Fixture::rows),std::nullopt};
-        try
+        enum class Entry { Append, PooledReadAhead };
+        for(const auto entry:{Entry::Append,Entry::PooledReadAhead})
         {
-            (void)Qwen4ExpPLEBuilder::append(graph,context,fixture.weights(),fixture.buffers(),storage,{});
-            FAIL()<<"Expected original shared source cohort rejection";
+            SCOPED_TRACE(entry==Entry::Append ? "append" : "pooled read-ahead publish");
+            ComputeGraph graph;
+            try
+            {
+                if(entry==Entry::Append)
+                    (void)Qwen4ExpPLEBuilder::append(graph,context,fixture.weights(),fixture.buffers(),storage,{});
+                else
+                    (void)Qwen4ExpPooledReadAheadFrame::publish(graph,context,fixture.buffers(),storage);
+                FAIL()<<"Expected original shared source cohort rejection";
+            }
+            catch(const std::invalid_argument& error)
+            {
+                EXPECT_NE(std::string(error.what()).find("original shared source participants"),std::string::npos)
+                    <<error.what();
+            }
+            EXPECT_EQ(graph.size(),0u);
+            EXPECT_FALSE(graph.retainedStorageBoundary());
         }
-        catch(const std::invalid_argument& error)
-        {
-            EXPECT_NE(std::string(error.what()).find("original shared source participants"),std::string::npos)
-                <<error.what();
-        }
-        EXPECT_EQ(graph.size(),0u);
-        EXPECT_FALSE(graph.retainedStorageBoundary());
     }
 }

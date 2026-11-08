@@ -1411,11 +1411,18 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
             const auto expected_family = resolveMTPVerifierGraphFamily(mtpVerifierExecutionRole(generation_execution));
             if (cfg.captured_serving_graphs.verifier_graph_family != expected_family)
                 throw std::invalid_argument("Captured serving verifier family contradicts this GPU's declared generation domain");
-            const std::size_t prefill_executable_count =
+            const std::size_t prefill_roster_count =
                 prefillGraphBucketsAtOrBelowCapacity(
                     cfg.captured_serving_graphs.prefill_bucket_rows,
                     activation_seq)
                     .size();
+            if (cfg.captured_serving_graphs.sparse_query_program_count == 0u ||
+                cfg.captured_serving_graphs.sparse_query_program_count > kSparseQueryExecutionProgramCount ||
+                prefill_roster_count > std::numeric_limits<std::size_t>::max() /
+                    cfg.captured_serving_graphs.sparse_query_program_count)
+                throw std::invalid_argument("Captured prefill program roster has invalid or overflowing native-owner quantity");
+            const std::size_t prefill_executable_count = prefill_roster_count *
+                cfg.captured_serving_graphs.sparse_query_program_count;
             const std::size_t executable_count = checkedAdd(
                 prefill_executable_count,
                 cfg.captured_serving_graphs.fixed_executable_count,

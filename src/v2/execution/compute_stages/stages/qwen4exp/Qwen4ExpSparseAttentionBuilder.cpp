@@ -141,7 +141,8 @@ void validateNodes(const ComputeGraph &graph,const std::vector<Pending> &nodes)
 }
 }
 qwen4exp::QwenSparseQueryDemand Qwen4ExpSparseAttentionBuilder::queryDemandForInvocation(
-    std::optional<ForwardExecutionPhase> phase, SparseQueryExecutionProgram program)
+    std::optional<ForwardExecutionPhase> phase, SparseQueryExecutionProgram program,
+    std::optional<SparseQueryPrefillProof> prefillProof, ForwardGraphSubmissionIntent intent)
 {
     using Demand = qwen4exp::QwenSparseQueryDemand;
     switch (program) {
@@ -151,9 +152,17 @@ qwen4exp::QwenSparseQueryDemand Qwen4ExpSparseAttentionBuilder::queryDemandForIn
     }
     if (phase) require(*phase == ForwardExecutionPhase::Prefill || *phase == ForwardExecutionPhase::Decode,
         "QSA builder requires a known original execution phase");
-    require(phase == ForwardExecutionPhase::Decode || program == SparseQueryExecutionProgram::RankingPossible,
-        "QSA query omission requires explicit Decode");
-    if (phase != ForwardExecutionPhase::Decode) return Demand::AllLive;
+    if (phase == ForwardExecutionPhase::Prefill && prefillProof) {
+        require(!prefillProof->isMaterialization() || intent == ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch,
+            "QSA cold prefill program cannot authorize execution");
+        require(prefillProof->program(qwen4exp::QwenSparseFirstRankingLogicalRow) == program,
+            "QSA prefill query program disagrees with original admission proof");
+    }
+    require(phase == ForwardExecutionPhase::Decode || program == SparseQueryExecutionProgram::RankingPossible ||
+        (phase == ForwardExecutionPhase::Prefill && prefillProof),
+        "QSA query omission requires explicit Decode or proved Prefill admission");
+    if (phase != ForwardExecutionPhase::Decode)
+        return program == SparseQueryExecutionProgram::ProvenNoRanking ? Demand::ProvenNoRanking : Demand::AllLive;
     return program == SparseQueryExecutionProgram::ProvenNoRanking
         ? Demand::ProvenNoRanking : Demand::RankingOnly;
 }
@@ -261,7 +270,7 @@ std::vector<std::string> Qwen4ExpSparseAttentionBuilder::appendRequests(ComputeG
         p.publication==Qwen4ExpSparsePublication::DeferredVerifierAcceptance,"QSA publication policy is invalid");
     // The admitted program fixes topology for the whole response. Validate it
     // before constructing any stage, even if another geometry check would fail.
-    const auto queryDemand = queryDemandForInvocation(p.executionPhase, p.queryExecutionProgram);
+    const auto queryDemand = queryDemandForInvocation(p.executionPhase, p.queryExecutionProgram, p.prefillQueryProof, p.submissionIntent);
     const bool omitQuery = queryDemand == qwen4exp::QwenSparseQueryDemand::ProvenNoRanking;
     // Reject policy corruption before preparing projections or publishing nodes.
     qwen4exp::validateQwenSparsePoolSelection(p.poolSelection, rows.rowsPerRequest());

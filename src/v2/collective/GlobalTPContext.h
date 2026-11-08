@@ -27,6 +27,7 @@
 
 namespace llaminar2
 {
+    namespace test { struct CPURootedPublicationTransportReplayAccess; }
 
     /** Communication operation governed by the same-node rooted policy. */
     enum class CPURootedPublicationOperation : uint8_t
@@ -281,6 +282,11 @@ namespace llaminar2
         std::string collectiveBackendNameForDiagnostics() const;
 
     private:
+        /** @brief The named Perf fixture may invoke the retained SharedSpin gather.
+         * No public transport override or independent backend lifetime is exposed;
+         * the admitted original context still owns allocation and retirement.
+         */
+        friend struct test::CPURootedPublicationTransportReplayAccess;
         /** @brief Shared original gather body; ranges never alter the wire protocol. */
         bool gatherVariableFloatRecordsToRootImpl(
             const float *, size_t, float *, size_t, size_t, int,

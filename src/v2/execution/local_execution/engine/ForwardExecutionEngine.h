@@ -781,6 +781,7 @@ namespace llaminar2
         struct Config
         {
             GraphCacheConfig cache_config;
+            std::size_t sparse_query_program_count = 1u; ///< Actual model-owned closed prefill topology roster per admitted bucket.
             std::optional<FactoryPPStageConfig> pp_stage_config;
             /** Frozen rank-owned prefill edges; cannot change after engine construction. */
             const PipelineForwardGraphEdges *pipeline_forward_edges = nullptr;

@@ -638,6 +638,7 @@ namespace llaminar2
             ForwardExecutionPhase::Prefill; ///< Typed math/topology phase; never inferred from M.
         /** Immutable whole-response query program; numeric admission counts are request data. */
         SparseQueryExecutionProgram sparse_query_execution_program = SparseQueryExecutionProgram::RankingPossible;
+        std::optional<SparseQueryPrefillProof> sparse_query_prefill_proof; ///< Accepted immutable request/chunk proof or explicit cold topology declaration.
         ForwardStateTransaction state_transaction =
             ForwardStateTransaction::Ordinary; ///< Typed persistent-state transition embedded by this graph.
         ForwardGraphSubmissionIntent graph_submission_intent =
