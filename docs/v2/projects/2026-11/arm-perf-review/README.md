@@ -38,7 +38,7 @@ references are as of the head above and may drift.
 | 9 | Non-volatile rounding barrier evidence | `09-rounding-barrier-evidence.md` | Open (evidence required first) |
 | 10 | FP32 RMSNorm scalar sum order + sanitizer warnings (issue #36) | `10-rmsnorm-fp32-sumsq-order.md` | Addressed (`3086894b5`, `ac3289bd9`); residuals listed |
 | 11 | Attention validation hoist + integer-dot range proof | `11-attention-validation-and-integer-dot-range.md` | Open |
-| 12 | Cache-topology-derived tiling / prefetch on GB10 | `12-cache-topology-tiling.md` | Partial (overlays installed but confirmed to regress E2E ~4–7%: disable-A/B or re-collect in-model) |
+| 12 | Cache-topology-derived tiling / prefetch on GB10 | `12-cache-topology-tiling.md` | Addressed (overlay table retired `264970e14` after head A/B confirmed regression; methodology in idea 20) |
 | 13 | Fewer OpenMP regions per decode step | `13-openmp-region-count-and-wakeup.md` | Partial (spin `27585692d` + verified bundle `408ff90e5`; remaining regions open) |
 | 14 | Dense-model MTP verifier economics (27B) | `14-dense-mtp-verifier-economics.md` | Open (verified −7…−8%; depth controller runs depth-10 at 43% acceptance) |
 | 15 | NUMA-less and cache-unpublished Linux ARM hosts | `15-numa-less-hosts.md` | Partial (memory attribution `a572c3c9c`) |
@@ -46,6 +46,8 @@ references are as of the head above and may drift.
 | 17 | GB10 CPU decode bandwidth gap (post-merge follow-up) | `17-gb10-decode-bandwidth-gap.md` | Open (operator-requested re-analysis after merge) |
 | 18 | GDN grouped verifier + publication economics | `18-gdn-grouped-verifier-economics.md` | Open (clean-host rerun needed; GB10 numbers from final Perf__ round) |
 | 19 | Prefill vs decode gap on GB10 (short-prompt effect) | `19-prefill-vs-decode-gap.md` | Open (prompt-length sweep planned) |
+| 20 | Overlay collection methodology (microbench wins that lose in-model) | `20-overlay-collection-methodology.md` | Open (new rule: in-model collection or per-format E2E validation) |
+| 21 | CUDA sm_121 (GB10) kernel spills under the zero-spill guard | `21-sm121-cuda-kernel-spills.md` | Open (18 instantiations, 24–276 B; CUDA follow-up, not ARM-CPU) |
 
 Measured numbers for all ideas: `00-measured-baseline.md` (GB10 serving,
 stage attribution, spin sweep, thread scaling, overlay statistics).

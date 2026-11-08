@@ -112,4 +112,19 @@ bench prompt):
 - B vs A: overlays regress end to end (~−4% MTP, −6% no-MTP, −7% prefill) —
   see idea 12. C vs B: pooled bundle gains +56% MTP, +54% no-MTP, +65%
   prefill. MTP gain over no-MTP at C: **+32.8%**.
+
+## Overlay removal A/B (head, 2026-11-08; evidence K14-OVERLAY-AB-HEAD)
+
+X `15f87f755` (with the 2,519-key table) vs Y `d397154da` (table emptied),
+alternating 2×2, mode-asserted: removing the table
+
+- 35B MTP decode: 27.35±0.06 → **28.51±0.29** (+4.2%);
+- 35B no-MTP: 20.54 → **20.95** (+2.0%);
+- 35B prefill: **+9–11%**;
+- 27B: unchanged; text byte-identical.
+
+The exact-overlay table is **retired** in `264970e14` (empty table; resolver,
+collector and generator kept). **New head reference: 35B MTP dynamic ≈ 28.5
+tok/s, no-MTP ≈ 21.0, 27B no-MTP 4.64.**
+
 - See `17-gb10-decode-bandwidth-gap.md` for the bandwidth-gap analysis.

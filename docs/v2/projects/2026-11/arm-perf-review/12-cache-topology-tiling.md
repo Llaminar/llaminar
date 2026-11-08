@@ -48,6 +48,18 @@ overlays are confirmed to **regress ~4–7%** (warm caches, concurrent stages).
 either retire the table or re-collect overlays from **in-model context** (warm
 caches, concurrent stages, per-layer shapes as they actually run).
 
+## Verdict (2026-11-08, evidence K14-OVERLAY-AB-HEAD)
+
+Head A/B confirmed the regression (X `15f87f755` with table vs Y `d397154da`
+with table emptied, alternating 2×2, mode-asserted): removing the table gives
+35B MTP decode 27.35±0.06 → **28.51±0.29** (+4.2%), no-MTP 20.54 → **20.95**
+(+2.0%), prefill **+9–11%**, 27B unchanged, text byte-identical.
+
+**The exact-overlay table is retired** in `264970e14` (empty table; resolver,
+collector and generator retained). Future overlay collection must follow idea
+20 (in-model context or per-format end-to-end validation) — microbench-selected
+keys win in isolation but lose in-model.
+
 ## Exactness / risk
 
 - Low: tables select implementations with identical arithmetic; but a wrong
