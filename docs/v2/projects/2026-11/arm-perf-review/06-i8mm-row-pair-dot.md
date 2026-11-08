@@ -208,3 +208,18 @@ Handoffs (rebased onto afe62c5ef, fork codex/i8mm-typed-placement):
 - Reviewer ACK does NOT transfer the de4535855 gate to the successor bytes —
   re-gate c24ce9b4e pending the lane's own Unit/preflight/I8MM run on .80.
 - Prefix-archive base item **CLOSED** (Main decision): 79c1f62ab accepted as a non-regressing fix proven by inspection only. The race is real (scheduleCompactionLocked silently absorbed a request during Copying/Publishing; the rewrite's finite tail copied superseded history; host pressure only stretches that window). No reproducer seam will be added (holding the archive advisory lock would deadlock writeBlock behind mutex_). Earlier 5/5 = host pressure + race. (Superseded: the .80 battery found no before-case repro — idle/spin/IO all pass both SHAs; that was part of the evidence.)
+
+## Gate classification (de4535855, arm-sparks, 2026-11-08)
+
+- Both ISA passes (NEON_I8MM + NEON_DOTPROD) IDENTICAL failure sets (11/960
+  Unit, 37–38/2303 Preflight) and ZERO I8MM/NEON_I8MM-specific failures (no
+  ISA-cell test failed) — envelope + leaf are CLEAN.
+- Expected base set ✓ (TestTargetSelection family, MoEForbiddenDependencyScan);
+  C/D ✓ (getenv pair + PrefixArchive; fixed in 79c1f62ab).
+- KNOWN-CONTAINER-EPERM/NUMA class (everything else): NUMAAllocator first-touch
+  mempolicy EPERM + OpenMPI bind-memory failed — sandbox lacks MBind/SYS_NICE.
+  Appears with 0868a5573+ (newer paths exercise mempolicy); absent at a8d380cd0
+  in the same container policy. DECISION (arm-perf, 2026-11-08): env-known,
+  NO production code change and NO silent skip; NUMA/mempolicy classes get
+  host-level evidence on a real GB10 host; container lists sealed in
+  K14-I8MM-GATE-DE4535855-20261108. Quiet re-gate: c24ce9b4e when lane green.
