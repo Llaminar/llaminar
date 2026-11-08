@@ -253,3 +253,28 @@ failures GONE at this base. RE-GATE GO to arm-sparks.
 - Parked follow-ups: Q6_K prefill rerun under production binding; idea-05
   window (~30 min, 35B/27B all-workers vs fastest-class ABBA + PerfStats
   claim counter); M=2/3 structural notes (no defect).
+
+## Mac qualification verdict (2026-11-08, arm-qualification)
+
+- Portability quadrant A(79c1f62ab)/B(c24ce9b4e) GREEN: 259/259 Release +
+  Integration × NEON/NEON_DOTPROD; ProductionTestPreflight 206/206 ×20 each.
+  Native macOS full engine configure fails at CMakeLists.txt:173 by design
+  (no libnuma) — portability is the native Mac quadrant; full-engine gates
+  stay Linux aarch64.
+- SMMLA absence: 0 smmla/usdot in NEON/DOTPROD (scanner validated: finds
+  smmla in the NEON_I8MM build). DOTPROD sdot count identical A vs B (11922).
+- Envelope: B DOTPROD proof signature == A; NEON_I8MM proof admitted only by
+  NEON_I8MM; NEON/DOTPROD reject it; unit/integration envelope tests pass.
+- I8MM guard on M1: B builds; 156/261 fail with explicit
+  'requires native ARM I8MM support' (9512 occurrences), 0 SIGILL, no
+  fallback. Expected.
+- BYTE GUARD: 13101/13244 common functions identical (DOTPROD); 74/78 objects
+  fully identical; 4 differing TUs = test TUs including changed headers.
+  PRODUCTION EXCEPTION (MERGE BLOCKER, decision 2026-11-08): Q6KNativeDualScale
+  (Encoding=2) non-SMMLA run<> leaf differs in ALL 48 DOTPROD + 24 NEON
+  instantiations — 5f4c9d4d4's q6Group() helper changed codegen (sub/cmp/csel
+  32-bit offset + extra cmp; ldr vs ldp in Tile4 epilogue; ±0–2 instructions;
+  same sdot/fmul/fadd tree; exactness tests pass). Every OTHER encoding is
+  byte-identical. FIX REQUIRED (helper only in I8MM pair block / restore
+  inline in non-SMMLA walk / unsigned-(group&3) math) → re-diff on the fix
+  SHA (arm-qualification, ~5 min) before Main merges. Evidence: /tmp/armqual.
