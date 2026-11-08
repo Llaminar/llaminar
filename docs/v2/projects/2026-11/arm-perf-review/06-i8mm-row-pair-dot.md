@@ -140,3 +140,25 @@ pin branches). Lane: `arm-i8mm` (01a1bbe6, codex/i8mm-typed-placement).
   rejected** — never silently mixed with different numerics. Add a focused
   regression: CPU-identity equality + byte equality (or clean rejection)
   across i8mm/dotprod-built ranks.
+
+## Lane progress (2026-11-08; 3 commits on b2cf793bf, .80 transport, not GitHub)
+
+- c1 `acadffd64` build(cpu): NEON_I8MM envelope — gate ran (correct spelling).
+- c2 `4d3f032f4` perf(cpu): I8MM row-pair leaf + tests. On .80 NEON_I8MM
+  Integration: Unit 958/960 (2 known-upstream), Preflight 2291/2293 (3 target
+  selection + 4 idea-27 cells); all I8MM byte suites pass (all
+  sources/encodings/policies, N%4 tails with canaries, M 1..16/31/33/65,
+  workers 1..10); `MTP_SmallM_AllFormats` with route assertions
+  (`grouped_neon_i8mm_*`, `integer_dot=i8mm`); mutation swap of grid pair
+  operands fails all four I8MM tests; objdump: Rows=1 → 0 smmla/0 sdot (calls
+  DotProd instantiation), Rows=2/4 → smmla only, Rows=3 → smmla + sdot.
+  OPEN ITEM: higher q-register stack traffic in I8MM Rows=3/4 tile run<>
+  (79/85 vs SDOT 26/35 st+ld per 16 fns) — possible spills; profile in the
+  perf window before any economy claim.
+- c3 `cc669d04c` fix(runtime): capacity-ordered binding (option a) — one
+  helper `bindOpenMPWorkersFastestFirst` + `capacityOrderedCorePlaces(mask)`,
+  used by cluster path and all self-launched OMP_PLACES=cores/close ranks;
+  latent fix: admitted set = thread mask ∪ libgomp place list (see idea 26).
+- Perf window (approved by arm-perf + arm-sparks) pending Release builds:
+  ThreadScaling SDOT-vs-SMMLA matrix, engine c3-I8MM vs c3-DOTPROD (27B/35B
+  MTP dyn/off), c2-vs-c3 35B MTP-off, IPC + disasm.
