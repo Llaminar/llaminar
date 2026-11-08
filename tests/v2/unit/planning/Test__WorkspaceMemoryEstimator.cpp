@@ -12,6 +12,9 @@
  * independently of the estimator's bounded family-envelope search. Historical
  * runtime anchors exclude the retired ROCm half-router workspace copy: prepared
  * half gates now belong to model weights, outside the graph workspace arena.
+ * QFN main attention uses selected-index arena ownership even when its source
+ * tensors are named attn_q; independently dense predictors retain their complete
+ * context conversion contract in predictor-only PP scopes.
  * GPU verifier work banks use the original generation request capacity rather
  * than generic prefill batching; explicit retained geometry remains a cold
  * prerequisite contract and does not select a serving implementation.
@@ -20,6 +23,7 @@
 #include "../../utils/ScopedGDNProjectionArithmetic.h"
 #include <gtest/gtest.h>
 #include "planning/WorkspaceMemoryEstimator.h"
+#include "models/qwen/LayerGraphIdentity.h"
 #include "planning/MemoryPlanner.h"
 #include "backends/DeviceId.h"
 #include "config/GDNHeadAssignment.h"
@@ -2385,5 +2389,216 @@ TEST(Test__WorkspaceMemoryEstimator, PipelineMemoryPlannerPreservesGlobalOwnerAt
         EXPECT_EQ(changed.weight_bytes(), original.weight_bytes());
         EXPECT_EQ(changed.workspace_bytes(), original.workspace_bytes()) << device.toString();
         EXPECT_EQ(changed.checkpoint_state_bytes(), original.checkpoint_state_bytes());
+    }
+}
+
+namespace
+{
+/** @brief Source-marker fixture isolating reader ownership from matrix/arena payloads. */
+ModelMemoryProfile qfnSelectedMainWorkspaceProfile()
+{
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen4exp";
+    profile.n_layers = 48;
+    profile.d_model = 2560;
+    profile.d_ff = 640;
+    profile.n_heads = 24;
+    profile.n_kv_heads = 2;
+    profile.head_dim = 256;
+    profile.vocab_size = 248320;
+    profile.max_seq_len = 262144;
+    profile.full_attention_interval = 0; // The original source marker triggers the old bug.
+    profile.gdn_conv_kernel_size = 4;
+    profile.gdn_state_size = 128;
+    profile.gdn_inner_size = 6144;
+    profile.gdn_group_count = 16;
+    profile.gdn_time_step_rank = 48;
+    profile.flash_next.emplace();
+    profile.flash_next->residual_branches = 4;
+    profile.flash_next->sparse_decoder_layers = {3};
+    profile.flash_next_predictor = Qwen4ExpPredictorMetadata{48,
+        Qwen4ExpPredictorAttention::Dense, Qwen4ExpPredictorHiddenNorm::PerBranch,
+        Qwen4ExpPredictorSource::SharedGGUF};
+    // These are metadata inventory markers, as in the existing recurrent tests.
+    // Zero K declares no GEMM payload or extra quantized/floating workspace.
+    TensorSizeInfo recurrent;
+    recurrent.name = "blk.0.ssm_out.weight";
+    recurrent.layer_index = 0;
+    profile.tensors.push_back(recurrent);
+    TensorSizeInfo query;
+    query.name = "blk.3.attn_q.weight";
+    query.layer_index = 3;
+    profile.tensors.push_back(query);
+    return profile;
+}
+
+/** @brief Remove only the source-name predicate; every other pricing input is unchanged. */
+ModelMemoryProfile withoutQFNMainQueryMarker(ModelMemoryProfile profile)
+{
+    profile.tensors.erase(std::remove_if(profile.tensors.begin(), profile.tensors.end(),
+        [](const auto &tensor) { return tensor.name == "blk.3.attn_q.weight"; }), profile.tensors.end());
+    return profile;
+}
+}
+
+/** @test The actual selected main reader cannot acquire a nonexistent dense FA2 family. */
+TEST(Test__WorkspaceMemoryEstimator, QFNSelectedMainAttentionAdmission)
+{
+    const test::ScopedGDNProjectionArithmetic arithmetic(GDNProjectionArithmetic::Native);
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const int tp : {1, 2, 4, 8})
+    for (const int context : {4096, 262144})
+    for (const int retained_rows : {0, 2, 4, 16})
+    {
+        const bool retained = retained_rows > 0;
+        SCOPED_TRACE(::testing::Message() << device.toString() << " TP=" << tp
+            << " context=" << context << " retained_query_rows=" << retained_rows);
+        auto profile = qfnSelectedMainWorkspaceProfile();
+        profile.mtp_layer_count = retained ? 1 : 0;
+        const auto source = LayerGraphSourceIdentity::main(3, 48, 0, GraphCacheLayerIndex::ModelGlobal);
+        ASSERT_EQ(FullAttentionLayerIdentity::main(source,
+            GraphAttentionConsumer::Selected).consumer(), GraphAttentionConsumer::Selected);
+        auto geometry = graphGeometry(device, profile.d_ff / tp, tp);
+        geometry.resident_graph_rows = 512;
+        geometry.max_context_rows = context;
+        geometry.first_layer = 0;
+        geometry.last_layer = 47;
+        geometry.local_query_heads = profile.n_heads / tp;
+        geometry.local_kv_heads = std::max(1, profile.n_kv_heads / tp);
+        geometry.mtp_target_query_rows = retained_rows;
+        geometry.mtp_dense_layout = MTPShiftedKVHeadLayout::FullModelPerParticipant;
+        geometry.mtp_terminal_logits_layout = MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
+        const auto without = WorkspaceMemoryEstimator::estimate(withoutQFNMainQueryMarker(profile), geometry);
+        const auto with = WorkspaceMemoryEstimator::estimate(profile, geometry);
+        // The marker also names the unchanged RoPE owner. Account its exact
+        // canonical ABI; the regression removes only nonexistent dense attention.
+        const auto rope = device.is_gpu() ? rope_workspace::requirements(
+            {.graph_rows = geometry.resident_graph_rows}).total_bytes_with_alignment() : 0u;
+        EXPECT_EQ(with, without + rope)
+            << "QSA remains arena-owned while its existing RoPE publication stays admitted";
+        if (device.is_gpu())
+        {
+            // Preserve the actual cache conversion pair over the full horizon.
+            const int heads = retained ? profile.n_kv_heads : geometry.local_kv_heads;
+            const auto cache = kv_cache_workspace::conversionRequirements({
+                .configured_batch_size = 1, .configured_context_rows = context,
+                .requested_graph_rows = 512, .requested_batch_size = 1,
+                .conversion_row_bytes = size_t(heads) * profile.head_dim * sizeof(float)});
+            EXPECT_GE(with, cache.total_bytes_with_alignment());
+        }
+        // Large-to-small request geometry reuses the same immutable metadata;
+        // adding a main bucket cannot change the separately dense predictor charge.
+        geometry.resident_graph_rows = 16;
+        const auto compact_rope = device.is_gpu() ? rope_workspace::requirements(
+            {.graph_rows = geometry.resident_graph_rows}).total_bytes_with_alignment() : 0u;
+        EXPECT_EQ(WorkspaceMemoryEstimator::estimate(profile, geometry),
+            WorkspaceMemoryEstimator::estimate(withoutQFNMainQueryMarker(profile), geometry) + compact_rope);
+    }
+}
+
+/** @test QFN predictor-only PP keeps dense attention despite the selected main policy. */
+TEST(Test__WorkspaceMemoryEstimator, QFNDensePredictorAttentionAdmission)
+{
+    const test::ScopedGDNProjectionArithmetic arithmetic(GDNProjectionArithmetic::Native);
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    for (const int context : {4096, 262144})
+    {
+        auto profile = qfnSelectedMainWorkspaceProfile();
+        profile.mtp_layer_count = 1;
+        auto geometry = graphGeometry(device, 320, 2);
+        geometry.first_layer = 48;
+        geometry.last_layer = 48;
+        geometry.weight_components = WeightComponentScope::LayersOnly;
+        geometry.local_query_heads = 12;
+        geometry.local_kv_heads = 1;
+        geometry.resident_graph_rows = 512;
+        geometry.max_context_rows = context;
+        geometry.mtp_dense_layout = MTPShiftedKVHeadLayout::FullModelPerParticipant;
+        geometry.mtp_terminal_logits_layout = MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
+        geometry.mtp_target_query_rows = 0;
+        const auto without = WorkspaceMemoryEstimator::estimate(profile, geometry);
+        geometry.mtp_target_query_rows = 16;
+        const auto with = WorkspaceMemoryEstimator::estimate(profile, geometry);
+        EXPECT_GT(with, without);
+        // A conventional dense predictor has the same complete physical ABI.
+        // Ordinary GGUF block_count includes its predictor; QFN keeps it separate.
+        auto conventional = profile;
+        conventional.architecture = "qwen35";
+        conventional.n_layers = 49;
+        conventional.flash_next.reset();
+        conventional.flash_next_predictor.reset();
+        EXPECT_EQ(with, WorkspaceMemoryEstimator::estimate(conventional, geometry));
+        for (int query = 0; query < 3; ++query)
+        {
+            geometry.resident_graph_rows = query % 2 ? 16 : 512;
+            EXPECT_EQ(WorkspaceMemoryEstimator::estimate(profile, geometry),
+                WorkspaceMemoryEstimator::estimate(conventional, geometry));
+            EXPECT_EQ(WorkspaceMemoryEstimator::estimate(profile, geometry),
+                WorkspaceMemoryEstimator::estimate(withoutQFNMainQueryMarker(profile), geometry));
+            geometry.mtp_target_query_rows = 0;
+            const auto disabled = WorkspaceMemoryEstimator::estimate(profile, geometry);
+            geometry.mtp_target_query_rows = 16;
+            EXPECT_GT(WorkspaceMemoryEstimator::estimate(profile, geometry), disabled);
+        }
+        // Independent canonical factory delta rejects a mutant that drops
+        // the dense sidecar in both QFN and conventional estimator branches.
+        auto sharded = geometry;
+        sharded.mtp_dense_layout = MTPShiftedKVHeadLayout::PrimaryTensorParallelShard;
+        const auto sharded_bytes = WorkspaceMemoryEstimator::estimate(profile, sharded);
+        if (device.is_cpu())
+        {
+            const auto attention_bytes = [&](int heads) {
+                return attention_workspace::cpuParallelRequirements({
+                    .compact_query_rows = attention::kMaxGroupedVerifierAttentionRows,
+                    .local_query_heads = heads, .head_dim = 256,
+                    .worker_count = geometry.device_compute_units}).total_bytes_with_alignment();
+            };
+            ASSERT_GE(with, sharded_bytes);
+            EXPECT_EQ(with - sharded_bytes, attention_bytes(24) - attention_bytes(12));
+        }
+        if (device.is_rocm())
+        {
+            const auto cache_bytes = [&](int heads) {
+                return kv_cache_workspace::conversionRequirements({
+                    .configured_batch_size = 1, .configured_context_rows = context,
+                    .requested_graph_rows = 16, .requested_batch_size = 1,
+                    .conversion_row_bytes = size_t(heads) * 256 * sizeof(float)})
+                    .total_bytes_with_alignment();
+            };
+            const auto attention_delta = rocmAttentionDescriptorBytes(geometry, 24, 2, 256, 16) -
+                rocmAttentionDescriptorBytes(geometry, 12, 1, 256, 16);
+            ASSERT_GE(with, sharded_bytes);
+            EXPECT_EQ(with - sharded_bytes, attention_delta + cache_bytes(2) - cache_bytes(1));
+        }
+        if (device.is_gpu())
+        {
+            const auto dense = attention_workspace::requirements({
+                .compact_query_rows = attention::kMaxGroupedVerifierAttentionRows,
+                .request_count = 1, .local_query_heads = 24, .local_kv_heads = 2,
+                .head_dim = 256, .context_rows = context});
+            EXPECT_GE(with - without, dense.total_bytes_with_alignment());
+        }
+    }
+}
+
+/** @test Conventional dense source ownership remains independent of the QFN correction. */
+TEST(Test__WorkspaceMemoryEstimator, QFNWorkspaceAdmissionPreservesConventionalDenseAttention)
+{
+    const test::ScopedGDNProjectionArithmetic arithmetic(GDNProjectionArithmetic::Native);
+    auto profile = qfnSelectedMainWorkspaceProfile();
+    profile.architecture = "qwen35";
+    profile.flash_next.reset();
+    profile.flash_next_predictor.reset();
+    for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        auto geometry = graphGeometry(device, 320, 2);
+        geometry.first_layer = 0;
+        geometry.last_layer = 47;
+        geometry.resident_graph_rows = 512;
+        geometry.max_context_rows = 262144;
+        geometry.local_query_heads = 12;
+        geometry.local_kv_heads = 1;
+        EXPECT_GT(WorkspaceMemoryEstimator::estimate(profile, geometry),
+            WorkspaceMemoryEstimator::estimate(withoutQFNMainQueryMarker(profile), geometry));
     }
 }

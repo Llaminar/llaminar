@@ -7,14 +7,20 @@ analysis in the linked tuning notes, not in this dashboard.
 ## Current status
 
 **Active hybrid target: 500 prefill /40 decode tok/s on 2×MI50 +2×CPU TP.**
-Matched local Release 512/256 measurements give **161.706 P /29.484 D**, up
-from 150.782/27.298 (+7.25%/+8.01%) after unique-source Q8 publication and CPU
-profiler cleanup. All three generated streams and MTP work counts match.
+Matched local Release 512/256 measurements give **184.840 P /30.809 D**,
+versus 161.929/29.380 with the original admission (+14.15%/+4.86%, aggregate
+tokens/time on both sides). QFN main QSA was charged for nonexistent dense FA2
+scratch: correcting that adds **61.67% GPU expert slots**, from 50–51 to
+82–83 experts/card/layer. All 768 generated tokens and MTP work counts match.
 Context remains 262144, with dynamic MTP/balancing, RAM ngrams, local GPU row
-caches and 16/32 GiB RAM/disk prefix budgets. **36 focused checkpoint tests
-pass, zero skips**; full preflight, exact checkpoint model and OpenCode remain open.
-The CPU checkpoint also retains the qualified ordered-pair, counter, affinity
-and aligned-fixture fixes. Four-row tuning is a separate unmeasured candidate.
+caches and 16/32 GiB RAM/disk prefix budgets. The workspace Unit suite and new
+CPU/CUDA/ROCm TP1/2/4/8 admission regression pass; the old binary fails the new
+regression. Driver free VRAM stays near 1.6 GiB/card through measured inference.
+**Full preflight, exact checkpoint model and OpenCode remain open.**
+The earlier CPU checkpoint retains its 36 focused passes and qualified pair,
+counter, affinity and aligned-fixture fixes. The experimental wide-row kernel
+was rejected after measurement; no blanket WideRows policy is promoted.
+[Admission correction, matched control and qualification limits](../2026-11/QFN_SELECTED_ATTENTION_WORKSPACE_ADMISSION_20261108.md).
 [Assembly, measurements, configuration and qualification limits](../2026-11/QFN_CPU_NATIVEVNNI_SPILL_AUDIT_20261108.md).
 
 **Earlier checkpoint `2cf99995d`:** finite-trajectory MTP comparison and full OpenCode

@@ -6,6 +6,9 @@
  * points but share the same kernel requirement formulas. This keeps GGUF
  * preflight aware of routed-expert, recurrent, and dense graph-family pressure
  * before weights consume the memory that exact graph capture will need.
+ * Main selected-index QFN attention is arena-owned, so dense source names cannot
+ * reserve an uninstantiated full-context FA2 family. Independently dense MTP
+ * attention retains its full-context contract.
  * Main and explicitly sharded/replicated MTP attention contribute their actual participant
  * geometries to one stable-name union, including full-context conversion banks.
  */
@@ -14,6 +17,7 @@
 #include "execution/moe/MoEExpertProjectionOwnership.h"
 #include "models/qwen4exp/Qwen4ExpPredictorProjectionGeometry.h"
 #include "models/qwen4exp/Qwen4ExpProjectionWorkspace.h"
+#include "models/qwen/LayerGraphIdentity.h"
 
 #include "config/GDNHeadAssignment.h"
 #include "loaders/PreparedWeightRepresentationContract.h"
@@ -1941,7 +1945,15 @@ size_t exactAttentionWorkspaceBytes(
     const WorkspaceMemoryGeometry& geometry)
 {
     WorkspaceRequirements requirements;
-    if (hasFullAttentionLayer(profile, geometry.first_layer, geometry.last_layer))
+    // Match QwenGraphBase's typed main-reader selection. QFN .attn_q sources
+    // feed selected-index QSA whose scratch belongs to BufferArena, not a
+    // generic dense FA2 context-parallel family. Dense predictor ownership is
+    // independent and remains in the exact sidecar union below, including PP
+    // scopes that contain only that predictor. KV conversion/RoPE are separate.
+    const auto main_consumer = profile.flash_next
+        ? GraphAttentionConsumer::Selected : GraphAttentionConsumer::Dense;
+    if (main_consumer == GraphAttentionConsumer::Dense &&
+        hasFullAttentionLayer(profile, geometry.first_layer, geometry.last_layer))
         requirements = exactAttentionMemberRequirements(profile, geometry);
     if (const auto sidecar = retainedMTPAttentionGeometry(profile, geometry))
         requirements.merge(exactAttentionMemberRequirements(profile, *sidecar));
