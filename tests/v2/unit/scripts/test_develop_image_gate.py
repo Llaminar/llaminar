@@ -299,7 +299,7 @@ class DevelopImageGateTests(unittest.TestCase):
         self.assertIn("exec python3 scripts/ci/run_develop_image_gate.py", workflow)
         policy = yaml.load(workflow, Loader=yaml.BaseLoader)
         self.assertEqual(policy["jobs"]["develop-images"]["runs-on"],
-                         {"group": "Develop CI", "labels": "llaminar-cloud-16"})
+                         {"group": "Develop CI", "labels": "llaminar-cloud-64"})
         self.assertEqual(policy["concurrency"], {
             "group": "llaminar-cloud-develop-images", "cancel-in-progress": "true"})
         self.assertIn("--build-only", workflow)
@@ -331,7 +331,7 @@ class DevelopImageGateTests(unittest.TestCase):
         self.assertEqual(reusable["permissions"], {"contents": "read"})
         caller = job
         job = reusable["jobs"]["unit"]
-        self.assertEqual(job["runs-on"], {"group": "Develop CI", "labels": "llaminar-cloud-16"})
+        self.assertEqual(job["runs-on"], {"group": "Develop CI", "labels": "llaminar-cloud-64"})
         self.assertEqual(job["strategy"], {"fail-fast": "false", "max-parallel": "2",
                                            "matrix": {"cpu_isa": ["AVX512", "AVX2"]}})
         self.assertEqual(f"{caller['name']} / {job['name']}",

@@ -34,17 +34,17 @@ Keep the fresh/full/partial prefix probes, exact repeatability, actual dynamic
 MTP activity, movement obligations and captured production-path evidence.
 
 Feature PRs into `develop` use `.github/workflows/develop-pr.yml` to run an
-AVX512/AVX2 matrix on two separate 16-core cloud runners in parallel. Each builds
+AVX512/AVX2 matrix on two separate 64-core cloud runners in parallel. Each builds
 a full-backend test companion with the `model-free` executable inventory.
 They run the complete device-free `Unit` suite and the production-preflight
 `host` lane selected by the canonical scheduler. CUDA, ROCm and exclusive
 preflight lanes do not run; the container receives no GPU devices or model
 mounts. Each job calls `run_develop_image_gate.py --cpu-isa <matrix ISA>` without
-`--build-only` or `--publish`, on the 16-core GitHub-hosted runner through the protected
+`--build-only` or `--publish`, on the 64-core GitHub-hosted runner through the protected
 `develop-pr-tests.yml@develop` reusable workflow. PRs import public registry cache
 layers without credentials or cache export. Separate PRs run concurrently;
 new commits cancel older checks on the same PR. The cloud pool admits up to
-four 16-core runners. The matrix disables fail-fast so both ISA results remain
+four 64-core runners. The matrix disables fail-fast so both ISA results remain
 visible. The driver admits the requested ISA against every visible CPU before
 compiling; missing required flags fail explicitly without changing the ISA. CTest owns selection and the JUnit receipt must prove
 that every discovered Unit and host test ran without skipping. Unit runs with
@@ -59,7 +59,7 @@ PR-only approval override; existing CI rules remain enforced. The dedicated
 release-evidence deploy key retains its existing publication exception.
 Never grant the general GitHub Actions app a ruleset bypass.
 
-The `develop` push workflow uses the 16-core GitHub-hosted cloud runner and
+The `develop` push workflow uses the 64-core GitHub-hosted cloud runner and
 `run_develop_image_gate.py --build-only --publish`. It compiles only the two
 full-backend Release runtimes, omits Integration compilation, and publishes
 both branch and source-SHA tags after both builds succeed. It runs no tests

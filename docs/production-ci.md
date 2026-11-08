@@ -25,7 +25,7 @@ develop ruleset immediately after the push.
 
 `.github/workflows/develop-pr.yml` tests same-repository feature PRs targeting
 `develop`. One workflow matrix runs AVX512 and AVX2 builds concurrently on
-separate 16-core runners, each with a full-backend `model-free` test image.
+separate 64-core runners, each with a full-backend `model-free` test image.
 Each image executes the complete device-free `Unit` suite plus the
 production-preflight `host` lane. The canonical production scheduler owns
 host selection; CUDA, ROCm and exclusive preflight lanes are not executed. The test
@@ -65,7 +65,7 @@ workflow reference while the default checkout still tests the caller's PR
 merge ref. Both workflows grant only Contents read access and pass no secrets.
 The called job admits only same-repository pull requests targeting `develop`.
 
-The PR test job uses the same 16-core GitHub-hosted runner pool as develop publication.
+The PR test job uses the same 64-core GitHub-hosted runner pool as develop publication.
 Each PR has its own `llaminar-cloud-develop-pr-<number>` concurrency group with
 `cancel-in-progress: true`: separate PRs can run concurrently, while new commits
 cancel obsolete checks on that same PR.
@@ -108,8 +108,8 @@ receipts do not satisfy this qualification.
 ## Develop branch image publication
 
 `.github/workflows/ci.yml` runs on pushes to `develop` and explicit manual
-dispatches on `develop`. It uses the GitHub-hosted `llaminar-cloud-16` runner
-in the `Develop CI` group: Ubuntu 24.04, 16 vCPUs, 64 GB RAM and 600 GB storage,
+dispatches on `develop`. It uses the GitHub-hosted `llaminar-cloud-64` runner
+in the `Develop CI` group: Ubuntu 24.04, 64 vCPUs, 256 GB RAM and 2,040 GB storage,
 with a maximum of four cloud runners across PR checks and publication. The
 group admits only this repository and
 `ci.yml` plus the reusable `develop-pr-tests.yml`, both pinned to
