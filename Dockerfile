@@ -156,7 +156,8 @@ RUN if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then \
     else \
         echo "==> [cutlass] skipped because CUDA is disabled"; \
     fi
-RUN rm -rf /tmp/install-scripts
+# RCCL final-link certification below still consumes the staged linker helper.
+# Retire the shared installer tree only after that certificate is complete.
 
 WORKDIR /src
 
