@@ -25,7 +25,7 @@ jobs:
     name: Unit + host (${{ matrix.cpu_isa }})
     runs-on:
       group: Develop CI
-      labels: llaminar-cloud-16
+      labels: llaminar-cloud-64
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v6
