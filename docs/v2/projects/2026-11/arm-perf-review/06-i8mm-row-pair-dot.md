@@ -57,3 +57,22 @@ SDOT path on GB10.
 
 - Perf harness A/B (idea 1): SDOT vs SMMLA for M≥2 grouped/verifier/prefill,
   per encoding, per core class; byte-auth every timed run.
+
+## Implementer constraints (Main/ARM base, 2026-11-08 — binding)
+
+1. INT32 sums identical; the per-block FP program after them unchanged:
+   `persistRoundedNEON` barriers, scale/min order, Q6_K dual-scale planes,
+   IQ3_S / NibbleLUT metadata checks.
+2. Whole output tiles with fixed full-K order; no K repartition; tile
+   ownership byte-neutral under `dynamic(1)`.
+3. Odd M lone tail rows and N tails go through the M=1 SDOT path —
+   byte-identical to serial decode (MTP batch invariance).
+4. Runtime HWCAP2_I8MM admission + compiler envelope via
+   `__ARM_FEATURE_MATMUL_INT8` (canonical macro, not `__ARM_FEATURE_I8MM`) in
+   its own object; M1 never dispatches SMMLA; `CPUCodegenEnvelope` /
+   `cpu_isa_profile` proof extends to the new ISA level (no bypass).
+5. Regressions in `ProductionTestPreflight`; ISA cells via
+   `V2_CPU_NATIVE_ISA_CELLS` (add NEON_I8MM there, not a separate loop).
+
+Base: `b2cf793bf` (upstream PR #43); rebase if the base moves (SHA-only, no
+pin branches). Lane: `arm-i8mm` (01a1bbe6, codex/i8mm-typed-placement).
