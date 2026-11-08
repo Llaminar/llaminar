@@ -193,3 +193,21 @@ Handoffs (rebased onto afe62c5ef, fork codex/i8mm-typed-placement):
   M=1 0.98–1.00. M=2/3 low gain is STRUCTURAL (one pair saves 2 dot
   instructions per group pair vs decode work SMMLA doesn't reduce; M=3 adds
   an SDOT tail row) — no defect.
+
+## Successor tip after reviewer (2026-11-08)
+
+- Branch origin/codex/i8mm-typed-placement @ **c24ce9b4e** (rebased onto
+  79c1f62ab): d8546d184 (envelope) + 5f4c9d4d4 (leaf) = reviewed checkpoint
+  (content-identical to gated de4535855); 2406c6549 overlay evidence schema
+  v2 (build_isa separated from resolved instruction — reviewer P1);
+  12940d605 single ARMCPUCapabilities::requireCompiledEnvelope admission
+  authority at tile bind / executeWith seam / batch bind, I8MM witness uses
+  signed SDOT (both P2s); c24ce9b4e explicit preflight inventory appends
+  moved after the late set() (incl. OpenMPCapacityOrderedCorePlaces from the
+  base binding commit).
+- Reviewer ACK does NOT transfer the de4535855 gate to the successor bytes —
+  re-gate c24ce9b4e pending the lane's own Unit/preflight/I8MM run on .80.
+- Prefix-archive base failure resolved as ENVIRONMENTAL (no before-repro on
+  .80 under idle/spin/IO pressure; original failure coincided with a full
+  Release compile; 79c1f62ab does not regress — fix-by-inspection stands
+  pending Main's choice of reproducer).
