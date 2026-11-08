@@ -159,3 +159,8 @@ Handoffs (rebased onto afe62c5ef, fork codex/i8mm-typed-placement):
 - a7f719dfb fix(runtime): capacity-ordered binding — BINDING-ONLY, parent afe62c5ef (Main cherry-pick).
 - 581765ae5 build(cpu): NEON_I8MM envelope. - cd55f6b27 perf(cpu): I8MM leaf — TIP SHA for the arm-sparks gate re-run (Unit + preflight + NEON_DOTPROD/NEON_I8MM cells).
 - Rebase conflict: upstream moved the fused launch recorder to recordNativeNEONFusedLaunches; I8MM ported inside the shared 21-tag schema (isa=NEON_I8MM, grouped_neon_i8mm_* routes); the extra integer_dot tag was dropped.
+
+- Correction 2026-11-08 (Main): cd55f6b27 ALREADY contains a7f719dfb as
+  ancestor — PR #43 fast-forwarded onto the binding commit, so the lane's
+  rebase is a no-op and cd55f6b27 is current-base + envelope + leaf; the
+  authoritative gate runs on cd55f6b27 unchanged.
