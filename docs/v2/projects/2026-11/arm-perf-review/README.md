@@ -47,7 +47,7 @@ references are as of the head above and may drift.
 | 18 | GDN grouped verifier + publication economics | `18-gdn-grouped-verifier-economics.md` | Open (clean-host rerun needed; GB10 numbers from final Perf__ round) |
 | 19 | Prefill vs decode gap on GB10 (short-prompt effect) | `19-prefill-vs-decode-gap.md` | Open (prompt-length sweep planned) |
 | 20 | Overlay collection methodology (microbench wins that lose in-model) | `20-overlay-collection-methodology.md` | Open (new rule: in-model collection or per-format E2E validation) |
-| 21 | CUDA sm_121 (GB10) kernel spills under the zero-spill guard | `21-sm121-cuda-kernel-spills.md` | Open (18 instantiations, 24–276 B; CUDA follow-up, not ARM-CPU) |
+| 21 | CUDA GB10 (sm_120/sm_121) kernel register spills under the zero-spill guard | `21-sm121-cuda-kernel-spills.md` | Open (sm_120 worse: 45 instantiations; blocks GB10 GPU + UMA validation) |
 
 Measured numbers for all ideas: `00-measured-baseline.md` (GB10 serving,
 stage attribution, spin sweep, thread scaling, overlay statistics).
