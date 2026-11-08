@@ -70,3 +70,18 @@ tensor-prefill instances being the largest single family).
   — report any slowdown with attribution); graph-capture identity includes
   the variant/generation. Implementation + measurements owned by Main/ARM
   after the branch move; arm-reviewer checks the implementation diff.
+
+## Moved into PR #43 (2026-11-08) — most spills fixed
+
+PR #43 = **7e709d60e** (ff from 0868a5573) now contains the CUDA commits from
+closed PR #44 (branch deleted):
+- a62696317 fix(cuda): sm_120/121 register budgets — SASS identical on the
+  shipped archs; 12.x spills before→after: single-row dispatch 276→0, paired
+  gate/up 44→0, owner phase 44→0, tiny 4→0, BK64 76→0 (inlining side effect,
+  source unchanged), **BK256 328→8**.
+- 7e709d60e docs: CUDA_SPILL_TENSOR_SPLIT_SPEC.md rev 2 (with the arm-perf
+  conditions).
+
+STILL OPEN on 12.x: BK256 non-ordered variants at 4–8 bytes (per-K A loads
+reverted — didn't help), and `tensor_prefill` (the signed-off split spec).
+Evidence: `~/llaminar-spark-results/K14-CUDA-SPILL-MIGRATION-a62696317`.

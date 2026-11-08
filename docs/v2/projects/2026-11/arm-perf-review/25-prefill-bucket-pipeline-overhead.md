@@ -93,3 +93,8 @@ the per-bucket trace; results → ideas 24/25.
 - Same model/prompt/length as idea 24; byte-identical output vs existing
   cells; target: close the gap toward llama.cpp's single-pass 0.94 ms/token;
   re-run the full matrix afterward.
+
+- Canonnical trace build SHA updated: **7e709d60e** (PR #43 head; contains
+  a62696317 + spec docs + the ARM base). 09e14d3ae stays provenance-only for
+  measured numbers. Trace still blocked on nsys in the uma3 image (idea 1
+  item 6); .79 GPU slot reserved.
