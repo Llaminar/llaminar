@@ -20,13 +20,42 @@ repeats:
 - The 4-digit prefill **is** reachable on GB10 (llama.cpp proves it), so the
   ceiling is not hardware; Llaminar-GPU decode is healthy vs CPU (7.5–8×).
 
-## Candidate causes (to be separated by a stage profile)
+## Candidate causes (now measured — see dig below)
 
 - Captured **multi-bucket prefill pipeline** overhead (graph capture, bucket
   scheduling) vs llama.cpp's single-pass FlashAttention prefill;
 - prefill GEMM / attention kernels (sm_121-specific tuning; recall the sm_120/
   sm_121 spill guard is still open — idea 21);
-- GDN path in prefill (identified as significant in the Qwen3.8 profile).
+- GDN path in prefill.
+
+## Stage-profile dig (2026-11-08, from existing benchmark evidence)
+
+**Work profile** — captured stage execute totals, 512-token prefill bucket,
+1283 stage objects, 305.1 ms total:
+
+- GEMM: 175.0 ms / 364 samples (max 170.1 ms) = **57%**
+- GDN_PROJECTION: 119.8 ms / 36 samples (max 119.1 ms) = **39%**
+- MOE_EXPERT_FFN: 1.92 ms / 48; everything else < 1 ms
+
+→ ~96% of prefill stage work is GEMM + GDN_PROJECTION; routed-expert FFN is
+negligible in prefill.
+
+**Kernel vs overhead split** (2160-token run):
+
+- Captured stage kernel time ≈ **0.60 ms/token** (512 tok / 305 ms) → if
+  replayed at stage speed, ~**1660 tok/s**;
+- measured benchmark marginal slope **3.009 ms/token** (approx 332 tok/s) plus a
+  fixed **~279 ms per-request intercept**;
+- → measured execution is ~**5× the stage kernel time**, so ~80% of prefill
+  wall time is **NOT kernel math**: per-bucket replay/launch/sync overhead of
+  the multi-bucket captured pipeline (buckets 512/448/384/256/128/64, graph
+  replay + event frontiers per bucket), plus ~280 ms fixed;
+- llama.cpp GPU reference: 0.94 ms/token (1063 tok/s), single-pass, no bucket
+  boundaries.
+
+**Conclusion:** the 3.3× prefill gap is **dominated by captured
+bucket-pipeline overhead, not GEMM/GDN kernel efficiency** (kernels would
+support ~1600 tok/s). See idea 25.
 
 ## Next steps
 

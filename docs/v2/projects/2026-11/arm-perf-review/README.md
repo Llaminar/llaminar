@@ -50,7 +50,8 @@ references are as of the head above and may drift.
 | 21 | CUDA GB10 (sm_120/sm_121) kernel register spills under the zero-spill guard | `21-sm121-cuda-kernel-spills.md` | Open (sm_120 worse: 45 instantiations; blocks GB10 GPU + UMA validation) |
 | 22 | FA2 tile-tournament policy tail on GB10 | `22-fa2-tile-tournament-policy-tail.md` | Open (p95 regret 8.926% > 5%; tq4_tq4 17.6%) |
 | 23 | qwen4exp HyperConnection auto-planning classification gap | `23-qwen4exp-hc-auto-planning.md` | Open (auto `plan` rejects HC models; authored `--expert-tier` works) |
-| 24 | GB10 GPU prefill gap vs llama.cpp (3.3×) | `24-gb10-gpu-prefill-gap.md` | Open (1063 vs 319 tok/s; decode ~21% behind; sm_121 tuning blocked on idea 21) |
+| 24 | GB10 GPU prefill gap vs llama.cpp (3.3×) | `24-gb10-gpu-prefill-gap.md` | Open (dig: ~80% is bucket-pipeline overhead, not kernels; see idea 25) |
+| 25 | Prefill capture/bucket-pipeline overhead reduction | `25-prefill-bucket-pipeline-overhead.md` | Open (kernels support ~1660 tok/s; measured ~332 tok/s + 279 ms fixed) |
 
 Measured numbers for all ideas: `00-measured-baseline.md` (GB10 serving,
 stage attribution, spin sweep, thread scaling, overlay statistics).
