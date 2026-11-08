@@ -42,6 +42,17 @@ foreach(backend IN ITEMS CUDA ROCm)
             LABELS "V2;Integration;ProductionTestPreflight;${backend};ExpertOverlay;ByteExact;ExplicitStream;Replay;Regression"
             MPI_PROCS 1 NO_MODELS TIMEOUT 30)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_${backend}_ExpertTierRectangularWeights)
+        # Issue #29: a pageable fixture upload returned before its DMA completed,
+        # so the non-blocking lane could overwrite poison that arrived later.
+        # Repeat the short floating-lane case so the race cannot hide behind
+        # one lucky schedule.
+        add_v2_test(V2_Integration_${backend}_ExpertTierFloatingLaneUploadOrdering
+            COMMAND $<TARGET_FILE:${rectangular_target}>
+                --gtest_filter=${backend}ExpertTierWeightKernelsTest.ContiguousFloatingLaneRoundTripsAllPrecisionsWithoutInferenceWaits
+                --gtest_repeat=20
+            LABELS "V2;Integration;ProductionTestPreflight;${backend};ExpertOverlay;ByteExact;ExplicitStream;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_${backend}_ExpertTierFloatingLaneUploadOrdering)
     endif()
 endforeach()
 
