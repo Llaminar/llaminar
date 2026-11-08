@@ -349,8 +349,7 @@ def discover_parameters(registered: list[parity.CampaignCell], campaigns: list[p
                     [str(binary), "--gtest_list_tests", f"--gtest_output=json:{output}"],
                     cwd=campaign.working_directory,
                     env={**os.environ, "LLAMINAR_FORCE_CPU_ONLY_STARTUP": "1",
-                         "HWLOC_COMPONENTS": "-gl,-opencl",
-                         "OMPI_MCA_btl_vader_single_copy_mechanism": "none"},
+                         "HWLOC_COMPONENTS": "-gl,-opencl"},
                     check=True, capture_output=True, text=True, timeout=30)
                 inventories[binary] = parse_parameters(output.read_text())
             actual = set(inventories[binary])

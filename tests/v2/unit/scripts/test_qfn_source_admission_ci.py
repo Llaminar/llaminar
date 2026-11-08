@@ -70,7 +70,9 @@ class QFNSourceAdmissionCI(unittest.TestCase):
                           for name in names}
             if missing:
                 registered[names[0]]['properties']['REQUIRED_FILES'] = [str(root / 'missing.gguf')]
+            self.metadata_environments = []
             def metadata(command, **kwargs):
+                self.metadata_environments.append(dict(kwargs['env']))
                 for arg in command:
                     if arg.startswith('--gtest_output=json:'):
                         Path(arg.split(':', 1)[1]).write_text('{}')
@@ -94,6 +96,19 @@ class QFNSourceAdmissionCI(unittest.TestCase):
                     error, status = failure, None
                 report = json.loads((output / 'source-admission.json').read_text())
                 return status, error, report, [call.args for call in run.call_args_list], cleanup.call_count
+
+    def test_native_mpi_selection_is_inherited_by_metadata_and_execution(self):
+        """The actual admission driver never substitutes its own vader policy."""
+        key = 'OMPI_MCA_btl_vader_single_copy_mechanism'
+        for selected in (None, 'cma', 'none'):
+            with self.subTest(selected=selected), patch.dict(
+                    source_gate.os.environ, {} if selected is None else {key: selected}, clear=True):
+                status, error, _, calls, _ = self._exact_driver()
+                self.assertEqual(status, 0); self.assertIsNone(error)
+                self.assertTrue(calls); self.assertTrue(self.metadata_environments)
+                for environment in self.metadata_environments + [call[4] for call in calls]:
+                    self.assertEqual(environment.get(key), selected)
+                self.assertEqual(source_gate.os.environ.get(key), selected)
 
     def test_exact_cell_uses_same_transaction_and_disjoint_receipt(self):
         exact = 'Source.FullSourceAdmission/Opaque'

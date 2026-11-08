@@ -181,7 +181,7 @@ env LLAMINAR_PROFILER_NORMAL_EXIT=1 \
   OMP_NUM_THREADS="$LLAMINAR_PROFILE_THREADS" OMP_PLACES=cores OMP_PROC_BIND=close \
   taskset -c "$LLAMINAR_PROFILE_CORES" \
   mpirun -np 1 --bind-to none \
-    --mca mpi_leave_pinned 1 --mca btl_vader_single_copy_mechanism none \
+    --mca mpi_leave_pinned 1 \
   rocprofv3 --kernel-trace --stats --output-directory "$LLAMINAR_PROFILE_RESULT" \
   -- "$LLAMINAR_PROFILE_BIN" benchmark \
     --config "$LLAMINAR_PROFILE_PLAN" --no-mpi-bootstrap \

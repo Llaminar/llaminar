@@ -662,9 +662,9 @@ namespace llaminar2
         cmd.push_back("mpi_leave_pinned");
         cmd.push_back("1");
 
-        cmd.push_back("--mca");
-        cmd.push_back("btl_vader_single_copy_mechanism");
-        cmd.push_back("none");
+        // Native MPI owns local-copy capability selection (CMA on supported
+        // Linux hosts). A CLI override would disable that path and also defeat
+        // an operator's inherited MCA setting. Preserve both sources of intent.
 
         appendDiagnosticEnvironment(cmd);
 

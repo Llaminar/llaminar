@@ -343,13 +343,13 @@ function(add_v2_test TEST_NAME)
         set(TEST_MPI_PLACEMENT --bind-to none --map-by slot)
     endif()
 
-    # Build mpirun command with optimal settings
+    # MPI selects its native shared-memory copy mechanism; explicit operator
+    # MCA settings remain authoritative in the inherited environment.
     set(MPI_CMD
         mpirun
         -np ${ARG_MPI_PROCS}
         ${TEST_MPI_PLACEMENT}
         --mca mpi_leave_pinned 1
-        --mca btl_vader_single_copy_mechanism none
         --mca orte_allowed_exit_without_sync 1
     )
 
@@ -483,7 +483,6 @@ function(add_v2_test TEST_NAME)
         "MKL_NUM_THREADS=${TEST_OMP_THREADS}"
         "MKL_DYNAMIC=false"
         "OMPI_MCA_mpi_leave_pinned=1"
-        "OMPI_MCA_btl_vader_single_copy_mechanism=none"
         "OMPI_MCA_btl_openib_allow_ib=1"
     )
 
@@ -13800,6 +13799,13 @@ foreach(backend IN ITEMS CUDA ROCm)
                 --gtest_filter=GPUHostRegistrationLifetime.FullSpanPolicyAndNeighbourReclaimPreserveCapturedPayload
             LABELS "V2;Integration;ProductionTestPreflight;${backend};Transfer;Memory;GraphCapture;Regression"
             MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+        add_v2_test(V2_Integration_GPUCrossProcessStaging_${backend}
+            COMMAND $<TARGET_FILE:v2_integration_gpu_host_registration_lifetime_${backend_lower}>
+                --gtest_filter=GPUHostRegistrationLifetime.RemoteStagingSupportsCmaAfterCapturedPublication
+            LABELS "V2;Integration;ProductionTestPreflight;${backend};Transfer;Memory;GraphCapture;Lifecycle;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+        set_property(TEST V2_Integration_GPUCrossProcessStaging_${backend} APPEND PROPERTY
+            ENVIRONMENT_MODIFICATION "HSA_USERPTR_FOR_PAGED_MEM=unset:" "HSA_USE_SVM=unset:")
     endif()
     if(TEST V2_Integration_GPUHostRegistrationLifetime_${backend})
         set_tests_properties(V2_Integration_GPUHostRegistrationLifetime_${backend}
@@ -16234,6 +16240,11 @@ add_v2_test(V2_Unit_MappedHostTransferRegion
     LABELS "V2;Unit;Transfer;TransferEngine;MappedHost;Timeline;NoSync"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_CrossProcessStagingAuthority
+    COMMAND $<TARGET_FILE:v2_unit_mapped_host_transfer_region>
+        --gtest_filter=Test__MappedHostTransferRegion.CrossProcess*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Transfer;Memory;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 
 # Test: QwenStandardGraphBufferManagement (BufferArena integration with DeviceGraphOrchestrator)
 # Tests setTensorFactory/initializeBuffers workflow, buffer allocation/binding,
@@ -19625,6 +19636,12 @@ if(HAVE_ROCM)
         TIMEOUT 60
         NO_MODELS
     )
+    # A successful payload retry must not conceal an ineligible source mapping.
+    # The companion captured-staging test proves the actual CMA syscall too.
+    if(TEST V2_Integration_ROCm_MoEOverlayRemoteProjection_MPI)
+        set_tests_properties(V2_Integration_ROCm_MoEOverlayRemoteProjection_MPI PROPERTIES
+            FAIL_REGULAR_EXPRESSION "Read -1, expected [0-9]+, errno =")
+    endif()
 endif()
 
 # A short-lived economy execution view must not disturb retained serving
@@ -36451,6 +36468,31 @@ if(NOT V2_PERF_TESTS_ONLY)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PlanningFixtureTopologyAndLocality)
 endif()
 
+# Exercise the original command builder and frontend without forcing a local
+# MPI copy mechanism; explicit native operator configuration remains authoritative.
+if(NOT V2_PERF_TESTS_ONLY)
+    add_v2_test(V2_Integration_MPIBootstrapNativeTransportPolicy
+        COMMAND $<TARGET_FILE:v2_unit_mpi_bootstrap>
+            --gtest_filter=Test__MPIBootstrap.NativeTransportSelectionPreservesAbsentAndExplicitIntent
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MPI;Bootstrap;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    add_v2_test(V2_Integration_MPILocalTransportDefault
+        COMMAND $<TARGET_FILE:v2_integration_frontend_startup_failure>
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;MPI;Lifecycle;Regression"
+        MPI_PROCS 2 NO_MODELS TIMEOUT 60)
+    set_tests_properties(V2_Integration_MPILocalTransportDefault PROPERTIES
+        ENVIRONMENT_MODIFICATION "OMPI_MCA_btl_vader_single_copy_mechanism=unset:")
+    add_v2_test(V2_Integration_MPILocalTransportExplicitNone
+        COMMAND $<TARGET_FILE:v2_integration_frontend_startup_failure>
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;MPI;Lifecycle;Regression"
+        MPI_PROCS 2 NO_MODELS TIMEOUT 60
+        ENVIRONMENT "OMPI_MCA_btl_vader_single_copy_mechanism=none")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_MPIBootstrapNativeTransportPolicy
+        V2_Integration_MPILocalTransportDefault
+        V2_Integration_MPILocalTransportExplicitNone)
+endif()
+
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)
     if(NOT TEST ${V2_PREFLIGHT_TEST})
         message(FATAL_ERROR
@@ -36706,6 +36748,51 @@ if(Python3_FOUND)
         MPI_PROCS 1 NO_MODELS NO_MPI TIMEOUT 30)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
         V2_Integration_PreflightFailureCollection)
+endif()
+
+# Native MPI owns its single-copy mechanism. These device-free controls inspect
+# real generated commands/environments while retaining explicit operator policy.
+if(Python3_Interpreter_FOUND AND NOT V2_PERF_TESTS_ONLY)
+    add_v2_test(V2_Integration_NativeMPITestLaunchDefaults
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_production_parity_campaigns.py
+            DeviceInventoryGateTests.test_native_mpi_registration_leaves_selection_to_mpi_and_accepts_explicit_override
+            ProductionParityCampaignTest.test_cmake_discovery_groups_production_cells_by_backend
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MPI;CI;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeMPITestLaunchDefaults)
+    add_v2_test(V2_Integration_NativeMPISourceAdmissionDefaults
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_qfn_source_admission_ci.py
+            QFNSourceAdmissionCI.test_native_mpi_selection_is_inherited_by_metadata_and_execution
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MPI;CI;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeMPISourceAdmissionDefaults)
+    add_v2_test(V2_Integration_NativeMPIInventoryDefaults
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_model_parity_inventory.py
+            ExactLiveSelectionTests.test_native_mpi_selection_is_inherited_without_forced_default
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MPI;CI;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeMPIInventoryDefaults)
+    add_v2_test(V2_Integration_NativeMPIKLDRankfileDefaults
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_model_kld_corpus_execution.py
+            CorpusExecutionTests.test_rankfile_launch_uses_native_mpi_selection_and_retains_operator_environment
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MPI;CI;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeMPIKLDRankfileDefaults)
+    add_v2_test(V2_Integration_NativeMPIHistoryOverrideDefaults
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_model_kld_history_replay.py
+            FrozenHistoryReplayTests.test_explicit_worker_launch_preserves_native_identity_and_transport
+            FrozenHistoryReplayTests.test_optional_native_transport_preserves_absent_and_explicit_intent
+            FrozenHistoryReplayTests.test_required_mca_and_unique_optional_transport_controls_are_enforced
+            FrozenHistoryReplayTests.test_socket_rank_population_retains_original_launcher_and_per_rank_workers
+            FrozenHistoryReplayTests.test_original_guardian_envelope_preserves_rank_population_and_application_boundary
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MPI;CI;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeMPIHistoryOverrideDefaults)
 endif()
 
 # The label, not the list above, is the installed gate's inventory authority.

@@ -129,7 +129,13 @@
                     .device = device, .slot_capacity = 2u, .execution_lane_capacity = 1u,
                     .execution_streams = execution, .maximum_bytes = capacity,
                     .name = "captured_packed_transfer", .perf_device = device.toString()});
-                auto staging = transfers.allocatePersistentTransferStagingSlices(capacity, 1u, device).front();
+                // Local tier slices keep their process-local native owner;
+                // remote projections publish the original bytes to MPI.
+                auto staging = transfers.allocatePersistentTransferStagingSlices(
+                    capacity, 1u, device,
+                    client == CapturedPackedClient::RemoteProjection
+                        ? HostTransferAccess::CrossProcessReadable
+                        : HostTransferAccess::ProcessLocal).front();
                 std::unique_ptr<ExpertTierWeightTransferLane> local;
                 std::unique_ptr<MoEOverlayGpuRemoteProjectionLane> remote;
                 if (client == CapturedPackedClient::LocalTier)

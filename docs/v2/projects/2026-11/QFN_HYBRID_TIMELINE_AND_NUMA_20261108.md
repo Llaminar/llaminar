@@ -221,15 +221,15 @@ in 5.60 seconds. This is ready-data service, not model sender-lateness evidence.
 | Both participants empty | 3.779 | 3.160 | — |
 
 MPI is 1.42–1.48× faster for these large ready payloads. SharedSpin runs first;
-this is not an order-independent crossover certification. Both arms use the
-existing `btl_vader_single_copy_mechanism=none` session setting. No result here
-qualifies a different MPI mechanism. Keep the production transport policy.
+this is not an order-independent crossover certification. Both initial arms
+used `btl_vader_single_copy_mechanism=none`. The separate CMA qualification below
+does not change the existing SharedSpin-versus-MPI collective selection policy.
 
-## Next transport candidate: existing OpenMPI CMA
+## Native MPI selection and OpenMPI CMA qualification
 
-A separate invocation-only diagnostic selects OpenMPI's existing CMA mechanism
-on the same original two-socket gather fixture. No host security setting,
-transport implementation or inference default changes. An untimed syscall trace
+A separate invocation-only diagnostic selected OpenMPI's existing CMA mechanism
+on the same original two-socket gather fixture, without changing host security
+or implementing a transport. An untimed syscall trace
 identifies the exact two MPI worker PIDs: rank 1 completes 120 positive
 `process_vm_readv` operations against rank 0, transferring 709448220 bytes in
 the fixture's exact positive-payload shapes. Both per-process ptracer admissions
@@ -251,9 +251,116 @@ it occurred before MPI started and is not a transport failure.
 | 71708 after large | 26.868 / 27.824 | 26.935 / 32.099 | 0.998 / 0.867 |
 
 Large ready-data gathers consistently improve; small and empty shapes have
-mixed results. This justifies a matched model diagnostic next, not multiplying
-whole-model throughput by the component ratio or changing a global default.
-The current default still uses `btl_vader_single_copy_mechanism=none`.
+mixed results. The matched complete-model comparison uses the original public
+process owner, two real socket ranks, 28 physical workers per socket and the
+same Release closure. Each arm has one warmup and three measured 512-token
+prefills /256-token completions with seed42. Context remains262144, dynamic
+MTP and balancing stay enabled, and the model, prompt, placement, RAM ngrams,
+GPU cache and16/32GiB RAM/disk prefix budgets match. Only the explicitly
+selected MPI mechanism differs.
+
+| Mechanism | Prefill tok/s | Decode-after-prefill tok/s |
+|---|---:|---:|
+| Explicit `none` | 197.507752 | 30.737784 |
+| Explicit `cma` | **199.674087** | **30.770366** |
+
+This is **+1.0968% prefill /+0.1060% decode** in this short paired run. The later
+staging investigation below found156 native read failures in this CMA arm;
+these are diagnostic timings, not a clean transport qualification. All768
+measured output token IDs and MTP records
+match:192 accepted drafts,0 rejects,64 verifiers and256 verified tokens per
+request. Native/driver exits are zero, all processes retire, session bases
+are empty, and the executable/core/decoder/helper/module metadata is unchanged
+throughout. Owned prefix files are removed only after retirement. The user
+accepted locking in this modest observed gain; the500/40 target remains open.
+The discovered staging defect must be fixed before promotion, and complete
+model timing must be repeated with clean native transport diagnostics.
+
+The implementation removes forced `none` from self-bootstrap, frontend runtime
+initialization and canonical CMake/parity/admission/KL launch defaults. Native
+MPI owns available mechanism selection; no new transport, mechanism enum,
+security change or universal forced-CMA setting is introduced. Explicit
+operator settings remain intact. Frozen-history launch validation now permits
+an absent or explicitly authored mechanism while retaining required lifecycle
+controls and rejecting duplicates, unknown controls and malformed argv.
+
+Original-code regressions fail for both the bootstrap argv and the frontend's
+environment mutation. The installed candidate passes all18 selected CTest
+registrations, including the complete six affected Unit registrations, native
+default/explicit-none two-rank startup and eight newly explicit preflight
+aliases. The frozen-history follow-up passes all15 tests and its original
+validator fails the new valid absent/non-none cases. Full preflight is not run
+in this focused iteration.
+
+An additional default-selection activation trace removes the mechanism from
+argv/environment and explicitly unsets inherited intent. MPI reports
+`cma (default)` and the actual two workers perform the same120 positive
+cross-rank copies and709448220 live bytes. Both ranks pass, retire and clean
+their session state, without permission failure or mechanism substitution.
+These traced timings are excluded from the throughput table.
+
+### GPU migration staging must support kernel cross-process access
+
+The subsequent ordinary self-bootstrap model run (`r1050`) completed with
+identical768 tokens/MTP at198.638 prefill /30.605 decode tok/s, but printed156
+OpenMPI `Read -1, expected ..., errno = 14` diagnostics. The earlier explicit-CMA
+model had the same156 failures; the explicit-none control had none. Normal
+process exits and byte-correct eventual output did not prove successful native
+CMA transport. The original timing/driver receipts remain intact, accompanied
+by an explicit failed transport qualification.
+
+The focused captured-publication regression reproduces the fault on all five
+ROCm devices: actual GPU staging maps have Linux `io`/`pf` flags and
+`process_vm_readv` returns EFAULT, despite CPU memcpy and captured GPU roundtrip
+being byte-correct. Original CUDA backing passes. The existing two-rank ROCm
+remote-projection fixture independently reproduces native CMA read failures;
+it now rejects those diagnostics even when MPI eventually completes the
+byte-correct transfer. No whole-model rerun is needed to reproduce this defect.
+
+`HostTransferAccess::CrossProcessReadable` selects ordinary host pages registered
+for the existing GPU aliases. Only remote expert-migration slabs request it;
+local GPU slabs retain their native backing. The same slab, exact live-byte
+extent, PMA/BOM geometry, NUMA first-touch policy and event lifetime remain in
+use. There is no extra payload buffer, added copy, host readback, global HSA
+change or second transport implementation. The immutable requirement propagates
+to slices; remote endpoints reject local-only staging before native setup.
+An arbitrary external registration cannot manufacture this capability.
+
+All17 focused registrations pass: complete mapped-host/transfer Unit owners,
+the explicit capability/lifetime regression, CUDA/ROCm captured publication and
+process-vm reads, existing registration lifetimes/native ROCm backing, real
+two-rank migration, and the affected packed/rectangular all-format, mapped
+progress and heterogeneous GPU transfer suites. Both driver windows are clean.
+The exact-feature CPU companion also passes all 21 selected registrations,
+including the eight complete affected Unit registrations. The new captured
+staging aliases are labeled lifecycle tests, rather than recorded-input replay;
+final registration metadata validates that distinction. Full preflight remains
+deferred for this focused iteration. Native/model evidence applies the same
+scoped patch to the broad optimization tree; exact-feature GPU/model
+certification remains open.
+
+The repaired actual two-rank migration trace proves 36,864 successful cross-worker
+CMA reads totaling 169,869,312 live bytes: 18,432 reads/84,934,656 bytes per
+direction, with 4608 bytes returned per call. MPI selects `cma (default)`, both
+ptracer authorizations succeed, and no read/permission/substitution error occurs.
+All 18 traced tasks retire and the session base is empty. Its 22.53-second traced
+lifetime is not a throughput measurement.
+
+The fresh clean Release model (`r1054`) passes admission and normal self-bootstrap
+with dynamic MTP and expert migration, zero native read errors, clean driver
+observation and complete retirement. The same 512/256 workload gives
+**197.140 prefill /30.199 after-prefill decode tok/s**, versus the clean
+explicit-none control's 197.508/30.738: **-0.19%/-1.75%**. This is approximately
+flat whole-model performance, not evidence of a new end-to-end speedup. All 768
+output IDs, prompt/configuration and MTP work match. Dynamic migration changes
+the routed-work distribution, so these are not identical per-expert execution
+traces. The large-gather component benefit remains separately measured above.
+Both GPU canonical allocation totals return to zero at retirement. Individual
+inference-process peak RSS is 77.281/36.035 GiB; shared mappings are not summed.
+The post-warmup measurement window adds 42.73/41.87 MiB RSS, with stable VRAM
+and about 1.6 GiB free per card. All owned processes and MPI session state
+retire; only then are the run's 18 prefix-cache files (727,912,505 bytes) removed.
+This short run does not certify leak freedom or the 500/40 performance target.
 
 ## Retained local evidence
 
@@ -286,3 +393,21 @@ Detailed artifacts are local ignored results, not repository payloads:
 - `/tmp/qfn-cma-owned-diagnostic-r1045/`: positive activation receipt, four
   untraced lifetimes and `ab-ba-comparison.json`; native artifacts stay unchanged
   and all owned session bases retire empty.
+- `/tmp/qfn-cma-model-r1047/`: matched explicit-none/CMA model lifetimes,
+  `comparison.json`, resource/driver observations and owned-cache cleanup.
+- `/tmp/qfn-mpi-native-transport-default-r1048/`: original-red bootstrap/runtime,
+  final builds and18-registration focused green, plus `activation-default/`.
+- `/tmp/qfn-history-native-mpi-followup-r1049/`: original-red/fixed-green
+  frozen-history validator follow-up; these are model-free metadata tests.
+- `/tmp/qfn-mpi-default-model-r1050/`: self-bootstrap model, matched-token
+  comparison, failed transport qualification and retired-cache cleanup.
+- `/tmp/qfn-mpi-readable-staging-r1051/`: original-red captured-syscall and
+  actual-MPI proofs, candidate builds, focused/format green and native traces.
+- `/tmp/qfn-cma-cross-process-staging-r1052/`: frozen typed backing patch,
+  source/ownership analysis and native activation protocol.
+- `/tmp/qfn-remote-staging-test-adaptations-r1053/`: existing remote fixture
+  adaptations; local-only cases retain their original backing selection.
+- `/tmp/qfn-mpi-clean-model-r1054/`: clean admission/model, matched comparison,
+  resource/driver and retirement evidence, native closure metadata and cleanup.
+- `/tmp/qfn-mpi-native-payload-owner-audit-r1054/REPORT.md`: read-only audit of
+  remaining MPI payload owners; no other concrete GPU-native mapping found.

@@ -12,6 +12,7 @@
 
 #include "backends/IBackend.h"
 #include "execution/moe/MoEOverlaySparseCollective.h"
+#include "execution/moe/MoEOverlayGpuRemoteProjectionEndpoint.h"
 #include "execution/local_execution/graph/IGraphBuilder.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/compute_stages/stages/MoEOverlayTicketPublishStage.h"
@@ -470,6 +471,91 @@ TEST_F(Test__MappedHostTransferRegion, GraphServiceMappedStagingViewsPreserveExa
         }
     }
     EXPECT_THROW((void)engine_.mappedStagingView({}), std::invalid_argument);
+}
+
+/** MPI slabs own ordinary registered pages, with one lifetime for every bounded view. */
+TEST_F(Test__MappedHostTransferRegion, CrossProcessStagingRetainsAccessBoundsAndRegistrationLifetime)
+{
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        auto &backend = device.is_cuda() ? *cuda_ : *rocm_;
+        auto slices = engine_.allocatePersistentTransferStagingSlices(
+            257u, 3u, device, HostTransferAccess::CrossProcessReadable);
+        EXPECT_EQ(backend.mapped_allocate_count, 0u);
+        EXPECT_EQ(backend.register_count, 1u);
+        EXPECT_EQ(backend.registered_bytes, TransferEngine::mappedHostRegionAllocationBytes(771u));
+        for (const auto &slice : slices)
+        {
+            EXPECT_EQ(slice.hostAccess(), HostTransferAccess::CrossProcessReadable);
+            auto view = engine_.mappedStagingView(slice);
+            EXPECT_EQ(view->hostAccess(), HostTransferAccess::CrossProcessReadable);
+            EXPECT_EQ(view->sizeBytes(), 257u);
+            EXPECT_EQ(view->mutableHostData(), slice.mutablePinnedData());
+            EXPECT_EQ(*static_cast<unsigned char *>(view->mutableHostData()), 0u);
+            EXPECT_THROW((void)view->deviceAlias(device, 258u), std::out_of_range);
+        }
+        auto retained = engine_.mappedStagingView(slices[1]);
+        std::memset(retained->mutableHostData(), 0x53, retained->sizeBytes());
+        EXPECT_EQ(*static_cast<unsigned char *>(slices[0].mutablePinnedData()), 0u);
+        EXPECT_EQ(*static_cast<unsigned char *>(slices[2].mutablePinnedData()), 0u);
+        slices.clear();
+        EXPECT_EQ(backend.unregister_count, 0u);
+        EXPECT_EQ(*static_cast<unsigned char *>(retained->mutableHostData()), 0x53u);
+        retained.reset();
+        EXPECT_EQ(backend.unregister_count, 1u);
+    }
+}
+
+/** Native singleton/portable allocation cannot silently replace a required process-readable backing. */
+TEST_F(Test__MappedHostTransferRegion, CrossProcessRegionPreservesEveryBackendAliasAndRollsBackFailure)
+{
+    const std::array devices{DeviceId::cuda(0), DeviceId::cuda(3), DeviceId::rocm(0), DeviceId::rocm(2)};
+    auto region = engine_.allocateMappedHostRegion(4097u, devices, HostTransferAccess::CrossProcessReadable);
+    EXPECT_EQ(region->hostAccess(), HostTransferAccess::CrossProcessReadable);
+    EXPECT_EQ(region->sizeBytes(), TransferEngine::mappedHostRegionAllocationBytes(4097u));
+    for (const auto device : devices) EXPECT_NE(region->deviceAlias(device), nullptr);
+    EXPECT_EQ(cuda_->register_count, 1u);
+    EXPECT_EQ(rocm_->register_count, 1u);
+    EXPECT_EQ(cuda_->mapped_allocate_count, 0u);
+    EXPECT_EQ(rocm_->mapped_allocate_count, 0u);
+    region.reset();
+    EXPECT_EQ(cuda_->unregister_count, 1u);
+    EXPECT_EQ(rocm_->unregister_count, 1u);
+    rocm_->registration_succeeds = false;
+    EXPECT_THROW((void)engine_.allocateMappedHostRegion(4097u, devices,
+        HostTransferAccess::CrossProcessReadable), std::runtime_error);
+    EXPECT_EQ(cuda_->unregister_count, 2u);
+    EXPECT_EQ(rocm_->unregister_count, 1u);
+    EXPECT_THROW((void)engine_.allocateMappedHostRegion(4097u, devices,
+        static_cast<HostTransferAccess>(255)), std::invalid_argument);
+    EXPECT_EQ(cuda_->register_count, 2u);
+    EXPECT_EQ(rocm_->register_count, 2u);
+}
+
+/** Reject a local-only staging slice before resolving a remote lane's native execution resources. */
+TEST_F(Test__MappedHostTransferRegion, CrossProcessEndpointRejectsLocalOnlyStaging)
+{
+    EXPECT_EQ(PersistentTransferStagingSlice{}.hostAccess(), HostTransferAccess::ProcessLocal);
+    for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+    {
+        const auto slices = engine_.allocatePersistentTransferStagingSlices(257u, 1u, device);
+        EXPECT_EQ(slices[0].hostAccess(), HostTransferAccess::ProcessLocal);
+        EXPECT_EQ(engine_.mappedStagingView(slices[0])->hostAccess(), HostTransferAccess::ProcessLocal);
+        try
+        {
+            MoEOverlayGpuRemoteProjectionLane lane({
+                .device = device,
+                .staging = slices[0],
+                .progress = BackgroundTransferProgressBinding::nativeStream(),
+                .lane_name = "rejected_local_only_remote_staging",
+            });
+            FAIL() << "Remote endpoint accepted local-only mapped backing";
+        }
+        catch (const std::invalid_argument &error)
+        {
+            EXPECT_NE(std::string(error.what()).find("cross-process-readable"), std::string::npos);
+        }
+    }
 }
 
 /** The public authority preserves device, stream, capacity and typed lifetime. */

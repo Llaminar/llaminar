@@ -673,8 +673,7 @@ def main(argv=None) -> int:
         if len(binaries) != 1:
             raise ValueError('source inventory belongs to more than one executable')
         binary = binaries.pop()
-        environment = {**os.environ, 'HWLOC_COMPONENTS': '-gl,-opencl',
-                       'OMPI_MCA_btl_vader_single_copy_mechanism': 'none'}
+        environment = {**os.environ, 'HWLOC_COMPONENTS': '-gl,-opencl'}
         with tempfile.TemporaryDirectory(prefix='qfn-source-metadata-') as temporary:
             parameters = Path(temporary) / 'parameters.json'
             subprocess.run([binary, '--gtest_list_tests', f'--gtest_output=json:{parameters}'],

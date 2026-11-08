@@ -334,6 +334,17 @@ namespace llaminar2
 namespace llaminar2
 {
 
+    /** @brief Required native host access, fixed before allocation/registration.
+     * ProcessLocal retains the existing GPU-native backing. CrossProcessReadable
+     * requires ordinary host pages that native MPI/process-vm can address, with
+     * those same pages registered for GPU DMA; it never creates a bounce copy.
+     */
+    enum class HostTransferAccess : std::uint8_t
+    {
+        ProcessLocal,
+        CrossProcessReadable,
+    };
+
     class MappedHostTransferRegion;
 
     /**
@@ -552,6 +563,9 @@ namespace llaminar2
 
         /** @return Exact GPU whose backend owns both staging slabs. */
         [[nodiscard]] DeviceId device() const noexcept { return device_; }
+
+        /** @return Original slab's immutable host-access contract; invalid placeholders are local-only. */
+        [[nodiscard]] HostTransferAccess hostAccess() const noexcept;
 
         /** @return Immutable exclusive byte capacity of this lane slot. */
         [[nodiscard]] size_t sizeBytes() const noexcept { return bytes_; }
@@ -789,8 +803,10 @@ namespace llaminar2
     /**
      * @brief One stable shared-page region mapped into explicit local endpoints.
      *
-     * Exact-one-GPU regions use the backend's native mapped allocation. Shared
-     * same-family regions use the backend's portable native allocation, rather
+     * ProcessLocal exact-one-GPU regions use native mapped allocation. Explicit
+     * CrossProcessReadable regions own ordinary pages registered for the same
+     * GPU aliases, so kernel-native MPI can address the original host backing.
+     * ProcessLocal same-family regions use portable native allocation, rather
      * than allocating pageable memory and registering it after first touch. On
      * ROCm both native forms avoid a page-table invalidation interrupt per host
      * page. Genuinely mixed-backend external pages are still registered once per
@@ -814,6 +830,9 @@ namespace llaminar2
 
         /** @return Immutable mapped byte capacity. */
         [[nodiscard]] size_t sizeBytes() const noexcept { return bytes_; }
+
+        /** @return Immutable backing access selected before native registration. */
+        [[nodiscard]] HostTransferAccess hostAccess() const noexcept { return host_access_; }
 
         /** @return Canonical sorted device set bound during setup. */
         [[nodiscard]] std::span<const DeviceId> devices() const noexcept
@@ -877,13 +896,22 @@ namespace llaminar2
                 MappedHostRegistrationScope::DeviceLocal;
         };
 
-        /** @brief Validate and retain immutable mapped-page identity. */
+        /**
+         * @brief Validate and retain immutable mapped-page identity.
+         * @param allocation Original stable host address.
+         * @param bytes Exact positive allocation/view capacity.
+         * @param devices Actual endpoint set, canonicalized once at setup.
+         * @param lifetime Physical backing or original parent lifetime owner.
+         * @param backing_kind Exact native/external/parent release authority.
+         * @param host_access Allocation-authenticated host consumer requirement.
+         */
         MappedHostTransferRegion(
             void *allocation,
             size_t bytes,
             std::span<const DeviceId> devices,
             std::shared_ptr<void> lifetime,
-            BackingKind backing_kind);
+            BackingKind backing_kind,
+            HostTransferAccess host_access = HostTransferAccess::ProcessLocal);
 
         /** @return Backend bound to @p device, or null for CPU/absent. */
         [[nodiscard]] IBackend *backendFor(DeviceId device) const noexcept;
@@ -897,6 +925,7 @@ namespace llaminar2
         std::shared_ptr<PhysicalMemoryAllocationLease> allocation_claim_;
         std::shared_ptr<void> lifetime_; ///< Frees pages or retains the parent.
         BackingKind backing_kind_ = BackingKind::ExternalRegistration;
+        const HostTransferAccess host_access_; ///< Construction-only capability; child views inherit it.
         bool bound_ = false; ///< True after every alias resolves successfully.
     };
 
@@ -1444,6 +1473,7 @@ namespace llaminar2
          * @param bytes_per_slice Positive capacity required by every lane.
          * @param slice_count Positive number of independently runnable lanes.
          * @param device Exact GPU owning the registration and device slab.
+         * @param host_access Required host backing; MPI lanes explicitly select CrossProcessReadable.
          * @return Exactly @p slice_count disjoint model-lifetime staging slices.
          * @throws std::invalid_argument for invalid geometry/device identity.
          * @throws std::overflow_error when the complete slab cannot be represented.
@@ -1453,7 +1483,8 @@ namespace llaminar2
         allocatePersistentTransferStagingSlices(
             size_t bytes_per_slice,
             size_t slice_count,
-            DeviceId device) const;
+            DeviceId device,
+            HostTransferAccess host_access = HostTransferAccess::ProcessLocal) const;
 
         /**
          * @brief Retain the exact mapped portion of an already-admitted staging slice.
@@ -1523,7 +1554,9 @@ namespace llaminar2
          * portability is selected only when two or more declared endpoints in
          * that same backend need aliases. Duplicate/invalid devices and partial
          * backend registration fail atomically; successful teardown unregisters
-         * every family before releasing @p lifetime.
+         * every family before releasing @p lifetime. Arbitrary caller-owned
+         * pages retain ProcessLocal access: registration alone is not proof of
+         * their backing's cross-process readability.
          */
         [[nodiscard]] std::shared_ptr<MappedHostTransferRegion>
         registerExternalMappedHostRegion(
@@ -1535,22 +1568,27 @@ namespace llaminar2
         /**
          * @brief Allocate first-touched mapped pages for exact local GPUs.
          *
-         * One endpoint uses its backend-native mapped allocator, avoiding the
-         * ROCm ATS invalidation storm caused by registering a large anonymous
-         * range. Multiple endpoints require genuinely shared pages and retain
-         * the typed external-registration path. The setup thread zeroes the
+         * ProcessLocal preserves the existing native mapped/portable allocator
+         * for one/same-family endpoints. CrossProcessReadable directly allocates
+         * ordinary pages and registers those same pages for the original GPUs;
+         * it never retries a native allocation or creates a bounce payload.
+         * Mixed-backend local endpoints retain external registration as before.
+         * The setup thread zeroes the
          * complete allocation, so Linux NUMA placement follows its established
          * affinity. Capacity is rounded to a system page. No allocation,
          * registration, or address change occurs after this method returns.
          *
          * @param bytes Positive minimum capacity.
          * @param devices Non-empty exact local GPU endpoint set.
+         * @param host_access ProcessLocal preserves GPU-native allocation; CrossProcessReadable
+         * allocates ordinary anonymous pages and registers those same pages with every GPU.
          * @return Immutable model-lifetime mapped-region authority.
          */
         [[nodiscard]] std::shared_ptr<MappedHostTransferRegion>
         allocateMappedHostRegion(
             size_t bytes,
-            std::span<const DeviceId> devices) const;
+            std::span<const DeviceId> devices,
+            HostTransferAccess host_access = HostTransferAccess::ProcessLocal) const;
 
         /**
          * @brief Materialize one admitted CPU publication backing through native mapping.
@@ -2945,6 +2983,19 @@ namespace llaminar2
             std::span<const CapturedTransferBinding> consumers,
             CapturedTransferEndpointScheduling scheduling, void *stream,
             const AcquiredDeviceTransferInput *fork) const;
+
+        /**
+         * @brief Register already-owned pages with an allocation-authenticated access contract.
+         * @param allocation Stable host pages; their physical owner remains in lifetime.
+         * @param bytes Exact mapped byte capacity.
+         * @param devices Original endpoint set, never fake consumers to influence allocation.
+         * @param lifetime Original backing owner retained through unregister.
+         * @param host_access CrossProcessReadable is supplied only by our ordinary-page allocator.
+         * @return Bound immutable region, or throws before publication on registration failure.
+         */
+        [[nodiscard]] std::shared_ptr<MappedHostTransferRegion> registerExternalMappedHostRegionImpl(
+            void *allocation, size_t bytes, std::span<const DeviceId> devices,
+            std::shared_ptr<void> lifetime, HostTransferAccess host_access) const;
 
         /**
          * @brief Derive one stable child view without another native mapping.

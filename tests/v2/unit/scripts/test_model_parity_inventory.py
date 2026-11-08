@@ -397,6 +397,7 @@ class ExactLiveSelectionTests(unittest.TestCase):
                           self.campaign("unrelated", self.other, ("Suite.ProductionParity/other",))]
         self.listings = {self.binary: self.cases, self.other: ("Suite.ProductionParity/other",)}
         self.launched = []
+        self.child_environments = []
 
     def campaign(self, name, binary, cases):
         """Retain real campaign value objects, never executable fixture processes."""
@@ -408,6 +409,7 @@ class ExactLiveSelectionTests(unittest.TestCase):
         """Stub process creation; production discovery performs every join and rejection."""
         def listing(command, **kwargs):
             self.launched.append(command[0])
+            self.child_environments.append(dict(kwargs["env"]))
             records = [{"name": exact.removeprefix("Suite."),
                 "value_param": json.dumps(row(exact, False)["configuration"] | {"model": str(self.model)})}
                 for exact in self.listings[command[0]]]
@@ -417,6 +419,18 @@ class ExactLiveSelectionTests(unittest.TestCase):
              patch.object(inventory.parity, "selected_model_files", return_value=[self.model]), \
              patch.object(inventory.subprocess, "run", side_effect=listing):
             return inventory.discover(self.args, inventory.InventoryScope.ALL)
+
+    def test_native_mpi_selection_is_inherited_without_forced_default(self):
+        """Actual inventory launches preserve absent and explicit operator policy."""
+        key = "OMPI_MCA_btl_vader_single_copy_mechanism"
+        for selected in (None, "cma", "none"):
+            with self.subTest(selected=selected), patch.dict(
+                    inventory.os.environ, {} if selected is None else {key: selected}, clear=True):
+                self.discover()
+                observed = self.child_environments[-1]
+                self.assertEqual(observed.get(key), selected)
+                self.assertEqual(observed["LLAMINAR_FORCE_CPU_ONLY_STARTUP"], "1")
+                self.assertEqual(inventory.os.environ.get(key), selected)
 
     def test_exact_cell_never_lists_unrelated_binary(self):
         self.assertEqual([exact for _, exact, _ in self.discover()], [self.cases[0]])

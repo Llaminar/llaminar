@@ -11,6 +11,7 @@
  * --config parser: excluded peers finalize while selected ranks reach real
  * runner metadata admission. Asymmetric or absent selections fail before split.
  * No real model or accelerator is used, and the ordinary MPI timeout applies.
+ * Native MPI copy policy remains library/operator owned across initialization.
  *
  * The custom entry owns one lexical native GPU lifetime without probing a
  * device. Native workers/caches retire before process exit and MPI finalization.
@@ -23,6 +24,7 @@
 #include "utils/DebugEnv.h"
 #include <mpi.h>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <optional>
 #include <string>
@@ -37,6 +39,14 @@ namespace
         RankParseFailure, DryRunFailure, SavedConfiguration,
         SelectedFollower, ReversedSelection, AsymmetricSelection, AbsentSelection
     };
+
+    /** @return Original native MPI transport intent; absence remains a distinct policy. */
+    std::optional<std::string> nativeTransportIntent()
+    {
+        if(const char *value=std::getenv("OMPI_MCA_btl_vader_single_copy_mechanism"))
+            return std::string(value);
+        return std::nullopt;
+    }
 
     /** @brief Own the exact per-rank input document until the frontend retires. */
     class SavedConfig final
@@ -114,7 +124,14 @@ int main(int argc, char **argv)
     int count = static_cast<int>(args.size());
     char **arguments = pointers.data();
     llaminar2::OrchestrationConfig config;
+    // The ordinary frontend must not insert a disabling override before MPI_Init.
+    const auto original_transport_intent=nativeTransportIntent();
     const auto result = llaminar2::RuntimeInitPhase{}.execute(config, count, arguments);
+    if(nativeTransportIntent()!=original_transport_intent)
+    {
+        std::fputs("FAIL: frontend replaced original native MPI transport intent\n",stderr);
+        return 1;
+    }
     const auto *terminal = std::get_if<llaminar2::RuntimeInitExit>(&result);
     int finalized = 0;
     MPI_Finalized(&finalized);

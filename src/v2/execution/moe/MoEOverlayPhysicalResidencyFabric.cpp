@@ -5028,7 +5028,8 @@ namespace llaminar2
                                 .allocatePersistentTransferStagingSlices(
                                     config.staging_capacity_bytes,
                                     lane_count,
-                                    device);
+                                    device,
+                                    HostTransferAccess::CrossProcessReadable);
                         for (std::size_t lane_index = 0;
                              lane_index < lane_count;
                              ++lane_index)

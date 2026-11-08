@@ -96,7 +96,6 @@ mpirun -np 1 \                             # Single rank for pure performance
     --bind-to socket \                     # Bind to socket
     --map-by socket \                      # Map by socket
     --mca mpi_leave_pinned 1 \             # Keep memory pinned
-    --mca btl_vader_single_copy_mechanism none \
     --report-bindings \                    # Verify core pinning
     ./benchmark_executable
 ```

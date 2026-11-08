@@ -151,7 +151,7 @@ def original_local_launch(args, adapter, image, output, native_command, environm
     session_base.mkdir()
     command=[str(launcher),'--session-base',str(session_base),'--',str(mpi),'-np',str(world),
              '--rankfile',str(rankfile),'--bind-to',binding,'--report-bindings']
-    command+=['--mca','mpi_leave_pinned','1','--mca','btl_vader_single_copy_mechanism','none',
+    command+=['--mca','mpi_leave_pinned','1',
               '--mca','orte_allowed_exit_without_sync','1','--',*native_command]
     proof=dict(schema='llaminar.original-mpi-rankfile-launch.v1',world_size=world,
                rankfile=dict(path=str(rankfile),stat=pins[str(rankfile)]),

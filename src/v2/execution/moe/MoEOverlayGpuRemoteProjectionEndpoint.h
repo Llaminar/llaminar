@@ -90,7 +90,7 @@ namespace llaminar2
         struct Config
         {
             DeviceId device = DeviceId::invalid();
-            /** Exclusive host/device staging region from one shared slab. */
+            /** Exclusive CrossProcessReadable host/device slab slice; local-only native backing is rejected. */
             PersistentTransferStagingSlice staging;
             /** Exact participant/cycle stream shared across compatible work. */
             PersistentTransferExecutionLane execution;

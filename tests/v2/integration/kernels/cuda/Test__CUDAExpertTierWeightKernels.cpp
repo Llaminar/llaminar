@@ -1367,7 +1367,8 @@ namespace llaminar2
                                    .allocatePersistentTransferStagingSlices(
                                        layout.chunkBytes(units_per_chunk),
                                        1u,
-                                       DeviceId::cuda(device_ordinal))
+                                       DeviceId::cuda(device_ordinal),
+                                       HostTransferAccess::CrossProcessReadable)
                                    .front(),
                     .execution = TransferEngine::instance()
                                      .allocatePersistentTransferExecutionLanes(
@@ -1724,7 +1725,8 @@ namespace llaminar2
                                    .allocatePersistentTransferStagingSlices(
                                        promotion_manifest.maximum_chunk_bytes,
                                        1u,
-                                       DeviceId::cuda(0))
+                                       DeviceId::cuda(0),
+                                       HostTransferAccess::CrossProcessReadable)
                                    .front(),
                     .execution = TransferEngine::instance()
                                      .allocatePersistentTransferExecutionLanes(

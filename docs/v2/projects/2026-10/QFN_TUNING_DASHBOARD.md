@@ -7,14 +7,13 @@ analysis in the linked tuning notes, not in this dashboard.
 ## Current status
 
 **Active hybrid target: 500 prefill /40 decode tok/s on 2×MI50 +2×CPU TP.**
-Current local Release 512/256 result: **196.279 P /30.230 D**. Omitting short-
-prefill indexer-query projection/preparation/scoring improves P **7.09%** over
+Last clean local Release 512/256 result: **197.140 P /30.199 D**.
+Skipping unused short-prefill indexer kernels gains **7.09%** over
 an identical-owner control (**183.283/30.179**); decode is unchanged. Each GPU
 executes **36 fewer kernels/chunk**. All 768 output IDs and MTP work match.
 Paired retained graphs cost eight GPU expert slots: **8066 total, 4033/card**.
 Context stays 262144 with dynamic MTP/balancing, RAM ngrams, local GPU caches
-and 16/32 GiB RAM/disk prefix budgets. The original dense-scratch accounting
-fix had raised GPU capacity from 50–51 to 82–83 experts/card/layer.
+and 16/32 GiB RAM/disk prefix budgets.
 
 Broad Integration: **1254 affected Unit cases and eight native CUDA/ROCm
 registrations pass**; focused host aliases pass. Exact-feature new checks pass;
@@ -22,8 +21,12 @@ its CPU-only companion cannot qualify 27 compiled-GPU geometry cases. **Full
 preflight, exact checkpoint GPU/model and OpenCode remain open**. The original
 owner0 remains selected: moving it to the other NUMA cohort did not help.
 Ready-data MPI gather beats retained SharedSpin by 1.42–1.48× at 1–16 MiB;
-CMA improves large gathers another 1.3–1.4× in both test orders; model effect
-is unmeasured and defaults stay unchanged.
+CMA adds 1.3–1.4× on large gathers. Model qualification exposed IO/PFN-backed
+GPU migration pages rejected by CMA. Typed registered backing fixes that:
+**17 native/transfer and 21 exact-feature checks pass**. Clean model output/MTP
+matches; zero read errors. Rates are -0.19%/-1.75% versus explicit-none:
+approximately flat, with changed migration routes. Earlier CMA timings had errors.
+Next: checkpoint this fix, then interleave independent CPU integer dots.
 [Launch omission, matched controls and timeline](../2026-11/QFN_HYBRID_TIMELINE_AND_NUMA_20261108.md).
 [Root phase timing](../2026-11/QFN_HYBRID_ROOT_TIMING_20261108.md).
 [Admission correction](../2026-11/QFN_SELECTED_ATTENTION_WORKSPACE_ADMISSION_20261108.md).

@@ -232,6 +232,30 @@ class CorpusExecutionTests(unittest.TestCase):
                 self.assertEqual(controller['native_launch']['overlap_policy'],'strict')
                 for rank in range(2):self.assertEqual(json.loads((output/f'rank-{rank}.json').read_text())['rank'],rank)
 
+    def test_rankfile_launch_uses_native_mpi_selection_and_retains_operator_environment(self):
+        """Inspect the actual stat-pinned launch, without executing any child."""
+        key = 'OMPI_MCA_btl_vader_single_copy_mechanism'
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            rankfile = root / 'original.rankfile'; rankfile.write_text('metadata only')
+            for name in ('llaminar_mpi_session', 'mpirun'):
+                path = root / name; path.write_text('metadata only'); path.chmod(0o700)
+            args = SimpleNamespace(binary=root/'observer', mpi_rankfile=rankfile)
+            original = SimpleNamespace(topology={'expected_config': {'configuration': {'mpi_procs': 2}}})
+            for selected in (None, 'cma', 'none'):
+                with self.subTest(selected=selected):
+                    environment = {'PATH': str(root)}
+                    if selected is not None: environment[key] = selected
+                    before = dict(environment)
+                    (root/str(selected)).mkdir()
+                    command, pins, proof = runner.original_local_launch(
+                        args, original, None, root/str(selected), [str(args.binary), '--exact'], environment)
+                    self.assertNotIn('btl_vader_single_copy_mechanism', command)
+                    self.assertEqual(environment, before)
+                    self.assertEqual(command[-2:], [str(args.binary), '--exact'])
+                    self.assertEqual(proof['world_size'], 2)
+                    self.assertEqual(len(pins), 3)
+
     def test_one_existing_lifecycle_retires_before_failed_native_artifact_cleanup(self):
         self._replay_original_lifecycle_retirement()
 

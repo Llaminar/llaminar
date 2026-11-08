@@ -188,7 +188,7 @@ class FrozenHistoryReplayTests(unittest.TestCase):
         self.assertEqual(self.prepare().descriptor['decode_rows'], 6)
 
     def test_explicit_worker_launch_preserves_native_identity_and_transport(self):
-        """Only the selected history gets the unbound physical-core projection."""
+        """Explicit operator transport selection survives the physical-core projection."""
         from unittest.mock import patch
         command = ('/usr/bin/mpirun', '-np', '1', '--bind-to', 'socket', '--map-by', 'socket',
                    '--mca', 'mpi_leave_pinned', '1',
@@ -243,13 +243,13 @@ class FrozenHistoryReplayTests(unittest.TestCase):
             self.value['expected_config']['configuration'].update(n_threads=2, mpi_procs=participants)
             self.publish()
             command = ('/usr/bin/mpirun', '-np', str(participants), '--bind-to', 'socket', '--map-by', 'socket',
-                '--mca', 'mpi_leave_pinned', '1', '--mca', 'btl_vader_single_copy_mechanism', 'none',
+                '--mca', 'mpi_leave_pinned', '1',
                 '--mca', 'orte_allowed_exit_without_sync', '1',
                 '/native/exact-target', '--gtest_filter=' + self.cell)
             environment = {'LLAMINAR_PERF_STATS_FILTER': 'forward_graph,immutable_lookup'}
             with patch('model_kld_corpus.physical_workers', return_value=participants*2):
                 actual, values = self.prepare().launch(command, environment)
-                self.assertEqual(actual[:16], command[:16])
+                self.assertEqual(actual[:13], command[:13])
                 self.assertEqual(values['OMP_NUM_THREADS'], '2')
                 self.assertEqual(actual[-2:], command[-2:])
                 with self.assertRaises(ValueError):
@@ -265,9 +265,51 @@ class FrozenHistoryReplayTests(unittest.TestCase):
     def original_mpi_command(self, participants, *, application_boundary=False):
         """Return original launch metadata only; no child/model/communicator is created."""
         return ('/usr/bin/mpirun', '-np', str(participants), '--bind-to', 'socket', '--map-by', 'socket',
-            '--mca', 'mpi_leave_pinned', '1', '--mca', 'btl_vader_single_copy_mechanism', 'none',
+            '--mca', 'mpi_leave_pinned', '1',
             '--mca', 'orte_allowed_exit_without_sync', '1') + (('--',) if application_boundary else ()) + (
             '/native/exact-target', '--gtest_filter=' + self.cell)
+
+    def test_optional_native_transport_preserves_absent_and_explicit_intent(self):
+        """Pass the original policy through; installed MPI owns mechanism support."""
+        key = 'OMPI_MCA_btl_vader_single_copy_mechanism'
+        for participants in (1, 2):
+            self.value['expected_config']['configuration']['mpi_procs'] = participants
+            self.publish()
+            for boundary in (False, True):
+                for selected in (None, 'none', 'cma', 'knem', 'xpmem'):
+                    with self.subTest(participants=participants, boundary=boundary, selected=selected):
+                        command = self.original_mpi_command(participants, application_boundary=boundary)
+                        if selected is not None:
+                            command = command[:10] + ('--mca', 'btl_vader_single_copy_mechanism', selected) + command[10:]
+                        environment = {'LLAMINAR_PERF_STATS_FILTER': 'forward_graph', key: 'cma'}
+                        with patch('model_kld_corpus.physical_workers', return_value=8):
+                            actual, values = self.prepare().launch(command, environment)
+                        # Only worker exports/one-rank placement change. MCA words
+                        # and an explicit application delimiter retain their order.
+                        boundary_index = command.index('--') if boundary else len(command)-2
+                        self.assertEqual(actual[7:boundary_index], command[7:boundary_index])
+                        self.assertEqual(values[key], 'cma')
+                        self.assertEqual(environment[key], 'cma')
+                        self.assertEqual(actual[-2:], command[-2:])
+
+    def test_required_mca_and_unique_optional_transport_controls_are_enforced(self):
+        """Optional transport cannot hide missing, duplicate or unknown controls."""
+        command = self.original_mpi_command(1, application_boundary=True)
+        optional = ('--mca', 'btl_vader_single_copy_mechanism', 'none')
+        cases = [command[:7] + command[10:], command[:10] + command[13:],
+                 command[:10] + command[7:10] + command[10:],
+                 command[:10] + optional + optional + command[10:],
+                 command[:10] + optional + ('--mca', optional[1], 'cma') + command[10:],
+                 command[:10] + ('--mca', 'unknown_resource_control', '1') + command[10:],
+                 command[:10] + ('--mca', optional[1], '') + command[10:],
+                 command[:9] + ('0',) + command[10:],
+                 command[:12] + ('0',) + command[13:],
+                 command[:10] + ('--mca', optional[1])]
+        environment = {'LLAMINAR_PERF_STATS_FILTER': 'forward_graph'}
+        with patch('model_kld_corpus.physical_workers', return_value=4):
+            for malformed in cases:
+                with self.subTest(command=malformed), self.assertRaises(ValueError):
+                    self.prepare().launch(malformed, environment)
 
     def test_original_guardian_envelope_preserves_rank_population_and_application_boundary(self):
         """Actual wrapped grammar preserves its owner/base and legacy direct MPI semantics."""

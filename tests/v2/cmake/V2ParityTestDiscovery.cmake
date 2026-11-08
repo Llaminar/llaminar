@@ -65,7 +65,6 @@ execute_process(
     COMMAND "${CMAKE_COMMAND}" -E env
         "HWLOC_COMPONENTS=-gl,-opencl"
         "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1"
-        "OMPI_MCA_btl_vader_single_copy_mechanism=none"
         "${TEST_EXECUTABLE}" --gtest_list_tests
     OUTPUT_VARIABLE _test_list_output
     ERROR_VARIABLE _discovery_error
@@ -217,7 +216,6 @@ set(_env_vars
     "MKL_NUM_THREADS=${CORES_PER_SOCKET}"
     "MKL_DYNAMIC=false"
     "OMPI_MCA_mpi_leave_pinned=1"
-    "OMPI_MCA_btl_vader_single_copy_mechanism=none"
     "OMPI_MCA_btl_openib_allow_ib=1"
 )
 
@@ -379,7 +377,6 @@ foreach(_full_name IN LISTS _all_tests)
         "--bind-to" "socket"
         "--map-by" "socket"
         "--mca" "mpi_leave_pinned" "1"
-        "--mca" "btl_vader_single_copy_mechanism" "none"
         "--mca" "orte_allowed_exit_without_sync" "1")
     if(NUM_SOCKETS AND _focused_mpi_procs GREATER NUM_SOCKETS)
         list(APPEND _test_mpi_cmd "--oversubscribe")
@@ -699,7 +696,6 @@ foreach(_campaign_key IN LISTS _production_campaign_keys)
         "--bind-to" "socket"
         "--map-by" "socket"
         "--mca" "mpi_leave_pinned" "1"
-        "--mca" "btl_vader_single_copy_mechanism" "none"
         "--mca" "orte_allowed_exit_without_sync" "1")
     if(NUM_SOCKETS AND _campaign_mpi_procs GREATER NUM_SOCKETS)
         list(APPEND _campaign_mpi_cmd "--oversubscribe")

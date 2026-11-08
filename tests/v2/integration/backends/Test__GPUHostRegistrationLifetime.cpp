@@ -10,6 +10,8 @@
  * is involved. CPU waits occur only at the test's terminal result boundary.
  * Full-span VMA assertions include interior PMDs, so khugepaged eligibility is
  * tested deterministically before captured DMA rather than through printk.
+ * MPI staging additionally proves the actual process_vm_readv syscall after
+ * captured GPU publication; a CPU-readable device mapping alone is insufficient.
  */
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -24,6 +26,10 @@
 #include <cstring>
 #include <memory>
 #include <array>
+#include <cerrno>
+#include <sys/uio.h>
+#include <unistd.h>
+#include <vector>
 
 using namespace llaminar2;
 
@@ -167,6 +173,87 @@ TEST(GPUHostRegistrationLifetime, TensorUploadAcrossAllDevices)
 TEST(GPUHostRegistrationLifetime, ExternalChannelCapturedReplayAcrossAllDevices)
 {
     proveRegistrationLifetime(SourceOwner::ExternalChannel);
+}
+
+/**
+ * @test GPU-published staging remains readable by the kernel's CMA operation.
+ * @details Driver-owned IO/PFN mappings can be CPU-readable yet reject Linux
+ * process_vm_readv with EFAULT. Exercise the exact syscall against a completed
+ * captured transfer, changing retained payloads between replays. Reading our
+ * own process isolates mapping eligibility from cross-process ptrace policy;
+ * the two-rank projection suite separately proves actual MPI movement.
+ */
+TEST(GPUHostRegistrationLifetime, RemoteStagingSupportsCmaAfterCapturedPublication)
+{
+    auto *backend = getBackendFor(deviceAt(0));
+    ASSERT_NE(backend, nullptr);
+    ASSERT_GT(backend->deviceCount(), 0);
+    TransferEngine transfers;
+    for (int ordinal = 0; ordinal < backend->deviceCount(); ++ordinal)
+        for (const std::size_t bytes : {4093u, 1024u * 1024u + 13u})
+        {
+            const auto device = deviceAt(ordinal);
+            SCOPED_TRACE(device.toString() + " bytes=" + std::to_string(bytes));
+            auto &worker = GPUDeviceContextPool::instance().getContext(device);
+            const auto staging = transfers.allocatePersistentTransferStagingSlices(
+                bytes, 2u, device, HostTransferAccess::CrossProcessReadable);
+            const auto input = transfers.mappedStagingView(staging[0]);
+            const auto output = transfers.mappedStagingView(staging[1]);
+            const auto lanes = transfers.allocatePersistentTransferExecutionLanes(
+                1u, device, "remote_staging_cma_publication");
+            std::vector<unsigned char> observed(bytes);
+            worker.submitAndWait([&] {
+                const auto stream = lanes.front().stream();
+                auto graph = worker.createGraphCapture(stream);
+                ASSERT_NE(graph, nullptr);
+                GraphCaptureDependencyLedger::StagePlan transaction{
+                    .stage_identity = &staging,
+                    .stage_name = "remote staging captured publication",
+                };
+                GraphCaptureDependencyLedger ledger(device, stream,
+                    {std::move(transaction)}, "remote staging CMA publication");
+                {
+                    ScopedBackendGraphCapture capture(worker, *graph,
+                        "remote staging CMA publication", &ledger);
+                    ASSERT_TRUE(capture.begin());
+                    ScopedGraphCaptureStage stage(&staging);
+                    transfers.enqueueMappedHostToPersistentDeviceRegion(*input, 0u,
+                        staging[0].mutableDeviceData(), bytes, 0u, bytes, device, stream);
+                    transfers.enqueuePersistentDeviceRegionToMappedHost(staging[0].mutableDeviceData(),
+                        bytes, 0u, *output, 0u, bytes, device, stream);
+                    stage.complete();
+                    capture.finish();
+                }
+                ASSERT_TRUE(graph->instantiate());
+                const auto destroy_event = [&](void *event) { worker.destroyEvent(event); };
+                std::unique_ptr<void, decltype(destroy_event)> terminal(worker.createEvent(), destroy_event);
+                ASSERT_NE(terminal, nullptr);
+                for (int replay = 0; replay < 3; ++replay)
+                {
+                    auto *expected = static_cast<unsigned char *>(input->mutableHostData());
+                    for (std::size_t index = 0; index < bytes; ++index)
+                        expected[index] = static_cast<unsigned char>(index * 43u + (index >> 7u) + replay);
+                    std::memset(output->mutableHostData(), 0xa5, bytes);
+                    std::fill(observed.begin(), observed.end(), 0x6b);
+                    ASSERT_TRUE(graph->launch());
+                    ASSERT_TRUE(worker.recordEventChecked(terminal.get(), stream));
+                    ASSERT_TRUE(worker.synchronizeEventChecked(terminal.get()));
+                    ASSERT_EQ(std::memcmp(output->mutableHostData(), expected, bytes), 0);
+                    iovec local{observed.data(), bytes};
+                    iovec remote{output->mutableHostData(), bytes};
+                    errno = 0;
+                    const auto copied = ::process_vm_readv(::getpid(), &local, 1u, &remote, 1u, 0u);
+                    const int native_error = errno;
+                    EXPECT_EQ(copied, static_cast<ssize_t>(bytes))
+                        << "errno=" << native_error
+                        << " io=" << test::HostPageMapping::hasFlag(remote.iov_base, "io")
+                        << " pf=" << test::HostPageMapping::hasFlag(remote.iov_base, "pf");
+                    if (copied == static_cast<ssize_t>(bytes))
+                        EXPECT_EQ(std::memcmp(observed.data(), expected, bytes), 0);
+                }
+                graph.reset();
+            });
+        }
 }
 
 TEST(GPUHostRegistrationLifetime, FullSpanPolicyAndNeighbourReclaimPreserveCapturedPayload)

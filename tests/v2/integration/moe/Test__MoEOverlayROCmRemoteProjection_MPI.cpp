@@ -424,7 +424,8 @@ namespace llaminar2::test
                                             .allocatePersistentTransferStagingSlices(
                                                 staging_bytes,
                                                 2u * kProjectionCount,
-                                                gpu_device);
+                                                gpu_device,
+                                                HostTransferAccess::CrossProcessReadable);
             const auto remote_execution = TransferEngine::instance()
                                               .allocatePersistentTransferExecutionLanes(
                                                   2u * kProjectionCount,

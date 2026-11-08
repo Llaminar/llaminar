@@ -1223,7 +1223,8 @@ namespace llaminar2
                                    .allocatePersistentTransferStagingSlices(
                                        manifest.maximum_chunk_bytes,
                                        1u,
-                                       source_device)
+                                       source_device,
+                                       HostTransferAccess::CrossProcessReadable)
                                    .front(),
                     .execution = TransferEngine::instance()
                                      .allocatePersistentTransferExecutionLanes(
@@ -1243,7 +1244,8 @@ namespace llaminar2
                                    .allocatePersistentTransferStagingSlices(
                                        manifest.maximum_chunk_bytes,
                                        1u,
-                                       destination_device)
+                                       destination_device,
+                                       HostTransferAccess::CrossProcessReadable)
                                    .front(),
                     .execution = TransferEngine::instance()
                                      .allocatePersistentTransferExecutionLanes(
@@ -1594,7 +1596,8 @@ namespace llaminar2
                                        .allocatePersistentTransferStagingSlices(
                                            manifest.maximum_chunk_bytes,
                                            1u,
-                                           source_device)
+                                           source_device,
+                                           HostTransferAccess::CrossProcessReadable)
                                        .front(),
                         .execution = TransferEngine::instance()
                                          .allocatePersistentTransferExecutionLanes(
@@ -1614,7 +1617,8 @@ namespace llaminar2
                                        .allocatePersistentTransferStagingSlices(
                                            manifest.maximum_chunk_bytes,
                                            1u,
-                                           destination_device)
+                                           destination_device,
+                                           HostTransferAccess::CrossProcessReadable)
                                        .front(),
                         .execution = TransferEngine::instance()
                                          .allocatePersistentTransferExecutionLanes(

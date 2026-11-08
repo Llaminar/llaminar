@@ -82,6 +82,32 @@ namespace
 
 } // namespace
 
+/**
+ * @test Bootstrap leaves native transport selection and explicit operator intent intact.
+ * @details MPI owns available local-copy mechanisms. Command-line overrides take
+ * precedence over its environment, so a forced disabled mechanism would defeat
+ * both native hardware selection and an explicit operator CMA setting.
+ */
+TEST(Test__MPIBootstrap, NativeTransportSelectionPreservesAbsentAndExplicitIntent)
+{
+    constexpr const char *name="OMPI_MCA_btl_vader_single_copy_mechanism";
+    for(const char *hostfile:{"","/cluster/hosts"})
+    for(const int ranks:{1,2,4,8})
+    for(const char *intent:{static_cast<const char *>(nullptr),"none","cma"})
+    {
+        SCOPED_TRACE(::testing::Message()<<hostfile<<'/'<<ranks<<'/'<<(intent?intent:"native default"));
+        ScopedLaunchEnvironment environment(name,intent);
+        llaminar2::MPILaunchConfig config;
+        config.hostfile=hostfile;
+        config.num_procs=ranks;
+        const auto command=buildCommand(config,{});
+        EXPECT_FALSE(contains(command,"btl_vader_single_copy_mechanism"));
+        const char *remaining=std::getenv(name);
+        if(intent) { ASSERT_NE(remaining,nullptr); EXPECT_STREQ(remaining,intent); }
+        else EXPECT_EQ(remaining,nullptr);
+    }
+}
+
 /** Remote SSH ranks receive observation intent through MPI, not local inheritance. */
 TEST(Test__MPIBootstrap, PortableDiagnosticsAreExplicitNameOnlyExports)
 {

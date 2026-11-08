@@ -7,11 +7,14 @@
  * exact non-null stream and publish an exact event. Device consumers import
  * that event without blocking the host; host consumers wait only for the event
  * that makes their destination bytes observable. Backend copy functions remain
- * low-level submission mechanisms and never decide tensor coherence.
+ * low-level submission mechanisms and never decide tensor coherence. Explicit
+ * cross-process host consumers retain ordinary registered pages rather than a
+ * backend-private host mapping, with no second payload or copy authority.
  */
 
 #include "transfer/TransferEngine.h"
 #include "planning/PhysicalMemoryAuthority.h"
+#include "memory/HostRegistrationPageRange.h"
 #include "kernels/qwen4exp/PooledImmutableLocalHotReadyRoot.h"
 
 #include <algorithm>
@@ -1059,6 +1062,11 @@ namespace llaminar2
                device_storage_->contains(offset_, bytes_);
     }
 
+    HostTransferAccess PersistentTransferStagingSlice::hostAccess() const noexcept
+    {
+        return mapped_ ? mapped_->hostAccess() : HostTransferAccess::ProcessLocal;
+    }
+
     void *PersistentTransferStagingSlice::mutablePinnedData() const
     {
         if (!valid())
@@ -1122,13 +1130,20 @@ namespace llaminar2
         size_t bytes,
         std::span<const DeviceId> devices,
         std::shared_ptr<void> lifetime,
-        BackingKind backing_kind)
+        BackingKind backing_kind,
+        HostTransferAccess host_access)
         : allocation_(allocation),
           bytes_(bytes),
           devices_(devices.begin(), devices.end()),
           lifetime_(std::move(lifetime)),
-          backing_kind_(backing_kind)
+          backing_kind_(backing_kind),
+          host_access_(host_access)
     {
+        if ((host_access != HostTransferAccess::ProcessLocal &&
+             host_access != HostTransferAccess::CrossProcessReadable) ||
+            (backing_kind == BackingKind::BackendAllocation &&
+             host_access != HostTransferAccess::ProcessLocal))
+            throw std::invalid_argument("Mapped backing has an incompatible native host-access contract");
         if (!allocation_ || bytes_ == 0u || devices_.empty() ||
             !lifetime_)
         {
@@ -1524,7 +1539,8 @@ namespace llaminar2
     TransferEngine::allocatePersistentTransferStagingSlices(
         size_t bytes_per_slice,
         size_t slice_count,
-        DeviceId device) const
+        DeviceId device,
+        HostTransferAccess host_access) const
     {
         if (bytes_per_slice == 0u || slice_count == 0u || !device.is_gpu())
         {
@@ -1539,7 +1555,7 @@ namespace llaminar2
         }
         const size_t total_bytes = bytes_per_slice * slice_count;
         const std::array devices{device};
-        auto mapped = allocateMappedHostRegion(total_bytes, devices);
+        auto mapped = allocateMappedHostRegion(total_bytes, devices, host_access);
         auto device_storage = allocateDeviceTransferBuffer(total_bytes, device);
 
         std::vector<PersistentTransferStagingSlice> slices;
@@ -1673,13 +1689,23 @@ namespace llaminar2
         std::span<const DeviceId> devices,
         std::shared_ptr<void> lifetime) const
     {
+        return registerExternalMappedHostRegionImpl(allocation, bytes, devices,
+            std::move(lifetime), HostTransferAccess::ProcessLocal);
+    }
+
+    std::shared_ptr<MappedHostTransferRegion>
+    TransferEngine::registerExternalMappedHostRegionImpl(
+        void *allocation, size_t bytes, std::span<const DeviceId> devices,
+        std::shared_ptr<void> lifetime, HostTransferAccess host_access) const
+    {
         auto region = std::shared_ptr<MappedHostTransferRegion>(
             new MappedHostTransferRegion(
                 allocation,
                 bytes,
                 devices,
                 std::move(lifetime),
-                MappedHostTransferRegion::BackingKind::ExternalRegistration));
+                MappedHostTransferRegion::BackingKind::ExternalRegistration,
+                host_access));
 
         for (const DeviceId device : region->devices_)
         {
@@ -1844,7 +1870,7 @@ namespace llaminar2
                 bytes,
                 parent->devices_,
                 std::move(parent_lifetime),
-                MappedHostTransferRegion::BackingKind::ParentSlice));
+                MappedHostTransferRegion::BackingKind::ParentSlice, parent->hostAccess()));
         slice->aliases_.reserve(parent->aliases_.size());
         for (const auto &alias : parent->aliases_)
         {
@@ -1950,8 +1976,12 @@ namespace llaminar2
     std::shared_ptr<MappedHostTransferRegion>
     TransferEngine::allocateMappedHostRegion(
         size_t bytes,
-        std::span<const DeviceId> devices) const
+        std::span<const DeviceId> devices,
+        HostTransferAccess host_access) const
     {
+        if (host_access != HostTransferAccess::ProcessLocal &&
+            host_access != HostTransferAccess::CrossProcessReadable)
+            throw std::invalid_argument("Mapped allocation requires a known native host-access contract");
         if (devices.empty() || std::any_of(devices.begin(), devices.end(), [](DeviceId device) { return !device.is_gpu(); }))
             throw std::invalid_argument("TransferEngine::allocateMappedHostRegion requires local GPU endpoints");
         const size_t mapping_bytes = mappedHostRegionAllocationBytes(bytes);
@@ -1969,7 +1999,8 @@ namespace llaminar2
                            resolveBackend(device) == allocation_backend;
                 });
 
-        if (devices.size() > 1u && same_backend_family &&
+        if (host_access == HostTransferAccess::ProcessLocal &&
+            devices.size() > 1u && same_backend_family &&
             allocation_backend->supportsPortableMappedAllocation())
         {
             /*
@@ -2076,7 +2107,7 @@ namespace llaminar2
             return region;
         }
 
-        if (devices.size() == 1u)
+        if (host_access == HostTransferAccess::ProcessLocal && devices.size() == 1u)
         {
             const DeviceId device = devices.front();
             IBackend *const backend = resolveBackend(device);
@@ -2201,17 +2232,24 @@ namespace llaminar2
                 if (address && address != MAP_FAILED)
                     (void)::munmap(address, mapping_bytes);
             });
+        // MPI/process-vm must receive ordinary host pages, not a GPU driver's
+        // VM_IO/GTT mapping. Register exactly this allocation; no extra payload
+        // buffer/copy or runtime retry exists. Exclude huge pages before first
+        // touch with the same native registration policy used by the backend.
+        if (host_access == HostTransferAccess::CrossProcessReadable)
+            HostRegistrationPageRange::prepare(mapping, mapping_bytes);
 #if defined(MADV_HUGEPAGE)
-        (void)::madvise(mapping, mapping_bytes, MADV_HUGEPAGE);
+        else (void)::madvise(mapping, mapping_bytes, MADV_HUGEPAGE);
 #endif
         /* Current-thread first touch is the only reliable placement authority
          * on the production NUMA host; callers establish setup affinity first. */
         std::memset(mapping, 0, mapping_bytes);
-        return registerExternalMappedHostRegion(
+        return registerExternalMappedHostRegionImpl(
             mapping,
             mapping_bytes,
             devices,
-            std::move(lifetime));
+            std::move(lifetime),
+            host_access);
     }
 
     std::vector<std::shared_ptr<MappedHostTransferRegion>>

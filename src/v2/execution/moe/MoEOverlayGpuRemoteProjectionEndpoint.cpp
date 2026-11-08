@@ -145,6 +145,9 @@ namespace llaminar2
             config_.staging.device() != config_.device)
             throw std::invalid_argument(
                 "Remote ExpertOverlay GPU lane requires one matching persistent staging slice");
+        if (config_.staging.hostAccess() != HostTransferAccess::CrossProcessReadable)
+            throw std::invalid_argument(
+                "Remote ExpertOverlay GPU lane requires cross-process-readable registered host staging; local-only native backing cannot enter MPI");
         if (!config_.execution.valid() ||
             config_.execution.device() != config_.device)
             throw std::invalid_argument(

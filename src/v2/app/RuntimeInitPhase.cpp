@@ -307,10 +307,10 @@ namespace llaminar2
     RuntimeInitResult RuntimeInitPhase::execute(OrchestrationConfig &config,
                                                 int &argc, char **&argv)
     {
-        const auto mpi_env = MPIBootstrap::detectMPIEnvironment();
-        if (mpi_env.is_mpi_process &&
-            debugEnv().mpi_bootstrap.ompi_mca_btl_vader_single_copy_mechanism.empty())
-            setenv("OMPI_MCA_btl_vader_single_copy_mechanism", "none", 0);
+        // Keep native transport selection and explicit operator overrides
+        // unchanged for external MPI launches as well as self-bootstrap.
+        // MPI_Init owns capability admission; this frontend does not disable
+        // single-copy transport or maintain a second transport policy.
 
         // Declared before every dependent owner. Early returns and exceptions
         // release those owners before this scope finalizes the process.

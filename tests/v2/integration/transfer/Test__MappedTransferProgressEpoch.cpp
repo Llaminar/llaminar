@@ -741,8 +741,12 @@ namespace
         std::vector<std::shared_ptr<DeviceTransferBuffer>> cpu_device_outputs;
         if (cpu_edge != CPUWeightEdgeProof::None)
         {
+            // Only the remote edge exposes these original slices to MPI.
             cpu_staging = transfers.allocatePersistentTransferStagingSlices(
-                cpu_bytes, slots, device);
+                cpu_bytes, slots, device,
+                cpu_edge == CPUWeightEdgeProof::Remote
+                    ? HostTransferAccess::CrossProcessReadable
+                    : HostTransferAccess::ProcessLocal);
             for (std::size_t i = 0; i < slots; ++i)
             {
                 cpu_outputs.emplace_back(cpu_bytes, 0u);
@@ -1103,7 +1107,7 @@ namespace
                 device,
                 "remote_mapped_shared_worker");
         auto staging = transfers.allocatePersistentTransferStagingSlices(
-            bytes, 1u, device);
+            bytes, 1u, device, HostTransferAccess::CrossProcessReadable);
         ASSERT_EQ(staging.size(), 1u);
         auto remote = std::make_unique<MoEOverlayGpuRemoteProjectionLane>(
             MoEOverlayGpuRemoteProjectionLane::Config{

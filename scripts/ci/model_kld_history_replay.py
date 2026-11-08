@@ -106,19 +106,25 @@ class HistoryReplaySelection:
         _require(len(command) >= 7 and Path(command[0]).name == 'mpirun' and
                  command[1:7] == ['-np', str(participants), '--bind-to', 'socket', '--map-by', 'socket'],
                  'Frozen replay needs the original canonical rank-population socket launch')
-        # Preserve the registered transport MCA options; reject other resource
-        # directives rather than accidentally retaining a second affinity owner.
+        # Lifecycle controls are required, while MPI owns native transport
+        # selection. Preserve one explicitly registered mechanism verbatim;
+        # MPI validates its installed values. Never add a default or admit an
+        # unrelated resource directive that could become an affinity owner.
         cursor = 7
-        expected_mca = {'mpi_leave_pinned': '1', 'btl_vader_single_copy_mechanism': 'none',
-                        'orte_allowed_exit_without_sync': '1'}
+        required_mca = {'mpi_leave_pinned': '1', 'orte_allowed_exit_without_sync': '1'}
+        optional_mechanism = 'btl_vader_single_copy_mechanism'
         seen = set()
         exports = {}
         while cursor < len(command) and command[cursor] in ('--mca', '-x'):
             if command[cursor] == '--mca':
-                _require(cursor + 2 < len(command) and command[cursor + 1] not in seen and
-                         expected_mca.get(command[cursor + 1]) == command[cursor + 2],
+                _require(cursor + 2 < len(command),
+                         'Frozen replay has incomplete MPI resource or transport override')
+                name, value = command[cursor + 1:cursor + 3]
+                _require(name not in seen and
+                         ((name in required_mca and required_mca[name] == value) or
+                          (name == optional_mechanism and type(value) is str and bool(value))),
                          'Frozen replay has unsupported MPI resource or transport overrides')
-                seen.add(command[cursor + 1])
+                seen.add(name)
                 cursor += 3
             else:
                 _require(cursor + 1 < len(command), 'Frozen replay has incomplete MPI environment export')
@@ -132,7 +138,7 @@ class HistoryReplaySelection:
         # boundary. Legacy direct MPI declarations omit it; preserve either
         # original form and keep resource exports before that boundary.
         application = cursor + int(cursor < len(command) and command[cursor] == '--')
-        _require(seen == set(expected_mca) and len(command[application:]) == 2 and
+        _require(set(required_mca).issubset(seen) and len(command[application:]) == 2 and
                  Path(command[application]).is_absolute() and
                  command[application + 1] == '--gtest_filter=' + self.descriptor['canonical_cell'],
                  'Frozen replay cannot represent additional MPI or native launch controls')

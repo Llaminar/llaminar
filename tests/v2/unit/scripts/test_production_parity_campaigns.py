@@ -449,6 +449,26 @@ class DeviceInventoryGateTests(unittest.TestCase):
             text=True, capture_output=True, timeout=10,
         )
 
+    def test_native_mpi_registration_leaves_selection_to_mpi_and_accepts_explicit_override(self):
+        """Inspect real CTest commands/properties; no MPI process is launched."""
+        key = 'OMPI_MCA_btl_vader_single_copy_mechanism'
+        for selected in (None, 'cma', 'none'):
+            with self.subTest(selected=selected), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                authored = '' if selected is None else f'ENVIRONMENT "{key}={selected}"'
+                result = self.configure_scope(root, 'DeclaredBackends', 'Integration', authored)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                tests = json.loads(subprocess.check_output(
+                    ['ctest', '--test-dir', str(root/'build'), '--show-only=json-v1'], text=True))['tests']
+                self.assertEqual(len(tests), 2)
+                for test in tests:
+                    self.assertNotIn('btl_vader_single_copy_mechanism', test['command'])
+                    properties = {item['name']: item['value'] for item in test['properties']}
+                    selections = [item for item in properties['ENVIRONMENT'] if item.startswith(key+'=')]
+                    self.assertEqual(selections, [] if selected is None else [key+'='+selected])
+                    self.assertIn('mpi_leave_pinned', test['command'])
+                    self.assertIn('orte_allowed_exit_without_sync', test['command'])
+
     def test_process_inventory_scope_overrides_backend_specific_filters(self) -> None:
         """Discovery cannot race either vendor's free-memory/graph certificate."""
         for scope in ("FullInventory", "DeclaredBackends"):
@@ -3375,6 +3395,7 @@ time.sleep(30)
             executable = directory / "v2_integration_parity_fake_single_device_matrix"
             executable.write_text(
                 "#!/bin/sh\n"
+                f"printf '%s' \"${{OMPI_MCA_btl_vader_single_copy_mechanism-__native__}}\" > '{directory / 'mpi-selection.txt'}'\n"
                 "cat <<'EOF'\n"
                 "MatrixSuite.\n"
                 '  ProductionParity/CPU_KV_FP16  # GetParam() = {"argv":["truncated...\n'
@@ -3395,6 +3416,8 @@ time.sleep(30)
                 backend_model.write_bytes(backend_model.name.encode("utf-8"))
             generated = directory / "discovered.cmake"
 
+            inherited = dict(os.environ)
+            inherited.pop("OMPI_MCA_btl_vader_single_copy_mechanism", None)
             completed = subprocess.run(
                 [
                     "cmake",
@@ -3415,6 +3438,7 @@ time.sleep(30)
                     "-P",
                     str(discovery),
                 ],
+                env=inherited,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -3425,6 +3449,14 @@ time.sleep(30)
                 msg=completed.stderr or completed.stdout,
             )
             registration = generated.read_text(encoding="utf-8")
+            self.assertNotIn("btl_vader_single_copy_mechanism", registration)
+            self.assertEqual((directory/'mpi-selection.txt').read_text(), '__native__')
+            explicit = subprocess.run(completed.args, env={**inherited,
+                "OMPI_MCA_btl_vader_single_copy_mechanism": "cma"},
+                check=False, capture_output=True, text=True)
+            self.assertEqual(explicit.returncode, 0, explicit.stdout + explicit.stderr)
+            self.assertEqual((directory/'mpi-selection.txt').read_text(), 'cma')
+            self.assertNotIn("btl_vader_single_copy_mechanism", generated.read_text())
 
             # The same production inventory must not be published under a
             # cell-shaped or legacy binary identity. Exercise real discovery,

@@ -1090,6 +1090,11 @@ the VMs afterward.
 
 ### MPI runtime files
 
+MPI selects the native local-copy mechanism for the installed host and runtime
+(for example, CMA on supported Linux hosts). Llaminar preserves explicit native
+MPI settings in both self-launched and externally launched jobs; standard MCA
+environment or launcher options remain available to the operator.
+
 Llaminar enters its process owner before MPI or model startup. The same owner
 retains temporary runtime files and shared-memory backing until the application,
 MPI launcher and their local daemon children have exited. Each run uses fresh
