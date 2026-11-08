@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Build, test and optionally publish the two minimal develop runtime images.
+"""Build and optionally validate/publish both develop runtime images.
 
 This intentionally small gate is distinct from the full production
-certification pipeline.  It owns exactly the develop-branch promise: build the
-AVX512 and AVX2 full-backend image pairs, run the complete CMake-owned Unit and
-ProductionTestPreflight gates inside each installed test runner, then publish the
-two already-tested runtime siblings.  It never discovers models, stages a
+certification pipeline. The develop push selects build-only publication of
+AVX512 and AVX2 full-backend runtimes without compiling or running test images.
+The separate PR gate runs only the complete CMake-owned, device-free Unit
+inventory inside its installed test runner.
+Neither policy discovers models, stages a
 corpus, launches a server, runs mathematical parity, E2E, remote MPI, or a
 benchmark, and it never calls an image a certified release artifact.
 """
@@ -21,10 +22,10 @@ import sys
 import uuid
 
 import docker_paths
-from production_artifacts import digest, image_identity, validate_prerequisites, write_json
+from production_artifacts import digest, image_identity, write_json
 from run_production_pipeline import (
-    TestRunnerInventory, ImageRole, SHIPPING_ISAS, build, device_lease, logged_container_command,
-    require_image_pair, run, source_identity,
+    TestRunnerInventory, ImageRole, SHIPPING_ISAS, build, logged_container_command,
+    require_image, run, source_identity,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -66,40 +67,43 @@ def remote_image_id(tag: str) -> str | None:
     return identity
 
 
-def run_prerequisites(images: dict, directory: Path) -> dict:
-    """Run the single canonical model-free transaction inside one test runner.
+def run_unit_tests(images: dict, directory: Path) -> dict:
+    """Run the complete device-free Unit suite without exposing accelerators.
 
-    The test runner already contains its immutable Integration executable inventory
+    The test runner already contains its immutable Unit executable inventory
     and installed receipt.  Bind only the evidence directory; attaching models
     or a corpus would make this deliberately model-free develop gate depend on
     a second, undocumented input surface.
     """
     image = images[ImageRole.TEST_RUNNER.value]["id"]
-    name = "llaminar-develop-prerequisites-" + uuid.uuid4().hex
-    command = ["python3", "scripts/ci/run_production_prerequisites.py",
+    name = "llaminar-develop-unit-" + uuid.uuid4().hex
+    command = ["python3", "scripts/ci/run_unit_tests.py",
                "--build-dir", "build_v2_integration",
                "--installed-build-receipt", "/src/installed-tests.json",
-               "--output", "/ci-results/prerequisites"]
+               "--output", "/ci-results/unit"]
     launch = ["docker", "run", "--rm", "--name", name,
-              *docker_paths.device_args(image, "CPU+CUDA+ROCm", user=f"{os.getuid()}:{os.getgid()}"),
+              "--user", f"{os.getuid()}:{os.getgid()}",
               *(part for group in os.getgroups() for part in ("--group-add", str(group))),
               *docker_paths.mounts([(directory, "/ci-results", False)]),
               "-w", "/src", image,
-              *logged_container_command(command, "/ci-results/prerequisites.process.log")]
+              *logged_container_command(command, "/ci-results/unit.process.log")]
     try:
-        run(launch, directory / "prerequisites.log")
+        run(launch, directory / "unit.log")
     finally:
         subprocess.run(["docker", "rm", "-f", name], check=False, timeout=30,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    report_path = directory / "prerequisites" / "prerequisites.json"
+    report_path = directory / "unit" / "unit.json"
     report = json.loads(report_path.read_text())
-    validate_prerequisites(report)
+    if (report.get("scope") != "unit" or report.get("complete") is not True
+            or report.get("return_code") != 0 or not report.get("tests")
+            or report.get("test_count") != len(report["tests"])):
+        raise ValueError("Unit receipt is incomplete or unsuccessful")
     return report
 
 
 def publish_runtime(images: dict, isa: str, base: str, revision: str,
                     directory: Path) -> dict:
-    """Publish a tested source-ref alias before moving its branch alias."""
+    """Publish an authenticated source-ref alias before moving its branch alias."""
     runtime = images[ImageRole.RUNTIME.value]
     tag = runtime_tag(base, isa)
     pinned = revision_tag(base, isa, revision)
@@ -109,7 +113,7 @@ def publish_runtime(images: dict, isa: str, base: str, revision: str,
     for alias in (pinned, tag):
         run(["docker", "tag", runtime["id"], alias], directory / "publish.log")
         if image_identity(alias)["id"] != runtime["id"]:
-            raise ValueError("develop publication tag no longer names its tested runtime image")
+            raise ValueError("develop publication tag no longer names its admitted runtime image")
         if alias != pinned or existing is None:
             run(["docker", "push", alias], directory / "publish.log")
     return {"tag": tag, "ref_tag": pinned, "image": runtime["id"]}
@@ -119,10 +123,12 @@ def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
     """Parse only the small explicit surface supported by the develop gate."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True,
-                        help="new ignored directory for build and prerequisite evidence")
+                        help="new ignored directory for build or Unit evidence")
     parser.add_argument("--image", help="AVX512 develop runtime tag; AVX2 appends -avx2")
+    parser.add_argument("--build-only", action="store_true",
+                        help="build runtime images without compiling or executing Unit/preflight tests")
     parser.add_argument("--publish", action="store_true",
-                        help="push both tested runtime images after both ISA gates pass")
+                        help="push both runtime images after both selected ISA transactions succeed")
     parser.add_argument("--cpu-isa", choices=SHIPPING_ISAS, action="append", dest="cpu_isas",
                         help="explicit local diagnostic ISA subset; publication requires both")
     args = parser.parse_args(argv)
@@ -132,55 +138,63 @@ def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
     args.cpu_isas = [isa for isa in SHIPPING_ISAS if isa in requested]
     if args.publish and (not args.image or set(args.cpu_isas) != set(SHIPPING_ISAS)):
         parser.error("--publish requires --image and both AVX512 and AVX2 gates")
+    if args.publish and not args.build_only:
+        parser.error("--publish requires --build-only; PR Unit validation never publishes")
     args.output = args.output.resolve()
     return args
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Build both images, test each image, then make the optional push atomic by gate."""
+    """Finish both admitted ISA transactions before publishing either runtime."""
     args = parse_arguments(argv)
     if args.output.exists():
         raise ValueError("develop image gate output already exists; preserve prior evidence and choose a new directory")
     args.output.mkdir(parents=True)
     source = source_identity()
     receipt = {"schema": 1, "source": source, "complete": False, "published": False,
-               "variants": {}, "image": args.image}
+               "variants": {}, "image": args.image,
+               "validation": "build-only" if args.build_only else "unit"}
     write_json(args.output / "develop-image-gate.json", receipt)
-    with device_lease():
-        for isa in args.cpu_isas:
-            if source_identity() != source:
-                raise ValueError("source changed after develop image gate admission")
-            directory = args.output / isa.lower()
-            directory.mkdir()
-            build_args = argparse.Namespace(cpu_isa=isa)
-            images = build(build_args, source, directory,
-                           test_inventory=TestRunnerInventory.MODEL_FREE)
-            require_image_pair(images, source, isa,
-                               test_inventory=TestRunnerInventory.MODEL_FREE)
-            prerequisites = run_prerequisites(images, directory)
-            receipt["variants"][isa] = {
-                "test_runner_image": images[ImageRole.TEST_RUNNER.value]["id"],
-                "runtime_image": images[ImageRole.RUNTIME.value]["id"],
-                "test_runner_inventory": TestRunnerInventory.MODEL_FREE.value,
-                "prerequisites_digest": digest(prerequisites),
-                "preflight_test_count": prerequisites["preflight_test_count"],
-            }
-            write_json(args.output / "develop-image-gate.json", receipt)
+    for isa in args.cpu_isas:
         if source_identity() != source:
-            raise ValueError("source changed before develop image gate completion")
-        receipt["complete"] = True
-        if args.publish:
-            # Do not publish one ISA before the other build/test result exists.
-            # A network failure can leave a published tag, but never a tag for
-            # an image that skipped its own local Unit/preflight gate.
-            for isa in args.cpu_isas:
-                images = {ImageRole.TEST_RUNNER.value: {"id": receipt["variants"][isa]["test_runner_image"]},
-                          ImageRole.RUNTIME.value: {"id": receipt["variants"][isa]["runtime_image"]}}
-                receipt["variants"][isa]["publication"] = publish_runtime(
-                    images, isa, args.image, source["revision"], args.output / isa.lower())
-                write_json(args.output / "develop-image-gate.json", receipt)
-            receipt["published"] = True
+            raise ValueError("source changed after develop image gate admission")
+        directory = args.output / isa.lower()
+        directory.mkdir()
+        build_args = argparse.Namespace(cpu_isa=isa)
+        if args.build_only:
+            images = build(build_args, source, directory,
+                           roles=(ImageRole.RUNTIME,),
+                           test_inventory=TestRunnerInventory.UNIT_ONLY)
+            require_image(images[ImageRole.RUNTIME.value], source, isa, ImageRole.RUNTIME)
+            variant = {"runtime_image": images[ImageRole.RUNTIME.value]["id"]}
+        else:
+            images = build(build_args, source, directory,
+                           roles=(ImageRole.TEST_RUNNER,),
+                           test_inventory=TestRunnerInventory.UNIT_ONLY)
+            require_image(images[ImageRole.TEST_RUNNER.value], source, isa, ImageRole.TEST_RUNNER,
+                          test_inventory=TestRunnerInventory.UNIT_ONLY)
+            unit = run_unit_tests(images, directory)
+            variant = {
+                "test_runner_image": images[ImageRole.TEST_RUNNER.value]["id"],
+                "test_runner_inventory": TestRunnerInventory.UNIT_ONLY.value,
+                "unit_digest": digest(unit),
+                "unit_test_count": unit["test_count"],
+            }
+        receipt["variants"][isa] = variant
         write_json(args.output / "develop-image-gate.json", receipt)
+    if source_identity() != source:
+        raise ValueError("source changed before develop image gate completion")
+    receipt["complete"] = True
+    if args.publish:
+        # Both builds and any explicitly selected tests must finish before
+        # moving a public tag. A network failure can still interrupt pushes.
+        for isa in args.cpu_isas:
+            images = {ImageRole.RUNTIME.value: {"id": receipt["variants"][isa]["runtime_image"]}}
+            receipt["variants"][isa]["publication"] = publish_runtime(
+                images, isa, args.image, source["revision"], args.output / isa.lower())
+            write_json(args.output / "develop-image-gate.json", receipt)
+        receipt["published"] = True
+    write_json(args.output / "develop-image-gate.json", receipt)
     return 0
 
 

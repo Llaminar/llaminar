@@ -13,7 +13,7 @@ routes local development checks, model diagnostics, and this full image gate.
 
 Ordinary work starts from current `develop` on a branch named
 `feat/short-feature-description`. Commit messages and PR titles use
-Conventional Commits. After its required checks pass, the feature PR
+Conventional Commits. After its required Unit check and owner approval pass, the feature PR
 squash-merges into `develop`. Only explicit user direction starts the separate
 `develop`-to-`master` release PR and its full certification/release workflow.
 
@@ -24,13 +24,14 @@ and its required gates. Restore any temporary maintenance exception in the
 develop ruleset immediately after the push.
 
 `.github/workflows/develop-pr.yml` tests same-repository feature PRs targeting
-`develop`. It builds only the AVX512 full-backend image pair and executes the
-complete Unit and `ProductionTestPreflight` transaction **inside its installed
-test-runner image**. This is the pre-commit test scope in a reproducible image,
-not release certification. The checkout is the PR merge ref, so the tests
+`develop`. It builds an AVX512 full-backend test image with the `unit-only` executable
+inventory and executes only the complete device-free `Unit` suite. It does not
+compile the production-preflight target or run integration tests. The test
+container receives no GPU devices or model mounts. This is PR validation, not
+release certification. The checkout is the PR merge ref, so the tests
 include the proposed integration with `develop`.
 
-The active `develop` ruleset requires this exact GitHub Actions check, an
+The active `develop` ruleset requires `Unit (AVX512)`, an
 up-to-date PR, and squash merge; direct human pushes, force pushes and deletion
 are rejected. `.github/workflows/develop-auto-merge.yml` arms GitHub's native
 auto-merge for same-repository, non-draft PRs. GitHub loads this
@@ -38,13 +39,14 @@ auto-merge for same-repository, non-draft PRs. GitHub loads this
 when the PR targets `develop`. That installed copy uses the dedicated
 `DEVELOP_AUTOMERGE_TOKEN` repository secret; changing only the develop copy
 cannot repair the live policy. It does not check out PR code and cannot merge
-before the required image-bound check succeeds. Fork PRs cannot run on the
+before the required image-bound check and review requirements succeed. Fork PRs cannot run on the
 privileged host runner; import a reviewed branch into this repository before
 requesting this gate.
 
 The automation secret is a fine-grained personal access token limited to
 `Llaminar/llaminar`, with Contents and Pull requests write permissions. It has
-no Administration permission and no ruleset bypass. The built-in
+no Administration permission. Native auto-merge waits for all required reviews
+and checks; the automation must never request an administrative merge override. The built-in
 `GITHUB_TOKEN` remains read-only: using it to merge would suppress the ordinary
 develop push workflow. A missing automation secret fails the arm job explicitly;
 there is no substitution of credentials. The command also authenticates the
@@ -59,8 +61,8 @@ files. Replace the secret before its configured expiration.
 The workflow calls the existing `run_develop_image_gate.py --cpu-isa AVX512`
 without `--publish`. It runs no AVX2 lane, model discovery/staging, generation,
 HF parity, HTTP/remote E2E, benchmarks, image publication or release creation.
-Every repository job that builds an image, runs tests, or prepares the
-self-hosted test toolchain shares `llaminar-develop-image-gate` with
+Every job on the production host that builds an image, runs tests, or prepares
+the self-hosted test toolchain shares `llaminar-develop-image-gate` with
 `queue: max` and `cancel-in-progress: false`. The ARC scale set also has
 `maxRunners: 1`. Thus separate PRs and certification runs wait their turn;
 GitHub must neither overlap their hardware work nor replace an older pending
@@ -71,8 +73,8 @@ acquire the privileged host runner; review/import them onto a repository branch
 before running this gate. Branch protection is configured independently.
 
 The PR uses the same host Docker daemon, retained `llaminar-ci` BuildKit worker,
-bounded local compiler cache and accelerator concurrency group as develop
-publication. Only build logs, image/test receipts and CTest/JUnit evidence are
+bounded local compiler cache and accelerator concurrency group as the
+production workflows. Cloud publication has its own independent queue. Only build logs, image/test receipts and CTest/JUnit evidence are
 uploaded to GitHub, never cache contents. Run the equivalent locally with:
 
 ```bash
@@ -80,40 +82,69 @@ python3 scripts/ci/run_develop_image_gate.py \
   --cpu-isa AVX512 --output parity-results/develop-pr-gate
 ```
 
-After merge, the ordinary develop push workflow below builds/tests **both**
-shipping ISA images and publishes them. Master PR certification remains a
+After merge, the ordinary develop push workflow below builds and publishes
+**both** shipping ISA runtime images without running tests. Master PR certification remains a
 separate, broader gate.
 
-## Develop branch image gate
+## Develop branch image publication
 
-`.github/workflows/ci.yml` runs for pushes to `develop` and explicit manual
-dispatches on `develop`. It runs
-`scripts/ci/run_develop_image_gate.py`, which builds AVX512 and AVX2
-full-backend test-runner/runtime pairs, runs the complete Unit and
-`ProductionTestPreflight` transaction inside each test runner, then publishes
-only the tested runtime images as `ghcr.io/llaminar/llaminar:develop` and
-`ghcr.io/llaminar/llaminar:develop-avx2`. It also publishes source-pinned
-`develop-<40-character SHA>` and `develop-<40-character SHA>-avx2` tags for
-the same tested bytes. A conflicting existing source-pinned tag is fatal; the
-branch tags are movable. It does not run model discovery,
-generation regression, mathematical parity, HTTP E2E, remote MPI, benchmarks,
-or image certification. Its test runner contains the complete model-free
-Unit/preflight inventory but not diagnostic model-parity matrices needed only
-by the full pipeline's typed E2E discovery. Its tags must never be described as certified
+`.github/workflows/ci.yml` runs on pushes to `develop` and explicit manual
+dispatches on `develop`. It uses the GitHub-hosted `llaminar-cloud-64` runner
+in the `Cloud image builds` group: Ubuntu 24.04, 64 vCPUs, 256 GB RAM and
+2,040 GB storage, with maximum concurrency one. The group admits only this
+repository's `ci.yml` on `refs/heads/develop`. Its independent
+`llaminar-cloud-develop-images` queue preserves every pending build without
+occupying the production host or its accelerators.
+
+The job runs `scripts/ci/run_develop_image_gate.py --build-only --publish`.
+It builds only the full CPU/CUDA/ROCm Release runtime targets for AVX512 and
+AVX2, with Integration compilation disabled. It runs no Unit, integration,
+production-preflight, model, E2E or benchmark tests and attaches no certificate.
+Compiler resource/spill checks remain part of building production code.
+
+Both runtimes must build and authenticate successfully before either is
+published as `ghcr.io/llaminar/llaminar:develop` and `:develop-avx2`. Matching
+`develop-<40-character SHA>` and `develop-<40-character SHA>-avx2` tags identify
+the same bytes. A conflicting source-pinned tag is fatal; branch tags are
+movable. The build receipt explicitly records `validation: build-only` and
+contains no invented test result. These are development images, not certified
 release artifacts.
 
-Run that exact narrow gate locally when validating its plumbing:
+The ephemeral cloud worker uses registry-backed BuildKit caches selected by
+`LLAMINAR_DOCKER_BUILD_CACHE_IMAGE`, with separate `-avx512` and `-avx2` tags.
+The workflow stores these under `ghcr.io/llaminar/llaminar:build-cache-develop`.
+Local host-path and registry cache authorities are mutually exclusive. Ccache
+mounts are shared within a build job; only immutable layers survive in the
+registry. Artifacts retain build/publication logs, timelines and identity
+receipts, never source snapshots or compiler caches.
+
+Run the same publication locally with:
 
 ```bash
 python3 scripts/ci/run_develop_image_gate.py \
+  --build-only \
   --output parity-results/develop-image-gate \
   --image ghcr.io/llaminar/llaminar:develop \
   --publish
 ```
 
-`--publish` requires both ISA lanes and is performed only after both installed
-Unit/preflight transactions pass. Omitting it is a local build/test diagnostic;
-`--cpu-isa` may narrow such a diagnostic but can never publish a partial pair.
+`--publish` requires `--build-only`, an image tag and both ISA lanes. Without
+`--build-only`, the driver runs the complete device-free Unit suite in a
+`unit-only` test companion and cannot publish. `--cpu-isa` can narrow a local
+build or PR diagnostic, never a published pair. Full production prerequisites
+remain owned by `run_production_prerequisites.py` and the production pipeline.
+
+### Protected-branch approval
+
+The separate `Owner approval` repository ruleset covers `master` and `develop`.
+It requires one approval from `@Llaminar/repository-approvers` for every file;
+that team's sole member is `@dbsanfte`. New reviewable commits dismiss stale
+approvals, and only `@dbsanfte` may dismiss reviews. Ordinary write access does
+not bypass these rules. The owner retains an explicit PR-only override for
+owner-authored changes; the existing release-evidence deploy-key exception
+preserves post-release evidence publication. Neither exception bypasses the
+separate CI rulesets. Keep approver-team membership restricted to the owner.
+The check installer leaves this independent approval ruleset intact.
 
 ### ARC runner on the production host
 
@@ -352,7 +383,7 @@ feature PRs, develop pushes and manual benchmark workflows retain their scope.
 
 `scripts/ci/apply_master_ruleset.py` installs the five required GitHub Actions
 checks on the existing master ruleset with strict up-to-date PR semantics and
-squash-only merge. It also installs the `develop` PR and AVX512 prerequisite
+squash-only merge. It also installs the `develop` PR and AVX512 Unit
 check requirements, while retaining deletion and force-push protection.
 `develop` deliberately does not require linear history: after a certified
 master squash merge, the release publisher records that exact master commit as

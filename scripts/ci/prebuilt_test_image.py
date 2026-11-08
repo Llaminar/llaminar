@@ -3,13 +3,15 @@
 
 An installed test-runner image cannot incrementally rebuild: compiler-only
 objects are deliberately absent. This receipt changes only build preparation,
-not test execution. Every Unit and ProductionTestPreflight test still runs.
+not test execution. Unit-only PR images and complete production companions
+carry distinct scopes; a Unit receipt cannot admit production preflight.
 The outer CI driver pins the immutable image ID and never overlays build/source
 files, while this receipt checks its installed CTest and executable inventory.
 """
 from __future__ import annotations
 
 import argparse
+from enum import Enum
 import json
 from pathlib import Path
 import subprocess
@@ -24,8 +26,17 @@ from run_production_parity_campaigns import (
 )
 
 
-def inventory(build: Path) -> dict:
+class InstalledTestScope(str, Enum):
+    """The caller, never the receipt, owns the required executable inventory."""
+
+    PRODUCTION = "production"
+    UNIT = "unit"
+
+
+def inventory(build: Path, scope: InstalledTestScope = InstalledTestScope.PRODUCTION) -> dict:
     """Describe exact registrations and installed executables/shared libraries."""
+    if not isinstance(scope, InstalledTestScope):
+        raise TypeError("installed test inventory requires a typed scope")
     build = build.resolve(strict=True)
     registrations = subprocess.check_output(
         ["ctest", "--test-dir", str(build), "--show-only=json-v1"], text=True)
@@ -41,8 +52,9 @@ def inventory(build: Path) -> dict:
         labels = _as_string_list(_property_map(test).get("LABELS", []))
         required = (name.startswith(PRODUCTION_PARITY_UNIT_PREFIX)
                     or PRODUCTION_PARITY_UNIT_LABEL in labels
-                    or PRODUCTION_TEST_PREFLIGHT_LABEL in labels
-                    or PRODUCTION_CAMPAIGN_NAME.search(name))
+                    or (scope is InstalledTestScope.PRODUCTION and (
+                        PRODUCTION_TEST_PREFLIGHT_LABEL in labels
+                        or PRODUCTION_CAMPAIGN_NAME.search(name))))
         if not required:
             continue
         # CTest can omit the command entirely when it cannot resolve the test
@@ -62,23 +74,31 @@ def inventory(build: Path) -> dict:
             "registration_digest": digest([path.read_text() for path in sorted(build.rglob("CTestTestfile.cmake"))])}
 
 
-def validate(path: Path, build: Path) -> None:
+def validate(path: Path, build: Path,
+             scope: InstalledTestScope = InstalledTestScope.PRODUCTION) -> None:
     """Reject stale, partial or foreign installed test trees before any gate."""
+    if not isinstance(scope, InstalledTestScope):
+        raise TypeError("installed test validation requires a typed scope")
     receipt = json.loads(path.read_text())
-    if receipt.get("schema") != 1 or receipt.get("inventory") != inventory(build):
+    if (receipt.get("schema") != 1 or receipt.get("scope") != scope.value
+            or receipt.get("inventory") != inventory(build, scope)):
         raise ValueError("installed test image receipt does not match this build/inventory")
 
 
-def seal(path: Path, build: Path) -> None:
+def seal(path: Path, build: Path,
+         scope: InstalledTestScope = InstalledTestScope.PRODUCTION) -> None:
     """Reject invalid gate contracts before installing a test-image receipt.
 
     Reuse the campaign's complete registration audit, including timeout,
     fixture and label contracts. Executable presence alone is insufficient:
     an image whose tests run manually may still be inadmissible to production.
     """
+    if not isinstance(scope, InstalledTestScope):
+        raise TypeError("installed test sealing requires a typed scope")
     discover_production_parity_unit_tests(build)
-    discover_production_test_preflight_tests(build)
-    write_json(path, {"schema": 1, "inventory": inventory(build)})
+    if scope is InstalledTestScope.PRODUCTION:
+        discover_production_test_preflight_tests(build)
+    write_json(path, {"schema": 1, "scope": scope.value, "inventory": inventory(build, scope)})
 
 
 if __name__ == "__main__":
@@ -86,8 +106,10 @@ if __name__ == "__main__":
     parser.add_argument("--build-dir", type=Path, required=True)
     parser.add_argument("--receipt", type=Path, required=True)
     parser.add_argument("--seal", action="store_true")
+    parser.add_argument("--scope", type=InstalledTestScope, choices=tuple(InstalledTestScope),
+                        default=InstalledTestScope.PRODUCTION)
     args = parser.parse_args()
     if args.seal:
-        seal(args.receipt, args.build_dir)
+        seal(args.receipt, args.build_dir, args.scope)
     else:
-        validate(args.receipt, args.build_dir)
+        validate(args.receipt, args.build_dir, args.scope)

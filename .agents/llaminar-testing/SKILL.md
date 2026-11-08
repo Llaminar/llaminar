@@ -32,28 +32,31 @@ separate explicit workflow. Never silently regenerate answers on drift.
 Keep the fresh/full/partial prefix probes, exact repeatability, actual dynamic
 MTP activity, movement obligations and captured production-path evidence.
 
-Feature PRs into `develop` use `.github/workflows/develop-pr.yml` to build one
-AVX512 full-backend image pair and run only complete Unit and
-ProductionTestPreflight inside its test runner. This is the pre-commit scope,
-not certification: no AVX2, models, E2E, benchmarks or publication. It calls the
-existing image driver with `--cpu-isa AVX512` and no `--publish`, using the same
-host-only cache and shared accelerator concurrency group. See
-`docs/production-ci.md` for its same-repository trust boundary and local command.
-The `develop` ruleset requires that exact check on an up-to-date PR and rejects
-direct human pushes. The trusted base-branch auto-merge workflow arms native
-squash auto-merge only for non-draft same-repository PRs; it never runs PR code.
-The sole direct-push exception is the dedicated release-evidence deploy key for
-the certified post-squash high-water/ancestry commit. Never grant the general
-GitHub Actions app bypass, since it also owns PR auto-merge.
+Feature PRs into `develop` use `.github/workflows/develop-pr.yml` to build an
+AVX512 full-backend test companion with the `unit-only` executable inventory
+and run only the complete device-free `Unit` suite. No integration or
+production-preflight tests run, and the container receives no GPU devices or
+model mounts. It calls `run_develop_image_gate.py --cpu-isa AVX512` without
+`--build-only` or `--publish`, using the production host's persistent cache
+and serialized queue. CTest owns selection and the JUnit receipt must prove
+that every discovered Unit test ran without skipping.
+The `develop` ruleset requires `Unit (AVX512)` on an up-to-date PR. The separate
+`Owner approval` ruleset requires approval from the owner-only
+`@Llaminar/repository-approvers` team for both protected branches. Native
+squash auto-merge waits for required reviews and checks. The owner has a
+PR-only approval override; existing CI rules remain enforced. The dedicated
+release-evidence deploy key retains its existing publication exception.
+Never grant the general GitHub Actions app a ruleset bypass.
 
-The enabled `develop` push workflow is intentionally narrower than that
-routine certification path. It uses `scripts/ci/run_develop_image_gate.py` to
-build both full-backend AVX512/AVX2 builder/runtime pairs, run the complete
-Unit and ProductionTestPreflight transaction inside each builder, and publish
-the two tested `develop` runtime tags **and exact source-SHA tags**. It does not run model discovery,
-generation, mathematical parity, HTTP E2E, remote MPI, benchmarks, or attach a
-certificate. Use it for fast shippable developer images; use the full pipeline
-when requesting a certified artifact.
+The `develop` push workflow uses the 64-core GitHub-hosted cloud runner and
+`run_develop_image_gate.py --build-only --publish`. It compiles only the two
+full-backend Release runtimes, omits Integration compilation, and publishes
+both branch and source-SHA tags after both builds succeed. It runs no tests
+and grants no certificate. Registry layer caches retain cloud build inputs;
+this job has a separate queue from the production host. Complete Unit and
+production preflight remain mandatory in the explicit production pipeline,
+through `run_production_prerequisites.py`. See `docs/production-ci.md` for
+runner, cache, receipt and publication boundaries.
 The `develop` → `master` PR gate is separate: its required pull-request E2E
 check waits for the exact develop-head image pair, proves both ISAs on the full
 HTTP matrix, then its dependent benchmark check consumes that same image-bound

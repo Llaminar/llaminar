@@ -3408,12 +3408,12 @@ class ImageIdentityTests(unittest.TestCase):
         test_runner = dockerfile.split("FROM runtime AS test-runner", 1)[1]
         self.assertIn("ON:full-matrix|OFF:model-free", builder)
         self.assertIn(
-            'ON) integration_targets="v2_unit_gate v2_production_test_preflight_gate '
+            'full-matrix) integration_targets="v2_unit_gate v2_production_test_preflight_gate '
             'v2_model_parity_matrices"',
             builder,
         )
         self.assertIn(
-            'OFF) integration_targets="v2_unit_gate v2_production_test_preflight_gate"',
+            'model-free) integration_targets="v2_unit_gate v2_production_test_preflight_gate"',
             builder,
         )
         self.assertIn(
@@ -3619,6 +3619,43 @@ class ImageIdentityTests(unittest.TestCase):
                              [("started", "test-runner"), ("failed", "test-runner")])
             self.assertEqual(timeline[-1]["exception"], "RuntimeError")
             self.assertEqual(timeline[-1]["message"], "local import failed")
+
+    def test_runtime_only_omits_integration_but_unit_companion_keeps_its_inventory(self):
+        """Exercise both ISAs through the production Buildx command builder."""
+        for isa in pipeline.SHIPPING_ISAS:
+            for role in pipeline.ImageRole:
+                with self.subTest(isa=isa, role=role), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    (root / "source").mkdir()
+                    source = {"revision": "revision", "tree": "tree", "dirty": False}
+                    inventory = pipeline.TestRunnerInventory.UNIT_ONLY
+                    expected = image_pair(source, isa, test_inventory=inventory)[role.value]
+                    with patch.object(pipeline, "run") as execute, \
+                         patch.object(pipeline, "image_identity", return_value=expected):
+                        pipeline.build(argparse.Namespace(cpu_isa=isa), source, root,
+                                       roles=(role,), test_inventory=inventory)
+                    command = execute.call_args.args[0]
+                    self.assertEqual(execute.call_count, 1)
+                    self.assertEqual(command[command.index("--target") + 1], role.value)
+                    self.assertIn(f"LLAMINAR_SKIP_INTEGRATION={int(role is pipeline.ImageRole.RUNTIME)}", command)
+                    self.assertIn("LLAMINAR_TEST_RUNNER_INVENTORY=unit-only", command)
+
+    def test_cloud_cache_is_isa_scoped_and_has_one_export_owner(self):
+        """Cloud cache exports never collide with another ISA or an ARC cache."""
+        registry = "ghcr.io/llaminar/llaminar:build-cache-develop"
+        with patch.dict(pipeline.os.environ, {pipeline.DOCKER_BUILD_CACHE_IMAGE_ENV: registry}, clear=True):
+            for isa in pipeline.SHIPPING_ISAS:
+                for role in pipeline.ImageRole:
+                    args = pipeline.persistent_build_cache_arguments(isa, role, pipeline.ImageRole.RUNTIME)
+                    self.assertEqual(args[:2], ["--cache-from", f"type=registry,ref={registry}-{isa.lower()}"])
+                    self.assertEqual("--cache-to" in args, role is pipeline.ImageRole.RUNTIME)
+            with patch.dict(pipeline.os.environ, {pipeline.DOCKER_BUILD_CACHE_ROOT_ENV: "/tmp/cache"}):
+                with self.assertRaisesRegex(ValueError, "exactly one"):
+                    pipeline.persistent_build_cache_arguments("AVX512", role, role)
+        for invalid in ("", "image", "ghcr.io/repo:tag,mode=min", "ghcr.io/repo:bad tag"):
+            with patch.dict(pipeline.os.environ, {pipeline.DOCKER_BUILD_CACHE_IMAGE_ENV: invalid}, clear=True):
+                with self.assertRaisesRegex(ValueError, "tagged registry image"):
+                    pipeline.persistent_build_cache_arguments("AVX512", role, role)
 
     def test_persistent_build_cache_is_partitioned_and_cold_start_safe(self):
         """An ARC hostPath adds Buildx cache state without a bogus cold import."""
@@ -4486,10 +4523,39 @@ class InfrastructureTests(unittest.TestCase):
     def test_prebuilt_receipt_rejects_changed_inventory(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "installed.json"
-            artifacts.write_json(path, {"schema": 1, "inventory": {"tests": ["one"]}})
+            artifacts.write_json(path, {"schema": 1, "scope": "production", "inventory": {"tests": ["one"]}})
             with patch.object(prebuilt_test_image, "inventory", return_value={"tests": ["two"]}):
                 with self.assertRaises(ValueError):
                     prebuilt_test_image.validate(path, Path(directory))
+
+    def test_unit_receipt_cannot_admit_production_or_require_unbuilt_integration(self):
+        """A smaller installed Unit image must remain an explicit scope."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("CMakeCache.txt", "compile_commands.json", "build.ninja", "CTestTestfile.cmake"):
+                (root / name).write_text("fixture")
+            (root / "CMakeFiles").mkdir()
+            (root / "CMakeFiles/rules.ninja").write_text("fixture")
+            (root / "v2_unit").write_text("fixture executable")
+            registration = {"tests": [
+                {"name": "V2_Unit_HostOnly", "command": [str(root / "v2_unit")]},
+                {"name": "V2_Integration_Preflight", "properties": {"LABELS": ["ProductionTestPreflight"]}},
+            ]}
+            receipt = root / "installed.json"
+            scope = prebuilt_test_image.InstalledTestScope.UNIT
+            with patch.object(prebuilt_test_image.subprocess, "check_output", return_value=json.dumps(registration)), \
+                 patch.object(prebuilt_test_image, "discover_production_parity_unit_tests"), \
+                 patch.object(prebuilt_test_image, "discover_production_test_preflight_tests") as integration:
+                prebuilt_test_image.seal(receipt, root, scope)
+                prebuilt_test_image.validate(receipt, root, scope)
+                integration.assert_not_called()
+                with self.assertRaisesRegex(ValueError, "does not match"):
+                    prebuilt_test_image.validate(receipt, root)
+                with self.assertRaisesRegex(ValueError, "CTest omitted command"):
+                    prebuilt_test_image.inventory(root)
+                (root / "v2_unit").unlink()
+                with self.assertRaisesRegex(ValueError, "executable is missing"):
+                    prebuilt_test_image.validate(receipt, root, scope)
 
     def test_seal_rejects_invalid_gate_registration_before_writing_a_receipt(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -4741,9 +4807,9 @@ class InfrastructureTests(unittest.TestCase):
         # bounded compiler cache instead of allocating anonymous mounts.
         self.assertEqual(dockerfile.count(mount), 4)
 
-    def test_develop_workflow_uses_one_persistent_buildkit_worker_for_host_cache(self):
+    def test_pr_workflow_uses_one_persistent_buildkit_worker_for_host_cache(self):
         """The ARC cache needs a retained BuildKit worker, never the unsupported Docker driver."""
-        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        workflow = (ROOT / ".github/workflows/develop-pr.yml").read_text(encoding="utf-8")
         self.assertIn("driver: docker-container", workflow)
         self.assertIn("name: llaminar-ci", workflow)
         self.assertIn("cleanup: false", workflow)
@@ -4937,7 +5003,7 @@ class InfrastructureTests(unittest.TestCase):
         self.assertNotIn('--cuda-driver-required', harness)
         self.assertIn('if docker_args_need_cuda "${args_ref[@]}"; then', harness)
 
-    def test_develop_workflow_has_one_model_free_driver_and_no_certification_axes(self):
+    def test_develop_workflow_has_one_build_only_driver_and_no_certification_axes(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         self.assertIn("scripts/ci/run_develop_image_gate.py", workflow)
         self.assertNotIn("scripts/ci/run_production_pipeline.py", workflow)
@@ -4952,7 +5018,9 @@ class InfrastructureTests(unittest.TestCase):
         self.assertIn("actions/upload-artifact@v4", workflow)
         self.assertIn("parity-results/develop-image-gate/develop-image-gate.json", workflow)
         self.assertIn("parity-results/develop-image-gate/**/build-timeline.jsonl", workflow)
-        self.assertIn("parity-results/develop-image-gate/**/prerequisites/**", workflow)
+        self.assertIn("--build-only", workflow)
+        self.assertIn("parity-results/develop-image-gate/**/publish.log", workflow)
+        self.assertNotIn("parity-results/develop-image-gate/**/prerequisites/**", workflow)
         self.assertNotIn("path: parity-results/develop-image-gate\n", workflow)
 
 
