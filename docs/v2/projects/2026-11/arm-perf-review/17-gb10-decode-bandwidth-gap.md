@@ -50,20 +50,23 @@ with repeats) were still running on `.80`; at A: 35B 17.9/17.8, 27B 4.16 (MTP)
 / 4.21 (off) tok/s decode. The final verified A/B/C supersedes this paragraph —
 see `00-measured-baseline.md`.
 
-## llama.cpp CPU baseline on GB10 (2026-11-08)
+## llama.cpp baseline on GB10 (2026-11-08) — full matrix
 
-Same qwen4exp UD-Q4_K_XL GGUF on `.79`; llama.cpp `cf34d31`, CPU 20 threads,
-`llama-bench`, 3 repeats:
+Same qwen4exp UD-Q4_K_XL GGUF, same `.79`, llama.cpp `cf34d31`, llama-bench
+3 repeats:
 
-- pp2160 = **40.88 ± 0.09** tok/s
-- tg256 = **3.06 ± 0.11** tok/s
+| Engine | Prefill pp2160 (tok/s) | Decode tg256 (tok/s) |
+|---|---|---|
+| llama.cpp **CUDA** (`-ngl 99`, GGML_CUDA sm_121, host CUDA 13.0.88) | **1063.24 ± 13.10** | **28.80 ± 0.03** |
+| Llaminar CUDA (GB10, all-CUDA:0) | 318.6 | 22.82 |
+| llama.cpp CPU (20 threads) | 40.88 ± 0.09 | 3.06 ± 0.11 |
 
-Compared with Llaminar GPU (GB10, all-CUDA:0): prefill 318.6 tok/s, decode
-22.82 tok/s → **GPU is 7.8× prefill, 7.5× decode**.
+(CUDA reports Total VRAM 124546 MiB — the GB10 unified pool is fully visible.)
 
-Inference: the Llaminar GPU numbers are **not anomalously low for this model
-class**; the CPU reference is ~7.5–8× behind. (llama.cpp reports the arch as
-“qwen4exp A3B Q4_K Medium”, i.e. it supports the qwen4exp family.)
+**Conclusions:**
 
-Optional next data point: llama.cpp with **CUDA on GB10** (build ~30 min) —
-would separate llama.cpp CPU-arch limits from GB10-class ceilings.
+- Llaminar GPU **prefill is 3.3× behind** llama.cpp GPU (1063 vs 319) — a
+  real engine perf gap on prefill; decode is ~21% behind (22.8 vs 28.8),
+  smaller. The 4-digit prefill **is** reachable on GB10, so it is not a
+  hardware ceiling. See idea 24.
+- The CPU row confirms Llaminar-GPU is healthy relative to CPU (7.5–8×).
