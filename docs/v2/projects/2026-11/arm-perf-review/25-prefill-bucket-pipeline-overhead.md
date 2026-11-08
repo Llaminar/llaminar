@@ -67,16 +67,18 @@ captured bucket-pipeline overhead**, not kernel efficiency:
 ## Rerun tree (SHA-only policy, 2026-11-08)
 
 The old `arm-validation` pin branch (and its merged tree `bef53edb6`) is
-deleted. Replacement merged tree, built locally per the SHA-only policy:
+deleted. **Canonical SHA for the trace build — updated:** the CUDA spills are
+now a stacked upstream PR (`Llaminar/llaminar` **#44**, draft, base
+`feat/arm64-native-kernels`) with linear tip **`09e14d3ae`** (= old merged
+tree `a5412af30` content).
 
-- merge commit **`a5412af30f475d655a83108980a4f920d753b2d8`**
-  (tree `80c81df7c0eb207c978bc2b49671d0067553ef12`),
-  `codex/cuda-sm121-spills` merged with upstream
-  `Llaminar/llaminar feat/arm64-native-kernels` @ `1a01e6786`;
-- spill kernel files verified unchanged vs `be998fdec`.
+- Use **`09e14d3ae`** for the future nsys trace build (Release sm_121, `.79`).
+- `a5412af30f475d655a83108980a4f920d753b2d8` (internal merge commit) and
+  `bef53edb6` stay as **provenance only**.
+- Spill kernel files verified unchanged vs `be998fdec`.
 
-When nsys lands in `uma3`, rebuild Release sm_121 from this SHA on `.79` and
-run the per-bucket trace; results → ideas 24/25.
+When nsys lands in `uma3`, rebuild Release sm_121 from `09e14d3ae` and run
+the per-bucket trace; results → ideas 24/25.
 
 ## Validation
 
