@@ -24625,6 +24625,16 @@ if(HAVE_ROCM)
                 --gtest_filter=SharedBackendPolicy/RetainedPrefillBucketFamilyTest.ReplaysSmallRemainder/*
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;GraphCapture;Prefill;Buckets;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+    # Issue #30: the KV probe reset ran on the admission stream while the
+    # retained replay ran on the engine's prefill stream with no edge between
+    # them, so a replay could append past the capacity with the previous
+    # request's count. Repeat the reset/replay rounds to keep the edge proven.
+    add_v2_test(V2_Integration_PrefillRetainedRemainderResetOrdering_ROCm
+        COMMAND $<TARGET_FILE:v2_test_prefill_graph_cache_execution_rocm>
+                --gtest_filter=SharedBackendPolicy/RetainedPrefillBucketFamilyTest.ReplaysSmallRemainder/*
+                --gtest_repeat=10
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GraphCapture;Prefill;KVCache;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     add_v2_test(V2_Integration_PrefillGraphCacheLongContextMTotality_ROCm
         COMMAND $<TARGET_FILE:v2_test_prefill_graph_cache_execution_rocm>
                 --gtest_filter=PrefillGraphCacheExecutionTest.LongContext256KPlusTailIsMTotal
@@ -24680,6 +24690,16 @@ if(HAVE_CUDA)
                 --gtest_filter=SharedBackendPolicy/RetainedPrefillBucketFamilyTest.ReplaysSmallRemainder/*
         LABELS "V2;Integration;ProductionTestPreflight;CUDA;GraphCapture;Prefill;Buckets;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+    # Issue #30: the KV probe reset ran on the admission stream while the
+    # retained replay ran on the engine's prefill stream with no edge between
+    # them, so a replay could append past the capacity with the previous
+    # request's count. Repeat the reset/replay rounds to keep the edge proven.
+    add_v2_test(V2_Integration_PrefillRetainedRemainderResetOrdering_CUDA
+        COMMAND $<TARGET_FILE:v2_test_prefill_graph_cache_execution_cuda>
+                --gtest_filter=SharedBackendPolicy/RetainedPrefillBucketFamilyTest.ReplaysSmallRemainder/*
+                --gtest_repeat=10
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;GraphCapture;Prefill;KVCache;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     add_v2_test(V2_Integration_PrefillGraphCacheLongContextMTotality_CUDA
         COMMAND $<TARGET_FILE:v2_test_prefill_graph_cache_execution_cuda>
                 --gtest_filter=PrefillGraphCacheExecutionTest.LongContext256KPlusTailIsMTotal

@@ -766,6 +766,13 @@ namespace
             void *execution_stream,
             DeviceId execution_device) override
         {
+            // RequestStateResetReady: the reset's KV count is live state every
+            // forward reads. The event stays valid for the whole request; a wait
+            // on an already completed event costs nothing.
+            if (request_reset_ready_stream_ && execution_stream != request_reset_ready_stream_ &&
+                !getBackendFor(device_)->streamWaitEvent(execution_stream,
+                    request_reset_ready_event_.get(), device_.toKernelDeviceIndex()))
+                return false;
             if (previous_forward_published_ && forwardGraphEntryDependency(input, device_,
                     ForwardParticipantOutputRole::TerminalOwner) ==
                     ForwardGraphEntryDependency::PreviousForwardCompletion)
@@ -994,11 +1001,42 @@ namespace
                        : nullptr;
         }
 
-        /** @brief Reset real cache data on its exact fixture stream, preserving captured addresses. */
+        /**
+         * @brief Reset real cache data on its exact fixture stream, preserving captured addresses.
+         *
+         * The reset is enqueued on @p stream, but forward graphs execute on the
+         * engine's own prefill/decode streams. Like the orchestrator's
+         * RequestStateResetReady edge, the fixture records one completion event
+         * after the reset; prepareLiveStateForForwardGraphExecution() makes every
+         * later forward wait for it. Without that edge a retained replay can
+         * observe the previous request's KV count and append past the capacity.
+         *
+         * @param stream Explicit reset producer stream.
+         * @return False if the reset or its readiness publication fails.
+         */
         bool resetKVCacheProbeForTesting(void *stream)
         {
-            return kv_cache_ && stream && kv_cache_->resetRequestState(
-                IKVCache::StateResetContext::testReinitialization(stream, "resident-generation-reset"));
+            if (!kv_cache_ || !stream || !kv_cache_->resetRequestState(
+                    IKVCache::StateResetContext::testReinitialization(stream, "resident-generation-reset")))
+                return false;
+            if (!device_.is_gpu())
+                return true;
+            auto *backend = getBackendFor(device_);
+            if (!backend)
+                return false;
+            if (!request_reset_ready_event_)
+            {
+                void *const event = backend->createEvent(device_.toKernelDeviceIndex());
+                if (!event)
+                    return false;
+                request_reset_ready_event_ = std::shared_ptr<void>(event,
+                    [backend, device = device_](void *value)
+                    { backend->destroyEvent(value, device.toKernelDeviceIndex()); });
+            }
+            if (!backend->recordEvent(request_reset_ready_event_.get(), device_.toKernelDeviceIndex(), stream))
+                return false;
+            request_reset_ready_stream_ = stream;
+            return true;
         }
 
         /**
@@ -1184,6 +1222,8 @@ namespace
     private:
         std::shared_ptr<void> previous_forward_event_; ///< Persistent exact producer publication.
         bool previous_forward_published_ = false; ///< Fixture event's publication lifecycle.
+        std::shared_ptr<void> request_reset_ready_event_; ///< Completion of the latest KV probe reset.
+        void *request_reset_ready_stream_ = nullptr; ///< Producer stream of that reset; null before any reset.
         /**
          * @brief Create one stable arena address set shared by every cached bucket.
          *
