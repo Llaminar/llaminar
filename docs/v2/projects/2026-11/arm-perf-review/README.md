@@ -100,3 +100,11 @@ CUDA / GB10 GPU (part of the ARM story):
 - 21 remainder (BK256 non-ordered; tensor_prefill split — spec signed off) · 25 (PerfStats bucket counters + nsys-in-uma3 first; single-bucket/async path after) · 22 FA2 per-codec tournament prep.
 After i8mm merge (same tile / post-merge):
 - 4 wider panel + activation reuse (MXFP4-coordinated) · 5 rework prototype (id-gated claiming; lane-held) · 3 metadata hoist (lands on the tile) · 6 Q6_K prefill rerun under production binding.
+
+## Live lanes
+
+- **addon** (successor to i8mm; same session 01a1bbe6, branch codex/arm-addon
+  on c24ce9b4e): Lane 2 = ideas 03 (metadata hoist + publication proof),
+  04 (wider panel + activation reuse, MXFP4-coordinated), 11 (attention
+  validation hoist + integer-dot proof). Plan-first; independent until fully
+  merge-ready, then handover to Main.
