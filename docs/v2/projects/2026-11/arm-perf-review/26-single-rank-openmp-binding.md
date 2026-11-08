@@ -55,3 +55,10 @@ deciding — the lane will run that check.
 - Status: pending Main's review/cherry-pick onto PR #43. Rebase conflict with
   the upstream fused recorder was resolved inside the lane's tip
   (recordNativeNEONFusedLaunches, 21-tag schema).
+
+## Taken by Main (2026-11-08) — binding is in PR #43
+
+Main reviewed and cherry-picked a7f719dfb; PR #43 is now a7f719dfb (same
+commit object, fast-forward). Local pass: OpenMPCapacityOrderedCorePlaces,
+MPIBootstrap*, OpenMPIdleSpinPolicy. The i8mm lane rebases onto a7f719dfb and
+drops its binding commit; remaining tip goes to the gate.
