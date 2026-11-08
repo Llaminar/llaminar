@@ -128,3 +128,23 @@ collector and generator kept). **New head reference: 35B MTP dynamic ≈ 28.5
 tok/s, no-MTP ≈ 21.0, 27B no-MTP 4.64.**
 
 - See `17-gb10-decode-bandwidth-gap.md` for the bandwidth-gap analysis.
+
+## GB10 GPU reference (Qwen3.8-Flash-Next, all-CUDA:0, sm_121, Release)
+
+Engine `arm-validation/0cdcecc3c-spills` = `bef53edb6`; Qwen3.8-Flash-Next-
+UD-Q4_K_XL (4-shard GGUF, ~111 GB, 177B MoE, qwen4exp, no MTP layers);
+greedy, single stream, graph-captured bucket pipeline, 102 GB resident:
+
+| Prompt | Prefill tok/s | Decode tok/s |
+|---|---|---|
+| 120 | 187.5 | — |
+| 2160 | 318.6 | 22.82 (~115 GB/s effective weight reads) |
+| 7200 (@ -c 8192) | 312.3 (23.06 s) | 23.11 |
+
+- **Prefill plateaus ~315 tok/s** (120 → 2160 → 7200), so it is steady-state
+  compute-bound, not a length/startup artifact; decode is stable ~23 tok/s.
+- Observations: GEMM dominates (prefill bucket ~198 ms/512);
+  `MOE_EXPERT_FFN` 48 samples/layer; `GDN_PROJECTION` significant.
+- GPU-side reference only — used as the GB10 ceiling context for idea 17's
+  CPU bandwidth comparison and the llama.cpp cross-engine check (CPU baseline
+  still open).
