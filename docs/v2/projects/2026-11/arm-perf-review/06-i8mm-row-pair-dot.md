@@ -97,3 +97,32 @@ pin branches). Lane: `arm-i8mm` (01a1bbe6, codex/i8mm-typed-placement).
 - Ownership: CPUCodegenEnvelope.py NEON_I8MM + CPUInstructionSet.cmake =
   the i8mm lane; arm-sparks validates at the gate (envelope + BuildSystem
   gates + Unit/byte tests) when handed a SHA.
+
+## Design accepted (2026-11-08) — envelope + leaf, not a new ISALevel
+
+- I8MM is modeled as a **compiled build envelope** + **projection leaf**, NOT
+  `ISALevel::NEONI8MM`: active ISA level stays `NEONDotProd` (SMMLA is
+  byte-identical to SDOT by contract), so FA2/attention/RMSNorm/SwiGLU/
+  qwen4exp/MPI-wire/planning are untouched.
+- `LLAMINAR_CPU_ISA=NEON_I8MM` → `LLAMINAR_COMPILED_WITH_NEON_DOTPROD=1` +
+  `LLAMINAR_COMPILED_WITH_NEON_I8MM=1`; `compiledNativeVNNIBuildISAName()`
+  = `NEON_I8MM` (local/diagnostic only); startup hard-fails without
+  HWCAP2_I8MM; `CPUCodegenEnvelope` NEON_I8MM mode (sdot + smmla);
+  `V2_CPU_NATIVE_ISA_CELLS` gains `NEON_I8MM`.
+- Projection leaf: `ISAPath::NEON_I8MM` (AUTO → I8MM in an I8MM build;
+  explicit `NEON_DOTPROD`/`NEON` remain real, tested leaf families → same-
+  binary SDOT-vs-SMMLA A/B); rejected outside an I8MM build.
+- PerfStats route names: `grouped_neon_i8mm_pair_rows` / `four_rows`; tests
+  assert SMMLA actually ran (path proof, maxim 26).
+- Sealed identity condition: the 8-field CPU identity, MPI wire codec,
+  prepared/archive identities and cross-machine cache keys keep encoding
+  NEONDotProd — nothing serializes the I8MM build name into them.
+
+- **Heterogeneous MPI condition (Main, binding):** an i8mm-built rank and a
+  dotprod-built rank exchange identical CPU identities — fine only because
+  SMMLA is byte-identical. The planner must never place an i8mm binary on a
+  host without I8MM (startup hard-fail covers). A heterogeneous MPI job
+  (i8mm rank + dotprod rank) must be **admitted with identical bytes or
+  rejected** — never silently mixed with different numerics. Add a focused
+  regression: CPU-identity equality + byte equality (or clean rejection)
+  across i8mm/dotprod-built ranks.
