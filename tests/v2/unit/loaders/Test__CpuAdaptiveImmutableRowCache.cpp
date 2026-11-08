@@ -670,7 +670,7 @@ TEST(CpuAdaptiveImmutableRowCache, LookupOnlyReadsNeverCreditReplacementPolicy) 
         // Resolve through the same production mapping as the native fixture.
         // A future inventory entry without a native GGUF declaration must be
         // explicitly accounted for rather than silently disappearing.
-        for (unsigned code = 0; code <= unsigned(GGUFTensorType::BF16); ++code) {
+        for (unsigned code = 0; code <= unsigned(GGUFTensorType::MXFP4); ++code) {
             try {
                 if (ggufToTensorType(GGUFTensorType(code)) == native->native_type()) {
                     format = GGUFTensorType(code);
@@ -756,7 +756,7 @@ TEST(CpuAdaptiveImmutableRowCache, LookupOnlyFreeRetentionNativeFormatReplay) {
     for(const auto& entry:embeddingVerifierFormats()) {
         SCOPED_TRACE(entry.label);const auto native=entry.create({2,256},1701);
         std::optional<GGUFTensorType> format;
-        for(unsigned code=0;code<=unsigned(GGUFTensorType::BF16);++code)try{
+        for(unsigned code=0;code<=unsigned(GGUFTensorType::MXFP4);++code)try{
             if(ggufToTensorType(GGUFTensorType(code))==native->native_type()){format=GGUFTensorType(code);break;}
         }catch(const std::invalid_argument&){}
         if(!format){ASSERT_EQ(native->native_type(),TensorType::Q8_1);++unsupported;continue;}
