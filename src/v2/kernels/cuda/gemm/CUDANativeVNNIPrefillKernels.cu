@@ -413,7 +413,7 @@ namespace
                         }
                     }
 
-#pragma unroll
+#pragma unroll 1
                     for (int k = 0; k < 4; ++k)
                     {
                         const int b_k_offset =
@@ -511,7 +511,10 @@ namespace
                         (num_q40_blocks +
                          serial_m1_k_partitions - 1) /
                         serial_m1_k_partitions;
-#pragma unroll
+                    // The ordered reducer keeps partition and running totals
+                    // live; a rolled K loop bounds the in-flight MMA/fragment
+                    // temps instead of multiplying them by the unroll factor.
+#pragma unroll 1
                     for (int k = 0; k < 4; ++k)
                     {
                         const int completed_block =
@@ -550,7 +553,7 @@ namespace
                                     scale_idx];
                         }
 
-#pragma unroll
+#pragma unroll 1
                         for (int wj = 0; wj < WN; ++wj)
                         {
                             const int b_col_base =

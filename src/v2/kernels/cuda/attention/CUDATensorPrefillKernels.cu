@@ -303,7 +303,10 @@ __device__ __forceinline__ void run(const float *__restrict__ queries, const voi
             }
             running_l0 = fmaf(running_l0,alpha0,sum0); running_l1 = fmaf(running_l1,alpha1,sum1);
             running_m0 = next0; running_m1 = next1;
-#pragma unroll
+            // The 128-float output accumulator already owns half the register
+            // file; keep the P/V MMA body rolled so its per-tile ldmatrix and
+            // fragment temps do not stack an extra unrolled window on top.
+#pragma unroll 1
             for (int n = 0; n < 32; ++n)
             {
                 unsigned b[kKeys/16][2];

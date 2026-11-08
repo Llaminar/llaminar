@@ -985,7 +985,7 @@ namespace llaminar2::cuda::prefill
                         }
                     }
 
-#pragma unroll
+#pragma unroll 1
                     for (int wj = 0; wj < WN; ++wj)
                     {
                         const int b_col_base = wc * WARP_N + wj * 8;

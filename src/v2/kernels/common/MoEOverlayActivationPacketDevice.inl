@@ -39,6 +39,14 @@ namespace llaminar2::moe_activation_packet_device
 {
     /** Threads in the portable CUDA/HIP deterministic metadata compactor. */
     inline constexpr std::uint32_t kDispatchMetadataBlockThreads = 256u;
+    /**
+     * One-row fused dispatch metadata+copy blocks. The metadata chain
+     * (grant validation, snapshotting, route compaction) needs the full
+     * 255-register budget, which a 512-thread CTA cannot supply on
+     * sm_120/121; 256 threads keep the fused single-node launch while
+     * still giving eight warps of independent mapped reads for the copy.
+     */
+    inline constexpr std::uint32_t kSingleRowDispatchThreads = 256u;
 
     /**
      * @brief Load one peer-published scalar without accepting a cached line.
@@ -2806,7 +2814,7 @@ namespace llaminar2::moe_activation_packet_device
     /** @brief Launch-compatible wrapper for one direct-mapped dispatch lane. */
     // CUDA and HIP launch 512 threads for mapped single-row payloads. Keeping
     // this bound explicit prevents an unnecessarily restricted register budget.
-    static __global__ __launch_bounds__(512) void packSingleRowDispatchKernel(
+    static __global__ __launch_bounds__(kSingleRowDispatchThreads) void packSingleRowDispatchKernel(
         LLAMINAR_MOE_PACKET_GRID_CONSTANT MoEOverlayActivationSingleRowDispatchPackLaunch launch)
     {
         if (blockIdx.x == 0u)
@@ -2821,7 +2829,7 @@ namespace llaminar2::moe_activation_packet_device
      * removes serial launch and mapped-store latency without changing any lane's
      * packet bytes or timeline protocol.
      */
-    static __global__ __launch_bounds__(512) void packSingleRowDispatchBatchKernel(
+    static __global__ __launch_bounds__(kSingleRowDispatchThreads) void packSingleRowDispatchBatchKernel(
         MoEOverlayActivationSingleRowDispatchBatchLaunch launch)
     {
         const std::uint32_t lane = blockIdx.x;
@@ -2838,7 +2846,7 @@ namespace llaminar2::moe_activation_packet_device
      * Thus downstream expert compute observes the same tensors as the ordinary
      * validator/materializer pair, with two graph nodes removed.
      */
-    static __global__ __launch_bounds__(512) void consumeSingleRowDispatchKernel(
+    static __global__ __launch_bounds__(kSingleRowDispatchThreads) void consumeSingleRowDispatchKernel(
         MoEOverlayActivationSingleRowDispatchConsumeLaunch launch)
     {
         auto &packet = launch.packet;

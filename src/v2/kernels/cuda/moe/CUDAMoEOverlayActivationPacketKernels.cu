@@ -32,6 +32,9 @@ namespace
      * smaller block because they scale through their grid instead.
      */
     constexpr unsigned int kSingleRowThreads = 512u;
+    /** Fused dispatch kernels carry the register-heavy metadata chain; they use
+     *  the 256-thread bound so the cap is 255 registers instead of 128. */
+    constexpr unsigned int kSingleRowDispatchThreads = 256u;
     /** Bounded route-slot blocks; each block walks additional slots grid-stride. */
     constexpr unsigned int kSparseRoutePayloadBlocks = 256u;
 
@@ -208,7 +211,7 @@ extern "C" bool cudaMoEOverlayActivationPackSingleRowDispatch(
     }
     const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     llaminar2::moe_activation_packet_device::packSingleRowDispatchKernel
-        <<<1u, kSingleRowThreads, 0u, cuda_stream>>>(*launch);
+        <<<1u, kSingleRowDispatchThreads, 0u, cuda_stream>>>(*launch);
     return launchAccepted();
 }
 
@@ -224,7 +227,7 @@ extern "C" bool cudaMoEOverlayActivationConsumeSingleRowDispatch(
     }
     const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     llaminar2::moe_activation_packet_device::consumeSingleRowDispatchKernel
-        <<<1u, kSingleRowThreads, 0u, cuda_stream>>>(*launch);
+        <<<1u, kSingleRowDispatchThreads, 0u, cuda_stream>>>(*launch);
     return launchAccepted();
 }
 
@@ -272,7 +275,7 @@ extern "C" bool cudaMoEOverlayActivationPackSingleRowDispatchBatch(
     }
     const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     llaminar2::moe_activation_packet_device::packSingleRowDispatchBatchKernel
-        <<<launch->lane_count, kSingleRowThreads, 0u, cuda_stream>>>(*launch);
+        <<<launch->lane_count, kSingleRowDispatchThreads, 0u, cuda_stream>>>(*launch);
     return launchAccepted();
 }
 

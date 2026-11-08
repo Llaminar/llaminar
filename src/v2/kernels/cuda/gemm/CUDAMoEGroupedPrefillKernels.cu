@@ -1664,7 +1664,7 @@ namespace
                             up_b_fragment);
                     }
 
-#pragma unroll
+#pragma unroll 1
                     for (int element = 0; element < 4; ++element)
                     {
                         const int local_row = mmaFragmentRow(lane, element);
