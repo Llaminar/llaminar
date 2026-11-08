@@ -80,6 +80,14 @@ tree `a5412af30` content).
 When nsys lands in `uma3`, rebuild Release sm_121 from `09e14d3ae` and run
 the per-bucket trace; results → ideas 24/25.
 
+## Host reservation (2026-11-08, brokered via arm-perf)
+
+- `.79` is reserved **GPU-only** for this trace (172G free; executor
+  `spark-cuda-spil`) — runs as soon as nsys lands in `uma3`; no order
+  dependency with the CPU lane. 
+- `.80` is dedicated to the arm-i8mm lane (CPU-only); perf windows are booked
+  through arm-perf.
+
 ## Validation
 
 - Same model/prompt/length as idea 24; byte-identical output vs existing
