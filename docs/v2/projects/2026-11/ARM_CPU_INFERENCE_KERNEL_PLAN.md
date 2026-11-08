@@ -82,9 +82,15 @@ tiles over all 20 cores with `OMP_PLACES=cores` is the measured best policy
 
 Open, in order:
 
-1. Live GB10 joint-pool validation: the CUDA build at sm_121 is blocked by
-   18 kernel spills under the zero-spill guard (seal
-   `K14-UMA-SM121-SPILLS-20261108`); the status run uses compute 12.0 SASS.
+1. Live GB10 joint-pool validation is blocked by CUDA register pressure. The
+   zero-spill guard rejects 18 kernel instantiations at sm_121 and 45 at
+   sm_120, including the tensor prefill family, BF16 tiny projection, MoE
+   grouped/IMMA gate-up and overlay activation packets (seal
+   `K14-UMA-SM121-SPILLS-20261108`, both tables). The rest of the GB10 CUDA
+   path is proven up to compilation: both configures, canonical NCCL with all
+   four builder probes, CUTLASS, and the two-language manifest regression.
+   Joint-pool admission is covered device-free (`PhysicalMemoryRankHostPool`,
+   10 cases). The spill fixes are CUDA tuning outside this CPU scope.
 2. GDN grouped verifier economics on mixed cores (from the final round).
    27B dense MTP economics (MTP dynamic 4.24 vs off 4.62 tok/s, 43% acceptance
    at depth 10) moves to the I8MM and depth-controller follow-ups.
