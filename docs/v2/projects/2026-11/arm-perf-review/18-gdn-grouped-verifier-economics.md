@@ -22,11 +22,13 @@ Source: `Perf__CPUGatedDeltaNetVerifierRows`.
 ## GB10 confirmation (final Perf round, K14-PERF-FINAL-264970E14 @ `264970e14`)
 
 `CPUGatedDeltaNetVerifierRows` on the sealed final round: **grouped-vs-serial
-speedup < 1 for every M at both 20T and 1T** (e.g. M=4 **0.447**, M=6
-**0.416** @ 20T). The grouped GDN verifier path is **uneconomical on NEON** —
-confirming, not just suggesting, the analysis above. Any fix must first
+speedup < 1 for essentially every M at both 20T and 1T** (e.g. M=4 **0.447**,
+M=6 **0.416** @ 20T; only M=2 @ 1T shows 2.08, likely noise). The grouped GDN
+verifier path is **uneconomical on NEON** — confirming, not just suggesting,
+the analysis above. Any fix must first
 separate kernel vs capture/publication cost (the production-path numbers above
-were the worse half).
+were the worse half). Since it fails at 1T too, the cause is the **grouped
+kernel/publication structure, not core heterogeneity** (see idea 5).
 
 ## Open questions (before any kernel change)
 

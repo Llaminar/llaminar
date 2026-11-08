@@ -62,14 +62,20 @@ Two follow-ups have landed since:
 
 ## Measured placement economics (P1 final Perf round, K14-PERF-FINAL-264970E14)
 
-- **Fast-only (X925, 10T) ≈ mixed 20T** for GEMV — the X925-only placement
-  matches all-core throughput with half the workers.
-- **Slow-only (A725) is 2.4–3.7x worse** than mixed.
+- **Fast-only (X925, 10T) ≈ mixed 20T** for GEMV decode: 217.7 vs 226.4 µs —
+  the 10 X925 cores alone saturate decode; adding A725 cores gives nothing
+  (slightly worse).
+- **Grouped M=15: mixed 20T still wins 11–12%** (1569 vs 1750 µs) — the
+  big-K grouped/prefill shapes do use the extra cores.
+- **Slow-only (A725) is 2.4x (GEMV) to 3.7x (grouped) behind fast-only.**
 
-So the current `dynamic(1)` all-core policy is not leaving much on the table
-for GEMV; the economical win would be a typed policy that avoids putting
-work on slow cores when fast cores can absorb it (or a P-core-only mode where
-power/thermal matter). No such typed policy exists yet.
+Suggested typed placement policy (no implementation yet):
+- **M=1 decode on X925 only** — frees A725 cores for other work and avoids
+  straggler barriers on mixed-core teams;
+- **grouped/prefill on all 20**.
+
+This is a decision for a typed policy with per-shape placement evidence, not
+another schedule heuristic.
 
 ## Validation
 
