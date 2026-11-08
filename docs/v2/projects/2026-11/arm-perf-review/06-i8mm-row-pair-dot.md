@@ -141,24 +141,21 @@ pin branches). Lane: `arm-i8mm` (01a1bbe6, codex/i8mm-typed-placement).
   regression: CPU-identity equality + byte equality (or clean rejection)
   across i8mm/dotprod-built ranks.
 
-## Lane progress (2026-11-08; 3 commits on b2cf793bf, .80 transport, not GitHub)
+## Perf window results (2026-11-08, Release c3, same-binary SDOT vs SMMLA; interleaved A,B,B,A; 31 iters + 5 warmup; raw+p95 under .80:/home/factory/llaminar-i8mm/build/results/ab-20261108T175836Z)
 
-- c1 `acadffd64` build(cpu): NEON_I8MM envelope — gate ran (correct spelling).
-- c2 `4d3f032f4` perf(cpu): I8MM row-pair leaf + tests. On .80 NEON_I8MM
-  Integration: Unit 958/960 (2 known-upstream), Preflight 2291/2293 (3 target
-  selection + 4 idea-27 cells); all I8MM byte suites pass (all
-  sources/encodings/policies, N%4 tails with canaries, M 1..16/31/33/65,
-  workers 1..10); `MTP_SmallM_AllFormats` with route assertions
-  (`grouped_neon_i8mm_*`, `integer_dot=i8mm`); mutation swap of grid pair
-  operands fails all four I8MM tests; objdump: Rows=1 → 0 smmla/0 sdot (calls
-  DotProd instantiation), Rows=2/4 → smmla only, Rows=3 → smmla + sdot.
-  OPEN ITEM: higher q-register stack traffic in I8MM Rows=3/4 tile run<>
-  (79/85 vs SDOT 26/35 st+ld per 16 fns) — possible spills; profile in the
-  perf window before any economy claim.
-- c3 `cc669d04c` fix(runtime): capacity-ordered binding (option a) — one
-  helper `bindOpenMPWorkersFastestFirst` + `capacityOrderedCorePlaces(mask)`,
-  used by cluster path and all self-launched OMP_PLACES=cores/close ranks;
-  latent fix: admitted set = thread mask ∪ libgomp place list (see idea 26).
-- Perf window (approved by arm-perf + arm-sparks) pending Release builds:
-  ThreadScaling SDOT-vs-SMMLA matrix, engine c3-I8MM vs c3-DOTPROD (27B/35B
-  MTP dyn/off), c2-vs-c3 35B MTP-off, IPC + disasm.
+Kernel speedup (SDOT/SMMLA times, grouped M≥4):
+- 17408x5120 (27B gate/up): X925×10 → 1.01–1.09 (Q4_K/Q8_0/IQ3_S/Q3_K 1.07–1.09; IQ4_XS/Q2_K 1.05–1.07; Q6_K 1.04–1.06; IQ2_S 1.03–1.04; Q5_K 1.01–1.03; prefill M=64 1.02–1.09). A725×10 larger: 1.06–1.19 (Q4_K 1.16–1.19, IQ4_XS 1.17–1.19, Q3_K/Q6_K/Q8_0/IQ3_S 1.09–1.13, IQ2_S/Q5_K ~1.09, Q2_K ~1.06; prefill up to 1.19). Mixed 20T: 1.03–1.10 with scheduling noise; some M=2..8 regress (Q3_K M=3 0.77, Q2_K M=4 0.86) — from the harness's CPU-id-ordered team (no capacity binding; idea 26 fixes this in the engine).
+- 512x2048 (35B bundle): X925 1.09–1.17 (Q4_K/Q5_K/Q8_0/IQ3_S/IQ4_XS), 1.04–1.06 compact; Q6_K ~1.00 on X925; Q6_K mixed prefill 0.85 but bimodal (min 174 µs = SDOT) → needs a rerun.
+- M=1: 0.98–1.02 everywhere (identical SDOT instantiation — guard holds by construction AND measurement). M=2/3 gain little (0.98–1.05).
+
+Codegen (Release libllaminar2_core): SMMLA tiles have NO spill traffic — q stack st/ld Rows=4 I8MM 8/8 vs SDOT 12/12 per encoding family. The earlier Integration numbers were -O3 debug-info noise. Q6_K I8MM has ~37% more static instructions (decode-bound), matching its ~0 gain.
+
+Engine (Release, saved plans, n=256 greedy, A,B,C,C,B,A / A,B,B,A; tokens byte-identical across builds × MTP on/off):
+- 27B MTP dyn 5.455→5.545 (+1.7%, acceptance 43.4% both); no-MTP 5.28→5.25 (noise); prefill +2–3%.
+- 35B MTP 33.57→34.01 (+1.3%); no-MTP 23.61→23.55 (noise).
+- Binding C→B: 35B no-MTP 23.42→23.55 (no regress, ≤+0.5%), MTP 33.94→34.01; prefill noisy.
+
+Handoffs (rebased onto afe62c5ef, fork codex/i8mm-typed-placement):
+- a7f719dfb fix(runtime): capacity-ordered binding — BINDING-ONLY, parent afe62c5ef (Main cherry-pick).
+- 581765ae5 build(cpu): NEON_I8MM envelope. - cd55f6b27 perf(cpu): I8MM leaf — TIP SHA for the arm-sparks gate re-run (Unit + preflight + NEON_DOTPROD/NEON_I8MM cells).
+- Rebase conflict: upstream moved the fused launch recorder to recordNativeNEONFusedLaunches; I8MM ported inside the shared 21-tag schema (isa=NEON_I8MM, grouped_neon_i8mm_* routes); the extra integer_dot tag was dropped.

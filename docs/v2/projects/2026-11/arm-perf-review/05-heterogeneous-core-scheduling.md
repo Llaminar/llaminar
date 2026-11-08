@@ -81,3 +81,10 @@ another schedule heuristic.
 
 - Thread-scaling Perf on GB10, M 1..8/12/15/16/31/64, all formats; per-class
   placement runs; unprofiled timing; then engine-level decode/prefill curves.
+
+## Placement evidence update (2026-11-08 perf window — task-count matters)
+
+- BIG shape (17408x5120): mixed-20 beats X925-10 for decode (Q4_K 545 vs 573 µs) AND grouped M=15 (2349 vs 3075 µs).
+- SMALL N=512 bundle: mixed-20 is much worse for grouped M=4 (IQ2_S 52.5 vs 19.3 µs; Q4_K 32.5 vs 11.2 µs) — only ~8 tasks, 20 workers to wake.
+- Conclusion: the placement choice must depend on the projection's TASK COUNT (columns × chunk structure), not only M=1 vs grouped — the C8 default table is revised accordingly (fastest-class only when the task count is small AND M=1; all-workers for big shapes).
+- Nuance vs the earlier P1 numbers: 'fast-only ≈ mixed for GEMV' was a different shape (2048x4096); at 17408x5120 mixed wins decode. The typed policy needs per-shape-class evidence, not a single switch.

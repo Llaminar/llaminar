@@ -80,3 +80,7 @@ grouped verify is wasted. Two open questions:
 2. Are the CPU continuation profile defaults in `execution/config/
    MTPDepthDefaults.h` sensible for CPU (they may be tuned for device
    continua)?
+
+## Base-dependent result (2026-11-08, afe62c5ef + i8mm c3)
+
+On the NEW base, 27B MTP dyn **5.455—5.545 vs no-MTP 5.28 tok/s** — MTP now beats no-MTP on this base (acceptance 43.4%), opposite of the older 268cd81de numbers (4.24/4.27 vs 4.49). The dense-MTP decision is base/version-sensitive: evaluate the economics for each base, not once. (Root causes of the flip are not yet separated — likely the upstream perf/prefill fixes.)

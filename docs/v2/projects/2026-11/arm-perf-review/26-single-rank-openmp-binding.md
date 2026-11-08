@@ -38,22 +38,20 @@ deciding — the lane will run that check.
   binding change: single-rank 35B/27B decode+prefill, worker classes measured
   (X925-only / A725-only / mixed).
 
-## Decision (Main, 2026-11-08): option (a), two conditions
+## Implemented (2026-11-08) — binding-only SHA a7f719dfb (parent afe62c5ef)
 
-1. **One implementation.** Factor the binding in `configureClusterRankThreads`
-   into one helper used by EVERY bootstrap path that sets OMP_PLACES=cores /
-   OMP_PROC_BIND=close (single-rank CPU, explicit `cpu:N`, GPU-NUMA cpu-set,
-   shorthand). Keep the existing OpenMP-partition authority: bind within the
-   rank's admitted mask (`sched_getaffinity` /
-   `ScopedOpenMPPartitionAffinity`), never widen it. On hosts without
-   `cpu_capacity`/`cpufreq` the order stays plain CPU-id order — x86 unchanged.
-2. **Proof.** Device-free ordering test with a fake sysfs root
-   (`capacityOrderedCpus` already takes one) + the .80 sched_getcpu-per-member
-   check in single-rank serve and with explicit `cpu:0`; registered in
-   `ProductionTestPreflight`. Rerun `V2_Integration_CPUStartupAffinity` and
-   `OpenMPIdleSpinPolicy` on .80; measure 35B MTP-off decode before/after (must
-   not regress — dynamic tiles already balance load; the gain is in serial and
-   static work).
-
-Implemented by arm-i8mm in commit 3 on top of `b2cf793bf`; Main reviews the
-diff by SHA.
+- One helper bindOpenMPWorkersFastestFirst + capacityOrderedCorePlaces(mask)
+  (one place per physical core, allowed siblings only); used by the cluster
+  path and every self-launched OMP_PLACES=cores/close rank.
+- Proof: V2_Integration_OpenMPCapacityOrderedCorePlaces (GB10 layout/SMT/
+  partial mask) registered in preflight; Test__MPIBootstrap
+  CorePlacesFollowCapacityWithinTheRankMask; Test__CPUStartupAffinity now
+  asserts every full/half/single close team on capacity-ordered places
+  (failed before: worker 0 on CPU 0; passes after; localhost:-1:cpu:0 /
+  cpu:0 / localhost:0:cpu:0 on .80).
+- Engine effect (C→B, 35B): no-MTP 23.42→23.55, MTP 33.94→34.01, prefill
+  noisy — no regression, ≤ +0.5% (dynamic tiles already balance load; gain
+  is in serial/static work, as Main predicted).
+- Status: pending Main's review/cherry-pick onto PR #43. Rebase conflict with
+  the upstream fused recorder was resolved inside the lane's tip
+  (recordNativeNEONFusedLaunches, 21-tag schema).
