@@ -12,6 +12,8 @@
  * IQ2_S synthetic tier metadata preserves original bases and coefficient bytes.
  * IQ4_XS uses physical24/source4 and raw encoded6 coefficient words; IQ4_NL
  * remains the independent physical4 control with no secondary plane.
+ * Fixture uploads complete on an explicit stream before publishing storage to
+ * independent non-blocking transfer lanes; pageable H2D staging is not completion.
  */
 
 #include "execution/moe/MoEOverlayMPIRemoteProjectionTransport.h"
@@ -371,18 +373,25 @@ namespace llaminar2
             }
 
             /**
-             * @brief Upload a complete host vector with a synchronous test copy.
+             * @brief Complete a fixture upload before independent streams use it.
              * @param source Host elements whose size must equal the allocation.
              * @return CUDA status; empty-to-empty uploads succeed without an API call.
+             * @throws std::runtime_error If the explicit copy stream cannot be created.
              */
-            [[nodiscard]] cudaError_t upload(const std::vector<T> &source) noexcept
+            [[nodiscard]] cudaError_t upload(const std::vector<T> &source)
             {
                 if (source.size() != elements_)
                     return cudaErrorInvalidValue;
                 if (elements_ == 0)
                     return cudaSuccess;
-                return cudaMemcpy(
-                    pointer_, source.data(), bytes(), cudaMemcpyHostToDevice);
+                TestCUDAStream copy_stream;
+                const auto status = cudaMemcpyAsync(
+                    pointer_, source.data(), bytes(), cudaMemcpyHostToDevice,
+                    copy_stream.native());
+                // Pageable H2D may return after staging, before DMA finishes.
+                // This cold fixture boundary must publish completed device bytes,
+                // not rely on legacy-stream ordering with non-blocking consumers.
+                return status == cudaSuccess ? copy_stream.synchronize() : status;
             }
 
             /**

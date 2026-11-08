@@ -10,6 +10,8 @@
  * separated destination array with the device-free reference. IQ4_XS uses
  * physical24 with original half bases and raw encoded6 secondary words; its
  * source identity remains4 and symmetric arithmetic is unchanged.
+ * Fixture uploads complete on an explicit stream before publishing storage to
+ * independent non-blocking transfer lanes; pageable H2D staging is not completion.
  */
 
 #include "execution/moe/MoEOverlayMPIRemoteProjectionTransport.h"
@@ -376,19 +378,25 @@ namespace llaminar2
             }
 
             /**
-             * @brief Upload a complete host vector before kernel execution.
+             * @brief Complete a fixture upload before independent streams use it.
              * @param source Host elements whose size must match the allocation.
              * @return HIP copy status, or invalid-value for a size mismatch.
+             * @throws std::runtime_error If the explicit copy stream cannot be created.
              */
             [[nodiscard]] hipError_t upload(
-                const std::vector<T> &source) noexcept
+                const std::vector<T> &source)
             {
                 if (source.size() != elements_)
                     return hipErrorInvalidValue;
                 if (elements_ == 0)
                     return hipSuccess;
-                return hipMemcpy(
-                    pointer_, source.data(), bytes(), hipMemcpyHostToDevice);
+                TestHIPStream copy_stream;
+                const auto status = hipMemcpyAsync(
+                    pointer_, source.data(), bytes(), hipMemcpyHostToDevice,
+                    copy_stream.native());
+                // Publish completed fixture bytes to non-blocking consumers;
+                // returning from pageable H2D staging is not a readiness edge.
+                return status == hipSuccess ? copy_stream.synchronize() : status;
             }
 
             /**
