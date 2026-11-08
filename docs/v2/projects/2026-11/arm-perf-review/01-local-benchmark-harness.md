@@ -49,6 +49,12 @@ and byte-identical output. The repo already has the model for this:
    admits its workspace); corrected sweep numbers follow as P3B. Keep the
    regression in mind: any future perf harness must go through the same
    workspace admission/contract as production invocation, not bypass it.
+6. **Tooling (idea 25 blocker, 2026-11-08):** the `uma3` SDK image has **no
+   nsys** (only `ncu`); add `nvidia-nsight-systems` to the dev image (or a
+   documented in-container host-attach profile path), and add **PerfStats
+   per-replay bucket counters** (only moe_placement/mtp/physical_memory
+   domains exist today). With nsys inside the image the bucket trace is a
+   ~15-min run.
 
 ## Exactness / risk
 

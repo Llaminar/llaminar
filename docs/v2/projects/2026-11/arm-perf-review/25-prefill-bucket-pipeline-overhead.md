@@ -42,6 +42,28 @@ captured bucket-pipeline overhead**, not kernel efficiency:
   Qwen3.8-Flash-Next-UD-Q4_K_XL, 2160-token prefill; ETA ~45–60 min. Results
   will be filed into this idea (and idea 24) on arrival.
 
+## Trace attempt result (2026-11-08 14:49) — blocked on tooling
+
+- **Blocker 1:** SDK image `llaminar-arm-engine-sdk-cu13:uma3` has **no nsys**
+  (only `ncu`; host `nsys 13.0.3` exists at /usr/local/bin/nsys but the
+  binary is container-linked).
+- **Blocker 2:** host-side run to use host nsys fails (missing
+  libmpi*/libopen-pal/libopen-rte/libhwloc/libevent, then OpenMPI self-launch
+  breaks under prte semantics outside the container; `--no-mpi-bootstrap`
+  hits missing /usr/share/openmpi runtime files). Not a code issue.
+- **Reproduced without profiler** (DEBUG run, same setup, 2160 tokens): prefill
+  **320.12 tok/s** (6747.48 ms), decode **22.73 tok/s**.
+- **Evidence-based split (still valid):** marginal prefill 3.01–3.22 ms/token
+  across 2160/7200-token runs, fixed intercept ≈ **280 ms** per request,
+  captured stage kernel time **0.60 ms/token** (≈1660 tok/s at stage speed)
+  → ~80% of prefill wall time is inter-bucket replay/launch/sync + fixed
+  setup, not kernels (GEMM 57% + GDN_PROJECTION 39% of stage work).
+- **Action needed (tooling):** add `nvidia-nsight-systems` to the uma3 dev
+  image, or a documented host-attach/profile path from inside the container.
+  With nsys in the image the trace is a ~15-min run (`nsys profile -t
+  cuda,nvtx --stats`); `spark-cuda-spil` will execute it then. `.79` returned
+  clean.
+
 ## Validation
 
 - Same model/prompt/length as idea 24; byte-identical output vs existing
