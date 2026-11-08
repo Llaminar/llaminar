@@ -296,3 +296,100 @@ TEST(CPUJointServingMetadata, PreparedComputeRejectsForeignDomainBeforeCollectiv
         EXPECT_TRUE(std::all_of(combined.data(),combined.data()+combined.numel(),[](float x){return x==-991.0f;}));
     }
 }
+
+namespace {
+/** @brief Replay authored partial records only; this never fabricates native/ticket readiness. */
+class RootTimingRecordReplay final : public test::ScriptedGlobalTPContext {
+public:
+    /** @brief Bind one original source ordinal for standalone host-record execution. */
+    explicit RootTimingRecordReplay(int member):member_(member){}
+    /** @return Original scripted source ordinal. */
+    int myIndex() const override{return member_;}
+    /** @return Declared original node-local scope, not a native communicator. */
+    TPScope scope() const override{return TPScope::NODE_LOCAL;}
+    /** @return Exact original NUMA endpoint metadata. */
+    GlobalDeviceAddress localDevice() const override{return GlobalDeviceAddress::cpu(member_);}
+    /** @brief Replay compact source0/source1 data without transport, or fail/throw as requested. */
+    bool gatherVariableFloatRecordsToRoot(const float*,size_t count,float* records,size_t capacity,
+        size_t width,int root,size_t& gathered,const std::string&,std::span<RootedFloatRecordRange> ranges) override {
+        ++calls;
+        if(throw_next){throw_next=false;throw std::runtime_error("authored gather exception");}
+        if(reject_next){reject_next=false;return false;}
+        if(capacity!=2 || width!=257 || root!=0)return false;
+        if(member_!=root){gathered=0;return ranges.empty();}
+        if(ranges.size()!=2 || count>1)return false;
+        gathered=2*count;
+        for(size_t source=0;source<2;++source){
+            ranges[source]={static_cast<int>(source),source*count,count};
+            if(count){
+                auto* record=records+source*width;
+                std::fill_n(record,256,float(source+1));
+                if(!canonical_moe_route_record::writeFlatRouteSlot(record,256,malformed?1u:0u))return false;
+            }
+        }
+        return true;
+    }
+    bool reject_next=false,throw_next=false,malformed=false;
+    int calls=0;
+private:
+    int member_;
+};
+}
+/** @test Optional observations track real root success, empty work, omission, failure and scope reset. */
+TEST(CPUJointServingMetadata, RootTimingLifecycle) {
+    auto context=IDeviceContext::create(DeviceId::cpu());
+    const auto placement=MoEExpertOwnerMap::buildShardPlacement(declaration(2),{source()});
+    for(auto phase:{ExpertHistogramSource::DecodeToken,ExpertHistogramSource::PrefillChunk,ExpertHistogramSource::GroupedVerifier})
+    for(int member:{0,1}){
+        RootTimingRecordReplay tp(member);
+        FP32Tensor packed({size_t((member==0?2:1)*257+1)}),indices({1,1}),weights({1,1}),combined({1,256});
+        std::array<RootedFloatRecordRange,2> ranges{};
+        std::array<int32_t,2> maps{};std::array<float,1> required{};
+        MoECPUExpertShardRouteStage::Params params{
+            .original_source=CPUExpertShardSourceSelection::fromOriginalPlacement(placement,7,member),
+            .tp=&tp,.packed_records=&packed,.route_indices=&indices,.route_weights=&weights,
+            .combined_routes=member==0?&combined:nullptr,
+            .source_ranges=member==0?std::span(ranges):std::span<RootedFloatRecordRange>{},
+            .participant_route_maps=maps,.required_route_weights=required,
+            .rows=1,.top_k=1,.columns=256,.root_participant=0,.stage_name="root_timing_record_replay",
+            .standalone_execution_phase=phase};
+        MoECPUExpertShardRouteStage stage(params);
+        const auto fill=[&](bool live){
+            indices.mutable_data()[0]=0;weights.mutable_data()[0]=live?.5f:0.0f;
+            std::fill_n(combined.mutable_data(),combined.numel(),-991.0f);
+            ASSERT_TRUE(canonical_moe_route_record::writeRecordCount(packed.mutable_data(),packed.numel(),live?1:0));
+        };
+        fill(true);
+        {auto omitted=stage.observeRootTiming(false);ASSERT_TRUE(stage.execute(context.get()));EXPECT_FALSE(omitted.completed());}
+        int gather_observations=0,combine_observations=0;
+        {
+            auto observation=stage.observeRootTiming(true);
+            EXPECT_FALSE(observation.completed());
+            if(member==0)EXPECT_THROW((void)stage.observeRootTiming(true),std::logic_error);
+            for(const bool live:{true,false,true}){
+                fill(live);ASSERT_TRUE(stage.execute(context.get()));
+                const auto sample=observation.completed();
+                if(member!=0){EXPECT_FALSE(sample);continue;}
+                ASSERT_TRUE(sample);EXPECT_EQ(sample->source,phase);
+                ASSERT_TRUE(sample->gather_ns);ASSERT_TRUE(sample->combine_ns);
+                // Standalone dense records have no original sparse publication edge.
+                EXPECT_FALSE(sample->preweight_publication_ns);
+                ++gather_observations;++combine_observations;
+                EXPECT_TRUE(std::all_of(combined.data(),combined.data()+combined.numel(),
+                    [live](float value){return value==(live?3.0f:-991.0f);}));
+            }
+            // A failed gather or exceptional call cannot expose the previous successful sample.
+            fill(true);tp.reject_next=true;EXPECT_FALSE(stage.execute(context.get()));EXPECT_FALSE(observation.completed());
+            fill(true);tp.throw_next=true;EXPECT_THROW(stage.execute(context.get()),std::runtime_error);EXPECT_FALSE(observation.completed());
+            if(member==0){fill(true);tp.malformed=true;EXPECT_FALSE(stage.execute(context.get()));EXPECT_FALSE(observation.completed());tp.malformed=false;}
+            fill(true);ASSERT_TRUE(stage.execute(context.get()));
+            EXPECT_EQ(observation.completed().has_value(),member==0);
+        }
+        EXPECT_EQ(gather_observations,member==0?3:0);EXPECT_EQ(combine_observations,gather_observations);
+        // Destroyed and disabled scopes neither preserve nor re-enable a previous result.
+        fill(false);ASSERT_TRUE(stage.execute(context.get()));
+        {auto fresh=stage.observeRootTiming(true);EXPECT_FALSE(fresh.completed());fill(false);ASSERT_TRUE(stage.execute(context.get()));
+         EXPECT_EQ(fresh.completed().has_value(),member==0);}
+        EXPECT_EQ(tp.calls,member==0?10:9);
+    }
+}

@@ -24,6 +24,53 @@ class MoEOverlayCanonicalRouteReturnTicketStorage;
 /** @brief Explicit collective edge between prepared shard compute and original route return. */
 class MoECPUExpertShardRouteStage final : public IComputeStage {
 public:
+    /** @brief Completed root-only host intervals; gather includes peer readiness/transport wait.
+     * @note Combine includes complete input validation and fixed participant-order FP32 addition.
+     * Preweight includes destination validation, weighting and metadata; the ticket path additionally
+     * includes its original release publication. Mapped joint-return signaling remains a later edge.
+     * Absent components were not executed; an observed zero is retained without a synthetic 1ns.
+     */
+    struct RootTimingSample {
+        ExpertHistogramSource source=ExpertHistogramSource::DecodeToken;
+        std::optional<std::uint64_t> gather_ns, combine_ns, preweight_publication_ns;
+    };
+    /** @brief Stack-owned, nonmoving observation borrowed only for one serialized stage scope.
+     * @note This carries no execution/publication authority. The worker owns it until its existing
+     * terminal join; callers copy only completed values into existing deferred telemetry storage.
+     * No ownership of a prepared bank, route, ticket or protocol completion is transferred.
+     */
+    class RootTimingObservation final {
+    public:
+        RootTimingObservation(const RootTimingObservation&)=delete;
+        RootTimingObservation& operator=(const RootTimingObservation&)=delete;
+        /** @brief Revoke the stage borrow before this stack storage expires. */
+        ~RootTimingObservation();
+        /** @return Last completely successful root call in this scope, absent before/following failure. */
+        std::optional<RootTimingSample> completed() const noexcept {
+            return completed_?std::optional{sample_}:std::nullopt;
+        }
+    private:
+        friend class MoECPUExpertShardRouteStage;
+        /** @brief Borrow only the original root; disabled/contributor observations stay absent.
+         * @param stage Serialized stage, which must outlive this nonmoving scope.
+         * @param enabled Existing enclosing transaction telemetry decision.
+         * @throws std::logic_error For an already borrowed root observation.
+         */
+        RootTimingObservation(MoECPUExpertShardRouteStage& stage,bool enabled);
+        /** @brief Clear each execution entry/failure, including previous successful observations. */
+        void reset() noexcept {sample_={};completed_=false;}
+        MoECPUExpertShardRouteStage* stage_=nullptr;
+        RootTimingSample sample_{};
+        bool completed_=false;
+    };
+    /** @brief Observe a serialized original root execution without tags, collector calls or allocation.
+     * @param enabled Existing transaction telemetry admission, decided outside the stage.
+     * @return Nonmoving stack scope; contributors yield no root-compute observation.
+     * @throws std::logic_error For overlapping enabled observations of the same root stage.
+     */
+    [[nodiscard]] RootTimingObservation observeRootTiming(bool enabled) {
+        return RootTimingObservation(*this,enabled);
+    }
     /** @brief Immutable bindings; all mutable spans borrow existing graph/PMA arena roots. */
     struct Params {
         std::shared_ptr<const CPUExpertShardSourceSelection> original_source;
@@ -131,5 +178,6 @@ private:
     /** @return Original immutable tensor/geometry diagnostics, without probing runtime state. */
     StageDumpInfo buildDumpInfoImpl() const override;
     Params params_;
+    RootTimingObservation* timing_observation_=nullptr; ///< Borrowed only by the current serialized observation scope.
 };
 } // namespace llaminar2

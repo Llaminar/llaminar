@@ -19,6 +19,8 @@
  */
 
 #include "DeviceGraphExecutor.h"
+#include "../../compute_stages/stages/MoECPUExpertShardRouteStage.h"
+#include <array>
 #include "backends/NativeOrderingEventGroup.h"
 #include "../../../backends/ReadAheadNativeResourceFamily.h"
 #include "../../../backends/NativeContextPreparation.h"
@@ -439,6 +441,9 @@ namespace llaminar2
             std::span<const size_t> segments;
             bool collect_timing = false;
             std::uint64_t service_elapsed_ns = 0u;
+            // Worker writes stack scalars; original await retires it before caller publication.
+            std::array<std::array<std::uint64_t,3>,kExpertHistogramProductionSourceCount> root_ns{};
+            std::array<std::array<std::uint64_t,3>,kExpertHistogramProductionSourceCount> root_calls{};
         } invocation{
             .executor = this,
             .graph = &graph,
@@ -470,8 +475,26 @@ namespace llaminar2
                             job.segments,
                             [&](ComputeNode &node)
                             {
-                                return job.executor->executeNode(
-                                    node, job.context);
+                                auto* root=job.collect_timing
+                                    ?dynamic_cast<MoECPUExpertShardRouteStage*>(node.stage.get()):nullptr;
+                                if(!root)return job.executor->executeNode(node,job.context);
+                                auto observation=root->observeRootTiming(true);
+                                const bool ok=job.executor->executeNode(node,job.context);
+                                if(const auto sample=observation.completed();ok && sample) {
+                                    const auto phase=expertHistogramProductionSourceIndex(sample->source);
+                                    if(phase==kExpertHistogramProductionSourceCount)
+                                        throw std::logic_error("CPU root timing has no production phase");
+                                    const std::array components{sample->gather_ns,sample->combine_ns,sample->preweight_publication_ns};
+                                    for(size_t component=0;component<components.size();++component)if(components[component]) {
+                                        auto& ns=job.root_ns[phase][component];
+                                        auto& calls=job.root_calls[phase][component];
+                                        if(*components[component]>std::numeric_limits<std::uint64_t>::max()-ns ||
+                                           calls==std::numeric_limits<std::uint64_t>::max())
+                                            throw std::overflow_error("CPU root deferred timing overflows");
+                                        ns+=*components[component];++calls;
+                                    }
+                                }
+                                return ok;
                             });
                     if (job.collect_timing)
                     {
@@ -567,6 +590,26 @@ namespace llaminar2
             record(
                 "concurrent_ticket_service",
                 std::max<std::uint64_t>(1u, invocation.service_elapsed_ns));
+            // No stage mutates the collector. Failed atomic transactions expose no successful-prefix child totals.
+            if(launch_ok && service_ok) {
+                auto root_tags=tags;
+                root_tags["timing_semantics"]="root_only_component_totals_nested_in_ticket_service";
+                root_tags["gather_semantics"]="rooted_gather_includes_peer_wait";
+                constexpr std::array phases{"decode","prefill","grouped_verifier"};
+                static_assert(phases.size()==kExpertHistogramProductionSourceCount);
+                static_assert(expertHistogramProductionSourceIndex(ExpertHistogramSource::DecodeToken)==0u);
+                static_assert(expertHistogramProductionSourceIndex(ExpertHistogramSource::PrefillChunk)==1u);
+                static_assert(expertHistogramProductionSourceIndex(ExpertHistogramSource::GroupedVerifier)==2u);
+                constexpr std::array names{"cpu_root_gather","cpu_root_validated_fixed_order_combine","cpu_root_preweight_publication"};
+                constexpr std::array counters{"cpu_root_gather_calls","cpu_root_validated_fixed_order_combine_calls","cpu_root_preweight_publication_calls"};
+                for(size_t phase=0;phase<phases.size();++phase)for(size_t component=0;component<names.size();++component) {
+                    if(!invocation.root_calls[phase][component])continue;
+                    PerfStatsCollector::recordTimingNs("retained_parent_transaction",names[component],
+                        invocation.root_ns[phase][component],phases[phase],ctx->deviceId().toString(),root_tags);
+                    PerfStatsCollector::addCounter("retained_parent_transaction",counters[component],
+                        static_cast<double>(invocation.root_calls[phase][component]),phases[phase],ctx->deviceId().toString(),root_tags);
+                }
+            }
         }
 
         if (!launch_ok || !service_ok)

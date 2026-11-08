@@ -20,6 +20,11 @@ regression. Driver free VRAM stays near 1.6 GiB/card through measured inference.
 The earlier CPU checkpoint retains its 36 focused passes and qualified pair,
 counter, affinity and aligned-fixture fixes. The experimental wide-row kernel
 was rejected after measurement; no blanket WideRows policy is promoted.
+Latest observation run is **184.310 P /30.839 D**, with identical token/MTP work.
+Phase labeling is fixed; 12 focused development tests and four checkpoint tests
+pass. Root combine/weighting is small; **GPU-ticket waits and rooted gather**
+are the next profiling targets.
+[Measured scopes and current candidate decisions](../2026-11/QFN_HYBRID_ROOT_TIMING_20261108.md).
 [Admission correction, matched control and qualification limits](../2026-11/QFN_SELECTED_ATTENTION_WORKSPACE_ADMISSION_20261108.md).
 [Assembly, measurements, configuration and qualification limits](../2026-11/QFN_CPU_NATIVEVNNI_SPILL_AUDIT_20261108.md).
 

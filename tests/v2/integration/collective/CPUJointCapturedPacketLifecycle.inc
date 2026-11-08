@@ -1425,6 +1425,8 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
             size_t(live * top_k));
         const double gathered_bytes_before = evidence.value("cpu_packed_route_gather_local_bytes", recorded.histogram_source);
         const double gathered_calls_before = evidence.value("cpu_packed_route_gather_calls", recorded.histogram_source);
+        auto root_timing=reduce->observeRootTiming(true);
+        EXPECT_FALSE(root_timing.completed());
         if (rank == 0)
             requireOriginal(reduce->execute(local_context.get()),
                             "actual source-local rooted reduction/publication");
@@ -1438,6 +1440,14 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
             requireOriginal(
                 protocol.complete(MoEOverlayActivationEndpoint::Follower, identity, &error),
                 error.c_str());
+        }
+        const auto root_sample=root_timing.completed();
+        EXPECT_EQ(root_sample.has_value(),is_root);
+        if(root_sample){
+            EXPECT_EQ(root_sample->source,recorded.histogram_source);
+            EXPECT_TRUE(root_sample->gather_ns);EXPECT_TRUE(root_sample->combine_ns);
+            // Even an empty live prefix executes the original ticket metadata/release edge.
+            EXPECT_TRUE(root_sample->preweight_publication_ns);
         }
         const size_t gathered_prefix = size_t(live * top_k) * (is_root ? members.size() : 1);
         EXPECT_TRUE(std::all_of(packed.data() + gathered_prefix * (hidden + 1),

@@ -136,7 +136,16 @@ TEST_F(Test__GlobalTPContext_MPI, CPUShardStageUsesOriginalCohortAndUnweightedRo
             ASSERT_TRUE(canonical_moe_route_record::writeFlatRouteSlot(record,H,slot));
         }
         ASSERT_TRUE(canonical_moe_route_record::writeRecordCount(records.mutable_data(),records.numel(),count));
+        auto root_timing=stage.observeRootTiming(true);
+        EXPECT_FALSE(root_timing.completed());
         ASSERT_TRUE(stage.execute(context.get()));
+        const auto sample=root_timing.completed();
+        EXPECT_EQ(sample.has_value(),world_rank_==1);
+        if(sample){
+            EXPECT_EQ(sample->source,ExpertHistogramSource::DecodeToken);
+            EXPECT_TRUE(sample->gather_ns);EXPECT_TRUE(sample->combine_ns);
+            EXPECT_FALSE(sample->preweight_publication_ns);
+        }
         EXPECT_EQ(observedBytes()-bytesBefore,double(count*(H+1)*sizeof(float)));
         if(liveRows==0)EXPECT_EQ(count,0u);else EXPECT_GT(count,0u);
         const size_t payloadRecords=world_rank_==1?2*count:count;

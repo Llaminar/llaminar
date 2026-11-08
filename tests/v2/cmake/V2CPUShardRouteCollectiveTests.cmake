@@ -69,7 +69,7 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUShardOriginalCo
 
 # Metadata checks call the same source/owner-map and immutable return-role projections as serving.
 target_sources(v2_test_cpu_shard_route_collective PRIVATE unit/execution/moe/Test__CPUJointServingMetadata.cpp)
-foreach(cpu_joint_metadata_case IN ITEMS ExplicitTensorTP1UsesOriginalWholeMatrixWithoutJointAuthority OriginalPopulationAndReturnRolesThroughEight ActualStageSharesRootExtentAcrossAsymmetricParticipantBanks ActualStageRejectsSparsePhaseWithoutOriginalPreparedBank)
+foreach(cpu_joint_metadata_case IN ITEMS ExplicitTensorTP1UsesOriginalWholeMatrixWithoutJointAuthority OriginalPopulationAndReturnRolesThroughEight ActualStageSharesRootExtentAcrossAsymmetricParticipantBanks ActualStageRejectsSparsePhaseWithoutOriginalPreparedBank RootTimingLifecycle)
     set(cpu_joint_metadata_name "V2_Integration_CPUJointServingMetadata_${cpu_joint_metadata_case}")
     add_v2_test(${cpu_joint_metadata_name}
         COMMAND $<TARGET_FILE:v2_test_cpu_shard_route_collective> "--gtest_filter=CPUJointServingMetadata.${cpu_joint_metadata_case}" --gtest_repeat=20

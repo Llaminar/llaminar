@@ -4834,6 +4834,7 @@ namespace llaminar2
             std::uint64_t local_execute_ns = 0u;
             std::uint64_t endpoint_post_service_ns = 0u; ///< Nested in local_execute_ns.
             std::uint64_t joint_publication_ns = 0u;
+            std::optional<MoECPUExpertShardRouteStage::RootTimingSample> joint_root; ///< Absent for contributor/failed/unobserved calls.
             std::uint64_t return_publication_ns = 0u;
         };
         struct ArmedLane
@@ -5800,12 +5801,14 @@ namespace llaminar2
                 std::optional<CPUExpertShardRouteCompletion> joint_completed;
                 if(expert_compute_ok && layer.joint_route_collective) {
                     const auto joint_begin = collect_timeline ? Clock::now() : Clock::time_point{};
+                    auto root_observation=layer.joint_route_collective->observeRootTiming(collect_timeline);
                     joint_completed=layer.joint_route_collective->executeOriginalJointPublication(
                         context_it->second,protocol,lane->identity,layer.stage_ordinal);
                     if (collect_timeline)
                         layer_timing.joint_publication_ns = static_cast<std::uint64_t>(
                             std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 Clock::now() - joint_begin).count());
+                    layer_timing.joint_root=root_observation.completed();
                     expert_compute_ok=joint_completed.has_value();
                 }
                 const bool joint_contributor =
@@ -6950,6 +6953,17 @@ namespace llaminar2
                     if (ns > 0u)
                         PerfStatsCollector::recordTimingNs("moe_overlay_participant_graph", name,
                             ns, transaction_phase, "CPU", child_tags);
+                if(sample.joint_root) {
+                    child_tags["timing_semantics"]="root_only_components_nested_in_joint_publication";
+                    child_tags["gather_semantics"]="rooted_gather_includes_peer_wait";
+                    for(const auto& [name,ns]:std::array{
+                        std::pair{"mapped_cpu_layer_root_gather",sample.joint_root->gather_ns},
+                        std::pair{"mapped_cpu_layer_root_validated_fixed_order_combine",sample.joint_root->combine_ns},
+                        std::pair{"mapped_cpu_layer_root_preweight_publication",sample.joint_root->preweight_publication_ns}})
+                        if(ns)PerfStatsCollector::recordTimingNs("moe_overlay_participant_graph",name,*ns,
+                            transaction_phase,"CPU",child_tags);
+                    child_tags.erase("gather_semantics");
+                }
                 child_tags["timing_semantics"] = "deferred_postservice_nested_in_local_execute";
                 // Zero means this optional child observation was absent (for
                 // example an empty endpoint's early return), never a 1ns sample.

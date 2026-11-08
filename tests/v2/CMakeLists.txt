@@ -36342,6 +36342,17 @@ if(NOT V2_PERF_TESTS_ONLY)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QFNSelectedAttentionWorkspaceAdmission)
 endif()
 
+# Real captured-ticket waits retain immutable graph phase independently of row capacity.
+if(NOT V2_PERF_TESTS_ONLY)
+    add_v2_test(V2_Integration_MoEOverlayPublicationWaitPhase
+        COMMAND $<TARGET_FILE:v2_test_moe_expert_dispatch_stage>
+            --gtest_filter=Test__MoEExpertDispatchStage.CapturedTicketPublishesWholeBatchesInEveryProductionPhase:Test__MoEExpertDispatchStage.CapturedTicketPublicationWaitWithoutPhaseIsUnknown
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;MTP;PerfStats;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOverlayPublicationWaitPhase)
+endif()
+
 # These CPU aliases are declared above the main preflight inventory. Append
 # them here after its set() so that the explicit suite retains every regression.
 if(NOT V2_PERF_TESTS_ONLY)

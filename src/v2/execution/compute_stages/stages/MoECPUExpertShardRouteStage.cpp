@@ -13,9 +13,31 @@
 #include "../../../utils/Logger.h"
 #include "../../../collective/GlobalTPContext.h"
 #include <limits>
+#include <chrono>
 #include <array>
 #include <stdexcept>
 namespace llaminar2 {
+namespace {
+/**
+ * @brief Measure the completed host interval without manufacturing a nonzero sample.
+ * @param begin Start of the original operation in the steady-clock domain.
+ * @return Elapsed nanoseconds, retaining an actual zero-length observation.
+ */
+std::uint64_t rootTimingElapsed(std::chrono::steady_clock::time_point begin) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now()-begin).count());
+}
+}
+MoECPUExpertShardRouteStage::RootTimingObservation::RootTimingObservation(
+    MoECPUExpertShardRouteStage& stage,bool enabled) {
+    if(!enabled || stage.params_.tp->myIndex()!=stage.params_.root_participant)return;
+    if(stage.timing_observation_)throw std::logic_error("CPU root timing scope already borrowed");
+    stage_=&stage;stage.timing_observation_=this;
+}
+MoECPUExpertShardRouteStage::RootTimingObservation::~RootTimingObservation() {
+    if(stage_)stage_->timing_observation_=nullptr;
+}
+
 MoECPUExpertShardRouteStage::MoECPUExpertShardRouteStage(Params params)
     : IComputeStage(DeviceId::cpu()),params_(std::move(params)) {
     const auto &p=params_;
@@ -118,7 +140,12 @@ MoECPUExpertShardRouteStage::MoECPUExpertShardRouteStage(Params params)
     }
 }
 bool MoECPUExpertShardRouteStage::execute(IDeviceContext* ctx)
-{return executeWithBank(ctx,nullptr);}
+{
+    if(timing_observation_)timing_observation_->reset();
+    const bool ok=executeWithBank(ctx,nullptr);
+    if(ok && timing_observation_)timing_observation_->completed_=true;
+    return ok;
+}
 bool MoECPUExpertShardRouteStage::executeWithBank(IDeviceContext *ctx,MoEOverlayParticipantBankLease* completed_bank) {
     auto &p=params_;
     std::optional<MoEOverlayCanonicalRouteReturnTicketStorage::Publication> publication;
@@ -195,6 +222,8 @@ bool MoECPUExpertShardRouteStage::executeWithBank(IDeviceContext *ctx,MoEOverlay
     if(sparse && (sparse->live_entry_count>slots || sparse->live_entry_count>sparse->entry_capacity))return reject("sparse_count_exceeds_admission");
     if(sparse && local!=sparse->live_entry_count)return reject("packed_sparse_count_mismatch");
     if(sparse && sparse->target_participant!=p.original_source->participant().participant_id)return reject("sparse_participant_mismatch");
+    const auto gather_begin=timing_observation_?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+    if(timing_observation_)timing_observation_->sample_.source=source_phase;
     if(!p.tp->gatherVariableFloatRecordsToRoot(records,local,records,
         // Every member selects the same original rooted protocol from this
         // declared receive extent. Contributor storage is intentionally smaller;
@@ -202,6 +231,7 @@ bool MoECPUExpertShardRouteStage::executeWithBank(IDeviceContext *ctx,MoEOverlay
         slots*p.original_source->cohort()->participants().size(),
         canonical_moe_route_record::recordWidth(p.columns),p.root_participant,gathered,
         p.stage_name,p.source_ranges)) return reject("original_rooted_gather");
+    if(timing_observation_)timing_observation_->sample_.gather_ns=rootTimingElapsed(gather_begin);
     const auto publish=[&]() {
         if(!PerfStatsCollector::isDomainEnabled("moe_canonical_publication")) return;
         const PerfStatsCollector::Tags tags{{"stage",p.stage_name},{"root",std::to_string(p.root_participant)},
@@ -228,6 +258,7 @@ bool MoECPUExpertShardRouteStage::executeWithBank(IDeviceContext *ctx,MoEOverlay
         {sparse->original_route_slots_host,sparse->live_entry_count},
         {sparse->expert_ids_host,sparse->live_entry_count},
         {sparse->route_weights_host,sparse->live_entry_count}};
+    const auto combine_begin=timing_observation_?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     if(!cpu::moe::combineCanonicalShardRouteRecords({
         {records,gathered*canonical_moe_route_record::recordWidth(p.columns)},p.source_ranges,
         {p.route_indices?p.route_indices->data():nullptr,p.route_indices?slots:0},
@@ -236,13 +267,16 @@ bool MoECPUExpertShardRouteStage::executeWithBank(IDeviceContext *ctx,MoEOverlay
         p.participant_route_maps,p.required_route_weights,
         {p.combined_routes->mutable_data(),slots*static_cast<size_t>(p.columns)},
         p.original_source->ownership().geometry().experts,p.rows,p.top_k,p.columns,sparse_view})) return reject("canonical_fixed_order_combine");
+    if(timing_observation_)timing_observation_->sample_.combine_ns=rootTimingElapsed(combine_begin);
     if(publication) {
+        const auto publication_begin=timing_observation_?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
         if(!publishMoEOverlayCanonicalRouteRows(*p.original_canonical_ticket,*publication,*sparse,
             {p.combined_routes->data(),p.combined_routes->numel()},MoEOverlayCanonicalRouteSourceLayout::originalSlots()))return reject("canonical_live_ticket_publication");
         // The mapped ticket owns these values. This protocol return carries
         // only completion metadata, never a duplicate weighted route payload.
         p.original_return_rows->live_row_count=0u;
         p.original_return_rows->layout=MoEOverlayReturnLayout::CanonicalExpertRoutes;
+        if(timing_observation_)timing_observation_->sample_.preweight_publication_ns=rootTimingElapsed(publication_begin);
     }
     publish();
     return finish();
@@ -258,6 +292,7 @@ bool MoECPUExpertShardRouteStage::hasOriginalCanonicalTicket() const noexcept {
         params_.original_continuation_device.is_gpu() && ticket->continuationDevice()==params_.original_continuation_device;
 }
 bool MoECPUExpertShardRouteStage::publishConcurrentManualFailure() noexcept {
+    if(timing_observation_)timing_observation_->reset();
     LOG_ERROR("[MoECPUExpertShardRouteStage] Concurrent manual failure publication requested: stage="
         << params_.stage_name << " layer=" << params_.original_source->layer()
         << " participant=" << params_.original_source->participant().participant_id);
@@ -273,6 +308,7 @@ bool MoECPUExpertShardRouteStage::publishConcurrentManualFailure() noexcept {
 std::optional<CPUExpertShardRouteCompletion> MoECPUExpertShardRouteStage::executeOriginalJointPublication(
     IDeviceContext *ctx,MoEOverlayActivationEpochProtocol &protocol,
     const MoEOverlayActivationEpochIdentity &identity,std::uint32_t stage) {
+    if(timing_observation_)timing_observation_->reset();
     const auto &source=*params_.original_source;
     const auto expected = source.participantIndex() == static_cast<size_t>(params_.root_participant)
                               ? MoEOverlayActivationReturnRole::JointRoot
@@ -337,6 +373,7 @@ std::optional<CPUExpertShardRouteCompletion> MoECPUExpertShardRouteStage::execut
         // top-k accumulation, after the fixed participant-order addition here.
         if (expected == MoEOverlayActivationReturnRole::JointRoot)
         {
+            const auto publication_begin=timing_observation_?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
             const auto width=static_cast<size_t>(params_.columns);
             for(size_t entry=0;entry<input.live_entry_count;++entry) {
                 const auto slot=static_cast<size_t>(input.original_route_slots_host[entry]);
@@ -353,10 +390,12 @@ std::optional<CPUExpertShardRouteCompletion> MoECPUExpertShardRouteStage::execut
             }
             for(size_t row=0;row<input.live_row_count;++row)output.row_ids_host[row]=input.row_ids_host[row];
             output.live_row_count=input.live_row_count;
+            if(timing_observation_)timing_observation_->sample_.preweight_publication_ns=rootTimingElapsed(publication_begin);
         }
         else
             output.live_row_count = 0;
     }
+    if(timing_observation_)timing_observation_->completed_=true;
     return CPUExpertShardRouteCompletion(protocol.control_,identity,stage,params_.original_source,
         params_.original_tp_owner,params_.root_participant,params_.original_prepared_layer,std::move(completed_bank));
 }

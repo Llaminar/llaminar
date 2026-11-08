@@ -8,7 +8,8 @@
  * sparse per-tier work descriptors.  When dynamic residency is enabled, the
  * same already-host-visible route IDs are merged into the phase-specific
  * histogram; no additional D2H copy, stream wait, or hot-path allocation is
- * introduced for that evidence.
+ * introduced for that evidence. Publication-wait timing projects only the
+ * immutable routing phase; absent phase metadata is explicitly unknown.
  */
 
 #include "MoEExpertDispatchStage.h"
@@ -370,10 +371,32 @@ namespace
 
         if (params_.ticket_storage)
         {
+            // Row capacity is not inference purpose: an M1 predictor and an
+            // M>1 verifier both retain the graph's GroupedVerifier identity.
+            // This immutable declaration requires no ticket/device probe and
+            // remains valid for peers that do not publish shared histograms.
+            const char *publication_phase = "unknown";
+            if (params_.routing_evidence_publication)
+            {
+                switch (params_.routing_evidence_publication->source)
+                {
+                case ExpertHistogramSource::DecodeToken:
+                    publication_phase = "decode";
+                    break;
+                case ExpertHistogramSource::PrefillChunk:
+                    publication_phase = "prefill";
+                    break;
+                case ExpertHistogramSource::GroupedVerifier:
+                    publication_phase = "grouped_verifier";
+                    break;
+                case ExpertHistogramSource::SyntheticTest:
+                    break; // Constructor rejects non-production declarations.
+                }
+            }
             PerfStatsCollector::ScopedTimer publication_wait(
                 "moe_overlay_endpoint",
                 "captured_ticket_publication_wait",
-                params_.seq_len == 1 ? "decode" : "prefill",
+                publication_phase,
                 params_.ticket_storage->sourceDevice().toString(),
                 {{"consumer", "expert_dispatch"},
                  {"layer",

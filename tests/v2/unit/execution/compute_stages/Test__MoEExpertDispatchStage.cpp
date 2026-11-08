@@ -5,7 +5,9 @@
  * The suite proves route validation, immutable residency leases, sparse tier
  * descriptors, and exact phase-specific histogram publication at the explicit
  * heterogeneous boundary.  Ticket tests retain padded poison rows so any
- * accidental use of physical rather than logical geometry fails loudly.
+ * accidental use of physical rather than logical geometry fails loudly. The
+ * actual publication-wait timer retains declared phases, including M1 verifier
+ * work, and reports absent metadata without manufacturing a row-based phase.
  */
 
 #include "execution/compute_stages/ComputeStageFactory.h"
@@ -14,10 +16,13 @@
 #include "../../../utils/ObservedExpertDemandFixture.h"
 #include "mocks/MockComputeStage.h"
 #include "utils/TestTensorFactory.h"
+#include "utils/DebugEnv.h"
+#include "utils/PerfStatsCollector.h"
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <future>
 #include <memory>
 #include <optional>
@@ -74,6 +79,47 @@ namespace
                 Owner::None,
                 /*final_ordered_return=*/true),
             Terminal::Retain);
+    }
+
+    /** @brief Isolate the real collector's timer policy and epoch for one fixture. */
+    class ScopedPublicationWaitTiming final
+    {
+    public:
+        /** @brief Enable collection independently of inherited test export filters. */
+        ScopedPublicationWaitTiming() : previous_(debugEnv().profile.enabled)
+        {
+            mutableDebugEnv().profile.enabled = true;
+            PerfStatsCollector::reset();
+        }
+        /** @brief Restore the original collection policy, including assertion exits. */
+        ~ScopedPublicationWaitTiming()
+        {
+            mutableDebugEnv().profile.enabled = previous_;
+            PerfStatsCollector::reset();
+        }
+        ScopedPublicationWaitTiming(const ScopedPublicationWaitTiming &) = delete;
+        ScopedPublicationWaitTiming &operator=(const ScopedPublicationWaitTiming &) = delete;
+    private:
+        bool previous_;
+    };
+
+    /** @brief Assert the emitted real wait timer and its unchanged bounded identity. */
+    void expectPublicationWaitPhase(const char *expected)
+    {
+        auto records = PerfStatsCollector::snapshot({"moe_overlay_endpoint"});
+        std::erase_if(records, [](const auto &record) {
+            return record.name != "captured_ticket_publication_wait";
+        });
+        ASSERT_EQ(records.size(), 1u);
+        const auto &record = records.front();
+        EXPECT_EQ(record.kind, PerfStatRecord::Kind::Timer);
+        EXPECT_EQ(record.phase, expected);
+        EXPECT_EQ(record.count, 1u);
+        EXPECT_EQ(record.device, DeviceId::cpu().toString());
+        EXPECT_EQ(record.tags.at("consumer"), "expert_dispatch");
+        EXPECT_EQ(record.tags.at("layer"), "4");
+        EXPECT_EQ(record.tags.at("ordering"), "mapped_system_release_acquire");
+        EXPECT_EQ(record.tags.at("stream_synchronize"), "false");
     }
 
     RoutedExpertTier tier(const std::string &name, const std::string &domain, bool fallback = false)
@@ -662,13 +708,26 @@ TEST_F(
     Test__MoEExpertDispatchStage,
     CapturedTicketPublishesWholeBatchesInEveryProductionPhase)
 {
-    for (const auto phase : {ExpertHistogramSource::DecodeToken,
-                            ExpertHistogramSource::PrefillChunk,
-                            ExpertHistogramSource::GroupedVerifier})
+    const ScopedPublicationWaitTiming timing;
+    struct Case
     {
+        ExpertHistogramSource source;
+        int logical_rows;
+        int bucket_rows;
+        const char *timer_phase;
+    };
+    for (const auto &item : std::array{
+             Case{ExpertHistogramSource::DecodeToken, 1, 4, "decode"},
+             Case{ExpertHistogramSource::PrefillChunk, 2, 4, "prefill"},
+             Case{ExpertHistogramSource::GroupedVerifier, 2, 4, "grouped_verifier"},
+             Case{ExpertHistogramSource::GroupedVerifier, 1, 1, "grouped_verifier"}})
+    {
+        const auto phase = item.source;
         SCOPED_TRACE(static_cast<int>(phase));
-        constexpr int bucket_rows = 4;
-        const int logical_rows = phase == ExpertHistogramSource::DecodeToken ? 1 : 2;
+        SCOPED_TRACE(item.logical_rows);
+        PerfStatsCollector::reset();
+        const int bucket_rows = item.bucket_rows;
+        const int logical_rows = item.logical_rows;
         constexpr int top_k = 2;
         auto ticket_storage =
             std::make_shared<MoEOverlayDispatchTicketStorage>();
@@ -694,10 +753,10 @@ TEST_F(
             123.0f, 123.0f,
             123.0f, 123.0f,
         };
-        std::copy(
-            indices.begin(), indices.end(), ticket.routing_indices_fp32);
-        std::copy(
-            weights.begin(), weights.end(), ticket.routing_weights_fp32);
+        std::copy_n(indices.begin(), static_cast<size_t>(bucket_rows) * top_k,
+            ticket.routing_indices_fp32);
+        std::copy_n(weights.begin(), static_cast<size_t>(bucket_rows) * top_k,
+            ticket.routing_weights_fp32);
 
         DecodeExpertHistogramConfig histogram_config;
         histogram_config.num_layers = 5;
@@ -710,7 +769,7 @@ TEST_F(
             /*participant_count=*/1,
             {0, 0, 0, 0});
         llaminar2::test::admitObservedExpertDemand(histogram_config,
-            {.target_rows = 8, .max_transaction_rows = bucket_rows, .top_k = top_k}, 1);
+            {.target_rows = 8, .max_transaction_rows = static_cast<uint32_t>(bucket_rows), .top_k = top_k}, 1);
         DecodeExpertHistogram histogram(std::move(histogram_config));
 
         MoEExpertDispatchOutput output;
@@ -732,6 +791,7 @@ TEST_F(
 
         MoEExpertDispatchStage stage(std::move(params));
         ASSERT_TRUE(stage.execute(ctx_.get()));
+        expectPublicationWaitPhase(item.timer_phase);
 
         EXPECT_EQ(output.residency_epoch, 1u);
         EXPECT_EQ(ticket.header->residency_epoch, 1u);
@@ -758,6 +818,34 @@ TEST_F(
         EXPECT_EQ(demand.routes(4, 0).logical_rows, logical_rows);
         EXPECT_EQ(demand.routes(4, 0).expert_ids[0], 3);
         EXPECT_EQ(demand.routes(4, 0).expert_ids[logical_rows * top_k - 1], logical_rows == 1 ? 1 : 2);
+    }
+}
+
+/** @test Missing phase evidence cannot be guessed from a one-row or padded ticket. */
+TEST_F(Test__MoEExpertDispatchStage, CapturedTicketPublicationWaitWithoutPhaseIsUnknown)
+{
+    const ScopedPublicationWaitTiming timing;
+    for (const int bucket_rows : {1, 4})
+    {
+        SCOPED_TRACE(bucket_rows);
+        PerfStatsCollector::reset();
+        auto storage = std::make_shared<MoEOverlayDispatchTicketStorage>();
+        storage->bindFixedCapacity(4, bucket_rows, 2, 8, DeviceId::cpu(), 17);
+        auto &ticket = storage->ticket();
+        ticket.header->logical_row_count = 1;
+        ticket.routing_indices_fp32[0] = 0.0f;
+        ticket.routing_indices_fp32[1] = 1.0f;
+        ticket.routing_weights_fp32[0] = 0.75f;
+        ticket.routing_weights_fp32[1] = 0.25f;
+        MoEExpertDispatchOutput output;
+        auto params = paramsFor(nullptr, nullptr, bucket_rows, 2,
+            placement({0, 1, 0, 1}),
+            {tier("gpu", "gpu_domain"), tier("cpu", "cpu_domain")}, &output);
+        params.ticket_storage = storage;
+        ASSERT_FALSE(params.routing_evidence_publication.has_value());
+        MoEExpertDispatchStage stage(std::move(params));
+        ASSERT_TRUE(stage.execute(ctx_.get()));
+        expectPublicationWaitPhase("unknown");
     }
 }
 
