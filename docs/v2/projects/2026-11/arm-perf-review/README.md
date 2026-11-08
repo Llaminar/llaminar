@@ -81,3 +81,11 @@ stage attribution, spin sweep, thread scaling, overlay statistics).
 - **Later this cycle:** one natural checkpoint for these ideas is after the
   complete engine Unit/preflight gate on ARM; kernel-only wins then need
   full-inference confirmation.
+
+## Remote/home note
+
+The tracker and all lane branches are now mirrored on **Llaminar/llaminar**
+(upstream): `codex/arm-perf-review`, `codex/i8mm-typed-placement`, plus the
+frozen `codex/qfn-ngram-continuation-arm64`. The personal fork that hosted
+them is being deleted by the operator — use upstream only; SHAs remain the
+source of truth.
