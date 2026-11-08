@@ -76,3 +76,15 @@ SDOT path on GB10.
 
 Base: `b2cf793bf` (upstream PR #43); rebase if the base moves (SHA-only, no
 pin branches). Lane: `arm-i8mm` (01a1bbe6, codex/i8mm-typed-placement).
+
+## Envelope resolved (2026-11-08, g++-14 probe on .80)
+
+- Spelling: **`-march=armv8.6-a+dotprod+i8mm`** (minimal honest target;
+  compiles `vusmmlaq_s32`/`vmmlaq_s32` cleanly).
+- Negative control: `armv8.2-a+dotprod+i8mm` declares the intrinsic but fails
+  with `target specific option mismatch` — use it in envelope/checker tests.
+- Feature macro: **`__ARM_FEATURE_MATMUL_INT8`** (GCC does not define
+  `__ARM_FEATURE_I8MM` on this toolchain) plus `__ARM_FEATURE_DOTPROD`.
+- Ownership: CPUCodegenEnvelope.py NEON_I8MM + CPUInstructionSet.cmake =
+  the i8mm lane; arm-sparks validates at the gate (envelope + BuildSystem
+  gates + Unit/byte tests) when handed a SHA.
