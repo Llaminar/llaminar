@@ -356,3 +356,9 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
 - Nonblocking: lo12 ADD on stack base fails too (memory + arithmetic claim).
 - Evidence: 57 tests; GNU-14 + AppleClang re-audit identical counts; Mac E2E
   I8MM + NEON; proof.i declared. GB10 9-cell census at fa92d351a pending.
+
+- SOURCE120 census FULLY GREEN (sealed K14-SOURCE120-CENSUS-20261109): PASS
+  176; 4/4; proof GNU-14 NEON_I8MM 242/1274 (GNU objdump 2.42); lifecycle 1;
+  9/9 cells single=0 grouped=budget (1029/1176/1274), 0 mismatches. Owner
+  evidence complete for the object-bound gate (GNU + AppleClang). Reviewer
+  SOURCE120 (source) pending.
