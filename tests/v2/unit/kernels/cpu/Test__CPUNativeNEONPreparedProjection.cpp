@@ -340,6 +340,82 @@ TEST_F(CPUNativeNEONPreparedProjection, I8MMTailPaddingContract)
 { verifyAllTailPadding<ms::NEONMultiScaleOps<ms::NEONByteDot::I8MM>>(); }
 #endif
 
+namespace
+{
+/**
+ * @brief Prove that every panel width writes the strip program's bytes, and nothing past N.
+ * @tparam Rows Physical row tile. @tparam Ops Admitted family.
+ * @details Strips=1 is the per-strip program; 2 and 4 interleave strips and
+ * cover the whole 64-column chunk, so N tails exercise partial strips and
+ * strips wholly in the sealed padding columns, which must never be stored.
+ */
+template <std::size_t Rows, typename Ops> void verifyPanelWidths(const NativeQuantisedFormatInfo &source, int n, int blocks,
+    CPUProjectionNumericalPolicy policy)
+{
+    SCOPED_TRACE(::testing::Message() << "codebook=" << int(source.codebook_id) << " rows=" << Rows << " n=" << n
+        << " blocks=" << blocks << " policy=" << int(policy));
+    NativeQuantisedPreparedByteFixture fixture(source, n, blocks * 32);
+    fixture.descriptor.numerical_policy = policy;
+    fixture.seedPayloadAndMetadata();
+    const auto packed = fixture.view();
+    const auto activation = activationRows(blocks, Rows);
+    std::array<std::span<const Q8_1Block>, Rows> input;
+    for (std::size_t row = 0; row < Rows; ++row) input[row] = {activation.data() + row * blocks, std::size_t(blocks)};
+    const float dirty = std::bit_cast<float>(0x7fc12345u);
+    const int stride = packed.N_padded + 4;
+    const auto run = [&]<int Strips>() {
+        std::vector<float> out(Rows * stride, dirty);
+        for (int chunk = 0; chunk < packed.N_padded / 64; ++chunk)
+        {
+            const int columns = std::min(64, n - chunk * 64);
+            std::array<std::span<float>, Rows> output;
+            for (std::size_t row = 0; row < Rows; ++row)
+                output[row] = {out.data() + row * stride + chunk * 64, std::size_t(columns)};
+            CPUNativeNEONProjectionTile<Rows>::bind(packed, input, output, chunk).template executeWith<Ops, Strips>();
+        }
+        return out;
+    };
+    const auto reference = run.template operator()<1>();
+    for (std::size_t row = 0; row < Rows; ++row)
+        for (int column = n; column < stride; ++column)
+            ASSERT_EQ(std::bit_cast<std::uint32_t>(reference[row * stride + column]), 0x7fc12345u);
+    const auto two = run.template operator()<2>();
+    const auto four = run.template operator()<4>();
+    EXPECT_EQ(std::memcmp(two.data(), reference.data(), reference.size() * sizeof(float)), 0) << "strips=2";
+    EXPECT_EQ(std::memcmp(four.data(), reference.data(), reference.size() * sizeof(float)), 0) << "strips=4";
+}
+
+/** @brief Sweep every non-compact source over panel widths, N tails, rows 1..4 and both policies. */
+template <typename Ops> void verifyAllPanelWidths()
+{
+    for (const auto &source : native_quantised_formats::kAllSourceFormats)
+    {
+        if (preparedEncodingForSource(*source.metadata) == CPUNativeQuantisedEncoding::CompactMultiScale)
+            continue;
+        for (const int n : {1, 5, 8, 12, 15, 16, 17, 20, 31, 33, 47, 63, 64, 65, 100})
+            for (const int blocks : {1, 3, 17})
+                for (const auto policy : {CPUProjectionNumericalPolicy::BackendNative,
+                                          CPUProjectionNumericalPolicy::GPUAlignedExpert})
+                {
+                    verifyPanelWidths<1, Ops>(*source.metadata, n, blocks, policy);
+                    verifyPanelWidths<2, Ops>(*source.metadata, n, blocks, policy);
+                    verifyPanelWidths<3, Ops>(*source.metadata, n, blocks, policy);
+                    verifyPanelWidths<4, Ops>(*source.metadata, n, blocks, policy);
+                }
+    }
+}
+} // namespace
+
+/** @test Every decode panel width reproduces the per-strip program's bytes (ASIMD). */
+TEST_F(CPUNativeNEONPreparedProjection, ASIMDPanelWidthsMatchTheStripProgram)
+{ verifyAllPanelWidths<ms::NEONMultiScaleOps<ms::NEONByteDot::ASIMD>>(); }
+
+#if defined(__ARM_FEATURE_DOTPROD)
+/** @test Every decode panel width reproduces the per-strip program's bytes (DotProd). */
+TEST_F(CPUNativeNEONPreparedProjection, DotProdPanelWidthsMatchTheStripProgram)
+{ verifyAllPanelWidths<ms::NEONMultiScaleOps<ms::NEONByteDot::DotProd>>(); }
+#endif
+
 /** @test Every source's ASIMD projection obeys serial bytes and its independent numerical program. */
 TEST_F(CPUNativeNEONPreparedProjection, ASIMDEverySourceAndEncodingMatchesSerialAndSourceOrder)
 { verifyAllPrepared<ms::NEONMultiScaleOps<ms::NEONByteDot::ASIMD>>(); }
@@ -467,6 +543,13 @@ template <typename Base> struct GroupingObserver : Base
         terms.push_back(term(std::bit_cast<std::array<std::uint32_t, 4>>(activation)[0], weights));
         return Base::dot(acc, weights, activation);
     }
+    /** @brief Record and execute one single-row lane-indexed leaf call (decode panels). */
+    template <int Group> static I dotLane(I acc, I weights, const typename Base::ActivationBlock &block)
+    {
+        const auto words = std::bit_cast<std::array<std::uint32_t, 4>>(Group < 4 ? block.low : block.high);
+        terms.push_back(term(words[Group % 4], weights));
+        return Base::template dotLane<Group>(acc, weights, block);
+    }
     /** @brief Record and execute one two-row SMMLA call as four product terms. */
     static void pairDot(I &columns01, I &columns23, I activation, I first, I second)
         requires Base::row_pairs
@@ -508,6 +591,11 @@ std::vector<Q8_1Block> identityRows(int blocks, int rows)
  * @tparam Rows Physical shared rows.
  * @param source Registered source format.
  * @param expert Whether the ordered expert tree is used.
+ * @details The oracle is the serial strip walk (Strips = 1), which computes
+ * live strips only. The installed single-row decode panel also computes the
+ * strips its final panel covers in the chunk's sealed padding columns (never
+ * stored); its terms must be exactly the oracle's plus those padding strips.
+ * Compact multi-scale encodings keep their own column walk (no panels).
  */
 template <std::size_t Rows> void verifyI8MMGrouping(const NativeQuantisedFormatInfo &source, bool expert)
 {
@@ -521,7 +609,7 @@ template <std::size_t Rows> void verifyI8MMGrouping(const NativeQuantisedFormatI
     const auto packed = fixture.view();
     const auto activation = identityRows(blocks, Rows);
     std::vector<float> bank(Rows * std::size_t(n));
-    const auto observe = [&]<typename Ops>(std::size_t rows_per_tile) {
+    const auto observe = [&]<typename Ops, int Strips>(std::size_t rows_per_tile) {
         Ops::terms.clear();
         for (int chunk = 0; chunk < packed.N_padded / 64; ++chunk)
         {
@@ -534,7 +622,7 @@ template <std::size_t Rows> void verifyI8MMGrouping(const NativeQuantisedFormatI
                     input[row] = {activation.data() + (first + row) * blocks, std::size_t(blocks)};
                     output[row] = {bank.data() + (first + row) * n + chunk * 64, std::size_t(columns)};
                 }
-                CPUNativeNEONProjectionTile<R>::bind(packed, input, output, chunk).template executeWith<Ops>();
+                CPUNativeNEONProjectionTile<R>::bind(packed, input, output, chunk).template executeWith<Ops, Strips>();
             };
             if (rows_per_tile == 1)
                 for (std::size_t row = 0; row < Rows; ++row) bind.template operator()<1>(row);
@@ -545,11 +633,41 @@ template <std::size_t Rows> void verifyI8MMGrouping(const NativeQuantisedFormatI
         std::sort(terms.begin(), terms.end());
         return terms;
     };
-    const auto serial = observe.template operator()<GroupingObserver<SDOTOps>>(1);
-    const auto pairs = observe.template operator()<GroupingObserver<I8MMOps>>(Rows);
+    const auto serial = observe.template operator()<GroupingObserver<SDOTOps>, 1>(1);
+    const auto pairs = observe.template operator()<GroupingObserver<I8MMOps>, 0>(Rows);
     ASSERT_FALSE(serial.empty());
     ASSERT_EQ(serial.size(), pairs.size());
     ASSERT_TRUE(serial == pairs);
+    // Installed decode panels: every live product, plus whole padding strips of
+    // the final chunk's last panel (n = 67 leaves one live strip in chunk 1).
+    // Compact multi-scale tiles have their own column walk and no panels.
+    const auto panels = observe.template operator()<GroupingObserver<SDOTOps>, 0>(1);
+    const int width = [&] {
+        using Tile = CPUNativeNEONProjectionTile<1>;
+        switch (packed.encoding)
+        {
+        case CPUNativeQuantisedEncoding::ExpandedInt8:
+            return packed.is_asymmetric
+                ? Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::ExpandedInt8, true>()
+                : Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::ExpandedInt8, false>();
+        case CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale:
+            return Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale>();
+        case CPUNativeQuantisedEncoding::Q6KNativeDualScale:
+            return Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::Q6KNativeDualScale>();
+        case CPUNativeQuantisedEncoding::NibbleLUTSourceScale:
+            return Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::NibbleLUTSourceScale>();
+        case CPUNativeQuantisedEncoding::NibbleLUT:
+            return Tile::template panelStrips<SDOTOps, CPUNativeQuantisedEncoding::NibbleLUT>();
+        case CPUNativeQuantisedEncoding::CompactMultiScale:
+            return 1; // Own column walk; no panels.
+        }
+        return 0;
+    }();
+    ASSERT_GT(width, 0);
+    const int live_strips = ((n % 64) + 3) / 4;
+    const int padding_strips = (width - live_strips % width) % width;
+    ASSERT_EQ(panels.size(), serial.size() + std::size_t(Rows) * blocks * 8 * padding_strips);
+    ASSERT_TRUE(std::includes(panels.begin(), panels.end(), serial.begin(), serial.end()));
 }
 } // namespace
 #endif
