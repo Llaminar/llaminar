@@ -1380,3 +1380,55 @@ TEST_F(Test__CPUFlashAttention_TP_GQA, BatchedPrefill_4xTP_Rank1)
     EXPECT_LE(mae, FP32_TOLERANCE) << "batch TP: max abs error " << mae;
     EXPECT_GE(cos, FP32_COSINE_THRESHOLD) << "batch TP: cosine sim " << cos;
 }
+
+/**
+ * @test Invocation admission: banks, head mapping and output disjointness are
+ * proved once before any worker team, on every ISA. A failed proof returns
+ * false without writing; the row programs themselves carry no per-call checks.
+ */
+TEST_F(Test__CPUFlashAttention_TP_GQA, InvocationAdmissionRejectsBeforeAnyWrite)
+{
+    constexpr int seq_len = 1, kv_len = 32, n_heads = 4, n_kv_heads = 2, head_dim = 64;
+    const std::size_t q_size = std::size_t(seq_len) * n_heads * head_dim;
+    const std::size_t kv_size = std::size_t(kv_len) * n_kv_heads * head_dim;
+    std::vector<float> Q(q_size), K(kv_size), V(kv_size + q_size), O(q_size, 123.0f);
+    fill_random(Q.data(), q_size);
+    fill_random(K.data(), kv_size);
+    fill_random(V.data(), V.size());
+    const auto V_before = V;
+
+    // Output inside the value bank.
+    EXPECT_FALSE(kernel_.compute_decode(Q.data(), K.data(), V.data(), V.data() + 64,
+        seq_len, kv_len, n_heads, n_kv_heads, head_dim, true, kv_len - 1));
+    EXPECT_EQ(V, V_before);
+    // Output inside the query bank.
+    auto Q_alias = Q;
+    EXPECT_FALSE(kernel_.compute_decode(Q_alias.data(), K.data(), V.data(), Q_alias.data(),
+        seq_len, kv_len, n_heads, n_kv_heads, head_dim, true, kv_len - 1));
+    EXPECT_EQ(Q_alias, Q);
+    EXPECT_TRUE(kernel_.compute_decode(Q.data(), K.data(), V.data(), O.data(),
+        seq_len, kv_len, n_heads, n_kv_heads, head_dim, true, kv_len - 1));
+
+    TensorFactory factory(mpi_ctx_);
+    auto Q_tensor = factory.createFP32({std::size_t(seq_len), std::size_t(n_heads * head_dim)}, device_id_);
+    auto K_tensor = factory.createFP32({std::size_t(kv_len), std::size_t(n_kv_heads * head_dim)}, device_id_);
+    auto V_tensor = factory.createFP32({std::size_t(kv_len), std::size_t(n_kv_heads * head_dim)}, device_id_);
+    auto O_tensor = factory.createFP32({std::size_t(seq_len), std::size_t(n_heads * head_dim)}, device_id_);
+    fill_random(Q_tensor->mutable_data(), q_size);
+    fill_random(K_tensor->mutable_data(), kv_size);
+    fill_random(V_tensor->mutable_data(), kv_size);
+    std::fill(O_tensor->mutable_data(), O_tensor->mutable_data() + q_size, 123.0f);
+    const auto call = [&](int heads, int kv_heads, int head_start, int gqa, attention::AttentionKVLogicalView view) {
+        return kernel_.compute_tensor(Q_tensor.get(), K_tensor.get(), V_tensor.get(), O_tensor.get(),
+            1, seq_len, kv_len, heads, kv_heads, head_dim, true, -1, nullptr, nullptr, &mpi_ctx_, -1,
+            head_start, heads, kv_heads, gqa, {}, view);
+    };
+    // A ring capacity beyond the cache tensor's rows.
+    EXPECT_FALSE(call(n_heads, n_kv_heads, 0, 0, {.logical_row_origin = 0, .physical_row_capacity = 2 * kv_len}));
+    // Query heads that map past the declared K/V heads.
+    EXPECT_FALSE(call(n_heads, n_kv_heads, 4, 2, {}));
+    // More query heads than the query tensor holds.
+    EXPECT_FALSE(call(2 * n_heads, n_kv_heads, 0, 0, {}));
+    for (std::size_t i = 0; i < q_size; ++i) ASSERT_EQ(O_tensor->data()[i], 123.0f);
+    EXPECT_TRUE(call(n_heads, n_kv_heads, 0, 0, {}));
+}

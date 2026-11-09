@@ -1025,7 +1025,8 @@ v2_add_core_free_test(V2_Integration_CPURoPEHybridStorageAdmission
 
 add_executable(v2_test_cpu_flash_attention_launch_policy
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/attention/Test__CPUFlashAttentionLaunchPolicy.cpp"
-    "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/attention/Test__CPUQ16AttentionMath.cpp")
+    "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/attention/Test__CPUQ16AttentionMath.cpp"
+    "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/attention/Test__CPUAttentionInvocationAdmission.cpp")
 target_compile_features(v2_test_cpu_flash_attention_launch_policy PRIVATE cxx_std_20)
 target_include_directories(v2_test_cpu_flash_attention_launch_policy PRIVATE
     "${V2_CPU_ARCHITECTURE_ROOT}/src" "${V2_CPU_ARCHITECTURE_ROOT}/src/v2")
@@ -1036,6 +1037,12 @@ v2_add_core_free_test(V2_Unit_CPUFlashAttentionLaunchPolicy
 v2_add_core_free_test(V2_Integration_CPUFlashAttentionLaunchPolicy
     COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_launch_policy>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention Dispatch Geometry)
+# Every CPU attention entry admits banks, head mapping and output disjointness
+# once per invocation; the row programs (NEON included) carry no per-call checks.
+v2_add_core_free_test(V2_Integration_CPUAttentionInvocationAdmission
+    COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_launch_policy>
+        --gtest_filter=CPUAttentionInvocationAdmission.*
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention Geometry Regression)
 v2_add_core_free_test(V2_Integration_CPUFA2NativeISAAdmission
     COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_launch_policy>
         --gtest_filter=*NativeISAIdentityRejectsForeignEnvelopes
