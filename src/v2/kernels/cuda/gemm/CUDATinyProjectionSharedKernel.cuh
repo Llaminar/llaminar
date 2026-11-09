@@ -153,6 +153,28 @@ __global__ __launch_bounds__(256, 2) void sharedTinyProjectionKernel(
                 : 0.0f;
         __syncthreads();
 
+        // On sm_120/121 the original full unroll is one register over the
+        // two-block budget, because the masked form keeps the authored-row
+        // mask live across the loop. There, every row executes the unmasked
+        // expression. Rows outside the authored set were staged as 0.0f above,
+        // and the final reduction skips their partials, so they never reach an
+        // output. Authored rows execute exactly the original unmasked
+        // multiply-add, and so keep the same contraction and bytes as every
+        // other architecture. Other architectures keep the original schedule.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+        #pragma unroll
+        for (int part = 0; part < parts_per_lane; ++part)
+        {
+            const int tile_k = lane + part * warp_width;
+            if (start + tile_k < static_cast<unsigned int>(k))
+            {
+                const float weight = weight_tile[column][tile_k];
+                #pragma unroll
+                for (int row = 0; row < RowsPerCTA; ++row)
+                    partials[row][part] += activation_tile[row][tile_k] * weight;
+            }
+        }
+#else
         #pragma unroll
         for (int part = 0; part < parts_per_lane; ++part)
         {
@@ -173,6 +195,7 @@ __global__ __launch_bounds__(256, 2) void sharedTinyProjectionKernel(
                 }
             }
         }
+#endif
         __syncthreads();
     }
 
