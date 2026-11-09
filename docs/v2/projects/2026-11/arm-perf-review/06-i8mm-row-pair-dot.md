@@ -293,3 +293,18 @@ failures GONE at this base. RE-GATE GO to arm-sparks.
   NEON_I8MM runtime check NOT re-run on Mac — covered by the arm-sparks
   re-gate on ea5402a54; Mac can't run I8MM anyway.)
 - Evidence: /tmp/armqual/{neon,neon_dotprod}.c.objfn.txt + c_*_rel.*.log.
+
+## MERGED (2026-11-09) — i8mm is in the arm branch
+
+- PR #43 = **302318f1e**: ea5402a54 taken as fast-forward (79c1f62ab →
+  d8546d184, 5f4c9d4d4, 2406c6549, 12940d605, c24ce9b4e, ea5402a54); Main's
+  aarch64 container (no i8mm HW → NEON_DOTPROD): 103/103 NEON/ISA/codegen/
+  overlay/capacity-places cells pass.
+- 302318f1e test(build) base fix: CPU-only tree didn't build with `ninja all`
+  (6 CUDA verifier/parity exes + TensorCoherence without HAVE_CUDA;
+  PrefillGraphCaptureGuards ROCm-only GDN symbols; GemmKernelContext missing
+  DeviceWorkspaceManager include) — now backend-guarded + REQUIRES_BACKEND
+  (300 omissions); complete aarch64 CPU-only tree builds.
+- i8mm lane RETIRED (already); .80 back to arm-sparks; Mac qual evidence stays
+  until the gcc-14 objdump confirm (arm-sparks, pending) — if a non-SMMLA
+  codegen difference shows, a follow-up commit + revalidation.
