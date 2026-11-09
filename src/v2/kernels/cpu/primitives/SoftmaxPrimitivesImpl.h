@@ -4,9 +4,10 @@
  * @author David Sanftenberg
  *
  * Separated implementations allow:
- * - Individual testing of scalar vs AVX2 vs AVX512
- * - Performance benchmarking per SIMD level
- * - Parity validation (scalar as ground truth)
+ * Checked original row geometry precedes production ISA selection. Native ARM
+ * normalization uses fixed register summaries and bounded in-place publication;
+ * explicit scalar/x86 variants retain their own numerical programs for diagnosis.
+ * Q8 metadata follows Q8_1Block's FP16 storage ABI, never a private BF16 variant.
  */
 #pragma once
 
@@ -14,6 +15,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <span>
 #include <vector>
 
 #if defined(__AVX512F__)
@@ -27,6 +29,12 @@
 #endif
 
 #include "../../../utils/CPUFeatures.h"
+#include "../../../tensors/FP16Utils.h"
+#include "CPUSoftmaxOperands.h"
+#include "CPUQ8SoftmaxMetadata.h"
+#if LLAMINAR_COMPILED_WITH_NEON
+#include "NEONSoftmaxPrimitives.h"
+#endif
 
 #if defined(__F16C__)
 #define LLAMINAR_HAS_F16C
@@ -67,6 +75,15 @@ namespace llaminar2::primitives
             std::memcpy(&result, &fp32_bits, sizeof(float));
             return result;
         }
+
+#if defined(__AVX2__)
+        /** @brief Load a bounded FP16-normalization result fragment without inventing alignment.
+         * @param probabilities Exactly eight original local FP32 probability values.
+         * @return Original lanes, permitting any valid float alignment.
+         */
+        inline __m256 loadFP16SoftmaxProbabilities(std::span<const float,8> probabilities) noexcept
+        {return _mm256_loadu_ps(probabilities.data());}
+#endif
 
         inline uint16_t fp32_to_bf16_scalar(float fp32)
         {
@@ -260,6 +277,8 @@ namespace llaminar2::primitives
             y = _mm_add_ps(_mm_mul_ps(y, x), p4);
             y = _mm_add_ps(_mm_mul_ps(y, x), p5);
             y = _mm_add_ps(_mm_mul_ps(y, x), _mm_set1_ps(1.0f));
+            // Complete both constant/linear Horner stages: exp'(0) must be one.
+            y = _mm_add_ps(_mm_mul_ps(y, x), _mm_set1_ps(1.0f));
 
             __m128i emm0 = _mm_cvttps_epi32(floored);
             emm0 = _mm_add_epi32(emm0, _mm_set1_epi32(0x7f));
@@ -314,6 +333,8 @@ namespace llaminar2::primitives
             y = _mm256_add_ps(_mm256_mul_ps(y, x), p4);
             y = _mm256_add_ps(_mm256_mul_ps(y, x), p5);
             y = _mm256_add_ps(_mm256_mul_ps(y, x), _mm256_set1_ps(1.0f));
+            // Complete both constant/linear Horner stages: exp'(0) must be one.
+            y = _mm256_add_ps(_mm256_mul_ps(y, x), _mm256_set1_ps(1.0f));
 
             __m256i emm0 = _mm256_cvttps_epi32(floored);
             emm0 = _mm256_add_epi32(emm0, _mm256_set1_epi32(0x7f));
@@ -367,6 +388,8 @@ namespace llaminar2::primitives
             y = _mm512_add_ps(_mm512_mul_ps(y, x), p3);
             y = _mm512_add_ps(_mm512_mul_ps(y, x), p4);
             y = _mm512_add_ps(_mm512_mul_ps(y, x), p5);
+            y = _mm512_add_ps(_mm512_mul_ps(y, x), _mm512_set1_ps(1.0f));
+            // Complete both constant/linear Horner stages: exp'(0) must be one.
             y = _mm512_add_ps(_mm512_mul_ps(y, x), _mm512_set1_ps(1.0f));
 
             __m512i emm0 = _mm512_cvttps_epi32(floored);
@@ -478,7 +501,7 @@ namespace llaminar2::primitives
         // Pass 1: Find max
         __m256 vmax = neg_inf;
         int c = 0;
-        for (; c + 8 <= cols; c += 8)
+        for (; c <= cols - 8; c += 8)
         {
             __m256 v = _mm256_loadu_ps(row + c);
             v = _mm256_mul_ps(v, scale_ps);
@@ -534,7 +557,7 @@ namespace llaminar2::primitives
         const __m256 zero_ps = _mm256_setzero_ps();
 
         c = 0;
-        for (; c + 8 <= cols; c += 8)
+        for (; c <= cols - 8; c += 8)
         {
             __m256 v = _mm256_loadu_ps(row + c);
             v = _mm256_mul_ps(v, scale_ps);
@@ -595,7 +618,7 @@ namespace llaminar2::primitives
         // Pass 1: Find max
         __m512 vmax = neg_inf;
         int c = 0;
-        for (; c + 16 <= cols; c += 16)
+        for (; c <= cols - 16; c += 16)
         {
             __m512 v = _mm512_loadu_ps(row + c);
             v = _mm512_mul_ps(v, scale_ps);
@@ -651,7 +674,7 @@ namespace llaminar2::primitives
         const __m512 zero_ps = _mm512_setzero_ps();
 
         c = 0;
-        for (; c + 16 <= cols; c += 16)
+        for (; c <= cols - 16; c += 16)
         {
             __m512 v = _mm512_loadu_ps(row + c);
             v = _mm512_mul_ps(v, scale_ps);
@@ -698,15 +721,6 @@ namespace llaminar2::primitives
     // FP32 Softmax - Compile-Time Dispatch
     // ============================================================================
 
-    inline void softmax_row_fp32(
-        float *row,
-        int cols,
-        bool causal,
-        float scale,
-        int row_idx)
-    {
-        ISA_DISPATCH_VOID(softmax_row_fp32, row, cols, causal, scale, row_idx);
-    }
 
     // ============================================================================
     // BF16 Softmax - Scalar Implementation
@@ -803,15 +817,6 @@ namespace llaminar2::primitives
     // BF16 Softmax - Compile-Time Dispatch
     // ============================================================================
 
-    inline void softmax_row_bf16(
-        uint16_t *row,
-        int cols,
-        bool causal,
-        float scale,
-        int row_idx)
-    {
-        ISA_DISPATCH_VOID(softmax_row_bf16, row, cols, causal, scale, row_idx);
-    }
 
     // ============================================================================
     // FP16 Softmax - Scalar Implementation
@@ -901,7 +906,7 @@ namespace llaminar2::primitives
         // Pass 1: Find max (convert FP16→FP32)
         __m256 vmax = neg_inf;
         int c = 0;
-        for (; c + 8 <= cols; c += 8)
+        for (; c <= cols - 8; c += 8)
         {
             __m128i fp16_vec = _mm_loadu_si128(reinterpret_cast<const __m128i *>(row + c));
             __m256 v = _mm256_cvtph_ps(fp16_vec);
@@ -957,7 +962,7 @@ namespace llaminar2::primitives
         const __m256 max_ps = _mm256_set1_ps(row_max);
 
         c = 0;
-        for (; c + 8 <= cols; c += 8)
+        for (; c <= cols - 8; c += 8)
         {
             __m128i fp16_vec = _mm_loadu_si128(reinterpret_cast<const __m128i *>(row + c));
             __m256 v = _mm256_cvtph_ps(fp16_vec);
@@ -979,7 +984,7 @@ namespace llaminar2::primitives
                 }
             }
 
-            __m256 out_ps = _mm256_load_ps(out);
+            __m256 out_ps = detail::loadFP16SoftmaxProbabilities(std::span<const float,8>(out));
             __m128i fp16_out = _mm256_cvtps_ph(out_ps, _MM_FROUND_TO_NEAREST_INT);
             _mm_storeu_si128(reinterpret_cast<__m128i *>(row + c), fp16_out);
         }
@@ -1024,15 +1029,6 @@ namespace llaminar2::primitives
     // FP16 Softmax - Compile-Time Dispatch
     // ============================================================================
 
-    inline void softmax_row_fp16(
-        uint16_t *row,
-        int cols,
-        bool causal,
-        float scale,
-        int row_idx)
-    {
-        ISA_DISPATCH_VOID(softmax_row_fp16, row, cols, causal, scale, row_idx);
-    }
 
     // ============================================================================
     // Q8_1 Integer-Aware Softmax - Scalar Implementation (OPTIMIZED)
@@ -1041,7 +1037,7 @@ namespace llaminar2::primitives
     // 1. ELIMINATED HEAP ALLOCATION: Use fixed-size stack buffer (32 floats = 1 block)
     // 2. FUSED Pass 2+3: Single pass for exp sum AND max_prob finding
     // 3. STREAMING REQUANT: Process block-by-block to stay in cache
-    // 4. REDUCED REDUNDANT SCALE CONVERSION: Cache bf16→fp32 per block
+    // 4. Reuse the original FP16 scale within each block; no coefficient bank.
 
     inline void softmax_row_q8_1_scalar(
         Q8_1Block *row,
@@ -1056,38 +1052,8 @@ namespace llaminar2::primitives
         // Find max(qs[i] * d) across all blocks
         // Key insight: We find integer max per block, then scale and reduce
 
-        float row_max = -std::numeric_limits<float>::infinity();
-
-        for (int b = 0; b < n_blocks; ++b)
-        {
-            const Q8_1Block &block = row[b];
-            const int col_start = b * 32;
-
-            // Convert BF16 scale to FP32 once per block
-            const float d = detail::bf16_to_fp32_scalar(block.d);
-
-            // Find max within block (integer comparison)
-            int8_t block_max_qs = -128;
-            for (int i = 0; i < 32; ++i)
-            {
-                const int col = col_start + i;
-                if (causal && col > row_idx)
-                    continue;
-                if (block.qs[i] > block_max_qs)
-                    block_max_qs = block.qs[i];
-            }
-
-            // Scale to FP32 and update row max
-            if (block_max_qs > -128)
-            { // Only if we found valid elements
-                float block_max = static_cast<float>(block_max_qs) * d * scale;
-                if (block_max > row_max)
-                    row_max = block_max;
-            }
-        }
-
-        if (!std::isfinite(row_max))
-            row_max = 0.0f;
+        const auto original = softmax_detail::Row<softmax_detail::Storage::Q8_1>::bind(row,n_blocks,causal,scale,row_idx);
+        const float row_max = softmax_detail::q8MaximumScalar(original);
 
         // ========================================================================
         // Pass 2 (FUSED): Compute Sum of Exponentials AND Find Max Probability
@@ -1104,13 +1070,13 @@ namespace llaminar2::primitives
         for (int b = 0; b < n_blocks; ++b)
         {
             const Q8_1Block &block = row[b];
-            const int col_start = b * 32;
-            const float d = detail::bf16_to_fp32_scalar(block.d);
+            const std::int64_t col_start = std::int64_t(b) * 32;
+            const float d = fp16_to_fp32(block.d);
             const float scaled_d = d * scale;
 
             for (int i = 0; i < 32; ++i)
             {
-                const int col = col_start + i;
+                const std::int64_t col = col_start + i;
                 if (causal && col > row_idx)
                     continue;
                 float v = static_cast<float>(block.qs[i]) * scaled_d;
@@ -1139,9 +1105,9 @@ namespace llaminar2::primitives
         // This keeps working set in L1 cache (32 floats = 128 bytes)
 
         // Compute requantization scale
-        const float new_d = (max_prob > 0.0f) ? max_prob / 127.0f : 1.0f / 127.0f;
+        const float new_d = softmax_detail::q8OutputScale(max_prob);
         const float inv_d = 1.0f / new_d;
-        const uint16_t new_d_bf16 = detail::fp32_to_bf16_scalar(new_d);
+        const uint16_t new_d_fp16 = fp32_to_fp16(new_d);
 
         // Stack buffer for one block's probabilities (32 floats = 128 bytes)
         alignas(32) float block_probs[32];
@@ -1149,14 +1115,14 @@ namespace llaminar2::primitives
         for (int b = 0; b < n_blocks; ++b)
         {
             Q8_1Block &block = row[b];
-            const int col_start = b * 32;
-            const float d = detail::bf16_to_fp32_scalar(block.d);
+            const std::int64_t col_start = std::int64_t(b) * 32;
+            const float d = fp16_to_fp32(block.d);
             const float scaled_d = d * scale;
 
             // Compute probabilities for this block into stack buffer
             for (int i = 0; i < 32; ++i)
             {
-                const int col = col_start + i;
+                const std::int64_t col = col_start + i;
                 if (causal && col > row_idx)
                 {
                     block_probs[i] = 0.0f;
@@ -1169,7 +1135,7 @@ namespace llaminar2::primitives
             }
 
             // Write new scale
-            block.d = new_d_bf16;
+            block.d = new_d_fp16;
 
             // Quantize and accumulate sum_qs
             int16_t sum_qs = 0;
@@ -1206,71 +1172,9 @@ namespace llaminar2::primitives
         // ========================================================================
         // Use vpmaxsb for 32-way INT8 max comparison per block
 
-        float row_max = -std::numeric_limits<float>::infinity();
+        const auto original = softmax_detail::Row<softmax_detail::Storage::Q8_1>::bind(row,n_blocks,causal,scale,row_idx);
+        const float row_max = softmax_detail::q8MaximumX86(original);
         const __m256 scale_ps = _mm256_set1_ps(scale);
-
-        for (int b = 0; b < n_blocks; ++b)
-        {
-            const Q8_1Block &block = row[b];
-            const int col_start = b * 32;
-
-            // Load 32 INT8 values as two __m128i (AVX2 vpmaxsb works on 256-bit)
-            __m256i qs_vec = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block.qs));
-
-            // Find max within 32 bytes using horizontal reduction
-            // Split into two 128-bit halves
-            __m128i lo = _mm256_castsi256_si128(qs_vec);
-            __m128i hi = _mm256_extracti128_si256(qs_vec, 1);
-            __m128i max_16 = _mm_max_epi8(lo, hi);
-
-            // Reduce 16 bytes to 8 bytes
-            __m128i shifted = _mm_srli_si128(max_16, 8);
-            __m128i max_8 = _mm_max_epi8(max_16, shifted);
-
-            // Reduce 8 bytes to 4 bytes
-            shifted = _mm_srli_si128(max_8, 4);
-            __m128i max_4 = _mm_max_epi8(max_8, shifted);
-
-            // Reduce 4 bytes to 2 bytes
-            shifted = _mm_srli_si128(max_4, 2);
-            __m128i max_2 = _mm_max_epi8(max_4, shifted);
-
-            // Reduce 2 bytes to 1 byte
-            shifted = _mm_srli_si128(max_2, 1);
-            __m128i max_1 = _mm_max_epi8(max_2, shifted);
-
-            // Extract scalar max
-            int8_t block_max_qs = static_cast<int8_t>(_mm_extract_epi8(max_1, 0));
-
-            // Handle causal masking (may need to recompute if causal cuts this block)
-            if (causal)
-            {
-                const int causal_end = std::min(row_idx + 1, col_start + 32);
-                if (causal_end <= col_start)
-                {
-                    continue; // Entire block is masked
-                }
-                else if (causal_end < col_start + 32)
-                {
-                    // Partial block - recompute max for valid range
-                    block_max_qs = -128;
-                    for (int i = 0; i < causal_end - col_start; ++i)
-                    {
-                        if (block.qs[i] > block_max_qs)
-                            block_max_qs = block.qs[i];
-                    }
-                }
-            }
-
-            // Convert BF16 scale to FP32 and compute block max
-            const float d = detail::bf16_to_fp32_scalar(block.d);
-            float block_max = static_cast<float>(block_max_qs) * d * scale;
-            if (block_max > row_max)
-                row_max = block_max;
-        }
-
-        if (!std::isfinite(row_max))
-            row_max = 0.0f;
 
         // ========================================================================
         // Pass 2: Compute Sum of Exponentials using AVX2
@@ -1283,8 +1187,8 @@ namespace llaminar2::primitives
         for (int b = 0; b < n_blocks; ++b)
         {
             const Q8_1Block &block = row[b];
-            const int col_start = b * 32;
-            const float d = detail::bf16_to_fp32_scalar(block.d);
+            const std::int64_t col_start = std::int64_t(b) * 32;
+            const float d = fp16_to_fp32(block.d);
             const __m256 d_ps = _mm256_set1_ps(d);
             const __m256 scaled_d_ps = _mm256_mul_ps(d_ps, scale_ps);
 
@@ -1306,7 +1210,7 @@ namespace llaminar2::primitives
                 // Handle causal masking
                 if (causal)
                 {
-                    const int group_start = col_start + g * 8;
+                    const std::int64_t group_start = col_start + g * 8;
                     for (int lane = 0; lane < 8; ++lane)
                     {
                         if (group_start + lane > row_idx)
@@ -1325,8 +1229,8 @@ namespace llaminar2::primitives
                 _mm256_store_ps(tmp, v);
                 for (int lane = 0; lane < 8; ++lane)
                 {
-                    const int col = col_start + g * 8 + lane;
-                    if (causal && col > row_idx)
+                    const auto col = std::size_t(col_start) + std::size_t(g) * 8 + std::size_t(lane);
+                    if (!original.containsColumn(col))
                         continue;
                     sum += std::exp(tmp[lane]);
                 }
@@ -1348,9 +1252,9 @@ namespace llaminar2::primitives
         // VECTORIZED SUM_QS: Use AVX2 horizontal sum
 
         // Compute requantization scale
-        const float new_d = (max_prob > 0.0f) ? max_prob / 127.0f : 1.0f / 127.0f;
+        const float new_d = softmax_detail::q8OutputScale(max_prob);
         const float inv_d = 1.0f / new_d;
-        const uint16_t new_d_bf16 = detail::fp32_to_bf16_scalar(new_d);
+        const uint16_t new_d_fp16 = fp32_to_fp16(new_d);
 
         // Stack buffer for one block's probabilities
         alignas(32) float block_probs[32];
@@ -1361,8 +1265,8 @@ namespace llaminar2::primitives
         for (int b = 0; b < n_blocks; ++b)
         {
             Q8_1Block &block = row[b];
-            const int col_start = b * 32;
-            const float d = detail::bf16_to_fp32_scalar(block.d);
+            const std::int64_t col_start = std::int64_t(b) * 32;
+            const float d = fp16_to_fp32(block.d);
             const __m256 d_ps = _mm256_set1_ps(d);
             const __m256 scaled_d_ps = _mm256_mul_ps(d_ps, scale_ps);
 
@@ -1379,7 +1283,7 @@ namespace llaminar2::primitives
                 // Handle causal masking
                 if (causal)
                 {
-                    const int group_start = col_start + g * 8;
+                    const std::int64_t group_start = col_start + g * 8;
                     for (int lane = 0; lane < 8; ++lane)
                     {
                         if (group_start + lane > row_idx)
@@ -1401,7 +1305,7 @@ namespace llaminar2::primitives
                 }
             }
 
-            block.d = new_d_bf16;
+            block.d = new_d_fp16;
 
             // OPTIMIZED: Vectorized quantization with AVX2 horizontal sum
             __m256i sum_qs_vec = _mm256_setzero_si256();
@@ -1477,59 +1381,9 @@ namespace llaminar2::primitives
         // ========================================================================
         // Use vpmaxsb (zmm) for 64-way INT8 max, but Q8_1 block is 32 bytes
 
-        float row_max = -std::numeric_limits<float>::infinity();
+        const auto original = softmax_detail::Row<softmax_detail::Storage::Q8_1>::bind(row,n_blocks,causal,scale,row_idx);
+        const float row_max = softmax_detail::q8MaximumX86(original);
         const __m512 scale_ps = _mm512_set1_ps(scale);
-
-        for (int b = 0; b < n_blocks; ++b)
-        {
-            const Q8_1Block &block = row[b];
-            const int col_start = b * 32;
-
-            // Load 32 INT8 values into lower half of zmm
-            __m256i qs_256 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block.qs));
-
-            // Use AVX2 horizontal reduction (32 bytes fits in ymm)
-            __m128i lo = _mm256_castsi256_si128(qs_256);
-            __m128i hi = _mm256_extracti128_si256(qs_256, 1);
-            __m128i max_16 = _mm_max_epi8(lo, hi);
-            __m128i shifted = _mm_srli_si128(max_16, 8);
-            __m128i max_8 = _mm_max_epi8(max_16, shifted);
-            shifted = _mm_srli_si128(max_8, 4);
-            __m128i max_4 = _mm_max_epi8(max_8, shifted);
-            shifted = _mm_srli_si128(max_4, 2);
-            __m128i max_2 = _mm_max_epi8(max_4, shifted);
-            shifted = _mm_srli_si128(max_2, 1);
-            __m128i max_1 = _mm_max_epi8(max_2, shifted);
-
-            int8_t block_max_qs = static_cast<int8_t>(_mm_extract_epi8(max_1, 0));
-
-            // Handle causal masking
-            if (causal)
-            {
-                const int causal_end = std::min(row_idx + 1, col_start + 32);
-                if (causal_end <= col_start)
-                {
-                    continue;
-                }
-                else if (causal_end < col_start + 32)
-                {
-                    block_max_qs = -128;
-                    for (int i = 0; i < causal_end - col_start; ++i)
-                    {
-                        if (block.qs[i] > block_max_qs)
-                            block_max_qs = block.qs[i];
-                    }
-                }
-            }
-
-            const float d = detail::bf16_to_fp32_scalar(block.d);
-            float block_max = static_cast<float>(block_max_qs) * d * scale;
-            if (block_max > row_max)
-                row_max = block_max;
-        }
-
-        if (!std::isfinite(row_max))
-            row_max = 0.0f;
 
         // ========================================================================
         // Pass 2: Compute Sum of Exponentials using AVX-512
@@ -1542,8 +1396,8 @@ namespace llaminar2::primitives
         for (int b = 0; b < n_blocks; ++b)
         {
             const Q8_1Block &block = row[b];
-            const int col_start = b * 32;
-            const float d = detail::bf16_to_fp32_scalar(block.d);
+            const std::int64_t col_start = std::int64_t(b) * 32;
+            const float d = fp16_to_fp32(block.d);
             const __m512 d_ps = _mm512_set1_ps(d);
             const __m512 scaled_d_ps = _mm512_mul_ps(d_ps, scale_ps);
 
@@ -1564,10 +1418,10 @@ namespace llaminar2::primitives
                 // Handle causal masking using AVX-512 mask (OPTIMIZED)
                 if (causal)
                 {
-                    const int group_start = col_start + g * 16;
+                    const std::int64_t group_start = col_start + g * 16;
                     // Compute mask: valid if position <= row_idx
                     __mmask16 valid_mask = 0xFFFF;
-                    const int first_invalid = row_idx - group_start + 1;
+                    const std::int64_t first_invalid = std::int64_t(row_idx) - group_start + 1;
                     if (first_invalid < 16)
                     {
                         valid_mask = (first_invalid > 0) ? ((1 << first_invalid) - 1) : 0;
@@ -1577,7 +1431,7 @@ namespace llaminar2::primitives
                 }
 
                 // Compute exp using AVX-512 polynomial approximation
-                __m512 exp_v = detail::exp512_ps(v);
+                __m512 exp_v = softmax_detail::maskQ8Exp(detail::exp512_ps(v),original.liveColumns(),std::size_t(col_start)+std::size_t(g)*16);
 
                 // Horizontal sum
                 sum += static_cast<double>(_mm512_reduce_add_ps(exp_v));
@@ -1599,9 +1453,9 @@ namespace llaminar2::primitives
         // VECTORIZED SUM_QS: Use AVX-512 horizontal sum
 
         // Compute requantization scale
-        const float new_d = (max_prob > 0.0f) ? max_prob / 127.0f : 1.0f / 127.0f;
+        const float new_d = softmax_detail::q8OutputScale(max_prob);
         const float inv_d = 1.0f / new_d;
-        const uint16_t new_d_bf16 = detail::fp32_to_bf16_scalar(new_d);
+        const uint16_t new_d_fp16 = fp32_to_fp16(new_d);
 
         // Stack buffer for one block's probabilities
         alignas(64) float block_probs[32];
@@ -1612,8 +1466,8 @@ namespace llaminar2::primitives
         for (int b = 0; b < n_blocks; ++b)
         {
             Q8_1Block &block = row[b];
-            const int col_start = b * 32;
-            const float d = detail::bf16_to_fp32_scalar(block.d);
+            const std::int64_t col_start = std::int64_t(b) * 32;
+            const float d = fp16_to_fp32(block.d);
             const __m512 d_ps = _mm512_set1_ps(d);
             const __m512 scaled_d_ps = _mm512_mul_ps(d_ps, scale_ps);
 
@@ -1629,9 +1483,9 @@ namespace llaminar2::primitives
                 // Handle causal masking (OPTIMIZED)
                 if (causal)
                 {
-                    const int group_start = col_start + g * 16;
+                    const std::int64_t group_start = col_start + g * 16;
                     __mmask16 valid_mask = 0xFFFF;
-                    const int first_invalid = row_idx - group_start + 1;
+                    const std::int64_t first_invalid = std::int64_t(row_idx) - group_start + 1;
                     if (first_invalid < 16)
                     {
                         valid_mask = (first_invalid > 0) ? ((1 << first_invalid) - 1) : 0;
@@ -1640,14 +1494,14 @@ namespace llaminar2::primitives
                 }
 
                 // Compute exp and normalize
-                __m512 exp_v = detail::exp512_ps(v);
+                __m512 exp_v = softmax_detail::maskQ8Exp(detail::exp512_ps(v),original.liveColumns(),std::size_t(col_start)+std::size_t(g)*16);
                 __m512 prob_ps = _mm512_mul_ps(exp_v, inv_sum_ps);
 
                 // Store probabilities to stack buffer
                 _mm512_store_ps(&block_probs[g * 16], prob_ps);
             }
 
-            block.d = new_d_bf16;
+            block.d = new_d_fp16;
 
             // OPTIMIZED: Vectorized quantization with AVX-512 horizontal sum
             __m512i sum_qs_vec = _mm512_setzero_si512();
@@ -1693,14 +1547,94 @@ namespace llaminar2::primitives
     // Q8_1 Integer-Aware Softmax - Compile-Time Dispatch
     // ============================================================================
 
-    inline void softmax_row_q8_1(
-        Q8_1Block *row,
-        int n_blocks,
-        bool causal,
-        float scale,
-        int row_idx)
-    {
-        ISA_DISPATCH_VOID(softmax_row_q8_1, row, n_blocks, causal, scale, row_idx);
-    }
 
+    namespace softmax_detail
+    {
+        /** @brief Invoke an explicitly selected original scalar diagnostic program.
+         * @tparam Format Original physical tensor storage.
+         * @param row Checked original row and immutable invocation coordinates.
+         */
+        template<Storage Format>
+        inline void execute_scalar(const Row<Format>&row)
+        {
+            if constexpr(Format==Storage::FP32) softmax_row_fp32_scalar(row.data(),row.units(),row.causal(),row.scale(),row.rowIndex());
+            else if constexpr(Format==Storage::BFloat16) softmax_row_bf16_scalar(row.data(),row.units(),row.causal(),row.scale(),row.rowIndex());
+            else if constexpr(Format==Storage::Half) softmax_row_fp16_scalar(row.data(),row.units(),row.causal(),row.scale(),row.rowIndex());
+            else softmax_row_q8_1_scalar(row.data(),row.units(),row.causal(),row.scale(),row.rowIndex());
+        }
+#if defined(__AVX2__)
+        /** @brief Bind checked original storage to the existing compiled AVX2 numerical program.
+         * @tparam Format Original physical tensor storage; @param row Complete original row.
+         */
+        template<Storage Format>
+        inline void execute_avx2(const Row<Format>&row)
+        {
+            if constexpr(Format==Storage::FP32) softmax_row_fp32_avx2(row.data(),row.units(),row.causal(),row.scale(),row.rowIndex());
+            else if constexpr(Format==Storage::BFloat16) softmax_row_bf16_avx2(row.data(),row.units(),row.causal(),row.scale(),row.rowIndex());
+            else if constexpr(Format==Storage::Half) softmax_row_fp16_avx2(row.data(),row.units(),row.causal(),row.scale(),row.rowIndex());
+            else softmax_row_q8_1_avx2(row.data(),row.units(),row.causal(),row.scale(),row.rowIndex());
+        }
+#endif
+#if defined(__AVX512F__)
+        /** @brief Bind checked original storage to the existing compiled AVX-512 program.
+         * @tparam Format Original physical tensor storage; @param row Complete original row.
+         */
+        template<Storage Format>
+        inline void execute_avx512(const Row<Format>&row)
+        {
+            if constexpr(Format==Storage::FP32) softmax_row_fp32_avx512(row.data(),row.units(),row.causal(),row.scale(),row.rowIndex());
+            else if constexpr(Format==Storage::BFloat16) softmax_row_bf16_avx512(row.data(),row.units(),row.causal(),row.scale(),row.rowIndex());
+            else if constexpr(Format==Storage::Half) softmax_row_fp16_avx512(row.data(),row.units(),row.causal(),row.scale(),row.rowIndex());
+            else softmax_row_q8_1_avx512(row.data(),row.units(),row.causal(),row.scale(),row.rowIndex());
+        }
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON
+        /** @brief Execute a complete native SIMD row without allocation or a scalar substitute.
+         * @tparam Format Original physical tensor storage; @param row Checked complete original row.
+         * @throws std::domain_error For an invalid active score/metadata/normalizer.
+         */
+        template<Storage Format>
+        inline void execute_neon(const Row<Format>&row) {neon_softmax::execute(row);}
+#endif
+    }
+    /** @brief Normalize one checked original FP32 row on its admitted native ISA.
+     * @param row Original complete bank; @param cols Physical count; @param causal Prefix mask policy.
+     * @param scale Finite score multiplier; @param row_idx Original causal coordinate.
+     * @throws std::invalid_argument For malformed original geometry or invocation policy.
+     */
+    inline void softmax_row_fp32(float*row,int cols,bool causal,float scale,int row_idx)
+    {
+        const auto input=softmax_detail::Row<softmax_detail::Storage::FP32>::bind(row,cols,causal,scale,row_idx);
+        ISA_DISPATCH_VOID(softmax_detail::execute,input);
+    }
+    /** @brief Normalize one checked original BF16 row without selecting another storage ABI.
+     * @param row Original complete bank; @param cols Physical count; @param causal Prefix mask policy.
+     * @param scale Finite score multiplier; @param row_idx Original causal coordinate.
+     * @throws std::invalid_argument For malformed original geometry or invocation policy.
+     */
+    inline void softmax_row_bf16(uint16_t*row,int cols,bool causal,float scale,int row_idx)
+    {
+        const auto input=softmax_detail::Row<softmax_detail::Storage::BFloat16>::bind(row,cols,causal,scale,row_idx);
+        ISA_DISPATCH_VOID(softmax_detail::execute,input);
+    }
+    /** @brief Normalize one checked original FP16 row through its canonical storage conversion.
+     * @param row Original complete bank; @param cols Physical count; @param causal Prefix mask policy.
+     * @param scale Finite score multiplier; @param row_idx Original causal coordinate.
+     * @throws std::invalid_argument For malformed original geometry or invocation policy.
+     */
+    inline void softmax_row_fp16(uint16_t*row,int cols,bool causal,float scale,int row_idx)
+    {
+        const auto input=softmax_detail::Row<softmax_detail::Storage::Half>::bind(row,cols,causal,scale,row_idx);
+        ISA_DISPATCH_VOID(softmax_detail::execute,input);
+    }
+    /** @brief Normalize one checked original Q8 row with FP16 metadata and complete blocks.
+     * @param row Original complete Q8 blocks; @param n_blocks Physical block count.
+     * @param causal Prefix mask policy; @param scale Finite multiplier; @param row_idx Original causal coordinate.
+     * @throws std::invalid_argument For malformed original geometry or invocation policy.
+     */
+    inline void softmax_row_q8_1(Q8_1Block*row,int n_blocks,bool causal,float scale,int row_idx)
+    {
+        const auto input=softmax_detail::Row<softmax_detail::Storage::Q8_1>::bind(row,n_blocks,causal,scale,row_idx);
+        ISA_DISPATCH_VOID(softmax_detail::execute,input);
+    }
 } // namespace llaminar2::primitives

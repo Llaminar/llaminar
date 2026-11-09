@@ -2,10 +2,11 @@
  * @file RoPEPrimitives.cpp
  * @brief Native CPU rotary embeddings with absolute-position angle ownership.
  *
- * Prefill, prefix-restored suffixes and grouped/ordinary decode use the same
- * position-times-frequency equation. Angle caches memoize that pure function;
- * they never advance a history-dependent recurrence. Native SIMD rotations and
- * quantized storage remain unchanged, so chunking cannot change arithmetic.
+ * Prefill, prefix-restored suffixes and grouped/ordinary decode share the same
+ * absolute-position coefficient authority, never a history-dependent recurrence.
+ * Native floating pairs retain explicit rounding; quantized block cycles consume
+ * both original halves before replacing their scale/payload. One head workshare
+ * owns cached decode even inside retained teams, with no repeated bank rotation.
  * @author David Sanftenberg
  */
 
@@ -20,11 +21,17 @@
 #include <array>
 #include <atomic>
 #include <type_traits>
+#include <limits>
 
 #include <omp.h>
 
 #include "../../../utils/OpenMPUtils.h"
 #include "../../../utils/CPUFeatures.h"
+#if LLAMINAR_COMPILED_WITH_NEON
+#include "NEONRoPEPrimitives.h"
+#include "NEONQuantizedRoPE.h"
+#include "NEONIntegerRoPE.h"
+#endif
 
 #if defined(__AVX512F__)
 #include <immintrin.h>
@@ -84,6 +91,56 @@ namespace llaminar2::primitives
     // ============================================================================
     // Vectorized RoPE Application - Separated Implementations
     // ============================================================================
+
+#if LLAMINAR_COMPILED_WITH_NEON
+    /** @brief Rotate an original retained head through the checked native pair leaf.
+     * @tparam Format Actual original floating storage, never inferred from pointer width.
+     * @param head Original writable head.
+     * @param cosine Borrowed absolute-position cosine words.
+     * @param sine Matching sine words.
+     * @param head_dim Complete nonnegative even rotary width.
+     */
+    template <neon_rope::Storage Format>
+    static void apply_rope_to_head_cached_neon(
+        neon_rope::Word<Format> *head, const float *cosine, const float *sine, int head_dim)
+    { neon_rope::rotate_head<Format>(head, cosine, sine, head_dim); }
+
+    /** @brief Generate bounded absolute-position coefficients and rotate native lanes.
+     * @tparam Format Original retained floating storage.
+     * @param head Original in-place head, retained until return.
+     * @param position Absolute position, not a recurrence seed.
+     * @param inv_freq Immutable original coefficient frequencies.
+     * @param head_dim Nonnegative even original rotary width.
+     * @return Complete pair count, including the identically computed native tail.
+     * @throws std::invalid_argument Before mutation on malformed head/frequency geometry.
+     */
+    template <neon_rope::Storage Format>
+    static int apply_rope_to_head_neon(
+        neon_rope::Word<Format> *head, int position,
+        const std::vector<float> &inv_freq, int head_dim)
+    {
+        if (head_dim < 0 || head_dim % 2 != 0 ||
+            inv_freq.size() < static_cast<std::size_t>(head_dim / 2) || (head_dim && !head))
+            throw std::invalid_argument("Native direct RoPE requires complete head and frequency geometry");
+        const int half = head_dim / 2;
+        for (int first = 0; first < half;)
+        {
+            const int count = std::min(4, half - first);
+            float cosine[4] = {}, sine[4] = {};
+            // Trigonometry follows the existing CPU coefficient authority. Only
+            // four pairs are private; there is no expanded head/tensor mirror.
+            for (int lane = 0; lane < count; ++lane)
+            {
+                const float angle = static_cast<float>(position) * inv_freq[static_cast<std::size_t>(first + lane)];
+                cosine[lane] = std::cos(angle);
+                sine[lane] = std::sin(angle);
+            }
+            neon_rope::rotate_pairs<Format>(head + first, head + half + first, cosine, sine, count);
+            first += count;
+        }
+        return half;
+    }
+#endif
 
 #if defined(__AVX2__)
     /**
@@ -323,27 +380,6 @@ namespace llaminar2::primitives
 #endif
 
     /**
-     * @brief Apply RoPE rotation to a single head (dispatches to best available implementation)
-     */
-    static void apply_rope_to_head_vectorized(
-        float *head_ptr,
-        int position,
-        const std::vector<float> &inv_freq,
-        int head_dim)
-    {
-        int processed = 0;
-
-#if defined(__AVX512F__)
-        processed = apply_rope_to_head_avx512(head_ptr, position, inv_freq, head_dim);
-#elif defined(__AVX2__)
-        processed = apply_rope_to_head_avx2(head_ptr, position, inv_freq, head_dim);
-#endif
-
-        // Scalar tail
-        apply_rope_to_head_scalar(head_ptr, position, inv_freq, head_dim, processed);
-    }
-
-    /**
      * @brief Fill position-owned angles once, shared by all heads in each row.
      * @param inv_freq Immutable inverse frequencies for the rotary geometry.
      * @param first_position Absolute position of row zero, never a recurrence seed.
@@ -437,13 +473,15 @@ namespace llaminar2::primitives
     {
         const auto rotate = [head_dim](float *head_ptr, const float *cos_ptr, const float *sin_ptr)
         {
-            const int half_dim = head_dim / 2;
-#if defined(__AVX512F__)
+#if LLAMINAR_COMPILED_WITH_NEON
+            apply_rope_to_head_cached_neon<neon_rope::Storage::FP32>(head_ptr, cos_ptr, sin_ptr, head_dim);
+#elif defined(__AVX512F__)
             apply_rope_to_head_cached_avx512(head_ptr, cos_ptr, sin_ptr, head_dim);
 #elif defined(__AVX2__)
             apply_rope_to_head_cached_avx2(head_ptr, cos_ptr, sin_ptr, head_dim);
 #else
-            // Scalar builds preserve the same fixed rotation arithmetic.
+            const int half_dim = head_dim / 2;
+            // Explicit scalar diagnostics preserve their fixed rotation arithmetic.
             for (int i = 0; i < half_dim; ++i)
             {
                 float x_first = head_ptr[i];
@@ -489,43 +527,98 @@ namespace llaminar2::primitives
     /**
      * @brief Apply RoPE with persistent state (single-token decode optimization)
      */
+    /**
+     * @brief Own each cached query/key head exactly once in standalone or retained execution.
+     * @tparam Native Original floating storage word.
+     * @tparam Rotate Architecture-native single-head operation, not a whole-bank replay.
+     * @param q Original writable query bank.
+     * @param k Optional original writable key bank, disjoint from q.
+     * @param q_heads Query head count.
+     * @param k_heads Key head count when k is present.
+     * @param head_dim Nonnegative even physical head width.
+     * @param state Calling participant's immutable, fully prepared angle cache.
+     * @param rotate One original-head rotation with borrowed coefficient pointers.
+     * @throws std::invalid_argument Before mutation on incomplete geometry/cache or writable aliases.
+     *
+     * Each retained-team caller has its own thread-local angle cache, but all
+     * callers share the output banks. Repeating a serial head loop per member
+     * transforms those banks multiple times. One head workshare and its final
+     * edge instead own publication, including the empty-head case.
+     */
+    template <typename Native, typename Rotate>
+    static void apply_rope_cached_heads(
+        Native *q, Native *k, int q_heads, int k_heads, int head_dim,
+        const RoPEPersistentState &state, Rotate rotate)
+    {
+        if (q_heads < 0 || k_heads < 0 || head_dim < 0 || head_dim % 2 != 0 ||
+            (q_heads && head_dim && !q) ||
+            state.cos_curr.size() != static_cast<std::size_t>(head_dim / 2) ||
+            state.sin_curr.size() != state.cos_curr.size())
+            throw std::invalid_argument("Cached CPU RoPE requires complete head and angle geometry");
+        const auto q_bytes = std::size_t(q_heads) * head_dim * sizeof(Native);
+        const auto k_bytes = k ? std::size_t(k_heads) * head_dim * sizeof(Native) : 0;
+        const auto coefficient_bytes = state.cos_curr.size() * sizeof(float);
+        const auto reject_overlap = [](const void *a, std::size_t a_bytes, const void *b, std::size_t b_bytes) {
+            const auto x = reinterpret_cast<std::uintptr_t>(a), y = reinterpret_cast<std::uintptr_t>(b);
+            if (a_bytes && b_bytes && (x <= y ? y - x < a_bytes : x - y < b_bytes))
+                throw std::invalid_argument("Cached CPU RoPE writable banks alias another retained authority");
+        };
+        reject_overlap(q, q_bytes, k, k_bytes);
+        for (const auto *coefficients : {state.cos_curr.data(), state.sin_curr.data()})
+        {
+            reject_overlap(q, q_bytes, coefficients, coefficient_bytes);
+            reject_overlap(k, k_bytes, coefficients, coefficient_bytes);
+        }
+        const std::int64_t heads = head_dim ? std::int64_t(q_heads) + (k ? k_heads : 0) : 0;
+        auto work = [&]()
+        {
+#pragma omp for schedule(static)
+            for (std::int64_t head = 0; head < heads; ++head)
+            {
+                Native *data = head < q_heads
+                    ? q + static_cast<std::size_t>(head) * head_dim
+                    : k + static_cast<std::size_t>(head - q_heads) * head_dim;
+                rotate(data, state.cos_curr.data(), state.sin_curr.data());
+            }
+        };
+        // The conditional macro creates a private one-thread region when its
+        // condition is false. Preserve the active outer team explicitly; the
+        // size hint controls only standalone team creation, never membership.
+        OMP_WORKSHARE_REGION_IF(work, omp_in_parallel() || heads >= 4);
+    }
+
+    /** @brief Rotate cached FP32 heads once through the shared participant workshare.
+     * @param q Original query bank.
+     * @param k Optional original key bank.
+     * @param q_heads Query head count.
+     * @param k_heads Key head count when k is present.
+     * @param head_dim Original even head width.
+     * @param state Participant-thread-owned immutable angle memoization.
+     */
     static void apply_rope_from_cache(
         float *q, float *k,
         int q_heads, int k_heads, int head_dim,
         const RoPEPersistentState &state)
     {
-        const int half_dim = head_dim / 2;
-
-        // Apply rotation to all heads using cached sin/cos
-        auto apply_to_heads = [&](float *tensor, int num_heads)
+        const auto rotate = [head_dim](float *head, const float *cosine, const float *sine)
         {
-            for (int h = 0; h < num_heads; ++h)
-            {
-                float *head_ptr = tensor + h * head_dim;
-#if defined(__AVX512F__)
-                apply_rope_to_head_cached_avx512(head_ptr, state.cos_curr.data(), state.sin_curr.data(), head_dim);
+#if LLAMINAR_COMPILED_WITH_NEON
+            apply_rope_to_head_cached_neon<neon_rope::Storage::FP32>(head, cosine, sine, head_dim);
+#elif defined(__AVX512F__)
+            apply_rope_to_head_cached_avx512(head, cosine, sine, head_dim);
 #elif defined(__AVX2__)
-                apply_rope_to_head_cached_avx2(head_ptr, state.cos_curr.data(), state.sin_curr.data(), head_dim);
+            apply_rope_to_head_cached_avx2(head, cosine, sine, head_dim);
 #else
-                for (int i = 0; i < half_dim; ++i)
-                {
-                    float x_first = head_ptr[i];
-                    float x_second = head_ptr[i + half_dim];
-                    float cos_val = state.cos_curr[i];
-                    float sin_val = state.sin_curr[i];
-
-                    head_ptr[i] = x_first * cos_val - x_second * sin_val;
-                    head_ptr[i + half_dim] = x_first * sin_val + x_second * cos_val;
-                }
-#endif
+            const int half = head_dim / 2;
+            for (int i = 0; i < half; ++i)
+            {
+                const float x = head[i], y = head[i + half];
+                head[i] = x * cosine[i] - y * sine[i];
+                head[i + half] = x * sine[i] + y * cosine[i];
             }
+#endif
         };
-
-        apply_to_heads(q, q_heads);
-        if (k)
-        {
-            apply_to_heads(k, k_heads);
-        }
+        apply_rope_cached_heads(q, k, q_heads, k_heads, head_dim, state, rotate);
     } // ============================================================================
     // Public API
     // ============================================================================
@@ -627,15 +720,30 @@ namespace llaminar2::primitives
         }
 #endif
 
-// --- ISA stubs for runtime dispatch ---
-#if !defined(__AVX2__)
+#if LLAMINAR_COMPILED_WITH_NEON
+        /** @brief Rotate the original partial FP32 interval with the native four-lane program.
+         * @param head_ptr Original first rotary word.
+         * @param cos_ptr Original cosine coefficients.
+         * @param sin_ptr Matching sine coefficients.
+         * @param half_rotary Half of the complete even rotary interval.
+         */
+        void rope_rotate_head_neon(float *head_ptr, const float *cos_ptr, const float *sin_ptr, int half_rotary)
+        {
+            if (half_rotary < 0 || half_rotary > std::numeric_limits<int>::max() / 2)
+                throw std::invalid_argument("Native partial RoPE pair count is not representable");
+            neon_rope::rotate_head<neon_rope::Storage::FP32>(head_ptr, cos_ptr, sin_ptr, half_rotary * 2);
+        }
+#endif
+
+// --- ISA stubs for non-ARM diagnostic builds ---
+#if !defined(__AVX2__) && !LLAMINAR_COMPILED_WITH_NEON
         void rope_rotate_head_avx2(float *head_ptr, const float *cos_ptr,
                                    const float *sin_ptr, int half_rotary)
         {
             rope_rotate_head_scalar(head_ptr, cos_ptr, sin_ptr, half_rotary);
         }
 #endif
-#if !defined(__AVX512F__)
+#if !defined(__AVX512F__) && !LLAMINAR_COMPILED_WITH_NEON
         void rope_rotate_head_avx512(float *head_ptr, const float *cos_ptr,
                                      const float *sin_ptr, int half_rotary)
         {
@@ -824,7 +932,9 @@ namespace llaminar2::primitives
                                    const float *cos_values,
                                    const float *sin_values)
         {
-#if defined(__AVX512F__)
+#if LLAMINAR_COMPILED_WITH_NEON
+            apply_rope_to_head_cached_neon<neon_rope::Storage::FP32>(head, cos_values, sin_values, head_dim);
+#elif defined(__AVX512F__)
             apply_rope_to_head_cached_avx512(
                 head, cos_values, sin_values, head_dim);
 #elif defined(__AVX2__)
@@ -1204,7 +1314,9 @@ namespace llaminar2::primitives
     {
         int processed = 0;
 
-#if defined(__AVX512F__)
+#if LLAMINAR_COMPILED_WITH_NEON
+        processed = apply_rope_to_head_neon<neon_rope::Storage::BFloat16>(head_ptr, position, inv_freq, head_dim);
+#elif defined(__AVX512F__)
         processed = apply_rope_to_head_bf16_avx512(head_ptr, position, inv_freq, head_dim);
 #elif defined(__AVX2__)
         processed = apply_rope_to_head_bf16_avx2(head_ptr, position, inv_freq, head_dim);
@@ -1222,13 +1334,15 @@ namespace llaminar2::primitives
     {
         const auto rotate = [head_dim](uint16_t *head_ptr, const float *cos_ptr, const float *sin_ptr)
         {
-            const int half_dim = head_dim / 2;
-#if defined(__AVX512F__)
+#if LLAMINAR_COMPILED_WITH_NEON
+            apply_rope_to_head_cached_neon<neon_rope::Storage::BFloat16>(head_ptr, cos_ptr, sin_ptr, head_dim);
+#elif defined(__AVX512F__)
             apply_rope_to_head_cached_bf16_avx512(head_ptr, cos_ptr, sin_ptr, head_dim);
 #elif defined(__AVX2__)
             apply_rope_to_head_cached_bf16_avx2(head_ptr, cos_ptr, sin_ptr, head_dim);
 #else
-            // Scalar builds preserve the same fixed rotation arithmetic.
+            const int half_dim = head_dim / 2;
+            // Explicit scalar diagnostics preserve their fixed rotation arithmetic.
             for (int i = 0; i < half_dim; ++i)
             {
                 float x_first = simd::bf16_to_fp32(head_ptr[i]);
@@ -1247,43 +1361,38 @@ namespace llaminar2::primitives
         apply_rope_pair_positions(q, k, seq_len, q_heads, k_heads, head_dim, n_past, inv_freq, rotate);
     }
 
+    /** @brief Rotate cached BFloat16 heads once through the shared participant workshare.
+     * @param q Original query bank.
+     * @param k Optional original key bank.
+     * @param q_heads Query head count.
+     * @param k_heads Key head count when k is present.
+     * @param head_dim Original even head width.
+     * @param state Participant-thread-owned immutable angle memoization.
+     */
     static void apply_rope_bf16_from_cache(
         uint16_t *q, uint16_t *k,
         int q_heads, int k_heads, int head_dim,
         const RoPEPersistentState &state)
     {
-        const int half_dim = head_dim / 2;
-
-        auto apply_to_heads = [&](uint16_t *tensor, int num_heads)
+        const auto rotate = [head_dim](uint16_t *head, const float *cosine, const float *sine)
         {
-            for (int h = 0; h < num_heads; ++h)
-            {
-                uint16_t *head_ptr = tensor + h * head_dim;
-#if defined(__AVX512F__)
-                apply_rope_to_head_cached_bf16_avx512(head_ptr, state.cos_curr.data(), state.sin_curr.data(), head_dim);
+#if LLAMINAR_COMPILED_WITH_NEON
+            apply_rope_to_head_cached_neon<neon_rope::Storage::BFloat16>(head, cosine, sine, head_dim);
+#elif defined(__AVX512F__)
+            apply_rope_to_head_cached_bf16_avx512(head, cosine, sine, head_dim);
 #elif defined(__AVX2__)
-                apply_rope_to_head_cached_bf16_avx2(head_ptr, state.cos_curr.data(), state.sin_curr.data(), head_dim);
+            apply_rope_to_head_cached_bf16_avx2(head, cosine, sine, head_dim);
 #else
-                for (int i = 0; i < half_dim; ++i)
-                {
-                    float x_first = simd::bf16_to_fp32(head_ptr[i]);
-                    float x_second = simd::bf16_to_fp32(head_ptr[i + half_dim]);
-                    float cos_val = state.cos_curr[i];
-                    float sin_val = state.sin_curr[i];
-
-                    float n1 = x_first * cos_val - x_second * sin_val;
-                    float n2 = x_first * sin_val + x_second * cos_val;
-
-                    head_ptr[i] = simd::fp32_to_bf16(n1);
-                    head_ptr[i + half_dim] = simd::fp32_to_bf16(n2);
-                }
-#endif
+            const int half = head_dim / 2;
+            for (int i = 0; i < half; ++i)
+            {
+                const float x = simd::bf16_to_fp32(head[i]), y = simd::bf16_to_fp32(head[i + half]);
+                head[i] = simd::fp32_to_bf16(x * cosine[i] - y * sine[i]);
+                head[i + half] = simd::fp32_to_bf16(x * sine[i] + y * cosine[i]);
             }
+#endif
         };
-
-        apply_to_heads(q, q_heads);
-        if (k)
-            apply_to_heads(k, k_heads);
+        apply_rope_cached_heads(q, k, q_heads, k_heads, head_dim, state, rotate);
     }
 
     static void apply_rope_to_tensor_bf16_direct(
@@ -1379,7 +1488,9 @@ namespace llaminar2::primitives
                               const float *cos_values,
                               const float *sin_values)
         {
-#if defined(__AVX512F__)
+#if LLAMINAR_COMPILED_WITH_NEON
+            apply_rope_to_head_cached_neon<neon_rope::Storage::BFloat16>(head, cos_values, sin_values, head_dim);
+#elif defined(__AVX512F__)
             apply_rope_to_head_cached_bf16_avx512(
                 head, cos_values, sin_values, head_dim);
 #elif defined(__AVX2__)
@@ -1747,7 +1858,9 @@ namespace llaminar2::primitives
     {
         int processed = 0;
 
-#if defined(__AVX512F__)
+#if LLAMINAR_COMPILED_WITH_NEON
+        processed = apply_rope_to_head_neon<neon_rope::Storage::Half>(head_ptr, position, inv_freq, head_dim);
+#elif defined(__AVX512F__)
         processed = apply_rope_to_head_fp16_avx512(head_ptr, position, inv_freq, head_dim);
 #elif defined(__AVX2__)
         processed = apply_rope_to_head_fp16_avx2(head_ptr, position, inv_freq, head_dim);
@@ -1765,13 +1878,15 @@ namespace llaminar2::primitives
     {
         const auto rotate = [head_dim](uint16_t *head_ptr, const float *cos_ptr, const float *sin_ptr)
         {
-            const int half_dim = head_dim / 2;
-#if defined(__AVX512F__)
+#if LLAMINAR_COMPILED_WITH_NEON
+            apply_rope_to_head_cached_neon<neon_rope::Storage::Half>(head_ptr, cos_ptr, sin_ptr, head_dim);
+#elif defined(__AVX512F__)
             apply_rope_to_head_cached_fp16_avx512(head_ptr, cos_ptr, sin_ptr, head_dim);
 #elif defined(__AVX2__)
             apply_rope_to_head_cached_fp16_avx2(head_ptr, cos_ptr, sin_ptr, head_dim);
 #else
-            // Scalar builds preserve the same fixed rotation arithmetic.
+            const int half_dim = head_dim / 2;
+            // Explicit scalar diagnostics preserve their fixed rotation arithmetic.
             for (int i = 0; i < half_dim; ++i)
             {
                 float x_first = simd::fp16_to_fp32(head_ptr[i]);
@@ -1790,43 +1905,38 @@ namespace llaminar2::primitives
         apply_rope_pair_positions(q, k, seq_len, q_heads, k_heads, head_dim, n_past, inv_freq, rotate);
     }
 
+    /** @brief Rotate cached Half heads once through the shared participant workshare.
+     * @param q Original query bank.
+     * @param k Optional original key bank.
+     * @param q_heads Query head count.
+     * @param k_heads Key head count when k is present.
+     * @param head_dim Original even head width.
+     * @param state Participant-thread-owned immutable angle memoization.
+     */
     static void apply_rope_fp16_from_cache(
         uint16_t *q, uint16_t *k,
         int q_heads, int k_heads, int head_dim,
         const RoPEPersistentState &state)
     {
-        const int half_dim = head_dim / 2;
-
-        auto apply_to_heads = [&](uint16_t *tensor, int num_heads)
+        const auto rotate = [head_dim](uint16_t *head, const float *cosine, const float *sine)
         {
-            for (int h = 0; h < num_heads; ++h)
-            {
-                uint16_t *head_ptr = tensor + h * head_dim;
-#if defined(__AVX512F__)
-                apply_rope_to_head_cached_fp16_avx512(head_ptr, state.cos_curr.data(), state.sin_curr.data(), head_dim);
+#if LLAMINAR_COMPILED_WITH_NEON
+            apply_rope_to_head_cached_neon<neon_rope::Storage::Half>(head, cosine, sine, head_dim);
+#elif defined(__AVX512F__)
+            apply_rope_to_head_cached_fp16_avx512(head, cosine, sine, head_dim);
 #elif defined(__AVX2__)
-                apply_rope_to_head_cached_fp16_avx2(head_ptr, state.cos_curr.data(), state.sin_curr.data(), head_dim);
+            apply_rope_to_head_cached_fp16_avx2(head, cosine, sine, head_dim);
 #else
-                for (int i = 0; i < half_dim; ++i)
-                {
-                    float x_first = simd::fp16_to_fp32(head_ptr[i]);
-                    float x_second = simd::fp16_to_fp32(head_ptr[i + half_dim]);
-                    float cos_val = state.cos_curr[i];
-                    float sin_val = state.sin_curr[i];
-
-                    float n1 = x_first * cos_val - x_second * sin_val;
-                    float n2 = x_first * sin_val + x_second * cos_val;
-
-                    head_ptr[i] = simd::fp32_to_fp16(n1);
-                    head_ptr[i + half_dim] = simd::fp32_to_fp16(n2);
-                }
-#endif
+            const int half = head_dim / 2;
+            for (int i = 0; i < half; ++i)
+            {
+                const float x = simd::fp16_to_fp32(head[i]), y = simd::fp16_to_fp32(head[i + half]);
+                head[i] = simd::fp32_to_fp16(x * cosine[i] - y * sine[i]);
+                head[i + half] = simd::fp32_to_fp16(x * sine[i] + y * cosine[i]);
             }
+#endif
         };
-
-        apply_to_heads(q, q_heads);
-        if (k)
-            apply_to_heads(k, k_heads);
+        apply_rope_cached_heads(q, k, q_heads, k_heads, head_dim, state, rotate);
     }
 
     static void apply_rope_to_tensor_fp16_direct(
@@ -1922,7 +2032,9 @@ namespace llaminar2::primitives
                               const float *cos_values,
                               const float *sin_values)
         {
-#if defined(__AVX512F__)
+#if LLAMINAR_COMPILED_WITH_NEON
+            apply_rope_to_head_cached_neon<neon_rope::Storage::Half>(head, cos_values, sin_values, head_dim);
+#elif defined(__AVX512F__)
             apply_rope_to_head_cached_fp16_avx512(
                 head, cos_values, sin_values, head_dim);
 #elif defined(__AVX2__)
@@ -1993,10 +2105,7 @@ namespace llaminar2::primitives
     // ============================================================================
 
     bool apply_rope_int32(
-        int32_t *q_int32, int32_t *k_int32,
-        int seq_len, int head_dim,
-        int q_heads, int k_heads,
-        int n_past, float freq_base)
+        int32_t *, int32_t *, int, int, int, int, int, float)
     {
         // RoPE is an activation operation and cannot be applied to quantized INT32 accumulators
         return false;
@@ -2019,7 +2128,9 @@ namespace llaminar2::primitives
         {
             float angle = position * inv_freq[i];
             float cos_val, sin_val;
-#if defined(__GNUC__)
+#if defined(__APPLE__)
+            __sincosf(angle, &sin_val, &cos_val);
+#elif defined(__GNUC__)
             sincosf(angle, &sin_val, &cos_val);
 #else
             cos_val = std::cos(angle);
@@ -2569,7 +2680,9 @@ namespace llaminar2::primitives
         const int16_t *sin_q15)
     {
         // Dispatch to best available SIMD implementation
-#if defined(__AVX512F__)
+#if LLAMINAR_COMPILED_WITH_NEON
+        neon_rope::rotate_quantized(head_blocks, blocks_per_head, cos_q15, sin_q15);
+#elif defined(__AVX512F__)
         apply_rope_q8_1_integer_head_avx512(head_blocks, blocks_per_head, cos_q15, sin_q15);
 #elif defined(__AVX2__)
         apply_rope_q8_1_integer_head_avx2(head_blocks, blocks_per_head, cos_q15, sin_q15);
@@ -2831,148 +2944,138 @@ namespace llaminar2::primitives
     // Q8_1 → FP32 RoPE (Hybrid Mode - No Requantization)
     // =========================================================================
 
-    void apply_rope_q8_1_to_fp32(
-        const Q8_1Block *Q_in,
-        const Q8_1Block *K_in,
-        float *Q_out,
-        float *K_out,
-        const int *position_ids,
-        int seq_len,
-        int n_heads,
-        int n_kv_heads,
-        int head_dim,
-        float rope_theta)
+    /** @brief Reject overlapping retained conversion authorities without pointer-end overflow.
+     * @param a First byte root; @param a_bytes Complete first extent.
+     * @param b Second byte root; @param b_bytes Complete second extent.
+     */
+    static void require_rope_disjoint(const void *a, std::size_t a_bytes, const void *b, std::size_t b_bytes)
     {
-        if (!Q_in || !Q_out)
+        const auto x = reinterpret_cast<std::uintptr_t>(a), y = reinterpret_cast<std::uintptr_t>(b);
+        if (a_bytes && b_bytes && (x <= y ? y - x < a_bytes : x - y < b_bytes))
+            throw std::invalid_argument("CPU RoPE conversion output aliases a retained input/publication authority");
+    }
+
+    /** @brief Price a physical byte extent only to validate integer geometry, not memory admission.
+     * @param rows Nonnegative original physical M.
+     * @param heads Nonnegative physical heads per row.
+     * @param words Positive physical storage words per head.
+     * @param bytes Positive bytes per physical storage word.
+     * @return Complete nonoverflowing bank extent.
+     */
+    static std::size_t rope_bank_bytes(int rows, int heads, int words, std::size_t bytes)
+    {
+        if (rows < 0 || heads < 0 || words <= 0 || !bytes)
+            throw std::invalid_argument("CPU RoPE conversion has invalid physical geometry");
+        if (!rows || !heads) return 0;
+        if (std::size_t(rows) > std::numeric_limits<std::size_t>::max() / heads / words / bytes)
+            throw std::invalid_argument("CPU RoPE conversion physical extent overflows");
+        return std::size_t(rows) * heads * words * bytes;
+    }
+
+    /** @brief Stream one original Q8 head into its FP32 output without a head-sized mirror.
+     * @param input Complete original readable Q8 head.
+     * @param output Disjoint original FP32 head.
+     * @param dim Complete Q8-block-aligned logical width.
+     * @param cosine Borrowed original FP32 cosine plane.
+     * @param sine Matching original sine plane.
+     */
+    static void apply_rope_q8_head_to_fp32(const Q8_1Block *input, float *output, int dim,
+        const float *cosine, const float *sine)
+    {
+#if LLAMINAR_COMPILED_WITH_NEON
+        neon_rope::q8_to_fp32_head(input, output, dim, cosine, sine);
+#else
+        // This existing x86 scalar program is streamed instead of using its
+        // formerly fixed 256-value stack mirror. No ISA mode is substituted.
+        const int half = dim / 2;
+        for (int first = 0; first < half;)
         {
-            LOG_ERROR("apply_rope_q8_1_to_fp32: Q_in and Q_out must not be null");
-            return;
-        }
-
-        if (head_dim % 32 != 0)
-        {
-            LOG_ERROR("apply_rope_q8_1_to_fp32: head_dim (" << head_dim << ") must be divisible by 32");
-            return;
-        }
-
-        const int blocks_per_head = head_dim / 32;
-        const int half_dim = head_dim / 2;
-        const int q_stride_blocks = n_heads * blocks_per_head;
-        const int k_stride_blocks = n_kv_heads * blocks_per_head;
-        const int q_stride_floats = n_heads * head_dim;
-        const int k_stride_floats = n_kv_heads * head_dim;
-
-        // Pre-compute FP32 sin/cos table for all positions
-        // Shape: [seq_len, half_dim]
-        std::vector<float> cos_table(seq_len * half_dim);
-        std::vector<float> sin_table(seq_len * half_dim);
-
-        // Compute frequency bases: inv_freq[i] = 1.0 / (theta^(2i/head_dim))
-        std::vector<float> inv_freq(half_dim);
-        for (int i = 0; i < half_dim; ++i)
-        {
-            float exponent = static_cast<float>(2 * i) / static_cast<float>(head_dim);
-            inv_freq[i] = 1.0f / std::pow(rope_theta, exponent);
-        }
-
-        // Compute sin/cos for each position
-        for (int t = 0; t < seq_len; ++t)
-        {
-            int pos = position_ids ? position_ids[t] : t;
-            if (pos < 0)
-                pos = 0; // Handle padding
-            float *c_ptr = cos_table.data() + t * half_dim;
-            float *s_ptr = sin_table.data() + t * half_dim;
-            for (int i = 0; i < half_dim; ++i)
+            const int second = first + half;
+            const auto &a = input[first / 32], &b = input[second / 32];
+            const float a_scale = fp16_to_fp32_rope(a.d), b_scale = fp16_to_fp32_rope(b.d);
+            const int count = std::min({32 - first % 32, 32 - second % 32, half - first});
+            for (int i = 0; i < count; ++i)
             {
-                float angle = static_cast<float>(pos) * inv_freq[i];
-                c_ptr[i] = std::cos(angle);
-                s_ptr[i] = std::sin(angle);
+                const float x = float(a.qs[first % 32 + i]) * a_scale;
+                const float y = float(b.qs[second % 32 + i]) * b_scale;
+                output[first + i] = x * cosine[first + i] - y * sine[first + i];
+                output[second + i] = x * sine[first + i] + y * cosine[first + i];
+            }
+            first += count;
+        }
+#endif
+    }
+
+    /** @brief Convert original Q/K rows through the existing reciprocal-power coefficient program.
+     * @param Q_in Original query Q8 bank; @param K_in Optional original key Q8 bank.
+     * @param Q_out Original disjoint query FP32 destination; @param K_out Matching optional key destination.
+     * @param position_ids Original position words; negative padding retains the established position-zero program.
+     * @param seq_len Nonnegative original physical row count.
+     * @param n_heads Query heads per row; @param n_kv_heads Key heads per row.
+     * @param head_dim Positive Q8-block-aligned logical head width.
+     * @param rope_theta Positive finite coefficient base.
+     */
+    void apply_rope_q8_1_to_fp32(
+        const Q8_1Block *Q_in, const Q8_1Block *K_in, float *Q_out, float *K_out,
+        const int *position_ids, int seq_len, int n_heads, int n_kv_heads, int head_dim, float rope_theta)
+    {
+        if (seq_len < 0 || n_heads < 0 || n_kv_heads < 0 || head_dim <= 0 || head_dim % 32 ||
+            !std::isfinite(rope_theta) || rope_theta <= 0 || (!K_in != !K_out))
+            throw std::invalid_argument("CPU Q8/FP32 RoPE requires complete row/head/key geometry");
+        const int blocks = head_dim / 32, half = head_dim / 2;
+        const auto q_in_bytes = rope_bank_bytes(seq_len, n_heads, blocks, sizeof(Q8_1Block));
+        const auto q_out_bytes = rope_bank_bytes(seq_len, n_heads, head_dim, sizeof(float));
+        const auto k_in_bytes = K_in ? rope_bank_bytes(seq_len, n_kv_heads, blocks, sizeof(Q8_1Block)) : 0;
+        const auto k_out_bytes = K_out ? rope_bank_bytes(seq_len, n_kv_heads, head_dim, sizeof(float)) : 0;
+        const auto coefficient_bytes = rope_bank_bytes(seq_len, 1, half, sizeof(float));
+        if ((q_in_bytes && (!Q_in || !Q_out)) || (k_in_bytes && (!K_in || !K_out)))
+            throw std::invalid_argument("CPU Q8/FP32 RoPE requires every live original bank");
+        for (const auto write : {std::pair<const void *, std::size_t>{Q_out, q_out_bytes}, {K_out, k_out_bytes}})
+        {
+            require_rope_disjoint(write.first, write.second, Q_in, q_in_bytes);
+            require_rope_disjoint(write.first, write.second, K_in, k_in_bytes);
+            require_rope_disjoint(write.first, write.second, position_ids, position_ids ? std::size_t(seq_len) * sizeof(int) : 0);
+        }
+        require_rope_disjoint(Q_out, q_out_bytes, K_out, k_out_bytes);
+        if (!seq_len || (!n_heads && (!K_in || !n_kv_heads)))
+        {
+            (void)llaminar::v2::beginWorkshare(false);
+            return;
+        }
+        const auto q_block_stride = std::size_t(n_heads) * blocks, k_block_stride = std::size_t(n_kv_heads) * blocks;
+        const auto q_float_stride = std::size_t(n_heads) * head_dim, k_float_stride = std::size_t(n_kv_heads) * head_dim;
+        std::vector<float> cosine(coefficient_bytes / sizeof(float)), sine(cosine.size()), inv_freq(half);
+        for (int i = 0; i < half; ++i)
+            inv_freq[i] = 1.0f / std::pow(rope_theta, static_cast<float>(2 * i) / static_cast<float>(head_dim));
+        for (int row = 0; row < seq_len; ++row)
+        {
+            const int position = position_ids ? std::max(position_ids[row], 0) : row;
+            for (int i = 0; i < half; ++i)
+            {
+                const float angle = static_cast<float>(position) * inv_freq[i];
+                cosine[std::size_t(row) * half + i] = std::cos(angle);
+                sine[std::size_t(row) * half + i] = std::sin(angle);
             }
         }
-
-        // Process Q tensor: dequant + rotate (no requant)
-        auto do_q_work = [&]()
+        auto work = [&]()
         {
-#pragma omp for collapse(2)
-            for (int t = 0; t < seq_len; ++t)
+#pragma omp for collapse(2) schedule(static)
+            for (int row = 0; row < seq_len; ++row)
+                for (int head = 0; head < n_heads; ++head)
+                    apply_rope_q8_head_to_fp32(Q_in + std::size_t(row) * q_block_stride + std::size_t(head) * blocks,
+                        Q_out + std::size_t(row) * q_float_stride + std::size_t(head) * head_dim, head_dim,
+                        cosine.data() + std::size_t(row) * half, sine.data() + std::size_t(row) * half);
+            if (K_in)
             {
-                for (int h = 0; h < n_heads; ++h)
-                {
-                    const Q8_1Block *head_in = Q_in + t * q_stride_blocks + h * blocks_per_head;
-                    float *head_out = Q_out + t * q_stride_floats + h * head_dim;
-                    const float *c_ptr = cos_table.data() + t * half_dim;
-                    const float *s_ptr = sin_table.data() + t * half_dim;
-
-                    // Dequantize all blocks for this head
-                    alignas(64) float dequant[256]; // Max head_dim = 256
-                    for (int b = 0; b < blocks_per_head; ++b)
-                    {
-                        const Q8_1Block &block = head_in[b];
-                        float scale = fp16_to_fp32_rope(block.d);
-                        for (int i = 0; i < 32; ++i)
-                        {
-                            dequant[b * 32 + i] = static_cast<float>(block.qs[i]) * scale;
-                        }
-                    }
-
-                    // Apply rotation and write to FP32 output
-                    for (int i = 0; i < half_dim; ++i)
-                    {
-                        float x = dequant[i];
-                        float y = dequant[i + half_dim];
-                        float c = c_ptr[i];
-                        float s = s_ptr[i];
-                        head_out[i] = x * c - y * s;
-                        head_out[i + half_dim] = x * s + y * c;
-                    }
-                }
+#pragma omp for collapse(2) schedule(static)
+                for (int row = 0; row < seq_len; ++row)
+                    for (int head = 0; head < n_kv_heads; ++head)
+                        apply_rope_q8_head_to_fp32(K_in + std::size_t(row) * k_block_stride + std::size_t(head) * blocks,
+                            K_out + std::size_t(row) * k_float_stride + std::size_t(head) * head_dim, head_dim,
+                            cosine.data() + std::size_t(row) * half, sine.data() + std::size_t(row) * half);
             }
         };
-        OMP_WORKSHARE_REGION(do_q_work);
-
-        // Process K tensor if provided
-        if (K_in && K_out)
-        {
-            auto do_k_work = [&]()
-            {
-#pragma omp for collapse(2)
-                for (int t = 0; t < seq_len; ++t)
-                {
-                    for (int h = 0; h < n_kv_heads; ++h)
-                    {
-                        const Q8_1Block *head_in = K_in + t * k_stride_blocks + h * blocks_per_head;
-                        float *head_out = K_out + t * k_stride_floats + h * head_dim;
-                        const float *c_ptr = cos_table.data() + t * half_dim;
-                        const float *s_ptr = sin_table.data() + t * half_dim;
-
-                        // Dequantize all blocks for this head
-                        alignas(64) float dequant[256];
-                        for (int b = 0; b < blocks_per_head; ++b)
-                        {
-                            const Q8_1Block &block = head_in[b];
-                            float scale = fp16_to_fp32_rope(block.d);
-                            for (int i = 0; i < 32; ++i)
-                            {
-                                dequant[b * 32 + i] = static_cast<float>(block.qs[i]) * scale;
-                            }
-                        }
-
-                        // Apply rotation and write to FP32 output
-                        for (int i = 0; i < half_dim; ++i)
-                        {
-                            float x = dequant[i];
-                            float y = dequant[i + half_dim];
-                            float c = c_ptr[i];
-                            float s = s_ptr[i];
-                            head_out[i] = x * c - y * s;
-                            head_out[i + half_dim] = x * s + y * c;
-                        }
-                    }
-                }
-            };
-            OMP_WORKSHARE_REGION(do_k_work);
-        }
+        OMP_WORKSHARE_REGION(work);
     }
 
     // ============================================================================
@@ -3449,7 +3552,9 @@ namespace llaminar2::primitives
         const int16_t *sin_q15)
     {
         // Dispatch to best available SIMD implementation
-#if defined(__AVX512F__)
+#if LLAMINAR_COMPILED_WITH_NEON
+        neon_rope::rotate_quantized(head_blocks, blocks_per_head, cos_q15, sin_q15);
+#elif defined(__AVX512F__)
         apply_rope_q16_1_integer_head_avx512(head_blocks, blocks_per_head, cos_q15, sin_q15);
 #elif defined(__AVX2__)
         apply_rope_q16_1_integer_head_avx2(head_blocks, blocks_per_head, cos_q15, sin_q15);
@@ -4015,9 +4120,12 @@ namespace llaminar2::primitives
             const int16_t *sin_q15,
             float common_scale)
         {
-            // Correctness-first: use the scalar implementation with int64 intermediates.
-            // The AVX2/AVX512 variants use int32 products and can overflow for typical ranges.
+#if LLAMINAR_COMPILED_WITH_NEON
+            neon_rope::q8_pair_to_q16(blockA, blockB, outA, outB, cos_q15, sin_q15, common_scale);
+#else
+            // Existing x86 correctness path, pending a widened native equivalent.
             rotate_q8_1_block_pair_to_q16_1_scalar(blockA, blockB, outA, outB, cos_q15, sin_q15, common_scale);
+#endif
         }
 
         // Process one head: compute common scale, then rotate all block pairs
@@ -4028,6 +4136,9 @@ namespace llaminar2::primitives
             const int16_t *cos_q15, // [half_dim] = [blocks_per_head/2 * 32]
             const int16_t *sin_q15)
         {
+#if LLAMINAR_COMPILED_WITH_NEON
+            return neon_rope::q8_legacy_head(head_in, head_out, blocks_per_head, cos_q15, sin_q15);
+#else
             const int half_blocks = blocks_per_head / 2;
 
             // Step 1: Compute common scale (max|dequant| across all blocks)
@@ -4055,6 +4166,7 @@ namespace llaminar2::primitives
             }
 
             return common_scale;
+#endif
         }
 
     } // namespace detail
@@ -4820,7 +4932,9 @@ namespace llaminar2::primitives
         const int16_t *cos_q15,
         const int16_t *sin_q15)
     {
-#if defined(__AVX512F__)
+#if LLAMINAR_COMPILED_WITH_NEON
+        neon_rope::rotate_quantized(head_blocks, num_blocks, cos_q15, sin_q15);
+#elif defined(__AVX512F__)
         apply_rope_q16_integer_head_avx512<BlockType>(head_blocks, num_blocks, cos_q15, sin_q15);
 #elif defined(__AVX2__)
         apply_rope_q16_integer_head_avx2<BlockType>(head_blocks, num_blocks, cos_q15, sin_q15);
@@ -4849,7 +4963,7 @@ namespace llaminar2::primitives
         int n_kv_heads,
         int head_dim,
         float rope_theta,
-        RoPEPersistentState *persistent_state,
+        RoPEPersistentState *,
         int pos_offset)
     {
         constexpr int BLOCK_SIZE = static_cast<int>(BlockType::BLOCK_SIZE);
@@ -5516,7 +5630,9 @@ namespace llaminar2::primitives
         const int16_t *cos_q15,
         const int16_t *sin_q15)
     {
-#if defined(__AVX512F__)
+#if LLAMINAR_COMPILED_WITH_NEON
+        return neon_rope::q8_to_q16(q8_in, q16_out, head_dim, cos_q15, sin_q15);
+#elif defined(__AVX512F__)
         return apply_rope_q8_1_to_q16_head_avx512<OutBlockType>(q8_in, q16_out, head_dim, cos_q15, sin_q15);
 #elif defined(__AVX2__)
         return apply_rope_q8_1_to_q16_head_avx2<OutBlockType>(q8_in, q16_out, head_dim, cos_q15, sin_q15);
@@ -5729,6 +5845,9 @@ namespace llaminar2::primitives
         const int16_t *sin_q15,
         float kv_cache_scale)
     {
+#if LLAMINAR_COMPILED_WITH_NEON
+        neon_rope::q8_to_q16_fixed(q8_in, q16_out, head_dim, cos_q15, sin_q15, kv_cache_scale);
+#else
         constexpr int Q8_BLOCK_SIZE = 32;
         constexpr int OUT_BLOCK_SIZE = static_cast<int>(OutBlockType::BLOCK_SIZE);
         const int q8_blocks_per_head = head_dim / Q8_BLOCK_SIZE;
@@ -5819,6 +5938,7 @@ namespace llaminar2::primitives
             }
             out.sum_qs = sum_qs;
         }
+#endif
     }
 
     // Explicit instantiations for fixed-scale
@@ -6389,8 +6509,10 @@ namespace llaminar2::primitives
         const int16_t *sin_q15,
         float kv_cache_scale)
     {
-        // AVX2/AVX512 versions only implemented for Q16_1Block (32-element)
-        // Larger block sizes use scalar fallback
+#if LLAMINAR_COMPILED_WITH_NEON
+        neon_rope::q16_fixed(q16_in, q16_out, head_dim, cos_q15, sin_q15, kv_cache_scale);
+#else
+        // The existing x86 implementations remain unchanged in this branch.
         if constexpr (std::is_same_v<BlockType, Q16_1Block>)
         {
 #if defined(__AVX512F__)
@@ -6410,6 +6532,7 @@ namespace llaminar2::primitives
             apply_rope_q16_to_q16_head_fixed_scale_scalar<BlockType>(
                 q16_in, q16_out, head_dim, cos_q15, sin_q15, kv_cache_scale);
         }
+#endif
     }
 
     // Explicit instantiations for Q16→Q16 fixed-scale dispatcher
@@ -7143,7 +7266,9 @@ namespace llaminar2::primitives
         const int16_t *sin_q15,
         float *out_unified_scale)
     {
-#if defined(__AVX512F__)
+#if LLAMINAR_COMPILED_WITH_NEON
+        neon_rope::q16_dynamic(q16_in, q16_out, head_dim, cos_q15, sin_q15, out_unified_scale);
+#elif defined(__AVX512F__)
         apply_rope_q16_to_q16_head_dynamic_scale_avx512_impl<BlockType>(
             q16_in, q16_out, head_dim, cos_q15, sin_q15, out_unified_scale);
 #elif defined(__AVX2__)

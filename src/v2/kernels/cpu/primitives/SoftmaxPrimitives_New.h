@@ -6,15 +6,20 @@
  * V2 Softmax implementation with:
  * - Native precision support (FP32, BF16, FP16)
  * - Q8_1 integer-aware softmax (minimizes FP conversions)
- * - Separated scalar/AVX2/AVX512 variants for testing
- * - Causal masking support
- * - Numerical stability (max subtraction)
+ * - Admitted native ARM/x86 row programs and explicit diagnostic variants
+ * - Original-coordinate causal prefixes and checked whole-bank geometry
+ * - Stable maximum subtraction, fixed native FP64 summaries and bounded publication
+ *
+ * Rows are noncollective synchronous borrows. Row-major APIs own a completion
+ * edge, including empty retained teams, without splitting an existing team.
  */
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
 #include "../../../tensors/BlockStructures.h"
+#include "../../../utils/OpenMPUtils.h"
+#include "CPUSoftmaxOperands.h"
 
 namespace llaminar2::primitives
 {
@@ -297,6 +302,27 @@ namespace llaminar2::primitives
     // Row-Major Batch Softmax (Multi-row)
     // ============================================================================
 
+    namespace softmax_detail
+    {
+        /** @brief Cooperate on original rows without nested-team whole-bank replay.
+         * @tparam Format Original physical storage; @tparam Operation Original-row kernel callback.
+         * @param bank Checked whole-bank borrow; @param parallel Standalone team-creation intent.
+         * @param operation Noncollective operation on one checked original row.
+         * @details Empty retained teams rendezvous before release. A false standalone
+         * hint never partitions an already-active team into private one-worker banks.
+         */
+        template<Storage Format,class Operation>
+        inline void executeBatch(const Batch<Format>&bank,bool parallel,Operation&&operation)
+        {
+            if(!::llaminar::v2::beginWorkshare(!bank.empty()))return;
+            auto work=[&]{
+#pragma omp for schedule(static)
+                for(int row=0;row<bank.rows();++row)operation(bank.row(row));
+            };
+            OMP_WORKSHARE_REGION_IF(work,omp_in_parallel()||parallel);
+        }
+    }
+
     /**
      * @brief Apply softmax to multiple FP32 rows (row-major layout)
      *
@@ -315,11 +341,10 @@ namespace llaminar2::primitives
         float scale = 1.0f,
         bool parallel = true)
     {
-#pragma omp parallel for schedule(static) if (parallel)
-        for (int r = 0; r < rows; ++r)
-        {
-            softmax_row_fp32(scores + r * cols, cols, causal, scale, r);
-        }
+        const auto bank=softmax_detail::Batch<softmax_detail::Storage::FP32>::bind(scores,rows,cols,causal,scale);
+        softmax_detail::executeBatch(bank,parallel,[](const auto&row){
+            softmax_row_fp32(row.data(),row.units(),row.causal(),row.scale(),row.rowIndex());
+        });
     }
 
     /**
@@ -333,11 +358,10 @@ namespace llaminar2::primitives
         float scale = 1.0f,
         bool parallel = true)
     {
-#pragma omp parallel for schedule(static) if (parallel)
-        for (int r = 0; r < rows; ++r)
-        {
-            softmax_row_bf16(scores + r * cols, cols, causal, scale, r);
-        }
+        const auto bank=softmax_detail::Batch<softmax_detail::Storage::BFloat16>::bind(scores,rows,cols,causal,scale);
+        softmax_detail::executeBatch(bank,parallel,[](const auto&row){
+            softmax_row_bf16(row.data(),row.units(),row.causal(),row.scale(),row.rowIndex());
+        });
     }
 
     /**
@@ -351,11 +375,10 @@ namespace llaminar2::primitives
         float scale = 1.0f,
         bool parallel = true)
     {
-#pragma omp parallel for schedule(static) if (parallel)
-        for (int r = 0; r < rows; ++r)
-        {
-            softmax_row_fp16(scores + r * cols, cols, causal, scale, r);
-        }
+        const auto bank=softmax_detail::Batch<softmax_detail::Storage::Half>::bind(scores,rows,cols,causal,scale);
+        softmax_detail::executeBatch(bank,parallel,[](const auto&row){
+            softmax_row_fp16(row.data(),row.units(),row.causal(),row.scale(),row.rowIndex());
+        });
     }
 
     /**
@@ -376,11 +399,10 @@ namespace llaminar2::primitives
         float scale = 1.0f,
         bool parallel = true)
     {
-#pragma omp parallel for schedule(static) if (parallel)
-        for (int r = 0; r < rows; ++r)
-        {
-            softmax_row_q8_1(scores + r * n_blocks_per_row, n_blocks_per_row, causal, scale, r);
-        }
+        const auto bank=softmax_detail::Batch<softmax_detail::Storage::Q8_1>::bind(scores,rows,n_blocks_per_row,causal,scale);
+        softmax_detail::executeBatch(bank,parallel,[](const auto&row){
+            softmax_row_q8_1(row.data(),row.units(),row.causal(),row.scale(),row.rowIndex());
+        });
     }
 
 } // namespace llaminar2::primitives

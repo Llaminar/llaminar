@@ -19,6 +19,8 @@
  * destinations allocate new bytes through their own admitted storage authority.
  * Explicit output-job ownership is invocation-local and independent of row
  * arithmetic; both stable-FFN phases are authenticated before payload mutation.
+ * Empty retained-team work keeps its completion edge before a caller can publish
+ * new request/frontier data, just as a nonempty workshare does.
  */
 
 #pragma once
@@ -367,7 +369,7 @@ namespace llaminar2::cpu::native_quantised
             const auto projection_work=projectionWorkFor(m);
             const auto *work=projection_work?&*projection_work:nullptr;
             if(work&&m!=1)throw std::invalid_argument("CPU ordinary query work requires explicit M1 arithmetic");
-            if(work&&!CPUProjectionRowGrid(m,work).hasAny())return true;
+            if(work&&!CPUProjectionRowGrid(m,work).beginWorkshare())return true;
             const float *A_data = A->data() + static_cast<size_t>(activation_row_offset) * k;
             float *C_data = C->mutable_data();
 
@@ -1069,7 +1071,11 @@ namespace llaminar2::cpu::native_quantised
             if (activation_rotation_)
                 (void)CPUInvocationWorkspace::require<float>(workspace, kCPUProjectionRotation,
                     static_cast<size_t>(m) * k);
-            if(live_rows==0||(work&&!CPUProjectionRowGrid(m,work).hasAny()))return true;
+            if(live_rows==0) {
+                (void)llaminar::v2::beginWorkshare(false);
+                return true;
+            }
+            if(work&&!CPUProjectionRowGrid(m,work).beginWorkshare())return true;
 
             const bool perf_enabled =
                 PerfStatsCollector::isDomainEnabled("kernel");
@@ -1825,6 +1831,11 @@ namespace llaminar2::cpu::native_quantised
         static void requireBatchedOutputJobOwnership(const BatchedPrequantizedProjectionDesc *descriptors,
             int count, FusedOutputJobOwnership ownership)
         {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+            // The native ARM schedule owns N directly; only Auto/Current exist.
+            (void)descriptors; (void)count;
+            requireNativeNEONFusedOutputJobOwnership(ownership);
+#else
             (void)fusedOutputJobOwnershipName(ownership);
             if (ownership == FusedOutputJobOwnership::Current || ownership == FusedOutputJobOwnership::Auto) return;
             alignas(FusedVerifierRowsDesc) std::array<std::byte,
@@ -1841,6 +1852,7 @@ namespace llaminar2::cpu::native_quantised
                 1, nativeQuantisedInvocationWorkerCount());
             detail::requireFusedOutputJobOwnership(ownership,
                 {fused, static_cast<size_t>(count)}, live_plan.projections(), bundle.partial_route);
+#endif
         }
 
         /**
@@ -1946,7 +1958,7 @@ namespace llaminar2::cpu::native_quantised
                 return input;
 
             const CPUProjectionRowGrid row_grid(m,work);
-            if(!row_grid.hasAny())return input;
+            if(!row_grid.beginWorkshare())return input;
             const size_t len = static_cast<size_t>(m) * k;
             auto rotated = CPUInvocationWorkspace::require<float>(workspace, kCPUProjectionRotation, len);
             auto rotate_row = [&](int row) {

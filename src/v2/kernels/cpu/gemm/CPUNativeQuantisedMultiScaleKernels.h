@@ -10,6 +10,9 @@
  * K blocks and publishes the same separately rounded contribution as CUDA/HIP.
  * The same primitive serves serial decode and grouped verification; no row
  * replay, temporary decoded matrix or inference-time allocation is used.
+ * AArch64's four-column native operations use the same decoder and rounded
+ * source-factor program as x86. Borrowed read views keep the owning storage
+ * dependency out of native leaves, and bounded stores support logical N tails.
  */
 #pragma once
 
@@ -17,13 +20,17 @@
 #include <algorithm>
 #include <bit>
 #include <cstring>
-#include <immintrin.h>
 #include <stdexcept>
 
-#include "CPUNativeQuantisedWeightPacker.h"
+#include "CPUNativeQuantisedDecode.h"
 #include "CPUNativeQuantisedFP16.h"
 #include "CPUNativeQuantisedActivationSums.h"
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include "CPUNativeNEONMultiScaleOps.h"
+#else
+#include <immintrin.h>
 #include "VNNIEmulation.h"
+#endif
 
 namespace llaminar2::cpu::native_quantised::multi_scale
 {
@@ -52,9 +59,10 @@ namespace llaminar2::cpu::native_quantised::multi_scale
 #define LLAMINAR_MULTISCALE_EXACT
 #endif
 
-    /** @brief ISA operations; vector arithmetic below is identical for both widths. */
+    /** @brief ISA operations; the decoded arithmetic is shared by all three widths. */
     template <int Lanes> struct SIMD;
 
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
     /** @brief Eight-column AVX2 implementation, including saturation-safe VNNI. */
     template <> struct SIMD<8>
     {
@@ -127,6 +135,16 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         static I words(const uint16_t *source)
         { return std::bit_cast<I>(_mm256_cvtepu16_epi32(_mm_loadu_si128(
             reinterpret_cast<const __m128i *>(source)))); }
+        /** @brief Reject reserved source coefficient bits across eight columns.
+         * @param metadata Zero-extended original source words.
+         * @param permitted_bits Source-owned coefficient bit positions.
+         * @return Whether all words obey the source metadata ABI.
+         */
+        static bool metadataFits(I metadata, uint32_t permitted_bits)
+        {
+            return _mm256_testz_si256(std::bit_cast<__m256i>(metadata),
+                _mm256_set1_epi32(static_cast<int>(~permitted_bits))) != 0;
+        }
         /** @return FP32 values from the low FP16 half of each packed word. */
         static F halfWords(I words)
         {
@@ -219,6 +237,16 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         static I words(const uint16_t *source)
         { return std::bit_cast<I>(_mm512_cvtepu16_epi32(_mm256_loadu_si256(
             reinterpret_cast<const __m256i *>(source)))); }
+        /** @brief Reject reserved source coefficient bits across sixteen columns.
+         * @param metadata Zero-extended original source words.
+         * @param permitted_bits Source-owned coefficient bit positions.
+         * @return Whether all words obey the source metadata ABI.
+         */
+        static bool metadataFits(I metadata, uint32_t permitted_bits)
+        {
+            return _mm512_test_epi32_mask(std::bit_cast<__m512i>(metadata),
+                _mm512_set1_epi32(static_cast<int>(~permitted_bits))) == 0;
+        }
         /** @return FP32 values from the low FP16 half of each packed word. */
         static F halfWords(I words)
         {
@@ -227,6 +255,8 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         }
     };
 #endif
+
+#endif // native x86 SIMD operations
 
     /** @brief Load a SIMD value without imposing aliasing or alignment on the caller. */
     template <typename V> inline V load(const void *source)
@@ -245,14 +275,17 @@ namespace llaminar2::cpu::native_quantised::multi_scale
      * @param column Local output column.
      * @return GPU-ordered FP32 block contribution, including required corrections.
      */
+    template <typename Packed>
     LLAMINAR_MULTISCALE_EXACT
-    inline float scalarReferenceBlock(const CPUNativeQuantisedPackedWeights &packed,
+    inline float scalarReferenceBlock(const Packed &packed,
                                      const Q8_1Block &a, int chunk, int kb, int column)
     {
 #if defined(__clang__)
 #pragma clang fp contract(off)
 #pragma clang fp reassociate(off)
 #endif
+        if (!packed.usesCompactMultiScale() || packed.payload_bytes <= 0 || packed.payload_bytes > 16)
+            throw std::invalid_argument("Multi-scale diagnostic requires its bounded compact source payload");
         uint8_t payload[16]{};
         int8_t values[32];
         for (int byte = 0; byte < packed.payload_bytes; ++byte)
@@ -292,16 +325,15 @@ namespace llaminar2::cpu::native_quantised::multi_scale
      * @brief Decode one linear two/three-bit four-K group for SIMD columns.
      * @tparam Codebook Q3_K (9) or Q2_K (10) execution format.
      * @tparam Group Four-value group in [0,7].
-     * @tparam Lanes Eight AVX2 or sixteen AVX-512 columns.
+     * @tparam Lanes Four AArch64, eight AVX2 or sixteen AVX-512 columns.
      * @param unit Native CPU unit's first payload byte.
      * @param column First SIMD column within the 64-column unit.
      * @return Signed native grids on AVX2; unsigned-biased grids for AVX-512 VNNI.
      */
-    template <int Codebook, int Group, int Lanes>
-    inline typename SIMD<Lanes>::I decodeLinear(const uint8_t *unit, int column)
+    template <int Codebook, int Group, int Lanes, typename Ops = SIMD<Lanes>>
+    inline typename Ops::I decodeLinear(const uint8_t *unit, int column)
     {
         static_assert(Codebook == 9 || Codebook == 10);
-        using Ops = SIMD<Lanes>;
         using I = typename Ops::I;
         const auto word = [&](int index) { return load<I>(unit + index * 256 + column * 4); };
         I values = (word(Group / 4) >> ((Group % 4) * 2)) & 0x03030303;
@@ -310,7 +342,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale
             // Four high bits become bit two of four separate byte lanes.
             const I high = (word(2) >> (Group * 4)) & 15;
             values |= ((high * 0x02040810) & 0x10101010) >> 2;
-            if constexpr (Lanes == 8)
+            if constexpr (Lanes != 16)
                 values = Ops::subtractBytes(values, I{} + 0x04040404);
         }
         return values;
@@ -328,12 +360,11 @@ namespace llaminar2::cpu::native_quantised::multi_scale
      * The decoded vector dies after reuse by all rows. It is never stored as a
      * temporary matrix; this bounds register pressure and preserves grouped reuse.
      */
-    template <int Codebook, int Half, int Lanes, size_t Rows>
+    template <int Codebook, int Half, int Lanes, size_t Rows, typename Ops = SIMD<Lanes>>
     inline void dotHalf(const uint8_t *unit, int column,
                         const std::array<const Q8_1Block *, Rows> &activation,
-                        int kb, typename SIMD<Lanes>::I (&dots)[Rows])
+                        int kb, typename Ops::I (&dots)[Rows])
     {
-        using Ops = SIMD<Lanes>;
         using I = typename Ops::I;
         if constexpr (Codebook == 13 || Codebook == 14 || Codebook == 17)
         {
@@ -384,7 +415,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale
         else
         {
             const auto group = [&]<int G>() {
-                const I weights = decodeLinear<Codebook, G, Lanes>(unit, column);
+                const I weights = decodeLinear<Codebook, G, Lanes, Ops>(unit, column);
 #pragma GCC unroll 4
                 for (size_t row = 0; row < Rows; ++row)
                 {
@@ -415,24 +446,34 @@ namespace llaminar2::cpu::native_quantised::multi_scale
      * @param accumulate Whether the output owns a preceding K partition.
      * @param partitions Exact number of ordered partitions; unused for Contiguous.
      * @param blocks_per_partition Exact K-block span; unused for Contiguous.
+     * @param columns Live output span in this chunk; padded x86 callers retain 64.
+     * @throws std::invalid_argument For invalid chunk, K, output or partition geometry.
      */
-    template <int Codebook, int Lanes, size_t Rows, Reduction Tree = Reduction::Contiguous>
-    LLAMINAR_MULTISCALE_EXACT inline void rows(const CPUNativeQuantisedPackedWeights &packed,
+    template <int Codebook, int Lanes, size_t Rows, Reduction Tree = Reduction::Contiguous,
+              typename Packed, typename Ops = SIMD<Lanes>>
+    LLAMINAR_MULTISCALE_EXACT inline void rows(const Packed &packed,
                                                const std::array<const Q8_1Block *, Rows> &activation,
                                                const std::array<float *, Rows> &output, int chunk, int begin,
                                                int end, bool accumulate, int partitions = 1,
-                                               int blocks_per_partition = 0)
+                                               int blocks_per_partition = 0, int columns = 64)
     {
 #if defined(__clang__)
 #pragma clang fp contract(off)
 #pragma clang fp reassociate(off)
 #endif
-        using Ops = SIMD<Lanes>;
         using I = typename Ops::I;
         using F = typename Ops::F;
         static_assert(Rows >= 1 && Rows <= 4);
-        constexpr int center = Lanes == 8 || Codebook == 10 ? 0 : Codebook == 9 ? 4 : 128;
-        for (int column = 0; column < 64; column += Lanes)
+        if (chunk < 0 || chunk >= packed.N_padded / 64 || begin < 0 || end < begin ||
+            end > packed.blocks_per_row || columns <= 0 || columns > 64)
+            throw std::invalid_argument("Multi-scale CPU tile is outside its admitted geometry");
+        if constexpr (Tree == Reduction::OrderedPartitions)
+            if (partitions <= 0 || blocks_per_partition <= 0 ||
+                static_cast<int64_t>(partitions) * blocks_per_partition < end - begin ||
+                static_cast<int64_t>(begin) + static_cast<int64_t>(partitions) * blocks_per_partition > INT32_MAX)
+                throw std::invalid_argument("Multi-scale CPU tile requires an exact bounded ordered K tree");
+        constexpr int center = Lanes != 16 || Codebook == 10 ? 0 : Codebook == 9 ? 4 : 128;
+        for (int column = 0; column < columns; column += Lanes)
         {
             F reduced[Rows]{};
             const int partition_count = Tree == Reduction::OrderedPartitions ? partitions : 1;
@@ -442,10 +483,15 @@ namespace llaminar2::cpu::native_quantised::multi_scale
 #pragma GCC unroll 4
                 for (size_t row = 0; row < Rows; ++row)
                 {
+                    acc[row] = F{};
                     if constexpr (Tree == Reduction::Contiguous)
-                        acc[row] = accumulate ? load<F>(output[row] + column) : F{};
-                    else
-                        acc[row] = F{};
+                        if (accumulate)
+                        {
+                            if (column + Lanes <= columns)
+                                acc[row] = load<F>(output[row] + column);
+                            else
+                                std::memcpy(&acc[row], output[row] + column, (columns - column) * sizeof(float));
+                        }
                 }
                 const int first =
                     Tree == Reduction::OrderedPartitions ? begin + partition * blocks_per_partition : begin;
@@ -457,8 +503,8 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                         packed.interleavedBase() + (static_cast<size_t>(chunk) * packed.blocks_per_row + kb) *
                                                        packed.interleaved_block_stride;
                     I low[Rows]{}, high[Rows]{};
-                    dotHalf<Codebook, 0, Lanes>(unit, column, activation, kb, low);
-                    dotHalf<Codebook, 1, Lanes>(unit, column, activation, kb, high);
+                    dotHalf<Codebook, 0, Lanes, Rows, Ops>(unit, column, activation, kb, low);
+                    dotHalf<Codebook, 1, Lanes, Rows, Ops>(unit, column, activation, kb, high);
                     F scale0 = Ops::half(packed.chunkScales(chunk, kb) + column);
                     F scale1;
                     if constexpr (Codebook == 13)
@@ -467,6 +513,8 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                         // Function contraction/reassociation is disabled above;
                         // each source multiply remains a separate FP32 edge.
                         const I metadata = Ops::words(packed.chunkMins(chunk, kb) + column);
+                        if (!Ops::metadataFits(metadata, 255u))
+                            throw std::invalid_argument("IQ2_S coefficient contains reserved bits");
                         const F low_coefficient = __builtin_convertvector(metadata & 15, F);
                         const F high_coefficient = __builtin_convertvector((metadata >> 4) & 15, F);
                         const F base = scale0;
@@ -545,7 +593,12 @@ namespace llaminar2::cpu::native_quantised::multi_scale
             }
 #pragma GCC unroll 4
             for (size_t row = 0; row < Rows; ++row)
-                std::memcpy(output[row] + column, &reduced[row], sizeof(F));
+            {
+                if (column + Lanes <= columns)
+                    std::memcpy(output[row] + column, &reduced[row], sizeof(F));
+                else
+                    std::memcpy(output[row] + column, &reduced[row], (columns - column) * sizeof(float));
+            }
         }
     }
 
@@ -558,18 +611,19 @@ namespace llaminar2::cpu::native_quantised::multi_scale
      * @param begin First K block.
      * @param end Exclusive K block bound.
      * @param accumulate Preserve prior K partition output.
+     * @param columns Live output columns; the padded x86 contract defaults to 64.
      */
-    template <int Lanes, size_t Rows>
-    inline void dispatch(const CPUNativeQuantisedPackedWeights &packed,
+    template <int Lanes, size_t Rows, typename Ops = SIMD<Lanes>, typename Packed>
+    inline void dispatch(const Packed &packed,
                          const std::array<const Q8_1Block *, Rows> &activation,
                          const std::array<float *, Rows> &output, int chunk, int begin, int end,
-                         bool accumulate)
+                         bool accumulate, int columns = 64)
     {
         if (!packed.usesCompactMultiScale())
             throw std::invalid_argument("Compact multi-scale kernel requires its native encoding");
         switch (packed.codebook_id)
         {
-#define LLAMINAR_MULTISCALE_CASE(C) case C: return rows<C, Lanes>(packed, activation, output, chunk, begin, end, accumulate)
+#define LLAMINAR_MULTISCALE_CASE(C) case C: return rows<C, Lanes, Rows, Reduction::Contiguous, Packed, Ops>(packed, activation, output, chunk, begin, end, accumulate, 1, 0, columns)
         LLAMINAR_MULTISCALE_CASE(9);
         LLAMINAR_MULTISCALE_CASE(10);
         LLAMINAR_MULTISCALE_CASE(13);
@@ -589,6 +643,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale
      * @param blocks Complete logical K extent in 32-value blocks.
      * @param partitions Exact arithmetic partition count from the shared contract.
      * @param blocks_per_partition Consecutive K blocks per partial.
+     * @param columns Live output columns; the padded x86 contract defaults to 64.
      * @throws std::invalid_argument For inconsistent encoding or partition geometry.
      *
      * This changes physical traversal only. Each partial starts at positive
@@ -596,12 +651,12 @@ namespace llaminar2::cpu::native_quantised::multi_scale
      * as the independent producer/reducer path. No quantized bytes, dispatch
      * choice, output precision, or scratch capacity are changed.
      */
-    template <int Lanes, size_t Rows>
-    inline void dispatchOrdered(const CPUNativeQuantisedPackedWeights &packed,
+    template <int Lanes, size_t Rows, typename Ops = SIMD<Lanes>, typename Packed>
+    inline void dispatchOrdered(const Packed &packed,
                                 const std::array<const Q8_1Block *, Rows> &activation,
                                 const std::array<float *, Rows> &output,
                                 int chunk, int blocks, int partitions,
-                                int blocks_per_partition)
+                                int blocks_per_partition, int columns = 64)
     {
         if (!packed.usesCompactMultiScale() || blocks <= 0 ||
             blocks != packed.blocks_per_row || partitions <= 0 ||
@@ -611,7 +666,7 @@ namespace llaminar2::cpu::native_quantised::multi_scale
             throw std::invalid_argument("Compact ordered dot requires its exact admitted K tree");
         switch (packed.codebook_id)
         {
-#define LLAMINAR_MULTISCALE_ORDERED_CASE(C) case C: return rows<C, Lanes, Rows, Reduction::OrderedPartitions>(packed, activation, output, chunk, 0, blocks, false, partitions, blocks_per_partition)
+#define LLAMINAR_MULTISCALE_ORDERED_CASE(C) case C: return rows<C, Lanes, Rows, Reduction::OrderedPartitions, Packed, Ops>(packed, activation, output, chunk, 0, blocks, false, partitions, blocks_per_partition, columns)
         LLAMINAR_MULTISCALE_ORDERED_CASE(9);
         LLAMINAR_MULTISCALE_ORDERED_CASE(10);
         LLAMINAR_MULTISCALE_ORDERED_CASE(13);

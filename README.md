@@ -1453,6 +1453,62 @@ scripts/docker/build-runtime-image.sh --cpu-isa AVX512 --tag llaminar:local
 Use `--cpu-isa AVX2` for an AVX2 image. A local image is not CI-certified merely
 because it built successfully.
 
+### AArch64 portability checks (not inference)
+
+The native ARM port is incomplete: `llaminar2` does **not** yet run on macOS.
+The compiler envelope selects NEON on AArch64 without x86 flags. Native vector,
+SwiGLU, RoPE and anchored AQ8 key primitives have focused numerical tests;
+grouped prepared projections cover the quantized source catalog. Complete
+factory/arena wiring, other attention/kernel families and the Linux-specific
+memory, topology and MPI lifecycle still need porting.
+Published images remain x86-64 only.
+
+To build the focused device-free checks on an Apple Silicon Mac with Xcode
+Command Line Tools, CMake, Ninja, Python 3, GoogleTest, OpenMP, MPI headers/libraries
+and optional ccache installed (Homebrew packages:
+`cmake ninja python googletest libomp open-mpi ccache`):
+
+```bash
+OMP_PREFIX="$(brew --prefix libomp)"
+cmake -S tests/v2/portability -B build_arm_portability -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_MAKE_PROGRAM:FILEPATH="$(command -v ninja)" \
+  '-DOpenMP_CXX_FLAGS:STRING=-Xpreprocessor -fopenmp' \
+  -DOpenMP_CXX_INCLUDE_DIR:PATH="${OMP_PREFIX}/include" \
+  -DOpenMP_CXX_LIB_NAMES:STRING=omp \
+  -DOpenMP_omp_LIBRARY:FILEPATH="${OMP_PREFIX}/lib/libomp.dylib"
+cmake --build build_arm_portability --parallel
+ctest --test-dir build_arm_portability --output-on-failure --parallel
+```
+
+This test-only project compiles production primitive/projection/attention-key
+leaves and shares their registrations with the normal Unit/preflight gates.
+The ownership-header regression uses the real MPI SDK without initializing MPI;
+it does not qualify the production session runtime's separate ABI requirements.
+It is not a server build or the complete production gate. `LLAMINAR_CPU_ISA=NEON` names a
+compiler envelope, not a complete inference capability. A separate build with
+`-DLLAMINAR_CPU_ISA=NEON_DOTPROD` exercises signed dot-product instructions on
+hardware that advertises them. Incompatible architecture/ISA selections fail;
+runtime diagnostic requests (`LLAMINAR_ISA_LEVEL=neon` or `neon-dotprod`) must
+also fit the compiled envelope and native capabilities. They never downgrade
+an unsupported request to scalar. The
+[native ARM kernel plan](docs/v2/projects/2026-11/ARM_CPU_INFERENCE_KERNEL_PLAN.md)
+tracks the full numerical, runtime, exact-overlay and `Perf__` qualification scope.
+
+For isolated AQ8 codec tuning, this build also exposes the canonical `Perf__`
+target. Run timing separately from CTest/profilers; it is not full inference or
+the final ARM performance gate:
+
+```bash
+cmake --build build_arm_portability --parallel --target v2_perf_cpu_attention_key_q8
+./build_arm_portability/v2_perf_cpu_attention_key_q8 \
+  --head-dim 128 --heads 128 --iterations 1000 --workers 1 \
+  --isa neon --operation encode
+```
+
+Use `decode` for reconstruction and 64/128/256 for the physical head width.
+Explicit ISA requests must match the compiled/native instruction family.
+
 ### Projection arithmetic diagnostics
 
 Qwen GDN MoE alpha/beta projections use FP16 weights and activations with FP32

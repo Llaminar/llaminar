@@ -58,15 +58,22 @@
 #include "../../../utils/PerfStatsCollector.h"
 #include "../primitives/ActivationTraits.h"
 #include "../CPUKernelBase.h"
+#include "../CPUWorkshareTiming.h"
 #include "../turboquant/TurboQuantRotation.h"
 #include "../turboquant/TurboQuantContext.h"
 #include "CPUFlashAttentionLaunchPolicy.h"
 #include "TQFusedAttentionPrimitives.h"
 #include "CPUAttentionKeyQ8.h"
 #include "CPUQ16AttentionMath.h"
+#include "../primitives/VectorPrimitives.h"
+#if LLAMINAR_COMPILED_WITH_NEON
+#include "NEONAttentionMath.h"
+#include "../primitives/NEONSoftmaxPrimitives.h"
+#endif
 #include "../../../tensors/AttentionKeyQ8Tensor.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -93,6 +100,14 @@ namespace llaminar2
 {
     namespace detail
     {
+        /** @brief Hint a checked original attention row into the native L1 cache.
+         * @param row Address inside the already admitted cache span.
+         * @details This is only a locality hint: it transfers no ownership and
+         * cannot replace cache publication or extend an original borrow's lease.
+         */
+        inline void prefetchCPUAttentionL1(const void *row) noexcept
+        { __builtin_prefetch(row, 0, 3); }
+
         /**
          * @brief Select one authenticated K/V tile from exact storage geometry.
          *
@@ -828,7 +843,7 @@ namespace llaminar2
             // and prefill. One implementation owns every M so all regimes use
             // identical canonical summaries and bounded wave workspace.
             // ---------------------------------------------------------------
-#if (defined(__AVX512F__) && defined(__AVX512VNNI__)) || defined(__AVX2__)
+#if (defined(__AVX512F__) && defined(__AVX512VNNI__)) || defined(__AVX2__) || LLAMINAR_COMPILED_WITH_NEON
             if (K->native_type() == TensorType::Q16_1 &&
                 V->native_type() == TensorType::Q16_1 &&
                 batch_size == 1)
@@ -1352,7 +1367,7 @@ namespace llaminar2
                 }
             }
 #endif
-#if (defined(__AVX512F__) && defined(__AVX512VNNI__)) || defined(__AVX2__)
+#if (defined(__AVX512F__) && defined(__AVX512VNNI__)) || defined(__AVX2__) || LLAMINAR_COMPILED_WITH_NEON
             else if (key_type == TensorType::Q16_1 &&
                      value_type == TensorType::Q16_1)
             {
@@ -1638,6 +1653,59 @@ namespace llaminar2
         // Dot-product helpers
         // -----------------------------------------------------------------
 
+#if LLAMINAR_COMPILED_WITH_NEON
+        /** @brief Bind original noncontiguous cache rows to one native shared-query register program.
+         * @tparam Format Original physical cache encoding; @tparam Rows Native row count.
+         * @param query Original FP32 query; @param keys Original cache row addresses.
+         * @param count Complete original head width.
+         * @return Native original-row dot results, with no repacked/decoded cache bank.
+         */
+        template<cpu::neon_attention::Storage Format,std::size_t Rows>
+        static auto native_cache_dot(const float*query,
+            const std::array<const cpu::neon_attention::Unit<Format>*,Rows>&keys,int count)
+        {
+            return cpu::neon_attention::dot<Format,Rows>(
+                cpu::neon_attention::originalRows<float,1>({query},count)[0],
+                cpu::neon_attention::originalRows<cpu::neon_attention::Unit<Format>,Rows>(keys,count));
+        }
+        /** @brief Stream original values through the increasing-row native FMA program.
+         * @tparam Format Original physical value encoding; @tparam Rows Original row count.
+         * @param output Original FP32 numerator; @param values Original disjoint cache row addresses.
+         * @param weights Original finite weights; @param count Complete original head width.
+         */
+        template<cpu::neon_attention::Storage Format,std::size_t Rows>
+        static void native_cache_accumulate(float*output,
+            const std::array<const cpu::neon_attention::Unit<Format>*,Rows>&values,
+            const std::array<float,Rows>&weights,int count)
+        {
+            if(count<0||(count&&!output))throw std::invalid_argument("CPU native attention numerator has invalid original geometry/storage");
+            cpu::neon_attention::accumulate<Format,Rows>({output,std::size_t(count)},
+                cpu::neon_attention::originalRows<cpu::neon_attention::Unit<Format>,Rows>(values,count),weights);
+        }
+#endif
+        /** @brief Retain the native pointwise exponential program in bounded tails and summary rescaling.
+         * @param argument Nonpositive original score/maximum difference.
+         * @return Native SIMD-program word, or the explicitly selected scalar diagnostic program.
+         * @details x86 retains its existing scalar-tail program; no native tail silently selects libm.
+         */
+        static float attention_exp(float argument)
+        {
+#if LLAMINAR_COMPILED_WITH_NEON
+            switch(activeISALevel())
+            {
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+                return vgetq_lane_f32(primitives::neon_softmax::exponential(vdupq_n_f32(argument)),0);
+            case ISALevel::Scalar:
+                return std::exp(argument);
+            default:
+                LLAMINAR_UNREACHABLE("CPU native attention exponential received a foreign ISA");
+            }
+#else
+            return std::exp(argument);
+#endif
+        }
+
         /**
          * @brief Scalar (no-SIMD) dot product of two FP32 vectors.
          *
@@ -1701,10 +1769,21 @@ namespace llaminar2
             case ISALevel::AVX512:
                 return dot_fp32_avx512(a, b, n);
 #endif
+#if defined(__AVX2__)
             case ISALevel::AVX2:
                 return dot_fp32_avx2(a, b, n);
-            default:
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                return native_cache_dot<cpu::neon_attention::Storage::FP32,1>(a,{b},n)[0];
+            }
+#endif
+            case ISALevel::Scalar:
                 return dot_fp32_scalar(a, b, n);
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention dot_fp32 received an uncompiled or foreign ISA");
             }
         }
 
@@ -1713,6 +1792,7 @@ namespace llaminar2
          *
          * Processes 8 floats per iteration using `_mm256_fmadd_ps`.
          */
+        #if defined(__AVX2__)
         static float dot_fp32_avx2(const float *a, const float *b, int n)
         {
             __m256 acc = _mm256_setzero_ps();
@@ -1736,6 +1816,7 @@ namespace llaminar2
                 sum += a[i] * b[i];
             return sum;
         }
+#endif
 
 #if defined(__AVX512F__)
         /**
@@ -2308,8 +2389,18 @@ namespace llaminar2
             case ISALevel::AVX2:
                 return dot_native16_avx2<Format>(query, key, head_dim);
 #endif
-            default:
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                constexpr auto storage=Format==Native16BitKVFormat::FP16?cpu::neon_attention::Storage::FP16:cpu::neon_attention::Storage::BF16;
+                return native_cache_dot<storage,1>(query,{key},head_dim)[0];
+            }
+#endif
+            case ISALevel::Scalar:
                 return dot_native16_scalar<Format>(query, key, head_dim);
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention dot_native16 received an uncompiled or foreign ISA");
             }
         }
 
@@ -2343,10 +2434,22 @@ namespace llaminar2
                     score0, score1, score2, score3);
                 return;
 #endif
-            default:
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                constexpr auto storage=Format==Native16BitKVFormat::FP16?cpu::neon_attention::Storage::FP16:cpu::neon_attention::Storage::BF16;
+                const auto result=native_cache_dot<storage,4>(query,{key0,key1,key2,key3},head_dim);
+                score0=result[0];score1=result[1];score2=result[2];score3=result[3];return;
+            }
+#endif
+            case ISALevel::Scalar:
                 dot_native16_4row_scalar<Format>(
                     query, key0, key1, key2, key3, head_dim,
                     score0, score1, score2, score3);
+                return;
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention dot_native16_4row received an uncompiled or foreign ISA");
             }
         }
 
@@ -2372,9 +2475,20 @@ namespace llaminar2
                     output, value, weight, head_dim);
                 return;
 #endif
-            default:
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                constexpr auto storage=Format==Native16BitKVFormat::FP16?cpu::neon_attention::Storage::FP16:cpu::neon_attention::Storage::BF16;
+                native_cache_accumulate<storage,1>(output,{value},{weight},head_dim);return;
+            }
+#endif
+            case ISALevel::Scalar:
                 accum_native16_scalar<Format>(
                     output, value, weight, head_dim);
+                return;
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention accum_native16 received an uncompiled or foreign ISA");
             }
         }
 
@@ -2416,7 +2530,15 @@ namespace llaminar2
                     head_dim);
                 return;
 #endif
-            default:
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                constexpr auto storage=Format==Native16BitKVFormat::FP16?cpu::neon_attention::Storage::FP16:cpu::neon_attention::Storage::BF16;
+                native_cache_accumulate<storage,4>(output,{value0,value1,value2,value3},{weight0,weight1,weight2,weight3},head_dim);return;
+            }
+#endif
+            case ISALevel::Scalar:
                 accum_native16_4row_scalar<Format>(
                     output,
                     value0, weight0,
@@ -2424,6 +2546,9 @@ namespace llaminar2
                     value2, weight2,
                     value3, weight3,
                     head_dim);
+                return;
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention accum_native16_4row received an uncompiled or foreign ISA");
             }
         }
 
@@ -2502,12 +2627,24 @@ namespace llaminar2
                 dot_fp32_avx512_4row(q, k0, k1, k2, k3, head_dim, s0, s1, s2, s3);
                 break;
 #endif
+#if defined(__AVX2__)
             case ISALevel::AVX2:
                 dot_fp32_avx2_4row(q, k0, k1, k2, k3, head_dim, s0, s1, s2, s3);
                 break;
-            default:
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                const auto result=native_cache_dot<cpu::neon_attention::Storage::FP32,4>(q,{k0,k1,k2,k3},head_dim);
+                s0=result[0];s1=result[1];s2=result[2];s3=result[3];return;
+            }
+#endif
+            case ISALevel::Scalar:
                 dot_fp32_4row_scalar(q, k0, k1, k2, k3, head_dim, s0, s1, s2, s3);
                 break;
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention dot_fp32_4row received an uncompiled or foreign ISA");
             }
         }
 
@@ -2572,12 +2709,26 @@ namespace llaminar2
                 batch_exp_4_avx512(s0, s1, s2, s3, max_val, p0, p1, p2, p3);
                 break;
 #endif
+#if defined(__AVX2__)
             case ISALevel::AVX2:
                 batch_exp_4_avx2(s0, s1, s2, s3, max_val, p0, p1, p2, p3);
                 break;
-            default:
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                const float scores[4]{s0,s1,s2,s3};float probabilities[4];
+                const auto shifted=vsubq_f32(vld1q_f32(scores),vdupq_n_f32(max_val));
+                vst1q_f32(probabilities,primitives::neon_softmax::exponential(shifted));
+                p0=probabilities[0];p1=probabilities[1];p2=probabilities[2];p3=probabilities[3];return;
+            }
+#endif
+            case ISALevel::Scalar:
                 batch_exp_4_scalar(s0, s1, s2, s3, max_val, p0, p1, p2, p3);
                 break;
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention batch_exp_4 received an uncompiled or foreign ISA");
             }
         }
 
@@ -2698,12 +2849,23 @@ namespace llaminar2
                 accum_weighted_v_avx512(out, v, weight, head_dim);
                 break;
 #endif
+#if defined(__AVX2__)
             case ISALevel::AVX2:
                 accum_weighted_v_avx2(out, v, weight, head_dim);
                 break;
-            default:
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                native_cache_accumulate<cpu::neon_attention::Storage::FP32,1>(out,{v},{weight},head_dim);return;
+            }
+#endif
+            case ISALevel::Scalar:
                 accum_weighted_v_scalar(out, v, weight, head_dim);
                 break;
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention accum_weighted_v received an uncompiled or foreign ISA");
             }
         }
 
@@ -2832,12 +2994,23 @@ namespace llaminar2
                 accum_weighted_v_4row_avx512(out, v0, w0, v1, w1, v2, w2, v3, w3, head_dim);
                 break;
 #endif
+#if defined(__AVX2__)
             case ISALevel::AVX2:
                 accum_weighted_v_4row_avx2(out, v0, w0, v1, w1, v2, w2, v3, w3, head_dim);
                 break;
-            default:
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                native_cache_accumulate<cpu::neon_attention::Storage::FP32,4>(out,{v0,v1,v2,v3},{w0,w1,w2,w3},head_dim);return;
+            }
+#endif
+            case ISALevel::Scalar:
                 accum_weighted_v_4row_scalar(out, v0, w0, v1, w1, v2, w2, v3, w3, head_dim);
                 break;
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention accum_weighted_v_4row received an uncompiled or foreign ISA");
             }
         }
 
@@ -2905,12 +3078,23 @@ namespace llaminar2
                 scale_vec_avx512(out, alpha, head_dim);
                 break;
 #endif
+#if defined(__AVX2__)
             case ISALevel::AVX2:
                 scale_vec_avx2(out, alpha, head_dim);
                 break;
-            default:
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                primitives::vec_scale(out,alpha,head_dim);return;
+            }
+#endif
+            case ISALevel::Scalar:
                 scale_vec_scalar(out, alpha, head_dim);
                 break;
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention scale_vec received an uncompiled or foreign ISA");
             }
         }
 
@@ -3096,10 +3280,22 @@ namespace llaminar2
             case ISALevel::AVX512:
                 return quantize_row_i16_i12_avx512(src, dst, n, qmax);
 #endif
+#if defined(__AVX2__)
             case ISALevel::AVX2:
                 return quantize_row_i16_i12_avx2(src, dst, n, qmax);
-            default:
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                if(n<0)throw std::invalid_argument("CPU native query width is negative");
+                return cpu::neon_attention::quantizeQuery(cpu::neon_attention::originalRows<float,1>({src},n)[0],{dst,std::size_t(n)},qmax);
+            }
+#endif
+            case ISALevel::Scalar:
                 return quantize_row_i16_i12_scalar(src, dst, n, qmax);
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention quantize_row_i16_i12 received an uncompiled or foreign ISA");
             }
         }
 
@@ -3169,10 +3365,21 @@ namespace llaminar2
             case ISALevel::AVX512:
                 return dot_i16_i16_i32_vnni(a, b, n);
 #endif
+#if defined(__AVX2__)
             case ISALevel::AVX2:
                 return dot_i16_i16_i32_avx2(a, b, n);
-            default:
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                return cpu::neon_attention::integerDot<1>(cpu::neon_attention::originalRows<std::int16_t,1>({a},n)[0],cpu::neon_attention::originalRows<std::int16_t,1>({b},n))[0];
+            }
+#endif
+            case ISALevel::Scalar:
                 return dot_i16_i16_i32_scalar(a, b, n);
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention dot_i16_i16_i32 received an uncompiled or foreign ISA");
             }
         }
 
@@ -3182,6 +3389,7 @@ namespace llaminar2
          * Uses `_mm256_madd_epi16` which computes adjacent pairs:
          * acc[k] += a[2k]*b[2k] + a[2k+1]*b[2k+1] for 8 output i32s.
          */
+        #if defined(__AVX2__)
         static int32_t dot_i16_i16_i32_avx2(const int16_t *a, const int16_t *b, int n)
         {
             __m256i acc = _mm256_setzero_si256();
@@ -3203,6 +3411,7 @@ namespace llaminar2
                 sum += static_cast<int32_t>(a[i]) * static_cast<int32_t>(b[i]);
             return sum;
         }
+#endif
 
         /**
          * @brief Dual-row VNNI dot product:  `out0 = q·k0` and `out1 = q·k1`.
@@ -3344,12 +3553,24 @@ namespace llaminar2
                 dot_i16_i16_i32_vnni_2row_avx512(q, k0, k1, n, out0, out1);
                 break;
 #endif
+#if defined(__AVX2__)
             case ISALevel::AVX2:
                 dot_i16_i16_i32_vnni_2row_avx2(q, k0, k1, n, out0, out1);
                 break;
-            default:
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                const auto result=cpu::neon_attention::integerDot<2>(cpu::neon_attention::originalRows<std::int16_t,1>({q},n)[0],cpu::neon_attention::originalRows<std::int16_t,2>({k0,k1},n));
+                out0=result[0];out1=result[1];return;
+            }
+#endif
+            case ISALevel::Scalar:
                 dot_i16_i16_i32_vnni_2row_scalar(q, k0, k1, n, out0, out1);
                 break;
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention dot_i16_i16_i32_vnni_2row received an uncompiled or foreign ISA");
             }
         }
 
@@ -3492,12 +3713,24 @@ namespace llaminar2
                 dot_4row_separate_avx512(q, k0, k1, k2, k3, n, out0, out1, out2, out3);
                 break;
 #endif
+#if defined(__AVX2__)
             case ISALevel::AVX2:
                 dot_4row_separate_avx2(q, k0, k1, k2, k3, n, out0, out1, out2, out3);
                 break;
-            default:
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                const auto result=cpu::neon_attention::integerDot<4>(cpu::neon_attention::originalRows<std::int16_t,1>({q},n)[0],cpu::neon_attention::originalRows<std::int16_t,4>({k0,k1,k2,k3},n));
+                out0=result[0];out1=result[1];out2=result[2];out3=result[3];return;
+            }
+#endif
+            case ISALevel::Scalar:
                 dot_4row_separate_scalar(q, k0, k1, k2, k3, n, out0, out1, out2, out3);
                 break;
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention dot_i16_i16_i32_vnni_4row received an uncompiled or foreign ISA");
             }
         }
 
@@ -3796,15 +4029,16 @@ namespace llaminar2
             }
 
             const bool profiling_enabled = KernelProfiler::isEnabled();
-            std::uint64_t qk_duration_ns = 0;
-            std::uint64_t v_duration_ns = 0;
+            cpu::CPUWorkshareTiming timing(profiling_enabled);
             const auto slot_index = [slots_per_row](int row, int slot)
             {
                 return static_cast<std::size_t>(row) * slots_per_row + slot;
             };
 
-            auto work = [&]()
+            auto work = timing.worker([&](cpu::CPUWorkshareTiming::Counters &sample)
             {
+                auto &qk_duration_ns = sample.qk_ns;
+                auto &v_duration_ns = sample.value_ns;
                 Scratch scratch{};
                 alignas(64) float scores[detail::kMaxKVTile];
 
@@ -3831,7 +4065,7 @@ namespace llaminar2
                         canonical_summaries - wave_begin);
                     const int wave_items = output_rows * active_slots;
 
-#pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
+#pragma omp for schedule(static)
                     for (int item = 0; item < wave_items; ++item)
                     {
                         const int row = item / active_slots;
@@ -3913,20 +4147,14 @@ namespace llaminar2
                         partial_output_ + merged_slot * padded_head_dim,
                         partial_l_[merged_slot]);
                 }
-            };
+            });
 
             OMP_WORKSHARE_REGION(work);
-            if (profiling_enabled)
+            timing.publish([](std::uint64_t qk, std::uint64_t value, int workers)
             {
-                KernelProfiler::recordParallel(
-                    KernelType::ATTENTION_QK,
-                    qk_duration_ns,
-                    omp_get_max_threads());
-                KernelProfiler::recordParallel(
-                    KernelType::ATTENTION_V,
-                    v_duration_ns,
-                    omp_get_max_threads());
-            }
+                KernelProfiler::recordParallel(KernelType::ATTENTION_QK, qk, workers);
+                KernelProfiler::recordParallel(KernelType::ATTENTION_V, value, workers);
+            });
             return true;
         }
 
@@ -4073,13 +4301,14 @@ namespace llaminar2
             const int work_items = output_rows;
 
             const bool profiling_enabled = KernelProfiler::isEnabled();
-            std::uint64_t qk_duration_ns = 0;
-            std::uint64_t v_duration_ns = 0;
+            cpu::CPUWorkshareTiming timing(profiling_enabled);
             const int requested_threads = computeOptimalAttentionThreads(
                 n_heads, query_rows, kv_len, head_dim, causal);
 
-            auto work = [&]()
+            auto work = timing.worker([&](cpu::CPUWorkshareTiming::Counters &sample)
             {
+                auto &qk_duration_ns = sample.qk_ns;
+                auto &v_duration_ns = sample.value_ns;
                 Scratch scratch{};
                 alignas(64) float local_partial[kMaximumAttentionHeadDim];
                 alignas(64) float merged[kMaximumAttentionHeadDim];
@@ -4090,7 +4319,7 @@ namespace llaminar2
                 // in a fresh prefill. Cyclic whole-row ownership balances that
                 // triangle without splitting a reduction: every row still
                 // merges the same canonical summaries in ascending K/V order.
-#pragma omp for schedule(static, 1) reduction(+ : qk_duration_ns, v_duration_ns)
+#pragma omp for schedule(static, 1)
                 for (int item = 0; item < work_items; ++item)
                 {
                     const int row = item;
@@ -4151,15 +4380,15 @@ namespace llaminar2
                     finalize_row(row, merged, merged_l);
                 }
 
-            };
+            });
 
+            // A retained invocation already owns its team. A small standalone
+            // hint must never split those members into nested whole-row teams.
             const bool use_full_team =
-                kv_len > 100 || output_rows >= physical_workers;
-            int actual_threads = requested_threads;
+                omp_in_parallel() || kv_len > 100 || output_rows >= physical_workers;
             if (use_full_team)
             {
                 OMP_WORKSHARE_REGION(work);
-                actual_threads = physical_workers;
             }
             else
             {
@@ -4169,17 +4398,11 @@ namespace llaminar2
                 }
             }
 
-            if (profiling_enabled)
+            timing.publish([](std::uint64_t qk, std::uint64_t value, int workers)
             {
-                KernelProfiler::recordParallel(
-                    KernelType::ATTENTION_QK,
-                    qk_duration_ns,
-                    actual_threads);
-                KernelProfiler::recordParallel(
-                    KernelType::ATTENTION_V,
-                    v_duration_ns,
-                    actual_threads);
-            }
+                KernelProfiler::recordParallel(KernelType::ATTENTION_QK, qk, workers);
+                KernelProfiler::recordParallel(KernelType::ATTENTION_V, value, workers);
+            });
             return true;
         }
 
@@ -4271,12 +4494,23 @@ namespace llaminar2
                 accum_weighted_v_q16_avx512(out, v_qs, combined, head_dim);
                 break;
 #endif
+#if defined(__AVX2__)
             case ISALevel::AVX2:
                 accum_weighted_v_q16_avx2(out, v_qs, combined, head_dim);
                 break;
-            default:
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                native_cache_accumulate<cpu::neon_attention::Storage::I16,1>(out,{v_qs},{combined},head_dim);return;
+            }
+#endif
+            case ISALevel::Scalar:
                 accum_weighted_v_q16_scalar(out, v_qs, combined, head_dim);
                 break;
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention accum_weighted_v_q16 received an uncompiled or foreign ISA");
             }
         }
 
@@ -4432,12 +4666,23 @@ namespace llaminar2
                 accum_weighted_v_q16_4row_avx512(out, v0, w0, v1, w1, v2, w2, v3, w3, head_dim);
                 break;
 #endif
+#if defined(__AVX2__)
             case ISALevel::AVX2:
                 accum_weighted_v_q16_4row_avx2(out, v0, w0, v1, w1, v2, w2, v3, w3, head_dim);
                 break;
-            default:
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON
+            case ISALevel::NEON:
+            case ISALevel::NEONDotProd:
+            {
+                native_cache_accumulate<cpu::neon_attention::Storage::I16,4>(out,{v0,v1,v2,v3},{w0,w1,w2,w3},head_dim);return;
+            }
+#endif
+            case ISALevel::Scalar:
                 accum_weighted_v_q16_4row_scalar(out, v0, w0, v1, w1, v2, w2, v3, w3, head_dim);
                 break;
+            default:
+                LLAMINAR_UNREACHABLE("CPU attention accum_weighted_v_q16_4row received an uncompiled or foreign ISA");
             }
         }
 
@@ -4562,9 +4807,6 @@ namespace llaminar2
 
             // Profiling: track QK dot-product and V accumulation times separately.
             const bool profiling_enabled = KernelProfiler::isEnabled();
-            uint64_t qk_duration_ns = 0;
-            uint64_t v_duration_ns = 0;
-
             const cpu::fa2_policy::CPUFA2ParallelPlan partition_plan =
                 cpu::fa2_policy::selectCPUFA2ParallelPlan({
                     .batch_size = 1,
@@ -4825,9 +5067,12 @@ namespace llaminar2
             const int attention_tasks =
                 partition_query_rows ? n_heads * seq_len : n_heads;
 
-            auto work = [&]()
+            cpu::CPUWorkshareTiming timing(profiling_enabled);
+            auto work = timing.worker([&](cpu::CPUWorkshareTiming::Counters &sample)
             {
-#pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
+                auto &qk_duration_ns = sample.qk_ns;
+                auto &v_duration_ns = sample.value_ns;
+#pragma omp for schedule(static)
                 for (int task = 0; task < attention_tasks; ++task)
                 {
                     /*
@@ -5069,7 +5314,7 @@ namespace llaminar2
                         div_vec(out, running_l, head_dim, use_avx512);
                     } // end q_pos loop
                 } // end head loop
-            };
+            });
 
             // DECODE THREADING STRATEGY: prevent libgomp thread pool sleep.
             //
@@ -5092,17 +5337,15 @@ namespace llaminar2
             // prevent the inter-region sleep; libgomp's team-end idle path has
             // a fixed spin count independent of these settings.
             const bool is_decode_phase = (kv_len != seq_len);
-            const bool force_full_pool = is_decode_phase && kv_len > 100;
+            const bool force_full_pool = omp_in_parallel() || (is_decode_phase && kv_len > 100);
 
             // Use OMP_WORKSHARE_REGION for decode so the kernel is
             // compatible with a persistent outer parallel region (the
             // macro detects omp_in_parallel() and skips creating a new
             // team, eliminating ~16 µs fork/join overhead per call).
-            int actual_threads;
             if (force_full_pool)
             {
                 OMP_WORKSHARE_REGION(work);
-                actual_threads = omp_get_max_threads();
             }
             else
             {
@@ -5110,25 +5353,21 @@ namespace llaminar2
                 {
                     work();
                 }
-                actual_threads = attn_threads;
             }
 
-            // Report profiling breakdown (QK vs V phase) if enabled.
-            // qk_duration_ns and v_duration_ns are thread-time sums from
-            // the OMP reduction — divide by active thread count to get
-            // wall-clock estimates that are consistent with other kernel
-            // timings in the profiler output.
-            if (profiling_enabled)
+            // Publish one complete thread-time sum using the team that actually
+            // executed, before any elected retained-team stack storage retires.
+            timing.publish([](std::uint64_t qk, std::uint64_t value, int workers)
             {
-                KernelProfiler::recordParallel(KernelType::ATTENTION_QK, qk_duration_ns, actual_threads);
-                KernelProfiler::recordParallel(KernelType::ATTENTION_V, v_duration_ns, actual_threads);
-            }
+                KernelProfiler::recordParallel(KernelType::ATTENTION_QK, qk, workers);
+                KernelProfiler::recordParallel(KernelType::ATTENTION_V, value, workers);
+            });
             return true;
         }
 
-#if (defined(__AVX512F__) && defined(__AVX512VNNI__)) || defined(__AVX2__)
+#if (defined(__AVX512F__) && defined(__AVX512VNNI__)) || defined(__AVX2__) || LLAMINAR_COMPILED_WITH_NEON
         /**
-         * @brief Prefill flash attention with Q16_1 KV cache (VNNI accelerated).
+         * @brief Native integer prefill/decode attention over original Q16 cache storage.
          *
          * Handles seq_len >= 1 (including prefill where seq_len == kv_len).
          * Uses the same VNNI QK dot products and Q16_1 V accumulation as
@@ -5235,9 +5474,6 @@ namespace llaminar2
                 launch_policy_.explicit_kv_tile);
 
             const bool profiling_enabled = KernelProfiler::isEnabled();
-            uint64_t qk_duration_ns = 0;
-            uint64_t v_duration_ns = 0;
-
             const int attn_threads = computeOptimalAttentionThreads(
                 n_heads, seq_len, kv_len, head_dim, causal);
 
@@ -5573,11 +5809,14 @@ namespace llaminar2
             const int attention_tasks =
                 partition_query_rows ? n_heads * seq_len : n_heads;
 
-            auto work = [&]()
+            cpu::CPUWorkshareTiming timing(profiling_enabled);
+            auto work = timing.worker([&](cpu::CPUWorkshareTiming::Counters &sample)
             {
+                auto &qk_duration_ns = sample.qk_ns;
+                auto &v_duration_ns = sample.value_ns;
                 alignas(64) int16_t q_i16_buf[detail::kMaxI16RowStride];
 
-#pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
+#pragma omp for schedule(static)
                 for (int task = 0; task < attention_tasks; ++task)
                 {
                     /*
@@ -5671,18 +5910,14 @@ namespace llaminar2
 
                                         if (k + 7 < valid_end)
                                         {
-                                            _mm_prefetch(reinterpret_cast<const char *>(
-                                                             k_raw + q16_layout.blockIndex(k + 4, kv_h, 0) * block_bytes),
-                                                         _MM_HINT_T0);
-                                            _mm_prefetch(reinterpret_cast<const char *>(
-                                                             k_raw + q16_layout.blockIndex(k + 5, kv_h, 0) * block_bytes),
-                                                         _MM_HINT_T0);
-                                            _mm_prefetch(reinterpret_cast<const char *>(
-                                                             k_raw + q16_layout.blockIndex(k + 6, kv_h, 0) * block_bytes),
-                                                         _MM_HINT_T0);
-                                            _mm_prefetch(reinterpret_cast<const char *>(
-                                                             k_raw + q16_layout.blockIndex(k + 7, kv_h, 0) * block_bytes),
-                                                         _MM_HINT_T0);
+                                            detail::prefetchCPUAttentionL1(
+                                                k_raw + q16_layout.blockIndex(k + 4, kv_h, 0) * block_bytes);
+                                            detail::prefetchCPUAttentionL1(
+                                                k_raw + q16_layout.blockIndex(k + 5, kv_h, 0) * block_bytes);
+                                            detail::prefetchCPUAttentionL1(
+                                                k_raw + q16_layout.blockIndex(k + 6, kv_h, 0) * block_bytes);
+                                            detail::prefetchCPUAttentionL1(
+                                                k_raw + q16_layout.blockIndex(k + 7, kv_h, 0) * block_bytes);
                                         }
 
                                         float kd0, kd1, kd2, kd3;
@@ -5761,23 +5996,7 @@ namespace llaminar2
                             const float alpha = std::isfinite(running_m)
                                                     ? std::exp(running_m - new_m)
                                                     : 0.0f;
-                            {
-#if defined(__AVX512F__)
-                                const __m512 va = _mm512_set1_ps(alpha);
-                                int sd = 0;
-                                for (; sd + 15 < head_dim; sd += 16)
-                                    _mm512_storeu_ps(out + sd, _mm512_mul_ps(va, _mm512_loadu_ps(out + sd)));
-                                for (; sd < head_dim; ++sd)
-                                    out[sd] *= alpha;
-#else
-                                const __m256 va = _mm256_set1_ps(alpha);
-                                int sd = 0;
-                                for (; sd + 7 < head_dim; sd += 8)
-                                    _mm256_storeu_ps(out + sd, _mm256_mul_ps(va, _mm256_loadu_ps(out + sd)));
-                                for (; sd < head_dim; ++sd)
-                                    out[sd] *= alpha;
-#endif
-                            }
+                            scale_vec(out, alpha, head_dim, cpu_supports_avx512());
                             float new_l = running_l * alpha;
 
                             // --- V Phase: Q16_1 V weighted accumulation ---
@@ -5792,18 +6011,14 @@ namespace llaminar2
                                 {
                                     if (k + 7 < valid_end)
                                     {
-                                        _mm_prefetch(reinterpret_cast<const char *>(
-                                                         v_raw + q16_layout.blockIndex(k + 4, kv_h, 0) * block_bytes),
-                                                     _MM_HINT_T0);
-                                        _mm_prefetch(reinterpret_cast<const char *>(
-                                                         v_raw + q16_layout.blockIndex(k + 5, kv_h, 0) * block_bytes),
-                                                     _MM_HINT_T0);
-                                        _mm_prefetch(reinterpret_cast<const char *>(
-                                                         v_raw + q16_layout.blockIndex(k + 6, kv_h, 0) * block_bytes),
-                                                     _MM_HINT_T0);
-                                        _mm_prefetch(reinterpret_cast<const char *>(
-                                                         v_raw + q16_layout.blockIndex(k + 7, kv_h, 0) * block_bytes),
-                                                     _MM_HINT_T0);
+                                        detail::prefetchCPUAttentionL1(
+                                            v_raw + q16_layout.blockIndex(k + 4, kv_h, 0) * block_bytes);
+                                        detail::prefetchCPUAttentionL1(
+                                            v_raw + q16_layout.blockIndex(k + 5, kv_h, 0) * block_bytes);
+                                        detail::prefetchCPUAttentionL1(
+                                            v_raw + q16_layout.blockIndex(k + 6, kv_h, 0) * block_bytes);
+                                        detail::prefetchCPUAttentionL1(
+                                            v_raw + q16_layout.blockIndex(k + 7, kv_h, 0) * block_bytes);
                                     }
 
                                     alignas(16) float pp[4];
@@ -5885,35 +6100,19 @@ namespace llaminar2
                         if (running_l > 0.0f)
                         {
                             const float inv_l = 1.0f / running_l;
-#if defined(__AVX512F__)
-                            const __m512 vi = _mm512_set1_ps(inv_l);
-                            int sd = 0;
-                            for (; sd + 15 < head_dim; sd += 16)
-                                _mm512_storeu_ps(out + sd, _mm512_mul_ps(vi, _mm512_loadu_ps(out + sd)));
-                            for (; sd < head_dim; ++sd)
-                                out[sd] *= inv_l;
-#else
-                            const __m256 vi = _mm256_set1_ps(inv_l);
-                            int sd = 0;
-                            for (; sd + 7 < head_dim; sd += 8)
-                                _mm256_storeu_ps(out + sd, _mm256_mul_ps(vi, _mm256_loadu_ps(out + sd)));
-                            for (; sd < head_dim; ++sd)
-                                out[sd] *= inv_l;
-#endif
+                            scale_vec(out, inv_l, head_dim, cpu_supports_avx512());
                         }
                     } // end q_pos loop
                 } // end head loop
-            };
+            });
 
-            // Threading: prefill has enough work for all threads
+            // Threading: prefill has enough work for all threads.
             OMP_WORKSHARE_REGION(work);
-            const int actual_threads = omp_get_max_threads();
-
-            if (profiling_enabled)
+            timing.publish([](std::uint64_t qk, std::uint64_t value, int workers)
             {
-                KernelProfiler::recordParallel(KernelType::ATTENTION_QK, qk_duration_ns, actual_threads);
-                KernelProfiler::recordParallel(KernelType::ATTENTION_V, v_duration_ns, actual_threads);
-            }
+                KernelProfiler::recordParallel(KernelType::ATTENTION_QK, qk, workers);
+                KernelProfiler::recordParallel(KernelType::ATTENTION_V, value, workers);
+            });
             return true;
         }
 #endif // (__AVX512F__ && __AVX512VNNI__) || __AVX2__
@@ -6185,10 +6384,7 @@ namespace llaminar2
                                                            : physical_kv_row(kv_row + 1) *
                                                                      blocks_per_kv_row +
                                                                  scratch.head_base;
-                        _mm_prefetch(
-                            reinterpret_cast<const char *>(
-                                &k_blocks[next_index]),
-                            _MM_HINT_T0);
+                        detail::prefetchCPUAttentionL1(&k_blocks[next_index]);
                     }
                 }
             };
@@ -6238,10 +6434,7 @@ namespace llaminar2
                                                            : physical_kv_row(kv_row + 1) *
                                                                      blocks_per_kv_row +
                                                                  scratch.head_base;
-                        _mm_prefetch(
-                            reinterpret_cast<const char *>(
-                                &v_blocks[next_index]),
-                            _MM_HINT_T0);
+                        detail::prefetchCPUAttentionL1(&v_blocks[next_index]);
                     }
                 }
             };
@@ -6756,13 +6949,8 @@ namespace llaminar2
                 {
                     if (kv_row + 4 < visible.end)
                     {
-                        _mm_prefetch(
-                            reinterpret_cast<const char *>(
-                                k_raw +
-                                physical_kv_row(kv_row + 4) *
-                                    k_row_stride +
-                                scratch.key_head_offset),
-                            _MM_HINT_T0);
+                        detail::prefetchCPUAttentionL1(
+                            k_raw + physical_kv_row(kv_row + 4) * k_row_stride + scratch.key_head_offset);
                     }
                     const std::uint8_t *key_block =
                         k_raw + physical_kv_row(kv_row) * k_row_stride +
@@ -6805,13 +6993,8 @@ namespace llaminar2
                 {
                     if (kv_row + 4 < visible.end)
                     {
-                        _mm_prefetch(
-                            reinterpret_cast<const char *>(
-                                v_raw +
-                                physical_kv_row(kv_row + 4) *
-                                    v_row_stride +
-                                scratch.value_head_offset),
-                            _MM_HINT_T0);
+                        detail::prefetchCPUAttentionL1(
+                            v_raw + physical_kv_row(kv_row + 4) * v_row_stride + scratch.value_head_offset);
                     }
                     const float probability = std::exp(
                         scores[static_cast<std::size_t>(kv_row - tile_begin)] -
