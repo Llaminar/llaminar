@@ -16,7 +16,6 @@
 #include "utils/OpenMPUtils.h"
 #include "execution/compute_stages/stages/GEMMStage.h"
 #include "loaders/HostImmutableRowProvider.h"
-#include "fixtures/qwen4exp/PooledImmutableReadGraphFixture.h"
 #include <limits>
 #include <type_traits>
 #include "../../../utils/PreparedWeightTestHarness.h"
