@@ -154,3 +154,22 @@ another schedule heuristic.
   {10,…,19}` and `{0:5},{5:5}` WORK; `{5-9},{15-19},{0-4},{10-14}` is
   INVALID (range-inside-braces rejected). v4 uses `{5:5},{15:5},{0:5},{10:5}`
   for the capacity-order arm.
+
+## FINAL VERDICT (2026-11-09, v4/v5, .80, c3060d607, seccomp+SYS caps)
+
+- All-workers vs fastest-class, ABBA×2, n256 t0 s42, 20T: 35B-nomtp D
+  23.755±0.065 vs 19.350±0.020 (**all-workers +22.8%**); 35B-mtp +8.2%;
+  27B-nomtp +34.6%; 27B-mtp +7.2%; prefill equal (±0.5%); text byte-identical.
+- VERDICT: **fastest-class = clear LOSS for engine decode on GB10** — the
+  typed-placement idea does NOT help the served decode path. KEEP
+  auto/all-workers. Held branch codex/arm-decode-team-placement @ c3060d607
+  is NOT for merge (evidence-only). The capacity-ordered BINDING base fix
+  (in base) remains valuable.
+- Q6_K kernel (M=64 512×2048 mixed 20T, 61 iters, 3×ABBA): ID order dot 41.7
+  vs i8mm 42.1 (−1.0%), p95 317.7 vs 586.6; CAPACITY order ({5:5},{15:5},
+  {0:5},{10:5} = X925-first production binding): dot 41.5 vs i8mm 41.5 (0.0%),
+  p95 143.5 vs **45.5**. DECISION: the small-M regression/tail DISAPPEARS
+  under capacity order → HARNESS ARTIFACT, not a real small-N mixed penalty →
+  idea 06 NOT triggered by this cell; I8MM stays for Q6_K (better tail).
+- libgomp capacity spelling = colon form `{5:5},…` (range-inside-braces
+  rejected).
