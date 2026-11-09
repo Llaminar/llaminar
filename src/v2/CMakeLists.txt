@@ -600,16 +600,17 @@ if(HAVE_CUDA)
         set(CUTLASS_DIR "/opt/cutlass")
     endif()
     
+    # Host adapters use the project's C++23 dialect whether or not CUTLASS is
+    # present. CUDA translation units use the explicit C++20 device dialect
+    # above, the common fully-supported level across the pinned CUDA and ROCm
+    # toolchains.
+    target_compile_features(cuda_backend PUBLIC cxx_std_23)
+
     if(EXISTS "${CUTLASS_DIR}/include")
         message(STATUS "V2: Found CUTLASS at ${CUTLASS_DIR}")
         set(LLAMINAR_HAVE_CUTLASS ON)
         target_include_directories(cuda_backend PUBLIC "${CUTLASS_DIR}/include")
         target_compile_definitions(cuda_backend PUBLIC HAVE_CUTLASS)
-        
-        # Host adapters use the project's C++23 dialect. CUDA translation units
-        # use the explicit C++20 device dialect above, which is the common
-        # fully-supported level across the pinned CUDA and ROCm toolchains.
-        target_compile_features(cuda_backend PUBLIC cxx_std_23)
         
         message(STATUS "V2: CUTLASS Tensor Core support enabled (Phase 2)")
     else()
