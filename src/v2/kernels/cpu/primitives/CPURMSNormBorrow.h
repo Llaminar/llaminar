@@ -16,6 +16,7 @@
 #include <span>
 #include <stdexcept>
 #include <type_traits>
+#include "RMSNumericFatal.h"
 #include "../../../tensors/BlockStructures.h"
 
 namespace llaminar2::primitives::rmsnorm_operands
@@ -39,10 +40,10 @@ inline bool overlaps(const void *a,std::size_t a_bytes,const void *b,std::size_t
 inline void requireBank(const void *bank,std::size_t units,std::size_t unit_bytes)
 {
     if(!unit_bytes||units>std::size_t(std::numeric_limits<std::ptrdiff_t>::max())/unit_bytes)
-        throw std::invalid_argument("CPU RMS original bank extent exceeds the pointer domain");
+        rms_numeric::rejectPolicy("CPU RMS original bank extent exceeds the pointer domain");
     const auto bytes=units*unit_bytes;
     if(bytes&&(!bank||reinterpret_cast<std::uintptr_t>(bank)>std::numeric_limits<std::uintptr_t>::max()-bytes))
-        throw std::invalid_argument("CPU RMS requires a complete nonwrapping original bank");
+        rms_numeric::rejectPolicy("CPU RMS requires a complete nonwrapping original bank");
 }
 
 /** @brief Checked complete original floating bank and immutable normalization policy.
@@ -67,15 +68,15 @@ public:
         if(!std::isfinite(epsilon)||epsilon<0.0f||rows>std::size_t(std::numeric_limits<std::ptrdiff_t>::max())||
            columns>std::size_t(std::numeric_limits<std::ptrdiff_t>::max())/sizeof(Word)||
            (columns&&rows>std::size_t(std::numeric_limits<std::ptrdiff_t>::max())/sizeof(Word)/columns))
-            throw std::invalid_argument("CPU RMS requires representable original geometry and a finite nonnegative epsilon");
+            rms_numeric::rejectPolicy("CPU RMS requires representable original geometry and a finite nonnegative epsilon");
         const auto words=rows*columns;
         requireBank(source,words,sizeof(Word));requireBank(output,words,sizeof(Word));
         if(gamma)requireBank(gamma,columns,sizeof(float));
         const auto bytes=words*sizeof(Word);
         if(source!=output&&overlaps(source,bytes,output,bytes))
-            throw std::invalid_argument("CPU RMS supports exact source aliases, not partial original-bank overlap");
+            rms_numeric::rejectPolicy("CPU RMS supports exact source aliases, not partial original-bank overlap");
         if(gamma&&overlaps(output,bytes,gamma,columns*sizeof(float)))
-            throw std::invalid_argument("CPU RMS output aliases immutable original gamma");
+            rms_numeric::rejectPolicy("CPU RMS output aliases immutable original gamma");
         return FloatingBorrow(source,gamma,output,rows,columns,epsilon);
     }
     /** @return Whether the complete original invocation has no arithmetic work. */
@@ -95,7 +96,7 @@ public:
      */
     [[nodiscard]] std::span<const Word> sourceRow(std::size_t row)const
     {
-        if(row>=rows_)throw std::out_of_range("CPU RMS input row outside original bank");
+        if(row>=rows_)rms_numeric::rejectRangePolicy("CPU RMS input row outside original bank");
         return {columns_?source_+row*columns_:source_,columns_};
     }
     /** @brief Borrow one original logical output row.
@@ -104,7 +105,7 @@ public:
      */
     [[nodiscard]] std::span<Word> outputRow(std::size_t row)const
     {
-        if(row>=rows_)throw std::out_of_range("CPU RMS output row outside original bank");
+        if(row>=rows_)rms_numeric::rejectRangePolicy("CPU RMS output row outside original bank");
         return {columns_?output_+row*columns_:output_,columns_};
     }
     /** @brief Retain immutable invocation metadata throughout publication.
@@ -114,7 +115,7 @@ public:
     void requireMetadataReadOnly(const void *metadata,std::size_t bytes)const
     {
         if(overlaps(output_,rows_*columns_*sizeof(Word),metadata,bytes))
-            throw std::invalid_argument("CPU RMS output aliases retained invocation metadata");
+            rms_numeric::rejectPolicy("CPU RMS output aliases retained invocation metadata");
     }
 private:
     /** @brief Retain only already-checked original addressing and policy.
@@ -149,12 +150,12 @@ public:
         constexpr auto bound=std::size_t(std::numeric_limits<std::ptrdiff_t>::max());
         if(rows>bound/sizeof(double)||columns>bound/sizeof(std::int32_t)||
             (columns&&rows>bound/sizeof(std::int32_t)/columns))
-            throw std::invalid_argument("INT32 RMS summary requires representable original row geometry");
+            rms_numeric::rejectPolicy("INT32 RMS summary requires representable original row geometry");
         const auto outputRows=rows&&columns?rows:0;
         requireBank(source,rows*columns,sizeof(std::int32_t));
         requireBank(output,outputRows,sizeof(double));
         if(overlaps(source,rows*columns*sizeof(std::int32_t),output,outputRows*sizeof(double)))
-            throw std::invalid_argument("INT32 RMS summary aliases original integer storage");
+            rms_numeric::rejectPolicy("INT32 RMS summary aliases original integer storage");
         return Int32ReductionBorrow(source,output,rows,columns);
     }
     /** @return Whether this invocation owns no arithmetic/payload publication. */
@@ -169,7 +170,7 @@ public:
      */
     [[nodiscard]]std::span<const std::int32_t> sourceRow(std::size_t row)const
     {
-        if(row>=rows_)throw std::out_of_range("INT32 RMS source row outside original bank");
+        if(row>=rows_)rms_numeric::rejectRangePolicy("INT32 RMS source row outside original bank");
         return {columns_?source_+row*columns_:source_,columns_};
     }
     /** @brief Publish one owned row summary after its complete fixed-order reduction.
@@ -178,7 +179,7 @@ public:
      */
     void publish(std::size_t row,double value)const
     {
-        if(empty()||row>=rows_)throw std::out_of_range("INT32 RMS summary outside live original bank");
+        if(empty()||row>=rows_)rms_numeric::rejectRangePolicy("INT32 RMS summary outside live original bank");
         output_[row]=value;
     }
     /** @brief Exclude original immutable policy from every worker-owned output byte.
@@ -188,7 +189,7 @@ public:
     void requireMetadataReadOnly(const void*metadata,std::size_t bytes)const
     {
         if(overlaps(output_,empty()?0:rows_*sizeof(double),metadata,bytes))
-            throw std::invalid_argument("INT32 RMS summary aliases retained invocation policy");
+            rms_numeric::rejectPolicy("INT32 RMS summary aliases retained invocation policy");
     }
 private:
     /** @brief Retain only already validated original addressing and geometry.
@@ -252,7 +253,7 @@ public:
         constexpr auto bound=std::size_t(std::numeric_limits<std::ptrdiff_t>::max());
         if(rows>bound/sizeof(float)||columns>bound/sizeof(std::int32_t)||
             (columns&&rows>bound/sizeof(std::int32_t)/columns))
-            throw std::invalid_argument("INT32 RMS quantization requires representable original geometry");
+            rms_numeric::rejectPolicy("INT32 RMS quantization requires representable original geometry");
         const auto words=rows*columns,outputRows=words?rows:0;
         requireBank(source,words,sizeof(std::int32_t));requireBank(output,words,sizeof(std::int8_t));
         requireBank(scales,outputRows,sizeof(float));
@@ -261,7 +262,7 @@ public:
         if(overlaps(output,codeBytes,source,sourceBytes)||overlaps(scales,scaleBytes,source,sourceBytes)||
             overlaps(output,codeBytes,scales,scaleBytes)||
             (gamma&&(overlaps(output,codeBytes,gamma,columns*sizeof(float))||overlaps(scales,scaleBytes,gamma,columns*sizeof(float)))))
-            throw std::invalid_argument("INT32 RMS codes/scales intersect an original bank or another publication");
+            rms_numeric::rejectPolicy("INT32 RMS codes/scales intersect an original bank or another publication");
         return Int32QuantizationBorrow(source,gamma,output,scales,rows,columns);
     }
     /** @return Whether no live payload or row metadata is published. */
@@ -282,7 +283,7 @@ public:
      */
     [[nodiscard]]Row row(std::size_t index)const
     {
-        if(empty()||index>=rows_)throw std::out_of_range("INT32 RMS publication outside original row bank");
+        if(empty()||index>=rows_)rms_numeric::rejectRangePolicy("INT32 RMS publication outside original row bank");
         return Row(source_+index*columns_,gamma_,output_+index*columns_,scales_+index,columns_);
     }
     /** @brief Exclude retained invocation policy/inverses from both writable banks.
@@ -292,7 +293,7 @@ public:
     void requireMetadataReadOnly(const void*metadata,std::size_t bytes)const
     {
         if(overlaps(output_,rows_*columns_,metadata,bytes)||overlaps(scales_,empty()?0:rows_*sizeof(float),metadata,bytes))
-            throw std::invalid_argument("INT32 RMS publication aliases retained policy or inverse metadata");
+            rms_numeric::rejectPolicy("INT32 RMS publication aliases retained policy or inverse metadata");
     }
 private:
     /** @brief Retain only validated original addressing and geometry.
@@ -331,17 +332,17 @@ public:
         constexpr auto bound=std::size_t(std::numeric_limits<std::ptrdiff_t>::max());
         if(columns%32||rows>bound||columns>bound/sizeof(float)||
            (columns&&rows>bound/sizeof(float)/columns)||!std::isfinite(epsilon)||epsilon<0.0f)
-            throw std::invalid_argument("Q16 RMS requires complete32-value rows, representable geometry and finite nonnegative epsilon");
+            rms_numeric::rejectPolicy("Q16 RMS requires complete32-value rows, representable geometry and finite nonnegative epsilon");
         const auto blocks=columns/32;
         if(blocks&&rows>bound/sizeof(Q16_1Block)/blocks)
-            throw std::invalid_argument("Q16 RMS original compressed bank exceeds the pointer domain");
+            rms_numeric::rejectPolicy("Q16 RMS original compressed bank exceeds the pointer domain");
         requireBank(source,rows*blocks,sizeof(Q16_1Block));
         requireBank(output,rows*columns,sizeof(float));
         if(rows&&columns)requireBank(gamma,columns,sizeof(float));
         const auto bytes=rows*columns*sizeof(float);
         if(overlaps(output,bytes,source,rows*blocks*sizeof(Q16_1Block))||
            overlaps(output,bytes,gamma,columns*sizeof(float)))
-            throw std::invalid_argument("Q16 RMS expansion aliases original compressed storage or immutable gamma");
+            rms_numeric::rejectPolicy("Q16 RMS expansion aliases original compressed storage or immutable gamma");
         return Q16ExpansionBorrow(source,gamma,output,rows,columns,epsilon);
     }
     /** @return Whether the complete invocation contains no arithmetic rows/columns. */
@@ -361,7 +362,7 @@ public:
      */
     [[nodiscard]] std::span<const Q16_1Block> sourceRow(std::size_t row)const
     {
-        if(row>=rows_)throw std::out_of_range("Q16 RMS source row outside original bank");
+        if(row>=rows_)rms_numeric::rejectRangePolicy("Q16 RMS source row outside original bank");
         const auto blocks=columns_/32;
         return {blocks?source_+row*blocks:source_,blocks};
     }
@@ -371,7 +372,7 @@ public:
      */
     [[nodiscard]] std::span<float> outputRow(std::size_t row)const
     {
-        if(row>=rows_)throw std::out_of_range("Q16 RMS output row outside original bank");
+        if(row>=rows_)rms_numeric::rejectRangePolicy("Q16 RMS output row outside original bank");
         return {columns_?output_+row*columns_:output_,columns_};
     }
     /** @brief Protect complete retained invocation metadata before publication.
@@ -381,7 +382,7 @@ public:
     void requireMetadataReadOnly(const void *metadata,std::size_t bytes)const
     {
         if(overlaps(output_,rows_*columns_*sizeof(float),metadata,bytes))
-            throw std::invalid_argument("Q16 RMS output aliases retained invocation metadata");
+            rms_numeric::rejectPolicy("Q16 RMS output aliases retained invocation metadata");
     }
 private:
     /** @brief Retain only validated original addressing and policy.
