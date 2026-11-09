@@ -256,3 +256,12 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
 - Owner: 18 census assemblies zero structural errors + identical counts
   (budget JSON unchanged); 33 tests; Mac AppleClang E2E green (WeightView.h
   touch re-runs edge). GNU-14 .80 E2E queued (5-min).
+
+- e6afa66e8 GNU-14 E2E GREEN (arm-sparks, .80): witness PASS 176 programs;
+  4/4 tests; proof GNU-14 NEON_I8MM 242 inputs, total 1274. SOURCE117 now has
+  GNU-14 + AppleClang end-to-end evidence. Lifecycle flag resolved: .80 tree's
+  CONFIGURE_DEPENDS glob re-runs CMake every invocation → `ninja -n` shows only
+  manifest regen; the REAL build after rm proof.s re-ran the witness edge
+  (PASS line + "Generating proof.json, proof.s" = build-only output); Mac tree
+  (stable manifest) lists the edge directly; proof.s = declared OUTPUT +
+  DEPENDS → lifecycle holds.
