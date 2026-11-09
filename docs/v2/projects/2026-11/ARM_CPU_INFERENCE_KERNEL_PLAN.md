@@ -10,6 +10,17 @@ existing Intel path, not merely a successful configure or primitive benchmark.
 
 ### Verified frontier — 2026-11-06
 
+The validated K11 slice closes native sparse-indexer arithmetic/resource
+slice: all229 configured core-free tests pass on five native profiles, and all179
+preflight cells pass20 times per profile. It is not an engine/serving certificate.
+Twelve optimized-sanitizer RMS transform warnings remain open in
+[issue36](https://github.com/Llaminar/llaminar/issues/36); canonical engine gates,
+complete indexer M/worker coverage, native-x86 current-source proof and economy
+remain unfinished. The fresh Git-bound canonical hook fails OpenMP discovery
+before native macOS memory admission; no full-engine gate passes. Source-only
+reviews and old published packets do not replace
+those gates. Exact retained evidence and boundaries follow below.
+
 The immutable `4e56c543` successor now has independently audited native x86
 AQ8/value/lookup correctness:24 registrations and12 focused cells×20 per ISA,
 then actual AVX512-built/runtime-AVX2 binaries and three default-ISA byte-auth
@@ -60,9 +71,76 @@ value hot loops have native FMAs and no hot stack/calls; this is static ISA, not
 PMU/economy. These remain local kernel/caller proofs, not native-x86 sparse,
 complete-engine/factory/PMA/serving or economical grouped execution certificates.
 
+The independent tester then found two real numerical/lifecycle defects: a669
+GNU14 contracts FP32 indexer RoPE differently from Clang, and c759/K2 recovering
+UBSan reports null-score pointer arithmetic despite GTest success. Old sanitizer
+case counts are not UB-free certificates. The separated native indexer and
+conditional score-address fix pass32 callers with fatal UBSan on sealed K3 and
+genuine GNU14; the original-object and unguarded-score controls fail. K3 resource
+audits still show GNU14 FP16 summary and Clang FP16 table-RoPE vector spills.
+K4 sequences native register lifetimes without changing arithmetic, repairs the
+perf-only registration omission and pins native/mixed rotary16/18 in addition
+to scalar rotary2. Native three-profile/fatal-sanitizer and GNU14 positive/negative
+regressions pass, and actual vector-pressure spills disappear. Scalar position/
+output-pointer spills and policy reloads remain inside table loops, so K4 is not
+zero-spill/economy qualified. Working K5 binds one typed table/analytic source per
+head, borrowing original roots/frequencies rather than output-aliasable policy
+rereads. Its optimized-sanitizer run exposes42 one-ULP FP32 analytic assertions:
+Clang pairs cosf/sinf into a different Apple libm ABI. K5 is preserved RED before
+GNU14/resource work; source ACK79 is not numeric certification. Working K6 seals
+the two separate public host elementary calls with native register dependencies,
+keeps the oracle independent through volatile public-function pointers, and adds
+an explicit public-entry regression using genuine setup frequencies. K6 passes
+the original32 cases but its new fixture's input1 legitimately equals cosf==1,
+so the strict alias-poison precondition fails before that invocation. Working
+K7 uses input2/epsilon2/exact inverse1/2 to retain normalized1/0 and all poison
+checks, with no production change. Native three-profile and GNU14 runs pass33
+callers/32 focused registrations; actual libm closure uses only public unary
+calls, and the old paired-call object fails the new/broad byte regressions.
+K7 analytic-copy/inlined-pool GPR debt is closed by K8's sealed analytic64 and
+outlined native pool phase: actual Clang/GNU14 prepare/pool/rotate call-free
+cycles have zero vector/GPR stack traffic, numerics33/registrations32 pass and
+public libm closure remains exact. K9's isolated original-root score phase fixes
+caller GPR pressure and passes34 callers/33 registrations, but GNU14 hoists an
+entire128-float pool across heads, causing seven q-register and scalar-constant
+spills. K10 closes that RED with an unchanged-root compiler dependency: actual
+native34/33 passes and the29 profiled preparation/scoring caller/helper functions
+have no stack accesses on call-free cycles, with original math/public libm
+retained. Exact identity removal restores the GNU spills while math still passes.
+Tie reversal fails all24 score cells, but head reversal stops at the first FP32
+fatal assertion, leaving actual FP16/BF16 negatives unobserved in that first
+attempt. K11 retains every score-word bit check/zero-mismatch requirement with
+nonfatal cell reports; actual rebound head/tie controls now fail24/24 cells on
+all three native validation profiles. Its full core-free five-profile matrix
+passes229 cases and179×20 preflights each, with separate LLVM22/DotProd resource
+proof. The12 non-QSA RMS sanitizer warnings are not waived. No production,
+geometry, expected-word or registration change is introduced by K11. Full
+indexer M/all-worker coverage, complete engine gates and economy remain open;
+static resources are not allocation, lease or runtime-synchronization proofs.
+No complete M1 indexer replay is introduced.
+The operator-assigned arm-sparks session owns all Spark/related remote
+coordination, with verified DATA-only handoffs and no inherited execution or
+resource grant. Historical WSL SDK/intake paths are not assumed live after
+reported cleanup; fresh restoration/owner/window admission is required. The
+user-designated tester owns all local builds/long checks on immutable snapshots;
+Main retains implementation/source publication. See the evidence record for
+exact snapshots and retained first failures.
+
+A separate source audit confirms the handoff's UMA concern is an implementation
+gap, not a solved feature: CPU and CUDA observations become separate `(rank,
+device)` resources and admission checks each BOM independently. One registry
+therefore does not constrain their joint GB10 LPDDR footprint. Shared-capacity
+work (task39, blocking target15) must add typed physical-pool constraints inside
+PMA, preserve allocator-specific limits/RAII/backing identities and test combined
+CPU+GPU pressure before mixed-overlay/model admission. Actual CUDA-free versus
+host/file-cache observations remain unverified on hardware. No second ledger,
+blind capacity minimum or duplicate residency credit is an acceptable repair.
+
 Finish optimized compiler/resource/economy and native-x86 validation; retain the
-same-head in-place indexer and representation programs. Then seal a fresh source and obtain a separate app/gate-target build-only
-window. No old source token/window, model admission or full-engine pass is inherited.
+same-head in-place indexer and representation programs. Obtain a separately
+reviewed app/gate-target build-only window using one exact sealed source and
+fully authenticated offline dependency closure. No old source token/window,
+metadata-only closure, model admission or full-engine pass is inherited.
 
 ## 1. Mandate and completion criteria
 
@@ -614,6 +692,17 @@ this machine. In particular, `BF16=0` does not remove BF16 tensor support:
 widen the exact bit representation into FP32 and execute the established
 FP32 accumulation/rounding policy. Hardware feature absence is not permission
 to advertise fewer source tensor formats.
+
+This M1 boundary is not a blanket GB10 deferral. On the primary Spark target,
+verify actual native HWCAP/compiler admission, then evaluate an I8MM row-pair
+candidate against ASIMD/SDOT for grouped M. Preserve the existing64×32 packing
+where exact operand assembly permits it, prove scale-subgroup and integer-bound
+semantics, odd rows/tails and the original per-column FP32 program, and require
+native economy/resource evidence before installing any exact overlay. MAC count
+alone does not establish a speedup. Keep X925/A725/mixed placement and every
+positive worker count through20 distinct; weighted output-column ownership may
+change scheduling but never the arithmetic K partition/fold. No I8MM kernel or
+weighted production policy is currently qualified by the M1 leaf results.
 
 ### 4.3 Reuse the physical packed layout first
 

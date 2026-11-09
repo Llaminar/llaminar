@@ -4,7 +4,9 @@
 # The complete build retains its ordinary process owner, gate dependencies and
 # labels through add_v2_test. The explicit test-only portability project uses
 # plain CTest over the identical production sources; it does not certify the
-# full engine or replace the complete Unit/preflight inventory.
+# full engine or replace the complete Unit/preflight inventory. Undefined-
+# behavior sanitizer diagnostics are fatal: a recovering runtime must never
+# turn a GTest/CTest success into a false sanitizer-clean receipt.
 include_guard(GLOBAL)
 
 # @brief Register a device-free test with the available directory's test authority.
@@ -13,10 +15,15 @@ include_guard(GLOBAL)
 function(v2_add_core_free_test name)
     cmake_parse_arguments(PARSE_ARGV 1 ARG "" "" "COMMAND;LABELS")
     if(COMMAND add_v2_test)
+        # The directory authority owns registration and intentional omission
+        # atomically (notably perf-only builds); never decorate an absent test.
         add_v2_test(${name} COMMAND ${ARG_COMMAND} LABELS ${ARG_LABELS}
-            NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30)
+            NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30
+            ENVIRONMENT "UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1")
     else()
         add_test(NAME ${name} COMMAND ${ARG_COMMAND})
-        set_tests_properties(${name} PROPERTIES LABELS "${ARG_LABELS}" TIMEOUT 30)
+        # Failure reporting only: no floating-point/kernel arithmetic changes.
+        set_tests_properties(${name} PROPERTIES LABELS "${ARG_LABELS}" TIMEOUT 30
+            ENVIRONMENT "UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1")
     endif()
 endfunction()
