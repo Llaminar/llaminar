@@ -2254,8 +2254,8 @@ Seals live in the Spark results archive named below.
 | GB10 integrated GPU (with `codex/cuda-sm121-spills`) | zero-spill sm_121 build, joint-pool admission and over-subscription rejection, 35B 132/97 tok/s, deterministic across fresh processes | `K14-UMA-MERGED-BEF53EDB6-FINAL-20261108`, `98e427c7c` |
 | Refresh-suite CTest timeout | CTest PROCESSOR_AFFINITY grants at most the parallel level; not a defect | `K14-REFRESH-CONFIRM-A8D380CD0`, `a8d380cd0` |
 
-Out of scope for this branch and tracked in
-[`arm-perf-review/`](arm-perf-review/README.md): I8MM grouped rows and 27B
+Out of scope for this branch and tracked on the separate
+`codex/arm-perf-review` branch: I8MM grouped rows and 27B
 dense MTP economics, GDN grouped verifier, FA2 policy regret, region/barrier
 count, LM head, placement by core class, in-model overlay collection, GB10 CUDA
 register pressure (separate branch), NUMA-less hosts and a native macOS engine
