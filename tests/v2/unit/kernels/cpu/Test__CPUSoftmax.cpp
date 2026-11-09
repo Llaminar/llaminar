@@ -498,11 +498,28 @@ template<Storage Format>void groupedRows(int maximum_workers)
     }
 }
 /** @test All original M1..16/31/33 rows retain actual production serial bytes at every positive worker count. */
-TEST(CPUSoftmax, AllPositiveWorkersRetainOriginalSerialRows)
+TEST(CPUSoftmax, AllPositiveWorkersRetainOriginalSerialRowsFP32)
 {
     const TeamPolicy policy;
-    groupedRows<Storage::FP32>(policy.threads());groupedRows<Storage::BFloat16>(policy.threads());
-    groupedRows<Storage::Half>(policy.threads());groupedRows<Storage::Q8_1>(policy.threads());
+    groupedRows<Storage::FP32>(policy.threads());
+}
+/** @test Same whole-team sweep for BF16 storage; one storage per test keeps each within budget. */
+TEST(CPUSoftmax, AllPositiveWorkersRetainOriginalSerialRowsBF16)
+{
+    const TeamPolicy policy;
+    groupedRows<Storage::BFloat16>(policy.threads());
+}
+/** @test Same whole-team sweep for FP16 storage. */
+TEST(CPUSoftmax, AllPositiveWorkersRetainOriginalSerialRowsFP16)
+{
+    const TeamPolicy policy;
+    groupedRows<Storage::Half>(policy.threads());
+}
+/** @test Same whole-team sweep for Q8_1 storage. */
+TEST(CPUSoftmax, AllPositiveWorkersRetainOriginalSerialRowsQ8_1)
+{
+    const TeamPolicy policy;
+    groupedRows<Storage::Q8_1>(policy.threads());
 }
 /** @brief Observe an empty collective's completion before its enclosing team join.
  * @tparam Format Original storage.

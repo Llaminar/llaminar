@@ -265,6 +265,7 @@ TEST(CPUImmutableLookupRows,IQ4OriginalCodebookScalesAndPartialRows)
         {
             constexpr std::size_t count=5;
             const auto stride=strideFor(TensorType::IQ4_NL,width),blocks=stride/sizeof(IQ4_NLBlock);
+            ASSERT_GT(blocks,0u)<<"Every positive width occupies at least one original block";
             std::vector<IQ4_NLBlock>native(count*blocks);
             std::vector<float>expected(count*width),storage(count*width+14,canary);
             auto output=std::span(storage).subspan(7,count*width);
