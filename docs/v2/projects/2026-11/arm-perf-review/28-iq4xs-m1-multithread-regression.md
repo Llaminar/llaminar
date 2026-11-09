@@ -203,3 +203,15 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   evidence = timing recovery + zero-spill census only.
 - STATUS: idea 28 RESOLVED with b01d285dc; idea 29 open (pre-existing grouped
   spills). SOURCE116 tooling successor submitted (f6be6b510).
+
+## SOURCE116 owner evidence (f6be6b510) — GNU-14 .80 E2E green
+
+- Witness PASS 176 programs (Rows=1 zero; grouped within budget, total 1274
+  == committed GNU-14 budget); proof binds 242 inputs; recorded identity
+  GNU-14 == configured; 4/4 tests (TileRegisterEvidence + NEONTileRegisters,
+  Unit+Integration); lifecycle: removing proof.s re-ran exactly the witness
+  edge, next dry run no witness work (Ninja -n CONFIGURE_DEPENDS glob
+  re-check = pre-existing, unrelated).
+- Owner evidence set: Mac AppleClang E2E; .80 GNU-14 E2E; census 9 GNU + 9
+  AppleClang assemblies, zero structural errors; 27 adversarial tests.
+- R1: complete from the lane (SOURCE116 under review; WSL x86 gate pending).
