@@ -34,6 +34,17 @@ v2_add_core_free_test(V2_Integration_DeviceFreeImageFixtureOwnership
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/scripts/test_production_pipeline.py"
         CrossHostRunnerTests.test_report_artifacts_survive_staging_cleanup_on_success_and_failure
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Build Ownership Regression)
+foreach(_stage_header_suite IN ITEMS Unit Integration)
+    if(_stage_header_suite STREQUAL "Unit")
+        set(_stage_header_labels V2 Unit CPU DeviceFree Architecture)
+    else()
+        set(_stage_header_labels V2 Integration ProductionTestPreflight CPU DeviceFree Architecture Regression)
+    endif()
+    v2_add_core_free_test(V2_${_stage_header_suite}_CPUCacheAppendHeaderBoundary
+        COMMAND "${Python3_EXECUTABLE}" -B
+            "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_stage_header_boundary.py"
+        LABELS ${_stage_header_labels})
+endforeach()
 v2_add_core_free_test(V2_Unit_CPUHostTopology
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_host_topology.py"
@@ -103,8 +114,22 @@ v2_add_core_free_test(V2_Integration_OneDNNCompilerArgumentIdentity
         --cmake "${CMAKE_COMMAND}" --ninja "${CMAKE_MAKE_PROGRAM}"
         OneDNNBuildLifecycleTest.test_compiler_arg1_is_forwarded_and_changes_identity
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Build ISA Regression)
+add_executable(v2_test_q16_1_rmsnorm
+    "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/ops/Test__Q16_1RMSNorm.cpp"
+    "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/primitives/RMSNormPrimitives.cpp")
+target_compile_features(v2_test_q16_1_rmsnorm PRIVATE cxx_std_23)
+target_include_directories(v2_test_q16_1_rmsnorm PRIVATE
+    "${V2_CPU_ARCHITECTURE_ROOT}/src/v2" "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2")
+target_link_libraries(v2_test_q16_1_rmsnorm PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX)
+v2_add_core_free_test(V2_Unit_Q16_1RMSNorm
+    COMMAND $<TARGET_FILE:v2_test_q16_1_rmsnorm>
+    LABELS V2 Unit CPU DeviceFree Kernels RMSNorm Q16_1 TypedResiduals)
+v2_add_core_free_test(V2_Integration_CPURMSNormQ16LegacyCoverage
+    COMMAND $<TARGET_FILE:v2_test_q16_1_rmsnorm>
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Q16_1 Regression)
 add_executable(v2_test_cpu_rmsnorm_workshare
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPURMSNormWorkshare.cpp"
+    "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/kernels/cpu/Test__CPUQuantizedRMSNorm.cpp"
     "${V2_CPU_ARCHITECTURE_ROOT}/src/v2/kernels/cpu/primitives/RMSNormPrimitives.cpp")
 target_compile_features(v2_test_cpu_rmsnorm_workshare PRIVATE cxx_std_23)
 target_include_directories(v2_test_cpu_rmsnorm_workshare PRIVATE
@@ -132,6 +157,27 @@ v2_add_core_free_test(V2_Integration_CPURMSNormAllPositiveWorkers
 v2_add_core_free_test(V2_Integration_CPURMSNormOriginalBankAliases
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=*OriginalBankAndPolicyAliasesRejectBeforeMutation
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Ownership Regression)
+v2_add_core_free_test(V2_Integration_CPURMSNormQ16Geometry
+    COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=*Q16CompleteGeometryRejectsBeforeStores
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Q16 Geometry Regression)
+v2_add_core_free_test(V2_Integration_CPURMSNormQ16Expansion
+    COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=*Q16ExpansionProtectsCompleteOriginalBanks
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Q16 Ownership Regression)
+v2_add_core_free_test(V2_Integration_CPURMSNormQ16EmptyCompletion
+    COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=*Q16EmptyRetainedInvocationCompletes
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Q16 Ownership Regression)
+v2_add_core_free_test(V2_Integration_CPURMSNormQ16AllPositiveWorkers
+    COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=*Q16AllPositiveWorkersThroughTenRetainSerialBytes
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Q16 ByteExact)
+v2_add_core_free_test(V2_Integration_CPURMSNormQ16NumericalProgram
+    COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=*Q16RoundedSquaresAndOriginalMetadataMatchIndependentProgram
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Q16 ByteExact Regression)
+v2_add_core_free_test(V2_Integration_CPURMSNormQ16ReductionTreeIdentity
+    COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=*Q16ReductionTreeIdentityRemainsISASpecific
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Q16 ISA ByteExact Regression)
+v2_add_core_free_test(V2_Integration_CPURMSNormQ16Policy
+    COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=*Q16PolicyAndNonfiniteSummaryFailHard
+    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Q16 Ownership Regression)
 v2_add_core_free_test(V2_Integration_CPURMSNormPortableHalfTail
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=*PortableHalfNormalRoundingIsLaneIndependent
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm FP16 ByteExact Regression)
