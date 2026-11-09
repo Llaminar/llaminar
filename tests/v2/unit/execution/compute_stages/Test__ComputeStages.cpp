@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "execution/compute_stages/ComputeStages.h"
+#include "../../../utils/CPURoPETestBinding.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/moe/DeviceMoETransferSlotDirectory.h"
 #include "execution/moe/MoERuntimeTable.h"
@@ -1315,6 +1316,7 @@ TEST_F(ComputeStagesTest, RoPEStage_PreservesNorm)
         .theta_base = 10000.0f};
 
     RoPEStage stage(params);
+    const test::StageWorkspaceTestBinding workspace(stage, seq_len);
 
     bool success = false;
     try
