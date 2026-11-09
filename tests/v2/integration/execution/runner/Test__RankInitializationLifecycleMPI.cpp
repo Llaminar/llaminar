@@ -263,6 +263,7 @@ namespace llaminar2::test
         {
             inventory.ranks[index].rank = index;
             inventory.ranks[index].node_id = 0;
+            inventory.ranks[index].local_rank = index;
         }
         const auto execution = resolveMoEExpertOverlayExecutionPlan(overlay,
             {.current_world_rank = rank, .world_size = 2});
