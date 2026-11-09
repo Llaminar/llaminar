@@ -43,6 +43,16 @@ namespace llaminar2::cpu::native_quantised
             const auto active = activeISALevel();
             if (path == ISAPath::NEON || (path == ISAPath::AUTO && active == ISALevel::NEON))
                 return multi_scale::NEONByteDot::ASIMD;
+#if LLAMINAR_COMPILED_WITH_NEON_I8MM
+            // The I8MM envelope keeps the DotProd arithmetic level. Automatic
+            // selection takes its row-pair family; explicit SDOT stays a real leaf.
+            if (path == ISAPath::NEON_I8MM || (path == ISAPath::AUTO && active == ISALevel::NEONDotProd))
+            {
+                ARMCPUCapabilities::native().require(ARMCPUFeature::DotProd);
+                ARMCPUCapabilities::native().require(ARMCPUFeature::IntegerMatMul);
+                return multi_scale::NEONByteDot::I8MM;
+            }
+#endif
 #if defined(__ARM_FEATURE_DOTPROD)
             if (path == ISAPath::NEON_DOTPROD || (path == ISAPath::AUTO && active == ISALevel::NEONDotProd))
             {
@@ -144,6 +154,9 @@ namespace llaminar2::cpu::native_quantised
          */
         inline void execute(const CPUNativeNEONProjectionBatch &batch, multi_scale::NEONByteDot dot)
         {
+#if LLAMINAR_COMPILED_WITH_NEON_I8MM
+            if (dot == multi_scale::NEONByteDot::I8MM) return batch.execute<multi_scale::NEONByteDot::I8MM>();
+#endif
 #if defined(__ARM_FEATURE_DOTPROD)
             if (dot == multi_scale::NEONByteDot::DotProd) return batch.execute<multi_scale::NEONByteDot::DotProd>();
 #endif
@@ -602,6 +615,15 @@ namespace llaminar2::cpu::native_quantised
             };
             OMP_WORKSHARE_REGION(workshare);
         };
+#if LLAMINAR_COMPILED_WITH_NEON_I8MM
+        if (dot == multi_scale::NEONByteDot::I8MM)
+        {
+            ARMCPUCapabilities::native().require(ARMCPUFeature::DotProd);
+            ARMCPUCapabilities::native().require(ARMCPUFeature::IntegerMatMul);
+            pooled.template operator()<multi_scale::NEONByteDot::I8MM>();
+            return true;
+        }
+#endif
 #if defined(__ARM_FEATURE_DOTPROD)
         if (dot == multi_scale::NEONByteDot::DotProd)
         {

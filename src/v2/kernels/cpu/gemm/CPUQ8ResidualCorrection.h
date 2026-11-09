@@ -104,6 +104,11 @@ inline void cpuNativeResidualChunk(const CPUNativeQuantisedPackedWeights &packed
  float *destination0,float *destination1,int chunk,int valid,CPUQ8ResidualISA avx512)
 {
 #if defined(__aarch64__) && defined(__ARM_NEON)
+#if LLAMINAR_COMPILED_WITH_NEON_I8MM
+ if(avx512==multi_scale::NEONByteDot::I8MM)
+  return nativeNEONResidualChunk<multi_scale::NEONByteDot::I8MM>(packed.readView(),primary0,residual0,primary1,residual1,
+    destination0,destination1,chunk,valid);
+#endif
 #if defined(__ARM_FEATURE_DOTPROD)
  if(avx512==multi_scale::NEONByteDot::DotProd)
   return nativeNEONResidualChunk<multi_scale::NEONByteDot::DotProd>(packed.readView(),primary0,residual0,primary1,residual1,

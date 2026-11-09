@@ -258,6 +258,12 @@ namespace llaminar2::cpu::native_quantised::multi_scale
 
 #endif // native x86 SIMD operations
 
+    /**
+     * @brief Whether an ISA operation set consumes shared-row tiles in row pairs.
+     * @tparam Ops Native operation set; only the AArch64 I8MM family declares row pairs.
+     */
+    template <typename Ops> inline constexpr bool usesRowPairs = requires { requires Ops::row_pairs; };
+
     /** @brief Load a SIMD value without imposing aliasing or alignment on the caller. */
     template <typename V> inline V load(const void *source)
     {
@@ -349,6 +355,99 @@ namespace llaminar2::cpu::native_quantised::multi_scale
     }
 
     /**
+     * @brief Apply one half's four groups to row pairs with two-row matrix dots.
+     * @tparam Codebook Native source execution codebook.
+     * @tparam Half Zero for K0..15 or one for K16..31.
+     * @tparam Rows Shared rows in [2,4]; an odd last row keeps the single-row leaf.
+     * @param unit Native unit, shared by every row.
+     * @param column First SIMD output column.
+     * @param activation Persistent quantized rows.
+     * @param kb Source block index.
+     * @param dots One independent exact integer accumulator per row.
+     *
+     * Each group pair is decoded exactly as dotHalf decodes it and consumed in
+     * one pairDot per row pair. The integer sums cover the same products of
+     * the same half, so every row's INT32 result equals the single-row walk.
+     */
+    template <int Codebook, int Half, int Lanes, size_t Rows, typename Ops>
+    inline void dotHalfRowPairs(const uint8_t *unit, int column,
+                                const std::array<const Q8_1Block *, Rows> &activation,
+                                int kb, typename Ops::I (&dots)[Rows])
+    {
+        using I = typename Ops::I;
+        static_assert(Lanes == 4 && Rows >= 2 && Rows <= 4);
+        constexpr size_t pairs = Rows / 2;
+        I columns01[pairs]{}, columns23[pairs]{};
+        // Consume two adjacent four-value groups starting at activation byte
+        // `offset`. The odd last row retains the SDOT leaf in group order.
+        const auto consume = [&](I first, I second, int offset) {
+#pragma GCC unroll 2
+            for (size_t pair = 0; pair < pairs; ++pair)
+                Ops::pairDot(columns01[pair], columns23[pair],
+                    Ops::activationPair(activation[2 * pair][kb].qs + offset,
+                                        activation[2 * pair + 1][kb].qs + offset),
+                    first, second);
+            if constexpr (Rows % 2 != 0)
+            {
+                int word0 = 0, word1 = 0;
+                std::memcpy(&word0, activation[Rows - 1][kb].qs + offset, 4);
+                std::memcpy(&word1, activation[Rows - 1][kb].qs + offset + 4, 4);
+                dots[Rows - 1] = Ops::dot(dots[Rows - 1], first, I{} + word0);
+                dots[Rows - 1] = Ops::dot(dots[Rows - 1], second, I{} + word1);
+            }
+        };
+        if constexpr (Codebook == 13 || Codebook == 14 || Codebook == 17)
+        {
+            const auto quarter = [&]<int Q>() {
+                const auto word = [&](int offset) {
+                    return load<I>(unit + offset * 256 + column * 4);
+                };
+                I index = (word(0) >> (Q * 8)) & 255;
+                if constexpr (Codebook == 17)
+                    index |= ((word(1) >> ((Q / 2) * 8 + (Q % 2) * 4)) & 7) << 8;
+                else
+                {
+                    constexpr int bits = Codebook == 13 ? 2 : 1;
+                    index |= ((word(1) >> (Q * bits)) & ((1 << bits) - 1)) << 8;
+                }
+                const uint64_t *table = Codebook == 17 ? iq1s_grid
+                    : Codebook == 13 ? iq2s_grid : iq2xs_grid;
+                I low, high;
+                Ops::gridPair(table, index, low, high);
+                if constexpr (Codebook != 17)
+                {
+                    constexpr int sign_byte = 5 + Q;
+                    const I signs = Ops::template repeatByte<sign_byte % 4>(word(sign_byte / 4));
+                    low = Ops::template signGrid<0>(low, signs);
+                    high = Ops::template signGrid<1>(high, signs);
+                }
+                // One grid entry is eight consecutive K values per column:
+                // its low/high halves are exactly one adjacent group pair.
+                consume(low, high, Q * 8);
+            };
+            quarter.template operator()<Half * 2>();
+            quarter.template operator()<Half * 2 + 1>();
+        }
+        else
+        {
+            const auto group_pair = [&]<int G>() {
+                consume(decodeLinear<Codebook, G, Lanes, Ops>(unit, column),
+                        decodeLinear<Codebook, G + 1, Lanes, Ops>(unit, column), G * 4);
+            };
+            group_pair.template operator()<Half * 4>();
+            group_pair.template operator()<Half * 4 + 2>();
+        }
+#pragma GCC unroll 2
+        for (size_t pair = 0; pair < pairs; ++pair)
+        {
+            I row0, row1;
+            Ops::splitPair(columns01[pair], columns23[pair], row0, row1);
+            dots[2 * pair] += row0;
+            dots[2 * pair + 1] += row1;
+        }
+    }
+
+    /**
      * @brief Apply all four groups of a half to every independently accumulated row.
      * @tparam Half Zero for K0..15 or one for K16..31.
      * @param unit Native unit, shared by every row.
@@ -366,7 +465,9 @@ namespace llaminar2::cpu::native_quantised::multi_scale
                         int kb, typename Ops::I (&dots)[Rows])
     {
         using I = typename Ops::I;
-        if constexpr (Codebook == 13 || Codebook == 14 || Codebook == 17)
+        if constexpr (usesRowPairs<Ops> && Rows >= 2)
+            return dotHalfRowPairs<Codebook, Half, Lanes, Rows, Ops>(unit, column, activation, kb, dots);
+        else if constexpr (Codebook == 13 || Codebook == 14 || Codebook == 17)
         {
             const auto quarter = [&]<int Q>() {
                 const auto word = [&](int offset) {
