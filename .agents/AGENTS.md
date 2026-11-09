@@ -751,6 +751,13 @@ cmake -B build_v2_integration -S src/v2 -G Ninja \
 cmake --build build_v2_integration --parallel
 ```
 
+For ARM port work, `cmake/CPUInstructionSet.cmake` owns the architecture/ISA
+compiler envelope; `src/v2/utils/ARMCPUFeatures.h` owns native optional-instruction
+observations. The core-free `tests/v2/portability` project uses the normal CPU
+architecture regression registrations; see the README's AArch64 checks.
+Passing those checks does not certify inference: complete native kernels and
+OS lifecycle support are still required before advertising an ARM runtime.
+
 The supported build types are `Debug`, `Release`, and `Integration`. CUDA and
 ROCm are both enabled by default. Disable an unavailable toolchain explicitly,
 for example:
