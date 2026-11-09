@@ -58,8 +58,14 @@ def row(choice="Pairwise", *, contract=None, members=None, holdout=False):
 
 def observe(raw):
     """Use the common strong adapter's intentionally non-installable smoke context."""
-    return adapt_cpu_execution_exact_row(raw, CPUVerifierAdapterContext.workflow_smoke(
+    result = adapt_cpu_execution_exact_row(raw, CPUVerifierAdapterContext.workflow_smoke(
         corpus_id="sha256:" + "2" * 64))
+    # Authored common-witness metadata for clean batch admission controls. This
+    # is not a measured native producer or a claim about legacy CSV clocks.
+    return replace(result, physical_launch_evidence={**result.physical_launch_evidence,
+        "native_timing_owner": "CPUExecutionExactBatch",
+        "native_timing_schema": "cpu_execution_exact_native_v1",
+        "timed_collection_disabled": True, "timed_projection_observations": 0})
 
 
 class CPUExecutionExactTest(unittest.TestCase):
@@ -172,7 +178,7 @@ class CPUExecutionNativeEvidenceTest(unittest.TestCase):
         from native_quantised_dispatch.adapters.evidence import summarize_sorted_timing
         contract = key(rows=m); source = row(contract=contract)
         summary = summarize_sorted_timing((10.0, 11.0, 13.0))
-        return dict(schema='cpu_execution_exact_native_v1', exact_key=contract.scalars(),
+        return dict(schema='cpu_execution_exact_native_v1', request_id='synthetic-batch-request', exact_key=contract.scalars(),
             descriptor_keys=[contract.scalars()] * 2, descriptor_policies=[0, 0],
             baseline_descriptor_policies=[0, 0], target_descriptor=0, candidate='Pairwise',
             exact_key_verified=True, source_format='Q4_K', source_superblock=True,
@@ -187,7 +193,9 @@ class CPUExecutionNativeEvidenceTest(unittest.TestCase):
             correctness=dict(mismatch_count=0, nonfinite_count=0, actual_digest=source['grouped_output_digest'],
                 expected_digest=source['serial_output_digest'], max_abs=0, relative_l2=0, cosine=1,
                 symmetric_kld=0, guard_replays=2, bitwise_equal=True),
-            counters=dict(enabled=True, projection_observations=2, expected_projection_observations=2,
+            counters=dict(enabled=True, projection_observations=4, expected_projection_observations=4,
+                timed_collection_disabled=True, timed_projection_observations=0,
+                sample_observation_basis='untimed_guard_calls_only',
                 authentication_calls=1, authentication_outside_timing=True,
                 authenticated_projection_observations=2, route_records=[dict(count=2)]),
             placement=dict(workers=28, admitted_physical_cores=28, disjoint_single_core_masks=True))
@@ -197,6 +205,80 @@ class CPUExecutionNativeEvidenceTest(unittest.TestCase):
             path = Path(directory) / 'native.json'; path.write_text(json.dumps(payload))
             return adapt_cpu_execution_exact_native(path, CPUVerifierAdapterContext.workflow_smoke(
                 corpus_id='sha256:' + '2' * 64), holdout=False)
+
+    def test_batch_timing_requires_true_collection_disabled_and_exact_zero(self):
+        from copy import deepcopy
+        original = self.payload()
+        for name, value in (("timed_collection_disabled", None),
+                ("timed_collection_disabled", False), ("timed_collection_disabled", 1),
+                ("timed_projection_observations", None), ("timed_projection_observations", 1),
+                ("timed_projection_observations", False), ("timed_projection_observations", "0")):
+            bad = deepcopy(original)
+            if value is None: bad['counters'].pop(name)
+            else: bad['counters'][name] = value
+            with self.subTest(name=name, value=value), self.assertRaisesRegex(ValueError, 'disabled timed collection'):
+                self.adapt(bad)
+        result = self.adapt(original)
+        self.assertIs(result.physical_launch_evidence.get('timed_collection_disabled'), True)
+        self.assertEqual(result.physical_launch_evidence['timed_projection_observations'], 0)
+        for changes in ({'projection_observations': 0, 'expected_projection_observations': 0},
+                        {'sample_observation_basis': 'screen_and_final_timed_calls_only'}):
+            bad = deepcopy(original); bad['counters'].update(changes)
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, 'untimed guards'):
+                self.adapt(bad)
+
+    def test_publication_rechecks_batch_raw_markers_and_rejects_nonbatch_diagnostic(self):
+        from copy import deepcopy
+        from native_quantised_dispatch.cpu_exact_overlay import require_execution_exact_publication_timing, canonical_digest
+        context = CPUVerifierAdapterContext.workflow_smoke(corpus_id='sha256:' + '2' * 64)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'original.json'; payload = self.payload()
+            path.write_text(json.dumps(payload))
+            result = adapt_cpu_execution_exact_native(path, context, holdout=False)
+            require_execution_exact_publication_timing(result)
+            # A reserialized common row cannot lose the additive marker.
+            for field in ('timed_collection_disabled', 'timed_projection_observations'):
+                witness = dict(result.physical_launch_evidence); witness.pop(field)
+                with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'disabled timed collection'):
+                    require_execution_exact_publication_timing(replace(result, physical_launch_evidence=witness))
+            # Historical common rows lack the new owner tag. Original typed raw
+            # batch provenance still rejects dirty clocks; no path-name heuristic.
+            bad = deepcopy(payload); bad['counters'].pop('timed_collection_disabled')
+            path.write_text(json.dumps(bad)); witness = dict(result.physical_launch_evidence)
+            for field in ('native_timing_owner', 'timed_collection_disabled', 'timed_projection_observations'):
+                witness.pop(field)
+            witness['native_evidence_mapping_digest'] = canonical_digest(bad)
+            with self.assertRaisesRegex(ValueError, 'disabled timed collection'):
+                require_execution_exact_publication_timing(replace(result, physical_launch_evidence=witness))
+            # The separate standalone diagnostic remains parseable/profileable,
+            # but its declared instrumented clocks cannot publish NEW exact rows.
+            standalone = deepcopy(payload); standalone.pop('request_id')
+            standalone['counters'].pop('timed_collection_disabled')
+            standalone['counters'].pop('timed_projection_observations')
+            standalone['counters'].pop('sample_observation_basis')
+            path.write_text(json.dumps(standalone))
+            diagnostic = adapt_cpu_execution_exact_native(path, context, holdout=False)
+            self.assertEqual(diagnostic.median_us, 11.)
+            from native_quantised_dispatch.profiler_evidence import profiler_request_for_observation
+            self.assertTrue(profiler_request_for_observation(diagnostic).request_id)
+            with self.assertRaisesRegex(ValueError, 'nonbatch.*diagnostic'):
+                select_execution_exact_entries([diagnostic])
+
+    def test_winner_publication_requires_clean_timing_on_every_member(self):
+        contract = key(); mixed = [contract, key(rows=1)]
+        clean = [observe(row(candidate)) for candidate in ('Pairwise', 'WideRows')]
+        clean += [observe(row(candidate, members=mixed, holdout=True)) for candidate in ('Pairwise', 'WideRows')]
+        self.assertTrue(select_execution_exact_entries(clean)[0])
+        for index in range(len(clean)):
+            witness = dict(clean[index].physical_launch_evidence)
+            witness.pop('timed_collection_disabled')
+            bad = list(clean); bad[index] = replace(bad[index], physical_launch_evidence=witness)
+            with self.subTest(index=index), self.assertRaisesRegex(ValueError, 'disabled timed collection'):
+                select_execution_exact_entries(bad)
+        raw_diagnostic = adapt_cpu_execution_exact_row(row(), CPUVerifierAdapterContext.workflow_smoke(
+            corpus_id='sha256:' + '2' * 64))
+        with self.assertRaisesRegex(ValueError, 'known uninstrumented'):
+            select_execution_exact_entries([raw_diagnostic])
 
     def test_actual_samples_remain_whole_bundle_and_round_trip_profile_identity(self):
         from native_quantised_dispatch.profiler_evidence import profiler_request_for_observation, ProfilerRequest
@@ -307,6 +389,9 @@ class CPUExecutionNativeEvidenceTest(unittest.TestCase):
         payload.update(schema='cpu_execution_exact_profile_v1', request_id=request.request_id,
             profile_request_id=request.request_id, profiled_calls=1, preconditioning_calls=2,
             activation_layout='aligned_tightly_packed_expert_rows_v1', activation_row_offsets=[0, 64])
+        payload['counters'].update(projection_observations=2, expected_projection_observations=2)
+        payload['counters'].pop('timed_collection_disabled')
+        payload['counters'].pop('timed_projection_observations')
         payload['counters']['route_records'][0]['tags'] = dict(m='64', n='320', policy_n='320',
             k='2560', codebook='5', k_tiles='16', ambient_n_block_chunks='1',
             isa='AVX512', purpose='prefill', effective_verifier_policy='Pairwise')

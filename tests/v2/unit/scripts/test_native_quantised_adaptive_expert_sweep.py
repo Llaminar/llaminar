@@ -4,7 +4,9 @@
 Synthetic observations prove timing grades and original receipt identities;
 these tests make no claim of native timing, physical placement or model speed.
 """
+from contextlib import redirect_stderr
 from copy import deepcopy
+import io
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -65,9 +67,8 @@ def adaptive_payload(candidate='Pairwise', *, screened=False):
         min_us=summary.minimum,median_us=summary.median,p95_us=summary.p95,mad_us=summary.mad,cv=summary.cv,
         sorted_native_digest=summary.digest)
     p['correctness'].update(guard_replays=4,repeated_replay=True)
-    expected=(3+(0 if screened else 30*8))*len(p['descriptor_keys'])
-    p['counters'].update(projection_observations=expected,expected_projection_observations=expected,
-        sample_observation_basis='screen_and_final_timed_calls_only')
+    p['counters'].update(projection_observations=0,expected_projection_observations=0,
+        sample_observation_basis='timed_calls_collection_suppressed')
     return p
 
 
@@ -84,6 +85,53 @@ class AdaptiveExpertScopeTest(unittest.TestCase):
         self.assertTrue({128,256,512,1024}.issubset(plan['expert_prefill_m']))
         self.assertIn('no interval',plan['prefill_publication'])
 
+    def test_actual_m_projection_keeps_native_train_and_mixed_holdouts(self):
+        scope=dict(model_family='qwen4exp',tp_degree=2,layout='intermediate_shard',
+            isa=('AVX512','AVX512'),purposes=('mtp_verifier',))
+        plan=target_plan(expert_scope=scope,expert_m=(3,),tournament='full')
+        jobs=list(sweep.iter_jobs(plan));requests=list(sweep.iter_requests(plan))
+        self.assertEqual(plan['expert_m'],(3,));self.assertEqual(plan['total_jobs'],2)
+        self.assertEqual(plan['total_logical_requests'],8);self.assertEqual(len(requests),8)
+        self.assertEqual({r['m'] for r in requests},{3})
+        self.assertEqual({r['purpose'] for r in requests},{'mtp_verifier'})
+        for job in jobs:
+            self.assertEqual({(r['candidate'],r['holdout']) for r in job['requests']},
+                {('Pairwise',False),('Pairwise',True),('WideRows',False),('WideRows',True)})
+            expected=[3,3,3] if job['role']=='gate_up' else [3,3]
+            for request in job['requests']:
+                self.assertEqual(request['expert_rows'],expected+([1] if request['holdout'] else []))
+        broad=target_plan(expert_scope=scope,tournament='full')
+        self.assertNotIn('expert_m',broad)
+        self.assertTrue({sweep.job_id(j) for j in jobs}.isdisjoint(sweep.job_id(j) for j in sweep.iter_jobs(broad)))
+        # Request identities remain reusable when their actual execution inputs
+        # match; narrowing a prepared batch never relabels the old completion.
+        self.assertTrue({sweep.job_id(r) for r in requests}.issubset(
+            sweep.job_id(r) for r in sweep.iter_requests(broad)))
+
+    def test_actual_m_projection_rejects_unadmitted_or_conflicting_scope(self):
+        for values in ((0,),(1,),(-3,),(3,3),(17,),(3.0,),(True,)):
+            with self.subTest(values=values),self.assertRaises(ValueError):target_plan(expert_m=values)
+        with self.assertRaises(ValueError):sweep.build_plan(28,expert_m=(3,))
+        with self.assertRaises(ValueError):target_plan(expert_m=(128,))
+        prefill_scope=dict(model_family='qwen4exp',tp_degree=2,layout='intermediate_shard',
+            isa=('AVX512','AVX512'),purposes=('prefill',))
+        self.assertEqual(target_plan(expert_scope=prefill_scope,expert_m=(512,128))['expert_m'],(128,512))
+
+    def test_actual_m_cli_resume_requires_unchanged_saved_scope_without_native(self):
+        with tempfile.TemporaryDirectory() as directory:
+            argv=['--output-dir',directory,'--threads','28','--plan-only','--stage','expert-only',
+                '--expert-model-family','qwen4exp','--expert-tp-degree','2',
+                '--expert-layout','intermediate_shard','--expert-isa','AVX512:AVX512',
+                '--expert-purpose','mtp_verifier','--expert-role-format','gate_up:Q4_K',
+                '--expert-role-format','down:Q5_1','--expert-m','3']
+            with mock.patch.object(sweep.subprocess,'run',side_effect=AssertionError('unexpected native launch')):
+                self.assertEqual(sweep.main(argv),0)
+                saved=(Path(directory)/sweep.PLAN_NAME).read_bytes()
+                self.assertEqual(sweep.main(argv+['--resume']),0)
+                with redirect_stderr(io.StringIO()),self.assertRaises(SystemExit):
+                    sweep.main(argv[:-1]+['4','--resume'])
+                self.assertEqual((Path(directory)/sweep.PLAN_NAME).read_bytes(),saved)
+
     def test_complement_retains_twenty_six_admissible_batches(self):
         plan=target_plan(expert_role_formats=(),exclude_expert_role_formats=(('gate_up','Q4_K'),('down','Q5_1')))
         self.assertEqual(plan['total_jobs'],26)
@@ -92,7 +140,7 @@ class AdaptiveExpertScopeTest(unittest.TestCase):
     def test_default_plan_preserves_original_broad_identity(self):
         plan=sweep.build_plan(28)
         self.assertEqual(plan['schema'],'cpu-exact-sweep-v1');self.assertEqual(plan['total_jobs'],1269)
-        self.assertNotIn('tournament',plan);self.assertNotIn('prefill_row_policy',plan)
+        self.assertNotIn('tournament',plan);self.assertNotIn('prefill_row_policy',plan);self.assertNotIn('expert_m',plan)
 
     def test_scope_rejects_invalid_source_slice_and_legacy_adaptive(self):
         with self.assertRaises(ValueError):target_plan(expert_role_formats=(('down','Q4_K'),))
@@ -124,6 +172,23 @@ class AdaptiveExpertScopeTest(unittest.TestCase):
 
 class AdaptiveExpertEvidenceTest(unittest.TestCase):
     """All byte proofs remain mandatory; screen clocks cannot win an overlay."""
+    def test_v2_final_and_screening_cannot_import_timed_counter_collection(self):
+        evidence = fixture.CPUExecutionNativeEvidenceTest()
+        for screened in (False, True):
+            original = adaptive_payload('WideRows' if screened else 'Pairwise', screened=screened)
+            evidence.adapt(original)
+            for field, value in (('timed_collection_disabled', None), ('timed_collection_disabled', False),
+                                 ('timed_projection_observations', None), ('timed_projection_observations', 1)):
+                bad = deepcopy(original)
+                if value is None: bad['counters'].pop(field)
+                else: bad['counters'][field] = value
+                with self.subTest(screened=screened, field=field, value=value), self.assertRaisesRegex(ValueError, 'disabled timed collection'):
+                    evidence.adapt(bad)
+            bad = deepcopy(original)
+            bad['counters'].update(projection_observations=6, expected_projection_observations=6)
+            with self.subTest(screened=screened), self.assertRaisesRegex(ValueError, 'untimed guards'):
+                evidence.adapt(bad)
+
     def test_native_final_and_screening_have_distinct_timing_grade(self):
         final=validate_fused_tournament(adaptive_payload(),minimum_samples=30)
         screen=validate_fused_tournament(adaptive_payload('WideRows',screened=True),minimum_samples=30)

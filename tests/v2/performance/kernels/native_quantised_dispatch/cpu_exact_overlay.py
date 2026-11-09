@@ -6,6 +6,8 @@ execution keys. A refresh replaces its declared keys, retaining every unrelated
 exact entry. New measurements never inherit the retained generic certificate.
 Collection, arithmetic admission and winner selection continue to use the common
 NativeQuantised adapters and exact oracle; this is their publication boundary.
+New batch timings must prove collector suppression; instrumented standalone
+history remains diagnostic and cannot acquire new winner authority.
 """
 from __future__ import annotations
 
@@ -245,6 +247,68 @@ def generate_execution_exact_include(entries: Mapping[CPUExecutionExactKey, int]
     return "\n".join(lines)
 
 
+
+def is_execution_exact_batch_timing(payload: Mapping) -> bool:
+    """Identify the existing typed batch producer, never its filename/location.
+
+    Native v2 is batch-only. The shared native v1 schema also has an older
+    standalone diagnostic producer; only its batch form carries request_id.
+    Neither an absent new marker nor an old path name grants clean clocks.
+    """
+    return (payload.get("schema") == "cpu_execution_exact_native_v2" or
+            (payload.get("schema") == "cpu_execution_exact_native_v1" and
+             "request_id" in payload))
+
+
+def require_execution_exact_batch_timing_collection_disabled(payload: Mapping) -> None:
+    """Reject batch clocks unless native collection was disabled and observed zero.
+
+    These additive native counters concern ONLY timed calls. Fresh route
+    authentication remains enabled outside timing. Bool/int types are exact so
+    strings, truthy integers and bool-as-zero cannot acquire timing authority.
+    """
+    if not is_execution_exact_batch_timing(payload):
+        raise ValueError("CPU exact timing requires original native-batch identity")
+    if not isinstance(payload.get("request_id"), str) or not payload["request_id"]:
+        raise ValueError("CPU exact batch timing requires its original request_id")
+    counters = payload.get("counters", {})
+    if (not isinstance(counters, Mapping) or
+            counters.get("timed_collection_disabled") is not True or
+            type(counters.get("timed_projection_observations")) is not int or
+            counters["timed_projection_observations"] != 0):
+        raise ValueError("CPU exact batch timing requires disabled timed collection and zero timed projection observations")
+
+
+def require_execution_exact_publication_timing(observation) -> None:
+    """Admit new winners only from a known uninstrumented exact timing contract.
+
+    Reopen explicit original-native provenance when present. Historical batch
+    rows cannot evade this gate by lacking the new common-witness tag. Ordinary
+    nonbatch diagnostic parsing/profiling stays valid, but its counter-bearing
+    clocks do not qualify NEW exact winners. Installed literal rows are separate
+    retained authority and never pass through this function.
+    """
+    witness = observation.physical_launch_evidence
+    path = witness.get("native_evidence_path")
+    if path is not None:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        if canonical_digest(payload) != witness.get("native_evidence_mapping_digest"):
+            raise ValueError("CPU exact original native evidence mapping changed")
+        if not is_execution_exact_batch_timing(payload):
+            raise ValueError("nonbatch CPU exact timing remains diagnostic, not new winner publication evidence")
+        require_execution_exact_batch_timing_collection_disabled(payload)
+        if witness.get("native_timing_schema") != payload["schema"]:
+            raise ValueError("CPU exact common/native timing schemas disagree")
+    if (witness.get("native_timing_owner") != "CPUExecutionExactBatch" or
+            witness.get("native_timing_schema") not in
+                {"cpu_execution_exact_native_v1", "cpu_execution_exact_native_v2"}):
+        raise ValueError("CPU exact publication lacks a known uninstrumented batch timing contract")
+    if (witness.get("timed_collection_disabled") is not True or
+            type(witness.get("timed_projection_observations")) is not int or
+            witness["timed_projection_observations"] != 0):
+        raise ValueError("CPU exact publication requires disabled timed collection and zero timed projection observations")
+
+
 def execution_key_from_observation(observation) -> CPUExecutionExactKey:
     """Recover only an adapter-authenticated exact key, never infer a producer."""
     witness = observation.physical_launch_evidence
@@ -319,6 +383,7 @@ def select_execution_exact_entries(corpus) -> tuple[dict[CPUExecutionExactKey, i
     grouped: dict[CPUExecutionExactKey, list] = {}
     holdouts: dict[tuple[int, ...], list] = {}
     for row in corpus:
+        require_execution_exact_publication_timing(row)
         key = execution_key_from_observation(row)
         target = holdouts.setdefault(_holdout_domain(key), []) if row.physical_launch_evidence["holdout"] else grouped.setdefault(key, [])
         target.append(row)

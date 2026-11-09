@@ -837,3 +837,159 @@ Readiness waits overlap device/parent scopes and are not isolated GPU timing.
 The conservative low-live gather selector would affect only 212/9792 root calls,
 half empty, and no predictor calls. That proposed optimization is parked;
 `/tmp/qfn-shmem-low-live-feasibility-r1113/` preserves its limited applicability.
+
+## Ordered three-row tiles and live-plan initialization, 2026-11-09
+
+The next bounded slice changes physical execution, without resweeping the
+retained inventory or changing the generated row-policy table. An AVX512
+WideRows tile with exactly three live rows can retain six integer-dot chains
+for two sixteen-column segments and the original ordered FP32 partition fold.
+The canonical prepared decoder/asymmetry metadata selects the three real
+families; impossible Cartesian combinations reject before payload access.
+All five nibble source formats retain their original scale/min handling,
+including IQ4_XS factor restoration. The same resolved WideRows policy selects
+the body for explicit requests and eventual measured Auto choices.
+
+Linked V3 core and complete-FFN owner inspection finds no hot accumulator/LUT
+spills. The original pair helpers retain identical normalized instructions.
+The new native lifecycle covers all 21 formats, both runtime ISAs, original
+source slices, owned/workspace banks, rows11→3→7→3→2→1→3, live-descriptor changes,
+poisoned outputs and tails, immediate existing-team completion, and malformed
+metadata rejection. V3's 12 focused registrations passed in16.29seconds.
+
+The existing complete-FFN owner supplies matched Q4_K gate/up N320/K2560 and
+Q5_1 down N2560/K320,28physical workers, two fresh lifetimes per arm in reversed
+order,8warmup batches and9samples×4transactions. These are authored workload
+vectors, not recorded model routes. Explicit WideRows comparisons are:
+
+| Operation | Previous us | Ordered three-row us | Speedup |
+|---|---:|---:|---:|
+| MTP E24/R72 gate/up |204.398|191.082|1.070×|
+| Same complete persistent FFN |316.505|310.716|1.019×|
+| MTP E24/R168 gate/up, four-row plus three-row tail |425.548|415.127|1.025×|
+| Same complete persistent FFN |788.316|766.138|1.029×|
+
+Unchanged Auto control is645.895→639.375us; this small difference is not a new
+Auto dispatch win. Separate gate/up profiles have27,252/26,024samples, zero lost
+samples and28native worker TIDs. They show the intended new three-row body,
+but include setup/oracles and OpenMP work; their sampled user-cycle periods
+are neither canonical timings nor cache/IPC evidence. Artifacts remain at
+`/tmp/qfn-cpu-ordered-three-row-next/`.
+
+A second change removes unused plan initialization from each hot invocation.
+One common fill routine serves the unchanged full-value public plan and an
+internal invocation-owned live-prefix view. The latter constructs only the
+actual live objects in the original fixed stack backing. Public default, copy
+and assignment semantics remain intact; no heap allocation, shared planner,
+cache, publication edge, arithmetic change or parallel memory ledger is added.
+The focused lifecycle compares every observable public/private field, poisons
+inactive backing, checks37→1→37→3→1 reuse and actual1/3/7-worker teams, and retains
+the independent all-format serial-byte oracle. Fourteen final native aliases
+passed in17.55seconds; both new LivePlanFill aliases belong explicitly to
+production preflight.
+
+Final core/fixture ISA confirms the hot path initializes num_descs×128bytes,
+without the131,360-byte capacity clear or1026-entry defaults loop. The public
+value wrapper intentionally retains those operations. The fill's frame size
+is unchanged; the launcher grows64bytes. Separately emitted numerical bodies
+retain identical normalized instruction sequences, and no new hot spill is
+introduced. The paired complete-FFN controls against the frozen V3 owner show:
+
+| Runtime ISA / operation | Full-value hot plan us | Live-prefix slice us | Latency change |
+|---|---:|---:|---:|
+| AVX512 / MTP E24/R72 |649.083|634.022|−2.32%|
+| AVX512 / Prefill E84/R519 |2160.015|2106.440|−2.48%|
+| AVX2 / MTP E24/R72 |1157.425|1074.775|−7.14%|
+| AVX2 / Prefill E84/R519 |5378.840|5335.515|−0.81%|
+
+AVX2 prefill overlaps the observed lifetime variation. Both runtime regimes
+use the AVX512 compilation; this does not qualify independent AVX2 compiler
+output. Evidence is at `/tmp/qfn-cpu-fused-live-plan-r1118/`. The matched model
+comparison at `/tmp/qfn-live-plan-model-r1119/` passes at279.840919/38.838234tok/s
+versus278.611720/38.800220. The +0.44%/+0.10% differences are within run variation;
+this establishes no clear model gain. All768 output IDs, actual MTP work,
+configuration and both ranks' initial expert selections match. Native/driver
+exit and process/GPU retirement pass;221 passive host samples and1097 memory
+observations have no errors, without claiming a leak/full-resource certificate.
+Metadata-only cleanup removes18 owned cache files totaling727,912,510bytes.
+The500/40goal remains open.
+
+The expert-only collector now accepts a plan-owned `--expert-m` projection,
+retaining the selected purposes' finite row inventory, candidate grades,
+mixed-row holdouts, unchanged default plans and saved-scope resume checks.
+Its Unit and explicit Scope/Evidence preflight registrations passed in1.60seconds.
+The new M3 scope needs only2prepared batches/8requests; other paid cells remain
+untouched. During this collection, review found that the exact owner records
+projection counters inside timing intervals. The completed candidate clocks
+are therefore diagnostic-only and must not promote a table. Original records
+are retained at `/tmp/qfn-cpu-three-row-exact-next/campaign/`. No generated table
+from that instrumented campaign has been installed.
+
+The repaired owner suppresses recording through the existing PerfStats policy
+at quiescent team boundaries, outside screening/warmup/sample clocks, and
+restores the original policy for fresh route authentication. Native results
+prove zero timed projection observations. Import, completed-cell reuse and new
+winner publication reject instrumented clocks without discarding their original
+diagnostic records or unrelated legacy/GPU collectors. The new original-code
+control reproduces 134 observations instead of four untimed guards, and 126
+instead of zero for adaptive timing. All four fixed native full/adaptive aliases
+pass on AVX2 and AVX512 runtime routes in 2.97 seconds; fourteen focused Python
+Unit/preflight registrations also pass. An authored fixture initially used an
+unaligned N65 row; N80 restores its actual aligned execution class while keeping
+the N64 tail. Neither production admission nor its numerical checks was relaxed.
+The aliases now register beside their original executable, so explicit Release
+selection reaches them as well as the Integration preflight inventory.
+
+Fresh collection at `/tmp/qfn-cpu-exact-timing-isolation-next/campaign-clean/`
+contains only two prepared M3 batches/eight requests and four separate profiler
+requests. Resuming leaves all ten native timing artifacts unchanged. Gate/up
+Q4_K training changes Pairwise 22.046 to WideRows 18.620 microseconds; its small
+mixed holdout is effectively tied at 19.040/19.028 microseconds. Q5_1 down keeps
+Pairwise (6.103 versus 7.561 microseconds). The generated two-key overlay retains
+all prior includes and selects WideRows only for the measured AVX512/28-worker
+MTP M3, N320/K2560 gate/up execution class; down remains Pairwise.
+
+An independent authored E24/R42 control uses `[3,3]+[4]*3+[2]*5+[1]*14`, changing
+only matching M3 keys. It is not a recorded model route. Forward/reverse fresh
+lifetimes give gate/up Auto 91.408/91.973 versus WideRows 83.226/83.700
+microseconds, about 9% lower whole-bundle latency. Mixed down prefers WideRows
+in this larger vector, unlike its smaller training case; that observation does
+not justify replacing the retained down policy. Canonical installation now
+passes rebuilt Auto-dispatch authentication. Twenty focused native aliases pass
+against the final Release core in 21.23 seconds. The larger post-install control
+records four gate/up and two down exact hits, unchanged bytes and zero timed
+observations. Across its two fresh lifetimes, Auto gate/up improves from 91.690
+to 81.608 microseconds (11.00%); down is 47.615 to 46.548 microseconds, a smaller
+difference that does not establish a new down-kernel gain. Final core ISA proves
+identical complete numerical-helper/caller instructions versus the pre-table
+core, including the inlined linear three-row body and unchanged frame/spill
+behavior. The separate one-call gate profiles show Pairwise/WideRows instruction
+counts 2.175/1.916 million; their perturbed durations are not canonical clocks.
+The final matched model run at `/tmp/qfn-m3-overlay-model-r1121/` passes at
+279.867598 prefill /38.707213 decode tok/s, versus the live-plan baseline
+279.840919/38.838234. Changes are +0.01%/−0.34%, within run variation; this is
+not a model-speed win. All 768 output IDs, actual MTP work, normalized runtime
+configuration and both ranks' initial expert selections match. Context remains
+262144, with the original dynamic MTP/balancing and RAM/local-cache placement.
+Native and driver exits are zero, no new driver findings appear, and the owned
+processes/contexts retire. Passive observation contains 219 host samples and
+1087 individual process-memory observations without errors. Largest individual
+RSS is 82.862 GB versus 82.834 GB; each selected GPU's maximum individual-client
+resident VRAM differs by only 12 KiB. Shared aliases are never summed, and this
+is not a full leak/resource certificate. Metadata-only cleanup removes 18 owned cache files,
+727,912,513 bytes. The 500/40 model target remains open. This checkpoint contains
+the measured component improvement and repaired measurement workflow; complete
+production preflight and image certification are still outside this focused run.
+
+The closed ROCm trace at `/tmp/qfn-prefill-next-attribution-r1118/analysis/`
+measures one 512-token prefill after preparation and warmup. Root pure wait is
+832.691 ms, of which 820.986 ms overlaps follower collectives: these are largely
+the same critical interval and must not be added. Native Q8 GEMM contributes
+197.290 ms root interval union, and live CPU-ticket materialization 134.484 ms.
+The latter reads only live rows; no capacity-sized transfer defect is established.
+The next bounded GPU candidate is the existing N64 tile for N320 prepared-Q8
+projections at M448, qualified separately for HC K10240 and shared-FFN K2560.
+It reduces padded columns and increases independent blocks; neither performance
+nor byte equivalence of that selection has yet been measured. The general Q8
+variant sweep does not currently exercise this observed NativeCooperative
+producer, so an unrelated variant result cannot qualify it.

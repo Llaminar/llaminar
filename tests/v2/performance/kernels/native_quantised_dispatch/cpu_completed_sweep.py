@@ -3,6 +3,8 @@
 The existing request, completion, native artifacts and common observations stay
 in their original directory. A consumer only records a reference after matching
 the actual job's executable/core closure and current semantic/timing contract.
+Expert batch reuse also authenticates its original zero-observation timed scope;
+old instrumented clocks remain retained artifacts rather than new timing proof.
 """
 from pathlib import Path
 import json
@@ -62,6 +64,8 @@ def inspect_completed_job(directory, job, current, plan, *, contract_hash):
                 raw_path=directory/'evidence'/(canonical_digest(request_row).split(':')[1]+'.json')
                 if str(raw_path.resolve()) not in artifacts:return None,'original expert result is not receipt-bound'
                 native=json.loads(raw_path.read_text())
+                from .cpu_exact_overlay import require_execution_exact_batch_timing_collection_disabled
+                require_execution_exact_batch_timing_collection_disabled(native)
                 repeats=native.get('configured_full_repeat_count',native['timing']['repeat_count'])
                 if repeats<plan['repeats']:return None,'original expert timing repeat floor is insufficient'
         corpus=read_observation_csv([observations])
@@ -69,6 +73,9 @@ def inspect_completed_job(directory, job, current, plan, *, contract_hash):
         expected_isa=(f"openmp:build={job['build_isa']}:requested={job['runtime_isa']}:"
                       f"effective={job['runtime_isa']}:threads={plan['threads']}")
         for row in corpus:
+            if job['kind']=='expert_rows':
+                from .cpu_exact_overlay import require_execution_exact_publication_timing
+                require_execution_exact_publication_timing(row)
             if (row.build_id!=producer['digest']+'|cpu_isa='+job['build_isa'] or
                     row.compiler_id!='cmake-release-closure:'+producer['digest']):
                 return None,'original observations are not bound to their recorded native producer'

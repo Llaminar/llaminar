@@ -44,8 +44,73 @@ def original_completed(directory):
     return job,producer,dict(threads=28,warmups=5,samples=30),contract
 
 
+def original_completed_expert(directory):
+    """Bind synthetic clean batch timing to the EXISTING completion format."""
+    from native_quantised_dispatch.adapters.cpu_execution_exact import adapt_cpu_execution_exact_native
+    from native_quantised_dispatch.adapters.cpu_verifier import CPUVerifierAdapterContext
+    from native_quantised_dispatch.adapters.evidence import summarize_sorted_timing
+    job, producer, plan, contract = original_completed(directory)
+    job.update(kind='expert_rows', requests=[dict(candidate='Pairwise', holdout=False, m=64)])
+    plan['repeats'] = 8
+    evidence = directory / 'evidence'; evidence.mkdir()
+    raw = evidence / (sweep.canonical_digest(job['requests'][0]).split(':')[1] + '.json')
+    payload = fixture.CPUExecutionNativeEvidenceTest.payload()
+    samples = [10., 11., 13.] * 10; summary = summarize_sorted_timing(tuple(sorted(samples)))
+    payload.update(raw_samples_us=samples, sorted_samples_us=sorted(samples))
+    payload['timing'].update(sample_count=30, repeat_count=8, warmup_count=5,
+        min_us=summary.minimum, median_us=summary.median, p95_us=summary.p95,
+        mad_us=summary.mad, cv=summary.cv, sorted_native_digest=summary.digest)
+    raw.write_text(json.dumps(payload))
+    row = adapt_cpu_execution_exact_native(raw, CPUVerifierAdapterContext.workflow_smoke(
+        corpus_id='sha256:' + '2' * 64), holdout=False)
+    row = replace(row, build_id=producer['digest']+'|cpu_isa=AVX512',
+        compiler_id='cmake-release-closure:'+producer['digest'], serial_m1_policy_hash=contract,
+        threading_or_stream_mode='openmp:build=AVX512:requested=AVX512:effective=AVX512:threads=28')
+    observations = directory / 'observations.csv'
+    write_observation_csv(observations, ObservationCorpus([row]))
+    sweep._atomic(directory/'request.json',dict(job=job,producer=producer,argv=['synthetic-original-owner']))
+    sweep._atomic(directory/'complete.json',dict(job_digest=sweep.canonical_digest(job),producer_digest=producer['digest'],
+        native_exit=0,session_retired=True,artifacts={str(v.resolve()):sweep.file_digest(v) for v in (observations,raw)}))
+    return job, producer, plan, contract, raw
+
+
 class CPUCompletedSweepReuseTest(unittest.TestCase):
     """Reuse checks actual used owners and never changes original observations."""
+    def test_expert_reuse_rejects_dirty_timing_even_with_rebound_completion(self):
+        for field, value in (('timed_collection_disabled', None), ('timed_collection_disabled', False),
+                             ('timed_projection_observations', None), ('timed_projection_observations', 1)):
+            with self.subTest(field=field,value=value), tempfile.TemporaryDirectory() as root:
+                directory = Path(root) / 'original'
+                job, producer, plan, contract, raw = original_completed_expert(directory)
+                self.assertIsNotNone(inspect_completed_job(directory,job,producer,plan,contract_hash=contract)[0])
+                payload=json.loads(raw.read_text())
+                if value is None: payload['counters'].pop(field)
+                else: payload['counters'][field]=value
+                raw.write_text(json.dumps(payload))
+                receipt=json.loads((directory/'complete.json').read_text())
+                receipt['artifacts'][str(raw.resolve())]=sweep.file_digest(raw)
+                sweep._atomic(directory/'complete.json',receipt)
+                admitted,reason=inspect_completed_job(directory,job,producer,plan,contract_hash=contract)
+                self.assertIsNone(admitted)
+                self.assertIn('disabled timed collection',reason)
+                self.assertTrue(raw.exists())
+
+    def test_clean_expert_completion_reuses_original_and_launches_zero(self):
+        with tempfile.TemporaryDirectory() as root:
+            root=Path(root);job,producer,plan,contract,_=original_completed_expert(root/'provisional')
+            paid=root/'paid';cell=paid/'cells'/job['kind']/sweep.job_id(job)
+            cell.parent.mkdir(parents=True)
+            job,producer,plan,contract,raw=original_completed_expert(cell)
+            output=root/'new';output.mkdir()
+            args=SimpleNamespace(output_dir=output,reuse_completed_root=paid,emit_only=False,batch_limit=0)
+            original=raw.read_bytes()
+            with mock.patch.object(sweep,'iter_jobs',return_value=iter([job])), \
+                    mock.patch.object(sweep.subprocess,'run',side_effect=AssertionError('native launch')):
+                self.assertEqual(sweep._collect_stage(args,plan,producer,'expert-only'),0)
+            self.assertEqual(raw.read_bytes(),original)
+            completion=output/'cells'/job['kind']/sweep.job_id(job)/'complete.json'
+            self.assertIn('retained_original_receipt',json.loads(completion.read_text()))
+
     def test_install_rebuilds_every_selected_owner_build_once(self):
         with tempfile.TemporaryDirectory() as root:
             root=Path(root);output=root/'output';output.mkdir()

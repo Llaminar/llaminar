@@ -18185,6 +18185,12 @@ foreach(V2_FUSED_COMPLETION_ISA AVX2 AVX512)
         LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;MoE;Prefill;Decode;${V2_FUSED_COMPLETION_ISA};ByteExact;Replay;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=4" "OMP_DYNAMIC=false")
+    add_v2_test(V2_Integration_CPU_NativeQuantisedOrderedThreeRowNibble_${V2_FUSED_COMPLETION_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
+            --gtest_filter=CPUNativeQuantisedFusedCompletion.GPUAlignedOrderedThreeRowNibbleByteLifecycle
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;MoE;MTP;Prefill;${V2_FUSED_COMPLETION_ISA};ByteExact;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=4" "OMP_DYNAMIC=false")
     add_v2_test(V2_Integration_CPU_NativeQuantisedUnsignedWeightDot_${V2_FUSED_COMPLETION_ISA}
         COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
             --gtest_filter=CPUNativeQuantisedFusedCompletion.UnsignedCoefficientDomainContract:CPUNativeQuantisedFusedCompletion.UnsignedWeightDotAllFormatByteLifecycle
@@ -18195,6 +18201,12 @@ foreach(V2_FUSED_COMPLETION_ISA AVX2 AVX512)
         COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
             --gtest_filter=CPUNativeQuantisedFusedCompletion.GPUAlignedPrefillSamePanelPairRunReplay
         LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;MoE;Prefill;${V2_FUSED_COMPLETION_ISA};ByteExact;Replay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=7" "OMP_DYNAMIC=false")
+    add_v2_test(V2_Integration_CPU_NativeQuantisedLivePlanFill_${V2_FUSED_COMPLETION_ISA}
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_fused_completion>
+            --gtest_filter=CPUNativeQuantisedFusedCompletion.LivePlanFillValueAndPrefixReset:CPUNativeQuantisedFusedCompletion.LivePrefixStorageLargeSmallReset
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;AllFormats;Lifecycle;${V2_FUSED_COMPLETION_ISA};ByteExact;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_ISA_LEVEL=${V2_FUSED_COMPLETION_RUNTIME_ISA}" "OMP_NUM_THREADS=7" "OMP_DYNAMIC=false")
     add_v2_test(V2_Integration_CPU_NativeQuantisedFusedLivePrefix_${V2_FUSED_COMPLETION_ISA}
@@ -18621,6 +18633,35 @@ add_v2_test(V2_Perf_CPUFusedVerifier
     MPI_PROCS 1
     NO_MODELS
 )
+# Reuse the real collector fixture with unequal row vectors and dirty retained
+# storage; target-only overrides must leave singleton peers on their own policy.
+# Register beside the owner so explicit Release selection reaches these aliases;
+# the canonical preflight list below retains their Integration membership.
+foreach(_execution_exact_isa IN ITEMS AVX2 AVX512)
+    if(_execution_exact_isa STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+        continue()
+    endif()
+    string(TOLOWER "${_execution_exact_isa}" _execution_exact_runtime_isa)
+    add_v2_test(V2_Integration_CPU_ExecutionExactBatch_${_execution_exact_isa}
+        COMMAND $<TARGET_FILE:v2_perf_cpu_fused_verifier>
+            --gtest_filter=CPUExecutionExactBatch.MixedTargetPoliciesAndLargeSmallReuse
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;MTP;Prefill;Replay;ByteExact;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${_execution_exact_runtime_isa}" "OMP_NUM_THREADS=2"
+            "OMP_DYNAMIC=false" "OMP_PROC_BIND=false"
+            "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1"
+            "LLAMINAR_SKIP_ROCM_STARTUP=1")
+    add_v2_test(V2_Integration_CPU_ExecutionExactTimingCollection_${_execution_exact_isa}
+        COMMAND $<TARGET_FILE:v2_perf_cpu_fused_verifier>
+            --gtest_filter=CPUExecutionExactBatch.TimingCollectionIsSuppressedAndRestored
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;Trainer;Counters;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${_execution_exact_runtime_isa}" "OMP_NUM_THREADS=2"
+            "OMP_DYNAMIC=false" "OMP_PROC_BIND=false"
+            "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1"
+            "LLAMINAR_SKIP_ROCM_STARTUP=1")
+endforeach()
+
 target_link_libraries(v2_perf_cpu_native_quantised_gemv
     llaminar2_core
     GTest::gtest
@@ -34908,24 +34949,14 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_NativeQuantisedModernCPUPlan
     V2_Integration_CPUSweepCompletedReceiptReuse)
 
-# Reuse the real collector fixture with unequal row vectors and dirty retained
-# storage; target-only overrides must leave singleton peers on their own policy.
+# The actual batch aliases are registered beside their original native owner.
 foreach(_execution_exact_isa IN ITEMS AVX2 AVX512)
     if(_execution_exact_isa STREQUAL "AVX512" AND NOT LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
         continue()
     endif()
-    string(TOLOWER "${_execution_exact_isa}" _execution_exact_runtime_isa)
-    add_v2_test(V2_Integration_CPU_ExecutionExactBatch_${_execution_exact_isa}
-        COMMAND $<TARGET_FILE:v2_perf_cpu_fused_verifier>
-            --gtest_filter=CPUExecutionExactBatch.MixedTargetPoliciesAndLargeSmallReuse
-        LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;MTP;Prefill;Replay;ByteExact;Regression"
-        MPI_PROCS 1 NO_MODELS TIMEOUT 30
-        ENVIRONMENT "LLAMINAR_ISA_LEVEL=${_execution_exact_runtime_isa}" "OMP_NUM_THREADS=2"
-            "OMP_DYNAMIC=false" "OMP_PROC_BIND=false"
-            "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1"
-            "LLAMINAR_SKIP_ROCM_STARTUP=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
-        V2_Integration_CPU_ExecutionExactBatch_${_execution_exact_isa})
+        V2_Integration_CPU_ExecutionExactBatch_${_execution_exact_isa}
+        V2_Integration_CPU_ExecutionExactTimingCollection_${_execution_exact_isa})
 endforeach()
 
 add_v2_test(V2_Integration_ROCmNativeQuantisedExactRetention
@@ -36691,6 +36722,8 @@ if(NOT V2_PERF_TESTS_ONLY)
             V2_Integration_CPURouterQ8UniqueSourceStageReplay_${_cpu_checkpoint_isa}
             V2_Integration_CPU_NativeQuantisedFusedProjectionEvidenceIdentity_${_cpu_checkpoint_isa}
             V2_Integration_CPU_NativeQuantisedOrderedNibbleReplay_${_cpu_checkpoint_isa}
+            V2_Integration_CPU_NativeQuantisedOrderedThreeRowNibble_${_cpu_checkpoint_isa}
+            V2_Integration_CPU_NativeQuantisedLivePlanFill_${_cpu_checkpoint_isa}
             V2_Integration_CPU_NativeQuantisedFusedLivePrefix_${_cpu_checkpoint_isa}
             V2_Integration_CPU_NativeQuantisedSamePanelPairRunReplay_${_cpu_checkpoint_isa}
             V2_Integration_CPU_NativeQuantisedUnsignedWeightDot_${_cpu_checkpoint_isa}

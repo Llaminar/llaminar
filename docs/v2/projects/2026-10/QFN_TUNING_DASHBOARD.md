@@ -7,8 +7,8 @@ analysis in the linked tuning notes, not in this dashboard.
 ## Current status
 
 **Active hybrid target: 500 prefill /40 decode tok/s on 2×MI50 +2×CPU TP.**
-Release 512/256: **278.612 P /38.800 D with passive counters**.
-Versus267.049/38.476: **+4.33% P /+0.84% D**; output/MTP match.
+Release 512/256: **279.868 P /38.707 D with passive counters**.
+Versus279.841/38.838: within run variation; all768 output IDs/MTP work match.
 Short-prefill indexer elision saves **36 kernels/chunk/GPU**; its matched
 control showed **+7.09% P**, with unchanged output IDs/MTP.
 Paired retained graphs cost eight GPU expert slots: **8066 total, 4033/card**.
@@ -21,13 +21,14 @@ matches with zero read errors. Throughput is approximately flat versus the
 explicit-none control. Full preflight, exact-feature GPU/model and OpenCode
 qualification remain open; previous broad-tree passes are not that certificate.
 
-**Current CPU tuning:** modern sweeps retain105 geometries,315 completed M1
-jobs,11 grouped cells and two QFN expert cells without recollection. M1 is
-installed; the staged expert point table covers<1% of observed prefill members.
-Four/two/one same-panel scheduling gives **1.62× complete CPU FFN over two-pair**;
-six focused registrations and matched model output/MTP/retirement pass.
-Parallel shared gather gives **~3× at16MiB**; diagnostic gather falls440→105ms/request.
-Sparse prefill transport remains unpromoted (213.959 P,−1.45%).
+**Current CPU tuning:** modern scope retains105 geometries,315 completed M1
+jobs and11 grouped cells; historical expert evidence is preserved. M1 is installed.
+Four/two/one panel scheduling gives **1.62× CPU FFN over two-pair**. Live-plan
+initialization saves **2.3% MTP /2.5% prefill** in matched AVX512 components.
+Clean-clock two-job M3 overlay is installed: mixed Auto gate/up is **11% faster**;
+model throughput is flat. **20 native +14 tooling registrations pass.**
+Completed results resume unchanged; no broad resweep.
+Parallel shared gather gives **~3× at16MiB**; sparse prefill is unpromoted.
 [Exact-overlay scope and measurements](../2026-11/QFN_NATIVE_QUANTISED_EXACT_OVERLAY_20261108.md).
 [Launch omission, matched controls and timeline](../2026-11/QFN_HYBRID_TIMELINE_AND_NUMA_20261108.md).
 [Root phase timing](../2026-11/QFN_HYBRID_ROOT_TIMING_20261108.md).

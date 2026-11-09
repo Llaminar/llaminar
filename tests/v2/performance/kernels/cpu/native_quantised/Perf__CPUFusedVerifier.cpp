@@ -13,6 +13,8 @@
  * after timing retain tail-write checks without imposing padded timing rows.
  * The native-Q6 serial-tile experiment similarly compares existing physical
  * register geometries without modifying the production selector.
+ * Exact-batch warmup/timing suppresses recording while final fresh route
+ * proofs remain fully observed; focused tests cover both full/adaptive clocks.
  */
 
 #include "../../../../utils/NativeQuantisedTestPartialStorage.h"
@@ -32,6 +34,7 @@
 #include <set>
 #include <sched.h>
 #include <fstream>
+#include <exception>
 #include <string>
 #include <vector>
 #include <omp.h>
@@ -300,8 +303,13 @@ namespace
 
 #include "CPUExecutionExactBatch.inc"
 
-    /** @test One prepared owner preserves target-only policies and dirty mixed-M replay. */
-    TEST(CPUExecutionExactBatch, MixedTargetPoliciesAndLargeSmallReuse)
+    /** @brief Authored original-owner clock lifecycle exercised by the tests below. */
+    enum class CPUExactCollectionFixtureMode { Full, FullStandalone, Adaptive };
+
+    /** @brief Execute real batch bytes/counters under one explicit clock protocol.
+     * @param mode Original full or adaptive retained-team batch entrypoint.
+     */
+    void proveCPUExactBatchCollection(CPUExactCollectionFixtureMode mode)
     {
         std::string pattern = "/tmp/llaminar-execution-exact-batch-XXXXXX";
         char *created = mkdtemp(pattern.data());
@@ -334,6 +342,40 @@ namespace
                 PerfStatsCollector::reset();
             }
         } collection;
+        struct TimingSettingsScope
+        {
+            std::map<std::string, std::optional<std::string>> prior;
+            /** @brief Supply small real geometry and canonical adaptive sample floors. */
+            explicit TimingSettingsScope(CPUExactCollectionFixtureMode mode)
+            {
+                // N80 keeps an N64 tail while ldc=N has a 64-byte-aligned
+                // row stride. N65 would violate the exact class's layout ABI.
+                const std::map<std::string, std::string> fields{
+                    {"LLAMINAR_CPU_FUSED_VERIFIER_NUMERICAL_POLICY", "GPUAlignedExpert"},
+                    {"LLAMINAR_CPU_FUSED_VERIFIER_N_A", "80"},
+                    {"LLAMINAR_CPU_FUSED_VERIFIER_K", "512"},
+                    {"LLAMINAR_CPU_FUSED_VERIFIER_POLICY_N", "80"},
+                    {"LLAMINAR_CPU_FUSED_VERIFIER_TEAM_LIFETIME", mode == CPUExactCollectionFixtureMode::FullStandalone ? "standalone" : "retained"},
+                    {"LLAMINAR_CPU_FUSED_VERIFIER_OUTPUT_ROLE", "projection"},
+                    {"LLAMINAR_CPU_FUSED_VERIFIER_WARMUP", "5"},
+                    {"LLAMINAR_CPU_FUSED_VERIFIER_SAMPLES", "30"},
+                    {"LLAMINAR_CPU_FUSED_VERIFIER_REPEATS", "2"},
+                    {"LLAMINAR_NATIVE_QUANTISED_TOURNAMENT", mode == CPUExactCollectionFixtureMode::Adaptive ? "adaptive_v1" : ""}};
+                for (const auto &[name, value] : fields)
+                {
+                    const char *old = std::getenv(name.c_str());
+                    prior.emplace(name, old ? std::optional<std::string>(old) : std::nullopt);
+                    setenv(name.c_str(), value.c_str(), 1);
+                }
+            }
+            /** @brief Withdraw only this authored fixture's temporary settings. */
+            ~TimingSettingsScope()
+            {
+                for (const auto &[name, value] : prior)
+                    if (value) setenv(name.c_str(), value->c_str(), 1);
+                    else unsetenv(name.c_str());
+            }
+        } timing_settings(mode);
         const auto &formats = quantizedVerifierFormats();
         const auto format = std::find_if(formats.begin(), formats.end(),
             [](const auto &entry) { return std::string(entry.label) == "Q4_1"; });
@@ -343,14 +385,24 @@ namespace
 #else
         const bool wide = false;
 #endif
-        nlohmann::json manifest{{"schema", "cpu_execution_exact_batch_v1"},
+        const bool adaptive = mode == CPUExactCollectionFixtureMode::Adaptive;
+        nlohmann::json manifest{{"schema", adaptive ? "cpu_execution_exact_batch_v2" : "cpu_execution_exact_batch_v1"},
             {"shape", "fixture-only-mixed-target-replay"}, {"requests", nlohmann::json::array()}};
-        const std::array<std::vector<int>, 3> rows{{{8, 3}, {3, 1}, {8, 1}}};
-        const std::array<std::string, 3> purposes{{"prefill", "mtp_verifier", "decode"}};
+        std::vector<std::vector<int>> rows{{8, 3}, {3, 1}, {8, 1}};
+        std::vector<std::string> purposes{"prefill", "mtp_verifier", "decode"};
+        std::vector<std::string> candidates{wide ? "WideRows" : "Pairwise", "Pairwise", "Pairwise"};
+        if (adaptive)
+        {
+            rows = wide ? std::vector<std::vector<int>>{{3, 1}, {3, 1}}
+                        : std::vector<std::vector<int>>{{3, 1}};
+            purposes.assign(rows.size(), "mtp_verifier");
+            candidates = wide ? std::vector<std::string>{"Pairwise", "WideRows"}
+                              : std::vector<std::string>{"Pairwise"};
+        }
         for (size_t index = 0; index < rows.size(); ++index)
             manifest["requests"].push_back({{"id", std::to_string(index)}, {"m", rows[index][0]},
                 {"purpose", purposes[index]}, {"expert_rows", rows[index]}, {"target_descriptor", 0},
-                {"candidate", index == 0 && wide ? "WideRows" : "Pairwise"}, {"holdout", true},
+                {"candidate", candidates[index]}, {"holdout", true},
                 {"evidence_path", (directory.path / (std::to_string(index) + ".json")).string()}});
         const auto request_path = directory.path / "requests.json";
         { std::ofstream output(request_path); ASSERT_TRUE(output.is_open()); output << manifest.dump(2); }
@@ -365,6 +417,15 @@ namespace
             EXPECT_TRUE(result.at("counters").at("enabled").get<bool>());
             EXPECT_EQ(result.at("counters").at("authenticated_projection_observations").get<uint64_t>(),
                 result.at("descriptor_keys").size());
+            // Original instrumented code records warmup/sample calls here and
+            // genuinely fails this behavioral count before checking new markers.
+            EXPECT_EQ(result.at("counters").at("projection_observations").get<uint64_t>(),
+                adaptive ? 0u : 2u * result.at("descriptor_keys").size());
+            EXPECT_EQ(result.at("counters").at("expected_projection_observations").get<uint64_t>(),
+                adaptive ? 0u : 2u * result.at("descriptor_keys").size());
+            EXPECT_TRUE(result.at("counters").value("timed_collection_disabled", false));
+            EXPECT_EQ(result.at("counters").value("timed_projection_observations", uint64_t{1}), 0u);
+            EXPECT_TRUE(PerfStatsCollector::isDomainEnabled("kernel"));
             EXPECT_EQ(result.at("purpose").get<std::string>(), purposes[index]);
             const auto target = result.at("exact_key");
             const auto keys = result.at("descriptor_keys");
@@ -372,6 +433,22 @@ namespace
                 if (keys[member] != target)
                     EXPECT_EQ(result.at("descriptor_policies")[member], result.at("baseline_descriptor_policies")[member]);
         }
+    }
+
+    /** @test One prepared owner preserves target-only policies and dirty mixed-M replay. */
+    TEST(CPUExecutionExactBatch, MixedTargetPoliciesAndLargeSmallReuse)
+    {
+        proveCPUExactBatchCollection(CPUExactCollectionFixtureMode::Full);
+    }
+
+    /** @test Real full/adaptive clocks record zero work; final fresh proofs remain enabled. */
+    TEST(CPUExecutionExactBatch, TimingCollectionIsSuppressedAndRestored)
+    {
+        proveCPUExactBatchCollection(CPUExactCollectionFixtureMode::Full);
+        ASSERT_FALSE(::testing::Test::HasFatalFailure());
+        proveCPUExactBatchCollection(CPUExactCollectionFixtureMode::FullStandalone);
+        ASSERT_FALSE(::testing::Test::HasFatalFailure());
+        proveCPUExactBatchCollection(CPUExactCollectionFixtureMode::Adaptive);
     }
 
     TEST_P(CPUFusedVerifier, ProjectionCounterBundleReplay)

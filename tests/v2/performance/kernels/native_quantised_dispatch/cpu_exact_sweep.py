@@ -43,7 +43,8 @@ def _atomic(path: Path, value) -> None:
 
 def build_plan(threads: int, *, warmups: int = 5, samples: int = 30, repeats: int = 8, prefill_row_policy: str = "exact-points",
                expert_only: bool = False, expert_scope: dict | None = None, tournament: str = "full", model_scope: str = "all-retained",
-               expert_role_formats: tuple[tuple[str,str],...] = (), exclude_expert_role_formats: tuple[tuple[str,str],...] = ()) -> dict:
+               expert_role_formats: tuple[tuple[str,str],...] = (), exclude_expert_role_formats: tuple[tuple[str,str],...] = (),
+               expert_m: tuple[int,...] = ()) -> dict:
     """Project shared production geometry, source formats and actual M anchors."""
     if min(threads, warmups, samples, repeats) <= 0:
         raise ValueError("CPU exact collection requires positive team/timing settings")
@@ -115,6 +116,20 @@ def build_plan(threads: int, *, warmups: int = 5, samples: int = 30, repeats: in
         plan.update(schema="cpu-expert-only-exact-sweep-v1",expert_only=True,expert_scope=expert_scope,
             regimes=(tuple(expert_scope['isa']),),
             scope="additive shared-catalog expert-only projection; broad decode/grouped/ordinary campaign remains unqualified")
+    if expert_m:
+        if not expert_only:
+            raise ValueError("expert actual-M projection requires the explicit expert-only transaction")
+        if (any(type(m) is not int or m < 2 for m in expert_m) or
+                len(set(expert_m)) != len(expert_m)):
+            raise ValueError("expert actual-M values must be unique integers of at least two")
+        for purpose in expert_scope['purposes']:
+            admitted_m = plan['expert_prefill_m'] if purpose == 'prefill' else plan['grouped_m']
+            if not set(expert_m).issubset(admitted_m):
+                raise ValueError("expert actual-M projection is outside the existing " + purpose + " row inventory")
+        # Actual M remains execution geometry. This finite projection changes
+        # only collection obligations and their plan/job identities, never an
+        # old receipt, row regime, generated choice or runtime arithmetic key.
+        plan['expert_m'] = tuple(sorted(expert_m))
     if expert_role_formats or exclude_expert_role_formats:
         if not expert_only:raise ValueError("role/format selection requires explicit expert-only scope")
         selected=tuple(expert_role_formats);excluded_formats=tuple(exclude_expert_role_formats)
@@ -181,6 +196,7 @@ def iter_requests(plan):
                         (1,'mtp_verifier',plan['grouped_m']),(2,'prefill',plan['expert_prefill_m'])):
                     if plan.get('expert_only') and purpose not in plan['expert_scope']['purposes']:continue
                     for m in values:
+                        if plan.get('expert_m') and m not in plan['expert_m']:continue
                         row_owners = ((m+3)//4)*((geometry['n']+63)//64)
                         count = max(2, math.ceil(plan['threads']/row_owners))
                         gate_up = geometry['role']=='gate_up'
@@ -315,6 +331,8 @@ def main(argv=None):
     parser.add_argument('--expert-layout',choices=tuple(layout.value for layout in ExpertProjectionLayout))
     parser.add_argument('--expert-isa',choices=tuple(':'.join(pair) for pair in REGIMES))
     parser.add_argument('--expert-purpose',choices=('decode','mtp_verifier','prefill'),action='append')
+    parser.add_argument('--expert-m',type=int,action='append',default=[],metavar='M',
+        help='Repeat to project expert-only collection onto actual M values admitted by every selected purpose; preserve on resume')
     parser.add_argument('--expert-role-format',action='append',default=[],metavar='ROLE:FORMAT',
         help='Explicit additive source-format slice; source/TP geometry stays catalog-owned')
     parser.add_argument('--exclude-expert-role-format',action='append',default=[],metavar='ROLE:FORMAT',
@@ -348,12 +366,13 @@ def main(argv=None):
         expert_scope=dict(model_family=args.expert_model_family,tp_degree=args.expert_tp_degree,
             layout=args.expert_layout,isa=tuple(args.expert_isa.split(':')),
             purposes=tuple(args.expert_purpose or ('decode','mtp_verifier','prefill')))
-    elif any(getattr(args,name) is not None for name in ('expert_model_family','expert_tp_degree','expert_layout','expert_isa','expert_purpose')):
+    elif args.expert_m or any(getattr(args,name) is not None for name in ('expert_model_family','expert_tp_degree','expert_layout','expert_isa','expert_purpose')):
         parser.error('expert selection belongs to the expert-only transaction')
     try:
         plan=build_plan(args.threads,warmups=args.warmups,samples=args.samples,repeats=args.repeats, prefill_row_policy=args.prefill_row_policy,
             expert_only=args.stage=='expert-only',expert_scope=expert_scope,tournament=args.tournament,model_scope=args.model_scope,
-            expert_role_formats=role_formats(args.expert_role_format),exclude_expert_role_formats=role_formats(args.exclude_expert_role_format))
+            expert_role_formats=role_formats(args.expert_role_format),exclude_expert_role_formats=role_formats(args.exclude_expert_role_format),
+            expert_m=tuple(args.expert_m))
         args.output_dir.mkdir(parents=True,exist_ok=True); target=args.output_dir/PLAN_NAME
         if target.exists():
             if json.loads(target.read_text()) != json.loads(json.dumps(plan)):

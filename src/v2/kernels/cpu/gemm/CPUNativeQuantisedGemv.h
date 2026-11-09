@@ -37,12 +37,16 @@
  * VNNI operand roles, eliminating only the exact integer bias compensation.
  * Fused prefix/LUT stack storage initializes only admitted live descriptors;
  * inactive fixed-capacity slots never enter searches or microkernel arguments.
+ * Execution plans likewise default-construct only live projections in caller-owned
+ * stack backing; the public full-value plan retains its default/copy contract.
  * Ordinary-prefill ordered pair jobs may retain up to four adjacent row pairs on one
  * worker for the same prepared N panel, without changing either pair kernel.
  * GPU-aligned fused row pairs use the bounded ordered nibble kernel for all
  * eligible prepared nibble encodings. Decoder, original scale factors and
  * asymmetry remain tensor-owned; fixed K partitions and their FP32 fold do not
  * depend on the physical row or column tile.
+ * Resolved WideRows three-row nibble tiles retain two sixteen-column segments
+ * and the ordered fold directly; policy selection and two-row kernels stay separate.
  *
  * ## Cache-Aware Tiling
  *
@@ -65,9 +69,12 @@
 #include <compare>
 #include <cmath>
 #include <cstdint>
+#include <cstddef>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <new>
+#include <type_traits>
 #include <omp.h>
 #include <span>
 #include <stdexcept>
@@ -2605,6 +2612,294 @@ namespace llaminar2::cpu::native_quantised
             DISPATCH_ORDERED_2ROW(NibbleDecodeKind::Q4_1_IDENTITY);
         }
 #undef DISPATCH_ORDERED_2ROW
+        throw std::logic_error("Unknown NativeQuantised nibble decode kind");
+    }
+
+    /**
+     * @brief Resolved WideRows tile retaining three rows and two segments.
+     * @tparam DecodeKind Original prepared nibble decoder.
+     * @tparam IsAsymmetric Original scale/min correction policy.
+     * @param packed Original owned or workspace-bound prepared weights.
+     * @param A_q8_row0 First immutable Q8 row.
+     * @param A_q8_row1 Second immutable Q8 row.
+     * @param A_q8_row2 Third immutable Q8 row; no fourth row is read.
+     * @param C_row0 First complete output chunk.
+     * @param C_row1 Second complete output chunk.
+     * @param C_row2 Third complete output chunk.
+     * @param chunk Original N64 panel.
+     * @param K_blocks Original logical K-block extent.
+     * @param k_tiles Original fixed ordered partition count.
+     * @param k_blocks_per_tile Original consecutive block extent per partition.
+     * @param decode_lut Original nonlinear nibble decoder table.
+     *
+     * Six independent dot chains preserve the generic three-row column width.
+     * Each partition still begins at positive zero; the first partial is assigned
+     * and later partials left-fold in increasing order. The two-row body is not
+     * generalized or rewritten. Keep this per-decoder/asymmetry specialization
+     * as a normal optimization unit rather than forcing all variants into one
+     * giant dispatcher. Zero hot spills remains a compiled qualification gate.
+     */
+    template <NibbleDecodeKind DecodeKind, bool IsAsymmetric>
+    inline void gemm_3row_native_avx512_ordered_partitions(
+        const CPUNativeQuantisedPackedWeights &packed,
+        const Q8_1Block *A_q8_row0,
+        const Q8_1Block *A_q8_row1,
+        const Q8_1Block *A_q8_row2,
+        float *C_row0,
+        float *C_row1,
+        float *C_row2,
+        int chunk,
+        int K_blocks,
+        int k_tiles,
+        int k_blocks_per_tile,
+        const __m512i decode_lut)
+    {
+        const __m512i mask_0F = _mm512_set1_epi8(0x0F);
+        const __m512i q4_zero_offset = _mm512_set1_epi8(8);
+        const __m512i bias_128_i32 = _mm512_set1_epi32(128);
+
+        for (int zbase = 0; zbase < 4; zbase += 2)
+        {
+            __m512 reduced0_0 = _mm512_setzero_ps();
+            __m512 reduced0_1 = _mm512_setzero_ps();
+            __m512 reduced1_0 = _mm512_setzero_ps();
+            __m512 reduced1_1 = _mm512_setzero_ps();
+            __m512 reduced2_0 = _mm512_setzero_ps();
+            __m512 reduced2_1 = _mm512_setzero_ps();
+
+            /*
+             * Preserve six independent dot chains: three rows share each
+             * decoded vector across two adjacent sixteen-column segments.
+             * Keep each original ordered reduction local to this half chunk.
+             * Compiler allocation must be qualified in both actual owners.
+             */
+            for (int k_tile = 0; k_tile < k_tiles; ++k_tile)
+            {
+                __m512 partial0_0 = _mm512_setzero_ps();
+                __m512 partial0_1 = _mm512_setzero_ps();
+                __m512 partial1_0 = _mm512_setzero_ps();
+                __m512 partial1_1 = _mm512_setzero_ps();
+                __m512 partial2_0 = _mm512_setzero_ps();
+                __m512 partial2_1 = _mm512_setzero_ps();
+                const int kb_start = k_tile * k_blocks_per_tile;
+                const int kb_end = std::min(
+                    kb_start + k_blocks_per_tile, K_blocks);
+
+                for (int kb = kb_start; kb < kb_end; ++kb)
+                {
+                    const Q8_1Block &a0 = A_q8_row0[kb];
+                    const Q8_1Block &a1 = A_q8_row1[kb];
+                    const Q8_1Block &a2 = A_q8_row2[kb];
+                    __m512i int0_0 = _mm512_setzero_si512();
+                    __m512i int0_1 = _mm512_setzero_si512();
+                    __m512i int1_0 = _mm512_setzero_si512();
+                    __m512i int1_1 = _mm512_setzero_si512();
+                    __m512i int2_0 = _mm512_setzero_si512();
+                    __m512i int2_1 = _mm512_setzero_si512();
+
+                    for (int group = 0; group < 4; ++group)
+                    {
+                        const __m512i raw0 = _mm512_load_si512(
+                            packed.interleavedB(
+                                chunk, kb, group, zbase));
+                        const __m512i raw1 = _mm512_load_si512(
+                            packed.interleavedB(
+                                chunk, kb, group, zbase + 1));
+                        const __m512i low0 =
+                            decode_low_nibbles_avx512_static<DecodeKind>(
+                                raw0,
+                                decode_lut,
+                                mask_0F,
+                                q4_zero_offset);
+                        const __m512i low1 =
+                            decode_low_nibbles_avx512_static<DecodeKind>(
+                                raw1,
+                                decode_lut,
+                                mask_0F,
+                                q4_zero_offset);
+                        const __m512i high0 =
+                            decode_high_nibbles_avx512_static<DecodeKind>(
+                                raw0,
+                                decode_lut,
+                                mask_0F,
+                                q4_zero_offset);
+                        const __m512i high1 =
+                            decode_high_nibbles_avx512_static<DecodeKind>(
+                                raw1,
+                                decode_lut,
+                                mask_0F,
+                                q4_zero_offset);
+
+#define ORDERED_3ROW_DOT(ROW, BLOCK)                                           \
+                        {                                                      \
+                            const __m512i a_low = _mm512_set1_epi32(           \
+                                pack_q8_1_unsigned_word(BLOCK, group * 4));    \
+                            int##ROW##_0 = _mm512_dpbusd_epi32(                \
+                                int##ROW##_0, a_low, low0);                    \
+                            int##ROW##_1 = _mm512_dpbusd_epi32(                \
+                                int##ROW##_1, a_low, low1);                    \
+                            const __m512i a_high = _mm512_set1_epi32(          \
+                                pack_q8_1_unsigned_word(                       \
+                                    BLOCK, group * 4 + 16));                   \
+                            int##ROW##_0 = _mm512_dpbusd_epi32(                \
+                                int##ROW##_0, a_high, high0);                  \
+                            int##ROW##_1 = _mm512_dpbusd_epi32(                \
+                                int##ROW##_1, a_high, high1);                  \
+                        }
+                        ORDERED_3ROW_DOT(0, a0)
+                        ORDERED_3ROW_DOT(1, a1)
+                        ORDERED_3ROW_DOT(2, a2)
+#undef ORDERED_3ROW_DOT
+                    }
+
+                    // Retire one segment's INT values before loading the next
+                    // segment's correction metadata. The original source-factor
+                    // scale loader and exact contribution helpers remain sole
+                    // arithmetic authority; no combined scale/min expression.
+#define ORDERED_3ROW_FOLD_SEGMENT(SEGMENT)                                    \
+                    {                                                        \
+                        const int16_t *comp = packed.chunkComp(chunk, kb) +  \
+                            (zbase + SEGMENT) * 16;                          \
+                        const __m512i bias = _mm512_mullo_epi32(             \
+                            bias_128_i32, _mm512_cvtepi16_epi32(             \
+                                _mm256_load_si256(                          \
+                                    reinterpret_cast<const __m256i *>(comp)))); \
+                        int0_##SEGMENT = _mm512_sub_epi32(int0_##SEGMENT, bias); \
+                        int1_##SEGMENT = _mm512_sub_epi32(int1_##SEGMENT, bias); \
+                        int2_##SEGMENT = _mm512_sub_epi32(int2_##SEGMENT, bias); \
+                        const __m512 scale = packed.loadScales512(           \
+                            packed.chunkScales(chunk, kb) +                 \
+                                (zbase + SEGMENT) * 16);                     \
+                        const float a0_scale = nativeQuantisedFP16ScaleToFP32(a0.d); \
+                        const float a1_scale = nativeQuantisedFP16ScaleToFP32(a1.d); \
+                        const float a2_scale = nativeQuantisedFP16ScaleToFP32(a2.d); \
+                        if constexpr (IsAsymmetric)                         \
+                        {                                                    \
+                            const __m512 minimum = _mm512_cvtph_ps(         \
+                                _mm256_load_si256(reinterpret_cast<const __m256i *>( \
+                                    packed.chunkMins(chunk, kb) +            \
+                                        (zbase + SEGMENT) * 16)));           \
+                            partial0_##SEGMENT = accumulateCorrectedSingleScaleBlockAVX512( \
+                                partial0_##SEGMENT, int0_##SEGMENT, scale,  \
+                                a0.sum_qs, minimum, a0_scale,                \
+                                CPUProjectionNumericalPolicy::GPUAlignedExpert); \
+                            partial1_##SEGMENT = accumulateCorrectedSingleScaleBlockAVX512( \
+                                partial1_##SEGMENT, int1_##SEGMENT, scale,  \
+                                a1.sum_qs, minimum, a1_scale,                \
+                                CPUProjectionNumericalPolicy::GPUAlignedExpert); \
+                            partial2_##SEGMENT = accumulateCorrectedSingleScaleBlockAVX512( \
+                                partial2_##SEGMENT, int2_##SEGMENT, scale,  \
+                                a2.sum_qs, minimum, a2_scale,                \
+                                CPUProjectionNumericalPolicy::GPUAlignedExpert); \
+                        }                                                    \
+                        else                                                 \
+                        {                                                    \
+                            partial0_##SEGMENT = accumulateSingleScaleBlockAVX512( \
+                                partial0_##SEGMENT, int0_##SEGMENT, scale, a0_scale, \
+                                CPUProjectionNumericalPolicy::GPUAlignedExpert); \
+                            partial1_##SEGMENT = accumulateSingleScaleBlockAVX512( \
+                                partial1_##SEGMENT, int1_##SEGMENT, scale, a1_scale, \
+                                CPUProjectionNumericalPolicy::GPUAlignedExpert); \
+                            partial2_##SEGMENT = accumulateSingleScaleBlockAVX512( \
+                                partial2_##SEGMENT, int2_##SEGMENT, scale, a2_scale, \
+                                CPUProjectionNumericalPolicy::GPUAlignedExpert); \
+                        }                                                    \
+                    }
+                    ORDERED_3ROW_FOLD_SEGMENT(0)
+                    ORDERED_3ROW_FOLD_SEGMENT(1)
+#undef ORDERED_3ROW_FOLD_SEGMENT
+                }
+
+                if (k_tile == 0)
+                {
+                    reduced0_0 = partial0_0;
+                    reduced0_1 = partial0_1;
+                    reduced1_0 = partial1_0;
+                    reduced1_1 = partial1_1;
+                    reduced2_0 = partial2_0;
+                    reduced2_1 = partial2_1;
+                }
+                else
+                {
+                    reduced0_0 = _mm512_add_ps(reduced0_0, partial0_0);
+                    reduced0_1 = _mm512_add_ps(reduced0_1, partial0_1);
+                    reduced1_0 = _mm512_add_ps(reduced1_0, partial1_0);
+                    reduced1_1 = _mm512_add_ps(reduced1_1, partial1_1);
+                    reduced2_0 = _mm512_add_ps(reduced2_0, partial2_0);
+                    reduced2_1 = _mm512_add_ps(reduced2_1, partial2_1);
+                }
+            }
+
+            _mm512_storeu_ps(C_row0 + zbase * 16, reduced0_0);
+            _mm512_storeu_ps(C_row0 + (zbase + 1) * 16, reduced0_1);
+            _mm512_storeu_ps(C_row1 + zbase * 16, reduced1_0);
+            _mm512_storeu_ps(C_row1 + (zbase + 1) * 16, reduced1_1);
+            _mm512_storeu_ps(C_row2 + zbase * 16, reduced2_0);
+            _mm512_storeu_ps(C_row2 + (zbase + 1) * 16, reduced2_1);
+        }
+    }
+
+    /**
+     * @brief Select the immutable decoder/asymmetry specialization once per panel.
+     * @param packed Original prepared layout and source-factor authority.
+     * @param A_q8_row0 First Q8 row in the tile.
+     * @param A_q8_row1 Second Q8 row in the tile.
+     * @param A_q8_row2 Third Q8 row in the tile.
+     * @param C_row0 First complete N64 destination or caller-owned tail scratch.
+     * @param C_row1 Second complete N64 destination or caller-owned tail scratch.
+     * @param C_row2 Third complete N64 destination or caller-owned tail scratch.
+     * @param chunk Original N64 panel index.
+     * @param K_blocks Original live activation block count.
+     * @param k_tiles Fixed ordered partition count from the admitted plan.
+     * @param k_blocks_per_tile Original consecutive blocks per partition.
+     * @param decode_lut Original prepared codebook decode table.
+     * @throws std::logic_error For conflicting source/encoding/asymmetry metadata.
+     */
+    inline void dispatch_3row_native_avx512_ordered_partitions(
+        const CPUNativeQuantisedPackedWeights &packed,
+        const Q8_1Block *A_q8_row0,
+        const Q8_1Block *A_q8_row1,
+        const Q8_1Block *A_q8_row2,
+        float *C_row0,
+        float *C_row1,
+        float *C_row2,
+        int chunk,
+        int K_blocks,
+        int k_tiles,
+        int k_blocks_per_tile,
+        const __m512i decode_lut)
+    {
+        // These are prepared-format consistency checks, not a numerical
+        // alternative. The existing source/codebook authority admits exactly
+        // the canonical nibble families; source aliases retain their original
+        // factor loader and bank. No unsupported Cartesian product is created.
+        if (!packed.usesNibbleLUT() || !is_nibble_lut_format(packed.codebook_id))
+            throw std::logic_error(
+                "CPU ordered three-row dispatch requires canonical nibble prepared encoding");
+        static_assert(native_quantised_formats::IQ4_XS.is_asymmetric ==
+                      native_quantised_formats::IQ4_NL.is_asymmetric);
+        static_assert(native_quantised_formats::Q4_K.is_asymmetric ==
+                      native_quantised_formats::Q4_1.is_asymmetric);
+#define DISPATCH_ORDERED_3ROW(DECODE_KIND, FORMAT)                              \
+        if (packed.is_asymmetric != native_quantised_formats::FORMAT.is_asymmetric) \
+            throw std::logic_error(                                           \
+                "CPU ordered three-row nibble decoder/asymmetry metadata mismatch: " #FORMAT); \
+        return gemm_3row_native_avx512_ordered_partitions<                      \
+            DECODE_KIND, native_quantised_formats::FORMAT.is_asymmetric>(      \
+            packed, A_q8_row0, A_q8_row1, A_q8_row2,                            \
+            C_row0, C_row1, C_row2, chunk,                                     \
+            K_blocks, k_tiles, k_blocks_per_tile, decode_lut)
+
+        switch (nibbleDecodeKind(packed.codebook_id))
+        {
+        case NibbleDecodeKind::LUT:
+            DISPATCH_ORDERED_3ROW(NibbleDecodeKind::LUT, IQ4_NL);
+        case NibbleDecodeKind::Q4_0_LINEAR:
+            DISPATCH_ORDERED_3ROW(NibbleDecodeKind::Q4_0_LINEAR, Q4_0);
+        case NibbleDecodeKind::Q4_1_IDENTITY:
+            DISPATCH_ORDERED_3ROW(NibbleDecodeKind::Q4_1_IDENTITY, Q4_1);
+        }
+#undef DISPATCH_ORDERED_3ROW
         throw std::logic_error("Unknown NativeQuantised nibble decode kind");
     }
 
@@ -6830,6 +7125,85 @@ namespace llaminar2::cpu::native_quantised
         }
     };
 
+    namespace detail
+    {
+        /** @brief Invocation-local scalar result of the one common fused planner fill. */
+        struct NativeQuantisedFusedRowsPlanSummary
+        {
+            NativeQuantisedFusedPartialRoute partial_route = NativeQuantisedFusedPartialRoute::FullK;
+            size_t partial_floats = 0;
+            size_t worker_partial_stride = 0;
+            bool use_avx512 = false;
+            bool use_avx2 = false;
+            bool all_k_partitioned = false;
+            CPUExecutionExactBundleClass execution_exact_class = CPUExecutionExactBundleClass::None;
+
+            /** @return Same exact shared-bank demand as the unchanged public value API. */
+            size_t sharedPartialFloats() const noexcept
+            {
+                return partial_route == NativeQuantisedFusedPartialRoute::SharedBank ||
+                    partial_route == NativeQuantisedFusedPartialRoute::OutputTileWorkspace ? partial_floats : 0;
+            }
+        };
+
+        /**
+         * @brief One nonmoving borrow of live plans in original invocation stack backing.
+         *
+         * Standard non-allocating placement array-new starts exactly the live
+         * contiguous objects, preserving every default including unused live
+         * decoder/schedule fields. Inactive bytes stay raw backing. No view may
+         * outlive its caller-owned backing, which remains fixed maximum capacity.
+         */
+        class NativeQuantisedFusedRowsLiveView final
+        {
+        public:
+            /**
+             * @brief Start the exact live object prefix without heap allocation.
+             * @param backing Original aligned fixed-capacity invocation storage, which outlives this view.
+             * @param count Positive original descriptor count, never capacity padding.
+             * @throws std::invalid_argument Before construction for invalid count/alignment/extent.
+             */
+            NativeQuantisedFusedRowsLiveView(std::span<std::byte> backing, size_t count)
+            {
+                static_assert(std::is_trivially_destructible_v<FusedVerifierRowsPlan>);
+                static_assert(std::is_nothrow_default_constructible_v<FusedVerifierRowsPlan>);
+                if(count == 0 || count > NativeQuantisedFusedRowsPlan::capacity ||
+                   backing.size() != sizeof(FusedVerifierRowsPlan) * NativeQuantisedFusedRowsPlan::capacity ||
+                   !backing.data() || reinterpret_cast<std::uintptr_t>(backing.data()) % alignof(FusedVerifierRowsPlan))
+                    throw std::invalid_argument("CPU live fused plan requires its exact aligned capacity and positive prefix");
+                auto* live = ::new (static_cast<void*>(backing.data())) FusedVerifierRowsPlan[count];
+                projections_ = {live,count};
+            }
+            /** @brief End the live object prefix before backing may be reused; destruction is trivial. */
+            ~NativeQuantisedFusedRowsLiveView() { std::destroy_n(projections_.data(),projections_.size()); }
+            NativeQuantisedFusedRowsLiveView(const NativeQuantisedFusedRowsLiveView&) = delete;
+            NativeQuantisedFusedRowsLiveView& operator=(const NativeQuantisedFusedRowsLiveView&) = delete;
+            NativeQuantisedFusedRowsLiveView(NativeQuantisedFusedRowsLiveView&&) = delete;
+            NativeQuantisedFusedRowsLiveView& operator=(NativeQuantisedFusedRowsLiveView&&) = delete;
+            /** @return Exact mutable prefix, borrowed only while the common planner fills it. */
+            std::span<FusedVerifierRowsPlan> mutableProjections() noexcept { return projections_; }
+            /** @return Complete read-only prefix for this invocation's execution. */
+            std::span<const FusedVerifierRowsPlan> projections() const noexcept { return projections_; }
+        private:
+            std::span<FusedVerifierRowsPlan> projections_; ///< Non-owning view; trivial objects end with backing lifetime.
+        };
+
+        /** @brief Validate the common public/private planner entry before any plan construction.
+         * @param descriptors Original prepared projection metadata.
+         * @param rows Positive inherited row count.
+         * @param workers Actual positive invocation worker count.
+         * @throws std::invalid_argument For the original incomplete invocation geometry.
+         */
+        inline void requireNativeQuantisedFusedRowsPlanInput(std::span<const FusedVerifierRowsDesc> descriptors,
+            int rows,int workers)
+        {
+            if(descriptors.empty() || descriptors.size() > NativeQuantisedFusedRowsPlan::capacity ||
+               rows <= 0 || workers <= 0 || !descriptors.front().packed ||
+               descriptors.front().packed->blocks_per_row <= 0)
+                throw std::invalid_argument("CPU fused plan requires positive rows, workers and matrix descriptors");
+        }
+    }
+
     /**
      * @brief Project admitted output metadata without reading any tensor payload.
      * @param descriptor Actual output binding and its immutable prepared matrix.
@@ -6885,8 +7259,11 @@ namespace llaminar2::cpu::native_quantised
             .bundle_class = bundle_class};
     }
 
+    namespace detail
+    {
     /**
-     * @brief Resolve a fused bundle without requiring tensor payloads or scratch.
+     * @brief Fill an exactly sized initialized prefix through the one original planner.
+     * @param plans Original live plan objects, each already default-initialized by its owner.
      * @param descriptors Each member's real prepared format, shape and schedule.
      *        Payloads are never read. Exact evidence additionally checks immutable
      *        output addresses/strides; null metadata-only bindings retain the
@@ -6896,7 +7273,7 @@ namespace llaminar2::cpu::native_quantised
      * @param isa_path Runtime ISA policy; shared with execution and diagnostics.
      * @tparam ExactPolicyLookup Immutable generated lookup; tests may instantiate
      *         the same planner with a frozen observation, never mutate live policy.
-     * @return Complete task geometry and exact simultaneous partial-bank demand.
+     * @return Small scalar summary; projection geometry remains in the borrowed prefix.
      * @throws std::invalid_argument for incomplete or inconsistent geometry.
      * @throws std::overflow_error when the physical partial bank cannot be represented.
      *
@@ -6907,14 +7284,14 @@ namespace llaminar2::cpu::native_quantised
      * than invoke this local prepared-weight boundary on the discovery root.
      */
     template <auto ExactPolicyLookup = generated::selectCPUExecutionExactPolicy>
-    inline NativeQuantisedFusedRowsPlan planNativeQuantisedFusedRows(
+    inline NativeQuantisedFusedRowsPlanSummary fillNativeQuantisedFusedRowsPlans(
+        std::span<FusedVerifierRowsPlan> plans,
         std::span<const FusedVerifierRowsDesc> descriptors,
         int M, int num_threads, ISAPath isa_path = ISAPath::AUTO)
     {
-        if (descriptors.empty() || descriptors.size() > NativeQuantisedFusedRowsPlan::capacity ||
-            M <= 0 || num_threads <= 0 || !descriptors.front().packed ||
-            descriptors.front().packed->blocks_per_row <= 0)
-            throw std::invalid_argument("CPU fused plan requires positive rows, workers and matrix descriptors");
+        requireNativeQuantisedFusedRowsPlanInput(descriptors,M,num_threads);
+        if(plans.size() != descriptors.size())
+            throw std::invalid_argument("CPU fused planner fill requires exactly its live projection prefix");
         const auto *descs = descriptors.data();
         const int num_descs = static_cast<int>(descriptors.size());
         const int K_blocks = descriptors.front().packed->blocks_per_row;
@@ -6935,8 +7312,7 @@ namespace llaminar2::cpu::native_quantised
                 "AVX2 or AVX512 grouped implementation");
         }
 
-        NativeQuantisedFusedRowsPlan result;
-        auto &plans = result.projections;
+        NativeQuantisedFusedRowsPlanSummary result;
         size_t fused_partial_sum_floats = 0;
         for (int p = 0; p < num_descs; ++p)
         {
@@ -7187,6 +7563,39 @@ namespace llaminar2::cpu::native_quantised
         return result;
     }
 
+    } // namespace detail
+
+    /**
+     * @brief Preserve the complete public value plan while sharing the original fill logic.
+     * @param descriptors Original prepared projection metadata; only this live prefix is planned.
+     * @param M Positive inherited rows.
+     * @param num_threads Actual positive invocation workers, including existing-team identity.
+     * @param isa_path Original runtime ISA policy.
+     * @tparam ExactPolicyLookup Same immutable generated policy used by execution.
+     * @return Original capacity/default/copy-safe value with exact scratch/task geometry.
+     * @throws std::invalid_argument For incomplete geometry or incompatible scheduling.
+     * @throws std::runtime_error For unsupported vector execution.
+     * @throws std::overflow_error For unrepresentable original bank geometry.
+     */
+    template <auto ExactPolicyLookup = generated::selectCPUExecutionExactPolicy>
+    inline NativeQuantisedFusedRowsPlan planNativeQuantisedFusedRows(
+        std::span<const FusedVerifierRowsDesc> descriptors,
+        int M,int num_threads,ISAPath isa_path = ISAPath::AUTO)
+    {
+        detail::requireNativeQuantisedFusedRowsPlanInput(descriptors,M,num_threads);
+        NativeQuantisedFusedRowsPlan result;
+        const auto summary = detail::fillNativeQuantisedFusedRowsPlans<ExactPolicyLookup>(
+            std::span(result.projections).first(descriptors.size()),descriptors,M,num_threads,isa_path);
+        result.partial_route = summary.partial_route;
+        result.partial_floats = summary.partial_floats;
+        result.worker_partial_stride = summary.worker_partial_stride;
+        result.use_avx512 = summary.use_avx512;
+        result.use_avx2 = summary.use_avx2;
+        result.all_k_partitioned = summary.all_k_partitioned;
+        result.execution_exact_class = summary.execution_exact_class;
+        return result;
+    }
+
     namespace detail
     {
         /**
@@ -7281,9 +7690,14 @@ namespace llaminar2::cpu::native_quantised
             }
         }
 
-        const auto bundle = planNativeQuantisedFusedRows(
-            {descs, static_cast<size_t>(num_descs)}, M, num_threads, isa_path);
-        const auto &plans = bundle.projections;
+        // Each actual caller/worker keeps its original fixed stack capacity.
+        // Only live plans begin lifetimes; the public full-value API is unchanged.
+        alignas(FusedVerifierRowsPlan) std::array<std::byte,
+            sizeof(FusedVerifierRowsPlan) * kMaxFusedVerifierProjections> plan_storage;
+        detail::NativeQuantisedFusedRowsLiveView live_plan(plan_storage,static_cast<size_t>(num_descs));
+        const auto bundle = detail::fillNativeQuantisedFusedRowsPlans(
+            live_plan.mutableProjections(),{descs,static_cast<size_t>(num_descs)},M,num_threads,isa_path);
+        const auto plans = live_plan.projections();
         const bool use_avx512 = bundle.use_avx512;
         const bool use_avx2 = bundle.use_avx2;
         const bool all_full_k = bundle.partial_route == NativeQuantisedFusedPartialRoute::FullK;
@@ -8304,9 +8718,42 @@ namespace llaminar2::cpu::native_quantised
                              * registers, or in one task-local partition consumed
                              * immediately, so avoid materializing sixteen partial
                              * planes. Two-row kernels retain shared weight decode;
-                             * wider tiles continue through the common partial path.
+                             * Three-row WideRows has its own six-chain
+                             * kernel below; other wider tiles retain the common
+                             * partial path until independent economy admission.
                              */
                             const auto &packed = *descriptor.packed;
+                            // Dispatch from the resolved physical policy so explicit
+                            // and measured Auto choices execute the same kernel.
+                            // A true three-row tail owns exactly these same original
+                            // addresses, partitions and N64 panel, with no row replay.
+                            if (tile_rows == 3 && use_avx512 && packed.usesNibbleLUT() &&
+                                packed.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert &&
+                                plan.effective_verifier_schedule == VerifierRowsPolicy::WideRows)
+                            {
+                                const Q8_1Block *input = descriptor.input ? descriptor.input : A_q8_all;
+                                const int n_start = chunk * 64;
+                                const int columns = std::min(64, descriptor.N - n_start);
+                                alignas(64) float tails[3][64];
+                                const auto destination = [&](int row_offset) {
+                                    return columns == 64 ? descriptor.output +
+                                        static_cast<size_t>(first_row + row_offset) * descriptor.ldc + n_start
+                                        : tails[row_offset];
+                                };
+                                dispatch_3row_native_avx512_ordered_partitions(packed,
+                                    input + static_cast<size_t>(first_row) * K_blocks,
+                                    input + static_cast<size_t>(first_row + 1) * K_blocks,
+                                    input + static_cast<size_t>(first_row + 2) * K_blocks,
+                                    destination(0), destination(1), destination(2), chunk,
+                                    K_blocks, plan.k_tiles, plan.k_blocks_per_tile,
+                                    decode_luts_512[static_cast<size_t>(projection)].value);
+                                if (columns != 64)
+                                    for (int row_offset = 0; row_offset < 3; ++row_offset)
+                                        std::memcpy(descriptor.output +
+                                            static_cast<size_t>(first_row + row_offset) * descriptor.ldc + n_start,
+                                            tails[row_offset], static_cast<size_t>(columns) * sizeof(float));
+                                continue;
+                            }
                             if (tile_rows <= 2 && use_avx512 &&
                                 packed.numerical_policy ==
                                     CPUProjectionNumericalPolicy::GPUAlignedExpert)

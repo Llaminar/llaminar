@@ -4,6 +4,8 @@ The existing adapter remains the byte, effective-route and raw-timing authority.
 This extension binds its evidence to the full production key and complete live
 bundle witness. Whole-bundle latency is retained as whole-bundle latency; no
 per-leaf division, inferred producer or generic training label is introduced.
+Batch timing additionally proves zero projection observations while collection
+is suppressed; isolated profiler counters keep their separate one-call contract.
 """
 from __future__ import annotations
 
@@ -18,7 +20,11 @@ from .cpu_verifier import (
     _timing_key, adapt_cpu_verifier_row,
 )
 from ..corpus import ObservationCorpus
-from ..cpu_exact_overlay import CPUExecutionExactKey, canonical_digest, validate_filled_bundle
+from ..cpu_exact_overlay import (
+    CPUExecutionExactKey, canonical_digest, validate_filled_bundle,
+    is_execution_exact_batch_timing,
+    require_execution_exact_batch_timing_collection_disabled,
+)
 from ..format_registry import format_spec
 from ..schema import Backend, NativeQuantisedObservation, classify_aspect
 
@@ -174,6 +180,9 @@ def adapt_cpu_execution_exact_native(
     schema=payload.get("schema")
     if schema not in {"cpu_execution_exact_native_v1","cpu_execution_exact_native_v2"}:
         raise ValueError("CPU exact native evidence has an unsupported producer schema")
+    batch_timing = is_execution_exact_batch_timing(payload)
+    if batch_timing:
+        require_execution_exact_batch_timing_collection_disabled(payload)
     tournament=None
     if schema=="cpu_execution_exact_native_v2":
         from ..adaptive_tournament import validate_fused_tournament
@@ -204,11 +213,14 @@ def adapt_cpu_execution_exact_native(
         counters["authentication_calls"] != 1 or not counters["authentication_outside_timing"] or
         counters["authenticated_projection_observations"] != len(payload["descriptor_keys"]) or not counters["route_records"]):
         raise ValueError("CPU exact native evidence is missing its original route counters")
-    if tournament is not None:
-        expected=(3+(timing["sample_count"]*timing["repeat_count"] if tournament.promotion_grade else 0))*len(members)
-        if (not correct.get("repeated_replay") or counters["expected_projection_observations"]!=expected or
-                counters.get("sample_observation_basis")!="screen_and_final_timed_calls_only"):
-            raise ValueError("adaptive native counters do not separate screening/final/correctness work")
+    if batch_timing:
+        expected = 0 if tournament is not None else 2 * len(members)
+        basis = "timed_calls_collection_suppressed" if tournament is not None else "untimed_guard_calls_only"
+        if (counters["expected_projection_observations"] != expected or
+                counters.get("sample_observation_basis") != basis):
+            raise ValueError("CPU exact batch counters do not isolate untimed guards from suppressed timing")
+    if tournament is not None and not correct.get("repeated_replay"):
+        raise ValueError("adaptive native evidence lost its original repeated byte checks")
     placement = payload["placement"]
     if placement["workers"] != key.workers or placement["admitted_physical_cores"] < key.workers:
         raise ValueError("CPU exact native placement does not admit its actual physical team")
@@ -268,4 +280,9 @@ def adapt_cpu_execution_exact_native(
         "requested_candidate": requested_candidate,
         "installed_generated_lookup_verified": installed_choices is not None,
         "target_descriptor": payload["target_descriptor"], "placement": placement,
-        "expert_rows": payload["expert_rows"], "output_role": payload["output_role"]})
+        "expert_rows": payload["expert_rows"], "output_role": payload["output_role"],
+        "native_timing_owner": "CPUExecutionExactBatch" if batch_timing else "ProjectionCounterBundleReplay",
+        "native_timing_schema": schema,
+        **({"timed_collection_disabled": counters["timed_collection_disabled"],
+            "timed_projection_observations": counters["timed_projection_observations"]}
+           if batch_timing else {})})

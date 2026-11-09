@@ -13,6 +13,8 @@
  * geometries, partial bundles and repeated large-to-small request reuse.
  * Unsigned-weight dot lifecycle inputs also cover signed-Q8 extremes, every
  * canonical source family and both owned/workspace prepared banks.
+ * Explicit three-row WideRows additionally preserves original bank/factor
+ * arithmetic, true three-row and four-plus-three tails across request reuse.
  * Same-panel pair-run replay retains the original pair arithmetic through
  * mixed singleton/long-expert ownership, dirty tails and existing-team calls.
  */
@@ -234,3 +236,5 @@ TEST(CPUNativeQuantisedFusedCompletion, SharedBank)
 #include "CPUNativeQuantisedUnsignedWeightDotLifecycle.inc"
 
 #include "CPUNativeQuantisedSamePanelPairRunReplay.inc"
+
+#include "CPUNativeQuantisedOrderedThreeRowNibbleLifecycle.inc"

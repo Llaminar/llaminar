@@ -6,7 +6,42 @@
  * storage are prepared once. Request boundaries bind only tight live prefixes;
  * no capacity tail enters the production kernel. A timing team spans requests.
  * Profiling reuses the native worker pool through the existing counter owner.
+ * Warmup/sample loops suppress collection at quiescent team boundaries; their
+ * final route proof uses one fresh, fully recorded call outside the clocks.
  */
+
+/**
+ * @brief Test-owner recording suppression; all workers must be quiescent on entry/exit.
+ *
+ * Only the collection filter changes. Existing immutable PerfStats policies own
+ * publication/lifetime; production execution, request topology and record data
+ * are untouched. This cold owner control never surrounds profiler evidence.
+ */
+class CPUExactTimingCollectionScope final
+{
+public:
+    /** @brief Retain the exact original filter, then withdraw every timing record. */
+    CPUExactTimingCollectionScope()
+    {
+        if (const char *value = std::getenv("LLAMINAR_PERF_STATS_FILTER")) prior_filter_ = value;
+        if (setenv("LLAMINAR_PERF_STATS_FILTER", "cpu_exact_timing_disabled", 1) != 0)
+            throw std::runtime_error("Cannot suppress CPU exact timing collection");
+        PerfStatsCollector::reloadConfigurationFromEnvironment();
+    }
+    /** @brief Restore the caller's exact policy before a later proof/export. */
+    ~CPUExactTimingCollectionScope() noexcept
+    {
+        const int status = prior_filter_
+            ? setenv("LLAMINAR_PERF_STATS_FILTER", prior_filter_->c_str(), 1)
+            : unsetenv("LLAMINAR_PERF_STATS_FILTER");
+        if (status != 0) std::terminate();
+        PerfStatsCollector::reloadConfigurationFromEnvironment();
+    }
+    CPUExactTimingCollectionScope(const CPUExactTimingCollectionScope &) = delete;
+    CPUExactTimingCollectionScope &operator=(const CPUExactTimingCollectionScope &) = delete;
+private:
+    std::optional<std::string> prior_filter_; ///< Restored after the team retires its timed reads.
+};
 
 /** @brief One immutable request; source/geometry/worker contract belongs to the batch. */
 struct CPUExecutionExactBatchRequest
@@ -23,7 +58,8 @@ struct CPUExecutionExactBatchRequest
 /**
  * @brief Run the actual fused owner for compatible, independently retained requests.
  * @param format Canonical source/encoding registry entry selected by GTest.
- * @param request_path Immutable request manifest; no per-request environment mutation.
+ * @param request_path Immutable request manifest; execution settings never mutate.
+ * Recording-only filter transitions are scoped outside clocks at quiescent boundaries.
  */
 void runCPUExecutionExactBatch(const QuantizedVerifierFormatCase &format, const char *request_path)
 {
@@ -288,13 +324,40 @@ void runCPUExecutionExactBatch(const QuantizedVerifierFormatCase &format, const 
             for (size_t index = live_root_floats[root]; index < outputs[root].size(); ++index)
                 ASSERT_EQ(outputs[root][index], guard);
     };
+    const auto recorded_projections = []() {
+        uint64_t count = 0;
+        for (const auto &record : PerfStatsCollector::snapshot({"kernel.cpu_native_quantised_fused_verifier_rows_projection_launch"}))
+            count += record.count;
+        return count;
+    };
+    std::optional<CPUExactTimingCollectionScope> timing_collection;
+    uint64_t timing_records_before = 0, timed_projection_observations = 0;
+    bool timed_collection_disabled = false;
+    // Call only on the master between team barriers. Policy construction and
+    // snapshots stay outside warmup/timing; every worker reads one immutable
+    // disabled policy while it executes the unchanged production calls.
+    const auto begin_unrecorded_timing = [&]() {
+        timing_records_before = recorded_projections();
+        timing_collection.emplace();
+        ASSERT_FALSE(PerfStatsCollector::isDomainEnabled("kernel"));
+    };
+    const auto finish_unrecorded_timing = [&]() {
+        const auto after = recorded_projections();
+        const bool disabled = !PerfStatsCollector::isDomainEnabled("kernel");
+        timing_collection.reset(); // Restore even if the subsequent proof fails.
+        ASSERT_GE(after, timing_records_before);
+        timed_projection_observations = after - timing_records_before;
+        timed_collection_disabled = disabled;
+        ASSERT_TRUE(disabled);
+        ASSERT_EQ(timed_projection_observations, 0u);
+    };
     const auto sample_count = [&]()
     {
         sample_observations = 0;
         for (const auto &record : PerfStatsCollector::snapshot({"kernel.cpu_native_quantised_fused_verifier_rows_projection_launch"}))
             sample_observations += record.count;
         if (PerfStatsCollector::isDomainEnabled("kernel"))
-            ASSERT_EQ(sample_observations, (2u + static_cast<uint64_t>(warmup) + static_cast<uint64_t>(samples) * repeats) * live_projections);
+            ASSERT_EQ(sample_observations, 2u * live_projections);
     };
     nlohmann::json tournament_receipt;
     std::vector<double> current_screen_samples;
@@ -380,8 +443,10 @@ void runCPUExecutionExactBatch(const QuantizedVerifierFormatCase &format, const 
             if (PerfStatsCollector::isDomainEnabled("kernel")) ASSERT_EQ(authenticated, live_projections);
             evidence["counters"] = {{"enabled", PerfStatsCollector::isDomainEnabled("kernel")},
                 {"projection_observations", sample_observations}, {"expected_projection_observations",
-                    tournament ? current_timed_projection_count :
-                    (2u + static_cast<uint64_t>(warmup) + static_cast<uint64_t>(samples) * repeats) * live_projections},
+                    tournament ? current_timed_projection_count : 2u * live_projections},
+                {"timed_collection_disabled", timed_collection_disabled},
+                {"timed_projection_observations", timed_projection_observations},
+                {"sample_observation_basis", "untimed_guard_calls_only"},
                 {"authenticated_projection_observations", authenticated}, {"execution_exact_hits", hits},
                 {"route_records", routes}, {"authentication_calls", 1}, {"authentication_outside_timing", true}};
         }
@@ -396,7 +461,7 @@ void runCPUExecutionExactBatch(const QuantizedVerifierFormatCase &format, const 
             evidence["configured_full_repeat_count"] = repeats;
             evidence["tournament"] = tournament_receipt;
             ASSERT_EQ(sample_observations, current_timed_projection_count);
-            evidence["counters"]["sample_observation_basis"] = "screen_and_final_timed_calls_only";
+            evidence["counters"]["sample_observation_basis"] = "timed_calls_collection_suppressed";
         }
         std::ofstream output(current->evidence_path); ASSERT_TRUE(output.is_open());
         output << evidence.dump(2) << '\n'; output.flush(); ASSERT_TRUE(output.good());
@@ -480,7 +545,9 @@ void runCPUExecutionExactBatch(const QuantizedVerifierFormatCase &format, const 
             uint64_t observed = 0;
             for (const auto& record : PerfStatsCollector::snapshot({"kernel.cpu_native_quantised_fused_verifier_rows_projection_launch"}))
                 observed += record.count;
-            ASSERT_EQ(observed, static_cast<uint64_t>(count) * live_projections);
+            ASSERT_FALSE(PerfStatsCollector::isDomainEnabled("kernel"));
+            ASSERT_GT(count, 0);
+            ASSERT_EQ(observed, 0u);
             timed_counts[index] += observed;
         };
         // One team spans preparation, every candidate's byte checks, rotating
@@ -551,6 +618,15 @@ void runCPUExecutionExactBatch(const QuantizedVerifierFormatCase &format, const 
 #pragma omp barrier
                     if (stop) break;
                 }
+                if (stop) break;
+#pragma omp master
+                {
+                    // All candidate correctness calls have retired. Each later
+                    // bind resets records under this same disabled policy.
+                    PerfStatsCollector::reset(); begin_unrecorded_timing();
+                    stop = ::testing::Test::HasFatalFailure();
+                }
+#pragma omp barrier
                 if (stop) break;
                 for (size_t round = 0; round < 3 && !stop; ++round)
                     for (size_t offset = 0; offset < members.size(); ++offset)
@@ -680,6 +756,10 @@ void runCPUExecutionExactBatch(const QuantizedVerifierFormatCase &format, const 
                 }
 #pragma omp barrier
                 if (stop) break;
+#pragma omp master
+                { finish_unrecorded_timing(); stop = ::testing::Test::HasFatalFailure(); }
+#pragma omp barrier
+                if (stop) break;
                 // Timing never weakens the all-candidate byte/repeat/dirty-tail gate.
                 for (size_t position = 0; position < members.size(); ++position)
                 {
@@ -718,8 +798,7 @@ void runCPUExecutionExactBatch(const QuantizedVerifierFormatCase &format, const 
                         current_finalist_reason = selection.reasons[position];
                         timings = current_promotion_grade ? finals[index] : screens[index];
                         sample_observations = timed_counts[index];
-                        current_timed_projection_count = (3u + (current_promotion_grade
-                            ? static_cast<uint64_t>(samples) * repeats : 0u)) * live_projections;
+                        current_timed_projection_count = 0; // Actual timed collection is suppressed.
                         emit(false); stop = ::testing::Test::HasFatalFailure();
                     }
 #pragma omp barrier
@@ -743,6 +822,11 @@ void runCPUExecutionExactBatch(const QuantizedVerifierFormatCase &format, const 
 #pragma omp barrier
                 if (stop) break;
                 run_guarded();
+#pragma omp barrier
+#pragma omp master
+                { begin_unrecorded_timing(); stop = ::testing::Test::HasFatalFailure(); }
+#pragma omp barrier
+                if (stop) break;
                 for (int iteration = 0; iteration < warmup; ++iteration) run();
                 for (int sample = 0; sample < samples; ++sample)
                 {
@@ -755,6 +839,11 @@ void runCPUExecutionExactBatch(const QuantizedVerifierFormatCase &format, const 
 #pragma omp master
                     { timings[sample] = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / repeats; }
                 }
+#pragma omp barrier
+#pragma omp master
+                { finish_unrecorded_timing(); stop = ::testing::Test::HasFatalFailure(); }
+#pragma omp barrier
+                if (stop) break;
 #pragma omp master
                 { poison_guards(); }
 #pragma omp barrier
@@ -774,13 +863,15 @@ void runCPUExecutionExactBatch(const QuantizedVerifierFormatCase &format, const 
     else for (const auto &request : requests)
     {
         current = &request; bind_request(); ASSERT_FALSE(::testing::Test::HasFatalFailure());
-        run_guarded(); for (int iteration = 0; iteration < warmup; ++iteration) run();
+        run_guarded(); begin_unrecorded_timing(); ASSERT_FALSE(::testing::Test::HasFatalFailure());
+        for (int iteration = 0; iteration < warmup; ++iteration) run();
         for (int sample = 0; sample < samples; ++sample)
         {
             const auto start = std::chrono::steady_clock::now();
             for (int repeat = 0; repeat < repeats; ++repeat) run();
             timings[sample] = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / repeats;
         }
+        finish_unrecorded_timing(); ASSERT_FALSE(::testing::Test::HasFatalFailure());
         poison_guards(); run_guarded(); check_bytes(); sample_count(); ASSERT_FALSE(::testing::Test::HasFatalFailure());
         PerfStatsCollector::reset(); run(); check_bytes(); emit(false); ASSERT_FALSE(::testing::Test::HasFatalFailure());
     }

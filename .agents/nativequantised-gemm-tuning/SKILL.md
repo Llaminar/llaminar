@@ -73,6 +73,11 @@ Use the command's help for the Release trainer paths and resumable batch
 controls. Keep missing runtime installation surfaces explicit; collection
 alone must never be described as installed dispatch.
 
+For a focused expert-only experiment, repeat `--expert-m M` to select actual
+row counts from the selected purposes' existing inventory. Declare this scope
+before collection and retain it on resume. The projection preserves mixed-row
+holdouts and does not change runtime dispatch or the default full inventory.
+
 Fresh model sweeps select Qwen3.5/3.6/3.8 and QFN geometry, retaining shared
 physical shapes under their original names. `--model-scope all-retained`
 explicitly selects the older full inventory. `--resume` preserves the saved
@@ -106,6 +111,14 @@ persistent worker-team setup. Preserve each request's actual M, phase,
 candidate, descriptor vector, output extent, correctness and raw sample
 identity. Use atomic per-cell completion and resume only authenticated complete
 cells. Batching must not make one request's profiling interval include another.
+
+CPU expert-batch clocks must suppress PerfStats recording during screening,
+warmup and samples, then restore recording for a fresh untimed route proof.
+Change the existing recording policy only at quiescent team boundaries outside
+the clocks. Native evidence must prove zero timed projection observations;
+import, completed-cell reuse and new winner publication enforce that contract.
+Keep older instrumented records as diagnostics without relabeling their clocks.
+This does not withdraw unrelated completed collectors or installed policies.
 
 Interleave or reverse candidate order across repeated samples and fresh
 lifetimes. Retain all candidates and raw timings, including failures and
