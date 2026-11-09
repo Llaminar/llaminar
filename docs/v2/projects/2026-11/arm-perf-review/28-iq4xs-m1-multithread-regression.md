@@ -547,3 +547,9 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   args.compiler mismatch).
 - SOURCE124 GNU status = owner-reported FAILURE (census-caught defect);
   one-of-four Mac failure stays unreproduced/unresolved, no attribution.
+
+- SOURCE125 census FULLY GREEN (sealed K14-SOURCE125-CENSUS-20261109): PASS
+  176 first build; 4/4 tests; proof GNU-14 NEON_I8MM 242/1274; lifecycle 1;
+  9/9 cells single=0 grouped=budget 0 mismatches; no rejection/flake; final
+  `driver_plan != plan` now passes; still-different controls exercised
+  in-fixture. Fix confirmed. (SOURCE124 epoch still HOLD w/ folded items.)
