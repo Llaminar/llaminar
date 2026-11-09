@@ -478,3 +478,19 @@ the source policy). Dead persistent_state parameter removed.
   RunnerIdentity: SIGABRT double-free 9/9 at b199ccfa0, PASSES at
   5d4e3716a/ae090ec81 → (5'') 912d0107 = direct control (attribution
   verdict). No seal until both resolved.
+
+## RoPE lifecycle mismatch — ROOT CAUSE DIRECTION (2026-11-09)
+
+- x86 diagnostics: primitives IDENTICAL at 912d0107 + 5d4e3716a (all routes,
+  OMP 1/4/32, -ffp-contract=off) → defect ABOVE primitive. DIAG: all
+  elements differ (all 3 stages, both banks); 'actual' = EXACTLY the
+  UNROTATED seeds (q −0x1.e8p+1, k −0x1.ep+1) → execute() returns true but
+  leaves Q/K UNTOUCHED; 2-of-3 replays per stage (6×2 = 12 EXPECTs); 3rd
+  replay rotates. Pattern: first OK; after resetSessionState() execute =
+  SILENT NO-OP (bound angle workspace or kernel state cleared by reset).
+  Production-relevant (maxims 17/29 + unrepresentable-invalid). Lane fixing:
+  reset must not invalidate the admitted binding (or re-admit); execute must
+  fail fatally on unbound workspace (no silent-skip); focused regression
+  (reset+replay rotate; fail-fast case). NOTE: adaptive-diag patch applied
+  at b199ccfa0 (not 912d0107 — gate tree untouched; files byte-identical);
+  reverted clean. WSL's own earlier null-adapt = disregard (not product).
