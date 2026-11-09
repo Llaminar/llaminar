@@ -1,6 +1,25 @@
 # Idea 30 — ARMv9 ISA bundle: SVE2 (incl. SVE I8MM/BF16) + FP16/fp16fml
 
-Status: **QUEUED** (2026-11-09, operator) — next-lane candidate.
+Status: **DEPRIORITIZED** (2026-11-09) — evidence verdict below; not a lane now.
+
+TARGET = SPARKS (operator directive 2026-11-09); Grace-specific ignored.
+
+VERDICT: X925/GB10 VL probe (arm-sparks, .80): default=16, GET_VL=16,
+  svcntb=16, SET_VL(max|ONEXEC) = **-1 REJECTED** (X925 cannot raise VL;
+  DGX Grace = capped at 16 with SET returning 16) -> **SVE = 128-bit ONLY on
+  BOTH targets.** The 2x-width hypothesis is DEAD. HWCAP advertises
+  SVE/SVE2/SVEI8MM/SVEBF16/BF16/I8MM at VL=128 only. SVE2 residual value =
+  128-bit instruction pool (dot/bf16/fp16-widen = small vs NEON: NEON
+  vfmlalq_low_f16 is already default under armv9-a; SVE2 I8MM smmul at 128
+  = same-class as NEON SMMLA). => SVE2 deprioritized; only a 128-bit
+  ILP/SIMD-density question remains (unmeasured; low prio).
+
+FP16fml: ALREADY AVAILABLE (NEON vfmlalq_low_f16 default at armv9-a;
+  SVE2 svmlalb_f32 without +fp16fml) -> no envelope work; the actionable
+  small item = verify the engine's FP16 GDN alpha/beta kernels actually
+  EMIT fmlalq on X925 (objdump check), else a kernel tuning item.
+
+QUEUE NOW: idea 31 (S=4 spillfixes) = the Sparks-directed ISA follow-up.
 
 QUEUE ENTRY: this bundle is queued as a possible task for a lane that
 finishes its current work. Natural owner: the addon lane (01a1bbe6) after
