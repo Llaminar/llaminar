@@ -2528,6 +2528,8 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
             .device = cfg.device,
             .total_bytes = cfg.device_total_bytes,
             .admission_available_bytes = cfg.device_free_bytes,
+            .backing = cfg.device_memory_backing,
+            .pool_available_bytes = cfg.device_pool_available_bytes,
         });
         bom_builder
             .add(PhysicalMemoryOwner::ImmutableLookupStaging,(cfg.device.is_cpu() || gpu_adaptive)?adaptive_request_bytes:0u,

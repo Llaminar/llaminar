@@ -20,6 +20,7 @@
 #include "planning/GraphSnapshotMemoryCapacity.h"
 #include "planning/PipelineTransferMemory.h"
 #include "backends/PeerAccessCoverage.h"
+#include "backends/PhysicalMemoryBacking.h"
 #include "planning/WeightMemoryEstimator.h"
 #include "planning/KVCacheMemoryEstimator.h"
 #include "backends/DeviceId.h"
@@ -255,6 +256,10 @@ struct DevicePlanConfig
     DeviceId device;
     size_t device_total_bytes = 0;
     size_t device_free_bytes = 0;
+    /** Discovered backing; RankHostPool pools this GPU with its rank's CPU allocator. */
+    PhysicalMemoryBacking device_memory_backing = PhysicalMemoryBacking::Dedicated;
+    /** RankHostPool only: uncapped physical pool observation (see PhysicalMemoryResource). */
+    size_t device_pool_available_bytes = 0;
 
     /**
      * Host allocator that owns CPU-side state created by this execution graph.
