@@ -1,8 +1,9 @@
 # Native ARM CPU inference: implementation, numerical proof and tuning plan
 
 Created: 2026-11-04; progress updated 2026-11-06.
-Base: `feat/qfn-ngram-continuation` at `2cba3ca1d`.
-Working branch: `codex/qfn-ngram-continuation-arm64`.
+Rebased upstream base: `feat/qfn-ngram-continuation` at `f48c856105f6d1495a4c342ed2cc0c62b4d11273`.
+Local committed head: `fe4d37d19482c3161d7cdb0698a96027d9e0d68e`; working branch: `codex/qfn-ngram-continuation-arm64`.
+The rebased history has not been force-pushed; the immutable K17 source below also includes uncommitted implementation work.
 
 **Status: implementation plan, not a completed port or performance certificate.**
 The full objective remains native CPU inference with the robustness of the
@@ -10,16 +11,35 @@ existing Intel path, not merely a successful configure or primitive benchmark.
 
 ### Verified frontier — 2026-11-06
 
-The validated K11 slice closes native sparse-indexer arithmetic/resource
-slice: all229 configured core-free tests pass on five native profiles, and all179
-preflight cells pass20 times per profile. It is not an engine/serving certificate.
-Twelve optimized-sanitizer RMS transform warnings remain open in
-[issue36](https://github.com/Llaminar/llaminar/issues/36); canonical engine gates,
-complete indexer M/worker coverage, native-x86 current-source proof and economy
-remain unfinished. The fresh Git-bound canonical hook fails OpenMP discovery
-before native macOS memory admission; no full-engine gate passes. Source-only
-reviews and old published packets do not replace
-those gates. Exact retained evidence and boundaries follow below.
+Historical K11 passed all229 configured core-free tests on five profiles and
+all179 preflight cells20 times per profile. Current rebased K14 independently
+passed the expanded indexer native Mac slice, including original-input all-M,
+prefix-tail and admitted-team sweeps. K17 (`467cadff20f2e36065728a42970c3c93016b1c62`)
+passed three native RMS profiles:35 registrations, explicit native/Scalar/team
+authentication controls and a rounded-product mutant; all three RMS translation
+units compile without warnings. The complete five-profile K17 core-free matrix
+now passes243 tests per profile plus193 preflight cells20 times per profile
+(19,300 raw preflight passes), with zero warnings/sanitizer hits and unchanged
+source. Main independently authenticated all95 sealed artifacts and actual
+per-test repeat counts. This remains a Mac core-free slice, not an engine gate.
+GNU/native-x86, Spark20-core coverage, economy,
+canonical engine gates and serving remain unfinished. The old Git-bound Mac hook
+failure is historical evidence, not a rerun on the new base. Exact-SDK Spark mount
+primitives now pass; the guarded app plus both complete gate-target BUILD-ONLY
+protocol is under review, with no current complete-engine build result.
+
+Standalone issues36/37 were consolidated at the operator's request; this does not
+resolve or waive their remaining work. Fixes and regressions are tracked directly
+in this plan/local tasks. The operator-provided arm-helper owns isolated RMS
+numeric/lifecycle/half-policy/identity-gamma implementation against exact K17;
+Main retains engine/integration and publication, arm-tester immutable runs and
+arm-reviewer source-only review. Helper RMS candidates remain uncompiled source
+until reviewed and independently qualified; neither their seals nor the K17
+results certify the new fatal-policy changes. A clean25.07-second Debug timing
+observation exposed missing CTest PROCESSORS accounting for whole-team tests;
+that local follow-on uses the actual admitted budget, not caps, locks or a longer
+timeout. Source-only reviews and old packets never replace
+current compiler/runtime gates. Detailed retained scopes follow below.
 
 The immutable `4e56c543` successor now has independently audited native x86
 AQ8/value/lookup correctness:24 registrations and12 focused cells×20 per ISA,
@@ -118,6 +138,42 @@ geometry, expected-word or registration change is introduced by K11. Full
 indexer M/all-worker coverage, complete engine gates and economy remain open;
 static resources are not allocation, lease or runtime-synchronization proofs.
 No complete M1 indexer replay is introduced.
+K12 added twelve independently filterable format/tail integration cells for
+all M1..16/31/33 and caller-admitted positive teams, with original-source gold
+and retained checks before the outer join. Only configure/metadata policy checks
+ran:241 registrations,191 preflight, no native compilation. Source85 found its
+source value-equality checks insufficient to prove signed-zero preservation.
+Unverified K13 uses exact word checks, position/pair-varying supplied rotary
+planes, synthetic-input naming and honest unmeasured timeout wording. The
+existing registered lifetime test also covers delayed indexer/selector arrival
+at short/ranking and live/empty frontiers in every representation. Gold is
+computed once and persistent fixture banks are reused; named team-resource
+ownership avoids internal oversubscription without worker caps or timeout
+changes. Production code is unchanged; no K13 native/negative-control result or
+tested totality claim exists yet. The frozen published2ff7 packet remains the
+earlier independently audited checkpoint. The old-base K13 Mac scoped matrix
+subsequently passed; no GNU or countercontrols ran for that epoch. After the
+operator-requested conflict-free rebase, exact K14 workspacea97be2f7 is separately
+bound to local HEADfe4d37d1 atop upstreamf48c8561; its fresh baseline compile and
+first two native cells passed. Remaining current-base gates require fresh runs,
+not relabelled K13 evidence; the PR has not been force-pushed.
+K15 fixed increasing-column scalar FP64 FMA order with an exact existing-detail
+seam regression and explicit preflight. Its three Mac RMS profiles passed; old
+Release-object controls failed while legitimate serial O0/SAN controls passed.
+The remaining sanitizer warnings are six generic apply-loop transform warnings;
+no GNU/x86 or economy certificate follows. Unverified K16 installs explicit
+compiled FP32 row publishers, retires the two uncompiled summary alias stubs and
+adds public rounded-product/tail/alias/retained checks with focused preflight.
+Native ARM's shared-row program and all native summary trees are unchanged.
+K16's first focused native case and three sanitizer RMS compilations passed
+without warnings; broader compiler/resource/runtime proof is pending. Source89's
+two test-authentication findings are addressed in unverified K17: self-admit the
+native profile and assert the actual retained3-worker team with restored dynamic
+policy. The separate scalar-summary diagnostic still permits Scalar positives.
+Collective numeric-error handling and complete engine/serving gates remain open.
+Its standalone issue tracker was consolidated into this active work, not closed
+as proof of completion. RMS numeric/lifecycle and half-policy work remains active
+in the isolated helper lane; no issue flood is used as a substitute for fixing it.
 The operator-assigned arm-sparks session owns all Spark/related remote
 coordination, with verified DATA-only handoffs and no inherited execution or
 resource grant. Historical WSL SDK/intake paths are not assumed live after
