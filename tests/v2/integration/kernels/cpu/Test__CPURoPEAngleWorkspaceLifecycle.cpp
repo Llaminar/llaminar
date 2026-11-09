@@ -107,11 +107,19 @@ namespace
         std::memcpy(c.k->mutable_data(), c.k_original.data(), c.k_original.size() * sizeof(float));
     }
 
-    /** @brief Execute and compare against the serial reference. */
-    void executeAndCompare(StageCase &c, CPUDeviceContext &ctx)
+    /**
+     * @brief Publish one request's positions, execute, and compare against the serial reference.
+     *
+     * A session reset clears request-local positions. As in production, where
+     * the orchestrator republishes every request through updateDynamicPositionIds
+     * or updateDynamicParams before execution, each replay publishes its own
+     * positions first; the admitted workspace binding is the state that survives.
+     */
+    void executeAndCompare(StageCase &c, CPUDeviceContext &ctx, const std::vector<int> &positions)
     {
+        c.stage->updateDynamicPositionIds(positions.data(), static_cast<int>(positions.size()));
         auto q = c.q_original, k = c.k_original;
-        serialReference(q, k, c.positions);
+        serialReference(q, k, positions);
         ASSERT_TRUE(c.stage->execute(&ctx));
         EXPECT_EQ(std::memcmp(c.q->data(), q.data(), q.size() * sizeof(float)), 0);
         EXPECT_EQ(std::memcmp(c.k->data(), k.data(), k.size() * sizeof(float)), 0);
@@ -123,7 +131,9 @@ namespace
  *
  * The family's admitted extent comes from the largest stage's rows and the head
  * width. Every stage borrows the same buffer address before and after a
- * session reset, and each replay reproduces the serial reference bytes.
+ * session reset. Each replay republishes a different request's positions, as
+ * production does after a reset, and reproduces the serial reference bytes for
+ * those positions; verifier padding rows stay untouched.
  */
 TEST(CPURoPEAngleWorkspaceLifecycle, SerialFamilyReusesOneBindingAcrossResetAndReplay)
 {
@@ -153,8 +163,13 @@ TEST(CPURoPEAngleWorkspaceLifecycle, SerialFamilyReusesOneBindingAcrossResetAndR
     {
         for (auto &c : stages)
         {
+            // A new request per replay: shift every live position, keep padding.
+            std::vector<int> positions = c.positions;
+            for (int &position : positions)
+                if (position >= 0)
+                    position += 1000 * replay;
             restore(c);
-            executeAndCompare(c, ctx);
+            executeAndCompare(c, ctx, positions);
             EXPECT_EQ(c.stage->getWorkspace(), workspace.get());
             EXPECT_EQ(workspace.get()->getBuffer(RoPEWorkspaceBuffers::CPU_ANGLES), address);
         }
