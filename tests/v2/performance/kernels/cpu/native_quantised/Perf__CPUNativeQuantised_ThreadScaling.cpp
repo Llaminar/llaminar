@@ -3,29 +3,43 @@
  * @brief Measures production CPU NativeQuantised scaling from one thread through
  *        one physical socket for decode, grouped verification, and prefill.
  *
- * This benchmark intentionally keeps one prepared Q4_K projection resident
- * while varying only the OpenMP team width. Each regime enters its production
- * `Auto` dispatcher:
+ * Each selected format keeps one prepared projection resident while varying
+ * only the OpenMP team width. Each regime enters its production `Auto`
+ * dispatcher:
  *
- * - M=1 uses the generated decode policy.
- * - M=4 and M=15 use the generated decode-equivalent verifier policy.
- * - M=64 uses the ordinary prefill heuristic.
+ * - M=1 uses the decode policy (x86 generated table; ARM native total policy).
+ * - M=4 and M=15 use the decode-equivalent verifier policy.
+ * - M=64 uses the ordinary prefill policy.
+ *
+ * Every timed configuration is authenticated outside the timing interval:
+ * its complete output bank must equal the serial M=1 production rows computed
+ * with one worker, byte for byte. A scaling point therefore also proves thread
+ * width and batch invariance of the exact arithmetic that was timed.
+ *
+ * Every M>1 point also times M independent production serial M=1 calls at the
+ * same team width, so grouped/prefill amortization is a measured ratio over
+ * the exact serial arithmetic it reproduces.
  *
  * The default N=7168, K=5120 projection has a prepared weight footprint larger
- * than the last-level cache of the reference Xeon socket. It therefore exposes
- * the bandwidth saturation expected from decode while still giving grouped
- * decode and prefill enough independent work to reveal compute scaling.
+ * than the last-level cache of the reference Xeon socket and of GB10. It
+ * exposes decode bandwidth saturation while giving grouped decode and prefill
+ * enough independent work to reveal compute scaling.
  *
- * Run the benchmark on physical cores from one socket:
+ * Run on physical cores of one socket/package, for example:
  *
  * @code
- * OMP_NUM_THREADS=28 OMP_PLACES=cores OMP_PROC_BIND=close \
- *   taskset -c 0-27 \
+ * OMP_NUM_THREADS=28 OMP_PLACES=cores OMP_PROC_BIND=close taskset -c 0-27 \
  *   ./build_v2_release_avx512/tests/v2/v2_perf_cpu_native_quantised_thread_scaling
+ * OMP_NUM_THREADS=20 OMP_PLACES=cores OMP_PROC_BIND=close \
+ *   LLAMINAR_CPU_THREAD_SCALING_FORMATS=all \
+ *   ./build_v2_release_neon/tests/v2/v2_perf_cpu_native_quantised_thread_scaling
  * @endcode
  *
  * Environment overrides:
  *
+ * - `LLAMINAR_CPU_THREAD_SCALING_FORMATS` (CSV labels or `all`; default Q4_K)
+ * - `LLAMINAR_CPU_THREAD_SCALING_THREADS` (CSV widths; default every width
+ *   from one through `omp_get_max_threads()`)
  * - `LLAMINAR_CPU_THREAD_SCALING_N`
  * - `LLAMINAR_CPU_THREAD_SCALING_K`
  * - `LLAMINAR_CPU_THREAD_SCALING_PREFILL_M`
@@ -41,6 +55,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
+#include <sstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -51,6 +67,7 @@
 #include <vector>
 
 #include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
+#include "utils/QuantizedVerifierFormats.h"
 #include "utils/TestTensorFactory.h"
 
 using namespace llaminar2;
@@ -84,24 +101,65 @@ int positiveEnvironmentValue(const char *name, int default_value)
 }
 
 /**
- * @brief Return logarithmic and socket-fraction thread samples.
+ * @brief Return every requested OpenMP team width.
  *
- * For the reference 28-core socket this produces exactly
- * `{1, 2, 4, 7, 14, 28}`. Duplicate values are removed for smaller machines,
- * which keeps this diagnostic useful on developer workstations as well.
+ * The default is every width from one through the configured maximum, so a
+ * scaling curve cannot hide a regression between sampled points. An explicit
+ * CSV restricts the sweep for diagnosis; it never adds widths above the
+ * configured team limit.
  */
 std::vector<int> threadSamples(int maximum_threads)
 {
-    std::vector<int> result = {
-        1,
-        std::min(2, maximum_threads),
-        std::min(4, maximum_threads),
-        std::max(1, maximum_threads / 4),
-        std::max(1, maximum_threads / 2),
-        maximum_threads,
-    };
+    std::vector<int> result;
+    const char *raw = std::getenv("LLAMINAR_CPU_THREAD_SCALING_THREADS");
+    if (!raw || *raw == '\0')
+    {
+        for (int threads = 1; threads <= maximum_threads; ++threads)
+            result.push_back(threads);
+        return result;
+    }
+    std::stringstream stream(raw);
+    std::string token;
+    while (std::getline(stream, token, ','))
+    {
+        char *end = nullptr;
+        const long parsed = std::strtol(token.c_str(), &end, 10);
+        if (token.empty() || *end != '\0' || parsed <= 0 || parsed > maximum_threads)
+            throw std::invalid_argument(
+                "LLAMINAR_CPU_THREAD_SCALING_THREADS entries must be in 1..max threads");
+        result.push_back(static_cast<int>(parsed));
+    }
     std::sort(result.begin(), result.end());
     result.erase(std::unique(result.begin(), result.end()), result.end());
+    return result;
+}
+
+/**
+ * @brief Resolve the requested canonical source formats.
+ * @return Registry entries in canonical order; unknown labels are fatal.
+ */
+std::vector<const QuantizedVerifierFormatCase *> selectedFormats()
+{
+    const char *raw = std::getenv("LLAMINAR_CPU_THREAD_SCALING_FORMATS");
+    const std::string request = raw && *raw ? raw : "Q4_K";
+    std::vector<const QuantizedVerifierFormatCase *> result;
+    if (request == "all")
+    {
+        for (const auto &format : quantizedVerifierFormats())
+            result.push_back(&format);
+        return result;
+    }
+    std::stringstream stream(request);
+    std::string token;
+    while (std::getline(stream, token, ','))
+    {
+        const auto &formats = quantizedVerifierFormats();
+        const auto found = std::find_if(formats.begin(), formats.end(),
+            [&](const auto &format) { return token == format.label; });
+        if (found == formats.end())
+            throw std::invalid_argument("Unknown thread-scaling format: " + token);
+        result.push_back(&*found);
+    }
     return result;
 }
 
@@ -166,6 +224,7 @@ int observeOpenMPTeamSize()
 /** @brief One operation measured at one OpenMP thread count. */
 struct ScalingPoint
 {
+    std::string format;
     std::string regime;
     std::string policy;
     int m = 0;
@@ -178,6 +237,11 @@ struct ScalingPoint
     double speedup = 0.0;
     double parallel_efficiency = 0.0;
     double fraction_of_max_throughput = 0.0;
+    /// Median of M independent production serial M=1 calls at the same width
+    /// (zero for the M=1 regime itself).
+    double serial_rows_median_us = 0.0;
+    /// serial_rows_median_us / timing.median_us: grouped/prefill amortization.
+    double grouped_vs_serial_speedup = 0.0;
 };
 
 /**
@@ -200,6 +264,38 @@ std::vector<Q8_1Block> makeActivations(int rows, int k, int k_blocks)
 }
 
 /**
+ * @brief Describe the production schedule the Auto dispatcher resolves.
+ *
+ * x86 reports its generated decode/verifier policy names. The ARM native
+ * total policy is a fixed shared-row program: four-row tiles over full K with
+ * one 64-column chunk per task for every Auto regime.
+ */
+std::string resolvedPolicyName(
+    const CPUNativeQuantisedPackedWeights &packed, int m, int n, int k, int threads, bool grouped)
+{
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    (void)packed; (void)n; (void)k; (void)threads;
+    const auto tile = neon_execution::rowTile(VerifierRowsPolicy::Auto);
+    return std::string(m == 1 ? "neon_decode" : (grouped ? "neon_grouped" : "neon_prefill")) +
+        (tile == NEONProjectionRowTile::Four ? "_rows4" : "_rows2") + "_nbc" +
+        std::to_string(neon_execution::nChunks(DecodeSchedulePolicy::Auto));
+#else
+    if (m == 1)
+    {
+        const NativeQuantisedTileConfig serial_geometry = computeTileConfig(
+            n, k, 1, packed.preparedFootprint(), threads);
+        const ISALevel runtime_isa = activeISALevel();
+        return decodeSchedulePolicyName(selectDecodeSchedulePolicy(
+            packed, n, k, runtime_isa == ISALevel::AVX512, runtime_isa == ISALevel::AVX2,
+            serial_geometry.k_tiles > 1, serial_geometry.k_tiles));
+    }
+    if (grouped)
+        return verifierRowsPolicyName(selectVerifierRowsPolicy(packed, m, n, k));
+    return "Auto";
+#endif
+}
+
+/**
  * @brief Measure all production arithmetic regimes across one socket.
  */
 TEST(Perf__CPUNativeQuantisedThreadScaling, ProductionAutoRoutes)
@@ -219,20 +315,8 @@ TEST(Perf__CPUNativeQuantisedThreadScaling, ProductionAutoRoutes)
     const int iteration_count = positiveEnvironmentValue(
         "LLAMINAR_CPU_THREAD_SCALING_ITERS", 9);
     ASSERT_EQ(k % 256, 0)
-        << "Q4_K thread-scaling K must be superblock aligned";
-
-    auto weights = TestTensorFactory::createQ4_KRandom(
-        {static_cast<size_t>(n), static_cast<size_t>(k)}, 0x51A1u);
-    ASSERT_NE(weights, nullptr);
-    CPUNativeQuantisedGemmKernel kernel(weights.get());
-    ASSERT_TRUE(kernel.isValid());
-    const CPUNativeQuantisedPackedWeights &packed = kernel.packedWeights();
-
-    const int maximum_m = std::max(prefill_m, 15);
-    const std::vector<Q8_1Block> activations =
-        makeActivations(maximum_m, k, packed.blocks_per_row);
-    std::vector<float> output(
-        static_cast<size_t>(maximum_m) * static_cast<size_t>(n), 0.0f);
+        << "thread-scaling K must be superblock aligned for every format";
+    const std::vector<int> thread_widths = threadSamples(maximum_threads);
 
     struct Regime
     {
@@ -245,122 +329,176 @@ TEST(Perf__CPUNativeQuantisedThreadScaling, ProductionAutoRoutes)
         {"grouped_decode", 15},
         {"gemm_prefill", prefill_m},
     };
+    const int maximum_m = std::max(prefill_m, 15);
 
     std::vector<ScalingPoint> points;
-    for (const Regime &regime : regimes)
+    for (const QuantizedVerifierFormatCase *format : selectedFormats())
     {
-        const size_t first_point = points.size();
-        for (const int threads : threadSamples(maximum_threads))
+        SCOPED_TRACE(format->label);
+        auto weights = format->create(
+            {static_cast<size_t>(n), static_cast<size_t>(k)}, 0x51A1u);
+        ASSERT_NE(weights, nullptr);
+        CPUNativeQuantisedGemmKernel kernel(weights.get());
+        ASSERT_TRUE(kernel.isValid());
+        const CPUNativeQuantisedPackedWeights &packed = kernel.packedWeights();
+
+        const std::vector<Q8_1Block> activations =
+            makeActivations(maximum_m, k, packed.blocks_per_row);
+        std::vector<float> output(
+            static_cast<size_t>(maximum_m) * static_cast<size_t>(n), 0.0f);
+
+        // Serial production rows with one worker are the byte oracle for every
+        // regime and team width; computed once, outside every timing interval.
+        std::vector<float> serial_rows(output.size(), 0.0f);
         {
-            omp_set_num_threads(threads);
-            ASSERT_EQ(observeOpenMPTeamSize(), threads)
-                << "OpenMP runtime did not honor the requested team width";
+            omp_set_num_threads(1);
+            NativeQuantisedTestPartialStorage serial_partials(packed, 1);
+            for (int row = 0; row < maximum_m; ++row)
+                gemv_native_quantised_preq(packed,
+                    activations.data() + static_cast<size_t>(row) * packed.blocks_per_row,
+                    serial_rows.data() + static_cast<size_t>(row) * n,
+                    serial_partials.span(), ISAPath::AUTO, DecodeSchedulePolicy::Auto);
+        }
 
-            const NativeQuantisedTileConfig serial_geometry = computeTileConfig(
-                n, k, 1, packed.preparedFootprint(), threads);
-            const NativeQuantisedTileConfig regime_geometry = computeTileConfig(
-                n, k, regime.m, packed.preparedFootprint(), threads);
-            std::string policy = "Auto";
-            if (regime.m == 1)
+        for (const Regime &regime : regimes)
+        {
+            const size_t first_point = points.size();
+            const bool grouped = regime.name == "grouped_decode";
+            for (const int threads : thread_widths)
             {
-                const ISALevel runtime_isa = activeISALevel();
-                const DecodeSchedulePolicy selected =
-                    selectDecodeSchedulePolicy(
-                        packed,
-                        n,
-                        k,
-                        runtime_isa == ISALevel::AVX512,
-                        runtime_isa == ISALevel::AVX2,
-                        serial_geometry.k_tiles > 1,
-                        serial_geometry.k_tiles);
-                policy = decodeSchedulePolicyName(selected);
-            }
-            else if (regime.name == "grouped_decode")
-            {
-                policy = verifierRowsPolicyName(
-                    selectVerifierRowsPolicy(packed, regime.m, n, k));
-            }
+                omp_set_num_threads(threads);
+                ASSERT_EQ(observeOpenMPTeamSize(), threads)
+                    << "OpenMP runtime did not honor the requested team width";
 
-            NativeQuantisedTestPartialStorage partial_storage(packed, regime.m);
-            const auto launch = [&]()
-            {
-                if (regime.m == 1)
+#if defined(__aarch64__) && defined(__ARM_NEON)
+                const int n_block_chunks = neon_execution::nChunks(DecodeSchedulePolicy::Auto);
+                const int serial_k_tiles = 1; // Native ARM programs reduce full K in registers.
+                const int regime_k_tiles = 1;
+#else
+                const NativeQuantisedTileConfig serial_geometry = computeTileConfig(
+                    n, k, 1, packed.preparedFootprint(), threads);
+                const NativeQuantisedTileConfig regime_geometry = computeTileConfig(
+                    n, k, regime.m, packed.preparedFootprint(), threads);
+                const int n_block_chunks = regime_geometry.n_block_chunks;
+                const int serial_k_tiles = serial_geometry.k_tiles;
+                const int regime_k_tiles = regime_geometry.k_tiles;
+#endif
+                std::string policy = resolvedPolicyName(packed, regime.m, n, k, threads, grouped);
+
+                NativeQuantisedTestPartialStorage partial_storage(packed, regime.m);
+                const auto launch = [&]()
                 {
-                    gemv_native_quantised_preq(
-                        packed,
-                        activations.data(),
-                        output.data(), partial_storage.span(),
-                        ISAPath::AUTO,
-                        DecodeSchedulePolicy::Auto);
-                    return;
-                }
-                if (regime.name == "grouped_decode")
-                {
-                    gemm_native_quantised_preq_decode_equivalent_rows(
+                    if (regime.m == 1)
+                    {
+                        gemv_native_quantised_preq(
+                            packed,
+                            activations.data(),
+                            output.data(), partial_storage.span(),
+                            ISAPath::AUTO,
+                            DecodeSchedulePolicy::Auto);
+                        return;
+                    }
+                    if (grouped)
+                    {
+                        gemm_native_quantised_preq_decode_equivalent_rows(
+                            packed,
+                            activations.data(),
+                            output.data(), partial_storage.span(),
+                            regime.m,
+                            n,
+                            ISAPath::AUTO,
+                            VerifierRowsPolicy::Auto);
+                        return;
+                    }
+                    gemm_native_quantised_preq(
                         packed,
                         activations.data(),
                         output.data(), partial_storage.span(),
                         regime.m,
                         n,
                         ISAPath::AUTO,
-                        VerifierRowsPolicy::Auto);
-                    return;
+                        VerifierRowsPolicy::Auto,
+                        PrefillSchedulePolicy::Auto);
+                };
+
+                std::fill(output.begin(), output.end(), 0.0f);
+                const TimingSummary timing =
+                    measureLaunch(warmup_count, iteration_count, launch);
+                ASSERT_GT(timing.median_us, 0.0);
+                ASSERT_EQ(std::memcmp(output.data(), serial_rows.data(),
+                              static_cast<size_t>(regime.m) * n * sizeof(float)), 0)
+                    << format->label << ' ' << regime.name << " M=" << regime.m
+                    << " threads=" << threads
+                    << " must publish the serial one-worker M=1 bytes";
+                // Same-width baseline: M independent production serial calls,
+                // the arithmetic every grouped/prefill row must reproduce.
+                double serial_rows_median_us = 0.0;
+                if (regime.m > 1)
+                {
+                    NativeQuantisedTestPartialStorage serial_partials(packed, 1);
+                    const auto serial_launch = [&]()
+                    {
+                        for (int row = 0; row < regime.m; ++row)
+                            gemv_native_quantised_preq(packed,
+                                activations.data() + static_cast<size_t>(row) * packed.blocks_per_row,
+                                output.data() + static_cast<size_t>(row) * n,
+                                serial_partials.span(), ISAPath::AUTO, DecodeSchedulePolicy::Auto);
+                    };
+                    serial_rows_median_us =
+                        measureLaunch(warmup_count, iteration_count, serial_launch).median_us;
+                    ASSERT_EQ(std::memcmp(output.data(), serial_rows.data(),
+                                  static_cast<size_t>(regime.m) * n * sizeof(float)), 0)
+                        << format->label << " serial baseline M=" << regime.m
+                        << " threads=" << threads << " changed bytes across team widths";
                 }
-                gemm_native_quantised_preq(
-                    packed,
-                    activations.data(),
-                    output.data(), partial_storage.span(),
-                    regime.m,
-                    n,
-                    ISAPath::AUTO,
-                    VerifierRowsPolicy::Auto,
-                    PrefillSchedulePolicy::Auto);
-            };
+                const double operations =
+                    2.0 * static_cast<double>(regime.m) *
+                    static_cast<double>(n) * static_cast<double>(k);
+                points.push_back({
+                    .format = format->label,
+                    .regime = std::string(regime.name),
+                    .policy = std::move(policy),
+                    .m = regime.m,
+                    .threads = threads,
+                    .n_block_chunks = n_block_chunks,
+                    .serial_k_tiles = serial_k_tiles,
+                    .regime_k_tiles = regime_k_tiles,
+                    .timing = timing,
+                    .throughput_gops = operations / (timing.median_us * 1.0e3),
+                    .serial_rows_median_us = serial_rows_median_us,
+                    .grouped_vs_serial_speedup = serial_rows_median_us > 0.0
+                        ? serial_rows_median_us / timing.median_us : 0.0,
+                });
+            }
 
-            const TimingSummary timing =
-                measureLaunch(warmup_count, iteration_count, launch);
-            ASSERT_GT(timing.median_us, 0.0);
-            const double operations =
-                2.0 * static_cast<double>(regime.m) *
-                static_cast<double>(n) * static_cast<double>(k);
-            points.push_back({
-                .regime = std::string(regime.name),
-                .policy = std::move(policy),
-                .m = regime.m,
-                .threads = threads,
-                .n_block_chunks = regime_geometry.n_block_chunks,
-                .serial_k_tiles = serial_geometry.k_tiles,
-                .regime_k_tiles = regime_geometry.k_tiles,
-                .timing = timing,
-                .throughput_gops = operations / (timing.median_us * 1.0e3),
-            });
-        }
-
-        const double single_thread_us = points[first_point].timing.median_us;
-        const double maximum_throughput = points.back().throughput_gops;
-        for (size_t index = first_point; index < points.size(); ++index)
-        {
-            ScalingPoint &point = points[index];
-            point.speedup = single_thread_us / point.timing.median_us;
-            point.parallel_efficiency =
-                point.speedup / static_cast<double>(point.threads);
-            point.fraction_of_max_throughput =
-                point.throughput_gops / maximum_throughput;
+            const double single_thread_us = points[first_point].timing.median_us;
+            double maximum_throughput = 0.0;
+            for (size_t index = first_point; index < points.size(); ++index)
+                maximum_throughput = std::max(maximum_throughput, points[index].throughput_gops);
+            for (size_t index = first_point; index < points.size(); ++index)
+            {
+                ScalingPoint &point = points[index];
+                point.speedup = single_thread_us / point.timing.median_us;
+                point.parallel_efficiency =
+                    point.speedup / static_cast<double>(point.threads);
+                point.fraction_of_max_throughput =
+                    point.throughput_gops / maximum_throughput;
+            }
         }
     }
 
     std::cout
         << "\nCPU NativeQuantised production thread scaling"
-        << " (Q4_K N=" << n << " K=" << k
-        << ", prepared_weight_bytes="
-        << packed.native_interleaved.size() + packed.payload.size()
+        << " (N=" << n << " K=" << k
+        << ", isa=" << isaLevelName(activeISALevel())
         << ", max_threads=" << maximum_threads << ")\n"
-        << "regime,policy,M,threads,nbc,serial_k_tiles,regime_k_tiles,"
+        << "format,regime,policy,M,threads,nbc,serial_k_tiles,regime_k_tiles,"
            "median_us,min_us,p95_us,gops,speedup,efficiency_pct,"
-           "fraction_of_max_pct\n";
+           "fraction_of_max_pct,serial_rows_median_us,grouped_vs_serial\n";
     for (const ScalingPoint &point : points)
     {
         std::cout
+            << point.format << ','
             << point.regime << ',' << point.policy << ','
             << point.m << ',' << point.threads << ','
             << point.n_block_chunks << ','
@@ -373,7 +511,9 @@ TEST(Perf__CPUNativeQuantisedThreadScaling, ProductionAutoRoutes)
             << point.throughput_gops << ','
             << point.speedup << ','
             << point.parallel_efficiency * 100.0 << ','
-            << point.fraction_of_max_throughput * 100.0 << '\n';
+            << point.fraction_of_max_throughput * 100.0 << ','
+            << point.serial_rows_median_us << ','
+            << point.grouped_vs_serial_speedup << '\n';
     }
 
     omp_set_num_threads(maximum_threads);
