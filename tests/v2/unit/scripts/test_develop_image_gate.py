@@ -311,7 +311,7 @@ class DevelopImageGateTests(unittest.TestCase):
         self.assertEqual(buildx["with"]["keep-state"], "true")
         self.assertNotIn("sudo", workflow)
 
-    def test_develop_pr_runs_avx2_unit_and_host_on_the_dedicated_runner(self):
+    def test_develop_pr_runs_both_isas_on_separate_dedicated_runners(self):
         """Exercise the real PR command, not a separately invented argument set."""
         workflow = yaml.load((ROOT / ".github/workflows/develop-pr.yml").read_text(),
                              Loader=yaml.BaseLoader)
@@ -320,9 +320,7 @@ class DevelopImageGateTests(unittest.TestCase):
         self.assertEqual(set(workflow["on"]["pull_request"]["types"]),
                          {"opened", "synchronize", "reopened", "ready_for_review"})
         self.assertEqual(workflow["permissions"], {"contents": "read"})
-        self.assertEqual(workflow["concurrency"], {
-            "group": "llaminar-develop-pr-${{ github.event.pull_request.number }}",
-            "cancel-in-progress": "true"})
+        self.assertNotIn("concurrency", workflow)
         self.assertEqual(set(workflow["jobs"]), {"unit"})
         job = workflow["jobs"]["unit"]
         self.assertEqual(job["uses"],
@@ -336,9 +334,15 @@ class DevelopImageGateTests(unittest.TestCase):
         self.assertEqual(reusable["permissions"], {"contents": "read"})
         caller = job
         job = reusable["jobs"]["unit"]
-        self.assertEqual(job["runs-on"], {"group": "Develop CI", "labels": "llaminar-develop-avx2"})
-        self.assertEqual(job["strategy"], {"fail-fast": "false", "max-parallel": "1",
-                                           "matrix": {"cpu_isa": ["AVX2"]}})
+        self.assertEqual(job["concurrency"], {
+            "group": "llaminar-develop-pr-${{ github.event.pull_request.number }}-${{ matrix.cpu_isa }}",
+            "cancel-in-progress": "true"})
+        self.assertEqual(job["runs-on"], "${{ matrix.runner }}")
+        self.assertEqual(job["strategy"], {"fail-fast": "false", "max-parallel": "2",
+            "matrix": {"cpu_isa": ["AVX2", "AVX512"], "include": [
+                {"cpu_isa": "AVX2", "runner": "llaminar-develop-avx2"},
+                {"cpu_isa": "AVX512", "runner": "llaminar-avx512"}]}})
+        self.assertEqual(len({row["runner"] for row in job["strategy"]["matrix"]["include"]}), 2)
         self.assertEqual(f"{caller['name']} / {job['name']}",
                          "Develop PR / Unit + host (${{ matrix.cpu_isa }})")
         self.assertIn("github.event_name == 'pull_request'", job["if"])
