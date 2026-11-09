@@ -1,11 +1,15 @@
 # Idea 21 — CUDA GB10 (sm_120/sm_121) kernel register spills under the zero-spill guard
 
-Status: **Addressed** (2026-11-08 — the spill session fixed the CUDA
-register-pressure issue; fix is the stacked upstream PR `Llaminar/llaminar`
+Status: **In progress** (2026-11-09 — operator GO; Main landing the fixed
+sm_121 work on #43 as new commits, .79 compile-only, no demotions,
+12.x-guarded, shipped SASS identical, spill-free 121 / 120;121 / 6-arch).
+Prior state (2026-11-08 — the spill session fixed the CUDA register-pressure
+issue; fix was the stacked upstream PR `Llaminar/llaminar`
 **#44** (draft, base `feat/arm64-native-kernels`), linear tip **`09e14d3ae`**,
 whose content equals the local merged tree `a5412af30`; spill kernel files
-verified unchanged vs `be998fdec`). Remaining: upstream merge + live SM120/
-SM121 and joint-pool validation once the guard is clean.
+verified unchanged vs `be998fdec`). Remaining then: upstream merge + live SM120/
+SM121 and joint-pool validation once the guard was clean. That #44 tip is NOT
+in the 46c35f15b lineage; the fold lands on #43 per the operator GO.
 
 ## Finding (2026-11-08; evidence: K14-UMA-SM121-SPILLS-20261108)
 
