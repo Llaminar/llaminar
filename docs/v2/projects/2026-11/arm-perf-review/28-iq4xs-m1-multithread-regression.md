@@ -136,3 +136,21 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   depfile (CMP0116); Mac checks (touch NEONFP16.h regenerates; edit
   MoEProjection → verify fails until rebuild).
 - Tests: 13 negative cases. SOURCE115 forwarded. .80 run at 7abfc0dc1.
+
+## SOURCE115 preliminary (2026-11-09) — four pathological paths to close
+
+- (1) unknown callees cost1 paid from budgets (key2:0:0:0:0:0 budget4 can pass
+  an uninspectable `bl helper; ret`); blr/br ignored. Structural/closure
+  failures must be FATAL independent of allowance.
+- (2) alias analysis textual: conditional alias (`mov x9,sp; cbz; mov x9,x1;
+  ldr q0,[x9]`) reads stack on the taken edge but reports 0; `[sp,x9]` and
+  `add x9,sp,#1,lsl #12` unmatched; unmatched forms continued over, not
+  rejected → CFG-aware or fail-closed; never continue-over.
+- (3) d8–d15 excused by counts alone: no save-before-clobber/slot/epilogue
+  proof; in-loop/unmatched could pass as ABI saves → prove or reject.
+- (4) include closure uses ORIGINAL flags, compile adds -O3/-fno-sanitize=all/
+  -fno-lto → recorded -M set may differ from the executed closure → bind the
+  EXACT executed flags' closure.
+- Reviewer continues inventory/binding/depfile; ratchet = reported-approved
+  (not zero-spill/economy qualification); Linux-RED + Darwin-false-clean
+  history separate.
