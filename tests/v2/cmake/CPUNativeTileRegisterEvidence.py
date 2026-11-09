@@ -78,7 +78,9 @@ configured objdump and audit the instructions actually assembled.
   identity is derived from the compiler's own version output and must equal the
   configured one; unknown identities/envelopes fail closed.
 - Dependencies: the dependency closure is the one the compiler reports for this
-  exact compilation (-MD on the -c run), cross-checked against a preprocessing
+  exact compilation (-MD on the -c run), parsed in the plain subset of the
+  native Make depfile grammar (names that Make escaping would alter - '$$',
+  escaped spaces or '#', backslashes, quotes, wildcards - fail), cross-checked against a preprocessing
   pass with the same flags; every input is hashed before and after compiling and
   bound with its logical path, its resolved path (component-wise, as the kernel
   resolves symlinks and "..") and the symlinks followed. The Ninja depfile names
@@ -103,15 +105,21 @@ configured objdump and audit the instructions actually assembled.
   one integrated clang -cc1 -emit-obj job, or one GNU cc1plus job plus one as
   job reading only the compiler's output; a driver that reads specs or
   configuration files fails, as does any failing driver query.
-- Programs: the driver and every job program are identified logically -
-  absolute, or for GNU looked up as the driver does (its program directories
-  from -print-search-dirs, then PATH), cross-checked against the driver's
+- Programs: the driver is the absolute program of the authenticated target
+  command; every job program is identified logically - absolute, or for GNU
+  looked up as the driver does (its program directories from
+  -print-search-dirs, then PATH), cross-checked against the driver's
   -print-prog-name answer - with the directories examined before the
-  selection, the symlinks followed, the resolved file and its hash; the
-  identities must be equal before and after compiling. The receipt records the
-  plan and exactly one identity per program; verification revalidates the plan
-  with the same pure validator and replays every lookup (content, symlink
-  retargets, search shadowing).
+  selection, the symlinks followed, the resolved file and its hash. Search
+  lists with empty or relative entries (working-directory dependent) fail.
+- Epoch: the driver identity is bound before any observation the proof
+  consumes; the plan and all job programs are bound before preprocessing; the
+  identities must be unchanged after preprocessing and after compiling, and
+  the plan is observed again after compiling and must be identical.
+- The receipt records the plan and exactly one identity per program role;
+  verification revalidates the plan with the same pure validator, derives the
+  driver role from the authenticated target command and replays every lookup
+  (content, symlink retargets, search shadowing).
 
 Verify phase (Unit/preflight): no compiler is invoked, but every recorded input
 (including absolute system/SDK headers named by the compiler) must be present
@@ -1559,14 +1567,33 @@ def compiler_identity(version: str) -> str:
     raise ValueError(f"unrecognized compiler identity: {version.splitlines()[0] if version else version!r}")
 
 
+DEPFILE_UNSUPPORTED = re.compile(r"[$#\\'\"%*?\[\]]")
+
+
 def read_depfile(path: Path, directory: str) -> list[str]:
-    """Logical (unresolved, absolute) paths named by a compiler dependency file."""
-    text = path.read_text().replace("\\\n", " ")
-    target, _, prerequisites = text.partition(": ")
-    if not prerequisites:
+    """Logical (unresolved, absolute) paths named by a compiler (Make-syntax) dependency file.
+
+    Only the plain subset of the native depfile grammar is admitted: one rule, prerequisites separated by
+    whitespace, backslash-newline continuations. Any name that Make escaping would alter or that is not plain
+    ('$$' for '$', escaped spaces or '#', backslashes, quotes, wildcards) fails before anything is bound,
+    instead of being decoded with another grammar.
+    """
+    text = path.read_text()
+    if "\\\r" in text:
+        raise ValueError(f"unsupported line ending in dependency file {path}")
+    text = text.replace("\\\n", " ")
+    lines = [line for line in text.splitlines() if line.strip()]
+    if len(lines) != 1:
+        raise ValueError(f"dependency file {path} is not exactly one rule")
+    target, separator, prerequisites = lines[0].partition(": ")
+    if not separator:
         raise ValueError(f"malformed compiler dependency file {path}")
+    items = prerequisites.split()
+    unsupported = [item for item in items if DEPFILE_UNSUPPORTED.search(item)]
+    if not items or unsupported or DEPFILE_UNSUPPORTED.search(target):
+        raise ValueError(f"dependency file {path} uses unsupported escaped names: {unsupported[:3]}")
     # No lexical normalisation: "link/../h.h" must keep the filesystem's meaning (".." of the link target).
-    return sorted({os.path.join(directory, item) for item in shlex.split(prerequisites)})
+    return sorted({os.path.join(directory, item) for item in items})
 
 
 def resolve(path: str) -> tuple[str, list[list[str]]]:
@@ -1846,7 +1873,7 @@ class JobPaths(NamedTuple):
     obj: str
     deps: str
     directory: str
-    closure: frozenset
+    closure: frozenset | None  # None while the closure is not yet observed; validated again once it is.
 
 
 def admit_job(job: list[str], table: dict[str, str], paths: JobPaths, positional: str) -> dict[str, list[str]]:
@@ -1882,7 +1909,7 @@ def admit_job(job: list[str], table: dict[str, str], paths: JobPaths, positional
             named.setdefault(kind, []).append(value)
             if kind == "search" and not os.path.isabs(value):
                 raise ValueError(f"relative include search root {value}")
-            if kind == "closure" and value not in paths.closure:
+            if kind == "closure" and paths.closure is not None and value not in paths.closure:
                 raise ValueError(f"job input {value} is not in the bound dependency closure")
             if kind == "directory" and value != paths.directory:
                 raise ValueError(f"job directory {value} is not the executed directory")
@@ -1943,8 +1970,8 @@ def driver_plan(executed: list[str], directory: str, identity: str, paths: JobPa
         dirs = re.findall(r"^programs: =(.*)$", observe(executed + ["-print-search-dirs"], directory), re.MULTILINE)
         if len(dirs) != 1:
             raise ValueError("the GNU driver did not report its program search directories")
-        plan["program_dirs"] = [entry for entry in dirs[0].split(os.pathsep) if entry]
-        plan["path"] = [entry for entry in os.environ.get("PATH", "").split(os.pathsep) if entry]
+        plan["program_dirs"] = absolute_search(dirs[0], "program directory list")
+        plan["path"] = absolute_search(os.environ.get("PATH", ""), "PATH")
         for job in jobs:
             answer = observe(executed + [f"-print-prog-name={Path(job[0]).name}"], directory).strip()
             selected = lookup_program(job[0], plan)["selected"]
@@ -1952,6 +1979,15 @@ def driver_plan(executed: list[str], directory: str, identity: str, paths: JobPa
                     (not os.path.isabs(answer) and (answer != job[0] or selection_source(job[0], plan) != "path")):
                 raise ValueError(f"the driver selects {answer} for {job[0]}, the witness lookup selects {selected}")
     return plan
+
+
+def absolute_search(value: str, what: str) -> list[str]:
+    """A search list whose every entry is absolute. Empty entries (the current directory of the executing
+    process) and relative entries depend on the working directory: rejected, not reinterpreted."""
+    entries = value.split(os.pathsep)
+    if not value or any(not entry or not os.path.isabs(entry) for entry in entries):
+        raise ValueError(f"the {what} has empty or relative entries (working-directory dependent): {value!r}")
+    return entries
 
 
 def selection_source(program: str, plan: dict) -> str:
@@ -1988,21 +2024,19 @@ def lookup_program(program: str, plan: dict) -> dict:
             "resolved": resolved, "sha256": envelope.digest(Path(resolved))}
 
 
-def program_identities(plan: dict, driver: str) -> dict[str, dict]:
-    """Identity of the driver and of every job program of the plan."""
-    identities = {"driver": lookup_program(driver if os.path.isabs(driver) else shutil_which(driver), plan)}
-    identities["driver"]["program"] = identities["driver"]["selected"]
+def driver_identity(command: list[str]) -> dict:
+    """Identity of the driver named by the authenticated target command (which must name it absolutely)."""
+    if not os.path.isabs(command[0]):
+        raise ValueError(f"the target command names its compiler driver relatively: {command[0]}")
+    return lookup_program(command[0], {"program_dirs": [], "path": []})
+
+
+def program_identities(plan: dict, command: list[str]) -> dict[str, dict]:
+    """Identity of the driver (from the target command) and of every job program of the plan."""
+    identities = {"driver": driver_identity(command)}
     for index, job in enumerate(plan["jobs"]):
         identities[f"job{index}"] = lookup_program(job[0], plan)
     return identities
-
-
-def shutil_which(program: str) -> str:
-    for entry in os.environ.get("PATH", "").split(os.pathsep):
-        candidate = os.path.join(entry, program)
-        if entry and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return candidate
-    raise ValueError(f"cannot find the compiler driver {program}")
 
 
 def precompiled_headers(header_trace: str) -> list[str]:
@@ -2024,21 +2058,30 @@ def build(args: argparse.Namespace) -> None:
                   output.with_suffix(".s"), output.with_suffix(".sym")):
         stale.unlink(missing_ok=True)
     command, directory = envelope.target_command(args)
+    # Epoch: the driver is bound before any observation the proof consumes; the plan and every job program are
+    # bound before any job runs; all of it must be unchanged after compiling (and the plan observed again).
+    driver = driver_identity(command)
     version = subprocess.check_output([command[0], "--version"], cwd=directory, text=True)
     identity = compiler_identity(version)
     if identity != args.identity:
         raise ValueError(f"compiler reports identity {identity}, configured budget identity is {args.identity}")
+    executed = executed_command(command, args.source, obj, dependencies)
+    plan = driver_plan(executed, directory, identity, JobPaths(args.source, str(obj), str(dependencies), directory,
+                                                               None))
+    programs = program_identities(plan, command)
+    if programs["driver"] != driver:
+        raise ValueError("the compiler driver changed while its plan was observed")
     subprocess.run(command + WITNESS_FLAGS + ["-M", "-MF", str(preprocessed), "-MT", "probe", args.source],
                    cwd=directory, check=True, stdout=subprocess.DEVNULL)
     before = bind_inputs(read_depfile(preprocessed, directory))
+    paths = JobPaths(args.source, str(obj), str(dependencies), directory, frozenset(before))
+    validate_plan(plan["jobs"], identity, paths)
     subprocess.run(command + WITNESS_FLAGS + ["-E", args.source, "-o", str(translation_unit)], cwd=directory, check=True)
     unproved = inline_assembly_violations(translation_unit.read_text(errors="replace"))
     if unproved:
         raise ValueError(f"inline assembly the dependency closure cannot bind (non-empty template): {unproved[:2]}")
-    executed = executed_command(command, args.source, obj, dependencies)
-    paths = JobPaths(args.source, str(obj), str(dependencies), directory, frozenset(before))
-    plan = driver_plan(executed, directory, identity, paths)
-    programs = program_identities(plan, command[0])
+    if program_identities(plan, command) != programs:
+        raise ValueError("a compiler or assembler program changed during preprocessing")
     compiled = subprocess.run(executed, cwd=directory, capture_output=True, text=True)
     if compiled.returncode:
         raise ValueError(f"the witness compile failed: {compiled.stderr[-2000:]}")
@@ -2052,14 +2095,15 @@ def build(args: argparse.Namespace) -> None:
     if after != before:
         changed = sorted(path for path in closure if before[path] != after[path])
         raise ValueError(f"inputs changed while the witness compiled: {changed[:3]}")
-    if program_identities(plan, command[0]) != programs:
-        raise ValueError("a compiler or assembler program changed while the witness compiled")
+    if program_identities(plan, command) != programs or \
+            driver_plan(executed, directory, identity, paths) != plan:
+        raise ValueError("a compiler or assembler program, or the driver plan, changed while the witness compiled")
     disassembly, disassembly_command, tool_version = disassemble(args.disassembler, obj)
     disassembly_path.write_text(disassembly)
     counts = audit(obj.read_bytes(), disassembly, args.mode)
     require_registers(counts, args.identity, args.mode)
     result = {
-        "schema": 8, "signature": args.signature, "identity": identity, "mode": args.mode,
+        "schema": 9, "signature": args.signature, "identity": identity, "mode": args.mode,
         "checker_sha256": envelope.digest(Path(__file__)),
         "envelope_sha256": envelope.digest(_ENVELOPE),
         "budget_sha256": envelope.digest(BUDGET_PATH),
@@ -2088,7 +2132,7 @@ def verify(args: argparse.Namespace) -> None:
     require_absolute_source(args.source)
     proof_path = Path(args.proof)
     proof = json.loads(proof_path.read_text())
-    if (proof.get("schema") != 8 or proof.get("signature") != args.signature or
+    if (proof.get("schema") != 9 or proof.get("signature") != args.signature or
             proof.get("identity") != args.identity or proof.get("mode") != args.mode):
         raise ValueError("tile register proof has a foreign schema/configuration")
     if compiler_identity(str(proof.get("compiler_version", ""))) != args.identity:
@@ -2126,8 +2170,11 @@ def verify(args: argparse.Namespace) -> None:
     if not isinstance(programs, dict) or set(programs) != expected_keys or \
             any(programs[f"job{index}"].get("program") != job[0] for index, job in enumerate(plan["jobs"])):
         raise ValueError("tile register proof does not identify exactly the driver and every job program")
+    for key in ("program_dirs", "path"):
+        if plan[key] and absolute_search(os.pathsep.join(plan[key]), key) != plan[key]:
+            raise ValueError("recorded search list is not absolute")
     try:
-        current = program_identities(plan, programs["driver"].get("program", ""))
+        current = program_identities(plan, command)
     except (ValueError, OSError) as error:
         raise ValueError(f"a compiler or assembler program of the witness compile changed: {error}")
     if current != programs:
