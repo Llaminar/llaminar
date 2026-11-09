@@ -18727,7 +18727,11 @@ add_v2_test(V2_Perf_AVX2vsAVX512
 )
 endif()
 
-# Performance Test: CPU NativeQuantised Dispatch Parameter Sweep (tile heuristic tuning)
+# Performance Test: CPU NativeQuantised Dispatch Parameter Sweep (tile heuristic tuning).
+# It tunes the x86 shared-K cache-tiled schedule (k_tile_blocks from observed
+# L2/L3 geometry). AArch64 uses the register-K NEON ABI, which publishes no cache
+# tiling; its schedule candidates belong to Perf__CPUNativeNEONExactOverlay.
+if(V2_CPU_TARGET_X86)
 add_executable(v2_perf_cpu_native_quantised_dispatch_sweep performance/kernels/cpu/native_quantised/Perf__CPUNativeQuantised_DispatchSweep.cpp)
 target_link_libraries(v2_perf_cpu_native_quantised_dispatch_sweep
     llaminar2_core
@@ -18742,6 +18746,7 @@ add_v2_test(V2_Perf_CPUNativeQuantised_DispatchSweep
     LABELS "V2;Performance;GEMM;GEMV;NativeQuantised;CPU;Dispatch;Tuning;Qwen"
     MPI_PROCS 1
 )
+endif()
 
 # The native ARM exact-overlay generator is host-independent Python: exact-only,
 # alias-pooled, no-regression emission with fail-closed evidence checks.
