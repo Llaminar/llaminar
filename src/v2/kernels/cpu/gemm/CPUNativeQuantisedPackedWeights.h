@@ -245,7 +245,9 @@ namespace llaminar2::cpu::native_quantised
 
         /**
          * @brief Write the benign value into every padding metadata word of a partial final chunk.
-         * @throws std::logic_error If the stored extent disagrees with the descriptor-owned geometry.
+         * @throws std::invalid_argument For an unknown source/encoding or a non-canonical stored extent.
+         * @throws std::overflow_error For unrepresentable geometry.
+         * @throws std::logic_error If owner fields disagree with the canonical geometry.
          * @details Producers call this after their last live write and before
          * sealPublication(), inside the generation they own. Movement transfers
          * live columns only; padding words of the final chunk would otherwise keep
@@ -256,23 +258,24 @@ namespace llaminar2::cpu::native_quantised
          */
         void normalizePaddingMetadata()
         {
-            const bool has_secondary = is_asymmetric || usesNibbleLUTSourceScale() || usesIQ3SExpandedSourceScale() ||
-                usesQ6KNativeDualScale() || usesCompactMultiScale();
-            if (!has_secondary || N <= 0 || N % 64 == 0)
-                return;
-            const std::size_t chunks = std::size_t(N_padded / 64);
-            const std::size_t stride = std::size_t(interleaved_block_stride);
-            if (N_padded != (N + 63) / 64 * 64 || blocks_per_row <= 0 ||
-                stride != preparedInterleavedBlockStride(encoding, is_asymmetric) ||
-                std::size_t(data_stride) != std::size_t(preparedDataStride(encoding)) ||
-                native_interleaved.size() != chunks * std::size_t(blocks_per_row) * stride)
+            // Canonical checked admission first: source, encoding, positive
+            // geometry, widened extents and the exact stored size. No mutable
+            // span or pointer arithmetic exists until all of it holds.
+            const auto geometry = CPUNativeQuantisedWeightView::publishedGeometry(
+                descriptor(), {native_interleaved.data(), native_interleaved.size()});
+            if (geometry.padded_columns != N_padded || geometry.blocks_per_row != blocks_per_row ||
+                geometry.data_stride != data_stride || geometry.interleaved_block_stride != interleaved_block_stride)
                 throw std::logic_error("Native CPU padding normalization requires the descriptor-owned geometry");
-            const std::size_t secondary = std::size_t(data_stride) + (usesInlineCompensation() ? 256u : 128u);
-            const std::size_t live = std::size_t(N % 64);
+            if (!geometry.has_secondary || geometry.columns % 64 == 0)
+                return;
+            const std::size_t chunks = std::size_t(geometry.padded_columns / 64);
+            const std::size_t blocks = std::size_t(geometry.blocks_per_row);
+            const std::size_t stride = std::size_t(geometry.interleaved_block_stride);
+            const std::size_t live = std::size_t(geometry.columns % 64);
             const auto bytes = native_interleaved.unsealedGenerationBytes();
-            for (std::size_t block = 0; block < std::size_t(blocks_per_row); ++block)
+            for (std::size_t block = 0; block < blocks; ++block)
             {
-                auto *words = bytes.data() + ((chunks - 1) * std::size_t(blocks_per_row) + block) * stride + secondary;
+                auto *words = bytes.data() + ((chunks - 1) * blocks + block) * stride + std::size_t(geometry.secondary_offset);
                 std::memset(words + live * sizeof(std::uint16_t), 0, (64 - live) * sizeof(std::uint16_t));
             }
         }

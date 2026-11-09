@@ -138,11 +138,15 @@ namespace
 #endif
     }
 
+
     /**
      * @test x86 readers load whole 64-column vectors, so a partial final chunk's
-     * padding is part of the publication contract: raw poisoned padding fails
-     * both the publication seal and the x86 consumers (IQ2_S dispatch, IQ3_S
-     * and IQ4_XS scale loaders), and the producer-normalized arrival passes both.
+     * padding is part of the publication contract. Two complementary fixtures:
+     * an owner whose padding words are raw poison, and an owner of the same
+     * bytes after producer normalization. Each compiled reader (IQ2_S dispatch
+     * at 8 and 16 lanes, IQ3_S/IQ4_XS scale loaders at 8 and 16 lanes) is
+     * invoked separately on the padding-bearing vector of every block: every
+     * one rejects the raw owner and accepts the normalized one; the seal agrees.
      */
     TEST(CPUNativeSourceMetadata, PartialChunkPaddingIsNormalizedForX86Readers)
     {
@@ -154,53 +158,59 @@ namespace
                 NativeQuantisedPreparedByteFixture fixture(*source, n, k);
                 fixture.seedPayloadAndMetadata();
                 const auto layout = fixture.view();
-                CPUNativeQuantisedPackedWeights packed;
-                packed.N = layout.N; packed.K = layout.K; packed.N_padded = layout.N_padded;
-                packed.blocks_per_row = layout.blocks_per_row; packed.payload_bytes = layout.source_payload_bytes;
-                packed.codebook_id = layout.codebook_id; packed.is_superblock = layout.is_superblock;
-                packed.is_asymmetric = layout.is_asymmetric; packed.encoding = layout.encoding;
-                packed.numerical_policy = layout.numerical_policy; packed.data_stride = layout.data_stride;
-                packed.interleaved_block_stride = layout.interleaved_block_stride;
-                packed.native_interleaved.resize(fixture.bytes.size());
-                const auto owned = packed.native_interleaved.beginRewrite();
-                std::copy(fixture.bytes.begin(), fixture.bytes.end(), owned.begin());
-                const int last = layout.N_padded / 64 - 1;
-                const std::size_t secondary = std::size_t(layout.data_stride) + (layout.usesInlineCompensation() ? 256 : 128);
-                for (int block = 0; block < layout.blocks_per_row; ++block)
-                    for (int column = n % 64; column < 64; ++column)
-                    {
-                        const std::uint16_t poison = 0xffff;
-                        std::memcpy(owned.data() + (std::size_t(last) * layout.blocks_per_row + block) *
-                            layout.interleaved_block_stride + secondary + std::size_t(column) * 2, &poison, sizeof(poison));
-                    }
+                const int last = layout.N_padded / 64 - 1, live = n % 64;
+                const auto make = [&](bool normalized) {
+                    CPUNativeQuantisedPackedWeights packed;
+                    packed.N = layout.N; packed.K = layout.K; packed.N_padded = layout.N_padded;
+                    packed.blocks_per_row = layout.blocks_per_row; packed.payload_bytes = layout.source_payload_bytes;
+                    packed.codebook_id = layout.codebook_id; packed.is_superblock = layout.is_superblock;
+                    packed.is_asymmetric = layout.is_asymmetric; packed.encoding = layout.encoding;
+                    packed.numerical_policy = layout.numerical_policy; packed.data_stride = layout.data_stride;
+                    packed.interleaved_block_stride = layout.interleaved_block_stride;
+                    packed.native_interleaved.resize(fixture.bytes.size());
+                    const auto owned = packed.native_interleaved.beginRewrite();
+                    std::copy(fixture.bytes.begin(), fixture.bytes.end(), owned.begin());
+                    const std::size_t secondary = std::size_t(layout.data_stride) + (layout.usesInlineCompensation() ? 256 : 128);
+                    for (int block = 0; block < layout.blocks_per_row; ++block)
+                        for (int column = live; column < 64; ++column)
+                        {
+                            const std::uint16_t poison = 0xffff;
+                            std::memcpy(owned.data() + (std::size_t(last) * layout.blocks_per_row + block) *
+                                layout.interleaved_block_stride + secondary + std::size_t(column) * 2, &poison, sizeof(poison));
+                        }
+                    if (normalized) packed.normalizePaddingMetadata();
+                    return packed;
+                };
+                auto raw = make(false);
+                auto normalized = make(true);
+                EXPECT_THROW(raw.sealPublication(), std::invalid_argument);
+                EXPECT_NO_THROW(normalized.sealPublication());
+
                 Q8_1Block activation[k / 32]{};
                 for (auto &a : activation) { a.d = 0x3c00; std::fill(std::begin(a.qs), std::end(a.qs), std::int8_t{1}); a.sum_qs = 32; }
                 std::array<float, 64> result{};
-                const auto consume = [&] {
-                    for (int block = 0; block < layout.blocks_per_row; ++block)
-                    {
-                        if (packed.usesCompactMultiScale())
-                        {
-                            const std::array<const Q8_1Block *, 1> input{activation};
-                            const std::array<float *, 1> output{result.data()};
-                            multi_scale::dispatch<8, 1>(packed, input, output, last, 0, layout.blocks_per_row, false);
+                const std::array<const Q8_1Block *, 1> input{activation};
+                const std::array<float *, 1> output{result.data()};
+                if (source == &native_quantised_formats::IQ2_S)
+                {
+                    EXPECT_THROW((multi_scale::dispatch<8, 1>(raw, input, output, last, 0, layout.blocks_per_row, false)), std::invalid_argument);
+                    EXPECT_NO_THROW((multi_scale::dispatch<8, 1>(normalized, input, output, last, 0, layout.blocks_per_row, false)));
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
-                            multi_scale::dispatch<16, 1>(packed, input, output, last, 0, layout.blocks_per_row, false);
+                    EXPECT_THROW((multi_scale::dispatch<16, 1>(raw, input, output, last, 0, layout.blocks_per_row, false)), std::invalid_argument);
+                    EXPECT_NO_THROW((multi_scale::dispatch<16, 1>(normalized, input, output, last, 0, layout.blocks_per_row, false)));
 #endif
-                            return;
-                        }
-                        (void)packed.loadScales256(packed.chunkScales(last, block));
-                        (void)packed.loadScales256(packed.chunkScales(last, block) + 56);
+                    continue;
+                }
+                for (int block = 0; block < layout.blocks_per_row; ++block)
+                {
+                    SCOPED_TRACE(block);
+                    EXPECT_THROW((void)raw.loadScales256(raw.chunkScales(last, block) + live / 8 * 8), std::invalid_argument);
+                    EXPECT_NO_THROW((void)normalized.loadScales256(normalized.chunkScales(last, block) + live / 8 * 8));
 #if defined(__AVX512F__)
-                        (void)packed.loadScales512(packed.chunkScales(last, block) + 48);
+                    EXPECT_THROW((void)raw.loadScales512(raw.chunkScales(last, block) + live / 16 * 16), std::invalid_argument);
+                    EXPECT_NO_THROW((void)normalized.loadScales512(normalized.chunkScales(last, block) + live / 16 * 16));
 #endif
-                    }
-                };
-                EXPECT_THROW(packed.sealPublication(), std::invalid_argument);
-                EXPECT_THROW(consume(), std::invalid_argument);
-                packed.normalizePaddingMetadata();
-                EXPECT_NO_THROW(packed.sealPublication());
-                EXPECT_NO_THROW(consume());
+                }
             }
     }
 #endif
