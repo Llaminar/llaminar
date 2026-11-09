@@ -65,6 +65,7 @@
 #include "TQFusedAttentionPrimitives.h"
 #include "CPUAttentionKeyQ8Dot.h"
 #include "CPUQ8AttentionValue.h"
+#include "CPUAttentionInvocationAdmission.h"
 #include "CPUQ16AttentionMath.h"
 #include "../primitives/VectorPrimitives.h"
 #if LLAMINAR_COMPILED_WITH_NEON
@@ -791,6 +792,11 @@ namespace llaminar2
                 {
                     if (!key_tensor || !value_tensor)
                         return false;
+                    if (!admitTensorExtents(Q, K, V, output, Q_ptr, key_tensor->typed_data(),
+                            value_tensor->typed_data(), O_ptr, seq_len,
+                            physicalKVRows(kv_logical_view, kv_len), n_heads, n_kv_heads, head_dim,
+                            head_start, gqa_n_rep, sizeof(std::uint16_t)))
+                        return false;
                     return compute_native16kv<Format>(
                         Q_ptr,
                         key_tensor->typed_data(),
@@ -841,6 +847,8 @@ namespace llaminar2
                     float *O_ptr = O_base->mutable_data();
                     if (Q_ptr && O_ptr)
                     {
+                        if (!queryBanksCover(Q, output, seq_len, n_heads, head_dim))
+                            return false;
                         const int position_offset = (kv_len > seq_len)
                                                         ? (kv_len - seq_len)
                                                         : 0;
@@ -1015,6 +1023,12 @@ namespace llaminar2
                 LOG_ERROR("[CPUFlashAttentionKernelT] compute_tensor() null data pointer");
                 return false;
             }
+            // Batched requests are stacked rows of the same geometry.
+            if (!admitTensorExtents(Q, K, V, output, Q_ptr, K_ptr, V_ptr, O_ptr,
+                    batch_size * seq_len,
+                    batch_size > 1 ? batch_size * seq_len : physicalKVRows(kv_logical_view, kv_len),
+                    n_heads, n_kv_heads, head_dim, head_start, gqa_n_rep, sizeof(float)))
+                return false;
 
             if (batch_size > 1)
             {
@@ -1128,6 +1142,24 @@ namespace llaminar2
                 static_cast<size_t>(query_rows) *
                 static_cast<size_t>(n_heads) *
                 static_cast<size_t>(head_dim);
+            // Dense caches: admit each request's actual tensor extents; the
+            // implementations admit their declared geometry themselves.
+            const auto admit_dense = [&](int request, const float *request_q, const float *request_output,
+                                         const ITensor *key, const void *key_data, const ITensor *value,
+                                         const void *value_data, int kv_len,
+                                         const attention::AttentionKVLogicalView &view, std::size_t element_bytes)
+            {
+                const std::size_t offset = static_cast<std::size_t>(request) * query_stride * sizeof(float);
+                if (Q->size_bytes() < offset || output->size_bytes() < offset)
+                    return false;
+                auto admission = declaredRequest(request_q, key_data, value_data, request_output, query_rows,
+                    physicalKVRows(view, kv_len), n_heads, n_kv_heads, head_dim, head_start, gqa_n_rep, element_bytes);
+                admission.query.bytes = Q->size_bytes() - offset;
+                admission.output.bytes = output->size_bytes() - offset;
+                admission.key.bytes = key->size_bytes();
+                admission.value.bytes = value->size_bytes();
+                return admitInvocation(admission);
+            };
             const auto run_requests = [&](auto &&launch_request)
             {
                 for (int request = 0; request < request_count; ++request)
@@ -1160,7 +1192,10 @@ namespace llaminar2
                             K_by_request[request]);
                         const auto *value = dynamic_cast<const FP32Tensor *>(
                             V_by_request[request]);
-                        return key && value && compute_flash_fp32(
+                        return key && value &&
+                            admit_dense(request, request_q, request_output, key, key->data(),
+                                value, value->data(), kv_len, view, sizeof(float)) &&
+                            compute_flash_fp32(
                             request_q,
                             key->data(),
                             value->data(),
@@ -1194,7 +1229,10 @@ namespace llaminar2
                             K_by_request[request]);
                         const auto *value = dynamic_cast<const FP16Tensor *>(
                             V_by_request[request]);
-                        return key && value && compute_native16kv<
+                        return key && value &&
+                            admit_dense(request, request_q, request_output, key, key->typed_data(),
+                                value, value->typed_data(), kv_len, view, sizeof(std::uint16_t)) &&
+                            compute_native16kv<
                             Native16BitKVFormat::FP16>(
                             request_q,
                             key->typed_data(),
@@ -1228,7 +1266,10 @@ namespace llaminar2
                             K_by_request[request]);
                         const auto *value = dynamic_cast<const BF16Tensor *>(
                             V_by_request[request]);
-                        return key && value && compute_native16kv<
+                        return key && value &&
+                            admit_dense(request, request_q, request_output, key, key->typed_data(),
+                                value, value->typed_data(), kv_len, view, sizeof(std::uint16_t)) &&
+                            compute_native16kv<
                             Native16BitKVFormat::BF16>(
                             request_q,
                             key->typed_data(),
@@ -1649,38 +1690,116 @@ namespace llaminar2
         friend class ::AVX2Q16DotParityTest;
 
     private:
+        /**
+         * @brief Admit one invocation's banks and geometry before any worker team.
+         * @param request Declared banks and geometry (actual tensor extents where known).
+         * @return Whether the row programs may address the banks without per-call checks.
+         * @details Every ISA's row helpers rely on this proof; the NEON helpers
+         * no longer re-validate each 1/2/4-row call (measured on M1 at 3/6/11%
+         * of the dot and 5/10/20% of the update for head_dim 256/128/64).
+         */
+        static bool admitInvocation(const cpu::CPUAttentionInvocationRequest &request)
+        {
+            std::string error;
+            if (cpu::CPUAttentionInvocationAdmission::admit(request, &error))
+                return true;
+            LOG_ERROR("[CPUFlashAttentionKernelT] " << error);
+            return false;
+        }
+
+        /**
+         * @brief Admit actual tensor allocation extents for a tensor entry point.
+         * @param element_bytes Bytes of one K/V scalar of a dense native cache.
+         * @details Raw-pointer implementations below admit their declared
+         * geometry; this adds that the real allocations cover it.
+         */
+        static bool admitTensorExtents(const ITensor *Q, const ITensor *K, const ITensor *V, const ITensor *O,
+            const void *q, const void *k, const void *v, const void *o, int query_rows, int kv_physical_rows,
+            int n_heads, int n_kv_heads, int head_dim, int head_start, int gqa_n_rep, std::size_t element_bytes)
+        {
+            auto request = declaredRequest(q, k, v, o, query_rows, kv_physical_rows, n_heads, n_kv_heads,
+                head_dim, head_start, gqa_n_rep, element_bytes);
+            request.query.bytes = Q->size_bytes();
+            request.output.bytes = O->size_bytes();
+            request.key.bytes = K->size_bytes();
+            request.value.bytes = V->size_bytes();
+            return admitInvocation(request);
+        }
+
+        /**
+         * @brief Admit actual FP32 query/output allocations where the cache format admits its own banks.
+         * @return Whether both tensors cover @p query_rows rows of n_heads*head_dim values.
+         */
+        static bool queryBanksCover(const ITensor *Q, const ITensor *O, int query_rows, int n_heads, int head_dim)
+        {
+            const std::size_t bytes = std::size_t(std::max(query_rows, 0)) * std::size_t(std::max(n_heads, 0)) *
+                std::size_t(std::max(head_dim, 0)) * sizeof(float);
+            if (Q->size_bytes() >= bytes && O->size_bytes() >= bytes)
+                return true;
+            LOG_ERROR("[CPUFlashAttentionKernelT] CPU attention query/output tensors do not cover their declared rows");
+            return false;
+        }
+
+        /** @return Physical K/V rows a logical view can address for @p kv_len logical rows. */
+        static int physicalKVRows(const attention::AttentionKVLogicalView &view, int kv_len) noexcept
+        {
+            return view.isContiguous() ? kv_len : view.physical_row_capacity;
+        }
+
+        /**
+         * @brief Request whose extents are exactly what a raw-pointer geometry declares.
+         * @param element_bytes Bytes of one K/V scalar.
+         */
+        static cpu::CPUAttentionInvocationRequest declaredRequest(const void *q, const void *k, const void *v,
+            const void *o, int query_rows, int kv_physical_rows, int n_heads, int n_kv_heads, int head_dim,
+            int head_start, int gqa_n_rep, std::size_t element_bytes) noexcept
+        {
+            const std::size_t query_bytes = std::size_t(std::max(query_rows, 0)) * std::size_t(std::max(n_heads, 0)) *
+                std::size_t(std::max(head_dim, 0)) * sizeof(float);
+            const std::size_t kv_row_bytes = std::size_t(std::max(n_kv_heads, 0)) * std::size_t(std::max(head_dim, 0)) * element_bytes;
+            const std::size_t kv_bytes = kv_row_bytes * std::size_t(std::max(kv_physical_rows, 0));
+            return {
+                .query = {q, query_bytes}, .output = {o, query_bytes},
+                .key = {k, kv_bytes}, .value = {v, kv_bytes},
+                .query_rows = query_rows, .kv_physical_rows = kv_physical_rows,
+                .query_heads = n_heads, .kv_heads = n_kv_heads, .head_dim = head_dim,
+                .head_start = head_start, .gqa_n_rep = gqa_n_rep,
+                .key_row_bytes = kv_row_bytes, .value_row_bytes = kv_row_bytes,
+            };
+        }
+
         // -----------------------------------------------------------------
         // Dot-product helpers
         // -----------------------------------------------------------------
 
 #if LLAMINAR_COMPILED_WITH_NEON
-        /** @brief Bind original noncontiguous cache rows to one native shared-query register program.
+        /** @brief Run one native shared-query register program over admitted cache rows.
          * @tparam Format Original physical cache encoding; @tparam Rows Native row count.
          * @param query Original FP32 query; @param keys Original cache row addresses.
-         * @param count Complete original head width.
+         * @param count Admitted head width.
          * @return Native original-row dot results, with no repacked/decoded cache bank.
+         * @pre The enclosing invocation passed CPUAttentionInvocationAdmission, which
+         * proved every row and the width once; like the x86 helpers, this call
+         * performs no per-row validation and cannot throw inside the team.
          */
         template<cpu::neon_attention::Storage Format,std::size_t Rows>
         static auto native_cache_dot(const float*query,
-            const std::array<const cpu::neon_attention::Unit<Format>*,Rows>&keys,int count)
+            const std::array<const cpu::neon_attention::Unit<Format>*,Rows>&keys,int count) noexcept
         {
-            return cpu::neon_attention::dot<Format,Rows>(
-                cpu::neon_attention::originalRows<float,1>({query},count)[0],
-                cpu::neon_attention::originalRows<cpu::neon_attention::Unit<Format>,Rows>(keys,count));
+            return cpu::neon_attention::dotRows<Format,Rows>(query,keys,count);
         }
-        /** @brief Stream original values through the increasing-row native FMA program.
+        /** @brief Stream admitted value rows through the increasing-row native FMA program.
          * @tparam Format Original physical value encoding; @tparam Rows Original row count.
          * @param output Original FP32 numerator; @param values Original disjoint cache row addresses.
-         * @param weights Original finite weights; @param count Complete original head width.
+         * @param weights Finite weights, fatal otherwise; @param count Admitted head width.
+         * @pre As native_cache_dot.
          */
         template<cpu::neon_attention::Storage Format,std::size_t Rows>
         static void native_cache_accumulate(float*output,
             const std::array<const cpu::neon_attention::Unit<Format>*,Rows>&values,
-            const std::array<float,Rows>&weights,int count)
+            const std::array<float,Rows>&weights,int count) noexcept
         {
-            if(count<0||(count&&!output))throw std::invalid_argument("CPU native attention numerator has invalid original geometry/storage");
-            cpu::neon_attention::accumulate<Format,Rows>({output,std::size_t(count)},
-                cpu::neon_attention::originalRows<cpu::neon_attention::Unit<Format>,Rows>(values,count),weights);
+            cpu::neon_attention::accumulateRows<Format,Rows>(output,values,weights,count);
         }
 #endif
         /** @brief Retain the native pointwise exponential program in bounded tails and summary rescaling.
@@ -3374,7 +3493,7 @@ namespace llaminar2
             case ISALevel::NEON:
             case ISALevel::NEONDotProd:
             {
-                return cpu::neon_attention::integerDot<1>(bound,cpu::neon_attention::originalRows<std::int16_t,1>({a},n)[0],cpu::neon_attention::originalRows<std::int16_t,1>({b},n))[0];
+                return cpu::neon_attention::integerDotRows<1>(bound,a,{b},n)[0];
             }
 #endif
             case ISALevel::Scalar:
@@ -3564,7 +3683,7 @@ namespace llaminar2
             case ISALevel::NEON:
             case ISALevel::NEONDotProd:
             {
-                const auto result=cpu::neon_attention::integerDot<2>(bound,cpu::neon_attention::originalRows<std::int16_t,1>({q},n)[0],cpu::neon_attention::originalRows<std::int16_t,2>({k0,k1},n));
+                const auto result=cpu::neon_attention::integerDotRows<2>(bound,q,{k0,k1},n);
                 out0=result[0];out1=result[1];return;
             }
 #endif
@@ -3725,7 +3844,7 @@ namespace llaminar2
             case ISALevel::NEON:
             case ISALevel::NEONDotProd:
             {
-                const auto result=cpu::neon_attention::integerDot<4>(bound,cpu::neon_attention::originalRows<std::int16_t,1>({q},n)[0],cpu::neon_attention::originalRows<std::int16_t,4>({k0,k1,k2,k3},n));
+                const auto result=cpu::neon_attention::integerDotRows<4>(bound,q,{k0,k1,k2,k3},n);
                 out0=result[0];out1=result[1];out2=result[2];out3=result[3];return;
             }
 #endif
@@ -4775,6 +4894,10 @@ namespace llaminar2
             }
             if (!kv_logical_view.validFor(kv_len))
                 return false;
+            if (!admitInvocation(declaredRequest(Q, K, V, output, seq_len,
+                    physicalKVRows(kv_logical_view, kv_len), n_heads, n_kv_heads, head_dim,
+                    head_start, gqa_n_rep, sizeof(float))))
+                return false;
 
             const auto physical_kv_row = [&](int logical_row) -> std::size_t
             {
@@ -5448,6 +5571,17 @@ namespace llaminar2
             const uint8_t *v_raw = static_cast<const uint8_t *>(V_q16->raw_data());
             if (!k_raw || !v_raw)
                 return false;
+            {
+                // The tensors own their actual allocation extents; queries and
+                // output keep the declared FP32 geometry of this entry point.
+                auto request = declaredRequest(Q, k_raw, v_raw, output, seq_len, int(K_q16->rows()),
+                    n_heads, n_kv_heads, head_dim, head_start, gqa_n_rep, 1);
+                request.key = {k_raw, K_q16->size_bytes()};
+                request.value = {v_raw, V_q16->size_bytes()};
+                request.key_row_bytes = request.value_row_bytes = blocks_per_kv_row * block_bytes;
+                if (K_q16->rows() > std::size_t(std::numeric_limits<int>::max()) || !admitInvocation(request))
+                    return false;
+            }
 
             const int q_stride = n_heads * head_dim;
             const auto query_head = [&](int query_position,
@@ -6491,6 +6625,10 @@ namespace llaminar2
             if (gqa_n_rep <= 0 && n_heads % n_kv_heads != 0)
                 return false;
             if (!kv_logical_view.validFor(kv_len))
+                return false;
+            if (!admitInvocation(declaredRequest(Q, K_native, V_native, output, seq_len,
+                    physicalKVRows(kv_logical_view, kv_len), n_heads, n_kv_heads, head_dim,
+                    head_start, gqa_n_rep, sizeof(std::uint16_t))))
                 return false;
 
             const auto physical_kv_row = [&](int logical_row) -> std::size_t
