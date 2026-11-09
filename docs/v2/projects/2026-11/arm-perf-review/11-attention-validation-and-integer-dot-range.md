@@ -95,3 +95,21 @@ Proposed options (only with proof):
 - Reviewed tree = 09cba9963 + fix only (no R2). R2 (C2c) uncommitted; will
   rebase onto 0501d506b and carry the same tail ordering into the admitted
   integerDotRows kernel.
+
+## SOURCE110 final (2026-11-09, 5c89f981c) — STATIC GATE PASSED
+
+- All prior SOURCE109 P1/P2 findings SOURCE-CLOSED; no new P1. R1 passes the
+  static-review gate to R2 (runtime/economy gates separate). Closure: (1)
+  magnitude checked vector+tail before fold/scalar (valid program unchanged;
+  n65 fixture in Q16Int32Bound preflight); (2) slot epochs 1/2 valid seeds,
+  epoch3 corrupt only, same-root/republication checks kept; (3) rebound
+  private to deep-copy owner; admitted/executeAdmitted private to batch
+  friend + checked public methods with public positive controls; (4) SIGABRT
+  + diagnostic + terminate discriminator, MAP_SHARED child-visible, Rows1/2/4
+  × every bad row, write-then-reject control, single stdio; (5) whole-head/
+  per-block wording corrected in successor + source.
+- EVIDENCE PRECISION (nonblocking): the Q16 fixture's exact worst-case
+  positive = Rows4 only; invalid tail = 1/2/4; invalid vector = 4 only;
+  EXPECT_DEATH-based → cannot be cited as explicit-abort proof. Preferred
+  fix: extend fixture to Rows1/2/4 everywhere (lane doing); else narrow
+  evidence claims. UBSan old-code failure/fix report = owner evidence only.
