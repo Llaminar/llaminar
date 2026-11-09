@@ -77,3 +77,10 @@ separate (shared) path with the same pattern but different owners.
   valid secondary words for accepted epochs (epoch-distinct in-range values
   OK), corrupt a single coefficient only in the rejected epoch. Needs the
   .80 core-linked run (not covered by core-free/M1 suites).
+
+- FIXED at R1 tip 26d74e718 (2026-11-09): fixture-only (seal unchanged) —
+  accepted epochs seed 64 in-range epoch-distinct secondary words
+  (epoch + column%3, max 5); payload stays byte(epoch); ONLY epoch 3 corrupts
+  one word (0x0010, mid unit, col 17) and must fail; epochs 1/2 admit, keep
+  root + seal on republish. Core-linked run (.80) pending;
+  V2_Integration_CPUNativeVNNISlotReuseAdmission is the cell.
