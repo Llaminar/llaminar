@@ -39,3 +39,17 @@ the review and the implementer:
 ## Scope
 
 ARM NEON only (`persistRoundedNEON`); no x86 change implied.
+
+## Bundle 1/09 — VERDICT REJECT (2026-11-09; evidence/09-rounding-barrier-evidence.md)
+
+- Non-volatile variant rejected: no economic benefit; keep asm volatile. No
+  defect, no impl ticket. Evidence (gcc-14, NEON_DOTPROD, Release-equiv
+  flags; scratch patch never committed): 18 TUs incl. persistRoundedNEON all
+  compiled both variants; 13/18 identical .text; 118 unique functions
+  differ → 114 scheduling/regalloc only (same FP opcode multiset) + 4
+  multi-scale NEONProjectionTile instantiations = unroll/peel in lock-step
+  (scvtf/fmul/fmla), NOT contraction (no fadd↔fmla movement). Spills +2 ld/st
+  in two Tile<4> (83→85), +3 total. llvm-mca 22.1.8: Neoverse-V2 equal or
+  WORSE (+1.4/+5.9/+3.1%), X925 + M1 equal/worse. Byte identity NOT
+  established (not needed for rejection; optional confirm skipped — no
+  upside).
