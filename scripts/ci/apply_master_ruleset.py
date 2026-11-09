@@ -32,6 +32,7 @@ REQUIRED_CHECKS = (
 )
 DEVELOP_REQUIRED_CHECKS = (
     "Develop PR / Unit + host (AVX2)",
+    "Develop PR / Unit + host (AVX512)",
 )
 RELEASE_DEPLOY_KEY_TITLE = "llaminar-release-evidence"
 RELEASE_DEPLOY_KEY_BYPASS = [{"actor_id": None, "actor_type": "DeployKey",

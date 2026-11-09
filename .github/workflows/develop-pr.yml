@@ -9,11 +9,6 @@ on:
 permissions:
   contents: read
 
-# Different PRs run concurrently; new commits replace only their own PR run.
-concurrency:
-  group: llaminar-develop-pr-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-
 jobs:
   unit:
     # Preserve the existing same-repository PR admission policy.

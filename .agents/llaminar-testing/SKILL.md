@@ -34,19 +34,25 @@ MTP activity, movement obligations and captured production-path evidence.
 
 Feature PRs into `develop` use `.github/workflows/develop-pr.yml` through the
 protected `develop-pr-tests.yml@develop` reusable workflow. The dedicated
-`llaminar-develop-108` runner in `Develop CI` builds one AVX2 full-backend
-`model-free` test companion. It runs the complete device-free `Unit` suite and
+`llaminar-develop-108` runner (label `llaminar-develop-avx2`) builds the AVX2
+companion; the repository runner labeled `llaminar-avx512` builds AVX512. These
+full-backend `model-free` transactions run in parallel. Each runs complete
+device-free `Unit` and
 the production-preflight `host` lane selected by the canonical scheduler.
 CUDA, ROCm and exclusive preflight lanes do not run; no GPU devices or model
-mounts are exposed. Each PR calls `run_develop_image_gate.py --cpu-isa AVX2`
+mounts are exposed. Each job calls `run_develop_image_gate.py --cpu-isa <ISA>`
 without `--build-only` or `--publish`. CPU admission rejects unsupported
 hardware before compiling. Every discovered Unit and host test must run
 without skips. Unit uses unrestricted parallelism; host retains canonical
 serial scheduling. The `unit-and-host` receipt does not certify full preflight.
 
-The single development host serializes PR and publication jobs. Per-PR
-concurrency groups cancel obsolete commits without canceling another PR.
-Both workflows preserve the named `llaminar-develop` BuildKit worker's state,
+The two ISA jobs target distinct custom runner labels, allowing the
+organization-scoped AVX2 host and repository-scoped AVX512 host to participate
+without changing runner-group access. The matrix permits two simultaneous jobs
+and disables fail-fast, retaining both results. Each host serializes its own
+jobs; AVX2 shares its queue with develop publication. Per-PR/ISA concurrency groups
+cancel obsolete commits without canceling another PR. Each host preserves its
+local named `llaminar-develop` BuildKit worker's state,
 including compiler cache mounts across failed and successful jobs. Complete,
 dependency-bound OCI toolchains are restored before source compilation;
 a cold build checkpoints GPU SDK layers. Source builds admit their exact
@@ -54,14 +60,14 @@ OCI digests, inputs and ISA. PR cache entries remain scoped to that merge ref;
 registry cache access is import-only. See `docs/production-ci.md` for host
 provisioning and cache ownership. These jobs do not use GitHub cloud runners.
 
-The develop ruleset requires `Develop PR / Unit + host (AVX2)`, an up-to-date
-merge candidate and owner approval. The separate owner-approval ruleset uses
+The develop ruleset requires both `Develop PR / Unit + host (AVX2)` and
+`Develop PR / Unit + host (AVX512)`, an up-to-date merge candidate and owner approval. The separate owner-approval ruleset uses
 only `@Llaminar/repository-approvers` on both protected branches. Native squash
 auto-merge waits for reviews and checks. The owner's PR-only approval override
 and dedicated release-evidence deploy key retain their existing exceptions.
 Never grant the general GitHub Actions app a ruleset bypass.
 
-The `develop` push workflow uses this same host and
+The `develop` push workflow remains on the AVX2 development host and
 `run_develop_image_gate.py --build-only --publish`. It compiles both full-backend
 AVX512 and AVX2 Release runtimes, omits Integration compilation, and publishes
 both branch and source-SHA tags only after both builds authenticate. It runs no

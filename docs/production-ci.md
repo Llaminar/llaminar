@@ -24,15 +24,17 @@ and its required gates. Restore any temporary maintenance exception in the
 develop ruleset immediately after the push.
 
 `.github/workflows/develop-pr.yml` tests same-repository feature PRs targeting
-`develop`. The dedicated self-hosted development runner builds one AVX2
-full-backend `model-free` test image. That image executes the complete device-free `Unit` suite plus the
+`develop`. Separate self-hosted runners build AVX2 and AVX512 full-backend
+`model-free` test images in parallel. Each image executes complete device-free
+`Unit` plus the
 production-preflight `host` lane. The canonical production scheduler owns
 host selection; CUDA, ROCm and exclusive preflight lanes are not executed. The test
 container receives no GPU devices or model mounts. This is PR validation, not
 release certification. The checkout is the PR merge ref, so the tests
 include the proposed integration with `develop`.
 
-The active `develop` ruleset requires `Develop PR / Unit + host (AVX2)`, an up-to-date PR, and squash merge; direct human pushes, force pushes and deletion
+The active `develop` ruleset requires both `Develop PR / Unit + host (AVX2)`
+and `Develop PR / Unit + host (AVX512)`, an up-to-date PR, and squash merge; direct human pushes, force pushes and deletion
 are rejected. `.github/workflows/develop-auto-merge.yml` arms GitHub's native
 auto-merge for same-repository, non-draft PRs. GitHub loads this
 `pull_request_target` policy from the trusted default branch, `master`, even
@@ -63,13 +65,21 @@ workflow reference while the default checkout still tests the caller's PR
 merge ref. Both workflows grant only Contents read access and pass no secrets.
 The called job admits only same-repository pull requests targeting `develop`.
 
-The PR test job and develop publication use the same dedicated host. Each PR
-has its own `llaminar-develop-pr-<number>` concurrency group with
-`cancel-in-progress: true`, so a new commit cancels obsolete work on that PR.
-The single runner serializes jobs from different PRs and publication.
-The AVX2 job calls `run_develop_image_gate.py --cpu-isa AVX2` without publication.
-Before compilation, CPU admission checks every visible CPU against the shipped
-AVX2 feature contract and fails with missing flags instead of changing the ISA.
+The AVX2 job targets `llaminar-develop-avx2` on the organization development
+host; the AVX512 job targets the repository runner label `llaminar-avx512`.
+Custom-label routing accommodates both runner scopes. The AVX2 host retains
+its `Develop CI` group restrictions on the protected reusable workflow.
+The matrix allows two parallel jobs and disables fail-fast, so one ISA failure
+does not cancel the other. Each PR/ISA job has its own
+`llaminar-develop-pr-<number>-<ISA>` concurrency group with
+`cancel-in-progress: true`, so a new commit cancels obsolete work for that
+same PR and ISA without serializing its two hosts.
+Each host serializes its own jobs; AVX2 shares its queue with publication.
+Each job calls `run_develop_image_gate.py --cpu-isa <ISA>` without publication.
+Before toolchain preparation, CPU admission checks every visible CPU against
+the requested shipped ISA contract, including AVX512-VNNI for AVX512. Missing
+flags fail explicitly instead of changing the ISA; a runner label alone is
+not hardware qualification.
 Build-only publication does not require native ISA support.
 
 PR registry cache access is `import-only`, with no registry credentials or
@@ -155,7 +165,8 @@ The repository's cache storage limit is configured in GitHub Actions settings;
 GitHub owns eviction. These caches contain dependency images, not source
 builds or compiler-object cache mounts. The named `llaminar-develop` BuildKit worker uses `keep-state: true`; its
 local layers and ccache mounts survive job cleanup, failed builds and later
-commits. The single runner prevents simultaneous jobs mutating this worker. Per-ISA `*-toolchain.json` receipts record restore/build status,
+commits. Each physical host retains its own worker, shared only by that host's
+serial jobs; compiler caches are not transferred between the hosts. Per-ISA `*-toolchain.json` receipts record restore/build status,
 dependency fingerprint, image manifest, size and validation time. The canonical
 image driver still admits and builds the exact source snapshot. See
 [Docker's cache backend reference](https://docs.docker.com/build/cache/backends/gha/)

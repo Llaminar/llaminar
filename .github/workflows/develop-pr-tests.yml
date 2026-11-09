@@ -2,8 +2,8 @@ name: Develop Unit and host gate
 
 # Runner-group access is pinned to this workflow on develop. The caller keeps
 # the pull_request event, so checkout still tests its proposed merge commit.
-# The dedicated development host builds AVX2 and runs complete Unit plus host
-# preflight. CPU admission rejects unsupported hardware before compilation.
+# Dedicated AVX2 and AVX512 hosts run complete Unit plus host preflight in
+# parallel. CPU admission rejects unsupported hardware before compilation.
 on:
   workflow_call:
 
@@ -12,19 +12,30 @@ permissions:
 
 jobs:
   unit:
-    # Only same-repository PRs into develop may use the dedicated host.
+    # Only same-repository PRs into develop may use the dedicated hosts.
     if: >-
       github.event_name == 'pull_request' && github.base_ref == 'develop' &&
       github.event.pull_request.head.repo.full_name == github.repository
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 2
       matrix:
-        cpu_isa: [AVX2]
+        cpu_isa: [AVX2, AVX512]
+        include:
+          - cpu_isa: AVX2
+            runner: llaminar-develop-avx2
+          - cpu_isa: AVX512
+            runner: llaminar-avx512
     name: Unit + host (${{ matrix.cpu_isa }})
-    runs-on:
-      group: Develop CI
-      labels: llaminar-develop-avx2
+    # Each ISA replaces its own obsolete work independently, while different
+    # PRs retain separate queues on their respective dedicated hosts.
+    concurrency:
+      group: llaminar-develop-pr-${{ github.event.pull_request.number }}-${{ matrix.cpu_isa }}
+      cancel-in-progress: true
+    # Custom labels reach both the organization-scoped AVX2 runner (whose
+    # group still restricts this workflow to develop) and the repository's
+    # AVX512 runner, which has no default self-hosted/Linux/X64 labels.
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v6
