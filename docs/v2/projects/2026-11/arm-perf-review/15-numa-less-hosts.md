@@ -39,3 +39,21 @@ On the M1 Max Docker VM:
 
 This makes the Mac a whole-engine development loop, plus small ARM servers
 and VMs. It is not needed for the qualified GB10 target.
+
+## Bundle 1/15 classification (2026-11-09, lane) + tickets filed
+
+- 134 failing rows classified, 0 unclassified: B0 base 32; S1 env seccomp-
+  EPERM (DGX devcontainer default seccomp w/o CAP_SYS_NICE; mbind/
+  set_mempolicy EPERM — NOT 64K/memory-only as earlier recorded) 41;
+  T1 test assumption (hard-coded 4096 mmap windows; prod 64K passes;
+  validator fail-fast correct) 40; T2 test assumption (4K byte literals) 17;
+  E1 env oneDNN origin-probe 2. Benign: touch strides; min-alignment
+  promoted by AlignedVector.
+- PRODUCT GAPS → GitHub issues: #48 G1 NUMAAllocator 4096 (HIGH; DONTNEED
+  EINVAL/null + SILENT 64K-round zeroing); #49 G2 CPUBackend mbind 4096;
+  #50 G3 DeviceRegistry CPU-less nodes (cpus[0] capacity 0); #51 G4 MoE
+  planLayout 4096 granularity; #52 G5 NUMATopology silent node-0 fallback
+  (maxim 29).
+- Station probes (numactl/node loop/docker inspect/Mems_allowed) + approved
+  UNMASKING rerun (S1+P1 ~42 tests; SYS_NICE + seccomp=unconfined) in
+  flight → will refine G1/G2 reproduction + S1 true answers.
