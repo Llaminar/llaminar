@@ -77,6 +77,26 @@ namespace
         return dot;
     }
 
+
+#if LLAMINAR_COMPILED_WITH_NEON
+/** @test NEON TQ8 dequantize reproduces the exact scalar per-element bytes. */
+TEST(TQ8Roundtrip, DequantNeon_ExactScalar)
+{
+    constexpr int D = 64;
+    const TurboQuantContext ctx(D);
+    TQ8Block<D> block;
+    block.norm = 3.0f;
+    block.reconstruction_norm = 1.7f;
+    for (int i = 0; i < D; ++i)
+        block.indices[i] = static_cast<uint8_t>((i * 7 + 3) % 256);
+    alignas(64) float scratch[D];
+    std::vector<float> scalar_out(D, -9.0f), neon_out(D, -9.0f);
+    turboquant_dequantize_tq8_scalar<D>(block, ctx, scalar_out.data(), scratch);
+    turboquant_dequantize_tq8_neon<D>(block, ctx, neon_out.data(), scratch);
+    EXPECT_EQ(std::memcmp(neon_out.data(), scalar_out.data(), D * sizeof(float)), 0)
+        << "TQ8 NEON dequant bytes";
+}
+#endif
 } // anonymous namespace
 
 // ============================================================================
