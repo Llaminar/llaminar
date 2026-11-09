@@ -6,10 +6,12 @@
  * integer family (ASIMD, SDOT and, in an I8MM envelope, SMMLA row pairs),
  * both arithmetic policies and every non-compact encoding. The build compiles
  * this TU with the real target's command at -O3 and CPUNativeTileRegisterEvidence.py
- * rejects any FP/SIMD stack traffic inside the K-loop programs and their call
- * closure: the tiles must keep their whole working set in registers. The
- * inventory string names exactly the instantiations below (same guards), so
- * the checker can require every expected program body.
+ * analyses the FP/SIMD stack traffic of the K-loop programs and their call
+ * closure: single-row (decode) programs must not spill at all, grouped row
+ * tiles may not exceed their committed per-compiler/envelope ratchet budget,
+ * and anything the analysis cannot prove is a fatal failure. The expected
+ * programs derive from the admitted ISA envelope; the inventory string names
+ * the instantiations below (same guards) and must agree with it.
  */
 #include "kernels/cpu/gemm/CPUNativeNEONPreparedProjection.h"
 
