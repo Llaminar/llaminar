@@ -147,3 +147,10 @@ another schedule heuristic.
 - Honest expectation: economy likely small — removes A725 straggling but NOT
   their wake-up. Window request (~30 min, 35B/27B all-workers vs fastest-class,
   ABBA + PerfStats claim counter as proof) booked after the c24ce9b4e re-gate.
+
+## libgomp OMP_PLACES syntax (v4 rerun, 2026-11-09)
+
+- Capacity-ordered places only as EXPLICIT LISTS / COLON syntax: `{0,1,…,9},
+  {10,…,19}` and `{0:5},{5:5}` WORK; `{5-9},{15-19},{0-4},{10-14}` is
+  INVALID (range-inside-braces rejected). v4 uses `{5:5},{15:5},{0:5},{10:5}`
+  for the capacity-order arm.
