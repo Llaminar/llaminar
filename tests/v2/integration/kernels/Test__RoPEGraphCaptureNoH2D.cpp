@@ -19,6 +19,7 @@
 #include "kernels/rope/RoPEDeviceParams.h"
 #include "mocks/MockComputeStage.h"
 #include "tensors/Tensors.h"
+#include "../../utils/CPURoPETestBinding.h"
 
 #include <algorithm>
 #include <cmath>
@@ -174,6 +175,7 @@ namespace
         }
 
         RoPEStage stage(params);
+        const llaminar2::test::StageWorkspaceTestBinding workspace(stage, seq_len);
         llaminar2::testing::MockDeviceContext ctx(DeviceId::cpu(), ComputeBackendType::CPU);
         EXPECT_TRUE(stage.execute(&ctx));
 
