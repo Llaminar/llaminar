@@ -301,3 +301,18 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   FAILS CLOSED (no receipt; reason in _doc). GNU-14 all + AppleClang NEON/
   NEON_DOTPROD re-audit clean, budgets unchanged. 40 tests; Mac NEON_DOTPROD
   E2E green. GNU-14 .80 E2E queued (non-urgent).
+
+## SOURCE118 FINAL (2026-11-09) — successor scope (SOURCE119)
+
+- P1 whole-witness assembler state: reject unmodelled conditional/macro/
+  include/symbol-rebinding controls across preamble + data sections +
+  non-audited bodies (`.if 0` split/`.endif`-in-rodata; `.macro fmov→str q0`)
+  or bind actual expansion — whole-file, structural, never budgetable.
+- P2 relative path authority: resolve against the EXECUTED compile directory
+  (verify vs build cwd mismatch) or reject relative sources pre-compile;
+  differing cwd test with real/decoy.
+- Precision: T:154–155 ≠ composed heap-escape trace (narrow claim or add it).
+- Qualification boundary: AppleClang-21/NEON_I8MM evidence must be RECOVERED
+  (suggested: objdump/llvm-objdump of the probe OBJECT — full operands both
+  compilers) — fail-closed is honest current state, not a green exclusion;
+  never alter production allocation.
