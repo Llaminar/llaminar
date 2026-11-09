@@ -8301,6 +8301,12 @@ add_v2_test(V2_Unit_NodeTopology
     LABELS "V2;Unit;Topology;NUMA;Socket;CPU;MPI;TensorParallelism"
     MPI_PROCS 1  # NodeTopology is single-rank only (reads sysfs)
 )
+# Sparse firmware package ids (GB10 reports 36) must index sockets densely.
+add_v2_test(V2_Integration_NodeTopologyDensePackageIds
+    COMMAND $<TARGET_FILE:v2_test_node_topology>
+        --gtest_filter=Test__NodeTopology.SparsePackageIdsBecomeDenseSocketIndices:Test__NodeTopology.AllNUMANodesHaveValidSocketId:Test__NodeTopology.CPUToSocketMapping
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;Topology;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
 # Test: NUMAAllocator (NUMA-aware memory allocation for cross-socket CPU tensor parallelism)
 add_executable(v2_test_numa_allocator unit/memory/Test__NUMAAllocator.cpp)
@@ -9510,6 +9516,16 @@ add_v2_test(V2_Unit_Q8Q16FusedAttention
     MPI_PROCS 1
     LABELS "V2;Unit;Q8_1;Q16_1;Attention;CPU;Kernels;FlashAttention"
 )
+# Native TQ and Q8_1 cache attention must be implemented by every CPU family
+# (ARM entered the direct-attention error path before NEON enabled it).
+add_v2_test(V2_Integration_CPUNativeQuantizedKVAttention
+    COMMAND $<TARGET_FILE:v2_test_tq_fused_attention>
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;Attention;TurboQuant;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+add_v2_test(V2_Integration_CPUNativeQ8Q16KVAttention
+    COMMAND $<TARGET_FILE:v2_test_q8q16_fused_attention>
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;Attention;Q8_1;Q16_1;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
 
 # Split TQ Regression Tests
 # Targeted regression tests for 4 specific bugs found during split TQ8/TQ4 integration:
