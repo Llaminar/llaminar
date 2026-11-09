@@ -266,14 +266,17 @@ TEST(CPUImmutableLookupRows,IQ4OriginalCodebookScalesAndPartialRows)
             constexpr std::size_t count=5;
             const auto stride=strideFor(TensorType::IQ4_NL,width),blocks=stride/sizeof(IQ4_NLBlock);
             ASSERT_GT(blocks,0u)<<"Every positive width occupies at least one original block";
-            std::vector<IQ4_NLBlock>native(count*blocks);
+            // Build each block whole and append it, so the container never
+            // holds a value-initialized element that is then partly rewritten.
+            std::vector<IQ4_NLBlock>native;native.reserve(count*blocks);
+            for(std::size_t b=0;b<count*blocks;++b)
+            {
+                IQ4_NLBlock block{};block.d=scale;
+                for(int i=0;i<16;++i)block.qs[i]=std::uint8_t(b*29+i*17);
+                native.push_back(block);
+            }
             std::vector<float>expected(count*width),storage(count*width+14,canary);
             auto output=std::span(storage).subspan(7,count*width);
-            for(std::size_t b=0;b<native.size();++b)
-            {
-                native[b].d=scale;
-                for(int i=0;i<16;++i)native[b].qs[i]=std::uint8_t(b*29+i*17);
-            }
             for(std::size_t row=0;row<count;++row)
                 for(int column=0;column<width;++column)
                 {
