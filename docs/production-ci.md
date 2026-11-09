@@ -193,7 +193,10 @@ remain owned by `run_production_prerequisites.py` and the production pipeline.
 `192.168.68.108` (`david-stealth`) runs Ubuntu 24.04 with an i7-11800H,
 8 physical cores / 16 threads, 64 GB RAM and a 1 TB system volume. Its
 `llaminar-ci` system account owns `/opt/llaminar-actions-runner` and
-`/var/lib/llaminar-ci/work`; Docker access is granted only through the Docker
+`/home/runner/work`, with its home at `/var/lib/llaminar-ci`. The workspace
+preserves the prior runner's absolute cache paths: Actions cache versions hash
+the cached paths as well as compression, so moving them causes a miss even
+with the same dependency key. Docker access is granted only through the Docker
 group, with no passwordless sudo rule for workflow jobs. The systemd service
 `actions.runner.Llaminar.llaminar-develop-108.service` starts at boot.
 The release archive is verified against GitHub's declared SHA256 before
