@@ -611,3 +611,11 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   census green both compilers. Addon R1 remaining: WSL x86 gate; then
   handover to Main (exact tip). Original uncaptured one-of-four failure stays
   a separate historical observation (not retroactively authenticated).
+
+- Addon note: WSL x86 gate runs at **ae090ec81** (not d1f1e8e34) — production
+  src/ byte-identical to e633a56a9; the 10 Evidence {Analysis,Binding0..3}
+  tests registered OUTSIDE the arm64 block → also x86 Unit/preflight
+  (stand-in/shard machinery Linux coverage); ARM-only proof target +
+  NEONTileRegisters correctly absent on x86. Items:
+  PartialChunkPaddingIsNormalizedForX86Readers + full Unit/preflight + 10
+  Evidence shards; expected base set only.
