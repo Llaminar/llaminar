@@ -2791,6 +2791,7 @@ class NativeQuantisedProfilerEvidenceTest(unittest.TestCase):
                 fit_cache=cache,
                 policy_accelerators=(),
                 profiler_feature_catalog=catalog,
+                profiler_surrogate_devices=("cpu",),
             )
             replay_catalog = dataclasses.replace(catalog)
 
@@ -2816,6 +2817,7 @@ class NativeQuantisedProfilerEvidenceTest(unittest.TestCase):
                     fit_cache=cache,
                     policy_accelerators=(),
                     profiler_feature_catalog=replay_catalog,
+                    profiler_surrogate_devices=("cpu",),
                 )
 
         self.assertEqual(replay, expected)
@@ -3930,6 +3932,7 @@ class NativeQuantisedProfilerEvidenceTest(unittest.TestCase):
                 min_shape_groups_per_leaf=1,
                 policy_accelerators=(),
                 profiler_feature_catalog=catalog,
+                profiler_surrogate_devices=("cpu",),
                 fit_final_rules=False,
             )
 
@@ -4235,6 +4238,7 @@ class NativeQuantisedProfilerEvidenceTest(unittest.TestCase):
             "min_shape_groups_per_leaf": 1,
             "policy_accelerators": (),
             "profiler_feature_catalog": catalog,
+            "profiler_surrogate_devices": ("cpu",),
             "fit_final_rules": False,
         }
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
@@ -4313,6 +4317,44 @@ class NativeQuantisedProfilerEvidenceTest(unittest.TestCase):
                 build_profiler_observation_index(corpus),
             )
 
+    def test_explicit_surrogate_inventory_never_discovers_cuda_devices(self) -> None:
+        """An explicit device-free inventory reaches every surrogate fit.
+
+        Unit tests must not depend on the host's accelerators: before the
+        inventory was injectable, a GPU-less host failed device discovery
+        and a GPU host silently trained these fits on CUDA. Discovery is
+        made fatal here so any path that ignores the explicit inventory fails
+        on every host. The surrogate itself still sees only the CPU device.
+        """
+
+        corpus, _costs, *_unused, catalog = profiler_model_fixture()
+        observed_devices: list[str] = []
+        original_fit = profiler_model._fit_profiler_surrogate
+
+        def record_device(*args, device: str, **kwargs):
+            observed_devices.append(device)
+            return original_fit(*args, device=device, **kwargs)
+
+        with mock.patch(
+            "native_quantised_dispatch.segmented_policy."
+            "_profiler_surrogate_cuda_devices",
+            side_effect=AssertionError("CUDA discovery with an explicit inventory"),
+        ), mock.patch.object(
+            profiler_model, "_fit_profiler_surrogate", side_effect=record_device
+        ):
+            policy = fit_generic_policy(
+                corpus,
+                max_leaves=2,
+                min_shape_groups_per_leaf=1,
+                policy_accelerators=(),
+                profiler_feature_catalog=catalog,
+                profiler_surrogate_devices=("cpu",),
+            )
+
+        self.assertTrue(policy.rules)
+        self.assertTrue(observed_devices)
+        self.assertEqual(set(observed_devices), {"cpu"})
+
     def test_profiler_informed_catalog_drives_complete_generic_fit(self) -> None:
         """The authenticated sidecar reaches both CV and final tree fitting."""
 
@@ -4328,6 +4370,7 @@ class NativeQuantisedProfilerEvidenceTest(unittest.TestCase):
                 min_shape_groups_per_leaf=1,
                 policy_accelerators=(),
                 profiler_feature_catalog=catalog,
+                profiler_surrogate_devices=("cpu",),
             )
 
         build_index.assert_called_once_with(corpus)
@@ -4363,6 +4406,7 @@ class NativeQuantisedProfilerEvidenceTest(unittest.TestCase):
             min_shape_groups_per_leaf=1,
             policy_accelerators=(),
             profiler_feature_catalog=catalog,
+            profiler_surrogate_devices=("cpu",),
         )
         actual = fit_generic_policy(
             expanded,
@@ -4370,6 +4414,7 @@ class NativeQuantisedProfilerEvidenceTest(unittest.TestCase):
             min_shape_groups_per_leaf=1,
             policy_accelerators=(),
             profiler_feature_catalog=rebound,
+            profiler_surrogate_devices=("cpu",),
         )
 
         self.assertEqual(actual, expected)
@@ -4484,6 +4529,7 @@ class NativeQuantisedProfilerEvidenceTest(unittest.TestCase):
                 min_shape_groups_per_leaf=1,
                 policy_accelerators=(),
                 profiler_feature_catalog=baseline_catalog,
+                profiler_surrogate_devices=("cpu",),
                 fit_final_rules=False,
                 fit_cache=cache,
             )
@@ -4504,6 +4550,7 @@ class NativeQuantisedProfilerEvidenceTest(unittest.TestCase):
                     min_shape_groups_per_leaf=1,
                     policy_accelerators=(),
                     profiler_feature_catalog=extended_catalog,
+                    profiler_surrogate_devices=("cpu",),
                     fit_final_rules=False,
                     fit_cache=cache,
                 )
@@ -4529,6 +4576,7 @@ class NativeQuantisedProfilerEvidenceTest(unittest.TestCase):
             ),
             "policy_accelerators": (),
             "profiler_feature_catalog": catalog,
+            "profiler_surrogate_devices": ("cpu",),
             "fit_final_rules": False,
         }
 
