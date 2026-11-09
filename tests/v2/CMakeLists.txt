@@ -3105,6 +3105,15 @@ add_v2_test(V2_Integration_OpenMPIdleSpinPolicy
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MPI;CPU;Bootstrap;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OpenMPIdleSpinPolicy)
+# Self-launched core-placed ranks bind libgomp's pool to capacity-ordered
+# physical cores: GB10's X925 cores, which run the serial master and static
+# partitions, would otherwise follow the A725 cores in CPU-id order.
+add_v2_test(V2_Integration_OpenMPCapacityOrderedCorePlaces
+    COMMAND $<TARGET_FILE:v2_unit_mpi_bootstrap>
+        --gtest_filter=Test__MPIBootstrap.CorePlacesFollowCapacityWithinTheRankMask:Test__MPIBootstrap.ClusterWorkersOrderFastCoresFirst
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MPI;CPU;Bootstrap;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OpenMPCapacityOrderedCorePlaces)
 
 # Original native launch command owner: exact observed NUMA mapping, no GPU work.
 add_v2_test(V2_Integration_MPIBootstrapObservedNUMAMapping
