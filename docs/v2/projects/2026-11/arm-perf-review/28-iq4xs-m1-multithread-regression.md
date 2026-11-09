@@ -517,3 +517,15 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
 - Downstream: 2/4 ctest + lifecycle 0 = expected no-receipt consequences
   (proof.json absent); census 9/9 still green. NOT a skip: 100% reproduction.
 - Successor (SOURCE125) pending publication + census re-run.
+
+## SOURCE125 fix-back 64de475a2 (2026-11-09)
+
+- Strict temp normalization: invariant in validate_plan (build+verify) —
+  exactly one -o; absolute; basename cc+6alnum+.s; once in cc1plus (output)
+  + once in as (LAST + SOLE input); ONLY the shared basename masked at its
+  two validated positions (directory + all else compared); controls:
+  consistent rename = equal; mismatched names / probe.s / 7-char / relative =
+  rejected; another dir/added option/another program/PATH = still different;
+  mid-compile plan change → no receipt. Stand-in emits fresh temps now.
+- Real-data: 10 real GNU-14 jobs pass stricter validation; 81 tests; Mac E2E.
+- Census re-run at 64de475a2 pending.
