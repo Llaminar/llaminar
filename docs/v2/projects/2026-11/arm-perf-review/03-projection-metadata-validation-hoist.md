@@ -190,3 +190,25 @@ separate (shared) path with the same pattern but different owners.
   bound incl. chunk last live word; 4fb400ecb closes the Q16 precision notes.
 - Amend → separate successor SHA for re-review; owner/runtime/WSL/economy
   evidence still required.
+
+## SOURCE111 amendment — 661fc9284 (2026-11-09, parent b645ca7d1, base 302318f1e)
+
+- CONTRACT: padding defined by the PRODUCER — normalizePaddingMetadata zeroes
+  secondary words of columns N%64..63 of the final chunk in every block;
+  extents from descriptor + asserted; writes through unsealedGenerationBytes
+  (owned generation; FATAL on a sealed one); no new allocation/first-touch.
+- Arrival publish (admitCPUNativeVNNIPublication) normalizes THEN seals;
+  movement remains live-only. Seal back to ALL LANES (belt).
+- Tests distinguish: raw poisoned padding REJECTED; normalized arrival
+  ACCEPTED, every other byte unchanged.
+- Regressions: core-free PaddingNormalization; NEON TailPaddingContract
+  (N%4=1/2/3 + chunk tails × every family × ASIMD/SDOT/SMMLA × Rows1..4 ×
+  both policies — poisoned LOADED adjacent lanes rejected before writes,
+  benign padding vs bytes/oracle/guards); x86
+  PartialChunkPaddingIsNormalizedForX86Readers (_X86 preflight: poisoned
+  padding fails seal AND x86 consumers (IQ2_S dispatch<8/16>,
+  loadScales256/512); normalized owner passes both). M1 green; x86 syntax
+  only (WSL = proof). SOURCE112 recheck requested.
+- .80 run at 661fc9284 in progress (incremental; BUILD=0 on prior tip →
+  302318f1e cured outside-diff failures). Window (b) base = 302318f1e vs
+  661fc9284 after.
