@@ -8941,27 +8941,9 @@ add_v2_test(V2_Integration_CPUAttentionCacheSource
     NO_MODELS
 )
 
-# Production SIMD codec conformance does not need model or engine linkage.
-add_executable(v2_integration_cpu_attention_key_q8
-    integration/kernels/cpu/Test__CPUAttentionKeyQ8.cpp)
-target_include_directories(v2_integration_cpu_attention_key_q8 PRIVATE ${CMAKE_SOURCE_DIR})
-target_compile_features(v2_integration_cpu_attention_key_q8 PRIVATE cxx_std_23)
-target_link_libraries(v2_integration_cpu_attention_key_q8
-    GTest::gtest GTest::gtest_main OpenMP::OpenMP_CXX)
-add_v2_test(V2_Integration_CPUAttentionKeyQ8
-    COMMAND $<TARGET_FILE:v2_integration_cpu_attention_key_q8>
-    LABELS "V2;Integration;CPU;Attention;KVCache;Q8;AllHeadDims;AVX2;AVX512;ByteExact;Regression"
-    MPI_PROCS 1
-    TIMEOUT 120
-    NO_MODELS
-)
-
-# Economy/profiling stays outside ProductionTestPreflight.
-add_executable(v2_perf_cpu_attention_key_q8
-    performance/kernels/cpu/attention/Perf__CPUAttentionKeyQ8.cpp)
-target_include_directories(v2_perf_cpu_attention_key_q8 PRIVATE ${CMAKE_SOURCE_DIR})
-target_compile_features(v2_perf_cpu_attention_key_q8 PRIVATE cxx_std_23)
-target_link_libraries(v2_perf_cpu_attention_key_q8 PRIVATE OpenMP::OpenMP_CXX)
+# Production codec/performance targets share one source-owned registration with
+# the focused native CPU build. Economy stays outside ProductionTestPreflight.
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/V2CPUAttentionKeyQ8Tests.cmake")
 add_v2_test(V2_Perf_CPUAttentionKeyQ8
     COMMAND $<TARGET_FILE:v2_perf_cpu_attention_key_q8>
             --head-dim 64 --heads 128 --iterations 1000 --isa auto --operation encode
@@ -19493,72 +19475,7 @@ add_v2_test(V2_Perf_CPUGatedDeltaNetVerifierRows
     TIMEOUT 120
 )
 
-# The scalar FP32 publication ABI is device-free and header-only. Keep this
-# focused proof independent of the backend libraries for inexpensive feedback.
-add_executable(v2_test_cpu_explicit_rounding_contract
-    unit/kernels/cpu/Test__CPUExplicitRoundingContract.cpp)
-target_include_directories(v2_test_cpu_explicit_rounding_contract PRIVATE
-    ${CMAKE_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
-target_compile_features(v2_test_cpu_explicit_rounding_contract PRIVATE cxx_std_20)
-target_link_libraries(v2_test_cpu_explicit_rounding_contract PRIVATE
-    GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_CPUExplicitRoundingContract
-    COMMAND $<TARGET_FILE:v2_test_cpu_explicit_rounding_contract>
-    LABELS "V2;Unit;CPU;Numerics;ByteExact"
-    NO_MODELS NO_MPI MPI_PROCS 1)
-set(V2_Q8_FINITE_SCALE_CPU_PREFLIGHT_TESTS)
-set(V2_Q8_FINITE_SCALE_CPU_ISAS SCALAR AVX2)
-if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
-    list(APPEND V2_Q8_FINITE_SCALE_CPU_ISAS AVX512)
-endif()
-foreach(V2_Q8_SCALE_ISA IN LISTS V2_Q8_FINITE_SCALE_CPU_ISAS)
-    string(TOLOWER "${V2_Q8_SCALE_ISA}" V2_Q8_SCALE_TARGET_ISA)
-    set(V2_Q8_SCALE_TARGET v2_test_q8_finite_scale_contract_${V2_Q8_SCALE_TARGET_ISA})
-    # The production header selects SIMD with compiled feature guards and real
-    # CPUID, not LLAMINAR_ISA_LEVEL. Compile true ceilings; never stub detection.
-    add_executable(${V2_Q8_SCALE_TARGET}
-        unit/kernels/cpu/Test__CPUExplicitRoundingContract.cpp)
-    target_include_directories(${V2_Q8_SCALE_TARGET} PRIVATE
-        ${CMAKE_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
-    target_compile_features(${V2_Q8_SCALE_TARGET} PRIVATE cxx_std_20)
-    target_link_libraries(${V2_Q8_SCALE_TARGET} PRIVATE GTest::gtest GTest::gtest_main)
-    target_compile_definitions(${V2_Q8_SCALE_TARGET} PRIVATE
-        LLAMINAR_Q8_SCALE_TEST_${V2_Q8_SCALE_ISA}=1)
-    if(V2_Q8_SCALE_ISA STREQUAL "SCALAR")
-        target_compile_options(${V2_Q8_SCALE_TARGET} PRIVATE
-            -mno-avx -mno-avx2 -mno-avx512f -mno-fma)
-    elseif(V2_Q8_SCALE_ISA STREQUAL "AVX2")
-        target_compile_options(${V2_Q8_SCALE_TARGET} PRIVATE
-            -mavx2 -mfma -mno-avx512f)
-    else()
-        target_compile_options(${V2_Q8_SCALE_TARGET} PRIVATE
-            -mavx512f -mavx512bw -mavx512vl -mavx512dq -mfma)
-    endif()
-    add_v2_test(V2_Integration_Q8FiniteScaleContract_CPU_${V2_Q8_SCALE_ISA}
-        COMMAND $<TARGET_FILE:${V2_Q8_SCALE_TARGET}>
-            --gtest_filter=CPUExplicitRoundingContract.Q8FiniteScale*
-        LABELS "V2;Integration;CPU;${V2_Q8_SCALE_ISA};Quantization;Numerics;ScaleRange;Regression"
-        NO_MODELS NO_MPI MPI_PROCS 1)
-    list(APPEND V2_Q8_FINITE_SCALE_CPU_PREFLIGHT_TESTS
-        V2_Integration_Q8FiniteScaleContract_CPU_${V2_Q8_SCALE_ISA})
-endforeach()
-foreach(_fp32_subnormal_isa IN ITEMS SCALAR AVX2 AVX512)
-    string(TOLOWER "${_fp32_subnormal_isa}" _fp32_subnormal_isa_lower)
-    if(TARGET v2_test_q8_finite_scale_contract_${_fp32_subnormal_isa_lower})
-        add_v2_test(V2_Integration_FP32SubnormalContract_CPU_${_fp32_subnormal_isa}
-            COMMAND $<TARGET_FILE:v2_test_q8_finite_scale_contract_${_fp32_subnormal_isa_lower}>
-                --gtest_filter=CPUExplicitRoundingContract.Q8FiniteScaleCompiledISAPath:CPUExplicitRoundingContract.DeviceFP32SubnormalFixedWords
-            LABELS "V2;Integration;CPU;${_fp32_subnormal_isa};NumericalContract;ByteExact;Regression"
-            MPI_PROCS 1 NO_MODELS NO_MPI TIMEOUT 30)
-        list(APPEND V2_FP32_SUBNORMAL_PREFLIGHT_TESTS
-            V2_Integration_FP32SubnormalContract_CPU_${_fp32_subnormal_isa})
-    endif()
-endforeach()
-
-add_v2_test(V2_Integration_CPUExplicitRoundingContract
-    COMMAND $<TARGET_FILE:v2_test_cpu_explicit_rounding_contract>
-    LABELS "V2;Integration;ProductionTestPreflight;CPU;Numerics;MoE;AllFormats;ByteExact;Regression"
-    NO_MODELS NO_MPI MPI_PROCS 1)
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/V2CPUExplicitRoundingTests.cmake")
 
 # Performance evidence remains separate from the functional preflight proof.
 add_executable(v2_perf_cpu_expert_q8_publication
@@ -30132,6 +30049,24 @@ add_v2_test(V2_Integration_NativeQuantizedRowViewExtent
     MPI_PROCS 1 NO_MODELS)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeQuantizedRowViewExtent)
 
+# IQ2_S source coefficients are raw words, not a maskable approximation.
+if(NOT LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
+    add_v2_test(V2_Integration_CPUNativeSourceCoefficientMetadata_X86
+        COMMAND $<TARGET_FILE:v2_integration_cpu_native_quantised_gemv>
+            --gtest_filter=CPUNativeSourceMetadata.ReservedBitsRejectAtEveryVectorLane
+        LABELS "V2;Integration;DeviceFree;CPU;NativeQuantised;Metadata;Regression"
+        TIMEOUT 60 NO_MODELS MPI_PROCS 1)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeSourceCoefficientMetadata_X86)
+endif()
+
+# Native read views must accept the real catalog-wide CPU slot/demotion owners.
+add_v2_test(V2_Integration_CPUPreparedNativeReadPublication
+    COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
+        --gtest_filter=ExpertTierWeightStream.PreparedReadViewAcceptsAllMigratedSourceFormats:CpuExpertSlotPool.EveryCatalogedFormatBuildsStableTripletMetadata
+    LABELS "V2;Integration;DeviceFree;CPU;NativeQuantised;AllFormats;Movement;Regression"
+    TIMEOUT 60 NO_MODELS MPI_PROCS 1)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUPreparedNativeReadPublication)
+
 # IQ4_XS source-tuple mapping, movement, serialization and arithmetic-generation fences.
 add_v2_test(V2_Integration_IQ4XSTupleFormatContract
     COMMAND $<TARGET_FILE:v2_test_native_quantised_format_info>
@@ -38772,6 +38707,8 @@ if(TEST V2_Integration_MPIBootstrapNativeApplicationBoundary)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
         V2_Integration_MPIBootstrapNativeApplicationBoundary V2_Integration_MPIExternalParentOwnership)
 endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/V2CPUArchitectureTests.cmake")
 
 # Inventory finalization must observe later registrations too. The module
 # schedules one end-of-directory pass rather than relying on textual position.
