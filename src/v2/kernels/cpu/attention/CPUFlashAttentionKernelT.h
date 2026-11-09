@@ -873,7 +873,7 @@ namespace llaminar2
             // modes and the production TQ8-K/TQ4-V asymmetric mode enter this
             // same scheduler and therefore share one arithmetic contract.
             // ---------------------------------------------------------------
-#if defined(__AVX512F__) || defined(__AVX2__)
+#if defined(__AVX512F__) || defined(__AVX2__) || LLAMINAR_COMPILED_WITH_NEON
             if ((K->native_type() == TensorType::TQ4 ||
                  K->native_type() == TensorType::TQ8) &&
                 (V->native_type() == TensorType::TQ4 ||
@@ -953,7 +953,7 @@ namespace llaminar2
                     causal, window_size, std::max(0, kv_len - seq_len), head_start, gqa_n_rep,
                     execution_policy, kv_logical_view);
 #endif // AQ8 has a genuine native decoder/dot/value program on ARM and x86.
-#if defined(__AVX512F__) || defined(__AVX2__)
+#if defined(__AVX512F__) || defined(__AVX2__) || LLAMINAR_COMPILED_WITH_NEON
             if (K->native_type() == TensorType::Q8_1 &&
                 V->native_type() == TensorType::Q8_1 &&
                 batch_size == 1)
@@ -1261,7 +1261,7 @@ namespace llaminar2
                 });
             }
 #endif // AQ8 request-sliced entry has the same native operand authority.
-#if defined(__AVX512F__) || defined(__AVX2__)
+#if defined(__AVX512F__) || defined(__AVX2__) || LLAMINAR_COMPILED_WITH_NEON
             else if (key_type == TensorType::Q8_1 &&
                      value_type == TensorType::Q8_1)
             {
@@ -6716,7 +6716,7 @@ namespace llaminar2
         // V accumulation in rotated centroid space, one final Πᵀ at end.
         // Total: O(D² + kv_len·D) instead of O(kv_len·D²).
         // =================================================================
-#if defined(__AVX512F__) || defined(__AVX2__)
+#if defined(__AVX512F__) || defined(__AVX2__) || LLAMINAR_COMPILED_WITH_NEON
         /**
          * @brief Native TQ4/TQ8 attention for every supported K/V pairing.
          *
@@ -7044,7 +7044,7 @@ namespace llaminar2
                 accumulate_tile,
                 finalize_row);
         }
-#endif // __AVX512F__ || __AVX2__ (TQ fused)
+#endif // __AVX512F__ || __AVX2__ || NEON (TQ fused)
 
 #if defined(__AVX512F__) || defined(__AVX2__) || LLAMINAR_COMPILED_WITH_NEON
         // AQ8 uses native shared codec/value authorities independently of the

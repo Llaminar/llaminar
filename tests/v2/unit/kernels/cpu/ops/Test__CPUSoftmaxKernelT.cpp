@@ -131,8 +131,9 @@ namespace llaminar2
             if (scale < 1e-10f)
                 scale = 1e-10f;
 
-            // Store scale as BF16
-            block.d = fp32_to_bf16(scale);
+            // Q8_1Block carries one FP16 scale ABI; quantize with the stored value.
+            block.d = fp32_to_fp16(scale);
+            scale = fp16_to_fp32(block.d);
 
             // Quantize and compute sum
             int32_t sum_qs = 0;
@@ -153,7 +154,7 @@ namespace llaminar2
          */
         void dequantize_q8_1_block(const Q8_1Block &block, float *output)
         {
-            float scale = bf16_to_fp32(block.d);
+            float scale = fp16_to_fp32(block.d);
             for (int i = 0; i < 32; ++i)
             {
                 output[i] = static_cast<float>(block.qs[i]) * scale;
