@@ -100,8 +100,12 @@ namespace llaminar2::cpu::native_quantised
             const int chunks = weights_.N_padded / 64;
             const auto n_blocks = (std::int64_t(chunks) + n_block_chunks_ - 1) / n_block_chunks_;
             const std::int64_t tasks = std::int64_t(grid_.tiles(width_)) * n_blocks;
+            // Tasks are independent output tiles whose full-K arithmetic does
+            // not depend on the executing worker, so dynamic claiming keeps
+            // every byte while letting faster cores of a heterogeneous host
+            // (GB10: X925 + A725) take more tiles than an equal static split.
             auto workshare = [&] {
-#pragma omp for schedule(static)
+#pragma omp for schedule(dynamic, 1)
                 for (std::int64_t task = 0; task < tasks; ++task)
                 {
                     const auto span = grid_.tileSpan(static_cast<int>(task / n_blocks), width_);
