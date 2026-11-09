@@ -147,8 +147,12 @@ assert _SPEC and _SPEC.loader
 envelope = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(envelope)
 
+# A tile K-loop program run<Ops, Policy, Encoding, Map, WithMinimum, Strips>(): the one outlined program per
+# instantiation, containing the strip walk and, for a panel tile, its decode panels. Production instantiates
+# Strips = 0 (the installed width). Groups: rows, family, policy, encoding, map, minimum, strips.
 PROGRAM = re.compile(r"27CPUNativeNEONProjectionTileILm(\d)EE3runINS1_11multi_scale17NEONMultiScaleOpsILNS\d+_11NEONByteDotE(\d)EEE"
-                     r"LNS_28CPUProjectionNumericalPolicyE(\d)ELNS1_26CPUNativeQuantisedEncodingE(\d)ELNS\d+_9NibbleMapE(\d)ELb(\d)E")
+                     r"LNS_28CPUProjectionNumericalPolicyE(\d)ELNS1_26CPUNativeQuantisedEncodingE(\d)ELNS\d+_9NibbleMapE(\d)ELb(\d)E"
+                     r"Li(\d)E")
 INVENTORY = re.compile(r"llaminar-native-neon-tile-probe:([A-Za-z0-9,:]*)")
 # (encoding, nibble map, with-minimum) dispatched per policy by Tile::dispatch().
 DISPATCH = ((1, 0, 1), (1, 0, 0), (5, 0, 0), (2, 0, 0), (4, 2, 0), (0, 0, 0), (0, 2, 0), (0, 1, 1))
@@ -170,25 +174,25 @@ BRANCHES = ("b", "bl", "b.cond", "cbz", "cbnz", "tbz", "tbnz")
 # x/w general registers, b/h/s/d/q scalar FP views, v vector, v[] element, list / list[] register lists (lane),
 # mem addressing, imm, shift, cond, sym label, reloc relocated symbol. Any other form is a structural failure.
 FORMS = frozenset(line.strip() for line in """
-add v,v,v|add w,w,imm|add w,w,w|add x,x,imm|add x,x,imm,shift|add x,x,reloc|add x,x,x|add x,x,x,shift
-addp v,v,v|adrp x,reloc|adrp x,sym|and v,v,v|and w,w,imm|and x,x,imm|asr w,w,imm|b sym|b.cond sym|bic v,imm
-bic v,v,v|bics w,w,w|bif v,v,v|bit v,v,v|bfi w,w,imm,imm|bfi x,x,imm,imm|bfxil x,x,imm,imm|bl sym|bsl v,v,v
+add v,v,v|add w,w,imm|add w,w,w|add x,x,imm|add x,x,imm,shift|add x,x,reloc|add x,x,w,shift|add x,x,x|add x,x,x,shift
+addp v,v,v|adds x,x,imm|adrp x,reloc|adrp x,sym|and v,v,v|and w,w,imm|and x,x,imm|asr w,w,imm|b sym|b.cond sym|bic v,imm
+bic v,v,v|bic w,w,w,shift|bics w,w,w|bif v,v,v|bit v,v,v|bfi w,w,imm,imm|bfi x,x,imm,imm|bfxil x,x,imm,imm|bl sym|bsl v,v,v
 cbnz w,sym|cbnz x,sym|cbz w,sym|cbz x,sym|ccmp w,w,imm,cond|cmeq v,v,imm|cmeq v,v,v|cmhi v,v,v|cmn w,imm
-cmp w,imm|cmp w,w|cmp w,w,shift|cmp x,imm|cmp x,x|csel w,w,w,cond|csel x,x,x,cond|cset x,cond|dup d,v[]
+cmp w,imm|cmp w,w|cmp w,w,shift|cmp x,imm|cmp x,w,shift|cmp x,x|csel w,w,w,cond|csel x,x,x,cond|csneg w,w,w,cond|cset x,cond|dup d,v[]
 dup v,v[]|dup v,w|dup v,x|eor x,x,x|ext v,v,v,imm|fadd v,v,v|fcvtl v,v|fmla v,v,v|fmov d,d|fmov d,x|fmov s,s
 fmov s,w|fmov w,s|fmov x,d|fmul s,s,s|fmul v,v,v|fmul v,v,v[]|fneg v,v|ins v[],v[]|ins v[],x|ld1 list,mem
 ld1 list,mem,imm|ld1 list[],mem|ld1 list[],mem,imm|ld1r list,mem|ld1r list,mem,imm|ld2 list,mem|ld2 list[],mem
 ld2r list,mem|ldp d,d,mem|ldp d,d,mem,imm|ldp q,q,mem|ldp q,q,mem,imm|ldp s,s,mem|ldp w,w,mem|ldp x,x,mem
 ldp x,x,mem,imm|ldpsw x,x,mem|ldr b,mem|ldr d,mem|ldr d,mem,imm|ldr h,mem|ldr q,mem|ldr q,mem,imm|ldr s,mem
-ldr w,mem|ldr x,mem|ldrb w,mem|ldrh w,mem|ldrsh w,mem|ldrsw x,mem|ldur d,mem|ldur q,mem|lsl w,w,imm|lsl x,x,imm
+ldr w,mem|ldr x,mem|ldrb w,mem|ldrh w,mem|ldrsh w,mem|ldrsw x,mem|ldur d,mem|ldur q,mem|ldur w,mem|ldur x,mem|lsl w,w,imm|lsl x,x,imm
 lsr x,x,imm|lsr x,x,x|madd x,x,x,x|mov d,v[]|mov v,v|mov v[],v[]|mov w,imm|mov w,w|mov x,imm|mov x,x|movi d,imm|movi v,imm
-movi v,imm,shift|movk x,imm,shift|mul w,w,w|mul x,x,x|mvni v,imm|mvni v,imm,shift|nop|orr v,imm|orr v,v,v|orr w,w,imm
+movi v,imm,shift|movk x,imm,shift|mul w,w,w|mul x,x,x|mvni v,imm|mvni v,imm,shift|negs w,w|nop|orr v,imm|orr v,v,v|orr w,w,imm
 orr w,w,w|orr w,w,w,shift|orr x,x,imm|orr x,x,x,shift|ret|saddlp v,v|sbfiz x,x,imm,imm|scvtf s,w|scvtf v,v
-sdot v,v,v|shl v,v,imm|smaddl x,w,w,x|smmla v,v,v|smull v,v,v|smull x,w,w|smull2 v,v,v|sshll v,v,imm|sshr v,v,imm
+sdot v,v,v|sdot v,v,v[]|shl v,v,imm|smaddl x,w,w,x|smmla v,v,v|smull v,v,v|smull x,w,w|smull2 v,v,v|sshll v,v,imm|sshr v,v,imm
 st1 list,mem|st1 list,mem,imm|st1 list[],mem|stp d,d,mem|stp q,q,mem|stp w,w,mem|stp x,x,mem|str b,mem|str d,mem|str d,mem,imm|str q,mem,imm
-str h,mem|str q,mem|str s,mem|str w,mem|str x,mem|stur d,mem|stur q,mem|sub v,v,v|sub w,w,imm|sub w,w,w
-sub x,x,imm|sub x,x,imm,shift|sub x,x,x|sxtw x,w|tbl v,list,v|tbnz w,imm,sym|tbnz x,imm,sym|tbz w,imm,sym
-uaddw v,v,v|ubfiz w,w,imm,imm|ubfx w,w,imm,imm|ubfx x,x,imm,imm|ucvtf v,v|umaddl x,w,w,x|umull x,w,w|ushll v,v,imm|ushr v,v,imm
+str h,mem|str q,mem|str s,mem|str w,mem|str x,mem|stur d,mem|stur q,mem|stur w,mem|stur x,mem|sub v,v,v|sub w,w,imm|sub w,w,w
+sub x,x,imm|sub x,x,imm,shift|sub x,x,x|subs w,w,imm|subs w,w,w|sxtw x,w|tbl v,list,v|tbnz w,imm,sym|tbnz x,imm,sym|tbz w,imm,sym
+uaddw v,v,v|ubfiz w,w,imm,imm|ubfiz x,x,imm,imm|ubfx w,w,imm,imm|ubfx x,x,imm,imm|ucvtf v,v|umaddl x,w,w,x|umull x,w,w|ushll v,v,imm|ushr v,v,imm
 usra v,v,imm|uxtw x,w|zip1 v,v,v|zip2 v,v,v
 """.replace("\n", "|").split("|") if line.strip())
 # Admitted instruction grammar. Anything else is a structural failure.
@@ -202,7 +206,9 @@ ABI_REGISTER = re.compile(r"^([dq])(8|9|1[0-5])$")
 NO_DESTINATION = frozenset({"cmp", "cmn", "ccmp", "ccmn", "tst", "fcmp", "fcmpe"})
 # The destination is also an input: only part of it is written.
 MERGE_DEFINITIONS = frozenset({"bfi", "bfxil", "movk"})
-CONDITIONAL_SELECTS = frozenset({"csel"})  # csinc/csinv/csneg transform one alternative: not admitted.
+# csinc/csinv/csneg transform one alternative, so they are admitted only in 32-bit form, where no stack address
+# can take part (reading a 32-bit view of one is already fatal).
+CONDITIONAL_SELECTS = frozenset({"csel"})
 STRUCTURE_ACCESSES = re.compile(r"^(ld|st)([1-4])(r?)$")
 # Trusted calls of the fatal diagnostic body (they return; the path must still reach abort()).
 DIAGNOSTIC_CALLS = frozenset({"fwrite", "fputs"})
@@ -836,7 +842,7 @@ def operand_kind(operand: str) -> str | None:
         return operand[0]
     if re.match(r"^v(?:[12]?[0-9]|3[01])(?:\.\d+[bhsd])?$", operand):
         return "v"
-    if re.match(r"^v(?:[12]?[0-9]|3[01])(?:\.[bhsd])?\[\d+\]$", operand):
+    if re.match(r"^v(?:[12]?[0-9]|3[01])(?:\.\d*[bhsd])?\[\d+\]$", operand):
         return "v[]"
     if IMMEDIATE.match(operand) or FLOAT.match(operand):
         return "imm"
@@ -881,8 +887,20 @@ def footprint(instruction: Instruction, operand: str) -> int | None:
         return None
     count, replicate = int(structure.group(2)), bool(structure.group(3))
     lane = re.search(r"\]\s*$", operand) is not None and not operand.rstrip().endswith("}")
-    registers = [element.strip() for element in operand[1:operand.rindex("}")].split(",")]
-    if any("-" in element for element in registers) or len(registers) != (count if count > 1 else len(registers)):
+    registers = []
+    for element in (part.strip() for part in operand[1:operand.rindex("}")].split(",")):
+        bounds = [bound.strip() for bound in element.split("-")]
+        if len(bounds) == 2:  # A consecutive register range v<a>.T-v<b>.T of one arrangement.
+            first, last = (re.match(r"^v(\d+)(\.\w+)?$", bound) for bound in bounds)
+            if not first or not last or first.group(2) != last.group(2):
+                return None
+            span = (int(last.group(1)) - int(first.group(1))) % 32 + 1
+            registers += [f"v{(int(first.group(1)) + step) % 32}{first.group(2) or ''}" for step in range(span)]
+        elif len(bounds) == 1:
+            registers.append(element)
+        else:
+            return None
+    if len(registers) != (count if count > 1 else len(registers)) or not 1 <= len(registers) <= 4:
         return None
     shapes = {re.sub(r"^v\d+", "", element) for element in registers}
     if len(shapes) != 1:
@@ -1450,11 +1468,19 @@ def noreturn_symbols(bodies: dict[str, list[str]], dialect: Dialect, imports: se
 
 
 def program_key(name: str) -> str:
-    """Stable budget key rows:family:policy:encoding:map:minimum for a tile program symbol."""
+    """Stable budget key rows:family:policy:encoding:map:minimum for an installed (Strips = 0) tile program."""
     match = PROGRAM.search(name)
     if not match:
         raise ValueError(f"not a tile program: {name}")
-    return ":".join(match.groups())
+    *fields, strips = match.groups()
+    if strips != "0":
+        raise ValueError(f"tile program pins a non-installed panel width: {name}")
+    return ":".join(fields)
+
+
+def key_tuple(match: re.Match) -> tuple:
+    """Integer key of a matched program, including its Strips argument."""
+    return tuple(int(field) for field in match.groups())
 
 
 ENVELOPE_PROGRAMS = {
@@ -1464,7 +1490,7 @@ ENVELOPE_PROGRAMS = {
     "NEON_I8MM": ("1:ASIMD", "2:ASIMD", "3:ASIMD", "4:ASIMD", "1:DotProd", "2:DotProd", "3:DotProd", "4:DotProd",
                   "2:I8MM", "3:I8MM", "4:I8MM"),
 }
-TILE_RUN = re.compile(r"27CPUNativeNEONProjectionTileILm\d+EE3run")
+TILE_RUN = re.compile(r"27CPUNativeNEONProjectionTileILm\d+EE(?:3run|6strips|5panel)")
 TILE_PROGRAM = re.compile(r"_ZNK9llaminar23cpu16native_quantised" + PROGRAM.pattern + r"EEvv")
 
 
@@ -1489,7 +1515,7 @@ def audit(data: bytes, disassembly: str, mode: str) -> dict[str, int]:
         leaf = 1 if dot == "I8MM" and rows == "1" else DOTS[dot]
         for policy in (0, 1):
             for encoding, nibble_map, minimum in DISPATCH:
-                expected.add((int(rows), leaf, policy, encoding, nibble_map, minimum))
+                expected.add((int(rows), leaf, policy, encoding, nibble_map, minimum, 0))
     bodies = normalize_disassembly(disassembly, image)
     tile_symbols = sorted({symbol.name for symbol in image.symbols
                            if symbol.kind != "section" and TILE_RUN.search(symbol.name)})
@@ -1502,7 +1528,7 @@ def audit(data: bytes, disassembly: str, mode: str) -> dict[str, int]:
         match = TILE_PROGRAM.fullmatch(name[len(image.prefix):]) if name.startswith(image.prefix) else None
         if not match:
             raise ValueError(f"unrecognized tile program symbol: {name}")
-        key = tuple(int(group) for group in match.groups())
+        key = key_tuple(match)
         if key in found:
             raise ValueError(f"tile program appears twice: {name}")
         if key not in expected:
