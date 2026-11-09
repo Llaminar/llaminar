@@ -118,3 +118,19 @@ addKeyCachePublicationTransforms = FP32 Q/K, no Q_out; key-only factory
 rejects Q_out/K_out at ComputeStageFactory.cpp:111; ActivationPrecisionPolicy
 rejects non-FP32; GraphResolver sets no outputs — allowlisted by function in
 the source policy). Dead persistent_state parameter removed.
+
+## Tip + Main follow-ups (2026-11-09) — pushed, authoritative = 94d7cbe2f
+
+- RoPEStage creates its kernel EXACTLY ONCE; type mismatch FATAL
+  (LLAMINAR_UNREACHABLE names both types); recreate/rebind removed.
+- Angle workspace sized from EFFECTIVE ROTATED WIDTH (partial-RoPE prefix),
+  NOT head_dim — stage/kernel/estimator same contract; estimator via
+  ModelMemoryProfile::rope_dimension_count / effectiveRotaryDimension();
+  profile wire version 6→7 (stale layouts fail); exact-byte asserts full +
+  partial widths.
+- Two focused preflight regressions (production defects fixed in e17c08412):
+  CPURoPEQ8OneRowTeamHeadOwnership (retained team rotates each shared head
+  once) + CPURoPEQ8OneRowNegativePosition (independent of thread's previous
+  call) — both reproduce the defect against the BASE TU in standalone control.
+- Mac portability: 270/270 NEON_DOTPROD + 268/268 NEON @8a553c922, 0 skips;
+  source policy clean. Bundle/patches stale; origin branch authoritative.
