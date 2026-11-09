@@ -506,6 +506,48 @@ TEST(Test__MPIBootstrap, PortableOpenMPPlacementPreservesRankLocalWorkerGeometry
     EXPECT_THROW(MPIBootstrap::configureOpenMPPlacement(invalid), std::invalid_argument);
 }
 
+/** @test Every self-launched core-placed rank binds one place per allowed core, fastest first. */
+TEST(Test__MPIBootstrap, CorePlacesFollowCapacityWithinTheRankMask)
+{
+    namespace fs = std::filesystem;
+    const auto root = fs::temp_directory_path() /
+        ("llaminar-core-places-" + std::to_string(::getpid()));
+    const auto write = [&](int cpu, const std::string &leaf, const std::string &value) {
+        fs::create_directories((root / ("cpu" + std::to_string(cpu)) / leaf).parent_path());
+        std::ofstream(root / ("cpu" + std::to_string(cpu)) / leaf) << value << '\n';
+    };
+    // Recorded GB10 layout: no SMT, A725 0-4/10-14, X925 5-9/15-19.
+    const std::vector<long> gb10 = {718, 718, 718, 718, 718, 997, 997, 997, 997, 997,
+                                    731, 731, 731, 731, 731, 1017, 1017, 1017, 1017, 1024};
+    std::vector<int> all;
+    for (int cpu = 0; cpu < 20; ++cpu)
+    {
+        write(cpu, "cpu_capacity", std::to_string(gb10[cpu]));
+        write(cpu, "topology/thread_siblings_list", std::to_string(cpu));
+        all.push_back(cpu);
+    }
+    using Places = std::vector<std::vector<int>>;
+    EXPECT_EQ(llaminar2::MPIBootstrapPhase::capacityOrderedCorePlaces(all, root.string()),
+              (Places{{19}, {15}, {16}, {17}, {18}, {5}, {6}, {7}, {8}, {9},
+                      {10}, {11}, {12}, {13}, {14}, {0}, {1}, {2}, {3}, {4}}));
+    // A narrower rank mask is never widened.
+    EXPECT_EQ(llaminar2::MPIBootstrapPhase::capacityOrderedCorePlaces({0, 1, 5, 6}, root.string()),
+              (Places{{5}, {6}, {0}, {1}}));
+    fs::remove_all(root);
+
+    // SMT host without capacities: libgomp's core order (by first allowed
+    // CPU), siblings kept together and restricted to the allowed mask.
+    for (int core = 0; core < 4; ++core)
+        for (const int cpu : {core, core + 4})
+            write(cpu, "topology/thread_siblings_list", std::to_string(core) + "," + std::to_string(core + 4));
+    EXPECT_EQ(llaminar2::MPIBootstrapPhase::capacityOrderedCorePlaces({7, 6, 5, 4, 3, 2, 1, 0}, root.string()),
+              (Places{{0, 4}, {1, 5}, {2, 6}, {3, 7}}));
+    EXPECT_EQ(llaminar2::MPIBootstrapPhase::capacityOrderedCorePlaces({2, 4, 5}, root.string()),
+              (Places{{2}, {4}, {5}}));
+    EXPECT_TRUE(llaminar2::MPIBootstrapPhase::capacityOrderedCorePlaces({}, root.string()).empty());
+    fs::remove_all(root);
+}
+
 /** @test GB10 workers start on X925 cores; homogeneous hosts keep CPU order. */
 TEST(Test__MPIBootstrap, ClusterWorkersOrderFastCoresFirst)
 {
