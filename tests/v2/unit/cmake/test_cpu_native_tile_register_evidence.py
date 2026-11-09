@@ -1078,7 +1078,7 @@ class PolicyTest(unittest.TestCase):
             CHECKER.compiler_identity("icpx (ICX) 2025.0\n")
 
 
-FAKE_COMPILER = """#!{python} -S -E
+FAKE_COMPILER = """#!{python} -SE
 import os, pathlib, shutil, sys
 here = pathlib.Path(__file__).parent
 args = sys.argv[1:]
@@ -1138,7 +1138,7 @@ if compiling:
         sys.stderr.write((here / "headers.txt").read_text())
 pathlib.Path(value("-MF")).write_text(value("-MT") + ": " + " ".join(deps) + "\\n")
 """
-FAKE_DISASSEMBLER = """#!{python} -S -E
+FAKE_DISASSEMBLER = """#!{python} -SE
 import pathlib, sys
 here = pathlib.Path(__file__).parent
 args = sys.argv[1:]
