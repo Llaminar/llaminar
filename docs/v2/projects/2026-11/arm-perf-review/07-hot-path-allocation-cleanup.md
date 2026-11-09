@@ -138,3 +138,22 @@ the source policy). Dead persistent_state parameter removed.
 - PR #43 = 5922cd1f5: Main RETIRED the unused KernelFactory RoPE cache + two
   dead unregistered test sources flagged by this lane (7d/7a review). The only
   remaining failure in that filter = MoEForbiddenDependencyScan (known base).
+
+## A/B results (2026-11-09, 302318f1e vs 94d7cbe2f, .80, 20c -c8192, s42, n256)
+
+- 35B-nomtp: prefill 47.03→47.13 (+0.20%, jitter); decode 23.395→23.550
+  (**+0.66%** — BEYOND the ±0.05% memo gate; σ≈0.2–0.5% → 3rd ABBA repeat
+  requested). 35B-mtp: prefill −1.62% (A r1 48.73 = outlier rep/jitter),
+  decode +0.31%. 27B-nomtp: P −0.83%, D 0.00%. 27B-mtp: P +0.81%,
+  D −0.28%.
+- Mode assertions ✓ (mtp 1/0 per cell); text byte-identical A vs B (0/257
+  mismatch) ✓.
+- Extra-B forward_graph CSV (9 rows): notable
+  decode_capture_policy allow_graph_replay=false;
+  collectives_graph_capturable=false — DECODE CAPTURES DISABLED under
+  CPU-only/20T (lane to confirm expected; would explain decode-changed/
+  prefill-unchanged). No p50/p95 in bench stdout — latency via PerfStats
+  CSV/timer table if needed.
+- Expected-outcome framing: prefill gain did NOT materialize (+jitter);
+  decode +0.66% on 35B-nomtp is the candidate → repeat or accept-as-noise
+  before reviewer.
