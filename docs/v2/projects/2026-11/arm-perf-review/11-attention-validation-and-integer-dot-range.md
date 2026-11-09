@@ -113,3 +113,16 @@ Proposed options (only with proof):
   EXPECT_DEATH-based → cannot be cited as explicit-abort proof. Preferred
   fix: extend fixture to Rows1/2/4 everywhere (lane doing); else narrow
   evidence claims. UBSan old-code failure/fix report = owner evidence only.
+
+- Fixture extension done at **46c9ffc58** (parent 5c89f981c, test-only): worst-
+  case positive + invalid tail + invalid vector codes each run Rows1/2/4; all
+  assert KilledBySignal(SIGABRT) (terminate handler exits 77). 8/8
+  NEONAttentionMath on M1. R1 evidence SHA = 46c9ffc58.
+- R1 close run STARTED on .80 (Integration NEON_I8MM gcc-14, Unit + preflight
+  + focused: CPUNativeVNNI/NEON/attention/Q16, ExpertTier, PackedWeights,
+  CpuExpertSlot, MoEOverlay residency/migration/protocol/fabric, slot-reuse,
+  seal, writer policy; CUDA/ROCm/MPI/Perf excluded). Status:
+  build/r1-46c9ffc58.status. Then economy window (announced before start).
+- objdump checker handed to arm-sparks (fndiff.py + TU + gcc-14 commands,
+  normalization documented, STRICT=1 keeps immediates; mac result reproduces).
+- R2 being rebased onto 46c9ffc58 locally; outside the reviewed tree.
