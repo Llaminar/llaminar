@@ -395,3 +395,16 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   176; 4/4; proof GNU-14 NEON_I8MM 242/1274 (GNU objdump 2.42); lifecycle 1;
   9/9 cells single=0 grouped=budget 0 mismatches. Owner evidence complete at
   d0c536cd0. Reviewer SOURCE121 (source) pending.
+
+## SOURCE121 FINAL (2026-11-09) — successor scope (SOURCE122)
+
+- P1a nested asm (operand-expression/lambda asm) visitation or rejection +
+  composed controls.
+- P1b source-of-input boundary: reject opaque PCH/module markers +
+  -specs config-driven inputs (reject-before-compile or bound mutation
+  controls; tests for both).
+- P2 relocation field-combination validation (Mach-O r_pcrel/r_length per
+  reloc.h) + ELF malformed table/link/info/addend-slice rejections; controls
+  with unchanged rendering.
+- Precision: asm("nop") ASM_LABEL context; synthetic fixtures (unset
+  type/version/filetype) described accurately; native re-audits separate.
