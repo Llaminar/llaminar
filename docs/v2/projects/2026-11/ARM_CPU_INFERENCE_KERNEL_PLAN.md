@@ -938,6 +938,29 @@ kernel work, nor be quietly omitted from the final objective.
 multi-rank lifecycle/abort/reset/retirement tests; no model required for this
 stage. CPU-only startup must initialize no unavailable accelerator.
 
+**NUMA-less and cache-unpublished Linux ARM hosts.** Intel production hosts
+always publish NUMA node topology and CPUID cache geometry; ARM has no user-mode
+cache-size query, and some ARM Linux kernels publish neither (no
+`CONFIG_NUMA` embedded kernels, QEMU/KVM guests without PPTT cache entries,
+Docker Desktop's linuxkit VM). Observed on the M1 Max VM: `set_mempolicy`
+ENOSYS, no `/sys/devices/system/node`, cache `index*` entries without `size`.
+Inventory now attributes system memory to such a single-package host
+(`assignNonNUMAHostMemory`); serving still stops, precisely, at:
+
+- `CPU shorthand requires observed NUMA affinity` (apply mode), and the
+  CPU backend/allocator's required NUMA binding;
+- `Streaming CPU measurement requires observed aggregate cache coverage`
+  (automatic planning), because no cache size is observable.
+
+Supporting these hosts requires (a) a typed "single memory domain without
+NUMA policy" CPU endpoint through backend binding, allocator placement,
+first-touch proofs and shorthand resolution, with no fake libnuma; (b) a
+measured cache-geometry source (bandwidth/latency plateau probe) when sysfs
+publishes no sizes, never a guessed capacity; (c) a NUMA-less Unit/preflight
+qualification lane. Until then these hosts are explicitly unsupported and fail
+fast; DGX Spark/GB10 and ordinary NUMA arm64 server kernels are the qualified
+ARM serving targets.
+
 ### K — Exact overlays without generic retraining
 
 **Existing owners:** `native_quantised_dispatch/{shape_manifest,format_registry,
