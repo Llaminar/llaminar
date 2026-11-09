@@ -357,3 +357,16 @@ the source policy). Dead persistent_state parameter removed.
   some BF16 coincide); width 0. Gates: Mac 271/271 both ISAs; preflight
   215/215 ×20; gcc/clang x86 syntax OK. Reviewer test-delta pass in flight;
   WSL (5') final = b199ccfa0.
+
+## b199ccfa0 FINAL source ACK (2026-11-09)
+
+- Narrow source-only ACK, no new blocker; parent beffdbe13; ONLY
+  Test__CPURoPEWorkshare.cpp changed (production repair untouched). Four
+  qualifications confirmed source-level (rawBytes all bits + clean-standalone
+  per-cell; PriorPositive real prior call; member-0 width after join, no new
+  barrier; reference comment correct). Driver scope confirmed (1..64,
+  MIN_ROWS out, Q8 rows==1 neg-start only, BASE_NO_STATE); inspected scopes,
+  NOT output authentication. Minor wording limits (not blockers): sleep
+  doesn't prove arrival order; argv[2]=17231 = starts 17231+rows (record as
+  argument/offset). P2 stays source-closed. SOURCE COMPLETE for handover;
+  remaining = WSL (5') only.
