@@ -171,6 +171,24 @@ class CPUCodegenEnvelopeEvidenceTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             CHECKER.require_envelope("NEON_DOTPROD", CHECKER.instruction_counts("\tsdot v0,v1,v2\n\tsmmla v0,v1,v2\n"))
 
+    def test_i8mm_requires_real_dot_and_signed_matrix_only(self) -> None:
+        """I8MM proves both SDOT and SMMLA; mixed-sign/unsigned matrix forms stay rejected."""
+        gnu = "\tsdot\tv0.4s, v1.16b, v2.16b\n\tsmmla\tv0.4s, v1.16b, v2.16b\n"
+        apple = "\tsdot.4s\tv0, v1, v2\n\tsmmla\tv0.4s, v1.16b, v2.16b\n"
+        for assembly in (gnu, apple):
+            CHECKER.require_envelope("NEON_I8MM", CHECKER.instruction_counts(assembly))
+        for missing in ("\tsdot v0.4s,v1.16b,v2.16b\n", "\tsmmla v0.4s,v1.16b,v2.16b\n"):
+            with self.assertRaises(ValueError):
+                CHECKER.require_envelope("NEON_I8MM", CHECKER.instruction_counts(missing))
+        for foreign in ("usmmla", "ummla", "usdot", "sudot"):
+            with self.assertRaises(ValueError):
+                CHECKER.require_envelope("NEON_I8MM", CHECKER.instruction_counts(
+                    gnu + f"\t{foreign} v0.4s,v1.16b,v2.16b\n"))
+        with self.assertRaises(ValueError):
+            CHECKER.require_envelope("NEON", CHECKER.instruction_counts("\tsmmla v0.4s,v1.16b,v2.16b\n"))
+        with self.assertRaises(ValueError):
+            CHECKER.require_envelope("NEON_SVE", CHECKER.instruction_counts(gnu))
+
 
 if __name__ == "__main__":
     unittest.main()

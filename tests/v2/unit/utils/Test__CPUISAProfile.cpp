@@ -65,6 +65,13 @@ TEST(CPUISAProfile, NativeDefaultMatchesRealCapabilities)
     EXPECT_TRUE(cpu_supports_neon_dotprod());
     EXPECT_EQ(resolveCPUISALevel(), ISALevel::NEONDotProd);
     EXPECT_EQ(resolveCPUISALevel("neon-dotprod"), ISALevel::NEONDotProd);
+#if LLAMINAR_COMPILED_WITH_NEON_I8MM
+    // I8MM is a leaf-instruction envelope, not an arithmetic level: the
+    // binary admits the hardware feature but keeps the DotProd identity.
+    EXPECT_TRUE(cpu_supports_neon_i8mm());
+    EXPECT_EQ(compiledCPUISALevel(), ISALevel::NEONDotProd);
+    EXPECT_THROW(resolveCPUISALevel("neon-i8mm"), std::invalid_argument);
+#endif
 #else
     EXPECT_EQ(resolveCPUISALevel(), ISALevel::NEON);
     EXPECT_THROW(resolveCPUISALevel("neon-dotprod"), std::invalid_argument);
@@ -72,6 +79,7 @@ TEST(CPUISAProfile, NativeDefaultMatchesRealCapabilities)
 #else
     EXPECT_FALSE(cpu_supports_neon());
     EXPECT_FALSE(cpu_supports_neon_dotprod());
+    EXPECT_FALSE(cpu_supports_neon_i8mm());
     const auto expected = cpu_supports_avx512() ? ISALevel::AVX512
         : cpu_supports_avx2() ? ISALevel::AVX2 : ISALevel::Scalar;
     EXPECT_EQ(resolveCPUISALevel(), expected);
@@ -120,6 +128,7 @@ TEST(CPUISAProfile, NativeARMCapabilitiesHaveOneAuthority)
     EXPECT_TRUE(capabilities.supports(ARMCPUFeature::ASIMD));
     EXPECT_NO_THROW(capabilities.require(ARMCPUFeature::ASIMD));
     EXPECT_EQ(capabilities.supports(ARMCPUFeature::DotProd), cpu_supports_neon_dotprod());
+    EXPECT_EQ(capabilities.supports(ARMCPUFeature::IntegerMatMul), cpu_supports_neon_i8mm());
     for (const auto feature : {ARMCPUFeature::DotProd, ARMCPUFeature::FP16Arithmetic,
                               ARMCPUFeature::BF16Arithmetic, ARMCPUFeature::IntegerMatMul})
     {

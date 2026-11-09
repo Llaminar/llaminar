@@ -1464,7 +1464,11 @@ it does not qualify the production session runtime's separate ABI requirements.
 It is not a server build or the complete production gate. `LLAMINAR_CPU_ISA=NEON` names a
 compiler envelope, not a complete inference capability. A separate build with
 `-DLLAMINAR_CPU_ISA=NEON_DOTPROD` exercises signed dot-product instructions on
-hardware that advertises them. Incompatible architecture/ISA selections fail;
+hardware that advertises them, and `-DLLAMINAR_CPU_ISA=NEON_I8MM` adds the
+Int8 matrix-multiply (SMMLA) extension, for example on DGX Spark (GB10). An
+I8MM binary refuses to start without native I8MM; its arithmetic level and
+runtime spelling remain `neon-dotprod`, because SMMLA publishes the same exact
+integer sums. Incompatible architecture/ISA selections fail;
 runtime diagnostic requests (`LLAMINAR_ISA_LEVEL=neon` or `neon-dotprod`) must
 also fit the compiled envelope and native capabilities. They never downgrade
 an unsupported request to scalar. The
