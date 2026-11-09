@@ -23,3 +23,13 @@ Status: OPEN (2026-11-09; queued via R2 C4 per-encoding width evidence).
   S=4 on GNU-14 (6-33 spills) — likely addressing/load-schedule redesign.
 - Same gates as C4: witness census both compilers Rows=1=0 + grouped budgets
   unchanged + byte oracle + engine A/B (if the widths land) + reviewer.
+
+## Scope correction (2026-11-09, perf-lane step-1 auth @ 777f7a52a)
+
+- S=4 means FOUR COLUMN STRIPS (16 output columns) in the Rows=1 PANEL
+  program — NOT four grouped rows. R2 panels installed ONLY for Rows=1
+  SDOT / I8MM-single-row; grouped row/pair paths remain S1. The reported
+  spills (NibbleLUT GNU 6-33; Q5_K AppleClang BackendNative 4) = PANEL
+  (column-strip) pressure. Idea-31 v2 (panel scope) incoming; draft v1's
+  4-row reading is superseded. FP16 chain diff vs 39c at the real base =
+  EMPTY (verified) → FP16 plan base gate PASSED.
