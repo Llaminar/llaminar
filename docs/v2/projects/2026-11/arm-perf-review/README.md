@@ -144,3 +144,27 @@ After i8mm merge (same tile / post-merge):
   byte-identical. OPERATOR DIRECTION: routine base rebases don't trigger
   rebuilds/regates → d730777bd-armed GB10 gates valid; run at 7d1a94479 if
   not started. Active anchors: base 07d4f2085; tip 7d1a94479.
+
+## DGX station CPU test result (2026-11-09) — new hardware datapoint
+
+- Host: NVIDIA GB300 station, **Grace / Neoverse-V2**, 72 cores 1 socket
+  1T/core, PAGESIZE=65536 (64K), NUMA 9 nodes (node0 = all CPUs + 506GB;
+  nodes 1-8 memory-only). Features: sve sve2 svei8mm i8mm bf16 svebf16 fp16
+  sha3 sha512 sm3 sm4 paca pacg bti → I8MM YES, SVE2 YES, SMMLA NO (no SME).
+- Run: 39c24d8b4 (content-equivalent to tip 7d1a94479 for CPU-only; CUDA
+  stack excluded; operator no-regate direction applies), DEVcontainer gcc-14
+  + cmake + ninja + ccache, Integration CPU-only SHARED_CORE=ON, .venv (no
+  model fetch), build EXIT=0 (3177 targets, ~6 min).
+- UNIT 952/981 pass/29 fail (151s): base 9 + env 15 (64K-page assumption +
+  CPU-less NUMA nodes: mmap 'page-aligned and nonzero', first-touch
+  placement, capacity-0/NULL alloc, estimator byte equality) + fixture-
+  missing 5 (ModelLoaderRowSlice [needs qwen2.5-0.5b q4_0 GGUF; NOT on
+  station] + ROCm trainer CSV ×4). 40 initial false failures = missing
+  python deps → cleared via requirements into .venv.
+- PREFLIGHT 2243/2344 (685s): 45 = 64K-page mmap (×581), 16 = MPI hwloc
+  bind (NUMA), 14 = first-touch, 26 = owner base + env arena geometry. NO
+  arithmetic/NaN regression evidence. No source regressions.
+- Envelope built = NEON default (LLAMINAR_COMPILED_WITH_NEON_I8MM=0);
+  NEON_I8MM explicit supported + hardware capable → FOLLOW-UP OFFERED:
+  -DLLAMINAR_CPU_ISA=NEON_I8MM gate (real SMMLA datapoint on new CPU).
+- VOCAB-only GGUFs only → smoke skipped (no fetch allowed).
