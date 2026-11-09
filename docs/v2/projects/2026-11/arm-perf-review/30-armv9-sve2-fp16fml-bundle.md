@@ -44,3 +44,21 @@ decision; plan-first doc.
 3. Verify X925 SVE2/BF16/fp16fml support on .80 cpuinfo before scoping.
 4. Gate/evidence: extend the register witness + ISA census + byte oracle
    + per-ISA compile identity + ProductionTestPreflight cells.
+
+## DGX probe (2026-11-09) — VL = 128 CAPPED on Grace + GDN native ADMITS
+
+- COMPILER: GCC13 + devcontainer GCC14.2 accept ALL requested -march
+  spellings; census identical. Intrinsics: svdot_s32/u32 w/ SVE2; svmmla_s32
+  needs +i8mm; svbfdot/svbfmmla/svbfmlalb need +bf16; SVE2 svmlalb_f32 (FP16
+  widening) WITHOUT +fp16fml; NEON vfmlalq_low_f16 default under armv9-a.
+- VL: Grace REALLY capped at 128-bit on this OS/device: GET_VL=16,
+  svcntw=4; SET_VL 32/64/256/8192 + aligned max 65520 all return 16;
+  unaligned 65535 EINVAL. HWCAP: SVE,SVE2,SVEI8MM,SVEBF16,I8MM,BF16 all 1.
+  -> NO honest SVE256 timings; the 2x-width hypothesis DOES NOT HOLD on
+  Grace. Verify X925/GB10 VL (arm-sparks) before any SVE2 lane.
+- GDN ANSWER (user question): **quantized GDN source is ADMITTED under
+  LLAMINAR_GDN_PROJECTION_ARITHMETIC=native** (plan: 'Candidates: 1 admitted
+  (0 capacity-rejected)', Strategy: single, plan written) — the README
+  rejection (half-operand policies) is scoped; 'native' runs quantized GDN.
+  Full log retained by the DGX addon (scratch-sve2/*).
+- PMU inaccessible (perf_event_paranoid=4) -> estimated cycles only.
