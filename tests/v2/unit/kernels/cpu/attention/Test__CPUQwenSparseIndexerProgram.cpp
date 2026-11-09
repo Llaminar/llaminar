@@ -211,13 +211,15 @@ TEST(CPUQwenSparseIndexerProgram,NativeRepresentationCastsRetainIndependentIEEEW
     }
     authenticateCast<QwenSparseScalar::FP32>(inputs);authenticateCast<QwenSparseScalar::FP16>(inputs);authenticateCast<QwenSparseScalar::BF16>(inputs);
 }
-/** @test Actual query/pool preparation retains independently rounded bytes across representation/rotary widths and exact alias. */
-TEST(CPUQwenSparseIndexerProgram,OriginalRepresentationAndPartialRopeMatchIndependentBytes)
+/** @brief Prove query/pool preparation retains independently rounded bytes across rotary
+ * widths, rows and exact alias for one original representation. Each representation is
+ * its own test so the strict Debug build stays inside the per-test budget. */
+void originalRepresentationAndPartialRope(QwenSparseScalar rep)
 {
     ::llaminar2::cpu::qsa_native::requireNativeProgram(activeISALevel());TeamPolicy team;
     constexpr std::size_t guard=8;constexpr float canary=919.25f,epsilon=1.0e-6f;
     std::map<std::pair<QwenSparseScalar,int>,ReferenceNormalization>normalizations;
-    for(auto rep:{QwenSparseScalar::FP32,QwenSparseScalar::FP16,QwenSparseScalar::BF16})for(int rotary=2;rotary<=128;rotary+=2)for(int rows:{1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,31,33})for(bool analytic:{false,true})
+    for(int rotary=2;rotary<=128;rotary+=2)for(int rows:{1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,31,33})for(bool analytic:{false,true})
     {
         if(analytic&&rotary!=64)continue;
         SCOPED_TRACE(::testing::Message()<<"representation="<<int(rep)<<" rotary="<<rotary<<" rows="<<rows<<" analytic="<<analytic);
@@ -261,6 +263,12 @@ TEST(CPUQwenSparseIndexerProgram,OriginalRepresentationAndPartialRopeMatchIndepe
         EXPECT_EQ(query,originalQuery);EXPECT_EQ(raw,originalRaw);EXPECT_EQ(norm,originalNorm);EXPECT_EQ(cosine,originalCosine);EXPECT_EQ(sine,originalSine);
     }
 }
+/** @test FP32 query/pool preparation bytes. */
+TEST(CPUQwenSparseIndexerProgram,OriginalRepresentationAndPartialRopeMatchIndependentBytesFP32){originalRepresentationAndPartialRope(QwenSparseScalar::FP32);}
+/** @test FP16 query/pool preparation bytes. */
+TEST(CPUQwenSparseIndexerProgram,OriginalRepresentationAndPartialRopeMatchIndependentBytesFP16){originalRepresentationAndPartialRope(QwenSparseScalar::FP16);}
+/** @test BF16 query/pool preparation bytes. */
+TEST(CPUQwenSparseIndexerProgram,OriginalRepresentationAndPartialRopeMatchIndependentBytesBF16){originalRepresentationAndPartialRope(QwenSparseScalar::BF16);}
 /** @test Actual FP32 mean/RoPE edges do not become cross-statement FMA after GNU inlining. */
 TEST(CPUQwenSparseIndexerProgram,FP32MeanAndRopeCastEdgesCannotContractAfterInlining)
 {

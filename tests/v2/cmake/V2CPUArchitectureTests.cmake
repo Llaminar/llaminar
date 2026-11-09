@@ -674,10 +674,12 @@ v2_add_core_free_test(V2_Integration_CPUQwenSparseRepresentationCast
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
         --gtest_filter=CPUQwenSparseIndexerProgram.NativeRepresentationCastsRetainIndependentIEEEWordBoundaries
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact Regression)
-v2_add_core_free_test(V2_Integration_CPUQwenSparseIndexerRepresentation
-    COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
-        --gtest_filter=CPUQwenSparseIndexerProgram.OriginalRepresentationAndPartialRopeMatchIndependentBytes
-    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact Regression)
+foreach(_indexer_rep IN ITEMS FP32 FP16 BF16)
+    v2_add_core_free_test(V2_Integration_CPUQwenSparseIndexerRepresentation${_indexer_rep}
+        COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
+            --gtest_filter=CPUQwenSparseIndexerProgram.OriginalRepresentationAndPartialRopeMatchIndependentBytes${_indexer_rep}
+        LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact Regression)
+endforeach()
 v2_add_core_free_test(V2_Integration_CPUQwenSparseExactOriginalBasis
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
         --gtest_filter=CPUQwenSparseExactBasis.OriginalNonsymmetricBasisAndQueryAliasMatchOrderedFMABytes
