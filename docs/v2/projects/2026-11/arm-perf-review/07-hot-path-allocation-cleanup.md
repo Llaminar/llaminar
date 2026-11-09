@@ -247,3 +247,13 @@ the source policy). Dead persistent_state parameter removed.
   20d85fa31 then edits only compiled code. New tip SHA follows; production
   deltas unchanged. Dead DebugEnv threshold fields = Main follow-up
   (handover list; lane didn't remove).
+
+## Retired — tip 407347f6c (2026-11-09)
+
+- 8 commits on 425002104; force-push from 8ba25fc28. Bottom commit
+  36027718a = retire Perf__RMSNormParallelSweep.cpp (−440, git grep empty);
+  2f635c796 = 7d touching only registered ThreadSweep; other 6 content-
+  identical. `git diff 8ba25fc28 407347f6c` = one file deleted. Rebase/
+  equivalence + Mac portability carry over (file never built). WSL (5') at
+  407347f6c; ThreadSweep the only RMSNorm perf cell; dead DebugEnv
+  LLAMINAR_RMSNORM_* fields = Main follow-up (handover).
