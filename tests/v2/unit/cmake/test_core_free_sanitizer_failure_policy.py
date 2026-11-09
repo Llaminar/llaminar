@@ -4,10 +4,12 @@
 Only CMake/CTest metadata is configured: no runtime compiler, model or accelerator
 is needed. A minimal directory registrar exercises the wrapper interface, not a
 replacement native dependency or a claim that the complete engine gate ran.
-Named CPU-team resources must follow the same registration/omission boundary.
+Named CPU-team resources and whole-team CTest slots must follow the same
+registration/omission boundary.
 """
 from pathlib import Path
 import argparse
+import os
 import json
 import shutil
 import subprocess
@@ -50,6 +52,7 @@ endfunction()
                 "enable_testing()\n" + ("set(V2_PERF_TESTS_ONLY TRUE)\n" if perf_only else "") + registrar +
                 f'include("{MODULE.as_posix()}")\n'
                 'v2_add_core_free_test(PolicyProbe COMMAND "${CMAKE_COMMAND}" -E true LABELS V2 Unit DeviceFree RESOURCE_LOCK OriginalCPUTeam)\n'
+                'v2_add_core_free_test(WholeTeamProbe WHOLE_TEAM COMMAND "${CMAKE_COMMAND}" -E true LABELS V2 Unit DeviceFree)\n'
             )
             configured = subprocess.run(
                 [cmake, "-S", str(source), "-B", str(build), "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM:FILEPATH={ninja}"],
@@ -66,12 +69,18 @@ endfunction()
                 self.assertTrue(wrapped, "only the full directory registrar owns perf-only omission")
                 self.assertEqual(tests, [])
                 return {}
-            self.assertEqual(len(tests), 1)
-            test = tests[0]
-            self.assertEqual(test["name"], "PolicyProbe")
-            self.assertEqual(test["command"][1:], ["-E", "true"])
-            self.assertTrue(Path(test["command"][0]).is_file())
-            return {prop["name"]: prop["value"] for prop in test["properties"]}
+            self.assertEqual(sorted(test["name"] for test in tests), ["PolicyProbe", "WholeTeamProbe"])
+            by_name = {test["name"]: {prop["name"]: prop["value"] for prop in test["properties"]} for test in tests}
+            for test in tests:
+                self.assertEqual(test["command"][1:], ["-E", "true"])
+                self.assertTrue(Path(test["command"][0]).is_file())
+            # Whole-team sweeps declare every logical CPU as CTest slots;
+            # ordinary core-free tests keep the directory's default accounting.
+            self.assertEqual(by_name["WholeTeamProbe"]["PROCESSORS"], os.cpu_count())
+            if not wrapped:
+                self.assertNotIn("PROCESSORS", by_name["PolicyProbe"])
+            self.assertEqual(by_name["WholeTeamProbe"]["TIMEOUT"], 30.0)
+            return by_name["PolicyProbe"]
 
     def check(self, wrapped: bool) -> None:
         """Require fatal diagnostics without modifying arithmetic or source-owned timeout."""

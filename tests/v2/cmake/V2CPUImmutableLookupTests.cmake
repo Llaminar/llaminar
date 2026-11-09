@@ -15,14 +15,14 @@ add_executable(v2_test_cpu_immutable_lookup_rows
 target_compile_features(v2_test_cpu_immutable_lookup_rows PRIVATE cxx_std_23)
 target_include_directories(v2_test_cpu_immutable_lookup_rows PRIVATE "${V2_CPU_LOOKUP_ROOT}/src/v2")
 target_link_libraries(v2_test_cpu_immutable_lookup_rows PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX)
-v2_add_core_free_test(V2_Unit_CPUImmutableLookupRows
+v2_add_core_free_test(V2_Unit_CPUImmutableLookupRows WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_test_cpu_immutable_lookup_rows>
     LABELS V2 Unit CPU DeviceFree ImmutableLookup)
 v2_add_core_free_test(V2_Integration_CPUImmutableLookupNativePayloads
     COMMAND $<TARGET_FILE:v2_test_cpu_immutable_lookup_rows>
         --gtest_filter=CPUImmutableLookupRows.FloatingAllOriginalPayloads:CPUImmutableLookupRows.FloatingIndependentNonfiniteFringes:CPUImmutableLookupRows.IQ4OriginalCodebookScalesAndPartialRows
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree ImmutableLookup Native ByteExact Regression)
-v2_add_core_free_test(V2_Integration_CPUImmutableLookupOriginalRows
+v2_add_core_free_test(V2_Integration_CPUImmutableLookupOriginalRows WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_test_cpu_immutable_lookup_rows>
         --gtest_filter=CPUImmutableLookupRows.EverySourceAndPositiveTeamRetainSerialOriginalRows:CPUImmutableLookupRows.RetainedNativePublicationCompletesBeforeOutputReuse
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree ImmutableLookup AllFormats ByteExact Regression)

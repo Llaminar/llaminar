@@ -201,7 +201,7 @@ v2_add_core_free_test(V2_Integration_CPURMSNormInt32Completion
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare>
         --gtest_filter=CPUInt32RMSNorm.EmptyRetainedSummaryCompletesBeforeRetirement:CPUInt32RMSNorm.SmallRetainedSummaryHasOnePublicationOwner
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm INT32 Ownership Workshare Regression)
-v2_add_core_free_test(V2_Integration_CPURMSNormInt32AllPositiveWorkers
+v2_add_core_free_test(V2_Integration_CPURMSNormInt32AllPositiveWorkers WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare>
         --gtest_filter=CPUInt32RMSNorm.AllPositiveWorkersThroughTenRetainOriginalSummaries
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm INT32 ByteExact Regression)
@@ -224,7 +224,7 @@ v2_add_core_free_test(V2_Integration_CPURMSNormInt32PublicationNumeric
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare>
         --gtest_filter=CPUInt32RMSNormPublication.NonfiniteAndUnrepresentableRowsAreFatalNotZeroed
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm INT32 Numerical Regression)
-v2_add_core_free_test(V2_Integration_CPURMSNormInt32PublicationAllPositiveWorkers
+v2_add_core_free_test(V2_Integration_CPURMSNormInt32PublicationAllPositiveWorkers WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare>
         --gtest_filter=CPUInt32RMSNormPublication.AllPositiveWorkersThroughTenRetainNativeStagedFusedBytesAndGuards
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm INT32 ByteExact Regression)
@@ -240,7 +240,7 @@ v2_add_core_free_test(V2_Integration_CPURMSNormEmptyCompletion
 v2_add_core_free_test(V2_Integration_CPURMSNormOriginalFloatingRows
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=*FloatingMatricesPreserveOriginalRowsAndSerialBytes
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm ByteExact)
-v2_add_core_free_test(V2_Integration_CPURMSNormAllPositiveWorkers
+v2_add_core_free_test(V2_Integration_CPURMSNormAllPositiveWorkers WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=*AllPositiveWorkersThroughTenRetainSerialBytes
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm ByteExact)
 v2_add_core_free_test(V2_Integration_CPURMSNormOriginalBankAliases
@@ -255,7 +255,7 @@ v2_add_core_free_test(V2_Integration_CPURMSNormQ16Expansion
 v2_add_core_free_test(V2_Integration_CPURMSNormQ16EmptyCompletion
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=*Q16EmptyRetainedInvocationCompletes
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Q16 Ownership Regression)
-v2_add_core_free_test(V2_Integration_CPURMSNormQ16AllPositiveWorkers
+v2_add_core_free_test(V2_Integration_CPURMSNormQ16AllPositiveWorkers WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_test_cpu_rmsnorm_workshare> --gtest_filter=*Q16AllPositiveWorkersThroughTenRetainSerialBytes
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree RMSNorm Q16 ByteExact)
 v2_add_core_free_test(V2_Integration_CPURMSNormQ16NumericalProgram
@@ -500,10 +500,10 @@ target_compile_features(v2_test_cpu_softmax PRIVATE cxx_std_20)
 target_include_directories(v2_test_cpu_softmax PRIVATE
     "${V2_CPU_ARCHITECTURE_ROOT}/src/v2" "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2")
 target_link_libraries(v2_test_cpu_softmax PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX)
-v2_add_core_free_test(V2_Unit_CPUSoftmax
+v2_add_core_free_test(V2_Unit_CPUSoftmax WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_test_cpu_softmax> --gtest_filter=-*AllPositiveWorkers*
     LABELS V2 Unit CPU DeviceFree Softmax ByteExact)
-v2_add_core_free_test(V2_Integration_CPUSoftmax
+v2_add_core_free_test(V2_Integration_CPUSoftmax WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_test_cpu_softmax>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Softmax ByteExact)
 v2_add_core_free_test(V2_Integration_CPUSoftmaxPolynomialLinearTerm
@@ -527,7 +527,7 @@ v2_add_core_free_test(V2_Integration_CPUSoftmaxFP16FragmentAlignment
 v2_add_core_free_test(V2_Integration_CPUSoftmaxGeometry
     COMMAND $<TARGET_FILE:v2_test_cpu_softmax> --gtest_filter=*OriginalGeometryRejectsBeforeMutation
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Softmax Regression)
-v2_add_core_free_test(V2_Integration_CPUSoftmaxRetainedOriginalRows
+v2_add_core_free_test(V2_Integration_CPUSoftmaxRetainedOriginalRows WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_test_cpu_softmax> --gtest_filter=*AllPositiveWorkersRetainOriginalSerialRows
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Softmax ByteExact Regression)
 v2_add_core_free_test(V2_Integration_CPUSoftmaxEmptyCompletion
@@ -552,10 +552,10 @@ target_compile_features(v2_test_cpu_tq_rotation PRIVATE cxx_std_20)
 target_include_directories(v2_test_cpu_tq_rotation PRIVATE
     "${V2_CPU_ARCHITECTURE_ROOT}/src/v2" "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2")
 target_link_libraries(v2_test_cpu_tq_rotation PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX)
-v2_add_core_free_test(V2_Unit_CPUTQRotation
+v2_add_core_free_test(V2_Unit_CPUTQRotation WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_test_cpu_tq_rotation> --gtest_filter=-*AllPositiveWorkers*
     LABELS V2 Unit CPU DeviceFree Attention TurboQuant Rotation ByteExact)
-v2_add_core_free_test(V2_Integration_CPUTQRotation
+v2_add_core_free_test(V2_Integration_CPUTQRotation WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_test_cpu_tq_rotation>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention TurboQuant Rotation ByteExact)
 v2_add_core_free_test(V2_Integration_CPUTQRotationFringes
@@ -567,7 +567,7 @@ v2_add_core_free_test(V2_Integration_CPUTQRotationStorageAdmission
 v2_add_core_free_test(V2_Integration_CPUTQRotationFiniteVerifier
     COMMAND $<TARGET_FILE:v2_test_cpu_tq_rotation> --gtest_filter=*NonfiniteVerifierObservationsFailClosed
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention TurboQuant Rotation Regression)
-v2_add_core_free_test(V2_Integration_CPUTQRotationOriginalHeads
+v2_add_core_free_test(V2_Integration_CPUTQRotationOriginalHeads WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_test_cpu_tq_rotation> --gtest_filter=*AllPositiveWorkersRetainOriginalSerialHeadBytes
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention TurboQuant Rotation ByteExact)
 
@@ -697,7 +697,7 @@ v2_add_core_free_test(V2_Integration_CPUQwenSparseIndexerNumeric
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
         --gtest_filter=CPUQwenSparseLifetime.ConsumedIndexerNumericCorruptionIsFatalNotClamped
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse Numeric Regression)
-v2_add_core_free_test(V2_Integration_CPUQwenSparseAllPositiveWorkers
+v2_add_core_free_test(V2_Integration_CPUQwenSparseAllPositiveWorkers WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
         --gtest_filter=CPUQwenSparseLifetime.AllPositiveWorkersRetainOriginalSerialRowsAndGuards
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact ThreadBudget)
@@ -706,7 +706,7 @@ v2_add_core_free_test(V2_Integration_CPUQwenSparseAllPositiveWorkers
 # other; it does not reduce workers or cap ordinary build/CTest parallelism.
 foreach(_indexer_rep IN ITEMS FP32 FP16 BF16)
     foreach(_indexer_tail RANGE 0 3)
-        v2_add_core_free_test(V2_Integration_CPUQwenSparseIndexer${_indexer_rep}Tail${_indexer_tail}AllPositiveWorkers
+        v2_add_core_free_test(V2_Integration_CPUQwenSparseIndexer${_indexer_rep}Tail${_indexer_tail}AllPositiveWorkers WHOLE_TEAM
             COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
                 "--gtest_filter=OriginalInputs/CPUQwenSparseIndexerTotality.NativeRowsAndWorkers/${_indexer_rep}_Tail${_indexer_tail}"
             LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact ThreadBudget Regression
@@ -736,10 +736,10 @@ target_compile_features(v2_test_cpu_tq_attention PRIVATE cxx_std_20)
 target_include_directories(v2_test_cpu_tq_attention PRIVATE
     "${V2_CPU_ARCHITECTURE_ROOT}/src/v2" "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2")
 target_link_libraries(v2_test_cpu_tq_attention PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX)
-v2_add_core_free_test(V2_Unit_CPUTQAttention
+v2_add_core_free_test(V2_Unit_CPUTQAttention WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_test_cpu_tq_attention> --gtest_filter=-*AllPositiveWorkers*
     LABELS V2 Unit CPU DeviceFree Attention TurboQuant ByteExact)
-v2_add_core_free_test(V2_Integration_CPUTQAttention
+v2_add_core_free_test(V2_Integration_CPUTQAttention WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_test_cpu_tq_attention>
     LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention TurboQuant ByteExact)
 v2_add_core_free_test(V2_Integration_CPUTQAttentionStorageAdmission
@@ -983,10 +983,10 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     target_include_directories(v2_test_native_neon_execution PRIVATE
         "${V2_CPU_ARCHITECTURE_ROOT}/src/v2" "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2")
     target_link_libraries(v2_test_native_neon_execution PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX)
-    v2_add_core_free_test(V2_Unit_CPUNativeNEONExecution
+    v2_add_core_free_test(V2_Unit_CPUNativeNEONExecution WHOLE_TEAM
         COMMAND $<TARGET_FILE:v2_test_native_neon_execution>
         LABELS V2 Unit CPU NEON DeviceFree NativeQuantised Numerics ByteExact)
-    v2_add_core_free_test(V2_Integration_CPUNativeNEONExecution
+    v2_add_core_free_test(V2_Integration_CPUNativeNEONExecution WHOLE_TEAM
         COMMAND $<TARGET_FILE:v2_test_native_neon_execution>
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree NativeQuantised Numerics ByteExact AllFormats)
     v2_add_core_free_test(V2_Integration_CPUProjectionPublicationStorageAliases
@@ -1013,11 +1013,11 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     target_include_directories(v2_test_native_neon_projection_batch PRIVATE
         "${V2_CPU_ARCHITECTURE_ROOT}/src/v2" "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2")
     target_link_libraries(v2_test_native_neon_projection_batch PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX)
-    v2_add_core_free_test(V2_Unit_CPUNativeNEONProjectionBatch
+    v2_add_core_free_test(V2_Unit_CPUNativeNEONProjectionBatch WHOLE_TEAM
         COMMAND $<TARGET_FILE:v2_test_native_neon_projection_batch>
             --gtest_filter=-*AllPositiveWorkersThroughTen*
         LABELS V2 Unit CPU NEON DeviceFree NativeQuantised Numerics ByteExact)
-    v2_add_core_free_test(V2_Integration_CPUNativeNEONProjectionBatch
+    v2_add_core_free_test(V2_Integration_CPUNativeNEONProjectionBatch WHOLE_TEAM
         COMMAND $<TARGET_FILE:v2_test_native_neon_projection_batch>
         LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree NativeQuantised Numerics ByteExact AllFormats)
     v2_add_core_free_test(V2_Integration_CPUNativeNEONEmptyWorkshare
