@@ -152,7 +152,7 @@ namespace llaminar2::cpu::native_quantised
                 {"m", std::to_string(rows)}, {"n", std::to_string(d.N)},
                 {"policy_n", std::to_string(d.policy_n ? d.policy_n : cpuNativeQuantisedSerialEquivalentPolicyN(d.N))},
                 {"k", std::to_string(d.packed->K)}, {"codebook", std::to_string(d.packed->codebook_id)},
-                {"purpose", d.purpose == ProjectionRowsPurpose::Prefill ? "prefill" : "decode"},
+                {"purpose", projectionRowsPurposeName(d.purpose)},
                 {"isa", isa},
                 // ARM register-K tiles traverse full K: one K tile per output owner.
                 {"k_tiles", "1"}, {"k_tile_blocks", std::to_string(d.packed->blocks_per_row)},
