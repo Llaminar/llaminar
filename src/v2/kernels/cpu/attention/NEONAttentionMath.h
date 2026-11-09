@@ -6,9 +6,10 @@
  * packing keys or mirroring decoded heads. Floating dots retain two four-lane
  * FMA chains and one fixed fold; weighted updates retain original increasing-row
  * FMA order. Integer dots accumulate in int32 under a typed Q16ReductionBound
- * whose closed form makes every partial sum exact; a query code outside the
- * bound is fatal at the point of use, never an exception that could strand a
- * worker team. Spans are synchronous borrows, not capacity or cache-lease proofs.
+ * whose closed form makes every partial sum exact. Nonfinite weights and query
+ * codes outside the bound are fatal at the point of use, never exceptions that
+ * could strand a worker team. Spans are synchronous borrows, not capacity or
+ * cache-lease proofs.
  */
 #pragma once
 #if !defined(__aarch64__) || !defined(__ARM_NEON)
@@ -171,9 +172,18 @@ inline void accumulate(std::span<float>output,const std::array<std::span<const U
     for(std::size_t row=0;row<Rows;++row)
     {
         requireSpan(values[row]);
-        if(values[row].size()!=output.size()||!std::isfinite(weights[row])||
+        if(values[row].size()!=output.size()||
             overlaps(output.data(),output.size_bytes(),values[row].data(),values[row].size_bytes()))
-            throw std::invalid_argument("CPU native attention requires disjoint complete value/numerator banks and finite weights");
+            throw std::invalid_argument("CPU native attention requires disjoint complete value/numerator banks");
+    }
+    {
+        // w-w is +0 exactly for finite w and NaN for NaN/Inf; one vector test
+        // covers every row before the first numerator write.
+        float lanes[4]={0.0f,0.0f,0.0f,0.0f};
+        for(std::size_t row=0;row<Rows;++row)lanes[row]=weights[row];
+        const auto w=vld1q_f32(lanes);
+        if(vminvq_u32(vceqq_f32(vsubq_f32(w,w),vdupq_n_f32(0.0f)))==0)
+            rejectAttentionData("nonfinite attention weight");
     }
     std::size_t coordinate=0;
     for(;coordinate+4<=output.size();coordinate+=4)
