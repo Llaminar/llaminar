@@ -311,6 +311,7 @@ namespace
                      */
                     uint32_t A_frag_all[WM][4][4];
                     float sa_all[WM][2][4];
+#if !(defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200)
 #pragma unroll
                     for (int k = 0; k < 4; ++k)
                     {
@@ -342,9 +343,45 @@ namespace
                         }
                     }
 
+#endif
 #pragma unroll
                     for (int k = 0; k < 4; ++k)
                     {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+                        // 12.x: load this K step's A fragments and scales just
+                        // before their MMAs instead of all four up front, so at
+                        // most one slice (8 + 4 registers) is live beside the
+                        // accumulators. Every accumulator still receives its
+                        // contributions in the same k, wj, wi order.
+                        {
+                            const int k_offset = k * 32;
+                            const int scale_idx = hi * 4 + k;
+#pragma unroll
+                            for (int wi = 0; wi < WM; ++wi)
+                            {
+                                const int a_row_base =
+                                    wr * WARP_M + wi * 16;
+                                load_ldmatrix_a_m16n8k32(
+                                    A_frag_all[wi][k],
+                                    reinterpret_cast<const int *>(
+                                        &smem_A[
+                                            a_row_base * BK128_STRIDE +
+                                            k_offset]),
+                                    BK128_STRIDE / 4,
+                                    lane_id);
+
+                                const int local_row0 =
+                                    a_row_base + gid;
+                                sa_all[wi][0][k] =
+                                    smem_sa[
+                                        local_row0 * 8 + scale_idx];
+                                sa_all[wi][1][k] =
+                                    smem_sa[
+                                        (local_row0 + 8) * 8 +
+                                        scale_idx];
+                            }
+                        }
+#endif
                         const int b_k_offset =
                             hi * 128 + k * 32;
                         const int scale_idx_b = hi * 4 + k;
