@@ -813,8 +813,7 @@ namespace llaminar2
                     input.native_context_preparation->requireSelectedDevice(input.device);
                     const auto* resource=original.find({input.world_rank,input.device});
                     if(!resource)throw std::logic_error("Native source omitted original GPU observation");
-                    input.device_total_bytes=resource->resource().total_bytes;
-                    input.device_free_bytes=resource->resource().admission_available_bytes;
+                    input.adoptDeviceResource(resource->resource());
                 }
                 if(input.associated_host_memory){
                     const auto* host=original.find({input.world_rank,DeviceId::cpu()});
