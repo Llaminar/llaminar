@@ -853,11 +853,25 @@ namespace llaminar2
                 EXPECT_EQ(projection.destination_bytes.data(), root);
                 EXPECT_FALSE(packed->publicationSealed());
                 EXPECT_DEATH((void)packed->readView(), "not admitted");
+                // Epoch-distinct payload with in-range IQ3_S coefficient words
+                // (<= 15) in every unit; only epoch 3 then corrupts one word.
                 std::fill(projection.destination_bytes.begin(), projection.destination_bytes.end(),
                     static_cast<std::uint8_t>(epoch));
-                // IQ3_S coefficient words must stay <= 15: 0x0303 has reserved bits.
+                const std::size_t units = std::size_t(packed->N_padded / 64) * std::size_t(packed->blocks_per_row);
+                const auto secondary = [&](std::size_t unit) {
+                    return projection.destination_bytes.data() + unit * std::size_t(packed->interleaved_block_stride) +
+                        std::size_t(packed->data_stride) + 256;
+                };
+                for (std::size_t unit = 0; unit < units; ++unit)
+                    for (int column = 0; column < 64; ++column)
+                    {
+                        const std::uint16_t coefficient = static_cast<std::uint16_t>(epoch + column % 3);
+                        std::memcpy(secondary(unit) + column * 2, &coefficient, sizeof(coefficient));
+                    }
                 if (epoch == 3)
                 {
+                    const std::uint16_t reserved = 0x0010;
+                    std::memcpy(secondary(units / 2) + 17 * 2, &reserved, sizeof(reserved));
                     EXPECT_THROW(projection.engine->admitCPUNativeQuantisedPublication(), std::invalid_argument);
                     EXPECT_FALSE(packed->publicationSealed());
                     continue;
