@@ -44,3 +44,24 @@ Proposed options (only with proof):
 
 - Focused regressions: alias/geometry mutation tests still fail if checks are
   dropped; int32 overflow witness at large head_dim for 11b.
+
+## Addon-lane decisions (2026-11-09)
+
+- 11b GATE SATISFIED: limit(T) = min(2047, floor(INT32_MAX/(32768·T))), T =
+  min(head_dim, block_elems); every integer reduction runs under
+  blocks_per_head==1 (head_dim ≤ block_elems); multi-block = per-block INT32
+  → FP32 sum, NO cross-block INT32 sum; worst cases 2,139,095,040 (T=256,
+  limit 255) … 2,146,435,072 (T=32) ≤ INT32_MAX. Plan: typed
+  cpu::Q16ReductionBound as single authority; NEON → INT32 (vmlal); INT64
+  deleted.
+- 11a measurement (M1, FP16 cache, 4-row groups, 4096 rows, L2-resident):
+  dot checks +3/+6/+11% at head_dim 256/128/64; accumulate +5/+10/+20%.
+  Vectorized finite check ~0.6 ns/call → kept inside accumulate, FATAL +
+  noexcept (stronger than a throw).
+- SCOPE DECISION (arm-perf 2026-11-09): full FA invocation admission (a) —
+  ISA-neutral cold admission (Q/K/V/O banks, disjointness, head width) on
+  decode/batch/partitioned/context-parallel/Q16 entries; x86 gains it too
+  (today x86 has NO buffer admission); NEON helpers become unchecked-admitted
+  (debug asserts). Structure: R1 = C1(03) + C2a(11b) + C2b(fatal finite
+  check); R2 = C2c(FA admission) + C3/C4(04). R2 shared code validated via
+  WSL x86 gate + Mac portability + GB10 attention parity/engine.
