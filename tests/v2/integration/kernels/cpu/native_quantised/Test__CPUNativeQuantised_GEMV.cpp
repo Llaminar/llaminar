@@ -1795,8 +1795,11 @@ namespace
                         static_cast<float>((static_cast<int>(i % 17) - 8)) /
                         32.0f;
                     actual.mutable_data()[i] = prior[i];
+                    // Canonical epilogue: fma(alpha, product, round(beta*prior)),
+                    // then the separately rounded bias pass.
+                    volatile float scaled_prior = beta * prior[i];
                     expected[i] =
-                        alpha * product.data()[i] + beta * prior[i] +
+                        std::fma(alpha, product.data()[i], scaled_prior) +
                         bias.data()[i % static_cast<size_t>(N)];
                 }
 
@@ -2104,7 +2107,13 @@ namespace
                 const std::string &task_grid = record.tags.at("task_grid");
                 const int row_tile =
                     std::stoi(record.tags.at("physical_row_tile"));
-                if (route == "grouped_full_k_row_chunk_grid")
+                if (route == "native_neon_shared_rows")
+                {
+                    // ARM native shared-row tiles (two or four physical rows).
+                    EXPECT_EQ(task_grid, "row_tile_n_block");
+                    EXPECT_TRUE(row_tile == 2 || row_tile == 4) << row_tile;
+                }
+                else if (route == "grouped_full_k_row_chunk_grid")
                 {
                     EXPECT_EQ(task_grid, "row_n_chunk");
                     EXPECT_EQ(row_tile, 1);
@@ -2146,6 +2155,8 @@ namespace
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
 
+#if !defined(__aarch64__)
+    // Forces or inspects x86 schedules/telemetry; ARM native rows are covered by the NEON gates.
     /**
      * @test Prove every forceable full-K fused task grid is serial-row exact.
      *
@@ -2448,6 +2459,7 @@ namespace
         PerfStatsCollector::reset();
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
+#endif // x86 NativeQuantised scheduler contract
 
     /**
      * @test Prove a replicated MTP head matches uneven serial TP shards.
@@ -2647,6 +2659,8 @@ namespace
             }
         }
 
+#if !defined(__aarch64__)
+        // x86 decode/verifier launch telemetry; the bytes above are ISA-neutral.
         bool saw_mirrored_decode = false;
         bool saw_mirrored_grouped = false;
         for (const auto &record : PerfStatsCollector::snapshot({
@@ -2671,11 +2685,14 @@ namespace
         }
         EXPECT_TRUE(saw_mirrored_decode);
         EXPECT_TRUE(saw_mirrored_grouped);
+#endif
 
         PerfStatsCollector::reset();
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
 
+#if !defined(__aarch64__)
+    // Forces or inspects x86 schedules/telemetry; ARM native rows are covered by the NEON gates.
     /**
      * @test Four-row prefill retains every serial byte and padded-row guard.
      *
@@ -2766,7 +2783,10 @@ namespace
         PerfStatsCollector::reset();
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
+#endif // x86 NativeQuantised scheduler contract
 
+#if !defined(__aarch64__)
+    // Forces or inspects x86 schedules/telemetry; ARM native rows are covered by the NEON gates.
     /**
      * @test Prove production full-K prefill candidates are batch invariant.
      *
@@ -3007,6 +3027,7 @@ namespace
         PerfStatsCollector::reset();
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
+#endif // x86 NativeQuantised scheduler contract
 
     /**
      * @test Production wave balancing is byte-exact for all formats and row tails.
@@ -3078,6 +3099,8 @@ namespace
         }
     }
 
+#if !defined(__aarch64__)
+    // Forces or inspects x86 schedules/telemetry; ARM native rows are covered by the NEON gates.
     /**
      * @test Prove every cache-tile boundary preserves serial-row FP32 bytes.
      *
@@ -3249,6 +3272,7 @@ namespace
         PerfStatsCollector::reset();
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
+#endif // x86 NativeQuantised scheduler contract
     /**
      * @test Prove CPU production prefill is serial-row exact over canonical M.
      *
@@ -3371,6 +3395,8 @@ namespace
             }
         }
 
+#if !defined(__aarch64__)
+        // x86 prefill launch telemetry; the byte-exact sweep above is ISA-neutral.
         uint64_t observed_prefill_launches = 0;
         for (const auto &record : PerfStatsCollector::snapshot(
                  {"kernel.cpu_native_quantised_prefill_gemm_launch"}))
@@ -3397,10 +3423,13 @@ namespace
             << "Every CPU all-format M-totality cell must execute one real "
                "production grouped prefill route";
 
+        #endif
         PerfStatsCollector::reset();
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
 
+#if !defined(__aarch64__)
+    // Forces or inspects x86 schedules/telemetry; ARM native rows are covered by the NEON gates.
     /**
      * @test Prove partial 64-column chunks remain inside each logical output row.
      *
@@ -3600,6 +3629,7 @@ namespace
         PerfStatsCollector::reset();
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
+#endif // x86 NativeQuantised scheduler contract
 
 #if !defined(__aarch64__)
     // x86 serial K partitioning; ARM native rows own full-K trees (see the NEON batch gates).
@@ -3793,6 +3823,8 @@ namespace
     }
 #endif
 
+#if !defined(__aarch64__)
+    // Forces or inspects x86 schedules/telemetry; ARM native rows are covered by the NEON gates.
     /**
      * @test Prove the bounded wide-row tile over every runtime M and format.
      *
@@ -3938,7 +3970,10 @@ namespace
         run_k_tile_regime(/*K=*/256, /*forced_k_tiles=*/1);
         run_k_tile_regime(/*K=*/4096, /*forced_k_tiles=*/4);
     }
+#endif // x86 NativeQuantised scheduler contract
 
+#if !defined(__aarch64__)
+    // Forces or inspects x86 schedules/telemetry; ARM native rows are covered by the NEON gates.
     TEST_F(CPUNativeQuantisedGemvTest, MTP_FusedVerifierKParallel_AllFormatsMatchSerialDecodeRows)
     {
         constexpr int K = 4096;
@@ -4121,7 +4156,10 @@ namespace
         PerfStatsCollector::reset();
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
+#endif // x86 NativeQuantised scheduler contract
 
+#if !defined(__aarch64__)
+    // Forces or inspects x86 schedules/telemetry; ARM native rows are covered by the NEON gates.
     /**
      * @test Prove every forceable K-partitioned fused row tile is byte exact.
      *
@@ -4335,6 +4373,7 @@ namespace
         PerfStatsCollector::reset();
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
+#endif // x86 NativeQuantised scheduler contract
 
 #ifdef HAVE_ONEDNN
     TEST_F(CPUNativeQuantisedGemvTest, MTP_FP32FloatingVerifierRowsMatchSerialDecodeAndUseGroupedCounters)
@@ -5158,6 +5197,8 @@ namespace
         omp_set_num_threads(original_threads);
     }
 
+#if !defined(__aarch64__)
+    // Forces or inspects x86 schedules/telemetry; ARM native rows are covered by the NEON gates.
     TEST_F(CPUNativeQuantisedGemvTest, MTP_VerifierRoutePublishesBuildAndRuntimeISA)
     {
         /**
@@ -5246,6 +5287,7 @@ namespace
         PerfStatsCollector::reset();
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
+#endif // x86 NativeQuantised scheduler contract
 
     TEST_F(CPUNativeQuantisedGemvTest, MTP_FusedProjectionWithActivationRotationMatchesSerialDecodeRows)
     {

@@ -575,6 +575,36 @@ inline void quantize_single_block_avx512(const float *src, Q8_1Block &dst)
             dst.sum_qs = static_cast<int16_t>(sum_i32);
         }
 #endif
+#if defined(__aarch64__)
+/** @brief Scalar replica of the frozen AVX2 hardware quantizer: same scale, RNE
+ * conversion (cvtps_epi32) and int8 saturation, independent of production NEON. */
+inline void quantize_single_block_hardware_rne(const float *src, Q8_1Block &dst)
+        {
+            float max_abs = 0.0f;
+            for (int j = 0; j < 32; ++j) max_abs = std::max(max_abs, std::fabs(src[j]));
+            constexpr float MIN_SCALE_THRESHOLD = 1e-10f;
+            if (max_abs < MIN_SCALE_THRESHOLD)
+            {
+                dst.d = 0;
+                dst.sum_qs = 0;
+                std::memset(dst.qs, 0, 32);
+                return;
+            }
+            volatile float d = max_abs / 127.0f;
+            const float id = 1.0f / d;
+            dst.d = fp32_to_fp16(d);
+            int32_t sum = 0;
+            for (int j = 0; j < 32; ++j)
+            {
+                volatile float scaled = src[j] * id;
+                const long rounded = std::lrint(scaled); // RNE under the default mode.
+                const int8_t q = static_cast<int8_t>(std::clamp<long>(rounded, -128, 127));
+                dst.qs[j] = q;
+                sum += q;
+            }
+            dst.sum_qs = static_cast<int16_t>(sum);
+        }
+#endif
 inline void quantize_single_block(const float *src, Q8_1Block &dst, int valid_elements = 32)
         {
             // Partial blocks always use scalar (rare, at row boundaries only)
@@ -599,6 +629,14 @@ inline void quantize_single_block(const float *src, Q8_1Block &dst, int valid_el
             if (has_avx2)
             {
                 quantize_single_block_avx2(src, dst);
+                return;
+            }
+#endif
+#if defined(__aarch64__)
+            // Native ARM publication reproduces the x86 hardware quantizer.
+            if (activeISALevel() != ISALevel::Scalar)
+            {
+                quantize_single_block_hardware_rne(src, dst);
                 return;
             }
 #endif
