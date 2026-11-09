@@ -712,6 +712,8 @@ TEST(PooledImmutableCurrentDemand, ActualEndpointRolesRejectForgedPureReaderAndW
 }
 }
 
+#ifdef HAVE_CUDA
+// Uses the compiled CUDA native-kernel factory, like the production PLE builder.
 namespace llaminar2::test {
 /** @test Real factory allocations may differ while complete source/query geometry stays identical. */
 TEST(PooledImmutableCurrentDemand, RealFactoryRegenerationConsumesOriginalFrameAndRejectsPrecisionDrift){
@@ -753,6 +755,7 @@ TEST(PooledImmutableCurrentDemand, RealFactoryRegenerationConsumesOriginalFrameA
     EXPECT_LT(demandPosition(graph,"trunk/terminal"),demandPosition(graph,"L1_ple_gather"));
 }
 }
+#endif // HAVE_CUDA
 
 namespace llaminar2::test {
 /** @test Counted prefill retains original count, sixteen-head expansion and exact graph identity across partial/empty reset records. */
