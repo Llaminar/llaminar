@@ -51,6 +51,10 @@ namespace
         std::vector<int> scalar_ids(static_cast<size_t>(top_k), -1);
         std::vector<int> avx2_ids(static_cast<size_t>(top_k), -1);
         std::vector<int> avx512_ids(static_cast<size_t>(top_k), -1);
+#if LLAMINAR_COMPILED_WITH_NEON
+        std::vector<float> neon_logits(static_cast<size_t>(top_k), 0.0f);
+        std::vector<int> neon_ids(static_cast<size_t>(top_k), -1);
+#endif
 
         const int scalar_count = cpu_sampling::select_topk_scalar(
             logits.data(),
@@ -70,9 +74,20 @@ namespace
             top_k,
             avx512_logits.data(),
             avx512_ids.data());
+#if LLAMINAR_COMPILED_WITH_NEON
+        const int neon_count = cpu_sampling::select_topk_neon(
+            logits.data(),
+            static_cast<int>(logits.size()),
+            top_k,
+            neon_logits.data(),
+            neon_ids.data());
+#endif
 
         ASSERT_EQ(avx2_count, scalar_count);
         ASSERT_EQ(avx512_count, scalar_count);
+#if LLAMINAR_COMPILED_WITH_NEON
+        ASSERT_EQ(neon_count, scalar_count);
+#endif
         ASSERT_EQ(scalar_count, std::min<int>(top_k, static_cast<int>(logits.size())));
         for (int i = 0; i < scalar_count; ++i)
         {
@@ -80,10 +95,18 @@ namespace
                 << "AVX2 top-k id mismatch at rank " << i;
             EXPECT_EQ(avx512_ids[static_cast<size_t>(i)], scalar_ids[static_cast<size_t>(i)])
                 << "AVX512 top-k id mismatch at rank " << i;
+#if LLAMINAR_COMPILED_WITH_NEON
+            EXPECT_EQ(neon_ids[static_cast<size_t>(i)], scalar_ids[static_cast<size_t>(i)])
+                << "NEON top-k id mismatch at rank " << i;
+#endif
             EXPECT_FLOAT_EQ(avx2_logits[static_cast<size_t>(i)], scalar_logits[static_cast<size_t>(i)])
                 << "AVX2 top-k logit mismatch at rank " << i;
             EXPECT_FLOAT_EQ(avx512_logits[static_cast<size_t>(i)], scalar_logits[static_cast<size_t>(i)])
                 << "AVX512 top-k logit mismatch at rank " << i;
+#if LLAMARIN_COMPILED_WITH_NEON
+            EXPECT_FLOAT_EQ(neon_logits[static_cast<size_t>(i)], scalar_logits[static_cast<size_t>(i)])
+                << "NEON top-k logit mismatch at rank " << i;
+#endif
         }
     }
 
