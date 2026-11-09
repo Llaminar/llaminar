@@ -1,0 +1,23 @@
+diff --git a/src/graph/paths.cc b/src/graph/paths.cc
+--- a/src/graph/paths.cc
++++ b/src/graph/paths.cc
+@@ -322,9 +322,6 @@
+   // In general, use P2P whenever we can.
+   int p2pLevel = PATH_SYS;
+ 
+-  // User override
+-  NCCLCHECK(ncclGetUserP2pLevel(&p2pLevel));
+-
+   // Don't use P2P through ARM CPUs
+   int arch, vendor, model;
+   NCCLCHECK(ncclTopoCpuType(system, &arch, &vendor, &model));
+@@ -335,6 +332,9 @@
+   if (arch == NCCL_TOPO_CPU_ARCH_X86 && vendor == NCCL_TOPO_CPU_VENDOR_ZHAOXIN) {
+     p2pLevel = PATH_PXB;
+   }
++
++  // Explicit user selection overrides CPU-specific defaults, including disable.
++  NCCLCHECK(ncclGetUserP2pLevel(&p2pLevel));
+ 
+   // Compute the PCI distance and compare with the p2pLevel.
+   if (path->type <= p2pLevel) *p2p = 1;

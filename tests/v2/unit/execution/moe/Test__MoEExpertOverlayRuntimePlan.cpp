@@ -1063,6 +1063,9 @@ namespace llaminar2::test
         auto inventory = syntheticTwoSocketInventory(0, 1);
         inventory.ranks[0].cpu.numa_node = 7;
         inventory.ranks[1].cpu.numa_node = 3;
+        // Preserve original GPU-local ownership while reversing CPU endpoint order.
+        inventory.ranks[0].gpus[0].numa_node = 7;
+        inventory.ranks[1].gpus[0].numa_node = 3;
         requested->domains[2].participants = {
             GlobalDeviceAddress::cpu(-1), GlobalDeviceAddress::cpu(-1)};
         const auto resolved = bindMoEExpertOverlayPlanToClusterInventory(*requested, inventory);
@@ -1654,4 +1657,38 @@ namespace llaminar2::test
         }
     }
 
+
+    /** @test Full-host GPU visibility resolves only local owners; pinned remote ownership is fatal. */
+    TEST(Test__MoEExpertOverlayRuntimePlan, RankLocalGPUOwnershipRejectsRemotePinnedOwner)
+    {
+        for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+        {
+            auto inventory = syntheticTwoSocketInventory(1, 1);
+            inventory.ranks[0].gpus = inventory.ranks[1].gpus;
+            inventory.buildNodeAggregations();
+            auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
+            plan->enabled = true;
+            plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
+            plan->residency_policy = RoutedExpertResidencyPolicy::StaticById;
+            auto gpu = cudaSingleDomain("local_gpu");
+            gpu.participants = {GlobalDeviceAddress::fromLocalDeviceId(DeviceId(backend, 0))};
+            gpu.backend = backend == DeviceType::CUDA ? CollectiveBackendType::NCCL : CollectiveBackendType::RCCL;
+            plan->domains = {gpu};
+            plan->continuation_domain = gpu.name;
+            plan->shared_expert_domain = gpu.name;
+            plan->routed_tiers = {tier("hot", gpu.name, 0, true)};
+            const auto bound = bindMoEExpertOverlayPlanToClusterInventory(*plan, inventory);
+            ASSERT_NE(bound, nullptr);
+            EXPECT_EQ(bound->domains[0].world_ranks, std::vector<int>({1}));
+            plan->domains[0].owner_rank = 0;
+            plan->domains[0].world_ranks = {0};
+            EXPECT_THROW(bindMoEExpertOverlayPlanToClusterInventory(*plan, inventory), std::invalid_argument);
+            plan->domains[0].owner_rank = 1;
+            plan->domains[0].world_ranks = {1};
+            EXPECT_NO_THROW(bindMoEExpertOverlayPlanToClusterInventory(*plan, inventory));
+            inventory.ranks[1].cpu.numa_node = -1;
+            EXPECT_THROW(bindMoEExpertOverlayPlanToClusterInventory(*plan, inventory), std::invalid_argument);
+            EXPECT_EQ(inventory.ranks[0].gpus.size(), 2u);
+        }
+    }
 } // namespace llaminar2::test

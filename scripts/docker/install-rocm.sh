@@ -34,7 +34,7 @@ case "${MODE}" in
         # HIP ROCclr's headless build still compiles GL interop. Tensile's host
         # library needs MessagePack C++ headers; none may be accidental extras
         # inherited only by a full development image.
-        rocm_system_packages+=(libdrm-dev libglvnd-dev libmsgpack-cxx-dev)
+        rocm_system_packages+=(libdrm-dev libglvnd-dev libmsgpack-cxx-dev libelf-dev libnuma-dev pkg-config xxd)
         if [[ "${MODE}" == full ]]; then rocm_packages+=(debugger profiler); fi
         ;;
     runtime) ;;
@@ -66,6 +66,8 @@ export LD_LIBRARY_PATH="${ROCM_PATH}/lib:${ROCM_PATH}/lib/llvm/lib${LD_LIBRARY_P
 
 if [[ "${MODE}" != runtime ]]; then
     bash "${rocm_script_dir}/install-rocm-lto-linker.sh"
+    bash "${rocm_script_dir}/install-rocm-smi-compat.sh"
+    bash "${rocm_script_dir}/install-rocr-helper-numa.sh"
     bash "${rocm_script_dir}/install-hip-graph-runtime.sh"
     bash "${rocm_script_dir}/install-rocblas.sh"
 fi

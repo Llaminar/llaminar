@@ -1,0 +1,117 @@
+/** @file Authored host topology replay of the exact ROCr helper creation body.
+ * The shims model only native OS inputs; no GPU runtime or thread is launched.
+ */
+#define _GNU_SOURCE 1
+#include <algorithm>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <dirent.h>
+#include <iostream>
+#include <pthread.h>
+#include <sched.h>
+#include <string>
+#include <vector>
+#include <unistd.h>
+
+struct Scope { void (*unused)() = nullptr; };
+template<class F> struct Guard { F f; ~Guard() { f(); } };
+template<class F> Guard(F)->Guard<F>;
+#define JOIN_(a,b) a##b
+#define JOIN(a,b) JOIN_(a,b)
+#define MAKE_SCOPE_GUARD(f) auto JOIN(guard_,__LINE__) = Guard{f}
+template<class T> T Max(T a,T b) { return std::max(a,b); }
+static unsigned AlignUp(unsigned a,unsigned b) { return (a+b-1)/b*b; }
+using uint=unsigned;
+using ThreadEntry=void(*)(void*);
+struct ThreadArgs { void* entry_args; ThreadEntry entry_function; };
+static void* ThreadTrampoline(void*) { return nullptr; }
+static void* CreateMutex() { static int mutex; return &mutex; }
+constexpr int OS_THREAD_PRIORITY_DEFAULT=0, OS_THREAD_PRIORITY_HIGH=1, OS_THREAD_PRIORITY_MAX=2;
+static bool override_affinity;
+namespace core {
+struct Flags { bool override_cpu_affinity() const { return override_affinity; } };
+struct Runtime { static Runtime* runtime_singleton_; Flags flag() const { return {}; } };
+Runtime runtime; Runtime* Runtime::runtime_singleton_=&runtime;
+}
+static cpu_set_t caller,helper,attribute;
+static std::vector<std::string> node_names;
+static std::vector<std::string> node_lists;
+static size_t next_node;
+static bool readable,affinity_readable,created,target_valid;
+static int fixture_get_nprocs_conf() { return 8; }
+static int fixture_sched_getaffinity(pid_t id,size_t n,cpu_set_t* out) {
+  if(id!=0 || !affinity_readable) return -1;
+  CPU_ZERO_S(n,out);
+  for(int i=0;i<8;i++) if(CPU_ISSET(i,&caller)) CPU_SET_S(i,n,out);
+  return 0;
+}
+static DIR* fixture_opendir(const char*) { next_node=0; return readable ? reinterpret_cast<DIR*>(1) : nullptr; }
+static dirent* fixture_readdir(DIR*) {
+  static dirent entry;
+  if(next_node>=node_names.size()) return nullptr;
+  std::snprintf(entry.d_name,sizeof(entry.d_name),"%s",node_names[next_node++].c_str());
+  return &entry;
+}
+static int fixture_closedir(DIR*) { return 0; }
+static FILE* fixture_fopen(const char* path,const char*) {
+  for(size_t i=0;i<node_names.size();i++) if(std::string(path).find("/"+node_names[i]+"/")!=std::string::npos)
+    return fmemopen(node_lists[i].data(),node_lists[i].size(),"r");
+  return nullptr;
+}
+static int fixture_attr_init(pthread_attr_t*) { attribute=caller; return 0; }
+static int fixture_attr_destroy(pthread_attr_t*) { return 0; }
+static int fixture_attr_setaffinity(pthread_attr_t*,size_t n,const cpu_set_t* set) {
+  CPU_ZERO(&attribute); for(int i=0;i<8;i++) if(CPU_ISSET_S(i,n,set)) CPU_SET(i,&attribute); return 0;
+}
+static int fixture_create(pthread_t* thread,const pthread_attr_t*,void*(*)(void*),void*) {
+  *thread=static_cast<pthread_t>(17); helper=attribute; created=true; return 0;
+}
+static int fixture_setaffinity(pthread_t thread,size_t n,const cpu_set_t* set) {
+  target_valid=thread==static_cast<pthread_t>(17);
+  CPU_ZERO(&helper); for(int i=0;i<8;i++) if(CPU_ISSET_S(i,n,set)) CPU_SET(i,&helper); return 0;
+}
+#define get_nprocs_conf fixture_get_nprocs_conf
+#define sched_getaffinity fixture_sched_getaffinity
+#define opendir fixture_opendir
+#define readdir fixture_readdir
+#define closedir fixture_closedir
+#define fopen fixture_fopen
+#define pthread_attr_init fixture_attr_init
+#define pthread_attr_destroy fixture_attr_destroy
+#define pthread_attr_setaffinity_np fixture_attr_setaffinity
+#define pthread_create fixture_create
+#define pthread_setaffinity_np fixture_setaffinity
+@HELPERS@
+class os_thread {
+  pthread_t thread; void* lock; enum { RUNNING } state; ThreadArgs args;
+public:
+@CONSTRUCTOR@
+};
+static unsigned bits(const cpu_set_t& set) {
+  unsigned result=0; for(int i=0;i<8;i++) if(CPU_ISSET(i,&set)) result|=1u<<i; return result;
+}
+int main() {
+  struct Case { const char* name; unsigned caller,expected; bool enabled,sysfs,affinity; };
+  const Case cases[]={
+    {"one_node_subset",1u<<1,0x03,true,true,true},
+    {"multiple_nodes",(1u<<1)|(1u<<6),0xf3,true,true,true},
+    {"exact_env_zero",1u<<1,1u<<1,false,true,true},
+    {"unrestricted",0xff,0xff,true,true,true},
+    {"unknown_topology_all_cpu_semantics",1u<<1,0xff,true,false,true},
+    {"affinity_error_all_cpu_semantics",1u<<1,0xff,true,true,false},
+    {"noncontiguous_node_ids",1u<<6,0xf0,true,true,true},
+  };
+  int failed=0;
+  for(const auto& c:cases) {
+    CPU_ZERO(&caller);for(int i=0;i<8;i++) if(c.caller&(1u<<i)) CPU_SET(i,&caller);
+    helper=caller;override_affinity=c.enabled;readable=c.sysfs;affinity_readable=c.affinity;
+    created=false;target_valid=true;node_names={"node0","node4","node12"};node_lists={"0-1\n","2-3\n","4-7\n"};
+    os_thread thread(nullptr,nullptr,0,OS_THREAD_PRIORITY_DEFAULT);
+    const bool pass=created && target_valid && bits(caller)==c.caller && bits(helper)==c.expected;
+    std::cout<<c.name<<","<<(pass?1:0)<<","<<bits(helper)<<","<<bits(caller)<<"\n";
+    failed+=!pass;
+  }
+  return failed ? 1 : 0;
+}

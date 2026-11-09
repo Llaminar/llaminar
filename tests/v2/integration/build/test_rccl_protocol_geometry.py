@@ -105,6 +105,29 @@ def verify_report(report, library):
             raise RuntimeError("RCCL protocol consumer/negative control has an unexpected outcome")
 
 
+def prepare_original_consumer(source, destination):
+    """Reverse the real repair while retaining the native hipify include layout.
+
+    Older hipify prepends a runtime include at byte zero. SDK 10.1 preserves
+    the source header and inserts that include with the source's other includes.
+    Only detach an actual leading generated include so Git can reverse the
+    file-header hunk; all other bytes and includes remain in their native order.
+    The exact reverse patch must succeed before the old consumer is compiled.
+    """
+    generated = source.read_bytes()
+    include = b'#include "hip/hip_runtime.h"\n'
+    first_include = next((line for line in generated.splitlines(keepends=True)
+                          if line.startswith(b"#include")), None)
+    if first_include != include:
+        raise RuntimeError("RCCL generated source lacks its canonical first HIP runtime include")
+    preamble = include if generated.startswith(include) else b""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(generated[len(preamble):])
+    subprocess.run(["git", "apply", "--reverse", str(ROOT / PATCH)],
+                   cwd=destination.parent.parent, check=True)
+    destination.write_bytes(preamble + destination.read_bytes())
+
+
 def compile_report(args):
     """Run actual native consumers and the preserved faulty implementation on CPU."""
     args.report.unlink(missing_ok=True)
@@ -122,20 +145,9 @@ def compile_report(args):
     with tempfile.TemporaryDirectory(prefix="llaminar-rccl-protocol-") as directory:
         temporary = Path(directory)
         original = temporary / "src/rccl_wrap.cc"
-        original.parent.mkdir()
-        generated = source.read_bytes()
-        preamble = b'#include "hip/hip_runtime.h"\n'
-        if not generated.startswith(preamble):
-            raise RuntimeError("RCCL generated source lacks the canonical HIP include preamble")
-        # hipify adds this include ahead of the source's first line. Temporarily
-        # detach it so Git can reverse the file-header hunk at its real boundary,
-        # then restore the exact generated include before compiling old code.
-        original.write_bytes(generated[len(preamble):])
-        # Reverse the exact production repair in a disposable copy. The old
-        # consumers must fail, so a vacuous or disconnected test cannot pass.
-        subprocess.run(["git", "apply", "--reverse", str(ROOT / PATCH)],
-                       cwd=temporary, check=True)
-        original.write_bytes(preamble + original.read_bytes())
+        # The actual old consumers must fail the same oracle; this changes only
+        # generated include placement handling, never the tested native bodies.
+        prepare_original_consumer(source, original)
         symbols = temporary / "probe.map"
         symbols.write_text("{ local: *; };\n")
         for variant, implementation in (("native", source), ("original", original)):

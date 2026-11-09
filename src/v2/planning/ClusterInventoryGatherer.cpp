@@ -255,13 +255,15 @@ namespace llaminar2
                 omp_get_thread_limit() < omp_get_max_threads())
                 throw std::invalid_argument("Inventory requires a fixed, non-nested CPU execution team");
             location.cpu_worker_threads = omp_get_max_threads();
-            if (distributed)
-            {
-                const auto numa = NUMATopology::detectLocalNUMANode();
-                if (!numa.detection_succeeded || numa.local_numa_node < 0)
-                    throw std::runtime_error("Multi-rank hardware discovery requires exact CPU NUMA affinity");
+            // A one-rank MPI launch is bound too. Observe its actual caller
+            // before driver discovery, exactly as for a distributed rank.
+            // Ambiguous unbound single-process CPU use retains whole-host scope;
+            // it never acquires GPU ownership from a visible card's NUMA ID.
+            const auto numa = NUMATopology::detectLocalNUMANode();
+            if (numa.detection_succeeded && numa.local_numa_node >= 0)
                 location.cpu_numa_node = numa.local_numa_node;
-            }
+            else if (distributed)
+                throw std::runtime_error("Multi-rank hardware discovery requires exact CPU NUMA affinity");
             auto &manager = DeviceManager::instance();
             // Reuse the complete observation even if another startup caller
             // installed a socket-local execution view. Visibility projection

@@ -92,7 +92,11 @@ namespace
             gpu.type = backend;
             gpu.local_device_id = index * 2 + 3;
             gpu.numa_node = inventory.ranks[rank].cpu.numa_node;
-            gpu.uuid = std::string(deviceTypeToString(backend)) + "-" + std::to_string(index);
+            // This helper creates distinct physical cards. Shared observations
+            // explicitly copy a card later; never publish conflicting locality
+            // before a fixture has a chance to rename a newly created device.
+            gpu.uuid = std::string(deviceTypeToString(backend)) + "-" +
+                std::to_string(rank) + "-" + std::to_string(index);
             gpu.compute_units = 64;
             inventory.ranks[rank].gpus.push_back(std::move(gpu));
         }
@@ -521,7 +525,7 @@ TEST(AutomaticOrchestrationCandidates,
     config.automatic_planning.device_counts =
         {{DeviceType::CUDA, 2}, {DeviceType::ROCm, 4}};
     const auto proposals = candidates(config, inventory, true);
-    ASSERT_EQ(proposals.size(), 8u); // Both continuation directions and dense policies.
+    ASSERT_EQ(proposals.size(), 4u); // Both continuation directions/dense policies, with only NUMA-local owners.
     for (const auto &proposal : proposals)
     {
         EXPECT_EQ(proposal.membership.discoveryRanks().size(), 2u);
@@ -1011,5 +1015,29 @@ TEST(AutomaticOrchestrationCandidates, QueryConsumerSourceUsesCanonicalAssignmen
         });
         const bool expert_columns_fit=MoEProjectionArenaGeometry::hasIntegralOutputPartition(2560,degree);
         EXPECT_EQ(proposed>0,expert_columns_fit)<<"Head coverage is valid1..8; owned expert columns impose a separate source constraint";
+    }
+}
+
+/** @test Complete visibility must not give a remote rank automatic GPU ownership. */
+TEST(AutomaticOrchestrationCandidates, RankLocalGPUOwnershipPreservesDiscoveryAndBothVendors)
+{
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        auto inventory = hosts(2);
+        inventory.ranks[0].node_id = inventory.ranks[1].node_id = 23;
+        inventory.ranks[0].hostname = inventory.ranks[1].hostname = "shared-host";
+        cards(inventory, 1, backend, 2);
+        inventory.ranks[0].gpus = inventory.ranks[1].gpus;
+        inventory.buildNodeAggregations();
+        const auto original = inventory.ranks[0].gpus.size();
+        const auto proposals = candidates(request({backend}, {OrchestrationStrategy::SingleDevice}), inventory);
+        ASSERT_EQ(proposals.size(), 2u);
+        for (const auto &proposal : proposals)
+        {
+            EXPECT_EQ(proposal.membership.discoveryRanks(), std::vector<int>({1}));
+            compile(proposal);
+        }
+        EXPECT_EQ(inventory.ranks[0].gpus.size(), original);
+        EXPECT_EQ(inventory.ranks[1].gpus.size(), original);
     }
 }

@@ -132,8 +132,11 @@ reclassify connections from measured bandwidth.
 
 Cluster publication uses the complete driver-visible hardware observation,
 not DeviceManager's socket-local execution view. CPU affinity binds the CPU
-endpoint but never removes GPUs on another socket; the planner uses GPU NUMA
-identity to prefer an owner later. This applies equally to plan, describe and
+endpoint but never removes GPUs on another socket. Execution and native
+calibration ownership require the GPU's observed NUMA node to equal its rank's
+observed CPU NUMA node. Visibility alone grants no execution ownership; unknown
+locality cannot authorize a GPU. A one-rank launch publishes its exact observed
+node too; a genuinely unqualified whole-host CPU observation remains CPU-only. This applies equally to plan, describe and
 serve, including hostfiles with just one discovery rank on a multi-socket host.
 Projecting another view reuses that observation without driver rediscovery.
 
@@ -208,12 +211,14 @@ CPU zero or a rank-derived hostname. Domain compilation preserves endpoint,
 parent rank and proportional work as one tuple when sorting participants.
 The same tuple supplies named global-stage construction and rank-local plans.
 
-`RankHardwareOwnership` is the shared CPU ownership query used by ordinary
-placement and ExpertOverlay binding. Bound ranks own their observed NUMA
-endpoint; whole-host observations require explicit physical-node detail.
+`RankHardwareOwnership` supplies the shared CPU and GPU ownership queries used
+by ordinary placement, ExpertOverlay binding and native preparation. Bound
+ranks own their observed CPU NUMA endpoint; whole-host CPU observations require
+explicit physical-node detail. GPU execution ownership requires two known,
+equal GPU and rank CPU NUMA identities, including cache-only, coordinator and
+follower roles. Explicit remote owners are rejected rather than rebound.
 Neither MPI local-rank order nor NUMA-node count establishes a physical ID.
-GPU owner preference compares its observed locality with observed CPU affinity,
-so reordered communicators and moved cards retain the correct physical owner.
+Reordered communicators preserve the original physical owner.
 
 ### 2.2 User configuration
 
@@ -401,7 +406,9 @@ origin is explicit in its BOM: only local GGUF reading needs reader staging.
 
 `PlanningKernelServiceCatalog` collects those observations before root-only
 candidate pricing. Reporter selection uses physical node, backend and GPU UUID,
-deduplicating ordinal-remapped visibility and preferring observed NUMA affinity.
+deduplicating ordinal-remapped visibility among reporters with matching
+observed GPU and rank CPU NUMA identities. A remote observer cannot substitute
+for a missing local GPU reporter.
 CPU observations remain qualified by discovery rank, observed NUMA scope and
 the measured worker/ISA identity; a whole-host measurement is not a socket
 measurement. Neither receipt contents nor elapsed time can assign rank or
@@ -516,9 +523,10 @@ precision to match its samples.
 
 `PlanningCommunicationService` collects native collective, GPU/host and host-MPI evidence
 through the existing failure-atomic discovery publication. Its sample basis is
-physical, not per candidate: maximal homogeneous rank-visible GPU groups are
-deduplicated by node/backend/UUID set, with one common affinity-preferred rank
-observing each group. The communicator itself keeps that rank's production
+physical, not per candidate: maximal homogeneous NUMA-local executable GPU
+groups are deduplicated by node/backend/UUID set, with one eligible local rank
+observing each group. Cross-rank CPU communication keeps its actual participant
+and payload identities; GPU locality does not erase those communication edges. The communicator itself keeps that rank's production
 ordinal order; UUID sorting is only a deduplication key, never a replacement
 ring order. Receipts retain the actual ordered group, reporting rank, native
 wire precision, payload and both completed graph phases. They do not certify

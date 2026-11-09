@@ -2,9 +2,8 @@
 # Compilation/execution is builder-owned and host-only; installed Unit/preflight
 # authenticates complete native/opposite old-enqueue outcomes without an SDK/GPU.
 include_guard(DIRECTORY)
-if(HAVE_ROCM AND HAVE_RCCL AND NOT V2_PERF_TESTS_ONLY)
-    set(RCCL_PROTOCOL_BUILD_DIR "${RCCL_BUILD_DIR}" CACHE PATH
-        "Completed canonical RCCL native source/proof build")
+v2_test_target_selected(v2_rccl_small_allgather_policy V2_RCCL_PROOF_SELECTED)
+if(HAVE_ROCM AND HAVE_RCCL AND V2_RCCL_PROOF_SELECTED)
     set(V2_RCCL_SMALL_GATHER_SCRIPT
         "${CMAKE_CURRENT_SOURCE_DIR}/integration/build/test_rccl_small_allgather_policy.py")
     set(V2_RCCL_SMALL_GATHER_PROOF
@@ -43,6 +42,7 @@ if(HAVE_ROCM AND HAVE_RCCL AND NOT V2_PERF_TESTS_ONLY)
             "${RCCL_LIBRARY}" "${CMAKE_HIP_COMPILER}"
         VERBATIM)
     add_custom_target(v2_rccl_small_allgather_policy DEPENDS "${V2_RCCL_SMALL_GATHER_PROOF}")
+    set_property(TARGET v2_rccl_small_allgather_policy PROPERTY V2_RELEASE_NATIVE_PROOF_OWNER TRUE)
     set_property(GLOBAL APPEND PROPERTY V2_UNIT_GATE_TARGETS v2_rccl_small_allgather_policy)
     foreach(V2_RCCL_SMALL_GATHER_SUITE Unit Integration)
         set(V2_RCCL_SMALL_GATHER_TEST "V2_${V2_RCCL_SMALL_GATHER_SUITE}_RCCLSmallAllGatherPolicy")

@@ -21,7 +21,15 @@ class SelectorProofTests(unittest.TestCase):
             sources=P.identities(),
             library_sha256=P.digest(self.library),
             native_sources={'/fixture/' + n: 'a' * 64 for n in (*P.NATIVE, 'src/include/device.h', 'src/include/nccl_common.h')},
-            rccl_receipt='fixture-selector-' + P.identities()[P.PATCH],
+            rccl_receipt='p2p-' + P.digest(ROOT / P.p2p_selection.PATCH) + '-fixture-selector-' + P.identities()[P.PATCH],
+            p2p_selection=dict(
+                native_sources={'/fixture/' + n: 'a' * 64 for n in P.p2p_selection.NATIVE},
+                native_compile_inputs=[dict(source='/fixture/' + n, flags=['-DFIXTURE']) for n in P.p2p_selection.NATIVE],
+                observations=[dict(variant=v, policy=name, stderr='',
+                    returncode=int(v == 'original' and P.p2p_selection.FAILURES.get(name, 0) != 0),
+                    measured=dict(checks=P.p2p_selection.CHECKS,
+                        failures=P.p2p_selection.FAILURES.get(name, 0) if v == 'original' else 0))
+                    for v in ('native', 'original') for name, _, _ in P.p2p_selection.POLICIES]),
             compiler=dict(path='/fixture/clang', stat=[1, 2, 3, 4, 5]),
             compiler_version='fixture',
             architecture='gfx906',
@@ -45,6 +53,31 @@ class SelectorProofTests(unittest.TestCase):
                 for v in ['native', 'original']
             ],
         )
+
+    def test_p2p_selector_requires_complete_actual_policy_matrix(self):
+        """Missing defaults, level boundaries, exact negative counts or source pins fail closed."""
+        for index in range(len(self.report['p2p_selection']['observations'])):
+            r = copy.deepcopy(self.report)
+            r['p2p_selection']['observations'].pop(index)
+            with self.assertRaises(RuntimeError):
+                P.verify(r, self.library)
+        for field in ('native_sources', 'native_compile_inputs', 'observations'):
+            r = copy.deepcopy(self.report)
+            r['p2p_selection'][field] = [] if field != 'native_sources' else {}
+            with self.assertRaises(RuntimeError):
+                P.verify(r, self.library)
+        for key, value in (('returncode', 0), ('measured', {'checks': P.p2p_selection.CHECKS, 'failures': 0})):
+            r = copy.deepcopy(self.report)
+            row = next(x for x in r['p2p_selection']['observations']
+                       if x['variant'] == 'original' and x['policy'] == 'disable')
+            row[key] = value
+            with self.assertRaises(RuntimeError):
+                P.verify(r, self.library)
+        for receipt in (None, 'p2p-' + '0' * 64 + '-fixture-selector-' + P.identities()[P.PATCH]):
+            r = copy.deepcopy(self.report)
+            r['rccl_receipt'] = receipt
+            with self.assertRaises(RuntimeError):
+                P.verify(r, self.library)
 
     def test_complete_passes(self):
         """Both complete opposite-polarity outcomes are necessary."""
@@ -83,13 +116,13 @@ class SelectorProofTests(unittest.TestCase):
         # The whole ordered pin remains mandatory: adding shared-file and thread repairs must
         # not disconnect selector, protocol or small-AllGather source identities.
         self.assertIn(
-            '${RCCL_GIT_REF}-completed-${rccl_completed_patch_sha}-capture-${rccl_capture_patch_sha}'
+            '${RCCL_GIT_REF}-smi-${rccl_smi_patch_sha}-completed-${rccl_completed_patch_sha}-capture-${rccl_capture_patch_sha}'
             '-rows-${rccl_rows_patch_sha}-storage-${rccl_storage_patch_sha}'
             '-shm-${rccl_shm_patch_sha}-selector-${rccl_selector_patch_sha}-thread-${rccl_thread_patch_sha}'
             '-protocol-${rccl_protocol_patch_sha}-smallag-${rccl_small_allgather_patch_sha}',
             (ROOT / 'Dockerfile').read_text())
         self.assertIn(
-            '${RCCL_COMMIT}-completed-${RCCL_COMPLETED_PATCH_HASH}-capture-${RCCL_CAPTURE_PATCH_HASH}'
+            '${RCCL_COMMIT}-smi-${RCCL_SMI_PATCH_HASH}-completed-${RCCL_COMPLETED_PATCH_HASH}-capture-${RCCL_CAPTURE_PATCH_HASH}'
             '-rows-${RCCL_ROWS_PATCH_HASH}-storage-${RCCL_HOST_STORAGE_PATCH_HASH}'
             '-shm-${RCCL_SHM_PATCH_HASH}-selector-${RCCL_SELECTOR_PATCH_HASH}-thread-${RCCL_THREAD_PATCH_HASH}'
             '-protocol-${RCCL_PROTOCOL_PATCH_HASH}-smallag-${RCCL_SMALL_ALLGATHER_PATCH_HASH}',
@@ -98,7 +131,7 @@ class SelectorProofTests(unittest.TestCase):
         # Compiler provenance precedes, and never truncates, the strict repair suffix.
         self.assertIn(
             'targets-${rccl_target_hash}-llvm-lto-${rccl_lto_receipt_sha}'
-            '-producer-${rccl_lto_producer_sha}-${RCCL_GIT_REF}-completed-',
+            '-producer-${rccl_lto_producer_sha}-${RCCL_GIT_REF}-smi-${rccl_smi_patch_sha}-completed-',
             (ROOT / 'Dockerfile').read_text())
         self.assertIn(
             'string(PREPEND RCCL_BUILD_ID "targets-${RCCL_TARGET_POLICY_HASH}'

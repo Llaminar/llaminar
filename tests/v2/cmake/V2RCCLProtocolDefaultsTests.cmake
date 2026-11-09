@@ -6,9 +6,8 @@
 # prove the selected runtime on real two/four-device topologies.
 include_guard(DIRECTORY)
 
-if(HAVE_ROCM AND HAVE_RCCL AND NOT V2_PERF_TESTS_ONLY)
-    set(RCCL_PROTOCOL_BUILD_DIR "${RCCL_BUILD_DIR}" CACHE PATH
-        "Completed canonical RCCL build providing the protocol regression's native sources")
+v2_test_target_selected(v2_rccl_protocol_geometry V2_RCCL_PROOF_SELECTED)
+if(HAVE_ROCM AND HAVE_RCCL AND V2_RCCL_PROOF_SELECTED)
     set(V2_RCCL_PROTOCOL_SCRIPT
         "${CMAKE_CURRENT_SOURCE_DIR}/integration/build/test_rccl_protocol_geometry.py")
     set(V2_RCCL_PROTOCOL_PROOF
@@ -31,6 +30,7 @@ if(HAVE_ROCM AND HAVE_RCCL AND NOT V2_PERF_TESTS_ONLY)
             "${RCCL_LIBRARY}" "${CMAKE_HIP_COMPILER}"
         VERBATIM)
     add_custom_target(v2_rccl_protocol_geometry DEPENDS "${V2_RCCL_PROTOCOL_PROOF}")
+    set_property(TARGET v2_rccl_protocol_geometry PROPERTY V2_RELEASE_NATIVE_PROOF_OWNER TRUE)
     set_property(GLOBAL APPEND PROPERTY V2_UNIT_GATE_TARGETS v2_rccl_protocol_geometry)
     foreach(V2_RCCL_PROTOCOL_SUITE Unit Integration)
         set(V2_RCCL_PROTOCOL_TEST "V2_${V2_RCCL_PROTOCOL_SUITE}_RCCLProtocolDefaults")

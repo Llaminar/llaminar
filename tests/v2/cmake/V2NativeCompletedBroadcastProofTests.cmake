@@ -58,6 +58,7 @@ foreach(V2_NATIVE_COMPLETED_BACKEND IN ITEMS nccl rccl)
                     --report "${V2_NATIVE_COMPLETED_REPORT}"
                 DEPENDS ${V2_NATIVE_COMPLETED_INPUTS}
                     "${REPO_ROOT}/scripts/docker/patches/rccl-device-completed-broadcast.patch"
+                    "${REPO_ROOT}/scripts/docker/patches/rccl-user-p2p-override.patch"
                     "${RCCL_PROTOCOL_BUILD_DIR}/CMakeCache.txt" "${V2_NATIVE_COMPLETED_RECEIPT}"
                     "${V2_NATIVE_COMPLETED_SOURCE}/src/collectives.cc"
                     "${V2_NATIVE_COMPLETED_SOURCE}/src/enqueue.cc"
@@ -86,6 +87,7 @@ foreach(V2_NATIVE_COMPLETED_BACKEND IN ITEMS nccl rccl)
         endif()
         set(V2_NATIVE_COMPLETED_TARGET "v2_${V2_NATIVE_COMPLETED_BACKEND}_completed_broadcast_proof")
         add_custom_target(${V2_NATIVE_COMPLETED_TARGET} DEPENDS "${V2_NATIVE_COMPLETED_REPORT}")
+        set_property(TARGET ${V2_NATIVE_COMPLETED_TARGET} PROPERTY V2_RELEASE_NATIVE_PROOF_OWNER TRUE)
         set_property(GLOBAL APPEND PROPERTY V2_UNIT_GATE_TARGETS ${V2_NATIVE_COMPLETED_TARGET})
         foreach(V2_NATIVE_COMPLETED_SUITE Unit Integration)
             set(V2_NATIVE_COMPLETED_TEST

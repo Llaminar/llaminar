@@ -377,6 +377,31 @@ namespace llaminar2
                 plan.runtime.mtp.terminal_head_policy = head_policy;
         }
 
+        // Declared ngram source/cache roles may be outside compute domains,
+        // including opposite-vendor storage-only GPUs. Authenticate their
+        // authored owner independently of which rank owns model arithmetic.
+        if (config.ngram_table_policy.isGPUAdaptive())
+            for (const auto &endpoint : config.ngram_table_policy.gpu_adaptive.placement.declaredParticipants())
+            {
+                const auto owner = std::find_if(cluster_inventory.ranks.begin(), cluster_inventory.ranks.end(),
+                    [&](const RankInventory &rank) { return rank.rank == endpoint.world_rank; });
+                if (owner == cluster_inventory.ranks.end())
+                    throw std::invalid_argument("Declared ngram GPU owner rank is absent from the original inventory");
+                requireRankLocalGPUOwnership(*owner, endpoint.device(), "Declared ngram GPU role");
+            }
+        // Validate actual emitted owners, including simple explicit device maps
+        // and PP participants that do not pass through named-domain resolution.
+        for (const auto &plan : plans)
+        {
+            const auto validate = [&](const GlobalDeviceAddress &device) {
+                if (!device.isGPU()) return;
+                if (findRankForDevice(device, cluster_inventory, plan.rank) < 0)
+                    throw std::invalid_argument("Execution plan GPU is absent from its declared owner rank");
+            };
+            validate(plan.primary_device);
+            for (const auto &device : plan.local_tp_devices) validate(device);
+            for (const auto &device : plan.local_pp_devices) validate(device);
+        }
         return plans;
     }
 
@@ -641,6 +666,7 @@ namespace llaminar2
             {
                 for (const auto &gpu : rank_inv.gpus)
                 {
+                    if (!rankOwnsGPUDevice(rank_inv, gpu)) continue;
                     domain.devices.push_back(GlobalDeviceAddress::fromLocalDeviceId(
                         DeviceId(gpu.type, gpu.local_device_id),
                         rank_inv.hostname,
@@ -688,6 +714,8 @@ namespace llaminar2
         const ClusterInventory &cluster_inventory,
         int required_rank)
     {
+        const RankInventory *ineligible_rank = nullptr;
+        const DeviceInfo *ineligible_gpu = nullptr;
         for (const auto &rank_inv : cluster_inventory.ranks)
         {
             if (required_rank >= 0 && rank_inv.rank != required_rank)
@@ -718,12 +746,16 @@ namespace llaminar2
                         if (gpu.numa_node < 0 || device.numa_node < 0 ||
                             gpu.numa_node == device.numa_node)
                         {
-                            return rank_inv.rank;
+                            if (rankOwnsGPUDevice(rank_inv, gpu)) return rank_inv.rank;
+                            ineligible_rank = &rank_inv;
+                            ineligible_gpu = &gpu;
                         }
                     }
                 }
             }
         }
+        if (ineligible_gpu)
+            requireRankLocalGPUOwnership(*ineligible_rank, *ineligible_gpu, "Execution domain");
         return -1; // Not found
     }
 
@@ -1087,9 +1119,11 @@ namespace llaminar2
         else if (rank < static_cast<int>(cluster_inventory.ranks.size()))
         {
             const auto &rank_inv = cluster_inventory.ranks[rank];
-            if (!rank_inv.gpus.empty())
+            const auto local_gpu = std::find_if(rank_inv.gpus.begin(), rank_inv.gpus.end(),
+                [&](const auto &gpu) { return rankOwnsGPUDevice(rank_inv, gpu); });
+            if (local_gpu != rank_inv.gpus.end())
             {
-                const auto &gpu = rank_inv.gpus[0];
+                const auto &gpu = *local_gpu;
                 plan.primary_device = GlobalDeviceAddress::fromLocalDeviceId(
                     DeviceId(gpu.type, gpu.local_device_id),
                     rank_inv.hostname,
@@ -1236,9 +1270,10 @@ namespace llaminar2
                 if (rank < static_cast<int>(cluster_inventory.ranks.size()))
                 {
                     const auto &rank_inv = cluster_inventory.ranks[rank];
-                    for (int i = 0; i < std::min(config.tp_degree, static_cast<int>(rank_inv.gpus.size())); ++i)
+                    for (const auto &gpu : rank_inv.gpus)
                     {
-                        const auto &gpu = rank_inv.gpus[i];
+                        if (!rankOwnsGPUDevice(rank_inv, gpu)) continue;
+                        if (plan.local_tp_devices.size() >= static_cast<std::size_t>(config.tp_degree)) break;
                         plan.local_tp_devices.push_back(GlobalDeviceAddress::fromLocalDeviceId(
                             DeviceId(gpu.type, gpu.local_device_id),
                             rank_inv.hostname,
@@ -1351,9 +1386,11 @@ namespace llaminar2
         else if (rank < static_cast<int>(cluster_inventory.ranks.size()))
         {
             const auto &rank_inv = cluster_inventory.ranks[rank];
-            if (!rank_inv.gpus.empty())
+            const auto local_gpu = std::find_if(rank_inv.gpus.begin(), rank_inv.gpus.end(),
+                [&](const auto &gpu) { return rankOwnsGPUDevice(rank_inv, gpu); });
+            if (local_gpu != rank_inv.gpus.end())
             {
-                const auto &gpu = rank_inv.gpus[0];
+                const auto &gpu = *local_gpu;
                 plan.primary_device = GlobalDeviceAddress::fromLocalDeviceId(
                     DeviceId(gpu.type, gpu.local_device_id),
                     rank_inv.hostname,
@@ -1696,6 +1733,13 @@ namespace llaminar2
                 spec.per_rank_device = resolved->devices.front();
             }
 
+            // This public topology entrypoint can be called without
+            // buildAllPlans. A local stage may not move another rank's
+            // resolved GPU onto its first owner during topology emission.
+            if (!spec.is_global_tp)
+                for (const auto &device : spec.devices)
+                    if (device.isGPU() && findRankForDevice(device, cluster_inventory, spec.owning_rank) < 0)
+                        throw std::invalid_argument("Local PP stage GPU is absent from its declared owner rank");
             specs.push_back(std::move(spec));
         }
 

@@ -7,8 +7,12 @@ analysis in the linked tuning notes, not in this dashboard.
 ## Current status
 
 **Active hybrid target: 500 prefill /40 decode tok/s on 2×MI50 +2×CPU TP.**
-Latest Release 512/256: **298.175 P /39.891 D**; after-prefill **39.735 D**.
-Earlier CPU scheduling: **+3.44% P**; all768 IDs/MTP/placement match.
+Provisional NUMA-correct ROCm 10.1 Release closes at **300.092 P /38.357
+after-prefill D**; all 768 IDs/MTP/initial placement match. Historical remote-GPU
+rates are numerical controls, **not a placement speedup baseline**. Passive
+PID masks are local, but benchmark rank→PID publication is missing; nonzero DRM
+discovery bytes do not prove ownership. Native inventory/ownership gates pass.
+[SDK status](../2026-11/QFN_ROCM_101_SDK_UPGRADE_20261109.md).
 Short-prefill indexer elision saves **36 kernels/chunk/GPU**; its matched
 control showed **+7.09% P**, with unchanged output IDs/MTP.
 Paired retained graphs cost eight GPU expert slots: **8066 total, 4033/card**.
@@ -28,8 +32,13 @@ five within **+2.5%**. QFN-shaped FFN saves **26–31%** in both row orders.
 Cache/work block sizes1–4 pass; model uses Auto. CPU-result readiness remains next.
 [All-format evidence](../2026-11/QFN_CPU_ALL_FORMAT_JOB_OWNERSHIP_20261109.md).
 **Latest CPU slice:** selected M1 loops have zero vector stack traffic;
-20 focused tests pass, all768 IDs/MTP/placement match. No model speedup proved;
-final-add fusion withdrawn. Next: NUMA-local GPU ownership and eight-row tiles.
+20 focused tests pass, all 768 IDs/MTP/placement match. No model speedup proved;
+final-add fusion withdrawn; eight-row work parked. Two complete P/D profile
+pairs: exact GNU libgomp uses **59–68% P /76–82% D user cycles**, nearly all in
+two pause loops—not wall overhead or saved time. Original requested-SIGINT
+receipt stays red; separate actual-recorder control retires/flushes correctly.
+No wait-policy choice; matched **GOMP_SPINCOUNT=0** diagnostic next.
+[OpenMP result/limits](../2026-11/QFN_CPU_OPENMP_WAIT_ATTRIBUTION_20261109.md).
 [Evidence](../2026-11/QFN_CPU_M1_SCALE_LIFETIME_20261109.md).
 [Overlay scope](../2026-11/QFN_NATIVE_QUANTISED_EXACT_OVERLAY_20261108.md),
 [timeline](../2026-11/QFN_HYBRID_TIMELINE_AND_NUMA_20261108.md),
@@ -57,10 +66,10 @@ logits; component savings do not establish model gain.
 
 | Next action | State / decision |
 |---|---|
-| Admission | **Full preflight is skipped this iteration by request.** The last complete receipt (`complete497`) had 4,359 pass, one fail and 29 hardware-unavailable; it is not a green complete gate. Its HIP preferred-queue stall is repaired: 80 MI50/XTX repetitions, all 16 packet entries and focused graph/loader checks pass. Prior failures have focused reruns. Typed source definitions own the current inventory; absent hardware remains unqualified. CUDA TP2 shared-owner RAM/SSD off/1/3/dynamic and CPU2/MI50 fixed3/dynamic source admission have retained evidence. Indexed binding cut matched CUDA fixed3 setup **506.43→251.77 s**. [Stall](../2026-11/QFN_PACKET_PREFERRED_QUEUE_STALL_20261105.md), [admission](../2026-11/QFN_COHORT_MIGRATION_AND_MTP_ADMISSION_QUALIFICATION.md), [setup](../2026-11/QFN_FROZEN_BINDING_LOOKUP_QUALIFICATION.md). |
-| Six-GPU moving MTP | **Fixed1/fixed3/dynamic pass on CUDA2 continuation + four MI50 followers, RAM ngrams, DynamicOrdinal experts.** Final coherent build: **57 focused host + 16 native registrations pass**, plus **40 fresh cancellation lifetimes**. Final dynamic inference: **2,416 byte-exact stage/row comparisons**, four prefix histories, eight migrations and active adaptive MTP. All six contexts retire; owned caches are removed. Original-slot recurrence and absorbing cancellation are repaired without per-draft host fences. Full preflight remains skipped this iteration. [Focused qualification](../2026-11/QFN_RECURRENT_SIX_GPU_MTP_FOCUSED_QUALIFICATION_20261106.md). |
+| Admission / SDK10.1 | **Scoped final gates green; full preflight deferred.** Host 53/53 (5.105s), repaired RCCL 9/9 (36.549s, all four original storage cases), HIP 19/19 on each ISA, NUMA 13/13 and full-visibility inventory 4/4. Actual P2P proof 11 policies/2,640 checks: native 0 failures/original 96. lto-build8 GREEN 37.282 s; configure14/build5 exit0 (1216.682/179.489s). Receipt-prefix and probe-logging follow-ups pass. [SDK evidence](../2026-11/QFN_ROCM_101_SDK_UPGRADE_20261109.md). |
+| Six-GPU moving MTP | Prior CUDA2 continuation + MI50×4 follower fixed1/fixed3/dynamic slices pass: 57 host +16 native, 40 cancellation lifetimes, 2,416 byte comparisons, four prefix histories and eight migrations. All contexts retire. This earlier slice is not a complete current SDK/model certificate. [Focused qualification](../2026-11/QFN_RECURRENT_SIX_GPU_MTP_FOCUSED_QUALIFICATION_20261106.md). |
 | Native lifetime | [Captured component proof](../2026-11/QFN_READ_AHEAD_NATIVE_CAPTURE_QUALIFICATION.md): CUDA/ROCm each pass 40 lifetimes and 800 replays. [Early-current RAM/SSD proof](../2026-11/QFN_EARLY_CURRENT_CAUSAL_FOCUSED_20261105.md) and [ROCm TP2 fixed1/shared-owner proof](../2026-11/QFN_POOLED_CURRENT_READAHEAD_FOCUSED_20261106.md) pass. These establish scoped correctness and causal progress; combined-cache/dynamic-MTP Release overlap remains unqualified. Current hybrid benchmarks use ConsumerScheduled and warm all-hit requests. [Policy/overlap audit](../2026-11/QFN_HYBRID_NGRAM_POLICY_AND_OVERLAP_20261109.md). |
-| Continuation / ngrams | **ROCm TP2 shared-owner active MTP now passes:** RAM/owner1 C0/pure-reader coordinator/fixed3 gives **2,416 byte-exact comparisons**; SSD/owner0 C64/inline coordinator/fixed1 gives **1,208**, four cache promotions and four evictions. Both pass four prefix histories, public generation and clean retirement; source admission includes cold recreation. A hosted verifier signature was missing from producer validation; six focused host registrations pass. [New focused qualification](../2026-11/QFN_SHARED_OWNER_MTP_IDENTITY_FOCUSED_20261106.md). Earlier Static/Off RAM/C0 and SSD/C64 **25-history panels** remain green with identical numerical rows: [panel evidence](../2026-11/QFN_SHARED_READER_ADMISSION_FOCUSED_20261105.md). CPU2/MI50 moving fixed1/fixed3/dynamic is pushed in `010e57006`: [qualification](../2026-11/QFN_CPU_JOINT_MOVING_MTP_FOCUSED_CHECKPOINT_20261105.md). Next: ordinary hosted identity, grouped read-ahead, remaining target cells and Release economy. |
+| Continuation / ngrams | Prior ROCm TP2 shared-owner RAM/fixed3 and SSD/fixed1 slices pass 2,416/1,208 byte comparisons, four prefix histories, public generation and retirement. Current hybrid uses ConsumerScheduled; combined-cache/dynamic-MTP Release overlap remains unqualified. [Shared-owner evidence](../2026-11/QFN_SHARED_OWNER_MTP_IDENTITY_FOCUSED_20261106.md), [policy/overlap](../2026-11/QFN_HYBRID_NGRAM_POLICY_AND_OVERLAP_20261109.md). |
 
 QSA temporal/page certificates did not repay their costs through **64K/128K**;
 no pruning policy is installed. [Study][certificates]. CUDA hardware profiling
@@ -89,7 +98,7 @@ remain controls and do not qualify the new tier/ownership combinations.
 
 Functional coverage retains MTP off/1/3/dynamic and dynamic expert balancing.
 Small C0/C64 row-cache fixtures force movement; performance uses useful admitted
-capacities and reports exact tier bytes, hit rates and working set. Current
+capacities and reports exact tier bytes, hit rates and working set. Earlier pre-10.1
 native transfer floor: retained Release 22/28 green. Fresh original-owner
 Integration runs pass all six RCCL cases and all six CUDA cases after native
 stack provisioning; the original CUDA failure is reproduced by an isolated
@@ -142,7 +151,7 @@ the accepted references. N2047/D9 remains diagnostic, not long-context certifica
 **Matched A1 workload:** original four-shard `Qwen3.8-Flash-Next-UD-Q4_K_XL`,
 512 prompt tokens, 256 emitted tokens (255 after-prefill steps), context4096,
 FP16 KV, M512, greedy seed42, MTP/prefix cache off, unprofiled Release,
-28 NUMA1 physical workers, one warmup and three measured iterations per lifecycle.
+28 NUMA 1 physical workers, one warmup and three measured iterations per lifecycle.
 Arithmetic: HC-up TwoTermQ8, FP16 router operands with FP32 accumulation,
 FP16 MoE alpha/beta and ordinary Q8 projection activations.
 

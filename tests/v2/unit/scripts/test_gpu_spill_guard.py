@@ -4,6 +4,7 @@
 import importlib.util
 import argparse
 import copy
+import io
 from pathlib import Path
 import shlex
 import subprocess
@@ -82,6 +83,49 @@ class LauncherTest(unittest.TestCase):
             guard.preserve_device_diagnostics(["/usr/bin/ccache", "clang++", *flags]),
             ["/usr/bin/ccache", "clang++", "--ccache-skip", "-Xarch_device",
              "--ccache-skip", "-foptimization-record-file=-", "-c", "kernel.hip"])
+
+    def test_final_link_stdout_routing_survives_ccache_classification(self):
+        """The new driver must retain the real linker's stdout option on cache misses."""
+        flags = ["-Xarch_device", "-foptimization-record-file=-", "-Xoffload-linker",
+                 "-plugin-opt=opt-remarks-filename=-", "-c", "kernel.hip"]
+        self.assertEqual(guard.preserve_device_diagnostics(["clang++", *flags]), ["clang++", *flags])
+        self.assertEqual(guard.preserve_device_diagnostics(["ccache", "clang++", *flags]),
+            ["ccache", "clang++", "--ccache-skip", "-Xarch_device", "--ccache-skip",
+             "-foptimization-record-file=-", "--ccache-skip", "-Xoffload-linker",
+             "--ccache-skip", "-plugin-opt=opt-remarks-filename=-", "-c", "kernel.hip"])
+        # Preserve complete native option pairs without enumerating every
+        # future linker/device operand in this diagnostic transport layer.
+        other = ["-Xoffload-linker", "--lto-partitions=2", "-Xarch_device", "-O3"]
+        self.assertEqual(guard.preserve_device_diagnostics(["ccache", "clang++", *other]),
+            ["ccache", "clang++", "--ccache-skip", "-Xoffload-linker", "--ccache-skip",
+             "--lto-partitions=2", "--ccache-skip", "-Xarch_device", "--ccache-skip", "-O3"])
+
+    def test_final_link_stdout_is_required_for_every_target_and_helper_on_replay(self):
+        """Replay actual guard ownership with typed child output, never a compiler certificate."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output, sidecar = root / "cached.o", root / "-.opt.ld.yaml"
+            good = (AllocationTest.record("kernel") + AllocationTest.record("helper")) * 2
+            sidecar.write_text(good)
+            args = ["--llvm-bin", "/llvm", "--config", "Release", "--policy-id", "routing", "--",
+                    "ccache", "clang++", "-Xoffload-linker", "-plugin-opt=opt-remarks-filename=-",
+                    "-o", str(output)]
+            kernels = [guard.KernelSpills("kernel", 0, 0)] * 2
+            cases = [(good, 0), (good, 0), ("", 1),
+                     (AllocationTest.record("kernel") + AllocationTest.record("helper"), 1),
+                     (good + AllocationTest.record("helper", [("Spill", 4)]), 1)]
+            for text, expected in cases:
+                output.write_bytes(b"owned final object fixture")
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with self.subTest(expected=expected, stdout_records=len(text)), \
+                        patch.object(guard.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, text, "")), \
+                        patch.object(guard, "audit_rocm_object", return_value=kernels), \
+                        patch.object(sys, "stdout", stdout), patch.object(sys, "stderr", stderr):
+                    self.assertEqual(guard.main(args), expected)
+                self.assertEqual(output.exists(), expected == 0)
+                self.assertEqual(sidecar.read_text(), good)  # Never adopt/delete shared sidecar evidence.
+                if expected:
+                    self.assertIn("memory register spills are forbidden", stderr.getvalue())
 
     def test_output_and_response_file(self):
         with tempfile.TemporaryDirectory() as directory:

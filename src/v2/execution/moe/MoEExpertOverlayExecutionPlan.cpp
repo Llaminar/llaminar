@@ -479,7 +479,7 @@ namespace llaminar2
         };
 
         /**
-         * @brief Bind one GPU to an exact observed rank, preferring physical locality.
+         * @brief Bind one GPU only to an exact observed NUMA-local execution rank.
          * @param participant Portable endpoint; explicit host/NUMA fields constrain matching.
          * @param inventory Canonical rank observations, including CPU affinity and GPU locality.
          * @param domain_name Domain identity for actionable failure diagnostics.
@@ -515,8 +515,7 @@ namespace llaminar2
                         continue;
                     }
                     visible.push_back(GpuBindingCandidate{&rank, &gpu});
-                    if (gpu.numa_node >= 0 &&
-                        rank.cpu.numa_node == gpu.numa_node)
+                    if (rankOwnsGPUDevice(rank, gpu))
                     {
                         local.push_back(GpuBindingCandidate{&rank, &gpu});
                     }
@@ -545,8 +544,11 @@ namespace llaminar2
             };
             visible = uniqueByRank(std::move(visible));
             local = uniqueByRank(std::move(local));
-            const auto &candidates =
-                (pinned_rank.has_value() || local.empty()) ? visible : local;
+            // An explicit owner is immutable, and visibility alone never grants ownership.
+            if (local.empty() && !visible.empty())
+                requireRankLocalGPUOwnership(*visible.front().rank, *visible.front().device,
+                    "MoE overlay domain '" + domain_name + "'");
+            const auto &candidates = local;
             if (candidates.empty())
             {
                 std::ostringstream error;

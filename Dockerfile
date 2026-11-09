@@ -100,6 +100,8 @@ COPY scripts/docker/install-system-deps.sh \
      scripts/docker/rocm-release.env \
      scripts/docker/configure-rocm-repository.sh \
      scripts/docker/install-hip-graph-runtime.sh \
+     scripts/docker/install-rocr-helper-numa.sh \
+     scripts/docker/install-rocm-smi-compat.sh \
      scripts/docker/install-rocblas.sh \
      scripts/docker/install-cutlass.sh \
      /tmp/install-scripts/
@@ -109,6 +111,8 @@ COPY scripts/build/gpu_spill_guard.py /tmp/build/gpu_spill_guard.py
 COPY scripts/docker/llvm-lto-linker/ /tmp/install-scripts/llvm-lto-linker/
 COPY scripts/docker/patches/llvm-parallel-lto-remarks.patch \
      /tmp/install-scripts/patches/llvm-parallel-lto-remarks.patch
+COPY scripts/docker/patches/llvm-gvn-filtered-remarks.patch \
+     /tmp/install-scripts/patches/llvm-gvn-filtered-remarks.patch
 # CUDA's NCCL installer consumes this patch during early toolchain setup.
 COPY scripts/docker/patches/nccl-capture-reentry.patch \
      /tmp/install-scripts/patches/nccl-capture-reentry.patch
@@ -127,14 +131,14 @@ COPY scripts/docker/shared-file-lifecycle/ /tmp/install-scripts/shared-file-life
 COPY scripts/docker/patches/nccl-partial-file-cleanup.patch \
      /tmp/install-scripts/patches/nccl-partial-file-cleanup.patch
 COPY scripts/docker/patches/rocm-hip-graph-empty-segment-publication.patch \
-     scripts/docker/patches/rocm-hip-host-queue-native-stack.patch \
-     scripts/docker/patches/rocm-hip-sdma-stream-sharing.patch \
      scripts/docker/patches/rocm-hip-sdma-event-publication.patch \
      scripts/docker/patches/rocm-hip-graph-progress-safe-collapse.patch \
      scripts/docker/patches/rocm-hip-event-producer-lifetime.patch \
      scripts/docker/patches/rocm-hip-graph-kernarg-metadata.patch \
      scripts/docker/patches/rocm-hip-preferred-queue-unshared.patch \
      /tmp/install-scripts/patches/
+COPY scripts/docker/patches/rocm-rocr-helper-numa.patch /tmp/install-scripts/patches/rocm-rocr-helper-numa.patch
+COPY scripts/docker/rocr-helper-numa/ /tmp/install-scripts/rocr-helper-numa/
 COPY scripts/docker/hip-preferred-queue/proof.py \
      scripts/docker/hip-preferred-queue/selector-contract.cpp.in \
      /tmp/install-scripts/hip-preferred-queue/
@@ -200,6 +204,8 @@ COPY scripts/docker/patches/rccl-collective-selector-taxonomy.patch \
      /tmp/install-scripts/patches/rccl-collective-selector-taxonomy.patch
 COPY scripts/docker/patches/rccl-small-allgather-ll-policy.patch \
      /tmp/install-scripts/patches/rccl-small-allgather-ll-policy.patch
+COPY scripts/docker/patches/rccl-sdk-legacy-smi.patch /tmp/install-scripts/patches/rccl-sdk-legacy-smi.patch
+COPY scripts/docker/patches/rccl-user-p2p-override.patch /tmp/install-scripts/patches/rccl-user-p2p-override.patch
 COPY scripts/docker/patches/rccl-device-completed-broadcast.patch \
      /tmp/install-scripts/patches/rccl-device-completed-broadcast.patch
 # ccache hashes the compiler and full command line, so one 50 GB shared cache
@@ -287,11 +293,13 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
         rccl_protocol_patch_sha="$(sha256sum /tmp/install-scripts/patches/rccl-communicator-protocol-defaults.patch | cut -d ' ' -f 1)"; \
         rccl_selector_patch_sha="$(sha256sum /tmp/install-scripts/patches/rccl-collective-selector-taxonomy.patch | cut -d ' ' -f 1)"; \
         rccl_small_allgather_patch_sha="$(sha256sum /tmp/install-scripts/patches/rccl-small-allgather-ll-policy.patch | cut -d ' ' -f 1)"; \
+        rccl_smi_patch_sha="$(sha256sum /tmp/install-scripts/patches/rccl-sdk-legacy-smi.patch | cut -d ' ' -f 1)"; \
+        rccl_user_p2p_patch_sha="$(sha256sum /tmp/install-scripts/patches/rccl-user-p2p-override.patch | cut -d ' ' -f 1)"; \
         rccl_completed_patch_sha="$(sha256sum /tmp/install-scripts/patches/rccl-device-completed-broadcast.patch | cut -d ' ' -f 1)"; \
         rccl_target_hash="$(printf '%s' "${RCCL_GPU_TARGETS}" | sha256sum | cut -d ' ' -f 1)"; \
         rccl_lto_receipt_sha="$(sha256sum "${LLAMINAR_ROCM_LTO_LINKER_PREFIX}/share/llaminar-llvm-lto/receipt.json" | cut -d ' ' -f 1)"; \
         rccl_lto_producer_sha="$(sha256sum /tmp/install-scripts/llvm-lto-linker/artifact.py | cut -d ' ' -f 1)"; \
-        printf '%s\n' "targets-${rccl_target_hash}-llvm-lto-${rccl_lto_receipt_sha}-producer-${rccl_lto_producer_sha}-${RCCL_GIT_REF}-completed-${rccl_completed_patch_sha}-capture-${rccl_capture_patch_sha}-rows-${rccl_rows_patch_sha}-storage-${rccl_storage_patch_sha}-shm-${rccl_shm_patch_sha}-selector-${rccl_selector_patch_sha}-thread-${rccl_thread_patch_sha}-protocol-${rccl_protocol_patch_sha}-smallag-${rccl_small_allgather_patch_sha}" \
+        printf '%s\n' "p2p-${rccl_user_p2p_patch_sha}-targets-${rccl_target_hash}-llvm-lto-${rccl_lto_receipt_sha}-producer-${rccl_lto_producer_sha}-${RCCL_GIT_REF}-smi-${rccl_smi_patch_sha}-completed-${rccl_completed_patch_sha}-capture-${rccl_capture_patch_sha}-rows-${rccl_rows_patch_sha}-storage-${rccl_storage_patch_sha}-shm-${rccl_shm_patch_sha}-selector-${rccl_selector_patch_sha}-thread-${rccl_thread_patch_sha}-protocol-${rccl_protocol_patch_sha}-smallag-${rccl_small_allgather_patch_sha}" \
             > /src/external/rccl/build/.llaminar-rccl-commit.pending; \
         python3 /tmp/install-scripts/llvm-lto-linker/artifact.py compile \
             --sdk "${ROCM_PATH}" \
@@ -571,7 +579,7 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
         \( -name '*.o' -o -name '*.d' -o -name '*.gch' -o -name '*.cmake_pch.hxx' \) \
         -delete \
  && find build_v2_release -depth -type d -name CMakeFiles -exec rm -rf {} + \
- && mkdir -p /src/runtime-bin /src/runtime-libs /src/runtime-licenses /src/runtime-rocblas /src/runtime-hip \
+ && mkdir -p /src/runtime-bin /src/runtime-libs /src/runtime-licenses /src/runtime-rocblas /src/runtime-hip /src/runtime-rocr /src/runtime-rocm-smi \
  && cp build_v2_release/llaminar2 /src/runtime-bin/llaminar2 \
  && cp build_v2_release/llaminar_mpi_session /src/runtime-bin/ \
  && cp -r build_v2_release/llaminar_mpi_components /src/runtime-bin/ \
@@ -586,6 +594,8 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
  && if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then cp -r /usr/local/share/licenses/llaminar-nccl /src/runtime-licenses/; fi \
  && if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then \
         HIP_RUNTIME_STAGE_PREFIX=/src/runtime-hip bash scripts/docker/install-hip-graph-runtime.sh; \
+        ROCR_RUNTIME_STAGE_PREFIX=/src/runtime-rocr bash scripts/docker/install-rocr-helper-numa.sh; \
+        ROCM_SMI_STAGE_PREFIX=/src/runtime-rocm-smi bash scripts/docker/install-rocm-smi-compat.sh; \
         mkdir -p /src/runtime-rocblas/lib/rocblas /src/runtime-rocblas/share/llaminar; \
         cp -L "${ROCM_PATH}/lib/librocblas.so" /src/runtime-rocblas/lib/librocblas.so.5; \
         ln -s librocblas.so.5 /src/runtime-rocblas/lib/librocblas.so; \
@@ -694,6 +704,8 @@ COPY --from=builder /src/runtime-libs/ /usr/local/lib/
 # component. RUNPATH, dependent $ORIGIN paths and ldconfig now name one owner;
 # LD_LIBRARY_PATH is not required to bypass a stock SDK copy.
 COPY --from=builder /src/runtime-hip/ /opt/rocm-sdk/
+COPY --from=builder /src/runtime-rocr/ /opt/rocm-sdk/
+COPY --from=builder /src/runtime-rocm-smi/ /opt/rocm-sdk/
 COPY --from=builder /src/runtime-licenses/ /usr/local/share/licenses/
 # Keep the rocBLAS DSO and its shipping-target Tensile tree at their SDK-relative paths.
 # The DSO resolves code objects relative to itself, not from a foreign package.

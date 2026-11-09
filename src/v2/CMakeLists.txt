@@ -796,6 +796,13 @@ if(HAVE_ROCM)
         ${ROCM_PATH}/lib/libhipblaslt.so         # hipBLASLt for fused GEMM+bias
     )
     
+    # HSA interop shares the selected HIP SDK's physical runtime. Resolve once
+    # during configuration, not through ldconfig/LD_LIBRARY_PATH at execution.
+    include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/ROCmHSARuntime.cmake")
+    llaminar_find_rocm_hsa_runtime(ROCM_HSA_RUNTIME_LIBRARY)
+    set_property(SOURCE backends/rocm/ROCmBackend.cpp APPEND
+        PROPERTY COMPILE_DEFINITIONS "LLAMINAR_HSA_RUNTIME_LIBRARY_PATH=\"${ROCM_HSA_RUNTIME_LIBRARY}\"")
+
     # RCCLBackend.cpp needs MPI for MPIContext
     target_link_libraries(rocm_backend PUBLIC MPI::MPI_CXX)
     
@@ -896,6 +903,14 @@ if(HAVE_ROCM)
     set(RCCL_EXTERNAL_DIR "${REPO_ROOT}/external/rccl")
     set(RCCL_BUILD_DIR "${RCCL_EXTERNAL_DIR}/build")
 
+    # Shared proof authority is published by the dependency owner, before any
+    # test module/Release selection. Preserve explicit nonempty source builds.
+    if(NOT DEFINED RCCL_PROTOCOL_BUILD_DIR OR RCCL_PROTOCOL_BUILD_DIR STREQUAL "")
+        set(RCCL_PROTOCOL_BUILD_DIR "${RCCL_BUILD_DIR}" CACHE PATH
+            "Completed canonical RCCL source build for source/DSO-bound proofs" FORCE)
+    endif()
+    # End shared RCCL proof authority.
+
     if(LLAMINAR_BUILD_RCCL_FROM_SOURCE)
         find_package(Git REQUIRED)
     
@@ -986,6 +1001,8 @@ if(HAVE_ROCM)
     file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-collective-selector-taxonomy.patch" RCCL_SELECTOR_PATCH_HASH)
     file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-small-allgather-ll-policy.patch" RCCL_SMALL_ALLGATHER_PATCH_HASH)
     file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-device-completed-broadcast.patch" RCCL_COMPLETED_PATCH_HASH)
+    file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-sdk-legacy-smi.patch" RCCL_SMI_PATCH_HASH)
+    file(SHA256 "${REPO_ROOT}/scripts/docker/patches/rccl-user-p2p-override.patch" RCCL_USER_P2P_PATCH_HASH)
     # This is a nested dependency/compiler contract, not an inference admission
     # policy. The fixed builder-owned linker preserves full parallel LTO and
     # emits final physical allocation records for every native partition.
@@ -1011,13 +1028,14 @@ if(HAVE_ROCM)
     file(READ "${RCCL_BUILD_DIR}/llaminar-final-allocation/configuration.json" RCCL_LTO_CONFIGURATION)
     string(JSON RCCL_LTO_RECEIPT_HASH GET "${RCCL_LTO_CONFIGURATION}" linker_receipt_sha256)
     file(SHA256 "${RCCL_LTO_ARTIFACT_SCRIPT}" RCCL_LTO_PRODUCER_HASH)
-    set(RCCL_BUILD_ID "${RCCL_COMMIT}-completed-${RCCL_COMPLETED_PATCH_HASH}-capture-${RCCL_CAPTURE_PATCH_HASH}-rows-${RCCL_ROWS_PATCH_HASH}-storage-${RCCL_HOST_STORAGE_PATCH_HASH}-shm-${RCCL_SHM_PATCH_HASH}-selector-${RCCL_SELECTOR_PATCH_HASH}-thread-${RCCL_THREAD_PATCH_HASH}-protocol-${RCCL_PROTOCOL_PATCH_HASH}-smallag-${RCCL_SMALL_ALLGATHER_PATCH_HASH}")
+    set(RCCL_BUILD_ID "${RCCL_COMMIT}-smi-${RCCL_SMI_PATCH_HASH}-completed-${RCCL_COMPLETED_PATCH_HASH}-capture-${RCCL_CAPTURE_PATCH_HASH}-rows-${RCCL_ROWS_PATCH_HASH}-storage-${RCCL_HOST_STORAGE_PATCH_HASH}-shm-${RCCL_SHM_PATCH_HASH}-selector-${RCCL_SELECTOR_PATCH_HASH}-thread-${RCCL_THREAD_PATCH_HASH}-protocol-${RCCL_PROTOCOL_PATCH_HASH}-smallag-${RCCL_SMALL_ALLGATHER_PATCH_HASH}")
     
     # A changed requested target set requires new actual device binaries even
     # when the pinned patched source is unchanged.
     string(SHA256 RCCL_TARGET_POLICY_HASH "${RCCL_GPU_TARGETS}")
     # Compiler metadata precedes the strict thread/protocol/smallAG repair suffix.
     string(PREPEND RCCL_BUILD_ID "targets-${RCCL_TARGET_POLICY_HASH}-llvm-lto-${RCCL_LTO_RECEIPT_HASH}-producer-${RCCL_LTO_PRODUCER_HASH}-")
+    string(PREPEND RCCL_BUILD_ID "p2p-${RCCL_USER_P2P_PATCH_HASH}-")
 
     # Check if RCCL build is up-to-date
     set(RCCL_VERSION_FILE "${RCCL_BUILD_DIR}/.llaminar-rccl-commit")

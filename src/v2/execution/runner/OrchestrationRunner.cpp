@@ -145,6 +145,7 @@
 #include "../../config/OrchestrationStartupPolicy.h"
 #include "../../planning/ActivationBufferSizing.h"
 #include "../../planning/RankMemoryPlanInputs.h"
+#include "../../planning/RankHardwareOwnership.h"
 #include "../../backends/NativeContextPreparation.h"
 #include "../../planning/MoEOverlayPlanningInputs.h"
 #include "../../planning/MoEOverlayMemoryPlanInputs.h"
@@ -22130,6 +22131,14 @@ namespace llaminar2
                     if(std::find(unique_gpus.begin(),unique_gpus.end(),endpoint.device())==unique_gpus.end())
                         unique_gpus.push_back(endpoint.device());
                 }
+                // Validate every selected role even when borrowing an existing
+                // source. Storage-only/coordinator workers are not represented
+                // by the plan's primary/TP devices and cannot borrow visibility
+                // as permission to execute on another NUMA node.
+                const auto &owner_inventory = cluster_inventory_.ranks.at(static_cast<std::size_t>(world_rank));
+                for (const auto device : unique_gpus)
+                    requireRankLocalGPUOwnership(owner_inventory, device,
+                        "Native GPU preparation (" + std::string(purpose) + ")");
                 // Immutable inventory startup is a separately measured baseline.
                 // These ORIGINAL observations precede selected worker birth; no
                 // later free-memory sample may adopt that birth after growth.

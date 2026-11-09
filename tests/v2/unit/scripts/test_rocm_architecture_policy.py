@@ -128,13 +128,16 @@ class ROCmArchitecturePolicyTests(unittest.TestCase):
             probe=source/'probe.py'
             probe.write_text('import os\nassert "HSA_OVERRIDE_GFX_VERSION" not in os.environ, dict(os.environ)\n')
             (source/'CMakeLists.txt').write_text('cmake_minimum_required(VERSION 3.27)\nproject(Env NONE)\nenable_testing()\n'
+                # Keep the real Release/native-owner selection dependency; a
+                # fixture replacement would bypass the production registration.
+                f'include("{ROOT}/tests/v2/cmake/V2TestTargetSelection.cmake")\n'
                 'add_executable(llaminar_mpi_session IMPORTED GLOBAL)\n'
                 f'set_property(TARGET llaminar_mpi_session PROPERTY IMPORTED_LOCATION "{helper}")\n'
                 'set(V2_TEST_SOCKETS 1)\nset(V2_TEST_CORES_PER_SOCKET 1)\n'+text[start:end]+'\n'
                 f'add_v2_test(NativeIdentity COMMAND "{shutil.which("python3")}" "{probe}" LABELS Integration ROCm DeviceFree NO_MPI NO_MODELS MPI_PROCS 1)\n')
             result=run(['cmake','-S',str(source),'-B',str(build),'-G','Ninja'])
             self.assertEqual(result.returncode,0,result.stdout+result.stderr)
-            result=run(['ctest','--test-dir',str(build),'--output-on-failure'],env={**os.environ,'HSA_OVERRIDE_GFX_VERSION':'9.0.6'})
+            result=run(['ctest','--test-dir',str(build),'--output-on-failure','--no-tests=error'],env={**os.environ,'HSA_OVERRIDE_GFX_VERSION':'9.0.6'})
             self.assertEqual(result.returncode,0,result.stdout+result.stderr)
 
     def test_actual_campaign_child_uses_native_identity(self):

@@ -11,6 +11,8 @@
  * @author David Sanftenberg
  * Immutable hardware identity is admitted once; these queries never reopen
  * a context or confuse physical facts with runtime-resource generations.
+ * HSA interop opens only the real library selected from ROCM_PATH by CMake;
+ * bare runtime names cannot select an older SDK through the system cache.
  */
 
 #include "ROCmBackend.h"
@@ -39,6 +41,11 @@
 #include <sstream>
 #include <cstring>
 #include <dlfcn.h> // For HSA runtime loading
+
+#ifndef LLAMINAR_HSA_RUNTIME_LIBRARY_PATH
+#error "ROCm backend requires its CMake-selected SDK HSA runtime path"
+#endif
+
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -6657,7 +6664,7 @@ namespace llaminar2
         // But this doesn't exist either...
 
         // Let's try to use HSA directly via dlsym
-        void *hsa_handle = dlopen("libhsa-runtime64.so", RTLD_NOW | RTLD_GLOBAL);
+        void *hsa_handle = dlopen(LLAMINAR_HSA_RUNTIME_LIBRARY_PATH, RTLD_NOW | RTLD_GLOBAL);
         if (!hsa_handle)
         {
             LOG_ERROR("[ROCmBackend::hsaMemoryLock] Failed to load HSA runtime: " << dlerror());
@@ -6706,7 +6713,7 @@ namespace llaminar2
             return;
         }
 
-        void *hsa_handle = dlopen("libhsa-runtime64.so", RTLD_NOW | RTLD_GLOBAL);
+        void *hsa_handle = dlopen(LLAMINAR_HSA_RUNTIME_LIBRARY_PATH, RTLD_NOW | RTLD_GLOBAL);
         if (!hsa_handle)
         {
             LOG_WARN("[ROCmBackend::hsaMemoryUnlock] Failed to load HSA runtime");
@@ -6741,7 +6748,7 @@ namespace llaminar2
 
         LOG_INFO("[ROCmBackend::hsaInteropMapBuffer] Attempting to map dmabuf fd=" << dmabuf_fd);
 
-        void *hsa_handle = dlopen("libhsa-runtime64.so", RTLD_NOW | RTLD_GLOBAL);
+        void *hsa_handle = dlopen(LLAMINAR_HSA_RUNTIME_LIBRARY_PATH, RTLD_NOW | RTLD_GLOBAL);
         if (!hsa_handle)
         {
             LOG_ERROR("[ROCmBackend::hsaInteropMapBuffer] Failed to load HSA runtime: " << dlerror());
@@ -6818,7 +6825,7 @@ namespace llaminar2
             return;
         }
 
-        void *hsa_handle = dlopen("libhsa-runtime64.so", RTLD_NOW | RTLD_GLOBAL);
+        void *hsa_handle = dlopen(LLAMINAR_HSA_RUNTIME_LIBRARY_PATH, RTLD_NOW | RTLD_GLOBAL);
         if (!hsa_handle)
         {
             LOG_WARN("[ROCmBackend::hsaInteropUnmapBuffer] Failed to load HSA runtime");
@@ -6905,7 +6912,7 @@ namespace llaminar2
         // HIP exposes hipDeviceGetAttribute for getting the HSA agent
         // But we need to use HSA directly for this
 
-        void *hsa_handle = dlopen("libhsa-runtime64.so", RTLD_NOW | RTLD_GLOBAL);
+        void *hsa_handle = dlopen(LLAMINAR_HSA_RUNTIME_LIBRARY_PATH, RTLD_NOW | RTLD_GLOBAL);
         if (!hsa_handle)
         {
             LOG_ERROR("[ROCmBackend::getHsaAgent] Failed to load HSA runtime");

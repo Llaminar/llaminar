@@ -9,8 +9,8 @@ producer. Use the existing device stream registry and monotonic stream ID to
 borrow the exact generation for capture metadata inspection. No queue owner,
 allocation, device transfer, synchronization or graph scheduling mode is added.
 
-Pinned base: ROCm/rocm-systems 6b0e43f341195e203754e08f850e437ff2fc09f9
-             (therock-10.0, ROCm Core SDK 10.0.0)
+Pinned base: ROCm/rocm-systems 7da43026e4f2ef7600433c38c820732f7a205d22
+             (therock-10.1, ROCm Core SDK 10.1.0)
 
 diff --git a/hipamd/src/hip_internal.hpp b/hipamd/src/hip_internal.hpp
 --- a/hipamd/src/hip_internal.hpp
@@ -51,7 +51,7 @@ diff --git a/hipamd/src/hip_internal.hpp b/hipamd/src/hip_internal.hpp
 +    }
      /// Synchronize all streams (optionally only blocking ones)
      void SyncAllStreams(bool cpu_wait = true, bool wait_blocking_streams_only = false);
-     /// Returns true if any stream on this device is in capture mode
+     /// Returns and clears an async error from blocking streams on this device
 diff --git a/hipamd/src/hip_event.hpp b/hipamd/src/hip_event.hpp
 --- a/hipamd/src/hip_event.hpp
 +++ b/hipamd/src/hip_event.hpp

@@ -101,6 +101,8 @@ class RCCLProtocolProofTests(unittest.TestCase):
             smallag.P.verify(smallag_report, smallag_case.library)
 
         pairs = [
+            ("USER_P2P", "user_p2p", "rccl-user-p2p-override.patch"),
+            ("SMI", "smi", "rccl-sdk-legacy-smi.patch"),
             ("COMPLETED", "completed", "rccl-device-completed-broadcast.patch"),
             ("CAPTURE", "capture", "rccl-hip-capture-event-wait.patch"),
             ("ROWS", "rows", "rccl-device-live-rows.patch"),
@@ -133,7 +135,7 @@ class RCCLProtocolProofTests(unittest.TestCase):
         cmake_receipt = output.read_text()
         docker = (ROOT / "Dockerfile").read_text()
         producer = next(line.strip().removesuffix("\\").rstrip() for line in docker.splitlines()
-                        if line.strip().startswith("printf '%s\\n' \"targets-${rccl_target_hash}"))
+                        if line.strip().startswith("printf '%s\\n' \"p2p-${rccl_user_p2p_patch_sha}"))
         result = subprocess.run(["bash", "-c", producer], env=environment,
                                 capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -211,6 +213,56 @@ class RCCLProtocolProofTests(unittest.TestCase):
                 changed.pop(field)
                 with self.assertRaisesRegex(RuntimeError, "identity"):
                     PROOF.verify_report(changed, self.library)
+
+    def test_original_consumer_preserves_both_hipify_include_layouts(self):
+        """Reverse actual patch hunks with old and SDK 10.1 include placement.
+
+        This is a source-extraction fixture, not fabricated numerical evidence.
+        The builder still compiles the actual native tree and its reversed body.
+        """
+        section = (ROOT / PROOF.PATCH).read_text()
+        baseline = []
+        for hunk in re.split(r"(?m)(?=^@@ )", section)[1:]:
+            header, *lines = hunk.splitlines(keepends=True)
+            first = int(re.match(r"@@ -(\d+)", header)[1])
+            while len(baseline) < first - 1:
+                baseline.append("// unchanged native line\n")
+            baseline.extend(line[1:] for line in lines if line.startswith((" ", "-")))
+        include = b'#include "hip/hip_runtime.h"\n'
+        # Header-first positions cover the observed generated include at line32
+        # and the adjacent longer-header layout at line36. The old layout has
+        # one prepended include; it must not manufacture a second source include.
+        for layout in ("prepended", "header-first-32", "header-first-36"):
+            with self.subTest(layout=layout), tempfile.TemporaryDirectory() as directory:
+                body = baseline.copy()
+                prefix = include if layout == "prepended" else b""
+                if not prefix:
+                    generated_line = int(layout.rsplit("-", 1)[1])
+                    body[generated_line - 10] = include.decode()
+                original_bytes = "".join(body).encode()
+                root = Path(directory)
+                source = root / "src/rccl_wrap.cc"
+                source.parent.mkdir()
+                source.write_bytes(original_bytes)
+                subprocess.run(["git", "apply", str(ROOT / PROOF.PATCH)],
+                               cwd=root, check=True, capture_output=True)
+                generated = prefix + source.read_bytes()
+                source.write_bytes(generated)
+                destination = root / "negative/src/rccl_wrap.cc"
+                PROOF.prepare_original_consumer(source, destination)
+                self.assertEqual(destination.read_bytes(), prefix + original_bytes)
+                self.assertEqual(source.read_bytes(), generated)
+                for malformed in (b"", b'#include "hip/hip_runtime_api.h"\n',
+                                  b'// #include "hip/hip_runtime.h"\n'):
+                    source.write_bytes(generated.replace(include, malformed, 1))
+                    with self.subTest(malformed=malformed), self.assertRaisesRegex(
+                            RuntimeError, "canonical first HIP runtime include"):
+                        PROOF.prepare_original_consumer(source, destination)
+                # A consumer without the canonical repair cannot manufacture an
+                # original variant by silently accepting a failed reversal.
+                source.write_bytes(prefix + original_bytes)
+                with self.assertRaises(subprocess.CalledProcessError):
+                    PROOF.prepare_original_consumer(source, destination)
 
     def test_compile_inputs_preserve_definitions_and_headers_without_shell_execution(self):
         """Read the native compile database as structured argument data only."""

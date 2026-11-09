@@ -10,6 +10,7 @@
 #include "backends/DeviceUUID.h"
 #include "planning/RankHardwareOwnership.h"
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <array>
 #include <limits>
 
@@ -244,4 +245,66 @@ TEST(PhysicalInventoryAggregation, CapacityAndCoreOverflowCannotPublishASummary)
     EXPECT_THROW(inventory.buildNodeAggregations(), std::overflow_error);
     inventory.ranks[0].cpu_cores = -1;
     EXPECT_THROW(inventory.buildNodeAggregations(), std::invalid_argument);
+}
+
+/** @test Canonical publication rejects conflicting physical locality before any owner selection. */
+TEST(PhysicalInventoryAggregation, RankLocalGPURejectsConflictingKnownNUMAAliases)
+{
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        auto inventory = overlappingInventory();
+        inventory.buildNodeAggregations();
+        for (auto &rank : inventory.ranks)
+            for (auto &gpu : rank.gpus)
+                if (gpu.type == backend) gpu.numa_node = rank.rank == 0 ? 3 : 7;
+        EXPECT_THROW(inventory.buildNodeAggregations(), std::invalid_argument);
+        EXPECT_EQ(inventory.total_gpu_memory, 100u);
+        EXPECT_EQ(inventory.total_gpus, 2);
+    }
+}
+
+/** @test Unknown aliases stay unqualified and cannot mask two later contradictory observations. */
+TEST(PhysicalInventoryAggregation, RankLocalGPUUnknownAliasDoesNotInventOrMaskNUMA)
+{
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        auto inventory = overlappingInventory();
+        const auto find = [&](int rank) -> DeviceInfo & {
+            return *std::find_if(inventory.ranks[rank].gpus.begin(), inventory.ranks[rank].gpus.end(),
+                [&](const auto &gpu) { return gpu.type == backend; });
+        };
+        find(0).numa_node = -1;
+        find(1).numa_node = 7;
+        EXPECT_NO_THROW(inventory.buildNodeAggregations());
+        EXPECT_EQ(find(0).numa_node, -1);
+        EXPECT_EQ(find(1).numa_node, 7);
+        auto third = inventory.ranks[1];
+        third.rank = 2;
+        inventory.ranks.push_back(std::move(third));
+        inventory.world_size = 3;
+        find(2).numa_node = 9;
+        EXPECT_THROW(inventory.buildNodeAggregations(), std::invalid_argument);
+        EXPECT_EQ(find(0).numa_node, -1);
+        EXPECT_EQ(inventory.total_gpu_memory, 100u);
+    }
+}
+
+/** @test A rank cannot give one physical GPU two ordinals, or one ordinal two physical GPUs. */
+TEST(PhysicalInventoryAggregation, RankLocalGPURejectsAmbiguousLocalUUIDAndOrdinal)
+{
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    for (const bool duplicate_uuid : {false, true})
+    {
+        auto inventory = overlappingInventory();
+        inventory.buildNodeAggregations();
+        auto &rank = inventory.ranks.front();
+        auto duplicate = *std::find_if(rank.gpus.begin(), rank.gpus.end(),
+            [&](const auto &gpu) { return gpu.type == backend; });
+        if (duplicate_uuid) duplicate.local_device_id += 99;
+        else duplicate.uuid += "-different-device";
+        rank.gpus.push_back(std::move(duplicate));
+        EXPECT_THROW(inventory.buildNodeAggregations(), std::invalid_argument);
+        EXPECT_EQ(inventory.total_gpu_memory, 100u);
+        EXPECT_EQ(inventory.total_gpus, 2);
+    }
 }

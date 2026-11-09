@@ -21,7 +21,11 @@ add_compile_options(
     # including device callees. stdout is cached by ccache; no sidecar is needed.
     # '-' inherits stdout's file descriptor instead of reopening /dev/stdout and
     # potentially overwriting another target's remarks or compiler diagnostics.
-    "$<$<AND:$<COMPILE_LANGUAGE:HIP>,$<OR:$<CONFIG:Release>,$<CONFIG:Integration>>>:SHELL:-Xarch_device -fsave-optimization-record=yaml -Xarch_device -foptimization-record-passes=stack-frame-layout -Xarch_device -foptimization-record-file=- -Xarch_device -Rpass-analysis=stack-frame-layout>")
+    # The new HIP driver performs final codegen in a device LTO link. Clang
+    # suffixes its frontend filename '-' as '-.opt.ld.yaml' there; send the
+    # actual final linker's last filename option directly to stdout instead.
+    # Keeping both boundaries retains the original direct-cc1 evidence path.
+    "$<$<AND:$<COMPILE_LANGUAGE:HIP>,$<OR:$<CONFIG:Release>,$<CONFIG:Integration>>>:SHELL:-Xarch_device -fsave-optimization-record=yaml -Xarch_device -foptimization-record-passes=stack-frame-layout -Xarch_device -foptimization-record-file=- -Xarch_device -Rpass-analysis=stack-frame-layout -Xoffload-linker -plugin-opt=opt-remarks-filename=->")
 
 if(CMAKE_HIP_COMPILER)
     get_filename_component(LLAMINAR_HIP_LLVM_BIN "${CMAKE_HIP_COMPILER}" DIRECTORY)

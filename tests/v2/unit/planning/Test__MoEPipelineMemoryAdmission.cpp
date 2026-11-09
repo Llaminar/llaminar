@@ -60,6 +60,8 @@ namespace
         RankInventory rank;
         rank.rank = rank.node_id = rank.local_rank = 0;
         rank.hostname = "pipeline-host";
+        rank.cpu.numa_node = 0;
+        rank.numa_nodes = 1;
         rank.cpu_cores = rank.cpu_worker_threads = 8;
         rank.cpu_execution = kSyntheticCPUExecutionGeometry;
         rank.cpu.memory_bytes = rank.cpu.free_memory_bytes = rank.cpu_memory_bytes = 256ULL << 30;
@@ -68,7 +70,7 @@ namespace
             for (int ordinal = 0; ordinal < width; ++ordinal)
                 rank.gpus.push_back({.type = backend, .local_device_id = ordinal,
                     .memory_bytes = 32ULL << 30, .free_memory_bytes = 24ULL << 30,
-                    .compute_units = 64, .uuid = std::string(deviceTypeToString(backend)) + "-observed-" + std::to_string(ordinal)});
+                    .compute_units = 64, .uuid = std::string(deviceTypeToString(backend)) + "-observed-" + std::to_string(ordinal), .numa_node = 0});
             auto &matrix = backend == DeviceType::CUDA ? rank.p2p_cuda : rank.p2p_rocm;
             (backend == DeviceType::CUDA ? rank.p2p_cuda_count : rank.p2p_rocm_count) = width;
             matrix.assign(size_t(width * width), false);

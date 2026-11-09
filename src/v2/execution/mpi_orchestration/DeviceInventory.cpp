@@ -70,6 +70,8 @@ namespace llaminar2
             auto &node = rebuilt[r.node_id];
             if (node.hostname.empty()) node.hostname = r.hostname;
             node.ranks.push_back(r.rank);
+            std::set<GPUKey> local_uuids;
+            std::set<std::pair<DeviceType, int>> local_ordinals;
             for (const auto &gpu : r.gpus)
             {
                 if (!gpu.isGPU())
@@ -83,16 +85,31 @@ namespace llaminar2
                     addCount(node.total_gpus, 1);
                     continue;
                 }
+                // One process namespace must name each observed physical GPU
+                // once. Cross-rank ordinal remapping remains valid; repeated
+                // UUIDs or ordinals within one rank are ambiguous ownership.
+                if (gpu.local_device_id < 0 ||
+                    !local_uuids.emplace(gpu.type, gpu.uuid).second ||
+                    !local_ordinals.emplace(gpu.type, gpu.local_device_id).second)
+                    throw std::invalid_argument("Ambiguous GPU identity in MPI rank " + std::to_string(r.rank));
                 const auto [it, inserted] = gpu_views[r.node_id].emplace(
                     GPUKey{gpu.type, gpu.uuid}, &gpu);
                 if (!inserted)
                 {
                     const auto &previous = *it->second;
+                    if (previous.numa_node >= 0 && gpu.numa_node >= 0 &&
+                        previous.numa_node != gpu.numa_node)
+                        throw std::invalid_argument("Conflicting NUMA observations of GPU UUID " + gpu.uuid +
+                            ": " + std::to_string(previous.numa_node) + " versus " + std::to_string(gpu.numa_node));
                     if (previous.memory_bytes != gpu.memory_bytes ||
                         previous.compute_units != gpu.compute_units ||
                         previous.pci_bus_address != gpu.pci_bus_address ||
                         previous.last_level_cache_bytes != gpu.last_level_cache_bytes)
                         throw std::invalid_argument("Conflicting observations of GPU UUID " + gpu.uuid);
+                    // Retain a known observation for later consistency checks.
+                    // This only changes a temporary validation pointer; never
+                    // fill an unknown rank's published NUMA or ownership.
+                    if (previous.numa_node < 0 && gpu.numa_node >= 0) it->second = &gpu;
                     continue;
                 }
                 addCount(node.total_gpus, 1);

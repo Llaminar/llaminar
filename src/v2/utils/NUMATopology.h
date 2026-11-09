@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 #include <optional>
+#include <filesystem>
 
 namespace llaminar2
 {
@@ -24,10 +25,10 @@ namespace llaminar2
      */
     struct NUMAInfo
     {
-        int local_numa_node = 0;          ///< NUMA node this process is running on
+        int local_numa_node = -1;         ///< Exact caller NUMA node, or -1 when unproven
         int total_numa_nodes = 1;         ///< Total NUMA nodes in system
         bool detection_succeeded = false; ///< Whether detection was successful
-        std::string detection_method;     ///< How node was detected ("hwloc", "procfs", "fallback")
+        std::string detection_method = "unknown"; ///< How node was detected ("hwloc", "procfs", "unknown")
     };
 
     /**
@@ -46,7 +47,7 @@ namespace llaminar2
      * @brief NUMA topology detection utilities
      *
      * Provides methods to detect:
-     * 1. Which NUMA node the current process is bound to
+     * 1. Which exact NUMA node contains the caller thread binding
      * 2. Which NUMA node each GPU is affine to
      * 3. Total number of NUMA nodes in the system
      *
@@ -54,22 +55,37 @@ namespace llaminar2
      * 1. hwloc library (most reliable, optional dependency)
      * 2. /proc/self/status (Linux-specific)
      * 3. /sys/bus/pci/devices/PCIBUSID/numa_node (Linux sysfs)
-     * 4. Fallback to node 0 (single-socket assumption)
+     * CPU ownership remains unknown when no one-node binding is proven.
      */
     class NUMATopology
     {
     public:
         /**
-         * @brief Detect NUMA node for current process
+         * @brief Detect exact NUMA ownership of the calling thread
          *
          * Tries multiple methods in order:
          * 1. hwloc_get_cpubind() if available
-         * 2. Parse /proc/self/status Cpus_allowed_list
-         * 3. Fallback to node 0
+         * 2. Resolve /proc/thread-self/status Cpus_allowed_list
+         * 3. Explicit unknown (-1) if ownership cannot be proven
          *
          * @return NUMA info with detection status
          */
         static NUMAInfo detectLocalNUMANode();
+
+        /**
+         * @brief Resolve a procfs caller binding through exact sysfs CPU owners.
+         *
+         * Every CPU in Cpus_allowed_list must have one identical physical NUMA
+         * owner. This is a setup observation, not inferred rank or memory-page
+         * placement. Explicit paths let the same production resolver consume
+         * authored filesystem fixtures without querying hardware in Unit tests.
+         * @param status_path Process/thread status containing the allowed CPUs.
+         * @param cpu_sysfs_root Sysfs CPU directory containing cpuN/nodeM links.
+         * @return Exact OS NUMA ID, or -1 for absent/ambiguous/multi-node facts.
+         */
+        static int detectLocalNUMANodeFromStatus(
+            const std::filesystem::path &status_path,
+            const std::filesystem::path &cpu_sysfs_root);
 
         /**
          * @brief Get total number of NUMA nodes in system
@@ -134,16 +150,16 @@ namespace llaminar2
         /**
          * @brief Detect NUMA node via hwloc library
          *
-         * Most reliable method when hwloc is available.
+         * Observes the caller thread, excluding unrelated helper-thread masks.
          *
          * @return NUMA node or -1 if detection failed
          */
         static int detectViaHwloc();
 
         /**
-         * @brief Detect NUMA node via /proc/self/status
+         * @brief Detect caller NUMA ownership via /proc/thread-self/status
          *
-         * Parses Cpus_allowed_list to infer NUMA node.
+         * Resolves the complete allowed CPU mask to one exact sysfs NUMA node.
          * Works on Linux systems.
          *
          * @return NUMA node or -1 if detection failed

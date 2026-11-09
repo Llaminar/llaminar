@@ -44,6 +44,16 @@ class HIPRuntimeBindingError(RuntimeError):
     """A real loader choice lacks its current canonical HIP installation proof."""
 
 
+class HIPRuntimeSONAMEMismatch(HIPRuntimeBindingError):
+    """The actual resolved file has a foreign ELF identity, with its path retained."""
+
+    def __init__(self, runtime: Path, soname: str):
+        """Keep the observed file/SONAME so a negative control cannot accept another failure."""
+        super().__init__("Loaded HIP runtime has a foreign ELF SONAME")
+        self.runtime = runtime
+        self.soname = soname
+
+
 def file_digest(path: Path) -> str:
     """Hash one bounded dependency artifact while rejecting concurrent replacement."""
     before = path.stat()
@@ -185,7 +195,7 @@ def verify_binding(binary: Path, authority: HIPRuntimeAuthority, readelf: str,
     except ELFBindingError as error:
         raise HIPRuntimeBindingError("Loaded HIP runtime has no unique ELF SONAME") from error
     if soname != authority.soname:
-        raise HIPRuntimeBindingError("Loaded HIP runtime has a foreign ELF SONAME")
+        raise HIPRuntimeSONAMEMismatch(runtime, soname)
     require_installed_receipt(runtime, authority)
     return runtime.resolve(strict=True)
 
@@ -200,23 +210,42 @@ def verify_environments(binary: Path, authority: HIPRuntimeAuthority, readelf: s
 
 
 def verify_shadow_rejection(binary: Path, authority: HIPRuntimeAuthority, readelf: str,
-                            fixture: Path) -> None:
-    """Use the existing harmless same-filename DSO fixture; never execute native inference."""
+                            fixture: Path) -> str:
+    """Prove rejection of a foreign shadow or prevention by the native loader.
+
+    A pinned DT_RPATH may prevent LD_LIBRARY_PATH substitution. That is a valid
+    negative control only when the real fixture is independently foreign and
+    the injected closure authenticates the identical physical clean runtime.
+    """
+    fixture = fixture.resolve(strict=True)
+    dynamic = subprocess.run([readelf, "-d", str(fixture)], text=True,
+                             capture_output=True, check=True, timeout=30)
+    try:
+        fixture_soname = parse_soname(dynamic.stdout)
+    except ELFBindingError as error:
+        raise HIPRuntimeBindingError("HIP shadow fixture has no unique ELF SONAME") from error
+    if fixture_soname == authority.soname:
+        raise HIPRuntimeBindingError("HIP shadow fixture must have a foreign ELF SONAME")
+    clean = {key: value for key, value in os.environ.items()
+             if key not in ("LD_LIBRARY_PATH", "LD_PRELOAD", "LD_AUDIT")}
+    baseline = verify_binding(binary, authority, readelf, clean)
     with tempfile.TemporaryDirectory(prefix="llaminar-hip-shadow-") as directory:
         alias = Path(directory) / authority.soname
-        alias.symlink_to(fixture.resolve(strict=True))
+        alias.symlink_to(fixture)
         env = dict(os.environ)
         env.pop("LD_PRELOAD", None)
         env.pop("LD_AUDIT", None)
         env["LD_LIBRARY_PATH"] = directory + (
             ":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
         try:
-            verify_binding(binary, authority, readelf, env)
-        except HIPRuntimeBindingError as error:
-            if "foreign ELF SONAME" in str(error):
-                return
-            raise
-        raise HIPRuntimeBindingError("Same-filename foreign HIP runtime was not rejected")
+            runtime = verify_binding(binary, authority, readelf, env)
+        except HIPRuntimeSONAMEMismatch as error:
+            if error.runtime.resolve(strict=True) == fixture and error.soname == fixture_soname:
+                return "foreign_shadow_rejected"
+            raise HIPRuntimeBindingError("HIP shadow resolved an unexpected foreign runtime") from error
+        if runtime != baseline:
+            raise HIPRuntimeBindingError("HIP shadow changed the authenticated physical runtime")
+        return "shadow_injection_prevented"
 
 
 class HIPRuntimeBindingTests(unittest.TestCase):
@@ -427,14 +456,91 @@ class HIPRuntimeBindingTests(unittest.TestCase):
              patch(__name__ + ".subprocess.run", return_value=completed), \
              self.assertRaisesRegex(HIPRuntimeBindingError, "foreign ELF SONAME"):
             verify_binding(Path("/app"), authority, "readelf", {})
-        with tempfile.TemporaryDirectory() as directory:
-            fixture = Path(directory) / "harmless.so"
-            fixture.write_bytes(b"never loaded in a Unit test")
-            with patch(__name__ + ".verify_binding", side_effect=HIPRuntimeBindingError("foreign ELF SONAME")):
-                verify_shadow_rejection(Path("/app"), authority, "readelf", fixture)
-            with patch(__name__ + ".verify_binding", return_value=fixture), self.assertRaisesRegex(HIPRuntimeBindingError, "not rejected"):
-                verify_shadow_rejection(Path("/app"), authority, "readelf", fixture)
 
+
+    def test_shadow_outcomes_use_actual_binding_and_authenticated_baseline(self):
+        """Run the real validator for both substitution and RPATH prevention."""
+        for injected in (True, False):
+            with self.subTest(injected=injected), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                authority, library = self.fixture(root)
+                fixture = root / "harmless.so"
+                fixture.write_bytes(b"foreign DSO fixture; never loaded by Unit")
+
+                def dynamic(command, **kwargs):
+                    actual = Path(command[-1]).resolve(strict=True)
+                    soname = "libforeign.so" if actual == fixture else authority.soname
+                    self.assertIn(actual, (fixture, library))
+                    return subprocess.CompletedProcess(command, 0, f"(SONAME) [{soname}]", "")
+
+                def trace(binary, environment):
+                    self.assertNotIn("LD_PRELOAD", environment)
+                    self.assertNotIn("LD_AUDIT", environment)
+                    if injected and "LD_LIBRARY_PATH" in environment:
+                        actual = Path(environment["LD_LIBRARY_PATH"].split(":")[0]) / authority.soname
+                        self.assertEqual(actual.resolve(strict=True), fixture)
+                    else:
+                        actual = library
+                    return f"{authority.soname} => {actual} (0x1)"
+
+                with patch(__name__ + ".trace_loader", side_effect=trace) as loader, \
+                     patch(__name__ + ".subprocess.run", side_effect=dynamic), \
+                     patch.dict(os.environ, {"LD_LIBRARY_PATH": "/inherited", "LD_PRELOAD": "/preload", "LD_AUDIT": "/audit"}):
+                    outcome = verify_shadow_rejection(Path("/app"), authority, "readelf", fixture)
+                self.assertEqual(outcome, "foreign_shadow_rejected" if injected else "shadow_injection_prevented")
+                self.assertEqual(loader.call_count, 2)
+                self.assertNotIn("LD_LIBRARY_PATH", loader.call_args_list[0].args[1])
+
+    def test_shadow_rejects_unrelated_or_incomplete_loader_outcomes(self):
+        """Neither another foreign file nor another authenticated copy proves prevention."""
+        for failure in ("missing", "duplicate", "unresolved", "foreign_other", "authenticated_copy", "bad_receipt"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                authority, library = self.fixture(root)
+                fixture = root / "harmless.so"
+                fixture.write_bytes(b"foreign DSO fixture; never loaded by Unit")
+                other = root / "unrelated.so"
+                other.write_bytes(b"unrelated runtime")
+                copied = root / "copied"
+                shutil.copytree(library.parent.parent, copied)
+                duplicate = copied / "lib" / library.name
+                if failure == "bad_receipt":
+                    (copied / "share/llaminar/hip-graph-runtime.txt").write_text("stale")
+
+                def dynamic(command, **kwargs):
+                    actual = Path(command[-1]).resolve(strict=True)
+                    soname = "libforeign.so" if actual in (fixture, other) else authority.soname
+                    return subprocess.CompletedProcess(command, 0, f"(SONAME) [{soname}]", "")
+
+                def trace(binary, environment):
+                    clean = f"{authority.soname} => {library} (0x1)"
+                    if "LD_LIBRARY_PATH" not in environment:
+                        return clean
+                    if failure == "missing": return ""
+                    if failure == "duplicate": return clean + "\n" + clean
+                    if failure == "unresolved": return authority.soname + " => not found"
+                    actual = other if failure == "foreign_other" else duplicate
+                    return f"{authority.soname} => {actual} (0x1)"
+
+                with patch(__name__ + ".trace_loader", side_effect=trace), \
+                     patch(__name__ + ".subprocess.run", side_effect=dynamic), \
+                     self.assertRaises(HIPRuntimeBindingError):
+                    verify_shadow_rejection(Path("/app"), authority, "readelf", fixture)
+
+    def test_shadow_fixture_requires_real_foreign_soname_before_loading(self):
+        """An alias filename or missing/ambiguous SONAME cannot certify the fixture."""
+        for sonames in ("", "(SONAME) [libamdhip64.so.7]", "(SONAME) [one]\n(SONAME) [two]"):
+            with self.subTest(sonames=sonames), tempfile.TemporaryDirectory() as directory:
+                fixture = Path(directory) / "harmless.so"
+                fixture.write_bytes(b"never loaded by Unit")
+                authority = HIPRuntimeAuthority("libamdhip64.so.7", "identity", ())
+                result = subprocess.CompletedProcess([], 0, sonames, "")
+                with patch(__name__ + ".subprocess.run", return_value=result) as readelf, \
+                     patch(__name__ + ".trace_loader") as loader, self.assertRaises(HIPRuntimeBindingError):
+                    verify_shadow_rejection(Path("/app"), authority, "readelf", fixture)
+                readelf.assert_called_once_with(["readelf", "-d", str(fixture)], text=True,
+                                               capture_output=True, check=True, timeout=30)
+                loader.assert_not_called()
 
     def staged_component(self, root: Path) -> tuple[HIPRuntimeAuthority, Path]:
         """Exercise the real installer's export boundary with tiny authenticated file fixtures."""
@@ -633,7 +739,8 @@ def main() -> int:
         for mode, runtime in observations.items():
             print(f"PASS HIP runtime binding: {binary} {mode} {authority.soname} -> {runtime}")
         if args.wrong_runtime_fixture:
-            verify_shadow_rejection(binary, authority, args.readelf, args.wrong_runtime_fixture)
+            outcome = verify_shadow_rejection(binary, authority, args.readelf, args.wrong_runtime_fixture)
+            print(f"PASS HIP runtime shadow: {binary} {outcome}")
     return 0
 
 

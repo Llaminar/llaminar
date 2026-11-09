@@ -45,7 +45,10 @@ tuning data alone must never prevent inference.
 5. **Keep graphs per-device and symmetric.** Compute stages are
    participant-local and cross-device movement is an explicit graph collective.
    Never create nested multi-device subgraphs or hide rank coordination inside
-   an ordinary compute stage.
+   an ordinary compute stage. An MPI rank may execute on GPUs only on its own
+   observed NUMA node, including calibration and storage-only roles. Full-host
+   discovery is visibility, not execution ownership. A rank without local GPUs
+   participates through its CPU; explicit remote GPU ownership fails admission.
 6. **Use one public transfer/coherence authority.** Production callers use
    `TransferEngine`, arena contracts, and event-aware publication APIs. Direct
    `transitionTo()`, ad hoc `ensureOnDevice()`, and manual dirty-state mutation

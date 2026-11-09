@@ -9,6 +9,7 @@
  */
 #include <gtest/gtest.h>
 #include "planning/ClusterInventoryGatherer.h"
+#include "planning/RankHardwareOwnership.h"
 #include "utils/MPITopology.h"
 #include "../../utils/CPUExecutionTestGeometry.h"
 #include <array>
@@ -347,4 +348,29 @@ TEST(Test__ClusterInventoryGatherer, NodeAggregation_MultiNode)
 
     // Cluster total: 1024 GB
     EXPECT_EQ(inventory.total_cpu_memory, 2 * expected_per_node);
+}
+
+/** @test One rank's supplied exact locality authorizes only its local visible cards. */
+TEST(Test__ClusterInventoryGatherer, SingleRankObservedNUMAAdmitsOnlyLocalGPUOwnership)
+{
+    auto hardware = hardwareFixture();
+    hardware.cuda_devices = {gpuFixture(ComputeBackendType::GPU_CUDA, 9)};
+    hardware.rocm_devices = {gpuFixture(ComputeBackendType::GPU_ROCM, 2)};
+    for (const int node : {3, 7})
+    {
+        const auto rank = makeRankInventory(hardware, {.rank=0, .cpu_numa_node=node});
+        ASSERT_EQ(rank.gpus.size(), 2u);
+        EXPECT_EQ(rank.cpu.numa_node, node);
+        EXPECT_EQ(rank.cpu.memory_bytes, hardware.cpuDevice(node).total_memory_bytes);
+        for (const auto &gpu : rank.gpus)
+            EXPECT_EQ(rankOwnsGPUDevice(rank, gpu), node == 7);
+        const auto wire = MPITopology::serializeRankInventory(rank);
+        const auto roundtrip = MPITopology::deserializeRankInventory(wire.data(), wire.size());
+        EXPECT_EQ(roundtrip.cpu.numa_node, node);
+        EXPECT_EQ(roundtrip.gpus.size(), 2u);
+    }
+    const auto whole = makeRankInventory(hardware, {});
+    EXPECT_EQ(whole.cpu.numa_node, -1);
+    EXPECT_EQ(whole.cpu.memory_bytes, 3000u);
+    for (const auto &gpu : whole.gpus) EXPECT_FALSE(rankOwnsGPUDevice(whole, gpu));
 }

@@ -5027,6 +5027,109 @@ class InfrastructureTests(unittest.TestCase):
                       owner[resource_failure:authenticated_receipt])
         self.assertNotIn('file(WRITE "${RCCL_VERSION_FILE}"', owner)
 
+    def test_rccl_legacy_smi_rejects_foreign_sdk_discovery(self):
+        """Replay the actual patched CMake owner with authored package metadata."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            module = root / "cmake/rccl_legacy_smi_sdk.cmake"
+            result = subprocess.run(["git", "apply", "--include=cmake/rccl_legacy_smi_sdk.cmake",
+                str(ROOT / "scripts/docker/patches/rccl-sdk-legacy-smi.patch")],
+                cwd=root, capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for case in ("selected", "selected_release", "foreign_default", "foreign_warm_cache",
+                         "foreign_preimported", "foreign_library_symlink", "selected_cache_alias"):
+                with self.subTest(case=case):
+                    cell = root / case
+                    selected, foreign = cell / "sdk", cell / "foreign"
+                    for sdk in (selected, foreign):
+                        (sdk / "lib/cmake/rocm_smi").mkdir(parents=True)
+                        (sdk / "include").mkdir()
+                        library = sdk / "lib/librocm_smi64.so.1.0"
+                        library.write_bytes(b"authored SMI metadata fixture, not a native DSO")
+                        configuration = ("set(ROCM_SMI_INCLUDE_DIR \"" + str(sdk / "include") + "\")\n"
+                            "if(NOT TARGET rocm_smi64)\nadd_library(rocm_smi64 SHARED IMPORTED)\n"
+                            "set_target_properties(rocm_smi64 PROPERTIES ")
+                        if case == "selected_release":
+                            configuration += "IMPORTED_CONFIGURATIONS RELEASE IMPORTED_LOCATION_RELEASE "
+                        else:
+                            configuration += "IMPORTED_LOCATION "
+                        configuration += '"' + str(library) + '")\nendif()\n'
+                        (sdk / "lib/cmake/rocm_smi/rocm_smi-config.cmake").write_text(configuration)
+                    prefix = "cmake_minimum_required(VERSION 3.27)\nproject(SMIOwnership NONE)\n"
+                    prefix += 'set(CMAKE_PREFIX_PATH "' + str(foreign) + '")\n'
+                    if case == "foreign_preimported":
+                        prefix += ('add_library(rocm_smi64 SHARED IMPORTED)\n'
+                            'set_target_properties(rocm_smi64 PROPERTIES IMPORTED_LOCATION "'
+                            + str(foreign / "lib/librocm_smi64.so.1.0") + '")\n')
+                    if case == "foreign_default":
+                        (selected / "lib/cmake/rocm_smi/rocm_smi-config.cmake").unlink()
+                    if case == "foreign_library_symlink":
+                        library = selected / "lib/librocm_smi64.so.1.0"
+                        library.unlink()
+                        library.symlink_to(foreign / "lib/librocm_smi64.so.1.0")
+                    source = cell / "source"
+                    source.mkdir()
+                    (source / "CMakeLists.txt").write_text(prefix + 'include("' + str(module) + '")\n')
+                    command = ["cmake", "-S", str(source), "-B", str(cell / "build"), "-G", "Ninja"]
+                    if case == "foreign_warm_cache":
+                        warmed = subprocess.run(command + ["-DROCM_PATH=" + str(foreign)],
+                            capture_output=True, text=True, timeout=20)
+                        self.assertEqual(warmed.returncode, 0, warmed.stdout + warmed.stderr)
+                    command += ["-DROCM_PATH=" + str(selected)]
+                    if case == "selected_cache_alias":
+                        alias = cell / "sdk-alias"
+                        alias.symlink_to(selected, target_is_directory=True)
+                        command += ["-Drocm_smi_DIR=" + str(alias / "lib/cmake/rocm_smi")]
+                    configured = subprocess.run(command, capture_output=True, text=True, timeout=20)
+                    positive = case in ("selected", "selected_release", "selected_cache_alias")
+                    if positive:
+                        self.assertEqual(configured.returncode, 0, configured.stdout + configured.stderr)
+                    else:
+                        self.assertNotEqual(configured.returncode, 0, configured.stdout + configured.stderr)
+                    if case in ("foreign_warm_cache", "foreign_preimported", "foreign_library_symlink"):
+                        self.assertIn("another SDK", configured.stdout + configured.stderr)
+
+    def test_legacy_smi_runtime_component_authenticates_before_export(self):
+        """Run the real export boundary with authored files, never a build/runtime."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sdk = root / "sdk"
+            pins = rocm_release_pins()
+            (sdk / ".info").mkdir(parents=True)
+            (sdk / ".info/version").write_text(pins["LLAMINAR_ROCM_VERSION"] + "\n")
+            (sdk / "lib/cmake/rocm_smi").mkdir(parents=True)
+            (sdk / "include/rocm_smi").mkdir(parents=True)
+            (sdk / "share/llaminar").mkdir(parents=True)
+            (sdk / "share/licenses/llaminar-rocm-smi").mkdir(parents=True)
+            library = sdk / "lib/librocm_smi64.so.1.0"
+            library.write_bytes(b"authored SMI export artifact, not a native DSO")
+            (sdk / "lib/librocm_smi64.so.1").symlink_to(library.name)
+            (sdk / "lib/librocm_smi64.so").symlink_to("librocm_smi64.so.1")
+            (sdk / "include/rocm_smi/rocm_smi.h").write_text("authored header metadata")
+            (sdk / "lib/cmake/rocm_smi/rocm_smi-config.cmake").write_text("authored package metadata")
+            (sdk / "share/licenses/llaminar-rocm-smi/LICENSE.md").write_text("authored license metadata")
+            identity = ":".join(pins[key] for key in ("LLAMINAR_ROCM_VERSION", "LLAMINAR_ROCM_DEB_VERSION",
+                                                     "LLAMINAR_ROCM_SYSTEMS_REVISION")) + ":legacy-smi-1.0"
+            marker = sdk / "share/llaminar/rocm-smi-compat.txt"
+            marker.write_text(identity + ":" + hashlib.sha256(library.read_bytes()).hexdigest() + "\n")
+            component = root / "component"
+            environment = dict(os.environ, ROCM_PATH=str(sdk), ROCM_SMI_INSTALL_PREFIX=str(sdk),
+                               ROCM_SMI_STAGE_PREFIX=str(component))
+            command = ["bash", str(ROOT / "scripts/docker/install-rocm-smi-compat.sh")]
+            result = subprocess.run(command, env=environment, capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            exported = component / "lib" / library.name
+            self.assertEqual(exported.read_bytes(), library.read_bytes())
+            self.assertEqual((component / "lib/librocm_smi64.so.1").resolve(), exported)
+            self.assertFalse((component / "include").exists())
+            library.write_bytes(b"changed dependency artifact")
+            rejected = root / "must-not-be-created"
+            environment["ROCM_SMI_STAGE_PREFIX"] = str(rejected)
+            result = subprocess.run(command, env=environment, capture_output=True, text=True, timeout=20)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("requires an authenticated builder component", result.stderr)
+            self.assertFalse(rejected.exists())
+
     def test_hip_runtime_repair_is_shared_by_builder_and_shipping_image(self):
         """A green builder cannot ship the uncorrected distribution HIP DSO.
 
@@ -5041,8 +5144,8 @@ class InfrastructureTests(unittest.TestCase):
         self.assertIn("scripts/docker/install-hip-graph-runtime.sh", toolchain)
         self.assertIn("scripts/docker/rocm-release.env", toolchain)
         self.assertIn("patches/rocm-hip-graph-empty-segment-publication.patch", toolchain)
-        self.assertIn("patches/rocm-hip-host-queue-native-stack.patch", toolchain)
-        self.assertIn("patches/rocm-hip-sdma-stream-sharing.patch", toolchain)
+        self.assertNotIn("patches/rocm-hip-host-queue-native-stack.patch", toolchain)
+        self.assertNotIn("patches/rocm-hip-sdma-stream-sharing.patch", toolchain)
         self.assertIn("patches/rocm-hip-sdma-event-publication.patch", toolchain)
         self.assertIn("patches/rocm-hip-graph-progress-safe-collapse.patch", toolchain)
         self.assertIn("patches/rocm-hip-event-producer-lifetime.patch", toolchain)
@@ -5050,7 +5153,7 @@ class InfrastructureTests(unittest.TestCase):
         self.assertIn("patches/rocm-hip-preferred-queue-unshared.patch", toolchain)
         self.assertIn("scripts/docker/hip-preferred-queue/proof.py", toolchain)
         self.assertIn("scripts/docker/hip-preferred-queue/selector-contract.cpp.in", toolchain)
-        # Those four backports are part of the pinned upstream monorepo now.
+        # These graph backports and the native-stack/SDMA-sharing repairs are upstream.
         # Applying them again would make the upgrade a second orphaned repair.
         for old_patch in ("node-identity", "queue-placement", "packet-publication", "entry-ordering"):
             self.assertNotIn(f"rocm-hip-graph-{old_patch}.patch", toolchain)
@@ -5123,8 +5226,6 @@ class InfrastructureTests(unittest.TestCase):
                 alias.symlink_to(target)
             patches = (
                 ROOT / "scripts/docker/patches/rocm-hip-graph-empty-segment-publication.patch",
-                ROOT / "scripts/docker/patches/rocm-hip-host-queue-native-stack.patch",
-                ROOT / "scripts/docker/patches/rocm-hip-sdma-stream-sharing.patch",
                 ROOT / "scripts/docker/patches/rocm-hip-sdma-event-publication.patch",
                 ROOT / "scripts/docker/patches/rocm-hip-graph-progress-safe-collapse.patch",
                 ROOT / "scripts/docker/patches/rocm-hip-event-producer-lifetime.patch",
@@ -5205,7 +5306,8 @@ class InfrastructureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             sdk = Path(directory) / "sdk"
             (sdk / ".info").mkdir(parents=True)
-            for version in (None, "7.2.4", "10.0.1", "10.1.0"):
+            major, minor, patch = map(int, rocm_release_pins()["LLAMINAR_ROCM_VERSION"].split("."))
+            for version in (None, "0.0.0", f"{major}.{minor}.{patch + 1}", f"{major}.{minor + 1}.0"):
                 with self.subTest(version=version):
                     if version is not None:
                         (sdk / ".info/version").write_text(version + "\n")
@@ -5268,10 +5370,14 @@ class InfrastructureTests(unittest.TestCase):
                         self.assertNotIn(llvm_package, packages)
                         self.assertNotIn("libglvnd-dev", packages)
                         self.assertNotIn("libmsgpack-cxx-dev", packages)
+                        for dependency in ("libelf-dev", "libnuma-dev", "pkg-config", "xxd"):
+                            self.assertNotIn(dependency, packages)
                     else:
                         self.assertIn(llvm_package, packages)
                         self.assertIn("libglvnd-dev", packages)
                         self.assertIn("libmsgpack-cxx-dev", packages)
+                        for dependency in ("libelf-dev", "libnuma-dev", "pkg-config", "xxd"):
+                            self.assertIn(dependency, packages)
                     for package in packages:
                         if package.startswith("amdrocm-"):
                             self.assertTrue(package.endswith("=" + pins["LLAMINAR_ROCM_DEB_VERSION"]))
@@ -5401,7 +5507,8 @@ class InfrastructureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             sdk = Path(directory) / "sdk"
             (sdk / ".info").mkdir(parents=True)
-            for version in (None, "7.2.4", "10.0.1"):
+            major, minor, patch = map(int, rocm_release_pins()["LLAMINAR_ROCM_VERSION"].split("."))
+            for version in (None, "0.0.0", f"{major}.{minor}.{patch + 1}"):
                 with self.subTest(version=version):
                     if version is not None:
                         (sdk / ".info/version").write_text(version + "\n")

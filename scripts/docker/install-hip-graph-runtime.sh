@@ -4,9 +4,9 @@
 # The pinned monorepo release already owns race-free graph identities, queue
 # placement, ordered packet publication and launch entry/exit dependencies.
 # Do not stack obsolete backports on those upstream implementations. Remaining
-# repairs publish consumed empty-segment completions (ROCm/rocm-systems#12638),
-# backport #9643's TLS-safe native host-thread stack admission and #9652's SDMA
-# sharing when streams outnumber physical engines. Ordering-only SDMA events
+# repairs publish consumed empty-segment completions (ROCm/rocm-systems#12638).
+# The 10.1 source already includes #9643's TLS-safe native thread stacks and
+# #9652's SDMA sharing; those backports are retired. Ordering-only SDMA events
 # retain their exact DMA completion rather than waiting behind unrelated
 # captured compute frontiers on a shared hardware queue. The graph ROI
 # repair preserves independent progress for waits and opaque child/callback
@@ -34,8 +34,6 @@ hip_sdk_root="${ROCM_PATH:-${LLAMINAR_ROCM_SDK_PREFIX}}"
 hip_prefix="${HIP_RUNTIME_INSTALL_PREFIX:-${hip_sdk_root}}"
 hip_patches=(
     "${hip_script_dir}/patches/rocm-hip-graph-empty-segment-publication.patch"
-    "${hip_script_dir}/patches/rocm-hip-host-queue-native-stack.patch"
-    "${hip_script_dir}/patches/rocm-hip-sdma-stream-sharing.patch"
     "${hip_script_dir}/patches/rocm-hip-sdma-event-publication.patch"
     "${hip_script_dir}/patches/rocm-hip-graph-progress-safe-collapse.patch"
     "${hip_script_dir}/patches/rocm-hip-event-producer-lifetime.patch"

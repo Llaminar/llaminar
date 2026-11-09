@@ -13,7 +13,7 @@ add_test(NAME V2_Unit_ROCmLTOArtifact
     COMMAND ${Python3_EXECUTABLE} "${V2_LTO_UNIT_SCRIPT}")
 set_tests_properties(V2_Unit_ROCmLTOArtifact PROPERTIES
     LABELS "V2;Unit;DeviceFree;Build;Ownership;Regression" TIMEOUT 30)
-foreach(V2_LTO_CASE IN ITEMS OutputRoleTest CompilerProofTest FinalResourceEvidenceTest)
+foreach(V2_LTO_CASE IN ITEMS OutputRoleTest WrapperDriverTest CompilerProofTest FinalResourceEvidenceTest)
     set(V2_LTO_TEST "V2_Integration_ROCmLTOArtifact_${V2_LTO_CASE}")
     add_test(NAME ${V2_LTO_TEST}
         COMMAND ${Python3_EXECUTABLE} "${V2_LTO_UNIT_SCRIPT}" "${V2_LTO_CASE}")
@@ -21,6 +21,33 @@ foreach(V2_LTO_CASE IN ITEMS OutputRoleTest CompilerProofTest FinalResourceEvide
         LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Build;Ownership;Regression" TIMEOUT 30)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${V2_LTO_TEST})
 endforeach()
+
+# Keep the filtered-diagnostic regression individually selectable. Its parser
+# controls complement the actual GVN executions retained in the compiler proof.
+add_test(NAME V2_Integration_ROCmGVNFilteredRemarks
+    COMMAND ${Python3_EXECUTABLE} "${V2_LTO_UNIT_SCRIPT}"
+        CompilerProofTest.test_actual_guard_proof_rejects_excluded_work_lost_remarks_or_changed_ir)
+set_tests_properties(V2_Integration_ROCmGVNFilteredRemarks PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Build;Regression" TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmGVNFilteredRemarks)
+
+# SDK aliases may change spelling, never the physical tool or ld.lld basename.
+add_test(NAME V2_Integration_ROCmLTOExecutableAliases
+    COMMAND ${Python3_EXECUTABLE} "${V2_LTO_UNIT_SCRIPT}"
+        WrapperDriverTest.test_sdk_and_fixed_linker_aliases_authenticate_same_files_without_rewriting_commands
+        WrapperDriverTest.test_missing_foreign_and_basename_changing_aliases_reject)
+set_tests_properties(V2_Integration_ROCmLTOExecutableAliases PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Build;Ownership;Regression" TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmLTOExecutableAliases)
+
+# The wrapper's preview stream must be serial even when the actual link is parallel.
+add_test(NAME V2_Integration_ROCmLTOPreviewConcurrency
+    COMMAND ${Python3_EXECUTABLE} "${V2_LTO_UNIT_SCRIPT}"
+        WrapperDriverTest.test_preview_serializes_after_original_job_policy_without_mutating_link_argv
+        WrapperDriverTest.test_torn_parallel_preview_commands_are_rejected_without_reassembly)
+set_tests_properties(V2_Integration_ROCmLTOPreviewConcurrency PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Build;Ownership;Regression" TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmLTOPreviewConcurrency)
 
 if(HAVE_ROCM AND HAVE_RCCL)
     get_filename_component(V2_LTO_REPO_ROOT "${V2_LTO_TEST_ROOT}/../.." ABSOLUTE)
@@ -46,11 +73,14 @@ if(HAVE_ROCM AND HAVE_RCCL)
         DEPENDS "${RCCL_FINAL_ALLOCATION_REPORT}" "${RCCL_FINAL_ALLOCATION_RECEIPT}" "${RCCL_LIBRARY}"
             "${V2_LTO_ARTIFACT_SCRIPT}" "${V2_LTO_GUARD}"
             "${V2_LTO_REPO_ROOT}/scripts/docker/llvm-lto-linker/build.py"
+            "${V2_LTO_REPO_ROOT}/scripts/docker/llvm-lto-linker/GVNRemarkProbe.cpp"
             "${V2_LTO_REPO_ROOT}/scripts/docker/rocm-release.env"
             "${V2_LTO_REPO_ROOT}/scripts/docker/patches/llvm-parallel-lto-remarks.patch"
+            "${V2_LTO_REPO_ROOT}/scripts/docker/patches/llvm-gvn-filtered-remarks.patch"
         VERBATIM)
     add_custom_target(v2_rccl_final_allocation_proof
         DEPENDS "${V2_LTO_STAGED_PROOF}" "${V2_LTO_STAGED_RECEIPT}")
+    set_property(TARGET v2_rccl_final_allocation_proof PROPERTY V2_RELEASE_NATIVE_PROOF_OWNER TRUE)
     set_property(GLOBAL APPEND PROPERTY V2_PRODUCTION_TEST_PREFLIGHT_BUILD_TARGETS v2_rccl_final_allocation_proof)
     set_property(GLOBAL APPEND PROPERTY V2_UNIT_TEST_BUILD_TARGETS v2_rccl_final_allocation_proof)
     add_test(NAME V2_Integration_RCCLFinalParallelLTOResourceEvidence

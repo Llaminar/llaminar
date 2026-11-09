@@ -31,6 +31,7 @@
 #include <string>
 #include <unistd.h>
 #include <vector>
+#include <sched.h>
 
 using namespace llaminar2;
 
@@ -46,8 +47,14 @@ namespace
      */
     const HardwareInventory &publishedInventory()
     {
+        cpu_set_t caller_before{}, caller_after{};
+        if (sched_getaffinity(0,sizeof(caller_before),&caller_before)!=0)
+            throw std::runtime_error("Cannot observe original discovery caller affinity");
         auto &manager = DeviceManager::instance();
         manager.initialize(-1, false);
+        if (sched_getaffinity(0,sizeof(caller_after),&caller_after)!=0)
+            throw std::runtime_error("Cannot observe returned discovery caller affinity");
+        EXPECT_TRUE(CPU_EQUAL(&caller_before,&caller_after));
         const auto *observed = manager.hardware();
         if (!observed) throw std::runtime_error("DeviceManager did not publish hardware");
         const auto cluster_owner = gatherClusterInventory(nullptr);
@@ -55,7 +62,7 @@ namespace
         EXPECT_EQ(manager.hardware(), observed);
         EXPECT_EQ(cluster.world_size, 1);
         EXPECT_EQ(cluster.total_gpus, observed->cuda_device_count() + observed->rocm_device_count());
-        EXPECT_EQ(cluster.ranks.front().cpu.memory_bytes, observed->cpuDevice().total_memory_bytes);
+        EXPECT_EQ(cluster.ranks.front().cpu.memory_bytes, observed->cpuDevice(cluster.ranks.front().cpu.numa_node).total_memory_bytes);
         for (const auto &gpu : cluster.ranks.front().gpus)
         {
             EXPECT_FALSE(gpu.uuid.empty());

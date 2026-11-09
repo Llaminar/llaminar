@@ -169,6 +169,172 @@ endif()
                     self.assertNotIn("v2_integration_contract", default_all.group())
                     self.assertNotIn("qualify_native", default_all.group())
 
+    def test_explicit_release_native_alias_reachability(self):
+        """Execute original selected-owner aliases and the script-only replay."""
+        declaration = CMAKE_LISTS.read_text(encoding="utf-8")
+        first = declaration.index("function(add_v2_test TEST_NAME)")
+        stop = declaration.index("endfunction()", first) + len("endfunction()")
+        helper = declaration[first:stop]
+        first = declaration.index("# Native hardware identity and dependency target coverage")
+        stop = declaration.index("# Optional dependency discovery", first)
+        script_replay = declaration[first:stop]
+        owners = ("v2_unit_rccl_rows_abi", "v2_unit_rccl_path_configured",
+                  "v2_integration_captured_transfer_channel")
+        aliases = {
+            owners[0]: ("V2_Integration_RCCLNativeByteBroadcastABI",),
+            owners[1]: ("V2_Integration_RCCLNativeByteMissingABINoFallback",
+                        "V2_Integration_RCCLCompletedSemanticProtocolReplay"),
+            owners[2]: ("V2_Integration_ROCmNativeCompletedCollective_WireReplay",
+                        "V2_Integration_ROCmNativeCompletedCollective_ReaderAckReplay"),
+        }
+        for selected in ((), (owners[0],), (owners[1],), (owners[2],), owners):
+            with self.subTest(selected=selected):
+                checks = []
+                for owner, names in aliases.items():
+                    for name in names:
+                        checks.append(f"if({'NOT ' if owner in selected else ''}TEST {name})\n"
+                                      f'  message(FATAL_ERROR "Wrong original alias selection: {name}")\nendif()')
+                checks_text = "\n".join(checks)
+                extra = helper + f"""
+set(Python3_EXECUTABLE "{sys.executable}")
+set(V2_TEST_SOCKETS 1)
+set(V2_TEST_CORES_PER_SOCKET 1)
+set(CMAKE_BUILD_TYPE Release)
+set(HAVE_ROCM ON)
+set(HAVE_RCCL ON)
+set(HAVE_CUDA OFF)
+set(HAVE_NCCL OFF)
+foreach(owner IN ITEMS {" ".join(owners)})
+    add_executable(${{owner}} main.cpp)
+endforeach()
+include("{MODULE.with_name('V2NativeCountedBroadcastTests.cmake').as_posix()}")
+{script_replay}
+{checks_text}
+if(NOT TEST V2_Integration_ROCmArchitectureIdentityReplay)
+    message(FATAL_ERROR "Lost script-only architecture replay in Release")
+endif()
+get_test_property(V2_Integration_ROCmArchitectureIdentityReplay LABELS script_labels)
+get_test_property(V2_Integration_ROCmArchitectureIdentityReplay TIMEOUT script_timeout)
+if(NOT "ProductionTestPreflight" IN_LIST script_labels OR
+   NOT "DeviceFree" IN_LIST script_labels OR NOT script_timeout EQUAL 30)
+    message(FATAL_ERROR "Script replay lost original preflight contract")
+endif()
+foreach(foreign IN ITEMS V2_Integration_NCCLNativeByteBroadcastABI
+        V2_Integration_NCCLNativeByteMissingABINoFallback
+        V2_Integration_NativeCompleted_ROCm_Addressed2Source0Replay)
+    if(TEST ${{foreign}})
+        message(FATAL_ERROR "Unselected native alias admitted: ${{foreign}}")
+    endif()
+endforeach()
+"""
+                result = self.configure(True, scope="DeclaredBackends",
+                                        native_targets=selected, extra=extra)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_explicit_release_rccl_proof_owners(self):
+        """Configure actual proof modules in fresh language-free Release fixtures."""
+        repository = CMAKE_LISTS.parents[2]
+        production = (repository / "src/v2/CMakeLists.txt").read_text()
+        first = production.index("    # Shared proof authority is published")
+        stop = production.index("    # End shared RCCL proof authority.", first)
+        authority = production[first:stop]
+        modules = (
+            ("V2RCCLProtocolDefaultsTests.cmake", "v2_rccl_protocol_geometry", "RCCLProtocolDefaults"),
+            ("V2RCCLSelectorTests.cmake", "v2_rccl_selector_taxonomy", "RCCLCollectiveSelectors"),
+            ("V2RCCLThreadLifetimeTests.cmake", "v2_rccl_thread_lifetime_proof", "RCCLThreadLifetimeReplay"),
+            ("V2RCCLSmallAllGatherTests.cmake", "v2_rccl_small_allgather_policy", "RCCLSmallAllGatherPolicy"),
+        )
+        proof_targets = tuple(row[1] for row in modules) + (
+            "v2_rccl_completed_broadcast_proof", "v2_rccl_final_allocation_proof")
+        cases = (("none", (), False, ""), ("all", proof_targets, False, ""),
+                 ("reordered", proof_targets, True, ""),
+                 ("one", ("v2_rccl_selector_taxonomy",), False, ""),
+                 ("unknown", ("v2_missing_proof",), False, ""),
+                 ("missing_batch", ("v2_missing_proof_a", "v2_missing_proof_b"), False, ""),
+                 ("unmarked", ("ordinary_custom",), False, "add_custom_target(ordinary_custom)"))
+        for name, selected, reverse, extra in cases:
+            with self.subTest(case=name), tempfile.TemporaryDirectory(prefix="llaminar-rccl-proof-owner-") as tmp:
+                root = Path(tmp)
+                source = root / "project"
+                source.mkdir()
+                for relative in ("unit", "integration"):
+                    (source / relative).symlink_to(CMAKE_LISTS.parent / relative, target_is_directory=True)
+                native = root / "canonical-rccl"
+                (native / "src").mkdir(parents=True)
+                build = native / "build"
+                build.mkdir()
+                (build / "CMakeCache.txt").write_text("CMAKE_HOME_DIRECTORY:INTERNAL=" + str(native) + "\n")
+                library = build / "librccl.so.1.0"
+                library.write_text("inert configuration-only library; never loaded")
+                order = list(reversed(modules)) if reverse else list(modules)
+                included = "\n".join(f'include("{MODULE.with_name(row[0]).as_posix()}")' for row in order)
+                # The consumers run FIRST, before any selected/unselected module
+                # can publish RCCL_PROTOCOL_BUILD_DIR as an accidental side effect.
+                (source / "CMakeLists.txt").write_text(f"""
+cmake_minimum_required(VERSION 3.27)
+project(RCCLProofOwners NONE)
+enable_testing()
+set(CMAKE_BUILD_TYPE Release)
+set(V2_PERF_TESTS_ONLY ON)
+set(LLAMINAR_RELEASE_NATIVE_TEST_TARGETS "{";".join(selected)}" CACHE STRING "" FORCE)
+include("{MODULE.as_posix()}")
+set(REPO_ROOT "{repository.as_posix()}")
+set(HAVE_ROCM ON)
+set(HAVE_RCCL ON)
+set(HAVE_CUDA OFF)
+set(CMAKE_HIP_ARCHITECTURES gfx906 gfx1100)
+set(CMAKE_HIP_COMPILER "${{CMAKE_COMMAND}}")
+set(CMAKE_CXX_COMPILER "${{CMAKE_COMMAND}}")
+set(Python3_EXECUTABLE "{sys.executable}")
+set(ROCM_PATH "{(root / 'authored-sdk').as_posix()}")
+set(RCCL_BUILD_DIR "{build.as_posix()}")
+set(RCCL_LIBRARY "{library.as_posix()}")
+{authority}
+if(NOT RCCL_PROTOCOL_BUILD_DIR STREQUAL RCCL_BUILD_DIR)
+    message(FATAL_ERROR "Canonical proof authority was not published before consumers")
+endif()
+include("{MODULE.with_name('V2NativeCompletedBroadcastProofTests.cmake').as_posix()}")
+include("{MODULE.with_name('V2ROCmLTOArtifactTests.cmake').as_posix()}")
+{included}
+{extra}
+get_directory_property(proof_tests TESTS)
+file(WRITE "${{CMAKE_BINARY_DIR}}/tests.txt" "${{proof_tests}}")
+file(WRITE "${{CMAKE_BINARY_DIR}}/owners.txt" "")
+foreach(proof IN ITEMS {" ".join(proof_targets)})
+    if(TARGET ${{proof}})
+        get_target_property(kind ${{proof}} TYPE)
+        get_target_property(owner ${{proof}} V2_RELEASE_NATIVE_PROOF_OWNER)
+        file(APPEND "${{CMAKE_BINARY_DIR}}/owners.txt" "${{proof}}|${{kind}}|${{owner}}\n")
+    endif()
+endforeach()
+""")
+                output = root / "output"
+                result = subprocess.run([self.cmake, "-S", str(source), "-B", str(output),
+                    "-G", "Ninja", "-DCMAKE_MAKE_PROGRAM=" + self.ninja],
+                    capture_output=True, text=True, timeout=15, check=False)
+                if name in ("unknown", "missing_batch", "unmarked"):
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("was not declared" if name != "unmarked" else "not an original declared test executable",
+                                  " ".join((result.stdout + result.stderr).split()))
+                    if name == "missing_batch":
+                        self.assertIn("v2_missing_proof_a", result.stdout + result.stderr)
+                        self.assertIn("v2_missing_proof_b", result.stdout + result.stderr)
+                    continue
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                owners = (output / "owners.txt").read_text().splitlines()
+                tests = set((output / "tests.txt").read_text().split(";"))
+                for _, target, alias in modules:
+                    expected = target in selected
+                    self.assertEqual(any(row.startswith(target + "|") for row in owners), expected)
+                    for suite in ("Unit", "Integration"):
+                        self.assertEqual("V2_" + suite + "_" + alias in tests, expected)
+                for target in selected:
+                    self.assertIn(target + "|UTILITY|TRUE", owners)
+                default_all = re.search(r"^build all:.*$", (output / "build.ninja").read_text(), re.MULTILINE)
+                self.assertIsNotNone(default_all)
+                for target in proof_targets:
+                    self.assertNotIn(target, default_all.group())
+
     def test_explicit_release_native_owner_rejects_unknown_or_foreign_targets(self):
         """Unknown, imported, alias and non-test owners cannot masquerade as opt-ins."""
         cases = (

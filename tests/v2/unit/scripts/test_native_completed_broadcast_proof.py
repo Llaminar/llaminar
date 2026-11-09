@@ -7,6 +7,8 @@ No SDK, runtime library loading, model or GPU discovery occurs here.
 """
 from pathlib import Path
 import copy
+import hashlib
+import json
 import importlib.util
 import tempfile
 import unittest
@@ -28,7 +30,8 @@ class NativeCompletedProofTests(unittest.TestCase):
         self.library = Path(self.temporary.name) / "policy-fixture.so"
         self.library.write_bytes(b"validation-only-not-a-runtime")
         self.backend = "rccl"
-        self.receipt = "targets-policy-completed-" + PROOF.digest(PROOF.patch(self.backend)) + "-capture-policy"
+        self.receipt = ("p2p-" + PROOF.digest(PROOF.DOCKER / "patches/rccl-user-p2p-override.patch")
+                        + "-targets-policy-completed-" + PROOF.digest(PROOF.patch(self.backend)) + "-capture-policy")
         successes = dict(prefix="work_size=160 payload_offset=120\n" + PROOF.PREFIX_OK,
                          slice=PROOF.SLICE_OK, completion=PROOF.COMPLETION_OK, cancellation=PROOF.CANCELLATION_OK,
                          signal=PROOF.SIGNAL_OK, retirement=PROOF.RETIREMENT_OK,
@@ -139,6 +142,20 @@ class NativeCompletedProofTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     self.verify(changed)
 
+    def test_current_rccl_receipt_requires_exact_new_p2p_prefix(self):
+        """Authenticate the current prefix while preserving completed/capture body checks."""
+        self.assertTrue(PROOF.valid_receipt("rccl", self.receipt))
+        prefix, body = self.receipt.split("targets-", 1)
+        completed = "-completed-" + PROOF.digest(PROOF.patch("rccl")) + "-capture-"
+        for receipt in ("targets-" + body, "p2p-" + "0" * 64 + "-targets-" + body,
+                        prefix + self.receipt, "unknown-" + self.receipt,
+                        "targets-" + prefix + body, prefix + body,
+                        self.receipt.replace(completed, "-capture-" + PROOF.digest(PROOF.patch("rccl")) + "-completed-"),
+                        self.receipt.replace(completed, "-completed-" + "0" * 64 + "-capture-"),
+                        self.receipt + completed):
+            with self.subTest(receipt=receipt):
+                self.assertFalse(PROOF.valid_receipt("rccl", receipt))
+
     def test_stale_source_library_receipt_or_scope_reject(self):
         """The CPU proof is neither transferable to another DSO nor runtime evidence."""
         for key, value in (("sources", {}), ("library_sha256", "0" * 64),
@@ -224,6 +241,94 @@ class NativeCompletedProofTests(unittest.TestCase):
             with self.subTest(family=key):
                 with self.assertRaises(RuntimeError):
                     self.verify(changed)
+
+
+
+class OwnedEntryRecordPathTests(unittest.TestCase):
+    """Authored object-record metadata exercises the real final-path authority."""
+
+    def setUp(self):
+        """Create both complete target inventories without an SDK or code object."""
+        temporary = tempfile.TemporaryDirectory(prefix="owned-rccl-record-paths-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.library = self.root / "librccl.so.1.0"
+        self.library.write_bytes(b"authored dependency identity, not a native DSO")
+        self.alias = self.root / "librccl.so"
+        self.alias.symlink_to(self.library.name)
+        self.records = self.root / "llaminar-final-allocation"
+        self.records.mkdir()
+        self.targets = ["gfx906", "gfx1100"]
+        entry = importlib.util.spec_from_file_location("owned_rccl_record_paths",
+            ROOT / "scripts/docker/native-completed-broadcast/rccl_p2p_resources.py")
+        self.owner = importlib.util.module_from_spec(entry)
+        entry.loader.exec_module(self.owner)
+        entry = importlib.util.spec_from_file_location("owned_record_test_artifact",
+            ROOT / "scripts/docker/llvm-lto-linker/artifact.py")
+        artifact = importlib.util.module_from_spec(entry)
+        entry.loader.exec_module(artifact)
+        builder = artifact.module("owned_record_test_builder", ROOT / "scripts/docker/llvm-lto-linker/build.py")
+        self.spec = dict(schema=1, library=str(self.library), record_root=str(self.records), architectures=self.targets)
+        self.producer = dict(resource_evidence_complete=True, architectures=self.targets, observations=[])
+        self.files = {}
+        for target in self.targets:
+            original = builder.final_record_base(self.library, target)
+            paths = [Path(str(original) + ".part." + str(index) + ".obj.yaml")
+                     for index in range(artifact.PARTITIONS)]
+            rows = []
+            for index, path in enumerate(paths):
+                data = ("authored record identity " + target + " partition " + str(index)).encode()
+                path.write_bytes(data)
+                rows.append(dict(sha256=hashlib.sha256(data).hexdigest(), bytes=len(data)))
+                # Old-name decoys never authorize the current output's closure.
+                (self.records / ("final-" + target + ".opt.ld.yaml.part." + str(index) + ".obj.yaml")).write_bytes(data)
+            self.files[target] = paths
+            self.producer['observations'].append(dict(architecture=target, partitions=artifact.PARTITIONS, record_files=rows))
+        self.write_spec()
+
+    def write_spec(self):
+        """Publish only this authored immutable configuration fixture."""
+        (self.records / 'configuration.json').write_text(json.dumps(self.spec))
+
+    def observe(self):
+        """Invoke the actual owned-entry path collector, without ELF/ISA extraction."""
+        return self.owner.owned_record_files(self.records, self.alias, self.targets, self.producer)
+
+    def test_all_eight_original_output_records_on_both_architectures(self):
+        """The new-driver paths and alias retain every original partition in order."""
+        self.assertEqual(self.observe(), self.files)
+        self.assertTrue(all(len(paths) == 8 for paths in self.files.values()))
+
+    def test_missing_current_partition_rejects_complete_legacy_decoys(self):
+        """Old naming may not hide a lost current-target allocation record."""
+        self.files['gfx1100'][-1].unlink()
+        with self.assertRaisesRegex(RuntimeError, 'partition allocation record is missing'):
+            self.observe()
+
+    def test_changed_record_or_parent_inventory_rejects(self):
+        """Full paths alone cannot replace the authenticated parent record identities."""
+        original = copy.deepcopy(self.producer)
+        self.files['gfx906'][0].write_bytes(b'changed record')
+        with self.assertRaisesRegex(RuntimeError, 'differ from authenticated'):
+            self.observe()
+        self.producer = copy.deepcopy(original)
+        self.producer['observations'].pop()
+        with self.assertRaisesRegex(RuntimeError, 'lost an original architecture'):
+            self.observe()
+
+    def test_foreign_configuration_output_root_and_targets_reject(self):
+        """A different DSO or record transaction cannot lend this proof its files."""
+        original = copy.deepcopy(self.spec)
+        foreign_library = self.root / 'foreign.so'
+        foreign_library.write_bytes(b'authored foreign output')
+        for field, value in (('library', str(foreign_library)), ('record_root', str(self.root)),
+                             ('architectures', list(reversed(self.targets)))):
+            with self.subTest(field=field):
+                self.spec = copy.deepcopy(original)
+                self.spec[field] = value
+                self.write_spec()
+                with self.assertRaises(RuntimeError):
+                    self.observe()
 
 
 if __name__ == "__main__":

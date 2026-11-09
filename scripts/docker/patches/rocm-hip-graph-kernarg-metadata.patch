@@ -9,7 +9,7 @@ setup before recursive sizing, preserve its device across cloning, and propagate
 metadata/overflow errors. Keep graph reserves, execution and public ABI unchanged.
 
 Apply after the existing ordered HIP runtime patches at projects/clr.
-Pinned upstream: ROCm/rocm-systems 6b0e43f341195e203754e08f850e437ff2fc09f9.
+Pinned upstream: ROCm/rocm-systems 7da43026e4f2ef7600433c38c820732f7a205d22.
 Exact development baseline: selected hip-event-lease-source; see package manifest.
 
 diff --git a/hipamd/src/hip_graph_internal.hpp b/hipamd/src/hip_graph_internal.hpp

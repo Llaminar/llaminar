@@ -49,7 +49,9 @@ class NCCLConfiguredLibraryCMakeTests(unittest.TestCase):
                 'set(V2_PERF_TESTS_ONLY TRUE)\n'
                 f'set({self.backend}_LIBRARY "/selected private sdk/lib/{self.library}")\n'
                 + (property_command if wrong_scope else "")
-                + f'add_subdirectory(src/v2)\ninclude("{MODULE}")\n')
+                + f'add_subdirectory(src/v2)\n'
+                + f'include("{MODULE.with_name("V2TestTargetSelection.cmake")}")\n'
+                + f'include("{MODULE}")\n')
             ninja = shutil.which("ninja")
             self.assertIsNotNone(ninja)
             result = subprocess.run(["cmake", "-S", str(source), "-B", str(Path(directory) / "build"),

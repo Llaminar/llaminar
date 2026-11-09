@@ -1,0 +1,24 @@
+--- a/llvm/lib/Transforms/Scalar/GVN.cpp
++++ b/llvm/lib/Transforms/Scalar/GVN.cpp
+@@ -64,6 +64,7 @@
+ #include "llvm/IR/Value.h"
+ #include "llvm/InitializePasses.h"
+ #include "llvm/Pass.h"
++#include "llvm/Remarks/RemarkStreamer.h"
+ #include "llvm/Support/Casting.h"
+ #include "llvm/Support/CommandLine.h"
+ #include "llvm/Support/Compiler.h"
+@@ -1417,5 +1418,12 @@
+         // fast print dep, using operator<< on instruction is too slow.
+         dbgs() << "GVN: load "; Load->printAsOperand(dbgs());
+         dbgs() << " is clobbered by " << *DepInst << '\n';);
+-    if (ORE->allowExtraAnalysis(DEBUG_TYPE))
++    // Extra use-list/reachability work only explains this missed optimization.
++    // A saved remark stream can filter GVN out; preserve an explicitly selected
++    // terminal diagnostic and the existing external/no-main-streamer behavior.
++    LLVMContext &Context = Load->getContext();
++    auto *Streamer = Context.getMainRemarkStreamer();
++    if (ORE->allowExtraAnalysis(DEBUG_TYPE) &&
++        (!Streamer || Streamer->matchesFilter(DEBUG_TYPE) ||
++         Context.getDiagHandlerPtr()->isAnyRemarkEnabled(DEBUG_TYPE)))
+       reportMayClobberedLoad(Load, DepInst, DT, ORE);

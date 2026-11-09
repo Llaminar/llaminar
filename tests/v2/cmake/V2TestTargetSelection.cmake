@@ -1,7 +1,7 @@
 # Test executable selection for the production Release build.
 #
 # The test declarations are shared by Integration and Release, but Release owns
-# only v2_perf_* executables by default. Explicit native owners retain their
+# only v2_perf_* executables by default. Explicit executable/proof owners retain their
 # original sources and core ABI while remaining outside the default all target.
 # Keep target creation and its property setters in the same scope: a skipped Unit executable must not break configuration when
 # its declaration supplies language features instead of inheriting them from
@@ -9,7 +9,7 @@
 include_guard(DIRECTORY)
 
 set(LLAMINAR_RELEASE_NATIVE_TEST_TARGETS "" CACHE STRING
-    "Explicit native test executable targets to admit in Release (semicolon-separated; empty keeps performance-only selection; selected owners are excluded from default all)")
+    "Explicit native test executable and marked proof targets to admit in Release (semicolon-separated; empty keeps performance-only selection; selected owners are excluded from default all)")
 
 # This option admits declared test owners, not alternative build types or
 # compile definitions. Alias selection reuses the exact target identity carried
@@ -53,17 +53,33 @@ function(v2_test_registration_selected test_name result)
 endfunction()
 
 function(v2_validate_release_native_test_targets)
+    set(missing_owners "")
     foreach(requested IN LISTS LLAMINAR_RELEASE_NATIVE_TEST_TARGETS)
         if(NOT TARGET "${requested}")
-            message(FATAL_ERROR "Requested Release native test target was not declared: ${requested}")
+            list(APPEND missing_owners "${requested}")
         endif()
+    endforeach()
+    if(missing_owners)
+        list(JOIN missing_owners ", " missing_owners_text)
+        message(FATAL_ERROR "Requested Release native test target was not declared: ${missing_owners_text}")
+    endif()
+    foreach(requested IN LISTS LLAMINAR_RELEASE_NATIVE_TEST_TARGETS)
         get_target_property(kind "${requested}" TYPE)
         get_target_property(imported "${requested}" IMPORTED)
         get_target_property(alias "${requested}" ALIASED_TARGET)
         get_target_property(declared "${requested}" V2_RELEASE_NATIVE_TEST_OWNER)
-        if(NOT kind STREQUAL "EXECUTABLE" OR imported OR alias OR NOT declared)
+        get_target_property(proof_owner "${requested}" V2_RELEASE_NATIVE_PROOF_OWNER)
+        set(original_owner FALSE)
+        if(kind STREQUAL "EXECUTABLE" AND declared)
+            set(original_owner TRUE)
+        elseif(kind STREQUAL "UTILITY" AND proof_owner)
+            # Original source/DSO proof commands are opt-in owners too. An
+            # arbitrary dependency/custom target has no such declaration.
+            set(original_owner TRUE)
+        endif()
+        if(NOT original_owner OR imported OR alias)
             message(FATAL_ERROR
-                "Requested Release native test target is not an original declared test executable: ${requested}")
+                "Requested Release native test target is not an original declared test executable or proof owner: ${requested}")
         endif()
     endforeach()
 endfunction()

@@ -2915,6 +2915,13 @@ add_test(NAME V2_Unit_HIPRuntimeBinding
 set_tests_properties(V2_Unit_HIPRuntimeBinding PROPERTIES
     LABELS "V2;Unit;DeviceFree;ROCm;BuildSystem;Regression" TIMEOUT 30)
 
+# Authored proof controls remain device-free and never compile the vendor slice.
+add_test(NAME V2_Unit_ROCrHelperNUMA
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rocr_helper_numa.py)
+set_tests_properties(V2_Unit_ROCrHelperNUMA PROPERTIES
+    LABELS "V2;Unit;DeviceFree;ROCm;BuildSystem;Regression" TIMEOUT 30)
+
 # Prove the actual application/core loader closure, not merely FindOpenMP's
 # compiler-side path. The shadow DSO is never used for inference or Unit work.
 add_library(v2_integration_openmp_shadow_runtime SHARED
@@ -2963,6 +2970,12 @@ if(HAVE_CUDA OR HAVE_ROCM)
             else()
                 set(inventory_backend_environment "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
             endif()
+            add_v2_test(V2_Integration_ClusterAcceleratorInventorySingleRank_${backend}
+                COMMAND $<TARGET_FILE:v2_integration_cluster_accelerator_inventory>
+                    --single-rank-gpu-bootstrap
+                LABELS "V2;Integration;ProductionTestPreflight;${backend};MPI;Bootstrap;Inventory;NUMA;Regression"
+                MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+                ENVIRONMENT ${inventory_backend_environment} "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0")
             add_v2_test(V2_Integration_ClusterAcceleratorInventory_${backend}
                 COMMAND $<TARGET_FILE:v2_integration_cluster_accelerator_inventory>
                 LABELS "V2;Integration;ProductionTestPreflight;${backend};MPI;Bootstrap;Inventory;Regression"
@@ -4102,10 +4115,13 @@ add_v2_test(V2_Unit_ROCmArchitecturePolicy
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rocm_architecture_policy.py
     LABELS V2 Unit BuildSystem ROCm Regression
     NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30)
-add_v2_test(V2_Integration_ROCmArchitectureIdentityReplay
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rocm_architecture_policy.py
-    LABELS V2 Integration ProductionTestPreflight DeviceFree BuildSystem ROCm Regression
-    NO_MPI NO_MODELS MPI_PROCS 1 TIMEOUT 30)
+# This device-free Python owner has no native executable to select. Keep its
+# explicit preflight replay available in performance-only Release configurations.
+add_test(NAME V2_Integration_ROCmArchitectureIdentityReplay
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rocm_architecture_policy.py)
+set_tests_properties(V2_Integration_ROCmArchitectureIdentityReplay PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;BuildSystem;ROCm;Regression"
+    TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmArchitectureIdentityReplay)
 
 # Optional dependency discovery must not escape ROCM_PATH on a warmed build.
@@ -4152,6 +4168,26 @@ add_v2_test(V2_Integration_ReleaseExplicitNativeTestSelection
         TestTargetSelection.test_explicit_release_native_owner_rejects_unknown_or_foreign_targets
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;BuildSystem;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+# Language-free proof ownership must stay registered in selected-owner Release.
+add_test(NAME V2_Integration_ReleaseRCCLProofTargetSelection
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_test_target_selection.py
+        --cmake ${CMAKE_COMMAND} --ninja ${CMAKE_MAKE_PROGRAM}
+        TestTargetSelection.test_explicit_release_rccl_proof_owners)
+set_tests_properties(V2_Integration_ReleaseRCCLProofTargetSelection PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;BuildSystem;RCCL;Regression"
+    TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ReleaseRCCLProofTargetSelection)
+# Configure original selected ABI/loader/transfer aliases without running them.
+add_test(NAME V2_Integration_ReleaseNativeAliasReachability
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_test_target_selection.py
+        --cmake ${CMAKE_COMMAND} --ninja ${CMAKE_MAKE_PROGRAM}
+        TestTargetSelection.test_explicit_release_native_alias_reachability)
+set_tests_properties(V2_Integration_ReleaseNativeAliasReachability PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;BuildSystem;RCCL;Regression"
+    TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ReleaseNativeAliasReachability)
 # Actual included modules must obey the same Release/Integration target policy.
 foreach(_native_module_selection_kind Unit Integration)
     set(_native_module_selection_labels "V2;${_native_module_selection_kind};BuildSystem;Regression;DeviceFree")
@@ -4644,6 +4680,7 @@ include(cmake/V2NCCLGinSelectionTests.cmake)
 include(cmake/V2NCCLThreadLifetimeTests.cmake)
 include(cmake/V2NCCLUnusedRetirementTests.cmake)
 include(cmake/V2NCCLConfiguredLibraryTests.cmake)
+include(cmake/V2ROCmHSAConfiguredLibraryTests.cmake)
 add_test(NAME V2_Unit_NCCLThreadLifetimeProof
     COMMAND ${Python3_EXECUTABLE} -B
         "${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_nccl_thread_lifetime.py")
@@ -5102,6 +5139,18 @@ add_test(NAME V2_Integration_GPUSpillPartitionMetadata
             LauncherTest.test_missing_or_malformed_final_partition_metadata_is_fatal
 )
 set_tests_properties(V2_Integration_GPUSpillPartitionMetadata PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Build;Regression"
+    TIMEOUT 30
+)
+# The new HIP offload driver's final LTO remark stream must remain stdout-owned
+# through ccache; a shared sidecar cannot stand in for either target's evidence.
+add_test(NAME V2_Integration_HIPFinalAllocationRemarkRouting
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_gpu_spill_guard.py
+            LauncherTest.test_final_link_stdout_routing_survives_ccache_classification
+            LauncherTest.test_final_link_stdout_is_required_for_every_target_and_helper_on_replay
+)
+set_tests_properties(V2_Integration_HIPFinalAllocationRemarkRouting PROPERTIES
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Build;Regression"
     TIMEOUT 30
 )
@@ -8283,7 +8332,9 @@ add_v2_test(V2_Integration_BufferArenaIdentityCoverage
 )
 
 # Test: NUMATopology sysfs detection (hardware-independent unit tests with temp files)
-add_executable(v2_test_numa_topology_sysfs unit/utils/Test__NUMATopologySysfs.cpp)
+add_executable(v2_test_numa_topology_sysfs
+    unit/utils/Test__NUMATopologySysfs.cpp
+    unit/utils/Test__ScopedCallerThreadAffinity.cpp)
 target_link_libraries(v2_test_numa_topology_sysfs 
     llaminar2_core 
     GTest::gtest
@@ -15558,6 +15609,27 @@ add_v2_test(V2_Unit_ExecutionPlanBuilder
     LABELS "V2;Unit;Execution;Orchestration;Heterogeneous;PlanGeneration;TP;PP"
     MPI_PROCS 1
 )
+# Rank ownership uses gathered NUMA identity while discovery remains host-wide.
+add_v2_test(V2_Integration_RankLocalGPUOwnership
+    COMMAND $<TARGET_FILE:v2_test_execution_plan_builder>
+        --gtest_filter=RankLocalGPUOwnership.*:Test__ExecutionPlanBuilder.RankLocalGPUOwnership*:AutomaticOrchestrationCandidates.RankLocalGPUOwnership*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Ownership;NUMA;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+if(TEST V2_Integration_RankLocalGPUOwnership)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RankLocalGPUOwnership)
+endif()
+if(TARGET v2_unit_moe_expert_overlay_runtime_plan)
+    add_v2_test(V2_Integration_RankLocalGPUOverlayOwnership
+        COMMAND $<TARGET_FILE:v2_unit_moe_expert_overlay_runtime_plan>
+            --gtest_filter=Test__MoEExpertOverlayRuntimePlan.RankLocalGPUOwnership*
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;ExpertOverlay;Ownership;NUMA;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+    if(TEST V2_Integration_RankLocalGPUOverlayOwnership)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RankLocalGPUOverlayOwnership)
+    endif()
+endif()
 add_v2_test(V2_Integration_AutomaticDeviceCountCandidates
     COMMAND $<TARGET_FILE:v2_test_execution_plan_builder>
         --gtest_filter=AutomaticOrchestrationCandidates.ExactDeviceCounts*
@@ -26970,6 +27042,15 @@ add_executable(v2_test_memory_planner
     unit/planning/Test__MoEPipelineFixedMemory.cpp)
 target_link_libraries(v2_test_memory_planner llaminar2_core GTest::gtest GTest::gtest_main)
 target_include_directories(v2_test_memory_planner PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
+add_v2_test(V2_Integration_RankLocalGPUCalibrationOwnership
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=PlanningKernelServiceCatalog.RankLocalGPUOwnership*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Inventory;NUMA;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+if(TEST V2_Integration_RankLocalGPUCalibrationOwnership)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RankLocalGPUCalibrationOwnership)
+endif()
 add_v2_test(V2_Unit_MemoryPlanner
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
     LABELS "V2;Unit;Planning;MemoryPlanner;MemoryBudget"
@@ -27254,6 +27335,28 @@ add_v2_test(V2_Unit_ClusterInventoryGatherer
     LABELS "V2;Unit;Planning;ClusterInventory"
     NO_MPI NO_MODELS
 )
+add_v2_test(V2_Integration_PhysicalGPUInventoryIdentity
+    COMMAND $<TARGET_FILE:v2_test_cluster_inventory_gatherer>
+        --gtest_filter=PhysicalInventoryAggregation.RankLocalGPU*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Inventory;Ownership;NUMA;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+if(TEST V2_Integration_PhysicalGPUInventoryIdentity)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PhysicalGPUInventoryIdentity)
+endif()
+
+if(TARGET v2_test_cluster_inventory_gatherer)
+    add_v2_test(V2_Integration_RankLocalGPUSingleRankInventory
+        COMMAND $<TARGET_FILE:v2_test_cluster_inventory_gatherer>
+            --gtest_filter=Test__ClusterInventoryGatherer.SingleRankObservedNUMAAdmitsOnlyLocalGPUOwnership
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Inventory;NUMA;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+    if(TEST V2_Integration_RankLocalGPUSingleRankInventory)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RankLocalGPUSingleRankInventory)
+    endif()
+endif()
+
 
 # Test: KVCacheConfig::estimateBytes() — bridge between KernelFactory config and planning
 add_executable(v2_test_kvcache_config_estimate unit/planning/Test__KVCacheConfigEstimate.cpp)
@@ -28082,6 +28185,160 @@ add_v2_test(V2_Integration_FPWeightPipeline
     LABELS "V2;Integration;WeightLoading;GpuPipeline;FP;CUDA;ROCm"
     MPI_PROCS 1
 )
+
+# Selected original native owners and their exact runtime/ABI contracts must
+# precede the functional-only preflight wrapper. Each original block retains
+# its own target selection; unrelated preflight declarations remain excluded.
+# Native argument metadata must size original, cloned and child graph pools.
+v2_test_target_selected(v2_integration_hip_graph_argument_geometry V2_HIP_ARGUMENT_OWNER_SELECTED)
+if(HAVE_ROCM AND V2_HIP_ARGUMENT_OWNER_SELECTED)
+    set_source_files_properties(integration/backends/rocm/HIPGraphArgumentGeometryKernel.hip PROPERTIES LANGUAGE HIP)
+    add_executable(v2_integration_hip_graph_argument_geometry
+        integration/backends/rocm/Test__HIPGraphArgumentGeometry.cpp
+        integration/backends/rocm/HIPGraphArgumentGeometryKernel.hip
+        integration/mpi_gtest_main.cpp)
+    target_compile_features(v2_integration_hip_graph_argument_geometry PRIVATE cxx_std_20)
+    v2_test_device_scope(v2_integration_hip_graph_argument_geometry FullInventory)
+    target_link_libraries(v2_integration_hip_graph_argument_geometry PRIVATE llaminar2_core GTest::gtest)
+    add_v2_test(V2_Integration_HIPGraphArgumentGeometry
+        COMMAND $<TARGET_FILE:v2_integration_hip_graph_argument_geometry>
+            --gtest_filter=HIPGraphArgumentGeometry.OriginalCloneUpdateChildFamily
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;HIP;GraphCapture;Memory;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 60
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
+    if(TEST V2_Integration_HIPGraphArgumentGeometry)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HIPGraphArgumentGeometry)
+    endif()
+
+    # Trace both ordinary consumers before main: neither a private LD_LIBRARY_PATH
+    # positive nor a correct clean default can excuse the other closure being stale.
+    add_test(NAME V2_Integration_HIPRuntimeLoaderBinding
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_hip_runtime_binding.py
+            --source-root ${CMAKE_CURRENT_SOURCE_DIR}/../..
+            --binary $<TARGET_FILE:llaminar2>
+            --binary $<TARGET_FILE:v2_integration_hip_graph_argument_geometry>
+            --wrong-runtime-fixture $<TARGET_FILE:v2_integration_openmp_shadow_runtime>)
+    set_tests_properties(V2_Integration_HIPRuntimeLoaderBinding PROPERTIES
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;ROCm;HIP;Packaging;Loader;Regression"
+        TIMEOUT 60)
+    set_property(GLOBAL PROPERTY V2_TEST_BUILD_TARGETS_V2_Integration_HIPRuntimeLoaderBinding
+        "llaminar2;v2_integration_hip_graph_argument_geometry;v2_integration_openmp_shadow_runtime")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HIPRuntimeLoaderBinding)
+
+    # Installed runners authenticate actual builder replay without an SDK/compiler.
+    add_test(NAME V2_Integration_HIPPreferredQueueSelection
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_hip_runtime_binding.py
+            --preferred-queue-contract
+            --source-root ${CMAKE_CURRENT_SOURCE_DIR}/../..
+            --binary $<TARGET_FILE:llaminar2>
+            --binary $<TARGET_FILE:v2_integration_hip_graph_argument_geometry>)
+    set_tests_properties(V2_Integration_HIPPreferredQueueSelection PROPERTIES
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;ROCm;HIP;Contract;Regression"
+        TIMEOUT 60)
+    set_property(GLOBAL PROPERTY V2_TEST_BUILD_TARGETS_V2_Integration_HIPPreferredQueueSelection
+        "llaminar2;v2_integration_hip_graph_argument_geometry")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HIPPreferredQueueSelection)
+endif()
+
+# Authenticate the builder's actual ROCr helper-body replay against both native
+# consumer loader closures before main; installed tests need no compiler/GPU.
+if(HAVE_ROCM AND V2_HIP_ARGUMENT_OWNER_SELECTED)
+    add_test(NAME V2_Integration_ROCrHelperNUMA
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rocr_helper_numa.py
+            --source-root ${CMAKE_CURRENT_SOURCE_DIR}/../..
+            --binary $<TARGET_FILE:llaminar2>
+            --binary $<TARGET_FILE:v2_integration_hip_graph_argument_geometry>)
+    set_tests_properties(V2_Integration_ROCrHelperNUMA PROPERTIES
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;ROCm;Dependency;Lifecycle;Regression"
+        TIMEOUT 60)
+    set_property(GLOBAL PROPERTY V2_TEST_BUILD_TARGETS_V2_Integration_ROCrHelperNUMA
+        "llaminar2;v2_integration_hip_graph_argument_geometry")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCrHelperNUMA)
+endif()
+if(NOT V2_PERF_TESTS_ONLY OR V2_HIP_ARGUMENT_OWNER_SELECTED)
+    add_test(NAME V2_Integration_ROCrHelperNUMAContract
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_rocr_helper_numa.py)
+    set_tests_properties(V2_Integration_ROCrHelperNUMAContract PROPERTIES
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;ROCm;Contract;Regression"
+        TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCrHelperNUMAContract)
+endif()
+
+# Exact selected-SDK ownership and authenticated runtime export of the legacy
+# source-built SMI ABI required by the independently pinned RCCL dependency.
+if(NOT V2_PERF_TESTS_ONLY OR
+   "v2_rccl_completed_broadcast_proof" IN_LIST LLAMINAR_RELEASE_NATIVE_TEST_TARGETS)
+    add_test(NAME V2_Integration_RCCLLegacySMISDKOwnership
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_production_pipeline.py
+            InfrastructureTests.test_rccl_legacy_smi_rejects_foreign_sdk_discovery
+            InfrastructureTests.test_legacy_smi_runtime_component_authenticates_before_export)
+    set_tests_properties(V2_Integration_RCCLLegacySMISDKOwnership PROPERTIES
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;ROCm;RCCL;Dependency;Regression"
+        TIMEOUT 60)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RCCLLegacySMISDKOwnership)
+endif()
+
+
+# The original ABI owner determines its small dependency DSO and aliases.
+# Per-target selection below excludes unrelated vendors in Release.
+if(NOT V2_PERF_TESTS_ONLY OR
+   "v2_unit_nccl_rows_abi" IN_LIST LLAMINAR_RELEASE_NATIVE_TEST_TARGETS OR
+   "v2_unit_rccl_rows_abi" IN_LIST LLAMINAR_RELEASE_NATIVE_TEST_TARGETS)
+    # Device-free actual-loader ABI witnesses; separate DSOs keep NCCL/RCCL isolated.
+    foreach(native_rows_backend IN ITEMS NCCL RCCL)
+        if((native_rows_backend STREQUAL "NCCL" AND HAVE_CUDA) OR
+           (native_rows_backend STREQUAL "RCCL" AND HAVE_ROCM))
+            string(TOLOWER "${native_rows_backend}" native_rows_suffix)
+            set(native_rows_fixture "v2_unit_${native_rows_suffix}_rows_abi_dependency")
+            set(native_rows_test "v2_unit_${native_rows_suffix}_rows_abi")
+            v2_test_target_selected("${native_rows_test}" native_rows_selected)
+            if(NOT native_rows_selected)
+                continue()
+            endif()
+            add_library(${native_rows_fixture} SHARED
+                unit/collective/backends/NativeRowsABIDependency.cpp)
+            if(V2_PERF_TESTS_ONLY)
+                set_property(TARGET ${native_rows_fixture} PROPERTY EXCLUDE_FROM_ALL TRUE)
+            endif()
+            target_include_directories(${native_rows_fixture} PRIVATE ${CMAKE_SOURCE_DIR})
+            target_compile_features(${native_rows_fixture} PRIVATE cxx_std_20)
+            target_compile_definitions(${native_rows_fixture} PRIVATE
+                "LLAMINAR_NATIVE_ROWS_ABI_${native_rows_backend}=1")
+            add_executable(${native_rows_test}
+                unit/collective/backends/Test__NativeRowsABI.cpp)
+            target_compile_definitions(${native_rows_test} PRIVATE
+                "LLAMINAR_NATIVE_ROWS_ABI_${native_rows_backend}=1")
+            target_link_libraries(${native_rows_test} PRIVATE
+                llaminar2_core ${native_rows_fixture} GTest::gtest_main)
+            add_v2_test(V2_Unit_${native_rows_backend}FixedRowsABI
+                COMMAND $<TARGET_FILE:${native_rows_test}>
+                LABELS "V2;Unit;Collective;CPU;Dependency;${native_rows_backend};Regression"
+                MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 10)
+            add_v2_test(V2_Integration_${native_rows_backend}FixedRowsABI
+                COMMAND $<TARGET_FILE:${native_rows_test}>
+                LABELS "V2;Integration;ProductionTestPreflight;Collective;CPU;Dependency;${native_rows_backend};Regression"
+                MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 10)
+        endif()
+    endforeach()
+endif()
+
+
+# Execute real installer staging over tiny fixtures; both loader modes stay mandatory.
+# This script has no executable owner; retain it with selected HIP qualification.
+if(NOT V2_PERF_TESTS_ONLY OR V2_HIP_ARGUMENT_OWNER_SELECTED)
+    add_test(NAME V2_Integration_HIPRuntimeSDKDeployment
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_hip_runtime_binding.py)
+    set_tests_properties(V2_Integration_HIPRuntimeSDKDeployment PROPERTIES
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;ROCm;HIP;Packaging;Loader;Regression"
+        TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HIPRuntimeSDKDeployment)
+endif()
 
 # =============================================================================
 # Production model-parity preflight
@@ -34627,58 +34884,6 @@ if(NOT V2_PERF_TESTS_ONLY)
     endif()
 endif()
 
-# Native argument metadata must size original, cloned and child graph pools.
-if(HAVE_ROCM AND NOT V2_PERF_TESTS_ONLY)
-    set_source_files_properties(integration/backends/rocm/HIPGraphArgumentGeometryKernel.hip PROPERTIES LANGUAGE HIP)
-    add_executable(v2_integration_hip_graph_argument_geometry
-        integration/backends/rocm/Test__HIPGraphArgumentGeometry.cpp
-        integration/backends/rocm/HIPGraphArgumentGeometryKernel.hip
-        integration/mpi_gtest_main.cpp)
-    target_compile_features(v2_integration_hip_graph_argument_geometry PRIVATE cxx_std_20)
-    v2_test_device_scope(v2_integration_hip_graph_argument_geometry FullInventory)
-    target_link_libraries(v2_integration_hip_graph_argument_geometry PRIVATE llaminar2_core GTest::gtest)
-    add_v2_test(V2_Integration_HIPGraphArgumentGeometry
-        COMMAND $<TARGET_FILE:v2_integration_hip_graph_argument_geometry>
-            --gtest_filter=HIPGraphArgumentGeometry.OriginalCloneUpdateChildFamily
-        LABELS "V2;Integration;ProductionTestPreflight;ROCm;HIP;GraphCapture;Memory;Lifecycle;Regression"
-        MPI_PROCS 1 NO_MODELS TIMEOUT 60
-        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
-    if(TEST V2_Integration_HIPGraphArgumentGeometry)
-        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HIPGraphArgumentGeometry)
-    endif()
-
-    # Trace both ordinary consumers before main: neither a private LD_LIBRARY_PATH
-    # positive nor a correct clean default can excuse the other closure being stale.
-    add_test(NAME V2_Integration_HIPRuntimeLoaderBinding
-        COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_hip_runtime_binding.py
-            --source-root ${CMAKE_CURRENT_SOURCE_DIR}/../..
-            --binary $<TARGET_FILE:llaminar2>
-            --binary $<TARGET_FILE:v2_integration_hip_graph_argument_geometry>
-            --wrong-runtime-fixture $<TARGET_FILE:v2_integration_openmp_shadow_runtime>)
-    set_tests_properties(V2_Integration_HIPRuntimeLoaderBinding PROPERTIES
-        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;ROCm;HIP;Packaging;Loader;Regression"
-        TIMEOUT 60)
-    set_property(GLOBAL PROPERTY V2_TEST_BUILD_TARGETS_V2_Integration_HIPRuntimeLoaderBinding
-        "llaminar2;v2_integration_hip_graph_argument_geometry;v2_integration_openmp_shadow_runtime")
-    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HIPRuntimeLoaderBinding)
-
-    # Installed runners authenticate actual builder replay without an SDK/compiler.
-    add_test(NAME V2_Integration_HIPPreferredQueueSelection
-        COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_hip_runtime_binding.py
-            --preferred-queue-contract
-            --source-root ${CMAKE_CURRENT_SOURCE_DIR}/../..
-            --binary $<TARGET_FILE:llaminar2>
-            --binary $<TARGET_FILE:v2_integration_hip_graph_argument_geometry>)
-    set_tests_properties(V2_Integration_HIPPreferredQueueSelection PROPERTIES
-        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;ROCm;HIP;Contract;Regression"
-        TIMEOUT 60)
-    set_property(GLOBAL PROPERTY V2_TEST_BUILD_TARGETS_V2_Integration_HIPPreferredQueueSelection
-        "llaminar2;v2_integration_hip_graph_argument_geometry")
-    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HIPPreferredQueueSelection)
-endif()
-
 # Insert before the canonical ProductionTestPreflight finalizer. This candidate
 # does not alter old aliases or add a new executable/lifecycle implementation.
 if(NOT V2_PERF_TESTS_ONLY)
@@ -34795,38 +35000,6 @@ if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_test_mtp_graph_construction)
             MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     endif()
 
-endif()
-
-if(NOT V2_PERF_TESTS_ONLY)
-    # Device-free actual-loader ABI witnesses; separate DSOs keep NCCL/RCCL isolated.
-    foreach(native_rows_backend IN ITEMS NCCL RCCL)
-        if((native_rows_backend STREQUAL "NCCL" AND HAVE_CUDA) OR
-           (native_rows_backend STREQUAL "RCCL" AND HAVE_ROCM))
-            string(TOLOWER "${native_rows_backend}" native_rows_suffix)
-            set(native_rows_fixture "v2_unit_${native_rows_suffix}_rows_abi_dependency")
-            set(native_rows_test "v2_unit_${native_rows_suffix}_rows_abi")
-            add_library(${native_rows_fixture} SHARED
-                unit/collective/backends/NativeRowsABIDependency.cpp)
-            target_include_directories(${native_rows_fixture} PRIVATE ${CMAKE_SOURCE_DIR})
-            target_compile_features(${native_rows_fixture} PRIVATE cxx_std_20)
-            target_compile_definitions(${native_rows_fixture} PRIVATE
-                "LLAMINAR_NATIVE_ROWS_ABI_${native_rows_backend}=1")
-            add_executable(${native_rows_test}
-                unit/collective/backends/Test__NativeRowsABI.cpp)
-            target_compile_definitions(${native_rows_test} PRIVATE
-                "LLAMINAR_NATIVE_ROWS_ABI_${native_rows_backend}=1")
-            target_link_libraries(${native_rows_test} PRIVATE
-                llaminar2_core ${native_rows_fixture} GTest::gtest_main)
-            add_v2_test(V2_Unit_${native_rows_backend}FixedRowsABI
-                COMMAND $<TARGET_FILE:${native_rows_test}>
-                LABELS "V2;Unit;Collective;CPU;Dependency;${native_rows_backend};Regression"
-                MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 10)
-            add_v2_test(V2_Integration_${native_rows_backend}FixedRowsABI
-                COMMAND $<TARGET_FILE:${native_rows_test}>
-                LABELS "V2;Integration;ProductionTestPreflight;Collective;CPU;Dependency;${native_rows_backend};Regression"
-                MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 10)
-        endif()
-    endforeach()
 endif()
 
 if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_test_memory_planner)
@@ -36532,14 +36705,6 @@ if(TARGET v2_perf_cpu_gdn_verifier_rows)
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
 endif()
-
-# Execute real installer staging over tiny fixtures; both loader modes stay mandatory.
-add_v2_test(V2_Integration_HIPRuntimeSDKDeployment
-    COMMAND ${Python3_EXECUTABLE}
-        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_hip_runtime_binding.py
-    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;ROCm;HIP;Packaging;Loader;Regression"
-    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
-list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HIPRuntimeSDKDeployment)
 
 # Exact-correction geometry/retention is device-free; CUDA arithmetic is gated separately.
 if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_test_cpu_fixed_epoch_gdn)
@@ -39334,4 +39499,30 @@ if(HAVE_ROCM AND TARGET v2_test_qwen4exp_device_primitives)
                 MPI_PROCS 1 NO_MODELS TIMEOUT 120)
         endforeach()
     endforeach()
+endif()
+
+# Native inventory may temporarily retarget its caller, never its CPU ownership.
+if(TARGET v2_test_numa_topology_sysfs)
+    add_v2_test(V2_Integration_HardwareDiscoveryCallerAffinityReplay
+        COMMAND $<TARGET_FILE:v2_test_numa_topology_sysfs>
+            --gtest_filter=HardwareDiscoveryCallerAffinity.*
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NUMA;Backends;Lifecycle;Replay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 15
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    if(TEST V2_Integration_HardwareDiscoveryCallerAffinityReplay)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HardwareDiscoveryCallerAffinityReplay)
+    endif()
+endif()
+
+# CPU NUMA ownership is an exact startup observation, not a textual/rank guess.
+if(TARGET v2_test_numa_topology_sysfs)
+    add_v2_test(V2_Integration_CPUCallerNUMAOwnership
+        COMMAND $<TARGET_FILE:v2_test_numa_topology_sysfs>
+            --gtest_filter=CPUCallerNUMAOwnership.*:CPUCallerNUMAOwnershipContract.*
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NUMA;Startup;Contract;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 15
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    if(TEST V2_Integration_CPUCallerNUMAOwnership)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUCallerNUMAOwnership)
+    endif()
 endif()

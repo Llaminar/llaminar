@@ -10,6 +10,7 @@
  */
 #include "PlanningKernelServiceCatalog.h"
 #include "PlanningObservedResource.h"
+#include "RankHardwareOwnership.h"
 #include "PlanningExecutionMeasurement.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IWorkerGPUContext.h"
@@ -491,6 +492,9 @@ namespace llaminar2
         std::vector<PlanningServiceObserver> result;
         using Key = std::tuple<int, DeviceType, std::string>;
         std::map<Key, PlanningServiceObserver> gpus;
+        // Execution eligibility never hides contradictory visible aliases.
+        // Keep validation identity separate from the selected reporter roster.
+        std::map<Key, int> observed_numa;
         for (int rank = 0; rank < inventory.world_size; ++rank)
         {
             const auto &observed = inventory.ranks.at(rank);
@@ -498,24 +502,25 @@ namespace llaminar2
             if (request.allows(DeviceType::CPU) && observed.cpu.memory_bytes > 0)
                 result.push_back(PlanningServiceObserver(rank, node, DeviceId::cpu(), observed.cpu.numa_node, {}));
             std::set<std::pair<DeviceType, int>> ordinals;
+            std::set<std::pair<DeviceType, std::string>> uuids;
             for (const auto &gpu : observed.gpus)
             {
                 if (!request.allows(gpu.type)) continue;
                 require(gpu.type == DeviceType::CUDA || gpu.type == DeviceType::ROCm, "unsupported GPU backend");
                 require(!gpu.uuid.empty() && gpu.local_device_id >= 0, "GPU has no physical identity");
                 require(ordinals.emplace(gpu.type, gpu.local_device_id).second, "duplicate rank-local GPU ordinal");
+                require(uuids.emplace(gpu.type, gpu.uuid).second, "duplicate rank-local physical GPU UUID");
                 const Key key{node, gpu.type, gpu.uuid};
+                const auto [alias, first] = observed_numa.emplace(key, gpu.numa_node);
+                require(first || alias->second < 0 || gpu.numa_node < 0 || alias->second == gpu.numa_node,
+                    "GPU aliases disagree on physical NUMA affinity");
+                if (alias->second < 0 && gpu.numa_node >= 0) alias->second = gpu.numa_node;
+                // Validate every visible alias before selecting a local native
+                // executor. Remote or unknown ownership cannot hide bad facts.
+                if (!rankOwnsGPUDevice(observed, gpu)) continue;
                 PlanningServiceObserver candidate(rank, node, {gpu.type, gpu.local_device_id}, gpu.numa_node, gpu.uuid);
                 const auto previous = gpus.find(key);
-                require(previous == gpus.end() || previous->second.numaNode() < 0 || gpu.numa_node < 0 ||
-                    previous->second.numaNode() == gpu.numa_node, "GPU aliases disagree on physical NUMA affinity");
-                // Affinity selects the reporter only. It cannot change physical
-                // membership, select an inference topology or fabricate a cost.
-                const bool local = gpu.numa_node >= 0 && observed.cpu.numa_node == gpu.numa_node;
-                const bool previous_local = previous != gpus.end() && gpu.numa_node >= 0 &&
-                    inventory.ranks.at(previous->second.discoveryRank()).cpu.numa_node == gpu.numa_node;
                 if (previous == gpus.end()) gpus.emplace(key, std::move(candidate));
-                else if (local && !previous_local) previous->second = std::move(candidate);
             }
         }
         for (auto &[key, observer] : gpus) result.push_back(std::move(observer));

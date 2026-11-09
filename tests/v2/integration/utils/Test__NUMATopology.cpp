@@ -16,14 +16,16 @@ using namespace llaminar2;
 // Local NUMA Node Detection Tests
 // =============================================================================
 
-TEST(Test__Integration_NUMATopology, DetectLocalNUMANode_Succeeds)
+TEST(Test__Integration_NUMATopology, DetectLocalNUMANodeMatchesCallerBinding)
 {
-    auto info = NUMATopology::detectLocalNUMANode();
-
-    // Should always succeed on Linux systems
-    EXPECT_TRUE(info.detection_succeeded);
-    EXPECT_GE(info.local_numa_node, 0);
-    EXPECT_GE(info.total_numa_nodes, 1);
+    const auto info = NUMATopology::detectLocalNUMANode();
+    const int expected = NUMATopology::detectLocalNUMANodeFromStatus(
+        "/proc/thread-self/status", "/sys/devices/system/cpu");
+    // An unbound/multi-NUMA caller is genuinely unknown. It cannot certify
+    // physical node0 merely because the host's node directories exist.
+    EXPECT_EQ(info.detection_succeeded,expected>=0);
+    EXPECT_EQ(info.local_numa_node,expected);
+    EXPECT_GE(info.total_numa_nodes,1);
     EXPECT_FALSE(info.detection_method.empty());
 }
 
@@ -42,7 +44,7 @@ TEST(Test__Integration_NUMATopology, DetectionMethod_IsValid)
     EXPECT_TRUE(info.detection_method == "hwloc" ||
                 info.detection_method == "procfs" ||
                 info.detection_method == "sysfs" ||
-                info.detection_method == "fallback");
+                info.detection_method == "unknown");
 }
 
 // =============================================================================

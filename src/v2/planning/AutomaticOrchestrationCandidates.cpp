@@ -388,6 +388,8 @@ namespace llaminar2
                         if (gpu.local_device_id < 0 || gpu.uuid.empty() ||
                             !ordinals.insert(gpu.local_device_id).second || !uuids.insert(gpu.uuid).second)
                             throw std::invalid_argument("Automatic planning requires unique observed GPU ordinals and UUIDs");
+                        // Discovery remains complete; only NUMA-local ranks may execute this GPU.
+                        if (!rankOwnsGPUDevice(rank, gpu)) continue;
                         devices.push_back({rank.rank, rank.node_id,
                             GlobalDeviceAddress::fromLocalDeviceId(DeviceId(backend, gpu.local_device_id),
                                 rank.hostname, gpu.numa_node),

@@ -16,6 +16,7 @@
 #include <sstream>
 #include <filesystem>
 #include <algorithm>
+#include <charconv>
 #include <cstring>
 #include <set>
 #include <thread>
@@ -477,57 +478,38 @@ namespace llaminar2
 
     std::vector<int> NodeTopology::parseCPUListString(const std::string &cpu_list_str)
     {
+        const auto list = trim(cpu_list_str);
+        if (list.empty() || list.back() == ',') return {};
         std::vector<int> cpus;
-
-        if (cpu_list_str.empty())
-        {
-            return cpus;
-        }
-
-        // Parse comma-separated ranges like "0-7,16-23,32"
-        std::istringstream stream(cpu_list_str);
+        std::istringstream stream(list);
         std::string token;
-
+        // Never publish a valid prefix of malformed kernel metadata. Exact
+        // decimal parsing rejects negative IDs, overflow and trailing junk.
+        const auto number = [](const std::string &text, int &value) {
+            const auto digits = trim(text);
+            const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size(), value);
+            return parsed.ec == std::errc{} && parsed.ptr == digits.data() + digits.size() && value >= 0;
+        };
         while (std::getline(stream, token, ','))
         {
             token = trim(token);
-            if (token.empty())
+            if (token.empty()) return {};
+            const auto dash = token.find('-');
+            int first = -1, last = -1;
+            if (dash == std::string::npos)
             {
+                if (!number(token, first)) return {};
+                cpus.push_back(first);
                 continue;
             }
-
-            size_t dash = token.find('-');
-            if (dash != std::string::npos)
+            if (!number(token.substr(0, dash), first) ||
+                !number(token.substr(dash + 1), last) || last < first) return {};
+            for (int cpu = first;; ++cpu)
             {
-                // Range: "0-7"
-                try
-                {
-                    int start = std::stoi(token.substr(0, dash));
-                    int end = std::stoi(token.substr(dash + 1));
-                    for (int i = start; i <= end; ++i)
-                    {
-                        cpus.push_back(i);
-                    }
-                }
-                catch (...)
-                {
-                    LOG_WARN("[NodeTopology] Failed to parse CPU range: " << token);
-                }
-            }
-            else
-            {
-                // Single CPU: "32"
-                try
-                {
-                    cpus.push_back(std::stoi(token));
-                }
-                catch (...)
-                {
-                    LOG_WARN("[NodeTopology] Failed to parse CPU ID: " << token);
-                }
+                cpus.push_back(cpu);
+                if (cpu == last) break; // Do not increment INT_MAX.
             }
         }
-
         return cpus;
     }
 

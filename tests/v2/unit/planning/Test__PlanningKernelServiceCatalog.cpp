@@ -8,6 +8,7 @@
  */
 #include "../../utils/ScopedGDNProjectionArithmetic.h"
 #include "planning/PlanningKernelServiceCatalog.h"
+#include "planning/RankHardwareOwnership.h"
 #include "planning/PlanningWeightServiceModel.h"
 #include "planning/PlanningCommunicationService.h"
 #include "planning/PlanningCommunicationCost.h"
@@ -699,6 +700,9 @@ namespace
         auto cluster = multiple_gpus ? communicationInventory() : inventory();
         for (auto &rank : cluster.ranks)
         {
+            // Request arithmetic chooses rank zero; author its actual bound
+            // NUMA rather than borrowing the codec fixture's whole-host scope.
+            rank.cpu.numa_node = 0;
             rank.cpu.memory_bytes = rank.cpu.free_memory_bytes = rank.cpu_memory_bytes = size_t{16} << 30;
             for (auto &socket : rank.cpu_socket_info) socket.memory_bytes = size_t{16} << 30;
             for (auto &gpu : rank.gpus)
@@ -788,8 +792,9 @@ namespace
  * @test CPU allocation identity is independent of whole-host or bound NUMA affinity.
  *
  * A rank's -1 affinity denotes an observed whole-host CPU resource, not an
- * invalid process allocator. Binding NUMA3 likewise cannot invent CPU ordinal3.
- * Exercise the actual model-aware compiler and complete BOM on every backend;
+ * invalid process CPU allocator. GPU execution additionally requires exact
+ * locality, so the unqualified GPU arms are negative controls. Binding NUMA3
+ * likewise cannot invent CPU ordinal3. Exercise the actual model-aware compiler and complete BOM on every backend;
  * no model payload or accelerator is loaded by these metadata fixtures.
  */
 TEST(PlanningRequestCostModel, CPUAllocatorDoesNotUseNUMAAffinityAsDeviceOrdinal)
@@ -806,8 +811,17 @@ TEST(PlanningRequestCostModel, CPUAllocatorDoesNotUseNUMAAffinityAsDeviceOrdinal
                 rank.cpu.numa_node = affinity;
                 rank.numa_nodes = affinity < 0 ? 1 : 4;
                 for (auto &socket : rank.cpu_socket_info) socket.numa_node = affinity < 0 ? 0 : affinity;
+                if (affinity >= 0)
+                    for (auto &gpu : rank.gpus) gpu.numa_node = affinity;
             }
             observed.buildNodeAggregations();
+            if (affinity < 0 && backend != DeviceType::CPU)
+            {
+                // Whole-host CPU ownership cannot authorize any GPU executor.
+                EXPECT_THROW(requestCandidate(source, observed, backend,
+                    OrchestrationStrategy::SingleDevice), std::logic_error);
+                continue;
+            }
             std::optional<AdmittedOrchestrationCandidate> admitted;
             EXPECT_NO_THROW(admitted.emplace(requestCandidate(source, observed, backend,
                 OrchestrationStrategy::SingleDevice)));
@@ -1198,7 +1212,7 @@ TEST(PlanningCommunicationService, ProjectionOnlyTPSamplesItsActualHostScopes)
         EXPECT_TRUE(PlanningCommunicationSamplePlan::resolve(cluster, tp, 257, 31, precision).hostDevice().empty());
         const auto projection = PlanningCommunicationSamplePlan::resolve(cluster, tp, 257, 31, precision,
             RoutedExpertComputePolicy::GateUpOwnedDownColumns);
-        ASSERT_EQ(projection.hostDevice().size(), 7u);
+        ASSERT_EQ(projection.hostDevice().size(), 5u); // Only rank1/rank2 own local GPU execution.
         const auto automatic = PlanningCommunicationSamplePlan::resolve(cluster, tp, 257, 31, precision,
             RoutedExpertComputePolicy::Automatic);
         ASSERT_EQ(automatic.hostDevice().size(), projection.hostDevice().size());
@@ -1256,7 +1270,7 @@ TEST(PlanningCommunicationService, SampleBasisIsPhysicalBoundedAndConstraintAwar
     const auto plan = PlanningCommunicationSamplePlan::resolve(cluster, AutomaticOrchestrationRequest{}, 257, 31, precisions);
     EXPECT_EQ(plan.native().size(), 8u); // Two physical nodes, two vendors, two precisions.
     EXPECT_EQ(plan.mpi().size(), 18u); // Control plus two independently varied payload directions.
-    EXPECT_EQ(plan.hostDevice().size(), 14u); // Every rank's distinct first-touch scope is retained.
+    EXPECT_EQ(plan.hostDevice().size(), 10u); // Preserve each NUMA-local executor's host scope.
     for (const auto &sample : plan.native())
     {
         EXPECT_EQ(sample.discovery_rank, sample.physical_node ? 2 : 1);
@@ -1488,7 +1502,10 @@ TEST(PlanningCommunicationCost, ChangedMembershipAndCorruptOrDuplicateReceiptsFa
 
 TEST(PlanningCommunicationCost, HostPrimitivesRetainFirstTouchScopeDirectionAndMechanismAcrossGPUAliases)
 {
-    const auto cluster = communicationInventory();
+    auto cluster = communicationInventory();
+    // Both first-touch scopes are real local executors of this physical GPU.
+    // The generic codec fixture intentionally leaves rank zero unqualified.
+    cluster.ranks[0].cpu.numa_node = 0;
     const std::array precision{PlanningAllreducePrecision::FP32};
     const auto plan = PlanningCommunicationSamplePlan::resolve(cluster, AutomaticOrchestrationRequest{}, 257, 31, precision);
     const auto wire = nativeReceipts(plan, cluster.world_size);
@@ -1534,11 +1551,13 @@ TEST(PlanningCommunicationService, MalformedHostDeviceReceiptsCannotEscapeTheSha
     const std::array precision{PlanningAllreducePrecision::FP32};
     const auto plan = PlanningCommunicationSamplePlan::resolve(cluster, AutomaticOrchestrationRequest{}, 257, 31, precision);
     const auto encoded = nativeReceipts(plan, cluster.world_size);
+    ASSERT_FALSE(plan.hostDevice().empty());
+    const auto reporter = static_cast<std::size_t>(plan.hostDevice().front().rank());
     for (int defect = 0; defect < 12; ++defect)
     {
         SCOPED_TRACE(defect);
         auto broken = encoded;
-        auto wire = nlohmann::json::parse(broken[0]);
+        auto wire = nlohmann::json::parse(broken[reporter]);
         if (defect == 0) wire["host_device"].erase(0);
         if (defect == 1) wire["host_device"].push_back(wire["host_device"][0]);
         auto &sample = wire["host_device"][0];
@@ -1554,7 +1573,7 @@ TEST(PlanningCommunicationService, MalformedHostDeviceReceiptsCannotEscapeTheSha
         if (defect == 10) phase[6] = "";
         if (defect == 11) wire["plan"]["host_device"][0]["host_numa"] = 99;
         const auto text = wire.dump();
-        broken[0] = {text.begin(), text.end()};
+        broken[reporter] = {text.begin(), text.end()};
         EXPECT_THROW(PlanningCommunicationService::acceptLocal(plan, cluster.world_size, borrow(broken)), std::exception);
     }
 }
@@ -1584,5 +1603,58 @@ TEST(PlanningWeightServiceModel, GDNHalfOperandsKeepSeparateServiceFamilies)
             }
         EXPECT_TRUE(native_half);
         EXPECT_TRUE(gdn_half);
+    }
+}
+
+/** @test Calibration may observe remote hardware but cannot execute on its remote visibility. */
+TEST(PlanningKernelServiceCatalog, RankLocalGPUOwnershipFiltersNativeAndHostDeviceCalibration)
+{
+    auto cluster = communicationInventory();
+    const auto all = PlanningKernelServiceCatalog::observers(cluster, AutomaticOrchestrationRequest{});
+    for (const auto &observer : all)
+        if (observer.device().is_gpu())
+            EXPECT_NO_THROW(requireRankLocalGPUOwnership(cluster.ranks.at(observer.discoveryRank()), observer.device(), "sample reporter"));
+    const auto plan = PlanningCommunicationSamplePlan::resolve(cluster, AutomaticOrchestrationRequest{}, 257, 31,
+        std::array{PlanningAllreducePrecision::FP32});
+    for (const auto &sample : plan.native())
+        for (const auto device : sample.request.devices())
+            EXPECT_NO_THROW(requireRankLocalGPUOwnership(cluster.ranks.at(sample.discovery_rank), device, "native collective reporter"));
+    for (const auto &sample : plan.hostDevice())
+        EXPECT_NO_THROW(requireRankLocalGPUOwnership(cluster.ranks.at(sample.rank()), sample.device(), "host/device reporter"));
+    // CPU participants retain their legitimate cross-rank protocol samples.
+    EXPECT_EQ(plan.mpi().size(), 18u);
+    EXPECT_EQ(cluster.ranks[0].gpus.size(), 4u);
+    // If no reporting rank has the GPU's NUMA, do not substitute a remote one.
+    for (auto &rank : cluster.ranks) rank.cpu.numa_node = 19;
+    const auto none = PlanningKernelServiceCatalog::observers(cluster, AutomaticOrchestrationRequest{});
+    EXPECT_TRUE(std::none_of(none.begin(), none.end(), [](const auto &observer) { return observer.device().is_gpu(); }));
+    const auto no_native = PlanningCommunicationSamplePlan::resolve(cluster, AutomaticOrchestrationRequest{}, 257, 31,
+        std::array{PlanningAllreducePrecision::FP32});
+    EXPECT_TRUE(no_native.native().empty());
+    EXPECT_TRUE(no_native.hostDevice().empty());
+    EXPECT_EQ(no_native.mpi().size(), 18u);
+}
+
+/** @test Locality filtering cannot turn corrupt visible inventory into an empty valid roster. */
+TEST(PlanningKernelServiceCatalog, RankLocalGPUOwnershipRejectsMalformedRemoteAliases)
+{
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    for (const bool duplicate_uuid : {false, true})
+    {
+        auto cluster = inventory();
+        for (auto &rank : cluster.ranks) rank.cpu.numa_node = 19;
+        auto &gpus = cluster.ranks[1].gpus;
+        const auto gpu = std::find_if(gpus.begin(), gpus.end(), [&](const auto &value) { return value.type == backend; });
+        ASSERT_NE(gpu, gpus.end());
+        if (duplicate_uuid)
+        {
+            auto duplicate = *gpu;
+            duplicate.local_device_id += 99;
+            gpus.push_back(duplicate);
+        }
+        else gpu->numa_node = 1;
+        EXPECT_THROW(PlanningKernelServiceCatalog::observers(cluster, AutomaticOrchestrationRequest{}), std::invalid_argument);
+        EXPECT_THROW(PlanningCommunicationSamplePlan::resolve(cluster, AutomaticOrchestrationRequest{}, 1, 1,
+            std::array{PlanningAllreducePrecision::FP32}), std::invalid_argument);
     }
 }

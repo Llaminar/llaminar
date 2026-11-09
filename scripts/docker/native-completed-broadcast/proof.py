@@ -71,6 +71,7 @@ def source_identity(backend):
     result = {"native-completed-broadcast/" + name: digest(HERE / name) for name in FILES}
     result["patches/" + patch(backend).name] = digest(patch(backend))
     if backend=="rccl":
+        result["patches/rccl-user-p2p-override.patch"] = digest(DOCKER / "patches/rccl-user-p2p-override.patch")
         result["llvm-lto-linker/artifact.py"]=digest(DOCKER/"llvm-lto-linker/artifact.py")
         result["../build/gpu_spill_guard.py"]=digest(DOCKER.parent/"build/gpu_spill_guard.py")
     return result
@@ -91,7 +92,14 @@ def valid_receipt(backend, receipt):
         spec.loader.exec_module(module)
         prefix = module.receipt_prefix()
         return receipt.startswith(prefix) and len(receipt) > len(prefix)
-    return receipt.startswith("targets-") and receipt.count("-completed-" + digest(patch(backend)) + "-capture-") == 1
+    # The producer prepends this exact new selection repair to its otherwise
+    # unchanged targets/body/ordered completed-capture contract. Authenticate
+    # the full prefix before using the original body validation below.
+    prefix = "p2p-" + digest(DOCKER / "patches/rccl-user-p2p-override.patch") + "-"
+    if not receipt.startswith(prefix):
+        return False
+    body = receipt[len(prefix):]
+    return body.startswith("targets-") and body.count("-completed-" + digest(patch(backend)) + "-capture-") == 1
 
 
 def verify_observations(observations, backend):

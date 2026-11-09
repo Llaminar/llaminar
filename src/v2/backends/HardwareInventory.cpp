@@ -5,6 +5,9 @@
  * Detects CPU sockets (model, cores, HT, memory), GPU devices, and P2P
  * access matrices from sysfs, /proc/cpuinfo, and GPU driver APIs.
  *
+ * Native discovery borrows the calling thread; its exact CPU binding must be
+ * restored before returning or unwinding, without touching existing workers.
+ *
  * @author David Sanftenberg
  * @date 2026-04-11
  */
@@ -15,6 +18,7 @@
 #include "HostMemoryCapacity.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
+#include "../utils/ScopedCallerThreadAffinity.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -240,6 +244,7 @@ namespace llaminar2
 
     HardwareInventory HardwareInventory::detect()
     {
+        const ScopedCallerThreadAffinity preserve_caller;
         HardwareInventory hw;
         const auto &startup = debugEnv().backend_startup;
 

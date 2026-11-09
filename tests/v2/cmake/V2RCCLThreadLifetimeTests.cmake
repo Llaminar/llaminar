@@ -9,9 +9,8 @@ if(POLICY CMP0116)
     cmake_policy(SET CMP0116 NEW)
 endif()
 
-if(HAVE_ROCM AND HAVE_RCCL AND NOT V2_PERF_TESTS_ONLY)
-    set(RCCL_PROTOCOL_BUILD_DIR "${RCCL_BUILD_DIR}" CACHE PATH
-        "Completed canonical RCCL native source/proof build")
+v2_test_target_selected(v2_rccl_thread_lifetime_proof V2_RCCL_PROOF_SELECTED)
+if(HAVE_ROCM AND HAVE_RCCL AND V2_RCCL_PROOF_SELECTED)
     set(V2_RCCL_THREAD_SCRIPT
         "${CMAKE_CURRENT_SOURCE_DIR}/integration/build/test_rccl_thread_lifetime.py")
     set(V2_RCCL_THREAD_PROOF
@@ -52,6 +51,7 @@ if(HAVE_ROCM AND HAVE_RCCL AND NOT V2_PERF_TESTS_ONLY)
         DEPFILE "${V2_RCCL_THREAD_DEPFILE}"
         VERBATIM)
     add_custom_target(v2_rccl_thread_lifetime_proof DEPENDS "${V2_RCCL_THREAD_PROOF}")
+    set_property(TARGET v2_rccl_thread_lifetime_proof PROPERTY V2_RELEASE_NATIVE_PROOF_OWNER TRUE)
     set_property(GLOBAL APPEND PROPERTY V2_UNIT_GATE_TARGETS v2_rccl_thread_lifetime_proof)
     foreach(V2_RCCL_THREAD_SUITE Unit Integration)
         set(V2_RCCL_THREAD_TEST "V2_${V2_RCCL_THREAD_SUITE}_RCCLThreadLifetimeReplay")

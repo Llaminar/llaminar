@@ -7,11 +7,16 @@ No GPU initialization, substituted parser or source-substring proof is used.
 """
 import argparse, hashlib, json, shlex, subprocess, tempfile, re, os
 from pathlib import Path
+import importlib.util
+_P2P_SPEC = importlib.util.spec_from_file_location(
+    "rccl_p2p_selection", Path(__file__).with_name("rccl_p2p_selection.py"))
+p2p_selection = importlib.util.module_from_spec(_P2P_SPEC)
+_P2P_SPEC.loader.exec_module(p2p_selection)
 ROOT = Path(__file__).resolve().parents[4]
 PATCH = 'scripts/docker/patches/rccl-collective-selector-taxonomy.patch'
 INPUTS = (PATCH,
     'tests/v2/integration/build/rccl_selector_probe.cpp',
-    'tests/v2/integration/build/test_rccl_selector_taxonomy.py')
+    'tests/v2/integration/build/test_rccl_selector_taxonomy.py', *p2p_selection.INPUTS)
 CHECKS = 341
 NATIVE = ('src/init.cc', 'src/graph/tuning.cc', 'src/collectives.cc')
 
@@ -23,6 +28,10 @@ def identities():
     """Authenticate every installed proof input including dependency repair."""
     return {p: digest(ROOT / p) for p in INPUTS}
 
+def receipt_has_p2p(receipt):
+    """Require the exact canonical selection repair before admitting native outcomes."""
+    return isinstance(receipt, str) and receipt.startswith('p2p-' + digest(ROOT / p2p_selection.PATCH) + '-')
+
 def verify(report, library):
     """Reject missing, stale, crashed or vacuous native/old-code outcomes."""
     if (
@@ -31,6 +40,9 @@ def verify(report, library):
         or report.get('library_sha256') != digest(library)
     ):
         raise RuntimeError('Selector proof source/runtime identity differs')
+    if not receipt_has_p2p(report.get('rccl_receipt')):
+        raise RuntimeError('Dependency receipt lacks P2P user selection repair')
+    p2p_selection.verify(report.get('p2p_selection'))
     pins = report.get('native_sources', {})
     suffixes = ('src/init.cc',
         'src/graph/tuning.cc',
@@ -246,6 +258,7 @@ def compile_report(a):
                 measured=json.loads(run.stdout))
             report['observations'].append(row)
             print(json.dumps(row), flush=True)
+    report['p2p_selection'] = p2p_selection.compile_report(a, ROOT, inputs, digest)
     for path, expected in report['native_sources'].items():
         if digest(path) != expected:
             raise RuntimeError('Native source changed during proof: ' + path)

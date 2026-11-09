@@ -11,6 +11,7 @@
 #include "PlanningCommunicationService.h"
 #include "PlanningKernelServiceCatalog.h"
 #include "PlanningObservedResource.h"
+#include "RankHardwareOwnership.h"
 #include "interfaces/IMPIContext.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -153,7 +154,7 @@ namespace llaminar2
             !request.allows(OrchestrationStrategy::ExpertOverlay)) return result;
 
         using Key = std::tuple<int, DeviceType, std::vector<std::string>>;
-        /** @brief A common visible group and deterministic affinity-preferred process owner. */
+        /** @brief A NUMA-local executable group and deterministic eligible process owner. */
         struct Group
         {
             int rank, affinity;
@@ -169,7 +170,8 @@ namespace llaminar2
             {
                 if (!request.allows(backend)) continue;
                 std::vector<const DeviceInfo *> devices;
-                for (const auto &gpu : rank.gpus) if (gpu.type == backend) devices.push_back(&gpu);
+                for (const auto &gpu : rank.gpus)
+                    if (gpu.type == backend && rankOwnsGPUDevice(rank, gpu)) devices.push_back(&gpu);
                 compute |= !devices.empty();
                 if (devices.size() < 2) continue;
                 // Match the candidate compiler's ordinal order. Sorting the
@@ -227,9 +229,9 @@ namespace llaminar2
         // Keep a bounded per-GPU basis for the candidate subsets, rather than
         // changing the inference transport or probing each candidate. PP and
         // heterogeneous overlay searches also need host staging. Preserve
-        // every observing rank's host scope:
-        // the same GPU with pages first-touched on another socket is not the
-        // same link sample, even when both ranks see identical GPU ordinals.
+        // every eligible executor's original host scope. Cross-rank CPU
+        // packet measurements above keep their real peer membership; remote
+        // GPU visibility does not grant this rank native execution authority.
         if (request.allows(OrchestrationStrategy::PipelineParallel) || request.allows(OrchestrationStrategy::ExpertOverlay) ||
             (request.allows(OrchestrationStrategy::TensorParallel) &&
                 (routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns ||
@@ -238,7 +240,8 @@ namespace llaminar2
             {
                 std::vector<DeviceId> devices;
                 for (const auto &gpu : rank.gpus)
-                    if (request.allows(gpu.type)) devices.emplace_back(gpu.type, gpu.local_device_id);
+                    if (request.allows(gpu.type) && rankOwnsGPUDevice(rank, gpu))
+                        devices.emplace_back(gpu.type, gpu.local_device_id);
                 std::sort(devices.begin(), devices.end(), [](auto a, auto b) {
                     return std::tuple{a.type, a.ordinal} < std::tuple{b.type, b.ordinal};
                 });

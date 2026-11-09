@@ -8,7 +8,12 @@ arbitrary-byte wire replay. No model/lookup placement qualification is implied.
 ]=]
 include_guard(DIRECTORY)
 
-if(NOT V2_PERF_TESTS_ONLY)
+# Release selects the original ABI/loader/native-transfer owners independently.
+# Their existing registrations retain add_v2_test's exact owner filtering.
+if(NOT V2_PERF_TESTS_ONLY OR
+   TARGET v2_unit_nccl_rows_abi OR TARGET v2_unit_rccl_rows_abi OR
+   TARGET v2_unit_nccl_path_configured OR TARGET v2_unit_rccl_path_configured OR
+   TARGET v2_integration_captured_transfer_channel)
     foreach(_bytes_backend IN ITEMS NCCL RCCL)
         string(TOLOWER "${_bytes_backend}" _bytes_suffix)
         set(_bytes_target "v2_unit_${_bytes_suffix}_rows_abi")

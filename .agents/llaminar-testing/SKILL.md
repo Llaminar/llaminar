@@ -722,9 +722,10 @@ Keep `.githooks/pre-commit`, `.github/workflows/ci.yml`, this skill,
 Release keeps performance-only test selection by default. To qualify an existing
 native test against the exact serving core, reconfigure that same Release tree
 with `-DLLAMINAR_RELEASE_NATIVE_TEST_TARGETS='targetA;targetB'`, naming the
-original CMake test executable owners. Preserve its original compiler, SDK,
-architecture and snapshot settings. Unknown, imported and non-test targets fail
-configuration. Only aliases referencing a selected owner are admitted; script
+original CMake test executable owners or source/DSO proof custom targets marked
+`V2_RELEASE_NATIVE_PROOF_OWNER`. Preserve the original compiler, SDK,
+architecture and snapshot settings. Unknown, imported and unmarked non-test
+or custom targets fail configuration. Only aliases referencing a selected owner are admitted; script
 drivers retain the same explicit target dependency rules.
 
 Build selected owners explicitly with

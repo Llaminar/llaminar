@@ -79,14 +79,19 @@ def compiler_artifact(prefix, pin_file, guard_path):
     patch = HERE.parent / "patches/llvm-parallel-lto-remarks.patch"
     if receipt.get("schema") != 1 or receipt.get("proof_sha256") != digest(proof_path):
         raise RuntimeError("Fixed-linker proof receipt is missing or stale")
+    gvn_patch = HERE.parent / "patches/llvm-gvn-filtered-remarks.patch"
+    if digest(gvn_patch) != canonical["LLAMINAR_ROCM_LLVM_GVN_PATCH_SHA256"]:
+        raise RuntimeError("GVN diagnostic repair differs from its canonical patch pin")
     expected = {"llvm_revision": canonical["LLAMINAR_ROCM_LLVM_REVISION"],
                 "llvm_patch_sha256": digest(patch),
                 "backend_source_sha256": canonical["LLAMINAR_ROCM_LLVM_LTO_BACKEND_SHA256"],
-                "driver_source_sha256": canonical["LLAMINAR_ROCM_LLVM_LLD_DRIVER_SHA256"]}
+                "driver_source_sha256": canonical["LLAMINAR_ROCM_LLVM_LLD_DRIVER_SHA256"],
+                "gvn_source_sha256": canonical["LLAMINAR_ROCM_LLVM_GVN_SOURCE_SHA256"],
+                "gvn_patch_sha256": canonical["LLAMINAR_ROCM_LLVM_GVN_PATCH_SHA256"]}
     if any(proof.get(key) != value for key, value in expected.items()):
         raise RuntimeError("Fixed-linker artifact differs from the canonical source/patch pin")
     expected_sources = {path.name: digest(path) for path in
-                        (HERE / "build.py", HERE / "main.cpp", HERE / "PressureProbe.hip", Path(guard_path))}
+                        (HERE / "build.py", HERE / "main.cpp", HERE / "PressureProbe.hip", HERE / "GVNRemarkProbe.cpp", Path(guard_path))}
     if proof.get("source_inputs") != expected_sources:
         raise RuntimeError("Compiler-owned proof inputs changed; rebuild its artifact")
     builder = module("llaminar_pinned_lto_builder", HERE / "build.py")
@@ -94,8 +99,8 @@ def compiler_artifact(prefix, pin_file, guard_path):
     if not isinstance(targets, list) or len(set(targets)) != len(targets) or \
        not set(canonical["LLAMINAR_ROCM_GPU_TARGETS"].split(";")).issubset(targets):
         raise RuntimeError("Compiler artifact does not prove the complete shipping target set")
-    builder.verify(proof, targets, prefix / "bin/lld", load_guard(guard_path))
-    if receipt.get("linker_sha256") != digest(prefix / "bin/lld"):
+    builder.verify(proof, targets, prefix / "bin/ld.lld", load_guard(guard_path))
+    if receipt.get("linker_sha256") != digest(prefix / "bin/ld.lld"):
         raise RuntimeError("Fixed-linker executable changed after its builder receipt")
     return receipt_path, receipt
 
@@ -122,24 +127,10 @@ def authenticate_driver(spec, argv, cwd):
     role = classify_output(argv, spec["library"], cwd)
     if role is ArtifactRole.HOST:
         return {"role": role.value, "native_commands": []}
-    probe = subprocess.run([*argv, "-###"], cwd=cwd, capture_output=True, text=True, check=True)
-    commands = [shlex.split(line) for line in (probe.stdout + probe.stderr).splitlines()
-                if "elf64_amdgpu" in line and "-flavor" in line]
-    if len(commands) != len(spec["architectures"]):
-        raise RuntimeError("RCCL driver lost an original native architecture")
-    for arch in spec["architectures"]:
-        matching = [args for args in commands if "-plugin-opt=mcpu=" + arch in args]
-        if len(matching) != 1:
-            raise RuntimeError("RCCL driver repeated or replaced its native target")
-        args = matching[0]
-        if args[0] != spec["linker"] or "--lto-partitions=" + str(PARTITIONS) not in args:
-            raise RuntimeError("RCCL driver changed its fixed linker or parallel codegen policy")
-        filename = str(Path(spec["record_root"]) / ("final-" + arch + ".opt.ld.yaml"))
-        if "-plugin-opt=opt-remarks-filename=" + filename not in args:
-            raise RuntimeError("RCCL driver changed its target-owned allocation-record path")
-        if not any("pass-remarks-analysis=" in arg and "stack-frame-layout" in arg for arg in args):
-            raise RuntimeError("RCCL final stack analysis is disabled")
-    return {"role": role.value, "native_commands": commands, "driver_diagnostics": probe.stdout + probe.stderr}
+    builder = module("llaminar_rccl_native_driver", HERE / "build.py")
+    observation = builder.authenticate_wrapper(argv, cwd, spec["wrapper"], spec["linker"],
+        spec["architectures"], PARTITIONS, spec["library"])
+    return {"role": role.value, **observation}
 
 def configure(args):
     """Write nested-RCCL-only flags/spec; parent inference compiler settings remain untouched."""
@@ -154,18 +145,25 @@ def configure(args):
     records = build / "llaminar-final-allocation"
     records.mkdir(parents=True, exist_ok=True)
     spec = {"schema": 1, "library": str(library), "architectures": targets,
-            "record_root": str(records), "linker": str(prefix / "bin/lld"),
+            "record_root": str(records), "linker": str(prefix / "bin/ld.lld"),
+            "wrapper": str(args.sdk / "lib/llvm/bin/clang-linker-wrapper"),
             "linker_sha256": receipt["linker_sha256"], "linker_receipt": str(receipt_path),
             "linker_receipt_sha256": digest(receipt_path), "spill_guard": str(args.spill_guard.resolve())}
     spec_path = records / "configuration.json"
     dump(spec_path, spec)
-    compile_flags = ["--hip-path=" + str(args.sdk), "--rocm-path=" + str(args.sdk),
+    compile_flags = ["--offload-new-driver", "--hip-path=" + str(args.sdk), "--rocm-path=" + str(args.sdk),
                      "-Xarch_device", "-fsave-optimization-record=yaml", "-Xarch_device",
                      "-foptimization-record-passes=stack-frame-layout", "-Xarch_device",
-                     "-foptimization-record-file=-", "-Xarch_device", "-Rpass-analysis=stack-frame-layout"]
-    link_flags = ["-B" + str(prefix / "bin"), "-Rpass-analysis=stack-frame-layout|kernel-resource-usage"]
-    for arch in targets:
-        link_flags += ["-Xarch_" + arch, "-foptimization-record-file=" + str(records / ("final-" + arch))]
+                     "-Rpass-analysis=stack-frame-layout"]
+    # The new wrapper forwards only explicitly named offload-compiler options.
+    # Its own dumpdir includes each target; a fixed shared remark filename would
+    # race/overwrite targets, and -Xarch_<gfx> is not forwarded at this layer.
+    link_flags = ["--offload-new-driver", "-Xoffload-compiler", "--ld-path=" + str(prefix / "bin/ld.lld"),
+                  "-Rpass-analysis=stack-frame-layout|kernel-resource-usage",
+                  "SHELL:-Xoffload-linker --lto-partitions=" + str(PARTITIONS)]
+    # RCCL's own -Xoffload-linker operand controls kernarg preloading. Keep this
+    # second option/operand pair grouped so CMake's option deduplication cannot
+    # orphan the partition count or send it to the host linker.
     launcher = ";".join((sys.executable, str(Path(__file__).resolve()), "gate", "--spec", str(spec_path), "--"))
     target_hook = records / "target-link-dependencies.cmake"
     # The upstream rccl target appears after project(). Bind its native flags,
@@ -236,8 +234,9 @@ def record_transaction(spec):
 
 def object_records(spec, arch):
     """Require every current object partition; absent output must never borrow old records."""
-    files = [Path(spec["record_root"]) / f"final-{arch}.opt.ld.yaml.part.{index}.obj.yaml"
-             for index in range(PARTITIONS)]
+    builder = module("llaminar_rccl_record_paths", HERE / "build.py")
+    base = builder.final_record_base(spec["library"], arch)
+    files = [Path(str(base) + f".part.{index}.obj.yaml") for index in range(PARTITIONS)]
     if not all(path.is_file() for path in files):
         raise RuntimeError("RCCL final object partition allocation record is missing")
     return files
@@ -245,9 +244,9 @@ def object_records(spec, arch):
 
 def withdraw_records(spec):
     """Withdraw only this authenticated target's prior object/assembly allocation files."""
-    root = Path(spec["record_root"])
+    builder = module("llaminar_rccl_record_paths", HERE / "build.py")
     for arch in spec["architectures"]:
-        base = root / f"final-{arch}.opt.ld.yaml"
+        base = builder.final_record_base(spec["library"], arch)
         base.unlink(missing_ok=True)
         for index in range(PARTITIONS):
             for kind in ("obj", "asm"):
@@ -350,7 +349,7 @@ def verify_proof(args):
     if compiler_proof.get("toolchain", {}).get("linker_sha256") != compiler_receipt["linker_sha256"]:
         raise RuntimeError("Final compiler observations name a different linker executable")
     expected_sources = {path.name: digest(path) for path in
-                        (HERE / "build.py", HERE / "main.cpp", HERE / "PressureProbe.hip", Path(args.spill_guard))}
+                        (HERE / "build.py", HERE / "main.cpp", HERE / "PressureProbe.hip", HERE / "GVNRemarkProbe.cpp", Path(args.spill_guard))}
     if compiler_proof.get("source_inputs") != expected_sources:
         raise RuntimeError("Final compiler contract proof is stale for its code-owned inputs")
     if compiler_proof.get("llvm_revision") != canonical["LLAMINAR_ROCM_LLVM_REVISION"] or \
@@ -359,6 +358,11 @@ def verify_proof(args):
     if compiler_proof.get("backend_source_sha256") != canonical["LLAMINAR_ROCM_LLVM_LTO_BACKEND_SHA256"] or \
        compiler_proof.get("driver_source_sha256") != canonical["LLAMINAR_ROCM_LLVM_LLD_DRIVER_SHA256"]:
         raise RuntimeError("Final compiler proof changed pinned upstream translation units")
+    if (compiler_proof.get("gvn_source_sha256") != canonical["LLAMINAR_ROCM_LLVM_GVN_SOURCE_SHA256"]
+            or compiler_proof.get("gvn_patch_sha256") != canonical["LLAMINAR_ROCM_LLVM_GVN_PATCH_SHA256"]
+            or digest(HERE.parent / "patches/llvm-gvn-filtered-remarks.patch")
+               != canonical["LLAMINAR_ROCM_LLVM_GVN_PATCH_SHA256"]):
+        raise RuntimeError("Final compiler proof changed pinned GVN diagnostic repair")
     builder = module("llaminar_final_compiler_proof", HERE / "build.py")
     guard = load_guard(args.spill_guard)
     compiler_targets = compiler_receipt.get("architectures")
@@ -435,10 +439,12 @@ def main():
     elif args.action == "gate":
         argv = args.argv[1:] if args.argv and args.argv[0] == "--" else args.argv
         spec = json.loads(args.spec.read_text())
-        observation = authenticate_driver(spec, argv, Path.cwd())
-        if observation["role"] != ArtifactRole.COLLECTIVE.value:
+        if classify_output(argv, spec["library"], Path.cwd()) is not ArtifactRole.COLLECTIVE:
             raise RuntimeError("Configured collective target selected a non-collective output")
         with record_transaction(spec) as lock_fd:
+            # Wrapper authentication retains extracted inputs alongside this DSO;
+            # keep it inside the original exclusive final-link lifetime.
+            observation = authenticate_driver(spec, argv, Path.cwd())
             withdraw_records(spec)
             dump(Path(spec["record_root"]) / "link-admission.json", observation)
             # Retain the lock until the actual driver and all backend children terminate.
