@@ -376,3 +376,17 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   (Darwin `_fputs` vs bare) + foreign-import negatives.
 - P2 aligned extents (reject unaligned start/end/size; partial-final-
   instruction negatives).
+
+## SOURCE121 successor d0c536cd0 (2026-11-09)
+
+- P1a object relocation tables (ELF RELA/Mach-O extern only; printed==object
+  record; object record consumed; both-format controls incl. invented/
+  forged/wrong-target/padding; REAL relocation-table fixtures).
+- P1b proper C++ tokenization + fail-closed asm grammar (empty barrier or
+  plain label only; -Wa/-Xassembler/-save-temps fail; composed controls
+  before -c; real TUs scan clean).
+- P1c raw names + exact ABI spellings (_fputs/_abort vs fputs/abort; raw-mode
+  fixtures; matrix verified both formats; section symbols never tiles).
+- P2 4-aligned starts/extents (sizes 5/6/7 fail; +2 start fails; 8 passes).
+- Evidence: 66 tests; GNU-14 + AppleClang re-audit identical counts (~3000
+  relocations match tables); Mac E2E 3 configs. GB10 census pending (requested).
