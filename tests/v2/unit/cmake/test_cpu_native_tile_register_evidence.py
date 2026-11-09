@@ -1089,6 +1089,16 @@ def value(flag):
 def setting(name, default):
     path = here / name
     return path.read_text() if path.exists() else default
+def event(phase):
+    path = here / f"event-{{phase}}.txt"
+    if not path.exists():
+        return
+    action, target, value = path.read_text().split(None, 2)
+    path.unlink()
+    if action == "retarget":
+        os.unlink(target); os.symlink(value.strip(), target)
+    else:
+        pathlib.Path(target).write_text(value)
 if args[-1] == "-print-search-dirs":
     if (here / "fail-search.txt").exists():
         sys.stderr.write("driver error\\n"); sys.exit(1)
@@ -1097,6 +1107,7 @@ if args[-1].startswith("-print-prog-name="):
     name = args[-1].split("=", 1)[1]
     sys.stdout.write(setting(f"progname-{{name}}.txt", str(here / name)) + "\\n"); sys.exit(0)
 if "-###" in args:
+    event("plan")
     source = args[args.index("-c") + 1] if "-c" in args else ""
     default = (f" {{here}}/cc1plus -quiet -MD {{value('-MF')}} -MF {{value('-MF')}} -MT probe -H {{source}} "
                f"-o /tmp/ccTEST.s\\n as -EL -march=armv8-a -o {{value('-o')}} /tmp/ccTEST.s\\n")
@@ -1105,11 +1116,13 @@ if "-###" in args:
     sys.exit(0)
 (here / "invocations.txt").open("a").write(" ".join(args) + "\\n")
 if "-E" in args:
+    event("preprocess")
     unit = here / "preprocessed.txt"
     pathlib.Path(value("-o")).write_text(unit.read_text() if unit.exists() else "int probe;\\n"); sys.exit(0)
 compiling = "-c" in args
 deps = (here / ("deps.c.txt" if compiling and (here / "deps.c.txt").exists() else "deps.txt")).read_text().split()
 if compiling:
+    event("compile")
     mutate = here / "mutate.txt"
     if mutate.exists():
         target = pathlib.Path(mutate.read_text().strip())
@@ -1376,6 +1389,101 @@ class ProofBindingTest(unittest.TestCase):
                     CHECKER.verify(self.args)
         path.write_text(json.dumps(original))
         CHECKER.verify(self.args)
+
+    def driver_symlink(self) -> Path:
+        """Point the compile database at tool/cxx-driver -> tool/c++-A (a copy of the stand-in compiler)."""
+        for version in ("A", "B"):
+            (self.tool / f"c++-{version}").write_text(self.compiler.read_text())
+            (self.tool / f"c++-{version}").chmod(0o755)
+        link = self.tool / "cxx-driver"
+        link.symlink_to(self.tool / "c++-A")
+        database = json.loads(Path(self.args.compile_database).read_text())
+        database[0]["arguments"][0] = str(link)
+        Path(self.args.compile_database).write_text(json.dumps(database))
+        self.args.compiler = str(link)
+        return link
+
+    def test_search_lists_must_be_absolute(self) -> None:
+        original = os.environ["PATH"]
+        try:
+            for value in (":/usr/bin:/bin", "/usr/bin:/bin:", "/usr/bin::/bin", "bin:/usr/bin", ""):
+                with self.subTest(path=value):
+                    os.environ["PATH"] = value
+                    with self.assertRaisesRegex(ValueError, "empty or relative"):
+                        CHECKER.build(self.args)
+                    self.assertFalse(Path(self.args.proof).exists())
+        finally:
+            os.environ["PATH"] = original
+        (self.tool / "progdirs.txt").write_text(f"relative/dir/:{self.tool}/")
+        with self.assertRaisesRegex(ValueError, "empty or relative"):
+            CHECKER.build(self.args)
+        (self.tool / "progdirs.txt").write_text(f"{self.tool}/::{self.tool}/")
+        with self.assertRaisesRegex(ValueError, "empty or relative"):
+            CHECKER.build(self.args)
+
+    def test_checker_working_directory_does_not_matter(self) -> None:
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        here = os.getcwd()
+        try:
+            os.chdir(elsewhere)
+            CHECKER.build(self.args)
+            os.chdir(self.root)
+            CHECKER.verify(self.args)
+        finally:
+            os.chdir(here)
+
+    def test_epoch_mutations_publish_no_receipt(self) -> None:
+        link = self.driver_symlink()
+        cases = {
+            "driver retargeted during plan observation": ("plan", f"retarget {link} {self.tool / 'c++-B'}"),
+            "driver retargeted during preprocessing": ("preprocess", f"retarget {link} {self.tool / 'c++-B'}"),
+            "compiler proper replaced during preprocessing": ("preprocess", f"write {self.tool / 'cc1plus'} #!/bin/sh\n# B\n"),
+            "assembler replaced during compile": ("compile", f"write {self.tool / 'as'} #!/bin/sh\n# B\n"),
+            "driver retargeted during compile": ("compile", f"retarget {link} {self.tool / 'c++-B'}"),
+        }
+        for label, (phase, action) in cases.items():
+            with self.subTest(label=label):
+                (self.tool / f"event-{phase}.txt").write_text(action)
+                with self.assertRaisesRegex(ValueError, "changed"):
+                    CHECKER.build(self.args)
+                self.assertFalse(Path(self.args.proof).exists())
+                link.unlink()
+                link.symlink_to(self.tool / "c++-A")
+                for program in ("cc1plus", "as"):
+                    (self.tool / program).write_text("#!/bin/sh\n")
+        CHECKER.build(self.args)
+        CHECKER.verify(self.args)
+
+    def test_make_escaped_dependency_names_are_rejected_before_binding(self) -> None:
+        real, decoy = self.root / "a$b", self.root / "a$$b"
+        for directory in (real, decoy):
+            directory.mkdir()
+            (directory / "view.h").write_text("// same\n")
+        for deps in ("probe.cpp a$$b/view.h", "probe.cpp a\\ b/view.h", "probe.cpp a\\#b.h", "probe.cpp 'q.h'"):
+            with self.subTest(deps=deps):
+                (self.tool / "deps.txt").write_text(deps)
+                with self.assertRaisesRegex(ValueError, "unsupported escaped names"):
+                    CHECKER.build(self.args)
+                self.assertFalse(Path(self.args.proof).exists())
+
+    def test_driver_role_comes_from_the_target_command(self) -> None:
+        CHECKER.build(self.args)
+        path, original = Path(self.args.proof), self.proof()
+        programs = original["programs"]
+        foreign = dict(programs["driver"], program="/usr/bin/true", selected="/usr/bin/true")
+        for label, driver in (("job copied as driver", programs["job0"]), ("foreign driver", foreign)):
+            with self.subTest(label=label):
+                path.write_text(json.dumps(dict(original, programs=dict(programs, driver=driver))))
+                with self.assertRaisesRegex(ValueError, "program"):
+                    CHECKER.verify(self.args)
+        path.write_text(json.dumps(original))
+        CHECKER.verify(self.args)
+        database = json.loads(Path(self.args.compile_database).read_text())
+        database[0]["arguments"][0] = "c++"
+        Path(self.args.compile_database).write_text(json.dumps(database))
+        with self.assertRaises(ValueError):
+            CHECKER.build(self.args)
 
     def test_typed_job_admission(self) -> None:
         paths = CHECKER.JobPaths("/w/probe.cpp", "/w/out/proof.o", "/w/out/proof.deps", "/w/build",
