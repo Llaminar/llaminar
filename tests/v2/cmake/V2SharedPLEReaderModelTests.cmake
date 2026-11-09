@@ -2,7 +2,7 @@
 # This device-free actual-builder rejection complements full native cohort activation;
 # it proves missing source authority fails before mutating the participant graph.
 if(TARGET v2_test_qwen4exp_primitives)
-    add_v2_test(V2_Integration_SharedPLEReaderModelAuthority
+    add_v2_test(V2_Integration_SharedPLEReaderModelAuthority REQUIRES_BACKEND GPU
         COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
             --gtest_filter=Qwen4ExpPLEBuilder.SharedReaderRequiresOriginalCohortBeforeGraphMutation
             --gtest_repeat=20
