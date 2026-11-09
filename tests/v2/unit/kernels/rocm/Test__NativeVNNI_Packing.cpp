@@ -33,6 +33,7 @@
 
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "tensors/Tensors.h"
+#include "tensors/NativeVnniScalePlane.h"
 #include "utils/Logger.h"
 #include "../../../utils/TestTensorFactory.h"
 
@@ -209,8 +210,10 @@ namespace
             << " (expected " << expected_payload
             << ", got " << packed.native_vnni_payload.size() << ")";
 
-        // Verify scales size: blocks_per_row × N
-        EXPECT_EQ(packed.native_vnni_scales.size(), blocks_per_row * N)
+        // Verify scales size: one primary entry per block, held in 16-bit
+        // storage words. Native MXFP4's E8M0 bytes pack two per word.
+        EXPECT_EQ(packed.native_vnni_scales.size(),
+            llaminar2::nativeVnniScalePlaneStorageWords(fmt.expected_codebook_id, blocks_per_row * N))
             << fmt.name << ": scales size mismatch";
 
         // Verify physical secondary-plane presence using independent fixture literals.

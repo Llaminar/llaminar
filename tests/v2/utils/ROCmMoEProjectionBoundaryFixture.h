@@ -15,6 +15,7 @@
 #include "execution/moe/MoEExpertProjectionOwnership.h"
 #include "kernels/rocm/gemm/ROCmMoEGroupedPrefillKernels.h"
 #include "transfer/TransferEngine.h"
+#include "tensors/NativeVnniScalePlane.h"
 
 #include <hip/hip_runtime.h>
 #include <algorithm>
@@ -343,7 +344,9 @@ namespace llaminar2::test
                 auto descriptor = source;
                 descriptor.n = count;
                 descriptor.payload = static_cast<const uint8_t *>(copy(source.payload, metadata.payload_bytes));
-                descriptor.scales = copy(source.scales, sizeof(uint16_t));
+                // The primary plane is one E8M0 byte per block for native MXFP4
+                // and one FP16 word otherwise; the column pitch must follow it.
+                descriptor.scales = copy(source.scales, nativeVnniScalePlaneBytes(source.codebook_id));
                 descriptor.mins = copy(source.mins, sizeof(uint16_t));
                 descriptor.emins = copy(source.emins, sizeof(uint32_t));
                 result.push_back(descriptor);
