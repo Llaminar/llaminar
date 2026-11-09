@@ -397,11 +397,18 @@ namespace
     {
         (void)gateUpCandidateName(candidate);
         if(candidate==GateUpCandidate::ScalarPolicy)return;
+#if defined(__aarch64__)
+        // OrderedThreeRows is an x86 planner row body; the native ARM schedule
+        // has no such tile, so the experiment has no member it could select.
+        (void)purpose;(void)measurement;(void)gate;(void)down;(void)gate_ownership;(void)down_ownership;
+        throw std::invalid_argument("EligibleOrderedThreeRows is an x86 planner experiment; ARM has no OrderedThreeRows tile");
+#else
         if(purpose!=ProjectionRowsPurpose::Prefill || measurement!=MeasurementPolicy::Aligned ||
            gate!=VerifierRowsPolicy::Auto || down!=VerifierRowsPolicy::Auto ||
            (gate_ownership!=FusedOutputJobOwnership::Auto && gate_ownership!=FusedOutputJobOwnership::PanelBlocks) ||
            down_ownership!=FusedOutputJobOwnership::Auto)
             throw std::invalid_argument("EligibleOrderedThreeRows requires aligned Prefill, scalar Auto policies, gate Auto/PanelBlocks and down Auto ownership");
+#endif
     }
 
     /**
@@ -423,6 +430,7 @@ namespace
             throw std::runtime_error("Mixed gate lost its requested/actual Auto-Current or explicit PanelBlocks ownership");
     }
 
+#if !defined(__aarch64__)
     /**
      * @brief Choose only an already-supported original row body from validated metadata.
      * @param descriptor Original prepared source/purpose; no tensor values are read.
@@ -446,6 +454,7 @@ namespace
             return VerifierRowsPolicy::OrderedThreeRows;
         return VerifierRowsPolicy::Auto;
     }
+#endif
 
     /** @brief Complete per-member request identity used by fresh outside-clock evidence. */
     using MixedGateRouteKey=std::array<std::string,5>;
@@ -957,6 +966,9 @@ namespace
         const bool mixed_gate=gate_candidate==GateUpCandidate::EligibleOrderedThreeRows;
         MixedGateRouteCounts mixed_gate_expected,mixed_down_expected;
         size_t three_gate_members=0,three_gate_rows=0,auto_gate_rows=0;
+#if defined(__aarch64__)
+        if(mixed_gate)throw std::logic_error("EligibleOrderedThreeRows passed ARM option rejection");
+#else
         if(mixed_gate) {
             // Cold fixture setup uses the ORIGINAL planner for K parts/source
             // validation. No planner, selector or timer is added to production.
@@ -994,6 +1006,7 @@ namespace
                 <<",gate_requested_ownership="<<fusedOutputJobOwnershipName(gate_up_ownership)
                 <<",down_requested_policy=Auto,down_requested_ownership=Auto,outside_timing=1\n";
         }
+#endif
 
         // The production phase roots are64B aligned. Keep exact original
         // tight strides: Q8 block rows need not themselves be cache-line aligned.
@@ -1513,6 +1526,15 @@ TEST(Perf_CPUMoEExpertVerifierRows, ExplicitRoleAndNumericalPolicyContract)
     EXPECT_EQ(parseJobOwnership("Contiguous"),FusedOutputJobOwnership::Contiguous);
     EXPECT_EQ(parseJobOwnership("PanelBlocks"),FusedOutputJobOwnership::PanelBlocks);
     EXPECT_EQ(parseJobOwnership("Auto"),FusedOutputJobOwnership::Auto);
+#if defined(__aarch64__)
+    // ARM publishes no job-ownership record; any record, even a well-formed x86
+    // one, is a mismatch rather than a proof.
+    for(auto mode:{FusedOutputJobOwnership::Contiguous,FusedOutputJobOwnership::PanelBlocks,FusedOutputJobOwnership::Auto}) {
+        PerfStatsCollector::Tags proof{{"requested_ownership",fusedOutputJobOwnershipName(mode)},
+            {"effective_ownership","PanelBlocks"},{"k","2560"},{"descriptors","2"}};
+        EXPECT_THROW(requireOwnershipProof(proof,mode,2560,2),std::runtime_error);
+    }
+#else
     for(auto mode:{FusedOutputJobOwnership::Contiguous,FusedOutputJobOwnership::PanelBlocks,FusedOutputJobOwnership::Auto}) {
         const bool blocks=mode!=FusedOutputJobOwnership::Contiguous;
         PerfStatsCollector::Tags proof{{"requested_ownership",fusedOutputJobOwnershipName(mode)},
@@ -1532,6 +1554,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, ExplicitRoleAndNumericalPolicyContract)
     EXPECT_NO_THROW(requireOwnershipProof(preserved,FusedOutputJobOwnership::Auto,2560,2));
     preserved["selection_reason"]="foreign";
     EXPECT_THROW(requireOwnershipProof(preserved,FusedOutputJobOwnership::Auto,2560,2),std::runtime_error);
+#endif
     EXPECT_THROW((void)parseJobOwnership("PanelContiguous"),std::invalid_argument);
     EXPECT_THROW((void)parseJobOwnership("LiveRowPanelContiguous"),std::invalid_argument);
     EXPECT_THROW((void)parseJobOwnership(""),std::invalid_argument);
@@ -1572,6 +1595,15 @@ TEST(Perf_CPUMoEExpertVerifierRows, MixedGateCandidateContract)
     EXPECT_EQ(parseGateUpCandidate("EligibleOrderedThreeRows"),candidate);
     for(const auto* invalid:{"","OrderedThreeRows","eligible","Auto"})
         EXPECT_THROW((void)parseGateUpCandidate(invalid),std::invalid_argument);
+#if defined(__aarch64__)
+    // ARM has no OrderedThreeRows tile: even the x86-valid combination is rejected.
+    EXPECT_THROW(requireMixedGateOptions(candidate,ProjectionRowsPurpose::Prefill,MeasurementPolicy::Aligned,
+        VerifierRowsPolicy::Auto,VerifierRowsPolicy::Auto,FusedOutputJobOwnership::Auto,FusedOutputJobOwnership::Auto),
+        std::invalid_argument);
+    EXPECT_NO_THROW(requireMixedGateOptions(GateUpCandidate::ScalarPolicy,ProjectionRowsPurpose::Prefill,
+        MeasurementPolicy::Aligned,VerifierRowsPolicy::Auto,VerifierRowsPolicy::Auto,
+        FusedOutputJobOwnership::Current,FusedOutputJobOwnership::Current));
+#else
     EXPECT_NO_THROW(requireMixedGateOptions(candidate,ProjectionRowsPurpose::Prefill,MeasurementPolicy::Aligned,
         VerifierRowsPolicy::Auto,VerifierRowsPolicy::Auto,FusedOutputJobOwnership::Auto,FusedOutputJobOwnership::Auto));
     for(auto purpose:{ProjectionRowsPurpose::Decode,ProjectionRowsPurpose::MTPVerifier})
@@ -1592,6 +1624,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, MixedGateCandidateContract)
         VerifierRowsPolicy::Auto,FusedOutputJobOwnership::PanelBlocks,FusedOutputJobOwnership::Auto));
     EXPECT_THROW(requireMixedGateOptions(candidate,ProjectionRowsPurpose::Prefill,MeasurementPolicy::Aligned,VerifierRowsPolicy::Auto,
         VerifierRowsPolicy::Auto,FusedOutputJobOwnership::Contiguous,FusedOutputJobOwnership::Auto),std::invalid_argument);
+#endif
     PerfStatsCollector::Tags ownership{{"requested_ownership","Auto"},{"effective_ownership","Current"},
         {"selection_reason","current_other_row_policy"}};
     EXPECT_NO_THROW(requireMixedGateOwnership(ownership,FusedOutputJobOwnership::Auto));
@@ -1603,6 +1636,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, MixedGateCandidateContract)
     EXPECT_THROW(requireMixedGateOwnership(ownership,FusedOutputJobOwnership::Auto),std::runtime_error);
     ownership["effective_ownership"]="Current";
     EXPECT_THROW(requireMixedGateOwnership(ownership,FusedOutputJobOwnership::PanelBlocks),std::runtime_error);
+#if !defined(__aarch64__)
     CPUNativeQuantisedPackedWeights packed;
     packed.codebook_id=5;packed.is_superblock=true;packed.encoding=CPUNativeQuantisedEncoding::NibbleLUT;
     const auto* source=native_quantised_formats::forSourceIdentity(packed.codebook_id,packed.is_superblock);
@@ -1624,6 +1658,7 @@ TEST(Perf_CPUMoEExpertVerifierRows, MixedGateCandidateContract)
     EXPECT_EQ(eligibleThreeGatePolicy(descriptor,plan,true),VerifierRowsPolicy::Auto);
     descriptor.purpose=ProjectionRowsPurpose::Prefill;packed.encoding=CPUNativeQuantisedEncoding::ExpandedInt8;
     EXPECT_EQ(eligibleThreeGatePolicy(descriptor,plan,true),VerifierRowsPolicy::Auto);
+#endif
     MixedGateRouteCounts remaining{{{"3","320","2560","5","OrderedThreeRows"},2},{{"1","320","2560","5","Auto"},2}};
     PerfStatsCollector::Tags three{{"m","3"},{"n","320"},{"k","2560"},{"codebook","5"},
         {"requested_verifier_policy","OrderedThreeRows"},{"effective_verifier_policy","OrderedThreeRows"},
