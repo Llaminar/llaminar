@@ -50,11 +50,11 @@ FATAL_BODY = "\tstp\tx29, x30, [sp, #-16]!\n\tmov\tx29, sp\n\tbl\tfwrite\n\tbl\t
 BRANCH = re.compile(r"^(?:b|bl|cbz|cbnz|tbz|tbnz|b\.\w+)$")
 
 
-def name(rows: int, dot: int, policy: int, encoding: int, nibble_map: int, minimum: int) -> str:
-    """Mangled tile run<> symbol for one program key."""
+def name(rows: int, dot: int, policy: int, encoding: int, nibble_map: int, minimum: int, strips: int = 0) -> str:
+    """Mangled tile run<..., Strips>() symbol; production instantiates Strips = 0 (the installed width)."""
     return (f"_ZNK9llaminar23cpu16native_quantised27CPUNativeNEONProjectionTileILm{rows}EE3runINS1_11multi_scale17"
             f"NEONMultiScaleOpsILNS5_11NEONByteDotE{dot}EEELNS_28CPUProjectionNumericalPolicyE{policy}ELNS1_26"
-            f"CPUNativeQuantisedEncodingE{encoding}ELNS3_9NibbleMapE{nibble_map}ELb{minimum}EEEvv")
+            f"CPUNativeQuantisedEncodingE{encoding}ELNS3_9NibbleMapE{nibble_map}ELb{minimum}ELi{strips}EEEvv")
 
 
 ELF_TYPES = {name: number for number, name in CHECKER.ELF_RELOCATIONS.items()}
@@ -445,6 +445,8 @@ class ClassificationTest(unittest.TestCase):
         self.fatal(composed, "only some paths")  # The composed escape fails at its ambiguous base.
 
     def test_conditional_transforms_of_stack_addresses_are_not_admitted(self) -> None:
+        self.assertEqual(self.spills("\tcsneg w5, w1, w5, mi\n\tret\n"), 0)  # 32-bit form: no address involved.
+        self.fatal("\tmov x9, sp\n\tcsneg w5, w9, w5, mi\n\tret\n", "32-bit view")
         for transform in ("csinc x9, x9, x9, eq", "csinv x9, x9, x1, ne", "csneg x9, x9, x9, lt", "cinc x9, x9, eq"):
             with self.subTest(transform=transform):
                 self.fatal(f"\tmov x9, sp\n\t{transform}\n\tstr q0, [x9]\n\tret\n", "admitted grammar")
@@ -465,7 +467,13 @@ class ClassificationTest(unittest.TestCase):
             with self.subTest(cover=macho):  # A whole 16-byte store retires the slot: x10 is no stack address.
                 analysis = analyse(frame + "\tst1 {v0.16b}, [sp]\n" + tail, macho=macho)
                 self.assertEqual((analysis.spills, analysis.errors), (1, []))
-        for unknown in ("\tst1 {v0.16b-v1.16b}, [sp]\n", "\tst1 {v0}, [sp]\n", "\tld2 {v0.4s}, [sp]\n"):
+        for listing, spilled in (("\tld1 {v26.4s-v27.4s}, [x0]\n", 0), ("\tst1 {v0.16b-v1.16b}, [sp]\n", 1)):
+            with self.subTest(listing=listing):
+                self.assertEqual(self.spills("\tsub sp, sp, #32\n" + listing + "\tadd sp, sp, #32\n\tret\n"), spilled)
+        covered = analyse(frame + "\tst1 {v0.16b-v1.16b}, [sp]\n" + tail)  # 32 bytes cover the sp+8 slot whole.
+        self.assertEqual((covered.spills, covered.errors), (1, []))
+        self.fatal(frame + "\tadd x11, sp, #12\n\tst1 {v0.4s-v1.4s}, [x11]\n" + tail, "partial overwrite")
+        for unknown in ("\tst1 {v0.16b-v1.8b}, [sp]\n", "\tst1 {v0}, [sp]\n", "\tld2 {v0.4s}, [sp]\n"):
             with self.subTest(unknown=unknown):
                 self.fatal("\tsub sp, sp, #32\n" + unknown + "\tadd sp, sp, #32\n\tret\n", "footprint")
 
@@ -982,6 +990,11 @@ class AlignmentTest(unittest.TestCase):
 class InventoryTest(unittest.TestCase):
     """The expected programs derive from the admitted envelope; object, symbol table and disassembly agree."""
 
+    def test_pinned_panel_widths_have_no_key(self) -> None:
+        with self.assertRaisesRegex(ValueError, "non-installed panel width"):
+            CHECKER.program_key(name(1, 1, 0, 1, 0, 1, strips=2))
+        self.assertEqual(CHECKER.program_key(name(1, 1, 0, 1, 0, 1)), "1:1:0:1:0:1")
+
     def test_envelope_inventory_matches_the_written_out_keys(self) -> None:
         for macho in (False, True):
             counts = audit_witness(macho=macho)
@@ -1001,6 +1014,12 @@ class InventoryTest(unittest.TestCase):
             audit_witness(extra=[(name(1, 1, 0, 1, 0, 1), "\tstr q0, [sp, #-16]!\n\tret\n")])
         with self.assertRaisesRegex(ValueError, "unrecognized tile program"):
             audit_witness(extra=[(name(2, 0, 0, 1, 0, 1).replace("3runI", "3runIX"), "\tret\n")])
+        for retired in ("6strips", "5panel"):
+            with self.subTest(retired=retired):
+                with self.assertRaisesRegex(ValueError, "unrecognized tile program"):
+                    audit_witness(extra=[(name(2, 0, 0, 1, 0, 1).replace("3run", retired), "\tret\n")])
+        with self.assertRaisesRegex(ValueError, "outside the NEON inventory"):
+            audit_witness(extra=[(name(1, 0, 0, 1, 0, 1, strips=2), "\tret\n")])  # A pinned tournament width.
 
     def test_object_function_symbols_must_be_disassembled(self) -> None:
         functions = programs()

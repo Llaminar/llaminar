@@ -20,6 +20,7 @@
 #include <bit>
 #include <cstdint>
 #include <cstring>
+#include <utility>
 #include <span>
 #include <stdexcept>
 
@@ -147,15 +148,16 @@ namespace llaminar2::cpu::native_quantised
          * @brief Execute with one explicit native operation set.
          * @tparam Ops NEONMultiScaleOps of an admitted family, or a test type
          * derived from one that observes its integer leaf calls.
+         * @tparam Strips Panel width in strips for tournaments/tests; 0 selects the installed width.
          * @details Admits the complete compiler envelope itself, so an Ops type
          * cannot run instructions the machine lacks whichever entry is used.
          * @throws std::runtime_error If the compiled envelope is not supported.
          */
-        template <typename Ops> void executeWith() const
+        template <typename Ops, int Strips = 0> void executeWith() const
         {
             // Every entry, including an observer seam, admits the full envelope.
             ARMCPUCapabilities::native().requireCompiledEnvelope();
-            executeWithAdmitted<Ops>();
+            executeWithAdmitted<Ops, Strips>();
         }
 
         /**
@@ -169,6 +171,37 @@ namespace llaminar2::cpu::native_quantised
         template <Dot Instruction> static constexpr Dot leafInstruction() noexcept
         { return Instruction == Dot::I8MM && Rows == 1 ? Dot::DotProd : Instruction; }
 
+        /**
+         * @brief Installed panel width, in four-column strips, for one row tile, family and encoding.
+         * @tparam Ops Admitted operation set.
+         * @tparam Physical Non-compact execution encoding of the program.
+         * @tparam WithMinimum Whether the program applies an additive minimum.
+         * @return For the single-row SDOT leaf (DotProd, and the I8MM family's
+         * lone row): 4 for the symmetric expanded encodings (ExpandedInt8
+         * without a minimum, IQ3SExpandedSourceScale); 2 for ExpandedInt8 with
+         * a minimum and for the nibble and Q6_K encodings. 1 (the strip walk)
+         * for ASIMD, row-pair (SMMLA) tiles and shared-row tiles.
+         * @details Every column keeps its own block/partition FP32 program, so
+         * the width changes only which columns share one activation-block load
+         * and how many independent INT32 chains are in flight. Each entry is
+         * the widest panel that keeps that single-row program free of register
+         * spills on every qualified compiler (the tile register witness
+         * enforces it): expanded encodings hold one decoded vector per strip,
+         * while nibble decoding and the Q6_K dual-scale walk need more live
+         * registers per strip and spill at four strips, as does the minimum
+         * correction of ExpandedInt8 under AppleClang. Entries were measured
+         * against narrower widths in the GB10 panel tournament.
+         */
+        template <typename Ops, Encoding Physical, bool WithMinimum = false> static constexpr int panelStrips() noexcept
+        {
+            if constexpr (multi_scale::usesRowPairs<Ops>) return 1;
+            else if constexpr (Rows != 1 || Ops::instruction == multi_scale::NEONByteDot::ASIMD) return 1;
+            else if constexpr ((Physical == Encoding::ExpandedInt8 && !WithMinimum) ||
+                               Physical == Encoding::IQ3SExpandedSourceScale)
+                return 4;
+            else return 2;
+        }
+
     private:
         // Only the batch binding, which admits CPU features, publication,
         // policy, K tree and every task's spans before forming a team, may build
@@ -181,9 +214,9 @@ namespace llaminar2::cpu::native_quantised
          * @details No check can fail here: publication, policy, encoding and
          * geometry were admitted before the team, and metadata by the seal.
          */
-        template <Dot Instruction> void executeAdmitted() const noexcept
+        template <Dot Instruction, int Strips = 0> void executeAdmitted() const noexcept
         {
-            executeWithAdmitted<multi_scale::NEONMultiScaleOps<leafInstruction<Instruction>()>>();
+            executeWithAdmitted<multi_scale::NEONMultiScaleOps<leafInstruction<Instruction>()>, Strips>();
         }
 
         /**
@@ -210,7 +243,7 @@ namespace llaminar2::cpu::native_quantised
         }
 
         /** @brief Run one admitted tile with an explicit operation set; cannot fail. */
-        template <typename Ops> void executeWithAdmitted() const noexcept
+        template <typename Ops, int Strips = 0> void executeWithAdmitted() const noexcept
         {
             if (weights_.usesCompactMultiScale())
             {
@@ -228,8 +261,8 @@ namespace llaminar2::cpu::native_quantised
                     chunk_, 0, weights_.blocks_per_row, false, columns_);
             }
             if (weights_.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert)
-                return dispatch<Ops, CPUProjectionNumericalPolicy::GPUAlignedExpert>();
-            return dispatch<Ops, CPUProjectionNumericalPolicy::BackendNative>();
+                return dispatch<Ops, CPUProjectionNumericalPolicy::GPUAlignedExpert, Strips>();
+            return dispatch<Ops, CPUProjectionNumericalPolicy::BackendNative, Strips>();
         }
 
         /// Two-row SMMLA accumulator sets per tile; at least one keeps the array type valid.
@@ -269,26 +302,26 @@ namespace llaminar2::cpu::native_quantised
          * @tparam Policy Immutable complete projection arithmetic identity.
          * @pre requireExecutable() admitted the publication.
          */
-        template <typename Ops, CPUProjectionNumericalPolicy Policy> void dispatch() const noexcept
+        template <typename Ops, CPUProjectionNumericalPolicy Policy, int Strips = 0> void dispatch() const noexcept
         {
             switch (weights_.encoding)
             {
             case Encoding::ExpandedInt8:
                 if (weights_.is_asymmetric)
-                    return run<Ops, Policy, Encoding::ExpandedInt8, NibbleMap::Centered, true>();
-                return run<Ops, Policy, Encoding::ExpandedInt8>();
+                    return run<Ops, Policy, Encoding::ExpandedInt8, NibbleMap::Centered, true, Strips>();
+                return run<Ops, Policy, Encoding::ExpandedInt8, NibbleMap::Centered, false, Strips>();
             case Encoding::IQ3SExpandedSourceScale:
-                return run<Ops, Policy, Encoding::IQ3SExpandedSourceScale>();
+                return run<Ops, Policy, Encoding::IQ3SExpandedSourceScale, NibbleMap::Centered, false, Strips>();
             case Encoding::Q6KNativeDualScale:
-                return run<Ops, Policy, Encoding::Q6KNativeDualScale>();
+                return run<Ops, Policy, Encoding::Q6KNativeDualScale, NibbleMap::Centered, false, Strips>();
             case Encoding::NibbleLUTSourceScale:
-                return run<Ops, Policy, Encoding::NibbleLUTSourceScale, NibbleMap::NonLinear>();
+                return run<Ops, Policy, Encoding::NibbleLUTSourceScale, NibbleMap::NonLinear, false, Strips>();
             case Encoding::NibbleLUT:
                 switch (weights_.codebook_id)
                 {
-                case 0: return run<Ops, Policy, Encoding::NibbleLUT, NibbleMap::Centered>();
-                case 4: return run<Ops, Policy, Encoding::NibbleLUT, NibbleMap::NonLinear>();
-                case 5: return run<Ops, Policy, Encoding::NibbleLUT, NibbleMap::Unsigned, true>();
+                case 0: return run<Ops, Policy, Encoding::NibbleLUT, NibbleMap::Centered, false, Strips>();
+                case 4: return run<Ops, Policy, Encoding::NibbleLUT, NibbleMap::NonLinear, false, Strips>();
+                case 5: return run<Ops, Policy, Encoding::NibbleLUT, NibbleMap::Unsigned, true, Strips>();
                 }
                 break;
             case Encoding::CompactMultiScale:
@@ -486,8 +519,196 @@ namespace llaminar2::cpu::native_quantised
          * @tparam WithMinimum Whether the source owns an additive minimum vector.
          */
         template <typename Ops, CPUProjectionNumericalPolicy Policy, Encoding Physical,
-                  NibbleMap Map = NibbleMap::Centered, bool WithMinimum = false>
+                  NibbleMap Map = NibbleMap::Centered, bool WithMinimum = false, int Strips = 0>
         LLAMINAR_NEON_PROJECTION_EXACT void run() const noexcept
+        {
+            constexpr int S = Strips > 0 ? Strips : panelStrips<Ops, Physical, WithMinimum>();
+            // A panel never crosses its 64-column chunk: S strips must tile the chunk's 16.
+            static_assert(S == 1 || S == 2 || S == 4);
+            if constexpr (S > 1 && !multi_scale::usesRowPairs<Ops>)
+            {
+                // Panels cover the whole chunk: a final panel may extend into the
+                // chunk's sealed padding columns, which it computes but never stores.
+                for (int column = 0; column < columns_; column += 4 * S)
+                    panel<Ops, Policy, Physical, Map, WithMinimum, S>(column);
+            }
+            else
+            {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+#endif
+                using I = typename Ops::I;
+                using F = typename Ops::F;
+                constexpr bool nibble = Physical == Encoding::NibbleLUT || Physical == Encoding::NibbleLUTSourceScale;
+                for (int column = 0; column < columns_; column += 4)
+                {
+                    float32x4_t reduced[Rows]{};
+                    for (int partition = 0; partition < partitions_; ++partition)
+                    {
+                        float32x4_t accumulator[Rows]{};
+                        const int first = partition * blocks_per_partition_;
+                        const int last = std::min(first + blocks_per_partition_, weights_.blocks_per_row);
+                        for (int block = first; block < last; ++block)
+                        {
+                            const auto *unit = weights_.interleavedBase() +
+                                (std::size_t(chunk_) * weights_.blocks_per_row + block) * weights_.interleaved_block_stride;
+                            I low[Rows]{}, high[Rows]{};
+                            if constexpr (multi_scale::usesRowPairs<Ops>)
+                                pairBlock<Ops, Physical, Map>(unit, column, block, low, high);
+                            else if constexpr (Physical == Encoding::Q6KNativeDualScale)
+                            {
+                                // Keep one decoded group live at a time. Fully
+                                // unrolling all eight groups lets the compiler
+                                // hoist a complete four-row activation panel into
+                                // registers and spill it inside the K traversal.
+#pragma GCC unroll 1
+                                for (int group = 0; group < 8; ++group)
+                                {
+                                    const auto raw = vld1q_u8(unit + (group % 4) * 256 + column * 4);
+                                    auto values = group < 4 ? vandq_u8(raw, vdupq_n_u8(15)) : vshrq_n_u8(raw, 4);
+                                    const auto *planes = unit + 1024 + group * 64 + (column / 16) * 16;
+                                    std::uint64_t bits0 = 0, bits1 = 0;
+                                    std::memcpy(&bits0, planes, sizeof(bits0));
+                                    std::memcpy(&bits1, planes + 8, sizeof(bits1));
+                                    const int shift = (column % 16) * 4;
+                                    values = vorrq_u8(values, q6Plane(static_cast<std::uint16_t>(bits0 >> shift), 16));
+                                    values = vorrq_u8(values, q6Plane(static_cast<std::uint16_t>(bits1 >> shift), 32));
+                                    const auto centered = vsubq_s8(vreinterpretq_s8_u8(values), vdupq_n_s8(32));
+                                    if (group < 4) consume<Ops>(centered, block, group, low);
+                                    else consume<Ops>(centered, block, group, high);
+                                }
+                            }
+                            else if constexpr (nibble)
+                            {
+#pragma GCC unroll 4
+                                for (int group = 0; group < 4; ++group)
+                                {
+                                    const auto raw = vld1q_u8(unit + group * 256 + column * 4);
+                                    consume<Ops>(nibbles<Map>(vandq_u8(raw, vdupq_n_u8(15))), block, group, low);
+                                    consume<Ops>(nibbles<Map>(vshrq_n_u8(raw, 4)), block, group + 4, low);
+                                }
+                            }
+                            else
+                            {
+#pragma GCC unroll 8
+                                for (int group = 0; group < 8; ++group)
+                                    consume<Ops>(vld1q_s8(reinterpret_cast<const std::int8_t *>(unit + group * 256 + column * 4)),
+                                        block, group, low);
+                            }
+                            F scale0 = Ops::half(weights_.admittedScales(chunk_, block) + column);
+                            F scale1{};
+                            if constexpr (Physical == Encoding::Q6KNativeDualScale)
+                            {
+                                const I metadata = Ops::words(weights_.admittedMins(chunk_, block) + column);
+                                const I low_coefficient = (metadata & 127) - (metadata & 128);
+                                const I high_coefficient = ((metadata >> 8) & 127) - ((metadata >> 8) & 128);
+                                scale1 = scale0 * __builtin_convertvector(high_coefficient, F);
+                                scale0 = scale0 * __builtin_convertvector(low_coefficient, F);
+                            }
+                            else if constexpr (Physical == Encoding::IQ3SExpandedSourceScale || Physical == Encoding::NibbleLUTSourceScale)
+                            {
+                                // The publication seal admitted every coefficient word.
+                                const I metadata = Ops::words(weights_.admittedMins(chunk_, block) + column);
+                                const I coefficient = Physical == Encoding::IQ3SExpandedSourceScale ? metadata * 2 + 1 : metadata - 32;
+                                scale0 = scale0 * __builtin_convertvector(coefficient, F);
+                            }
+                            else if constexpr (WithMinimum)
+                                scale1 = Ops::half(weights_.admittedMins(chunk_, block) + column);
+#pragma GCC unroll 4
+                            for (std::size_t row = 0; row < Rows; ++row)
+                            {
+                                const auto &a = activation_[row][block];
+                                const float activation_scale = nativeQuantisedFP16ScaleToFP32(a.d);
+                                if constexpr (Physical == Encoding::Q6KNativeDualScale)
+                                {
+                                    const F term0 = scale0 * __builtin_convertvector(low[row], F);
+                                    const F term1 = scale1 * __builtin_convertvector(high[row], F);
+                                    const F contribution = std::bit_cast<F>(vdupq_n_f32(activation_scale)) * (term0 + term1);
+                                    accumulator[row] = vaddq_f32(accumulator[row], std::bit_cast<float32x4_t>(contribution));
+                                }
+                                else if constexpr (WithMinimum)
+                                    accumulator[row] = accumulateCorrectedSingleScaleBlockNEON(accumulator[row],
+                                        std::bit_cast<int32x4_t>(low[row]), std::bit_cast<float32x4_t>(scale0), a.sum_qs,
+                                        std::bit_cast<float32x4_t>(scale1), activation_scale, Policy);
+                                else
+                                    accumulator[row] = accumulateSingleScaleBlockNEON(accumulator[row],
+                                        std::bit_cast<int32x4_t>(low[row]), std::bit_cast<float32x4_t>(scale0), activation_scale, Policy);
+                            }
+                        }
+#pragma GCC unroll 4
+                        for (std::size_t row = 0; row < Rows; ++row)
+                            reduced[row] = partition == 0 ? accumulator[row] : vaddq_f32(reduced[row], accumulator[row]);
+                    }
+#pragma GCC unroll 4
+                    for (std::size_t row = 0; row < Rows; ++row)
+                    {
+                        if (column + 4 <= columns_)
+                            vst1q_f32(output_[row].data() + column, reduced[row]);
+                        else
+                        {
+                            // Scalar lane stores are the bounded final-column tail,
+                            // not a row replay. Never expose the accumulator array's
+                            // address to memcpy: that forces all full-column partials
+                            // into stack slots even when the tail branch is unused.
+                            auto *destination = output_[row].data() + column;
+                            vst1q_lane_f32(destination, reduced[row], 0);
+                            if (columns_ - column >= 2) vst1q_lane_f32(destination + 1, reduced[row], 1);
+                            if (columns_ - column == 3) vst1q_lane_f32(destination + 2, reduced[row], 2);
+                        }
+                    }
+                }
+            }
+        }
+
+        /**
+         * @brief Broadcast one row's four-byte activation group to every column lane.
+         * @param block Logical K block. @param group Four-value group in [0,7].
+         * @return The group word repeated in all four lanes, shared by every strip of a panel.
+         */
+        template <typename Ops> typename Ops::I activationGroup(std::size_t row, int block, int group) const noexcept
+        {
+            int word = 0;
+            std::memcpy(&word, activation_[row][block].qs + group * 4, sizeof(word));
+            return typename Ops::I{} + word;
+        }
+
+        /**
+         * @brief Load every row's activation block once for a panel (C3 seam).
+         * @param block Logical K block.
+         * @return One ActivationBlock per row, read by lane by every strip.
+         */
+        template <typename Ops> std::array<typename Ops::ActivationBlock, Rows> activationBlocks(int block) const noexcept
+        {
+            std::array<typename Ops::ActivationBlock, Rows> blocks;
+#pragma GCC unroll 4
+            for (std::size_t row = 0; row < Rows; ++row)
+                blocks[row] = Ops::activationBlock(activation_[row][block].qs);
+            return blocks;
+        }
+
+        /** @brief Invoke body.template operator()<G>() for G = 0..Count-1, in order; callers pass always_inline bodies so nothing is outlined. */
+        template <int Count, typename Body> [[gnu::always_inline]] static void forEachGroup(Body &&body) noexcept
+        {
+            [&]<int... Group>(std::integer_sequence<int, Group...>) __attribute__((always_inline)) {
+                (body.template operator()<Group>(), ...);
+            }(std::make_integer_sequence<int, Count>{});
+        }
+
+        /**
+         * @brief Execute S adjacent four-column strips together with one broadcast per row and group.
+         * @tparam S Strips per panel, 2..4.
+         * @param column0 First column; later strips may be partial or lie wholly in the
+         * chunk's padding columns (inside the 64-column chunk, sealed at publication),
+         * whose results are discarded.
+         * @details Decode expressions, INT32 group order, scale/coefficient
+         * expressions, the per-block FP32 program, block order and partition tree
+         * are those of the strip walk in run() for every column; only S strips' independent
+         * chains are interleaved and each activation group/scale is read once.
+         */
+        template <typename Ops, CPUProjectionNumericalPolicy Policy, Encoding Physical,
+                  NibbleMap Map, bool WithMinimum, int S>
+        [[gnu::always_inline]] LLAMINAR_NEON_PROJECTION_EXACT inline void panel(int column0) const noexcept
         {
 #if defined(__clang__)
 #pragma clang fp contract(off)
@@ -496,61 +717,83 @@ namespace llaminar2::cpu::native_quantised
             using I = typename Ops::I;
             using F = typename Ops::F;
             constexpr bool nibble = Physical == Encoding::NibbleLUT || Physical == Encoding::NibbleLUTSourceScale;
-            for (int column = 0; column < columns_; column += 4)
+            float32x4_t reduced[Rows][S]{};
+            for (int partition = 0; partition < partitions_; ++partition)
             {
-                float32x4_t reduced[Rows]{};
-                for (int partition = 0; partition < partitions_; ++partition)
+                float32x4_t accumulator[Rows][S]{};
+                const int first = partition * blocks_per_partition_;
+                const int last = std::min(first + blocks_per_partition_, weights_.blocks_per_row);
+                for (int block = first; block < last; ++block)
                 {
-                    float32x4_t accumulator[Rows]{};
-                    const int first = partition * blocks_per_partition_;
-                    const int last = std::min(first + blocks_per_partition_, weights_.blocks_per_row);
-                    for (int block = first; block < last; ++block)
+                    const auto *unit = weights_.interleavedBase() +
+                        (std::size_t(chunk_) * weights_.blocks_per_row + block) * weights_.interleaved_block_stride;
+                    I low[Rows][S]{}, high[Rows][S]{};
+                    if constexpr (Physical == Encoding::Q6KNativeDualScale)
                     {
-                        const auto *unit = weights_.interleavedBase() +
-                            (std::size_t(chunk_) * weights_.blocks_per_row + block) * weights_.interleaved_block_stride;
-                        I low[Rows]{}, high[Rows]{};
-                        if constexpr (multi_scale::usesRowPairs<Ops>)
-                            pairBlock<Ops, Physical, Map>(unit, column, block, low, high);
-                        else if constexpr (Physical == Encoding::Q6KNativeDualScale)
-                        {
-                            // Keep one decoded group live at a time. Fully
-                            // unrolling all eight groups lets the compiler
-                            // hoist a complete four-row activation panel into
-                            // registers and spill it inside the K traversal.
+                        // One group's S decoded strips live at a time, the
+                        // panel analogue of the strip walk's spill bound.
 #pragma GCC unroll 1
-                            for (int group = 0; group < 8; ++group)
-                            {
-                                const auto raw = vld1q_u8(unit + (group % 4) * 256 + column * 4);
-                                auto values = group < 4 ? vandq_u8(raw, vdupq_n_u8(15)) : vshrq_n_u8(raw, 4);
-                                const auto *planes = unit + 1024 + group * 64 + (column / 16) * 16;
-                                std::uint64_t bits0 = 0, bits1 = 0;
-                                std::memcpy(&bits0, planes, sizeof(bits0));
-                                std::memcpy(&bits1, planes + 8, sizeof(bits1));
-                                const int shift = (column % 16) * 4;
-                                values = vorrq_u8(values, q6Plane(static_cast<std::uint16_t>(bits0 >> shift), 16));
-                                values = vorrq_u8(values, q6Plane(static_cast<std::uint16_t>(bits1 >> shift), 32));
-                                const auto centered = vsubq_s8(vreinterpretq_s8_u8(values), vdupq_n_s8(32));
-                                if (group < 4) consume<Ops>(centered, block, group, low);
-                                else consume<Ops>(centered, block, group, high);
-                            }
-                        }
-                        else if constexpr (nibble)
+                        for (int group = 0; group < 8; ++group)
                         {
+                            I words[Rows];
 #pragma GCC unroll 4
-                            for (int group = 0; group < 4; ++group)
+                            for (std::size_t row = 0; row < Rows; ++row) words[row] = activationGroup<Ops>(row, block, group);
+#pragma GCC unroll 4
+                            for (int strip = 0; strip < S; ++strip)
                             {
-                                const auto raw = vld1q_u8(unit + group * 256 + column * 4);
-                                consume<Ops>(nibbles<Map>(vandq_u8(raw, vdupq_n_u8(15))), block, group, low);
-                                consume<Ops>(nibbles<Map>(vshrq_n_u8(raw, 4)), block, group + 4, low);
+                                const auto centered = std::bit_cast<I>(q6Group(unit, column0 + 4 * strip, group));
+#pragma GCC unroll 4
+                                for (std::size_t row = 0; row < Rows; ++row)
+                                {
+                                    auto &dots = group < 4 ? low[row][strip] : high[row][strip];
+                                    dots = Ops::dot(dots, centered, words[row]);
+                                }
                             }
                         }
-                        else
-                        {
-#pragma GCC unroll 8
-                            for (int group = 0; group < 8; ++group)
-                                consume<Ops>(vld1q_s8(reinterpret_cast<const std::int8_t *>(unit + group * 256 + column * 4)),
-                                    block, group, low);
-                        }
+                    }
+                    else if constexpr (nibble)
+                    {
+                        // Each row's block is loaded once; every strip reads its groups by lane.
+                        const auto blocks = activationBlocks<Ops>(block);
+                        forEachGroup<4>([&]<int Group>() __attribute__((always_inline)) {
+#pragma GCC unroll 4
+                            for (int strip = 0; strip < S; ++strip)
+                            {
+                                const auto raw = vld1q_u8(unit + Group * 256 + (column0 + 4 * strip) * 4);
+                                const auto low_nibbles = std::bit_cast<I>(nibbles<Map>(vandq_u8(raw, vdupq_n_u8(15))));
+                                const auto high_nibbles = std::bit_cast<I>(nibbles<Map>(vshrq_n_u8(raw, 4)));
+#pragma GCC unroll 4
+                                for (std::size_t row = 0; row < Rows; ++row)
+                                {
+                                    low[row][strip] = Ops::template dotLane<Group>(low[row][strip], low_nibbles, blocks[row]);
+                                    low[row][strip] = Ops::template dotLane<Group + 4>(low[row][strip], high_nibbles, blocks[row]);
+                                }
+                            }
+                        });
+                    }
+                    else
+                    {
+                        const auto blocks = activationBlocks<Ops>(block);
+                        forEachGroup<8>([&]<int Group>() __attribute__((always_inline)) {
+#pragma GCC unroll 4
+                            for (int strip = 0; strip < S; ++strip)
+                            {
+                                const auto weights = std::bit_cast<I>(vld1q_s8(
+                                    reinterpret_cast<const std::int8_t *>(unit + Group * 256 + (column0 + 4 * strip) * 4)));
+#pragma GCC unroll 4
+                                for (std::size_t row = 0; row < Rows; ++row)
+                                    low[row][strip] = Ops::template dotLane<Group>(low[row][strip], weights, blocks[row]);
+                            }
+                        });
+                    }
+                    float activation_scale[Rows];
+#pragma GCC unroll 4
+                    for (std::size_t row = 0; row < Rows; ++row)
+                        activation_scale[row] = nativeQuantisedFP16ScaleToFP32(activation_[row][block].d);
+#pragma GCC unroll 4
+                    for (int strip = 0; strip < S; ++strip)
+                    {
+                        const int column = column0 + 4 * strip;
                         F scale0 = Ops::half(weights_.admittedScales(chunk_, block) + column);
                         F scale1{};
                         if constexpr (Physical == Encoding::Q6KNativeDualScale)
@@ -563,7 +806,6 @@ namespace llaminar2::cpu::native_quantised
                         }
                         else if constexpr (Physical == Encoding::IQ3SExpandedSourceScale || Physical == Encoding::NibbleLUTSourceScale)
                         {
-                            // The publication seal admitted every coefficient word.
                             const I metadata = Ops::words(weights_.admittedMins(chunk_, block) + column);
                             const I coefficient = Physical == Encoding::IQ3SExpandedSourceScale ? metadata * 2 + 1 : metadata - 32;
                             scale0 = scale0 * __builtin_convertvector(coefficient, F);
@@ -573,43 +815,50 @@ namespace llaminar2::cpu::native_quantised
 #pragma GCC unroll 4
                         for (std::size_t row = 0; row < Rows; ++row)
                         {
-                            const auto &a = activation_[row][block];
-                            const float activation_scale = nativeQuantisedFP16ScaleToFP32(a.d);
+                            auto &partial = accumulator[row][strip];
                             if constexpr (Physical == Encoding::Q6KNativeDualScale)
                             {
-                                const F term0 = scale0 * __builtin_convertvector(low[row], F);
-                                const F term1 = scale1 * __builtin_convertvector(high[row], F);
-                                const F contribution = std::bit_cast<F>(vdupq_n_f32(activation_scale)) * (term0 + term1);
-                                accumulator[row] = vaddq_f32(accumulator[row], std::bit_cast<float32x4_t>(contribution));
+                                const F term0 = scale0 * __builtin_convertvector(low[row][strip], F);
+                                const F term1 = scale1 * __builtin_convertvector(high[row][strip], F);
+                                const F contribution = std::bit_cast<F>(vdupq_n_f32(activation_scale[row])) * (term0 + term1);
+                                partial = vaddq_f32(partial, std::bit_cast<float32x4_t>(contribution));
                             }
                             else if constexpr (WithMinimum)
-                                accumulator[row] = accumulateCorrectedSingleScaleBlockNEON(accumulator[row],
-                                    std::bit_cast<int32x4_t>(low[row]), std::bit_cast<float32x4_t>(scale0), a.sum_qs,
-                                    std::bit_cast<float32x4_t>(scale1), activation_scale, Policy);
+                                partial = accumulateCorrectedSingleScaleBlockNEON(partial,
+                                    std::bit_cast<int32x4_t>(low[row][strip]), std::bit_cast<float32x4_t>(scale0),
+                                    activation_[row][block].sum_qs, std::bit_cast<float32x4_t>(scale1),
+                                    activation_scale[row], Policy);
                             else
-                                accumulator[row] = accumulateSingleScaleBlockNEON(accumulator[row],
-                                    std::bit_cast<int32x4_t>(low[row]), std::bit_cast<float32x4_t>(scale0), activation_scale, Policy);
+                                partial = accumulateSingleScaleBlockNEON(partial,
+                                    std::bit_cast<int32x4_t>(low[row][strip]), std::bit_cast<float32x4_t>(scale0),
+                                    activation_scale[row], Policy);
                         }
                     }
-#pragma GCC unroll 4
-                    for (std::size_t row = 0; row < Rows; ++row)
-                        reduced[row] = partition == 0 ? accumulator[row] : vaddq_f32(reduced[row], accumulator[row]);
                 }
+#pragma GCC unroll 4
+                for (std::size_t row = 0; row < Rows; ++row)
+#pragma GCC unroll 4
+                    for (int strip = 0; strip < S; ++strip)
+                        reduced[row][strip] = partition == 0 ? accumulator[row][strip]
+                                                             : vaddq_f32(reduced[row][strip], accumulator[row][strip]);
+            }
+#pragma GCC unroll 4
+            for (int strip = 0; strip < S; ++strip)
+            {
+                const int column = column0 + 4 * strip;
+                if (column >= columns_)
+                    break;
 #pragma GCC unroll 4
                 for (std::size_t row = 0; row < Rows; ++row)
                 {
                     if (column + 4 <= columns_)
-                        vst1q_f32(output_[row].data() + column, reduced[row]);
+                        vst1q_f32(output_[row].data() + column, reduced[row][strip]);
                     else
                     {
-                        // Scalar lane stores are the bounded final-column tail,
-                        // not a row replay. Never expose the accumulator array's
-                        // address to memcpy: that forces all full-column partials
-                        // into stack slots even when the tail branch is unused.
                         auto *destination = output_[row].data() + column;
-                        vst1q_lane_f32(destination, reduced[row], 0);
-                        if (columns_ - column >= 2) vst1q_lane_f32(destination + 1, reduced[row], 1);
-                        if (columns_ - column == 3) vst1q_lane_f32(destination + 2, reduced[row], 2);
+                        vst1q_lane_f32(destination, reduced[row][strip], 0);
+                        if (columns_ - column >= 2) vst1q_lane_f32(destination + 1, reduced[row][strip], 1);
+                        if (columns_ - column == 3) vst1q_lane_f32(destination + 2, reduced[row][strip], 2);
                     }
                 }
             }

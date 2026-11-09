@@ -85,13 +85,14 @@ namespace llaminar2::cpu::native_quantised
         /**
          * @brief Execute independent original-coordinate tiles on the current/new team.
          * @tparam Instruction Explicit ASIMD, or separately compiled/admitted DotProd or I8MM.
+         * @tparam Strips Decode panel width for tournaments; 0 selects the installed width.
          * @details Every member of an existing OpenMP team enters the workshare,
          * following OMP_WORKSHARE_REGION. Fixed per-row K trees make ownership
          * independent of positive team size. Inactive rows and output padding
          * remain untouched. bind() admitted the publication, so no task can
          * fail; only successful completion may be published by the owner.
          */
-        template <multi_scale::NEONByteDot Instruction = multi_scale::NEONByteDot::ASIMD>
+        template <multi_scale::NEONByteDot Instruction = multi_scale::NEONByteDot::ASIMD, int Strips = 0>
         void execute() const
         {
             if constexpr (Instruction == multi_scale::NEONByteDot::DotProd || Instruction == multi_scale::NEONByteDot::I8MM)
@@ -107,7 +108,7 @@ namespace llaminar2::cpu::native_quantised
             auto workshare = [&] {
 #pragma omp for schedule(dynamic, 1)
                 for (std::int64_t task = 0; task < tasks; ++task)
-                    runTask<Instruction>(task);
+                    runTask<Instruction, Strips>(task);
             };
             OMP_WORKSHARE_REGION(workshare);
         }
@@ -130,7 +131,7 @@ namespace llaminar2::cpu::native_quantised
          * arithmetic, so pooling changes no byte.
          * @param task Index in [0, taskCount()).
          */
-        template <multi_scale::NEONByteDot Instruction = multi_scale::NEONByteDot::ASIMD>
+        template <multi_scale::NEONByteDot Instruction = multi_scale::NEONByteDot::ASIMD, int Strips = 0>
         void runTask(std::int64_t task) const noexcept
         {
             const int chunks = weights_.N_padded / 64;
@@ -144,10 +145,10 @@ namespace llaminar2::cpu::native_quantised
                 switch (span.size())
                 {
                 case 0: break;
-                case 1: tile<1, Instruction>(span.first, chunk); break;
-                case 2: tile<2, Instruction>(span.first, chunk); break;
-                case 3: tile<3, Instruction>(span.first, chunk); break;
-                case 4: tile<4, Instruction>(span.first, chunk); break;
+                case 1: tile<1, Instruction, Strips>(span.first, chunk); break;
+                case 2: tile<2, Instruction, Strips>(span.first, chunk); break;
+                case 3: tile<3, Instruction, Strips>(span.first, chunk); break;
+                case 4: tile<4, Instruction, Strips>(span.first, chunk); break;
                 default: __builtin_unreachable(); // The grid never forms a span wider than width_ <= 4.
                 }
             }
@@ -214,7 +215,7 @@ namespace llaminar2::cpu::native_quantised
          * @param first Original slice-relative first row; never compacted.
          * @param chunk Physical 64-column output chunk.
          */
-        template <std::size_t Rows, multi_scale::NEONByteDot Instruction>
+        template <std::size_t Rows, multi_scale::NEONByteDot Instruction, int Strips>
         void tile(int first, int chunk) const noexcept
         {
             const int columns = std::min(64, weights_.N - chunk * 64);
@@ -226,7 +227,7 @@ namespace llaminar2::cpu::native_quantised
                 output[row] = output_.subspan((std::size_t(first) + row) * stride_ + chunk * 64, columns);
             }
             // bind() proved every tile's spans, aliases and executability once.
-            CPUNativeNEONProjectionTile<Rows>::admitted(weights_, input, output, chunk).template executeAdmitted<Instruction>();
+            CPUNativeNEONProjectionTile<Rows>::admitted(weights_, input, output, chunk).template executeAdmitted<Instruction, Strips>();
             if (bias_.empty()) return;
             for (std::size_t row = 0; row < Rows; ++row)
             {
