@@ -247,7 +247,14 @@ endif()
 # Usage: add_v2_test(TestName COMMAND executable [args...] LABELS label1 label2
 #                     [MPI_PROCS n] [NO_MPI] [NO_MODELS] [ENVIRONMENT NAME=value ...]
 #                     [REQUIRED_FILES path ...]
-#                     [SKIP_REGULAR_EXPRESSION regex])
+#                     [SKIP_REGULAR_EXPRESSION regex]
+#                     [REQUIRES_BACKEND GPU|CUDA|ROCM])
+# REQUIRES_BACKEND declares that the test's subject exists only when that
+# compiled backend family exists (GPU = CUDA or ROCm). A build without it has
+# no such production path, so the registration is omitted and counted in the
+# configure summary rather than registered to fail on "not compiled". An
+# executable may declare the same requirement for every registration through
+# the V2_TEST_REQUIRED_BACKEND target property.
 # This automatically:
 #   - Wraps the test with mpirun and optimal MPI/OpenMP settings
 #   - Makes the test depend on the V2_Models fixture unless NO_MODELS is explicit
@@ -257,7 +264,7 @@ function(add_v2_test TEST_NAME)
     cmake_parse_arguments(
         ARG                             # Prefix for parsed args
         "NO_MODELS;NO_MPI"              # Explicit model/process requirements
-        "MPI_PROCS;TIMEOUT;SKIP_REGULAR_EXPRESSION" # One-value keywords
+        "MPI_PROCS;TIMEOUT;SKIP_REGULAR_EXPRESSION;REQUIRES_BACKEND" # One-value keywords
         "COMMAND;LABELS;RESOURCE_LOCK;ENVIRONMENT;REQUIRED_FILES"  # Multi-value keywords
         ${ARGN}                         # Arguments to parse
     )
@@ -268,6 +275,45 @@ function(add_v2_test TEST_NAME)
         return()
     endif()
     list(APPEND ARG_LABELS "ProcessOwned")
+
+    # Backend-family requirement: explicit keyword, or declared once on the
+    # executable target. Unknown families are configuration errors.
+    set(V2_TEST_REQUIRED_BACKENDS "")
+    if(ARG_REQUIRES_BACKEND)
+        list(APPEND V2_TEST_REQUIRED_BACKENDS "${ARG_REQUIRES_BACKEND}")
+    endif()
+    foreach(V2_TEST_COMMAND_ARG IN LISTS ARG_COMMAND)
+        # CMAKE_MATCH_1 is expanded before if() evaluates, so test the
+        # target in a nested condition after the match has been published.
+        if(V2_TEST_COMMAND_ARG MATCHES "\\$<TARGET_FILE:([^>]+)>")
+            set(V2_TEST_BACKEND_TARGET "${CMAKE_MATCH_1}")
+            if(TARGET "${V2_TEST_BACKEND_TARGET}")
+                get_target_property(V2_TEST_TARGET_BACKEND "${V2_TEST_BACKEND_TARGET}" V2_TEST_REQUIRED_BACKEND)
+                if(V2_TEST_TARGET_BACKEND)
+                    list(APPEND V2_TEST_REQUIRED_BACKENDS "${V2_TEST_TARGET_BACKEND}")
+                endif()
+            endif()
+        endif()
+    endforeach()
+    foreach(V2_TEST_REQUIRED_BACKEND IN LISTS V2_TEST_REQUIRED_BACKENDS)
+        string(TOUPPER "${V2_TEST_REQUIRED_BACKEND}" V2_TEST_REQUIRED_BACKEND)
+        if(V2_TEST_REQUIRED_BACKEND STREQUAL "GPU")
+            set(V2_TEST_BACKEND_PRESENT FALSE)
+            if(HAVE_CUDA OR HAVE_ROCM)
+                set(V2_TEST_BACKEND_PRESENT TRUE)
+            endif()
+        elseif(V2_TEST_REQUIRED_BACKEND STREQUAL "CUDA")
+            set(V2_TEST_BACKEND_PRESENT ${HAVE_CUDA})
+        elseif(V2_TEST_REQUIRED_BACKEND STREQUAL "ROCM")
+            set(V2_TEST_BACKEND_PRESENT ${HAVE_ROCM})
+        else()
+            message(FATAL_ERROR "Unknown REQUIRES_BACKEND '${V2_TEST_REQUIRED_BACKEND}' for ${TEST_NAME}")
+        endif()
+        if(NOT V2_TEST_BACKEND_PRESENT)
+            set_property(GLOBAL APPEND PROPERTY V2_BACKEND_OMITTED_TESTS "${TEST_NAME}")
+            return()
+        endif()
+    endforeach()
 
     # Retain target identities before MPI wrapping or Debug path rewriting.
     # Script drivers may receive their tested executable in a later argument,
@@ -25846,7 +25892,7 @@ foreach(_kv_init_backend CUDA ROCm)
     string(TOLOWER "${_kv_init_backend}" _kv_init_suffix)
     set(_kv_init_target "v2_integration_${_kv_init_suffix}_flash_attention_parity")
     if(TARGET ${_kv_init_target})
-        add_v2_test(V2_Integration_${_kv_init_backend}_KVMetadataColdInitializationReplay
+        add_v2_test(V2_Integration_${_kv_init_backend}_KVMetadataColdInitializationReplay REQUIRES_BACKEND ${_kv_init_backend}
             COMMAND $<TARGET_FILE:${_kv_init_target}>
                 --gtest_filter=Test__${_kv_init_backend}FlashAttentionParity.ColdSequenceMetadataInitializationIndependentStreamReplay
             LABELS "V2;Integration;ProductionTestPreflight;${_kv_init_backend};KVCache;GraphCapture;Replay;Regression"
@@ -27162,12 +27208,12 @@ add_v2_test(V2_Integration_MoEPipelineOriginalPreparedSourceContract
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEPipelineOriginalPreparedSourceContract)
 
 foreach(_devices 4 8)
-    add_v2_test(V2_Integration_MoEPipelinePreparedPlan_${_devices}Devices
+    add_v2_test(V2_Integration_MoEPipelinePreparedPlan_${_devices}Devices REQUIRES_BACKEND GPU
         COMMAND $<TARGET_FILE:v2_test_memory_planner>
             --gtest_filter=DeviceCounts/MoEPipelinePreparedPlanTest.*/Devices${_devices}
         LABELS "V2;Integration;ProductionTestPreflight;Planning;ExpertOverlay;CUDA;ROCm;PP;TP;MTP;AllFormats;DeviceFree;Devices${_devices};Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
-    add_v2_test(V2_Integration_MoEPipelineResidencySetup_${_devices}Devices
+    add_v2_test(V2_Integration_MoEPipelineResidencySetup_${_devices}Devices REQUIRES_BACKEND GPU
         COMMAND $<TARGET_FILE:v2_test_memory_planner>
             --gtest_filter=DeviceCounts/MoEPipelineResidencySetup.*/Devices${_devices}
         LABELS "V2;Integration;ProductionTestPreflight;Planning;ExpertOverlay;CUDA;ROCm;PP;TP;MTP;AllFormats;DeviceFree;Devices${_devices};Regression"
@@ -27200,7 +27246,7 @@ add_v2_test(V2_Integration_CPUOverlayCompactWorkspaceAdmission
         --gtest_filter=Test__MemoryPlanner.CPUOverlayContinuationAdmitsCompactProjectionWorkspaceAllFormats:Test__MemoryPlanner.OverlayCompactWorkspaceCapacityIsFlattenedOnEveryBackend
     LABELS "V2;Integration;ProductionTestPreflight;Planning;ExpertOverlay;CPU;AllFormats;PhysicalMemoryAuthority;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 60)
-add_v2_test(V2_Integration_MoEOverlayResidencySetup
+add_v2_test(V2_Integration_MoEOverlayResidencySetup REQUIRES_BACKEND GPU
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
         --gtest_filter=MoEOverlayResidencySetup.*
     LABELS "V2;Integration;ProductionTestPreflight;Planning;ExpertOverlay;CPU;CUDA;ROCm;MTP;DeviceFree;PhysicalMemoryAuthority;Regression"
@@ -27225,7 +27271,7 @@ add_v2_test(V2_Integration_AutomaticOverlayAdaptiveQuota
         --gtest_filter=OrchestrationCandidateAdmission.AutomaticOverlayKeepsLiveExpertQuotaAdaptive
     LABELS "V2;Integration;ProductionTestPreflight;Planning;ExpertOverlay;ROCm;PhysicalMemoryAuthority;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 60)
-add_v2_test(V2_Integration_AutomaticMultiTierOverlayAdmission
+add_v2_test(V2_Integration_AutomaticMultiTierOverlayAdmission REQUIRES_BACKEND GPU
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
         --gtest_filter=AutomaticOrchestrationPlanner.MultiTierOverlayAdmissionAndSelection
     LABELS "V2;Integration;ProductionTestPreflight;Planning;ExpertOverlay;CPU;CUDA;ROCm;PhysicalMemoryAuthority;Regression"
@@ -28682,7 +28728,7 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
 )
 
 # Exact stage-level regression for external event prejoins and scoped capture retirement.
-add_v2_test(V2_Integration_CUDA_GDNTensorCaptureOwnership
+add_v2_test(V2_Integration_CUDA_GDNTensorCaptureOwnership REQUIRES_BACKEND CUDA
     COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
         --gtest_filter=Test__CUDAGemmParity.GDNProjectionStageFusesCUDAQuantizedQKVAndZSmallM:Test__CUDAGemmParity.GDNProjectionStageCapturedMixedBF16AndFP32UsesPhysicalFormatSubgroups
         --gtest_brief=1
@@ -29985,7 +30031,7 @@ add_v2_test(V2_Integration_CPU_GEMMStageTypedBias
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Qwen4Exp;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPU_GEMMStageTypedBias)
-add_v2_test(V2_Integration_CUDACountedM1FusedWorkspace
+add_v2_test(V2_Integration_CUDACountedM1FusedWorkspace REQUIRES_BACKEND CUDA
     COMMAND $<TARGET_FILE:v2_unit_cuda_quantised_gemm_workspace>
         --gtest_filter=Test__CUDAQuantisedGemmKernel_Workspace.CountedM1FusedRequirementsDeclareExactSideSlots
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CUDA;GEMM;Workspace;Regression"
@@ -30648,7 +30694,7 @@ add_v2_test(V2_Integration_Qwen35MoEFileBackedSourceSeal
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Qwen35MoE;Loaders;Regression"
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
-add_v2_test(V2_Integration_Qwen35MoEP2PNativeRouteTransport
+add_v2_test(V2_Integration_Qwen35MoEP2PNativeRouteTransport REQUIRES_BACKEND GPU
     COMMAND $<TARGET_FILE:v2_test_qwen35moe_graph_native_production_lowering>
         --gtest_filter=Test__Qwen35MoEGraphNativeProductionLowering.DistributedLocalTPContinuationKeepsNativeCollectiveWithP2P
         --gtest_brief=1
@@ -31505,7 +31551,7 @@ add_v2_test(V2_Integration_Qwen4ExpDensePredictorPrefixOwnership
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1"
         "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
-add_v2_test(V2_Integration_Qwen4ExpPrefixEnabledOverlayFixedBOM
+add_v2_test(V2_Integration_Qwen4ExpPrefixEnabledOverlayFixedBOM REQUIRES_BACKEND GPU
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
         --gtest_filter=MoEOverlayMemoryPlanInputs.CompleteQwenSourcePrefixEnabledFixedBOMWholeAndPipeline
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;MTP;PrefixCache;ExpertOverlay;Planning;PP;Regression"
@@ -35817,7 +35863,7 @@ if(TARGET v2_integration_cuda_gemm_batch_invariance OR TARGET v2_integration_roc
 endif()
 if(TARGET v2_integration_cuda_gemm_batch_invariance)
     target_link_libraries(v2_integration_cuda_gemm_batch_invariance v2_original_output_slice_native_fixture)
-    add_v2_test(V2_Integration_CUDA_OriginalOutputSliceCapturedAllFormats
+    add_v2_test(V2_Integration_CUDA_OriginalOutputSliceCapturedAllFormats REQUIRES_BACKEND CUDA
         COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_batch_invariance>
             --gtest_filter=Test__CUDAGemmBatchInvariance.CapturedOriginalOutputSliceAllNativeFormats --gtest_brief=1
         LABELS "V2;Integration;ProductionTestPreflight;CUDA;NativeQuantised;PreparedWeights;TensorParallel;QKV;GraphCapture;ByteExact;AllFormats;Regression"
@@ -37180,6 +37226,13 @@ endif()
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_NativeQuantisedDensePrefillEvidenceIdentity)
 
+# A preflight member whose backend family is not compiled was omitted by
+# add_v2_test's REQUIRES_BACKEND declaration; it leaves this build's preflight
+# explicitly (and is counted), never as an unregistered name.
+get_property(V2_PREFLIGHT_BACKEND_OMITTED GLOBAL PROPERTY V2_BACKEND_OMITTED_TESTS)
+if(V2_PREFLIGHT_BACKEND_OMITTED)
+    list(REMOVE_ITEM V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${V2_PREFLIGHT_BACKEND_OMITTED})
+endif()
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)
     if(NOT TEST ${V2_PREFLIGHT_TEST})
         message(FATAL_ERROR
@@ -38193,6 +38246,11 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledImmutableFre
 # Register before canonical GPUProcessTestEntry finalization; installed runners
 # execute this precompiled CPU-only target and never load a vendor runtime.
 add_executable(v2_test_pooled_owner_pin_chain unit/kernels/qwen4exp/Test__PooledImmutableOwnerPinChain.cpp)
+# Pooled immutable sources are CUDA/ROCm-native objects (no CPU
+# implementation); every registration requires a GPU backend family.
+if(TARGET v2_test_pooled_owner_pin_chain)
+    set_target_properties(v2_test_pooled_owner_pin_chain PROPERTIES V2_TEST_REQUIRED_BACKEND GPU)
+endif()
 target_include_directories(v2_test_pooled_owner_pin_chain PRIVATE "${REPO_ROOT}/src/v2" "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(v2_test_pooled_owner_pin_chain PRIVATE llaminar2_core GTest::gtest_main)
 target_compile_features(v2_test_pooled_owner_pin_chain PRIVATE cxx_std_23)
@@ -38347,6 +38405,11 @@ endforeach()
 # Original hit Grant64/native byte parsers and complete original-order reader DAG.
 # Both targets are compiled by the builder; installed runners require no SDK/compiler.
 add_executable(v2_test_pooled_hit_read_graph fixtures/qwen4exp/Test__PooledImmutableReadGraph.cpp)
+# Pooled immutable sources are CUDA/ROCm-native objects (no CPU
+# implementation); every registration requires a GPU backend family.
+if(TARGET v2_test_pooled_hit_read_graph)
+    set_target_properties(v2_test_pooled_hit_read_graph PROPERTIES V2_TEST_REQUIRED_BACKEND GPU)
+endif()
 target_include_directories(v2_test_pooled_hit_read_graph PRIVATE "${REPO_ROOT}/src/v2")
 target_link_libraries(v2_test_pooled_hit_read_graph PRIVATE llaminar2_core GTest::gtest_main)
 target_compile_features(v2_test_pooled_hit_read_graph PRIVATE cxx_std_23)
@@ -38402,6 +38465,11 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PooledImmutableHit
 # Actual last-reader/nominal-gate/physical-terminal bodies and concrete original graph owners.
 add_executable(v2_test_pooled_retirement_body fixtures/qwen4exp/Test__PooledImmutableRetirementBody.cpp)
 add_executable(v2_test_pooled_retirement_graph fixtures/qwen4exp/Test__PooledImmutableRetirementGraph.cpp)
+# Pooled immutable sources are CUDA/ROCm-native objects (no CPU
+# implementation); every registration requires a GPU backend family.
+if(TARGET v2_test_pooled_retirement_graph)
+    set_target_properties(v2_test_pooled_retirement_graph PROPERTIES V2_TEST_REQUIRED_BACKEND GPU)
+endif()
 foreach(_pooled_terminal_target v2_test_pooled_retirement_body v2_test_pooled_retirement_graph)
     target_include_directories(${_pooled_terminal_target} PRIVATE "${REPO_ROOT}/src/v2" "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(${_pooled_terminal_target} PRIVATE llaminar2_core GTest::gtest_main)
@@ -38970,7 +39038,7 @@ foreach(ROW_PUBLICATION_BACKEND IN ITEMS CUDA ROCm)
         set(ROW_PUBLICATION_TARGET v2_integration_rocm_hidden_state_row_select_stage)
     endif()
     if(TARGET ${ROW_PUBLICATION_TARGET})
-        add_v2_test(V2_Integration_${ROW_PUBLICATION_BACKEND}_RowSelectPublicationReplay
+        add_v2_test(V2_Integration_${ROW_PUBLICATION_BACKEND}_RowSelectPublicationReplay REQUIRES_BACKEND ${ROW_PUBLICATION_BACKEND}
             COMMAND $<TARGET_FILE:${ROW_PUBLICATION_TARGET}>
                 --gtest_filter=Test__${ROW_PUBLICATION_BACKEND}HiddenStateRowSelectStage.CapturedPublicationSentinelStridesAndResetAreByteExact
             LABELS "V2;Integration;ProductionTestPreflight;${ROW_PUBLICATION_BACKEND};MTP;RowSelect;Capture;Regression"
@@ -38987,7 +39055,7 @@ foreach(ROW_COLD_BACKEND IN ITEMS CUDA ROCm)
         set(ROW_COLD_TARGET v2_integration_rocm_hidden_state_row_select_stage)
     endif()
     if(TARGET ${ROW_COLD_TARGET})
-        add_v2_test(V2_Integration_${ROW_COLD_BACKEND}_RowSelectColdResidentCheckpointReplay
+        add_v2_test(V2_Integration_${ROW_COLD_BACKEND}_RowSelectColdResidentCheckpointReplay REQUIRES_BACKEND ${ROW_COLD_BACKEND}
             COMMAND $<TARGET_FILE:${ROW_COLD_TARGET}>
                 --gtest_filter=Test__${ROW_COLD_BACKEND}HiddenStateRowSelectStage.CapturedCheckpointReadsResidentPrefillLength
                 --gtest_repeat=20
@@ -39717,4 +39785,12 @@ if(TARGET v2_integration_cpu_native_quantised_fused_completion)
             list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPU_NativeQuantisedNibbleDotILP_${_split_dot_isa})
         endif()
     endforeach()
+endif()
+
+# Report, never hide, every registration omitted (after all includes) because their compiled backend
+# family is absent from this build (for example a CPU-only build).
+get_property(V2_BACKEND_OMITTED_TESTS GLOBAL PROPERTY V2_BACKEND_OMITTED_TESTS)
+list(LENGTH V2_BACKEND_OMITTED_TESTS V2_BACKEND_OMITTED_TEST_COUNT)
+if(V2_BACKEND_OMITTED_TEST_COUNT GREATER 0)
+    message(STATUS "V2 Tests: omitted ${V2_BACKEND_OMITTED_TEST_COUNT} registrations whose backend family is not compiled (HAVE_CUDA=${HAVE_CUDA} HAVE_ROCM=${HAVE_ROCM})")
 endif()

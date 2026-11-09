@@ -169,6 +169,9 @@ namespace
 /** @brief Physical participant count is an explicit preflight axis. */
 class MoEPipelineMemoryAdmission : public ::testing::TestWithParam<int> {};
 
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 /** @test All source formats and serving modes retain complete compact stage authority. */
 TEST_P(MoEPipelineMemoryAdmission, AllFormatsMTPModesAndBothVendorOrders)
 {
@@ -228,7 +231,11 @@ TEST_P(MoEPipelineMemoryAdmission, AllFormatsMTPModesAndBothVendorOrders)
                 }
     }
 }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 /** @test Shared host and later-stage GPU pressure cannot admit only the leading child. */
 TEST_P(MoEPipelineMemoryAdmission, AggregatePressureAndFailureLeaveInputUnchanged)
 {
@@ -256,6 +263,7 @@ TEST_P(MoEPipelineMemoryAdmission, AggregatePressureAndFailureLeaveInputUnchange
         EXPECT_EQ(serializeOrchestrationConfig(input.config), original);
     }
 }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
 /** @test Invalid capture policy remains an input error and cannot select a smaller shape. */
 TEST_P(MoEPipelineMemoryAdmission, InvalidPolicyIsNotCapacityExhaustion)
@@ -279,6 +287,9 @@ INSTANTIATE_TEST_SUITE_P(DeviceCounts, MoEPipelineMemoryAdmission, ::testing::Va
 /** @brief Runtime construction retains the same explicit four/eight-participant axis. */
 class MoEPipelineResidencySetup : public ::testing::TestWithParam<int> {};
 
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 /** @test Every source format and maintenance/MTP policy constructs exact stage owners. */
 TEST_P(MoEPipelineResidencySetup, AllFormatsModesAndBothVendorOrders)
 {
@@ -359,7 +370,11 @@ TEST_P(MoEPipelineResidencySetup, AllFormatsModesAndBothVendorOrders)
                     }
     }
 }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 /** @test Equal-sized foreign intervals/certificates and unfinished quota policy fail before publication. */
 TEST_P(MoEPipelineResidencySetup, RejectsForeignOwnersWithoutPublishingPartialState)
 {
@@ -417,13 +432,20 @@ TEST_P(MoEPipelineResidencySetup, RejectsForeignOwnersWithoutPublishingPartialSt
         .rebalance = stage.topology().config().moe_rebalance, .storage_policy = stage.storagePolicy(),
         .capacity = *stage.capacity(), .memory = memory}));
 }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
+// Every test of this suite requires a compiled GPU backend family.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 INSTANTIATE_TEST_SUITE_P(DeviceCounts, MoEPipelineResidencySetup, ::testing::Values(4, 8),
     [](const auto &info) { return "Devices" + std::to_string(info.param); });
+#endif
 
 /** @brief End-to-end metadata handoff keeps every declared physical participant. */
 class MoEPipelinePreparedPlanTest : public ::testing::TestWithParam<int> {};
 
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 /** @test Retained immutable placements create fresh stage owners in every source/MTP lane. */
 TEST_P(MoEPipelinePreparedPlanTest, AllFormatsModesAndFreshRuntimeLifetimes)
 {
@@ -484,6 +506,7 @@ TEST_P(MoEPipelinePreparedPlanTest, AllFormatsModesAndFreshRuntimeLifetimes)
                 }
     }
 }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
 /** @test Actual retained context identity reaches every fresh CPU/CUDA/ROCm pipeline registry. */
 TEST(MoEPipelinePreparedSource, OriginalContextAuthenticatesEveryStageAndRejectsForeignRebinding)
@@ -547,6 +570,9 @@ TEST(MoEPipelinePreparedSource, OriginalContextAuthenticatesEveryStageAndRejects
     }
 }
 
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 /** @test Foreign source/certificate/policy cannot consume a retained stage's capacity. */
 TEST_P(MoEPipelinePreparedPlanTest, RejectsForeignSourcesAndCapacityPolicyBeforePublication)
 {
@@ -609,7 +635,11 @@ TEST_P(MoEPipelinePreparedPlanTest, RejectsForeignSourcesAndCapacityPolicyBefore
     EXPECT_THROW((void)prepared->createRuntimeBindings(source.loader(), memory, context, topology), std::invalid_argument);
     EXPECT_EQ(memory->rankAttestationSummary(), before);
 }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 /** @test Active depth may change within retained physical geometry without readmission. */
 TEST_P(MoEPipelinePreparedPlanTest, ReusesRetainedCapacityAcrossActiveMTPModes)
 {
@@ -642,9 +672,13 @@ TEST_P(MoEPipelinePreparedPlanTest, ReusesRetainedCapacityAcrossActiveMTPModes)
         EXPECT_EQ(memory->admission(), admitted.pipelineMemory()->physicalAdmission());
     }
 }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
+// Every test of this suite requires a compiled GPU backend family.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 INSTANTIATE_TEST_SUITE_P(DeviceCounts, MoEPipelinePreparedPlanTest, ::testing::Values(4, 8),
     [](const auto &info) { return "Devices" + std::to_string(info.param); });
+#endif
 
 /** @test Correction scratch cannot borrow an authority admitted for single-bank activations. */
 TEST(PreparedWeightAuthorityIdentity, Qwen4ExpHCUpWorkspaceSelectionSeparatesRetainedAuthority)
@@ -744,6 +778,9 @@ TEST(PreparedWeightAuthorityIdentity, MTPReuseRequiresPredictorAndHeadPlacement)
         }
 }
 
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 /** @test Ordinary model-wide setup shares the same constructor on every backend. */
 TEST(MoEOverlayResidencySetup, ModelWideModesRetireDemandClaimsAndFailedConstruction)
 {
@@ -871,6 +908,7 @@ TEST(MoEOverlayResidencySetup, ModelWideModesRetireDemandClaimsAndFailedConstruc
                 }
         }
 }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 }
 
 namespace llaminar2::test
