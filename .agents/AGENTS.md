@@ -241,11 +241,12 @@ Conventional Commits: `<type>(<optional-scope>): <description>`, for example
 Push the feature branch and open a PR into `develop`. Same-repository,
 non-draft feature PRs enable native squash auto-merge, which must wait for every
 required gate, owner approval and an up-to-date merge candidate. The canonical
-PR workflow builds AVX512 and AVX2 model-free test images concurrently on two
-16-core cloud runners. Both run the complete device-free `Unit` suite plus
-the canonical preflight `host` lane, and both checks must pass. CUDA, ROCm and exclusive preflight lanes remain production gates. A successful
-develop merge builds and publishes both AVX512 and AVX2 runtime images on the
-16-core GitHub-hosted cloud runner, without compiling or running test images.
+PR workflow builds an AVX2 full-backend model-free test image on the dedicated
+self-hosted development runner and runs complete device-free `Unit` plus the
+canonical preflight `host` lane. That AVX2 check must pass. CUDA, ROCm and
+exclusive preflight lanes remain production gates. A successful develop merge
+builds and publishes both AVX512 and AVX2 runtime images on the same host,
+without compiling or running test images.
 These images are development artifacts; this gate does not certify a release.
 
 Only upon explicit user direction, open a release PR from `develop` into
@@ -1009,35 +1010,29 @@ commit or publish implicitly. See `docs/production-ci.md`. Do not
 add a second benchmark topology/model list or reintroduce this pipeline into
 pre-commit.
 
-Feature PRs targeting `develop` run `.github/workflows/develop-pr.yml`: build
-AVX512 and AVX2 full-backend test images with the model-free executable
-inventory in parallel on separate 16-core GitHub-hosted runners through
-`develop-pr-tests.yml@develop`. Each runs the complete device-free `Unit` suite
-plus the canonical preflight `host` lane. Both ISA checks are required and
-a failure in one does not cancel the other. CPU feature admission rejects
-unsupported runners before compilation without substituting an ISA. CUDA, ROCm and exclusive lanes remain production gates. The PR
-receipt records `unit-and-host`; it cannot certify complete preflight or images.
-It reuses the existing image driver without publication; no models, E2E or
-benchmarks run on this PR. The PR imports public registry layers without
-credentials or registry cache export. Both cloud workflows restore complete,
-dependency-bound OCI toolchains from GitHub Actions cache before source
-compilation. The source image driver requires those admitted OCI contexts;
-cold builds also checkpoint shared GPU SDK layers. PR cache writes stay isolated to that PR's merge ref; publication
-cannot restore them. Cache capacity is configured in GitHub Actions settings.
-Separate PRs run concurrently in a pool of up to
-four 16-core cloud runners; a new commit cancels older checks on the same PR.
-Production hardware has its own independent queue.
+Feature PRs targeting `develop` run `.github/workflows/develop-pr.yml` through
+`develop-pr-tests.yml@develop` on the dedicated `llaminar-develop-108` host.
+Only the AVX2 full-backend model-free test companion is built and tested.
+Complete device-free Unit and canonical host-preflight inventories must pass
+without skips; CPU admission rejects unsupported hardware before compilation.
+CUDA, ROCm and exclusive lanes remain production gates. The `unit-and-host`
+receipt cannot certify complete preflight or release images. No models, E2E
+or benchmarks run on this PR. PRs import public registry layers without
+credentials or registry cache export. Dependency-bound complete OCI toolchains
+are admitted before source compilation, and the persistent named BuildKit
+worker retains layers and compiler cache mounts between jobs. PR cache writes
+stay isolated to their merge ref. The single development runner serializes
+jobs; new commits cancel older checks on that same PR. Production hardware
+has its own independent queue. No GitHub cloud runner is used for this gate.
 
-The enabled `develop` push workflow is deliberately smaller than certification: it invokes
-`scripts/ci/run_develop_image_gate.py --build-only --publish` on the 16-core
-GitHub-hosted runner to build AVX512 and AVX2 full-backend Release runtimes
-and publish both `develop` and source-SHA tags. It compiles no Integration
-inventory and runs no tests. Its single concurrency group cancels an older
-build when a newer develop merge arrives. PRs separately require device-free
-Unit and host-preflight tests and approval from the owner-only repository approvers team. It does not
-run model/generation/parity/E2E/benchmark certification and must not be
-expanded into a second production-pipeline implementation. See
-`docs/production-ci.md` for the exact boundary and local invocation.
+The enabled develop push workflow invokes
+`scripts/ci/run_develop_image_gate.py --build-only --publish` on that same host.
+It builds both AVX512 and AVX2 full-backend Release runtimes and publishes both
+develop and source-SHA tags. It compiles no Integration inventory and runs no
+tests. One publication concurrency group cancels superseded develop builds.
+PRs require the AVX2 Unit/host check and approval from the owner-only repository
+approvers team. Model/generation/parity/E2E/benchmark certification remains
+separate. See `docs/production-ci.md` for host ownership and local invocation.
 
 The separate manual `production-e2e.yml` and `production-benchmarks.yml`
 workflows consume the branch's existing GHCR image pair. They use

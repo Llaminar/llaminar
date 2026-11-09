@@ -32,49 +32,43 @@ separate explicit workflow. Never silently regenerate answers on drift.
 Keep the fresh/full/partial prefix probes, exact repeatability, actual dynamic
 MTP activity, movement obligations and captured production-path evidence.
 
-Feature PRs into `develop` use `.github/workflows/develop-pr.yml` to run an
-AVX512/AVX2 matrix on two separate 16-core cloud runners in parallel. Each builds
-a full-backend test companion with the `model-free` executable inventory.
-They run the complete device-free `Unit` suite and the production-preflight
-`host` lane selected by the canonical scheduler. CUDA, ROCm and exclusive
-preflight lanes do not run; the container receives no GPU devices or model
-mounts. Each job calls `run_develop_image_gate.py --cpu-isa <matrix ISA>` without
-`--build-only` or `--publish`, on the 16-core GitHub-hosted runner through the protected
-`develop-pr-tests.yml@develop` reusable workflow. PRs import public registry cache
-layers without credentials or registry cache export. Before source compilation,
-both cloud workflows restore complete ISA-specific OCI toolchain images from
-GitHub Actions cache, keyed by the committed dependency context. A cold build
-also checkpoints `gpu-sdk` layers. OCI labels and digests authenticate restored
-toolchains, and source builds consume the pinned OCI context directly.
-Later build/test failures retain completed dependencies;
-PR caches remain scoped to their merge ref. Cache capacity is configured in
-GitHub Actions settings. Separate PRs run concurrently;
-new commits cancel older checks on the same PR. The cloud pool admits up to
-four 16-core runners. The matrix disables fail-fast so both ISA results remain
-visible. The driver admits the requested ISA against every visible CPU before
-compiling; missing required flags fail explicitly without changing the ISA. CTest owns selection and the JUnit receipt must prove
-that every discovered Unit and host test ran without skipping. Unit runs with
-unrestricted parallelism; host retains its canonical serial scheduling. The
-`unit-and-host` PR receipt is separate from complete production preflight.
-The `develop` ruleset requires both `Develop PR / Unit + host (AVX512)` and
-`Develop PR / Unit + host (AVX2)` on an up-to-date PR. The separate
-`Owner approval` ruleset requires approval from the owner-only
-`@Llaminar/repository-approvers` team for both protected branches. Native
-squash auto-merge waits for required reviews and checks. The owner has a
-PR-only approval override; existing CI rules remain enforced. The dedicated
-release-evidence deploy key retains its existing publication exception.
+Feature PRs into `develop` use `.github/workflows/develop-pr.yml` through the
+protected `develop-pr-tests.yml@develop` reusable workflow. The dedicated
+`llaminar-develop-108` runner in `Develop CI` builds one AVX2 full-backend
+`model-free` test companion. It runs the complete device-free `Unit` suite and
+the production-preflight `host` lane selected by the canonical scheduler.
+CUDA, ROCm and exclusive preflight lanes do not run; no GPU devices or model
+mounts are exposed. Each PR calls `run_develop_image_gate.py --cpu-isa AVX2`
+without `--build-only` or `--publish`. CPU admission rejects unsupported
+hardware before compiling. Every discovered Unit and host test must run
+without skips. Unit uses unrestricted parallelism; host retains canonical
+serial scheduling. The `unit-and-host` receipt does not certify full preflight.
+
+The single development host serializes PR and publication jobs. Per-PR
+concurrency groups cancel obsolete commits without canceling another PR.
+Both workflows preserve the named `llaminar-develop` BuildKit worker's state,
+including compiler cache mounts across failed and successful jobs. Complete,
+dependency-bound OCI toolchains are restored before source compilation;
+a cold build checkpoints GPU SDK layers. Source builds admit their exact
+OCI digests, inputs and ISA. PR cache entries remain scoped to that merge ref;
+registry cache access is import-only. See `docs/production-ci.md` for host
+provisioning and cache ownership. These jobs do not use GitHub cloud runners.
+
+The develop ruleset requires `Develop PR / Unit + host (AVX2)`, an up-to-date
+merge candidate and owner approval. The separate owner-approval ruleset uses
+only `@Llaminar/repository-approvers` on both protected branches. Native squash
+auto-merge waits for reviews and checks. The owner's PR-only approval override
+and dedicated release-evidence deploy key retain their existing exceptions.
 Never grant the general GitHub Actions app a ruleset bypass.
 
-The `develop` push workflow uses the 16-core GitHub-hosted cloud runner and
-`run_develop_image_gate.py --build-only --publish`. It compiles only the two
-full-backend Release runtimes, omits Integration compilation, and publishes
-both branch and source-SHA tags after both builds succeed. It runs no tests
-and grants no certificate. Registry layer caches retain cloud build inputs;
-publication has a single concurrency group that cancels a superseded build
-when a new merge arrives. PR checks and production hardware use separate groups. Complete Unit and
-production preflight remain mandatory in the explicit production pipeline,
-through `run_production_prerequisites.py`. See `docs/production-ci.md` for
-runner, cache, receipt and publication boundaries.
+The `develop` push workflow uses this same host and
+`run_develop_image_gate.py --build-only --publish`. It compiles both full-backend
+AVX512 and AVX2 Release runtimes, omits Integration compilation, and publishes
+both branch and source-SHA tags only after both builds authenticate. It runs no
+tests and grants no certificate. Publication has one concurrency group and
+cancels a superseded build when a new develop merge arrives. Complete Unit and
+production preflight remain mandatory in the explicit production pipeline
+through `run_production_prerequisites.py`. Production hardware has its own queue.
 The `develop` → `master` PR gate is separate: its required pull-request E2E
 check waits for the exact develop-head image pair, runs complete Unit and
 production preflight in source/ISA-bound full-matrix test companions on both

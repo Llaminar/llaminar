@@ -11,7 +11,7 @@ permissions:
 
 # Different PRs run concurrently; new commits replace only their own PR run.
 concurrency:
-  group: llaminar-cloud-develop-pr-${{ github.event.pull_request.number }}
+  group: llaminar-develop-pr-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:

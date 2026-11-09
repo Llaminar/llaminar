@@ -24,17 +24,15 @@ and its required gates. Restore any temporary maintenance exception in the
 develop ruleset immediately after the push.
 
 `.github/workflows/develop-pr.yml` tests same-repository feature PRs targeting
-`develop`. One workflow matrix runs AVX512 and AVX2 builds concurrently on
-separate 16-core runners, each with a full-backend `model-free` test image.
-Each image executes the complete device-free `Unit` suite plus the
+`develop`. The dedicated self-hosted development runner builds one AVX2
+full-backend `model-free` test image. That image executes the complete device-free `Unit` suite plus the
 production-preflight `host` lane. The canonical production scheduler owns
 host selection; CUDA, ROCm and exclusive preflight lanes are not executed. The test
 container receives no GPU devices or model mounts. This is PR validation, not
 release certification. The checkout is the PR merge ref, so the tests
 include the proposed integration with `develop`.
 
-The active `develop` ruleset requires both `Develop PR / Unit + host (AVX512)`
-and `Develop PR / Unit + host (AVX2)`, an up-to-date PR, and squash merge; direct human pushes, force pushes and deletion
+The active `develop` ruleset requires `Develop PR / Unit + host (AVX2)`, an up-to-date PR, and squash merge; direct human pushes, force pushes and deletion
 are rejected. `.github/workflows/develop-auto-merge.yml` arms GitHub's native
 auto-merge for same-repository, non-draft PRs. GitHub loads this
 `pull_request_target` policy from the trusted default branch, `master`, even
@@ -65,38 +63,29 @@ workflow reference while the default checkout still tests the caller's PR
 merge ref. Both workflows grant only Contents read access and pass no secrets.
 The called job admits only same-repository pull requests targeting `develop`.
 
-Both cloud workflows disable core collection on their disposable Ubuntu VMs
-with `kernel.core_pattern=/dev/null`. Native proof death tests retain their fatal
-signals and ordinary watchdogs. Piped crash collectors ignore `RLIMIT_CORE=0`
-and otherwise add unrelated host work to every expected trap. This setup also
-applies to dependency proofs during cold toolchain preparation.
+The PR test job and develop publication use the same dedicated host. Each PR
+has its own `llaminar-develop-pr-<number>` concurrency group with
+`cancel-in-progress: true`, so a new commit cancels obsolete work on that PR.
+The single runner serializes jobs from different PRs and publication.
+The AVX2 job calls `run_develop_image_gate.py --cpu-isa AVX2` without publication.
+Before compilation, CPU admission checks every visible CPU against the shipped
+AVX2 feature contract and fails with missing flags instead of changing the ISA.
+Build-only publication does not require native ISA support.
 
-The PR test job uses the same 16-core GitHub-hosted runner pool as develop publication.
-Each PR has its own `llaminar-cloud-develop-pr-<number>` concurrency group with
-`cancel-in-progress: true`: separate PRs can run concurrently, while new commits
-cancel obsolete checks on that same PR.
-The matrix allows two simultaneous jobs and disables fail-fast, so a failing
-ISA cannot cancel its sibling's evidence. Each calls the existing
-`run_develop_image_gate.py --cpu-isa <matrix ISA>` without `--publish`, using its
-own ephemeral BuildKit worker. Before compiling, the driver checks every
-visible CPU against the existing shipped ISA feature contract, including
-AVX512-VNNI. Unsupported hardware fails with the missing flags; the requested
-ISA is never changed. Build-only publication does not require native ISA support. It imports public registry layers with
-`LLAMINAR_DOCKER_BUILD_CACHE_ACCESS=import-only`; it never exports caches or logs
-into the registry. Before source compilation, the local
-`cache-develop-toolchain` action restores or builds complete dependency images
-in GitHub Actions cache. No registry-write permission is granted. The model-free image compiles Unit
-and preflight executables, but `run_develop_pr_tests.py` executes only Unit
-and host. Unit retains unrestricted parallelism; host uses the production
-lane's serial scheduling. Both exact inventories must pass with no skips.
-Their logs and JUnit evidence are retained separately, and `pr-tests.json`
-records the `unit-and-host` scope. That receipt cannot certify full preflight.
+PR registry cache access is `import-only`, with no registry credentials or
+cache export. The `cache-develop-toolchain` action restores or builds complete,
+dependency-bound OCI images before source compilation. No registry-write
+permission is granted. The model-free image compiles Unit and preflight
+executables, while `run_develop_pr_tests.py` executes only complete Unit and
+host inventories. Unit retains unrestricted parallelism; host uses canonical
+serial scheduling. Neither may skip tests. Logs and JUnit evidence are retained
+separately; `pr-tests.json` records the narrower `unit-and-host` scope.
 Accelerator preflight, model staging, generation, HF parity, E2E and benchmarks
 remain outside this PR gate. Only build logs, image/test receipts and CTest/JUnit evidence are
-uploaded to GitHub under artifact names containing the ISA. Run both ISA transactions locally (sequentially on that host) with:
+uploaded to GitHub under artifact names containing the ISA. Run the same AVX2 PR transaction locally with:
 
 ```bash
-python3 scripts/ci/run_develop_image_gate.py \
+python3 scripts/ci/run_develop_image_gate.py --cpu-isa AVX2 \
   --output parity-results/develop-pr-gate
 ```
 
@@ -107,16 +96,14 @@ separate, broader gate.
 ## Develop branch image publication
 
 `.github/workflows/ci.yml` runs on pushes to `develop` and explicit manual
-dispatches on `develop`. It uses the GitHub-hosted `llaminar-cloud-16` runner
-in the `Develop CI` group: Ubuntu 24.04, 16 vCPUs, 64 GB RAM and 600 GB storage,
-with a maximum of four cloud runners across PR checks and publication. The
-group admits only this repository and
-`ci.yml` plus the reusable `develop-pr-tests.yml`, both pinned to
-`refs/heads/develop`. Image publication has its own
-`llaminar-cloud-develop-images` concurrency group with
-`cancel-in-progress: true`: at most one develop image build runs, and a new
-merge cancels the superseded build. PRs use separate per-PR groups, so they
-can run alongside publication without occupying production accelerators.
+dispatches on `develop`. It uses the self-hosted `llaminar-develop-108` runner
+with label `llaminar-develop-avx2` in the `Develop CI` group. The group admits
+only this repository and `ci.yml` plus reusable `develop-pr-tests.yml`, both
+pinned to `refs/heads/develop`. Image publication has its own
+`llaminar-develop-images` concurrency group with `cancel-in-progress: true`:
+at most one develop publication runs, and a newer merge cancels its predecessor.
+PRs retain separate per-PR groups; all development jobs share one host queue
+without occupying production accelerators or GitHub cloud runners.
 
 The job runs `scripts/ci/run_develop_image_gate.py --build-only --publish`.
 It builds only the full CPU/CUDA/ROCm Release runtime targets for AVX512 and
@@ -132,14 +119,14 @@ movable. The build receipt explicitly records `validation: build-only` and
 contains no invented test result. These are development images, not certified
 release artifacts.
 
-The ephemeral cloud worker uses registry-backed BuildKit caches selected by
+The persistent development worker also imports registry-backed BuildKit caches selected by
 `LLAMINAR_DOCKER_BUILD_CACHE_IMAGE`, with separate `-avx512` and `-avx2` tags.
 The workflow stores these under `ghcr.io/llaminar/llaminar:build-cache-develop`.
 Registry access defaults to `read-write` for publication; PRs explicitly select
 `import-only`, with no registry cache export. Local host-path and registry cache
 authorities are mutually exclusive.
 
-Both cloud workflows first run `.github/actions/cache-develop-toolchain`.
+Both development workflows first run `.github/actions/cache-develop-toolchain`.
 `toolchain_cache.py` constructs a restricted committed dependency context and
 keys a complete OCI toolchain image by those Git objects, policy version and
 CPU ISA. Source-only commits retain the key. SDK/installer, dependency-pin,
@@ -153,7 +140,7 @@ image driver independently admits its dependency identity and passes the
 digest-pinned `toolchain=oci-layout://...` named context to Buildx. This replaces
 the toolchain stage directly, without depending on intermediate solver-cache
 hits. The builder declares its build arguments explicitly because an external
-image does not inherit in-file ARG state. Both cloud workflows pin Buildx and
+image does not inherit in-file ARG state. Both development workflows pin Buildx and
 BuildKit to the same versions.
 
 On a cold image-cache miss, `gpu-sdk` is checkpointed through the GitHub Actions
@@ -166,8 +153,9 @@ restored by develop publication or another PR. They remain reusable across
 updates to that PR. Develop populates the same dependency keys for inbound PRs to read.
 The repository's cache storage limit is configured in GitHub Actions settings;
 GitHub owns eviction. These caches contain dependency images, not source
-builds or compiler-object cache mounts. Ccache mounts are shared within a
-build job. Per-ISA `*-toolchain.json` receipts record restore/build status,
+builds or compiler-object cache mounts. The named `llaminar-develop` BuildKit worker uses `keep-state: true`; its
+local layers and ccache mounts survive job cleanup, failed builds and later
+commits. The single runner prevents simultaneous jobs mutating this worker. Per-ISA `*-toolchain.json` receipts record restore/build status,
 dependency fingerprint, image manifest, size and validation time. The canonical
 image driver still admits and builds the exact source snapshot. See
 [Docker's cache backend reference](https://docs.docker.com/build/cache/backends/gha/)
@@ -191,6 +179,25 @@ host preflight lane in a `model-free` test companion and cannot publish. `--cpu-
 build or PR diagnostic, never a published pair. Full production prerequisites
 remain owned by `run_production_prerequisites.py` and the production pipeline.
 
+### Dedicated development host
+
+`192.168.68.108` (`david-stealth`) runs Ubuntu 24.04 with an i7-11800H,
+8 physical cores / 16 threads, 64 GB RAM and a 1 TB system volume. Its
+`llaminar-ci` system account owns `/opt/llaminar-actions-runner` and
+`/var/lib/llaminar-ci/work`; Docker access is granted only through the Docker
+group, with no passwordless sudo rule for workflow jobs. The systemd service
+`actions.runner.Llaminar.llaminar-develop-108.service` starts at boot.
+The release archive is verified against GitHub's declared SHA256 before
+registration. Registration credentials are temporary and never belong in Git.
+
+The host's `/etc/sysctl.d/70-llaminar-ci.conf` sets
+`kernel.core_pattern=/proc/llaminar-core-disabled`. Procfs cannot create that
+file, so expected-fatal native proofs retain their signals and watchdogs
+without invoking the piped crash collector. `RLIMIT_CORE=0` alone does not
+suppress piped collectors. Never use `/dev/null` as a core-output filename:
+core dumping can replace that device in a container, contaminating tools that
+use it as an empty input. Workflow jobs do not change host kernel settings.
+
 ### Protected-branch approval
 
 The separate `Owner approval` repository ruleset covers `master` and `develop`.
@@ -209,7 +216,7 @@ Production-host image builds, tests and toolchain preparation share
 `llaminar-develop-image-gate` with `queue: max` and
 `cancel-in-progress: false`. The ARC scale set has `maxRunners: 1`, so those jobs
 cannot overlap GPU work or replace an older pending run. This queue is separate
-from develop PRs and image publication in the cloud.
+from develop PRs and image publication on the dedicated development host.
 
 The `llaminar-xeon` ARC scale set runs inside the host's Kubernetes cluster,
 but it deliberately uses the host's Docker Unix socket rather than a DIND

@@ -2,8 +2,8 @@ name: Develop Unit and host gate
 
 # Runner-group access is pinned to this workflow on develop. The caller keeps
 # the pull_request event, so checkout still tests its proposed merge commit.
-# Each ISA builds and tests on its own VM. The driver admits that VM's CPU
-# features before compiling; an unsupported ISA fails without substitution.
+# The dedicated development host builds AVX2 and runs complete Unit plus host
+# preflight. CPU admission rejects unsupported hardware before compilation.
 on:
   workflow_call:
 
@@ -12,20 +12,19 @@ permissions:
 
 jobs:
   unit:
-    # Only same-repository PRs into develop may call this paid PR gate.
+    # Only same-repository PRs into develop may use the dedicated host.
     if: >-
       github.event_name == 'pull_request' && github.base_ref == 'develop' &&
       github.event.pull_request.head.repo.full_name == github.repository
     strategy:
-      # Retain both ISA results even when one image build or test gate fails.
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 1
       matrix:
-        cpu_isa: [AVX512, AVX2]
+        cpu_isa: [AVX2]
     name: Unit + host (${{ matrix.cpu_isa }})
     runs-on:
       group: Develop CI
-      labels: llaminar-cloud-16
+      labels: llaminar-develop-avx2
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v6
@@ -33,12 +32,6 @@ jobs:
           submodules: false
           lfs: false
           persist-credentials: false
-      - name: Disable crash collection for expected-fatal test cases
-        # This kernel belongs to the disposable Actions VM. Piped collectors
-        # ignore RLIMIT_CORE=0 and can stall hundreds of intentional traps.
-        # A non-piped, unwritable core target preserves signals and watchdogs.
-        shell: bash
-        run: sudo sysctl -w kernel.core_pattern=/dev/null
       - name: Admit the requested CPU ISA before toolchain preparation
         shell: bash
         env:
@@ -54,8 +47,11 @@ jobs:
       - uses: docker/setup-buildx-action@v4
         with:
           version: v0.38.1
+          name: llaminar-develop
           driver: docker-container
-          # Pin the same BuildKit image for both cloud workflows.
+          # Reuse the named worker's layers and ccache mounts across jobs,
+          # including source builds that fail before exporting an image.
+          keep-state: true
           driver-opts: |
             network=host
             image=moby/buildkit@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe

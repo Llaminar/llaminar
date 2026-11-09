@@ -31,7 +31,6 @@ REQUIRED_CHECKS = (
     "Published OpenCode (AVX512 and AVX2)",
 )
 DEVELOP_REQUIRED_CHECKS = (
-    "Develop PR / Unit + host (AVX512)",
     "Develop PR / Unit + host (AVX2)",
 )
 RELEASE_DEPLOY_KEY_TITLE = "llaminar-release-evidence"

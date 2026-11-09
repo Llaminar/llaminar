@@ -1,6 +1,6 @@
 name: CI
 
-# Develop publishes Release runtime images on a GitHub-hosted larger runner.
+# Develop publishes both Release runtime images on the dedicated development host.
 # Unit and host-preflight tests belong to the separate PR gate. This push job
 # only builds and publishes; complete certification remains production work.
 on:
@@ -14,7 +14,7 @@ permissions:
 
 # Only the newest develop head needs publication. Cancel superseded builds.
 concurrency:
-  group: llaminar-cloud-develop-images
+  group: llaminar-develop-images
   cancel-in-progress: true
 
 jobs:
@@ -24,7 +24,7 @@ jobs:
     name: Build → Publish develop images
     runs-on:
       group: Develop CI
-      labels: llaminar-cloud-16
+      labels: llaminar-develop-avx2
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v6
@@ -32,17 +32,13 @@ jobs:
           submodules: false
           lfs: false
           persist-credentials: false
-      - name: Disable crash collection for builder proof death tests
-        # Dependency installers run native host replay proofs on a cold cache.
-        # The disposable VM must not hand intentional traps to Ubuntu's collector.
-        shell: bash
-        run: sudo sysctl -w kernel.core_pattern=/dev/null
       - uses: docker/setup-buildx-action@v4
         with:
           version: v0.38.1
-          # Complete OCI toolchains survive the ephemeral VM; registry layer
-          # caches accelerate the remaining build. Ccache is shared per job.
+          name: llaminar-develop
+          # Retain layers and compiler cache mounts on the dedicated host.
           driver: docker-container
+          keep-state: true
           driver-opts: |
             network=host
             image=moby/buildkit@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
