@@ -316,3 +316,13 @@ unchanged (~49.5–50 tok/s). NOT claiming economy for the IQ4_XS M=1 cell.
   (suggested: objdump/llvm-objdump of the probe OBJECT — full operands both
   compilers) — fail-closed is honest current state, not a green exclusion;
   never alter production allocation.
+
+## SOURCE119 census FULLY GREEN (2026-11-09; sealed K14-SOURCE119-CENSUS-20261109)
+
+- Witness PASS 176 (single-row zero; grouped within budget); ctest 4/4; proof
+  GNU-14 NEON_I8MM 242 inputs/1274, GNU objdump 2.42; lifecycle after proof.o
+  removal = 1 (PASS re-emitted). Census 9/9 cells (Debug/Release/Integration ×
+  NEON/NEON_DOTPROD/NEON_I8MM): single=0, grouped = budget EXACTLY
+  (1029/1176/1274), mismatches=0. Last GNU-14 gap closed — the requalified
+  object-disassembly gate has its complete owner evidence (AppleClang Mac E2E
+  + GNU-14 .80). Reviewer SOURCE119 (source) pending; .80 free.
